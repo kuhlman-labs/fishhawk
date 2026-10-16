@@ -1976,9 +1976,9 @@ components:
             `pending` until decided. `approved` / `denied` are operator
             decisions. `lapsed` (#4127) means the request was still undecided
             when its stage succeeded, was cancelled or superseded, or its run
-            reached a terminal state; it is terminal and never approvable
+            succeeded or was cancelled; it is terminal and never approvable
             (`decision_reason` names the triggering transition, `decided_by`
-            is absent). A stage that fails on a live run keeps its requests
+            is absent). A failed stage or a failed run keeps its requests
             `pending`.
         decision_reason:
           type: string
@@ -28189,7 +28189,8 @@ paths:
         pre-commit refresh. Already-decided amendments return 409
         (`amendment_already_decided`) — decisions are immutable. A
         lapsed amendment (undecided when its stage succeeded, was
-        cancelled or superseded, or its run ended; #4127) returns 409
+        cancelled or superseded, or its run succeeded or was cancelled;
+        #4127) returns 409
         (`amendment_lapsed`) and is never approvable.
       tags: [runs]
       parameters:

@@ -482,7 +482,7 @@ Before #4186, cancelling a decomposed parent transitioned only the parent, so ev
 
 ## Terminal observers (#4127)
 
-`StageTerminalObserver` / `TerminalRunObserver` are optional post-commit hooks on the postgres repo, installed through the `StageTerminalObservable` / `TerminalRunObservable` capabilities (kept off `Repository`; nil clears). fishhawkd installs `scopeamendment.InstallLapseHooks` there.
+`StageTerminalObserver` / `TerminalRunObserver` are optional post-commit hooks on the postgres repo, installed through the `StageTerminalObservable` / `TerminalRunObservable` capabilities (kept off `Repository`; nil clears). fishhawkd installs `scopeamendment.InstallLapseHooks` there; the hooks fire on EVERY terminal state, and the lapse predicate (`scopeamendment.StageStateLapses` / `RunStateLapses`) then skips `failed` — a failed stage or failed run stays recoverable on `fishhawk_retry_stage`.
 
 - **Fired by:** `transitionStage` (`TransitionStage`, `TransitionStageFrom`, `TransitionStageFromAttempt` — every `FailStage`, cancel, trace-upload and fix-up recovery path) and `SupersedeStrandedStageOnMerge`, whenever the committed stage state is terminal; `TransitionRun` whenever the committed run state is terminal. A same-state re-application fires again, so an observer must be idempotent.
 - **Not fired by:** the transaction-scoped `TransitionStageFromTx` / `TransitionStageFromLiveRunTx` (their only caller, `concurrency.Admit`, moves to dispatched), `RetryStage`, `RetryRun`, `ReviveRunOnReopen` (they leave a terminal state), or a refused transition.

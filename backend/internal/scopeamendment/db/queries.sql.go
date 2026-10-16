@@ -280,7 +280,7 @@ SELECT DISTINCT sa.stage_id, s.state AS stage_state, r.state AS run_state
   JOIN runs r ON r.id = sa.run_id
  WHERE sa.status = 'pending'
    AND (s.state IN ('succeeded', 'cancelled', 'superseded')
-        OR r.state IN ('succeeded', 'failed', 'cancelled'))
+        OR r.state IN ('succeeded', 'cancelled'))
  ORDER BY sa.stage_id
 `
 
@@ -293,8 +293,9 @@ type ListStrandedPendingScopeAmendmentStagesRow struct {
 // The startup backfill's work list: each stage carrying a pending request
 // whose stage state or run state already lapses it. The stage literal set is
 // the lapsing subset of run.StageState.IsTerminal (failed is deliberately
-// absent: a failed stage on a live run keeps its requests pending); the run
-// literal set mirrors run.State.IsTerminal.
+// absent: a failed stage keeps its requests pending); the run literal set
+// mirrors scopeamendment.RunStateLapses (failed is deliberately absent too:
+// fishhawk_retry_stage reopens a failed run).
 func (q *Queries) ListStrandedPendingScopeAmendmentStages(ctx context.Context) ([]ListStrandedPendingScopeAmendmentStagesRow, error) {
 	rows, err := q.db.Query(ctx, listStrandedPendingScopeAmendmentStages)
 	if err != nil {

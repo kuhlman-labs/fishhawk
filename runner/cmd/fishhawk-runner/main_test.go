@@ -19005,9 +19005,11 @@ func TestDetectUndecidedScopeAmendments_NoOpGuards(t *testing.T) {
 // category-B demote annotation: the captured verify output is preserved as the
 // prefix, and the appended text names the amendment id, the requested path(s)
 // with their operation, the never-DECIDED (not denied) framing, and the
-// recovery QUALIFIED by the #4127 lapse rule: decide-then-retry while the stage
-// is failed and the run is live, and fishhawk_resume_run add_scope_files /
-// fishhawk_retry_stage once the request lapses. The pre-#4127 UNQUALIFIED
+// recovery QUALIFIED by the #4127 lapse rule: decide-then-retry while the
+// stage or run is failed (both stay recoverable), and fishhawk_resume_run
+// add_scope_files / fishhawk_retry_stage once the request lapses (a stage that
+// succeeds, is cancelled or superseded, or a run that succeeds or is
+// cancelled). The pre-#4127 UNQUALIFIED
 // "still landable" sentence must be gone. The empty case returns the reason
 // byte-identically.
 func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T) {
@@ -19029,7 +19031,8 @@ func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T)
 		"pkg/coupled_test.go (modify)",
 		"pkg/new.go (create)",
 		"never DECIDED (not denied",
-		"While this stage is failed and the run is live the request stays `pending`",
+		"The request stays `pending` — a failed stage or failed run stays recoverable",
+		"a run that succeeds or is cancelled, LAPSES the request (#4127)",
 		"decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
 		"LAPSES the request (#4127)",
 		"amendment_lapsed",
@@ -19055,9 +19058,10 @@ func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T)
 // arriving after an earlier refresh saw it pending is still landable. Attempt 1
 // sees the row pending and folds nothing; the operator then approves; attempt 2
 // (the fishhawk_retry_stage re-run, a fresh cfg from the same plan scope) folds
-// the requested paths. Since #4127 that holds while the stage is failed and the
-// run is live — a stage that succeeds, is cancelled or superseded, or a run
-// that ends, lapses the row and the backend refuses a later decide (409
+// the requested paths. Since #4127 that holds unless the stage succeeded, was
+// cancelled or superseded, or the run succeeded or was cancelled (a failed
+// stage or failed run stays recoverable) — those lapse the row and the backend
+// refuses a later decide (409
 // amendment_lapsed), so no approval exists to fold. Pinned rather than asserted
 // in prose.
 func TestRefreshScopeAmendments_ApprovedAfterExpiryFoldsOnRetry(t *testing.T) {
@@ -19245,8 +19249,7 @@ func TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke(t *testing.T) {
 	}
 	// The demote reason is actionable: the amendment id, the requested path, and
 	// the recovery qualified by the #4127 lapse rule (decide-then-retry while the
-	// stage is failed and the run is live; resume_run add_scope_files once it
-	// lapses).
+	// stage or run is failed; resume_run add_scope_files once it lapses).
 	for _, want := range []string{"amd-e2e", "mod/other.go", "fishhawk_decide_scope_amendment", "fishhawk_retry_stage",
 		"LAPSES the request", "fishhawk_resume_run add_scope_files"} {
 		if !strings.Contains(stderr.String(), want) {

@@ -1902,10 +1902,11 @@ func runStageEventMessage(payload any) string {
 		// an operator watching a blocking fishhawk_run_stage learn the request
 		// went unanswered instead of inferring it from a generic verify failure.
 		// The recovery it names is QUALIFIED by the #4127 lapse rule: decide then
-		// fishhawk_retry_stage works while the stage is failed and the run is
-		// live; once the stage succeeds, is cancelled or superseded, or the run
-		// ends, the request lapses (a decide is refused 409 amendment_lapsed) and
-		// the recovery is fishhawk_resume_run add_scope_files (category B) or
+		// fishhawk_retry_stage works unless the stage succeeded, was cancelled or
+		// superseded, or the run succeeded or was cancelled (a failed stage or
+		// failed run stays recoverable); once one of those lapses the request (a
+		// decide is refused 409 amendment_lapsed) the recovery is
+		// fishhawk_resume_run add_scope_files (category B) or
 		// fishhawk_retry_stage (category C).
 		// The field set {event, amendments:[{amendment_id, paths:[{path,
 		// operation}]}]} is the literal-JSONL seam this relay shares with the
@@ -1951,11 +1952,11 @@ func runStageEventMessage(payload any) string {
 				return "scope_amendment_undecided"
 			}
 			return fmt.Sprintf("scope_amendment_undecided %s — never decided (NOT denied); "+
-				"while the stage is failed and the run is live it stays pending: decide it with "+
+				"it stays pending — a failed stage or failed run stays recoverable: decide it with "+
 				"fishhawk_decide_scope_amendment, then fishhawk_retry_stage. A stage that succeeds, is cancelled or "+
-				"superseded, or a run that ends, lapses it (a later decide is refused 409 amendment_lapsed) — recover "+
-				"then with fishhawk_resume_run add_scope_files naming these paths (category B) or fishhawk_retry_stage "+
-				"(category C)",
+				"superseded, or a run that succeeds or is cancelled, lapses it (a later decide is refused 409 "+
+				"amendment_lapsed) — recover then with fishhawk_resume_run add_scope_files naming these paths "+
+				"(category B) or fishhawk_retry_stage (category C)",
 				strings.Join(rows, "; "))
 		}
 		for _, key := range []string{"kind", "type", "event"} {

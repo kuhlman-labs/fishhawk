@@ -1973,7 +1973,8 @@ Notes:
   internal-only kind (it doubles as the page-class ping trigger + the
   `fishhawk_await_audit` anchor), and `scope_amendment_lapsed` (one system
   entry per undecided request lapsed when its stage succeeds / is cancelled /
-  superseded or its run ends, written by `backend/internal/scopeamendment`) is
+  superseded or its run succeeds / is cancelled, written by
+  `backend/internal/scopeamendment`) is
   a further internal-only kind, deliberately NOT in `activityCategories` (the
   startup backfill would otherwise render activity lines onto every stale
   run's anchor), but as of E42.6

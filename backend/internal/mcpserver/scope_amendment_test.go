@@ -134,7 +134,7 @@ func TestDecideScopeAmendment_BackendErrorsSurfaced(t *testing.T) {
 			`{"error":{"code":"amendment_already_decided","message":"this scope amendment has already been decided"}}`,
 			"amendment_already_decided"},
 		{"lapsed", http.StatusConflict,
-			`{"error":{"code":"amendment_lapsed","message":"this scope amendment lapsed undecided (its stage succeeded, was cancelled or superseded, or its run ended)","details":{"status":"lapsed"}}}`,
+			`{"error":{"code":"amendment_lapsed","message":"this scope amendment lapsed undecided (its stage succeeded, was cancelled or superseded, or its run succeeded or was cancelled)","details":{"status":"lapsed"}}}`,
 			"amendment_lapsed"},
 		{"self decision", http.StatusForbidden,
 			`{"error":{"code":"self_decision","message":"a run-bound agent token may not decide a scope amendment"}}`,
@@ -403,7 +403,8 @@ func TestDecideScopeAmendment_DescriptionStatesApprovalBinding(t *testing.T) {
 // on the scope-amendment tool descriptions over the real ListTools round-trip:
 // the list tool names the lapsed status as not actionable; the decide tool and
 // fishhawk_await_children keep the late-decision recovery (decide, then
-// fishhawk_retry_stage) QUALIFIED by the live-run condition and name the lapse
+// fishhawk_retry_stage) QUALIFIED by the lapse rule (a failed stage or failed
+// run stays recoverable) and name the lapse
 // triggers; the decide tool also names the post-lapse recovery and lists
 // amendment_lapsed among its tool errors. (fishhawk_await_stage's description
 // is pinned by TestAwaitStageToolDescription_NamesAmendmentRelease.)
@@ -443,15 +444,16 @@ func TestScopeAmendmentTools_DescriptionsQualifyLapse(t *testing.T) {
 			"amendment_lapsed",
 		},
 		"fishhawk_decide_scope_amendment": {
-			"still landable while the stage is failed and the run is live",
+			"still landable unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled",
+			"a failed stage or failed run stays recoverable",
 			"fishhawk_retry_stage folds the paths",
-			"A stage that succeeds, is cancelled or superseded, or a run that ends, LAPSES the request",
+			"A stage that succeeds, is cancelled or superseded, or a run that succeeds or is cancelled, LAPSES the request",
 			"fishhawk_resume_run add_scope_files",
 			"amendment_lapsed (the stage succeeded",
 		},
 		"fishhawk_await_children": {
-			"a late decision is still honored on fishhawk_retry_stage while the stage is failed and the run is live",
-			"a stage that succeeds, is cancelled or superseded, or a run that ends, lapses it",
+			"a late decision is still honored on fishhawk_retry_stage unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled, which lapses it",
+			"a failed stage or failed run stays recoverable",
 			"amendment_lapsed",
 		},
 	} {

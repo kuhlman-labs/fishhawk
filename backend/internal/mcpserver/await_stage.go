@@ -261,11 +261,11 @@ Statuses:
                      window elapses with no decision the request EXPIRES
                      UNDECIDED — it stays pending server-side and is NOT a
                      denial, so a late decision is still honored on a
-                     fishhawk_retry_stage of the same stage while the stage is
-                     failed and the run is live; a stage that succeeds, is
-                     cancelled or superseded, or a run that ends, lapses it
-                     (#4127 — a later decide is refused 409
-                     amendment_lapsed). Settledness wins
+                     fishhawk_retry_stage of the same stage unless the stage
+                     succeeded, was cancelled or superseded, or the run
+                     succeeded or was cancelled, which lapses it (#4127 — a
+                     later decide is refused 409 amendment_lapsed); a failed
+                     stage or failed run stays recoverable. Settledness wins
                      the race — a stage that has settled resolves 'settled'
                      even with an amendment still pending.
   - "timeout"      — YOUR wait cap expired before the stage settled. What
@@ -631,7 +631,7 @@ func awaitStageAmendmentPendingOutput(stageType, stageID string, runID uuid.UUID
 			Consumes:     "none",
 			Reason: "the agent is blocked on this decision and its " + amendmentPollWindowText() + " poll window expires UNDECIDED " +
 				"(an expiry is not a denial — the request stays pending until its stage succeeds, is cancelled or superseded, " +
-				"or its run ends, which lapses it, #4127)",
+				"or its run succeeds or is cancelled, which lapses it, #4127; a failed stage or failed run stays recoverable)",
 		},
 		Message: fmt.Sprintf("stage %q is still running and filed scope amendment %s for %s. Reason: %s. "+
 			"Decide it now with fishhawk_decide_scope_amendment (run_id + amendment_id are pre-filled on next_step): "+

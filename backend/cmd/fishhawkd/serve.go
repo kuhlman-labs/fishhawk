@@ -2690,7 +2690,8 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.MCPTokenRepo = mcptoken.NewPostgresRepository(pool)
 		cfg.ScopeAmendmentRepo = scopeamendment.NewPostgresRepository(pool)
 		// #4127: lapse a still-undecided amendment when its stage succeeds /
-		// is cancelled / superseded or its run ends. InstallLapseHooks WARNs
+		// is cancelled / superseded or its run succeeds / is cancelled (a
+		// failed stage or run keeps it pending). InstallLapseHooks WARNs
 		// when either repository lacks the capability.
 		scopeamendment.InstallLapseHooks(cfg.RunRepo, cfg.ScopeAmendmentRepo, logger)
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)

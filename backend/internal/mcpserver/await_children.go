@@ -127,11 +127,12 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               polls ` + amendmentPollWindowText() + ` per request and then the request
                               EXPIRES UNDECIDED (it stays pending — an expiry is
                               NOT a denial — and a late decision is still
-                              honored on fishhawk_retry_stage while the stage is
-                              failed and the run is live; a stage that
-                              succeeds, is cancelled or superseded, or a run
-                              that ends, lapses it, #4127: a later decide is
-                              refused 409 amendment_lapsed). pending_amendment
+                              honored on fishhawk_retry_stage unless the stage
+                              succeeded, was cancelled or superseded, or the
+                              run succeeded or was cancelled, which lapses it,
+                              #4127: a later decide is refused 409
+                              amendment_lapsed; a failed stage or failed run
+                              stays recoverable). pending_amendment
                               carries the whole row and next_step is a
                               pre-filled fishhawk_decide_scope_amendment call.
   - "children_dispatchable" — some child's implement stage awaits a host
@@ -363,14 +364,16 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 			Consumes:     "none",
 			Reason: "the child agent is blocked on this decision and its " + amendmentPollWindowText() +
 				" poll window expires UNDECIDED (an expiry is not a denial — the request stays pending until its stage succeeds, " +
-				"is cancelled or superseded, or its run ends, which lapses it, #4127)",
+				"is cancelled or superseded, or its run succeeds or is cancelled, which lapses it, #4127; a failed stage or " +
+				"failed run stays recoverable)",
 		}
 		out.Message = fmt.Sprintf(
 			"child %s filed scope amendment %s for %s. Reason: %s. Decide it now with fishhawk_decide_scope_amendment "+
 				"(run_id + amendment_id are pre-filled on next_step): the agent polls %s per request and then the request "+
-				"EXPIRES UNDECIDED (it stays pending: a late decision is still honored on fishhawk_retry_stage while the stage "+
-				"is failed and the run is live; a stage that succeeds, is cancelled or superseded, or a run that ends, lapses it "+
-				"and a later decide is refused 409 amendment_lapsed). Amendments are surfaced ONE at a time in ascending slice "+
+				"EXPIRES UNDECIDED (it stays pending: a late decision is still honored on fishhawk_retry_stage unless the stage "+
+				"succeeded, was cancelled or superseded, or the run succeeded or was cancelled, which lapses it and a later "+
+				"decide is refused 409 amendment_lapsed; a failed stage or failed run stays recoverable). Amendments are "+
+				"surfaced ONE at a time in ascending slice "+
 				"order — decide this one, then re-invoke fishhawk_await_children for the next.",
 			childID, item.ID, amendmentPathList(item), item.Reason, amendmentPollWindowText())
 		return out, true, nil

@@ -1283,8 +1283,10 @@ func TestRunStageEventMessage_ScopeAmendmentPending(t *testing.T) {
 // surfaced message names the amendment id and the requested paths and states
 // the request was never decided, rather than the bare event name the generic
 // fallback would yield. Since #4127 it also pins the recovery as QUALIFIED:
-// decide-then-retry while the stage is failed and the run is live, and the
-// post-lapse recovery (fishhawk_resume_run add_scope_files / retry) otherwise.
+// decide-then-retry while the request is pending (a failed stage or failed
+// run stays recoverable), and the post-lapse recovery (fishhawk_resume_run
+// add_scope_files / retry) once a stage that succeeds, is cancelled or
+// superseded, or a run that succeeds or is cancelled, lapses it.
 //
 // A full emitter-to-relay test is NOT available: the runner and the backend are
 // separate Go modules with no dependency edge in either direction, so nothing
@@ -1307,10 +1309,10 @@ func TestRunStageEventMessage_ScopeAmendmentUndecided(t *testing.T) {
 		"docs/ARCHITECTURE.md (modify)",
 		"x/new.go (create)",
 		"never decided (NOT denied)",
-		// #4127: the decide-then-retry recovery is QUALIFIED by the live-run
-		// condition, and the post-lapse recovery is named.
-		"while the stage is failed and the run is live it stays pending: decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
-		"lapses it",
+		// #4127: the decide-then-retry recovery is QUALIFIED by the lapse
+		// rule, and the post-lapse recovery is named.
+		"it stays pending — a failed stage or failed run stays recoverable: decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
+		"or a run that succeeds or is cancelled, lapses it",
 		"amendment_lapsed",
 		"fishhawk_resume_run add_scope_files naming these paths (category B)",
 		"fishhawk_retry_stage (category C)",

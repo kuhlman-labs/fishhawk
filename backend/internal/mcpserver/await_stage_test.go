@@ -1273,13 +1273,14 @@ func TestAwaitStageToolDescription_NamesAmendmentRelease(t *testing.T) {
 		}
 	}
 	// The late-decision recovery is QUALIFIED, not removed (#4127): it holds
-	// while the stage is failed and the run is live, and a lapse is named with
-	// its 409. Whitespace is collapsed so the description's line wrapping does
+	// unless the stage succeeded, was cancelled or superseded, or the run
+	// succeeded or was cancelled (a failed stage or failed run stays
+	// recoverable), and a lapse is named with its 409. Whitespace is collapsed so the description's line wrapping does
 	// not decide the match.
 	flat := strings.Join(strings.Fields(lower), " ")
 	for _, want := range []string{
-		"a late decision is still honored on a fishhawk_retry_stage of the same stage while the stage is failed and the run is live",
-		"a stage that succeeds, is cancelled or superseded, or a run that ends, lapses it",
+		"a late decision is still honored on a fishhawk_retry_stage of the same stage unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled, which lapses it",
+		"a failed stage or failed run stays recoverable",
 		"amendment_lapsed",
 	} {
 		if !strings.Contains(flat, want) {

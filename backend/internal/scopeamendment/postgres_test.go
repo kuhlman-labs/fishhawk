@@ -513,7 +513,7 @@ func TestPostgres_Lapse_RejectsBadParams(t *testing.T) {
 // TestPostgres_LapseStranded_BackfillIdempotent reproduces the pre-#4127 data
 // shape (stage/run states written with NO hooks installed) and pins the
 // startup backfill: rows on succeeded/cancelled/superseded stages and on a
-// terminal run lapse, a failed stage on a live run and a running stage keep
+// cancelled run lapse, a failed stage on a live run and a running stage keep
 // theirs, the issue's acceptance count reaches 0, and a second pass is a no-op.
 func TestPostgres_LapseStranded_BackfillIdempotent(t *testing.T) {
 	h := newHarness(t)
@@ -541,13 +541,13 @@ func TestPostgres_LapseStranded_BackfillIdempotent(t *testing.T) {
 		setStage(stageID, st.state)
 		rows = append(rows, seeded{h.createOn(t, h.runID, stageID, st.state+".go"), st.trigger})
 	}
-	// Terminal (failed) run: its failed stage's row lapses on the RUN.
+	// Cancelled run: its failed stage's row lapses on the RUN.
 	deadRun, deadStage := h.newRunStage(t)
 	setStage(deadStage, "failed")
-	if _, err := h.pool.Exec(ctx, `UPDATE runs SET state = 'failed' WHERE id = $1`, deadRun); err != nil {
+	if _, err := h.pool.Exec(ctx, `UPDATE runs SET state = 'cancelled' WHERE id = $1`, deadRun); err != nil {
 		t.Fatalf("seed run state: %v", err)
 	}
-	rows = append(rows, seeded{h.createOn(t, deadRun, deadStage, "dead.go"), "run failed"})
+	rows = append(rows, seeded{h.createOn(t, deadRun, deadStage, "dead.go"), "run cancelled"})
 
 	lapser := h.repo.(scopeamendment.Lapser)
 	n, err := lapser.LapseStranded(ctx)
@@ -579,7 +579,7 @@ func TestPostgres_LapseStranded_BackfillIdempotent(t *testing.T) {
 	var stale int
 	if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM scope_amendments sa
 JOIN stages s ON s.id = sa.stage_id JOIN runs r ON r.id = sa.run_id
-WHERE sa.status = 'pending' AND (s.state IN ('succeeded','cancelled','superseded') OR r.state IN ('succeeded','failed','cancelled'))`).Scan(&stale); err != nil {
+WHERE sa.status = 'pending' AND (s.state IN ('succeeded','cancelled','superseded') OR r.state IN ('succeeded','cancelled'))`).Scan(&stale); err != nil {
 		t.Fatalf("acceptance count: %v", err)
 	}
 	if stale != 0 {
@@ -591,6 +591,180 @@ WHERE sa.status = 'pending' AND (s.state IN ('succeeded','cancelled','superseded
 	}
 	if got := len(h.lapsedEntries(t, h.runID)) + len(h.lapsedEntries(t, deadRun)); got != 4 {
 		t.Errorf("lapsed entries after a second pass = %d, want still 4", got)
+	}
+}
+
+// TestPostgres_LapseHooks_FailedRunKeepsPending is the cross-boundary pin of
+// the #4127 option-a ruling: a FAILED run does not lapse its requests, because
+// fishhawk_retry_stage reopens it (server/retry.go, failed → running). It
+// drives the exact path orchestrator.completeRun takes — the implement stage
+// fails, then TransitionRun(run → failed) through the observer
+// InstallLapseHooks installed — and asserts the request is still pending, a
+// late approve lands, and the approved row survives RetryStage (failed →
+// pending) plus the run reopen as the fold source.
+//
+// MECHANISM: with failed back in RunStateLapses the run-terminal observer
+// lapses the row on run → failed, so the "still pending" assertion and the
+// approve go RED.
+func TestPostgres_LapseHooks_FailedRunKeepsPending(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	if l := scopeamendment.InstallLapseHooks(h.runRepo, h.repo, slog.New(slog.NewTextHandler(io.Discard, nil))); l == nil {
+		t.Fatal("InstallLapseHooks returned nil for the postgres repositories")
+	}
+	runID, stageID := h.newRunStage(t)
+	if _, err := h.runRepo.TransitionRun(ctx, runID, run.StateRunning); err != nil {
+		t.Fatalf("run → running: %v", err)
+	}
+	pending := h.createOn(t, runID, stageID, "a.go")
+	h.walk(t, stageID, run.StageStateDispatched, run.StageStateRunning, run.StageStateFailed)
+	// orchestrator.completeRun: a failed stage moves the run to failed.
+	if _, err := h.runRepo.TransitionRun(ctx, runID, run.StateFailed); err != nil {
+		t.Fatalf("run → failed: %v", err)
+	}
+	if got := h.get(t, pending.ID); got.Status != scopeamendment.StatusPending || got.DecidedAt != nil || got.DecisionReason != nil {
+		t.Fatalf("amendment on a failed stage of a FAILED run: status = %q decided_at = %v decision_reason = %v, want still pending (a failed run is recoverable)",
+			got.Status, got.DecidedAt, got.DecisionReason)
+	}
+	if got := h.lapsedEntries(t, runID); len(got) != 0 {
+		t.Errorf("lapsed entries after run → failed = %+v, want none", got)
+	}
+	approved, err := h.repo.Decide(ctx, scopeamendment.DecideParams{
+		ID: pending.ID, Status: scopeamendment.StatusApproved, Reason: "ok", DecidedBy: "github:operator",
+	})
+	if err != nil || approved.Status != scopeamendment.StatusApproved {
+		t.Fatalf("Decide(approve) on a failed run's pending request = (%v, %v), want approved", approved, err)
+	}
+	// The fishhawk_retry_stage path: stage failed → pending, run failed → running.
+	if _, err := h.runRepo.RetryStage(ctx, stageID, run.StageStatePending); err != nil {
+		t.Fatalf("RetryStage(failed → pending): %v", err)
+	}
+	if _, err := h.runRepo.RetryRun(ctx, runID, run.StateRunning); err != nil {
+		t.Fatalf("RetryRun(failed → running): %v", err)
+	}
+	items, err := h.repo.ListByRun(ctx, runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	folded := 0
+	for _, a := range items {
+		if a.ID == pending.ID && a.StageID == stageID && a.Status == scopeamendment.StatusApproved {
+			folded++
+		}
+	}
+	if folded != 1 {
+		t.Errorf("approved rows on the retried stage = %d (items %+v), want 1 (the fold source)", folded, items)
+	}
+}
+
+// TestPostgres_LapseStranded_FailedRunKeepsPending pins the backfill half of
+// the #4127 option-a ruling: a pending row on a failed stage of a FAILED run
+// is not lapsed by LapseStranded, while the same shape on a CANCELLED or
+// SUCCEEDED run is. It also pins that the backfill's SQL run literal set
+// agrees with RunStateLapses, the observer predicate.
+//
+// MECHANISM: with failed back in RunStateLapses the parity assertion goes
+// RED; with 'failed' back in the SQL run literal set the failed run's row
+// lapses and the "still pending" assertion goes RED.
+func TestPostgres_LapseStranded_FailedRunKeepsPending(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	cases := []struct {
+		runState   string
+		wantLapsed bool
+	}{
+		{"failed", false},
+		{"cancelled", true},
+		{"succeeded", true},
+	}
+	seeded := make([]*scopeamendment.Amendment, len(cases))
+	for i, c := range cases {
+		runID, stageID := h.newRunStage(t)
+		if _, err := h.pool.Exec(ctx, `UPDATE stages SET state = 'failed' WHERE id = $1`, stageID); err != nil {
+			t.Fatalf("seed stage state: %v", err)
+		}
+		if _, err := h.pool.Exec(ctx, `UPDATE runs SET state = $2 WHERE id = $1`, runID, c.runState); err != nil {
+			t.Fatalf("seed run state %s: %v", c.runState, err)
+		}
+		seeded[i] = h.createOn(t, runID, stageID, c.runState+".go")
+	}
+	n, err := h.repo.(scopeamendment.Lapser).LapseStranded(ctx)
+	if err != nil {
+		t.Fatalf("LapseStranded: %v", err)
+	}
+	if n != 2 {
+		t.Errorf("LapseStranded = %d, want 2 (the cancelled and succeeded runs only)", n)
+	}
+	for i, c := range cases {
+		if got := scopeamendment.RunStateLapses(c.runState); got != c.wantLapsed {
+			t.Errorf("RunStateLapses(%q) = %v, want %v — the observer predicate (scopeamendment.go RunStateLapses) and the backfill's run literal set "+
+				"(queries.sql + db/queries.sql.go ListStrandedPendingScopeAmendmentStages) must agree", c.runState, got, c.wantLapsed)
+		}
+		got := h.get(t, seeded[i].ID)
+		if c.wantLapsed {
+			assertLapsed(t, got, "run "+c.runState)
+			continue
+		}
+		if got.Status != scopeamendment.StatusPending || got.DecidedAt != nil {
+			t.Errorf("row on a failed stage of a %s run: status = %q decided_at = %v, want still pending", c.runState, got.Status, got.DecidedAt)
+		}
+	}
+}
+
+// TestPostgres_Lapse_AuditAppendFailureRollsBack pins lapse()'s
+// one-transaction contract: a trigger makes the chained
+// scope_amendment_lapsed INSERT fail AFTER the lapse UPDATE matched rows, and
+// both lapse paths must surface the failure with every row still pending and
+// no lapsed entry written.
+//
+// MECHANISM: run the UPDATE on r.pool instead of the transaction and the flip
+// commits on its own — the rows read back lapsed (RED on the read-back, not
+// on the error).
+func TestPostgres_Lapse_AuditAppendFailureRollsBack(t *testing.T) {
+	h := newHarness(t)
+	ctx := context.Background()
+	rows := []*scopeamendment.Amendment{h.create(t), h.create(t)}
+	for _, ddl := range []string{
+		`CREATE FUNCTION fail_lapsed_append() RETURNS trigger LANGUAGE plpgsql AS $$
+		 BEGIN
+		   IF NEW.category = 'scope_amendment_lapsed' THEN
+		     RAISE EXCEPTION 'forced lapsed-append failure';
+		   END IF;
+		   RETURN NEW;
+		 END $$`,
+		`CREATE TRIGGER fail_lapsed_append BEFORE INSERT ON audit_entries
+		   FOR EACH ROW EXECUTE FUNCTION fail_lapsed_append()`,
+	} {
+		if _, err := h.pool.Exec(ctx, ddl); err != nil {
+			t.Fatalf("install failing trigger: %v\n%s", err, ddl)
+		}
+	}
+	lapser := h.repo.(scopeamendment.Lapser)
+	calls := map[string]func() ([]*scopeamendment.Amendment, error){
+		"LapseForStage": func() ([]*scopeamendment.Amendment, error) {
+			return lapser.LapseForStage(ctx, scopeamendment.LapseParams{StageID: h.stageID, Trigger: "stage succeeded", Source: scopeamendment.LapseSourceStageTerminal})
+		},
+		"LapseForRun": func() ([]*scopeamendment.Amendment, error) {
+			return lapser.LapseForRun(ctx, scopeamendment.LapseParams{RunID: h.runID, Trigger: "run cancelled", Source: scopeamendment.LapseSourceRunTerminal})
+		},
+	}
+	for name, call := range calls {
+		lapsed, err := call()
+		if err == nil || !strings.Contains(err.Error(), "forced lapsed-append failure") {
+			t.Fatalf("%s under the failing trigger = (%v, %v), want the forced failure surfaced", name, lapsed, err)
+		}
+		if lapsed != nil {
+			t.Errorf("%s returned rows %+v alongside the error, want nil", name, lapsed)
+		}
+		for _, a := range rows {
+			if got := h.get(t, a.ID); got.Status != scopeamendment.StatusPending || got.DecidedAt != nil || got.DecisionReason != nil {
+				t.Errorf("%s: row %s after the failed append: status = %q decided_at = %v decision_reason = %v, want still pending (the flip must roll back with the entry)",
+					name, a.ID, got.Status, got.DecidedAt, got.DecisionReason)
+			}
+		}
+		if got := h.lapsedEntries(t, h.runID); len(got) != 0 {
+			t.Errorf("%s: lapsed entries after the failed append = %+v, want none", name, got)
+		}
 	}
 }
 
@@ -648,9 +822,11 @@ func bufLogger() (*slog.Logger, *strings.Builder) {
 	return slog.New(slog.NewTextHandler(&buf, &slog.HandlerOptions{Level: slog.LevelDebug})), &buf
 }
 
-// TestLapseOnTerminal_StateFilter pins rule (b): a stage lapses its requests
-// only on succeeded/cancelled/superseded — NOT on failed or a live state —
-// and a run lapses on every terminal state.
+// TestLapseOnTerminal_StateFilter pins rule (b) as narrowed by the #4127
+// option-a ruling: a stage lapses its requests only on
+// succeeded/cancelled/superseded — NOT on failed or a live state — and a run
+// only on succeeded/cancelled — NOT on failed (fishhawk_retry_stage reopens a
+// failed run) or a live state.
 func TestLapseOnTerminal_StateFilter(t *testing.T) {
 	ctx := context.Background()
 	for state, want := range map[string]bool{
@@ -667,7 +843,7 @@ func TestLapseOnTerminal_StateFilter(t *testing.T) {
 		}
 	}
 	for state, want := range map[string]bool{
-		"succeeded": true, "failed": true, "cancelled": true, "running": false, "pending": false,
+		"succeeded": true, "cancelled": true, "failed": false, "running": false, "pending": false,
 	} {
 		f := &fakeLapser{}
 		scopeamendment.LapseOnRunTerminal(ctx, f, nil, uuid.New(), state)
@@ -689,7 +865,7 @@ func TestLapseOnTerminal_LogsErrorsAndCounts(t *testing.T) {
 	logger, buf := bufLogger()
 	failing := &fakeLapser{err: errors.New("db down")}
 	scopeamendment.LapseOnStageTerminal(ctx, failing, logger, stageID, "succeeded")
-	scopeamendment.LapseOnRunTerminal(ctx, failing, logger, runID, "failed")
+	scopeamendment.LapseOnRunTerminal(ctx, failing, logger, runID, "cancelled")
 	out := buf.String()
 	for _, want := range []string{"level=WARN", "stage_id=" + stageID.String(), "run_id=" + runID.String(), "db down", "startup backfill"} {
 		if !strings.Contains(out, want) {

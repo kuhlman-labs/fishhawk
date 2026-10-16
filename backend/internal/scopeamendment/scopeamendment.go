@@ -10,12 +10,12 @@
 //
 // A request still pending when the run can no longer use a decision LAPSES
 // (E83.64 / #4127): its stage reached succeeded, cancelled or superseded, or
-// its run reached a terminal state. fishhawkd's run-repository terminal
+// its run succeeded or was cancelled. fishhawkd's run-repository terminal
 // observers (InstallLapseHooks) and a one-shot startup backfill
 // (BackfillStranded) write it, each lapse with one chained
-// scope_amendment_lapsed audit entry. A stage that FAILS on a live run keeps
-// its requests pending, so a late decision plus fishhawk_retry_stage still
-// folds.
+// scope_amendment_lapsed audit entry. A FAILED stage or a FAILED run keeps
+// its requests pending (fishhawk_retry_stage reopens a failed run), so a late
+// decision plus fishhawk_retry_stage still folds.
 //
 // Mirrors mcptoken's layout: domain types + Repository here,
 // queries.sql + sqlc-generated ./db, postgres.go implementing the
@@ -41,8 +41,8 @@ type Status string
 
 // Statuses. Pending is the creation state; Decide moves a row to
 // approved or denied exactly once; a row still pending when its stage
-// reaches succeeded/cancelled/superseded or its run reaches a terminal
-// state moves to lapsed (#4127). All three are terminal.
+// reaches succeeded/cancelled/superseded or its run reaches
+// succeeded/cancelled moves to lapsed (#4127). All three are terminal.
 const (
 	StatusPending  Status = "pending"
 	StatusApproved Status = "approved"
@@ -177,8 +177,8 @@ type Lapser interface {
 
 // StageStateLapses reports whether a stage reaching state lapses its pending
 // amendments: succeeded, cancelled and superseded do. failed deliberately
-// does NOT: a failed stage on a live run can be re-run with
-// fishhawk_retry_stage, and a late approval folds on that retry.
+// does NOT: a failed stage can be re-run with fishhawk_retry_stage (which
+// reopens a failed run), and a late approval folds on that retry.
 func StageStateLapses(state string) bool {
 	switch run.StageState(state) {
 	case run.StageStateSucceeded, run.StageStateCancelled, run.StageStateSuperseded:
@@ -189,9 +189,17 @@ func StageStateLapses(state string) bool {
 }
 
 // RunStateLapses reports whether a run reaching state lapses every pending
-// amendment on every one of its stages: every terminal run state does.
+// amendment on every one of its stages: succeeded and cancelled do. failed
+// deliberately does NOT: fishhawk_retry_stage reopens a failed run
+// (server/retry.go, failed → running), so a late approval still folds on that
+// retry.
 func RunStateLapses(state string) bool {
-	return run.State(state).IsTerminal()
+	switch run.State(state) {
+	case run.StateSucceeded, run.StateCancelled:
+		return true
+	default:
+		return false
+	}
 }
 
 // lapseTimeout bounds one observer-driven lapse transaction.

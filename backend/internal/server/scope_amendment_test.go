@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strconv"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
@@ -1640,5 +1644,82 @@ func TestListScopeAmendments_LapsedNotPresentedAsPending(t *testing.T) {
 	}
 	if item := list.Items[0]; item.EffectiveScopeFilesAfterApproval != nil || item.MaxFilesChanged != nil || item.DecidedBy != nil {
 		t.Errorf("lapsed item = %+v, want no headroom fields and no decided_by", item)
+	}
+}
+
+// TestDecideScopeAmendment_FailedRunApprove200 (#4127 option-a ruling): on a
+// run in state failed — reached through the postgres run repository with the
+// lapse hooks fishhawkd installs, the path orchestrator.completeRun takes —
+// POST decide approve answers 200, not 409 amendment_lapsed:
+// fishhawk_retry_stage reopens a failed run, so its requests stay decidable.
+//
+// MECHANISM: with failed back in scopeamendment.RunStateLapses the
+// run-terminal observer lapses the request on run → failed and the decide
+// answers 409 amendment_lapsed (RED).
+func TestDecideScopeAmendment_FailedRunApprove200(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+	runRepo := run.NewPostgresRepository(pool)
+	amendRepo := scopeamendment.NewPostgresRepository(pool)
+	if l := scopeamendment.InstallLapseHooks(runRepo, amendRepo, slog.New(slog.NewTextHandler(io.Discard, nil))); l == nil {
+		t.Fatal("InstallLapseHooks returned nil for the postgres repositories")
+	}
+	runRow, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: runRow.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	if _, err := runRepo.TransitionRun(ctx, runRow.ID, run.StateRunning); err != nil {
+		t.Fatalf("run → running: %v", err)
+	}
+	a, err := amendRepo.Create(ctx, scopeamendment.CreateParams{
+		RunID: runRow.ID, StageID: stage.ID, Reason: "needed",
+		Paths: []scopeamendment.PathEntry{{Path: "backend/internal/server/extra.go", Operation: scopeamendment.OperationModify}},
+	})
+	if err != nil {
+		t.Fatalf("create amendment: %v", err)
+	}
+	cat, reason := run.FailureB, "scope"
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateFailed} {
+		var completion *run.StageCompletion
+		if to == run.StageStateFailed {
+			completion = &run.StageCompletion{FailureCategory: &cat, FailureReason: &reason}
+		}
+		if _, err := runRepo.TransitionStage(ctx, stage.ID, to, completion); err != nil {
+			t.Fatalf("stage → %s: %v", to, err)
+		}
+	}
+	if _, err := runRepo.TransitionRun(ctx, runRow.ID, run.StateFailed); err != nil {
+		t.Fatalf("run → failed: %v", err)
+	}
+
+	s := New(Config{
+		Addr:               "127.0.0.1:0",
+		RunRepo:            runRepo,
+		ScopeAmendmentRepo: amendRepo,
+		AuditRepo:          audit.NewPostgresRepository(pool),
+	})
+	w := postDecision(t, s, runRow.ID, a.ID, `{"decision":"approve","reason":"late but valid"}`,
+		func(r *http.Request) *http.Request { return withOperatorIdentity(r, "write:stages") })
+	if w.Code != http.StatusOK {
+		t.Fatalf("approve on a failed run's pending request: status = %d, want 200 (a failed run is recoverable); body = %s", w.Code, w.Body.String())
+	}
+	var resp scopeAmendmentResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v; body = %s", err, w.Body.String())
+	}
+	if resp.Status != string(scopeamendment.StatusApproved) {
+		t.Errorf("response status = %q, want approved", resp.Status)
+	}
+	got, err := amendRepo.GetByID(ctx, a.ID)
+	if err != nil || got.Status != scopeamendment.StatusApproved {
+		t.Errorf("row after the approve = (%+v, %v), want approved", got, err)
 	}
 }

@@ -671,15 +671,17 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 		switch {
 		case errors.Is(err, scopeamendment.ErrLapsed):
 			// #4127: the request lapsed undecided (its stage succeeded, was
-			// cancelled or superseded, or its run ended). Never approvable;
-			// no scope_amendment_decided entry is written. The pre-read row
-			// can predate the lapse (an observer committing between the read
-			// and the decide), so the details come from a fresh read.
+			// cancelled or superseded, or its run succeeded or was cancelled).
+			// Never approvable; no scope_amendment_decided entry is written.
+			// The pre-read row can predate the lapse (an observer committing
+			// between the read and the decide), so the details come from a
+			// fresh read.
 			if cur, gerr := s.cfg.ScopeAmendmentRepo.GetByID(r.Context(), amendmentID); gerr == nil {
 				existing = cur
 			}
 			s.writeError(w, r, http.StatusConflict, "amendment_lapsed",
-				"this scope amendment lapsed undecided (its stage succeeded, was cancelled or superseded, or its run ended); "+
+				"this scope amendment lapsed undecided (its stage succeeded, was cancelled or superseded, or its run succeeded "+
+					"or was cancelled); "+
 					"a lapsed request can never be approved or denied — recover with fishhawk_resume_run add_scope_files naming its paths "+
 					"(category B) or fishhawk_retry_stage (category C), on which the agent may re-request",
 				map[string]any{

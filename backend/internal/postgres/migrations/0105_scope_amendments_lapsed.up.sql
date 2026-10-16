@@ -2,10 +2,11 @@
 --
 -- lapsed = the request was still undecided (`pending`) when the run could no
 -- longer use a decision: its stage reached succeeded, cancelled or
--- superseded, or its run reached a terminal state (succeeded, failed,
--- cancelled). A stage that FAILS on a still-live run does NOT lapse its
--- requests: they stay pending so a late decision plus fishhawk_retry_stage
--- still folds the paths. A lapsed row is never approvable; Decide refuses it.
+-- superseded, or its run reached succeeded or cancelled. A stage that FAILS,
+-- or a run that FAILS (fishhawk_retry_stage reopens a failed run), does NOT
+-- lapse its requests: they stay pending so a late decision plus
+-- fishhawk_retry_stage still folds the paths. A lapsed row is never
+-- approvable; Decide refuses it.
 --
 -- Rows are written to `lapsed` ONLY by fishhawkd (the run repository's
 -- post-commit terminal observers and the one-shot startup backfill), never by
