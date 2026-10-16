@@ -1282,7 +1282,9 @@ func TestRunStageEventMessage_ScopeAmendmentPending(t *testing.T) {
 // amendments:[{amendment_id, paths:[{path, operation}]}]} — and asserts the
 // surfaced message names the amendment id and the requested paths and states
 // the request was never decided, rather than the bare event name the generic
-// fallback would yield.
+// fallback would yield. Since #4127 it also pins the recovery as QUALIFIED:
+// decide-then-retry while the stage is failed and the run is live, and the
+// post-lapse recovery (fishhawk_resume_run add_scope_files / retry) otherwise.
 //
 // A full emitter-to-relay test is NOT available: the runner and the backend are
 // separate Go modules with no dependency edge in either direction, so nothing
@@ -1305,12 +1307,22 @@ func TestRunStageEventMessage_ScopeAmendmentUndecided(t *testing.T) {
 		"docs/ARCHITECTURE.md (modify)",
 		"x/new.go (create)",
 		"never decided (NOT denied)",
-		"fishhawk_decide_scope_amendment",
-		"fishhawk_retry_stage",
+		// #4127: the decide-then-retry recovery is QUALIFIED by the live-run
+		// condition, and the post-lapse recovery is named.
+		"while the stage is failed and the run is live it stays pending: decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
+		"lapses it",
+		"amendment_lapsed",
+		"fishhawk_resume_run add_scope_files naming these paths (category B)",
+		"fishhawk_retry_stage (category C)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("message = %q, want it to contain %q", got, want)
 		}
+	}
+	// The pre-#4127 UNQUALIFIED recovery clause must be gone: it promised the
+	// decision was landable regardless of what happened to the stage or run.
+	if strings.Contains(got, "(NOT denied); decide it with") {
+		t.Errorf("message = %q still carries the unqualified decide-then-retry recovery", got)
 	}
 }
 

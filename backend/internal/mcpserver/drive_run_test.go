@@ -766,6 +766,105 @@ func TestDriveRun_ScopeAmendmentPending_Decision(t *testing.T) {
 	}
 }
 
+// --- (f1) a LAPSED scope amendment is resolved, not a decision (#4127) -----
+
+// lapsedAmendmentDriveFake builds a running run the server PARKED on a failed
+// acceptance stage (#4356) — a fixture whose only stop AFTER the amendment
+// check (b) is acceptance_stage_failed — and seeds the given amendment audit
+// categories. The (b) check runs first, so the stopped_reason discriminates
+// whether the drive counted an amendment as pending.
+func lapsedAmendmentDriveFake(categories ...string) *driveFakeBackend {
+	accID := uuid.NewSHA1(uuid.Nil, []byte("acceptance")).String()
+	acc := stg(accID, "acceptance", "failed", 2)
+	cat := "C"
+	acc.FailureCategory = &cat
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		stg(driveImplID, "implement", "succeeded", 1),
+		acc,
+		stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "pending", 3),
+	})
+	for _, c := range categories {
+		f.seq++
+		f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: c, Payload: map[string]any{}})
+	}
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	return f
+}
+
+// TestDriveRun_LapsedScopeAmendmentIsNotADecision pins the #4127 pending count:
+// a scope_amendment_lapsed entry RESOLVES its request like a decided one, so a
+// run carrying one requested + one lapsed entry (zero decided) does NOT stop on
+// decision_required:scope_amendment_requested — a lapsed row can never be
+// decided (409 amendment_lapsed), so that stop could never clear. A second
+// still-undecided request beside the lapsed one still stops on the decision.
+//
+// MECHANISM: with the lapsed term removed from driveScopeAmendmentPending,
+// 1 requested > 0 decided reads as pending and the drive stops on the decision
+// instead of reaching the acceptance_stage_failed stop.
+func TestDriveRun_LapsedScopeAmendmentIsNotADecision(t *testing.T) {
+	t.Run("requested_plus_lapsed_is_resolved", func(t *testing.T) {
+		f := lapsedAmendmentDriveFake("scope_amendment_requested", "scope_amendment_lapsed")
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveMaxWallclock = 300 * time.Millisecond
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != stoppedAcceptanceStageFailed {
+			t.Fatalf("stopped_reason = %q, want %q (a lapsed request is not a pending decision)", out.StoppedReason, stoppedAcceptanceStageFailed)
+		}
+	})
+	t.Run("second_undecided_request_still_stops", func(t *testing.T) {
+		f := lapsedAmendmentDriveFake("scope_amendment_requested", "scope_amendment_lapsed", "scope_amendment_requested")
+		rec := &spawnRecorder{}
+		r, srv := newDriveResolver(t, f, rec)
+		defer srv.Close()
+		r.driveMaxWallclock = 300 * time.Millisecond
+
+		_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+		if err != nil {
+			t.Fatalf("driveRun: %v", err)
+		}
+		if out.StoppedReason != "decision_required:scope_amendment_requested" {
+			t.Fatalf("stopped_reason = %q, want decision_required:scope_amendment_requested (one request is still undecided)", out.StoppedReason)
+		}
+	})
+}
+
+// TestDriveRun_LapsedAmendmentReadError_FailsClosed pins the fail-closed arm of
+// the #4127 lapsed read: the requested and decided reads succeed but the
+// scope_amendment_lapsed read errors, so the drive cannot confirm no amendment
+// is parked. It must HALT with amendment_check_failed and spawn nothing — not
+// fall through to dispatch the pending plan stage.
+func TestDriveRun_LapsedAmendmentReadError_FailsClosed(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "pending", 0), // dispatchable — a fail-open would spawn this
+		stg(driveImplID, "implement", "blocked", 1),
+	})
+	f.seq++
+	f.audit = append(f.audit, AuditEntry{ID: uuid.New().String(), Sequence: f.seq, RunID: f.runID.String(), Category: "scope_amendment_requested", Payload: map[string]any{}})
+	f.auditErrCategory = "scope_amendment_lapsed"
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedAmendmentCheckFailed {
+		t.Fatalf("stopped_reason = %q, want %q", out.StoppedReason, stoppedAmendmentCheckFailed)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v past an unreadable lapsed-amendment state, want nothing", got)
+	}
+}
+
 // --- (f2) scope-amendment poll ERROR -> fail-closed, never dispatch ---------
 
 func TestDriveRun_ScopeAmendmentCheckError_FailsClosed(t *testing.T) {
