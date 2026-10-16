@@ -374,7 +374,8 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 
 	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
 	defer cancel()
-	r, err := newClient(cf).StartRun(ctx, in)
+	client := newClient(cf)
+	r, err := client.StartRun(ctx, in)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk run start: %v\n", err)
 		return exitFailure
@@ -385,7 +386,7 @@ func runStart(args []string, stdout, stderr io.Writer) int {
 	// or edit the sticky status comment. Best-effort; nil-safe when
 	// not applicable.
 	if r.RunnerKind == "local" && r.IssueContext != nil {
-		if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+		if err := postOrEditStatusComment(*cf.backendURL, client.Token, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
 			_, _ = fmt.Fprintf(stderr, "fishhawk: comment on issue #%d failed: %v\n", r.IssueContext.Number, err)
 		}
 	}
@@ -496,7 +497,8 @@ func runCancel(args []string, stdout, stderr io.Writer) int {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
 	defer cancel()
-	r, err := newClient(cf).CancelRun(ctx, id)
+	client := newClient(cf)
+	r, err := client.CancelRun(ctx, id)
 	if err != nil {
 		_, _ = fmt.Fprintf(stderr, "fishhawk run cancel: %v\n", err)
 		return exitOnAPIError(err)
@@ -505,7 +507,7 @@ func runCancel(args []string, stdout, stderr io.Writer) int {
 
 	// #428: sticky status comment for local-runner issue-triggered runs.
 	if r.RunnerKind == "local" && r.IssueContext != nil {
-		if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+		if err := postOrEditStatusComment(*cf.backendURL, client.Token, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
 			_, _ = fmt.Fprintf(stderr, "fishhawk: comment on issue #%d failed: %v\n", r.IssueContext.Number, err)
 		}
 	}

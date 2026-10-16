@@ -395,7 +395,7 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 			_, _ = fmt.Fprintf(stderr, "fishhawk runner start: auto-PR warning: %v\n", autoErr)
 		} else {
 			if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil && r.RunnerKind == "local" && r.IssueContext != nil {
-				if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+				if err := postOrEditStatusComment(*cf.backendURL, client.Token, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
 					_, _ = fmt.Fprintf(stderr, "fishhawk runner start: comment on issue #%d: %v\n", r.IssueContext.Number, err)
 				}
 			}
@@ -406,7 +406,7 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		defer clientCancel()
 		client := runnerNewClient(cf)
 		if r := fetchRunForComment(clientCtx, client, parsedRunID); r != nil && r.RunnerKind == "local" && r.IssueContext != nil {
-			if err := postOrEditStatusComment(*cf.backendURL, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
+			if err := postOrEditStatusComment(*cf.backendURL, client.Token, r.ID.String(), r.Repo, r.IssueContext.Number); err != nil && !errors.Is(err, ghcomment.ErrGhNotInstalled) {
 				_, _ = fmt.Fprintf(stderr, "fishhawk runner start: comment on issue #%d: %v\n", r.IssueContext.Number, err)
 			}
 		}
