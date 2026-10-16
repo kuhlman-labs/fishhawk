@@ -1,0 +1,14 @@
+id: scenario:issue-4142/ops-probe-unobservable-is-unknown
+statement: '`fishhawkd ops-probe --deployment local --ops-monitor-gocache-dir <a path that does not exist>` reports the gocache probe as unknown with a reason, never ok, and without --db reports the postgres and runners probes as unknown rather than ok.'
+verify_hint: CLI stdout of the branch's fishhawkd `ops-probe --json` with a nonexistent gocache dir and no --db; check the gocache, postgres and runners statuses.
+steps: Ran /tmp/fhacc4142/fishhawkd ops-probe --deployment local --ops-monitor-gocache-dir /tmp/fhacc4142/does-not-exist --json with no --db, using fishhawkd built from the sanctioned checkout.
+assertions:
+    expected: gocache unknown with a reason; postgres and runners unknown, never ok
+    observed_at_record: 'gocache: status unknown, reason ''GOCACHE root is missing or not a directory''. postgres: unknown, ''no database configured''. runners: unknown, ''no database configured''. None of them reports ok. Exit 1 because the docker probe fails in the sandbox.'
+    repro_handle: fishhawkd ops-probe --deployment local --ops-monitor-gocache-dir /nonexistent --json
+origin:
+    issue: 4142
+    pr: 0
+    run_id: ae93140a-b2e6-4fe8-b723-21a20ca9e5ad
+    head_sha: 738a648c0a728ddde5eb20c16ae90d3a949778e1
+    recorded_at: 2026-10-16T03:37:04Z

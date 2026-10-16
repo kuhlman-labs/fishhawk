@@ -1,0 +1,14 @@
+id: scenario:issue-4142/ops-probe-nonlocal-not-applicable
+statement: Running the branch's fishhawkd binary as `fishhawkd ops-probe --deployment kubernetes` exits 0 and its stdout reports the disk, gocache, load, docker and runners probes each as not_applicable, with no host probe reported ok.
+verify_hint: 'CLI stdout/exit code: build or run the branch''s fishhawkd (the acceptance preview build, or `go build ./backend/cmd/fishhawkd` from the worktree), run `ops-probe --deployment kubernetes --json`, read the status per probe and the exit code.'
+steps: 'Built fishhawkd from the sanctioned checkout (HEAD 738a648c = preview git_sha): cd backend && go build -o /tmp/fhacc4142/fishhawkd ./cmd/fishhawkd. Ran /tmp/fhacc4142/fishhawkd ops-probe --deployment kubernetes --json and recorded the exit code. Also ran the --ops-monitor-deployment kubernetes spelling in text mode.'
+assertions:
+    expected: exit 0; disk, gocache, load, docker and runners not_applicable; no host probe ok
+    observed_at_record: 'exit 0. disk, gocache, load, docker and runners each report status not_applicable with reason ''host-local probe skipped: deployment is kubernetes''. postgres reports unknown (''no database configured''). No probe reports ok. The alias spelling gives identical results, exit 0.'
+    repro_handle: fishhawkd ops-probe --deployment kubernetes --json
+origin:
+    issue: 4142
+    pr: 0
+    run_id: ae93140a-b2e6-4fe8-b723-21a20ca9e5ad
+    head_sha: 738a648c0a728ddde5eb20c16ae90d3a949778e1
+    recorded_at: 2026-10-16T03:37:04Z

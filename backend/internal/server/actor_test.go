@@ -44,6 +44,9 @@ func TestActorKindForSubject(t *testing.T) {
 		{"anonymous fallback is user", "anonymous", audit.ActorUser},
 		{"mcp run-bound subject is user", "mcp:run:00000000-0000-0000-0000-000000000001", audit.ActorUser},
 		{"bare operator-agent without slash is user", "operator-agent", audit.ActorUser},
+		{"first-officer run seat is agent", "first_officer/run/6f1c2a52-6a0e-4b8a-9d0c-1f2e3d4c5b6a", audit.ActorAgent},
+		{"first-officer campaign seat is agent", "first_officer/campaign/6f1c2a52-6a0e-4b8a-9d0c-1f2e3d4c5b6a", audit.ActorAgent},
+		{"malformed first-officer subject is agent", "first_officer/bogus", audit.ActorAgent},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -51,5 +54,28 @@ func TestActorKindForSubject(t *testing.T) {
 				t.Errorf("actorKindForSubject(%q) = %q, want %q", tc.subject, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestIsAgentSubject_FirstOfficerSeat pins the seat rows of the shared agent
+// classification (E85.6 / #4148): the captain verbs, the human-only
+// server-check clearing guard and the re-run refusal all treat a seat as an
+// agent. Counterfactual run by hand: removing the firstofficer.IsSeatSubject
+// term from isAgentSubject turned this test RED on every seat row.
+func TestIsAgentSubject_FirstOfficerSeat(t *testing.T) {
+	cases := []struct {
+		subject string
+		want    bool
+	}{
+		{"first_officer/run/6f1c2a52-6a0e-4b8a-9d0c-1f2e3d4c5b6a", true},
+		{"first_officer/campaign/6f1c2a52-6a0e-4b8a-9d0c-1f2e3d4c5b6a", true},
+		{"first_officer/not-a-valid-seat", true},
+		{"github:first_officer", false},
+		{"first_officer", false},
+	}
+	for _, tc := range cases {
+		if got := isAgentSubject(tc.subject); got != tc.want {
+			t.Errorf("isAgentSubject(%q) = %v, want %v", tc.subject, got, tc.want)
+		}
 	}
 }

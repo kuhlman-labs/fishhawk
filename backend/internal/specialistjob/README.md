@@ -28,7 +28,7 @@ SHA, so each handler scopes by the caller's account through the store
 
 | Route | Scope | Notes |
 |---|---|---|
-| `POST /v0/specialist-jobs` | `write:stages` only | 64 KiB cap (`413 request_too_large`). Run-bound token → `403 specialist_job_requester_not_a_seat`. Subject run / campaign outside the caller's account → `404 run_not_found` / `campaign_not_found`. `draft` → `201 completed`; else `201 queued`. A runner credential (`attest:specialist-jobs` only) can never request a job. |
+| `POST /v0/specialist-jobs` | `write:stages`, or `request:specialist_jobs` (`RequestScope`) from a first-officer seat ONLY | 64 KiB cap (`413 request_too_large`). Run-bound token → `403 specialist_job_requester_not_a_seat`. A non-seat token holding only `request:specialist_jobs` → `403 insufficient_scope`. A seat's subject must lie inside its seat (`subject.campaign_id` = a campaign seat's own campaign, `subject.run_id` a run inside the seat; a subject naming neither) or `403 first_officer_subject_out_of_seat`, before any store call; a seat-membership read failure → `503`. Subject run / campaign outside the caller's account → `404 run_not_found` / `campaign_not_found`. `draft` → `201 completed`; else `201 queued`. A runner credential (`attest:specialist-jobs` only) can never request a job. |
 | `GET /v0/specialist-jobs/{job_id}` | `read:runs` or `attest:specialist-jobs` | Never renders `execution_nonce`. Advisory `stale`. `provenance` (completed jobs only) and `blocking_eligible`. |
 | `POST .../{job_id}/admission` | `write:stages` or `attest:specialist-jobs` | `{host, nonce}`; admit / heartbeat / stale takeover. `409 specialist_job_not_admissible` / `specialist_job_already_running`. An attester's admission that moves the job to running carries `attestation_key` + `attestation_expires_at`, once. |
 | `POST .../{job_id}/result` | `write:stages` or `attest:specialist-jobs` | 256 KiB cap. Parsed against the STORED kind (`400`, `details.reason: kind_mismatch`). `409 specialist_job_not_running` / `specialist_job_nonce_mismatch`. Optional `X-Fishhawk-Signature`; a refused signature is `401 specialist_job_attestation_invalid` with `details.reason`. |
@@ -41,10 +41,14 @@ holding neither scope is `403 insufficient_scope`.
 
 **Requester.** Server-derived from the authenticated identity, never read from
 the body (the closed request def refuses a `requester` member):
-`seat: operator` (no first-officer identity exists yet; E85.6 adds the
-derivation branch, request scope tracked in #4148), `actor_kind` from the token
-subject (`actorKindForSubject`: an operator-agent token is `agent`, every other
-identity `user`), `subject` = the identity subject.
+`seat: first_officer` for a first-officer seat identity (a `first_officer/`
+token subject, E85.6 / #4148; contract: `backend/internal/firstofficer/README.md`),
+`seat: operator` for every other identity; `actor_kind` from the token subject
+(`actorKindForSubject`: an operator-agent token or a first-officer seat is
+`agent`, every other identity `user`), `subject` = the identity subject. A seat
+is charged to its anchor's account (the seat identity hook stamps it). A seat
+holds no `write:stages` and no attest scope, so admission and result refuse it
+`403 insufficient_scope`.
 
 **Draft** is a model-free template render at request time (`RenderDraft`); it
 writes only its `specialist_job_requested` + `specialist_job_completed` rows

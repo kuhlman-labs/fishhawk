@@ -1,0 +1,14 @@
+id: scenario:issue-4142/ops-probe-disk-failing-has-remedy
+statement: '`fishhawkd ops-probe --deployment local --ops-monitor-disk-path <an existing directory> --ops-monitor-disk-min-free-gb 1000000000` exits 1 and its stdout carries a failing disk result whose condition is disk_free_low and whose remedy is non-empty.'
+verify_hint: CLI stdout/exit code of the branch's fishhawkd `ops-probe` with an impossible free-space threshold; check exit code 1, status failing, condition disk_free_low, remedy present.
+steps: Ran /tmp/fhacc4142/fishhawkd ops-probe --deployment local --ops-monitor-disk-path /tmp/fhacc4142/diskdir (an existing directory) --ops-monitor-disk-min-free-gb 1000000000 --json, using fishhawkd built from the sanctioned checkout.
+assertions:
+    expected: exit 1, failing disk result, condition disk_free_low, non-empty remedy
+    observed_at_record: 'exit 1. The disk entry has status failing, condition disk_free_low, observed ''598.4 GiB free of 926.4 GiB'', threshold ''>= 1000000000.0 GiB free'' and remedy ''Free space on the data volume: run `scripts/dev sweep` and `scripts/dev gocache --trim`, prune unused Docker images and volumes, and remove stale run worktrees.'''
+    repro_handle: fishhawkd ops-probe --deployment local --ops-monitor-disk-path /tmp --ops-monitor-disk-min-free-gb 1000000000 --json
+origin:
+    issue: 4142
+    pr: 0
+    run_id: ae93140a-b2e6-4fe8-b723-21a20ca9e5ad
+    head_sha: 738a648c0a728ddde5eb20c16ae90d3a949778e1
+    recorded_at: 2026-10-16T03:37:04Z

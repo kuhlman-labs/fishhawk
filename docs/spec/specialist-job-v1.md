@@ -115,12 +115,12 @@ Contract of record: `docs/api/v0.openapi.yaml`.
 
 | Route | Scope | Purpose |
 |---|---|---|
-| POST `/v0/specialist-jobs` | `write:stages`, non-run-bound identity | file a request; `draft` answers 201 completed, other kinds 201 queued |
+| POST `/v0/specialist-jobs` | `write:stages` from a non-run-bound identity, or `request:specialist_jobs` from a first-officer seat only | file a request; `draft` answers 201 completed, other kinds 201 queued. A seat's subject must lie inside its seat (403 `first_officer_subject_out_of_seat`) and records `requester.seat: first_officer` |
 | GET `/v0/specialist-jobs/{job_id}` | `read:runs` or `attest:specialist-jobs`, own account | job state, inputs, verdict, result, derived `stale`, `provenance` and `blocking_eligible` when completed; NEVER returns `execution_nonce` |
 | POST `/v0/specialist-jobs/{job_id}/admission` | `write:stages` or `attest:specialist-jobs` | admit-or-queue, heartbeat with the same nonce, stale-running takeover under a new nonce; an attester's admission to running also delivers the attestation key once |
 | POST `/v0/specialist-jobs/{job_id}/result` | `write:stages` or `attest:specialist-jobs` | ship the completion, optionally signed (`X-Fishhawk-Signature`); touches only `specialist_jobs` and the audit chain |
 
-A cookie session keeps `requireWriteScope`'s posture on all three routes: scopes are checked only for an explicit API token. `attest:specialist-jobs` never satisfies POST `/v0/specialist-jobs`, so a runner credential cannot file a job.
+A cookie session keeps `requireWriteScope`'s posture on all three routes: scopes are checked only for an explicit API token. `attest:specialist-jobs` never satisfies POST `/v0/specialist-jobs`, so a runner credential cannot file a job. `request:specialist_jobs` is honored only for a first-officer seat (a `first_officer/campaign/<uuid>` or `first_officer/run/<uuid>` token subject, E85.6 / #4148); a non-seat token holding only it is 403 `insufficient_scope`, and a seat can never admit or ship a result (it holds neither `write:stages` nor the attest scope).
 
 ## Audit payloads
 

@@ -24,8 +24,11 @@ import (
 //
 // A crew `finding` is ADVISORY: it lives in crew_messages, never in
 // review_concerns, so it is structurally absent from ConcernRepo.ListOpenByRun
-// — the merge gate's open-concern source. This route is the captain's
-// explicit promotion: after it, the EXISTING concern_ids fix-up routing makes
+// — the merge gate's open-concern source. The one exception is a blocking
+// first-officer finding, which the send handler converts automatically
+// (insert-then-dispose, provenance first_officer; first_officer_gate.go,
+// E85.6 / #4148) through the same mintCrewFindingConcern core this route
+// uses. This route is the captain's explicit promotion: after it, the EXISTING concern_ids fix-up routing makes
 // the concern binding with no change. Long-form contract: this package's
 // README ("Crew messages" -> "Finding conversion").
 
@@ -74,12 +77,17 @@ type crewConvertedConcern struct {
 }
 
 // crewFindingConvertedPayload is the crew_finding_converted payload.
+// Provenance and BlockingBasis are set ONLY on the automatic conversion of a
+// blocking first-officer finding (E85.6 / #4148); a captain's conversion
+// leaves both absent, byte-identical to E77.7.
 type crewFindingConvertedPayload struct {
-	SentSequence        int64  `json:"sent_sequence"`
-	DispositionSequence *int64 `json:"disposition_sequence,omitempty"`
-	ConcernID           string `json:"concern_id"`
-	StageKind           string `json:"stage_kind"`
-	Severity            string `json:"severity"`
+	SentSequence        int64                      `json:"sent_sequence"`
+	DispositionSequence *int64                     `json:"disposition_sequence,omitempty"`
+	ConcernID           string                     `json:"concern_id"`
+	StageKind           string                     `json:"stage_kind"`
+	Severity            string                     `json:"severity"`
+	Provenance          string                     `json:"provenance,omitempty"`
+	BlockingBasis       *firstOfficerBlockingBasis `json:"blocking_basis,omitempty"`
 }
 
 // crewFindingConvertFailedPayload is the crew_finding_convert_failed payload.
@@ -241,21 +249,12 @@ func (s *Server) handleConvertCrewFindingToConcern(w http.ResponseWriter, r *htt
 		return
 	}
 
-	// (4) THEN the concern.
-	minted, err := s.cfg.ConcernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
-		RunID:                runID,
-		StageID:              stage.ID,
-		StageKind:            stageKind,
-		OriginReviewSequence: seq,
-		Concerns: []concern.RaisedConcern{{
-			Severity: severity,
-			Category: crewConvertedConcernCategory,
-			Note:     crewConvertedNote(msg, seq),
-		}},
+	// (4) THEN the concern, through the conversion core the automatic
+	// first-officer conversion shares (first_officer_gate.go). A captain's
+	// conversion carries no provenance: it is an ordinary concern.
+	c, err := s.mintCrewFindingConcern(ctx, crewConcernMint{
+		RunID: runID, Stage: stage, StageKind: stageKind, Sequence: seq, Msg: msg, Severity: severity,
 	})
-	if err == nil && len(minted) != 1 {
-		err = errors.New("concern insert returned no row")
-	}
 	if err != nil {
 		s.appendCrewConvertAudit(ctx, runID, stage.ID, CategoryCrewFindingConvertFailed, crewFindingConvertFailedPayload{
 			SentSequence:        seq,
@@ -269,7 +268,6 @@ func (s *Server) handleConvertCrewFindingToConcern(w http.ResponseWriter, r *htt
 			map[string]any{"sent_sequence": seq})
 		return
 	}
-	c := minted[0]
 	s.appendCrewConvertAudit(ctx, runID, stage.ID, CategoryCrewFindingConverted, crewFindingConvertedPayload{
 		SentSequence:        seq,
 		DispositionSequence: disposed.DispositionSequence,

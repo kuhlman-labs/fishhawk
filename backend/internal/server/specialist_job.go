@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/firstofficer"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
@@ -314,24 +315,46 @@ func (s *Server) writeSpecialistJobStoreError(w http.ResponseWriter, r *http.Req
 
 // handleRequestSpecialistJob implements POST /v0/specialist-jobs.
 //
-// Auth: write:stages, from a SEAT identity. A run-bound (mcp:run:<uuid>)
-// token is refused specialist_job_requester_not_a_seat even when it carries
-// write:stages: a job is requested by the operator (or, after E85.6, the
-// first officer), never by an agent inside a run. The requester is derived
-// from the authenticated identity and is NEVER read from the body (the
+// Auth: write:stages from an operator seat identity, or
+// specialistjob.RequestScope from a first-officer seat identity (E85.6 /
+// #4148) — the narrow scope is honored ONLY for a first_officer/ subject, so a
+// non-seat token holding only it is 403 insufficient_scope. A run-bound
+// (mcp:run:<uuid>) token is refused specialist_job_requester_not_a_seat even
+// when it carries write:stages: a job is requested by the operator or the
+// first officer, never by an agent inside a run. A first-officer request is
+// confined to its seat: subject.campaign_id must be a campaign seat's own
+// campaign and subject.run_id a run inside the seat (firstOfficerRunInSeat); a
+// subject naming neither is refused before any store call. The requester is
+// derived from the authenticated identity and is NEVER read from the body (the
 // closed request schema refuses a requester member).
 func (s *Server) handleRequestSpecialistJob(w http.ResponseWriter, r *http.Request) {
 	if !s.specialistJobsConfigured(w, r) {
 		return
 	}
-	if !s.requireWriteScope(w, r, "write:stages") {
-		return
-	}
 	id := IdentityFrom(r.Context())
-	if strings.HasPrefix(id.Subject, "mcp:run:") {
-		s.writeError(w, r, http.StatusForbidden, "specialist_job_requester_not_a_seat",
-			"a run-bound token cannot request a specialist job; request it from an operator identity", nil)
-		return
+	isSeat := firstofficer.IsSeatSubject(id.Subject)
+	seatKind := specialistjob.SeatOperator
+	var anchor firstofficer.Anchor
+	if isSeat {
+		if !s.requireWriteScope(w, r, specialistjob.RequestScope) {
+			return
+		}
+		a, ok := firstOfficerSeatOf(id)
+		if !ok {
+			s.writeError(w, r, http.StatusUnauthorized, "first_officer_seat_invalid",
+				"the token subject carries the first-officer prefix but is not a valid seat subject", nil)
+			return
+		}
+		anchor, seatKind = a, specialistjob.SeatFirstOfficer
+	} else {
+		if !s.requireWriteScope(w, r, "write:stages") {
+			return
+		}
+		if strings.HasPrefix(id.Subject, "mcp:run:") {
+			s.writeError(w, r, http.StatusForbidden, "specialist_job_requester_not_a_seat",
+				"a run-bound token cannot request a specialist job; request it from an operator identity", nil)
+			return
+		}
 	}
 	acct, ok := s.callerAccountUUID(w, r)
 	if !ok {
@@ -347,11 +370,14 @@ func (s *Server) handleRequestSpecialistJob(w http.ResponseWriter, r *http.Reque
 			"specialist-job request is invalid", specialistJobParseDetails(err))
 		return
 	}
+	if isSeat && !s.specialistJobSubjectInSeat(w, r, anchor, req.Subject) {
+		return
+	}
 	if req.Subject.CampaignID != "" && !s.specialistJobCampaignVisible(w, r, req.Subject.CampaignID, id.AccountID) {
 		return
 	}
 	requester := specialistjob.Requester{
-		Seat: specialistjob.SeatOperator, ActorKind: string(actorKindForSubject(id.Subject)), Subject: id.Subject,
+		Seat: seatKind, ActorKind: string(actorKindForSubject(id.Subject)), Subject: id.Subject,
 	}
 	var job *specialistjob.Job
 	if req.Kind == specialistjob.KindDraft {
@@ -374,6 +400,45 @@ func (s *Server) handleRequestSpecialistJob(w http.ResponseWriter, r *http.Reque
 		return
 	}
 	s.writeJSON(w, r, http.StatusCreated, toSpecialistJobResponse(job, time.Now()))
+}
+
+// specialistJobSubjectInSeat confines a first-officer request to its seat. A
+// subject naming neither a run nor a campaign, a campaign that is not a
+// campaign seat's own, or a run outside the seat is 403
+// first_officer_subject_out_of_seat; a seat-membership read failure is 503.
+func (s *Server) specialistJobSubjectInSeat(w http.ResponseWriter, r *http.Request, a firstofficer.Anchor, subj specialistjob.Subject) bool {
+	outOfSeat := func(field string) bool {
+		s.writeError(w, r, http.StatusForbidden, "first_officer_subject_out_of_seat",
+			"a first-officer seat may request a specialist job only about its own campaign or a run inside it",
+			map[string]any{"field": field, "seat_subject": firstofficer.SubjectFor(a)})
+		return false
+	}
+	if subj.RunID == "" && subj.CampaignID == "" {
+		return outOfSeat("subject")
+	}
+	if subj.CampaignID != "" {
+		cid, err := uuid.Parse(subj.CampaignID)
+		if err != nil || a.Kind != firstofficer.AnchorCampaign || cid != a.ID {
+			return outOfSeat("subject.campaign_id")
+		}
+	}
+	if subj.RunID != "" {
+		rid, err := uuid.Parse(subj.RunID)
+		if err != nil {
+			return outOfSeat("subject.run_id")
+		}
+		in, err := s.firstOfficerRunInSeat(r.Context(), a, rid)
+		if err != nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "service_unavailable",
+				"could not resolve whether the run lies inside the first-officer seat; retry shortly",
+				map[string]any{internalCauseKey: err.Error()})
+			return false
+		}
+		if !in {
+			return outOfSeat("subject.run_id")
+		}
+	}
+	return true
 }
 
 // specialistJobCampaignVisible requires the subject campaign to exist in the
