@@ -186,7 +186,7 @@ func TestRescoreCatchRateTrials_GainsAMissUnderTheCurrentRule(t *testing.T) {
 // as a catch manufactured by the redaction (#4314 review: the bare "redact"
 // probe did exactly that).
 func TestRescoreCatchRateTrials_RedactionMarkerNeverCatches(t *testing.T) {
-	const name = "secret-credential-in-error-path"
+	const name = "secret-signed-url-in-debug-retry-log"
 	secCases, _ := loadCommittedSecurity(t)
 	var sc SecurityCatchCase
 	for _, c := range secCases {
@@ -611,8 +611,8 @@ func TestRescoreCatchRateTrials_CommittedSidecar(t *testing.T) {
 	if err != nil {
 		t.Fatalf("the committed sidecar does not re-score: %v", err)
 	}
-	// A LOOSE decode: the committed pair is v1 until the shared #4313/#4314
-	// re-pin recording, v2 after it; both carry arms.<name>.per_case.
+	// A LOOSE decode: the committed pair was v1 until the #4313 re-pin
+	// recording and is v2 since; both carry arms.<name>.per_case.
 	var rec CatchRateEvidence
 	if err := json.Unmarshal(mustRead(t, committedCatchEvidence), &rec); err != nil {
 		t.Fatal(err)

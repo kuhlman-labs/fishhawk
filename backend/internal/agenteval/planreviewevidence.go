@@ -11,8 +11,8 @@
 // PINNED BASELINE carrying the same arm map.
 //
 // THE ARM TABLE. catchRateArmTable is the one place an arm is declared: its
-// name, kind, cases (name, expectation class, catch rule, raw bytes), its
-// fingerprint and its runner. It holds without_conventions and
+// name, kind, cases (name, expectation class, catch rule, raw input bytes),
+// its fingerprint, its input digest and its runner. It holds without_conventions and
 // with_conventions over the miss corpus, architect over the architect persona
 // corpus, and (E80.17 / #4314) security and security_portability over the
 // security persona corpus. The record, the sidecar, the gate and the re-score
@@ -35,12 +35,17 @@
 // class, must clear the 136-trial floor and is judged against the SAME arm of
 // the pinned baseline: FAIL on a catch-rate drop, or a false-alarm-rate rise
 // ((false_alarms + undecodable) / trials over the clean cases), strictly
-// above the tolerance, in exact rationals.
+// above the tolerance, in exact rationals. A baseline is judged only when it
+// was measured on the SAME instrument (#4326): the generator model, arm set,
+// per-arm case set, expectation classes and samples_per_case, the catch rule
+// (catch_rule_version) and, per arm, the case inputs (input_digest). The
+// treatment — rendered prompt, conventions fixture, remit, documents — is
+// deliberately outside the instrument, so a prompt change stays comparable.
 //
 // LEGACY v1. A planreview-catchrate-evidence-v1 record is recognised by a
-// version-dispatching reader: the gate refuses it naming the shared
-// #4313/#4314 re-pin recording, and the recorder treats it as a
-// non-comparable baseline (only a pin replaces it).
+// version-dispatching reader: the gate refuses it naming the #4313 re-pin
+// recording (#4314 re-pinned separately after it), and the recorder treats it
+// as a non-comparable baseline (only a pin replaces it).
 //
 // THE BASELINE IS PINNED, NOT ROLLING. Every recording is judged against two
 // references: its own same-run without-conventions arm (the within-run rule)
@@ -102,8 +107,10 @@ const CatchRateEvidenceSchema = "planreview-catchrate-evidence-v2"
 // (never accepted) by readCatchRateEvidence.
 const catchRateEvidenceSchemaV1 = "planreview-catchrate-evidence-v1"
 
-// catchRateSharedRecording names the remedy for a legacy v1 record.
-const catchRateSharedRecording = "the shared #4313/#4314 re-pin recording (one recording of every arm, pinning a v2 baseline)"
+// catchRateLegacyRepin names the remedy for a legacy v1 record, in the order
+// the Captain ruled on 2026-10-12: #4313 is recorded first, on its own re-pin,
+// and #4314 is re-pinned separately after it (not one shared recording).
+const catchRateLegacyRepin = "the #4313 re-pin recording (#4313 recorded first, pinning the first v2 baseline over every arm; #4314 re-pinned separately after it)"
 
 // errLegacyCatchRateEvidence marks a v1 record.
 var errLegacyCatchRateEvidence = errors.New("legacy planreview-catchrate-evidence-v1 record")
@@ -258,10 +265,17 @@ type CatchRateFalseAlarmPartition struct {
 // sample count, the fingerprint of everything that arm's model was shown, and
 // its per-case counts.
 type CatchRateEvidenceArm struct {
-	Kind              string                     `json:"kind"`
-	SamplesPerCase    int                        `json:"samples_per_case"`
-	PromptFingerprint string                     `json:"prompt_fingerprint"`
-	PerCase           map[string]CaseCatchCounts `json:"per_case"`
+	Kind              string `json:"kind"`
+	SamplesPerCase    int    `json:"samples_per_case"`
+	PromptFingerprint string `json:"prompt_fingerprint"`
+	// InputDigest (#4326) is armInputDigest over the arm's cases: each case's
+	// name, expectation class, exact input bytes and catch rule — the
+	// INSTRUMENT, not the treatment (no rendered prompt, conventions fixture,
+	// remit or document), so a prompt change stays comparable against the
+	// pinned baseline while a case-input or probe change does not. Empty on a
+	// record made before #4326.
+	InputDigest string                     `json:"input_digest"`
+	PerCase     map[string]CaseCatchCounts `json:"per_case"`
 	// FalseAlarmPartition is set on a partitioned arm (the security arms)
 	// only: one entry per clean case.
 	FalseAlarmPartition map[string]CatchRateFalseAlarmPartition `json:"false_alarm_partition,omitempty"`
@@ -277,22 +291,31 @@ type CatchRateBaseline struct {
 	// PinnedAt is the RFC 3339 time the operator pinned this baseline.
 	PinnedAt string `json:"pinned_at"`
 	// Reason is the operator's stated reason for pinning (never empty).
-	Reason            string                `json:"reason"`
-	GeneratorModel    string                `json:"generator_model"`
-	PromptFingerprint string                `json:"prompt_fingerprint"`
-	Arms              CatchRateEvidenceArms `json:"arms"`
+	Reason            string `json:"reason"`
+	GeneratorModel    string `json:"generator_model"`
+	PromptFingerprint string `json:"prompt_fingerprint"`
+	// CatchRuleVersion (#4326) is the catchRuleVersion text the baseline was
+	// measured under (empty on a baseline pinned before #4326): part of the
+	// instrument, so a baseline from another catch rule is not comparable.
+	CatchRuleVersion string                `json:"catch_rule_version"`
+	Arms             CatchRateEvidenceArms `json:"arms"`
 }
 
 // CatchRateEvidence is the committed evidence record
 // (testdata/planreview-catchrate/evidence.json).
 type CatchRateEvidence struct {
-	Schema            string                `json:"schema"`
-	RecordedAt        string                `json:"recorded_at"`
-	GeneratorModel    string                `json:"generator_model"`
-	PromptFingerprint string                `json:"prompt_fingerprint"`
-	Tolerance         float64               `json:"tolerance"`
-	MinTrialsPerArm   int                   `json:"min_trials_per_arm"`
-	Arms              CatchRateEvidenceArms `json:"arms"`
+	Schema            string `json:"schema"`
+	RecordedAt        string `json:"recorded_at"`
+	GeneratorModel    string `json:"generator_model"`
+	PromptFingerprint string `json:"prompt_fingerprint"`
+	// CatchRuleVersion (#4326) is the full catchRuleVersion text the arms
+	// were scored under (empty on a record made before #4326). The gate
+	// requires it to equal the current rule (mode 4c) and a baseline to carry
+	// the same one (mode 10).
+	CatchRuleVersion string                `json:"catch_rule_version"`
+	Tolerance        float64               `json:"tolerance"`
+	MinTrialsPerArm  int                   `json:"min_trials_per_arm"`
+	Arms             CatchRateEvidenceArms `json:"arms"`
 	// Baseline is the pinned reference; absent or null is refused by
 	// CheckCatchRateEvidence.
 	Baseline *CatchRateBaseline `json:"baseline"`
@@ -306,6 +329,10 @@ type catchRateArmCase struct {
 	rule   CatchRule
 	// lens is a security defect case's remit lens ("" otherwise).
 	lens string
+	// raw is the case's exact input bytes (review_input.json for a
+	// conventions case, persona_case.json for a persona case), hashed into
+	// the arm's input digest.
+	raw []byte
 }
 
 // catchRateArmRow is ONE arm of the arm table: everything the recorder, the
@@ -321,6 +348,9 @@ type catchRateArmRow struct {
 	// fingerprint is "sha256:<hex>" over everything this arm's model is
 	// shown and how its trials are scored.
 	fingerprint string
+	// inputDigest is armInputDigest(cases): the instrument half of the
+	// fingerprint (#4326), compared against the pinned baseline's.
+	inputDigest string
 	// measure measures the arm over the cases keep selects (nil = every
 	// case).
 	measure func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error)
@@ -445,6 +475,40 @@ func securityArmFingerprint(arm string, cases []SecurityCatchCase, markers Secur
 	return f.sum(), nil
 }
 
+// armInputDigest is one arm's INPUT DIGEST (#4326): "sha256:<hex>" over a
+// domain tag and, per case in name order, its name, its expectation class,
+// its exact input bytes and its catch rule (probes, planted criterion ids,
+// attribution phrases, category, anchor step, clean). It is the INSTRUMENT:
+// what the arm is measured on and how a trial is scored. It deliberately
+// excludes the TREATMENT — the rendered prompt, the conventions fixture, the
+// remit and every document — so a prompt change leaves a baseline comparable
+// while a case-input or probe change with the same case names does not. The
+// rule is hashed separately from the raw bytes because a conventions case's
+// planted criterion ids come from miss.json, which is not in its
+// review_input.json bytes. markers.json is not folded in: it annotates
+// concerns and drives the portability refusal but never changes a rate.
+func armInputDigest(cases []catchRateArmCase) string {
+	sorted := append([]catchRateArmCase(nil), cases...)
+	sort.Slice(sorted, func(i, j int) bool { return sorted[i].name < sorted[j].name })
+	f := newFingerprintHasher()
+	f.put([]byte("planreview-catchrate-input-digest-v1"))
+	for _, c := range sorted {
+		f.put([]byte(c.name))
+		f.put([]byte(c.expect))
+		f.put(c.raw)
+		for _, list := range [][]string{c.rule.Probes, c.rule.CriterionIDs, c.rule.AttributionPhrases} {
+			f.put([]byte(strconv.Itoa(len(list))))
+			for _, v := range list {
+				f.put([]byte(v))
+			}
+		}
+		f.put([]byte(c.rule.Category))
+		f.put([]byte(strconv.Itoa(c.rule.AnchorStep)))
+		f.put([]byte(strconv.FormatBool(c.rule.Clean)))
+	}
+	return f.sum()
+}
+
 // catchRateArmTable builds THE arm table from inputs, in arm-name order. It
 // fails closed on an unavailable corpus, conventions fixture, persona corpus,
 // security corpus (or its markers) or document checkout, and on a render
@@ -473,7 +537,7 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 	var rows []catchRateArmRow
 	convCases := make([]catchRateArmCase, 0, len(cases))
 	for _, c := range cases {
-		convCases = append(convCases, catchRateArmCase{name: c.Name, expect: CatchExpectCatch, rule: c.CatchRule()})
+		convCases = append(convCases, catchRateArmCase{name: c.Name, expect: CatchExpectCatch, rule: c.CatchRule(), raw: c.ReviewInputRaw})
 	}
 	sort.Slice(convCases, func(i, j int) bool { return convCases[i].name < convCases[j].name })
 	for _, arm := range []string{ArmWithoutConventions, ArmWithConventions} {
@@ -483,7 +547,7 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 		}
 		rows = append(rows, catchRateArmRow{
 			name: arm, kind: CatchRateArmKindConventions, cases: convCases,
-			samples: SamplesPerCaseForPower(len(cases)), fingerprint: fp,
+			samples: SamplesPerCaseForPower(len(cases)), fingerprint: fp, inputDigest: armInputDigest(convCases),
 			measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
 				return RunCatchRateArm(ctx, sender, selectCatchCases(cases, keep, func(c PlanReviewCatchCase) string { return c.Name }), conv, arm, samples)
 			},
@@ -492,7 +556,7 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 	pCases := make([]catchRateArmCase, 0, len(personaCases))
 	var nCatch, nClean int
 	for _, c := range personaCases {
-		pCases = append(pCases, catchRateArmCase{name: c.Name, expect: c.Expect(), rule: c.CatchRule()})
+		pCases = append(pCases, catchRateArmCase{name: c.Name, expect: c.Expect(), rule: c.CatchRule(), raw: c.Raw})
 		if c.Expect() == CatchExpectClean {
 			nClean++
 		} else {
@@ -505,7 +569,7 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 	}
 	rows = append(rows, catchRateArmRow{
 		name: ArmArchitect, kind: CatchRateArmKindPersona, cases: pCases,
-		samples: SamplesPerCaseForPersona(nCatch, nClean), fingerprint: fp,
+		samples: SamplesPerCaseForPersona(nCatch, nClean), fingerprint: fp, inputDigest: armInputDigest(pCases),
 		measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
 			return runPersonaCatchArm(ctx, sender, selectCatchCases(personaCases, keep, func(c PersonaCatchCase) string { return c.Name }), in.RepoRoot, samples, render)
 		},
@@ -515,7 +579,7 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 		sCases := make([]catchRateArmCase, 0, len(armCases))
 		var sCatch, sClean int
 		for _, c := range armCases {
-			sCases = append(sCases, catchRateArmCase{name: c.Name, expect: c.Expect(), rule: c.CatchRule(), lens: c.Lens()})
+			sCases = append(sCases, catchRateArmCase{name: c.Name, expect: c.Expect(), rule: c.CatchRule(), lens: c.Lens(), raw: c.Raw})
 			if c.Expect() == CatchExpectClean {
 				sClean++
 			} else {
@@ -529,7 +593,7 @@ func catchRateArmTableWith(in CatchRateInputs, render personaArmRenderer, secRen
 		}
 		rows = append(rows, catchRateArmRow{
 			name: arm, kind: CatchRateArmKindPersona, cases: sCases, partition: true,
-			samples: SamplesPerCaseForPersona(sCatch, sClean), fingerprint: fp,
+			samples: SamplesPerCaseForPersona(sCatch, sClean), fingerprint: fp, inputDigest: armInputDigest(sCases),
 			measure: func(ctx context.Context, sender MessageSender, samples int, keep func(string) bool) (CatchRateArmReport, error) {
 				return runSecurityCatchArm(ctx, sender, selectCatchCases(secCases, keep, func(c SecurityCatchCase) string { return c.Name }), markers, in.RepoRoot, arm, samples, secRender)
 			},
@@ -619,7 +683,8 @@ type RecordCatchRateOptions struct {
 // BEFORE any model call); an unavailable input, a transport or render error;
 // a within-run regression; a regression of any arm against the pinned
 // baseline; and, without PinBaseline, a baseline that is not comparable to
-// this measurement (arm set, case set, model or samples changed — re-pin).
+// this measurement (arm set, case set, expectation class, model, samples,
+// catch rule or case inputs changed — re-pin).
 func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generatorModel string, in CatchRateInputs, evidencePath string, now time.Time, opts RecordCatchRateOptions) (string, error) {
 	if opts.Subset.active() && (!opts.DryRun || opts.PinBaseline) {
 		return "", fmt.Errorf("agenteval: %w: %s / %s measure part of the arm table, so the run must be a dry run — unset FISHHAWK_AGENTEVAL_PLANREVIEW_RECORD=1 and FISHHAWK_AGENTEVAL_PLANREVIEW_PIN_REASON, or unset the subset knobs for a full recording; see %s", ErrCatchRateSubsetNotRecordable, CatchRateSubsetCasesEnv, CatchRateSubsetTrialsEnv, catchRateRunbook)
@@ -646,7 +711,7 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 		ref = existing.Baseline
 	}
 	if legacy && !opts.PinBaseline && !opts.DryRun {
-		return "", fmt.Errorf("agenteval: the existing catch-rate evidence %q is a legacy %s record: its baseline is not comparable to an arm-keyed measurement, so this recording must pin a new one (PinBaseline with a reason) — %s; see %s", evidencePath, catchRateEvidenceSchemaV1, catchRateSharedRecording, catchRateRunbook)
+		return "", fmt.Errorf("agenteval: the existing catch-rate evidence %q is a legacy %s record: its baseline is not comparable to an arm-keyed measurement, so this recording must pin a new one (PinBaseline with a reason) — %s; see %s", evidencePath, catchRateEvidenceSchemaV1, catchRateLegacyRepin, catchRateRunbook)
 	}
 	if ref == nil && !legacy && !opts.PinBaseline && !opts.DryRun {
 		return "", fmt.Errorf("agenteval: no pinned catch-rate baseline exists in %q: the first recording must pin one (PinBaseline with a reason); see %s", evidencePath, catchRateRunbook)
@@ -657,6 +722,7 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 		RecordedAt:        now.UTC().Format(time.RFC3339),
 		GeneratorModel:    generatorModel,
 		PromptFingerprint: catchRateRecordFingerprint(rowFingerprints(rows), generatorModel),
+		CatchRuleVersion:  catchRuleVersion,
 		Tolerance:         DefaultCatchRateRegressionTolerance,
 		MinTrialsPerArm:   MinCatchRateTrialsPerArm,
 		Arms:              make(CatchRateEvidenceArms, len(rows)),
@@ -672,7 +738,7 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 			return "", err
 		}
 		reports[row.name] = r
-		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: samples, PromptFingerprint: row.fingerprint, PerCase: r.PerCase}
+		arm := CatchRateEvidenceArm{Kind: row.kind, SamplesPerCase: samples, PromptFingerprint: row.fingerprint, InputDigest: row.inputDigest, PerCase: r.PerCase}
 		if row.partition {
 			arm.FalseAlarmPartition = falseAlarmPartitionOf(row, r)
 		}
@@ -703,6 +769,7 @@ func RecordCatchRateEvidence(ctx context.Context, sender MessageSender, generato
 			Reason:            strings.TrimSpace(opts.Reason),
 			GeneratorModel:    rec.GeneratorModel,
 			PromptFingerprint: rec.PromptFingerprint,
+			CatchRuleVersion:  rec.CatchRuleVersion,
 			Arms:              cloneEvidenceArms(rec.Arms),
 		}
 		report += fmt.Sprintf("\nPinned this measurement as the new baseline (reason: %s).\n", rec.Baseline.Reason)
@@ -861,7 +928,7 @@ func decodeCatchRateEvidence(raw []byte) (*CatchRateEvidence, error) {
 		Schema string `json:"schema"`
 	}
 	if err := json.Unmarshal(raw, &head); err == nil && head.Schema == catchRateEvidenceSchemaV1 {
-		return nil, fmt.Errorf("%w: the arm-keyed gate does not read it — re-record every arm in %s", errLegacyCatchRateEvidence, catchRateSharedRecording)
+		return nil, fmt.Errorf("%w: the arm-keyed gate does not read it — re-pin every arm with a fresh v2 recording (PinBaseline); history: %s", errLegacyCatchRateEvidence, catchRateLegacyRepin)
 	}
 	var rec CatchRateEvidence
 	if err := decodeStrictJSON(raw, &rec); err != nil {
@@ -938,10 +1005,13 @@ func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
 //
 //	(1) an absent evidence file
 //	(2) malformed JSON, an unknown field, or trailing content after the record
-//	(3) a wrong schema; (3b) a legacy v1 record, refused naming the shared
-//	    #4313/#4314 re-pin recording
+//	(3) a wrong schema; (3b) a legacy v1 record, refused naming the #4313
+//	    re-pin recording (#4314 re-pinned separately after it)
 //	(4) a stale prompt fingerprint, or a generator model other than
-//	    generatorModel; (4b) a stale ARM fingerprint, naming every stale arm
+//	    generatorModel; (4b) a stale ARM fingerprint, naming every stale arm;
+//	    (4c) a recorded catch_rule_version other than the current catch rule,
+//	    or an arm input_digest other than the current arm table's (#4326) —
+//	    including a record made before #4326, which carries neither
 //	(5) a recorded tolerance / min_trials_per_arm differing from the current constants
 //	(6) inconsistent counts in any arm (negative, caught+undecodable > trials,
 //	    false_alarms on a catch case, caught on a clean case), samples_per_case
@@ -955,8 +1025,10 @@ func stageCatchRateFile(dir, pattern string, b []byte) (string, error) {
 //	    unknown arm, or an arm kind differing from the arm table's
 //	(8) an under-powered arm or expectation class
 //	(9) a within-run regression above the tolerance
-//	(10) a missing, malformed or non-comparable pinned baseline, or a catch-rate
-//	     drop or false-alarm-rate rise of any arm against it
+//	(10) a missing, malformed or non-comparable pinned baseline (generator
+//	     model, catch rule, arm set, or per arm case set, expectation class,
+//	     samples_per_case or case inputs differ — baselineComparable), or a
+//	     catch-rate drop or false-alarm-rate rise of any arm against it
 //	(11) an unavailable corpus
 //	(12) an unavailable conventions fixture (or persona corpus / checkout)
 //
@@ -1018,6 +1090,30 @@ func CheckCatchRateEvidence(evidencePath string, in CatchRateInputs, generatorMo
 	}
 	if want := catchRateRecordFingerprint(rowFingerprints(rows), generatorModel); rec.PromptFingerprint != want {
 		return fail("STALE: recorded prompt fingerprint %s != current %s — the schema, model, tolerance, floor or an arm fingerprint changed since the measurement: re-measure", rec.PromptFingerprint, want) // (4)
+	}
+	// (4c) #4326: (4b) proved every arm was measured on the CURRENT
+	// instrument, so a stored instrument term that differs from the current
+	// one is a hand edit or a record made before #4326. The gate recomputes
+	// both terms rather than trusting the stored ones.
+	if rec.CatchRuleVersion != catchRuleVersion {
+		if rec.CatchRuleVersion == "" {
+			return fail("catch_rule_version is absent: the record was made before #4326 added the instrument terms (current rule %s), so the next recording must re-pin the baseline (it is not comparable)", catchRuleLabel(catchRuleVersion)) // (4c)
+		}
+		return fail("recorded catch_rule_version %s is not the current catch rule %s (or its text differs under the same label): a stored instrument term the gate recomputes — re-measure and re-pin", catchRuleLabel(rec.CatchRuleVersion), catchRuleLabel(catchRuleVersion)) // (4c)
+	}
+	var drifted []string
+	pre4326 := false
+	for _, row := range rows {
+		if rec.Arms[row.name].InputDigest != row.inputDigest {
+			drifted = append(drifted, row.name)
+			pre4326 = pre4326 || rec.Arms[row.name].InputDigest == ""
+		}
+	}
+	if len(drifted) > 0 {
+		if pre4326 {
+			return fail("arm(s) %s carry no input_digest matching the current arm table: the record was made before #4326 added the instrument terms, so the next recording must re-pin the baseline (it is not comparable)", strings.Join(drifted, ", ")) // (4c)
+		}
+		return fail("arm(s) %s: recorded input_digest differs from the current arm table's — a stored instrument term the gate recomputes: re-measure", strings.Join(drifted, ", ")) // (4c)
 	}
 	if err := validateEvidenceArms(rec.Arms); err != nil {
 		return fail("measurement: %v", err) // (6)
@@ -1573,12 +1669,23 @@ func validateCatchRateBaseline(b *CatchRateBaseline) error {
 }
 
 // baselineComparable reports why a measurement cannot be judged against a
-// baseline: a different generator model, arm set, or — per arm — case set
-// (or expectation class) or samples_per_case makes the pooled rates a
-// different instrument.
+// baseline: a different generator model, catch rule (catch_rule_version,
+// #4326), arm set, or — per arm — case set (or expectation class),
+// samples_per_case or case inputs (input_digest, #4326: a case's input bytes
+// or catch rule with the same case names) makes the pooled rates a different
+// instrument. The treatment (rendered prompt, conventions fixture, remit,
+// documents) is outside the instrument: changing it is what a measurement
+// judges, not a reason to re-pin.
 func baselineComparable(rec CatchRateEvidence, b *CatchRateBaseline) (bool, string) {
 	if rec.GeneratorModel != b.GeneratorModel {
 		return false, fmt.Sprintf("generator model changed (%q pinned, %q measured)", b.GeneratorModel, rec.GeneratorModel)
+	}
+	if rec.CatchRuleVersion != b.CatchRuleVersion {
+		pinned, measured := catchRuleLabel(b.CatchRuleVersion), catchRuleLabel(rec.CatchRuleVersion)
+		if pinned == measured {
+			return false, fmt.Sprintf("catch rule changed (the rule text differs under the same label %q)", pinned)
+		}
+		return false, fmt.Sprintf("catch rule changed (%s pinned, %s measured)", pinned, measured)
 	}
 	if got, want := sortedArmNames(rec.Arms), sortedArmNames(b.Arms); !slices.Equal(got, want) {
 		return false, fmt.Sprintf("arm set changed (%v pinned, %v measured)", want, got)
@@ -1596,8 +1703,34 @@ func baselineComparable(rec CatchRateEvidence, b *CatchRateBaseline) (bool, stri
 		if m.SamplesPerCase != p.SamplesPerCase {
 			return false, fmt.Sprintf("arm %q samples_per_case changed (%d pinned, %d measured)", name, p.SamplesPerCase, m.SamplesPerCase)
 		}
+		if m.InputDigest != p.InputDigest {
+			return false, fmt.Sprintf("arm %q case inputs changed (input_digest %s pinned, %s measured): a case's input bytes or catch rule differ from the baseline's", name, orPre4326(p.InputDigest), orPre4326(m.InputDigest))
+		}
 	}
 	return true, ""
+}
+
+// catchRulePre4326 renders an empty catch_rule_version or input_digest: the
+// record or baseline predates #4326, which added both.
+const catchRulePre4326 = "none: recorded before #4326"
+
+// catchRuleLabel is a catch-rule version's label — the text before its first
+// ':' (e.g. "planreview-catch-v5") — or catchRulePre4326 when empty. It is the
+// one place a rule version is shortened for a report or a reason.
+func catchRuleLabel(version string) string {
+	if version == "" {
+		return catchRulePre4326
+	}
+	label, _, _ := strings.Cut(version, ":")
+	return label
+}
+
+// orPre4326 is s, or catchRulePre4326 when s is empty.
+func orPre4326(s string) string {
+	if s == "" {
+		return catchRulePre4326
+	}
+	return s
 }
 
 // classCounts pools one arm's counts per expectation class: catch trials and

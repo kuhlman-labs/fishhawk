@@ -599,6 +599,35 @@ func TestCheckCatchRateEvidence_FailClosed(t *testing.T) {
 				}
 			}
 		}, want: "samples_per_case changed"},
+		// #4326: each row differs from the passing record ONLY in the named
+		// instrument term, so the new check is the only thing that can refuse.
+		{name: "(10) baseline from another catch rule", mutate: func(r *CatchRateEvidence) {
+			r.Baseline.CatchRuleVersion = forgedCatchRule
+		}, want: "catch rule changed"},
+		{name: "(10) baseline pinned before #4326", mutate: func(r *CatchRateEvidence) { r.Baseline.CatchRuleVersion = "" }, want: "before #4326"},
+		{name: "(10) baseline from other case inputs, same case names", mutate: func(r *CatchRateEvidence) {
+			setArmInputDigest(r.Baseline.Arms, ArmWithoutConventions, forgedInputDigest)
+		}, want: `arm "without_conventions" case inputs changed`},
+		{name: "(4c) record catch rule not the current one", mutate: func(r *CatchRateEvidence) {
+			// The baseline carries the SAME forged rule, so it stays comparable:
+			// only (4c) compares the stored rule with the current one.
+			r.CatchRuleVersion, r.Baseline.CatchRuleVersion = forgedCatchRule, forgedCatchRule
+		}, want: "catch_rule_version"},
+		{name: "(4c) record input_digest not the current arm table's", mutate: func(r *CatchRateEvidence) {
+			setArmInputDigest(r.Arms, ArmWithConventions, forgedInputDigest)
+			setArmInputDigest(r.Baseline.Arms, ArmWithConventions, forgedInputDigest)
+		}, want: "input_digest"},
+		{name: "(4c) a record made before #4326", raw: stripInstrumentTerms, want: "before #4326"},
+		{name: "(4c) arms without input_digest under the current catch rule", mutate: func(r *CatchRateEvidence) {
+			for _, arms := range []CatchRateEvidenceArms{r.Arms, r.Baseline.Arms} {
+				for name := range arms {
+					setArmInputDigest(arms, name, "")
+				}
+			}
+		}, want: "carry no input_digest matching the current arm table: the record was made before #4326"},
+		{name: "(10) baseline catch rule text edited under the same label", mutate: func(r *CatchRateEvidence) {
+			r.Baseline.CatchRuleVersion = catchRuleLabel(catchRuleVersion) + ": an edited rule text"
+		}, want: "rule text differs under the same label"},
 		{name: "(10) both arms equal but 0.17 below the pinned baseline", mutate: func(r *CatchRateEvidence) {
 			setCaught(r.Arms[ArmWithoutConventions].PerCase, int(math.Round(0.83*float64(samples))))
 			setCaught(r.Arms[ArmWithConventions].PerCase, int(math.Round(0.83*float64(samples))))
@@ -1037,6 +1066,298 @@ func TestRecordCatchRateEvidence_NonComparableBaselineNeedsRePin(t *testing.T) {
 	if got := readCatchEvidence(t, path).Baseline.Arms[ArmWithoutConventions].SamplesPerCase; got != SamplesPerCaseForPower(n) {
 		t.Errorf("re-pinned baseline samples_per_case = %d", got)
 	}
+}
+
+// forgedCatchRule is an older catch rule's text, and forgedInputDigest an
+// input digest no arm table produces (#4326 fixtures).
+const forgedCatchRule = "planreview-catch-v4: an older rule"
+
+var forgedInputDigest = "sha256:" + strings.Repeat("0", 64)
+
+// setArmInputDigest sets one arm's input_digest.
+func setArmInputDigest(arms CatchRateEvidenceArms, name, digest string) {
+	a := arms[name]
+	a.InputDigest = digest
+	arms[name] = a
+}
+
+// stripInstrumentTerms removes catch_rule_version (record and baseline) and
+// every arm's input_digest (record and baseline arms) from a raw record: the
+// shape of a record made before #4326, the committed one included.
+func stripInstrumentTerms(raw []byte) []byte {
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		panic(err)
+	}
+	stripArms := func(arms any) {
+		for _, a := range arms.(map[string]any) {
+			delete(a.(map[string]any), "input_digest")
+		}
+	}
+	delete(m, "catch_rule_version")
+	stripArms(m["arms"])
+	if b, ok := m["baseline"].(map[string]any); ok {
+		delete(b, "catch_rule_version")
+		stripArms(b["arms"])
+	}
+	out, err := json.MarshalIndent(m, "", "  ")
+	if err != nil {
+		panic(err)
+	}
+	return out
+}
+
+// armRow is the named row of an arm table.
+func armRow(t *testing.T, rows []catchRateArmRow, name string) catchRateArmRow {
+	t.Helper()
+	for _, r := range rows {
+		if r.name == name {
+			return r
+		}
+	}
+	t.Fatalf("the arm table has no %q row", name)
+	return catchRateArmRow{}
+}
+
+// TestRecordCatchRateEvidence_ChangedInstrumentNeedsRePin (#4326): a baseline
+// measured under another catch rule, on other case inputs with the SAME case
+// names, or before #4326 recorded either term, is a different instrument. An
+// ordinary recording is refused with both files byte-identical (read back
+// after the call); an explicit pin replaces the baseline.
+func TestRecordCatchRateEvidence_ChangedInstrumentNeedsRePin(t *testing.T) {
+	all := committedCatchTrials(t)
+	assertRefusedUnchanged := func(t *testing.T, path string, in CatchRateInputs, want ...string) {
+		t.Helper()
+		before, beforeTrials := mustRead(t, path), mustRead(t, CatchRateTrialsPath(path))
+		_, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, in, path, catchT0.Add(time.Hour), RecordCatchRateOptions{})
+		if err == nil {
+			t.Fatalf("the recording was written; want a refusal naming %q", want)
+		}
+		for _, w := range append([]string{"not comparable"}, want...) {
+			if !strings.Contains(err.Error(), w) {
+				t.Fatalf("err = %v, want it to name %q", err, w)
+			}
+		}
+		if !bytes.Equal(mustRead(t, path), before) || !bytes.Equal(mustRead(t, CatchRateTrialsPath(path)), beforeTrials) {
+			t.Fatal("a refused recording changed the evidence pair")
+		}
+	}
+	rePin := func(t *testing.T, path string, in CatchRateInputs) CatchRateEvidence {
+		t.Helper()
+		report, err := RecordCatchRateEvidence(context.Background(), newScriptedCatchSender(t, all, all), testCatchModel, in, path, catchT0.Add(2*time.Hour), pin("instrument changed"))
+		if err != nil {
+			t.Fatalf("re-pin after an instrument change: %v", err)
+		}
+		if !strings.Contains(report, "not comparable") || !strings.Contains(report, "the pin replaces it") {
+			t.Errorf("report does not explain the replaced baseline:\n%s", report)
+		}
+		return readCatchEvidence(t, path)
+	}
+
+	t.Run("catch rule", func(t *testing.T) {
+		path := freshCatchEvidence(t)
+		rec := readCatchEvidence(t, path)
+		rec.Baseline.CatchRuleVersion = forgedCatchRule
+		writeCatchEvidence(t, path, rec)
+		assertRefusedUnchanged(t, path, committedCatchInputs(), "catch rule changed", "planreview-catch-v4 pinned")
+		if got := rePin(t, path, committedCatchInputs()).Baseline.CatchRuleVersion; got != catchRuleVersion {
+			t.Errorf("re-pinned baseline catch_rule_version = %q, want the current rule", got)
+		}
+	})
+
+	t.Run("case inputs, same case names", func(t *testing.T) {
+		path := freshCatchEvidence(t)
+		corpus := copyCatchCorpus(t)
+		cases, _ := loadCommittedCatch(t)
+		input := filepath.Join(corpus, cases[0].Name, "review_input.json")
+		if err := os.WriteFile(input, append(mustRead(t, input), '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		in := catchInputs(corpus, committedCatchConventions)
+		rows, err := catchRateArmTable(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		pinned := readCatchEvidence(t, path).Baseline.Arms[ArmWithConventions]
+		if pinned.SamplesPerCase != armRow(t, rows, ArmWithConventions).samples || len(pinned.PerCase) != len(armRow(t, rows, ArmWithConventions).cases) {
+			t.Fatal("fixture premise: the copied corpus keeps the case set and samples")
+		}
+		assertRefusedUnchanged(t, path, in, "case inputs changed")
+		if got, want := rePin(t, path, in).Baseline.Arms[ArmWithConventions].InputDigest, armRow(t, rows, ArmWithConventions).inputDigest; got != want {
+			t.Errorf("re-pinned baseline input_digest = %s, want the copied table's %s", got, want)
+		}
+	})
+
+	t.Run("pre-#4326 baseline", func(t *testing.T) {
+		path := freshCatchEvidence(t)
+		if err := os.WriteFile(path, stripInstrumentTerms(mustRead(t, path)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains(mustRead(t, path), []byte("catch_rule_version")) || bytes.Contains(mustRead(t, path), []byte("input_digest")) {
+			t.Fatal("fixture premise: the stripped record carries no instrument term")
+		}
+		assertRefusedUnchanged(t, path, committedCatchInputs(), "catch rule changed", "before #4326")
+		if got := rePin(t, path, committedCatchInputs()); got.Baseline.CatchRuleVersion != catchRuleVersion || got.CatchRuleVersion != catchRuleVersion {
+			t.Errorf("re-pinned catch_rule_version = %q (baseline %q), want the current rule", got.CatchRuleVersion, got.Baseline.CatchRuleVersion)
+		}
+	})
+}
+
+// TestRecordCatchRateEvidence_StampsInstrumentTerms is the #4326 done-means:
+// a recording writes catch_rule_version on the record and its pinned baseline
+// and an input_digest on every arm of both, each equal to the CURRENT arm
+// table's, and the written pair passes the gate.
+func TestRecordCatchRateEvidence_StampsInstrumentTerms(t *testing.T) {
+	path := freshCatchEvidence(t)
+	raw := mustRead(t, path)
+	for _, key := range []string{`"catch_rule_version"`, `"input_digest"`} {
+		if !bytes.Contains(raw, []byte(key)) {
+			t.Errorf("the written evidence lacks %s", key)
+		}
+	}
+	rec, err := decodeCatchRateEvidence(raw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if rec.CatchRuleVersion != catchRuleVersion || rec.Baseline.CatchRuleVersion != catchRuleVersion {
+		t.Errorf("catch_rule_version = %q (baseline %q), want the current rule", rec.CatchRuleVersion, rec.Baseline.CatchRuleVersion)
+	}
+	rows, err := catchRateArmTable(committedCatchInputs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		if !strings.HasPrefix(row.inputDigest, "sha256:") {
+			t.Errorf("arm %q table input digest %q is not a sha256 digest", row.name, row.inputDigest)
+		}
+		if got := rec.Arms[row.name].InputDigest; got != row.inputDigest {
+			t.Errorf("arm %q input_digest = %q, want the table's %q", row.name, got, row.inputDigest)
+		}
+		if got := rec.Baseline.Arms[row.name].InputDigest; got != row.inputDigest {
+			t.Errorf("baseline arm %q input_digest = %q, want the table's %q", row.name, got, row.inputDigest)
+		}
+	}
+	if _, err := CheckCatchRateEvidence(path, committedCatchInputs(), testCatchModel); err != nil {
+		t.Fatalf("the stamped pair does not pass the gate: %v", err)
+	}
+}
+
+// TestArmInputDigest_InstrumentNotTreatment pins the #4326 split: the input
+// digest moves with a case's input bytes, expectation class or catch rule and
+// with nothing the model is merely SHOWN (the conventions fixture, the remit),
+// while the arm fingerprint moves with both.
+func TestArmInputDigest_InstrumentNotTreatment(t *testing.T) {
+	base, err := catchRateArmTable(committedCatchInputs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	again, err := catchRateArmTable(committedCatchInputs())
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range base {
+		if armRow(t, again, row.name).inputDigest != row.inputDigest {
+			t.Fatalf("arm %q input digest is not deterministic", row.name)
+		}
+		reversed := make([]catchRateArmCase, len(row.cases))
+		for i, c := range row.cases {
+			reversed[len(row.cases)-1-i] = c
+		}
+		if armInputDigest(reversed) != row.inputDigest {
+			t.Fatalf("arm %q input digest depends on case order", row.name)
+		}
+	}
+	tableOf := func(t *testing.T, in CatchRateInputs) []catchRateArmRow {
+		t.Helper()
+		rows, err := catchRateArmTable(in)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	conventionsArms := []string{ArmWithoutConventions, ArmWithConventions}
+	personaArms := []string{ArmArchitect, ArmSecurity, ArmSecurityPortability}
+
+	t.Run("a one-byte review_input.json change moves only the conventions arms", func(t *testing.T) {
+		corpus := copyCatchCorpus(t)
+		cases, _ := loadCommittedCatch(t)
+		input := filepath.Join(corpus, cases[0].Name, "review_input.json")
+		if err := os.WriteFile(input, append(mustRead(t, input), '\n'), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rows := tableOf(t, catchInputs(corpus, committedCatchConventions))
+		for _, arm := range conventionsArms {
+			if armRow(t, rows, arm).inputDigest == armRow(t, base, arm).inputDigest {
+				t.Errorf("arm %q input digest unchanged by a review_input.json byte", arm)
+			}
+		}
+		for _, arm := range personaArms {
+			if armRow(t, rows, arm).inputDigest != armRow(t, base, arm).inputDigest {
+				t.Errorf("arm %q input digest moved with a conventions case's input", arm)
+			}
+		}
+	})
+
+	t.Run("the conventions fixture is treatment", func(t *testing.T) {
+		conv := mustRead(t, committedCatchConventions)
+		conv[len(conv)-2] ^= 0x01
+		convPath := filepath.Join(t.TempDir(), "conventions.md")
+		if err := os.WriteFile(convPath, conv, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rows := tableOf(t, catchInputs(committedCatchCorpus, convPath))
+		row, was := armRow(t, rows, ArmWithConventions), armRow(t, base, ArmWithConventions)
+		if row.fingerprint == was.fingerprint {
+			t.Fatal("fixture premise: the conventions byte changes the with-conventions fingerprint")
+		}
+		for _, arm := range conventionsArms {
+			if armRow(t, rows, arm).inputDigest != armRow(t, base, arm).inputDigest {
+				t.Errorf("arm %q input digest moved with the conventions fixture (treatment)", arm)
+			}
+		}
+	})
+
+	t.Run("the architect remit is treatment", func(t *testing.T) {
+		in := copyPersonaRepo(t)
+		remit := filepath.Join(in.RepoRoot, filepath.FromSlash(personaArchitectRemitPath))
+		b := mustRead(t, remit)
+		b[len(b)-2] ^= 0x01
+		if err := os.WriteFile(remit, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		rows := tableOf(t, in)
+		row, was := armRow(t, rows, ArmArchitect), armRow(t, base, ArmArchitect)
+		if row.fingerprint == was.fingerprint {
+			t.Fatal("fixture premise: the remit byte changes the architect fingerprint")
+		}
+		if row.inputDigest != was.inputDigest {
+			t.Error("the architect input digest moved with the remit (treatment)")
+		}
+	})
+
+	t.Run("the catch rule and the expectation class are instrument", func(t *testing.T) {
+		cases := armRow(t, base, ArmWithConventions).cases
+		if len(cases[0].rule.CriterionIDs) == 0 {
+			t.Fatal("fixture premise: the first conventions case plants a criterion id")
+		}
+		clone := func() []catchRateArmCase {
+			out := append([]catchRateArmCase(nil), cases...)
+			out[0].rule.CriterionIDs = append([]string(nil), cases[0].rule.CriterionIDs...)
+			return out
+		}
+		ids := clone()
+		ids[0].rule.CriterionIDs[0] += "-renumbered"
+		expect := clone()
+		expect[0].expect = CatchExpectClean
+		for name, c := range map[string][]catchRateArmCase{"one criterion id": ids, "one expectation class": expect} {
+			if armInputDigest(c) == armInputDigest(cases) {
+				t.Errorf("input digest unchanged by %s", name)
+			}
+		}
+		if armInputDigest(clone()) != armInputDigest(cases) {
+			t.Error("fixture premise: an unmodified clone digests equal")
+		}
+	})
 }
 
 func TestRecordCatchRateEvidence_DryRunNeverWrites(t *testing.T) {
@@ -1621,10 +1942,9 @@ func copyPersonaRepo(t *testing.T) CatchRateInputs {
 // per_case entry for EVERY committed case of that arm and a pinned baseline,
 // and pass every count invariant and every rule — so the documented shape
 // cannot drift from what CheckCatchRateEvidence accepts (only the
-// fingerprints are placeholders). A LEGACY v1 block (the README before the
-// #4313 docs slice rewrites it) must be recognised by the version-dispatching
-// reader as legacy — never accepted, never mistaken for a malformed v2 record.
-// Adding a corpus case obliges a README update.
+// fingerprints are placeholders). A LEGACY v1 block FAILS the test: the README
+// must document the v2 record the gate accepts. Adding a corpus case obliges a
+// README update.
 func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	readme := string(mustRead(t, "README.md"))
 	const begin, end = "<!-- BEGIN minimal-catchrate-evidence -->", "<!-- END minimal-catchrate-evidence -->"
@@ -1638,8 +1958,7 @@ func TestREADMEMinimalCatchRateEvidenceIsValid(t *testing.T) {
 	block = strings.TrimSuffix(block, "```")
 	rec, err := decodeCatchRateEvidence([]byte(block))
 	if errors.Is(err, errLegacyCatchRateEvidence) {
-		t.Logf("README minimal record is the LEGACY %s shape: recognised as legacy; the #4313 docs slice rewrites it as a v2 record", catchRateEvidenceSchemaV1)
-		return
+		t.Fatalf("README minimal record is the LEGACY %s shape; the README block must be a %s record: %v", catchRateEvidenceSchemaV1, CatchRateEvidenceSchema, err)
 	}
 	if err != nil {
 		t.Fatalf("README minimal record: %v", err)
@@ -1715,9 +2034,9 @@ func TestCheckCatchRateEvidence_PerArmModes(t *testing.T) {
 		want      string
 		regressed bool
 	}{
-		{name: "(3b) a legacy v1 record names the shared re-recording", raw: func([]byte) []byte {
+		{name: "(3b) a legacy v1 record names the #4313-then-#4314 re-pin sequence", raw: func([]byte) []byte {
 			return []byte(`{"schema":"planreview-catchrate-evidence-v1","samples_per_case":12,"arms":{}}`)
-		}, want: "#4313/#4314 re-pin recording"},
+		}, want: "#4313 recorded first, pinning the first v2 baseline over every arm; #4314 re-pinned separately after it"},
 		{name: "(6b) false_alarms on a catch case", mutate: func(r *CatchRateEvidence) {
 			setCounts(r.Arms, ArmArchitect, catchCase, func(c *CaseCatchCounts) { c.Caught, c.FalseAlarms = c.Trials-1, 1 })
 		}, want: "on a catch case"},
@@ -2004,7 +2323,7 @@ func TestRecordCatchRateEvidence_V1ExistingRequiresPin(t *testing.T) {
 	if !bytes.Equal(mustRead(t, path), legacy) {
 		t.Fatal("a dry run changed the legacy record")
 	}
-	report, err = record(t, newScriptedCatchSender(t, all, all), path, catchT0, pin("shared #4313/#4314 re-pin"))
+	report, err = record(t, newScriptedCatchSender(t, all, all), path, catchT0, pin("#4313 re-pin"))
 	if err != nil {
 		t.Fatalf("pin over a legacy record: %v", err)
 	}

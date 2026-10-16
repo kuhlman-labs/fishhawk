@@ -1,0 +1,161 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "supply_chain",
+  "issue_title": "Bump helm to v3.19.0 and check-jsonschema to 0.34.1 in the gate image",
+  "issue_body": "Dependabot cannot see the gate image's tool versions. helm v3.19.0 fixes the `helm template` regression the chart render harness works around, and check-jsonschema 0.34.1 adds Draft 2020-12 `$dynamicRef` support. Bump both in deploy/gate-image, keep the README's version table in step, and have the build print the installed versions.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94406",
+      "id": "kuhlman-labs/fishhawk#94406"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Bump the gate image's helm to v3.19.0 and check-jsonschema to 0.34.1, and print the installed versions at build time.",
+    "scope": {
+      "files": [
+        {
+          "path": "deploy/gate-image/Dockerfile",
+          "operation": "modify"
+        },
+        {
+          "path": "deploy/gate-image/install-tools.sh",
+          "operation": "modify"
+        },
+        {
+          "path": "deploy/gate-image/README.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Dockerfile: set ARG HELM_VERSION=v3.19.0 and ARG CHECK_JSONSCHEMA_VERSION=0.34.1."
+      },
+      {
+        "step": 2,
+        "description": "install-tools.sh: get-helm-3 moved for the v3.19 line, so download it from the upstream repository's scripts directory; it still installs exactly HELM_VERSION through DESIRED_VERSION, now with VERIFY_CHECKSUM=true. Install check-jsonschema from wheels only."
+      },
+      {
+        "step": 3,
+        "description": "install-tools.sh: print both installed versions at the end of main."
+      },
+      {
+        "step": 4,
+        "description": "README.md: update the version table."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Build the image locally with docker buildx and check the printed helm and check-jsonschema versions.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-tool-versions",
+          "statement": "The gate image reports helm v3.19.0 and check-jsonschema 0.34.1.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94406"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/deploy/gate-image/Dockerfile b/deploy/gate-image/Dockerfile\nindex 4e7b2a1..f0c9d35 100644\n--- a/deploy/gate-image/Dockerfile\n+++ b/deploy/gate-image/Dockerfile\n@@ -9,10 +9,10 @@ FROM golang:${GO_VERSION}-bookworm AS tools\n ARG GOLANGCI_LINT_VERSION=v2.8.0\n-ARG HELM_VERSION=v3.18.4\n-ARG CHECK_JSONSCHEMA_VERSION=0.33.2\n+ARG HELM_VERSION=v3.19.0\n+ARG CHECK_JSONSCHEMA_VERSION=0.34.1\n COPY install-tools.sh /usr/local/bin/install-tools.sh\n RUN HELM_VERSION=\"${HELM_VERSION}\" \\\n \tCHECK_JSONSCHEMA_VERSION=\"${CHECK_JSONSCHEMA_VERSION}\" \\\n \t/usr/local/bin/install-tools.sh\ndiff --git a/deploy/gate-image/install-tools.sh b/deploy/gate-image/install-tools.sh\nindex 9a1d3c7..58e2b40 100755\n--- a/deploy/gate-image/install-tools.sh\n+++ b/deploy/gate-image/install-tools.sh\n@@ -22,16 +22,18 @@ set -euo pipefail\n : \"${HELM_VERSION:?HELM_VERSION is required}\"\n : \"${CHECK_JSONSCHEMA_VERSION:?CHECK_JSONSCHEMA_VERSION is required}\"\n\n install_helm() {\n-\tcurl -fsSL \"https://raw.githubusercontent.com/helm/helm/${HELM_VERSION}/scripts/get-helm-3\" -o /tmp/get-helm-3\n-\tDESIRED_VERSION=\"${HELM_VERSION}\" bash /tmp/get-helm-3 --no-sudo\n+\t# get-helm-3 is not published under the v3.19 tag path; the script\n+\t# installs exactly DESIRED_VERSION, so the release stays at HELM_VERSION.\n+\tcurl -fsSL \"https://raw.githubusercontent.com/helm/helm/main/scripts/get-helm-3\" -o /tmp/get-helm-3\n+\tDESIRED_VERSION=\"${HELM_VERSION}\" VERIFY_CHECKSUM=true bash /tmp/get-helm-3 --no-sudo\n \thelm version --short | grep -F \"${HELM_VERSION}\"\n }\n\n install_check_jsonschema() {\n-\tpip install --no-cache-dir \"check-jsonschema==${CHECK_JSONSCHEMA_VERSION}\"\n+\tpip install --no-cache-dir --only-binary=:all: \"check-jsonschema==${CHECK_JSONSCHEMA_VERSION}\"\n \tcheck-jsonschema --version | grep -F \"${CHECK_JSONSCHEMA_VERSION}\"\n }\n@@ -48,6 +50,10 @@ main() {\n \tinstall_helm\n \tinstall_check_jsonschema\n+\techo \"gate image tools:\"\n+\thelm version --short\n+\tcheck-jsonschema --version\n }\n\n main \"$@\"\ndiff --git a/deploy/gate-image/README.md b/deploy/gate-image/README.md\nindex 1d6f0a2..7b3e9c4 100644\n--- a/deploy/gate-image/README.md\n+++ b/deploy/gate-image/README.md\n@@ -31,8 +31,8 @@ The image's tool versions are build ARGs in `Dockerfile`:\n | ARG | Version | Source |\n |---|---|---|\n | `GOLANGCI_LINT_VERSION` | v2.8.0 | golangci-lint release tag |\n-| `HELM_VERSION` | v3.18.4 | helm release, via get-helm-3 |\n-| `CHECK_JSONSCHEMA_VERSION` | 0.33.2 | PyPI |\n+| `HELM_VERSION` | v3.19.0 | helm release, via get-helm-3 |\n+| `CHECK_JSONSCHEMA_VERSION` | 0.34.1 | PyPI (wheel only) |\n",
+  "defect_phrases": [
+    "helm/helm/main/scripts/get-helm-3"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "deploy/gate-image/install-tools.sh"
+  },
+  "catch_probes": [
+    "default branch",
+    "main branch",
+    "master branch",
+    "branch head",
+    "branch tip",
+    "tip of main",
+    "head of main",
+    "push to main",
+    "pushes to main",
+    "lands on main",
+    "changes on main",
+    "commit on main",
+    "is mutable",
+    "a mutable",
+    "mutable ref",
+    "mutable url",
+    "floating ref",
+    "moving ref",
+    "moving target",
+    "not pinned",
+    "isn't pinned",
+    "is unpinned",
+    "unpinned script",
+    "unpinned installer",
+    "unpinned url",
+    "unpinned download",
+    "unpinned fetch",
+    "pin the script",
+    "pin the installer",
+    "pin the get-helm",
+    "immutable ref",
+    "immutable tag",
+    "immutable url",
+    "commit sha",
+    "to a tag",
+    "arbitrary code",
+    "whatever is on",
+    "whatever upstream",
+    "upstream compromise",
+    "compromised upstream",
+    "only checks the release",
+    "only verifies the release",
+    "not the script",
+    "script itself"
+  ],
+  "attribution_phrases": [
+    "install-tools.sh"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "supply_chain",
+      "note": "install-tools.sh now downloads get-helm-3 from the main branch and runs it; DESIRED_VERSION pins the helm binary, not the script, so any push to main runs arbitrary code in the gate image build. Fetch the script from the v3.19.0 tag or a commit SHA."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "install-tools.sh: the installer URL is a mutable ref; VERIFY_CHECKSUM only checks the release tarball the downloaded script chooses to fetch."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "install-tools.sh: piping downloaded tooling into bash during an image build is risky and dangerous; harden it."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "install-tools.sh: --only-binary=:all: fails the build if check-jsonschema 0.34.1 ships no wheel for the image's platform."
+    },
+    {
+      "severity": "low",
+      "category": "maintainability",
+      "note": "install-tools.sh: the closing echo prints versions already grepped above; drop the duplicate output."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Dockerfile: GOLANGCI_LINT_VERSION is unchanged; confirm it still matches CI's v2.8.0."
+    }
+  ]
+}

@@ -251,7 +251,7 @@ func RescoreCatchRateTrials(trialsPath string, in CatchRateInputs) (CatchRateRes
 		return 2
 	}
 	sort.SliceStable(rows, func(i, j int) bool { return rank(rows[i].name) < rank(rows[j].name) })
-	label, _, _ := strings.Cut(catchRuleVersion, ":")
+	label := catchRuleLabel(catchRuleVersion)
 	out := CatchRateRescore{
 		TrialsPath:          trialsPath,
 		RecordedAt:          trials.RecordedAt,

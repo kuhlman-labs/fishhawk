@@ -6,7 +6,9 @@ import (
 	"errors"
 	"math"
 	"os"
+	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 )
@@ -199,8 +201,65 @@ func TestCalibrate_AnyArmInTheTable(t *testing.T) {
 	}
 }
 
+// treeSnapshot records every directory (as "<dir>/") and regular file (its
+// bytes) under root, keyed by root-relative slash path.
+func treeSnapshot(t *testing.T, root string) map[string]string {
+	t.Helper()
+	snap := map[string]string{}
+	err := filepath.WalkDir(root, func(p string, d os.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		rel, err := filepath.Rel(root, p)
+		if err != nil || rel == "." {
+			return err
+		}
+		rel = filepath.ToSlash(rel)
+		if d.IsDir() {
+			snap[rel+"/"] = ""
+			return nil
+		}
+		b, err := os.ReadFile(p)
+		if err != nil {
+			return err
+		}
+		snap[rel] = string(b)
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return snap
+}
+
+// diffTreeSnapshots names every path created, removed or modified between two
+// snapshots of the same root.
+func diffTreeSnapshots(before, after map[string]string) []string {
+	var changed []string
+	for p, b := range before {
+		a, ok := after[p]
+		switch {
+		case !ok:
+			changed = append(changed, "removed "+p)
+		case a != b:
+			changed = append(changed, "modified "+p)
+		}
+	}
+	for p := range after {
+		if _, ok := before[p]; !ok {
+			changed = append(changed, "created "+p)
+		}
+	}
+	sort.Strings(changed)
+	return changed
+}
+
 // TestCalibrate_NeverWrites reads the committed evidence pair back after a
-// calibration run: byte-identical, modification time unchanged.
+// calibration run (byte-identical, modification time unchanged), then
+// calibrates EVERY arm against temp copies of the corpus directory and the
+// checkout root and asserts neither tree gained, lost or changed a file or
+// directory — so a write into an input the committed-evidence check cannot see
+// still fails.
 func TestCalibrate_NeverWrites(t *testing.T) {
 	paths := []string{planReviewCatchEvidencePath, CatchRateTrialsPath(planReviewCatchEvidencePath)}
 	before := make(map[string][]byte, len(paths))
@@ -223,6 +282,30 @@ func TestCalibrate_NeverWrites(t *testing.T) {
 		}
 		if fi.ModTime().UnixNano() != stamps[p] || !bytes.Equal(mustReadCatch(t, p), before[p]) {
 			t.Errorf("calibration modified %s", p)
+		}
+	}
+
+	in := copyPersonaRepo(t)
+	in.CorpusDir = copyCatchCorpus(t)
+	roots := map[string]string{"corpus dir": in.CorpusDir, "repo root": in.RepoRoot}
+	snaps := make(map[string]map[string]string, len(roots))
+	for name, root := range roots {
+		snaps[name] = treeSnapshot(t, root)
+	}
+	rows, err := catchRateArmTable(in)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, row := range rows {
+		sender := newScriptedCatchSender(t, 0, 0)
+		sender.persona = personaScriptFor(t, in.RepoRoot)
+		if _, err := CalibrateCatchRateArm(context.Background(), sender, in, row.name, 1); err != nil {
+			t.Fatalf("CalibrateCatchRateArm(%s): %v", row.name, err)
+		}
+	}
+	for name, root := range roots {
+		if changed := diffTreeSnapshots(snaps[name], treeSnapshot(t, root)); len(changed) > 0 {
+			t.Errorf("calibrating every arm changed the %s %s: %s", name, root, strings.Join(changed, ", "))
 		}
 	}
 }

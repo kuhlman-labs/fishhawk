@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://fishhawk.dev/spec/operator-role-overlay-v0.schema.json",
   "title": "Fishhawk operator role overlay v0 (.fishhawk/operator.yaml)",
-  "description": "Schema for the per-repo operator role overlay (ADR-040 D1). The overlay is thin by design: it may only select knob presets, set local conventions (merge-ritual specifics, escalation contacts/channels), and point at the repo's work-management config. It cannot define procedure — procedure added per-repo is definitionally a product gap; file an issue. The procedure fields below are declared with always-failing subschemas so a violation names the thinness rule.",
+  "description": "Schema for the per-repo operator role overlay (ADR-040 D1). The overlay is thin by design: it may only select knob presets, set local conventions (merge-ritual specifics, escalation contacts/channels), and point at the repo's work-management config. It cannot define procedure — procedure added per-repo is definitionally a product gap; file an issue. The procedure fields below (mission, gate_procedures, escalation, forbidden and the orchestration remit) are declared with always-failing subschemas so a violation names the thinness rule.",
 
   "type": "object",
   "additionalProperties": false,
@@ -59,6 +59,11 @@
     "forbidden": {
       "not": {
         "$comment": "thinness rule (ADR-040 D1): overlays cannot define procedure — per-repo procedure is a product gap; file an issue"
+      }
+    },
+    "orchestration": {
+      "not": {
+        "$comment": "thinness rule (ADR-040 D1, ADR-097 D1): the orchestration remit is base-spec procedure — an overlay can neither add to nor remove it; file an issue"
       }
     }
   }

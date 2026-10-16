@@ -66,10 +66,59 @@
       "minItems": 1,
       "items": { "type": "string", "minLength": 1 },
       "description": "Actions the role must never take, regardless of delegation."
+    },
+    "orchestration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["remit", "delegation", "reading_results"],
+      "x-intended-required": true,
+      "description": "The orchestration remit (ADR-097 D1, #4301): the driver reads gates, decides and dispositions, dispatches, merges and pages, and delegates evidence work to specialist jobs (docs/spec/specialist-job-v1.md) instead of doing it inline. This is procedure, so it lives ONLY here — an overlay that sets or nulls it fails the thinness rule. It is a remit, not a capability fence: the operator keeps its read scopes, so inline evidence work is a playbook deviation, never a permission error. Optional within operator-role-v0 (additive); the shipped default always carries it, and promotion to required belongs to a future operator-role-v1.",
+      "properties": {
+        "remit": {
+          "$ref": "#/$defs/procedure",
+          "description": "Ordered remit steps: what the driver does (read gates, decide, dispatch, merge, page), what it does NOT do inline (evidence work), and that the remit is playbook, not a fence."
+        },
+        "delegation": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["counterfactual_battery", "fanin_build", "overlap_scan", "plan_crosscheck", "inventory", "draft"],
+          "description": "One recipe per specialist-job kind. The key set is closed and equals the six kinds docs/spec/specialist-job-v1.schema.json defines; a new kind is a coordinated change to both schemas.",
+          "properties": {
+            "counterfactual_battery": { "$ref": "#/$defs/delegation_recipe" },
+            "fanin_build": { "$ref": "#/$defs/delegation_recipe" },
+            "overlap_scan": { "$ref": "#/$defs/delegation_recipe" },
+            "plan_crosscheck": { "$ref": "#/$defs/delegation_recipe" },
+            "inventory": { "$ref": "#/$defs/delegation_recipe" },
+            "draft": { "$ref": "#/$defs/delegation_recipe" }
+          }
+        },
+        "reading_results": {
+          "$ref": "#/$defs/procedure",
+          "description": "Ordered steps for reading a job result: the wait, the verdict, provenance (runner_attested vs bearer) and how to cite a result in a disposition or page."
+        }
+      }
     }
   },
 
   "$defs": {
+    "delegation_recipe": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["when", "read"],
+      "description": "How the driver uses one specialist-job kind (ADR-097 D1).",
+      "properties": {
+        "when": {
+          "type": "string",
+          "minLength": 1,
+          "description": "The situation that calls for requesting this kind."
+        },
+        "read": {
+          "type": "string",
+          "minLength": 1,
+          "description": "How to read the job's result: which evidence members matter and what each verdict means."
+        }
+      }
+    },
     "procedure": {
       "type": "array",
       "minItems": 1,

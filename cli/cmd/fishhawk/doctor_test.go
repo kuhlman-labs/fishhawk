@@ -1684,6 +1684,125 @@ func TestRunDoctor_SpecOnlyExcludesVerifyRung(t *testing.T) {
 	}
 }
 
+// --- host-environment rungs (doctor_env.go, #4088) ---------------------------
+
+// hostEnvRungLabels are the five host-environment rung labels.
+var hostEnvRungLabels = []string{"checkout location", "golangci-lint pin", "go toolchain pin", "host load", "orphaned shells"}
+
+// TestRunDoctor_HostEnvRungsWarnNeverFail drives runDoctor itself on the
+// all-green external-repo fixture with the env seams stubbed so EVERY
+// host-environment rung trips: each must render as `warn` followed by a
+// `hint:` line, none as `fail`, and the command still exits 0.
+func TestRunDoctor_HostEnvRungsWarnNeverFail(t *testing.T) {
+	dir := initCleanGitRepo(t)
+	writeValidSpec(t, dir)
+	mustWrite(t, filepath.Join(dir, "go.work"), "go 1.26.0\n")
+	mustWrite(t, filepath.Join(dir, "deploy", "gate-image", "Dockerfile"),
+		"ARG GO_VERSION=1.26.9\nARG GOLANGCI_LINT_VERSION=v2.12.2\n")
+
+	withFakeDoctorHTTP(t, externalRepoDoctorHTTP(externalRepoAllGreenReadinessJSON))
+	withFakeDoctorRunOutput(t, externalRepoDoctorRunOutput())
+	withFakeDoctorLookPath(t, func(_ string) (string, error) {
+		return "/usr/local/bin/fishhawk-runner", nil
+	})
+	withFakeDoctorCredLoad(t, func(_ string) (credstore.Credential, error) {
+		return credstore.Credential{Token: "fho_external_oauth"}, nil
+	})
+	origGitRemote := gitRemoteOriginURL
+	gitRemoteOriginURL = func(_ string) (string, error) {
+		return "https://github.com/acme/widgets.git", nil
+	}
+	t.Cleanup(func() { gitRemoteOriginURL = origGitRemote })
+
+	withFakeDoctorGOOS(t, "darwin")
+	withFakeDoctorNumCPU(t, 10)
+	withFakeDoctorReadFile(t, func(path string) ([]byte, error) {
+		if path == "/proc/loadavg" {
+			return nil, os.ErrNotExist
+		}
+		return os.ReadFile(path) //nolint:gosec // test fixture paths
+	})
+	withFakeDoctorEnvRunOutput(t, func(_ time.Duration, _ string, name string, args ...string) (string, error) {
+		switch name {
+		case "git":
+			if args[len(args)-1] == "--show-toplevel" {
+				return dir, nil
+			}
+			return "", errors.New("no common dir")
+		case "find":
+			return filepath.Join(dir, "evicted.go"), nil
+		case "golangci-lint":
+			return "golangci-lint has version 2.13.0 built with go1.27.0", nil
+		case "go":
+			return "go version go1.27.1 darwin/arm64", nil
+		case "sysctl":
+			return "{ 99.00 50.00 20.00 }", nil
+		case "ps":
+			if strings.Contains(args[len(args)-1], "ppid") {
+				return "5150 1 99.0 30:00 -zsh", nil
+			}
+			return "5150 99.0 -zsh", nil
+		}
+		return "", fmt.Errorf("unexpected command %s %v", name, args)
+	})
+
+	var stdout, stderr strings.Builder
+	got := run([]string{
+		"doctor",
+		"--backend-url", "http://localhost:8080",
+		"--repo", "acme/widgets",
+		"--working-dir", dir,
+		"--runner-binary", "/usr/local/bin/fishhawk-runner",
+	}, &stdout, &stderr)
+
+	out := stdout.String()
+	if got != exitOK {
+		t.Fatalf("run = %d, want exitOK (host-environment rungs never fail); stdout:\n%s", got, out)
+	}
+	lines := strings.Split(out, "\n")
+	for _, label := range hostEnvRungLabels {
+		found := false
+		for i, line := range lines {
+			if !strings.HasPrefix(line, label+" ") {
+				continue
+			}
+			found = true
+			status := strings.TrimRight(line, " ")
+			if strings.HasSuffix(status, "fail") {
+				t.Errorf("%q rendered as fail: %q", label, line)
+			}
+			if !strings.HasSuffix(status, "warn") {
+				t.Errorf("%q not rendered as warn: %q", label, line)
+			}
+			if i+1 >= len(lines) || !strings.HasPrefix(lines[i+1], "  hint: ") {
+				t.Errorf("%q warn carries no hint line:\n%s", label, out)
+			}
+		}
+		if !found {
+			t.Errorf("%q rung not rendered:\n%s", label, out)
+		}
+	}
+}
+
+// TestRunDoctor_SpecOnlyExcludesHostEnvRungs: --spec-only is environment-free
+// by contract, so none of the host-environment rungs renders and none of
+// their seams is reached.
+func TestRunDoctor_SpecOnlyExcludesHostEnvRungs(t *testing.T) {
+	dir := t.TempDir()
+	writeValidSpec(t, dir)
+	withFakeDoctorEnvRunOutput(t, func(_ time.Duration, _ string, name string, args ...string) (string, error) {
+		t.Errorf("--spec-only reached a host-environment exec: %s %v", name, args)
+		return "", errors.New("unexpected")
+	})
+	var stdout, stderr strings.Builder
+	runDoctor([]string{"--spec-only", "--working-dir", dir}, &stdout, &stderr)
+	for _, label := range hostEnvRungLabels {
+		if strings.Contains(stdout.String(), label) {
+			t.Errorf("--spec-only rendered the %q rung:\n%s", label, stdout.String())
+		}
+	}
+}
+
 // --- token rung: proactive refresh + fatal refresh failure (#2393) ----------
 
 func withFakeDoctorCredRefresh(t *testing.T, fn func(string) (credstore.Credential, error)) {

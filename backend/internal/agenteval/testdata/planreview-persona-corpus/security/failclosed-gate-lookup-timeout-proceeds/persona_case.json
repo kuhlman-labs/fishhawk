@@ -1,0 +1,153 @@
+{
+  "persona": "security",
+  "kind": "defect",
+  "expect": "catch",
+  "lens": "fail_closed",
+  "issue_title": "Merge gate: tolerate a slow review-coverage read",
+  "issue_body": "When the database is under load, the merge gate's review-coverage read sometimes hits its 2s store deadline and the merge request answers 500, which the operator then retries by hand. Retry the read once after a deadline, flatten the nested error handling in handleMergeRun so each outcome is easy to read, and count the retries so we can see how often it happens.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94403",
+      "id": "kuhlman-labs/fishhawk#94403"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Retry the merge gate's review-coverage read once after a store deadline, flatten its error handling into a switch, and count the retries.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/server/merge_gate.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/metrics.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/merge_gate_test.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In merge_gate.go, add lookupCoverage: call reviewCoverageFor and, on context.DeadlineExceeded, call it once more (reviewCoverageFor applies its own 2s deadline per call)."
+      },
+      {
+        "step": 2,
+        "description": "Replace the nested ifs in handleMergeRun with a switch over the read error: incomplete coverage and a not-found read answer 409, any other error answers 500, and a deadline gets its own case with a warning log."
+      },
+      {
+        "step": 3,
+        "description": "Add the mergeGateLookupRetries counter to metrics.go."
+      },
+      {
+        "step": 4,
+        "description": "Extend merge_gate_test.go: a read that times out once and then succeeds queues the merge, and a generic read error answers 500."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Handler tests against the store fake, which returns a scripted error sequence per coverage read.",
+      "rollback_plan": "Revert the commit.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-deadline-retried",
+          "statement": "A review-coverage read that hits the store deadline once is retried and the merge completes.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94403"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "diff": "diff --git a/backend/internal/server/merge_gate.go b/backend/internal/server/merge_gate.go\nindex 3f9a1c2..e04b7d5 100644\n--- a/backend/internal/server/merge_gate.go\n+++ b/backend/internal/server/merge_gate.go\n@@ -88,25 +88,41 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {\n \trun, ok := s.loadRunForMerge(w, r)\n \tif !ok {\n \t\treturn\n \t}\n-\tcov, err := s.reviewCoverageFor(r.Context(), run.ID, run.HeadSHA)\n-\tif err != nil {\n-\t\tif errors.Is(err, store.ErrNotFound) {\n-\t\t\twriteError(w, http.StatusConflict, \"coverage_missing\", \"run %s has no review coverage at %s\", run.ID, run.HeadSHA)\n-\t\t\treturn\n-\t\t}\n-\t\twriteError(w, http.StatusInternalServerError, \"coverage_lookup_failed\", \"%v\", err)\n-\t\treturn\n-\t}\n-\tif !cov.Complete() {\n-\t\twriteError(w, http.StatusConflict, \"coverage_incomplete\", \"run %s: %s\", run.ID, cov.Missing())\n-\t\treturn\n-\t}\n+\tcov, err := s.lookupCoverage(r.Context(), run)\n+\tswitch {\n+\tcase err == nil:\n+\t\tif !cov.Complete() {\n+\t\t\twriteError(w, http.StatusConflict, \"coverage_incomplete\", \"run %s: %s\", run.ID, cov.Missing())\n+\t\t\treturn\n+\t\t}\n+\tcase errors.Is(err, store.ErrNotFound):\n+\t\twriteError(w, http.StatusConflict, \"coverage_missing\", \"run %s has no review coverage at %s\", run.ID, run.HeadSHA)\n+\t\treturn\n+\tcase errors.Is(err, context.DeadlineExceeded):\n+\t\ts.log.Warn(\"merge: review coverage lookup timed out after retry\", \"run\", run.ID, \"head\", run.HeadSHA, \"err\", err)\n+\tdefault:\n+\t\twriteError(w, http.StatusInternalServerError, \"coverage_lookup_failed\", \"%v\", err)\n+\t\treturn\n+\t}\n \tif err := s.queueMerge(r.Context(), run); err != nil {\n \t\twriteError(w, http.StatusBadGateway, \"merge_queue_failed\", \"%v\", err)\n \t\treturn\n \t}\n \twriteJSON(w, http.StatusAccepted, mergeAccepted{RunID: run.ID})\n }\n+\n+// lookupCoverage reads the run's review coverage at its head. A read that\n+// hits the store deadline is retried once; reviewCoverageFor applies its own\n+// 2s deadline per call.\n+func (s *Server) lookupCoverage(ctx context.Context, run store.Run) (store.Coverage, error) {\n+\tcov, err := s.reviewCoverageFor(ctx, run.ID, run.HeadSHA)\n+\tif !errors.Is(err, context.DeadlineExceeded) {\n+\t\treturn cov, err\n+\t}\n+\tmergeGateLookupRetries.Inc()\n+\treturn s.reviewCoverageFor(ctx, run.ID, run.HeadSHA)\n+}\ndiff --git a/backend/internal/server/metrics.go b/backend/internal/server/metrics.go\nindex 71c0d3e..5a8e2f6 100644\n--- a/backend/internal/server/metrics.go\n+++ b/backend/internal/server/metrics.go\n@@ -52,6 +52,12 @@ var (\n \t\tName: \"fishhawkd_merge_queue_depth\",\n \t\tHelp: \"Runs waiting in the merge queue.\",\n \t})\n+\t// mergeGateLookupRetries counts merge-gate review-coverage reads retried\n+\t// after a deadline.\n+\tmergeGateLookupRetries = promauto.NewCounter(prometheus.CounterOpts{\n+\t\tName: \"fishhawkd_merge_gate_lookup_retries_total\",\n+\t\tHelp: \"Review-coverage reads the merge gate retried after a deadline.\",\n+\t})\n )\ndiff --git a/backend/internal/server/merge_gate_test.go b/backend/internal/server/merge_gate_test.go\nindex a81d4c0..2f6b9e3 100644\n--- a/backend/internal/server/merge_gate_test.go\n+++ b/backend/internal/server/merge_gate_test.go\n@@ -140,6 +140,32 @@ func TestHandleMergeRun_CoverageMissing(t *testing.T) {\n \tif rec.Code != http.StatusConflict {\n \t\tt.Fatalf(\"status = %d, want 409\", rec.Code)\n \t}\n }\n+\n+func TestHandleMergeRun_CoverageReadRetriedAfterDeadline(t *testing.T) {\n+\tsrv, st := newMergeGateServer(t)\n+\tst.coverageErrs = []error{context.DeadlineExceeded, nil}\n+\tst.coverage = completeCoverage()\n+\trec := doMerge(t, srv, \"run-1\")\n+\tif rec.Code != http.StatusAccepted {\n+\t\tt.Fatalf(\"status = %d, want 202\", rec.Code)\n+\t}\n+\tif st.coverageCalls != 2 {\n+\t\tt.Errorf(\"coverage reads = %d, want 2\", st.coverageCalls)\n+\t}\n+}\n+\n+func TestHandleMergeRun_CoverageReadError(t *testing.T) {\n+\tsrv, st := newMergeGateServer(t)\n+\tst.coverageErrs = []error{errors.New(\"connection reset\")}\n+\trec := doMerge(t, srv, \"run-1\")\n+\tif rec.Code != http.StatusInternalServerError {\n+\t\tt.Fatalf(\"status = %d, want 500\", rec.Code)\n+\t}\n+\tif st.queued != 0 {\n+\t\tt.Errorf(\"merges queued = %d, want 0\", st.queued)\n+\t}\n+}\n",
+  "defect_phrases": [
+    "lookupCoverage",
+    "review coverage lookup timed out after retry"
+  ],
+  "anchor": {
+    "kind": "diff_file",
+    "path": "backend/internal/server/merge_gate.go"
+  },
+  "catch_probes": [
+    "fails open",
+    "fail open",
+    "fail-open",
+    "fails-open",
+    "failing open",
+    "missing return",
+    "missing a return",
+    "no return",
+    "without returning",
+    "without a return",
+    "falls out of the switch",
+    "falls through",
+    "fall through",
+    "falling through",
+    "still merges",
+    "still queues",
+    "still calls queuemerge",
+    "merges anyway",
+    "merge anyway",
+    "queues anyway",
+    "merge proceeds",
+    "proceeds to queue",
+    "proceeds to merge",
+    "goes on to queue",
+    "without review coverage",
+    "without coverage",
+    "unreviewed head",
+    "unreviewed commit",
+    "unknown coverage",
+    "coverage is unknown",
+    "unverified coverage",
+    "should refuse",
+    "should be refused",
+    "is not refused",
+    "not refused"
+  ],
+  "attribution_phrases": [
+    "merge_gate.go"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "fail_closed",
+      "note": "merge_gate.go: the context.DeadlineExceeded case only logs a warning and has no return, so after a second timeout handleMergeRun falls out of the switch and calls queueMerge: the gate fails open and merges without review coverage."
+    },
+    {
+      "severity": "medium",
+      "category": "security",
+      "note": "In merge_gate.go a coverage read that times out twice still queues the merge; a timeout should refuse like the default branch does."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "merge_gate.go: changing a merge gate is a security risk; harden it."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "merge_gate.go: lookupCoverage retries with the request's context, so a request already past its own deadline retries for nothing; derive the retry from a fresh context."
+    },
+    {
+      "severity": "low",
+      "category": "observability",
+      "note": "merge_gate.go: the warning log should carry the elapsed time of both reads."
+    },
+    {
+      "severity": "low",
+      "category": "observability",
+      "note": "metrics.go: the retry counter has no label for the outcome of the retried read."
+    }
+  ]
+}
