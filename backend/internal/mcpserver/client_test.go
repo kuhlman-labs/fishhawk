@@ -25,6 +25,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -394,7 +395,15 @@ func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
 		}
 	}
 
-	s := server.New(server.Config{RunRepo: runRepo})
+	// The ingest admits the run-bound token of THIS run (#4483), so the POST
+	// carries a real fhm_ bearer minted for the seeded run with the runner's
+	// heartbeat scopes, authenticated through the real bearerAuth middleware.
+	mcpTokens := mcptoken.NewPostgresRepository(pool)
+	runTok, err := mcpTokens.Issue(ctx, mcptoken.IssueParams{RunID: row.ID, Scopes: []string{"mcp:read"}})
+	if err != nil {
+		t.Fatalf("issue run-bound token: %v", err)
+	}
+	s := server.New(server.Config{RunRepo: runRepo, MCPTokenRepo: mcpTokens})
 	ts := httptest.NewServer(s.Handler())
 	t.Cleanup(ts.Close)
 
@@ -422,6 +431,7 @@ func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
 		ts.URL+"/v0/runs/"+row.ID.String()+"/stages/"+stage.ID.String()+"/progress",
 		bytes.NewReader(reportBody))
 	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+runTok.PlainText)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatalf("POST progress: %v", err)

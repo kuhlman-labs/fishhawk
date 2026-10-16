@@ -329,7 +329,7 @@ func TestFetchStatus_HappyPath(t *testing.T) {
 	defer srv.Close()
 
 	runID := uuid.New().String()
-	got, err := FetchStatus(srv.URL, runID)
+	got, err := FetchStatus(srv.URL, "", runID)
 	if err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
@@ -347,7 +347,7 @@ func TestFetchStatus_BackendError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	_, err := FetchStatus(srv.URL, uuid.New().String())
+	_, err := FetchStatus(srv.URL, "", uuid.New().String())
 	if err == nil {
 		t.Fatal("expected error on 404 response")
 	}
@@ -369,7 +369,7 @@ func TestRecordCommentID_HappyPath(t *testing.T) {
 	defer srv.Close()
 
 	runID := uuid.New().String()
-	if err := RecordCommentID(srv.URL, runID, 42); err != nil {
+	if err := RecordCommentID(srv.URL, "", runID, 42); err != nil {
 		t.Fatalf("err = %v, want nil", err)
 	}
 	if gotPayload["github_comment_id"].(float64) != 42 {
@@ -383,11 +383,140 @@ func TestRecordCommentID_BackendError(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	err := RecordCommentID(srv.URL, uuid.New().String(), 1)
+	err := RecordCommentID(srv.URL, "", uuid.New().String(), 1)
 	if err == nil {
 		t.Fatal("expected error on 500 response")
 	}
 	if !strings.Contains(err.Error(), "HTTP 500") {
 		t.Errorf("err = %v, want HTTP 500 mention", err)
+	}
+}
+
+// authRecorder is an httptest server that records the Authorization header
+// of each request and answers with status (and, for a GET, an empty
+// StatusCommentResponse body).
+func authRecorder(t *testing.T, status int) (*httptest.Server, *[]string) {
+	t.Helper()
+	got := new([]string)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		*got = append(*got, r.Header.Get("Authorization"))
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(StatusCommentResponse{})
+			return
+		}
+		w.WriteHeader(status)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, got
+}
+
+// TestRecordCommentID_SendsBearer pins the bearer on the record-id POST
+// (#4483): the route now requires write:runs, so the CLI's resolved token
+// must ride the request. The empty-token arm sends NO header, keeping the
+// token-less request shape. Deleting the Header.Set leaves the header empty
+// and turns the first arm RED.
+func TestRecordCommentID_SendsBearer(t *testing.T) {
+	for _, tc := range []struct {
+		name, token, want string
+	}{
+		{name: "token", token: "tok", want: "Bearer tok"},
+		{name: "empty_token", token: "", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := authRecorder(t, http.StatusCreated)
+			if err := RecordCommentID(srv.URL, tc.token, uuid.New().String(), 7); err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if len(*got) != 1 || (*got)[0] != tc.want {
+				t.Errorf("Authorization headers = %q, want [%q]", *got, tc.want)
+			}
+		})
+	}
+}
+
+// TestFetchStatus_SendsBearer pins the bearer on the rendered-body GET, the
+// same two arms as TestRecordCommentID_SendsBearer.
+func TestFetchStatus_SendsBearer(t *testing.T) {
+	for _, tc := range []struct {
+		name, token, want string
+	}{
+		{name: "token", token: "tok", want: "Bearer tok"},
+		{name: "empty_token", token: "", want: ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv, got := authRecorder(t, http.StatusOK)
+			if _, err := FetchStatus(srv.URL, tc.token, uuid.New().String()); err != nil {
+				t.Fatalf("err = %v, want nil", err)
+			}
+			if len(*got) != 1 || (*got)[0] != tc.want {
+				t.Errorf("Authorization headers = %q, want [%q]", *got, tc.want)
+			}
+		})
+	}
+}
+
+// TestStatusCommentCalls_InvalidBackendURL pins the request-construction
+// error branches: a backend URL that does not parse fails before any request
+// is sent, on both calls.
+func TestStatusCommentCalls_InvalidBackendURL(t *testing.T) {
+	const bad = "http://bad\x7fhost"
+	if _, err := FetchStatus(bad, "tok", uuid.New().String()); err == nil || !strings.Contains(err.Error(), "fetch status") {
+		t.Errorf("FetchStatus err = %v, want a fetch status error", err)
+	}
+	if err := RecordCommentID(bad, "tok", uuid.New().String(), 1); err == nil || !strings.Contains(err.Error(), "record comment id") {
+		t.Errorf("RecordCommentID err = %v, want a record comment id error", err)
+	}
+}
+
+// TestPostOrEditStatusComment_SendsBearerOnBothCalls drives the composed
+// fetch → gh → record path (#4483): the resolved token must ride BOTH the
+// rendered-body GET and the record-id POST, and the id gh returns is the id
+// recorded. Dropping token from either inner call turns this RED.
+func TestPostOrEditStatusComment_SendsBearerOnBothCalls(t *testing.T) {
+	withFakeGhOutput(t, "99")
+	var auths []string
+	var recorded map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		auths = append(auths, r.Method+" "+r.Header.Get("Authorization"))
+		if r.Method == http.MethodGet {
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(StatusCommentResponse{Body: "status body"})
+			return
+		}
+		_ = json.NewDecoder(r.Body).Decode(&recorded)
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer srv.Close()
+
+	if err := PostOrEditStatusComment(srv.URL, "tok", uuid.New().String(), "owner/name", 3); err != nil {
+		t.Fatalf("err = %v, want nil", err)
+	}
+	want := []string{"GET Bearer tok", "POST Bearer tok"}
+	if len(auths) != len(want) || auths[0] != want[0] || auths[1] != want[1] {
+		t.Errorf("requests = %q, want %q", auths, want)
+	}
+	if got, _ := recorded["github_comment_id"].(float64); got != 99 {
+		t.Errorf("recorded github_comment_id = %v, want 99", recorded["github_comment_id"])
+	}
+}
+
+// TestPostOrEditStatusComment_FetchErrorStopsBeforeGh: a failed body fetch
+// is returned wrapped and gh is never invoked.
+func TestPostOrEditStatusComment_FetchErrorStopsBeforeGh(t *testing.T) {
+	origCmd := ghCommentCommand
+	ghCommentCommand = func(_ string, _ ...string) *exec.Cmd {
+		t.Error("gh must NOT be invoked after a failed fetch")
+		return exec.Command("/usr/bin/false")
+	}
+	t.Cleanup(func() { ghCommentCommand = origCmd })
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	err := PostOrEditStatusComment(srv.URL, "tok", uuid.New().String(), "owner/name", 3)
+	if err == nil || !strings.Contains(err.Error(), "fetch rendered body") {
+		t.Errorf("err = %v, want a fetch rendered body error", err)
 	}
 }

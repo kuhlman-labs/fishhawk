@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -115,15 +116,57 @@ func (a *scAuditFake) AppendChained(_ context.Context, p audit.ChainAppendParams
 	}, nil
 }
 
+// writeRunsBearer / readRunsBearer are the plaintexts the status-comment and
+// stage-progress tests present through the real bearerAuth middleware
+// (#4483). The write bearer is the operator-default shape (write:runs); the
+// read bearer carries read:runs only, disjoint from write:runs BY
+// CONSTRUCTION, with a github: subject so no run-bound arm can intervene.
+// bearerAuth sets TokenID from the token row, so requireWriteScope's
+// cookie-session bypass cannot admit either.
+const (
+	writeRunsBearer = "fhk_write_scope_write_runs"
+	readRunsBearer  = "fhk_write_scope_read_runs"
+)
+
+// writeScopeTokenRepo authenticates the two bearers above.
+type writeScopeTokenRepo struct {
+	apitoken.Repository
+}
+
+func (writeScopeTokenRepo) Authenticate(_ context.Context, plaintext string) (*apitoken.Token, error) {
+	switch plaintext {
+	case writeRunsBearer:
+		return &apitoken.Token{ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:runs"}, PlainText: plaintext}, nil
+	case readRunsBearer:
+		return &apitoken.Token{ID: uuid.New(), Subject: "github:reader", Scopes: []string{"read:runs"}, PlainText: plaintext}, nil
+	}
+	return nil, apitoken.ErrNotFound
+}
+
 func newSCServer(t *testing.T, stored *run.Run, stages []*run.Stage, af *scAuditFake) *Server {
 	t.Helper()
 	repo := &statusCommentRunRepo{stored: stored, stages: stages}
 	return New(Config{
-		Addr:        "127.0.0.1:0",
-		RunRepo:     repo,
-		AuditRepo:   af,
-		ExternalURL: "http://localhost:8080",
+		Addr:         "127.0.0.1:0",
+		RunRepo:      repo,
+		AuditRepo:    af,
+		APITokenRepo: writeScopeTokenRepo{},
+		ExternalURL:  "http://localhost:8080",
 	})
+}
+
+// postSC drives POST /v0/runs/{id}/status-comment through the registered mux
+// (bearerAuth, requireRunAccount, then the handler). An empty bearer sends no
+// Authorization header — the anonymous shape.
+func postSC(s *Server, runID uuid.UUID, body, bearer string) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodPost,
+		fmt.Sprintf("/v0/runs/%s/status-comment", runID), strings.NewReader(body))
+	if bearer != "" {
+		req.Header.Set("Authorization", "Bearer "+bearer)
+	}
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	return w
 }
 
 // --- GET tests ---
@@ -242,10 +285,7 @@ func TestPostStatusComment_HappyPath(t *testing.T) {
 	af := &scAuditFake{}
 	s := newSCServer(t, runRow, nil, af)
 
-	body := `{"github_comment_id": 12345}`
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", runID), strings.NewReader(body)))
+	w := postSC(s, runID, `{"github_comment_id": 12345}`, writeRunsBearer)
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 	}
@@ -282,10 +322,7 @@ func TestPostStatusComment_SubsequentGETReadsBackPostedID(t *testing.T) {
 	s := newSCServer(t, runRow, nil, af)
 
 	// POST the comment id.
-	postBody := `{"github_comment_id": 777}`
-	w1 := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w1, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", runID), strings.NewReader(postBody)))
+	w1 := postSC(s, runID, `{"github_comment_id": 777}`, writeRunsBearer)
 	if w1.Code != http.StatusCreated {
 		t.Fatalf("POST status = %d", w1.Code)
 	}
@@ -313,10 +350,7 @@ func TestPostStatusComment_SubsequentGETReadsBackPostedID(t *testing.T) {
 
 func TestPostStatusComment_NotFound(t *testing.T) {
 	s := newSCServer(t, nil, nil, &scAuditFake{})
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", uuid.New()),
-		strings.NewReader(`{"github_comment_id": 1}`)))
+	w := postSC(s, uuid.New(), `{"github_comment_id": 1}`, writeRunsBearer)
 	if w.Code != http.StatusNotFound {
 		t.Errorf("status = %d, want 404", w.Code)
 	}
@@ -327,10 +361,7 @@ func TestPostStatusComment_InvalidCommentID(t *testing.T) {
 	runRow := &run.Run{ID: runID, Repo: "x/y", WorkflowID: "f", State: run.StatePending}
 	s := newSCServer(t, runRow, nil, &scAuditFake{})
 
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", runID),
-		strings.NewReader(`{"github_comment_id": 0}`)))
+	w := postSC(s, runID, `{"github_comment_id": 0}`, writeRunsBearer)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
@@ -344,10 +375,7 @@ func TestPostStatusComment_BadJSON(t *testing.T) {
 	runRow := &run.Run{ID: runID, Repo: "x/y", WorkflowID: "f", State: run.StatePending}
 	s := newSCServer(t, runRow, nil, &scAuditFake{})
 
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", runID),
-		strings.NewReader("not json")))
+	w := postSC(s, runID, "not json", writeRunsBearer)
 	if w.Code != http.StatusBadRequest {
 		t.Errorf("status = %d, want 400", w.Code)
 	}
@@ -359,21 +387,15 @@ func TestPostStatusComment_AuditAppendFails(t *testing.T) {
 	af := &scAuditFake{appendErr: errors.New("db down")}
 	s := newSCServer(t, runRow, nil, af)
 
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", runID),
-		strings.NewReader(`{"github_comment_id": 1}`)))
+	w := postSC(s, runID, `{"github_comment_id": 1}`, writeRunsBearer)
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
 	}
 }
 
 func TestPostStatusComment_NilRunRepo(t *testing.T) {
-	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &scAuditFake{}})
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", uuid.New()),
-		strings.NewReader(`{"github_comment_id": 1}`)))
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &scAuditFake{}, APITokenRepo: writeScopeTokenRepo{}})
+	w := postSC(s, uuid.New(), `{"github_comment_id": 1}`, writeRunsBearer)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
 	}
@@ -383,13 +405,67 @@ func TestPostStatusComment_NilAuditRepo(t *testing.T) {
 	runID := uuid.New()
 	runRow := &run.Run{ID: runID, Repo: "x/y", WorkflowID: "f", State: run.StatePending}
 	repo := &statusCommentRunRepo{stored: runRow}
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo})
-	w := httptest.NewRecorder()
-	s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodPost,
-		fmt.Sprintf("/v0/runs/%s/status-comment", runID),
-		strings.NewReader(`{"github_comment_id": 1}`)))
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: repo, APITokenRepo: writeScopeTokenRepo{}})
+	w := postSC(s, runID, `{"github_comment_id": 1}`, writeRunsBearer)
 	if w.Code != http.StatusServiceUnavailable {
 		t.Errorf("status = %d, want 503", w.Code)
+	}
+}
+
+// TestPostStatusComment_ReadOnlyToken_Refused pins the write:runs rung on the
+// status-comment POST (#4483). The control's effect is a COMMITTED hash-chain
+// row (status_comment_posted), so every arm reads the audit fake's append
+// count, not just the status code: with the rung deleted, the read-only and
+// anonymous arms reach AppendChained and return 201 with one append.
+func TestPostStatusComment_ReadOnlyToken_Refused(t *testing.T) {
+	cases := []struct {
+		name        string
+		bearer      string
+		wantStatus  int
+		wantCode    string
+		wantAppends int
+	}{
+		{name: "read_only_token", bearer: readRunsBearer, wantStatus: http.StatusForbidden, wantCode: "insufficient_scope", wantAppends: 0},
+		{name: "anonymous", bearer: "", wantStatus: http.StatusUnauthorized, wantCode: "authentication_required", wantAppends: 0},
+		{name: "write_runs_token", bearer: writeRunsBearer, wantStatus: http.StatusCreated, wantAppends: 1},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			runRow := &run.Run{
+				ID: runID, Repo: "x/y", WorkflowID: "feature", State: run.StatePending,
+				IssueContext: &run.IssueContext{Number: 42},
+			}
+			af := &scAuditFake{}
+			s := newSCServer(t, runRow, nil, af)
+
+			w := postSC(s, runID, `{"github_comment_id": 12345}`, tc.bearer)
+			// Committed state first, so a missing rung reports BOTH the
+			// unwanted row and the wrong status.
+			if got := len(af.appendedParams); got != tc.wantAppends {
+				t.Errorf("status_comment_posted appends = %d, want %d", got, tc.wantAppends)
+			}
+			if w.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d:\n%s", w.Code, tc.wantStatus, w.Body.String())
+			}
+			if tc.wantCode != "" {
+				var env struct {
+					Error struct {
+						Code    string         `json:"code"`
+						Details map[string]any `json:"details"`
+					} `json:"error"`
+				}
+				if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+					t.Fatalf("decode error envelope: %v (%s)", err, w.Body.String())
+				}
+				if env.Error.Code != tc.wantCode {
+					t.Errorf("error code = %q, want %q", env.Error.Code, tc.wantCode)
+				}
+				if tc.wantCode == "insufficient_scope" && env.Error.Details["required_scope"] != "write:runs" {
+					t.Errorf("required_scope = %v, want write:runs", env.Error.Details["required_scope"])
+				}
+			}
+		})
 	}
 }
 

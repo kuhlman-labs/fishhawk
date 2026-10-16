@@ -17044,6 +17044,15 @@ paths:
         The reporter is fail-open by construction on the runner side: a lost
         heartbeat is superseded ~15s later and can never fail a stage.
 
+        **Auth (#4483).** A run-bound `mcp:run:<uuid>` token is admitted only
+        on its OWN run (the runner's heartbeat bearer, which carries `mcp:read`
+        and never `write:runs`); a run-bound token for any other run is `403
+        run_not_entitled`. Every other bearer needs `write:runs` (`403
+        insufficient_scope` otherwise), and an anonymous caller is `401`. A
+        cookie session is admitted, bounded by the `memberWrite` tier. The
+        check runs before the body is read, so a refused heartbeat records
+        nothing.
+
         `reported_at` is stamped by the DATABASE at ingest (Postgres `now()`),
         so it shares a clock domain with the dispatch stamp the dispatch
         watchdog compares it against (#3084); the runner does not set it.
@@ -17074,7 +17083,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_not_entitled` — a run-bound token for a DIFFERENT run than the
+            path `run_id` (`details.run_id`). `insufficient_scope` — a
+            non-run-bound bearer without `write:runs`
+            (`details.required_scope`). `account_forbidden` — the run belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: |
             `stage_not_found` — no stage with that id, or the stage's `run_id`
@@ -17555,6 +17574,14 @@ paths:
         Appends a `status_comment_posted` audit entry with the returned
         `github_comment_id` so subsequent GET calls can return it for
         edit-in-place targeting. Idempotent: multiple POSTs are safe (#428).
+
+        **Auth (#4483).** Requires `write:runs`, checked before the
+        configuration checks and the body read: an anonymous caller is `401`
+        and a bearer without `write:runs` (a read-only token, a first-officer
+        seat) is `403 insufficient_scope`; neither appends a row. A run-bound
+        `mcp:run` token gets no exemption. The CLI sends the bearer it already
+        resolved (flag, env or credstore). A cookie session is admitted,
+        bounded by the `memberWrite` tier.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -17576,6 +17603,14 @@ paths:
         '400':
           description: "`validation_failed` — `github_comment_id` missing or ≤ 0."
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — the bearer lacks `write:runs`
+            (`details.required_scope`). `account_forbidden` — the run belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '503': { description: Run repository unavailable. }
 
@@ -21182,6 +21217,12 @@ paths:
         agent token must file run-scoped (supply its own `run_id`) and is
         rejected with `403 run_scoped_filing_required` if it omits `run_id`.
 
+        **Auth (#4481).** A non-run-bound bearer needs `write:runs`, checked
+        before the body is read: a read-only token is `403
+        insufficient_scope` and nothing is filed. A run-bound `mcp:run:<uuid>`
+        token is exempt and held to its own run instead (`run_not_entitled`,
+        `run_scoped_filing_required` above). A cookie session is admitted.
+
         An unregistered/unimplemented provider id fails closed with `501
         provider_unimplemented` naming the missing provider — never a panic.
       tags: [work-items]
@@ -21217,6 +21258,8 @@ paths:
             first-officer seat (`first_officer/…` subject, E85.6 / #4148),
             refused before the handler whatever its scopes: a seat never
             writes tracker state.
+            `insufficient_scope` — a non-run-bound bearer without `write:runs`
+            (`details.required_scope`, #4481); nothing is filed.
         '404':
           description: "`run_not_found` — `run_id` supplied but no such run."
         '413':
