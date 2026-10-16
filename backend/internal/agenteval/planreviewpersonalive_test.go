@@ -118,7 +118,8 @@ func TestCalibrationLiveKnobs(t *testing.T) {
 // TestCatchRateCalibrationLive_WiresCatchRateGeneratorModel is OFFLINE: the
 // live seam builds ONE generator on the catch-rate model and calibrates the
 // committed architect arm end to end (a scripted sender catching every catch
-// case is ABOVE band, so the live test would fail on it).
+// case is ABOVE band, so the live test would fail on it). The want is every
+// committed catch case, counted from the loaded corpus.
 func TestCatchRateCalibrationLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	var got []anthropic.Config
 	cal, model, err := calibrateLive(context.Background(), func(c anthropic.Config) MessageSender {
@@ -131,8 +132,14 @@ func TestCatchRateCalibrationLive_WiresCatchRateGeneratorModel(t *testing.T) {
 	if len(got) != 1 || got[0].Model != "claude-sonnet-5-5" || model != "claude-sonnet-5-5" {
 		t.Errorf("generator configs = %+v, model %q; want one claude-sonnet-5-5 client", got, model)
 	}
-	if oob := cal.OutOfBand(); len(oob) != 3 {
-		t.Errorf("OutOfBand() = %v, want the 3 always-caught architect catch cases", oob)
+	nCatch := 0
+	for _, c := range loadCommittedPersona(t) {
+		if c.Expect() == CatchExpectCatch {
+			nCatch++
+		}
+	}
+	if oob := cal.OutOfBand(); len(oob) != nCatch {
+		t.Errorf("OutOfBand() = %v, want the %d always-caught architect catch cases", oob, nCatch)
 	}
 }
 
