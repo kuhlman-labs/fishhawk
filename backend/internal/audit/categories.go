@@ -374,6 +374,7 @@ var KnownCategories = map[string]struct{}{
 	"campaign_admission_screened":             {},
 	"campaign_advanced":                       {},
 	"campaign_cancelled":                      {},
+	"campaign_dependencies_refreshed":         {}, // E86.47 / #4358: the monotone tracker-edge refresh added held depends_on edges (server/campaign_dependency_refresh.go) — INTERNAL
 	"campaign_gate_acted":                     {},
 	"campaign_gate_paged":                     {},
 	"campaign_grooming_source_resolved":       {},
@@ -381,6 +382,7 @@ var KnownCategories = map[string]struct{}{
 	"campaign_issue_settled":                  {},
 	"campaign_issue_started":                  {},
 	"campaign_item_autonomy_refreshed":        {},
+	"campaign_items_appended":                 {}, // E86.47 / #4358: POST /v0/campaigns/{id}/items appended issues to an existing campaign, recorded before commit (server/campaign_append.go) — INTERNAL
 	"campaign_paused":                         {},
 	"captain_assigned":                        {},
 	"captain_claimed":                         {},

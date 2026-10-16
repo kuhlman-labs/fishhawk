@@ -2737,3 +2737,234 @@ func TestPostgres_GroomingCurrencyGuard(t *testing.T) {
 }
 
 func uuidPtr(u uuid.UUID) *uuid.UUID { return &u }
+
+// --- AppendCampaignItems (E86.47 / #4358) ---
+
+// appendFixture seeds a campaign with items via the repository and returns the
+// repo, campaign and items by ref.
+func appendFixture(t *testing.T, items ...campaign.CreateCampaignItemParams) (campaign.Repository, *pgxpool.Pool, *campaign.Campaign, map[string]*campaign.Item) {
+	t.Helper()
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	c := makeCampaign(t, repo)
+	byRef := map[string]*campaign.Item{}
+	for i, p := range items {
+		p.CampaignID = c.ID
+		p.Position = i
+		it, err := repo.CreateCampaignItem(context.Background(), p)
+		if err != nil {
+			t.Fatalf("seed item %s: %v", p.IssueRef, err)
+		}
+		byRef[it.IssueRef] = it
+	}
+	return repo, pool, c, byRef
+}
+
+// readItems re-reads the committed items keyed by ref.
+func readItems(t *testing.T, repo campaign.Repository, id uuid.UUID) map[string]*campaign.Item {
+	t.Helper()
+	items, err := repo.ListCampaignItemsForCampaign(context.Background(), id)
+	if err != nil {
+		t.Fatalf("list items: %v", err)
+	}
+	out := map[string]*campaign.Item{}
+	for _, it := range items {
+		out[it.IssueRef] = it
+	}
+	return out
+}
+
+func TestPostgres_AppendCampaignItems_QueuePositions(t *testing.T) {
+	repo, _, c, _ := appendFixture(t,
+		campaign.CreateCampaignItemParams{IssueRef: "issue:10"},
+		campaign.CreateCampaignItemParams{IssueRef: "issue:11"},
+	)
+	var recorded *campaign.AppendOutcome
+	out, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID: c.ID,
+		NewItems: []campaign.CreateCampaignItemParams{
+			{IssueRef: "issue:20", DependsOn: []string{"issue:10"}, Autonomy: "low"},
+			{IssueRef: "issue:21", DependsOn: []string{"issue:20"}},
+		},
+		Record: func(_ context.Context, o campaign.AppendOutcome) error { recorded = &o; return nil },
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if len(out.Created) != 2 || recorded == nil || len(recorded.Created) != 2 {
+		t.Fatalf("created = %d, recorded = %v", len(out.Created), recorded)
+	}
+	got := readItems(t, repo, c.ID)
+	if got["issue:20"].Position != 2 || got["issue:21"].Position != 3 {
+		t.Errorf("positions = %d,%d, want 2,3", got["issue:20"].Position, got["issue:21"].Position)
+	}
+	if got["issue:20"].Autonomy != "low" || !reflect.DeepEqual(got["issue:21"].DependsOn, []string{"issue:20"}) {
+		t.Errorf("read-back mismatch: %+v %+v", got["issue:20"], got["issue:21"])
+	}
+}
+
+func TestPostgres_AppendCampaignItems_DuplicateUnderLock(t *testing.T) {
+	repo, _, c, _ := appendFixture(t, campaign.CreateCampaignItemParams{IssueRef: "issue:10"})
+	_, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID: c.ID,
+		NewItems:   []campaign.CreateCampaignItemParams{{IssueRef: "issue:11"}, {IssueRef: "issue:10"}},
+	})
+	if !errors.Is(err, campaign.ErrDuplicateItem) {
+		t.Fatalf("err = %v, want ErrDuplicateItem", err)
+	}
+	if n := len(readItems(t, repo, c.ID)); n != 1 {
+		t.Errorf("item count = %d, want 1 (nothing written)", n)
+	}
+}
+
+func TestPostgres_AppendCampaignItems_CycleWritesNothing(t *testing.T) {
+	// Seeded BY CONSTRUCTION: A already depends on B, which is not yet a member.
+	repo, _, c, _ := appendFixture(t, campaign.CreateCampaignItemParams{IssueRef: "issue:1", DependsOn: []string{"issue:2"}})
+	for name, newItems := range map[string][]campaign.CreateCampaignItemParams{
+		"new-existing": {{IssueRef: "issue:2", DependsOn: []string{"issue:1"}}},
+		"new-new":      {{IssueRef: "issue:3", DependsOn: []string{"issue:4"}}, {IssueRef: "issue:4", DependsOn: []string{"issue:3"}}},
+	} {
+		_, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{CampaignID: c.ID, NewItems: newItems})
+		if !errors.Is(err, campaign.ErrCycle) {
+			t.Fatalf("%s: err = %v, want ErrCycle", name, err)
+		}
+		got := readItems(t, repo, c.ID)
+		if len(got) != 1 || !reflect.DeepEqual(got["issue:1"].DependsOn, []string{"issue:2"}) {
+			t.Errorf("%s: committed state changed: %d items, deps %v", name, len(got), got["issue:1"].DependsOn)
+		}
+	}
+}
+
+func TestPostgres_AppendCampaignItems_ExternalRefusedUnlessAllowed(t *testing.T) {
+	repo, _, c, _ := appendFixture(t, campaign.CreateCampaignItemParams{IssueRef: "issue:10"})
+	p := campaign.AppendCampaignItemsParams{
+		CampaignID: c.ID,
+		NewItems:   []campaign.CreateCampaignItemParams{{IssueRef: "issue:20", DependsOn: []string{"issue:999"}}},
+	}
+	if _, err := repo.AppendCampaignItems(context.Background(), p); !errors.Is(err, campaign.ErrExternalDependency) {
+		t.Fatalf("err = %v, want ErrExternalDependency", err)
+	}
+	if n := len(readItems(t, repo, c.ID)); n != 1 {
+		t.Fatalf("item count = %d, want 1", n)
+	}
+	p.AllowExternal = true
+	if _, err := repo.AppendCampaignItems(context.Background(), p); err != nil {
+		t.Fatalf("allowed: %v", err)
+	}
+	if got := readItems(t, repo, c.ID); !reflect.DeepEqual(got["issue:20"].DependsOn, []string{"issue:999"}) {
+		t.Errorf("external edge not persisted: %v", got["issue:20"])
+	}
+}
+
+func TestPostgres_AppendCampaignItems_AdditionIsMonotone(t *testing.T) {
+	repo, _, c, items := appendFixture(t,
+		campaign.CreateCampaignItemParams{IssueRef: "issue:1"},
+		campaign.CreateCampaignItemParams{IssueRef: "issue:2"},
+		campaign.CreateCampaignItemParams{IssueRef: "issue:3", DependsOn: []string{"issue:1"}},
+	)
+	p3 := items["issue:3"].ID
+	out, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID:      c.ID,
+		AddDependencies: map[uuid.UUID][]string{p3: {"issue:2"}},
+	})
+	if err != nil {
+		t.Fatalf("append addition: %v", err)
+	}
+	if len(out.Added) != 1 || !reflect.DeepEqual(out.Added[0].Refs, []string{"issue:2"}) {
+		t.Errorf("added = %+v", out.Added)
+	}
+	// A NARROWER addition (only issue:2) must retain the old issue:1 edge.
+	if _, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID:      c.ID,
+		AddDependencies: map[uuid.UUID][]string{p3: {"issue:2"}},
+	}); err != nil {
+		t.Fatalf("narrower addition: %v", err)
+	}
+	if got := readItems(t, repo, c.ID)["issue:3"].DependsOn; !reflect.DeepEqual(got, []string{"issue:1", "issue:2"}) {
+		t.Errorf("depends_on = %v, want [issue:1 issue:2] (monotone union)", got)
+	}
+}
+
+func TestPostgres_AppendCampaignItems_RunningItemSkipped(t *testing.T) {
+	repo, _, c, items := appendFixture(t,
+		campaign.CreateCampaignItemParams{IssueRef: "issue:1"},
+		campaign.CreateCampaignItemParams{IssueRef: "issue:2", DependsOn: []string{"issue:1"}},
+	)
+	running := items["issue:2"]
+	if _, err := repo.TransitionCampaignItem(context.Background(), running.ID, campaign.ItemStateRunning); err != nil {
+		t.Fatalf("transition: %v", err)
+	}
+	before := readItems(t, repo, c.ID)["issue:2"]
+	out, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID:      c.ID,
+		AddDependencies: map[uuid.UUID][]string{running.ID: {"issue:3"}},
+		NewItems:        []campaign.CreateCampaignItemParams{{IssueRef: "issue:3"}},
+	})
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	if !reflect.DeepEqual(out.SkippedStarted, []string{"issue:2"}) || len(out.Added) != 0 {
+		t.Errorf("skipped = %v added = %v", out.SkippedStarted, out.Added)
+	}
+	after := readItems(t, repo, c.ID)["issue:2"]
+	if !reflect.DeepEqual(after.DependsOn, before.DependsOn) || after.State != campaign.ItemStateRunning || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Errorf("running item touched: before %+v after %+v", before, after)
+	}
+}
+
+func TestPostgres_AppendCampaignItems_MalformedRefRefused(t *testing.T) {
+	repo, _, c, items := appendFixture(t, campaign.CreateCampaignItemParams{IssueRef: "issue:1"})
+	for name, p := range map[string]campaign.AppendCampaignItemsParams{
+		"new dep":  {CampaignID: c.ID, AllowExternal: true, NewItems: []campaign.CreateCampaignItemParams{{IssueRef: "issue:2", DependsOn: []string{"unparsable:x"}}}},
+		"addition": {CampaignID: c.ID, AddDependencies: map[uuid.UUID][]string{items["issue:1"].ID: {"unparsable:x"}}},
+	} {
+		if _, err := repo.AppendCampaignItems(context.Background(), p); !errors.Is(err, campaign.ErrInvalidDependencyRef) {
+			t.Fatalf("%s: err = %v, want ErrInvalidDependencyRef", name, err)
+		}
+		got := readItems(t, repo, c.ID)
+		if len(got) != 1 || len(got["issue:1"].DependsOn) != 0 {
+			t.Errorf("%s: committed state changed: %+v", name, got)
+		}
+	}
+}
+
+func TestPostgres_AppendCampaignItems_RecordFailureWritesNothing(t *testing.T) {
+	repo, _, c, items := appendFixture(t,
+		campaign.CreateCampaignItemParams{IssueRef: "issue:1"},
+		campaign.CreateCampaignItemParams{IssueRef: "issue:2"},
+	)
+	boom := errors.New("audit down")
+	_, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID:      c.ID,
+		NewItems:        []campaign.CreateCampaignItemParams{{IssueRef: "issue:3"}},
+		AddDependencies: map[uuid.UUID][]string{items["issue:2"].ID: {"issue:1"}},
+		Record:          func(context.Context, campaign.AppendOutcome) error { return boom },
+	})
+	if !errors.Is(err, campaign.ErrAppendUnrecorded) || !errors.Is(err, boom) {
+		t.Fatalf("err = %v, want ErrAppendUnrecorded wrapping the record error", err)
+	}
+	got := readItems(t, repo, c.ID)
+	if len(got) != 2 || len(got["issue:2"].DependsOn) != 0 {
+		t.Errorf("record failure left writes: %d items, issue:2 deps %v", len(got), got["issue:2"].DependsOn)
+	}
+}
+
+func TestPostgres_AppendCampaignItems_TerminalCampaignRefused(t *testing.T) {
+	repo, _, c, _ := appendFixture(t)
+	if _, err := repo.TransitionCampaign(context.Background(), c.ID, campaign.StateCancelled); err != nil {
+		t.Fatalf("cancel: %v", err)
+	}
+	_, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{
+		CampaignID: c.ID, NewItems: []campaign.CreateCampaignItemParams{{IssueRef: "issue:1"}},
+	})
+	var inv campaign.InvalidTransitionError
+	if !errors.As(err, &inv) || inv.Kind != "campaign" || inv.From != string(campaign.StateCancelled) {
+		t.Fatalf("err = %v, want InvalidTransitionError{campaign, cancelled}", err)
+	}
+	if n := len(readItems(t, repo, c.ID)); n != 0 {
+		t.Errorf("item count = %d, want 0", n)
+	}
+	if _, err := repo.AppendCampaignItems(context.Background(), campaign.AppendCampaignItemsParams{CampaignID: uuid.New()}); !errors.Is(err, campaign.ErrCampaignNotFound) {
+		t.Errorf("missing campaign err = %v, want ErrCampaignNotFound", err)
+	}
+}
