@@ -346,6 +346,42 @@ func TestFirstOfficerSeat_ProhibitedVerbsRefused(t *testing.T) {
 	}
 }
 
+// A seat cannot file a work item (ADR-089 D2): POST /v0/work-items checks no
+// scope, so the seat's clamp cannot stop it and the route refuses the seat by
+// subject — 403 plus a refusal row, provider never called. The human bearer on
+// the SAME fixture files 201, so the seat's 403 comes from the subject guard,
+// not from a fixture that could not file. fishhawk_file_issue over /mcp dials
+// this route under the caller's bearer, so it meets the same refusal.
+func TestFirstOfficerSeat_CannotFileWorkItem(t *testing.T) {
+	fp := &fakeWorkProvider{}
+	registerFakeProvider(t, fp)
+	f := newSeatFixture(t)
+	runID := f.seedRun(run.StateRunning, "")
+	body := `{"repo":"kuhlman-labs/fishhawk","type":"chore","summary":"Seat tracker write","title_vars":{"epic":"22","n":"7"}}`
+	for _, seat := range []string{runSeat(runID), campaignSeat(f.seedCampaign(campaign.StateRunning, ""))} {
+		bearer := f.mint(seat, "write:runs", "write:stages", "read:runs", "write:messages")
+		before := len(f.aud.globalOf(auditFirstOfficerActionRefused))
+		w := f.do(http.MethodPost, "/v0/work-items", bearer, body)
+		requireCrewRefusal(t, w, http.StatusForbidden, "first_officer_tracker_write_not_permitted")
+		if fp.called {
+			t.Fatalf("%s: the work-item provider was called for a seat filing", seat)
+		}
+		refused := f.aud.globalOf(auditFirstOfficerActionRefused)
+		if len(refused) != before+1 {
+			t.Fatalf("%s: refusal rows %d -> %d, want +1", seat, before, len(refused))
+		}
+		var p map[string]any
+		_ = json.Unmarshal(refused[len(refused)-1].Payload, &p)
+		if p["seat_subject"] != seat || p["code"] != "first_officer_tracker_write_not_permitted" || p["path"] != "/v0/work-items" {
+			t.Fatalf("%s: refusal payload = %v", seat, p)
+		}
+	}
+	human := f.mint("github:octocat", "read:runs")
+	if w := f.do(http.MethodPost, "/v0/work-items", human, body); w.Code != http.StatusCreated || !fp.called {
+		t.Fatalf("human filing: status %d, provider called %v, want 201 + called; body %s", w.Code, fp.called, w.Body.String())
+	}
+}
+
 // The refusal hook is best-effort: an append failure never alters the 403.
 func TestFirstOfficerSeat_RefusalAuditRow(t *testing.T) {
 	f := newSeatFixture(t)

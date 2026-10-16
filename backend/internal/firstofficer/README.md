@@ -33,7 +33,10 @@ Withheld, and why: `write:approvals` (the seat never approves a gate),
 ships a result), `write:fixups` / dispositions (the captain disposes findings),
 `attest:specialist-jobs` (only a runner credential attests). A seat cannot mint
 itself a token: POST `/v0/tokens` refuses a seat subject 403
-`first_officer_cannot_mint_tokens`.
+`first_officer_cannot_mint_tokens`. A seat cannot write tracker state: POST
+`/v0/work-items` (and so `fishhawk_file_issue` over `/mcp`, which dials it under
+the caller's bearer) checks no scope, so the route refuses a seat subject 403
+`first_officer_tracker_write_not_permitted` before the handler runs.
 
 ## Enforcement (server)
 

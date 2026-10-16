@@ -179,7 +179,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 
 	// fishhawk_file_issue POSTs /v0/work-items, which enforces no scope:
 	// workitems.go gates on run ENTITLEMENT (runBoundTokenRunID) and
-	// repo consistency, not on a scope predicate.
+	// repo consistency, not on a scope predicate. A first-officer seat passes
+	// this gate and is refused at that route by subject (403
+	// first_officer_tracker_write_not_permitted, refuseFirstOfficerTrackerWrite,
+	// E85.6 / #4148), since the tool dials it under the caller's own bearer.
 	"fishhawk_file_issue": mcpScopeAuthenticatedOnly,
 
 	// fishhawk_preview_issue POSTs /v0/work-items/preview

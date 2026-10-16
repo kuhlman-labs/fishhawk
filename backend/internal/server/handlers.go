@@ -208,7 +208,9 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("PATCH /v0/refinement/sessions/{session_id}/draft", s.handlePatchRefinementDraft)
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/decision", s.handleDecideRefinementSession)
 	mux.HandleFunc("POST /v0/refinement/sessions/{session_id}/file", s.handleFileRefinementSession)
-	mux.HandleFunc("POST /v0/work-items", s.handleFileWorkItem)
+	// A first-officer seat is refused by subject before the handler (E85.6 /
+	// #4148): the route checks no scope, so the seat clamp cannot stop it.
+	mux.HandleFunc("POST /v0/work-items", s.refuseFirstOfficerTrackerWrite(s.handleFileWorkItem))
 	// The non-mutating intake preview of the filing above (#3774): the same
 	// prelude and conventions/intake core, never provider.File, no audit. A
 	// literal path segment, so it does not collide with POST /v0/work-items.

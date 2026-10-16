@@ -253,6 +253,24 @@ func (s *Server) firstOfficerRunInSeat(ctx context.Context, a firstofficer.Ancho
 	return false, nil
 }
 
+// refuseFirstOfficerTrackerWrite wraps POST /v0/work-items (ADR-089 D2): a
+// seat never writes tracker state. That route checks no scope (it gates on run
+// entitlement, and the run-absent arm refuses only run-bound mcp:run: subjects),
+// so the seat's clamped scopes cannot stop it and the refusal is by SUBJECT.
+// fishhawk_file_issue over /mcp is covered too: its tool client dials this
+// route back under the caller's own bearer. writeError's 403 hook records the
+// first_officer_action_refused row.
+func (s *Server) refuseFirstOfficerTrackerWrite(next http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		if firstofficer.IsSeatSubject(IdentityFrom(r.Context()).Subject) {
+			s.writeError(w, r, http.StatusForbidden, "first_officer_tracker_write_not_permitted",
+				"a first-officer seat cannot file a work item; it sends findings and notices to its captain", nil)
+			return
+		}
+		next(w, r)
+	}
+}
+
 // recordFirstOfficerRefusal is writeError's 403 hook (ADR-089 D2): every
 // permission refusal served to a seat identity also writes a
 // first_officer_action_refused row, so a prohibited call is a permission error

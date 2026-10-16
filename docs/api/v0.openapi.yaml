@@ -20991,6 +20991,10 @@ paths:
             repository than the filing target; a run_id is honoured only when
             its repo matches `repo`, so a run-bound token cannot borrow an
             unrelated repository's installation context.
+            `first_officer_tracker_write_not_permitted` — the caller is a
+            first-officer seat (`first_officer/…` subject, E85.6 / #4148),
+            refused before the handler whatever its scopes: a seat never
+            writes tracker state.
         '404':
           description: "`run_not_found` — `run_id` supplied but no such run."
         '413':
