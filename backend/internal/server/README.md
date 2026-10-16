@@ -7115,6 +7115,40 @@ provider is refused `400` naming the configured set. A verified subject whose
 `identity.ProviderOf` disagrees with the selected provider is refused `401`
 rather than minted — defence in depth against a mis-stamped row.
 
+### `POST /v0/tokens` mint ceiling
+
+`handleCreateToken` (#4503) mints for the caller's OWN subject and refuses, in
+order and each before anything is issued (no token row, no `api_token_issued`
+audit row): `401 auth_required` (anonymous) → `403
+first_officer_cannot_mint_tokens` (seat) → `403 run_bound_cannot_mint_tokens`
+(any `mcp:run:` subject) → `403 scope_escalation_refused` (a requested scope
+outside the ceiling; `details.excess_scopes` names every excess scope,
+de-duplicated, request order; `details.ceiling` names the ceiling applied).
+
+- **Ceiling.** A bearer (`Identity.TokenID` set: `fhk_`, `fho_`, a clamped
+  seat) is bounded by its own resolved `Identity.Scopes` (`token_scopes`), so
+  an `fho_` token cannot widen its AS grant. A cookie session (`TokenID`
+  empty) carries no scope list and no role-to-scope mapping exists, so it is
+  bounded by `Config.OperatorDefaultScopes` (`operator_default_scopes`), the
+  set `POST /v0/tokens/login` mints within for the same humans; an unwired set
+  admits no explicit scope. An empty `scopes` list is a subset of any ceiling.
+- **Run-bound refusal.** bearerAuth resolves an `fhm_` agent token to
+  `mcp:run:<run_id>`, and the route has no wrapper, so before #4503 an in-run
+  agent could mint itself an untenanted `fhk_` token with operator scopes.
+  `isRunBoundSubject` matches the PREFIX, not a parseable UUID, so a
+  malformed `mcp:run:` subject self-minted under the old hole is refused too.
+  It precedes the ceiling: the code is `run_bound_cannot_mint_tokens` even for
+  a subset of the agent's own scopes.
+- **DELETE stays scope-free.** `DELETE /v0/tokens/{token_id}` requires no
+  scope and does not refuse a run-bound subject: revocation only removes
+  privilege, and `Repository.Revoke`'s ownership check confines it to the
+  caller's own tokens, so a token minted under the old hole can revoke itself.
+- **Counterfactual tests** (`tokens_test.go`): `TestCreateToken_ScopeEscalationRefused`
+  (ceiling), `TestCreateToken_RunBoundRefused` (run-bound refusal, a real
+  `fhm_` token through bearerAuth), `TestCreateToken_CookieSessionCeiling`
+  (cookie ceiling). Each asserts committed state (token rows, audit rows)
+  after the call; `TestRevokeToken_RunBoundSubject` pins the DELETE decision.
+
 ### Forge-aware federated sign-in
 
 `signInForges()` lists the configured BROWSER sign-in legs (`GitHubOAuth` /

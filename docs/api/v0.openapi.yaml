@@ -12184,6 +12184,22 @@ paths:
         #4148) is refused `403 first_officer_cannot_mint_tokens` before any
         token is issued: its captain attaches the seat credential through
         `POST /v0/first-officer-seats`.
+
+        A run-bound subject (any `mcp:run:` subject, e.g. an in-run `fhm_`
+        agent token, #4503) is refused `403 run_bound_cannot_mint_tokens`
+        before any token is issued, whatever scopes it requests.
+
+        **Scope ceiling (#4503).** Every requested scope must already be in
+        the caller's own scope set; otherwise the request is refused
+        `403 scope_escalation_refused` before any token is issued, with
+        `details.excess_scopes` naming every excess scope (de-duplicated,
+        request order) and `details.ceiling` naming the ceiling applied:
+        `token_scopes` for a bearer (bounded by the presenting token's own
+        resolved scopes, so an AS-issued `fho_` token cannot widen its
+        grant), `operator_default_scopes` for a cookie session (bounded by
+        the deployment's operator default scope set, the same set
+        `POST /v0/tokens/login` mints within; an unwired set admits no
+        explicit scope). An empty `scopes` list is always admitted.
       tags: [auth]
       requestBody:
         required: true
@@ -12369,6 +12385,13 @@ paths:
     delete:
       operationId: revokeToken
       summary: Revoke an API token
+      description: |
+        Requires no scope (#4503, deliberate): revocation only removes
+        privilege, and the caller can revoke only its OWN tokens (another
+        subject's token is `403`). A run-bound `mcp:run:` subject is
+        admitted, so a token minted under the pre-#4503 unbounded
+        `POST /v0/tokens` can revoke itself. Idempotent: a second revoke
+        returns `204` with no state change.
       tags: [auth]
       parameters:
         - { name: token_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }

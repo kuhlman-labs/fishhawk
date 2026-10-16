@@ -5,6 +5,7 @@ import (
 	"errors"
 	"log/slog"
 	"net/http"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -271,6 +272,39 @@ func scopesOutside(requested, allow []string) string {
 	return ""
 }
 
+// isRunBoundSubject reports whether subject is a run-bound agent subject.
+// bearerAuth stamps "mcp:run:<run_id>" on every fhm_ identity. It
+// deliberately matches on the PREFIX rather than reusing
+// scope_amendment.go's runBoundTokenRunID, which requires a parseable
+// UUID: a malformed suffix (e.g. an fhk_ row self-minted under the old
+// unbounded POST /v0/tokens with subject "mcp:run:garbage") must still be
+// refused.
+func isRunBoundSubject(subject string) bool {
+	return strings.HasPrefix(subject, "mcp:run:")
+}
+
+// scopesExceeding returns EVERY requested scope absent from ceiling,
+// de-duplicated and in request order, or nil when all are present. Unlike
+// scopesOutside (the /login mint's first-excess helper) it names the full
+// excess so a refused caller sees every scope it lacks. It is
+// deny-by-default: an empty or nil ceiling admits no explicit scope.
+func scopesExceeding(requested, ceiling []string) []string {
+	held := make(map[string]bool, len(ceiling))
+	for _, sc := range ceiling {
+		held[sc] = true
+	}
+	var excess []string
+	seen := make(map[string]bool, len(requested))
+	for _, sc := range requested {
+		if held[sc] || seen[sc] {
+			continue
+		}
+		seen[sc] = true
+		excess = append(excess, sc)
+	}
+	return excess
+}
+
 // apiTokenResponse mirrors the OpenAPI `ApiToken` schema. The
 // plaintext is sent ONCE on POST (via apiTokenCreatedResponse) and
 // never appears in any List/Get response.
@@ -320,10 +354,31 @@ func toTokenResponse(t *apitoken.Token) apiTokenResponse {
 // handleCreateToken implements POST /v0/tokens. Mints a new token
 // for the authenticated user and returns the plaintext exactly once.
 //
-// AUTH: requires non-anonymous Identity. Bootstrap (the very first
-// token for an installation) is issued via the `fishhawkd token
-// issue` CLI command, which calls APITokenRepo directly without
-// going through this handler.
+// AUTH (#4503): four refusals, in order, each before anything is issued
+// (so no token row and no api_token_issued audit row results):
+//
+//   - 401 auth_required for an anonymous caller;
+//   - 403 first_officer_cannot_mint_tokens for a first-officer seat;
+//   - 403 run_bound_cannot_mint_tokens for a run-bound (mcp:run:) subject;
+//   - 403 scope_escalation_refused when any requested scope lies outside
+//     the caller's scope CEILING; details.excess_scopes names every excess
+//     scope, de-duplicated, in request order.
+//
+// The ceiling is the caller's CURRENT effective scope set. For a bearer
+// (Identity.TokenID set: fhk_, fho_, a clamped seat) it is the bearer's
+// own resolved Identity.Scopes, so an fho_ token is bounded by its
+// AS-granted set and a seat by its clamp. For a cookie session (TokenID
+// empty) it is the deployment's operator default scope set
+// (Config.OperatorDefaultScopes): a cookie identity carries no scope list
+// (requireWriteScope exempts it), no role-to-scope mapping exists, and the
+// operator default set is exactly what POST /v0/tokens/login lets the
+// same humans mint. An unwired default set admits no explicit scope
+// (deny-by-default). An empty scopes list stays legal: it is a subset of
+// any ceiling.
+//
+// Bootstrap (the very first token for an installation) is issued via the
+// `fishhawkd token issue` CLI command, which calls APITokenRepo directly
+// without going through this handler.
 func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.APITokenRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
@@ -336,14 +391,22 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 			"creating a token requires an authenticated session or an existing bearer token", nil)
 		return
 	}
-	// A first-officer seat never mints itself a token (E85.6 / #4148): this
-	// route issues for the caller's OWN subject with no scope ceiling, so a
-	// seat-minted token would carry whatever scopes it asked for. The
-	// middleware clamp would still bound it, but the refusal keeps the seat's
-	// token set exactly what its captain attached.
+	// A first-officer seat never mints itself a token (E85.6 / #4148). The
+	// scope ceiling below would bound a seat-minted token to the seat's own
+	// clamped set, but the refusal keeps the seat's token set exactly what
+	// its captain attached.
 	if firstofficer.IsSeatSubject(id.Subject) {
 		s.writeError(w, r, http.StatusForbidden, "first_officer_cannot_mint_tokens",
 			"a first-officer seat cannot mint API tokens; its captain attaches the seat credential", nil)
+		return
+	}
+	// A run-bound agent never mints a token (#4503): an in-run fhm_ token
+	// reaches this route through bearerAuth, and a minted fhk_ token would
+	// outlive the run and escape its run binding. Refused before the
+	// ceiling, so even a subset of the agent's own scopes is refused.
+	if isRunBoundSubject(id.Subject) {
+		s.writeError(w, r, http.StatusForbidden, "run_bound_cannot_mint_tokens",
+			"a run-bound agent token cannot mint API tokens", nil)
 		return
 	}
 
@@ -356,6 +419,21 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"request body is not valid JSON or contains unknown fields",
 			map[string]any{"error": err.Error()})
+		return
+	}
+
+	// Scope ceiling (#4503): a bearer is bounded by its own resolved scopes;
+	// a cookie session, which carries none, by the operator default set.
+	ceiling := id.Scopes
+	ceilingKind := "token_scopes"
+	if id.TokenID == "" {
+		ceiling = s.cfg.OperatorDefaultScopes
+		ceilingKind = "operator_default_scopes"
+	}
+	if excess := scopesExceeding(req.Scopes, ceiling); len(excess) > 0 {
+		s.writeError(w, r, http.StatusForbidden, "scope_escalation_refused",
+			"requested scopes exceed the caller's own scope set; a token can only be minted with scopes the caller already holds",
+			map[string]any{"excess_scopes": excess, "ceiling": ceilingKind})
 		return
 	}
 
@@ -407,6 +485,11 @@ func (s *Server) handleListTokens(w http.ResponseWriter, r *http.Request) {
 // Idempotent: a second revoke on the same token returns 204 with no
 // state change. The repository's ownership check produces 403 if
 // the caller doesn't own the token.
+//
+// No scope is required (#4503, deliberate): revocation only removes
+// privilege, and the ownership check confines it to the caller's own
+// subject. A run-bound subject is deliberately NOT refused here, so it can
+// revoke an fhk_ row self-minted under the old unbounded POST /v0/tokens.
 func (s *Server) handleRevokeToken(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.APITokenRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
