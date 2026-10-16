@@ -1450,17 +1450,18 @@ under critical memory pressure (E85.11 / #4330).
 They also pass `--enable-scheduler --scheduler-repos kuhlman-labs/fishhawk
 --scheduler-runner-kind local`, which turn on the workflow scheduler
 (E79.1 / #3725). It starts one run per due cron window for each workflow that
-declares a `schedule` in `.fishhawk/workflows.yaml`. Today that is only
+declares a `schedule` in `.fishhawk/workflows.yaml`. Today that is
 `upkeep_scan`, the weekly upkeep and dependency-advisory scan (E80.2 / #3750),
-on Mondays at 09:00 UTC.
+on Mondays at 09:00 UTC, and `backlog_grooming` on the grooming anchor #3112,
+on Tuesdays at 09:00 UTC.
 
 - **Default branch only.** The scheduler reads the spec at the default branch
   through the GitHub App, so a schedule on a feature branch never fires.
 - **Parks, never dispatches.** With runner kind `local`, a scheduled run parks
   at `awaiting_host_dispatch` until a host dispatches it. A firing therefore
   holds no host-dispatch slot and spends nothing until someone dispatches it.
-  An `upkeep_scan` run then stops at its approval gate, and nothing is filed
-  until a human approves it.
+  An `upkeep_scan` or `backlog_grooming` run then stops at its approval gate,
+  and nothing is filed or mutated until a human approves it.
 - **First tick.** The first tick after the scheduler is enabled starts one run
   for the most recent window. Missed windows are never backfilled.
 - **Repositories.** `FISHHAWKD_SCHEDULER_REPOS` in `.env` replaces the default
@@ -1469,6 +1470,25 @@ on Mondays at 09:00 UTC.
 - **Inspect.** `GET /v0/schedules?repo=kuhlman-labs/fishhawk` reports each
   schedule's window, next due time and last outcome.
 - **Pins.** `scripts/test-dev` pins the three flags and pins that they reach
+  the `serve` argv.
+
+They also pass `--enable-merge-outcome-observer`, which turns on the
+merge-outcome CI observer (E82.2 / #3779, ADR-085). It fixes each merged run's
+merge-commit CI conclusion once, at `merged_at` + 6h, as one
+`run_merge_ci_observed` audit row (`green`, `red` or `missing`).
+
+- **Reads only.** Each 10-minute tick reads four audit categories from the
+  database, then makes at most 20 forge evaluations: one `GetPullRequest` and
+  1-5 check-run pages per mature merged run, through the GitHub App. It writes
+  nothing to the forge, and the row is an internal fact record, not an
+  issue-comment surface.
+- **Backfill.** The first enabled tick starts backfilling up to 14 days of
+  merged runs, 20 per tick.
+- **Needs the GitHub App.** Without an app id fishhawkd logs a warning and
+  starts no ticker.
+- **Opting out.** `FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER=0` drops the flag.
+- **Contract.** `backend/internal/mergeoutcome/README.md`.
+- **Pins.** `scripts/test-dev` pins the flag, the opt-out and that it reaches
   the `serve` argv.
 
 ### `post-merge` and `reload`

@@ -111,9 +111,28 @@ workflows:
   # degrading into a rubber stamp.
   #
   # No ordinary issue run can select this workflow: its routing predicate
-  # is the non-diff trigger form, and every trigger source in use today
-  # normalizes to `diff`. That is a safety property rather than a gap —
-  # the declaration is here ahead of the scheduler that will drive it.
+  # is the non-diff trigger form, and every issue and webhook trigger
+  # normalizes to `diff`. That is a safety property rather than a gap. Runs
+  # come from the scheduler (`scheduled`) or an operator- or event-started
+  # non-diff run (`on_demand`).
+  #
+  # SCHEDULE. Weekly, Tuesday 09:00 UTC, the day after upkeep_scan, so the
+  # two scheduled runs never share a window. Every scheduled run is
+  # anchored to #3112, the standing grooming anchor issue, which feeds the
+  # groom stage's required issue input. The schedule starts runs only when
+  # fishhawkd runs with --enable-scheduler and this repository in
+  # --scheduler-repos (scripts/dev passes both, with --scheduler-runner-kind
+  # local). A local scheduled run parks at awaiting_host_dispatch until a
+  # host dispatches its groom stage, so it spends nothing until then, and
+  # it still stops at the approval gate below: nothing is mutated until a
+  # human approves the report. The first tick after the scheduler sees this
+  # declaration starts one run for the most recent Tuesday window; there is
+  # never a backfill.
+  #
+  # No gate in this workflow declares an `sla`. A missed SLA FAILS the run
+  # (category D), so with one eligible approver a gate left over a weekend
+  # would fail instead of waiting. The SLA timer is also off on this
+  # deployment, so an `sla` here would state a deadline nothing enforces.
   # ---------------------------------------------------------------------------
   backlog_grooming:
     description: >-
@@ -122,6 +141,10 @@ workflows:
 
     applies_to:
       trigger: [scheduled, on_demand]
+
+    schedule:
+      cron: "0 9 * * 2"
+      issue: 3112
 
     # The five run-driving classes: nothing delegated.
     autonomy: low
@@ -173,12 +196,12 @@ workflows:
             schema: grooming_report_v1
         gates:
           - type: approval
-            sla: 24_hours
             approvals:
               count: 1
-              # Forge-verified approver identity (provider-qualified subject). Not
-              # enforced until #4116; MCP approvals must come from a `fishhawk token
-              # login` (GitHub device-flow) credential, not the static MCP token.
+              # Forge-verified approver identity (provider-qualified subject),
+              # enforced since #4116: an MCP approval must come from a `fishhawk
+              # token login` (GitHub device-flow) credential; the static MCP
+              # token is refused.
               members: ["github:kuhlman-labs"]
               not: [author, agent]
 
@@ -208,12 +231,12 @@ workflows:
           human: true
         gates:
           - type: approval
-            sla: 24_hours
             approvals:
               count: 1
-              # Forge-verified approver identity (provider-qualified subject). Not
-              # enforced until #4116; MCP approvals must come from a `fishhawk token
-              # login` (GitHub device-flow) credential, not the static MCP token.
+              # Forge-verified approver identity (provider-qualified subject),
+              # enforced since #4116: an MCP approval must come from a `fishhawk
+              # token login` (GitHub device-flow) credential; the static MCP
+              # token is refused.
               members: ["github:kuhlman-labs"]
               not: [agent]
 
@@ -251,7 +274,8 @@ workflows:
   # scheduled run parks at awaiting_host_dispatch until a host dispatches
   # its scan stage, so it holds no host-dispatch slot and spends nothing
   # until then. The first tick after the scheduler is enabled starts one
-  # run for the most recent Monday window; there is never a backfill.
+  # run for the most recent Monday window; there is never a backfill. The
+  # gate declares no `sla`, for the reason given on backlog_grooming.
   # ---------------------------------------------------------------------------
   upkeep_scan:
     description: >-
@@ -278,7 +302,6 @@ workflows:
             schema: upkeep_report_v1
         gates:
           - type: approval
-            sla: 24_hours
             approvals:
               count: 1
               # Forge-verified approver identity (provider-qualified subject),
@@ -437,7 +460,16 @@ workflows:
                 update_on_change: true
               - target: fishhawk_audit_log
                 mode: canonical
+        # limit_usd is the one enforced per-stage lever (#2328), set at about
+        # three times the largest observed spend for this stage type so it never
+        # fires on a normal stage. Basis, 2026-10-16: the per-stage sum of every
+        # feature_change plan stage's cost_recorded entries (agent passes,
+        # fix-ups and the reviews billed to the stage, deduped by content hash
+        # as the enforcement sums them) over 1502 stages: max $20.97, p99 $14.72,
+        # median $3.66. Advisory: a breach records stage_budget_exceeded and
+        # the run proceeds.
         budget:
+          limit_usd: 65
           max_tokens: 200000
           max_runtime: 15m
           enforcement: advisory
@@ -445,9 +477,10 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              # Forge-verified approver identity (provider-qualified subject). Not
-              # enforced until #4116; MCP approvals must come from a `fishhawk token
-              # login` (GitHub device-flow) credential, not the static MCP token.
+              # Forge-verified approver identity (provider-qualified subject),
+              # enforced since #4116: an MCP approval must come from a `fishhawk
+              # token login` (GitHub device-flow) credential; the static MCP
+              # token is refused.
               members: ["github:kuhlman-labs"]
               # Exclude the change's author and any agent identity. Taking
               # part in the loop — answering a clarification, attaching
@@ -610,7 +643,16 @@ workflows:
           required_outcomes:
             - tests_added_or_updated
             - ci_green
+        # limit_usd is the one enforced per-stage lever (#2328), set at about
+        # three times the largest observed spend for this stage type so it never
+        # fires on a normal stage. Basis, 2026-10-16: the per-stage sum of every
+        # feature_change implement stage's cost_recorded entries (agent passes,
+        # fix-ups and the reviews billed to the stage, deduped by content hash
+        # as the enforcement sums them) over 2024 stages: max $68.23, p99 $45.58,
+        # median $6.64. Advisory: a breach records stage_budget_exceeded and
+        # the run proceeds.
         budget:
+          limit_usd: 210
           max_tokens: 500000
           max_runtime: 30m
           enforcement: advisory
@@ -660,7 +702,16 @@ workflows:
         # acceptance stage.
         produces:
           - artifact: acceptance
+        # limit_usd is the one enforced per-stage lever (#2328), set at about
+        # three times the largest observed spend for this stage type so it never
+        # fires on a normal stage. Basis, 2026-10-16: the per-stage sum of every
+        # feature_change acceptance stage's cost_recorded entries (agent passes,
+        # fix-ups and the reviews billed to the stage, deduped by content hash
+        # as the enforcement sums them) over 461 stages: max $29.80, p99 $14.80,
+        # median $2.15. Advisory: a breach records stage_budget_exceeded and
+        # the run proceeds.
         budget:
+          limit_usd: 90
           max_tokens: 200000
           max_runtime: 20m
           enforcement: advisory
@@ -681,9 +732,10 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              # Forge-verified approver identity (provider-qualified subject). Not
-              # enforced until #4116; MCP approvals must come from a `fishhawk token
-              # login` (GitHub device-flow) credential, not the static MCP token.
+              # Forge-verified approver identity (provider-qualified subject),
+              # enforced since #4116: an MCP approval must come from a `fishhawk
+              # token login` (GitHub device-flow) credential; the static MCP
+              # token is refused.
               members: ["github:kuhlman-labs"]
               # Same predicate as the plan gate: one approval, excluding the
               # author and any agent identity.
@@ -839,9 +891,10 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              # Forge-verified approver identity (provider-qualified subject). Not
-              # enforced until #4116; MCP approvals must come from a `fishhawk token
-              # login` (GitHub device-flow) credential, not the static MCP token.
+              # Forge-verified approver identity (provider-qualified subject),
+              # enforced since #4116: an MCP approval must come from a `fishhawk
+              # token login` (GitHub device-flow) credential; the static MCP
+              # token is refused.
               members: ["github:kuhlman-labs"]
               not: [author, agent]
 
@@ -912,8 +965,9 @@ workflows:
           - type: approval
             approvals:
               count: 1
-              # Forge-verified approver identity (provider-qualified subject). Not
-              # enforced until #4116; MCP approvals must come from a `fishhawk token
-              # login` (GitHub device-flow) credential, not the static MCP token.
+              # Forge-verified approver identity (provider-qualified subject),
+              # enforced since #4116: an MCP approval must come from a `fishhawk
+              # token login` (GitHub device-flow) credential; the static MCP
+              # token is refused.
               members: ["github:kuhlman-labs"]
               not: [author, agent]
