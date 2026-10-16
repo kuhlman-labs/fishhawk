@@ -1296,6 +1296,8 @@ sidecar (below), which a recording writes beside it.
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
+          "seed-synthetic-realmiss-criterion-needs-forbidden-path": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-realmiss-criterion-needs-unwritable-pr-body": {"trials": 11, "caught": 7, "undecodable": 0},
           "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 6, "undecodable": 1},
           "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
           "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1317,6 +1319,8 @@ sidecar (below), which a recording writes beside it.
       "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
       "per_case": {
+          "seed-synthetic-realmiss-criterion-needs-forbidden-path": {"trials": 11, "caught": 7, "undecodable": 0},
+          "seed-synthetic-realmiss-criterion-needs-unwritable-pr-body": {"trials": 11, "caught": 7, "undecodable": 0},
           "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 7, "undecodable": 0},
           "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
           "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1402,6 +1406,8 @@ sidecar (below), which a recording writes beside it.
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
+            "seed-synthetic-realmiss-criterion-needs-forbidden-path": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-realmiss-criterion-needs-unwritable-pr-body": {"trials": 11, "caught": 7, "undecodable": 0},
             "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 6, "undecodable": 1},
             "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
             "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
@@ -1423,6 +1429,8 @@ sidecar (below), which a recording writes beside it.
         "prompt_fingerprint": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "input_digest": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
         "per_case": {
+            "seed-synthetic-realmiss-criterion-needs-forbidden-path": {"trials": 11, "caught": 7, "undecodable": 0},
+            "seed-synthetic-realmiss-criterion-needs-unwritable-pr-body": {"trials": 11, "caught": 7, "undecodable": 0},
             "seed-synthetic-contradicts-issue": {"trials": 11, "caught": 7, "undecodable": 0},
             "seed-synthetic-contradicts-numeric-limit": {"trials": 11, "caught": 7, "undecodable": 0},
             "seed-synthetic-contradicts-status-code": {"trials": 11, "caught": 7, "undecodable": 0},
