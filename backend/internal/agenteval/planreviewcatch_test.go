@@ -32,10 +32,16 @@ const (
 // the corpus has carried since E55.23 / #4361 (six E55.4 seeds, six E55.18 /
 // #4253 mid-difficulty cases and the one #4361 subtler case that calibrated
 // in band on reviewer misses; five were cut, three at the ceiling and two in
-// band only on scoring misses);
+// band only on scoring misses), plus E55.26 / #4453's three slice-0
+// real-miss reconstructions (seed-synthetic-realmiss-guard-off-upload-route,
+// -pairing-rule-off-upload-route and -deferred-surface-conjunct). The
+// operator's live calibration (run-book Step 1d, 2026-10-16) cut none of
+// #4453's five cases, and its fix-up left this floor at 16, so the two
+// lesson-derived seeds sit in its slack;
 // the derived list below may grow past it, never shrink below it (so the
-// derivation cannot go vacuous and a deleted case cannot pass silently).
-const committedSyntheticCatchCaseFloor = 13
+// derivation cannot go vacuous and a deletion past the slack cannot pass
+// silently).
+const committedSyntheticCatchCaseFloor = 16
 
 // committedSyntheticCatchCases DERIVES the hand-authored seed cases: every
 // seed-synthetic-* directory under the committed corpus, sorted. Only THESE

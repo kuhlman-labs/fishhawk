@@ -1,0 +1,170 @@
+{
+  "persona": "architect",
+  "kind": "accepted_conflict",
+  "expect": "catch",
+  "issue_title": "Filter the runs list by status, repository and label together",
+  "issue_body": "Operators can only list runs by one status today. Let the runs list filter on any combination of status, repository and label, and show the per-status counts above the list.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94454",
+      "id": "kuhlman-labs/fishhawk#94454"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add combinable status, repository and label filters to the runs list and a per-status count, through the run store and the runs handler.",
+    "scope": {
+      "files": [
+        {
+          "path": "backend/internal/run/queries.sql",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/db/queries.sql.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/postgres.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/run/postgres_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/server/runs.go",
+          "operation": "modify"
+        },
+        {
+          "path": "docs/api/v0.openapi.yaml",
+          "operation": "modify"
+        },
+        {
+          "path": "docs/api/v0.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add a CountRunsByStatus query to backend/internal/run/queries.sql for the per-status header and regenerate the db package with sqlc generate."
+      },
+      {
+        "step": 2,
+        "description": "Add ListRunsFiltered to backend/internal/run/postgres.go: it appends a WHERE condition for each filter the caller set and runs the assembled SQL string through the pgxpool directly, because a filter set that varies per request does not fit a static generated query; every value is bound as a positional parameter."
+      },
+      {
+        "step": 3,
+        "description": "Accept status, repo and label query parameters on GET /v0/runs in backend/internal/server/runs.go, call the new filtered list method and CountRunsByStatus, and document the parameters and the counts field in docs/api/v0.openapi.yaml and docs/api/v0.md."
+      },
+      {
+        "step": 4,
+        "description": "Add store tests on the shared test Postgres for each filter alone, all three together and none, and a handler test for the counts field."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Store tests on the shared test Postgres for every filter combination, plus handler tests for the query parameters and the counts field.",
+      "rollback_plan": "Revert the PR; the parameters are optional and an unfiltered list is unchanged.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-filters-combine",
+          "statement": "GET /v0/runs with status, repo and label all set returns only the runs matching all three.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94454"
+        },
+        {
+          "id": "ac-status-counts",
+          "statement": "The runs list response carries the number of runs in each status.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94454"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 45,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-002",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "runs the assembled SQL string through the pgxpool directly",
+    "does not fit a static generated query"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 2
+  },
+  "catch_probes": [
+    "adr-002",
+    "narg",
+    "bypasses sqlc",
+    "bypassing sqlc",
+    "bypass sqlc",
+    "outside sqlc",
+    "outside of sqlc",
+    "instead of sqlc",
+    "not a sqlc query",
+    "outside queries.sql",
+    "not in queries.sql",
+    "queries live in",
+    "every database query is visible"
+  ],
+  "attribution_phrases": [
+    "listrunsfiltered",
+    "pgxpool directly",
+    "assembled sql"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 runs an assembled SQL string through the pgxpool directly. ADR-002 decides that queries live in backend/internal/<feature>/queries.sql with sqlc generating the typed Go, so this bypasses sqlc. Express the optional filters with sqlc.narg parameters in queries.sql instead."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "ListRunsFiltered bypasses sqlc: under ADR-002 every database query is visible in a *.sql file and type-checked by the generator."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "The assembled SQL in the run store sits outside queries.sql, which ADR-002's Decision rules out for backend queries."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2: the filter design is ambiguous."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 adds a list query over runs; ADR-006 makes production rollback forward-only, so confirm the filter columns need no new migration."
+    },
+    {
+      "severity": "low",
+      "category": "security",
+      "note": "Step 2 builds the WHERE clause from request input; keep every filter value a bound parameter and add a test with a quote in the label."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-filters-combine does not say whether a request with no filter lists every run."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "ListRunsFiltered has no test for a label that matches nothing."
+    }
+  ]
+}

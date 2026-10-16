@@ -1,0 +1,261 @@
+{
+  "issue_title": "Skip bad rows instead of failing the whole import, and record what was dropped",
+  "issue_body": "An import of a 40,000-row file fails outright when a single row has a malformed date, and the owner has to fix the file and start over. Imports should skip the rows that fail validation and finish with the rest.\n\nDropping rows silently would be worse than failing, though: every dropped row must be recorded with its row number and the reason it was dropped, so support can tell an owner exactly what did not make it in.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/example-org/batch-imports/issues/301",
+      "id": "example-org/batch-imports#301"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Skip rows that fail validation, finish the import with the rows that pass, and record every dropped row with its reason in one import_rows_dropped audit entry.",
+    "scope": {
+      "files": [
+        {
+          "path": "internal/imports/runner.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/imports/runner_test.go",
+          "operation": "modify"
+        },
+        {
+          "path": "internal/imports/drops.go",
+          "operation": "create"
+        },
+        {
+          "path": "internal/audit/categories.go",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "In internal/imports/runner.go, stop aborting the import on a row validation error: record the failing row's number and the validator's reason, and continue with the next row."
+      },
+      {
+        "step": 2,
+        "description": "Add internal/imports/drops.go: when an import finishes with one or more dropped rows, append one import_rows_dropped audit entry whose payload lists each dropped row number with its reason."
+      },
+      {
+        "step": 3,
+        "description": "Register the import_rows_dropped category in internal/audit/categories.go."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Runner tests with a fixture file whose rows 7 and 12 fail validation: the import finishes with the other rows stored, and one import_rows_dropped entry lists rows 7 and 12 with their reasons. A clean fixture file appends no import_rows_dropped entry.",
+      "rollback_plan": "Revert the PR; imports fail on the first bad row again. Recorded import_rows_dropped entries stay in the audit log.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-bad-rows-skipped",
+          "statement": "An import whose file contains rows that fail validation finishes and stores every row that passed validation.",
+          "source": "explicit",
+          "source_ref": "example-org/batch-imports#301"
+        },
+        {
+          "id": "ac-drops-audited-and-emailed",
+          "statement": "An import that drops rows appends one import_rows_dropped audit entry listing each dropped row number with its drop reason, and the import owner's import-complete email names the dropped row numbers.",
+          "source": "inferred",
+          "rationale": "The issue requires every dropped row to be recorded so the owner can learn what did not make it in; owners already read the import-complete email, so the dropped rows should reach them there as well.",
+          "verify_hint": "Import a fixture file whose rows 7 and 12 are malformed, then read the audit log and the owner's captured import-complete email."
+        }
+      ],
+      "out_of_scope": [
+        "Listing dropped row numbers in the owner's import-complete email: this change records drops in the audit log only, and the email change is tracked as example-org/batch-imports#319.",
+        "Re-importing dropped rows after the owner fixes them."
+      ]
+    },
+    "risks_and_assumptions": [
+      "Reasons come from the existing row validator and are stored verbatim.",
+      "A file in which most rows fail still finishes; a drop-ratio threshold can follow if support asks for one."
+    ],
+    "predicted_runtime_minutes": 35,
+    "predicted_runtime_confidence": "medium"
+  },
+  "catch_probes": [
+    "contradicts the out-of-scope",
+    "contradicts the plan's out-of-scope",
+    "contradicts out_of_scope",
+    "contradicts the out_of_scope",
+    "contradicts the plan's out_of_scope",
+    "contradicts the plan's own out",
+    "contradicts its own out",
+    "contradicts the plan's own deferral",
+    "contradicts the plan's own exclusion",
+    "conflicts with the out-of-scope",
+    "conflicts with out_of_scope",
+    "conflicts with the out_of_scope",
+    "conflicts with the plan's out",
+    "conflicts with the plan's own out",
+    "at odds with the out-of-scope",
+    "at odds with out_of_scope",
+    "at odds with the out_of_scope",
+    "out-of-scope says",
+    "out_of_scope says",
+    "out-of-scope line",
+    "out_of_scope line",
+    "out-of-scope entry",
+    "out_of_scope entry",
+    "out-of-scope item",
+    "out_of_scope item",
+    "excludes the email",
+    "excluded the email",
+    "excluded email",
+    "defers the email",
+    "deferred the email",
+    "email is deferred",
+    "email change is deferred",
+    "email part is deferred",
+    "email clause is deferred",
+    "email half is deferred",
+    "deferred to #319",
+    "deferred to example-org",
+    "email clause cannot",
+    "email clause can't",
+    "email clause will fail",
+    "email clause fails",
+    "email clause would fail",
+    "email half cannot",
+    "email half can't",
+    "email half will fail",
+    "email part cannot",
+    "email part can't",
+    "email requirement cannot",
+    "email conjunct",
+    "second clause cannot",
+    "second clause can't",
+    "second clause will fail",
+    "second clause fails",
+    "second clause would fail",
+    "second half cannot",
+    "second half can't",
+    "second half will fail",
+    "no step changes the email",
+    "no step touches the email",
+    "no step updates the email",
+    "no approach step changes the email",
+    "nothing changes the email",
+    "email is not in scope",
+    "email is not in the scope",
+    "email code is not in scope",
+    "mailer is not in scope",
+    "no email file",
+    "no mailer file",
+    "cannot pass as planned",
+    "can't pass as planned",
+    "will fail as planned",
+    "would fail as planned",
+    "fails as planned",
+    "unsatisfiable as planned",
+    "unsatisfiable by this change",
+    "not satisfiable by this change",
+    "cannot be satisfied by this change",
+    "can't be satisfied by this change",
+    "cannot pass in this change",
+    "can't pass in this change",
+    "email clause is not warranted",
+    "email clause isn't warranted",
+    "email clause is unwarranted",
+    "email requirement is not warranted",
+    "email part is not warranted",
+    "issue never mentions email",
+    "issue never mentions an email",
+    "issue never asks for an email",
+    "issue does not mention email",
+    "issue doesn't mention email",
+    "issue does not mention an email",
+    "no email in the issue",
+    "no step sends the email",
+    "no step sends an email",
+    "plan itself defers the email",
+    "plan itself excludes the email",
+    "out of scope section excludes",
+    "excludes exactly that",
+    "excludes that email",
+    "contradicts the plan's own scope"
+  ],
+  "attribution_phrases": [
+    "email names the dropped row numbers",
+    "import owner's import-complete email",
+    "with its drop reason, and"
+  ],
+  "defect_phrases": [
+    "import-complete email",
+    "dropped row numbers",
+    "batch-imports#319"
+  ],
+  "catching_examples": [
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-drops-audited-and-emailed cannot pass as planned: its second clause demands that the import-complete email name the dropped rows, but the plan's out_of_scope defers the email change to #319."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-drops-audited-and-emailed contradicts the plan's out-of-scope: this change records drops in the audit log, so the email clause cannot pass."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "The criterion requiring that the import owner's import-complete email names the dropped row numbers conflicts with the out-of-scope line, and no step changes the email."
+    },
+    {
+      "severity": "medium",
+      "category": "correctness",
+      "note": "ac-drops-audited-and-emailed: the audit half is fine, but the email half cannot pass; the email is deferred to example-org/batch-imports#319."
+    },
+    {
+      "severity": "medium",
+      "category": "acceptance_criteria",
+      "note": "ac-drops-audited-and-emailed: the email clause is not warranted (the issue asks for a record support can read) and the plan itself excludes the email; drop the second clause."
+    },
+    {
+      "severity": "high",
+      "category": "acceptance_criteria",
+      "note": "ac-drops-audited-and-emailed: the plan's out of scope section excludes exactly that, so the criterion contradicts the plan's own scope."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-drops-audited-and-emailed should also assert each listed row carries the validator's reason verbatim."
+    },
+    {
+      "category": "risk",
+      "note": "ac-drops-audited-and-emailed is ambiguous about the email's wording: the format of the row list is unspecified and unjustified."
+    },
+    {
+      "severity": "medium",
+      "category": "risk",
+      "note": "Approach step 2: a 40,000-row file with most rows dropped makes one huge audit payload; cap the list and store a count."
+    },
+    {
+      "severity": "low",
+      "category": "coverage",
+      "note": "ac-bad-rows-skipped: add a test where the first and the last rows fail."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Add import_rows_dropped to the activity feed allow-list so support sees it."
+    },
+    {
+      "severity": "low",
+      "category": "correctness",
+      "note": "ac-drops-audited-and-emailed: row numbers should be 1-based to match what owners see in their spreadsheet."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "The out-of-scope re-import of dropped rows needs its own tracking issue."
+    }
+  ]
+}

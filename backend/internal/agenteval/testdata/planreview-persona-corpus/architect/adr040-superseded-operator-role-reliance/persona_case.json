@@ -1,0 +1,169 @@
+{
+  "persona": "architect",
+  "kind": "superseded_reliance",
+  "expect": "catch",
+  "issue_title": "Keep the operator loop moving overnight",
+  "issue_body": "Plan approvals and infrastructure retries stall from evening until someone is back at the keyboard. Let a repository run the operator role on a schedule, inside the workflow's delegation knobs, and record which instance acted on each gate.",
+  "plan": {
+    "plan_version": "standard_v1",
+    "ticket_reference": {
+      "type": "github_issue",
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/94453",
+      "id": "kuhlman-labs/fishhawk#94453"
+    },
+    "generated_by": {
+      "agent": "claude-code",
+      "model": "synthetic-fixture",
+      "timestamp": "2026-10-15T09:00:00Z"
+    },
+    "summary": "Add an optional schedule block to the operator role spec and a cron-driven instance of the role that approves and retries within the workflow's operator_agent knobs.",
+    "scope": {
+      "files": [
+        {
+          "path": "docs/spec/operator-role.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/operatorrole/schemas/operator-role.schema.json",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/operatorrole/operatorrole.go",
+          "operation": "modify"
+        },
+        {
+          "path": "backend/internal/operatorrole/scheduler.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/operatorrole/scheduler_test.go",
+          "operation": "create"
+        },
+        {
+          "path": "backend/internal/operatorrole/README.md",
+          "operation": "modify"
+        }
+      ]
+    },
+    "approach": [
+      {
+        "step": 1,
+        "description": "Add an optional schedule block (a cron expression and a knob preset name) to docs/spec/operator-role.schema.json, mirror it with scripts/sync-schemas, and decode it in operatorrole.go."
+      },
+      {
+        "step": 2,
+        "description": "Add a scheduler harness in backend/internal/operatorrole/scheduler.go that, on each cron tick, instantiates the role from the shipped versioned playbook and drives approvals and retries under the existing operator-agent/<role-spec-version> token subject, since the role contract lets any harness, a scheduler included, instantiate the role."
+      },
+      {
+        "step": 3,
+        "description": "Record every action the scheduled instance takes with the instance id and the cron tick that triggered it, and document the schedule block in the operatorrole package README."
+      },
+      {
+        "step": 4,
+        "description": "Add tests: a tick inside the knobs approves a clean plan, a tick facing an undelegated gate pages instead, and a spec without a schedule block runs no instance."
+      }
+    ],
+    "verification": {
+      "test_strategy": "Unit tests over a fake clock and a fake gate store for each tick outcome, plus schema validation tests for a present and an absent schedule block.",
+      "rollback_plan": "Revert the PR; the schedule block is optional and a spec without it runs nothing.",
+      "acceptance_criteria": [
+        {
+          "id": "ac-scheduled-action-recorded",
+          "statement": "Every approval or retry the scheduled instance makes is recorded with the instance that acted and the tick that triggered it.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94453"
+        },
+        {
+          "id": "ac-undelegated-gate-pages",
+          "statement": "A gate the workflow's knobs do not delegate is paged to a human, never acted on by the scheduled instance.",
+          "source": "explicit",
+          "source_ref": "kuhlman-labs/fishhawk#94453"
+        }
+      ]
+    },
+    "predicted_runtime_minutes": 50,
+    "predicted_runtime_confidence": "medium"
+  },
+  "governing_records": [
+    {
+      "id": "ADR-040",
+      "status": "accepted",
+      "superseded_by": [
+        "ADR-101"
+      ]
+    },
+    {
+      "id": "ADR-101",
+      "status": "accepted",
+      "superseded_by": []
+    }
+  ],
+  "defect_phrases": [
+    "lets any harness, a scheduler included, instantiate the role",
+    "drives approvals and retries under the existing"
+  ],
+  "anchor": {
+    "kind": "approach_step",
+    "step": 2
+  },
+  "catch_probes": [
+    "adr-101",
+    "charter",
+    "lease-based",
+    "per-lease",
+    "lease credential",
+    "product-spawned",
+    "adr-040 is superseded",
+    "adr-040, which is superseded",
+    "adr-040 (superseded"
+  ],
+  "attribution_phrases": [
+    "scheduler harness",
+    "operator-agent/<role-spec-version>",
+    "any harness"
+  ],
+  "catching_examples": [
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 runs the role unattended under the operator-agent/<role-spec-version> subject because ADR-040 lets any harness instantiate it. ADR-040 is superseded by ADR-101: sustained unattended operation needs a captain-issued charter lease and a product-spawned operator holding only the per-lease credential. Route the scheduled instance through a charter lease, or needs an amending ADR."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "The scheduler harness rests on ADR-040's any-harness model, which the index marks superseded by ADR-101; ADR-101 D5 runs unattended actions under a per-lease credential held by a product-spawned operator."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "An instance acting under operator-agent/<role-spec-version> on a cron is not a charter session; unattended approvals now need a live lease."
+    }
+  ],
+  "non_catching_examples": [
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "Step 2: the choice of a cron trigger is unjustified."
+    },
+    {
+      "severity": "medium",
+      "category": "decision_record",
+      "note": "Step 2 lets the scheduled instance approve plans; ADR-083 keeps the captain seat human, so confirm the instance never takes a captain verb."
+    },
+    {
+      "severity": "low",
+      "category": "decision_record",
+      "note": "The scheduler harness in step 2 follows ADR-040; cite it in the plan."
+    },
+    {
+      "severity": "low",
+      "category": "acceptance_criteria",
+      "note": "ac-scheduled-action-recorded does not say where the record is kept."
+    },
+    {
+      "severity": "low",
+      "category": "scope",
+      "note": "Step 2 adds a harness with no test for a missed cron tick."
+    }
+  ]
+}
