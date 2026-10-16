@@ -98,7 +98,7 @@ type RunStageInput struct {
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
 	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
-	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; resolved in order: FISHHAWK_RUNNER_BIN env, then fishhawk-runner sibling to this binary (os.Executable dir), then PATH"`
+	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary (os.Executable dir), then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	Verbose       bool   `json:"verbose,omitempty" jsonschema:"when true, return the full runner event list including every stage_progress heartbeat; default false returns a compact result that omits routine heartbeats"`
 }
 
@@ -400,6 +400,12 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	if cerr := r.confinePath("working_dir", in.WorkingDir); cerr != nil {
 		return nil, RunStageOutput{}, cerr
 	}
+	// runner_binary is refused over HTTP (E66.64 / #4476), here — ahead of
+	// every backend read — so the refusal dials nothing; resolveRunnerBinary
+	// refuses it again as the chokepoint.
+	if rerr := r.refuseHTTPRunnerBinary(in.RunnerBinary); rerr != nil {
+		return nil, RunStageOutput{}, rerr
+	}
 
 	// Resolve the push_and_open_pr default. A bare bool can't tell an
 	// omitted JSON key from an explicit false, so the field is *bool:
@@ -492,8 +498,8 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	in.WorkingDir = workingDir
 
 	// (2) Resolve the runner binary.
-	// Resolution order: input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error.
-	binary, err := resolveRunnerBinary(in.RunnerBinary, r.getenv)
+	// Resolution order: input (stdio only) > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > error.
+	binary, err := r.resolveRunnerBinary(in.RunnerBinary)
 	if err != nil {
 		return nil, RunStageOutput{}, err
 	}
@@ -1136,15 +1142,23 @@ func acceptanceShortCircuitWarning(res *AcceptanceAdmissionResult, noSpawnEviden
 	return msg + "."
 }
 
-// resolveRunnerBinary resolves the fishhawk-runner binary path shared by
-// fishhawk_run_stage and fishhawk_run_children. Resolution order: explicit
-// input > FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > a clean
-// remediation error. The runStageExecutable / runStageLookPath test seams keep
-// the sibling/PATH rungs injectable.
-func resolveRunnerBinary(input string, getenv func(string) string) (string, error) {
+// resolveRunnerBinary resolves the fishhawk-runner binary path shared by every
+// runner-spawning tool. Resolution order on stdio: explicit input >
+// FISHHAWK_RUNNER_BIN env > os.Executable sibling dir > PATH > a clean
+// remediation error. Over the HTTP transport a supplied input is REFUSED
+// runner_binary_not_allowed_over_http (E66.64 / #4476) and the daemon resolves
+// from its own env / sibling / PATH only. That refusal is the chokepoint behind
+// each handler's early refuseHTTPRunnerBinary guard, so a future spawning tool
+// that forgets the guard still cannot spawn a caller-chosen binary. The
+// runStageExecutable / runStageLookPath test seams keep the sibling/PATH rungs
+// injectable.
+func (r *runResolver) resolveRunnerBinary(input string) (string, error) {
+	if err := r.refuseHTTPRunnerBinary(input); err != nil {
+		return "", err
+	}
 	binary := input
 	if binary == "" {
-		if env := getenv("FISHHAWK_RUNNER_BIN"); env != "" {
+		if env := r.getenv("FISHHAWK_RUNNER_BIN"); env != "" {
 			binary = env
 		}
 	}
@@ -1159,6 +1173,13 @@ func resolveRunnerBinary(input string, getenv func(string) string) (string, erro
 	if binary == "" {
 		resolved, lerr := runStageLookPath("fishhawk-runner")
 		if lerr != nil {
+			if r.httpTransport {
+				// Over HTTP the caller cannot supply runner_binary, so the remedy
+				// names only the serving daemon's own configuration.
+				return "", errors.New(
+					"fishhawk-runner not on PATH; the serving daemon could not resolve its runner — " +
+						"the operator sets FISHHAWK_RUNNER_BIN in the serving daemon's environment, or co-locates fishhawk-runner beside the serving binary")
+			}
 			return "", errors.New(
 				"fishhawk-runner not on PATH; this tool requires local MCP execution — " +
 					"pass runner_binary, set FISHHAWK_RUNNER_BIN, or co-locate fishhawk-runner with fishhawk-mcp")

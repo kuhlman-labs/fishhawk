@@ -85,8 +85,9 @@ Specialist jobs: a seat files POST `/v0/specialist-jobs` with
 matches a run any of its campaign items is linked to) or 403
 `first_officer_subject_out_of_seat`. REST only: over `/mcp`,
 `fishhawk_request_specialist_job` stays `write:stages`, because that tool
-resolves a caller-chosen `runner_binary` and spawns it on the daemon host with
-the daemon's environment. A seat reaches no `/mcp` tool that spawns a host
+spawns the daemon-resolved runner on the daemon host with the daemon's
+environment, executing repository code from a caller-chosen `working_dir` (a
+caller-chosen `runner_binary` is refused over HTTP since #4476). A seat reaches no `/mcp` tool that spawns a host
 program (403 `insufficient_scope` at the gate); the REST request only queues.
 
 ## Residuals
