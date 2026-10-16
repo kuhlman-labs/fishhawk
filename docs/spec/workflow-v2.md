@@ -761,13 +761,30 @@ An in-band test gate that fires after the agent exits cleanly and before the bun
 
 | Field | Meaning |
 |---|---|
-| `command` | Executed via `sh -c`; a non-zero exit is a category-A failure. |
+| `command` | Executed via `sh -c`. Classified by exit code per the [verify exit-code contract](#verify-exit-code-contract): only `0` passes, `75` and `73` mean the change was NOT judged, and any other non-zero exit is a category-A failure. |
 | `timeout` | Go duration string; defaults to 10 minutes when absent. |
 | `max_iterations` | Verify-fix loop budget, integer `>= 0`, default `0`. |
 
 `max_iterations: 0` is a single-shot demote-on-failure gate. A value `> 0` enables a bounded evaluator-optimizer fix loop against the committed scope-only tree, capping total verify-fix agent invocations across the stage at that value; worst-case wall clock is bounded by `(max_iterations+1) × executor.timeout` plus `(max_iterations+1) × verify.timeout`. The runner captures combined stdout and stderr into a `verify_run` bundle event (`command`, `exit_code`, `output`, `outcome`) so an operator can see why the gate failed without re-running it. The gate fires only when the agent itself succeeded — re-running the tests against a broken working tree would be misleading.
 
 A workflow declaring the `verification_reported` required outcome **must** configure `verify` on that stage, or the outcome can never be satisfied.
+
+#### Verify exit-code contract
+
+The runner classifies a verify run by its **exit code**, not by scraping its output (#4022). The contract is project-agnostic — any `command` may use it — and the two reserved codes are sysexits(3)'s.
+
+| Exit | Meaning | Runner behaviour |
+|---|---|---|
+| `0` | passed | The only passing exit; the tree is verified. |
+| `75` (`EX_TEMPFAIL`) | infrastructure or temporary failure; the change was NOT judged | Re-run in place, bounded. Never routed to the verify-fix agent and never spends a fix iteration. Still `75` at the bound: the stage ends category C (retryable in place), reason lead `verify_infra_tempfail`. |
+| `73` (`EX_CANTCREAT`) | the command could not acquire its shared verify lock; the change was NOT judged | Re-run in place, bounded; never routed to the fix agent. Still refused at the bound: category C, reason lead `verify_lock_contended`. |
+| any other non-zero | the change failed | The single-shot gate fails; with `max_iterations > 0` it is the verify-fix loop's input. |
+
+- **Applies at every committed-tree verify site**: the verify-fix loop, the single-shot gate, the strict re-verify before push, reverify-resume and the merge-candidate verify (where `75`/`73` read as not executed, never as a red tree).
+- **Only an explicit pass passes.** A verify outcome counts as `passed` only when it IS `passed`; anything else is not a pass (#3983). An attempted gate whose run reports `skipped` (its throwaway checkout could not be prepared) is re-run once, then ends category C with reason lead `verify_gate_skipped` — no verified tree, no fix agent. A stage with no scope changes still skips the gate as a no-op.
+- **Text signatures remain a fallback.** For a tool that cannot set an exit code, the runner still recognises a fixed set of infrastructure-failure signatures in a failed verify's output and absorbs them as before. Declaring project-specific signatures in this spec is not available yet (#4022 Proposal 2, deferred).
+- **Collision residual.** A `command` whose own red tree exits `75` or `73` steers that red to category C instead of the fix agent. It is never read as a pass: a push still needs an exit `0`. Wrap such a tool so its failures exit `1`. On the container gate path `docker run` returns the contained command's status for every code but `125`/`126`/`127`, so `75` and `73` survive it.
+- **This repository's `scripts/test verify`** (and `verify --in-gate-image`) exits `73` on every verify-lock refusal — the shell-kind immediate refusal, the runner-kind refusal after its wait budget, the retaken-after-displacement refusal and the never-settled bail-out — and exits `75` for no condition yet. Long form: `scripts/README.md` § "The verify lock".
 
 ### The `human` branch
 
