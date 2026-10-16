@@ -2,6 +2,7 @@ package decisionrecord
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,7 +17,8 @@ import (
 // (scripts/check-adr --write-index) through the COMMITTED docs/adr/index.json
 // and record bodies into the Go strict parser, selection, assembly and
 // framing (E78.13 / #4471). They read the real files, so a record re-encode, a
-// writer change or an index past its injection cap fails verify here.
+// writer change or an index whose compact rendering (RenderIndex, #4478) is
+// past its injection cap fails verify here.
 
 // shippedRepoRoot is the repository root relative to this package directory,
 // where `go test` runs.
@@ -94,17 +96,57 @@ func TestShippedIndex_EncodesAmendments(t *testing.T) {
 	}
 }
 
-// TestShippedIndex_WithinInjectionCap is approval condition 9: the committed
-// index fits repodoc's default injection cap, so it is never shown truncated.
-// The next record that crosses the cap fails here and is an operator decision
-// (a compact index format), never a silent truncation.
+// injectedIndexHeadroom returns how many bytes raw is SHOWN as in a prompt —
+// its RenderIndex rendering, which is what Assemble derives the index document
+// from (#4478) — and the default injection cap minus that.
+func injectedIndexHeadroom(t *testing.T, raw []byte) (shown, headroom int) {
+	t.Helper()
+	idx, err := ParseIndex(raw)
+	if err != nil {
+		t.Fatalf("ParseIndex: %v", err)
+	}
+	rendered, err := RenderIndex(idx)
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	return len(rendered), repodoc.DefaultMaxBytes - len(rendered)
+}
+
+// TestShippedIndex_WithinInjectionCap is #4471's approval condition 9,
+// retargeted by #4478: the committed index's COMPACT RENDERING fits repodoc's
+// default injection cap, so it is never shown truncated. Every path that
+// injects docs/adr/index.json goes through decisionrecord.Assemble, which shows
+// RenderIndex's rendering and never the raw file: the architect persona's
+// decision_record (backend/internal/server/reviewer_persona.go) and the
+// catch-rate harness's persona arm (backend/internal/agenteval/planreviewpersona.go).
+// So the RENDERING, not the raw bytes, is what must fit. The synthetic arm is
+// the shipped index re-encoded PRETTY: its raw bytes exceed the cap while its
+// rendering does not, so a check that measured the raw file again would fail
+// it. The next record that crosses the cap fails here and is an operator
+// decision, never a silent truncation.
 func TestShippedIndex_WithinInjectionCap(t *testing.T) {
 	_, raw := shippedIndex(t)
-	headroom := repodoc.DefaultMaxBytes - len(raw)
-	t.Logf("shipped %s: %d bytes, cap %d, headroom %d bytes", indexPath, len(raw), repodoc.DefaultMaxBytes, headroom)
-	if headroom < 0 {
-		t.Fatalf("shipped %s is %d bytes, %d over repodoc.DefaultMaxBytes (%d): the index would be injected truncated; a compact index format is an operator decision",
-			indexPath, len(raw), -headroom, repodoc.DefaultMaxBytes)
+	var generic map[string]any
+	if err := json.Unmarshal(raw, &generic); err != nil {
+		t.Fatalf("decode shipped index: %v", err)
+	}
+	pretty, err := json.MarshalIndent(generic, "", "    ")
+	if err != nil {
+		t.Fatalf("re-encode shipped index: %v", err)
+	}
+	if len(pretty) <= repodoc.DefaultMaxBytes {
+		t.Fatalf("premise: the pretty re-encoding is %d bytes, want > the %d-byte cap", len(pretty), repodoc.DefaultMaxBytes)
+	}
+	for _, tc := range []struct {
+		name string
+		raw  []byte
+	}{{"shipped", raw}, {"shipped re-encoded pretty (raw over the cap)", pretty}} {
+		shown, headroom := injectedIndexHeadroom(t, tc.raw)
+		t.Logf("%s %s: %d raw bytes, rendering %d bytes, cap %d, headroom %d bytes", tc.name, indexPath, len(tc.raw), shown, repodoc.DefaultMaxBytes, headroom)
+		if headroom < 0 {
+			t.Fatalf("%s %s renders to %d bytes, %d over repodoc.DefaultMaxBytes (%d): the index would be injected truncated; a more compact index format (or a larger cap) is an operator decision",
+				tc.name, indexPath, shown, -headroom, repodoc.DefaultMaxBytes)
+		}
 	}
 }
 

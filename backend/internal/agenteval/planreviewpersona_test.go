@@ -1,6 +1,7 @@
 package agenteval
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -742,9 +743,10 @@ func TestPersonaGeneratorSystemPrompt_NamesQuoteFields(t *testing.T) {
 }
 
 // TestPersonaArmPrompt_GoverningIndexEntriesSurviveTruncation is an early
-// tripwire for approval condition C1: the real index is near the
-// DefaultMaxBytes cap and decisionrecord.Assemble truncates an over-cap index,
-// which would silently drop the tail entries the persona cases rest on. The
+// tripwire for approval condition C1: decisionrecord.Assemble truncates an
+// index whose compact rendering (decisionrecord.RenderIndex, #4478) is over the
+// DefaultMaxBytes cap, which would silently drop the tail entries the persona
+// cases rest on. The
 // in-test superseded case rests on ADR-033 and its successor ADR-076; both
 // must appear in the RENDERED, post-truncation index text. ADR-094 is a later
 // index entry that no committed case rests on, kept here as a further
@@ -769,9 +771,23 @@ func TestPersonaArmPrompt_GoverningIndexEntriesSurviveTruncation(t *testing.T) {
 		t.Fatalf("no rendered index text among the quote docs %v", r.QuoteDocs)
 	}
 	for _, id := range []string{"ADR-033", "ADR-076", "ADR-094"} {
-		if !strings.Contains(indexText, `"id": "`+id+`"`) {
+		if !strings.Contains(indexText, `"id":"`+id+`"`) {
 			t.Errorf("the rendered index lacks %s's entry: an index truncation dropped a record the persona cases depend on", id)
 		}
 	}
 	t.Logf("index rendered %d bytes (cap %d)", r.Selection.Index.RenderedBytes, r.Selection.CapBytes)
+}
+
+// jsonEncodedTitle is title as decisionrecord.RenderIndex writes it inside the
+// compact index rendering: JSON-string encoded with SetEscapeHTML(false), the
+// surrounding quotes stripped.
+func jsonEncodedTitle(t *testing.T, title string) string {
+	t.Helper()
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(title); err != nil {
+		t.Fatalf("encode title %q: %v", title, err)
+	}
+	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(b.String(), "\n"), `"`), `"`)
 }

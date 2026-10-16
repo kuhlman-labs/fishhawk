@@ -311,11 +311,11 @@ func TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes(t *testin
 			}
 		}
 		for id := range need {
-			if !strings.Contains(indexText, `"id": "`+id+`"`) {
+			if !strings.Contains(indexText, `"id":"`+id+`"`) {
 				t.Errorf("case %q: the rendered index lacks %s's entry: an index truncation dropped a record the case depends on", c.Name, id)
 				continue
 			}
-			if title := real[id].Title; title == "" || !strings.Contains(indexText, title) {
+			if title := real[id].Title; title == "" || !strings.Contains(indexText, jsonEncodedTitle(t, title)) {
 				t.Errorf("case %q: the rendered index lacks %s's title %q", c.Name, id, title)
 			}
 		}
@@ -764,7 +764,7 @@ func TestPersonaCatchCorpus_NotLeakedIntoPersonaPrompt(t *testing.T) {
 	if err != nil {
 		t.Fatalf("neutral persona render: %v", err)
 	}
-	for _, premise := range []string{"Reviewer persona remit: " + ArmArchitect, `"id": "ADR-094"`, "8a. **Issue fidelity**"} {
+	for _, premise := range []string{"Reviewer persona remit: " + ArmArchitect, `"id":"ADR-094"`, "8a. **Issue fidelity**"} {
 		if !strings.Contains(r.Prompt, premise) {
 			t.Fatalf("fixture premise: the neutral persona render lacks %q, so the leak check would be vacuous", premise)
 		}

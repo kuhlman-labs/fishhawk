@@ -3,6 +3,7 @@ package decisionrecord
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -776,5 +777,148 @@ func TestSelect_ShippedIndexGovernsSupersedingRecordPaths(t *testing.T) {
 	}
 	if slices.Contains(ids(got), "ADR-096") {
 		t.Errorf("selected %v: ADR-096 is a predecessor, never followed", ids(got))
+	}
+}
+
+// fullRecord populates EVERY Record field, the amendment relations included.
+func fullRecord() Record {
+	return Record{
+		ID:           "ADR-002",
+		Title:        "Amended & superseding <record>",
+		Path:         "docs/adr/002-b.md",
+		Status:       StatusAccepted,
+		Supersedes:   []string{"ADR-001"},
+		SupersededBy: []string{"ADR-004"},
+		Amends:       []string{"ADR-003"},
+		AmendedBy:    []string{"ADR-005"},
+		AppliesTo:    []string{"backend/internal/audit/**"},
+	}
+}
+
+// TestRenderIndex_RendersEveryRecordField (#4478): a fully populated record's
+// line names every json key Record declares, and every slice field's tag
+// carries omitempty — so a field added to Record renders, and an empty list
+// renders compactly (left out of its line).
+func TestRenderIndex_RendersEveryRecordField(t *testing.T) {
+	r := fullRecord()
+	out, err := RenderIndex(&Index{SchemaVersion: IndexSchemaVersion, Records: []Record{r}})
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	rt := reflect.TypeOf(Record{})
+	for i := range rt.NumField() {
+		f := rt.Field(i)
+		tag := f.Tag.Get("json")
+		name, opts, _ := strings.Cut(tag, ",")
+		v := reflect.ValueOf(r).Field(i)
+		if v.IsZero() {
+			t.Fatalf("fixture leaves Record.%s zero; populate every field", f.Name)
+		}
+		if !strings.Contains(string(out), `"`+name+`":`) {
+			t.Errorf("rendering lacks Record.%s (json %q):\n%s", f.Name, name, out)
+		}
+		if f.Type.Kind() == reflect.Slice && !slices.Contains(strings.Split(opts, ","), "omitempty") {
+			t.Errorf("Record.%s json tag %q lacks omitempty: an empty %s list would cost the compact rendering bytes", f.Name, tag, name)
+		}
+	}
+	var back Record
+	dec := json.NewDecoder(strings.NewReader(string(out)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(&back); err != nil || !reflect.DeepEqual(back, r) {
+		t.Errorf("line decodes to %+v (%v), want %+v", back, err, r)
+	}
+}
+
+// TestRenderIndex_EmptyListsOmitted pins the exact line of a record with no
+// links and no globs, of a superseding record, and of an amended record (the
+// amends / amended_by relations render alongside supersedes / superseded_by).
+func TestRenderIndex_EmptyListsOmitted(t *testing.T) {
+	plain := Record{ID: "ADR-001", Title: "Plain", Path: "docs/adr/001-a.md", Status: StatusUnknown, Supersedes: []string{}, SupersededBy: nil, AppliesTo: []string{}}
+	superseding := Record{ID: "ADR-004", Title: "Successor", Path: "docs/adr/004-d.md", Status: StatusAccepted, Supersedes: []string{"ADR-002"}}
+	amended := Record{ID: "ADR-003", Title: "Amended", Path: "docs/adr/003-c.md", Status: StatusAccepted, Amends: []string{"ADR-001"}, AmendedBy: []string{"ADR-005", "ADR-006"}, AppliesTo: []string{".fishhawk/operator.yaml"}}
+	out, err := RenderIndex(&Index{SchemaVersion: IndexSchemaVersion, Records: []Record{plain, superseding, amended}})
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	want := `{"id":"ADR-001","title":"Plain","path":"docs/adr/001-a.md","status":"unknown"}` + "\n" +
+		`{"id":"ADR-004","title":"Successor","path":"docs/adr/004-d.md","status":"accepted","supersedes":["ADR-002"]}` + "\n" +
+		`{"id":"ADR-003","title":"Amended","path":"docs/adr/003-c.md","status":"accepted","amends":["ADR-001"],"amended_by":["ADR-005","ADR-006"],"applies_to":[".fishhawk/operator.yaml"]}` + "\n"
+	if string(out) != want {
+		t.Errorf("RenderIndex =\n%s\nwant\n%s", out, want)
+	}
+}
+
+// countRepodocLineBreaks counts every line separator repodoc's neutralizer
+// honours (repodoc lineSeparatorWidth): LF, CR, CRLF as one, VT, FF, U+0085,
+// U+2028 and U+2029.
+func countRepodocLineBreaks(s string) int {
+	n := 0
+	for i := 0; i < len(s); i++ {
+		switch {
+		case s[i] == '\r' && i+1 < len(s) && s[i+1] == '\n':
+			n++
+			i++
+		case s[i] == '\n', s[i] == '\r', s[i] == '\v', s[i] == '\f':
+			n++
+		case strings.HasPrefix(s[i:], "\u0085"), strings.HasPrefix(s[i:], "\u2028"), strings.HasPrefix(s[i:], "\u2029"):
+			n++
+		}
+	}
+	return n
+}
+
+// TestRenderIndex_OneLinePerRecordRoundTrips: titles carrying every line
+// separator repodoc honours, a double quote and '<'. The rendering has exactly
+// one repodoc line break per record, no raw NEL, the RAW '<' (SetEscapeHTML
+// false) and no < escape, and every line decodes strictly back to its
+// record.
+func TestRenderIndex_OneLinePerRecordRoundTrips(t *testing.T) {
+	titles := []string{"lf\nbreak", "cr\rbreak", "crlf\r\nbreak", "vt\vbreak", "ff\fbreak", "nel\u0085break", "ls\u2028break", "ps\u2029break", `a "quoted" <tag> & more`}
+	recs := make([]Record, 0, len(titles))
+	for i, title := range titles {
+		r := Record{ID: fmt.Sprintf("ADR-%03d", i+1), Title: title, Path: fmt.Sprintf("docs/adr/%03d.md", i+1), Status: StatusAccepted}
+		if i%2 == 0 {
+			r.Supersedes, r.AppliesTo = []string{}, []string{"docs/**"}
+		}
+		recs = append(recs, r)
+	}
+	out, err := RenderIndex(&Index{SchemaVersion: IndexSchemaVersion, Records: recs})
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	s := string(out)
+	if got := countRepodocLineBreaks(s); got != len(recs) {
+		t.Errorf("rendering holds %d repodoc line breaks, want exactly %d (one per record):\n%q", got, len(recs), s)
+	}
+	if strings.Contains(s, "\u0085") {
+		t.Errorf("rendering carries a raw U+0085 NEL, which repodoc reads as a line break:\n%q", s)
+	}
+	if !strings.Contains(s, "<tag>") || strings.Contains(s, `\u003c`) {
+		t.Errorf("rendering must carry the raw '<' and no \\u003c escape (SetEscapeHTML(false)):\n%s", s)
+	}
+	lines := strings.Split(strings.TrimSuffix(s, "\n"), "\n")
+	if len(lines) != len(recs) {
+		t.Fatalf("%d lines, want %d", len(lines), len(recs))
+	}
+	norm := func(l []string) []string {
+		if len(l) == 0 {
+			return nil
+		}
+		return l
+	}
+	for i, line := range lines {
+		var got Record
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&got); err != nil {
+			t.Fatalf("line %d does not decode: %v\n%s", i, err, line)
+		}
+		want := recs[i]
+		for _, p := range []*[]string{&got.Supersedes, &got.SupersededBy, &got.Amends, &got.AmendedBy, &got.AppliesTo, &want.Supersedes, &want.SupersededBy, &want.Amends, &want.AmendedBy, &want.AppliesTo} {
+			*p = norm(*p)
+		}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("line %d decodes to %+v, want %+v", i, got, want)
+		}
 	}
 }

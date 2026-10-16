@@ -69,7 +69,8 @@ deciding whether to show it, and parses a structured document from the same
 bytes the content hash covers. A negative `capBytes` is clamped to zero (only
 the marker is shown), never read as "no cap" (`TestFetchedDocument_CapDomain`).
 `Resolver.CapBytes()`, `ValidatePath` (step a) and `SanitizeMetadata` are
-exported for that consumer.
+exported for that consumer. `Fetched.Derive` (below, #4478) shapes a
+consumer-derived body instead of the fetched bytes.
 
 Every step fails closed.
 
@@ -324,6 +325,41 @@ a delimiter — so a hand-constructed `Document` is still framed safely.
 hash against an explicitly constructed expected byte sequence and asserts it is
 **not** the hash of the truncated content.
 
+## Derived renderings (`Fetched.Derive`, #4478)
+
+`Fetched.Derive(rendering, body, capBytes)` shapes a CONSUMER-DERIVED body (the
+decision-record index's compact rendering, `decisionrecord.RenderIndex`) for
+display in place of the fetched bytes. This is a README-level contract: no ADR
+records it yet.
+
+- **The hash domain is unchanged.** `ContentHash` is over the FETCHED bytes and
+  `OriginalBytes` is their length, exactly as `Document` reports them, so
+  attribution still names the file revision that constrained the agent. A
+  derived document and a verbatim one of the same file carry the same hash.
+- **What each byte field means for a derived document.** `Content` is the
+  rendering, capped (rune-safe loud cut) and neutralized exactly like any body;
+  `RenderedBytes = len(Content)`; `DroppedBytes` and the marker's
+  `N of M bytes` count RENDERING bytes; `RenderingBytes` is the untruncated
+  rendering length; `Rendering` names the derivation. `Document` leaves both
+  new fields zero (`Rendering == ""` means verbatim).
+- **Attribution.** `document_injected` and the per-document
+  `document_truncated` of a derived document add `rendering` and
+  `rendering_bytes` (`addRendering`), so a truncated rendering is reconcilable:
+  `dropped_bytes` is counted against `rendering_bytes`, not `original_bytes`. A
+  verbatim document's payloads carry neither key, byte-for-byte the pre-#4478
+  shape. No new audit category.
+- **Prompt disclosure.** The Source line reads `Source: <path> at commit
+  <commit> (content hash <hash>; shown as its <rendering> rendering, not
+  verbatim).`, every value through `sanitizeMetadata`; a verbatim document's
+  line is unchanged.
+- **Name rule.** `rendering` must match `^[a-z0-9][a-z0-9._-]*$`; anything
+  else, `""` included, is refused with an error naming the path and the name,
+  because an unnamed derivation would read as a verbatim injection in the audit
+  trail.
+- **Quotes.** A reviewer quote is verified against the SHOWN rendering
+  (`InjectedContent`) while the record carries the file's `content_hash` —
+  the same shown-versus-hashed split truncation and neutralization already make.
+
 ## Size cap and loud truncation
 
 `DefaultMaxBytes` is 32 KiB, overridable per `Resolver` (`MaxBytes`). It is a
@@ -393,8 +429,8 @@ NEL included — plus U+2028/U+2029).
 
 | Category | When | Payload keys |
 |---|---|---|
-| `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `base_source`, `injection_set_id`, `document_index`, `document_count` |
-| `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes`, `injection_set_id` |
+| `document_injected` | every injection | `declaration_site`, `path`, `commit`, `content_hash`, `original_bytes`, `rendered_bytes`, `truncated`, `base_source`, `injection_set_id`, `document_index`, `document_count`; plus `rendering`, `rendering_bytes` for a derived document (#4478) |
+| `document_truncated` | in **addition**, when the document was cut | `path`, `commit`, `content_hash`, `cap_bytes`, `dropped_bytes`, `injection_set_id`; plus `rendering`, `rendering_bytes` for a derived document (#4478) |
 | `document_truncated` (selection shape, E78.5 / #3756) | once per `SelectionTruncation` in an `AttributeSet` call: whole documents of a ranked selection were left OUT to fit a byte budget | `selection` (the shape discriminator — the per-document shape never carries it), `path` (the document the selection was made from), `commit`, `cap_bytes`, `included_bytes`, `dropped` (`[{id, path, status, rank}]`, rank order), `dropped_count`, `injection_set_id` |
 | `document_injection_degraded` | once per SERVED prompt PER REASON: run-admission declarations withheld for an unrecorded base (E55.7 / #3746), and optional review conventions resolved and found absent (E55.3 / #2244); both precede any `document_injected` claim | `reason` (`run_base_commit_unrecorded` \| `optional_document_missing`), `paths`, `declaration_sites`, `document_count` |
 
@@ -565,6 +601,10 @@ writes to the audit trail.
 | M31 selection-truncation append fails (E78.5 / #3756) | error; no `document_injected` committed (asserted on the appender's committed entries) | `TestAttributeSet_SelectionAppendFailure_LeavesNoInjectionClaim` |
 | M32 selection truncation with no name / no dropped document | refused before any append | `TestAttributeSet_MalformedSelectionRefusedBeforeAnyAppend` |
 | M33 negative cap handed to `Fetched.Document` | clamped to zero (marker only), never a slice panic or "no cap" | `TestFetchedDocument_CapDomain` |
+| M34 `Fetched.Derive` with an empty / non-identifier rendering name | refused with an error naming path and name; no Document | `TestFetched_Derive_RefusesInvalidRenderingName` |
+| M35 derived document | hash and `original_bytes` stay the fetched file's; the rendering is capped and neutralized | `TestFetched_Derive_HashesFetchedBytes`, `TestFetched_Derive_CapsAndNeutralizesRendering` |
+| M36 derived vs verbatim attribution | `rendering` / `rendering_bytes` only on a derived document's payloads (read from the persisted entries) | `TestAttributeSet_DerivedDocumentRecordsRendering` |
+| M37 derived Source line / rendering name carrying a line break | disclosed as a rendering; name sanitized to U+FFFD | `TestRender_DerivedDocument_DisclosesRendering`, `TestRender_DerivedDocument_RenderingNameSanitized` |
 
 ## Consumer contract
 
@@ -588,8 +628,10 @@ learn about conventions or charters.
 
 The decision-record consumer injects an index under its own per-document cap
 plus a ranked selection of whole records under a SEPARATE record budget (each
-the resolver's `CapBytes()`, #4399). It is the first
-consumer of `Fetch`/`Document`, `AttributeSet` and the selection shape of
+the resolver's `CapBytes()`, #4399). The index is shown as its compact
+rendering through `Fetched.Derive` (#4478), so the index cap is spent on the
+rendering while the index's hash stays the file's. It is the first
+consumer of `Fetch`/`Document`/`Derive`, `AttributeSet` and the selection shape of
 `document_truncated`; repodoc still carries no consumer vocabulary — the
 selection's name, ids and statuses are opaque strings to it. Contract:
 `backend/internal/decisionrecord/README.md`.

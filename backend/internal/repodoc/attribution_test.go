@@ -646,3 +646,51 @@ func TestAttributeSet_EmptyAndNilAppender(t *testing.T) {
 		t.Errorf("nil appender err = %v, want a refusal naming the selection path", err)
 	}
 }
+
+// TestAttributeSet_DerivedDocumentRecordsRendering (#4478): one derived,
+// truncated document and one verbatim document. The PERSISTED payloads of the
+// derived document — its document_injected and per-document
+// document_truncated — carry rendering and rendering_bytes; the verbatim
+// document's carry neither key.
+func TestAttributeSet_DerivedDocumentRecordsRendering(t *testing.T) {
+	f := &Fetched{Path: "docs/adr/index.json", Commit: pinnedCommit, Content: []byte(strings.Repeat("p", 900)), DeclarationSite: declSite}
+	rendering := strings.Repeat("r", 600)
+	derived, err := f.Derive("adr-index-lines-v1", []byte(rendering), 256)
+	if err != nil {
+		t.Fatalf("Derive: %v", err)
+	}
+	if !derived.Truncated {
+		t.Fatalf("fixture precondition: the derived document is not truncated")
+	}
+	verbatim := attributedDoc()
+	a := &recordingAppender{}
+	if err := AttributeSet(context.Background(), a, uuid.New(), uuid.New(), InjectionSet{Documents: []Document{derived, verbatim}}); err != nil {
+		t.Fatalf("AttributeSet: %v", err)
+	}
+	if got := a.categories(); !reflect.DeepEqual(got, []string{"document_truncated", "document_injected", "document_injected"}) {
+		t.Fatalf("categories = %v", got)
+	}
+	for i, wantDerived := range []bool{true, true, false} {
+		p := a.payload(t, i)
+		_, hasR := p["rendering"]
+		_, hasRB := p["rendering_bytes"]
+		if !wantDerived {
+			if hasR || hasRB {
+				t.Errorf("verbatim payload %d carries a rendering key: %v", i, p)
+			}
+			continue
+		}
+		if p["rendering"] != "adr-index-lines-v1" || p["rendering_bytes"] != float64(len(rendering)) {
+			t.Errorf("derived payload %d (%s) rendering = %v, rendering_bytes = %v; want adr-index-lines-v1, %d", i, a.entries[i].Category, p["rendering"], p["rendering_bytes"], len(rendering))
+		}
+		if p["content_hash"] != derived.ContentHash {
+			t.Errorf("derived payload %d content_hash = %v, want the fetched file's %s", i, p["content_hash"], derived.ContentHash)
+		}
+	}
+	if trunc := a.payload(t, 0); trunc["dropped_bytes"] != float64(len(rendering)-256) {
+		t.Errorf("document_truncated dropped_bytes = %v, want %d counted against rendering_bytes", trunc["dropped_bytes"], len(rendering)-256)
+	}
+	if inj := a.payload(t, 1); inj["original_bytes"] != float64(900) {
+		t.Errorf("document_injected original_bytes = %v, want the fetched size 900", inj["original_bytes"])
+	}
+}

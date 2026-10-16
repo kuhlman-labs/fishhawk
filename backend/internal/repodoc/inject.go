@@ -128,8 +128,16 @@ func renderBody(doc Document, f Framing) string {
 	// arriving through the file NAME rather than the file body. Resolve
 	// already REFUSES such a path; this is the second, render-side layer, and
 	// it also covers a Document a consumer constructed by hand.
-	fmt.Fprintf(&b, "Source: %s at commit %s (content hash %s).\n",
-		sanitizeMetadata(doc.Path), sanitizeMetadata(doc.Commit), sanitizeMetadata(doc.ContentHash))
+	//
+	// A DERIVED document (Fetched.Derive, #4478) says so on the same line: the
+	// hash names the fetched file, and the body below is its rendering.
+	if doc.Rendering != "" {
+		fmt.Fprintf(&b, "Source: %s at commit %s (content hash %s; shown as its %s rendering, not verbatim).\n",
+			sanitizeMetadata(doc.Path), sanitizeMetadata(doc.Commit), sanitizeMetadata(doc.ContentHash), sanitizeMetadata(doc.Rendering))
+	} else {
+		fmt.Fprintf(&b, "Source: %s at commit %s (content hash %s).\n",
+			sanitizeMetadata(doc.Path), sanitizeMetadata(doc.Commit), sanitizeMetadata(doc.ContentHash))
+	}
 	if doc.Truncated {
 		fmt.Fprintf(&b, "This document was TRUNCATED at %d bytes — see the marker at the end of the body.\n", doc.CapBytes)
 	}
