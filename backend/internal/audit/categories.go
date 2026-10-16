@@ -332,6 +332,14 @@ import "sort"
 // implement_review_started sequence (rerun_of_sequence) and the operator
 // subject. NOT an issue-comment activity category
 // (docs/issue-comment-surfaces.md is untouched).
+// E83.64 / #4127 added scope_amendment_lapsed, written by
+// scopeamendment.postgresRepo.LapseForStage / LapseForRun (the run
+// repository's terminal observers and the one-shot startup backfill) once per
+// pending scope amendment flipped to the terminal `lapsed` status, in the same
+// transaction as the flip. INTERNAL, actor system, like its
+// scope_amendment_requested / scope_amendment_decided siblings — NOT an
+// issue-comment activity category (the startup backfill would otherwise
+// re-render activity lines onto every stale run's anchor).
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -576,6 +584,7 @@ var KnownCategories = map[string]struct{}{
 	"scheduled_run_skipped":                   {}, // E79.1 / #3725: a due schedule window replayed an existing run (already_started)
 	"scheduled_run_started":                   {}, // E79.1 / #3725: a due schedule window started a new run
 	"scope_amendment_decided":                 {},
+	"scope_amendment_lapsed":                  {},
 	"scope_amendment_requested":               {},
 	"scope_completeness_amended":              {},
 	"scope_completeness_exempted":             {},

@@ -1968,9 +1968,16 @@ Notes:
   `fixup_pushed` (#794). Listed here only so a future reader grepping the audit
   categories doesn't mistake them for comment surfaces.
 - The mid-stage scope-amendment audit kinds — `scope_amendment_requested` /
-  `scope_amendment_decided` (#961) — have **no dedicated Notifier methods**.
-  `scope_amendment_requested` stays an internal-only kind (it doubles as the
-  page-class ping trigger + the `fishhawk_await_audit` anchor), but as of E42.6
+  `scope_amendment_decided` (#961) / `scope_amendment_lapsed` (#4127) — have
+  **no dedicated Notifier methods**. `scope_amendment_requested` stays an
+  internal-only kind (it doubles as the page-class ping trigger + the
+  `fishhawk_await_audit` anchor), and `scope_amendment_lapsed` (one system
+  entry per undecided request lapsed when its stage succeeds / is cancelled /
+  superseded or its run succeeds / is cancelled, written by
+  `backend/internal/scopeamendment`) is
+  a further internal-only kind, deliberately NOT in `activityCategories` (the
+  startup backfill would otherwise render activity lines onto every stale
+  run's anchor), but as of E42.6
   (#1789) `scope_amendment_decided` renders **data-drivenly** on the
   living-anchor / status timeline through the `activityCategories` set +
   `renderActivityLine` (as "Scope amendment approved: `<reason>`" / "Scope

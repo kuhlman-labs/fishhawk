@@ -110,7 +110,7 @@ type scopeAmendmentResponse struct {
 	StageID        uuid.UUID                  `json:"stage_id"`
 	Paths          []scopeamendment.PathEntry `json:"paths"`
 	Reason         string                     `json:"reason"`
-	Status         string                     `json:"status"`
+	Status         string                     `json:"status"` // pending | approved | denied | lapsed (#4127)
 	DecisionReason *string                    `json:"decision_reason,omitempty"`
 	DecidedBy      *string                    `json:"decided_by,omitempty"`
 	RequestedAt    time.Time                  `json:"requested_at"`
@@ -669,6 +669,27 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 	})
 	if err != nil {
 		switch {
+		case errors.Is(err, scopeamendment.ErrLapsed):
+			// #4127: the request lapsed undecided (its stage succeeded, was
+			// cancelled or superseded, or its run succeeded or was cancelled).
+			// Never approvable; no scope_amendment_decided entry is written.
+			// The pre-read row can predate the lapse (an observer committing
+			// between the read and the decide), so the details come from a
+			// fresh read.
+			if cur, gerr := s.cfg.ScopeAmendmentRepo.GetByID(r.Context(), amendmentID); gerr == nil {
+				existing = cur
+			}
+			s.writeError(w, r, http.StatusConflict, "amendment_lapsed",
+				"this scope amendment lapsed undecided (its stage succeeded, was cancelled or superseded, or its run succeeded "+
+					"or was cancelled); "+
+					"a lapsed request can never be approved or denied — recover with fishhawk_resume_run add_scope_files naming its paths "+
+					"(category B) or fishhawk_retry_stage (category C), on which the agent may re-request",
+				map[string]any{
+					"status":          string(scopeamendment.StatusLapsed),
+					"decision_reason": lapsedDecisionReason(existing),
+					"stage_id":        existing.StageID.String(),
+				})
+			return
 		case errors.Is(err, scopeamendment.ErrAlreadyDecided):
 			s.writeError(w, r, http.StatusConflict, "amendment_already_decided",
 				"this scope amendment has already been decided",
@@ -691,6 +712,15 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 	resp.EffectiveScopeFilesAfterApproval = effective
 	resp.MaxFilesChanged = maxFiles
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// lapsedDecisionReason is the decision_reason the amendment_lapsed refusal
+// reports; "" when the row carries none.
+func lapsedDecisionReason(a *scopeamendment.Amendment) string {
+	if a.DecisionReason == nil {
+		return ""
+	}
+	return *a.DecisionReason
 }
 
 // resolveExecutingImplementStage returns the run's active-or-next

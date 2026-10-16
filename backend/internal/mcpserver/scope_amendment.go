@@ -20,7 +20,10 @@ type ScopeAmendmentPath struct {
 
 // ScopeAmendmentItem mirrors the backend's scope-amendment wire shape
 // (GET /v0/runs/{run_id}/scope-amendments items and the decision
-// response). Status is pending|approved|denied.
+// response). Status is pending|approved|denied|lapsed — lapsed (#4127) means
+// the request was still undecided when its stage succeeded, was cancelled or
+// superseded, or its run succeeded or was cancelled; it is terminal and not
+// actionable.
 type ScopeAmendmentItem struct {
 	ID             string               `json:"id"`
 	RunID          string               `json:"run_id"`
@@ -109,7 +112,10 @@ in-scope files.
 Use this tool to inspect the pending request(s) — the paths, the
 operation per path, and the agent's reason — before deciding with
 fishhawk_decide_scope_amendment. Items return oldest first; status is
-pending | approved | denied.
+pending | approved | denied | lapsed. A lapsed request (#4127) was still
+undecided when its stage succeeded, was cancelled or superseded, or its run
+succeeded or was cancelled: it is terminal and NOT actionable — a decide on
+it is refused (amendment_lapsed).
 `),
 	}, resolver.listScopeAmendments)
 }
@@ -204,8 +210,15 @@ row stays pending, the agent must not treat the silence as a refusal,
 and the runner emits scope_amendment_undecided and withholds the
 verify-fix reinvoke rather than burning iterations on a fix it cannot
 make. Because the row is still pending, a LATE decision is still
-landable — approve it here and fishhawk_retry_stage folds the paths into
-the retried stage's effective scope.
+landable unless the stage succeeded, was cancelled or superseded, or the
+run succeeded or was cancelled (a failed stage or failed run stays
+recoverable) — approve it here and fishhawk_retry_stage folds the paths
+into the retried stage's effective scope. A stage that succeeds, is
+cancelled or superseded, or a run that succeeds or is cancelled, LAPSES
+the request (#4127): a later decide is refused
+(amendment_lapsed), and the recovery is fishhawk_resume_run
+add_scope_files naming its paths (category B) or fishhawk_retry_stage
+(category C), on which the agent may re-request.
 
 Each implement stage gets at most 2 requests (denied ones count against
 the budget).
@@ -215,6 +228,10 @@ Returns the decided amendment row. Tool errors:
   - validation_failed (decision not approve/deny, 400)
   - amendment_not_found (wrong id or wrong run, 404)
   - amendment_already_decided (idempotency guard, 409)
+  - amendment_lapsed (the stage succeeded, was cancelled or superseded, or
+    the run succeeded or was cancelled before a decision; never approvable —
+    recover with fishhawk_resume_run add_scope_files or fishhawk_retry_stage,
+    409)
   - self_decision (a run-bound agent token attempted the decision, 403)
   - insufficient_scope (token lacks write:stages, 403)
 `),

@@ -1,0 +1,14 @@
+id: scenario:issue-4127/lapsed-audit-category-readable
+statement: 'The audit read accepts the new category: GET /v0/runs/{run_id}/audit?category=scope_amendment_lapsed returns 200 with an items list (empty for a run that never lapsed an amendment) instead of the 400 validation_failed unknown-category refusal.'
+verify_hint: 'HTTP: create or pick any run on the localhost preview, GET /v0/runs/{run_id}/audit?category=scope_amendment_lapsed with an operator bearer; expect 200 and no error.code; contrast with a nonsense category, which returns 400 validation_failed.'
+steps: '1. POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} returned run 2d0f5297-4b7f-4c45-98fd-0c12fd4ac3c2. 2. GET /v0/runs/{run}/audit?category=scope_amendment_lapsed. 3. Control: GET /v0/runs/{run}/audit?category=not_a_real_category. 4. Sibling: GET /v0/runs/{run}/audit?category=scope_amendment_requested.'
+assertions:
+    expected: 200 with an items list (empty for a run that never lapsed an amendment) instead of 400 validation_failed
+    observed_at_record: scope_amendment_lapsed returned 200 {"items":[],"next_cursor":""} with no error.code. not_a_real_category returned 400 validation_failed 'category is not a known audit category'. scope_amendment_requested returned 200 with empty items.
+    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run>/audit?category=scope_amendment_lapsed'
+origin:
+    issue: 4127
+    pr: 0
+    run_id: 783e8731-82cf-483d-ac1a-2f62d621e60a
+    head_sha: 816ac212cf5691f439eb8b1f4103f8f7f70aa2dd
+    recorded_at: 2026-10-16T11:10:13Z

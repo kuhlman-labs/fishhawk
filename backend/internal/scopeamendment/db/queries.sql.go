@@ -136,6 +136,104 @@ func (q *Queries) GetScopeAmendmentByID(ctx context.Context, id uuid.UUID) (Scop
 	return i, err
 }
 
+const lapsePendingScopeAmendmentsForRun = `-- name: LapsePendingScopeAmendmentsForRun :many
+UPDATE scope_amendments
+   SET status = 'lapsed',
+       decision_reason = $2,
+       decided_at = $3
+ WHERE run_id = $1 AND status = 'pending'
+RETURNING id, run_id, stage_id, paths, reason, status, decision_reason, decided_by, requested_at, decided_at
+`
+
+type LapsePendingScopeAmendmentsForRunParams struct {
+	RunID          uuid.UUID          `json:"run_id"`
+	DecisionReason *string            `json:"decision_reason"`
+	DecidedAt      pgtype.Timestamptz `json:"decided_at"`
+}
+
+// The run-terminal sibling of LapsePendingScopeAmendmentsForStage: every
+// still-undecided request on every stage of the run.
+func (q *Queries) LapsePendingScopeAmendmentsForRun(ctx context.Context, arg LapsePendingScopeAmendmentsForRunParams) ([]ScopeAmendment, error) {
+	rows, err := q.db.Query(ctx, lapsePendingScopeAmendmentsForRun, arg.RunID, arg.DecisionReason, arg.DecidedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ScopeAmendment
+	for rows.Next() {
+		var i ScopeAmendment
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.StageID,
+			&i.Paths,
+			&i.Reason,
+			&i.Status,
+			&i.DecisionReason,
+			&i.DecidedBy,
+			&i.RequestedAt,
+			&i.DecidedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lapsePendingScopeAmendmentsForStage = `-- name: LapsePendingScopeAmendmentsForStage :many
+UPDATE scope_amendments
+   SET status = 'lapsed',
+       decision_reason = $2,
+       decided_at = $3
+ WHERE stage_id = $1 AND status = 'pending'
+RETURNING id, run_id, stage_id, paths, reason, status, decision_reason, decided_by, requested_at, decided_at
+`
+
+type LapsePendingScopeAmendmentsForStageParams struct {
+	StageID        uuid.UUID          `json:"stage_id"`
+	DecisionReason *string            `json:"decision_reason"`
+	DecidedAt      pgtype.Timestamptz `json:"decided_at"`
+}
+
+// E83.64 / #4127: flip the stage's still-undecided requests to the terminal
+// `lapsed` status. Pending-only, so an approved/denied row is never touched
+// and a second call matches zero rows (idempotent). decided_by stays NULL:
+// no operator decided a lapsed row.
+func (q *Queries) LapsePendingScopeAmendmentsForStage(ctx context.Context, arg LapsePendingScopeAmendmentsForStageParams) ([]ScopeAmendment, error) {
+	rows, err := q.db.Query(ctx, lapsePendingScopeAmendmentsForStage, arg.StageID, arg.DecisionReason, arg.DecidedAt)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ScopeAmendment
+	for rows.Next() {
+		var i ScopeAmendment
+		if err := rows.Scan(
+			&i.ID,
+			&i.RunID,
+			&i.StageID,
+			&i.Paths,
+			&i.Reason,
+			&i.Status,
+			&i.DecisionReason,
+			&i.DecidedBy,
+			&i.RequestedAt,
+			&i.DecidedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listScopeAmendmentsByRun = `-- name: ListScopeAmendmentsByRun :many
 SELECT id, run_id, stage_id, paths, reason, status, decision_reason, decided_by, requested_at, decided_at FROM scope_amendments
  WHERE run_id = $1
@@ -165,6 +263,49 @@ func (q *Queries) ListScopeAmendmentsByRun(ctx context.Context, runID uuid.UUID)
 			&i.RequestedAt,
 			&i.DecidedAt,
 		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listStrandedPendingScopeAmendmentStages = `-- name: ListStrandedPendingScopeAmendmentStages :many
+SELECT DISTINCT sa.stage_id, s.state AS stage_state, r.state AS run_state
+  FROM scope_amendments sa
+  JOIN stages s ON s.id = sa.stage_id
+  JOIN runs r ON r.id = sa.run_id
+ WHERE sa.status = 'pending'
+   AND (s.state IN ('succeeded', 'cancelled', 'superseded')
+        OR r.state IN ('succeeded', 'cancelled'))
+ ORDER BY sa.stage_id
+`
+
+type ListStrandedPendingScopeAmendmentStagesRow struct {
+	StageID    uuid.UUID `json:"stage_id"`
+	StageState string    `json:"stage_state"`
+	RunState   string    `json:"run_state"`
+}
+
+// The startup backfill's work list: each stage carrying a pending request
+// whose stage state or run state already lapses it. The stage literal set is
+// the lapsing subset of run.StageState.IsTerminal (failed is deliberately
+// absent: a failed stage keeps its requests pending); the run literal set
+// mirrors scopeamendment.RunStateLapses (failed is deliberately absent too:
+// fishhawk_retry_stage reopens a failed run).
+func (q *Queries) ListStrandedPendingScopeAmendmentStages(ctx context.Context) ([]ListStrandedPendingScopeAmendmentStagesRow, error) {
+	rows, err := q.db.Query(ctx, listStrandedPendingScopeAmendmentStages)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListStrandedPendingScopeAmendmentStagesRow
+	for rows.Next() {
+		var i ListStrandedPendingScopeAmendmentStagesRow
+		if err := rows.Scan(&i.StageID, &i.StageState, &i.RunState); err != nil {
 			return nil, err
 		}
 		items = append(items, i)

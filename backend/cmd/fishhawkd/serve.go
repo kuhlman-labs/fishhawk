@@ -2689,6 +2689,11 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.APITokenRepo = apitoken.NewPostgresRepository(pool)
 		cfg.MCPTokenRepo = mcptoken.NewPostgresRepository(pool)
 		cfg.ScopeAmendmentRepo = scopeamendment.NewPostgresRepository(pool)
+		// #4127: lapse a still-undecided amendment when its stage succeeds /
+		// is cancelled / superseded or its run succeeds / is cancelled (a
+		// failed stage or run keeps it pending). InstallLapseHooks WARNs
+		// when either repository lacks the capability.
+		scopeamendment.InstallLapseHooks(cfg.RunRepo, cfg.ScopeAmendmentRepo, logger)
 		cfg.ConcernRepo = concern.NewPostgresRepository(pool)
 		cfg.RefinementRepo = resolveRefinementRepo(pool)
 		cfg.AuthRepo = authpkg.NewPostgresRepository(pool)
@@ -3894,6 +3899,15 @@ func runServe(args []string, logSink io.Writer) int {
 		} else if n > 0 {
 			logger.Info("startup orphaned-review reconciliation completed", slog.Int("terminated", n))
 		}
+	}
+
+	// One-shot startup stranded scope-amendment lapse (#4127): every pending
+	// amendment whose stage or run already lapses it (the pre-#4127 rows, or
+	// one a crash left between a terminal commit and its observer) is lapsed
+	// with its scope_amendment_lapsed entry. Idempotent; never blocks start.
+	if cfg.ScopeAmendmentRepo != nil {
+		lapser, _ := cfg.ScopeAmendmentRepo.(scopeamendment.Lapser)
+		scopeamendment.BackfillStranded(ctx, lapser, logger)
 	}
 
 	// Self-consistency invariant monitor (#764). Generalizes the

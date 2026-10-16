@@ -1971,13 +1971,22 @@ components:
           description: The agent's rationale for needing the paths.
         status:
           type: string
-          enum: [pending, approved, denied]
+          enum: [pending, approved, denied, lapsed]
+          description: >-
+            `pending` until decided. `approved` / `denied` are operator
+            decisions. `lapsed` (#4127) means the request was still undecided
+            when its stage succeeded, was cancelled or superseded, or its run
+            succeeded or was cancelled; it is terminal and never approvable
+            (`decision_reason` names the triggering transition, `decided_by`
+            is absent). A failed stage or a failed run keeps its requests
+            `pending`.
         decision_reason:
           type: string
           description: >-
             Operator note; returned on every decided row and delivered to the
             agent verbatim on approve and on deny. On approve it binds the
-            amended paths.
+            amended paths. On a `lapsed` row it is the server-written lapse
+            reason naming the triggering transition.
         decided_by:
           type: string
           description: Operator subject (never a run-bound token).
@@ -28178,7 +28187,11 @@ paths:
         On approve, the paths fold into the stage's effective
         `scope.files` at the next prompt fetch AND the runner's
         pre-commit refresh. Already-decided amendments return 409
-        (`amendment_already_decided`) — decisions are immutable.
+        (`amendment_already_decided`) — decisions are immutable. A
+        lapsed amendment (undecided when its stage succeeded, was
+        cancelled or superseded, or its run succeeded or was cancelled;
+        #4127) returns 409
+        (`amendment_lapsed`) and is never approvable.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -28234,6 +28247,8 @@ paths:
         '409':
           description: |
             `amendment_already_decided` — decisions are immutable.
+            `amendment_lapsed` — the request lapsed undecided (#4127);
+            `details` carries `status`, `decision_reason` and `stage_id`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

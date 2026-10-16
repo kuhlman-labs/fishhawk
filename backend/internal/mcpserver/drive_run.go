@@ -1368,7 +1368,13 @@ func driveSignature(run *Run, stages []Stage) string {
 }
 
 // driveScopeAmendmentPending reports whether the run has an undecided scope
-// amendment: more scope_amendment_requested entries than scope_amendment_decided.
+// amendment: more scope_amendment_requested entries than resolved ones, where
+// a request is resolved by a scope_amendment_decided entry OR a
+// scope_amendment_lapsed entry (#4127). A lapsed request is terminal and can
+// never be decided (the decide route refuses it 409 amendment_lapsed), so
+// counting it as pending would stop a retried run on an undecidable decision
+// forever. A failed read of either resolving category fails CLOSED through the
+// caller (amendment_check_failed), never toward dispatch.
 func (r *runResolver) driveScopeAmendmentPending(ctx context.Context, runID uuid.UUID) (bool, error) {
 	req, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: "scope_amendment_requested", Limit: 200})
 	if err != nil {
@@ -1381,7 +1387,11 @@ func (r *runResolver) driveScopeAmendmentPending(ctx context.Context, runID uuid
 	if err != nil {
 		return false, err
 	}
-	return len(req) > len(dec), nil
+	lapsed, _, err := r.api.ListRunAudit(ctx, runID, ListRunAuditFilter{Category: "scope_amendment_lapsed", Limit: 200})
+	if err != nil {
+		return false, err
+	}
+	return len(req) > len(dec)+len(lapsed), nil
 }
 
 // driveHasPriorDispatchRow reports whether a run_auto_driven dispatch row for

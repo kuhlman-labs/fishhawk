@@ -11913,9 +11913,15 @@ func detectUndecidedScopeAmendments(ctx context.Context, client uploadClient, cf
 // failure reads as "the agent wrote broken code", when in fact the stage was
 // blocked on an operator who never answered — so the message names the
 // amendment id(s) and requested path(s), states that the request was never
-// DECIDED (not denied), and gives both recovery verbs in order:
-// fishhawk_decide_scope_amendment then fishhawk_retry_stage, on which an
-// approval folds into the retried stage.
+// DECIDED (not denied), and gives the recovery QUALIFIED by the #4127 lapse
+// rule: the request stays `pending` (a failed stage or failed run stays
+// recoverable), so fishhawk_decide_scope_amendment then fishhawk_retry_stage
+// folds an approval into the retried stage; once the stage succeeds, is
+// cancelled or superseded, or the run succeeds or is cancelled, the request
+// LAPSES (a later decide is refused 409 amendment_lapsed) and the recovery is
+// fishhawk_resume_run
+// add_scope_files naming the paths (category B) or fishhawk_retry_stage
+// (category C), on which the agent may re-request them.
 //
 // Pure and reason-preserving: the captured verify output stays the prefix, so
 // nothing an operator or reviewer reads today is lost.
@@ -11944,9 +11950,14 @@ func annotateUndecidedAmendmentFailure(reason string, undecided []upload.ScopeAm
 	}
 	return fmt.Sprintf("%s\n\nThis stage filed a mid-stage scope amendment that was never DECIDED (not denied — the "+
 		"operator's decision window expired undecided): %s. The verify-fix reinvoke was withheld because a fix the "+
-		"agent cannot make without an un-amended path cannot converge. The request is still `pending`, so the decision "+
-		"is still landable: decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage — an approval "+
-		"folds the requested paths into the retried stage's effective scope.",
+		"agent cannot make without an un-amended path cannot converge. The request stays `pending` — a failed stage or "+
+		"failed run stays recoverable — so the decision is landable: decide it with fishhawk_decide_scope_amendment, "+
+		"then fishhawk_retry_stage — an approval folds the requested paths into the retried stage's effective scope. "+
+		"A stage that succeeds, is cancelled or superseded, or a run that succeeds or is cancelled, LAPSES the "+
+		"request (#4127): it can no longer be approved (a later decide is refused 409 amendment_lapsed), so recover "+
+		"then with fishhawk_resume_run "+
+		"add_scope_files naming the paths above (category B) or fishhawk_retry_stage (category C), on which the agent "+
+		"may re-request them.",
 		reason, strings.Join(parts, "; "))
 }
 

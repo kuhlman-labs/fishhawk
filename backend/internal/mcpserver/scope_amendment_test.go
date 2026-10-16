@@ -133,6 +133,9 @@ func TestDecideScopeAmendment_BackendErrorsSurfaced(t *testing.T) {
 		{"already decided", http.StatusConflict,
 			`{"error":{"code":"amendment_already_decided","message":"this scope amendment has already been decided"}}`,
 			"amendment_already_decided"},
+		{"lapsed", http.StatusConflict,
+			`{"error":{"code":"amendment_lapsed","message":"this scope amendment lapsed undecided (its stage succeeded, was cancelled or superseded, or its run succeeded or was cancelled)","details":{"status":"lapsed"}}}`,
+			"amendment_lapsed"},
 		{"self decision", http.StatusForbidden,
 			`{"error":{"code":"self_decision","message":"a run-bound agent token may not decide a scope amendment"}}`,
 			"self_decision"},
@@ -393,5 +396,75 @@ func TestDecideScopeAmendment_DescriptionStatesApprovalBinding(t *testing.T) {
 	}
 	if strings.Contains(reason.Description, "delivered to the agent verbatim on deny") {
 		t.Errorf("reason schema still carries the retired deny-only phrasing (#3322):\n%s", reason.Description)
+	}
+}
+
+// TestScopeAmendmentTools_DescriptionsQualifyLapse pins the #4127 lapse wording
+// on the scope-amendment tool descriptions over the real ListTools round-trip:
+// the list tool names the lapsed status as not actionable; the decide tool and
+// fishhawk_await_children keep the late-decision recovery (decide, then
+// fishhawk_retry_stage) QUALIFIED by the lapse rule (a failed stage or failed
+// run stays recoverable) and name the lapse
+// triggers; the decide tool also names the post-lapse recovery and lists
+// amendment_lapsed among its tool errors. (fishhawk_await_stage's description
+// is pinned by TestAwaitStageToolDescription_NamesAmendmentRelease.)
+func TestScopeAmendmentTools_DescriptionsQualifyLapse(t *testing.T) {
+	ctx := context.Background()
+	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
+	srv := buildServer(cfg)
+	resolver := &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(nil)}
+	registerTools(srv, resolver)
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srv.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	desc := map[string]string{}
+	for _, tl := range res.Tools {
+		desc[tl.Name] = strings.Join(strings.Fields(tl.Description), " ")
+	}
+
+	for tool, wants := range map[string][]string{
+		"fishhawk_list_scope_amendments": {
+			"pending | approved | denied | lapsed",
+			"NOT actionable",
+			"amendment_lapsed",
+		},
+		"fishhawk_decide_scope_amendment": {
+			"still landable unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled",
+			"a failed stage or failed run stays recoverable",
+			"fishhawk_retry_stage folds the paths",
+			"A stage that succeeds, is cancelled or superseded, or a run that succeeds or is cancelled, LAPSES the request",
+			"fishhawk_resume_run add_scope_files",
+			"amendment_lapsed (the stage succeeded",
+		},
+		"fishhawk_await_children": {
+			"a late decision is still honored on fishhawk_retry_stage unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled, which lapses it",
+			"a failed stage or failed run stays recoverable",
+			"amendment_lapsed",
+		},
+	} {
+		got, ok := desc[tool]
+		if !ok {
+			t.Fatalf("%s not registered/visible over ListTools", tool)
+		}
+		for _, want := range wants {
+			if !strings.Contains(got, want) {
+				t.Errorf("%s description missing %q:\n%s", tool, want, got)
+			}
+		}
 	}
 }

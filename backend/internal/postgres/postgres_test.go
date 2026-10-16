@@ -7820,3 +7820,106 @@ VALUES ('inventory', 'running', 'operator', 'user', 's', '{}', 4, now(), 'n', de
 		t.Errorf("attestation columns after re-applying 0104 = %d, want 4", n)
 	}
 }
+
+// TestMigrateDown_ScopeAmendmentsLapsedReversal pins 0105 (E83.64 / #4127):
+// up admits status 'lapsed'; down maps every lapsed row back to an undecided
+// pending row (decision fields cleared) BEFORE narrowing the CHECK, leaves the
+// approved and pending rows untouched, and re-refuses 'lapsed'; re-applying up
+// admits it again.
+func TestMigrateDown_ScopeAmendmentsLapsedReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	runID, stageID := uuid.New(), uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state, runner_kind)
+		 VALUES ($1, 'r', 'feature_change', 'sha', 'cli', 'running', 'local')`, runID,
+	); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+		 VALUES ($1, $2, 1, 'implement', 'agent', 'claude-code', 'succeeded')`,
+		stageID, runID,
+	); err != nil {
+		t.Fatalf("seed implement stage: %v", err)
+	}
+	insert := func(status string, decided bool) (uuid.UUID, error) {
+		id := uuid.New()
+		var err error
+		if decided {
+			_, err = pool.Exec(ctx,
+				`INSERT INTO scope_amendments (id, run_id, stage_id, paths, reason, status, decision_reason, decided_by, decided_at)
+				 VALUES ($1, $2, $3, '[]'::jsonb, 'r', $4, 'why '||$4, CASE WHEN $4 = 'lapsed' THEN NULL ELSE 'github:op' END, now())`,
+				id, runID, stageID, status)
+		} else {
+			_, err = pool.Exec(ctx,
+				`INSERT INTO scope_amendments (id, run_id, stage_id, paths, reason) VALUES ($1, $2, $3, '[]'::jsonb, 'r')`,
+				id, runID, stageID)
+		}
+		return id, err
+	}
+	lapsedID, err := insert("lapsed", true)
+	if err != nil {
+		t.Fatalf("insert lapsed row after 0105: %v", err)
+	}
+	approvedID, err := insert("approved", true)
+	if err != nil {
+		t.Fatalf("insert approved row: %v", err)
+	}
+	pendingID, err := insert("pending", false)
+	if err != nil {
+		t.Fatalf("insert pending row: %v", err)
+	}
+
+	type row struct {
+		status    string
+		reason    *string
+		decidedBy *string
+		decided   bool
+	}
+	read := func(id uuid.UUID) row {
+		t.Helper()
+		var r row
+		if err := pool.QueryRow(ctx,
+			`SELECT status, decision_reason, decided_by, decided_at IS NOT NULL FROM scope_amendments WHERE id = $1`, id,
+		).Scan(&r.status, &r.reason, &r.decidedBy, &r.decided); err != nil {
+			t.Fatalf("read amendment %s: %v", id, err)
+		}
+		return r
+	}
+
+	downThrough(t, url, "0105")
+
+	if got := read(lapsedID); got.status != "pending" || got.reason != nil || got.decidedBy != nil || got.decided {
+		t.Errorf("lapsed row after rolling back 0105 = %+v, want pending with decision_reason/decided_by/decided_at NULL", got)
+	}
+	if got := read(approvedID); got.status != "approved" || got.reason == nil || *got.reason != "why approved" ||
+		got.decidedBy == nil || *got.decidedBy != "github:op" || !got.decided {
+		t.Errorf("approved row after rolling back 0105 = %+v, want it untouched", got)
+	}
+	if got := read(pendingID); got.status != "pending" || got.reason != nil || got.decided {
+		t.Errorf("pending row after rolling back 0105 = %+v, want it untouched", got)
+	}
+	_, err = insert("lapsed", true)
+	var pgErr *pgconn.PgError
+	if !errors.As(err, &pgErr) || pgErr.ConstraintName != "scope_amendments_status_check" {
+		t.Errorf("insert status 'lapsed' after rolling back 0105: err = %v, want a scope_amendments_status_check violation", err)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if _, err := insert("lapsed", true); err != nil {
+		t.Errorf("insert status 'lapsed' after re-applying 0105: %v", err)
+	}
+}

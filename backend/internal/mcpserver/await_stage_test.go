@@ -1099,6 +1099,44 @@ func TestAwaitStage_DecidedAmendmentDoesNotRelease(t *testing.T) {
 	}
 }
 
+// TestAwaitStage_LapsedAmendmentDoesNotRelease pins the strict status
+// predicate against the #4127 lapsed status: a lapsed amendment on the awaited
+// stage is terminal and never approvable (a decide is refused 409
+// amendment_lapsed), so it must not release a re-armed wait as
+// amendment_pending — the wait resolves on its own deadline instead. Widening
+// the Status=="pending" filter to "not approved/denied" makes this release.
+func TestAwaitStage_LapsedAmendmentDoesNotRelease(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	seedAmendment(fb, runID, stageID, "lapsed", "docs/lapsed.md")
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	fb.stageWaitFlip = func(sid uuid.UUID, reads int) {
+		if sid == stageID && reads == 3 {
+			cancel()
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(ctx, nil, AwaitStageInput{
+		RunID:          runID.String(),
+		Stage:          "implement",
+		TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout — a LAPSED amendment must not release the wait", out.Status)
+	}
+	if out.PendingAmendment != nil {
+		t.Errorf("PendingAmendment = %+v, want nil for a lapsed row", out.PendingAmendment)
+	}
+}
+
 // TestAwaitStage_AmendmentForAnotherStageDoesNotRelease pins the strict
 // stage_id predicate: a sibling stage's pending amendment on the SAME run must
 // not release this stage's wait. Deleting the StageID equality filter makes
@@ -1231,6 +1269,21 @@ func TestAwaitStageToolDescription_NamesAmendmentRelease(t *testing.T) {
 		"does not park the stage",
 	} {
 		if !strings.Contains(lower, want) {
+			t.Errorf("await_stage description must carry %q; got:\n%s", want, desc)
+		}
+	}
+	// The late-decision recovery is QUALIFIED, not removed (#4127): it holds
+	// unless the stage succeeded, was cancelled or superseded, or the run
+	// succeeded or was cancelled (a failed stage or failed run stays
+	// recoverable), and a lapse is named with its 409. Whitespace is collapsed so the description's line wrapping does
+	// not decide the match.
+	flat := strings.Join(strings.Fields(lower), " ")
+	for _, want := range []string{
+		"a late decision is still honored on a fishhawk_retry_stage of the same stage unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled, which lapses it",
+		"a failed stage or failed run stays recoverable",
+		"amendment_lapsed",
+	} {
+		if !strings.Contains(flat, want) {
 			t.Errorf("await_stage description must carry %q; got:\n%s", want, desc)
 		}
 	}

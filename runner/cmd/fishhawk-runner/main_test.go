@@ -19004,8 +19004,14 @@ func TestDetectUndecidedScopeAmendments_NoOpGuards(t *testing.T) {
 // TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery pins the
 // category-B demote annotation: the captured verify output is preserved as the
 // prefix, and the appended text names the amendment id, the requested path(s)
-// with their operation, the never-DECIDED (not denied) framing, and BOTH
-// recovery verbs. The empty case returns the reason byte-identically.
+// with their operation, the never-DECIDED (not denied) framing, and the
+// recovery QUALIFIED by the #4127 lapse rule: decide-then-retry while the
+// stage or run is failed (both stay recoverable), and fishhawk_resume_run
+// add_scope_files / fishhawk_retry_stage once the request lapses (a stage that
+// succeeds, is cancelled or superseded, or a run that succeeds or is
+// cancelled). The pre-#4127 UNQUALIFIED
+// "still landable" sentence must be gone. The empty case returns the reason
+// byte-identically.
 func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T) {
 	const reason = "verify command \"go test ./...\" failed:\nFAIL example.com/mod"
 	undecided := []upload.ScopeAmendment{
@@ -19025,12 +19031,20 @@ func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T)
 		"pkg/coupled_test.go (modify)",
 		"pkg/new.go (create)",
 		"never DECIDED (not denied",
-		"fishhawk_decide_scope_amendment",
-		"fishhawk_retry_stage",
+		"The request stays `pending` — a failed stage or failed run stays recoverable",
+		"a run that succeeds or is cancelled, LAPSES the request (#4127)",
+		"decide it with fishhawk_decide_scope_amendment, then fishhawk_retry_stage",
+		"LAPSES the request (#4127)",
+		"amendment_lapsed",
+		"fishhawk_resume_run add_scope_files naming the paths above (category B)",
+		"fishhawk_retry_stage (category C)",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("annotated reason missing %q:\n%s", want, got)
 		}
+	}
+	if strings.Contains(got, "The request is still `pending`, so the decision is still landable") {
+		t.Errorf("annotated reason still carries the unqualified pre-#4127 recovery:\n%s", got)
 	}
 
 	if plain := annotateUndecidedAmendmentFailure(reason, nil); plain != reason {
@@ -19040,11 +19054,16 @@ func TestAnnotateUndecidedAmendmentFailure_NamesIDPathsAndRecovery(t *testing.T)
 
 // TestRefreshScopeAmendments_ApprovedAfterExpiryFoldsOnRetry is the property
 // that makes deliberately NOT introducing an `expired` status correct (#2601):
-// the row stays `pending`, so an operator decision arriving AFTER the stage
-// ended is still landable. Attempt 1 sees the row pending and folds nothing;
-// the operator then approves; attempt 2 (the fishhawk_retry_stage re-run, a
-// fresh cfg from the same plan scope) folds the requested paths. Pinned rather
-// than asserted in prose.
+// an expiry inside the stage leaves the row `pending`, so an operator decision
+// arriving after an earlier refresh saw it pending is still landable. Attempt 1
+// sees the row pending and folds nothing; the operator then approves; attempt 2
+// (the fishhawk_retry_stage re-run, a fresh cfg from the same plan scope) folds
+// the requested paths. Since #4127 that holds unless the stage succeeded, was
+// cancelled or superseded, or the run succeeded or was cancelled (a failed
+// stage or failed run stays recoverable) — those lapse the row and the backend
+// refuses a later decide (409
+// amendment_lapsed), so no approval exists to fold. Pinned rather than asserted
+// in prose.
 func TestRefreshScopeAmendments_ApprovedAfterExpiryFoldsOnRetry(t *testing.T) {
 	fake := newFakeUploader(t)
 	row := upload.ScopeAmendment{
@@ -19229,8 +19248,10 @@ func TestRun_UndecidedScopeAmendment_NoVerifyFixReinvoke(t *testing.T) {
 		t.Error("bundle missing the scope_amendment_undecided policy_event")
 	}
 	// The demote reason is actionable: the amendment id, the requested path, and
-	// BOTH recovery verbs.
-	for _, want := range []string{"amd-e2e", "mod/other.go", "fishhawk_decide_scope_amendment", "fishhawk_retry_stage"} {
+	// the recovery qualified by the #4127 lapse rule (decide-then-retry while the
+	// stage or run is failed; resume_run add_scope_files once it lapses).
+	for _, want := range []string{"amd-e2e", "mod/other.go", "fishhawk_decide_scope_amendment", "fishhawk_retry_stage",
+		"LAPSES the request", "fishhawk_resume_run add_scope_files"} {
 		if !strings.Contains(stderr.String(), want) {
 			t.Errorf("failure reason missing %q:\n%s", want, stderr.String())
 		}

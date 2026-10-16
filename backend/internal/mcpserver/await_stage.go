@@ -261,7 +261,11 @@ Statuses:
                      window elapses with no decision the request EXPIRES
                      UNDECIDED — it stays pending server-side and is NOT a
                      denial, so a late decision is still honored on a
-                     fishhawk_retry_stage of the same stage. Settledness wins
+                     fishhawk_retry_stage of the same stage unless the stage
+                     succeeded, was cancelled or superseded, or the run
+                     succeeded or was cancelled, which lapses it (#4127 — a
+                     later decide is refused 409 amendment_lapsed); a failed
+                     stage or failed run stays recoverable. Settledness wins
                      the race — a stage that has settled resolves 'settled'
                      even with an amendment still pending.
   - "timeout"      — YOUR wait cap expired before the stage settled. What
@@ -535,7 +539,8 @@ func (r *runResolver) awaitStageRunTerminalBackstop(ctx context.Context, runID, 
 // an hours-long wait on a transient list error.
 //
 // The match is STRICT on both fields. Status must be exactly "pending" (a
-// decided amendment is not actionable and must not release a re-armed wait),
+// decided — approved / denied — or lapsed (#4127) amendment is not actionable
+// and must not release a re-armed wait),
 // and StageID must equal the awaited stage — the backend's amendment row
 // carries a non-pointer, non-omitempty stage_id, so equality is a complete
 // predicate rather than one that silently drops rows, and a sibling stage's
@@ -624,7 +629,9 @@ func awaitStageAmendmentPendingOutput(stageType, stageID string, runID uuid.UUID
 			},
 			Precondition: "the awaited stage filed this scope amendment and it is still pending",
 			Consumes:     "none",
-			Reason:       "the agent is blocked on this decision and its " + amendmentPollWindowText() + " poll window expires UNDECIDED (an expiry is not a denial — the request stays pending)",
+			Reason: "the agent is blocked on this decision and its " + amendmentPollWindowText() + " poll window expires UNDECIDED " +
+				"(an expiry is not a denial — the request stays pending until its stage succeeds, is cancelled or superseded, " +
+				"or its run succeeds or is cancelled, which lapses it, #4127; a failed stage or failed run stays recoverable)",
 		},
 		Message: fmt.Sprintf("stage %q is still running and filed scope amendment %s for %s. Reason: %s. "+
 			"Decide it now with fishhawk_decide_scope_amendment (run_id + amendment_id are pre-filled on next_step): "+
