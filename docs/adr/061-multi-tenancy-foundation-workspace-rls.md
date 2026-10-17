@@ -5,6 +5,7 @@ status: unknown
 issue: https://github.com/kuhlman-labs/fishhawk/issues/2069
 supersedes: ["ADR-058"]
 superseded_by: []
+amended_by: ["ADR-105"]
 applies_to: []
 ---
 
