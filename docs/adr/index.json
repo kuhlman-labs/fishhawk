@@ -561,6 +561,9 @@
       "status": "unknown",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-105"
+      ],
       "applies_to": []
     },
     {
@@ -603,6 +606,9 @@
         "ADR-058"
       ],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-105"
+      ],
       "applies_to": []
     },
     {
@@ -977,6 +983,19 @@
         "ADR-040",
         "ADR-089",
         "ADR-097"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-105",
+      "title": "Repository identity keyed on the forge's immutable repository id; names resolve through a time-bounded history; an owner change re-establishes trust (amends ADR-057, ADR-061)",
+      "path": "docs/adr/105-repository-identity-forge-id.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-057",
+        "ADR-061"
       ],
       "applies_to": []
     }
