@@ -26,7 +26,7 @@
     "test:watch": "vitest"
   },
   "dependencies": {
-    "@radix-ui/react-slot": "^1.4.0",
+    "@radix-ui/react-slot": "^1.5.0",
     "class-variance-authority": "^0.7.1",
     "clsx": "^2.1.1",
     "lucide-react": "^1.55.0",
