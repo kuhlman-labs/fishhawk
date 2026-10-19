@@ -120,6 +120,180 @@ func TestClient_Messages_OmitsOutputConfigWhenNil(t *testing.T) {
 	}
 }
 
+// requestBlocks decodes the captured request body's raw `system` array (nil
+// when the key is absent; sawSystem reports presence) and the raw content
+// blocks of messages[0], as untyped maps so a cache_control key is observed
+// exactly as it crossed the wire (#4563).
+func requestBlocks(t *testing.T, body []byte) (system, userContent []map[string]json.RawMessage, sawSystem bool) {
+	t.Helper()
+	var raw struct {
+		System   []map[string]json.RawMessage `json:"system"`
+		Messages []struct {
+			Content []map[string]json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &raw); err != nil {
+		t.Fatalf("parse captured request body: %v", err)
+	}
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil {
+		t.Fatalf("parse captured request body: %v", err)
+	}
+	_, sawSystem = top["system"]
+	if len(raw.Messages) != 1 || len(raw.Messages[0].Content) != 1 {
+		t.Fatalf("want exactly one user message with one content block, got %s", body)
+	}
+	return raw.System, raw.Messages[0].Content, sawSystem
+}
+
+// countBreakpoints counts the cache_control keys across the system blocks and
+// the user content blocks.
+func countBreakpoints(system, userContent []map[string]json.RawMessage) int {
+	n := 0
+	for _, blocks := range [][]map[string]json.RawMessage{system, userContent} {
+		for _, b := range blocks {
+			if _, ok := b["cache_control"]; ok {
+				n++
+			}
+		}
+	}
+	return n
+}
+
+// requireEphemeral fails unless block carries cache_control JSON-equal to
+// {"type":"ephemeral"}.
+func requireEphemeral(t *testing.T, where string, block map[string]json.RawMessage) {
+	t.Helper()
+	cc, ok := block["cache_control"]
+	if !ok {
+		t.Fatalf("%s carries no cache_control; want {\"type\":\"ephemeral\"}", where)
+	}
+	var got, want any
+	if err := json.Unmarshal(cc, &got); err != nil {
+		t.Fatalf("%s cache_control is not JSON: %v", where, err)
+	}
+	if err := json.Unmarshal([]byte(`{"type":"ephemeral"}`), &want); err != nil {
+		t.Fatalf("want JSON: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("%s cache_control = %s, want {\"type\":\"ephemeral\"}", where, cc)
+	}
+}
+
+// TestClient_Messages_CacheUserTurnOnMarksUserAndSystem: with CacheUserTurn set
+// the user text block carries an ephemeral breakpoint beside the system one, 2
+// in total (the API allows 4).
+func TestClient_Messages_CacheUserTurnOnMarksUserAndSystem(t *testing.T) {
+	srv, captured := captureSchemaServer(t)
+	cfg := testConfig()
+	cfg.CacheUserTurn = true
+	c := NewClient(cfg, option.WithBaseURL(srv.URL))
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+
+	system, userContent, sawSystem := requestBlocks(t, *captured)
+	if !sawSystem || len(system) != 1 {
+		t.Fatalf("want one system block, got %s", *captured)
+	}
+	requireEphemeral(t, "system[0]", system[0])
+	requireEphemeral(t, "messages[0].content[0]", userContent[0])
+	if n := countBreakpoints(system, userContent); n != 2 {
+		t.Errorf("breakpoints = %d, want 2", n)
+	}
+}
+
+// TestClient_Messages_CacheUserTurnOffLeavesUserUnmarked is the production
+// regression pin: the zero-value config leaves the user block unmarked and the
+// whole messages array byte-for-byte what it was before the flag existed, while
+// the system block keeps its breakpoint.
+func TestClient_Messages_CacheUserTurnOffLeavesUserUnmarked(t *testing.T) {
+	srv, captured := captureSchemaServer(t)
+	c := NewClient(testConfig(), option.WithBaseURL(srv.URL))
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+
+	system, userContent, _ := requestBlocks(t, *captured)
+	if _, ok := userContent[0]["cache_control"]; ok {
+		t.Errorf("zero-value config marked the user block: %s", *captured)
+	}
+	requireEphemeral(t, "system[0]", system[0])
+
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(*captured, &top); err != nil {
+		t.Fatalf("parse captured request body: %v", err)
+	}
+	var got, want any
+	if err := json.Unmarshal(top["messages"], &got); err != nil {
+		t.Fatalf("parse messages: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`[{"role":"user","content":[{"type":"text","text":"user"}]}]`), &want); err != nil {
+		t.Fatalf("want JSON: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("messages = %s, want the pre-change shape", top["messages"])
+	}
+}
+
+// TestClient_Messages_CacheUserTurnEmptySystemSingleBreakpoint: with CacheUserTurn
+// set and an empty systemText the body has no system key and exactly one
+// breakpoint, on the user block.
+func TestClient_Messages_CacheUserTurnEmptySystemSingleBreakpoint(t *testing.T) {
+	srv, captured := captureSchemaServer(t)
+	cfg := testConfig()
+	cfg.CacheUserTurn = true
+	c := NewClient(cfg, option.WithBaseURL(srv.URL))
+
+	if _, _, _, _, _, _, err := c.Messages(context.Background(), "", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+
+	system, userContent, sawSystem := requestBlocks(t, *captured)
+	if sawSystem {
+		t.Errorf("empty systemText still sent a system key: %s", *captured)
+	}
+	if n := countBreakpoints(system, userContent); n != 1 {
+		t.Errorf("breakpoints = %d, want exactly 1", n)
+	}
+	requireEphemeral(t, "messages[0].content[0]", userContent[0])
+}
+
+// TestReviewer_LeavesUserTurnUncached pins the production construction path
+// (NewReviewer over a Config literal that does not set CacheUserTurn, as
+// serve.go builds it): the system split keeps its breakpoint and the user turn
+// stays unmarked.
+func TestReviewer_LeavesUserTurnUncached(t *testing.T) {
+	var captured []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		captured, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(okResp(`{"verdict":"approve"}`))
+	}))
+	defer srv.Close()
+
+	reviewer := NewReviewer(testConfig(), option.WithBaseURL(srv.URL))
+	promptText := "ROLE CONSTRAINT preamble text" + prompt.PlanReviewSplitMarker + "Plan artifact body text"
+	if _, _, err := reviewer.Review(context.Background(), promptText); err != nil {
+		t.Fatalf("Review: %v", err)
+	}
+
+	system, userContent, sawSystem := requestBlocks(t, captured)
+	if !sawSystem || len(system) != 1 {
+		t.Fatalf("want one system block (the production split), got %s", captured)
+	}
+	var text string
+	if err := json.Unmarshal(system[0]["text"], &text); err != nil || text == "" {
+		t.Errorf("system[0].text = %s (err %v), want non-empty", system[0]["text"], err)
+	}
+	requireEphemeral(t, "system[0]", system[0])
+	if _, ok := userContent[0]["cache_control"]; ok {
+		t.Errorf("production reviewer marked the user turn: %s", captured)
+	}
+}
+
 // fakeRespServer returns an httptest server that replies with the given
 // fakeAnthropicResp envelope. It mirrors captureSchemaServer but provides
 // response control rather than request capture, letting tests set arbitrary
