@@ -3,9 +3,11 @@ package agenteval
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"reflect"
 	"regexp"
 	"strings"
 	"testing"
@@ -69,10 +71,19 @@ func (*liveCredentialConflictError) Error() string {
 }
 
 // config stamps exactly the resolved credential onto cfg, overwriting both
-// credential fields so a caller's literal can never carry the other one.
+// credential fields so a caller's literal can never carry the other one. It also
+// forces Config.CacheUserTurn on (#4563), whatever the caller's literal says, so
+// a per-judge opt-out would need a new parameter on this seam, not a literal
+// false.
 func (c liveCredential) config(cfg anthropic.Config) anthropic.Config {
 	cfg.APIKey = c.apiKey
 	cfg.AuthToken = c.authToken
+	// Every live eval client resends identical prompts within the 5-minute TTL
+	// (catch-rate 8-11 samples per case, persona 46), so the user-turn
+	// breakpoint is forced on at this one seam whatever the caller's literal
+	// says: samples 2..N read the prompt from cache instead of paying for it
+	// again. Caching never changes model outputs.
+	cfg.CacheUserTurn = true
 	return cfg
 }
 
@@ -156,6 +167,75 @@ func TestLiveCredentialConfig_StampsExactlyOne(t *testing.T) {
 	got = liveCredential{authToken: "t"}.config(anthropic.Config{APIKey: "stale"})
 	if got.APIKey != "" || got.AuthToken != "t" {
 		t.Errorf("stale APIKey survived: APIKey=%q AuthToken=%q", got.APIKey, got.AuthToken)
+	}
+
+	// The user-turn breakpoint is forced on for both credential kinds, even over
+	// a literal that sets it false explicitly (#4563).
+	for name, cred := range map[string]liveCredential{
+		"key":   {apiKey: "k"},
+		"token": {authToken: "t"},
+	} {
+		if got := cred.config(base); !got.CacheUserTurn {
+			t.Errorf("%s credential left CacheUserTurn false", name)
+		}
+		if got := cred.config(anthropic.Config{CacheUserTurn: false}); !got.CacheUserTurn {
+			t.Errorf("%s credential let an explicit CacheUserTurn=false through", name)
+		}
+	}
+}
+
+// TestLiveCredential_ConfigCachesUserTurnOnWire is the cross-boundary test for
+// #4563: liveCredential.config -> anthropic.Config -> NewClient -> SDK -> wire.
+// The captured raw request body carries an ephemeral cache_control on the user
+// text block. No live key is needed.
+func TestLiveCredential_ConfigCachesUserTurnOnWire(t *testing.T) {
+	var body []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ = io.ReadAll(r.Body)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"id": "msg_test", "type": "message", "role": "assistant",
+			"content":     []map[string]string{{"type": "text", "text": "ok"}},
+			"model":       "claude-sonnet-4-6",
+			"stop_reason": "end_turn",
+			"usage":       map[string]int{"input_tokens": 1, "output_tokens": 1},
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	client := anthropic.NewClient(liveCredential{apiKey: "key-sentinel"}.config(anthropic.Config{
+		Model:     "claude-sonnet-4-6",
+		MaxTokens: 16,
+		Timeout:   5 * time.Second,
+	}), option.WithBaseURL(srv.URL))
+	if _, _, _, _, _, _, err := client.Messages(context.Background(), "sys", "user"); err != nil {
+		t.Fatalf("Messages: %v", err)
+	}
+
+	var req struct {
+		Messages []struct {
+			Content []map[string]json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(body, &req); err != nil {
+		t.Fatalf("parse captured request body: %v", err)
+	}
+	if len(req.Messages) != 1 || len(req.Messages[0].Content) != 1 {
+		t.Fatalf("want one user message with one content block, got %s", body)
+	}
+	cc, ok := req.Messages[0].Content[0]["cache_control"]
+	if !ok {
+		t.Fatalf("user content block carries no cache_control; want {\"type\":\"ephemeral\"}: %s", body)
+	}
+	var got, want any
+	if err := json.Unmarshal(cc, &got); err != nil {
+		t.Fatalf("cache_control is not JSON: %v", err)
+	}
+	if err := json.Unmarshal([]byte(`{"type":"ephemeral"}`), &want); err != nil {
+		t.Fatalf("want JSON: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("user cache_control = %s, want {\"type\":\"ephemeral\"}", cc)
 	}
 }
 
