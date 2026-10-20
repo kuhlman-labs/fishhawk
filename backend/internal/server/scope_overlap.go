@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"net/http"
 	"sort"
-	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -397,12 +396,6 @@ func (s *Server) stagePlanForOverlap(ctx context.Context, stageID uuid.UUID) *pl
 	return &p
 }
 
-// isRunBoundSubject reports whether the caller authenticated with a run-bound
-// mcp:run:<uuid> token (well-formed or not).
-func isRunBoundSubject(id Identity) bool {
-	return strings.HasPrefix(id.Subject, "mcp:run:")
-}
-
 // handleGetRunScopeOverlap implements GET /v0/runs/{run_id}/scope-overlap.
 //
 // Read authorization: the payload names OTHER runs' ids, issue refs and paths,
@@ -423,7 +416,7 @@ func (s *Server) handleGetRunScopeOverlap(w http.ResponseWriter, r *http.Request
 			map[string]any{"field": "run_id", "got": r.PathValue("run_id")})
 		return
 	}
-	if isRunBoundSubject(IdentityFrom(r.Context())) {
+	if isRunBoundSubject(IdentityFrom(r.Context()).Subject) {
 		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
 			"a run-bound agent token may not read cross-run scope overlap; it names other runs' issues and paths", nil)
 		return
@@ -455,7 +448,7 @@ func (s *Server) handleGetRunScopeOverlap(w http.ResponseWriter, r *http.Request
 // run-bound caller (it would name other runs, approval condition 1) and on a
 // compute error (WARN-logged; the gate view still answers 200).
 func (s *Server) gateViewScopeOverlapFor(ctx context.Context, runRow *run.Run) *scopeOverlapPayload {
-	if runRow == nil || isRunBoundSubject(IdentityFrom(ctx)) {
+	if runRow == nil || isRunBoundSubject(IdentityFrom(ctx).Subject) {
 		return nil
 	}
 	result, err := s.computeScopeOverlap(ctx, runRow)
