@@ -36,6 +36,14 @@
 #   host docker absent -> d7 (RED on the MESSAGE only: with the guard gone,
 #   `docker run` exits 127 and the exec-failure guard still exits 1).
 #   helm v4 floor -> s15a              helm exact-version -> s15b
+#   HOST mode (#4245): golangci-lint version compare -> h2 h11 h14
+#   golangci-lint build-Go compare -> h3      gofmt Go compare -> h4 h11
+#   golangci-lint absent -> h5         unparseable version -> h6
+#   no `built with` -> h7              go absent beside gofmt -> h9
+#   gofmt `go version` unparseable -> h10
+#   GO_VERSION MAJOR.MINOR unparseable -> h13
+#   --host conflict -> h12a (h12b stays green: the --platform-requires-
+#   --image guard still exits 2 behind it)
 # ---------------------------------------------------------------------------
 set -uo pipefail
 
@@ -471,6 +479,134 @@ expect "d9a: a failed image inspect fails closed" 1 "cannot resolve the image ID
 
 run_dynamic d9b "$r" "$GOOD_PROBE" 0 "" 0 --image fishhawk-gate:test
 expect "d9b: an inspect that exits 0 without an ID fails closed" 1 "cannot resolve the image ID of fishhawk-gate:test"
+
+# --- host cases (#4245) ------------------------------------------------------
+# HOST mode probes the tools on PATH. Each case runs under a PATH of a per-case
+# HOSTBIN (fakes for golangci-lint, gofmt and go, only the ones the case wants)
+# ahead of the symlink-only SAFEBIN, so the host's real tools are unreachable.
+# The fixture pins are GO_VERSION 1.25.6 and GOLANGCI_LINT_VERSION v2.8.0; the
+# fakes default to agreeing with them and each case overrides ONE knob, so the
+# branch under test is the only one that can refuse.
+HOSTFAKES="$tmproot/hostfakes"
+mkdir -p "$HOSTFAKES"
+cat > "$HOSTFAKES/golangci-lint" <<'EOF'
+#!/bin/sh
+if [ -n "${FAKE_GL_LINE+x}" ]; then printf '%s\n' "$FAKE_GL_LINE"; exit 0; fi
+printf 'golangci-lint has version %s built with go%s from fake on 2026-01-01T00:00:00Z\n' "$FAKE_GL_VER" "$FAKE_GL_GO"
+EOF
+cat > "$HOSTFAKES/gofmt" <<'EOF'
+#!/bin/sh
+exit 0
+EOF
+cat > "$HOSTFAKES/go" <<'EOF'
+#!/bin/sh
+if [ "$1" = version ] && [ -n "${2:-}" ]; then
+  if [ -n "${FAKE_GOFMT_LINE+x}" ]; then printf '%s\n' "$FAKE_GOFMT_LINE"; exit 0; fi
+  printf '%s: go%s\n' "$2" "$FAKE_GOFMT_GO"
+  exit 0
+fi
+echo "fake go: unexpected argv: $*" >&2
+exit 99
+EOF
+chmod +x "$HOSTFAKES/golangci-lint" "$HOSTFAKES/gofmt" "$HOSTFAKES/go"
+
+# mkhostbin NAME TOOL... -> a dir holding only the named fakes; prints it.
+mkhostbin() {
+  local d="$tmproot/hostbin-$1" t
+  shift
+  mkdir -p "$d"
+  for t in "$@"; do ln -s "$HOSTFAKES/$t" "$d/$t"; done
+  printf '%s\n' "$d"
+}
+if PATH="$SAFEBIN" bash -c 'command -v golangci-lint || command -v gofmt || command -v go' >/dev/null 2>&1; then
+  echo "test-check-gate-image: precondition failed — a real golangci-lint/gofmt/go resolves on the symlinked PATH" >&2
+  exit 1
+fi
+
+# run_host ROOT HOSTBIN [extra args...] — knobs from H_GL_VER, H_GL_GO,
+# H_GOFMT_GO (defaults agree with the fixture) and H_GL_LINE / H_GOFMT_LINE
+# (verbatim lines, only when set).
+run_host() {
+  local r="$1" hb="$2"; shift 2
+  local e=(PATH="$hb:$SAFEBIN" FAKE_GL_VER="${H_GL_VER:-2.8.0}" FAKE_GL_GO="${H_GL_GO:-1.25.5}" FAKE_GOFMT_GO="${H_GOFMT_GO:-1.25.6}")
+  if [ -n "${H_GL_LINE+x}" ]; then e+=(FAKE_GL_LINE="$H_GL_LINE"); fi
+  if [ -n "${H_GOFMT_LINE+x}" ]; then e+=(FAKE_GOFMT_LINE="$H_GOFMT_LINE"); fi
+  out="$(env "${e[@]}" "$CHECK" --root "$r" --host "$@" 2>&1)"
+  status=$?
+}
+# lacks CASE SUBSTRING — fail when the last output carries SUBSTRING.
+lacks() {
+  case "$out" in
+    *"$2"*) fail "$1: output unexpectedly carries '$2'; output: $out" ;;
+    *) pass "$1" ;;
+  esac
+}
+
+r="$(mkfix h0)"
+HB_ALL="$(mkhostbin all golangci-lint gofmt go)"
+
+run_host "$r" "$HB_ALL"
+expect "h1: a host golangci-lint and gofmt agreeing with the pins pass" 0 \
+  "ok host golangci-lint 2.8.0 (built with go1.25)" "ok host gofmt $HB_ALL/gofmt go1.25"
+
+H_GL_VER=2.9.0 run_host "$r" "$HB_ALL"
+expect "h2: host golangci-lint 2.9.0 vs ARG v2.8.0" 1 \
+  "host golangci-lint 2.9.0 differs from deploy/gate-image/Dockerfile:7 GOLANGCI_LINT_VERSION v2.8.0" "1 host toolchain violation(s)"
+
+H_GL_GO=1.26.0 run_host "$r" "$HB_ALL"
+expect "h3: host golangci-lint built with go1.26 vs GO_VERSION 1.25.6" 1 \
+  "host golangci-lint is built with go1.26 but deploy/gate-image/Dockerfile:4 GO_VERSION 1.25.6 is 1.25" \
+  "its gofmt/goimports formatters follow the Go that built it" "1 host toolchain violation(s)"
+
+H_GOFMT_GO=1.27.2 run_host "$r" "$HB_ALL"
+expect "h4: host gofmt go1.27 vs GO_VERSION 1.25.6, naming the gofmt path" 1 \
+  "host gofmt $HB_ALL/gofmt is built with go1.27 but deploy/gate-image/Dockerfile:4 GO_VERSION 1.25.6 is 1.25" \
+  "\`go env -w GOTOOLCHAIN\` switches \`go\`, never a standalone gofmt" "1 host toolchain violation(s)"
+
+run_host "$r" "$(mkhostbin nogl gofmt go)"
+expect "h5: golangci-lint absent from PATH fails closed" 1 "host golangci-lint not found on PATH (fail closed"
+
+H_GL_LINE='golangci-lint has version (devel) built with go1.25.5 from fake' run_host "$r" "$HB_ALL"
+expect "h6: an unparseable golangci-lint version fails closed" 1 \
+  "cannot parse a version from host \`golangci-lint version\` output 'golangci-lint has version (devel) built with go1.25.5 from fake'" \
+  "1 host toolchain violation(s)"
+
+H_GL_LINE='golangci-lint has version 2.8.0 from fake' run_host "$r" "$HB_ALL"
+expect "h7: a version line without \`built with goX.Y\` fails closed" 1 \
+  "cannot parse the Go that built host golangci-lint (no \`built with goX.Y\`) from 'golangci-lint has version 2.8.0 from fake'" \
+  "1 host toolchain violation(s)"
+
+run_host "$r" "$(mkhostbin nogofmt golangci-lint go)"
+expect "h8: gofmt absent from PATH passes (the lint leg never runs it)" 0 \
+  "ok host gofmt absent from PATH" "ok host golangci-lint 2.8.0 (built with go1.25)"
+
+HB_NOGO="$(mkhostbin nogo golangci-lint gofmt)"
+run_host "$r" "$HB_NOGO"
+expect "h9: gofmt present but go absent fails closed" 1 "host gofmt $HB_NOGO/gofmt is on PATH but \`go\` is not"
+
+H_GOFMT_LINE="$HB_ALL/gofmt: could not read Go build info from $HB_ALL/gofmt: not a Go executable" run_host "$r" "$HB_ALL"
+expect "h10: \`go version\` exiting 0 with no Go build info fails closed" 1 \
+  "cannot read the Go version of host gofmt $HB_ALL/gofmt" "could not read Go build info" "1 host toolchain violation(s)"
+
+H_GL_VER=2.9.0 H_GOFMT_GO=1.27.2 run_host "$r" "$HB_ALL"
+expect "h11: two mismatches at once are BOTH reported" 1 \
+  "host golangci-lint 2.9.0 differs" "host gofmt $HB_ALL/gofmt is built with go1.27" "2 host toolchain violation(s)"
+
+run_host "$r" "$HB_ALL" --image x
+expect "h12a: --host with --image is a usage error" 2 "--host probes THIS host's PATH and cannot be combined with --image or --platform"
+run_host "$r" "$HB_ALL" --platform linux/arm64
+expect "h12b: --host with --platform is a usage error" 2 "--host probes THIS host's PATH and cannot be combined with --image or --platform"
+
+r13="$(mkfix h13)"
+edit "$r13/deploy/gate-image/Dockerfile" 's#^ARG GO_VERSION=.*#ARG GO_VERSION=latest#'
+run_host "$r13" "$HB_ALL"
+expect "h13: a GO_VERSION without a MAJOR.MINOR fails closed" 1 \
+  "deploy/gate-image/Dockerfile:4: GO_VERSION 'latest' has no parseable MAJOR.MINOR"
+lacks "h13: no tool is reported ok against an uncomparable pin" "ok host"
+
+run_host "$REPO_ROOT" "$HB_ALL"
+expect "h14: --host reads the pins from the SHIPPED Dockerfile at run time (fixture tools disagree with them)" 1 \
+  "GOLANGCI_LINT_VERSION v2.12.2" "GO_VERSION 1.26.9"
 
 echo
 echo "test-check-gate-image: $PASS passed, $FAIL failed"
