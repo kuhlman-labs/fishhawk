@@ -1,0 +1,14 @@
+id: scenario:issue-4245/lint-proceeds-on-pinned-toolchain
+statement: When golangci-lint and gofmt on PATH match the Dockerfile pins, `scripts/check-gate-image --host` exits 0 printing one `ok host golangci-lint` and one `ok host gofmt` line, and `scripts/test lint` goes on to run golangci-lint in every go.work module.
+verify_hint: CLI stdout/exit code of `scripts/check-gate-image --host` and of `scripts/test lint` with pinned stub tools on PATH (stub `run` exits 0); alternatively inside the gate image via `scripts/test lint --in-gate-image`.
+steps: 'In the sanctioned checkout, created a stub dir with: a golangci-lint whose version is 2.12.2 built with go1.26.2 and whose run exits 0 and records its cwd; a stub gofmt; and a stub go answering ''version <gofmt>'' with go1.26.9. Ran PATH=<stubdir>:$PATH scripts/check-gate-image --host, then PATH=<stubdir>:$PATH scripts/test lint.'
+assertions:
+    expected: --host exits 0 with one ok host golangci-lint and one ok host gofmt line; lint runs golangci-lint in every go.work module.
+    observed_at_record: check-gate-image --host exits 0 and prints exactly 'ok host golangci-lint 2.12.2 (built with go1.26)' and 'ok host gofmt /tmp/fhv4245/stubs/good/gofmt go1.26'. scripts/test lint exits 0 and run.trace records golangci-lint run in all 8 go.work modules (backend, cli, credstore, directory, pricing, redaction, runner, verifier). TestLintLegRunsOnPinnedHostToolchain PASS.
+    repro_handle: PATH=/tmp/fhv4245/stubs/good:$PATH scripts/check-gate-image --host && PATH=/tmp/fhv4245/stubs/good:$PATH scripts/test lint
+origin:
+    issue: 4245
+    pr: 4535
+    run_id: ab48e168-c713-417a-b5fc-6674b1b22752
+    head_sha: 60964391153dea43c175372687fedebf232bc68c
+    recorded_at: 2026-10-16T22:08:01Z

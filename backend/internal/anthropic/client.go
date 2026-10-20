@@ -60,14 +60,24 @@ type Config struct {
 	// deployment gets. Selection is process-level per ADR-062 Q3(a) — there
 	// is no per-account endpoint registry.
 	BaseURL string
+
+	// CacheUserTurn is opt-in (#4563). When true, Messages also puts an
+	// ephemeral cache_control breakpoint on the user text block, beside the
+	// system-block breakpoint: at most 2 breakpoints, default 5-minute TTL, no
+	// ttl field set. The zero value (false) leaves the request bytes unchanged,
+	// so the production reviewer (NewReviewer in serve.go) is unaffected. It is
+	// meant for a caller that resends a byte-identical user prompt within the
+	// TTL (the agenteval live arms); see README.md.
+	CacheUserTurn bool
 }
 
 // Client wraps the Anthropic SDK for Messages API calls.
 type Client struct {
-	inner     anthropicsdk.Client
-	model     string
-	maxTokens int
-	schema    map[string]any
+	inner         anthropicsdk.Client
+	model         string
+	maxTokens     int
+	schema        map[string]any
+	cacheUserTurn bool
 	// configErr is a construction-time misconfiguration (today only
 	// ErrConflictingCredentials). NewClient keeps its non-error signature, so
 	// the error rides on the Client and Messages returns it before any I/O.
@@ -143,16 +153,20 @@ func NewClient(cfg Config, opts ...option.RequestOption) *Client {
 	}
 	allOpts := append(defaults, opts...)
 	return &Client{
-		inner:     anthropicsdk.NewClient(allOpts...),
-		model:     cfg.Model,
-		maxTokens: cfg.MaxTokens,
-		schema:    cfg.Schema,
+		inner:         anthropicsdk.NewClient(allOpts...),
+		model:         cfg.Model,
+		maxTokens:     cfg.MaxTokens,
+		schema:        cfg.Schema,
+		cacheUserTurn: cfg.CacheUserTurn,
 	}
 }
 
 // Messages calls the Anthropic Messages API. systemText is placed in a
 // system block with ephemeral cache_control; when empty, the system block is
-// omitted. userText becomes the single user message. Returns the first text
+// omitted. userText becomes the single user message; when Config.CacheUserTurn
+// is set, its text block carries an ephemeral cache_control breakpoint too (at
+// most 2 breakpoints in total, 1 when systemText is empty), otherwise it is
+// unmarked. Returns the first text
 // block from the response, the model name used, and the response's token
 // usage — fresh input, output, and the cache read / cache write split
 // (#681/#1343) — so the caller can attribute reviewer agent cost including
@@ -190,11 +204,15 @@ func (c *Client) Messages(ctx context.Context, systemText, userText string) (res
 	if c.configErr != nil {
 		return "", "", 0, 0, 0, 0, c.configErr
 	}
+	userBlock := anthropicsdk.TextBlockParam{Text: userText}
+	if c.cacheUserTurn {
+		userBlock.CacheControl = anthropicsdk.NewCacheControlEphemeralParam()
+	}
 	params := anthropicsdk.MessageNewParams{
 		Model:     c.model,
 		MaxTokens: int64(c.maxTokens),
 		Messages: []anthropicsdk.MessageParam{
-			anthropicsdk.NewUserMessage(anthropicsdk.NewTextBlock(userText)),
+			anthropicsdk.NewUserMessage(anthropicsdk.ContentBlockParamUnion{OfText: &userBlock}),
 		},
 	}
 	if c.schema != nil {
