@@ -3,9 +3,12 @@ package server
 import (
 	"context"
 	"net/http"
+	"net/http/httptest"
 	"sort"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
@@ -513,5 +516,43 @@ func TestMCPToolScopeTable_CommsDispositionsMirrorsHandler(t *testing.T) {
 	upkeep, _ := mcpToolScopeFor("fishhawk_record_upkeep_dispositions")
 	if strings.Join(rule.anyOf, ",") != strings.Join(upkeep.anyOf, ",") {
 		t.Errorf("comms anyOf = %v, want the upkeep capture posture %v (both captures share requireOperatorCapture)", rule.anyOf, upkeep.anyOf)
+	}
+}
+
+// TestMCPToolScopeTable_AppendCampaignItemsMirrorsHandler (E86.47 / #4358):
+// fishhawk_append_campaign_items carries EXACTLY the predicate
+// handleAppendCampaignItems enforces — requireWriteScope("write:campaigns").
+// A write:campaigns token passes the handler's scope guard (it reaches the
+// campaign lookup, 404) and the row; a token holding only other write scopes
+// is refused by both, so the row is neither stricter nor looser.
+func TestMCPToolScopeTable_AppendCampaignItemsMirrorsHandler(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_append_campaign_items")
+	if !ok {
+		t.Fatal("fishhawk_append_campaign_items has no scope rule")
+	}
+	if strings.Join(rule.anyOf, ",") != "write:campaigns" || rule.runBoundSubjectOK {
+		t.Errorf("rule = %+v, want anyOf [write:campaigns], no run-bound subject", rule)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: newFakeCampaignRepo()})
+	id := uuid.NewString()
+	post := func(scopes ...string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+id+"/items", strings.NewReader(`{"items":["20"]}`))
+		req.SetPathValue("campaign_id", id)
+		w := httptest.NewRecorder()
+		s.handleAppendCampaignItems(w, withIdentity(req, Identity{Subject: "github:op", TokenID: "tok", Scopes: scopes}))
+		return w
+	}
+	if w := post("write:campaigns"); w.Code != http.StatusNotFound {
+		t.Errorf("write:campaigns = %d %s, want past the scope guard (404)", w.Code, w.Body.String())
+	}
+	if !rule.satisfiedBy(Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{"write:campaigns"}}) {
+		t.Error("row refuses write:campaigns, which the handler admits")
+	}
+	other := []string{"write:runs", "write:approvals", "write:stages"}
+	if w := post(other...); w.Code != http.StatusForbidden {
+		t.Errorf("other write scopes = %d, want 403 insufficient_scope", w.Code)
+	}
+	if rule.satisfiedBy(Identity{Subject: "github:op", TokenID: "tok", Scopes: other}) {
+		t.Error("row admits a token the handler refuses")
 	}
 }

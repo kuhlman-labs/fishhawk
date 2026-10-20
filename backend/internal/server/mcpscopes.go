@@ -316,6 +316,11 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	"fishhawk_start_campaign_item_run": {anyOf: []string{"write:campaigns"}},
 	"fishhawk_resume_campaign":         {anyOf: []string{"write:campaigns"}},
 	"fishhawk_cancel_campaign":         {anyOf: []string{"write:campaigns"}},
+	// fishhawk_append_campaign_items (E86.47 / #4358) MIRRORS POST
+	// /v0/campaigns/{id}/items: handleAppendCampaignItems calls
+	// requireWriteScope("write:campaigns"). Pinned by
+	// TestMCPToolScopeTable_AppendCampaignItemsMirrorsHandler.
+	"fishhawk_append_campaign_items": {anyOf: []string{"write:campaigns"}},
 
 	// fishhawk_digest (E75.6 / #3734) dials TWO endpoints: its default read
 	// mode GETs /v0/digest (digest.go handleGetDigest:
