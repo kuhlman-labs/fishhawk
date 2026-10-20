@@ -32,8 +32,9 @@ func newRepo(t *testing.T) apitoken.Repository {
 // TestPostgres_GetTokenByHash_ScansAccountID exercises migration 0055's
 // nullable api_tokens.account_id (ADR-057 / E44.5): Authenticate (which reads
 // via GetTokenByHash) surfaces "" for an untenanted token and the bound
-// account UUID for a tenanted one. Issue does not set account_id, so the
-// binding is a raw UPDATE — the writer/backfill lands in a later child.
+// account UUID for a tenanted one. The binding is a raw UPDATE on an
+// Issue-minted (untenanted) row, so this test isolates the READ path from
+// the IssueForAccount writer (#4506), which TestIssueForAccount_* pin.
 func TestPostgres_GetTokenByHash_ScansAccountID(t *testing.T) {
 	url := pgtest.NewURL(t)
 	if err := postgres.MigrateUp(url); err != nil {
@@ -255,5 +256,114 @@ func TestPostgres_Issue_RejectsEmptySubject(t *testing.T) {
 	_, err := r.Issue(context.Background(), "", nil)
 	if err == nil || !strings.Contains(err.Error(), "subject") {
 		t.Errorf("err = %v, want subject error", err)
+	}
+}
+
+// newRepoWithPool is newRepo plus the pool, for tests that read COMMITTED
+// api_tokens rows back by raw SQL.
+func newRepoWithPool(t *testing.T) (apitoken.Repository, *pgxpool.Pool) {
+	t.Helper()
+	url := pgtest.NewURL(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return apitoken.NewPostgresRepository(pool), pool
+}
+
+// committedAccountID reads a token row's account_id back from the table
+// after the call that wrote it returned: nil for NULL (untenanted).
+func committedAccountID(t *testing.T, pool *pgxpool.Pool, id uuid.UUID) *uuid.UUID {
+	t.Helper()
+	var acct *uuid.UUID
+	if err := pool.QueryRow(context.Background(),
+		`SELECT account_id FROM api_tokens WHERE id = $1`, id).Scan(&acct); err != nil {
+		t.Fatalf("read committed account_id: %v", err)
+	}
+	return acct
+}
+
+// TestIssueForAccount_PersistsAccount (#4506): a tenanted mint's account is
+// on the returned token, on the COMMITTED row and on the re-authenticated
+// token; an Issue-minted row stays untenanted (NULL).
+func TestIssueForAccount_PersistsAccount(t *testing.T) {
+	r, pool := newRepoWithPool(t)
+	ctx := context.Background()
+	acctID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO accounts (id, account_key) VALUES ($1, $2)`,
+		acctID, "acct-"+acctID.String()[:8]); err != nil {
+		t.Fatalf("insert account: %v", err)
+	}
+
+	tok, err := r.IssueForAccount(ctx, "github:member", []string{"read:runs"}, acctID.String())
+	if err != nil {
+		t.Fatalf("IssueForAccount: %v", err)
+	}
+	if tok.AccountID != acctID.String() {
+		t.Errorf("returned AccountID = %q, want %q", tok.AccountID, acctID)
+	}
+	if got := committedAccountID(t, pool, tok.ID); got == nil || *got != acctID {
+		t.Errorf("committed account_id = %v, want %s", got, acctID)
+	}
+	auth, err := r.Authenticate(ctx, tok.PlainText)
+	if err != nil {
+		t.Fatalf("Authenticate: %v", err)
+	}
+	if auth.AccountID != acctID.String() {
+		t.Errorf("authenticated AccountID = %q, want %q", auth.AccountID, acctID)
+	}
+
+	untenanted, err := r.Issue(ctx, "github:operator", []string{"read:runs"})
+	if err != nil {
+		t.Fatalf("Issue: %v", err)
+	}
+	if untenanted.AccountID != "" {
+		t.Errorf("Issue returned AccountID = %q, want empty", untenanted.AccountID)
+	}
+	if got := committedAccountID(t, pool, untenanted.ID); got != nil {
+		t.Errorf("Issue committed account_id = %s, want NULL", *got)
+	}
+}
+
+// TestIssueForAccount_RefusesInvalidAccount (#4506): an empty, malformed, or
+// unknown (no accounts row: the foreign key) account id is an error, never a
+// silent untenanted mint. Each case reads COMMITTED state: zero rows.
+func TestIssueForAccount_RefusesInvalidAccount(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		accountID string
+	}{
+		{"empty", ""},
+		{"malformed", "not-a-uuid"},
+		{"unknown-account", uuid.NewString()},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r, pool := newRepoWithPool(t)
+			ctx := context.Background()
+			subject := "github:invalid-" + tc.name
+			tok, err := r.IssueForAccount(ctx, subject, []string{"read:runs"}, tc.accountID)
+			if err == nil {
+				t.Errorf("IssueForAccount(%q) = token %v, want an error", tc.accountID, tok.ID)
+			}
+			toks, err := r.ListForSubject(ctx, subject)
+			if err != nil {
+				t.Fatalf("ListForSubject: %v", err)
+			}
+			if len(toks) != 0 {
+				t.Errorf("ListForSubject = %d tokens, want 0", len(toks))
+			}
+			var n int
+			if err := pool.QueryRow(ctx,
+				`SELECT count(*) FROM api_tokens WHERE subject = $1`, subject).Scan(&n); err != nil {
+				t.Fatalf("count: %v", err)
+			}
+			if n != 0 {
+				t.Errorf("committed api_tokens rows = %d, want 0", n)
+			}
+		})
 	}
 }

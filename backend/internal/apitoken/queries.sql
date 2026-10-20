@@ -3,9 +3,11 @@
 
 -- name: CreateToken :one
 -- Static operator-token path. auth_method is left to the column
--- DEFAULT 'static' and provider stays NULL.
-INSERT INTO api_tokens (id, subject, token_hash, scopes)
-VALUES ($1, $2, $3, $4)
+-- DEFAULT 'static' and provider stays NULL. account_id NULL mints an
+-- untenanted token; a set account_id binds it to that workspace
+-- account (#4506).
+INSERT INTO api_tokens (id, subject, token_hash, scopes, account_id)
+VALUES ($1, $2, $3, $4, $5)
 RETURNING *;
 
 -- name: CreateOAuthToken :one

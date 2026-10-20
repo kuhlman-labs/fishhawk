@@ -12200,6 +12200,13 @@ paths:
         the deployment's operator default scope set, the same set
         `POST /v0/tokens/login` mints within; an unwired set admits no
         explicit scope). An empty `scopes` list is always admitted.
+
+        **Tenancy (#4506).** The minted token inherits the caller's
+        workspace account: a tenanted caller (a tenanted bearer, or a cookie
+        session resolved to an account) mints a token bound to that account,
+        so the new bearer sees that account's view; an untenanted caller
+        (an operator token or an accountless session) mints an untenanted
+        token. The request and response shapes are unchanged.
       tags: [auth]
       requestBody:
         required: true
