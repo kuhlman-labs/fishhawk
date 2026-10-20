@@ -133,6 +133,41 @@ With the gate gone the #1558 in-memory FIXPOINT loop is gone too: it existed sol
 
 **Transition-table note.** `pending → cancelled` and `blocked → cancelled` were already admitted by `campaignItemTransitions` as MANUAL halts; the issue-closed settle is a second, NON-manual producer of those edges. No table change was needed — only the comments naming the new producer.
 
+## Append and the monotone dependency refresh (E86.47 / #4358)
+
+A campaign's DAG is no longer frozen at assembly. Two writers grow it, both through ONE repository transaction, `AppendCampaignItems` (`postgres.go`), which locks the campaign row, then each addition's item row (the package lock order), re-runs `ValidateAppend` under the lock, and calls the caller's `Record` callback before commit — an unrecordable change rolls back whole.
+
+**Append** (`POST /v0/campaigns/{campaign_id}/items`, `fishhawk_append_campaign_items`; `backend/internal/server/campaign_append.go`). Only the NEW refs are resolved on the tracker; `PlanAppend` (`append.go`) maps the result. Refusals, each writing nothing:
+
+- a duplicate member (`ErrDuplicateItem`), decided before the tracker read and again under the lock;
+- a malformed ref (`ErrInvalidDependencyRef`: only canonical `issue:N` is ever persisted);
+- a NEW item's dependency on a non-member, unless `allow_external_blockers` admits it (the edge is then persisted and HOLDS the item);
+- a cycle **only when it passes through a NEW node**. A pre-existing member-only cycle (one a refresh held) is HELD, not refused, so an unrelated append never fails on it.
+
+Existing members are never re-checked on append: their external edges are HELD by the refresh rather than refused on append (`CheckExternal` runs over new nodes only).
+
+**Refresh** (`backend/internal/server/campaign_dependency_refresh.go`). Native blocked-by links and `Depends-on:` lines are re-read for members that have not started (pending/blocked, no run). It is MONOTONE: `MergeDependsOn` only ever adds, so a tracker edit can HOLD an item and never release one — removing a native link or a `Depends-on:` line changes nothing persisted. An edge onto a non-member is held and marked external; an unparsable tracker token is reported and never written; an item that started between the read and the lock is skipped (`SkippedStarted`) and never touched; a cycle the tracker closes among members is held (both items blocked) and named in `cycle_members`. When nothing new is observed there is NO repository call and NO audit row. Each write is recorded before commit as `campaign_dependencies_refreshed`.
+
+| Trigger | Scope | Gate | Tracker read fails | Audit row / write fails |
+|---|---|---|---|---|
+| `GET …/status` | every unstarted member | caller's account owns the campaign (or untenanted) AND repo visible; single-flight per campaign, 30 s minimum interval (process-local) | read served with a warning; the interval still starts | transaction rolls back; the response still HOLDS the observed blocker (`committed:false`, a warning naming the missing row); the next refresh retries |
+| `POST …/runs` (start) | the target item only | same access predicate; not interval-gated | `502 campaign_dependency_refresh_failed`, nothing started | `503 campaign_dependency_audit_failed`, nothing written or started |
+
+A caller failing the access predicate skips the refresh entirely (zero tracker reads, zero writes) and the read or start otherwise behaves as before. `Config.CampaignDependencyRefresh` (set in `serve.go`) is the kill switch: false makes no refresh read or write.
+
+### Releasing a held edge (interim)
+
+The refresh never removes an edge, and an admitted external blocker holds its item by design. The explicit, audited, operator-only edge-drop act (an operator flag on the append verb, pending/blocked items only, recorded before commit) is the remaining, ruling-derived scope of #4358 and is filed separately by the operator. Until it lands, release a held item this way:
+
+1. A wrong edge onto a fellow MEMBER clears on its own once that member succeeds.
+2. Otherwise drive the issue standalone with `fishhawk_start_run`, outside the campaign rollup (the campaign will not track it).
+3. As a last resort the operator edits `campaign_items.depends_on` by SQL and records the edit by hand as a comment on the campaign's issue (no audit row is written for it):
+
+```sql
+UPDATE campaign_items SET depends_on = '["issue:11"]'::jsonb
+WHERE campaign_id = '<campaign uuid>' AND issue_ref = 'issue:10' AND state IN ('pending','blocked') AND run_id IS NULL;
+```
+
 ## The third campaign source: an approved grooming order (E54.6 / #2238)
 
 `POST /v0/campaigns` accepts three mutually-exclusive sources: an `epic_ref` to

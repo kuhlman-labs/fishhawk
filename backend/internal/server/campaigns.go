@@ -2075,19 +2075,37 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Monotone dependency refresh (E86.47 / #4358): re-read the tracker for
+	// unstarted members and ADD newly observed edges. Gated on account
+	// ownership + repo visibility and single-flight per campaign with a 30 s
+	// minimum interval; it never fails the read. A committed change re-reads
+	// the items; an UNcommitted one (audit or write failure) is held in this
+	// response only, so a newly blocked item is never reported eligible.
+	refresh := s.refreshCampaignDependenciesForStatus(r.Context(), c, items)
+	if refresh != nil && refresh.Committed && len(refresh.Added) > 0 {
+		if fresh, ferr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id); ferr == nil {
+			items = fresh
+		}
+	}
+	items = holdObservedEdges(items, refresh)
+
 	elig := campaign.NextEligible(items)
 	out := make([]campaignItemResponse, 0, len(items))
 	for _, it := range items {
 		out = append(out, toCampaignItemResponse(it))
 	}
-	s.writeJSON(w, r, http.StatusOK, map[string]any{
+	body := map[string]any{
 		"campaign": toCampaignResponse(c),
 		"items":    out,
 		"rollup":   toCampaignRollupPayload(elig),
 		// The POST-reconcile campaign state feeds the terminal post-filter (#2681)
 		// so a campaign that just derived terminal never advertises a refused verb.
 		"next_action": computeCampaignNextAction(c.State, elig),
-	})
+	}
+	if refresh != nil {
+		body["dependency_refresh"] = refresh.payload()
+	}
+	s.writeJSON(w, r, http.StatusOK, body)
 }
 
 // handleResumeCampaign implements POST /v0/campaigns/{campaign_id}/resume: the
@@ -2605,6 +2623,25 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 					items[i] = refreshed
 					break
 				}
+			}
+		}
+	}
+
+	// Dependency refresh for the TARGET (E86.47 / #4358), BEFORE the DAG gate so
+	// a blocked-by added on the tracker after the campaign started holds the
+	// item even with no intervening status poll. It runs only for a caller whose
+	// account owns the campaign (or it is untenanted) and who can see the repo;
+	// anyone else skips it entirely and the start proceeds exactly as before.
+	// It FAILS CLOSED: an unreadable tracker or an unrecordable change starts
+	// nothing, because starting past an unobserved dependency is the hazard.
+	if refreshed, ok := s.refreshStartTarget(w, r, c, item, items); !ok {
+		return
+	} else if refreshed != nil {
+		items = refreshed
+		for _, it := range items {
+			if it.IssueRef == req.IssueRef {
+				item = it
+				break
 			}
 		}
 	}

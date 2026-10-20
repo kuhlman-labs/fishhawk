@@ -133,6 +133,14 @@ type Config struct {
 	// (campaign.NewPostgresRepository).
 	CampaignRepo campaign.Repository
 
+	// CampaignDependencyRefresh enables the monotone campaign dependency
+	// refresh (E86.47 / #4358): GET /v0/campaigns/{id}/status and the item
+	// start verb re-read native blocked-by links and Depends-on lines for
+	// unstarted members and ADD any newly observed edge. False (the zero value)
+	// makes no forge read and no write, so fake-backed tests are unaffected;
+	// serve.go sets it true.
+	CampaignDependencyRefresh bool
+
 	// SigningRepo issues + persists per-run Ed25519 keys for the
 	// trace bundle signing flow. Wired by the
 	// /v0/runs/{id}/signing-key handler; nil leaves it 503.
@@ -1285,6 +1293,11 @@ type Server struct {
 	// seeding to one controlled instant. Defaults to time.Now; tests inject a
 	// fake to drive TTL expiry without sleeping or to fix the spend-alert hour.
 	nowFunc func() time.Time
+
+	// campaignRefreshGate is the GET /status dependency refresh's per-campaign
+	// single-flight + 30 s minimum-interval gate (E86.47 / #4358). It reads
+	// time through nowFunc; zero value ready.
+	campaignRefreshGate campaignDependencyRefreshGate
 
 	// postMergeHeadReadBackoff is the rebase verb's post-merge PR head
 	// re-read schedule (#4199). nil in production, which selects
