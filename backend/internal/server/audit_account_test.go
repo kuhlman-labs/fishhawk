@@ -41,7 +41,10 @@ func TestTokenHandler_EndToEnd_AuditChainsWithinAccount(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	auditRepo := audit.NewPostgresRepository(pool)
 	tokenRepo := apitoken.NewPostgresRepository(pool)
-	s := New(Config{AuditRepo: auditRepo, APITokenRepo: tokenRepo})
+	// The identities below are cookie-shaped (no TokenID), so the #4503
+	// mint ceiling is the operator default set; the requested scope sits
+	// inside it, exercising the ceiling's admit path end to end.
+	s := New(Config{AuditRepo: auditRepo, APITokenRepo: tokenRepo, OperatorDefaultScopes: []string{"write:runs"}})
 
 	acctA := uuid.New()
 	acctB := uuid.New()
@@ -58,7 +61,7 @@ func TestTokenHandler_EndToEnd_AuditChainsWithinAccount(t *testing.T) {
 	mint := func(id Identity) {
 		t.Helper()
 		req := httptest.NewRequest(http.MethodPost, "/v0/tokens",
-			strings.NewReader(`{"scopes":["runs:write"]}`))
+			strings.NewReader(`{"scopes":["write:runs"]}`))
 		req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
 		w := httptest.NewRecorder()
 		s.handleCreateToken(w, req)
