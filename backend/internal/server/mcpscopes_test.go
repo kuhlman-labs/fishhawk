@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"net/http"
+	"sort"
 	"strings"
 	"testing"
 
@@ -229,6 +231,125 @@ func TestMCPToolScopeTable_MergeRecoveryPairRequiresWriteRuns(t *testing.T) {
 				"admits it — the merge-recovery verb completion_blocked hands an operator would be unreachable",
 				tool)
 		}
+	}
+}
+
+// TestMCPToolScopeTable_FileIssueRequiresWriteRuns pins the fishhawk_file_issue
+// row (#4481) to {anyOf: [write:runs], runBoundSubjectOK: true} and proves the
+// gate admits and refuses exactly who POST /v0/work-items does: the handler
+// calls requireWriteScope(w, r, "write:runs") for every NON-run-bound caller
+// and admits a run-bound subject by its own-run entitlement (the
+// product_report.go switch). A read-only operator bearer is REFUSED, a
+// write:runs operator bearer is ADMITTED, and a run-bound mcp:read token is
+// ADMITTED. A comment-only touch of mcpscopes.go fails it.
+func TestMCPToolScopeTable_FileIssueRequiresWriteRuns(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_file_issue")
+	if !ok {
+		t.Fatal("fishhawk_file_issue has no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime")
+	}
+	if len(rule.anyOf) != 1 || rule.anyOf[0] != "write:runs" {
+		t.Errorf("rule.anyOf = %v, want exactly [write:runs]: workitems.go requires write:runs of every "+
+			"non-run-bound caller (#4481)", rule.anyOf)
+	}
+	if !rule.runBoundSubjectOK {
+		t.Error("runBoundSubjectOK is unset, but workitems.go admits a run-bound subject by its own-run " +
+			"entitlement without write:runs: the in-run agent's filing would be refused at the gate")
+	}
+	// Disjoint from the requirement by construction.
+	readOnlyOperator := Identity{Subject: "github:reader", TokenID: "tok", Scopes: []string{"read:runs"}}
+	if rule.satisfiedBy(readOnlyOperator) {
+		t.Errorf("a read-scoped operator bearer (%s) is ADMITTED by the gate, but POST /v0/work-items refuses "+
+			"it 403 insufficient_scope", strings.Join(readOnlyOperator.Scopes, " "))
+	}
+	writeRunsOperator := Identity{Subject: "github:operator", TokenID: "tok", Scopes: []string{"write:runs"}}
+	if !rule.satisfiedBy(writeRunsOperator) {
+		t.Error("an operator bearer holding write:runs is REFUSED by the gate, but POST /v0/work-items files for it")
+	}
+	runBound := Identity{
+		Subject: "mcp:run:44444444-4444-4444-4444-444444444444",
+		TokenID: "tok",
+		Scopes:  []string{scopeRunBoundRead},
+	}
+	if !rule.satisfiedBy(runBound) {
+		t.Error("a run-bound mcp:read token is REFUSED by the gate, but POST /v0/work-items admits it on its own run")
+	}
+}
+
+// TestHandleMCP_FileIssueRequiresWriteRuns is the CROSS-BOUNDARY assertion for
+// the #4481 row: the table entry, the gate predicate and the wire envelope on
+// ONE path, over the real HTTP /mcp transport. A bearer minted read:runs draws
+// 403 insufficient_scope naming write:runs and NEVER reaches the per-request
+// tool registry; a bearer minted write:runs passes the gate into the SDK.
+func TestHandleMCP_FileIssueRequiresWriteRuns(t *testing.T) {
+	const tool = "fishhawk_file_issue"
+	t.Run("refused", func(t *testing.T) {
+		s, bearer, f := mcpGateServer(t, "read:runs")
+		body := assertMCPGateRefusal(t, s, f, newMCPToolCall(tool, bearer),
+			http.StatusForbidden, "insufficient_scope")
+		if !strings.Contains(body, "required_scope") || !strings.Contains(body, "write:runs") {
+			t.Errorf("body = %s, want details.required_scope naming write:runs", body)
+		}
+	})
+	t.Run("admitted", func(t *testing.T) {
+		s, bearer, f := mcpGateServer(t, "write:runs")
+		status, body := mcpGateResult(t, s, newMCPToolCall(tool, bearer))
+		if status == http.StatusForbidden {
+			t.Fatalf("a granted-scope tools/call was refused %d: %s", status, body)
+		}
+		if strings.Contains(body, "insufficient_scope") {
+			t.Errorf("granted-scope call drew insufficient_scope: %s", body)
+		}
+		if f.calls.Load() == 0 {
+			t.Error("the granted-scope call never reached the per-request tool registry")
+		}
+	})
+}
+
+// TestMCPToolScopeTable_AuthenticatedOnlyRowsEnumerated pins the EXACT set of
+// rows whose anyOf is empty (mcpScopeAuthenticatedOnly), so a new
+// authenticated-only row, or a write row regressing back to one (the #4481
+// fishhawk_file_issue shape), fails loudly and is reviewed. Every row here
+// must front a handler that enforces no scope beyond authentication, or one
+// whose write arm the inner handler enforces itself ("gate admits, handler
+// refuses"): fishhawk_release_notes (prepare: write:runs),
+// fishhawk_delegation_confirm (confirm/lower: write:approvals) and
+// fishhawk_preview_issue (writes nothing; refuses run-bound tokens).
+func TestMCPToolScopeTable_AuthenticatedOnlyRowsEnumerated(t *testing.T) {
+	want := []string{
+		"fishhawk_await_audit",
+		"fishhawk_await_children",
+		"fishhawk_await_review",
+		"fishhawk_await_stage",
+		"fishhawk_delegation",
+		"fishhawk_delegation_confirm",
+		"fishhawk_doctor",
+		"fishhawk_get_active_run",
+		"fishhawk_get_campaign_status",
+		"fishhawk_get_plan",
+		"fishhawk_get_run_status",
+		"fishhawk_init",
+		"fishhawk_list_audit",
+		"fishhawk_list_runs",
+		"fishhawk_list_schedules",
+		"fishhawk_list_scope_amendments",
+		"fishhawk_precedent",
+		"fishhawk_preview_issue",
+		"fishhawk_release_notes",
+		"fishhawk_runtime_calibration",
+		"fishhawk_validate",
+		"fishhawk_verify_run",
+	}
+	var got []string
+	for tool, rule := range mcpToolScopes {
+		if len(rule.anyOf) == 0 {
+			got = append(got, tool)
+		}
+	}
+	sort.Strings(got)
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Errorf("authenticated-only rows changed:\n got  %v\n want %v\n"+
+			"a row added here must front a handler that checks no scope (or whose inner handler enforces its "+
+			"write arm); a write route must name its scope instead (#4481)", got, want)
 	}
 }
 

@@ -34,7 +34,7 @@ Last verified walk: **18 mutations applied, 0 failed**, confirmed on the forge.
 fishhawk_start_run(
   repo:           "kuhlman-labs/fishhawk",
   workflow_id:    "backlog_grooming",
-  issue:          2832,
+  issue:          3112,
   trigger_source: "on_demand",
   runner_kind:    "local",
   working_dir:    "<absolute path to your checkout>"
@@ -56,8 +56,16 @@ Two failure modes that look like product bugs and are not:
   `available: [plan implement review]`. `groom` is the stage id.
 
 The anchor issue supplies the request — the `groom` stage declares
-`inputs: [{source: github_issue, required: true}]`. Reuse #2832 or open a new issue whose
-body states what you want groomed; the body IS the request.
+`inputs: [{source: github_issue, required: true}]`. Reuse #3112, the standing anchor, or
+open a new issue whose body states what you want groomed; the body IS the request.
+
+**Scheduled runs.** `.fishhawk/workflows.yaml` also schedules the workflow weekly, Tuesday
+09:00 UTC, anchored to #3112 (`schedule: {cron: "0 9 * * 2", issue: 3112}`). It fires only
+when fishhawkd runs with `--enable-scheduler` (`scripts/dev up` passes it; contract:
+`scripts/README.md` § "The local `serve` flags"). A scheduled run carries
+`trigger_source: scheduled`, parks at `awaiting_host_dispatch`, and is driven from
+`fishhawk_run_stage` exactly as above. The approval gates declare no `sla`, so an unattended
+report waits for you instead of failing the run.
 
 Stage budget is 45m (#2838). A real pass over this backlog measures ~24m.
 

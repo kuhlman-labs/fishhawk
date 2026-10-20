@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -19,6 +20,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -195,10 +197,12 @@ func tokenRequest(t *testing.T, s *Server, method, path, bearer string, body any
 }
 
 func TestCreateToken_HappyPath(t *testing.T) {
-	s, _, bearer := newTokenServer(t)
+	s, repo, bearer := newTokenServer(t)
 
+	// The seeded bearer holds [runs:read]; #4503 bounds a mint to a subset
+	// of the caller's own scopes.
 	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", bearer,
-		map[string]any{"scopes": []string{"runs:read", "runs:write"}})
+		map[string]any{"scopes": []string{"runs:read"}})
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
@@ -210,9 +214,317 @@ func TestCreateToken_HappyPath(t *testing.T) {
 	if !strings.HasPrefix(resp.Token, apitoken.TokenPrefix) {
 		t.Errorf("token plaintext missing prefix: %q", resp.Token)
 	}
-	if len(resp.Scopes) != 2 {
-		t.Errorf("Scopes = %v, want 2", resp.Scopes)
+	if !slices.Equal(resp.Scopes, []string{"runs:read"}) {
+		t.Errorf("Scopes = %v, want [runs:read]", resp.Scopes)
 	}
+	toks, err := repo.ListForSubject(context.Background(), "github:42")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toks) != 2 {
+		t.Errorf("github:42 tokens after mint = %d, want 2 (seed + minted)", len(toks))
+	}
+}
+
+// mintAs drives handleCreateToken directly with an injected Identity, for
+// the identity shapes the bearer middleware cannot produce from a fake
+// repo (a cookie session, an AS-issued fho_ token).
+func mintAs(t *testing.T, s *Server, id Identity, scopes []string) *httptest.ResponseRecorder {
+	t.Helper()
+	raw, err := json.Marshal(map[string]any{"scopes": scopes})
+	if err != nil {
+		t.Fatal(err)
+	}
+	req := httptest.NewRequest(http.MethodPost, "/v0/tokens", bytes.NewReader(raw))
+	req = req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, id))
+	w := httptest.NewRecorder()
+	s.handleCreateToken(w, req)
+	return w
+}
+
+// assertMintRefused checks a refused mint's status and error code WITHOUT
+// stopping the test, so the committed-state assertions that follow still
+// run (and report) when the refusal is absent.
+func assertMintRefused(t *testing.T, w *httptest.ResponseRecorder, code string) {
+	t.Helper()
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if w.Code != http.StatusForbidden || env.Error.Code != code {
+		t.Errorf("mint = %d %q, want 403 %q; body = %s", w.Code, env.Error.Code, code, w.Body.String())
+	}
+}
+
+// mintRefusalDetails decodes a scope_escalation_refused body's
+// details.excess_scopes and details.ceiling.
+func mintRefusalDetails(t *testing.T, w *httptest.ResponseRecorder) (excess []string, ceiling string) {
+	t.Helper()
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode error envelope: %v\n%s", err, w.Body.String())
+	}
+	raw, _ := env.Error.Details["excess_scopes"].([]any)
+	for _, v := range raw {
+		sc, _ := v.(string)
+		excess = append(excess, sc)
+	}
+	ceiling, _ = env.Error.Details["ceiling"].(string)
+	return excess, ceiling
+}
+
+// requireTokenCount reads COMMITTED state: the active token rows the
+// store holds for subject after the call returned.
+func requireTokenCount(t *testing.T, repo *fakeTokenRepo, subject string, want int) {
+	t.Helper()
+	toks, err := repo.ListForSubject(context.Background(), subject)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(toks) != want {
+		t.Errorf("%s tokens after mint = %d, want %d", subject, len(toks), want)
+	}
+}
+
+// TestCreateToken_SubsetOfOwnScopesIssued (#4503): the ceiling admits any
+// subset of the bearer's own scopes, including the full set and the empty
+// list, and the persisted row carries exactly the requested scopes.
+func TestCreateToken_SubsetOfOwnScopesIssued(t *testing.T) {
+	repo := newFakeTokenRepo()
+	s := New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo})
+	const subject = "github:7"
+	seed, err := repo.Issue(context.Background(), subject, []string{"read:runs", "write:runs", "read:audit"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	requests := [][]string{
+		{"read:runs", "write:runs"},
+		{"read:runs", "write:runs", "read:audit"},
+		{},
+	}
+	for i, scopes := range requests {
+		w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", seed.PlainText, map[string]any{"scopes": scopes})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("mint %d %v: status = %d, want 201:\n%s", i, scopes, w.Code, w.Body.String())
+		}
+		var resp apiTokenCreatedResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatal(err)
+		}
+		row, err := repo.GetByID(context.Background(), uuid.MustParse(resp.ID))
+		if err != nil {
+			t.Fatalf("mint %d: minted row not persisted: %v", i, err)
+		}
+		if !slices.Equal(row.Scopes, scopes) {
+			t.Errorf("mint %d: persisted scopes = %v, want %v", i, row.Scopes, scopes)
+		}
+	}
+	requireTokenCount(t, repo, subject, 1+len(requests))
+}
+
+// TestCreateToken_ScopeEscalationRefused (#4503): a bearer cannot mint a
+// token carrying a scope it does not itself hold. Each case reads
+// COMMITTED state after the call: no new token row and no
+// api_token_issued audit row. The github: subject is neither a seat nor
+// run-bound, so the ceiling is the only control in the path; with it
+// neutralized the handler issues (201, a second row, an issued audit row).
+func TestCreateToken_ScopeEscalationRefused(t *testing.T) {
+	mintFixture := func(t *testing.T) (*Server, *fakeTokenRepo, *foAuditFake) {
+		t.Helper()
+		repo, aud := newFakeTokenRepo(), &foAuditFake{}
+		return New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo, AuditRepo: aud}), repo, aud
+	}
+
+	t.Run("read-only bearer cannot mint write scopes", func(t *testing.T) {
+		s, repo, aud := mintFixture(t)
+		const subject = "github:narrow"
+		seed, err := repo.Issue(context.Background(), subject, []string{"read:runs"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", seed.PlainText, map[string]any{
+			"scopes": []string{"read:runs", "write:runs", "write:stages", "write:approvals"},
+		})
+		assertMintRefused(t, w, "scope_escalation_refused")
+		toks, err := repo.ListForSubject(context.Background(), subject)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(toks) != 1 || toks[0].ID != seed.ID {
+			t.Errorf("tokens after refused mint = %d, want exactly the seeded one", len(toks))
+		}
+		if got := aud.globalOf("api_token_issued"); len(got) != 0 {
+			t.Errorf("api_token_issued rows = %d, want 0", len(got))
+		}
+		excess, ceiling := mintRefusalDetails(t, w)
+		if want := []string{"write:runs", "write:stages", "write:approvals"}; !slices.Equal(excess, want) {
+			t.Errorf("excess_scopes = %v, want %v", excess, want)
+		}
+		if ceiling != "token_scopes" {
+			t.Errorf("ceiling = %q, want token_scopes", ceiling)
+		}
+	})
+
+	t.Run("AS-issued token cannot widen its granted set", func(t *testing.T) {
+		s, repo, aud := mintFixture(t)
+		const subject = "github:as-user"
+		w := mintAs(t, s, Identity{
+			Subject:       subject,
+			TokenID:       uuid.NewString(),
+			Scopes:        []string{"read:runs", "write:runs"},
+			OAuthAudience: "https://fishhawk.example/mcp",
+		}, []string{"write:deploy"})
+		assertMintRefused(t, w, "scope_escalation_refused")
+		requireTokenCount(t, repo, subject, 0)
+		if got := aud.globalOf("api_token_issued"); len(got) != 0 {
+			t.Errorf("api_token_issued rows = %d, want 0", len(got))
+		}
+		if excess, _ := mintRefusalDetails(t, w); !slices.Equal(excess, []string{"write:deploy"}) {
+			t.Errorf("excess_scopes = %v, want [write:deploy]", excess)
+		}
+	})
+
+	t.Run("duplicate excess scopes reported once", func(t *testing.T) {
+		s, repo, _ := mintFixture(t)
+		const subject = "github:dup"
+		seed, err := repo.Issue(context.Background(), subject, []string{"read:runs"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", seed.PlainText, map[string]any{
+			"scopes": []string{"write:runs", "read:runs", "write:runs", "write:stages", "write:stages"},
+		})
+		assertMintRefused(t, w, "scope_escalation_refused")
+		requireTokenCount(t, repo, subject, 1)
+		if excess, _ := mintRefusalDetails(t, w); !slices.Equal(excess, []string{"write:runs", "write:stages"}) {
+			t.Errorf("excess_scopes = %v, want [write:runs write:stages]", excess)
+		}
+	})
+}
+
+// TestCreateToken_RunBoundRefused (#4503) is the end-to-end reachability
+// proof: a REAL fhm_ token resolved by the bearerAuth middleware reaches
+// POST /v0/tokens, and the run-bound refusal turns it away. Every case
+// requests a SUBSET of the caller's own scopes, so the ceiling admits it
+// and cannot mask the refusal; with the refusal neutralized the handler
+// issues (201 and a new mcp:run row). Before the fix this fixture
+// returned 201.
+func TestCreateToken_RunBoundRefused(t *testing.T) {
+	mintFixture := func(t *testing.T) (*Server, *fakeTokenRepo, *fakeMCPTokenRepo, *foAuditFake, uuid.UUID) {
+		t.Helper()
+		repo, mcpRepo, runs, aud := newFakeTokenRepo(), newFakeMCPTokenRepo(), newFakeRepo(), &foAuditFake{}
+		runID := uuid.New()
+		// bearerAuth's fhm_ arm resolves the run's account, so the run must exist.
+		runs.runs[runID] = &run.Run{ID: runID, State: run.StateRunning}
+		s := New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo, MCPTokenRepo: mcpRepo, RunRepo: runs, AuditRepo: aud})
+		return s, repo, mcpRepo, aud, runID
+	}
+	noIssuedRow := func(t *testing.T, aud *foAuditFake) {
+		t.Helper()
+		if got := aud.globalOf("api_token_issued"); len(got) != 0 {
+			t.Errorf("api_token_issued rows = %d, want 0", len(got))
+		}
+	}
+
+	for _, tc := range []struct {
+		name   string
+		scopes []string
+	}{
+		// A subset of the agent token's own scopes: only the refusal stops it.
+		{"fhm", []string{"mcp:read"}},
+		// Operator scopes: the refusal precedes the ceiling, so the code is
+		// still run_bound_cannot_mint_tokens, not scope_escalation_refused.
+		{"fhm-operator-scopes", []string{"write:runs", "write:approvals"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, mcpRepo, aud, runID := mintFixture(t)
+			agent, err := mcpRepo.Issue(context.Background(), mcptoken.IssueParams{
+				RunID:  runID,
+				Scopes: []string{"mcp:read", "write:scope-amendments"},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", agent.PlainText, map[string]any{"scopes": tc.scopes})
+			assertMintRefused(t, w, "run_bound_cannot_mint_tokens")
+			requireTokenCount(t, repo, "mcp:run:"+runID.String(), 0)
+			noIssuedRow(t, aud)
+		})
+	}
+
+	for _, tc := range []struct {
+		name    string
+		subject string
+	}{
+		// An fhk_ row self-minted under the old hole carries the run subject.
+		{"legacy-fhk", "mcp:run:" + uuid.NewString()},
+		// The prefix match refuses a suffix no UUID parser would accept.
+		{"malformed", "mcp:run:not-a-uuid"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, _, aud, _ := mintFixture(t)
+			legacy, err := repo.Issue(context.Background(), tc.subject, []string{"read:runs"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", legacy.PlainText,
+				map[string]any{"scopes": []string{"read:runs"}})
+			assertMintRefused(t, w, "run_bound_cannot_mint_tokens")
+			requireTokenCount(t, repo, tc.subject, 1)
+			noIssuedRow(t, aud)
+		})
+	}
+}
+
+// TestCreateToken_CookieSessionCeiling (#4503): a cookie session carries no
+// scope list, so its ceiling is Config.OperatorDefaultScopes, and an
+// unwired default set admits no explicit scope. With the cookie ceiling
+// replaced by the request itself, the excess and deny-by-default cases
+// would issue (201 and a row).
+func TestCreateToken_CookieSessionCeiling(t *testing.T) {
+	const subject = "github:alice"
+	cookie := Identity{Subject: subject, SessionID: "sess-1"}
+	mintFixture := func(defaults []string) (*Server, *fakeTokenRepo) {
+		repo := newFakeTokenRepo()
+		return New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo, OperatorDefaultScopes: defaults}), repo
+	}
+
+	t.Run("within-default", func(t *testing.T) {
+		s, repo := mintFixture([]string{"read:runs", "write:runs"})
+		w := mintAs(t, s, cookie, []string{"write:runs"})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		requireTokenCount(t, repo, subject, 1)
+	})
+
+	t.Run("excess", func(t *testing.T) {
+		s, repo := mintFixture([]string{"read:runs", "write:runs"})
+		w := mintAs(t, s, cookie, []string{"write:runs", "admin:everything"})
+		assertMintRefused(t, w, "scope_escalation_refused")
+		requireTokenCount(t, repo, subject, 0)
+		excess, ceiling := mintRefusalDetails(t, w)
+		if !slices.Equal(excess, []string{"admin:everything"}) {
+			t.Errorf("excess_scopes = %v, want [admin:everything]", excess)
+		}
+		if ceiling != "operator_default_scopes" {
+			t.Errorf("ceiling = %q, want operator_default_scopes", ceiling)
+		}
+	})
+
+	t.Run("deny-by-default", func(t *testing.T) {
+		s, repo := mintFixture(nil)
+		w := mintAs(t, s, cookie, []string{"read:runs"})
+		assertMintRefused(t, w, "scope_escalation_refused")
+		requireTokenCount(t, repo, subject, 0)
+	})
+
+	t.Run("empty", func(t *testing.T) {
+		s, repo := mintFixture(nil)
+		w := mintAs(t, s, cookie, []string{})
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		requireTokenCount(t, repo, subject, 1)
+	})
 }
 
 // TestCreateToken_FirstOfficerSeatRefused (E85.6 / #4148): a seat cannot
@@ -356,6 +668,33 @@ func TestRevokeToken_HappyPath(t *testing.T) {
 	if !got.IsRevoked() {
 		t.Errorf("token not marked revoked")
 	}
+}
+
+// TestRevokeToken_RunBoundSubject pins the documented DELETE decision
+// (#4503): revocation needs no scope and does NOT refuse a run-bound
+// subject, so an fhk_ row self-minted under the old unbounded mint (subject
+// mcp:run:<uuid>) can revoke itself.
+func TestRevokeToken_RunBoundSubject(t *testing.T) {
+	t.Run("fhk mcp:run row revokes its own token", func(t *testing.T) {
+		repo := newFakeTokenRepo()
+		s := New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo})
+		subject := "mcp:run:" + uuid.NewString()
+		legacy, err := repo.Issue(context.Background(), subject, []string{"write:runs"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		w := tokenRequest(t, s, http.MethodDelete, fmt.Sprintf("/v0/tokens/%s", legacy.ID), legacy.PlainText, nil)
+		if w.Code != http.StatusNoContent {
+			t.Fatalf("status = %d, want 204:\n%s", w.Code, w.Body.String())
+		}
+		got, err := repo.GetByID(context.Background(), legacy.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !got.IsRevoked() {
+			t.Errorf("run-bound subject's token not marked revoked")
+		}
+	})
 }
 
 func TestRevokeToken_OtherUsersToken_403(t *testing.T) {

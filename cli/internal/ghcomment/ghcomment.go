@@ -181,13 +181,28 @@ type StatusCommentResponse struct {
 	GithubCommentID int64  `json:"github_comment_id"`
 }
 
+// setBearer sets `Authorization: Bearer <token>` on req when token is
+// non-empty. An empty token sends no header, so a token-less CLI keeps its
+// prior anonymous request shape (#4483).
+func setBearer(req *http.Request, token string) {
+	if token != "" {
+		req.Header.Set("Authorization", "Bearer "+token)
+	}
+}
+
 // FetchStatus calls GET /v0/runs/{runID}/status-comment on the backend and
 // returns the rendered sticky-comment body plus the most-recent stored
-// github_comment_id. Returns an error when the backend is unreachable, the
-// run is not found, or the response is not parseable.
-func FetchStatus(backendURL, runID string) (StatusCommentResponse, error) {
+// github_comment_id. token is the CLI's resolved bearer (flag, env or
+// credstore), sent when non-empty. Returns an error when the backend is
+// unreachable, the run is not found, or the response is not parseable.
+func FetchStatus(backendURL, token, runID string) (StatusCommentResponse, error) {
 	url := strings.TrimRight(backendURL, "/") + "/v0/runs/" + runID + "/status-comment"
-	resp, err := http.Get(url) //nolint:noctx
+	req, err := http.NewRequest(http.MethodGet, url, nil) //nolint:noctx
+	if err != nil {
+		return StatusCommentResponse{}, fmt.Errorf("ghcomment: fetch status: %w", err)
+	}
+	setBearer(req, token)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return StatusCommentResponse{}, fmt.Errorf("ghcomment: fetch status: %w", err)
 	}
@@ -270,11 +285,19 @@ func EditOrCreate(repo string, issueNumber int, githubCommentID int64, body stri
 
 // RecordCommentID calls POST /v0/runs/{runID}/status-comment to record the
 // github_comment_id in the backend's audit log so the GHA-side Notifier can
-// pick it up on subsequent transitions.
-func RecordCommentID(backendURL, runID string, githubCommentID int64) error {
+// pick it up on subsequent transitions. The route requires write:runs
+// (#4483), so token — the CLI's resolved bearer — is sent when non-empty; a
+// token-less call is refused 401, which callers treat as best-effort and warn.
+func RecordCommentID(backendURL, token, runID string, githubCommentID int64) error {
 	url := strings.TrimRight(backendURL, "/") + "/v0/runs/" + runID + "/status-comment"
 	payload, _ := json.Marshal(map[string]any{"github_comment_id": githubCommentID})
-	resp, err := http.Post(url, "application/json", bytes.NewReader(payload)) //nolint:noctx
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(payload)) //nolint:noctx
+	if err != nil {
+		return fmt.Errorf("ghcomment: record comment id: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	setBearer(req, token)
+	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("ghcomment: record comment id: %w", err)
 	}
@@ -288,10 +311,11 @@ func RecordCommentID(backendURL, runID string, githubCommentID int64) error {
 
 // PostOrEditStatusComment fetches the rendered sticky-comment body from the
 // backend, creates or edits the GitHub comment in place, and records the
-// resulting comment id back to the backend (#428). Best-effort for callers:
-// errors are returned so the caller can warn and continue.
-func PostOrEditStatusComment(backendURL, runID, repo string, issueNumber int) error {
-	sc, err := FetchStatus(backendURL, runID)
+// resulting comment id back to the backend (#428). token is the CLI's
+// resolved bearer, sent on both backend calls (#4483). Best-effort for
+// callers: errors are returned so the caller can warn and continue.
+func PostOrEditStatusComment(backendURL, token, runID, repo string, issueNumber int) error {
+	sc, err := FetchStatus(backendURL, token, runID)
 	if err != nil {
 		return fmt.Errorf("ghcomment: fetch rendered body: %w", err)
 	}
@@ -299,7 +323,7 @@ func PostOrEditStatusComment(backendURL, runID, repo string, issueNumber int) er
 	if err != nil {
 		return err
 	}
-	return RecordCommentID(backendURL, runID, newID)
+	return RecordCommentID(backendURL, token, runID, newID)
 }
 
 // Post shells to `gh issue comment <number> --repo <owner/name>

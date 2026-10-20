@@ -62,9 +62,42 @@ region-scoped endpoint governs production while a test's explicit
 `option.WithBaseURL` still wins (ADR-062). It is independent of the credential
 rows above.
 
+## User-turn prompt caching (Config.CacheUserTurn, #4563)
+
+`Messages` always puts an ephemeral `cache_control` breakpoint on the system
+block (when `systemText` is non-empty). `Config.CacheUserTurn` additionally puts
+one on the single user text block: at most 2 of the API's 4 breakpoints (1 when
+`systemText` is empty), the default 5-minute TTL, no `ttl: 1h`.
+
+- **Default off.** Production reviews are rarely repeated within the TTL, so a
+  user-turn write would mostly be a 25% cache-write surcharge. The off path's
+  request bytes are unchanged, pinned by
+  `TestClient_Messages_CacheUserTurnOffLeavesUserUnmarked` (the `messages` array
+  is JSON-equal to the pre-change shape) and `TestReviewer_LeavesUserTurnUncached`
+  (the `NewReviewer` path `serve.go` uses).
+- **When to enable it.** A caller that resends a byte-identical user prompt
+  within the TTL. Today that is only agenteval's live arms, through
+  `liveCredential.config` in `backend/internal/agenteval/livecredential_test.go`,
+  which forces `CacheUserTurn` on whatever the caller's `Config` literal says.
+  That seam serves every live eval client, the rubric judges included, so a
+  per-judge opt-out would need a new seam parameter, not a caller-literal
+  `false`.
+- **Outputs.** Caching never changes model outputs, so a catch-rate measurement
+  is unaffected.
+- **Minimum length.** A prompt below the model's minimum cacheable length is
+  simply not cached; the API returns no error, so the saving shrinks and nothing
+  else changes.
+- **Checking it worked.** The `cacheReadTokens` `Messages` returns should be
+  non-zero on samples 2..N of a repeated prompt.
+
 ## Tests
 
 `client_test.go` isolates the ambient environment with `isolateAmbientAnthropicEnv`
 (unsets the autoloader's sources and points `ANTHROPIC_CONFIG_DIR` at an empty
 directory so the host's real profile cannot load). Tests that use it call
 `t.Setenv`, so none may call `t.Parallel`.
+
+The `CacheUserTurn` tests (`TestClient_Messages_CacheUserTurn*`,
+`TestReviewer_LeavesUserTurnUncached`) assert on the RAW request JSON captured
+by an `httptest` server, never on SDK param structs, and are parallel-safe (no
+`t.Setenv`).

@@ -12,8 +12,10 @@ import (
 // postOrEditStatusComment is a test seam for local-runner sticky comment
 // posting (#428). Production wires to ghcomment.PostOrEditStatusComment;
 // tests swap to capture calls without shelling to gh or reaching the backend.
-var postOrEditStatusComment = func(backendURL, runID, repo string, issueNumber int) error {
-	return ghcomment.PostOrEditStatusComment(backendURL, runID, repo, issueNumber)
+// token is the bearer the caller's httpclient.Client already resolved (flag,
+// env or credstore); the record-id POST requires write:runs (#4483).
+var postOrEditStatusComment = func(backendURL, token, runID, repo string, issueNumber int) error {
+	return ghcomment.PostOrEditStatusComment(backendURL, token, runID, repo, issueNumber)
 }
 
 // fetchRunForComment loads the run by id. Returns nil on any error

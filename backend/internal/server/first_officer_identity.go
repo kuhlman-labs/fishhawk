@@ -254,12 +254,15 @@ func (s *Server) firstOfficerRunInSeat(ctx context.Context, a firstofficer.Ancho
 }
 
 // refuseFirstOfficerTrackerWrite wraps POST /v0/work-items (ADR-089 D2): a
-// seat never writes tracker state. That route checks no scope (it gates on run
-// entitlement, and the run-absent arm refuses only run-bound mcp:run: subjects),
-// so the seat's clamped scopes cannot stop it and the refusal is by SUBJECT.
-// fishhawk_file_issue over /mcp is covered too: its tool client dials this
-// route back under the caller's own bearer. writeError's 403 hook records the
-// first_officer_action_refused row.
+// seat never writes tracker state. The route now requires write:runs of every
+// non-run-bound bearer (#4481), which a seat's clamped scopes lack, but this
+// wrapper stays the NAMED refusal ahead of that scope check: it refuses by
+// SUBJECT, so the seat draws first_officer_tracker_write_not_permitted (and its
+// row) rather than a generic insufficient_scope. writeError's 403 hook records
+// the first_officer_action_refused row. Over /mcp, fishhawk_file_issue's gate
+// row now requires write:runs, so a seat is refused at the gate with
+// insufficient_scope before this route is dialled, recording nothing (the
+// documented gate residual, see recordFirstOfficerRefusal).
 func (s *Server) refuseFirstOfficerTrackerWrite(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if firstofficer.IsSeatSubject(IdentityFrom(r.Context()).Subject) {
