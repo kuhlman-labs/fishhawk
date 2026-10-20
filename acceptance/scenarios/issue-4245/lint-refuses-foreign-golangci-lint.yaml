@@ -1,0 +1,14 @@
+id: scenario:issue-4245/lint-refuses-foreign-golangci-lint
+statement: With a golangci-lint first on PATH whose `version` output reports a version other than deploy/gate-image/Dockerfile's GOLANGCI_LINT_VERSION, or one built with a Go whose MAJOR.MINOR differs from GO_VERSION's, `scripts/test lint` exits non-zero, its stderr carries `host_toolchain_mismatch` and names the host value and the pin, and golangci-lint `run` is never invoked, so no format finding is printed.
+verify_hint: CLI exit code and stderr of `scripts/test lint` run with a temp directory of stub tools prepended to PATH (a stub golangci-lint whose `run` would print a gofmt finding); the stderr must name host_toolchain_mismatch and the stub's `run` must leave no trace. Decided in-repo by runner/cmd/fishhawk-runner/linthosttoolchain_test.go's TestLintLegRefuses* tests.
+steps: 'In the sanctioned checkout /tmp/fishhawk-acceptance-tree-..., created a stub dir with an executable golangci-lint. Its ''version'' prints ''golangci-lint has version 2.13.2 built with go1.26.9 ...''. Its ''run'' appends to run.trace and prints ''fanin_verify.go:148:1: File is not properly formatted (gofmt)''. The dir also holds a stub gofmt and a stub go that answers ''version <stub gofmt>'' with go1.26.9 and execs the real go otherwise. Ran PATH=<stubdir>:$PATH scripts/test lint. Repeated with a golangci-lint stub reporting version 2.12.2 built with go1.27.0. Also ran go test ./cmd/fishhawk-runner/ -run TestLintLeg in runner/.'
+assertions:
+    expected: Non-zero exit, stderr carries host_toolchain_mismatch naming the host value and the pin, and golangci-lint run is never invoked.
+    observed_at_record: 'Both cases exit 1. Stderr: ''check-gate-image: host golangci-lint 2.13.2 differs from deploy/gate-image/Dockerfile:77 GOLANGCI_LINT_VERSION v2.12.2'' and, for the build-Go case, ''host golangci-lint is built with go1.27 but deploy/gate-image/Dockerfile:72 GO_VERSION 1.26.9 is 1.26''. Each is followed by ''scripts/test: host_toolchain_mismatch: lint REFUSED ...''. Stdout is empty and run.trace was never created, so ''run'' was never invoked. TestLintLegRefusesForeignGolangciLintVersion and TestLintLegRefusesGolangciLintBuiltWithForeignGo PASS.'
+    repro_handle: PATH=/tmp/fhv4245/stubs/badgl:$PATH scripts/test lint; PATH=/tmp/fhv4245/stubs/badglgo:$PATH scripts/test lint
+origin:
+    issue: 4245
+    pr: 4535
+    run_id: ab48e168-c713-417a-b5fc-6674b1b22752
+    head_sha: 60964391153dea43c175372687fedebf232bc68c
+    recorded_at: 2026-10-16T22:08:01Z
