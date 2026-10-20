@@ -41,7 +41,7 @@ externally-managed). Deliberately absent: `docker`, `kubectl`, `kind`, `node`.
 | Dockerfile ARG | Held to (by `scripts/check-gate-image`) |
 |---|---|
 | `GO_VERSION` (exact `MAJOR.MINOR.PATCH`) | MAJOR.MINOR of every `go.work` / `go.mod` `go` directive and every workflow `go-version:` literal; no `go` / `toolchain` directive may EXCEED it in full (`GOTOOLCHAIN=local` refuses a newer one) |
-| `GOLANGCI_LINT_VERSION` | EXACTLY the golangci-lint `install.sh` tag in every `.github/workflows/*` file and in `scripts/test`'s install hint |
+| `GOLANGCI_LINT_VERSION` | EXACTLY the golangci-lint `install.sh` tag in every `.github/workflows/*` file and in `scripts/test`'s install hint; on the HOST (`--host`, #4245), EXACTLY the `golangci-lint version` on PATH, whose binary must also be `built with` a Go of `GO_VERSION`'s MAJOR.MINOR (its gofmt/goimports formatters follow the Go that built it). A bump that pairs a golangci-lint release built with another Go minor therefore makes `scripts/test lint` refuse everywhere, CI included, so bump both together |
 | `HELM_VERSION` (exact `vMAJOR.MINOR.PATCH`, currently `v4.2.4`) | MAJOR ≥ 4, because `scripts/test-helm-render` r9 renders `NOTES.txt` with `helm install --dry-run`, which Helm v3 (`--dry-run=client` too) refuses without a reachable cluster and the image has none. The helm render gate's documented CI half (`deploy/helm/fishhawk/README.md`, `setup-helm` `version:`) carries the same `v4.2.4`; nothing checks that pair, so bump both together |
 | `CHECK_JSONSCHEMA_VERSION` | the `check-jsonschema` validator `AGENTS.md` names for `docs/spec/` |
 
@@ -58,6 +58,12 @@ The chain closes in two halves:
   docker binary is inside. Every `--in-gate-image` run performs it first, and
   the workflow below runs it on every build and weekly against the published
   `:main`.
+- **Dockerfile ⇔ host tools** — `scripts/check-gate-image --host` (#4245)
+  compares the golangci-lint on PATH (version and build Go) and the standalone
+  gofmt on PATH (its Go, via `go version <path>`) with `GOLANGCI_LINT_VERSION`
+  and `GO_VERSION`'s MAJOR.MINOR. It is `scripts/test lint`'s precondition (so
+  verify's lint leg too): a mismatch refuses with `host_toolchain_mismatch`.
+  Long form: `scripts/README.md` § "Lint".
 
 Go parity with CI is MAJOR.MINOR only, because CI itself floats the patch
 (`go-version: '1.26'`); the Dockerfile's `GO_VERSION` is the repo's one exact
@@ -344,8 +350,12 @@ jobs:
 
 ## Testing
 
-- `scripts/test-check-gate-image` — hermetic harness for both check modes
-  (temp fixture roots, fake docker).
+- `scripts/test-check-gate-image` — hermetic harness for all three check
+  modes (temp fixture roots, fake docker, and for `--host` fake golangci-lint,
+  gofmt and go on a symlink-only PATH).
+- `runner/cmd/fishhawk-runner/linthosttoolchain_test.go` — drives the real
+  `scripts/test lint` against the real Dockerfile pins with fake host tools,
+  asserting each mismatch refuses before golangci-lint runs.
 - `scripts/test-in-gate-image` — hermetic harness for `verify --no-tests` and
   `lint|verify --in-gate-image`: argument order (including a docker-absent
   arm), the docker-absent refusal, the host lock (held during the run, refused
@@ -354,6 +364,7 @@ jobs:
   the full docker argv, the linked-worktree common-dir mount, and exit-status
   propagation.
 
-Both run inside `scripts/test verify` via `_verify_gate_harnesses`, with no
+The two scripts run inside `scripts/test verify` via `_verify_gate_harnesses`
+(the Go test in its `go test` loop), with no
 network and no real Docker. The live image build and in-image smoke are
 operator-validated (the workflow above).
