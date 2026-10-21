@@ -5,10 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -911,5 +913,451 @@ func TestLastNonEmptyLine(t *testing.T) {
 		if got := lastNonEmptyLine(tc.in); got != tc.want {
 			t.Errorf("lastNonEmptyLine(%q) = %q, want %q", tc.in, got, tc.want)
 		}
+	}
+}
+
+// --- #4023 gate budget: the two-budget stage clock at every gate site ------
+//
+// Every case runs REAL verify processes under a ctx-carried stagePhaseClock.
+// Every deadline-competing duration derives from scaledD (#1984); a verify
+// that must COMPLETE runs under gateBudgetSafeVerifyTimeout, an order of
+// magnitude over its own runtime (#3587), and the gate budget a case seeds is
+// far below that timeout so only the budget can be what kills it.
+
+// gateBudgetSafeVerifyTimeout is executor.verify.timeout for every #4023 case:
+// far above any verify these fixtures expect to complete, so a kill can only
+// come from the gate budget.
+func gateBudgetSafeVerifyTimeout() time.Duration { return scaledD(5 * time.Second) }
+
+// exhaustedGateBudget is the tiny gate budget the exhaustion cases seed, far
+// below gateBudgetSafeVerifyTimeout.
+func exhaustedGateBudget() time.Duration { return scaledD(300 * time.Millisecond) }
+
+// gateBudgetKillBound is how long an exhaustion case may take: well over the
+// seeded budget plus spawn/kill jitter, well UNDER gateBudgetSafeVerifyTimeout,
+// so a verify that ran to its own timeout instead of the budget fails it.
+func gateBudgetKillBound() time.Duration { return scaledD(3 * time.Second) }
+
+// gateBudgetReasonMarker is a phrase only gateBudgetExhaustedReason renders
+// (the trailer says the budget "expired"), so a REASON assertion on it cannot
+// be satisfied by the gate-budget trailer appended to the captured output.
+const gateBudgetReasonMarker = "ran out before it reached a verdict"
+
+// phaseRecorder is a stagePhaseClock report hook recording every snapshot.
+type phaseRecorder struct {
+	mu    sync.Mutex
+	snaps []stagePhaseSnapshot
+}
+
+func (r *phaseRecorder) record(s stagePhaseSnapshot) {
+	r.mu.Lock()
+	r.snaps = append(r.snaps, s)
+	r.mu.Unlock()
+}
+
+func (r *phaseRecorder) all() []stagePhaseSnapshot {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return append([]stagePhaseSnapshot(nil), r.snaps...)
+}
+
+// phaseSequence collapses consecutive same-phase snapshots into one entry.
+func phaseSequence(snaps []stagePhaseSnapshot) []string {
+	var seq []string
+	for _, s := range snaps {
+		if len(seq) == 0 || seq[len(seq)-1] != s.Phase {
+			seq = append(seq, s.Phase)
+		}
+	}
+	return seq
+}
+
+// gateBudgetClockCtx returns a ctx carrying a fresh clock for agentBudget /
+// verifyTimeout, its recorder wired as the report hook.
+func gateBudgetClockCtx(agentBudget, verifyTimeout time.Duration) (context.Context, *stagePhaseClock, *phaseRecorder) {
+	clock := newStagePhaseClock(agentBudget, verifyTimeout)
+	rec := &phaseRecorder{}
+	clock.report = rec.record
+	return withStagePhases(context.Background(), clock), clock, rec
+}
+
+// exhaustedGateClockCtx returns a ctx whose clock is in a gate phase with the
+// seeded exhaustedGateBudget and nothing charged yet.
+func exhaustedGateClockCtx() (context.Context, *stagePhaseClock) {
+	ctx, clock, _ := gateBudgetClockCtx(time.Hour, gateBudgetSafeVerifyTimeout())
+	clock.gateBudget = exhaustedGateBudget()
+	clock.beginGate()
+	return ctx, clock
+}
+
+// gateBudgetRunPayload decodes the #4023 keys of a gate-budget verify_run.
+type gateBudgetRunPayload struct {
+	TimedOut            bool `json:"timed_out"`
+	GateBudgetSeconds   *int `json:"gate_budget_seconds"`
+	GateBudgetExhausted bool `json:"gate_budget_exhausted"`
+}
+
+func assertNoTimedOutVerifyRun(t *testing.T, events []agent.Event) {
+	t.Helper()
+	for _, ev := range events {
+		if ev.Kind != "verify_run" {
+			continue
+		}
+		if p := decodeVerifyRun(t, ev); p.TimedOut {
+			t.Errorf("a verify_run timed out, want none:\n%s", p.Output)
+		}
+	}
+}
+
+// slowPassVerifyCmd writes a verify script that sleeps d and exits 0 — a
+// verify that is green but LONG relative to the agent budget's leftover.
+func slowPassVerifyCmd(t *testing.T, d time.Duration) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "slow-pass.sh")
+	mustWrite(t, script, fmt.Sprintf("#!/bin/sh\nsleep %g\nexit 0\n", d.Seconds()))
+	return "sh " + script
+}
+
+// failUntilFixedVerifyCmd writes a verify script that fails fast until the
+// committed a.txt says "fixed", then sleeps passDelay and exits 0.
+func failUntilFixedVerifyCmd(t *testing.T, passDelay time.Duration) string {
+	t.Helper()
+	script := filepath.Join(t.TempDir(), "fail-until-fixed.sh")
+	mustWrite(t, script, fmt.Sprintf("#!/bin/sh\nif grep -q fixed a.txt; then sleep %g; exit 0; fi\necho '--- FAIL: TestGate (0.00s)'\nexit 1\n", passDelay.Seconds()))
+	return "sh " + script
+}
+
+// Done-means 1 (#4023): an agent that spends 95%% of its budget leaves the gate
+// its FULL budget — a verify that runs 30%% of the agent budget (far over the
+// agent's ~5%% leftover) passes. Counterfactual CF-A: restoring the shared
+// budget (gateRemainingLocked returning the agent budget's leftover) clips the
+// verify to ~5%% of the agent budget and kills it category C.
+func TestGateBudget_AgentNearTimeoutThenLongVerifySucceeds(t *testing.T) {
+	agentBudget := scaledD(2 * time.Second)
+	ctx, clock, _ := gateBudgetClockCtx(agentBudget, gateBudgetSafeVerifyTimeout())
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, slowPassVerifyCmd(t, agentBudget*30/100))
+	cfg.verifyMaxIterations = 1
+	cfg.verifyTimeout = gateBudgetSafeVerifyTimeout()
+
+	clock.beginAgent()
+	time.Sleep(agentBudget * 95 / 100)
+	clock.beginGate()
+
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	_, tree, err := runVerifyFixLoop(ctx, &cfg, nil, "", &fakeInvoker{canned: agent.Result{OK: true}}, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if !res.OK {
+		t.Fatalf("res.OK = false (category %q): the agent's spent budget reached the gate:\n%s", res.FailureCategory, res.FailureReason)
+	}
+	if tree == "" {
+		t.Error("verified tree is empty, want the passing tree")
+	}
+	assertNoTimedOutVerifyRun(t, res.Events)
+}
+
+// The fix-up shape of done-means 1: iteration 1 fails fast, the FIX agent
+// spends 95%% of the agent budget, and iteration 2's slow verify still passes
+// because the fix re-invoke's exit opens a fresh gate phase. CF-A turns it RED
+// the same way.
+func TestGateBudget_FixReinvokeNearTimeoutThenLongVerifySucceeds(t *testing.T) {
+	agentBudget := scaledD(2 * time.Second)
+	ctx, clock, _ := gateBudgetClockCtx(agentBudget, gateBudgetSafeVerifyTimeout())
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, failUntilFixedVerifyCmd(t, agentBudget*30/100))
+	cfg.verifyMaxIterations = 2
+	cfg.verifyTimeout = gateBudgetSafeVerifyTimeout()
+	invoker := &fakeInvoker{
+		canned: agent.Result{OK: true},
+		onInvoke: func(int, agent.Invocation) {
+			time.Sleep(agentBudget * 95 / 100)
+			mustWrite(t, filepath.Join(repo, "a.txt"), "fixed\n")
+		},
+	}
+
+	// The primary agent's quick pass, then its gate phase.
+	clock.beginAgent()
+	clock.beginGate()
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	reinvoked, tree, err := runVerifyFixLoop(ctx, &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if invoker.callIdx != 1 || !reinvoked {
+		t.Fatalf("fix agent calls = %d (reinvoked=%v), want exactly 1 — the fixture's first verify must fail fast", invoker.callIdx, reinvoked)
+	}
+	if !res.OK {
+		t.Fatalf("res.OK = false (category %q): the fix agent's spent budget reached the gate:\n%s", res.FailureCategory, res.FailureReason)
+	}
+	if tree == "" {
+		t.Error("verified tree is empty, want the passing tree")
+	}
+	assertNoTimedOutVerifyRun(t, res.Events)
+}
+
+// Done-means 2 (#4023): a gate phase whose budget runs out is a category-C
+// verify-gate timeout naming the GATE budget, never an agent timeout, and the
+// verify is killed at the budget, not at its own executor.verify.timeout.
+// Counterfactual CF-B: a gateVerifyTimeout that never clips lets the hanging
+// verify run to its own timeout, past gateBudgetKillBound, without the
+// gate-budget wording.
+func TestGateBudget_ExhaustedFixLoopIsGateTimeoutCategoryC(t *testing.T) {
+	ctx, _ := exhaustedGateClockCtx()
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, hangingVerifyScript(t, ">> > ./runner"))
+	cfg.verifyMaxIterations = 1
+	cfg.verifyTimeout = gateBudgetSafeVerifyTimeout()
+	res := agent.Result{OK: true}
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	var logSink strings.Builder
+	start := time.Now()
+	reinvoked, tree, err := runVerifyFixLoop(ctx, &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink)
+	if elapsed := time.Since(start); elapsed > gateBudgetKillBound() {
+		t.Fatalf("loop returned after %s, want within %s — the gate budget did not bound the verify", elapsed, gateBudgetKillBound())
+	}
+	if err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	assertFixLoopTimedOut(t, res, invoker, reinvoked, tree, logSink.String(), verifyFormFull, 1)
+	if lead, _, _ := strings.Cut(res.FailureReason, "\n"); !strings.Contains(lead, gateBudgetReasonMarker) {
+		t.Errorf("FailureReason lead must be the gate-budget reason:\n%s", res.FailureReason)
+	}
+	for _, ev := range res.Events {
+		if ev.Kind != "verify_summary" {
+			continue
+		}
+		var sum struct {
+			Detail string `json:"detail"`
+		}
+		_ = json.Unmarshal(ev.Payload, &sum)
+		if !strings.Contains(sum.Detail, gateBudgetReasonMarker) {
+			t.Errorf("verify_summary detail must be the gate-budget reason, got %q", sum.Detail)
+		}
+	}
+	if strings.Contains(res.FailureReason, "agent timed out") || strings.Contains(res.FailureReason, "agent_timeout") {
+		t.Errorf("FailureReason must never report an agent timeout:\n%s", res.FailureReason)
+	}
+	if !strings.Contains(res.FailureReason, "the stage's gate budget (") || !strings.Contains(res.FailureReason, "--- fishhawk-runner: verify TERMINATED, no verdict ---") {
+		t.Errorf("FailureReason must carry the gate-budget trailer:\n%s", res.FailureReason)
+	}
+	assertGateBudgetExhaustedVerifyRun(t, res.Events)
+}
+
+// assertGateBudgetExhaustedVerifyRun requires the LAST verify_run to carry the
+// additive #4023 keys.
+func assertGateBudgetExhaustedVerifyRun(t *testing.T, events []agent.Event) {
+	t.Helper()
+	var last *agent.Event
+	for i := range events {
+		if events[i].Kind == "verify_run" {
+			last = &events[i]
+		}
+	}
+	if last == nil {
+		t.Fatal("no verify_run event")
+	}
+	var p gateBudgetRunPayload
+	if err := json.Unmarshal(last.Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if !p.TimedOut || !p.GateBudgetExhausted || p.GateBudgetSeconds == nil {
+		t.Errorf("verify_run = %+v, want timed_out + gate_budget_exhausted + gate_budget_seconds", p)
+	}
+}
+
+// The single-shot committed gate under an exhausted gate budget.
+func TestGateBudget_ExhaustedCommittedGateIsCategoryC(t *testing.T) {
+	ctx, _ := exhaustedGateClockCtx()
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, hangingVerifyScript(t, ">> > ./runner"))
+	cfg.verifyTimeout = gateBudgetSafeVerifyTimeout()
+	var logSink strings.Builder
+	start := time.Now()
+	events, tree, err := runVerifyGateCommitted(ctx, cfg, &logSink)
+	if elapsed := time.Since(start); elapsed > gateBudgetKillBound() {
+		t.Fatalf("gate returned after %s, want within %s", elapsed, gateBudgetKillBound())
+	}
+	if !errors.Is(err, errVerifyGateTimedOut) {
+		t.Fatalf("err = %v, want errVerifyGateTimedOut", err)
+	}
+	if got := committedGateFailureCategory(err); got != "C" {
+		t.Errorf("committedGateFailureCategory = %q, want C", got)
+	}
+	if tree != "" {
+		t.Errorf("verified tree = %q, want empty", tree)
+	}
+	if !strings.Contains(err.Error(), verifyGateTimedOutLead+": ") || !strings.Contains(err.Error(), gateBudgetReasonMarker) {
+		t.Errorf("error must carry the timed-out lead naming the gate budget: %v", err)
+	}
+	assertGateBudgetExhaustedVerifyRun(t, events)
+}
+
+// The #960 strict re-verify before push under an exhausted gate budget.
+func TestGateBudget_ExhaustedStrictReverifyIsCategoryC(t *testing.T) {
+	repo, bare, _ := verifiedTreeRepo(t)
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, verifiedTree, gerr := runVerifyGateCommitted(context.Background(), verifiedTreeCfg(repo, "true"), os.Stderr)
+	if gerr != nil || verifiedTree == "" {
+		t.Fatalf("gate: tree=%q err=%v", verifiedTree, gerr)
+	}
+	moveBareMain(t, bare)
+
+	ctx, _ := exhaustedGateClockCtx()
+	var logSink strings.Builder
+	cfg := verifiedTreeCfg(repo, hangingVerifyScript(t, ">> > ./runner"))
+	cfg.verifyTimeout = gateBudgetSafeVerifyTimeout()
+	start := time.Now()
+	err = openPRAndShipArtifact(ctx, cfg, &logSink, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, nil)
+	if elapsed := time.Since(start); elapsed > gateBudgetKillBound()+scaledD(5*time.Second) {
+		t.Fatalf("push returned after %s — the gate budget did not bound the strict re-verify", elapsed)
+	}
+	if !errors.Is(err, gitops.ErrVerifyInfraFailure) {
+		t.Fatalf("err = %v, want ErrVerifyInfraFailure", err)
+	}
+	if got := pushFailureCategory(err); got != "C" {
+		t.Errorf("pushFailureCategory = %q, want C", got)
+	}
+	if !strings.Contains(err.Error(), verifyGateTimedOutLead+": ") || !strings.Contains(err.Error(), gateBudgetReasonMarker) {
+		t.Errorf("error must carry the timed-out lead naming the gate budget: %v", err)
+	}
+	if !strings.Contains(err.Error(), "the stage's gate budget (") {
+		t.Errorf("error must carry the gate-budget trailer: %v", err)
+	}
+}
+
+// The working-tree gate (plan / --no-pr stages) under an exhausted gate budget.
+func TestGateBudget_ExhaustedWorkingTreeGateIsCategoryC(t *testing.T) {
+	ctx, _ := exhaustedGateClockCtx()
+	cfg := config{verifyCmd: `echo ">> > ./runner"; sleep 300`, verifyTimeout: gateBudgetSafeVerifyTimeout()}
+	start := time.Now()
+	ev, err := runVerifyGate(ctx, cfg, io.Discard)
+	if elapsed := time.Since(start); elapsed > gateBudgetKillBound() {
+		t.Fatalf("gate returned after %s, want within %s", elapsed, gateBudgetKillBound())
+	}
+	if !errors.Is(err, errVerifyGateTimedOut) {
+		t.Fatalf("err = %v, want errVerifyGateTimedOut", err)
+	}
+	if got := workingTreeGateFailureCategory(err); got != "C" {
+		t.Errorf("workingTreeGateFailureCategory = %q, want C", got)
+	}
+	if !strings.Contains(err.Error(), verifyGateTimedOutLead+": ") || !strings.Contains(err.Error(), gateBudgetReasonMarker) {
+		t.Errorf("error must carry the timed-out lead naming the gate budget: %v", err)
+	}
+	assertGateBudgetExhaustedVerifyRun(t, []agent.Event{ev})
+	if p := decodeVerifyRun(t, ev); !strings.Contains(p.Output, "the stage's gate budget (") {
+		t.Errorf("verify_run output must end with the gate-budget trailer:\n%s", p.Output)
+	}
+}
+
+// An already-spent gate budget times BOTH chokepoints out without spawning
+// the verify or materializing its clone. The counting seams isolate the
+// short-circuit: without it, a 0 timeout still never starts the command, but
+// the clone is materialized and the exec seam is entered.
+func TestGateBudget_ExhaustedBeforeStartSpawnsNothing(t *testing.T) {
+	ctx, clock := exhaustedGateClockCtx()
+	clock.mu.Lock()
+	clock.gateUsed = clock.gateBudget
+	clock.mu.Unlock()
+	if !clock.gateExhausted() {
+		t.Fatal("fixture precondition: the gate budget must be spent")
+	}
+	var mu sync.Mutex
+	var execs, clones int
+	prevExec, prevClone := execBoundedHostArgvFn, materializeGateCheckoutFn
+	execBoundedHostArgvFn = func(ctx context.Context, argv []string, dir string, env []string, timeout time.Duration) (string, int, bool) {
+		mu.Lock()
+		execs++
+		mu.Unlock()
+		return prevExec(ctx, argv, dir, env, timeout)
+	}
+	materializeGateCheckoutFn = func(ctx context.Context, repoDir, headSHA, parent string) (string, error) {
+		mu.Lock()
+		clones++
+		mu.Unlock()
+		return prevClone(ctx, repoDir, headSHA, parent)
+	}
+	t.Cleanup(func() { execBoundedHostArgvFn, materializeGateCheckoutFn = prevExec, prevClone })
+
+	sentinel := filepath.Join(t.TempDir(), "spawned")
+	verifyCmd := "touch " + sentinel
+
+	repo, _, _ := verifiedTreeRepo(t)
+	head := commitAgentChange(t, repo)
+	ev, _, outcome, disp := runVerifyCommittedTree(ctx, verifyCmd, repo, head, gateBudgetSafeVerifyTimeout(), nil)
+	if disp != gateTimedOut || outcome != "failed" {
+		t.Errorf("committed chokepoint = (%q, %v), want (failed, gateTimedOut)", outcome, disp)
+	}
+	assertGateBudgetExhaustedVerifyRun(t, []agent.Event{ev})
+
+	wev, werr := runVerifyGate(ctx, config{verifyCmd: verifyCmd, verifyTimeout: gateBudgetSafeVerifyTimeout()}, io.Discard)
+	if !errors.Is(werr, errVerifyGateTimedOut) || !strings.Contains(werr.Error(), gateBudgetReasonMarker) {
+		t.Errorf("working-tree gate err = %v, want errVerifyGateTimedOut naming the gate budget", werr)
+	}
+	assertGateBudgetExhaustedVerifyRun(t, []agent.Event{wev})
+
+	mu.Lock()
+	defer mu.Unlock()
+	if execs != 0 || clones != 0 {
+		t.Errorf("exec seam entered %d time(s), clone materialized %d time(s); want 0 and 0 on a spent gate budget", execs, clones)
+	}
+	if _, err := os.Stat(sentinel); err == nil {
+		t.Error("the verify command ran on a spent gate budget")
+	}
+}
+
+// The fix loop's phase transitions: gate (the primary agent exited), agent
+// (the fix re-invoke), gate (the fix agent exited), with a verify bracketed
+// inside each gate phase. Counterfactual CF-D: deleting the beginGate after
+// the fix re-invoke leaves the second verify reported in the agent phase.
+func TestGateBudget_FixLoopReportsGateAgentGate(t *testing.T) {
+	ctx, clock, rec := gateBudgetClockCtx(time.Hour, gateBudgetSafeVerifyTimeout())
+	repo, _, _ := verifiedTreeRepo(t)
+	cfg := verifiedTreeCfg(repo, failUntilFixedVerifyCmd(t, 0))
+	cfg.verifyMaxIterations = 2
+	cfg.verifyTimeout = gateBudgetSafeVerifyTimeout()
+	invoker := &fakeInvoker{
+		canned:   agent.Result{OK: true},
+		onInvoke: func(int, agent.Invocation) { mustWrite(t, filepath.Join(repo, "a.txt"), "fixed\n") },
+	}
+	clock.beginGate()
+	res := agent.Result{OK: true}
+	var logSink strings.Builder
+	if _, _, err := runVerifyFixLoop(ctx, &cfg, nil, "", invoker, agent.Invocation{}, &res, &logSink); err != nil {
+		t.Fatalf("runVerifyFixLoop: %v\n%s", err, logSink.String())
+	}
+	if !res.OK || invoker.callIdx != 1 {
+		t.Fatalf("fixture precondition: want one fix re-invoke then a pass, got OK=%v calls=%d:\n%s", res.OK, invoker.callIdx, res.FailureReason)
+	}
+	snaps := rec.all()
+	if got, want := strings.Join(phaseSequence(snaps), ","), "gate,agent,gate"; got != want {
+		t.Fatalf("phase sequence = %s, want %s (%+v)", got, want, snaps)
+	}
+	// The verify of the SECOND gate phase is bracketed: verifying true, then
+	// false, after the last agent snapshot.
+	lastAgent := -1
+	for i, s := range snaps {
+		if s.Phase == stagePhaseAgent {
+			lastAgent = i
+		}
+	}
+	var sawStart, sawEnd bool
+	for _, s := range snaps[lastAgent+1:] {
+		if s.Verifying {
+			sawStart = true
+		} else if sawStart {
+			sawEnd = true
+		}
+	}
+	if !sawStart || !sawEnd {
+		t.Errorf("second gate phase verify not bracketed (start=%v end=%v): %+v", sawStart, sawEnd, snaps)
 	}
 }
