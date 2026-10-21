@@ -1097,6 +1097,15 @@
         "ADR-093"
       ],
       "applies_to": []
+    },
+    {
+      "id": "ADR-110",
+      "title": "Product features are repository-agnostic: repository specifics are declared configuration, and this repository is a configured instance, not a special case",
+      "path": "docs/adr/110-repository-agnostic-product-features.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }

@@ -463,6 +463,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-107](107-split-stage-timeout-agent-and-gate-budgets.md) | Amend ADR-025: split the stage timeout into an agent budget and a project-derived verify-gate budget | `accepted` | [#4581](https://github.com/kuhlman-labs/fishhawk/issues/4581) |
 | [ADR-108](108-shared-postgres-lock-holder-budget.md) | Shared Postgres lock-holder budget: one pool-wide pglock budget with reserved headroom and enforced no-nesting for every connection-holding advisory-lock helper | `accepted` | [#4594](https://github.com/kuhlman-labs/fishhawk/issues/4594) |
 | [ADR-109](109-merge-queue-owns-the-merge.md) | Amend ADR-093 D1: the merge queue owns the merge — one database-enforced per-run dispatch ledger across inline, delegated and queue merges, plus the admission-epoch CAS protocol | `accepted` | [#4601](https://github.com/kuhlman-labs/fishhawk/issues/4601) |
+| [ADR-110](110-repository-agnostic-product-features.md) | Product features are repository-agnostic: repository specifics are declared configuration, and this repository is a configured instance, not a special case | `accepted` | [#4605](https://github.com/kuhlman-labs/fishhawk/issues/4605) |
 
 ## Status unknown — needs captain confirmation
 
