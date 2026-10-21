@@ -2,9 +2,10 @@
 // queue behind ADR-092 D1 (#4200): at most ONE merge-candidate verify pass is
 // live per base, and every other eligible pass is held FIFO by eligibility
 // time, consuming no runner slot. Every mutation is one transaction under a
-// per-base advisory lock, scoped by account through runs.account_id. The rows
-// are shaped so ADR-093's merge queue extends them without a second
-// migration. README.md is the contract.
+// per-base advisory lock, scoped by account through runs.account_id. ADR-093's
+// merge queue reuses the rows, FIFO order and lock order unchanged, adding
+// only the operator's merge intent (merge_intent_at, 0107) and the line-turn
+// read. README.md is the contract.
 package mergequeue
 
 import (
@@ -74,6 +75,15 @@ var (
 	// ErrStateConflict is an entry not in a state the call accepts (for
 	// example Unadmit on a held entry, or Reanchor on a terminal one).
 	ErrStateConflict = errors.New("mergequeue: entry state conflict")
+	// ErrIntentUnrecorded is a merge-intent call whose RecordIntentFunc
+	// failed: the whole call was rolled back and wrote nothing. It wraps the
+	// callback's error.
+	ErrIntentUnrecorded = errors.New("mergequeue: merge intent not recorded")
+	// ErrIntentLockLapsed is a WithMergeIntentLock whose fn RAN and returned
+	// nil, but whose lock could not be confirmed held through its release
+	// (the lock session failed, or the unlock found no lock), so another
+	// holder may have overlapped fn. fn's writes stand; the caller decides.
+	ErrIntentLockLapsed = errors.New("mergequeue: merge-intent lock lapsed")
 )
 
 // Base is one queue: a repository base ref inside one account. AccountID is
@@ -86,8 +96,9 @@ type Base struct {
 }
 
 // Entry is one merge_candidate_queue_entries row. Phase, EjectReason and
-// AnchoredBaseSHA are "" for NULL. AccountID is read through runs, never
-// stored on the row.
+// AnchoredBaseSHA are "" for NULL; MergeIntentAt is nil for NULL (no
+// recorded merge intent). AccountID is read through runs, never stored on the
+// row.
 type Entry struct {
 	ID              uuid.UUID
 	RunID           uuid.UUID
@@ -104,6 +115,9 @@ type Entry struct {
 	AdmittedAt      *time.Time
 	SettledAt       *time.Time
 	UpdatedAt       time.Time
+	// MergeIntentAt is when the operator's merge intent was recorded on this
+	// episode (0107, ADR-093 D2); set once, never cleared.
+	MergeIntentAt *time.Time
 }
 
 // Base returns the queue the entry belongs to.
@@ -120,7 +134,24 @@ type EnqueueRequest struct {
 	HeadSHA string
 	// BaseSHA is the base tip the head was produced against ("" if unknown).
 	BaseSHA string
+	// MergeIntent records the operator's merge intent on the entry (ADR-093
+	// D2): a new row is stamped at insert, a same-base active entry only
+	// when it carries none yet. False never clears an existing intent.
+	MergeIntent bool
+	// RecordIntent, when non-nil, is called INSIDE the transaction when this
+	// call records merge intent (EnqueueResult.IntentRecorded), after every
+	// write and before commit. A non-nil error rolls the whole call back and
+	// Enqueue returns it wrapped in ErrIntentUnrecorded. Never called when
+	// MergeIntent is false or the intent was already recorded.
+	RecordIntent RecordIntentFunc
 }
+
+// RecordIntentFunc is the record-before-commit callback of a merge-intent
+// call: st is the entry's Status read inside the call's transaction (its
+// writes visible, nothing committed). It runs while the call holds its
+// advisory locks and the entry's row lock, so it must not call back into the
+// Store.
+type RecordIntentFunc func(ctx context.Context, st Status) error
 
 // EnqueueOutcome says what Enqueue did.
 type EnqueueOutcome string
@@ -148,6 +179,18 @@ type EnqueueResult struct {
 	// Dropped is the entry dropped base_changed (EnqueueBaseChanged only).
 	// When it was live its base has no live entry now; pump that base.
 	Dropped *Entry
+	// IntentRecorded reports THIS call moved the entry's merge_intent_at
+	// from NULL to set (MergeIntent only; false on a repeat).
+	IntentRecorded bool
+}
+
+// MergeIntentResult is MarkMergeIntent's verdict.
+type MergeIntentResult struct {
+	// Entry is the row after the call.
+	Entry Entry
+	// IntentRecorded reports THIS call moved merge_intent_at from NULL to
+	// set; false (and nothing written) when it was already set.
+	IntentRecorded bool
 }
 
 // Admission is AdmitNext's verdict.
@@ -194,6 +237,9 @@ type Store interface {
 	ActiveForRun(ctx context.Context, runID uuid.UUID) (Status, bool, error)
 	ListForBase(ctx context.Context, base Base) ([]Entry, error)
 	ActiveBases(ctx context.Context) ([]Base, error)
+	MarkMergeIntent(ctx context.Context, entryID uuid.UUID, record RecordIntentFunc) (MergeIntentResult, error)
+	RecentLineTurns(ctx context.Context, base Base, limit int) ([]time.Duration, error)
+	WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error
 }
 
 // validate refuses a malformed Base before any SQL runs.
@@ -226,6 +272,18 @@ func lockKey(accountID, repo, baseRef string) int64 {
 	h.Write([]byte(repo))
 	h.Write([]byte{0})
 	h.Write([]byte(baseRef))
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
+}
+
+// intentLockKey derives WithMergeIntentLock's per-run key in its own
+// "fishhawk:mergequeue-intent:" domain, disjoint from runLockKey: the lock is
+// held on one connection while fn's Enqueue takes runLockKey on another, so
+// a shared key would make the holder wait on itself.
+func intentLockKey(runID uuid.UUID) int64 {
+	h := sha256.New()
+	h.Write([]byte("fishhawk:mergequeue-intent:"))
+	h.Write(runID[:])
 	sum := h.Sum(nil)
 	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
 }

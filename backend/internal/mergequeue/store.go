@@ -31,6 +31,10 @@ import (
 // share one scope), and the lock key is per account.
 type PostgresStore struct {
 	pool *pgxpool.Pool
+	// intentHolders bounds this store's concurrent WithMergeIntentLock
+	// holders to intentHolderLimit, so lock holders alone can never occupy
+	// every connection their fn needs (README.md § "Merge-intent lock").
+	intentHolders chan struct{}
 
 	// afterLiveCheck is a test hook, nil in production: it runs inside
 	// AdmitNext after the live-entry check found none and before the oldest
@@ -47,7 +51,22 @@ var _ Store = (*PostgresStore)(nil)
 
 // NewPostgresStore returns the Postgres queue store.
 func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
-	return &PostgresStore{pool: pool}
+	return &PostgresStore{pool: pool, intentHolders: make(chan struct{}, intentHolderLimit(pool))}
+}
+
+// intentHolderLimit is half the pool's MaxConns, at least 1: each holder
+// keeps one connection for its lock and its fn uses at most one more at a
+// time, so with at most half the pool held by locks every holder's fn can
+// get its connection at once. A pool of fewer than 2 connections cannot run
+// a holder's fn at all.
+func intentHolderLimit(pool *pgxpool.Pool) int {
+	n := 1
+	if pool != nil {
+		if half := int(pool.Config().MaxConns) / 2; half > n {
+			n = half
+		}
+	}
+	return n
 }
 
 // admissionStaleSQL is built from the Go constant (an integer, never input).
@@ -55,7 +74,8 @@ var admissionStaleSQL = fmt.Sprintf("interval '%d seconds'", int(AdmissionStaleA
 
 const entryCols = `e.id, e.run_id, COALESCE(r.account_id::text, ''), e.repo, e.base_ref, e.state,
   COALESCE(e.phase, ''), COALESCE(e.eject_reason, ''), e.enqueued_at, e.anchored_head_sha,
-  COALESCE(e.anchored_base_sha, ''), e.anchored_at, e.admitted_at, e.settled_at, e.updated_at`
+  COALESCE(e.anchored_base_sha, ''), e.anchored_at, e.admitted_at, e.settled_at, e.updated_at,
+  e.merge_intent_at`
 
 const entryFrom = `
 FROM merge_candidate_queue_entries e
@@ -70,7 +90,8 @@ func scanEntry(row pgx.Row, extra ...any) (Entry, error) {
 	var state, phase string
 	dest := append([]any{&e.ID, &e.RunID, &e.AccountID, &e.Repo, &e.BaseRef, &state,
 		&phase, &e.EjectReason, &e.EnqueuedAt, &e.AnchoredHeadSHA,
-		&e.AnchoredBaseSHA, &e.AnchoredAt, &e.AdmittedAt, &e.SettledAt, &e.UpdatedAt}, extra...)
+		&e.AnchoredBaseSHA, &e.AnchoredAt, &e.AdmittedAt, &e.SettledAt, &e.UpdatedAt,
+		&e.MergeIntentAt}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return Entry{}, err
 	}
@@ -170,7 +191,13 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 				return err
 			}
 			out = EnqueueResult{Entry: e, Outcome: EnqueueReanchored, AnchorChanged: changed}
-			return nil
+			if req.MergeIntent {
+				e, recorded, err := markIntentTx(ctx, tx, e)
+				if err != nil {
+					return err
+				}
+				out.Entry, out.IntentRecorded = e, recorded
+			}
 		case cur != nil:
 			dropped, err := settleTx(ctx, tx, cur.ID, StateDropped, ReasonBaseChanged)
 			if err != nil {
@@ -180,16 +207,18 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 			if err != nil {
 				return err
 			}
-			out = EnqueueResult{Entry: e, Outcome: EnqueueBaseChanged, Dropped: &dropped}
-			return nil
+			out = EnqueueResult{Entry: e, Outcome: EnqueueBaseChanged, Dropped: &dropped, IntentRecorded: req.MergeIntent}
 		default:
 			e, err := insertTx(ctx, tx, req, repo)
 			if err != nil {
 				return err
 			}
-			out = EnqueueResult{Entry: e, Outcome: EnqueueInserted}
-			return nil
+			out = EnqueueResult{Entry: e, Outcome: EnqueueInserted, IntentRecorded: req.MergeIntent}
 		}
+		if out.IntentRecorded {
+			return recordIntentTx(ctx, tx, out.Entry.RunID, req.RecordIntent)
+		}
+		return nil
 	})
 	if err != nil {
 		return EnqueueResult{}, err
@@ -197,15 +226,16 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 	return out, nil
 }
 
-// insertTx inserts a held row at the base's tail: enqueued_at (the FIFO key)
-// and anchored_at are one database-clock instant.
+// insertTx inserts a held row at the base's tail: enqueued_at (the FIFO key),
+// anchored_at and (with MergeIntent) merge_intent_at are one database-clock
+// instant.
 func insertTx(ctx context.Context, tx pgx.Tx, req EnqueueRequest, repo string) (Entry, error) {
 	var id uuid.UUID
 	if err := tx.QueryRow(ctx, `INSERT INTO merge_candidate_queue_entries
-  (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at)
-SELECT $1, $2, $3, 'held', c.ts, $4, NULLIF($5, ''), c.ts
+  (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at, merge_intent_at)
+SELECT $1, $2, $3, 'held', c.ts, $4, NULLIF($5, ''), c.ts, CASE WHEN $6::bool THEN c.ts END
 FROM (SELECT clock_timestamp() AS ts) c
-RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA).Scan(&id); err != nil {
+RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA, req.MergeIntent).Scan(&id); err != nil {
 		return Entry{}, fmt.Errorf("mergequeue: insert entry: %w", err)
 	}
 	return getEntryTx(ctx, tx, id)
@@ -224,6 +254,40 @@ WHERE id = $1`, cur.ID, headSHA, baseSHA); err != nil {
 	}
 	e, err := getEntryTx(ctx, tx, cur.ID)
 	return e, true, err
+}
+
+// markIntentTx stamps an active entry's merge_intent_at when it is NULL and
+// reports whether it did; an already-set intent writes nothing.
+func markIntentTx(ctx context.Context, tx pgx.Tx, cur Entry) (Entry, bool, error) {
+	if cur.MergeIntentAt != nil {
+		return cur, false, nil
+	}
+	if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
+SET merge_intent_at = clock_timestamp()
+WHERE id = $1 AND merge_intent_at IS NULL`, cur.ID); err != nil {
+		return Entry{}, false, fmt.Errorf("mergequeue: mark merge intent: %w", err)
+	}
+	e, err := getEntryTx(ctx, tx, cur.ID)
+	return e, true, err
+}
+
+// recordIntentTx runs a merge-intent call's record-before-commit callback
+// on the run's Status read inside tx; its error rolls the call back.
+func recordIntentTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID, record RecordIntentFunc) error {
+	if record == nil {
+		return nil
+	}
+	st, found, err := activeForRun(ctx, tx, runID)
+	if err != nil {
+		return err
+	}
+	if !found {
+		return fmt.Errorf("mergequeue: run %s has no active entry to record intent on", runID)
+	}
+	if err := record(ctx, st); err != nil {
+		return fmt.Errorf("%w: %w", ErrIntentUnrecorded, err)
+	}
+	return nil
 }
 
 // settleTx moves an ACTIVE entry to a terminal state.
@@ -438,13 +502,126 @@ func (s *PostgresStore) Settle(ctx context.Context, entryID uuid.UUID, state Sta
 	return out, nil
 }
 
-// ActiveForRun returns the run's active entry with its held position and the
-// base's live run, counted within the run's own account. found is false when
-// the run has no active entry.
-func (s *PostgresStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (Status, bool, error) {
+// MarkMergeIntent records the operator's merge intent on an ACTIVE entry. A
+// terminal entry is ErrStateConflict; an already-set intent writes nothing
+// and calls no record (IntentRecorded=false). record, when non-nil, runs
+// inside the transaction after the write and before commit; its error rolls
+// the write back (ErrIntentUnrecorded). Lock order is SetPhase's.
+func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, record RecordIntentFunc) (MergeIntentResult, error) {
+	var out MergeIntentResult
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		if !cur.State.Active() {
+			return stateConflict(cur, "held or live")
+		}
+		e, recorded, err := markIntentTx(ctx, tx, cur)
+		if err != nil {
+			return err
+		}
+		out = MergeIntentResult{Entry: e, IntentRecorded: recorded}
+		if !recorded {
+			return nil
+		}
+		return recordIntentTx(ctx, tx, e.RunID, record)
+	})
+	if err != nil {
+		return MergeIntentResult{}, err
+	}
+	return out, nil
+}
+
+// mergeIntentLockPoll is how often WithMergeIntentLock re-tries a held lock.
+const mergeIntentLockPoll = 25 * time.Millisecond
+
+// intentUnlockTimeout bounds the unlock after fn, which runs on a context
+// that ignores the caller's cancellation so a canceled request still unlocks.
+const intentUnlockTimeout = 5 * time.Second
+
+// WithMergeIntentLock runs fn while holding the run's merge-intent lock: a
+// SESSION-level advisory lock on intentLockKey, held on one dedicated pooled
+// connection that runs no transaction while fn runs on others (the
+// run.WithConsolidatedPROpenLock shape). See README.md § "Merge-intent lock".
+//
+// Each attempt takes one of intentHolderLimit holder slots, then a
+// connection, then TRIES the lock; a held lock releases both and re-tries
+// every mergeIntentLockPoll, so a waiter holds neither a slot nor a
+// connection between tries. The wait is bounded only by ctx; a canceled ctx
+// returns its error and fn never runs.
+//
+// fn's error is returned as is. When fn returned nil but the unlock failed or
+// found no lock (the session died mid-fn, so the exclusion may have lapsed),
+// the result is ErrIntentLockLapsed. A connection whose lock or unlock query
+// failed is CLOSED before release, so a lock-holding session is never
+// returned to the pool.
+func (s *PostgresStore) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error {
+	if runID == uuid.Nil {
+		return fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	}
+	key := intentLockKey(runID)
+	for {
+		ran, err := s.tryMergeIntentLock(ctx, key, fn)
+		if ran || err != nil {
+			return err
+		}
+		t := time.NewTimer(mergeIntentLockPoll)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return fmt.Errorf("mergequeue: intent lock: %w", ctx.Err())
+		case <-t.C:
+		}
+	}
+}
+
+// tryMergeIntentLock is one WithMergeIntentLock attempt. ran reports fn ran;
+// the holder slot and the connection are released before it returns.
+func (s *PostgresStore) tryMergeIntentLock(ctx context.Context, key int64, fn func() error) (bool, error) {
+	select {
+	case s.intentHolders <- struct{}{}:
+	case <-ctx.Done():
+		return false, fmt.Errorf("mergequeue: intent lock: %w", ctx.Err())
+	}
+	defer func() { <-s.intentHolders }()
+	conn, err := s.pool.Acquire(ctx)
+	if err != nil {
+		return false, fmt.Errorf("mergequeue: intent lock: acquire connection: %w", err)
+	}
+	defer conn.Release()
+	var got bool
+	if err := conn.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, key).Scan(&got); err != nil {
+		_ = conn.Conn().Close(context.Background())
+		return false, fmt.Errorf("mergequeue: intent lock: %w", err)
+	}
+	if !got {
+		return false, nil
+	}
+	fnErr := fn()
+	uctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), intentUnlockTimeout)
+	defer cancel()
+	var unlocked bool
+	uerr := conn.QueryRow(uctx, `SELECT pg_advisory_unlock($1)`, key).Scan(&unlocked)
+	if uerr != nil || !unlocked {
+		_ = conn.Conn().Close(context.Background())
+		if fnErr == nil {
+			if uerr == nil {
+				uerr = errors.New("the unlock found no lock held")
+			}
+			return true, fmt.Errorf("%w: %v", ErrIntentLockLapsed, uerr)
+		}
+	}
+	return true, fnErr
+}
+
+// rowQuerier is the QueryRow half shared by the pool and a transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// activeForRun is ActiveForRun on q: the pool for the read surface, the
+// call's transaction for a RecordIntentFunc.
+func activeForRun(ctx context.Context, q rowQuerier, runID uuid.UUID) (Status, bool, error) {
 	var st Status
 	var liveRun pgtype.UUID
-	e, err := scanEntry(s.pool.QueryRow(ctx, `SELECT `+entryCols+`,
+	e, err := scanEntry(q.QueryRow(ctx, `SELECT `+entryCols+`,
   CASE WHEN e.state = 'held' THEN (
     SELECT count(*) FROM merge_candidate_queue_entries h JOIN runs hr ON hr.id = h.run_id
     WHERE h.repo = e.repo AND h.base_ref = e.base_ref AND h.state = 'held'
@@ -468,6 +645,13 @@ WHERE e.run_id = $1 AND e.state IN ('held', 'live')`, runID), &st.Position, &liv
 		st.LiveRunID = &id
 	}
 	return st, true, nil
+}
+
+// ActiveForRun returns the run's active entry with its held position and the
+// base's live run, counted within the run's own account. found is false when
+// the run has no active entry.
+func (s *PostgresStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (Status, bool, error) {
+	return activeForRun(ctx, s.pool, runID)
 }
 
 // ListForBase returns the base's active entries in queue order: the live
@@ -507,6 +691,36 @@ ORDER BY 1, 2, 3`)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("mergequeue: scan active bases: %w", err)
+	}
+	return out, nil
+}
+
+// RecentLineTurns returns the line-turn durations (settled_at − admitted_at,
+// database clock) of the base's newest `limit` MERGED entries, newest settle
+// first, scoped to the base's account like ListForBase. An entry merged
+// without ever being admitted has no line turn and is skipped. Never nil;
+// limit < 1 is ErrInvalidRequest. The ETA basis of ADR-093's queue read.
+func (s *PostgresStore) RecentLineTurns(ctx context.Context, base Base, limit int) ([]time.Duration, error) {
+	if err := base.validate(); err != nil {
+		return nil, err
+	}
+	if limit < 1 {
+		return nil, fmt.Errorf("%w: line-turn limit %d, want at least 1", ErrInvalidRequest, limit)
+	}
+	rows, err := s.pool.Query(ctx, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM e.settled_at - e.admitted_at) * 1000000)::bigint)`+entryFrom+`
+WHERE `+basePredicate+` AND e.state = 'merged' AND e.admitted_at IS NOT NULL
+ORDER BY e.settled_at DESC, e.id DESC
+LIMIT $4`, base.Repo, base.BaseRef, acctArg(base.AccountID), limit)
+	if err != nil {
+		return nil, fmt.Errorf("mergequeue: recent line turns: %w", err)
+	}
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (time.Duration, error) {
+		var us int64
+		err := row.Scan(&us)
+		return time.Duration(us) * time.Microsecond, err
+	})
+	if err != nil {
+		return nil, fmt.Errorf("mergequeue: scan line turns: %w", err)
 	}
 	return out, nil
 }

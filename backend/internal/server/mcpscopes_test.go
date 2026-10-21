@@ -10,6 +10,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/oauthas"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
@@ -608,5 +609,53 @@ func TestMCPToolScopeTable_CampaignHotfixMirrorsHandler(t *testing.T) {
 	agent := Identity{Subject: "operator-agent/v1", TokenID: "tok", Scopes: []string{"write:campaigns"}}
 	if w := post(agent); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "operator_agent_forbidden") {
 		t.Errorf("operator-agent = %d %s, want 403 operator_agent_forbidden from the handler", w.Code, w.Body.String())
+	}
+}
+
+// TestMCPToolScopeTable_GetMergeQueueMirrorsHandler (E87.4 / #4295):
+// fishhawk_get_merge_queue carries EXACTLY the predicate handleGetMergeQueue
+// enforces — a run-bound subject refused 403 run_token_forbidden (approval
+// condition C10, so no runBoundSubjectOK), otherwise
+// requireWriteScope(scopeMergeQueueRead) = read:audit. A read:audit token
+// passes the handler (200) and the row; a token holding only other scopes,
+// and a run-bound token even carrying read:audit, are refused by both.
+func TestMCPToolScopeTable_GetMergeQueueMirrorsHandler(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_get_merge_queue")
+	if !ok {
+		t.Fatal("fishhawk_get_merge_queue has no scope rule")
+	}
+	if strings.Join(rule.anyOf, ",") != scopeGateViewRead || rule.runBoundSubjectOK {
+		t.Errorf("rule = %+v, want anyOf [%s], no run-bound subject", rule, scopeGateViewRead)
+	}
+	store := &mcqFaultStore{activeBases: func() ([]mergequeue.Base, error) { return nil, nil }}
+	s := New(Config{Addr: "127.0.0.1:0", MergeQueue: store})
+	get := func(id Identity) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodGet, "/v0/repos/x/y/merge-queue", nil)
+		req.SetPathValue("owner", "x")
+		req.SetPathValue("name", "y")
+		w := httptest.NewRecorder()
+		s.handleGetMergeQueue(w, withIdentity(req, id))
+		return w
+	}
+	audit := Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{scopeGateViewRead}}
+	if w := get(audit); w.Code != http.StatusOK {
+		t.Errorf("read:audit = %d %s, want 200", w.Code, w.Body.String())
+	}
+	if !rule.satisfiedBy(audit) {
+		t.Error("row refuses read:audit, which the handler admits")
+	}
+	other := Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{"read:runs", "write:runs", "write:approvals"}}
+	if w := get(other); w.Code != http.StatusForbidden {
+		t.Errorf("other scopes = %d, want 403 insufficient_scope", w.Code)
+	}
+	if rule.satisfiedBy(other) {
+		t.Error("row admits a token the handler refuses")
+	}
+	runBound := Identity{Subject: "mcp:run:" + uuid.NewString(), TokenID: "tok-run", Scopes: []string{scopeRunBoundRead}}
+	if w := get(runBound); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "run_token_forbidden") {
+		t.Errorf("run-bound = %d %s, want 403 run_token_forbidden", w.Code, w.Body.String())
+	}
+	if rule.satisfiedBy(runBound) {
+		t.Error("row admits a run-bound token the handler refuses")
 	}
 }

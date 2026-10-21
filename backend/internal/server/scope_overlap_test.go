@@ -100,7 +100,9 @@ func (f *overlapFixture) seedPlannedRun(t *testing.T, state run.State, p *plan.P
 	t.Helper()
 	r := f.rr.seedRun()
 	r.State = state
-	ref := "issue:" + r.ID.String()[:8]
+	// Non-numeric on purpose: an all-digit id prefix would parse as an
+	// issue number in guardPlanTicketReference and fail the plan upload.
+	ref := "issue:run-" + r.ID.String()[:8]
 	r.TriggerRef = &ref
 	if p != nil {
 		st := f.rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)

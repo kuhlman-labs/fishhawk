@@ -245,6 +245,11 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/repos/{owner}/{name}/delegation/confirmation", s.handleGetDelegationConfirmation)
 	mux.HandleFunc("POST /v0/repos/{owner}/{name}/delegation/confirm", s.handleDelegationConfirm)
 	mux.HandleFunc("POST /v0/repos/{owner}/{name}/delegation/lower", s.handleDelegationLower)
+	// Per-base merge-queue read (ADR-093 slice 1, E87.4 / #4295): scoped to
+	// the caller's account; run-bound tokens refused, read:audit required, and
+	// the repo-visibility point-read DENY inside the handler
+	// (merge_queue_read.go).
+	mux.HandleFunc("GET /v0/repos/{owner}/{name}/merge-queue", s.handleGetMergeQueue)
 	mux.HandleFunc("GET /v0/acceptance-triage/stats", s.handleGetAcceptanceTriageStats)
 	// Dev-only seeded-fixture surface (E72.2 / #3326): registered ONLY
 	// when a DevFixtures applier is configured, so a production server

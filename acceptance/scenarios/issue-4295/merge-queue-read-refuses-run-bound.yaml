@@ -1,0 +1,13 @@
+id: scenario:issue-4295/merge-queue-read-refuses-run-bound
+statement: A run-bound (mcp:run:*) token calling the per-base merge-queue read is refused with 403 run_token_forbidden. The list names other runs' ids and queue state, the same cross-run data class ADR-106 (#4575) withholds from run-bound readers. An operator token reads it.
+steps: 'Seeded plan-gate-parked and minted a run-bound fhm_ token: POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over ''{}'', POST /v0/runs/{run}/mcp-token. GET /v0/repos/kuhlman-labs/fishhawk/merge-queue?base_ref=main with Bearer <fhm_>, and the same GET without a token.'
+assertions:
+    expected: 403 run_token_forbidden for a run-bound token.
+    observed_at_record: 403 {"error":{"code":"run_token_forbidden","message":"a run-bound agent token may not read the merge queue; it names other runs and their heads"}}. Anonymous -> 401. The operator-reads half could not be exercised (no operator token in the sandbox).
+    repro_handle: 'curl -H ''Authorization: Bearer <fhm_>'' localhost:8090/v0/repos/kuhlman-labs/fishhawk/merge-queue?base_ref=main'
+origin:
+    issue: 4295
+    pr: 0
+    run_id: b47c6e59-8859-4496-ad77-4c7cbf08fdd0
+    head_sha: 32d8318e24c6d4b190c35ec32b8ae8c7c9f57ef7
+    recorded_at: 2026-10-21T11:46:04Z

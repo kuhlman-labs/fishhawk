@@ -67,6 +67,24 @@ type mergeRunResponse struct {
 	MergeObservationRecorded bool   `json:"merge_observation_recorded,omitempty"`
 	RunState                 string `json:"run_state,omitempty"`
 	Message                  string `json:"message,omitempty"`
+
+	// ADR-093 slice 1 (E87.4 / #4295) widens it ADDITIVELY for the 202
+	// queued answer of the merge-queue enqueue arm (mergeQueueEnqueueArm);
+	// every field is zero-valued (omitted) on the 200 paths, and merge_queued
+	// stays false when queued is true. queue_position is the 1-based place
+	// among the base's held entries (omitted for a live entry);
+	// intent_sequence is the merge_queue_entered row's chain sequence;
+	// already_queued is true when the entry already carried merge intent, so
+	// nothing was written.
+	Queued          bool   `json:"queued,omitempty"`
+	QueueState      string `json:"queue_state,omitempty"`
+	QueuePosition   int    `json:"queue_position,omitempty"`
+	LiveRunID       string `json:"live_run_id,omitempty"`
+	EntryID         string `json:"entry_id,omitempty"`
+	BaseRef         string `json:"base_ref,omitempty"`
+	AnchoredHeadSHA string `json:"anchored_head_sha,omitempty"`
+	IntentSequence  int64  `json:"intent_sequence,omitempty"`
+	AlreadyQueued   bool   `json:"already_queued,omitempty"`
 }
 
 // handleMergeRun implements POST /v0/runs/{run_id}/merge (E48.7 / #1954): the
@@ -133,6 +151,11 @@ type mergeRunResponse struct {
 //     mergeCandidateGate for the determinability ladder. Inside it, BEFORE the
 //     behind check, 409 merge_candidate_held (ADR-092 / #4200) when the run's
 //     pass is HELD in its base's queue (fail-open on a queue read error).
+//     With the queue wired, a merge_base_behind / merge_candidate_unverified
+//     / merge_candidate_held refusal of a MERGE-QUEUE ELIGIBLE run becomes a
+//     202 queued answer instead (ADR-093 slice 1, mergeQueueEnqueueArm); an
+//     ineligible run keeps the 409 with an additive merge_queue_ineligible
+//     detail and nothing written.
 //   - 409 approval_dismissed (#4086), AFTER the merge-candidate gate and
 //     BEFORE the verdict append: GitHub reports mergeable_state=="blocked", no
 //     reviewer's latest review is APPROVED and one is DISMISSED, so the queued
@@ -388,6 +411,20 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// every anchor resolved (D7); see mergeCandidateGate.
 	gate := s.mergeCandidateGate(r.Context(), runRow)
 	if !gate.admits() {
+		// ADR-093 slice 1 (E87.4 / #4295): an ELIGIBLE run the gate refuses
+		// as behind / unverified / held is ENQUEUED (202 queued) instead; an
+		// ineligible one keeps today's refusal, plus the reason codes, with
+		// nothing written.
+		handled, ineligible := s.mergeQueueEnqueueArm(w, r, runRow, prURL, verdict, id.Subject, gate)
+		if handled {
+			return
+		}
+		if ineligible != nil {
+			if gate.Details == nil {
+				gate.Details = map[string]any{}
+			}
+			gate.Details["merge_queue_ineligible"] = ineligible
+		}
 		s.writeMergeCandidateRefusal(w, r, runID, prURL, gate)
 		return
 	}
@@ -740,6 +777,12 @@ type mergeCandidateGateResult struct {
 	// cannot resolve a conflict-resolution, base-advance or vouched head; an
 	// empty value keeps the findHeadSHA resolution.
 	HeadSHA string
+	// prHeadSHA / prBaseRef are the live PR head and base ref the gate read,
+	// set on the merge_base_behind, merge_candidate_unverified and
+	// merge_candidate_held refusals: the ADR-093 merge-queue enqueue arm
+	// anchors its entry to them (E87.4 / #4295).
+	prHeadSHA string
+	prBaseRef string
 }
 
 func (g mergeCandidateGateResult) admits() bool { return g.Code == "" }
@@ -832,6 +875,7 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 	// its admission auto-advances it, so merge_base_behind would name the
 	// wrong verb. A live entry falls through to today's checks.
 	if held := s.mergeCandidateHeldRefusal(ctx, runRow, headSHA, baseRef); held != nil {
+		held.prHeadSHA, held.prBaseRef = headSHA, baseRef
 		return *held
 	}
 
@@ -850,6 +894,7 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 				"behind_by": len(behind),
 				"next_step": "fishhawk_rebase_run_branch",
 			},
+			prHeadSHA: headSHA, prBaseRef: baseRef,
 		}
 	}
 
@@ -870,6 +915,7 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 				"stage_id":     st.StageID.String(),
 				"next_step":    "fishhawk_await_stage",
 			},
+			prHeadSHA: headSHA, prBaseRef: baseRef,
 		}
 	case mergeCandidateStateUnverified:
 		return mergeCandidateGateResult{
@@ -882,6 +928,7 @@ func (s *Server) mergeCandidateGate(ctx context.Context, runRow *run.Run) mergeC
 				"verify_state": st.State,
 				"next_step":    "fishhawk_rebase_run_branch",
 			},
+			prHeadSHA: headSHA, prBaseRef: baseRef,
 		}
 	case mergeCandidateStateFailed:
 		return mergeCandidateGateResult{
@@ -1130,4 +1177,304 @@ func (s *Server) writeAlreadyMergedResponse(w http.ResponseWriter, r *http.Reque
 		RunState:                 runState,
 		Message:                  msg,
 	})
+}
+
+// CategoryMergeQueueEntered is the chained audit row the ADR-093 merge-queue
+// enqueue arm appends when an operator's merge_run records merge intent on a
+// queue entry (E87.4 / #4295). It carries the operator's verdict prose (no
+// merge_verdict_recorded row is written on the queued path: nothing merged
+// yet), which ADR-093 slice 2's merge-on-pass reads. INTERNAL: registered in
+// audit/categories.go, not an issue-comment surface.
+const CategoryMergeQueueEntered = "merge_queue_entered"
+
+// mergeQueueEnqueueArm is the ADR-093 slice 1 enqueue arm of POST
+// /v0/runs/{id}/merge (D2). It runs only when the queue is wired and the
+// merge-candidate gate refused with merge_base_behind,
+// merge_candidate_unverified (verify state unverified, or in_flight for a run
+// that already has an active queue entry) or merge_candidate_held — never
+// merge_candidate_verify_failed or merge_candidate_check_failed: enqueueing is
+// never a way around a red or unreadable gate.
+//
+// It returns handled=true when it wrote the response. handled=false leaves
+// the caller to render today's refusal; ineligible is then the eligibility
+// reason codes (nil when the arm did not evaluate eligibility), rendered as
+// the additive merge_queue_ineligible detail. An ineligible or undeterminable
+// run writes NOTHING: no store row, no audit row.
+//
+// An eligible run is enqueued RECORD-BEFORE-COMMIT (approval condition C3):
+// the merge_queue_entered row is appended FIRST, and only then is the entry
+// created (Enqueue with MergeIntent) or its intent marked (MarkMergeIntent).
+// A failed append answers 503 merge_queue_unrecorded with no entry and no
+// merge_intent_at, and a retry appends again. The ordering, not the store's
+// in-transaction RecordIntent callback, is the guarantee: the chained append
+// locks the runs row FOR UPDATE on its own connection, while Enqueue's insert
+// holds a FOR KEY SHARE lock on that row through its foreign key, so the
+// callback would wait on its own transaction. The residual of the ordering:
+// an append whose store write then fails leaves a merge_queue_entered row
+// with no entry (503 merge_queue_write_failed; a retry records again).
+//
+// The intent decision (re-read the entry, append, write, read back) runs
+// under the run's merge-intent lock (mergequeue.Store.WithMergeIntentLock,
+// recordMergeQueueIntent), so overlapping merges of one run take turns: the
+// second sees the first's committed intent and answers already_queued with
+// the SAME intent_sequence, and one intent transition gets exactly one
+// merge_queue_entered row. A lock that cannot be taken (a canceled request,
+// a pool error) fails closed to today's refusal with nothing written; a lock
+// that lapsed while the decision ran (ErrIntentLockLapsed) turns its 202
+// into a retryable 503 merge_queue_write_failed.
+//
+// The base is pumped DETACHED (approval condition C6), on a bounded
+// mergeCandidateAdmissionContext tracked by bgMergeQueuePump, so the 202 never
+// waits on an admission's auto-advance or pass start; it answers from the
+// store state read right after the write.
+func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, runRow *run.Run,
+	prURL, verdict, subject string, gate mergeCandidateGateResult) (bool, []string) {
+	if s.cfg.MergeQueue == nil {
+		return false, nil
+	}
+	switch gate.Code {
+	case mergeCodeBaseBehind, mergeCodeCandidateHeld, mergeCodeCandidateUnverified:
+	default:
+		return false, nil
+	}
+	if gate.prHeadSHA == "" || gate.prBaseRef == "" {
+		return false, nil
+	}
+	ctx := r.Context()
+	runID := runRow.ID
+	// A routing read only (the in-flight skip below): the intent decision
+	// re-reads the entry under the run's merge-intent lock.
+	_, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	if err != nil {
+		// Fail closed: an unreadable queue never enqueues; today's refusal.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: merge-queue entry unreadable; not enqueueing (fail closed)",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return false, nil
+	}
+	if gate.Code == mergeCodeCandidateUnverified && gate.Details["verify_state"] == mergeCandidateStateInFlight && !found {
+		// An in-flight pass the queue does not own (e.g. fan_in): today's
+		// refusal, which names the stage to await.
+		return false, nil
+	}
+
+	elig := s.mergeQueueEligibility(ctx, runRow, gate.prHeadSHA)
+	if !elig.Eligible {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: run is not merge-queue eligible; refusing without enqueueing",
+			slog.String("run_id", runID.String()), slog.String("gate_code", gate.Code),
+			slog.Bool("undeterminable", elig.Undeterminable),
+			slog.String("reasons", strings.Join(elig.codes(), ",")))
+		return false, elig.codes()
+	}
+
+	if subject == "" {
+		subject = "anonymous"
+	}
+	var (
+		res          *mergeQueueIntent
+		handled, ran bool
+	)
+	if lerr := s.cfg.MergeQueue.WithMergeIntentLock(ctx, runID, func() error {
+		ran = true
+		res, handled = s.recordMergeQueueIntent(w, r, runRow, prURL, verdict, subject, gate)
+		return nil
+	}); lerr != nil {
+		if !ran {
+			// Fail closed: no lock, no decision; nothing was written. Today's refusal.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"merge: merge-intent lock unavailable; not enqueueing (fail closed)",
+				slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
+			return false, nil
+		}
+		// The decision ran but its exclusion may have lapsed mid-way
+		// (mergequeue.ErrIntentLockLapsed): never a 202 a concurrent merge
+		// may contradict. A decision that already wrote its own response
+		// keeps it.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: merge-intent lock lapsed during the intent decision",
+			slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
+		if res != nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_write_failed",
+				"the merge-intent lock lapsed before the merge intent decision finished, so this answer cannot vouch for the queue state; read fishhawk_get_run_status, then re-invoke the merge (an entry that already carries the intent answers already_queued).",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return true, nil
+		}
+	}
+	if res == nil {
+		return handled, nil
+	}
+	st, intentSeq, alreadyQueued := res.status, res.intentSeq, res.alreadyQueued
+	s.pumpMergeCandidateQueueDetached(ctx, st.Entry.Base())
+
+	resp := mergeRunResponse{
+		RunID:           runID.String(),
+		PRURL:           prURL,
+		Queued:          true,
+		QueueState:      string(st.Entry.State),
+		QueuePosition:   st.Position,
+		EntryID:         st.Entry.ID.String(),
+		BaseRef:         st.Entry.BaseRef,
+		AnchoredHeadSHA: st.Entry.AnchoredHeadSHA,
+		IntentSequence:  intentSeq,
+		AlreadyQueued:   alreadyQueued,
+	}
+	holder := "no run yet (the next queue event admits it)"
+	if st.LiveRunID != nil {
+		resp.LiveRunID = st.LiveRunID.String()
+		holder = "run " + resp.LiveRunID
+	}
+	if st.Entry.State == mergequeue.StateLive {
+		resp.Message = fmt.Sprintf("the run is merge-queue eligible and holds the %s line (ADR-093 D2, gate %s); its merge-candidate pass runs there. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status, then re-invoke the merge once the pass is green. Nothing merged yet; no merge verdict was recorded.",
+			st.Entry.BaseRef, gate.Code)
+	} else {
+		resp.Message = fmt.Sprintf("the run is merge-queue eligible and was queued at position %d on %s behind %s (ADR-093 D2, gate %s). Admission is automatic: the queue advances the branch, re-anchors and starts its pass. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status, then re-invoke the merge once the pass is green. Nothing merged yet; no merge verdict was recorded.",
+			st.Position, st.Entry.BaseRef, holder, gate.Code)
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: run enqueued in the merge queue",
+		slog.String("run_id", runID.String()), slog.String("gate_code", gate.Code),
+		slog.String("queue_state", resp.QueueState), slog.Int("queue_position", resp.QueuePosition),
+		slog.Bool("already_queued", alreadyQueued))
+	s.writeJSON(w, r, http.StatusAccepted, resp)
+	return true, nil
+}
+
+// mergeQueueIntent is recordMergeQueueIntent's verdict: the entry read back
+// after the write, the merge_queue_entered row's chain sequence, and whether
+// the entry already carried the intent (nothing appended or written).
+type mergeQueueIntent struct {
+	status        mergequeue.Status
+	intentSeq     int64
+	alreadyQueued bool
+}
+
+// recordMergeQueueIntent is the intent decision of mergeQueueEnqueueArm: it
+// runs ONLY under the run's merge-intent lock (Store.WithMergeIntentLock), so
+// two overlapping merges of one run take it in turn and the second sees the
+// first's committed intent — exactly one merge_queue_entered row per intent
+// transition, and both answers name it. It reads the entry itself: a read
+// taken before the lock may predate a concurrent intent.
+//
+// A non-nil result is the enqueued state. A nil result with handled=true
+// means an error response was written; with handled=false the caller renders
+// today's refusal (the entry was unreadable; nothing was written).
+func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, runRow *run.Run,
+	prURL, verdict, subject string, gate mergeCandidateGateResult) (*mergeQueueIntent, bool) {
+	ctx := r.Context()
+	runID := runRow.ID
+	prior, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge: merge-queue entry unreadable under the intent lock; not enqueueing (fail closed)",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		return nil, false
+	}
+	sameBase := found && prior.Entry.BaseRef == gate.prBaseRef
+	alreadyQueued := sameBase && prior.Entry.MergeIntentAt != nil
+	var intentSeq int64
+	if alreadyQueued {
+		if rows, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeQueueEntered); lerr == nil {
+			intentSeq = mergeIntentRowSequence(rows, prior.Entry.BaseRef)
+		}
+	} else {
+		fields := map[string]any{
+			"run_id":            runID.String(),
+			"repo":              runRow.Repo,
+			"base_ref":          gate.prBaseRef,
+			"anchored_head_sha": gate.prHeadSHA,
+			"gate_code":         gate.Code,
+			"verdict":           verdict,
+			"pr_url":            prURL,
+			"delegated":         false,
+		}
+		if sameBase {
+			fields["entry_id"] = prior.Entry.ID.String()
+			fields["queue_state"] = string(prior.Entry.State)
+			fields["queue_position"] = prior.Position
+		}
+		payload, _ := json.Marshal(fields)
+		actorKind := audit.ActorUser
+		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+			RunID:        runID,
+			Timestamp:    time.Now().UTC(),
+			Category:     CategoryMergeQueueEntered,
+			ActorKind:    &actorKind,
+			ActorSubject: &subject,
+			Payload:      payload,
+		})
+		if aerr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge: append merge_queue_entered failed; not enqueueing",
+				slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_unrecorded",
+				"the merge intent could not be recorded on the audit chain, so the run was NOT enqueued (record before commit). Nothing was written to the queue; re-invoke the merge to retry.",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return nil, true
+		}
+		intentSeq = entry.Sequence
+
+		var werr error
+		if sameBase {
+			_, werr = s.cfg.MergeQueue.MarkMergeIntent(ctx, prior.Entry.ID, nil)
+		} else {
+			var res mergequeue.EnqueueResult
+			res, werr = s.cfg.MergeQueue.Enqueue(ctx, mergequeue.EnqueueRequest{
+				RunID: runID, BaseRef: gate.prBaseRef, HeadSHA: gate.prHeadSHA, MergeIntent: true,
+			})
+			if werr == nil {
+				if res.Dropped != nil {
+					s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueSettled, *res.Dropped, nil)
+					if res.Dropped.State == mergequeue.StateLive {
+						s.pumpMergeCandidateQueueDetached(ctx, res.Dropped.Base())
+					}
+				}
+				switch res.Outcome {
+				case mergequeue.EnqueueInserted, mergequeue.EnqueueBaseChanged:
+					s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueHeld, res.Entry, nil)
+				case mergequeue.EnqueueReanchored:
+					if res.AnchorChanged {
+						s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueReanchored, res.Entry, nil)
+					}
+				}
+			}
+		}
+		if werr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge: merge-queue write failed after merge_queue_entered was recorded",
+				slog.String("run_id", runID.String()), slog.String("error", werr.Error()))
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_write_failed",
+				"the merge intent was recorded but the merge queue could not be written, so the run is NOT queued; re-invoke the merge to retry.",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return nil, true
+		}
+	}
+
+	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	if err != nil || !found {
+		why := "the entry left the queue"
+		if err != nil {
+			why = err.Error()
+		}
+		s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_write_failed",
+			"the merge queue entry could not be read back ("+why+"); read fishhawk_get_run_status, then re-invoke the merge to retry.",
+			map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+		return nil, true
+	}
+	return &mergeQueueIntent{status: st, intentSeq: intentSeq, alreadyQueued: alreadyQueued}, true
+}
+
+// mergeIntentRowSequence is the chain sequence of the merge_queue_entered row
+// that recorded an active entry's intent on baseRef: the NEWEST row naming
+// that base (0 when none). Rows are appended only under the run's
+// merge-intent lock and only while the entry carries no intent, so a row
+// orphaned by a failed queue write is always older than the row that
+// recorded the intent; an orphan of a failed base change names another base
+// and is skipped.
+func mergeIntentRowSequence(rows []*audit.Entry, baseRef string) int64 {
+	for i := len(rows) - 1; i >= 0; i-- {
+		var p struct {
+			BaseRef string `json:"base_ref"`
+		}
+		if json.Unmarshal(rows[i].Payload, &p) == nil && p.BaseRef == baseRef {
+			return rows[i].Sequence
+		}
+	}
+	return 0
 }

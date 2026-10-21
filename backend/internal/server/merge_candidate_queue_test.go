@@ -20,6 +20,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
@@ -65,7 +66,19 @@ type mcqGitHub struct {
 	// and, when it returns a sha, makes that the merge commit for the base —
 	// the e2e transfer tests create a real `git merge --no-ff` commit here.
 	mergeFn func(base string) string
+	// reviews / reviewsStatus serve GET /pulls/{n}/reviews (ADR-093 slice 1
+	// eligibility, E87.4 / #4295): a raw JSON array per PR (default `[]`),
+	// or a status. checks / checksStatus serve GET /commits/{ref}/check-runs:
+	// a raw JSON check_runs array per ref (default one green "ci" run), or a
+	// status.
+	reviews       map[int]string
+	reviewsStatus map[int]int
+	checks        map[string]string
+	checksStatus  map[string]int
 }
+
+// mcqGreenChecks is the default check-runs listing: one completed, green run.
+const mcqGreenChecks = `[{"id":1,"name":"ci","status":"completed","conclusion":"success","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
 
 func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 	t.Helper()
@@ -141,6 +154,38 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"sha":"` + sha + `"}`))
 	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}/reviews", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("number"))
+		g.mu.Lock()
+		status, body := g.reviewsStatus[n], g.reviews[n]
+		g.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		if body == "" {
+			body = "[]"
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(body))
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/commits/{ref}/check-runs", func(w http.ResponseWriter, r *http.Request) {
+		ref := r.PathValue("ref")
+		g.mu.Lock()
+		status, body := g.checksStatus[ref], g.checks[ref]
+		g.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		if body == "" {
+			body = mcqGreenChecks
+		}
+		var runs []json.RawMessage
+		_ = json.Unmarshal([]byte(body), &runs)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"total_count":%d,"check_runs":%s}`, len(runs), body)
+	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
 	return &githubclient.Client{
@@ -196,7 +241,8 @@ func newMCQFixture(t *testing.T) *mcqFixture {
 		audit: audit.NewPostgresRepository(pool),
 		store: mergequeue.NewPostgresStore(pool),
 		gh: &mcqGitHub{prs: map[int]*mcqPR{}, behind: map[string][]string{},
-			compareStatus: map[string]int{}, mergeSHA: map[string]string{}, mergeStatus: map[string]int{}},
+			compareStatus: map[string]int{}, mergeSHA: map[string]string{}, mergeStatus: map[string]int{},
+			reviews: map[int]string{}, reviewsStatus: map[int]int{}, checks: map[string]string{}, checksStatus: map[string]int{}},
 	}
 	f.srv = New(Config{
 		Addr:        "127.0.0.1:0",
@@ -205,6 +251,8 @@ func newMCQFixture(t *testing.T) *mcqFixture {
 		GitHub:      f.gh.client(t),
 		MergeQueue:  f.store,
 		Concurrency: concurrency.NewPostgresStore(pool),
+		// ADR-093 slice 1: eligibility leg (d) reads open concerns.
+		ConcernRepo: concern.NewPostgresRepository(pool),
 	})
 	f.srv.postMergeHeadReadBackoff = testPostMergeHeadReadBackoff()
 	return f
@@ -535,13 +583,17 @@ func TestMergeCandidateQueue_HandOffWhileReviewHeld(t *testing.T) {
 	gated := []byte(strings.Replace(mcvUndelegatedSpecYAML,
 		"        produces:\n          - artifact: pull_request\n",
 		"        reviewers:\n          agent: 1\n          human: 0\n        produces:\n          - artifact: pull_request\n", 1))
-	a := f.seed("a", "a0", gated)
+	// A takes the line merge-queue ELIGIBLE (ADR-093 slice 1: a configured
+	// agent reviewer with no terminal review would answer not_queued), then
+	// its cached spec gains the agent reviewer so the ADR-036 gate holds.
+	a := f.seed("a", "a0", spec)
 	b := f.seed("b", "b0", spec)
 	f.behind(a, "a0", "a1")
 	f.behind(b, "b0", "b1")
 	f.rebase(a)
 	f.rebase(b)
 	f.requireState(b, mergequeue.StateHeld, "")
+	f.exec(`UPDATE runs SET workflow_spec = $1 WHERE id = $2`, gated, a.id)
 	kind, subj := audit.ActorSystem, "reviewer"
 	if _, err := f.audit.AppendChained(context.Background(), audit.ChainAppendParams{
 		RunID: a.id, Timestamp: time.Now().UTC(), Category: "implement_review_started",
@@ -1022,6 +1074,8 @@ type mcqFaultStore struct {
 	settle       func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
 	activeForRun func(uuid.UUID) (mergequeue.Status, bool, error)
 	activeBases  func() ([]mergequeue.Base, error)
+	markIntent   func(uuid.UUID) (mergequeue.MergeIntentResult, error)
+	intentLock   func(fn func() error) error
 }
 
 // mcqCall is one recorded store call: the method, the id it named (the entry
@@ -1146,6 +1200,27 @@ func (s *mcqFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, err
 		return s.activeBases()
 	}
 	return s.Store.ActiveBases(ctx)
+}
+
+func (s *mcqFaultStore) MarkMergeIntent(ctx context.Context, id uuid.UUID, record mergequeue.RecordIntentFunc) (mergequeue.MergeIntentResult, error) {
+	s.record(ctx, "MarkMergeIntent", id)
+	if s.markIntent != nil {
+		return s.markIntent(id)
+	}
+	return s.Store.MarkMergeIntent(ctx, id, record)
+}
+
+// WithMergeIntentLock delegates to the wrapped store's lock; a pure fake (nil
+// Store) has no second process to exclude, so it just runs fn.
+func (s *mcqFaultStore) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error {
+	s.record(ctx, "WithMergeIntentLock", runID)
+	if s.intentLock != nil {
+		return s.intentLock(fn)
+	}
+	if s.Store == nil {
+		return fn()
+	}
+	return s.Store.WithMergeIntentLock(ctx, runID, fn)
 }
 
 var errMCQStore = fmt.Errorf("queue store unavailable")
@@ -2506,4 +2581,100 @@ func TestMergeCandidateQueue_ConflictResolutionReopenReleasesTheLine(t *testing.
 	if n := len(f.triggers(b)); n != 1 {
 		t.Fatalf("B triggers = %d, want 1", n)
 	}
+}
+
+// ADR-093 slice 1 (E87.4 / #4295): eligibility decides QUEUE ADMISSION.
+
+// TestMergeCandidateQueue_UnapprovedRebaseDoesNotTakeLineApprovedBehindDoes:
+// A (unapproved) and B (approved by a listed member) are both behind on one
+// base and otherwise identical. A's rebase-path serialize answers not_queued
+// and writes no entry; B's is admitted live.
+func TestMergeCandidateQueue_UnapprovedRebaseDoesNotTakeLineApprovedBehindDoes(t *testing.T) {
+	f := newMCQFixture(t)
+	a := f.seed("a", "a0", []byte(mqeSpecYAML))
+	b := f.seed("b", "b0", []byte(mqeSpecYAML))
+	f.behind(a, "a0", "a1")
+	f.behind(b, "b0", "b1")
+	f.gh.set(func() { f.gh.reviews[b.pr] = mqeApprovedBy("alice") })
+
+	resp := f.rebase(a)
+	if resp.MergeCandidateVerifyState != mergeCandidateStateNotQueued || resp.MergeCandidateVerifyTriggered ||
+		!strings.Contains(resp.MergeCandidateVerifyNote, mergeQueueReasonNotApproved) ||
+		!strings.Contains(resp.MergeCandidateVerifyNote, "fishhawk_merge_run") {
+		t.Fatalf("A rebase = state %q triggered=%v note %q, want not_queued naming not_approved and fishhawk_merge_run",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+	}
+	if es := f.entries(a); len(es) != 0 {
+		t.Fatalf("A queue entries = %d, want 0", len(es))
+	}
+	if st := f.stageState(a.impl.ID); st != run.StageStateSucceeded {
+		t.Fatalf("A implement = %s, want succeeded (no re-open on not_queued)", st)
+	}
+	if resp := f.rebase(b); resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+		t.Fatalf("B rebase = state %q triggered=%v, want in_flight", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+	f.requireState(b, mergequeue.StateLive, "")
+}
+
+// enqueueDirect seeds a HELD entry through the store, bypassing every enqueue
+// control.
+func (f *mcqFixture) enqueueDirect(r *mcqRun, head string) {
+	f.t.Helper()
+	if _, err := f.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{RunID: r.id, BaseRef: mcqBase, HeadSHA: head}); err != nil {
+		f.t.Fatalf("enqueue: %v", err)
+	}
+}
+
+// TestMergeCandidateQueue_AdmissionDropsIneligibleHeldEntry: A (unapproved)
+// and B (approved) are seeded HELD directly, A at the head of line. One pump
+// drops A not_merge_eligible and admits B.
+func TestMergeCandidateQueue_AdmissionDropsIneligibleHeldEntry(t *testing.T) {
+	f := newMCQFixture(t)
+	a := f.seed("a", "a0", []byte(mqeSpecYAML))
+	b := f.seed("b", "b0", []byte(mqeSpecYAML))
+	f.gh.set(func() { f.gh.reviews[b.pr] = mqeApprovedBy("alice") })
+	f.enqueueDirect(a, "a0")
+	f.enqueueDirect(b, "b0")
+	f.srv.PumpMergeCandidateQueues(context.Background())
+	f.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible)
+	if n := len(f.rows(a, CategoryMergeCandidateQueueSettled)); n != 1 {
+		t.Fatalf("A settled rows = %d, want 1", n)
+	}
+	f.requireState(b, mergequeue.StateLive, "")
+}
+
+// TestMergeCandidateQueue_AdmissionUndeterminableUnadmits: an unreadable
+// reviews listing returns the head of line to held at its place.
+func TestMergeCandidateQueue_AdmissionUndeterminableUnadmits(t *testing.T) {
+	f := newMCQFixture(t)
+	a := f.seed("a", "a0", []byte(mqeSpecYAML))
+	b := f.seed("b", "b0", []byte(mqeSpecYAML))
+	f.gh.set(func() {
+		f.gh.reviewsStatus[a.pr] = http.StatusInternalServerError
+		f.gh.reviews[b.pr] = mqeApprovedBy("alice")
+	})
+	f.enqueueDirect(a, "a0")
+	f.enqueueDirect(b, "b0")
+	f.srv.PumpMergeCandidateQueues(context.Background())
+	f.requireState(a, mergequeue.StateHeld, "")
+	f.requireState(b, mergequeue.StateHeld, "")
+	st, found, err := f.store.ActiveForRun(context.Background(), a.id)
+	if err != nil || !found || st.Position != 1 {
+		t.Fatalf("A status = %+v found=%v err=%v, want held at position 1", st, found, err)
+	}
+}
+
+// TestMergeCandidateQueue_LiveEntryNotReevaluated: a live entry whose
+// approval is dismissed afterwards keeps the line (slice 1 re-evaluates only
+// at admission).
+func TestMergeCandidateQueue_LiveEntryNotReevaluated(t *testing.T) {
+	f := newMCQFixture(t)
+	a := f.seed("a", "a0", []byte(mqeSpecYAML))
+	f.gh.set(func() { f.gh.reviews[a.pr] = mqeApprovedBy("alice") })
+	f.enqueueDirect(a, "a0")
+	f.srv.PumpMergeCandidateQueues(context.Background())
+	f.requireState(a, mergequeue.StateLive, "")
+	f.gh.set(func() { f.gh.reviews[a.pr] = `[]` })
+	f.srv.PumpMergeCandidateQueues(context.Background())
+	f.requireState(a, mergequeue.StateLive, "")
 }

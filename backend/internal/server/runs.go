@@ -447,6 +447,12 @@ type runMergeCandidateQueuePayload struct {
 	EjectReason string `json:"eject_reason,omitempty"`
 	// Note is a constant-shape sentence naming what happens next.
 	Note string `json:"note"`
+	// MergeIntent is whether the operator's merge_run recorded merge intent
+	// on the entry (ADR-093 D2, E87.4 / #4295): false for an entry the
+	// ADR-092 rebase path enqueued. Always on the wire; MergeIntentAt is when
+	// it was recorded, omitted without intent.
+	MergeIntent   bool       `json:"merge_intent"`
+	MergeIntentAt *time.Time `json:"merge_intent_at,omitempty"`
 }
 
 // mergeCandidateQueuePayloadFor projects the run's active queue entry, or
@@ -469,6 +475,8 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 		EnqueuedAt:      e.EnqueuedAt,
 		AdmittedAt:      e.AdmittedAt,
 		EjectReason:     e.EjectReason,
+		MergeIntent:     e.MergeIntentAt != nil,
+		MergeIntentAt:   e.MergeIntentAt,
 	}
 	if st.LiveRunID != nil {
 		out.LiveRunID = st.LiveRunID.String()

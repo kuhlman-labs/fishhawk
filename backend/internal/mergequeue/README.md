@@ -4,7 +4,10 @@ Persisted held-pass queue for ADR-092 D1 (#4200, `docs/adr/092-serialize-merge-c
 At most ONE merge-candidate verify pass is live per `(repository, base ref)`
 inside one account. Every other eligible pass is held FIFO by eligibility time
 and consumes no runner slot. Table: `merge_candidate_queue_entries`
-(migration 0101). The SQL is hand-written pgx, with no sqlc (same precedent as
+(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295).
+ADR-093's merge queue (slice 1) reuses these rows, the FIFO order, the
+one-live-per-base rule and the lock order UNCHANGED; it adds only the
+operator's recorded merge intent and the line-turn read below. The SQL is hand-written pgx, with no sqlc (same precedent as
 `backend/internal/concurrency`).
 
 This package is persistence only. It never reads stage, PR or forge state and
@@ -25,6 +28,7 @@ One row per queue EPISODE of a run.
 | `anchored_head_sha` / `anchored_base_sha` / `anchored_at` | The head the pass is bound to, the base tip it was produced against (NULL when unknown), and when. |
 | `admitted_at` | Set by `AdmitNext`; required while `live` (DB CHECK). |
 | `settled_at` | Set exactly when the row is terminal (DB CHECK). |
+| `merge_intent_at` | The operator's merge intent on this episode (0107, ADR-093 D2): NULL = none (every ADR-092 rebase/base-advance entry and every pre-0107 row). Stamped once from the database clock by `Enqueue{MergeIntent}` or `MarkMergeIntent`, never cleared; a terminal row keeps it as history, and a re-entry after a terminal row starts a FRESH row without it. |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE
@@ -40,9 +44,15 @@ SQL), `ErrNotFound` (unknown run or entry; wraps `run.ErrNotFound`), and
 Repo, BaseRef}` takes `AccountID` in `run.Run.AccountID`'s shape (`""` =
 untenanted); a non-UUID account is `ErrInvalidRequest`.
 
-- **`Enqueue(EnqueueRequest{RunID, BaseRef, HeadSHA, BaseSHA})`**. `RunID`,
+- **`Enqueue(EnqueueRequest{RunID, BaseRef, HeadSHA, BaseSHA, MergeIntent, RecordIntent})`**. `RunID`,
   `BaseRef`, `HeadSHA` are required. Repository and account come from the run
-  row, never the caller.
+  row, never the caller. Merge intent (`MergeIntent`): an inserted row
+  (`EnqueueInserted`, `EnqueueBaseChanged`) is stamped at its enqueue
+  instant; a same-base active entry is stamped only when its
+  `merge_intent_at` is NULL. `IntentRecorded` reports THIS call moved it
+  NULL → set (false on a repeat, and always false without `MergeIntent`;
+  `MergeIntent=false` never clears an existing intent). A base change carries
+  the intent onto the NEW row only.
   - No active entry (none, or only terminal ones) → a new `held` row at the
     TAIL, `EnqueueInserted`. A run re-entering after a terminal row gets a
     FRESH row at the tail (ADR-093 Q2); the terminal row is untouched.
@@ -77,6 +87,32 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   (`ErrInvalidRequest` otherwise); `reason` required for `ejected`/`dropped`.
   Idempotent: on an already-terminal row it writes nothing and returns
   `Settled=false` with the row's FIRST state and reason.
+- **`MarkMergeIntent(id, record)`** → `MergeIntentResult{Entry,
+  IntentRecorded}`: stamps an ACTIVE entry's `merge_intent_at`
+  (`ErrStateConflict` on terminal, nothing written). Idempotent: an
+  already-set intent writes nothing (`updated_at` unchanged), calls no
+  `record`, and answers `IntentRecorded=false`. For the merge_run arm on a run
+  that already holds a held/live entry.
+- **Record-before-commit (`RecordIntentFunc`)**: `EnqueueRequest.RecordIntent`
+  and `MarkMergeIntent`'s `record` are called INSIDE the call's transaction
+  only when it records intent (`IntentRecorded`), after every write and
+  before commit, with the entry's `Status` (position, live run) read in that
+  transaction. A non-nil error rolls the WHOLE call back — no inserted row,
+  no re-anchor, no `base_changed` drop, no `merge_intent_at` — and the call
+  returns `ErrIntentUnrecorded` wrapping it. Because nothing committed, a
+  retry records again (`IntentRecorded=true`), so a failed audit append is
+  never followed by an unrecorded intent. The callback runs under the call's
+  advisory and row locks and must not call back into the Store
+  (`TestRecordIntent_FailureRollsBackAndRetryRecords`). The server's
+  `merge_queue_entered` row does NOT use this seam: a chained append locks
+  the runs row `FOR UPDATE` and would wait on the insert's own `FOR KEY
+  SHARE`. It appends BEFORE the write instead, under `WithMergeIntentLock`.
+- **`WithMergeIntentLock(runID, fn)`**: runs `fn` while holding the run's
+  merge-intent lock (§ "Merge-intent lock"); returns `fn`'s error as is, the
+  context's error (fn not run) when the wait ends first,
+  `ErrIntentLockLapsed` when `fn` returned nil but the lock could not be
+  confirmed held through its release, and `ErrInvalidRequest` for a nil run
+  id.
 - **`ActiveForRun(runID)`** → `(Status, found, error)`: the run's active entry,
   its 1-based `Position` among the base's held entries (0 when live), and
   `LiveRunID` (the base's live run; the entry's own run when it is live; nil
@@ -86,6 +122,23 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
 - **`ActiveBases()`**: every base with a held or live entry, one per
   `(account, repo, base ref)`, ordered by those fields. Never nil. The
   periodic pump's sweep list; spans every account.
+- **`RecentLineTurns(base, limit)`** → `[]time.Duration`: the line turn
+  (`settled_at − admitted_at`, database clock) of the base's newest `limit`
+  `merged` entries, newest settle first, account-scoped like `ListForBase`
+  (`TestRecentLineTurns_MergedOnlyNewestFirstAccountScoped` seeds a newer
+  merged row in a second account on the same base). Ejected/dropped rows and
+  a merged row never admitted are skipped; `limit < 1` is
+  `ErrInvalidRequest`; never nil. It is the ETA basis of ADR-093's per-base
+  queue read: a line turn spans admission to merge, so until ADR-093 slice 2's
+  merge-on-pass lands it INCLUDES the operator's merge step after a `passed`
+  verdict (a slow merge lengthens every estimate behind it).
+
+Merge intent is written only for a run the server judged queue-eligible
+(`backend/internal/server/README.md`). Known deviation from ADR-093 D6 in
+slice 1: that eligibility requires a LIVE forge approval and approval
+transfer across a clean advance is deferred to slice 2, so in a
+dismiss-stale repository a rebase answers `not_queued` until then. The
+store itself never judges eligibility.
 
 ## Reasons
 
@@ -111,9 +164,10 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   only stay put or be settled by a by-entry mutation; a settled one is treated
   as absent (fresh row), never re-anchored
   (`TestEnqueue_EntrySettledBetweenPeekAndLockGetsFreshRow`).
-- By-entry mutations (`Unadmit`, `SetPhase`, `Reanchor`, `Settle`): read the
-  entry's base → its base lock → the row `FOR UPDATE`. `repo`/`base_ref` never
-  change on a row, so the derived key stays correct.
+- By-entry mutations (`Unadmit`, `SetPhase`, `Reanchor`, `Settle`,
+  `MarkMergeIntent`): read the entry's base → its base lock → the row
+  `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
+  stays correct.
 - `AdmitNext`: the base lock → the live check → the oldest held row.
 
 No path takes a row lock before an advisory lock, and multi-key acquisition is
@@ -121,11 +175,51 @@ ascending, so the order is acyclic. The one-live-per-base guarantee is the
 base lock: `TestAdmitNext_LockSerializesTheLiveCheck` (deterministic, parks an
 admitter between its live check and its held select) and
 `TestAdmitNext_ConcurrentAdmittersAdmitExactlyOne` (8 goroutines) both go RED
-with the lock removed. Reads (`ActiveForRun`, `ListForBase`) are single
-statements without the lock.
+with the lock removed. Reads (`ActiveForRun`, `ListForBase`,
+`RecentLineTurns`, `ActiveBases`) are single statements without the lock.
 
 Every time comparison uses the database clock (`clock_timestamp()`); no Go
 `time.Now()` value is passed into SQL.
+
+### Merge-intent lock
+
+`WithMergeIntentLock` serializes the server's merge-intent decision for one
+run across requests AND processes: read the entry, append
+`merge_queue_entered`, then `Enqueue{MergeIntent}` / `MarkMergeIntent`. The
+append runs on its own connection, so the decision cannot share one
+transaction with the write.
+
+- **Lock.** A SESSION-level `pg_try_advisory_lock` on
+  `sha256("fishhawk:mergequeue-intent:" + run id)`, held on one dedicated
+  pooled connection that runs no transaction while `fn` runs on others (the
+  `run.WithConsolidatedPROpenLock` shape). The session is never idle in a
+  transaction, so a server-side `idle_in_transaction_session_timeout`
+  cannot end it mid-`fn`
+  (`TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout`). The domain
+  is disjoint from the per-run Enqueue key, so `fn`'s own Enqueue never
+  waits on its holder.
+- **Lapse.** After `fn` the lock is released with `pg_advisory_unlock`.
+  When that fails or finds no lock (the session died mid-`fn`, so another
+  holder may have overlapped it), a nil from `fn` becomes
+  `ErrIntentLockLapsed` (`TestWithMergeIntentLock_LapsedSessionSurfaces`).
+  A connection whose lock or unlock query failed is closed before release,
+  so a lock-holding session never returns to the pool.
+- **Connection budget.** A holder keeps one connection for its lock and its
+  `fn` uses at most one more at a time. The store admits at most
+  `intentHolderLimit` concurrent holders: half the pool's `MaxConns`, at
+  least 1 (5 of fishhawkd's 10). Lock holders alone can never occupy every
+  connection, so concurrent merges of DISTINCT runs make progress without
+  any caller timeout
+  (`TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress`: six
+  runs on a 2-connection pool). The bound is per store. A pool of fewer
+  than 2 connections cannot run a holder's `fn`. Other pool users that hold
+  one connection while acquiring another (for example
+  `run.WithConsolidatedPROpenLock`) are outside this bound.
+- **Waiting.** A held lock releases both the holder slot and the connection
+  and re-tries every 25 ms (`mergeIntentLockPoll`), so a waiter holds
+  neither between tries. The wait is bounded only by the caller's context
+  (`TestWithMergeIntentLock_SerializesOneRun`,
+  `TestWithMergeIntentLock_ErrorsAndCancel`).
 
 ## Tenancy
 
