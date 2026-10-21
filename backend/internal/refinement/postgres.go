@@ -13,6 +13,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	refinementdb "github.com/kuhlman-labs/fishhawk/backend/internal/refinement/db"
 )
 
@@ -47,12 +48,16 @@ func filedItemInt32(field string, v, min int) (int32, error) {
 // sqlc-generated queries and a pgxpool connection.
 type postgresRepo struct {
 	pool *pgxpool.Pool
+
+	// locks is the pool-wide pglock holder budget WithFilingLock shares with
+	// every other pglock helper on the pool (#4591).
+	locks *pglock.Budget
 }
 
 // NewPostgresRepository wraps a pgxpool.Pool to satisfy Repository. Caller
 // retains ownership of the pool.
 func NewPostgresRepository(pool *pgxpool.Pool) Repository {
-	return &postgresRepo{pool: pool}
+	return &postgresRepo{pool: pool, locks: pglock.BudgetFor(pool)}
 }
 
 func (r *postgresRepo) CreateDraft(ctx context.Context, p CreateParams) (*StoredDraft, error) {
@@ -235,30 +240,33 @@ func (r *postgresRepo) ListFiledItems(ctx context.Context, draftID uuid.UUID) ([
 	return out, nil
 }
 
-// WithFilingLock acquires a session-level advisory lock keyed on the draft UUID
-// on a dedicated pooled connection, runs fn, then releases the lock and the
-// connection. A concurrent WithFilingLock for the same draft blocks at the lock
-// acquisition until this one releases — the per-draft mutual exclusion that
-// stops two filing invocations from both observing an ordinal as unfiled
-// (ADR-052 concurrent-duplication guard). It is session-level (pg_advisory_lock,
-// the pgtest bootstrap precedent) rather than xact-level so the executor's
-// record-after-file commits stay independent and durable per item; the
-// serialization guarantee is identical.
+// filingLockFnTimeout bounds WithFilingLock's fn (#4591): a ceiling above the
+// server's detached filing budget (refinementFilingBudgetFor) for drafts up to
+// 39 children. A larger draft stops at the ceiling and resumes on re-invoke
+// through the idempotent ledger.
+const filingLockFnTimeout = 30 * time.Minute
+
+// WithFilingLock holds a session-level advisory lock keyed on the draft UUID
+// for fn's whole body, through pglock.WithSessionLock on the pool-wide pglock
+// holder budget (#4591): the per-draft mutual exclusion that stops two filing
+// invocations from both observing an ordinal as unfiled (ADR-052
+// concurrent-duplication guard). It is session-level rather than xact-level so
+// the executor's record-after-file commits stay independent and durable per
+// item.
+//
+// The lock is TRIED, and a held lock re-tries every pglock.Poll holding
+// neither a budget slot nor a connection, so a concurrent call for the same
+// draft waits (bounded by its ctx) and then observes the first's recorded
+// progress. fn runs on a context bounded by filingLockFnTimeout and marked as
+// inside a pglock lock (fn must not take another one: pglock.ErrNestedLock).
+// A panic in fn still unlocks; a failed lock query or unlock closes the
+// connection rather than return a lock-holding session to the pool. When the
+// unlock fails or finds no lock after fn returned nil, the call returns an
+// error wrapping pglock.ErrLockLapsed (the exclusion may have lapsed). fn's
+// own error is returned unchanged.
 func (r *postgresRepo) WithFilingLock(ctx context.Context, draftID uuid.UUID, fn func(context.Context) error) error {
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire filing-lock connection: %w", err)
-	}
-	defer conn.Release()
-	key := advisoryLockKey(draftID)
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
-		return fmt.Errorf("acquire filing advisory lock: %w", err)
-	}
-	// Release on a background context so a cancelled ctx still unlocks. Release
-	// runs before conn.Release() (defer LIFO) so the connection is unlocked
-	// before it returns to the pool.
-	defer func() { _, _ = conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", key) }()
-	return fn(ctx)
+	return pglock.WithSessionLock(ctx, r.pool, r.locks, advisoryLockKey(draftID),
+		pglock.Options{Name: "filing lock", FnTimeout: filingLockFnTimeout}, fn)
 }
 
 // advisoryLockKey derives a stable int64 advisory-lock key from a draft UUID by

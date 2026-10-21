@@ -2,6 +2,8 @@ package run_test
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -11,6 +13,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -200,5 +203,129 @@ func TestPostgres_WithConsolidatedPROpenLock_CancelledWaitDoesNotRunFn(t *testin
 	}
 	if !reacquired.Load() {
 		t.Fatal("re-acquire returned without running fn")
+	}
+}
+
+// newLockPool opens a pool on dbURL closed at test end. Registered after
+// NewURL's drop cleanup, so it closes first (LIFO).
+func newLockPool(t *testing.T, dbURL string) *pgxpool.Pool {
+	t.Helper()
+	p, err := pgxpool.New(context.Background(), dbURL)
+	if err != nil {
+		t.Fatalf("connect pool: %v", err)
+	}
+	t.Cleanup(p.Close)
+	return p
+}
+
+// consolidatedPROpenFnTimeout mirrors run's unexported constant (5m); a
+// change to it must change this pin.
+const consolidatedPROpenFnTimeout = 5 * time.Minute
+
+// TestPostgres_WithConsolidatedPROpenLock_FnCarriesDeadline (#4591): under a
+// deadline-free caller ctx, fn's ctx carries the helper's own fn deadline
+// (consolidatedPROpenFnTimeout) and the pglock nesting marker. Counterfactual:
+// fn on a plain WithCancel of the caller ctx has no deadline, and a 1000x
+// constant lands past the upper bound, RED.
+func TestPostgres_WithConsolidatedPROpenLock_FnCarriesDeadline(t *testing.T) {
+	locker := consolidatedPROpenLocker(t, run.NewPostgresRepository(pgtest.NewPool(t)))
+	start := time.Now()
+	var deadline time.Time
+	var hasDeadline, marked bool
+	if err := locker.WithConsolidatedPROpenLock(context.Background(), uuid.New(), func(fctx context.Context) error {
+		deadline, hasDeadline = fctx.Deadline()
+		marked = pglock.InLock(fctx)
+		return nil
+	}); err != nil {
+		t.Fatalf("WithConsolidatedPROpenLock: %v", err)
+	}
+	if !hasDeadline {
+		t.Fatal("fn's ctx carried no deadline under a deadline-free caller ctx")
+	}
+	slack := timescale.D(5 * time.Second)
+	if lo, hi := start.Add(consolidatedPROpenFnTimeout-slack), time.Now().Add(consolidatedPROpenFnTimeout+slack); deadline.Before(lo) || deadline.After(hi) {
+		t.Fatalf("fn deadline = %s, want within [%s, %s] (consolidatedPROpenFnTimeout = %s)", deadline, lo, hi, consolidatedPROpenFnTimeout)
+	}
+	if !marked {
+		t.Fatal("fn's ctx is not marked as inside a pglock lock, so a nested lock would not be refused")
+	}
+}
+
+// TestPostgres_WithConsolidatedPROpenLock_PanicReleasesLock (#4591): a panic
+// in fn propagates after the unlock. The probe acquires the same run's lock
+// from a SECOND pool (a distinct session: advisory locks are re-entrant per
+// session, so a probe on the first pool could reuse a leaked session).
+// Counterfactual: an inline (not deferred) unlock leaks the lock, so the
+// probe never acquires within its bound, RED.
+func TestPostgres_WithConsolidatedPROpenLock_PanicReleasesLock(t *testing.T) {
+	dbURL := pgtest.NewURL(t)
+	locker := consolidatedPROpenLocker(t, run.NewPostgresRepository(newLockPool(t, dbURL)))
+	probe := consolidatedPROpenLocker(t, run.NewPostgresRepository(newLockPool(t, dbURL)))
+	runID := uuid.New()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("fn's panic did not propagate")
+			}
+		}()
+		_ = locker.WithConsolidatedPROpenLock(context.Background(), runID, func(context.Context) error { panic("boom") })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(2*time.Second))
+	defer cancel()
+	ran := false
+	if err := probe.WithConsolidatedPROpenLock(ctx, runID, func(context.Context) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("separate-session acquire after fn panicked = %v ran=%v, want it to acquire (a leaked lock times out here)", err, ran)
+	}
+}
+
+// killAdvisoryLockSession terminates the one session holding a granted
+// advisory lock in pool's database and waits for it to exit. The test holds
+// exactly one advisory lock in its per-test database, so no key is needed.
+func killAdvisoryLockSession(ctx context.Context, pool *pgxpool.Pool) error {
+	var pid int32
+	if err := pool.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype = 'advisory' AND granted
+  AND database = (SELECT oid FROM pg_database WHERE datname = current_database())`).Scan(&pid); err != nil {
+		return fmt.Errorf("find the lock session: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		return fmt.Errorf("terminate the lock session: %w", err)
+	}
+	deadline := time.Now().Add(timescale.D(5 * time.Second))
+	for time.Now().Before(deadline) {
+		var alive bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, pid).Scan(&alive); err != nil {
+			return err
+		}
+		if !alive {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return errors.New("the lock session never exited")
+}
+
+// TestPostgres_WithConsolidatedPROpenLock_LapsedSessionSurfaces (#4591,
+// lock-lapse-surfaced; #4434's unlock-error branch): the lock session dies
+// mid-fn, so a nil fn returns an error wrapping pglock.ErrLockLapsed instead
+// of a silent nil, and the run's lock is free afterwards. Counterfactual:
+// ignoring the unlock result returns nil, RED.
+func TestPostgres_WithConsolidatedPROpenLock_LapsedSessionSurfaces(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	locker := consolidatedPROpenLocker(t, run.NewPostgresRepository(pool))
+	runID := uuid.New()
+	err := locker.WithConsolidatedPROpenLock(context.Background(), runID, func(fctx context.Context) error {
+		return killAdvisoryLockSession(fctx, pool)
+	})
+	if !errors.Is(err, pglock.ErrLockLapsed) {
+		t.Fatalf("nil fn after its lock session died = %v, want an error wrapping pglock.ErrLockLapsed", err)
+	}
+	if !strings.Contains(err.Error(), "consolidated PR open lock") {
+		t.Errorf("lapse error = %q, want it to name the consolidated PR open lock", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(2*time.Second))
+	defer cancel()
+	ran := false
+	if err := locker.WithConsolidatedPROpenLock(ctx, runID, func(context.Context) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("next holder after the lapse = %v ran=%v, want the lock free", err, ran)
 	}
 }
