@@ -2765,7 +2765,10 @@ settle carries.
   `merge_candidate_queue` block (omitted with no entry, a nil store or a read
   error) and the merge gate's `409 merge_candidate_held` (a HELD run's merge
   is refused before the behind check, naming its position, the live run and
-  that admission is automatic; next step `fishhawk_get_run_status`).
+  that admission is automatic; next step `fishhawk_get_run_status`). With
+  ADR-093 slice 1 that refusal answers only a run that is NOT merge-queue
+  eligible: an eligible held run's merge call records merge intent and
+  answers `202 queued` instead (§ "Merge queue").
   `releaseMergeCandidateQueueOnReopen(ctx, runID, reason, heldToo)` is the
   re-open release below.
 - **Re-open release (#4352).** A run re-opened for agent work, or whose head
@@ -2853,6 +2856,134 @@ settle carries.
   unresolved post-merge head, a re-anchor error, no installation, and a
   pending-replacement trigger-append failure, which TODAY ejects
   `pass_not_startable`).
+
+## Merge queue (ADR-093 slice 1, E87.4 / [#4295](https://github.com/kuhlman-labs/fishhawk/issues/4295))
+
+ADR-093 D1, D2 and D7 on the ADR-092 queue above: the same store rows, FIFO
+order, one-live-per-base rule and lock order, plus the operator's merge
+intent (`merge_intent_at`, migration 0106; `backend/internal/mergequeue`
+README). Merge-on-pass, eject/promote and durability are slices 2-4.
+
+- **Eligibility (`merge_queue_eligibility.go`, D1).** One predicate decides
+  queue ADMISSION, not only the merge. It never writes; every read error is
+  `undeterminable`, which is NOT eligible. Four legs, each on the existing
+  single-source helper: (a) review gate approved — every configured agent
+  implement reviewer has a TERMINAL entry (a pure count, never
+  `checkImplementReviewSettled`, which writes), review coverage complete, and
+  when the review stage declares an approval gate a LIVE forge approval by an
+  `approvals.members` identity (any live approval when members is empty). A
+  spec that was READ and declares no review stage or no approval gate passes;
+  an absent, unreadable or unparseable spec is `undeterminable` (fail
+  closed). (b) acceptance merge-eligible and not stale. (c) required checks
+  green at the PR head, classified by `mergeoutcome.ClassifyMergeCI` against
+  `runs.required_checks_snapshot`; **zero observed check runs is never green
+  — it is `undeterminable`, and a nil snapshot is judged on the observed set
+  only when at least one check run exists.** (d) no open blocking concern: an
+  open concern whose provenance is `concern.ProvenanceFirstOfficer`
+  (`"first_officer"`) or whose severity is `planreview.SeverityHigh`
+  (`"high"`); medium/low stay advisory (ADR-027). No requirement-arbitration
+  concern CATEGORY exists (`requirement_arbitration` is a page event), so the
+  leg matches none. Reason codes: `not_approved`, `review_pending`,
+  `review_coverage_incomplete`, `acceptance_not_eligible`,
+  `acceptance_stale`, `checks_not_green`, `checks_red`,
+  `blocking_concern_open`, `undeterminable`. The ADMISSION variant differs
+  only in leg (c): it refuses an observed RED required check and nothing else
+  (a freshly advanced head is legitimately pending; the verify pass is the
+  gate there).
+- **KNOWN DEVIATION from ADR-093 D6 (accepted at approval).** Leg (a)
+  requires a LIVE forge approval; D6's approval transfer across a clean
+  advance is slice 2's. In a repository with GitHub's dismiss-stale-approvals
+  setting (this one) any push dismisses the approval, so the ADR-092 rebase
+  path answers `not_queued` until the PR is re-approved, and
+  `fishhawk_merge_run` after re-approval is the queue entry point — until
+  slice 2 lands.
+- **Enqueue arm (`merge_run.go::mergeQueueEnqueueArm`, D2).** With
+  `Config.MergeQueue` wired, a `merge_base_behind`,
+  `merge_candidate_unverified` (`unverified`, or `in_flight` for a run that
+  already has an active entry) or `merge_candidate_held` refusal of an
+  ELIGIBLE run becomes `202 queued:true` (`queue_state`, `queue_position`,
+  `live_run_id`, `entry_id`, `base_ref`, `anchored_head_sha`,
+  `intent_sequence`, `already_queued`, `message`); `merge_queued` stays false
+  and NO `merge_verdict_recorded` row is written. Every pre-gate refusal keeps
+  its order; `merge_candidate_verify_failed` / `merge_candidate_check_failed`
+  are never enqueued; an up-to-date verified (or ADR-096 transferred) head
+  merges inline as before. An ineligible or undeterminable run gets today's
+  refusal plus the additive `details.merge_queue_ineligible` codes, with
+  nothing written.
+- **Record before commit.** The chained `merge_queue_entered` row (operator
+  actor; payload `run_id`, `repo`, `base_ref`, `anchored_head_sha`,
+  `gate_code`, the verdict prose slice 2's merge-on-pass reads, `pr_url`)
+  is appended BEFORE `Enqueue{MergeIntent}` / `MarkMergeIntent`. A failed
+  append answers `503 merge_queue_unrecorded` with no entry and no
+  `merge_intent_at`; a retry appends again. Ordering, not the store's
+  in-transaction `RecordIntent` callback, is the guarantee (the chained
+  append's `FOR UPDATE` on the runs row would wait on the insert's own
+  `FOR KEY SHARE`). Residual: an append whose queue write then fails leaves
+  a row with no entry (`503 merge_queue_write_failed`; a retry records
+  again). An entry already carrying intent answers `already_queued` and
+  writes nothing.
+- **Detached pump.** After the write the base is pumped on a detached,
+  bounded `mergeCandidateAdmissionContext` tracked by `bgMergeQueuePump`, so
+  the 202 never waits on an admission's auto-advance or pass start; it is
+  answered from the store state read right after the write.
+- **Admission gating (`merge_candidate_queue.go`).**
+  `serializeMergeCandidateVerifyPass` (the ADR-092 rebase / base-advance
+  path) enqueues a run with NO active entry only when the admission variant
+  says eligible; otherwise it starts nothing and answers start state
+  `not_queued` with the reasons and a note naming `fishhawk_merge_run`
+  (`rebase_branch.go` renders it in the merge-candidate block). An existing
+  entry keeps its re-anchor semantics. `admitMergeCandidateEntry` evaluates
+  the admission variant on the PR's current head BEFORE the behind probe:
+  determined-ineligible → settled `dropped` / `not_merge_eligible` (the pump
+  admits the next; the run re-enters at the TAIL on its next merge call,
+  ADR-093 Q2); undeterminable → `Unadmit`, held at its place. Live entries
+  are not re-evaluated in this slice. No new automated rebase is added
+  (#4574 stays out of scope; the admission auto-advance is ADR-092's).
+- **Run and gate-view projection (`runs.go`).**
+  `runMergeCandidateQueuePayload` carries `merge_intent` (always on the wire)
+  and `merge_intent_at` (omitempty); GET /v0/runs/{id} and the gate view
+  share it, so `gateview.go` needs no edit.
+
+### Merge queue read (`merge_queue_read.go`)
+
+`GET /v0/repos/{owner}/{name}/merge-queue[?base_ref=]`.
+
+- **Scope tier.** A run-bound `mcp:run:<uuid>` token is refused
+  `403 run_token_forbidden` (`isRunBoundSubject`) — the payload names other
+  runs and their heads. Every other caller needs `read:audit`
+  (`scopeMergeQueueRead` = `scopeGateViewRead`, via `requireWriteScope`: 401
+  anonymous, 403 `insufficient_scope`); a cookie-session operator passes.
+  Repo visibility is a point-read DENY (`enforceRepoVisibility`).
+- **Account scope.** The caller identity's `AccountID` is the
+  `mergequeue.Base` account, so another account's queue on the same
+  repository and base is structurally unreadable; an untenanted caller reads
+  the untenanted queue; a non-UUID account fails closed 500
+  (`callerAccountUUID`). Without `base_ref` the bases are `ActiveBases`
+  filtered to that account and repository.
+- **Body.** Per base: `entries` from `ListForBase` (live first, then held
+  FIFO) with `position` (1-based among held), `merge_intent` /
+  `merge_intent_at`, anchors and `eta_seconds`; `head_of_line` = the first
+  entry with `current_head_sha` read best-effort from the forge (one read per
+  base; `current_head_unavailable` = `run_read_failed` | `forge_unwired` |
+  `pull_request_unresolvable` | `forge_read_failed`); `eta_basis`
+  `{samples, median_seconds?, note}`.
+- **ETA basis.** `eta_seconds` = `position` x the median of
+  `RecentLineTurns(base, 10)` (admission to merge of the base's newest merged
+  entries, database clock, account-scoped), rounded to the second; omitted
+  for the live entry and with no history. **Until slice 2's merge-on-pass
+  lands, a line turn includes the operator's merge step** (the line frees
+  only when the PR merges), so the estimate is as fast as the operator
+  merges.
+- **Fail posture.** `503 merge_queue_unconfigured` unwired; any store read
+  error is `500 internal_error` with no partial body; the forge read never
+  fails the read.
+- **Tests.** `merge_queue_read_test.go` over the real store (mcq fixture):
+  FIFO positions, intent, head of line and ETA together; account isolation
+  (A / B / untenanted on one repo and base); the auth ladder (including the
+  shipped route, 401 not 404); unconfigured; non-UUID account; repo
+  forbidden; each store read error; each head-of-line degrade; the held head
+  of line; `medianLineTurnSeconds`. `runs_get_test.go` /
+  `gateview_test.go` pin `merge_intent` on the run read and the gate view.
 
 ## Concurrency-group promote (`stage_concurrency_promote.go`, E83.81 / [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 
