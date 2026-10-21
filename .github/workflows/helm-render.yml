@@ -1,0 +1,57 @@
+name: Helm render
+
+on:
+  pull_request:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+      - 'scripts/test-helm-render'
+      - '.github/workflows/helm-render.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'deploy/helm/**'
+      - 'scripts/test-helm-render'
+      - '.github/workflows/helm-render.yml'
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  render:
+    name: Chart render gate
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      # Pinned to an immutable version per AGENTS.md's run-time tooling
+      # pinning rule: a floating tag lets a third-party release red-line
+      # main with no change on our side. Helm v4 is REQUIRED: r9's
+      # `helm install --dry-run` needs a reachable cluster on Helm v3, and
+      # this runner has none. Keep equal to deploy/gate-image's HELM_VERSION.
+      - name: Install Helm
+        uses: azure/setup-helm@v4
+        with:
+          version: v4.2.4
+
+      - name: helm version
+        run: helm version
+
+      # The harness SKIPS when helm is absent; failing here if it is not
+      # installed keeps a silent skip from passing as a green gate.
+      - name: Assert helm is on PATH
+        run: command -v helm
+
+      - name: Render gate
+        run: scripts/test-helm-render
+
+      - name: Per-profile lint
+        run: |
+          for p in values-local values-prod values-cell values-single-tenant; do
+            echo "== $p"
+            helm lint deploy/helm/fishhawk -f "deploy/helm/fishhawk/$p.yaml"
+          done

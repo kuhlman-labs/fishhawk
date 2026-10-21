@@ -1,0 +1,83 @@
+name: Docs site
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'site/**'
+      - '.github/workflows/docs.yml'
+  workflow_dispatch:
+
+# NO permissions by default; each job is granted exactly what it needs. The
+# split is load-bearing, not tidiness. The `build` job executes third-party
+# code with network egress — pnpm install lifecycle scripts and `astro build`
+# pulling in the whole dependency tree — so it gets `contents: read` and
+# NOTHING else. A compromised transitive dependency in that job therefore has
+# no Pages authority to abuse and no OIDC token to mint. `pages: write` and
+# `id-token: write` live only on `deploy`, which runs one first-party action
+# against the already-built artifact and executes no dependency code.
+permissions: {}
+
+# One deploy at a time. Do NOT cancel an in-progress run: a cancelled deploy can
+# leave Pages serving a half-published build.
+concurrency:
+  group: pages
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    # Deliberately contents-only: this job runs dependency code.
+    permissions:
+      contents: read
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v7
+
+      # pnpm version comes from `packageManager` in site/package.json;
+      # action-setup reads the *root* package.json by default and there is no
+      # root package.json in this repo, so point it at site/ explicitly.
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: site/package.json
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: 'pnpm'
+          cache-dependency-path: site/pnpm-lock.yaml
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      # There is deliberately NO actions/configure-pages step. Its only job is
+      # to hand the framework a base path at build time, and astro.config.mjs
+      # hardcodes `site` and `base` instead (see "Base path" above). Omitting
+      # it keeps every Pages-scoped permission out of the job that runs
+      # dependency code; the Pages source is set once by hand, above.
+      - name: Build
+        run: pnpm build
+
+      # `path` is workspace-relative; defaults.run.working-directory applies to
+      # `run` steps only, not to an action's inputs.
+      - uses: actions/upload-pages-artifact@v5
+        with:
+          path: site/dist
+
+  deploy:
+    name: Deploy
+    needs: build
+    runs-on: ubuntu-latest
+    # The only job holding these, and it runs no dependency code.
+    permissions:
+      pages: write # actions/deploy-pages publishes the artifact
+      id-token: write # ... and exchanges an OIDC token to authenticate that
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - id: deployment
+        uses: actions/deploy-pages@v5
