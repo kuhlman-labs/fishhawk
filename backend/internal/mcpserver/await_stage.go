@@ -46,8 +46,9 @@ type AwaitStageInput struct {
 //     The wait holds no server state, so re-calling is a safe idempotent no-op.
 //     TimeoutKind discriminates WHICH deadline expired (E45.91 / #3626):
 //     "client_wait_cap" (only yours) or "stage_deadline_exceeded" (a
-//     best-effort health read showed the stage's OWN per-attempt agent budget
-//     exhausted while the stage is still unsettled).
+//     best-effort health read showed the stage's OWN budget for its current
+//     phase — the per-attempt agent budget, or the gate budget in the gate
+//     phase (#4023) — exhausted while the stage is still unsettled).
 //   - "run_terminal" — the run reached a terminal state while the stage was
 //     still unsettled (ADR-036 backstop); a final read found it still
 //     unsettled, so it most likely never will. Do not re-arm blindly.
@@ -107,7 +108,7 @@ type AwaitStageOutput struct {
 	// unresolved the Message says the stage's own deadline status is UNKNOWN —
 	// a failed read cannot rule out that it too expired — and points at
 	// fishhawk_get_run_status.
-	TimeoutKind string `json:"timeout_kind,omitempty" jsonschema:"present only on the 'timeout' status: WHICH deadline expired. On this verb a timeout NEVER by itself means the stage failed. 'client_wait_cap' means ONLY that your own wait cap expired before the stage settled — it is NOT a statement that the stage is healthy: read message and stage_wait_status, and when the health read failed or the agent budget is unresolved the message says the stage's OWN deadline status is UNKNOWN (a failed read can neither confirm nor rule out that it also expired) and points at fishhawk_get_run_status. 'stage_deadline_exceeded' means a best-effort health read showed the stage's OWN per-attempt agent budget exhausted (deadline_seconds_remaining is 0) while the stage is still unsettled — the concerning shape; do not just re-arm. A stage that blows its own agent deadline is KILLED by the runner and arrives as status settled/failed, never as this status"`
+	TimeoutKind string `json:"timeout_kind,omitempty" jsonschema:"present only on the 'timeout' status: WHICH deadline expired. On this verb a timeout NEVER by itself means the stage failed. 'client_wait_cap' means ONLY that your own wait cap expired before the stage settled — it is NOT a statement that the stage is healthy: read message and stage_wait_status, and when the health read failed or the agent budget is unresolved the message says the stage's OWN deadline status is UNKNOWN (a failed read can neither confirm nor rule out that it also expired) and points at fishhawk_get_run_status. 'stage_deadline_exceeded' means a best-effort health read showed the stage's OWN budget for its CURRENT phase exhausted (deadline_seconds_remaining is 0) while the stage is still unsettled — the per-attempt agent budget in the agent phase, or the separate gate budget (gate_budget_seconds of verify time) when stage_wait_status.phase is 'gate' (#4023); the concerning shape; do not just re-arm. A stage that blows its own agent deadline is KILLED by the runner and arrives as status settled/failed, never as this status"`
 	Stage       string `json:"stage" jsonschema:"the resolved stage type"`
 	// StageID is the resolved stage UUID — the durable ADR-037 handle, echoed so
 	// a resuming caller can re-issue against the same stage.
@@ -177,8 +178,10 @@ const (
 	// health fact only when the probe actually read one.
 	awaitStageTimeoutKindClientWaitCap = "client_wait_cap"
 	// awaitStageTimeoutKindStageDeadlineExceeded is the concerning case: a
-	// best-effort health read showed the stage's per-attempt agent budget
-	// exhausted (deadline_seconds_remaining == 0) while it is still unsettled.
+	// best-effort health read showed the budget of the stage's CURRENT phase
+	// (the per-attempt agent budget, or the gate budget in the gate phase,
+	// #4023) exhausted (deadline_seconds_remaining == 0) while it is still
+	// unsettled.
 	awaitStageTimeoutKindStageDeadlineExceeded = "stage_deadline_exceeded"
 )
 
@@ -288,9 +291,12 @@ Statuses:
                          deadline also passed — and sends you to
                          fishhawk_get_run_status.
                        - "stage_deadline_exceeded" — a best-effort health read
-                         shows the stage's per-attempt agent budget exhausted
-                         (deadline_seconds_remaining is 0) while it is STILL
-                         unsettled. Do not just re-arm: check
+                         shows the budget of the stage's CURRENT phase
+                         exhausted (deadline_seconds_remaining is 0) while it
+                         is STILL unsettled: the per-attempt agent budget in
+                         the agent phase, or the separate gate budget in the
+                         gate phase (stage_wait_status.phase, #4023; the
+                         message names which). Do not just re-arm: check
                          fishhawk_get_run_status, and fishhawk_reap_stage if
                          the runner is gone.
                      state and stage_wait_status ride out alongside it, so
@@ -783,11 +789,14 @@ func awaitStageSettledOutput(stageType string, sw *RunStageWait, start time.Time
 // awaitStageTimeoutHealth is the BEST-EFFORT stage-health read paid ONCE when a
 // wait times out (E45.91 / #3626) — never per poll tick. It answers the one
 // question the bare "timeout" token could not: is the stage still inside its own
-// per-attempt agent budget, or has that budget run out too?
+// budget for its current phase (the per-attempt agent budget, or the gate
+// budget once the runner reports the gate phase, #4023), or has that budget run
+// out too?
 //
 // It reuses the EXISTING api-client reads (ListRunStages + GetRun) and the
-// EXISTING stageWaitStatusFor classifier, so the #2540 budget derivation and the
-// #3335 per-attempt dispatch clock are inherited verbatim — no new REST surface
+// EXISTING stageWaitStatusFor classifier, so the #2540 budget derivation, the
+// #3335 per-attempt dispatch clock and the #4023 phase-aware deadline are
+// inherited verbatim — no new REST surface
 // and no signature change to stage_wait.go.
 //
 // BEST-EFFORT in exactly the same direction as awaitStageRunTerminalBackstop and
@@ -849,9 +858,13 @@ func awaitStageTimeoutKind(sw *StageWaitStatus) string {
 // variants stay table-testable.
 //
 // THREE messages, because the operator's binding condition on #3626 forbids
-// client_wait_cap from claiming the stage is healthy:
+// client_wait_cap from claiming the stage is healthy. The two health-read
+// variants are PHASE-AWARE (#4023): deadline_seconds_remaining is the CURRENT
+// phase's budget, so in the gate phase the message names the GATE budget and
+// says the agent phase already finished, and in the agent phase it names the
+// agent phase; with no phase reported the wording is the pre-#4023 one:
 //
-//   - stage_deadline_exceeded — the stage's own per-attempt budget is spent and
+//   - stage_deadline_exceeded — the budget of the stage's current phase is spent and
 //     it still has not settled. Re-arming may just burn a second cap, so the
 //     message routes to fishhawk_get_run_status / fishhawk_reap_stage instead.
 //   - client_wait_cap, health KNOWN — the probe succeeded and reported a
@@ -877,18 +890,32 @@ func awaitStageTimeoutOutput(stageType string, stageID uuid.UUID, timeout int, s
 		TimeoutCapSeconds:   capSeconds,
 	}
 	switch {
+	case kind == awaitStageTimeoutKindStageDeadlineExceeded && sw.Phase == stagePhaseGate:
+		out.Message = fmt.Sprintf("stage %q did not settle within %ds, and YOUR wait cap is not the only deadline that expired: "+
+			"a stage-health read shows it in its GATE phase — the agent phase already finished — and its gate budget "+
+			"(%ds of verify time) is EXHAUSTED — deadline_seconds_remaining is 0 — while the stage state is still %q. "+
+			"Arming another wait may simply burn a second cap. "+
+			"Check fishhawk_get_run_status for the stage's actual state, and fishhawk_reap_stage if the runner is gone.",
+			stageType, timeout, sw.GateBudgetSeconds, rawState)
 	case kind == awaitStageTimeoutKindStageDeadlineExceeded:
 		out.Message = fmt.Sprintf("stage %q did not settle within %ds, and YOUR wait cap is not the only deadline that expired: "+
-			"a stage-health read shows its per-attempt agent budget (%ds) is EXHAUSTED — deadline_seconds_remaining is 0 — "+
+			"a stage-health read shows %sits per-attempt agent budget (%ds) is EXHAUSTED — deadline_seconds_remaining is 0 — "+
 			"while the stage state is still %q. Arming another wait may simply burn a second cap. "+
 			"Check fishhawk_get_run_status for the stage's actual state, and fishhawk_reap_stage if the runner is gone.",
-			stageType, timeout, sw.AgentTimeoutSeconds, rawState)
+			stageType, timeout, awaitStagePhaseLabel(sw, "and"), sw.AgentTimeoutSeconds, rawState)
+	case sw != nil && sw.DeadlineSecondsRemaining != nil && sw.Phase == stagePhaseGate:
+		out.Message = fmt.Sprintf("stage %q did not settle within %ds — YOUR wait cap expired, not the stage's own deadline, "+
+			"and the stage has NOT failed. A stage-health read shows it in its GATE phase (the agent phase finished) with "+
+			"%ds of its gate budget remaining (state %q), so it is still within its deadline. The wait holds nothing: "+
+			"re-call fishhawk_await_stage to resume it (a safe idempotent no-op), or poll fishhawk_get_run_status every %ds "+
+			"(the authoritative path).",
+			stageType, timeout, *sw.DeadlineSecondsRemaining, rawState, suggestedStageWaitPollIntervalSeconds)
 	case sw != nil && sw.DeadlineSecondsRemaining != nil:
 		out.Message = fmt.Sprintf("stage %q did not settle within %ds — YOUR wait cap expired, not the stage's own deadline, "+
-			"and the stage has NOT failed. A stage-health read shows %ds of its per-attempt agent budget remaining "+
+			"and the stage has NOT failed. A stage-health read shows %s%ds of its per-attempt agent budget remaining "+
 			"(state %q), so it is still within its deadline. The wait holds nothing: re-call fishhawk_await_stage "+
 			"to resume it (a safe idempotent no-op), or poll fishhawk_get_run_status every %ds (the authoritative path).",
-			stageType, timeout, *sw.DeadlineSecondsRemaining, rawState, suggestedStageWaitPollIntervalSeconds)
+			stageType, timeout, awaitStagePhaseLabel(sw, "with"), *sw.DeadlineSecondsRemaining, rawState, suggestedStageWaitPollIntervalSeconds)
 	default:
 		out.Message = fmt.Sprintf("stage %q did not settle within %ds — YOUR wait cap expired. Whether the stage's OWN "+
 			"deadline also expired is UNKNOWN: the health read failed or the stage's agent budget is unresolved, so this "+
@@ -898,6 +925,17 @@ func awaitStageTimeoutOutput(stageType string, stageID uuid.UUID, timeout int, s
 			stageType, timeout, suggestedStageWaitPollIntervalSeconds)
 	}
 	return out
+}
+
+// awaitStagePhaseLabel names the agent phase inside an agent-budget timeout
+// message ("it in its agent phase <connector> "), and is empty when no current
+// phase was reported so the legacy messages stay byte-identical (#4023). The
+// gate phase has its own message variants and never reaches this.
+func awaitStagePhaseLabel(sw *StageWaitStatus, connector string) string {
+	if sw.Phase == stagePhaseAgent {
+		return "it in its agent phase " + connector + " "
+	}
+	return ""
 }
 
 // awaitStageProgressMessage builds the per-tick heartbeat message for a pending

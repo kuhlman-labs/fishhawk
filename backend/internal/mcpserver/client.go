@@ -5984,11 +5984,25 @@ type Stage struct {
 // stage-wait status is derived server-side from the stage's started_at, which
 // makes it cumulative and monotonic across re-spawns. Each json tag MUST
 // byte-match the backend or that field silently decodes to zero (the #371 trap).
+//
+// The five phase fields (#4023) mirror the runner's agent/gate phase report:
+// Phase is "agent" | "gate" (empty on a pre-#4023 report), PhaseElapsedSeconds
+// the runner-measured seconds in that phase at reported_at, GateBudgetSeconds /
+// GateRemainingSeconds the gate phase's verify budget and what was left of it,
+// and GateVerifying whether a verify was consuming that budget at report time.
+// The stage-wait derivation (stageWaitStatusFor) reads them; absent keys decode
+// to the zero value / nil, which the derivation treats as "no phase report".
 type StageProgress struct {
 	LastEvent         string    `json:"last_event"`
 	TurnsThisAttempt  int       `json:"turns_this_attempt"`
 	TokensThisAttempt int       `json:"tokens_this_attempt"`
 	ReportedAt        time.Time `json:"reported_at"`
+
+	Phase                string `json:"phase,omitempty"`
+	PhaseElapsedSeconds  *int   `json:"phase_elapsed_seconds,omitempty"`
+	GateBudgetSeconds    *int   `json:"gate_budget_seconds,omitempty"`
+	GateRemainingSeconds *int   `json:"gate_remaining_seconds,omitempty"`
+	GateVerifying        bool   `json:"gate_verifying,omitempty"`
 }
 
 // StageExecutor mirrors the OpenAPI sub-schema. The closed-set

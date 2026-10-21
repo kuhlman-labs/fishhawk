@@ -952,3 +952,260 @@ func TestStageWaitStatus_ProjectsConcurrency(t *testing.T) {
 		t.Errorf("wire = %s, want the concurrency block with status + waiter_live", raw)
 	}
 }
+
+// phaseKeys are the five #4023 phase keys StageWaitStatus may carry.
+var phaseKeys = []string{"\"phase\"", "phase_elapsed_seconds", "agent_seconds_remaining", "gate_budget_seconds", "gate_seconds_remaining"}
+
+// requirePhaseKeysAbsent marshals st and asserts none of the five #4023 phase
+// keys appear on the wire — the byte-level proof that a status with no CURRENT
+// phase report keeps the pre-#4023 shape.
+func requirePhaseKeysAbsent(t *testing.T, st *StageWaitStatus, label string) {
+	t.Helper()
+	b, err := json.Marshal(st)
+	if err != nil {
+		t.Fatalf("%s: marshal: %v", label, err)
+	}
+	for _, key := range phaseKeys {
+		if strings.Contains(string(b), key) {
+			t.Errorf("%s: wire carries %s, want omitted:\n%s", label, key, b)
+		}
+	}
+}
+
+// phaseImplementStage is a running implement stage under a 60m agent budget,
+// dispatched dispatchedAgo before waitBase, carrying progress p.
+func phaseImplementStage(dispatchedAgo time.Duration, p *StageProgress) []Stage {
+	return []Stage{{
+		Type: "implement", State: "running",
+		StartedAt: startedAgo(dispatchedAgo), DispatchedAt: startedAgo(dispatchedAgo),
+		AgentTimeoutSeconds: 3600, Progress: p,
+	}}
+}
+
+// TestStageWaitStatus_GatePhaseReportsGateBudgetNotAgentDeadline is the #4023
+// done-means unit: a stage dispatched 79 minutes ago under a 60-minute agent
+// budget whose runner reports the GATE phase must report the gate budget's
+// remaining as its deadline, not the 0 the attempt clock derives (the false
+// stage_deadline_exceeded the issue observed).
+func TestStageWaitStatus_GatePhaseReportsGateBudgetNotAgentDeadline(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(79*time.Minute, &StageProgress{
+		LastEvent: "gate:verify", ReportedAt: waitBase.Add(-10 * time.Second),
+		Phase: "gate", PhaseElapsedSeconds: intPtr(312), GateBudgetSeconds: intPtr(5400),
+		GateRemainingSeconds: intPtr(4980), GateVerifying: true,
+	}), "implement", "running", 0, waitBase)
+	if st == nil {
+		t.Fatal("wait status nil")
+	}
+	if st.Phase != "gate" {
+		t.Errorf("phase = %q, want gate", st.Phase)
+	}
+	if st.GateBudgetSeconds != 5400 {
+		t.Errorf("gate_budget_seconds = %d, want 5400", st.GateBudgetSeconds)
+	}
+	// 4980 reported, 10s since the report while verifying.
+	if st.GateSecondsRemaining == nil || *st.GateSecondsRemaining != 4970 {
+		t.Errorf("gate_seconds_remaining = %v, want 4970", fmtIntPtr(st.GateSecondsRemaining))
+	}
+	if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 4970 {
+		t.Errorf("deadline_seconds_remaining = %v, want 4970 (the gate remaining, not the attempt clock's 0)", fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+	if st.PhaseElapsedSeconds == nil || *st.PhaseElapsedSeconds != 322 {
+		t.Errorf("phase_elapsed_seconds = %v, want 322 (312 reported + 10 since)", fmtIntPtr(st.PhaseElapsedSeconds))
+	}
+	if st.AgentSecondsRemaining != nil {
+		t.Errorf("agent_seconds_remaining = %d in the gate phase, want absent", *st.AgentSecondsRemaining)
+	}
+	// The cumulative and per-attempt clocks keep their meaning.
+	if st.ElapsedSeconds != 79*60 || st.AttemptElapsedSeconds == nil || *st.AttemptElapsedSeconds != 79*60 {
+		t.Errorf("elapsed/attempt_elapsed = %d/%v, want %d (unchanged meaning)", st.ElapsedSeconds, fmtIntPtr(st.AttemptElapsedSeconds), 79*60)
+	}
+	if got := awaitStageTimeoutKind(st); got != awaitStageTimeoutKindClientWaitCap {
+		t.Errorf("timeout kind = %q, want %q for a healthy gate phase", got, awaitStageTimeoutKindClientWaitCap)
+	}
+}
+
+// TestStageWaitStatus_AgentPhaseUsesPhaseClock: in the agent phase the agent
+// budget is charged by the runner's phase clock, not the attempt clock — a fix
+// re-invoke 10 minutes in, on an attempt dispatched 79 minutes ago, has ~50
+// minutes left, not 0.
+func TestStageWaitStatus_AgentPhaseUsesPhaseClock(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(79*time.Minute, &StageProgress{
+		LastEvent: "agent_start", ReportedAt: waitBase.Add(-20 * time.Second),
+		Phase: "agent", PhaseElapsedSeconds: intPtr(580),
+	}), "implement", "running", 0, waitBase)
+	if st == nil {
+		t.Fatal("wait status nil")
+	}
+	if st.Phase != "agent" {
+		t.Errorf("phase = %q, want agent", st.Phase)
+	}
+	if st.PhaseElapsedSeconds == nil || *st.PhaseElapsedSeconds != 600 {
+		t.Errorf("phase_elapsed_seconds = %v, want 600", fmtIntPtr(st.PhaseElapsedSeconds))
+	}
+	if st.AgentSecondsRemaining == nil || *st.AgentSecondsRemaining != 3000 {
+		t.Errorf("agent_seconds_remaining = %v, want 3000", fmtIntPtr(st.AgentSecondsRemaining))
+	}
+	if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3000 {
+		t.Errorf("deadline_seconds_remaining = %v, want 3000 (agent remaining)", fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+	if st.GateBudgetSeconds != 0 || st.GateSecondsRemaining != nil {
+		t.Errorf("gate fields in the agent phase: budget=%d remaining=%v, want absent", st.GateBudgetSeconds, fmtIntPtr(st.GateSecondsRemaining))
+	}
+}
+
+// TestStageWaitStatus_AgentPhaseWithoutElapsedUsesAttemptClock: an agent-phase
+// report carrying no phase_elapsed_seconds falls back to the attempt clock (an
+// upper bound on agent time), and phase_elapsed stays unknown.
+func TestStageWaitStatus_AgentPhaseWithoutElapsedUsesAttemptClock(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(600*time.Second, &StageProgress{
+		ReportedAt: waitBase.Add(-5 * time.Second), Phase: "agent",
+	}), "implement", "running", 0, waitBase)
+	if st.Phase != "agent" || st.PhaseElapsedSeconds != nil {
+		t.Errorf("phase/phase_elapsed = %q/%v, want agent/nil", st.Phase, fmtIntPtr(st.PhaseElapsedSeconds))
+	}
+	if st.AgentSecondsRemaining == nil || *st.AgentSecondsRemaining != 3000 ||
+		st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3000 {
+		t.Errorf("agent remaining/deadline = %v/%v, want 3000/3000 (attempt clock)", fmtIntPtr(st.AgentSecondsRemaining), fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+}
+
+// TestStageWaitStatus_StaleReportFromPreviousAttemptIgnored pins the
+// current-attempt guard: the progress row survives a re-dispatch, so a gate
+// report with 0 remaining from the PREVIOUS attempt must not be read as the
+// fresh attempt's spent budget.
+func TestStageWaitStatus_StaleReportFromPreviousAttemptIgnored(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(30*time.Second, &StageProgress{
+		LastEvent: "gate:verify", ReportedAt: waitBase.Add(-60 * time.Second),
+		Phase: "gate", PhaseElapsedSeconds: intPtr(900), GateBudgetSeconds: intPtr(5400),
+		GateRemainingSeconds: intPtr(0), GateVerifying: true,
+	}), "implement", "running", 0, waitBase)
+	if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3570 {
+		t.Errorf("deadline_seconds_remaining = %v, want 3570 (legacy attempt clock)", fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+	if st.Phase != "" {
+		t.Errorf("phase = %q, want absent for a previous attempt's report", st.Phase)
+	}
+	requirePhaseKeysAbsent(t, st, "stale report")
+	// The progress counters still project — only the phase derivation is guarded.
+	if st.LastEvent != "gate:verify" {
+		t.Errorf("last_event = %q, want gate:verify (progress projection unchanged)", st.LastEvent)
+	}
+}
+
+// TestStageWaitStatus_UnknownPhaseFallsBackToLegacy: an empty (pre-#4023) or
+// unrecognized phase keeps the legacy attempt-clock derivation byte-identically.
+func TestStageWaitStatus_UnknownPhaseFallsBackToLegacy(t *testing.T) {
+	for _, phase := range []string{"", "deploy"} {
+		t.Run("phase="+phase, func(t *testing.T) {
+			st := stageWaitStatusFor(phaseImplementStage(600*time.Second, &StageProgress{
+				LastEvent: "assistant", ReportedAt: waitBase, Phase: phase,
+				PhaseElapsedSeconds: intPtr(10), GateRemainingSeconds: intPtr(5),
+			}), "implement", "running", 0, waitBase)
+			if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3000 {
+				t.Errorf("deadline_seconds_remaining = %v, want 3000 (legacy)", fmtIntPtr(st.DeadlineSecondsRemaining))
+			}
+			requirePhaseKeysAbsent(t, st, "phase "+phase)
+		})
+	}
+}
+
+// TestStageWaitStatus_NoAttemptClockFallsBackToLegacy: with neither
+// dispatched_at nor started_at the current-attempt guard cannot be decided, so
+// the phase report is not trusted.
+func TestStageWaitStatus_NoAttemptClockFallsBackToLegacy(t *testing.T) {
+	st := stageWaitStatusFor([]Stage{{
+		Type: "implement", State: "running", AgentTimeoutSeconds: 3600,
+		Progress: &StageProgress{ReportedAt: waitBase, Phase: "gate", GateRemainingSeconds: intPtr(0)},
+	}}, "implement", "running", 0, waitBase)
+	if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3600 {
+		t.Errorf("deadline_seconds_remaining = %v, want 3600 (legacy, zero elapsed)", fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+	requirePhaseKeysAbsent(t, st, "no attempt clock")
+}
+
+// TestStageWaitStatus_GatePhaseWithoutRemainingIsUnknown: a gate report with no
+// remaining makes the deadline UNKNOWN (nil), never 0 — so await_stage cannot
+// classify it stage_deadline_exceeded.
+func TestStageWaitStatus_GatePhaseWithoutRemainingIsUnknown(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(79*time.Minute, &StageProgress{
+		ReportedAt: waitBase, Phase: "gate", PhaseElapsedSeconds: intPtr(5),
+	}), "implement", "running", 0, waitBase)
+	if st.Phase != "gate" {
+		t.Errorf("phase = %q, want gate", st.Phase)
+	}
+	if st.DeadlineSecondsRemaining != nil || st.GateSecondsRemaining != nil {
+		t.Errorf("deadline/gate remaining = %v/%v, want nil/nil (unknown)", fmtIntPtr(st.DeadlineSecondsRemaining), fmtIntPtr(st.GateSecondsRemaining))
+	}
+	b, _ := json.Marshal(st)
+	for _, key := range []string{"deadline_seconds_remaining", "gate_seconds_remaining", "gate_budget_seconds"} {
+		if strings.Contains(string(b), key) {
+			t.Errorf("wire carries %q for an unreported gate remaining/budget:\n%s", key, b)
+		}
+	}
+	if got := awaitStageTimeoutKind(st); got != awaitStageTimeoutKindClientWaitCap {
+		t.Errorf("timeout kind = %q, want %q (unknown is never exhausted)", got, awaitStageTimeoutKindClientWaitCap)
+	}
+}
+
+// TestStageWaitStatus_FutureReportedAtClampsSince: a reported_at ahead of this
+// process's clock adds no negative time to either extrapolation.
+func TestStageWaitStatus_FutureReportedAtClampsSince(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(10*time.Minute, &StageProgress{
+		ReportedAt: waitBase.Add(30 * time.Second), Phase: "gate", PhaseElapsedSeconds: intPtr(50),
+		GateBudgetSeconds: intPtr(5400), GateRemainingSeconds: intPtr(100), GateVerifying: true,
+	}), "implement", "running", 0, waitBase)
+	if st.PhaseElapsedSeconds == nil || *st.PhaseElapsedSeconds != 50 {
+		t.Errorf("phase_elapsed_seconds = %v, want 50 (since clamped at 0)", fmtIntPtr(st.PhaseElapsedSeconds))
+	}
+	if st.GateSecondsRemaining == nil || *st.GateSecondsRemaining != 100 {
+		t.Errorf("gate_seconds_remaining = %v, want 100 (since clamped at 0)", fmtIntPtr(st.GateSecondsRemaining))
+	}
+}
+
+// TestStageWaitStatus_GateRemainingExtrapolatesOnlyWhileVerifying: only verify
+// execution is charged to the gate budget, so the reported remaining drains by
+// the time since the report ONLY when a verify was running; an overrun clamps
+// to 0, which await_stage then reads as exhausted.
+func TestStageWaitStatus_GateRemainingExtrapolatesOnlyWhileVerifying(t *testing.T) {
+	cases := []struct {
+		name      string
+		remaining int
+		verifying bool
+		want      int
+	}{
+		{"between verifies: frozen", 1000, false, 1000},
+		{"verifying: drains by since", 1000, true, 960},
+		{"verifying overrun: clamps to 0", 30, true, 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			st := stageWaitStatusFor(phaseImplementStage(10*time.Minute, &StageProgress{
+				ReportedAt: waitBase.Add(-40 * time.Second), Phase: "gate", PhaseElapsedSeconds: intPtr(0),
+				GateBudgetSeconds: intPtr(5400), GateRemainingSeconds: intPtr(tc.remaining), GateVerifying: tc.verifying,
+			}), "implement", "running", 0, waitBase)
+			if st.GateSecondsRemaining == nil || *st.GateSecondsRemaining != tc.want {
+				t.Errorf("gate_seconds_remaining = %v, want %d", fmtIntPtr(st.GateSecondsRemaining), tc.want)
+			}
+			if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != tc.want {
+				t.Errorf("deadline_seconds_remaining = %v, want %d", fmtIntPtr(st.DeadlineSecondsRemaining), tc.want)
+			}
+			wantKind := awaitStageTimeoutKindClientWaitCap
+			if tc.want == 0 {
+				wantKind = awaitStageTimeoutKindStageDeadlineExceeded
+			}
+			if got := awaitStageTimeoutKind(st); got != wantKind {
+				t.Errorf("timeout kind = %q, want %q", got, wantKind)
+			}
+		})
+	}
+}
+
+// TestStageWaitStatus_NoProgressKeepsPhaseKeysAbsent: a stage that never
+// reported keeps every phase key off the wire (the pre-#4023 shape).
+func TestStageWaitStatus_NoProgressKeepsPhaseKeysAbsent(t *testing.T) {
+	st := stageWaitStatusFor(phaseImplementStage(600*time.Second, nil), "implement", "running", 0, waitBase)
+	requirePhaseKeysAbsent(t, st, "no progress")
+	if st.DeadlineSecondsRemaining == nil || *st.DeadlineSecondsRemaining != 3000 {
+		t.Errorf("deadline_seconds_remaining = %v, want 3000 (legacy)", fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+}
