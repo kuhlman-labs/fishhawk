@@ -633,6 +633,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// below independent of the launch path.
 	var forgeWritesSignal string
 
+	// agentSessionLedger is the lineage's agent-session ledger path (#4089),
+	// set only once the lineage worktree is provisioned and its lock held, so
+	// every ledger read and write happens under that lock. "" on the
+	// --prompt-file path, which provisions no lineage worktree.
+	var agentSessionLedger string
+
 	// Forge-writes /healthz dev_mode probe (E72.16 / #3510): ONE direct GET
 	// of <backend-url>/healthz, here — the first backend contact of run(),
 	// ahead of the fetch block — so both refuseIfForgeWritesDenied sites
@@ -1020,6 +1026,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 		defer release()
 		cfg.workingDir = wt
+		if d, derr := worktreesDir(ctx, baseRepoDir); derr == nil {
+			agentSessionLedger = agentSessionLedgerPath(d, root)
+		}
 	}
 
 	// Forge-writes gate (E72.13 / #3500, E72.16 / #3510), SECOND site: the
@@ -2224,6 +2233,18 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	orphanSweeper.start(ctx)
 	defer func() { _ = orphanSweeper.sweep(context.WithoutCancel(ctx)) }()
 
+	// Fix-up session resume (#4089): decide ONCE, before the loop, whether this
+	// fix-up resumes the implement agent's recorded session. nil on every
+	// non-fix-up stage, which pays no ledger read and emits no event. The
+	// decision rides invokePrimaryAgent on the loop's FIRST attempt only; the
+	// shared inv is never mutated, so the verify-fix (fixInv := baseInv) and
+	// base-rebase (reinvokeInv := baseInv) re-invokes stay fresh.
+	var fixupResume *fixupResumeDecision
+	if stageType == "implement" && cfg.fixup && !appliedFixup {
+		d := resolveFixupResume(agentSessionLedger, &cfg, inv, fixupResumeGetenv)
+		fixupResume = &d
+	}
+
 	invokeStart := time.Now()
 	// When appliedFixup is set, the near-deterministic fix-up apply (#1165)
 	// already produced the change and passed the committed-tree verify gate
@@ -2235,7 +2256,8 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// invokedAt bounds the legacy-plan fallback's freshness check (#4067):
 		// only a legacy file written during THIS invocation can be claimed.
 		invokedAt := time.Now()
-		res, invokeErr = invoker.Invoke(ctx, inv)
+		res, invokeErr = invokePrimaryAgent(ctx, invoker, inv,
+			primaryResumeDecision(fixupResume, selfRetryCount), &cfg, logSink)
 
 		// Plan validation runs only if the agent itself succeeded —
 		// no point re-stating "your plan is malformed" when the
@@ -2469,6 +2491,13 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	if ev := orphanSweeper.sweep(ctx); ev != nil {
 		res.Events = append(res.Events, *ev)
 	}
+
+	// Record the implement agent's session (#4089) so a later fix-up of this
+	// run can resume it. res is still the primary invocation's result here:
+	// the verify-fix and base-rebase re-invokes below fold tokens and events
+	// into res but never its SessionID, so their narrower sessions are never
+	// recorded. A no-op unless res is OK and carries a session id.
+	recordAgentSession(agentSessionLedger, stageType, &cfg, inv, &res, logSink)
 
 	// Fold the #1165 deterministic-apply trace into the bundle. Appended here
 	// (not before the loop) because the agent loop reassigns res wholesale, so
