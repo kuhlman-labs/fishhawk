@@ -54,26 +54,30 @@ func (q *Queries) CreateOAuthToken(ctx context.Context, arg CreateOAuthTokenPara
 
 const createToken = `-- name: CreateToken :one
 
-INSERT INTO api_tokens (id, subject, token_hash, scopes)
-VALUES ($1, $2, $3, $4)
-RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider
+INSERT INTO api_tokens (id, subject, token_hash, scopes, account_id)
+VALUES ($1, $2, $3, $4, $5)
+RETURNING id, subject, token_hash, scopes, last_used_at, created_at, revoked_at, auth_method, provider, account_id
 `
 
 type CreateTokenParams struct {
-	ID        uuid.UUID `json:"id"`
-	Subject   string    `json:"subject"`
-	TokenHash string    `json:"token_hash"`
-	Scopes    []string  `json:"scopes"`
+	ID        uuid.UUID  `json:"id"`
+	Subject   string     `json:"subject"`
+	TokenHash string     `json:"token_hash"`
+	Scopes    []string   `json:"scopes"`
+	AccountID *uuid.UUID `json:"account_id"`
 }
 
 // Static operator-token path. auth_method is left to the column
-// DEFAULT 'static' and provider stays NULL.
+// DEFAULT 'static' and provider stays NULL. account_id NULL mints an
+// untenanted token; a set account_id binds it to that workspace
+// account (#4506).
 func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (ApiToken, error) {
 	row := q.db.QueryRow(ctx, createToken,
 		arg.ID,
 		arg.Subject,
 		arg.TokenHash,
 		arg.Scopes,
+		arg.AccountID,
 	)
 	var i ApiToken
 	err := row.Scan(
@@ -86,6 +90,7 @@ func (q *Queries) CreateToken(ctx context.Context, arg CreateTokenParams) (ApiTo
 		&i.RevokedAt,
 		&i.AuthMethod,
 		&i.Provider,
+		&i.AccountID,
 	)
 	return i, err
 }

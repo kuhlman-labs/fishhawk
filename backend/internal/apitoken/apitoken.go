@@ -82,10 +82,11 @@ type Token struct {
 
 	// AccountID is the tenant workspace account this token acts within
 	// (ADR-057 / E44.5, migration 0055's nullable api_tokens.account_id).
-	// Empty string when the token is untenanted (NULL account_id — every
-	// operator/static token and every legacy row until a later child
-	// backfills). Populated by Authenticate (GetTokenByHash selects the
-	// column); the bearer-auth path threads it onto Identity.AccountID so
+	// Empty string when the token is untenanted (NULL account_id: every
+	// token minted through Issue or IssueOAuth, and every legacy row).
+	// Populated by Authenticate (GetTokenByHash selects the column) and by
+	// Issue / IssueForAccount's return value (CreateToken returns it,
+	// #4506); the bearer-auth path threads it onto Identity.AccountID so
 	// the account-ownership middleware can bound a bearer request to its
 	// account.
 	AccountID string
@@ -105,10 +106,24 @@ func (t Token) IsRevoked() bool {
 // token_hash as the index of record — Authenticate looks up by
 // hash and never has the plaintext.
 type Repository interface {
-	// Issue mints a fresh token for subject with the given scopes
-	// and returns the populated Token (including PlainText). The row
-	// carries auth_method='static' via the column default.
+	// Issue mints a fresh UNTENANTED token (NULL account_id) for
+	// subject with the given scopes and returns the populated Token
+	// (including PlainText). The row carries auth_method='static' via
+	// the column default. Its callers are the operator bootstrap
+	// (`fishhawkd token issue`), the first-officer seat attach (whose
+	// account binding bearerAuth derives from the seat's anchor run at
+	// auth time), and an untenanted caller of POST /v0/tokens.
 	Issue(ctx context.Context, subject string, scopes []string) (*Token, error)
+
+	// IssueForAccount mints a fresh token like Issue but BOUND to the
+	// workspace account accountID (#4506): POST /v0/tokens calls it for
+	// a tenanted caller, so the minted bearer resolves to the caller's
+	// own account. accountID is a UUID string and is REQUIRED: an empty
+	// or malformed id is an error, never a silent untenanted mint, and
+	// an id naming no accounts row fails on the foreign key. Required on
+	// Repository (not an optional seam) so no wiring gap can turn a
+	// tenanted mint into an untenanted one (the E44.11 / #2074 rule).
+	IssueForAccount(ctx context.Context, subject string, scopes []string, accountID string) (*Token, error)
 
 	// Authenticate hashes plaintext, looks up the row, and returns
 	// the matched Token. ErrMalformedToken on bad format,
@@ -146,7 +161,11 @@ type OAuthIssuer interface {
 	// IssueOAuth mints a token stamping auth_method='oauth' and the
 	// originating provider (e.g. "github"). It is additive to Issue: the
 	// static path is unchanged and keeps stamping 'static' via the column
-	// default. subject and provider must be non-empty.
+	// default. subject and provider must be non-empty. The token is
+	// UNTENANTED by design (NULL account_id, #4506): its caller, POST
+	// /v0/tokens/login, is unauthenticated at the bearer layer, carries no
+	// account context, and is authorized by the operator-repo permission
+	// gate, so its tokens are operator-class credentials.
 	IssueOAuth(ctx context.Context, subject string, scopes []string, provider string) (*Token, error)
 }
 

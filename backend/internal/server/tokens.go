@@ -106,7 +106,10 @@ func (s *Server) handleTokenLoginDiscovery(w http.ResponseWriter, r *http.Reques
 // unconfigured OperatorRepo, or an unconfigured identity provider
 // (VerifyAccessToken returns ErrNotConfigured on the NoOp). The mint is
 // deliberately UNAUTHENTICATED at the bearer layer — the access token in
-// the body IS the credential the backend re-verifies.
+// the body IS the credential the backend re-verifies. Its tokens stay
+// UNTENANTED by design (#4506): the request carries no account context and
+// the operator-repo permission gate authorizes it, so an IssueOAuth token
+// is an operator-class credential.
 func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.APITokenRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
@@ -376,9 +379,18 @@ func toTokenResponse(t *apitoken.Token) apiTokenResponse {
 // (deny-by-default). An empty scopes list stays legal: it is a subset of
 // any ceiling.
 //
+// TENANCY (#4506): the minted token inherits the caller's workspace
+// account. A tenanted caller (Identity.AccountID set, from a tenanted
+// bearer's row or a cookie session's resolved account) mints through
+// IssueForAccount, so the new row's account_id is the caller's account
+// and the minted bearer resolves to that account's view; a repository
+// failure there is a 500 with no row. An untenanted caller (an operator
+// token or an accountless session) mints through Issue, an untenanted row,
+// exactly as before.
+//
 // Bootstrap (the very first token for an installation) is issued via the
 // `fishhawkd token issue` CLI command, which calls APITokenRepo directly
-// without going through this handler.
+// without going through this handler; its tokens are untenanted.
 func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.APITokenRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
@@ -437,7 +449,15 @@ func (s *Server) handleCreateToken(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	tok, err := s.cfg.APITokenRepo.Issue(r.Context(), id.Subject, req.Scopes)
+	// Tenancy (#4506): a tenanted caller mints a token bound to its own
+	// account; an untenanted caller (operator) mints an untenanted one.
+	var tok *apitoken.Token
+	var err error
+	if id.AccountID != "" {
+		tok, err = s.cfg.APITokenRepo.IssueForAccount(r.Context(), id.Subject, req.Scopes, id.AccountID)
+	} else {
+		tok, err = s.cfg.APITokenRepo.Issue(r.Context(), id.Subject, req.Scopes)
+	}
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"issue token failed", map[string]any{"error": err.Error()})
