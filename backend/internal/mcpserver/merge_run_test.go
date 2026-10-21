@@ -107,6 +107,7 @@ type mergeRunFakeBackend struct {
 	mu sync.Mutex
 
 	prURL            string // "" means the run carries no PR URL
+	repo             string // the run's repo on GET /v0/runs/{id}
 	stateBeforeMerge string
 	stateAfterMerge  string // "" -> unchanged after merge
 
@@ -124,6 +125,10 @@ type mergeRunFakeBackend struct {
 	// last entry repeats) — a test drives a checks_pending-then-refusal pair.
 	mergeErrBodies []string
 	mergeResp      MergeRunResult
+	// mergeRawBody, when set, is the success body served VERBATIM instead of
+	// mergeResp — a test pins the wire bytes the backend writes (ADR-093's
+	// 202 queued answer) rather than a re-encoding of the client mirror.
+	mergeRawBody string
 	// mergeVerdicts records the verdict body of each POST so a test can assert
 	// every re-POST across the wait carries the same verdict (the tool never
 	// skips the POST — endpoint-side idempotence).
@@ -191,7 +196,7 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 			prPtr = &pr
 		}
 		fb.mu.Unlock()
-		_ = json.NewEncoder(w).Encode(Run{ID: id.String(), State: state, PullRequestURL: prPtr})
+		_ = json.NewEncoder(w).Encode(Run{ID: id.String(), Repo: fb.repo, State: state, PullRequestURL: prPtr})
 	})
 
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge", func(w http.ResponseWriter, r *http.Request) {
@@ -222,10 +227,16 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 		}
 		fb.mu.Unlock()
 		w.WriteHeader(status)
-		if status != http.StatusOK {
+		// A 2xx other than 200 (the ADR-093 202 queued answer) carries the
+		// success body too, and merges nothing.
+		if status >= http.StatusBadRequest {
 			if errBody != "" {
 				_, _ = w.Write([]byte(errBody))
 			}
+			return
+		}
+		if fb.mergeRawBody != "" {
+			_, _ = w.Write([]byte(fb.mergeRawBody))
 			return
 		}
 		_ = json.NewEncoder(w).Encode(resp)
@@ -2222,5 +2233,173 @@ func TestMergeRun_ScopeOverlap_NotReadOnToolError(t *testing.T) {
 	}
 	if fb.scopeOverlapCalls != 0 {
 		t.Errorf("scope-overlap reads = %d, want 0 on a tool error", fb.scopeOverlapCalls)
+	}
+}
+
+// queuedWireBody is the backend's ADR-093 202 queued answer as the server
+// writes it (backend/internal/server/merge_run.go::mergeRunResponse): every
+// zero-valued field omitted, merge_queued absent (false), the queued fields
+// in the server's json-tag spelling.
+const queuedWireBody = `{"run_id":"%s","pr_url":"https://github.com/x/y/pull/7","queued":true,"queue_state":"held","queue_position":2,"live_run_id":"%s","entry_id":"%s","base_ref":"main","anchored_head_sha":"H2","intent_sequence":41,"message":"backend says: queued at position 2"}`
+
+// TestMergeRun_QueuedReturnsImmediately pins the ADR-093 slice 1 202 queued
+// answer (E87.4 / #4295) as an IMMEDIATE status=queued: exactly ONE POST and
+// ZERO terminal-await audit reads, even though the fake carries a pr_merged
+// entry an armed await would resolve to status=merged; every merge flag
+// false (nothing merged, no merge_verdict_recorded row); the entry lifted from
+// the raw wire body; next_action fishhawk_get_merge_queue on the run's repo
+// and base. Counterfactual: delete the res.Queued arm in mergeRunCore → the
+// queued answer falls into awaitMergeTerminal → status=merged with audit
+// reads → RED.
+func TestMergeRun_QueuedReturnsImmediately(t *testing.T) {
+	runID, live, entry := uuid.New(), uuid.NewString(), uuid.NewString()
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		repo:             "x/y",
+		stateBeforeMerge: "succeeded",
+		mergeStatuses:    []int{http.StatusAccepted},
+		mergeRawBody:     fmt.Sprintf(queuedWireBody, runID, live, entry),
+		auditEntries:     []AuditEntry{{Sequence: 99, Category: "pr_merged"}},
+	}
+	r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+	start := time.Now()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a 202 queued answer must be a status, not a tool error", err)
+	}
+	if out.Status != "queued" {
+		t.Fatalf("status = %q, want queued", out.Status)
+	}
+	if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded || out.AlreadyMerged || out.VerdictSequence != 0 {
+		t.Errorf("merge flags = %+v, want all false (nothing merged, no verdict row)", out)
+	}
+	if out.QueueState != "held" || out.QueuePosition != 2 || out.LiveRunID != live || out.EntryID != entry ||
+		out.BaseRef != "main" || out.AnchoredHeadSHA != "H2" || out.IntentSequence != 41 || out.AlreadyQueued {
+		t.Errorf("queue fields = state %q pos %d live %q entry %q base %q head %q seq %d already %v, want held/2/%s/%s/main/H2/41/false",
+			out.QueueState, out.QueuePosition, out.LiveRunID, out.EntryID, out.BaseRef, out.AnchoredHeadSHA, out.IntentSequence, out.AlreadyQueued, live, entry)
+	}
+	if out.Message != "backend says: queued at position 2" || out.PRURL != "https://github.com/x/y/pull/7" {
+		t.Errorf("message/pr_url = %q/%q, want the backend's verbatim", out.Message, out.PRURL)
+	}
+	na := out.NextAction
+	if na == nil || na.Action != "fishhawk_get_merge_queue" || na.Params["repo"] != "x/y" || na.Params["base_ref"] != "main" ||
+		na.Params["run_id"] != runID.String() || na.Consumes != consumesNone {
+		t.Fatalf("next_action = %+v, want fishhawk_get_merge_queue {repo x/y, base_ref main, run_id}", na)
+	}
+	fb.mu.Lock()
+	calls, reads := fb.mergeCalls, fb.auditReadCalls
+	fb.mu.Unlock()
+	if calls != 1 || reads != 0 {
+		t.Errorf("POSTs = %d, terminal-await audit reads = %d; want 1 and 0 (the await is never armed)", calls, reads)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("mergeRun took %s, want an immediate return", elapsed)
+	}
+}
+
+// TestMergeRun_QueuedLiveAndAlreadyQueued: the run that holds the line (live,
+// no position, no live_run_id of another run) and a repeat merge_run on an
+// entry that already carried intent (already_queued) both stay status=queued
+// with the flags carried through; an answer with no message, repo or base
+// falls back to a constant message and a next_action keyed on run_id alone.
+func TestMergeRun_QueuedLiveAndAlreadyQueued(t *testing.T) {
+	runID := uuid.New()
+	for _, tc := range []struct {
+		name, body, repo string
+		wantMsg          bool
+	}{
+		{"live already queued", `{"queued":true,"queue_state":"live","entry_id":"e1","base_ref":"main","anchored_head_sha":"H","intent_sequence":7,"already_queued":true,"message":"holds the line"}`, "x/y", true},
+		{"bare answer", `{"queued":true}`, "", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL: "https://github.com/x/y/pull/7", repo: tc.repo, stateBeforeMerge: "succeeded",
+				mergeStatuses: []int{http.StatusAccepted}, mergeRawBody: tc.body,
+				auditEntries: []AuditEntry{{Sequence: 99, Category: "pr_merged"}},
+			}
+			r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it"})
+			if err != nil || out.Status != "queued" {
+				t.Fatalf("mergeRun = %q, %v; want status=queued", out.Status, err)
+			}
+			if tc.wantMsg {
+				if out.QueueState != "live" || out.QueuePosition != 0 || !out.AlreadyQueued || out.IntentSequence != 7 || out.Message != "holds the line" {
+					t.Errorf("out = %+v, want live, no position, already_queued, intent_sequence 7, the backend message", out)
+				}
+				if out.NextAction.Params["repo"] != "x/y" || out.NextAction.Params["base_ref"] != "main" {
+					t.Errorf("next_action params = %v, want repo + base_ref", out.NextAction.Params)
+				}
+			} else {
+				if !strings.Contains(out.Message, "fishhawk_get_merge_queue") || !strings.Contains(out.Message, "no merge verdict was recorded") {
+					t.Errorf("fallback message = %q, want the constant queued explanation", out.Message)
+				}
+				if _, ok := out.NextAction.Params["repo"]; ok {
+					t.Errorf("next_action params = %v, want no repo when the run carries none", out.NextAction.Params)
+				}
+				if _, ok := out.NextAction.Params["base_ref"]; ok {
+					t.Errorf("next_action params = %v, want no base_ref when the answer carries none", out.NextAction.Params)
+				}
+				if out.NextAction.Params["run_id"] != runID.String() {
+					t.Errorf("next_action run_id = %q, want %s", out.NextAction.Params["run_id"], runID)
+				}
+			}
+			fb.mu.Lock()
+			reads := fb.auditReadCalls
+			fb.mu.Unlock()
+			if reads != 0 {
+				t.Errorf("terminal-await audit reads = %d, want 0", reads)
+			}
+		})
+	}
+}
+
+// TestMergeRun_IneligibleSurfacesReasons: an INELIGIBLE run keeps today's
+// behind_base / merge_candidate_unverified / merge_candidate_held status, and
+// the 409's details.merge_queue_ineligible reason codes ride
+// merge_queue_ineligible (ADR-093 slice 1). Counterfactual: make
+// mergeQueueIneligibleFrom return nil → RED.
+func TestMergeRun_IneligibleSurfacesReasons(t *testing.T) {
+	for _, tc := range []struct{ code, status string }{
+		{"merge_base_behind", "behind_base"},
+		{"merge_candidate_unverified", "merge_candidate_unverified"},
+		{"merge_candidate_held", "merge_candidate_held"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			details := map[string]any{"pr_url": "https://github.com/x/y/pull/7", "merge_queue_ineligible": []string{"not_approved", "checks_not_green"}}
+			fb := &mergeRunFakeBackend{
+				prURL: "https://github.com/x/y/pull/7", stateBeforeMerge: "succeeded",
+				mergeStickyStatus: http.StatusConflict, mergeErrBody: mergeCandidateErrBody(tc.code, "refused", details),
+			}
+			r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+			if err != nil || out.Status != tc.status {
+				t.Fatalf("mergeRun = %q, %v; want %s", out.Status, err, tc.status)
+			}
+			if strings.Join(out.MergeQueueIneligible, ",") != "not_approved,checks_not_green" {
+				t.Errorf("merge_queue_ineligible = %v, want [not_approved checks_not_green]", out.MergeQueueIneligible)
+			}
+		})
+	}
+}
+
+// TestMergeQueueIneligibleFrom pins the defensive decode of a detail that
+// crossed an HTTP JSON boundary: absent, wrong-typed or empty is nil, and a
+// non-string or blank member is skipped rather than failing the status.
+func TestMergeQueueIneligibleFrom(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		details map[string]any
+		want    string
+	}{
+		{"nil details", nil, ""},
+		{"absent", map[string]any{"pr_url": "p"}, ""},
+		{"wrong type", map[string]any{"merge_queue_ineligible": "not_approved"}, ""},
+		{"empty", map[string]any{"merge_queue_ineligible": []any{}}, ""},
+		{"mixed members", map[string]any{"merge_queue_ineligible": []any{"undeterminable", 3.0, " ", nil, "checks_red"}}, "undeterminable,checks_red"},
+	} {
+		got := mergeQueueIneligibleFrom(tc.details)
+		if strings.Join(got, ",") != tc.want || (tc.want == "" && got != nil) {
+			t.Errorf("%s: got %#v, want %q", tc.name, got, tc.want)
+		}
 	}
 }

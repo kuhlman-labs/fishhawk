@@ -217,6 +217,14 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// its own run; every other identity needs scopeGateViewRead (read:audit).
 	"fishhawk_get_gate_view": {anyOf: []string{scopeGateViewRead}, runBoundSubjectOK: true},
 
+	// fishhawk_get_merge_queue (ADR-093 slice 1, E87.4 / #4295) MIRRORS GET
+	// /v0/repos/{owner}/{name}/merge-queue: handleGetMergeQueue refuses a
+	// run-bound subject 403 run_token_forbidden and otherwise calls
+	// requireWriteScope(scopeMergeQueueRead) = read:audit, so NO
+	// runBoundSubjectOK. Pinned by
+	// TestMCPToolScopeTable_GetMergeQueueMirrorsHandler.
+	"fishhawk_get_merge_queue": {anyOf: []string{scopeGateViewRead}},
+
 	// product_report.go handleFileProductReport: mutually-exclusive switch —
 	// a run-bound token may file on its OWN run without write:runs; any other
 	// bearer must hold write:runs.

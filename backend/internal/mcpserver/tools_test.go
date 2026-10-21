@@ -3515,7 +3515,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// specialist_job_requester_not_a_seat); get needs read:runs. Their own
 	// tools, not run verbs: a job has no stage, writes no run or stage row,
 	// and is admitted through local-verify:<host>. 77 -> 79.
-	const wantToolCount = 80
+	//
+	// E87.4 / #4295 (ADR-093 slice 1 D7) adds exactly ONE tool —
+	// fishhawk_get_merge_queue, the thin read over GET
+	// /v0/repos/{owner}/{name}/merge-queue. WHEN: fishhawk_merge_run returned
+	// status=queued (its next_action), or the operator wants to see which runs
+	// hold or wait for a repository's merge line. ELIGIBILITY: read:audit; the
+	// backend refuses a run-bound token 403 run_token_forbidden. Its own tool,
+	// not a run-status mode: the read spans every run on the base, in the
+	// caller's account. Bumped by exactly ONE from the base (approval
+	// condition C1): 80 -> 81.
+	const wantToolCount = 81
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3544,6 +3554,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawWaiveConcerns {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
+	}
+	// fishhawk_get_merge_queue (E87.4 / #4295) must likewise be wire-visible:
+	// the 80 -> 81 bump alone would stay green if its registration were
+	// dropped and a DIFFERENT tool added in the same change.
+	var sawGetMergeQueue bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_get_merge_queue" {
+			sawGetMergeQueue = true
+			break
+		}
+	}
+	if !sawGetMergeQueue {
+		t.Error("fishhawk_get_merge_queue is not in the registered tool list — the merge-queue read fishhawk_merge_run's status=queued names is unreachable")
 	}
 	// fishhawk_request_specialist_job / fishhawk_get_specialist_job (#4300)
 	// must likewise be wire-visible: the 77 -> 79 bump alone would stay green

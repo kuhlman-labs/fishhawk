@@ -104,8 +104,19 @@ type MergeRunInput struct {
 //     fishhawk_await_review while a round is in flight, before the PR opens,
 //     or for a gating parent with no round (whose message names
 //     fishhawk_fixup_stage).
+//   - "queued" — ADR-093 slice 1 (E87.4 / #4295): the run is merge-queue
+//     ELIGIBLE and the endpoint's 202 answer ENQUEUED it in its base's merge
+//     queue (or marked merge intent on its existing entry) instead of refusing
+//     it as behind / unverified / held. IMMEDIATE: the tool NEVER enters the
+//     terminal await, because nothing merged and no merge_verdict_recorded row
+//     was written (merge_queued / verdict_recorded / already_recorded are all
+//     false). QueueState / QueuePosition / LiveRunID / EntryID / BaseRef /
+//     AnchoredHeadSHA / AlreadyQueued / IntentSequence carry the entry, and
+//     NextAction names fishhawk_get_merge_queue. An INELIGIBLE run instead
+//     keeps the behind_base / merge_candidate_unverified / merge_candidate_held
+//     status, with MergeQueueIneligible naming the reason codes.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete, queued"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -140,13 +151,27 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued, fishhawk_get_merge_queue (watch the base's line)"`
 	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness statuses"`
 	// QueuePosition / AnchoredHeadSHA / LiveRunID ride status
-	// merge_candidate_held only (ADR-092 / #4200), from the 409's details.
-	QueuePosition   int    `json:"queue_position,omitempty" jsonschema:"on merge_candidate_held: the run's 1-based place among its base's held merge-candidate passes"`
-	AnchoredHeadSHA string `json:"anchored_head_sha,omitempty" jsonschema:"on merge_candidate_held: the PR head the held pass is anchored to (admission re-reads and may auto-advance it)"`
-	LiveRunID       string `json:"live_run_id,omitempty" jsonschema:"on merge_candidate_held: the run holding the base's merge-candidate line, when one does"`
+	// merge_candidate_held (ADR-092 / #4200), from the 409's details, and
+	// status queued (ADR-093 slice 1, E87.4 / #4295), from the 202 body.
+	QueuePosition   int    `json:"queue_position,omitempty" jsonschema:"on merge_candidate_held and queued: the run's 1-based place among its base's held entries (omitted when the run holds the line)"`
+	AnchoredHeadSHA string `json:"anchored_head_sha,omitempty" jsonschema:"on merge_candidate_held and queued: the PR head the entry is anchored to (admission re-reads and may auto-advance it)"`
+	LiveRunID       string `json:"live_run_id,omitempty" jsonschema:"on merge_candidate_held and queued: the run holding the base's merge-candidate line, when one does"`
+	// QueueState / EntryID / BaseRef / AlreadyQueued / IntentSequence ride
+	// status queued only (ADR-093 slice 1), from the 202 body.
+	QueueState     string `json:"queue_state,omitempty" jsonschema:"on queued: live (the run holds its base's line; its merge-candidate pass runs there) or held (waiting at queue_position)"`
+	EntryID        string `json:"entry_id,omitempty" jsonschema:"on queued: the merge-queue entry id"`
+	BaseRef        string `json:"base_ref,omitempty" jsonschema:"on queued: the base ref whose queue the run entered"`
+	AlreadyQueued  bool   `json:"already_queued,omitempty" jsonschema:"on queued: true when the entry already carried merge intent, so this call wrote nothing"`
+	IntentSequence int64  `json:"intent_sequence,omitempty" jsonschema:"on queued: the audit sequence of the merge_queue_entered row that recorded your merge intent and verdict"`
+	// MergeQueueIneligible rides the behind_base / merge_candidate_unverified
+	// / merge_candidate_held statuses (ADR-093 slice 1): the 409's
+	// details.merge_queue_ineligible, the eligibility reason codes that kept
+	// the run OUT of the merge queue. Absent when the endpoint did not
+	// evaluate eligibility (no queue wired, or an older backend).
+	MergeQueueIneligible []string `json:"merge_queue_ineligible,omitempty" jsonschema:"on behind_base / merge_candidate_unverified / merge_candidate_held: why the run was NOT enqueued (not_approved, review_pending, review_coverage_incomplete, acceptance_not_eligible, acceptance_stale, checks_not_green, checks_red, blocking_concern_open, undeterminable); nothing was written. Clear each, then re-invoke"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
 	// approval deferred to E39). Queueing the merge before that approval is
@@ -308,6 +333,27 @@ Statuses:
                      fishhawk_await_review (a round is in flight, the PR is not
                      open yet, or a gating parent has no round — the message
                      then names fishhawk_fixup_stage).
+  - "queued"        — ADR-093 slice 1 (E87.4 / #4295): the run is merge-queue
+                     ELIGIBLE (review gate approved with a LIVE forge
+                     approval, acceptance merge-eligible and not stale,
+                     required checks green at the head, no open blocking
+                     concern), so instead of refusing it as behind_base /
+                     merge_candidate_unverified / merge_candidate_held the
+                     endpoint ENQUEUED it in its base's merge queue with your
+                     merge intent (202). Immediate: the tool does NOT await a
+                     terminal merge — nothing merged yet and no
+                     merge_verdict_recorded row was written; your verdict rides
+                     the merge_queue_entered audit row (intent_sequence).
+                     queue_state (live / held), queue_position, live_run_id,
+                     entry_id, base_ref and anchored_head_sha carry the entry;
+                     already_queued:true means the entry already carried merge
+                     intent and nothing was written. Admission is automatic:
+                     the queue advances the branch, re-anchors and starts its
+                     pass. next_action names fishhawk_get_merge_queue; re-invoke
+                     fishhawk_merge_run once the pass is green. An INELIGIBLE
+                     run keeps the behind_base / merge_candidate_unverified /
+                     merge_candidate_held status and nothing is written;
+                     merge_queue_ineligible names the reason codes.
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -334,7 +380,10 @@ Tool errors:
     merge_candidate_check_failed (502 — ADR-090 D7: on a fully wired GitHub
     run a forge or audit read error fails the merge-candidate gate CLOSED;
     nothing was recorded and the call is retryable; re-invoke),
-    merge_unconfigured (503)
+    merge_unconfigured (503), merge_queue_unrecorded / merge_queue_write_failed
+    (503 — ADR-093 slice 1: the merge intent could not be recorded on the
+    audit chain, or the queue could not be written after it was; the run is
+    NOT queued and the call is retryable; re-invoke)
 
 The backend's 409 merge_checks_pending is NOT surfaced as a tool error: it is
 the checks-not-all-passed precondition the tool WAITS on (re-POSTing on the poll
@@ -351,7 +400,9 @@ merge_candidate_verify_failed (ADR-090) are likewise NOT tool errors: each is
 returned IMMEDIATELY as status=behind_base / merge_candidate_unverified /
 merge_candidate_verify_failed with next_action naming the clearing verb. So is
 the ADR-092 409 merge_candidate_held (status=merge_candidate_held,
-next_action fishhawk_get_run_status).
+next_action fishhawk_get_run_status). With the merge queue wired, an ELIGIBLE
+run meeting one of those three gates is enqueued instead (status=queued); an
+ineligible one keeps the 409 status with merge_queue_ineligible set.
 
 The backend's 409 acceptance_stale / approval_dismissed (#4086) and
 review_coverage_incomplete (#4219) are likewise NOT tool errors: each is returned IMMEDIATELY under the same status name with
@@ -475,11 +526,12 @@ func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start ti
 	}
 	reason := "ADR-090: Fishhawk merges only an up-to-date, verified merge candidate; re-invoke fishhawk_merge_run once this clears"
 	out := MergeRunOutput{
-		Status:        status,
-		PRURL:         prURL,
-		WaitedSeconds: time.Since(start).Seconds(),
-		Note:          mergeRunNote,
-		Message:       msg,
+		Status:               status,
+		PRURL:                prURL,
+		WaitedSeconds:        time.Since(start).Seconds(),
+		Note:                 mergeRunNote,
+		Message:              msg,
+		MergeQueueIneligible: mergeQueueIneligibleFrom(ae.Details),
 	}
 	if status == "merge_candidate_held" {
 		// ADR-092 (#4200): the held entry, from the 409's details. A JSON
@@ -499,6 +551,64 @@ func mergeCandidateOutput(ae *apiError, status string, runID uuid.UUID, start ti
 		Reason:       reason,
 	}
 	return out
+}
+
+// mergeQueueIneligibleFrom reads details.merge_queue_ineligible (ADR-093
+// slice 1, E87.4 / #4295): the eligibility reason codes the endpoint's
+// merge-queue enqueue arm refused with. DEFENSIVE: the map crossed an HTTP
+// JSON boundary, so an absent, wrong-typed or empty value is nil, and a
+// non-string or blank member is skipped.
+func mergeQueueIneligibleFrom(details map[string]any) []string {
+	raw, _ := details["merge_queue_ineligible"].([]any)
+	var out []string
+	for _, v := range raw {
+		if code, ok := v.(string); ok && strings.TrimSpace(code) != "" {
+			out = append(out, code)
+		}
+	}
+	return out
+}
+
+// queuedOutput builds the IMMEDIATE status=queued checkpoint for the
+// endpoint's ADR-093 202 answer (E87.4 / #4295): the run entered its base's
+// merge queue with the operator's merge intent. Nothing merged and no
+// merge_verdict_recorded row was written, so every merge flag is false and
+// the tool never arms the terminal await. NextAction names
+// fishhawk_get_merge_queue on the run's repository and base.
+func queuedOutput(res *MergeRunResult, repo string, runID uuid.UUID, start time.Time) MergeRunOutput {
+	params := map[string]string{"run_id": runID.String()}
+	if repo != "" {
+		params["repo"] = repo
+	}
+	if res.BaseRef != "" {
+		params["base_ref"] = res.BaseRef
+	}
+	msg := res.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "the run is merge-queue eligible and was queued in its base's merge queue (ADR-093 D2); nothing merged yet and no merge verdict was recorded. Watch it with fishhawk_get_merge_queue, then re-invoke fishhawk_merge_run once its merge-candidate pass is green."
+	}
+	return MergeRunOutput{
+		Status:          "queued",
+		PRURL:           res.PRURL,
+		WaitedSeconds:   time.Since(start).Seconds(),
+		Note:            mergeRunNote,
+		Message:         msg,
+		QueueState:      res.QueueState,
+		QueuePosition:   res.QueuePosition,
+		LiveRunID:       res.LiveRunID,
+		EntryID:         res.EntryID,
+		BaseRef:         res.BaseRef,
+		AnchoredHeadSHA: res.AnchoredHeadSHA,
+		AlreadyQueued:   res.AlreadyQueued,
+		IntentSequence:  res.IntentSequence,
+		NextAction: &SuggestedAction{
+			Action:       "fishhawk_get_merge_queue",
+			Params:       params,
+			Precondition: "the run is in its base's merge queue with merge intent recorded (queued)",
+			Consumes:     consumesNone,
+			Reason:       "ADR-093: admission is automatic — the queue advances the branch, re-anchors and starts the merge-candidate pass when the line frees; watch the line, dispatch and await the pass once admitted on a local runner, then re-invoke fishhawk_merge_run",
+		},
+	}
 }
 
 // readinessStatuses maps the backend's merge-readiness 409 codes (#4086) to the
@@ -1011,6 +1121,15 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 		case <-timer.C:
 		}
+	}
+
+	// QUEUED ARM (ADR-093 slice 1, E87.4 / #4295). The endpoint ENQUEUED an
+	// eligible behind / unverified / held run (202) instead of merging it:
+	// nothing merged and no merge_verdict_recorded row exists, so there is no
+	// anchor to await past and nothing would settle within the budget. Return
+	// at once, BEFORE the terminal await is ever armed.
+	if res.Queued {
+		return nil, queuedOutput(res, run.Repo, runID, start), nil
 	}
 
 	out := MergeRunOutput{
