@@ -107,12 +107,14 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   `merge_queue_entered` row does NOT use this seam: a chained append locks
   the runs row `FOR UPDATE` and would wait on the insert's own `FOR KEY
   SHARE`. It appends BEFORE the write instead, under `WithMergeIntentLock`.
-- **`WithMergeIntentLock(runID, fn)`**: runs `fn` while holding the run's
-  merge-intent lock (§ "Merge-intent lock"); returns `fn`'s error as is, the
-  context's error (fn not run) when the wait ends first,
-  `ErrIntentLockLapsed` when `fn` returned nil but the lock could not be
-  confirmed held through its release, and `ErrInvalidRequest` for a nil run
-  id.
+- **`WithMergeIntentLock(runID, fn)`**: runs `fn(ctx)` while holding the
+  run's merge-intent lock (§ "Merge-intent lock"); `fn`'s context is bounded
+  by `intentFnTimeout` and must not take another pglock lock. Returns `fn`'s
+  error as is, the context's error (fn not run) when the wait ends first,
+  `ErrIntentLockLapsed` (wrapping `pglock.ErrLockLapsed`) when `fn` returned
+  nil but the lock could not be confirmed held through its release,
+  `pglock.ErrNestedLock` when called from inside another pglock `fn`, and
+  `ErrInvalidRequest` for a nil run id.
 - **`ActiveForRun(runID)`** → `(Status, found, error)`: the run's active entry,
   its 1-based `Position` among the base's held entries (0 when live), and
   `LiveRunID` (the base's live run; the entry's own run when it is live; nil
@@ -190,34 +192,51 @@ append runs on its own connection, so the decision cannot share one
 transaction with the write.
 
 - **Lock.** A SESSION-level `pg_try_advisory_lock` on
-  `sha256("fishhawk:mergequeue-intent:" + run id)`, held on one dedicated
-  pooled connection that runs no transaction while `fn` runs on others (the
-  `run.WithConsolidatedPROpenLock` shape). The session is never idle in a
-  transaction, so a server-side `idle_in_transaction_session_timeout`
-  cannot end it mid-`fn`
+  `sha256("fishhawk:mergequeue-intent:" + run id)`, taken through
+  `pglock.WithSessionLock` and held on one dedicated pooled connection that
+  runs no transaction while `fn` runs on others (the shape every pglock
+  helper shares; contract in the `backend/internal/pglock` package doc). The
+  session is never idle in a transaction, so a server-side
+  `idle_in_transaction_session_timeout` cannot end it mid-`fn`
   (`TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout`). The domain
   is disjoint from the per-run Enqueue key, so `fn`'s own Enqueue never
   waits on its holder.
 - **Lapse.** After `fn` the lock is released with `pg_advisory_unlock`.
   When that fails or finds no lock (the session died mid-`fn`, so another
   holder may have overlapped it), a nil from `fn` becomes
-  `ErrIntentLockLapsed` (`TestWithMergeIntentLock_LapsedSessionSurfaces`).
-  A connection whose lock or unlock query failed is closed before release,
-  so a lock-holding session never returns to the pool.
+  `ErrIntentLockLapsed` wrapping `pglock.ErrLockLapsed`
+  (`TestWithMergeIntentLock_LapsedSessionSurfaces`). A connection whose
+  lock or unlock query failed is closed before release, so a lock-holding
+  session never returns to the pool.
 - **Connection budget.** A holder keeps one connection for its lock and its
-  `fn` uses at most one more at a time. The store admits at most
-  `intentHolderLimit` concurrent holders: half the pool's `MaxConns`, at
-  least 1 (5 of fishhawkd's 10). Lock holders alone can never occupy every
-  connection, so concurrent merges of DISTINCT runs make progress without
-  any caller timeout
-  (`TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress`: six
-  runs on a 2-connection pool). The bound is per store. A pool of fewer
-  than 2 connections cannot run a holder's `fn`. Other pool users that hold
-  one connection while acquiring another (for example
-  `run.WithConsolidatedPROpenLock`) are outside this bound.
-- **Waiting.** A held lock releases both the holder slot and the connection
-  and re-tries every 25 ms (`mergeIntentLockPoll`), so a waiter holds
-  neither between tries. The wait is bounded only by the caller's context
+  `fn` uses at most one more at a time. Holders draw on the pool-wide
+  `pglock.BudgetFor(pool)` budget, shared with every pglock helper on the
+  same pool (`run.WithConsolidatedPROpenLock`, `refinement.WithFilingLock`),
+  not a per-store bound (`TestWithMergeIntentLock_SharesThePoolBudget`). It
+  admits `pglock.HolderLimit` = max(1, (`MaxConns` − `pglock.ReservedConns`)
+  / 2) concurrent holders, with `ReservedConns` = 2 (4 of fishhawkd's 10),
+  so at least 2 connections stay free for non-lock work even when every
+  slot is taken, and concurrent merges of DISTINCT runs make progress
+  without any caller timeout
+  (`TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress`: eight
+  runs on a 6-connection pool). A pool of fewer than `pglock.MinPoolConns`
+  (4) connections refuses every holder with `pglock.ErrPoolTooSmall`.
+  Detached work `fn` spawns (the server's detached queue pump) is ordinary
+  non-lock load bounded by its own context, not `fn`'s extra connection.
+- **fn deadline.** `fn` gets a `context.Context` bounded by
+  `intentFnTimeout` (30 s), applied even when the caller's context has no
+  deadline, so every DB call in the decision is bounded
+  (`TestWithMergeIntentLock_FnCarriesDeadline`). The bound is cooperative:
+  it reaches `fn` only through that context. The context is marked as
+  inside a pglock lock, so a nested pglock lock from `fn` is refused with
+  `pglock.ErrNestedLock`; work `fn` spawns detached starts from
+  `pglock.Detach`.
+- **Panic safety.** The unlock is deferred: a panic in `fn` still unlocks
+  and releases the connection and the budget slot, then propagates
+  (`TestWithMergeIntentLock_PanicReleasesLock`).
+- **Waiting.** A held lock releases both the budget slot and the connection
+  and re-tries every 25 ms (`pglock.Poll`), so a waiter holds neither
+  between tries. The wait is bounded only by the caller's context
   (`TestWithMergeIntentLock_SerializesOneRun`,
   `TestWithMergeIntentLock_ErrorsAndCancel`).
 

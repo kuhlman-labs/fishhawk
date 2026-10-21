@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
@@ -1303,7 +1304,14 @@ const CategoryMergeQueueEntered = "merge_queue_entered"
 // merge_queue_entered row. A lock that cannot be taken (a canceled request,
 // a pool error) fails closed to today's refusal with nothing written; a lock
 // that lapsed while the decision ran (ErrIntentLockLapsed) turns its 202
-// into a retryable 503 merge_queue_write_failed.
+// into a retryable 503 merge_queue_write_failed, after pumping the base so an
+// entry the decision just created on an idle base is still admitted. The
+// decision runs on the lock's fn context (r.WithContext), so every DB call in
+// it is bounded by the intent fn deadline even when the request carries none;
+// work it spawns detached starts from pglock.Detach, never on that context.
+// An already_queued entry whose merge_queue_entered row cannot be read back
+// answers a retryable 503 merge_queue_write_failed, never a 202 naming
+// intent_sequence 0; nothing is written on that path.
 //
 // The base is pumped DETACHED (approval condition C6), on a bounded
 // mergeCandidateAdmissionContext tracked by bgMergeQueuePump, so the 202 never
@@ -1362,9 +1370,9 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 		res          *mergeQueueIntent
 		handled, ran bool
 	)
-	if lerr := s.cfg.MergeQueue.WithMergeIntentLock(ctx, runID, func() error {
+	if lerr := s.cfg.MergeQueue.WithMergeIntentLock(ctx, runID, func(fctx context.Context) error {
 		ran = true
-		res, handled = s.recordMergeQueueIntent(w, r, runRow, prURL, verdict, subject, gate, preCommit)
+		res, handled = s.recordMergeQueueIntent(w, r.WithContext(fctx), runRow, prURL, verdict, subject, gate, preCommit)
 		return nil
 	}); lerr != nil {
 		if !ran {
@@ -1382,6 +1390,11 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 			"merge: merge-intent lock lapsed during the intent decision",
 			slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
 		if res != nil {
+			// The decision's write stands: pump the base before answering,
+			// so an entry it just created on an idle base is admitted
+			// without waiting for another queue event (the pump is
+			// idempotent under the base lock).
+			s.pumpMergeCandidateQueueDetached(ctx, res.status.Entry.Base())
 			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_write_failed",
 				"the merge-intent lock lapsed before the merge intent decision finished, so this answer cannot vouch for the queue state; read fishhawk_get_run_status, then re-invoke the merge (an entry that already carries the intent answers already_queued).",
 				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
@@ -1436,7 +1449,8 @@ type mergeQueueIntent struct {
 }
 
 // recordMergeQueueIntent is the intent decision of mergeQueueEnqueueArm: it
-// runs ONLY under the run's merge-intent lock (Store.WithMergeIntentLock), so
+// runs ONLY under the run's merge-intent lock (Store.WithMergeIntentLock), on
+// the lock's fn context (r's context is bounded and pglock-marked), so
 // two overlapping merges of one run take it in turn and the second sees the
 // first's committed intent — exactly one merge_queue_entered row per intent
 // transition, and both answers name it. It reads the entry itself: a read
@@ -1460,9 +1474,19 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 	alreadyQueued := sameBase && prior.Entry.MergeIntentAt != nil
 	var intentSeq int64
 	if alreadyQueued {
-		if rows, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeQueueEntered); lerr == nil {
-			intentSeq = mergeIntentRowSequence(rows, prior.Entry.BaseRef)
+		rows, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeQueueEntered)
+		if lerr != nil {
+			// Never a 202 naming intent_sequence 0: the answer must name the
+			// row that recorded the intent. Nothing is written here.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"merge: merge_queue_entered unreadable for an already-queued entry; not answering 202",
+				slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_write_failed",
+				"the run is already queued, but its merge_queue_entered row could not be read back, so this answer cannot name the intent_sequence; nothing was written. Re-invoke the merge to retry.",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return nil, true
 		}
+		intentSeq = mergeIntentRowSequence(rows, prior.Entry.BaseRef)
 	} else {
 		fields := map[string]any{
 			"run_id":            runID.String(),
@@ -1514,7 +1538,9 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 				if res.Dropped != nil {
 					s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueSettled, *res.Dropped, nil)
 					if res.Dropped.State == mergequeue.StateLive {
-						s.pumpMergeCandidateQueueDetached(ctx, res.Dropped.Base())
+						// ctx is the lock's fn context: detach so the pump
+						// is not refused as a nested pglock lock.
+						s.pumpMergeCandidateQueueDetached(pglock.Detach(ctx), res.Dropped.Base())
 					}
 				}
 				switch res.Outcome {
