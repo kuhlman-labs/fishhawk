@@ -3515,7 +3515,17 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// specialist_job_requester_not_a_seat); get needs read:runs. Their own
 	// tools, not run verbs: a job has no stage, writes no run or stage row,
 	// and is admitted through local-verify:<host>. 77 -> 79.
-	const wantToolCount = 80
+	//
+	// #4234 (E83.100) adds exactly ONE tool — fishhawk_campaign_hotfix, the
+	// thin wrapper over POST /v0/campaigns/{campaign_id}/hotfix. WHEN: one
+	// urgent issue must jump a (possibly running) campaign's queue as an
+	// expedited item, optionally holding the campaign's other implement
+	// dispatches until it settles. ELIGIBILITY: write:campaigns; the backend
+	// refuses run-bound and delegated operator-agent tokens for the whole
+	// verb. Its own tool, not an append mode: it records campaign_item_added
+	// (not campaign_items_appended), binds the item's workflow, and owns the
+	// dispatch hold. 80 -> 81.
+	const wantToolCount = 81
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

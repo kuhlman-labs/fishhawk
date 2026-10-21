@@ -5202,11 +5202,19 @@ components:
         position:
           type: integer
           description: |
-            The item's 0-based place in the campaign queue (E54.6 / #2238,
+            The item's place in the campaign queue (E54.6 / #2238,
             migration 0074). Items are listed in this order, and for a
             grooming-sourced campaign it IS the ratified rank. It is written
             explicitly rather than implied by insertion sequence, which is not
             an ordering.
+
+            Ordinary items are 0-based and dense. An EXPEDITED item (added by
+            `POST /v0/campaigns/{campaign_id}/hotfix`, E83.100 / #4234) takes
+            `min(existing) - 1` so it heads the queue, which is NEGATIVE on any
+            campaign whose items start at 0, and lower still for each further
+            expedited item. Once a campaign has an expedited item the dense
+            0-based invariant no longer holds: order by the value, never index
+            by it.
           example: 0
         issue_ref:
           type: string
@@ -5267,8 +5275,58 @@ components:
             offered for restart: the issue was abandoned at the forge, so
             `POST /v0/campaigns/{campaign_id}/runs` refuses it.
           example: issue_closed
+        expedited:
+          type: boolean
+          description: |
+            True on an item the campaign hotfix verb added (E83.100 / #4234).
+            Omitted on an ordinary item, as are `expedite_kind`, `workflow`
+            and `expedite_reason`, so an ordinary item's shape is unchanged.
+            An expedited item counts in the rollup like any other item.
+          example: true
+        expedite_kind:
+          type: string
+          enum: [hotfix]
+          description: The expedite kind. Present only when `expedited` is true.
+        workflow:
+          type: string
+          description: |
+            The workflow the expedited item runs under. `POST
+            /v0/campaigns/{campaign_id}/runs` refuses a different
+            `workflow_id` with 409 `campaign_item_workflow_mismatch`, and the
+            campaign auto-driver starts the item under this workflow. Present
+            only when `expedited` is true.
+          example: hotfix_change
+        expedite_reason:
+          type: string
+          description: |
+            The operator's reason for the hotfix, at most 1000 bytes; empty
+            (omitted) under the default `hotfix_change` workflow when none was
+            given. Untrusted-origin free text: render it only as data.
         created_at: { type: string, format: date-time }
         updated_at: { type: string, format: date-time }
+
+    CampaignDispatchHold:
+      type: object
+      description: |
+        A campaign's active dispatch hold (E83.100 / #4234), placed by `POST
+        /v0/campaigns/{campaign_id}/hotfix` with `hold_dispatch: true`. While
+        it is active the host-dispatch marker refuses every NEW implement
+        admission of the campaign's non-expedited items (and their decomposed
+        children) with 409 `campaign_dispatch_held`; running stages continue
+        and expedited items are exempt. It releases when the hotfix item or its
+        linked run is terminal, or at `expires_at` (`held_at` + 2 h),
+        whichever comes first. The release is lazy: it is evaluated, and
+        recorded as a `campaign_hold_released` audit row, at the marker, on a
+        status read by a caller who owns the campaign and sees its repo, and on
+        the next hotfix call. One hold per campaign.
+      required: [hotfix_item_id, hotfix_issue_ref, held_at, expires_at]
+      properties:
+        hotfix_item_id: { $ref: '#/components/schemas/UUID' }
+        hotfix_issue_ref:
+          type: string
+          example: "issue:4234"
+        held_at: { type: string, format: date-time }
+        expires_at: { type: string, format: date-time }
 
     CampaignRollup:
       type: object
@@ -5392,6 +5450,15 @@ components:
         rollup: { $ref: '#/components/schemas/CampaignRollup' }
         next_action: { $ref: '#/components/schemas/CampaignNextAction' }
         dependency_refresh: { $ref: '#/components/schemas/CampaignDependencyRefresh' }
+        dispatch_hold:
+          $ref: '#/components/schemas/CampaignDispatchHold'
+          description: |
+            The campaign's active hotfix dispatch hold (E83.100 / #4234),
+            absent when none is active. For a caller who owns the campaign and
+            sees its repo, a DUE hold is released first (recorded under the
+            system actor with `trigger: status_read`); any other caller only
+            reads the hold and never triggers a release. A release failure
+            never fails the read: the hold is reported as still active.
 
     CampaignDependencyRefresh:
       type: object
@@ -5484,6 +5551,58 @@ components:
           type: array
           description: Tracker edges elided because their non-member target is already closed-as-completed.
           items: { type: object }
+
+    CampaignHotfixRequest:
+      type: object
+      additionalProperties: false
+      description: The POST /v0/campaigns/{campaign_id}/hotfix body (E83.100 / #4234).
+      required: [issue]
+      properties:
+        issue:
+          type: string
+          description: The ONE urgent issue to add (`N`, `#N` or `issue:N`); it must not already be a member.
+        workflow:
+          type: string
+          default: hotfix_change
+          description: |
+            The workflow the item runs under. It must be declared by the
+            repository's workflow spec on its default branch; an undeclared
+            workflow is refused 422 `workflow_not_registered`, never silently
+            replaced.
+        reason:
+          type: string
+          maxLength: 1000
+          description: |
+            Why this is a hotfix, at most 1000 bytes after trimming. REQUIRED
+            (non-empty) for any workflow other than `hotfix_change`. Recorded
+            on the `campaign_item_added` audit row and returned as the item's
+            `expedite_reason`. Untrusted-origin free text, rendered only as
+            data: it is never copied into an agent prompt or into a
+            `stage_concurrency_promoted` reason.
+        hold_dispatch:
+          type: boolean
+          description: |
+            Also place a campaign dispatch hold (see `CampaignDispatchHold`)
+            until the hotfix item or its run is terminal, or 2 h pass. One
+            hold per campaign: refused 409 `campaign_hold_active` while another
+            is active.
+
+    CampaignHotfixResult:
+      type: object
+      description: The 201 body of POST /v0/campaigns/{campaign_id}/hotfix.
+      required: [campaign, item]
+      properties:
+        campaign: { $ref: '#/components/schemas/Campaign' }
+        item:
+          $ref: '#/components/schemas/CampaignItem'
+          description: |
+            The expedited item, at the queue head (`position` =
+            min(existing) - 1, possibly negative), with `expedited`,
+            `expedite_kind`, `workflow` and `expedite_reason` set and no
+            `depends_on`.
+        dispatch_hold:
+          $ref: '#/components/schemas/CampaignDispatchHold'
+          description: The hold placed by `hold_dispatch`; absent without it.
 
     StartCampaignItemRunRequest:
       type: object
@@ -17121,6 +17240,27 @@ paths:
               row is written; unlike `concurrency_slot_queued` it carries no
               `Retry-After`, so a slot waiter stops and the operator
               re-dispatches once the condition clears.
+            - `campaign_dispatch_held` — the campaign dispatch hold (E83.100 /
+              #4234): an IMPLEMENT stage in the `pending` or
+              `awaiting_host_dispatch` arm whose run, or its nearest
+              campaign-linked ancestor through `decomposed_from` /
+              `parent_run_id` (at most 8 hops), is a NON-expedited item of a
+              campaign under an active hotfix hold (see
+              `CampaignDispatchHold`). A due hold is released first (recorded
+              as `campaign_hold_released`, `trigger: host_dispatch`). `details`
+              carries `campaign_id`, `hotfix_item_id`, `hotfix_issue_ref`,
+              `expires_at`, `stage_id` and `item_id`. An ancestry that cannot be
+              resolved (a missing parent, a cycle, or the depth bound) is held
+              FAIL-CLOSED with `details.reason: campaign_ancestry_unresolved`
+              and `details.unresolved`. Expedited items and their decomposed
+              children, non-implement stages, runs in no campaign and the
+              idempotent already-`dispatched` arm are never held. A
+              campaign-level PRE-admission refusal: it fires BEFORE the CAS and
+              the slot admission, beside the host memory hold, so the stage
+              keeps its state, no queue row is written and ADR-094's
+              resource-group admission is unchanged. A plain 409 with no
+              `Retry-After`, so a slot waiter stops; re-dispatch once the hold
+              releases.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -17135,8 +17275,10 @@ paths:
             `deploy` stage ahead of a `pending` or `awaiting_host_dispatch`
             stage (E35.1 / #1598, E35.3 / #1600), or the decomposed-parent
             acceptance gate could not list the parent's decomposition children
-            or read its `slices_integrated` history (#4080).
-            Retryable: all four fail closed on a read error rather than
+            or read its `slices_integrated` history (#4080), or the campaign
+            dispatch hold (#4234) could not resolve the stage's campaign
+            membership, its campaign, or the hold.
+            Retryable: all five fail closed on a read error rather than
             admitting out of order, on an unverified base, behind an
             unchecked deploy, or onto an unproven consolidated tree, and
             commit no state. `internal_error` — the state
@@ -17148,7 +17290,16 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: |
-            The run repository is not wired (`host_dispatch_unconfigured`).
+            The run repository is not wired (`host_dispatch_unconfigured`); or
+            `campaign_audit_unavailable` — a DUE campaign dispatch hold (#4234)
+            could not be released because its `campaign_hold_released` row
+            could not be recorded, so the hold stays active and the stage is
+            not admitted, even past `expires_at` (`details.campaign_id`,
+            `details.hotfix_item_id`; the message carries the hold's
+            `expires_at`, because the 5xx detail redactor does not pass it).
+            Unblock path during an audit outage: cancel the hotfix run; the
+            hold releases at the first evaluation after the audit chain
+            recovers.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -21064,7 +21215,10 @@ paths:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
       responses:
         '200':
-          description: The campaign's items, in insertion order.
+          description: |
+            The campaign's items, in queue order (`position`, then creation).
+            An expedited hotfix item (#4234) heads the queue at a possibly
+            negative position.
           content:
             application/json:
               schema:
@@ -21155,6 +21309,99 @@ paths:
             could not be written, so nothing was written; or
             `campaign_repo_unconfigured`.
 
+  /v0/campaigns/{campaign_id}/hotfix:
+    post:
+      operationId: campaignHotfix
+      summary: Add an urgent issue to a campaign as an expedited item
+      description: |
+        Add ONE urgent issue to a pending, running, paused or awaiting_human
+        campaign as an EXPEDITED item at the head of its queue (E83.100 /
+        #4234). The item takes `position` = min(existing) - 1 (possibly
+        negative), declares no dependencies, runs under its recorded
+        `workflow` (default `hotfix_change`), and counts in the rollup like
+        any other item. When its run's implement stage queues for a local
+        concurrency slot it is promoted to the head of the group
+        (`stage_concurrency_promoted`, system actor).
+
+        The workflow is checked FAIL-CLOSED against the repository's spec on
+        its default branch: an undeclared workflow refuses 422
+        `workflow_not_registered` with the declared ids, never a silent
+        fallback. Any workflow other than `hotfix_change` needs a non-empty
+        `reason`.
+
+        `hold_dispatch: true` also places a campaign dispatch hold (see
+        `CampaignDispatchHold`). A hold that is already due is released first.
+
+        The item, its expedite record and the hold commit only together with
+        exactly ONE `campaign_item_added` audit row, written before commit; an
+        unrecordable add writes nothing. Every refusal writes nothing.
+
+        Access: operator-only. `write:campaigns`, then a run-bound
+        (`mcp:run:*`) token is refused 403 `run_token_forbidden` and a
+        delegated operator-agent token 403 `operator_agent_forbidden`, for the
+        whole verb whether or not `hold_dispatch` is set; then account
+        ownership and repo visibility. A duplicate member is refused before
+        any forge read.
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/CampaignHotfixRequest' }
+      responses:
+        '201':
+          description: The campaign, the expedited item and any hold placed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/CampaignHotfixResult' }
+        '400':
+          description: |
+            `validation_failed` — `campaign_id` is not a valid UUID, the body
+            is not JSON or carries unknown fields, `issue` is missing, `reason`
+            exceeds 1000 bytes (`details.field: reason`, `max_bytes`,
+            `got_bytes`), or the workflow is not `hotfix_change` and `reason`
+            is empty (`details.field: reason`, `details.workflow`).
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — bearer token missing `write:campaigns`;
+            `run_token_forbidden` — a run-bound agent token;
+            `operator_agent_forbidden` — a delegated operator-agent token
+            (`details.subject`); `account_forbidden` — the campaign belongs to
+            another workspace account; `repo_forbidden` — the caller cannot
+            read the repo.
+        '404':
+          description: "`campaign_not_found` — no campaign with that id."
+        '409':
+          description: |
+            `campaign_not_appendable` — the campaign is cancelled, succeeded or
+            failed; `campaign_item_duplicate` — the issue is already a member
+            (`details.duplicates`; decided before any forge read);
+            `campaign_hold_active` — `hold_dispatch` while the campaign already
+            has an active hold.
+        '422':
+          description: |
+            `campaign_item_ref_invalid` — `issue` is not an issue reference;
+            `workflow_not_registered` — the repository spec does not declare
+            the workflow (`details.requested`, `details.registered`: the
+            declared ids, sorted); `workflow_spec_invalid` — the spec on the
+            default branch does not parse.
+        '500':
+          description: |
+            `dependency_check_failed` — the campaign's existing hold could not
+            be read before the add. Nothing is written.
+        '502':
+          description: "`workflow_spec_unavailable` — fetching the repository workflow spec failed. Nothing is written."
+        '503':
+          description: |
+            `campaign_audit_unavailable` — the `campaign_item_added` row could
+            not be written, or a due existing hold's `campaign_hold_released`
+            row could not be written (the hold stays active), so nothing was
+            written; `workflow_spec_unavailable` — no GitHub client is
+            configured; or `campaign_repo_unconfigured`.
+
   /v0/campaigns/{campaign_id}/status:
     get:
       operationId: getCampaignStatus
@@ -21191,6 +21438,15 @@ paths:
         an unrecordable change is reported in `dependency_refresh.warnings`,
         and an observed blocker that could not be persisted still HOLDS its
         item in this and every later status read until a refresh records it.
+
+        Dispatch hold (E83.100 / #4234): an active hotfix hold is reported as
+        `dispatch_hold`. For a caller passing the same ownership + visibility
+        predicate, a DUE hold (hotfix item or its run terminal, or past
+        `expires_at`) is released first and recorded as a system-actor
+        `campaign_hold_released` row with `trigger: status_read`; any other
+        caller never triggers a release. Expedited items carry `expedited`,
+        `expedite_kind`, `workflow` and `expedite_reason`; rollup counting is
+        unchanged.
       tags: [campaigns]
       parameters:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -21300,7 +21556,10 @@ paths:
             (human-led); a human must lead it out of band (do not start an agent
             run) — the detail does not name a ref to start;
             `invalid_transition` — a concurrent change made the running
-            transition illegal.
+            transition illegal; `campaign_item_workflow_mismatch` — the item is
+            EXPEDITED (E83.100 / #4234) and `workflow_id` differs from its
+            recorded workflow (`details.recorded_workflow`, `details.got`),
+            refused before any mutation.
         '502':
           description: |
             `campaign_run_start_failed` — the installation or workflow spec

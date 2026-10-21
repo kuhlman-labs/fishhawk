@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
@@ -119,6 +120,9 @@ type GetCampaignStatusOutput struct {
 	// DependencyRefresh passes the backend's monotone dependency refresh block
 	// through (E86.47 / #4358).
 	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty" jsonschema:"the monotone dependency refresh this poll ran: tracker blocked-by links and Depends-on lines re-read for unstarted items; edges are only ever ADDED (held), never removed. skipped_reason is in_flight/min_interval (30 s per campaign)/foreign_account/repo_not_visible/no_candidates; warnings name an unrecorded or unreadable refresh. Absent when the deployment disables it"`
+	// DispatchHold passes the backend's active hotfix dispatch hold through
+	// (E83.100 / #4234).
+	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty" jsonschema:"present while a fishhawk_campaign_hotfix hold_dispatch hold is active: new implement dispatches of the campaign's other (non-expedited) items are refused campaign_dispatch_held until the hotfix item or its run is terminal or expires_at passes. Absent when not held"`
 }
 
 // appendCampaignItemsInput is the fishhawk_append_campaign_items tool's input.
@@ -133,6 +137,23 @@ type appendCampaignItemsOutput struct {
 	Campaign              Campaign                      `json:"campaign"`
 	Appended              []appendedCampaignItem        `json:"appended"`
 	SatisfiedDependencies []satisfiedCampaignDependency `json:"satisfied_dependencies,omitempty"`
+}
+
+// campaignHotfixInput is the fishhawk_campaign_hotfix tool's input.
+type campaignHotfixInput struct {
+	CampaignID   string `json:"campaign_id" jsonschema:"the non-terminal campaign UUID to add the hotfix to (pending, running, paused or awaiting_human)"`
+	Issue        string `json:"issue" jsonschema:"the ONE urgent issue to add (N, #N or issue:N); it must not already be a campaign member"`
+	Workflow     string `json:"workflow,omitempty" jsonschema:"the workflow the item runs under; default hotfix_change. It must be declared by the repository spec on its default branch (workflow_not_registered otherwise, never a silent fallback)"`
+	Reason       string `json:"reason,omitempty" jsonschema:"why this is a hotfix, at most 1000 bytes; REQUIRED for any workflow other than hotfix_change. Recorded on the audit chain and shown as the item's expedite_reason"`
+	HoldDispatch bool   `json:"hold_dispatch,omitempty" jsonschema:"also hold the campaign: new implement dispatches of its other (non-expedited) items are refused until the hotfix item or its run is terminal, or 2 h pass. Running stages continue. One hold per campaign"`
+}
+
+// campaignHotfixOutput carries the campaign, the expedited item and the hold.
+type campaignHotfixOutput struct {
+	Campaign     Campaign              `json:"campaign"`
+	Item         campaignHotfixItem    `json:"item" jsonschema:"the expedited item: expedited, expedite_kind, workflow and expedite_reason set; position is the queue head (min(existing)-1, possibly negative)"`
+	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty" jsonschema:"the hold placed by hold_dispatch; absent without it"`
+	NextStep     string                `json:"next_step" jsonschema:"how to start the expedited item"`
 }
 
 // campaignScopeOverlapMaxItemReads bounds the per-poll scope-overlap reads
@@ -988,6 +1009,7 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		// (E83.60 / #4118), likewise after the successful backend read.
 		ScopeOverlap:      r.campaignScopeOverlapFor(ctx, st.Items),
 		DependencyRefresh: st.DependencyRefresh,
+		DispatchHold:      st.DispatchHold,
 	}, nil
 }
 
@@ -1058,6 +1080,110 @@ func appendCampaignItemsRemedy(ae *apiError) string {
 		return "pass the id fishhawk_start_campaign returned"
 	case "campaign_audit_unavailable":
 		return "nothing was written; retry shortly"
+	}
+	return ""
+}
+
+// registerCampaignHotfix wires the fishhawk_campaign_hotfix tool (E83.100 /
+// #4234).
+//
+// Auth: a write tool — operator-side fhk_* tokens with write:campaigns scope.
+// The backend additionally refuses a run-bound (mcp:run:*) token and a
+// delegated operator-agent token for the whole verb.
+func registerCampaignHotfix(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_campaign_hotfix",
+		Description: strings.TrimSpace(`
+Add ONE urgent issue to a non-terminal campaign — including a RUNNING one — as
+an EXPEDITED item at the head of its queue. Use this when a fix must jump the
+campaign's queue; use fishhawk_append_campaign_items for ordinary additions.
+The item runs under workflow (default hotfix_change, which must be declared by
+the repository spec: an undeclared workflow refuses workflow_not_registered
+naming the registered ones, never a silent fallback); any other workflow needs a
+reason. The item declares no dependencies, counts in the campaign rollup like
+any other item, is tagged expedited in fishhawk_get_campaign_status, and its
+implement stage is promoted to the head of its local concurrency group.
+hold_dispatch:true also HOLDS the campaign: new implement dispatches of its
+other items are refused campaign_dispatch_held until the hotfix item or its run
+is terminal, or 2 h pass (running stages continue; one hold per campaign).
+Recorded on the audit chain before it commits. Operator-only: needs
+write:campaigns, and run-bound and delegated operator-agent tokens are refused.
+`),
+	}, resolver.campaignHotfix)
+}
+
+// campaignHotfix is the tool handler.
+func (r *runResolver) campaignHotfix(ctx context.Context, _ *mcp.CallToolRequest, in campaignHotfixInput) (*mcp.CallToolResult, campaignHotfixOutput, error) {
+	id, err := uuid.Parse(in.CampaignID)
+	if err != nil {
+		return nil, campaignHotfixOutput{}, fmt.Errorf("campaign_id %q is not a valid UUID: %w", in.CampaignID, err)
+	}
+	if strings.TrimSpace(in.Issue) == "" {
+		return nil, campaignHotfixOutput{}, errors.New("issue is required: name the ONE urgent issue to add (N, #N or issue:N)")
+	}
+	res, err := r.api.CampaignHotfix(ctx, id, campaignHotfixRequest{
+		Issue:        in.Issue,
+		Workflow:     in.Workflow,
+		Reason:       in.Reason,
+		HoldDispatch: in.HoldDispatch,
+	})
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) {
+			if remedy := campaignHotfixRemedy(ae); remedy != "" {
+				return nil, campaignHotfixOutput{}, fmt.Errorf("%s: %s — %s", ae.Code, ae.Message, remedy)
+			}
+		}
+		return nil, campaignHotfixOutput{}, fmt.Errorf("campaign hotfix: %w", err)
+	}
+	next := fmt.Sprintf("start it with fishhawk_start_campaign_item_run (issue_ref %s, workflow_id %s — the recorded workflow; any other is refused campaign_item_workflow_mismatch); it heads the queue, so fishhawk_get_campaign_status offers it first",
+		res.Item.IssueRef, res.Item.Workflow)
+	if res.DispatchHold != nil {
+		next += fmt.Sprintf(". The campaign is HELD until the hotfix is terminal or %s: other items' implement dispatches answer campaign_dispatch_held",
+			res.DispatchHold.ExpiresAt.UTC().Format(time.RFC3339))
+	}
+	return nil, campaignHotfixOutput{
+		Campaign:     res.Campaign,
+		Item:         res.Item,
+		DispatchHold: res.DispatchHold,
+		NextStep:     next,
+	}, nil
+}
+
+// campaignHotfixRemedy names the operator move for each hotfix refusal code,
+// reading the structured details where they carry the specifics. The
+// operator's free-text reason is never echoed into a remedy.
+func campaignHotfixRemedy(ae *apiError) string {
+	switch ae.Code {
+	case "workflow_not_registered":
+		return fmt.Sprintf("the repository spec on its default branch does not declare that workflow; registered: %s. Pass one of them as workflow (any workflow other than hotfix_change needs a reason), or declare hotfix_change in .fishhawk/workflows.yaml first",
+			detailStrings(ae.Details, "registered", ", "))
+	case "workflow_spec_invalid":
+		return "the repository's .fishhawk/workflows.yaml on its default branch does not parse; fix it (fishhawk_validate) and retry. Nothing was written"
+	case "workflow_spec_unavailable":
+		return "the workflow could not be checked against the repository spec (forge read failed, or no GitHub client on this deployment); nothing was written, retry shortly"
+	case "campaign_hold_active":
+		return "the campaign already has an active dispatch hold (one per campaign); retry without hold_dispatch to add this item expedited but unheld, or wait for the holding hotfix to settle (fishhawk_get_campaign_status shows dispatch_hold)"
+	case "campaign_item_duplicate":
+		return fmt.Sprintf("already a campaign member: %s; a member cannot be re-added as a hotfix", detailStrings(ae.Details, "duplicates", ", "))
+	case "campaign_not_appendable":
+		return "the campaign is terminal (cancelled/succeeded/failed) and accepts no hotfix; drive the issue standalone with fishhawk_start_run"
+	case "campaign_item_ref_invalid":
+		return "pass issue as N, #N or issue:N"
+	case "campaign_not_found":
+		return "pass the id fishhawk_start_campaign returned"
+	case "campaign_audit_unavailable":
+		return "the audit chain could not record it, so nothing was written; retry shortly"
+	case "dependency_check_failed":
+		return "reading the campaign's dispatch hold failed, so nothing was written; retry shortly"
+	case "run_token_forbidden":
+		return "a run-bound agent token cannot add a campaign hotfix; it is an operator action — call it with an operator token holding write:campaigns"
+	case "operator_agent_forbidden":
+		return "a delegated operator-agent token cannot add a campaign hotfix; ask the human operator to run it under their own token"
+	case "validation_failed":
+		if field, _ := ae.Details["field"].(string); field == "reason" {
+			return "pass a non-empty reason (at most 1000 bytes): any workflow other than hotfix_change needs one"
+		}
 	}
 	return ""
 }
