@@ -70,8 +70,9 @@ type stageResponse struct {
 	AgentTimeoutSeconds int `json:"agent_timeout_seconds"`
 	// Progress is the runner's mid-execution stage_progress heartbeat projected
 	// onto the stage row (#2541): last_event / turns_this_attempt /
-	// tokens_this_attempt / reported_at, so a mid-stage poll returns real
-	// activity instead of a single 'running' bit. omitempty (a POINTER) so a
+	// tokens_this_attempt / reported_at, plus the optional #4023 phase fields,
+	// so a mid-stage poll returns real activity instead of a single 'running'
+	// bit. omitempty (a POINTER) so a
 	// stage that has not reported — and every action endpoint that builds a
 	// stageResponse — serves the byte-identical pre-#2541 shape. Populated ONLY
 	// by the two observability read handlers (handleGetStage,
@@ -89,15 +90,24 @@ type stageResponse struct {
 
 // stageProgress mirrors run.StageProgress on the wire. The per-attempt-versus-
 // cumulative meaning is encoded in the FIELD NAMES (turns_this_attempt /
-// tokens_this_attempt reset on an in-driver re-spawn), and elapsed is
+// tokens_this_attempt reset on an in-driver re-spawn), and stage elapsed is
 // deliberately absent — the operator-facing elapsed_seconds is derived
 // server-side from started_at (see the StageWaitStatus projection), which makes
-// it cumulative and monotonic across re-spawns.
+// it cumulative and monotonic across re-spawns. phase_elapsed_seconds (#4023)
+// is the runner's time in its CURRENT phase, a different quantity.
+//
+// The five phase fields (#4023) are omitempty, so a phase-less row serves the
+// byte-identical pre-#4023 shape.
 type stageProgress struct {
-	LastEvent         string    `json:"last_event"`
-	TurnsThisAttempt  int       `json:"turns_this_attempt"`
-	TokensThisAttempt int       `json:"tokens_this_attempt"`
-	ReportedAt        time.Time `json:"reported_at"`
+	LastEvent            string    `json:"last_event"`
+	TurnsThisAttempt     int       `json:"turns_this_attempt"`
+	TokensThisAttempt    int       `json:"tokens_this_attempt"`
+	ReportedAt           time.Time `json:"reported_at"`
+	Phase                string    `json:"phase,omitempty"`
+	PhaseElapsedSeconds  *int      `json:"phase_elapsed_seconds,omitempty"`
+	GateBudgetSeconds    *int      `json:"gate_budget_seconds,omitempty"`
+	GateRemainingSeconds *int      `json:"gate_remaining_seconds,omitempty"`
+	GateVerifying        bool      `json:"gate_verifying,omitempty"`
 }
 
 func toStageProgress(p *run.StageProgress) *stageProgress {
@@ -105,10 +115,15 @@ func toStageProgress(p *run.StageProgress) *stageProgress {
 		return nil
 	}
 	return &stageProgress{
-		LastEvent:         p.LastEvent,
-		TurnsThisAttempt:  p.TurnsThisAttempt,
-		TokensThisAttempt: p.TokensThisAttempt,
-		ReportedAt:        p.ReportedAt,
+		LastEvent:            p.LastEvent,
+		TurnsThisAttempt:     p.TurnsThisAttempt,
+		TokensThisAttempt:    p.TokensThisAttempt,
+		ReportedAt:           p.ReportedAt,
+		Phase:                p.Phase,
+		PhaseElapsedSeconds:  p.PhaseElapsedSeconds,
+		GateBudgetSeconds:    p.GateBudgetSeconds,
+		GateRemainingSeconds: p.GateRemainingSeconds,
+		GateVerifying:        p.GateVerifying,
 	}
 }
 

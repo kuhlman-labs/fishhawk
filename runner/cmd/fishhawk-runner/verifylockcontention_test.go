@@ -393,6 +393,82 @@ func TestVerifyLockRerunFits(t *testing.T) {
 	}
 }
 
+// gateClockWithRemaining builds a gate-phase stage clock with exactly rem of
+// its verify budget left (verify.timeout = 1m, so the budget is 17m).
+func gateClockWithRemaining(t *testing.T, rem time.Duration) *stagePhaseClock {
+	t.Helper()
+	c, mc := newTestPhaseClock(time.Hour, time.Minute)
+	c.beginGate()
+	c.startVerify()
+	mc.advance(c.gateBudget - rem)
+	c.endVerify()
+	if got := c.gateRemaining(); got != rem {
+		t.Fatalf("precondition: gate remaining = %s, want %s", got, rem)
+	}
+	return c
+}
+
+// TestVerifyLockRerunFits_GateBudgetBounds (CF-I vehicle): with NO ctx
+// deadline the #4023 gate clock is the only bound, so a gate budget that
+// cannot cover a lock wait plus one verify refuses the re-run, naming the
+// gate budget; one that can admits it.
+func TestVerifyLockRerunFits_GateBudgetBounds(t *testing.T) {
+	short := withStagePhases(context.Background(), gateClockWithRemaining(t, verifyLockWaitBudget))
+	if fits, rem, bound := verifyLockRerunBudget(short, time.Minute); fits || rem != verifyLockWaitBudget || bound != verifyLockBoundGateBudget {
+		t.Errorf("short gate budget: (fits=%t, remaining=%s, bound=%q), want (false, %s, %q)", fits, rem, bound, verifyLockWaitBudget, verifyLockBoundGateBudget)
+	}
+	if fits, _ := verifyLockRerunFits(short, time.Minute); fits {
+		t.Error("verifyLockRerunFits must refuse a re-run the gate budget cannot cover")
+	}
+	ample := withStagePhases(context.Background(), gateClockWithRemaining(t, verifyLockWaitBudget+2*time.Minute))
+	if fits, _, bound := verifyLockRerunBudget(ample, time.Minute); !fits || bound != verifyLockBoundGateBudget {
+		t.Errorf("ample gate budget: (fits=%t, bound=%q), want (true, %q)", fits, bound, verifyLockBoundGateBudget)
+	}
+
+	var lc verifyLockContention
+	if lc.admit(short, time.Minute) {
+		t.Fatal("admit must refuse when the gate budget is short")
+	}
+	r := lc.reason("scripts/test verify", 1, time.Minute)
+	if !strings.Contains(r, "No further in-place re-run was attempted: the remaining gate budget") || !strings.Contains(r, "17 x executor.verify.timeout") {
+		t.Errorf("reason = %q, want the note to name the gate budget", r)
+	}
+}
+
+// TestVerifyLockRerunFits_NoClockKeepsCtxDeadline: without a clock the ctx
+// deadline alone decides, as before #4023; with both, the TIGHTER wins and is
+// the one named.
+func TestVerifyLockRerunFits_NoClockKeepsCtxDeadline(t *testing.T) {
+	if fits, rem, bound := verifyLockRerunBudget(context.Background(), time.Hour); !fits || rem != 0 || bound != verifyLockBoundNone {
+		t.Errorf("no clock, no deadline: (%t, %s, %q), want (true, 0, none)", fits, rem, bound)
+	}
+	short, cancel := context.WithTimeout(context.Background(), verifyLockWaitBudget)
+	defer cancel()
+	if fits, _, bound := verifyLockRerunBudget(short, time.Minute); fits || bound != verifyLockBoundCtxDeadline {
+		t.Errorf("no clock, short deadline: (fits=%t, bound=%q), want (false, %q)", fits, bound, verifyLockBoundCtxDeadline)
+	}
+	var lc verifyLockContention
+	if lc.admit(short, time.Minute) {
+		t.Fatal("admit must refuse when the ctx deadline is short")
+	}
+	if r := lc.reason("scripts/test verify", 1, time.Minute); !strings.Contains(r, "the remaining stage budget (the context deadline)") {
+		t.Errorf("reason = %q, want the note to name the context deadline", r)
+	}
+
+	// Tight deadline, ample gate budget: the deadline binds.
+	ampleGate := withStagePhases(short, gateClockWithRemaining(t, 10*time.Minute+verifyLockWaitBudget))
+	if fits, _, bound := verifyLockRerunBudget(ampleGate, time.Minute); fits || bound != verifyLockBoundCtxDeadline {
+		t.Errorf("short deadline + ample gate: (fits=%t, bound=%q), want (false, %q)", fits, bound, verifyLockBoundCtxDeadline)
+	}
+	// Ample deadline, tight gate budget: the gate binds.
+	long, cancel2 := context.WithTimeout(context.Background(), time.Hour)
+	defer cancel2()
+	tightGate := withStagePhases(long, gateClockWithRemaining(t, time.Minute))
+	if fits, rem, bound := verifyLockRerunBudget(tightGate, time.Minute); fits || rem != time.Minute || bound != verifyLockBoundGateBudget {
+		t.Errorf("ample deadline + tight gate: (fits=%t, rem=%s, bound=%q), want (false, 1m, %q)", fits, rem, bound, verifyLockBoundGateBudget)
+	}
+}
+
 // --- (E) the single-shot committed gate -----------------------------------
 
 func TestRunVerifyGateCommitted_VerifyLockContendedOnceThenPass(t *testing.T) {

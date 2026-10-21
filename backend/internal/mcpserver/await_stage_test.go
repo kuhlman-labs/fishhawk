@@ -2639,3 +2639,90 @@ func TestAwaitStageToolDescription_NamesAcceptanceVerdictHold(t *testing.T) {
 		}
 	}
 }
+
+// TestAwaitStageTimeoutOutput_GatePhaseDeadlineExceededNamesGateBudget pins the
+// #4023 gate-phase stage_deadline_exceeded message: it names the GATE budget
+// (not the agent budget), says the agent phase already finished, and keeps the
+// get_run_status / reap routing with no blind re-arm.
+func TestAwaitStageTimeoutOutput_GatePhaseDeadlineExceededNamesGateBudget(t *testing.T) {
+	zero := 0
+	out := awaitStageTimeoutOutput("implement", uuid.New(), 600, time.Now(), false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600,
+			Phase: "gate", GateBudgetSeconds: 5400, GateSecondsRemaining: &zero, DeadlineSecondsRemaining: &zero})
+	if out.TimeoutKind != awaitStageTimeoutKindStageDeadlineExceeded {
+		t.Fatalf("TimeoutKind = %q, want %q", out.TimeoutKind, awaitStageTimeoutKindStageDeadlineExceeded)
+	}
+	for _, want := range []string{"GATE phase", "agent phase already finished", "gate budget", "5400", "EXHAUSTED",
+		"within 600s", "fishhawk_get_run_status", "fishhawk_reap_stage"} {
+		if !strings.Contains(out.Message, want) {
+			t.Errorf("gate-phase stage_deadline_exceeded message missing %q: %q", want, out.Message)
+		}
+	}
+	for _, banned := range []string{"agent budget (3600s)", "re-call fishhawk_await_stage", "no-op"} {
+		if strings.Contains(out.Message, banned) {
+			t.Errorf("gate-phase stage_deadline_exceeded message must not carry %q: %q", banned, out.Message)
+		}
+	}
+}
+
+// TestAwaitStageTimeoutOutput_GatePhaseClientWaitCapNamesPhase pins the healthy
+// client_wait_cap message in each phase: the gate phase names the gate budget
+// and its remaining; the agent phase names the agent phase; neither claims the
+// other budget.
+func TestAwaitStageTimeoutOutput_GatePhaseClientWaitCapNamesPhase(t *testing.T) {
+	gateRem := 4970
+	gate := awaitStageTimeoutOutput("implement", uuid.New(), 600, time.Now(), false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600,
+			Phase: "gate", GateBudgetSeconds: 5400, GateSecondsRemaining: &gateRem, DeadlineSecondsRemaining: &gateRem})
+	if gate.TimeoutKind != awaitStageTimeoutKindClientWaitCap {
+		t.Fatalf("gate TimeoutKind = %q, want %q", gate.TimeoutKind, awaitStageTimeoutKindClientWaitCap)
+	}
+	for _, want := range []string{"GATE phase", "4970s of its gate budget remaining", "within its deadline",
+		"YOUR wait cap expired", "re-call fishhawk_await_stage"} {
+		if !strings.Contains(gate.Message, want) {
+			t.Errorf("gate-phase client_wait_cap message missing %q: %q", want, gate.Message)
+		}
+	}
+	if strings.Contains(gate.Message, "agent budget") {
+		t.Errorf("gate-phase client_wait_cap message names the agent budget: %q", gate.Message)
+	}
+
+	agentRem := 3000
+	agent := awaitStageTimeoutOutput("implement", uuid.New(), 600, time.Now(), false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600,
+			Phase: "agent", AgentSecondsRemaining: &agentRem, DeadlineSecondsRemaining: &agentRem})
+	for _, want := range []string{"it in its agent phase with 3000s of its per-attempt agent budget remaining", "within its deadline"} {
+		if !strings.Contains(agent.Message, want) {
+			t.Errorf("agent-phase client_wait_cap message missing %q: %q", want, agent.Message)
+		}
+	}
+
+	zero := 0
+	agentExceeded := awaitStageTimeoutOutput("implement", uuid.New(), 600, time.Now(), false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600,
+			Phase: "agent", AgentSecondsRemaining: &zero, DeadlineSecondsRemaining: &zero})
+	if !strings.Contains(agentExceeded.Message, "shows it in its agent phase and its per-attempt agent budget (3600s) is EXHAUSTED") {
+		t.Errorf("agent-phase stage_deadline_exceeded message does not name the phase: %q", agentExceeded.Message)
+	}
+}
+
+// TestAwaitStageTimeoutOutput_LegacyMessagesUnchanged pins that a status with no
+// reported phase keeps the pre-#4023 message bytes (no phase wording added).
+func TestAwaitStageTimeoutOutput_LegacyMessagesUnchanged(t *testing.T) {
+	zero, rem := 0, 1800
+	exceeded := awaitStageTimeoutOutput("implement", uuid.New(), 600, time.Now(), false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600, DeadlineSecondsRemaining: &zero})
+	if !strings.Contains(exceeded.Message, "a stage-health read shows its per-attempt agent budget (3600s) is EXHAUSTED") {
+		t.Errorf("legacy exceeded message changed: %q", exceeded.Message)
+	}
+	healthy := awaitStageTimeoutOutput("implement", uuid.New(), 600, time.Now(), false, 600, "running",
+		&StageWaitStatus{Stage: "implement", Status: "running", AgentTimeoutSeconds: 3600, DeadlineSecondsRemaining: &rem})
+	if !strings.Contains(healthy.Message, "A stage-health read shows 1800s of its per-attempt agent budget remaining (state \"running\")") {
+		t.Errorf("legacy healthy message changed: %q", healthy.Message)
+	}
+	for _, m := range []string{exceeded.Message, healthy.Message} {
+		if strings.Contains(m, "phase") {
+			t.Errorf("legacy message names a phase: %q", m)
+		}
+	}
+}

@@ -3929,6 +3929,10 @@ func (c *Client) RequestScopeAmendment(ctx context.Context, args RequestScopeAme
 // agent's poll loop and FetchScopeAmendments use, so the backend has one
 // agent-side auth path for the progress surface (#2541). No signing key: the
 // endpoint authenticates on the bearer.
+//
+// The five phase fields (#4023) are OPTIONAL: the zero value of each (an empty
+// Phase, a nil pointer, a false GateVerifying) omits its key, so a caller that
+// sets none of them marshals a body byte-identical to the pre-#4023 one.
 type ReportStageProgressArgs struct {
 	RunID             string
 	StageID           string
@@ -3936,20 +3940,47 @@ type ReportStageProgressArgs struct {
 	LastEvent         string
 	TurnsThisAttempt  int
 	TokensThisAttempt int
+	// Phase is the stage phase the runner is in: "agent" (an agent invocation
+	// is running) or "gate" (the agent exited and the verify gate owns the
+	// stage). Empty omits it.
+	Phase string
+	// PhaseElapsedSeconds is the runner-measured MONOTONIC wall seconds spent
+	// in the current phase at report time.
+	PhaseElapsedSeconds *int
+	// GateBudgetSeconds is the gate phase's total verify-execution budget.
+	GateBudgetSeconds *int
+	// GateRemainingSeconds is the verify budget left at report time.
+	GateRemainingSeconds *int
+	// GateVerifying is true while a verify execution is in flight, i.e. the
+	// gate budget is being consumed.
+	GateVerifying bool
 }
 
 // reportStageProgressBody is the POST wire shape. reported_at is server-stamped,
 // so it is not sent.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical — options
+// included — to the backend's stageProgressReport
+// (backend/internal/server/stage_progress.go), registered as the
+// stage_progress_report pair in backend/internal/wirecontract. The backend
+// decodes under DisallowUnknownFields, so a renamed tag here 400s every
+// heartbeat. The gate-phase body is pinned by the shared golden
+// testdata/wire/stage_progress_phase.json (#4023).
 type reportStageProgressBody struct {
-	LastEvent         string `json:"last_event"`
-	TurnsThisAttempt  int    `json:"turns_this_attempt"`
-	TokensThisAttempt int    `json:"tokens_this_attempt"`
+	LastEvent            string `json:"last_event"`
+	TurnsThisAttempt     int    `json:"turns_this_attempt"`
+	TokensThisAttempt    int    `json:"tokens_this_attempt"`
+	Phase                string `json:"phase,omitempty"`
+	PhaseElapsedSeconds  *int   `json:"phase_elapsed_seconds,omitempty"`
+	GateBudgetSeconds    *int   `json:"gate_budget_seconds,omitempty"`
+	GateRemainingSeconds *int   `json:"gate_remaining_seconds,omitempty"`
+	GateVerifying        bool   `json:"gate_verifying,omitempty"`
 }
 
 // ReportStageProgress POSTs the runner's stage_progress heartbeat to
 // /v0/runs/{run_id}/stages/{stage_id}/progress bearing the run-bound MCP token
-// (#2541), projecting last_event / turns / tokens onto the stage row so an
-// operator poll returns real activity.
+// (#2541), projecting last_event / turns / tokens — and, when set, the #4023
+// phase fields — onto the stage row so an operator poll returns real activity.
 //
 // SINGLE ATTEMPT, no retry and no backoff — deliberately unlike ShipTrace /
 // ShipPlan: the next ~15s heartbeat supersedes a lost report, so a retry would
@@ -3964,9 +3995,14 @@ func (c *Client) ReportStageProgress(ctx context.Context, args ReportStageProgre
 	}
 
 	body, err := json.Marshal(reportStageProgressBody{
-		LastEvent:         args.LastEvent,
-		TurnsThisAttempt:  args.TurnsThisAttempt,
-		TokensThisAttempt: args.TokensThisAttempt,
+		LastEvent:            args.LastEvent,
+		TurnsThisAttempt:     args.TurnsThisAttempt,
+		TokensThisAttempt:    args.TokensThisAttempt,
+		Phase:                args.Phase,
+		PhaseElapsedSeconds:  args.PhaseElapsedSeconds,
+		GateBudgetSeconds:    args.GateBudgetSeconds,
+		GateRemainingSeconds: args.GateRemainingSeconds,
+		GateVerifying:        args.GateVerifying,
 	})
 	if err != nil {
 		return fmt.Errorf("upload: marshal stage progress: %w", err)

@@ -420,11 +420,31 @@ func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
 	}
 	// The runner reporter's field mapping (turns -> turns_this_attempt, etc.),
 	// elapsed_seconds dropped because the backend derives it.
-	reportBody, _ := json.Marshal(map[string]any{
+	report := map[string]any{
 		"last_event":          hb.LastEvent,
 		"turns_this_attempt":  hb.Turns,
 		"tokens_this_attempt": hb.TokensSoFar,
-	})
+	}
+	// The five #4023 phase fields come from the SHARED runner/backend golden
+	// (testdata/wire/stage_progress_phase.json), the same bytes the runner's
+	// upload test asserts its marshalled body against, so a key drift on any hop
+	// to the stage-wait projection fails here.
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "stage_progress_phase.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	var goldenBody map[string]any
+	if err := json.Unmarshal(golden, &goldenBody); err != nil {
+		t.Fatalf("decode shared golden: %v", err)
+	}
+	for _, k := range []string{"phase", "phase_elapsed_seconds", "gate_budget_seconds", "gate_remaining_seconds", "gate_verifying"} {
+		v, ok := goldenBody[k]
+		if !ok {
+			t.Fatalf("shared golden lacks %q", k)
+		}
+		report[k] = v
+	}
+	reportBody, _ := json.Marshal(report)
 
 	// HTTP INGEST -> POSTGRES: POST the report to the real backend.
 	req, _ := http.NewRequestWithContext(ctx, http.MethodPost,
@@ -464,6 +484,34 @@ func TestStageProgress_CrossBoundaryEndToEnd(t *testing.T) {
 	// elapsed_seconds is derived from started_at (a few seconds), never 999.
 	if st.ElapsedSeconds == 999 {
 		t.Errorf("elapsed_seconds = 999 — it leaked from the heartbeat instead of started_at")
+	}
+
+	// The five #4023 phase fields survive every hop. The decoded mirror carries
+	// the golden's values verbatim...
+	p := stages[0].Progress
+	if p.Phase != "gate" || p.PhaseElapsedSeconds == nil || *p.PhaseElapsedSeconds != 312 ||
+		p.GateBudgetSeconds == nil || *p.GateBudgetSeconds != 5400 ||
+		p.GateRemainingSeconds == nil || *p.GateRemainingSeconds != 4980 || !p.GateVerifying {
+		t.Fatalf("decoded phase fields = {phase:%q elapsed:%v budget:%v remaining:%v verifying:%v}, want gate/312/5400/4980/true",
+			p.Phase, fmtIntPtr(p.PhaseElapsedSeconds), fmtIntPtr(p.GateBudgetSeconds), fmtIntPtr(p.GateRemainingSeconds), p.GateVerifying)
+	}
+	// ...and the projection derives the gate-phase deadline from them. Both
+	// extrapolations share one `since` (now - reported_at), so the identity
+	// below holds whatever the host/DB clock skew is, while a dropped field
+	// breaks it.
+	if st.Phase != "gate" || st.GateBudgetSeconds != 5400 {
+		t.Fatalf("projected phase/gate_budget = %q/%d, want gate/5400", st.Phase, st.GateBudgetSeconds)
+	}
+	if st.GateSecondsRemaining == nil || st.PhaseElapsedSeconds == nil || st.DeadlineSecondsRemaining == nil {
+		t.Fatalf("projected gate remaining/phase elapsed/deadline = %v/%v/%v, want all present",
+			fmtIntPtr(st.GateSecondsRemaining), fmtIntPtr(st.PhaseElapsedSeconds), fmtIntPtr(st.DeadlineSecondsRemaining))
+	}
+	if *st.DeadlineSecondsRemaining != *st.GateSecondsRemaining {
+		t.Errorf("deadline_seconds_remaining = %d, want gate_seconds_remaining %d", *st.DeadlineSecondsRemaining, *st.GateSecondsRemaining)
+	}
+	if since := *st.PhaseElapsedSeconds - 312; since < 0 || 4980-*st.GateSecondsRemaining != since {
+		t.Errorf("phase extrapolation mismatch: phase_elapsed %d (since %d), gate remaining %d (drained %d)",
+			*st.PhaseElapsedSeconds, since, *st.GateSecondsRemaining, 4980-*st.GateSecondsRemaining)
 	}
 }
 

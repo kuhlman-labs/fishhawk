@@ -6433,13 +6433,53 @@ components:
             `now()`, in the ingest UPDATE) — so it shares a clock domain with
             the dispatch stamp the dispatch watchdog compares it against
             (#3084). Neither the runner nor the backend process sets it.
+        phase:
+          type: string
+          enum: [agent, gate]
+          description: |
+            The runner's stage phase at report time (#4023): `agent` while an
+            agent invocation runs, `gate` once the agent exited and the verify
+            gate owns the stage. Omitted for a runner that predates the split.
+          example: gate
+        phase_elapsed_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            Runner-measured monotonic wall seconds spent in the CURRENT phase
+            at report time (#4023). A different quantity from the stage-wait
+            `elapsed_seconds`, which is derived from `started_at`. Omitted when
+            not reported.
+          example: 312
+        gate_budget_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            The gate phase's total verify-execution budget (#4023). Gate phase
+            only; omitted when not reported.
+          example: 5400
+        gate_remaining_seconds:
+          type: integer
+          minimum: 0
+          description: |
+            Gate budget left at report time (#4023). Gate phase only; omitted
+            when not reported.
+          example: 4980
+        gate_verifying:
+          type: boolean
+          description: |
+            True while a verify execution was in flight at report time, i.e.
+            the gate budget was being consumed (#4023). Omitted when false.
+          example: true
 
     StageProgressReport:
       type: object
       description: |
         The request body of `POST /v0/runs/{run_id}/stages/{stage_id}/progress`
         (#2541). `reported_at` is NOT accepted — it is stamped by the DATABASE
-        at ingest (Postgres `now()`). Unknown fields are rejected.
+        at ingest (Postgres `now()`). Unknown fields are rejected. The five
+        phase fields (#4023) are optional; each is validated (an unknown
+        `phase` or a negative `*_seconds` is `400 validation_failed` with
+        `details.field` naming it) and persisted as sent.
       required: [last_event, turns_this_attempt, tokens_this_attempt]
       properties:
         last_event:
@@ -6453,6 +6493,30 @@ components:
           type: integer
           minimum: 0
           example: 13402
+        phase:
+          type: string
+          enum: [agent, gate]
+          description: The runner's stage phase at report time (#4023).
+          example: gate
+        phase_elapsed_seconds:
+          type: integer
+          minimum: 0
+          description: Runner-measured monotonic seconds in the current phase.
+          example: 312
+        gate_budget_seconds:
+          type: integer
+          minimum: 0
+          description: The gate phase's total verify-execution budget.
+          example: 5400
+        gate_remaining_seconds:
+          type: integer
+          minimum: 0
+          description: Gate budget left at report time.
+          example: 4980
+        gate_verifying:
+          type: boolean
+          description: A verify execution is in flight (the budget is being consumed).
+          example: true
 
     StageGate:
       type: object
@@ -17536,7 +17600,11 @@ paths:
         watchdog compares it against (#3084); the runner does not set it.
         `last_event` is clamped to 128 runes and negative counters are
         rejected, so an unbounded or nonsensical payload can never be
-        persisted. Unknown body fields are rejected.
+        persisted. Unknown body fields are rejected. The optional phase fields
+        (#4023: `phase`, `phase_elapsed_seconds`, `gate_budget_seconds`,
+        `gate_remaining_seconds`, `gate_verifying`) report whether the agent or
+        the verify gate owns the stage and the gate's remaining verify budget;
+        an unknown `phase` or a negative seconds value is rejected.
 
         **Terminal refusal.** A heartbeat that arrives after the stage settled
         (`succeeded` / `failed` / `cancelled`) matches zero rows and returns
@@ -17557,7 +17625,10 @@ paths:
         '400':
           description: |
             A malformed `run_id`/`stage_id`, an invalid body (bad JSON, an
-            unknown field, or a negative counter) — `validation_failed`.
+            unknown field, a negative counter, a `phase` other than `agent` /
+            `gate`, or a negative `phase_elapsed_seconds` /
+            `gate_budget_seconds` / `gate_remaining_seconds`, the latter two
+            classes naming the field in `details.field`) — `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

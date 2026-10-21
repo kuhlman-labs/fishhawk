@@ -294,3 +294,282 @@ func TestProgressTee_TokenSourceRefreshesBearer(t *testing.T) {
 		t.Fatalf("nil-source posted = %+v, want constructor token fhm_tok", rep2.calls)
 	}
 }
+
+// TestProgressTee_HeartbeatCarriesPhaseSnapshot (#4023): with a stage clock
+// attached, a heartbeat POST carries the clock's snapshot read at Write time —
+// agent-phase fields only in the agent phase, all five in the gate phase, and
+// a negative extrapolated remainder clamped to 0. Without a clock the five
+// fields stay unset (the byte-identical legacy body).
+func TestProgressTee_HeartbeatCarriesPhaseSnapshot(t *testing.T) {
+	var sink syncBuf
+	rep := &fakeReporter{}
+	tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_tok", &sink)
+
+	_, _ = tee.Write([]byte(testHeartbeat))
+	tee.waitForReports()
+	if got := rep.calls[0]; got.Phase != "" || got.PhaseElapsedSeconds != nil || got.GateBudgetSeconds != nil ||
+		got.GateRemainingSeconds != nil || got.GateVerifying {
+		t.Errorf("clock-less heartbeat carried phase fields: %+v", got)
+	}
+
+	clock, mc := newTestPhaseClock(time.Hour, time.Minute)
+	tee.phases = clock
+	clock.beginAgent()
+	mc.advance(90 * time.Second)
+	_, _ = tee.Write([]byte(testHeartbeat))
+	tee.waitForReports()
+	got := rep.calls[1]
+	if got.Phase != stagePhaseAgent || got.PhaseElapsedSeconds == nil || *got.PhaseElapsedSeconds != 90 {
+		t.Errorf("agent heartbeat = %+v, want phase=agent phase_elapsed=90", got)
+	}
+	if got.GateBudgetSeconds != nil || got.GateRemainingSeconds != nil || got.GateVerifying {
+		t.Errorf("agent heartbeat carried gate fields: %+v", got)
+	}
+	if got.LastEvent != "assistant" || got.TurnsThisAttempt != 9 || got.TokensThisAttempt != 13402 {
+		t.Errorf("agent heartbeat lost its counters: %+v", got)
+	}
+
+	clock.beginGate()
+	clock.startVerify()
+	mc.advance(clock.gateBudget + time.Minute) // overdrawn while in flight
+	_, _ = tee.Write([]byte(testHeartbeat))
+	tee.waitForReports()
+	got = rep.calls[2]
+	if got.Phase != stagePhaseGate || !got.GateVerifying || got.GateBudgetSeconds == nil || *got.GateBudgetSeconds != 17*60 {
+		t.Errorf("gate heartbeat = %+v, want phase=gate verifying budget=1020", got)
+	}
+	if got.GateRemainingSeconds == nil || *got.GateRemainingSeconds != 0 {
+		t.Errorf("gate heartbeat remaining = %v, want clamped to 0 (the ingest rejects negatives)", got.GateRemainingSeconds)
+	}
+	if got.PhaseElapsedSeconds == nil || *got.PhaseElapsedSeconds != 18*60 {
+		t.Errorf("gate heartbeat phase_elapsed = %v, want 1080", got.PhaseElapsedSeconds)
+	}
+}
+
+// orderReporter records the order in which reports COMPLETE and blocks the
+// FIRST call until released, flagging any call that ENTERS while that first
+// call is still in flight.
+type orderReporter struct {
+	mu          sync.Mutex
+	calls       []upload.ReportStageProgressArgs
+	first       chan struct{} // released by the test
+	firstActive bool
+	overlapped  bool
+	entered     chan struct{} // closed when a second call enters
+	n           int
+}
+
+func (o *orderReporter) ReportStageProgress(_ context.Context, args upload.ReportStageProgressArgs) error {
+	o.mu.Lock()
+	o.n++
+	idx := o.n
+	if idx == 1 {
+		o.firstActive = true
+	} else {
+		if o.firstActive {
+			o.overlapped = true
+		}
+		close(o.entered)
+	}
+	o.mu.Unlock()
+	if idx == 1 {
+		<-o.first
+	}
+	o.mu.Lock()
+	if idx == 1 {
+		o.firstActive = false
+	}
+	o.calls = append(o.calls, args)
+	o.mu.Unlock()
+	return nil
+}
+
+// TestProgressTee_ReportPhaseWaitsForInFlightHeartbeat (CF-J vehicle): a phase
+// report issued while a heartbeat POST is in flight waits for it, so the
+// heartbeat cannot land after the transition and flip the stored phase back
+// (last-writer-wins). The heartbeat is blocked until the phase report has
+// either entered the reporter (the defect) or had ample time to.
+func TestProgressTee_ReportPhaseWaitsForInFlightHeartbeat(t *testing.T) {
+	var sink syncBuf
+	rep := &orderReporter{first: make(chan struct{}), entered: make(chan struct{})}
+	tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_tok", &sink)
+
+	_, _ = tee.Write([]byte(testHeartbeat))
+	deadline := time.Now().Add(scaledD(5 * time.Second))
+	for {
+		rep.mu.Lock()
+		active := rep.firstActive
+		rep.mu.Unlock()
+		if active {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatal("precondition: the heartbeat POST never went in flight")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		tee.reportPhase(stagePhaseSnapshot{Phase: stagePhaseGate, GateBudget: time.Hour, GateRemaining: time.Hour})
+	}()
+	select {
+	case <-rep.entered:
+	case <-time.After(scaledD(300 * time.Millisecond)):
+	}
+	close(rep.first)
+	<-done
+	tee.waitForReports()
+
+	rep.mu.Lock()
+	defer rep.mu.Unlock()
+	if rep.overlapped {
+		t.Error("the phase report POSTed while the heartbeat was still in flight; it must wait for it")
+	}
+	if len(rep.calls) != 2 || rep.calls[0].LastEvent != "assistant" || rep.calls[1].Phase != stagePhaseGate {
+		t.Errorf("completion order = %+v, want [heartbeat, gate phase report]", rep.calls)
+	}
+}
+
+// TestProgressTee_ReportPhaseNoClientIsNoOp: a nil tee, a nil client and an
+// empty token (the acceptance stage's zero-credential posture) all make
+// reportPhase a no-op.
+func TestProgressTee_ReportPhaseNoClientIsNoOp(t *testing.T) {
+	var nilTee *progressTee
+	nilTee.reportPhase(stagePhaseSnapshot{Phase: stagePhaseAgent})
+
+	var sink syncBuf
+	newProgressTee(&sink, nil, "run-1", "stage-1", "fhm_tok", &sink).reportPhase(stagePhaseSnapshot{Phase: stagePhaseAgent})
+
+	rep := &fakeReporter{}
+	newProgressTee(&sink, rep, "run-1", "stage-1", "", &sink).reportPhase(stagePhaseSnapshot{Phase: stagePhaseAgent})
+	if rep.callCount() != 0 {
+		t.Errorf("POST count = %d, want 0 (no token → no phase report)", rep.callCount())
+	}
+	if sink.String() != "" {
+		t.Errorf("a no-op phase report wrote %q", sink.String())
+	}
+}
+
+// TestProgressTee_ReportPhaseFailureLoggedAndDropped: a failed phase report is
+// one stage_progress_report_failed diag line and is dropped; the tee keeps
+// working afterwards (the slot is released).
+func TestProgressTee_ReportPhaseFailureLoggedAndDropped(t *testing.T) {
+	var sink syncBuf
+	rep := &fakeReporter{err: &statusErr{code: 400}}
+	tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_tok", &sink)
+	tee.reportPhase(stagePhaseSnapshot{Phase: stagePhaseGate})
+	if got := strings.Count(sink.String(), "stage_progress_report_failed"); got != 1 {
+		t.Errorf("diag carries %d stage_progress_report_failed lines, want 1:\n%s", got, sink.String())
+	}
+	_, _ = tee.Write([]byte(testHeartbeat))
+	tee.waitForReports()
+	if rep.callCount() != 2 {
+		t.Errorf("POST count = %d, want 2 (the slot must be released after a failed phase report)", rep.callCount())
+	}
+}
+
+// TestProgressTee_ReportPhaseCarriesCountersAndEvent: a phase report carries
+// the last heartbeat's turns/tokens, a runner-authored last_event per
+// transition, and the snapshot's phase fields.
+func TestProgressTee_ReportPhaseCarriesCountersAndEvent(t *testing.T) {
+	var sink syncBuf
+	rep := &fakeReporter{}
+	tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_tok", &sink)
+
+	tee.reportPhase(stagePhaseSnapshot{Phase: stagePhaseAgent, PhaseElapsed: 0})
+	_, _ = tee.Write([]byte(testHeartbeat))
+	tee.waitForReports()
+	tee.reportPhase(stagePhaseSnapshot{Phase: stagePhaseGate, PhaseElapsed: 61 * time.Second, GateBudget: 17 * time.Minute, GateRemaining: 16 * time.Minute, Verifying: true})
+	tee.reportPhase(stagePhaseSnapshot{Phase: stagePhaseGate, GateBudget: 17 * time.Minute, GateRemaining: 15 * time.Minute})
+
+	if rep.callCount() != 4 {
+		t.Fatalf("POST count = %d, want 4", rep.callCount())
+	}
+	first := rep.calls[0]
+	if first.LastEvent != phaseEventAgentStart || first.TurnsThisAttempt != 0 || first.Phase != stagePhaseAgent ||
+		first.PhaseElapsedSeconds == nil || *first.PhaseElapsedSeconds != 0 || first.GateBudgetSeconds != nil {
+		t.Errorf("agent_start report = %+v", first)
+	}
+	verify := rep.calls[2]
+	if verify.LastEvent != phaseEventGateVerify || verify.TurnsThisAttempt != 9 || verify.TokensThisAttempt != 13402 ||
+		!verify.GateVerifying || *verify.GateBudgetSeconds != 1020 || *verify.GateRemainingSeconds != 960 || *verify.PhaseElapsedSeconds != 61 {
+		t.Errorf("gate:verify report = %+v", verify)
+	}
+	gate := rep.calls[3]
+	if gate.LastEvent != phaseEventGate || gate.GateVerifying || *gate.GateRemainingSeconds != 900 {
+		t.Errorf("gate report = %+v", gate)
+	}
+	if got := phaseReportEvent(stagePhaseSnapshot{}); got != "" {
+		t.Errorf("phaseReportEvent(zero) = %q, want empty", got)
+	}
+}
+
+// slowIngestReporter simulates slow progress ingestion on the stage clock's
+// manual time source: every report advances it by delay, then returns err.
+type slowIngestReporter struct {
+	mc    *manualClock
+	delay time.Duration
+	err   error
+	calls atomic.Int32
+}
+
+func (s *slowIngestReporter) ReportStageProgress(ctx context.Context, _ upload.ReportStageProgressArgs) error {
+	s.calls.Add(1)
+	if _, ok := ctx.Deadline(); !ok {
+		return context.Canceled // the POST must run under a bounded context
+	}
+	s.mc.advance(s.delay)
+	return s.err
+}
+
+// TestProgressTee_SlowPhaseReportsAreNotChargedToGateBudget drives the REAL
+// reportPhase as the clock's report hook against delayed and timing-out
+// progress ingestion: the gate budget is charged only the verifies' own wall
+// time, so repeated slow reports never refuse a later verify.
+func TestProgressTee_SlowPhaseReportsAreNotChargedToGateBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration
+		err   error
+	}{
+		{"delayed", 4 * time.Minute, nil},
+		{"timing out", 40 * time.Second, context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sink syncBuf
+			clock, mc := newTestPhaseClock(time.Hour, time.Minute) // budget 17m
+			rep := &slowIngestReporter{mc: mc, delay: tc.delay, err: tc.err}
+			tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_tok", &sink)
+			tee.phases = clock
+			clock.report = tee.reportPhase
+
+			clock.beginGate()
+			for i := 0; i < 5; i++ {
+				clock.startVerify()
+				mc.advance(30 * time.Second)
+				clock.endVerify()
+			}
+			if got := rep.calls.Load(); got != 11 {
+				t.Fatalf("phase reports = %d, want 11 (beginGate + 5 x start/end)", got)
+			}
+			if got, want := clock.gateRemaining(), clock.gateBudget-150*time.Second; got != want {
+				t.Errorf("gateRemaining = %s, want %s (five 30s verifies; report latency uncharged)", got, want)
+			}
+			if eff, clipped := clock.gateVerifyTimeout(time.Minute); eff != time.Minute || clipped {
+				t.Errorf("gateVerifyTimeout(1m) = (%s, %t), want (1m, false)", eff, clipped)
+			}
+			if clock.gateExhausted() {
+				t.Error("gate budget exhausted by slow progress ingestion")
+			}
+			wantFailures := 0
+			if tc.err != nil {
+				wantFailures = 11
+			}
+			if got := strings.Count(sink.String(), "stage_progress_report_failed"); got != wantFailures {
+				t.Errorf("stage_progress_report_failed lines = %d, want %d", got, wantFailures)
+			}
+		})
+	}
+}

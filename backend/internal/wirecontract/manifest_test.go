@@ -519,3 +519,61 @@ func TestSeedManifest_RegistersVerifyFlakeAbsorbedEvidencePair(t *testing.T) {
 		}
 	}
 }
+
+// TestSeedManifest_RegistersStageProgressReportPair pins the #4023
+// registration: stage_progress.go is a covered file and the runner's progress
+// heartbeat body is paired EXACT with the server's stageProgressReport,
+// resolving the legacy fields and all five phase fields on both sides — so
+// dropping the row, the covered file or a field fails here rather than leaving
+// the contract unguarded.
+func TestSeedManifest_RegistersStageProgressReportPair(t *testing.T) {
+	m := SeedManifest()
+	covered := map[string]bool{}
+	for _, f := range m.CoveredFiles {
+		covered[f] = true
+	}
+	for _, f := range []string{uploadFile, stageProgressGo} {
+		if !covered[f] {
+			t.Errorf("CoveredFiles missing %s", f)
+		}
+	}
+	var pair *Pair
+	for i := range m.Pairs {
+		if m.Pairs[i].Name == "stage_progress_report" {
+			pair = &m.Pairs[i]
+		}
+	}
+	if pair == nil {
+		t.Fatal("seed manifest has no stage_progress_report pair")
+	}
+	if pair.Mode != ModeExact {
+		t.Errorf("stage_progress_report mode = %v, want ModeExact", pair.Mode)
+	}
+	if pair.Emitter != (Endpoint{File: uploadFile, Type: "reportStageProgressBody"}) ||
+		pair.Consumer != (Endpoint{File: stageProgressGo, Type: "stageProgressReport"}) {
+		t.Errorf("stage_progress_report endpoints = %+v -> %+v", pair.Emitter, pair.Consumer)
+	}
+	root, err := RepoRoot()
+	if err != nil {
+		t.Fatalf("resolve repo root: %v", err)
+	}
+	for _, ep := range []Endpoint{pair.Emitter, pair.Consumer} {
+		fields, err := ExtractStruct(filepath.Join(root, filepath.FromSlash(ep.File)), ep.Type)
+		if err != nil {
+			t.Fatalf("extract %s.%s: %v", ep.File, ep.Type, err)
+		}
+		names := map[string]bool{}
+		for _, f := range fields {
+			names[f.JSONName] = true
+		}
+		for _, want := range []string{
+			"last_event", "turns_this_attempt", "tokens_this_attempt",
+			"phase", "phase_elapsed_seconds", "gate_budget_seconds",
+			"gate_remaining_seconds", "gate_verifying",
+		} {
+			if !names[want] {
+				t.Errorf("%s.%s carries no %s wire field: %+v", ep.File, ep.Type, want, fields)
+			}
+		}
+	}
+}

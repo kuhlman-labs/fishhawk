@@ -3720,10 +3720,39 @@ func TestRun_ProgressHeartbeatReachesBackend(t *testing.T) {
 	}
 	tee.waitForReports()
 	reports := fu.progressArgs()
-	if len(reports) != 1 {
-		t.Fatalf("ReportStageProgress calls = %d, want 1", len(reports))
+	// #4023: the stage clock also posts runner-authored phase reports around
+	// the invocation (agent_start before it, gate after it), so select the
+	// HEARTBEAT-shaped report by its LastEvent: exactly one must have landed,
+	// after the agent_start phase report and before the gate one.
+	hbIdx, agentIdx, gateIdx := -1, -1, -1
+	for i, r := range reports {
+		switch r.LastEvent {
+		case "assistant":
+			if hbIdx != -1 {
+				t.Fatalf("heartbeat-shaped ReportStageProgress calls > 1: %+v", reports)
+			}
+			hbIdx = i
+		case phaseEventAgentStart:
+			if agentIdx == -1 {
+				agentIdx = i
+			}
+		case phaseEventGate:
+			gateIdx = i
+		}
 	}
-	r := reports[0]
+	if hbIdx == -1 {
+		t.Fatalf("no heartbeat-shaped ReportStageProgress call (LastEvent=assistant) among %d: %+v", len(reports), reports)
+	}
+	if agentIdx == -1 || agentIdx > hbIdx {
+		t.Errorf("agent_start phase report at %d, want one before the heartbeat at %d: %+v", agentIdx, hbIdx, reports)
+	}
+	if gateIdx == -1 || gateIdx < hbIdx {
+		t.Errorf("gate phase report at %d, want one after the heartbeat at %d: %+v", gateIdx, hbIdx, reports)
+	}
+	r := reports[hbIdx]
+	if r.Phase != stagePhaseAgent {
+		t.Errorf("heartbeat phase = %q, want %q (it was written during the agent invocation)", r.Phase, stagePhaseAgent)
+	}
 	if r.RunID != "11111111-2222-3333-4444-555555555555" || r.StageID != "22222222-3333-4444-5555-666666666666" {
 		t.Errorf("report ids = {run:%q stage:%q}", r.RunID, r.StageID)
 	}

@@ -18,9 +18,11 @@ import (
 // cumulative WITHIN THE CURRENT AGENT ATTEMPT ONLY: they reset when the driver
 // re-spawns the agent mid-stage (the observed 9, 9, 5 turn series). The
 // per-attempt semantics live in the field NAMES on the wire, not only in this
-// comment. Elapsed is deliberately NOT carried here — the operator-facing
+// comment. Stage elapsed is deliberately NOT carried here — the operator-facing
 // elapsed_seconds is derived server-side from the stage row's started_at, which
 // makes it cumulative and monotonic across in-driver re-spawns by construction.
+// PhaseElapsedSeconds (#4023) is a different quantity: the runner's time in its
+// CURRENT phase (agent or gate), which no stage-row timestamp records.
 //
 // ReportedAt is stamped by the DATABASE at ingest — Postgres now(), inside
 // RecordStageProgress's UPDATE — not by the backend process and not by the
@@ -46,6 +48,28 @@ type StageProgress struct {
 	// ReportedAt is the DATABASE-stamped ingest time of this heartbeat. A value
 	// set here by a caller is discarded on write (see the type doc).
 	ReportedAt time.Time `json:"reported_at"`
+
+	// The five phase fields (#4023) are OPTIONAL and omitempty, so a phase-less
+	// report persists (and serves) the byte-identical pre-#4023 payload. They
+	// ride the same last-writer-wins replace as the fields above; there is no
+	// SQL change and no migration.
+
+	// Phase is the runner's stage phase at report time: "agent" (an agent
+	// invocation is running) or "gate" (the verify gate owns the stage). Empty
+	// for a runner that predates the split. Validated at ingest.
+	Phase string `json:"phase,omitempty"`
+	// PhaseElapsedSeconds is the runner-measured MONOTONIC wall seconds spent
+	// in the current phase at report time. nil when not reported.
+	PhaseElapsedSeconds *int `json:"phase_elapsed_seconds,omitempty"`
+	// GateBudgetSeconds is the gate phase's total verify-execution budget
+	// (gate phase only). nil when not reported.
+	GateBudgetSeconds *int `json:"gate_budget_seconds,omitempty"`
+	// GateRemainingSeconds is the gate budget left at report time (gate phase
+	// only). nil when not reported.
+	GateRemainingSeconds *int `json:"gate_remaining_seconds,omitempty"`
+	// GateVerifying is true while a verify execution was in flight at report
+	// time, i.e. the gate budget was being consumed.
+	GateVerifying bool `json:"gate_verifying,omitempty"`
 }
 
 // StageProgressStore is the OPTIONAL capability the server's progress ingest

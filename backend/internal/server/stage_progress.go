@@ -18,8 +18,9 @@ const progressLastEventMaxLen = 128
 // progressMaxBodyBytes bounds the request body BEFORE decode. The clamp above
 // bounds what is PERSISTED, but not what is ALLOCATED per request:
 // json.NewDecoder would otherwise read an arbitrarily large payload into memory
-// before the clamp runs. The report is three small fields — a 128-rune
-// last_event plus two ints — so a few KiB is ample; an oversized body trips the
+// before the clamp runs. The report is a few small fields — a 128-rune
+// last_event, two ints and the optional #4023 phase fields (a short phase,
+// three ints, a bool) — so a few KiB is ample; an oversized body trips the
 // decode-error branch and returns 400. The route sits behind
 // requireRunAccount(memberWrite) and authorizeStageProgress, so only the run's
 // own run-bound bearer or a write:runs caller reaches the decode, but the cap
@@ -46,10 +47,55 @@ type stageProgressStore interface {
 // this process's request clock additionally removes the backend host's clock
 // from the dispatch watchdog's attempt-relative liveness comparison (#3084):
 // reported_at then shares a clock domain with stages.dispatched_at.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags MUST stay byte-identical — options
+// included — to the runner's reportStageProgressBody
+// (runner/internal/upload/upload.go), registered as the stage_progress_report
+// pair in backend/internal/wirecontract. This decoder runs under
+// DisallowUnknownFields, so a tag drift 400s every heartbeat. The five phase
+// fields (#4023) are OPTIONAL; the gate-phase body is pinned by the shared
+// golden testdata/wire/stage_progress_phase.json.
 type stageProgressReport struct {
-	LastEvent         string `json:"last_event"`
-	TurnsThisAttempt  int    `json:"turns_this_attempt"`
-	TokensThisAttempt int    `json:"tokens_this_attempt"`
+	LastEvent            string `json:"last_event"`
+	TurnsThisAttempt     int    `json:"turns_this_attempt"`
+	TokensThisAttempt    int    `json:"tokens_this_attempt"`
+	Phase                string `json:"phase,omitempty"`
+	PhaseElapsedSeconds  *int   `json:"phase_elapsed_seconds,omitempty"`
+	GateBudgetSeconds    *int   `json:"gate_budget_seconds,omitempty"`
+	GateRemainingSeconds *int   `json:"gate_remaining_seconds,omitempty"`
+	GateVerifying        bool   `json:"gate_verifying,omitempty"`
+}
+
+// Stage phases the progress ingest accepts (#4023). An empty phase is a
+// pre-split runner's report and stays valid.
+const (
+	stagePhaseAgent = "agent"
+	stagePhaseGate  = "gate"
+)
+
+// validateProgressPhase checks the optional #4023 phase fields: phase must be
+// empty, "agent" or "gate", and every reported *_seconds must be non-negative.
+// It returns the offending field's wire name and a message, or "" when the
+// fields are valid.
+func validateProgressPhase(body stageProgressReport) (field, msg string) {
+	switch body.Phase {
+	case "", stagePhaseAgent, stagePhaseGate:
+	default:
+		return "phase", `phase must be "agent" or "gate" when set`
+	}
+	for _, f := range []struct {
+		name string
+		v    *int
+	}{
+		{"phase_elapsed_seconds", body.PhaseElapsedSeconds},
+		{"gate_budget_seconds", body.GateBudgetSeconds},
+		{"gate_remaining_seconds", body.GateRemainingSeconds},
+	} {
+		if f.v != nil && *f.v < 0 {
+			return f.name, f.name + " must be non-negative"
+		}
+	}
+	return "", ""
 }
 
 // handleReportStageProgress implements
@@ -107,7 +153,7 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 	var body stageProgressReport
 	if err := dec.Decode(&body); err != nil {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"request body must be valid JSON {last_event, turns_this_attempt, tokens_this_attempt}",
+			"request body must be valid JSON {last_event, turns_this_attempt, tokens_this_attempt} with optional phase, phase_elapsed_seconds, gate_budget_seconds, gate_remaining_seconds, gate_verifying",
 			map[string]any{"error": err.Error()})
 		return
 	}
@@ -115,6 +161,11 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"turns_this_attempt and tokens_this_attempt must be non-negative",
 			map[string]any{"turns_this_attempt": body.TurnsThisAttempt, "tokens_this_attempt": body.TokensThisAttempt})
+		return
+	}
+	if field, msg := validateProgressPhase(body); field != "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", msg,
+			map[string]any{"field": field})
 		return
 	}
 
@@ -142,6 +193,12 @@ func (s *Server) handleReportStageProgress(w http.ResponseWriter, r *http.Reques
 		LastEvent:         clampRunes(body.LastEvent, progressLastEventMaxLen),
 		TurnsThisAttempt:  body.TurnsThisAttempt,
 		TokensThisAttempt: body.TokensThisAttempt,
+
+		Phase:                body.Phase,
+		PhaseElapsedSeconds:  body.PhaseElapsedSeconds,
+		GateBudgetSeconds:    body.GateBudgetSeconds,
+		GateRemainingSeconds: body.GateRemainingSeconds,
+		GateVerifying:        body.GateVerifying,
 	}
 	applied, err := store.RecordStageProgress(r.Context(), stageID, p)
 	if err != nil {
