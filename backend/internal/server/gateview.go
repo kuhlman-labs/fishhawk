@@ -181,6 +181,13 @@ type gateViewResponse struct {
 	// conflict or no AuditRepo; omitted with a fan_in history_gaps entry when
 	// a read or a payload decode fails. See fanInConflictForRun.
 	FanInConflict *gateViewFanInConflict `json:"fan_in_conflict,omitempty"`
+	// ScopeOverlap is the LIVE cross-run scope overlap (E83.60 / #4118): every
+	// other non-terminal run in the repo and tenant whose effective scope
+	// shares files with this run's. Advisory; run-level. Computed only by
+	// handleGetRunGateView. Omitted (nil) for a run-bound mcp:run: caller (it
+	// names other runs) and when the ListRuns scan fails. See
+	// computeScopeOverlap.
+	ScopeOverlap *scopeOverlapPayload `json:"scope_overlap,omitempty"`
 	// MergeCandidateStaleness is the read-time staleness of an open
 	// decomposed parent's consolidated PR head against its base tip (E85.4 /
 	// #4147): fresh | stale | undetermined, with next_step
@@ -1197,6 +1204,10 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	// HERE and not in buildGateView: up to six category reads, which the
 	// attention scan must not pay per run.
 	resp.FanInConflict = s.fanInConflictForRun(r.Context(), runID, &resp)
+	// HERE and not in buildGateView (E83.60 / #4118): a cross-run ListRuns
+	// scan the attention scan must not pay per run. Omitted for a run-bound
+	// caller and on a compute error.
+	resp.ScopeOverlap = s.gateViewScopeOverlapFor(r.Context(), runRow)
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 

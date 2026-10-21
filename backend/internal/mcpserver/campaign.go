@@ -111,6 +111,99 @@ type GetCampaignStatusOutput struct {
 	// the acceptance gate (a campaign nowhere near acceptance issues no probe and
 	// omits the block).
 	AcceptanceSlot *AcceptanceSlot `json:"acceptance_slot,omitempty" jsonschema:"present only when at least one campaign item is at or near the acceptance gate: names the shared preview slot's resolved host, its live state (free/held/unverifiable), the item holding it, and the items serialized behind it. Observability only — no host mutation"`
+	// ScopeOverlap is the additive, best-effort cross-run scope-overlap block
+	// (E83.60 / #4118): for each in-flight item, the OTHER in-flight items whose
+	// runs share files with it. Composed MCP-side from one live scope-overlap
+	// read per item (capped). Nil when no item is in flight.
+	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read)"`
+}
+
+// campaignScopeOverlapMaxItemReads bounds the per-poll scope-overlap reads
+// (one GET /v0/runs/{run_id}/scope-overlap per in-flight item), so a drive
+// tick on a wide campaign cannot fan out unboundedly. Items beyond it are
+// reported via truncated, never capped silently.
+const campaignScopeOverlapMaxItemReads = 8
+
+// campaignScopeOverlap is the campaign-status scope_overlap block (#4118).
+// UNEXPORTED, like gateViewFanInConflict, so the export baseline is unchanged.
+type campaignScopeOverlap struct {
+	Items        []campaignItemScopeOverlap `json:"items" jsonschema:"one entry per in-flight item whose overlap read succeeded; always an array"`
+	Truncated    bool                       `json:"truncated,omitempty" jsonschema:"true when more in-flight items existed than the per-poll read cap; the extra items were not read"`
+	ReadFailures []string                   `json:"read_failures,omitempty" jsonschema:"issue refs of in-flight items whose overlap read failed"`
+}
+
+// campaignItemScopeOverlap is one in-flight item's overlap with the OTHER
+// in-flight items, filtered from its live scope-overlap read.
+type campaignItemScopeOverlap struct {
+	IssueRef          string            `json:"issue_ref" jsonschema:"the campaign item"`
+	RunID             string            `json:"run_id" jsonschema:"the item's run"`
+	SelfScopeResolved bool              `json:"self_scope_resolved" jsonschema:"false when the item's run has no resolvable scope yet (no plan), so an empty overlaps[] says nothing"`
+	Overlaps          []scopeOverlapRun `json:"overlaps" jsonschema:"overlapping runs that are another in-flight item's run, or a decomposition slice of one (decomposed_from); always an array"`
+}
+
+// campaignScopeOverlapItemInFlight reports whether a campaign item counts as
+// in flight for the overlap block: running or paused (a paused item's run is
+// parked at a gate, still holding its files).
+func campaignScopeOverlapItemInFlight(state string) bool {
+	return state == "running" || state == "paused"
+}
+
+// campaignScopeOverlapFor composes the campaign-status scope_overlap block
+// (#4118), modelled on acceptanceSlotFor: in-flight items (running or paused
+// with a parseable run_id), at most campaignScopeOverlapMaxItemReads reads.
+// Each item's live overlap is filtered to entries whose run_id is ANOTHER
+// in-flight item's run, or whose decomposed_from is one (a decomposed item's
+// slice children). A per-item read failure lists the item in read_failures and
+// never fails the status snapshot. Nil when no item is in flight.
+func (r *runResolver) campaignScopeOverlapFor(ctx context.Context, items []CampaignItem) *campaignScopeOverlap {
+	type candidate struct {
+		item  CampaignItem
+		runID uuid.UUID
+	}
+	var inFlight []candidate
+	itemRuns := map[string]bool{}
+	for _, it := range items {
+		if !campaignScopeOverlapItemInFlight(it.State) {
+			continue
+		}
+		parsed, perr := uuid.Parse(strings.TrimSpace(it.RunID))
+		if perr != nil {
+			continue
+		}
+		inFlight = append(inFlight, candidate{item: it, runID: parsed})
+		itemRuns[parsed.String()] = true
+	}
+	if len(inFlight) == 0 {
+		return nil
+	}
+	out := &campaignScopeOverlap{Items: []campaignItemScopeOverlap{}}
+	if len(inFlight) > campaignScopeOverlapMaxItemReads {
+		out.Truncated = true
+		inFlight = inFlight[:campaignScopeOverlapMaxItemReads]
+	}
+	for _, c := range inFlight {
+		ov, err := r.api.GetScopeOverlap(ctx, c.runID)
+		if err != nil {
+			out.ReadFailures = append(out.ReadFailures, c.item.IssueRef)
+			continue
+		}
+		self := c.runID.String()
+		entry := campaignItemScopeOverlap{
+			IssueRef:          c.item.IssueRef,
+			RunID:             self,
+			SelfScopeResolved: ov.SelfScopeResolved,
+			Overlaps:          []scopeOverlapRun{},
+		}
+		for _, o := range ov.Overlaps {
+			otherItem := o.RunID != self && itemRuns[o.RunID]
+			sliceOfOtherItem := o.DecomposedFrom != "" && o.DecomposedFrom != self && itemRuns[o.DecomposedFrom]
+			if otherItem || sliceOfOtherItem {
+				entry.Overlaps = append(entry.Overlaps, o)
+			}
+		}
+		out.Items = append(out.Items, entry)
+	}
+	return out
 }
 
 // ResumeCampaignInput is the fishhawk_resume_campaign tool's input.
@@ -836,6 +929,12 @@ Acceptance validates against a SINGLE shared preview slot, so a campaign's items
 serialize on it. When any item is at or near the acceptance gate the response
 carries an acceptance_slot block naming which head holds that slot and which
 items are serialized behind it, so the contention is visible before you hit it.
+
+When any item is in flight (running or paused with a run) the response carries a
+scope_overlap block: per in-flight item, the OTHER in-flight items' runs (or their
+decomposition slices) sharing files with it, from one live scope-overlap read per
+item (at most 8; truncated beyond). Advisory: merging one of two overlapping items
+while the other is mid-implement can strand it.
 `),
 	}, resolver.getCampaignStatus)
 }
@@ -868,6 +967,9 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		// still surfaces unchanged. Nil (block omitted) when no item is at or near
 		// the acceptance gate.
 		AcceptanceSlot: r.acceptanceSlotFor(ctx, st.Items),
+		// Best-effort cross-run scope overlap among the in-flight items
+		// (E83.60 / #4118), likewise after the successful backend read.
+		ScopeOverlap: r.campaignScopeOverlapFor(ctx, st.Items),
 	}, nil
 }
 

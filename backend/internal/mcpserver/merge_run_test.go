@@ -155,6 +155,14 @@ type mergeRunFakeBackend struct {
 	// poll's own reads alone — degrade D3 (the audit read FAILS -> the GENERIC
 	// wording still ships).
 	acceptanceAuditStatus int
+
+	// E83.60 / #4118: GET /v0/runs/{run_id}/scope-overlap. scopeOverlapBody,
+	// when non-empty, is served with scopeOverlapStatus (default 200);
+	// otherwise the route answers 404 (an older backend). scopeOverlapCalls
+	// counts reads.
+	scopeOverlapBody   string
+	scopeOverlapStatus int
+	scopeOverlapCalls  int
 }
 
 func (fb *mergeRunFakeBackend) runState() string {
@@ -299,6 +307,23 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 			matches = matches[:limit]
 		}
 		_ = json.NewEncoder(w).Encode(listAuditResult{Items: matches})
+	})
+
+	mux.HandleFunc("GET /v0/runs/{run_id}/scope-overlap", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fb.mu.Lock()
+		fb.scopeOverlapCalls++
+		body, status := fb.scopeOverlapBody, fb.scopeOverlapStatus
+		fb.mu.Unlock()
+		if body == "" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		if status == 0 {
+			status = http.StatusOK
+		}
+		w.WriteHeader(status)
+		_, _ = w.Write([]byte(body))
 	})
 
 	srv := httptest.NewServer(mux)
@@ -2105,5 +2130,97 @@ func TestMergeRun_ReviewCoverageIncomplete_ImmediateStatus(t *testing.T) {
 				t.Errorf("merge_queued=%v consumes=%q, want false / none", out.MergeQueued, out.NextAction.Consumes)
 			}
 		})
+	}
+}
+
+// --- scope_overlap on fishhawk_merge_run (E83.60 / #4118) ---
+
+// mergedFake is a backend whose merge settles immediately (pr_merged past the
+// verdict anchor).
+func mergedFake() *mergeRunFakeBackend {
+	return &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		stateAfterMerge:  "succeeded",
+		mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 5, PRURL: "https://github.com/x/y/pull/7"},
+		auditEntries:     []AuditEntry{{Category: "pr_merged", Sequence: 6}},
+	}
+}
+
+// TestMergeRun_ScopeOverlap_NamesOverlappingRuns: a merged response carries the
+// backend's live overlap for the run being merged, informational only.
+func TestMergeRun_ScopeOverlap_NamesOverlappingRuns(t *testing.T) {
+	runID := uuid.NewString()
+	other := uuid.NewString()
+	fb := mergedFake()
+	fb.scopeOverlapBody = `{"run_id":"` + runID + `","self_scope_resolved":true,"overlaps":[{"run_id":"` + other +
+		`","issue_ref":"x/y#11","stage":"implement","stage_state":"running","paths":["shared.go"]}],` +
+		`"scanned_runs":1,"unscoped_runs":0,"truncated":false}`
+	r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID, Verdict: "ship it"})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "merged" {
+		t.Fatalf("status = %q, want merged", out.Status)
+	}
+	ov := out.ScopeOverlap
+	if ov == nil || len(ov.Overlaps) != 1 {
+		t.Fatalf("scope_overlap = %+v, want the seeded overlap", ov)
+	}
+	if o := ov.Overlaps[0]; o.RunID != other || o.IssueRef != "x/y#11" || o.Stage != "implement" ||
+		len(o.Paths) != 1 || o.Paths[0] != "shared.go" {
+		t.Errorf("overlap = %+v, want run %s implement sharing shared.go", o, other)
+	}
+	if fb.scopeOverlapCalls != 1 {
+		t.Errorf("scope-overlap reads = %d, want 1", fb.scopeOverlapCalls)
+	}
+}
+
+// TestMergeRun_ScopeOverlap_ReadFailureOmitted: a 500, a 403 (a token without
+// read:audit) and an unrouted 404 each leave scope_overlap nil while the merge
+// still answers status=merged — the read never refuses the merge.
+func TestMergeRun_ScopeOverlap_ReadFailureOmitted(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		body   string
+		status int
+	}{
+		{"500", `{"code":"internal_error","message":"boom"}`, http.StatusInternalServerError},
+		{"403", `{"code":"insufficient_scope","message":"read:audit"}`, http.StatusForbidden},
+		{"unrouted 404", "", 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := mergedFake()
+			fb.scopeOverlapBody, fb.scopeOverlapStatus = tc.body, tc.status
+			r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+			if err != nil {
+				t.Fatalf("mergeRun: %v (a failed overlap read must not fail the merge)", err)
+			}
+			if out.Status != "merged" || out.ScopeOverlap != nil {
+				t.Errorf("status = %q scope_overlap = %+v, want merged with no block", out.Status, out.ScopeOverlap)
+			}
+			if fb.scopeOverlapCalls != 1 {
+				t.Errorf("scope-overlap reads = %d, want 1 (attempted)", fb.scopeOverlapCalls)
+			}
+		})
+	}
+}
+
+// TestMergeRun_ScopeOverlap_NotReadOnToolError: a tool error from the merge
+// flow (no PR URL) makes no scope-overlap read and returns the error unchanged.
+func TestMergeRun_ScopeOverlap_NotReadOnToolError(t *testing.T) {
+	fb := mergedFake()
+	fb.prURL = ""
+	fb.scopeOverlapBody = `{"run_id":"x","self_scope_resolved":true,"overlaps":[],"scanned_runs":0,"unscoped_runs":0,"truncated":false}`
+	r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+	_, _, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it"})
+	if err == nil || !strings.Contains(err.Error(), "no pull request URL") {
+		t.Fatalf("err = %v, want the no-PR refusal", err)
+	}
+	if fb.scopeOverlapCalls != 0 {
+		t.Errorf("scope-overlap reads = %d, want 0 on a tool error", fb.scopeOverlapCalls)
 	}
 }

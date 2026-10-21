@@ -3469,6 +3469,74 @@ components:
             `history_gaps` entry and `history_incomplete=true` when the
             decomposition-children list or the chain-head read fails, so an
             unreadable state is never shown as fresh.
+        scope_overlap:
+          $ref: '#/components/schemas/ScopeOverlap'
+          description: |
+            E83.60 / #4118. The LIVE cross-run scope overlap, the same payload
+            `GET /v0/runs/{run_id}/scope-overlap` returns, computed by this
+            handler only (the attention scan never pays the cross-run listing).
+            Advisory. Omitted for a run-bound `mcp:run:<uuid>` caller (it names
+            other runs' ids, issues and paths) and when the live-run listing
+            fails — never a failed request.
+
+    ScopeOverlap:
+      type: object
+      description: |
+        Cross-run scope overlap (E83.60 / #4118): every OTHER non-terminal run
+        (state `pending`/`running`) in the same repository and tenant whose
+        EFFECTIVE scope shares an exact path with this run's. Effective scope =
+        the newest standard_v1 plan's files (a decomposition child narrows to
+        its own sub_plan slice; any other run takes top-level `scope.files`
+        UNION every sub_plan scope) plus approval `add_scope_files` plus
+        APPROVED scope amendments, minus approval `remove_scope_files`. The
+        run's own decomposition/recovery lineage is excluded. Advisory: nothing
+        refuses on it. Live — recomputed on every read; the
+        `plan_scope_overlap` audit row is the snapshot the plan saw when it
+        settled.
+      required: [run_id, self_scope_resolved, overlaps, scanned_runs, unscoped_runs, truncated]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/UUID'
+        self_scope_resolved:
+          type: boolean
+          description: False when this run's own effective scope did not resolve (no plan yet, or a read failed); no other run is listed and `overlaps` is empty.
+        overlaps:
+          type: array
+          description: Sorted by `issue_ref` then `run_id`; an empty array (never null) when nothing overlaps.
+          items: { $ref: '#/components/schemas/ScopeOverlapRun' }
+        scanned_runs:
+          type: integer
+          description: Candidate runs examined after the lineage and tenant exclusions.
+        unscoped_runs:
+          type: integer
+          description: Scanned runs whose effective scope did not resolve (not reported).
+        truncated:
+          type: boolean
+          description: True when a per-state live-run page reached the 200-run list limit, so some live run may have gone unscanned.
+
+    ScopeOverlapRun:
+      type: object
+      required: [run_id, paths]
+      properties:
+        run_id:
+          $ref: '#/components/schemas/UUID'
+        issue_ref:
+          type: string
+          description: The run's trigger ref (e.g. `issue:4118`). A decomposition child carries its parent's.
+        decomposed_from:
+          type: string
+          format: uuid
+          description: The decomposed parent run, when this run is a decomposition slice.
+        stage:
+          type: string
+          description: The run's current stage type (lowest-sequence non-terminal stage, else its last stage); absent when the stage read failed.
+        stage_state:
+          type: string
+          description: That stage's state; absent when the stage read failed.
+        paths:
+          type: array
+          description: The shared exact paths, sorted.
+          items: { type: string }
 
     GateViewFanInConflict:
       type: object
@@ -17098,9 +17166,24 @@ paths:
         The `chain=true` read (hash-chain verification) and the compliance
         export stay complete. This is not access control: any caller holding
         `read:audit` may request the category explicitly.
+
+        **Run-bound withhold (E83.60 / #4118).** For a run-bound
+        `mcp:run:<uuid>` caller, entries of category `plan_scope_overlap`
+        (which name OTHER runs) are omitted from every non-chain read, a read
+        that names the category included, BEFORE pagination; such a caller's
+        `chain=true` read is refused `403 run_token_forbidden`. Operators are
+        unchanged.
       tags: [audit]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+        - name: chain
+          in: query
+          schema: { type: boolean, default: false }
+          description: |
+            Optional. When `true`, returns the run's complete hash chain
+            (every withheld category included) for verification. Refused
+            `403 run_token_forbidden` for a run-bound `mcp:run:<uuid>` token
+            (E83.60 / #4118).
         - name: category
           in: query
           schema: { type: string }
@@ -17169,6 +17252,8 @@ paths:
             not a known audit category (absent `allow_unknown=true`; the
             error `details.suggestions` names the nearest known categories).
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` — a run-bound `mcp:run:<uuid>` token requested `chain=true` (E83.60 / #4118).'
         '404': { $ref: '#/components/responses/NotFound' }
 
   /v0/runs/{run_id}/gate-view:
@@ -17213,6 +17298,41 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '503':
           description: '`gate_view_unconfigured` — the concern repository is not configured; or `run_repo_unconfigured` — the run repository is not configured.'
+
+  /v0/runs/{run_id}/scope-overlap:
+    get:
+      operationId: getRunScopeOverlap
+      summary: Live cross-run scope overlap for a run
+      description: |
+        E83.60 / #4118. Which OTHER non-terminal runs in the same repository
+        and tenant share files with this run's effective scope — the
+        merge-order signal for overlapping in-flight work. Advisory and
+        read-only: nothing refuses on it. Recomputed on every read; the
+        `plan_scope_overlap` audit row records what the plan saw when it
+        settled.
+
+        Auth: the payload names other runs' ids, issue refs and paths, so a
+        run-bound `mcp:run:<uuid>` token is refused `403 run_token_forbidden`
+        even for its own run. Every other caller must hold `read:audit`.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The overlap payload.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/ScopeOverlap' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID.'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` — a run-bound `mcp:run:<uuid>` token (own run included); or `insufficient_scope` — a token missing the `read:audit` scope.'
+        '404': { $ref: '#/components/responses/NotFound' }
+        '500':
+          description: '`internal_error` — the run read or the live-run listing failed.'
+        '503':
+          description: '`run_repo_unconfigured` — the run repository is not configured.'
 
   /v0/runs/{run_id}/budget:
     get:
@@ -17578,6 +17698,12 @@ paths:
         `limit=N` (e.g. `fishhawk_get_run_status`'s `run_id` + `limit`
         recent-activity read) still returns up to N visible entries. This is
         not access control.
+
+        **Run-bound withhold (E83.60 / #4118).** For a run-bound
+        `mcp:run:<uuid>` caller, entries of category `plan_scope_overlap`
+        (which name OTHER runs) are omitted even when the request names the
+        category, BEFORE pagination. This one IS access control by subject;
+        operators are unchanged.
       tags: [audit]
       parameters:
         - name: category
