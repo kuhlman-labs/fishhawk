@@ -298,6 +298,55 @@ func TestMergeRun_EmptyVerdict(t *testing.T) {
 	}
 }
 
+// TestMergeRun_AllowOverlapEmptyReason pins the override contract's 400
+// (E83.61 / #4119): allow_overlap with an empty or whitespace-only
+// overlap_reason is validation_failed {field: overlap_reason}, decided before
+// any read — an UNKNOWN run id still answers 400, not 404 — and nothing is
+// recorded or dispatched.
+func TestMergeRun_AllowOverlapEmptyReason(t *testing.T) {
+	for name, reason := range map[string]string{"empty": "", "whitespace": " \t\n "} {
+		t.Run(name, func(t *testing.T) {
+			merger := &fakeMerger{}
+			s, _, au := newAutoDriveMergeServer(t, merger)
+			w := postMergeRun(t, s, uuid.New(), mergeRunRequest{Verdict: "go", AllowOverlap: true, OverlapReason: reason}, withMergeOperator)
+			assertOverlapReasonRefused(t, w)
+			if len(mergeVerdictRows(au)) != 0 || merger.called != 0 {
+				t.Fatalf("verdict rows = %d, merger called %d; want nothing recorded or dispatched", len(mergeVerdictRows(au)), merger.called)
+			}
+		})
+	}
+}
+
+// TestMergeRun_OverlapReasonCap pins approval condition C4: overlap_reason
+// over mergeOverlapReasonMaxBytes is 400 validation_failed {field:
+// overlap_reason}; exactly at the cap passes validation (an unknown run then
+// answers 404).
+func TestMergeRun_OverlapReasonCap(t *testing.T) {
+	merger := &fakeMerger{}
+	s, _, au := newAutoDriveMergeServer(t, merger)
+	over := strings.Repeat("x", mergeOverlapReasonMaxBytes+1)
+	w := postMergeRun(t, s, uuid.New(), mergeRunRequest{Verdict: "go", AllowOverlap: true, OverlapReason: over}, withMergeOperator)
+	assertOverlapReasonRefused(t, w)
+	if len(mergeVerdictRows(au)) != 0 || merger.called != 0 {
+		t.Fatal("nothing may be recorded or dispatched on an over-cap overlap_reason")
+	}
+	at := strings.Repeat("x", mergeOverlapReasonMaxBytes)
+	if w := postMergeRun(t, s, uuid.New(), mergeRunRequest{Verdict: "go", AllowOverlap: true, OverlapReason: at}, withMergeOperator); w.Code != http.StatusNotFound {
+		t.Fatalf("at-cap overlap_reason status = %d, want 404 (validation passed):\n%s", w.Code, w.Body.String())
+	}
+}
+
+func assertOverlapReasonRefused(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	env := decodeMergeErr(t, w)
+	if env.Error.Code != "validation_failed" || env.Error.Details["field"] != "overlap_reason" {
+		t.Fatalf("error = %+v, want validation_failed field overlap_reason", env.Error)
+	}
+}
+
 func TestMergeRun_MalformedBody(t *testing.T) {
 	s, repo, au := newAutoDriveMergeServer(t, &fakeMerger{})
 	runID := uuid.New()
@@ -3290,7 +3339,7 @@ func TestMergeRun_EnqueueArmSkipsRedAndUnreadableGates(t *testing.T) {
 		req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
 		w := httptest.NewRecorder()
 		handled, ineligible := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
-			mergeCandidateGateResult{Code: code, prHeadSHA: "m0", prBaseRef: mcqBase})
+			mergeCandidateGateResult{Code: code, prHeadSHA: "m0", prBaseRef: mcqBase}, nil)
 		if handled || ineligible != nil {
 			t.Fatalf("%s: handled=%v ineligible=%v, want today's refusal untouched", code, handled, ineligible)
 		}
@@ -3443,7 +3492,7 @@ func TestMergeRun_RepeatNamesTheIntentRowNotACrossBaseOrphan(t *testing.T) {
 	req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
 	w := httptest.NewRecorder()
 	handled, _ := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
-		mergeCandidateGateResult{Code: mergeCodeBaseBehind, prHeadSHA: "m0", prBaseRef: "release"})
+		mergeCandidateGateResult{Code: mergeCodeBaseBehind, prHeadSHA: "m0", prBaseRef: "release"}, nil)
 	if !handled || w.Code != http.StatusServiceUnavailable {
 		t.Fatalf("base-change merge = %v %d, want a handled 503:\n%s", handled, w.Code, w.Body.String())
 	}
@@ -3491,7 +3540,7 @@ func TestMergeRun_EnqueueArmSkipsUnownedInFlightPass(t *testing.T) {
 	w := httptest.NewRecorder()
 	handled, ineligible := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
 		mergeCandidateGateResult{Code: mergeCodeCandidateUnverified, prHeadSHA: "m0", prBaseRef: mcqBase,
-			Details: map[string]any{"verify_state": mergeCandidateStateInFlight}})
+			Details: map[string]any{"verify_state": mergeCandidateStateInFlight}}, nil)
 	if handled || ineligible != nil {
 		t.Fatalf("handled=%v ineligible=%v, want today's refusal untouched", handled, ineligible)
 	}
@@ -3516,7 +3565,7 @@ func TestMergeRun_EnqueueOnNewBaseDropsTheOldEntry(t *testing.T) {
 	req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
 	w := httptest.NewRecorder()
 	handled, _ := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
-		mergeCandidateGateResult{Code: mergeCodeBaseBehind, prHeadSHA: "m0", prBaseRef: "release"})
+		mergeCandidateGateResult{Code: mergeCodeBaseBehind, prHeadSHA: "m0", prBaseRef: "release"}, nil)
 	f.srv.bgMergeQueuePump.Wait()
 	if !handled || w.Code != http.StatusAccepted {
 		t.Fatalf("base-change merge = %v %d, want a handled 202:\n%s", handled, w.Code, w.Body.String())

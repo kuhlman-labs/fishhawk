@@ -34,8 +34,14 @@ const CategoryMergeVerdictRecorded = "merge_verdict_recorded"
 // mergeRunRequest is the JSON body of POST /v0/runs/{run_id}/merge. verdict is
 // required non-empty: the merge is an audited operator declaration, so it must
 // carry the operator's verdict prose.
+//
+// allow_overlap overrides a refusing merge overlap guard (E83.61 / #4119) and
+// requires a non-empty overlap_reason of at most mergeOverlapReasonMaxBytes;
+// the reason is recorded verbatim on the merge_overlap_overridden row.
 type mergeRunRequest struct {
-	Verdict string `json:"verdict"`
+	Verdict       string `json:"verdict"`
+	AllowOverlap  bool   `json:"allow_overlap,omitempty"`
+	OverlapReason string `json:"overlap_reason,omitempty"`
 }
 
 // mergeRunResponse reports the recorded verdict + queued merge. merge_queued is
@@ -140,6 +146,19 @@ type mergeRunResponse struct {
 //     BEFORE the merge_verdict_recorded append, so a merge that structurally
 //     cannot queue records no verdict; the post-resolution route is
 //     operator-resolve-then-vouch-then-re-merge.
+//   - the merge overlap guard (E83.61 / #4119, merge_overlap_guard.go), AFTER
+//     the conflict guard and BEFORE the merge-candidate gate — so the ADR-093
+//     enqueue arm (#4295) can never enqueue an overlap-blocked run: 409
+//     overlapping_implement_in_flight when another live run's implement-type
+//     stage (dispatched / running) has an effective scope intersecting this
+//     PR's changed paths, 409 overlap_undetermined and 502
+//     overlap_check_failed when that cannot be decided once a live implement
+//     exists elsewhere (FAIL-CLOSED). allow_overlap with a non-empty
+//     overlap_reason (400 when empty or over 2000 bytes) admits the merge and
+//     records a merge_overlap_overridden row RECORD-BEFORE-COMMIT — before
+//     the merge-intent append on the enqueue path and before the verdict
+//     append otherwise; a failed record is 503 overlap_override_unrecorded
+//     with nothing merged, enqueued or newly recorded.
 //   - the merge-candidate gate (ADR-090 / E83.33 / #4018), AFTER the conflict
 //     guard and BEFORE the verdict append: 409 merge_base_behind when the PR
 //     head does not contain the base tip, 409 merge_candidate_unverified /
@@ -248,6 +267,21 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"verdict is required: the merge is an audited operator declaration; state your merge verdict",
 			map[string]any{"field": "verdict"})
+		return
+	}
+	// Overlap override contract (E83.61 / #4119): validated before any read.
+	// The trim only rejects blank input; the recorded value is the original
+	// string (approval condition C3).
+	if len(reqBody.OverlapReason) > mergeOverlapReasonMaxBytes {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			fmt.Sprintf("overlap_reason must be at most %d bytes", mergeOverlapReasonMaxBytes),
+			map[string]any{"field": "overlap_reason", "max_bytes": mergeOverlapReasonMaxBytes})
+		return
+	}
+	if reqBody.AllowOverlap && strings.TrimSpace(reqBody.OverlapReason) == "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"allow_overlap requires a non-empty overlap_reason: overriding the merge overlap guard is an audited operator judgement; state why the overlap is safe",
+			map[string]any{"field": "overlap_reason"})
 		return
 	}
 
@@ -403,6 +437,37 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Merge overlap guard (E83.61 / #4119): another live run's implement
+	// stage writing files this PR changes refuses the merge. AFTER the #3109
+	// conflict guard and BEFORE the merge-candidate gate, so the ADR-093
+	// enqueue arm below can never enqueue an overlap-blocked run, and before
+	// any verdict append. FAILS CLOSED; see mergeOverlapGuard. An override
+	// (allow_overlap + overlap_reason) proceeds and is recorded by
+	// recordOverlapOverride at the first commit point reached.
+	overlap := s.mergeOverlapGuard(r.Context(), runRow)
+	if overlap.refused() && !reqBody.AllowOverlap {
+		s.writeMergeOverlapRefusal(w, r, runID, prURL, overlap)
+		return
+	}
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	// recordOverlapOverride is the override's record-before-commit step: a
+	// no-op when the guard admitted, otherwise the merge_overlap_overridden
+	// append (deduped), with a failure rendered as 503 and false returned so
+	// the caller commits nothing.
+	recordOverlapOverride := func() bool {
+		if !overlap.refused() {
+			return true
+		}
+		if err := s.recordMergeOverlapOverride(r.Context(), runID, prURL, subject, overlap, reqBody.OverlapReason); err != nil {
+			s.writeMergeOverlapOverrideUnrecorded(w, r, runID, prURL, err)
+			return false
+		}
+		return true
+	}
+
 	// Merge-candidate gate (ADR-090 D1/D2/D7, E83.33 / #4018): Fishhawk
 	// verifies the MERGE CANDIDATE, not the branch. AFTER the #3109 conflict
 	// guard (a conflicting PR keeps its own, more specific refusal) and BEFORE
@@ -414,8 +479,9 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// ADR-093 slice 1 (E87.4 / #4295): an ELIGIBLE run the gate refuses
 		// as behind / unverified / held is ENQUEUED (202 queued) instead; an
 		// ineligible one keeps today's refusal, plus the reason codes, with
-		// nothing written.
-		handled, ineligible := s.mergeQueueEnqueueArm(w, r, runRow, prURL, verdict, id.Subject, gate)
+		// nothing written. An overlap override is recorded before the
+		// merge-intent append (recordOverlapOverride as the pre-commit step).
+		handled, ineligible := s.mergeQueueEnqueueArm(w, r, runRow, prURL, verdict, id.Subject, gate, recordOverlapOverride)
 		if handled {
 			return
 		}
@@ -463,9 +529,14 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// index's collision (not an unrelated 23505 on the hash-chain / entry-hash
 	// / (run_id, sequence) uniqueness); the loser re-reads the winner's
 	// sequence, responds already_recorded, and still dispatches the merge.
-	subject := id.Subject
-	if subject == "" {
-		subject = "anonymous"
+	//
+	// An overlap override (E83.61 / #4119) is recorded FIRST, record-before-
+	// commit: a failed record answers 503 overlap_override_unrecorded with no
+	// verdict appended and no merge dispatched. On a FIRST POST its row
+	// therefore precedes the verdict row; on a resume the verdict row already
+	// exists and only a changed judgement appends a new override row.
+	if !recordOverlapOverride() {
+		return
 	}
 	existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
 	if err != nil {
@@ -1227,8 +1298,14 @@ const CategoryMergeQueueEntered = "merge_queue_entered"
 // mergeCandidateAdmissionContext tracked by bgMergeQueuePump, so the 202 never
 // waits on an admission's auto-advance or pass start; it answers from the
 // store state read right after the write.
+//
+// preCommit (nil = none) runs under the lock immediately BEFORE the
+// merge_queue_entered append, only when an intent is about to be recorded:
+// the handler passes its merge-overlap override record (E83.61 / #4119), so an
+// overridden overlap is durable before any merge intent. A false return means
+// preCommit wrote the response; nothing is appended or enqueued.
 func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, runRow *run.Run,
-	prURL, verdict, subject string, gate mergeCandidateGateResult) (bool, []string) {
+	prURL, verdict, subject string, gate mergeCandidateGateResult, preCommit func() bool) (bool, []string) {
 	if s.cfg.MergeQueue == nil {
 		return false, nil
 	}
@@ -1276,7 +1353,7 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	)
 	if lerr := s.cfg.MergeQueue.WithMergeIntentLock(ctx, runID, func() error {
 		ran = true
-		res, handled = s.recordMergeQueueIntent(w, r, runRow, prURL, verdict, subject, gate)
+		res, handled = s.recordMergeQueueIntent(w, r, runRow, prURL, verdict, subject, gate, preCommit)
 		return nil
 	}); lerr != nil {
 		if !ran {
@@ -1358,7 +1435,7 @@ type mergeQueueIntent struct {
 // means an error response was written; with handled=false the caller renders
 // today's refusal (the entry was unreadable; nothing was written).
 func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, runRow *run.Run,
-	prURL, verdict, subject string, gate mergeCandidateGateResult) (*mergeQueueIntent, bool) {
+	prURL, verdict, subject string, gate mergeCandidateGateResult, preCommit func() bool) (*mergeQueueIntent, bool) {
 	ctx := r.Context()
 	runID := runRow.ID
 	prior, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
@@ -1392,6 +1469,9 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 			fields["queue_position"] = prior.Position
 		}
 		payload, _ := json.Marshal(fields)
+		if preCommit != nil && !preCommit() {
+			return nil, true
+		}
 		actorKind := audit.ActorUser
 		entry, aerr := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 			RunID:        runID,
