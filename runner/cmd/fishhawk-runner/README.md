@@ -71,6 +71,43 @@ The state vocabulary is read from ONE definition (`runStateCancelled` in `lockho
 
 In practice a TERMed runner exits gracefully and its deferred release removes the lockfile, so this path is normally never reached — it is the net for the SIGKILL / host-crash / cancel-from-a-different-MCP-process cases the MCP-side reap (`backend/internal/mcpserver/detached_registry.go`) cannot cover.
 
+## Fix-up session resume (E83.56 / [#4089](https://github.com/kuhlman-labs/fishhawk/issues/4089))
+
+An operator fix-up pass RESUMES the implement agent's Claude Code session instead of re-orienting a fresh agent. The resumed turn is the backend's fetched fix-up prompt, byte for byte: the concerns, the current prior diff, and the fix-up-only sidecar and scope instructions the implement session never saw. The runner never re-sends the implement prompt or the session history. The adapter half (`Invocation.ResumeSessionID` → `--resume <id>`, `Result.SessionID`, `agent.ErrSessionResumeFailed`) is in `runner/internal/agent/claudecode/README.md` § "Session resume (#4089)". `fixupresume.go` owns the rest.
+
+**Ledger.** `<git-common-dir>/fishhawk-worktrees/run-<root>.agent-sessions.json` (`agentSessionLedgerPath`), beside the lineage worktree and never inside it, like the `.runid` sidecar and the `.lock`. Shape: `{"schema":"agent-sessions-v1","runs":{<full run id>:{session_id, agent, agent_binary, requested_model, reported_model, working_dir, stage_id, recorded_at}}}`, keyed by the full run id because decomposed siblings share one lineage file. `run()` sets the path only after the lineage worktree is provisioned and its lock acquired, so every read and write happens under the lineage lock. The write is atomic (temp file + rename). A missing file is an empty ledger. Unparseable JSON or a foreign `schema` is a read error. `pruneStaleWorktree` and `sweepTerminalWorktrees` remove the ledger with the `.runid` and `.lock`, so a swept lineage leaves no session pointer behind.
+
+**Recording (`recordAgentSession`).** After the agent loop, an implement stage whose primary result is `OK` with a non-empty `SessionID` upserts its record and appends one `agent_session_recorded` bundle event (payload `session_id`) plus a log line. A failed `Result` is never recorded, because a refused resume echoes the dead requested id. The verify-fix and base-rebase re-invokes fold tokens and events into `res` but never its `SessionID`, so their narrower sessions are never recorded. Any IO error logs `agent_session_ledger_degraded` and never fails the stage. A fix-up pass records too, so a second fix-up resumes the latest session.
+
+**Decision (`decideFixupResume`, pure).** It runs once per fix-up dispatch (`stageType == implement && cfg.fixup`, not on the #1165 deterministic-apply path). Non-fix-up stages pay no ledger read and emit no event. The first guard that applies names the fallback reason:
+
+| Reason | When |
+|---|---|
+| `disabled` | `FISHHAWK_FIXUP_RESUME=off` (surrounding whitespace ignored; any other value leaves resume on). Read through the `fixupResumeGetenv` seam. |
+| `unsupported_agent` | `--agent` is not `claude-code` (codex ignores `ResumeSessionID`). |
+| `ledger_unreadable` | The ledger cannot be read or parsed, or no lineage worktree gave it a path. |
+| `no_session_recorded` | No record for this run id, or an empty `session_id`. |
+| `agent_mismatch` | The recorded agent id or resolved binary (`FISHHAWK_AGENT_BIN` / default) differs. |
+| `model_mismatch` | The recorded requested model differs from this spawn's `inv.Model`. |
+| `working_dir_mismatch` | The recorded working directory differs. claude files sessions per cwd, so a moved checkout cannot resume. |
+| `resumed` | None of the above: resume `session_id`. |
+
+**Invocation (`invokePrimaryAgent`).** The decision applies to the agent loop's FIRST attempt only (`primaryResumeDecision`). An ADR-023 self-retry follows a failed attempt, spawns fresh, and is traced as fallback `self_retry`. The shared `inv` is never mutated: the resumed spawn is a by-value copy carrying `ResumeSessionID`, so the verify-fix (`fixInv := baseInv`) and base-rebase (`reinvokeInv := baseInv`) re-invokes stay fresh. If the CLI refuses the resume (`agent.ErrSessionResumeFailed`), the runner traces fallback `resume_failed` (with the dead id and the error detail) and re-invokes the ORIGINAL `inv` fresh. The merged `Result` carries both attempts' events and summed token buckets, but only the fresh attempt's `SessionID`, `Model` and `StructuredOutput`. A resumed spawn that fails for any other reason is not re-spawned.
+
+**Events.**
+
+| Event | Where | Payload |
+|---|---|---|
+| `fixup_session_resume` | bundle + log | `outcome` (`resumed` / `fallback`), `reason` (table above, plus `resume_failed`, `self_retry`), `session_id` when one was resumed or refused, `detail` on `resume_failed` |
+| `agent_session_recorded` | bundle + log | `session_id` (log adds `path`) |
+| `agent_session_ledger_degraded` | log only | `path`, `detail` |
+
+**Cost caveat.** The runner's `TokensUsed` is fresh input + output and excludes the prompt-cache buckets. A resumed session re-sends the prior transcript to the API, and once the prompt cache has expired the first resumed turn pays a cache WRITE of that transcript. A resumed fix-up can therefore be ≥3x cheaper in `TokensUsed` and not in dollars. The bundle manifest prices cache read and write (ADR-044), and the harness asserts `cache_read_input_tokens` is recorded on the resumed arm so the carried context stays visible. The USD comparison is the live operator walk. Whether `--resume` in stream-json print mode replays prior events is also unproven offline; that walk inspects the fix-up trace for implement-era events.
+
+**Channel scope.** The `github_actions` channel always falls back (`no_session_recorded`): each dispatch is a fresh VM with no ledger and no session store.
+
+**Tests (`fixupresume_test.go`).** `TestDecideFixupResume` has one row per reason, each differing from the `resumed` baseline in exactly one input. `TestAgentSessionLedger_RoundTripAndAtomicWrite` and `TestRecordAgentSession_SkipsFailedOrSessionless` read state back from disk. `TestInvokePrimaryAgent_*` cover the resume-failed fallback and the other branches. The run()-level tests (`TestRun_FixupResume_*`) cover ledger → spawn, no ledger, self-retry and verify-fix re-invoke. `TestSweepTerminalWorktrees_RemovesAgentSessionLedger` covers both sweep sites. `TestFixupResume_TokenCostHarness_ThreeXCheaper` drives the REAL claudecode adapter against a fake `claude` sh script through `run()` twice. Arm R resumes, arm F runs with the kill switch off, and arm X expires the stored session between passes. Its 3x is a property of the fake's named token model (fresh input = ⌈turn/4⌉ + 40000 re-orientation; resumed input = ⌈turn/4⌉ with cache reads of ⌈transcript/4⌉). It proves the mechanism and the bookkeeping, not real-world dollars.
+
 ## Acceptance executor (E31.7 / #1535, ADR-049 #3/#5)
 
 `acceptance.go` — verdict capture/validation/redaction + evidence event for the `stageType=="acceptance"` branch in `main.go::run`.

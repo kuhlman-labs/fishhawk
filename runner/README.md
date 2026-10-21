@@ -118,6 +118,14 @@ The value may be an absolute path or a name resolvable on `PATH`. A whitespace-o
 
 > **Recommended: disable agent-CLI auto-update on runner hosts.** A CLI that silently auto-updates can introduce a breaking change mid-flight — exactly the #1741 incident, where Claude CLI `2.1.205` tightened `--json-schema` validation and took every plan stage down. Pin a vetted version (uninstall/reinstall a specific version, or point `FISHHAWK_AGENT_BIN` / `FISHHAWK_CODEX_BIN` at a pinned build) and turn off the CLI's self-update on operator hosts so upgrades are deliberate and reviewable. The `agent_version` on `runner_started` lets you confirm which build actually ran.
 
+### Fix-up session resume (`FISHHAWK_FIXUP_RESUME`, [E83.56 / #4089](https://github.com/kuhlman-labs/fishhawk/issues/4089))
+
+On the local channel, a fix-up pass with the `claude-code` agent resumes the implement agent's Claude Code session (`claude --resume <id>`) and sends only the fetched fix-up prompt as the next turn. The runner records each successful implement session in `<git-common-dir>/fishhawk-worktrees/run-<root>.agent-sessions.json`, beside the lineage worktree, and the worktree sweep removes it. Every case that cannot resume falls back to a full fresh fix-up and logs a `fixup_session_resume` line naming the reason. Examples: a changed `FISHHAWK_AGENT_BIN` or model, a moved checkout, or a session the CLI no longer has. The `github_actions` channel always falls back.
+
+**Kill switch.** Set `FISHHAWK_FIXUP_RESUME=off` in the environment that spawns the runner (for the local loop, the fishhawk MCP server env) to restore the fresh fix-up on the next dispatch, with no revert. Any other value leaves resume on.
+
+The cost caveat is that `tokens_used` excludes prompt-cache reads and writes, which a resumed transcript incurs. The decision table, the event names and that caveat are in `cmd/fishhawk-runner/README.md` § "Fix-up session resume".
+
 ### Local verification with a fake Codex binary
 
 You can exercise the codex dispatch path without the real OpenAI CLI or an API key by putting an executable named `codex` early on `PATH` that emits a canned `codex exec --json` event stream. The codex adapter parses newline-delimited JSON events; a minimal happy-path transcript (mirroring the helper in `internal/agent/codex/codex_test.go`) is:
