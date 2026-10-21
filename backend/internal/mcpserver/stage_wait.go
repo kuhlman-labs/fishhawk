@@ -117,9 +117,30 @@ type StageWaitStatus struct {
 	// case, clamped up from a negative) is distinguishable from "unknown" (nil,
 	// when the budget was unresolved). ElapsedSeconds/AgentTimeoutSeconds are
 	// omitempty scalars — absent when the budget is unknown or the stage terminal.
+	//
+	// Since #4023 DeadlineSecondsRemaining is the CURRENT PHASE's remaining
+	// budget: the runner bounds each agent invocation by agent_timeout_seconds
+	// and the verify gate by its own gate budget, so a stage whose current
+	// attempt reported a phase derives the deadline from that phase's clock (see
+	// phaseDeadline). With no current phase report it keeps the legacy
+	// attempt-clock derivation byte-identically.
 	ElapsedSeconds           int  `json:"elapsed_seconds,omitempty" jsonschema:"seconds the stage has been running (from its server-recorded started_at); present only while non-terminal and when the agent wall clock is known"`
-	AgentTimeoutSeconds      int  `json:"agent_timeout_seconds,omitempty" jsonschema:"the spec-resolved agent wall clock (seconds) the runner enforces for this stage; present only while non-terminal and when resolved"`
-	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of agent budget left before the runner kills the stage, derived from the PER-ATTEMPT dispatch clock (agent_timeout_seconds - attempt_elapsed_seconds, clamped at 0); present only while non-terminal and when the budget is known. Because it is per-attempt, a re-dispatched (fix-up or retried) stage reports its fresh remaining budget rather than a cumulative clock that would read 0 (#3335). A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`
+	AgentTimeoutSeconds      int  `json:"agent_timeout_seconds,omitempty" jsonschema:"the spec-resolved agent wall clock (seconds) the runner enforces for EACH agent invocation of this stage (it does not cover verify-gate time, which has its own gate budget); present only while non-terminal and when resolved"`
+	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of the CURRENT phase's remaining budget. When the current attempt reported a phase (#4023): in the agent phase it equals agent_seconds_remaining (agent_timeout_seconds - phase_elapsed_seconds, clamped at 0); in the gate phase it equals gate_seconds_remaining (the verify gate's own budget, independent of the agent budget), and is absent when the runner reported no gate remaining. With no phase report for the current attempt it is the legacy derivation from the PER-ATTEMPT dispatch clock (agent_timeout_seconds - attempt_elapsed_seconds, clamped at 0), so a re-dispatched (fix-up or retried) stage reports its fresh remaining budget rather than a cumulative clock that would read 0 (#3335). Present only while non-terminal and when the budget is known. A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`
+	// Phase / PhaseElapsedSeconds / AgentSecondsRemaining / GateBudgetSeconds /
+	// GateSecondsRemaining are the #4023 two-budget observability: which budget
+	// the stage is currently spending (the runner's agent|gate phase report),
+	// how long it has been in that phase, and what is left of each budget.
+	// Populated ONLY from a progress report that belongs to the CURRENT attempt
+	// (reported_at not before the attempt clock — see currentPhaseReport); a
+	// stale report from a previous attempt, a report with no or an unknown
+	// phase, or no report at all leaves all five absent. The pointers keep a
+	// genuine 0 (budget spent) distinguishable from unknown (nil).
+	Phase                 string `json:"phase,omitempty" jsonschema:"the runner's current stage phase from the CURRENT attempt's progress report: 'agent' (an agent invocation is running, bounded by agent_timeout_seconds) or 'gate' (the agent exited and the verify gate is running, bounded by the separate gate budget). Absent when the current attempt has reported no phase; deadline_seconds_remaining then uses the legacy attempt clock"`
+	PhaseElapsedSeconds   *int   `json:"phase_elapsed_seconds,omitempty" jsonschema:"seconds spent in the current phase: the runner-measured phase_elapsed_seconds at its last report plus the time since that report. Present only when phase is present and the runner reported it"`
+	AgentSecondsRemaining *int   `json:"agent_seconds_remaining,omitempty" jsonschema:"agent phase only: agent_timeout_seconds - phase_elapsed_seconds, clamped at 0 — the budget left for the RUNNING agent invocation (each invocation gets a fresh agent_timeout_seconds); when the runner reported no phase_elapsed_seconds it falls back to the attempt clock (an upper bound on agent time, so it errs low). Absent in the gate phase, when no phase is reported, or when the agent budget is unresolved"`
+	GateBudgetSeconds     int    `json:"gate_budget_seconds,omitempty" jsonschema:"gate phase only: the gate phase's total verify-execution budget as the runner reported it (a multiple of executor.verify.timeout). Absent outside the gate phase or when unreported"`
+	GateSecondsRemaining  *int   `json:"gate_seconds_remaining,omitempty" jsonschema:"gate phase only: the verify budget left. The runner's reported gate_remaining_seconds, minus the time since that report ONLY while a verify was running at report time (only verify execution is charged to the gate budget), clamped at 0. Absent outside the gate phase or when the runner reported no remaining"`
 	// AttemptElapsedSeconds is how long the CURRENT attempt has run, from the
 	// per-attempt dispatch clock (dispatched_at, or started_at when the stage
 	// never re-dispatched) — the clock deadline_seconds_remaining is derived
@@ -329,6 +350,100 @@ func stageDeadlineRemaining(agentTimeoutSeconds int, elapsed time.Duration) *int
 	return &remaining
 }
 
+// stagePhaseAgent / stagePhaseGate are the two phase values the runner's
+// progress report carries (#4023). Any other value — including the empty phase
+// of a pre-#4023 report — is "no phase report" to the derivation below.
+const (
+	stagePhaseAgent = "agent"
+	stagePhaseGate  = "gate"
+)
+
+// currentPhaseReport returns p when it is a phase report that belongs to the
+// CURRENT attempt, else nil (#4023). Two conditions, both required:
+//
+//   - the phase is one the derivation understands (agent | gate). An empty
+//     phase (a pre-#4023 runner) or an unknown one (a newer runner) falls back
+//     to the legacy attempt-clock derivation rather than being guessed at.
+//   - reported_at is NOT BEFORE the attempt clock (stageAttemptStart). The
+//     progress row is last-writer-wins and survives a re-dispatch, so the
+//     PREVIOUS attempt's last report — say a gate phase with 0 remaining — is
+//     still on the row when a fix-up or retry starts a fresh attempt. Reading it
+//     would report the old attempt's spent budget as the new attempt's. Both
+//     reported_at and dispatched_at are stamped by the database's now(), so the
+//     comparison is single-clock-domain (the #3084 rule
+//     ListDispatchedStageLiveness also follows).
+//
+// A nil attempt clock cannot decide the second condition, so it also yields nil
+// (legacy derivation). Pure and table-testable.
+func currentPhaseReport(p *StageProgress, attemptStart *time.Time) *StageProgress {
+	if p == nil || attemptStart == nil {
+		return nil
+	}
+	if p.Phase != stagePhaseAgent && p.Phase != stagePhaseGate {
+		return nil
+	}
+	if p.ReportedAt.Before(*attemptStart) {
+		return nil
+	}
+	return p
+}
+
+// applyPhaseDeadline folds a CURRENT phase report (see currentPhaseReport) onto
+// st: the phase, its elapsed time, the remaining budget of that phase, and
+// deadline_seconds_remaining as the current phase's remaining (#4023).
+//
+// since is the time between the runner's report and now, clamped at 0 so a
+// reported_at ahead of this process's clock (cross-process skew) never adds
+// negative time. The runner measured phase_elapsed and gate_remaining at
+// reported_at; since extrapolates them to now:
+//
+//   - agent phase — phase_elapsed = reported + since, and the agent budget left
+//     is agent_timeout_seconds - phase_elapsed (each agent invocation gets a
+//     fresh agent_timeout_seconds, so the attempt clock — which also counts
+//     earlier gate time — would over-charge it). With no reported
+//     phase_elapsed the attempt clock is the only clock left; it is an UPPER
+//     bound on the agent's elapsed time, so it errs toward less remaining.
+//   - gate phase — only verify execution is charged to the gate budget, so the
+//     reported remaining is reduced by since ONLY when a verify was running at
+//     report time; between verifies it is frozen. No reported remaining leaves
+//     the gate deadline unknown (nil), never 0.
+func applyPhaseDeadline(st *StageWaitStatus, p *StageProgress, agentTimeoutSeconds int, attemptElapsed time.Duration, now time.Time) {
+	since := 0
+	if now.After(p.ReportedAt) {
+		since = int(now.Sub(p.ReportedAt).Seconds())
+	}
+	st.Phase = p.Phase
+	if p.PhaseElapsedSeconds != nil {
+		pe := *p.PhaseElapsedSeconds + since
+		st.PhaseElapsedSeconds = &pe
+	}
+	switch p.Phase {
+	case stagePhaseAgent:
+		agentElapsed := attemptElapsed
+		if st.PhaseElapsedSeconds != nil {
+			agentElapsed = time.Duration(*st.PhaseElapsedSeconds) * time.Second
+		}
+		st.AgentSecondsRemaining = stageDeadlineRemaining(agentTimeoutSeconds, agentElapsed)
+		st.DeadlineSecondsRemaining = stageDeadlineRemaining(agentTimeoutSeconds, agentElapsed)
+	case stagePhaseGate:
+		if p.GateBudgetSeconds != nil {
+			st.GateBudgetSeconds = *p.GateBudgetSeconds
+		}
+		if p.GateRemainingSeconds != nil {
+			rem := *p.GateRemainingSeconds
+			if p.GateVerifying {
+				rem -= since
+			}
+			if rem < 0 {
+				rem = 0
+			}
+			deadline := rem
+			st.GateSecondsRemaining = &rem
+			st.DeadlineSecondsRemaining = &deadline
+		}
+	}
+}
+
 // stageStateIsTerminal reports whether a backend stage state is one past which
 // the stage can no longer make progress. The terminal set —
 // succeeded / failed / cancelled / superseded — is compared INLINE here against
@@ -427,9 +542,17 @@ func stageWaitStatusFor(stages []Stage, stageType, runState string, predictedMin
 				// re-dispatched stage reports its fresh remaining budget rather
 				// than a cumulative clock reading 0. ElapsedSeconds below keeps its
 				// documented cumulative-from-started_at meaning.
-				attemptElapsed := stageElapsed(stageAttemptStart(s.DispatchedAt, s.StartedAt), now)
+				attemptStart := stageAttemptStart(s.DispatchedAt, s.StartedAt)
+				attemptElapsed := stageElapsed(attemptStart, now)
 				st.AgentTimeoutSeconds = s.AgentTimeoutSeconds
-				st.DeadlineSecondsRemaining = stageDeadlineRemaining(s.AgentTimeoutSeconds, attemptElapsed)
+				// Two-budget deadline (#4023): a phase report from THIS attempt
+				// derives the deadline from the current phase's own clock; with
+				// none the legacy attempt-clock derivation is unchanged.
+				if pr := currentPhaseReport(s.Progress, attemptStart); pr != nil {
+					applyPhaseDeadline(st, pr, s.AgentTimeoutSeconds, attemptElapsed, now)
+				} else {
+					st.DeadlineSecondsRemaining = stageDeadlineRemaining(s.AgentTimeoutSeconds, attemptElapsed)
+				}
 				// Mid-execution progress heartbeat (#2541): project the per-attempt
 				// counters + last_event onto the wait status. elapsed_seconds is NOT
 				// taken from the heartbeat — it stays the started_at derivation, so it

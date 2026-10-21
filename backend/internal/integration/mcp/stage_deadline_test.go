@@ -1,8 +1,14 @@
 package mcpe2e_test
 
 import (
+	"bytes"
 	"context"
+	"fmt"
+	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"strconv"
 	"testing"
 	"time"
 
@@ -250,8 +256,184 @@ func TestE2E_StageDeadline_RedispatchReportsPerAttemptBudget(t *testing.T) {
 	}
 }
 
+// pkgSrcDir is this package's SOURCE directory, captured once at package init
+// (go test runs the binary from it), so the shared wire golden resolves under
+// -trimpath too — the backend/internal/testanchor rule (#4179).
+var pkgSrcDir = mustGetwd()
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
+
+// fmtIntPtr renders an optional int for a failure message ("<nil>" or the value).
+func fmtIntPtr(p *int) string {
+	if p == nil {
+		return "<nil>"
+	}
+	return strconv.Itoa(*p)
+}
+
+// TestE2E_StageDeadline_GatePhaseReportsGateBudget is the #4023 cross-boundary
+// done-means test. A stage dispatched 79 minutes ago under a 60-minute agent
+// budget is, by the legacy attempt clock, past its deadline (0 remaining) —
+// the false stage_deadline_exceeded the issue observed while the verify gate
+// was still running. With the runner reporting its GATE phase, the deadline
+// must come from the gate budget instead. The whole seam is real:
+//
+//	runner-shaped wire body (the SHARED golden testdata/wire/stage_progress_phase.json)
+//	→ the real ingest route POST /v0/runs/{id}/stages/{id}/progress
+//	→ stages.progress JSONB → GET /v0/runs/{id}/stages
+//	→ the fishhawk-mcp binary's client decode → stageWaitStatusFor
+//	→ implement_stage_wait_status on fishhawk_get_run_status
+//
+// It then reports the AGENT phase and asserts the agent budget is charged by
+// the runner's phase clock (3600 - phase_elapsed), not the 79-minute attempt.
+func TestE2E_StageDeadline_GatePhaseReportsGateBudget(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    audit.NewPostgresRepository(fx.pool),
+		SigningRepo:  signing.NewPostgresRepository(fx.pool),
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+
+	r, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+		TriggerSource: runpkg.TriggerCLI, WorkflowSpec: stageDeadlineWorkflowSpec,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if _, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 1, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1", RequiresApproval: true,
+	}); err != nil {
+		t.Fatalf("CreateStage(plan): %v", err)
+	}
+	implStage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r.ID, Sequence: 2, Type: runpkg.StageTypeImplement,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage(implement): %v", err)
+	}
+	for _, to := range []runpkg.StageState{runpkg.StageStateDispatched, runpkg.StageStateRunning} {
+		if _, err := fx.runRepo.TransitionStage(ctx, implStage.ID, to, nil); err != nil {
+			t.Fatalf("TransitionStage(implement → %s): %v", to, err)
+		}
+	}
+	// 79 minutes into a 60-minute agent budget by the attempt clock. Backdated
+	// with the DATABASE clock so the later DB-stamped reported_at is after it
+	// (the current-attempt guard compares the two in one clock domain).
+	if _, err := fx.pool.Exec(ctx,
+		`UPDATE stages SET started_at = now() - interval '79 minutes', dispatched_at = now() - interval '79 minutes' WHERE id = $1`,
+		implStage.ID); err != nil {
+		t.Fatalf("backdate implement started_at/dispatched_at: %v", err)
+	}
+	const wantBudget = 3600
+
+	golden, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "..", "testdata", "wire", "stage_progress_phase.json"))
+	if err != nil {
+		t.Fatalf("read shared golden: %v", err)
+	}
+	postStageProgress(t, ctx, httpSrv.URL, fx.operatorTok, r.ID, implStage.ID, golden)
+
+	gate := implementDeadlineStatus(t, ctx, session, r.ID)
+	if gate == nil {
+		t.Fatal("implement_stage_wait_status is nil")
+	}
+	if gate.AttemptElapsedSeconds == nil || *gate.AttemptElapsedSeconds < 79*60 {
+		t.Fatalf("attempt_elapsed_seconds = %v, want >= %d (the fixture must put the attempt clock past the agent budget)",
+			fmtIntPtr(gate.AttemptElapsedSeconds), 79*60)
+	}
+	if gate.AgentTimeoutSeconds != wantBudget {
+		t.Errorf("agent_timeout_seconds = %d, want %d", gate.AgentTimeoutSeconds, wantBudget)
+	}
+	if gate.Phase != "gate" {
+		t.Errorf("phase = %q, want gate", gate.Phase)
+	}
+	if gate.GateBudgetSeconds != 5400 {
+		t.Errorf("gate_budget_seconds = %d, want 5400 (the golden's)", gate.GateBudgetSeconds)
+	}
+	if gate.GateSecondsRemaining == nil || gate.DeadlineSecondsRemaining == nil {
+		t.Fatalf("gate_seconds_remaining/deadline_seconds_remaining = %v/%v, want both present",
+			fmtIntPtr(gate.GateSecondsRemaining), fmtIntPtr(gate.DeadlineSecondsRemaining))
+	}
+	if *gate.DeadlineSecondsRemaining != *gate.GateSecondsRemaining || *gate.DeadlineSecondsRemaining <= 0 {
+		t.Errorf("deadline_seconds_remaining = %d, gate_seconds_remaining = %d, want equal and > 0 (the attempt clock would say 0)",
+			*gate.DeadlineSecondsRemaining, *gate.GateSecondsRemaining)
+	}
+	if gate.AgentSecondsRemaining != nil {
+		t.Errorf("agent_seconds_remaining = %d in the gate phase, want absent", *gate.AgentSecondsRemaining)
+	}
+
+	// Agent phase: a fix re-invoke 600s in has 3600 - phase_elapsed left.
+	postStageProgress(t, ctx, httpSrv.URL, fx.operatorTok, r.ID, implStage.ID,
+		[]byte(`{"last_event":"agent_start","turns_this_attempt":0,"tokens_this_attempt":0,"phase":"agent","phase_elapsed_seconds":600}`))
+	agent := implementDeadlineStatus(t, ctx, session, r.ID)
+	if agent == nil {
+		t.Fatal("implement_stage_wait_status is nil after the agent report")
+	}
+	if agent.Phase != "agent" {
+		t.Errorf("phase = %q, want agent", agent.Phase)
+	}
+	if agent.PhaseElapsedSeconds == nil || agent.AgentSecondsRemaining == nil || agent.DeadlineSecondsRemaining == nil {
+		t.Fatalf("phase_elapsed/agent_remaining/deadline = %v/%v/%v, want all present",
+			fmtIntPtr(agent.PhaseElapsedSeconds), fmtIntPtr(agent.AgentSecondsRemaining), fmtIntPtr(agent.DeadlineSecondsRemaining))
+	}
+	// phase_elapsed is 600 plus the poll slack; the identity is exact because
+	// both sides derive from the same since.
+	if *agent.PhaseElapsedSeconds < 600 || *agent.PhaseElapsedSeconds > 600+60 {
+		t.Errorf("phase_elapsed_seconds = %d, want ~600", *agent.PhaseElapsedSeconds)
+	}
+	if *agent.AgentSecondsRemaining != wantBudget-*agent.PhaseElapsedSeconds {
+		t.Errorf("agent_seconds_remaining = %d, want %d - %d", *agent.AgentSecondsRemaining, wantBudget, *agent.PhaseElapsedSeconds)
+	}
+	if *agent.DeadlineSecondsRemaining != *agent.AgentSecondsRemaining {
+		t.Errorf("deadline_seconds_remaining = %d, want agent_seconds_remaining %d", *agent.DeadlineSecondsRemaining, *agent.AgentSecondsRemaining)
+	}
+	if agent.GateBudgetSeconds != 0 || agent.GateSecondsRemaining != nil {
+		t.Errorf("gate fields in the agent phase: budget=%d remaining=%v, want absent", agent.GateBudgetSeconds, fmtIntPtr(agent.GateSecondsRemaining))
+	}
+}
+
+// postStageProgress POSTs body verbatim to the real progress ingest route and
+// requires 204.
+func postStageProgress(t *testing.T, ctx context.Context, baseURL, token string, runID, stageID uuid.UUID, body []byte) {
+	t.Helper()
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost,
+		baseURL+"/v0/runs/"+runID.String()+"/stages/"+stageID.String()+"/progress", bytes.NewReader(body))
+	if err != nil {
+		t.Fatalf("build progress request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Authorization", "Bearer "+token)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("POST progress: %v", err)
+	}
+	_ = resp.Body.Close()
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("POST progress status = %d, want 204", resp.StatusCode)
+	}
+}
+
 // implementDeadlineWaitStatus is the decoded implement_stage_wait_status,
-// projecting the #2540 deadline fields alongside status.
+// projecting the #2540 deadline fields and the #4023 phase fields alongside
+// status.
 type implementDeadlineWaitStatus struct {
 	Stage                    string `json:"stage"`
 	Status                   string `json:"status"`
@@ -259,6 +441,11 @@ type implementDeadlineWaitStatus struct {
 	AttemptElapsedSeconds    *int   `json:"attempt_elapsed_seconds"`
 	AgentTimeoutSeconds      int    `json:"agent_timeout_seconds"`
 	DeadlineSecondsRemaining *int   `json:"deadline_seconds_remaining"`
+	Phase                    string `json:"phase"`
+	PhaseElapsedSeconds      *int   `json:"phase_elapsed_seconds"`
+	AgentSecondsRemaining    *int   `json:"agent_seconds_remaining"`
+	GateBudgetSeconds        int    `json:"gate_budget_seconds"`
+	GateSecondsRemaining     *int   `json:"gate_seconds_remaining"`
 }
 
 // implementDeadlineStatus calls fishhawk_get_run_status through the MCP session
