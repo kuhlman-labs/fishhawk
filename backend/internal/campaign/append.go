@@ -230,9 +230,13 @@ func ValidateAppendClosure(existing []*Item, newItems []CreateCampaignItemParams
 // duplicate a member (ErrDuplicateItem), every addition must target a member
 // (ErrCampaignItemNotFound), a NEW item may not depend on a non-member unless
 // p.AllowExternal (ErrExternalDependency), and no cycle may pass through a new
-// node (ErrCycle). It is exported so a test fake enforces exactly the
-// production rules.
+// node (ErrCycle). An expedited append (p.Expedite non-nil) is first checked by
+// ValidateExpedite (ErrExpediteInvalid). It is exported so a test fake enforces
+// exactly the production rules.
 func ValidateAppend(existing []*Item, p AppendCampaignItemsParams) error {
+	if err := ValidateExpedite(p); err != nil {
+		return err
+	}
 	var bad []string
 	newRefs := make([]string, 0, len(p.NewItems))
 	for _, ni := range p.NewItems {

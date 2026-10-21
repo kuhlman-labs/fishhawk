@@ -157,7 +157,9 @@ type AppendCampaignItemsParams struct {
 	CampaignID uuid.UUID
 	// NewItems are the items to insert. CampaignID and Position are assigned
 	// by the adapter: Position is max(existing queue_position)+1+i, so appended
-	// items queue after every existing item in request order.
+	// items queue after every existing item in request order — except an
+	// EXPEDITED item (Expedite non-nil), which takes ExpeditedHeadPosition
+	// (min(existing)-1, possibly negative) and heads the queue.
 	NewItems []CreateCampaignItemParams
 	// AddDependencies maps an EXISTING item id to depends_on refs to ADD. The
 	// write is the monotone MergeDependsOn union: no persisted edge is ever
@@ -167,6 +169,13 @@ type AppendCampaignItemsParams struct {
 	// AllowExternal admits a NEW item's depends_on edge onto a non-member
 	// issue (held until released). False refuses it ErrExternalDependency.
 	AllowExternal bool
+	// Expedite, when non-nil, makes this an EXPEDITED (hotfix) append (#4234):
+	// exactly one new item, no additions (ValidateExpedite, ErrExpediteInvalid),
+	// placed at the head of the queue with its campaign_item_expedites row, and
+	// — when Expedite.Hold is set — a dispatch hold, refused with
+	// ErrDispatchHoldActive when the campaign already holds one. All of it is
+	// written inside the same transaction, before Record.
+	Expedite *ExpediteParams
 	// Record, when non-nil, is called INSIDE the transaction after every write
 	// and before commit. A non-nil error rolls the whole transaction back and
 	// AppendCampaignItems returns it wrapped in ErrAppendUnrecorded, so an
@@ -193,6 +202,8 @@ type AppendOutcome struct {
 	// SkippedStarted are the refs of items an addition targeted that had
 	// already started (not pending/blocked, or carrying a run): never touched.
 	SkippedStarted []string
+	// Hold is the dispatch hold an expedited append placed; nil otherwise.
+	Hold *DispatchHold
 }
 
 // ListCampaignsFilter scopes a ListCampaigns query. Empty strings mean "no
@@ -433,7 +444,33 @@ type Repository interface {
 	// RECORD-BEFORE-COMMIT: p.Record runs inside the transaction after every
 	// write; its error rolls everything back (ErrAppendUnrecorded), so no
 	// member or edge exists that its audit row does not describe.
+	//
+	// EXPEDITE (#4234): a non-nil p.Expedite is validated under the lock by
+	// ValidateExpedite (ErrExpediteInvalid). The item takes
+	// ExpeditedHeadPosition, its campaign_item_expedites row is inserted, and
+	// when p.Expedite.Hold is set the campaign's hold row is read FOR UPDATE —
+	// an existing hold refuses ErrDispatchHoldActive with nothing written —
+	// and the hold is inserted. All of it precedes p.Record, so an
+	// unrecordable expedite leaves no item, expedite row or hold.
 	AppendCampaignItems(ctx context.Context, p AppendCampaignItemsParams) (*AppendOutcome, error)
+
+	// GetDispatchHold returns the campaign's active dispatch hold, or (nil,
+	// nil) when it holds none (#4234). It is a plain read: a hold past its
+	// expires_at is still returned until ReleaseDispatchHold deletes it, so the
+	// caller decides due-ness with HoldReleaseReason against its own clock.
+	GetDispatchHold(ctx context.Context, campaignID uuid.UUID) (*DispatchHold, error)
+
+	// ReleaseDispatchHold deletes the campaign's dispatch hold, RECORDED
+	// BEFORE COMMIT (#4234). Lock order is the package-wide one: the campaign
+	// row, then the hold row (FOR UPDATE). No hold, or a hold naming a
+	// different HotfixItemID, is an idempotent no-op returning (nil, nil) — a
+	// concurrent release that won the race leaves the loser nothing to do.
+	// Otherwise it deletes the row and calls p.Record before commit; a Record
+	// error rolls the delete back and wraps ErrHoldReleaseUnrecorded, so the
+	// hold is still active. An unknown reason (ErrExpediteInvalid) or a nil
+	// Record (ErrHoldReleaseUnrecorded) is refused before any read. On success
+	// it returns the released hold.
+	ReleaseDispatchHold(ctx context.Context, p ReleaseDispatchHoldParams) (*DispatchHold, error)
 }
 
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / #1830) that
