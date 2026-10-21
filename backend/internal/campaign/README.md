@@ -6,7 +6,7 @@ Campaign domain model: object model + persistence (E25.2) and the pure assembly 
 
 The package mirrors `backend/internal/run/`:
 
-- Domain types in `campaign.go`: `Campaign` (id, repo, epic_ref, state) + `CampaignItem` (id, campaign_id, issue_ref, `depends_on []string`, `run_id *uuid.UUID`, state).
+- Domain types in `campaign.go`: `Campaign` (id, repo, epic_ref, state) + `CampaignItem` (id, campaign_id, issue_ref, `depends_on []string`, `run_id *uuid.UUID`, state, and `Expedite` for a hotfix-added item — see "Expedited items and the dispatch hold") + `DispatchHold`.
 - Two state machines in `transition.go`, governed by transition tables:
   - campaign: `pending → running → {succeeded,failed,cancelled}`
   - item: `pending → blocked → running → {succeeded,failed,cancelled}` (`blocked` = depends_on edges unsatisfied)
@@ -168,6 +168,39 @@ UPDATE campaign_items SET depends_on = '["issue:11"]'::jsonb
 WHERE campaign_id = '<campaign uuid>' AND issue_ref = 'issue:10' AND state IN ('pending','blocked') AND run_id IS NULL;
 ```
 
+## Expedited items and the dispatch hold (E83.100 / #4234)
+
+The persistence half of the campaign hotfix verb (`POST /v0/campaigns/{campaign_id}/hotfix`, `backend/internal/server/campaign_hotfix.go`). Pure core in `expedite.go`, hand-written pgx in `expedite_postgres.go`, schema in migration `0106`.
+
+**Tables.** Two child tables, hand-written pgx rather than new `campaign_items` columns, so the sqlc `SELECT *` / `RETURNING *` scans of `campaign_items` stay untouched. Like `campaign_items` they carry no `account_id` and no RLS; tenancy is the parent campaign's, enforced by the caller. Both cascade with their campaign and item.
+
+| Table | Key | Columns | Meaning |
+|---|---|---|---|
+| `campaign_item_expedites` | `item_id` | `campaign_id`, `kind` (CHECK `hotfix`), `workflow` (CHECK non-empty), `reason`, `created_at` | the item is EXPEDITED; a normal item has no row |
+| `campaign_dispatch_holds` | `campaign_id` | `hotfix_item_id`, `held_at`, `expires_at` (CHECK `expires_at > held_at`) | the campaign's ONE active dispatch hold |
+
+**Expedited append.** `AppendCampaignItemsParams.Expedite` (`ExpediteParams{Kind, Workflow, Reason, Hold}`) makes an append expedited. Inside the existing transaction, under the campaign row lock and before `Record`:
+
+1. `ValidateExpedite` (called by `ValidateAppend`, so every fake enforces it too) refuses `ErrExpediteInvalid` unless the append carries exactly ONE new item, NO `depends_on` additions (an expedited item declares no reverse dependencies), kind `hotfix`, a non-blank workflow, and, when a hold is set, a non-zero `held_at < expires_at <= held_at + MaxDispatchHold` (2 h).
+2. When a hold is asked, the campaign's hold row is read `FOR UPDATE`; an existing one refuses `ErrDispatchHoldActive` before the first write. A second expedite WITHOUT a hold is admitted during an active hold.
+3. The item takes `ExpeditedHeadPosition` = `min(existing queue_position) - 1` (0 on an empty roster), so `ListCampaignItemsForCampaign` lists it first and `NextEligible` offers it first with no engine change.
+4. Its `campaign_item_expedites` row is inserted, and the hold, naming it, with the CALLER's `held_at` / `expires_at`.
+5. `Record` sees the created item with `Expedite` attached and `AppendOutcome.Hold`; its error rolls back the item, the expedite row and the hold together (`ErrAppendUnrecorded`).
+
+**`queue_position` is no longer dense or non-negative.** An expedited head position is `-1` or lower on any campaign whose items start at 0, and a second expedite goes lower still. Migration `0074` put no CHECK on the column, so this is legal; readers must order by the value, never index by it. The dense 0-based invariant holds only for a campaign that has never had an expedited item.
+
+**Reads.** `GetCampaignItem`, `ListCampaignItemsForCampaign` and `ListCampaignItemsForRun` attach `Item.Expedite` through one `item_id = ANY($1)` query; an expedite read error fails the whole item read, so a caller deciding the hold exemption never mistakes an unreadable expedite for a normal item. The single-row write returns (transitions, run link, restart, settle) do not attach it. `Expedite.Reason` is the operator's free text: untrusted-origin, rendered only as data, never copied into an agent prompt or a promote reason.
+
+**Hold lifecycle.** `GetDispatchHold` is a plain read and returns a hold past its `expires_at` until something releases it (so is `ListDispatchHolds`, every campaign's hold oldest `held_at` first, which the host-dispatch guard reads only for a stage whose campaign ancestry is unresolvable, to hold it while ANY campaign still holds dispatches); the caller decides due-ness with `HoldReleaseReason(hold, hotfixTerminal, now)` against ITS OWN clock: a terminal hotfix wins (`hotfix_terminal`), else `now >= expires_at` is `timeout`. Every stamp is fishhawkd-clock, never Postgres `now()`, so the comparison stays in one clock domain (AGENTS.md trap #3048). `ReleaseDispatchHold` locks the campaign row, then the hold row (the package lock order), deletes the row and calls `Record` before commit:
+
+- no campaign, no hold, or a hold naming a different `HotfixItemID` is an idempotent `(nil, nil)` no-op, so the loser of a concurrent release does nothing;
+- a `Record` error rolls the delete back (`ErrHoldReleaseUnrecorded`) and the hold stays active, even past the 2 h cap;
+- a nil `Record` (`ErrHoldReleaseUnrecorded`) or an unknown reason (`ErrExpediteInvalid`) is refused before any read.
+
+**Unblocking during an audit outage.** A release that cannot be recorded keeps the hold, so while the audit chain is down the campaign's other implements stay refused, even past `expires_at`. The unblock path is to cancel the hotfix run. That makes the hotfix terminal, and the hold releases at the first evaluation after the audit chain recovers. Do not delete the hold row by hand, because that release would carry no audit row.
+
+**Rollback.** `0106` is additive. Revert the binary first, then migrate down. The down migration drops both tables, an expedited item survives as an ordinary item at its (possibly negative) position, and a held campaign is simply un-held.
+
 ## The third campaign source: an approved grooming order (E54.6 / #2238)
 
 `POST /v0/campaigns` accepts three mutually-exclusive sources: an `epic_ref` to
@@ -224,6 +257,8 @@ a `created_at` and the order is then decided by a RANDOM UUID. A queue meant to
 carry a ratified priority order cannot rest on that, so the order is written down.
 The column is not unique and the `(created_at, id)` tiebreak is retained, so every
 pre-`0074` row (which carries the `DEFAULT 0`) lists in exactly its prior order.
+An expedited item (`0106` / #4234) is the one exception to the assembled order: it
+takes `min - 1`, possibly negative, and heads the queue above the ratified ranks.
 `campaign/postgres_test.go` proves this against REAL Postgres — including a case
 whose queue positions CONTRADICT insertion order, so it cannot pass by timing luck.
 

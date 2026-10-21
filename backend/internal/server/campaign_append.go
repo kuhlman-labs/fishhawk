@@ -45,7 +45,16 @@ type appendCampaignItemsRequest struct {
 	// requestStart anchors the issue-set resolution deadline (#3113) at the
 	// caller's handler entry. Not part of the wire body.
 	requestStart time.Time
+	// expedite, set only by the hotfix verb (#4234), is passed through to
+	// AppendCampaignItemsParams.Expedite. Not part of the wire body.
+	expedite *campaign.ExpediteParams
 }
+
+// appendRecorder is the record-before-commit callback a caller binds onto the
+// append core: it runs inside the repository transaction after every write
+// and before commit, and its error rolls the whole append back. plan is the
+// resolved append plan the outcome was written from.
+type appendRecorder func(ctx context.Context, out campaign.AppendOutcome, plan *campaign.AppendPlan) error
 
 // appendCampaignItemsResult is the core's successful output.
 type appendCampaignItemsResult struct {
@@ -54,6 +63,8 @@ type appendCampaignItemsResult struct {
 	// External maps an appended item's ref to its admitted non-member edges.
 	External  map[string][]string
 	Satisfied []workmgmt.SatisfiedEdge
+	// Hold is the dispatch hold an expedited append placed; nil otherwise.
+	Hold *campaign.DispatchHold
 }
 
 // appendedCampaignItemResponse is one appended item in the 201 body: the
@@ -119,7 +130,7 @@ func (s *Server) handleAppendCampaignItems(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	req.requestStart = requestStart
-	res, refusal := s.appendCampaignItems(r.Context(), c, req, true)
+	res, refusal := s.appendCampaignItems(r.Context(), c, req, nil)
 	if refusal != nil {
 		s.writeCampaignSourceRefusal(w, r, refusal)
 		return
@@ -142,11 +153,11 @@ func (s *Server) handleAppendCampaignItems(w http.ResponseWriter, r *http.Reques
 }
 
 // appendCampaignItems is the handler-independent append core. The caller has
-// already authorized access to c. record=true binds the strict
-// campaign_items_appended audit row as the repository's record-before-commit
-// callback, so an unrecordable append writes nothing; a caller passing false
-// takes on recording the change itself.
-func (s *Server) appendCampaignItems(ctx context.Context, c *campaign.Campaign, req appendCampaignItemsRequest, record bool) (*appendCampaignItemsResult, *campaignSourceRefusal) {
+// already authorized access to c. rec is the repository's record-before-commit
+// callback; a nil rec binds the strict campaign_items_appended recorder, so the
+// core has NO path that commits without an audit row (#4234 removed the old
+// record=false escape hatch). An unrecordable append writes nothing.
+func (s *Server) appendCampaignItems(ctx context.Context, c *campaign.Campaign, req appendCampaignItemsRequest, rec appendRecorder) (*appendCampaignItemsResult, *campaignSourceRefusal) {
 	if req.requestStart.IsZero() {
 		req.requestStart = time.Now()
 	}
@@ -207,39 +218,17 @@ func (s *Server) appendCampaignItems(ctx context.Context, c *campaign.Campaign, 
 		}
 	}
 
+	if rec == nil {
+		rec = s.campaignItemsAppendedRecorder(c, req)
+	}
 	params := campaign.AppendCampaignItemsParams{
 		CampaignID:    c.ID,
 		NewItems:      plan.Items,
 		AllowExternal: req.AllowExternalBlockers,
-	}
-	if record {
-		params.Record = func(rctx context.Context, out campaign.AppendOutcome) error {
-			appended := make([]map[string]any, 0, len(out.Created))
-			for _, it := range out.Created {
-				deps := it.DependsOn
-				if deps == nil {
-					deps = []string{}
-				}
-				ext := plan.External[it.IssueRef]
-				if ext == nil {
-					ext = []string{}
-				}
-				appended = append(appended, map[string]any{
-					"issue_ref":  it.IssueRef,
-					"depends_on": deps,
-					"external":   ext,
-					"autonomy":   it.Autonomy,
-				})
-			}
-			return s.appendCampaignAuditStrict(rctx, categoryCampaignItemsAppended, map[string]any{
-				"campaign_id":             c.ID.String(),
-				"repo":                    c.Repo,
-				"appended":                appended,
-				"allow_external_blockers": req.AllowExternalBlockers,
-				"satisfied_dependencies":  satisfiedDependencyPayloads(plan.Satisfied),
-				"actor":                   IdentityFrom(rctx).Subject,
-			})
-		}
+		Expedite:      req.expedite,
+		Record: func(rctx context.Context, out campaign.AppendOutcome) error {
+			return rec(rctx, out, plan)
+		},
 	}
 	out, err := s.cfg.CampaignRepo.AppendCampaignItems(ctx, params)
 	if err != nil {
@@ -259,7 +248,40 @@ func (s *Server) appendCampaignItems(ctx context.Context, c *campaign.Campaign, 
 		Appended:  out.Created,
 		External:  plan.External,
 		Satisfied: plan.Satisfied,
+		Hold:      out.Hold,
 	}, nil
+}
+
+// campaignItemsAppendedRecorder is the default recorder: one strict
+// campaign_items_appended row describing every created item.
+func (s *Server) campaignItemsAppendedRecorder(c *campaign.Campaign, req appendCampaignItemsRequest) appendRecorder {
+	return func(rctx context.Context, out campaign.AppendOutcome, plan *campaign.AppendPlan) error {
+		appended := make([]map[string]any, 0, len(out.Created))
+		for _, it := range out.Created {
+			deps := it.DependsOn
+			if deps == nil {
+				deps = []string{}
+			}
+			ext := plan.External[it.IssueRef]
+			if ext == nil {
+				ext = []string{}
+			}
+			appended = append(appended, map[string]any{
+				"issue_ref":  it.IssueRef,
+				"depends_on": deps,
+				"external":   ext,
+				"autonomy":   it.Autonomy,
+			})
+		}
+		return s.appendCampaignAuditStrict(rctx, categoryCampaignItemsAppended, map[string]any{
+			"campaign_id":             c.ID.String(),
+			"repo":                    c.Repo,
+			"appended":                appended,
+			"allow_external_blockers": req.AllowExternalBlockers,
+			"satisfied_dependencies":  satisfiedDependencyPayloads(plan.Satisfied),
+			"actor":                   IdentityFrom(rctx).Subject,
+		})
+	}
 }
 
 func appendNotAppendable(c *campaign.Campaign) *campaignSourceRefusal {
@@ -304,6 +326,20 @@ func appendRepositoryRefusal(c *campaign.Campaign, err error) *campaignSourceRef
 		}
 	case errors.Is(err, campaign.ErrDuplicateItem):
 		return appendDuplicateRefusal(err)
+	case errors.Is(err, campaign.ErrDispatchHoldActive):
+		return &campaignSourceRefusal{
+			Status:  http.StatusConflict,
+			Code:    "campaign_hold_active",
+			Message: "the campaign already holds a dispatch hold; add the hotfix without hold_dispatch, or wait for the active hold to release",
+			Details: map[string]any{"campaign_id": c.ID.String()},
+		}
+	case errors.Is(err, campaign.ErrExpediteInvalid):
+		return &campaignSourceRefusal{
+			Status:  http.StatusUnprocessableEntity,
+			Code:    "validation_failed",
+			Message: err.Error(),
+			Details: map[string]any{"campaign_id": c.ID.String()},
+		}
 	case errors.As(err, &ext):
 		return &campaignSourceRefusal{
 			Status:  http.StatusUnprocessableEntity,

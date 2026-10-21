@@ -295,7 +295,17 @@ type Item struct {
 	// therefore the engine's Eligible slice — reproducible. Every pre-0074 row
 	// carries the DEFAULT 0 and so keeps its exact prior order via the retained
 	// (created_at, id) tiebreak.
+	//
+	// It is NOT necessarily dense or non-negative: an EXPEDITED item (the
+	// hotfix verb, #4234) takes min(existing)-1 so it heads the queue, which is
+	// -1 or lower on any campaign whose items start at 0.
 	Position int
+	// Expedite is non-nil for an EXPEDITED item — one added by the campaign
+	// hotfix verb (#4234), persisted as its campaign_item_expedites row — and
+	// nil for every ordinary item. GetCampaignItem, ListCampaignItemsForCampaign,
+	// ListCampaignItemsForRun and the AppendCampaignItems outcome attach it; the
+	// single-row write methods (transitions, run link, restart, settle) do not.
+	Expedite *Expedite
 	// ResolvedBy is the DURABLE provenance of how this item reached its
 	// terminal state (campaign_items.resolved_by, migration 0085 / #3563).
 	// The closed value set is {ResolvedByUnset, ResolvedByIssueClosed}, pinned
@@ -310,4 +320,25 @@ type Item struct {
 	ResolvedBy string
 	CreatedAt  time.Time
 	UpdatedAt  time.Time
+}
+
+// Expedite is an expedited item's record (campaign_item_expedites, migration
+// 0106 / #4234): its kind, the workflow it runs under, and the operator's
+// reason. Reason is untrusted-origin text, rendered only as data.
+type Expedite struct {
+	Kind      string
+	Workflow  string
+	Reason    string
+	CreatedAt time.Time
+}
+
+// DispatchHold is a campaign's active dispatch hold (campaign_dispatch_holds,
+// migration 0106 / #4234): while it exists the host-dispatch marker refuses
+// NEW implement admissions of the campaign's non-expedited items. HeldAt and
+// ExpiresAt are fishhawkd-clock stamps; at most MaxDispatchHold apart.
+type DispatchHold struct {
+	CampaignID   uuid.UUID
+	HotfixItemID uuid.UUID
+	HeldAt       time.Time
+	ExpiresAt    time.Time
 }

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -247,7 +248,11 @@ func (r *postgresRepo) GetCampaignItem(ctx context.Context, id uuid.UUID) (*Item
 	if err != nil {
 		return nil, fmt.Errorf("get campaign item: %w", err)
 	}
-	return rowToCampaignItem(row), nil
+	item := rowToCampaignItem(row)
+	if err := attachExpedites(ctx, r.pool, []*Item{item}); err != nil {
+		return nil, err
+	}
+	return item, nil
 }
 
 func (r *postgresRepo) ListCampaignItemsForCampaign(ctx context.Context, campaignID uuid.UUID) ([]*Item, error) {
@@ -259,6 +264,9 @@ func (r *postgresRepo) ListCampaignItemsForCampaign(ctx context.Context, campaig
 	out := make([]*Item, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, rowToCampaignItem(row))
+	}
+	if err := attachExpedites(ctx, r.pool, out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -272,6 +280,9 @@ func (r *postgresRepo) ListCampaignItemsForRun(ctx context.Context, runID uuid.U
 	out := make([]*Item, 0, len(rows))
 	for _, row := range rows {
 		out = append(out, rowToCampaignItem(row))
+	}
+	if err := attachExpedites(ctx, r.pool, out); err != nil {
+		return nil, err
 	}
 	return out, nil
 }
@@ -624,10 +635,12 @@ func (r *postgresRepo) SettleCampaignItemForClosedIssue(ctx context.Context, id 
 
 // AppendCampaignItems inserts new items and applies add-only depends_on
 // additions in ONE transaction (see the Repository doc for the contract). Lock
-// order is the package-wide one — campaign row, then item rows — and every
-// guard runs under the campaign lock before the first write, so a refusal
-// commits nothing. p.Record runs last, still inside the transaction, so an
-// unrecordable append rolls back whole.
+// order is the package-wide one — campaign row, then the dispatch-hold row (an
+// expedited append asking for a hold), then item rows — and every guard runs
+// under the campaign lock before the first write, so a refusal commits
+// nothing. An expedited item's expedite row and hold are written in the same
+// transaction. p.Record runs last, still inside it, so an unrecordable append
+// rolls back whole.
 func (r *postgresRepo) AppendCampaignItems(ctx context.Context, p AppendCampaignItemsParams) (*AppendOutcome, error) {
 	var out *AppendOutcome
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
@@ -663,6 +676,20 @@ func (r *postgresRepo) AppendCampaignItems(ctx context.Context, p AppendCampaign
 		}
 		if err := ValidateAppend(existing, p); err != nil {
 			return err
+		}
+		// 2b. An expedited append asking for a dispatch hold is refused while
+		// the campaign already holds one, before the first write. The campaign
+		// lock above serializes every hold writer; the hold row is locked
+		// second (the package order).
+		if p.Expedite != nil && p.Expedite.Hold != nil {
+			held, err := lockDispatchHold(ctx, tx, p.CampaignID)
+			if err != nil {
+				return err
+			}
+			if held != nil {
+				return fmt.Errorf("%w: hotfix item %s holds it until %s",
+					ErrDispatchHoldActive, held.HotfixItemID, held.ExpiresAt.UTC().Format(time.RFC3339))
+			}
 		}
 
 		// 3. Additions, in queue order for a deterministic outcome. Each item
@@ -701,11 +728,17 @@ func (r *postgresRepo) AppendCampaignItems(ctx context.Context, p AppendCampaign
 			})
 		}
 
-		// 4. New items queue after every existing item, in request order.
+		// 4. New items queue after every existing item, in request order. An
+		// expedited item (exactly one, ValidateExpedite) heads the queue
+		// instead, at min(existing)-1, and gets its campaign_item_expedites row.
 		for i, ni := range p.NewItems {
 			deps, err := marshalDependsOn(ni.DependsOn)
 			if err != nil {
 				return err
+			}
+			pos := maxPos + 1 + i
+			if p.Expedite != nil {
+				pos = ExpeditedHeadPosition(existing)
 			}
 			row, err := q.CreateCampaignItem(ctx, campaigndb.CreateCampaignItemParams{
 				ID:            uuid.New(),
@@ -714,12 +747,28 @@ func (r *postgresRepo) AppendCampaignItems(ctx context.Context, p AppendCampaign
 				DependsOn:     deps,
 				State:         string(ItemStatePending),
 				Autonomy:      normalizeAutonomy(ni.Autonomy),
-				QueuePosition: int32(maxPos + 1 + i), //nolint:gosec // dense index over one campaign's items
+				QueuePosition: int32(pos), //nolint:gosec // an index over one campaign's items, offset by at most the expedited heads
 			})
 			if err != nil {
 				return fmt.Errorf("create campaign item: %w", err)
 			}
-			outcome.Created = append(outcome.Created, rowToCampaignItem(row))
+			item := rowToCampaignItem(row)
+			if p.Expedite != nil {
+				if item.Expedite, err = insertExpedite(ctx, tx, item.ID, p.CampaignID, *p.Expedite); err != nil {
+					return err
+				}
+			}
+			outcome.Created = append(outcome.Created, item)
+		}
+
+		// 4b. The dispatch hold names the expedited item, stamped with the
+		// caller's clock.
+		if p.Expedite != nil && p.Expedite.Hold != nil {
+			hold, err := insertDispatchHold(ctx, tx, p.CampaignID, outcome.Created[0].ID, p.Expedite.Hold.HeldAt, p.Expedite.Hold.ExpiresAt)
+			if err != nil {
+				return err
+			}
+			outcome.Hold = hold
 		}
 
 		// 5. Record before commit: an error here rolls every write above back.

@@ -247,3 +247,20 @@ func TestPlanAppend_UnparsableTargetIsRefusedDownstream(t *testing.T) {
 		t.Fatalf("unparsable target err = %v, want ErrInvalidDependencyRef", err)
 	}
 }
+
+// TestValidateAppend_RunsValidateExpedite pins that the shared append guard
+// (the one the Postgres adapter and every fake call under the lock) applies
+// the expedite rule, so no repository path admits an invalid expedite.
+func TestValidateAppend_RunsValidateExpedite(t *testing.T) {
+	p := AppendCampaignItemsParams{
+		NewItems: []CreateCampaignItemParams{{IssueRef: "issue:1"}, {IssueRef: "issue:2"}},
+		Expedite: &ExpediteParams{Kind: ExpediteKindHotfix, Workflow: "w"},
+	}
+	if err := ValidateAppend(nil, p); !errors.Is(err, ErrExpediteInvalid) {
+		t.Fatalf("ValidateAppend(two expedited items) = %v, want ErrExpediteInvalid", err)
+	}
+	p.NewItems = p.NewItems[:1]
+	if err := ValidateAppend(nil, p); err != nil {
+		t.Fatalf("ValidateAppend(one expedited item) = %v, want nil", err)
+	}
+}

@@ -153,7 +153,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **177 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **178 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -265,6 +265,7 @@ The v0 REST API exposes **177 operations** across the paths below, generated fro
 | `GET` | `/v0/campaigns/{campaign_id}` | Get a campaign |
 | `GET` | `/v0/campaigns/{campaign_id}/items` | List a campaign's items |
 | `POST` | `/v0/campaigns/{campaign_id}/items` | Append issues to an existing campaign |
+| `POST` | `/v0/campaigns/{campaign_id}/hotfix` | Add an urgent issue to a campaign as an expedited item |
 | `GET` | `/v0/campaigns/{campaign_id}/status` | Get a campaign's rollup status + next action |
 | `POST` | `/v0/campaigns/{campaign_id}/runs` | Start a run for an eligible campaign item |
 | `POST` | `/v0/campaigns/{campaign_id}/resume` | Resume a paused campaign |

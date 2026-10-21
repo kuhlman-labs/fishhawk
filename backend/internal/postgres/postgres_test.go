@@ -7923,3 +7923,132 @@ func TestMigrateDown_ScopeAmendmentsLapsedReversal(t *testing.T) {
 		t.Errorf("insert status 'lapsed' after re-applying 0105: %v", err)
 	}
 }
+
+// TestMigrateDown_CampaignExpediteDispatchHoldReversal pins 0106 (E83.100 /
+// #4234): after MigrateUp campaign_item_expedites and campaign_dispatch_holds
+// exist with their CHECKs (a known kind, a non-empty workflow, expires_at >
+// held_at), the hold PK admits ONE hold per campaign, a NEGATIVE
+// queue_position is legal (0074 has no CHECK, which the expedited head
+// position relies on) and both rows cascade with their campaign; after
+// rolling back 0106 both tables are gone, the schema lands on 0105 and the
+// campaign and item rows survive.
+func TestMigrateDown_CampaignExpediteDispatchHoldReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	seedCampaign := func() (uuid.UUID, uuid.UUID) {
+		t.Helper()
+		campaignID, itemID := uuid.New(), uuid.New()
+		if _, err := pool.Exec(ctx, `INSERT INTO campaigns (id, repo, epic_ref) VALUES ($1, 'o/r', 'issue:1')`, campaignID); err != nil {
+			t.Fatalf("seed campaign: %v", err)
+		}
+		if _, err := pool.Exec(ctx,
+			`INSERT INTO campaign_items (id, campaign_id, issue_ref, queue_position) VALUES ($1, $2, 'issue:2', -1)`,
+			itemID, campaignID); err != nil {
+			t.Fatalf("seed item at a negative queue_position: %v — the expedited head position needs it legal", err)
+		}
+		return campaignID, itemID
+	}
+	campaignID, itemID := seedCampaign()
+
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_item_expedites (item_id, campaign_id, kind, workflow, reason) VALUES ($1, $2, 'hotfix', 'hotfix_change', 'prod down')`,
+		itemID, campaignID); err != nil {
+		t.Fatalf("insert expedite row after MigrateUp: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_dispatch_holds (campaign_id, hotfix_item_id, held_at, expires_at) VALUES ($1, $2, now(), now() + interval '2 hours')`,
+		campaignID, itemID); err != nil {
+		t.Fatalf("insert dispatch hold after MigrateUp: %v", err)
+	}
+	var pgErr *pgconn.PgError
+	for name, tc := range map[string]struct {
+		sql        string
+		constraint string
+	}{
+		"unknown kind": {
+			`INSERT INTO campaign_item_expedites (item_id, campaign_id, kind, workflow) VALUES ($1, $2, 'urgent', 'w')`,
+			"campaign_item_expedites_kind_check",
+		},
+		"empty workflow": {
+			`INSERT INTO campaign_item_expedites (item_id, campaign_id, kind, workflow) VALUES ($1, $2, 'hotfix', '')`,
+			"campaign_item_expedites_workflow_check",
+		},
+		"expires_at not after held_at": {
+			`INSERT INTO campaign_dispatch_holds (campaign_id, hotfix_item_id, held_at, expires_at) VALUES ($1, $2, now(), now())`,
+			"campaign_dispatch_holds_window_check",
+		},
+	} {
+		// A fresh campaign + item per case, so the PK never masks the CHECK.
+		c, i := seedCampaign()
+		args := []any{i, c}
+		if strings.Contains(tc.sql, "campaign_dispatch_holds") {
+			args = []any{c, i}
+		}
+		_, err := pool.Exec(ctx, tc.sql, args...)
+		if !errors.As(err, &pgErr) || pgErr.ConstraintName != tc.constraint {
+			t.Errorf("%s: err = %v, want a %s violation", name, err, tc.constraint)
+		}
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_dispatch_holds (campaign_id, hotfix_item_id, held_at, expires_at) VALUES ($1, $2, now(), now() + interval '1 hour')`,
+		campaignID, itemID); !errors.As(err, &pgErr) || pgErr.ConstraintName != "campaign_dispatch_holds_pkey" {
+		t.Errorf("second hold on one campaign: err = %v, want a campaign_dispatch_holds_pkey violation", err)
+	}
+
+	// Cascade: deleting a campaign removes its expedite and hold rows.
+	cascadeCampaign, cascadeItem := seedCampaign()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_item_expedites (item_id, campaign_id, kind, workflow) VALUES ($1, $2, 'hotfix', 'w')`,
+		cascadeItem, cascadeCampaign); err != nil {
+		t.Fatalf("insert cascade expedite: %v", err)
+	}
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaign_dispatch_holds (campaign_id, hotfix_item_id, held_at, expires_at) VALUES ($1, $2, now(), now() + interval '1 hour')`,
+		cascadeCampaign, cascadeItem); err != nil {
+		t.Fatalf("insert cascade hold: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `DELETE FROM campaigns WHERE id = $1`, cascadeCampaign); err != nil {
+		t.Fatalf("delete cascade campaign: %v", err)
+	}
+	var leftExpedites, leftHolds int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM campaign_item_expedites WHERE campaign_id = $1),
+  (SELECT count(*) FROM campaign_dispatch_holds WHERE campaign_id = $1)`, cascadeCampaign).Scan(&leftExpedites, &leftHolds); err != nil {
+		t.Fatalf("read cascade: %v", err)
+	}
+	if leftExpedites != 0 || leftHolds != 0 {
+		t.Errorf("after deleting the campaign: expedites=%d holds=%d, want 0/0 (ON DELETE CASCADE)", leftExpedites, leftHolds)
+	}
+
+	downThrough(t, url, "0106")
+
+	var tables, items int
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT count(*) FROM information_schema.tables WHERE table_name IN ('campaign_item_expedites', 'campaign_dispatch_holds')),
+  (SELECT count(*) FROM campaign_items WHERE id = $1 AND queue_position = -1)`, itemID).Scan(&tables, &items); err != nil {
+		t.Fatalf("read back after rollback: %v", err)
+	}
+	if tables != 0 {
+		t.Errorf("0106 tables after rolling back 0106 = %d, want 0", tables)
+	}
+	if items != 1 {
+		t.Errorf("expedited item after rolling back 0106 = %d, want 1 (an ordinary item at its position)", items)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if !tableExists(t, url, "campaign_item_expedites") || !tableExists(t, url, "campaign_dispatch_holds") {
+		t.Error("0106 tables missing after re-applying 0106")
+	}
+}

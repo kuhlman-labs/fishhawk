@@ -4718,9 +4718,18 @@ type CampaignItem struct {
 	// succeeded for a closed-as-completed issue, cancelled for a
 	// not_planned/duplicate closure. omitempty, so an item with no recorded
 	// provenance (an operator or run-driven outcome) carries no key.
-	ResolvedBy string    `json:"resolved_by,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	// Expedited, ExpediteKind, Workflow and ExpediteReason mirror the backend's
+	// omitempty expedite tags (E83.100 / #4234): set only on an item the
+	// campaign hotfix verb added, so an ordinary item decodes and re-emits
+	// exactly as before. ExpediteReason is the operator's untrusted-origin free
+	// text, passed through as data only.
+	Expedited      bool      `json:"expedited,omitempty"`
+	ExpediteKind   string    `json:"expedite_kind,omitempty"`
+	Workflow       string    `json:"workflow,omitempty"`
+	ExpediteReason string    `json:"expedite_reason,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // CampaignRollup mirrors the backend's `CampaignRollup` wire schema
@@ -4763,6 +4772,19 @@ type CampaignStatus struct {
 	// DependencyRefresh is the monotone dependency refresh block (E86.47 /
 	// #4358); absent when the deployment disables the refresh.
 	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty"`
+	// DispatchHold is the campaign's active hotfix dispatch hold (E83.100 /
+	// #4234); absent when the campaign is not held.
+	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty"`
+}
+
+// campaignDispatchHold mirrors the backend's dispatchHoldPayload
+// (server/campaign_hotfix.go), carried by the status read's dispatch_hold block
+// and the hotfix 201 body. Unexported, so the export baseline is unchanged.
+type campaignDispatchHold struct {
+	HotfixItemID   string    `json:"hotfix_item_id"`
+	HotfixIssueRef string    `json:"hotfix_issue_ref"`
+	HeldAt         time.Time `json:"held_at"`
+	ExpiresAt      time.Time `json:"expires_at"`
 }
 
 // campaignDependencyRefresh mirrors the status response's dependency_refresh
@@ -5148,6 +5170,61 @@ func (c *apiClient) AppendCampaignItems(ctx context.Context, id uuid.UUID, items
 		return nil, fmt.Errorf("marshal append campaign items request: %w", err)
 	}
 	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+id.String()+"/items", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
+}
+
+// campaignHotfixRequest mirrors the backend's POST
+// /v0/campaigns/{campaign_id}/hotfix body
+// (`backend/internal/server/campaign_hotfix.go::campaignHotfixRequest`). The
+// backend refuses unknown fields, so this carries exactly its four keys; the
+// optional ones are omitempty so the backend applies its own defaults.
+type campaignHotfixRequest struct {
+	Issue        string `json:"issue"`
+	Workflow     string `json:"workflow,omitempty"`
+	Reason       string `json:"reason,omitempty"`
+	HoldDispatch bool   `json:"hold_dispatch,omitempty"`
+}
+
+// campaignHotfixItem is the hotfix 201 body's item: the campaign item plus its
+// queue position, which is NEGATIVE once an expedited item heads a queue whose
+// ordinary items start at 0.
+type campaignHotfixItem struct {
+	CampaignItem
+	Position int `json:"position"`
+}
+
+// campaignHotfixResult is the hotfix 201 body.
+type campaignHotfixResult struct {
+	Campaign     Campaign              `json:"campaign"`
+	Item         campaignHotfixItem    `json:"item"`
+	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty"`
+}
+
+// CampaignHotfix adds ONE urgent issue to a non-terminal campaign as an
+// EXPEDITED item at the head of its queue via `POST
+// /v0/campaigns/{id}/hotfix` (E83.100 / #4234). A write tool: requires
+// write:campaigns, and the backend refuses run-bound and delegated
+// operator-agent tokens. 4xx/5xx surfaces:
+//   - 400 validation_failed (bad UUID, unknown field, missing issue, reason
+//     over 1000 bytes, a non-hotfix_change workflow with no reason)
+//   - 403 insufficient_scope / run_token_forbidden / operator_agent_forbidden /
+//     account_forbidden / repo_forbidden
+//   - 404 campaign_not_found
+//   - 409 campaign_not_appendable / campaign_item_duplicate /
+//     campaign_hold_active
+//   - 422 campaign_item_ref_invalid / workflow_not_registered /
+//     workflow_spec_invalid
+//   - 502/503 workflow_spec_unavailable; 503 campaign_audit_unavailable
+//     (nothing written)
+func (c *apiClient) CampaignHotfix(ctx context.Context, id uuid.UUID, req campaignHotfixRequest) (*campaignHotfixResult, error) {
+	var out campaignHotfixResult
+	body, err := json.Marshal(req)
+	if err != nil {
+		return nil, fmt.Errorf("marshal campaign hotfix request: %w", err)
+	}
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+id.String()+"/hotfix", body, &out); err != nil {
 		return nil, err
 	}
 	return &out, nil
