@@ -234,6 +234,7 @@ type Store interface {
 	ActiveBases(ctx context.Context) ([]Base, error)
 	MarkMergeIntent(ctx context.Context, entryID uuid.UUID, record RecordIntentFunc) (MergeIntentResult, error)
 	RecentLineTurns(ctx context.Context, base Base, limit int) ([]time.Duration, error)
+	WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error
 }
 
 // validate refuses a malformed Base before any SQL runs.
@@ -266,6 +267,18 @@ func lockKey(accountID, repo, baseRef string) int64 {
 	h.Write([]byte(repo))
 	h.Write([]byte{0})
 	h.Write([]byte(baseRef))
+	sum := h.Sum(nil)
+	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
+}
+
+// intentLockKey derives WithMergeIntentLock's per-run key in its own
+// "fishhawk:mergequeue-intent:" domain, disjoint from runLockKey: the lock is
+// held on one connection while fn's Enqueue takes runLockKey on another, so
+// a shared key would make the holder wait on itself.
+func intentLockKey(runID uuid.UUID) int64 {
+	h := sha256.New()
+	h.Write([]byte("fishhawk:mergequeue-intent:"))
+	h.Write(runID[:])
 	sum := h.Sum(nil)
 	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
 }

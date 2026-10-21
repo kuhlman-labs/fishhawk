@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -23,6 +24,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // unstableMergeErr is the multi-%w shape githubclient.EnableAutoMerge produces
@@ -3295,5 +3297,290 @@ func TestMergeRun_EnqueueArmSkipsRedAndUnreadableGates(t *testing.T) {
 	}
 	if es := f.entries(r); len(es) != 0 {
 		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+}
+
+func decodeMergeRunResponse(t *testing.T, w *httptest.ResponseRecorder) mergeRunResponse {
+	t.Helper()
+	var resp mergeRunResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode %s: %v", w.Body.String(), err)
+	}
+	return resp
+}
+
+// TestMergeRun_ConcurrentMergesRecordOneIntent pins the merge-intent lock:
+// merge A parks INSIDE its queue write (after its merge_queue_entered append)
+// while merge B of the same run starts. Under the lock B waits, then re-reads
+// the entry, sees A's intent and answers already_queued with A's sequence:
+// one row, one intent, both answers naming it. Counterfactual: calling the
+// decision without WithMergeIntentLock lets B read "no intent" and append a
+// second row while A is parked — two rows, two sequences, RED. Both write
+// paths are covered: a fresh Enqueue and MarkMergeIntent on a held entry.
+func TestMergeRun_ConcurrentMergesRecordOneIntent(t *testing.T) {
+	for _, held := range []bool{false, true} {
+		t.Run(fmt.Sprintf("held=%v", held), func(t *testing.T) {
+			f, r, _ := mqMergeFixture(t, true)
+			if held {
+				other := f.seed("o", "o0", []byte(mcvUndelegatedSpecYAML))
+				f.behind(other, "o0", "o1")
+				f.rebase(other)
+				f.rebase(r) // held behind other, no intent
+			}
+			parked, release := make(chan struct{}), make(chan struct{})
+			var once sync.Once
+			park := func() { once.Do(func() { close(parked); <-release }) }
+			f.srv.cfg.MergeQueue = &mcqFaultStore{Store: f.store,
+				enqueue: func(req mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error) {
+					park()
+					return f.store.Enqueue(context.Background(), req)
+				},
+				markIntent: func(id uuid.UUID) (mergequeue.MergeIntentResult, error) {
+					park()
+					return f.store.MarkMergeIntent(context.Background(), id, nil)
+				},
+			}
+			first, second := make(chan *httptest.ResponseRecorder, 1), make(chan *httptest.ResponseRecorder, 1)
+			go func() { first <- f.mergeRun(r) }()
+			<-parked
+			go func() { second <- f.mergeRun(r) }()
+			var wb *httptest.ResponseRecorder
+			select {
+			case wb = <-second: // only reachable without the lock
+			case <-time.After(timescale.D(300 * time.Millisecond)):
+			}
+			close(release)
+			wa := <-first
+			if wb == nil {
+				wb = <-second
+			}
+			f.srv.bgMergeQueuePump.Wait()
+			if wa.Code != http.StatusAccepted || wb.Code != http.StatusAccepted {
+				t.Fatalf("merges = %d / %d, want 202 / 202:\n%s\n%s", wa.Code, wb.Code, wa.Body.String(), wb.Body.String())
+			}
+			ra, rb := decodeMergeRunResponse(t, wa), decodeMergeRunResponse(t, wb)
+			rows := f.rows(r, CategoryMergeQueueEntered)
+			if len(rows) != 1 {
+				t.Fatalf("merge_queue_entered rows = %d, want exactly 1 for one intent transition", len(rows))
+			}
+			if ra.IntentSequence != rows[0].Sequence || rb.IntentSequence != rows[0].Sequence {
+				t.Fatalf("intent sequences = %d / %d, want both %d (the one row)", ra.IntentSequence, rb.IntentSequence, rows[0].Sequence)
+			}
+			if ra.AlreadyQueued || !rb.AlreadyQueued {
+				t.Fatalf("already_queued = %v / %v, want false for the first and true for the second", ra.AlreadyQueued, rb.AlreadyQueued)
+			}
+			if got := f.intentAt(r); len(got) != 1 || !got[0] {
+				t.Fatalf("entries merge_intent_at set = %v, want one entry with intent", got)
+			}
+		})
+	}
+}
+
+// TestMergeRun_QueueWriteFailureAfterAppend pins the documented
+// record-before-commit residual: a queue write that fails AFTER the
+// merge_queue_entered append answers 503 merge_queue_write_failed and leaves
+// that row with no entry; the retry appends a second row and records the
+// intent, and a repeat merge names the RETRY's row.
+func TestMergeRun_QueueWriteFailureAfterAppend(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	var fail atomic.Bool
+	fail.Store(true)
+	f.srv.cfg.MergeQueue = &mcqFaultStore{Store: f.store,
+		enqueue: func(req mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error) {
+			if fail.Load() {
+				return mergequeue.EnqueueResult{}, errMCQStore
+			}
+			return f.store.Enqueue(context.Background(), req)
+		},
+	}
+	w := f.mergeRun(r)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "merge_queue_write_failed") {
+		t.Fatalf("merge = %d %s, want 503 merge_queue_write_failed", w.Code, w.Body.String())
+	}
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries after a failed write = %d, want 0", len(es))
+	}
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 1 {
+		t.Fatalf("merge_queue_entered rows after a failed write = %d, want the 1 orphan", n)
+	}
+	fail.Store(false)
+	w = f.mergeRun(r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("retry = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	rows := f.rows(r, CategoryMergeQueueEntered)
+	if len(rows) != 2 || decodeMergeRunResponse(t, w).IntentSequence != rows[1].Sequence {
+		t.Fatalf("rows = %d, retry intent_sequence = %d, want 2 rows and the newest (%d)", len(rows), decodeMergeRunResponse(t, w).IntentSequence, rows[len(rows)-1].Sequence)
+	}
+	if got := f.intentAt(r); len(got) != 1 || !got[0] {
+		t.Fatalf("intent after retry = %v", got)
+	}
+	repeat := decodeMergeRunResponse(t, f.mergeRun(r))
+	if !repeat.AlreadyQueued || repeat.IntentSequence != rows[1].Sequence {
+		t.Fatalf("repeat = %+v, want already_queued naming sequence %d", repeat, rows[1].Sequence)
+	}
+}
+
+// TestMergeRun_RepeatNamesTheIntentRowNotACrossBaseOrphan: a base change
+// whose queue write fails leaves an orphan merge_queue_entered row naming the
+// NEW base while the old entry keeps its intent. A repeat merge on the old
+// base must answer the row that recorded that intent, not the newer orphan.
+// Counterfactual: taking the newest row regardless of base_ref answers the
+// orphan's sequence, RED.
+func TestMergeRun_RepeatNamesTheIntentRowNotACrossBaseOrphan(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("first merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	intentRow := f.rows(r, CategoryMergeQueueEntered)[0].Sequence
+	f.srv.cfg.MergeQueue = &mcqFaultStore{Store: f.store,
+		enqueue: func(mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error) {
+			return mergequeue.EnqueueResult{}, errMCQStore
+		},
+	}
+	req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
+	w := httptest.NewRecorder()
+	handled, _ := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
+		mergeCandidateGateResult{Code: mergeCodeBaseBehind, prHeadSHA: "m0", prBaseRef: "release"})
+	if !handled || w.Code != http.StatusServiceUnavailable {
+		t.Fatalf("base-change merge = %v %d, want a handled 503:\n%s", handled, w.Code, w.Body.String())
+	}
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 2 {
+		t.Fatalf("merge_queue_entered rows = %d, want the intent row plus the orphan", n)
+	}
+	f.srv.cfg.MergeQueue = f.store
+	repeat := decodeMergeRunResponse(t, f.mergeRun(r))
+	if !repeat.AlreadyQueued || repeat.BaseRef != mcqBase || repeat.IntentSequence != intentRow {
+		t.Fatalf("repeat = %+v, want already_queued on %s naming sequence %d", repeat, mcqBase, intentRow)
+	}
+}
+
+// TestMergeRun_ReadBackMissAnswers503: an entry that is gone when the arm
+// reads it back after the write answers 503 merge_queue_write_failed, never a
+// 202 built from a missing entry.
+func TestMergeRun_ReadBackMissAnswers503(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	var wrote atomic.Bool
+	f.srv.cfg.MergeQueue = &mcqFaultStore{Store: f.store,
+		enqueue: func(req mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error) {
+			wrote.Store(true)
+			return f.store.Enqueue(context.Background(), req)
+		},
+		activeForRun: func(id uuid.UUID) (mergequeue.Status, bool, error) {
+			if wrote.Load() {
+				return mergequeue.Status{}, false, nil
+			}
+			return f.store.ActiveForRun(context.Background(), id)
+		},
+	}
+	w := f.mergeRun(r)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "could not be read back (the entry left the queue)") {
+		t.Fatalf("merge = %d %s, want 503 merge_queue_write_failed naming the read-back", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+}
+
+// TestMergeRun_EnqueueArmSkipsUnownedInFlightPass: an in-flight pass with no
+// active queue entry (e.g. fan_in) keeps today's refusal and writes nothing.
+// Counterfactual: deleting the skip lets this eligible run enqueue, RED.
+func TestMergeRun_EnqueueArmSkipsUnownedInFlightPass(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
+	w := httptest.NewRecorder()
+	handled, ineligible := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
+		mergeCandidateGateResult{Code: mergeCodeCandidateUnverified, prHeadSHA: "m0", prBaseRef: mcqBase,
+			Details: map[string]any{"verify_state": mergeCandidateStateInFlight}})
+	if handled || ineligible != nil {
+		t.Fatalf("handled=%v ineligible=%v, want today's refusal untouched", handled, ineligible)
+	}
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 0 {
+		t.Fatalf("merge_queue_entered rows = %d, want 0", n)
+	}
+}
+
+// TestMergeRun_EnqueueOnNewBaseDropsTheOldEntry: a run whose entry is live on
+// one base, merged against another, is enqueued on the new base; the old
+// entry is dropped base_changed with its settled audit row.
+func TestMergeRun_EnqueueOnNewBaseDropsTheOldEntry(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("first merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	old := f.requireState(r, "live", "")
+	req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
+	w := httptest.NewRecorder()
+	handled, _ := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
+		mergeCandidateGateResult{Code: mergeCodeBaseBehind, prHeadSHA: "m0", prBaseRef: "release"})
+	f.srv.bgMergeQueuePump.Wait()
+	if !handled || w.Code != http.StatusAccepted {
+		t.Fatalf("base-change merge = %v %d, want a handled 202:\n%s", handled, w.Code, w.Body.String())
+	}
+	if resp := decodeMergeRunResponse(t, w); resp.BaseRef != "release" || resp.AlreadyQueued {
+		t.Fatalf("response = %+v, want a fresh enqueue on release", resp)
+	}
+	var dropped bool
+	for _, e := range f.entries(r) {
+		if e.ID == old.ID {
+			dropped = e.State == mergequeue.StateDropped && e.EjectReason == mergequeue.ReasonBaseChanged
+		}
+	}
+	if !dropped {
+		t.Fatalf("old entry %s not dropped base_changed: %+v", old.ID, f.entries(r))
+	}
+	var settled bool
+	for _, row := range f.rows(r, CategoryMergeCandidateQueueSettled) {
+		var p map[string]any
+		_ = json.Unmarshal(row.Payload, &p)
+		settled = settled || p["entry_id"] == old.ID.String()
+	}
+	if !settled {
+		t.Fatal("no merge_candidate_queue_settled row names the dropped entry")
+	}
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 2 {
+		t.Fatalf("merge_queue_entered rows = %d, want 2 (one per base)", n)
+	}
+}
+
+// TestMergeRun_IntentLockFailuresKeepTodaysRefusal: a merge-intent lock that
+// cannot be taken, or an entry unreadable under it, writes nothing and
+// renders today's merge_base_behind refusal.
+func TestMergeRun_IntentLockFailuresKeepTodaysRefusal(t *testing.T) {
+	for name, fs := range map[string]func(*mcqFixture) *mcqFaultStore{
+		"lock unavailable": func(f *mcqFixture) *mcqFaultStore {
+			return &mcqFaultStore{Store: f.store, intentLock: func(func() error) error { return errMCQStore }}
+		},
+		"entry unreadable under the lock": func(f *mcqFixture) *mcqFaultStore {
+			var locked atomic.Bool
+			return &mcqFaultStore{Store: f.store,
+				intentLock: func(fn func() error) error { locked.Store(true); return fn() },
+				activeForRun: func(id uuid.UUID) (mergequeue.Status, bool, error) {
+					if locked.Load() {
+						return mergequeue.Status{}, false, errMCQStore
+					}
+					return f.store.ActiveForRun(context.Background(), id)
+				},
+			}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f, r, _ := mqMergeFixture(t, true)
+			f.srv.cfg.MergeQueue = fs(f)
+			w := f.mergeRun(r)
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), mergeCodeBaseBehind) {
+				t.Fatalf("merge = %d %s, want today's 409 merge_base_behind", w.Code, w.Body.String())
+			}
+			if es := f.entries(r); len(es) != 0 {
+				t.Fatalf("queue entries = %d, want 0", len(es))
+			}
+			if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 0 {
+				t.Fatalf("merge_queue_entered rows = %d, want 0", n)
+			}
+		})
 	}
 }

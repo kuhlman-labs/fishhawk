@@ -1074,6 +1074,8 @@ type mcqFaultStore struct {
 	settle       func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
 	activeForRun func(uuid.UUID) (mergequeue.Status, bool, error)
 	activeBases  func() ([]mergequeue.Base, error)
+	markIntent   func(uuid.UUID) (mergequeue.MergeIntentResult, error)
+	intentLock   func(fn func() error) error
 }
 
 // mcqCall is one recorded store call: the method, the id it named (the entry
@@ -1198,6 +1200,27 @@ func (s *mcqFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, err
 		return s.activeBases()
 	}
 	return s.Store.ActiveBases(ctx)
+}
+
+func (s *mcqFaultStore) MarkMergeIntent(ctx context.Context, id uuid.UUID, record mergequeue.RecordIntentFunc) (mergequeue.MergeIntentResult, error) {
+	s.record(ctx, "MarkMergeIntent", id)
+	if s.markIntent != nil {
+		return s.markIntent(id)
+	}
+	return s.Store.MarkMergeIntent(ctx, id, record)
+}
+
+// WithMergeIntentLock delegates to the wrapped store's lock; a pure fake (nil
+// Store) has no second process to exclude, so it just runs fn.
+func (s *mcqFaultStore) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error {
+	s.record(ctx, "WithMergeIntentLock", runID)
+	if s.intentLock != nil {
+		return s.intentLock(fn)
+	}
+	if s.Store == nil {
+		return fn()
+	}
+	return s.Store.WithMergeIntentLock(ctx, runID, fn)
 }
 
 var errMCQStore = fmt.Errorf("queue store unavailable")

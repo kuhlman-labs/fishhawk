@@ -2918,10 +2918,28 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
   `merge_intent_at`; a retry appends again. Ordering, not the store's
   in-transaction `RecordIntent` callback, is the guarantee (the chained
   append's `FOR UPDATE` on the runs row would wait on the insert's own
-  `FOR KEY SHARE`). Residual: an append whose queue write then fails leaves
-  a row with no entry (`503 merge_queue_write_failed`; a retry records
-  again). An entry already carrying intent answers `already_queued` and
-  writes nothing.
+  `FOR KEY SHARE`). Residual: an append whose queue write (or its read-back)
+  then fails leaves an orphan row (`503 merge_queue_write_failed`; a retry
+  appends a second row and records the intent;
+  `TestMergeRun_QueueWriteFailureAfterAppend`). An entry already carrying
+  intent answers `already_queued` and writes nothing.
+- **One row per intent (merge-intent lock).** The decision (re-read the
+  entry, append, write, read back; `recordMergeQueueIntent`) runs under
+  `mergequeue.Store.WithMergeIntentLock`, a per-run Postgres advisory lock.
+  Overlapping merges of one run, including across fishhawkd replicas, take
+  turns. The second sees the first's committed intent and answers
+  `already_queued` with the SAME `intent_sequence`, so one intent
+  transition has exactly one `merge_queue_entered` row
+  (`TestMergeRun_ConcurrentMergesRecordOneIntent`, both write paths). A
+  lock that cannot be taken, or an entry unreadable under it, gets today's
+  refusal with nothing written. `intent_sequence` on a repeat is the NEWEST
+  row whose `base_ref` is the entry's base. Rows are appended only under the
+  lock and only while the entry has no intent, so an orphan is always older
+  than the row that recorded the intent, and the orphan of a failed base
+  change names the other base
+  (`TestMergeRun_RepeatNamesTheIntentRowNotACrossBaseOrphan`). Slice 2's
+  merge-on-pass must identify the verdict row by the same rule, never by
+  "newest row of the run".
 - **Detached pump.** After the write the base is pumped on a detached,
   bounded `mergeCandidateAdmissionContext` tracked by `bgMergeQueuePump`, so
   the 202 never waits on an admission's auto-advance or pass start; it is
@@ -2974,9 +2992,12 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
   lands, a line turn includes the operator's merge step** (the line frees
   only when the PR merges), so the estimate is as fast as the operator
   merges.
-- **Fail posture.** `503 merge_queue_unconfigured` unwired; any store read
-  error is `500 internal_error` with no partial body; the forge read never
-  fails the read.
+- **Fail posture.** `503 merge_queue_unconfigured` unwired, answered only
+  AFTER the run-bound refusal and the scope check (the sibling merge verb's
+  order), so an anonymous or under-scoped caller cannot learn whether a queue
+  is wired (`TestMergeQueueRead_Unconfigured`); any store read error is
+  `500 internal_error` with no partial body; the forge read never fails the
+  read.
 - **Tests.** `merge_queue_read_test.go` over the real store (mcq fixture):
   FIFO positions, intent, head of line and ETA together; account isolation
   (A / B / untenanted on one repo and base); the auth ladder (including the

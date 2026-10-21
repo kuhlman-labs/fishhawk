@@ -120,7 +120,10 @@ type mergeQueueETABasis struct {
 // (isRunBoundSubject). Every other caller must clear scopeMergeQueueRead
 // (read:audit) via requireWriteScope: 401 anonymous, 403 insufficient_scope
 // for a token missing it; a cookie-session operator passes. The repository is
-// a point read (403 repo_forbidden when not visible).
+// a point read (403 repo_forbidden when not visible). Both authorization
+// checks run BEFORE the unwired-queue 503 (merge_queue_unconfigured), as on
+// the sibling merge verb, so an unauthenticated or under-scoped caller cannot
+// learn whether the deployment wires a merge queue.
 //
 // Account scope: the caller identity's AccountID is the Base account, so
 // another account's queue on the same repository and base ref is structurally
@@ -130,17 +133,17 @@ type mergeQueueETABasis struct {
 // Store reads fail closed (500); the head-of-line forge read is best-effort
 // (current_head_unavailable names the degrade, the read answers 200).
 func (s *Server) handleGetMergeQueue(w http.ResponseWriter, r *http.Request) {
-	if s.cfg.MergeQueue == nil {
-		s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_unconfigured",
-			"the merge-queue read requires a configured merge queue", nil)
-		return
-	}
 	if isRunBoundSubject(IdentityFrom(r.Context()).Subject) {
 		s.writeError(w, r, http.StatusForbidden, "run_token_forbidden",
 			"a run-bound agent token may not read the merge queue; it names other runs and their heads", nil)
 		return
 	}
 	if !s.requireWriteScope(w, r, scopeMergeQueueRead) {
+		return
+	}
+	if s.cfg.MergeQueue == nil {
+		s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_unconfigured",
+			"the merge-queue read requires a configured merge queue", nil)
 		return
 	}
 	acct, ok := s.callerAccountUUID(w, r)

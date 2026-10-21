@@ -101,11 +101,16 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   no re-anchor, no `base_changed` drop, no `merge_intent_at` — and the call
   returns `ErrIntentUnrecorded` wrapping it. Because nothing committed, a
   retry records again (`IntentRecorded=true`), so a failed audit append is
-  never followed by an unrecorded intent. This is the seam the server's
-  `merge_queue_entered` audit row uses (the #4358
-  `appendCampaignAuditStrict` pattern); the callback runs under the call's
+  never followed by an unrecorded intent. The callback runs under the call's
   advisory and row locks and must not call back into the Store
-  (`TestRecordIntent_FailureRollsBackAndRetryRecords`).
+  (`TestRecordIntent_FailureRollsBackAndRetryRecords`). The server's
+  `merge_queue_entered` row does NOT use this seam: a chained append locks
+  the runs row `FOR UPDATE` and would wait on the insert's own `FOR KEY
+  SHARE`. It appends BEFORE the write instead, under `WithMergeIntentLock`.
+- **`WithMergeIntentLock(runID, fn)`**: runs `fn` while holding the run's
+  merge-intent lock (§ "Merge-intent lock"); returns `fn`'s error as is, the
+  context's error (fn not run) when the wait ends first, and
+  `ErrInvalidRequest` for a nil run id.
 - **`ActiveForRun(runID)`** → `(Status, found, error)`: the run's active entry,
   its 1-based `Position` among the base's held entries (0 when live), and
   `LiveRunID` (the base's live run; the entry's own run when it is live; nil
@@ -173,6 +178,23 @@ with the lock removed. Reads (`ActiveForRun`, `ListForBase`,
 
 Every time comparison uses the database clock (`clock_timestamp()`); no Go
 `time.Now()` value is passed into SQL.
+
+### Merge-intent lock
+
+`WithMergeIntentLock` serializes the server's merge-intent decision for one
+run across requests AND processes: read the entry, append
+`merge_queue_entered`, then `Enqueue{MergeIntent}` / `MarkMergeIntent`. The
+append runs on its own connection, so the decision cannot share one
+transaction with the write. The lock is `pg_try_advisory_xact_lock` on
+`sha256("fishhawk:mergequeue-intent:" + run id)`, held by an otherwise idle
+transaction on one pooled connection while `fn` runs on others. That domain
+is disjoint from the per-run Enqueue key, so `fn`'s own Enqueue never waits
+on its holder. A waiter re-tries every 25 ms (`mergeIntentLockPoll`) and holds
+no pooled connection between tries, so waiters on one run cannot drain the
+pool the holder needs. The wait is bounded only by the caller's context. A
+holder whose connection dies releases the lock with it
+(`TestWithMergeIntentLock_SerializesOneRun`,
+`TestWithMergeIntentLock_ErrorsAndCancel`).
 
 ## Tenancy
 

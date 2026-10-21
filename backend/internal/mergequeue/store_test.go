@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"slices"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -671,6 +672,9 @@ func TestLockKeyDomains(t *testing.T) {
 	if k1, k2 := runLockKey(id), runLockKey(id); k1 != k2 || k1 == runLockKey(uuid.New()) {
 		t.Fatal("run lock key not per run")
 	}
+	if k1, k2 := intentLockKey(id), intentLockKey(id); k1 != k2 || k1 == intentLockKey(uuid.New()) || k1 == runLockKey(id) {
+		t.Fatal("intent lock key not per run, or not disjoint from the run lock key")
+	}
 	if !StateHeld.Active() || !StateLive.Active() || StateMerged.Active() || StateHeld.Terminal() || !StateDropped.Terminal() {
 		t.Fatal("state classification wrong")
 	}
@@ -1088,5 +1092,95 @@ func TestRecentLineTurns_MergedOnlyNewestFirstAccountScoped(t *testing.T) {
 		if err := call(); !errors.Is(err, ErrInvalidRequest) {
 			t.Errorf("%s: err = %v, want ErrInvalidRequest", name, err)
 		}
+	}
+}
+
+// TestWithMergeIntentLock_SerializesOneRun: while A holds run r's intent lock
+// B waits, and runs only after A returns; a different run's lock is
+// independent. Inside the lock fn can Enqueue the same run (the intent key is
+// disjoint from Enqueue's run key, so the holder never waits on itself).
+// Counterfactual: a body that just calls fn lets B run while A holds, RED.
+func TestWithMergeIntentLock_SerializesOneRun(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	ctx := context.Background()
+	held, release := make(chan struct{}), make(chan struct{})
+	aDone := make(chan error, 1)
+	go func() {
+		aDone <- f.store.WithMergeIntentLock(ctx, r, func() error {
+			if _, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h1", MergeIntent: true}); err != nil {
+				return err
+			}
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	if err := f.store.WithMergeIntentLock(ctx, f.run(), func() error { return nil }); err != nil {
+		t.Fatalf("another run's lock: %v", err)
+	}
+	var bRan atomic.Bool
+	bDone := make(chan error, 1)
+	go func() {
+		bDone <- f.store.WithMergeIntentLock(ctx, r, func() error {
+			bRan.Store(true)
+			return nil
+		})
+	}()
+	select {
+	case <-bDone:
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+	if bRan.Load() {
+		t.Fatal("B ran while A held the run's intent lock")
+	}
+	close(release)
+	if err := <-aDone; err != nil {
+		t.Fatalf("A: %v", err)
+	}
+	if err := <-bDone; err != nil || !bRan.Load() {
+		t.Fatalf("B = %v ran=%v, want it to run once A released", err, bRan.Load())
+	}
+}
+
+// TestWithMergeIntentLock_ErrorsAndCancel: fn's error is returned as is; a
+// waiter whose context ends returns its error without running fn; a nil run
+// id is refused before any SQL.
+func TestWithMergeIntentLock_ErrorsAndCancel(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	errFn := errors.New("fn failed")
+	if err := f.store.WithMergeIntentLock(context.Background(), r, func() error { return errFn }); !errors.Is(err, errFn) {
+		t.Fatalf("fn error = %v, want it returned", err)
+	}
+	if err := f.store.WithMergeIntentLock(context.Background(), uuid.Nil, func() error { return nil }); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("nil run id = %v, want ErrInvalidRequest", err)
+	}
+	held, release := make(chan struct{}), make(chan struct{})
+	aDone := make(chan error, 1)
+	go func() {
+		aDone <- f.store.WithMergeIntentLock(context.Background(), r, func() error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(100*time.Millisecond))
+	defer cancel()
+	ran := false
+	err := f.store.WithMergeIntentLock(ctx, r, func() error { ran = true; return nil })
+	close(release)
+	if !errors.Is(err, context.DeadlineExceeded) || ran {
+		t.Fatalf("waiter past its deadline = %v ran=%v, want DeadlineExceeded and fn not run", err, ran)
+	}
+	if err := <-aDone; err != nil {
+		t.Fatalf("holder: %v", err)
+	}
+	canceled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	if err := f.store.WithMergeIntentLock(canceled, r, func() error { ran = true; return nil }); !errors.Is(err, context.Canceled) || ran {
+		t.Fatalf("canceled context = %v ran=%v, want context.Canceled and fn not run", err, ran)
 	}
 }

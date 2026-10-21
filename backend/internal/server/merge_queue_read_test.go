@@ -319,10 +319,18 @@ func TestMergeQueueRead_AuthLadder(t *testing.T) {
 	}
 }
 
-// TestMergeQueueRead_Unconfigured: an unwired queue is 503.
+// TestMergeQueueRead_Unconfigured: an unwired queue is 503 to an authorized
+// caller only. Every authorization refusal answers first, so an anonymous,
+// run-bound or under-scoped caller learns nothing about whether a queue is
+// wired (the sibling merge verb's order).
 func TestMergeQueueRead_Unconfigured(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
 	requireErrorCode(t, getMergeQueue(t, s, "", mqrOperator("")), http.StatusServiceUnavailable, "merge_queue_unconfigured")
+	requireErrorCode(t, getMergeQueue(t, s, "", Identity{Subject: "anonymous"}), http.StatusUnauthorized, "authentication_required")
+	runBound := Identity{Subject: "mcp:run:" + uuid.NewString(), TokenID: "tok-run", Scopes: []string{scopeRunBoundRead, scopeGateViewRead}}
+	requireErrorCode(t, getMergeQueue(t, s, "", runBound), http.StatusForbidden, "run_token_forbidden")
+	noScope := Identity{Subject: "github:ops", TokenID: "tok-op", Scopes: []string{"read:runs"}}
+	requireErrorCode(t, getMergeQueue(t, s, "", noScope), http.StatusForbidden, "insufficient_scope")
 }
 
 // TestMergeQueueRead_NonUUIDAccountFailsClosed: a corrupted session account

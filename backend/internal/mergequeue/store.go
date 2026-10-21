@@ -510,6 +510,53 @@ func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, 
 	return out, nil
 }
 
+// mergeIntentLockPoll is how often WithMergeIntentLock re-tries a held lock.
+const mergeIntentLockPoll = 25 * time.Millisecond
+
+// WithMergeIntentLock runs fn while holding the run's merge-intent lock: a
+// transaction-scoped advisory lock on intentLockKey, held by an otherwise
+// idle transaction on one pooled connection until fn returns. See README.md §
+// "Merge-intent lock". A waiter TRIES the lock and polls every
+// mergeIntentLockPoll, holding no pooled connection between tries, so
+// waiters on one run cannot drain the pool the holder's fn needs. The wait
+// is bounded only by ctx; a canceled ctx returns its error and fn never
+// runs. fn runs on its own connections and must not depend on this
+// transaction; its error is returned as is.
+func (s *PostgresStore) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error {
+	if runID == uuid.Nil {
+		return fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	}
+	key := intentLockKey(runID)
+	for {
+		held := false
+		var fnErr error
+		err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+			if err := tx.QueryRow(ctx, `SELECT pg_try_advisory_xact_lock($1)`, key).Scan(&held); err != nil {
+				return fmt.Errorf("mergequeue: intent lock: %w", err)
+			}
+			if held {
+				fnErr = fn()
+			}
+			return nil
+		})
+		if held {
+			// fn ran; ending the lock transaction is not fn's verdict. A
+			// failed end closes the connection, which releases the lock.
+			return fnErr
+		}
+		if err != nil {
+			return err
+		}
+		t := time.NewTimer(mergeIntentLockPoll)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+			return fmt.Errorf("mergequeue: intent lock: %w", ctx.Err())
+		case <-t.C:
+		}
+	}
+}
+
 // rowQuerier is the QueryRow half shared by the pool and a transaction.
 type rowQuerier interface {
 	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
