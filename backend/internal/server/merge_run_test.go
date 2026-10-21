@@ -3602,12 +3602,12 @@ func TestMergeRun_EnqueueOnNewBaseDropsTheOldEntry(t *testing.T) {
 func TestMergeRun_IntentLockFailuresKeepTodaysRefusal(t *testing.T) {
 	for name, fs := range map[string]func(*mcqFixture) *mcqFaultStore{
 		"lock unavailable": func(f *mcqFixture) *mcqFaultStore {
-			return &mcqFaultStore{Store: f.store, intentLock: func(func() error) error { return errMCQStore }}
+			return &mcqFaultStore{Store: f.store, intentLock: func(context.Context, func(context.Context) error) error { return errMCQStore }}
 		},
 		"entry unreadable under the lock": func(f *mcqFixture) *mcqFaultStore {
 			var locked atomic.Bool
 			return &mcqFaultStore{Store: f.store,
-				intentLock: func(fn func() error) error { locked.Store(true); return fn() },
+				intentLock: func(ctx context.Context, fn func(context.Context) error) error { locked.Store(true); return fn(ctx) },
 				activeForRun: func(id uuid.UUID) (mergequeue.Status, bool, error) {
 					if locked.Load() {
 						return mergequeue.Status{}, false, errMCQStore
@@ -3634,17 +3634,95 @@ func TestMergeRun_IntentLockFailuresKeepTodaysRefusal(t *testing.T) {
 	}
 }
 
+// mqFailListAudit fails every merge_queue_entered READ (ListForRunByCategory)
+// and delegates everything else.
+type mqFailListAudit struct {
+	audit.Repository
+}
+
+func (a mqFailListAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == CategoryMergeQueueEntered {
+		return nil, errors.New("audit read unavailable")
+	}
+	return a.Repository.ListForRunByCategory(ctx, runID, category)
+}
+
+// TestMergeRun_AlreadyQueuedAuditReadFailureIs503: a repeat merge of a run
+// whose entry already carries the intent, when its merge_queue_entered row
+// cannot be read back, answers a retryable 503 merge_queue_write_failed,
+// never a 202 naming intent_sequence 0, and writes nothing (the committed
+// row count is still 1). Counterfactual: swallowing the read error answers
+// 202 already_queued with intent_sequence 0, RED.
+func TestMergeRun_AlreadyQueuedAuditReadFailureIs503(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("first merge = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	f.srv.cfg.AuditRepo = mqFailListAudit{Repository: f.audit}
+	w := f.mergeRun(r)
+	f.srv.bgMergeQueuePump.Wait()
+	body := w.Body.String()
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(body, "merge_queue_write_failed") ||
+		!strings.Contains(body, `"retryable":true`) || strings.Contains(body, `"queued":true`) {
+		t.Fatalf("repeat merge = %d %s, want a retryable 503 merge_queue_write_failed and no queued answer", w.Code, body)
+	}
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 1 {
+		t.Fatalf("merge_queue_entered rows = %d, want still 1 (nothing written)", n)
+	}
+}
+
+// TestMergeRun_IntentDecisionRunsOnLockDeadline: the request context carries
+// no deadline, but the decision's in-lock ActiveForRun (the first one
+// recorded after WithMergeIntentLock; earlier ones are routing reads before
+// the lock) runs on the lock's fn context, bounded by the intent fn deadline.
+// Counterfactual: passing r instead of r.WithContext(fctx) records no
+// deadline, RED.
+func TestMergeRun_IntentDecisionRunsOnLockDeadline(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	fs := &mcqFaultStore{Store: f.store}
+	f.srv.cfg.MergeQueue = fs
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	fs.mu.Lock()
+	var lockCall, decision *mcqCall
+	for i := range fs.calls {
+		c := &fs.calls[i]
+		switch {
+		case c.method == "WithMergeIntentLock" && lockCall == nil:
+			lockCall = c
+		case lockCall != nil && decision == nil && c.method == "ActiveForRun" && c.id == r.id:
+			decision = c
+		}
+	}
+	fs.mu.Unlock()
+	if lockCall == nil || decision == nil {
+		t.Fatalf("calls = %v, want WithMergeIntentLock followed by the in-lock ActiveForRun", fs.names())
+	}
+	if lockCall.hasDeadline {
+		t.Fatal("fixture: the request context already carries a deadline, so the pin cannot discriminate")
+	}
+	if !decision.hasDeadline {
+		t.Fatal("the in-lock ActiveForRun ran with no deadline: the decision does not run on the lock's fn context")
+	}
+}
+
 // TestMergeRun_LapsedIntentLockNeverAnswers202: when the merge-intent lock
 // lapsed while the decision ran (mergequeue.ErrIntentLockLapsed), a decision
 // that succeeded answers a retryable 503 instead of a 202 a concurrent merge
 // may contradict, and a decision that already wrote its own error keeps that
-// one answer (no second body). Counterfactuals: dropping the lapse 503 lets
-// the 202 through; treating a lapse like an untaken lock renders today's 409
-// over or instead of the decision's answer, RED.
+// one answer (no second body). The lapse 503 pumps the base first, so the
+// entry the decision created on the idle base is admitted with no further
+// queue event, and a re-invoke answers already_queued naming the SAME intent
+// row. Counterfactuals: dropping the lapse 503 lets the 202 through; treating
+// a lapse like an untaken lock renders today's 409 over or instead of the
+// decision's answer; dropping the lapse-path pump leaves the entry held, RED.
 func TestMergeRun_LapsedIntentLockNeverAnswers202(t *testing.T) {
 	lapse := func(f *mcqFixture) *mcqFaultStore {
-		return &mcqFaultStore{Store: f.store, intentLock: func(fn func() error) error {
-			_ = fn()
+		return &mcqFaultStore{Store: f.store, intentLock: func(ctx context.Context, fn func(context.Context) error) error {
+			_ = fn(ctx)
 			return fmt.Errorf("%w: session gone", mergequeue.ErrIntentLockLapsed)
 		}}
 	}
@@ -3657,6 +3735,22 @@ func TestMergeRun_LapsedIntentLockNeverAnswers202(t *testing.T) {
 		if w.Code != http.StatusServiceUnavailable || !strings.Contains(body, "merge_queue_write_failed") ||
 			!strings.Contains(body, "lock lapsed") || strings.Contains(body, `"queued":true`) {
 			t.Fatalf("merge = %d %s, want only a 503 merge_queue_write_failed naming the lapse", w.Code, body)
+		}
+		// The lapse path pumped the idle base: the new entry went live.
+		f.requireState(r, mergequeue.StateLive, "")
+		rows := f.rows(r, CategoryMergeQueueEntered)
+		if len(rows) != 1 || rows[0].Sequence == 0 {
+			t.Fatalf("merge_queue_entered rows = %d, want exactly 1", len(rows))
+		}
+		f.srv.cfg.MergeQueue = f.store
+		again := f.mergeRun(r)
+		f.srv.bgMergeQueuePump.Wait()
+		if again.Code != http.StatusAccepted {
+			t.Fatalf("re-invoke = %d, want 202:\n%s", again.Code, again.Body.String())
+		}
+		resp := decodeMergeRunResponse(t, again)
+		if !resp.AlreadyQueued || resp.IntentSequence != rows[0].Sequence {
+			t.Fatalf("re-invoke = %+v, want already_queued naming sequence %d", resp, rows[0].Sequence)
 		}
 	})
 	t.Run("decision wrote its own error", func(t *testing.T) {

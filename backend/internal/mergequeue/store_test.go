@@ -15,6 +15,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -1107,7 +1108,7 @@ func TestWithMergeIntentLock_SerializesOneRun(t *testing.T) {
 	held, release := make(chan struct{}), make(chan struct{})
 	aDone := make(chan error, 1)
 	go func() {
-		aDone <- f.store.WithMergeIntentLock(ctx, r, func() error {
+		aDone <- f.store.WithMergeIntentLock(ctx, r, func(context.Context) error {
 			if _, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h1", MergeIntent: true}); err != nil {
 				return err
 			}
@@ -1117,13 +1118,13 @@ func TestWithMergeIntentLock_SerializesOneRun(t *testing.T) {
 		})
 	}()
 	<-held
-	if err := f.store.WithMergeIntentLock(ctx, f.run(), func() error { return nil }); err != nil {
+	if err := f.store.WithMergeIntentLock(ctx, f.run(), func(context.Context) error { return nil }); err != nil {
 		t.Fatalf("another run's lock: %v", err)
 	}
 	var bRan atomic.Bool
 	bDone := make(chan error, 1)
 	go func() {
-		bDone <- f.store.WithMergeIntentLock(ctx, r, func() error {
+		bDone <- f.store.WithMergeIntentLock(ctx, r, func(context.Context) error {
 			bRan.Store(true)
 			return nil
 		})
@@ -1151,16 +1152,16 @@ func TestWithMergeIntentLock_ErrorsAndCancel(t *testing.T) {
 	f := newFixture(t)
 	r := f.run()
 	errFn := errors.New("fn failed")
-	if err := f.store.WithMergeIntentLock(context.Background(), r, func() error { return errFn }); !errors.Is(err, errFn) {
+	if err := f.store.WithMergeIntentLock(context.Background(), r, func(context.Context) error { return errFn }); !errors.Is(err, errFn) {
 		t.Fatalf("fn error = %v, want it returned", err)
 	}
-	if err := f.store.WithMergeIntentLock(context.Background(), uuid.Nil, func() error { return nil }); !errors.Is(err, ErrInvalidRequest) {
+	if err := f.store.WithMergeIntentLock(context.Background(), uuid.Nil, func(context.Context) error { return nil }); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("nil run id = %v, want ErrInvalidRequest", err)
 	}
 	held, release := make(chan struct{}), make(chan struct{})
 	aDone := make(chan error, 1)
 	go func() {
-		aDone <- f.store.WithMergeIntentLock(context.Background(), r, func() error {
+		aDone <- f.store.WithMergeIntentLock(context.Background(), r, func(context.Context) error {
 			close(held)
 			<-release
 			return nil
@@ -1170,7 +1171,7 @@ func TestWithMergeIntentLock_ErrorsAndCancel(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(100*time.Millisecond))
 	defer cancel()
 	ran := false
-	err := f.store.WithMergeIntentLock(ctx, r, func() error { ran = true; return nil })
+	err := f.store.WithMergeIntentLock(ctx, r, func(context.Context) error { ran = true; return nil })
 	close(release)
 	if !errors.Is(err, context.DeadlineExceeded) || ran {
 		t.Fatalf("waiter past its deadline = %v ran=%v, want DeadlineExceeded and fn not run", err, ran)
@@ -1180,45 +1181,107 @@ func TestWithMergeIntentLock_ErrorsAndCancel(t *testing.T) {
 	}
 	canceled, cancelNow := context.WithCancel(context.Background())
 	cancelNow()
-	if err := f.store.WithMergeIntentLock(canceled, r, func() error { ran = true; return nil }); !errors.Is(err, context.Canceled) || ran {
+	if err := f.store.WithMergeIntentLock(canceled, r, func(context.Context) error { ran = true; return nil }); !errors.Is(err, context.Canceled) || ran {
 		t.Fatalf("canceled context = %v ran=%v, want context.Canceled and fn not run", err, ran)
 	}
 }
 
-func TestIntentHolderLimit_HalfThePoolAtLeastOne(t *testing.T) {
+// TestWithMergeIntentLock_SharesThePoolBudget: the store's holder budget is
+// the pool-wide pglock budget every other pglock helper on the pool shares,
+// not a store-local one. Counterfactual: a store-local budget (today's
+// pre-#4591 intentHolders shape) is a different pointer, RED.
+func TestWithMergeIntentLock_SharesThePoolBudget(t *testing.T) {
 	f := newFixture(t)
-	for _, tc := range []struct {
-		maxConns int32
-		want     int
-	}{{10, 5}, {3, 1}, {2, 1}, {1, 1}} {
-		cfg := f.pool.Config()
-		cfg.MaxConns = tc.maxConns
-		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-		if err != nil {
-			t.Fatalf("pool: %v", err)
-		}
-		if got := intentHolderLimit(pool); got != tc.want {
-			t.Errorf("intentHolderLimit(MaxConns=%d) = %d, want %d", tc.maxConns, got, tc.want)
-		}
-		pool.Close()
+	if f.store.locks != pglock.BudgetFor(f.pool) {
+		t.Fatal("store.locks is not pglock.BudgetFor(pool): the intent lock does not share the pool-wide holder budget")
 	}
-	if got := intentHolderLimit(nil); got != 1 {
-		t.Errorf("intentHolderLimit(nil) = %d, want 1", got)
+	if NewPostgresStore(f.pool).locks != f.store.locks {
+		t.Fatal("two stores on one pool got different budgets")
 	}
 }
 
-// TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress: six merges
-// of six DISTINCT runs race on a 2-connection pool, and every fn needs a
+// TestWithMergeIntentLock_FnCarriesDeadline: a caller context with NO
+// deadline still hands fn one, no later than intentFnTimeout from now, and fn
+// runs marked as inside a pglock lock. Counterfactual: running fn on the
+// caller's context, or multiplying intentFnTimeout, fails the bound, RED.
+func TestWithMergeIntentLock_FnCarriesDeadline(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	before := time.Now()
+	var deadline time.Time
+	var ok, marked bool
+	if err := f.store.WithMergeIntentLock(context.Background(), r, func(fctx context.Context) error {
+		deadline, ok = fctx.Deadline()
+		marked = pglock.InLock(fctx)
+		return nil
+	}); err != nil {
+		t.Fatalf("WithMergeIntentLock: %v", err)
+	}
+	if !ok {
+		t.Fatal("fn's context carries no deadline under a deadline-free caller context")
+	}
+	// The literal, not intentFnTimeout: a bound derived from the constant
+	// would scale with it and could not catch a wrong value.
+	if limit := before.Add(30*time.Second + timescale.D(5*time.Second)); deadline.After(limit) {
+		t.Fatalf("fn deadline %s is later than now+30s (the intent fn deadline)+slack", deadline.Sub(before))
+	}
+	if !marked {
+		t.Fatal("fn's context is not marked as inside a pglock lock")
+	}
+}
+
+// TestWithMergeIntentLock_PanicReleasesLock: a panic in fn propagates, but
+// the lock is released first: a SEPARATE, non-pooled session (advisory locks
+// are re-entrant per session, so a pooled probe could reuse the leaked one)
+// takes it, and the next WithMergeIntentLock on the run runs fn.
+// Counterfactual: an unlock that is not deferred leaks the lock, RED.
+func TestWithMergeIntentLock_PanicReleasesLock(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("fn's panic did not propagate")
+			}
+		}()
+		_ = f.store.WithMergeIntentLock(context.Background(), r, func(context.Context) error { panic("fn panicked") })
+	}()
+	probe, err := pgx.Connect(context.Background(), f.pool.Config().ConnString())
+	if err != nil {
+		t.Fatalf("probe session: %v", err)
+	}
+	defer func() { _ = probe.Close(context.Background()) }()
+	var took bool
+	if err := probe.QueryRow(context.Background(), `SELECT pg_try_advisory_lock($1)`, intentLockKey(r)).Scan(&took); err != nil {
+		t.Fatalf("probe: %v", err)
+	}
+	if !took {
+		t.Fatal("a separate session cannot take the run's intent lock after fn panicked: the lock leaked")
+	}
+	if _, err := probe.Exec(context.Background(), `SELECT pg_advisory_unlock($1)`, intentLockKey(r)); err != nil {
+		t.Fatalf("probe unlock: %v", err)
+	}
+	next, cancel := context.WithTimeout(context.Background(), timescale.D(time.Second))
+	defer cancel()
+	ran := false
+	if err := f.store.WithMergeIntentLock(next, r, func(context.Context) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("next holder after the panic = %v ran=%v, want the lock free", err, ran)
+	}
+}
+
+// TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress: eight merges
+// of eight DISTINCT runs race on a 6-connection pool, and every fn needs a
 // second connection (a store read) while its lock is held. Each fn first
 // waits until as many holders as the pool has connections are inside (or a
-// short bound passes), so without the holder bound two holders take both
-// connections and every fn's read waits forever. With it at most one holder
-// is inside and all six finish. The context deadline only bounds a RED run.
-// Counterfactual: a holder limit equal to the pool size deadlocks, RED.
+// short bound passes), so without the holder bound six holders take every
+// connection and every fn's read waits forever. With it at most
+// pglock.HolderLimit = 2 holders are inside and all eight finish. The context
+// deadline only bounds a RED run. Counterfactual: a holder limit equal to the
+// pool size deadlocks, RED.
 func TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress(t *testing.T) {
 	f := newFixture(t)
 	cfg := f.pool.Config()
-	cfg.MaxConns = 2
+	cfg.MaxConns = 6
 	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
 	if err != nil {
 		t.Fatalf("pool: %v", err)
@@ -1227,7 +1290,7 @@ func TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress(t *testing.T)
 	store := NewPostgresStore(pool)
 	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(5*time.Second))
 	defer cancel()
-	const runs = 6
+	const runs = 8
 	var inside, maxInside atomic.Int32
 	var wg sync.WaitGroup
 	errs := make(chan error, runs)
@@ -1236,7 +1299,7 @@ func TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress(t *testing.T)
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			errs <- store.WithMergeIntentLock(ctx, r, func() error {
+			errs <- store.WithMergeIntentLock(ctx, r, func(context.Context) error {
 				n := inside.Add(1)
 				defer inside.Add(-1)
 				for {
@@ -1261,8 +1324,8 @@ func TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress(t *testing.T)
 			t.Fatalf("WithMergeIntentLock on a saturated pool = %v, want every distinct-run holder to finish", err)
 		}
 	}
-	if m := maxInside.Load(); m > 1 {
-		t.Fatalf("concurrent holders = %d, want at most intentHolderLimit = 1 on a 2-connection pool", m)
+	if m, limit := maxInside.Load(), pglock.HolderLimit(pool); int(m) > limit {
+		t.Fatalf("concurrent holders = %d, want at most pglock.HolderLimit = %d on a 6-connection pool", m, limit)
 	}
 }
 
@@ -1276,7 +1339,7 @@ func TestWithMergeIntentLock_LapsedSessionSurfaces(t *testing.T) {
 	r := f.run()
 	ctx := context.Background()
 	key := uint64(intentLockKey(r))
-	err := f.store.WithMergeIntentLock(ctx, r, func() error {
+	err := f.store.WithMergeIntentLock(ctx, r, func(context.Context) error {
 		var pid int32
 		if err := f.pool.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype = 'advisory'
   AND classid = $1::bigint::oid AND objid = $2::bigint::oid AND objsubid = 1 AND granted`,
@@ -1299,13 +1362,13 @@ func TestWithMergeIntentLock_LapsedSessionSurfaces(t *testing.T) {
 		}
 		return errors.New("the lock session never exited")
 	})
-	if !errors.Is(err, ErrIntentLockLapsed) {
-		t.Fatalf("WithMergeIntentLock after its session died = %v, want ErrIntentLockLapsed", err)
+	if !errors.Is(err, ErrIntentLockLapsed) || !errors.Is(err, pglock.ErrLockLapsed) {
+		t.Fatalf("WithMergeIntentLock after its session died = %v, want ErrIntentLockLapsed wrapping pglock.ErrLockLapsed", err)
 	}
 	next, cancel := context.WithTimeout(ctx, timescale.D(time.Second))
 	defer cancel()
 	ran := false
-	if err := f.store.WithMergeIntentLock(next, r, func() error { ran = true; return nil }); err != nil || !ran {
+	if err := f.store.WithMergeIntentLock(next, r, func(context.Context) error { ran = true; return nil }); err != nil || !ran {
 		t.Fatalf("next holder = %v ran=%v, want the lock free again", err, ran)
 	}
 }
@@ -1329,7 +1392,7 @@ func TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout(t *testing.T) {
 	r := f.run()
 	ctx := context.Background()
 	var probeTook bool
-	err = store.WithMergeIntentLock(ctx, r, func() error {
+	err = store.WithMergeIntentLock(ctx, r, func(context.Context) error {
 		time.Sleep(timescale.D(300 * time.Millisecond))
 		if err := f.pool.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, intentLockKey(r)).Scan(&probeTook); err != nil {
 			return err
