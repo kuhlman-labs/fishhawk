@@ -1,11 +1,14 @@
 package server
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -722,4 +725,152 @@ func (r *capturingProgressRepo) StageProgressByID(context.Context, uuid.UUID) (*
 
 func (r *capturingProgressRepo) StageProgressForRun(context.Context, uuid.UUID) (map[uuid.UUID]run.StageProgress, error) {
 	return nil, nil
+}
+
+// stageProgressPhaseGoldenBytes reads the SHARED cross-module golden
+// testdata/wire/stage_progress_phase.json (#4023) — the SAME bytes the runner's
+// upload test asserts its marshalled body JSON-equal to.
+func stageProgressPhaseGoldenBytes(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "stage_progress_phase.json"))
+	if err != nil {
+		t.Fatalf("read shared stage-progress phase golden: %v", err)
+	}
+	return bytes.TrimSpace(b)
+}
+
+// TestReportStageProgress_GatePhaseGoldenPersisted POSTs the runner-shaped
+// golden bytes through the REGISTERED mux (real DisallowUnknownFields decoder,
+// real validation, real pgtest store) and reads every phase field back from
+// the store — the backend half of the cross-module golden (#4023).
+func TestReportStageProgress_GatePhaseGoldenPersisted(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+
+	w := postProgressMux(t, s, runID, stageID, strings.NewReader(string(stageProgressPhaseGoldenBytes(t))))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("POST golden status = %d, want 204:\n%s", w.Code, w.Body.String())
+	}
+	got, err := repo.(run.StageProgressStore).StageProgressByID(ctx, stageID)
+	if err != nil || got == nil {
+		t.Fatalf("StageProgressByID = %+v, %v; want the recorded golden", got, err)
+	}
+	if got.LastEvent != "gate:verify" || got.TurnsThisAttempt != 9 || got.TokensThisAttempt != 13402 {
+		t.Errorf("legacy fields = %+v", *got)
+	}
+	if got.Phase != "gate" || !got.GateVerifying {
+		t.Errorf("phase = %q gate_verifying = %v, want gate/true", got.Phase, got.GateVerifying)
+	}
+	for name, pair := range map[string]struct {
+		got  *int
+		want int
+	}{
+		"phase_elapsed_seconds":  {got.PhaseElapsedSeconds, 312},
+		"gate_budget_seconds":    {got.GateBudgetSeconds, 5400},
+		"gate_remaining_seconds": {got.GateRemainingSeconds, 4980},
+	} {
+		if pair.got == nil || *pair.got != pair.want {
+			t.Errorf("%s = %v, want %d", name, pair.got, pair.want)
+		}
+	}
+}
+
+// assertPhaseFieldRejected seeds a VALID heartbeat, POSTs body (which differs
+// from the seed in last_event, so an accepted write is observable), and asserts
+// both the 400 validation_failed naming field AND the committed state: the
+// stored progress still reads back as the seed.
+func assertPhaseFieldRejected(t *testing.T, field string, body string) {
+	t.Helper()
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+
+	seed := postProgressMux(t, s, runID, stageID, progressBody(t, stageProgressReport{
+		LastEvent: "seed", TurnsThisAttempt: 1, TokensThisAttempt: 2,
+	}))
+	if seed.Code != http.StatusNoContent {
+		t.Fatalf("seed POST status = %d, want 204:\n%s", seed.Code, seed.Body.String())
+	}
+
+	w := postProgressMux(t, s, runID, stageID, strings.NewReader(body))
+	// Status and committed state are asserted INDEPENDENTLY (Errorf, not
+	// Fatalf), so a deleted control reports both.
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+
+	got, err := repo.(run.StageProgressStore).StageProgressByID(ctx, stageID)
+	if err != nil || got == nil {
+		t.Fatalf("StageProgressByID = %+v, %v; want the seeded heartbeat", got, err)
+	}
+	if got.LastEvent != "seed" || got.TurnsThisAttempt != 1 || got.TokensThisAttempt != 2 ||
+		got.Phase != "" || got.PhaseElapsedSeconds != nil || got.GateBudgetSeconds != nil ||
+		got.GateRemainingSeconds != nil || got.GateVerifying {
+		t.Errorf("stored progress changed despite a rejected %s: %+v", field, *got)
+	}
+
+	if w.Code == http.StatusBadRequest {
+		details := progressErrorCode(t, w, "validation_failed")
+		if details["field"] != field {
+			t.Errorf("details.field = %v, want %q (body %s)", details["field"], field, w.Body.String())
+		}
+	}
+}
+
+// TestReportStageProgress_InvalidPhaseRejected pins the phase enum (#4023): a
+// phase other than "", "agent" or "gate" is 400 naming phase, and nothing is
+// written.
+func TestReportStageProgress_InvalidPhaseRejected(t *testing.T) {
+	assertPhaseFieldRejected(t, "phase",
+		`{"last_event":"bad","turns_this_attempt":3,"tokens_this_attempt":4,"phase":"verify"}`)
+}
+
+// TestReportStageProgress_NegativePhaseElapsedRejected pins the non-negative
+// phase_elapsed_seconds check.
+func TestReportStageProgress_NegativePhaseElapsedRejected(t *testing.T) {
+	assertPhaseFieldRejected(t, "phase_elapsed_seconds",
+		`{"last_event":"bad","turns_this_attempt":3,"tokens_this_attempt":4,"phase":"agent","phase_elapsed_seconds":-1}`)
+}
+
+// TestReportStageProgress_NegativeGateBudgetRejected pins the non-negative
+// gate_budget_seconds check.
+func TestReportStageProgress_NegativeGateBudgetRejected(t *testing.T) {
+	assertPhaseFieldRejected(t, "gate_budget_seconds",
+		`{"last_event":"bad","turns_this_attempt":3,"tokens_this_attempt":4,"phase":"gate","gate_budget_seconds":-5}`)
+}
+
+// TestReportStageProgress_NegativeGateRemainingRejected pins the non-negative
+// gate_remaining_seconds check.
+func TestReportStageProgress_NegativeGateRemainingRejected(t *testing.T) {
+	assertPhaseFieldRejected(t, "gate_remaining_seconds",
+		`{"last_event":"bad","turns_this_attempt":3,"tokens_this_attempt":4,"phase":"gate","gate_budget_seconds":5400,"gate_remaining_seconds":-1}`)
+}
+
+// TestReportStageProgress_AgentPhaseAccepted pins the "agent" arm of the
+// phase enum and the zero-valued pointer: phase_elapsed_seconds 0 is a valid,
+// PRESENT value (not absent) and round-trips as such.
+func TestReportStageProgress_AgentPhaseAccepted(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, stageID := seedRunningStage(t, repo)
+
+	w := postProgressMux(t, s, runID, stageID, strings.NewReader(
+		`{"last_event":"agent_start","turns_this_attempt":0,"tokens_this_attempt":0,"phase":"agent","phase_elapsed_seconds":0}`))
+	if w.Code != http.StatusNoContent {
+		t.Fatalf("status = %d, want 204:\n%s", w.Code, w.Body.String())
+	}
+	got, err := repo.(run.StageProgressStore).StageProgressByID(ctx, stageID)
+	if err != nil || got == nil {
+		t.Fatalf("StageProgressByID = %+v, %v", got, err)
+	}
+	if got.Phase != "agent" || got.PhaseElapsedSeconds == nil || *got.PhaseElapsedSeconds != 0 {
+		t.Errorf("progress = %+v, want phase agent with phase_elapsed_seconds 0 present", *got)
+	}
+	if got.GateBudgetSeconds != nil || got.GateRemainingSeconds != nil || got.GateVerifying {
+		t.Errorf("unsent gate fields materialised: %+v", *got)
+	}
 }

@@ -1819,6 +1819,84 @@ func TestReportStageProgress_RejectsMissingInputs(t *testing.T) {
 	}
 }
 
+// progressBodyCapture spins a progress ingest stub that records the raw POST
+// body and answers 204.
+func progressBodyCapture(t *testing.T) (*Client, *string) {
+	t.Helper()
+	var body string
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/stages/{stage_id}/progress", func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		body = string(b)
+		w.WriteHeader(http.StatusNoContent)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &Client{BaseURL: srv.URL, HTTP: srv.Client()}, &body
+}
+
+// stageProgressPhaseGolden reads the SHARED cross-module golden
+// testdata/wire/stage_progress_phase.json (#4023) — the SAME bytes the
+// backend's ingest test POSTs through the real handler.
+func stageProgressPhaseGolden(t *testing.T) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "stage_progress_phase.json"))
+	if err != nil {
+		t.Fatalf("read shared stage-progress phase golden: %v", err)
+	}
+	return bytes.TrimSpace(b)
+}
+
+// TestReportStageProgress_PhaseFieldsMatchSharedGolden pins the runner's
+// marshalled gate-phase heartbeat JSON-equal to the shared golden, so a tag
+// drift on the emitter side fails here (the backend's twin test POSTs the same
+// bytes through the real ingest handler).
+func TestReportStageProgress_PhaseFieldsMatchSharedGolden(t *testing.T) {
+	c, body := progressBodyCapture(t)
+	intp := func(v int) *int { return &v }
+	err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{
+		RunID: "run-abc", StageID: "stage-xyz", MCPToken: "fhm_x",
+		LastEvent: "gate:verify", TurnsThisAttempt: 9, TokensThisAttempt: 13402,
+		Phase: "gate", PhaseElapsedSeconds: intp(312), GateBudgetSeconds: intp(5400),
+		GateRemainingSeconds: intp(4980), GateVerifying: true,
+	})
+	if err != nil {
+		t.Fatalf("ReportStageProgress: %v", err)
+	}
+	var got, want map[string]any
+	if err := json.Unmarshal([]byte(*body), &got); err != nil {
+		t.Fatalf("decode sent body %q: %v", *body, err)
+	}
+	if err := json.Unmarshal(stageProgressPhaseGolden(t), &want); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Errorf("sent body not JSON-equal to testdata/wire/stage_progress_phase.json:\n got  %s\n want %s", *body, stageProgressPhaseGolden(t))
+	}
+}
+
+// TestReportStageProgress_LegacyArgsOmitPhaseKeys pins the additive shape: a
+// caller setting none of the #4023 phase args sends NONE of the five keys, so
+// an old backend's DisallowUnknownFields decoder still accepts the heartbeat.
+func TestReportStageProgress_LegacyArgsOmitPhaseKeys(t *testing.T) {
+	c, body := progressBodyCapture(t)
+	err := c.ReportStageProgress(context.Background(), ReportStageProgressArgs{
+		RunID: "run-abc", StageID: "stage-xyz", MCPToken: "fhm_x",
+		LastEvent: "assistant", TurnsThisAttempt: 9, TokensThisAttempt: 13402,
+	})
+	if err != nil {
+		t.Fatalf("ReportStageProgress: %v", err)
+	}
+	if want := `{"last_event":"assistant","turns_this_attempt":9,"tokens_this_attempt":13402}`; *body != want {
+		t.Errorf("legacy body = %s, want byte-identical pre-#4023 %s", *body, want)
+	}
+	for _, key := range []string{"phase", "phase_elapsed_seconds", "gate_budget_seconds", "gate_remaining_seconds", "gate_verifying"} {
+		if strings.Contains(*body, `"`+key+`"`) {
+			t.Errorf("legacy body carries %q: %s", key, *body)
+		}
+	}
+}
+
 // runLineageServer spins a httptest server whose GET /v0/runs/{run_id}
 // returns body for any run id, and returns a Client pointed at it.
 func runLineageServer(t *testing.T, status int, body string) *Client {

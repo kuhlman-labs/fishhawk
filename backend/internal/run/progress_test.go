@@ -225,3 +225,70 @@ func TestRecordStageProgress_ReportedAtIsDatabaseStamped(t *testing.T) {
 		t.Errorf("stored ReportedAt = %v is %v from the database's own now() = %v (want within %v) — it is not the database's instant", got.ReportedAt, d, dbNow.UTC(), window)
 	}
 }
+
+// TestPostgres_RecordStageProgress_PhaseFieldsRoundTrip pins the #4023 phase
+// fields through the real JSONB column: a gate-phase heartbeat reads back every
+// field (a zero-valued pointer included, as PRESENT), and a phase-less heartbeat
+// stores NONE of the five keys, so a pre-#4023 row and a phase-less write stay
+// byte-identical in shape.
+func TestPostgres_RecordStageProgress_PhaseFieldsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	repo := run.NewPostgresRepository(pool)
+	store := progressStore(t, repo)
+
+	r := makeRun(t, repo)
+	gate := makeStage(t, repo, r.ID, 0)
+	legacy := makeStage(t, repo, r.ID, 1)
+
+	intp := func(v int) *int { return &v }
+	if _, err := store.RecordStageProgress(ctx, gate.ID, run.StageProgress{
+		LastEvent: "gate:verify", TurnsThisAttempt: 9, TokensThisAttempt: 13402,
+		Phase: "gate", PhaseElapsedSeconds: intp(312), GateBudgetSeconds: intp(5400),
+		GateRemainingSeconds: intp(0), GateVerifying: true,
+	}); err != nil {
+		t.Fatalf("RecordStageProgress (gate): %v", err)
+	}
+	got, err := store.StageProgressByID(ctx, gate.ID)
+	if err != nil || got == nil {
+		t.Fatalf("StageProgressByID (gate) = %+v, %v", got, err)
+	}
+	if got.Phase != "gate" || !got.GateVerifying {
+		t.Errorf("phase = %q gate_verifying = %v, want gate/true", got.Phase, got.GateVerifying)
+	}
+	if got.PhaseElapsedSeconds == nil || *got.PhaseElapsedSeconds != 312 ||
+		got.GateBudgetSeconds == nil || *got.GateBudgetSeconds != 5400 ||
+		got.GateRemainingSeconds == nil || *got.GateRemainingSeconds != 0 {
+		t.Errorf("phase seconds round-trip mismatch: %+v", *got)
+	}
+
+	if _, err := store.RecordStageProgress(ctx, legacy.ID, run.StageProgress{
+		LastEvent: "assistant", TurnsThisAttempt: 1, TokensThisAttempt: 2,
+	}); err != nil {
+		t.Fatalf("RecordStageProgress (legacy): %v", err)
+	}
+	var keys []string
+	if err := pool.QueryRow(ctx,
+		`SELECT array_agg(k ORDER BY k) FROM stages, jsonb_object_keys(progress) AS k WHERE id = $1`,
+		legacy.ID).Scan(&keys); err != nil {
+		t.Fatalf("read stored keys: %v", err)
+	}
+	want := []string{"last_event", "reported_at", "tokens_this_attempt", "turns_this_attempt"}
+	if len(keys) != len(want) {
+		t.Fatalf("phase-less row stored keys %v, want exactly %v", keys, want)
+	}
+	for i := range want {
+		if keys[i] != want[i] {
+			t.Errorf("phase-less row stored keys %v, want exactly %v", keys, want)
+			break
+		}
+	}
+	lg, err := store.StageProgressByID(ctx, legacy.ID)
+	if err != nil || lg == nil {
+		t.Fatalf("StageProgressByID (legacy) = %+v, %v", lg, err)
+	}
+	if lg.Phase != "" || lg.PhaseElapsedSeconds != nil || lg.GateBudgetSeconds != nil ||
+		lg.GateRemainingSeconds != nil || lg.GateVerifying {
+		t.Errorf("phase-less row decoded phase fields: %+v", *lg)
+	}
+}
