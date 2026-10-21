@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
@@ -866,19 +867,30 @@ func TestFileRefinementSession_InFlightOtherRepo409(t *testing.T) {
 // ---- binding condition: concurrent filing serializes across processes -----
 
 // TestFileRefinementSession_ConcurrentFilesOnce: two SERVERS (two replicas,
-// each with its own in-process tracker) file the same approved draft
-// concurrently; the per-draft advisory lock guarantees exactly ONE epic + N
-// children are provider-created, zero duplicate records and one completion
-// audit.
+// each with its own in-process tracker AND its own connection pool) file the
+// same approved draft concurrently; the per-draft advisory lock guarantees
+// exactly ONE epic + N children are provider-created, zero duplicate records
+// and one completion audit.
 //
-// The overlap is FORCED deterministically: the winner's detached filing is
-// pinned inside the critical section by a provider-side gate on its first
-// CreateIssue (barrier 1), the loser's filing is then launched and its arrival
-// confirmed by a real non-granted advisory-lock waiter in pg_locks (barrier
-// 2), and only THEN is the winner released.
+// The overlap is FORCED and PROVEN: the winner's detached filing is pinned
+// inside the critical section (holding the filing lock) by a provider-side
+// gate on its first CreateIssue (barrier 1); the loser's filing is then
+// launched, and barrier 2 waits until the loser's pool has COMPLETED at least
+// two pg_try_advisory_lock queries. WithFilingLock re-tries only a refused
+// lock (#4591's try-lock poll), so a second try proves the loser reached the
+// lock, was refused while the winner held it, and is polling — both callers
+// are inside the lock-acquire window and neither can finish. Only THEN is the
+// winner released. Counterfactual (observed): with the filing exclusion
+// disabled the loser completes no try-lock (barrier 2 fails) and, once the
+// gate opens, files a duplicate epic (8 creates, a 23505 on the ledger), RED.
+// The gate's sync.Once parks a concurrent CreateIssue until it opens, so the
+// pinned-window create check below is a backstop, not the discriminator.
 func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
-	pool := pgtest.NewPool(t)
+	dbURL := pgtest.NewURL(t)
+	pool := newFilingTestPool(t, dbURL, nil)
+	loserTries := &filingTryLockTracer{}
 	repo := refinement.NewPostgresRepository(pool)
+	loserRepo := refinement.NewPostgresRepository(newFilingTestPool(t, dbURL, loserTries))
 	api := newFakeGHAPI()
 	api.createGateEntered = make(chan struct{})
 	api.createGateRelease = make(chan struct{})
@@ -888,7 +900,7 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	auditRepo := audit.NewPostgresRepository(pool)
 	gh := newRefinementGHClient(t, api, 42)
 	winner := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
-	loser := New(Config{RefinementRepo: repo, AuditRepo: auditRepo, GitHub: gh})
+	loser := New(Config{RefinementRepo: loserRepo, AuditRepo: auditRepo, GitHub: gh})
 	releaseOnCleanup(t, api, winner)
 	t.Cleanup(loser.waitRefinementFiling)
 
@@ -900,7 +912,20 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	}
 
 	postFileLaunched(t, loser, sessionID, "o/r")
-	waitForAdvisoryLockWaiter(t, pool)
+	// Barrier 2: the loser is refused at least once, or (exclusion broken) it
+	// files inside the winner's critical section; whichever comes first.
+	deadline := time.Now().Add(timescale.D(10 * time.Second))
+	for loserTries.tries.Load() < 2 && api.creates() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	// The winner's pinned call has not counted yet, so any create here is the
+	// loser filing while the winner holds the lock.
+	if got := api.creates(); got != 0 {
+		t.Errorf("CreateIssue calls while the winner held the filing lock = %d, want 0 (the loser filed inside the critical section)", got)
+	}
+	if got := loserTries.tries.Load(); got < 2 {
+		t.Errorf("loser completed %d pg_try_advisory_lock queries while the winner held the lock, want >= 2 (refused, then polling): the loser never contended", got)
+	}
 	api.release()
 
 	waitFilingBounded(t, winner)
@@ -927,26 +952,42 @@ func TestFileRefinementSession_ConcurrentFilesOnce(t *testing.T) {
 	}
 }
 
-// waitForAdvisoryLockWaiter blocks until a session is waiting on (blocked
-// acquiring) a Postgres advisory lock — the signal that the loser has reached
-// WithFilingLock and is contending for the per-draft lock the winner holds.
-func waitForAdvisoryLockWaiter(t *testing.T, pool *pgxpool.Pool) {
+// newFilingTestPool opens a 10-connection pool (the production size) on
+// dbURL, with tracer when non-nil, closed at test end.
+func newFilingTestPool(t *testing.T, dbURL string, tracer pgx.QueryTracer) *pgxpool.Pool {
 	t.Helper()
-	deadline := time.Now().Add(timescale.D(10 * time.Second))
-	for {
-		var waiters int
-		if err := pool.QueryRow(context.Background(),
-			`SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted`,
-		).Scan(&waiters); err != nil {
-			t.Fatalf("poll pg_locks for advisory waiter: %v", err)
-		}
-		if waiters > 0 {
-			return
-		}
-		if time.Now().After(deadline) {
-			t.Fatal("loser never blocked on the per-draft advisory lock")
-		}
-		time.Sleep(5 * time.Millisecond)
+	cfg, err := pgxpool.ParseConfig(dbURL)
+	if err != nil {
+		t.Fatalf("parse pool config: %v", err)
+	}
+	cfg.MaxConns = 10
+	if tracer != nil {
+		cfg.ConnConfig.Tracer = tracer
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("open pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	return pool
+}
+
+// filingTryLockTracer counts COMPLETED pg_try_advisory_lock queries on its
+// pool (TraceQueryEnd fires once the row is scanned).
+type filingTryLockTracer struct{ tries atomic.Int32 }
+
+type filingTryLockQueryKey struct{}
+
+func (f *filingTryLockTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	if strings.Contains(d.SQL, "pg_try_advisory_lock") {
+		return context.WithValue(ctx, filingTryLockQueryKey{}, true)
+	}
+	return ctx
+}
+
+func (f *filingTryLockTracer) TraceQueryEnd(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryEndData) {
+	if ctx.Value(filingTryLockQueryKey{}) != nil && d.Err == nil {
+		f.tries.Add(1)
 	}
 }
 

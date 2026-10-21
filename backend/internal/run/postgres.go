@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	rundb "github.com/kuhlman-labs/fishhawk/backend/internal/run/db"
 )
 
@@ -69,6 +70,10 @@ type pgxQueries interface {
 // from observing the same prior state.
 type postgresRepo struct {
 	pool *pgxpool.Pool
+
+	// locks is the pool-wide pglock holder budget WithConsolidatedPROpenLock
+	// shares with every other pglock helper on the pool (#4591).
+	locks *pglock.Budget
 
 	// stageTerminalObserver / runTerminalObserver are the post-commit
 	// terminal hooks (#4127); nil when none is installed.
@@ -127,7 +132,7 @@ func (r *postgresRepo) notifyRunTerminal(ctx context.Context, run *Run) {
 // NewPostgresRepository wraps a pgxpool.Pool to satisfy Repository.
 // Caller retains ownership of the pool and is responsible for Close.
 func NewPostgresRepository(pool *pgxpool.Pool) Repository {
-	return &postgresRepo{pool: pool}
+	return &postgresRepo{pool: pool, locks: pglock.BudgetFor(pool)}
 }
 
 // --- Run methods ---
@@ -1509,46 +1514,35 @@ func consolidatedPROpenLockKey(runID uuid.UUID) int64 {
 	return int64(binary.BigEndian.Uint64(sum[:8])) //nolint:gosec // deliberate wrap: advisory-lock keys are opaque int64s
 }
 
-// WithConsolidatedPROpenLock implements ConsolidatedPROpenLocker (#4110): it
-// takes a SESSION-level advisory lock keyed on consolidatedPROpenLockKey on a
-// dedicated pooled connection, runs fn, then unlocks and releases the
-// connection (the refinement WithFilingLock precedent). Session-level rather
-// than xact-level so fn's own repository writes commit independently on other
-// pool connections while the lock is held.
+// consolidatedPROpenFnTimeout bounds WithConsolidatedPROpenLock's fn: one
+// forge create plus the artifact insert, URL stamp and audit append (#4591).
+const consolidatedPROpenFnTimeout = 5 * time.Minute
+
+// WithConsolidatedPROpenLock implements ConsolidatedPROpenLocker (#4110): a
+// SESSION-level advisory lock keyed on consolidatedPROpenLockKey, run through
+// pglock.WithSessionLock on the pool-wide pglock holder budget (#4591).
+// Session-level rather than xact-level so fn's own repository writes commit
+// independently on other pool connections while the lock is held.
+//
+// The lock is TRIED, and a held lock re-tries every pglock.Poll holding
+// neither a budget slot nor a connection; the wait ends only with ctx, and a
+// failed acquisition returns an error naming the lock with fn never run. fn
+// runs on a context bounded by consolidatedPROpenFnTimeout (even under a
+// deadline-free caller ctx) and marked as inside a pglock lock, so fn must not
+// take another one (pglock.ErrNestedLock). A panic in fn still unlocks. A
+// lock-holding session never returns to the pool in doubt: a failed lock
+// query or unlock closes the connection. When the unlock fails or finds no
+// lock after fn returned nil, the call returns an error wrapping
+// pglock.ErrLockLapsed (the exclusion may have lapsed); the caller's next
+// Advance retries and its in-lock re-read finds a stamped URL.
 //
 // LOCK ORDER: the orchestrator takes its in-process per-parent mutex FIRST and
 // this advisory lock SECOND; every caller must keep that order. Residual: a
 // goroutine waiting on that sync.Mutex cannot observe ctx cancellation (the
-// accepted #1936 posture); the wait here can, because pgx cancels the
-// pg_advisory_lock query when ctx ends.
-//
-// A session lock outlives a failed statement, so the connection is never
-// returned to the pool in doubt: when the lock query errors (ctx cancelled
-// while waiting, or a database error) the underlying connection is CLOSED
-// before Release, so a lock the server granted concurrently with the
-// client-side cancel dies with the session; and when the unlock errors the
-// connection is closed the same way. fn never runs unless the lock was
-// acquired.
+// accepted #1936 posture); the wait here can.
 func (r *postgresRepo) WithConsolidatedPROpenLock(ctx context.Context, parentRunID uuid.UUID, fn func(context.Context) error) error {
-	conn, err := r.pool.Acquire(ctx)
-	if err != nil {
-		return fmt.Errorf("acquire connection for consolidated PR open lock: %w", err)
-	}
-	defer conn.Release()
-	key := consolidatedPROpenLockKey(parentRunID)
-	if _, err := conn.Exec(ctx, "SELECT pg_advisory_lock($1)", key); err != nil {
-		_ = conn.Conn().Close(context.Background())
-		return fmt.Errorf("acquire consolidated PR open lock: %w", err)
-	}
-	// Unlock on a background context so a cancelled ctx still unlocks. It runs
-	// before conn.Release() (defer LIFO); an unlock failure closes the
-	// connection so a lock-holding session is never returned to the pool.
-	defer func() {
-		if _, uerr := conn.Exec(context.Background(), "SELECT pg_advisory_unlock($1)", key); uerr != nil {
-			_ = conn.Conn().Close(context.Background())
-		}
-	}()
-	return fn(ctx)
+	return pglock.WithSessionLock(ctx, r.pool, r.locks, consolidatedPROpenLockKey(parentRunID),
+		pglock.Options{Name: "consolidated PR open lock", FnTimeout: consolidatedPROpenFnTimeout}, fn)
 }
 
 // Compile-time check that postgresRepo implements Repository.
