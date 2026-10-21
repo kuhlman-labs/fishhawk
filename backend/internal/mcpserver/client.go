@@ -891,6 +891,37 @@ type GateView struct {
 	// backend. The json tags MUST byte-match the backend;
 	// TestMergeCandidateStaleness_WireShape pins them against a REAL server.
 	MergeCandidateStaleness *runMergeCandidateStaleness `json:"merge_candidate_staleness,omitempty" jsonschema:"read-time observation for an open decomposed parent's consolidated PR: fresh, stale (the base advanced past the head; next_step fishhawk_rebase_run_branch) or undetermined (reason names the failed forge read; never reported fresh). Absent when the run is not an open decomposed parent with a PR, or with a merge_candidate_staleness history_gaps entry when the read failed"`
+	// ScopeOverlap mirrors the backend's gate-view scope_overlap block (E83.60
+	// / #4118): the LIVE cross-run scope overlap, passed through verbatim.
+	// Omitted (nil) for a run-bound caller, when the backend's compute failed,
+	// or against an older backend.
+	ScopeOverlap *scopeOverlap `json:"scope_overlap,omitempty" jsonschema:"live cross-run scope overlap (#4118): every OTHER non-terminal run in the same repo and tenant whose effective scope shares files with this run, outside its own decomposition/recovery lineage. Advisory, never blocks. Absent for a run-bound caller, when the read failed, or against an older backend"`
+}
+
+// scopeOverlap mirrors the backend's scopeOverlapPayload
+// (backend/internal/server/scope_overlap.go, E83.60 / #4118): the body of GET
+// /v0/runs/{run_id}/scope-overlap and the gate view's scope_overlap block.
+// UNEXPORTED, like gateViewFanInConflict, so the package's export baseline is
+// unchanged. The json tags MUST byte-match the backend;
+// TestE2E_ScopeOverlap_ShipToMCPSurfaces pins them against a REAL server.
+type scopeOverlap struct {
+	RunID             string            `json:"run_id" jsonschema:"the run whose effective scope was intersected"`
+	SelfScopeResolved bool              `json:"self_scope_resolved" jsonschema:"false when this run's own effective scope did not resolve (no plan yet, or a read failed); no other run is listed then"`
+	Overlaps          []scopeOverlapRun `json:"overlaps" jsonschema:"one entry per other live run sharing files; always an array"`
+	ScannedRuns       int               `json:"scanned_runs" jsonschema:"candidate runs examined after the lineage and tenant exclusions"`
+	UnscopedRuns      int               `json:"unscoped_runs" jsonschema:"scanned runs whose effective scope did not resolve (no plan yet, or a read failed); they may overlap unseen"`
+	Truncated         bool              `json:"truncated" jsonschema:"true when a per-state run listing hit its page cap, so some live run may have gone unscanned"`
+}
+
+// scopeOverlapRun mirrors the backend's scopeOverlapRun: one other live run
+// sharing files with the subject run. The json tags MUST byte-match the backend.
+type scopeOverlapRun struct {
+	RunID          string   `json:"run_id" jsonschema:"the overlapping run"`
+	IssueRef       string   `json:"issue_ref,omitempty" jsonschema:"the overlapping run's trigger ref; a decomposition child carries its parent's issue"`
+	DecomposedFrom string   `json:"decomposed_from,omitempty" jsonschema:"the decomposed parent run id when the overlapping run is a decomposition slice"`
+	Stage          string   `json:"stage,omitempty" jsonschema:"the overlapping run's current stage: the lowest-sequence non-terminal stage, else its last"`
+	StageState     string   `json:"stage_state,omitempty" jsonschema:"that stage's state"`
+	Paths          []string `json:"paths" jsonschema:"the shared exact paths, sorted"`
 }
 
 // gateViewFanInConflict mirrors the backend's gateViewFanInConflict
@@ -1283,6 +1314,19 @@ func (c *apiClient) GetGateView(ctx context.Context, runID uuid.UUID, stageKind 
 		return nil, err
 	}
 	return &gv, nil
+}
+
+// GetScopeOverlap calls GET /v0/runs/{run_id}/scope-overlap (E83.60 / #4118):
+// the LIVE cross-run scope overlap of the run's effective scope with every
+// other non-terminal run in its repo and tenant. The backend requires
+// read:audit and refuses a run-bound token 403 run_token_forbidden; every MCP
+// caller treats any error as "no block" (fail-open).
+func (c *apiClient) GetScopeOverlap(ctx context.Context, runID uuid.UUID) (*scopeOverlap, error) {
+	var out scopeOverlap
+	if err := c.do(ctx, http.MethodGet, "/v0/runs/"+runID.String()+"/scope-overlap", nil, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // BudgetStatus mirrors the backend's GET /v0/runs/{run_id}/budget body

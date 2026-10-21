@@ -829,3 +829,13 @@ func TestKnownCategories_ScopeAmendmentLapsed(t *testing.T) {
 		t.Fatal("scope_amendment_lapsed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_PlanScopeOverlap pins the E83.60 / #4118 registration:
+// handleShipPlan appends plan_scope_overlap when a settling plan shares paths
+// with another in-flight run (server/scope_overlap.go), and a
+// fishhawk_await_audit wait armed on it must not be refused as unknown.
+func TestKnownCategories_PlanScopeOverlap(t *testing.T) {
+	if !IsKnownCategory("plan_scope_overlap") {
+		t.Fatal("plan_scope_overlap is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
