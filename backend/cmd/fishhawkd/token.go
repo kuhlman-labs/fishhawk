@@ -119,6 +119,10 @@ func runTokenIssue(args []string, logSink io.Writer) int {
 	defer pool.Close()
 
 	repo := apitoken.NewPostgresRepository(pool)
+	// Untenanted by design (#4506): this is the operator bootstrap
+	// credential, and its holder already has database access. A tenanted
+	// token is minted through POST /v0/tokens, which inherits the caller's
+	// account.
 	tok, err := repo.Issue(context.Background(), *subject, scopes)
 	if err != nil {
 		_, _ = fmt.Fprintf(logSink, "fishhawkd token issue: %v\n", err)
