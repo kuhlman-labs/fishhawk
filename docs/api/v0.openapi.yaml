@@ -15183,10 +15183,17 @@ paths:
         deduped, so a re-POST writes no second row. A failed record is `503
         overlap_override_unrecorded` with nothing merged or enqueued. The row
         names other runs, so it is withheld from run-bound subjects, like
-        `plan_scope_overlap`. Residuals: the delegated `may_merge` arm of the
-        auto-driver is not guarded, and the guard reads the state at POST
-        time (a push or dispatch between the read and the forge merge is not
-        caught).
+        `plan_scope_overlap`. The `409` refusal names other runs (their ids,
+        stages, issue refs and paths) ONLY to a caller that may read
+        cross-run overlap (#4582): not a run-bound subject, and a cookie
+        session or a token holding `read:audit` — the posture of `GET
+        /v0/runs/{run_id}/scope-overlap`. A `write:approvals`-only token gets
+        counts instead (see the `409` response). The delegated `may_merge`
+        arm of the auto-driver runs the SAME guard (#4582, see `POST
+        /v0/runs/{run_id}/auto-drive`) with no override. Residuals: ADR-093
+        slice 2's merge-on-pass (#4296) does not run it yet, and the guard
+        reads the state at POST time (a push or dispatch between the read and
+        the forge merge is not caught).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -15469,9 +15476,17 @@ paths:
             `reason` on `overlap_undetermined` and, on
             `overlapping_implement_in_flight`, `next_step:
             "fishhawk_await_stage"` with `blocking_run_id` and `stage_id` (the
-            first blocker, sorted by `issue_ref` then `run_id`). Wait for the
-            stage to settle and re-invoke, or re-POST with `allow_overlap` and
-            an `overlap_reason`.
+            first blocker, sorted by `issue_ref` then `run_id`). Those
+            cross-run keys (`blocking[]`, `undetermined[]`, `blocking_run_id`,
+            `stage_id`) and the run/stage named in the message render ONLY
+            when the caller holds `read:audit` (or is a cookie session; never
+            a run-bound subject, #4582). Otherwise `details` carry `{run_id,
+            pr_url, blocking_count, undetermined_count, head_sha,
+            details_withheld: true, required_scope: "read:audit"}` plus
+            `reason` (`overlap_undetermined`) or `next_step`
+            (`overlapping_implement_in_flight`), and the message names no
+            other run. Wait for the stage to settle and re-invoke, or re-POST
+            with `allow_overlap` and an `overlap_reason`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -16383,6 +16398,20 @@ paths:
         `acted:true`. Neither declined pass appends a `run_auto_driven`
         attribution row.
 
+        The `may_merge` arm runs the merge overlap guard (#4119) after the
+        first-officer hold and before the merge-candidate gate (#4582): a
+        refusal parks `decision_state: overlapping_implement_in_flight` or
+        `overlap_undetermined` with `action: merge`, nothing merged and no
+        `run_auto_driven` row; a chained `delegated_merge_overlap_refused`
+        audit row (counts, code, reason and head only — never another run's
+        ids or paths) records each distinct decision. The note names other
+        runs only when the caller holds `read:audit`. The guard's `502`
+        `overlap_check_failed` read failure is observe-only (fail-closed).
+        There is no delegated override: `allow_overlap` is operator-only
+        (`POST /v0/runs/{run_id}/merge`). A deployment that cannot read the
+        run's changed paths (every GitLab run) therefore parks the delegated
+        merge whenever another same-repo implement is live.
+
         **Authorization.** Requires `write:approvals` — the strictest action
         the gate can dispatch (approve); operator and operator-agent tokens
         already carry it.
@@ -16412,7 +16441,7 @@ paths:
                   paged: { type: boolean, description: 'True when a must_page_human condition was refused.' }
                   page_event: { type: string, description: 'The page event name, set when paged.' }
                   decision_required: { type: boolean, description: 'True when the actor could not auto-act on a well-defined, expected gate state and hands it to the operator (distinct from observe-only, which keeps polling). #2091.' }
-                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381).' }
+                  decision_state: { type: string, description: 'The decision state naming the operator hand-off, set when decision_required. One of: fixup_budget_exhausted, fixup_ceiling_reached (#2091), fixup_concerns_overflow (#4284); human_quorum_required (a delegated approve could never advance the gate — an approvals block, or a firing/unevaluable escalation, or an unreadable block), delegated_approval_no_progress (a delegated approve came back a duplicate) (#2381); overlapping_implement_in_flight, overlap_undetermined (the may_merge arm was refused by the merge overlap guard) (#4582).' }
                   reported: { type: boolean, description: 'True when a workflow-v2 `mode: report` class surfaced a proposal at a live gate (#2222): a run_auto_driven act:report row was appended (at most once per gate occurrence), `action` names the verb the class governs, and nothing was dispatched or paged. The driver keeps polling.' }
                   note: { type: string, description: 'Short human-readable summary of the outcome.' }
         '401': { $ref: '#/components/responses/Unauthorized' }

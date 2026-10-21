@@ -29,6 +29,20 @@ import (
 // elsewhere. allow_overlap + overlap_reason overrides any refusal and is
 // recorded record-before-commit as a merge_overlap_overridden audit row.
 // Contract: backend/internal/server/README.md § "Merge overlap guard".
+//
+// #4582: the delegated may_merge arm of AutoDriveRunGate runs the SAME guard
+// (mergeOverlapAutoDriveHold) with no override, and a 409 refusal names other
+// runs only to a caller that may read cross-run overlap (overlapDetailsVisible).
+
+// CategoryDelegatedMergeOverlapRefused is the chained audit row the delegated
+// may_merge arm appends when the merge overlap guard refuses it (#4582,
+// approval condition C5). The payload carries counts plus code, reason and
+// head only, NEVER another run's id, stage id, issue ref or path, so it needs
+// no run-bound withholding. One row per distinct decision: a refusal equal to
+// the latest row (same code, reason, head and counts) appends nothing, so a
+// polling campaign driver does not write a row per tick. INTERNAL: registered
+// in audit/categories.go, not an issue-comment surface.
+const CategoryDelegatedMergeOverlapRefused = "delegated_merge_overlap_refused"
 
 // CategoryMergeOverlapOverridden is the chained audit row handleMergeRun
 // appends when an operator overrides a refusing merge overlap guard. It names
@@ -101,6 +115,51 @@ type mergeOverlapResult struct {
 }
 
 func (o mergeOverlapResult) refused() bool { return o.Code != "" }
+
+// overlapDetailsVisible reports whether a refusal may name other runs to id
+// (#4582). It mirrors GET /v0/runs/{run_id}/scope-overlap's read posture — a
+// run-bound subject is refused, and every other caller needs read:audit
+// through requireWriteScope's cookie-session bypass — so the merge refusal
+// never shows a caller more of other runs than the #4118 surfaces do.
+func overlapDetailsVisible(id Identity) bool {
+	return !isRunBoundSubject(id.Subject) && (id.TokenID == "" || hasScope(id, scopeGateViewRead))
+}
+
+// withheld returns the refusal a caller WITHOUT cross-run read access sees
+// (#4582): for the two 409 codes the Details are rebuilt as counts, the head,
+// the reason token (overlap_undetermined) or next_step
+// (overlapping_implement_in_flight), details_withheld and required_scope, with
+// no blocking / undetermined / blocking_run_id / stage_id key, and the
+// overlapping_implement_in_flight Message is re-rendered naming no run, stage
+// or path (the overlap_undetermined Message already names only a count). A
+// 502 overlap_check_failed and an admitting zero value are returned unchanged:
+// their details are already only reason / retryable. Blockers, Undetermined,
+// HeadSHA, Code, Reason and Status are copied unchanged — the override
+// fingerprint and the merge_overlap_overridden payload still read them.
+func (o mergeOverlapResult) withheld() mergeOverlapResult {
+	if o.Code != mergeCodeOverlappingImplement && o.Code != mergeCodeOverlapUndetermined {
+		return o
+	}
+	out := o
+	details := map[string]any{
+		"blocking_count":     len(o.Blockers),
+		"undetermined_count": len(o.Undetermined),
+		"details_withheld":   true,
+		"required_scope":     scopeGateViewRead,
+	}
+	if o.HeadSHA != "" {
+		details["head_sha"] = o.HeadSHA
+	}
+	if o.Code == mergeCodeOverlapUndetermined {
+		details["reason"] = o.Reason
+	} else {
+		details["next_step"] = "fishhawk_await_stage"
+		out.Message = fmt.Sprintf("%d live run(s) elsewhere have an implement-type stage dispatched or running on path(s) this pull request changes at head %s. Merging now moves the base under that agent and risks a category-B conflict for its run. The blocking runs, their stages and the shared paths are withheld: reading them requires read:audit (GET /v0/runs/{run_id}/scope-overlap). Wait for the stage to settle with fishhawk_await_stage, then re-invoke the merge; or pass allow_overlap:true with an overlap_reason to merge deliberately (audited as merge_overlap_overridden). No new merge verdict was recorded.",
+			len(o.Blockers), o.HeadSHA)
+	}
+	out.Details = details
+	return out
+}
 
 // liveOverlapCandidate is a candidate run with a blocking implement stage.
 type liveOverlapCandidate struct {
@@ -448,6 +507,76 @@ func (s *Server) recordMergeOverlapOverride(ctx context.Context, runID uuid.UUID
 		return appendErr
 	}
 	return nil
+}
+
+// delegatedOverlapDecision is the decision a delegated_merge_overlap_refused
+// row records: counts plus code, reason and head, never another run's id or
+// path (#4582, approval condition C5).
+type delegatedOverlapDecision struct {
+	HeadSHA           string `json:"head_sha"`
+	RefusedCode       string `json:"refused_code"`
+	RefusedReason     string `json:"refused_reason"`
+	BlockingCount     int    `json:"blocking_count"`
+	UndeterminedCount int    `json:"undetermined_count"`
+}
+
+// recordDelegatedMergeOverlapRefusal appends the delegated_merge_overlap_refused
+// row for a delegated may_merge the guard refused (#4582, approval condition
+// C5), unless the run's LATEST such row records the same decision: the
+// campaign driver re-evaluates a parked run every tick, so one row per
+// distinct decision, not per poll. A read or append error is returned; the
+// caller logs it and still refuses (the refusal, not the record, is the
+// control).
+func (s *Server) recordDelegatedMergeOverlapRefusal(ctx context.Context, runRow *run.Run, subject string, o mergeOverlapResult) error {
+	decision := delegatedOverlapDecision{
+		HeadSHA:           o.HeadSHA,
+		RefusedCode:       o.Code,
+		RefusedReason:     o.Reason,
+		BlockingCount:     len(o.Blockers),
+		UndeterminedCount: len(o.Undetermined),
+	}
+	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, CategoryDelegatedMergeOverlapRefused)
+	if err != nil {
+		return err
+	}
+	var latest *audit.Entry
+	for _, row := range rows {
+		if row != nil && (latest == nil || row.Sequence >= latest.Sequence) {
+			latest = row
+		}
+	}
+	if latest != nil {
+		var prior delegatedOverlapDecision
+		if json.Unmarshal(latest.Payload, &prior) == nil && prior == decision {
+			return nil
+		}
+	}
+	prURL := ""
+	if runRow.PullRequestURL != nil {
+		prURL = *runRow.PullRequestURL
+	}
+	payload, err := json.Marshal(map[string]any{
+		"run_id":             runRow.ID.String(),
+		"pr_url":             prURL,
+		"head_sha":           decision.HeadSHA,
+		"refused_code":       decision.RefusedCode,
+		"refused_reason":     decision.RefusedReason,
+		"blocking_count":     decision.BlockingCount,
+		"undetermined_count": decision.UndeterminedCount,
+	})
+	if err != nil {
+		return err
+	}
+	kind := actorKindForSubject(subject)
+	_, err = s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        runRow.ID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryDelegatedMergeOverlapRefused,
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	})
+	return err
 }
 
 // writeMergeOverlapOverrideUnrecorded renders the 503 for a failed override

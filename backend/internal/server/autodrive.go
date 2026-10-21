@@ -307,7 +307,9 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		// share (a human merge deliberately does not block on a review stage
 		// still awaiting approval; resolveReviewStageOnMerge settles it ON the
 		// merge). The acceptance-gate + nil-merger + dispatch tail is the shared
-		// helper both surfaces converge on (E48.7 / #1954).
+		// helper both surfaces converge on (E48.7 / #1954). The merge overlap
+		// guard (#4119) is evaluated BEFORE that tail by both callers —
+		// handleMergeRun inline, this arm via mergeOverlapAutoDriveHold (#4582).
 		if !mergeGateReady(runRow, stages) {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
 				slog.String("run_id", runRow.ID.String()))
@@ -323,6 +325,13 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 			// operator merge endpoint refuses on; the merger is never called.
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but a first-officer finding holds the merge",
 				slog.String("run_id", runRow.ID.String()), slog.Bool("decision_required", out.DecisionRequired))
+			return out, nil
+		} else if out, held := s.mergeOverlapAutoDriveHold(ctx, runRow, id); held {
+			// E83.61 / #4119 via #4582: the SAME merge overlap guard the
+			// operator merge endpoint refuses on, BEFORE the merge-candidate
+			// gate (handleMergeRun's guard-before-gate order). A 409 parks
+			// decision_required with the code as the state; a 502 read failure
+			// is observe-only. No delegated override; the merger is never called.
 			return out, nil
 		} else if gate := s.mergeCandidateGate(ctx, runRow); !gate.admits() {
 			// ADR-090 D1/D2/D7 (E83.33 / #4018): the SAME merge-candidate gate the
@@ -425,6 +434,59 @@ func (s *Server) firstOfficerAutoDriveHold(ctx context.Context, runID uuid.UUID,
 	}, true
 }
 
+// mergeOverlapAutoDriveHold applies the merge overlap guard (E83.61 / #4119)
+// to the delegated may_merge arm (#4582): the SAME mergeOverlapGuard
+// handleMergeRun refuses on, evaluated at the same point relative to the
+// merge-candidate gate. A 409 refusal (overlapping_implement_in_flight /
+// overlap_undetermined) returns decision_required with the code as
+// DecisionState; a 502 overlap_check_failed read failure returns observe-only
+// (fail-closed), the delegated arm's rule for every read error. There is NO
+// delegated override: this path has no allow_overlap input and never records
+// merge_overlap_overridden. Every refusal appends a
+// delegated_merge_overlap_refused row (approval condition C5, counts only,
+// deduped per decision); a failed append is logged and the refusal stands.
+// The note and log carry the same detail level as the operator 409 for id:
+// other runs are named only when overlapDetailsVisible(id). held=false means
+// the arm may proceed.
+func (s *Server) mergeOverlapAutoDriveHold(ctx context.Context, runRow *run.Run, id Identity) (AutoDriveOutcome, bool) {
+	o := s.mergeOverlapGuard(ctx, runRow)
+	if !o.refused() {
+		return AutoDriveOutcome{}, false
+	}
+	attrs := []slog.Attr{
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("code", o.Code),
+		slog.String("reason", o.Reason),
+		slog.Int("blocking_count", len(o.Blockers)),
+		slog.Int("undetermined_count", len(o.Undetermined)),
+	}
+	if o.Cause != nil {
+		attrs = append(attrs, slog.String("error", o.Cause.Error()))
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but the merge overlap guard refused", attrs...)
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	if err := s.recordDelegatedMergeOverlapRefusal(ctx, runRow, subject, o); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: delegated_merge_overlap_refused could not be recorded; the refusal stands",
+			slog.String("run_id", runRow.ID.String()), slog.String("code", o.Code), slog.String("error", err.Error()))
+	}
+	if o.Code == mergeCodeOverlapCheckFailed {
+		return observeOnly("merge overlap guard could not read its inputs (overlap_check_failed: " + o.Reason + ", fail-closed); observe-only"), true
+	}
+	shown := o
+	if !overlapDetailsVisible(id) {
+		shown = o.withheld()
+	}
+	return AutoDriveOutcome{
+		DecisionRequired: true,
+		DecisionState:    o.Code,
+		Action:           delegation.ActionMerge,
+		Note:             "merge overlap guard refused the delegated merge (" + o.Code + "): " + shown.Message + " The delegated arm never overrides it: allow_overlap is operator-only (fishhawk_merge_run).",
+	}, true
+}
+
 // mergeCandidateObserveNote renders a refused merge-candidate gate as the
 // delegated arm's observe-only note, naming the operator's next step. The
 // delegated arm acts on none of them: it never rebases, never triggers a pass
@@ -476,6 +538,11 @@ const (
 //
 // It is behavior-preserving for the delegated arm and is the SAME path the
 // operator merge endpoint converges on by construction.
+//
+// It does NOT run the merge overlap guard (E83.61 / #4119): both callers
+// evaluate it BEFORE this tail — handleMergeRun inline, the delegated may_merge
+// arm via mergeOverlapAutoDriveHold (#4582). A new caller (#4296's
+// merge-on-pass) carries its own obligation to run it first.
 //
 // liveHead is the head mergeCandidateGate admitted (mergeCandidateGateResult.
 // HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it. Empty

@@ -343,6 +343,10 @@ import "sort"
 // E83.61 / #4119 added merge_overlap_overridden, the operator's audited
 // override of the merge overlap guard (server/merge_overlap_guard.go),
 // appended record-before-commit — INTERNAL, not an issue-comment surface.
+// E89.9 / #4582 added delegated_merge_overlap_refused, the delegated may_merge
+// arm's record of a refusing merge overlap guard (server/autodrive.go
+// mergeOverlapAutoDriveHold), carrying counts plus code, reason and head only
+// and deduped per decision — INTERNAL, not an issue-comment surface.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -436,6 +440,7 @@ var KnownCategories = map[string]struct{}{
 	"crew_message_sent":                       {},
 	"crew_work_request_filed":                 {},
 	"decomposition_child_cancelled":           {}, // #4186: a parent cancel or the orphan backfill cancelled this decomposition child (childcancel) — INTERNAL, not in issuecomment activityCategories
+	"delegated_merge_overlap_refused":         {}, // E89.9 / #4582: the delegated may_merge arm was refused by the merge overlap guard; counts only, no other run's ids or paths (server/merge_overlap_guard.go) — INTERNAL, not an issue-comment surface
 	"delegation_confirmed":                    {},
 	"delegation_lower_proposed":               {},
 	"delegation_shadow_evaluated":             {},

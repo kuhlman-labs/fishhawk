@@ -3025,6 +3025,28 @@ the advisory #4118 surfaces it FAILS CLOSED.
   an overlap-blocked run: an overlap-blocked, otherwise queue-eligible run is
   refused, not enqueued. Every refusal records nothing: no verdict, no
   override row, no merge intent, no dispatch.
+- **Placement (delegated `may_merge`, #4582).** `AutoDriveRunGate`'s
+  may_merge arm calls `mergeOverlapAutoDriveHold` AFTER the first-officer
+  hold and BEFORE the merge-candidate gate (the operator path's
+  guard-before-gate order), so the merger is never called on a refusal. A 409
+  (`overlapping_implement_in_flight` / `overlap_undetermined`) returns
+  `decision_required` with the code as `decision_state` and action `merge`; a
+  502 `overlap_check_failed` is observe-only fail-closed (the delegated arm's
+  rule for every read error, like the first-officer and D7 read errors).
+  There is NO delegated override: the path has no `allow_overlap` input and
+  never records `merge_overlap_overridden` — `allow_overlap` is operator-only
+  (`fishhawk_merge_run`). Every delegated refusal appends a
+  `delegated_merge_overlap_refused` row (approval condition C5): payload
+  `run_id, pr_url, head_sha, refused_code, refused_reason, blocking_count,
+  undetermined_count` — counts only, never another run's id, stage id, issue
+  ref or path, so it needs no run-bound withholding. It is deduped against the
+  run's LATEST such row (same code, reason, head and counts appends nothing),
+  so a campaign driver polling a parked run writes one row per distinct
+  decision, not per tick; a failed read or append is WARN-logged and the
+  refusal stands. `decision_required` stops `fishhawk_drive_run`; the campaign
+  `GateActor` does not carry it and keeps polling, merging once the other
+  implement settles. Registered in `audit/categories.go`; NOT an
+  issue-comment activity category.
 - **Candidates.** `overlapCandidates` — the #4118 enumeration (`ListRuns` per
   live state, same repo and tenant, lineage and one-hop recovery exclusions).
   A `ListRuns` error is 502 `run_list`; a page at `scopeOverlapListLimit`
@@ -3074,7 +3096,21 @@ the advisory #4118 surfaces it FAILS CLOSED.
   (`{run_id, issue_ref, decomposed_from, stage_id, stage_type, stage_state,
   paths}`), `head_sha` (when read), `reason` (undetermined), and for the
   blocker refusal `next_step: fishhawk_await_stage`, `blocking_run_id` and
-  `stage_id` of the first blocker (the MCP `NextAction`). 502
+  `stage_id` of the first blocker (the MCP `NextAction`). **Those cross-run
+  details render ONLY when the caller may read cross-run overlap (#4582,
+  `overlapDetailsVisible`):** not a run-bound subject, and a cookie session or
+  a token holding `read:audit` — the posture of `GET
+  /v0/runs/{run_id}/scope-overlap` (the merge verb itself requires only
+  `write:approvals`). Otherwise `mergeOverlapResult.withheld` rebuilds the
+  details as `blocking_count`, `undetermined_count`, `head_sha` (when read),
+  `reason` (undetermined) or `next_step` (blocker), `details_withheld: true`
+  and `required_scope: read:audit`, with NO `blocking` / `undetermined` /
+  `blocking_run_id` / `stage_id` key, and the blocker message is re-rendered
+  naming no run, stage or path (the undetermined message already names only a
+  count). The override path keeps the unredacted result for its audited row.
+  The delegated arm's note and log use the same detail level for its
+  identity (the campaign operator identity holds no `read:audit`, so its note
+  is the withheld form). 502
   `overlap_check_failed` carries only the allow-listed `reason` +
   `retryable:true` (+ `run_id`); the raw cause is logged, never in the
   message. Messages are static wording plus ids, states, path COUNTS and the
@@ -3108,12 +3144,20 @@ the advisory #4118 surfaces it FAILS CLOSED.
   (`withholdScopeOverlapFromRunBound`, § "Cross-run scope overlap"): it names
   other runs' ids, issue refs and paths. Registered in
   `audit/categories.go`; NOT an issue-comment activity category.
-- **Residuals.** The delegated `may_merge` arm (autodrive
-  `dispatchAcceptanceGatedMerge`) and ADR-093 slice 2's merge-on-pass (#4296)
-  do NOT run this guard. TOCTOU: a push or a newly dispatched implement
-  between the guard read and GitHub's merge is not caught. Cost per POST with
-  a live candidate elsewhere: one stage list per candidate plus one
-  `GetPullRequest` and one compare.
+- **Residuals.** ADR-093 slice 2's merge-on-pass (#4296) does NOT run this
+  guard (`dispatchAcceptanceGatedMerge` does not either: both of its current
+  callers run it first). TOCTOU: a push or a newly dispatched implement
+  between the guard read and GitHub's merge is not caught. Cost per POST (or
+  delegated pass) with a live candidate elsewhere: one stage list per
+  candidate plus one `GetPullRequest` and one compare. **Fail-closed
+  consequence for the delegated arm, accepted (#4582, approval condition
+  C1):** a deployment where the guard cannot read this run's changed paths
+  (no GitHub client, no installation, an unparseable repo, no PR number;
+  GitLab runs land here) LOSES the delegated `may_merge` arm whenever another
+  same-repo run has a live implement stage: the run parks `decision_required`
+  `overlap_undetermined`, the campaign `GateActor` keeps polling it, and only
+  an operator `fishhawk_merge_run` with `allow_overlap` clears it. This is
+  accepted under the issue's no-delegated-override rule.
 - **Counterfactual anchors** (`merge_overlap_guard_test.go` unless noted):
   the call `overlap := s.mergeOverlapGuard(r.Context(), runRow)`
   (`TestMergeRun_OverlappingImplementRefused`); `overlapBlockingStageState`
@@ -3124,7 +3168,19 @@ the advisory #4118 surfaces it FAILS CLOSED.
   the `preCommit` call in `recordMergeQueueIntent`
   (`TestMergeRun_OverlapOverrideUnrecordedNeverEnqueues`); the withhold
   predicate (`reads_test.go`
-  `TestListRunAudit_RunBoundWithholdsMergeOverlapOverride`).
+  `TestListRunAudit_RunBoundWithholdsMergeOverlapOverride`). #4582
+  (`autodrive_merge_overlap_test.go` for the delegated arm): the may_merge
+  call line `} else if out, held := s.mergeOverlapAutoDriveHold(ctx, runRow,
+  id); held {` (`TestAutoDriveRunGate_MergeOverlap_RefusesAndParks`); the
+  `overlapDetailsVisible` body (`TestMergeRun_OverlapDetailsWithheldWithoutReadAudit`,
+  `TestOverlapDetailsVisible`); `shown = overlap.withheld()` in
+  `merge_run.go` (`TestMergeRun_OverlapDetailsWithheldWithoutReadAudit`);
+  `shown = o.withheld()` in `autodrive.go`
+  (`TestAutoDriveRunGate_MergeOverlap_NoteWithheldWithoutReadAudit`); the
+  502 classification `if o.Code == mergeCodeOverlapCheckFailed {`
+  (`TestAutoDriveRunGate_MergeOverlap_CheckFailedObservesOnly`); the
+  `recordDelegatedMergeOverlapRefusal` call and its latest-row comparison
+  (`TestAutoDriveRunGate_MergeOverlap_RefusalRecordedOncePerDecision`).
 
 ## Concurrency-group promote (`stage_concurrency_promote.go`, E83.81 / [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 
@@ -5088,7 +5144,7 @@ A scope amendment filed near the agent wall clock is **undecidable by constructi
 
 ### Cross-run scope overlap (`scope_overlap.go`, #4118)
 
-E83.60 / #4118. `computeScopeOverlap` answers "which OTHER in-flight runs share files with this one" — the merge-order signal for overlapping work (merging while an overlapping run is mid-implement can strand it in a category-B dead end). **Advisory on these surfaces** (endpoint, gate view, plan-gate row): nothing here refuses on it, every read is fail-open. The one REFUSING consumer is `POST /v0/runs/{run_id}/merge`, whose fail-closed merge overlap guard reuses `overlapCandidates` and `resolveOverlapScope` (§ "Merge overlap guard").
+E83.60 / #4118. `computeScopeOverlap` answers "which OTHER in-flight runs share files with this one" — the merge-order signal for overlapping work (merging while an overlapping run is mid-implement can strand it in a category-B dead end). **Advisory on these surfaces** (endpoint, gate view, plan-gate row): nothing here refuses on it, every read is fail-open. The one REFUSING consumer is the fail-closed merge overlap guard, run by `POST /v0/runs/{run_id}/merge` and by the delegated `may_merge` arm (#4582); it reuses `overlapCandidates` and `resolveOverlapScope` (§ "Merge overlap guard").
 
 - **Effective scope** (`resolveOverlapScope`, exact paths only, no glob/directory semantics): the newest standard_v1 plan via `loadApprovedPlanForRun` (parent-walk) — a decomposition child narrows to its own `sub_plan` slice when `matchDecomposedSubPlan` links one with declared files; any other run takes `scopeFilesFromApprovedPlanFull` (top-level `scope.files` UNION every sub_plan) — plus approval `add_scope_files`, plus APPROVED scope amendments only (`approvedAmendmentPaths`; pending/denied/lapsed never count), minus approval `remove_scope_files`. No plan, a plan read error, or an amendment-list error → unresolved.
 - **Candidates** (`overlapCandidates`, shared with the merge overlap guard so both judge one set): `ListRuns` per state in `scopeOverlapLiveStates` (`pending`, `running` — terminal runs are never listed), same `Repo`, `AccountID` filter, `Limit: scopeOverlapListLimit` (200). `len(page) >= scopeOverlapListLimit` sets `truncated`.
@@ -8034,7 +8090,7 @@ The ADR-089 read-only first-officer seat, PARTIAL delivery (the ADR-097 standing
 - **Identity (`first_officer_identity.go`).** A seat IS an api token whose subject is `first_officer/campaign/<uuid>` or `first_officer/run/<uuid>`. `bearerAuth` hands every seat-subject token to `resolveFirstOfficerSeat`, which ALWAYS clamps scopes to `firstofficer.SeatScopes` (`read:runs`, `read:audit`, `write:messages`, `request:specialist_jobs`) first, so a hand-minted seat token carrying `write:approvals` cannot approve; then refuses a malformed subject (401 `first_officer_seat_invalid`), unwired repos or an unreadable anchor (503 `first_officer_seat_unverifiable`, nothing revoked), and RETIRES the seat on a terminal or missing anchor (every token for the subject revoked, `first_officer_seat_retired` appended — the run's chain for a run seat, the global chain for a campaign seat — 401 `first_officer_seat_retired`). A live anchor stamps its account onto `Identity.AccountID` (approval condition 1): reads and writes are account-scoped to the anchor's account, and an untenanted anchor stays untenanted. Seat subjects classify as agents (`isAgentSubject`). POST `/v0/work-items` requires `write:runs` of every non-run-bound caller (#4481), which a seat's clamped scopes lack; `refuseFirstOfficerTrackerWrite` (wrapped at registration in `handlers.go`) stays the NAMED seat refusal ahead of that scope check, so over REST a seat subject is refused 403 `first_officer_tracker_write_not_permitted` before the handler and the refusal is recorded (`TestFirstOfficerSeat_CannotFileWorkItem`). Over `/mcp` the `fishhawk_file_issue` row now requires `write:runs` too, so a seat is refused earlier, at the gate, with 403 `insufficient_scope`, and that gate refusal records no row (the residual below). `writeError` records `first_officer_action_refused` on every 403 served to a seat; a refusal that bypasses `writeError` (the `/mcp` JSON-RPC tool-scope precheck) records nothing — the stated residual. That row is unbounded per seat (no coalescing), as is a seat's `POST /v0/specialist-jobs`: a looping seat agent amplifies refused requests into chain writes and requests into queued jobs. The ADR-089 D6 spend cap / a per-seat rate bound is remaining scope on #4148. Over `/mcp` a seat reaches no tool that spawns a host program: `request:specialist_jobs` is NOT an alternative on `fishhawk_request_specialist_job` (which spawns the daemon-resolved runner with the daemon's environment in a caller-chosen `working_dir`; a caller-chosen `runner_binary` is refused over HTTP since #4476), so a seat files jobs over REST, which only queues (`TestFirstOfficerSeat_MCPRefusesRunnerSpawningTools`).
 - **Lifecycle routes (`first_officer_seat.go`).** `POST /v0/first-officer-seats` `{campaign_id | run_id}` is a captain act: `write:approvals`; an agent caller → 403 `first_officer_attach_requires_human` (before any anchor read, so an agent learns nothing about the anchor; a delegated operator-agent attach waits for an `operator_agent` grant); an anchor outside the caller's account → 404 (not disclosed); while `currentCaptain` reports a SITTING captain for the anchor's repository (read in the anchor's account partition) only that subject attaches → 403 `first_officer_attach_not_captain`, and a vacant or unavailable captain record admits any human `write:approvals` holder with `captain_basis` recorded; a terminal anchor → 409 `first_officer_anchor_terminal`; an active seat token → 409 `first_officer_seat_exists`. One seat per anchor has no DB unique index: after `Issue`, `convergeSeatTokens` re-lists the subject's active tokens, keeps the OLDEST (`created_at`, then id) and revokes the rest, so a losing concurrent attach answers 409 with its token revoked. The outcome reflects PERSISTED revocation: if any losing token's `Revoke` fails, there is no winner — the attach withdraws its own token and answers 500 naming the unrevoked token ids, never a 201 beside a live competitor or a 409 claiming a revocation that did not happen. A failed convergence read or attach-row append likewise withdraws the issued token and answers 500 (an unrecorded or unproven seat must not exist); every such 500 says whether that withdrawal persisted, and when it did not, names the token as possibly still active and points at the retire verb. `first_officer_seat_attached` `{seat_subject, token_id, anchor, scopes, attached_by, captain_basis}` never carries the plaintext; the 201 returns the token ONCE. `GET /v0/first-officer-seats?campaign_id=|run_id=` (`read:runs`) derives attach state from the active tokens. `POST /v0/first-officer-seats/retire` `{anchor, reason}` applies the same human/captain gate (a terminal anchor is allowed), requires a non-empty `reason` (1-1000), revokes every active token and appends `first_officer_seat_retired` `{reason: captain_detached, note, …}`; no active token → 404 `first_officer_seat_not_attached`. Any of the token, audit, run or campaign repositories unwired → 503 `first_officer_seats_unconfigured`.
 - **Blocking findings and the hold (`first_officer_gate.go`).** A seat's crew finding citing a runner-attested FAILING specialist-job completion on its anchor run converts (insert-then-dispose) to an open concern with provenance `first_officer`; `firstOfficerHoldRefusal` is the ONE predicate deciding the hold, and an unwired `ConcernRepo` is no hold (the explicit fail-open for the unconfigured case only). Long-form: `backend/internal/crewmessage/README.md`, `docs/spec/crew-message-v1.md`.
-- **Where the hold applies.** `handleSubmitApproval` (approve only; plan stage → plan-kind, review stage → implement-kind; 409 `first_officer_finding_open`, read error 500, no approval row), `handleMergeRun` (after `review_coverage_incomplete`, before the merge seam; no verdict row), the delegated auto-drive arms (`firstOfficerAutoDriveHold` in `autodrive.go`: may_approve before `approveStageAs` on the gated stage's kind, may_merge after the review-coverage hold; a hold is `decision_required` `first_officer_finding_open`, a read error observe-only), and the gate view's `merge_readiness` (a `first_officer_finding_open` blocker, or an `undetermined` "first-officer findings: …" line plus the `merge_readiness` history gap on a read error). The drive layer's `awaiting_merge` next-action stamp is NOT held, so `next_actions` may still suggest merge while `merge_run` refuses with the named code. The captain clears the hold through the existing concern surface: waive (reason required), defer, or route a fix-up.
+- **Where the hold applies.** `handleSubmitApproval` (approve only; plan stage → plan-kind, review stage → implement-kind; 409 `first_officer_finding_open`, read error 500, no approval row), `handleMergeRun` (after `review_coverage_incomplete`, before the merge seam; no verdict row), the delegated auto-drive arms (`firstOfficerAutoDriveHold` in `autodrive.go`: may_approve before `approveStageAs` on the gated stage's kind, may_merge after the review-coverage hold and before the merge overlap guard (`mergeOverlapAutoDriveHold`, #4582); a hold is `decision_required` `first_officer_finding_open`, a read error observe-only), and the gate view's `merge_readiness` (a `first_officer_finding_open` blocker, or an `undetermined` "first-officer findings: …" line plus the `merge_readiness` history gap on a read error). The drive layer's `awaiting_merge` next-action stamp is NOT held, so `next_actions` may still suggest merge while `merge_run` refuses with the named code. The captain clears the hold through the existing concern surface: waive (reason required), defer, or route a fix-up.
 - **Tests.** `first_officer_identity_test.go` (clamp, retirement arms, tenanted anchor), `first_officer_gate_test.go` (evidence resolution, conversion, approve/merge holds), `first_officer_seat_test.go` (attach/get/retire refusals, post-issue convergence both ways plus revoke-failure injection, auto-drive and gate-view holds — the latter isolate the hold's own concern read with `holdReadConcernRepo`, because the delegated conditions and the gate view's concern block react to an open concern first and would mask the hold), and `first_officer_pg_test.go` (the cross-boundary walk over real Postgres: attach → four prohibited verbs refused with `first_officer_action_refused` rows → seat job request → runner-attested failing completion by construction → blocking finding → the captain's `recipient_role: first_officer` notice listed by the seat (`GET /v0/crew-messages?recipient_role=first_officer`) → merge 409 + gate-view blocker → waive → retirement on cancel; plus the captain gate over the real captain store).
 - **Rollback.** Revert the PR; there is no migration. Retire live seats first (`POST /v0/first-officer-seats/retire`, or revoke tokens whose subject starts with `first_officer/`): a reverted server no longer clamps them. Converted `first_officer` concerns stay ordinary open concerns.
 
