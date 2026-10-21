@@ -7923,3 +7923,78 @@ func TestMigrateDown_ScopeAmendmentsLapsedReversal(t *testing.T) {
 		t.Errorf("insert status 'lapsed' after re-applying 0105: %v", err)
 	}
 }
+
+// TestMigrateDown_MergeQueueIntentReversal pins 0106 (ADR-093 D2 / #4295):
+// after MigrateUp merge_candidate_queue_entries carries a nullable
+// TIMESTAMPTZ merge_intent_at (NULL by default, so a pre-0106-shaped insert
+// records no intent); after rolling back through 0106 the column is gone,
+// the schema lands on 0105, and the 0101 rows survive; MigrateUp again
+// restores the column.
+func TestMigrateDown_MergeQueueIntentReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	intentColumn := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'merge_intent_at'
+  AND is_nullable = 'YES' AND data_type = 'timestamp with time zone'`).Scan(&n); err != nil {
+			t.Fatalf("read 0106 column: %v", err)
+		}
+		return n
+	}
+	if n := intentColumn(); n != 1 {
+		t.Fatalf("nullable TIMESTAMPTZ merge_intent_at columns after MigrateUp = %d, want 1", n)
+	}
+
+	var runID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha)
+VALUES ($1, 'o/r', 'main', 'held', 'h1')`, runID); err != nil {
+		t.Fatalf("insert pre-0106-shaped row: %v — 0106 must leave it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, eject_reason, anchored_head_sha, settled_at, merge_intent_at)
+VALUES ($1, 'o/r', 'main', 'dropped', 'pr_closed', 'h0', now(), now())`, runID); err != nil {
+		t.Fatalf("insert a row carrying merge intent: %v", err)
+	}
+	var nullIntent int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM merge_candidate_queue_entries WHERE state = 'held' AND merge_intent_at IS NULL`).Scan(&nullIntent); err != nil {
+		t.Fatalf("read default intent: %v", err)
+	}
+	if nullIntent != 1 {
+		t.Errorf("held rows with NULL merge_intent_at = %d, want 1 (no default, no backfill)", nullIntent)
+	}
+
+	downThrough(t, url, "0106")
+
+	if n := intentColumn(); n != 0 {
+		t.Errorf("merge_intent_at columns after rolling back 0106 = %d, want 0", n)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM merge_candidate_queue_entries WHERE run_id = $1`, runID).Scan(&rows); err != nil {
+		t.Fatalf("read entries after rollback: %v — the 0101 table must survive", err)
+	}
+	if rows != 2 {
+		t.Errorf("queue rows after rolling back 0106 = %d, want 2 (untouched)", rows)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n := intentColumn(); n != 1 {
+		t.Errorf("merge_intent_at columns after re-applying 0106 = %d, want 1", n)
+	}
+}
