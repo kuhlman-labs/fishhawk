@@ -815,10 +815,11 @@ func looksLikeRunID(s string) bool {
 
 // pruneStaleWorktree removes a worktree the sweep has proven reclaimable
 // (a non-run fixture root, or a run the backend definitively reports
-// absent) and clears its sidecar + lock so the dir goes quiet. Best-effort:
-// on a `git worktree remove` failure it logs one worktree_sweep_degraded
-// line and leaves the entry; on success it removes the run-id sidecar and
-// the run-<root>.lock and logs exactly one lineage_worktree_pruned line.
+// absent) and clears its sidecar, lock and agent-session ledger so the dir
+// goes quiet. Best-effort: on a `git worktree remove` failure it logs one
+// worktree_sweep_degraded line and leaves the entry; on success it removes the run-id sidecar, the
+// run-<root>.lock and the run-<root>.agent-sessions.json ledger (#4089) and
+// logs exactly one lineage_worktree_pruned line.
 func pruneStaleWorktree(ctx context.Context, repoDir, wtDir, root, path, reason string, logSink io.Writer) {
 	if out, err := worktreeAdminGit(ctx, repoDir, logSink,
 		"worktree", "remove", "--force", path); err != nil {
@@ -829,6 +830,7 @@ func pruneStaleWorktree(ctx context.Context, repoDir, wtDir, root, path, reason 
 	}
 	_ = os.Remove(lineageRunIDPath(wtDir, root))
 	_ = os.Remove(filepath.Join(wtDir, "run-"+root+".lock"))
+	_ = os.Remove(agentSessionLedgerPath(wtDir, root))
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"lineage_worktree_pruned","root":%q,"reason":%q,"path":%q}`+"\n", root, reason, path)
 }
@@ -914,9 +916,11 @@ func sweepTerminalWorktrees(ctx context.Context, repoDir string, client lineageS
 				root, strings.TrimSpace(string(out)))
 			continue
 		}
-		// Worktree gone — remove its sidecar + lock so the dir is clean.
+		// Worktree gone — remove its sidecar, lock and agent-session ledger
+		// (#4089) so the dir is clean and no session pointer outlives it.
 		_ = os.Remove(lineageRunIDPath(wtDir, root))
 		_ = os.Remove(filepath.Join(wtDir, "run-"+root+".lock"))
+		_ = os.Remove(agentSessionLedgerPath(wtDir, root))
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"lineage_worktree_swept","root":%q,"path":%q}`+"\n", root, p)
 	}
