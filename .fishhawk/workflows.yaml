@@ -18,6 +18,7 @@
 #   backlog_grooming   decide what to build
 #   upkeep_scan        find upkeep work: flakes, pin drift, advisories
 #   feature_change    build it — plan, implement, verify, approve
+#   hotfix_change      the same at emergency cadence, for an incident fix
 #   routine_change     the low-risk variant the agent carries alone
 #   human_led_change   the variant a human writes and the log records
 #   release            record the release and gate its environment deploy
@@ -739,6 +740,274 @@ workflows:
               members: ["github:kuhlman-labs"]
               # Same predicate as the plan gate: one approval, excluding the
               # author and any agent identity.
+              not: [author, agent]
+
+  # ---------------------------------------------------------------------------
+  # hotfix_change — the same cycle at emergency cadence (ADR-053, E35.5).
+  #
+  # feature_change's in-run shape (plan -> implement -> preview acceptance ->
+  # human review) with tighter stage budgets, a smaller diff cap, a 20m
+  # stage-runtime policy and delegation NARROWER than feature_change. Copied
+  # from docs/spec/examples/workflow-v2-hotfix-change.yaml, which is the
+  # contract (docs/spec/workflow-v2.md § "Incident hotfix preset"); only the
+  # repository-specific knobs are adapted to match feature_change above:
+  # executor models, efforts and concurrency, reviewer models, conventions,
+  # personas and escalations, the verify command and its timeout, the full
+  # forbidden_paths list, and the approver members.
+  #
+  # The alert ingress auto-starts this workflow by default for an alert
+  # source, but only when that source sets `auto_start: true`; none here
+  # does. It does NOT deploy or verify the deploy: post-deploy verification
+  # is a follow-on `release` run the operator starts after merge.
+  # ---------------------------------------------------------------------------
+  hotfix_change:
+    description: >-
+      Incident hotfix: feature_change's shape at emergency cadence. The agent plans and implements; a human approves the plan and the PR. Tighter budgets, a smaller diff cap, and no delegated approve, waive or merge.
+    # The alert ingress (E35.4 / #1601) routes an `alert` run as the `diff`
+    # trigger form (appliesto.TriggerFormForSource), so `diff` is required for
+    # an auto-started incident run to be admitted. No `labels` predicate: the
+    # alert path hydrates issue context best-effort, and a labels criterion
+    # fails closed on an empty snapshot.
+    applies_to:
+      trigger: [diff]
+    auto_advance: true
+    # Delegation: start from the medium tier (fixup under convergent_concerns
+    # and retry under infra_flake stay delegated — the mechanical, reversible
+    # moves), then pin approve, waive and merge to `gated` EXPLICITLY. An
+    # explicit entry wins over the tier for that class, so raising the tier to
+    # `high` can never widen these three. Do NOT declare an autonomy or
+    # actions block on any gate below: a gate-level block replaces this one
+    # wholesale.
+    autonomy: medium
+    actions:
+      approve:
+        mode: gated
+      waive:
+        mode: gated
+      merge:
+        mode: gated
+      # The full closed set: the tier's seven events plus
+      # advisory_reviewer_reject (any reviewer reject pages during an
+      # incident) and clarification_request.
+      page_human_on:
+        - advisory_reviewer_reject
+        - gating_reviewer_reject
+        - plan_rejection
+        - scope_amendment
+        - budget_override
+        - policy_override
+        - exception_request
+        - requirement_arbitration
+        - clarification_request
+    # The same per-path security-persona escalations as feature_change.
+    # feature_change's `max_autonomy: medium` clamp on the first set is NOT
+    # carried: this workflow already resolves at medium with approve, waive
+    # and merge explicitly gated, so the clamp would change nothing and the
+    # validator refuses a no-op escalation. Raising this workflow's tier
+    # would mean restoring it.
+    escalations:
+      - match:
+          paths:
+            - "backend/internal/spec/**"
+            - "cli/internal/spec/**"
+            - "backend/internal/audit/**"
+            - "backend/internal/policy/**"
+            - "backend/internal/auth/**"
+            - "backend/internal/githubapp/**"
+            - "verifier/**"
+        require:
+          reviewers: [security]
+      - match:
+          paths:
+            - "backend/internal/prompt/**"
+            - "backend/internal/agentpaths/**"
+            - "runner/internal/constraint/**"
+            - "runner/internal/agentenv/**"
+            - "runner/cmd/fishhawk-runner/gateenv*.go"
+            - "credstore/**"
+        require:
+          reviewers: [security]
+    # Enforced: the wall-clock envelope of every agent stage, and the plan
+    # gate's implement budget — a plan predicting more than ~20 minutes is
+    # pushed to decompose.
+    policy:
+      max_stage_runtime: "20m"
+    on_ci_failure:
+      max_retries: 1
+    # No periodic `budgets`: advisory would change nothing for the run, and
+    # blocking would refuse an incident fix at admission.
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+          # Same pins as feature_change's plan stage.
+          model: claude-opus-5-5
+          reasoning_effort: xhigh
+        # Dual advisory review runs concurrently, so it costs no wall-clock;
+        # the human gate below decides. Same reviewers, conventions and
+        # persona as feature_change's plan stage.
+        reviewers:
+          authority: advisory
+          agents:
+            - provider: claudecode
+              model: claude-fable-5-1
+              reasoning_effort: high
+            - provider: codex
+              model: gpt-6-astra
+              reasoning_effort: high
+          human: 1
+          conventions: [security_conventions]
+          personas: [architect]
+        inputs:
+          - source: github_issue
+            required: true
+        produces:
+          - artifact: plan
+            schema: standard_v1
+            persistence:
+              - target: originating_issue
+                mode: rendered_comment
+                update_on_change: true
+              - target: fishhawk_audit_log
+                mode: canonical
+        # limit_usd is the enforced ceiling; max_tokens and max_runtime are
+        # declared but calibration-pending (#2328). The preset's values are
+        # kept as-is. Advisory: a breach records stage_budget_exceeded and the
+        # run proceeds.
+        budget:
+          max_tokens: 150000
+          max_runtime: 10m
+          limit_usd: 3
+          enforcement: advisory
+        # Retained: alert text is untrusted input, and this gate puts the plan
+        # derived from it in front of a human before any code is written.
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              # Forge-verified approver identity, as on feature_change.
+              members: ["github:kuhlman-labs"]
+              not: [author, agent]
+
+      - id: implement
+        type: implement
+        # Same concurrency as feature_change's implement (ADR-087 / #3964).
+        concurrency:
+          limit: 2
+        executor:
+          agent: claude-code
+          model: claude-opus-5-5
+          reasoning_effort: xhigh
+          verify:
+            command: "scripts/test verify"
+            # NOT tightened: equal to feature_change's verify timeout. A full
+            # `scripts/test verify` on this repo can run past 15m, and a gate
+            # killed by its timeout reads as a verify failure with no failing
+            # test (#3383).
+            timeout: "40m"
+            max_iterations: 1
+        reviewers:
+          authority: advisory
+          agents:
+            - provider: claudecode
+              model: claude-fable-5-1
+              reasoning_effort: high
+            - provider: codex
+              model: gpt-6-astra
+              reasoning_effort: high
+          human: 1
+          conventions: [security_conventions]
+        inputs:
+          - artifact: plan
+            from_stage: plan
+        produces:
+          - artifact: pull_request
+        constraints:
+          # A hotfix is a narrow change; a wider one is a feature_change.
+          max_files_changed: 15
+          # No `agent_instruction_paths` relaxation: the built-in constraint
+          # (#3942) stays at its default, so unlike feature_change the ROOT
+          # AGENTS.md is not writable either. An incident fix has no reason to
+          # edit agent instructions. The globs below are routine_change's
+          # agent-instruction set plus feature_change's remaining entries and
+          # the preset's GitLab CI paths. Pinned by the twin
+          # TestRepoSpecForbidsAgentInstructionPaths tests.
+          forbidden_paths:
+            - ".github/workflows/**"
+            - ".gitlab-ci.yml"
+            - ".gitlab/ci/**"
+            - ".gitlab/agents/**"
+            - ".fishhawk/**"
+            # Agent-config directories at ANY depth and in ANY letter case.
+            - "**/.[aA][gG][eE][nN][tT][sS]/**"
+            - "**/.[cC][lL][aA][uU][dD][eE]/**"
+            - "**/.[cC][oO][dD][eE][xX]/**"
+            # The instruction files every CLI auto-loads, at any depth and in
+            # any letter case, the root AGENTS.md included.
+            - "**/[aA][gG][eE][nN][tT][sS].[mM][dD]"
+            - "**/[aA][gG][eE][nN][tT][sS].[oO][vV][eE][rR][rR][iI][dD][eE].[mM][dD]"
+            - "**/[cC][lL][aA][uU][dD][eE].[mM][dD]"
+            - "**/[cC][lL][aA][uU][dD][eE].[lL][oO][cC][aA][lL].[mM][dD]"
+            # The operator-only skill guard and its harness.
+            - "scripts/is-run-agent"
+            - "scripts/test-is-run-agent"
+            - "LICENSE"
+            - "NOTICE"
+          required_outcomes:
+            - tests_added_or_updated
+            - ci_green
+        budget:
+          max_tokens: 300000
+          max_runtime: 20m
+          limit_usd: 8
+          enforcement: advisory
+
+      # Pre-merge acceptance against the PREVIEW instance, as in
+      # feature_change. Not post-deploy verification — see the header.
+      - id: acceptance
+        type: acceptance
+        # Same serialization as feature_change's acceptance: every local
+        # acceptance shares the single preview (localhost:8090).
+        concurrency:
+          group: local-acceptance
+          limit: 1
+        executor:
+          agent: claude-code
+          model: claude-opus-5-5
+          reasoning_effort: medium
+        inputs:
+          - artifact: plan
+            from_stage: plan
+          - artifact: pull_request
+            from_stage: implement
+        egress:
+          target_hosts:
+            - localhost:8090
+        produces:
+          - artifact: acceptance
+        budget:
+          max_tokens: 150000
+          max_runtime: 10m
+          limit_usd: 3
+          enforcement: advisory
+
+      # The merge gate. A human executor, and an approval excluding the
+      # change's author and any agent identity. No gate-level autonomy or
+      # actions block (see the workflow-level comment).
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: implement
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              # Forge-verified approver identity, as on feature_change.
+              members: ["github:kuhlman-labs"]
               not: [author, agent]
 
   # ---------------------------------------------------------------------------
