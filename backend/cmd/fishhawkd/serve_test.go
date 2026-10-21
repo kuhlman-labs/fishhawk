@@ -1018,6 +1018,21 @@ func TestServeGo_WiresMergeReconcilerPollHelpers(t *testing.T) {
 	}
 }
 
+// TestServeGo_EnablesCampaignDependencyRefresh pins the production wiring of
+// the monotone campaign dependency refresh (E86.47 / #4358). The flag defaults
+// false so fake-backed server tests make no forge read; without this literal
+// in serve.go a deployed campaign's DAG would stay frozen at assembly and no
+// server-package test could see it.
+func TestServeGo_EnablesCampaignDependencyRefresh(t *testing.T) {
+	src, err := os.ReadFile("serve.go")
+	if err != nil {
+		t.Fatalf("read serve.go: %v", err)
+	}
+	if !strings.Contains(string(src), "cfg.CampaignDependencyRefresh = true") {
+		t.Errorf("serve.go does not set cfg.CampaignDependencyRefresh = true; campaign status polls and item starts would never re-read tracker dependency edges")
+	}
+}
+
 // TestServeGo_StartsMergeCandidateQueuePump pins the ADR-092 held-pass queue's
 // liveness wiring (#4302, M3): runServe must START the periodic pump, in its own
 // goroutine, as `go srv.RunMergeCandidateQueuePump(ctx,

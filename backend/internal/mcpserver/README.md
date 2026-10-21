@@ -2941,6 +2941,14 @@ per-tool contract). Internals not covered there:
   it does NOT cancel the linked RUNS (`fishhawk_cancel_run` owns that). Idempotent + convergent — re-invoking after a
   partial failure completes the cancellation. Maps `campaign_not_cancellable` (already terminal) / `campaign_not_found`
   onto actionable tool errors.
+- **`fishhawk_append_campaign_items` (E86.47 / #4358).** `campaign_id`, `items` (1..50 refs), optional
+  `allow_external_blockers`. Thin wrapper over `POST /v0/campaigns/{id}/items` (`write:campaigns`): appends issues to a
+  pending/running/paused/awaiting_human campaign without rebuilding it. Each refusal carries its remedy
+  (`appendCampaignItemsRemedy`): `campaign_external_dependency` names `allow_external_blockers`,
+  `campaign_dependency_cycle` renders `details.cycle`, `campaign_item_duplicate` names the member(s). The new
+  input/output/result types are UNEXPORTED so the exported-surface baseline is unchanged.
+  `fishhawk_get_campaign_status` passes the status read's `dependency_refresh` block through (the monotone refresh:
+  tracker edges only ever ADDED for unstarted items; contract in `backend/internal/campaign/README.md`).
 - The campaign-scoped operator procedure lives in the operator role spec's `conventions.campaign`
   (`docs/spec/operator-role.md`), not hard-coded here.
 - **Batch-as-campaign local drive.** The step-by-step operator procedure for driving a multi-issue batch

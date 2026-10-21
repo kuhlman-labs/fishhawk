@@ -112,3 +112,8 @@ func (BaseFake) SettleCampaignItemOutOfBand(_ context.Context, _ uuid.UUID) (*It
 func (BaseFake) SettleCampaignItemForClosedIssue(_ context.Context, _ uuid.UUID, _ ItemState) (*Item, error) {
 	return nil, ErrNotFound
 }
+
+// AppendCampaignItems returns nil, ErrNotFound.
+func (BaseFake) AppendCampaignItems(_ context.Context, _ AppendCampaignItemsParams) (*AppendOutcome, error) {
+	return nil, ErrNotFound
+}
