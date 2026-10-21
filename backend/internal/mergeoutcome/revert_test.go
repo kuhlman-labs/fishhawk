@@ -248,6 +248,30 @@ func TestIsDefaultBranchPush(t *testing.T) {
 	}
 }
 
+// HasRevertSignals is the push route's pre-scan (#3990): it must agree with
+// ObservePush's collectSignals rules, so a push it rejects truly needs no
+// forge work.
+func TestPushEvent_HasRevertSignals(t *testing.T) {
+	sha := "0123456789abcdef0123456789abcdef01234567"
+	cases := []struct {
+		name string
+		push *PushEvent
+		want bool
+	}{
+		{"trailer", &PushEvent{Commits: []PushCommit{{ID: "c1", Message: "Revert x\n\nThis reverts commit " + sha + "."}}}, true},
+		{"subject", &PushEvent{Commits: []PushCommit{{ID: "c1", Message: `Revert "feat: add widgets (#42)"`}}}, true},
+		{"plain commit", &PushEvent{Commits: []PushCommit{{ID: "c1", Message: "feat: add widgets (#42)"}}}, false},
+		{"revert-of-revert subject without trailer", &PushEvent{Commits: []PushCommit{{ID: "c1", Message: `Revert "Revert "feat: add widgets (#42)""`}}}, false},
+		{"signal on an empty-id commit", &PushEvent{Commits: []PushCommit{{ID: "", Message: "This reverts commit " + sha + "."}}}, false},
+		{"nil receiver", nil, false},
+	}
+	for _, tc := range cases {
+		if got := tc.push.HasRevertSignals(); got != tc.want {
+			t.Errorf("%s: HasRevertSignals = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
 func TestParseRevertSignals(t *testing.T) {
 	cases := []struct {
 		name string
