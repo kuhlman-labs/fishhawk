@@ -18,50 +18,28 @@ import (
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
 )
 
-// --- #3948 verify-lock contention ---------------------------------------
+// --- #3948 verify-lock contention, by exit code since #4022 ----------------
 //
 // Every contended case below seeds the refusal BY CONSTRUCTION: a scripted
-// verify command prints scripts/test's real runner-vs-runner refusal text and
-// exits non-zero, so the assertions land on the classification, not on fixture
-// setup. TestRealScriptsTestRunnerRefusalIsVerifyLockContended binds that text
-// to the REAL script's behaviour.
-//
-// OUTPUT HYGIENE (approval condition 5). This repository's own committed-tree
-// gate runs these tests, and a failing test's output becomes that gate's
-// verify output. No failure message below may therefore carry a refusal
-// literal: every message that would print an error, a reason or a log routes
-// it through redactLockRefusal first, and the signature tables are reported by
-// index, never by value.
+// verify command exits 73 (verifyExitLockRefused) with SIGNATURE-FREE output,
+// so only the exit-code disposition can classify it — no text fallback can
+// mask a missing arm. TestRealScriptsTestRefusalExitsLockRefused binds the
+// code to the REAL script's behaviour.
 
-// lockRefusalFixtureOutput is scripts/test's runner-vs-runner refusal as a
-// RUNNER-kind verify prints it: the wait announcement, then the refusal once
-// the 600s budget is spent.
-const lockRefusalFixtureOutput = `scripts/test: waiting up to 600s for the verify lock at /primary/.git/fishhawk-verify.lock (holder pid 4242, kind runner)
-scripts/test: another RUNNER verify still holds the lock at /primary/.git/fishhawk-verify.lock after 600s
-(holder pid 4242, this pid 4343). Two concurrent runner verifies on one
-worktree family is a bug to surface, not one to paper over — refusing rather than
-displacing a peer runner.`
+// lockRefusalFixtureOutput is what the fixture prints on a refused run. It
+// carries no scripts/test refusal literal and matches no infra signature.
+const lockRefusalFixtureOutput = "fixture: the shared verify lock could not be acquired"
 
-// redactLockRefusal replaces every refusal signature in s with a placeholder,
-// so a failure message can show the surrounding text without echoing a
-// literal the outer gate would read as contention.
-func redactLockRefusal(s string) string {
-	for i, sig := range verifyLockRefusalSignatures {
-		s = strings.ReplaceAll(s, sig, fmt.Sprintf("<lock-refusal-signature-%d>", i))
-	}
-	return s
-}
-
-// redactErr is redactLockRefusal over an error's text ("<nil>" for nil).
+// redactErr renders an error's text ("<nil>" for nil) for a failure message.
 func redactErr(err error) string {
 	if err == nil {
 		return "<nil>"
 	}
-	return redactLockRefusal(err.Error())
+	return err.Error()
 }
 
 // contendedNTimesThenPassVerifyCmd writes a verify script that prints the
-// refusal and exits 1 on its first n invocations, then exits 0. The
+// fixture output and exits 73 on its first n invocations, then exits 0. The
 // invocation count is recorded in a counter file OUTSIDE the worktree (the
 // gate runs the command in a throwaway clone), returned for the caller to read.
 func contendedNTimesThenPassVerifyCmd(t *testing.T, n int) (cmd, counter string) {
@@ -74,8 +52,8 @@ func contendedNTimesThenPassVerifyCmd(t *testing.T, n int) (cmd, counter string)
 		"c=$((c + 1))\n"+
 		"echo \"$c\" > "+counter+"\n"+
 		"if [ \"$c\" -le "+strconv.Itoa(n)+" ]; then\n"+
-		"  cat <<'FISHHAWK_VERIFY_EOF'\n"+lockRefusalFixtureOutput+"\nFISHHAWK_VERIFY_EOF\n"+
-		"  exit 1\n"+
+		"  echo '"+lockRefusalFixtureOutput+"'\n"+
+		"  exit "+strconv.Itoa(verifyExitLockRefused)+"\n"+
 		"fi\n"+
 		"exit 0\n")
 	return "sh " + script, counter
@@ -129,101 +107,42 @@ func verifySummaryOf(t *testing.T, events []agent.Event) (outcome, detail string
 	return outcome, detail
 }
 
-// --- (A) the matcher ------------------------------------------------------
+// --- (A) the exit-code pin ------------------------------------------------
 
-func TestIsVerifyLockContended(t *testing.T) {
-	cases := []struct {
-		name   string
-		output string
-		want   bool
-	}{
-		{"runner-vs-runner refusal after the wait announcement", lockRefusalFixtureOutput, true},
-		{"runner-vs-runner refusal alone", "scripts/test: another RUNNER verify still holds the lock at /l after 600s\n(holder pid 1, this pid 2).", true},
-		{"retaken after a displacement",
-			"scripts/test: WARNING: displacing a wedged shell verify holding /l (deposed pid 9) after 600s — two verifies may now contend.\n" +
-				"scripts/test: the freed verify lock at /l was taken by another invocation before this one could re-acquire it — this invocation will not displace again.\n" +
-				"scripts/test: the verify lock at /l was retaken after a displacement — refusing rather than displacing twice", true},
-		{"lock never settled (multi-line message)",
-			"scripts/test: the verify lock never settled — refusing rather than proceeding under an uncertain lock state.\nIf this repeats, a pruner was killed holding a recovery claim.", true},
-		{"CRLF line endings", "scripts/test: waiting up to 600s for the verify lock\r\nscripts/test: another RUNNER verify still holds the lock at /l after 600s\r\n", true},
-		{"leading blank lines", "\n\n  \nscripts/test: another RUNNER verify still holds the lock at /l after 600s", true},
-		{"golangci-lint lock contention is the #2645 absorb's, not this", lintLockOutput2645, false},
-		{"ordinary test failure", ordinaryFailOutput, false},
-		{"shell-kind immediate refusal is not a runner-gate signature",
-			"scripts/test: another verify already holds the lock at /l (pid 7, kind runner).\nThe runner owns verify for this stage.", false},
-		// Position anchor (approval condition 5): a literal printed by a test
-		// can only follow lint/test output, so it is never recognised.
-		{"literal inside a failing test's output",
-			"0 issues.\n--- FAIL: TestX (0.00s)\n    x_test.go:3: scripts/test: another RUNNER verify still holds the lock at /l after 600s\nFAIL", false},
-		{"literal on an unprefixed first line", "    x_test.go:3: another RUNNER verify still holds the lock", false},
-		{"literal after an unrelated scripts/test-prefixed line and lint output",
-			"scripts/test: waiting up to 600s for the verify lock\n>>> ./backend\nscripts/test: another RUNNER verify still holds the lock", false},
-		{"only the wait announcement (no refusal)", "scripts/test: waiting up to 600s for the verify lock at /l (holder pid 1, kind runner)", false},
-		{"empty", "", false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			if got := isVerifyLockContended(tc.output); got != tc.want {
-				t.Errorf("isVerifyLockContended = %t, want %t for:\n%s", got, tc.want, redactLockRefusal(tc.output))
-			}
-		})
-	}
-}
-
-// --- (B) the name pin -----------------------------------------------------
-
-// TestVerifyLockRefusalSignaturesMatchScriptsTest binds every signature, the
-// line prefix the position anchor requires, and verifyLockWaitBudget to the
-// REAL scripts/test text: a rewording on either side fails here.
-func TestVerifyLockRefusalSignaturesMatchScriptsTest(t *testing.T) {
+// TestVerifyExitCodesMatchScriptsTest binds verifyExitLockRefused,
+// verifyExitTempFail and verifyLockWaitBudget to the REAL scripts/test
+// declarations: a renumbering on either side fails here.
+func TestVerifyExitCodesMatchScriptsTest(t *testing.T) {
 	root := repoRootForVerifyScopeTest(t)
 	b, err := os.ReadFile(filepath.Join(root, "scripts", "test"))
 	if err != nil {
 		t.Fatalf("read scripts/test: %v", err)
 	}
-	lines := strings.Split(string(b), "\n")
-	for i, sig := range verifyLockRefusalSignatures {
-		found := false
-		for _, line := range lines {
-			idx := strings.Index(line, sig)
-			if idx < 0 {
-				continue
-			}
-			found = true
-			// The position anchor requires the refusal LINE to begin with the
-			// prefix: in the script it is a heredoc line, an echo argument or
-			// a quoted assignment, and in every form the prefix precedes the
-			// signature on the same line.
-			if !strings.Contains(line[:idx], verifyLockRefusalLinePrefix) {
-				t.Errorf("verifyLockRefusalSignatures[%d]: the scripts/test line carrying it does not print the %q prefix ahead of it", i, verifyLockRefusalLinePrefix)
-			}
+	for _, want := range []string{
+		fmt.Sprintf("VERIFY_EXIT_TEMPFAIL=%d\n", verifyExitTempFail),
+		fmt.Sprintf("VERIFY_EXIT_LOCK_REFUSED=%d\n", verifyExitLockRefused),
+		fmt.Sprintf("VERIFY_LOCK_WAIT_SECONDS=%d\n", int(verifyLockWaitBudget/time.Second)),
+	} {
+		if !strings.Contains(string(b), want) {
+			t.Errorf("scripts/test does not declare %q — the runner's verify exit-code contract no longer mirrors the script", strings.TrimSpace(want))
 		}
-		if !found {
-			t.Errorf("verifyLockRefusalSignatures[%d] does not appear in scripts/test — the runner would stop recognising that refusal", i)
-		}
-	}
-	want := fmt.Sprintf("VERIFY_LOCK_WAIT_SECONDS=%d\n", int(verifyLockWaitBudget/time.Second))
-	if !strings.Contains(string(b), want) {
-		t.Errorf("scripts/test does not declare %q — verifyLockWaitBudget no longer mirrors the runner-vs-runner wait", strings.TrimSpace(want))
 	}
 }
 
-// --- (C) the executable pin -----------------------------------------------
+// --- (B) the executable pin -----------------------------------------------
 
-// TestRealScriptsTestRunnerRefusalIsVerifyLockContended drives the REAL
-// scripts/test (copied into the standard fixture by `scripts/test-verify-scope
-// --fixture`) into its runner-vs-runner refusal and asserts the matcher
-// accepts what it actually prints.
+// TestRealScriptsTestRefusalExitsLockRefused drives the REAL scripts/test
+// (copied into the standard fixture by `scripts/test-verify-scope --fixture`)
+// into its verify-lock refusal and asserts it exits 73, which
+// verifyExitDisposition maps to gateLockRefused.
 //
-// Holder encoding (approval condition 6), read from scripts/test: the lock is
-// a symlink whose TARGET is `<pid>:<kind>`; _verify_lock_classify reports
-// live-<kind> when `kill -0 <pid>` succeeds. The script's own identity is `$$`
-// (_verify_lock_self_pid), the bash process's pid — never this test process's
-// — so os.Getpid() is a FOREIGN live runner holder by construction, alive for
-// the whole test. FISHHAWK_VERIFY_LOCK_WAIT_SECONDS is read by
-// _verify_lock_wait_budget, which is what the acquire loop compares `waited`
-// against, so 0 makes the refusal immediate.
-func TestRealScriptsTestRunnerRefusalIsVerifyLockContended(t *testing.T) {
+// Holder encoding, read from scripts/test: the lock is a symlink whose TARGET
+// is `<pid>:<kind>`; _verify_lock_classify reports live-<kind> when `kill -0
+// <pid>` succeeds. The script's own identity is `$$`, the bash process's pid —
+// never this test process's — so os.Getpid() is a FOREIGN live runner holder
+// by construction. FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0 makes the refusal
+// immediate.
+func TestRealScriptsTestRefusalExitsLockRefused(t *testing.T) {
 	if _, err := exec.LookPath("bash"); err != nil {
 		t.Skipf("bash not on PATH (%v); skipping the cross-boundary script test", err)
 	}
@@ -233,7 +152,7 @@ func TestRealScriptsTestRunnerRefusalIsVerifyLockContended(t *testing.T) {
 	build := exec.Command("bash", harness, "--fixture", fixture) //nolint:gosec // fixed workspace-relative path
 	build.Env = append(os.Environ(), "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null")
 	if out, err := build.CombinedOutput(); err != nil {
-		t.Fatalf("building the standard fixture failed: %v\n%s", err, redactLockRefusal(string(out)))
+		t.Fatalf("building the standard fixture failed: %v\n%s", err, out)
 	}
 	goLog := filepath.Join(fixture, "logs", "go.log")
 	if err := os.Truncate(goLog, 0); err != nil {
@@ -259,37 +178,40 @@ func TestRealScriptsTestRunnerRefusalIsVerifyLockContended(t *testing.T) {
 	if tmp := os.Getenv("TMPDIR"); tmp != "" {
 		base = append(base, "TMPDIR="+tmp)
 	}
-	runVerify := func(env []string) (string, error) {
+	runVerify := func(env []string) (string, int) {
 		cmd := exec.Command("bash", filepath.Join(fixture, "scripts", "test"), "verify") //nolint:gosec // fixture path
 		cmd.Dir = fixture
 		cmd.Env = env
 		out, err := cmd.CombinedOutput()
-		return string(out), err
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return string(out), ee.ExitCode()
+		}
+		if err != nil {
+			t.Fatalf("running scripts/test verify: %v\n%s", err, out)
+		}
+		return string(out), 0
 	}
 
-	// RUNNER kind — what runVerifyCommittedTree injects.
-	out, err := runVerify(verifyLockOwnerEnv(base))
-	if err == nil {
-		t.Fatalf("the real scripts/test verify exited 0 against a live runner holder, want a refusal:\n%s", redactLockRefusal(out))
-	}
-	if !isVerifyLockContended(out) {
-		t.Errorf("isVerifyLockContended = false on the real scripts/test runner refusal:\n%s", redactLockRefusal(out))
+	// RUNNER kind — what runVerifyCommittedTree injects — and SHELL kind: both
+	// refusals exit 73.
+	for _, kind := range []struct {
+		name string
+		env  []string
+	}{{"runner", verifyLockOwnerEnv(base)}, {"shell", base}} {
+		out, code := runVerify(kind.env)
+		if code != verifyExitLockRefused {
+			t.Errorf("%s-kind scripts/test verify against a live runner holder exited %d, want %d:\n%s", kind.name, code, verifyExitLockRefused, out)
+		}
+		if got := verifyExitDisposition(code, gateExecuted); got != gateLockRefused {
+			t.Errorf("%s-kind refusal disposition = %s, want lock_refused", kind.name, got)
+		}
 	}
 	if b, rerr := os.ReadFile(goLog); rerr != nil || len(strings.TrimSpace(string(b))) != 0 {
-		t.Errorf("`go test` ran before the refusal (log %q, err %v) — the position anchor assumes the lock is taken before any leg", b, rerr)
+		t.Errorf("`go test` ran before the refusal (log %q, err %v) — the lock is taken before any leg", b, rerr)
 	}
 	if got, lerr := os.Readlink(lock); lerr != nil || got != holder {
 		t.Errorf("the planted holder was disturbed (target %q, err %v) — a runner must refuse, never displace a peer runner", got, lerr)
-	}
-
-	// SHELL kind — the same live holder yields the shell refusal, which is
-	// deliberately not a runner-gate signature.
-	out, err = runVerify(base)
-	if err == nil {
-		t.Fatalf("the real scripts/test verify exited 0 as a shell caller against a live holder, want a refusal:\n%s", redactLockRefusal(out))
-	}
-	if isVerifyLockContended(out) {
-		t.Errorf("isVerifyLockContended = true on the SHELL-kind refusal, want false:\n%s", redactLockRefusal(out))
 	}
 }
 
@@ -364,10 +286,10 @@ func TestRunVerifyFixLoop_VerifyLockAlwaysContendedIsCategoryC(t *testing.T) {
 		t.Errorf("res = OK:%t cat:%q, want category C", res.OK, res.FailureCategory)
 	}
 	if !strings.HasPrefix(res.FailureReason, verifyLockContendedLead+": ") {
-		t.Errorf("FailureReason must lead with %q, got:\n%s", verifyLockContendedLead+": ", redactLockRefusal(res.FailureReason))
+		t.Errorf("FailureReason must lead with %q, got:\n%s", verifyLockContendedLead+": ", res.FailureReason)
 	}
 	if strings.Contains(res.FailureReason, "No further in-place re-run") {
-		t.Errorf("an unbounded context must not report a budget skip:\n%s", redactLockRefusal(res.FailureReason))
+		t.Errorf("an unbounded context must not report a budget skip:\n%s", res.FailureReason)
 	}
 	if n := readInvocations(t, counter); n != 3 {
 		t.Errorf("verify invocations = %d, want 3 (1 initial + 2 re-runs)", n)
@@ -379,14 +301,14 @@ func TestRunVerifyFixLoop_VerifyLockAlwaysContendedIsCategoryC(t *testing.T) {
 		t.Errorf("verify_lock_contended events = %d, want 1", n)
 	}
 	if !strings.Contains(logSink.String(), `"cause":"reruns_exhausted"`) {
-		t.Errorf("verify_lock_contended log line must name cause reruns_exhausted:\n%s", redactLockRefusal(logSink.String()))
+		t.Errorf("verify_lock_contended log line must name cause reruns_exhausted:\n%s", logSink.String())
 	}
 	if n := countEvents(res.Events, "verify_infra_flake_retry"); n != 0 {
 		t.Errorf("verify_infra_flake_retry events = %d, want 0", n)
 	}
 	outcome, detail := verifySummaryOf(t, res.Events)
 	if outcome != "failed" || !strings.HasPrefix(detail, verifyLockContendedLead+": ") {
-		t.Errorf("verify_summary = %q / %q, want failed with the contended lead", outcome, redactLockRefusal(detail))
+		t.Errorf("verify_summary = %q / %q, want failed with the contended lead", outcome, detail)
 	}
 }
 
@@ -426,10 +348,10 @@ func TestRunVerifyFixLoop_VerifyLockContentionHonoursStageBudget(t *testing.T) {
 			}
 			if res.FailureCategory != "C" || !strings.HasPrefix(res.FailureReason, verifyLockContendedLead+": ") {
 				t.Errorf("res = cat:%q reason:%q, want category C verify_lock_contended (never a timeout classification)",
-					res.FailureCategory, redactLockRefusal(res.FailureReason))
+					res.FailureCategory, res.FailureReason)
 			}
 			if strings.HasPrefix(res.FailureReason, verifyGateTimedOutLead) {
-				t.Errorf("a budget skip must not read as a timed-out gate:\n%s", redactLockRefusal(res.FailureReason))
+				t.Errorf("a budget skip must not read as a timed-out gate:\n%s", res.FailureReason)
 			}
 			if invoker.callIdx != 0 {
 				t.Errorf("fix invocations = %d, want 0", invoker.callIdx)
@@ -442,14 +364,14 @@ func TestRunVerifyFixLoop_VerifyLockContentionHonoursStageBudget(t *testing.T) {
 			}
 			short := strings.Contains(res.FailureReason, "No further in-place re-run was attempted")
 			if short != tc.wantShort {
-				t.Errorf("budget-skip note present = %t, want %t:\n%s", short, tc.wantShort, redactLockRefusal(res.FailureReason))
+				t.Errorf("budget-skip note present = %t, want %t:\n%s", short, tc.wantShort, res.FailureReason)
 			}
 			wantCause := `"cause":"reruns_exhausted"`
 			if tc.wantShort {
 				wantCause = `"cause":"budget_short"`
 			}
 			if !strings.Contains(logSink.String(), wantCause) {
-				t.Errorf("verify_lock_contended log line must carry %s:\n%s", wantCause, redactLockRefusal(logSink.String()))
+				t.Errorf("verify_lock_contended log line must carry %s:\n%s", wantCause, logSink.String())
 			}
 		})
 	}

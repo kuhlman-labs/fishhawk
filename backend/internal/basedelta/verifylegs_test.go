@@ -128,8 +128,7 @@ var realLegTable = legTable{
 			r("runner/cmd/fishhawk-runner/*.go"), r("cli/cmd/fishhawk/*.go"), g("go.work"))},
 	},
 	verifyPlumbing: []string{
-		`if ! _acquire_verify_lock; then`,
-		`exit 1`,
+		`_acquire_verify_lock || exit "$?"`,
 		`fi`,
 		`if [ "$VERIFY_NO_TESTS" = "1" ]; then`,
 		`echo "scripts/test: verify --no-tests — the go test loop and the patch-coverage gate are SKIPPED (the daemon-dependent tests need full gate isolation, #2137); the full verify still runs them" >&2`,

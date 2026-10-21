@@ -474,6 +474,67 @@ func TestFixupStage_NoOperatorEvidence_OmittedFromBody(t *testing.T) {
 	}
 }
 
+// TestFixupStage_InstructionTargets_ThreadsIntoBody: instruction_targets
+// (E83.37 / #4022) reaches the backend request body verbatim — the backend owns
+// validation, so the verb passes every key and value through, invalid ones
+// included — and is omitted from the body when unset. Asserted on the RAW wire
+// body, since the shared fake decodes into the client's fixupRequest, which does
+// not carry the field.
+//
+// Counterfactual: drop InstructionTargets from the marshalled body in
+// fixupStageWithObligations and the first case goes RED.
+func TestFixupStage_InstructionTargets_ThreadsIntoBody(t *testing.T) {
+	cid := uuid.New().String()
+	for _, tc := range []struct {
+		name    string
+		targets map[string]string
+		want    map[string]any
+	}{
+		{"set", map[string]string{cid: "pr_body", "reason": "docs", "operator_concern": "not-a-target"},
+			map[string]any{cid: "pr_body", "reason": "docs", "operator_concern": "not-a-target"}},
+		{"unset", nil, nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			stageID, runID := uuid.New(), uuid.New()
+			var raw map[string]any
+			ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_ = json.NewDecoder(r.Body).Decode(&raw)
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(map[string]any{
+					"id": stageID.String(), "run_id": runID.String(), "type": "implement", "state": "pending",
+				})
+			}))
+			t.Cleanup(ts.Close)
+			r := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})}
+			if _, _, err := r.fixupStage(context.Background(), nil, FixupStageInput{
+				StageID: stageID.String(), ConcernIDs: []string{cid}, Reason: "r", InstructionTargets: tc.targets,
+			}); err != nil {
+				t.Fatalf("fixupStage: %v", err)
+			}
+			got, present := raw["instruction_targets"]
+			if tc.want == nil {
+				if present {
+					t.Errorf("body carries instruction_targets = %v with the field unset, want it omitted", got)
+				}
+				return
+			}
+			m, _ := got.(map[string]any)
+			if len(m) != len(tc.want) {
+				t.Fatalf("body instruction_targets = %v, want %v", got, tc.want)
+			}
+			for k, v := range tc.want {
+				if m[k] != v {
+					t.Errorf("body instruction_targets[%q] = %v, want %v", k, m[k], v)
+				}
+			}
+			// The shared fields still promote to the top level of the body.
+			if ids, _ := raw["concern_ids"].([]any); len(ids) != 1 || ids[0] != cid || raw["reason"] != "r" {
+				t.Errorf("shared fixupRequest fields not at the top level: %v", raw)
+			}
+		})
+	}
+}
+
 // --- #2782: PR-body-unsatisfiable routing-time warning ---
 
 // fixupResolverReturning builds a resolver whose backend returns the given
@@ -518,8 +579,9 @@ func TestFixupStage_PRBodyInstruction_WarnsAtRouting(t *testing.T) {
 	})
 
 	_, out, err := r.fixupStage(context.Background(), nil, FixupStageInput{
-		StageID:         stageID.String(),
-		OperatorConcern: "Record the counterfactual table in the PR body's ## Notes.",
+		StageID:            stageID.String(),
+		OperatorConcern:    "Record the counterfactual table in the PR body's ## Notes.",
+		InstructionTargets: map[string]string{"operator_concern": "pr_body"},
 	})
 	if err != nil {
 		t.Fatalf("fixupStage: %v", err)
@@ -532,7 +594,8 @@ func TestFixupStage_PRBodyInstruction_WarnsAtRouting(t *testing.T) {
 		"ob-1",              // the server's obligation id (CONDITION 2)
 		"operator_concern",  // the arrival channel (CONDITION 2)
 		"PULL-REQUEST BODY", // names the PR body
-		"CANNOT update",     // states a fix-up pass cannot update it
+		"instruction_targets: pr_body",
+		"CANNOT update", // states a fix-up pass cannot update it
 		"self-report sidecar",
 	} {
 		if !strings.Contains(w, want) {

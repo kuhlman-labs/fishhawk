@@ -5706,9 +5706,10 @@ components:
         The `POST /v0/stages/{stage_id}/fixup` 200 body (#2782): the re-opened
         Stage with an OPTIONAL `pr_body_obligations` field. All the Stage fields
         appear at the top level exactly as before; `pr_body_obligations` is
-        present only when a routed instruction named the pull-request body — a
-        surface a fix-up pass cannot write — so a pass that routed none serves a
-        byte-identical Stage response.
+        present only when a routed instruction was declared with the `pr_body`
+        target in `instruction_targets` (E83.37 / #4022) — the pull-request
+        body is a surface a fix-up pass cannot write — so a pass that targeted
+        none serves a byte-identical Stage response.
       allOf:
         - $ref: '#/components/schemas/Stage'
         - type: object
@@ -5716,7 +5717,8 @@ components:
             pr_body_obligations:
               type: array
               description: |
-                Routed instructions that named the pull-request body (#2782), so
+                Routed instructions declared with the `pr_body` target (#2782,
+                E83.37 / #4022), so
                 the caller (the MCP verb) can warn the operator that a fix-up
                 pass has no mechanism to write it. The same ids appear later to
                 the reviewer. Omitted when empty.
@@ -5821,8 +5823,9 @@ components:
     PRBodyObligation:
       type: object
       description: |
-        One routed instruction that named the pull-request body — a surface a
-        fix-up pass cannot write (#2782).
+        One routed instruction declared with the `pr_body` target — the
+        pull-request body, a surface a fix-up pass cannot write (#2782,
+        E83.37 / #4022).
       required: [id, source, text_excerpt]
       additionalProperties: false
       properties:
@@ -25946,13 +25949,41 @@ paths:
                     text is recorded on the `stage_fixup_triggered` audit entry
                     as `operator_evidence` ONLY when non-empty, so a fix-up that
                     omits it leaves the payload byte-identical.
+                instruction_targets:
+                  type: object
+                  description: |
+                    Optional router-declared target of each routed instruction
+                    (E83.37 / #4022): the surface the instruction asks the pass
+                    to change. A key is a routed concern id from `concern_ids`,
+                    `operator_concern`, or `reason`; a value is `code`,
+                    `pr_body`, or `docs`. An instruction with no key is `code`.
+                    The target alone decides whether the instruction is
+                    unsatisfiable on a fix-up pass: `pr_body` (a pass cannot
+                    write the PR body, #2782) puts it on the response's
+                    `pr_body_obligations`, writes a `fixup_pr_body_unsatisfiable`
+                    audit entry, and makes the implement review report it
+                    `unsatisfiable` even under a `met` self-report. The
+                    instruction's prose is never classified for that, so an
+                    undeclared instruction that mentions the PR body is an
+                    ordinary instruction. Index-routed (deprecated positional
+                    `concerns`) concerns cannot be targeted. Every value is
+                    validated before the stage lookup and every key must name
+                    an instruction this request routes; otherwise 400
+                    `validation_failed` (`field: instruction_targets`). Recorded
+                    on the `stage_fixup_triggered` payload as `concern_targets`
+                    (aligned with `concerns`), `operator_concern_target` and
+                    `reason_target`, each omitted when every target is `code`.
+                  additionalProperties:
+                    type: string
+                    enum: [code, pr_body, docs]
       responses:
         '200':
           description: |
             Stage re-opened for the fix-up pass; refreshed Stage row in body,
             plus an OPTIONAL `pr_body_obligations` array (#2782) — present only
-            when a routed instruction named the pull-request body, a surface a
-            fix-up pass cannot write. Absent otherwise, so an unchanged consumer
+            when a routed instruction was declared with the `pr_body` target in
+            `instruction_targets` (E83.37 / #4022) — the pull-request body, a
+            surface a fix-up pass cannot write. Absent otherwise, so an unchanged consumer
             sees a byte-identical Stage response.
           content:
             application/json:

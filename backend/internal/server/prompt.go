@@ -4509,9 +4509,11 @@ type fixupReportObligationsDeclaredPayload struct {
 //     the whole point: the review joins against the exact entry the agent saw,
 //     not against whatever is newest when the review happens to run.
 //
-// The selected entry's `concerns` notes, `operator_concern`, and `reason` are
+// The selected entry's `concerns` notes, `operator_concern`, and `reason` —
+// with the router-declared targets recorded beside them (concern_targets /
+// operator_concern_target / reason_target, E83.37 / #4022; absent = code) — are
 // fed to fixupobligation.Detect, so the same entry always mints the same `ob-N`
-// ids.
+// ids and the same PR-body classification.
 //
 // Returns nil when the AuditRepo is unconfigured, the stage carries no fix-up
 // trigger (the common, non-fix-up case), no routed instruction carries a
@@ -4542,10 +4544,15 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 		if atTriggerSequence > 0 && e.Sequence != atTriggerSequence {
 			continue
 		}
+		// The embedded fixupInstructionTargets decodes the router-declared
+		// targets the trigger recorded (E83.37 / #4022) from the SAME struct
+		// writeFixupAudit wrote them from; an absent key decodes to code, so a
+		// pre-#4022 payload re-derives as all-code.
 		var payload struct {
 			Concerns        []planreview.Concern `json:"concerns"`
 			Reason          string               `json:"reason"`
 			OperatorConcern string               `json:"operator_concern"`
+			fixupInstructionTargets
 		}
 		if err := json.Unmarshal(e.Payload, &payload); err != nil {
 			// Same tolerance as resolveFixupConcerns: skip a malformed entry.
@@ -4562,9 +4569,10 @@ func (s *Server) resolveFixupReportObligations(ctx context.Context, runID, stage
 		// compares against the minted concern's note text (#2623), and each
 		// concern's TRUST provenance rides through so an obligation detected
 		// inside an acceptance-synthesized note stays quarantined at every render
-		// site (ADR-050 / E31.8 / #1613).
+		// site (ADR-050 / E31.8 / #1613). The recorded targets ride the same
+		// helper, so PRBody here is the routing-time PRBody (E83.37 / #4022).
 		obligations := fixupobligation.Detect(
-			buildFixupObligationSources(payload.Concerns, payload.OperatorConcern, payload.Reason))
+			buildFixupObligationSources(payload.Concerns, payload.OperatorConcern, payload.Reason, payload.fixupInstructionTargets))
 		if len(obligations) == 0 {
 			return nil, 0
 		}

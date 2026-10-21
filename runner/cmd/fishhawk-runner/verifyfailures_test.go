@@ -768,8 +768,9 @@ func TestRunVerifyFixLoop_NoopFlakeRerunFailingUnknownIsRefunded(t *testing.T) {
 func TestRunVerifyFixLoop_FlakeRerunSurvivesVerifyLockContention(t *testing.T) {
 	f := newNoopLoopFixture(t, 1,
 		scopedPass(), fullFail(noopOutsideOut), // iter 0 → fix 1 (no-op)
-		scopedFail(lockRefusalFixtureOutput), // iter 1: admitted re-run is lock-contended → in-place repeat
-		scopedPass(), fullPass(),             // the repeat on the identical tree passes
+		// iter 1: admitted re-run is lock-contended (exit 73) → in-place repeat
+		noopVerifyStep{scoped: true, out: lockRefusalFixtureOutput, rc: verifyExitLockRefused},
+		scopedPass(), fullPass(), // the repeat on the identical tree passes
 	)
 	inv := cappedInvoker(t, 3, nil)
 	res, tree, log := f.run(t, inv)

@@ -95,14 +95,15 @@ func TestDetect_IDsAreDeterministicAndKindOrdered(t *testing.T) {
 	if len(got) != 4 {
 		t.Fatalf("Detect returned %d, want 4: %+v", len(got), got)
 	}
-	// Every text here names a PR-body surface (PR body / ## Notes / pull
-	// request description), so each obligation carries PRBody true — the id
-	// ordering itself is unchanged by the #2782 split, which is what this pins.
+	// Every text here names a PR-body surface in prose, but no source declares
+	// a target, so each obligation is a code-target obligation with PRBody
+	// false (E83.37 / #4022: prose never decides satisfiability). The id
+	// ordering itself is what this pins.
 	want := []Obligation{
-		{ID: "ob-1", Source: SourceConcern, Text: concernA, PRBody: true},
-		{ID: "ob-2", Source: SourceConcern, Text: concernB, PRBody: true},
-		{ID: "ob-3", Source: SourceOperatorConcern, Text: operatorText, PRBody: true},
-		{ID: "ob-4", Source: SourceReason, Text: reasonText, PRBody: true},
+		{ID: "ob-1", Source: SourceConcern, Text: concernA, Target: TargetCode},
+		{ID: "ob-2", Source: SourceConcern, Text: concernB, Target: TargetCode},
+		{ID: "ob-3", Source: SourceOperatorConcern, Text: operatorText, Target: TargetCode},
+		{ID: "ob-4", Source: SourceReason, Text: reasonText, Target: TargetCode},
 	}
 	for i := range want {
 		if got[i] != want[i] {
@@ -313,42 +314,76 @@ func TestDetect_CarriesUntrustedProvenance(t *testing.T) {
 	}
 }
 
-// TestDetect_PRBodyClassification pins the #2782 noun-list split: an
-// obligation naming the pull-request body (including the `## Notes` heading and
-// `notes section`, which ARE PR-body conventions in this workflow) carries
-// PRBody true, while one naming the run log — a surface the pass CAN write —
-// carries PRBody false. The classification decides whether an obligation is
-// later treated as unsatisfiable, so a change to it must be deliberate.
+// TestDetect_TargetDecidesSatisfiability pins E83.37 / #4022: PRBody — the
+// flag that makes an obligation unsatisfiable — is derived from the
+// ROUTER-DECLARED target alone, never from the instruction's prose.
 //
-// Delete the run-log carve-out (fold "run log" into prBodySurfaceNouns) and the
-// run-log arm goes RED; force NamesPRBodySurface to return false and every
-// PR-body arm goes RED.
-func TestDetect_PRBodyClassification(t *testing.T) {
+//   - prose naming the PR body + target code -> an obligation, PRBody false;
+//   - the same prose with NO target -> PRBody false (absent = code);
+//   - prose naming NO surface (and no recording verb) + target pr_body -> still
+//     an obligation, PRBody true;
+//   - a reporting instruction + target docs -> PRBody false (docs is writable).
+//
+// Counterfactuals: hard-code PRBody false in Detect and the pr_body rows go
+// RED; re-add a prose disjunct (PRBody also true when the text names "pr body")
+// and the code / no-target rows go RED; drop the `target != TargetPRBody`
+// inclusion disjunct and the no-surface pr_body row (which carries no recording
+// verb, so IsObligation is false) is not declared at all — RED.
+func TestDetect_TargetDecidesSatisfiability(t *testing.T) {
+	const prBodyProse = "Record the counterfactual results in the PR body's ## Notes."
 	cases := []struct {
 		name       string
 		text       string
+		target     Target
+		wantTarget Target
 		wantPRBody bool
 	}{
-		{"pr_body", "Record the deletion table in the PR body.", true},
-		{"pull_request_body", "Document each dropped branch in the pull request body.", true},
-		{"pr_description", "Report the mapping in the pull-request description.", true},
-		{"notes_heading", "Record the counterfactual results in the PR body's ## Notes.", true},
-		{"notes_section", "Document the failure modes in the notes section.", true},
-		{"run_log", "Report the observed RED output in the run log.", false},
+		{"pr_body_prose_code_target", prBodyProse, TargetCode, TargetCode, false},
+		{"pr_body_prose_no_target", prBodyProse, "", TargetCode, false},
+		{"no_surface_prose_pr_body_target", "Tighten the summary to mention the retry bound.", TargetPRBody, TargetPRBody, true},
+		{"reporting_prose_pr_body_target", prBodyProse, TargetPRBody, TargetPRBody, true},
+		{"run_log_prose_docs_target", "Report the observed RED output in the run log.", TargetDocs, TargetDocs, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got := Detect([]Source{{Kind: SourceConcern, Text: tc.text}})
+			got := Detect([]Source{{Kind: SourceConcern, Text: tc.text, Target: tc.target}})
 			if len(got) != 1 {
-				t.Fatalf("Detect(%q) = %+v, want exactly one obligation", tc.text, got)
+				t.Fatalf("Detect(%q, target %q) = %+v, want exactly one obligation", tc.text, tc.target, got)
 			}
 			if got[0].PRBody != tc.wantPRBody {
-				t.Errorf("Detect(%q).PRBody = %v, want %v", tc.text, got[0].PRBody, tc.wantPRBody)
+				t.Errorf("Detect(%q, target %q).PRBody = %v, want %v", tc.text, tc.target, got[0].PRBody, tc.wantPRBody)
 			}
-			if NamesPRBodySurface(tc.text) != tc.wantPRBody {
-				t.Errorf("NamesPRBodySurface(%q) = %v, want %v", tc.text, NamesPRBodySurface(tc.text), tc.wantPRBody)
+			if got[0].Target != tc.wantTarget {
+				t.Errorf("Detect(%q, target %q).Target = %q, want %q", tc.text, tc.target, got[0].Target, tc.wantTarget)
 			}
 		})
+	}
+}
+
+// TestDetect_NoTargetNonReportingInstructionStaysUndeclared is the no-noise
+// control for the pr_body inclusion disjunct: an ordinary code instruction
+// with no recording verb and a code (or absent) target is NOT declared, so the
+// disjunct widens the set only for a router-declared pr_body target.
+func TestDetect_NoTargetNonReportingInstructionStaysUndeclared(t *testing.T) {
+	for _, target := range []Target{"", TargetCode, TargetDocs} {
+		if got := Detect([]Source{{Kind: SourceReason, Text: "Tighten the summary to mention the retry bound.", Target: target}}); got != nil {
+			t.Errorf("Detect(target %q) = %+v, want nil", target, got)
+		}
+	}
+}
+
+// TestParseTarget accepts exactly the three literals and refuses everything
+// else, the empty string included (absence is the caller's to map to code).
+func TestParseTarget(t *testing.T) {
+	for _, ok := range []string{"code", "pr_body", "docs"} {
+		if got, valid := ParseTarget(ok); !valid || string(got) != ok {
+			t.Errorf("ParseTarget(%q) = (%q, %v), want (%q, true)", ok, got, valid, ok)
+		}
+	}
+	for _, bad := range []string{"", "PR_BODY", "pr-body", "prbody", " code", "tests"} {
+		if got, valid := ParseTarget(bad); valid || got != "" {
+			t.Errorf("ParseTarget(%q) = (%q, %v), want (\"\", false)", bad, got, valid)
+		}
 	}
 }
 
@@ -379,10 +414,6 @@ func TestUndelivered_PRBodyObligation_UnsatisfiableEvenWhenMetReported(t *testin
 // classification is NARROW rather than blanket: an obligation naming the run
 // log — a surface the pass CAN write — keeps the prior `met`-suppresses-the-
 // finding behaviour, so a satisfied run-log obligation emits nothing.
-//
-// Delete the run-log carve-out (fold "run log" into prBodySurfaceNouns) and
-// this goes RED: the obligation would then classify PRBody true and be returned
-// as unsatisfiable despite the `met` report.
 func TestUndelivered_RunLogObligation_MetSuppressesFinding(t *testing.T) {
 	declared := Detect([]Source{{Kind: SourceConcern, Text: "Report the observed RED output in the run log."}})
 	if len(declared) != 1 || declared[0].PRBody {
@@ -390,5 +421,25 @@ func TestUndelivered_RunLogObligation_MetSuppressesFinding(t *testing.T) {
 	}
 	if got := Undelivered(declared, []Report{{ID: "ob-1", Status: StatusMet}}); len(got) != 0 {
 		t.Fatalf("Undelivered = %+v, want nothing — a met run-log obligation is satisfiable and suppressed", got)
+	}
+}
+
+// TestUndelivered_TargetDecidesUnsatisfiable is the done-means at the join
+// (E83.37 / #4022): the SAME PR-body prose, reported `met`, is suppressed when
+// its router targeted code (nil — a prose mention is not a structural
+// impossibility) and returned unsatisfiable when its router targeted pr_body.
+// Both obligations come from Detect, so the flag is the real derivation.
+func TestUndelivered_TargetDecidesUnsatisfiable(t *testing.T) {
+	const text = "Record the counterfactual table in the PR body's ## Notes."
+	met := []Report{{ID: "ob-1", Status: StatusMet}}
+
+	code := Detect([]Source{{Kind: SourceReason, Text: text, Target: TargetCode}})
+	if got := Undelivered(code, met); got != nil {
+		t.Errorf("code target + met: Undelivered = %+v, want nil", got)
+	}
+	prBody := Detect([]Source{{Kind: SourceReason, Text: text, Target: TargetPRBody}})
+	got := Undelivered(prBody, met)
+	if len(got) != 1 || got[0].Status != StatusUnsatisfiable {
+		t.Errorf("pr_body target + met: Undelivered = %+v, want one %q finding", got, StatusUnsatisfiable)
 	}
 }

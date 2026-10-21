@@ -825,7 +825,8 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
 - **`lint --in-gate-image` / `verify --in-gate-image`** (the latter implies
   `--no-tests`, and is rejected with `--packages`) run the subcommand inside
   the image. Order, each step failing closed: argument validation; docker
-  absent → exit 1 (never a skip); for verify, the HOST verify lock (a
+  absent → exit 1 (never a skip); for verify, the HOST verify lock, whose
+  refusal exits 73 exactly as `verify`'s does (a
   container cannot share it, since `kill -0` liveness does not cross PID
   namespaces, so the container gets a private
   `FISHHAWK_VERIFY_LOCK_PATH=/tmp/fishhawk-verify.lock`); resolve
@@ -860,8 +861,8 @@ command's argv and whether the harness-owned lock was held at that instant.
 Lib-only cases drive `cmd_verify` with every leg stubbed (always including
 `_verify_gate_harnesses`, which would otherwise recurse). Cases: argument
 rejection before the docker probe (with docker absent too), the docker-absent
-refusal, the host lock (held during the run, refused on a live holder with
-docker never invoked, released after a failing run), the full argv contract,
+refusal, the host lock (held during the run, refused with exit 73 on a live
+holder with docker never invoked, released after a failing run), the full argv contract,
 the primary vs linked-worktree common-dir mount, exit-status propagation, a
 mismatching image never running the inner command, image resolution (pull
 fallback, failed pull, non-ID inspect output), a missing check script, an
@@ -983,20 +984,28 @@ Semantics, by the kind of the invocation MEETING a live holder:
 
 | Meeting | Behaviour |
 |---|---|
-| SHELL meets any live holder | **Refuse immediately.** Non-zero, no sleep, no poll, and an actionable message naming `scripts/test single -run TestX ./your/package/...`. |
+| SHELL meets any live holder | **Refuse immediately.** Exit 73, no sleep, no poll, and an actionable message naming `scripts/test single -run TestX ./your/package/...`. |
 | RUNNER meets a live SHELL holder | **Wait**, bounded by **600 seconds** at a **2-second** poll, announcing the wait once. Most holders finish inside that and the runner then acquires with no concurrency at all. |
 | RUNNER meets a live SHELL holder, budget EXPIRED | **Displace**, with a loud one-line warning naming the deposed pid and stating that two verifies may now contend. That warning is printed on every COMPLETED displacement — including the one where the freed lock is then won by somebody else and this invocation refuses (the steal's `rc=2`), because the victim is running unprotected either way. The wedged-holder escape hatch, not the normal path. It displaces at most once per invocation, and only against the holder it actually waited on — see "The displacement stays valid through the unlink". |
-| RUNNER meets a live RUNNER holder | Wait on the same budget, then **refuse** naming both pids. Two concurrent runner verifies on one worktree family is a bug to surface, not one to paper over by stealing. |
+| RUNNER meets a live RUNNER holder | Wait on the same budget, then **refuse** (exit 73) naming both pids. Two concurrent runner verifies on one worktree family is a bug to surface, not one to paper over by stealing. |
 
-**What the runner does with a RUNNER-meets-RUNNER refusal (#3948).** The runner's committed-tree
+**Every refusal exits 73 (`VERIFY_EXIT_LOCK_REFUSED`, sysexits(3) `EX_CANTCREAT`, #4022), never 1.**
+A refusal judged nothing, and an exit 1 reads to the runner as a red tree. `_acquire_verify_lock_at`
+returns 73 at every refusal site — the shell-kind immediate refusal, runner-meets-runner after the
+budget, the retaken-after-displacement refusal, and both never-settled restart bail-outs —
+`_acquire_verify_lock` propagates it, and both `verify` and `verify --in-gate-image` exit with it. A
+red tree still exits 1. The refusal TEXT is unchanged. `VERIFY_EXIT_TEMPFAIL=75` is declared beside it
+for the same contract but nothing in `scripts/test` exits 75 yet. The contract, and what the runner
+does with each code: `docs/spec/workflow-v2.md` § "Verify exit-code contract".
+
+**What the runner does with a RUNNER-meets-RUNNER refusal (#3948, #4022).** The runner's committed-tree
 gates (the verify-fix loop, the single-shot gate and the #960 pre-push strict re-verify) recognise the
-refusal text, re-run the verify in place up to twice per gate site (each re-run is itself one bounded
-600s wait inside the verify command, so the runner adds no sleep of its own), and then fail the stage
-category C with a `verify_lock_contended:` reason, retryable in place. A contended verify never reaches
-the fix agent and never spends the infra-flake absorb. That is a bounded RUNNER behaviour, not a licence
-for a shell caller to retry — the rule below is unchanged. The `scripts/test` behaviour itself is
-unchanged too. Long-form: `runner/cmd/fishhawk-runner/README.md` § "Verify-lock contention is category C
-(#3948)".
+refusal by its exit code 73 (#4022; #3948 matched its text), re-run the verify in place a bounded number
+of times per gate site (each re-run is itself one bounded 600s wait inside the verify command, so the
+runner adds no sleep of its own), and then fail the stage category C with a `verify_lock_contended:`
+reason, retryable in place. A contended verify never reaches the fix agent and never spends the
+infra-flake absorb. That is a bounded RUNNER behaviour, not a licence for a shell caller to retry — the
+rule below is unchanged. Long-form: `runner/cmd/fishhawk-runner/README.md`.
 
 **Do not poll a refusal.** It is a fast failure, not a queue — retrying it in a
 loop is what killed run a662ed6f category-A. Narrow to `scripts/test single` on
@@ -1153,8 +1162,8 @@ no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
   having run in BOTH modes AND still gating in both (`a11` drives a real
   over-long `ARCHITECTURE.md` line to a non-zero exit); and the scoped loop's
   fail-closed branch when the module list changes under it.
-- **b1–b13** cover the lock: the shell refusal, asserted to run no tests, no lint
-  and — the STRUCTURAL proof of promptness, never an elapsed-time bound — zero
+- **b1–b13** cover the lock: the shell refusal, asserted to exit exactly 73 and
+  to run no tests, no lint and — the STRUCTURAL proof of promptness, never an elapsed-time bound — zero
   recorded `sleep` calls; the dead-holder prune; the prune RACE driven exactly as
   written above, with B's classification taken BEFORE A's acquire and exactly one
   proceeding; the live and dead prune-marker branches; the MARKER-recovery race
@@ -1172,8 +1181,8 @@ no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
   pins that the warning is owed on the steal's `rc=2` and, in the same run, the
   steal-at-most-once refusal it arms; the restart bail-out under repeated
   dead/free churn (`b5f`), whose assertion is that the loop TERMINATES in a
-  refusal at all; runner-REFUSES-a-
-  runner on expiry, asserted on lock STATE and not only on the message; all three
+  refusal at all, returning 73; runner-REFUSES-a-
+  runner on expiry (73), asserted on lock STATE and not only on the message; all three
   no-locking degrades as separate cases; a real `git worktree add` proving a
   linked worktree resolves the SAME lock path (which is what makes the control
   contend at all); the three release branches; and one case per classification
@@ -1190,6 +1199,13 @@ no Go toolchain) is wired into `_verify_gate_harnesses`, so a regression fails
   `_verify_lock_path`, the reason names the variable, `_acquire_verify_lock`
   proceeds unlocked, no lock in the common dir, the parent is never created).
   `b16` pins that UNSET and EMPTY both resolve the common-dir lock unchanged.
+- **b17–b18** pin the refusal exit code (#4022) past the function: `b17` asserts
+  the `_acquire_verify_lock` wrapper hands 73 back, and `b18` drives the real
+  `verify --in-gate-image` (Docker-free: the fixture's `docker` is a no-op stub)
+  against a live host holder and asserts exit 73 before any image work. Every
+  refusal case (`b1`, `b3g`, `b5e`, `b5f`, `b6`, `b14`) asserts exactly 73,
+  and `a13`/`a13b` assert a red tree exits exactly 1, so the two stay
+  distinguishable by exit code alone.
 - There is deliberately **no wall-clock assertion anywhere**. The issue's "under
   10 minutes" outcome is established by measurement recorded in the #3315 PR
   notes, not by a timing bound that would be a flake risk.
