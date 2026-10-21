@@ -201,6 +201,7 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}", s.handleGetCampaign)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/items", s.handleListCampaignItems)
 	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/items", s.handleAppendCampaignItems)
+	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/hotfix", s.handleCampaignHotfix)
 	mux.HandleFunc("GET /v0/campaigns/{campaign_id}/status", s.handleGetCampaignStatus)
 	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/runs", s.handleStartCampaignItemRun)
 	mux.HandleFunc("POST /v0/campaigns/{campaign_id}/resume", s.handleResumeCampaign)

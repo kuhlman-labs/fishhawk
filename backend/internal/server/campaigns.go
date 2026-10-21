@@ -274,10 +274,13 @@ type campaignItemResponse struct {
 	// page event + run/stage/gate). Omitted (omitempty) unless the item is —
 	// or was — paused; mirrors the domain *PauseReason.
 	PauseReason *campaign.PauseReason `json:"pause_reason,omitempty"`
-	// Position is the item's 0-based place in the campaign queue
+	// Position is the item's place in the campaign queue
 	// (campaign_items.queue_position, migration 0074) — for a grooming-sourced
 	// campaign, its ratified rank. Always present: it is the field that makes
-	// the queue order legible without inferring it from the array index.
+	// the queue order legible without inferring it from the array index. It is
+	// 0-based and dense for ordinary items, but an EXPEDITED item (#4234) takes
+	// min(existing)-1 to head the queue, so it may be NEGATIVE and the dense
+	// 0-based invariant no longer holds once a campaign has one.
 	Position int `json:"position"`
 	// ResolvedBy is the durable provenance of HOW the item reached its terminal
 	// state (campaign_items.resolved_by, migration 0085 / #3563). The only
@@ -285,9 +288,18 @@ type campaignItemResponse struct {
 	// issue-closed pass settled it off the forge's issue state. omitempty, so
 	// an item with no recorded provenance — every pre-0085 row, every
 	// operator/run-driven outcome — keeps its exact pre-#3563 wire shape.
-	ResolvedBy string    `json:"resolved_by,omitempty"`
-	CreatedAt  time.Time `json:"created_at"`
-	UpdatedAt  time.Time `json:"updated_at"`
+	ResolvedBy string `json:"resolved_by,omitempty"`
+	// Expedited, ExpediteKind, Workflow and ExpediteReason tag an EXPEDITED
+	// item — one the campaign hotfix verb added (#4234) — with its kind, the
+	// workflow it runs under and the operator's reason. All omitempty, so an
+	// ordinary item keeps its exact wire shape. ExpediteReason is
+	// untrusted-origin text, rendered only as data.
+	Expedited      bool      `json:"expedited,omitempty"`
+	ExpediteKind   string    `json:"expedite_kind,omitempty"`
+	Workflow       string    `json:"workflow,omitempty"`
+	ExpediteReason string    `json:"expedite_reason,omitempty"`
+	CreatedAt      time.Time `json:"created_at"`
+	UpdatedAt      time.Time `json:"updated_at"`
 }
 
 // campaignRollupPayload is the engine's readiness partition over a
@@ -456,7 +468,7 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 	if deps == nil {
 		deps = []string{}
 	}
-	return campaignItemResponse{
+	out := campaignItemResponse{
 		ID:          it.ID,
 		IssueRef:    it.IssueRef,
 		DependsOn:   deps,
@@ -468,6 +480,13 @@ func toCampaignItemResponse(it *campaign.Item) campaignItemResponse {
 		CreatedAt:   it.CreatedAt,
 		UpdatedAt:   it.UpdatedAt,
 	}
+	if e := it.Expedite; e != nil {
+		out.Expedited = true
+		out.ExpediteKind = e.Kind
+		out.Workflow = e.Workflow
+		out.ExpediteReason = e.Reason
+	}
+	return out
 }
 
 // toCampaignRollupPayload maps a campaign.Eligibility partition onto the
@@ -2093,6 +2112,8 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	}
 	items = holdObservedEdges(items, refresh)
 
+	hold := s.campaignDispatchHoldForStatus(r.Context(), c)
+
 	elig := campaign.NextEligible(items)
 	out := make([]campaignItemResponse, 0, len(items))
 	for _, it := range items {
@@ -2109,7 +2130,41 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	if refresh != nil {
 		body["dependency_refresh"] = refresh.payload()
 	}
+	if hold != nil {
+		ref := ""
+		for _, it := range items {
+			if it.ID == hold.HotfixItemID {
+				ref = it.IssueRef
+				break
+			}
+		}
+		body["dispatch_hold"] = toDispatchHoldPayload(hold, ref)
+	}
 	s.writeJSON(w, r, http.StatusOK, body)
+}
+
+// campaignDispatchHoldForStatus returns the campaign's active dispatch hold
+// for the status read (#4234). A caller with campaignRefreshAccess (account
+// owner + repo visible) lazily releases a DUE hold first, recorded under the
+// system actor with trigger=status_read; any other caller only reads the hold
+// and never drives a release. It never fails the read: a release or read
+// failure is logged, and the hold that is still active is reported.
+func (s *Server) campaignDispatchHoldForStatus(ctx context.Context, c *campaign.Campaign) *campaign.DispatchHold {
+	if ok, _ := s.campaignRefreshAccess(ctx, c); ok {
+		hold, err := s.releaseCampaignHoldIfDue(ctx, c, holdReleaseTriggerStatusRead)
+		if err != nil {
+			s.cfg.Logger.Warn("campaign status: dispatch hold release failed; reporting the hold as active",
+				"campaign_id", c.ID.String(), "error", err.Error())
+		}
+		return hold
+	}
+	hold, err := s.cfg.CampaignRepo.GetDispatchHold(ctx, c.ID)
+	if err != nil {
+		s.cfg.Logger.Warn("campaign status: dispatch hold read failed",
+			"campaign_id", c.ID.String(), "error", err.Error())
+		return nil
+	}
+	return hold
 }
 
 // handleResumeCampaign implements POST /v0/campaigns/{campaign_id}/resume: the
@@ -2591,6 +2646,15 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		s.writeError(w, r, http.StatusNotFound, "campaign_item_not_found",
 			"no campaign item with that issue_ref",
 			map[string]any{"campaign_id": id.String(), "issue_ref": req.IssueRef})
+		return
+	}
+	// An EXPEDITED item (#4234) runs only under the workflow its hotfix
+	// recorded; a different workflow_id is refused before any mutation.
+	if e := item.Expedite; e != nil && e.Workflow != req.WorkflowID {
+		s.writeError(w, r, http.StatusConflict, "campaign_item_workflow_mismatch",
+			"this item was expedited by the campaign hotfix verb to run under workflow "+e.Workflow+"; start it with that workflow_id",
+			map[string]any{"campaign_id": id.String(), "issue_ref": req.IssueRef,
+				"recorded_workflow": e.Workflow, "got": req.WorkflowID})
 		return
 	}
 

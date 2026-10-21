@@ -7316,3 +7316,19 @@ func TestServeGo_WiresSpecialistJobStore(t *testing.T) {
 			"every /v0/specialist-jobs route would answer 503 specialist_jobs_unconfigured")
 	}
 }
+
+// TestCampaignRunStarter_ExpeditedItemUsesRecordedWorkflow pins the driver's
+// workflow binding (#4234): an expedited item starts under the workflow its
+// hotfix recorded, every other item under --campaign-driver-workflow-id.
+func TestCampaignRunStarter_ExpeditedItemUsesRecordedWorkflow(t *testing.T) {
+	a := campaignRunStarter{workflowID: "feature_change", workflowRef: "main"}
+	c := &campaign.Campaign{Repo: "kuhlman-labs/fishhawk"}
+	plain := &campaign.Item{IssueRef: "issue:10"}
+	hot := &campaign.Item{IssueRef: "issue:42", Expedite: &campaign.Expedite{Kind: campaign.ExpediteKindHotfix, Workflow: "hotfix_change"}}
+	if got := a.startParams(plain, c); got != (server.StartRunForCampaignIssueParams{Repo: c.Repo, IssueRef: "issue:10", WorkflowID: "feature_change", WorkflowRef: "main"}) {
+		t.Errorf("plain item params = %+v", got)
+	}
+	if got := a.startParams(hot, c); got.WorkflowID != "hotfix_change" || got.IssueRef != "issue:42" || got.WorkflowRef != "main" {
+		t.Errorf("expedited item params = %+v, want workflow hotfix_change", got)
+	}
+}
