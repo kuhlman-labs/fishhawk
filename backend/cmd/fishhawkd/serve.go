@@ -2623,6 +2623,12 @@ func runServe(args []string, logSink io.Writer) int {
 		// start-immediately behaviour without touching any other surface.
 		cfg.MergeQueue = mergequeue.NewPostgresStore(pool)
 		cfg.CampaignRepo = campaign.NewPostgresRepository(pool)
+		// Monotone campaign dependency refresh (E86.47 / #4358): status polls
+		// and item starts re-read tracker edges for unstarted members and ADD
+		// newly observed ones. Setting this false disables every refresh read
+		// and write without a revert. Pinned by
+		// TestServeGo_EnablesCampaignDependencyRefresh.
+		cfg.CampaignDependencyRefresh = true
 		cfg.SigningRepo = signing.NewPostgresRepository(pool)
 		auditRepo, err := newAuditRepository(pool, logger)
 		if err != nil {

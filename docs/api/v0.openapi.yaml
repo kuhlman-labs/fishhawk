@@ -5323,6 +5323,99 @@ components:
           items: { $ref: '#/components/schemas/CampaignItem' }
         rollup: { $ref: '#/components/schemas/CampaignRollup' }
         next_action: { $ref: '#/components/schemas/CampaignNextAction' }
+        dependency_refresh: { $ref: '#/components/schemas/CampaignDependencyRefresh' }
+
+    CampaignDependencyRefresh:
+      type: object
+      description: |
+        The monotone dependency refresh this status read ran (E86.47 / #4358).
+        Native blocked-by links and `Depends-on:` lines are re-read for
+        unstarted (pending/blocked, no run) items and any edge the persisted
+        `depends_on` lacks is ADDED — never removed — recorded before commit
+        as a `campaign_dependencies_refreshed` audit row. An edge onto a
+        non-member is held and listed under `external`; an unparsable tracker
+        token is reported under `unparsable` and never written; an item that
+        started under the lock is reported under `skipped_started` and never
+        touched; members on a cycle the tracker closed are held and named in
+        `cycle_members`. When nothing new is observed no write and no audit row
+        happen. Absent when the deployment disables the refresh.
+      required: [performed, committed]
+      properties:
+        performed:
+          type: boolean
+          description: True when the tracker was read this poll.
+        skipped_reason:
+          type: string
+          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates]
+          description: |
+            Why no read happened: another refresh of this campaign is in flight;
+            one finished (successfully or on a tracker error) under 30 s ago;
+            the caller's account does not own the campaign; the caller cannot
+            see the repo; or no item is unstarted.
+        committed:
+          type: boolean
+          description: |
+            False when observed additions could NOT be persisted (audit row or
+            write failure). The additions are then HELD in `items`/`rollup`/
+            `next_action` and listed under `added`, and `warnings` names the
+            cause. Every later status read (one the 30 s interval skips, or one
+            whose tracker read fails) keeps that hold and warning until a
+            refresh records the additions; the hold is process-local.
+        added:
+          type: array
+          items:
+            type: object
+            required: [issue_ref, refs]
+            properties:
+              issue_ref: { type: string }
+              refs: { type: array, items: { type: string } }
+              external: { type: array, items: { type: string } }
+        skipped_started: { type: array, items: { type: string } }
+        unparsable: { type: array, items: { type: string } }
+        cycle_members: { type: array, items: { type: string } }
+        warnings: { type: array, items: { type: string } }
+
+    AppendCampaignItemsRequest:
+      type: object
+      additionalProperties: false
+      description: The POST /v0/campaigns/{campaign_id}/items body (E86.47 / #4358).
+      required: [items]
+      properties:
+        items:
+          type: array
+          minItems: 1
+          maxItems: 50
+          items: { type: string }
+          description: Issue refs to append (`N`, `#N` or `issue:N`).
+        allow_external_blockers:
+          type: boolean
+          description: |
+            Admit a NEW item's dependency on an issue that is not a campaign
+            member. The edge is persisted and HOLDS the item blocked until it
+            is released. Without it such an edge refuses the append 422
+            `campaign_external_dependency`.
+
+    AppendCampaignItemsResult:
+      type: object
+      description: The 201 body of POST /v0/campaigns/{campaign_id}/items.
+      required: [campaign, appended]
+      properties:
+        campaign: { $ref: '#/components/schemas/Campaign' }
+        appended:
+          type: array
+          items:
+            allOf:
+              - { $ref: '#/components/schemas/CampaignItem' }
+              - type: object
+                properties:
+                  external_depends_on:
+                    type: array
+                    items: { type: string }
+                    description: The admitted non-member blockers this item carries.
+        satisfied_dependencies:
+          type: array
+          description: Tracker edges elided because their non-member target is already closed-as-completed.
+          items: { type: object }
 
     StartCampaignItemRunRequest:
       type: object
@@ -20866,6 +20959,75 @@ paths:
             `campaign_repo_unconfigured` — no campaign repository wired; or
             `service_unavailable` — the repo-ACL mirror's store could not be
             reached so repo visibility could not be resolved (#2071).
+    post:
+      operationId: appendCampaignItems
+      summary: Append issues to an existing campaign
+      description: |
+        Add issues to a pending, running, paused or awaiting_human campaign
+        without cancelling it (E86.47 / #4358). Only the NEW refs are resolved
+        on the tracker (native blocked-by links and `Depends-on:` lines),
+        through the same resolver `POST /v0/campaigns` uses, so existence,
+        provider, installation, timeout and invalid-ref refusals match it. The
+        new items queue after every existing item.
+
+        Under the campaign row lock the closure is re-validated: a duplicate
+        member, a malformed ref, a NEW item's dependency on a non-member
+        (unless `allow_external_blockers`), and a cycle passing through a NEW
+        item are refused with nothing written. A cycle among existing members
+        only is tolerated (the dependency refresh holds it), and existing
+        members' tracker drift is never read here — it is observed and HELD by
+        the refresh on the next status read or item start, never a reason to
+        refuse an unrelated append. The `campaign_items_appended` audit row is
+        written BEFORE commit; an unrecordable append writes nothing.
+
+        Access: `write:campaigns`, then account ownership and repo visibility,
+        both checked before any tracker read or write.
+      tags: [campaigns]
+      parameters:
+        - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/AppendCampaignItemsRequest' }
+      responses:
+        '201':
+          description: The campaign and the appended items.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/AppendCampaignItemsResult' }
+        '400':
+          description: |
+            `validation_failed` — `campaign_id` is not a valid UUID, the body
+            is not JSON or carries unknown fields, or `items` is empty or names
+            more than 50 refs.
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — bearer token missing `write:campaigns`;
+            `account_forbidden` — the campaign belongs to another workspace
+            account; `repo_forbidden` — the caller cannot read the repo.
+        '404':
+          description: "`campaign_not_found` — no campaign with that id."
+        '409':
+          description: |
+            `campaign_not_appendable` — the campaign is cancelled, succeeded or
+            failed; `campaign_item_duplicate` — a ref is already a member or is
+            named twice (`details.duplicates`; decided before any tracker read).
+        '422':
+          description: |
+            `campaign_external_dependency` — a NEW item depends on a non-member
+            and `allow_external_blockers` is false (`details.edges`,
+            `details.remedy`); `campaign_dependency_cycle` — the append would
+            close a cycle through a NEW item (`details.cycle`);
+            `campaign_item_ref_invalid` — a ref is not an issue reference.
+        '502':
+          description: The tracker could not be read; the same refusals `POST /v0/campaigns` answers. Nothing is written.
+        '503':
+          description: |
+            `campaign_audit_unavailable` — the `campaign_items_appended` row
+            could not be written, so nothing was written; or
+            `campaign_repo_unconfigured`.
 
   /v0/campaigns/{campaign_id}/status:
     get:
@@ -20893,6 +21055,16 @@ paths:
         merge, with no auto-driver and no GitHub Actions. Best-effort and
         idempotent: the reconcile never fails the read, and a re-poll over an
         already-settled item performs no further transition.
+
+        Dependency refresh (E86.47 / #4358): after the reconcile, the read
+        re-reads tracker dependencies for unstarted items and ADDS newly
+        observed edges (never removes one) — see `CampaignDependencyRefresh`.
+        It runs only for a caller whose account owns the campaign (or it is
+        untenanted) and who can see the repo, at most once per 30 s per
+        campaign (single-flight), and never fails the read: a tracker error or
+        an unrecordable change is reported in `dependency_refresh.warnings`,
+        and an observed blocker that could not be persisted still HOLDS its
+        item in this and every later status read until a refresh records it.
       tags: [campaigns]
       parameters:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -20947,6 +21119,15 @@ paths:
         reconcile-on-read: it settles any running item whose linked run reached
         terminal and re-derives the campaign, so the rollup advances in DAG
         order as each run is driven to merge.
+
+        Dependency refresh (E86.47 / #4358): before the DAG gate, an unstarted
+        target item's tracker dependencies are re-read and any new edge is
+        ADDED (recorded before commit as `campaign_dependencies_refreshed`), so
+        a blocked-by added after the campaign started refuses
+        `item_not_eligible` naming it even with no prior status read. It FAILS
+        CLOSED (502 / 503, nothing started). It runs only for a caller whose
+        account owns the campaign (or it is untenanted) and who can see the
+        repo; any other caller skips it and the start behaves as before.
       tags: [campaigns]
       parameters:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -20995,9 +21176,17 @@ paths:
             `invalid_transition` — a concurrent change made the running
             transition illegal.
         '502':
-          description: "`campaign_run_start_failed` — the installation or workflow spec could not be resolved."
+          description: |
+            `campaign_run_start_failed` — the installation or workflow spec
+            could not be resolved; `campaign_dependency_refresh_failed` — the
+            target's dependencies could not be re-read from the tracker, so
+            nothing was started.
         '503':
-          description: "`campaign_repo_unconfigured` — no campaign repository wired."
+          description: |
+            `campaign_repo_unconfigured` — no campaign repository wired;
+            `campaign_dependency_audit_failed` — a newly observed dependency
+            could not be recorded or written, so nothing was written and
+            nothing was started.
 
   /v0/campaigns/{campaign_id}/resume:
     post:

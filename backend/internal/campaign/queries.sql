@@ -171,6 +171,16 @@ UPDATE campaign_items
  WHERE id = $1
 RETURNING *;
 
+-- name: SetCampaignItemDependsOn :one
+-- Overwrites an item's depends_on with the MONOTONE union the append path
+-- computed (E86.47 / #4358). The caller holds the campaign row lock, then this
+-- item's LockCampaignItemForUpdate lock, applies it only to a pending/blocked
+-- item with no run, and passes a superset of the persisted edges.
+UPDATE campaign_items
+   SET depends_on = $2
+ WHERE id = $1
+RETURNING *;
+
 -- name: SetCampaignItemPause :one
 -- Pauses an item: sets state='paused' and records the pause_reason JSONB,
 -- applied under the existing LockCampaignItemForUpdate FOR UPDATE lock so the
