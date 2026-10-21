@@ -19,6 +19,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -328,6 +329,64 @@ func TestStageProgress_WireSemanticsAreOnTheSchema(t *testing.T) {
 	}
 	if strings.Contains(string(bare), "progress") {
 		t.Errorf("stageResponse without progress must omit the key:\n%s", bare)
+	}
+}
+
+// TestGetStage_ProgressCarriesPhaseFields drives GET /v0/stages/{id} and GET
+// /v0/runs/{id}/stages through the real handlers over a pgtest store and
+// asserts on the RAW response bytes (#4023): a gate-phase heartbeat serves all
+// five phase keys, and a phase-less heartbeat serves none of them (the
+// byte-identical pre-#4023 progress shape).
+func TestGetStage_ProgressCarriesPhaseFields(t *testing.T) {
+	ctx := context.Background()
+	repo := run.NewPostgresRepository(pgtest.NewPool(t))
+	s := newProgressServer(repo)
+	runID, gateStage := seedRunningStage(t, repo)
+	_, legacyStage := seedRunningStage(t, repo)
+	store := repo.(run.StageProgressStore)
+
+	intp := func(v int) *int { return &v }
+	if _, err := store.RecordStageProgress(ctx, gateStage, run.StageProgress{
+		LastEvent: "gate:verify", TurnsThisAttempt: 9, TokensThisAttempt: 13402,
+		Phase: "gate", PhaseElapsedSeconds: intp(312), GateBudgetSeconds: intp(5400),
+		GateRemainingSeconds: intp(4980), GateVerifying: true,
+	}); err != nil {
+		t.Fatalf("record gate progress: %v", err)
+	}
+	if _, err := store.RecordStageProgress(ctx, legacyStage, run.StageProgress{
+		LastEvent: "assistant", TurnsThisAttempt: 1, TokensThisAttempt: 2,
+	}); err != nil {
+		t.Fatalf("record legacy progress: %v", err)
+	}
+
+	get := func(path string) string {
+		t.Helper()
+		w := httptest.NewRecorder()
+		s.Handler().ServeHTTP(w, httptest.NewRequest(http.MethodGet, path, nil))
+		if w.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d:\n%s", path, w.Code, w.Body.String())
+		}
+		return w.Body.String()
+	}
+	phaseKeys := []string{
+		`"phase":"gate"`, `"phase_elapsed_seconds":312`, `"gate_budget_seconds":5400`,
+		`"gate_remaining_seconds":4980`, `"gate_verifying":true`,
+	}
+	for _, body := range []string{get("/v0/stages/" + gateStage.String()), get("/v0/runs/" + runID.String() + "/stages")} {
+		for _, want := range phaseKeys {
+			if !strings.Contains(body, want) {
+				t.Errorf("gate-phase read missing %s:\n%s", want, body)
+			}
+		}
+	}
+	legacy := get("/v0/stages/" + legacyStage.String())
+	if !strings.Contains(legacy, `"last_event":"assistant"`) {
+		t.Fatalf("legacy read carries no progress:\n%s", legacy)
+	}
+	for _, key := range []string{`"phase"`, `"phase_elapsed_seconds"`, `"gate_budget_seconds"`, `"gate_remaining_seconds"`, `"gate_verifying"`} {
+		if strings.Contains(legacy, key) {
+			t.Errorf("phase-less read serves %s:\n%s", key, legacy)
+		}
 	}
 }
 
