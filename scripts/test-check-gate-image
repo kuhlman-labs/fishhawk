@@ -32,6 +32,7 @@
 #   missing line -> d6b                unreadable docker probe -> d6d
 #   docker exec failure -> d6a         inspect failure -> d9a d9b
 #   inspect no-ID -> d9b               unknown arg -> s14a
+#   inspect template `range` (not `join`) over .RepoDigests -> d10 (#4603)
 #   --platform w/o --image -> s14b     unreadable Dockerfile -> s13
 #   host docker absent -> d7 (RED on the MESSAGE only: with the guard gone,
 #   `docker run` exits 127 and the exec-failure guard still exits 1).
@@ -95,6 +96,16 @@ case "$1" in
     exit "${FAKE_RUN_RC:-0}" ;;
   image)
     if [ "$2" = inspect ]; then
+      # FAKE_INSPECT_ENGINE=interface emulates a newer Docker engine/CLI that
+      # decodes .RepoDigests as []interface{}: the template `join` func then
+      # refuses it, with the engine's own error, before any output.
+      if [ "${FAKE_INSPECT_ENGINE:-}" = interface ]; then
+        case "$*" in
+          *'join .RepoDigests'*)
+            echo 'template parsing error: template: :1:15: executing "" at <.RepoDigests>: wrong type for value; expected []string; got []interface {}' >&2
+            exit 1 ;;
+        esac
+      fi
       cat "$FAKE_INSPECT_OUT"
       exit "${FAKE_INSPECT_RC:-0}"
     fi ;;
@@ -479,6 +490,20 @@ expect "d9a: a failed image inspect fails closed" 1 "cannot resolve the image ID
 
 run_dynamic d9b "$r" "$GOOD_PROBE" 0 "" 0 --image fishhawk-gate:test
 expect "d9b: an inspect that exits 0 without an ID fails closed" 1 "cannot resolve the image ID of fishhawk-gate:test"
+
+# d9c: a locally built image has NO RepoDigests, so the inspect template emits
+# the ID and a trailing space; that must still pass, reporting digests=none.
+run_dynamic d9c "$r" "$GOOD_PROBE" 0 "sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 " 0 --image fishhawk-gate:test
+expect "d9c: an image with no RepoDigests passes with digests=none" 0 \
+  "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=none"
+
+# d10: the inspect template must survive an engine that decodes .RepoDigests as
+# []interface{} (GitHub's hosted runners, first hit by PR #4603's gate-image CI
+# job), where `{{join .RepoDigests ","}}` is a template error. The fake refuses
+# a `join` over .RepoDigests the way that engine does.
+FAKE_INSPECT_ENGINE=interface run_dynamic d10 "$r" "$GOOD_PROBE" 0 "$GOOD_INSPECT" 0 --image fishhawk-gate:test
+expect "d10: the inspect template is portable to a []interface{} RepoDigests engine" 0 \
+  "ok image fishhawk-gate:test id=sha256:0c7eeb187563a2051ec0675d932d06f0999dc6aa04584f77ee80e36c0dfcad97 digests=fishhawk-gate@sha256:"
 
 # --- host cases (#4245) ------------------------------------------------------
 # HOST mode probes the tools on PATH. Each case runs under a PATH of a per-case
