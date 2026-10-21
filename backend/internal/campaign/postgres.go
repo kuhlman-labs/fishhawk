@@ -622,6 +622,121 @@ func (r *postgresRepo) SettleCampaignItemForClosedIssue(ctx context.Context, id 
 	return result, nil
 }
 
+// AppendCampaignItems inserts new items and applies add-only depends_on
+// additions in ONE transaction (see the Repository doc for the contract). Lock
+// order is the package-wide one — campaign row, then item rows — and every
+// guard runs under the campaign lock before the first write, so a refusal
+// commits nothing. p.Record runs last, still inside the transaction, so an
+// unrecordable append rolls back whole.
+func (r *postgresRepo) AppendCampaignItems(ctx context.Context, p AppendCampaignItemsParams) (*AppendOutcome, error) {
+	var out *AppendOutcome
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := campaigndb.New(tx)
+
+		// 1. Lock and guard the CAMPAIGN row first (the package-wide order).
+		current, err := q.LockCampaignForUpdate(ctx, p.CampaignID)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCampaignNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock campaign: %w", err)
+		}
+		if st := State(current.State); st.IsTerminal() {
+			return InvalidTransitionError{Kind: "campaign", From: string(st), To: "append"}
+		}
+
+		// 2. Re-read the members inside the transaction and re-run every guard
+		// under the lock, so a pre-lock check cannot be raced by a concurrent
+		// append (which takes the same campaign lock first).
+		rows, err := q.ListCampaignItemsForCampaign(ctx, p.CampaignID)
+		if err != nil {
+			return fmt.Errorf("list campaign items: %w", err)
+		}
+		existing := make([]*Item, 0, len(rows))
+		maxPos := -1
+		for _, row := range rows {
+			it := rowToCampaignItem(row)
+			existing = append(existing, it)
+			if it.Position > maxPos {
+				maxPos = it.Position
+			}
+		}
+		if err := ValidateAppend(existing, p); err != nil {
+			return err
+		}
+
+		// 3. Additions, in queue order for a deterministic outcome. Each item
+		// row is locked AFTER the campaign row; a started item is skipped and
+		// reported, never written.
+		outcome := AppendOutcome{Campaign: rowToCampaign(current)}
+		for _, it := range existing {
+			add, ok := p.AddDependencies[it.ID]
+			if !ok {
+				continue
+			}
+			locked, err := q.LockCampaignItemForUpdate(ctx, it.ID)
+			if err != nil {
+				return fmt.Errorf("lock campaign item: %w", err)
+			}
+			item := rowToCampaignItem(locked)
+			if (item.State != ItemStatePending && item.State != ItemStateBlocked) || item.RunID != nil {
+				outcome.SkippedStarted = append(outcome.SkippedStarted, item.IssueRef)
+				continue
+			}
+			merged := MergeDependsOn(item.DependsOn, add)
+			if len(merged) == len(item.DependsOn) {
+				continue // the union adds nothing: no write
+			}
+			deps, err := marshalDependsOn(merged)
+			if err != nil {
+				return err
+			}
+			if _, err := q.SetCampaignItemDependsOn(ctx, campaigndb.SetCampaignItemDependsOnParams{ID: item.ID, DependsOn: deps}); err != nil {
+				return fmt.Errorf("set campaign item depends_on: %w", err)
+			}
+			outcome.Added = append(outcome.Added, AppliedAddition{
+				ItemID:   item.ID,
+				IssueRef: item.IssueRef,
+				Refs:     merged[len(item.DependsOn):],
+			})
+		}
+
+		// 4. New items queue after every existing item, in request order.
+		for i, ni := range p.NewItems {
+			deps, err := marshalDependsOn(ni.DependsOn)
+			if err != nil {
+				return err
+			}
+			row, err := q.CreateCampaignItem(ctx, campaigndb.CreateCampaignItemParams{
+				ID:            uuid.New(),
+				CampaignID:    p.CampaignID,
+				IssueRef:      ni.IssueRef,
+				DependsOn:     deps,
+				State:         string(ItemStatePending),
+				Autonomy:      normalizeAutonomy(ni.Autonomy),
+				QueuePosition: int32(maxPos + 1 + i), //nolint:gosec // dense index over one campaign's items
+			})
+			if err != nil {
+				return fmt.Errorf("create campaign item: %w", err)
+			}
+			outcome.Created = append(outcome.Created, rowToCampaignItem(row))
+		}
+
+		// 5. Record before commit: an error here rolls every write above back.
+		if p.Record != nil {
+			if err := p.Record(ctx, outcome); err != nil {
+				return fmt.Errorf("%w: %w", ErrAppendUnrecorded, err)
+			}
+		}
+		out = &outcome
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // --- Conversions between DB and domain types ---
 
 // marshalDependsOn renders the depends_on edge slice as a JSONB array. A nil

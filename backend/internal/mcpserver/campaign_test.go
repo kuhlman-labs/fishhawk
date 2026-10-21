@@ -3661,3 +3661,115 @@ func TestGetCampaignStatus_ScopeOverlap_TruncatedPastCap(t *testing.T) {
 		t.Errorf("#1 overlaps = %+v, want the beyond-cap item's run kept", so.Items[0].Overlaps)
 	}
 }
+
+// --- fishhawk_append_campaign_items (E86.47 / #4358) ---
+
+// appendBackend serves POST /v0/campaigns/{id}/items with a scripted answer and
+// records the request it received.
+func appendBackend(t *testing.T, status int, body string) (*httptest.Server, *map[string]any, *string) {
+	t.Helper()
+	var got map[string]any
+	var path string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		path = r.Method + " " + r.URL.Path
+		_ = json.NewDecoder(r.Body).Decode(&got)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		_, _ = io.WriteString(w, body)
+	}))
+	t.Cleanup(srv.Close)
+	return srv, &got, &path
+}
+
+func TestAppendCampaignItemsTool_RoundTrip(t *testing.T) {
+	id := uuid.New()
+	srv, got, path := appendBackend(t, http.StatusCreated, `{"campaign":{"id":"`+id.String()+`","state":"running"},"appended":[{"id":"`+uuid.NewString()+`","issue_ref":"issue:20","depends_on":["issue:999"],"state":"pending","external_depends_on":["issue:999"]}],"satisfied_dependencies":[{"from":20,"to":500,"state":"closed","state_reason":"completed"}]}`)
+	r := newResolver(srv, nil)
+	_, out, err := r.appendCampaignItems(context.Background(), nil, appendCampaignItemsInput{CampaignID: id.String(), Items: []string{"20"}, AllowExternalBlockers: true})
+	if err != nil {
+		t.Fatalf("appendCampaignItems: %v", err)
+	}
+	if *path != "POST /v0/campaigns/"+id.String()+"/items" {
+		t.Errorf("path = %q", *path)
+	}
+	if (*got)["allow_external_blockers"] != true {
+		t.Errorf("body = %v, want allow_external_blockers true", *got)
+	}
+	if len(out.Appended) != 1 || out.Appended[0].IssueRef != "issue:20" || len(out.Appended[0].ExternalDependsOn) != 1 {
+		t.Errorf("appended = %+v", out.Appended)
+	}
+	if len(out.SatisfiedDependencies) != 1 || out.SatisfiedDependencies[0].To != 500 {
+		t.Errorf("satisfied = %+v", out.SatisfiedDependencies)
+	}
+}
+
+func TestAppendCampaignItemsTool_LocalValidation(t *testing.T) {
+	srv, _, path := appendBackend(t, http.StatusCreated, `{}`)
+	r := newResolver(srv, nil)
+	if _, _, err := r.appendCampaignItems(context.Background(), nil, appendCampaignItemsInput{CampaignID: "nope", Items: []string{"1"}}); err == nil || !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("bad uuid err = %v", err)
+	}
+	if _, _, err := r.appendCampaignItems(context.Background(), nil, appendCampaignItemsInput{CampaignID: uuid.NewString()}); err == nil || !strings.Contains(err.Error(), "items is required") {
+		t.Errorf("empty items err = %v", err)
+	}
+	if *path != "" {
+		t.Errorf("a local refusal dialed the backend: %q", *path)
+	}
+}
+
+// TestAppendCampaignItemsTool_RemedyPerRefusal: every refusal code maps to an
+// operator move naming the specifics from details.
+func TestAppendCampaignItemsTool_RemedyPerRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		code      string
+		details   string
+		wantParts []string
+	}{
+		{422, "campaign_external_dependency", `{"edges":[{"from":"issue:20","to":"issue:999"}]}`, []string{"allow_external_blockers"}},
+		{422, "campaign_dependency_cycle", `{"cycle":["issue:20","issue:21","issue:20"]}`, []string{"issue:20 -> issue:21 -> issue:20"}},
+		{409, "campaign_item_duplicate", `{"duplicates":["issue:10"]}`, []string{"issue:10", "drop it"}},
+		{409, "campaign_not_appendable", `{}`, []string{"terminal"}},
+		{422, "campaign_item_ref_invalid", `{}`, []string{"issue:N"}},
+		{404, "campaign_not_found", `{}`, []string{"fishhawk_start_campaign"}},
+		{503, "campaign_audit_unavailable", `{}`, []string{"nothing was written"}},
+	} {
+		srv, _, _ := appendBackend(t, tc.status, `{"error":{"code":"`+tc.code+`","message":"m","details":`+tc.details+`}}`)
+		r := newResolver(srv, nil)
+		_, _, err := r.appendCampaignItems(context.Background(), nil, appendCampaignItemsInput{CampaignID: uuid.NewString(), Items: []string{"20"}})
+		if err == nil {
+			t.Fatalf("%s: err = nil", tc.code)
+		}
+		for _, want := range append([]string{tc.code}, tc.wantParts...) {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: err %q missing %q", tc.code, err.Error(), want)
+			}
+		}
+	}
+	// An unmapped code and a malformed detail still surface.
+	srv, _, _ := appendBackend(t, 500, `{"error":{"code":"internal_error","message":"boom"}}`)
+	if _, _, err := newResolver(srv, nil).appendCampaignItems(context.Background(), nil, appendCampaignItemsInput{CampaignID: uuid.NewString(), Items: []string{"20"}}); err == nil || !strings.Contains(err.Error(), "append campaign items") {
+		t.Errorf("unmapped err = %v", err)
+	}
+	if got := detailStrings(map[string]any{"cycle": "x"}, "cycle", ","); got != "?" {
+		t.Errorf("detailStrings malformed = %q, want ?", got)
+	}
+}
+
+// TestGetCampaignStatusTool_PassesDependencyRefresh: the status tool passes the
+// backend's dependency_refresh block through.
+func TestGetCampaignStatusTool_PassesDependencyRefresh(t *testing.T) {
+	id := uuid.New()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"campaign":{"id":"`+id.String()+`","state":"running"},"items":[],"rollup":{},"next_action":{"action":"wait"},"dependency_refresh":{"performed":true,"committed":false,"warnings":["w"]}}`)
+	}))
+	t.Cleanup(srv.Close)
+	_, out, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out.DependencyRefresh == nil || !out.DependencyRefresh.Performed || len(out.DependencyRefresh.Warnings) != 1 {
+		t.Errorf("dependency_refresh = %+v", out.DependencyRefresh)
+	}
+}

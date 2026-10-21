@@ -116,6 +116,23 @@ type GetCampaignStatusOutput struct {
 	// runs share files with it. Composed MCP-side from one live scope-overlap
 	// read per item (capped). Nil when no item is in flight.
 	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read)"`
+	// DependencyRefresh passes the backend's monotone dependency refresh block
+	// through (E86.47 / #4358).
+	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty" jsonschema:"the monotone dependency refresh this poll ran: tracker blocked-by links and Depends-on lines re-read for unstarted items; edges are only ever ADDED (held), never removed. skipped_reason is in_flight/min_interval (30 s per campaign)/foreign_account/repo_not_visible/no_candidates; warnings name an unrecorded or unreadable refresh. Absent when the deployment disables it"`
+}
+
+// appendCampaignItemsInput is the fishhawk_append_campaign_items tool's input.
+type appendCampaignItemsInput struct {
+	CampaignID            string   `json:"campaign_id" jsonschema:"the campaign UUID to append to (pending, running, paused or awaiting_human)"`
+	Items                 []string `json:"items" jsonschema:"1..50 issue refs to append (N, #N or issue:N); each is resolved on the tracker with its blocked-by links and Depends-on lines"`
+	AllowExternalBlockers bool     `json:"allow_external_blockers,omitempty" jsonschema:"admit a NEW item's dependency on an issue that is not a campaign member: the edge is persisted and HOLDS the item blocked until released. Without it such an edge refuses the append"`
+}
+
+// appendCampaignItemsOutput carries the campaign and the appended items.
+type appendCampaignItemsOutput struct {
+	Campaign              Campaign                      `json:"campaign"`
+	Appended              []appendedCampaignItem        `json:"appended"`
+	SatisfiedDependencies []satisfiedCampaignDependency `json:"satisfied_dependencies,omitempty"`
 }
 
 // campaignScopeOverlapMaxItemReads bounds the per-poll scope-overlap reads
@@ -969,8 +986,94 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		AcceptanceSlot: r.acceptanceSlotFor(ctx, st.Items),
 		// Best-effort cross-run scope overlap among the in-flight items
 		// (E83.60 / #4118), likewise after the successful backend read.
-		ScopeOverlap: r.campaignScopeOverlapFor(ctx, st.Items),
+		ScopeOverlap:      r.campaignScopeOverlapFor(ctx, st.Items),
+		DependencyRefresh: st.DependencyRefresh,
 	}, nil
+}
+
+// registerAppendCampaignItems wires the fishhawk_append_campaign_items tool
+// (E86.47 / #4358).
+//
+// Auth: a write tool — operator-side fhk_* tokens with write:campaigns scope.
+func registerAppendCampaignItems(srv *mcp.Server, resolver *runResolver) {
+	mcp.AddTool(srv, &mcp.Tool{
+		Name: "fishhawk_append_campaign_items",
+		Description: strings.TrimSpace(`
+Add issues to an existing campaign — including a RUNNING one — without
+cancelling and rebuilding it. Each new ref is resolved on the tracker (native
+blocked-by links and Depends-on lines) and queued after every existing item;
+the dependency closure is re-validated under the campaign lock and the append is
+recorded on the audit chain before it commits (an unrecordable append writes
+nothing). A cycle is refused only when it passes through a NEW item; a NEW
+item's dependency on a non-member refuses campaign_external_dependency unless
+allow_external_blockers admits it (the item is then held blocked). Existing
+members are not re-checked here: their tracker drift is observed and HELD by the
+dependency refresh on the next fishhawk_get_campaign_status poll or item start.
+A write tool: needs an operator token with write:campaigns scope.
+`),
+	}, resolver.appendCampaignItems)
+}
+
+// appendCampaignItems is the tool handler.
+func (r *runResolver) appendCampaignItems(ctx context.Context, _ *mcp.CallToolRequest, in appendCampaignItemsInput) (*mcp.CallToolResult, appendCampaignItemsOutput, error) {
+	id, err := uuid.Parse(in.CampaignID)
+	if err != nil {
+		return nil, appendCampaignItemsOutput{}, fmt.Errorf("campaign_id %q is not a valid UUID: %w", in.CampaignID, err)
+	}
+	if len(in.Items) == 0 {
+		return nil, appendCampaignItemsOutput{}, errors.New("items is required: name 1..50 issue refs to append")
+	}
+	res, err := r.api.AppendCampaignItems(ctx, id, in.Items, in.AllowExternalBlockers)
+	if err != nil {
+		var ae *apiError
+		if errors.As(err, &ae) {
+			if remedy := appendCampaignItemsRemedy(ae); remedy != "" {
+				return nil, appendCampaignItemsOutput{}, fmt.Errorf("%s: %s — %s", ae.Code, ae.Message, remedy)
+			}
+		}
+		return nil, appendCampaignItemsOutput{}, fmt.Errorf("append campaign items: %w", err)
+	}
+	return nil, appendCampaignItemsOutput{
+		Campaign:              res.Campaign,
+		Appended:              res.Appended,
+		SatisfiedDependencies: res.SatisfiedDependencies,
+	}, nil
+}
+
+// appendCampaignItemsRemedy names the operator move for each append refusal
+// code, reading the structured details where they carry the specifics.
+func appendCampaignItemsRemedy(ae *apiError) string {
+	switch ae.Code {
+	case "campaign_external_dependency":
+		return "a new item depends on an issue outside the campaign: append that issue in the same call, or pass allow_external_blockers:true to admit the edge (the item is then held blocked until the blocker is released)"
+	case "campaign_dependency_cycle":
+		return fmt.Sprintf("the append would close a dependency cycle through a new item (cycle: %s); break one edge on the tracker, then retry", detailStrings(ae.Details, "cycle", " -> "))
+	case "campaign_item_duplicate":
+		return fmt.Sprintf("already a campaign member (or named twice): %s; drop it from items and retry", detailStrings(ae.Details, "duplicates", ", "))
+	case "campaign_not_appendable":
+		return "the campaign is terminal (cancelled/succeeded/failed) and accepts no new items; start a new campaign with fishhawk_start_campaign"
+	case "campaign_item_ref_invalid":
+		return "pass each item as N, #N or issue:N"
+	case "campaign_not_found":
+		return "pass the id fishhawk_start_campaign returned"
+	case "campaign_audit_unavailable":
+		return "nothing was written; retry shortly"
+	}
+	return ""
+}
+
+// detailStrings renders a []string-shaped detail (decoded as []any) for an
+// error message; a missing or wrong-typed value renders as "?".
+func detailStrings(details map[string]any, key, sep string) string {
+	raw, ok := details[key].([]any)
+	if !ok || len(raw) == 0 {
+		return "?"
+	}
+	parts := make([]string, 0, len(raw))
+	for _, v := range raw {
+		parts = append(parts, fmt.Sprint(v))
+	}
+	return strings.Join(parts, sep)
 }
 
 // registerResumeCampaign wires the fishhawk_resume_campaign tool (E25.7 hand-back).

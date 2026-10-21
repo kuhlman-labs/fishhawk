@@ -4760,6 +4760,26 @@ type CampaignStatus struct {
 	Items      []CampaignItem     `json:"items"`
 	Rollup     CampaignRollup     `json:"rollup"`
 	NextAction CampaignNextAction `json:"next_action"`
+	// DependencyRefresh is the monotone dependency refresh block (E86.47 /
+	// #4358); absent when the deployment disables the refresh.
+	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty"`
+}
+
+// campaignDependencyRefresh mirrors the status response's dependency_refresh
+// block: what the tracker re-read added (never removed), and why it skipped.
+type campaignDependencyRefresh struct {
+	Performed     bool   `json:"performed"`
+	SkippedReason string `json:"skipped_reason,omitempty"`
+	Added         []struct {
+		IssueRef string   `json:"issue_ref"`
+		Refs     []string `json:"refs"`
+		External []string `json:"external,omitempty"`
+	} `json:"added,omitempty"`
+	Committed      bool     `json:"committed"`
+	SkippedStarted []string `json:"skipped_started,omitempty"`
+	Unparsable     []string `json:"unparsable,omitempty"`
+	CycleMembers   []string `json:"cycle_members,omitempty"`
+	Warnings       []string `json:"warnings,omitempty"`
 }
 
 // campaignCreateRequest mirrors the backend's POST /v0/campaigns body
@@ -5077,6 +5097,60 @@ func (c *apiClient) CancelCampaign(ctx context.Context, id uuid.UUID) (*Campaign
 		return nil, err
 	}
 	return &camp, nil
+}
+
+// appendCampaignItemsRequest mirrors the backend's POST
+// /v0/campaigns/{campaign_id}/items body
+// (`backend/internal/server/campaign_append.go::appendCampaignItemsRequest`).
+type appendCampaignItemsRequest struct {
+	Items                 []string `json:"items"`
+	AllowExternalBlockers bool     `json:"allow_external_blockers,omitempty"`
+}
+
+// appendedCampaignItem is one appended item in the append 201 body: the item
+// plus the admitted non-member blockers it carries.
+type appendedCampaignItem struct {
+	CampaignItem
+	ExternalDependsOn []string `json:"external_depends_on,omitempty"`
+}
+
+// appendCampaignItemsResult is the append 201 body.
+type appendCampaignItemsResult struct {
+	Campaign              Campaign                      `json:"campaign"`
+	Appended              []appendedCampaignItem        `json:"appended"`
+	SatisfiedDependencies []satisfiedCampaignDependency `json:"satisfied_dependencies,omitempty"`
+}
+
+// satisfiedCampaignDependency is one tracker edge elided because its
+// non-member target is already closed-as-completed.
+type satisfiedCampaignDependency struct {
+	From        int    `json:"from"`
+	To          int    `json:"to"`
+	State       string `json:"state"`
+	StateReason string `json:"state_reason"`
+	Source      string `json:"source,omitempty"`
+}
+
+// AppendCampaignItems appends issues to an existing — possibly running —
+// campaign via `POST /v0/campaigns/{id}/items` (E86.47 / #4358). A write tool:
+// requires write:campaigns. 4xx/5xx surfaces:
+//   - 400 validation_failed (bad UUID, unknown field, 0 or >50 items)
+//   - 403 insufficient_scope / account_forbidden / repo_forbidden
+//   - 404 campaign_not_found
+//   - 409 campaign_not_appendable (terminal) / campaign_item_duplicate
+//   - 422 campaign_external_dependency / campaign_dependency_cycle /
+//     campaign_item_ref_invalid
+//   - 502/503 tracker or audit unavailable (nothing written)
+func (c *apiClient) AppendCampaignItems(ctx context.Context, id uuid.UUID, items []string, allowExternal bool) (*appendCampaignItemsResult, error) {
+	var out appendCampaignItemsResult
+	body, err := json.Marshal(appendCampaignItemsRequest{Items: items, AllowExternalBlockers: allowExternal})
+	if err != nil {
+		return nil, fmt.Errorf("marshal append campaign items request: %w", err)
+	}
+	if err := c.do(ctx, http.MethodPost, "/v0/campaigns/"+id.String()+"/items", body, &out); err != nil {
+		return nil, err
+	}
+	return &out, nil
 }
 
 // startCampaignItemRunRequest mirrors the backend's POST

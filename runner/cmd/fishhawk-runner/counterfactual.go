@@ -23,9 +23,14 @@ package main
 // lineage worktree between specs with os.RemoveAll + MaterializeClone instead
 // of restoring the used clone with git, so spec N+1 never touches spec N's
 // clone with git; and the one git call that must run after untrusted execution,
-// the patch-form `git apply`, runs through cfGitApply under a runner-held
-// GIT_DIR OUTSIDE the clone with the clone's config and attributes pinned off,
-// refusing unless <clone>/.git is the runner's own directory.
+// the patch-form `git apply`, runs through cfGitApply under a GIT_DIR OUTSIDE
+// the clone with the clone's config and attributes pinned off, refusing unless
+// <clone>/.git is the runner's own directory. That GIT_DIR is minted FRESH and
+// empty for every invocation and removed on every exit (#4360), so a
+// repository a baseline plants at a predictable scratch path is never opened,
+// and the git child gets the default-deny gate env rather than the runner's
+// own: no config source that could define a smudge/clean driver is read, so a
+// work-tree `filter=` attribute is inert.
 //
 // Classification reads the `go test -json` (test2json) action stream and the
 // gate exec disposition, never free text, and an unmutated baseline must be
@@ -129,6 +134,14 @@ type counterfactualExecutor struct {
 	materialize func(ctx context.Context, repoDir, headSHA, parent string) (string, error)
 	now         func() time.Time
 	lastRelease time.Time
+	// phaseCleanupDir is the runner-owned phase directory the last
+	// runCounterfactualPhase created ("" when it created none). Its name is
+	// runner-minted, so it is safe to log.
+	phaseCleanupDir string
+	// phaseCleanupErr is the error of that phase directory's final removal
+	// (nil when it was removed, or no phase ran). runPlanCounterfactualsWith
+	// surfaces it as a counterfactual_cleanup_failed log line and trace event.
+	phaseCleanupErr error
 }
 
 func newCounterfactualExecutor(ctx context.Context, repoDir string) *counterfactualExecutor {
@@ -164,6 +177,17 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 	if len(specs) == 0 {
 		return nil, nil
 	}
+	return runPlanCounterfactualsWith(ctx, cfg, newCounterfactualExecutor(ctx, repoDir), repoDir, events, verifiedTreeSHA, specs, logSink)
+}
+
+// runPlanCounterfactualsWith is runPlanCounterfactuals on a caller-supplied
+// executor (the test seam). A phase directory whose final removal failed is
+// surfaced as ONE counterfactual_cleanup_failed log line plus trace event
+// carrying the runner-owned phase directory and the failure's op and errno
+// only (cfCleanupDetail) — never the failing path, whose components a
+// baseline names. It is a trace-only kind: not folded into gate_evidence and
+// not an audit category.
+func runPlanCounterfactualsWith(ctx context.Context, cfg config, x *counterfactualExecutor, repoDir string, events []agent.Event, verifiedTreeSHA string, specs []upload.CounterfactualSpec, logSink io.Writer) ([]agent.Event, []counterfactualObservationEvidence) {
 	// The plan and the backend ingest both cap counterfactuals at
 	// gateEvidenceCounterfactualCap (8); a longer delivery is never executed
 	// past it, so the phase cannot spend budget on observations nothing keeps.
@@ -178,9 +202,8 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 	if verifiedTreeSHA == "" || tree != verifiedTreeSHA {
 		head, tree = "", ""
 	}
-	x := newCounterfactualExecutor(ctx, repoDir)
 	obs := runCounterfactualPhase(ctx, x, repoDir, head, tree, specs)
-	out := make([]agent.Event, 0, len(obs))
+	out := make([]agent.Event, 0, len(obs)+1)
 	for _, o := range obs {
 		logEvent(logSink, "counterfactual_observed", map[string]string{
 			"run_id": cfg.runID, "stage_id": cfg.stageID,
@@ -189,7 +212,33 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 		})
 		out = append(out, counterfactualObservedEvent(cfg, o))
 	}
+	if x.phaseCleanupErr != nil {
+		detail := cfCleanupDetail(x.phaseCleanupErr)
+		logEvent(logSink, "counterfactual_cleanup_failed", map[string]string{
+			"run_id": cfg.runID, "stage_id": cfg.stageID,
+			"phase_dir": x.phaseCleanupDir, "detail": detail,
+		})
+		out = append(out, agent.Event{
+			Kind: "counterfactual_cleanup_failed",
+			Payload: agent.MakePayload(map[string]any{
+				"run_id": cfg.runID, "stage_id": cfg.stageID,
+				"phase_dir": x.phaseCleanupDir, "detail": detail,
+			}),
+		})
+	}
 	return out, obs
+}
+
+// cfCleanupDetail renders a removal error as its operation and errno text
+// only. The failing path of a *fs.PathError is dropped: it lies under the
+// clone, where a baseline chose the names, so it never reaches a log or the
+// trace. Any other error renders as a fixed string.
+func cfCleanupDetail(err error) string {
+	var pe *fs.PathError
+	if errors.As(err, &pe) && pe.Err != nil {
+		return pe.Op + ": " + pe.Err.Error()
+	}
+	return "remove failed"
 }
 
 // runCounterfactualPhase executes specs strictly sequentially and returns
@@ -198,11 +247,14 @@ func runPlanCounterfactuals(ctx context.Context, cfg config, repoDir string, eve
 // one, executes a spec, then — because that spec ran untrusted repository code
 // in the clone and may have poisoned its <clone>/.git — re-materializes a clean
 // clone from the trusted lineage worktree for the NEXT spec (os.RemoveAll +
-// x.materialize), never restoring the used clone with host git (H1). A
-// re-materialize that fails leaves no clean tree for the remaining specs, so
-// they record error/restore_failed instead of running on a stale or poisoned
-// one. The last clone is removed with the parent at the end.
+// x.materialize), never restoring the used clone with host git (H1). A removal
+// that fails, or a re-materialize that fails, leaves no clean tree for the
+// remaining specs, so they record error/restore_failed instead of running on a
+// stale or poisoned one; a failed removal is checked explicitly and never
+// reaches x.materialize (#4360). The last clone is removed with the parent at
+// the end, and that removal's error is recorded on x for the caller to surface.
 func runCounterfactualPhase(ctx context.Context, x *counterfactualExecutor, repoDir, headSHA, treeSHA string, specs []upload.CounterfactualSpec) []counterfactualObservationEvidence {
+	x.phaseCleanupDir, x.phaseCleanupErr = "", nil
 	out := make([]counterfactualObservationEvidence, 0, len(specs))
 	all := func(observed, reason string) []counterfactualObservationEvidence {
 		for _, s := range specs {
@@ -219,7 +271,12 @@ func runCounterfactualPhase(ctx context.Context, x *counterfactualExecutor, repo
 	if err != nil {
 		return all(cfOutcomeError, cfReasonCloneFailed)
 	}
-	defer func() { _ = os.RemoveAll(parent) }()
+	x.phaseCleanupDir = parent
+	defer func() {
+		if err := os.RemoveAll(parent); err != nil {
+			x.phaseCleanupErr = err
+		}
+	}()
 	clone, err := x.materialize(ctx, repoDir, headSHA, parent)
 	if err != nil {
 		return all(cfOutcomeError, cfReasonCloneFailed)
@@ -239,9 +296,11 @@ func runCounterfactualPhase(ctx context.Context, x *counterfactualExecutor, repo
 				// Discard the (possibly poisoned) clone with a pure-filesystem
 				// RemoveAll — never host git, which a planted core.worktree or
 				// filter would subvert — and clone afresh from the trusted
-				// source for the next spec.
-				_ = os.RemoveAll(clone)
-				if clone, err = x.materialize(ctx, repoDir, headSHA, parent); err != nil {
+				// source for the next spec. A removal that fails leaves the
+				// used clone in place, so the next spec must not run at all.
+				if err := os.RemoveAll(clone); err != nil {
+					cloneBroken = true
+				} else if clone, err = x.materialize(ctx, repoDir, headSHA, parent); err != nil {
 					cloneBroken = true
 				}
 			}
@@ -678,15 +737,12 @@ func applyCounterfactualMutation(ctx context.Context, clone, scratch string, s u
 	case upload.CounterfactualMutationPatch:
 		// The patch form is the ONE mutation path that runs host git after the
 		// baseline executed untrusted repository code in the clone. It runs
-		// through cfGitApply under a runner-held GIT_DIR outside the clone
-		// (gitDir, a sibling of the clone under scratch) so neither
-		// <clone>/.git/config nor <clone>/.git/info/attributes is read: a
-		// planted core.worktree cannot redirect the write out of the clone and
-		// a planted filter cannot run on the host (H1).
-		gitDir := filepath.Join(scratch, "cf-gitdir")
-		if err := os.MkdirAll(gitDir, 0o700); err != nil {
-			return "", cfReasonMutationNotApplied
-		}
+		// through cfGitApply, which mints its own fresh GIT_DIR under scratch
+		// (outside the clone) for each call, so neither <clone>/.git/config
+		// nor <clone>/.git/info/attributes nor anything a baseline planted
+		// under scratch is read: a planted core.worktree cannot redirect the
+		// write out of the clone and a planted filter cannot run on the host
+		// (H1, #4360).
 		pf, err := os.CreateTemp(scratch, "counterfactual-*.patch")
 		if err != nil {
 			return "", cfReasonMutationNotApplied
@@ -697,14 +753,14 @@ func applyCounterfactualMutation(ctx context.Context, clone, scratch string, s u
 		if werr != nil || cerr != nil {
 			return "", cfReasonMutationNotApplied
 		}
-		stat, err := cfGitApply(ctx, clone, gitDir, "apply", "--numstat", "--summary", patchPath)
+		stat, err := cfGitApply(ctx, clone, scratch, "apply", "--numstat", "--summary", patchPath)
 		if err != nil {
 			return "", cfReasonMutationNotApplied
 		}
 		if reason := checkPatchConfinedToControl(stat, s.ControlPath); reason != "" {
 			return "", reason
 		}
-		if _, err := cfGitApply(ctx, clone, gitDir, "apply", patchPath); err != nil {
+		if _, err := cfGitApply(ctx, clone, scratch, "apply", patchPath); err != nil {
 			return "", cfReasonMutationNotApplied
 		}
 		return counterfactualMutationSHA256(s), ""
@@ -779,29 +835,43 @@ func checkPatchConfinedToControl(stat, control string) string {
 
 // cfGitApply runs a `git apply` against clone's WORK TREE after the baseline
 // has executed untrusted repository code there, reading NONE of the clone's
-// own git metadata (H1). git discovers no repository from the clone because
-// GIT_DIR is pinned to a runner-held directory OUTSIDE the mount (gitDir,
-// created empty — `git apply` needs no repository state there); GIT_WORK_TREE
-// anchors path resolution at the clone; and GIT_CONFIG_NOSYSTEM /
-// GIT_CONFIG_GLOBAL=/dev/null / GIT_ATTR_NOSYSTEM pin off every config and
-// attribute source git would otherwise still consult. A baseline that appended
-// a relative core.worktree, or planted a filter.<x>.smudge/clean plus a
-// "* filter=<x>" line in <clone>/.git/info/attributes, therefore cannot
-// redirect the write out of the clone or run a command on the host.
+// own git metadata and nothing a baseline could have planted (H1, #4360).
+//
+//   - GIT_DIR is a directory minted fresh and empty under scratch for THIS
+//     invocation (never a fixed, reusable name a baseline could pre-create as
+//     a repository) and removed on every exit — success, git failure and
+//     context cancellation alike. Its removal error is deliberately ignored:
+//     the name is never reused, and it lives under the phase directory, whose
+//     final removal is checked. `git apply` needs no repository state, so git
+//     runs it outside any repository and discovers nothing from the clone.
+//   - GIT_WORK_TREE anchors path resolution at the clone.
+//   - The child env is the default-deny gate allow-list (sanitizedGateEnv),
+//     never the runner's own env, so no runner credential reaches it; that
+//     list already pins global and system config to /dev/null and drops every
+//     inherited GIT_* key (GIT_CONFIG_PARAMETERS / GIT_CONFIG_COUNT included).
+//     GIT_CONFIG_NOSYSTEM and GIT_ATTR_NOSYSTEM are pinned on top.
+//
+// With no repository, global or system config read, nothing can define a
+// smudge/clean driver, so a work-tree `.gitattributes` filter line — or a
+// relative core.worktree / filter planted in <clone>/.git — is inert.
 // gitops.HardeningArgs is layered on as `-c` overrides for defense in depth.
-// It refuses unless <clone>/.git is the runner's own real directory.
-func cfGitApply(ctx context.Context, clone, gitDir string, args ...string) (string, error) {
+// It refuses, minting nothing, unless <clone>/.git is the runner's own real
+// directory.
+func cfGitApply(ctx context.Context, clone, scratch string, args ...string) (string, error) {
 	if err := cloneGitDirOwned(clone); err != nil {
 		return "", err
 	}
+	gitDir, err := os.MkdirTemp(scratch, "cf-gitdir-")
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = os.RemoveAll(gitDir) }()
 	cmd := exec.CommandContext(ctx, "git", append(gitops.HardeningArgs(), args...)...)
 	cmd.Dir = clone
-	cmd.Env = append(os.Environ(),
+	cmd.Env = append(sanitizedGateEnv(),
 		"GIT_DIR="+gitDir,
 		"GIT_WORK_TREE="+clone,
 		"GIT_CONFIG_NOSYSTEM=1",
-		"GIT_CONFIG_GLOBAL=/dev/null",
-		"GIT_CONFIG_SYSTEM=/dev/null",
 		"GIT_ATTR_NOSYSTEM=1",
 		"GIT_TERMINAL_PROMPT=0",
 	)
@@ -817,7 +887,7 @@ func cfGitApply(ctx context.Context, clone, gitDir string, args ...string) (stri
 
 // cloneGitDirOwned refuses unless <clone>/.git is a real directory the runner
 // itself materialized — not a symlink or gitfile a baseline could have swapped
-// in to redirect git back at the host's repository. The isolated GIT_DIR in
+// in to redirect git back at the host's repository. The fresh GIT_DIR in
 // cfGitApply already means git never discovers <clone>/.git, so this is a
 // fail-closed guard against the clone's metadata being tampered with, not the
 // primary containment.

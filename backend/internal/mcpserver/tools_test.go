@@ -3515,7 +3515,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// specialist_job_requester_not_a_seat); get needs read:runs. Their own
 	// tools, not run verbs: a job has no stage, writes no run or stage row,
 	// and is admitted through local-verify:<host>. 77 -> 79.
-	const wantToolCount = 79
+	const wantToolCount = 80
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

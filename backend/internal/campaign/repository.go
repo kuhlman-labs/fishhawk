@@ -150,6 +150,51 @@ type CreateCampaignItemParams struct {
 	Position int
 }
 
+// AppendCampaignItemsParams is the input to Repository.AppendCampaignItems
+// (E86.47 / #4358): new items to insert into an existing campaign plus
+// add-only depends_on additions to existing members.
+type AppendCampaignItemsParams struct {
+	CampaignID uuid.UUID
+	// NewItems are the items to insert. CampaignID and Position are assigned
+	// by the adapter: Position is max(existing queue_position)+1+i, so appended
+	// items queue after every existing item in request order.
+	NewItems []CreateCampaignItemParams
+	// AddDependencies maps an EXISTING item id to depends_on refs to ADD. The
+	// write is the monotone MergeDependsOn union: no persisted edge is ever
+	// removed. An addition is applied only while the item is pending/blocked
+	// with no run; a started item is reported in SkippedStarted and untouched.
+	AddDependencies map[uuid.UUID][]string
+	// AllowExternal admits a NEW item's depends_on edge onto a non-member
+	// issue (held until released). False refuses it ErrExternalDependency.
+	AllowExternal bool
+	// Record, when non-nil, is called INSIDE the transaction after every write
+	// and before commit. A non-nil error rolls the whole transaction back and
+	// AppendCampaignItems returns it wrapped in ErrAppendUnrecorded, so an
+	// unrecordable change writes nothing.
+	Record func(ctx context.Context, out AppendOutcome) error
+}
+
+// AppliedAddition is one depends_on addition AppendCampaignItems wrote: Refs
+// are the refs newly added (the union minus what was already persisted).
+type AppliedAddition struct {
+	ItemID   uuid.UUID
+	IssueRef string
+	Refs     []string
+}
+
+// AppendOutcome is what AppendCampaignItems wrote.
+type AppendOutcome struct {
+	// Campaign is the campaign row as locked by the transaction.
+	Campaign *Campaign
+	// Created are the inserted items, in NewItems order.
+	Created []*Item
+	// Added are the depends_on additions that changed a row.
+	Added []AppliedAddition
+	// SkippedStarted are the refs of items an addition targeted that had
+	// already started (not pending/blocked, or carrying a run): never touched.
+	SkippedStarted []string
+}
+
 // ListCampaignsFilter scopes a ListCampaigns query. Empty strings mean "no
 // constraint" — same convention as run.ListRunsFilter and the underlying
 // SQL. Limit must be > 0; Offset must be >= 0.
@@ -371,6 +416,24 @@ type Repository interface {
 	// ResolvedByIssueClosed, normalized so an out-of-set value can never trip
 	// the migration-0085 CHECK.
 	SettleCampaignItemForClosedIssue(ctx context.Context, id uuid.UUID, to ItemState) (*Item, error)
+
+	// AppendCampaignItems inserts p.NewItems into an existing campaign and
+	// applies p.AddDependencies to existing not-yet-started items, in ONE
+	// transaction (E86.47 / #4358).
+	//
+	// LOCK ORDER is the package-wide one: the campaign row (SELECT … FOR
+	// UPDATE) first, then each addition's item row. Under the campaign lock it
+	// re-runs ValidateAppend over the campaign's current items, so a check the
+	// caller made before the lock cannot be raced: a missing campaign is
+	// ErrCampaignNotFound, a terminal one (cancelled/succeeded/failed)
+	// InvalidTransitionError{Kind:"campaign"}, and a malformed ref, duplicate,
+	// unadmitted external edge on a NEW item, or a cycle through a NEW node is
+	// refused with nothing written.
+	//
+	// RECORD-BEFORE-COMMIT: p.Record runs inside the transaction after every
+	// write; its error rolls everything back (ErrAppendUnrecorded), so no
+	// member or edge exists that its audit row does not describe.
+	AppendCampaignItems(ctx context.Context, p AppendCampaignItemsParams) (*AppendOutcome, error)
 }
 
 // AccountGetter is the cheap tenant-account lookup (ADR-057 / #1830) that

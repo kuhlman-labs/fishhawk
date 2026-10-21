@@ -11,6 +11,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -32,6 +33,9 @@ type tickAudit struct {
 	memAudit
 	listAllErr error
 	appendErr  error
+	// appendFailures fails the next N run_merge_ci_observed appends, then
+	// delegates (appendErr stays the persistent failure).
+	appendFailures int
 }
 
 func (a *tickAudit) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.Entry, error) {
@@ -50,6 +54,17 @@ func (a *tickAudit) ListAll(_ context.Context, p audit.ListAllParams) ([]*audit.
 func (a *tickAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
 	if a.appendErr != nil && p.Category == CategoryRunMergeCIObserved {
 		return nil, a.appendErr
+	}
+	if p.Category == CategoryRunMergeCIObserved {
+		a.mu.Lock()
+		fail := a.appendFailures > 0
+		if fail {
+			a.appendFailures--
+		}
+		a.mu.Unlock()
+		if fail {
+			return nil, errors.New("injected audit append failure")
+		}
 	}
 	return a.memAudit.AppendChained(ctx, p)
 }
@@ -407,7 +422,7 @@ func TestTick_MergeEvidenceOutsideLookback_Skipped(t *testing.T) {
 
 func TestCITicker_LookbackNeverBelowTerminalDeadline(t *testing.T) {
 	tk := &CITicker{Lookback: time.Hour, Window: 6 * time.Hour}
-	if got, want := tk.lookback(), 6*time.Hour+DefaultCITerminalAfter+24*time.Hour; got != want {
+	if got, want := tk.lookback(), 6*time.Hour+DefaultCITerminalAfter+24*time.Hour+24*time.Hour; got != want {
 		t.Fatalf("lookback = %v, want %v", got, want)
 	}
 	if got := (&CITicker{}).lookback(); got != DefaultCILookback {
@@ -476,15 +491,20 @@ func TestCITicker_BackoffDoublesAndCaps(t *testing.T) {
 	tk := &CITicker{Interval: 10 * time.Minute, MaxBackoff: time.Hour}
 	id := uuid.New()
 	var got []time.Duration
+	var last time.Time
 	for i := 0; i < 5; i++ {
-		st := tk.noteFailure(id, tickNow)
-		got = append(got, st.nextAttempt.Sub(tickNow))
+		last = tickNow.Add(time.Duration(i) * time.Second)
+		st := tk.noteFailure(id, last)
+		got = append(got, st.nextAttempt.Sub(last))
+		if !st.firstFailure.Equal(tickNow) {
+			t.Fatalf("failure %d: firstFailure = %v, want the first failure's time %v", i+1, st.firstFailure, tickNow)
+		}
 	}
 	want := []time.Duration{10 * time.Minute, 20 * time.Minute, 40 * time.Minute, time.Hour, time.Hour}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("backoff = %v, want %v", got, want)
 	}
-	if !tk.inBackoff(id, tickNow.Add(59*time.Minute)) || tk.inBackoff(id, tickNow.Add(time.Hour)) {
+	if !tk.inBackoff(id, last.Add(59*time.Minute)) || tk.inBackoff(id, last.Add(time.Hour)) {
 		t.Fatal("inBackoff disagrees with nextAttempt")
 	}
 	tk.clear(id)
@@ -498,11 +518,16 @@ func TestCITicker_BackoffDoublesAndCaps(t *testing.T) {
 
 // Operator condition 5: a run still unobservable 7 days after maturity records
 // a terminal missing/observation_failed row naming the last error class, and
-// leaves the queue.
+// leaves the queue. Since #3990 the row needs a second failure at least 24h
+// after the first, so it lands on the tick at T0+25h.
 func TestTick_UnobservableSevenDaysAfterMaturity_RecordsTerminalMissing(t *testing.T) {
 	f := newTickFixture(t)
 	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
 	f.forge.prErr[42] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+	if sum := f.tick(); len(f.ciRows(id)) != 0 || sum.Terminal != 0 {
+		t.Fatalf("tick 1: rows = %d sum = %+v, want no terminal row on the first failure", len(f.ciRows(id)), sum)
+	}
+	f.now = tickNow.Add(25 * time.Hour)
 	sum := f.tick()
 	rows := f.ciRows(id)
 	if len(rows) != 1 || sum.Terminal != 1 {
@@ -513,9 +538,9 @@ func TestTick_UnobservableSevenDaysAfterMaturity_RecordsTerminalMissing(t *testi
 		r["merge_commit_sha"] != "" || r["merged_at"] != nil || r["matures_at"] != "2026-09-02T18:00:00Z" {
 		t.Fatalf("terminal row = %v", r)
 	}
-	f.now = tickNow.Add(24 * time.Hour)
+	f.now = tickNow.Add(49 * time.Hour)
 	f.tick()
-	if f.forge.gets(42) != 1 || len(f.ciRows(id)) != 1 {
+	if f.forge.gets(42) != 2 || len(f.ciRows(id)) != 1 {
 		t.Fatalf("gets = %d rows = %d, want the run out of the queue", f.forge.gets(42), len(f.ciRows(id)))
 	}
 }
@@ -526,30 +551,37 @@ func TestTick_TerminalAfterCheckRunsFailure_CarriesMergeFacts(t *testing.T) {
 	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
 	f.forge.checksErr = errors.New("githubclient: list check runs: 503: unavailable")
 	f.tick()
+	f.now = tickNow.Add(25 * time.Hour)
+	f.tick()
 	rows := f.ciRows(id)
 	if len(rows) != 1 || rows[0]["observation_error_class"] != "transient" || rows[0]["merge_commit_sha"] != shaFor(42) ||
 		rows[0]["merged_at"] == nil || rows[0]["missing_reason"] != "observation_failed" {
 		t.Fatalf("rows = %v, want a terminal row carrying the merge facts", rows)
 	}
-	if f.forge.checkCalls != forgeAttempts {
-		t.Fatalf("check calls = %d, want %d (a 5xx is retried)", f.forge.checkCalls, forgeAttempts)
+	if f.forge.checkCalls != 2*forgeAttempts {
+		t.Fatalf("check calls = %d, want %d (a 5xx is retried, on each of two ticks)", f.forge.checkCalls, 2*forgeAttempts)
 	}
 }
 
 // The terminal deadline keys on the FORGE maturity once GetPullRequest has
 // returned merged_at: an 8-day-old forge merge whose merge-evidence row landed
-// only 7 hours ago records its terminal row on the first failing tick.
-// Counterfactual: anchoring on the evidence maturity backs off instead.
+// only 7 hours ago records its terminal row on the second failing tick (T0+25h,
+// once the two-failure / 24h gate opens).
+// Counterfactual: anchoring on the evidence maturity backs off there instead.
 func TestTick_TerminalDeadline_ForgeMergeOlderThanEvidence(t *testing.T) {
 	f := newTickFixture(t)
 	id := f.addMergedRun(42, tickNow.Add(-7*time.Hour))
 	forgeMerged := tickNow.Add(-8 * 24 * time.Hour)
 	f.forge.prs[42].MergedAt = &forgeMerged
 	f.forge.checksErr = errors.New("githubclient: list check runs: 503: unavailable")
+	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 1: sum = %+v rows = %d, want a failure gated by the two-failure rule", sum, len(f.ciRows(id)))
+	}
+	f.now = tickNow.Add(25 * time.Hour)
 	sum := f.tick()
 	rows := f.ciRows(id)
 	if len(rows) != 1 || sum.Terminal != 1 {
-		t.Fatalf("rows = %v sum = %+v, want one terminal row on the first tick", rows, sum)
+		t.Fatalf("rows = %v sum = %+v, want one terminal row on the second tick", rows, sum)
 	}
 	r := rows[0]
 	if r["missing_reason"] != "observation_failed" || r["matures_at"] != "2026-09-02T18:00:00Z" ||
@@ -561,8 +593,10 @@ func TestTick_TerminalDeadline_ForgeMergeOlderThanEvidence(t *testing.T) {
 // An evidence row OLDER than the forge merge never terminates observation
 // early: the deadline is the forge maturity + 7 days, also after a later
 // pre-PR failure (the forge PR this process already saw keeps anchoring it).
-// Counterfactuals: anchoring on the evidence maturity records a terminal row
-// on tick 1; dropping knownPull records one on tick 2.
+// Each anchor counterfactual is observed AFTER the two-failure / 24h gate
+// opens (tick 2 at T0+25h), so the gate cannot mask it: anchoring on the
+// evidence maturity records a terminal row on tick 2; dropping knownPull
+// records one on tick 3.
 func TestTick_TerminalDeadline_EvidenceOlderThanForgeMerge(t *testing.T) {
 	f := newTickFixture(t)
 	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
@@ -572,10 +606,14 @@ func TestTick_TerminalDeadline_EvidenceOlderThanForgeMerge(t *testing.T) {
 	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
 		t.Fatalf("tick 1: sum = %+v rows = %d, want a failure but no terminal row before the forge deadline", sum, len(f.ciRows(id)))
 	}
-	f.forge.prErr[42] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
-	f.now = tickNow.Add(11 * time.Minute)
+	f.now = tickNow.Add(25 * time.Hour)
 	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
-		t.Fatalf("tick 2: sum = %+v rows = %d, want a pre-PR failure still anchored on the forge maturity", sum, len(f.ciRows(id)))
+		t.Fatalf("tick 2: sum = %+v rows = %d, want a failure anchored on the forge maturity, not the evidence", sum, len(f.ciRows(id)))
+	}
+	f.forge.prErr[42] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+	f.now = tickNow.Add(26 * time.Hour)
+	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 3: sum = %+v rows = %d, want a pre-PR failure still anchored on the forge maturity", sum, len(f.ciRows(id)))
 	}
 	f.now = tickNow.Add(5*24*time.Hour + 12*time.Hour)
 	f.tick()
@@ -610,6 +648,11 @@ func TestTick_UnmergedOrMissingFacts_Fail(t *testing.T) {
 		}
 		sum := f.tick()
 		if name == "terminal class" {
+			if rows := f.ciRows(id); len(rows) != 0 {
+				t.Fatalf("%s: rows = %v after the first failure, want none", name, rows)
+			}
+			f.now = tickNow.Add(9*24*time.Hour + time.Minute)
+			f.tick()
 			if rows := f.ciRows(id); len(rows) != 1 || rows[0]["observation_error_class"] != "pr_not_merged" {
 				t.Fatalf("%s: rows = %v", name, rows)
 			}
@@ -640,17 +683,175 @@ func TestTick_RedAndTruncatedVerdictsRecorded(t *testing.T) {
 
 func TestTick_AuditAppendError_Fails(t *testing.T) {
 	f := newTickFixture(t)
-	f.addMergedRun(42, tickNow.Add(-7*time.Hour))
+	id := f.addMergedRun(42, tickNow.Add(-7*time.Hour))
 	f.audit.appendErr = errors.New("db down")
 	if sum := f.tick(); sum.Failed != 1 || sum.Recorded != 0 {
 		t.Fatalf("sum = %+v, want the append failure counted", sum)
 	}
-	// Past the terminal deadline the terminal append fails too; nothing lands
-	// and the run stays queued.
+	// Past the terminal deadline the run re-attempts its PENDING verdict (no
+	// forge call) and never goes terminal; nothing lands and it stays queued.
 	f.now = tickNow.Add(8 * 24 * time.Hour)
-	if sum := f.tick(); sum.Terminal != 0 || sum.Failed != 1 {
-		t.Fatalf("sum = %+v, want no terminal row while the store refuses", sum)
+	if sum := f.tick(); sum.Terminal != 0 || sum.Failed != 1 || sum.Evaluated != 0 {
+		t.Fatalf("sum = %+v, want a failed pending re-append and no terminal row while the store refuses", sum)
 	}
+	if f.forge.gets(42) != 1 || f.forge.checkCalls != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("gets = %d checks = %d rows = %d, want no new forge call and no row", f.forge.gets(42), f.forge.checkCalls, len(f.ciRows(id)))
+	}
+}
+
+// #3990 item 1: an audit-append failure after a successful classification
+// holds the verdict; past the terminal deadline it is never overwritten by a
+// terminal missing, and the SAME verdict is re-appended later with its
+// original observed_at and zero forge calls. Tick 1 seeds a checks failure at
+// T0 so that on tick 2 (T0+25h) the two-failure / 24h gate is ALREADY OPEN and
+// cannot mask the pending-verdict guard; the red append fails exactly once, so
+// a terminal append WOULD land. Counterfactuals: delete the guard in fail →
+// tick 2 commits a missing/observation_failed row; delete the retry call in
+// Tick → tick 3 re-queries the forge and commits GREEN.
+func TestTick_AuditAppendFailure_PastDeadline_KeepsObservedVerdict(t *testing.T) {
+	f := newTickFixture(t)
+	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
+	f.forge.checksErr = errors.New("githubclient: list check runs: 503: unavailable")
+	if sum := f.tick(); sum.Failed != 1 || sum.Terminal != 0 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 1: sum = %+v rows = %d, want one gated failure and no row", sum, len(f.ciRows(id)))
+	}
+	f.forge.checksErr = nil
+	f.forge.checks[shaFor(42)][0].Conclusion = "failure"
+	f.audit.appendFailures = 1
+	f.now = tickNow.Add(25 * time.Hour)
+	if sum := f.tick(); sum.Terminal != 0 || sum.Failed != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 2: sum = %+v rows = %v, want the failed red append held, no terminal row committed", sum, f.ciRows(id))
+	}
+	f.forge.checks[shaFor(42)][0].Conclusion = "success"
+	gets, checks := f.forge.gets(42), f.forge.checkCalls
+	f.now = tickNow.Add(26 * time.Hour)
+	if sum := f.tick(); sum.Recorded != 1 || sum.Evaluated != 0 || sum.Terminal != 0 {
+		t.Fatalf("tick 3: sum = %+v, want the pending verdict re-appended without a forge evaluation", sum)
+	}
+	rows := f.ciRows(id)
+	if len(rows) != 1 {
+		t.Fatalf("tick 3: rows = %v, want exactly one committed row", rows)
+	}
+	r := rows[0]
+	if r["conclusion"] != "red" || fmt.Sprint(r["failed_checks"]) != "[CI Pass]" || r["missing_reason"] != "" ||
+		r["observation_error_class"] != "" || r["merge_commit_sha"] != shaFor(42) || r["observed_at"] != "2026-09-11T13:00:00Z" {
+		t.Fatalf("committed row = %v, want the ORIGINAL red verdict observed at T0+25h", r)
+	}
+	if e := f.audit.rows(id, CategoryRunMergeCIObserved)[0]; !e.Timestamp.Equal(tickNow.Add(26 * time.Hour)) {
+		t.Fatalf("chain-row timestamp = %v, want the append time %v", e.Timestamp, tickNow.Add(26*time.Hour))
+	}
+	if f.forge.gets(42) != gets || f.forge.checkCalls != checks {
+		t.Fatalf("forge calls: gets %d→%d checks %d→%d, want none on the re-append", gets, f.forge.gets(42), checks, f.forge.checkCalls)
+	}
+}
+
+// #3990 item 2: a FIRST attempt already past the terminal deadline (a backfill
+// at first enable) backs off instead of terminating; the terminal row needs a
+// second failure at least 24h later. Counterfactual: drop the two-failure gate
+// → tick 1 commits the terminal row.
+func TestTick_FirstAttemptPastDeadline_BacksOffNotTerminal(t *testing.T) {
+	f := newTickFixture(t)
+	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
+	f.forge.prErr[42] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+	sum := f.tick()
+	if len(f.ciRows(id)) != 0 || sum.Failed != 1 || sum.Terminal != 0 {
+		t.Fatalf("tick 1: rows = %v sum = %+v, want a failure and no terminal row", f.ciRows(id), sum)
+	}
+	if !f.ticker.inBackoff(id, tickNow.Add(time.Minute)) {
+		t.Fatal("tick 1: the run is not in backoff")
+	}
+	f.now = tickNow.Add(25 * time.Hour)
+	f.tick()
+	rows := f.ciRows(id)
+	if len(rows) != 1 || rows[0]["missing_reason"] != "observation_failed" || rows[0]["observation_error_class"] != "forbidden" {
+		t.Fatalf("tick 2: rows = %v, want one terminal missing/observation_failed row", rows)
+	}
+}
+
+// #3990 item 2: two failures past the deadline but only 11 minutes apart do
+// not terminate; the span arm alone blocks here (the count arm is satisfied).
+// Counterfactual: drop the span arm → tick 2 commits the terminal row.
+func TestTick_TwoFailuresUnderMinSpan_NotTerminal(t *testing.T) {
+	f := newTickFixture(t)
+	id := f.addMergedRun(42, tickNow.Add(-8*24*time.Hour))
+	f.forge.prErr[42] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+	f.tick()
+	f.now = tickNow.Add(11 * time.Minute)
+	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(id)) != 0 {
+		t.Fatalf("tick 2: sum = %+v rows = %v, want a second failure and no terminal row under the 24h span", sum, f.ciRows(id))
+	}
+	f.now = tickNow.Add(24*time.Hour + time.Minute)
+	f.tick()
+	if rows := f.ciRows(id); len(rows) != 1 || rows[0]["missing_reason"] != "observation_failed" {
+		t.Fatalf("tick 3: rows = %v, want the terminal row once the span is met", rows)
+	}
+}
+
+// #3990 C2: the per-tick forge cap never starves a pending-verdict re-append.
+// MaxPerTick=1 with two candidates: the older one spends the cap, and the
+// pending one, sorted SECOND, still re-appends in that tick with zero forge
+// calls. Counterfactual: restore the plain cap break → the pending run records
+// nothing in tick 2.
+func TestTick_PendingVerdictDrainsPastPerTickCap(t *testing.T) {
+	f := newTickFixture(t)
+	pending := f.addMergedRun(2, tickNow.Add(-7*time.Hour))
+	f.forge.checks[shaFor(2)][0].Conclusion = "failure"
+	f.audit.appendFailures = 1
+	if sum := f.tick(); sum.Failed != 1 || len(f.ciRows(pending)) != 0 {
+		t.Fatalf("tick 1: sum = %+v rows = %d, want the red append held", sum, len(f.ciRows(pending)))
+	}
+	f.forge.checks[shaFor(2)][0].Conclusion = "success"
+	older := f.addMergedRun(1, tickNow.Add(-20*time.Hour))
+	f.ticker.MaxPerTick = 1
+	gets, checks := f.forge.gets(2), f.forge.checkCalls
+	f.now = tickNow.Add(11 * time.Minute)
+	sum := f.tick()
+	if sum.Evaluated != 1 || sum.Recorded != 2 || len(f.ciRows(older)) != 1 {
+		t.Fatalf("tick 2: sum = %+v older rows = %d, want the older run evaluated (cap spent) and both recorded", sum, len(f.ciRows(older)))
+	}
+	if rows := f.ciRows(pending); len(rows) != 1 || rows[0]["conclusion"] != "red" || rows[0]["observed_at"] != "2026-09-10T12:00:00Z" {
+		t.Fatalf("tick 2: pending rows = %v, want the held red verdict re-appended past the cap", rows)
+	}
+	if f.forge.gets(2) != gets || f.forge.checkCalls != checks+1 {
+		t.Fatalf("forge calls: pending gets %d→%d checks %d→%d, want only the older run's one listing", gets, f.forge.gets(2), checks, f.forge.checkCalls)
+	}
+}
+
+// #3990 C3: in-memory state never outlives the scan. An observed run's entry
+// (pending verdict included) is dropped at the top of the next tick, and a run
+// whose merge evidence left the lookback is evicted. Each arm is isolated: on
+// tick 2 the in-backoff run is still inside the lookback, so only the
+// observed-run clear drops the observed one; on tick 3 only the lookback
+// eviction applies. Counterfactuals: delete either forgetRuns call → its arm's
+// entry survives.
+func TestTick_ForgetsStateOfObservedAndOutOfScanRuns(t *testing.T) {
+	f := newTickFixture(t)
+	held := f.addMergedRun(1, tickNow.Add(-7*time.Hour))
+	failing := f.addMergedRun(2, tickNow.Add(-7*time.Hour))
+	f.forge.prErr[2] = fmt.Errorf("%w: get pr", forge.ErrForbidden)
+	f.audit.appendFailures = 1
+	f.tick()
+	if f.ticker.pendingVerdict(held) == nil || f.ticker.knownPull(failing) != nil || f.backoffEntries() != 2 {
+		t.Fatalf("tick 1: entries = %d pending = %v, want a held verdict and a backed-off run", f.backoffEntries(), f.ticker.pendingVerdict(held))
+	}
+	// Another replica records the held run's row.
+	f.audit.seed(held, CategoryRunMergeCIObserved, tickNow.Add(time.Minute), fmt.Sprintf(`{"merge_commit_sha":%q}`, shaFor(1)))
+	f.now = tickNow.Add(2 * time.Minute)
+	f.tick()
+	if f.ticker.pendingVerdict(held) != nil || f.backoffEntries() != 1 {
+		t.Fatalf("tick 2: entries = %d, want the observed run's state (pending verdict included) dropped", f.backoffEntries())
+	}
+	f.now = tickNow.Add(15 * 24 * time.Hour)
+	f.tick()
+	if f.backoffEntries() != 0 {
+		t.Fatalf("tick 3: entries = %d, want the run outside the lookback evicted", f.backoffEntries())
+	}
+}
+
+func (f *tickFixture) backoffEntries() int {
+	f.ticker.mu.Lock()
+	defer f.ticker.mu.Unlock()
+	return len(f.ticker.backoff)
 }
 
 func TestTick_AuditListError_TickSkipped(t *testing.T) {
@@ -921,5 +1122,124 @@ func TestTick_PG_RealClient_RecordsCommittedRow(t *testing.T) {
 	}
 	if p["conclusion"] != "green" || p["merge_commit_sha"] != shaFor(42) || fmt.Sprint(p["excluded_checks"]) != "[fishhawk_audit_complete]" {
 		t.Fatalf("committed payload = %v", p)
+	}
+}
+
+// failFirstCIAppend wraps the Postgres audit repository and fails the FIRST
+// deduped run_merge_ci_observed append. It DECLARES AppendChainedDeduped and
+// forwards through a type assertion, so appendDeduped takes the production
+// dedup path rather than the list-then-AppendChained fallback.
+type failFirstCIAppend struct {
+	audit.Repository
+	failed atomic.Bool
+	calls  atomic.Int32
+}
+
+var _ audit.DedupedChainAppender = (*failFirstCIAppend)(nil)
+
+func (w *failFirstCIAppend) AppendChainedDeduped(ctx context.Context, p audit.ChainAppendParams, spec audit.DedupeSpec) (*audit.Entry, error) {
+	if p.Category == CategoryRunMergeCIObserved {
+		w.calls.Add(1)
+		if w.failed.CompareAndSwap(false, true) {
+			return nil, errors.New("injected audit append failure")
+		}
+	}
+	d, ok := w.Repository.(audit.DedupedChainAppender)
+	if !ok {
+		return nil, errors.New("wrapped audit repository is not an audit.DedupedChainAppender")
+	}
+	return d.AppendChainedDeduped(ctx, p, spec)
+}
+
+// #3990 item 1, cross-boundary: a REAL githubclient over HTTP, the ticker's
+// in-memory pending verdict, and the Postgres audit store. The first deduped
+// append fails; after the forge flips to green, the next tick commits the
+// ORIGINAL red verdict with its original observed_at and makes no further
+// GitHub request.
+func TestTick_PG_AuditAppendFailure_CommitsOriginalVerdict(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	auditRepo := &failFirstCIAppend{Repository: audit.NewPostgresRepository(pool)}
+	inst := int64(9)
+	r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+		Repo: "acme/widgets", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: run.TriggerCLI,
+		InstallationID:         &inst,
+		RequiredChecksSnapshot: snap("CI Pass", auditcheckpublisher.CheckName),
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	if _, err := runRepo.SetRunPullRequestURL(ctx, r.ID, prURLFor(42)); err != nil {
+		t.Fatalf("set pr url: %v", err)
+	}
+	now := time.Now().UTC().Truncate(time.Second)
+	merged := now.Add(-7 * time.Hour)
+	kind := audit.ActorSystem
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{RunID: r.ID, Timestamp: merged, Category: "pr_merged",
+		ActorKind: &kind, Payload: json.RawMessage(`{}`)}); err != nil {
+		t.Fatalf("seed pr_merged: %v", err)
+	}
+	var requests atomic.Int32
+	var green atomic.Bool
+	mux := http.NewServeMux()
+	mux.HandleFunc("/repos/acme/widgets/pulls/42", func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		_, _ = fmt.Fprintf(w, `{"node_id":"PR_42","state":"closed","merged":true,"merge_commit_sha":%q,"merged_at":%q}`,
+			shaFor(42), merged.Format(time.RFC3339))
+	})
+	mux.HandleFunc("/repos/acme/widgets/commits/"+shaFor(42)+"/check-runs", func(w http.ResponseWriter, _ *http.Request) {
+		requests.Add(1)
+		conclusion := "failure"
+		if green.Load() {
+			conclusion = "success"
+		}
+		_, _ = fmt.Fprintf(w, `{"total_count":1,"check_runs":[
+			{"id":1,"name":"CI Pass","status":"completed","conclusion":%q,"started_at":%q,"completed_at":%q,"check_suite":{"id":5}}]}`,
+			conclusion, merged.Format(time.RFC3339), merged.Add(20*time.Minute).Format(time.RFC3339))
+	})
+	srv := httptest.NewServer(mux)
+	defer srv.Close()
+	c := githubclient.New(staticTokens{})
+	c.BaseURL = srv.URL
+	c.HTTP = &http.Client{Timeout: 5 * time.Second}
+
+	tk, reason := NewCITicker(CITickerConfig{Enabled: true, Runs: runRepo, Audit: auditRepo, GitHub: c})
+	if tk == nil {
+		t.Fatalf("NewCITicker: %s", reason)
+	}
+	clock := now
+	tk.Now = func() time.Time { return clock }
+	tk.RetryBackoff = time.Millisecond
+	if sum := tk.Tick(ctx); sum.Failed != 1 || sum.Recorded != 0 {
+		t.Fatalf("tick 1 = %+v, want the injected append failure counted", sum)
+	}
+	rows, err := auditRepo.ListForRunByCategory(ctx, r.ID, CategoryRunMergeCIObserved)
+	if err != nil || len(rows) != 0 {
+		t.Fatalf("after tick 1: committed rows = %d err = %v, want 0", len(rows), err)
+	}
+	green.Store(true)
+	before := requests.Load()
+	clock = now.Add(time.Hour)
+	if sum := tk.Tick(ctx); sum.Recorded != 1 {
+		t.Fatalf("tick 2 = %+v, want the pending verdict recorded", sum)
+	}
+	if got := requests.Load(); got != before {
+		t.Fatalf("GitHub requests %d→%d on the re-append, want none", before, got)
+	}
+	if got := auditRepo.calls.Load(); got != 2 {
+		t.Fatalf("AppendChainedDeduped calls = %d, want 2 (the dedup path, both ticks)", got)
+	}
+	rows, err = auditRepo.ListForRunByCategory(ctx, r.ID, CategoryRunMergeCIObserved)
+	if err != nil || len(rows) != 1 {
+		t.Fatalf("committed rows = %d err = %v, want 1", len(rows), err)
+	}
+	var p map[string]any
+	if err := json.Unmarshal(rows[0].Payload, &p); err != nil {
+		t.Fatalf("payload: %v", err)
+	}
+	observed, err := time.Parse(time.RFC3339, fmt.Sprint(p["observed_at"]))
+	if err != nil || p["conclusion"] != "red" || !observed.Equal(now) || p["merge_commit_sha"] != shaFor(42) {
+		t.Fatalf("committed payload = %v (observed_at err %v), want red observed at tick 1 (%v)", p, err, now)
 	}
 }
