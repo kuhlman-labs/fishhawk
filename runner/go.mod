@@ -3,7 +3,7 @@ module github.com/kuhlman-labs/fishhawk/runner
 go 1.26.0
 
 require (
-	github.com/bmatcuk/doublestar/v4 v4.10.2
+	github.com/bmatcuk/doublestar/v4 v4.10.3
 	github.com/kuhlman-labs/fishhawk/pricing v0.0.0-20260703162803-7c209fb2bab8
 	github.com/kuhlman-labs/fishhawk/redaction v0.0.0-20260703162803-7c209fb2bab8
 	github.com/santhosh-tekuri/jsonschema/v6 v6.0.3
