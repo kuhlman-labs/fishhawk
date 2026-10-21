@@ -109,8 +109,10 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   SHARE`. It appends BEFORE the write instead, under `WithMergeIntentLock`.
 - **`WithMergeIntentLock(runID, fn)`**: runs `fn` while holding the run's
   merge-intent lock (§ "Merge-intent lock"); returns `fn`'s error as is, the
-  context's error (fn not run) when the wait ends first, and
-  `ErrInvalidRequest` for a nil run id.
+  context's error (fn not run) when the wait ends first,
+  `ErrIntentLockLapsed` when `fn` returned nil but the lock could not be
+  confirmed held through its release, and `ErrInvalidRequest` for a nil run
+  id.
 - **`ActiveForRun(runID)`** → `(Status, found, error)`: the run's active entry,
   its 1-based `Position` among the base's held entries (0 when live), and
   `LiveRunID` (the base's live run; the entry's own run when it is live; nil
@@ -185,16 +187,39 @@ Every time comparison uses the database clock (`clock_timestamp()`); no Go
 run across requests AND processes: read the entry, append
 `merge_queue_entered`, then `Enqueue{MergeIntent}` / `MarkMergeIntent`. The
 append runs on its own connection, so the decision cannot share one
-transaction with the write. The lock is `pg_try_advisory_xact_lock` on
-`sha256("fishhawk:mergequeue-intent:" + run id)`, held by an otherwise idle
-transaction on one pooled connection while `fn` runs on others. That domain
-is disjoint from the per-run Enqueue key, so `fn`'s own Enqueue never waits
-on its holder. A waiter re-tries every 25 ms (`mergeIntentLockPoll`) and holds
-no pooled connection between tries, so waiters on one run cannot drain the
-pool the holder needs. The wait is bounded only by the caller's context. A
-holder whose connection dies releases the lock with it
-(`TestWithMergeIntentLock_SerializesOneRun`,
-`TestWithMergeIntentLock_ErrorsAndCancel`).
+transaction with the write.
+
+- **Lock.** A SESSION-level `pg_try_advisory_lock` on
+  `sha256("fishhawk:mergequeue-intent:" + run id)`, held on one dedicated
+  pooled connection that runs no transaction while `fn` runs on others (the
+  `run.WithConsolidatedPROpenLock` shape). The session is never idle in a
+  transaction, so a server-side `idle_in_transaction_session_timeout`
+  cannot end it mid-`fn`
+  (`TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout`). The domain
+  is disjoint from the per-run Enqueue key, so `fn`'s own Enqueue never
+  waits on its holder.
+- **Lapse.** After `fn` the lock is released with `pg_advisory_unlock`.
+  When that fails or finds no lock (the session died mid-`fn`, so another
+  holder may have overlapped it), a nil from `fn` becomes
+  `ErrIntentLockLapsed` (`TestWithMergeIntentLock_LapsedSessionSurfaces`).
+  A connection whose lock or unlock query failed is closed before release,
+  so a lock-holding session never returns to the pool.
+- **Connection budget.** A holder keeps one connection for its lock and its
+  `fn` uses at most one more at a time. The store admits at most
+  `intentHolderLimit` concurrent holders: half the pool's `MaxConns`, at
+  least 1 (5 of fishhawkd's 10). Lock holders alone can never occupy every
+  connection, so concurrent merges of DISTINCT runs make progress without
+  any caller timeout
+  (`TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress`: six
+  runs on a 2-connection pool). The bound is per store. A pool of fewer
+  than 2 connections cannot run a holder's `fn`. Other pool users that hold
+  one connection while acquiring another (for example
+  `run.WithConsolidatedPROpenLock`) are outside this bound.
+- **Waiting.** A held lock releases both the holder slot and the connection
+  and re-tries every 25 ms (`mergeIntentLockPoll`), so a waiter holds
+  neither between tries. The wait is bounded only by the caller's context
+  (`TestWithMergeIntentLock_SerializesOneRun`,
+  `TestWithMergeIntentLock_ErrorsAndCancel`).
 
 ## Tenancy
 

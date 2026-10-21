@@ -2925,14 +2925,20 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
   intent answers `already_queued` and writes nothing.
 - **One row per intent (merge-intent lock).** The decision (re-read the
   entry, append, write, read back; `recordMergeQueueIntent`) runs under
-  `mergequeue.Store.WithMergeIntentLock`, a per-run Postgres advisory lock.
-  Overlapping merges of one run, including across fishhawkd replicas, take
-  turns. The second sees the first's committed intent and answers
+  `mergequeue.Store.WithMergeIntentLock`, a per-run session-level Postgres
+  advisory lock with a bounded number of concurrent holders (its contract
+  and connection budget: `backend/internal/mergequeue/README.md` §
+  "Merge-intent lock"). Overlapping merges of one run, including across
+  fishhawkd replicas, take turns. The second sees the first's committed intent and answers
   `already_queued` with the SAME `intent_sequence`, so one intent
   transition has exactly one `merge_queue_entered` row
   (`TestMergeRun_ConcurrentMergesRecordOneIntent`, both write paths). A
   lock that cannot be taken, or an entry unreadable under it, gets today's
-  refusal with nothing written. `intent_sequence` on a repeat is the NEWEST
+  refusal with nothing written. A lock that lapsed while the decision ran
+  (`ErrIntentLockLapsed`) turns its 202 into a retryable `503
+  merge_queue_write_failed`; a decision that already wrote its own error
+  keeps that one answer (`TestMergeRun_LapsedIntentLockNeverAnswers202`).
+  `intent_sequence` on a repeat is the NEWEST
   row whose `base_ref` is the entry's base. Rows are appended only under the
   lock and only while the entry has no intent, so an orphan is always older
   than the row that recorded the intent, and the orphan of a failed base

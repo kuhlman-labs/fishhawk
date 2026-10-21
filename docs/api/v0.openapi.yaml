@@ -15254,7 +15254,10 @@ paths:
             could not be appended, so NOTHING was written to the queue (record
             before commit); `merge_queue_write_failed` — the row was appended
             but the queue write or its read-back failed, so the run is not
-            queued. Re-invoke the merge to retry.
+            queued, or the per-run merge-intent lock lapsed before the
+            decision finished, so the answer cannot vouch for the queue state
+            (the run may be queued; a re-invoke answers `already_queued`).
+            Re-invoke the merge to retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

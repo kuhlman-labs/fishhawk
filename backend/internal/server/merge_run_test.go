@@ -3584,3 +3584,41 @@ func TestMergeRun_IntentLockFailuresKeepTodaysRefusal(t *testing.T) {
 		})
 	}
 }
+
+// TestMergeRun_LapsedIntentLockNeverAnswers202: when the merge-intent lock
+// lapsed while the decision ran (mergequeue.ErrIntentLockLapsed), a decision
+// that succeeded answers a retryable 503 instead of a 202 a concurrent merge
+// may contradict, and a decision that already wrote its own error keeps that
+// one answer (no second body). Counterfactuals: dropping the lapse 503 lets
+// the 202 through; treating a lapse like an untaken lock renders today's 409
+// over or instead of the decision's answer, RED.
+func TestMergeRun_LapsedIntentLockNeverAnswers202(t *testing.T) {
+	lapse := func(f *mcqFixture) *mcqFaultStore {
+		return &mcqFaultStore{Store: f.store, intentLock: func(fn func() error) error {
+			_ = fn()
+			return fmt.Errorf("%w: session gone", mergequeue.ErrIntentLockLapsed)
+		}}
+	}
+	t.Run("decision succeeded", func(t *testing.T) {
+		f, r, _ := mqMergeFixture(t, true)
+		f.srv.cfg.MergeQueue = lapse(f)
+		w := f.mergeRun(r)
+		f.srv.bgMergeQueuePump.Wait()
+		body := w.Body.String()
+		if w.Code != http.StatusServiceUnavailable || !strings.Contains(body, "merge_queue_write_failed") ||
+			!strings.Contains(body, "lock lapsed") || strings.Contains(body, `"queued":true`) {
+			t.Fatalf("merge = %d %s, want only a 503 merge_queue_write_failed naming the lapse", w.Code, body)
+		}
+	})
+	t.Run("decision wrote its own error", func(t *testing.T) {
+		f, r, _ := mqMergeFixture(t, true)
+		f.srv.cfg.AuditRepo = mqFailEnteredAudit{Repository: f.audit}
+		f.srv.cfg.MergeQueue = lapse(f)
+		w := f.mergeRun(r)
+		body := w.Body.String()
+		if w.Code != http.StatusServiceUnavailable || strings.Count(body, `"code"`) != 1 ||
+			!strings.Contains(body, "merge_queue_unrecorded") {
+			t.Fatalf("merge = %d %s, want exactly the decision's 503 merge_queue_unrecorded", w.Code, body)
+		}
+	})
+}

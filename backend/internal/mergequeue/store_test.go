@@ -1184,3 +1184,165 @@ func TestWithMergeIntentLock_ErrorsAndCancel(t *testing.T) {
 		t.Fatalf("canceled context = %v ran=%v, want context.Canceled and fn not run", err, ran)
 	}
 }
+
+func TestIntentHolderLimit_HalfThePoolAtLeastOne(t *testing.T) {
+	f := newFixture(t)
+	for _, tc := range []struct {
+		maxConns int32
+		want     int
+	}{{10, 5}, {3, 1}, {2, 1}, {1, 1}} {
+		cfg := f.pool.Config()
+		cfg.MaxConns = tc.maxConns
+		pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+		if err != nil {
+			t.Fatalf("pool: %v", err)
+		}
+		if got := intentHolderLimit(pool); got != tc.want {
+			t.Errorf("intentHolderLimit(MaxConns=%d) = %d, want %d", tc.maxConns, got, tc.want)
+		}
+		pool.Close()
+	}
+	if got := intentHolderLimit(nil); got != 1 {
+		t.Errorf("intentHolderLimit(nil) = %d, want 1", got)
+	}
+}
+
+// TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress: six merges
+// of six DISTINCT runs race on a 2-connection pool, and every fn needs a
+// second connection (a store read) while its lock is held. Each fn first
+// waits until as many holders as the pool has connections are inside (or a
+// short bound passes), so without the holder bound two holders take both
+// connections and every fn's read waits forever. With it at most one holder
+// is inside and all six finish. The context deadline only bounds a RED run.
+// Counterfactual: a holder limit equal to the pool size deadlocks, RED.
+func TestWithMergeIntentLock_DistinctRunsSaturatingThePoolProgress(t *testing.T) {
+	f := newFixture(t)
+	cfg := f.pool.Config()
+	cfg.MaxConns = 2
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	store := NewPostgresStore(pool)
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(5*time.Second))
+	defer cancel()
+	const runs = 6
+	var inside, maxInside atomic.Int32
+	var wg sync.WaitGroup
+	errs := make(chan error, runs)
+	for i := 0; i < runs; i++ {
+		r := f.run()
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			errs <- store.WithMergeIntentLock(ctx, r, func() error {
+				n := inside.Add(1)
+				defer inside.Add(-1)
+				for {
+					m := maxInside.Load()
+					if n <= m || maxInside.CompareAndSwap(m, n) {
+						break
+					}
+				}
+				deadline := time.Now().Add(timescale.D(100 * time.Millisecond))
+				for inside.Load() < cfg.MaxConns && time.Now().Before(deadline) {
+					time.Sleep(5 * time.Millisecond)
+				}
+				_, _, err := store.ActiveForRun(ctx, r)
+				return err
+			})
+		}()
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatalf("WithMergeIntentLock on a saturated pool = %v, want every distinct-run holder to finish", err)
+		}
+	}
+	if m := maxInside.Load(); m > 1 {
+		t.Fatalf("concurrent holders = %d, want at most intentHolderLimit = 1 on a 2-connection pool", m)
+	}
+}
+
+// TestWithMergeIntentLock_LapsedSessionSurfaces: the lock session dies while
+// fn runs (an operator kill, an idle-session timeout). fn's nil is NOT
+// reported as success: the call answers ErrIntentLockLapsed, and the lock is
+// free again for the next holder. Counterfactual: ignoring the unlock result
+// returns nil, RED.
+func TestWithMergeIntentLock_LapsedSessionSurfaces(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	ctx := context.Background()
+	key := uint64(intentLockKey(r))
+	err := f.store.WithMergeIntentLock(ctx, r, func() error {
+		var pid int32
+		if err := f.pool.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype = 'advisory'
+  AND classid = $1::bigint::oid AND objid = $2::bigint::oid AND objsubid = 1 AND granted`,
+			int64(key>>32), int64(key&0xffffffff)).Scan(&pid); err != nil {
+			return fmt.Errorf("find the lock session: %w", err)
+		}
+		if _, err := f.pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+			return fmt.Errorf("terminate the lock session: %w", err)
+		}
+		deadline := time.Now().Add(timescale.D(5 * time.Second))
+		for time.Now().Before(deadline) {
+			var alive bool
+			if err := f.pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, pid).Scan(&alive); err != nil {
+				return err
+			}
+			if !alive {
+				return nil
+			}
+			time.Sleep(10 * time.Millisecond)
+		}
+		return errors.New("the lock session never exited")
+	})
+	if !errors.Is(err, ErrIntentLockLapsed) {
+		t.Fatalf("WithMergeIntentLock after its session died = %v, want ErrIntentLockLapsed", err)
+	}
+	next, cancel := context.WithTimeout(ctx, timescale.D(time.Second))
+	defer cancel()
+	ran := false
+	if err := f.store.WithMergeIntentLock(next, r, func() error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("next holder = %v ran=%v, want the lock free again", err, ran)
+	}
+}
+
+// TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout: the lock session
+// runs no transaction while fn runs, so a server-side
+// idle_in_transaction_session_timeout far shorter than fn cannot end it and
+// release the exclusion early. Counterfactual: the transaction-scoped lock
+// this replaced (pg_try_advisory_xact_lock in an idle transaction) is killed
+// at 50 ms, the probe takes the lock mid-fn, RED.
+func TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout(t *testing.T) {
+	f := newFixture(t)
+	cfg := f.pool.Config()
+	cfg.ConnConfig.RuntimeParams["idle_in_transaction_session_timeout"] = "50"
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	defer pool.Close()
+	store := NewPostgresStore(pool)
+	r := f.run()
+	ctx := context.Background()
+	var probeTook bool
+	err = store.WithMergeIntentLock(ctx, r, func() error {
+		time.Sleep(timescale.D(300 * time.Millisecond))
+		if err := f.pool.QueryRow(ctx, `SELECT pg_try_advisory_lock($1)`, intentLockKey(r)).Scan(&probeTook); err != nil {
+			return err
+		}
+		if probeTook {
+			_, _ = f.pool.Exec(ctx, `SELECT pg_advisory_unlock($1)`, intentLockKey(r))
+		}
+		return nil
+	})
+	if probeTook {
+		t.Fatal("another session took the run's intent lock while fn ran: the exclusion lapsed under idle_in_transaction_session_timeout")
+	}
+	if err != nil {
+		t.Fatalf("WithMergeIntentLock = %v, want nil", err)
+	}
+}

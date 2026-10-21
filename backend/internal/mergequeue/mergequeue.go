@@ -79,6 +79,11 @@ var (
 	// failed: the whole call was rolled back and wrote nothing. It wraps the
 	// callback's error.
 	ErrIntentUnrecorded = errors.New("mergequeue: merge intent not recorded")
+	// ErrIntentLockLapsed is a WithMergeIntentLock whose fn RAN and returned
+	// nil, but whose lock could not be confirmed held through its release
+	// (the lock session failed, or the unlock found no lock), so another
+	// holder may have overlapped fn. fn's writes stand; the caller decides.
+	ErrIntentLockLapsed = errors.New("mergequeue: merge-intent lock lapsed")
 )
 
 // Base is one queue: a repository base ref inside one account. AccountID is

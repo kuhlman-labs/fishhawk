@@ -1219,7 +1219,9 @@ const CategoryMergeQueueEntered = "merge_queue_entered"
 // second sees the first's committed intent and answers already_queued with
 // the SAME intent_sequence, and one intent transition gets exactly one
 // merge_queue_entered row. A lock that cannot be taken (a canceled request,
-// a pool error) fails closed to today's refusal with nothing written.
+// a pool error) fails closed to today's refusal with nothing written; a lock
+// that lapsed while the decision ran (ErrIntentLockLapsed) turns its 202
+// into a retryable 503 merge_queue_write_failed.
 //
 // The base is pumped DETACHED (approval condition C6), on a bounded
 // mergeCandidateAdmissionContext tracked by bgMergeQueuePump, so the 202 never
@@ -1269,18 +1271,34 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 		subject = "anonymous"
 	}
 	var (
-		res     *mergeQueueIntent
-		handled bool
+		res          *mergeQueueIntent
+		handled, ran bool
 	)
 	if lerr := s.cfg.MergeQueue.WithMergeIntentLock(ctx, runID, func() error {
+		ran = true
 		res, handled = s.recordMergeQueueIntent(w, r, runRow, prURL, verdict, subject, gate)
 		return nil
 	}); lerr != nil {
-		// Fail closed: no lock, no decision; nothing was written. Today's refusal.
+		if !ran {
+			// Fail closed: no lock, no decision; nothing was written. Today's refusal.
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"merge: merge-intent lock unavailable; not enqueueing (fail closed)",
+				slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
+			return false, nil
+		}
+		// The decision ran but its exclusion may have lapsed mid-way
+		// (mergequeue.ErrIntentLockLapsed): never a 202 a concurrent merge
+		// may contradict. A decision that already wrote its own response
+		// keeps it.
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"merge: merge-intent lock unavailable; not enqueueing (fail closed)",
+			"merge: merge-intent lock lapsed during the intent decision",
 			slog.String("run_id", runID.String()), slog.String("error", lerr.Error()))
-		return false, nil
+		if res != nil {
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_write_failed",
+				"the merge-intent lock lapsed before the merge intent decision finished, so this answer cannot vouch for the queue state; read fishhawk_get_run_status, then re-invoke the merge (an entry that already carries the intent answers already_queued).",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return true, nil
+		}
 	}
 	if res == nil {
 		return handled, nil
