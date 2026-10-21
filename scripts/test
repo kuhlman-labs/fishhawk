@@ -54,11 +54,27 @@
 # runner) waits up to 600s. FISHHAWK_VERIFY_LOCK_PATH overrides the lock's
 # location: the runner's throwaway verify checkout is a CLONE with its own
 # common dir (ADR-063 / #2134), so the runner injects the primary repository's
-# lock path to keep contending with shell verifies. Long form: scripts/README.md.
+# lock path to keep contending with shell verifies. Every lock refusal exits
+# VERIFY_EXIT_LOCK_REFUSED (73), never 1 (#4022). Long form: scripts/README.md.
 #
 # Frontend gates (pnpm format:check / typecheck / test) are NOT
 # covered here — they have their own conventions per docs/.
 set -euo pipefail
+
+# Verify exit-code contract (#4022; docs/spec/workflow-v2.md § "Verify exit-code
+# contract"). The runner classifies a verify by its EXIT CODE, not by scraping
+# its output: 0 = passed; VERIFY_EXIT_TEMPFAIL (75, sysexits(3) EX_TEMPFAIL) = an
+# infrastructure/temporary failure, re-run in place and never routed to the fix
+# agent; VERIFY_EXIT_LOCK_REFUSED (73, sysexits(3) EX_CANTCREAT) = the shared
+# verify lock could not be acquired; any other non-zero = the change failed.
+# Every verify-lock refusal (_acquire_verify_lock_at's refusal sites, propagated
+# by _acquire_verify_lock and exited by cmd_verify and the --in-gate-image verify
+# path) exits 73. Nothing exits 75 yet: no leg here can tell an infrastructure
+# failure from a red tree by exit status, so 75 is reserved for the contract and
+# the runner's text signatures stay the fallback. The runner's Go side
+# (runner/cmd/fishhawk-runner) carries the same two values: change them together.
+VERIFY_EXIT_TEMPFAIL=75
+VERIFY_EXIT_LOCK_REFUSED=73
 
 # Verify flake-absorption attest nonce (#4229). The runner sets a fresh 128-bit
 # FISHHAWK_VERIFY_ABSORB_NONCE on each full-form verify; a FAILED patch-coverage
@@ -2284,9 +2300,13 @@ If this repeats, a pruner was killed holding a recovery claim: inspect and remov
 the override is set) and its .reap.* siblings by hand.'
 
 # _acquire_verify_lock_at <lockpath>: the acquisition loop. Returns 0 when this
-# invocation may proceed (it holds the lock), 1 when it must REFUSE. Split from
-# _acquire_verify_lock so the harness can drive every branch in-process against a
-# fixture lock path with an injected self pid.
+# invocation may proceed (it holds the lock), and VERIFY_EXIT_LOCK_REFUSED (73)
+# when it must REFUSE — at EVERY refusal site: the shell-kind live-holder
+# refusal, the runner-kind refusal of a live RUNNER holder after the wait budget,
+# the retaken-after-displacement refusal, and both never-settled restart
+# bail-outs. Never 1: a refusal that exited 1 would read to the runner as a red
+# tree (#4022). Split from _acquire_verify_lock so the harness can drive every
+# branch in-process against a fixture lock path with an injected self pid.
 _acquire_verify_lock_at() {
   local lock="$1" kind target self cls holder budget poll steal_rc waited=0 announced=0 stole=0 restarts=0
   self="$(_verify_lock_self_pid)"
@@ -2305,7 +2325,7 @@ _acquire_verify_lock_at() {
         restarts=$((restarts + 1))
         if [ "$restarts" -gt 100 ]; then
           echo "$VERIFY_LOCK_UNSETTLED_MSG" >&2
-          return 1
+          return "$VERIFY_EXIT_LOCK_REFUSED"
         fi
         if [ "$cls" = "free" ]; then
           continue
@@ -2323,7 +2343,7 @@ The runner owns verify for this stage. Do NOT poll or retry this in a loop — i
 fast failure, not a queue. Run your package's tests directly instead:
   scripts/test single -run TestX ./your/package/...
 EOF
-          return 1
+          return "$VERIFY_EXIT_LOCK_REFUSED"
         fi
         if [ "$waited" -ge "$budget" ]; then
           if [ "$cls" = "live-runner" ]; then
@@ -2333,11 +2353,11 @@ scripts/test: another RUNNER verify still holds the lock at $lock after ${budget
 worktree family is a bug to surface, not one to paper over — refusing rather than
 displacing a peer runner.
 EOF
-            return 1
+            return "$VERIFY_EXIT_LOCK_REFUSED"
           fi
           if [ "$stole" -eq 1 ]; then
             echo "scripts/test: the verify lock at $lock was retaken after a displacement — refusing rather than displacing twice" >&2
-            return 1
+            return "$VERIFY_EXIT_LOCK_REFUSED"
           fi
           # Conditional displacement: the decision must still be VALID at the
           # unlink, not merely at the classification. _verify_lock_steal
@@ -2369,7 +2389,7 @@ EOF
           restarts=$((restarts + 1))
           if [ "$restarts" -gt 100 ]; then
             echo "$VERIFY_LOCK_UNSETTLED_MSG" >&2
-            return 1
+            return "$VERIFY_EXIT_LOCK_REFUSED"
           fi
           continue
         fi
@@ -2386,13 +2406,15 @@ EOF
 }
 
 # _acquire_verify_lock: resolve the lock path and acquire. Returns 0 to proceed
-# (held, or degraded to no locking) and 1 to refuse.
+# (held, or degraded to no locking) and propagates _acquire_verify_lock_at's
+# VERIFY_EXIT_LOCK_REFUSED (73) to refuse; its callers exit with that status.
 _acquire_verify_lock() {
-  local lock
+  local lock rc=0
   if ! lock="$(_verify_lock_path)"; then
     return 0  # degrade: reason already printed, run without the lock
   fi
-  _acquire_verify_lock_at "$lock"
+  _acquire_verify_lock_at "$lock" || rc=$?
+  return "$rc"
 }
 
 # _release_verify_lock: EXIT-trap release. Removes the prune marker only when it
@@ -2430,9 +2452,9 @@ _release_verify_lock() {
 # second run happens. Every precondition degrades to a one-line reason plus the
 # plain `cmd_test` loop; none of them can red-line verify.
 cmd_verify() {
-  if ! _acquire_verify_lock; then
-    exit 1
-  fi
+  # A lock refusal exits _acquire_verify_lock's VERIFY_EXIT_LOCK_REFUSED (73),
+  # never 1: the runner reads exit 1 as a red tree (#4022).
+  _acquire_verify_lock || exit "$?"
   cmd_lint
   _verify_doc_line_budget
   _verify_schema_sync
@@ -2493,7 +2515,7 @@ cmd_verify() {
 #   1. docker absent from PATH -> exit 1 naming docker. Never a skip. Argument
 #      validation already ran in _parse_verify_args/_parse_lint_args.
 #   2. verify only: take the HOST per-repository verify lock, refusing exactly
-#      as `verify` does on a live holder. Lock liveness is a `kill -0` PID
+#      as `verify` does on a live holder (exit VERIFY_EXIT_LOCK_REFUSED, 73). Lock liveness is a `kill -0` PID
 #      check, which cannot cross a PID namespace, so a container sharing the
 #      host lock would judge a live host holder dead and displace it. The host
 #      lock is therefore the real one, and the container gets a private
@@ -2594,9 +2616,8 @@ EOF
     exit 1
   fi
   if [ "$mode" = "verify" ]; then
-    if ! _acquire_verify_lock; then
-      exit 1
-    fi
+    # VERIFY_EXIT_LOCK_REFUSED (73) on a refusal, exactly as cmd_verify exits it.
+    _acquire_verify_lock || exit "$?"
     inner=(scripts/test verify --no-tests)
   else
     inner=(scripts/test lint)

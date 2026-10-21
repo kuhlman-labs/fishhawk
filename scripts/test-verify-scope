@@ -28,6 +28,11 @@
 #      CLONE with its own common dir, so the runner injects the primary's lock
 #      path — honoured first when set; a missing parent dir degrades to no
 #      locking naming the variable; unset keeps the common-dir derivation.
+#      EVERY refusal exits exactly VERIFY_EXIT_LOCK_REFUSED (73, #4022) — the
+#      function's return (b3g, b5e, b5f, b6), the _acquire_verify_lock wrapper
+#      (b17), and the process exit of `verify` (b1, b14) and `verify
+#      --in-gate-image` (b18) — while a red tree still exits 1 (a13, a13b), so
+#      the runner can tell "not judged" from "failed" by exit code alone.
 #
 # Hermetic: temp-dir git fixtures with stubbed `go`, `golangci-lint`, `sleep` and
 # `docker` on PATH. No network, no real Docker, no real Go toolchain. Bash (no
@@ -473,7 +478,7 @@ assert_eq "a12 it ran no tests" "0" "$(go_log_lines "$FX")"
 RV_ENV=(FIXTURE_GO_FAIL=backend)
 run_verify "$FX"
 rc=$?
-assert_ne "a13 unscoped verify with a failing module exits non-zero" "0" "$rc"
+assert_eq "a13 unscoped verify with a failing module exits exactly 1 (a red tree, never 73/75)" "1" "$rc"
 assert_eq "a13 every module still ran" "2" "$(go_log_lines "$FX")"
 assert_contains "a13 the module AFTER the failing one ran" "$FX/logs/go.log" "cli	test -race"
 assert_contains "a13 the summary counts the failure" \
@@ -489,7 +494,7 @@ assert_not_contains "a13 a failed loop never reaches the patch-coverage gate" \
 RV_ENV=(FISHHAWK_SKIP_PATCH_COVERAGE=1 FIXTURE_GO_FAIL=backend)
 run_verify "$FX"
 rc=$?
-assert_ne "a13b plain-loop verify with a failing module exits non-zero" "0" "$rc"
+assert_eq "a13b plain-loop verify with a failing module exits exactly 1 (a red tree, never 73/75)" "1" "$rc"
 assert_contains "a13b it took the plain loop" "$FX/logs/stderr.log" "FISHHAWK_SKIP_PATCH_COVERAGE set"
 assert_eq "a13b every module still ran" "2" "$(go_log_lines "$FX")"
 assert_contains "a13b the summary names the failed module" "$FX/logs/stderr.log" "  - ./backend"
@@ -542,15 +547,17 @@ lock_reset() {
   : > "$FX/logs/sleep.log"
 }
 
-# b1 — a SHELL-kind verify meeting a LIVE holder refuses IMMEDIATELY: non-zero,
-# the actionable `scripts/test single` message, NO test run, and — the structural
-# proof of promptness, never an elapsed-time bound — zero recorded sleeps.
+# b1 — a SHELL-kind verify meeting a LIVE holder refuses IMMEDIATELY: exit
+# exactly 73 (VERIFY_EXIT_LOCK_REFUSED, #4022 — exit 1 would read to the runner
+# as a red tree), the actionable `scripts/test single` message, NO test run, and
+# — the structural proof of promptness, never an elapsed-time bound — zero
+# recorded sleeps.
 lock_reset
 livepid="$(spawn_live)"
 ln -s "$livepid:runner" "$LOCK"
 run_verify "$FX" --packages backend/internal/alpha
 rc=$?
-assert_ne "b1 shell meeting a live holder exits non-zero" "0" "$rc"
+assert_eq "b1 shell meeting a live holder exits exactly 73 (lock refused)" "73" "$rc"
 assert_contains "b1 the refusal names scripts/test single" \
   "$FX/logs/stderr.log" "scripts/test single -run TestX ./your/package/..."
 assert_contains "b1 the refusal says not to poll it" "$FX/logs/stderr.log" "Do NOT poll"
@@ -701,7 +708,7 @@ _verify_lock_recover_marker "$LOCK.prune" "$victimB" >/dev/null 2>&1
 _acquire_verify_lock_at "$LOCK" > "$tmproot/b3g-b.out" 2>&1; rcB=$?
 unset FISHHAWK_VERIFY_LOCK_OWNER FISHHAWK_VERIFY_LOCK_SELF_PID FISHHAWK_VERIFY_LOCK_WAIT_SECONDS
 assert_eq "b3g A recovers the dead marker, prunes the dead holder and acquires" "0" "$rcA"
-assert_ne "b3g B does NOT also acquire" "0" "$rcB"
+assert_eq "b3g B does NOT also acquire: it refuses with 73" "73" "$rcB"
 assert_eq "b3g exactly one holder remains, and it is A" "$pidA:runner" "$(readlink "$LOCK")"
 
 # b4 — RUNNER meets a live SHELL holder that RELEASES inside the budget: it
@@ -819,7 +826,7 @@ export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
 export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0
 _acquire_verify_lock_at "$LOCK" > "$tmproot/b5e.out" 2>&1; rc=$?
 eval "$B5E_SAVED_STEAL"
-assert_ne "b5e a lost re-acquisition does not let this invocation proceed" "0" "$rc"
+assert_eq "b5e a lost re-acquisition does not let this invocation proceed: the retaken-lock refusal returns 73" "73" "$rc"
 assert_contains "b5e the displacement warning is printed even when re-acquisition is lost" \
   "$tmproot/b5e.out" "deposed pid $holderH"
 assert_contains "b5e that warning still states the contention consequence" \
@@ -836,7 +843,7 @@ lock_reset
 # pruned, path re-taken, re-classified dead, ...) must TERMINATE in a refusal
 # rather than spin forever. `_verify_lock_try_acquire` is stubbed to re-plant a
 # dead holder and fail, which is that churn by construction; the assertion is
-# that the loop returns at all, non-zero, with the uncertain-state message.
+# that the loop returns at all, with exactly 73, and the uncertain-state message.
 lock_reset
 deadpid="$(spawn_dead)"
 selfpid="$(spawn_live)"
@@ -850,7 +857,7 @@ export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
 _acquire_verify_lock_at "$LOCK" > "$tmproot/b5f.out" 2>&1; rc=$?
 eval "$B5F_SAVED_ACQ"
 unset FISHHAWK_VERIFY_LOCK_SELF_PID
-assert_ne "b5f a lock that keeps changing hands ends in a refusal" "0" "$rc"
+assert_eq "b5f a lock that keeps changing hands ends in a refusal returning 73" "73" "$rc"
 assert_contains "b5f the refusal names the uncertain lock state" \
   "$tmproot/b5f.out" "refusing rather than proceeding under an uncertain lock state"
 assert_contains "b5f the refusal names the paths to clear by hand" \
@@ -867,7 +874,7 @@ export FISHHAWK_VERIFY_LOCK_OWNER=runner
 export FISHHAWK_VERIFY_LOCK_SELF_PID="$selfpid"
 export FISHHAWK_VERIFY_LOCK_WAIT_SECONDS=0
 _acquire_verify_lock_at "$LOCK" > "$tmproot/b6.out" 2>&1; rc=$?
-assert_ne "b6 runner refuses a live RUNNER holder" "0" "$rc"
+assert_eq "b6 runner refuses a live RUNNER holder, returning 73" "73" "$rc"
 assert_contains "b6 the refusal names the holder pid" "$tmproot/b6.out" "holder pid $holder"
 assert_contains "b6 the refusal names this pid" "$tmproot/b6.out" "this pid $selfpid"
 assert_eq "b6 the holder's lock still exists and still names it" "$holder:runner" "$(readlink "$LOCK")"
@@ -1008,7 +1015,7 @@ ln -s "$livepid:shell" "$OVLOCK"
 RV_ENV=(FISHHAWK_VERIFY_LOCK_PATH="$OVLOCK")
 run_verify "$tmproot/clone" --packages backend/internal/alpha
 rc=$?
-assert_ne "b14 shell verify from a CLONE meeting a live holder at the OVERRIDE path refuses" "0" "$rc"
+assert_eq "b14 shell verify from a CLONE meeting a live holder at the OVERRIDE path refuses with 73" "73" "$rc"
 assert_contains "b14 the refusal names the override path" "$tmproot/clone/logs/stderr.log" "holds the lock at $OVLOCK"
 assert_eq "b14 the override holder's lock is untouched" "$livepid:shell" "$(readlink "$OVLOCK")"
 if [ -L "$tmproot/clone/.git/fishhawk-verify.lock" ]; then
@@ -1080,6 +1087,40 @@ assert_eq "b16 unset resolves the common-dir lock" "$common_lock" "$got_unset"
 assert_eq "b16 unset exits 0" "0" "$rc_unset"
 assert_eq "b16 an EMPTY override is treated as unset" "$common_lock" "$got_empty"
 assert_eq "b16 empty override exits 0" "0" "$rc_empty"
+lock_reset
+
+# b17 — the _acquire_verify_lock WRAPPER propagates the refusal code: with the
+# real lock path resolved from $ROOT and a live holder there, a shell-kind
+# caller gets exactly 73 back — the value cmd_verify and the --in-gate-image
+# path exit with. The degrade cases (b8-b10, b15) pin its 0 arm.
+lock_reset
+ROOT_SAVED="$ROOT"; ROOT="$FX"
+livepid="$(spawn_live)"
+ln -s "$livepid:runner" "$LOCK"
+export FISHHAWK_VERIFY_LOCK_SELF_PID="$(spawn_live)"
+_acquire_verify_lock > "$tmproot/b17.out" 2>&1; arc=$?
+unset FISHHAWK_VERIFY_LOCK_SELF_PID
+ROOT="$ROOT_SAVED"
+assert_eq "b17 _acquire_verify_lock propagates the refusal as 73" "73" "$arc"
+assert_contains "b17 it is the shell-kind refusal" "$tmproot/b17.out" "another verify already holds the lock at"
+assert_eq "b17 the holder's lock is untouched" "$livepid:runner" "$(readlink "$LOCK")"
+lock_reset
+
+# b18 — `verify --in-gate-image` meeting a live HOST holder exits exactly 73 too
+# (it takes the host lock before any docker work). Docker-free: the fixture's
+# `docker` is a no-op stub, so the docker-present guard passes, and with the
+# lock refused nothing else runs. Were the refusal to exit anything else, the
+# stub's empty `image inspect` would fail the image resolve and exit 1 instead.
+lock_reset
+livepid="$(spawn_live)"
+ln -s "$livepid:shell" "$LOCK"
+run_verify "$FX" --in-gate-image
+rc=$?
+assert_eq "b18 verify --in-gate-image meeting a live host holder exits exactly 73" "73" "$rc"
+assert_contains "b18 the refusal is the shell-kind refusal" "$FX/logs/stderr.log" "another verify already holds the lock at"
+assert_not_contains "b18 no gate image was resolved" "$FX/logs/stderr.log" "gate image"
+assert_eq "b18 a refusal runs no lint" "0" "$(count_lines "$FX/logs/lint.log")"
+assert_eq "b18 the holder's lock is untouched" "$livepid:shell" "$(readlink "$LOCK")"
 lock_reset
 
 echo

@@ -336,7 +336,11 @@ func TestMergeCandidateVerify_NotExecutedArms(t *testing.T) {
 		{"unavailable", "failed", gateUnavailable, "host", mcReasonGateUnavailable},
 		{"timed_out", "failed", gateTimedOut, "killed", mcReasonGateTimedOut},
 		{"skipped", "skipped", gateExecuted, "", mcReasonGateSkipped},
-		{"lock_contended", "failed", gateExecuted, verifyLockRefusalLinePrefix + "another RUNNER verify still holds the lock\n", mcReasonLockContended},
+		// The exit-code dispositions (#4022) classify with SIGNATURE-FREE output,
+		// so only the disposition arm can make them not_executed: without it
+		// both fall to the default verify_failed.
+		{"temp_fail_exit_75", "failed", gateTempFail, "", mcReasonTempFail},
+		{"lock_refused_exit_73", "failed", gateLockRefused, "", mcReasonLockContended},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			orig := mergeCandidateVerifyFn
@@ -351,6 +355,16 @@ func TestMergeCandidateVerify_NotExecutedArms(t *testing.T) {
 			}
 		})
 	}
+	// The #3948 text classifier is deleted (#4022): scripts/test's refusal
+	// TEXT from an executed gate that did NOT exit 73 is an ordinary failure,
+	// so a regression that re-adds text scraping reddens this.
+	t.Run("refusal_text_without_exit_73_is_verify_failed", func(t *testing.T) {
+		result, reason := classifyMergeCandidateVerify("failed", gateExecuted,
+			"scripts/test: another RUNNER verify still holds the lock at /l after 600s\n")
+		if result != mergeCandidateFailed || reason != "verify_failed" {
+			t.Errorf("result/reason = %q/%q, want %s/verify_failed", result, reason, mergeCandidateFailed)
+		}
+	})
 }
 
 // TestMergeCandidateVerify_ReportFailureExitsFailure: an undelivered report is

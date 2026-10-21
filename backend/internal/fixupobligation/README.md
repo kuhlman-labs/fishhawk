@@ -89,12 +89,13 @@ the case-folded text contains **both**:
 | Half | Terms |
 |---|---|
 | Recording verb | `record`, `report`, `document`, `attest`, `attestation`, `write up`, `list out` |
-| Report-surface noun (PR-body set) | `pr body`, `pull request body`, `pull-request body`, `pr description`, `pull request description`, `pull-request description`, `## notes`, `notes section` |
-| Report-surface noun (other) | `run log` |
+| Report-surface noun | `pr body`, `pull request body`, `pull-request body`, `pr description`, `pull request description`, `pull-request description`, `## notes`, `notes section`, `run log` |
 
-`IsObligation` tests the **union** of the two noun sets, so the detected set —
-and every `ob-N` id — is unchanged by the #2782 split; only the per-member
-classification is new (see "PR-body obligations" below).
+The noun list decides only **whether** an instruction is a reporting obligation
+(and so draws an `ob-N` id). It never decides whether the obligation is
+satisfiable — the router-declared target does (see "PR-body obligations"
+below). A source whose router targeted `pr_body` is declared even when its text
+matches neither half.
 
 The narrowness is the anti-noise property: a signal that fires on every pass is
 one operators learn to ignore, which is the failure mode this change must not
@@ -105,29 +106,41 @@ correctly rejected.
 This is a lexical, English-only heuristic over operator-authored text. A
 reporting obligation phrased without any listed term is a **false negative** —
 which is today's exact behavior, so nothing regresses when it misses. A concern
-that mentions the PR body in passing while also using a recording verb can
-produce a **false positive** advisory entry; that entry never fails or
-re-budgets anything.
+that mentions the PR body in passing while also using a recording verb is a
+**false positive** reporting obligation (an extra `ob-N` the agent may report
+`met`); it is never PR-body `unsatisfiable` unless its router targeted
+`pr_body`, and it never fails or re-budgets anything.
 
-## PR-body obligations (#2782)
+## PR-body obligations (#2782) — decided by the router-declared target (#4022)
 
-The report-surface nouns split by whether a fix-up pass **can write** the named
-surface. The PR-body set names the pull-request body — which a fix-up pass has
-**no mechanism to write**: the slim fix-up prompt renders no PR-description
-block and the pass only pushes commits, so the PR title/body composed at PR-open
-by the first implement attempt is never re-composed (verified in
-`runner/cmd/fishhawk-runner/main.go`, where `willOpenPR` is gated on
-`!cfg.fixup`). `## notes` / `notes section` count as PR-body surfaces because in
-this workflow the `## Notes` heading **is** a PR-body convention (AGENTS.md's
-git-flow PR-body template) — and it was the exact phrasing the #2782 occurrence
-used. `run log` names a surface the pass **can** write, so it stays satisfiable.
+A fix-up pass has **no mechanism to write** the pull-request body: the slim
+fix-up prompt renders no PR-description block and the pass only pushes commits,
+so the PR title/body composed at PR-open by the first implement attempt is never
+re-composed (verified in `runner/cmd/fishhawk-runner/main.go`, where `willOpenPR`
+is gated on `!cfg.fixup`). An instruction that asks for a PR-body change is
+therefore unsatisfiable on any pass.
 
-`Detect` records the split on `Obligation.PRBody`, derived once (at the single
-detection site) from `NamesPRBodySurface(text)` — which, unlike `IsObligation`,
-is **not** conjunctive with the recording verbs: it answers "does this name the
-surface the pass cannot write", the question that decides unsatisfiability. The
-flag then rides every consumer (the routing-time warning, the advisory audit
-entry, the fix-up prompt bullet, and the review-time join) with no re-derivation.
+**Which instruction that is comes from the router, not the prose** (E83.37 /
+#4022). Every `Source` carries a `Target` — `code` (the zero value and the
+meaning of an absent target), `pr_body`, or `docs` — set by whoever routes the
+instruction: the operator on `POST /v0/stages/{id}/fixup`'s
+`instruction_targets` / `fishhawk_fixup_stage`, recorded on the
+`stage_fixup_triggered` payload as `concern_targets` (positional over
+`concerns`) / `operator_concern_target` / `reason_target`, each omitted when
+every target is `code`. `Detect` sets `Obligation.PRBody = (Target ==
+pr_body)` at the single detection site, and the flag rides every consumer (the
+routing-time warning, the advisory audit entry, the fix-up prompt bullet, and
+the review-time join), all of which read the targets the trigger recorded. The
+#2782 lexical PR-body noun test (`NamesPRBodySurface`) is **deleted**: a code
+instruction that merely mentions the PR body is an ordinary instruction, and a
+`pr_body`-targeted instruction is unsatisfiable however it is worded. Callers
+that declare no target — the campaign auto-driver, acceptance triage — therefore
+never raise the PR-body signal. `docs` is satisfiable like `code`; it records
+the router's intent. `ParseTarget` accepts exactly the three literals.
+
+Pinned by `TestDetect_TargetDecidesSatisfiability` (prose + `code` → false; no
+target → false; no-surface prose + `pr_body` → declared, true; `docs` → false)
+and `TestUndelivered_TargetDecidesUnsatisfiable`.
 
 `Undelivered` returns a PR-body obligation as a Finding with status
 `unsatisfiable` **regardless of the agent's report — including a `met`**,
@@ -146,7 +159,8 @@ control, pinned by `TestUndelivered_RunLogObligation_MetSuppressesFinding`.
 Because the impossibility is knowable at ROUTING time, the operator learns it
 without waiting for the review. `server/fixup.go::recordFixupPRBodyUnsatisfiable`
 (called from `fixupStageAs` on every routing path — the HTTP verb, the campaign
-auto-driver, and acceptance triage) derives the PR-body obligation set via the
+auto-driver, and acceptance triage, the last two declaring no targets) derives
+the PR-body obligation set via the
 **shared** `buildFixupObligationSources` helper + `Detect`, so the ids match the
 reviewer's by construction; when non-empty it appends the advisory
 `fixup_pr_body_unsatisfiable` audit entry AND returns the set on the fix-up

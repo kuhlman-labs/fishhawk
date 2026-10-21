@@ -31,7 +31,8 @@ import (
 //     post-commit scope assertion #980). A failure is PERMANENT category B: no
 //     agent fallback, no checkpoint, nothing published.
 //  3. reverifyHeldCommit — ONE full-form committed-tree verify, plus one re-run
-//     only on an infra signature. A failure is category C.
+//     only on an exit-75 temporary failure or an infra signature. A failure is
+//     category C.
 //  4. synthesizeCommitOnParent — a DCO-signed commit of the held tree on its
 //     recorded parent, which the push-resume tail publishes.
 //
@@ -80,7 +81,8 @@ const (
 	reverifyFailedInChange      = "reverify_failed_in_change"      // permanent
 )
 
-// reverifyMaxInfraReruns bounds reverifyHeldCommit's infra-signature re-run.
+// reverifyMaxInfraReruns bounds reverifyHeldCommit's temp-fail / infra-signature
+// re-run.
 const reverifyMaxInfraReruns = 1
 
 // reverifyHeld is everything the reverify helpers read about the served held
@@ -240,14 +242,16 @@ type reverifyResult struct {
 // reverifyHeldCommit runs ONE full-form committed-tree verify over the held
 // commit — a nil package set, so FISHHAWK_VERIFY_PACKAGES is absent and
 // `scripts/test verify` runs its full loop plus the patch-coverage gate — and
-// re-runs it once only when an EXECUTED failure carries an infra signature
-// (isVerifyInfraFailure, the #2645 absorb's classifier). Every verdict is
-// category C:
+// re-runs it once only when the command exited 75 (gateTempFail, the #4022
+// exit-code contract) or an EXECUTED failure carries an infra signature
+// (isVerifyInfraFailure, the #2645 absorb's classifier, kept as the fallback
+// for tools that cannot set exit codes). Every verdict is category C:
 //
 //   - passed → ok;
-//   - never executed (refused / unavailable / skipped), timed out,
-//     lock-contended, or an infra signature that persists → reverify_gate_not_executed,
-//     transient (the tree was never judged);
+//   - never executed (refused / unavailable / skipped), timed out, a temporary
+//     failure (exit 75) or an infra signature that persists, or lock-contended
+//     (exit 73, gateLockRefused; the #3948 text classifier is deleted, #4022)
+//     → reverify_gate_not_executed, transient (the tree was never judged);
 //   - an executed failure whose failing packages all lie OUTSIDE the change
 //     (verifyFailureScopeRelation over the served scope) → reverify_failed_outside_change,
 //     transient;
@@ -263,8 +267,8 @@ func reverifyHeldCommit(ctx context.Context, h reverifyHeld, timeout time.Durati
 		return out, outcome, disp
 	}
 	out, outcome, disp := run()
-	for i := 0; i < reverifyMaxInfraReruns && outcome == "failed" && disp == gateExecuted &&
-		isVerifyInfraFailure(out) && !isVerifyLockContended(out); i++ {
+	for i := 0; i < reverifyMaxInfraReruns && outcome == "failed" && (disp == gateTempFail ||
+		disp == gateExecuted && isVerifyInfraFailure(out)); i++ {
 		out, outcome, disp = run()
 	}
 	notExecuted := func(why string) reverifyResult {
@@ -280,8 +284,10 @@ func reverifyHeldCommit(ctx context.Context, h reverifyHeld, timeout time.Durati
 		return notExecuted("the verify gate never executed (" + disp.String() + ")")
 	case disp == gateTimedOut:
 		return notExecuted("the verify gate timed out before a verdict")
-	case isVerifyLockContended(out):
-		return notExecuted("the verify lock was held by another runner verify")
+	case disp == gateTempFail:
+		return notExecuted("the verify command exited 75 (temporary infrastructure failure) across the re-run")
+	case disp == gateLockRefused:
+		return notExecuted("the verify command exited 73 (the verify lock could not be acquired)")
 	case isVerifyInfraFailure(out):
 		return notExecuted("an infrastructure failure signature persisted across the re-run")
 	}

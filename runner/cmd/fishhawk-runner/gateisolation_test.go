@@ -968,10 +968,35 @@ func TestGateDisposition_String(t *testing.T) {
 		{gateRefused, "refused"},
 		{gateUnavailable, "unavailable"},
 		{gateTimedOut, "timed_out"},
+		{gateTempFail, "temp_fail"},
+		{gateLockRefused, "lock_refused"},
 		{gateDisposition(99), "gateDisposition(99)"},
 	} {
 		if got := tc.d.String(); got != tc.want {
 			t.Errorf("gateDisposition(%d).String() = %q, want %q", int(tc.d), got, tc.want)
+		}
+	}
+}
+
+// TestGateDisposition_NeverExecutedInfra pins which dispositions take the
+// shared never-executed arm. The exit-code dispositions (#4022) stay OUT of it
+// — the command ran — so each gate site must test gateTempFail /
+// gateLockRefused explicitly, exactly as it tests gateTimedOut.
+func TestGateDisposition_NeverExecutedInfra(t *testing.T) {
+	for _, tc := range []struct {
+		d    gateDisposition
+		want bool
+	}{
+		{gateExecuted, false},
+		{gateCheckoutRefused, false},
+		{gateRefused, true},
+		{gateUnavailable, true},
+		{gateTimedOut, false},
+		{gateTempFail, false},
+		{gateLockRefused, false},
+	} {
+		if got := tc.d.neverExecutedInfra(); got != tc.want {
+			t.Errorf("%s.neverExecutedInfra() = %t, want %t", tc.d, got, tc.want)
 		}
 	}
 }
