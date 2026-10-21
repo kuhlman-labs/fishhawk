@@ -4,8 +4,10 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/agent"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/runner/internal/upload"
 )
 
@@ -502,12 +505,13 @@ func TestCounterfactual_BaselineGitMetadataEscapeContained(t *testing.T) {
 
 // TestCFGitApply_RefusesForeignGitDir pins cloneGitDirOwned inside cfGitApply:
 // a clone whose .git is a symlink — which a baseline could swap in to point
-// host git back at the primary repository — is refused before any git runs.
+// host git back at the primary repository — is refused before any git runs,
+// and before a per-invocation GIT_DIR is minted under scratch.
 // COUNTERFACTUAL: drop the cloneGitDirOwned call in cfGitApply → `git apply
 // --numstat` on the valid patch succeeds (err == nil) → RED.
 func TestCFGitApply_RefusesForeignGitDir(t *testing.T) {
 	t.Parallel()
-	clone, gitDir := t.TempDir(), t.TempDir()
+	clone, scratch := t.TempDir(), t.TempDir()
 	if err := os.Symlink(t.TempDir(), filepath.Join(clone, ".git")); err != nil {
 		t.Fatal(err)
 	}
@@ -515,8 +519,480 @@ func TestCFGitApply_RefusesForeignGitDir(t *testing.T) {
 	if err := os.WriteFile(patch, []byte("--- a/ctl.go\n+++ b/ctl.go\n@@ -1 +1 @@\n-package cf\n+package cf2\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := cfGitApply(context.Background(), clone, gitDir, "apply", "--numstat", patch); err == nil || !strings.Contains(err.Error(), "not the runner's own") {
+	if _, err := cfGitApply(context.Background(), clone, scratch, "apply", "--numstat", patch); err == nil || !strings.Contains(err.Error(), "not the runner's own") {
 		t.Fatalf("cfGitApply on a symlinked .git = %v, want the ownership refusal", err)
+	}
+	if m := cfMintedGitDirs(t, scratch); len(m) != 0 {
+		t.Fatalf("the ownership refusal minted a GIT_DIR: %v", m)
+	}
+}
+
+// --- #4360: cfGitApply GIT_DIR + env hardening, checked phase removals -------
+
+// cfCtlPatch rewrites the fixture ctl.go's pinned `return n > 0`.
+const cfCtlPatch = "--- a/ctl.go\n+++ b/ctl.go\n@@ -1,4 +1,4 @@\n package cf\n \n // Allowed is the pinned control.\n" +
+	"-func Allowed(n int) bool { return n > 0 }\n+func Allowed(n int) bool { return true }\n"
+
+// cfPlantedName is a baseline-chosen path component; it must never reach a log
+// line or the trace.
+const cfPlantedName = "CF-PLANTED-NAME-4360"
+
+func cfWritePatch(t *testing.T, body string) string {
+	t.Helper()
+	p := filepath.Join(t.TempDir(), "p.patch")
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// cfApplyClone builds a minimal cfGitApply target: a real `.git` directory
+// (git init), the fixture ctl.go and, when filtered, a work-tree
+// .gitattributes routing every path through filter x.
+func cfApplyClone(t *testing.T, filtered bool) string {
+	t.Helper()
+	clone := t.TempDir()
+	cfGit(t, clone, "init", "-q")
+	if err := os.WriteFile(filepath.Join(clone, "ctl.go"), []byte(cfFixtureFiles["ctl.go"]), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if filtered {
+		if err := os.WriteFile(filepath.Join(clone, ".gitattributes"), []byte("* filter=x\n"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return clone
+}
+
+// cfPlantFilterRepo plants a VALID bare repository at dir whose config defines
+// filter.x clean and smudge as a command that touches marker and passes the
+// content through — what a baseline could leave at a predictable scratch path.
+func cfPlantFilterRepo(t *testing.T, dir, marker string) {
+	t.Helper()
+	cfGit(t, filepath.Dir(dir), "init", "-q", "--bare", dir)
+	for _, k := range []string{"filter.x.clean", "filter.x.smudge"} {
+		cfGit(t, filepath.Dir(dir), "--git-dir="+dir, "config", k, "touch '"+marker+"'; cat")
+	}
+}
+
+func cfMintedGitDirs(t *testing.T, scratch string) []string {
+	t.Helper()
+	m, err := filepath.Glob(filepath.Join(scratch, "cf-gitdir-*"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
+}
+
+// cfFakeGoTest stands in for `go test -run ^TestAllowed$` in dir: it passes
+// while ctl.go still carries the pinned `return n > 0` and fails once mutated.
+func cfFakeGoTest(dir string) (string, int, gateDisposition) {
+	if b, err := os.ReadFile(filepath.Join(dir, "ctl.go")); err == nil && strings.Contains(string(b), pinnedFind) {
+		return `{"Action":"pass","Package":"example.com/cf","Test":"TestAllowed"}` + "\n", 0, gateExecuted
+	}
+	return `{"Action":"fail","Package":"example.com/cf","Test":"TestAllowed"}` + "\n", 1, gateExecuted
+}
+
+// cfLockDir creates dir holding one file and drops its write bit, so a
+// non-root os.RemoveAll of any ancestor fails (unlinking f needs write
+// permission on dir). Cleanup restores the bit and removes phaseDir, which is
+// os.MkdirTemp-based rather than a t.TempDir.
+func cfLockDir(t *testing.T, dir, phaseDir string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(dir, "f"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(dir, 0o555); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = os.Chmod(dir, 0o755)
+		_ = os.RemoveAll(phaseDir)
+	})
+}
+
+// cfRequireLockedRemovalFails is the twin precondition for the 0555 fixtures:
+// on this host, os.RemoveAll really fails on that shape.
+func cfRequireLockedRemovalFails(t *testing.T) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory write permission; the removal-failure fixture cannot fail")
+	}
+	root := t.TempDir()
+	cfLockDir(t, filepath.Join(root, "d", "locked"), filepath.Join(root, "d"))
+	if err := os.RemoveAll(filepath.Join(root, "d")); err == nil {
+		t.Fatal("fixture precondition: os.RemoveAll succeeded on a non-empty 0555 directory; the removal-failure fixture is vacuous on this host")
+	}
+}
+
+// TestCFGitApply_StaleScratchGitDirNotReused (#4360, control a): a VALID bare
+// repository planted at the old fixed <scratch>/cf-gitdir name, whose config
+// defines a marker-touching filter.x, is never opened: cfGitApply mints a fresh
+// GIT_DIR, so the work-tree `* filter=x` attribute is inert, the marker is
+// never created, and the patch still applies. The twin first proves the
+// planted driver is live when git DOES open that repository. COUNTERFACTUAL:
+// mint the GIT_DIR at the fixed <scratch>/cf-gitdir with MkdirAll → git opens
+// the planted repository and runs its clean/smudge on ctl.go → marker → RED.
+func TestCFGitApply_StaleScratchGitDirNotReused(t *testing.T) {
+	t.Parallel()
+	patch := cfWritePatch(t, cfCtlPatch)
+
+	twinScratch, twinMarker := t.TempDir(), filepath.Join(t.TempDir(), "TWIN-MARKER")
+	cfPlantFilterRepo(t, filepath.Join(twinScratch, "cf-gitdir"), twinMarker)
+	twin := cfApplyClone(t, true)
+	cmd := exec.Command("git", "apply", patch)
+	cmd.Dir = twin
+	cmd.Env = append(os.Environ(), "GIT_DIR="+filepath.Join(twinScratch, "cf-gitdir"), "GIT_WORK_TREE="+twin)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("fixture precondition: git apply under the planted GIT_DIR: %v\n%s", err, out)
+	}
+	if _, err := os.Lstat(twinMarker); err != nil {
+		t.Fatalf("fixture precondition: the planted filter did not run when git opened the planted repository (lstat err = %v); the main assertion would be vacuous", err)
+	}
+
+	scratch, marker := t.TempDir(), filepath.Join(t.TempDir(), "MARKER")
+	cfPlantFilterRepo(t, filepath.Join(scratch, "cf-gitdir"), marker)
+	clone := cfApplyClone(t, true)
+	_, err := cfGitApply(context.Background(), clone, scratch, "apply", patch)
+	if _, lerr := os.Lstat(marker); !os.IsNotExist(lerr) {
+		t.Fatalf("the planted filter ran: cfGitApply opened the repository planted at <scratch>/cf-gitdir (lstat err = %v)", lerr)
+	}
+	if err != nil {
+		t.Fatalf("cfGitApply: %v", err)
+	}
+	if got, _ := os.ReadFile(filepath.Join(clone, "ctl.go")); !strings.Contains(string(got), "return true") {
+		t.Fatalf("the patch was not applied: %q", got)
+	}
+}
+
+// cfGitCanary is a runner-env var the gate's default-deny allow-list drops.
+const cfGitCanary = "FISHHAWK_CF_GIT_CANARY"
+
+// TestCFGitApply_RunnerEnvNotInherited (#4360, control b): the cfGitApply git
+// child gets the default-deny gate env plus its pins, never the runner's own
+// env. A fake `git` first on PATH dumps its env and execs the real git.
+// COUNTERFACTUAL: build cmd.Env from os.Environ() → the canary set in the
+// runner's env reaches the dump → RED. Not t.Parallel: it uses t.Setenv.
+func TestCFGitApply_RunnerEnvNotInherited(t *testing.T) {
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	clone, scratch := cfApplyClone(t, false), t.TempDir()
+	patch := cfWritePatch(t, cfCtlPatch)
+	fakeDir, dump := t.TempDir(), filepath.Join(t.TempDir(), "env.dump")
+	script := "#!/bin/sh\nenv > '" + dump + "'\nexec '" + realGit + "' \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(fakeDir, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("PATH", fakeDir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	t.Setenv(cfGitCanary, "leaked")
+
+	if _, err := cfGitApply(context.Background(), clone, scratch, "apply", "--numstat", patch); err != nil {
+		t.Fatalf("cfGitApply: %v", err)
+	}
+	b, err := os.ReadFile(dump)
+	if err != nil {
+		t.Fatalf("the fake git never ran, so the env was not observed: %v", err)
+	}
+	lines := strings.Split(string(b), "\n")
+	count := func(want string) int {
+		n := 0
+		for _, l := range lines {
+			if l == want {
+				n++
+			}
+		}
+		return n
+	}
+	for _, l := range lines {
+		if strings.HasPrefix(l, cfGitCanary+"=") {
+			t.Fatalf("the runner's env reached the cfGitApply git child: %q", l)
+		}
+	}
+	var gitDir string
+	for _, l := range lines {
+		if v, ok := strings.CutPrefix(l, "GIT_DIR="); ok {
+			gitDir = v
+		}
+	}
+	if !strings.HasPrefix(gitDir, filepath.Join(scratch, "cf-gitdir-")) {
+		t.Fatalf("GIT_DIR = %q, want a fresh %s/cf-gitdir-* directory", gitDir, scratch)
+	}
+	for _, want := range []string{"GIT_WORK_TREE=" + clone, "GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_SYSTEM=/dev/null", "GIT_CONFIG_NOSYSTEM=1", "GIT_ATTR_NOSYSTEM=1"} {
+		if n := count(want); n != 1 {
+			t.Errorf("%q appears %d times in the git child env, want exactly once", want, n)
+		}
+	}
+}
+
+// TestCFGitApply_ScratchGitDirRemovedOnEveryExit (#4360, control c): the
+// per-invocation GIT_DIR is gone after a successful apply, a failing apply, a
+// cancelled context and the ownership refusal; a missing scratch refuses
+// before git runs. COUNTERFACTUAL: drop the deferred removal of the minted
+// GIT_DIR → the success / failure / cancel calls leave cf-gitdir-* → RED.
+func TestCFGitApply_ScratchGitDirRemovedOnEveryExit(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+	patch := cfWritePatch(t, cfCtlPatch)
+	stale := cfWritePatch(t, "--- a/ctl.go\n+++ b/ctl.go\n@@ -1 +1 @@\n-this line is not in ctl.go\n+package cf\n")
+	clone, scratch := cfApplyClone(t, false), t.TempDir()
+	assertNone := func(when string) {
+		t.Helper()
+		if m := cfMintedGitDirs(t, scratch); len(m) != 0 {
+			t.Fatalf("after %s the minted GIT_DIR remains: %v", when, m)
+		}
+	}
+
+	if _, err := cfGitApply(ctx, clone, scratch, "apply", patch); err != nil {
+		t.Fatalf("successful apply: %v", err)
+	}
+	assertNone("a successful apply")
+	if _, err := cfGitApply(ctx, clone, scratch, "apply", stale); err == nil {
+		t.Fatal("a patch whose context does not match applied")
+	}
+	assertNone("a failing apply")
+	cancelled, cancel := context.WithCancel(ctx)
+	cancel()
+	if _, err := cfGitApply(cancelled, clone, scratch, "apply", "--numstat", patch); err == nil {
+		t.Fatal("cfGitApply on a cancelled context succeeded")
+	}
+	assertNone("a cancelled context")
+	foreign := t.TempDir()
+	if err := os.Symlink(t.TempDir(), filepath.Join(foreign, ".git")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := cfGitApply(ctx, foreign, scratch, "apply", patch); err == nil {
+		t.Fatal("a symlinked .git was not refused")
+	}
+	assertNone("the ownership refusal")
+
+	fresh := cfApplyClone(t, false)
+	if _, err := cfGitApply(ctx, fresh, filepath.Join(t.TempDir(), "missing"), "apply", patch); err == nil {
+		t.Fatal("a missing scratch directory did not refuse")
+	}
+	if got, _ := os.ReadFile(filepath.Join(fresh, "ctl.go")); string(got) != cfFixtureFiles["ctl.go"] {
+		t.Fatalf("git ran although no GIT_DIR could be minted: ctl.go = %q", got)
+	}
+}
+
+// TestCounterfactual_BaselinePlantedScratchGitDirContained (#4360, phase
+// level): a baseline that plants the marker-touching repository at the old
+// fixed <phase dir>/cf-gitdir name and a `* filter=x` work-tree attribute
+// cannot make the patch form run that filter; the spec still observes red.
+// COUNTERFACTUAL (full revert only): fixed <scratch>/cf-gitdir via MkdirAll AND
+// no per-call removal → the apply opens the planted repository → marker → RED.
+// Reverting the fresh name alone is masked here, because the `--numstat`
+// call's per-call removal deletes the planted repository before the apply;
+// TestCFGitApply_StaleScratchGitDirNotReused is that control's vehicle.
+func TestCounterfactual_BaselinePlantedScratchGitDirContained(t *testing.T) {
+	t.Parallel()
+	repo, head, tree := newCFFixture(t)
+	marker := filepath.Join(t.TempDir(), "MARKER")
+	textPatch := cfStagedPatch(t, repo, func() {
+		_ = os.WriteFile(filepath.Join(repo, "ctl.go"), []byte(strings.Replace(cfFixtureFiles["ctl.go"], pinnedFind, "return true", 1)), 0o644)
+	})
+	x := newTestCFExecutor(t, repo)
+	planted := false
+	x.exec = func(ctx context.Context, argv []string, dir, lc string, to time.Duration) (string, int, gateDisposition) {
+		if argv[1] == "list" {
+			return runBoundedGateArgvDisposed(ctx, argv, dir, lc, to)
+		}
+		if !planted {
+			planted = true
+			cfPlantFilterRepo(t, filepath.Join(filepath.Dir(dir), "cf-gitdir"), marker)
+			if err := os.WriteFile(filepath.Join(dir, ".gitattributes"), []byte("* filter=x\n"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+		}
+		return cfFakeGoTest(dir)
+	}
+	obs := runCF(t, x, repo, head, tree, patchSpec(0, "ctl.go", textPatch))
+	if _, err := os.Lstat(marker); !os.IsNotExist(err) {
+		t.Fatalf("the baseline-planted filter ran on the host (lstat err = %v)", err)
+	}
+	if !planted {
+		t.Fatal("the baseline never ran, so nothing was planted")
+	}
+	wantObs(t, obs[0], cfOutcomeRed, "")
+}
+
+// TestCounterfactual_CloneRemovalFailureIsRestoreFailed (#4360, control d): a
+// baseline that leaves an unremovable directory in the clone makes the
+// per-spec os.RemoveAll fail, and the remaining spec records
+// error/restore_failed WITHOUT re-materializing. The materializer is
+// PERMISSIVE after its first call (it hands back the stale clone), so git
+// clone's refusal of a non-empty destination cannot mask the explicit check.
+// COUNTERFACTUAL: ignore the per-spec removal error → materialize runs a
+// second time and spec 1 executes on the stale clone → RED.
+func TestCounterfactual_CloneRemovalFailureIsRestoreFailed(t *testing.T) {
+	t.Parallel()
+	cfRequireLockedRemovalFails(t)
+	repo, head, tree := newCFFixture(t)
+	x := newTestCFExecutor(t, repo)
+	var calls int
+	var first string
+	x.materialize = func(ctx context.Context, repoDir, headSHA, parent string) (string, error) {
+		calls++
+		if calls > 1 {
+			return first, nil
+		}
+		c, err := materializeGateCheckout(ctx, repoDir, headSHA, parent)
+		first = c
+		return c, err
+	}
+	tests := 0
+	x.exec = func(ctx context.Context, argv []string, dir, lc string, to time.Duration) (string, int, gateDisposition) {
+		if argv[1] == "list" {
+			return runBoundedGateArgvDisposed(ctx, argv, dir, lc, to)
+		}
+		if tests++; tests == 1 {
+			cfLockDir(t, filepath.Join(dir, "locked"), filepath.Dir(dir))
+		}
+		return cfFakeGoTest(dir)
+	}
+	obs := runCF(t, x, repo, head, tree,
+		replaceSpec(0, "ctl.go", pinnedFind, "return true", "^TestAllowed$"),
+		replaceSpec(1, "unpinned.go", "return n > 1", "return true", "^TestAllowed$"))
+	if calls != 1 {
+		t.Fatalf("materialize called %d times, want 1: a failed clone removal reached the re-materialize", calls)
+	}
+	wantObs(t, obs[0], cfOutcomeRed, "")
+	wantObs(t, obs[1], cfOutcomeError, cfReasonRestoreFailed)
+}
+
+// TestRunPlanCounterfactuals_FinalCleanupFailureSurfaced (#4360, controls e and
+// f): a phase directory whose final removal fails is surfaced as ONE
+// counterfactual_cleanup_failed log line and trace event carrying the
+// runner-owned phase directory and an op/errno detail, the observation is
+// still emitted, the baseline-named path component reaches neither, and the
+// event survives the bundle encoding the runner ships (both the raw and the
+// redacted variant). COUNTERFACTUAL: drop the recording of the final removal's
+// error → no event and no log line → RED; render the detail with the full
+// PathError text → the planted name appears → RED.
+func TestRunPlanCounterfactuals_FinalCleanupFailureSurfaced(t *testing.T) {
+	t.Parallel()
+	cfRequireLockedRemovalFails(t)
+	repo, head, tree := newCFFixture(t)
+	cfg := config{runID: "r", stageID: "s"}
+	verifyRun := agent.Event{Kind: "verify_run", Payload: agent.MakePayload(map[string]any{"head_sha": head, "tree_sha": tree})}
+	x := newTestCFExecutor(t, repo)
+	tests := 0
+	x.exec = func(ctx context.Context, argv []string, dir, lc string, to time.Duration) (string, int, gateDisposition) {
+		if argv[1] == "list" {
+			return runBoundedGateArgvDisposed(ctx, argv, dir, lc, to)
+		}
+		if tests++; tests == 1 {
+			cfLockDir(t, filepath.Join(dir, cfPlantedName), filepath.Dir(dir))
+		}
+		return cfFakeGoTest(dir)
+	}
+	var logBuf bytes.Buffer
+	evs, obs := runPlanCounterfactualsWith(context.Background(), cfg, x, repo, []agent.Event{verifyRun}, tree,
+		[]upload.CounterfactualSpec{replaceSpec(0, "ctl.go", pinnedFind, "return true", "^TestAllowed$")}, &logBuf)
+	if len(obs) != 1 {
+		t.Fatalf("observations = %d, want 1", len(obs))
+	}
+	wantObs(t, obs[0], cfOutcomeRed, "")
+	if x.phaseCleanupDir == "" {
+		t.Fatal("phaseCleanupDir not recorded")
+	}
+
+	type cleanupPayload struct {
+		PhaseDir string `json:"phase_dir"`
+		Detail   string `json:"detail"`
+	}
+	var observed, cleanup int
+	for _, ev := range evs {
+		switch ev.Kind {
+		case "counterfactual_observed":
+			observed++
+		case "counterfactual_cleanup_failed":
+			cleanup++
+			var p cleanupPayload
+			if err := json.Unmarshal(ev.Payload, &p); err != nil {
+				t.Fatal(err)
+			}
+			if p.PhaseDir != x.phaseCleanupDir || p.Detail == "" {
+				t.Fatalf("cleanup payload = %+v, want phase_dir %q and a non-empty detail", p, x.phaseCleanupDir)
+			}
+			if strings.Contains(string(ev.Payload), cfPlantedName) {
+				t.Fatalf("the baseline-named path reached the trace event: %s", ev.Payload)
+			}
+		}
+	}
+	if observed != 1 || cleanup != 1 {
+		t.Fatalf("events: %d counterfactual_observed, %d counterfactual_cleanup_failed; want 1 and 1", observed, cleanup)
+	}
+	if !strings.Contains(logBuf.String(), `"event":"counterfactual_cleanup_failed"`) {
+		t.Fatalf("no counterfactual_cleanup_failed log line:\n%s", logBuf.String())
+	}
+	if strings.Contains(logBuf.String(), cfPlantedName) {
+		t.Fatalf("the baseline-named path reached the log:\n%s", logBuf.String())
+	}
+
+	// The event survives the encoding main.go ships: scrubKnownEvents →
+	// bundle.PackBytes (raw) and redactEvents → bundle.PackBytes (redacted).
+	packEvents, _ := scrubKnownEvents(evs, nil)
+	redacted, _ := redactEvents(packEvents)
+	in := bundle.PackInputs{RunID: cfg.runID, StageID: cfg.stageID, Agent: "claude"}
+	for name, set := range map[string][]agent.Event{"raw": packEvents, "redacted": redacted} {
+		data, _, err := bundle.PackBytes(in, set)
+		if err != nil {
+			t.Fatalf("%s: pack: %v", name, err)
+		}
+		_, lines, _, err := bundle.Open(bytes.NewReader(data))
+		if err != nil {
+			t.Fatalf("%s: open: %v", name, err)
+		}
+		found := 0
+		for _, ln := range lines {
+			if ln.Kind != "counterfactual_cleanup_failed" {
+				continue
+			}
+			found++
+			var p cleanupPayload
+			if err := json.Unmarshal(ln.Data, &p); err != nil {
+				t.Fatalf("%s: decode: %v", name, err)
+			}
+			if p.PhaseDir != x.phaseCleanupDir || p.Detail == "" {
+				t.Fatalf("%s bundle: cleanup payload = %+v, want phase_dir %q and a non-empty detail", name, p, x.phaseCleanupDir)
+			}
+		}
+		if found != 1 {
+			t.Fatalf("%s bundle: %d counterfactual_cleanup_failed lines, want 1", name, found)
+		}
+	}
+}
+
+// TestCFCleanupDetail (#4360, control f): a removal error renders as op and
+// errno text only, never the failing path; a PathError without an Err and a
+// non-PathError render as the fixed string. COUNTERFACTUAL: return the
+// PathError's own Error() → the path appears → RED.
+func TestCFCleanupDetail(t *testing.T) {
+	t.Parallel()
+	pe := &fs.PathError{Op: "unlinkat", Path: "/tmp/phase/tree/" + cfPlantedName + "/f", Err: fs.ErrPermission}
+	want := "unlinkat: " + fs.ErrPermission.Error()
+	for _, c := range []struct {
+		name string
+		err  error
+		want string
+	}{
+		{"path error", pe, want},
+		{"wrapped path error", fmt.Errorf("remove: %w", pe), want},
+		{"path error without errno", &fs.PathError{Op: "unlinkat", Path: cfPlantedName}, "remove failed"},
+		{"other error", errors.New("boom " + cfPlantedName), "remove failed"},
+	} {
+		got := cfCleanupDetail(c.err)
+		if got != c.want {
+			t.Errorf("%s: cfCleanupDetail = %q, want %q", c.name, got, c.want)
+		}
+		if strings.Contains(got, cfPlantedName) {
+			t.Errorf("%s: the failing path reached the detail: %q", c.name, got)
+		}
 	}
 }
 
@@ -897,8 +1373,9 @@ func TestCounterfactual_RestoreFailurePoisonsRemainingSpecs(t *testing.T) {
 	// re-materializes a clean clone for the next spec. Here the re-materialize
 	// fails, so there is no clean tree for spec 1 and it records restore_failed
 	// rather than running on a stale one. COUNTERFACTUAL: drop the cloneBroken
-	// arm in runCounterfactualPhase → spec 1 runs on the stale clone → GREEN,
-	// not restore_failed → RED.
+	// arm in runCounterfactualPhase → spec 1 runs executeCounterfactual with
+	// clone == "" (the failed materialize returned ""), whose C2 walk fails →
+	// error/invalid_spec, not restore_failed → RED.
 	var n int
 	x.materialize = func(ctx context.Context, repoDir, headSHA, parent string) (string, error) {
 		n++
