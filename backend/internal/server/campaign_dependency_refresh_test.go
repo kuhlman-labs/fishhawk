@@ -33,6 +33,15 @@ type refreshRepo struct {
 	// Postgres adapter does, so a caller holding a stale list does not see a
 	// later write through shared pointers.
 	snapshot bool
+	// accountErr fails GetCampaignAccountID (a store fault on the access probe).
+	accountErr error
+}
+
+func (r *refreshRepo) GetCampaignAccountID(ctx context.Context, id uuid.UUID) (string, error) {
+	if r.accountErr != nil {
+		return "", r.accountErr
+	}
+	return r.fakeCampaignRepo.GetCampaignAccountID(ctx, id)
 }
 
 func (r *refreshRepo) ListCampaignItemsForCampaign(ctx context.Context, id uuid.UUID) ([]*campaign.Item, error) {
@@ -425,14 +434,14 @@ func TestStatus_RefreshSingleFlightMinInterval(t *testing.T) {
 
 	// In flight: another refresh holds the slot.
 	h.clk.advance(campaignDependencyRefreshMinInterval)
-	if ok, _ := h.s.campaignRefreshGate.tryAcquire(c.ID, h.clk.now()); !ok {
+	if ok, _, _ := h.s.campaignRefreshGate.tryAcquire(c.ID, h.clk.now()); !ok {
 		t.Fatal("could not claim the slot")
 	}
 	st = mustStatus(t, h.s, c.ID)
 	if st.DependencyRefresh.SkippedReason != refreshSkippedInFlight || h.res.callCount() != 2 {
 		t.Errorf("in flight: reason %q calls %d, want in_flight/2", st.DependencyRefresh.SkippedReason, h.res.callCount())
 	}
-	h.s.campaignRefreshGate.release(c.ID, h.clk.now())
+	h.s.campaignRefreshGate.release(c.ID, h.clk.now(), nil, nil)
 
 	// Forge error: lastFinished is stamped, so the next poll inside 30 s skips.
 	h.clk.advance(campaignDependencyRefreshMinInterval)
@@ -496,7 +505,9 @@ func TestStatus_RepoInvisibleSkipsRefresh(t *testing.T) {
 // TestStatus_AuditFailureKeepsHoldWarns: an unrecordable change rolls back
 // (committed depends_on unchanged) but the response still HOLDS the newly
 // blocked item and names the missing audit row (condition 3). A write failure
-// of any other kind holds the same way.
+// of any other kind holds the same way. The hold outlives the failing poll:
+// polls the interval gate skips, and a poll whose tracker read fails, still
+// hold it and warn, until a refresh records it.
 func TestStatus_AuditFailureKeepsHoldWarns(t *testing.T) {
 	for name, setup := range map[string]func(*refreshHarness){
 		"audit": func(*refreshHarness) {},
@@ -526,6 +537,124 @@ func TestStatus_AuditFailureKeepsHoldWarns(t *testing.T) {
 			}
 			if name == "audit" && !strings.Contains(st.DependencyRefresh.Warnings[0], categoryCampaignDependenciesRefreshed) {
 				t.Errorf("warning %q does not name the missing audit row", st.DependencyRefresh.Warnings[0])
+			}
+			assertHeld := func(phase string, st refreshStatusBody) {
+				t.Helper()
+				if containsRef(st.Rollup.Eligible, "issue:10") || st.NextAction.IssueRef == "issue:10" {
+					t.Errorf("%s: issue:10 reported eligible (rollup %v, next_action %+v) while its blocker is unrecorded", phase, st.Rollup.Eligible, st.NextAction)
+				}
+				if st.DependencyRefresh == nil || st.DependencyRefresh.Committed || len(st.DependencyRefresh.Added) != 1 {
+					t.Fatalf("%s: dependency_refresh = %+v, want the uncommitted hold carried", phase, st.DependencyRefresh)
+				}
+				if name == "audit" && !strings.Contains(strings.Join(st.DependencyRefresh.Warnings, " | "), categoryCampaignDependenciesRefreshed) {
+					t.Errorf("%s: warnings %v do not name the missing audit row", phase, st.DependencyRefresh.Warnings)
+				}
+			}
+			// Polls inside the interval are skipped by the gate, not re-observed.
+			for i := 0; i < 2; i++ {
+				st = mustStatus(t, h.s, c.ID)
+				if st.DependencyRefresh == nil || st.DependencyRefresh.SkippedReason != refreshSkippedMinInterval {
+					t.Fatalf("poll %d inside the interval: dependency_refresh = %+v, want min_interval", i, st.DependencyRefresh)
+				}
+				assertHeld("skipped poll", st)
+			}
+			// A tracker read failure observed nothing, so the hold stays.
+			h.clk.advance(campaignDependencyRefreshMinInterval)
+			h.res.err = errors.New("tracker down")
+			st = mustStatus(t, h.s, c.ID)
+			if !st.DependencyRefresh.Performed {
+				t.Fatalf("forge-error poll did not read the tracker: %+v", st.DependencyRefresh)
+			}
+			assertHeld("forge-error poll", st)
+			// The record recovers: the next refresh commits and the hold clears.
+			h.res.err = nil
+			h.rr.appendErr = nil
+			h.s.cfg.AuditRepo = h.aud
+			h.clk.advance(campaignDependencyRefreshMinInterval)
+			st = mustStatus(t, h.s, c.ID)
+			if got := h.itemDeps(c.ID, "issue:10"); !containsRef(got, "issue:11") {
+				t.Fatalf("after recovery committed depends_on = %v, want issue:11", got)
+			}
+			if !st.DependencyRefresh.Committed || containsRef(st.Rollup.Eligible, "issue:10") {
+				t.Errorf("after recovery: dependency_refresh %+v rollup %v", st.DependencyRefresh, st.Rollup.Eligible)
+			}
+			st = mustStatus(t, h.s, c.ID)
+			if len(st.DependencyRefresh.Warnings) != 0 || len(st.DependencyRefresh.Added) != 0 {
+				t.Errorf("recorded hold still carried: %+v", st.DependencyRefresh)
+			}
+			if containsRef(st.Rollup.Eligible, "issue:10") {
+				t.Errorf("issue:10 eligible after its blocker was recorded: %v", st.Rollup.Eligible)
+			}
+		})
+	}
+}
+
+// TestStatus_RelistFailureStillHolds: the refresh COMMITTED an edge but the
+// status handler's re-list failed — the response holds the committed edge on
+// the stale slice rather than reporting the newly blocked item eligible.
+func TestStatus_RelistFailureStillHolds(t *testing.T) {
+	h := newRefreshHarness(t, Config{})
+	c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending), cItem("issue:11", nil, campaign.ItemStatePending))
+	h.res.deps[10] = []int{11}
+	h.rr.snapshot = true                          // the read's list must not alias the committed write
+	h.repo.itemsErrOnCall = h.repo.itemsCalls + 2 // the read's own list, then the post-refresh re-list
+	st := mustStatus(t, h.s, c.ID)
+	if got := h.itemDeps(c.ID, "issue:10"); !containsRef(got, "issue:11") {
+		t.Fatalf("committed depends_on = %v, want issue:11", got)
+	}
+	if st.DependencyRefresh == nil || !st.DependencyRefresh.Committed {
+		t.Fatalf("dependency_refresh = %+v, want committed", st.DependencyRefresh)
+	}
+	if containsRef(st.Rollup.Eligible, "issue:10") || st.NextAction.IssueRef == "issue:10" {
+		t.Errorf("issue:10 reported eligible (rollup %v, next_action %+v) despite its committed blocker", st.Rollup.Eligible, st.NextAction)
+	}
+}
+
+// TestRefreshAccess_LookupErrorsDeny: every error on the access predicate's
+// three lookups — the campaign's account, the repo filter, the visibility
+// answer — DENIES the refresh (fail closed) with zero tracker reads and zero
+// writes. Each row's other lookups allow, so the error is the only denial.
+func TestRefreshAccess_LookupErrorsDeny(t *testing.T) {
+	for name, tc := range map[string]struct {
+		cfg   Config
+		setup func(*refreshHarness)
+		want  string
+	}{
+		"account_lookup": {
+			setup: func(h *refreshHarness) { h.rr.accountErr = errors.New("db down") },
+			want:  refreshSkippedForeign,
+		},
+		"repo_filter": {
+			cfg: Config{
+				AccountRoles:   fakeAccountRoles{err: errors.New("roles down")},
+				RepoVisibility: newFakeRepoVisibility(map[string]bool{"kuhlman-labs/fishhawk": true}),
+			},
+			want: refreshSkippedRepoInvisible,
+		},
+		"visibility": {
+			cfg: Config{
+				AccountRoles:   fakeAccountRoles{role: account.RoleMember},
+				RepoVisibility: &fakeRepoVisibility{visible: map[string]bool{"kuhlman-labs/fishhawk": true}, err: errors.New("mirror down")},
+			},
+			want: refreshSkippedRepoInvisible,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			h := newRefreshHarness(t, tc.cfg)
+			if tc.setup != nil {
+				tc.setup(h)
+			}
+			c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending), cItem("issue:11", nil, campaign.ItemStatePending))
+			h.res.deps[10] = []int{11}
+			ctx := context.WithValue(context.Background(), ctxKeyIdentity, memberIdentity())
+			items, _ := h.repo.ListCampaignItemsForCampaign(ctx, c.ID)
+			res := h.s.refreshCampaignDependenciesForStatus(ctx, c, items)
+			if res == nil || res.SkippedReason != tc.want {
+				t.Errorf("refresh = %+v, want skipped %s", res, tc.want)
+			}
+			if h.res.callCount() != 0 || h.rr.appendCount() != 0 || h.aud.count(categoryCampaignDependenciesRefreshed) != 0 {
+				t.Errorf("lookup error drove resolver %d append %d audit %d, want 0/0/0",
+					h.res.callCount(), h.rr.appendCount(), h.aud.count(categoryCampaignDependenciesRefreshed))
 			}
 		})
 	}
@@ -667,6 +796,33 @@ func TestStart_ForeignAccountSkipsRefresh(t *testing.T) {
 	}
 	if res.callCount() != 0 || rr.appendCount() != 0 || aud.count(categoryCampaignDependenciesRefreshed) != 0 {
 		t.Errorf("foreign start drove resolver %d append %d audit %d, want 0/0/0",
+			res.callCount(), rr.appendCount(), aud.count(categoryCampaignDependenciesRefreshed))
+	}
+}
+
+// TestStart_RepoInvisibleSkipsRefresh: a SAME-account caller who cannot see
+// the repo drives zero resolver calls, zero writes and zero audit rows, and the
+// start behaves as before (condition 1's visibility half; without the check
+// the refresh holds the item and the start refuses 409).
+func TestStart_RepoInvisibleSkipsRefresh(t *testing.T) {
+	s, rr, _, aud, res := newRefreshStartServer(t)
+	s.cfg.AccountRoles = fakeAccountRoles{role: account.RoleMember}
+	vis := newFakeRepoVisibility(map[string]bool{})
+	s.cfg.RepoVisibility = vis
+	c := rr.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{
+		cItem("issue:10", nil, campaign.ItemStatePending), cItem("issue:11", nil, campaign.ItemStatePending),
+	})
+	rr.accounts[c.ID] = testOperatorAccountID
+	res.deps[10] = []int{11}
+	w := postStartItemRun(t, s, c.ID, startP)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("start = %d %s, want 201 (unchanged start behaviour)", w.Code, w.Body.String())
+	}
+	if vis.callCount() == 0 {
+		t.Fatal("the visibility mirror was never asked: the fixture does not exercise the predicate")
+	}
+	if res.callCount() != 0 || rr.appendCount() != 0 || aud.count(categoryCampaignDependenciesRefreshed) != 0 {
+		t.Errorf("repo-invisible start drove resolver %d append %d audit %d, want 0/0/0",
 			res.callCount(), rr.appendCount(), aud.count(categoryCampaignDependenciesRefreshed))
 	}
 }

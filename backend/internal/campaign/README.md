@@ -150,7 +150,7 @@ Existing members are never re-checked on append: their external edges are HELD b
 
 | Trigger | Scope | Gate | Tracker read fails | Audit row / write fails |
 |---|---|---|---|---|
-| `GET …/status` | every unstarted member | caller's account owns the campaign (or untenanted) AND repo visible; single-flight per campaign, 30 s minimum interval (process-local) | read served with a warning; the interval still starts | transaction rolls back; the response still HOLDS the observed blocker (`committed:false`, a warning naming the missing row); the next refresh retries |
+| `GET …/status` | every unstarted member | caller's account owns the campaign (or untenanted) AND repo visible; single-flight per campaign, 30 s minimum interval (process-local) | read served with a warning; the interval still starts | transaction rolls back; the response still HOLDS the observed blocker (`committed:false`, a warning naming the missing row), and so does every later status read (interval-skipped or tracker-failed) until a refresh records it (process-local, like the gate). A committed edge whose re-list fails is held on the stale list |
 | `POST …/runs` (start) | the target item only | same access predicate; not interval-gated | `502 campaign_dependency_refresh_failed`, nothing started | `503 campaign_dependency_audit_failed`, nothing written or started |
 
 A caller failing the access predicate skips the refresh entirely (zero tracker reads, zero writes) and the read or start otherwise behaves as before. `Config.CampaignDependencyRefresh` (set in `serve.go`) is the kill switch: false makes no refresh read or write.

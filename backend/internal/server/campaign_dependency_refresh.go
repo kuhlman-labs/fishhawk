@@ -142,12 +142,38 @@ type campaignDependencyRefreshGate struct {
 type campaignDependencyRefreshSlot struct {
 	inFlight     bool
 	lastFinished time.Time
+	// held is the last UNRECORDED observation (audit or write failure). Every
+	// status read until a later refresh records it still holds it, so a poll
+	// inside the interval never reports a newly blocked item eligible.
+	// Process-local, like the gate: a restart drops it and the next refresh
+	// re-observes.
+	held *heldDependencyEdges
+}
+
+// heldDependencyEdges is an observation a refresh could not record.
+type heldDependencyEdges struct {
+	observed map[uuid.UUID][]string
+	added    []dependencyRefreshAddition
+	warnings []string
+}
+
+// carryInto folds the hold into a result that observed nothing of its own (a
+// skipped poll, or a tracker read failure), so holdObservedEdges still holds
+// the blocked items and the warning still names the missing record.
+func (h *heldDependencyEdges) carryInto(res *dependencyRefreshResult) {
+	if h == nil || res == nil || len(res.observed) > 0 {
+		return
+	}
+	res.observed = h.observed
+	res.Added = h.added
+	res.Warnings = append(res.Warnings, h.warnings...)
 }
 
 // tryAcquire claims the campaign's slot without blocking. It refuses with
 // in_flight while another refresh runs, and with min_interval when the last
-// one finished less than campaignDependencyRefreshMinInterval before now.
-func (g *campaignDependencyRefreshGate) tryAcquire(id uuid.UUID, now time.Time) (bool, string) {
+// one finished less than campaignDependencyRefreshMinInterval before now; a
+// refusal returns the slot's unrecorded hold, if any.
+func (g *campaignDependencyRefreshGate) tryAcquire(id uuid.UUID, now time.Time) (bool, string, *heldDependencyEdges) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
 	if g.slots == nil {
@@ -159,25 +185,38 @@ func (g *campaignDependencyRefreshGate) tryAcquire(id uuid.UUID, now time.Time) 
 		g.slots[id] = sl
 	}
 	if sl.inFlight {
-		return false, refreshSkippedInFlight
+		return false, refreshSkippedInFlight, sl.held
 	}
 	if !sl.lastFinished.IsZero() && now.Sub(sl.lastFinished) < campaignDependencyRefreshMinInterval {
-		return false, refreshSkippedMinInterval
+		return false, refreshSkippedMinInterval, sl.held
 	}
 	sl.inFlight = true
-	return true, ""
+	return true, "", nil
 }
 
 // release stamps lastFinished on EVERY completion — success, no-op, forge
 // error or audit failure alike — so a failing tracker is retried at most once
-// per interval rather than on every poll.
-func (g *campaignDependencyRefreshGate) release(id uuid.UUID, now time.Time) {
+// per interval rather than on every poll. It also updates the hold: an
+// unrecorded observation replaces it; a refresh that read the tracker and
+// recorded everything it observed (or observed nothing new) clears it; a
+// tracker read failure, or no result at all, observed nothing and keeps it.
+// It returns the hold the slot carries afterwards.
+func (g *campaignDependencyRefreshGate) release(id uuid.UUID, now time.Time, res *dependencyRefreshResult, err error) *heldDependencyEdges {
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if sl := g.slots[id]; sl != nil {
-		sl.inFlight = false
-		sl.lastFinished = now
+	sl := g.slots[id]
+	if sl == nil {
+		return nil
 	}
+	sl.inFlight = false
+	sl.lastFinished = now
+	switch {
+	case res != nil && !res.Committed && len(res.observed) > 0:
+		sl.held = &heldDependencyEdges{observed: res.observed, added: res.Added, warnings: res.Warnings}
+	case res != nil && err == nil:
+		sl.held = nil
+	}
+	return sl.held
 }
 
 // campaignRefreshAccess reports whether the caller may drive a refresh of c:
@@ -202,21 +241,25 @@ func (s *Server) campaignRefreshAccess(ctx context.Context, c *campaign.Campaign
 
 // refreshCampaignDependenciesForStatus is the GET /status trigger: access
 // gate, then the single-flight + minimum-interval gate, then a lenient
-// refresh. It never fails the read. Returns nil when the deployment disables
-// the refresh.
-func (s *Server) refreshCampaignDependenciesForStatus(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) *dependencyRefreshResult {
+// refresh. It never fails the read. A poll the gate skips, and one whose
+// tracker read fails, still carries the last unrecorded hold. Returns nil when
+// the deployment disables the refresh.
+func (s *Server) refreshCampaignDependenciesForStatus(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) (res *dependencyRefreshResult) {
 	if !s.cfg.CampaignDependencyRefresh {
 		return nil
 	}
 	if ok, reason := s.campaignRefreshAccess(ctx, c); !ok {
 		return &dependencyRefreshResult{SkippedReason: reason}
 	}
-	ok, reason := s.campaignRefreshGate.tryAcquire(c.ID, s.nowFunc())
+	ok, reason, held := s.campaignRefreshGate.tryAcquire(c.ID, s.nowFunc())
 	if !ok {
-		return &dependencyRefreshResult{SkippedReason: reason}
+		res = &dependencyRefreshResult{SkippedReason: reason}
+		held.carryInto(res)
+		return res
 	}
-	defer func() { s.campaignRefreshGate.release(c.ID, s.nowFunc()) }()
-	res, err := s.refreshCampaignDependencies(ctx, c, items, dependencyRefreshOpts{trigger: refreshTriggerStatus})
+	var err error
+	defer func() { s.campaignRefreshGate.release(c.ID, s.nowFunc(), res, err).carryInto(res) }()
+	res, err = s.refreshCampaignDependencies(ctx, c, items, dependencyRefreshOpts{trigger: refreshTriggerStatus})
 	if err != nil {
 		s.cfg.Logger.WarnContext(ctx, "campaign dependency refresh failed on status read; serving the persisted DAG",
 			"campaign_id", c.ID.String(), "error", err.Error())
@@ -406,10 +449,10 @@ func (s *Server) applyObservedDependencies(ctx context.Context, c *campaign.Camp
 	})
 	if err != nil {
 		if errors.Is(err, campaign.ErrAppendUnrecorded) {
-			res.Warnings = append(res.Warnings, "the "+categoryCampaignDependenciesRefreshed+" audit row could not be written, so the observed blockers were NOT persisted; they are held in this response only and the next refresh retries")
+			res.Warnings = append(res.Warnings, "the "+categoryCampaignDependenciesRefreshed+" audit row could not be written, so the observed blockers were NOT persisted; they are held in every status response until a refresh records them")
 			return res, fmt.Errorf("%w: %w", errDependencyRefreshUnrecorded, err)
 		}
-		res.Warnings = append(res.Warnings, "the observed blockers could not be written; they are held in this response only and the next refresh retries")
+		res.Warnings = append(res.Warnings, "the observed blockers could not be written; they are held in every status response until a refresh records them")
 		return res, fmt.Errorf("%w: %w", errDependencyRefreshPersist, err)
 	}
 	res.Committed = true

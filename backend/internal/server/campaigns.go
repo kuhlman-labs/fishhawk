@@ -2079,12 +2079,16 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	// unstarted members and ADD newly observed edges. Gated on account
 	// ownership + repo visibility and single-flight per campaign with a 30 s
 	// minimum interval; it never fails the read. A committed change re-reads
-	// the items; an UNcommitted one (audit or write failure) is held in this
-	// response only, so a newly blocked item is never reported eligible.
+	// the items (and, if that re-read fails, holds the committed edges on the
+	// stale slice, as the start path does); an UNcommitted one (audit or write
+	// failure) is held in every status response until a refresh records it,
+	// so a newly blocked item is never reported eligible.
 	refresh := s.refreshCampaignDependenciesForStatus(r.Context(), c, items)
 	if refresh != nil && refresh.Committed && len(refresh.Added) > 0 {
 		if fresh, ferr := s.cfg.CampaignRepo.ListCampaignItemsForCampaign(r.Context(), id); ferr == nil {
 			items = fresh
+		} else {
+			items = holdObservedEdges(items, &dependencyRefreshResult{observed: refresh.observed})
 		}
 	}
 	items = holdObservedEdges(items, refresh)

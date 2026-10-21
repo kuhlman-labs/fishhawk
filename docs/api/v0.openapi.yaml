@@ -5356,9 +5356,11 @@ components:
           type: boolean
           description: |
             False when observed additions could NOT be persisted (audit row or
-            write failure). The additions are then HELD in this response's
-            `items`/`rollup`/`next_action` only, `warnings` names the cause,
-            and the next refresh retries.
+            write failure). The additions are then HELD in `items`/`rollup`/
+            `next_action` and listed under `added`, and `warnings` names the
+            cause. Every later status read (one the 30 s interval skips, or one
+            whose tracker read fails) keeps that hold and warning until a
+            refresh records the additions; the hold is process-local.
         added:
           type: array
           items:
@@ -21052,7 +21054,7 @@ paths:
         campaign (single-flight), and never fails the read: a tracker error or
         an unrecordable change is reported in `dependency_refresh.warnings`,
         and an observed blocker that could not be persisted still HOLDS its
-        item in this response.
+        item in this and every later status read until a refresh records it.
       tags: [campaigns]
       parameters:
         - { name: campaign_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
