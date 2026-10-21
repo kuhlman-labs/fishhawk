@@ -15151,6 +15151,42 @@ paths:
         approval transfer across a clean advance is not implemented, so in a
         dismiss-stale repository a rebased run needs a fresh approval before
         it is eligible.
+
+        **Merge overlap guard (E83.61 / #4119).** AFTER the conflict guard and
+        BEFORE the merge-candidate gate (so the ADR-093 enqueue arm can never
+        enqueue an overlap-blocked run), the merge is refused `409
+        overlapping_implement_in_flight` when ANOTHER non-terminal run in the
+        same repository and tenant, outside this run's lineage (self,
+        decomposition parent/child/sibling slices, a recovery pair), has an
+        implement-type stage (an implement, fix-up, conflict-resolution or
+        merge-candidate verify pass) `dispatched` or `running` whose effective
+        scope shares a path with what THIS pull request changes at its head
+        (the forge's three-dot compare `base_ref...head_sha`, rename sources
+        included). A run that is only planned or parked (`pending`,
+        `awaiting_host_dispatch`, `awaiting_approval`,
+        `awaiting_scope_decision`) or terminal does not block. It FAILS
+        CLOSED once a live implement exists elsewhere: `409
+        overlap_undetermined` when the overlap cannot be decided, `502
+        overlap_check_failed` on a read failure. With no live implement
+        elsewhere it admits without any forge read; a pull request the forge
+        reports already merged is admitted (the `already_merged` resume).
+        `allow_overlap: true` with a non-empty `overlap_reason` overrides any
+        of those refusals: the merge proceeds and a chained
+        `merge_overlap_overridden` audit row (the overridden code and reason,
+        the blocking / undetermined runs, the head, and `overlap_reason`
+        verbatim) is appended RECORD-BEFORE-COMMIT — before the
+        `merge_queue_entered` row on the enqueue path and before the
+        `merge_verdict_recorded` append otherwise, so on a FIRST POST the
+        override row precedes the verdict row; on a resume the verdict row
+        already exists. An identical judgement (same code, reason, head,
+        blocking/undetermined run and stage ids, and `overlap_reason`) is
+        deduped, so a re-POST writes no second row. A failed record is `503
+        overlap_override_unrecorded` with nothing merged or enqueued. The row
+        names other runs, so it is withheld from run-bound subjects, like
+        `plan_scope_overlap`. Residuals: the delegated `may_merge` arm of the
+        auto-driver is not guarded, and the guard reads the state at POST
+        time (a push or dispatch between the read and the forge merge is not
+        caught).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -15158,7 +15194,8 @@ paths:
         required: true
         description: |
           Carries the operator's merge verdict. `verdict` is required — the
-          merge is an audited operator declaration.
+          merge is an audited operator declaration. `allow_overlap` and
+          `overlap_reason` override the merge overlap guard (#4119).
         content:
           application/json:
             schema:
@@ -15171,6 +15208,24 @@ paths:
                   description: |
                     Operator merge verdict prose. Recorded verbatim on the
                     `merge_verdict_recorded` audit entry.
+                allow_overlap:
+                  type: boolean
+                  description: |
+                    Override a refusing merge overlap guard
+                    (`overlapping_implement_in_flight`,
+                    `overlap_undetermined` or `overlap_check_failed`). Requires
+                    a non-empty `overlap_reason`. The override is recorded as a
+                    `merge_overlap_overridden` audit row before any verdict or
+                    merge intent; when the guard admits, nothing is recorded.
+                overlap_reason:
+                  type: string
+                  maxLength: 2000
+                  description: |
+                    Required non-empty (after trimming whitespace) when
+                    `allow_overlap` is true; at most 2000 bytes, checked
+                    whether or not `allow_overlap` is set. Recorded VERBATIM
+                    (untrimmed) on the `merge_overlap_overridden` row, as data
+                    only.
       responses:
         '200':
           description: |
@@ -15223,7 +15278,12 @@ paths:
                   message: { type: string, description: 'Where the run stands and the next step; names the gate code that triggered the enqueue.' }
         '400':
           description: |
-            Malformed body or an empty `verdict`. Body's `error` is
+            Malformed body, an empty `verdict`, or an invalid merge overlap
+            override: `allow_overlap: true` with an empty or whitespace-only
+            `overlap_reason`, or an `overlap_reason` over 2000 bytes
+            (`details.field: "overlap_reason"`; the cap adds
+            `details.max_bytes: 2000`). Checked before the run is read, so
+            nothing is read or recorded. Body's `error` is
             `validation_failed`.
           content:
             application/json:
@@ -15242,7 +15302,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            One of seven cases. (1) The run cannot be merged: no PR url or a
+            One of twelve cases. (1) The run cannot be merged: no PR url or a
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
@@ -15389,6 +15449,29 @@ paths:
             `acceptance_not_eligible`, `acceptance_stale`, `checks_not_green`,
             `checks_red`, `blocking_concern_open`, `undeterminable` (a read
             failed: fail closed) — and nothing is written.
+            (12) The merge overlap guard (#4119) refused, checked after case
+            (4) and before case (7a), with NO new verdict row, nothing
+            dispatched or enqueued. `overlapping_implement_in_flight`:
+            another live run's implement-type stage scopes a path this pull
+            request changes. `overlap_undetermined`: the guard could not rule
+            that out and fails closed; `details.reason` is
+            `changed_files_capped` (the forge's compare was truncated — the
+            300-file cap or an omitted patch body), `rename_source_unknown`
+            (a renamed file with no source path), `run_list_truncated` (a
+            live-run listing hit its 200-row cap), `changed_paths_unavailable`
+            (no GitHub client or installation, an unparseable repo, or no PR
+            number; every GitLab-family run lands here) or `scope_unresolved`
+            (a live run's effective scope did not resolve). `details` carry
+            `{run_id, pr_url, blocking[], undetermined[], head_sha}` (each
+            entry `{run_id, issue_ref, decomposed_from, stage_id, stage_type,
+            stage_state, paths[]}`, `paths` empty for an undetermined run;
+            `head_sha` omitted when the changed paths were never read), plus
+            `reason` on `overlap_undetermined` and, on
+            `overlapping_implement_in_flight`, `next_step:
+            "fishhawk_await_stage"` with `blocking_run_id` and `stage_id` (the
+            first blocker, sorted by `issue_ref` then `run_id`). Wait for the
+            stage to settle and re-invoke, or re-POST with `allow_overlap` and
+            an `overlap_reason`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15404,7 +15487,16 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '502':
           description: |
-            One of two cases.
+            One of three cases.
+
+            `overlap_check_failed` (#4119): the merge overlap guard could not
+            list the repository's live runs, read a live run's stages, or read
+            the pull request or its compare from the forge, so it refused
+            (fail closed). Nothing was recorded and nothing was dispatched; the
+            call is retryable, or `allow_overlap` with an `overlap_reason`
+            overrides it. `details` carry `{run_id, pr_url, reason, retryable:
+            true}` where `reason` is `run_list`, `stage_read` or `forge_read`;
+            the raw cause stays in the operator log.
 
             `merge_candidate_check_failed` (ADR-090 D7): on a fully wired
             GitHub run the merge-candidate gate could not read the live pull
@@ -15445,7 +15537,11 @@ paths:
             queued, or the per-run merge-intent lock lapsed before the
             decision finished, so the answer cannot vouch for the queue state
             (the run may be queued; a re-invoke answers `already_queued`).
-            Re-invoke the merge to retry.
+            Re-invoke the merge to retry. `overlap_override_unrecorded`
+            (#4119, `details.retryable: true`): the `merge_overlap_overridden`
+            row could not be read for dedupe or appended, so nothing was
+            merged or enqueued and no new verdict was recorded (record before
+            commit); re-invoke to retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -17823,7 +17919,11 @@ paths:
         E83.60 / #4118. Which OTHER non-terminal runs in the same repository
         and tenant share files with this run's effective scope — the
         merge-order signal for overlapping in-flight work. Advisory and
-        read-only: nothing refuses on it. Recomputed on every read; the
+        read-only: this endpoint refuses nothing. The one refusing consumer
+        of the same computation is the merge overlap guard on
+        `POST /v0/runs/{run_id}/merge` (#4119), which judges only runs whose
+        implement stage is live against the pull request's actual changed
+        paths. Recomputed on every read; the
         `plan_scope_overlap` audit row records what the plan saw when it
         settled.
 
