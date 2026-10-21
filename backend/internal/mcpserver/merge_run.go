@@ -175,7 +175,7 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued, fishhawk_get_merge_queue (watch the base's line); on overlapping_implement_in_flight, fishhawk_await_stage on the blocking run's stage; on overlap_undetermined, fishhawk_merge_run with allow_overlap (an audited override)"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued and merge_queue_owns_merge, fishhawk_get_merge_queue (watch the base's line); on overlapping_implement_in_flight, fishhawk_await_stage on the blocking run's stage; on overlap_undetermined, fishhawk_merge_run with allow_overlap (an audited override)"`
 	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness / merge-overlap statuses"`
 	// QueuePosition / AnchoredHeadSHA / LiveRunID ride status
 	// merge_candidate_held (ADR-092 / #4200), from the 409's details, and
@@ -195,7 +195,7 @@ type MergeRunOutput struct {
 	// details.merge_queue_ineligible, the eligibility reason codes that kept
 	// the run OUT of the merge queue. Absent when the endpoint did not
 	// evaluate eligibility (no queue wired, or an older backend).
-	MergeQueueIneligible []string `json:"merge_queue_ineligible,omitempty" jsonschema:"on behind_base / merge_candidate_unverified / merge_candidate_held: why the run was NOT enqueued (not_approved, review_pending, review_coverage_incomplete, acceptance_not_eligible, acceptance_stale, checks_not_green, checks_red, blocking_concern_open, undeterminable); nothing was written. Clear each, then re-invoke"`
+	MergeQueueIneligible []string `json:"merge_queue_ineligible,omitempty" jsonschema:"on behind_base / merge_candidate_unverified / merge_candidate_held: why the run was NOT enqueued (not_approved, changes_requested, review_pending, review_coverage_incomplete, acceptance_not_eligible, acceptance_stale, checks_not_green, checks_red, blocking_concern_open, undeterminable); nothing was written. Clear each, then re-invoke"`
 	// Note restates the split-identity contract: the PR-approval review stays a
 	// gh step under the operator's OWN GitHub identity (option a, App-identity
 	// approval deferred to E39). Queueing the merge before that approval is
@@ -376,11 +376,24 @@ Statuses:
                      already_queued:true means the entry already carried merge
                      intent and nothing was written. Admission is automatic:
                      the queue advances the branch, re-anchors and starts its
-                     pass. next_action names fishhawk_get_merge_queue; re-invoke
-                     fishhawk_merge_run once the pass is green. An INELIGIBLE
+                     pass. next_action names fishhawk_get_merge_queue. With a
+                     head-pinned merge seam bound (ADR-093 D3) your merge
+                     intent persists until the entry settles: the queue
+                     merges the run pinned to the verified head on its green
+                     pass, so you do NOT re-invoke fishhawk_merge_run (a
+                     re-invoke answers merge_queue_owns_merge); without one,
+                     re-invoke once the pass is green. An INELIGIBLE
                      run keeps the behind_base / merge_candidate_unverified /
                      merge_candidate_held status and nothing is written;
                      merge_queue_ineligible names the reason codes.
+  - "merge_queue_owns_merge" — ADR-093 D2/D3 (E87.5 / #4296): the run has
+                     an active merge-queue entry (live or held, any phase)
+                     carrying your merge intent and a head-pinned merge seam
+                     is bound, so the QUEUE owns the merge and merges it
+                     pinned to the verified head on its green pass.
+                     Immediate: nothing recorded, nothing merged. next_action
+                     names fishhawk_get_merge_queue. A PR that already merged
+                     answers merged instead.
   - "overlapping_implement_in_flight" — the merge overlap guard (#4119):
                      ANOTHER live run in this repository (outside this run's
                      lineage) has its implement stage dispatched or running,
@@ -448,6 +461,16 @@ Tool errors:
     (503 — ADR-093 slice 1: the merge intent could not be recorded on the
     audit chain, or the queue could not be written after it was; the run is
     NOT queued and the call is retryable; re-invoke),
+    merge_queue_unreadable / merge_lock_unavailable (503 — ADR-093
+    slice 2: the queue's ownership of the merge could not be read, or the
+    run's merge-intent lock could not be taken within its bound; nothing was
+    recorded and the call is retryable; re-invoke),
+    merge_already_dispatched (409 — ADR-093 approval condition D1: the run's
+    ONE merge dispatch is already claimed by the queue, the delegated arm or
+    an earlier inline dispatch, so the forge was not called; a dispatched
+    merge settles through the forge, a dispatch_failed claim needs the
+    operator re-arm), merge_dispatch_unclaimed (503 — the dispatch claim
+    could not be written; nothing dispatched; retryable),
     overlap_check_failed (502 — the merge overlap guard could not read the
     forge, the live runs or a run's stages, so it refused; retryable;
     re-invoke, or override with allow_overlap), overlap_override_unrecorded
@@ -680,6 +703,47 @@ func queuedOutput(res *MergeRunResult, repo string, runID uuid.UUID, start time.
 			Precondition: "the run is in its base's merge queue with merge intent recorded (queued)",
 			Consumes:     consumesNone,
 			Reason:       "ADR-093: admission is automatic — the queue advances the branch, re-anchors and starts the merge-candidate pass when the line frees; watch the line, dispatch and await the pass once admitted on a local runner, then re-invoke fishhawk_merge_run",
+		},
+	}
+}
+
+// isQueueOwnsMerge reports whether err is the backend's 409
+// merge_queue_owns_merge (ADR-093 D2, E87.5 / #4296): the run has an active
+// merge-queue entry carrying merge intent, so the queue owns its merge and
+// the endpoint recorded nothing.
+func isQueueOwnsMerge(err error) (*apiError, bool) {
+	var ae *apiError
+	if errors.As(err, &ae) && ae.StatusCode == http.StatusConflict && ae.Code == "merge_queue_owns_merge" {
+		return ae, true
+	}
+	return nil, false
+}
+
+// queueOwnsMergeOutput builds the IMMEDIATE status=merge_queue_owns_merge
+// checkpoint. Nothing was recorded and nothing merged, so every merge flag is
+// false; NextAction names fishhawk_get_merge_queue on the run's repository.
+func queueOwnsMergeOutput(ae *apiError, repo string, runID uuid.UUID, start time.Time) MergeRunOutput {
+	prURL, _ := ae.Details["pr_url"].(string)
+	params := map[string]string{"run_id": runID.String()}
+	if repo != "" {
+		params["repo"] = repo
+	}
+	msg := ae.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "the merge queue owns this run's merge and merges it pinned to the verified head on its green pass; nothing was recorded. Watch it with fishhawk_get_merge_queue."
+	}
+	return MergeRunOutput{
+		Status:        "merge_queue_owns_merge",
+		PRURL:         prURL,
+		WaitedSeconds: time.Since(start).Seconds(),
+		Note:          mergeRunNote,
+		Message:       msg,
+		NextAction: &SuggestedAction{
+			Action:       "fishhawk_get_merge_queue",
+			Params:       params,
+			Precondition: "the run's merge-queue entry carries your merge intent (merge_queue_owns_merge)",
+			Consumes:     consumesNone,
+			Reason:       "ADR-093 D3: the queue merges the run itself, pinned to the verified head, on its green pass; watch the line instead of re-invoking fishhawk_merge_run",
 		},
 	}
 }
@@ -1333,6 +1397,12 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 		// out the budget. Checked on every POST, like the readiness arm.
 		if oae, status, refused := isMergeOverlapRefusal(merr); refused {
 			return nil, mergeOverlapOutput(oae, status, runID, start), nil
+		}
+		// ADR-093 D2/D3 (E87.5 / #4296): the merge queue owns the run's merge
+		// and merges it pinned to the verified head on its green pass; waiting
+		// here cannot change that, so return at once.
+		if qae, owned := isQueueOwnsMerge(merr); owned {
+			return nil, queueOwnsMergeOutput(qae, run.Repo, runID, start), nil
 		}
 		ae, pending := isChecksPending(merr)
 		if !pending {

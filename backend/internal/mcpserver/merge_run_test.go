@@ -2795,3 +2795,50 @@ func TestIsMergeOverlapRefusal(t *testing.T) {
 		t.Error("a non-apiError mapped")
 	}
 }
+
+// TestMergeRun_QueueOwnsMergeStatus: the backend's 409 merge_queue_owns_merge
+// (ADR-093 D2/D3, E87.5 / #4296) is an IMMEDIATE status, not a tool error:
+// nothing recorded, every merge flag false, next_action
+// fishhawk_get_merge_queue, one POST and no terminal await.
+func TestMergeRun_QueueOwnsMergeStatus(t *testing.T) {
+	runID := uuid.New()
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		repo:             "x/y",
+		stateBeforeMerge: "succeeded",
+		mergeStatuses:    []int{http.StatusConflict},
+		mergeErrBody:     `{"error":{"code":"merge_queue_owns_merge","message":"the merge queue owns this run's merge","details":{"pr_url":"https://github.com/x/y/pull/7"}}}`,
+	}
+	r := newMergeRunResolver(newMergeRunFakeBackend(t, fb))
+	start := time.Now()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — merge_queue_owns_merge must be a status, not a tool error", err)
+	}
+	if out.Status != "merge_queue_owns_merge" || out.Message != "the merge queue owns this run's merge" || out.PRURL != "https://github.com/x/y/pull/7" {
+		t.Fatalf("out = %+v, want status merge_queue_owns_merge with the backend message", out)
+	}
+	if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded || out.AlreadyMerged {
+		t.Errorf("merge flags = %+v, want all false (nothing recorded)", out)
+	}
+	na := out.NextAction
+	if na == nil || na.Action != "fishhawk_get_merge_queue" || na.Params["run_id"] != runID.String() || na.Params["repo"] != "x/y" {
+		t.Fatalf("next_action = %+v, want fishhawk_get_merge_queue", na)
+	}
+	fb.mu.Lock()
+	calls, reads := fb.mergeCalls, fb.auditReadCalls
+	fb.mu.Unlock()
+	if calls != 1 || reads != 0 {
+		t.Errorf("POSTs = %d, audit reads = %d; want 1 and 0", calls, reads)
+	}
+	if time.Since(start) > 5*time.Second {
+		t.Error("mergeRun did not return immediately")
+	}
+	// A blank message falls back to the constant.
+	if got := queueOwnsMergeOutput(&apiError{Code: "merge_queue_owns_merge"}, "", runID, start); !strings.Contains(got.Message, "fishhawk_get_merge_queue") {
+		t.Errorf("fallback message = %q", got.Message)
+	}
+	if _, owned := isQueueOwnsMerge(errors.New("plain")); owned {
+		t.Error("a non-API error classified as merge_queue_owns_merge")
+	}
+}
