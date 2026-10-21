@@ -1,0 +1,12 @@
+id: scenario:issue-4582/delegated-undetermined-parks
+statement: When the merge overlap guard answers 409 overlap_undetermined for a run whose delegation allows may_merge, the delegated arm does not merge, parks the run decision_required with a named overlap reason, and records the refusal.
+steps: 'Posture B in the sanctioned checkout: env -u FISHHAWK_TEST_PG_URL go test ./internal/server/ -count=1 -run ''TestAutoDriveRunGate_MergeOverlap_UndeterminedParks'' (named under approval condition C4; needs no forge dial). On the target: GET /v0/runs/{run}/audit?category=delegated_merge_overlap_refused.'
+assertions:
+    expected: The delegated arm does not merge, parks decision_required with a named overlap reason, and records the refusal.
+    observed_at_record: PASS. The test asserts decision_required with DecisionState overlap_undetermined, Action merge, Acted false; no merge rows; and a delegated_merge_overlap_refused row with refused_reason changed_paths_unavailable, undetermined_count 1 and blocking_count 0. The target answers 200 for the new audit category.
+origin:
+    issue: 4582
+    pr: 4596
+    run_id: e9daa2dc-99ea-4845-aaec-b27e2ad11183
+    head_sha: 64a5d52f02780956734b9200dc4290a484af3661
+    recorded_at: 2026-10-21T17:30:08Z
