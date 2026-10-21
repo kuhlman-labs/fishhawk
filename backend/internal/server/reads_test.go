@@ -2183,3 +2183,193 @@ func TestListGlobalAudit_NoRunRepo_FilteredCallerSeesNothing(t *testing.T) {
 		t.Fatalf("items = %d, want 0 (no run repo ⇒ no entry is authorizable)", len(items))
 	}
 }
+
+// scopeOverlapWithholdFixture seeds run B's audit with ONE plan_scope_overlap
+// row sequenced FIRST (so a withhold applied after pagination would cost a
+// limit=1 read its only visible row) and ONE ordinary row after it. The fake
+// returns both on every list read (ListForRun, ListForRunByCategory, ListAll
+// and, through chainReadingAudit, ChainsByParent), so only the handler-side
+// withhold or refusal can keep the overlap row from a run-bound caller.
+type scopeOverlapWithholdFixture struct {
+	s    *Server
+	runB uuid.UUID
+}
+
+const scopeOverlapWithholdMarker = "other-run-shared-path.go"
+
+func newScopeOverlapWithholdFixture(t *testing.T) scopeOverlapWithholdFixture {
+	t.Helper()
+	runB := uuid.New()
+	au := newAuditFake()
+	rid := runB
+	au.seeded = []*audit.Entry{
+		{
+			ID: uuid.New(), RunID: &rid, Sequence: 1,
+			Timestamp: time.Date(2026, 10, 20, 12, 0, 1, 0, time.UTC),
+			Category:  planScopeOverlapCategory,
+			Payload:   json.RawMessage(`{"overlaps":[{"shared_paths":["` + scopeOverlapWithholdMarker + `"]}]}`),
+		},
+		{
+			ID: uuid.New(), RunID: &rid, Sequence: 2,
+			Timestamp: time.Date(2026, 10, 20, 12, 0, 2, 0, time.UTC),
+			Category:  "plan_generated",
+			Payload:   json.RawMessage(`{}`),
+		},
+	}
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: chainReadingAudit{au}})
+	return scopeOverlapWithholdFixture{s: s, runB: runB}
+}
+
+// scopeOverlapWithholdSubjects are the run-bound subjects every withhold test
+// drives: the run's own token, another run's token, and a malformed suffix
+// (isRunBoundSubject is a prefix match, so it is withheld too).
+func scopeOverlapWithholdSubjects(runB uuid.UUID) []string {
+	return []string{"mcp:run:" + runB.String(), "mcp:run:" + uuid.NewString(), "mcp:run:malformed"}
+}
+
+func readAuditItems(t *testing.T, w *httptest.ResponseRecorder) []auditEntryResponse {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d body = %s", w.Code, w.Body.String())
+	}
+	var got struct {
+		Items []auditEntryResponse `json:"items"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return got.Items
+}
+
+func countAuditItemsInCategory(items []auditEntryResponse, category string) int {
+	n := 0
+	for _, it := range items {
+		if it.Category == category {
+			n++
+		}
+	}
+	return n
+}
+
+func (f scopeOverlapWithholdFixture) listRunAudit(query string, id Identity) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+f.runB.String()+"/audit"+query, nil)
+	req.SetPathValue("run_id", f.runB.String())
+	w := httptest.NewRecorder()
+	f.s.handleListRunAudit(w, withIdentity(req, id))
+	return w
+}
+
+func (f scopeOverlapWithholdFixture) listGlobalAudit(query string, id Identity) *httptest.ResponseRecorder {
+	req := httptest.NewRequest(http.MethodGet, "/v0/audit?run_id="+f.runB.String()+query, nil)
+	w := httptest.NewRecorder()
+	f.s.handleListGlobalAudit(w, withIdentity(req, id))
+	return w
+}
+
+// TestListRunAudit_RunBoundWithholdsScopeOverlap pins the run-bound withhold
+// on GET /v0/runs/{run_id}/audit's non-chain reads (E83.60 / #4118): a
+// run-bound subject never receives a plan_scope_overlap row, not on the
+// unfiltered read, not on a read that NAMES the category, and the withhold
+// runs before pagination. An operator sees the row on both reads.
+func TestListRunAudit_RunBoundWithholdsScopeOverlap(t *testing.T) {
+	f := newScopeOverlapWithholdFixture(t)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		id := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+		t.Run(subject, func(t *testing.T) {
+			w := f.listRunAudit("", id)
+			items := readAuditItems(t, w)
+			if n := countAuditItemsInCategory(items, planScopeOverlapCategory); n != 0 {
+				t.Fatalf("unfiltered read: %d plan_scope_overlap rows, want 0", n)
+			}
+			if n := countAuditItemsInCategory(items, "plan_generated"); n != 1 {
+				t.Fatalf("unfiltered read: %d ordinary rows, want 1", n)
+			}
+			if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+				t.Fatalf("unfiltered read leaks the overlap payload:\n%s", w.Body.String())
+			}
+
+			w = f.listRunAudit("?category="+planScopeOverlapCategory, id)
+			if items := readAuditItems(t, w); len(items) != 0 {
+				t.Fatalf("category-named read: %d items, want 0:\n%s", len(items), w.Body.String())
+			}
+
+			items = readAuditItems(t, f.listRunAudit("?limit=1", id))
+			if len(items) != 1 || items[0].Category != "plan_generated" {
+				t.Fatalf("limit=1 read = %+v, want the ordinary row (withhold before pagination)", items)
+			}
+		})
+	}
+	t.Run("operator sees the row", func(t *testing.T) {
+		op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+		if n := countAuditItemsInCategory(readAuditItems(t, f.listRunAudit("", op)), planScopeOverlapCategory); n != 1 {
+			t.Fatalf("operator unfiltered read: %d plan_scope_overlap rows, want 1", n)
+		}
+		if n := countAuditItemsInCategory(readAuditItems(t, f.listRunAudit("?category="+planScopeOverlapCategory, op)), planScopeOverlapCategory); n != 1 {
+			t.Fatalf("operator category read: %d plan_scope_overlap rows, want 1", n)
+		}
+	})
+}
+
+// TestListRunAudit_RunBoundChainRefused pins the chain=true refusal: the
+// chain read stays complete for hash verification (no withhold), so a
+// run-bound subject is refused 403 run_token_forbidden instead; an operator's
+// chain read answers 200 and carries the row.
+func TestListRunAudit_RunBoundChainRefused(t *testing.T) {
+	f := newScopeOverlapWithholdFixture(t)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		w := f.listRunAudit("?chain=true", Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}})
+		if w.Code != http.StatusForbidden || !bodyHasCode(w, "run_token_forbidden") {
+			t.Fatalf("%s: chain=true status = %d body = %s, want 403 run_token_forbidden", subject, w.Code, w.Body.String())
+		}
+		if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+			t.Fatalf("%s: refusal body leaks the overlap payload:\n%s", subject, w.Body.String())
+		}
+	}
+	op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+	items := readAuditItems(t, f.listRunAudit("?chain=true", op))
+	if n := countAuditItemsInCategory(items, planScopeOverlapCategory); n != 1 {
+		t.Fatalf("operator chain read: %d plan_scope_overlap rows, want 1 (chain stays complete)", n)
+	}
+	if len(items) != 2 {
+		t.Fatalf("operator chain read: %d items, want 2", len(items))
+	}
+}
+
+// TestListGlobalAudit_RunBoundWithholdsScopeOverlap pins the same withhold on
+// GET /v0/audit (the read behind fishhawk_get_run_status's recent_audit),
+// unfiltered and category-named; an operator sees the row.
+func TestListGlobalAudit_RunBoundWithholdsScopeOverlap(t *testing.T) {
+	f := newScopeOverlapWithholdFixture(t)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		id := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+		t.Run(subject, func(t *testing.T) {
+			w := f.listGlobalAudit("", id)
+			items := readAuditItems(t, w)
+			if n := countAuditItemsInCategory(items, planScopeOverlapCategory); n != 0 {
+				t.Fatalf("unfiltered read: %d plan_scope_overlap rows, want 0", n)
+			}
+			if n := countAuditItemsInCategory(items, "plan_generated"); n != 1 {
+				t.Fatalf("unfiltered read: %d ordinary rows, want 1", n)
+			}
+			if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+				t.Fatalf("unfiltered read leaks the overlap payload:\n%s", w.Body.String())
+			}
+			if items := readAuditItems(t, f.listGlobalAudit("&category="+planScopeOverlapCategory, id)); len(items) != 0 {
+				t.Fatalf("category-named read: %d items, want 0", len(items))
+			}
+			items = readAuditItems(t, f.listGlobalAudit("&limit=1", id))
+			if len(items) != 1 || items[0].Category != "plan_generated" {
+				t.Fatalf("limit=1 read = %+v, want the ordinary row (withhold before pagination)", items)
+			}
+		})
+	}
+	t.Run("operator sees the row", func(t *testing.T) {
+		op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+		if n := countAuditItemsInCategory(readAuditItems(t, f.listGlobalAudit("", op)), planScopeOverlapCategory); n != 1 {
+			t.Fatalf("operator unfiltered read: %d plan_scope_overlap rows, want 1", n)
+		}
+		if n := countAuditItemsInCategory(readAuditItems(t, f.listGlobalAudit("&category="+planScopeOverlapCategory, op)), planScopeOverlapCategory); n != 1 {
+			t.Fatalf("operator category read: %d plan_scope_overlap rows, want 1", n)
+		}
+	})
+}

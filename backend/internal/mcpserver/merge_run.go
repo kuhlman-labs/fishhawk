@@ -157,6 +157,11 @@ type MergeRunOutput struct {
 	// a property of the repository's branch protection, which fishhawk_doctor's
 	// merge_gate rung reports. Nothing here may assert it is required.
 	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; queueing the merge before approval is safe — GitHub fires it once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether it gates the merge depends on this repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge enforces"`
+	// ScopeOverlap is informational (E83.60 / #4118): every non-terminal run
+	// sharing files with the run being merged, from a best-effort live read
+	// made after the merge flow returns. Never refuses; nil when the read
+	// failed (a token without read:audit) or against an older backend.
+	ScopeOverlap *scopeOverlap `json:"scope_overlap,omitempty" jsonschema:"informational (#4118): every OTHER non-terminal run in the repo whose effective scope shares exact paths with the run being merged (overlaps[] with run_id, issue_ref, decomposed_from, stage, stage_state, paths). Merging while one of them is mid-implement can leave it in a category-B dead end — check it before its next stage. Never refuses the merge; absent when the read failed (a token without read:audit) or against an older backend"`
 }
 
 // mergeRunNote is the split-identity reminder surfaced on every response.
@@ -351,6 +356,11 @@ next_action fishhawk_get_run_status).
 The backend's 409 acceptance_stale / approval_dismissed (#4086) and
 review_coverage_incomplete (#4219) are likewise NOT tool errors: each is returned IMMEDIATELY under the same status name with
 next_action naming the clearing verb, instead of a timeout.
+
+Every non-error response also carries scope_overlap (#4118, informational,
+best-effort): the other non-terminal runs whose effective scope shares files
+with this run. A run there that is mid-implement may need a rebase or a re-plan
+once this merge lands. It never refuses the merge.
 `),
 	}, resolver.mergeRun)
 }
@@ -849,7 +859,25 @@ func appendAcceptanceAdvisory(msg, advisory string) string {
 // #2717) rather than surfacing it as an error whose remedy would fail, then
 // awaits the terminal merge with the remaining budget via the await_audit poll
 // idiom.
-func (r *runResolver) mergeRun(ctx context.Context, _ *mcp.CallToolRequest, in MergeRunInput) (*mcp.CallToolResult, MergeRunOutput, error) {
+func (r *runResolver) mergeRun(ctx context.Context, req *mcp.CallToolRequest, in MergeRunInput) (*mcp.CallToolResult, MergeRunOutput, error) {
+	res, out, err := r.mergeRunCore(ctx, req, in)
+	if err != nil {
+		return res, out, err
+	}
+	// Informational cross-run scope overlap (E83.60 / #4118): best-effort,
+	// read after the merge flow so it never delays or refuses the merge. The
+	// run_id already parsed inside mergeRunCore, so this parse cannot fail.
+	if runID, perr := uuid.Parse(in.RunID); perr == nil {
+		if ov, oerr := r.api.GetScopeOverlap(ctx, runID); oerr == nil {
+			out.ScopeOverlap = ov
+		}
+	}
+	return res, out, nil
+}
+
+// mergeRunCore is the merge flow proper; mergeRun wraps it with the
+// informational scope_overlap read.
+func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, in MergeRunInput) (*mcp.CallToolResult, MergeRunOutput, error) {
 	runID, err := uuid.Parse(in.RunID)
 	if err != nil {
 		return nil, MergeRunOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
