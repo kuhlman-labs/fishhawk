@@ -3773,3 +3773,228 @@ func TestGetCampaignStatusTool_PassesDependencyRefresh(t *testing.T) {
 		t.Errorf("dependency_refresh = %+v", out.DependencyRefresh)
 	}
 }
+
+// --- fishhawk_campaign_hotfix (E83.100 / #4234) ---
+
+const hotfixOKBody = `{"campaign":{"id":"%s","state":"running"},"item":{"id":"%s","issue_ref":"issue:77","depends_on":[],"state":"pending","position":-1,"expedited":true,"expedite_kind":"hotfix","workflow":"feature_change","expedite_reason":"prod outage","created_at":"2026-10-21T00:00:00Z","updated_at":"2026-10-21T00:00:00Z"},"dispatch_hold":{"hotfix_item_id":"%s","hotfix_issue_ref":"issue:77","held_at":"2026-10-21T00:00:00Z","expires_at":"2026-10-21T02:00:00Z"}}`
+
+// TestCampaignHotfixTool_RoundTrip: every input maps onto the request body,
+// and the 201 decodes into the expedited item, its negative head position, the
+// hold and a next_step naming the recorded workflow and the hold's expiry.
+func TestCampaignHotfixTool_RoundTrip(t *testing.T) {
+	id, itemID := uuid.New(), uuid.NewString()
+	srv, got, path := appendBackend(t, http.StatusCreated, fmt.Sprintf(hotfixOKBody, id, itemID, itemID))
+	r := newResolver(srv, nil)
+	_, out, err := r.campaignHotfix(context.Background(), nil, campaignHotfixInput{
+		CampaignID: id.String(), Issue: "#77", Workflow: "feature_change", Reason: "prod outage", HoldDispatch: true,
+	})
+	if err != nil {
+		t.Fatalf("campaignHotfix: %v", err)
+	}
+	if *path != "POST /v0/campaigns/"+id.String()+"/hotfix" {
+		t.Errorf("path = %q", *path)
+	}
+	want := map[string]any{"issue": "#77", "workflow": "feature_change", "reason": "prod outage", "hold_dispatch": true}
+	if len(*got) != len(want) {
+		t.Errorf("body = %v, want exactly %v", *got, want)
+	}
+	for k, v := range want {
+		if (*got)[k] != v {
+			t.Errorf("body[%s] = %v, want %v", k, (*got)[k], v)
+		}
+	}
+	it := out.Item
+	if !it.Expedited || it.ExpediteKind != "hotfix" || it.Workflow != "feature_change" || it.ExpediteReason != "prod outage" || it.Position != -1 {
+		t.Errorf("item = %+v, want the expedited fields and position -1", it)
+	}
+	if out.DispatchHold == nil || out.DispatchHold.HotfixItemID != itemID || out.DispatchHold.HotfixIssueRef != "issue:77" ||
+		!out.DispatchHold.ExpiresAt.Equal(time.Date(2026, 10, 21, 2, 0, 0, 0, time.UTC)) {
+		t.Errorf("dispatch_hold = %+v", out.DispatchHold)
+	}
+	for _, part := range []string{"fishhawk_start_campaign_item_run", "issue:77", "workflow_id feature_change", "HELD", "2026-10-21T02:00:00Z"} {
+		if !strings.Contains(out.NextStep, part) {
+			t.Errorf("next_step %q missing %q", out.NextStep, part)
+		}
+	}
+}
+
+// TestCampaignHotfixTool_OptionalsOmittedSoBackendDefaults: with only the
+// issue set, the body carries ONLY issue, so the backend applies its own
+// hotfix_change default and no hold; the unheld next_step names no hold.
+func TestCampaignHotfixTool_OptionalsOmittedSoBackendDefaults(t *testing.T) {
+	id, itemID := uuid.New(), uuid.NewString()
+	srv, got, _ := appendBackend(t, http.StatusCreated, `{"campaign":{"id":"`+id.String()+`"},"item":{"id":"`+itemID+`","issue_ref":"issue:77","depends_on":[],"state":"pending","position":-1,"expedited":true,"expedite_kind":"hotfix","workflow":"hotfix_change"}}`)
+	_, out, err := newResolver(srv, nil).campaignHotfix(context.Background(), nil, campaignHotfixInput{CampaignID: id.String(), Issue: "77"})
+	if err != nil {
+		t.Fatalf("campaignHotfix: %v", err)
+	}
+	if len(*got) != 1 || (*got)["issue"] != "77" {
+		t.Errorf("body = %v, want only issue (optionals omitted)", *got)
+	}
+	if out.DispatchHold != nil || strings.Contains(out.NextStep, "HELD") {
+		t.Errorf("unheld hotfix reported a hold: %+v / %q", out.DispatchHold, out.NextStep)
+	}
+	if !strings.Contains(out.NextStep, "workflow_id hotfix_change") {
+		t.Errorf("next_step %q does not name the recorded workflow", out.NextStep)
+	}
+}
+
+func TestCampaignHotfixTool_LocalValidation(t *testing.T) {
+	srv, _, path := appendBackend(t, http.StatusCreated, `{}`)
+	r := newResolver(srv, nil)
+	if _, _, err := r.campaignHotfix(context.Background(), nil, campaignHotfixInput{CampaignID: "nope", Issue: "1"}); err == nil || !strings.Contains(err.Error(), "not a valid UUID") {
+		t.Errorf("bad uuid err = %v", err)
+	}
+	if _, _, err := r.campaignHotfix(context.Background(), nil, campaignHotfixInput{CampaignID: uuid.NewString(), Issue: "  "}); err == nil || !strings.Contains(err.Error(), "issue is required") {
+		t.Errorf("blank issue err = %v", err)
+	}
+	if *path != "" {
+		t.Errorf("a local refusal dialed the backend: %q", *path)
+	}
+}
+
+// TestCampaignHotfixTool_RemedyPerRefusal: every refusal code maps to an
+// operator move naming the specifics from details, and the free-text reason is
+// never echoed into a remedy.
+func TestCampaignHotfixTool_RemedyPerRefusal(t *testing.T) {
+	for _, tc := range []struct {
+		status    int
+		code      string
+		details   string
+		wantParts []string
+	}{
+		{422, "workflow_not_registered", `{"requested":"hotfix_change","registered":["docs_change","feature_change"]}`, []string{"docs_change, feature_change", "needs a reason", "hotfix_change in .fishhawk/workflows.yaml"}},
+		{422, "workflow_spec_invalid", `{}`, []string{"does not parse", "fishhawk_validate"}},
+		{502, "workflow_spec_unavailable", `{}`, []string{"nothing was written"}},
+		{409, "campaign_hold_active", `{}`, []string{"one per campaign", "without hold_dispatch"}},
+		{409, "campaign_item_duplicate", `{"duplicates":["issue:77"]}`, []string{"issue:77", "cannot be re-added"}},
+		{409, "campaign_not_appendable", `{}`, []string{"terminal", "fishhawk_start_run"}},
+		{422, "campaign_item_ref_invalid", `{}`, []string{"issue:N"}},
+		{404, "campaign_not_found", `{}`, []string{"fishhawk_start_campaign"}},
+		{503, "campaign_audit_unavailable", `{}`, []string{"nothing was written"}},
+		{500, "dependency_check_failed", `{}`, []string{"dispatch hold"}},
+		{403, "run_token_forbidden", `{}`, []string{"operator token", "write:campaigns"}},
+		{403, "operator_agent_forbidden", `{}`, []string{"human operator"}},
+		{400, "validation_failed", `{"field":"reason","workflow":"feature_change"}`, []string{"non-empty reason", "hotfix_change"}},
+	} {
+		srv, _, _ := appendBackend(t, tc.status, `{"error":{"code":"`+tc.code+`","message":"m","details":`+tc.details+`}}`)
+		_, _, err := newResolver(srv, nil).campaignHotfix(context.Background(), nil, campaignHotfixInput{CampaignID: uuid.NewString(), Issue: "77", Reason: "SECRET-REASON-TEXT"})
+		if err == nil {
+			t.Fatalf("%s: err = nil", tc.code)
+		}
+		for _, want := range append([]string{tc.code}, tc.wantParts...) {
+			if !strings.Contains(err.Error(), want) {
+				t.Errorf("%s: err %q missing %q", tc.code, err.Error(), want)
+			}
+		}
+		if strings.Contains(err.Error(), "SECRET-REASON-TEXT") {
+			t.Errorf("%s: the free-text reason leaked into the error: %q", tc.code, err.Error())
+		}
+	}
+	// A validation_failed on another field, and an unmapped code, pass through
+	// with no remedy.
+	for _, body := range []string{
+		`{"error":{"code":"validation_failed","message":"issue is required","details":{"field":"issue"}}}`,
+		`{"error":{"code":"internal_error","message":"boom"}}`,
+	} {
+		srv, _, _ := appendBackend(t, 400, body)
+		_, _, err := newResolver(srv, nil).campaignHotfix(context.Background(), nil, campaignHotfixInput{CampaignID: uuid.NewString(), Issue: "77"})
+		if err == nil || !strings.HasPrefix(err.Error(), "campaign hotfix:") || strings.Contains(err.Error(), "non-empty reason") {
+			t.Errorf("unmapped err = %v, want the generic wrap with no reason remedy", err)
+		}
+	}
+}
+
+// TestGetCampaignStatusTool_PassesDispatchHoldAndExpeditedTags: the status
+// tool passes the dispatch_hold block and the expedited item tags through, and
+// an ordinary item re-emits with no expedite key at all.
+func TestGetCampaignStatusTool_PassesDispatchHoldAndExpeditedTags(t *testing.T) {
+	id, hot := uuid.New(), uuid.NewString()
+	body := `{"campaign":{"id":"` + id.String() + `","state":"running"},"items":[` +
+		`{"id":"` + hot + `","issue_ref":"issue:77","depends_on":[],"state":"pending","expedited":true,"expedite_kind":"hotfix","workflow":"hotfix_change","expedite_reason":"prod outage"},` +
+		`{"id":"` + uuid.NewString() + `","issue_ref":"issue:10","depends_on":[],"state":"pending"}],` +
+		`"rollup":{"eligible":["issue:77","issue:10"]},"next_action":{"action":"start_run","issue_ref":"issue:77"},` +
+		`"dispatch_hold":{"hotfix_item_id":"` + hot + `","hotfix_issue_ref":"issue:77","held_at":"2026-10-21T00:00:00Z","expires_at":"2026-10-21T02:00:00Z"}}`
+	srv, _, _ := appendBackend(t, http.StatusOK, body)
+	_, out, err := newResolver(srv, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus: %v", err)
+	}
+	if out.DispatchHold == nil || out.DispatchHold.HotfixItemID != hot || out.DispatchHold.HotfixIssueRef != "issue:77" {
+		t.Fatalf("dispatch_hold = %+v, want the hold passed through", out.DispatchHold)
+	}
+	if it := out.Items[0]; !it.Expedited || it.ExpediteKind != "hotfix" || it.Workflow != "hotfix_change" || it.ExpediteReason != "prod outage" {
+		t.Errorf("expedited item = %+v", it)
+	}
+	raw, err := json.Marshal(out.Items[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{`"expedited"`, `"expedite_kind"`, `"workflow"`, `"expedite_reason"`} {
+		if bytes.Contains(raw, []byte(key)) {
+			t.Errorf("ordinary item re-emits %s: %s", key, raw)
+		}
+	}
+	// Absent upstream block → absent output key.
+	srv2, _, _ := appendBackend(t, http.StatusOK, `{"campaign":{"id":"`+id.String()+`"},"items":[],"rollup":{},"next_action":{"action":"wait"}}`)
+	_, out2, err := newResolver(srv2, nil).getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+	if err != nil {
+		t.Fatalf("getCampaignStatus (unheld): %v", err)
+	}
+	if out2.DispatchHold != nil {
+		t.Errorf("unheld campaign reported dispatch_hold %+v", out2.DispatchHold)
+	}
+}
+
+// hotfixRealServerRepo is a campaign repository holding ONE running,
+// untenanted campaign with no items and no hold, so the real hotfix handler
+// gets past every campaign check to the workflow-registration gate.
+type hotfixRealServerRepo struct {
+	campaign.BaseFake
+	c *campaign.Campaign
+}
+
+func (f hotfixRealServerRepo) GetCampaign(_ context.Context, id uuid.UUID) (*campaign.Campaign, error) {
+	if id != f.c.ID {
+		return nil, campaign.ErrNotFound
+	}
+	return f.c, nil
+}
+
+func (f hotfixRealServerRepo) GetCampaignAccountID(context.Context, uuid.UUID) (string, error) {
+	return "", nil
+}
+
+// TestCampaignHotfixTool_ThroughRealServer drives the REAL MCP client against
+// the REAL server.Handler() (bearer auth, requireWriteScope, the strict
+// DisallowUnknownFields decoder). With every optional input set, the body the
+// client serializes is accepted and the handler runs through every campaign
+// check to the fail-closed workflow-registration gate, which answers 503
+// workflow_spec_unavailable because no GitHub client is wired — so a renamed or
+// extra request key (a 400) cannot pass. The two token-class refusals cross
+// the same boundary with their remedies.
+func TestCampaignHotfixTool_ThroughRealServer(t *testing.T) {
+	c := &campaign.Campaign{ID: uuid.New(), Repo: "kuhlman-labs/fishhawk", State: campaign.StateRunning, PausePolicy: campaign.PausePolicyPauseCampaign}
+	call := func(subject string) error {
+		const bearer = "fhk_hotfix_e2e"
+		tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{ID: uuid.New(), Subject: subject, Scopes: []string{"write:campaigns"}, PlainText: bearer}}
+		s := server.New(server.Config{CampaignRepo: hotfixRealServerRepo{c: c}, APITokenRepo: tokRepo})
+		httpSrv := httptest.NewServer(s.Handler())
+		t.Cleanup(httpSrv.Close)
+		r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+		_, _, err := r.campaignHotfix(context.Background(), nil, campaignHotfixInput{
+			CampaignID: c.ID.String(), Issue: "#77", Workflow: "feature_change", Reason: "prod outage", HoldDispatch: true,
+		})
+		return err
+	}
+	err := call("github:op")
+	if err == nil || !strings.Contains(err.Error(), "workflow_spec_unavailable") || !strings.Contains(err.Error(), "nothing was written") {
+		t.Errorf("operator call err = %v, want 503 workflow_spec_unavailable with its remedy (the body crossed the strict decoder)", err)
+	}
+	if err := call("mcp:run:" + uuid.NewString()); err == nil || !strings.Contains(err.Error(), "run_token_forbidden") || !strings.Contains(err.Error(), "operator token") {
+		t.Errorf("run-bound call err = %v, want run_token_forbidden with its remedy", err)
+	}
+	if err := call("operator-agent/v1"); err == nil || !strings.Contains(err.Error(), "operator_agent_forbidden") || !strings.Contains(err.Error(), "human operator") {
+		t.Errorf("operator-agent call err = %v, want operator_agent_forbidden with its remedy", err)
+	}
+}

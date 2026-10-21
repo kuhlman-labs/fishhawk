@@ -123,6 +123,15 @@ type fakeCampaignRepo struct {
 	// asserted (an unchanged tier performs ZERO writes).
 	setAutonomyErr   error
 	setAutonomyCalls int
+
+	// holds is the per-campaign dispatch-hold store (#4234) shared by the
+	// expedited AppendCampaignItems, GetDispatchHold and ReleaseDispatchHold
+	// (campaign_append_test.go). holdErr fails GetDispatchHold, releaseErr
+	// fails ReleaseDispatchHold before any write; releaseCalls counts calls.
+	holds        map[uuid.UUID]*campaign.DispatchHold
+	holdErr      error
+	releaseErr   error
+	releaseCalls int
 }
 
 func newFakeCampaignRepo() *fakeCampaignRepo {
@@ -130,6 +139,7 @@ func newFakeCampaignRepo() *fakeCampaignRepo {
 		campaigns:  map[uuid.UUID]*campaign.Campaign{},
 		itemsByCmp: map[uuid.UUID][]*campaign.Item{},
 		accounts:   map[uuid.UUID]string{},
+		holds:      map[uuid.UUID]*campaign.DispatchHold{},
 	}
 }
 
@@ -10739,5 +10749,196 @@ func TestLegacyDependencyWarnings_EveryEdgeClass(t *testing.T) {
 	}
 	if w := legacyDependencyWarnings(nativeOnly); w != nil {
 		t.Errorf("native-only warnings = %+v, want nil", w)
+	}
+}
+
+// --- campaign hotfix visibility + workflow binding (#4234) ---
+
+func expeditedItem(ref, workflow string, state campaign.ItemState) *campaign.Item {
+	it := cItem(ref, nil, state)
+	it.Expedite = &campaign.Expedite{Kind: campaign.ExpediteKindHotfix, Workflow: workflow, Reason: "sev1"}
+	return it
+}
+
+func getCampaignStatusRaw(t *testing.T, s *Server, campaignID uuid.UUID) []byte {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+campaignID.String()+"/status", nil)
+	req.SetPathValue("campaign_id", campaignID.String())
+	w := httptest.NewRecorder()
+	s.handleGetCampaignStatus(w, withAuth(req))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status code = %d, want 200 (body=%s)", w.Code, w.Body.String())
+	}
+	return w.Body.Bytes()
+}
+
+type statusWithHold struct {
+	Items        []map[string]json.RawMessage `json:"items"`
+	Rollup       campaignRollupPayload        `json:"rollup"`
+	DispatchHold *dispatchHoldPayload         `json:"dispatch_hold"`
+}
+
+// Expedited fields ride only the expedited item: an ordinary item carries no
+// expedited key at all (raw bytes), and a settled expedited item counts in
+// done like any other (Q4).
+func TestCampaignStatus_ExpeditedFieldsOnlyOnExpeditedItem(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	hot := expeditedItem("issue:42", "feature_change", campaign.ItemStateSucceeded)
+	hot.Position = -1
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{hot, cItem("issue:10", nil, campaign.ItemStatePending)})
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: repo})
+	raw := getCampaignStatusRaw(t, s, c.ID)
+	var st statusWithHold
+	if err := json.Unmarshal(raw, &st); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if len(st.Items) != 2 {
+		t.Fatalf("items = %d", len(st.Items))
+	}
+	if string(st.Items[0]["expedited"]) != "true" || string(st.Items[0]["workflow"]) != `"feature_change"` ||
+		string(st.Items[0]["expedite_kind"]) != `"hotfix"` || string(st.Items[0]["expedite_reason"]) != `"sev1"` {
+		t.Errorf("expedited item = %v", st.Items[0])
+	}
+	for _, k := range []string{"expedited", "expedite_kind", "workflow", "expedite_reason"} {
+		if _, ok := st.Items[1][k]; ok {
+			t.Errorf("ordinary item carries %q: %s", k, raw)
+		}
+	}
+	if !containsRef(st.Rollup.Done, "issue:42") {
+		t.Errorf("rollup done = %v, want the settled expedited item counted", st.Rollup.Done)
+	}
+	if st.DispatchHold != nil || strings.Contains(string(raw), `"dispatch_hold"`) {
+		t.Errorf("dispatch_hold present with no hold: %s", raw)
+	}
+}
+
+// The status read reports an active hold, then lazily releases it once due
+// (trigger=status_read, system actor) and drops the block.
+func TestCampaignStatus_DispatchHoldBlockThenLazyRelease(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	hot := expeditedItem("issue:42", "hotfix_change", campaign.ItemStateRunning)
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{hot})
+	held := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	repo.holds[c.ID] = &campaign.DispatchHold{CampaignID: c.ID, HotfixItemID: hot.ID, HeldAt: held, ExpiresAt: held.Add(campaign.MaxDispatchHold)}
+	aud := &campaignAuditRecorder{}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: repo, AuditRepo: aud})
+	s.nowFunc = func() time.Time { return held.Add(time.Minute) }
+	var st statusWithHold
+	if err := json.Unmarshal(getCampaignStatusRaw(t, s, c.ID), &st); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if st.DispatchHold == nil || st.DispatchHold.HotfixItemID != hot.ID || st.DispatchHold.HotfixIssueRef != "issue:42" ||
+		!st.DispatchHold.ExpiresAt.Equal(held.Add(campaign.MaxDispatchHold)) {
+		t.Fatalf("dispatch_hold = %+v", st.DispatchHold)
+	}
+	s.nowFunc = func() time.Time { return held.Add(campaign.MaxDispatchHold) }
+	raw := getCampaignStatusRaw(t, s, c.ID)
+	if strings.Contains(string(raw), `"dispatch_hold"`) {
+		t.Fatalf("dispatch_hold still present after expiry: %s", raw)
+	}
+	if repo.holds[c.ID] != nil {
+		t.Errorf("hold row survived the lazy release")
+	}
+	if n := aud.count(categoryCampaignHoldReleased); n != 1 {
+		t.Fatalf("campaign_hold_released rows = %d, want 1", n)
+	}
+	for _, e := range aud.entries {
+		if e.Category != categoryCampaignHoldReleased {
+			continue
+		}
+		var p map[string]any
+		_ = json.Unmarshal(e.Payload, &p)
+		if p["trigger"] != holdReleaseTriggerStatusRead || p["reason"] != campaign.HoldReleasedTimeout {
+			t.Errorf("payload = %v", p)
+		}
+		if e.ActorKind == nil || *e.ActorKind != audit.ActorSystem {
+			t.Errorf("actor kind = %v, want system", e.ActorKind)
+		}
+	}
+}
+
+// C7: a status read by a caller WITHOUT campaignRefreshAccess (a foreign
+// account) never triggers a release, even past expiry; it still reports the
+// hold.
+func TestCampaignStatus_NoHoldReleaseWithoutRefreshAccess(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	hot := expeditedItem("issue:42", "hotfix_change", campaign.ItemStateSucceeded)
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{hot})
+	repo.accounts[c.ID] = uuid.NewString()
+	held := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	repo.holds[c.ID] = &campaign.DispatchHold{CampaignID: c.ID, HotfixItemID: hot.ID, HeldAt: held, ExpiresAt: held.Add(campaign.MaxDispatchHold)}
+	aud := &campaignAuditRecorder{}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: repo, AuditRepo: aud})
+	s.nowFunc = func() time.Time { return held.Add(3 * time.Hour) }
+	var st statusWithHold
+	if err := json.Unmarshal(getCampaignStatusRaw(t, s, c.ID), &st); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if repo.releaseCalls != 0 || repo.holds[c.ID] == nil {
+		t.Errorf("release calls = %d, hold = %+v; want no release", repo.releaseCalls, repo.holds[c.ID])
+	}
+	if n := aud.count(categoryCampaignHoldReleased); n != 0 {
+		t.Errorf("campaign_hold_released rows = %d, want 0", n)
+	}
+	if st.DispatchHold == nil {
+		t.Errorf("dispatch_hold missing for a foreign reader")
+	}
+	// A read error on that path omits the block and the read still succeeds.
+	repo.holdErr = errInjected
+	if raw := getCampaignStatusRaw(t, s, c.ID); strings.Contains(string(raw), `"dispatch_hold"`) {
+		t.Errorf("dispatch_hold present on a read error: %s", raw)
+	}
+}
+
+// A failed lazy release never fails the read: the still-active hold is
+// reported.
+func TestCampaignStatus_HoldReleaseFailureStillServesRead(t *testing.T) {
+	repo := newFakeCampaignRepo()
+	hot := expeditedItem("issue:42", "hotfix_change", campaign.ItemStateSucceeded)
+	c := repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{hot})
+	held := time.Date(2026, 10, 21, 12, 0, 0, 0, time.UTC)
+	repo.holds[c.ID] = &campaign.DispatchHold{CampaignID: c.ID, HotfixItemID: hot.ID, HeldAt: held, ExpiresAt: held.Add(campaign.MaxDispatchHold)}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: repo, AuditRepo: failingAuditRepo{}})
+	s.nowFunc = func() time.Time { return held.Add(time.Minute) }
+	var st statusWithHold
+	if err := json.Unmarshal(getCampaignStatusRaw(t, s, c.ID), &st); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if st.DispatchHold == nil || repo.holds[c.ID] == nil {
+		t.Errorf("hold = %+v / %+v, want it reported and kept", st.DispatchHold, repo.holds[c.ID])
+	}
+}
+
+// C14: an expedited item started under a different workflow is refused
+// before any mutation, and no run is minted; the recorded workflow mints.
+func TestStartCampaignItemRun_ExpeditedWorkflowMismatch(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{expeditedItem("issue:42", "hotfix_change", campaign.ItemStatePending)})
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:42","workflow_id":"feature_change"}`)
+	if w.Code != http.StatusConflict || decodeCampaignError(t, w) != "campaign_item_workflow_mismatch" {
+		t.Fatalf("status = %d %s, want 409 campaign_item_workflow_mismatch", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"recorded_workflow":"hotfix_change"`) || !strings.Contains(w.Body.String(), `"got":"feature_change"`) {
+		t.Errorf("details = %s", w.Body.String())
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	if crepo.setRunCalls != 0 {
+		t.Errorf("SetCampaignItemRun calls = %d, want 0", crepo.setRunCalls)
+	}
+}
+
+func TestStartCampaignItemRun_ExpeditedRecordedWorkflowMints(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	c := crepo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{expeditedItem("issue:42", "feature_change", campaign.ItemStatePending)})
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:42","workflow_id":"feature_change"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d %s, want 201", w.Code, w.Body.String())
+	}
+	if n := len(rrepo.runs); n != 1 {
+		t.Errorf("runs minted = %d, want 1", n)
 	}
 }

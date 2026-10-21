@@ -2973,6 +2973,47 @@ per-tool contract). Internals not covered there:
   input/output/result types are UNEXPORTED so the exported-surface baseline is unchanged.
   `fishhawk_get_campaign_status` passes the status read's `dependency_refresh` block through (the monotone refresh:
   tracker edges only ever ADDED for unstarted items; contract in `backend/internal/campaign/README.md`).
+- **`fishhawk_campaign_hotfix` (E83.100 / [#4234](https://github.com/kuhlman-labs/fishhawk/issues/4234)).**
+  `campaign_id`, `issue` (ONE ref), optional `workflow` (default `hotfix_change`), `reason` (at most 1000 bytes,
+  REQUIRED for any other workflow) and `hold_dispatch`. Thin wrapper over `POST /v0/campaigns/{id}/hotfix`
+  (`CampaignHotfix` in `client.go`; route contract: `backend/internal/server/README.md` § "Campaign hotfix verb").
+  WHEN: one urgent issue must jump a (possibly running) campaign's queue; ordinary additions stay on
+  `fishhawk_append_campaign_items`. The item lands EXPEDITED at the queue head (`position` = min(existing) - 1, so it
+  can be NEGATIVE: the dense 0-based position invariant no longer holds once a campaign has one), declares no
+  dependencies, counts in the rollup like any other item, runs under its recorded workflow, and its implement stage is
+  promoted to the head of its local concurrency group. `hold_dispatch` also HOLDS the campaign: the host-dispatch
+  marker refuses NEW implement admissions of its non-expedited items (and their decomposed children) with a plain
+  409 `campaign_dispatch_held`, which every local dispatch verb surfaces as a terminal tool error (the slot waiter
+  stops; it is not `concurrency_slot_queued`), until the hotfix item or its run is terminal, or 2 h pass. Running
+  stages continue. During an audit outage a due hold cannot be released and the marker answers 503
+  `campaign_audit_unavailable`; the unblock path is to cancel the hotfix run, and the hold releases once the audit
+  chain recovers.
+  - **Local validation** (no HTTP hop): a non-UUID `campaign_id` and a blank `issue`. The workflow and reason rules
+    are the backend's alone, so the tool never second-guesses the spec.
+  - **Body.** Exactly the four backend keys, the optionals `omitempty` so the backend applies its own default; the
+    backend refuses unknown fields, which `TestCampaignHotfixTool_ThroughRealServer` pins through the REAL
+    `server.Handler()` (the body crosses the strict decoder and reaches the fail-closed workflow-registration gate).
+  - **Output.** `{campaign, item (CampaignItem + position), dispatch_hold?, next_step}`. `next_step` names
+    `fishhawk_start_campaign_item_run` with the RECORDED `workflow_id` (another one is refused
+    `campaign_item_workflow_mismatch`) and, when held, the hold's `expires_at`.
+  - **Refusals** (`campaignHotfixRemedy`): `workflow_not_registered` renders `details.registered` plus the reason rule
+    and the `.fishhawk/workflows.yaml` registration step; `campaign_hold_active` says retry without `hold_dispatch`;
+    `campaign_item_duplicate`, `campaign_not_appendable`, `campaign_item_ref_invalid`, `campaign_not_found`,
+    `workflow_spec_invalid`, `workflow_spec_unavailable`, `campaign_audit_unavailable`, `dependency_check_failed`,
+    `run_token_forbidden`, `operator_agent_forbidden` and `validation_failed{field: reason}` each name their move.
+    The free-text `reason` is untrusted-origin text: it is returned only as the item's `expedite_reason` data and is
+    never echoed into a remedy (pinned).
+  - **Auth.** `write:campaigns` (scope table `server/mcpscopes.go`, pinned by
+    `TestMCPToolScopeTable_CampaignHotfixMirrorsHandler`). The backend refuses a run-bound (`mcp:run:*`) token and a
+    delegated operator-agent token for the WHOLE verb, not only `hold_dispatch`; the scope table has no subject-class
+    axis for the operator-agent case, so the inner REST call is that gate.
+  - **Status surface.** `CampaignItem` gains `omitempty` `expedited` / `expedite_kind` / `workflow` /
+    `expedite_reason` (an ordinary item re-emits with no such key, pinned on the marshalled bytes), and
+    `fishhawk_get_campaign_status` passes the status read's `dispatch_hold` block through. The new wire types
+    (`campaignHotfixInput`/`Output`, `campaignHotfixRequest`/`Result`/`Item`, `campaignDispatchHold`) are UNEXPORTED,
+    so the exported-surface baseline is unchanged.
+  - Pinned by `TestCampaignHotfixTool_*` and `TestGetCampaignStatusTool_PassesDispatchHoldAndExpeditedTags`
+    (`campaign_test.go`), and the tool-count bump 80 -> 81 (`tools_test.go`).
 - The campaign-scoped operator procedure lives in the operator role spec's `conventions.campaign`
   (`docs/spec/operator-role.md`), not hard-coded here.
 - **Batch-as-campaign local drive.** The step-by-step operator procedure for driving a multi-issue batch

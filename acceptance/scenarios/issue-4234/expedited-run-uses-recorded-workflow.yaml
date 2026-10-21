@@ -1,0 +1,14 @@
+id: scenario:issue-4234/expedited-run-uses-recorded-workflow
+statement: Starting an expedited item with a workflow_id other than its recorded workflow answers 409 campaign_item_workflow_mismatch naming the recorded workflow, and no run is minted.
+verify_hint: 'HTTP: POST /v0/campaigns/{id}/runs for the expedited item with a different workflow_id; observe 409 campaign_item_workflow_mismatch with details.recorded_workflow. Decided in-suite by TestStartCampaignItemRun_ExpeditedWorkflowMismatch.'
+steps: 'Posture B: in the sanctioned checkout /tmp/fishhawk-acceptance-tree-0dfcf217-.../backend ran env -u FISHHAWK_TEST_PG_URL go test ./internal/server/ -count=1 -run ''^TestStartCampaignItemRun_ExpeditedWorkflowMismatch$'' (with the other hermetic hotfix tests). The running target could not be driven (no write:campaigns token, no campaign).'
+assertions:
+    expected: 409 campaign_item_workflow_mismatch naming recorded_workflow, and no run minted.
+    observed_at_record: '--- PASS: TestStartCampaignItemRun_ExpeditedWorkflowMismatch (log sha256:3a6439c1...).'
+    repro_handle: cd backend && go test ./internal/server/ -run '^TestStartCampaignItemRun_ExpeditedWorkflowMismatch$'
+origin:
+    issue: 4234
+    pr: 0
+    run_id: 0dfcf217-4682-4e6e-8ab6-a63182e1d812
+    head_sha: 49b3367e559f80bda0948947c073a8007c0aa400
+    recorded_at: 2026-10-21T08:55:05Z
