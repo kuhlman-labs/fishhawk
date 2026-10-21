@@ -893,6 +893,9 @@
         "ADR-092"
       ],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-109"
+      ],
       "applies_to": []
     },
     {
@@ -1048,6 +1051,18 @@
       "applies_to": [
         "backend/internal/pglock/**"
       ]
+    },
+    {
+      "id": "ADR-109",
+      "title": "Amend ADR-093 D1: the merge queue owns the merge — one database-enforced per-run dispatch ledger across inline, delegated and queue merges, plus the admission-epoch CAS protocol",
+      "path": "docs/adr/109-merge-queue-owns-the-merge.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-093"
+      ],
+      "applies_to": []
     }
   ]
 }

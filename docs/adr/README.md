@@ -292,6 +292,10 @@ Amendments recorded under the upkeep rule since:
   status: an amendment does not change the amended record's status.
 - ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
   it"); ADR-025 `amended_by: [ADR-107]`.
+- ADR-109: `amends: [ADR-093]` ("It amends ADR-093"; "ADR-093 D1 says an
+  up-to-date PR with a valid pass "may merge inline, as today". This amendment
+  narrows that."); ADR-093 keeps `supersedes: [ADR-090, ADR-092]` and gains
+  `amended_by: [ADR-109]`. ADR-109 states no supersession of ADR-093.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 
 Decision-record selection (`backend/internal/decisionrecord`) follows
@@ -448,6 +452,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-106](106-run-bound-subject-filtered-audit-read.md) | Run-bound agent tokens get a subject-filtered audit read: how cross-run audit categories are withheld | `accepted` | [#4575](https://github.com/kuhlman-labs/fishhawk/issues/4575) |
 | [ADR-107](107-split-stage-timeout-agent-and-gate-budgets.md) | Amend ADR-025: split the stage timeout into an agent budget and a project-derived verify-gate budget | `accepted` | [#4581](https://github.com/kuhlman-labs/fishhawk/issues/4581) |
 | [ADR-108](108-shared-postgres-lock-holder-budget.md) | Shared Postgres lock-holder budget: one pool-wide pglock budget with reserved headroom and enforced no-nesting for every connection-holding advisory-lock helper | `accepted` | [#4594](https://github.com/kuhlman-labs/fishhawk/issues/4594) |
+| [ADR-109](109-merge-queue-owns-the-merge.md) | Amend ADR-093 D1: the merge queue owns the merge — one database-enforced per-run dispatch ledger across inline, delegated and queue merges, plus the admission-epoch CAS protocol | `accepted` | [#4601](https://github.com/kuhlman-labs/fishhawk/issues/4601) |
 
 ## Status unknown — needs captain confirmation
 

@@ -63,8 +63,10 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-024": {nil, nil, nil, []string{"ADR-104"}},
 	"ADR-025": {nil, nil, nil, []string{"ADR-107"}},
 	"ADR-085": {nil, nil, nil, []string{"ADR-101"}},
+	"ADR-093": {[]string{"ADR-090", "ADR-092"}, nil, nil, []string{"ADR-109"}},
 	"ADR-104": {nil, nil, []string{"ADR-022", "ADR-024"}, nil},
 	"ADR-107": {nil, nil, []string{"ADR-025"}, nil},
+	"ADR-109": {nil, nil, []string{"ADR-093"}, nil},
 }
 
 // TestShippedIndex_EncodesAmendments pins the exact four link lists of every
