@@ -3956,6 +3956,24 @@ type MergeRunResult struct {
 	MergeObservationRecorded bool   `json:"merge_observation_recorded"`
 	RunState                 string `json:"run_state"`
 	Message                  string `json:"message"`
+
+	// The ADR-093 slice 1 (E87.4 / #4295) 202 queued answer: the run is
+	// merge-queue eligible and the endpoint ENQUEUED it (or marked merge
+	// intent on its existing entry) instead of refusing it as behind,
+	// unverified or held. MergeQueued stays false on it and no
+	// merge_verdict_recorded row was written. The json tags byte-match the
+	// backend's mergeRunResponse (backend/internal/server/merge_run.go); every
+	// field is omitted on the 200 paths, so an older backend decodes to the
+	// zero values.
+	Queued          bool   `json:"queued"`
+	QueueState      string `json:"queue_state"`
+	QueuePosition   int    `json:"queue_position"`
+	LiveRunID       string `json:"live_run_id"`
+	EntryID         string `json:"entry_id"`
+	BaseRef         string `json:"base_ref"`
+	AnchoredHeadSHA string `json:"anchored_head_sha"`
+	IntentSequence  int64  `json:"intent_sequence"`
+	AlreadyQueued   bool   `json:"already_queued"`
 }
 
 // MergeRun records the operator merge verdict and queues the squash merge
@@ -3987,6 +4005,12 @@ type MergeRunResult struct {
 //     already_merged:true instead; details carry forge_merge_state and the
 //     message names record-merge-observation then reconcile-merge)
 //   - 503 merge_unconfigured (the merger seam is not wired)
+//   - 503 merge_queue_unrecorded / merge_queue_write_failed (ADR-093 slice 1:
+//     the merge-queue enqueue arm could not record the merge_queue_entered row
+//     or write the entry; retryable, re-POST)
+//
+// A 2xx other than 200 decodes the same way: the ADR-093 enqueue arm answers
+// 202 with Queued:true (E87.4 / #4295).
 func (c *apiClient) MergeRun(ctx context.Context, runID uuid.UUID, verdict string) (*MergeRunResult, error) {
 	body, err := json.Marshal(mergeRunRequest{Verdict: verdict})
 	if err != nil {
@@ -3994,6 +4018,85 @@ func (c *apiClient) MergeRun(ctx context.Context, runID uuid.UUID, verdict strin
 	}
 	var res MergeRunResult
 	if err := c.do(ctx, http.MethodPost, "/v0/runs/"+runID.String()+"/merge", body, &res); err != nil {
+		return nil, err
+	}
+	return &res, nil
+}
+
+// mergeQueueRead mirrors the backend's per-base merge-queue read body
+// (backend/internal/server/merge_queue_read.go::mergeQueueReadResponse,
+// ADR-093 slice 1 D7, E87.4 / #4295). Every json tag below MUST byte-match
+// its server twin, or the field silently decodes to its zero value; the MCP
+// → HTTP → store integration test (backend/internal/integration/mcp/
+// merge_queue_test.go) is what catches a drift.
+type mergeQueueRead struct {
+	Repo  string           `json:"repo" jsonschema:"the repository as owner/name"`
+	Bases []mergeQueueBase `json:"bases" jsonschema:"one block per base ref: the requested base_ref, or every base of the repository with an active entry in your account"`
+}
+
+// mergeQueueBase mirrors mergeQueueBaseView: one (account, repository, base
+// ref) queue.
+type mergeQueueBase struct {
+	BaseRef    string                `json:"base_ref"`
+	Entries    []mergeQueueEntry     `json:"entries" jsonschema:"the base's active entries in queue order: the live entry first, then held entries FIFO by enqueue time"`
+	HeadOfLine *mergeQueueHeadOfLine `json:"head_of_line,omitempty" jsonschema:"the base's first entry with its pull request's current head; omitted when the base has no active entry"`
+	ETABasis   mergeQueueETABasis    `json:"eta_basis" jsonschema:"what every eta_seconds on the base is derived from"`
+}
+
+// mergeQueueEntry mirrors mergeQueueEntryView: one active entry.
+type mergeQueueEntry struct {
+	RunID           string     `json:"run_id"`
+	EntryID         string     `json:"entry_id"`
+	State           string     `json:"state" jsonschema:"live (holds the line) or held (waiting)"`
+	Phase           string     `json:"phase,omitempty" jsonschema:"a live entry's progress; omitted while held"`
+	Position        int        `json:"position,omitempty" jsonschema:"the 1-based place among the base's held entries; omitted for the live entry"`
+	MergeIntent     bool       `json:"merge_intent" jsonschema:"whether fishhawk_merge_run recorded merge intent on the entry (ADR-093 D2); false for an entry the ADR-092 rebase path enqueued"`
+	MergeIntentAt   *time.Time `json:"merge_intent_at,omitempty"`
+	EnqueuedAt      time.Time  `json:"enqueued_at"`
+	AdmittedAt      *time.Time `json:"admitted_at,omitempty"`
+	AnchoredHeadSHA string     `json:"anchored_head_sha"`
+	AnchoredBaseSHA string     `json:"anchored_base_sha,omitempty"`
+	ETASeconds      *int64     `json:"eta_seconds,omitempty" jsonschema:"a held entry's estimated wait: position x the base's median line-turn time; omitted for the live entry and when the base has no merged history"`
+}
+
+// mergeQueueHeadOfLine mirrors the server's mergeQueueHeadOfLine.
+type mergeQueueHeadOfLine struct {
+	RunID                  string `json:"run_id"`
+	EntryID                string `json:"entry_id"`
+	State                  string `json:"state"`
+	Phase                  string `json:"phase,omitempty"`
+	AnchoredHeadSHA        string `json:"anchored_head_sha"`
+	CurrentHeadSHA         string `json:"current_head_sha,omitempty" jsonschema:"the pull request head read from the forge now; when it differs from anchored_head_sha the admission re-anchors before the pass"`
+	CurrentHeadUnavailable string `json:"current_head_unavailable,omitempty" jsonschema:"why current_head_sha is absent: run_read_failed, forge_unwired, pull_request_unresolvable or forge_read_failed"`
+}
+
+// mergeQueueETABasis mirrors the server's mergeQueueETABasis.
+type mergeQueueETABasis struct {
+	Samples       int    `json:"samples" jsonschema:"how many merged line turns the median read"`
+	MedianSeconds *int64 `json:"median_seconds,omitempty" jsonschema:"their median in seconds; omitted with no samples"`
+	Note          string `json:"note" jsonschema:"what eta_seconds measures: line-turn time, which includes the operator's merge step until ADR-093 slice 2's merge-on-pass lands"`
+}
+
+// GetMergeQueue reads one repository's merge queue via
+// `GET /v0/repos/{owner}/{name}/merge-queue[?base_ref=]` (ADR-093 slice 1 D7,
+// E87.4 / #4295), scoped server-side to the caller's account. An empty
+// baseRef reads every base of the repository with an active entry. 4xx/5xx
+// surfaces as *apiError:
+//   - 401 unauthenticated / 403 insufficient_scope (read:audit) /
+//     403 run_token_forbidden (a run-bound agent token) / 403 repo_forbidden
+//   - 500 internal_error (a store read failed)
+//   - 503 merge_queue_unconfigured (no merge queue wired)
+func (c *apiClient) GetMergeQueue(ctx context.Context, repo, baseRef string) (*mergeQueueRead, error) {
+	owner, name, ok := strings.Cut(repo, "/")
+	if !ok || owner == "" || name == "" || strings.Contains(name, "/") {
+		return nil, fmt.Errorf("repo must be owner/name, got %q", repo)
+	}
+	path := "/v0/repos/" + url.PathEscape(owner) + "/" + url.PathEscape(name) + "/merge-queue"
+	if baseRef != "" {
+		path += "?" + url.Values{"base_ref": {baseRef}}.Encode()
+	}
+	var res mergeQueueRead
+	if err := c.do(ctx, http.MethodGet, path, nil, &res); err != nil {
 		return nil, err
 	}
 	return &res, nil

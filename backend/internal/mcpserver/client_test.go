@@ -5025,3 +5025,121 @@ func TestRunMergeCandidateQueue_DecodesIntoRunStatus(t *testing.T) {
 		t.Errorf("merge_candidate_queue = %+v for a body without the key, want nil", out.Run.MergeCandidateQueue)
 	}
 }
+
+// TestMergeRunResult_DecodesQueuedFromRawBytes (ADR-093 slice 1, E87.4 /
+// #4295): the backend's 202 queued answer, served as the RAW bytes the server
+// writes (every zero field omitted, merge_queued absent), decodes into the
+// queued mirror fields, and a 202 is a success, not an error. The 200 body of
+// an older backend leaves every queued field zero (the additive degrade).
+// Counterfactual: a drifted json tag on any queued field decodes it to the
+// zero value → RED.
+func TestMergeRunResult_DecodesQueuedFromRawBytes(t *testing.T) {
+	runID := uuid.New()
+	serve := func(status int, body string) *MergeRunResult {
+		t.Helper()
+		ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(body))
+		}))
+		defer ts.Close()
+		res, err := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"}).MergeRun(context.Background(), runID, "ship it")
+		if err != nil {
+			t.Fatalf("MergeRun (%d): %v", status, err)
+		}
+		return res
+	}
+	res := serve(http.StatusAccepted, `{"run_id":"`+runID.String()+`","pr_url":"https://github.com/x/y/pull/7","queued":true,"queue_state":"held","queue_position":3,"live_run_id":"L","entry_id":"E","base_ref":"main","anchored_head_sha":"H","intent_sequence":17,"already_queued":true,"message":"queued"}`)
+	if !res.Queued || res.QueueState != "held" || res.QueuePosition != 3 || res.LiveRunID != "L" || res.EntryID != "E" ||
+		res.BaseRef != "main" || res.AnchoredHeadSHA != "H" || res.IntentSequence != 17 || !res.AlreadyQueued || res.Message != "queued" {
+		t.Errorf("queued decode = %+v, want every queued field from the wire", res)
+	}
+	if res.MergeQueued || res.VerdictSequence != 0 {
+		t.Errorf("queued decode = %+v, want merge_queued false and no verdict sequence", res)
+	}
+	old := serve(http.StatusOK, `{"merge_queued":true,"verdict_sequence":42,"pr_url":"https://github.com/x/y/pull/7"}`)
+	if old.Queued || old.QueueState != "" || old.QueuePosition != 0 || old.EntryID != "" || old.AlreadyQueued || old.IntentSequence != 0 {
+		t.Errorf("200 decode = %+v, want every queued field zero", old)
+	}
+}
+
+// TestRunMergeCandidateQueue_MergeIntentFromRawBytes (E87.4 / #4295): the
+// run-status mirror's merge_intent / merge_intent_at decode from the RAW bytes
+// the backend's runMergeCandidateQueuePayload writes. Absent and false are
+// both "no intent" on decode (an older backend omits the key), but the
+// mirror ALWAYS re-emits merge_intent — false is on the tool output, never
+// dropped — while merge_intent_at stays omitted without intent.
+func TestRunMergeCandidateQueue_MergeIntentFromRawBytes(t *testing.T) {
+	for _, tc := range []struct {
+		name, raw  string
+		wantIntent bool
+		wantAt     bool
+	}{
+		{"intent", `{"state":"held","position":1,"merge_intent":true,"merge_intent_at":"2026-10-21T06:00:00Z","note":"n"}`, true, true},
+		{"explicit false", `{"state":"held","position":1,"merge_intent":false,"note":"n"}`, false, false},
+		{"absent (older backend)", `{"state":"held","position":1,"note":"n"}`, false, false},
+	} {
+		var q runMergeCandidateQueue
+		if err := json.Unmarshal([]byte(tc.raw), &q); err != nil {
+			t.Fatalf("%s: decode: %v", tc.name, err)
+		}
+		if q.MergeIntent != tc.wantIntent || (q.MergeIntentAt != nil) != tc.wantAt {
+			t.Errorf("%s: merge_intent %v at %v, want %v / at present %v", tc.name, q.MergeIntent, q.MergeIntentAt, tc.wantIntent, tc.wantAt)
+		}
+		if tc.wantAt && !q.MergeIntentAt.Equal(time.Date(2026, 10, 21, 6, 0, 0, 0, time.UTC)) {
+			t.Errorf("%s: merge_intent_at = %v, want 2026-10-21T06:00:00Z", tc.name, q.MergeIntentAt)
+		}
+		out, _ := json.Marshal(q)
+		if !strings.Contains(string(out), `"merge_intent":`+strconv.FormatBool(tc.wantIntent)) {
+			t.Errorf("%s: re-encoded mirror %s does not carry merge_intent:%v", tc.name, out, tc.wantIntent)
+		}
+		if strings.Contains(string(out), "merge_intent_at") != tc.wantAt {
+			t.Errorf("%s: re-encoded mirror %s, want merge_intent_at present=%v", tc.name, out, tc.wantAt)
+		}
+	}
+}
+
+// TestGetMergeQueue_ClientPathAndRawDecode (E87.4 / #4295): GetMergeQueue
+// path-escapes owner/name and query-escapes base_ref, and the per-base read's
+// RAW bytes decode field-for-field into the mirror — eta_seconds absent (the
+// live entry) is nil, distinct from a present 0.
+func TestGetMergeQueue_ClientPathAndRawDecode(t *testing.T) {
+	var gotPath, gotQuery string
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath, gotQuery = r.URL.EscapedPath(), r.URL.RawQuery
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"repo":"x/y","bases":[{"base_ref":"release/1","entries":[` +
+			`{"run_id":"R1","entry_id":"E1","state":"live","phase":"verifying","merge_intent":true,"merge_intent_at":"2026-10-21T06:00:00Z","enqueued_at":"2026-10-21T05:00:00Z","admitted_at":"2026-10-21T06:00:01Z","anchored_head_sha":"A","anchored_base_sha":"B"},` +
+			`{"run_id":"R2","entry_id":"E2","state":"held","position":1,"merge_intent":false,"enqueued_at":"2026-10-21T05:30:00Z","anchored_head_sha":"C","eta_seconds":0}],` +
+			`"head_of_line":{"run_id":"R1","entry_id":"E1","state":"live","phase":"verifying","anchored_head_sha":"A","current_head_unavailable":"forge_read_failed"},` +
+			`"eta_basis":{"samples":1,"median_seconds":0,"note":"basis"}}]}`))
+	}))
+	defer ts.Close()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+	res, err := c.GetMergeQueue(context.Background(), "x/y", "release/1")
+	if err != nil {
+		t.Fatalf("GetMergeQueue: %v", err)
+	}
+	if gotPath != "/v0/repos/x/y/merge-queue" || gotQuery != "base_ref=release%2F1" {
+		t.Errorf("request = %s ? %s, want /v0/repos/x/y/merge-queue ? base_ref=release%%2F1", gotPath, gotQuery)
+	}
+	if res.Repo != "x/y" || len(res.Bases) != 1 || res.Bases[0].BaseRef != "release/1" || len(res.Bases[0].Entries) != 2 {
+		t.Fatalf("decode = %+v, want one release/1 base with two entries", res)
+	}
+	b := res.Bases[0]
+	live, held := b.Entries[0], b.Entries[1]
+	if live.RunID != "R1" || live.EntryID != "E1" || live.State != "live" || live.Phase != "verifying" || !live.MergeIntent ||
+		live.MergeIntentAt == nil || live.AdmittedAt == nil || live.AnchoredHeadSHA != "A" || live.AnchoredBaseSHA != "B" ||
+		live.Position != 0 || live.ETASeconds != nil || live.EnqueuedAt.IsZero() {
+		t.Errorf("live entry = %+v, want every field from the wire and no eta", live)
+	}
+	if held.State != "held" || held.Position != 1 || held.MergeIntent || held.MergeIntentAt != nil || held.ETASeconds == nil || *held.ETASeconds != 0 {
+		t.Errorf("held entry = %+v, want position 1, no intent, a PRESENT eta 0", held)
+	}
+	if b.HeadOfLine == nil || b.HeadOfLine.RunID != "R1" || b.HeadOfLine.CurrentHeadSHA != "" || b.HeadOfLine.CurrentHeadUnavailable != "forge_read_failed" {
+		t.Errorf("head_of_line = %+v, want R1 with current_head_unavailable forge_read_failed", b.HeadOfLine)
+	}
+	if b.ETABasis.Samples != 1 || b.ETABasis.MedianSeconds == nil || *b.ETABasis.MedianSeconds != 0 || b.ETABasis.Note != "basis" {
+		t.Errorf("eta_basis = %+v, want samples 1, a PRESENT median 0, note basis", b.ETABasis)
+	}
+}

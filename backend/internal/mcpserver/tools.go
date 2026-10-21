@@ -372,6 +372,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// run's PR (which cancels the run) to re-fire CI.
 	registerRetriggerCI(srv, resolver)
 	registerMergeRun(srv, resolver)
+	// ADR-093 slice 1 (E87.4 / #4295): the per-base merge-queue read that
+	// fishhawk_merge_run's status=queued names as its next_action, adjacent
+	// on purpose.
+	registerGetMergeQueue(srv, resolver)
 	registerArbitrateAcceptance(srv, resolver)
 	registerReportProductIssue(srv, resolver)
 	registerReleaseNotes(srv, resolver)
