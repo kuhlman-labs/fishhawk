@@ -38,10 +38,13 @@ func detachedPushContext(ctx context.Context) (context.Context, context.CancelFu
 // observeDefaultBranchPush routes a GitHub `push` delivery to the
 // default-branch revert observer (E82.2 / #3779). It is best-effort: it never
 // influences the 202, and the observation itself runs DETACHED on its own
-// goroutine so a slow forge never delays the delivery; ObservePush itself
-// skips a non-default-branch push with zero forge calls. A same-GUID redelivery
-// never reaches it — handleWebhook's delivery-dedup Mark rejects the GUID
-// before any routing (see the README's push-route section).
+// goroutine so a slow forge never delays the delivery. Only a push needing
+// forge work takes one of the process-wide observation slots: a cheap
+// pre-scan returns silently, before the slot is taken, for a non-default-branch
+// push or one whose commits carry no revert signal (#3990); ObservePush keeps
+// its own checks as defence in depth. A same-GUID redelivery never reaches it
+// — handleWebhook's delivery-dedup Mark rejects the GUID before any routing
+// (see the README's push-route section).
 //
 // The forge client is checked as a CONCRETE nil before it is wrapped in the
 // mergeoutcome.RevertForge interface: a nil *githubclient.Client stored in an
@@ -54,6 +57,12 @@ func (s *Server) observeDefaultBranchPush(ctx context.Context, ev webhook.Event)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge outcome: push payload undecodable; skipped",
 			slog.String("delivery_id", ev.DeliveryID), slog.String("error", err.Error()))
+		return
+	}
+	// The common push (a feature branch, or a default-branch push with no
+	// revert signal) needs no forge work: return without a log, before it can
+	// consume a slot a revert push needs.
+	if !push.IsDefaultBranchPush() || !push.HasRevertSignals() {
 		return
 	}
 	obs := &mergeoutcome.RevertObserver{
@@ -75,7 +84,9 @@ func (s *Server) observeDefaultBranchPush(ctx context.Context, ev webhook.Event)
 }
 
 // runDetachedPushObservation runs observe on its own goroutine under
-// detachedPushContext, holding one of slots for its lifetime. It never blocks:
+// detachedPushContext, holding one of slots for its lifetime; the route calls
+// it only for a push needing forge work (a default-branch push carrying a
+// revert signal). It never blocks:
 // with every slot held it logs a WARN, skips the observation and returns
 // false. A panic in observe is recovered, logged and the observation dropped —
 // the goroutine sits outside net/http's per-request recovery, so an unrecovered
