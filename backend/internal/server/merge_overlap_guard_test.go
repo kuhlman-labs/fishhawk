@@ -153,12 +153,29 @@ func (f *mergeOverlapFixture) seedOther(t *testing.T, state run.StageState, path
 	return b, f.seedImplementOn(b.ID, state)
 }
 
+// post merges as an operator holding write:approvals AND read:audit, so a
+// refusal carries the full cross-run details (#4582); postAs takes the
+// identity explicitly.
 func (f *mergeOverlapFixture) post(t *testing.T, body mergeRunRequest) *httptest.ResponseRecorder {
+	t.Helper()
+	return f.postAs(t, body, withMergeOperatorAuditReader)
+}
+
+func (f *mergeOverlapFixture) postAs(t *testing.T, body mergeRunRequest, withID func(*http.Request) *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
 	if body.Verdict == "" {
 		body.Verdict = "go"
 	}
-	return postMergeRun(t, f.s, f.a.ID, body, withMergeOperator)
+	return postMergeRun(t, f.s, f.a.ID, body, withID)
+}
+
+// withMergeOperatorAuditReader injects the operator token carrying
+// write:approvals plus read:audit — the scope that unlocks the overlap
+// refusal's cross-run details (overlapDetailsVisible).
+func withMergeOperatorAuditReader(req *http.Request) *http.Request {
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{
+		Subject: "github:ops", TokenID: "tok-op", Scopes: []string{"write:approvals", scopeGateViewRead},
+	}))
 }
 
 func overlapRows(au *auditFake, category string) []audit.ChainAppendParams {
@@ -604,6 +621,141 @@ func TestMergeRun_OverlapAdmittedOverrideRecordsNothing(t *testing.T) {
 	f.assertAdmitted(t, f.post(t, mergeRunRequest{AllowOverlap: true, OverlapReason: "safe"}))
 	if n := len(overlapRows(f.au, CategoryMergeOverlapOverridden)); n != 0 {
 		t.Fatalf("override rows = %d, want 0 (nothing was overridden)", n)
+	}
+}
+
+// TestMergeRun_OverlapOverrideOnCheckFailed: allow_overlap + overlap_reason
+// overrides a 502 overlap_check_failed (a forge read or a stage read failing)
+// and merges, recording ONE merge_overlap_overridden row naming the overridden
+// code and reason with EMPTY blocking / undetermined lists, before the verdict.
+func TestMergeRun_OverlapOverrideOnCheckFailed(t *testing.T) {
+	for name, tc := range map[string]struct {
+		reason string
+		set    func(f *mergeOverlapFixture, b *run.Run)
+	}{
+		"forge_read": {overlapReasonForgeRead, func(f *mergeOverlapFixture, _ *run.Run) { f.gh.compareStatus = http.StatusInternalServerError }},
+		"stage_read": {overlapReasonStageRead, func(f *mergeOverlapFixture, b *run.Run) { f.rr.failStagesRun, f.rr.failStagesCall = b.ID, 1 }},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMergeOverlapFixture(t)
+			b, _ := f.seedOther(t, run.StageStateRunning, "shared.go")
+			tc.set(f, b)
+			reason := "forge outage, judged safe"
+			f.assertAdmitted(t, f.post(t, mergeRunRequest{AllowOverlap: true, OverlapReason: reason}))
+			rows := overlapRows(f.au, CategoryMergeOverlapOverridden)
+			if len(rows) != 1 {
+				t.Fatalf("override rows = %d, want 1", len(rows))
+			}
+			raw := string(rows[0].Payload)
+			if !strings.Contains(raw, `"blocking":[]`) || !strings.Contains(raw, `"undetermined":[]`) {
+				t.Fatalf("override payload = %s, want empty blocking and undetermined arrays", raw)
+			}
+			p := decodeOverride(t, rows[0])
+			if p.OverriddenCode != mergeCodeOverlapCheckFailed || p.OverriddenReason != tc.reason || p.OverlapReason != reason {
+				t.Fatalf("override payload = %+v", p)
+			}
+			if oi, vi := overlapAppendIndex(f.au, CategoryMergeOverlapOverridden), overlapAppendIndex(f.au, CategoryMergeVerdictRecorded); oi < 0 || vi < 0 || oi >= vi {
+				t.Fatalf("override index %d, verdict index %d: the override must precede the verdict", oi, vi)
+			}
+		})
+	}
+}
+
+// TestMergeRun_OverlapDetailsWithheldWithoutReadAudit (#4582): a caller
+// holding write:approvals but not read:audit gets the same 409 code with
+// counts in place of other runs' ids, stages and paths. Counterfactuals (b)
+// predicate `return true` and (c) `shown = overlap` render the full details
+// → RED.
+func TestMergeRun_OverlapDetailsWithheldWithoutReadAudit(t *testing.T) {
+	for name, tc := range map[string]struct {
+		code                     string
+		blocking, undetermined   float64
+		set                      func(f *mergeOverlapFixture)
+		wantNextStep, wantReason string
+	}{
+		mergeCodeOverlappingImplement: {mergeCodeOverlappingImplement, 1, 0, func(*mergeOverlapFixture) {}, "fishhawk_await_stage", ""},
+		mergeCodeOverlapUndetermined: {mergeCodeOverlapUndetermined, 0, 1, func(f *mergeOverlapFixture) { f.a.InstallationID = nil }, "",
+			overlapReasonChangedPathsUnavailable},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMergeOverlapFixture(t)
+			b, st := f.seedOther(t, run.StageStateRunning, "shared.go")
+			tc.set(f)
+			w := f.postAs(t, mergeRunRequest{}, withMergeOperator)
+			env := f.assertRefused(t, w, http.StatusConflict, tc.code)
+			d := env.Error.Details
+			if d["blocking_count"] != tc.blocking || d["undetermined_count"] != tc.undetermined ||
+				d["details_withheld"] != true || d["required_scope"] != scopeGateViewRead {
+				t.Fatalf("details = %v", d)
+			}
+			if tc.wantNextStep != "" && d["next_step"] != tc.wantNextStep {
+				t.Errorf("next_step = %v, want %q", d["next_step"], tc.wantNextStep)
+			}
+			if tc.wantReason != "" && d["reason"] != tc.wantReason {
+				t.Errorf("reason = %v, want %q", d["reason"], tc.wantReason)
+			}
+			for _, k := range []string{"blocking", "undetermined", "blocking_run_id", "stage_id"} {
+				if _, ok := d[k]; ok {
+					t.Errorf("details carry withheld key %q: %v", k, d)
+				}
+			}
+			assertNamesNoOtherRun(t, "response body", w.Body.String(), b, st)
+		})
+	}
+}
+
+// TestMergeRun_OverlapDetailsVisibleWithReadAudit: the same blocker with
+// read:audit names B's run, stage and shared path, and is not marked withheld.
+func TestMergeRun_OverlapDetailsVisibleWithReadAudit(t *testing.T) {
+	f := newMergeOverlapFixture(t)
+	b, st := f.seedOther(t, run.StageStateRunning, "shared.go")
+	env := f.assertRefused(t, f.post(t, mergeRunRequest{}), http.StatusConflict, mergeCodeOverlappingImplement)
+	d := env.Error.Details
+	blocking, _ := d["blocking"].([]any)
+	if len(blocking) != 1 {
+		t.Fatalf("blocking = %v", d["blocking"])
+	}
+	first := blocking[0].(map[string]any)
+	if first["run_id"] != b.ID.String() || first["stage_id"] != st.ID.String() || fmt.Sprint(first["paths"]) != "[shared.go]" {
+		t.Fatalf("blocking[0] = %v", first)
+	}
+	if d["blocking_run_id"] != b.ID.String() || d["stage_id"] != st.ID.String() {
+		t.Fatalf("details = %v", d)
+	}
+	if _, ok := d["details_withheld"]; ok {
+		t.Fatalf("details_withheld present for a read:audit caller: %v", d)
+	}
+}
+
+func TestOverlapDetailsVisible(t *testing.T) {
+	for name, tc := range map[string]struct {
+		id   Identity
+		want bool
+	}{
+		"cookie_session":       {Identity{Subject: "github:ops"}, true},
+		"token_read_audit":     {Identity{Subject: "github:ops", TokenID: "t", Scopes: []string{"write:approvals", scopeGateViewRead}}, true},
+		"token_approvals_only": {Identity{Subject: "github:ops", TokenID: "t", Scopes: []string{"write:approvals"}}, false},
+		"run_bound_read_audit": {Identity{Subject: "mcp:run:" + uuid.NewString(), TokenID: "t", Scopes: []string{scopeGateViewRead}}, false},
+	} {
+		t.Run(name, func(t *testing.T) {
+			if got := overlapDetailsVisible(tc.id); got != tc.want {
+				t.Fatalf("overlapDetailsVisible(%+v) = %v, want %v", tc.id, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestMergeOverlapResult_WithheldLeavesCheckFailedAndAdmitUnchanged: the 502
+// and the admitting zero value carry no cross-run detail, so withheld returns
+// them as-is (the 5xx allow-list stays reason / retryable).
+func TestMergeOverlapResult_WithheldLeavesCheckFailedAndAdmitUnchanged(t *testing.T) {
+	failed := overlapCheckFailed(overlapReasonForgeRead, errors.New("boom"))
+	got := failed.withheld()
+	if got.Code != mergeCodeOverlapCheckFailed || got.Message != failed.Message || fmt.Sprint(got.Details) != fmt.Sprint(failed.Details) {
+		t.Fatalf("withheld 502 = %+v, want unchanged %+v", got, failed)
+	}
+	if (mergeOverlapResult{}).withheld().refused() {
+		t.Fatal("withheld zero value refuses")
 	}
 }
 

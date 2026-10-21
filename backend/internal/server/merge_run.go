@@ -158,7 +158,10 @@ type mergeRunResponse struct {
 //     records a merge_overlap_overridden row RECORD-BEFORE-COMMIT — before
 //     the merge-intent append on the enqueue path and before the verdict
 //     append otherwise; a failed record is 503 overlap_override_unrecorded
-//     with nothing merged, enqueued or newly recorded.
+//     with nothing merged, enqueued or newly recorded. The 409 body names
+//     other runs only to a caller holding read:audit (#4582); otherwise it
+//     carries counts and details_withheld. The delegated may_merge arm runs
+//     the same guard (mergeOverlapAutoDriveHold) with no override.
 //   - the merge-candidate gate (ADR-090 / E83.33 / #4018), AFTER the conflict
 //     guard and BEFORE the verdict append: 409 merge_base_behind when the PR
 //     head does not contain the base tip, 409 merge_candidate_unverified /
@@ -443,10 +446,18 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	// enqueue arm below can never enqueue an overlap-blocked run, and before
 	// any verdict append. FAILS CLOSED; see mergeOverlapGuard. An override
 	// (allow_overlap + overlap_reason) proceeds and is recorded by
-	// recordOverlapOverride at the first commit point reached.
+	// recordOverlapOverride at the first commit point reached. The 409 names
+	// other runs' ids, stages and paths only to a caller that may read
+	// cross-run overlap (#4582: read:audit, never a run-bound subject);
+	// write:approvals alone gets counts (mergeOverlapResult.withheld). The
+	// override path keeps the unredacted result for its audited row.
 	overlap := s.mergeOverlapGuard(r.Context(), runRow)
 	if overlap.refused() && !reqBody.AllowOverlap {
-		s.writeMergeOverlapRefusal(w, r, runID, prURL, overlap)
+		shown := overlap
+		if !overlapDetailsVisible(id) {
+			shown = overlap.withheld()
+		}
+		s.writeMergeOverlapRefusal(w, r, runID, prURL, shown)
 		return
 	}
 	subject := id.Subject

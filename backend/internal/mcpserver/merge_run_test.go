@@ -2715,6 +2715,66 @@ func TestMergeRun_OverlapRetryableFailuresAreToolErrors(t *testing.T) {
 	}
 }
 
+// TestMergeOverlapRefusalFrom_Counts pins the #4582 decode (approval
+// condition C2): a WITHHELD body (a token without read:audit) decodes empty
+// lists TOGETHER with details_withheld, required_scope and the server's
+// counts, so a consumer can tell "withheld" from "none"; a VISIBLE body's
+// counts are the decoded list lengths. Counterfactual: dropping the server
+// count read reports blocking_count 0 on the withheld body → RED.
+func TestMergeOverlapRefusalFrom_Counts(t *testing.T) {
+	blocker := map[string]any{"run_id": uuid.NewString(), "stage_id": uuid.NewString(), "stage_type": "implement", "stage_state": "running", "paths": []any{"a.go"}}
+	for name, tc := range map[string]struct {
+		details                map[string]any
+		blocking, undetermined int
+		lists                  int
+		withheld               bool
+		scope                  string
+	}{
+		"withheld": {details: map[string]any{"blocking_count": float64(2), "undetermined_count": float64(1), "details_withheld": true,
+			"required_scope": "read:audit", "head_sha": "H", "next_step": "fishhawk_await_stage"}, blocking: 2, undetermined: 1, withheld: true, scope: "read:audit"},
+		"visible": {details: map[string]any{"blocking": []any{blocker}, "undetermined": []any{}, "head_sha": "H"}, blocking: 1, lists: 1},
+		"withheld_none": {details: map[string]any{"blocking_count": float64(0), "undetermined_count": float64(0), "details_withheld": true,
+			"required_scope": "read:audit"}, withheld: true, scope: "read:audit"},
+		"malformed_count_falls_back": {details: map[string]any{"blocking": []any{blocker}, "blocking_count": "two", "undetermined_count": float64(-1)}, blocking: 1, lists: 1},
+	} {
+		t.Run(name, func(t *testing.T) {
+			ov := mergeOverlapRefusalFrom(tc.details)
+			if ov.BlockingCount != tc.blocking || ov.UndeterminedCount != tc.undetermined {
+				t.Fatalf("counts = %d/%d, want %d/%d", ov.BlockingCount, ov.UndeterminedCount, tc.blocking, tc.undetermined)
+			}
+			if ov.DetailsWithheld != tc.withheld || ov.RequiredScope != tc.scope {
+				t.Fatalf("details_withheld = %v required_scope = %q, want %v %q", ov.DetailsWithheld, ov.RequiredScope, tc.withheld, tc.scope)
+			}
+			if ov.Blocking == nil || ov.Undetermined == nil || len(ov.Blocking) != tc.lists || len(ov.Undetermined) != 0 {
+				t.Fatalf("lists = %+v / %+v, want non-nil with %d blocker(s)", ov.Blocking, ov.Undetermined, tc.lists)
+			}
+		})
+	}
+}
+
+// TestMergeRun_OverlapWithheldSurfacesCounts: through mergeRunCore, a withheld
+// 409 overlapping_implement_in_flight still returns IMMEDIATELY, with the
+// server's counts and details_withheld on the output and fishhawk_await_stage
+// naming no run or stage (none is known to this caller).
+func TestMergeRun_OverlapWithheldSurfacesCounts(t *testing.T) {
+	out, _, calls, reads := runOverlapRefusal(t, "overlapping_implement_in_flight", "1 live run(s) elsewhere ... withheld", map[string]any{
+		"run_id": uuid.NewString(), "pr_url": "https://github.com/x/y/pull/7", "head_sha": "H",
+		"blocking_count": 1, "undetermined_count": 0, "details_withheld": true, "required_scope": "read:audit",
+		"next_step": "fishhawk_await_stage",
+	})
+	if out.Status != "overlapping_implement_in_flight" || calls != 1 || reads != 0 {
+		t.Fatalf("status = %q POSTs = %d reads = %d, want an immediate overlapping_implement_in_flight", out.Status, calls, reads)
+	}
+	ov := out.Overlap
+	if ov == nil || ov.BlockingCount != 1 || ov.UndeterminedCount != 0 || !ov.DetailsWithheld || ov.RequiredScope != "read:audit" ||
+		ov.HeadSHA != "H" || ov.Blocking == nil || len(ov.Blocking) != 0 {
+		t.Fatalf("overlap = %+v, want the withheld counts", ov)
+	}
+	if na := out.NextAction; na == nil || na.Action != "fishhawk_await_stage" || na.Params["run_id"] != "" || na.Params["stage_id"] != "" {
+		t.Fatalf("next_action = %+v, want fishhawk_await_stage with no run or stage", out.NextAction)
+	}
+}
+
 // TestIsMergeOverlapRefusal pins the code→status table and that only a 409
 // maps.
 func TestIsMergeOverlapRefusal(t *testing.T) {

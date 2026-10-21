@@ -131,9 +131,12 @@ const mergeOverlapReasonMaxBytes = 2000
 //     changes, or the guard could not rule that out and failed closed.
 //     IMMEDIATE (no poll, no re-POST) and every merge flag is false: the
 //     guard refuses before any verdict or merge-intent append. Overlap carries
-//     the blocking / undetermined runs; NextAction names fishhawk_await_stage
-//     on the blocking stage (overlapping) or fishhawk_merge_run with
-//     allow_overlap (undetermined — an audited override). The guard's 502
+//     the blocking / undetermined counts and, only when the caller's token
+//     holds read:audit (#4582), the blocking / undetermined runs; otherwise
+//     details_withheld is set and the lists are empty. NextAction names
+//     fishhawk_await_stage on the blocking stage (overlapping; no run/stage
+//     params when withheld) or fishhawk_merge_run with allow_overlap
+//     (undetermined — an audited override). The guard's 502
 //     overlap_check_failed and 503 overlap_override_unrecorded stay TOOL
 //     ERRORS: both are retryable failures, not preconditions.
 type MergeRunOutput struct {
@@ -205,7 +208,7 @@ type MergeRunOutput struct {
 	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; queueing the merge before approval is safe — GitHub fires it once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether it gates the merge depends on this repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge enforces"`
 	// Overlap rides status overlapping_implement_in_flight / overlap_undetermined
 	// (E83.61 / #4119), decoded from the 409's details.
-	Overlap *mergeOverlapRefusal `json:"overlap,omitempty" jsonschema:"on overlapping_implement_in_flight / overlap_undetermined: the merge overlap guard's refusal — reason (overlap_undetermined: why the guard could not decide), head_sha, blocking[] (runs whose live implement stage scopes a path this pull request changes, with the shared paths) and undetermined[] (live runs the guard could not judge)"`
+	Overlap *mergeOverlapRefusal `json:"overlap,omitempty" jsonschema:"on overlapping_implement_in_flight / overlap_undetermined: the merge overlap guard's refusal — reason (overlap_undetermined: why the guard could not decide), head_sha, blocking_count / undetermined_count, and ONLY when the caller's token holds read:audit (#4582) blocking[] (runs whose live implement stage scopes a path this pull request changes, with the shared paths) and undetermined[] (live runs the guard could not judge). Without read:audit details_withheld is true, required_scope names read:audit and both lists are empty: the refusal carries counts plus next_step only"`
 	// ScopeOverlap is informational (E83.60 / #4118): every non-terminal run
 	// sharing files with the run being merged, from a best-effort live read
 	// made after the merge flow returns. Never refuses; nil when the read
@@ -386,9 +389,14 @@ Statuses:
                      under that agent (the category-B dead-end class).
                      Immediate, no new verdict row, nothing merged or queued.
                      overlap.blocking names each run, its stage and the shared
-                     paths; next_action names fishhawk_await_stage on the
-                     blocking stage — re-invoke once it settles, or pass
-                     allow_overlap with overlap_reason to merge deliberately.
+                     paths ONLY when your token holds read:audit (#4582);
+                     without it overlap carries blocking_count /
+                     undetermined_count and details_withheld:true, and
+                     next_action names fishhawk_await_stage without a run or
+                     stage. With read:audit next_action names
+                     fishhawk_await_stage on the blocking stage — re-invoke
+                     once it settles, or pass allow_overlap with
+                     overlap_reason to merge deliberately.
   - "overlap_undetermined" — the guard could not rule an overlap out while a
                      live implement exists elsewhere and FAILS CLOSED:
                      overlap.reason is changed_files_capped (the forge
@@ -396,8 +404,10 @@ Statuses:
                      run_list_truncated, changed_paths_unavailable (no GitHub
                      anchors — GitLab runs land here) or scope_unresolved (a
                      live run's scope does not resolve). Immediate, no new
-                     verdict row. next_action names fishhawk_merge_run with
-                     allow_overlap: an override is an audited operator
+                     verdict row. overlap.undetermined names the runs only
+                     with read:audit (otherwise undetermined_count and
+                     details_withheld). next_action names fishhawk_merge_run
+                     with allow_overlap: an override is an audited operator
                      judgement.
 
 Inputs:
@@ -796,12 +806,18 @@ type mergeOverlapRun struct {
 }
 
 // mergeOverlapRefusal is the tool's view of a 409 overlapping_implement_in_flight
-// / overlap_undetermined body's details.
+// / overlap_undetermined body's details. Blocking / Undetermined are populated
+// only for a caller whose token holds read:audit (#4582); the counts always
+// are.
 type mergeOverlapRefusal struct {
-	Reason       string            `json:"reason,omitempty" jsonschema:"overlap_undetermined only: changed_files_capped, rename_source_unknown, run_list_truncated, changed_paths_unavailable or scope_unresolved"`
-	HeadSHA      string            `json:"head_sha,omitempty" jsonschema:"the pull request head the guard judged (absent when the changed paths were never read)"`
-	Blocking     []mergeOverlapRun `json:"blocking" jsonschema:"runs whose live implement stage scopes a path this pull request changes"`
-	Undetermined []mergeOverlapRun `json:"undetermined" jsonschema:"live runs the guard could not judge"`
+	Reason            string            `json:"reason,omitempty" jsonschema:"overlap_undetermined only: changed_files_capped, rename_source_unknown, run_list_truncated, changed_paths_unavailable or scope_unresolved"`
+	HeadSHA           string            `json:"head_sha,omitempty" jsonschema:"the pull request head the guard judged (absent when the changed paths were never read)"`
+	BlockingCount     int               `json:"blocking_count" jsonschema:"how many live runs block the merge (always present)"`
+	UndeterminedCount int               `json:"undetermined_count" jsonschema:"how many live runs the guard could not judge (always present)"`
+	DetailsWithheld   bool              `json:"details_withheld,omitempty" jsonschema:"true when the caller's token lacks read:audit (#4582): blocking[] and undetermined[] are empty and only the counts are known"`
+	RequiredScope     string            `json:"required_scope,omitempty" jsonschema:"with details_withheld: the scope that unlocks the runs' details (read:audit)"`
+	Blocking          []mergeOverlapRun `json:"blocking" jsonschema:"runs whose live implement stage scopes a path this pull request changes; empty when details_withheld"`
+	Undetermined      []mergeOverlapRun `json:"undetermined" jsonschema:"live runs the guard could not judge; empty when details_withheld"`
 }
 
 // mergeOverlapStatuses maps the backend's merge overlap guard 409 codes
@@ -830,10 +846,14 @@ func isMergeOverlapRefusal(err error) (*apiError, string, bool) {
 // mergeOverlapRefusalFrom decodes the guard's details. DEFENSIVE: the map
 // crossed an HTTP JSON boundary, so a member that does not decode is dropped
 // rather than failing the status; blocking / undetermined are always arrays.
+// The counts come from the server's blocking_count / undetermined_count on a
+// withheld body (#4582) and from the decoded lists otherwise.
 func mergeOverlapRefusalFrom(details map[string]any) *mergeOverlapRefusal {
 	out := &mergeOverlapRefusal{}
 	out.Reason, _ = details["reason"].(string)
 	out.HeadSHA, _ = details["head_sha"].(string)
+	out.DetailsWithheld, _ = details["details_withheld"].(bool)
+	out.RequiredScope, _ = details["required_scope"].(string)
 	decode := func(key string) []mergeOverlapRun {
 		runs := []mergeOverlapRun{}
 		raw, _ := details[key].([]any)
@@ -855,6 +875,14 @@ func mergeOverlapRefusalFrom(details map[string]any) *mergeOverlapRefusal {
 	}
 	out.Blocking = decode("blocking")
 	out.Undetermined = decode("undetermined")
+	count := func(key string, decoded int) int {
+		if n, ok := details[key].(float64); ok && n >= 0 {
+			return int(n)
+		}
+		return decoded
+	}
+	out.BlockingCount = count("blocking_count", len(out.Blocking))
+	out.UndeterminedCount = count("undetermined_count", len(out.Undetermined))
 	return out
 }
 

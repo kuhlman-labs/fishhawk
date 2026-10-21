@@ -51,8 +51,9 @@ agent. Runs that are only planned or parked do not block, and neither does the
 run's own decomposition lineage. When a live implement exists elsewhere and the
 overlap cannot be decided (a truncated forge compare, a run whose scope does
 not resolve, a GitLab run whose changed paths cannot be read), the verb refuses
-409 `overlap_undetermined`; a read failure is 502 `overlap_check_failed`. The
-refusal names the blocking run and stage. To merge anyway, send
+409 `overlap_undetermined`; a read failure is 502 `overlap_check_failed`.
+To a caller holding `read:audit`, the refusal names the blocking run and
+stage; otherwise it gives counts. To merge anyway, send
 `allow_overlap: true` with an `overlap_reason`: the override is recorded on the
 audit chain as `merge_overlap_overridden` before any merge verdict, and a
 failed record refuses the merge (503 `overlap_override_unrecorded`).
