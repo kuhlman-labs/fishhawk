@@ -36,3 +36,15 @@ Implementation conditions accepted with the decision: (1) the post-publish Relea
 ## Consequences
 
 Positive: completes the SDLC loop's release arc using the product's unique asset; release notes become audit evidence themselves; per-release cost reporting falls out of existing data. Negative/risks: GH Release body updates need a releases-write App permission (inventory before enabling); evidence assembly spans refs→PRs→runs and must handle runs that bypassed the loop (human-led PRs appear with reduced evidence — render honestly, never fabricate); notes for repos with mixed loop/non-loop history will be partial by construction and must say so.
+
+
+
+## Amendment (2026-10-16)
+
+Recorded 2026-10-21 on the Captain's direction. Source: PR #4531 (Refs #3716, #1583, #1591, ADR-073). This amends the Recommendation and Decision as follows; the rest of the ADR stands.
+
+1. **The `release` workflow's deploy stage does not trigger the tag pipelines.** Option B's statement that "the existing `release` workflow's delegating deploy stage triggers the tag pipelines unchanged" no longer describes the system:
+   - Binary tags are pushed by a human. The tag-driven `*-release.yml` workflows build, sign and publish them.
+   - The `release` run anchors the E33 release record: `fishhawk release prepare` / `preview` / `cut` / `publish`, the evidence-linked notes, and the `release_cut` / `release_published` audit entries.
+   - It gates environment deploys through the delegated `deploy.yml`, which is a stub until #1418, with `allowed_environments: [staging]`.
+2. **Published GitHub Releases are immutable on this repository.** The post-publish step therefore cannot rely on replacing a published Release's assets or rewriting it after publication. The Decision's post-publish Release-body update and its `release_published` audit entry are subject to the publish-path fix tracked in #4521 (E33.7).

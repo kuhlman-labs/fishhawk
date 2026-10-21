@@ -292,6 +292,7 @@ Amendments recorded under the upkeep rule since:
   status: an amendment does not change the amended record's status.
 - ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
   it"); ADR-025 `amended_by: [ADR-107]`.
+- ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 
 Decision-record selection (`backend/internal/decisionrecord`) follows
 `amended_by` from a selected record to its amendments and ranks a
