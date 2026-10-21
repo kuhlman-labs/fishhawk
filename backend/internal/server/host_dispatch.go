@@ -117,7 +117,8 @@ type hostDispatchResponse struct {
 // campaign-linked ancestor, via DecomposedFrom / ParentRunID) is a campaign
 // item under an active hotfix hold returns 409 campaign_dispatch_held, at the
 // same point as the host memory hold below, so it commits nothing. Expedited
-// items are exempt; an unresolvable ancestry is held; a read error is 500
+// items are exempt; an unresolvable ancestry is held while any campaign
+// holds dispatches (admitted when none does); a read error is 500
 // dependency_check_failed and an unrecordable release 503
 // campaign_audit_unavailable (guardCampaignDispatchHold).
 //

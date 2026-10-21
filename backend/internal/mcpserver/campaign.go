@@ -143,7 +143,7 @@ type appendCampaignItemsOutput struct {
 type campaignHotfixInput struct {
 	CampaignID   string `json:"campaign_id" jsonschema:"the non-terminal campaign UUID to add the hotfix to (pending, running, paused or awaiting_human)"`
 	Issue        string `json:"issue" jsonschema:"the ONE urgent issue to add (N, #N or issue:N); it must not already be a campaign member"`
-	Workflow     string `json:"workflow,omitempty" jsonschema:"the workflow the item runs under; default hotfix_change. It must be declared by the repository spec on its default branch (workflow_not_registered otherwise, never a silent fallback)"`
+	Workflow     string `json:"workflow,omitempty" jsonschema:"the workflow the item runs under; default hotfix_change. A workflow id matching ^[a-z][a-z0-9_]*$, at most 100 bytes. It must be declared by the repository spec on its default branch (workflow_not_registered otherwise, never a silent fallback)"`
 	Reason       string `json:"reason,omitempty" jsonschema:"why this is a hotfix, at most 1000 bytes; REQUIRED for any workflow other than hotfix_change. Recorded on the audit chain and shown as the item's expedite_reason"`
 	HoldDispatch bool   `json:"hold_dispatch,omitempty" jsonschema:"also hold the campaign: new implement dispatches of its other (non-expedited) items are refused until the hotfix item or its run is terminal, or 2 h pass. Running stages continue. One hold per campaign"`
 }

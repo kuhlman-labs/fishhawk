@@ -32,7 +32,8 @@ import (
 // campaign item: at most this many DecomposedFrom / ParentRunID hops.
 const maxCampaignAncestorDepth = 8
 
-// Why the ancestor walk could not reach a root. Each is treated as HELD.
+// Why the ancestor walk could not reach a root. Each is treated as HELD
+// while any campaign dispatch hold is active (anyCampaignHoldActive).
 const (
 	campaignAncestryMissingParent = "missing_parent"
 	campaignAncestryCycle         = "cycle"
@@ -68,8 +69,8 @@ func runParentID(r *run.Run) *uuid.UUID {
 // decomposed child of a campaign item's run resolves to that item. A run with
 // no link and no item is not a campaign run. A missing parent, a cycle or
 // more than maxCampaignAncestorDepth hops sets unresolved, which the guard
-// treats as HELD (fail closed). A read error other than a missing parent is
-// returned.
+// treats as HELD (fail closed) while any campaign hold is active. A read
+// error other than a missing parent is returned.
 func (s *Server) resolveCampaignAncestry(ctx context.Context, runRow *run.Run) (campaignAncestry, error) {
 	cur := runRow
 	seen := map[uuid.UUID]bool{cur.ID: true}
@@ -110,7 +111,9 @@ func (s *Server) resolveCampaignAncestry(ctx context.Context, runRow *run.Run) (
 // other expedited item) is exempt, and so are its decomposed children. For
 // every other item it releases a due hold first (releaseCampaignHoldIfDue,
 // trigger host_dispatch), then refuses 409 campaign_dispatch_held while a
-// hold is still active. An unresolvable ancestry is HELD too.
+// hold is still active. An unresolvable ancestry is HELD too, but only while
+// some campaign still holds dispatches (anyCampaignHoldActive): with no
+// active hold anywhere it is admitted.
 //
 // It returns the expedited item the stage resolves to (nil when none), which
 // admitGroupedStage uses for the auto-promote, or a refusal. Read errors
@@ -133,10 +136,21 @@ func (s *Server) guardCampaignDispatchHold(ctx context.Context, runRow *run.Run,
 		return nil, readFailed(err)
 	}
 	if anc.unresolved != "" {
+		// The stage could belong to ANY campaign, so it is held only while some
+		// campaign still holds dispatches: with no active hold anywhere there
+		// is nothing to enforce, and a deep or broken lineage outside every
+		// campaign is admitted.
+		active, refusal := s.anyCampaignHoldActive(ctx, readFailed)
+		if refusal != nil {
+			return nil, refusal
+		}
+		if !active {
+			return nil, nil
+		}
 		return nil, &campaignSourceRefusal{
 			Status: http.StatusConflict,
 			Code:   "campaign_dispatch_held",
-			Message: fmt.Sprintf("the stage's campaign membership could not be resolved (%s), so its implement admission is held: a campaign dispatch hold is enforced fail-closed",
+			Message: fmt.Sprintf("the stage's campaign membership could not be resolved (%s) while a campaign dispatch hold is active, so its implement admission is held fail-closed until every hold releases",
 				anc.unresolved),
 			Details: map[string]any{"run_id": runRow.ID.String(), "stage_id": stage.ID.String(),
 				"reason": "campaign_ancestry_unresolved", "unresolved": anc.unresolved},
@@ -186,6 +200,33 @@ func (s *Server) guardCampaignDispatchHold(ctx context.Context, runRow *run.Run,
 		}
 	}
 	return expedited, nil
+}
+
+// anyCampaignHoldActive reports whether any campaign still holds dispatches,
+// releasing each due hold first (releaseCampaignHoldIfDue, trigger
+// host_dispatch) and stopping at the first one still active. It backs the
+// guard's unresolved-ancestry arm. Errors fail closed exactly like the
+// resolved arm's: a read error through readFailed, an unrecordable release
+// through holdReleaseRefusal.
+func (s *Server) anyCampaignHoldActive(ctx context.Context, readFailed func(error) *campaignSourceRefusal) (bool, *campaignSourceRefusal) {
+	holds, err := s.cfg.CampaignRepo.ListDispatchHolds(ctx)
+	if err != nil {
+		return false, readFailed(fmt.Errorf("list dispatch holds: %w", err))
+	}
+	for _, h := range holds {
+		c, err := s.cfg.CampaignRepo.GetCampaign(ctx, h.CampaignID)
+		if err != nil {
+			return false, readFailed(fmt.Errorf("read campaign %s: %w", h.CampaignID, err))
+		}
+		hold, err := s.releaseCampaignHoldIfDue(ctx, c, holdReleaseTriggerHostDispatch)
+		if err != nil {
+			return false, holdReleaseRefusal(c, hold, err)
+		}
+		if hold != nil {
+			return true, nil
+		}
+	}
+	return false, nil
 }
 
 // autoPromoteExpeditedWaiter moves a QUEUED implement stage of an expedited

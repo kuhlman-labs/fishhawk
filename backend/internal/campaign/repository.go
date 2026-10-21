@@ -460,6 +460,13 @@ type Repository interface {
 	// caller decides due-ness with HoldReleaseReason against its own clock.
 	GetDispatchHold(ctx context.Context, campaignID uuid.UUID) (*DispatchHold, error)
 
+	// ListDispatchHolds returns every campaign's dispatch hold row, across
+	// campaigns and accounts, ordered by held_at then campaign_id (#4234). It
+	// is a plain read like GetDispatchHold (a hold past its expires_at is still
+	// listed). The host-dispatch guard reads it only when a stage's campaign
+	// ancestry is unresolvable, to decide whether ANY hold could apply.
+	ListDispatchHolds(ctx context.Context) ([]*DispatchHold, error)
+
 	// ReleaseDispatchHold deletes the campaign's dispatch hold, RECORDED
 	// BEFORE COMMIT (#4234). Lock order is the package-wide one: the campaign
 	// row, then the hold row (FOR UPDATE). No hold, or a hold naming a

@@ -33,6 +33,7 @@ import (
 type holdCampaignRepo struct {
 	*fakeCampaignRepo
 	listForRunErr error
+	listHoldsErr  error
 	// itemErrOnCall fails GetCampaignItem on exactly that 1-based call.
 	itemMu        sync.Mutex
 	itemCalls     int
@@ -53,6 +54,20 @@ func (r *holdCampaignRepo) ListCampaignItemsForRun(_ context.Context, runID uuid
 				out = append(out, &cp)
 			}
 		}
+	}
+	return out, nil
+}
+
+func (r *holdCampaignRepo) ListDispatchHolds(_ context.Context) ([]*campaign.DispatchHold, error) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.listHoldsErr != nil {
+		return nil, r.listHoldsErr
+	}
+	var out []*campaign.DispatchHold
+	for _, h := range r.holds {
+		cp := *h
+		out = append(out, &cp)
 	}
 	return out, nil
 }
@@ -273,8 +288,9 @@ func TestCampaignDispatchHold_SiblingChildRunHeld(t *testing.T) {
 	h.admitted(t, h.impl(h.childOf(h.runH.ID).ID))
 }
 
-// Approval condition 1: an unresolvable ancestry fails CLOSED as held — a
-// missing parent, a cycle, and a chain past maxCampaignAncestorDepth hops.
+// Approval condition 1: under an active hold an unresolvable ancestry fails
+// CLOSED as held — a missing parent, a cycle, and a chain past
+// maxCampaignAncestorDepth hops.
 // The depth bound is exact: a campaign-linked ancestor exactly at the bound
 // resolves (and is held by the hold itself, not by the depth refusal).
 func TestCampaignDispatchHold_UnresolvableAncestorHeld(t *testing.T) {
@@ -320,6 +336,91 @@ func TestCampaignDispatchHold_UnresolvableAncestorHeld(t *testing.T) {
 			t.Errorf("details = %v, want the hold's refusal", d)
 		}
 		h.admitted(t, h.impl(chain(h, h.runH.ID, maxCampaignAncestorDepth).ID))
+	})
+}
+
+// Fix-up concerns c705d0e3 / 47ec2a19: an unresolvable ancestry is held ONLY
+// while some campaign still holds dispatches. Each shape is a run in NO
+// campaign: with the harness's hold removed it is admitted (a deep follow-up
+// lineage is the motivating case), and with the hold back it is held again.
+// A due hold is released on the way (trigger host_dispatch) and admits.
+func TestCampaignDispatchHold_UnresolvedAncestryNoHoldAdmitted(t *testing.T) {
+	shapes := []struct {
+		name  string
+		build func(h *holdHarness) *run.Run
+	}{
+		{"missing parent", func(h *holdHarness) *run.Run { return h.childOf(uuid.New()) }},
+		{"cycle", func(h *holdHarness) *run.Run {
+			a, b := h.rr.seedRun(), h.rr.seedRun()
+			h.rr.mu.Lock()
+			a.ParentRunID, b.ParentRunID = &b.ID, &a.ID
+			h.rr.mu.Unlock()
+			return a
+		}},
+		{"deep follow-up lineage", func(h *holdHarness) *run.Run {
+			leaf := h.rr.seedRun()
+			for range maxCampaignAncestorDepth + 1 {
+				next := h.rr.seedRun()
+				h.rr.mu.Lock()
+				next.ParentRunID = &leaf.ID
+				h.rr.mu.Unlock()
+				leaf = next
+			}
+			return leaf
+		}},
+	}
+	for _, sh := range shapes {
+		t.Run(sh.name+" with no hold anywhere", func(t *testing.T) {
+			h := newHoldHarness(t, nil)
+			hold := h.hold()
+			h.repo.mu.Lock()
+			delete(h.repo.holds, h.c.ID)
+			h.repo.mu.Unlock()
+			st := h.impl(sh.build(h).ID)
+			h.admitted(t, st)
+			// The same lineage is held again once any hold is active.
+			h.repo.mu.Lock()
+			h.repo.holds[h.c.ID] = hold
+			h.repo.mu.Unlock()
+			d, _ := h.refused(t, h.impl(st.RunID), http.StatusConflict, "campaign_dispatch_held")
+			if d["reason"] != "campaign_ancestry_unresolved" {
+				t.Errorf("details = %v, want the unresolved-ancestry refusal", d)
+			}
+		})
+	}
+	t.Run("due hold released then admitted", func(t *testing.T) {
+		h := newHoldHarness(t, nil)
+		h.rr.mu.Lock()
+		h.runH.State = run.StateSucceeded
+		h.rr.mu.Unlock()
+		h.admitted(t, h.impl(h.childOf(uuid.New()).ID))
+		if h.hold() != nil {
+			t.Fatalf("due hold survived the unresolved-ancestry evaluation")
+		}
+		p, _ := hotfixAuditPayload(t, h.aud, categoryCampaignHoldReleased)
+		if p["reason"] != campaign.HoldReleasedHotfixTerminal || p["trigger"] != holdReleaseTriggerHostDispatch {
+			t.Errorf("release payload = %v", p)
+		}
+	})
+	t.Run("hold list read error", func(t *testing.T) {
+		h := newHoldHarness(t, nil)
+		h.repo.listHoldsErr = errInjected
+		h.refused(t, h.impl(h.childOf(uuid.New()).ID), http.StatusInternalServerError, "dependency_check_failed")
+	})
+	t.Run("held campaign read error", func(t *testing.T) {
+		h := newHoldHarness(t, nil)
+		h.repo.getErr = errInjected
+		h.refused(t, h.impl(h.childOf(uuid.New()).ID), http.StatusInternalServerError, "dependency_check_failed")
+	})
+	t.Run("unrecordable release", func(t *testing.T) {
+		h := newHoldHarness(t, &hotfixFailCategoryAudit{fail: categoryCampaignHoldReleased})
+		h.rr.mu.Lock()
+		h.runH.State = run.StateSucceeded
+		h.rr.mu.Unlock()
+		h.refused(t, h.impl(h.childOf(uuid.New()).ID), http.StatusServiceUnavailable, "campaign_audit_unavailable")
+		if h.hold() == nil {
+			t.Fatalf("hold row released under an unrecordable release")
+		}
 	})
 }
 

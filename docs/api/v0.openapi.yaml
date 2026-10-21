@@ -5564,8 +5564,13 @@ components:
         workflow:
           type: string
           default: hotfix_change
+          maxLength: 100
+          pattern: '^[a-z][a-z0-9_]*$'
           description: |
-            The workflow the item runs under. It must be declared by the
+            The workflow the item runs under: a workflow id (the key pattern
+            every workflow-spec major declares) of at most 100 bytes after
+            trimming, else 400 `validation_failed` (`details.field: workflow`;
+            the value is not echoed). It must be declared by the
             repository's workflow spec on its default branch; an undeclared
             workflow is refused 422 `workflow_not_registered`, never silently
             replaced.
@@ -17250,9 +17255,12 @@ paths:
               as `campaign_hold_released`, `trigger: host_dispatch`). `details`
               carries `campaign_id`, `hotfix_item_id`, `hotfix_issue_ref`,
               `expires_at`, `stage_id` and `item_id`. An ancestry that cannot be
-              resolved (a missing parent, a cycle, or the depth bound) is held
-              FAIL-CLOSED with `details.reason: campaign_ancestry_unresolved`
-              and `details.unresolved`. Expedited items and their decomposed
+              resolved (a missing parent, a cycle, or the depth bound) could
+              belong to any campaign, so while ANY campaign holds dispatches
+              (due holds are released first) it is held FAIL-CLOSED with
+              `details.reason: campaign_ancestry_unresolved` and
+              `details.unresolved`; with no hold anywhere it is admitted.
+              Expedited items and their decomposed
               children, non-implement stages, runs in no campaign and the
               idempotent already-`dispatched` arm are never held. A
               campaign-level PRE-admission refusal: it fires BEFORE the CAS and
@@ -21359,7 +21367,10 @@ paths:
         '400':
           description: |
             `validation_failed` — `campaign_id` is not a valid UUID, the body
-            is not JSON or carries unknown fields, `issue` is missing, `reason`
+            is not JSON or carries unknown fields, `issue` is missing,
+            `workflow` is not a `^[a-z][a-z0-9_]*$` id of at most 100 bytes
+            (`details.field: workflow`, `max_bytes`, `got_bytes`; the value is
+            not echoed), `reason`
             exceeds 1000 bytes (`details.field: reason`, `max_bytes`,
             `got_bytes`), or the workflow is not `hotfix_change` and `reason`
             is empty (`details.field: reason`, `details.workflow`).

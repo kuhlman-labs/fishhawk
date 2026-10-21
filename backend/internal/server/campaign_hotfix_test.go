@@ -180,14 +180,20 @@ func TestCampaignHotfix_ValidationRefusals400(t *testing.T) {
 	h := newHotfixHarness(t, hotfixSpecYAML, Config{})
 	c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending))
 	long := strings.Repeat("x", maxHotfixReasonBytes+1)
+	// The workflow cases carry a reason, so without the workflow check they
+	// pass the reason rule and reach the 422 workflow_not_registered echo; the
+	// refusal must not echo the raw value either.
+	longWorkflow := strings.Repeat("w", maxHotfixWorkflowBytes+1)
 	cases := map[string]struct {
-		id, body, field string
+		id, body, field, noEcho string
 	}{
-		"unknown field":  {c.ID.String(), `{"issue":"42","bogus":1}`, ""},
-		"missing issue":  {c.ID.String(), `{"workflow":"hotfix_change"}`, "issue"},
-		"blank issue":    {c.ID.String(), `{"issue":"  "}`, "issue"},
-		"reason too big": {c.ID.String(), `{"issue":"42","reason":"` + long + `"}`, "reason"},
-		"bad uuid":       {"not-a-uuid", `{"issue":"42"}`, "campaign_id"},
+		"unknown field":      {c.ID.String(), `{"issue":"42","bogus":1}`, "", ""},
+		"missing issue":      {c.ID.String(), `{"workflow":"hotfix_change"}`, "issue", ""},
+		"blank issue":        {c.ID.String(), `{"issue":"  "}`, "issue", ""},
+		"reason too big":     {c.ID.String(), `{"issue":"42","reason":"` + long + `"}`, "reason", ""},
+		"workflow too big":   {c.ID.String(), `{"issue":"42","workflow":"` + longWorkflow + `","reason":"r"}`, "workflow", longWorkflow},
+		"workflow bad shape": {c.ID.String(), `{"issue":"42","workflow":"Feature-Change<x>","reason":"r"}`, "workflow", "Feature-Change"},
+		"bad uuid":           {"not-a-uuid", `{"issue":"42"}`, "campaign_id", ""},
 	}
 	for name, tc := range cases {
 		w := postHotfix(t, h.s, tc.id, tc.body, testOperatorIdentity())
@@ -197,6 +203,9 @@ func TestCampaignHotfix_ValidationRefusals400(t *testing.T) {
 		}
 		if tc.field != "" && !strings.Contains(w.Body.String(), `"field":"`+tc.field+`"`) {
 			t.Errorf("%s: body %s does not name field %s", name, w.Body.String(), tc.field)
+		}
+		if tc.noEcho != "" && strings.Contains(w.Body.String(), tc.noEcho) {
+			t.Errorf("%s: body %s echoes the requested workflow", name, w.Body.String())
 		}
 	}
 	h.assertHotfixNothingWritten(t, c.ID, 1, nil)
@@ -357,6 +366,13 @@ func TestCampaignHotfix_WorkflowNotRegistered(t *testing.T) {
 	_ = json.Unmarshal(w.Body.Bytes(), &env)
 	if env.Error.Details.Requested != defaultHotfixWorkflow || !reflect.DeepEqual(env.Error.Details.Registered, []string{"docs_change", "feature_change"}) {
 		t.Errorf("details = %+v (%s)", env.Error.Details, w.Body.String())
+	}
+	// A well-shaped id exactly at maxHotfixWorkflowBytes passes the cap and
+	// reaches this gate.
+	atCap := strings.Repeat("w", maxHotfixWorkflowBytes)
+	w = postHotfix(t, h.s, c.ID.String(), `{"issue":"42","workflow":"`+atCap+`","reason":"r"}`, testOperatorIdentity())
+	if w.Code != http.StatusUnprocessableEntity || decodeCampaignError(t, w) != "workflow_not_registered" {
+		t.Errorf("at-cap workflow = %d %s, want 422 workflow_not_registered", w.Code, w.Body.String())
 	}
 	h.assertHotfixNothingWritten(t, c.ID, 1, nil)
 }

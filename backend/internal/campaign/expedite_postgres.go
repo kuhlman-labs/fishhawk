@@ -118,6 +118,28 @@ func (r *postgresRepo) GetDispatchHold(ctx context.Context, campaignID uuid.UUID
 	return h, nil
 }
 
+// ListDispatchHolds returns every hold row, oldest first.
+func (r *postgresRepo) ListDispatchHolds(ctx context.Context) ([]*DispatchHold, error) {
+	rows, err := r.pool.Query(ctx,
+		`SELECT `+dispatchHoldColumns+` FROM campaign_dispatch_holds ORDER BY held_at, campaign_id`)
+	if err != nil {
+		return nil, fmt.Errorf("list campaign dispatch holds: %w", err)
+	}
+	defer rows.Close()
+	var out []*DispatchHold
+	for rows.Next() {
+		h, err := scanDispatchHold(rows)
+		if err != nil {
+			return nil, fmt.Errorf("scan campaign dispatch hold: %w", err)
+		}
+		out = append(out, h)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("list campaign dispatch holds: %w", err)
+	}
+	return out, nil
+}
+
 // ReleaseDispatchHold deletes the campaign's hold row, recorded before commit
 // (see the Repository doc for the contract). Lock order: campaign row, then
 // hold row. A missing campaign has no hold (the row cascades with it), so it

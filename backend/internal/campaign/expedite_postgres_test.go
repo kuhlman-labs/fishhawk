@@ -290,6 +290,38 @@ func TestReleaseDispatchHold_DeletesAndRecords(t *testing.T) {
 	}
 }
 
+// TestListDispatchHolds_AcrossCampaigns pins the cross-campaign read the
+// host-dispatch guard's unresolved-ancestry arm uses: no rows lists none, two
+// campaigns' holds list oldest held_at first, and a released hold drops out.
+func TestListDispatchHolds_AcrossCampaigns(t *testing.T) {
+	repo, _, c, _ := appendFixture(t, campaign.CreateCampaignItemParams{IssueRef: "issue:10"})
+	ctx := context.Background()
+	if hs, err := repo.ListDispatchHolds(ctx); err != nil || len(hs) != 0 {
+		t.Fatalf("holds on an empty table = %+v, %v; want none", hs, err)
+	}
+	hot := appendHotfix(t, repo, c.ID, "issue:20", hotfix(true)).Created[0]
+	other := makeCampaign(t, repo)
+	early := hotfix(true)
+	early.Hold.HeldAt = holdNow.Add(-time.Minute)
+	early.Hold.ExpiresAt = early.Hold.HeldAt.Add(campaign.MaxDispatchHold)
+	otherHot := appendHotfix(t, repo, other.ID, "issue:30", early).Created[0]
+	hs, err := repo.ListDispatchHolds(ctx)
+	if err != nil {
+		t.Fatalf("list holds: %v", err)
+	}
+	if len(hs) != 2 || hs[0].CampaignID != other.ID || hs[0].HotfixItemID != otherHot.ID ||
+		!hs[0].HeldAt.Equal(early.Hold.HeldAt) || hs[1].CampaignID != c.ID || hs[1].HotfixItemID != hot.ID {
+		t.Fatalf("holds = %+v, want %s's then %s's", hs, other.ID, c.ID)
+	}
+	if _, err := repo.ReleaseDispatchHold(ctx, releaseParams(other.ID, otherHot.ID,
+		func(context.Context, campaign.DispatchHold) error { return nil })); err != nil {
+		t.Fatalf("release: %v", err)
+	}
+	if hs, err := repo.ListDispatchHolds(ctx); err != nil || len(hs) != 1 || hs[0].CampaignID != c.ID {
+		t.Fatalf("holds after a release = %+v, %v; want only %s's", hs, err, c.ID)
+	}
+}
+
 // TestReleaseDispatchHold_NoOps pins the idempotent no-ops: a hold naming a
 // different item, a campaign with no hold, and a missing campaign return
 // (nil, nil) without calling the recorder, and the mismatched hold survives.

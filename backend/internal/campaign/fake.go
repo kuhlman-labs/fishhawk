@@ -123,6 +123,11 @@ func (BaseFake) GetDispatchHold(_ context.Context, _ uuid.UUID) (*DispatchHold, 
 	return nil, nil
 }
 
+// ListDispatchHolds returns nil, nil (no holds).
+func (BaseFake) ListDispatchHolds(_ context.Context) ([]*DispatchHold, error) {
+	return nil, nil
+}
+
 // ReleaseDispatchHold returns nil, nil (nothing to release).
 func (BaseFake) ReleaseDispatchHold(_ context.Context, _ ReleaseDispatchHoldParams) (*DispatchHold, error) {
 	return nil, nil

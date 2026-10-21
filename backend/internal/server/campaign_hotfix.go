@@ -17,6 +17,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -49,6 +50,13 @@ const defaultHotfixWorkflow = "hotfix_change"
 
 // maxHotfixReasonBytes caps the operator's free-text reason.
 const maxHotfixReasonBytes = 1000
+
+// maxHotfixWorkflowBytes caps the requested workflow id. With
+// hotfixWorkflowIDPattern (the workflow-key pattern every workflow-spec major
+// declares) it bounds what a 422 workflow_not_registered can echo back.
+const maxHotfixWorkflowBytes = 100
+
+var hotfixWorkflowIDPattern = regexp.MustCompile(`^[a-z][a-z0-9_]*$`)
 
 // campaignHoldSystemSubject is the actor subject of a campaign_hold_released
 // row: a release is a system decision whatever request triggered it.
@@ -103,7 +111,7 @@ func toDispatchHoldPayload(h *campaign.DispatchHold, issueRef string) *dispatchH
 // Every refusal writes nothing. Order: repo configured → write:campaigns →
 // operator-only (run-bound and delegated operator-agent tokens refused,
 // unconditionally) → campaign_id → strict body → issue → workflow default →
-// reason cap → reason rule → campaign exists → account + repo visibility →
+// workflow id shape + cap → reason cap → reason rule → campaign exists → account + repo visibility →
 // terminal → issue ref + duplicate (before any forge read) → workflow
 // registration → release a due hold → the shared append core.
 func (s *Server) handleCampaignHotfix(w http.ResponseWriter, r *http.Request) {
@@ -152,6 +160,12 @@ func (s *Server) handleCampaignHotfix(w http.ResponseWriter, r *http.Request) {
 	workflow := strings.TrimSpace(req.Workflow)
 	if workflow == "" {
 		workflow = defaultHotfixWorkflow
+	}
+	if len(workflow) > maxHotfixWorkflowBytes || !hotfixWorkflowIDPattern.MatchString(workflow) {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"workflow must be a workflow id matching "+hotfixWorkflowIDPattern.String()+" of at most "+strconv.Itoa(maxHotfixWorkflowBytes)+" bytes",
+			map[string]any{"field": "workflow", "max_bytes": maxHotfixWorkflowBytes, "got_bytes": len(workflow)})
+		return
 	}
 	reason := strings.TrimSpace(req.Reason)
 	if len(reason) > maxHotfixReasonBytes {
