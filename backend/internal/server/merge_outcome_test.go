@@ -366,6 +366,78 @@ func TestObserveDefaultBranchPush_UnwiredForge_NoObservation(t *testing.T) {
 	pushObservers.Wait()
 }
 
+// TestObserveDefaultBranchPush_NoForgeWorkPush_TakesNoSlot pins the #3990
+// pre-scan: a non-default-branch push and a signal-less default-branch push
+// return BEFORE taking one of the process-wide observation slots. Every slot
+// is pre-held, so a push reaching runDetachedPushObservation logs the
+// saturation WARN. NOT t.Parallel: it fills the package-level pushObserveSlots,
+// and Go runs t.Parallel top-level tests only after the sequential ones finish
+// (each push test waits on pushObservers before returning, so no slot is held
+// when it starts). Counterfactual: delete the pre-scan → both pushes log the
+// saturation WARN. The final revert push is the anti-vacuity control: it MUST
+// log the WARN, proving the slots really are saturated and the logger wired.
+func TestObserveDefaultBranchPush_NoForgeWorkPush_TakesNoSlot(t *testing.T) {
+	added := 0
+	for full := false; !full; {
+		select {
+		case pushObserveSlots <- struct{}{}:
+			added++
+		default:
+			full = true
+		}
+	}
+	t.Cleanup(func() {
+		for i := 0; i < added; i++ {
+			<-pushObserveSlots
+		}
+	})
+	var hits atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	t.Cleanup(srv.Close)
+	client := githubclient.New(seamTokenProvider{})
+	client.BaseURL = srv.URL
+	client.HTTP = &http.Client{Timeout: 10 * time.Second}
+	buf := &syncBuffer{}
+	s := New(Config{
+		Addr:                "127.0.0.1:0",
+		GitHubWebhookSecret: []byte(testSecret),
+		WebhookDeliveries:   webhook.NewMemoryStore(0),
+		RunRepo:             run.BaseFake{},
+		AuditRepo:           audit.BaseFake{},
+		GitHub:              client,
+		Logger:              slog.New(slog.NewTextHandler(buf, nil)),
+	})
+	const saturated = "concurrent observations saturated"
+	for _, tc := range []struct {
+		delivery string
+		body     []byte
+	}{
+		{"push-slot-feature", pushBody(t, "refs/heads/feature", "User", revertCommit())},
+		{"push-slot-plain", pushBody(t, "refs/heads/main", "User", map[string]string{"id": pushRevertSHA, "message": "feat: add widgets (#42)"})},
+	} {
+		if code := postPush(t, s, context.Background(), tc.delivery, tc.body); code != http.StatusAccepted {
+			t.Fatalf("%s: status = %d, want 202", tc.delivery, code)
+		}
+		pushObservers.Wait()
+		if out := buf.String(); strings.Contains(out, saturated) {
+			t.Fatalf("%s: log = %q, want no saturation WARN (a push needing no forge work must not reach the slots)", tc.delivery, out)
+		}
+	}
+	if code := postPush(t, s, context.Background(), "push-slot-revert", pushBody(t, "refs/heads/main", "User", revertCommit())); code != http.StatusAccepted {
+		t.Fatalf("control: status = %d, want 202", code)
+	}
+	pushObservers.Wait()
+	if out := buf.String(); !strings.Contains(out, saturated) || !strings.Contains(out, "push-slot-revert") {
+		t.Fatalf("control: log = %q, want the saturation WARN for the revert push (slots not saturated, or logger unwired)", out)
+	}
+	if n := hits.Load(); n != 0 {
+		t.Fatalf("GitHub requests = %d, want 0", n)
+	}
+}
+
 func TestWebhookPush_UndecodablePayload_Skipped(t *testing.T) {
 	f := newPushFixture(t, false)
 	if code := postPush(t, f.s, context.Background(), "push-9", []byte(`{"ref":5}`)); code != http.StatusAccepted {
