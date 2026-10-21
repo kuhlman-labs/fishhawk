@@ -82,24 +82,56 @@ func verifyLockContendedReason(verifyCmd string, attempts int) string {
 // verifyLockRerunFits reports whether the remaining stage budget can cover one
 // more contention re-run: a full lock wait (verifyLockWaitBudget) plus one
 // verify (verifyTimeout, executor.verify.timeout — the only bound the runner
-// holds on a verify's duration).
+// holds on a single verify's duration).
 //
-// The budget is the context's deadline: the runner holds no stage-wide wall
-// clock of its own (cfg.timeout bounds each agent invocation, and every fix
-// re-invoke gets it afresh), so a deadline on ctx is the only one that can cut
-// a re-run short from outside. A re-run started without the budget to finish
-// would end in a context cancellation mid-verify — a killed command
-// classified as a red tree or a timeout, which is a worse verdict than the
-// contention it was meant to clear. A context with no deadline always fits;
-// the re-run count bound still applies. remaining is the time left on the
-// deadline (zero when there is none).
+// Two budgets can bound it, and the tighter one wins (verifyLockRerunBudget):
+//
+//   - the #4023 GATE BUDGET, when the stage clock rides ctx
+//     (stagePhasesFrom): the verify-execution time the gate phase has left.
+//     A re-run is a verify execution charged to it, so one the budget cannot
+//     cover would be clipped and killed mid-wait.
+//   - the context's deadline, when one is set (production sets none today;
+//     cfg.timeout bounds each agent invocation only).
+//
+// A re-run started without the budget to finish would end killed mid-verify —
+// classified as a red tree or a timeout, a worse verdict than the contention
+// it was meant to clear. With neither budget present it always fits; the
+// re-run count bound still applies. remaining is the binding budget's time
+// left (zero when there is none).
 func verifyLockRerunFits(ctx context.Context, verifyTimeout time.Duration) (bool, time.Duration) {
-	deadline, ok := ctx.Deadline()
-	if !ok {
-		return true, 0
+	fits, remaining, _ := verifyLockRerunBudget(ctx, verifyTimeout)
+	return fits, remaining
+}
+
+// Which budget bound a verify-lock re-run admission (verifyLockRerunBudget).
+const (
+	verifyLockBoundNone        = ""
+	verifyLockBoundGateBudget  = "gate_budget"
+	verifyLockBoundCtxDeadline = "ctx_deadline"
+)
+
+// verifyLockRerunBudget is verifyLockRerunFits plus WHICH budget bound the
+// decision: verifyLockBoundGateBudget, verifyLockBoundCtxDeadline, or
+// verifyLockBoundNone when neither is present.
+func verifyLockRerunBudget(ctx context.Context, verifyTimeout time.Duration) (bool, time.Duration, string) {
+	var (
+		remaining time.Duration
+		bound     = verifyLockBoundNone
+	)
+	if deadline, ok := ctx.Deadline(); ok {
+		remaining = time.Until(deadline)
+		bound = verifyLockBoundCtxDeadline
 	}
-	remaining := time.Until(deadline)
-	return remaining >= verifyLockWaitBudget+verifyTimeout, remaining
+	if c := stagePhasesFrom(ctx); c != nil {
+		if g := c.gateRemaining(); bound == verifyLockBoundNone || g < remaining {
+			remaining = g
+			bound = verifyLockBoundGateBudget
+		}
+	}
+	if bound == verifyLockBoundNone {
+		return true, 0, bound
+	}
+	return remaining >= verifyLockWaitBudget+verifyTimeout, remaining, bound
 }
 
 // verifyLockContention is one gate site's contention state: the re-runs
@@ -108,19 +140,21 @@ type verifyLockContention struct {
 	reruns      int
 	budgetShort bool          // the count allowed another re-run but the stage budget did not
 	remaining   time.Duration // the budget left when budgetShort was decided
+	bound       string        // which budget decided budgetShort (verifyLockBound*)
 }
 
 // admit decides whether the site may re-run a contended verify once more:
-// below the re-run bound AND inside the stage budget (verifyLockRerunFits). It
-// counts the re-run on admission. On refusal for budget it records the
-// remaining budget so the reason can name it.
+// below the re-run bound AND inside the stage budget (verifyLockRerunBudget).
+// It counts the re-run on admission. On refusal for budget it records the
+// remaining budget, and which budget it was, so the reason can name it.
 func (c *verifyLockContention) admit(ctx context.Context, verifyTimeout time.Duration) bool {
 	if c.reruns >= verifyLockContentionMaxReruns {
 		return false
 	}
-	if fits, remaining := verifyLockRerunFits(ctx, verifyTimeout); !fits {
+	if fits, remaining, bound := verifyLockRerunBudget(ctx, verifyTimeout); !fits {
 		c.budgetShort = true
 		c.remaining = remaining
+		c.bound = bound
 		return false
 	}
 	c.reruns++
@@ -128,12 +162,17 @@ func (c *verifyLockContention) admit(ctx context.Context, verifyTimeout time.Dur
 }
 
 // reason renders the contended FailureReason lead, adding a note when the
-// last re-run was skipped because the stage budget could not cover it.
+// last re-run was skipped because a budget could not cover it — naming the
+// gate budget or the context deadline, whichever bound it.
 func (c *verifyLockContention) reason(verifyCmd string, attempts int, verifyTimeout time.Duration) string {
 	r := verifyLockContendedReason(verifyCmd, attempts)
 	if c.budgetShort {
-		r += fmt.Sprintf(" No further in-place re-run was attempted: the remaining stage budget (%s) cannot cover a full verify-lock wait (%s) plus one verify (%s).",
-			c.remaining.Round(time.Second), verifyLockWaitBudget, verifyTimeout)
+		budget := "stage budget (the context deadline)"
+		if c.bound == verifyLockBoundGateBudget {
+			budget = fmt.Sprintf("gate budget (%d x executor.verify.timeout of verify-execution time per gate phase)", gateBudgetVerifyForms)
+		}
+		r += fmt.Sprintf(" No further in-place re-run was attempted: the remaining %s, %s, cannot cover a full verify-lock wait (%s) plus one verify (%s).",
+			budget, c.remaining.Round(time.Second), verifyLockWaitBudget, verifyTimeout)
 	}
 	return r
 }
