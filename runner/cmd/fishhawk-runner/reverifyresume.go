@@ -250,9 +250,8 @@ type reverifyResult struct {
 //   - passed → ok;
 //   - never executed (refused / unavailable / skipped), timed out, a temporary
 //     failure (exit 75) or an infra signature that persists, or lock-contended
-//     (exit 73, gateLockRefused; the #3948 text classifier stays as the
-//     fallback until every gate site produces the disposition) →
-//     reverify_gate_not_executed, transient (the tree was never judged);
+//     (exit 73, gateLockRefused; the #3948 text classifier is deleted, #4022)
+//     → reverify_gate_not_executed, transient (the tree was never judged);
 //   - an executed failure whose failing packages all lie OUTSIDE the change
 //     (verifyFailureScopeRelation over the served scope) → reverify_failed_outside_change,
 //     transient;
@@ -269,7 +268,7 @@ func reverifyHeldCommit(ctx context.Context, h reverifyHeld, timeout time.Durati
 	}
 	out, outcome, disp := run()
 	for i := 0; i < reverifyMaxInfraReruns && outcome == "failed" && (disp == gateTempFail ||
-		disp == gateExecuted && isVerifyInfraFailure(out) && !isVerifyLockContended(out)); i++ {
+		disp == gateExecuted && isVerifyInfraFailure(out)); i++ {
 		out, outcome, disp = run()
 	}
 	notExecuted := func(why string) reverifyResult {
@@ -289,8 +288,6 @@ func reverifyHeldCommit(ctx context.Context, h reverifyHeld, timeout time.Durati
 		return notExecuted("the verify command exited 75 (temporary infrastructure failure) across the re-run")
 	case disp == gateLockRefused:
 		return notExecuted("the verify command exited 73 (the verify lock could not be acquired)")
-	case isVerifyLockContended(out):
-		return notExecuted("the verify lock was held by another runner verify")
 	case isVerifyInfraFailure(out):
 		return notExecuted("an infrastructure failure signature persisted across the re-run")
 	}
