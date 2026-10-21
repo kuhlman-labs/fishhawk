@@ -115,6 +115,11 @@ var _ forge.MergeProtectionReader = (*Forge)(nil)
 // branch-delete capability the run-branch sweep consumes (E68.67 / #3562).
 var _ forge.RefDeleter = (*Forge)(nil)
 
+// Compile-time assertion that the adapter provides the optional head-pinned
+// synchronous merge the merge queue's merge-on-pass consumes (ADR-093 D3,
+// E87.5 / #4296).
+var _ forge.HeadPinnedMerger = (*Forge)(nil)
+
 // Option customises a Forge at construction.
 type Option func(*forgeConfig)
 
@@ -555,6 +560,35 @@ func (f *Forge) MergePullRequest(ctx context.Context, scope forge.CredentialScop
 	_, err = c.MergeMergeRequest(ctx, pid, prNumber, gitlabclient.MergeMergeRequestParams{
 		Squash: method == forge.MergeMethodSquash,
 	})
+	return mapMergeError(err)
+}
+
+// MergePullRequestAtHead merges a merge request SYNCHRONOUSLY with the source
+// head pinned to expectedHeadSHA (forge.HeadPinnedMerger, ADR-093 D3 / E87.5).
+// It never sets merge_when_pipeline_succeeds: a queued merge would wait on the
+// pipeline while the base may move. GitLab answers 409 when sha differs from
+// the source branch HEAD — mapped to forge.ErrMergeConflict; 405/406 map to
+// forge.ErrPullRequestNotMergeable via mapMergeError. An empty expectedHeadSHA
+// is refused before any credential or HTTP call.
+func (f *Forge) MergePullRequestAtHead(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, prNumber int, method forge.MergeMethod, expectedHeadSHA string) error {
+	if strings.TrimSpace(expectedHeadSHA) == "" {
+		return errors.New("forge/gitlab: merge pull request at head: expected head sha required")
+	}
+	c, pid, err := f.resolve(ctx, scope)
+	if err != nil {
+		return err
+	}
+	_, err = c.MergeMergeRequest(ctx, pid, prNumber, gitlabclient.MergeMergeRequestParams{
+		Squash: method == forge.MergeMethodSquash,
+		SHA:    expectedHeadSHA,
+	})
+	// 409 = sha does not match the source branch HEAD (the head moved after
+	// verification). Mapped to forge.ErrMergeConflict, the head-pin contract's
+	// sentinel; only this pinned path maps it, so the unpinned merges keep
+	// their existing error shape.
+	if apiStatus(err) == http.StatusConflict {
+		return errors.Join(forge.ErrMergeConflict, err)
+	}
 	return mapMergeError(err)
 }
 

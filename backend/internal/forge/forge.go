@@ -127,6 +127,28 @@ type Forge interface {
 	ComparePatch(ctx context.Context, scope CredentialScope, repo RepoRef, base, head string) (*ComparePatchResult, error)
 }
 
+// HeadPinnedMerger is the OPTIONAL head-pinned synchronous merge capability
+// the merge queue's merge-on-pass consumes (ADR-093 D3, E87.5 / #4296): merge
+// a PR only if its head still equals expectedHeadSHA, the head the queue
+// verified. A forge whose merge endpoint takes a head pin (GitHub's REST `sha`,
+// GitLab's `sha`) refuses a moved head instead of merging an unverified tree.
+//
+// It is a STANDALONE capability rather than a method on Forge for the same
+// reason FileFetcher and RefDeleter are: widening Forge churns every adapter
+// and test fake for a capability one consumer uses. A forge that does not
+// implement it is a fail-closed nil at the consumer (server.ForgeMerger answers
+// a named error), never a fallback to an unpinned merge.
+//
+// Contract:
+//   - SYNCHRONOUS only: it never queues an auto-merge / merge-when-pipeline-
+//     succeeds, because a queued merge waits on checks while the base may move.
+//   - An empty expectedHeadSHA is an error before any forge call.
+//   - A head mismatch maps to ErrMergeConflict; a PR not in a mergeable state
+//     maps to ErrPullRequestNotMergeable; the rest per the adapter's mapping.
+type HeadPinnedMerger interface {
+	MergePullRequestAtHead(ctx context.Context, scope CredentialScope, repo RepoRef, prNumber int, method MergeMethod, expectedHeadSHA string) error
+}
+
 // FileFetcher is the forge-neutral single-file read capability (#2022).
 // It is deliberately a STANDALONE capability interface rather than a new
 // method on Forge: widening Forge would churn every existing

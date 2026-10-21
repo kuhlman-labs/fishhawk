@@ -655,6 +655,43 @@ func TestMergeMergeRequest_NotMergeable405IsAPIError(t *testing.T) {
 	assertAPIError(t, err, http.StatusMethodNotAllowed)
 }
 
+// TestMergeMergeRequest_SendsSHA pins the head pin on the wire (ADR-093 D3,
+// E87.5 / #4296): a non-empty SHA is sent as `sha`, which GitLab checks
+// against the source branch HEAD.
+func TestMergeMergeRequest_SendsSHA(t *testing.T) {
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		var got map[string]any
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if got["sha"] != "cafef00d" {
+			t.Errorf("sha = %v, want cafef00d", got["sha"])
+		}
+		return jsonResponse(http.StatusOK, `{"iid":7,"state":"merged"}`), nil
+	})
+	if _, err := c.MergeMergeRequest(context.Background(), 42, 7, MergeMergeRequestParams{Squash: true, SHA: "cafef00d"}); err != nil {
+		t.Fatalf("MergeMergeRequest: %v", err)
+	}
+}
+
+// TestMergeMergeRequest_OmitsEmptySHA: an empty SHA leaves the request
+// unpinned — no `sha` key — so the pre-existing merge callers are unchanged.
+func TestMergeMergeRequest_OmitsEmptySHA(t *testing.T) {
+	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+		var got map[string]any
+		if err := json.Unmarshal(rec.body, &got); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if _, ok := got["sha"]; ok {
+			t.Errorf("sha present though unset: %s", rec.body)
+		}
+		return jsonResponse(http.StatusOK, `{"iid":7}`), nil
+	})
+	if _, err := c.MergeMergeRequest(context.Background(), 42, 7, MergeMergeRequestParams{Squash: true}); err != nil {
+		t.Fatalf("MergeMergeRequest: %v", err)
+	}
+}
+
 func TestMergeMergeRequest_ValidatesArgs(t *testing.T) {
 	c := clientWith(t, func(*opRequest) (*http.Response, error) {
 		t.Fatal("transport called despite invalid args")
