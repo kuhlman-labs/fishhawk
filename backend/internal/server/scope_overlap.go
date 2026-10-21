@@ -21,11 +21,15 @@ import (
 
 // Cross-run scope overlap (E83.60 / #4118): which OTHER non-terminal runs in
 // the same repository and tenant share files with a run's effective scope.
-// Advisory everywhere — nothing refuses on it, every read is fail-open. It is
-// served live by GET /v0/runs/{run_id}/scope-overlap, carried on the gate view
-// as scope_overlap, and recorded at plan upload as a plan_scope_overlap audit
-// row (written only when an overlap exists, like plan_warnings). Contract:
-// backend/internal/server/README.md § "Cross-run scope overlap".
+// Advisory on these surfaces — nothing here refuses on it, every read is
+// fail-open. It is served live by GET /v0/runs/{run_id}/scope-overlap, carried
+// on the gate view as scope_overlap, and recorded at plan upload as a
+// plan_scope_overlap audit row (written only when an overlap exists, like
+// plan_warnings). The one refusing consumer is the merge overlap guard
+// (merge_overlap_guard.go, #4119), which reuses overlapCandidates and
+// resolveOverlapScope and FAILS CLOSED. Contract:
+// backend/internal/server/README.md § "Cross-run scope overlap" and
+// § "Merge overlap guard".
 
 // planScopeOverlapCategory is the advisory audit row handleShipPlan records
 // when the settling plan's effective scope intersects another live run's.
@@ -240,6 +244,62 @@ func (s *Server) computeScopeOverlapFrom(ctx context.Context, self *run.Run, sel
 	}
 	out.SelfScopeResolved = true
 
+	cands, truncated, err := s.overlapCandidates(ctx, self)
+	if err != nil {
+		return nil, err
+	}
+	out.Truncated = truncated
+	for _, other := range cands {
+		out.ScannedRuns++
+		otherSet, ok := s.resolveOverlapScope(ctx, other)
+		if !ok {
+			out.UnscopedRuns++
+			continue
+		}
+		paths := []string{}
+		for path := range otherSet {
+			if _, shared := selfSet[path]; shared {
+				paths = append(paths, path)
+			}
+		}
+		if len(paths) == 0 {
+			continue
+		}
+		sort.Strings(paths)
+		entry := scopeOverlapRun{RunID: other.ID.String(), Paths: paths}
+		if other.TriggerRef != nil {
+			entry.IssueRef = *other.TriggerRef
+		}
+		if other.DecomposedFrom != nil {
+			entry.DecomposedFrom = other.DecomposedFrom.String()
+		}
+		if stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, other.ID); err == nil {
+			if st := currentOverlapStage(stages); st != nil {
+				entry.Stage = string(st.Type)
+				entry.StageState = string(st.State)
+			}
+		}
+		out.Overlaps = append(out.Overlaps, entry)
+	}
+	sort.Slice(out.Overlaps, func(i, j int) bool {
+		if out.Overlaps[i].IssueRef != out.Overlaps[j].IssueRef {
+			return out.Overlaps[i].IssueRef < out.Overlaps[j].IssueRef
+		}
+		return out.Overlaps[i].RunID < out.Overlaps[j].RunID
+	})
+	return out, nil
+}
+
+// overlapCandidates enumerates the OTHER live runs self's overlap is judged
+// against: every run in scopeOverlapLiveStates in self's repo and tenant
+// (ListRuns per state, Limit scopeOverlapListLimit), minus nil rows, self's
+// own lineage (isOverlapLineage), the one-hop recovery-slice exclusions
+// (overlapRecoveredSlice, for self and for each candidate) and other tenants
+// (overlapSameTenant). truncated is true when any per-state page reached
+// scopeOverlapListLimit, so some live run may have gone unlisted. The only
+// error is a ListRuns failure. Shared by computeScopeOverlapFrom (advisory)
+// and mergeOverlapGuard (fail-closed, #4119), so both judge the same set.
+func (s *Server) overlapCandidates(ctx context.Context, self *run.Run) (cands []*run.Run, truncated bool, err error) {
 	parents := map[uuid.UUID]*run.Run{}
 	selfSlice := s.overlapRecoveredSlice(ctx, self, parents)
 	for _, state := range scopeOverlapLiveStates {
@@ -250,10 +310,10 @@ func (s *Server) computeScopeOverlapFrom(ctx context.Context, self *run.Run, sel
 			Limit:     scopeOverlapListLimit,
 		})
 		if err != nil {
-			return nil, fmt.Errorf("list %s runs in %s: %w", state, self.Repo, err)
+			return nil, false, fmt.Errorf("list %s runs in %s: %w", state, self.Repo, err)
 		}
 		if len(page) >= scopeOverlapListLimit {
-			out.Truncated = true
+			truncated = true
 		}
 		for _, other := range page {
 			if other == nil {
@@ -271,45 +331,10 @@ func (s *Server) computeScopeOverlapFrom(ctx context.Context, self *run.Run, sel
 			if !overlapSameTenant(self.AccountID, other.AccountID) {
 				continue
 			}
-			out.ScannedRuns++
-			otherSet, ok := s.resolveOverlapScope(ctx, other)
-			if !ok {
-				out.UnscopedRuns++
-				continue
-			}
-			paths := []string{}
-			for path := range otherSet {
-				if _, shared := selfSet[path]; shared {
-					paths = append(paths, path)
-				}
-			}
-			if len(paths) == 0 {
-				continue
-			}
-			sort.Strings(paths)
-			entry := scopeOverlapRun{RunID: other.ID.String(), Paths: paths}
-			if other.TriggerRef != nil {
-				entry.IssueRef = *other.TriggerRef
-			}
-			if other.DecomposedFrom != nil {
-				entry.DecomposedFrom = other.DecomposedFrom.String()
-			}
-			if stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, other.ID); err == nil {
-				if st := currentOverlapStage(stages); st != nil {
-					entry.Stage = string(st.Type)
-					entry.StageState = string(st.State)
-				}
-			}
-			out.Overlaps = append(out.Overlaps, entry)
+			cands = append(cands, other)
 		}
 	}
-	sort.Slice(out.Overlaps, func(i, j int) bool {
-		if out.Overlaps[i].IssueRef != out.Overlaps[j].IssueRef {
-			return out.Overlaps[i].IssueRef < out.Overlaps[j].IssueRef
-		}
-		return out.Overlaps[i].RunID < out.Overlaps[j].RunID
-	})
-	return out, nil
+	return cands, truncated, nil
 }
 
 // recordPlanScopeOverlap is the plan-gate leg (handleShipPlan): it computes the

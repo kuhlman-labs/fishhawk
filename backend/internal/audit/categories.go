@@ -340,6 +340,9 @@ import "sort"
 // scope_amendment_requested / scope_amendment_decided siblings — NOT an
 // issue-comment activity category (the startup backfill would otherwise
 // re-render activity lines onto every stale run's anchor).
+// E83.61 / #4119 added merge_overlap_overridden, the operator's audited
+// override of the merge overlap guard (server/merge_overlap_guard.go),
+// appended record-before-commit — INTERNAL, not an issue-comment surface.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -487,6 +490,7 @@ var KnownCategories = map[string]struct{}{
 	"lineage_violation":                       {},
 	"mcp_token_issued":                        {},
 	"merge_observation_recorded":              {},
+	"merge_overlap_overridden":                {}, // E83.61 / #4119: an operator merge_run overrode the overlapping-implement guard with allow_overlap + overlap_reason, appended BEFORE the verdict / merge-intent append (server/merge_overlap_guard.go) — INTERNAL, not an issue-comment surface
 	"merge_settle_members_refused":            {}, // E39.17 / #4132: a merge on a members-declaring review gate was HELD because no forge identity (merger / latest-APPROVED reviewer) is listed (server/merge_members.go) — INTERNAL, not an issue-comment surface
 	"merge_verdict_recorded":                  {},
 	"merge_candidate_queue_admitted":          {}, // E83.85 / #4200 (ADR-092 D1): a held merge-candidate pass was admitted as its base's ONE live pass (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface

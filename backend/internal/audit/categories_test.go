@@ -839,3 +839,14 @@ func TestKnownCategories_PlanScopeOverlap(t *testing.T) {
 		t.Fatal("plan_scope_overlap is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_MergeOverlapOverridden pins the E83.61 / #4119
+// registration: handleMergeRun appends merge_overlap_overridden when an
+// operator overrides the merge overlap guard (server/merge_overlap_guard.go),
+// and a fishhawk_await_audit wait (or a category-filtered audit read) armed on
+// it must not be refused as unknown.
+func TestKnownCategories_MergeOverlapOverridden(t *testing.T) {
+	if !IsKnownCategory("merge_overlap_overridden") {
+		t.Fatal("merge_overlap_overridden is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
