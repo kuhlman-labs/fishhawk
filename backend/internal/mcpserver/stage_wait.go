@@ -123,7 +123,10 @@ type StageWaitStatus struct {
 	// and the verify gate by its own gate budget, so a stage whose current
 	// attempt reported a phase derives the deadline from that phase's clock (see
 	// phaseDeadline). With no current phase report it keeps the legacy
-	// attempt-clock derivation byte-identically.
+	// attempt-clock derivation byte-identically. The one exception to the
+	// positive-agent_timeout_seconds condition above: a CURRENT gate-phase report
+	// carrying a gate remaining sets DeadlineSecondsRemaining even when the agent
+	// budget is unresolved, because the gate budget is known independently.
 	ElapsedSeconds           int  `json:"elapsed_seconds,omitempty" jsonschema:"seconds the stage has been running (from its server-recorded started_at); present only while non-terminal and when the agent wall clock is known"`
 	AgentTimeoutSeconds      int  `json:"agent_timeout_seconds,omitempty" jsonschema:"the spec-resolved agent wall clock (seconds) the runner enforces for EACH agent invocation of this stage (it does not cover verify-gate time, which has its own gate budget); present only while non-terminal and when resolved"`
 	DeadlineSecondsRemaining *int `json:"deadline_seconds_remaining,omitempty" jsonschema:"seconds of the CURRENT phase's remaining budget. When the current attempt reported a phase (#4023): in the agent phase it equals agent_seconds_remaining (agent_timeout_seconds - phase_elapsed_seconds, clamped at 0); in the gate phase it equals gate_seconds_remaining (the verify gate's own budget, independent of the agent budget), and is absent when the runner reported no gate remaining. With no phase report for the current attempt it is the legacy derivation from the PER-ATTEMPT dispatch clock (agent_timeout_seconds - attempt_elapsed_seconds, clamped at 0), so a re-dispatched (fix-up or retried) stage reports its fresh remaining budget rather than a cumulative clock that would read 0 (#3335). Present only while non-terminal and when the budget is known. A filed scope amendment needs at least the amendment poll window of remaining budget to be decidable"`

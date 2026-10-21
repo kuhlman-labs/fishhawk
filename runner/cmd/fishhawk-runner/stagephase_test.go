@@ -122,6 +122,28 @@ func TestStagePhaseClock_VerifyChargesGateBudget(t *testing.T) {
 	}
 }
 
+// TestStagePhaseClock_ReportLatencyIsNotCharged: a report hook that takes
+// 10 minutes per transition (slow progress ingestion) charges nothing; only
+// the verifies' own 1m each is. Without startVerify's re-stamp each
+// gate:verify report's 10m is charged and three verifies exhaust the 17m
+// budget.
+func TestStagePhaseClock_ReportLatencyIsNotCharged(t *testing.T) {
+	c, mc := newTestPhaseClock(time.Hour, time.Minute) // budget 17m
+	c.report = func(stagePhaseSnapshot) { mc.advance(10 * time.Minute) }
+	c.beginGate()
+	for i := 0; i < 3; i++ {
+		c.startVerify()
+		mc.advance(time.Minute)
+		c.endVerify()
+	}
+	if got, want := c.gateRemaining(), c.gateBudget-3*time.Minute; got != want {
+		t.Errorf("gateRemaining after three 1m verifies behind 10m reports = %s, want %s (reporting latency is never charged)", got, want)
+	}
+	if eff, clipped := c.gateVerifyTimeout(time.Minute); eff != time.Minute || clipped {
+		t.Errorf("gateVerifyTimeout(1m) = (%s, %t), want (1m, false): slow reports must not refuse a later verify", eff, clipped)
+	}
+}
+
 // TestStagePhaseClock_GateVerifyTimeoutClips: a verify timeout above the
 // remaining budget is clipped to it; one below is returned unclipped.
 func TestStagePhaseClock_GateVerifyTimeoutClips(t *testing.T) {

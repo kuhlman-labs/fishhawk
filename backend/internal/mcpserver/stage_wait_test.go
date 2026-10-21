@@ -1069,6 +1069,48 @@ func TestStageWaitStatus_AgentPhaseWithoutElapsedUsesAttemptClock(t *testing.T) 
 	}
 }
 
+// TestStageWaitStatus_PhaseUnderUnknownAgentBudget: with agent_timeout_seconds
+// unresolved (0) a CURRENT agent-phase report sets phase / phase_elapsed but
+// leaves both remaining figures nil (unknown, never 0), while a CURRENT
+// gate-phase report still derives its deadline from the independently-known
+// gate budget (the README's #2540 gate-phase exception).
+func TestStageWaitStatus_PhaseUnderUnknownAgentBudget(t *testing.T) {
+	unbudgeted := func(p *StageProgress) []Stage {
+		stages := phaseImplementStage(10*time.Minute, p)
+		stages[0].AgentTimeoutSeconds = 0
+		return stages
+	}
+
+	agent := stageWaitStatusFor(unbudgeted(&StageProgress{
+		LastEvent: "agent_start", ReportedAt: waitBase.Add(-20 * time.Second),
+		Phase: "agent", PhaseElapsedSeconds: intPtr(100),
+	}), "implement", "running", 0, waitBase)
+	if agent == nil {
+		t.Fatal("agent: wait status nil")
+	}
+	if agent.Phase != "agent" || agent.PhaseElapsedSeconds == nil || *agent.PhaseElapsedSeconds != 120 {
+		t.Errorf("agent: phase/phase_elapsed = %q/%v, want agent/120", agent.Phase, fmtIntPtr(agent.PhaseElapsedSeconds))
+	}
+	if agent.AgentSecondsRemaining != nil || agent.DeadlineSecondsRemaining != nil {
+		t.Errorf("agent: agent_seconds_remaining/deadline = %v/%v, want nil/nil under an unknown agent budget",
+			fmtIntPtr(agent.AgentSecondsRemaining), fmtIntPtr(agent.DeadlineSecondsRemaining))
+	}
+
+	gate := stageWaitStatusFor(unbudgeted(&StageProgress{
+		LastEvent: "gate", ReportedAt: waitBase.Add(-20 * time.Second),
+		Phase: "gate", PhaseElapsedSeconds: intPtr(100), GateBudgetSeconds: intPtr(1020),
+		GateRemainingSeconds: intPtr(900),
+	}), "implement", "running", 0, waitBase)
+	if gate == nil {
+		t.Fatal("gate: wait status nil")
+	}
+	if gate.GateSecondsRemaining == nil || *gate.GateSecondsRemaining != 900 ||
+		gate.DeadlineSecondsRemaining == nil || *gate.DeadlineSecondsRemaining != 900 {
+		t.Errorf("gate: gate_seconds_remaining/deadline = %v/%v, want 900/900 (the gate budget is known independently)",
+			fmtIntPtr(gate.GateSecondsRemaining), fmtIntPtr(gate.DeadlineSecondsRemaining))
+	}
+}
+
 // TestStageWaitStatus_StaleReportFromPreviousAttemptIgnored pins the
 // current-attempt guard: the progress row survives a re-dispatch, so a gate
 // report with 0 remaining from the PREVIOUS attempt must not be read as the

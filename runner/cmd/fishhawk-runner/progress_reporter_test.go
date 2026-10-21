@@ -505,3 +505,71 @@ func TestProgressTee_ReportPhaseCarriesCountersAndEvent(t *testing.T) {
 		t.Errorf("phaseReportEvent(zero) = %q, want empty", got)
 	}
 }
+
+// slowIngestReporter simulates slow progress ingestion on the stage clock's
+// manual time source: every report advances it by delay, then returns err.
+type slowIngestReporter struct {
+	mc    *manualClock
+	delay time.Duration
+	err   error
+	calls atomic.Int32
+}
+
+func (s *slowIngestReporter) ReportStageProgress(ctx context.Context, _ upload.ReportStageProgressArgs) error {
+	s.calls.Add(1)
+	if _, ok := ctx.Deadline(); !ok {
+		return context.Canceled // the POST must run under a bounded context
+	}
+	s.mc.advance(s.delay)
+	return s.err
+}
+
+// TestProgressTee_SlowPhaseReportsAreNotChargedToGateBudget drives the REAL
+// reportPhase as the clock's report hook against delayed and timing-out
+// progress ingestion: the gate budget is charged only the verifies' own wall
+// time, so repeated slow reports never refuse a later verify.
+func TestProgressTee_SlowPhaseReportsAreNotChargedToGateBudget(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		delay time.Duration
+		err   error
+	}{
+		{"delayed", 4 * time.Minute, nil},
+		{"timing out", 40 * time.Second, context.DeadlineExceeded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var sink syncBuf
+			clock, mc := newTestPhaseClock(time.Hour, time.Minute) // budget 17m
+			rep := &slowIngestReporter{mc: mc, delay: tc.delay, err: tc.err}
+			tee := newProgressTee(&sink, rep, "run-1", "stage-1", "fhm_tok", &sink)
+			tee.phases = clock
+			clock.report = tee.reportPhase
+
+			clock.beginGate()
+			for i := 0; i < 5; i++ {
+				clock.startVerify()
+				mc.advance(30 * time.Second)
+				clock.endVerify()
+			}
+			if got := rep.calls.Load(); got != 11 {
+				t.Fatalf("phase reports = %d, want 11 (beginGate + 5 x start/end)", got)
+			}
+			if got, want := clock.gateRemaining(), clock.gateBudget-150*time.Second; got != want {
+				t.Errorf("gateRemaining = %s, want %s (five 30s verifies; report latency uncharged)", got, want)
+			}
+			if eff, clipped := clock.gateVerifyTimeout(time.Minute); eff != time.Minute || clipped {
+				t.Errorf("gateVerifyTimeout(1m) = (%s, %t), want (1m, false)", eff, clipped)
+			}
+			if clock.gateExhausted() {
+				t.Error("gate budget exhausted by slow progress ingestion")
+			}
+			wantFailures := 0
+			if tc.err != nil {
+				wantFailures = 11
+			}
+			if got := strings.Count(sink.String(), "stage_progress_report_failed"); got != wantFailures {
+				t.Errorf("stage_progress_report_failed lines = %d, want %d", got, wantFailures)
+			}
+		})
+	}
+}

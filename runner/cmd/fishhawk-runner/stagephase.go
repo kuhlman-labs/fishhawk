@@ -127,8 +127,10 @@ type stagePhaseSnapshot struct {
 // stagePhaseClock is the per-stage two-budget clock. now is time.Now in
 // production (monotonic, host-clock-skew free) and injectable in tests. report,
 // when set, is called OUTSIDE the lock after every transition with the new
-// snapshot — wired to progressTee.reportPhase, which may block up to
-// progressReportTimeout.
+// snapshot — wired to progressTee.reportPhase, which blocks for one report's
+// worst case (an in-flight heartbeat's bearer refresh and POST, then its own:
+// ~40s against a wedged backend). That latency is never charged: startVerify
+// re-stamps its mark after the report returns.
 type stagePhaseClock struct {
 	mu          sync.Mutex
 	now         func() time.Time
@@ -210,11 +212,24 @@ func (c *stagePhaseClock) beginGate() {
 	})
 }
 
-// startVerify marks one verify execution as in flight.
+// startVerify marks one verify execution as in flight. The mark is set before
+// the gate:verify report, so that report (and a heartbeat read while it is in
+// flight) says a verify is running, and RE-STAMPED once the report returns:
+// both chokepoints spawn the verify only after startVerify returns, so the
+// report's own latency (the reporting slot, the bearer refresh and the POST)
+// is never charged to the gate budget.
 func (c *stagePhaseClock) startVerify() {
 	c.transition(func(now time.Time) {
 		c.verifyStart = now
 	})
+	if c == nil {
+		return
+	}
+	c.mu.Lock()
+	if !c.verifyStart.IsZero() {
+		c.verifyStart = c.now()
+	}
+	c.mu.Unlock()
 }
 
 // endVerify charges the in-flight verify's wall time to the gate budget. A

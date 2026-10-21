@@ -164,7 +164,11 @@ func (t *progressTee) Write(p []byte) (int, error) {
 // heartbeat's turns/tokens plus a runner-authored last_event: agent_start,
 // gate, or gate:verify while a verify is in flight. A failure is one
 // stage_progress_report_failed line and is dropped (guard 4): it never fails
-// or extends the stage beyond that bound.
+// the stage. The bound per call is NOT progressReportTimeout alone: the slot
+// wait can cover an in-flight heartbeat's bearer refresh
+// (mcpTokenRefreshTimeout, 15s) and POST (5s), and this call then pays its
+// own refresh and POST, so ~40s against a wedged backend. The stage clock
+// never charges that latency to the gate budget (startVerify re-stamps).
 func (t *progressTee) reportPhase(snap stagePhaseSnapshot) {
 	if t == nil || t.client == nil || t.token == "" {
 		return
