@@ -172,11 +172,11 @@ func New(apiKey string) *Invoker {
 // transient interleaved-thinking API 400 (agent.ErrAgentThinkingBlock):
 // a single transient harness fault re-spawns the agent fresh from the
 // same prompt rather than wasting the whole stage attempt. Every other
-// failure (timeout, budget, generic non-zero exit) is returned on the
-// first attempt with no retry. The aggregate Result carries every
-// attempt's events in order — with an agent_retry marker between them —
-// and the cumulative token total across all attempts, so cost stays
-// honest even when a retry doubles spend.
+// failure (timeout, budget, generic non-zero exit, a refused session
+// resume) is returned on the first attempt with no retry. The aggregate
+// Result carries every attempt's events in order — with an agent_retry
+// marker between them — and the cumulative token total across all
+// attempts, so cost stays honest even when a retry doubles spend.
 func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Result, error) {
 	maxAttempts := i.MaxThinkingBlockRetries + 1
 
@@ -188,8 +188,8 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		// cumulative across attempts on purpose: a retry really does
 		// spend the tokens twice and the trace must say so. The
 		// input/output split accumulates the same way so the cost
-		// rollup matches TokensUsed. Model is the latest non-empty id
-		// reported across attempts.
+		// rollup matches TokensUsed. Model and SessionID are the latest
+		// non-empty values reported across attempts.
 		agg.Events = append(agg.Events, res.Events...)
 		agg.TokensUsed += res.TokensUsed
 		agg.InputTokens += res.InputTokens
@@ -198,6 +198,9 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		agg.CacheWriteInputTokens += res.CacheWriteInputTokens
 		if res.Model != "" {
 			agg.Model = res.Model
+		}
+		if res.SessionID != "" {
+			agg.SessionID = res.SessionID
 		}
 		// Structured output (#1325): latest non-empty attempt wins, like Model.
 		if len(res.StructuredOutput) > 0 {
@@ -225,20 +228,30 @@ func (i *Invoker) Invoke(ctx context.Context, inv agent.Invocation) (agent.Resul
 		// the boundary and re-spawn a fresh `claude` process from the
 		// same prompt. We deliberately do NOT git-reset/clean the
 		// working tree between attempts: in local --no-pr mode the tree
-		// is the operator's own repo, so a reset would be destructive,
-		// and a fresh `claude --print` exec carries no conversation
-		// state anyway (no --continue/--resume), so the partial edits
-		// the killed attempt left are a safe, intended starting point.
-		// This mirrors fishhawk_retry_stage semantics. Do not "fix"
-		// this into a reset.
+		// is the operator's own repo, so a reset would be destructive.
+		// The partial edits the killed attempt left are a safe, intended
+		// starting point. This mirrors fishhawk_retry_stage semantics. Do
+		// not "fix" this into a reset.
+		//
+		// INVARIANT: a retry never carries the faulted conversation. The
+		// re-spawn passes no --continue, and a resumed invocation
+		// (ResumeSessionID set, #4089) has its resume id CLEARED here, so
+		// the retry starts a fresh session from the same prompt rather
+		// than re-loading the history whose thinking blocks the API just
+		// rejected. resume_dropped on the agent_retry event records it.
+		payload := map[string]any{
+			"attempt":       attempt,
+			"reason":        "agent_api_thinking_block",
+			"tokens_so_far": agg.TokensUsed,
+		}
+		if inv.ResumeSessionID != "" {
+			inv.ResumeSessionID = ""
+			payload["resume_dropped"] = true
+		}
 		agg.Events = append(agg.Events, agent.Event{
 			Kind:      "agent_retry",
 			Timestamp: i.now(),
-			Payload: agent.MakePayload(map[string]any{
-				"attempt":       attempt,
-				"reason":        "agent_api_thinking_block",
-				"tokens_so_far": agg.TokensUsed,
-			}),
+			Payload:   agent.MakePayload(payload),
 		})
 	}
 }
@@ -366,6 +379,17 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	if inv.JSONSchema != "" {
 		args = append(args, "--json-schema", inv.JSONSchema)
 	}
+	// --resume: continue the recorded session (#4089) so the prompt is sent
+	// as the next turn of the implement agent's conversation rather than to a
+	// fresh agent. Print-mode sessions are persisted to disk by default (the
+	// runner passes no --no-session-persistence) and filed per working
+	// directory, so the caller must spawn in the session's original cwd. An
+	// empty inv.ResumeSessionID appends NO flag, so the spawn is byte-identical
+	// to today. A missing session fails before any model call and is
+	// classified below as agent.ErrSessionResumeFailed.
+	if inv.ResumeSessionID != "" {
+		args = append(args, "--resume", inv.ResumeSessionID)
+	}
 	args = append(args, "-p", inv.Prompt)
 	// An ExecWrapper (the acceptance net sandbox, #3393) becomes the
 	// process name with the binary + args appended positionally; an empty
@@ -468,6 +492,9 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	cacheReadInputTokens := 0
 	cacheWriteInputTokens := 0
 	model := ""
+	// sessionID is the latest non-empty top-level session_id the stream
+	// surfaced (#4089): system.init, assistant and result events all carry it.
+	sessionID := ""
 	budgetHit := false
 	// Loop / duplicate-action detection (#653). The detector watches the
 	// tool-call signature stream and trips on an unbroken run of identical
@@ -601,6 +628,9 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		if info.Model != "" {
 			model = info.Model
 		}
+		if info.SessionID != "" {
+			sessionID = info.SessionID
+		}
 		res.Events = append(res.Events, ev)
 		if ev.Kind == "result" || strings.HasPrefix(ev.Kind, "result.") {
 			resultPayload = append([]byte(nil), ev.Payload...)
@@ -733,6 +763,7 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	res.CacheReadInputTokens = cacheReadInputTokens
 	res.CacheWriteInputTokens = cacheWriteInputTokens
 	res.Model = model
+	res.SessionID = sessionID
 	res.StructuredOutput = structuredOutput
 
 	// A non-zero exit whose result payload or stderr carries the
@@ -746,6 +777,11 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 	// derived from the same fake-clock seam (now/start) the heartbeat uses,
 	// so the quota-unavailable wall-clock bound is deterministic in tests.
 	elapsed := now().Sub(start)
+	// resumeMiss is the CLI's resume-not-found marker on this attempt's
+	// terminal result errors[] or stderr; "" when absent. Only the
+	// session_resume_failed arm below reads it, and that arm is gated on a
+	// resumed spawn itself.
+	resumeMiss := resumeNotFoundMarker(resultPayload, stderrBuf.String())
 
 	switch {
 	case budgetHit:
@@ -801,6 +837,25 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 			"external_api",
 		), false, fmt.Errorf("%w: %v", agent.ErrExternalAPI, waitErr)
 
+	case inv.ResumeSessionID != "" && waitErr != nil && tokensUsed == 0 && model == "" && resumeMiss != "":
+		// A RESUMED spawn the CLI refused before any model call because the
+		// session does not exist (#4089). Fingerprint, probed on claude
+		// 2.1.305: exit 1, one result event (subtype error_during_execution,
+		// num_turns 0, all-zero usage, session_id ECHOING the requested id,
+		// errors ["No conversation found with session ID: <id>"]) and the
+		// same text on stderr. That is also the zero-token, no-model,
+		// fast-exit shape the quota arm below matches, so this arm sits
+		// BEFORE it. The not-found marker is a REQUIRED conjunct: a resumed
+		// spawn that dies with zero tokens WITHOUT it (a real quota cap)
+		// falls through to the quota / agent_error arms, so the caller never
+		// burns a doomed fresh re-spawn against a cap. Category "A", the
+		// ErrSessionResumeFailed peer sentinel, NOT retried in-driver: the
+		// caller decides whether to re-invoke fresh without the resume id.
+		detail := fmt.Sprintf("claude could not resume session %s (%s): %v",
+			inv.ResumeSessionID, resumeMiss, waitErr)
+		return failureResult(res, now(), "A", "session resume failed: "+detail, "session_resume_failed"),
+			false, fmt.Errorf("%w: %s", agent.ErrSessionResumeFailed, detail)
+
 	case isQuotaUnavailable(waitErr, tokensUsed, model, elapsed):
 		// Model-quota exhaustion (a usage / rate cap): the agent exited
 		// non-zero having reached no model call (0 tokens, no model id) within
@@ -811,9 +866,10 @@ func (i *Invoker) invokeOnce(ctx context.Context, inv agent.Invocation) (agent.R
 		// model quota" reason phrase let the operator surface tell it apart
 		// from a transient crash. NOT retried in-driver (false): re-running the
 		// same prompt against an unreset cap would fail identically. Checked
-		// AFTER the thinking-block and external-API arms so a fast zero-token
-		// exit that ALSO carried a thinking-block marker or a 5xx
-		// api_error_status still classifies as those; a failure with tokens>0,
+		// AFTER the thinking-block, external-API and session-resume-miss arms
+		// so a fast zero-token exit that ALSO carried a thinking-block marker,
+		// a 5xx api_error_status, or (resumed) the not-found marker still
+		// classifies as those; a failure with tokens>0,
 		// a model id, or elapsed over the bound falls through unchanged to the
 		// generic agent_error arm.
 		return failureResult(res, now(), "A",
@@ -914,6 +970,42 @@ func isQuotaUnavailable(waitErr error, tokensUsed int, model string, elapsed tim
 	return waitErr != nil && tokensUsed == 0 && model == "" && elapsed <= quotaUnavailableMaxWall
 }
 
+// resumeNotFoundFragment is the durable, case-insensitive fragment of the
+// claude CLI's resume-miss message ("No conversation found with session ID:
+// <id>", claude 2.1.305). Matched as a fragment rather than the full sentence
+// so minor wording drift around the id does not silently regress the arm.
+const resumeNotFoundFragment = "no conversation found"
+
+// resumeNotFoundMarker returns the CLI's resume-not-found message when the
+// terminal result event's errors[] or stderr carries it, and "" otherwise
+// (#4089). The result payload is read only through its errors[] strings, so
+// an agent's own prose quoting the phrase in `result` cannot fabricate a
+// match; stderr is matched line by line. Fail-soft: an unparseable payload
+// contributes nothing, leaving stderr to decide. Pure, like
+// isThinkingBlock400.
+func resumeNotFoundMarker(resultPayload []byte, stderr string) string {
+	var meta struct {
+		Errors []json.RawMessage `json:"errors"`
+	}
+	if err := json.Unmarshal(resultPayload, &meta); err == nil {
+		for _, raw := range meta.Errors {
+			var s string
+			if json.Unmarshal(raw, &s) != nil {
+				continue
+			}
+			if strings.Contains(strings.ToLower(s), resumeNotFoundFragment) {
+				return strings.TrimSpace(s)
+			}
+		}
+	}
+	for _, line := range strings.Split(stderr, "\n") {
+		if strings.Contains(strings.ToLower(line), resumeNotFoundFragment) {
+			return strings.TrimSpace(line)
+		}
+	}
+	return ""
+}
+
 func (i *Invoker) now() time.Time {
 	if i.Now != nil {
 		return i.Now()
@@ -956,6 +1048,9 @@ type lineInfo struct {
 	CacheReadInputTokens  int
 	CacheWriteInputTokens int
 	Model                 string
+	// SessionID is the line's top-level `session_id` (#4089), present on
+	// system.init, assistant and result events; "" when absent.
+	SessionID string
 	// StructuredOutput is the raw JSON bytes of the line's top-level
 	// `structured_output` field, present on the terminal result event when
 	// the invocation carried a --json-schema (#1325). nil otherwise.
@@ -1001,6 +1096,7 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 		Type             string          `json:"type"`
 		Subtype          string          `json:"subtype"`
 		Model            string          `json:"model"`
+		SessionID        string          `json:"session_id"`
 		Usage            *usageBlock     `json:"usage"`
 		StructuredOutput json.RawMessage `json:"structured_output"`
 		Message          *struct {
@@ -1036,6 +1132,7 @@ func parseLine(line []byte, ts time.Time) (agent.Event, lineInfo, bool) {
 
 	var info lineInfo
 	info.Model = model
+	info.SessionID = meta.SessionID
 	// Capture structured_output (#1325) — copy out of the trimmed backing
 	// slice; skip a literal JSON null so it reads as absent.
 	if len(meta.StructuredOutput) > 0 && string(bytes.TrimSpace(meta.StructuredOutput)) != "null" {
