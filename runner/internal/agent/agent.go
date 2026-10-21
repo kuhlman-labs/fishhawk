@@ -124,6 +124,19 @@ type Invocation struct {
 	// StructuredOutput stays nil).
 	JSONSchema string
 
+	// ResumeSessionID, when non-empty, asks the agent CLI to RESUME the
+	// recorded session with that id and send Prompt as the next turn of it,
+	// instead of starting a fresh conversation (#4089): the runner sets it on
+	// an operator fix-up pass so the implement agent's context carries over
+	// and only the delta turn is sent. The claudecode adapter appends
+	// `--resume <id>`; a resumed spawn the CLI refuses before any model call
+	// (no such session) fails with ErrSessionResumeFailed so the caller can
+	// fall back to a fresh spawn. An EMPTY value appends NO flag, so the
+	// spawn is byte-identical to today's behavior. Honored only by the
+	// claudecode backend, like JSONSchema; any other backend ignores it and
+	// spawns fresh.
+	ResumeSessionID string
+
 	// ExecWrapper, when non-empty, is an OS-level confinement wrapper the
 	// adapter execs INSTEAD of the agent binary: the process name becomes
 	// ExecWrapper[0] and the argv is ExecWrapper[1:] ++ [binary] ++ args
@@ -223,6 +236,17 @@ type Result struct {
 	// (G6): the same model id keys pricing.Cost and is recorded on
 	// the run/audit trail. Empty when the agent didn't surface it.
 	Model string
+
+	// SessionID is the agent CLI's session id for this invocation (the
+	// top-level `session_id` on Claude Code's stream-json events), the
+	// handle a later invocation passes back as Invocation.ResumeSessionID
+	// (#4089). Like Model it is the latest non-empty value seen across
+	// in-driver retries, so after a thinking-block retry it names the
+	// fresh attempt's session. Empty when the agent didn't surface one;
+	// only the claudecode backend populates it. On a failed resume the CLI
+	// echoes the REQUESTED id here, so a caller must not record a session
+	// from a Result whose OK is false.
+	SessionID string
 
 	// APIErrorStatus is the terminal result event's api_error_status when a
 	// 5xx external-API error (e.g. 529 overloaded) killed the invocation with
@@ -364,6 +388,18 @@ var (
 	// argv byte counts (ArgvBytes) so the cause is named, never a raw
 	// fork/exec string.
 	ErrPromptTooLarge = errors.New("agent: prompt exceeds the OS argument-size limit")
+
+	// ErrSessionResumeFailed marks a RESUMED spawn (Invocation.ResumeSessionID
+	// set) that the agent CLI refused before any model call because it could
+	// not find the session — claude's `No conversation found with session ID`
+	// exit (#4089). It is a PEER sentinel and does NOT wrap ErrAgentFailed, so
+	// err_class classification stays unambiguous; Result.FailureCategory stays
+	// "A". It is recoverable rather than terminal: the caller re-invokes the
+	// same prompt fresh, without the resume id. Adapters classify it only when
+	// the CLI's not-found marker is present, so a resumed spawn that dies with
+	// zero tokens for any OTHER reason (a quota cap) keeps its own sentinel and
+	// never triggers a doomed fresh re-spawn. Not retried in-driver.
+	ErrSessionResumeFailed = errors.New("agent: session resume failed")
 )
 
 // ArgvBytes returns the execve accounting size of args: the length of each

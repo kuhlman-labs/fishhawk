@@ -324,6 +324,64 @@ func TestHelperProcess(t *testing.T) {
 		fmt.Println(`{"type":"system","subtype":"init"}`)
 		fmt.Println(strings.Repeat("x", 500))
 		fmt.Println(`{"type":"result","usage":{"input_tokens":11,"output_tokens":13}}`)
+	case "session":
+		// The CLI reports the conversation's session_id on system.init and
+		// again on the result event (#4089); the adapter must surface it on
+		// Result.SessionID so the runner can resume it later.
+		fmt.Printf(`{"type":"system","subtype":"init","session_id":%q}`+"\n", helperSessionID)
+		fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8","content":[{"type":"text","text":"done"}]}}`)
+		fmt.Printf(`{"type":"result","subtype":"success","session_id":%q,"usage":{"input_tokens":5,"output_tokens":7}}`+"\n", helperSessionID)
+	case "session_thinking_then_ok":
+		// Two attempts across a thinking-block retry, each in its OWN session:
+		// attempt 1 (session sessAttempt1) dies on the thinking-block 400,
+		// attempt 2 (session sessAttempt2) succeeds. Stateful via MARKER_FILE.
+		marker := os.Getenv("MARKER_FILE")
+		if _, err := os.Stat(marker); err != nil {
+			_ = os.WriteFile(marker, []byte("1"), 0o600)
+			fmt.Printf(`{"type":"system","subtype":"init","session_id":%q}`+"\n", sessAttempt1)
+			fmt.Printf(`{"type":"result","subtype":"error","is_error":true,"api_error_status":400,"session_id":%q,"result":"thinking blocks in the latest assistant message cannot be modified"}`+"\n", sessAttempt1)
+			helperExit(1)
+		}
+		fmt.Printf(`{"type":"system","subtype":"init","session_id":%q}`+"\n", sessAttempt2)
+		fmt.Println(`{"type":"assistant","content":"recovered"}`)
+		fmt.Printf(`{"type":"result","subtype":"success","session_id":%q,"usage":{"input_tokens":10,"output_tokens":20}}`+"\n", sessAttempt2)
+	case "resume_not_found":
+		// The EXACT bytes claude 2.1.305 emits for `--resume <missing id>`
+		// (probed on this host, #4089): one result event and the marker on
+		// stderr, exit 1, no model call.
+		fmt.Println(resumeNotFoundResultLine)
+		fmt.Fprintln(os.Stderr, resumeNotFoundStderr)
+		helperExit(1)
+	case "resume_no_marker":
+		// The SAME zero-token, no-model, fast-exit shape as resume_not_found,
+		// but WITHOUT the not-found marker anywhere (C1): the shape a real
+		// quota cap takes on a resumed spawn. Must classify as quota, never
+		// as a session-resume failure.
+		fmt.Println(resumeNoMarkerResultLine)
+		fmt.Fprintln(os.Stderr, "cannot obtain model quota")
+		helperExit(1)
+	case "resume_marker_variant":
+		// The not-found marker on stderr, but each VARIANT breaks exactly ONE
+		// other conjunct of the session_resume_failed arm, so deleting that
+		// conjunct is the only way the variant classifies as a resume miss.
+		switch os.Getenv("VARIANT") {
+		case "model_seen": // a model call was reached (model id), zero tokens
+			fmt.Println(`{"type":"system","subtype":"init"}`)
+			fmt.Println(`{"type":"assistant","message":{"model":"claude-opus-4-8"}}`)
+			fmt.Fprintln(os.Stderr, resumeNotFoundStderr)
+			helperExit(1)
+		case "tokens_seen": // usage reported, no model id
+			fmt.Println(`{"type":"system","subtype":"init"}`)
+			fmt.Println(`{"type":"result","subtype":"error","usage":{"input_tokens":30,"output_tokens":12}}`)
+			fmt.Fprintln(os.Stderr, resumeNotFoundStderr)
+			helperExit(1)
+		case "clean_exit": // exit 0, no tokens, no model
+			fmt.Println(`{"type":"system","subtype":"init"}`)
+			fmt.Fprintln(os.Stderr, resumeNotFoundStderr)
+		default:
+			fmt.Fprintln(os.Stderr, "unknown VARIANT")
+			helperExit(2)
+		}
 	default:
 		fmt.Fprintln(os.Stderr, "unknown HELPER_MODE")
 		helperExit(2)
@@ -342,6 +400,25 @@ const advResultObj = `{"type":"result","subtype":"success","usage":{"input_token
 // were removed, each would fire an out_of_tree_write event and the identical
 // signatures would trip the loop detector (#3020).
 const advWriteObj = `{"type":"assistant","message":{"content":[{"type":"tool_use","name":"Write","input":{"file_path":"/etc/fishhawk-evil.txt"}}]}}`
+
+// Session-resume fixtures (#4089).
+const (
+	helperSessionID = "5b2c0f0e-1111-4aaa-8bbb-000000000001"
+	sessAttempt1    = "5b2c0f0e-1111-4aaa-8bbb-00000000000a"
+	sessAttempt2    = "5b2c0f0e-1111-4aaa-8bbb-00000000000b"
+	// deadSessionID is the id the resume_not_found fixture was probed with.
+	deadSessionID = "00000000-0000-4000-8000-000000000000"
+	// resumeNotFoundResultLine is the verbatim stdout of
+	// `claude -p --verbose --output-format stream-json --resume <deadSessionID> hi`
+	// on claude 2.1.305: subtype error_during_execution, num_turns 0, all-zero
+	// usage, session_id ECHOING the requested id, and the marker in errors[].
+	resumeNotFoundResultLine = `{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"00000000-0000-4000-8000-000000000000","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":[],"uuid":"4f288de4-0c78-47a1-b77b-c929015f8686","errors":["No conversation found with session ID: 00000000-0000-4000-8000-000000000000"],"result_index":0}`
+	// resumeNotFoundStderr is the same probe's stderr.
+	resumeNotFoundStderr = "No conversation found with session ID: 00000000-0000-4000-8000-000000000000"
+	// resumeNoMarkerResultLine is resumeNotFoundResultLine with ONLY the
+	// errors[] entry changed to a non-marker message (C1 isolation).
+	resumeNoMarkerResultLine = `{"type":"result","subtype":"error_during_execution","duration_ms":0,"duration_api_ms":0,"is_error":true,"num_turns":0,"stop_reason":null,"session_id":"00000000-0000-4000-8000-000000000000","total_cost_usd":0,"usage":{"output_tokens_details":{"thinking_tokens":0},"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0,"server_tool_use":{"web_search_requests":0,"web_fetch_requests":0},"service_tier":"standard","cache_creation":{"ephemeral_1h_input_tokens":0,"ephemeral_5m_input_tokens":0},"inference_geo":"","iterations":[],"speed":"standard","fallback_credit":null},"modelUsage":{},"permission_denials":[],"uuid":"4f288de4-0c78-47a1-b77b-c929015f8686","errors":["cannot obtain model quota"],"result_index":0}`
+)
 
 // helperCommand returns a Cmd-builder that re-execs the test
 // binary as the `claude` stand-in, passing through HELPER_MODE.
@@ -2890,4 +2967,312 @@ func TestInvoke_StampsRunAgentMarker(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestInvoke_ResumeSessionID_AppendsResumeFlag pins the session-resume spawn
+// (#4089): a non-empty ResumeSessionID appends `--resume <id>` immediately
+// before `-p <prompt>` (after every other optional flag), and an empty one
+// appends NO --resume token, byte-identical to the spawn without the field.
+func TestInvoke_ResumeSessionID_AppendsResumeFlag(t *testing.T) {
+	capture := func(t *testing.T, in agent.Invocation) []string {
+		t.Helper()
+		var captured []string
+		inv := &Invoker{Cmd: capturingHelperCommand(&captured), Now: frozenNow()}
+		if _, err := inv.Invoke(context.Background(), in); err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		return captured
+	}
+	t.Run("non-empty id appends --resume before -p", func(t *testing.T) {
+		got := capture(t, agent.Invocation{Prompt: "fixup turn", Model: "m", ReasoningEffort: "high", JSONSchema: "{}", ResumeSessionID: "sess-1"})
+		want := []string{"--json-schema", "{}", "--resume", "sess-1", "-p", "fixup turn"}
+		if !argsContainSeq(got, want) {
+			t.Fatalf("expected contiguous %q in args, got %q", want, got)
+		}
+	})
+	t.Run("empty id omits --resume (byte-identical spawn)", func(t *testing.T) {
+		base := capture(t, agent.Invocation{Prompt: "p", Model: "m"})
+		got := capture(t, agent.Invocation{Prompt: "p", Model: "m", ResumeSessionID: ""})
+		if !reflect.DeepEqual(got, base) {
+			t.Fatalf("empty ResumeSessionID changed the spawn:\n got  %q\n want %q", got, base)
+		}
+		if argsHaveFlag(got, "--resume") {
+			t.Fatalf("expected NO --resume flag for an empty ResumeSessionID, got %q", got)
+		}
+	})
+}
+
+// TestParseLine_SessionID pins the stream-json field the session id is read
+// from: the top-level session_id, on any event type (#4089).
+func TestParseLine_SessionID(t *testing.T) {
+	cases := []struct {
+		name, line, want string
+	}{
+		{"system_init", `{"type":"system","subtype":"init","session_id":"s-init"}`, "s-init"},
+		{"result", `{"type":"result","session_id":"s-res","usage":{"input_tokens":1,"output_tokens":1}}`, "s-res"},
+		{"absent", `{"type":"assistant","message":{"model":"m"}}`, ""},
+		{"non_json", `not json`, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			_, info, _ := parseLine([]byte(tc.line), time.Unix(0, 0))
+			if info.SessionID != tc.want {
+				t.Errorf("SessionID = %q, want %q", info.SessionID, tc.want)
+			}
+		})
+	}
+}
+
+// TestInvoke_CapturesSessionID asserts the CLI-reported session id reaches
+// Result.SessionID through the real scan loop (#4089), and that across a
+// thinking-block retry the LATEST attempt's id wins (each attempt is its own
+// session, so the earlier one names a conversation the run abandoned).
+func TestInvoke_CapturesSessionID(t *testing.T) {
+	t.Run("single attempt", func(t *testing.T) {
+		inv := &Invoker{Cmd: helperCommand("session"), Now: frozenNow()}
+		res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"})
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if res.SessionID != helperSessionID {
+			t.Errorf("SessionID = %q, want %q", res.SessionID, helperSessionID)
+		}
+	})
+	t.Run("latest attempt wins across a thinking-block retry", func(t *testing.T) {
+		marker := filepath.Join(t.TempDir(), "attempt.marker")
+		inv := &Invoker{
+			Cmd:                     helperCommandWithEnv("session_thinking_then_ok", "MARKER_FILE="+marker),
+			Now:                     frozenNow(),
+			MaxThinkingBlockRetries: 1,
+		}
+		res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"})
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if got := countInvocationStarts(res); got != 2 {
+			t.Fatalf("invocation_start count = %d, want 2 (fixture must retry)", got)
+		}
+		if res.SessionID != sessAttempt2 {
+			t.Errorf("SessionID = %q, want the retry's session %q (not attempt 1's %q)", res.SessionID, sessAttempt2, sessAttempt1)
+		}
+	})
+}
+
+// TestInvoke_ResumeNotFound_ReturnsSessionResumeFailed replays the exact
+// claude 2.1.305 bytes for `--resume <missing id>` on a RESUMED invocation
+// and asserts the peer sentinel ErrSessionResumeFailed (#4089). That fixture
+// is also exactly the zero-token, no-model, fast-exit shape the quota arm
+// matches, so with the new arm deleted it classifies as quota: the sentinel
+// assertion is what discriminates.
+func TestInvoke_ResumeNotFound_ReturnsSessionResumeFailed(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("resume_not_found"), Now: frozenNow(), MaxThinkingBlockRetries: 1}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", ResumeSessionID: deadSessionID})
+	if !errors.Is(err, agent.ErrSessionResumeFailed) {
+		t.Fatalf("err = %v, want wrapping ErrSessionResumeFailed", err)
+	}
+	if errors.Is(err, agent.ErrAgentQuotaUnavailable) || errors.Is(err, agent.ErrAgentFailed) {
+		t.Errorf("err = %v, must be the peer sentinel only (not quota, not ErrAgentFailed)", err)
+	}
+	if res.OK {
+		t.Error("OK = true on a refused resume")
+	}
+	if res.FailureCategory != "A" {
+		t.Errorf("FailureCategory = %q, want A", res.FailureCategory)
+	}
+	if got := terminalOutcome(res); got != "session_resume_failed" {
+		t.Errorf("invocation_end outcome = %q, want session_resume_failed", got)
+	}
+	if !strings.Contains(res.FailureReason, "No conversation found with session ID") {
+		t.Errorf("FailureReason = %q, want it to quote the CLI marker", res.FailureReason)
+	}
+	if got := countInvocationStarts(res); got != 1 {
+		t.Errorf("invocation_start count = %d, want 1 (not retried in-driver)", got)
+	}
+	// The CLI echoes the REQUESTED (dead) id on the failed result: the
+	// documented reason a caller must never record a session from a failed
+	// Result.
+	if res.SessionID != deadSessionID {
+		t.Errorf("SessionID = %q, want the echoed requested id %q", res.SessionID, deadSessionID)
+	}
+}
+
+// TestInvoke_ResumeNotFoundShape_WithoutResume_StaysQuota runs the SAME probed
+// bytes on a FRESH invocation (no ResumeSessionID): the arm is gated on a
+// resumed spawn, so the shape keeps its #2085 quota classification.
+func TestInvoke_ResumeNotFoundShape_WithoutResume_StaysQuota(t *testing.T) {
+	inv := &Invoker{Cmd: helperCommand("resume_not_found"), Now: frozenNow()}
+	res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p"})
+	if !errors.Is(err, agent.ErrAgentQuotaUnavailable) {
+		t.Fatalf("err = %v, want ErrAgentQuotaUnavailable on a fresh spawn", err)
+	}
+	if errors.Is(err, agent.ErrSessionResumeFailed) {
+		t.Errorf("err = %v, a fresh spawn must never classify as a resume failure", err)
+	}
+	if got := terminalOutcome(res); got != "agent_quota_unavailable" {
+		t.Errorf("invocation_end outcome = %q, want agent_quota_unavailable", got)
+	}
+}
+
+// TestInvoke_ResumedZeroTokenExitWithoutMarker_StaysQuota is approval
+// condition C1: on a RESUMED spawn, a zero-token, no-model, fast non-zero exit
+// WITHOUT the not-found marker is a quota cap, not a resume miss, so it keeps
+// ErrAgentQuotaUnavailable and the caller never spends a doomed fresh
+// re-spawn on it. The first row is the probed resume-miss bytes with ONLY the
+// errors[] marker swapped out, isolating the marker conjunct.
+func TestInvoke_ResumedZeroTokenExitWithoutMarker_StaysQuota(t *testing.T) {
+	for _, mode := range []string{"resume_no_marker", "quota_unavailable"} {
+		t.Run(mode, func(t *testing.T) {
+			inv := &Invoker{Cmd: helperCommand(mode), Now: frozenNow(), MaxThinkingBlockRetries: 1}
+			res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", ResumeSessionID: deadSessionID})
+			if !errors.Is(err, agent.ErrAgentQuotaUnavailable) {
+				t.Fatalf("err = %v, want ErrAgentQuotaUnavailable (no not-found marker)", err)
+			}
+			if errors.Is(err, agent.ErrSessionResumeFailed) {
+				t.Errorf("err = %v, a marker-less exit must not classify as a resume failure", err)
+			}
+			if got := terminalOutcome(res); got != "agent_quota_unavailable" {
+				t.Errorf("invocation_end outcome = %q, want agent_quota_unavailable", got)
+			}
+			if got := countInvocationStarts(res); got != 1 {
+				t.Errorf("invocation_start count = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// TestInvoke_ResumeNotFoundArm_RequiresNoModelCallAndFailedExit isolates the
+// arm's remaining conjuncts. Each variant carries the not-found marker on a
+// resumed spawn but breaks exactly one other conjunct, so only that
+// conjunct keeps it off session_resume_failed.
+func TestInvoke_ResumeNotFoundArm_RequiresNoModelCallAndFailedExit(t *testing.T) {
+	cases := []struct {
+		variant     string
+		wantOK      bool
+		wantErr     error
+		wantOutcome string
+	}{
+		{"model_seen", false, agent.ErrAgentFailed, "agent_error"},
+		{"tokens_seen", false, agent.ErrAgentFailed, "agent_error"},
+		{"clean_exit", true, nil, "ok"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.variant, func(t *testing.T) {
+			inv := &Invoker{Cmd: helperCommandWithEnv("resume_marker_variant", "VARIANT="+tc.variant), Now: frozenNow()}
+			res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "p", ResumeSessionID: deadSessionID})
+			if tc.wantErr == nil {
+				if err != nil {
+					t.Fatalf("err = %v, want nil", err)
+				}
+			} else if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("err = %v, want wrapping %v", err, tc.wantErr)
+			}
+			if errors.Is(err, agent.ErrSessionResumeFailed) {
+				t.Errorf("err = %v, must not classify as a resume failure", err)
+			}
+			if res.OK != tc.wantOK {
+				t.Errorf("OK = %v, want %v", res.OK, tc.wantOK)
+			}
+			if got := terminalOutcome(res); got != tc.wantOutcome {
+				t.Errorf("invocation_end outcome = %q, want %q", got, tc.wantOutcome)
+			}
+		})
+	}
+}
+
+// TestResumeNotFoundMarker pins the pure marker reader: the result payload is
+// read only through errors[], so an agent's own prose quoting the phrase in
+// `result` cannot fabricate a resume miss; stderr matches line by line.
+func TestResumeNotFoundMarker(t *testing.T) {
+	cases := []struct {
+		name, payload, stderr, want string
+	}{
+		{"errors_entry", resumeNotFoundResultLine, "", resumeNotFoundStderr},
+		{"stderr_only", `{"type":"result"}`, "warn: x\n" + resumeNotFoundStderr + "\n", resumeNotFoundStderr},
+		{"unparseable_payload_stderr_decides", `{not json`, resumeNotFoundStderr, resumeNotFoundStderr},
+		{"prose_in_result_field_ignored", `{"type":"result","result":"No conversation found with session ID: x","errors":["other"]}`, "", ""},
+		{"non_string_errors_entry_ignored", `{"type":"result","errors":[{"msg":"No conversation found"}]}`, "", ""},
+		{"neither", resumeNoMarkerResultLine, "cannot obtain model quota", ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := resumeNotFoundMarker([]byte(tc.payload), tc.stderr); got != tc.want {
+				t.Errorf("resumeNotFoundMarker = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestInvoke_ThinkingBlockRetry_DropsResume pins the retry invariant (#4089):
+// a retry never carries the faulted conversation. Attempt 1 of a resumed
+// invocation carries `--resume sess-1`; the thinking-block retry re-spawns
+// with NO --resume and the identical -p prompt, and the agent_retry event
+// records resume_dropped=true. A non-resumed retry's payload is unchanged.
+func TestInvoke_ThinkingBlockRetry_DropsResume(t *testing.T) {
+	run := func(t *testing.T, resumeID string) ([][]string, agent.Result) {
+		t.Helper()
+		marker := filepath.Join(t.TempDir(), "attempt.marker")
+		var argvs [][]string
+		inv := &Invoker{
+			Now:                     frozenNow(),
+			MaxThinkingBlockRetries: 1,
+			Cmd: func(ctx context.Context, _ string, args ...string) *exec.Cmd {
+				argvs = append(argvs, append([]string(nil), args...))
+				c := exec.CommandContext(ctx, os.Args[0], "-test.run=TestHelperProcess")
+				c.Env = append(os.Environ(), "GO_HELPER_PROCESS=1", "HELPER_MODE=session_thinking_then_ok", "MARKER_FILE="+marker)
+				return c
+			},
+		}
+		res, err := inv.Invoke(context.Background(), agent.Invocation{Prompt: "fixup turn", ResumeSessionID: resumeID})
+		if err != nil {
+			t.Fatalf("Invoke: %v", err)
+		}
+		if len(argvs) != 2 {
+			t.Fatalf("attempts = %d, want 2", len(argvs))
+		}
+		return argvs, res
+	}
+	retryPayload := func(t *testing.T, res agent.Result) map[string]any {
+		t.Helper()
+		for _, ev := range res.Events {
+			if ev.Kind == "agent_retry" {
+				var p map[string]any
+				if err := json.Unmarshal(ev.Payload, &p); err != nil {
+					t.Fatalf("agent_retry payload: %v", err)
+				}
+				return p
+			}
+		}
+		t.Fatal("no agent_retry event")
+		return nil
+	}
+	promptOf := func(argv []string) string {
+		for i := 0; i+1 < len(argv); i++ {
+			if argv[i] == "-p" {
+				return argv[i+1]
+			}
+		}
+		return ""
+	}
+
+	t.Run("resumed first attempt, fresh retry", func(t *testing.T) {
+		argvs, res := run(t, "sess-1")
+		if !argsHaveFlagValue(argvs[0], "--resume", "sess-1") {
+			t.Errorf("attempt 1 argv lacks --resume sess-1: %q", argvs[0])
+		}
+		if argsHaveFlag(argvs[1], "--resume") || argsHaveFlag(argvs[1], "--continue") {
+			t.Errorf("retry argv carries the faulted conversation: %q", argvs[1])
+		}
+		if p0, p1 := promptOf(argvs[0]), promptOf(argvs[1]); p0 != "fixup turn" || p1 != p0 {
+			t.Errorf("-p prompts = %q / %q, want both %q", p0, p1, "fixup turn")
+		}
+		if got := retryPayload(t, res)["resume_dropped"]; got != true {
+			t.Errorf("agent_retry resume_dropped = %v, want true", got)
+		}
+	})
+	t.Run("fresh invocation retry payload carries no resume_dropped", func(t *testing.T) {
+		_, res := run(t, "")
+		if _, ok := retryPayload(t, res)["resume_dropped"]; ok {
+			t.Error("agent_retry carries resume_dropped on a non-resumed retry, want the pre-#4089 payload")
+		}
+	})
 }

@@ -206,6 +206,18 @@ func TestErrors_AreDistinct(t *testing.T) {
 		{ErrPromptTooLarge, ErrExternalAPI},
 		{ErrPromptTooLarge, ErrAgentQuotaUnavailable},
 		{ErrPromptTooLarge, ErrTraceStreamRead},
+		{ErrSessionResumeFailed, ErrAgentFailed},
+		{ErrSessionResumeFailed, ErrBudgetExceeded},
+		{ErrSessionResumeFailed, ErrTimeout},
+		{ErrSessionResumeFailed, ErrBinaryNotFound},
+		{ErrSessionResumeFailed, ErrAgentThinkingBlock},
+		{ErrSessionResumeFailed, ErrLoopDetected},
+		{ErrSessionResumeFailed, ErrExternalAPI},
+		{ErrSessionResumeFailed, ErrAgentQuotaUnavailable},
+		{ErrSessionResumeFailed, ErrTraceStreamRead},
+		{ErrSessionResumeFailed, ErrPromptTooLarge},
+		{ErrAgentFailed, ErrSessionResumeFailed},
+		{ErrAgentQuotaUnavailable, ErrSessionResumeFailed},
 	}
 	for _, p := range pairs {
 		if errors.Is(p.a, p.b) {
