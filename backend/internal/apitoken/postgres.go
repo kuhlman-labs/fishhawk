@@ -30,6 +30,21 @@ func NewPostgresRepository(pool *pgxpool.Pool) Repository {
 }
 
 func (r *postgresRepo) Issue(ctx context.Context, subject string, scopes []string) (*Token, error) {
+	return r.issue(ctx, subject, scopes, nil)
+}
+
+func (r *postgresRepo) IssueForAccount(ctx context.Context, subject string, scopes []string, accountID string) (*Token, error) {
+	acct, err := uuid.Parse(accountID)
+	if err != nil {
+		return nil, fmt.Errorf("apitoken: tenanted token needs a valid account id: %w", err)
+	}
+	return r.issue(ctx, subject, scopes, &acct)
+}
+
+// issue is the shared CreateToken path: a nil account mints an
+// untenanted token (NULL account_id), a non-nil one binds the token to
+// that account (#4506).
+func (r *postgresRepo) issue(ctx context.Context, subject string, scopes []string, account *uuid.UUID) (*Token, error) {
 	if subject == "" {
 		return nil, errors.New("apitoken: subject required")
 	}
@@ -51,6 +66,7 @@ func (r *postgresRepo) Issue(ctx context.Context, subject string, scopes []strin
 		Subject:   subject,
 		TokenHash: hash,
 		Scopes:    scopes,
+		AccountID: account,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("apitoken: create: %w", err)
@@ -178,8 +194,10 @@ func rowToToken(r tokendb.ApiToken) *Token {
 		out.Provider = r.Provider.String
 	}
 	// NULL account_id → "" (untenanted, ADR-057 / E44.5). Only GetTokenByHash
-	// selects the column; the other ApiToken-returning queries leave it nil,
-	// which maps to "" here — those paths don't consume the account.
+	// and CreateToken (#4506) select the column; the other ApiToken-returning
+	// queries (CreateOAuthToken, GetTokenByID, ListTokensForSubject,
+	// RevokeToken) leave it nil, which maps to "" here — those paths don't
+	// consume the account.
 	if r.AccountID != nil {
 		out.AccountID = r.AccountID.String()
 	}
