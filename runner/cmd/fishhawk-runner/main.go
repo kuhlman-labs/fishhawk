@@ -1145,6 +1145,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		cfg.timeout = 15 * time.Minute
 	}
 
+	// The #4023 two-budget stage clock: executor.timeout bounds each agent
+	// invocation (observed here, enforced by agent.Budget.Timeout), and the
+	// gate phase gets its own budget of gateBudgetVerifyForms x the effective
+	// executor.verify.timeout of verify-execution time. It rides ctx so every
+	// gate site (runVerifyCommittedTreeEnv, runVerifyGate, verifyLockRerunFits,
+	// gateTimedOutReason) reads the same clock; its report hook is wired to the
+	// progress tee below.
+	phaseClock := newStagePhaseClock(cfg.timeout, cfg.verifyTimeout)
+	ctx = withStagePhases(ctx, phaseClock)
+
 	// From here on the runner's structured stderr stream (logSink) has
 	// concurrent producers during the agent invocation: the agent
 	// heartbeat goroutine (wired below via inv.ProgressSink) and the
@@ -1326,6 +1336,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	// No context plumbing needed: bearer() mints under its own detached,
 	// mcpTokenRefreshTimeout-bounded context (#3255).
 	tee.tokens = cfg.mcpTokens
+	// #4023: every heartbeat carries the stage clock's phase snapshot, and
+	// every phase transition (agent start, gate start, verify start/end) posts
+	// one synchronous, ordered phase report. A pass-through tee (no token)
+	// makes reportPhase a no-op.
+	tee.phases = phaseClock
+	phaseClock.report = tee.reportPhase
 	inv.ProgressSink = tee
 
 	// Acceptance-agent containment (E31.7 / #1535, ADR-050 / ADR-049 #4).
@@ -2256,8 +2272,15 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		// invokedAt bounds the legacy-plan fallback's freshness check (#4067):
 		// only a legacy file written during THIS invocation can be claimed.
 		invokedAt := time.Now()
+		// #4023: the agent phase starts here and its gate phase starts the
+		// moment the agent exits, so every gate this pass runs (the
+		// working-tree gate, the verify-fix loop's first verify, the committed
+		// single-shot gate and the strict re-verify) is charged to ONE fresh
+		// gate budget, untouched by the agent's own time.
+		phaseClock.beginAgent()
 		res, invokeErr = invokePrimaryAgent(ctx, invoker, inv,
 			primaryResumeDecision(fixupResume, selfRetryCount), &cfg, logSink)
+		phaseClock.beginGate()
 
 		// Plan validation runs only if the agent itself succeeded —
 		// no point re-stating "your plan is malformed" when the
@@ -5253,14 +5276,33 @@ func runVerifyGate(ctx context.Context, cfg config, _ io.Writer) (agent.Event, e
 		gateEnv = withIsolatedLintCache(gateEnv, lintCacheDir)
 	}
 
+	// #4023: the working-tree gate runs under the gate budget left in this
+	// gate phase, exactly like the committed-tree chokepoint: a spent budget
+	// times out without spawning, a smaller remainder clips the timeout, and
+	// the exec is bracketed so its wall time is charged.
+	const form = "working-tree"
+	phases := stagePhasesFrom(ctx)
+	runTimeout, clipped := phases.gateVerifyTimeout(timeout)
+	if clipped && runTimeout <= 0 {
+		output := gateBudgetTimeoutTrailer(cfg.verifyCmd, form, phases.gateBudgetTotal(), 0, 0, "")
+		ev := verifyRunEventGateBudgetExhausted(cfg.verifyCmd, "", "", output, 0, 0, phases.gateBudgetTotal())
+		return ev, fmt.Errorf("%w: %s", errVerifyGateTimedOut, gateTimedOutReason(ctx, cfg.verifyCmd, form, timeout, 1))
+	}
+	phases.startVerify()
 	start := time.Now()
-	output, exitCode, timedOut := execBoundedHostArgvFn(ctx, []string{"sh", "-c", cfg.verifyCmd}, "", gateEnv, timeout)
+	output, exitCode, timedOut := execBoundedHostArgvFn(ctx, []string{"sh", "-c", cfg.verifyCmd}, "", gateEnv, runTimeout)
+	phases.endVerify()
 	if timedOut {
-		const form = "working-tree"
 		elapsed := time.Since(start)
-		output += verifyTimeoutTrailer(cfg.verifyCmd, form, timeout, elapsed, output)
-		ev := verifyRunEventTimedOut(cfg.verifyCmd, "", "", output, timeout, elapsed)
-		return ev, fmt.Errorf("%w: %s", errVerifyGateTimedOut, verifyTimedOutReason(cfg.verifyCmd, form, timeout, 1))
+		var ev agent.Event
+		if clipped {
+			output += gateBudgetTimeoutTrailer(cfg.verifyCmd, form, phases.gateBudgetTotal(), runTimeout, elapsed, output)
+			ev = verifyRunEventGateBudgetExhausted(cfg.verifyCmd, "", "", output, runTimeout, elapsed, phases.gateBudgetTotal())
+		} else {
+			output += verifyTimeoutTrailer(cfg.verifyCmd, form, timeout, elapsed, output)
+			ev = verifyRunEventTimedOut(cfg.verifyCmd, "", "", output, timeout, elapsed)
+		}
+		return ev, fmt.Errorf("%w: %s", errVerifyGateTimedOut, gateTimedOutReason(ctx, cfg.verifyCmd, form, timeout, 1))
 	}
 
 	outcome := "passed"
@@ -6463,6 +6505,8 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		)
 		for attempt := 1; attempt <= maxFixInvokeInfraRetries; attempt++ {
 			attemptsMade = attempt
+			// #4023: each fix re-invoke is an agent phase of its own.
+			stagePhasesFrom(ctx).beginAgent()
 			fixRes, fixErr = invoker.Invoke(ctx, fixInv)
 			if fixErr == nil {
 				break
@@ -6482,6 +6526,10 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 				break
 			}
 		}
+		// #4023: the fix agent has exited, so a FRESH gate phase begins: the
+		// next iteration's verifies (or, when every attempt failed, the strict
+		// re-verify before push) are charged to a full gate budget.
+		stagePhasesFrom(ctx).beginGate()
 		if fixErr != nil {
 			// Every fix-Invoke attempt for this iteration failed. The verify
 			// already ran and was counted (red), so this is recorded as
@@ -6562,7 +6610,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		summary["detail"] = lastIterErr.Error()
 	case timedOut:
 		summary["outcome"] = "failed"
-		summary["detail"] = verifyTimedOutReason(cfg.verifyCmd, form, timeout, attempts)
+		summary["detail"] = gateTimedOutReason(ctx, cfg.verifyCmd, form, timeout, attempts)
 	case lockContended:
 		summary["outcome"] = "failed"
 		summary["detail"] = lockState.reason(cfg.verifyCmd, attempts, timeout)
@@ -6642,7 +6690,7 @@ func runVerifyFixLoop(ctx context.Context, cfg *config, client uploadClient, mcp
 		// output already ends with the runner-authored trailer.
 		res.OK = false
 		res.FailureCategory = "C"
-		res.FailureReason = verifyTimedOutReason(cfg.verifyCmd, form, timeout, attempts) + "\n" + lastOutput
+		res.FailureReason = gateTimedOutReason(ctx, cfg.verifyCmd, form, timeout, attempts) + "\n" + lastOutput
 		return reinvoked, "", nil
 	}
 
@@ -7004,7 +7052,7 @@ func runVerifyGateCommitted(ctx context.Context, cfg config, logSink io.Writer) 
 			// an infra literal is still reported as what it is. The output
 			// already ends with the trailer.
 			return events, "", fmt.Errorf("%w: %w: %s\n%s",
-				gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut, verifyTimedOutReason(cfg.verifyCmd, verifyFormFull, timeout, verifyAttempts), out)
+				gitops.ErrVerifyInfraFailure, errVerifyGateTimedOut, gateTimedOutReason(ctx, cfg.verifyCmd, verifyFormFull, timeout, verifyAttempts), out)
 		}
 		if disp == gateLockRefused {
 			// Category C (retryable in place): the verify command kept exiting
@@ -7422,6 +7470,8 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 		reErr error
 	)
 	for attempt := 1; attempt <= maxFixInvokeInfraRetries; attempt++ {
+		// #4023: the re-land is an agent phase of its own.
+		stagePhasesFrom(ctx).beginAgent()
 		reRes, reErr = invoker.Invoke(ctx, reinvokeInv)
 		if reErr == nil {
 			break
@@ -7437,6 +7487,9 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 			}),
 		})
 	}
+	// #4023: the re-land agent has exited, so the retried push's #960 strict
+	// re-verify runs in a FRESH gate phase with its full budget.
+	stagePhasesFrom(ctx).beginGate()
 	if reErr != nil {
 		return fmt.Errorf("base-rebase re-invoke: agent invocation failed after %d attempts: %w",
 			maxFixInvokeInfraRetries, reErr)
@@ -7538,6 +7591,17 @@ func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA 
 	// capture is the gates' fail-closed gitRevParseTreeOf; an empty tree_sha
 	// here only degrades the audit stamp, never the invariant.
 	treeSHA, _ := gitRevParseTreeOf(ctx, repoDir, headSHA)
+	// #4023: the verify runs under the gate budget left in this gate phase.
+	// A spent budget times the gate out WITHOUT spawning the command (the
+	// out-of-band gateTimedOut disposition, never text, #3448); otherwise a
+	// remainder below timeout clips it, and the exec is bracketed so its wall
+	// time is charged. A nil clock leaves timeout unclipped.
+	phases := stagePhasesFrom(ctx)
+	runTimeout, clipped := phases.gateVerifyTimeout(timeout)
+	if clipped && runTimeout <= 0 {
+		output := gateBudgetTimeoutTrailer(verifyCmd, verifyFormName(scopePkgs), phases.gateBudgetTotal(), 0, 0, "")
+		return verifyRunEventGateBudgetExhausted(verifyCmd, headSHA, treeSHA, output, 0, 0, phases.gateBudgetTotal()), output, "failed", gateTimedOut
+	}
 	parent, err := os.MkdirTemp("", "fishhawk-verify-*")
 	if err != nil {
 		return verifyRunEvent(verifyCmd, headSHA, treeSHA, -1, "worktree_tmp: "+err.Error(), "skipped"), "", "skipped", gateExecuted
@@ -7567,6 +7631,7 @@ func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA 
 	}
 	extraEnv = append(extraEnv, extra...)
 
+	phases.startVerify()
 	start := time.Now()
 	// withDecidingGate marks this as a VERIFY gate: its outcome decides the
 	// push or the failure, so a declared gate_container's evidence records
@@ -7575,9 +7640,14 @@ func runVerifyCommittedTreeEnv(ctx context.Context, verifyCmd, repoDir, headSHA 
 	// work tree, so the container path preflights that git sees it at /work
 	// and maps a failure to gateUnavailable, never a red verdict (#4392).
 	output, exitCode, disp := runBoundedGateCommandDisposed(withGitWorkTreeRequired(withDecidingGate(ctx)), verifyCmd, wt,
-		filepath.Join(parent, "golangci-lint-cache"), timeout, extraEnv...)
+		filepath.Join(parent, "golangci-lint-cache"), runTimeout, extraEnv...)
+	phases.endVerify()
 	if disp == gateTimedOut {
 		elapsed := time.Since(start)
+		if clipped {
+			output += gateBudgetTimeoutTrailer(verifyCmd, verifyFormName(scopePkgs), phases.gateBudgetTotal(), runTimeout, elapsed, output)
+			return verifyRunEventGateBudgetExhausted(verifyCmd, headSHA, treeSHA, output, runTimeout, elapsed, phases.gateBudgetTotal()), output, "failed", gateTimedOut
+		}
 		output += verifyTimeoutTrailer(verifyCmd, verifyFormName(scopePkgs), timeout, elapsed, output)
 		return verifyRunEventTimedOut(verifyCmd, headSHA, treeSHA, output, timeout, elapsed), output, "failed", gateTimedOut
 	}
@@ -8416,6 +8486,10 @@ func attemptDeterministicFixup(ctx context.Context, cfg config, patches []upload
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"fixup_patches_applied","run_id":%q,"stage_id":%q,"patch_count":%d}`+"\n",
 		cfg.runID, cfg.stageID, len(patches))
+	// #4023: no agent runs on the deterministic apply path, so its gate phase
+	// starts here: the apply gate and the push's strict re-verify share one
+	// gate budget.
+	stagePhasesFrom(ctx).beginGate()
 	gateEvs, tree, demote := fixupVerifyGate(ctx, cfg, logSink)
 	evs = append(evs, gateEvs...)
 	if demote != nil {
@@ -10938,7 +11012,7 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			// is touched only on an explicit passed outcome.
 			if timedOut {
 				return fmt.Errorf("%w: %s; %s\n%s", gitops.ErrVerifyInfraFailure,
-					verifyTimedOutReason(cfg.verifyCmd, verifyFormFull, reverifyTimeout, 1), accounting, out)
+					gateTimedOutReason(ctx, cfg.verifyCmd, verifyFormFull, reverifyTimeout, 1), accounting, out)
 			}
 			// A re-verify that kept exiting 73 (the verify lock stayed
 			// contended) or 75 (a temporary infrastructure failure) was never

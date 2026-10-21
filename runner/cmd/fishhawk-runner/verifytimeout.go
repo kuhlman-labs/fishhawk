@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"io"
@@ -77,6 +78,63 @@ func lastNonEmptyLine(out string) string {
 func verifyTimedOutReason(command, form string, timeout time.Duration, iteration int) string {
 	return fmt.Sprintf("%s: %q (%s form) was killed by the runner when executor.verify.timeout (%s) expired on attempt %d before it reached a verdict; the captured output is incomplete and the change was NOT judged — retry the stage in place or raise executor.verify.timeout",
 		verifyGateTimedOutLead, command, form, timeout, iteration)
+}
+
+// gateBudgetExhaustedReason is verifyTimedOutReason for a verify the #4023
+// GATE BUDGET killed: its timeout was clipped to the budget left in the gate
+// phase and that remainder ran out. It BEGINS with verifyGateTimedOutLead, so
+// backend/internal/failuresig.AnchorVerifyGateTimedOut and its category-C hint
+// keep matching, and it names the budget, its derivation and the recovery.
+func gateBudgetExhaustedReason(command, form string, budget time.Duration, attempt int) string {
+	return fmt.Sprintf("%s: %q (%s form) was killed by the runner on attempt %d when the stage's gate budget (%s = %d x executor.verify.timeout of verify-execution time per gate phase) ran out before it reached a verdict; the captured output is incomplete and the change was NOT judged — retry the stage in place or raise executor.verify.timeout",
+		verifyGateTimedOutLead, command, form, attempt, budget, gateBudgetVerifyForms)
+}
+
+// gateTimedOutReason picks the timed-out LEAD for a gate site: the
+// gate-budget wording when the ctx's stage clock reports the gate budget
+// exhausted, else verifyTimedOutReason unchanged. Classification never reads
+// either text (#3448); only the operator-facing reason differs.
+func gateTimedOutReason(ctx context.Context, command, form string, timeout time.Duration, attempt int) string {
+	if c := stagePhasesFrom(ctx); c.gateExhausted() {
+		return gateBudgetExhaustedReason(command, form, c.gateBudgetTotal(), attempt)
+	}
+	return verifyTimedOutReason(command, form, timeout, attempt)
+}
+
+// gateBudgetTimeoutTrailer is verifyTimeoutTrailer for a verify whose timeout
+// the gate budget clipped (#4023): the same runner-authored end-of-output
+// marker and the same no-verdict statement, naming the gate budget as what
+// expired instead of executor.verify.timeout.
+func gateBudgetTimeoutTrailer(command, form string, budget, timeout, elapsed time.Duration, out string) string {
+	return fmt.Sprintf("\n--- fishhawk-runner: verify TERMINATED, no verdict ---\n"+
+		"%s: %q (%s form) was killed by the runner after %s: the stage's gate budget (%s = %d x executor.verify.timeout of verify-execution time per gate phase) had only %s left for this verify, and it expired before the verify finished. "+
+		"The runner sent SIGKILL to the command's process group; the output above is INCOMPLETE and ends where the process died (last captured line: %q). "+
+		"NO verdict was reached: any FAIL/panic lines above are real, but the ABSENCE of FAIL lines proves nothing — the tests that had not yet run were never judged. "+
+		"Recovery: retry the stage in place (category C), or raise executor.verify.timeout if the gate genuinely needs longer on this host.\n",
+		verifyGateTimedOutLead, command, form, elapsed.Round(time.Second), budget, gateBudgetVerifyForms, timeout, lastNonEmptyLine(out))
+}
+
+// verifyRunEventGateBudgetExhausted is verifyRunEventTimedOut for a verify the
+// gate budget killed, plus the ADDITIVE keys gate_budget_seconds and
+// gate_budget_exhausted:true (#4023). timeout is the clipped timeout the
+// verify actually ran under.
+func verifyRunEventGateBudgetExhausted(command, headSHA, treeSHA, output string, timeout, elapsed, budget time.Duration) agent.Event {
+	return agent.Event{
+		Kind: "verify_run",
+		Payload: agent.MakePayload(map[string]any{
+			"command":               command,
+			"head_sha":              headSHA,
+			"tree_sha":              treeSHA,
+			"exit_code":             -1,
+			"output":                output,
+			"outcome":               "failed",
+			"timed_out":             true,
+			"timeout_seconds":       int(timeout / time.Second),
+			"elapsed_seconds":       int(elapsed / time.Second),
+			"gate_budget_seconds":   int(budget / time.Second),
+			"gate_budget_exhausted": true,
+		}),
+	}
 }
 
 // verifyRunEventTimedOut is verifyRunEvent for a timed-out run: kind

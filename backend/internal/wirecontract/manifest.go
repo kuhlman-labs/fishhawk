@@ -84,6 +84,9 @@ const (
 	// the manifest row is what guards it.
 	specialistJobGo    = "backend/internal/server/specialist_job.go"
 	specialistJobPkgGo = "backend/internal/specialistjob/specialistjob.go"
+	// stageProgressGo holds the backend's decoder for the runner's
+	// stage-progress heartbeat (#2541, phase fields #4023).
+	stageProgressGo = "backend/internal/server/stage_progress.go"
 )
 
 // SeedManifest is the repo's cross-module wire contract manifest. Verified
@@ -392,6 +395,19 @@ func SeedManifest() Manifest {
 				Consumer: Endpoint{File: bundleGo, Type: "FixupCommitClaimEvidence"},
 				Mode:     ModeExact,
 			},
+			{
+				// The runner's stage-progress heartbeat (#2541), carrying the
+				// optional agent/gate phase fields (#4023). ModeExact: a flat
+				// leaf the backend decodes under DisallowUnknownFields, so a
+				// renamed tag 400s every heartbeat and an option drift breaks
+				// the omitempty additive shape. The gate-phase bytes are ALSO
+				// pinned by the shared golden
+				// testdata/wire/stage_progress_phase.json.
+				Name: "stage_progress_report", Anchor: "#4023",
+				Emitter:  Endpoint{File: uploadFile, Type: "reportStageProgressBody"},
+				Consumer: Endpoint{File: stageProgressGo, Type: "stageProgressReport"},
+				Mode:     ModeExact,
+			},
 		},
 		CoveredFiles: []string{
 			promptFile,
@@ -407,6 +423,7 @@ func SeedManifest() Manifest {
 			bundleGo,
 			specialistJobGo,
 			specialistJobPkgGo,
+			stageProgressGo,
 		},
 		UnpairedExemptions: []Endpoint{
 			// ShipPlanArgs carries the marker on its Reachability field, but the
