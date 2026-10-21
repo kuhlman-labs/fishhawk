@@ -73,6 +73,27 @@ func (f *fakeTokenRepo) Issue(_ context.Context, subject string, scopes []string
 	return tok, nil
 }
 
+// IssueForAccount mirrors the Postgres tenanted mint (#4506): it refuses
+// an account id uuid.Parse rejects, honors issueErr (via Issue), then
+// stamps AccountID on both the returned token and the stored row, so a
+// fake-authenticated minted bearer resolves tenanted.
+func (f *fakeTokenRepo) IssueForAccount(ctx context.Context, subject string, scopes []string, accountID string) (*apitoken.Token, error) {
+	if _, err := uuid.Parse(accountID); err != nil {
+		return nil, fmt.Errorf("account id: %w", err)
+	}
+	tok, err := f.Issue(ctx, subject, scopes)
+	if err != nil {
+		return nil, err
+	}
+	tok.AccountID = accountID
+	f.mu.Lock()
+	if row := f.rows[tok.ID]; row != nil {
+		row.AccountID = accountID
+	}
+	f.mu.Unlock()
+	return tok, nil
+}
+
 // IssueOAuth makes fakeTokenRepo an apitoken.OAuthIssuer so the mint
 // handler's type-assert passes. It mints like Issue but stamps
 // auth_method='oauth' + the provider on both the returned token and the
@@ -582,6 +603,31 @@ func TestCreateToken_RepoError(t *testing.T) {
 	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens", bearer, map[string]any{"scopes": []string{}})
 	if w.Code != http.StatusInternalServerError {
 		t.Errorf("status = %d, want 500", w.Code)
+	}
+}
+
+// TestCreateToken_TenantedIssueError (#4506): a repository failure on the
+// TENANTED mint path is a 500 internal_error with no token row and no
+// api_token_issued audit row, read from committed state after the call.
+func TestCreateToken_TenantedIssueError(t *testing.T) {
+	repo, aud := newFakeTokenRepo(), &foAuditFake{}
+	s := New(Config{Addr: "127.0.0.1:0", APITokenRepo: repo, AuditRepo: aud})
+	repo.issueErr = errors.New("disk full")
+	const subject = "github:tenanted"
+	w := mintAs(t, s, Identity{
+		Subject:   subject,
+		TokenID:   uuid.NewString(),
+		Scopes:    []string{"read:runs"},
+		AccountID: uuid.NewString(),
+	}, []string{"read:runs"})
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if w.Code != http.StatusInternalServerError || env.Error.Code != "internal_error" {
+		t.Errorf("mint = %d %q, want 500 internal_error; body = %s", w.Code, env.Error.Code, w.Body.String())
+	}
+	requireTokenCount(t, repo, subject, 0)
+	if got := aud.globalOf("api_token_issued"); len(got) != 0 {
+		t.Errorf("api_token_issued rows = %d, want 0", len(got))
 	}
 }
 

@@ -261,7 +261,7 @@ echoed and the candidate window never queried.
 
 **ACCOUNT, on the row set.** The candidate window is read with
 `decisionindex.ListFilter.AccountScoped`, so an identity carrying NO workspace
-account (a bearer token, the untenanted posture) matches only UNTENANTED rows —
+account (an untenanted bearer token, the operator posture) matches only UNTENANTED rows —
 the same stricter rule the gate resolve applies, rather than `ListFilter`'s
 default nil-matches-all, which is the backfill's row-set predicate. Repository
 visibility cannot stand in for this: two accounts can share a repository, so a
@@ -7141,6 +7141,22 @@ de-duplicated, request order; `details.ceiling` names the ceiling applied).
   malformed `mcp:run:` subject self-minted under the old hole is refused too.
   It precedes the ceiling: the code is `run_bound_cannot_mint_tokens` even for
   a subset of the agent's own scopes.
+- **Tenancy (#4506).** The minted token inherits the caller's workspace
+  account. A tenanted caller (`Identity.AccountID` set, from a tenanted
+  bearer's row or a cookie session's resolved account) mints through
+  `apitoken.Repository.IssueForAccount`, so the row's `account_id` is the
+  caller's account and the minted bearer resolves to that account's view;
+  an untenanted caller (operator token, accountless session) mints through
+  `Issue`, an untenanted row. A repository failure on the tenanted path is
+  `500 internal_error` with no row. `POST /v0/tokens/login` (`IssueOAuth`)
+  and `fishhawkd token issue` stay untenanted by design; the posture and a
+  read-only inventory query for pre-existing untenanted rows are in
+  [`../apitoken/README.md`](../apitoken/README.md). Counterfactual vehicles:
+  `TestCreateToken_TenantedBearerMintStampsAccount`,
+  `TestCreateToken_TenantedCookieMintStampsAccount` and
+  `TestCreateToken_UntenantedMintStaysUntenanted` (`tokens_tenancy_test.go`,
+  the real token repository on Postgres, committed `account_id` read back by
+  SQL), plus `TestCreateToken_TenantedIssueError` (`tokens_test.go`).
 - **DELETE stays scope-free.** `DELETE /v0/tokens/{token_id}` requires no
   scope and does not refuse a run-bound subject: revocation only removes
   privilege, and `Repository.Revoke`'s ownership check confines it to the
