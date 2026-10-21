@@ -112,6 +112,16 @@ type hostDispatchResponse struct {
 // deliberately NOT checked (a dead-runner re-spawn of an already-marked stage).
 // A stage-list read error there answers 500 dependency_check_failed.
 //
+// Campaign dispatch hold (E83.100 / #4234): with Config.CampaignRepo wired,
+// an IMPLEMENT stage in either admissible arm whose run (or nearest
+// campaign-linked ancestor, via DecomposedFrom / ParentRunID) is a campaign
+// item under an active hotfix hold returns 409 campaign_dispatch_held, at the
+// same point as the host memory hold below, so it commits nothing. Expedited
+// items are exempt; an unresolvable ancestry is held while any campaign
+// holds dispatches (admitted when none does); a read error is 500
+// dependency_check_failed and an unrecordable release 503
+// campaign_audit_unavailable (guardCampaignDispatchHold).
+//
 // Host memory hold (E85.11 / #4330, INTERIM until ADR-100's adaptive
 // concurrency controller): with Config.HostAdmissionHold wired and held, a
 // stage in either admissible arm — `pending` or `awaiting_host_dispatch` —
@@ -452,6 +462,21 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		}
 	}
 
+	// Campaign dispatch hold (E83.100 / #4234): a campaign-level
+	// PRE-admission refusal beside the host-memory hold, BEFORE the CAS /
+	// slot admission, so a refusal commits no state and ADR-094's
+	// resource-group admission is unchanged. Inert for every non-implement
+	// stage and with no campaign repository. While a hotfix holds its
+	// campaign, every NEW implement admission of the campaign's other items
+	// (and their decomposed children) answers 409 campaign_dispatch_held; a
+	// plain 409, so an MCP slot waiter stops. Expedited items are exempt.
+	// A due hold is released here first. See campaign_dispatch_hold.go.
+	expedited, holdRefusal := s.guardCampaignDispatchHold(r.Context(), runRow, stage)
+	if holdRefusal != nil {
+		s.writeCampaignSourceRefusal(w, r, holdRefusal)
+		return
+	}
+
 	// CAS the observed state → dispatched under the row lock (production
 	// postgresRepo). A concurrent writer that flipped the stage between the load
 	// and this call refuses atomically with StageStateChangedError rather than
@@ -479,7 +504,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	switch cas, isCAS := s.cfg.RunRepo.(run.StageCASTransitioner); {
 	case grouped:
 		var queued bool
-		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, group, limit, host, nonce)
+		updated, slot, queued, err = s.admitGroupedStage(w, r, stage, group, limit, host, nonce, expedited)
 		if queued {
 			return
 		}

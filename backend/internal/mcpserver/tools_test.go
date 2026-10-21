@@ -3516,6 +3516,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// tools, not run verbs: a job has no stage, writes no run or stage row,
 	// and is admitted through local-verify:<host>. 77 -> 79.
 	//
+	// #4234 (E83.100) adds exactly ONE tool — fishhawk_campaign_hotfix, the
+	// thin wrapper over POST /v0/campaigns/{campaign_id}/hotfix. WHEN: one
+	// urgent issue must jump a (possibly running) campaign's queue as an
+	// expedited item, optionally holding the campaign's other implement
+	// dispatches until it settles. ELIGIBILITY: write:campaigns; the backend
+	// refuses run-bound and delegated operator-agent tokens for the whole
+	// verb. Its own tool, not an append mode: it records campaign_item_added
+	// (not campaign_items_appended), binds the item's workflow, and owns the
+	// dispatch hold. 80 -> 81.
+	//
 	// E87.4 / #4295 (ADR-093 slice 1 D7) adds exactly ONE tool —
 	// fishhawk_get_merge_queue, the thin read over GET
 	// /v0/repos/{owner}/{name}/merge-queue. WHEN: fishhawk_merge_run returned
@@ -3524,8 +3534,8 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// backend refuses a run-bound token 403 run_token_forbidden. Its own tool,
 	// not a run-status mode: the read spans every run on the base, in the
 	// caller's account. Bumped by exactly ONE from the base (approval
-	// condition C1): 80 -> 81.
-	const wantToolCount = 81
+	// condition C1): 81 -> 82 (landed after #4234).
+	const wantToolCount = 82
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3556,7 +3566,7 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 		t.Error("fishhawk_waive_concerns is not in the registered tool list — the bulk waive verb is unreachable")
 	}
 	// fishhawk_get_merge_queue (E87.4 / #4295) must likewise be wire-visible:
-	// the 80 -> 81 bump alone would stay green if its registration were
+	// the 81 -> 82 bump alone would stay green if its registration were
 	// dropped and a DIFFERENT tool added in the same change.
 	var sawGetMergeQueue bool
 	for _, tool := range res.Tools {

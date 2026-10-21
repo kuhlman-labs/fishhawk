@@ -1,0 +1,14 @@
+id: scenario:issue-4234/hold-dispatch-operator-only
+statement: hold_dispatch true is refused 403 for a run-bound token (run_token_forbidden) and for a delegated operator-agent token (operator_agent_forbidden); the same verb without hold_dispatch is not refused for the operator-agent token.
+verify_hint: 'HTTP: POST the hotfix route with hold_dispatch true using each token kind; observe the two 403 codes. Decided in-suite by the per-token tests in campaign_hotfix_test.go if the preview cannot mint those tokens.'
+steps: 'Target: called the MCP fishhawk_campaign_hotfix tool with hold_dispatch true using the run-bound fhm_ token; it was refused at the scope check (insufficient_scope). Posture B, in the sanctioned checkout: go test ./internal/server/ -run ''TestCampaignHotfix_(RunTokenForbidden|OperatorAgentForbidden)''.'
+assertions:
+    expected: 403 run_token_forbidden and 403 operator_agent_forbidden for hold_dispatch true.
+    observed_at_record: 'RunTokenForbidden PASS: an mcp:run:* subject with write:campaigns gets 403 run_token_forbidden both with and without hold_dispatch, and nothing is written. OperatorAgentForbidden: an operator-agent/v1 subject gets 403 operator_agent_forbidden both with and without hold_dispatch, and nothing is written; those assertions passed. Only its trailing step, which checks that an ordinary operator token gets 201, failed, with 502 from the sandbox''s loopback-connect denial.'
+    repro_handle: cd backend && go test ./internal/server/ -run 'TestCampaignHotfix_(RunTokenForbidden|OperatorAgentForbidden)$'
+origin:
+    issue: 4234
+    pr: 0
+    run_id: 0dfcf217-4682-4e6e-8ab6-a63182e1d812
+    head_sha: 49b3367e559f80bda0948947c073a8007c0aa400
+    recorded_at: 2026-10-21T08:55:05Z

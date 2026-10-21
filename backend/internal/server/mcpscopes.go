@@ -329,6 +329,14 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// requireWriteScope("write:campaigns"). Pinned by
 	// TestMCPToolScopeTable_AppendCampaignItemsMirrorsHandler.
 	"fishhawk_append_campaign_items": {anyOf: []string{"write:campaigns"}},
+	// fishhawk_campaign_hotfix (E83.100 / #4234) MIRRORS POST
+	// /v0/campaigns/{id}/hotfix: handleCampaignHotfix calls
+	// requireWriteScope("write:campaigns") and then refuses a run-bound
+	// (mcp:run:*) subject and a delegated operator-agent subject outright, so
+	// runBoundSubjectOK stays false. The operator-agent refusal is the inner
+	// REST call's alone (this table has no subject-class axis beyond run-bound).
+	// Pinned by TestMCPToolScopeTable_CampaignHotfixMirrorsHandler.
+	"fishhawk_campaign_hotfix": {anyOf: []string{"write:campaigns"}},
 
 	// fishhawk_digest (E75.6 / #3734) dials TWO endpoints: its default read
 	// mode GETs /v0/digest (digest.go handleGetDigest:

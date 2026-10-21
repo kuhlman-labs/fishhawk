@@ -4,7 +4,7 @@
 // time, consuming no runner slot. Every mutation is one transaction under a
 // per-base advisory lock, scoped by account through runs.account_id. ADR-093's
 // merge queue reuses the rows, FIFO order and lock order unchanged, adding
-// only the operator's merge intent (merge_intent_at, 0106) and the line-turn
+// only the operator's merge intent (merge_intent_at, 0107) and the line-turn
 // read. README.md is the contract.
 package mergequeue
 
@@ -116,7 +116,7 @@ type Entry struct {
 	SettledAt       *time.Time
 	UpdatedAt       time.Time
 	// MergeIntentAt is when the operator's merge intent was recorded on this
-	// episode (0106, ADR-093 D2); set once, never cleared.
+	// episode (0107, ADR-093 D2); set once, never cleared.
 	MergeIntentAt *time.Time
 }
 

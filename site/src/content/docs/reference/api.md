@@ -265,6 +265,7 @@ The v0 REST API exposes **178 operations** across the paths below, generated fro
 | `GET` | `/v0/campaigns/{campaign_id}` | Get a campaign |
 | `GET` | `/v0/campaigns/{campaign_id}/items` | List a campaign's items |
 | `POST` | `/v0/campaigns/{campaign_id}/items` | Append issues to an existing campaign |
+| `POST` | `/v0/campaigns/{campaign_id}/hotfix` | Add an urgent issue to a campaign as an expedited item |
 | `GET` | `/v0/campaigns/{campaign_id}/status` | Get a campaign's rollup status + next action |
 | `POST` | `/v0/campaigns/{campaign_id}/runs` | Start a run for an eligible campaign item |
 | `POST` | `/v0/campaigns/{campaign_id}/resume` | Resume a paused campaign |

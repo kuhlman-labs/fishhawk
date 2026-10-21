@@ -378,9 +378,11 @@ var KnownCategories = map[string]struct{}{
 	"campaign_gate_acted":                     {},
 	"campaign_gate_paged":                     {},
 	"campaign_grooming_source_resolved":       {},
+	"campaign_hold_released":                  {}, // E83.100 / #4234: a campaign dispatch hold released (hotfix_terminal | timeout) by the hotfix verb, a status read or the host-dispatch marker, recorded before commit under the system actor (server/campaign_hotfix.go) — INTERNAL
 	"campaign_issue_restarted":                {},
 	"campaign_issue_settled":                  {},
 	"campaign_issue_started":                  {},
+	"campaign_item_added":                     {}, // E83.100 / #4234: POST /v0/campaigns/{id}/hotfix added one EXPEDITED item (kind, workflow, reason, optional dispatch hold), recorded before commit (server/campaign_hotfix.go) — INTERNAL
 	"campaign_item_autonomy_refreshed":        {},
 	"campaign_items_appended":                 {}, // E86.47 / #4358: POST /v0/campaigns/{id}/items appended issues to an existing campaign, recorded before commit (server/campaign_append.go) — INTERNAL
 	"campaign_paused":                         {},

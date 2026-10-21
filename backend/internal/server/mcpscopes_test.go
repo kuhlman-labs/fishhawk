@@ -558,6 +558,60 @@ func TestMCPToolScopeTable_AppendCampaignItemsMirrorsHandler(t *testing.T) {
 	}
 }
 
+// TestMCPToolScopeTable_CampaignHotfixMirrorsHandler (E83.100 / #4234):
+// fishhawk_campaign_hotfix carries EXACTLY the scope predicate
+// handleCampaignHotfix enforces — requireWriteScope("write:campaigns") — and
+// no run-bound subject exemption, because the handler refuses a run-bound
+// token for the whole verb. A write:campaigns operator token passes both
+// (the handler reaches the campaign lookup, 404); other write scopes are
+// refused by both; a run-bound subject is refused by both, even holding
+// write:campaigns. A delegated operator-agent token satisfies the row (the
+// table has no subject-class axis for it) and the handler refuses it 403
+// operator_agent_forbidden, so the inner call stays the authoritative gate.
+func TestMCPToolScopeTable_CampaignHotfixMirrorsHandler(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_campaign_hotfix")
+	if !ok {
+		t.Fatal("fishhawk_campaign_hotfix has no scope rule")
+	}
+	if strings.Join(rule.anyOf, ",") != "write:campaigns" || rule.runBoundSubjectOK {
+		t.Errorf("rule = %+v, want anyOf [write:campaigns], no run-bound subject", rule)
+	}
+	s := New(Config{Addr: "127.0.0.1:0", CampaignRepo: newFakeCampaignRepo()})
+	id := uuid.NewString()
+	post := func(ident Identity) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, "/v0/campaigns/"+id+"/hotfix", strings.NewReader(`{"issue":"20"}`))
+		req.SetPathValue("campaign_id", id)
+		w := httptest.NewRecorder()
+		s.handleCampaignHotfix(w, withIdentity(req, ident))
+		return w
+	}
+	op := Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{"write:campaigns"}}
+	if w := post(op); w.Code != http.StatusNotFound {
+		t.Errorf("write:campaigns = %d %s, want past the scope guard (404)", w.Code, w.Body.String())
+	}
+	if !rule.satisfiedBy(op) {
+		t.Error("row refuses write:campaigns, which the handler admits")
+	}
+	other := Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{"write:runs", "write:approvals", "write:stages"}}
+	if w := post(other); w.Code != http.StatusForbidden {
+		t.Errorf("other write scopes = %d, want 403 insufficient_scope", w.Code)
+	}
+	if rule.satisfiedBy(other) {
+		t.Error("row admits a token the handler refuses")
+	}
+	runBound := Identity{Subject: "mcp:run:" + uuid.NewString(), TokenID: "tok", Scopes: []string{"write:campaigns", scopeRunBoundRead}}
+	if w := post(runBound); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "run_token_forbidden") {
+		t.Errorf("run-bound = %d %s, want 403 run_token_forbidden", w.Code, w.Body.String())
+	}
+	if rule.satisfiedBy(Identity{Subject: runBound.Subject, TokenID: "tok", Scopes: []string{scopeRunBoundRead}}) {
+		t.Error("row admits a run-bound token without write:campaigns")
+	}
+	agent := Identity{Subject: "operator-agent/v1", TokenID: "tok", Scopes: []string{"write:campaigns"}}
+	if w := post(agent); w.Code != http.StatusForbidden || !strings.Contains(w.Body.String(), "operator_agent_forbidden") {
+		t.Errorf("operator-agent = %d %s, want 403 operator_agent_forbidden from the handler", w.Code, w.Body.String())
+	}
+}
+
 // TestMCPToolScopeTable_GetMergeQueueMirrorsHandler (E87.4 / #4295):
 // fishhawk_get_merge_queue carries EXACTLY the predicate handleGetMergeQueue
 // enforces — a run-bound subject refused 403 run_token_forbidden (approval

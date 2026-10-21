@@ -71,6 +71,21 @@ func (f *fakeCampaignRepo) AppendCampaignItems(ctx context.Context, p campaign.A
 			CreatedAt: now, UpdatedAt: now,
 		})
 	}
+	// EXPEDITE (#4234): the production head position, the expedite record, and
+	// the one-hold-per-campaign refusal, all staged before Record.
+	var stagedHold *campaign.DispatchHold
+	if e := p.Expedite; e != nil {
+		it := outcome.Created[0]
+		it.Position = campaign.ExpeditedHeadPosition(existing)
+		it.Expedite = &campaign.Expedite{Kind: e.Kind, Workflow: e.Workflow, Reason: e.Reason, CreatedAt: now}
+		if e.Hold != nil {
+			if f.holds[p.CampaignID] != nil {
+				return nil, campaign.ErrDispatchHoldActive
+			}
+			stagedHold = &campaign.DispatchHold{CampaignID: p.CampaignID, HotfixItemID: it.ID, HeldAt: e.Hold.HeldAt, ExpiresAt: e.Hold.ExpiresAt}
+			outcome.Hold = stagedHold
+		}
+	}
 	if p.Record != nil {
 		if err := p.Record(ctx, outcome); err != nil {
 			return nil, fmt.Errorf("%w: %w", campaign.ErrAppendUnrecorded, err)
@@ -79,8 +94,65 @@ func (f *fakeCampaignRepo) AppendCampaignItems(ctx context.Context, p campaign.A
 	for it, deps := range staged {
 		it.DependsOn = deps
 	}
+	if stagedHold != nil {
+		f.holds[p.CampaignID] = stagedHold
+	}
 	f.itemsByCmp[p.CampaignID] = append(f.itemsByCmp[p.CampaignID], outcome.Created...)
 	return &outcome, nil
+}
+
+// GetDispatchHold reads the fake hold store (#4234).
+func (f *fakeCampaignRepo) GetDispatchHold(_ context.Context, campaignID uuid.UUID) (*campaign.DispatchHold, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if f.holdErr != nil {
+		return nil, f.holdErr
+	}
+	h := f.holds[campaignID]
+	if h == nil {
+		return nil, nil
+	}
+	cp := *h
+	return &cp, nil
+}
+
+// ReleaseDispatchHold mirrors the production contract: the shared guards
+// (campaign.ValidateReleaseDispatchHold), an idempotent no-op for a missing or
+// foreign hold, and record-before-commit — a Record error keeps the hold.
+func (f *fakeCampaignRepo) ReleaseDispatchHold(ctx context.Context, p campaign.ReleaseDispatchHoldParams) (*campaign.DispatchHold, error) {
+	if err := campaign.ValidateReleaseDispatchHold(p); err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.releaseCalls++
+	if f.releaseErr != nil {
+		return nil, f.releaseErr
+	}
+	h := f.holds[p.CampaignID]
+	if h == nil || h.HotfixItemID != p.HotfixItemID {
+		return nil, nil
+	}
+	if err := p.Record(ctx, *h); err != nil {
+		return nil, fmt.Errorf("%w: %w", campaign.ErrHoldReleaseUnrecorded, err)
+	}
+	delete(f.holds, p.CampaignID)
+	return h, nil
+}
+
+// GetCampaignItem finds an item by id across every seeded campaign.
+func (f *fakeCampaignRepo) GetCampaignItem(_ context.Context, id uuid.UUID) (*campaign.Item, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	for _, items := range f.itemsByCmp {
+		for _, it := range items {
+			if it.ID == id {
+				cp := *it
+				return &cp, nil
+			}
+		}
+	}
+	return nil, campaign.ErrNotFound
 }
 
 // appendResolver is an IssueSetDependencyResolver whose tracker graph is
@@ -555,21 +627,57 @@ func TestAppendCampaignItems_AwaitingHumanRederives(t *testing.T) {
 	}
 }
 
-// TestAppendCampaignItemsCore_NoRecord pins the core's record=false contract:
-// the write happens and NO audit row is written by the core (the caller owns
-// recording).
-func TestAppendCampaignItemsCore_NoRecord(t *testing.T) {
+// TestAppendCampaignItems_NilRecorderStillRecords pins that the core has NO
+// path committing without an audit row (#4234 removed record=false): a nil
+// recorder binds the strict campaign_items_appended recorder, and a core call
+// with a nil recorder over a failing audit chain writes nothing.
+func TestAppendCampaignItems_NilRecorderStillRecords(t *testing.T) {
 	h := newAppendHarness(t, Config{})
 	c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending))
-	res, refusal := h.s.appendCampaignItems(context.Background(), c, appendCampaignItemsRequest{Items: []string{"20"}}, false)
+	res, refusal := h.s.appendCampaignItems(context.Background(), c, appendCampaignItemsRequest{Items: []string{"20"}}, nil)
 	if refusal != nil {
 		t.Fatalf("refusal = %+v", refusal)
 	}
 	if len(res.Appended) != 1 || h.itemCount(c.ID) != 2 {
 		t.Fatalf("appended = %+v", res.Appended)
 	}
+	if n := h.aud.count(categoryCampaignItemsAppended); n != 1 {
+		t.Errorf("campaign_items_appended rows = %d, want 1 for a nil recorder", n)
+	}
+
+	failing := newAppendHarness(t, Config{AuditRepo: failingAuditRepo{}})
+	fc := failing.seed(cItem("issue:10", nil, campaign.ItemStatePending))
+	if _, refusal := failing.s.appendCampaignItems(context.Background(), fc, appendCampaignItemsRequest{Items: []string{"20"}}, nil); refusal == nil || refusal.Code != "campaign_audit_unavailable" {
+		t.Fatalf("nil recorder over a failing chain = %+v, want campaign_audit_unavailable", refusal)
+	}
+	if n := failing.itemCount(fc.ID); n != 1 {
+		t.Errorf("item count = %d, want 1 (nothing committed unrecorded)", n)
+	}
+}
+
+// TestAppendCampaignItems_CustomRecorderReplacesDefault pins the recorder seam
+// the hotfix verb binds: a supplied recorder runs instead of the default and
+// sees the resolved plan; its error rolls the append back.
+func TestAppendCampaignItems_CustomRecorderReplacesDefault(t *testing.T) {
+	h := newAppendHarness(t, Config{})
+	c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending))
+	var sawPlan *campaign.AppendPlan
+	rec := func(_ context.Context, out campaign.AppendOutcome, plan *campaign.AppendPlan) error {
+		sawPlan = plan
+		return errors.New("recorder refused")
+	}
+	_, refusal := h.s.appendCampaignItems(context.Background(), c, appendCampaignItemsRequest{Items: []string{"20"}}, rec)
+	if refusal == nil || refusal.Code != "campaign_audit_unavailable" {
+		t.Fatalf("refusal = %+v, want campaign_audit_unavailable", refusal)
+	}
+	if sawPlan == nil || len(sawPlan.Items) != 1 || sawPlan.Items[0].IssueRef != "issue:20" {
+		t.Errorf("recorder plan = %+v, want the one resolved new item", sawPlan)
+	}
+	if n := h.itemCount(c.ID); n != 1 {
+		t.Errorf("item count = %d, want 1 (rolled back)", n)
+	}
 	if n := h.aud.count(categoryCampaignItemsAppended); n != 0 {
-		t.Errorf("audit rows = %d, want 0 for record=false", n)
+		t.Errorf("default recorder ran: campaign_items_appended rows = %d, want 0", n)
 	}
 }
 
@@ -587,6 +695,8 @@ func TestAppendRepositoryRefusal_Mapping(t *testing.T) {
 		{campaign.InvalidTransitionError{Kind: "campaign", From: "succeeded", To: "append"}, 409, "campaign_not_appendable"},
 		{fmt.Errorf("%w: unparsable:x", campaign.ErrInvalidDependencyRef), 422, "campaign_item_ref_invalid"},
 		{campaign.ErrCampaignNotFound, 404, "campaign_not_found"},
+		{campaign.ErrDispatchHoldActive, 409, "campaign_hold_active"},
+		{fmt.Errorf("%w: two items", campaign.ErrExpediteInvalid), 422, "validation_failed"},
 		{errors.New("db down"), 500, "internal_error"},
 	}
 	for _, tc := range cases {

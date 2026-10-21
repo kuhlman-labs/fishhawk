@@ -193,9 +193,35 @@ func (s *Server) handlePromoteQueuedStage(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	subject := id.Subject
-	actorKind := actorKindForSubject(subject)
-	var auditSeq int64
+	p, auditSeq, err := s.promoteQueuedStageRecorded(r.Context(), stageID, reason, actorKindForSubject(id.Subject), id.Subject)
+	if err != nil {
+		s.writePromoteError(w, r, stageID, err)
+		return
+	}
+	resp := promoteQueuedStageResponse{
+		StageID:     p.StageID,
+		RunID:       p.RunID,
+		Group:       p.GroupKey,
+		Limit:       p.Limit,
+		Promoted:    p.Changed,
+		OldPosition: p.OldPosition,
+		NewPosition: p.NewPosition,
+		Holders:     toConcurrencyHolders(p.Holders),
+	}
+	if p.Changed {
+		resp.AuditSequence = &auditSeq
+	}
+	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// promoteQueuedStageRecorded is the promote core shared by the operator verb
+// and the campaign hotfix auto-promote (#4234, campaign_dispatch_hold.go): it
+// runs the store's single promote transaction with a Record callback that
+// appends the stage_concurrency_promoted row INSIDE it, so a failed append
+// rolls the promotion back. reason is recorded verbatim; the caller owns its
+// rules. auditSeq names the row and is meaningful only when p.Changed (a
+// stage already first is a no-op: nothing appended).
+func (s *Server) promoteQueuedStageRecorded(ctx context.Context, stageID uuid.UUID, reason string, actorKind audit.ActorKind, subject string) (p concurrency.Promotion, auditSeq int64, err error) {
 	record := func(ctx context.Context, tx pgx.Tx, p concurrency.Promotion) error {
 		raw, err := json.Marshal(stageConcurrencyPromotedPayload{
 			StageID:     p.StageID.String(),
@@ -226,26 +252,8 @@ func (s *Server) handlePromoteQueuedStage(w http.ResponseWriter, r *http.Request
 		auditSeq = entry.Sequence
 		return nil
 	}
-
-	p, err := s.cfg.Concurrency.Promote(r.Context(), concurrency.PromoteRequest{StageID: stageID, Record: record})
-	if err != nil {
-		s.writePromoteError(w, r, stageID, err)
-		return
-	}
-	resp := promoteQueuedStageResponse{
-		StageID:     p.StageID,
-		RunID:       p.RunID,
-		Group:       p.GroupKey,
-		Limit:       p.Limit,
-		Promoted:    p.Changed,
-		OldPosition: p.OldPosition,
-		NewPosition: p.NewPosition,
-		Holders:     toConcurrencyHolders(p.Holders),
-	}
-	if p.Changed {
-		resp.AuditSequence = &auditSeq
-	}
-	s.writeJSON(w, r, http.StatusOK, resp)
+	p, err = s.cfg.Concurrency.Promote(ctx, concurrency.PromoteRequest{StageID: stageID, Record: record})
+	return p, auditSeq, err
 }
 
 // writePromoteError maps a Promote error to its response. Every refusal and

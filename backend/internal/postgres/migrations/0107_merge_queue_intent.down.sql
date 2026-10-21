@@ -1,4 +1,4 @@
--- 0106 (down): drop merge_candidate_queue_entries.merge_intent_at (#4295).
+-- 0107 (down): drop merge_candidate_queue_entries.merge_intent_at (#4295).
 --
 -- Rows survive; only the recorded merge intent is lost. Rollback order: revert
 -- the fishhawkd binary FIRST — a binary that selects or stamps the column

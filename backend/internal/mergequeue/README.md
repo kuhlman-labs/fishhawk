@@ -4,7 +4,7 @@ Persisted held-pass queue for ADR-092 D1 (#4200, `docs/adr/092-serialize-merge-c
 At most ONE merge-candidate verify pass is live per `(repository, base ref)`
 inside one account. Every other eligible pass is held FIFO by eligibility time
 and consumes no runner slot. Table: `merge_candidate_queue_entries`
-(migration 0101; `merge_intent_at` added by 0106 for ADR-093 D2, #4295).
+(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295).
 ADR-093's merge queue (slice 1) reuses these rows, the FIFO order, the
 one-live-per-base rule and the lock order UNCHANGED; it adds only the
 operator's recorded merge intent and the line-turn read below. The SQL is hand-written pgx, with no sqlc (same precedent as
@@ -28,7 +28,7 @@ One row per queue EPISODE of a run.
 | `anchored_head_sha` / `anchored_base_sha` / `anchored_at` | The head the pass is bound to, the base tip it was produced against (NULL when unknown), and when. |
 | `admitted_at` | Set by `AdmitNext`; required while `live` (DB CHECK). |
 | `settled_at` | Set exactly when the row is terminal (DB CHECK). |
-| `merge_intent_at` | The operator's merge intent on this episode (0106, ADR-093 D2): NULL = none (every ADR-092 rebase/base-advance entry and every pre-0106 row). Stamped once from the database clock by `Enqueue{MergeIntent}` or `MarkMergeIntent`, never cleared; a terminal row keeps it as history, and a re-entry after a terminal row starts a FRESH row without it. |
+| `merge_intent_at` | The operator's merge intent on this episode (0107, ADR-093 D2): NULL = none (every ADR-092 rebase/base-advance entry and every pre-0107 row). Stamped once from the database clock by `Enqueue{MergeIntent}` or `MarkMergeIntent`, never cleared; a terminal row keeps it as history, and a re-entry after a terminal row starts a FRESH row without it. |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE

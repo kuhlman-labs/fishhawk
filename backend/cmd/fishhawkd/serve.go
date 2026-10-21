@@ -2029,7 +2029,7 @@ func runServe(args []string, logSink io.Writer) int {
 		"campaign-driver scan interval; 60s is the upper bound on campaign-advancement latency after a run terminates")
 	campaignDriverWorkflowID := fs.String("campaign-driver-workflow-id",
 		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_ID", "feature_change"),
-		"workflow id the campaign driver starts for each eligible campaign issue. A campaign carries no workflow context (E25.2), so the driver fetches this workflow from the repo's spec at --campaign-driver-workflow-ref.")
+		"workflow id the campaign driver starts for each eligible campaign issue. A campaign carries no workflow context (E25.2), so the driver fetches this workflow from the repo's spec at --campaign-driver-workflow-ref. An expedited (hotfix) item runs under the workflow its hotfix recorded instead (#4234).")
 	campaignDriverWorkflowRef := fs.String("campaign-driver-workflow-ref",
 		envOr("FISHHAWKD_CAMPAIGN_DRIVER_WORKFLOW_REF", ""),
 		"git ref the campaign driver fetches the workflow spec at (empty = the repo's default branch). The fetched blob SHA becomes each started run's workflow_sha.")
@@ -4345,9 +4345,20 @@ func (a campaignRunStarter) StartCampaignRun(ctx context.Context, item *campaign
 	// through handleStartCampaignItemRun), and empty WorkingDir → an unbound run
 	// (E48.69 / #2498) — the GHA auto-driver spawns no local runner, so it binds
 	// no checkout, and a bound value would be the daemon host's own directory.
-	return a.srv.StartRunForCampaignIssue(ctx, server.StartRunForCampaignIssueParams{
-		Repo: c.Repo, IssueRef: item.IssueRef, WorkflowID: a.workflowID, WorkflowRef: a.workflowRef,
-	})
+	return a.srv.StartRunForCampaignIssue(ctx, a.startParams(item, c))
+}
+
+// startParams builds the run-start parameters for item. An EXPEDITED item
+// (the campaign hotfix verb, #4234) runs under the workflow its hotfix
+// recorded; every other item runs under --campaign-driver-workflow-id.
+func (a campaignRunStarter) startParams(item *campaign.Item, c *campaign.Campaign) server.StartRunForCampaignIssueParams {
+	workflowID := a.workflowID
+	if item.Expedite != nil && item.Expedite.Workflow != "" {
+		workflowID = item.Expedite.Workflow
+	}
+	return server.StartRunForCampaignIssueParams{
+		Repo: c.Repo, IssueRef: item.IssueRef, WorkflowID: workflowID, WorkflowRef: a.workflowRef,
+	}
 }
 
 // campaignDriverStartDecision reports whether the campaign-driver ticker
