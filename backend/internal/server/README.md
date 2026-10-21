@@ -2926,9 +2926,14 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
 - **One row per intent (merge-intent lock).** The decision (re-read the
   entry, append, write, read back; `recordMergeQueueIntent`) runs under
   `mergequeue.Store.WithMergeIntentLock`, a per-run session-level Postgres
-  advisory lock with a bounded number of concurrent holders (its contract
-  and connection budget: `backend/internal/mergequeue/README.md` §
-  "Merge-intent lock"). Overlapping merges of one run, including across
+  advisory lock on the pool-wide `pglock` holder budget (its contract and
+  connection budget: `backend/internal/mergequeue/README.md` §
+  "Merge-intent lock"). The decision runs on the lock's `fn` context
+  (`r.WithContext(fctx)`), so every DB call in it carries the intent `fn`
+  deadline even when the request has none
+  (`TestMergeRun_IntentDecisionRunsOnLockDeadline`); a pump it spawns
+  detached starts from `pglock.Detach`, so it is not refused as a nested
+  lock. Overlapping merges of one run, including across
   fishhawkd replicas, take turns. The second sees the first's committed intent and answers
   `already_queued` with the SAME `intent_sequence`, so one intent
   transition has exactly one `merge_queue_entered` row
@@ -2936,8 +2941,14 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
   lock that cannot be taken, or an entry unreadable under it, gets today's
   refusal with nothing written. A lock that lapsed while the decision ran
   (`ErrIntentLockLapsed`) turns its 202 into a retryable `503
-  merge_queue_write_failed`; a decision that already wrote its own error
-  keeps that one answer (`TestMergeRun_LapsedIntentLockNeverAnswers202`).
+  merge_queue_write_failed`, after pumping the base so an entry the decision
+  just created on an idle base is admitted without another queue event; a
+  decision that already wrote its own error keeps that one answer
+  (`TestMergeRun_LapsedIntentLockNeverAnswers202`). An `already_queued`
+  entry whose `merge_queue_entered` row cannot be read back answers a
+  retryable `503 merge_queue_write_failed` with nothing written, never a 202
+  naming `intent_sequence` 0
+  (`TestMergeRun_AlreadyQueuedAuditReadFailureIs503`).
   `intent_sequence` on a repeat is the NEWEST
   row whose `base_ref` is the entry's base. Rows are appended only under the
   lock and only while the entry has no intent, so an orphan is always older

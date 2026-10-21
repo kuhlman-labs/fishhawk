@@ -517,11 +517,18 @@ type TerminalRunObservable interface {
 // it (the in-memory fakes) leaves only the orchestrator's in-process mutex.
 type ConsolidatedPROpenLocker interface {
 	// WithConsolidatedPROpenLock runs fn while holding a cross-process mutual
-	// exclusion keyed on parentRunID. A concurrent call for the SAME run blocks
-	// until the holder's fn returns; calls for distinct runs never block each
-	// other. When the lock cannot be acquired (a database error, or ctx
-	// cancelled while waiting) fn is NOT run and the error is returned; fn's
-	// own error is returned unchanged.
+	// exclusion keyed on parentRunID. A concurrent call for the SAME run waits
+	// (a try-lock poll holding no connection between tries) until the holder's
+	// fn returns; calls for distinct runs never contend for one lock, though
+	// they may wait, bounded by ctx, for a slot on the pool-wide pglock holder
+	// budget every pglock helper shares (#4591). When the lock cannot be
+	// acquired (a database error, or ctx cancelled while waiting) fn is NOT run
+	// and the error is returned; fn's own error is returned unchanged. fn's
+	// ctx carries the lock's fn deadline (even when the caller's has none) and
+	// is marked as inside a pglock lock, so fn must not take another pglock
+	// lock (pglock.ErrNestedLock). When fn returned nil but the unlock failed
+	// or found no lock, the call returns an error wrapping pglock.ErrLockLapsed
+	// (the exclusion may have lapsed) instead of swallowing it.
 	//
 	// LOCK ORDER: callers take the orchestrator's in-process per-parent mutex
 	// FIRST and this session advisory lock SECOND, and every caller must keep

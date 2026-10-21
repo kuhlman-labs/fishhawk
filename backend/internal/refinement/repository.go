@@ -185,9 +185,15 @@ type Repository interface {
 	// WithFilingLock runs fn while holding a per-draft mutual exclusion, so two
 	// concurrent filing invocations for the same draft cannot both observe an
 	// ordinal as unfiled (the gpt-5.5 concurrent-duplication guard, ADR-052).
-	// The Postgres adapter acquires a session-level pg_advisory_lock keyed on
-	// the draft UUID on a dedicated pooled connection and releases it when fn
-	// returns; the second caller blocks until the first releases, then observes
-	// the first's committed progress. fn's error is returned unchanged.
+	// The Postgres adapter TRIES a session-level advisory lock keyed on the
+	// draft UUID through pglock.WithSessionLock (#4591): a held lock re-tries
+	// every pglock.Poll holding neither a budget slot nor a connection, on the
+	// pool-wide holder budget every pglock helper shares, so the second caller
+	// waits (bounded by its ctx) until the first releases, then observes the
+	// first's committed progress. fn runs on a context bounded by the filing
+	// lock's fn deadline and marked as inside a pglock lock, so fn must not
+	// take another pglock lock (pglock.ErrNestedLock). fn's error is returned
+	// unchanged; when fn returned nil but the unlock failed or found no lock,
+	// the call returns an error wrapping pglock.ErrLockLapsed.
 	WithFilingLock(ctx context.Context, draftID uuid.UUID, fn func(context.Context) error) error
 }

@@ -83,6 +83,7 @@ var (
 	// nil, but whose lock could not be confirmed held through its release
 	// (the lock session failed, or the unlock found no lock), so another
 	// holder may have overlapped fn. fn's writes stand; the caller decides.
+	// It also wraps pglock.ErrLockLapsed.
 	ErrIntentLockLapsed = errors.New("mergequeue: merge-intent lock lapsed")
 )
 
@@ -239,7 +240,10 @@ type Store interface {
 	ActiveBases(ctx context.Context) ([]Base, error)
 	MarkMergeIntent(ctx context.Context, entryID uuid.UUID, record RecordIntentFunc) (MergeIntentResult, error)
 	RecentLineTurns(ctx context.Context, base Base, limit int) ([]time.Duration, error)
-	WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func() error) error
+	// WithMergeIntentLock runs fn under the run's merge-intent lock; fn's
+	// context is bounded by the intent fn deadline (even when ctx has none)
+	// and must not take another pglock lock (README.md § "Merge-intent lock").
+	WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error
 }
 
 // validate refuses a malformed Base before any SQL runs.

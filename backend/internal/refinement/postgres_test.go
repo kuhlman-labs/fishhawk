@@ -3,13 +3,18 @@ package refinement
 import (
 	"context"
 	"errors"
+	"fmt"
 	"math"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 func TestPostgres_CreateGetRoundTrip(t *testing.T) {
@@ -677,5 +682,127 @@ func TestPostgres_WithFilingLock_SerializesSameDraft(t *testing.T) {
 		// Expected: acquired once the first released.
 	case <-time.After(2 * time.Second):
 		t.Fatal("second WithFilingLock never acquired after the first released")
+	}
+}
+
+// TestPostgres_WithFilingLock_FnCarriesDeadline (#4591): under a
+// deadline-free caller ctx, fn's ctx carries the filing lock's 30m fn
+// deadline and the pglock nesting marker. The window is pinned to a LITERAL,
+// not filingLockFnTimeout, so a changed constant cannot move it.
+// Counterfactual: fn on a plain WithCancel of the caller ctx has no deadline,
+// and a 1000x constant lands past the upper bound, RED.
+func TestPostgres_WithFilingLock_FnCarriesDeadline(t *testing.T) {
+	const wantFnTimeout = 30 * time.Minute
+	repo := NewPostgresRepository(pgtest.NewPool(t))
+	start := time.Now()
+	var deadline time.Time
+	var hasDeadline, marked bool
+	if err := repo.WithFilingLock(context.Background(), uuid.New(), func(fctx context.Context) error {
+		deadline, hasDeadline = fctx.Deadline()
+		marked = pglock.InLock(fctx)
+		return nil
+	}); err != nil {
+		t.Fatalf("WithFilingLock: %v", err)
+	}
+	if !hasDeadline {
+		t.Fatal("fn's ctx carried no deadline under a deadline-free caller ctx")
+	}
+	slack := timescale.D(5 * time.Second)
+	if lo, hi := start.Add(wantFnTimeout-slack), time.Now().Add(wantFnTimeout+slack); deadline.Before(lo) || deadline.After(hi) {
+		t.Fatalf("fn deadline = %s, want within [%s, %s] (the filing lock's fn deadline is %s)", deadline, lo, hi, wantFnTimeout)
+	}
+	if !marked {
+		t.Fatal("fn's ctx is not marked as inside a pglock lock, so a nested lock would not be refused")
+	}
+}
+
+// newFilingLockPool opens a pool on dbURL closed at test end (registered after
+// NewURL's drop cleanup, so it closes first).
+func newFilingLockPool(t *testing.T, dbURL string) *pgxpool.Pool {
+	t.Helper()
+	p, err := pgxpool.New(context.Background(), dbURL)
+	if err != nil {
+		t.Fatalf("connect pool: %v", err)
+	}
+	t.Cleanup(p.Close)
+	return p
+}
+
+// TestPostgres_WithFilingLock_PanicReleasesLock (#4591): a panic in fn
+// propagates after the unlock. The probe acquires the same draft's lock from a
+// SECOND pool (a distinct session: advisory locks are re-entrant per session).
+// Counterfactual: an inline (not deferred) unlock leaks the lock, so the
+// probe never acquires within its bound, RED.
+func TestPostgres_WithFilingLock_PanicReleasesLock(t *testing.T) {
+	dbURL := pgtest.NewURL(t)
+	repo := NewPostgresRepository(newFilingLockPool(t, dbURL))
+	probe := NewPostgresRepository(newFilingLockPool(t, dbURL))
+	draftID := uuid.New()
+	func() {
+		defer func() {
+			if recover() == nil {
+				t.Fatal("fn's panic did not propagate")
+			}
+		}()
+		_ = repo.WithFilingLock(context.Background(), draftID, func(context.Context) error { panic("boom") })
+	}()
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(2*time.Second))
+	defer cancel()
+	ran := false
+	if err := probe.WithFilingLock(ctx, draftID, func(context.Context) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("separate-session acquire after fn panicked = %v ran=%v, want it to acquire (a leaked lock times out here)", err, ran)
+	}
+}
+
+// killFilingLockSession terminates the session holding draftID's filing lock
+// and waits for it to exit.
+func killFilingLockSession(ctx context.Context, pool *pgxpool.Pool, draftID uuid.UUID) error {
+	k := uint64(advisoryLockKey(draftID))
+	var pid int32
+	if err := pool.QueryRow(ctx, `SELECT pid FROM pg_locks WHERE locktype = 'advisory'
+  AND classid = $1::bigint::oid AND objid = $2::bigint::oid AND objsubid = 1 AND granted`,
+		int64(k>>32), int64(k&0xffffffff)).Scan(&pid); err != nil {
+		return fmt.Errorf("find the lock session: %w", err)
+	}
+	if _, err := pool.Exec(ctx, `SELECT pg_terminate_backend($1)`, pid); err != nil {
+		return fmt.Errorf("terminate the lock session: %w", err)
+	}
+	deadline := time.Now().Add(timescale.D(5 * time.Second))
+	for time.Now().Before(deadline) {
+		var alive bool
+		if err := pool.QueryRow(ctx, `SELECT EXISTS (SELECT 1 FROM pg_stat_activity WHERE pid = $1)`, pid).Scan(&alive); err != nil {
+			return err
+		}
+		if !alive {
+			return nil
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	return errors.New("the lock session never exited")
+}
+
+// TestPostgres_WithFilingLock_LapsedSessionSurfaces (#4591,
+// lock-lapse-surfaced): the lock session dies mid-fn, so a nil fn returns an
+// error wrapping pglock.ErrLockLapsed (the old helper discarded the unlock
+// result), and the draft's lock is free afterwards. Counterfactual: ignoring
+// the unlock result returns nil, RED.
+func TestPostgres_WithFilingLock_LapsedSessionSurfaces(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	draftID := uuid.New()
+	err := repo.WithFilingLock(context.Background(), draftID, func(fctx context.Context) error {
+		return killFilingLockSession(fctx, pool, draftID)
+	})
+	if !errors.Is(err, pglock.ErrLockLapsed) {
+		t.Fatalf("nil fn after its lock session died = %v, want an error wrapping pglock.ErrLockLapsed", err)
+	}
+	if !strings.Contains(err.Error(), "filing lock") {
+		t.Errorf("lapse error = %q, want it to name the filing lock", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), timescale.D(2*time.Second))
+	defer cancel()
+	ran := false
+	if err := repo.WithFilingLock(ctx, draftID, func(context.Context) error { ran = true; return nil }); err != nil || !ran {
+		t.Fatalf("next holder after the lapse = %v ran=%v, want the lock free", err, ran)
 	}
 }

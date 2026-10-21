@@ -15551,7 +15551,10 @@ paths:
             but the queue write or its read-back failed, so the run is not
             queued, or the per-run merge-intent lock lapsed before the
             decision finished, so the answer cannot vouch for the queue state
-            (the run may be queued; a re-invoke answers `already_queued`).
+            (the run may be queued, and the base was pumped before the answer;
+            a re-invoke answers `already_queued`), or the run is already
+            queued but its `merge_queue_entered` row could not be read back,
+            so the answer cannot name `intent_sequence` (nothing was written).
             Re-invoke the merge to retry. `overlap_override_unrecorded`
             (#4119, `details.retryable: true`): the `merge_overlap_overridden`
             row could not be read for dedupe or appended, so nothing was
