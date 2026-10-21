@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -133,6 +134,10 @@ type mergeRunFakeBackend struct {
 	// every re-POST across the wait carries the same verdict (the tool never
 	// skips the POST — endpoint-side idempotence).
 	mergeVerdicts []string
+	// mergeRawBodies records each POST's raw body, so a test can assert the
+	// merge overlap guard override (allow_overlap / overlap_reason, #4119)
+	// rides every (re-)POST byte-for-byte, or is absent from the wire.
+	mergeRawBodies []string
 
 	auditEntries []AuditEntry
 	getRunCalls  int
@@ -205,9 +210,11 @@ func newMergeRunFakeBackend(t *testing.T, fb *mergeRunFakeBackend) *httptest.Ser
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
+		rawBody, _ := io.ReadAll(r.Body)
 		var body mergeRunRequest
-		_ = json.NewDecoder(r.Body).Decode(&body)
+		_ = json.Unmarshal(rawBody, &body)
 		fb.mu.Lock()
+		fb.mergeRawBodies = append(fb.mergeRawBodies, string(rawBody))
 		status := http.StatusOK
 		if fb.mergeCalls < len(fb.mergeStatuses) {
 			status = fb.mergeStatuses[fb.mergeCalls]
@@ -2401,5 +2408,330 @@ func TestMergeQueueIneligibleFrom(t *testing.T) {
 		if strings.Join(got, ",") != tc.want || (tc.want == "" && got != nil) {
 			t.Errorf("%s: got %#v, want %q", tc.name, got, tc.want)
 		}
+	}
+}
+
+// --- merge overlap guard (E83.61 / #4119) ---
+
+// runOverlapRefusal drives one fishhawk_merge_run against a backend whose
+// every POST answers the given 409, with a pr_merged entry an armed await
+// WOULD resolve on, and returns the output plus the POST / await-read counts.
+func runOverlapRefusal(t *testing.T, code, msg string, details map[string]any) (MergeRunOutput, uuid.UUID, int, int) {
+	t.Helper()
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		mergeStickyStatus: http.StatusConflict,
+		mergeErrBody:      mergeCandidateErrBody(code, msg, details),
+		auditEntries:      []AuditEntry{{Sequence: 99, Category: "pr_merged"}},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	runID := uuid.New()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: runID.String(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v — a %s 409 must be a status, not a tool error", err, code)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	return out, runID, fb.mergeCalls, fb.auditReadCalls
+}
+
+// TestMergeRun_OverlappingImplementReturnsImmediately pins the 409
+// overlapping_implement_in_flight as an IMMEDIATE status: exactly ONE POST,
+// zero terminal-await reads, every merge flag false, the server message
+// verbatim, overlap.blocking decoded, and next_action fishhawk_await_stage on
+// details.blocking_run_id / stage_id. Counterfactual: deleting the
+// isMergeOverlapRefusal arm in mergeRunCore surfaces the 409 as a tool error
+// → RED (runOverlapRefusal's t.Fatalf).
+func TestMergeRun_OverlappingImplementReturnsImmediately(t *testing.T) {
+	blockRun, blockStage := uuid.NewString(), uuid.NewString()
+	msg := "run " + blockRun + " has its implement stage " + blockStage + " running on 1 path(s) this pull request changes at head H. No new merge verdict was recorded."
+	out, runID, calls, reads := runOverlapRefusal(t, "overlapping_implement_in_flight", msg, map[string]any{
+		"run_id": uuid.NewString(), "pr_url": "https://github.com/x/y/pull/7", "head_sha": "H",
+		"blocking": []any{map[string]any{"run_id": blockRun, "issue_ref": "x/y#9", "stage_id": blockStage,
+			"stage_type": "implement", "stage_state": "running", "paths": []any{"shared.go"}}},
+		"undetermined":    []any{},
+		"next_step":       "fishhawk_await_stage",
+		"blocking_run_id": blockRun,
+		"stage_id":        blockStage,
+	})
+	if out.Status != "overlapping_implement_in_flight" {
+		t.Fatalf("status = %q, want overlapping_implement_in_flight", out.Status)
+	}
+	if calls != 1 || reads != 0 {
+		t.Errorf("POSTs = %d, await reads = %d; want exactly 1 and 0 (immediate, no re-POST)", calls, reads)
+	}
+	if out.MergeQueued || out.VerdictRecorded || out.AlreadyRecorded || out.AlreadyMerged {
+		t.Errorf("flags = %+v, want all false (no verdict, nothing merged)", out)
+	}
+	if out.Message != msg {
+		t.Errorf("message = %q, want the server's verbatim", out.Message)
+	}
+	if out.PRURL != "https://github.com/x/y/pull/7" {
+		t.Errorf("pr_url = %q", out.PRURL)
+	}
+	na := out.NextAction
+	if na == nil || na.Action != "fishhawk_await_stage" || na.Params["run_id"] != blockRun || na.Params["stage_id"] != blockStage || na.Consumes != consumesNone {
+		t.Fatalf("next_action = %+v, want fishhawk_await_stage on run %s stage %s consuming none", na, blockRun, blockStage)
+	}
+	if na.Params["run_id"] == runID.String() {
+		t.Errorf("next_action names the merging run, want the BLOCKING run")
+	}
+	if !strings.Contains(na.Reason, "allow_overlap") {
+		t.Errorf("next_action reason %q does not name the override", na.Reason)
+	}
+	ov := out.Overlap
+	if ov == nil || ov.HeadSHA != "H" || len(ov.Blocking) != 1 || ov.Undetermined == nil || len(ov.Undetermined) != 0 {
+		t.Fatalf("overlap = %+v, want one blocker at head H and an empty undetermined array", ov)
+	}
+	if b := ov.Blocking[0]; b.RunID != blockRun || b.StageID != blockStage || b.StageState != "running" || b.IssueRef != "x/y#9" ||
+		len(b.Paths) != 1 || b.Paths[0] != "shared.go" {
+		t.Errorf("blocker = %+v, want run %s stage %s running on [shared.go]", b, blockRun, blockStage)
+	}
+}
+
+// TestMergeRun_OverlappingImplementFallsBackToFirstBlocker pins that a detail
+// map without blocking_run_id / stage_id (an older backend shape) still names
+// the first blocker's run and stage.
+func TestMergeRun_OverlappingImplementFallsBackToFirstBlocker(t *testing.T) {
+	blockRun, blockStage := uuid.NewString(), uuid.NewString()
+	out, _, _, _ := runOverlapRefusal(t, "overlapping_implement_in_flight", "", map[string]any{
+		"blocking": []any{
+			map[string]any{"run_id": blockRun, "stage_id": blockStage, "stage_type": "implement", "stage_state": "dispatched", "paths": []any{"a.go"}},
+			"not-an-object",
+		},
+	})
+	if out.NextAction == nil || out.NextAction.Params["run_id"] != blockRun || out.NextAction.Params["stage_id"] != blockStage {
+		t.Fatalf("next_action = %+v, want the first blocker %s / %s", out.NextAction, blockRun, blockStage)
+	}
+	if len(out.Overlap.Blocking) != 1 {
+		t.Errorf("blocking = %+v, want the malformed member dropped", out.Overlap.Blocking)
+	}
+	if !strings.Contains(out.Message, "fishhawk_await_stage") {
+		t.Errorf("empty-message fallback %q does not name the verb", out.Message)
+	}
+}
+
+// TestMergeRun_OverlapUndeterminedReturnsImmediately pins the 409
+// overlap_undetermined as an IMMEDIATE status whose next_action is
+// fishhawk_merge_run on THIS run with allow_overlap, the reason naming
+// details.reason and the audited override. Counterfactual: deleting
+// "overlap_undetermined" from mergeOverlapStatuses makes it a tool error → RED.
+func TestMergeRun_OverlapUndeterminedReturnsImmediately(t *testing.T) {
+	other := uuid.NewString()
+	out, runID, calls, reads := runOverlapRefusal(t, "overlap_undetermined", "cannot rule out an overlap", map[string]any{
+		"reason":   "changed_paths_unavailable",
+		"blocking": []any{},
+		"undetermined": []any{map[string]any{"run_id": other, "stage_id": uuid.NewString(), "stage_type": "implement",
+			"stage_state": "running", "paths": []any{}}},
+	})
+	if out.Status != "overlap_undetermined" {
+		t.Fatalf("status = %q, want overlap_undetermined", out.Status)
+	}
+	if calls != 1 || reads != 0 {
+		t.Errorf("POSTs = %d, await reads = %d; want 1 and 0", calls, reads)
+	}
+	na := out.NextAction
+	if na == nil || na.Action != "fishhawk_merge_run" || na.Params["run_id"] != runID.String() || na.Params["allow_overlap"] != "true" {
+		t.Fatalf("next_action = %+v, want fishhawk_merge_run on %s with allow_overlap", na, runID)
+	}
+	if !strings.Contains(na.Reason, "changed_paths_unavailable") || !strings.Contains(na.Reason, "audited") {
+		t.Errorf("next_action reason %q must name details.reason and the audited override", na.Reason)
+	}
+	if out.Overlap == nil || out.Overlap.Reason != "changed_paths_unavailable" || len(out.Overlap.Undetermined) != 1 ||
+		out.Overlap.Undetermined[0].RunID != other || out.Overlap.Blocking == nil {
+		t.Errorf("overlap = %+v, want reason changed_paths_unavailable with one undetermined run %s", out.Overlap, other)
+	}
+}
+
+// TestMergeRun_AllowOverlapRequiresReasonLocally pins the local override
+// validation (approval conditions C3/C4): allow_overlap with a blank reason,
+// and a reason over 2000 bytes (with or without allow_overlap), are tool errors
+// with ZERO HTTP calls. Counterfactual: deleting either check lets the POST
+// happen → RED on the call count.
+func TestMergeRun_AllowOverlapRequiresReasonLocally(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		allow  bool
+		reason string
+		want   string
+	}{
+		{"empty", true, "", "non-empty overlap_reason"},
+		{"whitespace", true, " \t\n ", "non-empty overlap_reason"},
+		{"over cap with allow", true, strings.Repeat("r", mergeOverlapReasonMaxBytes+1), "at most 2000 bytes"},
+		{"over cap without allow", false, strings.Repeat("r", mergeOverlapReasonMaxBytes+1), "at most 2000 bytes"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{prURL: "https://github.com/x/y/pull/7", stateBeforeMerge: "running"}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+			_, _, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it",
+				AllowOverlap: tc.allow, OverlapReason: tc.reason, TimeoutSeconds: 1})
+			if err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("err = %v, want a tool error naming %q", err, tc.want)
+			}
+			fb.mu.Lock()
+			defer fb.mu.Unlock()
+			if fb.mergeCalls != 0 || fb.getRunCalls != 0 {
+				t.Errorf("POSTs = %d, GetRun = %d; want 0 and 0 (refused before any HTTP hop)", fb.mergeCalls, fb.getRunCalls)
+			}
+		})
+	}
+}
+
+// TestMergeRun_OverlapOverrideForwardedOnEveryPOST pins that the override
+// rides the first POST AND every checks_pending re-POST, with overlap_reason
+// byte-for-byte (leading/trailing whitespace kept — approval condition C3),
+// and that a reason of exactly the cap is accepted. Counterfactual: sending
+// mergeRunRequest{Verdict: verdict} (dropping the override) → RED.
+func TestMergeRun_OverlapOverrideForwardedOnEveryPOST(t *testing.T) {
+	reason := "  judged safe: B only touches docs <b>  \n"
+	for _, tc := range []struct{ name, reason string }{
+		{"verbatim whitespace", reason},
+		{"exactly the cap", strings.Repeat("x", mergeOverlapReasonMaxBytes)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL:            "https://github.com/x/y/pull/7",
+				stateBeforeMerge: "running",
+				mergeStatuses:    []int{http.StatusConflict},
+				mergeErrBody:     mergeCandidateErrBody("merge_checks_pending", "checks pending", map[string]any{"verdict_sequence": 4}),
+				mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 4, PRURL: "https://github.com/x/y/pull/7"},
+				auditEntries:     []AuditEntry{{Sequence: 9, Category: "pr_merged"}},
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it",
+				AllowOverlap: true, OverlapReason: tc.reason, TimeoutSeconds: 30})
+			if err != nil {
+				t.Fatalf("mergeRun: %v", err)
+			}
+			if out.Status != "merged" {
+				t.Fatalf("status = %q, want merged", out.Status)
+			}
+			fb.mu.Lock()
+			defer fb.mu.Unlock()
+			if len(fb.mergeRawBodies) != 2 {
+				t.Fatalf("POSTs = %d, want 2 (checks_pending, then the merge)", len(fb.mergeRawBodies))
+			}
+			for i, raw := range fb.mergeRawBodies {
+				var got map[string]any
+				if err := json.Unmarshal([]byte(raw), &got); err != nil {
+					t.Fatalf("POST %d body %q: %v", i, raw, err)
+				}
+				if got["allow_overlap"] != true || got["overlap_reason"] != tc.reason || got["verdict"] != "ship it" {
+					t.Errorf("POST %d body = %s, want allow_overlap true and overlap_reason verbatim", i, raw)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeRun_NoOverrideOmitsFieldsOnTheWire pins that a merge without an
+// override sends today's verdict-only body: allow_overlap / overlap_reason
+// are ABSENT, not false / "".
+func TestMergeRun_NoOverrideOmitsFieldsOnTheWire(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:            "https://github.com/x/y/pull/7",
+		stateBeforeMerge: "running",
+		mergeResp:        MergeRunResult{MergeQueued: true, VerdictSequence: 4},
+		auditEntries:     []AuditEntry{{Sequence: 9, Category: "pr_merged"}},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	if _, _, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 5}); err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	if len(fb.mergeRawBodies) != 1 || strings.Contains(fb.mergeRawBodies[0], "overlap") {
+		t.Errorf("bodies = %q, want one verdict-only body", fb.mergeRawBodies)
+	}
+}
+
+// TestMergeRun_OverlapRefusalDuringChecksPendingWait pins that the overlap
+// arm is consulted on EVERY POST: an overlap 409 met on a checks_pending
+// re-POST returns at once instead of waiting out the budget.
+func TestMergeRun_OverlapRefusalDuringChecksPendingWait(t *testing.T) {
+	fb := &mergeRunFakeBackend{
+		prURL:             "https://github.com/x/y/pull/7",
+		stateBeforeMerge:  "running",
+		mergeStickyStatus: http.StatusConflict,
+		mergeErrBodies: []string{
+			mergeCandidateErrBody("merge_checks_pending", "checks pending", map[string]any{"verdict_sequence": 4}),
+			mergeCandidateErrBody("overlapping_implement_in_flight", "overlap", map[string]any{"blocking_run_id": "b", "stage_id": "s"}),
+		},
+	}
+	srv := newMergeRunFakeBackend(t, fb)
+	r := newMergeRunResolver(srv)
+	start := time.Now()
+	_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("mergeRun: %v", err)
+	}
+	if out.Status != "overlapping_implement_in_flight" {
+		t.Fatalf("status = %q, want overlapping_implement_in_flight on the re-POST", out.Status)
+	}
+	fb.mu.Lock()
+	calls := fb.mergeCalls
+	fb.mu.Unlock()
+	if calls != 2 {
+		t.Errorf("POSTs = %d, want 2", calls)
+	}
+	if elapsed := time.Since(start); elapsed > 5*time.Second {
+		t.Errorf("mergeRun took %s, want an immediate return", elapsed)
+	}
+}
+
+// TestMergeRun_OverlapRetryableFailuresAreToolErrors pins that the guard's 502
+// overlap_check_failed and 503 overlap_override_unrecorded stay TOOL ERRORS
+// (retryable failures, not preconditions), and the 400 overlap_reason
+// validation passes through as one.
+func TestMergeRun_OverlapRetryableFailuresAreToolErrors(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		code   string
+	}{
+		{http.StatusBadGateway, "overlap_check_failed"},
+		{http.StatusServiceUnavailable, "overlap_override_unrecorded"},
+		{http.StatusBadRequest, "validation_failed"},
+	} {
+		t.Run(tc.code, func(t *testing.T) {
+			fb := &mergeRunFakeBackend{
+				prURL:             "https://github.com/x/y/pull/7",
+				stateBeforeMerge:  "running",
+				mergeStickyStatus: tc.status,
+				mergeErrBody:      mergeCandidateErrBody(tc.code, "refused", map[string]any{"reason": "forge_read", "retryable": true}),
+			}
+			srv := newMergeRunFakeBackend(t, fb)
+			r := newMergeRunResolver(srv)
+			_, out, err := r.mergeRun(context.Background(), nil, MergeRunInput{RunID: uuid.NewString(), Verdict: "ship it",
+				AllowOverlap: true, OverlapReason: "safe", TimeoutSeconds: 1})
+			if err == nil || !strings.Contains(err.Error(), tc.code) {
+				t.Fatalf("err = %v, out = %+v; want a tool error naming %s", err, out, tc.code)
+			}
+		})
+	}
+}
+
+// TestIsMergeOverlapRefusal pins the code→status table and that only a 409
+// maps.
+func TestIsMergeOverlapRefusal(t *testing.T) {
+	for _, code := range []string{"overlapping_implement_in_flight", "overlap_undetermined"} {
+		if _, got, ok := isMergeOverlapRefusal(&apiError{StatusCode: http.StatusConflict, Code: code}); !ok || got != code {
+			t.Errorf("%s → (%q, %v), want (%q, true)", code, got, ok, code)
+		}
+		if _, _, ok := isMergeOverlapRefusal(&apiError{StatusCode: http.StatusBadGateway, Code: code}); ok {
+			t.Errorf("%s on a 502 mapped; want only a 409", code)
+		}
+	}
+	for _, code := range []string{"overlap_check_failed", "overlap_override_unrecorded", "merge_base_behind"} {
+		if _, _, ok := isMergeOverlapRefusal(&apiError{StatusCode: http.StatusConflict, Code: code}); ok {
+			t.Errorf("%s mapped; want it left to the other arms", code)
+		}
+	}
+	if _, _, ok := isMergeOverlapRefusal(errors.New("plain")); ok {
+		t.Error("a non-apiError mapped")
 	}
 }

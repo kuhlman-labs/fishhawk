@@ -3913,8 +3913,16 @@ func (c *apiClient) ReconcileMerge(ctx context.Context, runID uuid.UUID, superse
 // body (`backend/internal/server/merge_run.go::mergeRunRequest`, E48.7 /
 // #1954). Verdict is REQUIRED — the merge records an audited operator
 // verdict as a chained merge_verdict_recorded audit entry.
+//
+// AllowOverlap / OverlapReason are the merge overlap guard override (E83.61 /
+// #4119): allow_overlap admits a merge the guard refuses and requires a
+// non-empty overlap_reason of at most 2000 bytes, recorded VERBATIM on the
+// merge_overlap_overridden audit row. Both are omitempty, so a merge without
+// an override sends today's verdict-only body byte-for-byte.
 type mergeRunRequest struct {
-	Verdict string `json:"verdict"`
+	Verdict       string `json:"verdict"`
+	AllowOverlap  bool   `json:"allow_overlap,omitempty"`
+	OverlapReason string `json:"overlap_reason,omitempty"`
 }
 
 // MergeRunResult mirrors the backend's merge 200 body: the merge was
@@ -4008,11 +4016,30 @@ type MergeRunResult struct {
 //   - 503 merge_queue_unrecorded / merge_queue_write_failed (ADR-093 slice 1:
 //     the merge-queue enqueue arm could not record the merge_queue_entered row
 //     or write the entry; retryable, re-POST)
+//   - the merge overlap guard (E83.61 / #4119): 400 validation_failed with
+//     details.field overlap_reason (allow_overlap with a blank reason, or a
+//     reason over 2000 bytes); 409 overlapping_implement_in_flight (another
+//     live run's dispatched/running implement stage scopes a path this PR
+//     changes; details carry blocking[], undetermined[], head_sha, next_step
+//     fishhawk_await_stage, blocking_run_id and stage_id) and 409
+//     overlap_undetermined (the guard could not rule an overlap out and fails
+//     closed; details.reason names why) — fishhawk_merge_run returns both as
+//     IMMEDIATE statuses; 502 overlap_check_failed (a retryable read failure;
+//     details reason + retryable) and 503 overlap_override_unrecorded (the
+//     override row could not be recorded, nothing merged) stay tool errors.
 //
 // A 2xx other than 200 decodes the same way: the ADR-093 enqueue arm answers
 // 202 with Queued:true (E87.4 / #4295).
 func (c *apiClient) MergeRun(ctx context.Context, runID uuid.UUID, verdict string) (*MergeRunResult, error) {
-	body, err := json.Marshal(mergeRunRequest{Verdict: verdict})
+	return c.mergeRunWith(ctx, runID, mergeRunRequest{Verdict: verdict})
+}
+
+// mergeRunWith is MergeRun with the full request body, so fishhawk_merge_run
+// can forward the merge overlap guard override (allow_overlap +
+// overlap_reason, E83.61 / #4119) on every (re-)POST. The body is sent as
+// given: overlap_reason is never trimmed here.
+func (c *apiClient) mergeRunWith(ctx context.Context, runID uuid.UUID, req mergeRunRequest) (*MergeRunResult, error) {
+	body, err := json.Marshal(req)
 	if err != nil {
 		return nil, fmt.Errorf("marshal merge: %w", err)
 	}

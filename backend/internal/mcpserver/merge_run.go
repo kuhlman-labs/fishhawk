@@ -38,7 +38,17 @@ type MergeRunInput struct {
 	// request before dispatching — a merge that settled during the wait returns
 	// already_merged rather than the 502 a blind re-dispatch produced.
 	TimeoutSeconds int `json:"timeout_seconds,omitempty" jsonschema:"how long to await the terminal merge (default 360, capped at 600). On timeout the tool returns status=timeout (resumable) — re-invoke to resume. The re-POST never duplicates the merge_verdict_recorded ROW, and re-dispatching is safe because the endpoint OBSERVES the pull request first: a merge that settled during the wait comes back as already_merged instead of a 502"`
+	// AllowOverlap / OverlapReason are the merge overlap guard override
+	// (E83.61 / #4119), forwarded on every (re-)POST. OverlapReason is sent
+	// VERBATIM: the trim only rejects a blank reason locally.
+	AllowOverlap  bool   `json:"allow_overlap,omitempty" jsonschema:"override the merge overlap guard (#4119): merge even though another live run's implement stage scopes a path this pull request changes (overlapping_implement_in_flight), or the guard could not rule that out (overlap_undetermined / overlap_check_failed). An AUDITED operator judgement: it requires overlap_reason and is recorded as a merge_overlap_overridden audit row before any merge verdict or merge intent"`
+	OverlapReason string `json:"overlap_reason,omitempty" jsonschema:"required non-empty (at most 2000 bytes) when allow_overlap is true: why merging over the overlap is safe. Recorded verbatim on the merge_overlap_overridden audit row"`
 }
+
+// mergeOverlapReasonMaxBytes mirrors the backend's overlap_reason cap
+// (backend/internal/server/merge_overlap_guard.go, approval condition C4):
+// an over-cap reason is a local tool error, never a POST.
+const mergeOverlapReasonMaxBytes = 2000
 
 // MergeRunOutput is the fishhawk_merge_run response. Status is one of:
 //
@@ -115,8 +125,19 @@ type MergeRunInput struct {
 //     NextAction names fishhawk_get_merge_queue. An INELIGIBLE run instead
 //     keeps the behind_base / merge_candidate_unverified / merge_candidate_held
 //     status, with MergeQueueIneligible naming the reason codes.
+//   - "overlapping_implement_in_flight", "overlap_undetermined" — the merge
+//     overlap guard (E83.61 / #4119) refused the merge: another live run's
+//     dispatched/running implement stage scopes a path this pull request
+//     changes, or the guard could not rule that out and failed closed.
+//     IMMEDIATE (no poll, no re-POST) and every merge flag is false: the
+//     guard refuses before any verdict or merge-intent append. Overlap carries
+//     the blocking / undetermined runs; NextAction names fishhawk_await_stage
+//     on the blocking stage (overlapping) or fishhawk_merge_run with
+//     allow_overlap (undetermined — an audited override). The guard's 502
+//     overlap_check_failed and 503 overlap_override_unrecorded stay TOOL
+//     ERRORS: both are retryable failures, not preconditions.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete, queued"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete, queued, overlapping_implement_in_flight, overlap_undetermined"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -151,8 +172,8 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued, fishhawk_get_merge_queue (watch the base's line)"`
-	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness statuses"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued, fishhawk_get_merge_queue (watch the base's line); on overlapping_implement_in_flight, fishhawk_await_stage on the blocking run's stage; on overlap_undetermined, fishhawk_merge_run with allow_overlap (an audited override)"`
+	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness / merge-overlap statuses"`
 	// QueuePosition / AnchoredHeadSHA / LiveRunID ride status
 	// merge_candidate_held (ADR-092 / #4200), from the 409's details, and
 	// status queued (ADR-093 slice 1, E87.4 / #4295), from the 202 body.
@@ -182,11 +203,14 @@ type MergeRunOutput struct {
 	// a property of the repository's branch protection, which fishhawk_doctor's
 	// merge_gate rung reports. Nothing here may assert it is required.
 	Note string `json:"note" jsonschema:"the PR-approval review stays a gh step under your own GitHub identity; queueing the merge before approval is safe — GitHub fires it once branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether it gates the merge depends on this repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge enforces"`
+	// Overlap rides status overlapping_implement_in_flight / overlap_undetermined
+	// (E83.61 / #4119), decoded from the 409's details.
+	Overlap *mergeOverlapRefusal `json:"overlap,omitempty" jsonschema:"on overlapping_implement_in_flight / overlap_undetermined: the merge overlap guard's refusal — reason (overlap_undetermined: why the guard could not decide), head_sha, blocking[] (runs whose live implement stage scopes a path this pull request changes, with the shared paths) and undetermined[] (live runs the guard could not judge)"`
 	// ScopeOverlap is informational (E83.60 / #4118): every non-terminal run
 	// sharing files with the run being merged, from a best-effort live read
 	// made after the merge flow returns. Never refuses; nil when the read
 	// failed (a token without read:audit) or against an older backend.
-	ScopeOverlap *scopeOverlap `json:"scope_overlap,omitempty" jsonschema:"informational (#4118): every OTHER non-terminal run in the repo whose effective scope shares exact paths with the run being merged (overlaps[] with run_id, issue_ref, decomposed_from, stage, stage_state, paths). Merging while one of them is mid-implement can leave it in a category-B dead end — check it before its next stage. Never refuses the merge; absent when the read failed (a token without read:audit) or against an older backend"`
+	ScopeOverlap *scopeOverlap `json:"scope_overlap,omitempty" jsonschema:"informational (#4118): every OTHER non-terminal run in the repo whose effective scope shares exact paths with the run being merged (overlaps[] with run_id, issue_ref, decomposed_from, stage, stage_state, paths). Merging while one of them is mid-implement can leave it in a category-B dead end — check it before its next stage. This informational field never refuses the merge (the merge overlap guard, status overlapping_implement_in_flight, does — #4119); absent when the read failed (a token without read:audit) or against an older backend"`
 }
 
 // mergeRunNote is the split-identity reminder surfaced on every response.
@@ -354,6 +378,27 @@ Statuses:
                      run keeps the behind_base / merge_candidate_unverified /
                      merge_candidate_held status and nothing is written;
                      merge_queue_ineligible names the reason codes.
+  - "overlapping_implement_in_flight" — the merge overlap guard (#4119):
+                     ANOTHER live run in this repository (outside this run's
+                     lineage) has its implement stage dispatched or running,
+                     and its effective scope shares paths with what this pull
+                     request changes at its head. Merging now moves the base
+                     under that agent (the category-B dead-end class).
+                     Immediate, no new verdict row, nothing merged or queued.
+                     overlap.blocking names each run, its stage and the shared
+                     paths; next_action names fishhawk_await_stage on the
+                     blocking stage — re-invoke once it settles, or pass
+                     allow_overlap with overlap_reason to merge deliberately.
+  - "overlap_undetermined" — the guard could not rule an overlap out while a
+                     live implement exists elsewhere and FAILS CLOSED:
+                     overlap.reason is changed_files_capped (the forge
+                     truncated this PR's comparison), rename_source_unknown,
+                     run_list_truncated, changed_paths_unavailable (no GitHub
+                     anchors — GitLab runs land here) or scope_unresolved (a
+                     live run's scope does not resolve). Immediate, no new
+                     verdict row. next_action names fishhawk_merge_run with
+                     allow_overlap: an override is an audited operator
+                     judgement.
 
 Inputs:
   - run_id          (required) — the gate-approved run's UUID; it must carry
@@ -363,9 +408,18 @@ Inputs:
   - verdict         (required) — your operator merge verdict, recorded
                     verbatim on the audit entry.
   - timeout_seconds — default 360, capped at 600.
+  - allow_overlap   — override a refusing merge overlap guard (any of its
+                    409s or its 502). Requires overlap_reason. The override is
+                    recorded as a merge_overlap_overridden audit row BEFORE the
+                    merge verdict (on a first merge) or the merge intent, and
+                    is deduped across re-POSTs of the same judgement.
+  - overlap_reason  — required non-empty (at most 2000 bytes) with
+                    allow_overlap; recorded verbatim.
 
 Tool errors:
   - invalid UUID (caught before the HTTP hop)
+  - allow_overlap with a blank overlap_reason, or an overlap_reason over 2000
+    bytes (caught before the HTTP hop)
   - the run has no PR URL, or the run is failed/cancelled (fast local
     refusal before the POST)
   - the backend's authoritative surfaces: validation_failed (400),
@@ -383,7 +437,12 @@ Tool errors:
     merge_unconfigured (503), merge_queue_unrecorded / merge_queue_write_failed
     (503 — ADR-093 slice 1: the merge intent could not be recorded on the
     audit chain, or the queue could not be written after it was; the run is
-    NOT queued and the call is retryable; re-invoke)
+    NOT queued and the call is retryable; re-invoke),
+    overlap_check_failed (502 — the merge overlap guard could not read the
+    forge, the live runs or a run's stages, so it refused; retryable;
+    re-invoke, or override with allow_overlap), overlap_override_unrecorded
+    (503 — the merge_overlap_overridden row could not be recorded, so nothing
+    merged and no new verdict was recorded; retryable; re-invoke)
 
 The backend's 409 merge_checks_pending is NOT surfaced as a tool error: it is
 the checks-not-all-passed precondition the tool WAITS on (re-POSTing on the poll
@@ -406,12 +465,16 @@ ineligible one keeps the 409 status with merge_queue_ineligible set.
 
 The backend's 409 acceptance_stale / approval_dismissed (#4086) and
 review_coverage_incomplete (#4219) are likewise NOT tool errors: each is returned IMMEDIATELY under the same status name with
-next_action naming the clearing verb, instead of a timeout.
+next_action naming the clearing verb, instead of a timeout. So are the merge
+overlap guard's 409 overlapping_implement_in_flight / overlap_undetermined
+(#4119), checked on every POST including a checks_pending re-POST.
 
 Every non-error response also carries scope_overlap (#4118, informational,
 best-effort): the other non-terminal runs whose effective scope shares files
 with this run. A run there that is mid-implement may need a rebase or a re-plan
-once this merge lands. It never refuses the merge.
+once this merge lands. The scope_overlap field itself never refuses; the
+refusing consumer is the merge overlap guard above, which judges only runs
+whose implement stage is live against this PR's actual changed paths.
 `),
 	}, resolver.mergeRun)
 }
@@ -716,6 +779,144 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 	}
 }
 
+// mergeOverlapRun mirrors one entry of the backend's merge overlap guard
+// refusal (backend/internal/server/merge_overlap_guard.go mergeOverlapBlocker,
+// E83.61 / #4119): a blocking run (Paths = the shared paths) or an
+// undetermined one (Paths empty). The json tags MUST byte-match the backend;
+// the MCP → HTTP → Postgres test (integration/mcp/merge_overlap_test.go)
+// catches a drift.
+type mergeOverlapRun struct {
+	RunID          string   `json:"run_id" jsonschema:"the other live run"`
+	IssueRef       string   `json:"issue_ref,omitempty" jsonschema:"its trigger ref; a decomposition child carries its parent's issue"`
+	DecomposedFrom string   `json:"decomposed_from,omitempty" jsonschema:"its decomposed parent run id, when it is a slice"`
+	StageID        string   `json:"stage_id" jsonschema:"its live implement-type stage"`
+	StageType      string   `json:"stage_type" jsonschema:"that stage's type (implement: an implement, fix-up, conflict-resolution or merge-candidate verify pass)"`
+	StageState     string   `json:"stage_state" jsonschema:"dispatched or running"`
+	Paths          []string `json:"paths" jsonschema:"the shared paths, sorted (empty for an undetermined run)"`
+}
+
+// mergeOverlapRefusal is the tool's view of a 409 overlapping_implement_in_flight
+// / overlap_undetermined body's details.
+type mergeOverlapRefusal struct {
+	Reason       string            `json:"reason,omitempty" jsonschema:"overlap_undetermined only: changed_files_capped, rename_source_unknown, run_list_truncated, changed_paths_unavailable or scope_unresolved"`
+	HeadSHA      string            `json:"head_sha,omitempty" jsonschema:"the pull request head the guard judged (absent when the changed paths were never read)"`
+	Blocking     []mergeOverlapRun `json:"blocking" jsonschema:"runs whose live implement stage scopes a path this pull request changes"`
+	Undetermined []mergeOverlapRun `json:"undetermined" jsonschema:"live runs the guard could not judge"`
+}
+
+// mergeOverlapStatuses maps the backend's merge overlap guard 409 codes
+// (E83.61 / #4119) to the tool's IMMEDIATE statuses. The guard's 502
+// overlap_check_failed and 503 overlap_override_unrecorded are deliberately
+// absent: retryable failures stay tool errors.
+var mergeOverlapStatuses = map[string]string{
+	"overlapping_implement_in_flight": "overlapping_implement_in_flight",
+	"overlap_undetermined":            "overlap_undetermined",
+}
+
+// isMergeOverlapRefusal reports whether err is one of the merge overlap
+// guard's 409 refusals and returns the tool status it maps to.
+func isMergeOverlapRefusal(err error) (*apiError, string, bool) {
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict {
+		return nil, "", false
+	}
+	status, ok := mergeOverlapStatuses[ae.Code]
+	if !ok {
+		return nil, "", false
+	}
+	return ae, status, true
+}
+
+// mergeOverlapRefusalFrom decodes the guard's details. DEFENSIVE: the map
+// crossed an HTTP JSON boundary, so a member that does not decode is dropped
+// rather than failing the status; blocking / undetermined are always arrays.
+func mergeOverlapRefusalFrom(details map[string]any) *mergeOverlapRefusal {
+	out := &mergeOverlapRefusal{}
+	out.Reason, _ = details["reason"].(string)
+	out.HeadSHA, _ = details["head_sha"].(string)
+	decode := func(key string) []mergeOverlapRun {
+		runs := []mergeOverlapRun{}
+		raw, _ := details[key].([]any)
+		for _, v := range raw {
+			b, err := json.Marshal(v)
+			if err != nil {
+				continue
+			}
+			var r mergeOverlapRun
+			if json.Unmarshal(b, &r) != nil || r.RunID == "" {
+				continue
+			}
+			if r.Paths == nil {
+				r.Paths = []string{}
+			}
+			runs = append(runs, r)
+		}
+		return runs
+	}
+	out.Blocking = decode("blocking")
+	out.Undetermined = decode("undetermined")
+	return out
+}
+
+// mergeOverlapOutput builds the IMMEDIATE checkpoint for a merge overlap guard
+// refusal (E83.61 / #4119). The guard refuses before any verdict or
+// merge-intent append, so every flag is false and the server's message is
+// passed through verbatim. overlapping_implement_in_flight names
+// fishhawk_await_stage on details.blocking_run_id / stage_id (the first
+// blocker); overlap_undetermined names fishhawk_merge_run with allow_overlap,
+// because nothing but the cause clearing or an audited override admits it.
+func mergeOverlapOutput(ae *apiError, status string, runID uuid.UUID, start time.Time) MergeRunOutput {
+	prURL, _ := ae.Details["pr_url"].(string)
+	ov := mergeOverlapRefusalFrom(ae.Details)
+	var next *SuggestedAction
+	if status == "overlapping_implement_in_flight" {
+		params := map[string]string{}
+		blockingRun, _ := ae.Details["blocking_run_id"].(string)
+		stageID, _ := ae.Details["stage_id"].(string)
+		if blockingRun == "" && len(ov.Blocking) > 0 {
+			blockingRun, stageID = ov.Blocking[0].RunID, ov.Blocking[0].StageID
+		}
+		if blockingRun != "" {
+			params["run_id"] = blockingRun
+		}
+		if stageID != "" {
+			params["stage_id"] = stageID
+		}
+		next = &SuggestedAction{
+			Action:       "fishhawk_await_stage",
+			Params:       params,
+			Precondition: "another live run's implement stage scopes a path this pull request changes (overlapping_implement_in_flight)",
+			Consumes:     consumesNone,
+			Reason:       "wait for the overlapping stage to settle, then re-invoke fishhawk_merge_run (or pass allow_overlap with overlap_reason to merge deliberately)",
+		}
+	} else {
+		reason := ov.Reason
+		if reason == "" {
+			reason = "undetermined"
+		}
+		next = &SuggestedAction{
+			Action:       "fishhawk_merge_run",
+			Params:       map[string]string{"run_id": runID.String(), "allow_overlap": "true"},
+			Precondition: "the merge overlap guard could not rule out an overlap with a live implement stage elsewhere (overlap_undetermined: " + reason + ")",
+			Consumes:     consumesNone,
+			Reason:       "clear the cause (" + reason + ") and re-invoke, or re-invoke with allow_overlap and an overlap_reason: overriding is an audited operator judgement recorded as merge_overlap_overridden",
+		}
+	}
+	msg := ae.Message
+	if strings.TrimSpace(msg) == "" {
+		msg = "the merge overlap guard refused the merge (" + ae.Code + "); call " + next.Action + ", then re-invoke fishhawk_merge_run."
+	}
+	return MergeRunOutput{
+		Status:        status,
+		PRURL:         prURL,
+		WaitedSeconds: time.Since(start).Seconds(),
+		Note:          mergeRunNote,
+		Message:       msg,
+		NextAction:    next,
+		Overlap:       ov,
+	}
+}
+
 // alreadyMergedMessage renders the operator-facing explanation for the
 // already-merged arm (E45.87 / #3622).
 //
@@ -996,6 +1197,16 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 	if verdict == "" {
 		return nil, MergeRunOutput{}, fmt.Errorf("verdict is required: the merge records an audited operator decision to ship")
 	}
+	// The merge overlap guard override (E83.61 / #4119), validated before any
+	// HTTP hop and mirroring the backend's 400s. The trim only rejects a blank
+	// reason: the POST carries in.OverlapReason verbatim (approval condition C3).
+	if len(in.OverlapReason) > mergeOverlapReasonMaxBytes {
+		return nil, MergeRunOutput{}, fmt.Errorf("overlap_reason is %d bytes; it must be at most %d bytes", len(in.OverlapReason), mergeOverlapReasonMaxBytes)
+	}
+	if in.AllowOverlap && strings.TrimSpace(in.OverlapReason) == "" {
+		return nil, MergeRunOutput{}, fmt.Errorf("allow_overlap requires a non-empty overlap_reason: overriding the merge overlap guard is an audited operator judgement — state why the overlap is safe")
+	}
+	mergeReq := mergeRunRequest{Verdict: verdict, AllowOverlap: in.AllowOverlap, OverlapReason: in.OverlapReason}
 
 	// Pre-flight fast refusal (the backend re-validates authoritatively). A
 	// run with no PR to merge, or one already failed/cancelled, can never
@@ -1066,7 +1277,7 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 			return nil, r.checksPendingCheckpoint(ctx, runID, checksSeq, start, checksDetails), nil
 		}
 		var merr error
-		res, merr = r.api.MergeRun(deadlineCtx, runID, verdict)
+		res, merr = r.api.mergeRunWith(deadlineCtx, runID, mergeReq)
 		if merr == nil {
 			break
 		}
@@ -1088,6 +1299,12 @@ func (r *runResolver) mergeRunCore(ctx context.Context, _ *mcp.CallToolRequest, 
 		// returns it at once instead of waiting out the budget.
 		if rae, status, refused := isMergeReadinessRefusal(merr); refused {
 			return nil, mergeReadinessOutput(rae, status, runID, start), nil
+		}
+		// The merge overlap guard (E83.61 / #4119) clears only when the other
+		// run's implement settles or the operator overrides: never by waiting
+		// out the budget. Checked on every POST, like the readiness arm.
+		if oae, status, refused := isMergeOverlapRefusal(merr); refused {
+			return nil, mergeOverlapOutput(oae, status, runID, start), nil
 		}
 		ae, pending := isChecksPending(merr)
 		if !pending {
