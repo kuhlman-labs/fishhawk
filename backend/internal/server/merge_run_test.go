@@ -2952,10 +2952,23 @@ func TestMergeRun_AcceptanceStale_GuardPrecedesMergeSeam(t *testing.T) {
 }
 
 // mcqGateStore wires a fake ADR-092 queue answering ActiveForRun with st/found/err.
+// Its D1 dispatch ledger grants every claim, so an admitted inline merge
+// dispatches (ADR-093 slice 2).
 func (g *mcGateFixture) mcqGateStore(st mergequeue.Status, found bool, err error) {
-	g.s.cfg.MergeQueue = &mcqFaultStore{activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+	g.s.cfg.MergeQueue = mcqGateLedgerStore{&mcqFaultStore{activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
 		return st, found, err
-	}}
+	}}}
+}
+
+// mcqGateLedgerStore is an mcqFaultStore whose D1 claim always succeeds.
+type mcqGateLedgerStore struct{ *mcqFaultStore }
+
+func (mcqGateLedgerStore) ClaimMergeDispatch(_ context.Context, runID uuid.UUID, path, head string) (mergequeue.DispatchClaim, error) {
+	return mergequeue.DispatchClaim{RunID: runID, State: mergequeue.DispatchDispatched, Path: path, HeadSHA: head}, nil
+}
+
+func (mcqGateLedgerStore) MarkMergeDispatchFailed(context.Context, uuid.UUID, string) error {
+	return nil
 }
 
 // TestMergeRun_MergeCandidate_HeldRefusedBeforeBehind pins the ADR-092 held arm
@@ -3647,8 +3660,9 @@ func (a mqFailListAudit) ListForRunByCategory(ctx context.Context, runID uuid.UU
 	return a.Repository.ListForRunByCategory(ctx, runID, category)
 }
 
-// TestMergeRun_AlreadyQueuedAuditReadFailureIs503: a repeat merge of a run
-// whose entry already carries the intent, when its merge_queue_entered row
+// TestMergeRun_AlreadyQueuedAuditReadFailureIs503: a repeat merge of a LEGACY
+// entry (its intent recorded before 0108, so merge_intent_sequence is NULL and
+// the answer must read the merge_queue_entered row back), when that row
 // cannot be read back, answers a retryable 503 merge_queue_write_failed,
 // never a 202 naming intent_sequence 0, and writes nothing (the committed
 // row count is still 1). Counterfactual: swallowing the read error answers
@@ -3659,6 +3673,7 @@ func TestMergeRun_AlreadyQueuedAuditReadFailureIs503(t *testing.T) {
 		t.Fatalf("first merge = %d, want 202:\n%s", w.Code, w.Body.String())
 	}
 	f.srv.bgMergeQueuePump.Wait()
+	f.exec(`UPDATE merge_candidate_queue_entries SET merge_intent_sequence = NULL WHERE run_id = $1`, r.id)
 	f.srv.cfg.AuditRepo = mqFailListAudit{Repository: f.audit}
 	w := f.mergeRun(r)
 	f.srv.bgMergeQueuePump.Wait()
@@ -3764,4 +3779,191 @@ func TestMergeRun_LapsedIntentLockNeverAnswers202(t *testing.T) {
 			t.Fatalf("merge = %d %s, want exactly the decision's 503 merge_queue_unrecorded", w.Code, body)
 		}
 	})
+}
+
+// TestMergeRun_EnqueueRecordsIntentSequenceOnEntry: the merge_queue_entered
+// row's sequence is stamped on the entry (merge_intent_sequence) in the same
+// write that records the intent, and the 202 names it.
+func TestMergeRun_EnqueueRecordsIntentSequenceOnEntry(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	w := f.mergeRun(r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	var resp mergeRunResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	f.srv.bgMergeQueuePump.Wait()
+	rows := f.rows(r, CategoryMergeQueueEntered)
+	if len(rows) != 1 || resp.IntentSequence != rows[0].Sequence {
+		t.Fatalf("intent_sequence = %d, rows %d; want the merge_queue_entered row's sequence", resp.IntentSequence, len(rows))
+	}
+	if e := f.activeEntry(r); e.MergeIntentSequence != rows[0].Sequence {
+		t.Fatalf("entry merge_intent_sequence = %d, want %d", e.MergeIntentSequence, rows[0].Sequence)
+	}
+}
+
+// TestMergeRun_MarkIntentRecordsIntentSequence: a held entry without intent
+// (the rebase path) gets its intent AND the row's sequence on merge_run.
+func TestMergeRun_MarkIntentRecordsIntentSequence(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	other := f.seed("o", "o0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(other, "o0", "o1")
+	f.rebase(other)
+	f.rebase(r)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	rows := f.rows(r, CategoryMergeQueueEntered)
+	if len(rows) != 1 {
+		t.Fatalf("merge_queue_entered rows = %d, want 1", len(rows))
+	}
+	if e := f.activeEntry(r); e.MergeIntentSequence != rows[0].Sequence || e.MergeIntentAt == nil {
+		t.Fatalf("entry intent seq = %d at %v, want %d set", e.MergeIntentSequence, e.MergeIntentAt, rows[0].Sequence)
+	}
+}
+
+// TestMergeRun_AlreadyQueuedNamesStoredSequence: a repeat merge names the
+// entry's STORED intent sequence, not a newer orphan merge_queue_entered row
+// naming the same base. Counterfactual: naming the newest row, RED.
+func TestMergeRun_AlreadyQueuedNamesStoredSequence(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("first merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	stored := f.activeEntry(r).MergeIntentSequence
+	if stored == 0 {
+		t.Fatal("no stored intent sequence")
+	}
+	orphan := f.mqeAppend(r, CategoryMergeQueueEntered, map[string]any{"base_ref": mcqBase, "anchored_head_sha": "orphan"})
+	if orphan.Sequence <= stored {
+		t.Fatalf("orphan sequence %d not newer than stored %d", orphan.Sequence, stored)
+	}
+	w := f.mergeRun(r)
+	var resp mergeRunResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if w.Code != http.StatusAccepted || !resp.AlreadyQueued || resp.IntentSequence != stored {
+		t.Fatalf("repeat = %d %+v, want already_queued naming the stored sequence %d (not orphan %d)", w.Code, resp, stored, orphan.Sequence)
+	}
+}
+
+// TestMergeRun_202MessageNamesIntentPersistence: with a head-pinned seam the
+// 202 says the intent persists until the entry settles and not to re-invoke;
+// without one it keeps slice 1's re-invoke wording.
+func TestMergeRun_202MessageNamesIntentPersistence(t *testing.T) {
+	w := newMQMWorld(t)
+	r := w.seed("p", "m0", []byte(mqeSpecYAML))
+	w.behind(r, "m0", "m1")
+	w.gh.set(func() { w.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+	resp := w.mergeRun(r)
+	w.srv.bgMergeQueuePump.Wait()
+	if resp.Code != http.StatusAccepted || !strings.Contains(resp.Body.String(), "persists until the entry settles") ||
+		!strings.Contains(resp.Body.String(), "do not re-invoke") {
+		t.Fatalf("pinned 202 = %d %s, want the intent-persistence wording", resp.Code, resp.Body.String())
+	}
+	f, r2, _ := mqMergeFixture(t, true)
+	resp = f.mergeRun(r2)
+	f.srv.bgMergeQueuePump.Wait()
+	if resp.Code != http.StatusAccepted || !strings.Contains(resp.Body.String(), "re-invoke the merge once the pass is green") {
+		t.Fatalf("unpinned 202 = %d %s, want slice 1's re-invoke wording", resp.Code, resp.Body.String())
+	}
+}
+
+// TestMergeRun_OwnershipIgnoredWithoutPinnedSeam: an intent-bearing entry
+// does not own the merge when the bound GateMerger has no pinned merge (the
+// operational stop): the inline merge dispatches as today.
+func TestMergeRun_OwnershipIgnoredWithoutPinnedSeam(t *testing.T) {
+	w := newMQMWorld(t)
+	merger := &fakeMerger{}
+	w.srv.cfg.GateMerger = merger
+	r := w.verified("u", "h1")
+	w.intentEntry(r, "h1", mergequeue.PhasePassed)
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusOK || merger.called != 1 {
+		t.Fatalf("merge = %d %s, merger %d; want 200 dispatched once", resp.Code, resp.Body.String(), merger.called)
+	}
+}
+
+// TestMergeRun_OwnershipReadErrorIs503: a queue read error on the ownership
+// check is 503 merge_queue_unreadable with nothing recorded and no dispatch.
+// Counterfactual: treating the error as not-owned dispatches, RED.
+func TestMergeRun_OwnershipReadErrorIs503(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("e", "h1")
+	fs := &mcqFaultStore{Store: w.store, activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) {
+		return mergequeue.Status{}, false, errors.New("queue down")
+	}}
+	w.srv.cfg.MergeQueue = fs
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusServiceUnavailable || mqeCode(t, resp.Body.Bytes()) != "merge_queue_unreadable" {
+		t.Fatalf("merge = %d %s, want 503 merge_queue_unreadable", resp.Code, resp.Body.String())
+	}
+	if n := len(w.rows(r, CategoryMergeVerdictRecorded)); n != 0 || m.inlineCalls() != 0 {
+		t.Fatalf("verdict rows %d, inline %d; want nothing recorded or dispatched", n, m.inlineCalls())
+	}
+}
+
+// TestMergeRun_LockUnavailableIs503NothingRecorded: another holder keeps the
+// run's merge-intent lock past the bounded acquire wait (approval condition
+// (g)): 503 merge_lock_unavailable, nothing recorded, nothing dispatched.
+func TestMergeRun_LockUnavailableIs503NothingRecorded(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("k", "h1")
+	prev := mergeRunLockAcquireTimeout
+	mergeRunLockAcquireTimeout = timescale.D(300 * time.Millisecond)
+	t.Cleanup(func() { mergeRunLockAcquireTimeout = prev })
+	held, release := make(chan struct{}), make(chan struct{})
+	done := make(chan error, 1)
+	go func() {
+		done <- w.store.WithMergeIntentLock(context.Background(), r.id, func(context.Context) error {
+			close(held)
+			<-release
+			return nil
+		})
+	}()
+	<-held
+	resp := w.mergeRun(r)
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatalf("holder: %v", err)
+	}
+	if resp.Code != http.StatusServiceUnavailable || mqeCode(t, resp.Body.Bytes()) != "merge_lock_unavailable" {
+		t.Fatalf("merge = %d %s, want 503 merge_lock_unavailable", resp.Code, resp.Body.String())
+	}
+	if n := len(w.rows(r, CategoryMergeVerdictRecorded)); n != 0 || m.inlineCalls() != 0 {
+		t.Fatalf("verdict rows %d, inline %d; want nothing recorded or dispatched", n, m.inlineCalls())
+	}
+	if st, _ := w.claim(r); st != "" {
+		t.Fatalf("claim state = %q, want none", st)
+	}
+}
+
+// TestBoundMergeLockAcquire: the bound cancels only a wait that has not
+// started; once started, the bound never cancels.
+func TestBoundMergeLockAcquire(t *testing.T) {
+	ctx, started, stop := boundMergeLockAcquire(context.Background(), time.Hour)
+	if !started() || started() {
+		t.Fatal("started must win exactly once")
+	}
+	stop()
+	if ctx.Err() == nil {
+		t.Fatal("stop did not release the context")
+	}
+	ctx, started, stop = boundMergeLockAcquire(context.Background(), time.Millisecond)
+	defer stop()
+	<-ctx.Done()
+	if started() {
+		t.Fatal("started after the bound fired")
+	}
+}
+
+// activeEntry reads r's active entry through the store (every column).
+func (f *mcqFixture) activeEntry(r *mcqRun) mergequeue.Entry {
+	f.t.Helper()
+	st, found, err := f.store.ActiveForRun(context.Background(), r.id)
+	if err != nil || !found {
+		f.t.Fatalf("active entry: found=%v err=%v", found, err)
+	}
+	return st.Entry
 }
