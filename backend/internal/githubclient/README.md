@@ -71,6 +71,17 @@ The forge-surface DTO vocabulary this package used to define — `RepoRef`, `Rep
 
 The two substrings (`"clean status"` vs `"unstable status"`) are disjoint, so neither branch can capture the other's message — pinned by paired positive/negative `errors.Is` assertions across the clean, unstable, and unrelated messages in `client_test.go`. A future GitHub rewording of either message degrades to the plain `ErrValidation` (the status-quo generic path), never a wrong merge.
 
+## Head-pinned merge — `MergePullRequestAtHead` (ADR-093 D3, E87.5 / #4296)
+
+`MergePullRequestAtHead(ctx, scope, repo, prNumber, method, expectedHeadSHA)` is `MergePullRequest` with the head PINNED: the same `PUT /repos/{owner}/{repo}/pulls/{number}/merge`, whose body also carries `sha` ("SHA that pull request head must match to allow merge"). It is the merge queue's merge-on-pass leaf (`serve.go` `githubAutoMerger.MergePullRequestAtHead`, reached through `server.ForgeMerger`'s optional `HeadPinnedMerger`), so a head that moved after the queue verified it is refused by GitHub rather than merged.
+
+- **Synchronous only.** It never touches `EnableAutoMerge` / GraphQL: a queued auto-merge waits on checks while the base may move, which would land a tree the queue never verified against the current base.
+- **An empty (or whitespace) `expectedHeadSHA` is refused before any HTTP call**, so the pinned seam can never silently degrade into an unpinned merge.
+- **Status mapping is `MergePullRequest`'s**: 405 → `ErrPullRequestNotMergeable`; 409 (head modified / sha mismatch) → `ErrMergeConflict` — the sentinel merge-on-pass re-advances on; 401/403/404/422 via `classifyStatus`.
+- Both methods share one private body (`mergePullRequest`); `MergePullRequest` passes an empty sha and its request stays byte-shaped as before (no `sha` key).
+
+Pinned by `TestMergePullRequestAtHead_{SendsShaAndMethod,EmptyShaRefusedBeforeHTTP,StatusMapping}` and `TestMergePullRequest_OmitsSha` in `client_test.go`. GitHub pins only the HEAD, not the base: a base push in the instant between the queue's base re-probe and this call is a documented merge-on-pass residual (`backend/internal/server/README.md`).
+
 ## Repository issue enumeration (#2230)
 
 `ListRepoIssues` (`projects.go`) enumerates a repository's ISSUES via the GraphQL `repository.issues` connection — the primitive the work-management read capability (`workmgmt.WorkItemReader`, see `../workmgmt/README.md`) lists through.

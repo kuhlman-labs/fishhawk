@@ -4822,18 +4822,48 @@ func mergeReconcilerPollSources(gh *githubclient.Client) (mergereconciler.PRGett
 	return prGetter, forge.Get
 }
 
-func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
+// githubAutoMerger also implements the optional server.HeadPinnedMerger the
+// merge queue's merge-on-pass consumes (ADR-093 D3, E87.5 / #4296).
+var _ server.HeadPinnedMerger = githubAutoMerger{}
+
+// mergeTarget resolves the run's GitHub merge target — the installation scope,
+// repo and PR number — failing closed before any HTTP call when the run lacks
+// the installation id or a parseable PR url. Shared by MergePullRequest and
+// MergePullRequestAtHead.
+func (githubAutoMerger) mergeTarget(runRow *runpkg.Run) (forge.CredentialScope, forge.RepoRef, int, error) {
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		return fmt.Errorf("campaign auto-merge: run %s has no installation id", runRow.ID)
+		return forge.CredentialScope{}, forge.RepoRef{}, 0, fmt.Errorf("campaign auto-merge: run %s has no installation id", runRow.ID)
 	}
 	if runRow.PullRequestURL == nil || *runRow.PullRequestURL == "" {
-		return fmt.Errorf("campaign auto-merge: run %s has no pull request url", runRow.ID)
+		return forge.CredentialScope{}, forge.RepoRef{}, 0, fmt.Errorf("campaign auto-merge: run %s has no pull request url", runRow.ID)
 	}
 	repo, number, err := parseCampaignPRURL(*runRow.PullRequestURL)
 	if err != nil {
-		return fmt.Errorf("campaign auto-merge: %w", err)
+		return forge.CredentialScope{}, forge.RepoRef{}, 0, fmt.Errorf("campaign auto-merge: %w", err)
 	}
-	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
+	return forge.FromGitHubInstallationID(*runRow.InstallationID), repo, number, nil
+}
+
+// MergePullRequestAtHead is the head-pinned merge-on-pass leaf (ADR-093 D3,
+// E87.5 / #4296): a SYNCHRONOUS REST squash merge whose body carries sha, so
+// GitHub refuses (409 -> forge.ErrMergeConflict) a head that moved after the
+// queue verified it. It NEVER calls EnableAutoMerge and never takes the
+// clean-status ladder MergePullRequest uses: a queued auto-merge waits on
+// checks while the base may move, which would merge a tree the queue never
+// verified against the current base.
+func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
+	scope, repo, number, err := m.mergeTarget(runRow)
+	if err != nil {
+		return err
+	}
+	return m.gh.MergePullRequestAtHead(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
+}
+
+func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
+	scope, repo, number, err := m.mergeTarget(runRow)
+	if err != nil {
+		return err
+	}
 	// Primary: queue GitHub auto-merge so the PR lands once the repository's
 	// branch protection clears. What that protection actually requires is a
 	// repo property, not a Fishhawk one (E64.44 / #3161): Fishhawk PUBLISHES

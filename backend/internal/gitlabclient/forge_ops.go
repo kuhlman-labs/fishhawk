@@ -500,11 +500,15 @@ func (c *Client) ListMergeRequestsForCommit(ctx context.Context, projectID int, 
 // MergeMergeRequestParams controls a merge. Squash squashes the MR's
 // commits; MergeWhenPipelineSucceeds queues the merge to run once the
 // pipeline passes (the adapter's EnableAutoMerge). SquashCommitMessage is
-// optional.
+// optional. SHA, when non-empty, PINS the merge to that source-branch head
+// (ADR-093 D3, E87.5 / #4296): GitLab answers 409 when it differs from the
+// source branch HEAD, so a head that moved after verification is refused
+// rather than merged. Empty SHA is omitted from the request (unpinned).
 type MergeMergeRequestParams struct {
 	Squash                    bool
 	MergeWhenPipelineSucceeds bool
 	SquashCommitMessage       string
+	SHA                       string
 }
 
 // MergeMergeRequest merges a merge request.
@@ -530,6 +534,9 @@ func (c *Client) MergeMergeRequest(ctx context.Context, projectID, iid int, p Me
 	}
 	if p.SquashCommitMessage != "" {
 		body["squash_commit_message"] = p.SquashCommitMessage
+	}
+	if p.SHA != "" {
+		body["sha"] = p.SHA
 	}
 
 	var reqBody any

@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -334,4 +335,166 @@ func TestForgeMerger_GitLab_RealAdapter_EndToEnd(t *testing.T) {
 	if body["squash"] != true {
 		t.Errorf("body squash = %v, want true", body["squash"])
 	}
+}
+
+// pinnedLeaf is a github-family leaf implementing BOTH GitHubMerger and
+// HeadPinnedMerger, recording the pinned head and the call's deadline.
+type pinnedLeaf struct {
+	recordingMerger
+	heads    []string
+	deadline time.Duration
+	err      error
+}
+
+func (p *pinnedLeaf) MergePullRequestAtHead(ctx context.Context, _ *run.Run, headSHA string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.heads = append(p.heads, headSHA)
+	if dl, ok := ctx.Deadline(); ok {
+		p.deadline = time.Until(dl)
+	}
+	return p.err
+}
+
+// pinnedMergeForge is a fakeMergeForge that ALSO implements
+// forge.HeadPinnedMerger.
+type pinnedMergeForge struct {
+	fakeMergeForge
+	pinnedCalls int
+	pinnedHead  string
+	pinnedErr   error
+}
+
+func (f *pinnedMergeForge) MergePullRequestAtHead(_ context.Context, scope forge.CredentialScope,
+	repo forge.RepoRef, number int, method forge.MergeMethod, head string) error {
+	f.pinnedCalls++
+	f.scope, f.repo, f.number, f.method, f.pinnedHead = scope, repo, number, method, head
+	return f.pinnedErr
+}
+
+// TestForgeMerger_MergePullRequestAtHead_Routes pins the head-pinned arm's
+// family routing (ADR-093 D3, E87.5 / #4296): github family -> the pinned leaf
+// (never the resolver, never the unpinned MergePullRequest); a non-pinned leaf
+// or forge -> ErrHeadPinnedMergeUnsupported with ZERO merge calls of any kind;
+// gitlab family -> the resolved forge's pinned merge with squash; an empty
+// head refuses before any call; every forge call carries a bounded deadline.
+func TestForgeMerger_MergePullRequestAtHead_Routes(t *testing.T) {
+	id42 := int64(42)
+	ghRun := &run.Run{ID: uuid.New(), InstallationID: &id42}
+	fatalResolver := func(string) (forge.Forge, error) { t.Fatal("resolver consulted for github family"); return nil, nil }
+
+	t.Run("github pinned leaf", func(t *testing.T) {
+		leaf := &pinnedLeaf{}
+		m := ForgeMerger{GitHub: leaf, Resolver: fatalResolver}
+		if err := m.MergePullRequestAtHead(context.Background(), ghRun, "head1"); err != nil {
+			t.Fatalf("MergePullRequestAtHead: %v", err)
+		}
+		if len(leaf.heads) != 1 || leaf.heads[0] != "head1" {
+			t.Fatalf("pinned heads = %v, want [head1]", leaf.heads)
+		}
+		if leaf.callCount() != 0 {
+			t.Errorf("unpinned MergePullRequest calls = %d, want 0", leaf.callCount())
+		}
+		if leaf.deadline <= 0 || leaf.deadline > headPinnedMergeCallTimeout {
+			t.Errorf("leaf ctx deadline remaining = %v, want in (0, %v]", leaf.deadline, headPinnedMergeCallTimeout)
+		}
+	})
+
+	t.Run("github pinned leaf error surfaces", func(t *testing.T) {
+		leaf := &pinnedLeaf{err: forge.ErrMergeConflict}
+		m := ForgeMerger{GitHub: leaf}
+		if err := m.MergePullRequestAtHead(context.Background(), ghRun, "head1"); !errors.Is(err, forge.ErrMergeConflict) {
+			t.Fatalf("err = %v, want ErrMergeConflict", err)
+		}
+	})
+
+	t.Run("github leaf not pinned", func(t *testing.T) {
+		leaf := &recordingMerger{}
+		m := ForgeMerger{GitHub: leaf, Resolver: fatalResolver}
+		err := m.MergePullRequestAtHead(context.Background(), ghRun, "head1")
+		if !errors.Is(err, ErrHeadPinnedMergeUnsupported) {
+			t.Fatalf("err = %v, want ErrHeadPinnedMergeUnsupported", err)
+		}
+		if leaf.callCount() != 0 {
+			t.Errorf("unpinned fallback taken: MergePullRequest calls = %d, want 0", leaf.callCount())
+		}
+	})
+
+	t.Run("github nil leaf", func(t *testing.T) {
+		m := ForgeMerger{Resolver: fatalResolver}
+		if err := m.MergePullRequestAtHead(context.Background(), ghRun, "head1"); err == nil {
+			t.Fatal("err = nil, want no-github-client refusal")
+		}
+	})
+
+	t.Run("empty head refused before any call", func(t *testing.T) {
+		leaf := &pinnedLeaf{}
+		m := ForgeMerger{GitHub: leaf, Resolver: fatalResolver}
+		for _, h := range []string{"", "  "} {
+			if err := m.MergePullRequestAtHead(context.Background(), ghRun, h); err == nil {
+				t.Errorf("head %q: err = nil, want refusal", h)
+			}
+		}
+		if len(leaf.heads) != 0 {
+			t.Errorf("pinned calls = %d, want 0", len(leaf.heads))
+		}
+	})
+
+	t.Run("gitlab pinned forge", func(t *testing.T) {
+		f := &pinnedMergeForge{fakeMergeForge: fakeMergeForge{name: "gitlab"}}
+		m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return f, nil }}
+		if err := m.MergePullRequestAtHead(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "head2"); err != nil {
+			t.Fatalf("MergePullRequestAtHead: %v", err)
+		}
+		if f.pinnedCalls != 1 || f.pinnedHead != "head2" || f.number != 7 || f.method != forge.MergeMethodSquash {
+			t.Fatalf("pinned call = (%d, %q, #%d, %q), want (1, head2, #7, squash)", f.pinnedCalls, f.pinnedHead, f.number, f.method)
+		}
+		if f.scope.Ref() != "gitlab:5" {
+			t.Errorf("scope = %q, want gitlab:5", f.scope.Ref())
+		}
+		if f.enableCalls != 0 || f.mergeCalls != 0 {
+			t.Errorf("unpinned calls enable=%d merge=%d, want 0/0", f.enableCalls, f.mergeCalls)
+		}
+	})
+
+	t.Run("gitlab forge not pinned", func(t *testing.T) {
+		f := &fakeMergeForge{name: "gitlab"}
+		m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return f, nil }}
+		err := m.MergePullRequestAtHead(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "head2")
+		if !errors.Is(err, ErrHeadPinnedMergeUnsupported) {
+			t.Fatalf("err = %v, want ErrHeadPinnedMergeUnsupported", err)
+		}
+		if f.enableCalls != 0 || f.mergeCalls != 0 {
+			t.Errorf("unpinned fallback taken: enable=%d merge=%d, want 0/0", f.enableCalls, f.mergeCalls)
+		}
+	})
+
+	t.Run("gitlab malformed url refuses before resolver", func(t *testing.T) {
+		m := ForgeMerger{Resolver: func(string) (forge.Forge, error) {
+			t.Fatal("resolver consulted before target resolution")
+			return nil, nil
+		}}
+		if err := m.MergePullRequestAtHead(context.Background(), gitlabMergeRun("https://gitlab.example.com/acme/widgets"), "head2"); err == nil {
+			t.Fatal("err = nil, want malformed-url refusal")
+		}
+	})
+
+	t.Run("gitlab real adapter sends sha", func(t *testing.T) {
+		var body string
+		gl := realGitLabMergeForge(t, &body)
+		m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return gl, nil }}
+		if err := m.MergePullRequestAtHead(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "head3"); err != nil {
+			t.Fatalf("MergePullRequestAtHead: %v", err)
+		}
+		var got map[string]any
+		if err := json.Unmarshal([]byte(body), &got); err != nil {
+			t.Fatalf("decode %q: %v", body, err)
+		}
+		if got["sha"] != "head3" {
+			t.Errorf("sha = %v, want head3", got["sha"])
+		}
+		if _, ok := got["merge_when_pipeline_succeeds"]; ok {
+			t.Errorf("pinned merge queued auto-merge: %s", body)
+		}
+	})
 }
