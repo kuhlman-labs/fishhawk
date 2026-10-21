@@ -120,6 +120,18 @@ func (p *PushEvent) IsDefaultBranchPush() bool {
 	return p.Ref == "refs/heads/"+p.DefaultBranch
 }
 
+// HasRevertSignals reports whether any commit of the push carries a revert
+// signal ObservePush would resolve, by the same collectSignals rules (trailer,
+// subject fallback, revert-of-revert skip, empty commit id skipped). It makes
+// no forge call, so the push route runs it BEFORE taking an observation slot
+// (#3990). A nil push is false.
+func (p *PushEvent) HasRevertSignals() bool {
+	if p == nil {
+		return false
+	}
+	return len(collectSignals(p.Commits)) > 0
+}
+
 // repoRef splits FullName into an owner/name pair.
 func (p *PushEvent) repoRef() (forge.RepoRef, bool) {
 	owner, name, ok := strings.Cut(p.FullName, "/")

@@ -30,17 +30,19 @@ const (
 	DefaultCIWindow = 6 * time.Hour
 	// DefaultCILookback bounds the scan by MERGE-EVIDENCE time (operator
 	// condition 4): a run whose earliest merge-evidence row is older is not
-	// evaluated. Never narrower than window + DefaultCITerminalAfter + a day,
-	// so a run reaches its terminal row before it leaves the scan unless its
-	// forge merged_at trails the evidence by more than that slack (README
-	// residual: the deadline keys on the forge maturity, the lookback does not).
+	// evaluated. Never narrower than window + DefaultCITerminalAfter + the
+	// terminal row's minimum failing span + a day, so a run reaches its
+	// terminal row before it leaves the scan unless its forge merged_at trails
+	// the evidence by more than that slack (README residual: the deadline keys
+	// on the forge maturity, the lookback does not).
 	DefaultCILookback = 14 * 24 * time.Hour
 	// DefaultCIMaxPerTick caps forge evaluations per tick, so a backfill
 	// drains over several ticks.
 	DefaultCIMaxPerTick = 20
 	// DefaultCITerminalAfter is how long after maturity a still-unobservable
 	// run keeps being retried before it records a terminal `missing` with
-	// missing_reason observation_failed (operator condition 5).
+	// missing_reason observation_failed (operator condition 5) — and then only
+	// on repeated failures (ciTerminalMinFailures / ciTerminalMinFailingSpan).
 	DefaultCITerminalAfter = 7 * 24 * time.Hour
 	// defaultCIMaxBackoff caps the per-run exponential backoff.
 	defaultCIMaxBackoff = 12 * time.Hour
@@ -48,6 +50,16 @@ const (
 
 // lookbackSlack is the margin the lookback keeps past window + terminal.
 const lookbackSlack = 24 * time.Hour
+
+// The terminal observation_failed row needs REPEATED failures, not one past
+// the deadline (#3990): at least ciTerminalMinFailures recorded failures whose
+// span — first failure to now — is at least ciTerminalMinFailingSpan. A first
+// attempt past the deadline (a backfill, or recovery after a long outage)
+// backs off instead of terminating.
+const (
+	ciTerminalMinFailures    = 2
+	ciTerminalMinFailingSpan = 24 * time.Hour
+)
 
 // sourceCheckRunsPoll is the payload's source tag for run_merge_ci_observed.
 const sourceCheckRunsPoll = "github_check_runs_poll"
@@ -58,6 +70,8 @@ var mergeEvidenceCategories = []string{"pr_merged", "post_merge_observed", "merg
 
 // Observation error classes recorded as observation_error_class on a
 // terminal row. Forge errors classify by their typed sentinel.
+// errClassAuditAppend is logged only: a run whose classified verdict failed to
+// append holds it as a pending verdict and never goes terminal (#3990).
 const (
 	errClassNotFound     = "not_found"
 	errClassForbidden    = "forbidden"
@@ -130,12 +144,29 @@ type CITicker struct {
 
 // ciBackoff is one run's in-memory retry state.
 type ciBackoff struct {
-	failures    int
-	nextAttempt time.Time
+	failures int
+	// firstFailure is the time of the failure that took failures from 0 to
+	// 1; later failures never move it. It anchors the terminal row's minimum
+	// failing span.
+	firstFailure time.Time
+	nextAttempt  time.Time
 	// pull is the last forge PR this process saw carrying the merge facts;
 	// a later pre-PR failure keeps anchoring the terminal deadline on its
 	// merged_at instead of falling back to the evidence time.
 	pull *forge.PullRequest
+	// pending is a classified verdict whose audit append failed; it is
+	// re-appended as-is, with zero forge calls, and never overwritten by a
+	// terminal missing (#3990).
+	pending *pendingCIVerdict
+}
+
+// pendingCIVerdict is one observed-but-unrecorded verdict: what record needs
+// to re-append the SAME row, including the ORIGINAL observation time.
+type pendingCIVerdict struct {
+	verdict    CIVerdict
+	pull       *forge.PullRequest
+	matures    time.Time
+	observedAt time.Time
 }
 
 // CITickerConfig is the flag-to-ticker input NewCITicker validates.
@@ -216,7 +247,7 @@ func (t *CITicker) lookback() time.Duration {
 	if lb <= 0 {
 		lb = DefaultCILookback
 	}
-	if floor := t.window() + t.terminalAfter() + lookbackSlack; lb < floor {
+	if floor := t.window() + t.terminalAfter() + ciTerminalMinFailingSpan + lookbackSlack; lb < floor {
 		lb = floor
 	}
 	return lb
@@ -260,7 +291,7 @@ type CITickSummary struct {
 	Evaluated  int // forge evaluations (≤ MaxPerTick)
 	Recorded   int // run_merge_ci_observed rows that landed (terminal included)
 	Deferred   int // candidates skipped while in backoff
-	Failed     int // evaluations that failed
+	Failed     int // evaluations (or pending-verdict re-appends) that failed
 	Terminal   int // observation_failed rows that landed
 }
 
@@ -273,6 +304,8 @@ type ciCandidate struct {
 
 // Tick runs one scan: mature, unobserved runs oldest-maturity-first, at most
 // MaxPerTick forge evaluations, runs in backoff skipped without spending one.
+// A run holding a pending verdict re-appends it without a forge call, so it
+// neither spends the cap nor is starved by it.
 func (t *CITicker) Tick(ctx context.Context) CITickSummary {
 	var sum CITickSummary
 	log := t.logger()
@@ -282,6 +315,9 @@ func (t *CITicker) Tick(ctx context.Context) CITickSummary {
 		log.LogAttrs(ctx, slog.LevelWarn, "merge outcome: CI tick could not list observed runs; tick skipped", slog.String("error", err.Error()))
 		return sum
 	}
+	// A run already observed (by this process's earlier append, or another
+	// replica's) needs no in-memory state: drop it, pending verdict included.
+	t.forgetRuns(func(id uuid.UUID) bool { return observed[id] })
 	evidence := map[uuid.UUID]time.Time{}
 	for _, cat := range mergeEvidenceCategories {
 		entries, err := t.Audit.ListAll(ctx, audit.ListAllParams{Category: &cat})
@@ -301,6 +337,12 @@ func (t *CITicker) Tick(ctx context.Context) CITickSummary {
 	}
 
 	floor := now.Add(-t.lookback())
+	// A run whose merge evidence left the lookback is never evaluated again:
+	// evict its state rather than hold it for the process lifetime.
+	t.forgetRuns(func(id uuid.UUID) bool {
+		at, ok := evidence[id]
+		return !ok || at.Before(floor)
+	})
 	var cands []ciCandidate
 	for id, at := range evidence {
 		if observed[id] || at.Before(floor) || t.isSkipped(id) {
@@ -328,8 +370,10 @@ func (t *CITicker) Tick(ctx context.Context) CITickSummary {
 			sum.Deferred++
 			continue
 		}
-		if sum.Evaluated >= t.maxPerTick() {
-			break
+		// The cap bounds FORGE evaluations only: a pending verdict's
+		// re-append makes zero forge calls, so it still drains past the cap.
+		if sum.Evaluated >= t.maxPerTick() && t.pendingVerdict(c.runID) == nil {
+			continue
 		}
 		r, err := t.Runs.GetRun(ctx, c.runID)
 		if errors.Is(err, run.ErrNotFound) {
@@ -344,6 +388,9 @@ func (t *CITicker) Tick(ctx context.Context) CITickSummary {
 		tgt, reason := ciTargetFor(r)
 		if reason != "" {
 			t.skip(ctx, c.runID, reason)
+			continue
+		}
+		if t.retryPendingVerdict(ctx, r, tgt, c, now, &sum) {
 			continue
 		}
 		sum.Evaluated++
@@ -420,7 +467,10 @@ func parseGitHubPRURL(raw string) (forge.RepoRef, int, bool) {
 	return forge.RepoRef{Owner: parts[0], Name: parts[1]}, n, true
 }
 
-// evaluate observes one candidate and records its row, or enters backoff.
+// evaluate observes one candidate and records its row, or enters backoff. A
+// classified verdict whose append fails is held as the run's pending verdict
+// before the failure is counted, so retryPendingVerdict re-appends that SAME
+// verdict and fail never replaces it with a terminal missing (#3990).
 func (t *CITicker) evaluate(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandidate, now time.Time, sum *CITickSummary) {
 	pull, err := withRetry(ctx, t.RetryBackoff, func(ctx context.Context) (*forge.PullRequest, error) {
 		return t.Forge.GetPullRequest(ctx, tgt.scope, tgt.repo, tgt.number)
@@ -453,8 +503,9 @@ func (t *CITicker) evaluate(ctx context.Context, r *run.Run, tgt ciTarget, c ciC
 		return
 	}
 	v := ClassifyMergeCI(r.RequiredChecksSnapshot, checks, truncated, matures)
-	landed, err := t.record(ctx, r, tgt, c, pull, matures, now, v, "")
+	landed, err := t.record(ctx, r, tgt, c, pull, matures, now, now, v, "")
 	if err != nil {
+		t.holdVerdict(c.runID, &pendingCIVerdict{verdict: v, pull: pull, matures: matures, observedAt: now})
 		t.fail(ctx, r, tgt, c, pull, now, errClassAuditAppend, err, sum)
 		return
 	}
@@ -462,6 +513,30 @@ func (t *CITicker) evaluate(ctx context.Context, r *run.Run, tgt ciTarget, c ciC
 	if landed {
 		sum.Recorded++
 	}
+}
+
+// retryPendingVerdict re-appends the run's pending verdict, if it holds one,
+// and reports whether it did (false: no verdict is pending, evaluate the run).
+// It makes ZERO forge calls: the row carries the original observation time as
+// observed_at and now as the chain-row timestamp. A dedup hit means the
+// earlier append had in fact committed, and clears the run like a landed row.
+// A failed re-append backs off again through fail, whose pending-verdict guard
+// keeps it out of the terminal branch.
+func (t *CITicker) retryPendingVerdict(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandidate, now time.Time, sum *CITickSummary) bool {
+	p := t.pendingVerdict(c.runID)
+	if p == nil {
+		return false
+	}
+	landed, err := t.record(ctx, r, tgt, c, p.pull, p.matures, p.observedAt, now, p.verdict, "")
+	if err != nil {
+		t.fail(ctx, r, tgt, c, p.pull, now, errClassAuditAppend, err, sum)
+		return true
+	}
+	t.clear(c.runID)
+	if landed {
+		sum.Recorded++
+	}
+	return true
 }
 
 // withRetry2 is withRetry for a two-result call.
@@ -478,7 +553,10 @@ func withRetry2[A, B any](ctx context.Context, base time.Duration, fn func(conte
 }
 
 // fail enters (or extends) the run's exponential backoff and, once the run is
-// TerminalAfter past maturity, records the terminal observation_failed row.
+// TerminalAfter past maturity AND has failed at least ciTerminalMinFailures
+// times over at least ciTerminalMinFailingSpan, records the terminal
+// observation_failed row. A run holding a pending verdict never goes terminal:
+// its observed verdict is re-appended instead (#3990).
 // Maturity is the FORGE merged_at + Window whenever the forge has returned it
 // (pull non-nil, from this evaluation or an earlier one in this process); the
 // evidence-derived c.maturesAt anchors the deadline only when it never has.
@@ -494,11 +572,21 @@ func (t *CITicker) fail(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandi
 		slog.String("run_id", r.ID.String()), slog.String("pull_request_url", tgt.prURL),
 		slog.String("error_class", class), slog.String("error", cause.Error()),
 		slog.Int("failures", st.failures), slog.Time("next_attempt", st.nextAttempt))
+	if t.pendingVerdict(c.runID) != nil {
+		// An observed verdict is never overwritten by a terminal missing
+		// (#3990): retryPendingVerdict re-appends it once the backoff lapses.
+		return
+	}
 	matures := c.maturesAt
 	if pull != nil && pull.MergedAt != nil {
 		matures = pull.MergedAt.Add(t.window())
 	}
 	if now.Before(matures.Add(t.terminalAfter())) {
+		return
+	}
+	if st.failures < ciTerminalMinFailures || now.Sub(st.firstFailure) < ciTerminalMinFailingSpan {
+		// One failure past the deadline is not yet "unobservable": back off
+		// and terminate only on repeated failures over a real span (#3990).
 		return
 	}
 	v := CIVerdict{
@@ -512,7 +600,7 @@ func (t *CITicker) fail(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandi
 		MissingChecks:        []string{},
 		MissingCheckReasons:  map[string]string{},
 	}
-	landed, err := t.record(ctx, r, tgt, c, pull, matures, now, v, class)
+	landed, err := t.record(ctx, r, tgt, c, pull, matures, now, now, v, class)
 	if err != nil {
 		log.LogAttrs(ctx, slog.LevelWarn, "merge outcome: terminal CI observation could not be recorded",
 			slog.String("run_id", r.ID.String()), slog.String("error", err.Error()))
@@ -583,15 +671,17 @@ type ciPayload struct {
 }
 
 // record appends the run_merge_ci_observed row, deduped on merge_commit_sha.
+// observedAt is the payload's observed_at (when the forge was read); appendAt
+// is the chain-row timestamp. They differ only on a pending-verdict re-append.
 func (t *CITicker) record(ctx context.Context, r *run.Run, tgt ciTarget, c ciCandidate, pull *forge.PullRequest,
-	matures, now time.Time, v CIVerdict, errClass string) (bool, error) {
+	matures, observedAt, appendAt time.Time, v CIVerdict, errClass string) (bool, error) {
 	p := ciPayload{
 		Repo:                  r.Repo,
 		PullRequestURL:        tgt.prURL,
 		PullRequestNumber:     tgt.number,
 		MergeEvidenceAt:       c.evidenceAt.UTC(),
 		MaturesAt:             matures.UTC(),
-		ObservedAt:            now.UTC(),
+		ObservedAt:            observedAt.UTC(),
 		WindowSeconds:         int64(t.window() / time.Second),
 		Conclusion:            v.Conclusion,
 		MissingReason:         v.MissingReason,
@@ -619,7 +709,7 @@ func (t *CITicker) record(ctx context.Context, r *run.Run, tgt ciTarget, c ciCan
 		return false, fmt.Errorf("mergeoutcome: marshal ci payload: %w", err)
 	}
 	return appendDeduped(ctx, t.Audit,
-		systemChainParams(r.ID, CategoryRunMergeCIObserved, now, payload),
+		systemChainParams(r.ID, CategoryRunMergeCIObserved, appendAt, payload),
 		audit.DedupeSpec{PayloadKey: "merge_commit_sha", PayloadValue: p.MergeCommitSHA})
 }
 
@@ -644,6 +734,9 @@ func (t *CITicker) noteFailure(id uuid.UUID, now time.Time) ciBackoff {
 		t.backoff[id] = st
 	}
 	st.failures++
+	if st.failures == 1 {
+		st.firstFailure = now
+	}
 	delay := t.interval()
 	for i := 1; i < st.failures && delay < t.maxBackoff(); i++ {
 		delay *= 2
@@ -695,10 +788,48 @@ func (t *CITicker) holdUntil(id uuid.UUID, notBefore time.Time) {
 	st.nextAttempt = notBefore
 }
 
+// holdVerdict records p as the run's pending verdict.
+func (t *CITicker) holdVerdict(id uuid.UUID, p *pendingCIVerdict) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if t.backoff == nil {
+		t.backoff = map[uuid.UUID]*ciBackoff{}
+	}
+	st := t.backoff[id]
+	if st == nil {
+		st = &ciBackoff{}
+		t.backoff[id] = st
+	}
+	st.pending = p
+}
+
+// pendingVerdict returns the run's pending verdict, or nil.
+func (t *CITicker) pendingVerdict(id uuid.UUID) *pendingCIVerdict {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	if st := t.backoff[id]; st != nil {
+		return st.pending
+	}
+	return nil
+}
+
+// clear drops the run's whole entry: backoff, remembered PR and pending
+// verdict.
 func (t *CITicker) clear(id uuid.UUID) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	delete(t.backoff, id)
+}
+
+// forgetRuns drops the whole entry of every run drop reports true for.
+func (t *CITicker) forgetRuns(drop func(uuid.UUID) bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	for id := range t.backoff {
+		if drop(id) {
+			delete(t.backoff, id)
+		}
+	}
 }
 
 func (t *CITicker) isSkipped(id uuid.UUID) bool {
