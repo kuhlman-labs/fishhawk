@@ -143,10 +143,11 @@ This table covers the attach, retire and seat-use paths. Other seat refusals (`f
 
 **Who may clear a `control_unpinned` concern.** Only a human: an agent token or a delegated request is refused with 403 `concern_requires_human`. While the concern is open, delegated settlement cannot fire (the `may_approve` and `may_merge` conditions require zero open concerns), and the gate view lists it under `open[]`. The human `fishhawk_merge_run` verb does not consult open concerns, so only delegated settlement is held; read `open[]` before merging by hand.
 
-**A missing `counterfactual_observed` row has two different causes.**
+**A missing `counterfactual_observed` row has three different causes.**
 
 1. **Non-execution** (the runner never produced an observation). The runner executes counterfactuals only on a successful implement pass (or fix-up) that was delivered declarations. It does not execute on: a plan with no declarations; a decomposed plan's parent; a pass whose committed-tree verify failed; a merge-candidate verify-only pass (ADR-090 D3), which never reaches the counterfactual phase; and a redacted upload, which records nothing. Check the plan's `counterfactuals` array and the stage's gate evidence first.
 2. **Admission rejection** (the runner executed it, the backend refused the observation). Only an executed observation can be rejected at admission, and only for: an `index` that is not a position in the approved plan's `counterfactuals` (undeclared), an `observed`, `baseline` or `reason` value outside the closed vocabulary (`testdata/wire/counterfactual_outcomes.json`), or more than 8 in one bundle. Each rejection is a named WARN in the fishhawkd log and gets no row. A re-POST of the same bundle appends nothing and raises nothing (dedup on stage, content hash and index).
+3. **Approved-plan read failure** (a deliberate fail-closed). When the backend cannot read the run's approved plan while ingesting the bundle, index membership is undecidable, so it records no `counterfactual_observed` row for that upload and raises no `control_unpinned` concern, even for a GREEN. The fishhawkd log carries the WARN `counterfactuals: approved-plan read failed; recording no counterfactual_observed (index membership undecidable)`. The runner ships the bundle once, so recover with a stage retry or a fix-up pass, which re-executes the counterfactuals.
 
 ## 5. Fan-in verdicts
 
