@@ -1086,8 +1086,9 @@ Notes:
   `{declared_count, undelivered_count, obligations:[{id, source, status,
   text_excerpt}]}`, where `status` is `unreported` (the agent said nothing, or
   its report failed the runner's fail-closed validation), `declined` (it
-  answered and honestly declined), or `unsatisfiable` (#2782 — the obligation
-  named the PR body, a surface the pass cannot write, so it is recorded even when
+  answered and honestly declined), or `unsatisfiable` (#2782 — the obligation's
+  router declared the `pr_body` target (`instruction_targets`, E83.37 / #4022;
+  never inferred from prose), a surface the pass cannot write, so it is recorded even when
   the agent reported `met`, and the reviewer prompt reframes it as a
   routing-surface limitation rather than an agent omission). Advisory +
   best-effort — a nil `AuditRepo`, a
@@ -1118,8 +1119,10 @@ Notes:
   `fixupStageAs` on EVERY routing path (the HTTP verb, the in-process campaign
   auto-driver, and acceptance triage) — is likewise an **internal, advisory audit
   kind, not an issue-comment surface**. Nothing in `issuecomment` posts it. It
-  records, at ROUTING time (before the review), that a routed instruction named
-  the PULL-REQUEST BODY — a surface a fix-up pass has no mechanism to write, since
+  records, at ROUTING time (before the review), that a routed instruction was
+  declared with the `pr_body` target (`instruction_targets` on the fix-up,
+  E83.37 / #4022 — the declaration, never the instruction's prose) — the
+  PULL-REQUEST BODY, a surface a fix-up pass has no mechanism to write, since
   the PR body is composed once at PR-open by the first implement attempt and a
   fix-up pass only pushes commits — so the operator learns the instruction is
   structurally unsatisfiable without waiting for the review. Payload `{stage_id,

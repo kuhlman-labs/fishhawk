@@ -68,8 +68,8 @@ const (
 	// obligation — no report, or one that failed the runner's fail-closed
 	// validation and was dropped.
 	StatusUnreported = "unreported"
-	// StatusUnsatisfiable means the obligation named the pull-request body —
-	// a surface a fix-up pass has NO mechanism to write (the slim fix-up
+	// StatusUnsatisfiable means the obligation's router targeted the
+	// pull-request body — a surface a fix-up pass has NO mechanism to write (the slim fix-up
 	// prompt renders no PR-description block, and the pass pushes commits
 	// only). Such an obligation is returned as a Finding REGARDLESS of the
 	// agent's self-report — even a `met` claim — because that claim cannot be
@@ -94,11 +94,51 @@ const MaxExcerptBytes = 400
 // text was cut rather than authored short.
 const truncationMarker = "… (truncated)"
 
-// Source is one routed instruction, tagged with the channel it arrived on and
-// with its TRUST provenance.
+// Target is the ROUTER-DECLARED surface a routed instruction asks the fix-up
+// pass to change (E83.37 / #4022). It is set by whoever routes the
+// instruction — the operator on POST /v0/stages/{id}/fixup's
+// instruction_targets, or fishhawk_fixup_stage — never inferred from the
+// instruction's prose. The zero value means TargetCode: an instruction the
+// router did not target is an ordinary code instruction.
+type Target string
+
+const (
+	// TargetCode is a change to files in the run's scope: the default, and the
+	// meaning of an absent target.
+	TargetCode Target = "code"
+	// TargetPRBody is a change to the pull-request title/body — a surface a
+	// fix-up pass has NO mechanism to write (#2782), so an obligation carrying
+	// it is unsatisfiable by construction.
+	TargetPRBody Target = "pr_body"
+	// TargetDocs is a change to documentation files. A fix-up pass CAN write
+	// them, so it is satisfiable exactly like TargetCode; it is recorded so the
+	// router's intent survives on the audit trail.
+	TargetDocs Target = "docs"
+)
+
+// ParseTarget accepts exactly one of the three target literals. Anything else
+// — including the empty string — is refused (ok false): a router that sends a
+// target must send a valid one. The ABSENCE of a target (no key at all) is the
+// caller's to map to TargetCode, not this function's.
+func ParseTarget(s string) (Target, bool) {
+	switch t := Target(s); t {
+	case TargetCode, TargetPRBody, TargetDocs:
+		return t, true
+	}
+	return "", false
+}
+
+// Source is one routed instruction, tagged with the channel it arrived on,
+// with its TRUST provenance, and with its router-declared Target.
 type Source struct {
 	Kind SourceKind
 	Text string
+	// Target is the router-declared surface (E83.37 / #4022). The zero value is
+	// TargetCode. It alone decides Obligation.PRBody: the instruction's prose
+	// is never consulted for that, so an instruction that merely MENTIONS the
+	// PR body is not unsatisfiable, and one that names no surface at all is
+	// unsatisfiable when its router targeted pr_body.
+	Target Target
 	// Untrusted marks text that is NOT operator-authored: today, a routed
 	// concern synthesized from the acceptance agent's attacker-influenceable
 	// free-text verdict (ADR-050 / E31.8 / #1613). Detect carries the flag onto
@@ -126,13 +166,17 @@ type Obligation struct {
 	// would launder untrusted text into trusted prompt content, which is the
 	// bypass this field exists to close.
 	Untrusted bool
-	// PRBody marks an obligation whose instruction names the pull-request body
-	// — a surface a fix-up pass has NO mechanism to write (#2782). Derived at
-	// the single Detect site from NamesPRBodySurface(text), so the flag rides
+	// Target is the originating Source's router-declared target, normalized
+	// (the zero value becomes TargetCode).
+	Target Target
+	// PRBody marks an obligation whose ROUTER targeted the pull-request body —
+	// a surface a fix-up pass has NO mechanism to write (#2782). Derived at the
+	// single Detect site from Target == TargetPRBody (E83.37 / #4022: the
+	// router's declaration, never the instruction's prose), so the flag rides
 	// every consumer (the routing-time warning, the advisory audit entry, the
-	// fix-up prompt, and the review-time join) without any of them re-running
-	// the classifier. Undelivered treats a PRBody obligation as unsatisfiable
-	// regardless of the agent's report.
+	// fix-up prompt, and the review-time join) without any of them re-deriving
+	// it. Undelivered treats a PRBody obligation as unsatisfiable regardless of
+	// the agent's report.
 	PRBody bool
 }
 
@@ -165,7 +209,7 @@ type Finding struct {
 	Obligation
 	// Status is StatusUnreported (nothing valid came back for this id),
 	// StatusDeclined (the agent reported it and honestly declined), or
-	// StatusUnsatisfiable (the obligation named the PR body, which the pass
+	// StatusUnsatisfiable (the obligation targeted the PR body, which the pass
 	// cannot write — returned regardless of the agent's report).
 	Status string
 }
@@ -184,32 +228,19 @@ var recordingVerbs = []string{
 	"list out",
 }
 
-// The report-surface nouns are the second half of the conjunctive classifier:
-// a recording verb alone is ordinary ("record the retry count in a metric"),
-// so the text must ALSO name a report surface. This narrowness is the
-// anti-noise property — a signal that fires on every pass is one operators
-// learn to ignore, which is the failure mode this package must not create.
+// reportSurfaceNouns are the second half of the conjunctive classifier: a
+// recording verb alone is ordinary ("record the retry count in a metric"), so
+// the text must ALSO name a report surface. This narrowness is the anti-noise
+// property — a signal that fires on every pass is one operators learn to
+// ignore, which is the failure mode this package must not create.
 //
-// The nouns split into two disjoint sets by whether a fix-up pass CAN write
-// the named surface (#2782):
-//
-//   - prBodySurfaceNouns name the pull-request body, which a fix-up pass has
-//     NO mechanism to write: the slim fix-up prompt renders no PR-description
-//     block and the pass pushes commits only, so the PR title/body composed at
-//     PR-open by the first implement attempt is never re-composed. An
-//     obligation naming one of these is UNSATISFIABLE by construction.
-//     `## notes` / `notes section` are PR-body surfaces because in this
-//     workflow the `## Notes` heading IS a pull-request-body convention
-//     (AGENTS.md's git-flow PR-body template) — and it is the exact phrasing
-//     the #2782 occurrence used.
-//   - otherReportSurfaceNouns name a surface the pass CAN still write (a run
-//     log), so an obligation naming one stays satisfiable and keeps today's
-//     `met`-suppresses-the-finding behaviour.
-//
-// IsObligation keeps its exact prior semantics by testing the UNION of the two
-// lists, so the detected obligation SET — and therefore every `ob-N` id — is
-// unchanged; only the per-member classification is new.
-var prBodySurfaceNouns = []string{
+// The list decides only WHETHER an instruction is a reporting obligation (and
+// so draws an `ob-N` id). It does NOT decide whether the obligation is
+// satisfiable: that is Source.Target's job alone (E83.37 / #4022), so the
+// PR-body nouns here carry no unsatisfiability meaning any more. The list is
+// the pre-#4022 union of the PR-body and run-log nouns, so the detected set —
+// and every `ob-N` id — is unchanged for a pass that declares no target.
+var reportSurfaceNouns = []string{
 	"pr body",
 	"pull request body",
 	"pull-request body",
@@ -218,39 +249,17 @@ var prBodySurfaceNouns = []string{
 	"pull-request description",
 	"## notes",
 	"notes section",
-}
-
-// otherReportSurfaceNouns name report surfaces a fix-up pass CAN write, so an
-// obligation naming one is satisfiable and keeps today's behaviour.
-var otherReportSurfaceNouns = []string{
 	"run log",
 }
 
 // IsObligation reports whether text carries a reporting obligation: it must
-// contain BOTH a recording verb AND a report-surface noun (case-folded),
-// testing the UNION of the PR-body and other-surface noun lists so the
-// detected set is identical to before the #2782 split. This is a lexical,
-// English-only heuristic over operator-authored text — a reporting obligation
-// phrased without any listed term is a false NEGATIVE, which is today's exact
-// behavior, so nothing regresses when it misses.
+// contain BOTH a recording verb AND a report-surface noun (case-folded). This
+// is a lexical, English-only heuristic over operator-authored text — a
+// reporting obligation phrased without any listed term is a false NEGATIVE.
+// It never decides satisfiability (see Source.Target).
 func IsObligation(text string) bool {
 	folded := strings.ToLower(text)
-	if !containsAny(folded, recordingVerbs) {
-		return false
-	}
-	return containsAny(folded, prBodySurfaceNouns) || containsAny(folded, otherReportSurfaceNouns)
-}
-
-// NamesPRBodySurface reports whether text names the pull-request body — a
-// surface a fix-up pass cannot write (#2782). It is deliberately NOT
-// conjunctive with the recording verbs: it answers a different question than
-// IsObligation. IsObligation asks "is this a reporting obligation at all"
-// (verb AND surface); NamesPRBodySurface asks "does this instruction name the
-// surface this pass structurally cannot write" (surface only), which is what
-// decides whether an already-detected obligation is unsatisfiable. Case-folded
-// substring over prBodySurfaceNouns only.
-func NamesPRBodySurface(text string) bool {
-	return containsAny(strings.ToLower(text), prBodySurfaceNouns)
+	return containsAny(folded, recordingVerbs) && containsAny(folded, reportSurfaceNouns)
 }
 
 func containsAny(folded string, needles []string) bool {
@@ -279,6 +288,12 @@ func containsAny(folded string, needles []string) bool {
 // reporting obligation detected inside an acceptance-derived (untrusted)
 // concern note stays marked as untrusted at every downstream render site.
 //
+// A source is declared when its text IsObligation OR its router targeted
+// TargetPRBody (E83.37 / #4022): a pr_body-targeted instruction is a
+// structurally unsatisfiable one whatever its wording, so it must reach the
+// routing-time warning and the review join even when it carries no recording
+// verb. PRBody is set from the target alone.
+//
 // Returns nil when nothing is classified — the common case, and the one that
 // keeps the fix-up prompt byte-identical to today.
 func Detect(sources []Source) []Obligation {
@@ -304,17 +319,21 @@ func Detect(sources []Source) []Obligation {
 					continue
 				}
 			}
-			if !IsObligation(trimmed) {
+			target := s.Target
+			if target == "" {
+				target = TargetCode
+			}
+			if !IsObligation(trimmed) && target != TargetPRBody {
 				continue
 			}
 			out = append(out, Obligation{
 				ID:     nextID(len(out)),
 				Source: kind,
 				Text:   Bound(trimmed),
-				// Classify the PR-body surface off the SAME trimmed text the id
-				// and excerpt derive from, so the flag is minted at exactly one
-				// site (#2782) and every downstream consumer inherits it.
-				PRBody:    NamesPRBodySurface(trimmed),
+				Target: target,
+				// The router's declaration, minted at exactly one site (#2782,
+				// E83.37 / #4022) so every downstream consumer inherits it.
+				PRBody:    target == TargetPRBody,
 				Untrusted: s.Untrusted,
 			})
 		}

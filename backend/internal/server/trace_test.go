@@ -7856,13 +7856,26 @@ func seedFixupTriggerWithConcern(t *testing.T, au *auditFake, runID, stageID uui
 // allocated monotonically per fake, mirroring the append-only audit chain.
 func seedFixupTriggerConcernWithProvenance(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason, provenance string) int64 {
 	t.Helper()
-	payload, err := json.Marshal(map[string]any{
+	return seedFixupTriggerConcernWithTarget(t, au, runID, stageID, note, reason, provenance, "")
+}
+
+// seedFixupTriggerConcernWithTarget is seedFixupTriggerConcernWithProvenance
+// plus the router-declared target of the one routed concern (E83.37 / #4022),
+// recorded as the positional concern_targets key writeFixupAudit writes. An
+// empty target writes no key — the pre-#4022 (all-code) payload shape.
+func seedFixupTriggerConcernWithTarget(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason, provenance string, target fixupobligation.Target) int64 {
+	t.Helper()
+	fields := map[string]any{
 		"stage_id": stageID.String(),
 		"concerns": []planreview.Concern{{
 			Severity: "medium", Category: "process", Note: note, Provenance: provenance,
 		}},
 		"reason": reason,
-	})
+	}
+	if target != "" {
+		fields["concern_targets"] = []fixupobligation.Target{target}
+	}
+	payload, err := json.Marshal(fields)
 	if err != nil {
 		t.Fatalf("marshal fixup trigger payload: %v", err)
 	}
@@ -7896,6 +7909,16 @@ func seedFixupObligationAnchor(t *testing.T, au *auditFake, runID, stageID uuid.
 func seedServedFixupObligation(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) int64 {
 	t.Helper()
 	seq := seedFixupTriggerWithConcern(t, au, runID, stageID, note, reason)
+	seedFixupObligationAnchor(t, au, runID, stageID, seq)
+	return seq
+}
+
+// seedServedPRBodyTargetedObligation is seedServedFixupObligation with the
+// routed concern's router-declared target set to pr_body (E83.37 / #4022) —
+// the only thing that makes a reporting obligation unsatisfiable.
+func seedServedPRBodyTargetedObligation(t *testing.T, au *auditFake, runID, stageID uuid.UUID, note, reason string) int64 {
+	t.Helper()
+	seq := seedFixupTriggerConcernWithTarget(t, au, runID, stageID, note, reason, "", fixupobligation.TargetPRBody)
 	seedFixupObligationAnchor(t, au, runID, stageID, seq)
 	return seq
 }
@@ -7998,10 +8021,11 @@ func TestImplementReview_FixupReportingObligationUndelivered_AppendsAuditEntryAn
 }
 
 // TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet drives the REAL
-// review path for the #2782 heart: a PR-body reporting obligation is surfaced
-// with status `unsatisfiable` EVEN when the agent reported it `met`, because the
-// pass could not have written the PR body. The reviewer prose reframes it as a
-// routing-surface limitation, not an agent omission.
+// review path for the #2782 heart: a reporting obligation whose router TARGETED
+// the PR body (E83.37 / #4022) is surfaced with status `unsatisfiable` EVEN when
+// the agent reported it `met`, because the pass could not have written the PR
+// body. The reviewer prose reframes it as a routing-surface limitation, not an
+// agent omission.
 func TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet(t *testing.T) {
 	const prBodyNote = "Record the per-deletion counterfactual results in the PR body's ## Notes."
 	reviewer := &fakePlanReviewer{
@@ -8009,7 +8033,7 @@ func TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet(t *testing.T)
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, prBodyNote, "route the reporting concern")
+	seedServedPRBodyTargetedObligation(t, au, runRow.ID, implStage.ID, prBodyNote, "route the reporting concern")
 
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -8038,6 +8062,33 @@ func TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet(t *testing.T)
 		if !strings.Contains(rp, w) {
 			t.Errorf("reviewer prompt missing %q:\n%s", w, rp)
 		}
+	}
+}
+
+// TestImplementReview_PRBodyProseCodeTarget_MetSuppressed is the E83.37 /
+// #4022 done-means on the REAL review path: the SAME PR-body prose, routed with
+// no declared target (absent = code), is an ordinary satisfiable obligation, so
+// a `met` report suppresses it and the review emits no undelivered entry.
+//
+// Counterfactual: re-derive PRBody from the prose and this goes RED with an
+// `unsatisfiable` entry.
+func TestImplementReview_PRBodyProseCodeTarget_MetSuppressed(t *testing.T) {
+	const prBodyNote = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	seedServedFixupObligation(t, au, runRow.ID, implStage.ID, prBodyNote, "route the reporting concern")
+
+	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
+		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
+	}}
+	if s.runImplementReviews(t.Context(), runRow.ID, implStage.ID, diff, nil, "", metReportEvidence("ob-1")) {
+		t.Fatal("gating approve must not gate")
+	}
+	if payloads := fixupObligationUndeliveredPayloads(t, au); len(payloads) != 0 {
+		t.Errorf("payloads = %+v, want none — a met code-target obligation is satisfied", payloads)
 	}
 }
 
@@ -8595,7 +8646,11 @@ func TestImplementReview_AcceptanceDerivedObligation_TextQuarantined(t *testing.
 		model:   "claude-opus-4-7",
 	}
 	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
-	seedFixupTriggerWithAcceptanceConcern(t, au, runRow.ID, implStage.ID, note, "route the acceptance failure")
+	// Targeted pr_body (E83.37 / #4022) so the quarantine is exercised on the
+	// unsatisfiable render with its cannot-write marker.
+	seq := seedFixupTriggerConcernWithTarget(t, au, runRow.ID, implStage.ID, note, "route the acceptance failure",
+		planreview.ConcernProvenanceAcceptance, fixupobligation.TargetPRBody)
+	seedFixupObligationAnchor(t, au, runRow.ID, implStage.ID, seq)
 
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "backend/internal/foo/foo.go", Status: policy.StatusModified},
@@ -8630,8 +8685,9 @@ func TestImplementReview_AcceptanceDerivedObligation_TextQuarantined(t *testing.
 	if outside := prompt[:begin] + prompt[end:]; strings.Contains(outside, injected) {
 		t.Errorf("acceptance-derived obligation text leaked OUTSIDE the quarantine envelope:\n%s", prompt)
 	}
-	// The obligation is still named by id. This note names the PR body, so its
-	// status is `unsatisfiable` (#2782) — the pass could not have written it —
+	// The obligation is still named by id. This note was routed with the
+	// pr_body target, so its status is `unsatisfiable` (#2782, E83.37 / #4022)
+	// — the pass could not have written it —
 	// and it carries the PR-body cannot-write marker, but the untrusted excerpt
 	// stays quarantined either way.
 	if !strings.Contains(prompt, "`ob-1` (routed as concern) — unsatisfiable: instruction text quarantined as untrusted DATA below") {

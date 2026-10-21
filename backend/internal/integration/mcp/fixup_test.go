@@ -409,128 +409,167 @@ func TestE2E_Fixup_OperatorConcernRoutedToPrompt(t *testing.T) {
 	}
 }
 
-// TestE2E_Fixup_PRBodyInstruction is the #2782 cross-boundary integration test:
-// the real fishhawk-mcp binary routes a fix-up whose operator_concern names the
-// PR body — a surface a fix-up pass cannot write — against the real backend over
-// real Postgres, and asserts in one test that the seam holds across three layers
-// (cf. #618). (a) The tool result carries a warnings entry naming the PR-body
-// limitation and pointing at the self-report sidecar. (b) A
-// fixup_pr_body_unsatisfiable audit entry persisted, carrying the obligation id
-// and bounded excerpt. (c) The served fix-up prompt marks that obligation as
-// naming a surface the pass cannot write. The review-time leg — an
-// `unsatisfiable` obligation reframed as a routing-surface limitation, surfaced
-// even under a `met` report — is covered through the real review path by
-// TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet.
+// TestE2E_Fixup_PRBodyInstruction is the #2782 / E83.37 (#4022) cross-boundary
+// integration test: the real fishhawk-mcp binary routes a fix-up whose
+// operator_concern asks for a PR-body change against the real backend over real
+// Postgres, once with the router-declared pr_body target and once with the SAME
+// prose and a code target, and asserts the seam across every layer (cf. #618):
+// (a) the tool result's warnings, (b) the persisted stage_fixup_triggered
+// target key and the fixup_pr_body_unsatisfiable advisory entry, and (c) the
+// served fix-up prompt, which re-derives the obligation from that persisted
+// entry. Only the declared target raises the warning, the advisory and the
+// prompt's cannot-write marker; the code-targeted prose is an ordinary
+// reporting obligation. The review-time join over the persisted entry is pinned
+// in the server package by TestFixupStage_DeclaredPRBodyTarget_RecordedAndReDerived
+// and on the real review path by
+// TestImplementReview_PRBodyObligation_UnsatisfiableEvenWhenMet /
+// TestImplementReview_PRBodyProseCodeTarget_MetSuppressed.
 func TestE2E_Fixup_PRBodyInstruction(t *testing.T) {
 	t.Parallel()
-	fx := newFixture(t)
-	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
-	defer cancel()
-
-	auditRepo := audit.NewPostgresRepository(fx.pool)
-	signingRepo := signing.NewPostgresRepository(fx.pool)
-	srv := server.New(server.Config{
-		Addr:         "127.0.0.1:0",
-		RunRepo:      fx.runRepo,
-		AuditRepo:    auditRepo,
-		SigningRepo:  signingRepo,
-		APITokenRepo: fx.apitokenRepo,
-		GitHub:       githubclient.New(nil),
-	})
-	httpSrv := httptest.NewServer(srv.Handler())
-	t.Cleanup(httpSrv.Close)
-
-	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
-		RunID:            fx.runID,
-		Sequence:         1,
-		Type:             runpkg.StageTypeImplement,
-		ExecutorKind:     runpkg.ExecutorAgent,
-		ExecutorRef:      "fishhawk/runner@v1",
-		RequiresApproval: true,
-	})
-	if err != nil {
-		t.Fatalf("CreateStage: %v", err)
-	}
-	parkAtGate(t, ctx, fx.runRepo, stage.ID)
-
 	const prBodyInstruction = "Record the per-deletion counterfactual results in the PR body's ## Notes."
-	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
-	result, err := session.CallTool(ctx, &mcp.CallToolParams{
-		Name: "fishhawk_fixup_stage",
-		Arguments: map[string]any{
-			"stage_id":         stage.ID.String(),
-			"operator_concern": prBodyInstruction,
-			"reason":           "route the reporting obligation",
-		},
-	})
-	if err != nil {
-		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
-	}
-	if result.IsError {
-		t.Fatalf("PR-body fix-up tool returned error: %s", toolContentString(t, result))
-	}
+	const cannotWriteMarker = "this names the PULL-REQUEST BODY, which THIS pass cannot write; report it `declined`"
+	for _, tc := range []struct {
+		name       string
+		target     string
+		wantPRBody bool
+	}{
+		{"declared pr_body target", "pr_body", true},
+		{"prose-only PR body with code target", "code", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			fx := newFixture(t)
+			ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+			defer cancel()
 
-	// (a) The tool result carries the routing-time warning.
-	var fixupOut struct {
-		Stage struct {
-			State string `json:"state"`
-		} `json:"stage"`
-		Warnings []string `json:"warnings"`
-	}
-	decodeStructured(t, result, &fixupOut)
-	if fixupOut.Stage.State != string(runpkg.StageStatePending) {
-		t.Errorf("fix-up stage state = %q, want pending", fixupOut.Stage.State)
-	}
-	if len(fixupOut.Warnings) != 1 {
-		t.Fatalf("warnings = %+v, want exactly 1 naming the PR-body limitation", fixupOut.Warnings)
-	}
-	// CROSS-BOUNDARY channel assertion (#2782): the warning names the TRUE arrival
-	// channel — operator_concern — derived by the REAL backend, not a value the
-	// test seeded. The backend folds operator_concern into a synthetic selected
-	// concern, so a naive dedupe would mis-report this instruction as arriving via
-	// "concern"; this pins that the server-minted obligation preserves the real
-	// channel end to end (the vacuity the unit-level rendering test cannot catch).
-	for _, w := range []string{"ob-1", "operator_concern", "PULL-REQUEST BODY", "CANNOT update", "self-report sidecar"} {
-		if !strings.Contains(fixupOut.Warnings[0], w) {
-			t.Errorf("warning missing %q:\n%s", w, fixupOut.Warnings[0])
-		}
-	}
+			auditRepo := audit.NewPostgresRepository(fx.pool)
+			signingRepo := signing.NewPostgresRepository(fx.pool)
+			srv := server.New(server.Config{
+				Addr:         "127.0.0.1:0",
+				RunRepo:      fx.runRepo,
+				AuditRepo:    auditRepo,
+				SigningRepo:  signingRepo,
+				APITokenRepo: fx.apitokenRepo,
+				GitHub:       githubclient.New(nil),
+			})
+			httpSrv := httptest.NewServer(srv.Handler())
+			t.Cleanup(httpSrv.Close)
 
-	// (b) The advisory fixup_pr_body_unsatisfiable audit entry persisted.
-	entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryFixupPRBodyUnsatisfiable)
-	if err != nil {
-		t.Fatalf("ListForRunByCategory: %v", err)
-	}
-	if len(entries) != 1 {
-		t.Fatalf("fixup_pr_body_unsatisfiable entries = %d, want 1", len(entries))
-	}
-	var payload struct {
-		StageID         string `json:"stage_id"`
-		ObligationCount int    `json:"obligation_count"`
-		Obligations     []struct {
-			ID          string `json:"id"`
-			Source      string `json:"source"`
-			TextExcerpt string `json:"text_excerpt"`
-		} `json:"obligations"`
-	}
-	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
-		t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
-	}
-	if payload.StageID != stage.ID.String() || payload.ObligationCount != 1 || len(payload.Obligations) != 1 {
-		t.Fatalf("payload = %+v, want the stage id and one obligation", payload)
-	}
-	if payload.Obligations[0].ID != "ob-1" || payload.Obligations[0].Source != "operator_concern" || payload.Obligations[0].TextExcerpt != prBodyInstruction {
-		t.Errorf("audit obligation = %+v, want ob-1/operator_concern with the PR-body excerpt", payload.Obligations[0])
-	}
+			stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+				RunID:            fx.runID,
+				Sequence:         1,
+				Type:             runpkg.StageTypeImplement,
+				ExecutorKind:     runpkg.ExecutorAgent,
+				ExecutorRef:      "fishhawk/runner@v1",
+				RequiresApproval: true,
+			})
+			if err != nil {
+				t.Fatalf("CreateStage: %v", err)
+			}
+			parkAtGate(t, ctx, fx.runRepo, stage.ID)
 
-	// (c) The served fix-up prompt marks the obligation as naming a surface the
-	// pass cannot write.
-	rendered := getPromptRender(t, ctx, httpSrv.URL, stage.ID)
-	if !strings.Contains(rendered, "### Reporting obligations routed with this fix-up") {
-		t.Errorf("rendered prompt missing the reporting-obligations block:\n%s", rendered)
-	}
-	if !strings.Contains(rendered, "this names the PULL-REQUEST BODY, which THIS pass cannot write; report it `declined`") {
-		t.Errorf("rendered prompt missing the PR-body cannot-write marker:\n%s", rendered)
+			session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+			result, err := session.CallTool(ctx, &mcp.CallToolParams{
+				Name: "fishhawk_fixup_stage",
+				Arguments: map[string]any{
+					"stage_id":            stage.ID.String(),
+					"operator_concern":    prBodyInstruction,
+					"reason":              "route the reporting obligation",
+					"instruction_targets": map[string]any{"operator_concern": tc.target},
+				},
+			})
+			if err != nil {
+				t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+			}
+			if result.IsError {
+				t.Fatalf("PR-body fix-up tool returned error: %s", toolContentString(t, result))
+			}
+
+			// (a) The tool result's routing-time warning.
+			var fixupOut struct {
+				Stage struct {
+					State string `json:"state"`
+				} `json:"stage"`
+				Warnings []string `json:"warnings"`
+			}
+			decodeStructured(t, result, &fixupOut)
+			if fixupOut.Stage.State != string(runpkg.StageStatePending) {
+				t.Errorf("fix-up stage state = %q, want pending", fixupOut.Stage.State)
+			}
+			if !tc.wantPRBody {
+				if len(fixupOut.Warnings) != 0 {
+					t.Errorf("warnings = %+v, want none for a code-targeted instruction", fixupOut.Warnings)
+				}
+			} else {
+				if len(fixupOut.Warnings) != 1 {
+					t.Fatalf("warnings = %+v, want exactly 1 naming the PR-body limitation", fixupOut.Warnings)
+				}
+				// CROSS-BOUNDARY channel assertion (#2782): the warning names the
+				// TRUE arrival channel — operator_concern — derived by the REAL
+				// backend, not a value the test seeded.
+				for _, w := range []string{"ob-1", "operator_concern", "PULL-REQUEST BODY", "instruction_targets: pr_body", "CANNOT update", "self-report sidecar"} {
+					if !strings.Contains(fixupOut.Warnings[0], w) {
+						t.Errorf("warning missing %q:\n%s", w, fixupOut.Warnings[0])
+					}
+				}
+			}
+
+			// (b) The persisted trigger entry carries the declared target (absent
+			// for code), and the advisory entry exists only for pr_body.
+			triggered, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryStageFixupTriggered)
+			if err != nil || len(triggered) != 1 {
+				t.Fatalf("stage_fixup_triggered entries = %d (err %v), want 1", len(triggered), err)
+			}
+			var trig map[string]any
+			if err := json.Unmarshal(triggered[0].Payload, &trig); err != nil {
+				t.Fatalf("unmarshal stage_fixup_triggered payload: %v", err)
+			}
+			if got, present := trig["operator_concern_target"]; tc.wantPRBody != present || (present && got != "pr_body") {
+				t.Errorf("persisted operator_concern_target = %v (present %v), want pr_body only for the declared target", got, present)
+			}
+			entries, err := auditRepo.ListForRunByCategory(ctx, fx.runID, server.CategoryFixupPRBodyUnsatisfiable)
+			if err != nil {
+				t.Fatalf("ListForRunByCategory: %v", err)
+			}
+			if !tc.wantPRBody {
+				if len(entries) != 0 {
+					t.Errorf("fixup_pr_body_unsatisfiable entries = %d, want 0 for a code target", len(entries))
+				}
+			} else {
+				if len(entries) != 1 {
+					t.Fatalf("fixup_pr_body_unsatisfiable entries = %d, want 1", len(entries))
+				}
+				var payload struct {
+					StageID         string `json:"stage_id"`
+					ObligationCount int    `json:"obligation_count"`
+					Obligations     []struct {
+						ID          string `json:"id"`
+						Source      string `json:"source"`
+						TextExcerpt string `json:"text_excerpt"`
+					} `json:"obligations"`
+				}
+				if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+					t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
+				}
+				if payload.StageID != stage.ID.String() || payload.ObligationCount != 1 || len(payload.Obligations) != 1 {
+					t.Fatalf("payload = %+v, want the stage id and one obligation", payload)
+				}
+				if payload.Obligations[0].ID != "ob-1" || payload.Obligations[0].Source != "operator_concern" || payload.Obligations[0].TextExcerpt != prBodyInstruction {
+					t.Errorf("audit obligation = %+v, want ob-1/operator_concern with the PR-body excerpt", payload.Obligations[0])
+				}
+			}
+
+			// (c) The served prompt re-derives from the persisted entry: both
+			// kinds are reporting obligations (recording verb + report surface),
+			// but only the declared pr_body target carries the cannot-write marker.
+			rendered := getPromptRender(t, ctx, httpSrv.URL, stage.ID)
+			if !strings.Contains(rendered, "### Reporting obligations routed with this fix-up") {
+				t.Errorf("rendered prompt missing the reporting-obligations block:\n%s", rendered)
+			}
+			if got := strings.Contains(rendered, cannotWriteMarker); got != tc.wantPRBody {
+				t.Errorf("rendered prompt carries the PR-body cannot-write marker = %v, want %v:\n%s", got, tc.wantPRBody, rendered)
+			}
+		})
 	}
 }
 
