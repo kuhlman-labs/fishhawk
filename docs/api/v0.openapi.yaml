@@ -5706,9 +5706,10 @@ components:
         The `POST /v0/stages/{stage_id}/fixup` 200 body (#2782): the re-opened
         Stage with an OPTIONAL `pr_body_obligations` field. All the Stage fields
         appear at the top level exactly as before; `pr_body_obligations` is
-        present only when a routed instruction named the pull-request body — a
-        surface a fix-up pass cannot write — so a pass that routed none serves a
-        byte-identical Stage response.
+        present only when a routed instruction was declared with the `pr_body`
+        target in `instruction_targets` (E83.37 / #4022) — the pull-request
+        body is a surface a fix-up pass cannot write — so a pass that targeted
+        none serves a byte-identical Stage response.
       allOf:
         - $ref: '#/components/schemas/Stage'
         - type: object
@@ -5716,7 +5717,8 @@ components:
             pr_body_obligations:
               type: array
               description: |
-                Routed instructions that named the pull-request body (#2782), so
+                Routed instructions declared with the `pr_body` target (#2782,
+                E83.37 / #4022), so
                 the caller (the MCP verb) can warn the operator that a fix-up
                 pass has no mechanism to write it. The same ids appear later to
                 the reviewer. Omitted when empty.
@@ -5821,8 +5823,9 @@ components:
     PRBodyObligation:
       type: object
       description: |
-        One routed instruction that named the pull-request body — a surface a
-        fix-up pass cannot write (#2782).
+        One routed instruction declared with the `pr_body` target — the
+        pull-request body, a surface a fix-up pass cannot write (#2782,
+        E83.37 / #4022).
       required: [id, source, text_excerpt]
       additionalProperties: false
       properties:
@@ -12184,6 +12187,22 @@ paths:
         #4148) is refused `403 first_officer_cannot_mint_tokens` before any
         token is issued: its captain attaches the seat credential through
         `POST /v0/first-officer-seats`.
+
+        A run-bound subject (any `mcp:run:` subject, e.g. an in-run `fhm_`
+        agent token, #4503) is refused `403 run_bound_cannot_mint_tokens`
+        before any token is issued, whatever scopes it requests.
+
+        **Scope ceiling (#4503).** Every requested scope must already be in
+        the caller's own scope set; otherwise the request is refused
+        `403 scope_escalation_refused` before any token is issued, with
+        `details.excess_scopes` naming every excess scope (de-duplicated,
+        request order) and `details.ceiling` naming the ceiling applied:
+        `token_scopes` for a bearer (bounded by the presenting token's own
+        resolved scopes, so an AS-issued `fho_` token cannot widen its
+        grant), `operator_default_scopes` for a cookie session (bounded by
+        the deployment's operator default scope set, the same set
+        `POST /v0/tokens/login` mints within; an unwired set admits no
+        explicit scope). An empty `scopes` list is always admitted.
       tags: [auth]
       requestBody:
         required: true
@@ -12369,6 +12388,13 @@ paths:
     delete:
       operationId: revokeToken
       summary: Revoke an API token
+      description: |
+        Requires no scope (#4503, deliberate): revocation only removes
+        privilege, and the caller can revoke only its OWN tokens (another
+        subject's token is `403`). A run-bound `mcp:run:` subject is
+        admitted, so a token minted under the pre-#4503 unbounded
+        `POST /v0/tokens` can revoke itself. Idempotent: a second revoke
+        returns `204` with no state change.
       tags: [auth]
       parameters:
         - { name: token_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -16976,6 +17002,15 @@ paths:
         The reporter is fail-open by construction on the runner side: a lost
         heartbeat is superseded ~15s later and can never fail a stage.
 
+        **Auth (#4483).** A run-bound `mcp:run:<uuid>` token is admitted only
+        on its OWN run (the runner's heartbeat bearer, which carries `mcp:read`
+        and never `write:runs`); a run-bound token for any other run is `403
+        run_not_entitled`. Every other bearer needs `write:runs` (`403
+        insufficient_scope` otherwise), and an anonymous caller is `401`. A
+        cookie session is admitted, bounded by the `memberWrite` tier. The
+        check runs before the body is read, so a refused heartbeat records
+        nothing.
+
         `reported_at` is stamped by the DATABASE at ingest (Postgres `now()`),
         so it shares a clock domain with the dispatch stamp the dispatch
         watchdog compares it against (#3084); the runner does not set it.
@@ -17006,7 +17041,17 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '403': { $ref: '#/components/responses/Forbidden' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `run_not_entitled` — a run-bound token for a DIFFERENT run than the
+            path `run_id` (`details.run_id`). `insufficient_scope` — a
+            non-run-bound bearer without `write:runs`
+            (`details.required_scope`). `account_forbidden` — the run belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404':
           description: |
             `stage_not_found` — no stage with that id, or the stage's `run_id`
@@ -17452,6 +17497,14 @@ paths:
         Appends a `status_comment_posted` audit entry with the returned
         `github_comment_id` so subsequent GET calls can return it for
         edit-in-place targeting. Idempotent: multiple POSTs are safe (#428).
+
+        **Auth (#4483).** Requires `write:runs`, checked before the
+        configuration checks and the body read: an anonymous caller is `401`
+        and a bearer without `write:runs` (a read-only token, a first-officer
+        seat) is `403 insufficient_scope`; neither appends a row. A run-bound
+        `mcp:run` token gets no exemption. The CLI sends the bearer it already
+        resolved (flag, env or credstore). A cookie session is admitted,
+        bounded by the `memberWrite` tier.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -17473,6 +17526,14 @@ paths:
         '400':
           description: "`validation_failed` — `github_comment_id` missing or ≤ 0."
         '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `insufficient_scope` — the bearer lacks `write:runs`
+            (`details.required_scope`). `account_forbidden` — the run belongs to
+            another workspace account.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
         '503': { description: Run repository unavailable. }
 
@@ -21079,6 +21140,12 @@ paths:
         agent token must file run-scoped (supply its own `run_id`) and is
         rejected with `403 run_scoped_filing_required` if it omits `run_id`.
 
+        **Auth (#4481).** A non-run-bound bearer needs `write:runs`, checked
+        before the body is read: a read-only token is `403
+        insufficient_scope` and nothing is filed. A run-bound `mcp:run:<uuid>`
+        token is exempt and held to its own run instead (`run_not_entitled`,
+        `run_scoped_filing_required` above). A cookie session is admitted.
+
         An unregistered/unimplemented provider id fails closed with `501
         provider_unimplemented` naming the missing provider — never a panic.
       tags: [work-items]
@@ -21114,6 +21181,8 @@ paths:
             first-officer seat (`first_officer/…` subject, E85.6 / #4148),
             refused before the handler whatever its scopes: a seat never
             writes tracker state.
+            `insufficient_scope` — a non-run-bound bearer without `write:runs`
+            (`details.required_scope`, #4481); nothing is filed.
         '404':
           description: "`run_not_found` — `run_id` supplied but no such run."
         '413':
@@ -25873,13 +25942,41 @@ paths:
                     text is recorded on the `stage_fixup_triggered` audit entry
                     as `operator_evidence` ONLY when non-empty, so a fix-up that
                     omits it leaves the payload byte-identical.
+                instruction_targets:
+                  type: object
+                  description: |
+                    Optional router-declared target of each routed instruction
+                    (E83.37 / #4022): the surface the instruction asks the pass
+                    to change. A key is a routed concern id from `concern_ids`,
+                    `operator_concern`, or `reason`; a value is `code`,
+                    `pr_body`, or `docs`. An instruction with no key is `code`.
+                    The target alone decides whether the instruction is
+                    unsatisfiable on a fix-up pass: `pr_body` (a pass cannot
+                    write the PR body, #2782) puts it on the response's
+                    `pr_body_obligations`, writes a `fixup_pr_body_unsatisfiable`
+                    audit entry, and makes the implement review report it
+                    `unsatisfiable` even under a `met` self-report. The
+                    instruction's prose is never classified for that, so an
+                    undeclared instruction that mentions the PR body is an
+                    ordinary instruction. Index-routed (deprecated positional
+                    `concerns`) concerns cannot be targeted. Every value is
+                    validated before the stage lookup and every key must name
+                    an instruction this request routes; otherwise 400
+                    `validation_failed` (`field: instruction_targets`). Recorded
+                    on the `stage_fixup_triggered` payload as `concern_targets`
+                    (aligned with `concerns`), `operator_concern_target` and
+                    `reason_target`, each omitted when every target is `code`.
+                  additionalProperties:
+                    type: string
+                    enum: [code, pr_body, docs]
       responses:
         '200':
           description: |
             Stage re-opened for the fix-up pass; refreshed Stage row in body,
             plus an OPTIONAL `pr_body_obligations` array (#2782) — present only
-            when a routed instruction named the pull-request body, a surface a
-            fix-up pass cannot write. Absent otherwise, so an unchanged consumer
+            when a routed instruction was declared with the `pr_body` target in
+            `instruction_targets` (E83.37 / #4022) — the pull-request body, a
+            surface a fix-up pass cannot write. Absent otherwise, so an unchanged consumer
             sees a byte-identical Stage response.
           content:
             application/json:

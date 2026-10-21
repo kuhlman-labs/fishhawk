@@ -309,6 +309,144 @@ type fixupRequest struct {
 	// inherited — is pinned on the stage_fixup_triggered audit entry at
 	// trigger time and read back when the runner fetches the fix-up prompt.
 	ImplementModel string `json:"implement_model"`
+	// InstructionTargets declares, per routed instruction, the surface the
+	// router asks the pass to change (E83.37 / #4022): a key is a routed
+	// concern id (from concern_ids), `operator_concern`, or `reason`; a value
+	// is `code`, `pr_body`, or `docs`. An instruction with no key is `code`.
+	// The value alone decides whether the instruction is unsatisfiable on a
+	// fix-up pass (`pr_body` — the pass cannot write the PR body, #2782); the
+	// instruction's prose is never classified for that. Index-routed
+	// (deprecated positional) concerns cannot be targeted. Validated before
+	// any state change (400 validation_failed); recorded on the
+	// stage_fixup_triggered entry as concern_targets / operator_concern_target
+	// / reason_target (each omitted when every target is code).
+	InstructionTargets map[string]string `json:"instruction_targets"`
+}
+
+// Instruction-target keys naming the two free-text channels (E83.37 / #4022);
+// every other key must be a routed concern id.
+const (
+	instructionTargetKeyOperatorConcern = "operator_concern"
+	instructionTargetKeyReason          = "reason"
+)
+
+// fixupInstructionTargets is the router-declared target of every routed
+// instruction on one fix-up pass (E83.37 / #4022). It is BOTH the routing-time
+// carrier (fixupActionParams.Targets) and the persisted shape: its json tags
+// are the stage_fixup_triggered payload keys, so the prompt-serve and
+// review-time re-derivation decode the same struct the trigger wrote. Concerns
+// is aligned positionally with the payload's `concerns` array. The zero value
+// (and every absent key) means fixupobligation.TargetCode, so a payload written
+// before #4022, or by a caller that declares nothing (campaign auto-driver,
+// acceptance triage), re-derives as all-code.
+type fixupInstructionTargets struct {
+	Concerns        []fixupobligation.Target `json:"concern_targets,omitempty"`
+	OperatorConcern fixupobligation.Target   `json:"operator_concern_target,omitempty"`
+	Reason          fixupobligation.Target   `json:"reason_target,omitempty"`
+}
+
+// concern returns the declared target of the i-th routed concern ("" — code —
+// when out of range).
+func (t fixupInstructionTargets) concern(i int) fixupobligation.Target {
+	if i < 0 || i >= len(t.Concerns) {
+		return ""
+	}
+	return t.Concerns[i]
+}
+
+// persisted collapses every code target to absent, so a pass that declares
+// nothing but code writes a payload byte-identical to the pre-#4022 shape.
+// Concerns is kept whole (with explicit "code" entries) when ANY concern
+// carries a non-code target, so the positional alignment survives.
+func (t fixupInstructionTargets) persisted() fixupInstructionTargets {
+	isCode := func(x fixupobligation.Target) bool { return x == "" || x == fixupobligation.TargetCode }
+	out := fixupInstructionTargets{}
+	for _, c := range t.Concerns {
+		if !isCode(c) {
+			out.Concerns = make([]fixupobligation.Target, len(t.Concerns))
+			for i, c := range t.Concerns {
+				if isCode(c) {
+					c = fixupobligation.TargetCode
+				}
+				out.Concerns[i] = c
+			}
+			break
+		}
+	}
+	if !isCode(t.OperatorConcern) {
+		out.OperatorConcern = t.OperatorConcern
+	}
+	if !isCode(t.Reason) {
+		out.Reason = t.Reason
+	}
+	return out
+}
+
+// parsedInstructionTargets is the validated instruction_targets request field.
+type parsedInstructionTargets struct {
+	byConcernID     map[uuid.UUID]fixupobligation.Target
+	operatorConcern fixupobligation.Target
+	reason          fixupobligation.Target
+}
+
+// validateInstructionTargets validates the instruction_targets request field
+// (E83.37 / #4022) BEFORE any state change. Every VALUE is checked first (one
+// of code / pr_body / docs), then every KEY must name an instruction this
+// request actually routes: `operator_concern` needs a non-empty
+// operator_concern, `reason` a non-empty reason, and any other key must be one
+// of the request's concern_ids — so an index-routed concern, or a typo, is
+// refused rather than silently defaulting to code. Keys are visited in sorted
+// order so the refusal is deterministic. Returns the (message, got) of the
+// first problem for a 400 validation_failed envelope, or "" on success.
+func validateInstructionTargets(raw map[string]string, concernIDs []uuid.UUID, operatorConcern, reason string) (parsedInstructionTargets, string, string) {
+	out := parsedInstructionTargets{byConcernID: map[uuid.UUID]fixupobligation.Target{}}
+	if len(raw) == 0 {
+		return out, "", ""
+	}
+	keys := make([]string, 0, len(raw))
+	for k := range raw {
+		keys = append(keys, k)
+	}
+	slices.Sort(keys)
+	parsed := make(map[string]fixupobligation.Target, len(raw))
+	for _, k := range keys {
+		t, ok := fixupobligation.ParseTarget(raw[k])
+		if !ok {
+			return out, fmt.Sprintf("instruction_targets[%q] is %q; the target must be one of code, pr_body, docs", k, raw[k]), raw[k]
+		}
+		parsed[k] = t
+	}
+	routed := make(map[uuid.UUID]struct{}, len(concernIDs))
+	for _, cid := range concernIDs {
+		routed[cid] = struct{}{}
+	}
+	for _, k := range keys {
+		switch k {
+		case instructionTargetKeyOperatorConcern:
+			if operatorConcern == "" {
+				return out, "instruction_targets names operator_concern, but this request routes no operator_concern", k
+			}
+			out.operatorConcern = parsed[k]
+		case instructionTargetKeyReason:
+			if strings.TrimSpace(reason) == "" {
+				return out, "instruction_targets names reason, but this request carries no reason", k
+			}
+			out.reason = parsed[k]
+		default:
+			cid, err := uuid.Parse(k)
+			if err != nil {
+				return out, fmt.Sprintf("instruction_targets key %q is not a routed concern id, operator_concern, or reason", k), k
+			}
+			if _, ok := routed[cid]; !ok {
+				return out, fmt.Sprintf("instruction_targets key %s is not one of this request's concern_ids (an index-routed concern cannot be targeted)", k), k
+			}
+			if _, dup := out.byConcernID[cid]; dup {
+				return out, fmt.Sprintf("instruction_targets names concern %s more than once", cid), k
+			}
+			out.byConcernID[cid] = parsed[k]
+		}
+	}
+	return out, "", ""
 }
 
 // validateAllowCreate normalizes and validates the fix-up allow-create
@@ -467,6 +605,17 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		concernIDs = append(concernIDs, cid)
 	}
 
+	// Validate the optional router-declared instruction targets (E83.37 /
+	// #4022) before any state change — and before the stage lookup — so a bad
+	// target never reaches a transition and is refused the same way whether or
+	// not the stage exists.
+	instructionTargets, targetMsg, targetGot := validateInstructionTargets(reqBody.InstructionTargets, concernIDs, operatorConcern, reqBody.Reason)
+	if targetMsg != "" {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			targetMsg, map[string]any{"field": "instruction_targets", "got": targetGot})
+		return
+	}
+
 	// Validate the optional allow-create paths (#823) before any state
 	// change: trim, reject empty/absolute/".."-containing entries.
 	allowCreate, badField, badMsg := validateAllowCreate(reqBody.AllowCreate)
@@ -529,6 +678,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 	// fallback resolves positional indices against the flattened
 	// implement_reviewed audit-entry concern set.
 	var selected []planreview.Concern
+	var targets fixupInstructionTargets
 	switch {
 	case len(concernIDs) > 0:
 		if s.cfg.ConcernRepo == nil {
@@ -537,7 +687,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 				nil)
 			return
 		}
-		rows, rerr := s.resolveConcernsByID(r.Context(), stage.RunID, stageID, concernIDs)
+		rows, rowIDs, rerr := s.resolveConcernsByID(r.Context(), stage.RunID, stageID, concernIDs)
 		if rerr != nil {
 			var bad *concernSelectionError
 			if errors.As(rerr, &bad) {
@@ -550,6 +700,15 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		selected = rows
+		// Align the declared targets with the resolved rows (E83.37 / #4022):
+		// concern_targets is positional over the payload's `concerns`, so it is
+		// keyed by the row each concern resolved from, not by request order.
+		if len(instructionTargets.byConcernID) > 0 {
+			targets.Concerns = make([]fixupobligation.Target, len(rowIDs))
+			for i, cid := range rowIDs {
+				targets.Concerns[i] = instructionTargets.byConcernID[cid]
+			}
+		}
 	case len(reqBody.Concerns) > 0:
 		// DEPRECATED positional-index path. Flattened across every
 		// reviewer entry, so with multiple heterogeneous reviews per
@@ -603,7 +762,16 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 			Category: operatorConcernCategory,
 			Note:     operatorConcern,
 		})
+		// Keep concern_targets aligned with `selected` when it is populated:
+		// the synthetic concern carries the operator_concern target
+		// (buildFixupObligationSources skips it in favour of the explicit
+		// operator_concern source, so the entry is alignment only).
+		if targets.Concerns != nil {
+			targets.Concerns = append(targets.Concerns, instructionTargets.operatorConcern)
+		}
 	}
+	targets.OperatorConcern = instructionTargets.operatorConcern
+	targets.Reason = instructionTargets.reason
 
 	// Count prior fix-up passes for this stage to enforce the bound.
 	priorPasses, err := s.countFixupPasses(r.Context(), stage.RunID, stageID)
@@ -747,6 +915,7 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 		PinModel:         pinModel,
 		OperatorConcern:  operatorConcern,
 		OperatorEvidence: operatorEvidence,
+		Targets:          targets,
 	})
 	if err != nil {
 		switch {
@@ -833,20 +1002,22 @@ func (s *Server) handleFixupStage(w http.ResponseWriter, r *http.Request) {
 }
 
 // CategoryFixupPRBodyUnsatisfiable is the audit-log category for the advisory
-// routing-time signal (#2782) fixupStageAs appends when a routed instruction
-// names the PULL-REQUEST BODY — a surface a fix-up pass has NO mechanism to
-// write (the slim fix-up prompt renders no PR-description block and the pass
-// pushes commits only). It records, at ROUTING time, that the operator's
+// routing-time signal (#2782) fixupStageAs appends when a routed instruction's
+// router TARGETED the PULL-REQUEST BODY (instruction_targets value pr_body,
+// E83.37 / #4022 — never inferred from prose) — a surface a fix-up pass has NO
+// mechanism to write (the slim fix-up prompt renders no PR-description block
+// and the pass pushes commits only). It records, at ROUTING time, that the operator's
 // instruction is structurally unsatisfiable so the operator learns it without
 // waiting for the review. Internal advisory kind — NOT an issue-comment surface
 // (nothing in issuecomment posts it) — written on EVERY routing path including
-// the in-process campaign auto-driver and acceptance triage. EVIDENCE ONLY: it
+// the in-process campaign auto-driver and acceptance triage, although those
+// two declare no targets and so never raise it. EVIDENCE ONLY: it
 // never fails, re-opens, or re-budgets the pass; a nil AuditRepo or an append
 // error is best-effort/fail-open.
 const CategoryFixupPRBodyUnsatisfiable = "fixup_pr_body_unsatisfiable"
 
-// fixupPRBodyObligation is one routed instruction that names the PR body — a
-// surface a fix-up pass cannot write (#2782). It is BOTH the shape returned on
+// fixupPRBodyObligation is one routed instruction whose router targeted the PR
+// body — a surface a fix-up pass cannot write (#2782, E83.37 / #4022). It is BOTH the shape returned on
 // the fix-up HTTP response (pr_body_obligations, omitempty) — so the MCP verb
 // renders its operator warning FROM the server-minted set rather than
 // re-deriving anything locally, which keeps the ids the operator sees at
@@ -914,6 +1085,12 @@ type fixupActionParams struct {
 	// every non-HTTP caller (acceptance triage, campaign auto-drive), keeping
 	// their payloads byte-identical.
 	OperatorEvidence string
+	// Targets is the router-declared target of each routed instruction
+	// (E83.37 / #4022), Concerns aligned with Selected. The zero value — every
+	// non-HTTP caller (acceptance triage, campaign auto-drive, the merge-
+	// candidate re-route) — means every instruction is a code instruction, so
+	// those callers never raise the PR-body advisory on prose alone.
+	Targets fixupInstructionTargets
 }
 
 // fixupStageAs performs the gate-action core of POST /v0/stages/{id}/fixup
@@ -985,10 +1162,11 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// minted id is ALSO recorded on its own `operator_concern_id` key so the
 	// gate-view fixups[] join attributes the pass to the operator concern.
 	truncatedIDs := fixupTruncatedConcernIDs(fullFit, p.Selected, routedIDs, p.ConcernIDs)
-	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence, fullFit.BodiesTruncated, truncatedIDs)
+	s.writeFixupAudit(ctx, id, dec, p.Selected, routedIDs, p.Indices, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, p.PinModel, p.OperatorConcern, operatorConcernID, p.OperatorEvidence, fullFit.BodiesTruncated, truncatedIDs, p.Targets)
 
-	// PR-body-unsatisfiable signal (#2782): a routed instruction that names the
-	// PR body cannot take effect — a fix-up pass has no mechanism to write the
+	// PR-body-unsatisfiable signal (#2782): a routed instruction whose router
+	// TARGETED the PR body (E83.37 / #4022 — the declared target, never the
+	// prose) cannot take effect — a fix-up pass has no mechanism to write the
 	// PR title/body. Derive the FULL PR-body obligation set here, across all
 	// three routed channels (the SAME single derivation the routing-time warning
 	// and the review-time join share via buildFixupObligationSources + Detect),
@@ -997,9 +1175,9 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 	// FROM. AFTER writeFixupAudit so the trigger entry stays the durable record;
 	// best-effort and fail-open, and it never unwinds the committed transition
 	// or changes the HTTP status. Deliberately NOT gated on a zero-concern skip:
-	// an operator_concern-only pass whose instruction names the PR body is
+	// an operator_concern-only pass whose instruction targets the PR body is
 	// unsatisfiable either way.
-	prBodyObligations := s.recordFixupPRBodyUnsatisfiable(ctx, dec, p.Selected, p.OperatorConcern, p.Reason)
+	prBodyObligations := s.recordFixupPRBodyUnsatisfiable(ctx, dec, p.Selected, p.OperatorConcern, p.Reason, p.Targets)
 
 	// Mark the routed concerns addressed_pending in the durable store
 	// (#964), recording the operator's fix-up reason as state_reason. AFTER the
@@ -1076,11 +1254,14 @@ func (s *Server) fixupStageAs(ctx context.Context, id Identity, p fixupActionPar
 // SourceConcern per concern note carrying its acceptance-trust provenance, then
 // the operator_concern, then the reason — the fixed order Detect assigns ids
 // by. The operator_concern text that already appears as a minted concern note
-// is deduped inside Detect, exactly as on the prompt-serve path.
-func buildFixupObligationSources(concerns []planreview.Concern, operatorConcern, reason string) []fixupobligation.Source {
+// is deduped inside Detect, exactly as on the prompt-serve path. Each source
+// carries its router-declared target from targets (E83.37 / #4022; absent =
+// code), which alone decides PRBody — so both sites agree on satisfiability
+// because both read the targets the trigger recorded.
+func buildFixupObligationSources(concerns []planreview.Concern, operatorConcern, reason string, targets fixupInstructionTargets) []fixupobligation.Source {
 	sources := make([]fixupobligation.Source, 0, len(concerns)+2)
 	trimmedOperator := strings.TrimSpace(operatorConcern)
-	for _, c := range concerns {
+	for i, c := range concerns {
 		// Skip the SYNTHETIC [high/operator] concern that handleFixupStage folds
 		// into `selected` from the free-text operator_concern (#1311): it carries
 		// the SAME note text as the operator_concern arg below, so if it were
@@ -1106,14 +1287,15 @@ func buildFixupObligationSources(concerns []planreview.Concern, operatorConcern,
 		sources = append(sources, fixupobligation.Source{
 			Kind:      fixupobligation.SourceConcern,
 			Text:      c.Note,
+			Target:    targets.concern(i),
 			Untrusted: c.Provenance == planreview.ConcernProvenanceAcceptance,
 		})
 	}
 	// operator_concern and reason are operator-authored by construction, so they
 	// carry no untrusted marking.
 	sources = append(sources,
-		fixupobligation.Source{Kind: fixupobligation.SourceOperatorConcern, Text: operatorConcern},
-		fixupobligation.Source{Kind: fixupobligation.SourceReason, Text: reason},
+		fixupobligation.Source{Kind: fixupobligation.SourceOperatorConcern, Text: operatorConcern, Target: targets.OperatorConcern},
+		fixupobligation.Source{Kind: fixupobligation.SourceReason, Text: reason, Target: targets.Reason},
 	)
 	return sources
 }
@@ -1121,15 +1303,18 @@ func buildFixupObligationSources(concerns []planreview.Concern, operatorConcern,
 // recordFixupPRBodyUnsatisfiable derives the PR-body obligation set from the
 // pass's routed instructions (#2782), appends the advisory
 // fixup_pr_body_unsatisfiable audit entry when the set is non-empty, and
-// returns the set for the HTTP response. Returns nil when nothing named the PR
-// body — the common case, keeping the pre-#2782 response byte-identical.
+// returns the set for the HTTP response. Since E83.37 / #4022 an instruction
+// joins the set only when its router declared the pr_body target; prose that
+// merely mentions the PR body is an ordinary instruction. Returns nil when
+// nothing targeted the PR body — the common case, keeping the pre-#2782
+// response byte-identical.
 //
 // Best-effort and fail-open: a nil AuditRepo skips the append, an append error
 // WARN-logs, and neither ever unwinds the already-committed fix-up transition
 // or changes the HTTP status. The returned set is independent of the audit
 // write, so a fail-open append still returns the obligations for the warning.
-func (s *Server) recordFixupPRBodyUnsatisfiable(ctx context.Context, dec *run.FixupDecision, selected []planreview.Concern, operatorConcern, reason string) []fixupPRBodyObligation {
-	obligations := fixupobligation.Detect(buildFixupObligationSources(selected, operatorConcern, reason))
+func (s *Server) recordFixupPRBodyUnsatisfiable(ctx context.Context, dec *run.FixupDecision, selected []planreview.Concern, operatorConcern, reason string, targets fixupInstructionTargets) []fixupPRBodyObligation {
+	obligations := fixupobligation.Detect(buildFixupObligationSources(selected, operatorConcern, reason, targets))
 	var prBody []fixupPRBodyObligation
 	for _, ob := range obligations {
 		if !ob.PRBody {
@@ -1313,38 +1498,43 @@ func conventionsOverrideAttemptRefusal(ref string) string {
 // A conventions_override_attempt concern (E55.3 / #2244) is refused in ANY
 // state, after the routability check: it is not a code obligation
 // (conventionsOverrideAttemptRefusal).
-func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UUID, ids []uuid.UUID) ([]planreview.Concern, error) {
+func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UUID, ids []uuid.UUID) ([]planreview.Concern, []uuid.UUID, error) {
 	seen := make(map[uuid.UUID]struct{}, len(ids))
 	for _, id := range ids {
 		if _, dup := seen[id]; dup {
-			return nil, &concernSelectionError{msg: fmt.Sprintf("concern_id %s selected more than once", id)}
+			return nil, nil, &concernSelectionError{msg: fmt.Sprintf("concern_id %s selected more than once", id)}
 		}
 		seen[id] = struct{}{}
 	}
 	rows, err := s.cfg.ConcernRepo.GetByIDs(ctx, ids)
 	if err != nil {
 		if errors.Is(err, concern.ErrNotFound) {
-			return nil, &concernSelectionError{msg: fmt.Sprintf("unknown concern_id: %s", err.Error())}
+			return nil, nil, &concernSelectionError{msg: fmt.Sprintf("unknown concern_id: %s", err.Error())}
 		}
-		return nil, fmt.Errorf("get concerns by id: %w", err)
+		return nil, nil, fmt.Errorf("get concerns by id: %w", err)
 	}
 	out := make([]planreview.Concern, 0, len(rows))
+	// outIDs[i] is the id out[i] resolved from, so a caller can align
+	// per-concern data (the E83.37 / #4022 instruction targets) with the
+	// resolved order without relying on the repository's ordering contract.
+	outIDs := make([]uuid.UUID, 0, len(rows))
 	for _, c := range rows {
 		if c.StageKind != concern.StageKindImplement {
-			return nil, &concernSelectionError{msg: fmt.Sprintf(
+			return nil, nil, &concernSelectionError{msg: fmt.Sprintf(
 				"concern_id %s is a %s-stage concern; only implement-stage concerns can be routed into an implement fix-up", c.ID, c.StageKind)}
 		}
 		if c.RunID != runID || c.StageID != stageID {
-			return nil, &concernSelectionError{msg: fmt.Sprintf(
+			return nil, nil, &concernSelectionError{msg: fmt.Sprintf(
 				"concern_id %s belongs to a different run/stage than the fix-up target", c.ID)}
 		}
 		if !concernRoutable(c.State) {
-			return nil, &concernSelectionError{msg: fmt.Sprintf(
+			return nil, nil, &concernSelectionError{msg: fmt.Sprintf(
 				"concern_id %s is not routable (state %s); only raised/addressed_pending/reopened or superseded (a retry-discarded) concerns can be routed", c.ID, c.State)}
 		}
 		if planreview.IsConventionsOverrideAttempt(c.Category) {
-			return nil, &concernSelectionError{msg: conventionsOverrideAttemptRefusal(fmt.Sprintf("concern_id %s", c.ID))}
+			return nil, nil, &concernSelectionError{msg: conventionsOverrideAttemptRefusal(fmt.Sprintf("concern_id %s", c.ID))}
 		}
+		outIDs = append(outIDs, c.ID)
 		out = append(out, planreview.Concern{
 			Severity: planreview.ConcernSeverity(c.Severity),
 			Category: c.Category,
@@ -1367,7 +1557,7 @@ func (s *Server) resolveConcernsByID(ctx context.Context, runID, stageID uuid.UU
 			QuoteUnverified: c.QuoteUnverified,
 		})
 	}
-	return out, nil
+	return out, outIDs, nil
 }
 
 // resolveImplementConcerns gathers the stage's recorded implement-
@@ -1706,9 +1896,14 @@ func selectConcerns(all []planreview.Concern, indices []int) ([]planreview.Conce
 // the route-time fit (#4284) trimmed at least one concern's note body in the
 // fix-up prompt, and the payload records `concern_bodies_truncated: true` plus
 // `truncated_concern_ids` (a conservative superset — see
-// fixupTruncatedConcernIDs); both keys are omitted otherwise. Best-effort: the
-// transition is already committed, so a failure here logs but doesn't unwind.
-func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string, bodiesTruncated bool, truncatedConcernIDs []string) {
+// fixupTruncatedConcernIDs); both keys are omitted otherwise. targets is the
+// router-declared target of each routed instruction (E83.37 / #4022), recorded
+// as concern_targets (aligned with `concerns`) / operator_concern_target /
+// reason_target, each omitted when every target is code — the prompt-serve and
+// review-time re-derivation read them back, so routing, serve and review agree
+// on which obligation is unsatisfiable. Best-effort: the transition is already
+// committed, so a failure here logs but doesn't unwind.
+func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.FixupDecision, selected []planreview.Concern, concernIDs []uuid.UUID, indices []int, reason string, allowCreate []string, priorPasses, refundedPasses int, delegatedRule string, pinModel *ResolvedModel, operatorConcern string, operatorConcernID uuid.UUID, operatorEvidence string, bodiesTruncated bool, truncatedConcernIDs []string, targets fixupInstructionTargets) {
 	subject := id.Subject
 	if subject == "" {
 		subject = "anonymous"
@@ -1831,6 +2026,19 @@ func (s *Server) writeFixupAudit(ctx context.Context, id Identity, dec *run.Fixu
 		}
 		fields["concern_bodies_truncated"] = true
 		fields["truncated_concern_ids"] = truncatedConcernIDs
+	}
+	// E83.37 / #4022: the router-declared instruction targets, written only
+	// when some target is not code so every other payload stays byte-identical.
+	if pt := targets.persisted(); pt.Concerns != nil || pt.OperatorConcern != "" || pt.Reason != "" {
+		if pt.Concerns != nil {
+			fields["concern_targets"] = pt.Concerns
+		}
+		if pt.OperatorConcern != "" {
+			fields["operator_concern_target"] = pt.OperatorConcern
+		}
+		if pt.Reason != "" {
+			fields["reason_target"] = pt.Reason
+		}
 	}
 
 	payload, _ := json.Marshal(fields)

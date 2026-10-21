@@ -70,7 +70,12 @@ var versionFiles = []legInput{
 
 var realLegTable = legTable{
 	verify: map[string]legSpec{
-		"cmd_lint":                {inputs: []legInput{r("**/*.go"), g(".golangci.yml"), g("go.work"), g("**/go.mod")}},
+		// cmd_lint's host-toolchain precondition (#4245) runs
+		// scripts/check-gate-image --host against the Dockerfile pins.
+		"cmd_lint": {inputs: []legInput{
+			r("**/*.go"), g(".golangci.yml"), g("go.work"), g("**/go.mod"),
+			g("deploy/gate-image/Dockerfile"), g("scripts/check-gate-image"),
+		}},
 		"_verify_doc_line_budget": {inputs: []legInput{g("docs/ARCHITECTURE.md")}},
 		"_verify_schema_sync": {scripts: []string{"sync-schemas"}, inputs: []legInput{
 			g("docs/spec/**"),

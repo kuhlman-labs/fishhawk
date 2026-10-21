@@ -1928,23 +1928,21 @@ func TestTriageAcceptance_Class1_Error_FixupDispatched(t *testing.T) {
 	}
 }
 
-// TestTriageAcceptance_Class1_PRBodyInstruction_AppendsAdvisoryAudit is the
-// #2782 every-routing-path pin for acceptance triage: when a synthesized
-// acceptance concern's evidence names the PR body, routing it through
-// routeAcceptanceClass1 (NOT the HTTP handler) still writes the advisory
-// fixup_pr_body_unsatisfiable audit entry inside fixupStageAs. It guards the
-// documented every-path guarantee against a refactor that moves
-// recordFixupPRBodyUnsatisfiable onto the HTTP handler. The obligation is
-// UNTRUSTED (Provenance acceptance), so its payload carries untrusted:true.
+// TestTriageAcceptance_Class1_PRBodyProse_NoAdvisory is the E83.37 / #4022
+// done-means on the acceptance-triage routing path: a synthesized acceptance
+// concern whose evidence MENTIONS the PR body is routed through
+// routeAcceptanceClass1 (NOT the HTTP handler), which declares no instruction
+// target, so the concern is an ordinary code instruction — the fix-up is still
+// dispatched, and ZERO fixup_pr_body_unsatisfiable entries are appended. The
+// in-fixupStageAs placement guard the #2782 version of this test carried now
+// lives at the fixupActionParams level
+// (TestFixupStageAs_DeclaredPRBodyTarget_AppendsAdvisoryOnEveryPath), because a
+// non-HTTP caller can no longer produce a pr_body obligation from prose.
 //
-// Counterfactual: move the recordFixupPRBodyUnsatisfiable call out of
-// fixupStageAs and this goes RED — acceptance triage then appends zero
-// fixup_pr_body_unsatisfiable entries.
-func TestTriageAcceptance_Class1_PRBodyInstruction_AppendsAdvisoryAudit(t *testing.T) {
+// Counterfactual: re-derive PRBody from the prose (the deleted
+// NamesPRBodySurface disjunct) and this goes RED with one advisory entry.
+func TestTriageAcceptance_Class1_PRBodyProse_NoAdvisory(t *testing.T) {
 	s, _, _, au, _, runID, _, _, acceptanceStageID, priv := newAcceptanceTriageServer(t)
-	// The failed criterion's behavioral evidence names the PR body — the surface
-	// a fix-up pass cannot write — so the synthesized concern note carries a
-	// PR-body reporting obligation.
 	body := failedAcceptanceBytes(t, "error", []acceptanceCriterionResult{
 		{ID: "ac-create", Result: "failed", Observed: "record the counterfactual results in the PR body's ## Notes"},
 	})
@@ -1953,18 +1951,12 @@ func TestTriageAcceptance_Class1_PRBodyInstruction_AppendsAdvisoryAudit(t *testi
 	if w.Code != http.StatusCreated {
 		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
 	}
-
-	e := findAppendedByCategory(t, au, CategoryFixupPRBodyUnsatisfiable)
-	var pl fixupPRBodyUnsatisfiablePayload
-	if err := json.Unmarshal(e.Payload, &pl); err != nil {
-		t.Fatalf("unmarshal fixup_pr_body_unsatisfiable payload: %v", err)
+	// The fix-up still routed — the prose was delivered as an instruction.
+	if n := countAppendedByCategory(au, CategoryStageFixupTriggered); n != 1 {
+		t.Fatalf("stage_fixup_triggered entries = %d, want 1", n)
 	}
-	if pl.ObligationCount != 1 || len(pl.Obligations) != 1 {
-		t.Fatalf("payload = %+v, want exactly one obligation", pl)
-	}
-	ob := pl.Obligations[0]
-	if ob.ID != "ob-1" || ob.Source != "concern" || !ob.Untrusted {
-		t.Errorf("obligation = %+v, want ob-1/concern marked untrusted (acceptance-synthesized)", ob)
+	if n := countAppendedByCategory(au, CategoryFixupPRBodyUnsatisfiable); n != 0 {
+		t.Errorf("fixup_pr_body_unsatisfiable entries = %d, want 0 for a prose-only PR-body mention", n)
 	}
 }
 

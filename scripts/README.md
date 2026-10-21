@@ -40,6 +40,34 @@ pin, never a silent skip. The runner's committed-tree implement verify gate runs
 `scripts/test verify`, so gofmt/golangci-lint defects fail in-loop rather than
 red-lining the PR in CI after the agent is terminal (#1064).
 
+**Host-toolchain precondition (#4245).** Before any module is linted,
+`cmd_lint` runs `_require_lint_host_toolchain`, which calls
+`scripts/check-gate-image --root $ROOT --host`. That compares the HOST's tools
+with the `deploy/gate-image/Dockerfile` pins, read at run time: the first line
+of `golangci-lint version` must report exactly `GOLANGCI_LINT_VERSION` and be
+`built with` a Go of `GO_VERSION`'s MAJOR.MINOR (its gofmt/goimports
+formatters are the go/printer of the Go that built the binary, not of the `go`
+on PATH), and the standalone `gofmt` on PATH, when present, must report a Go
+of that MAJOR.MINOR through `go version <gofmt path>` (whose output is parsed,
+never its exit status, which is 0 even on a non-Go file). `lint` never runs a
+standalone gofmt, but that half refuses anyway, because an agent's own
+`gofmt -l` on a Homebrew go1.27 gofmt is what misled run 580c33c6. On any
+mismatch `lint` exits 1 with a line starting
+`scripts/test: host_toolchain_mismatch:` (a stable token) that calls it an
+environment problem, not a defect in the tree, and names the remedies:
+`scripts/test lint --in-gate-image` / `verify --in-gate-image`, or the pinned
+tools first on PATH (`export PATH="$(go env GOROOT)/bin:$PATH"` when
+`go version` reports the pinned Go; `go env -w GOTOOLCHAIN` switches `go`,
+never a standalone gofmt). `verify` refuses the same way, because `cmd_verify`
+calls `cmd_lint` unconditionally. A missing or non-executable
+`scripts/check-gate-image` refuses too (fail closed: this is a control, unlike
+the static pin report below). Inside the gate image the check passes, because
+the image carries the pinned tools. It is pinned by
+`scripts/test-check-gate-image`'s `h*` arms and by
+`runner/cmd/fishhawk-runner/linthosttoolchain_test.go`, which drives the real
+`scripts/test lint` with fake tools on PATH. A direct host `gofmt -l` outside
+`scripts/test` is NOT guarded by this.
+
 ### Leg registration: the base-delta global surface (ADR-096 D3 / [#4292](https://github.com/kuhlman-labs/fishhawk/issues/4292))
 
 `backend/internal/basedelta/verifylegs_test.go` parses this script's `cmd_verify` and `_verify_gate_harnesses` bodies and `scripts/sync-schemas`' destinations. Every code line there must be a registered leg call or an exact allow-listed plumbing line, each `_verify_*` leg's `$ROOT/scripts/<x>` calls must match its row, and every input a leg reads as data must match `basedelta.GlobalSurface`. Adding a leg, a harness, an inline script call, a plumbing line or a sync mirror therefore fails verify until the table (and, for a new input, `GlobalSurface` plus its README row) is updated. Contract: `backend/internal/basedelta/README.md` § "Adding a verify leg".
@@ -782,9 +810,10 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
 - **`_verify_gate_image_pins`** runs `scripts/check-gate-image --root $ROOT`
   (STATIC mode: files only, no Docker, no network) right after
   `_verify_adr_records`. It skips with a printed reason when the script is
-  missing or not executable, which keeps the fixture ROOTs of
-  `test-patch-coverage` and `test-verify-scope` from running it against a
-  fixture. A violation exits 1 and fails verify, so bumping the CI
+  missing or not executable, which keeps the fixture ROOT of
+  `test-patch-coverage` from running it against a fixture
+  (`test-verify-scope`'s fixture ships a recording stub instead, because the
+  lint leg's host check below refuses without one). A violation exits 1 and fails verify, so bumping the CI
   golangci-lint pin (or the go directives) without the Dockerfile ARG fails
   in-loop, and so does a `HELM_VERSION` below v4 (test-helm-render r9's
   `helm install --dry-run` needs a cluster on Helm v3; the image has none).
@@ -816,6 +845,10 @@ in `deploy/gate-image/README.md`; this section covers the `scripts/test` side.
   the container's. Network on, mount read-write: CI parity, not isolation.
 - **`lint` now parses its arguments**: `--in-gate-image` is the one option and
   anything else exits 1 (it used to be ignored silently).
+- **`scripts/check-gate-image --host`** (#4245) is the lint leg's
+  host-toolchain precondition (§ "Lint" above): it compares the host's
+  golangci-lint version and build Go, and its standalone gofmt's Go, with the
+  Dockerfile pins, never touching docker or the network.
 
 ### Testing
 
@@ -1466,17 +1499,18 @@ under critical memory pressure (E85.11 / #4330).
 They also pass `--enable-scheduler --scheduler-repos kuhlman-labs/fishhawk
 --scheduler-runner-kind local`, which turn on the workflow scheduler
 (E79.1 / #3725). It starts one run per due cron window for each workflow that
-declares a `schedule` in `.fishhawk/workflows.yaml`. Today that is only
+declares a `schedule` in `.fishhawk/workflows.yaml`. Today that is
 `upkeep_scan`, the weekly upkeep and dependency-advisory scan (E80.2 / #3750),
-on Mondays at 09:00 UTC.
+on Mondays at 09:00 UTC, and `backlog_grooming` on the grooming anchor #3112,
+on Tuesdays at 09:00 UTC.
 
 - **Default branch only.** The scheduler reads the spec at the default branch
   through the GitHub App, so a schedule on a feature branch never fires.
 - **Parks, never dispatches.** With runner kind `local`, a scheduled run parks
   at `awaiting_host_dispatch` until a host dispatches it. A firing therefore
   holds no host-dispatch slot and spends nothing until someone dispatches it.
-  An `upkeep_scan` run then stops at its approval gate, and nothing is filed
-  until a human approves it.
+  An `upkeep_scan` or `backlog_grooming` run then stops at its approval gate,
+  and nothing is filed or mutated until a human approves it.
 - **First tick.** The first tick after the scheduler is enabled starts one run
   for the most recent window. Missed windows are never backfilled.
 - **Repositories.** `FISHHAWKD_SCHEDULER_REPOS` in `.env` replaces the default
@@ -1485,6 +1519,25 @@ on Mondays at 09:00 UTC.
 - **Inspect.** `GET /v0/schedules?repo=kuhlman-labs/fishhawk` reports each
   schedule's window, next due time and last outcome.
 - **Pins.** `scripts/test-dev` pins the three flags and pins that they reach
+  the `serve` argv.
+
+They also pass `--enable-merge-outcome-observer`, which turns on the
+merge-outcome CI observer (E82.2 / #3779, ADR-085). It fixes each merged run's
+merge-commit CI conclusion once, at `merged_at` + 6h, as one
+`run_merge_ci_observed` audit row (`green`, `red` or `missing`).
+
+- **Reads only.** Each 10-minute tick reads four audit categories from the
+  database, then makes at most 20 forge evaluations: one `GetPullRequest` and
+  1-5 check-run pages per mature merged run, through the GitHub App. It writes
+  nothing to the forge, and the row is an internal fact record, not an
+  issue-comment surface.
+- **Backfill.** The first enabled tick starts backfilling up to 14 days of
+  merged runs, 20 per tick.
+- **Needs the GitHub App.** Without an app id fishhawkd logs a warning and
+  starts no ticker.
+- **Opting out.** `FISHHAWK_DEV_MERGE_OUTCOME_OBSERVER=0` drops the flag.
+- **Contract.** `backend/internal/mergeoutcome/README.md`.
+- **Pins.** `scripts/test-dev` pins the flag, the opt-out and that it reaches
   the `serve` argv.
 
 ### `post-merge` and `reload`

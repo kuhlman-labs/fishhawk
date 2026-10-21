@@ -37,15 +37,24 @@ type PRBodyObligation struct {
 // exactly as before; pr_body_obligations is the optional sibling (omitempty),
 // nil for the common pass and on an older backend that omits it.
 func (c *apiClient) fixupStageWithObligations(ctx context.Context, id uuid.UUID, in FixupStageInput) (*Stage, []PRBodyObligation, error) {
-	body, err := json.Marshal(fixupRequest{
-		ConcernIDs:          in.ConcernIDs,
-		Concerns:            in.Concerns,
-		Reason:              in.Reason,
-		AllowCreate:         in.AllowCreate,
-		ForceAdditionalPass: in.ForceAdditionalPass,
-		ImplementModel:      in.ImplementModel,
-		OperatorConcern:     in.OperatorConcern,
-		OperatorEvidence:    in.OperatorEvidence,
+	// instruction_targets (E83.37 / #4022) rides beside the shared fixupRequest
+	// fields — embedded so they promote to the top level of the body — and is
+	// passed through verbatim: the backend owns its validation.
+	body, err := json.Marshal(struct {
+		fixupRequest
+		InstructionTargets map[string]string `json:"instruction_targets,omitempty"`
+	}{
+		fixupRequest: fixupRequest{
+			ConcernIDs:          in.ConcernIDs,
+			Concerns:            in.Concerns,
+			Reason:              in.Reason,
+			AllowCreate:         in.AllowCreate,
+			ForceAdditionalPass: in.ForceAdditionalPass,
+			ImplementModel:      in.ImplementModel,
+			OperatorConcern:     in.OperatorConcern,
+			OperatorEvidence:    in.OperatorEvidence,
+		},
+		InstructionTargets: in.InstructionTargets,
 	})
 	if err != nil {
 		return nil, nil, fmt.Errorf("marshal fixup: %w", err)
@@ -90,6 +99,9 @@ type FixupStageInput struct {
 	// OperatorEvidence declares the operator executed a reproduction of the
 	// routed concerns (E48.103 / #2551): an authority marker, not prose.
 	OperatorEvidence string `json:"operator_evidence,omitempty" jsonschema:"optional declaration that YOU, the operator, EXECUTED a reproduction of the concern(s) this pass routes back. Changes AUTHORITY, not delivery — put the reproduction prose in reason/operator_concern; this field records that the finding was verified by execution. Every concern routed by this pass is then EXEMPT from reviewer-confirmation auto-resolve: a later reviewer 'confirmed' verdict is vetoed (operator_evidence_routed) and the concern stays open until you waive or defer it, or a fix-up genuinely resolves it. PERMANENT for those concerns — use it when a reviewer has already retired a defect you can still reproduce. Not a selection input (it does not by itself satisfy the concern_ids requirement). Whitespace-only or over-length (>4000 bytes) returns validation_failed (400)."`
+	// InstructionTargets declares the surface each routed instruction asks the
+	// pass to change (E83.37 / #4022), passed through to the backend verbatim.
+	InstructionTargets map[string]string `json:"instruction_targets,omitempty" jsonschema:"optional per-instruction target: keys are a routed concern id from concern_ids, 'operator_concern', or 'reason'; values are 'code', 'pr_body', or 'docs'. An instruction with no key is 'code'. Declare 'pr_body' for an instruction that asks the agent to change the PULL-REQUEST BODY — a surface a fix-up pass cannot write — and the result carries a warning for it; the instruction's wording is never classified for that, so a code instruction that merely mentions the PR body raises nothing. Index-routed (deprecated positional) concerns cannot be targeted. A bad value, or a key naming an instruction this call does not route, returns validation_failed (400)."`
 }
 
 // FixupStageOutput surfaces the re-opened Stage row. A successful fix-up
@@ -102,15 +114,16 @@ type FixupStageInput struct {
 // fixup_budget_exhausted or fixup_ceiling_reached).
 type FixupStageOutput struct {
 	Stage Stage `json:"stage"`
-	// Warnings carries one advisory line per routed instruction that named the
-	// PULL-REQUEST BODY — a surface a fix-up pass has NO mechanism to write
+	// Warnings carries one advisory line per routed instruction declared with
+	// the pr_body target (instruction_targets, E83.37 / #4022) — the
+	// PULL-REQUEST BODY, a surface a fix-up pass has NO mechanism to write
 	// (#2782). It is rendered FROM the server-minted pr_body_obligations set on
 	// the fix-up response (never re-derived locally), so each line names the
 	// arrival channel and the same obligation id the reviewer will see, and it
 	// is ADVISORY: the fix-up still proceeded and returned its Stage. Present
-	// (omitempty) only when a routed instruction named the PR body, so an
+	// (omitempty) only when a routed instruction targeted the PR body, so an
 	// ordinary pass returns a byte-identical output.
-	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings emitted when a routed instruction named the PR body — a surface a fix-up pass cannot write. Each line names the arrival channel and obligation id and points at the surfaces that DO work. Present only when such an instruction was routed; the fix-up still proceeds regardless."`
+	Warnings []string `json:"warnings,omitempty" jsonschema:"advisory warnings emitted when a routed instruction was declared with the pr_body target (instruction_targets) — the PR body is a surface a fix-up pass cannot write. Each line names the arrival channel and obligation id and points at the surfaces that DO work. Present only when such an instruction was routed; the fix-up still proceeds regardless."`
 }
 
 // registerFixupStage wires the fishhawk_fixup_stage tool (E22.X / #762).
@@ -231,6 +244,14 @@ Inputs:
     credits — absolute cap 6 triggered passes), so check the
     fixup_budget_exhausted details' crashed_without_push and
     remaining_ceiling_slots before spending the override.
+  - instruction_targets : optional map declaring the surface each routed
+    instruction asks the pass to change (E83.37 / #4022). Keys: a routed
+    concern id from concern_ids, "operator_concern", or "reason". Values:
+    "code" (the default for any instruction with no key), "pr_body", or
+    "docs". Declare "pr_body" for an instruction that asks the agent to
+    change the pull-request body (see below). Index-routed (deprecated
+    positional) concerns cannot be targeted. A bad value, or a key naming an
+    instruction this call does not route, returns validation_failed.
   - implement_model : optional operator/driver model override for THIS
     fix-up pass (#1164). Default (empty) inherits the run's already-resolved
     implement model — byte-identical to today. A non-empty value is
@@ -245,10 +266,13 @@ pushes commits onto the existing branch. So an instruction routed here that asks
 the agent to RECORD something in the PR body (e.g. "put the counterfactual table
 in the ## Notes") cannot take effect on any pass — route such an attestation to
 a surface the pass CAN write (the fix-up self-report sidecar, a run log, or a
-file inside the declared scope), or make the change in a fresh run. When a routed
-instruction (in reason, operator_concern, OR a routed concern note) names the PR
-body, the tool result carries a "warnings" entry naming the arrival channel and
-the obligation id; "warnings" is absent otherwise.
+file inside the declared scope), or make the change in a fresh run. When you
+declare a routed instruction (reason, operator_concern, OR a routed concern) with
+the "pr_body" target in instruction_targets, the tool result carries a
+"warnings" entry naming the arrival channel and the obligation id, and the
+implement review reports it as unsatisfiable; "warnings" is absent otherwise.
+The instruction's wording is never classified for this: an undeclared
+instruction that merely mentions the PR body is an ordinary code instruction.
 
 Bounded + operator-gated: the NORMAL bound defaults to ONE pass per stage.
 The budget is the number of remaining passes (max − fix-ups already
@@ -345,15 +369,16 @@ func (r *runResolver) fixupStage(ctx context.Context, _ *mcp.CallToolRequest, in
 }
 
 // prBodyInstructionWarnings renders one advisory warning per routed instruction
-// that named the PR body (#2782), FROM the server-minted obligation set — never
+// declared with the pr_body target (#2782, E83.37 / #4022), FROM the
+// server-minted obligation set — never
 // re-deriving anything locally, so the arrival channel and id each line reports
 // are exactly what the backend recorded and what the reviewer will later see.
 // It deliberately does NOT render the obligation's TextExcerpt: the excerpt can
 // be attacker-influenceable (an acceptance-derived note), and the reviewer-
 // facing gate evidence is the one site that prints an excerpt, under quarantine
 // — keeping this operator-facing warning free of any injection surface. Returns
-// nil for the common pass that named no PR-body surface, so the output stays
-// byte-identical.
+// nil for the common pass that targeted no instruction at the PR body, so the
+// output stays byte-identical.
 func prBodyInstructionWarnings(obligations []PRBodyObligation) []string {
 	if len(obligations) == 0 {
 		return nil
@@ -361,7 +386,7 @@ func prBodyInstructionWarnings(obligations []PRBodyObligation) []string {
 	warnings := make([]string, 0, len(obligations))
 	for _, ob := range obligations {
 		warnings = append(warnings, fmt.Sprintf(
-			"routed instruction %s (arrived via %s) names the PULL-REQUEST BODY, which a fix-up pass CANNOT update: "+
+			"routed instruction %s (arrived via %s) is targeted at the PULL-REQUEST BODY (instruction_targets: pr_body), which a fix-up pass CANNOT update: "+
 				"the PR title and body are composed once at PR-open by the first implement attempt, and a fix-up pass "+
 				"only pushes commits — it has no mechanism to re-compose or PATCH them, so this instruction cannot take "+
 				"effect. Record the attestation on a surface this pass CAN write — the fix-up self-report sidecar (its "+

@@ -13437,14 +13437,33 @@ func makeFixupEntryWithReporting(runID, stageID uuid.UUID, concerns []planreview
 // makeFixupEntryWithReportingSeq is makeFixupEntryWithReporting with an explicit
 // audit Sequence — the identity the #2737 anchor pins a served prompt to.
 func makeFixupEntryWithReportingSeq(runID, stageID uuid.UUID, seq int64, concerns []planreview.Concern, operatorConcern, reason string) *audit.Entry {
-	payload, _ := json.Marshal(map[string]any{
+	return makeFixupEntryWithTargetsSeq(runID, stageID, seq, concerns, operatorConcern, reason, fixupInstructionTargets{})
+}
+
+// makeFixupEntryWithTargetsSeq is makeFixupEntryWithReportingSeq plus the
+// router-declared instruction targets (E83.37 / #4022), written under the SAME
+// keys writeFixupAudit uses (via fixupInstructionTargets.persisted), so an
+// all-code targets value writes no key at all.
+func makeFixupEntryWithTargetsSeq(runID, stageID uuid.UUID, seq int64, concerns []planreview.Concern, operatorConcern, reason string, targets fixupInstructionTargets) *audit.Entry {
+	fields := map[string]any{
 		"stage_id":         stageID.String(),
 		"selected_indices": []int{0},
 		"concerns":         concerns,
 		"operator_concern": operatorConcern,
 		"reason":           reason,
 		"pass_ordinal":     1,
-	})
+	}
+	pt := targets.persisted()
+	if pt.Concerns != nil {
+		fields["concern_targets"] = pt.Concerns
+	}
+	if pt.OperatorConcern != "" {
+		fields["operator_concern_target"] = pt.OperatorConcern
+	}
+	if pt.Reason != "" {
+		fields["reason_target"] = pt.Reason
+	}
+	payload, _ := json.Marshal(fields)
 	rid := runID
 	sid := stageID
 	return &audit.Entry{ID: uuid.New(), Sequence: seq, Category: CategoryStageFixupTriggered, RunID: &rid, StageID: &sid, Payload: payload}
@@ -13514,17 +13533,19 @@ func TestResolveFixupReportObligations_Channels(t *testing.T) {
 
 // TestResolveFixupReportObligations_PRBodyFlagFlowsToPrompt pins the #2782
 // PR-body flag through the server-side resolver and its prompt mapping: a
-// PR-body concern note resolves with PRBody true and carries that flag into the
-// prompt mirror, while a run-log note resolves with PRBody false.
+// concern recorded with the pr_body target (E83.37 / #4022) resolves with
+// PRBody true and carries that flag into the prompt mirror, while the SAME
+// PR-body prose recorded with no target, and a run-log note, resolve with
+// PRBody false — the recorded target, never the prose, decides it.
 func TestResolveFixupReportObligations_PRBodyFlagFlowsToPrompt(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 
-	resolveOne := func(t *testing.T, note string) fixupobligation.Obligation {
+	resolveOne := func(t *testing.T, note string, target fixupobligation.Target) fixupobligation.Obligation {
 		t.Helper()
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &feedbackAuditRepo{
-			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithReporting(runID, stageID,
+			byRunID: map[uuid.UUID][]*audit.Entry{runID: {makeFixupEntryWithTargetsSeq(runID, stageID, 1,
 				[]planreview.Concern{{Severity: planreview.SeverityMedium, Category: "process", Note: note}},
-				"", "route it")}},
+				"", "route it", fixupInstructionTargets{Concerns: []fixupobligation.Target{target}})}},
 		}})
 		got, _ := s.resolveFixupReportObligations(context.Background(), runID, stageID, 0)
 		if len(got) != 1 {
@@ -13533,11 +13554,15 @@ func TestResolveFixupReportObligations_PRBodyFlagFlowsToPrompt(t *testing.T) {
 		return got[0]
 	}
 
-	prBody := resolveOne(t, "Record the per-deletion counterfactual results in the PR body's ## Notes.")
+	const prBodyProse = "Record the per-deletion counterfactual results in the PR body's ## Notes."
+	prBody := resolveOne(t, prBodyProse, fixupobligation.TargetPRBody)
 	if !prBody.PRBody {
-		t.Errorf("PR-body note resolved with PRBody false: %+v", prBody)
+		t.Errorf("pr_body-targeted note resolved with PRBody false: %+v", prBody)
 	}
-	runLog := resolveOne(t, "Report the observed RED output in the run log.")
+	if prose := resolveOne(t, prBodyProse, ""); prose.PRBody {
+		t.Errorf("untargeted PR-body prose resolved with PRBody true: %+v", prose)
+	}
+	runLog := resolveOne(t, "Report the observed RED output in the run log.", "")
 	if runLog.PRBody {
 		t.Errorf("run-log note resolved with PRBody true: %+v", runLog)
 	}

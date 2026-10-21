@@ -155,6 +155,10 @@ type workItemResponse struct {
 // audit-write surface). An unimplemented/unregistered provider fails
 // closed with a typed error naming the missing provider — never a nil
 // dispatch.
+//
+// A non-run-bound bearer must hold write:runs (403 insufficient_scope
+// otherwise, #4481), checked before the body is read; a run-bound agent
+// token is admitted by its own-run entitlement instead.
 func (s *Server) handleFileWorkItem(w http.ResponseWriter, r *http.Request) {
 	rq, ok := s.resolveWorkItemRequest(w, r, false)
 	if !ok {
@@ -213,6 +217,9 @@ type resolvedWorkItem struct {
 // same order. It writes the error envelope itself and returns ok=false on any
 // refusal.
 //
+// preview=false adds one refusal right after the anonymous check: a
+// non-run-bound bearer without write:runs is 403 insufficient_scope (#4481).
+//
 // preview=true adds three refusals, in this order: (a) a run-bound
 // (mcp:run:<uuid>) identity is 403 preview_operator_only right after the
 // anonymous check, before the body is read; (b) a non-empty run_id is 400
@@ -229,6 +236,19 @@ func (s *Server) resolveWorkItemRequest(w http.ResponseWriter, r *http.Request, 
 		s.writeError(w, r, http.StatusUnauthorized, "authentication_required",
 			verb+" a work item requires an authenticated caller", nil)
 		return nil, false
+	}
+	// FILING scope (#4481): a non-run-bound bearer files with the deployment's
+	// forge credentials, so it must hold write:runs. Checked BEFORE the body is
+	// read, so a refused caller costs no body read, no conventions load and no
+	// forge round-trip. A run-bound (mcp:run:<uuid>) token is exempt: it is
+	// held to its own run below (403 run_not_entitled on a foreign run_id, 403
+	// run_scoped_filing_required on the run-absent arm, ADR-064). A cookie
+	// session (no TokenID) passes requireWriteScope as on every write route.
+	// The preview writes nothing and stays authenticated-only.
+	if !preview {
+		if _, runBound := runBoundTokenRunID(id); !runBound && !s.requireWriteScope(w, r, "write:runs") {
+			return nil, false
+		}
 	}
 	// PREVIEW (a): operator-only, refused BEFORE the body is read, so a
 	// run-bound agent token reaches no tracker read at all. A preview reads the
@@ -436,7 +456,8 @@ func (s *Server) resolveWorkItemRequest(w http.ResponseWriter, r *http.Request, 
 	// legitimate run-scoped filing whose run carries no GitHub installation
 	// (every gitlab run) is unaffected: it set activeRun by supplying a
 	// repo-consistency-checked run_id. Non-run-bound operator/session callers
-	// proceed (operators are trusted in v0). Reject before any
+	// proceed (a bearer already held write:runs at the top of the prelude,
+	// #4481). Reject before any
 	// GetRepoInstallation call or provider dispatch.
 	if activeRun == nil {
 		if _, runBound := runBoundTokenRunID(id); runBound {
