@@ -507,6 +507,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-103"
+      ],
       "applies_to": []
     },
     {
@@ -570,6 +573,9 @@
       "status": "unknown",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-105"
+      ],
       "applies_to": []
     },
     {
@@ -612,6 +618,9 @@
         "ADR-058"
       ],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-105"
+      ],
       "applies_to": []
     },
     {
@@ -1006,6 +1015,18 @@
       "applies_to": []
     },
     {
+      "id": "ADR-103",
+      "title": "Adversarial security probe: a scheduled acceptance-stage variant drives a disposable target under ADR-050 containment, emits a runner-replayed security_probe artifact, and files findings through a captain gate on a confidential channel (amends ADR-050)",
+      "path": "docs/adr/103-adversarial-security-probe.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-050"
+      ],
+      "applies_to": []
+    },
+    {
       "id": "ADR-104",
       "title": "Host dispatcher: a host-side, dispatch-only process spawns the parked local stages of auto-started campaign runs",
       "path": "docs/adr/104-host-dispatcher.md",
@@ -1015,6 +1036,19 @@
       "amends": [
         "ADR-022",
         "ADR-024"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-105",
+      "title": "Repository identity keyed on the forge's immutable repository id; names resolve through a time-bounded history; an owner change re-establishes trust (amends ADR-057, ADR-061)",
+      "path": "docs/adr/105-repository-identity-forge-id.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-057",
+        "ADR-061"
       ],
       "applies_to": []
     },

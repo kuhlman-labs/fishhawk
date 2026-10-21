@@ -286,10 +286,18 @@ touched):
 
 Amendments recorded under the upkeep rule since:
 
+- ADR-103: `amends: [ADR-050]` ("Adopt **Option D**, as a new ADR that amends
+  ADR-050"; "It supersedes nothing. It amends ADR-050 D4 (a new Rule-of-Two
+  row) and tightens D1's allow-list for this variant"); ADR-050 `amended_by:
+  [ADR-103]`. ADR-050 keeps its `accepted` status.
 - ADR-104: `amends: [ADR-022, ADR-024]` ("**Amends:** ADR-024 (Q4, Q5) and
   the ADR-022 addendum (a third identity: host dispatcher)"); ADR-022 and
   ADR-024 each carry `amended_by: [ADR-104]`. ADR-022 keeps its `unknown`
   status: an amendment does not change the amended record's status.
+- ADR-105: `amends: [ADR-057, ADR-061]` ("Amends ADR-057 (the repo-ACL key)
+  and ADR-061 (workspace ↔ installation, the two-sided adopt)"); ADR-057 and
+  ADR-061 each carry `amended_by: [ADR-105]` and keep their `unknown` status;
+  ADR-061 keeps `supersedes: [ADR-058]`. ADR-105 states no supersession.
 - ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
   it"); ADR-025 `amended_by: [ADR-107]`.
 - ADR-109: `amends: [ADR-093]` ("It amends ADR-093"; "ADR-093 D1 says an
@@ -448,7 +456,9 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-099](099-crew-role-naming.md) | Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles | `accepted` | [#4331](https://github.com/kuhlman-labs/fishhawk/issues/4331) |
 | [ADR-100](100-adaptive-bounded-concurrency.md) | Adaptive, bounded concurrency for host-dispatched stages: a product-owned headroom controller beside the integer limit, operator override, staged shadow→canary→enforce (amends ADR-087 limit rule and ADR-094 D4/Q1) | `accepted` | [#4403](https://github.com/kuhlman-labs/fishhawk/issues/4403) |
 | [ADR-101](101-charter-authorization-mode.md) | Charter authorization mode: lease-based, bounded autonomous operation by a product-spawned operator under a deterministic engine, intersected with delegation; captain seat stays human (amends ADR-040/085/089/097) | `accepted` | [#4412](https://github.com/kuhlman-labs/fishhawk/issues/4412) |
+| [ADR-103](103-adversarial-security-probe.md) | Adversarial security probe: a scheduled acceptance-stage variant drives a disposable target under ADR-050 containment, emits a runner-replayed security_probe artifact, and files findings through a captain gate on a confidential channel (amends ADR-050) | `accepted` | [#4518](https://github.com/kuhlman-labs/fishhawk/issues/4518) |
 | [ADR-104](104-host-dispatcher.md) | Host dispatcher: a host-side, dispatch-only process spawns the parked local stages of auto-started campaign runs | `accepted` | [#4524](https://github.com/kuhlman-labs/fishhawk/issues/4524) |
+| [ADR-105](105-repository-identity-forge-id.md) | Repository identity keyed on the forge's immutable repository id; names resolve through a time-bounded history; an owner change re-establishes trust (amends ADR-057, ADR-061) | `accepted` | [#4550](https://github.com/kuhlman-labs/fishhawk/issues/4550) |
 | [ADR-106](106-run-bound-subject-filtered-audit-read.md) | Run-bound agent tokens get a subject-filtered audit read: how cross-run audit categories are withheld | `accepted` | [#4575](https://github.com/kuhlman-labs/fishhawk/issues/4575) |
 | [ADR-107](107-split-stage-timeout-agent-and-gate-budgets.md) | Amend ADR-025: split the stage timeout into an agent budget and a project-derived verify-gate budget | `accepted` | [#4581](https://github.com/kuhlman-labs/fishhawk/issues/4581) |
 | [ADR-108](108-shared-postgres-lock-holder-budget.md) | Shared Postgres lock-holder budget: one pool-wide pglock budget with reserved headroom and enforced no-nesting for every connection-holding advisory-lock helper | `accepted` | [#4594](https://github.com/kuhlman-labs/fishhawk/issues/4594) |
