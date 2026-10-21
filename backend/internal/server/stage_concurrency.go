@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -25,7 +26,9 @@ import (
 // that cannot get one is QUEUED (409 concurrency_slot_queued, stage untouched
 // at awaiting_host_dispatch). The stage reads project the slot state as the
 // `concurrency` block. An operator can promote a queued waiter to the front
-// of its group (stage_concurrency_promote.go, #4191). The slot store's
+// of its group (stage_concurrency_promote.go, #4191), and the marker
+// auto-promotes an expedited campaign hotfix's implement waiter through the
+// same core (campaign_dispatch_hold.go, #4234). The slot store's
 // contract (atomicity, FIFO except a promoted waiter, derived holders,
 // tenancy) is backend/internal/concurrency/README.md.
 
@@ -38,7 +41,9 @@ const (
 	// CategoryStageConcurrencyAdmitted is written on every grouped admission.
 	CategoryStageConcurrencyAdmitted = "stage_concurrency_admitted"
 	// CategoryStageConcurrencyPromoted is written when an operator promotes a
-	// queued waiter (#4191, stage_concurrency_promote.go). Unlike the two
+	// queued waiter (#4191, stage_concurrency_promote.go), or when the marker
+	// auto-promotes an expedited campaign hotfix's implement waiter under the
+	// system actor (#4234, campaign_dispatch_hold.go). Unlike the two
 	// above it is NOT best-effort: it is appended inside the promotion
 	// transaction, so a failed append rolls the promotion back.
 	CategoryStageConcurrencyPromoted = "stage_concurrency_promoted"
@@ -436,7 +441,13 @@ func (s *Server) emitStageConcurrency(ctx context.Context, stage *run.Stage, cat
 // pending|awaiting_host_dispatch arm. done=true means the response was
 // written (queued 409); otherwise updated/block carry an admission, or err
 // carries the store error for the caller's existing drift reclassification.
-func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, group string, limit int, host, nonce string) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
+//
+// expedited is the campaign item guardCampaignDispatchHold resolved the stage
+// to when that item is expedited (#4234), else nil. A QUEUED stage of an
+// expedited item is auto-promoted to the head of its group
+// (autoPromoteExpeditedWaiter, fail-open), and the 409 reports the
+// post-promote position.
+func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage *run.Stage, group string, limit int, host, nonce string, expedited *campaign.Item) (updated *run.Stage, block *hostDispatchConcurrency, done bool, err error) {
 	adm, err := s.cfg.Concurrency.Admit(r.Context(), concurrency.Request{
 		StageID:        stage.ID,
 		RunID:          stage.RunID,
@@ -452,6 +463,9 @@ func (s *Server) admitGroupedStage(w http.ResponseWriter, r *http.Request, stage
 	if !adm.Admitted {
 		if adm.NewlyQueued {
 			s.emitStageConcurrencyQueued(r.Context(), stage, group, limit, host, adm)
+		}
+		if expedited != nil {
+			adm = s.autoPromoteExpeditedWaiter(r.Context(), stage, expedited, adm)
 		}
 		s.writeConcurrencySlotQueued(w, r, stage.ID, group, limit, adm)
 		return nil, nil, true, nil
