@@ -117,3 +117,13 @@ func (BaseFake) SettleCampaignItemForClosedIssue(_ context.Context, _ uuid.UUID,
 func (BaseFake) AppendCampaignItems(_ context.Context, _ AppendCampaignItemsParams) (*AppendOutcome, error) {
 	return nil, ErrNotFound
 }
+
+// GetDispatchHold returns nil, nil (no hold).
+func (BaseFake) GetDispatchHold(_ context.Context, _ uuid.UUID) (*DispatchHold, error) {
+	return nil, nil
+}
+
+// ReleaseDispatchHold returns nil, nil (nothing to release).
+func (BaseFake) ReleaseDispatchHold(_ context.Context, _ ReleaseDispatchHoldParams) (*DispatchHold, error) {
+	return nil, nil
+}
