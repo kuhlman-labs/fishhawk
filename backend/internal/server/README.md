@@ -3012,6 +3012,120 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
   of line; `medianLineTurnSeconds`. `runs_get_test.go` /
   `gateview_test.go` pin `merge_intent` on the run read and the gate view.
 
+## Merge overlap guard (`merge_overlap_guard.go`, E83.61 / [#4119](https://github.com/kuhlman-labs/fishhawk/issues/4119))
+
+`POST /v0/runs/{run_id}/merge` refuses while ANOTHER live run's implement
+stage is writing files this pull request changes: merging moves the base
+under that agent and lands its run in the category-B dead-end class. Unlike
+the advisory #4118 surfaces it FAILS CLOSED.
+
+- **Placement (`handleMergeRun`).** AFTER the #3109 conflict guard (a
+  conflicting PR keeps its own, more specific refusal) and BEFORE the ADR-090
+  merge-candidate gate, so the ADR-093 enqueue arm (#4295) can never enqueue
+  an overlap-blocked run: an overlap-blocked, otherwise queue-eligible run is
+  refused, not enqueued. Every refusal records nothing: no verdict, no
+  override row, no merge intent, no dispatch.
+- **Candidates.** `overlapCandidates` — the #4118 enumeration (`ListRuns` per
+  live state, same repo and tenant, lineage and one-hop recovery exclusions).
+  A `ListRuns` error is 502 `run_list`; a page at `scopeOverlapListLimit`
+  (truncated listing) is 409 `run_list_truncated`.
+- **Stage-state filter.** A candidate is LIVE when a stage of type
+  `implement` is `dispatched` or `running` (`overlapBlockingStageState`).
+  Fix-up, conflict-resolution and verify-only merge-candidate passes re-open
+  that same implement row, so they block too (a verify-only pass writes no
+  code; it is conservative, and it settles on its own). `pending`,
+  `awaiting_host_dispatch`, `awaiting_approval`, `awaiting_scope_decision`
+  and every terminal state do not block — a planned or parked run is not
+  writing files. A stage-list error is 502 `stage_read`. A candidate with no
+  implement stage (or no stages at all) is simply not live. A stranded
+  `running` implement (runner died, not reaped) blocks until
+  `fishhawk_reap_stage` or an override; the refusal names its stage id.
+- **No live candidate → admit with ZERO forge reads.** Only past that point
+  does the guard read the forge, so a quiet repo pays nothing and fixtures
+  without a compare stub keep their outcome.
+- **Changed paths.** GitHub anchors exactly like `mergeCandidateGate`
+  (`cfg.GitHub`, a non-zero installation, a parseable repo, a PR number); any
+  unresolved anchor is 409 `changed_paths_unavailable` — GitLab runs land
+  here until a GitLab changed-path read exists. `GetPullRequest` error or an
+  empty head/base is 502 `forge_read`; a PR the forge reports MERGED admits
+  (the #3622 `already_merged` resume still answers 200). Then
+  `ComparePatch(base_ref, head)` — three-dot, the PR's own diff (a compare
+  error is 502 `forge_read`). The changed set is every file `Path` plus every
+  non-empty `PreviousPath` (a rename's SOURCE counts). It is INCOMPLETE when
+  `forge.ComparePatchResult.Truncated` is set (`changed_files_capped`) or a
+  `renamed` file carries an EMPTY `PreviousPath` — "source unknown, not no
+  source" per `githubclient/README.md` (`rename_source_unknown`).
+  **`Truncated` is read deliberately instead of a file count (approval
+  condition C6):** it covers BOTH the 300-file compare cap and an omitted
+  oversized patch body. The second over-refuses (the file LIST is complete
+  when only a patch body was dropped); that is accepted as fail-closed with
+  the override as the route, and keeps the cap value out of this package. Do
+  not "simplify" this to `len(Files) >= 300` without exporting the cap.
+- **Decision.** Each live candidate's effective scope via
+  `resolveOverlapScope`: unresolved → undetermined; a non-empty
+  intersection with the changed set → blocker (sorted by `issue_ref` then
+  `run_id`). Blockers → 409 `overlapping_implement_in_flight` (wins;
+  `undetermined` is still carried). Else, with an incomplete changed set,
+  every non-blocking live candidate is undetermined → 409
+  `overlap_undetermined` reason `changed_files_capped` /
+  `rename_source_unknown`; else unresolved scopes → reason
+  `scope_unresolved`. Else admit.
+- **Refusal body.** 409 details: `blocking[]` / `undetermined[]`
+  (`{run_id, issue_ref, decomposed_from, stage_id, stage_type, stage_state,
+  paths}`), `head_sha` (when read), `reason` (undetermined), and for the
+  blocker refusal `next_step: fishhawk_await_stage`, `blocking_run_id` and
+  `stage_id` of the first blocker (the MCP `NextAction`). 502
+  `overlap_check_failed` carries only the allow-listed `reason` +
+  `retryable:true` (+ `run_id`); the raw cause is logged, never in the
+  message. Messages are static wording plus ids, states, path COUNTS and the
+  head; they say "No new merge verdict was recorded" (approval condition C5:
+  on a resume a verdict row may already exist).
+- **Override.** `allow_overlap: true` + `overlap_reason` (400
+  `validation_failed {field: overlap_reason}` when blank after trimming or
+  over 2000 bytes, decided before any read) overrides EVERY refusal the guard
+  produces, 502s included — otherwise a GitLab or degraded-forge merge would
+  have no way through. The recorded `overlap_reason` is the ORIGINAL string
+  (the trim only rejects blank input), stored as JSON data and never
+  interpolated into a message, prompt or log line. With the guard admitting,
+  `allow_overlap` records nothing.
+- **`merge_overlap_overridden` row, record-before-commit.** Payload:
+  `run_id, pr_url, head_sha, overridden_code, overridden_reason, blocking,
+  undetermined, overlap_reason, fingerprint`. It is appended at the FIRST
+  commit point the request reaches: immediately before the
+  `merge_queue_entered` append on the enqueue path (`mergeQueueEnqueueArm`'s
+  `preCommit`, under the run's merge-intent lock) and immediately before the
+  `merge_verdict_recorded` read/append otherwise. On a FIRST POST its row
+  therefore precedes the verdict (or intent) row; on a resume the verdict row
+  already exists and only a changed judgement appends a new override row. A
+  failed dedupe read or append is 503 `overlap_override_unrecorded`: nothing
+  merged or enqueued, no new verdict.
+- **Dedupe.** `fingerprint` = sha256 over (overridden code, reason token,
+  head, sorted `b:`/`u:` run_id:stage_id pairs, `overlap_reason`); a row
+  carrying it already means "already durable", so the
+  `fishhawk_merge_run` checks_pending re-POST loop writes one row per
+  distinct judgement. A changed head, blocker set or reason writes a new row.
+- **Access.** Withheld from run-bound subjects with `plan_scope_overlap`
+  (`withholdScopeOverlapFromRunBound`, § "Cross-run scope overlap"): it names
+  other runs' ids, issue refs and paths. Registered in
+  `audit/categories.go`; NOT an issue-comment activity category.
+- **Residuals.** The delegated `may_merge` arm (autodrive
+  `dispatchAcceptanceGatedMerge`) and ADR-093 slice 2's merge-on-pass (#4296)
+  do NOT run this guard. TOCTOU: a push or a newly dispatched implement
+  between the guard read and GitHub's merge is not caught. Cost per POST with
+  a live candidate elsewhere: one stage list per candidate plus one
+  `GetPullRequest` and one compare.
+- **Counterfactual anchors** (`merge_overlap_guard_test.go` unless noted):
+  the call `overlap := s.mergeOverlapGuard(r.Context(), runRow)`
+  (`TestMergeRun_OverlappingImplementRefused`); `overlapBlockingStageState`
+  (`TestMergeRun_OverlapNonLiveStageAdmits`, pending subcase); `return
+  appendErr` (`TestMergeRun_OverlapOverrideAppendFailureRefuses`); the
+  empty-rename-source check (`TestMergeRun_OverlapRenameSourceUnknownFailsClosed`);
+  the `Truncated` read (`TestMergeRun_OverlapCompareTruncatedFailsClosed`);
+  the `preCommit` call in `recordMergeQueueIntent`
+  (`TestMergeRun_OverlapOverrideUnrecordedNeverEnqueues`); the withhold
+  predicate (`reads_test.go`
+  `TestListRunAudit_RunBoundWithholdsMergeOverlapOverride`).
+
 ## Concurrency-group promote (`stage_concurrency_promote.go`, E83.81 / [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 
 `POST /v0/stages/{stage_id}/concurrency/promote` moves one QUEUED waiter in a local stage concurrency group (ADR-087 `stage_concurrency_slots`) to the front of its group, so a stage that unblocks everyone else is admitted at the next free slot. The ordering, lock order and refusal semantics are the store's: `backend/internal/concurrency/README.md` § "Promote". This file owns the HTTP ladder, the error mapping and the audit row.
@@ -4974,17 +5088,17 @@ A scope amendment filed near the agent wall clock is **undecidable by constructi
 
 ### Cross-run scope overlap (`scope_overlap.go`, #4118)
 
-E83.60 / #4118. `computeScopeOverlap` answers "which OTHER in-flight runs share files with this one" — the merge-order signal for overlapping work (merging while an overlapping run is mid-implement can strand it in a category-B dead end). **Advisory everywhere**: nothing refuses on it, every read is fail-open.
+E83.60 / #4118. `computeScopeOverlap` answers "which OTHER in-flight runs share files with this one" — the merge-order signal for overlapping work (merging while an overlapping run is mid-implement can strand it in a category-B dead end). **Advisory on these surfaces** (endpoint, gate view, plan-gate row): nothing here refuses on it, every read is fail-open. The one REFUSING consumer is `POST /v0/runs/{run_id}/merge`, whose fail-closed merge overlap guard reuses `overlapCandidates` and `resolveOverlapScope` (§ "Merge overlap guard").
 
 - **Effective scope** (`resolveOverlapScope`, exact paths only, no glob/directory semantics): the newest standard_v1 plan via `loadApprovedPlanForRun` (parent-walk) — a decomposition child narrows to its own `sub_plan` slice when `matchDecomposedSubPlan` links one with declared files; any other run takes `scopeFilesFromApprovedPlanFull` (top-level `scope.files` UNION every sub_plan) — plus approval `add_scope_files`, plus APPROVED scope amendments only (`approvedAmendmentPaths`; pending/denied/lapsed never count), minus approval `remove_scope_files`. No plan, a plan read error, or an amendment-list error → unresolved.
-- **Candidates**: `ListRuns` per state in `scopeOverlapLiveStates` (`pending`, `running` — terminal runs are never listed), same `Repo`, `AccountID` filter, `Limit: scopeOverlapListLimit` (200). `len(page) >= scopeOverlapListLimit` sets `truncated`.
+- **Candidates** (`overlapCandidates`, shared with the merge overlap guard so both judge one set): `ListRuns` per state in `scopeOverlapLiveStates` (`pending`, `running` — terminal runs are never listed), same `Repo`, `AccountID` filter, `Limit: scopeOverlapListLimit` (200). `len(page) >= scopeOverlapListLimit` sets `truncated`.
 - **Exclusions**: `isOverlapLineage` — self, parent/child (`DecomposedFrom`), sibling slices (equal `DecomposedFrom`; the within-plan `checkCrossSliceSharedFiles` rule governs them and they integrate into ONE consolidated PR), and a `ParentRunID` recovery/retry pair. **One `ParentRunID` hop** (`overlapRecoveredSlice`): a run with no `DecomposedFrom` whose parent IS a slice (a slice's recovery child, which resolves the parent's full union) is judged against that slice too, so it never reports its decomposed parent or sibling slices, and they never report it. A failed parent read infers no lineage. `overlapSameTenant`: an untenanted candidate stays visible (the `ListRunsFilter.AccountID` contract); a tenanted run never sees another tenant's run; an untenanted subject sees only untenanted runs.
 - **Payload** `scopeOverlapPayload{run_id, self_scope_resolved, overlaps[], scanned_runs, unscoped_runs, truncated}`; each `scopeOverlapRun{run_id, issue_ref (TriggerRef — a child carries its parent's), decomposed_from, stage, stage_state (currentOverlapStage: lowest-sequence non-terminal, else last), paths (sorted)}`; `overlaps` is `[]` never null, sorted by `issue_ref` then `run_id`. A decomposed parent and its in-flight child are BOTH reported to an unrelated run (deliberate; `decomposed_from` lets a consumer group them). Self unresolved → `self_scope_resolved:false`, empty, NO listing. A candidate whose scope does not resolve counts in `unscoped_runs`. A stage-list failure leaves `stage`/`stage_state` empty and keeps the entry. The ONE returned error is a `ListRuns` failure.
 - **Surfaces**:
   - `GET /v0/runs/{run_id}/scope-overlap` (`handleGetRunScopeOverlap`, `requireRunAccount(readAccess)`): 503 `run_repo_unconfigured` → 400 `validation_failed` → **403 `run_token_forbidden` for ANY run-bound `mcp:run:` subject, own run included** (the payload names other runs' ids, issue refs and paths — approval condition 1) → `read:audit` via `requireWriteScope` (401 anonymous, 403 `insufficient_scope`, cookie operators pass) → 404 `run_not_found` / 500 → 500 `internal_error` on a listing failure → 200.
   - Gate view `scope_overlap` (`gateViewScopeOverlapFor`), computed in `handleGetRunGateView` only — never `buildGateView`, so the attention scan's per-run gate-view fan-out does not pay the listing. OMITTED for a run-bound caller and on a listing failure (WARN; the view still answers 200).
   - Plan gate: `recordPlanScopeOverlap`, called from `handleShipPlan` right after `runPlanWarnings` (so the row precedes `plan_reviewed`), appends ONE `plan_scope_overlap` row (system actor, `StageID` set, payload = the overlap payload + `stage_id`) ONLY when the self scope resolved and an overlap exists (the `plan_warnings` write-only-when-non-empty convention — a reader cannot tell "checked and clean" from the audit log; the live endpoint answers that). Fail-open on nil `AuditRepo`/`RunRepo`, `GetRun` error, compute error and append error (WARN). Not an issue-thread activity category (`docs/issue-comment-surfaces.md`).
-  - **Audit-log withhold for run-bound subjects** (`reads.go`): the `plan_scope_overlap` row names other runs, so `withholdScopeOverlapFromRunBound` drops it for any `mcp:run:` subject (prefix match, malformed suffix included) on `handleListRunAudit`'s non-chain reads — the read that NAMES the category included, since this is access control by subject, not a render preference like `withholdDelegationShadow` — and on `handleListGlobalAudit`, both BEFORE `pageOffset` so `limit=N` keeps N visible rows. A run-bound `chain=true` read is refused **403 `run_token_forbidden`** before any repository read, because the chain read stays complete for hash verification and cannot be filtered; operators are unchanged. Reader inventory: `fishhawk_list_audit` / `fishhawk_await_audit` (`ListRunAudit` → per-run feed) and `fishhawk_get_run_status` `recent_audit` (`ListRecentRunAudit` → `GET /v0/audit`) are covered by those two handlers; `GET /v0/audit/export(.csv)` needs `read:audit-export`, which a run-bound token never holds (`mcptoken.go`); the diagnostics read and `diagnostics.Collect`/`CollectWithWedge` (the product-report bundle) never serialize entry payloads — a stage-tagged category NAME can surface as a bundle's `failing_surface`, never another run's id or path. **Accepted consequence**: `fishhawk_verify_run` pages the non-chain feed and recomputes `prev_hash` links, so under a run-bound subject it reports `chain_broken` on a run carrying a `plan_scope_overlap` row; `delegation_shadow_evaluated` already has the same latent effect. Operators verify on the complete feed.
+  - **Audit-log withhold for run-bound subjects** (`reads.go`): the `plan_scope_overlap` row (and, since #4119, the `merge_overlap_overridden` row) names other runs, so `withholdScopeOverlapFromRunBound` drops it for any `mcp:run:` subject (prefix match, malformed suffix included) on `handleListRunAudit`'s non-chain reads — the read that NAMES the category included, since this is access control by subject, not a render preference like `withholdDelegationShadow` — and on `handleListGlobalAudit`, both BEFORE `pageOffset` so `limit=N` keeps N visible rows. A run-bound `chain=true` read is refused **403 `run_token_forbidden`** before any repository read, because the chain read stays complete for hash verification and cannot be filtered; operators are unchanged. Reader inventory: `fishhawk_list_audit` / `fishhawk_await_audit` (`ListRunAudit` → per-run feed) and `fishhawk_get_run_status` `recent_audit` (`ListRecentRunAudit` → `GET /v0/audit`) are covered by those two handlers; `GET /v0/audit/export(.csv)` needs `read:audit-export`, which a run-bound token never holds (`mcptoken.go`); the diagnostics read and `diagnostics.Collect`/`CollectWithWedge` (the product-report bundle) never serialize entry payloads — a stage-tagged category NAME can surface as a bundle's `failing_surface`, never another run's id or path. **Accepted consequence**: `fishhawk_verify_run` pages the non-chain feed and recomputes `prev_hash` links, so under a run-bound subject it reports `chain_broken` on a run carrying a `plan_scope_overlap` row; `delegation_shadow_evaluated` already has the same latent effect. Operators verify on the complete feed.
 - **Live vs snapshot**: the audit row is what the plan saw when it settled, so the FIRST of two overlapping runs to settle has no row naming the later one; the endpoint and gate view recompute on every read, which is what makes "each reports the other" hold.
 - **Cost**: two `ListRuns` (≤200 each) plus ~5 reads per candidate; a per-repo cache is the follow-up if it proves slow.
 - **Counterfactual anchors** (`scope_overlap_test.go`): the `approvedAmendmentPaths` append and status filter (`TestScopeOverlap_ApprovedAmendmentOnlyOverlap`, `TestScopeOverlap_PendingAndDeniedAmendmentsIgnored`); the `scopeOverlapLiveStates` literal (`TestScopeOverlap_TerminalRunsNeverReported` — the fake honours the State filter and there is deliberately no second Go-side terminal check); the `isOverlapLineage` call (`TestScopeOverlap_DecompositionLineageExcluded`) and the one-hop calls (`TestScopeOverlap_SliceRecoveryChildLineageExcluded`); `overlapSameTenant` (`TestScopeOverlap_OtherTenantNeverReported` — the fake ignores `AccountID`); the slice-narrowing branch (`TestScopeOverlap_DecomposedChildSliceAttributed`); the `plan.go` call (`TestShipPlan_RecordsScopeOverlap`); the run-bound refusals (`TestHandleGetRunScopeOverlap`, `TestGateView_CarriesScopeOverlap`); `stagePlanForOverlap`'s schema filter and unmarshal check (`TestRecordPlanScopeOverlap_UnreadableStagePlan` — the non-standard_v1 artifact carries a VALID overlapping plan); and, in `reads_test.go`, the audit withhold and its before-pagination placement (`TestListRunAudit_RunBoundWithholdsScopeOverlap`, `TestListGlobalAudit_RunBoundWithholdsScopeOverlap` — the overlap row is sequenced first) and the chain refusal (`TestListRunAudit_RunBoundChainRefused`).

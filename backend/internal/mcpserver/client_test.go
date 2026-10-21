@@ -5191,3 +5191,61 @@ func TestGetMergeQueue_ClientPathAndRawDecode(t *testing.T) {
 		t.Errorf("eta_basis = %+v, want samples 1, a PRESENT median 0, note basis", b.ETABasis)
 	}
 }
+
+// TestMergeRunWith_OverlapOverrideWireShape pins the merge overlap guard
+// override on the wire (E83.61 / #4119): mergeRunWith marshals allow_overlap
+// and overlap_reason (verbatim, whitespace kept) when set, and MergeRun's
+// verdict-only body OMITS both keys — the json tags match the backend's
+// mergeRunRequest (allow_overlap / overlap_reason, omitempty). A 409
+// overlapping_implement_in_flight surfaces as an *apiError carrying its code
+// and details. Counterfactual: dropping either tag's omitempty puts the key on
+// the verdict-only body → RED.
+func TestMergeRunWith_OverlapOverrideWireShape(t *testing.T) {
+	runID := uuid.New()
+	var bodies []map[string]any
+	status := http.StatusOK
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		var got map[string]any
+		if err := json.Unmarshal(raw, &got); err != nil {
+			t.Errorf("body %q: %v", raw, err)
+		}
+		bodies = append(bodies, got)
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status == http.StatusConflict {
+			_, _ = w.Write([]byte(`{"error":{"code":"overlapping_implement_in_flight","message":"overlap","details":{"blocking_run_id":"b","stage_id":"s"}}}`))
+			return
+		}
+		_, _ = w.Write([]byte(`{"merge_queued":true,"verdict_sequence":7}`))
+	}))
+	defer ts.Close()
+	c := newAPIClient(config{backendURL: ts.URL, apiToken: "tok-test"})
+
+	if _, err := c.MergeRun(context.Background(), runID, "ship it"); err != nil {
+		t.Fatalf("MergeRun: %v", err)
+	}
+	reason := "  judged safe  \n"
+	if _, err := c.mergeRunWith(context.Background(), runID, mergeRunRequest{Verdict: "ship it", AllowOverlap: true, OverlapReason: reason}); err != nil {
+		t.Fatalf("mergeRunWith: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(bodies))
+	}
+	if _, ok := bodies[0]["allow_overlap"]; ok {
+		t.Errorf("verdict-only body %v carries allow_overlap; want it omitted", bodies[0])
+	}
+	if _, ok := bodies[0]["overlap_reason"]; ok {
+		t.Errorf("verdict-only body %v carries overlap_reason; want it omitted", bodies[0])
+	}
+	if bodies[1]["allow_overlap"] != true || bodies[1]["overlap_reason"] != reason || bodies[1]["verdict"] != "ship it" {
+		t.Errorf("override body = %v, want allow_overlap true and overlap_reason %q verbatim", bodies[1], reason)
+	}
+
+	status = http.StatusConflict
+	_, err := c.mergeRunWith(context.Background(), runID, mergeRunRequest{Verdict: "ship it"})
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != http.StatusConflict || ae.Code != "overlapping_implement_in_flight" || ae.Details["blocking_run_id"] != "b" {
+		t.Fatalf("err = %v, want a 409 overlapping_implement_in_flight *apiError with details", err)
+	}
+}

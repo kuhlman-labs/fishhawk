@@ -43,6 +43,20 @@ commit (409 `merge_candidate_unverified` or
 closed (502 `merge_candidate_check_failed`). Each refusal names the verb that
 clears it; the error-code table in the companion document has the details.
 
+Before that check, the merge verb refuses while another run in the same
+repository has an implement stage dispatched or running whose planned files
+include a path this pull request changes (409
+`overlapping_implement_in_flight`): merging would move the base under that
+agent. Runs that are only planned or parked do not block, and neither does the
+run's own decomposition lineage. When a live implement exists elsewhere and the
+overlap cannot be decided (a truncated forge compare, a run whose scope does
+not resolve, a GitLab run whose changed paths cannot be read), the verb refuses
+409 `overlap_undetermined`; a read failure is 502 `overlap_check_failed`. The
+refusal names the blocking run and stage. To merge anyway, send
+`allow_overlap: true` with an `overlap_reason`: the override is recorded on the
+audit chain as `merge_overlap_overridden` before any merge verdict, and a
+failed record refuses the merge (503 `overlap_override_unrecorded`).
+
 Verify-only passes for a base advance or a conflict resolution are serialized
 per repository base ref (ADR-092): one pass is live per base, and every other
 waits in a held queue without a runner slot until the line frees. While a

@@ -597,7 +597,8 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 	// list read that does not name the category, BEFORE pagination so
 	// limit=N still returns N visible rows. The chain=true read stays
 	// complete for hash-chain verification. The cross-run scope-overlap rows
-	// (E83.60 / #4118) are withheld from a run-bound subject here too, even
+	// (E83.60 / #4118) and merge overlap overrides (E83.61 / #4119) are
+	// withheld from a run-bound subject here too, even
 	// on a read that names their category; chain=true is refused above for
 	// that subject.
 	if !chain {
@@ -682,8 +683,9 @@ func (s *Server) handleListGlobalAudit(w http.ResponseWriter, r *http.Request) {
 	// fishhawk_get_run_status's recent_audit makes (run_id + limit), so a
 	// newest stamp must not cost it a visible row.
 	entries = withholdDelegationShadow(entries, q.Get("category"))
-	// Cross-run scope-overlap rows (E83.60 / #4118): withheld from a run-bound
-	// subject, category-named read included, before pagination.
+	// Cross-run scope-overlap rows (E83.60 / #4118) and merge overlap
+	// overrides (E83.61 / #4119): withheld from a run-bound subject,
+	// category-named read included, before pagination.
 	entries = withholdScopeOverlapFromRunBound(entries, IdentityFrom(r.Context()).Subject)
 
 	page, nextCursor := pageOffset(entries, offset, limit)
@@ -745,9 +747,10 @@ func withholdDelegationShadow(entries []*audit.Entry, requestedCategory string) 
 }
 
 // withholdScopeOverlapFromRunBound drops `plan_scope_overlap` entries
-// (E83.60 / #4118) when subject is a run-bound agent token (the
-// isRunBoundSubject prefix match, so a malformed `mcp:run:` suffix is withheld
-// too). Each row names OTHER runs' issue refs and file paths, so a run-bound
+// (E83.60 / #4118) and `merge_overlap_overridden` entries (E83.61 / #4119)
+// when subject is a run-bound agent token (the isRunBoundSubject prefix
+// match, so a malformed `mcp:run:` suffix is withheld too). Each row names
+// OTHER runs' ids, issue refs and file paths, so a run-bound
 // agent must not read it (approval condition 1 of run 3fa73698, the same rule
 // the scope-overlap endpoint and the gate view enforce). Unlike
 // withholdDelegationShadow this IS access control by subject, so it ignores
@@ -762,7 +765,7 @@ func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []
 	}
 	out := make([]*audit.Entry, 0, len(entries))
 	for _, e := range entries {
-		if e != nil && e.Category == planScopeOverlapCategory {
+		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden) {
 			continue
 		}
 		out = append(out, e)
