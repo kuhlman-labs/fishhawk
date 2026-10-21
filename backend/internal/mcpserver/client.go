@@ -420,6 +420,8 @@ type runMergeCandidateQueue struct {
 	LiveRunID       string     `json:"live_run_id,omitempty" jsonschema:"the run holding the base's line (this run when live); omitted when the base has no live entry"`
 	EjectReason     string     `json:"eject_reason,omitempty"`
 	Note            string     `json:"note" jsonschema:"what happens next, in one sentence"`
+	MergeIntent     bool       `json:"merge_intent" jsonschema:"whether fishhawk_merge_run recorded merge intent on the entry (ADR-093 D2); false for an entry the ADR-092 rebase path enqueued"`
+	MergeIntentAt   *time.Time `json:"merge_intent_at,omitempty" jsonschema:"when merge intent was recorded; omitted without intent"`
 }
 
 // runMergeCandidateRerun mirrors the backend's runMergeCandidateRerunPayload

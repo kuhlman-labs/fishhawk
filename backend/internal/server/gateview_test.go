@@ -2412,6 +2412,43 @@ func TestGateView_MergeCandidateQueue(t *testing.T) {
 	}
 }
 
+// TestGateView_MergeCandidateQueue_MergeIntent pins merge_intent on the gate
+// view's queue block (ADR-093 slice 1, E87.4 / #4295) — the same projection
+// the run read carries: an entry with recorded merge intent renders
+// merge_intent true and its merge_intent_at; one without renders false and no
+// timestamp. Counterfactual: dropping the MergeIntent assignment in
+// mergeCandidateQueuePayloadFor → the intent arm reads false → RED.
+func TestGateView_MergeCandidateQueue_MergeIntent(t *testing.T) {
+	at := time.Date(2026, 10, 21, 2, 0, 0, 0, time.UTC)
+	for _, tc := range []struct {
+		name   string
+		intent *time.Time
+	}{
+		{name: "merge_run intent", intent: &at},
+		{name: "rebase-path entry", intent: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, _, _ := gateViewServer(t)
+			runID := seedGateRun(t, repo)
+			s.cfg.MergeQueue = &mcqFaultStore{activeForRun: func(id uuid.UUID) (mergequeue.Status, bool, error) {
+				st := mcqHeldStatus(id, 1, nil, "h1")
+				st.Entry.MergeIntentAt = tc.intent
+				return st, true, nil
+			}}
+			q := decodeGateView(t, getGateView(t, s, runID, "")).MergeCandidateQueue
+			if q == nil {
+				t.Fatal("merge_candidate_queue omitted for a held run")
+			}
+			if q.MergeIntent != (tc.intent != nil) {
+				t.Fatalf("merge_intent = %v, want %v", q.MergeIntent, tc.intent != nil)
+			}
+			if (q.MergeIntentAt == nil) != (tc.intent == nil) || (q.MergeIntentAt != nil && !q.MergeIntentAt.Equal(at)) {
+				t.Fatalf("merge_intent_at = %v, want %v", q.MergeIntentAt, tc.intent)
+			}
+		})
+	}
+}
+
 // TestGateView_MergeReadiness_ReviewCoverage pins the gate view's #4219 half:
 // the SAME refusal the merge endpoint returns surfaces as a blocker, and a read
 // failure is an Undetermined entry plus ONE merge_readiness history gap (never

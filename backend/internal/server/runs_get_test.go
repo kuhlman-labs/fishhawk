@@ -4028,3 +4028,39 @@ func TestGetRun_MergeCandidateQueue_ReadErrorOmits(t *testing.T) {
 		t.Fatalf("merge_candidate_queue = %+v on a store read error, want the key omitted", q)
 	}
 }
+
+// TestGetRun_MergeCandidateQueue_MergeIntent pins merge_intent on the run
+// read (ADR-093 slice 1, E87.4 / #4295): after a merge_run ENQUEUE the block
+// carries merge_intent true with merge_intent_at; an entry the ADR-092 rebase
+// path enqueued carries merge_intent false ON the wire (read from the raw
+// bytes: absent and false are different claims) and no merge_intent_at.
+// Counterfactual: dropping the MergeIntent assignment in
+// mergeCandidateQueuePayloadFor leaves the enqueued run's flag false → RED.
+func TestGetRun_MergeCandidateQueue_MergeIntent(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	q, ok := runQueueBlock(t, getRunRaw(t, f.srv, r.id))
+	if !ok || !q.MergeIntent || q.MergeIntentAt == nil {
+		t.Fatalf("merge_run-enqueued block = %+v (present %v), want merge_intent true with merge_intent_at", q, ok)
+	}
+
+	rebased := f.seed("rb", "rb0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(rebased, "rb0", "rb1")
+	f.rebase(rebased)
+	w := getRunRaw(t, f.srv, rebased.id)
+	var raw struct {
+		Queue map[string]json.RawMessage `json:"merge_candidate_queue"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &raw); err != nil || raw.Queue == nil {
+		t.Fatalf("decode rebase-path block: %v\n%s", err, w.Body.String())
+	}
+	if got, ok := raw.Queue["merge_intent"]; !ok || string(got) != "false" {
+		t.Fatalf("rebase-path merge_intent on the wire = %s (present %v), want false", got, ok)
+	}
+	if _, ok := raw.Queue["merge_intent_at"]; ok {
+		t.Fatalf("rebase-path block carries merge_intent_at, want it absent")
+	}
+}

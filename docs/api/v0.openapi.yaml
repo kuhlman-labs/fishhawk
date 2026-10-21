@@ -2808,6 +2808,17 @@ components:
           description: "The run holding the base's line (this run when live); omitted when the base has no live entry."
         eject_reason: { type: string, description: 'Reserved; always omitted on an active entry.' }
         note: { type: string, description: One sentence naming what happens next. }
+        merge_intent:
+          type: boolean
+          description: |
+            Whether the operator's `POST /v0/runs/{run_id}/merge` recorded
+            merge intent on the entry (ADR-093 D2, E87.4 / #4295). `false` for
+            an entry the ADR-092 rebase / base-advance path enqueued. Always
+            present on an entry (absent and `false` are different claims).
+        merge_intent_at:
+          type: string
+          format: date-time
+          description: When the merge intent was recorded; omitted without intent.
 
     RunCompletionBlocked:
       type: object
@@ -3537,6 +3548,114 @@ components:
           type: array
           description: The shared exact paths, sorted.
           items: { type: string }
+
+    MergeQueue:
+      type: object
+      description: |
+        The per-base merge queue of one repository in the caller's account
+        (ADR-093 slice 1, E87.4 / #4295) — `GET
+        /v0/repos/{owner}/{name}/merge-queue`.
+      required: [repo, bases]
+      properties:
+        repo: { type: string, description: '`owner/name`.' }
+        bases:
+          type: array
+          description: |
+            One block per base ref: the requested `base_ref`, or every base of
+            the repository holding an active (held or live) entry in the
+            caller's account. Empty when nothing is queued.
+          items: { $ref: '#/components/schemas/MergeQueueBase' }
+
+    MergeQueueBase:
+      type: object
+      required: [base_ref, entries, eta_basis]
+      properties:
+        base_ref: { type: string }
+        entries:
+          type: array
+          description: |
+            The base's active entries in queue order: the live entry (holding
+            the line) first, then held entries FIFO by enqueue time.
+          items: { $ref: '#/components/schemas/MergeQueueEntry' }
+        head_of_line:
+          $ref: '#/components/schemas/MergeQueueHeadOfLine'
+        eta_basis:
+          $ref: '#/components/schemas/MergeQueueETABasis'
+
+    MergeQueueEntry:
+      type: object
+      required: [run_id, entry_id, state, merge_intent, enqueued_at, anchored_head_sha]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        entry_id: { $ref: '#/components/schemas/UUID' }
+        state:
+          type: string
+          enum: [held, live]
+        phase:
+          type: string
+          description: "A live entry's progress (`admitted`, `verifying`, `passed`, `unverified`; an open set). Omitted while held."
+        position:
+          type: integer
+          minimum: 1
+          description: "1-based place among the base's held entries; omitted for the live entry."
+        merge_intent:
+          type: boolean
+          description: Whether the operator's merge call recorded merge intent (ADR-093 D2); `false` for a rebase-path entry. Always present.
+        merge_intent_at: { type: string, format: date-time, description: When the intent was recorded; omitted without intent. }
+        enqueued_at: { type: string, format: date-time, description: 'Eligibility time — the FIFO key.' }
+        admitted_at: { type: string, format: date-time, description: When the entry became live. }
+        anchored_head_sha: { type: string, description: The PR head the entry's pass is anchored to. }
+        anchored_base_sha: { type: string, description: 'The base tip the head was produced against, when known.' }
+        eta_seconds:
+          type: integer
+          format: int64
+          description: |
+            A held entry's estimated wait: `position` x
+            `eta_basis.median_seconds`. Omitted for the live entry and when
+            the base has no merged history. An estimate, not a promise — see
+            `eta_basis`.
+
+    MergeQueueHeadOfLine:
+      type: object
+      description: |
+        The base's first entry — the live one, or the next held entry to admit
+        when none is live — with its pull request's current head. Omitted when
+        the base has no active entry.
+      required: [run_id, entry_id, state, anchored_head_sha]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        entry_id: { $ref: '#/components/schemas/UUID' }
+        state: { type: string, enum: [held, live] }
+        phase: { type: string, description: The live entry's phase; omitted while held. }
+        anchored_head_sha: { type: string }
+        current_head_sha:
+          type: string
+          description: |
+            The PR head read from the forge now (best-effort, one read per
+            base). When it differs from `anchored_head_sha`, the admission
+            re-anchors before the pass.
+        current_head_unavailable:
+          type: string
+          enum: [run_read_failed, forge_unwired, pull_request_unresolvable, forge_read_failed]
+          description: Why `current_head_sha` is absent; the read still answers 200.
+
+    MergeQueueETABasis:
+      type: object
+      description: |
+        What every `eta_seconds` on the base is derived from: the line-turn
+        time (admission to merge) of the base's newest merged entries in the
+        caller's account, at most 10. Until ADR-093 slice 2's merge-on-pass
+        lands, a line turn INCLUDES the operator's merge step (the line frees
+        only when the pull request merges), so the estimate is as fast as the
+        operator merges.
+      required: [samples, note]
+      properties:
+        samples: { type: integer, minimum: 0, maximum: 10, description: How many merged line turns the median read. }
+        median_seconds:
+          type: integer
+          format: int64
+          description: Their median, rounded to the second (the mean of the middle two for an even count); omitted with no samples.
+        note: { type: string, description: A constant sentence stating the basis. }
 
     GateViewFanInConflict:
       type: object
@@ -14818,6 +14937,32 @@ paths:
         includes every GitLab-family run), an unparseable repo, or no PR number
         — proceeds ungated with a server WARN; GitLab merge requests therefore
         keep today's behaviour, a stated residual.
+
+        **Merge-queue enqueue (ADR-093 slice 1, E87.4 / #4295).** With the
+        merge queue wired, a run the merge-candidate gate refuses as
+        `merge_base_behind`, `merge_candidate_unverified` (verify state
+        `unverified`, or `in_flight` for a run that already has an active
+        queue entry) or `merge_candidate_held` is evaluated against the
+        merge-queue eligibility predicate — agent implement reviews terminal,
+        review coverage complete and a LIVE forge approval from a listed
+        `approvals.members` identity when the review stage declares an
+        approval gate; acceptance merge-eligible and not stale; required
+        checks green at the PR head (zero observed check runs is not green);
+        no open blocking concern. An ELIGIBLE run is ENQUEUED in its (account,
+        repository, base ref) queue with the operator's merge intent and
+        answered `202` with `queued: true` (below); `merge_queued` stays
+        `false`, NO `merge_verdict_recorded` row is written (the verdict prose
+        rides the chained `merge_queue_entered` row, appended BEFORE the queue
+        write), and the base is pumped detached, so the answer never waits on
+        an admission's auto-advance or pass start. Re-invoke the merge once
+        the entry's pass is green. An INELIGIBLE or undeterminable run keeps
+        the 409 above, byte-for-byte, plus the additive
+        `details.merge_queue_ineligible` reason codes, with nothing written.
+        `merge_candidate_verify_failed` and `merge_candidate_check_failed`
+        are never enqueued. Known deviation from ADR-093 D6 in this slice:
+        approval transfer across a clean advance is not implemented, so in a
+        dismiss-stale repository a rebased run needs a fresh approval before
+        it is eligible.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -14857,6 +15002,37 @@ paths:
                   merge_observation_recorded: { type: boolean, description: 'True ONLY when THIS call successfully appended the merge_observation_recorded audit row. False when the audit chain already carried merge evidence, and false when the append failed — the message then names POST /v0/runs/{run_id}/record-merge-observation as the recovery.' }
                   run_state: { type: string, description: 'On the already_merged path, the run lifecycle state after the endpoint best-effort re-evaluated run completion. Empty when the re-read failed.' }
                   message: { type: string, description: 'On the already_merged path, the operator-facing explanation: what was (or was not) recorded, and — on a still non-terminal run — POST /v0/runs/{run_id}/reconcile-merge as the settling verb. The message names WHAT failed and the recovery verb but never carries the underlying storage error text, which stays in the operator log correlated by request id.' }
+        '202':
+          description: |
+            ADR-093 slice 1 (E87.4 / #4295): the run is merge-queue eligible
+            and was ENQUEUED with the operator's merge intent instead of
+            refused. Nothing merged and no merge verdict was recorded; the
+            response is read from the queue store right after the write.
+            Watch the entry on `GET /v0/repos/{owner}/{name}/merge-queue` or
+            `GET /v0/runs/{run_id}`'s `merge_candidate_queue`, then re-invoke
+            the merge once the pass is green. Every field the 200 path does
+            not set is omitted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [run_id, merge_queued, pr_url, queued, queue_state, entry_id, base_ref, anchored_head_sha, message]
+                properties:
+                  run_id: { $ref: '#/components/schemas/UUID' }
+                  merge_queued: { type: boolean, description: 'Always false on the queued path: no merge was dispatched.' }
+                  verdict_sequence: { type: integer, format: int64, description: 'Always 0: no merge_verdict_recorded row is written on the queued path.' }
+                  already_recorded: { type: boolean }
+                  pr_url: { type: string }
+                  queued: { type: boolean, description: 'True: the run is in the merge queue.' }
+                  queue_state: { type: string, enum: [held, live], description: '`live` — the run holds the base line now; `held` — it waits behind the live entry.' }
+                  queue_position: { type: integer, minimum: 1, description: "1-based place among the base's held entries; omitted for a live entry." }
+                  live_run_id: { $ref: '#/components/schemas/UUID' }
+                  entry_id: { $ref: '#/components/schemas/UUID' }
+                  base_ref: { type: string }
+                  anchored_head_sha: { type: string, description: The PR head the entry is anchored to. }
+                  intent_sequence: { type: integer, format: int64, description: "The chain sequence of the run's merge_queue_entered audit row." }
+                  already_queued: { type: boolean, description: 'True when the entry already carried merge intent, so nothing was written (an idempotent re-POST).' }
+                  message: { type: string, description: 'Where the run stands and the next step; names the gate code that triggered the enqueue.' }
         '400':
           description: |
             Malformed body or an empty `verdict`. Body's `error` is
@@ -15017,6 +15193,14 @@ paths:
             `500 internal_error` (fail-closed).
             Cases (8), (9), (10) and (11) record NO verdict row and dispatch
             nothing.
+            With the merge queue wired, cases (5), (6) and (7a) are refused
+            only for a run that is NOT merge-queue eligible (an eligible one
+            answers `202` queued); their `details` then carry the additive
+            `merge_queue_ineligible` array of reason codes — `not_approved`,
+            `review_pending`, `review_coverage_incomplete`,
+            `acceptance_not_eligible`, `acceptance_stale`, `checks_not_green`,
+            `checks_red`, `blocking_concern_open`, `undeterminable` (a read
+            failed: fail closed) — and nothing is written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15064,7 +15248,13 @@ paths:
         '503':
           description: |
             The run/audit repositories are not wired (`merge_unconfigured`) or
-            the merge seam is unconfigured (`merge_seam_unconfigured`).
+            the merge seam is unconfigured (`merge_seam_unconfigured`). On the
+            ADR-093 enqueue arm, both retryable (`details.retryable: true`):
+            `merge_queue_unrecorded` — the `merge_queue_entered` audit row
+            could not be appended, so NOTHING was written to the queue (record
+            before commit); `merge_queue_write_failed` — the row was appended
+            but the queue write or its read-back failed, so the run is not
+            queued. Re-invoke the merge to retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -22671,6 +22861,70 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: "`github_unconfigured` — `source=ref` with no GitHub App configured (the message names `run_cache`); `run_repo_unconfigured`; or `service_unavailable` — repository visibility could not be resolved."
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/repos/{owner}/{name}/merge-queue:
+    get:
+      operationId: getRepoMergeQueue
+      summary: Get a repository's per-base merge queue
+      description: |
+        ADR-093 slice 1 (E87.4 / #4295). The merge queue of one repository
+        per base ref, scoped to the CALLER'S account: the base's active
+        entries in FIFO order with their 1-based held position, whether each
+        carries the operator's merge intent, the head of line with its
+        anchored and current PR head, and a per-entry ETA. The queue rows are
+        ADR-092's held-pass queue; an entry gains merge intent when
+        `POST /v0/runs/{run_id}/merge` enqueues an eligible run.
+
+        **Account scope.** The caller identity's workspace account is the
+        queue's account, so another account's entries on the same repository
+        and base ref are structurally unreadable; an untenanted caller reads
+        the untenanted queue. A session account that is not a UUID fails
+        closed `500 internal_error`.
+
+        **ETA basis.** `eta_seconds` = `position` x the median line-turn time
+        (admission to merge) of the base's newest 10 merged entries. Until
+        ADR-093 slice 2's merge-on-pass lands, a line turn includes the
+        operator's merge step, so the estimate is as fast as the operator
+        merges. No merged history → no ETA.
+
+        **Auth.** The payload names other runs' ids and heads, so a run-bound
+        `mcp:run:<uuid>` token is refused `403 run_token_forbidden`. Every
+        other caller must hold `read:audit` (a cookie-session operator
+        passes). Repository visibility is enforced like a point read.
+
+        Store reads fail closed (`500`); the head-of-line forge read is
+        best-effort (`current_head_unavailable` names the degrade).
+      tags: [repos]
+      parameters:
+        - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
+        - { name: name, in: path, required: true, schema: { type: string }, description: Repository name (second `owner/name` segment). }
+        - name: base_ref
+          in: query
+          required: false
+          schema: { type: string }
+          description: One base ref. Omitted (or empty) lists every base with an active entry in the caller's account.
+      responses:
+        '200':
+          description: The merge queue.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MergeQueue' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` — a run-bound `mcp:run:<uuid>` token; `insufficient_scope` — a token missing `read:audit`; or `repo_forbidden` — the caller cannot read the repository on the forge.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error` — a queue store read failed, or the session account is not a UUID.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`merge_queue_unconfigured` — no merge queue is wired; or `service_unavailable` — repository visibility could not be resolved.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
