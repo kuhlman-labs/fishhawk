@@ -2997,3 +2997,30 @@ func TestRebaseRunBranch_ShadowBlockingClassifierNeverDelaysThe200(t *testing.T)
 		t.Errorf("shadow rows after release = %+v, want one would_transfer", sh)
 	}
 }
+
+// TestRebase_IneligibleRunAnswersNotQueued (ADR-093 slice 1, E87.4 / #4295):
+// the rebase verb renders the serializer's not_queued answer — state, a note
+// naming the reasons and fishhawk_merge_run — and re-opens nothing.
+func TestRebase_IneligibleRunAnswersNotQueued(t *testing.T) {
+	f := newMCQFixture(t)
+	r := f.seed("nq", "n0", []byte(mqeSpecYAML))
+	f.behind(r, "n0", "n1")
+	f.raiseConcern(r, "high", "")
+	resp := f.rebase(r)
+	if resp.MergeCandidateVerifyState != mergeCandidateStateNotQueued || resp.MergeCandidateVerifyTriggered ||
+		resp.MergeCandidateVerifyRefusal != "" {
+		t.Fatalf("rebase = state %q triggered=%v refusal %q, want not_queued", resp.MergeCandidateVerifyState,
+			resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyRefusal)
+	}
+	for _, want := range []string{mergeQueueReasonNotApproved, mergeQueueReasonBlockingConcernOpen, "fishhawk_merge_run"} {
+		if !strings.Contains(resp.MergeCandidateVerifyNote, want) {
+			t.Fatalf("note %q does not name %s", resp.MergeCandidateVerifyNote, want)
+		}
+	}
+	if st := f.stageState(r.impl.ID); st != run.StageStateSucceeded {
+		t.Fatalf("implement = %s, want succeeded (no re-open)", st)
+	}
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+}

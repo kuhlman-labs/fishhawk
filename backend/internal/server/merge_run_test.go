@@ -3058,3 +3058,242 @@ func TestMergeRun_ReviewCoverageCovered_Proceeds(t *testing.T) {
 		t.Errorf("merger called %d, verdict rows %d, want 1 and 1", h.merger.called, len(mergeVerdictRows(h.au)))
 	}
 }
+
+// ADR-093 slice 1 (E87.4 / #4295): the merge_run ENQUEUE arm over the real
+// Postgres stores (the mcq fixture) with a recording merger.
+
+// mqFailEnteredAudit fails every merge_queue_entered append (approval
+// condition C3) and delegates everything else.
+type mqFailEnteredAudit struct {
+	audit.Repository
+}
+
+func (a mqFailEnteredAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryMergeQueueEntered {
+		return nil, errors.New("audit chain unavailable")
+	}
+	return a.Repository.AppendChained(ctx, p)
+}
+
+// mqMergeFixture seeds one behind run under mqeSpecYAML (approved by alice
+// unless approved is false) and wires a recording merger.
+func mqMergeFixture(t *testing.T, approved bool) (*mcqFixture, *mcqRun, *fakeMerger) {
+	t.Helper()
+	f := newMCQFixture(t)
+	merger := &fakeMerger{}
+	f.srv.cfg.GateMerger = merger
+	r := f.seed("m", "m0", []byte(mqeSpecYAML))
+	f.behind(r, "m0", "m1")
+	if approved {
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+	}
+	return f, r, merger
+}
+
+func (f *mcqFixture) mergeRun(r *mcqRun) *httptest.ResponseRecorder {
+	f.t.Helper()
+	return postMergeRun(f.t, f.srv, r.id, mergeRunRequest{Verdict: "ship it"}, withMergeOperator)
+}
+
+func (f *mcqFixture) intentAt(r *mcqRun) []bool {
+	f.t.Helper()
+	rows, err := f.pool.Query(context.Background(),
+		`SELECT merge_intent_at IS NOT NULL FROM merge_candidate_queue_entries WHERE run_id = $1 ORDER BY enqueued_at, id`, r.id)
+	if err != nil {
+		f.t.Fatalf("query intent: %v", err)
+	}
+	defer rows.Close()
+	var out []bool
+	for rows.Next() {
+		var b bool
+		if err := rows.Scan(&b); err != nil {
+			f.t.Fatalf("scan: %v", err)
+		}
+		out = append(out, b)
+	}
+	return out
+}
+
+func TestMergeRun_BehindEligibleRunQueues(t *testing.T) {
+	f, r, merger := mqMergeFixture(t, true)
+	w := f.mergeRun(r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var resp mergeRunResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !resp.Queued || resp.MergeQueued || resp.QueueState != "held" || resp.QueuePosition != 1 ||
+		resp.BaseRef != mcqBase || resp.AnchoredHeadSHA != "m0" || resp.EntryID == "" || resp.IntentSequence == 0 || resp.AlreadyQueued {
+		t.Fatalf("response = %+v, want queued held position 1 anchored m0 with an intent sequence", resp)
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	if got := f.intentAt(r); len(got) != 1 || !got[0] {
+		t.Fatalf("entries merge_intent_at set = %v, want one entry with intent", got)
+	}
+	rows := f.rows(r, CategoryMergeQueueEntered)
+	if len(rows) != 1 || rows[0].Sequence != resp.IntentSequence {
+		t.Fatalf("merge_queue_entered rows = %d, want 1 at sequence %d", len(rows), resp.IntentSequence)
+	}
+	var payload map[string]any
+	_ = json.Unmarshal(rows[0].Payload, &payload)
+	if payload["verdict"] != "ship it" || payload["gate_code"] != mergeCodeBaseBehind || payload["anchored_head_sha"] != "m0" {
+		t.Fatalf("merge_queue_entered payload = %v", payload)
+	}
+	if n := len(f.rows(r, CategoryMergeVerdictRecorded)); n != 0 {
+		t.Fatalf("merge_verdict_recorded rows = %d, want 0 on the queued path", n)
+	}
+	if merger.called != 0 {
+		t.Fatalf("merger called %d times, want 0", merger.called)
+	}
+	// The detached pump admitted it: the empty line went live.
+	f.requireState(r, "live", "")
+}
+
+func TestMergeRun_LiveRunMarksIntentOnce(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("first merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	w := f.mergeRun(r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("second merge = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var resp mergeRunResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.AlreadyQueued || resp.QueueState != "live" {
+		t.Fatalf("second response = %+v, want already_queued on the live entry", resp)
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 1 {
+		t.Fatalf("merge_queue_entered rows = %d, want exactly 1", n)
+	}
+}
+
+func TestMergeRun_HeldRunWithoutIntentMarksIt(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	other := f.seed("o", "o0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(other, "o0", "o1")
+	f.rebase(other) // takes the line
+	f.rebase(r)     // held behind it, no intent (rebase path)
+	if got := f.intentAt(r); len(got) != 1 || got[0] {
+		t.Fatalf("pre-merge intent = %v, want one held entry without intent", got)
+	}
+	w := f.mergeRun(r)
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var resp mergeRunResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if resp.QueueState != "held" || resp.QueuePosition != 1 || resp.LiveRunID != other.id.String() || resp.AlreadyQueued {
+		t.Fatalf("response = %+v, want held position 1 behind %s", resp, other.id)
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	if got := f.intentAt(r); len(got) != 1 || !got[0] {
+		t.Fatalf("intent = %v, want the same entry marked", got)
+	}
+}
+
+// TestMergeRun_IneligibleBehindRunRefusesWithoutRows is the done-means
+// counterfactual vehicle: the run is behind, acceptance not declared, checks
+// green, no concern — only its EMPTY reviews listing (no live approval)
+// separates it from an enqueue.
+func TestMergeRun_IneligibleBehindRunRefusesWithoutRows(t *testing.T) {
+	f, r, merger := mqMergeFixture(t, false)
+	w := f.mergeRun(r)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("merge = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	body := env.Error
+	if body.Code != mergeCodeBaseBehind || !strings.Contains(body.Message, "does not contain the current tip") {
+		t.Fatalf("refusal = %s %q, want today's merge_base_behind", body.Code, body.Message)
+	}
+	if got, _ := json.Marshal(body.Details["merge_queue_ineligible"]); string(got) != `["not_approved"]` {
+		t.Fatalf("merge_queue_ineligible = %s, want [not_approved]", got)
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 0 {
+		t.Fatalf("merge_queue_entered rows = %d, want 0", n)
+	}
+	if merger.called != 0 {
+		t.Fatalf("merger called %d times", merger.called)
+	}
+}
+
+func TestMergeRun_UndeterminableEligibilityRefuses(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	f.gh.set(func() { f.gh.reviewsStatus[r.pr] = http.StatusInternalServerError })
+	w := f.mergeRun(r)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"merge_queue_ineligible":["undeterminable"]`) {
+		t.Fatalf("merge = %d %s, want 409 with merge_queue_ineligible [undeterminable]", w.Code, w.Body.String())
+	}
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+}
+
+// TestMergeRun_AuditAppendFailureLeavesNoEntry pins approval condition C3:
+// merge_queue_entered is appended BEFORE the queue write, so a failed append
+// leaves no entry and no merge_intent_at and answers 503; a retry records.
+func TestMergeRun_AuditAppendFailureLeavesNoEntry(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	f.srv.cfg.AuditRepo = mqFailEnteredAudit{Repository: f.audit}
+	w := f.mergeRun(r)
+	if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "merge_queue_unrecorded") {
+		t.Fatalf("merge = %d %s, want 503 merge_queue_unrecorded", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries after a failed append = %d, want 0 (record before commit)", len(es))
+	}
+	f.srv.cfg.AuditRepo = f.audit
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("retry = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 1 {
+		t.Fatalf("merge_queue_entered rows after retry = %d, want 1", n)
+	}
+	if got := f.intentAt(r); len(got) != 1 || !got[0] {
+		t.Fatalf("intent after retry = %v", got)
+	}
+}
+
+func TestMergeRun_QueueUnwiredKeepsTodaysRefusal(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	f.srv.cfg.MergeQueue = nil
+	w := f.mergeRun(r)
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), mergeCodeBaseBehind) ||
+		strings.Contains(w.Body.String(), "merge_queue_ineligible") {
+		t.Fatalf("merge = %d %s, want today's merge_base_behind with no queue detail", w.Code, w.Body.String())
+	}
+}
+
+func TestMergeRun_EnqueueArmSkipsRedAndUnreadableGates(t *testing.T) {
+	f, r, _ := mqMergeFixture(t, true)
+	for _, code := range []string{mergeCodeCandidateVerifyFailed, mergeCodeCandidateCheckFailed} {
+		req := withMergeOperator(httptest.NewRequest(http.MethodPost, "/", nil))
+		w := httptest.NewRecorder()
+		handled, ineligible := f.srv.mergeQueueEnqueueArm(w, req, f.runRow(r), r.prURL, "v", "github:ops",
+			mergeCandidateGateResult{Code: code, prHeadSHA: "m0", prBaseRef: mcqBase})
+		if handled || ineligible != nil {
+			t.Fatalf("%s: handled=%v ineligible=%v, want today's refusal untouched", code, handled, ineligible)
+		}
+	}
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+}
