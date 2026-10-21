@@ -246,6 +246,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-104"
+      ],
       "applies_to": []
     },
     {
@@ -255,6 +258,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-107"
+      ],
       "applies_to": []
     },
     {
@@ -787,6 +793,18 @@
       "applies_to": []
     },
     {
+      "id": "ADR-085",
+      "title": "Earned autonomy: recommendations only, from server-attested evidence and a blind shadow record, with asymmetric thresholds (lower fast, raise slowly) and captain ratification through a human-authored spec change",
+      "path": "docs/adr/085-earned-autonomy-recommendations-only.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amended_by": [
+        "ADR-101"
+      ],
+      "applies_to": []
+    },
+    {
       "id": "ADR-087",
       "title": "Local stage concurrency groups: server-coordinated admission of host-dispatched stages",
       "path": "docs/adr/087-local-stage-concurrency-groups.md",
@@ -975,10 +993,57 @@
       "superseded_by": [],
       "amends": [
         "ADR-040",
+        "ADR-085",
         "ADR-089",
         "ADR-097"
       ],
       "applies_to": []
+    },
+    {
+      "id": "ADR-104",
+      "title": "Host dispatcher: a host-side, dispatch-only process spawns the parked local stages of auto-started campaign runs",
+      "path": "docs/adr/104-host-dispatcher.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-024"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-106",
+      "title": "Run-bound agent tokens get a subject-filtered audit read: how cross-run audit categories are withheld",
+      "path": "docs/adr/106-run-bound-subject-filtered-audit-read.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "backend/internal/audit/categories.go"
+      ]
+    },
+    {
+      "id": "ADR-107",
+      "title": "Amend ADR-025: split the stage timeout into an agent budget and a project-derived verify-gate budget",
+      "path": "docs/adr/107-split-stage-timeout-agent-and-gate-budgets.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-025"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-108",
+      "title": "Shared Postgres lock-holder budget: one pool-wide pglock budget with reserved headroom and enforced no-nesting for every connection-holding advisory-lock helper",
+      "path": "docs/adr/108-shared-postgres-lock-holder-budget.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": [
+        "backend/internal/pglock/**"
+      ]
     }
   ]
 }

@@ -279,9 +279,20 @@ touched):
   whether it amends both "without superseding either", and it states no
   supersession. ADR-040 and ADR-089 therefore carry `amended_by: [ADR-097,
   ADR-101]`.
-- NOT encodable: ADR-101's "ADR-085: amended". No ADR-085 record exists, and a
-  link must name an existing record; the change that backfills ADR-085 adds
-  both sides.
+- ADR-101's "ADR-085: amended" was not encodable while no ADR-085 record
+  existed. The change that backfills ADR-085 adds both sides: ADR-101
+  `amends` gains ADR-085, and ADR-085 carries `amended_by: [ADR-101]`. ADR-085
+  stays `accepted`; ADR-101 states no supersession of it.
+
+Amendments recorded under the upkeep rule since:
+
+- ADR-104: `amends: [ADR-024]` ("**Amends:** ADR-024 (Q4, Q5)"; its
+  Decision names this front matter); ADR-024 `amended_by: [ADR-104]`. Its
+  "and the ADR-022 addendum (a third identity: host dispatcher)" is NOT
+  encoded: the Decision names only ADR-024 for the record. Adding ADR-022 is
+  an operator decision.
+- ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
+  it"); ADR-025 `amended_by: [ADR-107]`.
 
 Decision-record selection (`backend/internal/decisionrecord`) follows
 `amended_by` from a selected record to its amendments and ranks a
@@ -417,6 +428,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-078](078-ground-review-agents-widen-context-narrow-capability.md) | Ground the review agents by widening context and narrowing capability: export the reviewed tree, scrub the inherited environment, grant read and search only | `accepted` | [#2519](https://github.com/kuhlman-labs/fishhawk/issues/2519) |
 | [ADR-079](079-product-and-program-management-agent.md) | Product and program management agent for human-ratified charters, release strategy, and readiness | `accepted` | [#3238](https://github.com/kuhlman-labs/fishhawk/issues/3238) |
 | [ADR-080](080-solo-captain-alpha.md) | Solo-captain alpha: the repository is the unit, one developer commands the full crew locally from the bridge | `accepted` | [#3693](https://github.com/kuhlman-labs/fishhawk/issues/3693) |
+| [ADR-085](085-earned-autonomy-recommendations-only.md) | Earned autonomy: recommendations only, from server-attested evidence and a blind shadow record, with asymmetric thresholds (lower fast, raise slowly) and captain ratification through a human-authored spec change | `accepted` | [#3777](https://github.com/kuhlman-labs/fishhawk/issues/3777) |
 | [ADR-087](087-local-stage-concurrency-groups.md) | Local stage concurrency groups: server-coordinated admission of host-dispatched stages | `accepted` | [#3968](https://github.com/kuhlman-labs/fishhawk/issues/3968) |
 | [ADR-088](088-declarative-gate-services.md) | Declarative gate services: a closed, Fishhawk-owned `services:` schema under workflow-v2 `gate_container`, joined to the gate by a shared --network=none namespace (not raw compose, not a bridge network) | `accepted` | [#4042](https://github.com/kuhlman-labs/fishhawk/issues/4042) |
 | [ADR-089](089-first-officer-read-only-crew-seat.md) | First officer: a structurally read-only crew seat whose evidence-backed findings gate actions | `accepted` | [#4149](https://github.com/kuhlman-labs/fishhawk/issues/4149) |
@@ -432,6 +444,10 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-099](099-crew-role-naming.md) | Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles | `accepted` | [#4331](https://github.com/kuhlman-labs/fishhawk/issues/4331) |
 | [ADR-100](100-adaptive-bounded-concurrency.md) | Adaptive, bounded concurrency for host-dispatched stages: a product-owned headroom controller beside the integer limit, operator override, staged shadow→canary→enforce (amends ADR-087 limit rule and ADR-094 D4/Q1) | `accepted` | [#4403](https://github.com/kuhlman-labs/fishhawk/issues/4403) |
 | [ADR-101](101-charter-authorization-mode.md) | Charter authorization mode: lease-based, bounded autonomous operation by a product-spawned operator under a deterministic engine, intersected with delegation; captain seat stays human (amends ADR-040/085/089/097) | `accepted` | [#4412](https://github.com/kuhlman-labs/fishhawk/issues/4412) |
+| [ADR-104](104-host-dispatcher.md) | Host dispatcher: a host-side, dispatch-only process spawns the parked local stages of auto-started campaign runs | `accepted` | [#4524](https://github.com/kuhlman-labs/fishhawk/issues/4524) |
+| [ADR-106](106-run-bound-subject-filtered-audit-read.md) | Run-bound agent tokens get a subject-filtered audit read: how cross-run audit categories are withheld | `accepted` | [#4575](https://github.com/kuhlman-labs/fishhawk/issues/4575) |
+| [ADR-107](107-split-stage-timeout-agent-and-gate-budgets.md) | Amend ADR-025: split the stage timeout into an agent budget and a project-derived verify-gate budget | `accepted` | [#4581](https://github.com/kuhlman-labs/fishhawk/issues/4581) |
+| [ADR-108](108-shared-postgres-lock-holder-budget.md) | Shared Postgres lock-holder budget: one pool-wide pglock budget with reserved headroom and enforced no-nesting for every connection-holding advisory-lock helper | `accepted` | [#4594](https://github.com/kuhlman-labs/fishhawk/issues/4594) |
 
 ## Status unknown — needs captain confirmation
 

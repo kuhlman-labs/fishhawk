@@ -57,7 +57,13 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-095": {nil, nil, []string{"ADR-091"}, nil},
 	"ADR-097": {nil, nil, []string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
 	"ADR-100": {nil, nil, []string{"ADR-087", "ADR-094"}, nil},
-	"ADR-101": {nil, nil, []string{"ADR-040", "ADR-089", "ADR-097"}, nil},
+	"ADR-101": {nil, nil, []string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}, nil},
+	// Amendments recorded under the upkeep rule since #4471.
+	"ADR-024": {nil, nil, nil, []string{"ADR-104"}},
+	"ADR-025": {nil, nil, nil, []string{"ADR-107"}},
+	"ADR-085": {nil, nil, nil, []string{"ADR-101"}},
+	"ADR-104": {nil, nil, []string{"ADR-024"}, nil},
+	"ADR-107": {nil, nil, []string{"ADR-025"}, nil},
 }
 
 // TestShippedIndex_EncodesAmendments pins the exact four link lists of every
