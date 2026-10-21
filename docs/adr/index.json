@@ -228,6 +228,9 @@
       "status": "unknown",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-104"
+      ],
       "applies_to": []
     },
     {
@@ -1007,6 +1010,7 @@
       "supersedes": [],
       "superseded_by": [],
       "amends": [
+        "ADR-022",
         "ADR-024"
       ],
       "applies_to": []

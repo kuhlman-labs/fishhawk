@@ -286,11 +286,10 @@ touched):
 
 Amendments recorded under the upkeep rule since:
 
-- ADR-104: `amends: [ADR-024]` ("**Amends:** ADR-024 (Q4, Q5)"; its
-  Decision names this front matter); ADR-024 `amended_by: [ADR-104]`. Its
-  "and the ADR-022 addendum (a third identity: host dispatcher)" is NOT
-  encoded: the Decision names only ADR-024 for the record. Adding ADR-022 is
-  an operator decision.
+- ADR-104: `amends: [ADR-022, ADR-024]` ("**Amends:** ADR-024 (Q4, Q5) and
+  the ADR-022 addendum (a third identity: host dispatcher)"); ADR-022 and
+  ADR-024 each carry `amended_by: [ADR-104]`. ADR-022 keeps its `unknown`
+  status: an amendment does not change the amended record's status.
 - ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
   it"); ADR-025 `amended_by: [ADR-107]`.
 

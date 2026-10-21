@@ -825,7 +825,7 @@ var adr040AmendmentEdges = map[string]struct{ amends, amendedBy []string }{
 	"ADR-040": {nil, []string{"ADR-097", "ADR-101"}},
 	"ADR-089": {nil, []string{"ADR-097", "ADR-101"}},
 	"ADR-097": {[]string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
-	"ADR-101": {[]string{"ADR-040", "ADR-089", "ADR-097"}, nil},
+	"ADR-101": {[]string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}, nil},
 }
 
 // TestPersonaPrompt_AmendmentFramingCrossesTheBoundary is approval
