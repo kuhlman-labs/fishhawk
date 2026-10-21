@@ -9,6 +9,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/jackc/pgx/v5/pgxpool"
 
@@ -63,7 +64,7 @@ var admissionStaleSQL = fmt.Sprintf("interval '%d seconds'", int(AdmissionStaleA
 const entryCols = `e.id, e.run_id, COALESCE(r.account_id::text, ''), e.repo, e.base_ref, e.state,
   COALESCE(e.phase, ''), COALESCE(e.eject_reason, ''), e.enqueued_at, e.anchored_head_sha,
   COALESCE(e.anchored_base_sha, ''), e.anchored_at, e.admitted_at, e.settled_at, e.updated_at,
-  e.merge_intent_at`
+  e.merge_intent_at, COALESCE(e.merge_intent_sequence, 0), e.admission_epoch`
 
 const entryFrom = `
 FROM merge_candidate_queue_entries e
@@ -79,7 +80,7 @@ func scanEntry(row pgx.Row, extra ...any) (Entry, error) {
 	dest := append([]any{&e.ID, &e.RunID, &e.AccountID, &e.Repo, &e.BaseRef, &state,
 		&phase, &e.EjectReason, &e.EnqueuedAt, &e.AnchoredHeadSHA,
 		&e.AnchoredBaseSHA, &e.AnchoredAt, &e.AdmittedAt, &e.SettledAt, &e.UpdatedAt,
-		&e.MergeIntentAt}, extra...)
+		&e.MergeIntentAt, &e.MergeIntentSequence, &e.AdmissionEpoch}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return Entry{}, err
 	}
@@ -180,7 +181,7 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 			}
 			out = EnqueueResult{Entry: e, Outcome: EnqueueReanchored, AnchorChanged: changed}
 			if req.MergeIntent {
-				e, recorded, err := markIntentTx(ctx, tx, e)
+				e, recorded, err := markIntentTx(ctx, tx, e, req.IntentSequence)
 				if err != nil {
 					return err
 				}
@@ -216,14 +217,15 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 
 // insertTx inserts a held row at the base's tail: enqueued_at (the FIFO key),
 // anchored_at and (with MergeIntent) merge_intent_at are one database-clock
-// instant.
+// instant, and merge_intent_sequence is stamped in the same statement.
 func insertTx(ctx context.Context, tx pgx.Tx, req EnqueueRequest, repo string) (Entry, error) {
 	var id uuid.UUID
 	if err := tx.QueryRow(ctx, `INSERT INTO merge_candidate_queue_entries
-  (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at, merge_intent_at)
-SELECT $1, $2, $3, 'held', c.ts, $4, NULLIF($5, ''), c.ts, CASE WHEN $6::bool THEN c.ts END
+  (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at, merge_intent_at, merge_intent_sequence)
+SELECT $1, $2, $3, 'held', c.ts, $4, NULLIF($5, ''), c.ts, CASE WHEN $6::bool THEN c.ts END,
+  CASE WHEN $6::bool THEN NULLIF($7::bigint, 0) END
 FROM (SELECT clock_timestamp() AS ts) c
-RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA, req.MergeIntent).Scan(&id); err != nil {
+RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA, req.MergeIntent, req.IntentSequence).Scan(&id); err != nil {
 		return Entry{}, fmt.Errorf("mergequeue: insert entry: %w", err)
 	}
 	return getEntryTx(ctx, tx, id)
@@ -244,15 +246,17 @@ WHERE id = $1`, cur.ID, headSHA, baseSHA); err != nil {
 	return e, true, err
 }
 
-// markIntentTx stamps an active entry's merge_intent_at when it is NULL and
-// reports whether it did; an already-set intent writes nothing.
-func markIntentTx(ctx context.Context, tx pgx.Tx, cur Entry) (Entry, bool, error) {
+// markIntentTx stamps an active entry's merge_intent_at, and seq as its
+// merge_intent_sequence in the SAME statement, when merge_intent_at is NULL,
+// and reports whether it did; an already-set intent writes nothing, so a
+// recorded sequence is never overwritten.
+func markIntentTx(ctx context.Context, tx pgx.Tx, cur Entry, seq int64) (Entry, bool, error) {
 	if cur.MergeIntentAt != nil {
 		return cur, false, nil
 	}
 	if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
-SET merge_intent_at = clock_timestamp()
-WHERE id = $1 AND merge_intent_at IS NULL`, cur.ID); err != nil {
+SET merge_intent_at = clock_timestamp(), merge_intent_sequence = NULLIF($2::bigint, 0)
+WHERE id = $1 AND merge_intent_at IS NULL`, cur.ID, seq); err != nil {
 		return Entry{}, false, fmt.Errorf("mergequeue: mark merge intent: %w", err)
 	}
 	e, err := getEntryTx(ctx, tx, cur.ID)
@@ -311,7 +315,9 @@ FOR UPDATE OF e`, base.Repo, base.BaseRef, acct), &stale)
 		case err == nil && stale:
 			// A crash mid-admission: re-claim it so exactly one pump re-runs
 			// the (idempotent) admission work.
-			if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries SET admitted_at = clock_timestamp() WHERE id = $1`, live.ID); err != nil {
+			if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
+SET admitted_at = clock_timestamp(), admission_epoch = admission_epoch + 1
+WHERE id = $1`, live.ID); err != nil {
 				return fmt.Errorf("mergequeue: reclaim admission: %w", err)
 			}
 			e, err := getEntryTx(ctx, tx, live.ID)
@@ -341,7 +347,7 @@ FOR UPDATE OF e`, base.Repo, base.BaseRef, acct))
 			return fmt.Errorf("mergequeue: read next held entry: %w", err)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
-SET state = 'live', phase = $2, admitted_at = clock_timestamp()
+SET state = 'live', phase = $2, admitted_at = clock_timestamp(), admission_epoch = admission_epoch + 1
 WHERE id = $1 AND state = 'held'`, next.ID, string(PhaseAdmitted)); err != nil {
 			return fmt.Errorf("mergequeue: admit entry: %w", err)
 		}
@@ -390,14 +396,23 @@ func stateConflict(cur Entry, want string) error {
 	return fmt.Errorf("%w: entry %s is %s, want %s", ErrStateConflict, cur.ID, cur.State, want)
 }
 
+// epochConflict is a CAS refusal: the entry is no longer live at the epoch
+// the caller's decision was made against.
+func epochConflict(cur Entry, epoch int64) error {
+	return fmt.Errorf("%w: entry %s is %s at admission epoch %d, want live at epoch %d",
+		ErrStateConflict, cur.ID, cur.State, cur.AdmissionEpoch, epoch)
+}
+
 // Unadmit returns a live entry to held at its ORIGINAL place (enqueued_at is
 // kept), clearing its phase and admitted_at — for a transient admission
-// failure. A non-live entry is ErrStateConflict and is not touched.
-func (s *PostgresStore) Unadmit(ctx context.Context, entryID uuid.UUID) (Entry, error) {
+// failure or a merge-on-pass readvance. It is a compare-and-swap on the
+// admission epoch: an entry that is not live, or was re-admitted since epoch,
+// is ErrStateConflict and is not touched.
+func (s *PostgresStore) Unadmit(ctx context.Context, entryID uuid.UUID, epoch int64) (Entry, error) {
 	var out Entry
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
-		if cur.State != StateLive {
-			return stateConflict(cur, string(StateLive))
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // Unadmit admission-epoch CAS
+			return epochConflict(cur, epoch)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
 SET state = 'held', phase = NULL, admitted_at = NULL
@@ -414,16 +429,17 @@ WHERE id = $1`, cur.ID); err != nil {
 	return out, nil
 }
 
-// SetPhase records an active entry's phase. A terminal entry is
-// ErrStateConflict; an unchanged phase writes nothing.
-func (s *PostgresStore) SetPhase(ctx context.Context, entryID uuid.UUID, phase Phase) (Entry, error) {
+// SetPhase records a LIVE entry's phase, a compare-and-swap on the admission
+// epoch: an entry that is not live, or was re-admitted since epoch, is
+// ErrStateConflict and is not touched; an unchanged phase writes nothing.
+func (s *PostgresStore) SetPhase(ctx context.Context, entryID uuid.UUID, epoch int64, phase Phase) (Entry, error) {
 	if phase == "" {
 		return Entry{}, fmt.Errorf("%w: phase is required", ErrInvalidRequest)
 	}
 	var out Entry
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
-		if !cur.State.Active() {
-			return stateConflict(cur, "held or live")
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // SetPhase admission-epoch CAS
+			return epochConflict(cur, epoch)
 		}
 		if cur.Phase == phase {
 			out = cur
@@ -464,15 +480,73 @@ func (s *PostgresStore) Reanchor(ctx context.Context, entryID uuid.UUID, headSHA
 	return out, nil
 }
 
+// ReanchorAt is Reanchor for the admission owner: a compare-and-swap on the
+// admission epoch. An entry that is not live, or was re-admitted since epoch,
+// is ErrStateConflict and is not touched; an unchanged anchor writes nothing.
+func (s *PostgresStore) ReanchorAt(ctx context.Context, entryID uuid.UUID, epoch int64, headSHA, baseSHA string) (Entry, error) {
+	if headSHA == "" {
+		return Entry{}, fmt.Errorf("%w: head sha is required", ErrInvalidRequest)
+	}
+	var out Entry
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // ReanchorAt admission-epoch CAS
+			return epochConflict(cur, epoch)
+		}
+		e, _, err := reanchorTx(ctx, tx, cur, headSHA, baseSHA)
+		out = e
+		return err
+	})
+	if err != nil {
+		return Entry{}, err
+	}
+	return out, nil
+}
+
+// validateSettle refuses a malformed settle before any SQL runs.
+func validateSettle(state State, reason string) error {
+	if !state.Terminal() {
+		return fmt.Errorf("%w: settle state %q is not merged, ejected or dropped", ErrInvalidRequest, state)
+	}
+	if state != StateMerged && reason == "" {
+		return fmt.Errorf("%w: a %s entry requires a reason", ErrInvalidRequest, state)
+	}
+	return nil
+}
+
+// SettleAt is Settle for the admission owner and merge-on-pass decisions: a
+// compare-and-swap on the admission epoch. An already-terminal entry writes
+// nothing and returns that entry (Settled=false), like Settle; a held entry,
+// or a live one re-admitted since epoch, is ErrStateConflict and is not
+// touched.
+func (s *PostgresStore) SettleAt(ctx context.Context, entryID uuid.UUID, epoch int64, state State, reason string) (SettleResult, error) {
+	if err := validateSettle(state, reason); err != nil {
+		return SettleResult{}, err
+	}
+	var out SettleResult
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		if cur.State.Terminal() {
+			out = SettleResult{Entry: cur}
+			return nil
+		}
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // SettleAt admission-epoch CAS
+			return epochConflict(cur, epoch)
+		}
+		e, err := settleTx(ctx, tx, cur.ID, state, reason)
+		out = SettleResult{Entry: e, Settled: true}
+		return err
+	})
+	if err != nil {
+		return SettleResult{}, err
+	}
+	return out, nil
+}
+
 // Settle moves an active entry to merged, ejected or dropped. Ejected and
 // dropped require a reason. On an already-terminal entry it writes nothing
 // and returns that entry with its first state (Settled=false).
 func (s *PostgresStore) Settle(ctx context.Context, entryID uuid.UUID, state State, reason string) (SettleResult, error) {
-	if !state.Terminal() {
-		return SettleResult{}, fmt.Errorf("%w: settle state %q is not merged, ejected or dropped", ErrInvalidRequest, state)
-	}
-	if state != StateMerged && reason == "" {
-		return SettleResult{}, fmt.Errorf("%w: a %s entry requires a reason", ErrInvalidRequest, state)
+	if err := validateSettle(state, reason); err != nil {
+		return SettleResult{}, err
 	}
 	var out SettleResult
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
@@ -490,18 +564,26 @@ func (s *PostgresStore) Settle(ctx context.Context, entryID uuid.UUID, state Sta
 	return out, nil
 }
 
-// MarkMergeIntent records the operator's merge intent on an ACTIVE entry. A
-// terminal entry is ErrStateConflict; an already-set intent writes nothing
-// and calls no record (IntentRecorded=false). record, when non-nil, runs
-// inside the transaction after the write and before commit; its error rolls
-// the write back (ErrIntentUnrecorded). Lock order is SetPhase's.
-func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, record RecordIntentFunc) (MergeIntentResult, error) {
+// MarkMergeIntent records the operator's merge intent on an ACTIVE entry,
+// stamping req.IntentSequence as merge_intent_sequence in the same statement.
+// A terminal entry is ErrStateConflict; an already-set intent writes nothing
+// (the recorded sequence is never overwritten) and calls no record
+// (IntentRecorded=false). req.Record, when non-nil, runs inside the
+// transaction after the write and before commit; its error rolls the write
+// back (ErrIntentUnrecorded). A nil req records with neither. Lock order is
+// SetPhase's.
+func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, req *MergeIntentRequest) (MergeIntentResult, error) {
+	var seq int64
+	var record RecordIntentFunc
+	if req != nil {
+		seq, record = req.IntentSequence, req.Record
+	}
 	var out MergeIntentResult
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
 		if !cur.State.Active() {
 			return stateConflict(cur, "held or live")
 		}
-		e, recorded, err := markIntentTx(ctx, tx, cur)
+		e, recorded, err := markIntentTx(ctx, tx, cur, seq)
 		if err != nil {
 			return err
 		}
@@ -517,11 +599,12 @@ func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, 
 	return out, nil
 }
 
-// intentFnTimeout bounds the merge-intent decision fn runs under the lock:
-// generous for its DB-only work (ActiveForRun, the chained append, Enqueue or
-// MarkMergeIntent, the read-back), and applied even when the caller's context
-// carries no deadline.
-const intentFnTimeout = 30 * time.Second
+// intentFnTimeout bounds every fn run under the merge-intent lock: the
+// merge_run intent decision's DB work, and (ADR-093 slice 2) merge-on-pass's,
+// the inline merge_run tail's and the delegated arm's forge reads and merge
+// call, each carrying its own per-call timeout well under this bound. It is
+// applied even when the caller's context carries no deadline.
+const intentFnTimeout = 90 * time.Second
 
 // WithMergeIntentLock runs fn while holding the run's merge-intent lock: a
 // SESSION-level advisory lock on intentLockKey, held on one dedicated pooled
@@ -549,6 +632,87 @@ func (s *PostgresStore) WithMergeIntentLock(ctx context.Context, runID uuid.UUID
 		return fmt.Errorf("%w: %w", ErrIntentLockLapsed, err)
 	}
 	return err
+}
+
+// ClaimMergeDispatch claims the run's ONE merge dispatch (approval condition
+// D1): a plain INSERT into merge_dispatch_claims, so the UNIQUE run_id
+// constraint, not any lock, is what admits exactly one claim per run. A
+// unique violation is ErrAlreadyDispatched, returned with the existing claim
+// (read back on the pool; the zero claim when that read fails). An unknown
+// run is ErrNotFound. See README.md § "Merge-dispatch ledger".
+func (s *PostgresStore) ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (DispatchClaim, error) {
+	if runID == uuid.Nil || headSHA == "" {
+		return DispatchClaim{}, fmt.Errorf("%w: run id and head sha are required", ErrInvalidRequest)
+	}
+	switch path {
+	case DispatchPathInline, DispatchPathDelegated, DispatchPathQueue:
+	default:
+		return DispatchClaim{}, fmt.Errorf("%w: dispatch path %q is not inline, delegated or queue", ErrInvalidRequest, path)
+	}
+	c, err := scanClaim(s.pool.QueryRow(ctx, `INSERT INTO merge_dispatch_claims (run_id, state, path, head_sha)
+VALUES ($1, 'dispatched', $2, $3)
+RETURNING `+claimCols, runID, path, headSHA))
+	if err == nil {
+		return c, nil
+	}
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		switch pgErr.Code {
+		case "23505": // unique_violation: the D1 UNIQUE run_id
+			existing, _, _ := s.mergeDispatchFor(ctx, runID)
+			return existing, fmt.Errorf("run %s: %w", runID, ErrAlreadyDispatched)
+		case "23503": // foreign_key_violation: no such run
+			return DispatchClaim{}, fmt.Errorf("run %s: %w", runID, ErrNotFound)
+		}
+	}
+	return DispatchClaim{}, fmt.Errorf("mergequeue: claim merge dispatch: %w", err)
+}
+
+// MarkMergeDispatchFailed moves the run's dispatch claim to dispatch_failed,
+// recording cause and the database-clock instant. The claim is UPDATED, never
+// deleted, so a later dispatch is still refused until the operator re-arms it
+// (README.md § "Merge-dispatch ledger"). A repeat keeps the first failure. A
+// run with no claim is ErrNotFound.
+func (s *PostgresStore) MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error {
+	if runID == uuid.Nil {
+		return fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	}
+	tag, err := s.pool.Exec(ctx, `UPDATE merge_dispatch_claims
+SET state = 'dispatch_failed',
+    failed_at = COALESCE(failed_at, clock_timestamp()),
+    failure_cause = COALESCE(failure_cause, NULLIF($2, ''))
+WHERE run_id = $1`, runID, cause)
+	if err != nil {
+		return fmt.Errorf("mergequeue: mark merge dispatch failed: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("run %s has no merge dispatch claim: %w", runID, ErrNotFound)
+	}
+	return nil
+}
+
+const claimCols = `run_id, state, path, head_sha, claimed_at, failed_at, COALESCE(failure_cause, '')`
+
+func scanClaim(row pgx.Row) (DispatchClaim, error) {
+	var c DispatchClaim
+	var state string
+	if err := row.Scan(&c.RunID, &state, &c.Path, &c.HeadSHA, &c.ClaimedAt, &c.FailedAt, &c.FailureCause); err != nil {
+		return DispatchClaim{}, err
+	}
+	c.State = DispatchState(state)
+	return c, nil
+}
+
+// mergeDispatchFor reads the run's dispatch claim.
+func (s *PostgresStore) mergeDispatchFor(ctx context.Context, runID uuid.UUID) (DispatchClaim, bool, error) {
+	c, err := scanClaim(s.pool.QueryRow(ctx, `SELECT `+claimCols+` FROM merge_dispatch_claims WHERE run_id = $1`, runID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DispatchClaim{}, false, nil
+	}
+	if err != nil {
+		return DispatchClaim{}, false, fmt.Errorf("mergequeue: read merge dispatch claim: %w", err)
+	}
+	return c, true, nil
 }
 
 // rowQuerier is the QueryRow half shared by the pool and a transaction.

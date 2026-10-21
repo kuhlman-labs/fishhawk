@@ -531,7 +531,7 @@ func TestAdmitNext_StaleAdmissionReclaimedOnce(t *testing.T) {
 	if again := f.admitNext(mainBase()); again.Admitted || again.Entry.ID != first.ID {
 		t.Fatalf("second AdmitNext = %+v, want no re-claim of a just-claimed admission", again)
 	}
-	if _, err := f.store.SetPhase(context.Background(), first.ID, PhaseVerifying); err != nil {
+	if _, err := f.store.SetPhase(context.Background(), first.ID, f.entry(first.ID).AdmissionEpoch, PhaseVerifying); err != nil {
 		t.Fatalf("SetPhase: %v", err)
 	}
 	backdate()
@@ -588,9 +588,10 @@ func TestSettle_IdempotentOnTerminalRow(t *testing.T) {
 		t.Fatalf("row after second settle = %+v, want byte-identical to %+v (nothing written)", after, before)
 	}
 	for name, call := range map[string]func() error{
-		"Unadmit":  func() error { _, err := f.store.Unadmit(ctx, e.ID); return err },
-		"SetPhase": func() error { _, err := f.store.SetPhase(ctx, e.ID, PhasePassed); return err },
-		"Reanchor": func() error { _, err := f.store.Reanchor(ctx, e.ID, "h9", ""); return err },
+		"Unadmit":    func() error { _, err := f.store.Unadmit(ctx, e.ID, before.AdmissionEpoch); return err },
+		"SetPhase":   func() error { _, err := f.store.SetPhase(ctx, e.ID, before.AdmissionEpoch, PhasePassed); return err },
+		"Reanchor":   func() error { _, err := f.store.Reanchor(ctx, e.ID, "h9", ""); return err },
+		"ReanchorAt": func() error { _, err := f.store.ReanchorAt(ctx, e.ID, before.AdmissionEpoch, "h9", ""); return err },
 	} {
 		if err := call(); !errors.Is(err, ErrStateConflict) {
 			t.Errorf("%s on a terminal entry: err = %v, want ErrStateConflict", name, err)
@@ -603,12 +604,12 @@ func TestUnadmit_ReturnsToHeldKeepingEnqueuedAt(t *testing.T) {
 	a, b := f.run(), f.run()
 	orig := f.enqueue(a, "main", "h1").Entry
 	f.enqueue(b, "main", "x1")
-	if _, err := f.store.Unadmit(context.Background(), orig.ID); !errors.Is(err, ErrStateConflict) {
+	if _, err := f.store.Unadmit(context.Background(), orig.ID, orig.AdmissionEpoch); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("Unadmit(held) err = %v, want ErrStateConflict", err)
 	}
-	f.admitNext(mainBase())
+	adm := f.admitNext(mainBase())
 
-	got, err := f.store.Unadmit(context.Background(), orig.ID)
+	got, err := f.store.Unadmit(context.Background(), orig.ID, adm.Entry.AdmissionEpoch)
 	if err != nil {
 		t.Fatalf("Unadmit: %v", err)
 	}
@@ -628,13 +629,13 @@ func TestSetPhaseAndReanchor(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	e := f.enqueue(f.run(), "main", "h1").Entry
-	f.admitNext(mainBase())
+	epoch := f.admitNext(mainBase()).Entry.AdmissionEpoch
 
-	got, err := f.store.SetPhase(ctx, e.ID, PhasePassed)
+	got, err := f.store.SetPhase(ctx, e.ID, epoch, PhasePassed)
 	if err != nil || got.Phase != PhasePassed || f.entry(e.ID).Phase != PhasePassed {
 		t.Fatalf("SetPhase = %+v, %v; want passed", got, err)
 	}
-	same, err := f.store.SetPhase(ctx, e.ID, PhasePassed)
+	same, err := f.store.SetPhase(ctx, e.ID, epoch, PhasePassed)
 	if err != nil || !same.UpdatedAt.Equal(got.UpdatedAt) {
 		t.Fatalf("unchanged SetPhase = %+v, %v; want nothing written", same, err)
 	}
@@ -643,9 +644,11 @@ func TestSetPhaseAndReanchor(t *testing.T) {
 		t.Fatalf("Reanchor = %+v, %v; want head h2, NULL base, live/passed, same enqueued_at", re, err)
 	}
 	for name, call := range map[string]func() error{
-		"SetPhase empty": func() error { _, err := f.store.SetPhase(ctx, e.ID, ""); return err },
-		"Reanchor empty": func() error { _, err := f.store.Reanchor(ctx, e.ID, "", "b"); return err },
-		"Unadmit nil":    func() error { _, err := f.store.Unadmit(ctx, uuid.Nil); return err },
+		"SetPhase empty":   func() error { _, err := f.store.SetPhase(ctx, e.ID, epoch, ""); return err },
+		"Reanchor empty":   func() error { _, err := f.store.Reanchor(ctx, e.ID, "", "b"); return err },
+		"ReanchorAt empty": func() error { _, err := f.store.ReanchorAt(ctx, e.ID, epoch, "", "b"); return err },
+		"SettleAt held":    func() error { _, err := f.store.SettleAt(ctx, e.ID, epoch, StateHeld, "x"); return err },
+		"Unadmit nil":      func() error { _, err := f.store.Unadmit(ctx, uuid.Nil, epoch); return err },
 	} {
 		if err := call(); !errors.Is(err, ErrInvalidRequest) {
 			t.Errorf("%s: err = %v, want ErrInvalidRequest", name, err)
@@ -726,7 +729,7 @@ func TestTxHelpers_WrapDatabaseErrors(t *testing.T) {
 		},
 		"settleTx": func() error { _, err := settleTx(ctx, tx, id, StateDropped, ReasonBaseChanged); return err },
 		"markIntentTx": func() error {
-			_, recorded, err := markIntentTx(ctx, tx, Entry{ID: id})
+			_, recorded, err := markIntentTx(ctx, tx, Entry{ID: id}, 0)
 			if recorded {
 				t.Errorf("markIntentTx reported a recorded intent on a failed write")
 			}
@@ -756,11 +759,18 @@ func TestStore_CanceledContextFailsAndWritesNothing(t *testing.T) {
 			_, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "release", HeadSHA: "h2"})
 			return err
 		},
-		"AdmitNext": func() error { _, err := f.store.AdmitNext(ctx, mainBase()); return err },
-		"Unadmit":   func() error { _, err := f.store.Unadmit(ctx, e.ID); return err },
-		"SetPhase":  func() error { _, err := f.store.SetPhase(ctx, e.ID, PhasePassed); return err },
-		"Reanchor":  func() error { _, err := f.store.Reanchor(ctx, e.ID, "h2", ""); return err },
-		"Settle":    func() error { _, err := f.store.Settle(ctx, e.ID, StateMerged, ""); return err },
+		"AdmitNext":  func() error { _, err := f.store.AdmitNext(ctx, mainBase()); return err },
+		"Unadmit":    func() error { _, err := f.store.Unadmit(ctx, e.ID, 0); return err },
+		"SetPhase":   func() error { _, err := f.store.SetPhase(ctx, e.ID, 0, PhasePassed); return err },
+		"Reanchor":   func() error { _, err := f.store.Reanchor(ctx, e.ID, "h2", ""); return err },
+		"ReanchorAt": func() error { _, err := f.store.ReanchorAt(ctx, e.ID, 0, "h2", ""); return err },
+		"Settle":     func() error { _, err := f.store.Settle(ctx, e.ID, StateMerged, ""); return err },
+		"SettleAt":   func() error { _, err := f.store.SettleAt(ctx, e.ID, 0, StateMerged, ""); return err },
+		"ClaimMergeDispatch": func() error {
+			_, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathQueue, "h1")
+			return err
+		},
+		"MarkMergeDispatchFailed": func() error { return f.store.MarkMergeDispatchFailed(ctx, r, "x") },
 		"ActiveForRun": func() error {
 			_, found, err := f.store.ActiveForRun(ctx, r)
 			if found {
@@ -903,12 +913,12 @@ func TestMarkMergeIntent_IdempotentAndRefusesTerminal(t *testing.T) {
 	calls := 0
 	record := func(context.Context, Status) error { calls++; return nil }
 
-	got, err := f.store.MarkMergeIntent(ctx, e.ID, record)
+	got, err := f.store.MarkMergeIntent(ctx, e.ID, &MergeIntentRequest{Record: record})
 	if err != nil || !got.IntentRecorded || got.Entry.MergeIntentAt == nil || got.Entry.State != StateLive || calls != 1 {
 		t.Fatalf("MarkMergeIntent = %+v, %v (record calls %d); want the live entry stamped, recorded once", got, err, calls)
 	}
 	stamped := f.entry(e.ID)
-	again, err := f.store.MarkMergeIntent(ctx, e.ID, record)
+	again, err := f.store.MarkMergeIntent(ctx, e.ID, &MergeIntentRequest{Record: record})
 	if err != nil || again.IntentRecorded || calls != 1 {
 		t.Fatalf("repeat MarkMergeIntent = %+v, %v (record calls %d); want IntentRecorded false, no record", again, err, calls)
 	}
@@ -924,7 +934,7 @@ func TestMarkMergeIntent_IdempotentAndRefusesTerminal(t *testing.T) {
 	// A nil record isolates the state guard: no record-time backstop can
 	// roll a terminal stamp back.
 	for _, rec := range []RecordIntentFunc{nil, record} {
-		if _, err := f.store.MarkMergeIntent(ctx, gone.ID, rec); !errors.Is(err, ErrStateConflict) {
+		if _, err := f.store.MarkMergeIntent(ctx, gone.ID, &MergeIntentRequest{Record: rec}); !errors.Is(err, ErrStateConflict) {
 			t.Fatalf("MarkMergeIntent(terminal) err = %v, want ErrStateConflict", err)
 		}
 	}
@@ -1011,12 +1021,12 @@ func TestRecordIntent_FailureRollsBackAndRetryRecords(t *testing.T) {
 	// MarkMergeIntent.
 	c := f.run()
 	ce := f.enqueue(c, "main", "c1").Entry
-	_, err = f.store.MarkMergeIntent(ctx, ce.ID, fail)
+	_, err = f.store.MarkMergeIntent(ctx, ce.ID, &MergeIntentRequest{Record: fail})
 	wantUnrecorded("MarkMergeIntent", err)
 	if got := f.entry(ce.ID); got.MergeIntentAt != nil {
 		t.Fatalf("row after an unrecorded MarkMergeIntent = %+v, want no intent", got)
 	}
-	if res, err := f.store.MarkMergeIntent(ctx, ce.ID, ok); err != nil || !res.IntentRecorded || len(seen) != 3 || seen[2].Entry.ID != ce.ID {
+	if res, err := f.store.MarkMergeIntent(ctx, ce.ID, &MergeIntentRequest{Record: ok}); err != nil || !res.IntentRecorded || len(seen) != 3 || seen[2].Entry.ID != ce.ID {
 		t.Fatalf("retried MarkMergeIntent = %+v, %v (records %d); want recorded on the entry", res, err, len(seen))
 	}
 
@@ -1222,8 +1232,8 @@ func TestWithMergeIntentLock_FnCarriesDeadline(t *testing.T) {
 	}
 	// The literal, not intentFnTimeout: a bound derived from the constant
 	// would scale with it and could not catch a wrong value.
-	if limit := before.Add(30*time.Second + timescale.D(5*time.Second)); deadline.After(limit) {
-		t.Fatalf("fn deadline %s is later than now+30s (the intent fn deadline)+slack", deadline.Sub(before))
+	if limit := before.Add(90*time.Second + timescale.D(5*time.Second)); deadline.After(limit) {
+		t.Fatalf("fn deadline %s is later than now+90s (the intent fn deadline)+slack", deadline.Sub(before))
 	}
 	if !marked {
 		t.Fatal("fn's context is not marked as inside a pglock lock")
@@ -1408,4 +1418,298 @@ func TestWithMergeIntentLock_SurvivesIdleInTransactionTimeout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("WithMergeIntentLock = %v, want nil", err)
 	}
+}
+
+// TestAdmitNext_BumpsEpochOnAdmitAndReclaim pins 0108's admission epoch: a
+// fresh row reads 0, every admission (the admit AND the stale re-claim)
+// bumps it by one, and a no-op AdmitNext (a live entry holds the line)
+// leaves it.
+func TestAdmitNext_BumpsEpochOnAdmitAndReclaim(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	if e.AdmissionEpoch != 0 {
+		t.Fatalf("fresh entry epoch = %d, want 0", e.AdmissionEpoch)
+	}
+	if adm := f.admitNext(mainBase()); !adm.Admitted || adm.Entry.AdmissionEpoch != 1 {
+		t.Fatalf("admit = %+v, want admitted at epoch 1", adm)
+	}
+	if adm := f.admitNext(mainBase()); adm.Admitted || f.entry(e.ID).AdmissionEpoch != 1 {
+		t.Fatalf("no-op AdmitNext = %+v, epoch %d; want not admitted, epoch 1", adm, f.entry(e.ID).AdmissionEpoch)
+	}
+	f.exec(`UPDATE merge_candidate_queue_entries SET admitted_at = clock_timestamp() - make_interval(secs => $2) WHERE id = $1`,
+		e.ID, (AdmissionStaleAfter + time.Minute).Seconds())
+	if adm := f.admitNext(mainBase()); !adm.Readmitted || adm.Entry.AdmissionEpoch != 2 || f.entry(e.ID).AdmissionEpoch != 2 {
+		t.Fatalf("stale re-claim = %+v, want readmitted at epoch 2", adm)
+	}
+	if _, err := f.store.Unadmit(context.Background(), e.ID, 2); err != nil {
+		t.Fatalf("Unadmit(2): %v", err)
+	}
+	if adm := f.admitNext(mainBase()); !adm.Admitted || adm.Entry.AdmissionEpoch != 3 {
+		t.Fatalf("re-admission = %+v, want admitted at epoch 3", adm)
+	}
+}
+
+// TestUnadmit_StaleEpochConflicts is the ADR-093 slice 2 stale-decision race
+// at the store: admit (epoch 1), Unadmit(1), re-admit (epoch 2), then a
+// stale Unadmit(1) is ErrStateConflict and the COMMITTED row is still live at
+// epoch 2 with its admitted_at (read back, not inferred from the error).
+func TestUnadmit_StaleEpochConflicts(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	if adm := f.admitNext(mainBase()); adm.Entry.AdmissionEpoch != 1 {
+		t.Fatalf("admit epoch = %d, want 1", adm.Entry.AdmissionEpoch)
+	}
+	if _, err := f.store.Unadmit(ctx, e.ID, 1); err != nil {
+		t.Fatalf("Unadmit(1): %v", err)
+	}
+	f.admitNext(mainBase())
+	before := f.entry(e.ID)
+	if _, err := f.store.Unadmit(ctx, e.ID, 1); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale Unadmit(1) err = %v, want ErrStateConflict", err)
+	}
+	after := f.entry(e.ID)
+	if after.State != StateLive || after.AdmissionEpoch != 2 || after.AdmittedAt == nil || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("entry after stale Unadmit = %+v, want untouched live at epoch 2", after)
+	}
+}
+
+// TestSetPhase_StaleEpochConflicts: a stale epoch or a held entry is refused
+// and the committed phase is unchanged.
+func TestSetPhase_StaleEpochConflicts(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	if _, err := f.store.SetPhase(ctx, e.ID, 0, PhasePassed); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("SetPhase(held) err = %v, want ErrStateConflict", err)
+	}
+	f.admitNext(mainBase())
+	if _, err := f.store.SetPhase(ctx, e.ID, 0, PhasePassed); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("SetPhase(stale epoch 0) err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(e.ID); got.Phase != PhaseAdmitted {
+		t.Fatalf("phase after stale SetPhase = %q, want %q (untouched)", got.Phase, PhaseAdmitted)
+	}
+	if got, err := f.store.SetPhase(ctx, e.ID, 1, PhasePassed); err != nil || f.entry(e.ID).Phase != PhasePassed || got.Phase != PhasePassed {
+		t.Fatalf("SetPhase(1) = %+v, %v; want passed", got, err)
+	}
+}
+
+// TestSettleAt_StaleEpochConflicts: SettleAt settles only the live entry at
+// its epoch; a stale epoch or a held entry is ErrStateConflict with the row
+// still active, and a terminal row answers Settled=false like Settle.
+func TestSettleAt_StaleEpochConflicts(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	if _, err := f.store.SettleAt(ctx, e.ID, 0, StateDropped, "pr_closed"); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("SettleAt(held) err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(e.ID); got.State != StateHeld || got.SettledAt != nil {
+		t.Fatalf("held entry after SettleAt = %+v, want untouched", got)
+	}
+	f.admitNext(mainBase())
+	if _, err := f.store.SettleAt(ctx, e.ID, 0, StateDropped, "pr_closed"); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("SettleAt(stale epoch) err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(e.ID); got.State != StateLive || got.SettledAt != nil {
+		t.Fatalf("live entry after stale SettleAt = %+v, want untouched", got)
+	}
+	res, err := f.store.SettleAt(ctx, e.ID, 1, StateEjected, "verify_failed")
+	if err != nil || !res.Settled || f.entry(e.ID).State != StateEjected {
+		t.Fatalf("SettleAt(1) = %+v, %v; want settled ejected", res, err)
+	}
+	again, err := f.store.SettleAt(ctx, e.ID, 1, StateDropped, "pr_closed")
+	if err != nil || again.Settled || again.Entry.State != StateEjected || again.Entry.EjectReason != "verify_failed" {
+		t.Fatalf("SettleAt(terminal) = %+v, %v; want unsettled, first state kept", again, err)
+	}
+	if _, err := f.store.SettleAt(ctx, e.ID, 1, StateDropped, ""); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("SettleAt(no reason) err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// TestReanchorAt_StaleEpochConflicts: ReanchorAt moves only the live entry
+// at its epoch; a stale epoch is ErrStateConflict with the anchor unchanged.
+func TestReanchorAt_StaleEpochConflicts(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	if _, err := f.store.ReanchorAt(ctx, e.ID, 0, "h2", ""); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ReanchorAt(held) err = %v, want ErrStateConflict", err)
+	}
+	f.admitNext(mainBase())
+	if _, err := f.store.ReanchorAt(ctx, e.ID, 0, "h2", ""); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ReanchorAt(stale) err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(e.ID); got.AnchoredHeadSHA != "h1" {
+		t.Fatalf("anchor after stale ReanchorAt = %q, want h1 (untouched)", got.AnchoredHeadSHA)
+	}
+	got, err := f.store.ReanchorAt(ctx, e.ID, 1, "h2", "")
+	if err != nil || got.AnchoredHeadSHA != "h2" || f.entry(e.ID).AnchoredHeadSHA != "h2" || got.AdmissionEpoch != 1 {
+		t.Fatalf("ReanchorAt(1) = %+v, %v; want head h2 at epoch 1", got, err)
+	}
+}
+
+// TestEnqueue_StampsIntentSequenceOnce: a MergeIntent insert stamps the
+// sequence with merge_intent_at; a non-intent insert stamps neither; a
+// same-base repeat with another sequence never overwrites it.
+func TestEnqueue_StampsIntentSequenceOnce(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	r := f.run()
+	res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h1", MergeIntent: true, IntentSequence: 41})
+	if err != nil || !res.IntentRecorded || res.Entry.MergeIntentSequence != 41 || f.entry(res.Entry.ID).MergeIntentSequence != 41 {
+		t.Fatalf("intent Enqueue = %+v, %v; want sequence 41", res, err)
+	}
+	again, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h2", MergeIntent: true, IntentSequence: 99})
+	if err != nil || again.IntentRecorded || f.entry(res.Entry.ID).MergeIntentSequence != 41 {
+		t.Fatalf("repeat Enqueue = %+v, %v; sequence %d, want 41 kept", again, err, f.entry(res.Entry.ID).MergeIntentSequence)
+	}
+	plain, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: f.run(), BaseRef: "main", HeadSHA: "x1", IntentSequence: 7})
+	if err != nil || plain.Entry.MergeIntentAt != nil || plain.Entry.MergeIntentSequence != 0 {
+		t.Fatalf("non-intent Enqueue = %+v, %v; want no intent, no sequence", plain, err)
+	}
+}
+
+// TestMarkMergeIntent_StampsSequenceOnlyOnTransition: the sequence is
+// stamped on the NULL-to-set transition and a repeat (another sequence)
+// writes nothing.
+func TestMarkMergeIntent_StampsSequenceOnlyOnTransition(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	got, err := f.store.MarkMergeIntent(ctx, e.ID, &MergeIntentRequest{IntentSequence: 12})
+	if err != nil || !got.IntentRecorded || f.entry(e.ID).MergeIntentSequence != 12 {
+		t.Fatalf("MarkMergeIntent = %+v, %v; want sequence 12", got, err)
+	}
+	again, err := f.store.MarkMergeIntent(ctx, e.ID, &MergeIntentRequest{IntentSequence: 13})
+	if err != nil || again.IntentRecorded || f.entry(e.ID).MergeIntentSequence != 12 {
+		t.Fatalf("repeat MarkMergeIntent = %+v, %v; want 12 kept", again, err)
+	}
+}
+
+// TestMarkMergeIntent_NilRequestStampsNothing: a nil request records the
+// intent with no sequence (NULL, read as 0) and no callback.
+func TestMarkMergeIntent_NilRequestStampsNothing(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	got, err := f.store.MarkMergeIntent(context.Background(), e.ID, nil)
+	if err != nil || !got.IntentRecorded || f.entry(e.ID).MergeIntentAt == nil || f.entry(e.ID).MergeIntentSequence != 0 {
+		t.Fatalf("MarkMergeIntent(nil) = %+v, %v; want intent, sequence 0", got, err)
+	}
+	if n := f.count(`id = $1 AND merge_intent_sequence IS NULL`, e.ID); n != 1 {
+		t.Fatalf("merge_intent_sequence NULL rows = %d, want 1", n)
+	}
+}
+
+// TestClaimMergeDispatch_OnePerRunConcurrently is approval condition D1 at
+// the store, with NO lock held: N concurrent claims for one run across the
+// three paths admit exactly one; every other is ErrAlreadyDispatched carrying
+// the winning claim. The UNIQUE run_id constraint alone decides it.
+func TestClaimMergeDispatch_OnePerRunConcurrently(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	paths := []string{DispatchPathQueue, DispatchPathInline, DispatchPathDelegated}
+	const n = 9
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+	var won []DispatchClaim
+	var refused int
+	start := make(chan struct{})
+	for i := 0; i < n; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			<-start
+			c, err := f.store.ClaimMergeDispatch(context.Background(), r, paths[i%3], "h1")
+			mu.Lock()
+			defer mu.Unlock()
+			switch {
+			case err == nil:
+				won = append(won, c)
+			case errors.Is(err, ErrAlreadyDispatched):
+				refused++
+			default:
+				t.Errorf("claim %d: unexpected err %v", i, err)
+			}
+		}(i)
+	}
+	close(start)
+	wg.Wait()
+	if len(won) != 1 || refused != n-1 {
+		t.Fatalf("claims won = %d, refused = %d; want exactly 1 and %d (D1 UNIQUE run_id)", len(won), refused, n-1)
+	}
+	if rows := f.countClaims(r); rows != 1 {
+		t.Fatalf("merge_dispatch_claims rows = %d, want 1", rows)
+	}
+	existing, err := f.store.ClaimMergeDispatch(context.Background(), r, DispatchPathInline, "h2")
+	if !errors.Is(err, ErrAlreadyDispatched) || existing.Path != won[0].Path || existing.State != DispatchDispatched || existing.HeadSHA != "h1" {
+		t.Fatalf("repeat claim = %+v, %v; want ErrAlreadyDispatched carrying the winning claim", existing, err)
+	}
+}
+
+// TestMarkMergeDispatchFailed_UpdatesNeverDeletes: a failed dispatch moves
+// the claim to dispatch_failed (the row stays), the first cause is kept, and
+// a later claim is still refused until the operator re-arm deletes the row.
+func TestMarkMergeDispatchFailed_UpdatesNeverDeletes(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	r := f.run()
+	if err := f.store.MarkMergeDispatchFailed(ctx, r, "x"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("MarkMergeDispatchFailed(no claim) err = %v, want ErrNotFound", err)
+	}
+	if _, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathQueue, "h1"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := f.store.MarkMergeDispatchFailed(ctx, r, "405 not mergeable"); err != nil {
+		t.Fatalf("MarkMergeDispatchFailed: %v", err)
+	}
+	if err := f.store.MarkMergeDispatchFailed(ctx, r, "second"); err != nil {
+		t.Fatalf("repeat MarkMergeDispatchFailed: %v", err)
+	}
+	c, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathInline, "h1")
+	if !errors.Is(err, ErrAlreadyDispatched) || c.State != DispatchFailed || c.FailureCause != "405 not mergeable" || c.FailedAt == nil {
+		t.Fatalf("claim after failure = %+v, %v; want ErrAlreadyDispatched on dispatch_failed with the first cause", c, err)
+	}
+	if rows := f.countClaims(r); rows != 1 {
+		t.Fatalf("claim rows after failure = %d, want 1 (updated, never deleted)", rows)
+	}
+	// The operator re-arm (README.md § "Merge-dispatch ledger").
+	f.exec(`DELETE FROM merge_dispatch_claims WHERE run_id = $1 AND state = 'dispatch_failed'`, r)
+	if _, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathInline, "h2"); err != nil {
+		t.Fatalf("claim after the operator re-arm: %v", err)
+	}
+}
+
+// TestClaimMergeDispatch_RefusesBeforeSQL: malformed claims and an unknown
+// run.
+func TestClaimMergeDispatch_RefusesBeforeSQL(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	r := f.run()
+	for name, call := range map[string]func() error{
+		"nil run":  func() error { _, err := f.store.ClaimMergeDispatch(ctx, uuid.Nil, DispatchPathQueue, "h"); return err },
+		"no head":  func() error { _, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathQueue, ""); return err },
+		"bad path": func() error { _, err := f.store.ClaimMergeDispatch(ctx, r, "auto", "h"); return err },
+		"mark nil": func() error { return f.store.MarkMergeDispatchFailed(ctx, uuid.Nil, "x") },
+	} {
+		if err := call(); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("%s: err = %v, want ErrInvalidRequest", name, err)
+		}
+	}
+	if f.countClaims(r) != 0 {
+		t.Fatal("a refused claim wrote a row")
+	}
+	if _, err := f.store.ClaimMergeDispatch(ctx, uuid.New(), DispatchPathQueue, "h"); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("unknown run err = %v, want ErrNotFound", err)
+	}
+}
+
+func (f *fixture) countClaims(runID uuid.UUID) int {
+	f.t.Helper()
+	var n int
+	if err := f.pool.QueryRow(context.Background(), `SELECT count(*) FROM merge_dispatch_claims WHERE run_id = $1`, runID).Scan(&n); err != nil {
+		f.t.Fatalf("count claims: %v", err)
+	}
+	return n
 }

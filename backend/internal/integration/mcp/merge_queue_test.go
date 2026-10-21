@@ -273,7 +273,7 @@ func TestE2E_MergeQueue_MergeRunQueuesAndReadsSurviveEveryHop(t *testing.T) {
 	if err != nil || !adm.Admitted || adm.Entry == nil || adm.Entry.RunID != blocker.ID {
 		t.Fatalf("AdmitNext = %+v, %v; want the blocker admitted", adm, err)
 	}
-	if _, err := store.SetPhase(ctx, adm.Entry.ID, mergequeue.PhaseVerifying); err != nil {
+	if _, err := store.SetPhase(ctx, adm.Entry.ID, adm.Entry.AdmissionEpoch, mergequeue.PhaseVerifying); err != nil {
 		t.Fatalf("SetPhase: %v", err)
 	}
 
