@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -67,6 +68,20 @@ const (
 // base's live pass: no trigger, no re-open, no slot.
 const mergeCandidateStateHeld = "held"
 
+// mergeCandidateStateNotQueued is the start answer for a serialized pass whose
+// run is NOT merge-queue eligible (ADR-093 slice 1, E87.4 / #4295): no entry,
+// no trigger, no re-open, no slot. The run takes the line through
+// fishhawk_merge_run once it is eligible.
+const mergeCandidateStateNotQueued = "not_queued"
+
+// mergeCandidateNotQueuedNote is the not_queued answer's operator note.
+const mergeCandidateNotQueuedNote = "the run is not merge-queue eligible (ADR-093 D1), so no merge-candidate pass was queued or started. Clear the named reasons (approve the pull request, settle the reviews, acceptance and checks, disposition blocking concerns), then invoke fishhawk_merge_run, which enqueues the run once it is eligible."
+
+// mergeCandidateQueueReasonNotMergeEligible drops a HELD entry whose run is
+// determined ineligible at admission (ADR-093 slice 1); it re-enters at the
+// TAIL on its next fishhawk_merge_run (ADR-093 Q2).
+const mergeCandidateQueueReasonNotMergeEligible = "not_merge_eligible"
+
 // Queue eject/drop reasons (mergequeue README § "Reasons"; base_changed is the
 // store's own).
 const (
@@ -119,6 +134,21 @@ func (s *Server) serializeMergeCandidateVerifyPass(ctx context.Context, runID uu
 	// D4: nothing required means nothing queued.
 	if command, _, _ := s.resolveVerifyConfig(ctx, runRow, run.StageTypeImplement); command == "" {
 		return &mergeCandidateVerifyStart{State: mergeCandidateStateNotRequired}, nil
+	}
+
+	// ADR-093 slice 1 (E87.4 / #4295): eligibility decides QUEUE ADMISSION. A
+	// run with no active entry takes the line only when it is merge-queue
+	// eligible (admission variant); otherwise nothing is enqueued or started.
+	// An existing active entry keeps today's re-anchor semantics.
+	active, err := s.mergeCandidateQueueForRun(ctx, runID)
+	if err != nil {
+		return nil, &mergeCandidateVerifyRefusal{Reason: "the merge-candidate queue could not be read (" + err.Error() +
+			"), so no pass was queued or started; re-invoke fishhawk_rebase_run_branch to retry"}
+	}
+	if active == nil {
+		if elig := s.mergeQueueAdmissionEligibility(ctx, runRow, p.HeadSHA); !elig.Eligible {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStateNotQueued}, nil
+		}
 	}
 
 	res, err := s.cfg.MergeQueue.Enqueue(ctx, mergequeue.EnqueueRequest{
@@ -239,6 +269,33 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 		}
 	}
 	return out
+}
+
+// pumpMergeCandidateQueueDetached pumps base on a detached goroutine bounded
+// by mergeCandidateAdmissionContext and tracked by bgMergeQueuePump (so
+// Server.Shutdown drains it): the merge_run enqueue arm answers without
+// waiting on an admission's auto-advance or pass start (approval condition
+// C6).
+func (s *Server) pumpMergeCandidateQueueDetached(ctx context.Context, base mergequeue.Base) {
+	if s.cfg.MergeQueue == nil {
+		return
+	}
+	pctx, cancel := mergeCandidateAdmissionContext(ctx)
+	s.bgMergeQueuePump.Add(1)
+	go func() {
+		defer s.bgMergeQueuePump.Done()
+		defer cancel()
+		s.pumpMergeCandidateQueue(pctx, base)
+	}()
+}
+
+// mergeQueueReasonsText renders eligibility reasons as "code: detail; …".
+func mergeQueueReasonsText(reasons []mergeQueueIneligibility) string {
+	parts := make([]string, 0, len(reasons))
+	for _, r := range reasons {
+		parts = append(parts, r.Code+": "+r.Detail)
+	}
+	return strings.Join(parts, "; ")
 }
 
 // mergeCandidateAdmissionContext is the context ONE admission runs on:
@@ -378,6 +435,18 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 	head, branch := pr.HeadSHA, pr.HeadRef
 	if head == "" || branch == "" {
 		return unadmit("the pull request returned an empty head sha or branch")
+	}
+
+	// ADR-093 slice 1 (E87.4 / #4295): re-evaluate eligibility on the PR's
+	// current head BEFORE the behind probe and auto-advance. Determined
+	// ineligible → dropped not_merge_eligible (the pump admits the next);
+	// undeterminable → unadmit (stays held at its place).
+	if elig := s.mergeQueueAdmissionEligibility(ctx, runRow, head); !elig.Eligible {
+		if elig.Undeterminable {
+			return unadmit("merge-queue eligibility could not be determined: " + mergeQueueReasonsText(elig.Reasons))
+		}
+		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible,
+			"the run is no longer merge-queue eligible ("+mergeQueueReasonsText(elig.Reasons)+"); fishhawk_merge_run re-enqueues it at the tail once it is")
 	}
 
 	behind, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, head, e.BaseRef)

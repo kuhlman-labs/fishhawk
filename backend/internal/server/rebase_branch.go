@@ -878,12 +878,29 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 			slog.String("reason", refusal.Reason))
 		return rebaseMergeCandidateFields{State: mergeCandidateStateUnverified, Refusal: refusal.Reason}
 	}
+	if start.State == mergeCandidateStateNotQueued {
+		return s.rebaseNotQueuedFields(ctx, runRow, head, false)
+	}
 	out = rebaseMergeCandidateFields{State: start.State, Triggered: start.Triggered}
 	if start.State == mergeCandidateStateInFlight {
 		out.StageID = start.StageID.String()
 		out.Note = mergeCandidateVerifyTriggeredNote
 	}
 	return out
+}
+
+// rebaseNotQueuedFields renders the ADR-093 slice 1 not_queued answer (E87.4 /
+// #4295): the serializer refused to enqueue a run that is not merge-queue
+// eligible, so no pass was queued or started. The note names the reasons
+// (the admission predicate, re-read for the rendering — the start answer
+// carries only the state) and fishhawk_merge_run as the verb that enqueues
+// once the run is eligible. No implement re-open happens on this path.
+func (s *Server) rebaseNotQueuedFields(ctx context.Context, runRow *run.Run, head string, rerun bool) rebaseMergeCandidateFields {
+	note := mergeCandidateNotQueuedNote
+	if elig := s.mergeQueueAdmissionEligibility(ctx, runRow, head); len(elig.Reasons) > 0 {
+		note += " Reasons: " + mergeQueueReasonsText(elig.Reasons) + "."
+	}
+	return rebaseMergeCandidateFields{State: mergeCandidateStateNotQueued, Note: note, Rerun: rerun}
 }
 
 // rebaseRerunFailedMergeCandidateVerify is the operator's verify-only re-run
@@ -938,6 +955,9 @@ func (s *Server) rebaseRerunFailedMergeCandidateVerify(ctx context.Context, runR
 			slog.String("reason", refusal.Reason))
 		return rebaseMergeCandidateFields{State: mergeCandidateStateUnverified, Rerun: true,
 			Refusal: refusal.Reason + "; the failed verdict WAS voided, so the head is now unverified — re-invoke fishhawk_rebase_run_branch (no flag needed) to start its pass"}
+	}
+	if start.State == mergeCandidateStateNotQueued {
+		return s.rebaseNotQueuedFields(ctx, runRow, head, true)
 	}
 	out := rebaseMergeCandidateFields{State: start.State, Triggered: start.Triggered, Rerun: true}
 	if start.State == mergeCandidateStateInFlight {
