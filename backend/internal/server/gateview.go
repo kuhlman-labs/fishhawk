@@ -137,9 +137,12 @@ type gateViewResponse struct {
 	Consults []gateViewConsult `json:"consults"`
 	// MergeReadiness names what would make POST /v0/runs/{run_id}/merge refuse
 	// fast or queue a merge that never fires (#4086), computed by the SAME
-	// helpers the merge endpoint calls (acceptanceStaleRefusal,
-	// reviewCoverageRefusal (#4219) and approvalDismissedCheck), so the two
-	// surfaces cannot drift. Computed only
+	// helpers the merge endpoint calls (acceptanceStaleRefusal and
+	// reviewCoverageRefusal (#4219)), so those legs cannot drift. Its
+	// approvalDismissedCheck leg is ADVISORY: since ADR-112 (#4619) the merge
+	// endpoint's approval refusal comes from the in-lock forge-approval fold
+	// (forge_approval_required), so the two surfaces deliberately differ on
+	// that leg (ADR-112 R3). Computed only
 	// by handleGetRunGateView — never by buildGateView, which the attention
 	// scan calls once per run — because the approval half costs forge reads.
 	// Omitted (nil) when the run has no pull request url or is failed /
@@ -394,8 +397,10 @@ const gateViewGapSpecialistJobs = "specialist_jobs"
 
 // gateViewMergeReadiness is the gate view's merge-readiness block (#4086).
 // Blockers carries each determined refusal the merge endpoint would return
-// (acceptance_stale, review_coverage_incomplete, first_officer_finding_open,
-// approval_dismissed) with the endpoint's own message and details.
+// (acceptance_stale, review_coverage_incomplete, first_officer_finding_open)
+// with the endpoint's own message and details, plus the ADVISORY
+// approval_dismissed blocker the endpoint no longer returns (ADR-112 /
+// #4619: its approval refusal is the in-lock forge-approval fold).
 // Undetermined names every check that could not reach a verdict — the approval
 // check's fail-open reasons, or an acceptance-history, review-coverage or
 // first-officer concern read failure — so an empty Blockers list is never read as "nothing blocks" when a check did
@@ -741,6 +746,8 @@ func (s *Server) gateViewMergeReadinessFor(ctx context.Context, runRow *run.Run,
 		block.Blockers = append(block.Blockers, gateViewMergeBlockerOf(fo))
 	}
 
+	// ADVISORY (ADR-112 / #4619): the merge endpoint no longer runs this
+	// check; its approval refusal is the forge-approval fold.
 	approval := s.approvalDismissedCheck(ctx, runRow)
 	switch {
 	case approval.Refusal != nil:

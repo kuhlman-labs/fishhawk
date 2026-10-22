@@ -496,6 +496,11 @@ const (
 	autoDriveNoteLockUnavailable   = "the run's merge-intent lock could not be taken (fail-closed); observe-only"
 	autoDriveNoteAlreadyClaimed    = "a merge dispatch is already claimed for this run on the merge-dispatch ledger (ADR-093 D1), so the forge was not called; a dispatch_failed claim needs reconciliation (the PR reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); observe-only"
 	autoDriveNoteDispatchUnclaimed = "the run's merge dispatch could not be claimed on the merge-dispatch ledger (ADR-093 D1, fail-closed); observe-only"
+	// ADR-112 (#4619): the forge-approval fold did not qualify at the gate's
+	// verified head (or its snapshot was unreadable), or its evidence row
+	// could not be recorded; nothing was claimed and the merger was not called.
+	autoDriveNoteApprovalNotQualified    = "no qualifying forge approval covers the verified head (ADR-112 fold, fail-closed); observe-only"
+	autoDriveNoteAuthorizationUnrecorded = "the forge approval qualified but merge_queue_authorized could not be recorded (ADR-112 R4, fail-closed); observe-only"
 )
 
 // delegatedMergeUnderLock runs the delegated may_merge dispatch tail under the
@@ -574,6 +579,12 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but the merge dispatch could not be claimed; observe-only",
 			slog.String("run_id", runRow.ID.String()), slog.String("error", derr.Error()))
 		return observeOnly(autoDriveNoteDispatchUnclaimed), nil
+	case mergeDispatchApprovalNotQualified:
+		return observeOnly(autoDriveNoteApprovalNotQualified), nil
+	case mergeDispatchAuthorizationUnrecorded:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but merge_queue_authorized could not be recorded; observe-only",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", derr.Error()))
+		return observeOnly(autoDriveNoteAuthorizationUnrecorded), nil
 	}
 	if derr != nil {
 		return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
@@ -610,6 +621,14 @@ const (
 	// mergeDispatchUnclaimed: the claim itself failed (the returned error),
 	// so the forge was never called — fail-closed.
 	mergeDispatchUnclaimed
+	// mergeDispatchApprovalNotQualified: the ADR-112 forge-approval fold did
+	// not answer approved at the gate head (a moved head, an empty gate head,
+	// a snapshot read error, GitLab provider_unsupported and an unparseable
+	// spec included): no row, no claim, the merger is never called.
+	mergeDispatchApprovalNotQualified
+	// mergeDispatchAuthorizationUnrecorded: the fold approved but the
+	// merge_queue_authorized append failed (the returned error): no claim.
+	mergeDispatchAuthorizationUnrecorded
 )
 
 // dispatchAcceptanceGatedMerge is the shared merge-dispatch tail extracted from
@@ -673,6 +692,13 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	if merger == nil {
 		return mergeDispatchNoMerger, gateState, nil
 	}
+	// ADR-112 (#4619): the ONE forge-approval fold at the gate's verified
+	// head, AFTER the acceptance and nil-merger checks and BEFORE the
+	// republish and the claim. An empty liveHead folds undetermined
+	// (head_unknown, H1). A gate-less run makes no fold read.
+	if outcome, aerr := s.delegatedForgeApproval(ctx, runRow, liveHead); outcome != mergeDispatchMerged {
+		return outcome, gateState, aerr
+	}
 	// E64.42 / #3159: recompute and republish fishhawk_audit_complete
 	// immediately BEFORE the dispatch, the same control handleMergeRun
 	// (merge_run.go) carries on the operator path. A fix-up push publishes
@@ -722,6 +748,29 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 		s.settleMergeDispatchClaim(ctx, ledger, claim, merr)
 	}
 	return mergeDispatchMerged, gateState, merr
+}
+
+// delegatedForgeApproval runs the delegated arm's ADR-112 fold and evidence
+// write. mergeDispatchMerged means proceed (approved, or no gate declared);
+// any other outcome is observe-only with nothing recorded.
+func (s *Server) delegatedForgeApproval(ctx context.Context, runRow *run.Run, liveHead string) (mergeDispatchOutcome, error) {
+	d, ferr := s.forgeApprovalFold(ctx, runRow, liveHead)
+	if ferr != nil {
+		d = d.undetermined(forgeApprovalReasonSnapshotUnreadable, "the forge review snapshot could not be read", ferr)
+	}
+	if !d.approved() {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but no qualifying forge approval covers the verified head; observe-only",
+			slog.String("run_id", runRow.ID.String()), slog.String("fold", d.Result), slog.String("reason", d.Reason),
+			slog.String("detail", d.Detail))
+		return mergeDispatchApprovalNotQualified, nil
+	}
+	if !d.Declared {
+		return mergeDispatchMerged, nil
+	}
+	if _, aerr := s.writeMergeQueueAuthorized(ctx, runRow, d, forgeApprovalAuthorization{Path: mergequeue.DispatchPathDelegated}); aerr != nil {
+		return mergeDispatchAuthorizationUnrecorded, aerr
+	}
+	return mergeDispatchMerged, nil
 }
 
 // evaluateRunDelegation resolves the run's effective delegation Result

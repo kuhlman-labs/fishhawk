@@ -510,18 +510,25 @@ func TestMergeQueueE2E_BaseMovesBetweenPassAndMergeReadvances(t *testing.T) {
 	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
 }
 
-// TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues: the head
-// of line's forge approval was dismissed, so merge-on-pass ejects it
-// forge_approval_dismissed (no claim, no PUT) and the line continues: the
-// next entry merges in the same pump.
+// TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues: under a
+// review approval gate the head of line's in-lock forge-approval fold (ADR-112)
+// reads its only review DISMISSED, so merge-on-pass ejects it
+// forge_approval_dismissed (no claim, no PUT, no verdict) and the line
+// continues: the next entry, approved by a write-level member, merges in the
+// same pump. The entry and admission variants keep their REST legs, so both
+// PRs carry a REST approval that admits them.
 func TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues(t *testing.T) {
 	w := newMQELineWorld(t)
-	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
-	b := w.seed("b", "b1", []byte(mcvUndelegatedSpecYAML))
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
 	w.mqpHeldIntent(a, "a1", false)
 	w.mqpHeldIntent(b, "b1", false)
-	w.gh.set(func() { w.gh.reviews[a.pr] = mqeDismissed })
-	w.mergeable(a, "blocked")
+	w.gh.set(func() {
+		w.gh.reviews[a.pr] = mqeApprovedBy("alice")
+		w.gh.reviews[b.pr] = mqeApprovedBy("alice")
+	})
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "b1"))
 
 	w.pumpBase(a)
 
@@ -529,7 +536,31 @@ func TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues(t *testing.T
 	if n := w.claims(a); n != 0 {
 		t.Fatalf("A claims = %d, want 0 (ejected before any dispatch)", n)
 	}
+	if n := len(w.rows(a, CategoryMergeVerdictRecorded)) + len(w.rows(a, CategoryMergeQueueAuthorized)); n != 0 {
+		t.Fatalf("A verdict/authorization rows = %d, want 0", n)
+	}
 	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired is the
+// gate-less twin: no fold read, so A reaches the pinned merge; the forge
+// refuses it (405), the post-refusal snapshot reads BLOCKED, and A ejects
+// forge_review_required (ADR-112 R3 row 4, temporary until #4632) while B
+// still merges in the same pump.
+func TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	b := w.seed("b", "b1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.gh.set(func() { w.gh.putStatus[a.pr] = http.StatusMethodNotAllowed })
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{MergeStateStatus: "BLOCKED"})
+
+	w.pumpBase(a)
+
+	w.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonForgeReviewRequired)
+	w.requirePuts("a1", "b1")
 	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
 }
 
