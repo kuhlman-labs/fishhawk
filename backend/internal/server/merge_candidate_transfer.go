@@ -141,9 +141,17 @@ var errTransferWorkspace = errors.New("merge-candidate transfer: workspace")
 
 // mergeCandidateTransferRequest is one clean-advance decision request.
 type mergeCandidateTransferRequest struct {
-	Run            *run.Run
-	PriorHead      string
-	NewHead        string
+	Run       *run.Run
+	PriorHead string
+	NewHead   string
+	// MergePerformed is the FULL clean-advance predicate, not merely "a merge
+	// happened": the caller sets it true only when THIS advance performed a
+	// merge, the new head IS the decoded merge commit, AND that merge
+	// commit's parents were verified as exactly [prior head, base tip]
+	// (ADR-112 R1(a)(ii), rebaseAdvanceOutcome.CleanVerified). Both callers —
+	// the rebase verb (rebaseMergeCandidateVerify) and the queue-admission
+	// auto-advance (admitMergeCandidateEntry) — apply the same rule, so
+	// false here is decided not_clean_advance.
 	MergePerformed bool
 	Cause          string
 	// Reserve is the part of ctx's remaining time the classification must

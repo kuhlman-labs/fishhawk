@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"time"
@@ -23,11 +24,12 @@ import (
 // merge-intent lock, the SAME lock the inline merge_run tail and the delegated
 // may_merge arm take — re-reads the entry and the PR, refuses a run whose
 // operator merged inline after the entry's intent, runs the merge overlap
-// guard, re-probes the base tip, records the operator's verdict
-// (record-before-commit, from the merge_queue_entered row at the entry's
-// RECORDED intent sequence), re-checks changes_requested and a dismissed
-// approval, claims the run's ONE merge dispatch on the D1 ledger, and merges
-// through GateMerger with the head PINNED to the verified SHA.
+// guard, re-probes the base tip, runs the ADR-112 forge-approval FOLD at the
+// verified head and writes its merge_queue_authorized evidence row (step 6b,
+// #4619), records the operator's verdict (record-before-commit, from the
+// merge_queue_entered row at the entry's RECORDED intent sequence), claims the
+// run's ONE merge dispatch on the D1 ledger, and merges through GateMerger
+// with the head PINNED to the verified SHA.
 //
 // It returns an OUTCOME the pump applies with the admission-epoch CAS; the one
 // queue write it makes itself is the merged settle after the forge accepted
@@ -268,27 +270,70 @@ const (
 	mergeOnPassReasonTransient             = "transient"
 	mergeOnPassReasonVerifyNotPassed       = "verify_not_passed"
 	mergeOnPassReasonNotMergeable          = "not_mergeable_yet"
-	mergeOnPassReasonApprovalUndetermined  = "transferred_approval_undetermined"
 	mergeOnPassReasonEntryChanged          = "entry_changed"
 	mergeOnPassReasonMergedClaimMismatch   = "merged_claim_head_mismatch"
 	mergeOnPassReasonInlineMergeDispatched = "inline_merge_dispatched"
 	mergeOnPassReasonOverlapRefused        = "overlap_refused"
 	mergeOnPassReasonIntentRowMissing      = "intent_row_missing"
 	mergeOnPassReasonVerdictUnrecorded     = "verdict_unrecorded"
-	mergeOnPassReasonChangesRequested      = "changes_requested"
-	mergeOnPassReasonApprovalDismissed     = "approval_dismissed"
 	mergeOnPassReasonLedgerUnavailable     = "dispatch_ledger_unavailable"
 	mergeOnPassReasonAlreadyDispatched     = "merge_already_dispatched"
 	mergeOnPassReasonLockUnavailable       = "merge_lock_unavailable"
 	mergeOnPassReasonBaseMoved             = "base_moved"
 	mergeOnPassReasonHeadMoved             = "head_moved"
 	mergeOnPassReasonForgeHeadMismatch     = "forge_head_mismatch"
+	// mergeOnPassReasonAuthorizationUnrecorded: the fold approved but the
+	// merge_queue_authorized append failed (ADR-112 R4): no verdict row, no
+	// claim; the next pump re-decides.
+	mergeOnPassReasonAuthorizationUnrecorded = "authorization_unrecorded"
 
 	mergeCandidateQueueReasonPRMerged               = "pr_merged"
 	mergeCandidateQueueReasonMergedByQueue          = "merged_by_queue"
 	mergeCandidateQueueReasonForgeApprovalDismissed = "forge_approval_dismissed"
 	mergeCandidateQueueReasonForgeMergeRefused      = "forge_merge_refused"
+
+	// ADR-112 interim posture (#4619, until #4632's bounded wait then yield):
+	// a non-approved fold at the head of the line DROPS or EJECTS with one
+	// of these named reasons and the line continues.
+	mergeCandidateQueueReasonForgeApprovalVetoed              = "forge_approval_vetoed"
+	mergeCandidateQueueReasonForgeApprovalReviewRequired      = "forge_approval_review_required"
+	mergeCandidateQueueReasonForgeApprovalAbsent              = "forge_approval_absent"
+	mergeCandidateQueueReasonForgeApprovalUndetermined        = "forge_approval_undetermined"
+	mergeCandidateQueueReasonForgeApprovalReviewsTruncated    = "forge_approval_reviews_truncated"
+	mergeCandidateQueueReasonForgeApprovalProviderUnsupported = "forge_approval_provider_unsupported"
+	// mergeCandidateQueueReasonForgeReviewRequired is the post-refusal eject
+	// (ADR-112 R3 row 4): a TEMPORARY stand-in for #4632's yield.
+	mergeCandidateQueueReasonForgeReviewRequired = "forge_review_required"
 )
+
+// mergeOnPassFoldSettle is the ADR-112 INTERIM table (#4619): the queue
+// state and reason a non-approved fold result settles with. vetoed and
+// review_required DROP; every other result EJECTS. #4632 converts both into a
+// bounded wait followed by a yield.
+func mergeOnPassFoldSettle(result string) (mergequeue.State, string) {
+	switch result {
+	case forgeApprovalVetoed:
+		return mergequeue.StateDropped, mergeCandidateQueueReasonForgeApprovalVetoed
+	case forgeApprovalReviewRequired:
+		return mergequeue.StateDropped, mergeCandidateQueueReasonForgeApprovalReviewRequired
+	case forgeApprovalDismissed:
+		return mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed
+	case forgeApprovalAbsent:
+		return mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalAbsent
+	case forgeApprovalReviewsTruncated:
+		return mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalReviewsTruncated
+	case forgeApprovalProviderUnsupported:
+		return mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalProviderUnsupported
+	}
+	return mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalUndetermined
+}
+
+// mergeOnPassFoldDetail is the settle detail for a non-approved fold: the
+// sanitised fold detail, the next step and the interim re-entry route.
+func mergeOnPassFoldDetail(d forgeApprovalDecision) string {
+	return d.Detail + ". " + forgeApprovalNextStepProse(d) +
+		" Fishhawk cannot approve on the operator's behalf (self-approval is prohibited); after it clears, re-invoke fishhawk_merge_run and the run rejoins the queue at the tail (ADR-112 interim posture until #4632)."
+}
 
 // mergeOnPassForgeCallTimeout bounds ONE forge read inside merge-on-pass, and
 // mergeOnPassMergeCallTimeout the pinned merge call: both well under the
@@ -456,28 +501,16 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 			"the run is no longer merge-queue eligible ("+mergeQueueReasonsText(elig.Reasons)+"); fishhawk_merge_run re-enqueues it at the tail once it is")
 	}
 
-	// 5. The forge-side approval.
-	actx, acancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
-	approval := s.approvalDismissedCheck(actx, runRow)
-	acancel()
-	if approval.Refusal != nil {
-		return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed, mergeOnPassApprovalDismissedRemedy)
-	}
-	// ADR-093 D6: the transferred-basis approval check fails closed; no
-	// mergeable_state shortcut applies on that basis.
-	if elig.ApprovalBasis == mergeQueueApprovalTransferred && !approval.Determined {
-		return held(mergeOnPassReasonApprovalUndetermined,
-			"the approval is transferred and the forge approval could not be determined ("+approval.Undetermined+")")
-	}
-
-	// 6. Best-effort audit-check republish at the head the merge lands.
+	// 5. Best-effort audit-check republish at the head the merge lands. The
+	// forge-side approval is judged ONLY in-lock (step 6b, ADR-112): no
+	// pre-lock approval read exists.
 	s.republishAuditCheckBeforeMergeAtHead(ctx, e.RunID, head)
 
 	var out mergeOnPassOutcome
 	ran := false
 	lockErr := s.withRunMergeLock(ctx, e.RunID, func(lctx context.Context) error {
 		ran = true
-		out = s.mergeOnPassLocked(lctx, req, runRow, target, head, elig.ApprovalBasis, merger)
+		out = s.mergeOnPassLocked(lctx, req, runRow, target, head, merger)
 		return nil
 	})
 	if !ran {
@@ -493,15 +526,12 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 			slog.String("run_id", e.RunID.String()), slog.String("outcome", string(out.Kind)),
 			slog.String("error", lockErr.Error()))
 	}
-	if out.ApprovalBasis == "" {
-		out.ApprovalBasis = elig.ApprovalBasis
-	}
 	return out
 }
 
-// mergeOnPassApprovalDismissedRemedy is the forge_approval_dismissed eject's
-// operator remedy (ADR-093 Q2).
-const mergeOnPassApprovalDismissedRemedy = "the forge reports the pull request's approval dismissed and not re-given, so GitHub would refuse the merge. Fishhawk cannot re-approve (self-approval is prohibited): re-approve under your own GitHub identity (gh pr review --approve), then re-invoke fishhawk_merge_run; the run rejoins the queue at the tail (ADR-093 Q2)"
+// mergeOnPassReviewRequiredRemedy is the post-refusal forge_review_required
+// eject's operator remedy (ADR-112 R3 row 4, temporary until #4632).
+const mergeOnPassReviewRequiredRemedy = "the forge refused the pinned merge and reports the pull request still needs review or is blocked (reviewDecision %s, mergeStateStatus %s). Fishhawk cannot approve on your behalf (self-approval is prohibited): approve under your own GitHub identity (gh pr review --approve), or resolve what else GitHub reports blocking, then re-invoke fishhawk_merge_run; the run rejoins the queue at the tail (temporary until #4632)"
 
 // onlyChecksNotGreen reports a result whose every reason is checks_not_green
 // (a pending check: hold, never drop).
@@ -521,8 +551,10 @@ func onlyChecksNotGreen(r mergeQueueEligibilityResult) bool {
 // the merge-intent lock fn's deadline; every forge read takes its own
 // sub-deadline.
 func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, runRow *run.Run,
-	target mergeOnPassTarget, head, basis string, merger HeadPinnedMerger) mergeOnPassOutcome {
+	target mergeOnPassTarget, head string, merger HeadPinnedMerger) mergeOnPassOutcome {
 	e := req.Entry
+	// basis is the fold's (step 6b); "" until the fold ran.
+	basis := ""
 	held := func(reason, detail string) mergeOnPassOutcome {
 		return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
 	}
@@ -612,44 +644,53 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return readvance(mergeOnPassReasonBaseMoved, e.BaseRef+" moved past the verified head "+head)
 	}
 
+	// 6b. ADR-112 (#4619): the ONE forge-approval fold at the verified head,
+	// AFTER the base re-probe and BEFORE the verdict, the single source of
+	// approvals and vetoes on this path. A snapshot transport failure holds
+	// (a read failure, not a decision: nothing is written); a head the
+	// snapshot reports moved re-advances (H1); every other non-approved
+	// result settles per the interim table with no verdict row, no
+	// authorization row and no claim. An approved fold on a declared gate
+	// writes merge_queue_authorized BEFORE the verdict; a failed append holds.
+	fold, ferr := s.forgeApprovalFold(ctx, runRow, head)
+	if ferr != nil {
+		return held(mergeOnPassReasonTransient, sanitizeForgeReadDetail("review_snapshot", ferr.Error()))
+	}
+	basis = fold.Basis
+	switch {
+	case fold.Merged:
+		if ok, reason, detail := s.mergeOnPassReconcileMerged(ctx, req.Ledger, e.RunID, fold.ObservedHead); !ok {
+			return held(reason, detail)
+		}
+		return settle(mergequeue.StateMerged, mergeCandidateQueueReasonPRMerged, "the pull request is already merged")
+	case fold.Reason == forgeApprovalReasonHeadMoved:
+		return readvance(mergeOnPassReasonHeadMoved, fold.Detail)
+	case !fold.approved():
+		state, reason := mergeOnPassFoldSettle(fold.Result)
+		return settle(state, reason, mergeOnPassFoldDetail(fold))
+	}
+	var authSeq int64
+	if fold.Declared {
+		authSeq, err = s.writeMergeQueueAuthorized(ctx, runRow, fold, forgeApprovalAuthorization{Path: mergeDispatchPathQueue, IntentSequence: intentSeq})
+		if err != nil {
+			return held(mergeOnPassReasonAuthorizationUnrecorded,
+				"the forge approval qualified but merge_queue_authorized could not be recorded (evidence before verdict): "+err.Error())
+		}
+	}
+
 	// 7. Record before commit: the operator's verdict.
 	verdictSeq, verdictHead, err := s.recordMergeOnPassVerdict(ctx, runRow, e, intent, head, verdicts)
 	if err != nil {
 		return held(mergeOnPassReasonVerdictUnrecorded, "the merge verdict could not be recorded (record before commit): "+err.Error())
 	}
 
-	// 8. Approval condition (d): changes_requested and a dismissed approval,
-	// re-checked immediately before the pinned merge.
-	if declared, _, derr := reviewApprovalGateForRun(runRow); derr != nil {
-		return held(mergeOnPassReasonTransient, "the review approval gate could not be read: "+derr.Error())
-	} else if declared {
-		rctx, rcancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
-		reviews, rerr := s.listMergeSettledReviews(rctx, runRow)
-		rcancel()
-		if rerr != nil {
-			return held(mergeOnPassReasonTransient, "re-reading the pull request reviews failed: "+rerr.Error())
-		}
-		if requesters := changesRequestingReviewers(reviews); len(requesters) > 0 {
-			return held(mergeOnPassReasonChangesRequested, "a reviewer requested changes since the pre-lock check")
-		}
-	}
-	actx, acancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
-	approval := s.approvalDismissedCheck(actx, runRow)
-	acancel()
-	if approval.Refusal != nil {
-		return held(mergeOnPassReasonApprovalDismissed, "the forge approval was dismissed since the pre-lock check")
-	}
-	if basis == mergeQueueApprovalTransferred && !approval.Determined { // transferred-basis approval check fails closed
-		return held(mergeOnPassReasonApprovalUndetermined,
-			"the approval is transferred and the forge approval could not be determined ("+approval.Undetermined+")")
-	}
-
-	// 9. Approval condition D1: claim the run's ONE merge dispatch.
+	// 8. Approval condition D1: claim the run's ONE merge dispatch.
 	if req.Ledger == nil {
 		return held(mergeOnPassReasonLedgerUnavailable, "no merge-dispatch ledger is wired, so no dispatch can be claimed")
 	}
 	merged := func(observed bool) mergeOnPassOutcome {
-		return s.mergeOnPassMerged(ctx, e, head, basis, verdictSeq, verdictHead, intentSeq, observed)
+		return s.mergeOnPassMerged(ctx, e, head, basis, mergeOnPassMergedRefs{verdictSeq: verdictSeq, verdictHead: verdictHead,
+			intentSeq: intentSeq, authSeq: authSeq, counted: fold.Counted}, observed)
 	}
 	observedMerged := func() bool {
 		p, rerr := s.mergeOnPassReadPR(ctx, target)
@@ -673,7 +714,7 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 				"; dispatch_failed awaits reconciliation or the operator's re-arm); the forge was not called")
 	}
 
-	// 10. The pinned merge.
+	// 9. The pinned merge.
 	mctx, mcancel := context.WithTimeout(ctx, mergeOnPassMergeCallTimeout)
 	mergeErr := merger.MergePullRequestAtHead(mctx, runRow, head)
 	mcancel()
@@ -691,16 +732,42 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return readvance(mergeOnPassReasonForgeHeadMismatch,
 			"the forge refused the pinned merge because the head no longer matched "+head+": "+mergeErr.Error())
 	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrMergeUnprocessable):
-		dctx, dcancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
-		again := s.approvalDismissedCheck(dctx, runRow)
-		dcancel()
-		if again.Refusal != nil {
-			return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed, mergeOnPassApprovalDismissedRemedy)
+		if decision, status, ok := s.mergeOnPassRefusalNeedsReview(ctx, runRow); ok {
+			return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeReviewRequired,
+				fmt.Sprintf(mergeOnPassReviewRequiredRemedy, nonEmpty(decision, "null"), nonEmpty(status, "null")))
 		}
 		return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused,
 			"the forge refused the pinned merge ("+mergeErr.Error()+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
 	}
 	return held(mergeOnPassReasonTransient, "the pinned merge failed: "+mergeErr.Error())
+}
+
+// mergeOnPassRefusalNeedsReview is ADR-112 R3 rows 4/5 after a TYPED forge
+// refusal whose claim was released: ONE fresh review snapshot (no permission
+// reads). ok=true ONLY when reviewDecision is REVIEW_REQUIRED or
+// CHANGES_REQUESTED, or mergeStateStatus is BLOCKED (row 4, forge_review_required).
+// A null reviewDecision (a base without required-review protection) is NOT
+// "not approved". A non-GitHub forge, an unaddressable run or a snapshot read
+// error is ok=false (row 5, forge_merge_refused). It applies with or without a
+// declared gate.
+func (s *Server) mergeOnPassRefusalNeedsReview(ctx context.Context, runRow *run.Run) (reviewDecision, mergeStateStatus string, ok bool) {
+	reader, unsupported, _ := s.forgeApprovalReaderFor(runRow)
+	if unsupported || reader == nil {
+		return "", "", false
+	}
+	rctx, cancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
+	defer cancel()
+	snap, err := reader.ReviewSnapshot(rctx)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge queue: post-refusal review snapshot unreadable; ejecting forge_merge_refused",
+			slog.String("run_id", runRow.ID.String()), slog.String("detail", sanitizeForgeReadDetail("review_snapshot", err.Error())))
+		return "", "", false
+	}
+	switch {
+	case snap.ReviewDecision == "REVIEW_REQUIRED", snap.ReviewDecision == "CHANGES_REQUESTED", snap.MergeStateStatus == "BLOCKED":
+		return snap.ReviewDecision, snap.MergeStateStatus, true
+	}
+	return snap.ReviewDecision, snap.MergeStateStatus, false
 }
 
 // mergeOnPassVerdict is a decoded merge_verdict_recorded row.
@@ -793,25 +860,44 @@ func (s *Server) recordMergeOnPassVerdict(ctx context.Context, runRow *run.Run, 
 	return 0, "", errors.New("merge verdict duplicate conflict but no recorded verdict found on re-read")
 }
 
+// mergeOnPassMergedRefs are the chain references merge_queue_merged records:
+// the verdict row, the intent row and (ADR-112 R4) THIS attempt's
+// merge_queue_authorized row with the fold's counted approvals.
+type mergeOnPassMergedRefs struct {
+	verdictSeq  int64
+	verdictHead string
+	intentSeq   int64
+	authSeq     int64
+	counted     []countedApproval
+}
+
 // mergeOnPassMerged is the merged tail: the merge_queue_merged row, then the
 // merged settle INSIDE the lock (approval condition D3). A failed row append
 // after the forge accepted the merge is logged at ERROR and the outcome is
 // still merged (approval condition (c)); a failed settle leaves Settled false
 // so the pump settles it.
 func (s *Server) mergeOnPassMerged(ctx context.Context, e mergequeue.Entry, head, basis string,
-	verdictSeq int64, verdictHead string, intentSeq int64, observed bool) mergeOnPassOutcome {
+	refs mergeOnPassMergedRefs, observed bool) mergeOnPassOutcome {
 	out := mergeOnPassOutcome{Kind: mergeOnPassMerged, State: mergequeue.StateMerged,
 		Reason: mergeCandidateQueueReasonMergedByQueue, HeadSHA: head, ApprovalBasis: basis}
-	payload, _ := json.Marshal(map[string]any{
+	fields := map[string]any{
 		"entry_id":         e.ID.String(),
 		"base_ref":         e.BaseRef,
 		"head_sha":         head,
-		"verdict_sequence": verdictSeq,
-		"verdict_head_sha": verdictHead,
-		"intent_sequence":  intentSeq,
+		"verdict_sequence": refs.verdictSeq,
+		"verdict_head_sha": refs.verdictHead,
+		"intent_sequence":  refs.intentSeq,
 		"approval_basis":   basis,
 		"observed_merged":  observed,
-	})
+	}
+	if refs.authSeq > 0 {
+		fields["authorization_sequence"] = refs.authSeq
+	}
+	if len(refs.counted) > 0 {
+		q := refs.counted[0]
+		fields["qualifying_reviewer"] = map[string]any{"login": q.Login, "actor_id": q.ActorID, "permission": q.Permission}
+	}
+	payload, _ := json.Marshal(fields)
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        e.RunID,

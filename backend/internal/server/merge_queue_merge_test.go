@@ -189,6 +189,9 @@ type mqmWorld struct {
 	states map[int]string
 	// prReadFail, when set, answers every GET /pulls/{n} 500.
 	prReadFail bool
+	// onResponse, when set, runs on every proxied response (before any
+	// rewrite) with its request path: the ADR-112 head-moved seam.
+	onResponse func(path string)
 }
 
 var mqmPullPath = regexp.MustCompile(`^/repos/[^/]+/[^/]+/pulls/(\d+)$`)
@@ -211,6 +214,12 @@ func newMQMWorld(t *testing.T) *mqmWorld {
 	}
 	proxy := httputil.NewSingleHostReverseProxy(target)
 	proxy.ModifyResponse = func(resp *http.Response) error {
+		w.mu.Lock()
+		hook := w.onResponse
+		w.mu.Unlock()
+		if hook != nil {
+			hook(resp.Request.URL.Path)
+		}
 		m := mqmPullPath.FindStringSubmatch(resp.Request.URL.Path)
 		if resp.Request.Method != http.MethodGet || m == nil || resp.StatusCode != http.StatusOK {
 			return nil
@@ -463,30 +472,111 @@ func TestMergeQueueMergeOnPass_SettleOutcomes(t *testing.T) {
 	}
 }
 
-func TestMergeQueueMergeOnPass_ChangesRequestedDropsNotMergeEligible(t *testing.T) {
-	w := newMQMWorld(t)
-	r, req := w.ready("cr", "h1", mqeSpecYAML)
-	w.gh.set(func() {
-		w.gh.reviews[r.pr] = `[{"id":1,"user":{"login":"alice"},"state":"APPROVED"},{"id":2,"user":{"login":"bob"},"state":"CHANGES_REQUESTED"}]`
-	})
-	out := w.decide(req)
-	requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonNotMergeEligible)
-	if !strings.Contains(out.Detail, mergeQueueReasonChangesRequested) {
-		t.Fatalf("detail %q does not name changes_requested", out.Detail)
+// mqmActorID is a stable non-zero GraphQL databaseId for login.
+func mqmActorID(login string) int64 {
+	var n int64 = 7
+	for _, c := range login {
+		n = n*31 + int64(c)
 	}
-	w.requireMerges(0)
+	return n
 }
 
-// transferred seeds the D6 transfer world: intent at h0, a clean advance to
-// h1, h1 passed, and alice's approval dismissed (no live approval), so the
-// run is eligible only through the transferred basis.
-func (w *mqmWorld) transferred() (*mcqRun, mergeOnPassRequest) {
+// mqmReview is login's review in state at commit (a GraphQL User author).
+func mqmReview(id int64, login, state, commit string) mcqReviewNode {
+	return mcqReviewNode{ID: id, State: state, SubmittedAt: time.Date(2026, 1, 1, 0, 0, int(id), 0, time.UTC), Commit: commit,
+		Author: mcqActor{Typename: "User", Login: login, ID: mqmActorID(login)}}
+}
+
+// forgeReviews plants r's GraphQL review snapshot and grants every reviewer
+// in writers write permission.
+func (w *mqmWorld) forgeReviews(r *mcqRun, writers []string, nodes ...mcqReviewNode) {
+	w.t.Helper()
+	w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{Reviews: nodes, Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
+	for _, l := range writers {
+		w.gh.setPermission(l, "write", "write")
+	}
+}
+
+// requireNoMergeWrites asserts a non-merging decision wrote no verdict, no
+// authorization row, claimed nothing and merged nothing.
+func (w *mqmWorld) requireNoMergeWrites(r *mcqRun) {
+	w.t.Helper()
+	w.requireMerges(0)
+	if len(w.ledger.claims) != 0 {
+		w.t.Fatalf("ledger claimed %v", w.ledger.claims)
+	}
+	for _, c := range []string{CategoryMergeVerdictRecorded, CategoryMergeQueueAuthorized, CategoryMergeQueueMerged} {
+		if n := len(w.rows(r, c)); n != 0 {
+			w.t.Fatalf("%s rows = %d, want 0", c, n)
+		}
+	}
+}
+
+// TestMergeQueueMergeOnPass_ForgeApprovalFoldInterimTable pins ADR-112's
+// interim posture (#4619): a non-approved fold at the verified head DROPS or
+// EJECTS with a named reason and writes nothing.
+func TestMergeQueueMergeOnPass_ForgeApprovalFoldInterimTable(t *testing.T) {
+	cases := []struct {
+		name   string
+		plant  func(w *mqmWorld, r *mcqRun)
+		state  mergequeue.State
+		reason string
+	}{
+		{"write veto drops", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", "h1"), mqmReview(2, "bob", "CHANGES_REQUESTED", "h1"))
+		}, mergequeue.StateDropped, mergeCandidateQueueReasonForgeApprovalVetoed},
+		{"review required drops", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+			fx := *w.gh.reviewSnapshot[r.pr]
+			fx.ReviewDecision = "REVIEW_REQUIRED"
+			w.gh.setReviewSnapshot(r.pr, fx)
+		}, mergequeue.StateDropped, mergeCandidateQueueReasonForgeApprovalReviewRequired},
+		{"dismissed ejects", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h1"))
+		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed},
+		{"read-permission member ejects absent", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, nil, mqmReview(1, "alice", "APPROVED", "h1"))
+			w.gh.setPermission("alice", "read", "read")
+		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalAbsent},
+		// The operator's #4619 pin: a CLEAN mergeStateStatus with no reviews is
+		// no shortcut.
+		{"clean merge state and no reviews ejects absent", func(w *mqmWorld, r *mcqRun) {
+			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{MergeStateStatus: "CLEAN", Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
+			w.mergeable(r, "clean")
+		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalAbsent},
+		{"permission 500 ejects undetermined", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, nil, mqmReview(1, "alice", "APPROVED", "h1"))
+			w.gh.set(func() { w.gh.permStatus["alice"] = 500 })
+		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalUndetermined},
+		{"truncated listing ejects", func(w *mqmWorld, r *mcqRun) {
+			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{Truncated: true, Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
+		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalReviewsTruncated},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req := w.ready("ft", "h1", mqeSpecYAML)
+			tc.plant(w, r)
+			out := w.decide(req)
+			requireOutcome(t, out, mergeOnPassSettle, tc.reason)
+			if out.State != tc.state || !strings.Contains(out.Detail, "fishhawk_merge_run") || len(out.Detail) > 2000 {
+				t.Fatalf("outcome = %+v", out)
+			}
+			w.requireNoMergeWrites(r)
+		})
+	}
+}
+
+// transferred seeds the D6 transfer world: intent at h0, a parent-verified
+// clean advance to h1, h1 passed, and alice's approval at h0 only, so the
+// fold approves only through the transferred basis.
+func (w *mqmWorld) transferred(advance func(r *mcqRun)) (*mcqRun, mergeOnPassRequest) {
 	w.t.Helper()
 	r := w.seed("tr", "h1", []byte(mqeSpecYAML))
 	anchor := w.mqeIntent(r, "h0")
-	w.mqeRebased(r, "h0", "h1", "h1", false)
+	advance(r)
 	w.mqePassed(r, "h1")
-	w.gh.set(func() { w.gh.reviews[r.pr] = mqeDismissed })
+	w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h0"))
 	res, err := w.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{RunID: r.id, BaseRef: mcqBase, HeadSHA: "h1", MergeIntent: true})
 	if err != nil {
 		w.t.Fatalf("enqueue: %v", err)
@@ -498,142 +588,85 @@ func (w *mqmWorld) transferred() (*mcqRun, mergeOnPassRequest) {
 	return r, mergeOnPassRequest{Entry: w.active(r), IntentSequence: anchor.Sequence, Ledger: w.ledger}
 }
 
-func TestMergeQueueMergeOnPass_ForgeApprovalDismissedEjectsNamed(t *testing.T) {
-	w := newMQMWorld(t)
-	r, req := w.transferred()
-	w.mergeable(r, "blocked")
-	out := w.decide(req)
-	requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonForgeApprovalDismissed)
-	if out.State != mergequeue.StateEjected || !strings.Contains(out.Detail, "self-approval is prohibited") ||
-		!strings.Contains(out.Detail, "fishhawk_merge_run") {
-		t.Fatalf("outcome = %+v", out)
-	}
-	w.requireMerges(0)
-}
-
 func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
-	// inLockUnblocked: determined before the lock (blocked, no dismissed
-	// review); when the lock is taken the forge flips to a state the removed
-	// mergeable_state shortcut accepted, so the in-lock PR re-read and the
-	// in-lock approval check both see it (the check is undetermined off
-	// "blocked"). The transferred-basis approval check fails closed, so the
-	// locked re-check holds.
-	inLockUnblocked := func(state string) func(w *mqmWorld, r *mcqRun) {
-		return func(w *mqmWorld, r *mcqRun) {
-			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
-			w.srv.cfg.MergeQueue = mqmOnLockQueue{Store: w.srv.cfg.MergeQueue, onLock: func() { w.mergeable(r, state) }}
+	t.Run("parent-verified advance carries the approval", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.transferred(func(r *mcqRun) { w.mqeRebased(r, "h0", "h1", "h1", false) })
+		out := w.decide(req)
+		requireOutcome(t, out, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+		if out.ApprovalBasis != forgeApprovalBasisTransferred {
+			t.Fatalf("approval basis = %q, want transferred", out.ApprovalBasis)
 		}
-	}
-	cases := []struct {
-		name   string
-		state  string
-		mut    func(w *mqmWorld, r *mcqRun)
-		kind   mergeOnPassKind
-		reason string
-		inLock bool // the hold comes from the locked re-check (one verdict row)
-	}{
-		{"undetermined approval holds", "unknown", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, false},
-		// R3: the transferred-basis approval check fails closed, so a clean
-		// mergeable_state (the check is undetermined off "blocked") holds.
-		{"clean mergeable_state does not shortcut", "clean", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, false},
-		{"reviews read error holds", "blocked", func(w *mqmWorld, r *mcqRun) {
-			w.gh.set(func() { w.gh.reviewsStatus[r.pr] = 500 })
-		}, mergeOnPassHeld, mergeOnPassReasonNotMergeable, false},
-		// Determined before the lock (blocked, no dismissed review), then the
-		// in-lock approval read fails after the verdict is recorded.
-		{"in-lock approval read failure holds", "blocked", func(w *mqmWorld, r *mcqRun) {
-			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
-			w.audit.onAppend = func(category string) {
-				if category == CategoryMergeVerdictRecorded {
-					w.mu.Lock()
-					w.prReadFail = true
-					w.mu.Unlock()
-				}
-			}
-		}, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
-		{"in-lock clean mergeable_state does not shortcut", "blocked", inLockUnblocked("clean"),
-			mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
-		{"in-lock unstable mergeable_state does not shortcut", "blocked", inLockUnblocked("unstable"),
-			mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
-		{"in-lock has_hooks mergeable_state does not shortcut", "blocked", inLockUnblocked("has_hooks"),
-			mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
-		{"determined approval merges", "blocked", func(w *mqmWorld, r *mcqRun) {
-			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
-		}, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue, false},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			w := newMQMWorld(t)
-			r, req := w.transferred()
-			w.mergeable(r, tc.state)
-			if tc.mut != nil {
-				tc.mut(w, r)
-			}
-			out := w.decide(req)
-			requireOutcome(t, out, tc.kind, tc.reason)
-			if tc.kind == mergeOnPassMerged {
-				w.requireMerges(1)
-				if out.ApprovalBasis != mergeQueueApprovalTransferred {
-					t.Fatalf("approval basis = %q, want transferred", out.ApprovalBasis)
-				}
-				return
-			}
-			w.requireMerges(0)
-			if len(w.ledger.claims) != 0 {
-				t.Fatalf("ledger claimed %v on a held transferred basis", w.ledger.claims)
-			}
-			// The pre-lock check holds before the verdict is recorded; only the
-			// in-lock rows reach the locked re-check.
-			if n := len(w.rows(r, CategoryMergeVerdictRecorded)); (n == 1) != tc.inLock {
-				t.Fatalf("merge_verdict_recorded rows = %d: the hold came from the wrong check", n)
-			}
-		})
-	}
+		auth := w.rows(r, CategoryMergeQueueAuthorized)
+		if len(auth) != 1 {
+			t.Fatalf("merge_queue_authorized rows = %d, want 1", len(auth))
+		}
+		if p := w.payload(auth[0]); p["basis"] != forgeApprovalBasisTransferred || p["path"] != mergeDispatchPathQueue {
+			t.Fatalf("authorized payload = %v", p)
+		}
+	})
+	t.Run("unverified advance carries nothing", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.transferred(func(r *mcqRun) { w.mqeUnverifiedAdvance(r, "h0", "h1") })
+		requireOutcome(t, w.decide(req), mergeOnPassSettle, mergeCandidateQueueReasonForgeApprovalAbsent)
+		w.requireNoMergeWrites(r)
+	})
 }
 
-func TestMergeQueueMergeOnPass_LiveBasisUndeterminedApprovalProceeds(t *testing.T) {
+// TestMergeQueueMergeOnPass_LiveApprovalMergesWithEvidence pins the approved
+// path: one in-lock snapshot, ZERO REST review listings (the listing answers
+// 500, so any read would hold), and merge_queue_authorized < verdict <
+// merge_queue_merged, the merged row naming the authorization and reviewer.
+func TestMergeQueueMergeOnPass_LiveApprovalMergesWithEvidence(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("lv", "h1", mqeSpecYAML)
-	w.gh.set(func() { w.gh.reviews[r.pr] = mqeApprovedBy("alice") })
-	w.mergeable(r, "unknown")
+	w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+	w.gh.set(func() { w.gh.reviewsStatus[r.pr] = 500 })
 	out := w.decide(req)
 	requireOutcome(t, out, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
-	if out.ApprovalBasis != mergeQueueApprovalLive {
+	if out.ApprovalBasis != forgeApprovalBasisLive {
 		t.Fatalf("approval basis = %q, want live", out.ApprovalBasis)
+	}
+	if n := w.gh.snapshotCalls(); n != 1 {
+		t.Fatalf("snapshot calls = %d, want 1", n)
+	}
+	auth, verdicts, merged := w.rows(r, CategoryMergeQueueAuthorized), w.rows(r, CategoryMergeVerdictRecorded), w.rows(r, CategoryMergeQueueMerged)
+	if len(auth) != 1 || len(verdicts) != 1 || len(merged) != 1 {
+		t.Fatalf("rows authorized=%d verdict=%d merged=%d, want 1 each", len(auth), len(verdicts), len(merged))
+	}
+	if auth[0].Sequence >= verdicts[0].Sequence || verdicts[0].Sequence >= merged[0].Sequence {
+		t.Fatalf("sequences authorized=%d verdict=%d merged=%d out of order", auth[0].Sequence, verdicts[0].Sequence, merged[0].Sequence)
+	}
+	mp := w.payload(merged[0])
+	q, _ := mp["qualifying_reviewer"].(map[string]any)
+	if int64(mp["authorization_sequence"].(float64)) != auth[0].Sequence || q["login"] != "alice" || q["permission"] != "write" {
+		t.Fatalf("merged payload = %v", mp)
 	}
 }
 
-// TestMergeQueueMergeOnPass_InLockRecheck pins approval condition (d): a
-// change landing after the pre-lock checks (here, while the verdict is
-// appended inside the lock) holds the entry before the pinned merge.
-func TestMergeQueueMergeOnPass_InLockRecheck(t *testing.T) {
-	cases := []struct {
-		name    string
-		state   string
-		reviews string
-		reason  string
-	}{
-		{"changes requested", "", `[{"id":1,"user":{"login":"alice"},"state":"APPROVED"},{"id":2,"user":{"login":"bob"},"state":"CHANGES_REQUESTED"}]`, mergeOnPassReasonChangesRequested},
-		{"approval dismissed", "blocked", mqeDismissed, mergeOnPassReasonApprovalDismissed},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			w := newMQMWorld(t)
-			r, req := w.ready("rc", "h1", mqeSpecYAML)
-			w.gh.set(func() { w.gh.reviews[r.pr] = mqeApprovedBy("alice") })
-			w.audit.onAppend = func(category string) {
-				if category == CategoryMergeVerdictRecorded {
-					w.gh.set(func() { w.gh.reviews[r.pr] = tc.reviews })
-					w.mergeable(r, tc.state)
-				}
-			}
-			requireOutcome(t, w.decide(req), mergeOnPassHeld, tc.reason)
-			w.requireMerges(0)
-			if len(w.ledger.claims) != 0 {
-				t.Fatalf("ledger claimed %v before a held in-lock re-check", w.ledger.claims)
-			}
-		})
-	}
+// TestMergeQueueMergeOnPass_FoldFailureModes pins the two non-settle fold
+// outcomes: a snapshot transport failure HOLDS transient writing nothing (and
+// the healed next decision merges), and a failed merge_queue_authorized
+// append HOLDS authorization_unrecorded with no verdict and no claim.
+func TestMergeQueueMergeOnPass_FoldFailureModes(t *testing.T) {
+	t.Run("snapshot failure holds, then merges", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.ready("sf", "h1", mqeSpecYAML)
+		w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+		w.gh.set(func() { w.gh.graphQLFail[r.pr] = 3 })
+		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonTransient)
+		w.requireNoMergeWrites(r)
+		w.gh.set(func() { w.gh.graphQLFail[r.pr] = 0 })
+		requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	})
+	t.Run("authorization append failure holds", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.ready("af", "h1", mqeSpecYAML)
+		w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+		w.audit.failCategory = CategoryMergeQueueAuthorized
+		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonAuthorizationUnrecorded)
+		w.requireNoMergeWrites(r)
+	})
 }
 
 func TestMergeQueueMergeOnPass_OverlapRefusalHoldsUnmerged(t *testing.T) {
@@ -760,8 +793,9 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 	cases := []struct {
 		name         string
 		err          error
-		reviews      string
-		state        string
+		decision     string
+		mergeState   string
+		snapshotFail bool
 		observeMerge bool
 		kind         mergeOnPassKind
 		reason       string
@@ -772,8 +806,19 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 			kind: mergeOnPassReadvance, reason: mergeOnPassReasonForgeHeadMismatch, released: 1},
 		{name: "405 ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
 			kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, released: 1},
-		{name: "405 with dismissed approval ejects approval dismissed", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
-			reviews: mqeDismissed, state: "blocked", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeApprovalDismissed, released: 1},
+		// ADR-112 R3 rows 4/5: only REVIEW_REQUIRED, CHANGES_REQUESTED or
+		// BLOCKED select forge_review_required; the default null decision
+		// (row above) and a snapshot read error are forge_merge_refused.
+		{name: "405 review required ejects forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			decision: "REVIEW_REQUIRED", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeReviewRequired, released: 1},
+		{name: "422 changes requested ejects forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrMergeUnprocessable),
+			decision: "CHANGES_REQUESTED", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeReviewRequired, released: 1},
+		{name: "405 blocked ejects forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			mergeState: "BLOCKED", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeReviewRequired, released: 1},
+		{name: "405 null decision and clean state ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			mergeState: "CLEAN", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, released: 1},
+		{name: "405 snapshot read error ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			decision: "REVIEW_REQUIRED", snapshotFail: true, kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, released: 1},
 		{name: "403 is uncertain and holds", err: fmt.Errorf("pinned: %w", forge.ErrForbidden),
 			kind: mergeOnPassHeld, reason: mergeOnPassReasonTransient, failed: 1},
 		{name: "transient error holds", err: errors.New("connection reset"),
@@ -791,17 +836,11 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 				orig := w.merger
 				w.srv.cfg.GateMerger = mqmFailAfterMerge{orig, tc.err}
 			}
-			if tc.reviews != "" {
-				// Dismissed only after the pre-merge checks admitted.
-				w.audit.onAppend = nil
-				w.merger.entered = make(chan struct{}, 1)
-				go func() {
-					<-w.merger.entered
-					w.gh.set(func() { w.gh.reviews[r.pr] = tc.reviews })
-					w.mergeable(r, tc.state)
-				}()
-				w.merger.park = make(chan struct{})
-				go func() { time.Sleep(timescale.D(200 * time.Millisecond)); close(w.merger.park) }()
+			// The gate-less spec makes no pre-merge fold read, so the only
+			// snapshot read is the post-refusal one.
+			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{ReviewDecision: tc.decision, MergeStateStatus: tc.mergeState})
+			if tc.snapshotFail {
+				w.gh.set(func() { w.gh.graphQLFail[r.pr] = 5 })
 			}
 			out := w.decide(req)
 			requireOutcome(t, out, tc.kind, tc.reason)

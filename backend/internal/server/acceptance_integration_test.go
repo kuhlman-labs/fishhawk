@@ -886,14 +886,39 @@ func gateStateOf(t *testing.T, s *Server, seam *exampleAcceptanceSeam) string {
 //	class-5 all-skip verdict → externally_unvalidatable_paged →
 //	gate acceptance_triage → POST /merge 409 acceptance_gate_not_passed →
 //	POST /acceptance-arbitration 200 → gate acceptance_arbitrated →
-//	POST /merge 200 with merge_verdict_recorded on the chain.
+//	POST /merge 200 with merge_verdict_recorded on the chain (the gate-less
+//	twin; the gated example answers 409 forge_approval_required since
+//	ADR-112, its seam having no forge to read approvals from).
 //
 // It fails on a no-op or partial implementation where each per-layer unit test
 // would still pass, and it asserts the SHIPPED observable behavior — including
 // the audit entry whose loss (to a hand-merge) is the whole reason #2474 exists.
 func TestAcceptanceSeam_ArbitrationDischargesPagedTriageAndAdmitsMerge(t *testing.T) {
 	exampleBytes, _ := readAcceptanceExampleSpec(t)
-	seam := buildExampleAcceptanceSeam(t, exampleBytes, run.StageStateSucceeded)
+	// ADR-112 (#4619): the committed example's review stage declares an
+	// approval gate, and this seam wires no GitHub client (an ungated ADR-090
+	// D7 admit, so no verified head), so the in-lock forge-approval fold
+	// fails closed on the post-arbitration merge. The gated walk pins that
+	// refusal; the gate-less twin pins the arbitration-discharges-and-admits
+	// path.
+	t.Run("gated example refuses forge_approval_required", func(t *testing.T) {
+		arbitrationDischargeWalk(t, exampleBytes, true)
+	})
+	t.Run("gate-less twin admits the merge", func(t *testing.T) {
+		gate := "            from_stage: implement\n        gates:\n          - type: approval\n            approvers:\n              any_of: [founder]\n"
+		if strings.Count(string(exampleBytes), gate) != 1 {
+			t.Fatalf("the committed example's review approval gate moved; update the gate-less twin's strip")
+		}
+		gateless := []byte(strings.Replace(string(exampleBytes), gate, "            from_stage: implement\n", 1))
+		arbitrationDischargeWalk(t, gateless, false)
+	})
+}
+
+// arbitrationDischargeWalk is the arbitration walk on specBytes; gated says
+// whether its review stage declares an approval gate (ADR-112 fold).
+func arbitrationDischargeWalk(t *testing.T, specBytes []byte, gated bool) {
+	t.Helper()
+	seam := buildExampleAcceptanceSeam(t, specBytes, run.StageStateSucceeded)
 	s, sa, merger := arbitrationSeamServer(t, seam)
 
 	// #2536: this cross-boundary seam deliberately exercises the endpoint's
@@ -954,6 +979,26 @@ func TestAcceptanceSeam_ArbitrationDischargesPagedTriageAndAdmitsMerge(t *testin
 	}
 
 	merged := postMergeRun(t, s, seam.runID, mergeRunRequest{Verdict: "merging on an arbitrated acceptance failure"}, withMergeOperator)
+	if gated {
+		var env struct {
+			Error struct {
+				Code    string         `json:"code"`
+				Details map[string]any `json:"details"`
+			} `json:"error"`
+		}
+		_ = json.Unmarshal(merged.Body.Bytes(), &env)
+		if merged.Code != 409 || env.Error.Code != mergeCodeForgeApprovalRequired ||
+			env.Error.Details["fold"] != forgeApprovalUndetermined || env.Error.Details["reason"] != forgeApprovalReasonHeadUnknown {
+			t.Fatalf("gated post-arbitration merge = %d %s, want 409 forge_approval_required (undetermined, head_unknown)", merged.Code, merged.Body.String())
+		}
+		if merger.called != 0 {
+			t.Errorf("merger called %d times on the refused gated merge, want 0", merger.called)
+		}
+		if n := countAppendedByCategory(seam.au, CategoryMergeVerdictRecorded); n != 0 {
+			t.Errorf("merge_verdict_recorded entries = %d on the refused gated merge, want 0", n)
+		}
+		return
+	}
 	if merged.Code != 200 {
 		t.Fatalf("post-arbitration merge = %d:\n%s", merged.Code, merged.Body.String())
 	}

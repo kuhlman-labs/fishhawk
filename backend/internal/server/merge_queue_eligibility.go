@@ -58,9 +58,9 @@ import (
 //	    the head was reached by at least one clean advance (the anchored
 //	    head itself never transfers: an approval missing there was
 //	    withdrawn, not dismissed by an advance), no reviewer requests
-//	    changes and — merge variant only — the head's merge-candidate verify
-//	    state is passed or not_required. The result then names
-//	    ApprovalBasis transferred (live otherwise).
+//	    changes. The result then names ApprovalBasis transferred (live
+//	    otherwise). (The merge variant's in-lock fold applies the full
+//	    ADR-112 CLEAN predicate instead; this walk only ADMITS.)
 //	(b) acceptance merge-eligible and not stale — acceptanceGateState +
 //	    acceptanceGateAdmitsMerge, and acceptanceStaleRefusal == nil.
 //	(c) required checks at the head — the check-runs listing classified by
@@ -82,6 +82,14 @@ import (
 //	    (ADR-027). No requirement-arbitration concern CATEGORY exists
 //	    (requirement_arbitration is a page event, spec.PageEventRequirementArbitration,
 //	    never a concern category), so leg (d) matches no category.
+//
+// ADR-112 (#4619) restricts leg (a)'s FORGE sub-legs (changes_requested, the
+// live approval, the D6 transfer) to the ENTRY and ADMISSION variants: the
+// MERGE variant keeps the Fishhawk sub-legs (review_pending,
+// review_coverage_incomplete) and the spec read, and makes no forge review
+// read at all, because merge-on-pass judges approvals and vetoes through the
+// in-lock forge-approval fold (forge_approval.go). Its ApprovalBasis is
+// therefore always "" and the merge path takes the basis from the fold.
 //
 // The predicate NEVER writes. Every read error is undeterminable, which is
 // NOT eligible: uncertainty never enqueues, admits or merges.
@@ -119,8 +127,8 @@ const (
 	// mergeQueueVariantAdmission is the pump's admission: only a red
 	// required check refuses.
 	mergeQueueVariantAdmission
-	// mergeQueueVariantMerge is merge-on-pass: checks GREEN, and a
-	// transferred approval needs a passed (or not_required) head.
+	// mergeQueueVariantMerge is merge-on-pass: checks GREEN, and no forge
+	// review read (the in-lock forge-approval fold judges approvals, ADR-112).
 	mergeQueueVariantMerge
 )
 
@@ -186,9 +194,9 @@ func (s *Server) mergeQueueAdmissionEligibilityAt(ctx context.Context, runRow *r
 }
 
 // mergeQueueMergeEligibility is merge-on-pass's MERGE predicate (ADR-093
-// D3): leg (c) requires the required checks GREEN at headSHA, and a
-// transferred approval additionally needs headSHA's merge-candidate verify
-// state to be passed or not_required.
+// D3): leg (c) requires the required checks GREEN at headSHA, and leg (a)
+// makes no forge review read (ADR-112: the in-lock fold does). anchor is
+// unused by leg (a) on this variant and kept for the caller's signature.
 func (s *Server) mergeQueueMergeEligibility(ctx context.Context, runRow *run.Run, headSHA string, anchor mergeQueueIntentAnchor) mergeQueueEligibilityResult {
 	return s.evaluateMergeQueueEligibility(ctx, runRow, headSHA, anchor, mergeQueueVariantMerge)
 }
@@ -284,6 +292,14 @@ func (s *Server) mergeQueueReviewLeg(ctx context.Context, runRow *run.Run, headS
 	if !declared {
 		return "", "", "", nil
 	}
+	// ADR-112 variant restriction (#4619): merge-on-pass applies the ONE
+	// forge-approval fold itself, in-lock (mergeOnPassLocked step 6b), so the
+	// merge variant makes NO forge review read here: no REST listing, no
+	// changes_requested, no approvers and no transfer walk. The entry and
+	// admission variants keep these legs unchanged until #4632.
+	if variant == mergeQueueVariantMerge {
+		return "", "", "", nil
+	}
 	reviews, err := s.listMergeSettledReviews(ctx, runRow)
 	if err != nil {
 		return "", "", "", err
@@ -315,7 +331,7 @@ func (s *Server) mergeQueueReviewLeg(ctx context.Context, runRow *run.Run, headS
 	if anchor.isZero() {
 		return mergeQueueReasonNotApproved, notApproved, "", nil
 	}
-	carried, why, err := s.mergeQueueApprovalTransfers(ctx, runRow, headSHA, anchor, variant)
+	carried, why, err := s.mergeQueueApprovalTransfers(ctx, runRow, headSHA, anchor)
 	if err != nil {
 		return "", "", "", err
 	}
@@ -404,7 +420,7 @@ func (s *Server) mergeQueueIntentRow(ctx context.Context, runID uuid.UUID, ancho
 // recorded with the merge intent anchor names carries to headSHA. It returns
 // the reason it does not ("" when it does) or a read error.
 func (s *Server) mergeQueueApprovalTransfers(ctx context.Context, runRow *run.Run, headSHA string,
-	anchor mergeQueueIntentAnchor, variant mergeQueueEligibilityVariant) (bool, string, error) {
+	anchor mergeQueueIntentAnchor) (bool, string, error) {
 	intent, found, err := s.mergeQueueIntentRow(ctx, runRow.ID, anchor)
 	if err != nil {
 		return false, "", err
@@ -469,16 +485,6 @@ func (s *Server) mergeQueueApprovalTransfers(ctx context.Context, runRow *run.Ru
 	if !carriers[headSHA] {
 		return false, "the head " + headSHA + " was not reached from the intent's head " + intent.AnchoredHeadSHA +
 			" by clean advances only", nil
-	}
-	if variant == mergeQueueVariantMerge {
-		st, verr := s.mergeCandidateVerifyState(ctx, runRow, headSHA)
-		if verr != nil {
-			return false, "", fmt.Errorf("merge-candidate verify state: %w", verr)
-		}
-		if st.State != mergeCandidateStatePassed && st.State != mergeCandidateStateNotRequired {
-			return false, "the advanced head " + headSHA + "'s merge-candidate verify state is " + st.State +
-				", not passed", nil
-		}
 	}
 	return true, "", nil
 }

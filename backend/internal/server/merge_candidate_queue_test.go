@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strconv"
 	"strings"
 	"sync"
@@ -22,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -93,6 +95,194 @@ type mcqGitHub struct {
 	puts      []mcqPut
 	putStatus map[int]int
 	onPut     func(n int)
+
+	// ADR-112 R1(a)(ii) advance integrity, FAITHFUL by default (so a clean
+	// advance verifies and no other consumer's assertions change). GET
+	// /git/ref/heads/{branch...} serves baseTip[branch] (default
+	// mcqBaseTip(branch); a successful PUT moves the base's tip) or
+	// baseTipStatus[branch]. GET /git/commits/{sha} answers the parents
+	// recorded at POST /merges — [the PR's pre-merge head, the base tip last
+	// served for the merged-in ref] — with wrongParent[branch] replacing the
+	// second parent, or commitStatus; an unrecorded sha answers 404.
+	baseTip       map[string]string
+	baseTipStatus map[string]int
+	baseTipServed map[string]string
+	wrongParent   map[string]string
+	commitStatus  int
+	commitParents map[string][]string
+
+	// ADR-112 review snapshot: POST /graphql answers ONLY the review-snapshot
+	// query (recognised by `latestOpinionatedReviews`) from reviewSnapshot[n]
+	// (default: no reviews, null reviewDecision / mergeStateStatus, a User
+	// opener). merged / state / headRefOid come from the PR itself. The fake
+	// IGNORES writersOnly (real GitHub pre-filters), so the write floor and
+	// the permission filter are what tests exercise. graphQLFail[n] fails
+	// that many next calls with 500; graphQLCalls counts every snapshot
+	// call. Any other GraphQL query answers 404 as before.
+	reviewSnapshot map[int]*mcqReviewSnapshot
+	graphQLFail    map[int]int
+	graphQLCalls   int
+
+	// ADR-112 R1(c) permission read (#4620): GET
+	// /collaborators/{login}/permission answers perms[login] or
+	// permStatus[login]; an unlisted login answers 404, so nothing is
+	// granted by default. permCalls counts reads per login.
+	perms      map[string]mcqPermission
+	permStatus map[string]int
+	permCalls  map[string]int
+}
+
+// mcqBaseTip is the deterministic default tip served for a branch ref.
+func mcqBaseTip(branch string) string { return "basetip-" + branch }
+
+// mcqPermission is one served collaborator permission.
+type mcqPermission struct {
+	RoleName   string
+	Permission string
+}
+
+// mcqReviewSnapshot is one PR's GraphQL review-snapshot fixture.
+type mcqReviewSnapshot struct {
+	Reviews []mcqReviewNode
+	// ReviewDecision / MergeStateStatus: "" serves null.
+	ReviewDecision   string
+	MergeStateStatus string
+	// Author is the PR opener; a zero Typename serves a null author.
+	Author    mcqActor
+	IsPrivate bool
+	// Truncated makes every page advertise a next page, so the client stops
+	// at its page cap with Truncated=true.
+	Truncated bool
+}
+
+// mcqActor is a served GraphQL actor; a zero Typename serves null.
+type mcqActor struct {
+	Typename string
+	Login    string
+	ID       int64
+}
+
+// mcqReviewNode is one served latestOpinionatedReviews node.
+type mcqReviewNode struct {
+	ID          int64
+	State       string
+	SubmittedAt time.Time
+	Commit      string
+	Author      mcqActor
+}
+
+func (a mcqActor) graphQL() any {
+	if a.Typename == "" {
+		return nil
+	}
+	m := map[string]any{"__typename": a.Typename, "login": a.Login}
+	// A non-User actor carries a databaseId only when the fixture sets one
+	// (a Bot or Mannequin with a real id, R1(d)); zero keeps it absent.
+	if a.Typename == "User" || a.ID != 0 {
+		m["databaseId"] = a.ID
+	}
+	return m
+}
+
+func nullableEnum(v string) any {
+	if v == "" {
+		return nil
+	}
+	return v
+}
+
+// serveReviewSnapshot answers one review-snapshot GraphQL call.
+func (g *mcqGitHub) serveReviewSnapshot(w http.ResponseWriter, number int, cursor any) {
+	g.mu.Lock()
+	g.graphQLCalls++
+	if g.graphQLFail[number] > 0 {
+		g.graphQLFail[number]--
+		g.mu.Unlock()
+		w.WriteHeader(http.StatusInternalServerError)
+		return
+	}
+	pr, ok := g.prs[number]
+	var prCopy mcqPR
+	if ok {
+		prCopy = *pr
+	}
+	fx := mcqReviewSnapshot{Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}}
+	if f := g.reviewSnapshot[number]; f != nil {
+		fx = *f
+		fx.Reviews = append([]mcqReviewNode(nil), f.Reviews...)
+	}
+	g.mu.Unlock()
+	if !ok {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"data":{"repository":{"isPrivate":false,"pullRequest":null}}}`))
+		return
+	}
+	nodes := []any{}
+	if cursor == nil || fx.Truncated {
+		for _, r := range fx.Reviews {
+			var commit any
+			if r.Commit != "" {
+				commit = map[string]any{"oid": r.Commit}
+			}
+			var submitted any
+			if !r.SubmittedAt.IsZero() {
+				submitted = r.SubmittedAt.UTC().Format(time.RFC3339)
+			}
+			nodes = append(nodes, map[string]any{"databaseId": r.ID, "state": r.State,
+				"submittedAt": submitted, "commit": commit, "author": r.Author.graphQL()})
+		}
+	}
+	state := "OPEN"
+	switch {
+	case prCopy.merged:
+		state = "MERGED"
+	case prCopy.state == "closed":
+		state = "CLOSED"
+	}
+	page := 1
+	if c, isStr := cursor.(string); isStr {
+		_, _ = fmt.Sscanf(c, "c%d", &page)
+		page++
+	}
+	body := map[string]any{"data": map[string]any{"repository": map[string]any{
+		"isPrivate": fx.IsPrivate,
+		"pullRequest": map[string]any{
+			"merged": prCopy.merged, "state": state, "headRefOid": prCopy.head,
+			"reviewDecision": nullableEnum(fx.ReviewDecision), "mergeStateStatus": nullableEnum(fx.MergeStateStatus),
+			"author": fx.Author.graphQL(),
+			"latestOpinionatedReviews": map[string]any{
+				"pageInfo": map[string]any{"hasNextPage": fx.Truncated, "endCursor": fmt.Sprintf("c%d", page)},
+				"nodes":    nodes,
+			},
+		},
+	}}}
+	raw, _ := json.Marshal(body)
+	w.Header().Set("Content-Type", "application/json")
+	_, _ = w.Write(raw)
+}
+
+// setReviewSnapshot installs PR n's GraphQL review-snapshot fixture.
+func (g *mcqGitHub) setReviewSnapshot(n int, fx mcqReviewSnapshot) {
+	g.set(func() { g.reviewSnapshot[n] = &fx })
+}
+
+// setPermission serves login's collaborator permission.
+func (g *mcqGitHub) setPermission(login, roleName, permission string) {
+	g.set(func() { g.perms[login] = mcqPermission{RoleName: roleName, Permission: permission} })
+}
+
+// snapshotCalls is the number of review-snapshot GraphQL calls served.
+func (g *mcqGitHub) snapshotCalls() int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.graphQLCalls
+}
+
+// permissionCalls is the number of permission reads served for login.
+func (g *mcqGitHub) permissionCalls(login string) int {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return g.permCalls[login]
 }
 
 // mcqGreenChecks is the default check-runs listing: one completed, green run.
@@ -152,11 +342,18 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		status := g.mergeStatus[call.Base]
 		sha := g.mergeSHA[call.Base]
 		if status == 0 && sha != "" {
+			prior := ""
 			for _, pr := range g.prs {
 				if pr.branch == call.Base {
+					prior = pr.head
 					pr.head = sha
 				}
 			}
+			second := g.baseTipServed[call.Head]
+			if wp := g.wrongParent[call.Base]; wp != "" {
+				second = wp
+			}
+			g.commitParents[sha] = []string{prior, second}
 		}
 		onMerge := g.onMerge
 		g.mu.Unlock()
@@ -201,6 +398,7 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		}
 		pr.merged, pr.state = true, "closed"
 		tip := fmt.Sprintf("base-after-pr-%d", n)
+		g.baseTip[mcqBase] = tip
 		for other, o := range g.prs {
 			if other != n && o.state == "open" {
 				g.behind[o.head] = append(g.behind[o.head], tip)
@@ -240,6 +438,75 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		_ = json.Unmarshal([]byte(body), &runs)
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = fmt.Fprintf(w, `{"total_count":%d,"check_runs":%s}`, len(runs), body)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}", func(w http.ResponseWriter, r *http.Request) {
+		branch := r.PathValue("branch")
+		g.mu.Lock()
+		status := g.baseTipStatus[branch]
+		tip := g.baseTip[branch]
+		if tip == "" {
+			tip = mcqBaseTip(branch)
+		}
+		if status == 0 {
+			g.baseTipServed[branch] = tip
+		}
+		g.mu.Unlock()
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"object":{"sha":%q}}`, tip)
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/commits/{sha}", func(w http.ResponseWriter, r *http.Request) {
+		sha := r.PathValue("sha")
+		g.mu.Lock()
+		status := g.commitStatus
+		parents, ok := g.commitParents[sha]
+		g.mu.Unlock()
+		if status == 0 && !ok {
+			status = http.StatusNotFound
+		}
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		ps := make([]string, 0, len(parents))
+		for _, p := range parents {
+			ps = append(ps, fmt.Sprintf(`{"sha":%q}`, p))
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"sha":%q,"tree":{"sha":"tree-%s"},"parents":[%s]}`, sha, sha, strings.Join(ps, ","))
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if !strings.Contains(req.Query, "latestOpinionatedReviews") {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		n, _ := req.Variables["number"].(float64)
+		g.serveReviewSnapshot(w, int(n), req.Variables["cursor"])
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/collaborators/{login}/permission", func(w http.ResponseWriter, r *http.Request) {
+		login := r.PathValue("login")
+		g.mu.Lock()
+		g.permCalls[login]++
+		status := g.permStatus[login]
+		perm, ok := g.perms[login]
+		g.mu.Unlock()
+		if status == 0 && !ok {
+			status = http.StatusNotFound
+		}
+		if status != 0 {
+			w.WriteHeader(status)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"permission":%q,"role_name":%q,"user":{"login":%q}}`, perm.Permission, perm.RoleName, login)
 	})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -304,7 +571,11 @@ func newMCQFixture(t *testing.T) *mcqFixture {
 		gh: &mcqGitHub{prs: map[int]*mcqPR{}, behind: map[string][]string{},
 			compareStatus: map[string]int{}, mergeSHA: map[string]string{}, mergeStatus: map[string]int{},
 			reviews: map[int]string{}, reviewsStatus: map[int]int{}, checks: map[string]string{}, checksStatus: map[string]int{},
-			putStatus: map[int]int{}},
+			putStatus: map[int]int{},
+			baseTip:   map[string]string{}, baseTipStatus: map[string]int{}, baseTipServed: map[string]string{},
+			wrongParent: map[string]string{}, commitParents: map[string][]string{},
+			reviewSnapshot: map[int]*mcqReviewSnapshot{}, graphQLFail: map[int]int{},
+			perms: map[string]mcqPermission{}, permStatus: map[string]int{}, permCalls: map[string]int{}},
 	}
 	f.srv = New(Config{
 		Addr:        "127.0.0.1:0",
@@ -2850,4 +3121,118 @@ func TestMergeCandidateQueue_LiveEntryNotReevaluated(t *testing.T) {
 	f.gh.set(func() { f.gh.reviews[a.pr] = `[]` })
 	f.srv.PumpMergeCandidateQueues(context.Background())
 	f.requireState(a, mergequeue.StateLive, "")
+}
+
+// TestMCQFake_ReviewSnapshotAndPermissionRoutes exercises every ADR-112 route
+// and helper the mcqGitHub fake gained, through the PRODUCTION githubclient:
+// the branch-ref tip, the recorded merge-commit parents (and the wrong-parent
+// and status knobs), the review snapshot (fixture decode, writersOnly
+// IGNORED, truncation, failure budget, call counter, non-snapshot query 404)
+// and the collaborator permission read (listed, unlisted 404, status knob,
+// per-login counter).
+func TestMCQFake_ReviewSnapshotAndPermissionRoutes(t *testing.T) {
+	f := newMCQFixture(t)
+	gh := f.srv.cfg.GitHub
+	ctx := context.Background()
+	scope := forge.FromGitHubInstallationID(1)
+	repo := forge.RepoRef{Owner: "x", Name: "y"}
+	f.gh.set(func() { f.gh.prs[5] = &mcqPR{head: "h1", branch: "fishhawk/run/five", state: "open"} })
+
+	if tip, found, err := gh.GetBranchSHA(ctx, scope, repo, mcqBase); err != nil || !found || tip != mcqBaseTip(mcqBase) {
+		t.Fatalf("base tip = %q %v %v, want %s", tip, found, err, mcqBaseTip(mcqBase))
+	}
+	f.gh.set(func() { f.gh.mergeSHA["fishhawk/run/five"] = "m1" })
+	if sha, err := gh.MergeBranch(ctx, scope, repo, "fishhawk/run/five", mcqBase, "advance"); err != nil || sha != "m1" {
+		t.Fatalf("merge = %q %v", sha, err)
+	}
+	if c, err := gh.GetCommit(ctx, scope, repo, "m1"); err != nil || !reflect.DeepEqual(c.Parents, []string{"h1", mcqBaseTip(mcqBase)}) {
+		t.Fatalf("merge commit parents = %+v %v, want [h1 %s]", c, err, mcqBaseTip(mcqBase))
+	}
+	f.gh.set(func() {
+		f.gh.wrongParent["fishhawk/run/five"] = "wrong"
+		f.gh.mergeSHA["fishhawk/run/five"] = "m2"
+	})
+	if _, err := gh.MergeBranch(ctx, scope, repo, "fishhawk/run/five", mcqBase, "advance"); err != nil {
+		t.Fatalf("merge 2: %v", err)
+	}
+	if c, err := gh.GetCommit(ctx, scope, repo, "m2"); err != nil || !reflect.DeepEqual(c.Parents, []string{"m1", "wrong"}) {
+		t.Fatalf("wrong-parent knob = %+v %v, want [m1 wrong]", c, err)
+	}
+	if _, err := gh.GetCommit(ctx, scope, repo, "unknown"); !errors.Is(err, githubclient.ErrNotFound) {
+		t.Errorf("unrecorded commit err = %v, want ErrNotFound", err)
+	}
+	f.gh.set(func() {
+		f.gh.commitStatus = http.StatusInternalServerError
+		f.gh.baseTipStatus[mcqBase] = http.StatusInternalServerError
+	})
+	if _, err := gh.GetCommit(ctx, scope, repo, "m1"); err == nil {
+		t.Error("commitStatus knob did not fail the read")
+	}
+	if _, _, err := gh.GetBranchSHA(ctx, scope, repo, mcqBase); err == nil {
+		t.Error("baseTipStatus knob did not fail the read")
+	}
+
+	// Review snapshot: default fixture.
+	snap, err := gh.PullRequestReviewSnapshot(ctx, scope, repo, 5)
+	if err != nil || len(snap.Reviews) != 0 || snap.ReviewDecision != "" || snap.HeadOID != "m2" || snap.Merged ||
+		snap.Author.Typename != "User" {
+		t.Fatalf("default snapshot = %+v %v", snap, err)
+	}
+	at := time.Date(2026, 10, 22, 9, 0, 0, 0, time.UTC)
+	f.gh.setReviewSnapshot(5, mcqReviewSnapshot{
+		Reviews: []mcqReviewNode{
+			{ID: 11, State: "APPROVED", SubmittedAt: at, Commit: "m2", Author: mcqActor{Typename: "User", Login: "reader", ID: 7}},
+			{ID: 12, State: "DISMISSED", SubmittedAt: at, Commit: "h1", Author: mcqActor{Typename: "Bot", Login: "ci[bot]"}},
+			{ID: 13, State: "CHANGES_REQUESTED", SubmittedAt: at},
+		},
+		ReviewDecision: "REVIEW_REQUIRED", MergeStateStatus: "BLOCKED",
+		Author: mcqActor{Typename: "Bot", Login: "dependabot[bot]"}, IsPrivate: true,
+	})
+	snap, err = gh.PullRequestReviewSnapshot(ctx, scope, repo, 5)
+	if err != nil {
+		t.Fatalf("snapshot: %v", err)
+	}
+	// writersOnly is IGNORED: a read-permission reviewer's node is served.
+	if len(snap.Reviews) != 3 || snap.Reviews[0].Author.Login != "reader" || snap.Reviews[0].Author.DatabaseID != 7 ||
+		snap.Reviews[1].Author.Typename != "Bot" || snap.Reviews[2].Author.Present || snap.Reviews[2].CommitOID != "" ||
+		!snap.Reviews[0].SubmittedAt.Equal(at) {
+		t.Fatalf("fixture reviews = %+v", snap.Reviews)
+	}
+	if snap.ReviewDecision != "REVIEW_REQUIRED" || snap.MergeStateStatus != "BLOCKED" || !snap.IsPrivate || snap.Author.Typename != "Bot" {
+		t.Fatalf("fixture pr fields = %+v", snap)
+	}
+	f.gh.set(func() { f.gh.reviewSnapshot[5].Truncated = true })
+	before := f.gh.snapshotCalls()
+	if snap, err = gh.PullRequestReviewSnapshot(ctx, scope, repo, 5); err != nil || !snap.Truncated {
+		t.Fatalf("truncated snapshot = %+v %v", snap, err)
+	}
+	if n := f.gh.snapshotCalls() - before; n != 3 {
+		t.Errorf("truncated walk calls = %d, want 3 (the page cap)", n)
+	}
+	f.gh.set(func() { f.gh.graphQLFail[5] = 1 })
+	if _, err := gh.PullRequestReviewSnapshot(ctx, scope, repo, 5); err == nil {
+		t.Error("graphQLFail budget did not fail the call")
+	}
+	if _, err := gh.PullRequestReviewSnapshot(ctx, scope, repo, 999); !errors.Is(err, githubclient.ErrNotFound) {
+		t.Errorf("unknown PR err = %v, want ErrNotFound", err)
+	}
+	if _, err := gh.ListRepoIssues(ctx, scope, repo, githubclient.ListRepoIssuesOptions{}); err == nil {
+		t.Error("a non-snapshot GraphQL query was answered; want 404")
+	}
+
+	// Permission read.
+	f.gh.setPermission("writer", "maintain", "write")
+	if p, err := gh.CollaboratorPermission(ctx, scope, repo, "writer"); err != nil || p.EffectiveRole() != "maintain" {
+		t.Fatalf("listed permission = %+v %v", p, err)
+	}
+	if _, err := gh.CollaboratorPermission(ctx, scope, repo, "stranger"); !errors.Is(err, githubclient.ErrNotFound) {
+		t.Errorf("unlisted login err = %v, want ErrNotFound", err)
+	}
+	f.gh.set(func() { f.gh.permStatus["writer"] = http.StatusInternalServerError })
+	if _, err := gh.CollaboratorPermission(ctx, scope, repo, "writer"); err == nil {
+		t.Error("permStatus knob did not fail the read")
+	}
+	if n := f.gh.permissionCalls("writer"); n != 2 {
+		t.Errorf("permission calls for writer = %d, want 2", n)
+	}
 }

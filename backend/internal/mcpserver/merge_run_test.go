@@ -975,6 +975,12 @@ func TestMergeRun_CrossBoundary_RealServerChecksPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	// The run NEVER recorded a spec, so it declares no ADR-112 forge-approval
+	// gate; a recorded SHA with no cached spec is the legacy row shape the fold
+	// treats as undetermined (C4).
+	if _, err := pool.Exec(ctx, `UPDATE runs SET workflow_sha = '' WHERE id = $1`, row.ID); err != nil {
+		t.Fatalf("clear workflow_sha: %v", err)
+	}
 	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
 		t.Fatalf("transition running: %v", err)
 	}
@@ -2840,5 +2846,55 @@ func TestMergeRun_QueueOwnsMergeStatus(t *testing.T) {
 	}
 	if _, owned := isQueueOwnsMerge(errors.New("plain")); owned {
 		t.Error("a non-API error classified as merge_queue_owns_merge")
+	}
+}
+
+// TestMergeRun_ForgeApprovalRequired_NextStepMapping pins the ADR-112 (#4619)
+// 409 forge_approval_required: an immediate status whose next_action follows
+// details.next_step. Counterfactual: removing the readinessStatuses entry
+// turns the 409 into a tool error → RED.
+func TestMergeRun_ForgeApprovalRequired_NextStepMapping(t *testing.T) {
+	const prURL = "https://github.com/x/y/pull/7"
+	cases := []struct {
+		step, reviewer, wantAction string
+	}{
+		{"approve_pr", "", "approve_pr"},
+		{"dismiss_review", "vera", "dismiss_review"},
+		{"retry_after", "", "fishhawk_merge_run"},
+		{"configure_identity_provider", "", ""},
+		{"", "", ""},
+	}
+	for _, tc := range cases {
+		t.Run("next_step="+tc.step, func(t *testing.T) {
+			details := map[string]any{"pr_url": prURL, "fold": "absent", "reason": "no_qualifying_approval", "next_step": tc.step}
+			if tc.reviewer != "" {
+				details["veto_reviewer"] = tc.reviewer
+			}
+			out, runID := runReadinessRefusal(t, "forge_approval_required", "no qualifying forge approval covers the verified head", details)
+			if out.Status != "forge_approval_required" {
+				t.Fatalf("status = %q, want forge_approval_required", out.Status)
+			}
+			if tc.wantAction == "" {
+				if out.NextAction != nil {
+					t.Fatalf("next_action = %+v, want none", out.NextAction)
+				}
+				return
+			}
+			if out.NextAction == nil || out.NextAction.Action != tc.wantAction {
+				t.Fatalf("next_action = %+v, want %s", out.NextAction, tc.wantAction)
+			}
+			if out.NextAction.Params["run_id"] != runID.String() || out.NextAction.Params["pr_url"] != prURL {
+				t.Errorf("params = %v", out.NextAction.Params)
+			}
+			if tc.reviewer != "" && (out.NextAction.Params["reviewer"] != tc.reviewer || !strings.Contains(out.NextAction.Reason, tc.reviewer)) {
+				t.Errorf("dismiss_review does not name the reviewer: %+v", out.NextAction)
+			}
+		})
+	}
+	// An empty server message still renders without a next action.
+	out := mergeReadinessOutput(&apiError{StatusCode: http.StatusConflict, Code: "forge_approval_required",
+		Details: map[string]any{"next_step": "configure_identity_provider"}}, "forge_approval_required", uuid.New(), time.Now())
+	if out.NextAction != nil || !strings.Contains(out.Message, "forge_approval_required") {
+		t.Errorf("empty-message output = %+v", out)
 	}
 }

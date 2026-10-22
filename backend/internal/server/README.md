@@ -3003,15 +3003,10 @@ deadline): `backend/internal/mergequeue/README.md`.
   passed/not_required → hold; `mergeQueueMergeEligibility` at the anchor
   {recorded intent sequence, base}: undeterminable or only
   `checks_not_green` → hold, any other reason → drop `not_merge_eligible`
-  (re-enter at the tail with `fishhawk_merge_run`, ADR-093 Q2);
-  `approvalDismissedCheck` refusal → eject `forge_approval_dismissed`
-  (Fishhawk cannot re-approve: re-approve under your own identity, then
-  `fishhawk_merge_run`); on a TRANSFERRED basis the approval check fails
-  closed: an undetermined approval (an `unknown` read or a read failure)
-  holds `transferred_approval_undetermined`, with no `mergeable_state`
-  shortcut, both before the lock and in the locked re-check; a live basis
-  proceeds and the forge decides. Then a best-effort `fishhawk_audit_complete` republish at
-  the head.
+  (re-enter at the tail with `fishhawk_merge_run`, ADR-093 Q2). The merge
+  variant makes NO forge review read (ADR-112 variant restriction): the
+  approval is judged only in-lock, by the fold (step 6b below). Then a
+  best-effort `fishhawk_audit_complete` republish at the head.
 - **Locked steps** (`withRunMergeLock` = `WithMergeIntentLock`; in
   merge-on-pass every forge read is bounded 10s and the pinned merge 30s,
   under the 90s fn deadline):
@@ -3021,11 +3016,15 @@ deadline): `backend/internal/mergequeue/README.md`.
   and appends a deduped, counts-only `merge_queue_overlap_refused`, a 502
   holds, no override; the base re-probe (`CompareCommits(head, base)`
   behind > 0 → readvance); the `merge_queue_entered` row at the RECORDED
-  intent sequence (missing → hold); record-before-commit
+  intent sequence (missing → hold); **step 6b, the ADR-112 fold** at the
+  verified head (§ "ADR-112 forge-approval fold"): a snapshot transport
+  failure holds `transient` writing nothing, a snapshot head ≠ the verified
+  head readvances `head_moved`, any other non-approved result settles per
+  the interim table, approved writes `merge_queue_authorized` (an append
+  failure holds `authorization_unrecorded`); record-before-commit
   `merge_verdict_recorded` {verdict prose and actor from the intent row,
   `via: merge_queue`, `intent_sequence`, `head_sha`, `entry_id`} (a 0062
-  once-index duplicate is a resume); re-check changes_requested and the
-  dismissed approval (a change since the pre-lock read holds); claim the
+  once-index duplicate is a resume); claim the
   run's ONE dispatch on the D1 ledger (path `queue`; an existing claim →
   hold `merge_already_dispatched`, forge never called); the pinned merge
   `MergePullRequestAtHead(head)`.
@@ -3035,9 +3034,13 @@ deadline): `backend/internal/mergequeue/README.md`.
   failed append after the forge accepted still settles merged and logs at
   ERROR. `ErrMergeConflict` (409 head mismatch) → re-read: merged → merged,
   else readvance, no `merge_queue_merged` row. 405 / 422 →
-  re-read: merged → merged, else a dismissed approval → eject
-  `forge_approval_dismissed`, else eject `forge_merge_refused` naming the
-  error (never retried in a loop). Any other error → re-read: merged →
+  re-read: merged → merged, else ONE fresh review snapshot (no permission
+  reads): reviewDecision `REVIEW_REQUIRED` / `CHANGES_REQUESTED` or
+  mergeStateStatus `BLOCKED` → eject `forge_review_required` (ADR-112 R3 row
+  4, TEMPORARY until #4632's yield), else (a null reviewDecision, any other
+  state, a snapshot read error) eject `forge_merge_refused` naming the
+  error (row 5; never retried in a loop). This applies with or without a
+  declared gate. Any other error → re-read: merged →
   merged, else hold. After a claim, a failed dispatch is classified once
   (`classifyMergeDispatchOutcome`): 405 / 409 / 422 (and a checks_pending
   refusal) RELEASE the claim (an exact-claim compare-and-swap DELETE), so
@@ -3083,22 +3086,26 @@ deadline): `backend/internal/mergequeue/README.md`.
   reconciliation (the PR reads merged) or the operator re-arm (mergequeue
   README § "Merge-dispatch ledger"); the merge-queue read surfaces it on the
   entry as `dispatch_claim`.
-- **D6 approval transfer.** With no live `approvals.members` approval and an
-  intent anchor, the heads carrying the operator's approval are seeded from
-  the intent row's `anchored_head_sha` and walked through later
-  `branch_rebased` (a CLEAN advance from a carrying head adds its new head)
-  and `conflict_resolution_pushed` (never carries; clears the set) rows. The
-  transfer holds only when the current head is in the set, no
-  changes_requested, and (merge variant) the head reads passed or
-  not_required. A legacy anchor (sequence 0) resolves the newest
-  `merge_queue_entered` row naming the base.
+- **D6 approval transfer (admission only).** On the ENTRY and ADMISSION
+  variants, with no live `approvals.members` approval and an intent anchor,
+  the heads carrying the operator's approval are seeded from the intent
+  row's `anchored_head_sha` and walked through later `branch_rebased` (a
+  CLEAN advance from a carrying head adds its new head) and
+  `conflict_resolution_pushed` (never carries; clears the set) rows. The
+  transfer holds only when the current head is in the set and no
+  changes_requested. A legacy anchor (sequence 0) resolves the newest
+  `merge_queue_entered` row naming the base. This walk only ADMITS (on the
+  pre-ADR-112 clean predicate until #4632); every MERGE passes the in-lock
+  fold, whose review-commit-seeded chain applies the full CLEAN predicate.
 - **Audit rows** (system actor, INTERNAL, registered in
   `audit/categories.go`). `merge_queue_advanced` {entry_id, prior_head_sha,
   new_head_sha, merge_commit_sha, clean, admission_epoch};
   `merge_queue_verified` {entry_id, head_sha, source pass | transfer |
   already_passed | not_required}; `merge_queue_merged` {entry_id, base_ref,
   head_sha, verdict_sequence, verdict_head_sha, intent_sequence,
-  approval_basis}; `merge_queue_overlap_refused` {head, code, reason,
+  approval_basis (the fold's live | transferred | not_required),
+  authorization_sequence and qualifying_reviewer {login, actor_id,
+  permission} when a gate is declared}; `merge_queue_overlap_refused` {head, code, reason,
   counts}. **`merge_verdict_recorded.head_sha` is the FIRST merge-on-pass
   attempt's head** (the 0062 once-index keeps one verdict row per run);
   `merge_queue_merged.head_sha` is authoritative for the merged head, and its
@@ -3123,8 +3130,8 @@ deadline): `backend/internal/mergequeue/README.md`.
   see. An `inline_merge_dispatched` hold waits on the inline auto-merge; if
   it never fires the entry holds the line until slice 3's bounded hold. In a
   dismiss-stale repository requiring an approving review (this one) every
-  advance dismisses the approval, so a behind PR ejects
-  `forge_approval_dismissed`. A lock fn cut by its 90s deadline is
+  advance dismisses the approval, so a behind PR's fold answers dismissed
+  and ejects `forge_approval_dismissed` (interim posture, #4632). A lock fn cut by its 90s deadline is
   re-observed by the next pump; a merge that landed settles merged and is
   never applied twice.
 - **Tests.** `merge_queue_merge_test.go` (the decision), `merge_queue_pump_test.go`
@@ -3132,6 +3139,120 @@ deadline): `backend/internal/mergequeue/README.md`.
   race, inline vs merge-on-pass in three orders), `autodrive_merge_queue_test.go`
   (the delegated arm: ownership, read error, bounded lock, the D1 claim, the
   H2 race), `merge_queue_eligibility_test.go`.
+
+### ADR-112 forge-approval fold (`forge_approval.go`, [#4619](https://github.com/kuhlman-labs/fishhawk/issues/4619))
+
+ADR-112 (#4622, ratified 2026-10-22, v4.1) R1, R2, R4 and R6: ONE
+forge-approval predicate, `forgeApprovalFold(ctx, run, verifiedHead)`, for
+every basis and every merge path. PARTIAL delivery: R3 (bounded wait, yield)
+and R5 (yield surfaces) are #4632.
+
+- **Rules.** A review qualifies only if (a) it is the reviewer's latest
+  opinionated `APPROVED` at the verified head, or at a head reaching it only
+  through CLEAN advances (`clean_advance.go`: a `branch_rebased` row with
+  `clean_verified` true; seeded at the review's commit; a
+  `conflict_resolution_pushed` row clears; a legacy row with no
+  `clean_verified` is not clean); (b) its author satisfies the review gate's
+  approvals (fired escalations, `members`, `member_of`, `not: author`, the
+  single-member voucher exception); (c) its author's permission, read FRESH
+  with the run's installation token, is ≥ max(min_permission, write);
+  (d) its author is a real user. A `CHANGES_REQUESTED` vetoes only from a
+  write-or-higher identity-valid author (the same floor); an unresolvable
+  veto is undetermined.
+- **Precedence.** provider_unsupported > reviews_truncated > vetoed >
+  undetermined (veto) > [qualifying approval: reviewDecision
+  `REVIEW_REQUIRED` → review_required, else approved] > undetermined
+  (approval) > dismissed > absent.
+- **Cost and cap.** One GraphQL snapshot (≤ 3 pages) + at most 10
+  permission reads under ONE 15s deadline; needing more than 10 reads is
+  undetermined. Per decision: merge-on-pass makes ZERO REST review listings
+  (the merge variant reads none) and one in-lock snapshot (+1, no
+  permission reads, on a typed forge refusal); inline and delegated make
+  one snapshot + ≤ 10 permission reads in-lock, only when a gate is
+  declared; the entry and admission variants are unchanged (one REST
+  listing when a gate is declared, zero GraphQL).
+- **In-lock order, all three paths.** Inside the merge-intent lock, after the
+  ownership check and before every verdict, override, observe, republish
+  and claim write. Merge-on-pass: after the base re-probe (step 6b).
+  Inline (`merge_run.go::inlineForgeApproval`): before
+  `recordOverlapOverride`. Delegated
+  (`autodrive.go::delegatedForgeApproval`): after the acceptance and
+  nil-merger checks, before the republish and the claim.
+- **Head binding (H1).** Inline folds at `gate.HeadSHA` (the head the
+  merge-candidate gate verified), the delegated arm at its gate head (EMPTY
+  → undetermined `head_unknown`), merge-on-pass at the anchored head. On
+  every path the fold compares the in-lock snapshot's `headRefOid` with that
+  head: inline → 409 `forge_approval_required` (fold undetermined,
+  `head_moved`); delegated → observe-only (`mergeDispatchApprovalNotQualified`);
+  merge-on-pass → readvance `head_moved`. An inline merged-PR admit (empty
+  gate head, the PR merged) skips the fold so the observe path answers
+  `already_merged`.
+- **Interim table (merge-on-pass, until #4632).** A non-approved fold settles
+  with no verdict, no authorization row and no claim, and the pump continues
+  to the next entry. DROP: vetoed → `forge_approval_vetoed`, review_required
+  → `forge_approval_review_required`. EJECT: dismissed →
+  `forge_approval_dismissed`, absent → `forge_approval_absent`, undetermined
+  → `forge_approval_undetermined`, reviews_truncated →
+  `forge_approval_reviews_truncated`, provider_unsupported →
+  `forge_approval_provider_unsupported`. The ONE hold is a snapshot
+  TRANSPORT failure (`transient`, nothing written), exactly as a PR-read
+  failure holds today. The post-refusal `forge_review_required` eject is a
+  temporary stand-in for #4632's yield.
+- **Authorization row (R4).** An approved fold on a declared gate appends a
+  chained `merge_queue_authorized` row (path queue | inline | delegated)
+  BEFORE any verdict row or claim. Append failure: queue holds
+  `authorization_unrecorded`, inline answers 503
+  `merge_authorization_unrecorded` (retryable), delegated is observe-only
+  (`mergeDispatchAuthorizationUnrecorded`); none records a verdict or claims.
+  A gate-less merge writes no row. On a resume whose verdict row already
+  exists, THIS attempt's authorization row still precedes its claim.
+- **Spec postures (C4).** A run that NEVER recorded a spec (an empty
+  `WorkflowSHA` AND no cached `WorkflowSpec`: an ad-hoc run), or whose review
+  stage declares no approval gate → no gate (R6): no fold read, admit. A spec
+  that WAS recorded (`WorkflowSHA` set) but whose cached bytes are absent (the
+  legacy row shape that predates the `workflow_spec` column), read back empty,
+  do not parse, or lack the run's workflow → undetermined
+  (`spec_undeterminable`, no forge read): inline 409, delegated observe-only,
+  queue eject `forge_approval_undetermined`. This DIVERGES from the queue's entry and
+  admission variants (`reviewApprovalGateForRun`), which hold
+  (undeterminable) on any spec they cannot determine, absent included.
+- **GitLab (behaviour change).** On a non-GitHub forge whose review stage
+  declares an approval gate the fold answers `provider_unsupported` by name
+  (GitLab approvals carry no SHA, so R1(a) cannot be determined): inline and
+  delegated merges now FAIL CLOSED (409 / observe-only). A gate-less GitLab
+  run is unchanged.
+- **Removed legacy check.** `approvalDismissedCheck` (#4086) no longer runs
+  on merge-on-pass (pre-lock step 5 and in-lock step 8, with its REST
+  `changes_requested` re-read and the `transferred_approval_undetermined`
+  hold) or on the inline merge endpoint; the gate view keeps it as an
+  ADVISORY display, so the gate view and the merge endpoint deliberately
+  differ on that leg (ADR-112 R3).
+- **Gate-less changes_requested (C5).** The pre-change gate-less in-lock path
+  did NOT enforce changes_requested: step 8's re-read and the eligibility
+  leg both ran only when an approval gate was declared, and the inline
+  `approval_dismissed` check never read a veto. So no veto enforcement is
+  lost on a gate-less run. What IS lost there is the #4086 inline
+  `approval_dismissed` refusal: a branch-protected PR whose approval was
+  dismissed now queues an auto-merge that does not fire until re-approved
+  (the gate view still shows the advisory; on merge-on-pass the typed
+  refusal ejects `forge_review_required`).
+- **Fake fidelity.** The mcq fake's GraphQL route IGNORES `writersOnly`
+  (real GitHub pre-filters), so the tests exercise the write floor and the
+  permission filter; whether GitHub includes DISMISSED in
+  `latestOpinionatedReviews` is unconfirmed, and both shapes fail closed.
+- **Residuals.** (H3) The inline and delegated forge merge calls
+  (MergePullRequest) are not pinned to the evaluated head, so a push landing
+  after the in-lock snapshot and before the merge call is merged without a
+  qualifying approval. It is a pre-existing gap; follow-up
+  [#4641](https://github.com/kuhlman-labs/fishhawk/issues/4641) pins REST
+  `sha` / GraphQL `expectedHeadOid`. Merge-on-pass is already head-pinned.
+  A late approval (for example dismiss-stale after a queue advance) ejects
+  under the interim posture and must be re-invoked until #4632.
+- **Tests.** `forge_approval_test.go` (the fold), `forge_approval_e2e_test.go`
+  (inline, delegated and merge-on-pass, including the H2 head-moved row per
+  path), `merge_queue_merge_test.go` (the interim table, transfer, evidence
+  order, failure modes, post-refusal rows 4/5),
+  `merge_queue_eligibility_test.go` (variant restriction).
 
 ### Merge queue read (`merge_queue_read.go`)
 
@@ -8051,7 +8172,7 @@ Two gate states that used to be HIDDEN — a merge that queued and then timed ou
 All three are 409s returned BEFORE the `merge_verdict_recorded` append, so none records a verdict nor dispatches a merge. `mergeReadinessRefusal{Code, Message, Details}` never writes HTTP: `handleMergeRun` renders it (adding `run_id` / `pr_url`) and the gate view reuses the same value, so the two surfaces cannot drift.
 
 - **`acceptance_stale` — FAIL-CLOSED, audit chain only.** `acceptanceStaleRefusal` refuses when the run's acceptance stage carries a stage-scoped `acceptance_reopened` entry NEWER than the newest `acceptance_outcome_recorded` — the state `reopenAcceptanceOnFixupPush` (and the #1567 operator re-open) leaves, where `acceptanceGateState` still reads the stale `passed` outcome and admits. It keys on the chain's own invalidation record, NEVER a head compare: a vouch commit or an ADR-090 rebase moves the head without re-opening acceptance, by design, and a head compare would block merges no verb could clear. Details: `verified_head_sha` (the outcome's `head_sha`, "" when unrecorded), `current_head_sha` (the re-open's), both sequences, the stage id/state, and `next_step` (`fishhawk_dispatch_stage` pending / `fishhawk_await_stage` dispatched or running / `fishhawk_retry_stage` settled without a newer verdict). An audit read error is returned, and the endpoint maps it to `500 internal_error` with nothing recorded — the evidence lives on Fishhawk's own chain, like `acceptanceGateState`. Placed after the acceptance gate and BEFORE the `GateMerger` nil check, so it needs no merge seam.
-- **`approval_dismissed` — BEST-EFFORT, FAIL-OPEN, forge.** `approvalDismissedCheck` refuses only when GitHub reports `mergeable_state=blocked`, no reviewer's LATEST review (COMMENTED / PENDING ignored) is `APPROVED`, and at least one is `DISMISSED`. Every uncertainty admits with `Undetermined` naming why — no GitHub client, no installation, an unparseable repo, no PR number, a PR read error, a merged PR, any other `mergeable_state` (so a repo whose protection does not require reviews never refuses), a reviews read error, a truncated listing — in the `prMergeConflicting` posture: a failed forge read must not block a merge GitHub itself would accept. A dismissed review loses its earlier state, so a dismissed CHANGES_REQUESTED looks like a dismissed approval; the message therefore says "no approval is live and a prior review was dismissed", and re-approving is the remedy either way. A never-reviewed PR has no DISMISSED review and still queues. `dismissing_commit` is the live head (the forge does not say which push dismissed the review); `dismissing_cause` comes from the chain: `vouch_commit` (an `operator_commit_vouched` sha), `fixup_push` (a `fixup_pushed` head_sha), `push`, or `unknown` on an audit read error. Placed after the ADR-090 merge-candidate gate.
+- **`approval_dismissed` — GATE VIEW ONLY, advisory, BEST-EFFORT, FAIL-OPEN, forge.** Since ADR-112 (#4619) the merge endpoint no longer runs `approvalDismissedCheck`: its approval refusal is the forge-approval fold's 409 `forge_approval_required` (§ "ADR-112 forge-approval fold"), so the gate view's `merge_readiness` and the merge endpoint deliberately differ on this leg. The gate view still reports it: it flags only when GitHub reports `mergeable_state=blocked`, no reviewer's LATEST review (COMMENTED / PENDING ignored) is `APPROVED`, and at least one is `DISMISSED`. Every uncertainty is reported as undetermined, never a blocker — no GitHub client, no installation, an unparseable repo, no PR number, a PR read error, a merged PR, any other `mergeable_state`, a reviews read error, a truncated listing. A dismissed review loses its earlier state, so a dismissed CHANGES_REQUESTED looks like a dismissed approval; re-approving is the remedy either way. `dismissing_commit` is the live head; `dismissing_cause` comes from the chain: `vouch_commit`, `fixup_push`, `push`, or `unknown` on an audit read error.
 
 - **`review_coverage_incomplete` — FAIL-CLOSED, audit chain only (#4219).** `reviewCoverageRefusal` (`review_coverage.go`) holds a decomposed parent until every SUCCEEDED slice child is covered by a SUCCESSFUL agent review: the parent's latest implement-review round carries an `implement_reviewed` verdict (a consolidated or fix-up round compares the whole parent diff, so it covers every slice), or each slice's own latest round does. A round whose reviewers all failed or were skipped covers nothing — the d3b1d915 hole; a reject verdict counts. Not applicable to a non-parent, a child run, zero configured agent reviewers, or no wired reviewer backend. Details: `uncovered_slices[]` (`child_run_id`, `slice_index`, `round_sequence`, `reason` `no_review_round` | `review_round_in_flight` | `review_round_no_verdict`), `parent_round`, and `next_step` (`fishhawk_rerun_review` when the parent round settled with no verdict, or when the parent has NO round and its consolidated PR is open — the verb then starts the first consolidated round, #4282; `fishhawk_await_review` while a round is in flight, before the PR opens, and for a GATING parent with no round, whose message names `fishhawk_fixup_stage` because the verb refuses it `gating_authority`). Placed right after `acceptance_stale` and BEFORE the `GateMerger` nil check; a read error is `500 internal_error`. The same predicate feeds the gate view, the drive observer (`drive.RuleReviewCoverageIncomplete`, stamped instead of `checks_green_awaiting_merge`) and the delegated `may_merge` arm (observe-only on the hold), so the four cannot drift. The recovery is the re-run verb (§ "Operator re-run"), including for a parent whose consolidated dispatch never started a round; no merge-time override ships.
 

@@ -1365,14 +1365,12 @@ func TestMergeRun_BlockedStateProceeds(t *testing.T) {
 	if merger.called != 1 {
 		t.Errorf("merger called %d times, want 1 (blocked dispatches)", merger.called)
 	}
-	// #4086 approval condition 4: mergeable_state=="blocked" is exactly what
-	// arms the approval-dismissed check, and this stub serves no reviews
-	// listing, so the check must FAIL OPEN with its reason named — not refuse
-	// and not silently skip. Pinned on the handler's log line (the wiring)
-	// and on the helper's own result (the branch).
-	if !strings.Contains(logs.String(), "approval-dismissed check undetermined") ||
-		!strings.Contains(logs.String(), "reviews read failed") {
-		t.Errorf("merge log does not record the approval check's fail-open reason:\n%s", logs.String())
+	// ADR-112 (#4619): the merge endpoint no longer runs the #4086
+	// approval-dismissed check (the gate view keeps it advisory), so the
+	// handler logs no fail-open line; the helper's own fail-open branch is
+	// still pinned on its result.
+	if strings.Contains(logs.String(), "approval-dismissed check undetermined") {
+		t.Errorf("merge log records the removed approval-dismissed check:\n%s", logs.String())
 	}
 	res := s.approvalDismissedCheck(context.Background(), repo.runs[runID])
 	if res.Determined || res.Refusal != nil || !strings.Contains(res.Undetermined, "reviews read failed") {
@@ -1464,6 +1462,9 @@ func newMergeRepublishServer(t *testing.T, log *mergeOrderLog, publishErr error,
 	au := newAuditCompleteAuditFake()
 	arts := newFakeArtifactRepo()
 	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	// The run NEVER recorded a spec (empty WorkflowSHA), so it declares no
+	// ADR-112 forge-approval gate (C4).
+	r.WorkflowSHA = ""
 	prURL := mergePR
 	r.PullRequestURL = &prURL
 
@@ -2221,6 +2222,22 @@ func TestMergeRun_DispatchError_ForgeNotMerged_502(t *testing.T) {
 	}
 }
 
+// specLessRunRepo reads every run as one that NEVER recorded a spec (an empty
+// WorkflowSHA), so a spec-less fixture whose Postgres seed stamps a SHA
+// declares no ADR-112 forge-approval gate; a recorded SHA with no cached spec
+// is the legacy row shape the fold treats as undetermined (C4).
+type specLessRunRepo struct {
+	run.Repository
+}
+
+func (r specLessRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	rr, err := r.Repository.GetRun(ctx, id)
+	if rr != nil && len(rr.WorkflowSpec) == 0 {
+		rr.WorkflowSHA = ""
+	}
+	return rr, err
+}
+
 // TestMergeRun_AlreadyMergedEndToEnd drives the CROSS-BOUNDARY seam on a REAL
 // Postgres chain (HTTP handler → forge read → audit persistence): a resume with
 // a forge reporting merged+SHA+merged_at answers already_merged with
@@ -2233,6 +2250,7 @@ func TestMergeRun_AlreadyMergedEndToEnd(t *testing.T) {
 	f := newObservationFixture(t, reader)
 	merger := &fakeMerger{}
 	f.s.cfg.GateMerger = merger
+	f.s.cfg.RunRepo = specLessRunRepo{Repository: f.s.cfg.RunRepo}
 
 	// RESUME shape: a durable verdict row already exists.
 	if _, err := f.audit.AppendChained(ctx, audit.ChainAppendParams{
@@ -2814,15 +2832,13 @@ func TestMergeRun_MergeCandidate_ConflictGuardRunsFirst(t *testing.T) {
 
 // --- #4086: merge-readiness refusals -----------------------------------------
 
-// TestMergeRun_ApprovalDismissed_AfterVouchCommit pins D1: a PR GitHub reports
-// blocked, whose only review was DISMISSED by an operator vouch commit, is
-// refused 409 approval_dismissed naming the dismissed review's commit, the
-// vouched head and the cause — and the committed state is untouched (zero
-// verdict rows, no dispatch). The merge-candidate gate admits this fixture
-// (compare reports zero commits behind and the spec declares no
-// merge-candidate verify), so the approval check is the only thing in the
-// path. Counterfactual: deleting the approvalDismissedCheck call dispatches
-// the merge (merger.called==1, a verdict row) → RED.
+// TestMergeRun_ApprovalDismissed_AfterVouchCommit pins ADR-112's REMOVAL of
+// the #4086 approval_dismissed refusal from the merge endpoint (#4619): under
+// a gate-less spec a blocked PR whose only review was DISMISSED by an operator
+// vouch commit is now ADMITTED (the forge-approval fold judges approvals only
+// when the review stage declares an approval gate; the gate-spec dismissed
+// row answers 409 forge_approval_required in forge_approval_e2e_test.go). The
+// gate view keeps approvalDismissedCheck as an advisory display.
 func TestMergeRun_ApprovalDismissed_AfterVouchCommit(t *testing.T) {
 	const approved = "2222222222222222222222222222222222222222"
 	g := newMCGateFixture(t, mcvNoVerifySpecYAML)
@@ -2831,20 +2847,7 @@ func TestMergeRun_ApprovalDismissed_AfterVouchCommit(t *testing.T) {
 		{"id": 11, "user": map[string]any{"login": "operator"}, "state": "DISMISSED", "commit_id": approved},
 	}
 	seedReadinessEntry(g.au, g.runID, nil, CategoryOperatorCommitVouched, 40, map[string]any{lineageVouchedSHAField: mcvHead})
-
-	env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeApprovalDismissed)
-	d := env.Error.Details
-	if d["dismissing_commit"] != mcvHead || d["approved_commit"] != approved || d["dismissing_cause"] != dismissingCauseVouchCommit {
-		t.Errorf("details = %v, want dismissing_commit %s, approved_commit %s, dismissing_cause vouch_commit", d, mcvHead, approved)
-	}
-	if d["next_step"] != "approve_pr" || d["pr_url"] != mergePR || d["run_id"] != g.runID.String() {
-		t.Errorf("details = %v, want next_step approve_pr with run_id + pr_url", d)
-	}
-	for _, want := range []string{mcvHead, approved, "gh pr review --approve"} {
-		if !strings.Contains(env.Error.Message, want) {
-			t.Errorf("message %q does not name %q", env.Error.Message, want)
-		}
-	}
+	g.assertAdmitted(t, g.post(t))
 }
 
 // TestMergeRun_ApprovalDismissed_NeverReviewedStillQueues pins the preserved

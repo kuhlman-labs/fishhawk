@@ -2835,6 +2835,12 @@ func newGatedMergeRepublishServer(t *testing.T, log *mergeOrderLog, workflowSpec
 	r.PullRequestURL = &prURL
 	r.WorkflowID = "feature_change"
 	r.WorkflowSpec = workflowSpec
+	if workflowSpec == nil {
+		// A run that NEVER recorded a spec declares no ADR-112 forge-approval
+		// gate; a recorded SHA with no cached spec is the legacy row shape the
+		// fold treats as undetermined (C4).
+		r.WorkflowSHA = ""
+	}
 
 	s := New(Config{
 		Addr: "127.0.0.1:0", RunRepo: rr,
