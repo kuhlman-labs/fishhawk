@@ -286,7 +286,10 @@ func (c Conventions) ProductFeedbackEnabled() bool {
 
 // Project is the GitHub Projects connection. Owner is the project owner
 // login; OwnerType selects the GraphQL owner query (user vs organization
-// — the Project #7 trap); Number is the integer project number.
+// — a user-owned board is not reachable through the organization query);
+// Number is the integer project number. A nil *Project on a github_projects
+// config means no board is declared (ADR-110): filing creates the issue and
+// degrades to boarded:false with BoardingErrorNoProjectConfigured.
 type Project struct {
 	Owner     string `json:"owner"`
 	OwnerType string `json:"owner_type,omitempty"`
@@ -415,7 +418,7 @@ func (e *SchemaError) Error() string {
 
 // SemanticError is returned when the config satisfies the schema but
 // violates a cross-field rule the schema can't express (the mandatory
-// required-field trio, the github_projects connection requirement, ADR
+// required-field trio, the jira and gitlab connection requirements, ADR
 // numbering, complexity cross-reference). It is also the apply-time error
 // for a filing that violates its type's conventions (an unresolved title
 // placeholder, an off-skeleton sections key).
@@ -500,11 +503,10 @@ func parse(data []byte) (Conventions, error) {
 }
 
 // validateSemantics enforces the cross-field rules the JSON Schema can't
-// express: the mandatory required-field trio, the github_projects, jira, and
-// gitlab connection requirements, ADR numbering, the complexity
-// cross-reference, and the transitions->states cross-reference (every
-// configured transition target must name a canonical state declared in the
-// states map).
+// express: the mandatory required-field trio, the jira and gitlab connection
+// requirements, ADR numbering, the complexity cross-reference, and the
+// transitions->states cross-reference (every configured transition target
+// must name a canonical state declared in the states map).
 func validateSemantics(c Conventions) error {
 	if missing := missingMandatoryFields(c.RequiredFields); len(missing) > 0 {
 		return &SemanticError{Msg: fmt.Sprintf(
@@ -512,9 +514,9 @@ func validateSemantics(c Conventions) error {
 			strings.Join(missing, ", "))}
 	}
 
-	if c.Provider == "github_projects" && c.Project == nil {
-		return &SemanticError{Msg: "provider github_projects requires a project connection block (owner + number)"}
-	}
+	// github_projects does not require a project block (ADR-110): a config
+	// without one declares no board, and filing degrades to boarded:false
+	// with BoardingErrorNoProjectConfigured rather than refusing the parse.
 
 	if c.Provider == "jira" && c.Jira == nil {
 		return &SemanticError{Msg: "provider jira requires a jira connection block (project_key)"}

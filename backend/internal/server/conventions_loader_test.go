@@ -4,6 +4,8 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -884,5 +886,61 @@ func TestConventionsLoader_MixedForge(t *testing.T) {
 	}
 	if gl.lastScope.Ref() != "gitlab:deployment" {
 		t.Errorf("gitlab fetch scope = %q, want the deployment scope", gl.lastScope.Ref())
+	}
+}
+
+// TestConventionsLoader_UnconfiguredRepoResolvesNoBoard pins the loader tail
+// that ADR-110 guard (i) (#4606) rests on: a repository with no committed
+// .fishhawk/work-management.yaml (the fetch answers ErrNotFound) and no
+// break-glass override resolves to the shipped default, which declares no
+// project — so it can never resolve to any board.
+func TestConventionsLoader_UnconfiguredRepoResolvesNoBoard(t *testing.T) {
+	gh := &fakeFileFetcher{err: forge.ErrNotFound}
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:      &fakeProviderResolver{provider: "github", found: true},
+		GitHubFetcher: gh,
+		GitHubScope:   githubScopeFixed("42"),
+	})
+	conv, err := l.Load(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Load err = %v, want nil", err)
+	}
+	if gh.calls != 1 {
+		t.Fatalf("fetch calls = %d, want 1 (the fallback must be reached THROUGH the not-found fetch)", gh.calls)
+	}
+	if conv.Provider != "github_projects" {
+		t.Errorf("Provider = %q, want the shipped default's github_projects", conv.Provider)
+	}
+	if conv.Project != nil {
+		t.Errorf("Project = %+v, want nil: an unconfigured repository must resolve to no board (ADR-110)", *conv.Project)
+	}
+}
+
+// TestConventionsLoader_RepositoryOwnDeclarationBoardsProject7 is the
+// preservation pin for THIS repository: the real loader serves the committed
+// .fishhawk/work-management.yaml for kuhlman-labs/fishhawk, which declares
+// Project #7, and that declaration passes destination authorization (project
+// owner == the account key). It FAILS CLOSED when the file is absent: the
+// operator lands it on main before the shipped default drops Project #7
+// (#4606).
+func TestConventionsLoader_RepositoryOwnDeclarationBoardsProject7(t *testing.T) {
+	path := filepath.Join(repoRoot(t), ".fishhawk", "work-management.yaml")
+	body, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v — precondition: the operator must land this repository's own .fishhawk/work-management.yaml before the shipped default drops Project #7 (#4606)", path, err)
+	}
+	gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: body, SHA: "repo-own"}}
+	l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+		Resolver:      &fakeProviderResolver{provider: "github", found: true},
+		GitHubFetcher: gh,
+		GitHubScope:   githubScopeFixed("42"),
+	})
+	conv, err := l.Load(context.Background(), "kuhlman-labs/fishhawk")
+	if err != nil {
+		t.Fatalf("Load err = %v, want nil (the repo's own declaration must pass destination authorization)", err)
+	}
+	want := workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}
+	if conv.Project == nil || *conv.Project != want {
+		t.Errorf("Project = %+v, want %+v", conv.Project, want)
 	}
 }

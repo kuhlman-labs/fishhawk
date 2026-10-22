@@ -2038,12 +2038,25 @@ func TestFileWorkItem_RunBoundToken_FilesWithoutWriteRuns(t *testing.T) {
 // EpicChildren time, not a re-implementation. createdBody captures the body
 // the provider handed CreateIssue (where the depends_on marker is stamped);
 // subIssues is what ListSubIssues returns for the EpicChildren readback.
+//
+// It also RECORDS every board-touching call (ADR-110 guard (i), #4606):
+// projectFieldsCalls / addItemCalls / setSelectCalls count them and
+// projectCoords keeps every ProjectCoord passed to ProjectFields. The canned
+// success answers alone record nothing, so without these a "no board was
+// attempted" assertion would pass vacuously.
 type fakeGithubAPI struct {
 	createdBody string
 	subIssues   []githubclient.SubIssue
+
+	createCalls        int
+	projectFieldsCalls int
+	addItemCalls       int
+	setSelectCalls     int
+	projectCoords      []githubclient.ProjectCoord
 }
 
 func (f *fakeGithubAPI) CreateIssue(_ context.Context, _ forge.CredentialScope, _ githubclient.RepoRef, p githubclient.CreateIssueParams) (*githubclient.CreatedIssue, error) {
+	f.createCalls++
 	f.createdBody = p.Body
 	return &githubclient.CreatedIssue{Number: 4242, NodeID: "CHILD_NODE", HTMLURL: "https://github.com/kuhlman-labs/fishhawk/issues/4242"}, nil
 }
@@ -2052,7 +2065,9 @@ func (f *fakeGithubAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, 
 	return "EPIC_NODE", nil
 }
 
-func (f *fakeGithubAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, _ githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+func (f *fakeGithubAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, coord githubclient.ProjectCoord, _ string) (*githubclient.ProjectMeta, error) {
+	f.projectFieldsCalls++
+	f.projectCoords = append(f.projectCoords, coord)
 	return &githubclient.ProjectMeta{ProjectID: "PROJ", FieldID: "FIELD", StatusOptions: map[string]string{"Backlog": "OPT"}}, nil
 }
 
@@ -2061,10 +2076,12 @@ func (f *fakeGithubAPI) ProjectItemStatus(_ context.Context, _ forge.CredentialS
 }
 
 func (f *fakeGithubAPI) AddProjectItem(_ context.Context, _ forge.CredentialScope, _, _ string) (string, error) {
+	f.addItemCalls++
 	return "ITEM", nil
 }
 
 func (f *fakeGithubAPI) SetProjectItemSingleSelect(_ context.Context, _ forge.CredentialScope, _, _, _, _ string) error {
+	f.setSelectCalls++
 	return nil
 }
 
@@ -2180,6 +2197,152 @@ func TestFileWorkItem_DependsOn_EndToEnd(t *testing.T) {
 		if e != wantEdges[i] {
 			t.Fatalf("edge[%d] = %+v, want %+v", i, e, wantEdges[i])
 		}
+	}
+}
+
+// testProjectlessCommittedConventionsYAML is a repo-committed
+// .fishhawk/work-management.yaml that declares github_projects with NO project
+// block (ADR-110): valid, and meaning "file into the repo's own issues, no
+// board".
+const testProjectlessCommittedConventionsYAML = `
+spec_version: work-management-v0
+provider: github_projects
+required_fields: [Summary, Done-means, complexity]
+types:
+  feature:
+    title_format: "[E{epic}.{n}] {summary}"
+    body_skeleton: [Summary, Done-means]
+    default_labels: [type:feature]
+    default_fields: {status: Backlog, complexity: medium}
+`
+
+// TestFileWorkItem_UnconfiguredRepoNeverTargetsAnyBoard is the cross-layer
+// ADR-110 guard (i) test (#4606). A feature filing for a NON-Fishhawk
+// repository (acme/widgets) goes through the REAL RepoConventionsLoader (so
+// the fetch-fallback to the shipped default and the destination
+// authorization are the production ones), the HTTP handler, the REAL
+// workmgmt/github provider and a RECORDING API, and must come back 201 with
+// boarded=false and the NAMED boarding_error no_project_configured, having
+// made ZERO board calls and never carried a ProjectCoord — so an unconfigured
+// repository can never land on this repository's Project #7 (or any board).
+//
+// The recorder is what makes "zero" mean something: the fake answers
+// ProjectFields/AddProjectItem/SetProjectItemSingleSelect successfully, so a
+// default that still carried a project WOULD reach them and be counted. The
+// third arm proves that, by declaring a project and asserting the same
+// recorder sees one call each and the declared coordinate.
+func TestFileWorkItem_UnconfiguredRepoNeverTargetsAnyBoard(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		// fetcher is what the loader's forge fetch answers for acme/widgets.
+		fetcher *fakeFileFetcher
+		// wantBoarded / wantBoardingError / wantBoardCalls describe the
+		// expected outcome; wantCoord is the one coordinate a board call
+		// carries (nil when no board call is expected).
+		wantBoarded       bool
+		wantBoardingError string
+		wantBoardCalls    int
+		wantCoord         *githubclient.ProjectCoord
+	}{
+		{
+			name:              "no committed file falls back to the shipped default",
+			fetcher:           &fakeFileFetcher{err: forge.ErrNotFound},
+			wantBoardingError: workmgmt.BoardingErrorNoProjectConfigured,
+		},
+		{
+			name: "committed github_projects file with no project block",
+			fetcher: &fakeFileFetcher{fc: &forge.FileContent{
+				Path: conventionsFilePath, Content: []byte(testProjectlessCommittedConventionsYAML), SHA: "projectless",
+			}},
+			wantBoardingError: workmgmt.BoardingErrorNoProjectConfigured,
+		},
+		{
+			// Control: the recorder DOES see a board call when a project is
+			// declared, so the zero-call arms above are not vacuous.
+			name: "control: committed file declaring a project is boarded",
+			fetcher: &fakeFileFetcher{fc: &forge.FileContent{
+				Path: conventionsFilePath, SHA: "declared",
+				Content: []byte(strings.Replace(testProjectlessCommittedConventionsYAML,
+					"provider: github_projects\n",
+					"provider: github_projects\nproject: {owner: acme, owner_type: organization, number: 3}\n", 1)),
+			}},
+			wantBoarded:    true,
+			wantBoardCalls: 1,
+			wantCoord:      &githubclient.ProjectCoord{Owner: "acme", Number: 3},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loader := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+				Resolver:      mapProviderResolver{"acme/widgets": "github"},
+				GitHubFetcher: tc.fetcher,
+				GitHubScope:   githubScopeFixed("42"),
+			})
+			prevLoader := conventionsLoader
+			conventionsLoader = loader.Load
+			t.Cleanup(func() { conventionsLoader = prevLoader })
+
+			api := &fakeGithubAPI{}
+			prevProvider, prevErr := workmgmt.Get(workmgmt.Default().Provider)
+			workmgmt.Register(workmgmtgithub.New(api))
+			t.Cleanup(func() {
+				if prevErr == nil {
+					workmgmt.Register(prevProvider)
+					return
+				}
+				registerFakeProvider(t, &fakeWorkProvider{})
+			})
+
+			au := newAuditFake()
+			rr := newPromptRunRepo()
+			runID := uuid.New()
+			inst := int64(99)
+			rr.getRuns[runID] = &run.Run{
+				ID:             runID,
+				Repo:           "acme/widgets",
+				State:          run.StateRunning,
+				InstallationID: &inst,
+			}
+			s := New(Config{AuditRepo: au, RunRepo: rr})
+
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:      "acme/widgets",
+				Type:      "feature",
+				Summary:   "file onto an unconfigured repository",
+				TitleVars: map[string]string{"epic": "1", "n": "1"},
+				// The shipped default makes feature's epic link required.
+				Relations: &workItemRelations{ParentEpic: "#1"},
+				RunID:     runID.String(),
+			}, "mcp:run:"+runID.String())
+			if rec.Code != http.StatusCreated {
+				t.Fatalf("status = %d, want 201 (body=%s)", rec.Code, rec.Body.String())
+			}
+			resp := decodeWorkItem(t, rec)
+
+			if tc.fetcher.calls != 1 {
+				t.Errorf("loader fetch calls = %d, want 1: the real loader must have been exercised", tc.fetcher.calls)
+			}
+			if api.createCalls != 1 {
+				t.Fatalf("CreateIssue calls = %d, want 1: the filing must reach the real provider", api.createCalls)
+			}
+			if resp.Boarded != tc.wantBoarded || resp.BoardingError != tc.wantBoardingError {
+				t.Errorf("boarded=%v boarding_error=%q, want boarded=%v boarding_error=%q", resp.Boarded, resp.BoardingError, tc.wantBoarded, tc.wantBoardingError)
+			}
+			if api.projectFieldsCalls != tc.wantBoardCalls || api.addItemCalls != tc.wantBoardCalls || api.setSelectCalls != tc.wantBoardCalls {
+				t.Errorf("board calls ProjectFields=%d AddProjectItem=%d SetProjectItemSingleSelect=%d, want %d each",
+					api.projectFieldsCalls, api.addItemCalls, api.setSelectCalls, tc.wantBoardCalls)
+			}
+			for _, c := range api.projectCoords {
+				if c.Owner == "kuhlman-labs" || c.Number == 7 {
+					t.Errorf("ProjectCoord %+v reached the API for a non-Fishhawk repository", c)
+				}
+			}
+			switch {
+			case tc.wantCoord == nil && len(api.projectCoords) != 0:
+				t.Errorf("project coordinates = %+v, want none", api.projectCoords)
+			case tc.wantCoord != nil && (len(api.projectCoords) != 1 || api.projectCoords[0].Owner != tc.wantCoord.Owner || api.projectCoords[0].Number != tc.wantCoord.Number):
+				t.Errorf("project coordinates = %+v, want exactly [%+v]", api.projectCoords, *tc.wantCoord)
+			}
+		})
 	}
 }
 

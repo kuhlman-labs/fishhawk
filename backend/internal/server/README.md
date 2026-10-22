@@ -1360,9 +1360,11 @@ it is rejected at parse time, naming the root entry to use, rather than sitting 
 
 **The administrator-controlled fallbacks are deliberately NOT validated.** The
 `FISHHAWKD_WORKMGMT_CONVENTIONS` override and `workmgmt.Default()` are the trusted deployment
-inputs whose displacement by untrusted repo input is the entire concern; validating `Default()`
-would also break every deployment whose shipped default names a project outside the filing repo's
-owner.
+inputs whose displacement by untrusted repo input is the entire concern. The unvalidated
+rationale holds for the **override**: validating it would break every deployment whose break-glass
+file names a project outside the filing repo's owner. It no longer holds for `Default()`, which
+declares no project (ADR-110 guard (i), #4606) and so binds to the filing repo's own owner; it
+stays unvalidated because it is trusted product input, not because validating it would refuse it.
 
 **Residual limitation**: the binding is enforced only when the discriminator resolves an account.
 Until E44 populates repo→account rows, a repo with no account row still falls through to the

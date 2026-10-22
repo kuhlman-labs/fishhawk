@@ -1,16 +1,16 @@
 # Shipped default work-management conventions (#1005). This is a product
 # artifact, versioned with the product: the canonical copy lives at
 # docs/spec/work-management-default.yaml and is mirrored into
-# backend/internal/workmgmt/defaults/ by scripts/sync-schemas. Seed
-# content extracted from the kuhlman-labs/fishhawk Project #7 conventions
-# (AGENTS.md "Project tracker (#7)").
+# backend/internal/workmgmt/defaults/ by scripts/sync-schemas.
+#
+# The default deliberately declares NO project connection (ADR-110): it
+# carries no repository identity, so a repository without its own
+# .fishhawk/work-management.yaml can never resolve to somebody else's
+# board. Filing under it creates the issue in the repo's own issues and
+# degrades to boarded:false with boarding_error `no_project_configured`.
+# A repo declares its board in its own .fishhawk/work-management.yaml.
 spec_version: work-management-v0
 provider: github_projects
-
-project:
-  owner: kuhlman-labs
-  owner_type: user
-  number: 7
 
 # The complexity prior: pick a level by what the change touches, not by
 # how it feels. These are the concrete file/coupling definitions.
@@ -31,7 +31,7 @@ required_fields:
   - Done-means
   - complexity
 
-# Canonical board states -> the Project #7 single-select Status options
+# Canonical board states -> the provider's single-select Status options
 # (#1012). The closed canonical set keeps a future Jira provider tractable.
 # up_next (#1816) is the committed/not-started entry column a campaign start
 # sweeps its still-queued items onto.

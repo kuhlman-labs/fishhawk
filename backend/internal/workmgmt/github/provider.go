@@ -241,9 +241,11 @@ func (p *Provider) File(ctx context.Context, req workmgmt.ProviderRequest) (*wor
 	// Board placement is best-effort (#1107): the issue is the durable
 	// result, so a placement failure records the cause and leaves Boarded
 	// false rather than discarding the created issue. No project configured
-	// means nothing to board — leave Boarded false with no error.
+	// means nothing to board — Boarded stays false and the NAMED reason is
+	// recorded (ADR-110); no board API call is made.
 	if req.Target.Project == nil {
 		created.Boarded = false
+		created.BoardingError = workmgmt.BoardingErrorNoProjectConfigured
 	} else if err := p.placeOnBoard(ctx, scope, req, issue); err != nil {
 		created.BoardingError = err.Error()
 	} else {

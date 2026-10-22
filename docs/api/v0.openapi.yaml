@@ -1488,8 +1488,10 @@ components:
             Whether the created item was placed on the configured project board with its
             status set (#1107). Best-effort: board placement no longer fails the filing — when
             it fails, the item is still created and this is `false` with the cause in
-            `boarding_error` (also WARN-logged server-side). `false` with no `boarding_error`
-            means no project board was configured (nothing to board).
+            `boarding_error` (also WARN-logged server-side). `false` with `boarding_error`
+            `no_project_configured` means the resolved conventions declare no project board, so
+            none was attempted (ADR-110): the shipped default declares none, and a repository
+            without its own `.fishhawk/work-management.yaml` resolves to it.
         epic_linked:
           type: boolean
           description: >-
@@ -1499,7 +1501,10 @@ components:
             requested.
         boarding_error:
           type: string
-          description: The cause when best-effort board placement failed (#1107); absent on success.
+          description: >-
+            The cause when best-effort board placement failed (#1107), or `no_project_configured`
+            when the resolved conventions declare no project board and none was attempted
+            (ADR-110); absent on success.
         epic_link_error:
           type: string
           description: The cause when best-effort epic linking failed (#1107); absent on success.

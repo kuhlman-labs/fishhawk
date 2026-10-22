@@ -526,3 +526,18 @@ func TestProviderRequest_NotifyCreated(t *testing.T) {
 	// A nil hook must not panic.
 	ProviderRequest{}.NotifyCreated(context.Background(), &CreatedItem{Number: 1})
 }
+
+// TestBoardingErrorNoProjectConfiguredMatchesReaderReason pins the lockstep
+// between the filing path's named degrade and the board-read path's typed
+// reason (ADR-110): a filing-path boarding_error and a ReasonNoProjectConfigured
+// unavailable error name the same "no board is declared" state, so an operator
+// reads one string for both.
+func TestBoardingErrorNoProjectConfiguredMatchesReaderReason(t *testing.T) {
+	if BoardingErrorNoProjectConfigured != string(ReasonNoProjectConfigured) {
+		t.Errorf("BoardingErrorNoProjectConfigured = %q, want %q (== ReasonNoProjectConfigured)",
+			BoardingErrorNoProjectConfigured, string(ReasonNoProjectConfigured))
+	}
+	if BoardingErrorNoProjectConfigured != "no_project_configured" {
+		t.Errorf("BoardingErrorNoProjectConfigured = %q, want the documented wire value no_project_configured", BoardingErrorNoProjectConfigured)
+	}
+}
