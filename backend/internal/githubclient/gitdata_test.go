@@ -169,6 +169,30 @@ func TestGetCommit_HappyPath(t *testing.T) {
 	}
 }
 
+// TestGetCommit_ParentsInOrder pins the ADR-112 R1(a)(ii) decode: parents
+// arrive in the commit object's order (a merge commit's first parent is the
+// branch merged into), and a root commit decodes to an empty, non-nil list.
+func TestGetCommit_ParentsInOrder(t *testing.T) {
+	c, cap := gitDataClient(t)
+	cap.getCommitBody = `{"sha":"m1","tree":{"sha":"t1"},"parents":[{"sha":"prior","url":"u1"},{"sha":"basetip","url":"u2"}]}`
+	got, err := c.GetCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "m1")
+	if err != nil {
+		t.Fatalf("GetCommit: %v", err)
+	}
+	if len(got.Parents) != 2 || got.Parents[0] != "prior" || got.Parents[1] != "basetip" {
+		t.Errorf("Parents = %v, want [prior basetip]", got.Parents)
+	}
+
+	cap.getCommitBody = `{"sha":"root","tree":{"sha":"t0"},"parents":[]}`
+	got, err = c.GetCommit(context.Background(), forge.FromGitHubInstallationID(42), RepoRef{Owner: "x", Name: "y"}, "root")
+	if err != nil {
+		t.Fatalf("GetCommit root: %v", err)
+	}
+	if got.Parents == nil || len(got.Parents) != 0 {
+		t.Errorf("root Parents = %#v, want empty non-nil", got.Parents)
+	}
+}
+
 func TestGetCommit_MissingTreeSHA(t *testing.T) {
 	c, cap := gitDataClient(t)
 	cap.getCommitBody = `{"sha":"commit123"}`

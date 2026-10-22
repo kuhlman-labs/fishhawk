@@ -399,7 +399,7 @@ func (s *Server) handleRebaseRunBranch(w http.ResponseWriter, r *http.Request) {
 	// branch_rebased row the state predicate classifies on is already on the
 	// chain and the review gate is already re-parked.
 	mc := s.rebaseMergeCandidateVerify(r, runRow, out.Branch, out.BaseRef, out.PriorHeadSHA, out.NewHeadSHA, out.MergeCommitSHA, out.MergePerformed,
-		rebaseRerunRequest{Requested: reqBody.RerunFailedVerify, Reason: reqBody.Reason})
+		out.CleanVerified, rebaseRerunRequest{Requested: reqBody.RerunFailedVerify, Reason: reqBody.Reason})
 
 	s.writeJSON(w, r, http.StatusOK, rebaseBranchResponse{
 		RunID:                      runID.String(),
@@ -532,7 +532,17 @@ type rebaseAdvanceOutcome struct {
 	// no merge was attempted.
 	AlreadyUpToDate bool
 	// MergePerformed: THIS call merged the base into the run branch.
-	MergePerformed             bool
+	MergePerformed bool
+	// BaseTipSHA is the base ref's tip read immediately before MergeBranch
+	// (ADR-112 R1(a)(ii)); "" when no merge was attempted or the read failed.
+	BaseTipSHA string
+	// CleanVerified: the merge commit's parents were read back and are
+	// EXACTLY [PriorHeadSHA, BaseTipSHA] (ADR-112 R1(a)(ii)). False on every
+	// unverifiable case (no merge, a failed or absent base-tip read, a failed
+	// commit read, an empty merge sha, any other parent list). It never
+	// refuses the advance; only the carrying of approvals and ADR-096 verdicts
+	// depends on it.
+	CleanVerified              bool
 	ReparkedReviewStageID      string
 	AuditCheckRepublished      bool
 	AuditCheckRepublishWarning string
@@ -632,6 +642,12 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 				"lease re-check: the live PR head changed since the behind-probe (concurrent push); rebase aborted")
 		}
 
+		// BASE TIP (ADR-112 R1(a)(ii)), read immediately before the merge so
+		// the merge commit's second parent can be verified against it. A
+		// failed or absent read leaves it "" and the advance UNVERIFIED
+		// (clean_verified false); it never refuses the advance.
+		out.BaseTipSHA = s.readRebaseBaseTip(ctx, scope, repo, runID, baseRef)
+
 		// DIRECTION: the merges API's `base` is the branch that RECEIVES the
 		// merge and `head` is the branch merged in. So base is the RUN BRANCH
 		// and head is the BASE REF. An inversion here would merge the run
@@ -713,6 +729,11 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 		tailCtx, cancelTail := context.WithDeadline(context.WithoutCancel(ctx), out.TailDeadline)
 		defer cancelTail()
 		ctx = tailCtx
+
+		// ADVANCE INTEGRITY (ADR-112 R1(a)(ii)), SYNCHRONOUS on the detached
+		// tail and BEFORE the branch_rebased row, which records the result.
+		out.CleanVerified = s.verifyRebaseMergeParents(ctx, scope, repo, runID,
+			out.MergeCommitSHA, headSHA, out.BaseTipSHA)
 	}
 
 	// --- SHARED TAIL: re-park → audit → attribute → republish → notify ---
@@ -731,7 +752,8 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 	// The branch_rebased entry is appended BEFORE the recompute so the
 	// recompute observes it.
 	s.writeBranchRebasedAudit(ctx, actor, runID, prNumber, branch, baseRef,
-		headSHA, out.NewHeadSHA, out.MergeCommitSHA, out.AlreadyUpToDate, reason, out.ReparkedReviewStageID, postMerge)
+		headSHA, out.NewHeadSHA, out.MergeCommitSHA, out.AlreadyUpToDate, reason, out.ReparkedReviewStageID, postMerge,
+		out.BaseTipSHA, out.CleanVerified)
 
 	// LINEAGE ATTRIBUTION (E64.23 / #3125). The merge commit this verb
 	// creates is authored by the App installation but appears in NO
@@ -774,6 +796,56 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 	return out, nil
 }
 
+// readRebaseBaseTip reads baseRef's tip for the ADR-112 R1(a)(ii) parent
+// check. Any failure (an error, or an absent branch) answers "" and is
+// logged: the advance proceeds UNVERIFIED rather than being refused.
+func (s *Server) readRebaseBaseTip(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef,
+	runID uuid.UUID, baseRef string) string {
+	tip, found, err := s.cfg.GitHub.GetBranchSHA(ctx, scope, repo, baseRef)
+	if err != nil || !found || tip == "" {
+		reason := "base ref not found"
+		if err != nil {
+			reason = err.Error()
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch rebase: base-tip read failed; the advance will be recorded clean_verified=false",
+			slog.String("run_id", runID.String()),
+			slog.String("base_ref", baseRef),
+			slog.String("reason", reason))
+		return ""
+	}
+	return tip
+}
+
+// verifyRebaseMergeParents is the ADR-112 R1(a)(ii) parent check: the merge
+// commit this advance created must have EXACTLY the parents [priorHead,
+// baseTip] — the run branch's pre-merge head first (the merges API's `base`
+// receives the merge) and the base tip read immediately before the merge
+// second. It fails CLOSED: an empty merge sha, an empty base tip, a failed
+// commit read or any other parent list answers false. It never refuses the
+// advance.
+func (s *Server) verifyRebaseMergeParents(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef,
+	runID uuid.UUID, mergeCommit, priorHead, baseTip string) bool {
+	if mergeCommit == "" || priorHead == "" || baseTip == "" {
+		return false
+	}
+	commit, err := s.cfg.GitHub.GetCommit(ctx, scope, repo, mergeCommit)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"branch rebase: merge-commit read failed; the advance is recorded clean_verified=false",
+			slog.String("run_id", runID.String()),
+			slog.String("merge_commit_sha", mergeCommit),
+			slog.String("error", err.Error()))
+		return false
+	}
+	return mergeParentsAre(commit.Parents, priorHead, baseTip)
+}
+
+// mergeParentsAre reports whether parents is exactly [first, second].
+func mergeParentsAre(parents []string, first, second string) bool {
+	return len(parents) == 2 && parents[0] == first && parents[1] == second
+}
+
 // rebaseMergeCandidateVerify is the rebase verb's merge-candidate producer.
 //
 //   - A PERFORMED merge triggers a pass for the resolved new head (cause
@@ -784,7 +856,9 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 //     (E87.2 / #4293) the decision runs first: a transferred verdict answers
 //     passed and starts NO pass; a refusal is recorded and the pass runs. A
 //     new head that is not the decoded merge commit (a concurrent push) is
-//     never a clean advance: it is refused as not_clean_advance. In
+//     never a clean advance, nor is a merge commit whose parents were not
+//     verified as [prior head, base tip] (ADR-112 R1(a)(ii)): both are
+//     refused as not_clean_advance. In
 //     SHADOW mode the pass runs as above and the would-be decision is
 //     classified asynchronously after it.
 //   - An ALREADY-UP-TO-DATE invocation reads mergeCandidateVerifyState for
@@ -801,7 +875,7 @@ func (s *Server) advanceRunBranch(ctx context.Context, runRow *run.Run,
 // The actor is the OPERATOR who invoked the verb. Nothing here fails the
 // rebase: a refusal is carried on the 200.
 func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
-	branch, baseRef, priorHead, newHead, mergeCommit string, mergePerformed bool,
+	branch, baseRef, priorHead, newHead, mergeCommit string, mergePerformed, cleanVerified bool,
 	rerun rebaseRerunRequest) (out rebaseMergeCandidateFields) {
 	ctx := r.Context()
 	// rerunAttempted: the head was failed and the re-run arm decided (voided,
@@ -822,10 +896,13 @@ func (s *Server) rebaseMergeCandidateVerify(r *http.Request, runRow *run.Run,
 		// ADR-096 verdict transfer (E87.2 / #4293). ONLY a performed merge
 		// with a resolved new head reaches here; the already-up-to-date arm
 		// below never classifies. The advance is CLEAN only when the new head
-		// IS the merge commit this call created: a post-merge re-read that
-		// observed a concurrent push (newHead != mergeCommit) is refused as
-		// not_clean_advance and the pass runs for that head.
-		clean := mergeCommit != "" && newHead == mergeCommit
+		// IS the merge commit this call created AND that merge commit's
+		// parents were verified as exactly [prior head, base tip] (ADR-112
+		// R1(a)(ii), cleanVerified): a post-merge re-read that observed a
+		// concurrent push (newHead != mergeCommit), or a merge commit whose
+		// parents could not be verified, is refused as not_clean_advance and
+		// the pass runs for that head.
+		clean := mergeCommit != "" && newHead == mergeCommit && cleanVerified
 		req := mergeCandidateTransferRequest{Run: runRow, PriorHead: priorHead, NewHead: newHead,
 			MergePerformed: clean, Cause: mergeCandidateCauseBaseAdvance}
 		if s.mergeCandidateTransferMode() == MergeCandidateTransferEnforce {
@@ -1085,14 +1162,16 @@ func (s *Server) writeRebaseNotDeterminable(w http.ResponseWriter, r *http.Reque
 // (which may legitimately be empty), whether the branch already contained the
 // base, the reason, and the mechanism note — so the advance is auditable. On
 // a performed merge (postMerge non-nil) it also records the post-merge read
-// classification, the last observed head and the read count (#4199). The
+// classification, the last observed head and the read count (#4199). It
+// always records base_tip_sha and clean_verified (ADR-112 R1(a)(ii)). The
 // entry is attributed to actor: the invoking operator on the verb, the system
 // actor on a merge-candidate queue auto-advance — never an unattributed
 // action. Best-effort like branch_reset: the write already happened, so an
 // append failure WARNs rather than unwinding the advance.
 func (s *Server) writeBranchRebasedAudit(ctx context.Context, actor mergeCandidateActor, runID uuid.UUID, prNumber int,
 	branch, baseRef, priorHeadSHA, newHeadSHA, mergeCommitSHA string,
-	alreadyUpToDate bool, reason, reparkedReviewStageID string, postMerge *postMergeHeadRead) {
+	alreadyUpToDate bool, reason, reparkedReviewStageID string, postMerge *postMergeHeadRead,
+	baseTipSHA string, cleanVerified bool) {
 	actorKind, subject := actor.Kind, actor.Subject
 
 	fields := map[string]any{
@@ -1106,6 +1185,11 @@ func (s *Server) writeBranchRebasedAudit(ctx context.Context, actor mergeCandida
 		"already_up_to_date": alreadyUpToDate,
 		"reason":             reason,
 		"mechanism_note":     rebaseMechanismNote,
+		// ADR-112 R1(a)(ii): ALWAYS written. clean_verified is false on the
+		// already-up-to-date arm and on every unverifiable advance; a legacy
+		// row WITHOUT the key is never clean (isCleanAdvance).
+		"base_tip_sha":   baseTipSHA,
+		"clean_verified": cleanVerified,
 	}
 	if reparkedReviewStageID != "" {
 		fields["reparked_review_stage_id"] = reparkedReviewStageID

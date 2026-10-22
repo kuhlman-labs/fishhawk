@@ -2294,7 +2294,13 @@ Notes:
   `system:merge-candidate-verify` when the ADR-092 merge-candidate queue
   auto-advances an admitted PR. The payload is `{run_id, pr_number, branch,
   base_ref, prior_head_sha, new_head_sha, merge_commit_sha, already_up_to_date,
-  reason, mechanism_note}` (plus `reparked_review_stage_id` when a review stage
+  reason, mechanism_note, base_tip_sha, clean_verified}` — the last two ALWAYS
+  written (ADR-112 R1(a)(ii), #4619): `base_tip_sha` is the base ref's tip read
+  immediately before the merge (`""` when no merge was attempted or the read
+  failed) and `clean_verified` is true only when the merge commit's parents
+  were read back as exactly `[prior_head_sha, base_tip_sha]` (false on the
+  already-up-to-date arm and on every unverifiable advance; a legacy row
+  without the key is never a clean advance) (plus `reparked_review_stage_id` when a review stage
   was re-parked, and `post_merge_head_read`, `post_merge_observed_head_sha`,
   `post_merge_read_attempts` when the call performed the merge). Sibling of
   `branch_reset` above, and like it the advance DOES refresh the sticky status
