@@ -36,10 +36,12 @@ CLI's runtime check:
 - `TestWorkManagementTemplateParsesWithBackendSemantics` runs `workmgmt.Parse`
   (schema AND semantics: the mandatory trio, the provider connection, adr
   numbering, transitions->states) over every complete provider branch.
-- `TestWorkManagementIncompleteBranchesFailOnlyOnTheConnection` requires every
-  incomplete `github_projects` rendering to fail ONLY on the connection
-  `*SemanticError`, and the same options with the connection filled to parse
-  clean — so an incomplete config cannot hide another semantic defect.
+- `TestWorkManagementIncompleteBranchesParseWithoutProject` requires every
+  incomplete `github_projects` rendering to parse clean with `Project == nil`
+  (ADR-110: a missing project block declares no board; filing degrades to
+  `boarded:false` / `no_project_configured`), and the same options with the
+  connection filled to parse clean WITH the project — so an incomplete config
+  cannot hide another semantic defect.
 - `TestBackendSemanticProofDiscriminates` proves the vehicle is not vacuous:
   a schema-valid template missing the adr numbering rule is rejected.
 - `TestOperatorTemplatePassesThinnessRule` runs `operatorrole.ValidateOverlay`

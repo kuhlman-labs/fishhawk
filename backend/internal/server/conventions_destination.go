@@ -88,7 +88,9 @@ func destinationAllowKey(accountKey, provider, destKey string) string {
 // conventions file selects as its filing destination, for the filing repo
 // ("owner/name"):
 //
-//   - github_projects -> the Projects owner login;
+//   - github_projects -> the Projects owner login, or the filing repo's own
+//     owner when the config declares no project (ADR-110: the provider then
+//     files into the repo's own issues and attempts no board);
 //   - gitlab          -> the namespace root of the configured project path,
 //     or the filing repo's own owner when the block omits project (the
 //     provider then files into the repo's own path);
@@ -96,15 +98,16 @@ func destinationAllowKey(accountKey, provider, destKey string) string {
 //     bind to; authorization refuses it unless allow-listed).
 //
 // A provider outside that set — including the empty string — is an error, so
-// the policy fails closed on anything it has no binding rule for. A declared
-// provider with a nil connection block is likewise an error rather than an
-// implicit pass; workmgmt.Parse's semantic checks already reject it, and this
-// is the defensive second line.
+// the policy fails closed on anything it has no binding rule for. A jira or
+// gitlab provider with a nil connection block is likewise an error rather than
+// an implicit pass; workmgmt.Parse's semantic checks already reject it, and
+// this is the defensive second line.
 func conventionsDestination(conv workmgmt.Conventions, repo string) (string, string, error) {
 	switch conv.Provider {
 	case "github_projects":
 		if conv.Project == nil {
-			return "", "", fmt.Errorf("provider github_projects with no project connection block")
+			owner, _, _ := strings.Cut(repo, "/")
+			return "github_projects", owner, nil
 		}
 		return "github_projects", conv.Project.Owner, nil
 	case "gitlab":

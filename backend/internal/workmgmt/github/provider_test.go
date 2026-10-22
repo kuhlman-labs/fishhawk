@@ -51,6 +51,11 @@ type fakeAPI struct {
 	fieldsName  string
 	fieldsErr   error
 	meta        *githubclient.ProjectMeta
+	// fieldsCalls / addItemCalls count every board-touching call, so a test
+	// asserting "no board was attempted" cannot pass on a call that happened
+	// to record an empty argument.
+	fieldsCalls  int
+	addItemCalls int
 
 	itemStatus          *githubclient.ProjectItemStatus
 	itemStatusErr       error
@@ -287,6 +292,7 @@ func (f *fakeAPI) IssueNodeID(_ context.Context, _ forge.CredentialScope, _ gith
 
 func (f *fakeAPI) ProjectFields(_ context.Context, _ forge.CredentialScope, coord githubclient.ProjectCoord, fieldName string) (*githubclient.ProjectMeta, error) {
 	f.fieldsCoord, f.fieldsName = coord, fieldName
+	f.fieldsCalls++
 	if f.fieldsErr != nil {
 		return nil, f.fieldsErr
 	}
@@ -303,6 +309,7 @@ func (f *fakeAPI) ProjectItemStatus(_ context.Context, _ forge.CredentialScope, 
 
 func (f *fakeAPI) AddProjectItem(ctx context.Context, _ forge.CredentialScope, projectID, contentID string) (string, error) {
 	f.addItemContent = contentID
+	f.addItemCalls++
 	f.addProjectItemProjectsToken = githubclient.ProjectsTokenRequested(ctx)
 	_ = projectID
 	if f.addItemErr != nil {
@@ -496,12 +503,46 @@ func TestProvider_File_NoProjectSkipsBoard(t *testing.T) {
 	if created.Number != 5 {
 		t.Errorf("created = %+v", created)
 	}
-	if api.fieldsName != "" {
-		t.Errorf("project fields should not be queried when no project configured")
+	if api.fieldsName != "" || api.fieldsCalls != 0 {
+		t.Errorf("project fields should not be queried when no project configured (calls=%d)", api.fieldsCalls)
 	}
-	// No project configured: nothing to board, and no boarding error.
-	if created.Boarded || created.BoardingError != "" {
-		t.Errorf("boarded=%v boarding_error=%q, want false with no error", created.Boarded, created.BoardingError)
+	if api.addItemCalls != 0 {
+		t.Errorf("AddProjectItem called %d times with no project configured, want 0", api.addItemCalls)
+	}
+	// No project configured: nothing to board, and the NAMED reason is
+	// recorded (ADR-110), so the wire response says why the card is absent.
+	if created.Boarded || created.BoardingError != workmgmt.BoardingErrorNoProjectConfigured {
+		t.Errorf("boarded=%v boarding_error=%q, want false with %q", created.Boarded, created.BoardingError, workmgmt.BoardingErrorNoProjectConfigured)
+	}
+}
+
+// TestProvider_File_DefaultConventionsTargetNoBoard re-pins, at the provider
+// seam, that workmgmt.Default().Project is nil (workmgmt's
+// TestDefaultDeclaresNoRepositoryIdentity owns the artifact guard): a Target
+// built from the shipped default makes no board call and names the reason. It
+// claims nothing beyond that.
+func TestProvider_File_DefaultConventionsTargetNoBoard(t *testing.T) {
+	api := &fakeAPI{
+		created: &githubclient.CreatedIssue{Number: 8, NodeID: "N", HTMLURL: "u"},
+		meta:    &githubclient.ProjectMeta{ProjectID: "P", FieldID: "F", StatusOptions: map[string]string{"Backlog": "OPT"}},
+		itemID:  "ITEM",
+	}
+	req := baseRequest()
+	req.Target.Project = workmgmt.Default().Project
+	req.Item.Relations = workmgmt.Relations{}
+
+	created, err := New(api).File(context.Background(), req)
+	if err != nil {
+		t.Fatalf("File: %v", err)
+	}
+	if api.fieldsCalls != 0 || api.addItemCalls != 0 {
+		t.Errorf("board calls under Default() conventions: ProjectFields=%d AddProjectItem=%d, want 0/0", api.fieldsCalls, api.addItemCalls)
+	}
+	if api.fieldsCoord.Owner == "kuhlman-labs" || api.fieldsCoord.Number == 7 {
+		t.Errorf("a board coordinate %+v reached the API under Default() conventions", api.fieldsCoord)
+	}
+	if created.Boarded || created.BoardingError != workmgmt.BoardingErrorNoProjectConfigured {
+		t.Errorf("boarded=%v boarding_error=%q, want false with %q", created.Boarded, created.BoardingError, workmgmt.BoardingErrorNoProjectConfigured)
 	}
 }
 

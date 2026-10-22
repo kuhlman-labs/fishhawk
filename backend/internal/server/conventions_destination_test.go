@@ -108,6 +108,10 @@ func TestConventionsDestination(t *testing.T) {
 		wantKey      string
 	}{
 		{"github_projects owner", ghDest("acme"), "acme/widgets", "github_projects", "acme"},
+		// ADR-110: a project-less github_projects config files into the repo's
+		// own issues and attempts no board, so its destination is the filing
+		// repo's own owner (mirrors the gitlab absent-project branch).
+		{"github_projects absent project defaults to the filing repo's own owner", workmgmt.Conventions{Provider: "github_projects"}, "acme/widgets", "github_projects", "acme"},
 		{"gitlab explicit project", glDest("group/app"), "group/lib", "gitlab", "group"},
 		{"gitlab nested group takes the namespace root", glDest("group/subgroup/project"), "group/lib", "gitlab", "group"},
 		{"gitlab absent project defaults to the filing repo's own owner", glDest(""), "group/lib", "gitlab", "group"},
@@ -145,6 +149,17 @@ func TestAuthorizeConventionsDestination(t *testing.T) {
 		{
 			name:            "github account, own owner in differing case",
 			accountProvider: "github", repo: "Acme/widgets", conv: ghDest("acme"), wantErr: false,
+		},
+		{
+			name:            "project-less github_projects is authorized for its own account",
+			accountProvider: "github", repo: "acme/widgets", conv: workmgmt.Conventions{Provider: "github_projects"}, wantErr: false,
+		},
+		{
+			// The relaxation must not become a cross-forge hole: a project-less
+			// github_projects config under a gitlab account is still refused by
+			// the family match.
+			name:            "project-less github_projects under a gitlab account is refused",
+			accountProvider: "gitlab", repo: "acme/widgets", conv: workmgmt.Conventions{Provider: "github_projects"}, wantErr: true,
 		},
 		{
 			name:            "gitlab account, project path in another namespace",
@@ -186,12 +201,6 @@ func TestAuthorizeConventionsDestination(t *testing.T) {
 			name:            "empty conventions provider fails closed",
 			accountProvider: "github", repo: "acme/widgets",
 			conv:    workmgmt.Conventions{},
-			wantErr: true,
-		},
-		{
-			name:            "github_projects with a nil connection block fails closed",
-			accountProvider: "github", repo: "acme/widgets",
-			conv:    workmgmt.Conventions{Provider: "github_projects"},
 			wantErr: true,
 		},
 		{

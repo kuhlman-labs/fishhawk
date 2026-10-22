@@ -255,9 +255,11 @@ func renderConnection(opts Options) (string, error) {
 			if opts.ProjectNumber >= 1 {
 				number = fmt.Sprint(opts.ProjectNumber)
 			}
-			return "# REQUIRED — FILL ME IN (" + strings.Join(missing, ", ") + "): provider github_projects\n" +
-				"# needs a project connection block. Grooming and issue filing fail closed\n" +
-				"# until it is uncommented and filled.\n" +
+			return "# FILL ME IN (" + strings.Join(missing, ", ") + "): provider github_projects\n" +
+				"# declares no board until this project connection block is uncommented and\n" +
+				"# filled. Without it, issue filing still creates the issue but degrades to\n" +
+				"# boarded:false (boarding_error no_project_configured), and grooming board\n" +
+				"# moves and board field writes are refused as no_project_configured.\n" +
 				"# project:\n" +
 				"#   owner: " + owner + "\n" +
 				"#   owner_type: " + ownerType + "  # user | organization\n" +

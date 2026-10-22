@@ -755,6 +755,13 @@ func (r ProviderRequest) NotifyCreated(ctx context.Context, item *CreatedItem) {
 	r.OnCreated(ctx, *item)
 }
 
+// BoardingErrorNoProjectConfigured is the CreatedItem.BoardingError a filing
+// carries when the resolved conventions declare no project (ADR-110): the
+// issue was created in the repo's own issues and no board was attempted. It
+// is the same string as the reader's ReasonNoProjectConfigured, so a
+// filing-path degrade and a board-read degrade name the state identically.
+const BoardingErrorNoProjectConfigured = string(ReasonNoProjectConfigured)
+
 // CreatedItem is what a Provider returns on a successful filing: the
 // created item's number + URL and the placement/labels actually applied,
 // so the caller can audit and echo exactly what landed.
@@ -764,10 +771,11 @@ func (r ProviderRequest) NotifyCreated(ctx context.Context, item *CreatedItem) {
 // is returned when it fails); board placement and epic linking are
 // best-effort — a failure leaves Boarded/EpicLinked false and records the
 // cause in BoardingError/EpicLinkError, but the issue is still the durable
-// result so File returns it with a nil error (#1107). Boarded false with
-// an empty BoardingError means there was nothing to board (no project
-// configured); likewise EpicLinked false with an empty EpicLinkError means
-// no parent epic was requested.
+// result so File returns it with a nil error (#1107). Boarded false because
+// no project is configured carries the NAMED BoardingErrorNoProjectConfigured
+// (ADR-110); an empty BoardingError means the provider had no board concept
+// to attempt (gitlab with no state, for example). Likewise EpicLinked false
+// with an empty EpicLinkError means no parent epic was requested.
 type CreatedItem struct {
 	Provider      string   `json:"provider"`
 	Number        int      `json:"number"`

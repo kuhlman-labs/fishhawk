@@ -597,17 +597,34 @@ func TestBoardTransition_RealProviderNotApplicable_SuppressesAudit(t *testing.T)
 		workmgmt.Register(workmgmtgithub.New(api))
 		t.Cleanup(func() { registerTransitionProvider(t, &fakeTransitionProvider{}) })
 	}
-	// The default conventions carry the user-owned Project #7 coordinates; a
-	// nil Project is what the no-project skip needs.
+	// The shipped default declares NO project (ADR-110), so a subtest that
+	// needs a board installs a TEST-LOCAL, non-Fishhawk project through the
+	// conventions loader; the projectless subtest runs on Default() as shipped.
+	withProject := func(t *testing.T) {
+		t.Helper()
+		prev := conventionsLoader
+		conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+			conv := workmgmt.Default()
+			conv.Project = &workmgmt.Project{Owner: "acme", OwnerType: "user", Number: 1}
+			return conv, nil
+		}
+		t.Cleanup(func() { conventionsLoader = prev })
+	}
 	projectlessConventions := func() workmgmt.Conventions {
 		conv := workmgmt.Default()
-		conv.Project = nil
+		if conv.Project != nil {
+			t.Fatalf("workmgmt.Default().Project = %+v, want nil (ADR-110)", *conv.Project)
+		}
 		return conv
 	}
 
 	t.Run("issue not on the board suppresses the audit", func(t *testing.T) {
 		api := &boardSyncGHAPI{onBoard: false}
 		registerRealProvider(t, api)
+		// A project must be declared, or the no-project skip would suppress
+		// the audit for a different reason and this arm would not isolate the
+		// off-board suppression it exists to pin.
+		withProject(t)
 		rn := issueRun("issue:2494")
 		s, _, au := boardSyncServer(t, rn)
 
@@ -644,6 +661,7 @@ func TestBoardTransition_RealProviderNotApplicable_SuppressesAudit(t *testing.T)
 		// reach the audit chain. This is what proves the suppression is keyed
 		// to the typed flag and not to "the provider skipped".
 		registerRealProvider(t, &boardSyncGHAPI{onBoard: true, status: "Blocked"})
+		withProject(t)
 		rn := issueRun("issue:2494")
 		s, _, au := boardSyncServer(t, rn)
 
@@ -664,6 +682,7 @@ func TestBoardTransition_RealProviderNotApplicable_SuppressesAudit(t *testing.T)
 	t.Run("real provider landed move audits", func(t *testing.T) {
 		api := &boardSyncGHAPI{onBoard: true, status: "Backlog"}
 		registerRealProvider(t, api)
+		withProject(t)
 		rn := issueRun("issue:2494")
 		s, _, au := boardSyncServer(t, rn)
 

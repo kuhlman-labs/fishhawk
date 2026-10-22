@@ -37,8 +37,8 @@ const maxWorkItemRequestBytes = 64 * 1024
 const categoryWorkItemFiled = "work_item_filed"
 
 // conventionsLoader resolves the work-management conventions for a repo.
-// The default stub returns the shipped Default() (which seeds the
-// kuhlman-labs/fishhawk Project #7 conventions); serve.go replaces it at
+// The default stub returns the shipped Default() (which declares no project
+// connection, so a filing under it never boards; ADR-110); serve.go replaces it at
 // startup with RepoConventionsLoader.Load (conventions_loader.go, #2022),
 // which fetches `.fishhawk/work-management.yaml` from the filing repo's OWN
 // forge — resolved via the ADR-057/ADR-058 provider discriminator, with the
@@ -117,7 +117,9 @@ type workItemResponse struct {
 	// the cause in boarding_error / epic_link_error (also WARN-logged
 	// server-side) rather than a 502 that orphans the issue. Boarded is
 	// always set (required); boarding_error / epic_link_error are present
-	// only when the respective step failed.
+	// only when the respective step failed or, for boarding_error, when the
+	// resolved conventions declare no project (no_project_configured, the
+	// unconfigured-repo reason; ADR-110).
 	Boarded       bool   `json:"boarded"`
 	EpicLinked    bool   `json:"epic_linked"`
 	BoardingError string `json:"boarding_error,omitempty"`

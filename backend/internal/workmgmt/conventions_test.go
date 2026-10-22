@@ -2,12 +2,14 @@ package workmgmt
 
 import (
 	"errors"
+	"fmt"
 	"go/ast"
 	"go/parser"
 	"go/token"
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strconv"
 	"strings"
 	"testing"
@@ -30,11 +32,11 @@ func TestDefaultRoundTrip(t *testing.T) {
 	if d.Provider != "github_projects" {
 		t.Errorf("Provider = %q, want %q", d.Provider, "github_projects")
 	}
-	if d.Project == nil {
-		t.Fatal("Project is nil; github_projects requires a connection block")
-	}
-	if d.Project.Owner == "" || d.Project.Number == 0 {
-		t.Errorf("Project = %+v, want owner and number set", *d.Project)
+	// The shipped default declares NO project connection (ADR-110 guard (i),
+	// #4606): a repository without its own .fishhawk/work-management.yaml must
+	// never resolve to a board.
+	if d.Project != nil {
+		t.Errorf("Project = %+v, want nil; the shipped default carries no repository identity (ADR-110)", *d.Project)
 	}
 
 	for _, lvl := range []string{"low", "medium", "high"} {
@@ -491,15 +493,6 @@ types: {feature: {body_skeleton: [Summary]}}
 `,
 			want: "Done-means",
 		},
-		"github_projects without project": {
-			cfg: `
-spec_version: work-management-v0
-provider: github_projects
-required_fields: [Summary, Done-means, complexity]
-types: {feature: {body_skeleton: [Summary]}}
-`,
-			want: "requires a project connection",
-		},
 		"jira without jira block": {
 			cfg: `
 spec_version: work-management-v0
@@ -593,6 +586,25 @@ types: {feature: {body_skeleton: [Summary], label_defaults: {autonomy: high}}}
 				t.Errorf("error %q does not contain %q", err.Error(), tc.want)
 			}
 		})
+	}
+}
+
+// TestParseGithubProjectsWithoutProject pins the ADR-110 relaxation: a
+// github_projects config with no project block is valid and means "no board
+// declared" (Project == nil), no longer a SemanticError.
+func TestParseGithubProjectsWithoutProject(t *testing.T) {
+	cfg := `
+spec_version: work-management-v0
+provider: github_projects
+required_fields: [Summary, Done-means, complexity]
+types: {feature: {body_skeleton: [Summary]}}
+`
+	c, err := Parse(strings.NewReader(cfg))
+	if err != nil {
+		t.Fatalf("Parse(github_projects without project) = %v, want nil (ADR-110)", err)
+	}
+	if c.Project != nil {
+		t.Errorf("Project = %+v, want nil", *c.Project)
 	}
 }
 
@@ -1468,5 +1480,123 @@ func TestDefaultRequiresFourLabelNamespaces(t *testing.T) {
 				t.Errorf("%s LabelDefaults[autonomy] = %q, want autonomy:medium — #3179 adds a namespace and must alter no autonomy value (#2855)", typ, got)
 			}
 		})
+	}
+}
+
+// pkgSrcDir anchors repository paths (testanchor rule #4179: never
+// runtime.Caller).
+var pkgSrcDir = mustGetwd()
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
+
+// TestDefaultDeclaresNoRepositoryIdentity is the ADR-110 guard (i) (#4606): the
+// shipped default is a product artifact and must carry no repository's
+// identity, or a repository with no .fishhawk/work-management.yaml files onto
+// somebody else's board. Two reads, because a typed check alone would miss a
+// comment that names the repository:
+//   - Default().Project is nil (no board connection);
+//   - the RAW embedded bytes contain neither "kuhlman", "project #7" nor "(#7)",
+//     and no "fishhawk" outside the product's own ".fishhawk/" config
+//     directory (accepted: that path is the product's, not a repo's identity).
+//
+// Restoring the project block turns the first check red (Parse still accepts
+// it, because the github_projects-requires-project rule is gone) and the second
+// on "kuhlman".
+func TestDefaultDeclaresNoRepositoryIdentity(t *testing.T) {
+	if p := Default().Project; p != nil {
+		t.Errorf("Default().Project = %+v, want nil: the shipped default must declare no board (ADR-110 guard (i), #4606)", *p)
+	}
+
+	raw, err := embedded.ReadFile("defaults/work-management-default.yaml")
+	if err != nil {
+		t.Fatalf("read embedded default: %v", err)
+	}
+	lower := strings.ToLower(string(raw))
+	for _, banned := range []string{"kuhlman", "project #7", "(#7)"} {
+		if strings.Contains(lower, banned) {
+			t.Errorf("embedded default contains %q: it must carry no repository identity (ADR-110 guard (i), #4606); declare it in the repo's own .fishhawk/work-management.yaml", banned)
+		}
+	}
+	if strings.Contains(strings.ReplaceAll(lower, ".fishhawk/", ""), "fishhawk") {
+		t.Errorf("embedded default names fishhawk outside the .fishhawk/ config directory: it must carry no repository identity (ADR-110 guard (i), #4606)")
+	}
+}
+
+// TestRepositoryDeclarationKeepsTodaysConventions pins that this repository's
+// OWN declaration (.fishhawk/work-management.yaml) still carries Project #7 and
+// today's conventions, so removing them from the shipped default (ADR-110)
+// changed nothing here. It is a preservation pin, not a control. It FAILS
+// CLOSED when the file is absent: the operator lands it on main before the
+// guard-(i) change is dispatched (#4606).
+func TestRepositoryDeclarationKeepsTodaysConventions(t *testing.T) {
+	path := filepath.Join(pkgSrcDir, "..", "..", "..", ".fishhawk", "work-management.yaml")
+	f, err := os.Open(path)
+	if err != nil {
+		t.Fatalf("open %s: %v — precondition: the operator must land this repository's own .fishhawk/work-management.yaml (a verbatim copy of the pre-ADR-110 default) before the shipped default drops Project #7 (#4606)", path, err)
+	}
+	defer f.Close()
+	c, err := Parse(f)
+	if err != nil {
+		t.Fatalf("Parse(%s) = %v", path, err)
+	}
+
+	if c.Provider != "github_projects" {
+		t.Errorf("Provider = %q, want github_projects", c.Provider)
+	}
+	want := Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}
+	if c.Project == nil || *c.Project != want {
+		t.Errorf("Project = %+v, want %+v", c.Project, want)
+	}
+
+	titles := map[string]string{
+		"feature": "[E{epic}.{n}] {summary}",
+		"bug":     "[E{epic}.{n}] {summary}",
+		"chore":   "[E{epic}.{n}] {summary}",
+		"adr":     "[ADR-{number}] {summary}",
+		"epic":    "[E{number}] {summary}",
+	}
+	for typ, tf := range titles {
+		if got := c.Types[typ].TitleFormat; got != tf {
+			t.Errorf("types.%s.title_format = %q, want %q", typ, got, tf)
+		}
+	}
+	if n := c.Types["adr"].Numbering; n == nil || n.Scheme != "sequential" || n.Prefix != "ADR-" || n.Pad != 3 {
+		t.Errorf("types.adr.numbering = %+v, want sequential ADR- pad 3", n)
+	}
+	if n := c.Types["epic"].Numbering; n == nil || n.Scheme != "sequential" || n.Prefix != "E" || n.Pad != 0 {
+		t.Errorf("types.epic.numbering = %+v, want sequential E pad 0", n)
+	}
+	for _, typ := range []string{"feature", "bug", "chore"} {
+		if got := strings.Join(c.Types[typ].RequiredLabelNamespaces, ","); got != "area,autonomy,phase" {
+			t.Errorf("types.%s.required_label_namespaces = %q, want area,autonomy,phase", typ, got)
+		}
+	}
+	if got := c.Types["feature"].EpicLink; got != "required" {
+		t.Errorf("types.feature.epic_link = %q, want required", got)
+	}
+
+	wantStates := map[string]string{
+		"backlog": "Backlog", "up_next": "Up Next", "in_progress": "In Progress",
+		"in_review": "In Review", "blocked": "Blocked", "done": "Done",
+	}
+	if !reflect.DeepEqual(c.States, wantStates) {
+		t.Errorf("states = %v, want %v", c.States, wantStates)
+	}
+	wantTransitions := map[string]string{
+		"run_started": "in_progress", "pr_opened": "in_review", "run_failed": "blocked",
+		"run_merged": "done", "campaign_started": "up_next", "issue_closed": "done",
+		"issue_reopened": "backlog",
+	}
+	if !reflect.DeepEqual(c.Transitions, wantTransitions) {
+		t.Errorf("transitions = %v, want %v", c.Transitions, wantTransitions)
+	}
+	if c.Charter == nil || c.Charter.Path != ".fishhawk/charter.md" {
+		t.Errorf("charter = %+v, want path .fishhawk/charter.md", c.Charter)
 	}
 }

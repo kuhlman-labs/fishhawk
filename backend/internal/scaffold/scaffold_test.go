@@ -162,16 +162,22 @@ func TestWorkManagementTemplateParsesWithBackendSemantics(t *testing.T) {
 	}
 }
 
-// TestWorkManagementIncompleteConnectionFailsClosedNamingProject pins the
-// deliberately-incomplete arm: without a project number the config is
-// returned, but the backend parser refuses it naming the connection block, so
-// grooming and filing fail closed until the operator fills it.
-func TestWorkManagementIncompleteConnectionFailsClosedNamingProject(t *testing.T) {
+// TestWorkManagementIncompleteConnectionParsesWithoutProject pins the
+// deliberately-incomplete arm under ADR-110: without a project number the
+// config is returned and the backend parser ACCEPTS it with no project
+// declared (Project == nil), so filing degrades to boarded:false with
+// boarding_error no_project_configured instead of the parse refusing.
+func TestWorkManagementIncompleteConnectionParsesWithoutProject(t *testing.T) {
 	data := mustFiles(t, Options{Provider: ProviderGitHubProjects, Autonomy: "medium", ProjectOwner: "acme"})[WorkManagementPath]
-	_, err := workmgmt.Parse(bytes.NewReader(data))
-	var sem *workmgmt.SemanticError
-	if !errors.As(err, &sem) || !strings.Contains(sem.Msg, "project connection block") {
-		t.Fatalf("workmgmt.Parse err = %v, want the github_projects connection SemanticError", err)
+	conv, err := workmgmt.Parse(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("workmgmt.Parse rejects the incomplete github_projects config: %v\n%s", err, data)
+	}
+	if conv.Provider != ProviderGitHubProjects {
+		t.Errorf("provider = %q, want %q", conv.Provider, ProviderGitHubProjects)
+	}
+	if conv.Project != nil {
+		t.Errorf("project = %+v, want nil: the unfilled connection block is commented out", conv.Project)
 	}
 }
 
@@ -237,13 +243,14 @@ func swapTemplate(t *testing.T, target *[]byte, data []byte) {
 	t.Cleanup(func() { *target = orig })
 }
 
-// TestWorkManagementIncompleteBranchesFailOnlyOnTheConnection covers every
-// incomplete github_projects rendering: workmgmt.Parse must refuse it with the
-// provider-connection *SemanticError ONLY (a *SemanticError is reachable only
-// after the schema passed), and the same options with the connection filled
-// in must parse clean — so an incomplete config cannot hide a broken
-// types/states/transitions set behind its expected connection error.
-func TestWorkManagementIncompleteBranchesFailOnlyOnTheConnection(t *testing.T) {
+// TestWorkManagementIncompleteBranchesParseWithoutProject covers every
+// incomplete github_projects rendering: workmgmt.Parse must accept it WHOLE
+// (schema and every semantic rule) with no project declared, and the same
+// options with the connection filled in must parse clean WITH the project —
+// so an incomplete config still cannot hide a broken types/states/transitions
+// set, now that the connection no longer supplies an expected error to
+// mask it.
+func TestWorkManagementIncompleteBranchesParseWithoutProject(t *testing.T) {
 	for name, opts := range map[string]Options{
 		"no owner":       {Provider: ProviderGitHubProjects, Autonomy: "low", ProjectNumber: 3},
 		"no number":      {Provider: ProviderGitHubProjects, Autonomy: "medium", ProjectOwner: "acme"},
@@ -251,15 +258,21 @@ func TestWorkManagementIncompleteBranchesFailOnlyOnTheConnection(t *testing.T) {
 		"org, no number": {Provider: ProviderGitHubProjects, Autonomy: "high", ProjectOwner: "acme", ProjectOwnerType: "organization"},
 	} {
 		t.Run(name, func(t *testing.T) {
-			_, err := workmgmt.Parse(bytes.NewReader(mustFiles(t, opts)[WorkManagementPath]))
-			var sem *workmgmt.SemanticError
-			if !errors.As(err, &sem) || !strings.Contains(sem.Msg, "project connection block") {
-				t.Fatalf("workmgmt.Parse err = %v, want only the github_projects connection SemanticError", err)
+			conv, err := workmgmt.Parse(bytes.NewReader(mustFiles(t, opts)[WorkManagementPath]))
+			if err != nil {
+				t.Fatalf("workmgmt.Parse rejects the incomplete rendering: %v", err)
+			}
+			if conv.Project != nil {
+				t.Errorf("project = %+v, want nil: the unfilled connection block is commented out", conv.Project)
 			}
 			filled := opts
 			filled.ProjectOwner, filled.ProjectNumber = "acme", 9
-			if _, err := workmgmt.Parse(bytes.NewReader(mustFiles(t, filled)[WorkManagementPath])); err != nil {
+			conv, err = workmgmt.Parse(bytes.NewReader(mustFiles(t, filled)[WorkManagementPath]))
+			if err != nil {
 				t.Fatalf("with the connection filled in, workmgmt.Parse still rejects: %v", err)
+			}
+			if conv.Project == nil || conv.Project.Owner != "acme" || conv.Project.Number != 9 {
+				t.Errorf("filled project = %+v, want owner acme number 9", conv.Project)
 			}
 		})
 	}
