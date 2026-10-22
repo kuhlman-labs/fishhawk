@@ -3870,7 +3870,11 @@ components:
             `review_coverage_incomplete` (#4219), `first_officer_finding_open`
             (ADR-089 D4, E85.6 / #4148) and/or `approval_dismissed`, with the
             merge endpoint's message and details verbatim (see that
-            operation's 409 cases 8, 10, 11 and 9).
+            operation's 409 cases 8, 10 and 11). `approval_dismissed` is an
+            ADVISORY display only (ADR-112 R3, #4619): the merge endpoint's
+            approval refusal now comes from the forge-approval fold
+            (`409 forge_approval_required`, case 9), so the two surfaces
+            deliberately differ on that leg.
         undetermined:
           type: array
           items: { type: string }
@@ -15090,9 +15094,11 @@ paths:
         when the merge-candidate gate refuses (`409 merge_candidate_held`
         (ADR-092) / `merge_base_behind` / `merge_candidate_unverified` /
         `merge_candidate_verify_failed`, or `502 merge_candidate_check_failed`
-        — ADR-090, below), when the pull
-        request's approval was dismissed and not re-given
-        (`409 approval_dismissed`, #4086, best-effort and fail-open), or
+        — ADR-090, below), when the run's review stage declares an approval
+        gate and the ADR-112 forge-approval fold does not answer `approved`
+        at the verified head (`409 forge_approval_required`, fail-closed,
+        evaluated in-lock; `503 merge_authorization_unrecorded` when its
+        `merge_queue_authorized` evidence row cannot be appended), or
         when the merge seam is unconfigured (`503 merge_seam_unconfigured`). It
         deliberately does NOT block on a review stage awaiting approval (that
         stage settles ON merge).
@@ -15461,22 +15467,40 @@ paths:
             (dispatched/running) or `fishhawk_retry_stage` (settled without a
             newer verdict). Checked BEFORE the merge seam, so it is reported
             even where `merge_seam_unconfigured` would follow.
-            (9) The pull request's approval was dismissed and not re-given
-            (`approval_dismissed`, #4086): GitHub reports
-            `mergeable_state=blocked`, no reviewer's latest review is
-            `APPROVED`, and at least one reviewer's latest review is
-            `DISMISSED` (a vouch commit, fix-up push or rebase under "dismiss
-            stale reviews"). `details` carry `{run_id, pr_url,
-            dismissed_reviewer, approved_commit, dismissing_commit,
-            dismissing_cause, mergeable_state, next_step: "approve_pr"}` where
-            `approved_commit` is the dismissed review's commit,
-            `dismissing_commit` the live head, and `dismissing_cause` is
-            `vouch_commit` / `fixup_push` / `push` / `unknown` from the audit
-            chain. BEST-EFFORT and FAIL-OPEN: any forge uncertainty (no
-            client or installation, an unparseable repo or PR, a read error, a
-            merged PR, a `mergeable_state` other than `blocked`, a truncated
-            reviews listing) admits the merge. A never-reviewed PR still
-            queues. Re-approve the pull request, then re-invoke.
+            (9) No qualifying forge approval covers the verified head
+            (`forge_approval_required`, ADR-112 / #4619; replaces the #4086
+            `approval_dismissed` refusal, which this endpoint no longer
+            emits). Only when the run's review stage declares an approval
+            gate: the FOLD reads ONE GraphQL review snapshot (reviewer-latest
+            opinionated reviews) and, for at most 10 candidate reviewers, a
+            fresh collaborator-permission read, all with the run's
+            installation token under one 15 s deadline, inside the run's
+            merge-intent lock and BEFORE any verdict row. A review qualifies
+            only if it is its author's latest APPROVED review at the verified
+            head (or at a head reaching it only through Fishhawk-recorded
+            parent-verified CLEAN advances), its author satisfies the review
+            gate's approvals predicate with fired escalations (`members`,
+            `member_of`, `not: author`, the single-member voucher exception),
+            its author's permission is at least max(`min_permission`, write),
+            and its author is a real user (no bot, `ghost` or deleted
+            account). A write-or-higher `CHANGES_REQUESTED` vetoes.
+            `details` carry `{run_id, pr_url, head_sha, fold, reason, detail,
+            next_step, veto_reviewer?}`: `fold` is `vetoed` /
+            `review_required` / `dismissed` / `absent` / `undetermined` /
+            `reviews_truncated` / `provider_unsupported`; `reason` is a
+            machine reason (`head_moved` when the pull request head is not the
+            verified head); `detail` is sanitised (one line, tokens redacted,
+            at most 300 bytes); `next_step` is `approve_pr`,
+            `dismiss_review`, `retry_after`, `configure_identity_provider` or
+            absent. FAIL-CLOSED: a forge read error, an unparseable recorded
+            spec, an unresolvable escalation or permission, or a moved head is
+            `undetermined`. A run that never recorded a workflow spec, or
+            whose review stage declares no approval gate, makes no forge read
+            and is not refused. BEHAVIOUR CHANGE: a GitLab-family run whose
+            review stage declares an approval gate is refused with
+            `fold: provider_unsupported` (GitLab approvals carry no revision,
+            ADR-112 R6); a gate-less GitLab run is unchanged. Nothing is
+            recorded. Approve (or have the veto dismissed), then re-invoke.
             (10) A decomposed parent's review coverage is incomplete
             (`review_coverage_incomplete`, #4219): a SUCCEEDED slice child is
             covered by no successful agent review — neither the parent's
@@ -15642,6 +15666,11 @@ paths:
             nothing recorded. `merge_dispatch_unclaimed` — the verdict is
             recorded but the dispatch could not be claimed on the
             merge-dispatch ledger, so nothing was dispatched.
+            `merge_authorization_unrecorded` (ADR-112 R4 / #4619, retryable):
+            the forge-approval fold approved but its chained
+            `merge_queue_authorized` evidence row could not be appended, so no
+            verdict row was recorded and nothing was dispatched; re-invoke to
+            retry.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
