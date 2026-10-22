@@ -163,6 +163,10 @@ func (l mergeQueueDispatchLedger) ReleaseMergeDispatch(ctx context.Context, clai
 	return l.q.ReleaseMergeDispatch(ctx, claim)
 }
 
+func (l mergeQueueDispatchLedger) MergeDispatch(ctx context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error) {
+	return l.q.MergeDispatch(ctx, runID)
+}
+
 // mergeDispatchLedger is the wired D1 ledger, nil when the queue is unwired
 // (merge-on-pass then holds: no merge without a claim).
 func (s *Server) mergeDispatchLedger() mergeDispatchLedger {

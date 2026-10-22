@@ -183,10 +183,14 @@ change nothing (ADR-093 slice 2, rejection item 1):
 - **After a claim, the forge outcome is classified ONCE**
   (`server.classifyMergeDispatchOutcome`, first-officer ruling R1), the same
   on all three paths:
-  - **Release** (the forge guarantees nothing was applied): our own pre-call
-    `checks_pending` refusal (`forge.ErrPullRequestUnstableStatus`) and a
-    merge PUT 405 (not mergeable), 409 (head-SHA mismatch,
-    `forge.ErrMergeConflict`) or 422. **`ReleaseMergeDispatch(claim)`**
+  - **Release** (the forge guarantees nothing was applied), on TYPED
+    sentinels only: our own pre-call `checks_pending` refusal
+    (`forge.ErrPullRequestUnstableStatus`) and the REST merge PUT's 405 (not
+    mergeable, `forge.ErrPullRequestNotMergeable`), 409 (head-SHA mismatch,
+    `forge.ErrMergeConflict`) or 422 (`forge.ErrMergeUnprocessable`, wrapped
+    alongside `forge.ErrValidation`). A bare `forge.ErrValidation` is NOT a
+    release: it also carries a generic HTTP-200 GraphQL error envelope,
+    whose outcome is uncertain. **`ReleaseMergeDispatch(claim)`**
     DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,
     `state = 'dispatched'`, `path`, `head_sha`, `claimed_at`); a claim that
     no longer matches is `ErrStateConflict` and is never deleted, so a
@@ -194,7 +198,7 @@ change nothing (ADR-093 slice 2, rejection item 1):
     `merge_checks_pending` re-invoke, a re-advanced entry's next
     merge-on-pass) claims again.
   - **Uncertain** (everything else: 5xx, timeout, transport error, context
-    cancel, 403 that may be a rate limit, 404):
+    cancel, 403 that may be a rate limit, 404, a generic GraphQL error):
     **`MarkMergeDispatchFailed(runID, cause)`** moves the claim to
     `dispatch_failed` (first cause and time kept). It is UPDATED, never
     deleted, so nothing re-dispatches on its own.
@@ -204,11 +208,17 @@ change nothing (ADR-093 slice 2, rejection item 1):
     outcome appends a `merge_dispatch_settled` audit row (`outcome`
     `released` | `dispatch_failed`, `path`, `head_sha`, `reason`); an
     uncertain one also logs at WARN.
-- **Reconciliation before a re-arm.** The next merge-on-pass or `merge_run`
-  touching a run with a claim re-reads the PR: merged → the entry settles
-  merged (`pr_merged`) or the inline answer is `already_merged` (a
-  `dispatch_failed` claim also appends `merge_dispatch_settled`
-  `reconciled_merged`). Unmerged → the claim stands: merge-on-pass holds
+- **Reconciliation before a re-arm.** Every path re-reads the PR before it
+  touches the ledger (the inline and queue paths re-observe a landed merge
+  BEFORE settling a claim after a failed dispatch, so a merge that landed
+  leaves the claim `dispatched`). The next merge-on-pass or `merge_run`
+  touching a run with a claim re-reads the PR: merged → merge-on-pass reads
+  the claim and settles the entry merged (`pr_merged`) only when there is
+  no claim or the claim names the merged head, else it holds
+  `merged_claim_head_mismatch` (WARN); the inline answer is
+  `already_merged`. On both paths a reconciled `dispatch_failed` claim
+  appends `merge_dispatch_settled` `reconciled_merged`. Unmerged → the claim
+  stands: merge-on-pass holds
   `merge_already_dispatched` (WARN), the inline answer is
   `409 merge_already_dispatched` naming the claim, and the merge-queue read
   surfaces it on the entry (`dispatch_claim`: state, path, head, age,

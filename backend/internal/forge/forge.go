@@ -1,6 +1,18 @@
 package forge
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrMergeUnprocessable is a merge PUT the forge refused as unprocessable
+// (GitHub REST 422): a refusal that applied nothing. It is wrapped ALONGSIDE
+// ErrValidation, so every errors.Is(err, ErrValidation) caller is unchanged,
+// while the merge-dispatch ledger (server.classifyMergeDispatchOutcome)
+// releases a claim only on this typed refusal, never on a bare ErrValidation
+// (which also carries a generic GraphQL error envelope whose outcome is
+// uncertain).
+var ErrMergeUnprocessable = errors.New("forge: merge refused as unprocessable")
 
 // Forge is the forge-neutral surface Fishhawk's flows drive a code host
 // through (ADR-058 / E45.4): ref creation + SHA reads, git-data commit

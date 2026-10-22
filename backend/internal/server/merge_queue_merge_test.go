@@ -101,9 +101,27 @@ type mqmLedger struct {
 	claims     []string
 	failed     []string
 	released   []string
+	heads      map[uuid.UUID]string
+	failedRun  map[uuid.UUID]bool
 }
 
-func newMQMLedger() *mqmLedger { return &mqmLedger{claimed: map[uuid.UUID]string{}} }
+func newMQMLedger() *mqmLedger {
+	return &mqmLedger{claimed: map[uuid.UUID]string{}, heads: map[uuid.UUID]string{}, failedRun: map[uuid.UUID]bool{}}
+}
+
+func (l *mqmLedger) MergeDispatch(_ context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	p, ok := l.claimed[runID]
+	if !ok {
+		return mergequeue.DispatchClaim{}, false, nil
+	}
+	st := mergequeue.DispatchDispatched
+	if l.failedRun[runID] {
+		st = mergequeue.DispatchFailed
+	}
+	return mergequeue.DispatchClaim{RunID: runID, State: st, Path: p, HeadSHA: l.heads[runID]}, true, nil
+}
 
 func (l *mqmLedger) ClaimMergeDispatch(_ context.Context, runID uuid.UUID, path, head string) (mergequeue.DispatchClaim, bool, error) {
 	l.mu.Lock()
@@ -116,13 +134,15 @@ func (l *mqmLedger) ClaimMergeDispatch(_ context.Context, runID uuid.UUID, path,
 		return mergequeue.DispatchClaim{RunID: runID, State: mergequeue.DispatchDispatched, Path: p, HeadSHA: head}, false, nil
 	}
 	l.claimed[runID] = path
+	l.heads[runID] = head
 	return mergequeue.DispatchClaim{RunID: runID, State: mergequeue.DispatchDispatched, Path: path, HeadSHA: head, ClaimedAt: time.Now()}, true, nil
 }
 
-func (l *mqmLedger) MarkMergeDispatchFailed(_ context.Context, _ uuid.UUID, cause string) error {
+func (l *mqmLedger) MarkMergeDispatchFailed(_ context.Context, runID uuid.UUID, cause string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.failed = append(l.failed, cause)
+	l.failedRun[runID] = true
 	return nil
 }
 
@@ -167,6 +187,8 @@ type mqmWorld struct {
 	audit  *mqmAudit
 	mu     sync.Mutex
 	states map[int]string
+	// prReadFail, when set, answers every GET /pulls/{n} 500.
+	prReadFail bool
 }
 
 var mqmPullPath = regexp.MustCompile(`^/repos/[^/]+/[^/]+/pulls/(\d+)$`)
@@ -198,6 +220,16 @@ func newMQMWorld(t *testing.T) *mqmWorld {
 		_ = resp.Body.Close()
 		if err != nil {
 			return err
+		}
+		w.mu.Lock()
+		fail := w.prReadFail
+		w.mu.Unlock()
+		if fail {
+			resp.StatusCode, resp.Status = http.StatusInternalServerError, "500 Internal Server Error"
+			resp.Body = io.NopCloser(bytes.NewReader([]byte(`{"message":"injected"}`)))
+			resp.ContentLength = -1
+			resp.Header.Del("Content-Length")
+			return nil
 		}
 		var body map[string]any
 		if err := json.Unmarshal(raw, &body); err != nil {
@@ -488,10 +520,27 @@ func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
 		reason string
 	}{
 		{"undetermined approval holds", "unknown", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined},
+		// R3: the transferred-basis approval check fails closed, so a clean
+		// mergeable_state (the check is undetermined off "blocked") holds.
+		{"clean mergeable_state does not shortcut", "clean", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined},
 		{"reviews read error holds", "blocked", func(w *mqmWorld, r *mcqRun) {
 			w.gh.set(func() { w.gh.reviewsStatus[r.pr] = 500 })
 		}, mergeOnPassHeld, mergeOnPassReasonNotMergeable},
-		{"forge unblocked merges", "clean", nil, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue},
+		// Determined before the lock (blocked, no dismissed review), then the
+		// in-lock approval read fails after the verdict is recorded.
+		{"in-lock approval read failure holds", "blocked", func(w *mqmWorld, r *mcqRun) {
+			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
+			w.audit.onAppend = func(category string) {
+				if category == CategoryMergeVerdictRecorded {
+					w.mu.Lock()
+					w.prReadFail = true
+					w.mu.Unlock()
+				}
+			}
+		}, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined},
+		{"determined approval merges", "blocked", func(w *mqmWorld, r *mcqRun) {
+			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
+		}, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -511,6 +560,14 @@ func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
 				return
 			}
 			w.requireMerges(0)
+			if len(w.ledger.claims) != 0 {
+				t.Fatalf("ledger claimed %v on a held transferred basis", w.ledger.claims)
+			}
+			// The pre-lock check holds before the verdict is recorded; only the
+			// in-lock row reaches the locked re-check.
+			if n := len(w.rows(r, CategoryMergeVerdictRecorded)); (n == 1) != (tc.name == "in-lock approval read failure holds") {
+				t.Fatalf("merge_verdict_recorded rows = %d: the hold came from the wrong check", n)
+			}
 		})
 	}
 }
@@ -857,15 +914,6 @@ func TestWithRunMergeLock_UnwiredQueueCallsFn(t *testing.T) {
 	}
 	if owned, err := s.mergeQueueOwnsMerge(context.Background(), uuid.New()); owned || err != nil {
 		t.Fatalf("unwired: owned=%v err=%v", owned, err)
-	}
-}
-
-func TestForgeReportsMergeUnblocked(t *testing.T) {
-	for state, want := range map[string]bool{"clean": true, "unstable": true, "has_hooks": true,
-		"blocked": false, "behind": false, "dirty": false, "unknown": false, "": false} {
-		if got := forgeReportsMergeUnblocked(state); got != want {
-			t.Fatalf("%q = %v, want %v", state, got, want)
-		}
 	}
 }
 

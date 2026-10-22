@@ -508,6 +508,30 @@ func TestMergeQueueMergeOnPass_RealLedger_UncertainThenReconciles(t *testing.T) 
 	w.gh.set(func() { w.gh.prs[n].merged, w.gh.prs[n].state = true, "closed" })
 	requireOutcome(t, w.decide(req), mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
 	w.requireMerges(1)
+	if got := w.settledOutcomes(r); len(got) != 2 || got[1] != mergeDispatchReconciledMerged {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want [dispatch_failed reconciled_merged]", got)
+	}
+}
+
+// Ruling R1 reconciliation: a merged PR whose head the run's claim does NOT
+// name holds (merged_claim_head_mismatch), never settles merged; with no
+// claim it settles merged with no reconciliation row.
+func TestMergeQueueMergeOnPass_RealLedger_MergedReconcilesAgainstClaimHead(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("rlhd", "h1", mcvUndelegatedSpecYAML)
+	req = w.realLedger(req)
+	if _, err := w.store.ClaimMergeDispatch(context.Background(), r.id, mergequeue.DispatchPathDelegated, "h0"); err != nil {
+		t.Fatalf("seed claim: %v", err)
+	}
+	n := parsePRNumberFromURL(w.runRow(r).PullRequestURL)
+	w.gh.set(func() { w.gh.prs[n].merged, w.gh.prs[n].state = true, "closed" })
+	requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonMergedClaimMismatch)
+	w.exec(`DELETE FROM merge_dispatch_claims WHERE run_id = $1`, r.id)
+	requireOutcome(t, w.decide(req), mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
+	if got := w.settledOutcomes(r); len(got) != 0 {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want none without a claim", got)
+	}
+	w.requireMerges(0)
 }
 
 // Ruling R1 test 3: a dispatch whose context is cancelled mid-call records
@@ -545,7 +569,8 @@ func TestClassifyMergeDispatchOutcome(t *testing.T) {
 		{"checks pending (our pre-call refusal)", fmt.Errorf("x: %w", forge.ErrPullRequestUnstableStatus), mergeDispatchRelease},
 		{"405 not mergeable", fmt.Errorf("x: %w", forge.ErrPullRequestNotMergeable), mergeDispatchRelease},
 		{"409 head mismatch", fmt.Errorf("x: %w", forge.ErrMergeConflict), mergeDispatchRelease},
-		{"422 validation", fmt.Errorf("x: %w", forge.ErrValidation), mergeDispatchRelease},
+		{"422 merge PUT (typed)", fmt.Errorf("x: %w: %w", forge.ErrValidation, forge.ErrMergeUnprocessable), mergeDispatchRelease},
+		{"bare validation / generic GraphQL envelope", fmt.Errorf("x: %w", forge.ErrValidation), mergeDispatchUncertain},
 		{"403 may be a rate limit", fmt.Errorf("x: %w", forge.ErrForbidden), mergeDispatchUncertain},
 		{"404", fmt.Errorf("x: %w", forge.ErrNotFound), mergeDispatchUncertain},
 		{"5xx / transport", errors.New("502 bad gateway"), mergeDispatchUncertain},

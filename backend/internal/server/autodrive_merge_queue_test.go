@@ -12,6 +12,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -403,5 +404,83 @@ func TestAutoDrive_MayMergeDelegatedDispatchThenMergeOnPassDispatchesOnce(t *tes
 	requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonAlreadyDispatched)
 	if total := m.calls() + len(w.merger.calls()); total != 1 {
 		t.Fatalf("forge dispatches = %d (delegated %d, pinned %v), want exactly 1", total, m.calls(), w.merger.calls())
+	}
+}
+
+// TestAutoDrive_MayMergeRefusalReleasesClaim (ruling R1, delegated arm): a
+// dispatch refusal that applied nothing (checks pending, a 409 head
+// mismatch) RELEASES the delegated claim on the real ledger, so the next
+// tick claims again and dispatches.
+func TestAutoDrive_MayMergeRefusalReleasesClaim(t *testing.T) {
+	for name, refusal := range map[string]error{
+		"checks pending":    fmt.Errorf("enable auto-merge: %w", forge.ErrPullRequestUnstableStatus),
+		"409 head mismatch": fmt.Errorf("merge pr: %w", forge.ErrMergeConflict),
+	} {
+		t.Run(name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r := w.admqReady("rel", "h1")
+			m := &admqMerger{err: refusal}
+			runRow, err := w.repo.GetRun(context.Background(), r.id)
+			if err != nil {
+				t.Fatalf("GetRun: %v", err)
+			}
+			if _, err := w.srv.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), m, nil); err == nil {
+				t.Fatal("the refused dispatch was not surfaced")
+			}
+			var head string
+			if st, _ := w.claimRow(r, &head); st != "" {
+				t.Fatalf("claim state after a refusal = %q, want released (no row)", st)
+			}
+			m.mu.Lock()
+			m.err = nil
+			m.mu.Unlock()
+			if out := w.admqDrive(r, m); !out.Acted || m.calls() != 2 {
+				t.Fatalf("next tick = %+v with %d merger calls, want acted with 2", out, m.calls())
+			}
+			if st, path := w.claimRow(r, &head); st != string(mergequeue.DispatchDispatched) || path != mergequeue.DispatchPathDelegated {
+				t.Fatalf("claim after the re-dispatch = %s/%s, want dispatched/delegated", st, path)
+			}
+		})
+	}
+}
+
+// admqEnqueueOnLock enqueues a HELD entry carrying merge intent the first
+// time the run's merge-intent lock is taken, so the arm's pre-lock gate saw
+// no entry (merge_candidate_held cannot refuse first) and only the in-lock
+// ownership check (ADR-093 D2) stands between the arm and the forge.
+type admqEnqueueOnLock struct {
+	mergequeue.Store
+	once  *sync.Once
+	onRun func()
+}
+
+func (q admqEnqueueOnLock) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	q.once.Do(q.onRun)
+	return q.Store.WithMergeIntentLock(ctx, runID, fn)
+}
+
+// TestAutoDrive_MayMergeHeldIntentEntryOwnsMerge pins D2's held arm on the
+// delegated surface: a held intent entry the gate never saw makes the arm
+// observe-only with the queue-owns note, merger never called, no claim.
+func TestAutoDrive_MayMergeHeldIntentEntryOwnsMerge(t *testing.T) {
+	w := newMQMWorld(t)
+	r := w.admqReady("heldown", "h1")
+	w.srv.cfg.MergeQueue = admqEnqueueOnLock{Store: w.store, once: &sync.Once{}, onRun: func() {
+		if _, err := w.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{
+			RunID: r.id, BaseRef: mcqBase, HeadSHA: "h1", MergeIntent: true}); err != nil {
+			t.Errorf("enqueue held intent entry: %v", err)
+		}
+	}}
+	m := &admqMerger{}
+	requireObserveOnly(t, w.admqDrive(r, m), autoDriveNoteQueueOwnsMerge)
+	if m.calls() != 0 {
+		t.Fatalf("merger calls = %d, want 0", m.calls())
+	}
+	if e := w.storeEntry(r); e.State != mergequeue.StateHeld {
+		t.Fatalf("entry = %s, want held (the D2 held arm)", e.State)
+	}
+	var head string
+	if st, _ := w.claimRow(r, &head); st != "" {
+		t.Fatalf("claim state = %q, want none", st)
 	}
 }

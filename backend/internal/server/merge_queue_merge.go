@@ -75,6 +75,41 @@ type mergeDispatchLedger interface {
 	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (claim mergequeue.DispatchClaim, claimed bool, err error)
 	MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error
 	ReleaseMergeDispatch(ctx context.Context, claim mergequeue.DispatchClaim) error
+	// MergeDispatch reads the run's claim (found=false: none); a merged PR
+	// is reconciled against it (mergeOnPassReconcileMerged).
+	MergeDispatch(ctx context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error)
+}
+
+// mergeOnPassReconcileMerged reconciles a pull request the forge reports
+// merged against the run's D1 claim (ruling R1 reconciliation): settle merged
+// only when there is no claim, or the claim names the merged head; a
+// dispatch_failed claim that reconciles appends merge_dispatch_settled
+// reconciled_merged. ok=false holds with reason: the claim could not be read,
+// or it names a different head than the one that merged. A nil ledger has no
+// claim to read.
+func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string) {
+	if ledger == nil {
+		return true, "", ""
+	}
+	claim, found, err := ledger.MergeDispatch(ctx, runID)
+	if err != nil {
+		return false, mergeOnPassReasonTransient, "the pull request merged but the run's dispatch claim could not be read: " + err.Error()
+	}
+	if !found {
+		return true, "", ""
+	}
+	if claim.HeadSHA != mergedHead {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge queue: the pull request merged at a head the run's dispatch claim does not name; holding",
+			slog.String("run_id", runID.String()), slog.String("claim_head_sha", claim.HeadSHA),
+			slog.String("merged_head_sha", mergedHead), slog.String("claim_state", string(claim.State)))
+		return false, mergeOnPassReasonMergedClaimMismatch,
+			"the pull request merged at " + mergedHead + " but the run's dispatch claim (" + string(claim.State) + ", " + claim.Path + ") names " + claim.HeadSHA
+	}
+	if claim.State == mergequeue.DispatchFailed {
+		s.appendMergeDispatchSettled(ctx, claim, mergeDispatchReconciledMerged, "the forge reports the pull request merged at the claim's head")
+	}
+	return true, "", ""
 }
 
 // mergeDispatchLedgerOutcome classifies a failed forge dispatch made after a D1
@@ -83,12 +118,14 @@ type mergeDispatchLedgerOutcome string
 
 const (
 	// mergeDispatchRelease: the forge guarantees nothing was applied (our own
-	// pre-call checks_pending refusal, a merge PUT 405 / 409 / 422), so the
-	// claim is released and a later dispatch may claim again.
+	// pre-call checks_pending refusal, a REST merge PUT 405 / 409 / 422, each a
+	// typed sentinel), so the claim is released and a later dispatch may claim
+	// again.
 	mergeDispatchRelease mergeDispatchLedgerOutcome = "released"
 	// mergeDispatchUncertain: the merge may have been applied (5xx, timeout,
-	// transport error, ctx cancel, 403 that may be a rate limit, anything
-	// else), so the claim moves to dispatch_failed.
+	// transport error, ctx cancel, 403 that may be a rate limit, a generic
+	// GraphQL error envelope, anything else), so the claim moves to
+	// dispatch_failed.
 	mergeDispatchUncertain mergeDispatchLedgerOutcome = "dispatch_failed"
 )
 
@@ -103,7 +140,9 @@ func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 	case errors.Is(err, forge.ErrPullRequestUnstableStatus),
 		errors.Is(err, forge.ErrPullRequestNotMergeable),
 		errors.Is(err, forge.ErrMergeConflict),
-		errors.Is(err, forge.ErrValidation):
+		errors.Is(err, forge.ErrMergeUnprocessable):
+		// Typed refusals only: a bare forge.ErrValidation also carries a
+		// generic GraphQL error envelope (HTTP 200), which is uncertain.
 		return mergeDispatchRelease
 	}
 	return mergeDispatchUncertain
@@ -231,6 +270,7 @@ const (
 	mergeOnPassReasonNotMergeable          = "not_mergeable_yet"
 	mergeOnPassReasonApprovalUndetermined  = "transferred_approval_undetermined"
 	mergeOnPassReasonEntryChanged          = "entry_changed"
+	mergeOnPassReasonMergedClaimMismatch   = "merged_claim_head_mismatch"
 	mergeOnPassReasonInlineMergeDispatched = "inline_merge_dispatched"
 	mergeOnPassReasonOverlapRefused        = "overlap_refused"
 	mergeOnPassReasonIntentRowMissing      = "intent_row_missing"
@@ -301,18 +341,6 @@ func (s *Server) mergeQueueOwnsMerge(ctx context.Context, runID uuid.UUID) (bool
 	}
 	owned := found && st.Entry.State.Active() && st.Entry.MergeIntentAt != nil // ADR-093 D2: live or held, any phase
 	return owned, nil
-}
-
-// forgeReportsMergeUnblocked reports a GitHub mergeable_state that positively
-// says no review requirement holds the merge (MergeStateStatus CLEAN, UNSTABLE
-// or HAS_HOOKS). Every other value (blocked, behind, dirty, unknown, empty)
-// is not a positive answer.
-func forgeReportsMergeUnblocked(state string) bool {
-	switch state {
-	case "clean", "unstable", "has_hooks":
-		return true
-	}
-	return false
 }
 
 // mergeOnPassTarget is the run's resolved forge target.
@@ -391,6 +419,9 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 		return held(mergeOnPassReasonTransient, "reading the pull request failed: "+err.Error())
 	}
 	if pr.Merged {
+		if ok, reason, detail := s.mergeOnPassReconcileMerged(ctx, req.Ledger, e.RunID, pr.HeadSHA); !ok {
+			return held(reason, detail)
+		}
 		return settle(mergequeue.StateMerged, mergeCandidateQueueReasonPRMerged, "the pull request is already merged")
 	}
 	if pr.State == "closed" {
@@ -432,8 +463,9 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 	if approval.Refusal != nil {
 		return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed, mergeOnPassApprovalDismissedRemedy)
 	}
-	holdTransferred := elig.ApprovalBasis == mergeQueueApprovalTransferred && !approval.Determined && !forgeReportsMergeUnblocked(pr.MergeableState) // ADR-093 D6 fail-closed
-	if holdTransferred {
+	// ADR-093 D6: the transferred-basis approval check fails closed; no
+	// mergeable_state shortcut applies on that basis.
+	if elig.ApprovalBasis == mergeQueueApprovalTransferred && !approval.Determined {
 		return held(mergeOnPassReasonApprovalUndetermined,
 			"the approval is transferred and the forge approval could not be determined ("+approval.Undetermined+")")
 	}
@@ -517,6 +549,9 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return held(mergeOnPassReasonTransient, "re-reading the pull request failed: "+err.Error())
 	}
 	if pr.Merged {
+		if ok, reason, detail := s.mergeOnPassReconcileMerged(ctx, req.Ledger, e.RunID, pr.HeadSHA); !ok {
+			return held(reason, detail)
+		}
 		return settle(mergequeue.StateMerged, mergeCandidateQueueReasonPRMerged, "the pull request is already merged")
 	}
 	if pr.State == "closed" {
@@ -604,7 +639,7 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	if approval.Refusal != nil {
 		return held(mergeOnPassReasonApprovalDismissed, "the forge approval was dismissed since the pre-lock check")
 	}
-	if basis == mergeQueueApprovalTransferred && !approval.Determined && !forgeReportsMergeUnblocked(pr.MergeableState) {
+	if basis == mergeQueueApprovalTransferred && !approval.Determined { // transferred-basis approval check fails closed
 		return held(mergeOnPassReasonApprovalUndetermined,
 			"the approval is transferred and the forge approval could not be determined ("+approval.Undetermined+")")
 	}
@@ -655,7 +690,7 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	case errors.Is(mergeErr, forge.ErrMergeConflict):
 		return readvance(mergeOnPassReasonForgeHeadMismatch,
 			"the forge refused the pinned merge because the head no longer matched "+head+": "+mergeErr.Error())
-	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrValidation):
+	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrMergeUnprocessable):
 		dctx, dcancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
 		again := s.approvalDismissedCheck(dctx, runRow)
 		dcancel()

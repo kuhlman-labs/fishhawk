@@ -741,6 +741,25 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		}
 
 		if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
+			checksPending := errors.Is(merr, forge.ErrPullRequestUnstableStatus)
+			// RE-OBSERVE ONCE (E45.87 / #3622), BEFORE the ledger is settled
+			// (matching merge-on-pass): a merge that landed in the
+			// observe-to-dispatch window, or one the dispatch itself rejected
+			// BECAUSE the PR was already merged, resolves as already_merged and
+			// leaves the claim 'dispatched' (the merge landed), instead of a 502
+			// that tells the operator to retry an operation that already
+			// succeeded. The forge read is unconditional here (not gated on
+			// alreadyRecorded): the dispatch has already failed, so the extra read
+			// is paid only on an error path. Our own checks_pending refusal
+			// dispatched nothing, so it is not re-observed.
+			var obs mergeObserveResult
+			if !checksPending {
+				obs = s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true)
+				if obs.Landed {
+					s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
+					return nil
+				}
+			}
 			rearm := ""
 			// Ruling R1: a checks_pending refusal or a forge 405/409/422
 			// RELEASES the claim (nothing was applied), so the re-invoke can
@@ -758,7 +777,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			// already durable, so the tool re-POSTs across a bounded wait with no
 			// duplicate row. EVERY other error keeps the generic 502 so a real
 			// dispatch failure is never swallowed as "just waiting".
-			if errors.Is(merr, forge.ErrPullRequestUnstableStatus) {
+			if checksPending {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
 					slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
 				details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
@@ -779,18 +798,6 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 					msg += " fishhawk_audit_complete is pending because: " + auditRes.Missing[0].Detail
 				}
 				s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
-				return nil
-			}
-			// RE-OBSERVE ONCE (E45.87 / #3622). A merge that landed in the
-			// observe-to-dispatch window — or one the dispatch itself rejected
-			// BECAUSE the PR was already merged — resolves as already_merged
-			// instead of a 502 that tells the operator to retry an operation that
-			// already succeeded. The forge read is unconditional here (not gated on
-			// alreadyRecorded): the dispatch has already failed, so the extra read
-			// is paid only on an error path.
-			obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true)
-			if obs.Landed {
-				s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
 				return nil
 			}
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",

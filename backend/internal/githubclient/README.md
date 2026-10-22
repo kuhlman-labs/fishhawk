@@ -77,7 +77,7 @@ The two substrings (`"clean status"` vs `"unstable status"`) are disjoint, so ne
 
 - **Synchronous only.** It never touches `EnableAutoMerge` / GraphQL: a queued auto-merge waits on checks while the base may move, which would land a tree the queue never verified against the current base.
 - **An empty (or whitespace) `expectedHeadSHA` is refused before any HTTP call**, so the pinned seam can never silently degrade into an unpinned merge.
-- **Status mapping is `MergePullRequest`'s**: 405 → `ErrPullRequestNotMergeable`; 409 (head modified / sha mismatch) → `ErrMergeConflict` — the sentinel merge-on-pass re-advances on; 401/403/404/422 via `classifyStatus`.
+- **Status mapping is `MergePullRequest`'s**: 405 → `ErrPullRequestNotMergeable`; 409 (head modified / sha mismatch) → `ErrMergeConflict` — the sentinel merge-on-pass re-advances on; 422 → `ErrValidation` AND `ErrMergeUnprocessable` (multi-`%w`), the typed refusal the merge-dispatch ledger releases on (a generic GraphQL error envelope is `ErrValidation` only, an uncertain outcome; `TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal`); 401/403/404 via `classifyStatus`.
 - Both methods share one private body (`mergePullRequest`); `MergePullRequest` passes an empty sha and its request stays byte-shaped as before (no `sha` key).
 
 Pinned by `TestMergePullRequestAtHead_{SendsShaAndMethod,EmptyShaRefusedBeforeHTTP,StatusMapping}` and `TestMergePullRequest_OmitsSha` in `client_test.go`. GitHub pins only the HEAD, not the base: a base push in the instant between the queue's base re-probe and this call is a documented merge-on-pass residual (`backend/internal/server/README.md`).

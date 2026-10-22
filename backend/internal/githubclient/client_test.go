@@ -2382,7 +2382,33 @@ func TestMergePullRequestAtHead_StatusMapping(t *testing.T) {
 			if err == nil || !errors.Is(err, tc.want) {
 				t.Errorf("status %d: err = %v, want %v", tc.status, err, tc.want)
 			}
+			// Only the PUT's 422 carries the typed unprocessable refusal the
+			// merge-dispatch ledger releases on.
+			if got := errors.Is(err, ErrMergeUnprocessable); got != (tc.status == http.StatusUnprocessableEntity) {
+				t.Errorf("status %d: errors.Is(err, ErrMergeUnprocessable) = %v", tc.status, got)
+			}
 		})
+	}
+}
+
+// TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal: an HTTP-200
+// GraphQL error envelope that is not a known precondition refusal (here an
+// INTERNAL error) is ErrValidation ONLY, never a typed refusal sentinel, so
+// the merge-dispatch ledger treats its outcome as uncertain.
+func TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.graphqlBody = `{"data":null,"errors":[{"type":"INTERNAL","message":"Something went wrong while executing your query."}]}`
+	c, _ := newTestClient(t, srv, nil)
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+	for _, typed := range []error{ErrMergeUnprocessable, ErrPullRequestUnstableStatus, ErrPullRequestCleanStatus,
+		ErrPullRequestNotMergeable, ErrMergeConflict} {
+		if errors.Is(err, typed) {
+			t.Errorf("a generic GraphQL error must not wrap %v: %v", typed, err)
+		}
 	}
 }
 

@@ -66,6 +66,7 @@ var (
 	ErrPullRequestCleanStatus    = forge.ErrPullRequestCleanStatus
 	ErrPullRequestUnstableStatus = forge.ErrPullRequestUnstableStatus
 	ErrPullRequestNotMergeable   = forge.ErrPullRequestNotMergeable
+	ErrMergeUnprocessable        = forge.ErrMergeUnprocessable
 )
 
 // The Forge-surface vocabulary lives canonically in the forge package
@@ -1568,6 +1569,13 @@ func (c *Client) mergePullRequest(ctx context.Context, scope forge.CredentialSco
 	if resp.StatusCode == http.StatusConflict {
 		brief := readBriefBody(resp.Body)
 		return fmt.Errorf("%w: merge pr #%d: %s", ErrMergeConflict, prNumber, brief)
+	}
+	// 422 = the merge request was refused as unprocessable: nothing applied.
+	// ErrMergeUnprocessable rides ALONGSIDE ErrValidation (multi-%w), so the
+	// typed refusal is distinguishable from a generic validation error.
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		brief := readBriefBody(resp.Body)
+		return fmt.Errorf("%w: %w: merge pr #%d: %s", ErrValidation, ErrMergeUnprocessable, prNumber, brief)
 	}
 	return classifyStatus("merge pull request", resp)
 }

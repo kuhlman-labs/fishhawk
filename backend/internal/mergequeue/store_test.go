@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -1712,4 +1713,60 @@ func (f *fixture) countClaims(runID uuid.UUID) int {
 		f.t.Fatalf("count claims: %v", err)
 	}
 	return n
+}
+
+// failClaimReadTracer cancels the context of ClaimMergeDispatch's claim
+// read-back (the SELECT after a 23505) and of nothing else, so only that
+// follow-up read fails.
+type failClaimReadTracer struct{}
+
+func (failClaimReadTracer) TraceQueryStart(ctx context.Context, _ *pgx.Conn, d pgx.TraceQueryStartData) context.Context {
+	if strings.HasPrefix(d.SQL, "SELECT run_id, state, path, head_sha") && strings.Contains(d.SQL, "FROM merge_dispatch_claims") {
+		c, cancel := context.WithCancel(ctx)
+		cancel()
+		return c
+	}
+	return ctx
+}
+
+func (failClaimReadTracer) TraceQueryEnd(context.Context, *pgx.Conn, pgx.TraceQueryEndData) {}
+
+// TestClaimMergeDispatch_DuplicateWhoseReadBackFailsNamesUnknown (#53abff93):
+// a 23505 whose follow-up claim read fails is still ErrAlreadyDispatched
+// (fail closed), returned with the run id and an explicit unknown state, path
+// and head rather than a zero claim, and the existing claim is untouched.
+func TestClaimMergeDispatch_DuplicateWhoseReadBackFailsNamesUnknown(t *testing.T) {
+	ctx := context.Background()
+	dsn := pgtest.NewURL(t)
+	plain, err := pgxpool.New(ctx, dsn)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(plain.Close)
+	cfg, err := pgxpool.ParseConfig(dsn)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	cfg.ConnConfig.Tracer = failClaimReadTracer{}
+	traced, err := pgxpool.NewWithConfig(ctx, cfg)
+	if err != nil {
+		t.Fatalf("traced pool: %v", err)
+	}
+	t.Cleanup(traced.Close)
+	f := &fixture{t: t, pool: plain, repo: run.NewPostgresRepository(plain), store: NewPostgresStore(plain)}
+	runID := f.run()
+	if _, err := f.store.ClaimMergeDispatch(ctx, runID, DispatchPathQueue, "h1"); err != nil {
+		t.Fatalf("first claim: %v", err)
+	}
+	c, err := NewPostgresStore(traced).ClaimMergeDispatch(ctx, runID, DispatchPathInline, "h2")
+	if !errors.Is(err, ErrAlreadyDispatched) {
+		t.Fatalf("duplicate claim err = %v, want ErrAlreadyDispatched", err)
+	}
+	if c.RunID != runID || c.State != DispatchUnknown || c.Path != DispatchUnknownField || c.HeadSHA != DispatchUnknownField {
+		t.Fatalf("claim = %+v, want the run id with an unknown state, path and head", c)
+	}
+	existing, found, err := f.store.MergeDispatch(ctx, runID)
+	if err != nil || !found || existing.State != DispatchDispatched || existing.Path != DispatchPathQueue || existing.HeadSHA != "h1" {
+		t.Fatalf("existing claim = %+v found=%v err=%v, want the queue claim intact", existing, found, err)
+	}
 }

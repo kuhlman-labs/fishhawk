@@ -15,11 +15,15 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // ADR-093 slice 2 (E87.5 / #4296), the merge_run slice: HTTP-level tests over
@@ -392,5 +396,301 @@ func TestMergeQueueE2E_InlineCancelledRequestLeavesDispatchFailed(t *testing.T) 
 	w.exec(`DELETE FROM merge_dispatch_claims WHERE run_id = $1 AND state = 'dispatch_failed'`, r.id)
 	if resp := w.mergeRun(r); resp.Code != http.StatusOK {
 		t.Fatalf("merge after re-arm = %d %s, want 200", resp.Code, resp.Body.String())
+	}
+}
+
+// mqeForgePUTMerger is the head-pinned merge over the production githubclient
+// PUT against the mcq fake, which moves the base (every other open PR reads
+// behind) on a merge.
+type mqeForgePUTMerger struct{ gh *githubclient.Client }
+
+func (mqeForgePUTMerger) MergePullRequest(context.Context, *run.Run) error {
+	return errors.New("the line e2e drives only the head-pinned merge")
+}
+
+func (m mqeForgePUTMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run, head string) error {
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return err
+	}
+	return m.gh.MergePullRequestAtHead(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo,
+		parsePRNumberFromURL(runRow.PullRequestURL), forge.MergeMethodSquash, head)
+}
+
+// newMQELineWorld is an mqmWorld whose merge-on-pass merges through the real
+// PUT, so a merge moves the base under the rest of the line.
+func newMQELineWorld(t *testing.T) *mqmWorld {
+	t.Helper()
+	w := newMQMWorld(t)
+	w.srv.cfg.GateMerger = mqeForgePUTMerger{gh: w.srv.cfg.GitHub}
+	return w
+}
+
+// passAt records the runner's passed verdict at head for r's live verifying
+// entry and waits for the detached pump it triggers (no human act).
+func (w *mqmWorld) passAt(r *mcqRun, head string) {
+	w.t.Helper()
+	w.mqePassed(r, head)
+	w.srv.mergeCandidateQueueOnVerdict(context.Background(), r.id, head, mergeCandidateResultPassed)
+	w.srv.bgMergeQueuePump.Wait()
+}
+
+func (w *mqmWorld) requirePuts(want ...string) {
+	w.t.Helper()
+	var got []string
+	for _, p := range w.gh.putCalls() {
+		got = append(got, p.SHA)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		w.t.Fatalf("pinned PUTs = %v, want %v", got, want)
+	}
+}
+
+// TestMergeQueueE2E_TwoPRsMergeBackToBack: two intent entries on one base.
+// The first merges pinned to its verified head, which moves the base; the
+// second advances onto that base, passes there and merges pinned to the new
+// head, with no human act in between (the pass is the runner's verdict).
+func TestMergeQueueE2E_TwoPRsMergeBackToBack(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	b := w.seed("b", "b1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.gh.set(func() { w.gh.mergeSHA[b.branch] = "b2" })
+
+	w.pumpBase(a)
+
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if e := w.storeEntry(b); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "b2" {
+		t.Fatalf("B after A merged = %s at %s, want live at the advanced head b2", e.State, e.AnchoredHeadSHA)
+	}
+	w.requirePuts("a1")
+
+	w.passAt(b, "b2")
+
+	w.requirePuts("a1", "b2")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if n := len(w.rows(b, CategoryMergeQueueAdvanced)); n != 1 {
+		t.Fatalf("B merge_queue_advanced rows = %d, want 1 (onto the base A's merge moved)", n)
+	}
+}
+
+// TestMergeQueueE2E_BaseMovesBetweenPassAndMergeReadvances: the base moves
+// after the entry's pass and before its merge, so merge-on-pass re-advances
+// it at its place; the re-admission advances onto the new base, the runner's
+// pass there merges it pinned to the new head, and the stale head is never
+// PUT.
+func TestMergeQueueE2E_BaseMovesBetweenPassAndMergeReadvances(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.gh.set(func() { w.gh.mergeSHA[a.branch] = "a2" })
+	moved := false
+	w.audit.onAppend = func(category string) {
+		// The admission records the pass; the base moves right after it.
+		if category == CategoryMergeQueueVerified && !moved {
+			moved = true
+			w.gh.set(func() { w.gh.behind["a1"] = []string{"base-x"} })
+		}
+	}
+
+	w.pumpBase(a)
+
+	if !moved {
+		t.Fatal("the admission recorded no merge_queue_verified row")
+	}
+	w.requirePuts()
+	if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" {
+		t.Fatalf("entry after the readvance = %s at %s, want live at a2 (re-advanced in place)", e.State, e.AnchoredHeadSHA)
+	}
+
+	w.passAt(a, "a2")
+
+	w.requirePuts("a2")
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues: the head
+// of line's forge approval was dismissed, so merge-on-pass ejects it
+// forge_approval_dismissed (no claim, no PUT) and the line continues: the
+// next entry merges in the same pump.
+func TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	b := w.seed("b", "b1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.gh.set(func() { w.gh.reviews[a.pr] = mqeDismissed })
+	w.mergeable(a, "blocked")
+
+	w.pumpBase(a)
+
+	w.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed)
+	if n := w.claims(a); n != 0 {
+		t.Fatalf("A claims = %d, want 0 (ejected before any dispatch)", n)
+	}
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// mqeEnqueueOnLock enqueues a HELD intent entry the first time the run's
+// merge-intent lock is taken: the inline gate (before the lock) saw no entry,
+// so merge_candidate_held cannot refuse first and only the in-lock D2
+// ownership check refuses.
+type mqeEnqueueOnLock struct {
+	mergequeue.Store
+	once  *sync.Once
+	onRun func()
+}
+
+func (q mqeEnqueueOnLock) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	q.once.Do(q.onRun)
+	return q.Store.WithMergeIntentLock(ctx, runID, fn)
+}
+
+// TestMergeQueueE2E_InlineRefusedByHeldIntentEntry pins D2's held arm on the
+// inline surface: 409 merge_queue_owns_merge, the forge never called and no
+// claim taken.
+func TestMergeQueueE2E_InlineRefusedByHeldIntentEntry(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("heldown", "h1")
+	w.srv.cfg.MergeQueue = mqeEnqueueOnLock{Store: w.store, once: &sync.Once{}, onRun: func() {
+		if _, err := w.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{
+			RunID: r.id, BaseRef: mcqBase, HeadSHA: "h1", MergeIntent: true}); err != nil {
+			t.Errorf("enqueue held intent entry: %v", err)
+		}
+	}}
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusConflict || mqeCode(t, resp.Body.Bytes()) != "merge_queue_owns_merge" {
+		t.Fatalf("merge = %d %s, want 409 merge_queue_owns_merge", resp.Code, resp.Body.String())
+	}
+	if e := w.storeEntry(r); e.State != mergequeue.StateHeld {
+		t.Fatalf("entry = %s, want held (the D2 held arm)", e.State)
+	}
+	if m.inlineCalls() != 0 {
+		t.Fatalf("inline dispatches = %d, want 0", m.inlineCalls())
+	}
+	if st, _ := w.claim(r); st != "" {
+		t.Fatalf("claim = %q, want none", st)
+	}
+}
+
+// TestMergeQueueE2E_InlineHoldsLockMergeOnPassWaits is the barrier-forced
+// inline-vs-merge-on-pass race under the REAL merge-intent lock: the inline
+// merge holds the lock parked inside its dispatch while an intent entry
+// passes and merge-on-pass decides; merge-on-pass waits on the lock, then
+// meets the inline dispatch and holds. Exactly one forge dispatch.
+func TestMergeQueueE2E_InlineHoldsLockMergeOnPassWaits(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("race", "h1")
+	entered, release := make(chan struct{}), make(chan struct{})
+	m.mu.Lock()
+	m.inlineHook = func(context.Context) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	m.mu.Unlock()
+	inlineDone := make(chan int, 1)
+	go func() { inlineDone <- w.mergeRun(r).Code }()
+	<-entered // the inline path holds the run's lock, inside its dispatch
+
+	seq := w.intentEntry(r, "h1", mergequeue.PhasePassed)
+	decided := make(chan mergeOnPassOutcome, 1)
+	go func() {
+		decided <- w.decide(w.realLedger(mergeOnPassRequest{Entry: w.active(r), IntentSequence: seq}))
+	}()
+	select {
+	case out := <-decided:
+		close(release) // unpark the inline merge so a failure ends the test, never hangs it
+		<-inlineDone
+		t.Fatalf("merge-on-pass decided %+v while the inline merge held the lock", out)
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+	close(release)
+	if code := <-inlineDone; code != http.StatusOK {
+		t.Fatalf("inline merge = %d, want 200", code)
+	}
+	out := <-decided
+	if out.Kind != mergeOnPassHeld {
+		t.Fatalf("merge-on-pass = %+v, want held behind the inline dispatch", out)
+	}
+	if m.inlineCalls() != 1 || len(w.merger.calls()) != 0 {
+		t.Fatalf("dispatches: inline %d pinned %v, want exactly the one inline", m.inlineCalls(), w.merger.calls())
+	}
+}
+
+// TestMergeQueueE2E_InlineGenericGraphQLErrorLeavesDispatchFailed (ruling R1
+// tightening): the production githubclient auto-merge mutation answering an
+// HTTP-200 GraphQL INTERNAL error envelope is an UNCERTAIN outcome, so the
+// inline claim is dispatch_failed (never released) on the real ledger.
+func TestMergeQueueE2E_InlineGenericGraphQLErrorLeavesDispatchFailed(t *testing.T) {
+	w, _ := newMQEWorld(t)
+	r := w.verified("gql", "h1")
+	orig := w.srv.cfg.GitHub
+	target, err := url.Parse(orig.BaseURL)
+	if err != nil {
+		t.Fatalf("parse: %v", err)
+	}
+	rp := httputil.NewSingleHostReverseProxy(target)
+	gql := httptest.NewServer(http.HandlerFunc(func(rw http.ResponseWriter, req *http.Request) {
+		if req.URL.Path == "/graphql" {
+			rw.Header().Set("Content-Type", "application/json")
+			_, _ = rw.Write([]byte(`{"data":null,"errors":[{"type":"INTERNAL","message":"Something went wrong while executing your query."}]}`))
+			return
+		}
+		rp.ServeHTTP(rw, req)
+	}))
+	t.Cleanup(gql.Close)
+	c := *orig
+	c.BaseURL = gql.URL
+	w.srv.cfg.GateMerger = mqeAutoMerger{gh: &c}
+
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusBadGateway || mqeCode(t, resp.Body.Bytes()) != "merge_dispatch_failed" {
+		t.Fatalf("merge = %d %s, want 502 merge_dispatch_failed", resp.Code, resp.Body.String())
+	}
+	if st, path := w.claim(r); st != string(mergequeue.DispatchFailed) || path != mergequeue.DispatchPathInline {
+		t.Fatalf("claim = %q/%q, want dispatch_failed/inline (a generic GraphQL error is uncertain)", st, path)
+	}
+}
+
+// mqeAutoMerger is the inline GateMerger over the production githubclient
+// auto-merge mutation.
+type mqeAutoMerger struct{ gh *githubclient.Client }
+
+func (m mqeAutoMerger) MergePullRequest(ctx context.Context, runRow *run.Run) error {
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return err
+	}
+	return m.gh.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo,
+		parsePRNumberFromURL(runRow.PullRequestURL), forge.MergeMethodSquash)
+}
+
+// TestMergeQueueE2E_InlineUncertainErrorButMergedKeepsClaimDispatched
+// (#3320f2eb): an uncertain dispatch error whose merge in fact landed is
+// re-observed BEFORE the ledger is settled, so it answers already_merged,
+// the claim stays 'dispatched' and no merge_dispatch_settled row is written.
+func TestMergeQueueE2E_InlineUncertainErrorButMergedKeepsClaimDispatched(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("lm", "h1")
+	m.mu.Lock()
+	m.inlineHook = func(context.Context) error {
+		w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+		return errors.New("github: 502 bad gateway")
+	}
+	m.mu.Unlock()
+	resp := w.mergeRun(r)
+	var body mergeRunResponse
+	_ = json.Unmarshal(resp.Body.Bytes(), &body)
+	if resp.Code != http.StatusOK || !body.AlreadyMerged {
+		t.Fatalf("merge = %d %s, want 200 already_merged", resp.Code, resp.Body.String())
+	}
+	if st, _ := w.claim(r); st != string(mergequeue.DispatchDispatched) {
+		t.Fatalf("claim = %q, want dispatched (the merge landed)", st)
+	}
+	if n := len(w.rows(r, categoryMergeDispatchSettled)); n != 0 {
+		t.Fatalf("merge_dispatch_settled rows = %d, want 0", n)
 	}
 }

@@ -3004,13 +3004,15 @@ deadline): `backend/internal/mergequeue/README.md`.
   (re-enter at the tail with `fishhawk_merge_run`, ADR-093 Q2);
   `approvalDismissedCheck` refusal → eject `forge_approval_dismissed`
   (Fishhawk cannot re-approve: re-approve under your own identity, then
-  `fishhawk_merge_run`); a TRANSFERRED basis with an undetermined approval
-  holds unless the forge reports `mergeable_state` `clean`, `unstable` or
-  `has_hooks` (`forgeReportsMergeUnblocked`); a live basis proceeds and the
-  forge decides. Then a best-effort `fishhawk_audit_complete` republish at
+  `fishhawk_merge_run`); on a TRANSFERRED basis the approval check fails
+  closed: an undetermined approval (an `unknown` read or a read failure)
+  holds `transferred_approval_undetermined`, with no `mergeable_state`
+  shortcut, both before the lock and in the locked re-check; a live basis
+  proceeds and the forge decides. Then a best-effort `fishhawk_audit_complete` republish at
   the head.
-- **Locked steps** (`withRunMergeLock` = `WithMergeIntentLock`; every forge
-  read is bounded 10s, the pinned merge 30s, under the 90s fn deadline):
+- **Locked steps** (`withRunMergeLock` = `WithMergeIntentLock`; in
+  merge-on-pass every forge read is bounded 10s and the pinned merge 30s,
+  under the 90s fn deadline):
   re-read the entry (same id, live, passed, intent, same head) and the PR;
   a non-queue `merge_verdict_recorded` newer than the intent → hold
   `inline_merge_dispatched`; the merge overlap guard (#4119) → a 409 holds
@@ -3038,8 +3040,12 @@ deadline): `backend/internal/mergequeue/README.md`.
   (`classifyMergeDispatchOutcome`): 405 / 409 / 422 (and a checks_pending
   refusal) RELEASE the claim (an exact-claim compare-and-swap DELETE), so
   a re-advanced entry's next merge-on-pass claims again; anything else
-  (5xx, timeout, cancel, 403, 404) is uncertain → `dispatch_failed` and the
-  entry holds (mergequeue README § "Merge-dispatch ledger"). A lock never taken → hold; a lapse after fn → WARN, its
+  (5xx, timeout, cancel, 403, 404, a generic GraphQL error; only typed
+  sentinels release, never a bare `ErrValidation`) is uncertain →
+  `dispatch_failed` and the entry holds (mergequeue README §
+  "Merge-dispatch ledger"). A PR the forge reports merged settles
+  `pr_merged` only when the run has no claim or its claim names the merged
+  head, else holds `merged_claim_head_mismatch`. A lock never taken → hold; a lapse after fn → WARN, its
   writes stand.
 - **Outcomes the pump applies.** `merged` → continue; `settle` → `SettleAt`
   (epoch CAS; a conflict stops the pump); `readvance` → `Unadmit(epoch)`,
@@ -3064,7 +3070,10 @@ deadline): `backend/internal/mergequeue/README.md`.
   queue, a lock not taken within `autoDriveMergeLockAcquireTimeout` (30s), an
   existing claim and a claim error are each observe-only with the merger
   never called; a dispatch failure after the claim is classified (release or
-  `dispatch_failed`) and surfaces the error. Inline: a `merge_checks_pending`
+  `dispatch_failed`) and surfaces the error. The inline path re-observes a
+  landed merge BEFORE settling the claim (as merge-on-pass does), so a
+  merge that landed answers `already_merged` and leaves the claim
+  `dispatched`. Inline: a `merge_checks_pending`
   refusal releases the claim, so the re-invoke once the checks pass claims
   again. Every ledger write after the forge call runs on
   `context.WithoutCancel` with a bounded timeout and appends

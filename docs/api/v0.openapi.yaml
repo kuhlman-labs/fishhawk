@@ -15197,8 +15197,9 @@ paths:
         `409 merge_already_dispatched` (or `200 already_merged` when the pull
         request landed) and the forge is never called. A dispatch that fails
         after the claim is classified once: a refusal that applied nothing
-        (`merge_checks_pending`, a forge 405/409/422) releases the claim, so
-        the re-invoke claims again; an uncertain outcome (5xx, timeout,
+        (`merge_checks_pending`, a REST merge PUT 405/409/422; never a
+        generic GraphQL error envelope, which is uncertain) releases the
+        claim, so the re-invoke claims again; an uncertain outcome (5xx, timeout,
         cancel, 403) leaves it `dispatch_failed` until the pull request reads
         merged or the operator re-arms it
         (`backend/internal/mergequeue/README.md` § "Merge-dispatch ledger").
