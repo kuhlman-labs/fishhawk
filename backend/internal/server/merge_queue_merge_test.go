@@ -100,28 +100,37 @@ type mqmLedger struct {
 	claimed    map[uuid.UUID]string
 	claims     []string
 	failed     []string
+	released   []string
 }
 
 func newMQMLedger() *mqmLedger { return &mqmLedger{claimed: map[uuid.UUID]string{}} }
 
-func (l *mqmLedger) ClaimMergeDispatch(_ context.Context, runID uuid.UUID, path, head string) (bool, error) {
+func (l *mqmLedger) ClaimMergeDispatch(_ context.Context, runID uuid.UUID, path, head string) (mergequeue.DispatchClaim, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	if l.claimErr != nil {
-		return false, l.claimErr
+		return mergequeue.DispatchClaim{}, false, l.claimErr
 	}
 	l.claims = append(l.claims, path+"@"+head)
-	if _, ok := l.claimed[runID]; ok && !l.permissive {
-		return false, nil
+	if p, ok := l.claimed[runID]; ok && !l.permissive {
+		return mergequeue.DispatchClaim{RunID: runID, State: mergequeue.DispatchDispatched, Path: p, HeadSHA: head}, false, nil
 	}
 	l.claimed[runID] = path
-	return true, nil
+	return mergequeue.DispatchClaim{RunID: runID, State: mergequeue.DispatchDispatched, Path: path, HeadSHA: head, ClaimedAt: time.Now()}, true, nil
 }
 
 func (l *mqmLedger) MarkMergeDispatchFailed(_ context.Context, _ uuid.UUID, cause string) error {
 	l.mu.Lock()
 	defer l.mu.Unlock()
 	l.failed = append(l.failed, cause)
+	return nil
+}
+
+func (l *mqmLedger) ReleaseMergeDispatch(_ context.Context, c mergequeue.DispatchClaim) error {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.released = append(l.released, c.Path+"@"+c.HeadSHA)
+	delete(l.claimed, c.RunID)
 	return nil
 }
 
@@ -601,6 +610,23 @@ func TestMergeQueueMergeOnPass_InlineVerdict(t *testing.T) {
 	})
 }
 
+// TestRecordMergeOnPassVerdict_DuplicateOnAppendResumesWinner pins the 0062
+// once-index arm: a verdict row the pre-read did not see (existing=nil) makes
+// the append collide, and the re-read returns the winner's sequence and head.
+func TestRecordMergeOnPassVerdict_DuplicateOnAppendResumesWinner(t *testing.T) {
+	w := newMQMWorld(t)
+	r, _ := w.ready("dup", "h1", mcvUndelegatedSpecYAML)
+	winner := w.mqeAppend(r, CategoryMergeVerdictRecorded, map[string]any{"verdict": "raced", "delegated": false, "head_sha": "h0"})
+	seq, head, err := w.srv.recordMergeOnPassVerdict(context.Background(), w.runRow(r), w.active(r),
+		mergeQueueIntentRecord{Verdict: "ship it"}, "h1", nil)
+	if err != nil || seq != winner.Sequence || head != "h0" {
+		t.Fatalf("record = %d, %q, %v; want the winner %d at h0", seq, head, err, winner.Sequence)
+	}
+	if n := len(w.rows(r, CategoryMergeVerdictRecorded)); n != 1 {
+		t.Fatalf("verdict rows = %d, want the winner only", n)
+	}
+}
+
 func TestMergeQueueMergeOnPass_IntentRowSelectedByRecordedSequence(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("sq", "h1", mcvUndelegatedSpecYAML)
@@ -651,8 +677,9 @@ func TestMergeQueueMergeOnPass_AlreadyDispatchedNeverCallsForge(t *testing.T) {
 	}
 }
 
-// TestMergeQueueMergeOnPass_ForgeErrors pins the forge-refusal ladder; every
-// failed dispatch marks the claim dispatch_failed (never deletes it).
+// TestMergeQueueMergeOnPass_ForgeErrors pins the forge-refusal ladder and
+// ruling R1: a refusal that applied nothing (405/409/422) RELEASES the claim;
+// an uncertain failure marks it dispatch_failed (never deletes it).
 func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 	cases := []struct {
 		name         string
@@ -663,13 +690,16 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 		kind         mergeOnPassKind
 		reason       string
 		failed       int
+		released     int
 	}{
 		{name: "409 head mismatch readvances", err: fmt.Errorf("pinned: %w", forge.ErrMergeConflict),
-			kind: mergeOnPassReadvance, reason: mergeOnPassReasonForgeHeadMismatch, failed: 1},
+			kind: mergeOnPassReadvance, reason: mergeOnPassReasonForgeHeadMismatch, released: 1},
 		{name: "405 ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
-			kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, failed: 1},
+			kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, released: 1},
 		{name: "405 with dismissed approval ejects approval dismissed", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
-			reviews: mqeDismissed, state: "blocked", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeApprovalDismissed, failed: 1},
+			reviews: mqeDismissed, state: "blocked", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeApprovalDismissed, released: 1},
+		{name: "403 is uncertain and holds", err: fmt.Errorf("pinned: %w", forge.ErrForbidden),
+			kind: mergeOnPassHeld, reason: mergeOnPassReasonTransient, failed: 1},
 		{name: "transient error holds", err: errors.New("connection reset"),
 			kind: mergeOnPassHeld, reason: mergeOnPassReasonTransient, failed: 1},
 		{name: "transient error but observed merged", err: errors.New("timeout"), observeMerge: true,
@@ -702,11 +732,12 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 			if n := len(w.rows(r, CategoryMergeQueueMerged)); (n == 1) != (tc.kind == mergeOnPassMerged) {
 				t.Fatalf("merge_queue_merged rows = %d for outcome %s", n, tc.kind)
 			}
-			if len(w.ledger.failed) != tc.failed {
-				t.Fatalf("dispatch_failed marks = %v, want %d", w.ledger.failed, tc.failed)
+			if len(w.ledger.failed) != tc.failed || len(w.ledger.released) != tc.released {
+				t.Fatalf("dispatch_failed marks = %v (want %d), releases = %v (want %d)",
+					w.ledger.failed, tc.failed, w.ledger.released, tc.released)
 			}
-			if _, ok := w.ledger.claimed[r.id]; !ok {
-				t.Fatal("the dispatch claim was removed")
+			if _, ok := w.ledger.claimed[r.id]; ok != (tc.released == 0) {
+				t.Fatalf("claim present = %v, want %v", ok, tc.released == 0)
 			}
 		})
 	}

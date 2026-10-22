@@ -2971,6 +2971,10 @@ func (mcqGateLedgerStore) MarkMergeDispatchFailed(context.Context, uuid.UUID, st
 	return nil
 }
 
+func (mcqGateLedgerStore) ReleaseMergeDispatch(context.Context, mergequeue.DispatchClaim) error {
+	return nil
+}
+
 // TestMergeRun_MergeCandidate_HeldRefusedBeforeBehind pins the ADR-092 held arm
 // (#4200): a run whose queue entry is HELD — and whose PR is ALSO behind, the
 // expected shape for a held PR — is refused 409 merge_candidate_held naming its

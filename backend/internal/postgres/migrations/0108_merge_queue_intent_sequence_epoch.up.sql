@@ -17,10 +17,11 @@
 -- condition D1): at most ONE dispatch claim per run, DATABASE-enforced by the
 -- UNIQUE run_id constraint, taken by every merge dispatch path (queue
 -- merge-on-pass, the inline merge_run, the delegated may_merge arm) under the
--- run's merge-intent lock and BEFORE the forge is called. A failed dispatch
--- updates the claim to dispatch_failed; it is never deleted by Fishhawk. The
--- operator re-arm (mergequeue README § "Merge-dispatch ledger") is the only
--- path that removes a claim.
+-- run's merge-intent lock and BEFORE the forge is called. A forge refusal that
+-- applied nothing (checks pending, 405/409/422) deletes the exact claim (a
+-- compare-and-swap); any other failure updates it to dispatch_failed, which
+-- Fishhawk never deletes: only the operator re-arm (mergequeue README §
+-- "Merge-dispatch ledger") removes a dispatch_failed claim.
 --
 -- Additive: one nullable column, one defaulted column and a new table, so a
 -- reverted binary keeps processing rows that carry them.

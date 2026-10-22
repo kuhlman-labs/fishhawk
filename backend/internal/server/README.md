@@ -3030,12 +3030,16 @@ deadline): `backend/internal/mergequeue/README.md`.
   answers `already_merged`, never 409) and append `merge_queue_merged`; a
   failed append after the forge accepted still settles merged and logs at
   ERROR. `ErrMergeConflict` (409 head mismatch) → re-read: merged → merged,
-  else readvance, no `merge_queue_merged` row. 405 / 422 / 403 / 404 →
+  else readvance, no `merge_queue_merged` row. 405 / 422 →
   re-read: merged → merged, else a dismissed approval → eject
   `forge_approval_dismissed`, else eject `forge_merge_refused` naming the
   error (never retried in a loop). Any other error → re-read: merged →
-  merged, else hold. After a claim, a failed dispatch moves the claim to
-  `dispatch_failed`. A lock never taken → hold; a lapse after fn → WARN, its
+  merged, else hold. After a claim, a failed dispatch is classified once
+  (`classifyMergeDispatchOutcome`): 405 / 409 / 422 (and a checks_pending
+  refusal) RELEASE the claim (an exact-claim compare-and-swap DELETE), so
+  a re-advanced entry's next merge-on-pass claims again; anything else
+  (5xx, timeout, cancel, 403, 404) is uncertain → `dispatch_failed` and the
+  entry holds (mergequeue README § "Merge-dispatch ledger"). A lock never taken → hold; a lapse after fn → WARN, its
   writes stand.
 - **Outcomes the pump applies.** `merged` → continue; `settle` → `SettleAt`
   (epoch CAS; a conflict stops the pump); `readvance` → `Unadmit(epoch)`,
@@ -3059,9 +3063,15 @@ deadline): `backend/internal/mergequeue/README.md`.
   Delegated (`autodrive.go::delegatedMergeUnderLock`): owned, an unreadable
   queue, a lock not taken within `autoDriveMergeLockAcquireTimeout` (30s), an
   existing claim and a claim error are each observe-only with the merger
-  never called; a dispatch failure after the claim marks it `dispatch_failed`
-  and surfaces the error. A `dispatch_failed` claim is re-armed only by the
-  operator (mergequeue README § "Merge-dispatch ledger").
+  never called; a dispatch failure after the claim is classified (release or
+  `dispatch_failed`) and surfaces the error. Inline: a `merge_checks_pending`
+  refusal releases the claim, so the re-invoke once the checks pass claims
+  again. Every ledger write after the forge call runs on
+  `context.WithoutCancel` with a bounded timeout and appends
+  `merge_dispatch_settled`. A `dispatch_failed` claim is cleared only by
+  reconciliation (the PR reads merged) or the operator re-arm (mergequeue
+  README § "Merge-dispatch ledger"); the merge-queue read surfaces it on the
+  entry as `dispatch_claim`.
 - **D6 approval transfer.** With no live `approvals.members` approval and an
   intent anchor, the heads carrying the operator's approval are seeded from
   the intent row's `anchored_head_sha` and walked through later
@@ -3088,9 +3098,15 @@ deadline): `backend/internal/mergequeue/README.md`.
   wording; that edit is an operator follow-up.
 - **Operator note: a head moved after the final read.** GitHub refuses the
   pinned merge with 409 when the PR head no longer matches the verified SHA;
-  the entry re-advances and no `merge_queue_merged` row is written
-  (`TestMergeQueueMergeOnPass_ForgeErrors`). This is pinned by a fake-forge
-  test, not the live walk.
+  the dispatch claim is RELEASED (the forge applied nothing), the entry
+  re-advances and no `merge_queue_merged` row is written, and the next
+  merge-on-pass claims again and merges
+  (`TestMergeQueueMergeOnPass_ForgeErrors`,
+  `TestMergeQueueMergeOnPass_RealLedger_HeadMismatchThenMerges`). This is
+  pinned by fake-forge tests, not the live walk. A forge timeout or 5xx in
+  the same window is uncertain instead: the claim is `dispatch_failed`, the
+  head of line holds until the PR reads merged or the operator re-arms it,
+  and `dispatch_claim` on the merge-queue read names why.
 - **Residuals.** GitHub pins only the head: a base push between the locked
   re-probe and the merge call lands the merge on a base the pass did not
   see. An `inline_merge_dispatched` hold waits on the inline auto-merge; if

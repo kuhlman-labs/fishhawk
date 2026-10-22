@@ -735,15 +735,17 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// called: already_merged when the PR landed, else 409
 		// merge_already_dispatched. Without a wired queue there is no ledger
 		// and no queue dispatcher to race, so the dispatch proceeds unclaimed.
-		claimed, handled := s.claimInlineMergeDispatch(w, r, runID, runRow, prURL, subject, verdictSequence, alreadyRecorded, gate)
+		claim, claimed, handled := s.claimInlineMergeDispatch(w, r, runID, runRow, prURL, subject, verdictSequence, alreadyRecorded, gate)
 		if handled {
 			return nil
 		}
 
 		if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
 			rearm := ""
-			if claimed {
-				s.markInlineMergeDispatchFailed(r.Context(), runID, merr)
+			// Ruling R1: a checks_pending refusal or a forge 405/409/422
+			// RELEASES the claim (nothing was applied), so the re-invoke can
+			// claim again; any other outcome is uncertain: dispatch_failed.
+			if claimed && s.settleMergeDispatchClaim(r.Context(), mergeQueueDispatchLedger{s.cfg.MergeQueue}, claim, merr) == mergeDispatchUncertain {
 				rearm = mergeDispatchRearmNote
 			}
 			// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
@@ -1720,22 +1722,26 @@ func (s *Server) writeMergeQueueOwnsMerge(w http.ResponseWriter, r *http.Request
 		map[string]any{"run_id": runID.String(), "pr_url": prURL, "next_step": "fishhawk_get_merge_queue"})
 }
 
-// mergeDispatchRearmNote is appended to an inline dispatch failure after a
-// D1 claim: the claim is dispatch_failed, so a re-invoke is refused until
-// the operator re-arms it.
-const mergeDispatchRearmNote = " The run's merge-dispatch claim is now dispatch_failed (ADR-093 approval condition D1), so a re-invoke answers merge_already_dispatched until the operator re-arms the claim (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\")."
+// mergeDispatchRearmNote is appended to an inline dispatch failure whose
+// outcome was UNCERTAIN after a D1 claim: the claim is dispatch_failed, so a
+// re-invoke answers already_merged if the PR landed, else is refused until the
+// operator re-arms it. A released claim (checks_pending, 405/409/422) gets no
+// note: the re-invoke claims again.
+const mergeDispatchRearmNote = " The forge outcome is uncertain, so the run's merge-dispatch claim is now dispatch_failed (ADR-093 approval condition D1): a re-invoke answers already_merged if the pull request merged, else merge_already_dispatched until the operator re-arms the claim (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\")."
 
 // claimInlineMergeDispatch claims the run's ONE merge dispatch for the inline
 // path (approval condition D1), under the merge-intent lock and before the
-// forge. claimed=false with handled=false means no ledger is wired (no queue,
+// forge, returning the claim for the post-dispatch release / dispatch_failed
+// record. claimed=false with handled=false means no ledger is wired (no queue,
 // so no queue dispatcher to race): dispatch unclaimed. handled=true means the
-// response was written: already_merged when an existing claim's PR landed,
-// 409 merge_already_dispatched otherwise, or 503 merge_dispatch_unclaimed on
-// a claim error. The forge is never called on a handled answer.
+// response was written: already_merged when an existing claim's PR landed
+// (reconciliation, ruling R1), 409 merge_already_dispatched otherwise, or 503
+// merge_dispatch_unclaimed on a claim error. The forge is never called on a
+// handled answer.
 func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request, runID uuid.UUID, runRow *run.Run,
-	prURL, subject string, verdictSequence int64, alreadyRecorded bool, gate mergeCandidateGateResult) (claimed, handled bool) {
+	prURL, subject string, verdictSequence int64, alreadyRecorded bool, gate mergeCandidateGateResult) (claim mergequeue.DispatchClaim, claimed, handled bool) {
 	if s.cfg.MergeQueue == nil {
-		return false, false
+		return mergequeue.DispatchClaim{}, false, false
 	}
 	head := gate.HeadSHA
 	if head == "" {
@@ -1748,7 +1754,7 @@ func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request
 	}
 	existing, err := s.cfg.MergeQueue.ClaimMergeDispatch(r.Context(), runID, mergequeue.DispatchPathInline, head)
 	if err == nil {
-		return true, false
+		return existing, true, false
 	}
 	if !errors.Is(err, mergequeue.ErrAlreadyDispatched) {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge dispatch could not be claimed; not dispatching",
@@ -1756,29 +1762,23 @@ func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request
 		s.writeError(w, r, http.StatusServiceUnavailable, "merge_dispatch_unclaimed",
 			"the merge verdict is recorded and durable, but the run's merge dispatch could not be claimed on the merge-dispatch ledger, so nothing was dispatched (ADR-093 approval condition D1). Re-invoke the merge to retry.",
 			map[string]any{"run_id": runID.String(), "pr_url": prURL, "verdict_sequence": verdictSequence, "retryable": true})
-		return false, true
+		return mergequeue.DispatchClaim{}, false, true
 	}
 	if obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true); obs.Landed {
+		if existing.State == mergequeue.DispatchFailed {
+			s.appendMergeDispatchSettled(r.Context(), existing, mergeDispatchReconciledMerged, "the forge reports the pull request merged")
+		}
 		s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
-		return false, true
+		return mergequeue.DispatchClaim{}, false, true
 	}
-	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: merge already dispatched for this run; the forge was not called",
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge already dispatched for this run; the forge was not called",
 		slog.String("run_id", runID.String()), slog.String("claim_state", string(existing.State)),
-		slog.String("claim_path", existing.Path))
+		slog.String("claim_path", existing.Path), slog.String("failure_cause", existing.FailureCause))
 	s.writeError(w, r, http.StatusConflict, "merge_already_dispatched",
 		fmt.Sprintf("a merge dispatch is already claimed for this run (state %s, path %s, head %s), so the forge was not called again (ADR-093 approval condition D1). A dispatched merge settles through the forge: watch fishhawk_get_run_status. A dispatch_failed claim needs the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\") before a re-invoke.",
 			existing.State, existing.Path, existing.HeadSHA),
 		map[string]any{"run_id": runID.String(), "pr_url": prURL, "verdict_sequence": verdictSequence,
-			"claim_state": string(existing.State), "claim_path": existing.Path})
-	return false, true
-}
-
-// markInlineMergeDispatchFailed moves the inline claim to dispatch_failed,
-// best-effort: the claim stands either way, so nothing re-dispatches.
-func (s *Server) markInlineMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause error) {
-	if err := s.cfg.MergeQueue.MarkMergeDispatchFailed(ctx, runID, cause.Error()); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"merge: marking the inline merge dispatch failed did not land; the claim stands as dispatched",
-			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
-	}
+			"claim_state": string(existing.State), "claim_path": existing.Path, "claim_head_sha": existing.HeadSHA,
+			"claimed_at": existing.ClaimedAt, "failure_cause": existing.FailureCause})
+	return mergequeue.DispatchClaim{}, false, true
 }

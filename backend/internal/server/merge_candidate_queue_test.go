@@ -1334,6 +1334,22 @@ func (s *mcqFaultStore) MarkMergeDispatchFailed(ctx context.Context, runID uuid.
 	return s.Store.MarkMergeDispatchFailed(ctx, runID, cause)
 }
 
+func (s *mcqFaultStore) ReleaseMergeDispatch(ctx context.Context, claim mergequeue.DispatchClaim) error {
+	s.record(ctx, "ReleaseMergeDispatch", claim.RunID)
+	if s.Store == nil {
+		return errMCQNilStore
+	}
+	return s.Store.ReleaseMergeDispatch(ctx, claim)
+}
+
+func (s *mcqFaultStore) MergeDispatch(ctx context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error) {
+	s.record(ctx, "MergeDispatch", runID)
+	if s.Store == nil {
+		return mergequeue.DispatchClaim{}, false, errMCQNilStore
+	}
+	return s.Store.MergeDispatch(ctx, runID)
+}
+
 func (s *mcqFaultStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (mergequeue.Status, bool, error) {
 	s.record(ctx, "ActiveForRun", runID)
 	if s.activeForRun != nil {

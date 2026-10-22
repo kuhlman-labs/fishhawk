@@ -147,16 +147,20 @@ const (
 // claimed=false with a nil error (the forge is never called).
 type mergeQueueDispatchLedger struct{ q mergequeue.Store }
 
-func (l mergeQueueDispatchLedger) ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (bool, error) {
-	_, err := l.q.ClaimMergeDispatch(ctx, runID, path, headSHA)
+func (l mergeQueueDispatchLedger) ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (mergequeue.DispatchClaim, bool, error) {
+	c, err := l.q.ClaimMergeDispatch(ctx, runID, path, headSHA)
 	if errors.Is(err, mergequeue.ErrAlreadyDispatched) {
-		return false, nil
+		return c, false, nil
 	}
-	return err == nil, err
+	return c, err == nil, err
 }
 
 func (l mergeQueueDispatchLedger) MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error {
 	return l.q.MarkMergeDispatchFailed(ctx, runID, cause)
+}
+
+func (l mergeQueueDispatchLedger) ReleaseMergeDispatch(ctx context.Context, claim mergequeue.DispatchClaim) error {
+	return l.q.ReleaseMergeDispatch(ctx, claim)
 }
 
 // mergeDispatchLedger is the wired D1 ledger, nil when the queue is unwired

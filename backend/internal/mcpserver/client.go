@@ -4072,18 +4072,30 @@ type mergeQueueBase struct {
 
 // mergeQueueEntry mirrors mergeQueueEntryView: one active entry.
 type mergeQueueEntry struct {
-	RunID           string     `json:"run_id"`
-	EntryID         string     `json:"entry_id"`
-	State           string     `json:"state" jsonschema:"live (holds the line) or held (waiting)"`
-	Phase           string     `json:"phase,omitempty" jsonschema:"a live entry's progress; omitted while held"`
-	Position        int        `json:"position,omitempty" jsonschema:"the 1-based place among the base's held entries; omitted for the live entry"`
-	MergeIntent     bool       `json:"merge_intent" jsonschema:"whether fishhawk_merge_run recorded merge intent on the entry (ADR-093 D2); false for an entry the ADR-092 rebase path enqueued"`
-	MergeIntentAt   *time.Time `json:"merge_intent_at,omitempty"`
-	EnqueuedAt      time.Time  `json:"enqueued_at"`
-	AdmittedAt      *time.Time `json:"admitted_at,omitempty"`
-	AnchoredHeadSHA string     `json:"anchored_head_sha"`
-	AnchoredBaseSHA string     `json:"anchored_base_sha,omitempty"`
-	ETASeconds      *int64     `json:"eta_seconds,omitempty" jsonschema:"a held entry's estimated wait: position x the base's median line-turn time; omitted for the live entry and when the base has no merged history"`
+	RunID           string                   `json:"run_id"`
+	EntryID         string                   `json:"entry_id"`
+	State           string                   `json:"state" jsonschema:"live (holds the line) or held (waiting)"`
+	Phase           string                   `json:"phase,omitempty" jsonschema:"a live entry's progress; omitted while held"`
+	Position        int                      `json:"position,omitempty" jsonschema:"the 1-based place among the base's held entries; omitted for the live entry"`
+	MergeIntent     bool                     `json:"merge_intent" jsonschema:"whether fishhawk_merge_run recorded merge intent on the entry (ADR-093 D2); false for an entry the ADR-092 rebase path enqueued"`
+	MergeIntentAt   *time.Time               `json:"merge_intent_at,omitempty"`
+	EnqueuedAt      time.Time                `json:"enqueued_at"`
+	AdmittedAt      *time.Time               `json:"admitted_at,omitempty"`
+	AnchoredHeadSHA string                   `json:"anchored_head_sha"`
+	AnchoredBaseSHA string                   `json:"anchored_base_sha,omitempty"`
+	ETASeconds      *int64                   `json:"eta_seconds,omitempty" jsonschema:"a held entry's estimated wait: position x the base's median line-turn time; omitted for the live entry and when the base has no merged history"`
+	DispatchClaim   *mergeQueueDispatchClaim `json:"dispatch_claim,omitempty" jsonschema:"the run's merge-dispatch claim (ADR-093 D1); a dispatch_failed claim holds the entry until reconciliation or the operator re-arm; omitted with no claim"`
+}
+
+// mergeQueueDispatchClaim mirrors the server's mergeQueueDispatchClaimView.
+type mergeQueueDispatchClaim struct {
+	State      string     `json:"state" jsonschema:"dispatched or dispatch_failed"`
+	Path       string     `json:"path" jsonschema:"the claiming dispatch path: inline, delegated or queue"`
+	HeadSHA    string     `json:"head_sha"`
+	ClaimedAt  time.Time  `json:"claimed_at"`
+	AgeSeconds int64      `json:"age_seconds" jsonschema:"the claim's age at read time"`
+	FailedAt   *time.Time `json:"failed_at,omitempty"`
+	Reason     string     `json:"reason,omitempty" jsonschema:"a dispatch_failed claim's recorded forge failure"`
 }
 
 // mergeQueueHeadOfLine mirrors the server's mergeQueueHeadOfLine.

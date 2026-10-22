@@ -16,6 +16,7 @@ import (
 	"sync"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -31,16 +32,21 @@ import (
 // inline MergePullRequest (it models auto-merge: it never merges the PR).
 type mqeMerger struct {
 	*mqmMerger
-	mu        sync.Mutex
-	inlineErr error
-	inlineN   int
+	mu         sync.Mutex
+	inlineErr  error
+	inlineN    int
+	inlineHook func(ctx context.Context) error
 }
 
-func (m *mqeMerger) MergePullRequest(context.Context, *run.Run) error {
+func (m *mqeMerger) MergePullRequest(ctx context.Context, _ *run.Run) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.inlineN++
-	return m.inlineErr
+	err, hook := m.inlineErr, m.inlineHook
+	m.mu.Unlock()
+	if hook != nil {
+		return hook(ctx)
+	}
+	return err
 }
 
 func (m *mqeMerger) inlineCalls() int {
@@ -313,5 +319,78 @@ func TestMergeQueueE2E_ExistingClaimButMergedAnswersAlreadyMerged(t *testing.T) 
 	}
 	if m.inlineCalls() != 0 {
 		t.Fatalf("inline dispatches = %d, want 0", m.inlineCalls())
+	}
+}
+
+// Ruling R1 test 1 (concern c76a8132): a merge_checks_pending refusal applied
+// nothing, so it RELEASES the inline claim and the re-invoke, once the checks
+// pass, claims again and dispatches. Against the real postgres ledger.
+func TestMergeQueueE2E_InlineChecksPendingThenRetryMerges(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("cp", "h1")
+	m.mu.Lock()
+	m.inlineErr = fmt.Errorf("enable auto-merge: %w", forge.ErrPullRequestUnstableStatus)
+	m.mu.Unlock()
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusConflict || mqeCode(t, resp.Body.Bytes()) != "merge_checks_pending" {
+		t.Fatalf("first merge = %d %s, want 409 merge_checks_pending", resp.Code, resp.Body.String())
+	}
+	if strings.Contains(resp.Body.String(), "dispatch_failed") {
+		t.Fatalf("a checks_pending refusal must not name a dispatch_failed claim: %s", resp.Body.String())
+	}
+	if st, _ := w.claim(r); st != "" {
+		t.Fatalf("claim after checks_pending = %q, want released", st)
+	}
+	m.mu.Lock()
+	m.inlineErr = nil
+	m.mu.Unlock()
+	if resp := w.mergeRun(r); resp.Code != http.StatusOK {
+		t.Fatalf("retry merge = %d %s, want 200", resp.Code, resp.Body.String())
+	}
+	if m.inlineCalls() != 2 {
+		t.Fatalf("inline dispatches = %d, want 2 (refused, then dispatched)", m.inlineCalls())
+	}
+	if st, path := w.claim(r); st != string(mergequeue.DispatchDispatched) || path != mergequeue.DispatchPathInline {
+		t.Fatalf("claim after retry = %s/%s, want dispatched/inline", st, path)
+	}
+}
+
+// Ruling R1 test 3 (concern db4a28ac): a request cancelled mid-dispatch still
+// records dispatch_failed (the write runs on a non-cancellable context), so the
+// claim is never stranded as 'dispatched'; a re-invoke is refused (no
+// automatic redispatch) and the operator re-arm DELETE then admits one.
+func TestMergeQueueE2E_InlineCancelledRequestLeavesDispatchFailed(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("cx", "h1")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	m.mu.Lock()
+	m.inlineHook = func(c context.Context) error {
+		cancel()
+		<-c.Done()
+		return c.Err()
+	}
+	m.mu.Unlock()
+	raw, _ := json.Marshal(mergeRunRequest{Verdict: "ship it"})
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+r.id.String()+"/merge", bytes.NewReader(raw)).WithContext(ctx)
+	req.SetPathValue("run_id", r.id.String())
+	w.srv.handleMergeRun(httptest.NewRecorder(), withMergeOperator(req))
+	if st, path := w.claim(r); st != string(mergequeue.DispatchFailed) || path != mergequeue.DispatchPathInline {
+		t.Fatalf("claim after a cancelled dispatch = %q/%q, want dispatch_failed/inline", st, path)
+	}
+	m.mu.Lock()
+	m.inlineHook = nil
+	m.mu.Unlock()
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusConflict || mqeCode(t, resp.Body.Bytes()) != "merge_already_dispatched" {
+		t.Fatalf("re-invoke = %d %s, want 409 merge_already_dispatched", resp.Code, resp.Body.String())
+	}
+	if m.inlineCalls() != 1 {
+		t.Fatalf("inline dispatches = %d, want 1 (no automatic redispatch)", m.inlineCalls())
+	}
+	// The documented operator re-arm (mergequeue README).
+	w.exec(`DELETE FROM merge_dispatch_claims WHERE run_id = $1 AND state = 'dispatch_failed'`, r.id)
+	if resp := w.mergeRun(r); resp.Code != http.StatusOK {
+		t.Fatalf("merge after re-arm = %d %s, want 200", resp.Code, resp.Body.String())
 	}
 }

@@ -659,7 +659,14 @@ RETURNING `+claimCols, runID, path, headSHA))
 	if errors.As(err, &pgErr) {
 		switch pgErr.Code {
 		case "23505": // unique_violation: the D1 UNIQUE run_id
-			existing, _, _ := s.mergeDispatchFor(ctx, runID)
+			existing, found, rerr := s.mergeDispatchFor(ctx, runID)
+			if rerr != nil || !found {
+				// The claim exists but could not be read back: still
+				// ErrAlreadyDispatched (fail closed), with the run id and an
+				// explicit unknown state so no caller renders empty fields.
+				return DispatchClaim{RunID: runID, State: DispatchUnknown, Path: DispatchUnknownField, HeadSHA: DispatchUnknownField},
+					fmt.Errorf("run %s: %w (the existing claim could not be read: %v)", runID, ErrAlreadyDispatched, rerr)
+			}
 			return existing, fmt.Errorf("run %s: %w", runID, ErrAlreadyDispatched)
 		case "23503": // foreign_key_violation: no such run
 			return DispatchClaim{}, fmt.Errorf("run %s: %w", runID, ErrNotFound)
@@ -668,10 +675,11 @@ RETURNING `+claimCols, runID, path, headSHA))
 	return DispatchClaim{}, fmt.Errorf("mergequeue: claim merge dispatch: %w", err)
 }
 
-// MarkMergeDispatchFailed moves the run's dispatch claim to dispatch_failed,
-// recording cause and the database-clock instant. The claim is UPDATED, never
-// deleted, so a later dispatch is still refused until the operator re-arms it
-// (README.md § "Merge-dispatch ledger"). A repeat keeps the first failure. A
+// MarkMergeDispatchFailed moves the run's dispatch claim to dispatch_failed
+// for an UNCERTAIN forge outcome, recording cause and the database-clock
+// instant. The claim is UPDATED, never deleted, so a later dispatch is still
+// refused until reconciliation or the operator re-arm (README.md §
+// "Merge-dispatch ledger"). A repeat keeps the first failure. A
 // run with no claim is ErrNotFound.
 func (s *PostgresStore) MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error {
 	if runID == uuid.Nil {
@@ -689,6 +697,34 @@ WHERE run_id = $1`, runID, cause)
 		return fmt.Errorf("run %s has no merge dispatch claim: %w", runID, ErrNotFound)
 	}
 	return nil
+}
+
+// ReleaseMergeDispatch DELETEs the run's dispatch claim, a compare-and-swap
+// on the EXACT claim (run_id, state 'dispatched', path, head_sha and
+// claimed_at), for a forge outcome that guarantees nothing was applied
+// (README.md § "Merge-dispatch ledger": the release / uncertain split). A
+// claim that no longer matches, a dispatch_failed claim, or another holder's
+// claim is never deleted: ErrStateConflict. Call it under the run's
+// merge-intent lock.
+func (s *PostgresStore) ReleaseMergeDispatch(ctx context.Context, claim DispatchClaim) error {
+	if claim.RunID == uuid.Nil || claim.HeadSHA == "" || claim.ClaimedAt.IsZero() {
+		return fmt.Errorf("%w: run id, head sha and claimed_at are required", ErrInvalidRequest)
+	}
+	tag, err := s.pool.Exec(ctx, `DELETE FROM merge_dispatch_claims
+WHERE run_id = $1 AND state = 'dispatched' AND path = $2 AND head_sha = $3 AND claimed_at = $4`,
+		claim.RunID, claim.Path, claim.HeadSHA, claim.ClaimedAt)
+	if err != nil {
+		return fmt.Errorf("mergequeue: release merge dispatch: %w", err)
+	}
+	if tag.RowsAffected() == 0 {
+		return fmt.Errorf("run %s: the dispatch claim no longer matches the one released: %w", claim.RunID, ErrStateConflict)
+	}
+	return nil
+}
+
+// MergeDispatch reads the run's dispatch claim; found=false when it has none.
+func (s *PostgresStore) MergeDispatch(ctx context.Context, runID uuid.UUID) (DispatchClaim, bool, error) {
+	return s.mergeDispatchFor(ctx, runID)
 }
 
 const claimCols = `run_id, state, path, head_sha, claimed_at, failed_at, COALESCE(failure_cause, '')`

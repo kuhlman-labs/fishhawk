@@ -180,12 +180,43 @@ change nothing (ADR-093 slice 2, rejection item 1):
   dispatch path (queue merge-on-pass, the inline `merge_run`, the delegated
   `may_merge` arm) calls it under `WithMergeIntentLock` and BEFORE the forge;
   `ErrAlreadyDispatched` means the forge is never called.
-- **`MarkMergeDispatchFailed(runID, cause)`**: a dispatch that failed after
-  its claim moves the claim to `dispatch_failed` (first cause and time kept).
-  The claim is UPDATED, never deleted, so nothing re-dispatches on its own.
-- **Operator re-arm** (operator-only; no HTTP route, MCP tool or Fishhawk
-  code path deletes a claim): after resolving the forge refusal, the operator
-  removes the failed claim with
+- **After a claim, the forge outcome is classified ONCE**
+  (`server.classifyMergeDispatchOutcome`, first-officer ruling R1), the same
+  on all three paths:
+  - **Release** (the forge guarantees nothing was applied): our own pre-call
+    `checks_pending` refusal (`forge.ErrPullRequestUnstableStatus`) and a
+    merge PUT 405 (not mergeable), 409 (head-SHA mismatch,
+    `forge.ErrMergeConflict`) or 422. **`ReleaseMergeDispatch(claim)`**
+    DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,
+    `state = 'dispatched'`, `path`, `head_sha`, `claimed_at`); a claim that
+    no longer matches is `ErrStateConflict` and is never deleted, so a
+    release cannot remove another holder's claim. A later dispatch (the
+    `merge_checks_pending` re-invoke, a re-advanced entry's next
+    merge-on-pass) claims again.
+  - **Uncertain** (everything else: 5xx, timeout, transport error, context
+    cancel, 403 that may be a rate limit, 404):
+    **`MarkMergeDispatchFailed(runID, cause)`** moves the claim to
+    `dispatch_failed` (first cause and time kept). It is UPDATED, never
+    deleted, so nothing re-dispatches on its own.
+  - The ledger write runs on `context.WithoutCancel` with a bounded timeout,
+    so a cancelled request cannot strand a `dispatched` claim; a release
+    that does not land is recorded as `dispatch_failed` instead. Each
+    outcome appends a `merge_dispatch_settled` audit row (`outcome`
+    `released` | `dispatch_failed`, `path`, `head_sha`, `reason`); an
+    uncertain one also logs at WARN.
+- **Reconciliation before a re-arm.** The next merge-on-pass or `merge_run`
+  touching a run with a claim re-reads the PR: merged → the entry settles
+  merged (`pr_merged`) or the inline answer is `already_merged` (a
+  `dispatch_failed` claim also appends `merge_dispatch_settled`
+  `reconciled_merged`). Unmerged → the claim stands: merge-on-pass holds
+  `merge_already_dispatched` (WARN), the inline answer is
+  `409 merge_already_dispatched` naming the claim, and the merge-queue read
+  surfaces it on the entry (`dispatch_claim`: state, path, head, age,
+  reason).
+- **Operator re-arm** (operator-only, and only for an UNCERTAIN outcome; no
+  HTTP route, MCP tool or Fishhawk code path deletes a `dispatch_failed`
+  claim): after confirming on the forge that the PR did not merge and
+  resolving the cause, the operator removes the failed claim with
   `DELETE FROM merge_dispatch_claims WHERE run_id = '<run id>' AND state = 'dispatch_failed';`
   against fishhawkd's database, then re-invokes `fishhawk_merge_run`. A
   `dispatched` claim is never re-armed: its merge was handed to the forge.

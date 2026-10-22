@@ -494,7 +494,7 @@ const (
 	autoDriveNoteQueueOwnsMerge    = "the merge queue owns this run's merge (ADR-093 D3): its entry carries the operator's merge intent and the queue merges it pinned to the verified head on its green pass; the delegated arm never dispatches it; observe-only"
 	autoDriveNoteQueueUnreadable   = "merge-queue ownership could not be read (fail-closed); observe-only"
 	autoDriveNoteLockUnavailable   = "the run's merge-intent lock could not be taken (fail-closed); observe-only"
-	autoDriveNoteAlreadyClaimed    = "a merge dispatch is already claimed for this run on the merge-dispatch ledger (ADR-093 D1), so the forge was not called; a dispatch_failed claim needs the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); observe-only"
+	autoDriveNoteAlreadyClaimed    = "a merge dispatch is already claimed for this run on the merge-dispatch ledger (ADR-093 D1), so the forge was not called; a dispatch_failed claim needs reconciliation (the PR reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); observe-only"
 	autoDriveNoteDispatchUnclaimed = "the run's merge dispatch could not be claimed on the merge-dispatch ledger (ADR-093 D1, fail-closed); observe-only"
 )
 
@@ -641,8 +641,10 @@ const (
 // the inline merge_run's or an earlier delegated dispatch, dispatched or
 // dispatch_failed) is mergeDispatchAlreadyClaimed and a claim error is
 // mergeDispatchUnclaimed: the merger is never called on either. A dispatch
-// that fails after the claim moves the claim to dispatch_failed, never deleted,
-// so a retry needs the operator re-arm. Without a wired queue there is no
+// that fails after the claim is classified once (classifyMergeDispatchOutcome):
+// a refusal that applied nothing releases the claim, anything else moves it to
+// dispatch_failed, which only reconciliation or the operator re-arm clears.
+// Without a wired queue there is no
 // ledger and no queue dispatcher to race, so the dispatch proceeds unclaimed.
 //
 // liveHead is the head mergeCandidateGate admitted (mergeCandidateGateResult.
@@ -692,27 +694,32 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	_, _ = s.republishAuditCheckBeforeMergeAtHead(ctx, runRow.ID, liveHead)
 	ledger := s.mergeDispatchLedger()
 	claimed := false
+	var claim mergequeue.DispatchClaim
 	if ledger != nil {
 		claimHead := liveHead
 		if claimHead == "" {
 			claimHead = "unresolved"
 		}
 		var cerr error
-		claimed, cerr = ledger.ClaimMergeDispatch(ctx, runRow.ID, mergequeue.DispatchPathDelegated, claimHead)
+		claim, claimed, cerr = ledger.ClaimMergeDispatch(ctx, runRow.ID, mergequeue.DispatchPathDelegated, claimHead)
 		if cerr != nil {
 			return mergeDispatchUnclaimed, gateState, cerr
 		}
 		if !claimed { // ADR-093 D1: a merge dispatch is already claimed; never call the forge
+			if claim.State == mergequeue.DispatchFailed {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"auto-drive: the run's merge dispatch is dispatch_failed; observe-only until reconciliation or the operator re-arm",
+					slog.String("run_id", runRow.ID.String()), slog.String("claim_path", claim.Path),
+					slog.String("failure_cause", claim.FailureCause))
+			}
 			return mergeDispatchAlreadyClaimed, gateState, nil
 		}
 	}
 	merr := merger.MergePullRequest(ctx, runRow)
 	if merr != nil && claimed {
-		if err := ledger.MarkMergeDispatchFailed(ctx, runRow.ID, merr.Error()); err != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"auto-drive: marking the delegated merge dispatch failed did not land; the claim stands as dispatched",
-				slog.String("run_id", runRow.ID.String()), slog.String("error", err.Error()))
-		}
+		// Ruling R1: release when the forge applied nothing, else
+		// dispatch_failed; recorded on a non-cancellable bounded context.
+		s.settleMergeDispatchClaim(ctx, ledger, claim, merr)
 	}
 	return mergeDispatchMerged, gateState, merr
 }

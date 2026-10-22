@@ -3,7 +3,9 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
@@ -311,17 +314,46 @@ func TestMergeQueueDispatchLedger_Adapter(t *testing.T) {
 	r := w.seed("led", "h1", []byte(mcvUndelegatedSpecYAML))
 	l := w.srv.mergeDispatchLedger()
 	ctx := context.Background()
-	if ok, err := l.ClaimMergeDispatch(ctx, r.id, mergeDispatchPathQueue, "h1"); !ok || err != nil {
+	first, ok, err := l.ClaimMergeDispatch(ctx, r.id, mergeDispatchPathQueue, "h1")
+	if !ok || err != nil {
 		t.Fatalf("first claim = %v, %v; want claimed", ok, err)
 	}
-	if ok, err := l.ClaimMergeDispatch(ctx, r.id, mergeDispatchPathQueue, "h1"); ok || err != nil {
-		t.Fatalf("second claim = %v, %v; want false, nil (already dispatched)", ok, err)
+	if existing, ok, err := l.ClaimMergeDispatch(ctx, r.id, mergeDispatchPathQueue, "h1"); ok || err != nil || existing.Path != mergeDispatchPathQueue {
+		t.Fatalf("second claim = %+v, %v, %v; want the existing claim, false, nil (already dispatched)", existing, ok, err)
 	}
-	if ok, err := l.ClaimMergeDispatch(ctx, r.id, "bogus", "h1"); ok || !errors.Is(err, mergequeue.ErrInvalidRequest) {
+	if _, ok, err := l.ClaimMergeDispatch(ctx, r.id, "bogus", "h1"); ok || !errors.Is(err, mergequeue.ErrInvalidRequest) {
 		t.Fatalf("bad-path claim = %v, %v; want ErrInvalidRequest", ok, err)
 	}
 	if err := l.MarkMergeDispatchFailed(ctx, r.id, "boom"); err != nil {
 		t.Fatalf("mark failed: %v", err)
+	}
+	// Ruling R1 test 6: a release is a CAS on the exact dispatched claim, so
+	// it never deletes a dispatch_failed claim or another holder's claim.
+	if err := l.ReleaseMergeDispatch(ctx, first); !errors.Is(err, mergequeue.ErrStateConflict) {
+		t.Fatalf("release of a dispatch_failed claim = %v, want ErrStateConflict", err)
+	}
+	other := w.seed("led2", "h2", []byte(mcvUndelegatedSpecYAML))
+	mine, _, err := l.ClaimMergeDispatch(ctx, other.id, mergequeue.DispatchPathInline, "h2")
+	if err != nil {
+		t.Fatalf("claim other: %v", err)
+	}
+	for name, stale := range map[string]mergequeue.DispatchClaim{
+		"other head":       {RunID: other.id, State: mine.State, Path: mine.Path, HeadSHA: "h9", ClaimedAt: mine.ClaimedAt},
+		"other path":       {RunID: other.id, State: mine.State, Path: mergeDispatchPathQueue, HeadSHA: mine.HeadSHA, ClaimedAt: mine.ClaimedAt},
+		"other claimed_at": {RunID: other.id, State: mine.State, Path: mine.Path, HeadSHA: mine.HeadSHA, ClaimedAt: mine.ClaimedAt.Add(-time.Second)},
+	} {
+		if err := l.ReleaseMergeDispatch(ctx, stale); !errors.Is(err, mergequeue.ErrStateConflict) {
+			t.Fatalf("release with %s = %v, want ErrStateConflict", name, err)
+		}
+	}
+	if c, found, err := w.store.MergeDispatch(ctx, other.id); err != nil || !found || c.State != mergequeue.DispatchDispatched {
+		t.Fatalf("other's claim after stale releases = %+v found=%v err=%v; want it intact", c, found, err)
+	}
+	if err := l.ReleaseMergeDispatch(ctx, mine); err != nil {
+		t.Fatalf("release of the exact claim: %v", err)
+	}
+	if _, found, err := w.store.MergeDispatch(ctx, other.id); err != nil || found {
+		t.Fatalf("claim after its exact release: found=%v err=%v; want deleted", found, err)
 	}
 	if (&Server{}).mergeDispatchLedger() != nil {
 		t.Fatal("an unwired queue must yield a nil ledger")
@@ -354,6 +386,8 @@ func TestMCQFaultStore_NilEmbeddedReturnsNamedError(t *testing.T) {
 			return err
 		},
 		"MarkMergeDispatchFailed": func() error { return fs.MarkMergeDispatchFailed(ctx, id, "x") },
+		"ReleaseMergeDispatch":    func() error { return fs.ReleaseMergeDispatch(ctx, mergequeue.DispatchClaim{RunID: id}) },
+		"MergeDispatch":           func() error { _, _, err := fs.MergeDispatch(ctx, id); return err },
 	} {
 		if err := call(); !errors.Is(err, errMCQNilStore) {
 			t.Errorf("%s err = %v, want errMCQNilStore", name, err)
@@ -396,5 +430,132 @@ func TestMCQGitHub_PinnedPutMergesAndMovesBase(t *testing.T) {
 	f.gh.mu.Unlock()
 	if !merged || behindB != 1 {
 		t.Fatalf("after the merge: a merged=%v, b behind=%d; want true, 1 (the base moved)", merged, behindB)
+	}
+}
+
+// realLedger rewires the world onto the REAL postgres D1 ledger.
+func (w *mqmWorld) realLedger(req mergeOnPassRequest) mergeOnPassRequest {
+	req.Ledger = w.srv.mergeDispatchLedger()
+	return req
+}
+
+func (w *mqmWorld) requireClaim(r *mcqRun, want mergequeue.DispatchState) {
+	w.t.Helper()
+	c, found, err := w.store.MergeDispatch(context.Background(), r.id)
+	if err != nil {
+		w.t.Fatalf("read claim: %v", err)
+	}
+	if want == "" {
+		if found {
+			w.t.Fatalf("claim = %+v, want none (released)", c)
+		}
+		return
+	}
+	if !found || c.State != want {
+		w.t.Fatalf("claim = %+v found=%v, want state %s", c, found, want)
+	}
+}
+
+func (w *mqmWorld) settledOutcomes(r *mcqRun) []any {
+	var out []any
+	for _, row := range w.rows(r, categoryMergeDispatchSettled) {
+		out = append(out, w.payload(row)["outcome"])
+	}
+	return out
+}
+
+// Ruling R1 test 2: a pinned-merge 409 head mismatch releases the claim, so
+// the re-advanced entry's next merge-on-pass claims again and merges.
+func TestMergeQueueMergeOnPass_RealLedger_HeadMismatchThenMerges(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("rl409", "h1", mcvUndelegatedSpecYAML)
+	req = w.realLedger(req)
+	w.merger.err = fmt.Errorf("pinned: %w", forge.ErrMergeConflict)
+	requireOutcome(t, w.decide(req), mergeOnPassReadvance, mergeOnPassReasonForgeHeadMismatch)
+	w.requireClaim(r, "")
+	if got := w.settledOutcomes(r); len(got) != 1 || got[0] != string(mergeDispatchRelease) {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want [released]", got)
+	}
+	w.merger.err = nil
+	w.exec(`UPDATE merge_candidate_queue_entries SET phase = 'passed' WHERE run_id = $1 AND state = 'live'`, r.id)
+	req.Entry = w.active(r)
+	requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	w.requireMerges(2)
+}
+
+// Ruling R1 tests 4 and 5: a 5xx is uncertain (dispatch_failed); the next
+// merge-on-pass holds already-dispatched while the PR is unmerged, then
+// settles merged by reconciliation once the forge reports it merged.
+func TestMergeQueueMergeOnPass_RealLedger_UncertainThenReconciles(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("rl5xx", "h1", mcvUndelegatedSpecYAML)
+	req = w.realLedger(req)
+	w.merger.err = errors.New("github: 502 bad gateway")
+	requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonTransient)
+	w.requireClaim(r, mergequeue.DispatchFailed)
+	if got := w.settledOutcomes(r); len(got) != 1 || got[0] != string(mergeDispatchUncertain) {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want [dispatch_failed]", got)
+	}
+	w.merger.err = nil
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonAlreadyDispatched)
+	if !strings.Contains(out.Detail, string(mergequeue.DispatchFailed)) {
+		t.Fatalf("held detail %q does not surface the dispatch_failed claim", out.Detail)
+	}
+	w.requireMerges(1)
+	w.requireClaim(r, mergequeue.DispatchFailed)
+	n := parsePRNumberFromURL(w.runRow(r).PullRequestURL)
+	w.gh.set(func() { w.gh.prs[n].merged, w.gh.prs[n].state = true, "closed" })
+	requireOutcome(t, w.decide(req), mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
+	w.requireMerges(1)
+}
+
+// Ruling R1 test 3: a dispatch whose context is cancelled mid-call records
+// dispatch_failed on a non-cancellable context, never leaving 'dispatched'.
+func TestMergeQueueMergeOnPass_RealLedger_CancelledCtxLeavesDispatchFailed(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("rlctx", "h1", mcvUndelegatedSpecYAML)
+	req = w.realLedger(req)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	w.srv.cfg.GateMerger = mqmCancelMerger{w.merger, cancel}
+	_ = w.srv.mergeQueueMergeOnPass(ctx, req)
+	w.requireClaim(r, mergequeue.DispatchFailed)
+}
+
+// mqmCancelMerger cancels the caller's context, then fails with its error.
+type mqmCancelMerger struct {
+	*mqmMerger
+	cancel context.CancelFunc
+}
+
+func (m mqmCancelMerger) MergePullRequestAtHead(ctx context.Context, _ *run.Run, _ string) error {
+	m.cancel()
+	<-ctx.Done()
+	return ctx.Err()
+}
+
+// Ruling R1 test 7: the one classification of a failed post-claim dispatch.
+func TestClassifyMergeDispatchOutcome(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		err  error
+		want mergeDispatchLedgerOutcome
+	}{
+		{"checks pending (our pre-call refusal)", fmt.Errorf("x: %w", forge.ErrPullRequestUnstableStatus), mergeDispatchRelease},
+		{"405 not mergeable", fmt.Errorf("x: %w", forge.ErrPullRequestNotMergeable), mergeDispatchRelease},
+		{"409 head mismatch", fmt.Errorf("x: %w", forge.ErrMergeConflict), mergeDispatchRelease},
+		{"422 validation", fmt.Errorf("x: %w", forge.ErrValidation), mergeDispatchRelease},
+		{"403 may be a rate limit", fmt.Errorf("x: %w", forge.ErrForbidden), mergeDispatchUncertain},
+		{"404", fmt.Errorf("x: %w", forge.ErrNotFound), mergeDispatchUncertain},
+		{"5xx / transport", errors.New("502 bad gateway"), mergeDispatchUncertain},
+		{"timeout", fmt.Errorf("x: %w", context.DeadlineExceeded), mergeDispatchUncertain},
+		{"cancel", fmt.Errorf("x: %w", context.Canceled), mergeDispatchUncertain},
+		{"cancel wrapping a 409", fmt.Errorf("%w: %w", context.Canceled, forge.ErrMergeConflict), mergeDispatchUncertain},
+		{"nil", nil, mergeDispatchUncertain},
+	} {
+		if got := classifyMergeDispatchOutcome(tc.err); got != tc.want {
+			t.Errorf("%s: classify = %s, want %s", tc.name, got, tc.want)
+		}
 	}
 }

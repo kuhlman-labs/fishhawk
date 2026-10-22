@@ -203,6 +203,35 @@ func TestMergeQueueRead_ETAOmittedWithoutHistory(t *testing.T) {
 	}
 }
 
+// TestMergeQueueRead_DispatchClaimSurfaced (ruling R2): a run's merge-dispatch
+// claim is on its entry (state, path, head, age and the dispatch_failed
+// reason), so a dispatch_failed claim holding the line is visible; an entry
+// with no claim carries no dispatch_claim key.
+func TestMergeQueueRead_DispatchClaimSurfaced(t *testing.T) {
+	f := newMCQFixture(t)
+	a, _ := f.wave()
+	ctx := context.Background()
+	if _, err := f.store.ClaimMergeDispatch(ctx, a.id, mergequeue.DispatchPathQueue, "a1"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	if err := f.store.MarkMergeDispatchFailed(ctx, a.id, "github: 502 bad gateway"); err != nil {
+		t.Fatalf("mark failed: %v", err)
+	}
+	w := getMergeQueue(t, f.srv, "", mqrOperator(""))
+	resp := decodeMergeQueue(t, w)
+	if len(resp.Bases) != 1 || len(resp.Bases[0].Entries) != 2 {
+		t.Fatalf("bases = %+v, want one base with A and B", resp.Bases)
+	}
+	c := resp.Bases[0].Entries[0].DispatchClaim
+	if c == nil || c.State != string(mergequeue.DispatchFailed) || c.Path != mergequeue.DispatchPathQueue ||
+		c.HeadSHA != "a1" || c.Reason != "github: 502 bad gateway" || c.FailedAt == nil || c.ClaimedAt.IsZero() || c.AgeSeconds < 0 {
+		t.Fatalf("A dispatch_claim = %+v, want dispatch_failed/queue/a1 with the reason", c)
+	}
+	if resp.Bases[0].Entries[1].DispatchClaim != nil || strings.Count(w.Body.String(), `"dispatch_claim"`) != 1 {
+		t.Fatalf("B must carry no dispatch_claim:\n%s", w.Body.String())
+	}
+}
+
 // TestMedianLineTurnSeconds pins the median: odd and even counts (mean of the
 // middle two), rounding to the second, input order, and no samples.
 func TestMedianLineTurnSeconds(t *testing.T) {
@@ -354,7 +383,14 @@ func TestMergeQueueRead_RepoForbidden(t *testing.T) {
 // mqrFaultStore wraps the real store and fails the named read.
 type mqrFaultStore struct {
 	mergequeue.Store
-	failBases, failList, failTurns bool
+	failBases, failList, failTurns, failClaim bool
+}
+
+func (s *mqrFaultStore) MergeDispatch(ctx context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error) {
+	if s.failClaim {
+		return mergequeue.DispatchClaim{}, false, errMCQStore
+	}
+	return s.Store.MergeDispatch(ctx, runID)
 }
 
 func (s *mqrFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, error) {
@@ -392,6 +428,7 @@ func TestMergeQueueRead_StoreErrorsFailClosed(t *testing.T) {
 		{"list for base", "", &mqrFaultStore{Store: f.store, failList: true}},
 		{"list for a named base", "base_ref=" + mcqBase, &mqrFaultStore{Store: f.store, failList: true}},
 		{"line turns", "", &mqrFaultStore{Store: f.store, failTurns: true}},
+		{"dispatch claim", "", &mqrFaultStore{Store: f.store, failClaim: true}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f.srv.cfg.MergeQueue = tc.store

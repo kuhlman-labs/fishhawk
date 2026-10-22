@@ -64,13 +64,119 @@ const mergeDispatchPathQueue = "queue"
 // ClaimMergeDispatch claims the run's dispatch under the caller's merge-intent
 // lock and BEFORE any forge merge call: claimed=false with a nil error is the
 // store's ErrAlreadyDispatched (a claim already exists, dispatched or
-// dispatch_failed), and the forge must then never be called. Any error is a
-// failed claim: nothing is dispatched. MarkMergeDispatchFailed records a forge
-// dispatch that failed AFTER a claim; the claim is updated, never deleted, so
-// a retry needs the operator's explicit re-arm.
+// dispatch_failed; the returned claim is that existing one), and the forge
+// must then never be called. Any error is a failed claim: nothing is
+// dispatched. After a claim the forge outcome is classified ONCE
+// (classifyMergeDispatchOutcome): a RELEASE outcome (the forge applied
+// nothing) deletes the exact claim via ReleaseMergeDispatch, a compare-and-
+// swap; an UNCERTAIN one moves it to dispatch_failed (MarkMergeDispatchFailed),
+// never deleted, so only reconciliation or the operator re-arm clears it.
 type mergeDispatchLedger interface {
-	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (claimed bool, err error)
+	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (claim mergequeue.DispatchClaim, claimed bool, err error)
 	MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error
+	ReleaseMergeDispatch(ctx context.Context, claim mergequeue.DispatchClaim) error
+}
+
+// mergeDispatchLedgerOutcome classifies a failed forge dispatch made after a D1
+// claim (first-officer ruling R1).
+type mergeDispatchLedgerOutcome string
+
+const (
+	// mergeDispatchRelease: the forge guarantees nothing was applied (our own
+	// pre-call checks_pending refusal, a merge PUT 405 / 409 / 422), so the
+	// claim is released and a later dispatch may claim again.
+	mergeDispatchRelease mergeDispatchLedgerOutcome = "released"
+	// mergeDispatchUncertain: the merge may have been applied (5xx, timeout,
+	// transport error, ctx cancel, 403 that may be a rate limit, anything
+	// else), so the claim moves to dispatch_failed.
+	mergeDispatchUncertain mergeDispatchLedgerOutcome = "dispatch_failed"
+)
+
+// classifyMergeDispatchOutcome is the ONE classification of a failed forge
+// dispatch after a claim, shared by the inline, delegated and queue paths.
+func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
+	switch {
+	case err == nil:
+		return mergeDispatchUncertain
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return mergeDispatchUncertain
+	case errors.Is(err, forge.ErrPullRequestUnstableStatus),
+		errors.Is(err, forge.ErrPullRequestNotMergeable),
+		errors.Is(err, forge.ErrMergeConflict),
+		errors.Is(err, forge.ErrValidation):
+		return mergeDispatchRelease
+	}
+	return mergeDispatchUncertain
+}
+
+// categoryMergeDispatchSettled records what became of a D1 dispatch claim
+// after a failed forge dispatch, or on reconciliation: outcome released,
+// dispatch_failed or reconciled_merged, with the path, head and reason.
+const categoryMergeDispatchSettled = "merge_dispatch_settled"
+
+// Reconciliation outcome on merge_dispatch_settled: a dispatch_failed claim
+// whose PR the forge reports merged.
+const mergeDispatchReconciledMerged = "reconciled_merged"
+
+// mergeDispatchRecordTimeout bounds the post-dispatch ledger write, which
+// runs on context.WithoutCancel so a cancelled request or an expired parent
+// cannot strand a 'dispatched' claim.
+const mergeDispatchRecordTimeout = 10 * time.Second
+
+// settleMergeDispatchClaim classifies a failed forge dispatch after claim and
+// records it on the ledger: release (a compare-and-swap DELETE of the exact
+// claim) or dispatch_failed. The write runs on context.WithoutCancel(ctx) with
+// mergeDispatchRecordTimeout, then an audit row (categoryMergeDispatchSettled)
+// is appended best-effort; an uncertain outcome logs at WARN. A release that
+// did not land is reported as uncertain: the claim was not deleted.
+func (s *Server) settleMergeDispatchClaim(ctx context.Context, ledger mergeDispatchLedger, claim mergequeue.DispatchClaim, cause error) mergeDispatchLedgerOutcome {
+	outcome := classifyMergeDispatchOutcome(cause)
+	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeDispatchRecordTimeout)
+	defer cancel()
+	if outcome == mergeDispatchRelease {
+		if err := ledger.ReleaseMergeDispatch(wctx, claim); err != nil {
+			s.cfg.Logger.LogAttrs(wctx, slog.LevelWarn,
+				"merge dispatch: releasing the claim did not land; marking it dispatch_failed instead",
+				slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
+			outcome = mergeDispatchUncertain
+		}
+	}
+	if outcome == mergeDispatchUncertain {
+		if err := ledger.MarkMergeDispatchFailed(wctx, claim.RunID, cause.Error()); err != nil {
+			s.cfg.Logger.LogAttrs(wctx, slog.LevelError,
+				"merge dispatch: marking the claim dispatch_failed did not land; the claim stands as dispatched",
+				slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
+		}
+		s.cfg.Logger.LogAttrs(wctx, slog.LevelWarn,
+			"merge dispatch: the forge outcome is uncertain; the claim is dispatch_failed and a re-dispatch needs reconciliation or the operator re-arm",
+			slog.String("run_id", claim.RunID.String()), slog.String("path", claim.Path),
+			slog.String("head_sha", claim.HeadSHA), slog.String("error", cause.Error()))
+	}
+	s.appendMergeDispatchSettled(wctx, claim, string(outcome), cause.Error())
+	return outcome
+}
+
+// appendMergeDispatchSettled appends the categoryMergeDispatchSettled row,
+// best-effort (the ledger write is the authority).
+func (s *Server) appendMergeDispatchSettled(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload, _ := json.Marshal(map[string]any{
+		"outcome": outcome, "path": claim.Path, "head_sha": claim.HeadSHA, "reason": reason,
+	})
+	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
+	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        claim.RunID,
+		Timestamp:    time.Now().UTC(),
+		Category:     categoryMergeDispatchSettled,
+		ActorKind:    &kind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge dispatch: the merge_dispatch_settled row did not land",
+			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
+	}
 }
 
 // mergeOnPassRequest is one merge-on-pass decision: the entry as the pump
@@ -507,39 +613,49 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	if req.Ledger == nil {
 		return held(mergeOnPassReasonLedgerUnavailable, "no merge-dispatch ledger is wired, so no dispatch can be claimed")
 	}
-	claimed, err := req.Ledger.ClaimMergeDispatch(ctx, e.RunID, mergeDispatchPathQueue, head)
+	merged := func(observed bool) mergeOnPassOutcome {
+		return s.mergeOnPassMerged(ctx, e, head, basis, verdictSeq, verdictHead, intentSeq, observed)
+	}
+	observedMerged := func() bool {
+		p, rerr := s.mergeOnPassReadPR(ctx, target)
+		return rerr == nil && p.Merged
+	}
+	claim, claimed, err := req.Ledger.ClaimMergeDispatch(ctx, e.RunID, mergeDispatchPathQueue, head)
 	if err != nil {
 		return held(mergeOnPassReasonTransient, "the merge dispatch could not be claimed: "+err.Error())
 	}
 	if !claimed {
+		// Reconciliation (ruling R1) is the pre-lock and in-lock PR reads
+		// above: a PR the forge reports merged settles pr_merged before the
+		// claim. Reaching here, the PR is unmerged: hold and surface it.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge queue: a merge dispatch is already claimed for this run; the forge was not called",
+			slog.String("run_id", e.RunID.String()), slog.String("claim_state", string(claim.State)),
+			slog.String("claim_path", claim.Path), slog.String("claim_head_sha", claim.HeadSHA),
+			slog.String("failure_cause", claim.FailureCause))
 		return held(mergeOnPassReasonAlreadyDispatched,
-			"a merge dispatch is already claimed for this run (dispatched, or dispatch_failed awaiting the operator's re-arm); the forge was not called")
+			"a merge dispatch is already claimed for this run (state "+string(claim.State)+", path "+claim.Path+
+				"; dispatch_failed awaits reconciliation or the operator's re-arm); the forge was not called")
 	}
 
 	// 10. The pinned merge.
 	mctx, mcancel := context.WithTimeout(ctx, mergeOnPassMergeCallTimeout)
 	mergeErr := merger.MergePullRequestAtHead(mctx, runRow, head)
 	mcancel()
-	merged := func(observed bool) mergeOnPassOutcome {
-		return s.mergeOnPassMerged(ctx, e, head, basis, verdictSeq, verdictHead, intentSeq, observed)
-	}
 	if mergeErr == nil {
 		return merged(false)
-	}
-	observedMerged := func() bool {
-		p, rerr := s.mergeOnPassReadPR(ctx, target)
-		return rerr == nil && p.Merged
 	}
 	if observedMerged() {
 		return merged(true)
 	}
-	s.markMergeOnPassDispatchFailed(ctx, req.Ledger, e.RunID, mergeErr)
+	if s.settleMergeDispatchClaim(ctx, req.Ledger, claim, mergeErr) == mergeDispatchUncertain {
+		return held(mergeOnPassReasonTransient, "the pinned merge failed with an uncertain outcome; the dispatch claim is dispatch_failed: "+mergeErr.Error())
+	}
 	switch {
 	case errors.Is(mergeErr, forge.ErrMergeConflict):
 		return readvance(mergeOnPassReasonForgeHeadMismatch,
 			"the forge refused the pinned merge because the head no longer matched "+head+": "+mergeErr.Error())
-	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrValidation),
-		errors.Is(mergeErr, forge.ErrForbidden), errors.Is(mergeErr, forge.ErrNotFound):
+	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrValidation):
 		dctx, dcancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
 		again := s.approvalDismissedCheck(dctx, runRow)
 		dcancel()
@@ -547,19 +663,9 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 			return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed, mergeOnPassApprovalDismissedRemedy)
 		}
 		return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused,
-			"the forge refused the pinned merge ("+mergeErr.Error()+"); resolve it, then re-arm the dispatch and re-invoke fishhawk_merge_run")
+			"the forge refused the pinned merge ("+mergeErr.Error()+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
 	}
 	return held(mergeOnPassReasonTransient, "the pinned merge failed: "+mergeErr.Error())
-}
-
-// markMergeOnPassDispatchFailed records a failed dispatch on the ledger,
-// best-effort: the claim stands either way, so nothing re-dispatches.
-func (s *Server) markMergeOnPassDispatchFailed(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, cause error) {
-	if err := ledger.MarkMergeDispatchFailed(ctx, runID, cause.Error()); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"merge queue: marking the merge dispatch failed did not land; the claim stands as dispatched",
-			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
-	}
 }
 
 // mergeOnPassVerdict is a decoded merge_verdict_recorded row.

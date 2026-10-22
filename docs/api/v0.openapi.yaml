@@ -3614,6 +3614,31 @@ components:
             `eta_basis.median_seconds`. Omitted for the live entry and when
             the base has no merged history. An estimate, not a promise — see
             `eta_basis`.
+        dispatch_claim:
+          $ref: '#/components/schemas/MergeQueueDispatchClaim'
+
+    MergeQueueDispatchClaim:
+      type: object
+      description: |
+        The run's merge-dispatch claim (ADR-093 approval condition D1),
+        present only when one exists. A `dispatch_failed` claim (an uncertain
+        forge outcome) holds the entry until the pull request reads merged or
+        the operator re-arms it (`backend/internal/mergequeue/README.md` §
+        "Merge-dispatch ledger").
+      required: [state, path, head_sha, claimed_at, age_seconds]
+      properties:
+        state:
+          type: string
+          enum: [dispatched, dispatch_failed]
+        path:
+          type: string
+          enum: [inline, delegated, queue]
+          description: The dispatch path that took the claim.
+        head_sha: { type: string, description: The head the claim recorded. }
+        claimed_at: { type: string, format: date-time }
+        age_seconds: { type: integer, format: int64, description: The claim's age at read time. }
+        failed_at: { type: string, format: date-time, description: When the claim became `dispatch_failed`. }
+        reason: { type: string, description: "A `dispatch_failed` claim's recorded forge failure." }
 
     MergeQueueHeadOfLine:
       type: object
@@ -15170,10 +15195,13 @@ paths:
         dispatch path claims the run's ONE merge dispatch on the
         merge-dispatch ledger before the forge: an existing claim answers
         `409 merge_already_dispatched` (or `200 already_merged` when the pull
-        request landed) and the forge is never called; a dispatch that fails
-        after the claim leaves it `dispatch_failed` until the operator
-        re-arms it (`backend/internal/mergequeue/README.md` § "Merge-dispatch
-        ledger").
+        request landed) and the forge is never called. A dispatch that fails
+        after the claim is classified once: a refusal that applied nothing
+        (`merge_checks_pending`, a forge 405/409/422) releases the claim, so
+        the re-invoke claims again; an uncertain outcome (5xx, timeout,
+        cancel, 403) leaves it `dispatch_failed` until the pull request reads
+        merged or the operator re-arms it
+        (`backend/internal/mergequeue/README.md` § "Merge-dispatch ledger").
 
         **Merge overlap guard (E83.61 / #4119).** AFTER the conflict guard and
         BEFORE the merge-candidate gate (so the ADR-093 enqueue arm can never
@@ -15524,9 +15552,10 @@ paths:
             `merge_already_dispatched` — the run's ONE merge dispatch is
             already claimed on the merge-dispatch ledger (approval condition
             D1), so the forge was not called again; `details` carry
-            `{run_id, pr_url, verdict_sequence, claim_state, claim_path}`; a
-            `dispatch_failed` claim needs the operator re-arm before a
-            re-invoke.
+            `{run_id, pr_url, verdict_sequence, claim_state, claim_path,
+            claim_head_sha, claimed_at, failure_cause}`; a `dispatch_failed`
+            claim (an uncertain forge outcome) needs the operator re-arm
+            before a re-invoke.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

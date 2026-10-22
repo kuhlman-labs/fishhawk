@@ -182,7 +182,14 @@ type DispatchState string
 const (
 	DispatchDispatched DispatchState = "dispatched"
 	DispatchFailed     DispatchState = "dispatch_failed"
+	// DispatchUnknown is never stored: ClaimMergeDispatch returns it with
+	// ErrAlreadyDispatched when the existing claim could not be read back.
+	DispatchUnknown DispatchState = "unknown"
 )
+
+// DispatchUnknownField fills a claim's Path and HeadSHA alongside
+// DispatchUnknown.
+const DispatchUnknownField = "unknown"
 
 // Dispatch paths: the three merge dispatch paths that claim (approval
 // condition D1).
@@ -310,8 +317,15 @@ type Store interface {
 	// BEFORE the forge (README.md § "Merge-dispatch ledger").
 	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (DispatchClaim, error)
 	// MarkMergeDispatchFailed moves the run's claim to dispatch_failed with
-	// cause; the claim is never deleted (a retry needs the operator re-arm).
+	// cause, for an UNCERTAIN forge outcome; that claim is never deleted by
+	// Fishhawk (reconciliation or the operator re-arm clears it).
 	MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error
+	// ReleaseMergeDispatch deletes claim, a compare-and-swap on the exact
+	// claim, for a forge outcome that applied nothing; a claim that no
+	// longer matches is ErrStateConflict and is left alone.
+	ReleaseMergeDispatch(ctx context.Context, claim DispatchClaim) error
+	// MergeDispatch reads the run's dispatch claim (found=false: none).
+	MergeDispatch(ctx context.Context, runID uuid.UUID) (DispatchClaim, bool, error)
 }
 
 // validate refuses a malformed Base before any SQL runs.

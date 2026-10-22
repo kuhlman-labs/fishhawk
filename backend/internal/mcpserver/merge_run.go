@@ -468,8 +468,10 @@ Tool errors:
     merge_already_dispatched (409 — ADR-093 approval condition D1: the run's
     ONE merge dispatch is already claimed by the queue, the delegated arm or
     an earlier inline dispatch, so the forge was not called; a dispatched
-    merge settles through the forge, a dispatch_failed claim needs the
-    operator re-arm), merge_dispatch_unclaimed (503 — the dispatch claim
+    merge settles through the forge, a dispatch_failed claim (an uncertain
+    forge outcome) needs the operator re-arm unless the pull request reads
+    merged; a merge_checks_pending refusal releases the claim, so its
+    re-invoke claims again), merge_dispatch_unclaimed (503 — the dispatch claim
     could not be written; nothing dispatched; retryable),
     overlap_check_failed (502 — the merge overlap guard could not read the
     forge, the live runs or a run's stages, so it refused; retryable;

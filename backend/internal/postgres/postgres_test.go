@@ -135,15 +135,39 @@ func createExternalRawDB(f fataler, cleanup func(func()), base string) string {
 	cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		c, err := pgx.Connect(ctx, base)
-		if err != nil {
-			return // best-effort drop; the per-exec server is discarded anyway
+		// Best-effort (the per-exec server is discarded anyway), but retried
+		// on a transient refusal: the gate server is shared by every package
+		// in the test loop, so a connect can meet 53300 too_many_connections,
+		// and a single attempt silently leaked the database.
+		drop := func() error {
+			c, err := pgx.Connect(ctx, base)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = c.Close(ctx) }()
+			_, err = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+			return err
 		}
-		defer func() { _ = c.Close(ctx) }()
-		_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+		for err := drop(); isTransientPGRefusal(err) && ctx.Err() == nil; err = drop() {
+			time.Sleep(rawCreateDelay)
+		}
 	})
 	u.Path = "/" + name
 	return u.String()
+}
+
+// isTransientPGRefusal reports whether err is a server refusal worth retrying:
+// 53300 too_many_connections, 57P03 cannot_connect_now or 55006 object_in_use.
+func isTransientPGRefusal(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) {
+		return false
+	}
+	switch pg.Code {
+	case "53300", "57P03", "55006":
+		return true
+	}
+	return false
 }
 
 // retryObjectInUse runs create, retrying ONLY on SQLSTATE 55006 (object_in_use,
@@ -8234,5 +8258,21 @@ WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'merge_inte
 	}
 	if !tableExists(t, url, "merge_dispatch_claims") {
 		t.Error("merge_dispatch_claims missing after re-applying 0108")
+	}
+}
+
+// TestIsTransientPGRefusal: the raw-database drop retries only a server
+// refusal (also through a connect error's wrap), never another failure.
+func TestIsTransientPGRefusal(t *testing.T) {
+	t.Parallel()
+	for _, code := range []string{"53300", "57P03", "55006"} {
+		if err := fmt.Errorf("connect: %w", &pgconn.PgError{Code: code}); !isTransientPGRefusal(err) {
+			t.Errorf("wrapped SQLSTATE %s: got false, want true", code)
+		}
+	}
+	for _, err := range []error{nil, errors.New("dial unix: no such file"), &pgconn.PgError{Code: "42501"}} {
+		if isTransientPGRefusal(err) {
+			t.Errorf("%v: got true, want false", err)
+		}
 	}
 }
