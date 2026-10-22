@@ -2862,41 +2862,44 @@ settle carries.
 ADR-093 D1, D2 and D7 on the ADR-092 queue above: the same store rows, FIFO
 order, one-live-per-base rule and lock order, plus the operator's merge
 intent (`merge_intent_at`, migration 0107; `backend/internal/mergequeue`
-README). Merge-on-pass, eject/promote and durability are slices 2-4.
+README). Merge-on-pass is slice 2 (§ "Merge-on-pass (ADR-093 D3/D6)"
+below); eject/promote and durability are slices 3-4.
 
 - **Eligibility (`merge_queue_eligibility.go`, D1).** One predicate decides
   queue ADMISSION, not only the merge. It never writes; every read error is
   `undeterminable`, which is NOT eligible. Four legs, each on the existing
-  single-source helper: (a) review gate approved — every configured agent
-  implement reviewer has a TERMINAL entry (a pure count, never
-  `checkImplementReviewSettled`, which writes), review coverage complete, and
-  when the review stage declares an approval gate a LIVE forge approval by an
-  `approvals.members` identity (any live approval when members is empty). A
+  single-source helper: (a) review gate approved — the LATEST implement
+  review round (`implementReviewRound`, read-only) has a TERMINAL entry for
+  every configured agent reviewer (no started round, fewer terminals than
+  configured: `review_pending`; an unreadable round: `undeterminable`),
+  review coverage complete, and when the review stage declares an approval
+  gate a LIVE forge approval by an `approvals.members` identity (any live
+  approval when members is empty) — or the D6 approval TRANSFER (§
+  "Merge-on-pass (ADR-093 D3/D6)") — and no reviewer whose latest
+  non-comment review is CHANGES_REQUESTED (`changes_requested`, approval
+  gate declared only). A
   spec that was READ and declares no review stage or no approval gate passes;
   an absent, unreadable or unparseable spec is `undeterminable` (fail
   closed). (b) acceptance merge-eligible and not stale. (c) required checks
   green at the PR head, classified by `mergeoutcome.ClassifyMergeCI` against
   `runs.required_checks_snapshot`; **zero observed check runs is never green
   — it is `undeterminable`, and a nil snapshot is judged on the observed set
-  only when at least one check run exists.** (d) no open blocking concern: an
+  only when at least one check run exists;** with a nil snapshot an observed
+  red is NOT GREEN, not red: the admission variant admits, the merge variant
+  holds `checks_not_green`, the entry variant keeps `checks_red`. (d) no open blocking concern: an
   open concern whose provenance is `concern.ProvenanceFirstOfficer`
   (`"first_officer"`) or whose severity is `planreview.SeverityHigh`
   (`"high"`); medium/low stay advisory (ADR-027). No requirement-arbitration
   concern CATEGORY exists (`requirement_arbitration` is a page event), so the
-  leg matches none. Reason codes: `not_approved`, `review_pending`,
+  leg matches none. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
   `review_coverage_incomplete`, `acceptance_not_eligible`,
   `acceptance_stale`, `checks_not_green`, `checks_red`,
   `blocking_concern_open`, `undeterminable`. The ADMISSION variant differs
   only in leg (c): it refuses an observed RED required check and nothing else
   (a freshly advanced head is legitimately pending; the verify pass is the
-  gate there).
-- **KNOWN DEVIATION from ADR-093 D6 (accepted at approval).** Leg (a)
-  requires a LIVE forge approval; D6's approval transfer across a clean
-  advance is slice 2's. In a repository with GitHub's dismiss-stale-approvals
-  setting (this one) any push dismisses the approval, so the ADR-092 rebase
-  path answers `not_queued` until the PR is re-approved, and
-  `fishhawk_merge_run` after re-approval is the queue entry point — until
-  slice 2 lands.
+  gate there). The entry-aware variants (`mergeQueueAdmissionEligibilityAt`,
+  `mergeQueueMergeEligibility`, which requires checks GREEN) take the entry's
+  intent anchor and report `ApprovalBasis` (`live` | `transferred`).
 - **Enqueue arm (`merge_run.go::mergeQueueEnqueueArm`, D2).** With
   `Config.MergeQueue` wired, a `merge_base_behind`,
   `merge_candidate_unverified` (`unverified`, or `in_flight` for a run that
@@ -2971,13 +2974,137 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
   the admission variant on the PR's current head BEFORE the behind probe:
   determined-ineligible → settled `dropped` / `not_merge_eligible` (the pump
   admits the next; the run re-enters at the TAIL on its next merge call,
-  ADR-093 Q2); undeterminable → `Unadmit`, held at its place. Live entries
-  are not re-evaluated in this slice. No new automated rebase is added
+  ADR-093 Q2); undeterminable → `Unadmit`, held at its place. A live,
+  passed, intent-bearing entry runs merge-on-pass (§ below). No new automated rebase is added
   (#4574 stays out of scope; the admission auto-advance is ADR-092's).
 - **Run and gate-view projection (`runs.go`).**
   `runMergeCandidateQueuePayload` carries `merge_intent` (always on the wire)
   and `merge_intent_at` (omitempty); GET /v0/runs/{id} and the gate view
   share it, so `gateview.go` needs no edit.
+
+### Merge-on-pass (ADR-093 D3/D6)
+
+E87.5 / [#4296](https://github.com/kuhlman-labs/fishhawk/issues/4296); closes
+[#4289](https://github.com/kuhlman-labs/fishhawk/issues/4289) (the hand-off no
+longer waits on the PR webhook). The queue merges its own head of line:
+`mergeQueueMergeOnPass` (`merge_queue_merge.go`) decides, and the pump
+(`merge_candidate_queue.go`) applies the outcome. The store contract (epoch
+CAS, `merge_intent_sequence`, the dispatch ledger, the 90s intent fn
+deadline): `backend/internal/mergequeue/README.md`.
+
+- **Gate.** A LIVE entry in phase `passed` (a `not_required` head counts as
+  passed) carrying `merge_intent_at`, with a head-pinned `GateMerger`
+  (`HeadPinnedMerger`; `forge_merger.go`). Anything else holds.
+- **Pre-lock checks.** Run missing/terminal → drop `run_terminal`; PR merged
+  → settle merged `pr_merged`, closed → drop `pr_closed`, head ≠ anchored
+  head → readvance; verify failed → eject `verify_failed`, not
+  passed/not_required → hold; `mergeQueueMergeEligibility` at the anchor
+  {recorded intent sequence, base}: undeterminable or only
+  `checks_not_green` → hold, any other reason → drop `not_merge_eligible`
+  (re-enter at the tail with `fishhawk_merge_run`, ADR-093 Q2);
+  `approvalDismissedCheck` refusal → eject `forge_approval_dismissed`
+  (Fishhawk cannot re-approve: re-approve under your own identity, then
+  `fishhawk_merge_run`); a TRANSFERRED basis with an undetermined approval
+  holds unless the forge reports `mergeable_state` `clean`, `unstable` or
+  `has_hooks` (`forgeReportsMergeUnblocked`); a live basis proceeds and the
+  forge decides. Then a best-effort `fishhawk_audit_complete` republish at
+  the head.
+- **Locked steps** (`withRunMergeLock` = `WithMergeIntentLock`; every forge
+  read is bounded 10s, the pinned merge 30s, under the 90s fn deadline):
+  re-read the entry (same id, live, passed, intent, same head) and the PR;
+  a non-queue `merge_verdict_recorded` newer than the intent → hold
+  `inline_merge_dispatched`; the merge overlap guard (#4119) → a 409 holds
+  and appends a deduped, counts-only `merge_queue_overlap_refused`, a 502
+  holds, no override; the base re-probe (`CompareCommits(head, base)`
+  behind > 0 → readvance); the `merge_queue_entered` row at the RECORDED
+  intent sequence (missing → hold); record-before-commit
+  `merge_verdict_recorded` {verdict prose and actor from the intent row,
+  `via: merge_queue`, `intent_sequence`, `head_sha`, `entry_id`} (a 0062
+  once-index duplicate is a resume); re-check changes_requested and the
+  dismissed approval (a change since the pre-lock read holds); claim the
+  run's ONE dispatch on the D1 ledger (path `queue`; an existing claim →
+  hold `merge_already_dispatched`, forge never called); the pinned merge
+  `MergePullRequestAtHead(head)`.
+- **Classification.** nil → settle merged `merged_by_queue` INSIDE the lock
+  (approval condition D3: a later inline caller reads the PR merged and
+  answers `already_merged`, never 409) and append `merge_queue_merged`; a
+  failed append after the forge accepted still settles merged and logs at
+  ERROR. `ErrMergeConflict` (409 head mismatch) → re-read: merged → merged,
+  else readvance, no `merge_queue_merged` row. 405 / 422 / 403 / 404 →
+  re-read: merged → merged, else a dismissed approval → eject
+  `forge_approval_dismissed`, else eject `forge_merge_refused` naming the
+  error (never retried in a loop). Any other error → re-read: merged →
+  merged, else hold. After a claim, a failed dispatch moves the claim to
+  `dispatch_failed`. A lock never taken → hold; a lapse after fn → WARN, its
+  writes stand.
+- **Outcomes the pump applies.** `merged` → continue; `settle` → `SettleAt`
+  (epoch CAS; a conflict stops the pump); `readvance` → `Unadmit(epoch)`,
+  the only post-Unadmit continue, capped at `mergeQueueMaxReadvancesPerPump`
+  (3); `held` → stop. Otherwise the pump continues only after a settle or a
+  live admission (`stop := res.outcome != admitSettled && res.outcome !=
+  admitLive`). Admission-owned writes (`Unadmit`, `SetPhase`, `ReanchorAt`,
+  `SettleAt`) are compare-and-swaps on the entry's `admission_epoch`, so a
+  stale decision changes nothing. A passed verdict pumps the base detached.
+- **Ownership and the three dispatch paths (approval conditions D1/D2).**
+  The queue OWNS the run's merge while the run has an active entry, live OR
+  held, in any phase, carrying merge intent, and a head-pinned seam is bound
+  (`mergeQueueOwnsMerge`). Merge-on-pass, the inline `merge_run` tail and the
+  delegated `may_merge` arm all run under the run's merge-intent lock and
+  claim the run's ONE dispatch on `merge_dispatch_claims` (UNIQUE run_id)
+  BEFORE the forge. Inline: owned → `409 merge_queue_owns_merge` with nothing
+  recorded (unless the PR already merged: `already_merged`); an unreadable
+  queue → `503 merge_queue_unreadable`; a lock not taken within
+  `mergeRunLockAcquireTimeout` (30s) → `503 merge_lock_unavailable`; an
+  existing claim → `409 merge_already_dispatched` (or `already_merged`).
+  Delegated (`autodrive.go::delegatedMergeUnderLock`): owned, an unreadable
+  queue, a lock not taken within `autoDriveMergeLockAcquireTimeout` (30s), an
+  existing claim and a claim error are each observe-only with the merger
+  never called; a dispatch failure after the claim marks it `dispatch_failed`
+  and surfaces the error. A `dispatch_failed` claim is re-armed only by the
+  operator (mergequeue README § "Merge-dispatch ledger").
+- **D6 approval transfer.** With no live `approvals.members` approval and an
+  intent anchor, the heads carrying the operator's approval are seeded from
+  the intent row's `anchored_head_sha` and walked through later
+  `branch_rebased` (a CLEAN advance from a carrying head adds its new head)
+  and `conflict_resolution_pushed` (never carries; clears the set) rows. The
+  transfer holds only when the current head is in the set, no
+  changes_requested, and (merge variant) the head reads passed or
+  not_required. A legacy anchor (sequence 0) resolves the newest
+  `merge_queue_entered` row naming the base.
+- **Audit rows** (system actor, INTERNAL, registered in
+  `audit/categories.go`). `merge_queue_advanced` {entry_id, prior_head_sha,
+  new_head_sha, merge_commit_sha, clean, admission_epoch};
+  `merge_queue_verified` {entry_id, head_sha, source pass | transfer |
+  already_passed | not_required}; `merge_queue_merged` {entry_id, base_ref,
+  head_sha, verdict_sequence, verdict_head_sha, intent_sequence,
+  approval_basis}; `merge_queue_overlap_refused` {head, code, reason,
+  counts}. **`merge_verdict_recorded.head_sha` is the FIRST merge-on-pass
+  attempt's head** (the 0062 once-index keeps one verdict row per run);
+  `merge_queue_merged.head_sha` is authoritative for the merged head, and its
+  `verdict_head_sha` shows any mismatch.
+- **ETA basis.** A line turn now ends at the queue's own merge, so
+  `eta_seconds` no longer includes the operator's merge step. The read's
+  `eta_basis.note` string in `merge_queue_read.go` still carries the slice-1
+  wording; that edit is an operator follow-up.
+- **Operator note: a head moved after the final read.** GitHub refuses the
+  pinned merge with 409 when the PR head no longer matches the verified SHA;
+  the entry re-advances and no `merge_queue_merged` row is written
+  (`TestMergeQueueMergeOnPass_ForgeErrors`). This is pinned by a fake-forge
+  test, not the live walk.
+- **Residuals.** GitHub pins only the head: a base push between the locked
+  re-probe and the merge call lands the merge on a base the pass did not
+  see. An `inline_merge_dispatched` hold waits on the inline auto-merge; if
+  it never fires the entry holds the line until slice 3's bounded hold. In a
+  dismiss-stale repository requiring an approving review (this one) every
+  advance dismisses the approval, so a behind PR ejects
+  `forge_approval_dismissed`. A lock fn cut by its 90s deadline is
+  re-observed by the next pump; a merge that landed settles merged and is
+  never applied twice.
+- **Tests.** `merge_queue_merge_test.go` (the decision), `merge_queue_pump_test.go`
+  (epoch CAS, continuation, readvance cap), `merge_queue_e2e_test.go` (the H1
+  race, inline vs merge-on-pass in three orders), `autodrive_merge_queue_test.go`
+  (the delegated arm: ownership, read error, bounded lock, the D1 claim, the
+  H2 race), `merge_queue_eligibility_test.go`.
 
 ### Merge queue read (`merge_queue_read.go`)
 
@@ -3005,10 +3132,10 @@ README). Merge-on-pass, eject/promote and durability are slices 2-4.
 - **ETA basis.** `eta_seconds` = `position` x the median of
   `RecentLineTurns(base, 10)` (admission to merge of the base's newest merged
   entries, database clock, account-scoped), rounded to the second; omitted
-  for the live entry and with no history. **Until slice 2's merge-on-pass
-  lands, a line turn includes the operator's merge step** (the line frees
-  only when the PR merges), so the estimate is as fast as the operator
-  merges.
+  for the live entry and with no history. A line turn ends at the queue's
+  own merge-on-pass (§ "Merge-on-pass (ADR-093 D3/D6)"), not the operator's
+  merge step. The `eta_basis.note` string still carries the slice-1 wording
+  (an operator follow-up).
 - **Fail posture.** `503 merge_queue_unconfigured` unwired, answered only
   AFTER the run-bound refusal and the scope check (the sibling merge verb's
   order), so an anonymous or under-scoped caller cannot learn whether a queue
@@ -3155,9 +3282,11 @@ the advisory #4118 surfaces it FAILS CLOSED.
   (`withholdScopeOverlapFromRunBound`, § "Cross-run scope overlap"): it names
   other runs' ids, issue refs and paths. Registered in
   `audit/categories.go`; NOT an issue-comment activity category.
-- **Residuals.** ADR-093 slice 2's merge-on-pass (#4296) does NOT run this
-  guard (`dispatchAcceptanceGatedMerge` does not either: both of its current
-  callers run it first). TOCTOU: a push or a newly dispatched implement
+- **Residuals.** ADR-093 slice 2's merge-on-pass (#4296) runs this guard
+  under the run's merge-intent lock with no override, recording a refusal as
+  `merge_queue_overlap_refused` (§ "Merge-on-pass (ADR-093 D3/D6)");
+  `dispatchAcceptanceGatedMerge` does not run it (its delegated caller runs
+  it first). TOCTOU: a push or a newly dispatched implement
   between the guard read and GitHub's merge is not caught. Cost per POST (or
   delegated pass) with a live candidate elsewhere: one stage list per
   candidate plus one `GetPullRequest` and one compare. **Fail-closed
@@ -3267,7 +3396,7 @@ At a CLEAN base advance Fishhawk performed (the rebase verb's performed forge me
 - **Fail-closed verdict (the rollback contract).** `newestMergeCandidateVerdict` reads transferred rows ONLY in `enforce`; in `off` / `shadow` they are ignored and the head fails closed to `unverified`, so switching away from enforce revokes every transfer already written. The merge gate, the queue, the fan-in hold and the rebase up-to-date arm all read through it; a read error on either category fails closed.
 - **Untrusted reason.** The classifier's Reason names repository paths, so it is stored split: a closed `reason_code` plus a bounded, control-stripped `reason_detail` flagged `reason_untrusted: true`. It is neutralized by ONE helper, `issuecomment.NeutralizeUntrustedInline` (inside a code span on the comment timeline; as plain JSON on the gate view and the MCP mirror, whose description marks it UNTRUSTED DATA), and never rendered into an agent prompt.
 - **Gate view `merge_candidate_verdict`** (`gateViewMergeCandidateVerdictFor`, handler only). ALWAYS present: `transfer_mode`; `head_sha` — the run's current head as the chain records it (`gateViewCurrentHead`: the highest-sequence head across `pull_request_opened`, `child_pushed`, `fixup_pushed`, `acceptance_scenarios_pushed`, `conflict_resolution_pushed`, `operator_commit_vouched` and a performed `branch_rebased`) — with `state` / `cause` / `source` (`recorded` | `transferred`) / `transferred_from` / `root_head` from `mergeCandidateVerifyState` for EXACTLY that head, so a fix-up or conflict-resolution push after a transfer reports the new head and never the older transferred verdict; `last_transfer_refusal` (the newest refused row); `shadow[]`, each paired AT READ TIME with the newest recorded `merge_candidate_verified` result for its `to_head` (`pass_result`, `false_transfer = would_transfer && pass_result == failed`); `false_transfers[]`. Any read failure (or no audit repository) omits the block and adds a `merge_candidate_verdict` `history_gaps` entry — never a partial block.
-- **Residuals.** A delta REMOVING a package H' imports makes H' fail `go list`, so the decision is `undecidable`, not `reach_overlap` — fail closed and deliberate. A shadow row lost to a restart is a measurement gap, never a skipped pass. The gate view's head is chain-derived: an out-of-band push the operator never vouched is not seen there (the merge gate reads the forge head). ADR-093 merge-on-pass is not on this tree; a transfer sets the queue entry's phase `passed`.
+- **Residuals.** A delta REMOVING a package H' imports makes H' fail `go list`, so the decision is `undecidable`, not `reach_overlap` — fail closed and deliberate. A shadow row lost to a restart is a measurement gap, never a skipped pass. The gate view's head is chain-derived: an out-of-band push the operator never vouched is not seen there (the merge gate reads the forge head). A transfer sets the queue entry's phase `passed`, which ADR-093 merge-on-pass merges like a pass.
 - **Tests.** `merge_candidate_transfer_test.go` (one per ladder arm, false transfer in both arrival orders, the prompt-render exclusion), `merge_candidate_transfer_e2e_test.go` (real git + real classifier through the real rebase handler), `rebase_branch_test.go`, `merge_candidate_queue_test.go`, `gateview_test.go` (`TestGateView_MergeCandidateVerdict*`, `TestGateView_ShadowPairingFalseTransfer`, `TestGateView_LastTransferRefusalHostileReasonInert`) and `mcpserver`'s `TestMergeCandidateVerdict_WireShape`.
 
 ## Plan-gate scope/constraint pre-check (#658)
