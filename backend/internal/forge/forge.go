@@ -1,6 +1,18 @@
 package forge
 
-import "context"
+import (
+	"context"
+	"errors"
+)
+
+// ErrMergeUnprocessable is a merge PUT the forge refused as unprocessable
+// (GitHub REST 422): a refusal that applied nothing. It is wrapped ALONGSIDE
+// ErrValidation, so every errors.Is(err, ErrValidation) caller is unchanged,
+// while the merge-dispatch ledger (server.classifyMergeDispatchOutcome)
+// releases a claim only on this typed refusal, never on a bare ErrValidation
+// (which also carries a generic GraphQL error envelope whose outcome is
+// uncertain).
+var ErrMergeUnprocessable = errors.New("forge: merge refused as unprocessable")
 
 // Forge is the forge-neutral surface Fishhawk's flows drive a code host
 // through (ADR-058 / E45.4): ref creation + SHA reads, git-data commit
@@ -125,6 +137,28 @@ type Forge interface {
 	// base...head (#1060). Truncation is reported in the result, not as an
 	// error.
 	ComparePatch(ctx context.Context, scope CredentialScope, repo RepoRef, base, head string) (*ComparePatchResult, error)
+}
+
+// HeadPinnedMerger is the OPTIONAL head-pinned synchronous merge capability
+// the merge queue's merge-on-pass consumes (ADR-093 D3, E87.5 / #4296): merge
+// a PR only if its head still equals expectedHeadSHA, the head the queue
+// verified. A forge whose merge endpoint takes a head pin (GitHub's REST `sha`,
+// GitLab's `sha`) refuses a moved head instead of merging an unverified tree.
+//
+// It is a STANDALONE capability rather than a method on Forge for the same
+// reason FileFetcher and RefDeleter are: widening Forge churns every adapter
+// and test fake for a capability one consumer uses. A forge that does not
+// implement it is a fail-closed nil at the consumer (server.ForgeMerger answers
+// a named error), never a fallback to an unpinned merge.
+//
+// Contract:
+//   - SYNCHRONOUS only: it never queues an auto-merge / merge-when-pipeline-
+//     succeeds, because a queued merge waits on checks while the base may move.
+//   - An empty expectedHeadSHA is an error before any forge call.
+//   - A head mismatch maps to ErrMergeConflict; a PR not in a mergeable state
+//     maps to ErrPullRequestNotMergeable; the rest per the adapter's mapping.
+type HeadPinnedMerger interface {
+	MergePullRequestAtHead(ctx context.Context, scope CredentialScope, repo RepoRef, prNumber int, method MergeMethod, expectedHeadSHA string) error
 }
 
 // FileFetcher is the forge-neutral single-file read capability (#2022).

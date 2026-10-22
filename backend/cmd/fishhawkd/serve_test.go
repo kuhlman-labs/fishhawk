@@ -1164,6 +1164,8 @@ type mergeFallbackGitHub struct {
 	graphqlBody string // the enable-auto-merge graphql response body
 	mergeStatus int    // status for the REST merge PUT (0 → 200)
 	mergeHits   int    // number of REST merge PUTs served
+	graphqlHits int    // number of POST /graphql (auto-merge enable) served
+	mergeBody   []byte // the last REST merge PUT body
 }
 
 func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient.Client {
@@ -1176,12 +1178,14 @@ func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient
 		})
 	mux.HandleFunc("POST /graphql",
 		func(w http.ResponseWriter, _ *http.Request) {
+			fg.graphqlHits++
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, fg.graphqlBody)
 		})
 	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge",
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
 			fg.mergeHits++
+			fg.mergeBody, _ = io.ReadAll(r.Body)
 			st := fg.mergeStatus
 			if st == 0 {
 				st = http.StatusOK
@@ -7330,5 +7334,83 @@ func TestCampaignRunStarter_ExpeditedItemUsesRecordedWorkflow(t *testing.T) {
 	}
 	if got := a.startParams(hot, c); got.WorkflowID != "hotfix_change" || got.IssueRef != "issue:42" || got.WorkflowRef != "main" {
 		t.Errorf("expedited item params = %+v, want workflow hotfix_change", got)
+	}
+}
+
+// TestGithubAutoMerger_MergePullRequestAtHead_RESTWithSha_NeverGraphQL pins the
+// merge-on-pass leaf (ADR-093 D3, E87.5 / #4296): ONE synchronous REST merge
+// PUT whose body carries sha == the verified head and squash, and ZERO /graphql
+// hits — the pinned merge never queues auto-merge. Counterfactual: routing the
+// pinned leaf through MergePullRequest (the EnableAutoMerge ladder) makes this
+// RED on graphqlHits and on the missing sha.
+func TestGithubAutoMerger_MergePullRequestAtHead_RESTWithSha_NeverGraphQL(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		// An auto-merge enable would SUCCEED here, so only the pinned path's own
+		// shape keeps graphqlHits at zero.
+		graphqlBody: `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	const head = "0123456789abcdef0123456789abcdef01234567"
+	if err := m.MergePullRequestAtHead(context.Background(), mergeFallbackRun(), head); err != nil {
+		t.Fatalf("MergePullRequestAtHead: %v", err)
+	}
+	if fg.graphqlHits != 0 {
+		t.Errorf("/graphql hits = %d, want 0 (pinned merge must never enable auto-merge)", fg.graphqlHits)
+	}
+	if fg.mergeHits != 1 {
+		t.Fatalf("REST merge PUTs = %d, want 1", fg.mergeHits)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.mergeBody, &body); err != nil {
+		t.Fatalf("decode merge body %q: %v", fg.mergeBody, err)
+	}
+	if body["sha"] != head || body["merge_method"] != "squash" {
+		t.Errorf("merge body = %v, want sha=%s merge_method=squash", body, head)
+	}
+}
+
+// TestGithubAutoMerger_MergePullRequestAtHead_HeadMoved409IsMergeConflict: a
+// PUT answering 409 (head does not match sha) surfaces forge.ErrMergeConflict,
+// the sentinel merge-on-pass re-advances on, with no auto-merge fallback.
+func TestGithubAutoMerger_MergePullRequestAtHead_HeadMoved409IsMergeConflict(t *testing.T) {
+	fg := &mergeFallbackGitHub{mergeStatus: http.StatusConflict}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	err := m.MergePullRequestAtHead(context.Background(), mergeFallbackRun(), "abc")
+	if !errors.Is(err, forge.ErrMergeConflict) {
+		t.Fatalf("err = %v, want forge.ErrMergeConflict", err)
+	}
+	if fg.graphqlHits != 0 {
+		t.Errorf("/graphql hits = %d, want 0", fg.graphqlHits)
+	}
+}
+
+// TestGithubAutoMerger_MergePullRequestAtHead_FailsClosed: the pinned leaf
+// shares MergePullRequest's pre-HTTP refusals (no installation id, no / bad PR
+// url) and refuses an empty head, all with zero requests served.
+func TestGithubAutoMerger_MergePullRequestAtHead_FailsClosed(t *testing.T) {
+	fg := &mergeFallbackGitHub{}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	inst := int64(42)
+	prURL := "https://github.com/x/y/pull/7"
+	bad := "not-a-url"
+	cases := []struct {
+		name string
+		run  *runpkg.Run
+		head string
+	}{
+		{"no installation id", &runpkg.Run{ID: uuid.New(), PullRequestURL: &prURL}, "abc"},
+		{"no pull request url", &runpkg.Run{ID: uuid.New(), InstallationID: &inst}, "abc"},
+		{"unparseable pull request url", &runpkg.Run{ID: uuid.New(), InstallationID: &inst, PullRequestURL: &bad}, "abc"},
+		{"empty head", mergeFallbackRun(), ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := m.MergePullRequestAtHead(context.Background(), tc.run, tc.head); err == nil {
+				t.Fatalf("MergePullRequestAtHead(%s) = nil, want an error", tc.name)
+			}
+		})
+	}
+	if fg.mergeHits != 0 || fg.graphqlHits != 0 {
+		t.Errorf("requests served merge=%d graphql=%d, want 0/0", fg.mergeHits, fg.graphqlHits)
 	}
 }

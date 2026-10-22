@@ -4,7 +4,7 @@ Persisted held-pass queue for ADR-092 D1 (#4200, `docs/adr/092-serialize-merge-c
 At most ONE merge-candidate verify pass is live per `(repository, base ref)`
 inside one account. Every other eligible pass is held FIFO by eligibility time
 and consumes no runner slot. Table: `merge_candidate_queue_entries`
-(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295).
+(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296).
 ADR-093's merge queue (slice 1) reuses these rows, the FIFO order, the
 one-live-per-base rule and the lock order UNCHANGED; it adds only the
 operator's recorded merge intent and the line-turn read below. The SQL is hand-written pgx, with no sqlc (same precedent as
@@ -29,6 +29,8 @@ One row per queue EPISODE of a run.
 | `admitted_at` | Set by `AdmitNext`; required while `live` (DB CHECK). |
 | `settled_at` | Set exactly when the row is terminal (DB CHECK). |
 | `merge_intent_at` | The operator's merge intent on this episode (0107, ADR-093 D2): NULL = none (every ADR-092 rebase/base-advance entry and every pre-0107 row). Stamped once from the database clock by `Enqueue{MergeIntent}` or `MarkMergeIntent`, never cleared; a terminal row keeps it as history, and a re-entry after a terminal row starts a FRESH row without it. |
+| `merge_intent_sequence` | The audit sequence of the `merge_queue_entered` row that recorded the intent (0108, ADR-093 slice 2). Stamped in the SAME statement as `merge_intent_at` (`EnqueueRequest.IntentSequence`, `MergeIntentRequest.IntentSequence`), only on the NULL-to-set transition, never overwritten. NULL (read as `Entry.MergeIntentSequence` 0) = no intent, or an intent recorded before 0108; merge-on-pass then resolves the newest `merge_queue_entered` row naming the base. |
+| `admission_epoch` | `BIGINT NOT NULL DEFAULT 0` (0108). Bumped by every admission: `AdmitNext`'s admit AND its stale re-claim. The admission-owned writes are compare-and-swaps on it (§ "Admission-epoch CAS"). |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE
@@ -75,19 +77,28 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   - No live entry → the oldest `held` entry by `(enqueued_at, id)` becomes
     `live`, phase `admitted`, `admitted_at = now`; `Admitted=true`.
   - Empty base → zero `Admission` (`Entry` nil).
-- **`Unadmit(id)`**: `live` → `held` at its ORIGINAL place (`enqueued_at`
-  kept), phase and `admitted_at` cleared — for a transient admission failure.
-  Non-live → `ErrStateConflict`, nothing written.
-- **`SetPhase(id, phase)`**: active entries only (`ErrStateConflict` on
-  terminal); empty phase is `ErrInvalidRequest`; an unchanged phase writes
-  nothing.
+- **`Unadmit(id, epoch)`**: `live` → `held` at its ORIGINAL place
+  (`enqueued_at` kept), phase and `admitted_at` cleared. Callers: the pump's
+  transient admission failure and merge-on-pass's readvance
+  (`backend/internal/server/merge_candidate_queue.go`). Epoch CAS: not live,
+  or live at another epoch → `ErrStateConflict`, nothing written.
+- **`SetPhase(id, epoch, phase)`**: `live` at `epoch` only (epoch CAS;
+  `ErrStateConflict` otherwise, nothing written); empty phase is
+  `ErrInvalidRequest`; an unchanged phase writes nothing.
+- **`ReanchorAt(id, epoch, head, base)`**: `Reanchor` under the epoch CAS, for
+  the admission owner.
+- **`SettleAt(id, epoch, state, reason)`**: `Settle` under the epoch CAS, for
+  the admission owner and merge-on-pass decisions. An already-terminal row
+  answers `Settled=false` like `Settle`; held, or live at another epoch →
+  `ErrStateConflict`.
 - **`Reanchor(id, head, base)`**: active entries only; same in-place semantics
   as the Enqueue re-anchor arm.
 - **`Settle(id, state, reason)`**: `state` ∈ `merged|ejected|dropped`
   (`ErrInvalidRequest` otherwise); `reason` required for `ejected`/`dropped`.
   Idempotent: on an already-terminal row it writes nothing and returns
   `Settled=false` with the row's FIRST state and reason.
-- **`MarkMergeIntent(id, record)`** → `MergeIntentResult{Entry,
+- **`MarkMergeIntent(id, req *MergeIntentRequest)`** (`req.IntentSequence`
+  stamped with the intent, `req.Record` the callback; nil = neither) → `MergeIntentResult{Entry,
   IntentRecorded}`: stamps an ACTIVE entry's `merge_intent_at`
   (`ErrStateConflict` on terminal, nothing written). Idempotent: an
   already-set intent writes nothing (`updated_at` unchanged), calls no
@@ -141,6 +152,84 @@ slice 1: that eligibility requires a LIVE forge approval and approval
 transfer across a clean advance is deferred to slice 2, so in a
 dismiss-stale repository a rebase answers `not_queued` until then. The
 store itself never judges eligibility.
+
+### Admission-epoch CAS
+
+A pump's decision is made against the entry as it read it; another pump may
+have Unadmitted and re-admitted it since. The epoch makes that stale decision
+change nothing (ADR-093 slice 2, rejection item 1):
+
+| Write | Guard | Who |
+|---|---|---|
+| `Unadmit` | live AND `admission_epoch = epoch` | admission transient failure, merge-on-pass readvance |
+| `SetPhase` | live AND epoch | admission, verdict hook, transfer re-anchor |
+| `ReanchorAt` | live AND epoch | admission re-anchor |
+| `SettleAt` | live AND epoch (terminal: no-op) | admission settles, merge-on-pass settle outcomes |
+| `Settle` / `Reanchor` | active (unconditional) | EXTERNAL facts only: PR resolved, cancel / re-open release, run terminal, the rebase transfer re-anchor, the merged settle after the forge accepted a queue merge |
+
+### Merge-dispatch ledger
+
+`merge_dispatch_claims` (0108, approval condition D1): one row per run,
+`UNIQUE (run_id)` (`merge_dispatch_claims_run_id_key`), with `state`
+(`dispatched` | `dispatch_failed`), `path` (`inline` | `delegated` | `queue`),
+`head_sha`, `claimed_at`, and `failed_at` / `failure_cause` on a failure.
+
+- **`ClaimMergeDispatch(runID, path, head)`**: a plain INSERT. The UNIQUE
+  constraint, not any lock, admits exactly one claim per run: a duplicate is
+  `ErrAlreadyDispatched`, returned with the existing claim. Every merge
+  dispatch path (queue merge-on-pass, the inline `merge_run`, the delegated
+  `may_merge` arm) calls it under `WithMergeIntentLock` and BEFORE the forge;
+  `ErrAlreadyDispatched` means the forge is never called.
+- **After a claim, the forge outcome is classified ONCE**
+  (`server.classifyMergeDispatchOutcome`, first-officer ruling R1), the same
+  on all three paths:
+  - **Release** (the forge guarantees nothing was applied), on TYPED
+    sentinels only: our own pre-call `checks_pending` refusal
+    (`forge.ErrPullRequestUnstableStatus`) and the REST merge PUT's 405 (not
+    mergeable, `forge.ErrPullRequestNotMergeable`), 409 (head-SHA mismatch,
+    `forge.ErrMergeConflict`) or 422 (`forge.ErrMergeUnprocessable`, wrapped
+    alongside `forge.ErrValidation`). A bare `forge.ErrValidation` is NOT a
+    release: it also carries a generic HTTP-200 GraphQL error envelope,
+    whose outcome is uncertain. **`ReleaseMergeDispatch(claim)`**
+    DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,
+    `state = 'dispatched'`, `path`, `head_sha`, `claimed_at`); a claim that
+    no longer matches is `ErrStateConflict` and is never deleted, so a
+    release cannot remove another holder's claim. A later dispatch (the
+    `merge_checks_pending` re-invoke, a re-advanced entry's next
+    merge-on-pass) claims again.
+  - **Uncertain** (everything else: 5xx, timeout, transport error, context
+    cancel, 403 that may be a rate limit, 404, a generic GraphQL error):
+    **`MarkMergeDispatchFailed(runID, cause)`** moves the claim to
+    `dispatch_failed` (first cause and time kept). It is UPDATED, never
+    deleted, so nothing re-dispatches on its own.
+  - The ledger write runs on `context.WithoutCancel` with a bounded timeout,
+    so a cancelled request cannot strand a `dispatched` claim; a release
+    that does not land is recorded as `dispatch_failed` instead. Each
+    outcome appends a `merge_dispatch_settled` audit row (`outcome`
+    `released` | `dispatch_failed`, `path`, `head_sha`, `reason`); an
+    uncertain one also logs at WARN.
+- **Reconciliation before a re-arm.** Every path re-reads the PR before it
+  touches the ledger (the inline and queue paths re-observe a landed merge
+  BEFORE settling a claim after a failed dispatch, so a merge that landed
+  leaves the claim `dispatched`). The next merge-on-pass or `merge_run`
+  touching a run with a claim re-reads the PR: merged → merge-on-pass reads
+  the claim and settles the entry merged (`pr_merged`) only when there is
+  no claim or the claim names the merged head, else it holds
+  `merged_claim_head_mismatch` (WARN); the inline answer is
+  `already_merged`. On both paths a reconciled `dispatch_failed` claim
+  appends `merge_dispatch_settled` `reconciled_merged`. Unmerged → the claim
+  stands: merge-on-pass holds
+  `merge_already_dispatched` (WARN), the inline answer is
+  `409 merge_already_dispatched` naming the claim, and the merge-queue read
+  surfaces it on the entry (`dispatch_claim`: state, path, head, age,
+  reason).
+- **Operator re-arm** (operator-only, and only for an UNCERTAIN outcome; no
+  HTTP route, MCP tool or Fishhawk code path deletes a `dispatch_failed`
+  claim): after confirming on the forge that the PR did not merge and
+  resolving the cause, the operator removes the failed claim with
+  `DELETE FROM merge_dispatch_claims WHERE run_id = '<run id>' AND state = 'dispatch_failed';`
+  against fishhawkd's database, then re-invokes `fishhawk_merge_run`. A
+  `dispatched` claim is never re-armed: its merge was handed to the forge.
 
 ## Reasons
 
@@ -224,7 +313,8 @@ transaction with the write.
   Detached work `fn` spawns (the server's detached queue pump) is ordinary
   non-lock load bounded by its own context, not `fn`'s extra connection.
 - **fn deadline.** `fn` gets a `context.Context` bounded by
-  `intentFnTimeout` (30 s), applied even when the caller's context has no
+  `intentFnTimeout` (90 s since ADR-093 slice 2: the fn now also covers a
+  forge merge call, each forge call with its own shorter timeout), applied even when the caller's context has no
   deadline, so every DB call in the decision is bounded
   (`TestWithMergeIntentLock_FnCarriesDeadline`). The bound is cooperative:
   it reaches `fn` only through that context. The context is marked as

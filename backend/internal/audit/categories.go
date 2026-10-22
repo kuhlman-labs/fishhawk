@@ -347,6 +347,11 @@ import "sort"
 // arm's record of a refusing merge overlap guard (server/autodrive.go
 // mergeOverlapAutoDriveHold), carrying counts plus code, reason and head only
 // and deduped per decision — INTERNAL, not an issue-comment surface.
+// E87.5 / #4296 added merge_queue_advanced, merge_queue_verified,
+// merge_queue_merged and merge_queue_overlap_refused, the ADR-093 D3
+// merge-on-pass rows (server/merge_queue_merge.go, merge_candidate_queue.go),
+// plus merge_dispatch_settled, the D1 dispatch-ledger outcome row —
+// INTERNAL, not issue-comment surfaces.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -503,6 +508,11 @@ var KnownCategories = map[string]struct{}{
 	"merge_candidate_queue_reanchored":        {}, // E83.85 / #4200 (ADR-092 D2): an active queue entry moved to a new anchored head in place, keeping its place (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_candidate_queue_settled":           {}, // E83.85 / #4200 (ADR-092 D4): a queue entry left the line as merged, ejected or dropped, naming the reason (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_entered":                     {}, // E87.4 / #4295 (ADR-093 D2): an operator merge_run recorded merge intent and enqueued an eligible run, carrying the verdict prose for slice 2's merge-on-pass; appended BEFORE the queue write (server/merge_run.go) — INTERNAL, not an issue-comment surface
+	"merge_dispatch_settled":                  {}, // E87.5 / #4296 (ADR-093 D1, first-officer ruling R1): what became of a run's merge-dispatch claim after a failed forge dispatch (released, dispatch_failed) or on reconciliation (reconciled_merged), naming path, head and reason (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_advanced":                    {}, // E87.5 / #4296 (ADR-093 D3): a merge-intent queue entry's admission auto-advanced its branch, naming prior/new head, merge commit, clean and admission epoch (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_merged":                      {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass merged the head of line through the forge pinned to the verified head, naming verdict_head_sha and approval basis (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_overlap_refused":             {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass was held by the merge overlap guard; counts only, no other run's ids or paths, one row per distinct decision (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_verified":                    {}, // E87.5 / #4296 (ADR-093 D3): a merge-intent queue entry's head read passed (pass, transfer, already_passed or not_required) (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_candidate_verified":                {}, // E83.33 / #4018 (ADR-090): the result of a runner verify-only merge-candidate pass, bound to EXACTLY one head SHA; CONSUMES its trigger (server/merge_candidate_verify.go) — INTERNAL, not an issue-comment surface
 	"model_resolved":                          {},
 	"operator_commit_vouched":                 {},

@@ -84,6 +84,25 @@ type mergeQueueEntryView struct {
 	// line turn. Omitted for the live entry and when the base has no merged
 	// history.
 	ETASeconds *int64 `json:"eta_seconds,omitempty"`
+	// DispatchClaim is the run's merge-dispatch claim (ADR-093 approval
+	// condition D1, ruling R2): present while a claim exists, so a
+	// dispatch_failed claim holding the line is visible. Omitted with none.
+	DispatchClaim *mergeQueueDispatchClaimView `json:"dispatch_claim,omitempty"`
+}
+
+// mergeQueueDispatchClaimView is one run's merge_dispatch_claims row.
+type mergeQueueDispatchClaimView struct {
+	// State is dispatched or dispatch_failed.
+	State string `json:"state"`
+	// Path is the claiming dispatch path: inline, delegated or queue.
+	Path      string    `json:"path"`
+	HeadSHA   string    `json:"head_sha"`
+	ClaimedAt time.Time `json:"claimed_at"`
+	// AgeSeconds is the claim's age at read time.
+	AgeSeconds int64      `json:"age_seconds"`
+	FailedAt   *time.Time `json:"failed_at,omitempty"`
+	// Reason is a dispatch_failed claim's recorded forge failure.
+	Reason string `json:"reason,omitempty"`
 }
 
 // mergeQueueHeadOfLine is the base's first entry plus its PR's live head.
@@ -224,6 +243,16 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 			AdmittedAt:      e.AdmittedAt,
 			AnchoredHeadSHA: e.AnchoredHeadSHA,
 			AnchoredBaseSHA: e.AnchoredBaseSHA,
+		}
+		claim, found, err := s.cfg.MergeQueue.MergeDispatch(ctx, e.RunID)
+		if err != nil {
+			return mergeQueueBaseView{}, err
+		}
+		if found {
+			ev.DispatchClaim = &mergeQueueDispatchClaimView{
+				State: string(claim.State), Path: claim.Path, HeadSHA: claim.HeadSHA, ClaimedAt: claim.ClaimedAt,
+				AgeSeconds: int64(time.Since(claim.ClaimedAt) / time.Second), FailedAt: claim.FailedAt, Reason: claim.FailureCause,
+			}
 		}
 		if e.State == mergequeue.StateHeld {
 			held++

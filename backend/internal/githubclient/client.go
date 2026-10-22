@@ -66,6 +66,7 @@ var (
 	ErrPullRequestCleanStatus    = forge.ErrPullRequestCleanStatus
 	ErrPullRequestUnstableStatus = forge.ErrPullRequestUnstableStatus
 	ErrPullRequestNotMergeable   = forge.ErrPullRequestNotMergeable
+	ErrMergeUnprocessable        = forge.ErrMergeUnprocessable
 )
 
 // The Forge-surface vocabulary lives canonically in the forge package
@@ -1487,6 +1488,34 @@ func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScop
 // (422) are mapped like the sibling REST methods via classifyStatus.
 func (c *Client) MergePullRequest(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, prNumber int, method MergeMethod) error {
+	return c.mergePullRequest(ctx, scope, repo, prNumber, method, "")
+}
+
+// MergePullRequestAtHead is MergePullRequest with the head PINNED (ADR-093 D3,
+// E87.5 / #4296): the REST body carries `sha`, which GitHub documents as the
+// "SHA that pull request head must match to allow merge", so a head that moved
+// after the caller verified it is refused by the forge rather than merged. It is
+// the merge-on-pass seam's GitHub leaf and is ALWAYS synchronous — it never
+// queues auto-merge, because a queued auto-merge waits on checks while the base
+// may move, defeating the pin.
+//
+// An empty expectedHeadSHA is refused before any HTTP call (an unpinned merge
+// through this method would silently degrade to MergePullRequest). Status
+// mapping is MergePullRequest's: 405 -> ErrPullRequestNotMergeable, 409 (the
+// head was modified / does not match sha) -> ErrMergeConflict, the rest via
+// classifyStatus.
+func (c *Client) MergePullRequestAtHead(ctx context.Context, scope forge.CredentialScope,
+	repo RepoRef, prNumber int, method MergeMethod, expectedHeadSHA string) error {
+	if strings.TrimSpace(expectedHeadSHA) == "" {
+		return errors.New("githubclient: merge pull request at head: expected head sha required")
+	}
+	return c.mergePullRequest(ctx, scope, repo, prNumber, method, expectedHeadSHA)
+}
+
+// mergePullRequest is the shared PUT .../merge body for MergePullRequest and
+// MergePullRequestAtHead. sha is sent only when non-empty.
+func (c *Client) mergePullRequest(ctx context.Context, scope forge.CredentialScope,
+	repo RepoRef, prNumber int, method MergeMethod, sha string) error {
 	installationID, err := installationIDForScope(scope)
 	if err != nil {
 		return err
@@ -1505,6 +1534,9 @@ func (c *Client) MergePullRequest(ctx context.Context, scope forge.CredentialSco
 	}
 
 	body := map[string]string{"merge_method": strings.ToLower(string(method))}
+	if sha != "" {
+		body["sha"] = sha
+	}
 	raw, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("githubclient: marshal merge pull request: %w", err)
@@ -1537,6 +1569,13 @@ func (c *Client) MergePullRequest(ctx context.Context, scope forge.CredentialSco
 	if resp.StatusCode == http.StatusConflict {
 		brief := readBriefBody(resp.Body)
 		return fmt.Errorf("%w: merge pr #%d: %s", ErrMergeConflict, prNumber, brief)
+	}
+	// 422 = the merge request was refused as unprocessable: nothing applied.
+	// ErrMergeUnprocessable rides ALONGSIDE ErrValidation (multi-%w), so the
+	// typed refusal is distinguishable from a generic validation error.
+	if resp.StatusCode == http.StatusUnprocessableEntity {
+		brief := readBriefBody(resp.Body)
+		return fmt.Errorf("%w: %w: merge pr #%d: %s", ErrValidation, ErrMergeUnprocessable, prNumber, brief)
 	}
 	return classifyStatus("merge pull request", resp)
 }

@@ -12,6 +12,7 @@ import (
 	"net/http/httptest"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -2281,6 +2282,133 @@ func TestMergePullRequest_ValidationErrors(t *testing.T) {
 				t.Errorf("err = %v, want substring %q", err, tc.wantSubst)
 			}
 		})
+	}
+}
+
+// TestMergePullRequestAtHead_SendsShaAndMethod pins the head pin on the wire
+// (ADR-093 D3, E87.5 / #4296): the decoded PUT body carries sha == the
+// expected head and the lower-cased squash merge_method. Decoding (rather than
+// substring-matching) makes an absent sha key read as "", so deleting the
+// body["sha"] write turns this RED.
+func TestMergePullRequestAtHead_SendsShaAndMethod(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	const head = "0123456789abcdef0123456789abcdef01234567"
+	if err := c.MergePullRequestAtHead(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash, head); err != nil {
+		t.Fatalf("MergePullRequestAtHead: %v", err)
+	}
+	if fg.gotMethod != http.MethodPut || fg.gotPath != "/repos/x/y/pulls/7/merge" {
+		t.Fatalf("request = %s %s, want PUT /repos/x/y/pulls/7/merge", fg.gotMethod, fg.gotPath)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode body %q: %v", fg.gotBody, err)
+	}
+	if body["sha"] != head {
+		t.Errorf("body sha = %q, want %q (body %s)", body["sha"], head, fg.gotBody)
+	}
+	if body["merge_method"] != "squash" {
+		t.Errorf("body merge_method = %q, want squash", body["merge_method"])
+	}
+}
+
+// TestMergePullRequest_OmitsSha pins that the UNPINNED merge stays byte-shaped
+// as before: no sha key, so a pre-existing caller is not suddenly pinned.
+func TestMergePullRequest_OmitsSha(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+
+	if err := c.MergePullRequest(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash); err != nil {
+		t.Fatalf("MergePullRequest: %v", err)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.gotBody, &body); err != nil {
+		t.Fatalf("decode body %q: %v", fg.gotBody, err)
+	}
+	if _, ok := body["sha"]; ok {
+		t.Errorf("unpinned merge body carries sha: %s", fg.gotBody)
+	}
+}
+
+// TestMergePullRequestAtHead_EmptyShaRefusedBeforeHTTP: an empty (or
+// whitespace) expected head is refused with ZERO requests reaching the server,
+// so the pinned seam can never degrade into an unpinned merge.
+func TestMergePullRequestAtHead_EmptyShaRefusedBeforeHTTP(t *testing.T) {
+	var hits atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		hits.Add(1)
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	c, _ := newTestClient(t, srv, nil)
+
+	for _, sha := range []string{"", "   "} {
+		err := c.MergePullRequestAtHead(context.Background(), forge.FromGitHubInstallationID(42),
+			RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash, sha)
+		if err == nil || !strings.Contains(err.Error(), "expected head sha required") {
+			t.Errorf("sha %q: err = %v, want expected-head-sha refusal", sha, err)
+		}
+	}
+	if n := hits.Load(); n != 0 {
+		t.Errorf("server hits = %d, want 0 (refused before HTTP)", n)
+	}
+}
+
+// TestMergePullRequestAtHead_StatusMapping: the pinned merge maps statuses
+// exactly like MergePullRequest — 405 not mergeable, 409 head modified / sha
+// mismatch -> ErrMergeConflict, 422 -> ErrValidation.
+func TestMergePullRequestAtHead_StatusMapping(t *testing.T) {
+	cases := []struct {
+		status int
+		body   string
+		want   error
+	}{
+		{http.StatusMethodNotAllowed, `{"message":"Pull Request is not mergeable"}`, ErrPullRequestNotMergeable},
+		{http.StatusConflict, `{"message":"Head branch was modified. Review and try the merge again."}`, ErrMergeConflict},
+		{http.StatusUnprocessableEntity, `{"message":"Validation Failed"}`, ErrValidation},
+	}
+	for _, tc := range cases {
+		t.Run(http.StatusText(tc.status), func(t *testing.T) {
+			fg, srv := newFakeGitHub(t)
+			fg.mergePullStatus = tc.status
+			fg.mergePullBody = tc.body
+			c, _ := newTestClient(t, srv, nil)
+
+			err := c.MergePullRequestAtHead(context.Background(), forge.FromGitHubInstallationID(42),
+				RepoRef{Owner: "x", Name: "y"}, 7, MergeMethodSquash, "abc123")
+			if err == nil || !errors.Is(err, tc.want) {
+				t.Errorf("status %d: err = %v, want %v", tc.status, err, tc.want)
+			}
+			// Only the PUT's 422 carries the typed unprocessable refusal the
+			// merge-dispatch ledger releases on.
+			if got := errors.Is(err, ErrMergeUnprocessable); got != (tc.status == http.StatusUnprocessableEntity) {
+				t.Errorf("status %d: errors.Is(err, ErrMergeUnprocessable) = %v", tc.status, got)
+			}
+		})
+	}
+}
+
+// TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal: an HTTP-200
+// GraphQL error envelope that is not a known precondition refusal (here an
+// INTERNAL error) is ErrValidation ONLY, never a typed refusal sentinel, so
+// the merge-dispatch ledger treats its outcome as uncertain.
+func TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.graphqlBody = `{"data":null,"errors":[{"type":"INTERNAL","message":"Something went wrong while executing your query."}]}`
+	c, _ := newTestClient(t, srv, nil)
+	err := c.EnableAutoMerge(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, 42, MergeMethodSquash)
+	if !errors.Is(err, ErrValidation) {
+		t.Fatalf("err = %v, want ErrValidation", err)
+	}
+	for _, typed := range []error{ErrMergeUnprocessable, ErrPullRequestUnstableStatus, ErrPullRequestCleanStatus,
+		ErrPullRequestNotMergeable, ErrMergeConflict} {
+		if errors.Is(err, typed) {
+			t.Errorf("a generic GraphQL error must not wrap %v: %v", typed, err)
+		}
 	}
 }
 

@@ -43,6 +43,16 @@ const mcqBase = "main"
 type mcqPR struct {
 	head, branch, state string
 	merged              bool
+	// mergeableState is served as GET /pulls/{n}'s mergeable_state ("" by
+	// default, which merge-on-pass reads as not a positive answer).
+	mergeableState string
+}
+
+// mcqPut is one recorded PUT /pulls/{n}/merge (the head-pinned merge).
+type mcqPut struct {
+	PR     int
+	SHA    string `json:"sha"`
+	Method string `json:"merge_method"`
 }
 
 // mcqGitHub serves several PRs: GET /pulls/{n} answers each PR's live state;
@@ -75,6 +85,14 @@ type mcqGitHub struct {
 	reviewsStatus map[int]int
 	checks        map[string]string
 	checksStatus  map[string]int
+	// puts records every PUT /pulls/{n}/merge; putStatus[n] answers it with
+	// that status instead; onPut, when set, runs first on every PUT (outside
+	// the lock: the park seam). A PUT whose sha is not the PR's head answers
+	// 409 like GitHub. A successful PUT marks the PR merged and closed and
+	// MOVES THE BASE: every other open PR's head then reads behind.
+	puts      []mcqPut
+	putStatus map[int]int
+	onPut     func(n int)
 }
 
 // mcqGreenChecks is the default check-runs listing: one completed, green run.
@@ -89,8 +107,8 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		pr, ok := g.prs[n]
 		var body string
 		if ok {
-			body = fmt.Sprintf(`{"node_id":"PR_%d","state":%q,"merged":%t,"head":{"sha":%q,"ref":%q},"base":{"ref":%q}}`,
-				n, pr.state, pr.merged, pr.head, pr.branch, mcqBase)
+			body = fmt.Sprintf(`{"node_id":"PR_%d","state":%q,"merged":%t,"mergeable_state":%q,"head":{"sha":%q,"ref":%q},"base":{"ref":%q}}`,
+				n, pr.state, pr.merged, pr.mergeableState, pr.head, pr.branch, mcqBase)
 		}
 		g.mu.Unlock()
 		if !ok {
@@ -154,6 +172,43 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		w.WriteHeader(http.StatusCreated)
 		_, _ = w.Write([]byte(`{"sha":"` + sha + `"}`))
 	})
+	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge", func(w http.ResponseWriter, r *http.Request) {
+		n, _ := strconv.Atoi(r.PathValue("number"))
+		var put mcqPut
+		_ = json.NewDecoder(r.Body).Decode(&put)
+		put.PR = n
+		g.mu.Lock()
+		onPut := g.onPut
+		g.mu.Unlock()
+		if onPut != nil {
+			onPut(n)
+		}
+		g.mu.Lock()
+		defer g.mu.Unlock()
+		g.puts = append(g.puts, put)
+		pr, ok := g.prs[n]
+		status := g.putStatus[n]
+		switch {
+		case !ok:
+			status = http.StatusNotFound
+		case status == 0 && put.SHA != "" && put.SHA != pr.head:
+			status = http.StatusConflict
+		}
+		if status != 0 {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"message":"Head branch was modified. Review and try the merge again."}`))
+			return
+		}
+		pr.merged, pr.state = true, "closed"
+		tip := fmt.Sprintf("base-after-pr-%d", n)
+		for other, o := range g.prs {
+			if other != n && o.state == "open" {
+				g.behind[o.head] = append(g.behind[o.head], tip)
+			}
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"merged":true,"sha":"merged-` + put.SHA + `"}`))
+	})
 	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}/reviews", func(w http.ResponseWriter, r *http.Request) {
 		n, _ := strconv.Atoi(r.PathValue("number"))
 		g.mu.Lock()
@@ -204,6 +259,12 @@ func (g *mcqGitHub) set(fn func()) {
 	fn()
 }
 
+func (g *mcqGitHub) putCalls() []mcqPut {
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return append([]mcqPut(nil), g.puts...)
+}
+
 func (g *mcqGitHub) mergeCalls() []rebaseMergeCall {
 	g.mu.Lock()
 	defer g.mu.Unlock()
@@ -242,7 +303,8 @@ func newMCQFixture(t *testing.T) *mcqFixture {
 		store: mergequeue.NewPostgresStore(pool),
 		gh: &mcqGitHub{prs: map[int]*mcqPR{}, behind: map[string][]string{},
 			compareStatus: map[string]int{}, mergeSHA: map[string]string{}, mergeStatus: map[string]int{},
-			reviews: map[int]string{}, reviewsStatus: map[int]int{}, checks: map[string]string{}, checksStatus: map[string]int{}},
+			reviews: map[int]string{}, reviewsStatus: map[int]int{}, checks: map[string]string{}, checksStatus: map[string]int{},
+			putStatus: map[int]int{}},
 	}
 	f.srv = New(Config{
 		Addr:        "127.0.0.1:0",
@@ -1064,11 +1126,14 @@ func TestMergeCandidateQueue_FanInNotSerialized(t *testing.T) {
 // override left nil falls through to the wrapped store.
 type mcqFaultStore struct {
 	mergequeue.Store
-	mu           sync.Mutex
-	calls        []mcqCall
-	enqueue      func(mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error)
-	admitNext    func(mergequeue.Base) (mergequeue.Admission, error)
-	unadmit      func(uuid.UUID) (mergequeue.Entry, error)
+	mu        sync.Mutex
+	calls     []mcqCall
+	enqueue   func(mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error)
+	admitNext func(mergequeue.Base) (mergequeue.Admission, error)
+	unadmit   func(uuid.UUID) (mergequeue.Entry, error)
+	// unadmitAt, when set, replaces Unadmit with the caller's ctx and epoch
+	// (the barrier seam of merge_queue_pump_test.go); it wins over unadmit.
+	unadmitAt    func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error)
 	setPhase     func(uuid.UUID, mergequeue.Phase) (mergequeue.Entry, error)
 	reanchor     func(uuid.UUID, string, string) (mergequeue.Entry, error)
 	settle       func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
@@ -1143,6 +1208,9 @@ func (s *mcqFaultStore) Enqueue(ctx context.Context, req mergequeue.EnqueueReque
 	if s.enqueue != nil {
 		return s.enqueue(req)
 	}
+	if s.Store == nil {
+		return mergequeue.EnqueueResult{}, errMCQNilStore
+	}
 	return s.Store.Enqueue(ctx, req)
 }
 
@@ -1151,15 +1219,28 @@ func (s *mcqFaultStore) AdmitNext(ctx context.Context, base mergequeue.Base) (me
 	if s.admitNext != nil {
 		return s.admitNext(base)
 	}
+	if s.Store == nil {
+		return mergequeue.Admission{}, errMCQNilStore
+	}
 	return s.Store.AdmitNext(ctx, base)
 }
 
-func (s *mcqFaultStore) Unadmit(ctx context.Context, id uuid.UUID) (mergequeue.Entry, error) {
+// errMCQNilStore is a pure fake's (nil embedded Store) answer to a method it
+// has no override for: a named error instead of a nil-pointer panic.
+var errMCQNilStore = fmt.Errorf("mcqFaultStore: no embedded store and no override for this method")
+
+func (s *mcqFaultStore) Unadmit(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
 	s.record(ctx, "Unadmit", id)
+	if s.unadmitAt != nil {
+		return s.unadmitAt(ctx, id, epoch)
+	}
 	if s.unadmit != nil {
 		return s.unadmit(id)
 	}
-	return s.Store.Unadmit(ctx, id)
+	if s.Store == nil {
+		return mergequeue.Entry{}, errMCQNilStore
+	}
+	return s.Store.Unadmit(ctx, id, epoch)
 }
 
 func (s *mcqFaultStore) Reanchor(ctx context.Context, id uuid.UUID, headSHA, baseSHA string) (mergequeue.Entry, error) {
@@ -1167,15 +1248,34 @@ func (s *mcqFaultStore) Reanchor(ctx context.Context, id uuid.UUID, headSHA, bas
 	if s.reanchor != nil {
 		return s.reanchor(id, headSHA, baseSHA)
 	}
+	if s.Store == nil {
+		return mergequeue.Entry{}, errMCQNilStore
+	}
 	return s.Store.Reanchor(ctx, id, headSHA, baseSHA)
 }
 
-func (s *mcqFaultStore) SetPhase(ctx context.Context, id uuid.UUID, phase mergequeue.Phase) (mergequeue.Entry, error) {
+// ReanchorAt records as "Reanchor" and honours the reanchor override, so a
+// test counting or failing re-anchors sees the admission's CAS re-anchor.
+func (s *mcqFaultStore) ReanchorAt(ctx context.Context, id uuid.UUID, epoch int64, headSHA, baseSHA string) (mergequeue.Entry, error) {
+	s.record(ctx, "Reanchor", id)
+	if s.reanchor != nil {
+		return s.reanchor(id, headSHA, baseSHA)
+	}
+	if s.Store == nil {
+		return mergequeue.Entry{}, errMCQNilStore
+	}
+	return s.Store.ReanchorAt(ctx, id, epoch, headSHA, baseSHA)
+}
+
+func (s *mcqFaultStore) SetPhase(ctx context.Context, id uuid.UUID, epoch int64, phase mergequeue.Phase) (mergequeue.Entry, error) {
 	s.record(ctx, "SetPhase", id)
 	if s.setPhase != nil {
 		return s.setPhase(id, phase)
 	}
-	return s.Store.SetPhase(ctx, id, phase)
+	if s.Store == nil {
+		return mergequeue.Entry{}, errMCQNilStore
+	}
+	return s.Store.SetPhase(ctx, id, epoch, phase)
 }
 
 func (s *mcqFaultStore) Settle(ctx context.Context, id uuid.UUID, state mergequeue.State, reason string) (mergequeue.SettleResult, error) {
@@ -1183,13 +1283,80 @@ func (s *mcqFaultStore) Settle(ctx context.Context, id uuid.UUID, state mergeque
 	if s.settle != nil {
 		return s.settle(id, state, reason)
 	}
+	if s.Store == nil {
+		return mergequeue.SettleResult{}, errMCQNilStore
+	}
 	return s.Store.Settle(ctx, id, state, reason)
+}
+
+// SettleAt records as "Settle" and honours the settle override, so a test
+// counting or failing settles sees the admission's CAS settle.
+func (s *mcqFaultStore) SettleAt(ctx context.Context, id uuid.UUID, epoch int64, state mergequeue.State, reason string) (mergequeue.SettleResult, error) {
+	s.record(ctx, "Settle", id)
+	if s.settle != nil {
+		return s.settle(id, state, reason)
+	}
+	if s.Store == nil {
+		return mergequeue.SettleResult{}, errMCQNilStore
+	}
+	return s.Store.SettleAt(ctx, id, epoch, state, reason)
+}
+
+func (s *mcqFaultStore) ListForBase(ctx context.Context, base mergequeue.Base) ([]mergequeue.Entry, error) {
+	s.record(ctx, "ListForBase", uuid.Nil)
+	if s.Store == nil {
+		return nil, errMCQNilStore
+	}
+	return s.Store.ListForBase(ctx, base)
+}
+
+func (s *mcqFaultStore) RecentLineTurns(ctx context.Context, base mergequeue.Base, limit int) ([]time.Duration, error) {
+	s.record(ctx, "RecentLineTurns", uuid.Nil)
+	if s.Store == nil {
+		return nil, errMCQNilStore
+	}
+	return s.Store.RecentLineTurns(ctx, base, limit)
+}
+
+func (s *mcqFaultStore) ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (mergequeue.DispatchClaim, error) {
+	s.record(ctx, "ClaimMergeDispatch", runID)
+	if s.Store == nil {
+		return mergequeue.DispatchClaim{}, errMCQNilStore
+	}
+	return s.Store.ClaimMergeDispatch(ctx, runID, path, headSHA)
+}
+
+func (s *mcqFaultStore) MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error {
+	s.record(ctx, "MarkMergeDispatchFailed", runID)
+	if s.Store == nil {
+		return errMCQNilStore
+	}
+	return s.Store.MarkMergeDispatchFailed(ctx, runID, cause)
+}
+
+func (s *mcqFaultStore) ReleaseMergeDispatch(ctx context.Context, claim mergequeue.DispatchClaim) error {
+	s.record(ctx, "ReleaseMergeDispatch", claim.RunID)
+	if s.Store == nil {
+		return errMCQNilStore
+	}
+	return s.Store.ReleaseMergeDispatch(ctx, claim)
+}
+
+func (s *mcqFaultStore) MergeDispatch(ctx context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error) {
+	s.record(ctx, "MergeDispatch", runID)
+	if s.Store == nil {
+		return mergequeue.DispatchClaim{}, false, errMCQNilStore
+	}
+	return s.Store.MergeDispatch(ctx, runID)
 }
 
 func (s *mcqFaultStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (mergequeue.Status, bool, error) {
 	s.record(ctx, "ActiveForRun", runID)
 	if s.activeForRun != nil {
 		return s.activeForRun(runID)
+	}
+	if s.Store == nil {
+		return mergequeue.Status{}, false, errMCQNilStore
 	}
 	return s.Store.ActiveForRun(ctx, runID)
 }
@@ -1199,15 +1366,21 @@ func (s *mcqFaultStore) ActiveBases(ctx context.Context) ([]mergequeue.Base, err
 	if s.activeBases != nil {
 		return s.activeBases()
 	}
+	if s.Store == nil {
+		return nil, errMCQNilStore
+	}
 	return s.Store.ActiveBases(ctx)
 }
 
-func (s *mcqFaultStore) MarkMergeIntent(ctx context.Context, id uuid.UUID, record mergequeue.RecordIntentFunc) (mergequeue.MergeIntentResult, error) {
+func (s *mcqFaultStore) MarkMergeIntent(ctx context.Context, id uuid.UUID, req *mergequeue.MergeIntentRequest) (mergequeue.MergeIntentResult, error) {
 	s.record(ctx, "MarkMergeIntent", id)
 	if s.markIntent != nil {
 		return s.markIntent(id)
 	}
-	return s.Store.MarkMergeIntent(ctx, id, record)
+	if s.Store == nil {
+		return mergequeue.MergeIntentResult{}, errMCQNilStore
+	}
+	return s.Store.MarkMergeIntent(ctx, id, req)
 }
 
 // WithMergeIntentLock delegates to the wrapped store's lock; a pure fake (nil
@@ -1390,7 +1563,7 @@ func TestMergeCandidateQueue_WriteFailuresAreBestEffort(t *testing.T) {
 			admitNext: func(mergequeue.Base) (mergequeue.Admission, error) { return mergequeue.Admission{}, nil },
 		}
 		srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
-		if !srv.applyMergeCandidateStartToEntry(ctx, live, mergeCandidateStateFailed) {
+		if srv.applyMergeCandidateStartToEntry(ctx, live, mergeCandidateStateFailed, mergeQueueVerifiedSourceAlreadyPassed) != admitSettled {
 			t.Fatal("a failed pass start must report the entry settled")
 		}
 		if fs.called("Settle") != 1 || fs.called("AdmitNext") != 1 {
@@ -1411,7 +1584,7 @@ func TestMergeCandidateQueue_WriteFailuresAreBestEffort(t *testing.T) {
 		}
 		srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: fs})
 		srv.mergeCandidateQueueOnVerdict(ctx, live.RunID, "a1", mergeCandidateResultPassed)
-		if srv.applyMergeCandidateStartToEntry(ctx, live, mergeCandidateStateNotRequired) {
+		if srv.applyMergeCandidateStartToEntry(ctx, live, mergeCandidateStateNotRequired, mergeQueueVerifiedSourceAlreadyPassed) == admitSettled {
 			t.Fatal("a not_required start must not settle the entry")
 		}
 		if len(phases) != 2 || phases[0] != mergequeue.PhasePassed || phases[1] != mergequeue.PhasePassed {

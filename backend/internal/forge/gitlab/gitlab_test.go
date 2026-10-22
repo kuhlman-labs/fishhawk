@@ -459,6 +459,70 @@ func TestMergeSquashParam(t *testing.T) {
 	}
 }
 
+// TestMergePullRequestAtHead_PinsSHA_NoAutoMerge pins the head-pinned merge
+// (forge.HeadPinnedMerger, ADR-093 D3 / E87.5): the PUT carries sha == the
+// expected head and squash, and NEVER merge_when_pipeline_succeeds (a queued
+// merge would wait on the pipeline while the base may move).
+func TestMergePullRequestAtHead_PinsSHA_NoAutoMerge(t *testing.T) {
+	var body map[string]any
+	mux := http.NewServeMux()
+	mux.HandleFunc("PUT /api/v4/projects/5/merge_requests/7/merge", func(w http.ResponseWriter, r *http.Request) {
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		writeJSON(w, http.StatusOK, `{"iid":7,"state":"merged"}`)
+	})
+	f, _ := newForge(t, mux)
+	if err := f.MergePullRequestAtHead(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, forge.MergeMethodSquash, "headsha1"); err != nil {
+		t.Fatalf("MergePullRequestAtHead: %v", err)
+	}
+	if body["sha"] != "headsha1" {
+		t.Errorf("sha = %v, want headsha1", body["sha"])
+	}
+	if body["squash"] != true {
+		t.Errorf("squash = %v, want true", body["squash"])
+	}
+	if _, ok := body["merge_when_pipeline_succeeds"]; ok {
+		t.Errorf("pinned merge set merge_when_pipeline_succeeds: %v", body)
+	}
+}
+
+// TestMergePullRequestAtHead_ErrorMapping: 409 (sha != source HEAD) maps to
+// forge.ErrMergeConflict, 405/406 to ErrPullRequestNotMergeable, and an empty
+// head is refused with zero requests.
+func TestMergePullRequestAtHead_ErrorMapping(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   error
+	}{
+		{http.StatusConflict, forge.ErrMergeConflict},
+		{http.StatusMethodNotAllowed, forge.ErrPullRequestNotMergeable},
+		{http.StatusNotAcceptable, forge.ErrPullRequestNotMergeable},
+	} {
+		mux := http.NewServeMux()
+		mux.HandleFunc("PUT /api/v4/projects/5/merge_requests/7/merge", func(w http.ResponseWriter, r *http.Request) {
+			writeJSON(w, tc.status, `{"message":"refused"}`)
+		})
+		f, _ := newForge(t, mux)
+		err := f.MergePullRequestAtHead(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, forge.MergeMethodSquash, "headsha1")
+		if !errors.Is(err, tc.want) {
+			t.Errorf("status %d: err = %v, want %v", tc.status, err, tc.want)
+		}
+	}
+
+	hits := 0
+	mux := http.NewServeMux()
+	mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		hits++
+		writeJSON(w, http.StatusOK, `{}`)
+	})
+	f, _ := newForge(t, mux)
+	if err := f.MergePullRequestAtHead(context.Background(), gitlabScope("5"), forge.RepoRef{}, 7, forge.MergeMethodSquash, " "); err == nil {
+		t.Error("empty head: want error")
+	}
+	if hits != 0 {
+		t.Errorf("empty head: %d requests, want 0", hits)
+	}
+}
+
 // TestGetBranchSHAMissing pins the ("", false, nil) contract for a missing
 // branch, and the present-branch happy path.
 func TestGetBranchSHAMissing(t *testing.T) {

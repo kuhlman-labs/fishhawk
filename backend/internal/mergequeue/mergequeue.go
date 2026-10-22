@@ -4,8 +4,9 @@
 // time, consuming no runner slot. Every mutation is one transaction under a
 // per-base advisory lock, scoped by account through runs.account_id. ADR-093's
 // merge queue reuses the rows, FIFO order and lock order unchanged, adding
-// only the operator's merge intent (merge_intent_at, 0107) and the line-turn
-// read. README.md is the contract.
+// only the operator's merge intent (merge_intent_at, 0107), its recorded
+// audit sequence and the admission epoch (0108), the per-run merge-dispatch
+// ledger (0108) and the line-turn read. README.md is the contract.
 package mergequeue
 
 import (
@@ -85,6 +86,11 @@ var (
 	// holder may have overlapped fn. fn's writes stand; the caller decides.
 	// It also wraps pglock.ErrLockLapsed.
 	ErrIntentLockLapsed = errors.New("mergequeue: merge-intent lock lapsed")
+	// ErrAlreadyDispatched is a ClaimMergeDispatch for a run that already
+	// holds a dispatch claim (dispatched or dispatch_failed): the UNIQUE
+	// run_id of merge_dispatch_claims refused the insert, and the caller must
+	// not call the forge (approval condition D1).
+	ErrAlreadyDispatched = errors.New("mergequeue: merge already dispatched for this run")
 )
 
 // Base is one queue: a repository base ref inside one account. AccountID is
@@ -119,6 +125,14 @@ type Entry struct {
 	// MergeIntentAt is when the operator's merge intent was recorded on this
 	// episode (0107, ADR-093 D2); set once, never cleared.
 	MergeIntentAt *time.Time
+	// MergeIntentSequence is the audit sequence of the merge_queue_entered
+	// row that recorded the intent (0108), stamped with MergeIntentAt and
+	// never overwritten; 0 for NULL (no intent, or one recorded before 0108).
+	MergeIntentSequence int64
+	// AdmissionEpoch is bumped by every admission (AdmitNext's admit and its
+	// stale re-claim, 0108). The admission-owned writes (Unadmit, SetPhase,
+	// ReanchorAt, SettleAt) are compare-and-swaps on it.
+	AdmissionEpoch int64
 }
 
 // Base returns the queue the entry belongs to.
@@ -145,6 +159,57 @@ type EnqueueRequest struct {
 	// Enqueue returns it wrapped in ErrIntentUnrecorded. Never called when
 	// MergeIntent is false or the intent was already recorded.
 	RecordIntent RecordIntentFunc
+	// IntentSequence is the merge_queue_entered row's audit sequence, stamped
+	// as merge_intent_sequence in the same statement as merge_intent_at and
+	// only when THIS call records the intent (0 stamps NULL).
+	IntentSequence int64
+}
+
+// MergeIntentRequest is MarkMergeIntent's request; a nil request records
+// the intent with no sequence and no callback.
+type MergeIntentRequest struct {
+	// IntentSequence is stamped as merge_intent_sequence with
+	// merge_intent_at, only on the NULL-to-set transition (0 stamps NULL).
+	IntentSequence int64
+	// Record is EnqueueRequest.RecordIntent's callback for this call.
+	Record RecordIntentFunc
+}
+
+// DispatchState is a merge_dispatch_claims.state value.
+type DispatchState string
+
+// Dispatch claim states.
+const (
+	DispatchDispatched DispatchState = "dispatched"
+	DispatchFailed     DispatchState = "dispatch_failed"
+	// DispatchUnknown is never stored: ClaimMergeDispatch returns it with
+	// ErrAlreadyDispatched when the existing claim could not be read back.
+	DispatchUnknown DispatchState = "unknown"
+)
+
+// DispatchUnknownField fills a claim's Path and HeadSHA alongside
+// DispatchUnknown.
+const DispatchUnknownField = "unknown"
+
+// Dispatch paths: the three merge dispatch paths that claim (approval
+// condition D1).
+const (
+	DispatchPathInline    = "inline"
+	DispatchPathDelegated = "delegated"
+	DispatchPathQueue     = "queue"
+)
+
+// DispatchClaim is one merge_dispatch_claims row: the run's ONE merge
+// dispatch claim (0108). FailureCause and FailedAt are set only on
+// dispatch_failed.
+type DispatchClaim struct {
+	RunID        uuid.UUID
+	State        DispatchState
+	Path         string
+	HeadSHA      string
+	ClaimedAt    time.Time
+	FailedAt     *time.Time
+	FailureCause string
 }
 
 // RecordIntentFunc is the record-before-commit callback of a merge-intent
@@ -231,19 +296,36 @@ type Status struct {
 type Store interface {
 	Enqueue(ctx context.Context, req EnqueueRequest) (EnqueueResult, error)
 	AdmitNext(ctx context.Context, base Base) (Admission, error)
-	Unadmit(ctx context.Context, entryID uuid.UUID) (Entry, error)
-	SetPhase(ctx context.Context, entryID uuid.UUID, phase Phase) (Entry, error)
+	Unadmit(ctx context.Context, entryID uuid.UUID, epoch int64) (Entry, error)
+	SetPhase(ctx context.Context, entryID uuid.UUID, epoch int64, phase Phase) (Entry, error)
 	Reanchor(ctx context.Context, entryID uuid.UUID, headSHA, baseSHA string) (Entry, error)
+	ReanchorAt(ctx context.Context, entryID uuid.UUID, epoch int64, headSHA, baseSHA string) (Entry, error)
 	Settle(ctx context.Context, entryID uuid.UUID, state State, reason string) (SettleResult, error)
+	SettleAt(ctx context.Context, entryID uuid.UUID, epoch int64, state State, reason string) (SettleResult, error)
 	ActiveForRun(ctx context.Context, runID uuid.UUID) (Status, bool, error)
 	ListForBase(ctx context.Context, base Base) ([]Entry, error)
 	ActiveBases(ctx context.Context) ([]Base, error)
-	MarkMergeIntent(ctx context.Context, entryID uuid.UUID, record RecordIntentFunc) (MergeIntentResult, error)
+	MarkMergeIntent(ctx context.Context, entryID uuid.UUID, req *MergeIntentRequest) (MergeIntentResult, error)
 	RecentLineTurns(ctx context.Context, base Base, limit int) ([]time.Duration, error)
 	// WithMergeIntentLock runs fn under the run's merge-intent lock; fn's
 	// context is bounded by the intent fn deadline (even when ctx has none)
 	// and must not take another pglock lock (README.md § "Merge-intent lock").
 	WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error
+	// ClaimMergeDispatch claims the run's ONE merge dispatch (approval
+	// condition D1); a run already holding a claim is ErrAlreadyDispatched,
+	// returned with that existing claim. Call it under WithMergeIntentLock,
+	// BEFORE the forge (README.md § "Merge-dispatch ledger").
+	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (DispatchClaim, error)
+	// MarkMergeDispatchFailed moves the run's claim to dispatch_failed with
+	// cause, for an UNCERTAIN forge outcome; that claim is never deleted by
+	// Fishhawk (reconciliation or the operator re-arm clears it).
+	MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error
+	// ReleaseMergeDispatch deletes claim, a compare-and-swap on the exact
+	// claim, for a forge outcome that applied nothing; a claim that no
+	// longer matches is ErrStateConflict and is left alone.
+	ReleaseMergeDispatch(ctx context.Context, claim DispatchClaim) error
+	// MergeDispatch reads the run's dispatch claim (found=false: none).
+	MergeDispatch(ctx context.Context, runID uuid.UUID) (DispatchClaim, bool, error)
 }
 
 // validate refuses a malformed Base before any SQL runs.

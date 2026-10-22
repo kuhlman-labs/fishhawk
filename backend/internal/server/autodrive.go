@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -306,9 +307,10 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 		// delegated arm — it is the check the operator merge endpoint does NOT
 		// share (a human merge deliberately does not block on a review stage
 		// still awaiting approval; resolveReviewStageOnMerge settles it ON the
-		// merge). The acceptance-gate + nil-merger + dispatch tail is the shared
-		// helper both surfaces converge on (E48.7 / #1954). The merge overlap
-		// guard (#4119) is evaluated BEFORE that tail by both callers —
+		// merge). The acceptance-gate + nil-merger + dispatch tail is the
+		// extracted helper (E48.7 / #1954), run under the run's merge-intent lock
+		// after the queue-ownership check (ADR-093 slice 2, delegatedMergeUnderLock).
+		// The merge overlap guard (#4119) is evaluated BEFORE that tail —
 		// handleMergeRun inline, this arm via mergeOverlapAutoDriveHold (#4582).
 		if !mergeGateReady(runRow, stages) {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but real merge state not ready; observe-only",
@@ -344,33 +346,9 @@ func (s *Server) AutoDriveRunGate(ctx context.Context, runRow *run.Run, id Ident
 				slog.Bool("check_read_error", gate.Cause != nil))
 			return observeOnly(mergeCandidateObserveNote(gate)), nil
 		} else {
-			// #4397: the gate's admitted live head rides into the pre-merge
-			// republish so the required check lands where the merge will.
-			outcome, gateState, derr := s.dispatchAcceptanceGatedMerge(ctx, runRow, stages, merger, gate.HeadSHA)
-			switch outcome {
-			case mergeDispatchAcceptanceNotReady:
-				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but acceptance gate not passed; observe-only",
-					slog.String("run_id", runRow.ID.String()),
-					slog.String("acceptance_gate_state", gateState),
-					slog.Bool("acceptance_read_error", derr != nil))
-				return observeOnly("acceptance gate not passed (fail-closed); observe-only"), nil
-			case mergeDispatchNoMerger:
-				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but no merge client configured; observe-only",
-					slog.String("run_id", runRow.ID.String()))
-				return observeOnly("merge seam unconfigured (fail-closed); observe-only"), nil
-			case mergeDispatchMerged:
-				if derr != nil {
-					return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
-				}
-				// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
-				// the PR has landed. The settle (pr_merged + run completion) is
-				// deliberately left to the existing pull_request-closed webhook /
-				// resolveReviewStageOnMerge path that fires when GitHub actually
-				// merges — the actor must not record a merge GitHub may still
-				// block (failing checks) or defer (queued). Recording pr_merged
-				// here would complete the run before the merge is real.
-				return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: "enabled auto-merge; webhook settles on merge"}, nil
-			}
+			// ADR-093 slice 2 (E87.5 / #4296): the dispatch tail runs under the
+			// run's merge-intent lock, after the queue-ownership check.
+			return s.delegatedMergeUnderLock(ctx, runRow, stages, merger, gate)
 		}
 	}
 
@@ -503,11 +481,117 @@ func mergeCandidateObserveNote(gate mergeCandidateGateResult) string {
 	return "merge-candidate check could not read the forge or audit state (ADR-090 D7, fail-closed); observe-only"
 }
 
+// autoDriveMergeLockAcquireTimeout bounds how long the delegated may_merge arm
+// waits to take the run's merge-intent lock (the same bound as the inline
+// merge_run's, approval condition (g)); a wait past it is observe-only. A var
+// so a test can shorten it.
+var autoDriveMergeLockAcquireTimeout = 30 * time.Second
+
+// Delegated may_merge observe-only notes for the ADR-093 slice 2 (E87.5 /
+// #4296) merge-queue and dispatch-ledger holds. The merger is never called on
+// any of them.
+const (
+	autoDriveNoteQueueOwnsMerge    = "the merge queue owns this run's merge (ADR-093 D3): its entry carries the operator's merge intent and the queue merges it pinned to the verified head on its green pass; the delegated arm never dispatches it; observe-only"
+	autoDriveNoteQueueUnreadable   = "merge-queue ownership could not be read (fail-closed); observe-only"
+	autoDriveNoteLockUnavailable   = "the run's merge-intent lock could not be taken (fail-closed); observe-only"
+	autoDriveNoteAlreadyClaimed    = "a merge dispatch is already claimed for this run on the merge-dispatch ledger (ADR-093 D1), so the forge was not called; a dispatch_failed claim needs reconciliation (the PR reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); observe-only"
+	autoDriveNoteDispatchUnclaimed = "the run's merge dispatch could not be claimed on the merge-dispatch ledger (ADR-093 D1, fail-closed); observe-only"
+)
+
+// delegatedMergeUnderLock runs the delegated may_merge dispatch tail under the
+// run's merge-intent lock (ADR-093 slice 2, E87.5 / #4296), the SAME lock
+// merge-on-pass and the inline merge_run tail take, so the three dispatch
+// paths take turns. Its FIRST step is the queue-ownership check (approval
+// condition D2): while the run has an active queue entry carrying merge
+// intent, live or held, in any phase, the queue owns the merge and the arm is
+// observe-only with the merger never called; an ownership read error is
+// observe-only too (fail closed). The acquire wait is bounded
+// (autoDriveMergeLockAcquireTimeout); a lock that was never taken is
+// observe-only with nothing claimed or dispatched. A lapse after fn ran is a
+// WARN only: fn's outcome stands. fn starts no detached work.
+func (s *Server) delegatedMergeUnderLock(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, gate mergeCandidateGateResult) (AutoDriveOutcome, error) {
+	acquireCtx, started, stop := boundMergeLockAcquire(ctx, autoDriveMergeLockAcquireTimeout)
+	defer stop()
+	var (
+		out  AutoDriveOutcome
+		oerr error
+		ran  bool
+	)
+	lockErr := s.withRunMergeLock(acquireCtx, runRow.ID, func(lctx context.Context) error {
+		if !started() {
+			return errMergeLockAcquireTimedOut
+		}
+		ran = true
+		out, oerr = s.delegatedMergeLocked(lctx, runRow, stages, merger, gate)
+		return nil
+	})
+	if lockErr != nil {
+		if !ran {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but the merge-intent lock could not be taken; observe-only",
+				slog.String("run_id", runRow.ID.String()), slog.String("error", lockErr.Error()))
+			return observeOnly(autoDriveNoteLockUnavailable), nil
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: merge-intent lock lapsed after the delegated merge ran; its outcome stands",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", lockErr.Error()))
+	}
+	return out, oerr
+}
+
+// delegatedMergeLocked is delegatedMergeUnderLock's fn: the ownership check,
+// then the shared acceptance-gated dispatch tail, translated to the delegated
+// arm's outcome. ctx is the lock fn's context.
+func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, gate mergeCandidateGateResult) (AutoDriveOutcome, error) {
+	owned, oerr := s.mergeQueueOwnsMerge(ctx, runRow.ID)
+	if oerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but merge-queue ownership is unreadable; observe-only",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", oerr.Error()))
+		return observeOnly(autoDriveNoteQueueUnreadable), nil
+	}
+	if owned { // ADR-093 D2: the queue owns the merge; the merger is never called
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but the merge queue owns this run's merge; observe-only",
+			slog.String("run_id", runRow.ID.String()))
+		return observeOnly(autoDriveNoteQueueOwnsMerge), nil
+	}
+	// #4397: the gate's admitted live head rides into the pre-merge
+	// republish so the required check lands where the merge will.
+	outcome, gateState, derr := s.dispatchAcceptanceGatedMerge(ctx, runRow, stages, merger, gate.HeadSHA)
+	switch outcome {
+	case mergeDispatchAcceptanceNotReady:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but acceptance gate not passed; observe-only",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("acceptance_gate_state", gateState),
+			slog.Bool("acceptance_read_error", derr != nil))
+		return observeOnly("acceptance gate not passed (fail-closed); observe-only"), nil
+	case mergeDispatchNoMerger:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but no merge client configured; observe-only",
+			slog.String("run_id", runRow.ID.String()))
+		return observeOnly("merge seam unconfigured (fail-closed); observe-only"), nil
+	case mergeDispatchAlreadyClaimed:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but a merge dispatch is already claimed for this run; the forge was not called",
+			slog.String("run_id", runRow.ID.String()))
+		return observeOnly(autoDriveNoteAlreadyClaimed), nil
+	case mergeDispatchUnclaimed:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but the merge dispatch could not be claimed; observe-only",
+			slog.String("run_id", runRow.ID.String()), slog.String("error", derr.Error()))
+		return observeOnly(autoDriveNoteDispatchUnclaimed), nil
+	}
+	if derr != nil {
+		return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
+	}
+	// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
+	// the PR has landed. The settle (pr_merged + run completion) is
+	// deliberately left to the existing pull_request-closed webhook /
+	// resolveReviewStageOnMerge path that fires when GitHub actually
+	// merges — the actor must not record a merge GitHub may still
+	// block (failing checks) or defer (queued). Recording pr_merged
+	// here would complete the run before the merge is real.
+	return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: "enabled auto-merge; webhook settles on merge"}, nil
+}
+
 // mergeDispatchOutcome classifies what dispatchAcceptanceGatedMerge decided at
-// the shared merge-dispatch tail (E48.7 / #1954) so its two callers — the
-// delegated may_merge arm of AutoDriveRunGate and the operator merge endpoint
-// (handleMergeRun) — translate it to their own surfaces (an observe-only note
-// vs an HTTP status).
+// the shared merge-dispatch tail (E48.7 / #1954) so the delegated may_merge
+// arm of AutoDriveRunGate translates it to an observe-only note or an acted
+// outcome.
 type mergeDispatchOutcome int
 
 const (
@@ -520,6 +604,12 @@ const (
 	// mergeDispatchMerged: the merge was dispatched through the seam. The
 	// returned error, when non-nil, is the seam's own dispatch failure.
 	mergeDispatchMerged
+	// mergeDispatchAlreadyClaimed: the run already holds a merge-dispatch
+	// claim (ADR-093 approval condition D1), so the forge was never called.
+	mergeDispatchAlreadyClaimed
+	// mergeDispatchUnclaimed: the claim itself failed (the returned error),
+	// so the forge was never called — fail-closed.
+	mergeDispatchUnclaimed
 )
 
 // dispatchAcceptanceGatedMerge is the shared merge-dispatch tail extracted from
@@ -536,17 +626,31 @@ const (
 // read error (nil when the gate is simply not-passed rather than unreadable),
 // so the caller can distinguish an evidence hole from a read failure.
 //
-// It is behavior-preserving for the delegated arm and is the SAME path the
-// operator merge endpoint converges on by construction.
+// Its one caller is the delegated may_merge arm, which runs it under the run's
+// merge-intent lock (delegatedMergeUnderLock). handleMergeRun carries its own
+// inline tail (merge_run.go) and merge-on-pass its own pinned merge
+// (merge_queue_merge.go).
 //
-// It does NOT run the merge overlap guard (E83.61 / #4119): both callers
-// evaluate it BEFORE this tail — handleMergeRun inline, the delegated may_merge
-// arm via mergeOverlapAutoDriveHold (#4582). A new caller (#4296's
-// merge-on-pass) carries its own obligation to run it first.
+// It does NOT run the merge overlap guard (E83.61 / #4119): the delegated
+// may_merge arm evaluates it BEFORE this tail via mergeOverlapAutoDriveHold
+// (#4582).
+//
+// Approval condition D1 (ADR-093 slice 2, E87.5 / #4296): after the
+// republish and BEFORE the forge, it claims the run's ONE merge dispatch on
+// the merge-dispatch ledger (path delegated). An existing claim (the queue's,
+// the inline merge_run's or an earlier delegated dispatch, dispatched or
+// dispatch_failed) is mergeDispatchAlreadyClaimed and a claim error is
+// mergeDispatchUnclaimed: the merger is never called on either. A dispatch
+// that fails after the claim is classified once (classifyMergeDispatchOutcome):
+// a refusal that applied nothing releases the claim, anything else moves it to
+// dispatch_failed, which only reconciliation or the operator re-arm clears.
+// Without a wired queue there is no
+// ledger and no queue dispatcher to race, so the dispatch proceeds unclaimed.
 //
 // liveHead is the head mergeCandidateGate admitted (mergeCandidateGateResult.
-// HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it. Empty
-// (an ungated D7 admit, a merged PR) keeps the findHeadSHA resolution.
+// HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it, and
+// the claim records it. Empty (an ungated D7 admit, a merged PR) keeps the
+// findHeadSHA resolution and claims at "unresolved" (the claim is run-scoped).
 func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, liveHead string) (mergeDispatchOutcome, string, error) {
 	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
 	// The admitted set is the SHARED acceptanceGateAdmitsMerge predicate (E66.37
@@ -588,7 +692,36 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	// will land, because findHeadSHA cannot resolve a conflict-resolution,
 	// base-advance or operator-vouched head (mirror of handleMergeRun).
 	_, _ = s.republishAuditCheckBeforeMergeAtHead(ctx, runRow.ID, liveHead)
-	return mergeDispatchMerged, gateState, merger.MergePullRequest(ctx, runRow)
+	ledger := s.mergeDispatchLedger()
+	claimed := false
+	var claim mergequeue.DispatchClaim
+	if ledger != nil {
+		claimHead := liveHead
+		if claimHead == "" {
+			claimHead = "unresolved"
+		}
+		var cerr error
+		claim, claimed, cerr = ledger.ClaimMergeDispatch(ctx, runRow.ID, mergequeue.DispatchPathDelegated, claimHead)
+		if cerr != nil {
+			return mergeDispatchUnclaimed, gateState, cerr
+		}
+		if !claimed { // ADR-093 D1: a merge dispatch is already claimed; never call the forge
+			if claim.State == mergequeue.DispatchFailed {
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+					"auto-drive: the run's merge dispatch is dispatch_failed; observe-only until reconciliation or the operator re-arm",
+					slog.String("run_id", runRow.ID.String()), slog.String("claim_path", claim.Path),
+					slog.String("failure_cause", claim.FailureCause))
+			}
+			return mergeDispatchAlreadyClaimed, gateState, nil
+		}
+	}
+	merr := merger.MergePullRequest(ctx, runRow)
+	if merr != nil && claimed {
+		// Ruling R1: release when the forge applied nothing, else
+		// dispatch_failed; recorded on a non-cancellable bounded context.
+		s.settleMergeDispatchClaim(ctx, ledger, claim, merr)
+	}
+	return mergeDispatchMerged, gateState, merr
 }
 
 // evaluateRunDelegation resolves the run's effective delegation Result

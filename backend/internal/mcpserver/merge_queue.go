@@ -38,7 +38,7 @@ func registerGetMergeQueue(srv *mcp.Server, resolver *runResolver) {
 		Description: strings.TrimSpace(`
 WHEN: after fishhawk_merge_run returns status=queued (its next_action), or
 whenever you want to see which runs hold or wait for a repository's merge line:
-reads the per-base merge queue (ADR-093 slice 1, E87.4 / #4295) for one
+reads the per-base merge queue (ADR-093 slices 1-2, E87.4 / #4295, E87.5 / #4296) for one
 repository — every active entry in YOUR account, in queue order.
 
 ELIGIBILITY: an operator token with read:audit (the gate view's tier); a
@@ -59,13 +59,16 @@ Per base ref it reports:
     admission re-anchors before the pass.
   - eta_basis: samples + median_seconds of the base's newest merged line turns
     (admission to merge). eta_seconds = position x that median, omitted with
-    no merged history. Until ADR-093 slice 2's merge-on-pass lands, a line turn
-    includes YOUR merge step, so the estimate is only as fast as merges are.
+    no merged history. A line turn ends at the queue's own merge-on-pass, not
+    at a merge step of yours.
 
 base_ref (optional) narrows the read to one base. Admission is automatic; a
-held entry needs no verb. Re-invoke fishhawk_merge_run once your run's pass is
-green. fishhawk_get_run_status's merge_candidate_queue block shows one run's
-entry; this read shows the whole line.
+held entry needs no verb. Do NOT re-invoke fishhawk_merge_run: your merge
+intent persists until the entry settles, and the queue merges the run itself
+on its green pass, pinned to the verified head (while the entry exists an
+inline merge answers merge_queue_owns_merge). fishhawk_get_run_status's
+merge_candidate_queue block shows one run's entry; this read shows the whole
+line.
 
 Tool errors: repo not owner/name (caught before the HTTP hop); the backend's
 401 / 403 insufficient_scope / 403 run_token_forbidden / 403 repo_forbidden;

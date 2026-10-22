@@ -3614,6 +3614,31 @@ components:
             `eta_basis.median_seconds`. Omitted for the live entry and when
             the base has no merged history. An estimate, not a promise — see
             `eta_basis`.
+        dispatch_claim:
+          $ref: '#/components/schemas/MergeQueueDispatchClaim'
+
+    MergeQueueDispatchClaim:
+      type: object
+      description: |
+        The run's merge-dispatch claim (ADR-093 approval condition D1),
+        present only when one exists. A `dispatch_failed` claim (an uncertain
+        forge outcome) holds the entry until the pull request reads merged or
+        the operator re-arms it (`backend/internal/mergequeue/README.md` §
+        "Merge-dispatch ledger").
+      required: [state, path, head_sha, claimed_at, age_seconds]
+      properties:
+        state:
+          type: string
+          enum: [dispatched, dispatch_failed]
+        path:
+          type: string
+          enum: [inline, delegated, queue]
+          description: The dispatch path that took the claim.
+        head_sha: { type: string, description: The head the claim recorded. }
+        claimed_at: { type: string, format: date-time }
+        age_seconds: { type: integer, format: int64, description: The claim's age at read time. }
+        failed_at: { type: string, format: date-time, description: When the claim became `dispatch_failed`. }
+        reason: { type: string, description: "A `dispatch_failed` claim's recorded forge failure." }
 
     MergeQueueHeadOfLine:
       type: object
@@ -3644,10 +3669,10 @@ components:
       description: |
         What every `eta_seconds` on the base is derived from: the line-turn
         time (admission to merge) of the base's newest merged entries in the
-        caller's account, at most 10. Until ADR-093 slice 2's merge-on-pass
-        lands, a line turn INCLUDES the operator's merge step (the line frees
-        only when the pull request merges), so the estimate is as fast as the
-        operator merges.
+        caller's account, at most 10. Since ADR-093 slice 2 (E87.5 / #4296) a
+        line turn ends at the queue's own merge-on-pass, not at the
+        operator's merge step. The `note` string still carries the slice-1
+        wording until an operator follow-up.
       required: [samples, note]
       properties:
         samples: { type: integer, minimum: 0, maximum: 10, description: How many merged line turns the median read. }
@@ -15142,15 +15167,42 @@ paths:
         `false`, NO `merge_verdict_recorded` row is written (the verdict prose
         rides the chained `merge_queue_entered` row, appended BEFORE the queue
         write), and the base is pumped detached, so the answer never waits on
-        an admission's auto-advance or pass start. Re-invoke the merge once
-        the entry's pass is green. An INELIGIBLE or undeterminable run keeps
+        an admission's auto-advance or pass start. With a head-pinned merge
+        seam bound (ADR-093 slice 2, E87.5 / #4296) the merge intent persists
+        until the entry settles and the queue merges the run itself on its
+        green pass (merge-on-pass, pinned to the verified head): do NOT
+        re-invoke the merge; without the seam, re-invoke once the entry's pass
+        is green. An INELIGIBLE or undeterminable run keeps
         the 409 above, byte-for-byte, plus the additive
         `details.merge_queue_ineligible` reason codes, with nothing written.
         `merge_candidate_verify_failed` and `merge_candidate_check_failed`
-        are never enqueued. Known deviation from ADR-093 D6 in this slice:
-        approval transfer across a clean advance is not implemented, so in a
-        dismiss-stale repository a rebased run needs a fresh approval before
-        it is eligible.
+        are never enqueued. Eligibility also refuses `changes_requested` (a
+        reviewer's latest non-comment review is CHANGES_REQUESTED), and the
+        ADR-093 D6 approval transfer carries the operator's approval across a
+        clean advance and a green pass (never across a conflict-resolution
+        push).
+
+        **The queue owns the merge (ADR-093 slice 2, E87.5 / #4296).** While
+        the run has an active merge-queue entry carrying merge intent (live
+        or held, any phase) and a head-pinned merge seam is bound, the inline
+        merge refuses `409 merge_queue_owns_merge` with nothing recorded and
+        nothing dispatched (a pull request that already merged answers `200
+        already_merged` instead). The inline tail runs under the run's
+        merge-intent lock (the lock merge-on-pass and the delegated
+        `may_merge` arm also take); its acquire wait is bounded (30s), and a
+        lock not taken answers `503 merge_lock_unavailable`, an unreadable
+        queue `503 merge_queue_unreadable`, both with nothing recorded. Every
+        dispatch path claims the run's ONE merge dispatch on the
+        merge-dispatch ledger before the forge: an existing claim answers
+        `409 merge_already_dispatched` (or `200 already_merged` when the pull
+        request landed) and the forge is never called. A dispatch that fails
+        after the claim is classified once: a refusal that applied nothing
+        (`merge_checks_pending`, a REST merge PUT 405/409/422; never a
+        generic GraphQL error envelope, which is uncertain) releases the
+        claim, so the re-invoke claims again; an uncertain outcome (5xx, timeout,
+        cancel, 403) leaves it `dispatch_failed` until the pull request reads
+        merged or the operator re-arms it
+        (`backend/internal/mergequeue/README.md` § "Merge-dispatch ledger").
 
         **Merge overlap guard (E83.61 / #4119).** AFTER the conflict guard and
         BEFORE the merge-candidate gate (so the ADR-093 enqueue arm can never
@@ -15190,10 +15242,11 @@ paths:
         /v0/runs/{run_id}/scope-overlap`. A `write:approvals`-only token gets
         counts instead (see the `409` response). The delegated `may_merge`
         arm of the auto-driver runs the SAME guard (#4582, see `POST
-        /v0/runs/{run_id}/auto-drive`) with no override. Residuals: ADR-093
-        slice 2's merge-on-pass (#4296) does not run it yet, and the guard
-        reads the state at POST time (a push or dispatch between the read and
-        the forge merge is not caught).
+        /v0/runs/{run_id}/auto-drive`) with no override, and ADR-093 slice
+        2's merge-on-pass (#4296) runs it under the run's merge-intent lock,
+        also with no override. Residual: the guard reads the state at POST
+        time (a push or dispatch between the read and the forge merge is not
+        caught).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -15259,9 +15312,13 @@ paths:
             refused. Nothing merged and no merge verdict was recorded; the
             response is read from the queue store right after the write.
             Watch the entry on `GET /v0/repos/{owner}/{name}/merge-queue` or
-            `GET /v0/runs/{run_id}`'s `merge_candidate_queue`, then re-invoke
-            the merge once the pass is green. Every field the 200 path does
-            not set is omitted.
+            `GET /v0/runs/{run_id}`'s `merge_candidate_queue`. With a
+            head-pinned merge seam bound (ADR-093 slice 2, E87.5 / #4296) the
+            merge intent persists until the entry settles and the queue merges
+            the run on its green pass, so you do not re-invoke the merge (an
+            inline re-invoke answers `409 merge_queue_owns_merge`); without
+            the seam, re-invoke once the pass is green. Every field the 200
+            path does not set is omitted.
           content:
             application/json:
               schema:
@@ -15309,7 +15366,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            One of twelve cases. (1) The run cannot be merged: no PR url or a
+            One of fourteen cases. (1) The run cannot be merged: no PR url or a
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
@@ -15486,7 +15543,20 @@ paths:
             `reason` (`overlap_undetermined`) or `next_step`
             (`overlapping_implement_in_flight`), and the message names no
             other run. Wait for the stage to settle and re-invoke, or re-POST
-            with `allow_overlap` and an `overlap_reason`.
+            with `allow_overlap` and an `overlap_reason`. (13) and (14),
+            ADR-093 slice 2 (E87.5 / #4296): `merge_queue_owns_merge` — the run has an active
+            merge-queue entry carrying merge intent (live or held, any phase),
+            so the queue owns the merge and merges it pinned to the verified
+            head on its green pass; nothing was recorded or dispatched,
+            `details` carry `{run_id, pr_url, next_step:
+            "fishhawk_get_merge_queue"}`; do not re-invoke.
+            `merge_already_dispatched` — the run's ONE merge dispatch is
+            already claimed on the merge-dispatch ledger (approval condition
+            D1), so the forge was not called again; `details` carry
+            `{run_id, pr_url, verdict_sequence, claim_state, claim_path,
+            claim_head_sha, claimed_at, failure_cause}`; a `dispatch_failed`
+            claim (an uncertain forge outcome) needs the operator re-arm
+            before a re-invoke.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15559,7 +15629,14 @@ paths:
             (#4119, `details.retryable: true`): the `merge_overlap_overridden`
             row could not be read for dedupe or appended, so nothing was
             merged or enqueued and no new verdict was recorded (record before
-            commit); re-invoke to retry.
+            commit); re-invoke to retry. ADR-093 slice 2 (E87.5 / #4296), all
+            retryable (`details.retryable: true`): `merge_queue_unreadable` —
+            the merge queue could not be read, so whether it owns the merge is
+            unknown; nothing recorded. `merge_lock_unavailable` — the run's
+            merge-intent lock was not taken within its bounded acquire wait;
+            nothing recorded. `merge_dispatch_unclaimed` — the verdict is
+            recorded but the dispatch could not be claimed on the
+            merge-dispatch ledger, so nothing was dispatched.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -23361,10 +23438,10 @@ paths:
         closed `500 internal_error`.
 
         **ETA basis.** `eta_seconds` = `position` x the median line-turn time
-        (admission to merge) of the base's newest 10 merged entries. Until
-        ADR-093 slice 2's merge-on-pass lands, a line turn includes the
-        operator's merge step, so the estimate is as fast as the operator
-        merges. No merged history → no ETA.
+        (admission to merge) of the base's newest 10 merged entries. Since
+        ADR-093 slice 2 (E87.5 / #4296) a line turn ends at the queue's own
+        merge-on-pass, not at the operator's merge step. No merged history →
+        no ETA.
 
         **Auth.** The payload names other runs' ids and heads, so a run-bound
         `mcp:run:<uuid>` token is refused `403 run_token_forbidden`. Every

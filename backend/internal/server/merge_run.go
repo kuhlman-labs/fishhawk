@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -525,241 +526,322 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			slog.String("undetermined", approval.Undetermined))
 	}
 
-	// Idempotence on the ENDPOINT (binding condition 1): an existing
-	// merge_verdict_recorded row means a prior POST already recorded the
-	// verdict; do NOT append a duplicate. Either way the merge helper is
-	// dispatched below, so a 502-then-reinvoke re-queues the merge.
-	//
-	// The read-then-append fast-path covers the SEQUENTIAL retry flow (a
-	// 502-then-reinvoke, or a timed-out re-invoke). A genuinely CONCURRENT
-	// double-POST for the same run — where both observe zero rows and both
-	// append — is closed at the DB level by the 0062 partial unique index
-	// audit_entries_merge_verdict_recorded_once_idx (#1983): AppendChainedTx's
-	// SELECT ... FOR UPDATE on the run row serializes the two appends, so the
-	// race-loser's insert deterministically violates that index and returns a
-	// unique_violation. audit.IsMergeVerdictDuplicate catches ONLY that
-	// index's collision (not an unrelated 23505 on the hash-chain / entry-hash
-	// / (run_id, sequence) uniqueness); the loser re-reads the winner's
-	// sequence, responds already_recorded, and still dispatches the merge.
-	//
-	// An overlap override (E83.61 / #4119) is recorded FIRST, record-before-
-	// commit: a failed record answers 503 overlap_override_unrecorded with no
-	// verdict appended and no merge dispatched. On a FIRST POST its row
-	// therefore precedes the verdict row; on a resume the verdict row already
-	// exists and only a changed judgement appends a new override row.
-	if !recordOverlapOverride() {
-		return
-	}
-	existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"read prior merge verdict failed", map[string]any{"error": err.Error()})
-		return
-	}
-	var verdictSequence int64
-	alreadyRecorded := len(existing) > 0
-	if alreadyRecorded {
-		// Reuse the earliest recorded verdict's sequence (chain-stable).
-		verdictSequence = earliestMergeVerdictSequence(existing)
-	} else {
-		// Delegation shadow stamp (E82.1 / #3778): captured on the
-		// PRE-decision state, recorded ONLY on the fresh-append path below —
-		// never on alreadyRecorded or the lost-race duplicate path. This
-		// handler is never delegated (the delegated merge is the auto-driver).
-		shadow := s.captureDelegationShadow(r.Context(), runID, delegation.ActionMerge, subject, false)
-		actorKind := audit.ActorUser
-		payload, _ := json.Marshal(map[string]any{
-			"run_id":    runID.String(),
-			"verdict":   verdict,
-			"pr_url":    prURL,
-			"delegated": false,
-		})
-		entry, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
-			RunID:        runID,
-			Timestamp:    time.Now().UTC(),
-			Category:     CategoryMergeVerdictRecorded,
-			ActorKind:    &actorKind,
-			ActorSubject: &subject,
-			Payload:      payload,
-		})
-		switch {
-		case aerr == nil:
-			verdictSequence = entry.Sequence
-			s.recordDelegationShadow(r.Context(), shadow, nil, "merge", CategoryMergeVerdictRecorded, nil)
-		case audit.IsMergeVerdictDuplicate(aerr):
-			// Lost the concurrent merge-verdict race: another POST's insert
-			// won the partial-unique-index slot. Re-read to recover the
-			// winner's sequence, then fall through to the merge dispatch (a
-			// benign idempotent outcome, NOT a 500).
-			winner, rerr := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
-			if rerr != nil {
-				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-					"re-read merge verdict after concurrent-race conflict failed",
-					map[string]any{"error": rerr.Error()})
-				return
-			}
-			if len(winner) == 0 {
-				// Defensive fail-closed: the index guarantees the winner's row
-				// is committed before the loser's insert can conflict, so this
-				// is unreachable — but never fabricate a verdict_sequence on a
-				// phantom winner. Surface a 500 rather than dispatch.
-				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
-					"merge: merge-verdict duplicate caught but re-read found no winner row",
-					slog.String("run_id", runID.String()))
-				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-					"record merge verdict failed: duplicate conflict but no recorded verdict found on re-read",
-					map[string]any{"run_id": runID.String()})
-				return
-			}
-			alreadyRecorded = true
-			verdictSequence = earliestMergeVerdictSequence(winner)
-		default:
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-				"merge: append merge_verdict_recorded audit entry failed",
-				slog.String("run_id", runID.String()),
-				slog.String("error", aerr.Error()))
+	// ADR-093 slice 2 (E87.5 / #4296, approval conditions D1/D2): the rest
+	// of the inline merge (override record, verdict append, observe,
+	// republish, dispatch claim, dispatch, response) runs under the run's
+	// merge-intent lock, the SAME lock merge-on-pass and the delegated
+	// may_merge arm take, so the three dispatch paths take turns. Its FIRST
+	// step is the ownership check: while the run has an active queue entry
+	// carrying merge intent (live or held, any phase) the queue owns the
+	// merge and this path refuses 409 merge_queue_owns_merge with nothing
+	// recorded, unless the PR already merged (then the normal path answers
+	// already_merged). A queue read error is 503 merge_queue_unreadable. The
+	// lock-acquire wait is bounded (approval condition (g)): a lock that was
+	// never taken, by the bound or any other cause, answers 503
+	// merge_lock_unavailable with nothing recorded. A lapse after fn ran is a
+	// WARN only (fn already answered). r carries the bounded acquire context;
+	// fn shadows it with the lock fn's context, so any work it spawns detached
+	// starts from pglock.Detach.
+	acquireCtx, inlineStarted, stopAcquire := boundMergeLockAcquire(r.Context(), mergeRunLockAcquireTimeout)
+	defer stopAcquire()
+	r = r.WithContext(acquireCtx)
+	var ran bool
+	inline := func(fctx context.Context) error {
+		if !inlineStarted() {
+			return errMergeLockAcquireTimedOut
+		}
+		ran = true
+		r := r.WithContext(fctx)
+		owned, oerr := s.mergeQueueOwnsMerge(r.Context(), runID)
+		if oerr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge-queue ownership unreadable; refusing (fail closed)",
+				slog.String("run_id", runID.String()), slog.String("error", oerr.Error()))
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_queue_unreadable",
+				"the merge queue could not be read, so whether it owns this run's merge is unknown; nothing was recorded and nothing merged. Re-invoke the merge to retry.",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return nil
+		}
+		if owned && !s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true).Landed {
+			s.writeMergeQueueOwnsMerge(w, r, runID, prURL)
+			return nil
+		}
+
+		// Idempotence on the ENDPOINT (binding condition 1): an existing
+		// merge_verdict_recorded row means a prior POST already recorded the
+		// verdict; do NOT append a duplicate. Either way the merge helper is
+		// dispatched below, so a 502-then-reinvoke re-queues the merge.
+		//
+		// The read-then-append fast-path covers the SEQUENTIAL retry flow (a
+		// 502-then-reinvoke, or a timed-out re-invoke). A genuinely CONCURRENT
+		// double-POST for the same run — where both observe zero rows and both
+		// append — is closed at the DB level by the 0062 partial unique index
+		// audit_entries_merge_verdict_recorded_once_idx (#1983): AppendChainedTx's
+		// SELECT ... FOR UPDATE on the run row serializes the two appends, so the
+		// race-loser's insert deterministically violates that index and returns a
+		// unique_violation. audit.IsMergeVerdictDuplicate catches ONLY that
+		// index's collision (not an unrelated 23505 on the hash-chain / entry-hash
+		// / (run_id, sequence) uniqueness); the loser re-reads the winner's
+		// sequence, responds already_recorded, and still dispatches the merge.
+		//
+		// An overlap override (E83.61 / #4119) is recorded FIRST, record-before-
+		// commit: a failed record answers 503 overlap_override_unrecorded with no
+		// verdict appended and no merge dispatched. On a FIRST POST its row
+		// therefore precedes the verdict row; on a resume the verdict row already
+		// exists and only a changed judgement appends a new override row.
+		if !recordOverlapOverride() {
+			return nil
+		}
+		existing, err := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
+		if err != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-				"record merge verdict failed", map[string]any{"error": aerr.Error()})
-			return
+				"read prior merge verdict failed", map[string]any{"error": err.Error()})
+			return nil
 		}
-	}
-
-	// OBSERVE BEFORE DISPATCH (E45.87 / #3622). Re-queuing a merge for a PR/MR
-	// that has ALREADY merged errors on both forges, so the documented
-	// "re-invoke to resume" recovery returned 502 merge_dispatch_failed in the
-	// exact case where the operation had WORKED — the merge settled through the
-	// webhook during fishhawk_merge_run's bounded wait.
-	//
-	// PLACEMENT: AFTER the durable merge_verdict_recorded append, unlike the
-	// conflict guard above which refuses BEFORE it. The rationale differs by
-	// case: the conflict guard refuses a merge that structurally CANNOT queue,
-	// so its verdict would be a false record, whereas here the merge genuinely
-	// HAPPENED — the operator's verdict is a TRUE record and must be durable.
-	//
-	// Two tiers, and EVERY uncertainty falls through to today's dispatch (the
-	// prMergeConflicting fail-open posture):
-	//   (a) a CHEAP chain read on every POST (runPRObservablyMerged over
-	//       pr_merged / post_merge_observed / merge_observation_recorded). A
-	//       read error is logged and treated as NO evidence — never a 500.
-	//   (b) a LIVE forge read on a RESUME ONLY (alreadyRecorded — an existing
-	//       verdict row, i.e. the shape this issue reports). A first POST pays
-	//       ZERO forge requests.
-	if obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, alreadyRecorded); obs.Landed {
-		s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
-		return
-	}
-
-	// Dispatch the shared merge helper. The verdict row is already durable, so a
-	// dispatch failure is a retryable 502 (re-POST re-queues without duplicating
-	// the row). The merge only ENABLES/queues GitHub's merge — the pr_merged /
-	// run-completion settle is left to the pull_request-closed webhook, which is
-	// why the MCP tool awaits the terminal state client-side.
-	// E64.42 / #3159: recompute and republish fishhawk_audit_complete
-	// immediately BEFORE the dispatch. A fix-up push publishes `in_progress`
-	// against the new head and nothing is guaranteed to recompute between that
-	// synchronize and this merge; now that the check is REQUIRED, GitHub
-	// refuses to queue the merge while it is in_progress and this handler
-	// returns 409 merge_checks_pending forever. Healing AFTER the dispatch
-	// would be useless — the stranded check is what makes the dispatch fail.
-	//
-	// Placement: AFTER the acceptance-gate guard (a genuinely mid-flight run
-	// recomputes to pending; refusing there is the acceptance gate's job, not
-	// this publish's), AFTER the conflict guard and the durable verdict
-	// append, and BEFORE the dispatch. The delegated may_merge arm does NOT
-	// route through here — it calls GitHubMerger.MergePullRequest via
-	// dispatchAcceptanceGatedMerge (autodrive.go), which carries the SAME call
-	// — which is why both sites need it.
-	//
-	// Best-effort and never unwinds: a publish failure logs at WARN inside the
-	// helper and the merge is dispatched regardless.
-	// The returned Result is what lets the 409 below NAME the blocking
-	// audit-complete item instead of describing "required checks" generically
-	// (E64.59 / #3190). `auditRecomputed` distinguishes "the recompute ran and
-	// the state is not pending" from "we never got to look" (dev posture or a
-	// compute error), so the generic wording is used for the second case rather
-	// than a misleading claim about a state nothing derived.
-	//
-	// E86.57 / #4397, #4440: the forced republish targets the head the merge
-	// will land — the live PR head the merge-candidate gate admitted — because
-	// findHeadSHA cannot resolve a conflict-resolution, base-advance or
-	// operator-vouched head and would re-post at a stale recorded head while
-	// the live head kept its missing or IN_PROGRESS required check. An empty
-	// gate.HeadSHA (ungated D7 admit, merged PR) keeps the findHeadSHA head.
-	auditRes, auditRecomputed := s.republishAuditCheckBeforeMergeAtHead(r.Context(), runID, gate.HeadSHA)
-
-	if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
-		// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
-		// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE
-		// status and refuses to queue auto-merge until its required checks pass.
-		// Classify it distinctly as 409 merge_checks_pending so the operator gets
-		// a remedy that can work (wait for the checks, or inspect the PR if a
-		// check has already failed) instead of the generic 502's "retry the
-		// merge", which reproduces the identical failure. The verdict row is
-		// already durable, so the tool re-POSTs across a bounded wait with no
-		// duplicate row. EVERY other error keeps the generic 502 so a real
-		// dispatch failure is never swallowed as "just waiting".
-		if errors.Is(merr, forge.ErrPullRequestUnstableStatus) {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
-				slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
-			details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
-			msg := "the merge verdict is recorded and durable, but the squash merge cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting."
-			// E64.59 / #3190: when the blocking check is OUR OWN
-			// fishhawk_audit_complete sitting at pending, say WHY and WHAT TO
-			// DO. Purely additive — the existing keys are untouched, and a
-			// recompute that produced nothing, or a non-pending state, keeps
-			// the generic wording so a genuinely unrelated failing required
-			// check is never mislabelled.
-			if auditRecomputed && auditRes.State == stagecheck.StatePending && len(auditRes.Missing) > 0 {
-				items := make([]map[string]any, 0, len(auditRes.Missing))
-				for _, m := range auditRes.Missing {
-					items = append(items, map[string]any{"kind": string(m.Kind), "detail": m.Detail})
-				}
-				details["audit_complete_state"] = string(auditRes.State)
-				details["audit_complete_missing"] = items
-				msg += " fishhawk_audit_complete is pending because: " + auditRes.Missing[0].Detail
-			}
-			s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
-			return
-		}
-		// RE-OBSERVE ONCE (E45.87 / #3622). A merge that landed in the
-		// observe-to-dispatch window — or one the dispatch itself rejected
-		// BECAUSE the PR was already merged — resolves as already_merged
-		// instead of a 502 that tells the operator to retry an operation that
-		// already succeeded. The forge read is unconditional here (not gated on
-		// alreadyRecorded): the dispatch has already failed, so the extra read
-		// is paid only on an error path.
-		obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true)
-		if obs.Landed {
-			s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
-			return
-		}
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
-			slog.String("run_id", runID.String()), slog.String("error", merr.Error()),
-			slog.String("forge_merge_state", obs.ForgeState))
-		// The observed state is named in the MESSAGE, not only in the details:
-		// a 5xx body's details are default-deny redacted (errors.go's
-		// redactableDetailKeys), so an un-allow-listed forge_merge_state key
-		// would never reach the caller. It is still passed as a detail because
-		// writeError logs the FULL pre-redaction map against the error_ref, so
-		// the operator's log record carries it alongside the raw cause.
-		s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
-			"the merge verdict is recorded and durable, but queuing the squash merge failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run.",
-			map[string]any{
-				"run_id":            runID.String(),
-				"error":             merr.Error(),
-				"verdict_sequence":  verdictSequence,
-				"forge_merge_state": obs.ForgeState,
+		var verdictSequence int64
+		alreadyRecorded := len(existing) > 0
+		if alreadyRecorded {
+			// Reuse the earliest recorded verdict's sequence (chain-stable).
+			verdictSequence = earliestMergeVerdictSequence(existing)
+		} else {
+			// Delegation shadow stamp (E82.1 / #3778): captured on the
+			// PRE-decision state, recorded ONLY on the fresh-append path below —
+			// never on alreadyRecorded or the lost-race duplicate path. This
+			// handler is never delegated (the delegated merge is the auto-driver).
+			shadow := s.captureDelegationShadow(r.Context(), runID, delegation.ActionMerge, subject, false)
+			actorKind := audit.ActorUser
+			payload, _ := json.Marshal(map[string]any{
+				"run_id":    runID.String(),
+				"verdict":   verdict,
+				"pr_url":    prURL,
+				"delegated": false,
 			})
-		return
-	}
+			entry, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+				RunID:        runID,
+				Timestamp:    time.Now().UTC(),
+				Category:     CategoryMergeVerdictRecorded,
+				ActorKind:    &actorKind,
+				ActorSubject: &subject,
+				Payload:      payload,
+			})
+			switch {
+			case aerr == nil:
+				verdictSequence = entry.Sequence
+				s.recordDelegationShadow(r.Context(), shadow, nil, "merge", CategoryMergeVerdictRecorded, nil)
+			case audit.IsMergeVerdictDuplicate(aerr):
+				// Lost the concurrent merge-verdict race: another POST's insert
+				// won the partial-unique-index slot. Re-read to recover the
+				// winner's sequence, then fall through to the merge dispatch (a
+				// benign idempotent outcome, NOT a 500).
+				winner, rerr := s.cfg.AuditRepo.ListForRunByCategory(r.Context(), runID, CategoryMergeVerdictRecorded)
+				if rerr != nil {
+					s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+						"re-read merge verdict after concurrent-race conflict failed",
+						map[string]any{"error": rerr.Error()})
+					return nil
+				}
+				if len(winner) == 0 {
+					// Defensive fail-closed: the index guarantees the winner's row
+					// is committed before the loser's insert can conflict, so this
+					// is unreachable — but never fabricate a verdict_sequence on a
+					// phantom winner. Surface a 500 rather than dispatch.
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelError,
+						"merge: merge-verdict duplicate caught but re-read found no winner row",
+						slog.String("run_id", runID.String()))
+					s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+						"record merge verdict failed: duplicate conflict but no recorded verdict found on re-read",
+						map[string]any{"run_id": runID.String()})
+					return nil
+				}
+				alreadyRecorded = true
+				verdictSequence = earliestMergeVerdictSequence(winner)
+			default:
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+					"merge: append merge_verdict_recorded audit entry failed",
+					slog.String("run_id", runID.String()),
+					slog.String("error", aerr.Error()))
+				s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+					"record merge verdict failed", map[string]any{"error": aerr.Error()})
+				return nil
+			}
+		}
 
-	s.writeJSON(w, r, http.StatusOK, mergeRunResponse{
-		RunID:           runID.String(),
-		MergeQueued:     true,
-		VerdictSequence: verdictSequence,
-		AlreadyRecorded: alreadyRecorded,
-		PRURL:           prURL,
-	})
+		// OBSERVE BEFORE DISPATCH (E45.87 / #3622). Re-queuing a merge for a PR/MR
+		// that has ALREADY merged errors on both forges, so the documented
+		// "re-invoke to resume" recovery returned 502 merge_dispatch_failed in the
+		// exact case where the operation had WORKED — the merge settled through the
+		// webhook during fishhawk_merge_run's bounded wait.
+		//
+		// PLACEMENT: AFTER the durable merge_verdict_recorded append, unlike the
+		// conflict guard above which refuses BEFORE it. The rationale differs by
+		// case: the conflict guard refuses a merge that structurally CANNOT queue,
+		// so its verdict would be a false record, whereas here the merge genuinely
+		// HAPPENED — the operator's verdict is a TRUE record and must be durable.
+		//
+		// Two tiers, and EVERY uncertainty falls through to today's dispatch (the
+		// prMergeConflicting fail-open posture):
+		//   (a) a CHEAP chain read on every POST (runPRObservablyMerged over
+		//       pr_merged / post_merge_observed / merge_observation_recorded). A
+		//       read error is logged and treated as NO evidence — never a 500.
+		//   (b) a LIVE forge read on a RESUME ONLY (alreadyRecorded — an existing
+		//       verdict row, i.e. the shape this issue reports). A first POST pays
+		//       ZERO forge requests.
+		if obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, alreadyRecorded); obs.Landed {
+			s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
+			return nil
+		}
+
+		// Dispatch the shared merge helper. The verdict row is already durable, so a
+		// dispatch failure is a retryable 502 (re-POST re-queues without duplicating
+		// the row). The merge only ENABLES/queues GitHub's merge — the pr_merged /
+		// run-completion settle is left to the pull_request-closed webhook, which is
+		// why the MCP tool awaits the terminal state client-side.
+		// E64.42 / #3159: recompute and republish fishhawk_audit_complete
+		// immediately BEFORE the dispatch. A fix-up push publishes `in_progress`
+		// against the new head and nothing is guaranteed to recompute between that
+		// synchronize and this merge; now that the check is REQUIRED, GitHub
+		// refuses to queue the merge while it is in_progress and this handler
+		// returns 409 merge_checks_pending forever. Healing AFTER the dispatch
+		// would be useless — the stranded check is what makes the dispatch fail.
+		//
+		// Placement: AFTER the acceptance-gate guard (a genuinely mid-flight run
+		// recomputes to pending; refusing there is the acceptance gate's job, not
+		// this publish's), AFTER the conflict guard and the durable verdict
+		// append, and BEFORE the dispatch. The delegated may_merge arm does NOT
+		// route through here — it calls GitHubMerger.MergePullRequest via
+		// dispatchAcceptanceGatedMerge (autodrive.go), which carries the SAME call
+		// — which is why both sites need it.
+		//
+		// Best-effort and never unwinds: a publish failure logs at WARN inside the
+		// helper and the merge is dispatched regardless.
+		// The returned Result is what lets the 409 below NAME the blocking
+		// audit-complete item instead of describing "required checks" generically
+		// (E64.59 / #3190). `auditRecomputed` distinguishes "the recompute ran and
+		// the state is not pending" from "we never got to look" (dev posture or a
+		// compute error), so the generic wording is used for the second case rather
+		// than a misleading claim about a state nothing derived.
+		//
+		// E86.57 / #4397, #4440: the forced republish targets the head the merge
+		// will land — the live PR head the merge-candidate gate admitted — because
+		// findHeadSHA cannot resolve a conflict-resolution, base-advance or
+		// operator-vouched head and would re-post at a stale recorded head while
+		// the live head kept its missing or IN_PROGRESS required check. An empty
+		// gate.HeadSHA (ungated D7 admit, merged PR) keeps the findHeadSHA head.
+		auditRes, auditRecomputed := s.republishAuditCheckBeforeMergeAtHead(r.Context(), runID, gate.HeadSHA)
+
+		// Approval condition D1: claim the run's ONE merge dispatch on the
+		// ledger, under the merge-intent lock and BEFORE the forge call. An
+		// existing claim (the queue's, the delegated arm's or an earlier inline
+		// dispatch, dispatched or dispatch_failed) means the forge is NEVER
+		// called: already_merged when the PR landed, else 409
+		// merge_already_dispatched. Without a wired queue there is no ledger
+		// and no queue dispatcher to race, so the dispatch proceeds unclaimed.
+		claim, claimed, handled := s.claimInlineMergeDispatch(w, r, runID, runRow, prURL, subject, verdictSequence, alreadyRecorded, gate)
+		if handled {
+			return nil
+		}
+
+		if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
+			checksPending := errors.Is(merr, forge.ErrPullRequestUnstableStatus)
+			// RE-OBSERVE ONCE (E45.87 / #3622), BEFORE the ledger is settled
+			// (matching merge-on-pass): a merge that landed in the
+			// observe-to-dispatch window, or one the dispatch itself rejected
+			// BECAUSE the PR was already merged, resolves as already_merged and
+			// leaves the claim 'dispatched' (the merge landed), instead of a 502
+			// that tells the operator to retry an operation that already
+			// succeeded. The forge read is unconditional here (not gated on
+			// alreadyRecorded): the dispatch has already failed, so the extra read
+			// is paid only on an error path. Our own checks_pending refusal
+			// dispatched nothing, so it is not re-observed.
+			var obs mergeObserveResult
+			if !checksPending {
+				obs = s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true)
+				if obs.Landed {
+					s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
+					return nil
+				}
+			}
+			rearm := ""
+			// Ruling R1: a checks_pending refusal or a forge 405/409/422
+			// RELEASES the claim (nothing was applied), so the re-invoke can
+			// claim again; any other outcome is uncertain: dispatch_failed.
+			if claimed && s.settleMergeDispatchClaim(r.Context(), mergeQueueDispatchLedger{s.cfg.MergeQueue}, claim, merr) == mergeDispatchUncertain {
+				rearm = mergeDispatchRearmNote
+			}
+			// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
+			// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE
+			// status and refuses to queue auto-merge until its required checks pass.
+			// Classify it distinctly as 409 merge_checks_pending so the operator gets
+			// a remedy that can work (wait for the checks, or inspect the PR if a
+			// check has already failed) instead of the generic 502's "retry the
+			// merge", which reproduces the identical failure. The verdict row is
+			// already durable, so the tool re-POSTs across a bounded wait with no
+			// duplicate row. EVERY other error keeps the generic 502 so a real
+			// dispatch failure is never swallowed as "just waiting".
+			if checksPending {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
+					slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
+				details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
+				msg := "the merge verdict is recorded and durable, but the squash merge cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting." + rearm
+				// E64.59 / #3190: when the blocking check is OUR OWN
+				// fishhawk_audit_complete sitting at pending, say WHY and WHAT TO
+				// DO. Purely additive — the existing keys are untouched, and a
+				// recompute that produced nothing, or a non-pending state, keeps
+				// the generic wording so a genuinely unrelated failing required
+				// check is never mislabelled.
+				if auditRecomputed && auditRes.State == stagecheck.StatePending && len(auditRes.Missing) > 0 {
+					items := make([]map[string]any, 0, len(auditRes.Missing))
+					for _, m := range auditRes.Missing {
+						items = append(items, map[string]any{"kind": string(m.Kind), "detail": m.Detail})
+					}
+					details["audit_complete_state"] = string(auditRes.State)
+					details["audit_complete_missing"] = items
+					msg += " fishhawk_audit_complete is pending because: " + auditRes.Missing[0].Detail
+				}
+				s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
+				return nil
+			}
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
+				slog.String("run_id", runID.String()), slog.String("error", merr.Error()),
+				slog.String("forge_merge_state", obs.ForgeState))
+			// The observed state is named in the MESSAGE, not only in the details:
+			// a 5xx body's details are default-deny redacted (errors.go's
+			// redactableDetailKeys), so an un-allow-listed forge_merge_state key
+			// would never reach the caller. It is still passed as a detail because
+			// writeError logs the FULL pre-redaction map against the error_ref, so
+			// the operator's log record carries it alongside the raw cause.
+			s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
+				"the merge verdict is recorded and durable, but queuing the squash merge failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run."+rearm,
+				map[string]any{
+					"run_id":            runID.String(),
+					"error":             merr.Error(),
+					"verdict_sequence":  verdictSequence,
+					"forge_merge_state": obs.ForgeState,
+				})
+			return nil
+		}
+
+		s.writeJSON(w, r, http.StatusOK, mergeRunResponse{
+			RunID:           runID.String(),
+			MergeQueued:     true,
+			VerdictSequence: verdictSequence,
+			AlreadyRecorded: alreadyRecorded,
+			PRURL:           prURL,
+		})
+		return nil
+	}
+	lockErr := s.withRunMergeLock(r.Context(), runID, inline)
+	if lockErr != nil {
+		if !ran {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge-intent lock unavailable; nothing recorded (fail closed)",
+				slog.String("run_id", runID.String()), slog.String("error", lockErr.Error()))
+			s.writeError(w, r, http.StatusServiceUnavailable, "merge_lock_unavailable",
+				"the run's merge-intent lock could not be taken (another merge of this run holds it, or the wait was bounded out); nothing was recorded and nothing merged. Re-invoke the merge to retry.",
+				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+			return
+		}
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge-intent lock lapsed after the inline merge ran; its answer stands",
+			slog.String("run_id", runID.String()), slog.String("error", lockErr.Error()))
+	}
 }
 
 // prMergeConflicting reports whether the run's pull request has a merge
@@ -1424,10 +1506,17 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 		resp.LiveRunID = st.LiveRunID.String()
 		holder = "run " + resp.LiveRunID
 	}
-	if st.Entry.State == mergequeue.StateLive {
+	switch {
+	case s.headPinnedMerger() != nil && st.Entry.State == mergequeue.StateLive:
+		resp.Message = fmt.Sprintf("the run is merge-queue eligible and holds the %s line (ADR-093 D2, gate %s); its merge-candidate pass runs there. Your merge intent persists until the entry settles: the queue merges the run pinned to the verified head on its green pass (ADR-093 D3), so you do not re-invoke the merge. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
+			st.Entry.BaseRef, gate.Code)
+	case s.headPinnedMerger() != nil:
+		resp.Message = fmt.Sprintf("the run is merge-queue eligible and was queued at position %d on %s behind %s (ADR-093 D2, gate %s). Admission is automatic: the queue advances the branch, re-anchors and starts its pass. Your merge intent persists until the entry settles: the queue merges the run pinned to the verified head on its green pass (ADR-093 D3), so you do not re-invoke the merge. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
+			st.Position, st.Entry.BaseRef, holder, gate.Code)
+	case st.Entry.State == mergequeue.StateLive:
 		resp.Message = fmt.Sprintf("the run is merge-queue eligible and holds the %s line (ADR-093 D2, gate %s); its merge-candidate pass runs there. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status, then re-invoke the merge once the pass is green. Nothing merged yet; no merge verdict was recorded.",
 			st.Entry.BaseRef, gate.Code)
-	} else {
+	default:
 		resp.Message = fmt.Sprintf("the run is merge-queue eligible and was queued at position %d on %s behind %s (ADR-093 D2, gate %s). Admission is automatic: the queue advances the branch, re-anchors and starts its pass. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status, then re-invoke the merge once the pass is green. Nothing merged yet; no merge verdict was recorded.",
 			st.Position, st.Entry.BaseRef, holder, gate.Code)
 	}
@@ -1473,7 +1562,13 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 	sameBase := found && prior.Entry.BaseRef == gate.prBaseRef
 	alreadyQueued := sameBase && prior.Entry.MergeIntentAt != nil
 	var intentSeq int64
-	if alreadyQueued {
+	if alreadyQueued && prior.Entry.MergeIntentSequence > 0 {
+		// The entry's STORED intent sequence (0108) names the row that
+		// recorded the intent; a newer orphan row is never named.
+		intentSeq = prior.Entry.MergeIntentSequence
+	} else if alreadyQueued {
+		// Legacy entry (intent recorded before 0108): the newest row naming
+		// the base.
 		rows, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeQueueEntered)
 		if lerr != nil {
 			// Never a 202 naming intent_sequence 0: the answer must name the
@@ -1528,11 +1623,12 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 
 		var werr error
 		if sameBase {
-			_, werr = s.cfg.MergeQueue.MarkMergeIntent(ctx, prior.Entry.ID, nil)
+			_, werr = s.cfg.MergeQueue.MarkMergeIntent(ctx, prior.Entry.ID, &mergequeue.MergeIntentRequest{IntentSequence: intentSeq})
 		} else {
 			var res mergequeue.EnqueueResult
 			res, werr = s.cfg.MergeQueue.Enqueue(ctx, mergequeue.EnqueueRequest{
 				RunID: runID, BaseRef: gate.prBaseRef, HeadSHA: gate.prHeadSHA, MergeIntent: true,
+				IntentSequence: intentSeq,
 			})
 			if werr == nil {
 				if res.Dropped != nil {
@@ -1594,4 +1690,102 @@ func mergeIntentRowSequence(rows []*audit.Entry, baseRef string) int64 {
 		}
 	}
 	return 0
+}
+
+// mergeRunLockAcquireTimeout bounds how long the inline merge_run waits to
+// take the run's merge-intent lock (approval condition (g)); a wait past it
+// answers 503 merge_lock_unavailable with nothing recorded. A var so a test
+// can shorten it.
+var mergeRunLockAcquireTimeout = 30 * time.Second
+
+// errMergeLockAcquireTimedOut is the inline fn's refusal to start once the
+// acquire bound fired first.
+var errMergeLockAcquireTimedOut = errors.New("merge: merge-intent lock acquire wait exceeded its bound")
+
+// boundMergeLockAcquire bounds ONLY the lock-acquire wait: ctx is canceled
+// when the bound fires before fn starts, and never once fn started (the
+// bound and the start race on one compare-and-swap, so exactly one wins).
+// started reports, once, from inside fn, whether fn won; stop releases the
+// timer and the context.
+func boundMergeLockAcquire(parent context.Context, bound time.Duration) (ctx context.Context, started func() bool, stop func()) {
+	ctx, cancel := context.WithCancel(parent)
+	var state atomic.Bool
+	timer := time.AfterFunc(bound, func() {
+		if state.CompareAndSwap(false, true) {
+			cancel()
+		}
+	})
+	return ctx, func() bool { return state.CompareAndSwap(false, true) }, func() {
+		timer.Stop()
+		cancel()
+	}
+}
+
+// writeMergeQueueOwnsMerge renders the D2 refusal: the queue owns the run's
+// merge, so the inline path records nothing and dispatches nothing.
+func (s *Server) writeMergeQueueOwnsMerge(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string) {
+	s.writeError(w, r, http.StatusConflict, "merge_queue_owns_merge",
+		"the merge queue owns this run's merge: its entry carries your merge intent, and the queue merges it pinned to the verified head on its green pass (ADR-093 D3). Nothing was recorded and nothing merged; do not re-invoke the merge. Watch it with fishhawk_get_merge_queue.",
+		map[string]any{"run_id": runID.String(), "pr_url": prURL, "next_step": "fishhawk_get_merge_queue"})
+}
+
+// mergeDispatchRearmNote is appended to an inline dispatch failure whose
+// outcome was UNCERTAIN after a D1 claim: the claim is dispatch_failed, so a
+// re-invoke answers already_merged if the PR landed, else is refused until the
+// operator re-arms it. A released claim (checks_pending, 405/409/422) gets no
+// note: the re-invoke claims again.
+const mergeDispatchRearmNote = " The forge outcome is uncertain, so the run's merge-dispatch claim is now dispatch_failed (ADR-093 approval condition D1): a re-invoke answers already_merged if the pull request merged, else merge_already_dispatched until the operator re-arms the claim (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\")."
+
+// claimInlineMergeDispatch claims the run's ONE merge dispatch for the inline
+// path (approval condition D1), under the merge-intent lock and before the
+// forge, returning the claim for the post-dispatch release / dispatch_failed
+// record. claimed=false with handled=false means no ledger is wired (no queue,
+// so no queue dispatcher to race): dispatch unclaimed. handled=true means the
+// response was written: already_merged when an existing claim's PR landed
+// (reconciliation, ruling R1), 409 merge_already_dispatched otherwise, or 503
+// merge_dispatch_unclaimed on a claim error. The forge is never called on a
+// handled answer.
+func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request, runID uuid.UUID, runRow *run.Run,
+	prURL, subject string, verdictSequence int64, alreadyRecorded bool, gate mergeCandidateGateResult) (claim mergequeue.DispatchClaim, claimed, handled bool) {
+	if s.cfg.MergeQueue == nil {
+		return mergequeue.DispatchClaim{}, false, false
+	}
+	head := gate.HeadSHA
+	if head == "" {
+		head = gate.prHeadSHA
+	}
+	if head == "" {
+		// The ungated D7 admit carries no head; the claim is run-scoped, so
+		// the unresolved head is recorded as such.
+		head = "unresolved"
+	}
+	existing, err := s.cfg.MergeQueue.ClaimMergeDispatch(r.Context(), runID, mergequeue.DispatchPathInline, head)
+	if err == nil {
+		return existing, true, false
+	}
+	if !errors.Is(err, mergequeue.ErrAlreadyDispatched) {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge dispatch could not be claimed; not dispatching",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+		s.writeError(w, r, http.StatusServiceUnavailable, "merge_dispatch_unclaimed",
+			"the merge verdict is recorded and durable, but the run's merge dispatch could not be claimed on the merge-dispatch ledger, so nothing was dispatched (ADR-093 approval condition D1). Re-invoke the merge to retry.",
+			map[string]any{"run_id": runID.String(), "pr_url": prURL, "verdict_sequence": verdictSequence, "retryable": true})
+		return mergequeue.DispatchClaim{}, false, true
+	}
+	if obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true); obs.Landed {
+		if existing.State == mergequeue.DispatchFailed {
+			s.appendMergeDispatchSettled(r.Context(), existing, mergeDispatchReconciledMerged, "the forge reports the pull request merged")
+		}
+		s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
+		return mergequeue.DispatchClaim{}, false, true
+	}
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge already dispatched for this run; the forge was not called",
+		slog.String("run_id", runID.String()), slog.String("claim_state", string(existing.State)),
+		slog.String("claim_path", existing.Path), slog.String("failure_cause", existing.FailureCause))
+	s.writeError(w, r, http.StatusConflict, "merge_already_dispatched",
+		fmt.Sprintf("a merge dispatch is already claimed for this run (state %s, path %s, head %s), so the forge was not called again (ADR-093 approval condition D1). A dispatched merge settles through the forge: watch fishhawk_get_run_status. A dispatch_failed claim needs the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\") before a re-invoke.",
+			existing.State, existing.Path, existing.HeadSHA),
+		map[string]any{"run_id": runID.String(), "pr_url": prURL, "verdict_sequence": verdictSequence,
+			"claim_state": string(existing.State), "claim_path": existing.Path, "claim_head_sha": existing.HeadSHA,
+			"claimed_at": existing.ClaimedAt, "failure_cause": existing.FailureCause})
+	return mergequeue.DispatchClaim{}, false, true
 }

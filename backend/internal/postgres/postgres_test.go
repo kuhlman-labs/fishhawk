@@ -135,15 +135,39 @@ func createExternalRawDB(f fataler, cleanup func(func()), base string) string {
 	cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		c, err := pgx.Connect(ctx, base)
-		if err != nil {
-			return // best-effort drop; the per-exec server is discarded anyway
+		// Best-effort (the per-exec server is discarded anyway), but retried
+		// on a transient refusal: the gate server is shared by every package
+		// in the test loop, so a connect can meet 53300 too_many_connections,
+		// and a single attempt silently leaked the database.
+		drop := func() error {
+			c, err := pgx.Connect(ctx, base)
+			if err != nil {
+				return err
+			}
+			defer func() { _ = c.Close(ctx) }()
+			_, err = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+			return err
 		}
-		defer func() { _ = c.Close(ctx) }()
-		_, _ = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+		for err := drop(); isTransientPGRefusal(err) && ctx.Err() == nil; err = drop() {
+			time.Sleep(rawCreateDelay)
+		}
 	})
 	u.Path = "/" + name
 	return u.String()
+}
+
+// isTransientPGRefusal reports whether err is a server refusal worth retrying:
+// 53300 too_many_connections, 57P03 cannot_connect_now or 55006 object_in_use.
+func isTransientPGRefusal(err error) bool {
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) {
+		return false
+	}
+	switch pg.Code {
+	case "53300", "57P03", "55006":
+		return true
+	}
+	return false
 }
 
 // retryObjectInUse runs create, retrying ONLY on SQLSTATE 55006 (object_in_use,
@@ -8135,5 +8159,120 @@ WHERE table_name IN ('campaign_item_expedites', 'campaign_dispatch_holds')`).Sca
 	}
 	if n := intentColumn(); n != 1 {
 		t.Errorf("merge_intent_at columns after re-applying 0107 = %d, want 1", n)
+	}
+}
+
+// TestMigrateDown_MergeQueueIntentSequenceEpochReversal pins 0108 (ADR-093
+// slice 2 / #4296): after MigrateUp merge_candidate_queue_entries carries a
+// nullable BIGINT merge_intent_sequence and a NOT NULL admission_epoch
+// defaulting to 0 (a pre-0108-shaped insert reads epoch 0, no sequence), and
+// merge_dispatch_claims refuses a second claim for one run (the D1 UNIQUE
+// run_id). After rolling back through 0108 the columns and the ledger are
+// gone, the schema lands on 0107 (merge_intent_at survives) and the queue
+// rows survive; MigrateUp again restores both.
+func TestMigrateDown_MergeQueueIntentSequenceEpochReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	columns := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND data_type = 'bigint' AND (
+  (column_name = 'merge_intent_sequence' AND is_nullable = 'YES') OR
+  (column_name = 'admission_epoch' AND is_nullable = 'NO' AND column_default = '0'))`).Scan(&n); err != nil {
+			t.Fatalf("read 0108 columns: %v", err)
+		}
+		return n
+	}
+	if n := columns(); n != 2 {
+		t.Fatalf("0108 columns after MigrateUp = %d, want 2", n)
+	}
+	if !tableExists(t, url, "merge_dispatch_claims") {
+		t.Fatal("merge_dispatch_claims missing after MigrateUp")
+	}
+
+	var runID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha)
+VALUES ($1, 'o/r', 'main', 'held', 'h1')`, runID); err != nil {
+		t.Fatalf("insert pre-0108-shaped row: %v — 0108 must leave it insertable", err)
+	}
+	var epoch int64
+	var seqNull bool
+	if err := pool.QueryRow(ctx, `SELECT admission_epoch, merge_intent_sequence IS NULL FROM merge_candidate_queue_entries WHERE run_id = $1`, runID).
+		Scan(&epoch, &seqNull); err != nil {
+		t.Fatalf("read defaults: %v", err)
+	}
+	if epoch != 0 || !seqNull {
+		t.Errorf("pre-0108-shaped row: admission_epoch = %d, sequence NULL = %v; want 0, true (no backfill)", epoch, seqNull)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_dispatch_claims (run_id, state, path, head_sha) VALUES ($1, 'dispatched', 'queue', 'h1')`, runID); err != nil {
+		t.Fatalf("first dispatch claim: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_dispatch_claims (run_id, state, path, head_sha) VALUES ($1, 'dispatched', 'inline', 'h1')`, runID); err == nil {
+		t.Error("a second dispatch claim for one run was accepted; want the UNIQUE run_id refusal (approval condition D1)")
+	}
+
+	downThrough(t, url, "0108")
+
+	if n := columns(); n != 0 {
+		t.Errorf("0108 columns after rolling back 0108 = %d, want 0", n)
+	}
+	if tableExists(t, url, "merge_dispatch_claims") {
+		t.Error("merge_dispatch_claims survived rolling back 0108")
+	}
+	var rows, intentCols int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM merge_candidate_queue_entries WHERE run_id = $1`, runID).Scan(&rows); err != nil {
+		t.Fatalf("read entries after rollback: %v — the 0101 table must survive", err)
+	}
+	if rows != 1 {
+		t.Errorf("queue rows after rolling back 0108 = %d, want 1 (untouched)", rows)
+	}
+	// The rollback lands on 0107, so its merge_intent_at column survives.
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'merge_intent_at'`).Scan(&intentCols); err != nil {
+		t.Fatalf("read 0107 column after rolling back 0108: %v", err)
+	}
+	if intentCols != 1 {
+		t.Errorf("merge_intent_at columns after rolling back 0108 = %d, want 1 (0107 untouched)", intentCols)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n := columns(); n != 2 {
+		t.Errorf("0108 columns after re-applying 0108 = %d, want 2", n)
+	}
+	if !tableExists(t, url, "merge_dispatch_claims") {
+		t.Error("merge_dispatch_claims missing after re-applying 0108")
+	}
+}
+
+// TestIsTransientPGRefusal: the raw-database drop retries only a server
+// refusal (also through a connect error's wrap), never another failure.
+func TestIsTransientPGRefusal(t *testing.T) {
+	t.Parallel()
+	for _, code := range []string{"53300", "57P03", "55006"} {
+		if err := fmt.Errorf("connect: %w", &pgconn.PgError{Code: code}); !isTransientPGRefusal(err) {
+			t.Errorf("wrapped SQLSTATE %s: got false, want true", code)
+		}
+	}
+	for _, err := range []error{nil, errors.New("dial unix: no such file"), &pgconn.PgError{Code: "42501"}} {
+		if isTransientPGRefusal(err) {
+			t.Errorf("%v: got true, want false", err)
+		}
 	}
 }
