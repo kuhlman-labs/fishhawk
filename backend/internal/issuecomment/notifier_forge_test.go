@@ -29,6 +29,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -165,10 +166,13 @@ func (g *forgeTestGitHub) ListIssueComments(_ context.Context, scope forge.Crede
 	return nil, nil
 }
 
-// forgeTestRuns is a one-run run.Repository.
+// forgeTestRuns is a one-run run.Repository. stages, when set, is what
+// ListStagesForRun serves (the anchor renders a stage's reviews only when that
+// stage exists on the run).
 type forgeTestRuns struct {
 	run.Repository
-	row *run.Run
+	row    *run.Run
+	stages []*run.Stage
 }
 
 func (r *forgeTestRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error) {
@@ -179,7 +183,7 @@ func (r *forgeTestRuns) GetRun(_ context.Context, id uuid.UUID) (*run.Run, error
 }
 
 func (r *forgeTestRuns) ListStagesForRun(context.Context, uuid.UUID) ([]*run.Stage, error) {
-	return nil, nil
+	return r.stages, nil
 }
 
 func (r *forgeTestRuns) ListRuns(context.Context, run.ListRunsFilter) ([]*run.Run, error) {
@@ -199,6 +203,23 @@ func (a *forgeTestAudit) seed(runID uuid.UUID, category string, payload map[stri
 	a.mu.Lock()
 	defer a.mu.Unlock()
 	body, _ := json.Marshal(payload)
+	r := runID
+	a.seeded = append(a.seeded, &audit.Entry{
+		ID: uuid.New(), Sequence: int64(len(a.seeded) + 1), RunID: &r, Category: category, Payload: body,
+	})
+}
+
+// seedPayload seeds a row whose payload is json.Marshal of v — used with the
+// REAL planreview payload structs so a test crosses the payload-struct ↔
+// renderer seam on the production wire tags.
+func (a *forgeTestAudit) seedPayload(t *testing.T, runID uuid.UUID, category string, v any) {
+	t.Helper()
+	body, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	a.mu.Lock()
+	defer a.mu.Unlock()
 	r := runID
 	a.seeded = append(a.seeded, &audit.Entry{
 		ID: uuid.New(), Sequence: int64(len(a.seeded) + 1), RunID: &r, Category: category, Payload: body,
@@ -957,5 +978,142 @@ func TestEditComment_ForgeWithoutEditor_ReturnsSentinel(t *testing.T) {
 	}
 	if len(ops.calls) != 0 {
 		t.Errorf("forge calls = %+v; want none", ops.calls)
+	}
+}
+
+// ---------------------------------------------------------------------
+// (j) Reviewer-role attribution on the forge-routed surfaces (E89.33 / #4669).
+// Every review row is json.Marshal of the real planreview payload struct.
+// ---------------------------------------------------------------------
+
+// seedRoleRound seeds one plan review round: a standard verdict and a verdict
+// from a persona this repository does not declare (`compliance`, ADR-110),
+// plus a persona skip and a STANDARD skip that must stay unrendered.
+func seedRoleRound(t *testing.T, au *forgeTestAudit, runID uuid.UUID) {
+	t.Helper()
+	au.seedPayload(t, runID, "plan_review_started", planreview.ReviewStartedPayload{ConfiguredAgents: 4, Authority: planreview.AuthorityAdvisory})
+	au.seedPayload(t, runID, "plan_reviewed", planreview.PlanReviewedPayload{
+		ReviewerKind: "agent", ReviewerModel: "claude-opus-5-5", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictApprove,
+	})
+	au.seedPayload(t, runID, "plan_reviewed", planreview.PlanReviewedPayload{
+		ReviewerKind: "agent", ReviewerModel: "gpt-6-astra", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictApproveWithConcerns,
+		Concerns: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "compliance", Note: "retention policy unstated"}},
+		Persona:  "compliance",
+	})
+	au.seedPayload(t, runID, "plan_review_skipped", planreview.ReviewSkippedPayload{
+		Reason: planreview.ReasonPersonaRemitUnavailable, ConfiguredAgents: 4, Authority: planreview.AuthorityAdvisory, Persona: "architect",
+	})
+	au.seedPayload(t, runID, "plan_review_skipped", planreview.ReviewSkippedPayload{
+		Reason: planreview.ReasonReviewerUnavailable, ConfiguredAgents: 4, Authority: planreview.AuthorityAdvisory,
+	})
+}
+
+// assertRoleAnchor asserts the posted anchor body names each reviewer's role
+// ahead of its model.
+func assertRoleAnchor(t *testing.T, body string) {
+	t.Helper()
+	for _, want := range []string{
+		"**Plan review** — Plan Reviewer (claude-opus-5-5): approve · Compliance Reviewer (gpt-6-astra): approve_with_concerns (1 medium) · Architect Reviewer: skipped (persona_remit_unavailable)",
+		"<details><summary>Compliance Reviewer (gpt-6-astra): approve_with_concerns (1 medium)</summary>",
+	} {
+		if !strings.Contains(body, want) {
+			t.Errorf("anchor body missing %q:\n%s", want, body)
+		}
+	}
+	if strings.Contains(body, "reviewer_unavailable") {
+		t.Errorf("a standard reviewer's skip must stay unrendered:\n%s", body)
+	}
+}
+
+func TestNotifyStatusUpdateForRun_GitLab_ReviewerRoles(t *testing.T) {
+	row := gitlabRun()
+	ops := &fakeForgeEditor{}
+	h := newForgeHarness(t, row, ops)
+	h.n.runs = &forgeTestRuns{row: row, stages: []*run.Stage{{ID: uuid.New(), RunID: row.ID, Type: run.StageTypePlan, State: run.StageStateRunning}}}
+	seedRoleRound(t, h.au, row.ID)
+
+	if err := h.n.NotifyStatusUpdateForRun(context.Background(), row.ID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	posts := ops.callsFor("PostIssueCommentWithID")
+	if len(posts) != 1 {
+		t.Fatalf("PostIssueCommentWithID calls = %d; want 1 anchor (calls: %+v)", len(posts), ops.calls)
+	}
+	assertGitLabTarget(t, posts[0])
+	assertRoleAnchor(t, posts[0].body)
+	assertNoGitHub(t, h.gh)
+}
+
+func TestNotifyStatusUpdateForRun_GitHub_ReviewerRoles(t *testing.T) {
+	row := githubRun()
+	h := newForgeHarness(t, row, nil)
+	h.n.runs = &forgeTestRuns{row: row, stages: []*run.Stage{{ID: uuid.New(), RunID: row.ID, Type: run.StageTypePlan, State: run.StageStateRunning}}}
+	seedRoleRound(t, h.au, row.ID)
+
+	if err := h.n.NotifyStatusUpdateForRun(context.Background(), row.ID); err != nil {
+		t.Fatalf("NotifyStatusUpdateForRun: %v", err)
+	}
+	h.gh.mu.Lock()
+	creates := append([]forgeCall(nil), h.gh.creates...)
+	h.gh.mu.Unlock()
+	var anchor string
+	for _, c := range creates {
+		if strings.Contains(c.body, "fishhawk-sticky locus=anchor") {
+			anchor = c.body
+		}
+	}
+	if anchor == "" {
+		t.Fatalf("no anchor comment created on GitHub; creates: %+v", creates)
+	}
+	assertRoleAnchor(t, anchor)
+}
+
+// seedPersonaReject seeds a security persona's implement reject.
+func seedPersonaReject(t *testing.T, au *forgeTestAudit, runID uuid.UUID) {
+	t.Helper()
+	au.seedPayload(t, runID, "implement_reviewed", planreview.ImplementReviewedPayload{
+		ReviewerKind: "agent", ReviewerModel: "claude-opus-5-5", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictReject,
+		Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "security", Note: "token logged"}},
+		Persona:  "security",
+	})
+}
+
+const wantPersonaRejectPing = "🚫 Security Reviewer (claude-opus-5-5) flagged a blocking concern on the implement (advisory reject)"
+
+func TestNotifyPageClassForRun_GitLab_PersonaRejectPing(t *testing.T) {
+	row := gitlabRun()
+	ops := &fakeForgeOps{}
+	h := newForgeHarness(t, row, ops)
+	seedPersonaReject(t, h.au, row.ID)
+
+	if err := h.n.NotifyPageClassForRun(context.Background(), row.ID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	posts := ops.callsFor("PostIssueComment")
+	if len(posts) != 1 {
+		t.Fatalf("PostIssueComment calls = %d; want 1 ping (calls: %+v)", len(posts), ops.calls)
+	}
+	assertGitLabTarget(t, posts[0])
+	if !strings.Contains(posts[0].body, wantPersonaRejectPing) {
+		t.Errorf("ping body = %q; want it to contain %q", posts[0].body, wantPersonaRejectPing)
+	}
+	assertNoGitHub(t, h.gh)
+}
+
+func TestNotifyPageClassForRun_GitHub_PersonaRejectPing(t *testing.T) {
+	row := githubRun()
+	h := newForgeHarness(t, row, nil)
+	seedPersonaReject(t, h.au, row.ID)
+
+	if err := h.n.NotifyPageClassForRun(context.Background(), row.ID); err != nil {
+		t.Fatalf("NotifyPageClassForRun: %v", err)
+	}
+	h.gh.mu.Lock()
+	defer h.gh.mu.Unlock()
+	if len(h.gh.creates) != 1 {
+		t.Fatalf("CreateIssueComment calls = %d; want 1 ping (creates: %+v)", len(h.gh.creates), h.gh.creates)
+	}
+	if !strings.Contains(h.gh.creates[0].body, wantPersonaRejectPing) {
+		t.Errorf("ping body = %q; want it to contain %q", h.gh.creates[0].body, wantPersonaRejectPing)
 	}
 }

@@ -2196,15 +2196,41 @@ func (s *Server) emitPreRoundReviewFailed(ctx context.Context, runID, stageID uu
 	}
 }
 
+// emitInvocationReviewFailed is emitReviewFailed for a reviewer INVOCATION
+// failure (the agent_version mismatch and invocation-error branches of the
+// plan and implement rounds): the reason gains inv's persona prefix, and a
+// persona invocation's payload also names the persona in its structured
+// Persona field so a comment surface can render the failed reviewer's role
+// (E89.33 / #4669). A standard reviewer's payload is unchanged.
+func (s *Server) emitInvocationReviewFailed(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model string, inv reviewerInvocation, reason string, timeout bool) {
+	if s.cfg.AuditRepo == nil {
+		return
+	}
+	payload := planreview.ReviewFailedPayload{Reason: inv.personaFailureReason(reason), ReviewerModel: model, Authority: authority, Timeout: timeout}
+	payload.Persona = inv.personaName()
+	if _, aerr := s.appendReviewTerminal(ctx, reviewFailedParamsWith(runID, stageID, category, payload)); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review: append "+category+" audit entry failed",
+			slog.String("run_id", runID.String()),
+			slog.String("error", aerr.Error()),
+		)
+	}
+}
+
 // reviewFailedParams builds a *_review_failed append; the durable writers stamp
 // the timestamp themselves.
 func reviewFailedParams(runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, model, reason string, timeout bool) audit.ChainAppendParams {
-	payload, _ := json.Marshal(planreview.ReviewFailedPayload{
+	return reviewFailedParamsWith(runID, stageID, category, planreview.ReviewFailedPayload{
 		Reason:        reason,
 		ReviewerModel: model,
 		Authority:     authority,
 		Timeout:       timeout,
 	})
+}
+
+// reviewFailedParamsWith builds a *_review_failed append from a complete
+// payload.
+func reviewFailedParamsWith(runID, stageID uuid.UUID, category string, p planreview.ReviewFailedPayload) audit.ChainAppendParams {
+	payload, _ := json.Marshal(p)
 	systemKind := audit.ActorKind("system")
 	return audit.ChainAppendParams{
 		RunID:     runID,
@@ -2490,7 +2516,7 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 				slog.String("agent_version_range", inv.agentVersion),
 				slog.String("reason", reason),
 			)
-			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, inv.personaFailureReason(reason), false)
+			s.emitInvocationReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, inv.specModel, inv, reason, false)
 			hasRejection = true
 			continue
 		} else if degraded {
@@ -2528,7 +2554,7 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 			// discriminator (#747) tells a budget-kill apart from a transport
 			// failure. hasRejection is deliberately untouched — gating
 			// advance/degrade semantics are unchanged (#574); observability-only.
-			s.emitReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, inv.personaFailureReason(err.Error()), timedOut)
+			s.emitInvocationReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, model, inv, err.Error(), timedOut)
 			continue
 		}
 

@@ -194,3 +194,37 @@ func TestRenderPRReviewBody_ConcernEvidence(t *testing.T) {
 		})
 	}
 }
+
+// TestRenderPRReviewBody_NamesReviewerRole pins the PR review heading's role
+// attribution (E89.33 / #4669, AC1): a standard verdict's heading names "PR
+// Reviewer", a persona verdict's names the persona's role, and the attribution
+// line still names the reviewer model.
+func TestRenderPRReviewBody_NamesReviewerRole(t *testing.T) {
+	runRow := &run.Run{ID: uuid.New()}
+	cases := []struct {
+		name, persona, wantHeader string
+	}{
+		{"standard", "", "### 🤖 PR Reviewer — agent implement review\n"},
+		{"security persona", "security", "### 🤖 Security Reviewer — agent implement review\n"},
+		{"undeclared-here persona", "compliance", "### 🤖 Compliance Reviewer — agent implement review\n"},
+		{"invalid persona name", "@ops [x](y)", "### 🤖 Persona Reviewer — agent implement review\n"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := issuecomment.RenderPRReviewBody(implementReviewedEntry(t, 5, planreview.ImplementReviewedPayload{
+				ReviewerModel: "claude-opus-5-5",
+				Verdict:       planreview.VerdictApprove,
+				Persona:       tc.persona,
+			}), runRow, "https://app.example")
+			if !strings.HasPrefix(got, tc.wantHeader) {
+				t.Errorf("heading: want prefix %q; got:\n%s", tc.wantHeader, got)
+			}
+			if !strings.Contains(got, "_Advisory review by `claude-opus-5-5`") {
+				t.Errorf("attribution line must still name the model; got:\n%s", got)
+			}
+			if tc.persona != "" && strings.Contains(got, "@ops") {
+				t.Errorf("an invalid persona name must never be echoed; got:\n%s", got)
+			}
+		})
+	}
+}

@@ -11,6 +11,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -399,15 +400,154 @@ func TestRenderAnchorBody_ReviewVerdictsInline(t *testing.T) {
 		ExternalURL: "https://app.example",
 		Now:         time.Now(),
 	})
-	if !strings.Contains(body, "claude-opus-4-8: approve") {
+	if !strings.Contains(body, "Plan Reviewer (claude-opus-4-8): approve") {
 		t.Errorf("opus verdict missing: %q", body)
 	}
-	if !strings.Contains(body, "gpt-5.5: reject (1 high)") {
+	if !strings.Contains(body, "Plan Reviewer (gpt-5.5): reject (1 high)") {
 		t.Errorf("codex verdict with severity-tagged concern count missing: %q", body)
 	}
 	if !strings.Contains(body, "see the note") {
 		t.Errorf("free_form should be in the expandable details: %q", body)
 	}
+}
+
+// TestRenderAnchorBody_PersonaRoleNamed pins the anchor review section's role
+// attribution (E89.33 / #4669): each reviewer's summary token and its
+// <details><summary> name the role ahead of the model — the stage's standard
+// role for a standard reviewer, the persona's role for a persona — and a
+// verdict recorded before #3753 (no persona key at all) reads as the standard
+// role.
+func TestRenderAnchorBody_PersonaRoleNamed(t *testing.T) {
+	high := []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "design", Note: "boom"}}
+	render := func(stage run.StageType, entries []*audit.Entry) string {
+		return RenderAnchorBody(AnchorInput{
+			Run:         anchorRun(),
+			Stages:      []*run.Stage{{Type: stage, State: run.StageStateAwaitingApproval}},
+			Audit:       entries,
+			ExternalURL: "https://app.example",
+			Now:         time.Now(),
+		})
+	}
+
+	t.Run("plan round", func(t *testing.T) {
+		body := render(run.StageTypePlan, []*audit.Entry{
+			startedEntry(10, "plan"),
+			roleVerdictEntry(t, 11, "plan", "m1", "", planreview.VerdictApprove, nil),
+			roleVerdictEntry(t, 12, "plan", "m2", "architect", planreview.VerdictReject, high),
+		})
+		if !strings.Contains(body, "**Plan review** — Plan Reviewer (m1): approve · Architect Reviewer (m2): reject (1 high)\n") {
+			t.Errorf("plan summary line must name both roles ahead of the models:\n%s", body)
+		}
+		if !strings.Contains(body, "<details><summary>Architect Reviewer (m2): reject (1 high)</summary>") {
+			t.Errorf("persona <details> summary must name the persona role:\n%s", body)
+		}
+	})
+
+	t.Run("implement round", func(t *testing.T) {
+		body := render(run.StageTypeImplement, []*audit.Entry{
+			startedEntry(20, "implement"),
+			roleVerdictEntry(t, 21, "implement", "m1", "", planreview.VerdictReject, high),
+			roleVerdictEntry(t, 22, "implement", "m2", "security", planreview.VerdictApprove, nil),
+		})
+		if !strings.Contains(body, "**Implement review** — PR Reviewer (m1): reject (1 high) · Security Reviewer (m2): approve\n") {
+			t.Errorf("implement summary line must name both roles ahead of the models:\n%s", body)
+		}
+		if !strings.Contains(body, "<details><summary>PR Reviewer (m1): reject (1 high)</summary>") {
+			t.Errorf("standard <details> summary must name the PR Reviewer role:\n%s", body)
+		}
+	})
+
+	t.Run("pre-#3753 payload with no persona key", func(t *testing.T) {
+		legacy := reviewedEntry(t, 31, "plan", "old-model", "approve", nil, "")
+		if strings.Contains(string(legacy.Payload), `"persona"`) {
+			t.Fatalf("fixture must carry no persona key: %s", legacy.Payload)
+		}
+		body := render(run.StageTypePlan, []*audit.Entry{startedEntry(30, "plan"), legacy})
+		if !strings.Contains(body, "**Plan review** — Plan Reviewer (old-model): approve") {
+			t.Errorf("a legacy verdict must render the standard role:\n%s", body)
+		}
+	})
+}
+
+// TestRenderAnchorBody_PersonaSkipFailRows pins the persona-naming skip/fail
+// rows (E89.33 / #4669, AC3): a current-round persona skip or failure renders
+// by role on the summary line with no <details>, while a STANDARD reviewer's
+// skip/fail row stays unrendered exactly as before. The standard rows are
+// seeded beside the persona rows by construction so the persona-only filter is
+// the only thing keeping them out. A failure's reason prose and a non-slug skip
+// reason never render, and a persona skip below the latest *_review_started
+// floor is excluded.
+func TestRenderAnchorBody_PersonaSkipFailRows(t *testing.T) {
+	entries := []*audit.Entry{
+		// Stale round: a persona skip below the current floor.
+		startedEntry(5, "plan"),
+		roleSkippedEntry(t, 6, "plan", "historian", planreview.ReasonPersonaRemitUnavailable),
+		// Current round.
+		startedEntry(10, "plan"),
+		roleVerdictEntry(t, 11, "plan", "m1", "", planreview.VerdictApprove, nil),
+		roleSkippedEntry(t, 12, "plan", "security", planreview.ReasonPersonaRemitUnavailable),
+		roleFailedEntry(t, 13, "plan", "m3", "architect", "persona architect: context deadline exceeded", true),
+		roleSkippedEntry(t, 14, "plan", "", planreview.ReasonReviewerUnavailable),
+		roleFailedEntry(t, 15, "plan", "m4", "", "standard reviewer transport error", false),
+		roleSkippedEntry(t, 16, "plan", "compliance", "Remit **missing** @ops"),
+		roleFailedEntry(t, 17, "plan", "", "data_privacy", "persona data_privacy: exit 1", false),
+	}
+	body := RenderAnchorBody(AnchorInput{
+		Run:         anchorRun(),
+		Stages:      []*run.Stage{{Type: run.StageTypePlan, State: run.StageStateAwaitingApproval}},
+		Audit:       entries,
+		ExternalURL: "https://app.example",
+		Now:         time.Now(),
+	})
+	wantLine := "**Plan review** — Plan Reviewer (m1): approve · Security Reviewer: skipped (persona_remit_unavailable) · " +
+		"Architect Reviewer (m3): failed (timeout) · Compliance Reviewer: skipped · Data Privacy Reviewer: failed\n"
+	if !strings.Contains(body, wantLine) {
+		t.Errorf("summary line must carry the persona skip/fail rows by role, in audit order:\nwant %q\nin:\n%s", wantLine, body)
+	}
+	for _, absent := range []string{
+		"reviewer_unavailable", "Plan Reviewer: skipped", "Plan Reviewer (m4)", "standard reviewer transport error",
+		"context deadline exceeded", "exit 1", "Remit", "@ops", "Historian",
+	} {
+		if strings.Contains(body, absent) {
+			t.Errorf("anchor must not render %q:\n%s", absent, body)
+		}
+	}
+	if strings.Contains(body, "<details>") {
+		t.Errorf("skip/fail rows and a bare approve must open no <details>:\n%s", body)
+	}
+
+	t.Run("round of only persona skip/fail rows still renders", func(t *testing.T) {
+		body := RenderAnchorBody(AnchorInput{
+			Run:    anchorRun(),
+			Stages: []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+			Audit: []*audit.Entry{
+				startedEntry(40, "implement"),
+				roleSkippedEntry(t, 41, "implement", "security", planreview.ReasonReviewerUnavailable),
+			},
+			ExternalURL: "https://app.example",
+			Now:         time.Now(),
+		})
+		if !strings.Contains(body, "**Implement review** — Security Reviewer: skipped (reviewer_unavailable)") {
+			t.Errorf("a persona-only round must render a review section:\n%s", body)
+		}
+	})
+
+	t.Run("standard-only skip/fail round renders nothing", func(t *testing.T) {
+		body := RenderAnchorBody(AnchorInput{
+			Run:    anchorRun(),
+			Stages: []*run.Stage{{Type: run.StageTypeImplement, State: run.StageStateRunning}},
+			Audit: []*audit.Entry{
+				startedEntry(40, "implement"),
+				roleSkippedEntry(t, 41, "implement", "", planreview.ReasonReviewerNotConfigured),
+				roleFailedEntry(t, 42, "implement", "m1", "", "boom", false),
+			},
+			ExternalURL: "https://app.example",
+			Now:         time.Now(),
+		})
+		if strings.Contains(body, "Implement review") {
+			t.Errorf("standard skip/fail rows must render no review section:\n%s", body)
+		}
+	})
 }
 
 // TestRenderAnchorBody_PerReviewerBlocks pins the refined per-reviewer-block
@@ -428,17 +568,17 @@ func TestRenderAnchorBody_PerReviewerBlocks(t *testing.T) {
 		ExternalURL: "https://app.example",
 		Now:         time.Now(),
 	})
-	if strings.Contains(body, "<details><summary>claude-opus-4-8: approve</summary>") {
+	if strings.Contains(body, "<details><summary>Plan Reviewer (claude-opus-4-8): approve</summary>") {
 		t.Errorf("a content-free approve must not emit a per-reviewer block: %q", body)
 	}
-	if strings.Contains(body, "<details><summary>gpt-5.5: approve</summary>") {
+	if strings.Contains(body, "<details><summary>Plan Reviewer (gpt-5.5): approve</summary>") {
 		t.Errorf("a content-free approve must not emit a per-reviewer block: %q", body)
 	}
 	if strings.Contains(body, "(no additional notes)") {
 		t.Errorf("empty-details body must be dropped entirely: %q", body)
 	}
 	// The inline summary line still names every reviewer.
-	if !strings.Contains(body, "claude-opus-4-8: approve · gpt-5.5: approve") {
+	if !strings.Contains(body, "Plan Reviewer (claude-opus-4-8): approve · Plan Reviewer (gpt-5.5): approve") {
 		t.Errorf("inline one-liner must survive: %q", body)
 	}
 }
@@ -474,7 +614,7 @@ func TestRenderAnchorBody_StaleVerdictExcluded(t *testing.T) {
 	if strings.Contains(body, "round-1 problem") || strings.Contains(body, "stale free-form") {
 		t.Errorf("stale round-1 verdict leaked into the anchor: %q", body)
 	}
-	if !strings.Contains(body, "claude-opus-4-8: approve") {
+	if !strings.Contains(body, "PR Reviewer (claude-opus-4-8): approve") {
 		t.Errorf("current-round approve missing: %q", body)
 	}
 }

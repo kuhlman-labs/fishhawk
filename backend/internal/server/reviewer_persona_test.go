@@ -875,3 +875,43 @@ func TestPersona_NonGroundingPersonaNamesReviewerCannotGround(t *testing.T) {
 		}
 	})
 }
+
+// TestPersona_InvocationFailure_RecordsPersonaOnFailedPayload pins that a
+// persona whose invocation errors records its persona in the structured
+// ReviewFailedPayload.Persona field (E89.33 / #4669), so a comment surface can
+// name the failed reviewer's role, while the reason prose keeps its
+// "persona <name>: " prefix and the standard reviewer's verdict still lands and
+// settles the round. The assertion reads the COMMITTED audit row back.
+//
+// Counterfactual: stamp `payload.Persona = ""` in emitInvocationReviewFailed —
+// the recorded row carries no persona and this goes RED.
+func TestPersona_InvocationFailure_RecordsPersonaOnFailedPayload(t *testing.T) {
+	persona := &fakePlanReviewer{err: errors.New("persona transport exploded")}
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), approvingFake(), persona)
+	p.review(t)
+
+	if n := len(reviewerCalls(persona)); n != 1 {
+		t.Fatalf("persona reviewer calls = %d, want 1", n)
+	}
+	failed := auditFakeEntries(p.au, "plan_review_failed")
+	if len(failed) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1", len(failed))
+	}
+	var fp planreview.ReviewFailedPayload
+	if err := json.Unmarshal(failed[0].Payload, &fp); err != nil {
+		t.Fatalf("decode plan_review_failed: %v", err)
+	}
+	if fp.Persona != personaTestName {
+		t.Errorf("failed payload persona = %q, want %q (raw %s)", fp.Persona, personaTestName, failed[0].Payload)
+	}
+	if !strings.HasPrefix(fp.Reason, "persona "+personaTestName+": ") || !strings.Contains(fp.Reason, "persona transport exploded") {
+		t.Errorf("failed payload reason = %q, want the persona-prefixed error prose", fp.Reason)
+	}
+	if got := countAuditCategory(p.au, "plan_reviewed"); got != 1 {
+		t.Errorf("plan_reviewed entries = %d, want 1 (the standard reviewer's verdict)", got)
+	}
+	started := decodeStarted(t, p.au, "plan_review_started")
+	if !planreview.Settled(started.ConfiguredAgents, terminalCount(p.au, "plan")) {
+		t.Errorf("round does not settle: configured_agents %d, terminal entries %d", started.ConfiguredAgents, terminalCount(p.au, "plan"))
+	}
+}
