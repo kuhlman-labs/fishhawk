@@ -1770,3 +1770,492 @@ func TestClaimMergeDispatch_DuplicateWhoseReadBackFailsNamesUnknown(t *testing.T
 		t.Fatalf("existing claim = %+v found=%v err=%v, want the queue claim intact", existing, found, err)
 	}
 }
+
+// --- ADR-112 R3: approval wait, yield marker (0109) ---
+
+// markYielded marks a held row BY CONSTRUCTION (never through the store),
+// yielded `ago` before the database clock, and returns the stored yielded_at.
+func (f *fixture) markYielded(id uuid.UUID, reason string, ago time.Duration) time.Time {
+	f.t.Helper()
+	f.exec(`UPDATE merge_candidate_queue_entries
+SET yield_reason = $2, yield_detail = 'seeded', yielded_at = clock_timestamp() - make_interval(secs => $3::float8)
+WHERE id = $1`, id, reason, ago.Seconds())
+	e := f.entry(id)
+	if e.YieldedAt == nil {
+		f.t.Fatalf("seeded marker on %s did not land", id)
+	}
+	return *e.YieldedAt
+}
+
+// admitAt admits the base's next entry and returns its epoch, failing unless
+// want was the one admitted.
+func (f *fixture) admitAt(want uuid.UUID) int64 {
+	f.t.Helper()
+	adm := f.admitNext(mainBase())
+	if !adm.Admitted || adm.Entry.ID != want {
+		f.t.Fatalf("AdmitNext = %+v, want %s admitted", adm, want)
+	}
+	return adm.Entry.AdmissionEpoch
+}
+
+func (f *fixture) approvalWait(id uuid.UUID, epoch int64, window time.Duration) ApprovalWaitResult {
+	f.t.Helper()
+	res, err := f.store.ApprovalWait(context.Background(), id, epoch, window)
+	if err != nil {
+		f.t.Fatalf("ApprovalWait(%s, %d): %v", id, epoch, err)
+	}
+	return res
+}
+
+// TestApprovalWait_AnchorSurvivesUnadmitAndReadmission (CF1 vehicle): one
+// row's wait anchor is stamped by the first ApprovalWait and survives an
+// Unadmit (merge-on-pass readvance), the re-admission and a stale re-claim,
+// so every later ApprovalWait returns the SAME start; expiry is judged in SQL
+// against that anchor. With the anchor reset by Unadmit, or stamped without
+// COALESCE, the second start is a later database instant: RED.
+func TestApprovalWait_AnchorSurvivesUnadmitAndReadmission(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	if _, err := f.store.ApprovalWait(ctx, e.ID, 0, time.Hour); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ApprovalWait(held) err = %v, want ErrStateConflict", err)
+	}
+	if f.entry(e.ID).ApprovalWaitStartedAt != nil {
+		t.Fatal("a refused ApprovalWait stamped the wait anchor")
+	}
+	epoch := f.admitAt(e.ID)
+	first := f.approvalWait(e.ID, epoch, time.Hour)
+	if first.Entry.ApprovalWaitStartedAt == nil || first.Expired ||
+		first.Remaining <= 59*time.Minute || first.Remaining > time.Hour {
+		t.Fatalf("first ApprovalWait = %+v, want an anchor, not expired, ~1h remaining", first)
+	}
+	start := *first.Entry.ApprovalWaitStartedAt
+
+	if _, err := f.store.Unadmit(ctx, e.ID, epoch); err != nil {
+		t.Fatalf("Unadmit: %v", err)
+	}
+	if got := f.entry(e.ID).ApprovalWaitStartedAt; got == nil || !got.Equal(start) {
+		t.Fatalf("anchor after Unadmit = %v, want %v (never reset on readvance)", got, start)
+	}
+	epoch = f.admitAt(e.ID)
+	second := f.approvalWait(e.ID, epoch, time.Hour)
+	if second.Entry.ApprovalWaitStartedAt == nil || !second.Entry.ApprovalWaitStartedAt.Equal(start) {
+		t.Fatalf("anchor after re-admission = %v, want the first start %v", second.Entry.ApprovalWaitStartedAt, start)
+	}
+
+	// A stale re-claim keeps it too.
+	f.exec(`UPDATE merge_candidate_queue_entries SET admitted_at = clock_timestamp() - make_interval(secs => $2) WHERE id = $1`,
+		e.ID, (AdmissionStaleAfter + time.Minute).Seconds())
+	adm := f.admitNext(mainBase())
+	if !adm.Readmitted {
+		t.Fatalf("stale re-claim = %+v, want readmitted", adm)
+	}
+	if got := f.approvalWait(e.ID, adm.Entry.AdmissionEpoch, time.Hour).Entry.ApprovalWaitStartedAt; got == nil || !got.Equal(start) {
+		t.Fatalf("anchor after stale re-claim = %v, want %v", got, start)
+	}
+
+	// A stale epoch is refused and changes nothing.
+	before := f.entry(e.ID)
+	if _, err := f.store.ApprovalWait(ctx, e.ID, epoch, time.Hour); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale ApprovalWait err = %v, want ErrStateConflict", err)
+	}
+	if after := f.entry(e.ID); !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("stale ApprovalWait wrote the row: %+v", after)
+	}
+
+	// Expiry: the anchor backdated past the window (database clock).
+	f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = clock_timestamp() - interval '2 hours' WHERE id = $1`, e.ID)
+	if res := f.approvalWait(e.ID, adm.Entry.AdmissionEpoch, time.Hour); !res.Expired || res.Remaining != 0 {
+		t.Fatalf("ApprovalWait past the window = %+v, want expired with 0 remaining", res)
+	}
+	if res := f.approvalWait(e.ID, adm.Entry.AdmissionEpoch, 3*time.Hour); res.Expired || res.Remaining <= 59*time.Minute {
+		t.Fatalf("ApprovalWait inside a 3h window = %+v, want not expired, ~1h remaining", res)
+	}
+
+	for _, w := range []time.Duration{0, -time.Minute} {
+		if _, err := f.store.ApprovalWait(ctx, e.ID, adm.Entry.AdmissionEpoch, w); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("ApprovalWait(window %s) err = %v, want ErrInvalidRequest", w, err)
+		}
+	}
+}
+
+// TestAdmitNext_SkipsYieldedRows (CF2 vehicle): the yielded row is the OLDEST
+// by enqueued_at, so plain FIFO would admit it; AdmitNext admits the younger
+// unmarked row instead, and a base holding only yielded rows admits nothing.
+func TestAdmitNext_SkipsYieldedRows(t *testing.T) {
+	f := newFixture(t)
+	yielded, younger := uuid.New(), uuid.New()
+	f.seed(yielded, f.run(), StateHeld, 2*time.Hour)
+	f.seed(younger, f.run(), StateHeld, time.Hour)
+	f.markYielded(yielded, "forge_approval_absent", time.Minute)
+
+	adm := f.admitNext(mainBase())
+	if !adm.Admitted || adm.Entry.ID != younger {
+		t.Fatalf("AdmitNext = %+v, want the younger unmarked row %s (the yielded %s skipped)", adm, younger, yielded)
+	}
+	if got := f.entry(yielded); got.State != StateHeld || !got.Yielded() {
+		t.Fatalf("yielded row after admission = %+v, want still held and marked", got)
+	}
+
+	// A base with only yielded rows admits nothing.
+	other := Base{Repo: testRepo, BaseRef: "release"}
+	only := f.enqueue(f.run(), "release", "r1").Entry
+	f.markYielded(only.ID, "forge_approval_vetoed", time.Minute)
+	if adm := f.admitNext(other); adm.Admitted || adm.Entry != nil {
+		t.Fatalf("AdmitNext(only yielded) = %+v, want no admission and no entry", adm)
+	}
+	if got := f.entry(only.ID); got.State != StateHeld {
+		t.Fatalf("only-yielded row = %+v, want held", got)
+	}
+}
+
+// TestYield_OneTransactionUnderEpochCAS: a stale epoch is refused and the
+// COMMITTED row is still live and unmarked (read back); the current epoch
+// moves the row to held with the marker in one statement, keeping enqueued_at
+// and the wait anchor.
+func TestYield_OneTransactionUnderEpochCAS(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	marker := YieldMarker{Reason: "forge_approval_dismissed", Detail: "approval dismissed by a push"}
+	if _, err := f.store.Yield(ctx, e.ID, 0, marker); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("Yield(held) err = %v, want ErrStateConflict", err)
+	}
+	if f.entry(e.ID).Yielded() {
+		t.Fatal("a refused Yield on a held row marked it")
+	}
+	stale := f.admitAt(e.ID)
+	if _, err := f.store.Unadmit(ctx, e.ID, stale); err != nil {
+		t.Fatalf("Unadmit: %v", err)
+	}
+	epoch := f.admitAt(e.ID)
+	wait := f.approvalWait(e.ID, epoch, time.Hour)
+
+	if _, err := f.store.Yield(ctx, e.ID, stale, marker); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale Yield err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(e.ID); got.State != StateLive || got.Yielded() || got.YieldReason != "" || got.AdmissionEpoch != epoch {
+		t.Fatalf("entry after stale Yield = %+v, want untouched live, unmarked, epoch %d", got, epoch)
+	}
+	if _, err := f.store.Yield(ctx, e.ID, epoch, YieldMarker{}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("Yield(empty reason) err = %v, want ErrInvalidRequest", err)
+	}
+
+	got, err := f.store.Yield(ctx, e.ID, epoch, marker)
+	if err != nil {
+		t.Fatalf("Yield: %v", err)
+	}
+	read := f.entry(e.ID)
+	for _, g := range []Entry{got, read} {
+		if g.State != StateHeld || g.Phase != "" || g.AdmittedAt != nil || !g.EnqueuedAt.Equal(e.EnqueuedAt) ||
+			g.YieldReason != marker.Reason || g.YieldDetail != marker.Detail || g.YieldedAt == nil ||
+			g.ApprovalWaitStartedAt == nil || !g.ApprovalWaitStartedAt.Equal(*wait.Entry.ApprovalWaitStartedAt) {
+			t.Fatalf("yielded entry = %+v, want held, no phase/admitted_at, same enqueued_at, the marker, the wait anchor kept", g)
+		}
+	}
+	if _, err := f.store.Yield(ctx, e.ID, epoch, marker); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("second Yield err = %v, want ErrStateConflict (no longer live)", err)
+	}
+
+	// YieldAge is computed on the database clock; 0 when unmarked.
+	f.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '1 hour' WHERE id = $1`, e.ID)
+	if age := f.entry(e.ID).YieldAge; age < time.Hour || age > time.Hour+time.Minute {
+		t.Fatalf("YieldAge = %s, want ~1h", age)
+	}
+	if age := f.enqueue(f.run(), "main", "u1").Entry.YieldAge; age != 0 {
+		t.Fatalf("unmarked YieldAge = %s, want 0", age)
+	}
+}
+
+// TestClearYield_CompareAndSwap (CF3 vehicle): a stale yielded_at (another
+// episode) and a stale head (after a marker-preserving reanchor) are both
+// refused, and the marker is still set on READ-BACK (error identity alone is
+// not the assertion); the matching keys clear the marker and the wait anchor,
+// and the row is admitted ahead of a younger held row (FIFO at enqueued_at).
+func TestClearYield_CompareAndSwap(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b := f.run(), f.run()
+	ea := f.enqueue(a, "main", "h1").Entry
+	eb := f.enqueue(b, "main", "x1").Entry
+	epoch := f.admitAt(ea.ID)
+	f.approvalWait(ea.ID, epoch, time.Hour)
+	y, err := f.store.Yield(ctx, ea.ID, epoch, YieldMarker{Reason: "forge_approval_absent"})
+	if err != nil {
+		t.Fatalf("Yield: %v", err)
+	}
+	yieldedAt := *y.YieldedAt
+
+	stillMarked := func(why string) {
+		t.Helper()
+		if got := f.entry(ea.ID); !got.Yielded() || !got.YieldedAt.Equal(yieldedAt) || got.ApprovalWaitStartedAt == nil {
+			t.Fatalf("%s: entry = %+v, want the marker (yielded at %v) and wait anchor still set", why, got, yieldedAt)
+		}
+	}
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h1", yieldedAt.Add(-time.Second)); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ClearYield(prior episode) err = %v, want ErrStateConflict", err)
+	}
+	stillMarked("stale yielded_at")
+
+	// A marker-less re-enqueue at a new head moves the anchor and keeps the
+	// marker, so a probe judged at the OLD head is stale.
+	if res := f.enqueue(a, "main", "h2"); res.Outcome != EnqueueReanchored || res.Marked {
+		t.Fatalf("marker-less re-enqueue = %+v, want reanchored, not marked by this call", res)
+	}
+	stillMarked("marker-less reanchor")
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h1", yieldedAt); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ClearYield(stale head) err = %v, want ErrStateConflict", err)
+	}
+	stillMarked("stale head")
+	if _, err := f.store.ClearYield(ctx, eb.ID, "x1", yieldedAt); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ClearYield(unmarked row) err = %v, want ErrStateConflict", err)
+	}
+	if _, err := f.store.ClearYield(ctx, ea.ID, "", yieldedAt); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("ClearYield(no head) err = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h2", time.Time{}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("ClearYield(no yielded_at) err = %v, want ErrInvalidRequest", err)
+	}
+
+	cleared, err := f.store.ClearYield(ctx, ea.ID, "h2", yieldedAt)
+	if err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+	if cleared.Yielded() || cleared.YieldReason != "" || cleared.ApprovalWaitStartedAt != nil || !cleared.EnqueuedAt.Equal(ea.EnqueuedAt) {
+		t.Fatalf("cleared entry = %+v, want no marker, no wait anchor, same enqueued_at", cleared)
+	}
+	f.admitAt(ea.ID) // ahead of the younger B: FIFO at its original enqueued_at
+}
+
+// TestReanchorYielded_KeepsMarkerAndEpisode (ADR-112 approval condition C2):
+// the head moves after the yield; ReanchorYielded on the OLD head moves the
+// anchor and KEEPS the marker, yielded_at and the wait anchor (never a clear,
+// so a push buys no fresh window); a stale probe on the old head is refused;
+// the new head's qualifying approval then clears it at the NEW head and the
+// row rejoins FIFO. With ReanchorYielded a no-op, the clear at the new head
+// is refused and the row stays marked: RED.
+func TestReanchorYielded_KeepsMarkerAndEpisode(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b := f.run(), f.run()
+	ea := f.enqueue(a, "main", "h1").Entry
+	f.enqueue(b, "main", "x1")
+	epoch := f.admitAt(ea.ID)
+	wait := f.approvalWait(ea.ID, epoch, time.Hour)
+	y, err := f.store.Yield(ctx, ea.ID, epoch, YieldMarker{Reason: "forge_approval_dismissed", Detail: "d"})
+	if err != nil {
+		t.Fatalf("Yield: %v", err)
+	}
+	yieldedAt := *y.YieldedAt
+
+	moved, err := f.store.ReanchorYielded(ctx, ea.ID, "h1", yieldedAt, "h2", "b2")
+	if err != nil {
+		t.Fatalf("ReanchorYielded: %v", err)
+	}
+	read := f.entry(ea.ID)
+	for _, g := range []Entry{moved, read} {
+		if g.AnchoredHeadSHA != "h2" || g.AnchoredBaseSHA != "b2" || g.State != StateHeld ||
+			!g.Yielded() || !g.YieldedAt.Equal(yieldedAt) || g.YieldReason != "forge_approval_dismissed" ||
+			g.ApprovalWaitStartedAt == nil || !g.ApprovalWaitStartedAt.Equal(*wait.Entry.ApprovalWaitStartedAt) {
+			t.Fatalf("re-anchored yielded entry = %+v, want head h2, the same marker, yielded_at and wait anchor", g)
+		}
+	}
+	if _, err := f.store.ReanchorYielded(ctx, ea.ID, "h1", yieldedAt, "h3", ""); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale ReanchorYielded err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(ea.ID); got.AnchoredHeadSHA != "h2" {
+		t.Fatalf("stale ReanchorYielded moved the head to %q", got.AnchoredHeadSHA)
+	}
+	if _, err := f.store.ReanchorYielded(ctx, ea.ID, "h2", yieldedAt, "", ""); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("ReanchorYielded(no new head) err = %v, want ErrInvalidRequest", err)
+	}
+	if adm := f.admitNext(mainBase()); !adm.Admitted || adm.Entry.ID == ea.ID {
+		t.Fatalf("AdmitNext with A re-anchored but marked = %+v, want B admitted (A still skipped)", adm)
+	}
+
+	// The new head's approval clears at the NEW head; A rejoins at its place.
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h2", yieldedAt); err != nil {
+		t.Fatalf("ClearYield at the new head: %v", err)
+	}
+	if got := f.entry(ea.ID); got.Yielded() {
+		t.Fatalf("entry after the new head's clear = %+v, want unmarked", got)
+	}
+	if st := f.status(a); st.Position != 1 {
+		t.Fatalf("cleared A position = %d, want 1 (FIFO at its enqueued_at)", st.Position)
+	}
+}
+
+// TestEnqueue_MarkerlessReanchorPreservesMarker (approval condition C2(c)): an
+// Enqueue or a by-entry Reanchor WITHOUT a Yield marker (the ADR-092
+// rebase-path re-enqueue) keeps an existing marker, its yielded_at and the
+// wait anchor: it never clears or moves one.
+func TestEnqueue_MarkerlessReanchorPreservesMarker(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a := f.run()
+	e := f.enqueue(a, "main", "h1").Entry
+	yieldedAt := f.markYielded(e.ID, "forge_approval_absent", time.Minute)
+	f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = clock_timestamp() - interval '40 minutes' WHERE id = $1`, e.ID)
+	anchor := *f.entry(e.ID).ApprovalWaitStartedAt
+
+	check := func(why, head string) {
+		t.Helper()
+		got := f.entry(e.ID)
+		if got.AnchoredHeadSHA != head || !got.Yielded() || !got.YieldedAt.Equal(yieldedAt) ||
+			got.YieldReason != "forge_approval_absent" || got.YieldDetail != "seeded" ||
+			got.ApprovalWaitStartedAt == nil || !got.ApprovalWaitStartedAt.Equal(anchor) {
+			t.Fatalf("%s: entry = %+v, want head %s with the marker and wait anchor untouched", why, got, head)
+		}
+	}
+	if res := f.enqueue(a, "main", "h2"); res.Marked || !res.AnchorChanged {
+		t.Fatalf("marker-less re-enqueue = %+v, want re-anchored, Marked false", res)
+	}
+	check("marker-less Enqueue", "h2")
+	if _, err := f.store.Reanchor(ctx, e.ID, "h3", ""); err != nil {
+		t.Fatalf("Reanchor: %v", err)
+	}
+	check("by-entry Reanchor", "h3")
+	if _, err := f.store.MarkMergeIntent(ctx, e.ID, nil); err != nil {
+		t.Fatalf("MarkMergeIntent: %v", err)
+	}
+	check("MarkMergeIntent", "h3")
+}
+
+// TestEnqueue_YieldMarkerNeverOnLiveRow (approval condition C10): seed a LIVE
+// same-base entry, Enqueue it with a Yield marker (and merge intent), and READ
+// BACK yielded_at IS NULL: merge_run never marks the entry holding the line,
+// while the intent is still recorded and Marked is false.
+func TestEnqueue_YieldMarkerNeverOnLiveRow(t *testing.T) {
+	f := newFixture(t)
+	a := f.run()
+	e := f.enqueue(a, "main", "h1").Entry
+	f.admitAt(e.ID)
+	res, err := f.store.Enqueue(context.Background(), EnqueueRequest{RunID: a, BaseRef: "main", HeadSHA: "h1",
+		MergeIntent: true, Yield: &YieldMarker{Reason: "forge_approval_absent", Detail: "no approval"}})
+	if err != nil {
+		t.Fatalf("Enqueue(live, marker): %v", err)
+	}
+	if res.Marked || !res.IntentRecorded || res.Entry.State != StateLive {
+		t.Fatalf("Enqueue(live, marker) = %+v, want Marked false, intent recorded, still live", res)
+	}
+	if f.count(`id = $1 AND yielded_at IS NULL AND yield_reason IS NULL AND state = 'live'`, e.ID) != 1 {
+		t.Fatalf("live entry after a marked Enqueue = %+v, want live with yielded_at NULL", f.entry(e.ID))
+	}
+}
+
+// TestEnqueue_YieldMarkerArms: a new row is inserted held and marked; a
+// same-base HELD entry is re-anchored and marked, a repeat keeping yielded_at
+// (the same episode) while taking the new reason; a base change inserts the
+// new row marked; an empty reason is refused before any SQL.
+func TestEnqueue_YieldMarkerArms(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	enq := func(runID uuid.UUID, base, head, reason string) EnqueueResult {
+		t.Helper()
+		res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: runID, BaseRef: base, HeadSHA: head,
+			MergeIntent: true, Yield: &YieldMarker{Reason: reason, Detail: "d-" + head}})
+		if err != nil {
+			t.Fatalf("Enqueue(%s, %s, marker): %v", base, head, err)
+		}
+		return res
+	}
+
+	a := f.run()
+	ins := enq(a, "main", "h1", "forge_approval_absent")
+	got := f.entry(ins.Entry.ID)
+	if ins.Outcome != EnqueueInserted || !ins.Marked || got.State != StateHeld || !got.Yielded() ||
+		got.YieldReason != "forge_approval_absent" || got.YieldDetail != "d-h1" || got.MergeIntentAt == nil ||
+		!got.YieldedAt.Equal(got.EnqueuedAt) {
+		t.Fatalf("marked insert = %+v / %+v, want a held marked row with intent, yielded at enqueue", ins, got)
+	}
+
+	b := f.run()
+	plain := f.enqueue(b, "main", "x1").Entry
+	re := enq(b, "main", "x2", "forge_approval_vetoed")
+	first := f.entry(plain.ID)
+	if re.Outcome != EnqueueReanchored || !re.Marked || !first.Yielded() || first.AnchoredHeadSHA != "x2" ||
+		first.YieldReason != "forge_approval_vetoed" || !first.EnqueuedAt.Equal(plain.EnqueuedAt) {
+		t.Fatalf("marked held reanchor = %+v / %+v, want re-anchored at x2, marked vetoed, same enqueued_at", re, first)
+	}
+	again := enq(b, "main", "x3", "forge_approval_absent")
+	second := f.entry(plain.ID)
+	if !again.Marked || !second.YieldedAt.Equal(*first.YieldedAt) || second.YieldReason != "forge_approval_absent" || second.AnchoredHeadSHA != "x3" {
+		t.Fatalf("repeat marked reanchor = %+v, want yielded_at kept %v, reason absent, head x3", second, first.YieldedAt)
+	}
+
+	moved := enq(b, "release", "x4", "forge_approval_absent")
+	if moved.Outcome != EnqueueBaseChanged || !moved.Marked || !f.entry(moved.Entry.ID).Yielded() {
+		t.Fatalf("marked base change = %+v, want the new row marked", moved)
+	}
+
+	before := f.count(`true`)
+	if _, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: f.run(), BaseRef: "main", HeadSHA: "z1", Yield: &YieldMarker{}}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("Enqueue(empty reason) err = %v, want ErrInvalidRequest", err)
+	}
+	if f.count(`true`) != before {
+		t.Fatal("a refused marked Enqueue wrote a row")
+	}
+}
+
+// TestUpdateYield_RewritesReasonOnly: the matching (head, yielded_at) rewrites
+// reason and detail and keeps yielded_at, the head and the wait anchor; a
+// stale key is refused and the stored reason is unchanged on read-back.
+func TestUpdateYield_RewritesReasonOnly(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	yieldedAt := f.markYielded(e.ID, "forge_approval_absent", time.Minute)
+
+	if _, err := f.store.UpdateYield(ctx, e.ID, "h0", yieldedAt, YieldMarker{Reason: "forge_approval_vetoed"}); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("UpdateYield(stale head) err = %v, want ErrStateConflict", err)
+	}
+	if got := f.entry(e.ID); got.YieldReason != "forge_approval_absent" {
+		t.Fatalf("reason after a stale UpdateYield = %q, want unchanged", got.YieldReason)
+	}
+	if _, err := f.store.UpdateYield(ctx, e.ID, "h1", yieldedAt, YieldMarker{}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("UpdateYield(empty reason) err = %v, want ErrInvalidRequest", err)
+	}
+	got, err := f.store.UpdateYield(ctx, e.ID, "h1", yieldedAt, YieldMarker{Reason: "forge_approval_vetoed", Detail: "changes requested"})
+	if err != nil {
+		t.Fatalf("UpdateYield: %v", err)
+	}
+	if got.YieldReason != "forge_approval_vetoed" || got.YieldDetail != "changes requested" ||
+		!got.YieldedAt.Equal(yieldedAt) || got.AnchoredHeadSHA != "h1" || got.State != StateHeld {
+		t.Fatalf("updated entry = %+v, want the new reason/detail, yielded_at and head kept", got)
+	}
+}
+
+// TestListForBaseAndPosition_YieldedOrderedLast: the yielded row is the
+// OLDEST held row, yet it lists after every unmarked held row and its
+// position counts after them; the live row stays first.
+func TestListForBaseAndPosition_YieldedOrderedLast(t *testing.T) {
+	f := newFixture(t)
+	live, yielded, u1, u2 := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	runs := map[uuid.UUID]uuid.UUID{}
+	for i, id := range []uuid.UUID{live, yielded, u1, u2} {
+		state := StateHeld
+		if id == live {
+			state = StateLive
+		}
+		runs[id] = f.run()
+		f.seed(id, runs[id], state, time.Duration(4-i)*time.Hour)
+	}
+	f.markYielded(yielded, "forge_approval_absent", time.Minute)
+
+	es, err := f.store.ListForBase(context.Background(), mainBase())
+	if err != nil {
+		t.Fatalf("ListForBase: %v", err)
+	}
+	got := make([]uuid.UUID, len(es))
+	for i, e := range es {
+		got[i] = e.ID
+	}
+	if want := []uuid.UUID{live, u1, u2, yielded}; !slices.Equal(got, want) {
+		t.Fatalf("ListForBase order = %v, want live, u1, u2, yielded %v", got, want)
+	}
+	for id, want := range map[uuid.UUID]int{live: 0, u1: 1, u2: 2, yielded: 3} {
+		if st := f.status(runs[id]); st.Position != want {
+			t.Errorf("position of %s = %d, want %d", id, st.Position, want)
+		}
+	}
+}

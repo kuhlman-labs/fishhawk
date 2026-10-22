@@ -4,7 +4,7 @@ Persisted held-pass queue for ADR-092 D1 (#4200, `docs/adr/092-serialize-merge-c
 At most ONE merge-candidate verify pass is live per `(repository, base ref)`
 inside one account. Every other eligible pass is held FIFO by eligibility time
 and consumes no runner slot. Table: `merge_candidate_queue_entries`
-(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296).
+(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296; the yield marker and the approval-wait anchor by 0109 for ADR-112 R3, #4632).
 ADR-093's merge queue (slice 1) reuses these rows, the FIFO order, the
 one-live-per-base rule and the lock order UNCHANGED; it adds only the
 operator's recorded merge intent and the line-turn read below. The SQL is hand-written pgx, with no sqlc (same precedent as
@@ -31,6 +31,8 @@ One row per queue EPISODE of a run.
 | `merge_intent_at` | The operator's merge intent on this episode (0107, ADR-093 D2): NULL = none (every ADR-092 rebase/base-advance entry and every pre-0107 row). Stamped once from the database clock by `Enqueue{MergeIntent}` or `MarkMergeIntent`, never cleared; a terminal row keeps it as history, and a re-entry after a terminal row starts a FRESH row without it. |
 | `merge_intent_sequence` | The audit sequence of the `merge_queue_entered` row that recorded the intent (0108, ADR-093 slice 2). Stamped in the SAME statement as `merge_intent_at` (`EnqueueRequest.IntentSequence`, `MergeIntentRequest.IntentSequence`), only on the NULL-to-set transition, never overwritten. NULL (read as `Entry.MergeIntentSequence` 0) = no intent, or an intent recorded before 0108; merge-on-pass then resolves the newest `merge_queue_entered` row naming the base. |
 | `admission_epoch` | `BIGINT NOT NULL DEFAULT 0` (0108). Bumped by every admission: `AdmitNext`'s admit AND its stale re-claim. The admission-owned writes are compare-and-swaps on it (§ "Admission-epoch CAS"). |
+| `yield_reason` / `yield_detail` / `yielded_at` | The YIELD MARKER (0109, ADR-112 R3; § "Yield"). NULL = not marked. `yield_reason` is the server's closed vocabulary (`backend/internal/server/merge_queue_yield.go`); `yield_detail` is untrusted forge-derived text every read surface sanitises (`Entry.YieldDetail`, `""` for NULL). DB CHECKs: `yielded_at` is set exactly when a non-empty `yield_reason` is, and a `live` row never carries a marker; a terminal row keeps it as history. `AdmitNext` skips a marked row. |
+| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission or a stale re-claim, kept by `Yield`, cleared only by `ClearYield`. |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE
@@ -46,7 +48,7 @@ SQL), `ErrNotFound` (unknown run or entry; wraps `run.ErrNotFound`), and
 Repo, BaseRef}` takes `AccountID` in `run.Run.AccountID`'s shape (`""` =
 untenanted); a non-UUID account is `ErrInvalidRequest`.
 
-- **`Enqueue(EnqueueRequest{RunID, BaseRef, HeadSHA, BaseSHA, MergeIntent, RecordIntent})`**. `RunID`,
+- **`Enqueue(EnqueueRequest{RunID, BaseRef, HeadSHA, BaseSHA, MergeIntent, RecordIntent, Yield})`**. `RunID`,
   `BaseRef`, `HeadSHA` are required. Repository and account come from the run
   row, never the caller. Merge intent (`MergeIntent`): an inserted row
   (`EnqueueInserted`, `EnqueueBaseChanged`) is stamped at its enqueue
@@ -67,6 +69,18 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
     `ReasonBaseChanged` and a new `held` row is inserted at the new base's
     tail (`EnqueueBaseChanged`, `Dropped` = the old entry). When the dropped
     entry was live, its base has no live entry now: the caller pumps it.
+  - Yield marker (`Yield *YieldMarker`, ADR-112 R3, the merge_run queue arm):
+    an inserted row (`EnqueueInserted`, `EnqueueBaseChanged`) is inserted
+    `held` WITH the marker, `yielded_at` = its enqueue instant; a same-base
+    HELD entry is re-anchored and marked, taking the request's reason and
+    detail and keeping an existing `yielded_at` (COALESCE: the same episode,
+    while the head CAS still defeats a stale probe); a same-base LIVE entry is
+    NEVER marked. `Marked` reports the entry carries the marker after the call
+    (false for the live entry). An empty reason is `ErrInvalidRequest`. A nil
+    `Yield` never clears or moves an existing marker: a marker-less re-anchor
+    (the ADR-092 rebase-path re-enqueue) keeps the marker, `yielded_at` and
+    the wait anchor (`TestEnqueue_MarkerlessReanchorPreservesMarker`,
+    `TestEnqueue_YieldMarkerNeverOnLiveRow`, `TestEnqueue_YieldMarkerArms`).
 - **`AdmitNext(base)`**.
   - Base has a live entry → no admission; `Entry` = that live entry.
   - …unless that live entry is in phase `admitted` with `admitted_at` older
@@ -74,9 +88,12 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
     returns `Admitted=true, Readmitted=true` for it, so exactly one pump
     re-runs a crashed admission. A live entry in any other phase is never
     re-claimed.
-  - No live entry → the oldest `held` entry by `(enqueued_at, id)` becomes
-    `live`, phase `admitted`, `admitted_at = now`; `Admitted=true`.
-  - Empty base → zero `Admission` (`Entry` nil).
+  - No live entry → the oldest UNMARKED `held` entry by `(enqueued_at, id)`
+    becomes `live`, phase `admitted`, `admitted_at = now`; `Admitted=true`. A
+    yielded (marked) entry is skipped entirely, however old
+    (`TestAdmitNext_SkipsYieldedRows`).
+  - Empty base, or a base holding only yielded entries → zero `Admission`
+    (`Entry` nil).
 - **`Unadmit(id, epoch)`**: `live` → `held` at its ORIGINAL place
   (`enqueued_at` kept), phase and `admitted_at` cleared. Callers: the pump's
   transient admission failure and merge-on-pass's readvance
@@ -127,11 +144,14 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   `pglock.ErrNestedLock` when called from inside another pglock `fn`, and
   `ErrInvalidRequest` for a nil run id.
 - **`ActiveForRun(runID)`** → `(Status, found, error)`: the run's active entry,
-  its 1-based `Position` among the base's held entries (0 when live), and
+  its 1-based `Position` among the base's held entries in `ListForBase`'s
+  order (unmarked before yielded; 0 when live), and
   `LiveRunID` (the base's live run; the entry's own run when it is live; nil
   when none). Position and live run count the run's OWN account only.
-- **`ListForBase(base)`**: the base's active entries, live first, then held by
-  `(enqueued_at, id)`. Never nil. The seed for ADR-093's queue read surface.
+- **`ListForBase(base)`**: the base's active entries, live first, then
+  unmarked held by `(enqueued_at, id)`, then yielded held by `(enqueued_at,
+  id)` (`TestListForBaseAndPosition_YieldedOrderedLast`). Never nil. The seed
+  for ADR-093's queue read surface.
 - **`ActiveBases()`**: every base with a held or live entry, one per
   `(account, repo, base ref)`, ordered by those fields. Never nil. The
   periodic pump's sweep list; spans every account.
@@ -153,6 +173,50 @@ transfer across a clean advance is deferred to slice 2, so in a
 dismiss-stale repository a rebase answers `not_queued` until then. The
 store itself never judges eligibility.
 
+### Yield
+
+ADR-112 R3: an entry whose forge approval does not qualify at the head of the
+line waits (bounded) and then YIELDS: it steps aside, held and marked, so the
+line continues. The store owns the persistence; the server decides when, and
+which reason (`backend/internal/server/README.md`). Every time is the
+database clock: `Entry.YieldAge` is `clock_timestamp() − yielded_at` computed
+in the read (0 when unmarked), and the wait's expiry is judged in SQL, so no
+Go `time.Now()` is compared against a stored instant.
+
+- **`ApprovalWait(id, epoch, window)`** → `ApprovalWaitResult{Entry, Expired,
+  Remaining}`: live at `epoch` only (epoch CAS; `ErrStateConflict`, nothing
+  written). Stamps `approval_wait_started_at =
+  COALESCE(approval_wait_started_at, clock_timestamp())` and judges `Expired`
+  (`started + window <= now`) and `Remaining` (0 when expired) in the same
+  transaction. `window <= 0` is `ErrInvalidRequest`. The anchor survives
+  `Unadmit`, the re-admission and a stale re-claim
+  (`TestApprovalWait_AnchorSurvivesUnadmitAndReadmission`). Call it OUTSIDE
+  the merge-intent lock.
+- **`Yield(id, epoch, YieldMarker{Reason, Detail})`**: live at `epoch` only
+  (epoch CAS). ONE statement moves the row to `held` (phase and `admitted_at`
+  cleared, `enqueued_at` kept) and stamps `yield_reason`, `yield_detail` and
+  `yielded_at`; `approval_wait_started_at` is kept. Empty reason →
+  `ErrInvalidRequest` (`TestYield_OneTransactionUnderEpochCAS`).
+- **`ClearYield(id, head, yieldedAt)`**: the ONLY way back in. Under the base
+  lock, a compare-and-swap on `state = 'held' AND anchored_head_sha = head AND
+  yielded_at = yieldedAt`: clears the marker AND `approval_wait_started_at`
+  (a later non-approval starts a fresh episode). The row rejoins FIFO at its
+  original `enqueued_at`. A row whose head moved, whose episode changed
+  (another `yielded_at`) or that is not held → `ErrStateConflict` and the
+  marker stays (`TestClearYield_CompareAndSwap`, asserted on read-back).
+- **`UpdateYield(id, head, yieldedAt, YieldMarker)`**: the same CAS; rewrites
+  reason and detail only (a yield transition). `TestUpdateYield_RewritesReasonOnly`.
+- **`ReanchorYielded(id, head, yieldedAt, newHead, newBase)`**: the same CAS on
+  the OLD head; moves the anchor to the PR's current head and KEEPS the
+  marker, `yielded_at` and `approval_wait_started_at` (the same episode). A
+  head move never clears a marker, so a push loop cannot buy a fresh wait
+  window per push; the new head is judged by the next probe and cleared at
+  the NEW head (`TestReanchorYielded_KeepsMarkerAndEpisode`).
+
+`head` and `yieldedAt` are required on the three marker CASes
+(`ErrInvalidRequest`). `yieldedAt` is the value read back from the row
+(`Entry.YieldedAt`), compared at the column's microsecond precision.
+
 ### Admission-epoch CAS
 
 A pump's decision is made against the entry as it read it; another pump may
@@ -165,6 +229,8 @@ change nothing (ADR-093 slice 2, rejection item 1):
 | `SetPhase` | live AND epoch | admission, verdict hook, transfer re-anchor |
 | `ReanchorAt` | live AND epoch | admission re-anchor |
 | `SettleAt` | live AND epoch (terminal: no-op) | admission settles, merge-on-pass settle outcomes |
+| `ApprovalWait` / `Yield` | live AND epoch | merge-on-pass approval wait and yield, admission veto yield |
+| `ClearYield` / `UpdateYield` / `ReanchorYielded` | held AND `anchored_head_sha` AND `yielded_at` | the yield re-probe |
 | `Settle` / `Reanchor` | active (unconditional) | EXTERNAL facts only: PR resolved, cancel / re-open release, run terminal, the rebase transfer re-anchor, the merged settle after the forge accepted a queue merge |
 
 ### Merge-dispatch ledger
@@ -256,10 +322,11 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   as absent (fresh row), never re-anchored
   (`TestEnqueue_EntrySettledBetweenPeekAndLockGetsFreshRow`).
 - By-entry mutations (`Unadmit`, `SetPhase`, `Reanchor`, `Settle`,
-  `MarkMergeIntent`): read the entry's base → its base lock → the row
+  `MarkMergeIntent`, `ApprovalWait`, `Yield`, `ClearYield`, `UpdateYield`,
+  `ReanchorYielded`): read the entry's base → its base lock → the row
   `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
   stays correct.
-- `AdmitNext`: the base lock → the live check → the oldest held row.
+- `AdmitNext`: the base lock → the live check → the oldest unmarked held row.
 
 No path takes a row lock before an advisory lock, and multi-key acquisition is
 ascending, so the order is acyclic. The one-live-per-base guarantee is the
@@ -270,7 +337,9 @@ with the lock removed. Reads (`ActiveForRun`, `ListForBase`,
 `RecentLineTurns`, `ActiveBases`) are single statements without the lock.
 
 Every time comparison uses the database clock (`clock_timestamp()`); no Go
-`time.Now()` value is passed into SQL.
+`time.Now()` value is passed into SQL (the marker CASes pass back a
+`yielded_at` READ from the row, compared for equality, never against the
+clock).
 
 ### Merge-intent lock
 

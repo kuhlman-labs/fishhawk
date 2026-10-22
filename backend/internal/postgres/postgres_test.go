@@ -8261,6 +8261,121 @@ WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'merge_inte
 	}
 }
 
+// TestMigrateDown_MergeQueueYieldReversal pins 0109 (ADR-112 R3 / #4632):
+// after MigrateUp merge_candidate_queue_entries carries the four nullable
+// yield columns (a pre-0109-shaped insert carries no marker), a held row
+// accepts a complete marker, a LIVE row carrying one is refused, and a
+// half-set or empty-reason marker is refused. After rolling back through 0109
+// the columns are gone, the schema lands on 0108 (admission_epoch survives)
+// and the queue rows survive, the marked one as a plain held row; MigrateUp
+// again restores the columns and the live-row refusal.
+func TestMigrateDown_MergeQueueYieldReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	columns := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND is_nullable = 'YES' AND (
+  (column_name IN ('yield_reason', 'yield_detail') AND data_type = 'text') OR
+  (column_name IN ('yielded_at', 'approval_wait_started_at') AND data_type = 'timestamp with time zone'))`).Scan(&n); err != nil {
+			t.Fatalf("read 0109 columns: %v", err)
+		}
+		return n
+	}
+	if n := columns(); n != 4 {
+		t.Fatalf("0109 columns after MigrateUp = %d, want 4", n)
+	}
+
+	seedRun := func() uuid.UUID {
+		t.Helper()
+		var id uuid.UUID
+		if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&id); err != nil {
+			t.Fatalf("seed run: %v", err)
+		}
+		return id
+	}
+	plainRun, markedRun, liveRun := seedRun(), seedRun(), seedRun()
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha)
+VALUES ($1, 'o/r', 'main', 'held', 'h1')`, plainRun); err != nil {
+		t.Fatalf("insert pre-0109-shaped row: %v — 0109 must leave it insertable", err)
+	}
+	var markerNull bool
+	if err := pool.QueryRow(ctx, `SELECT yield_reason IS NULL AND yield_detail IS NULL AND yielded_at IS NULL AND approval_wait_started_at IS NULL
+FROM merge_candidate_queue_entries WHERE run_id = $1`, plainRun).Scan(&markerNull); err != nil {
+		t.Fatalf("read defaults: %v", err)
+	}
+	if !markerNull {
+		t.Error("pre-0109-shaped row carries a yield column; want all four NULL (no backfill)")
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries
+  (run_id, repo, base_ref, state, anchored_head_sha, yield_reason, yield_detail, yielded_at, approval_wait_started_at)
+VALUES ($1, 'o/r', 'main', 'held', 'h2', 'forge_approval_absent', 'no approval', now(), now())`, markedRun); err != nil {
+		t.Fatalf("insert marked held row: %v — a held row must accept a complete marker", err)
+	}
+	refused := []struct{ name, sql string }{
+		{"a live row carrying a marker", `INSERT INTO merge_candidate_queue_entries
+  (run_id, repo, base_ref, state, admitted_at, anchored_head_sha, yield_reason, yielded_at)
+VALUES ($1, 'o/r', 'main', 'live', now(), 'h3', 'forge_approval_absent', now())`},
+		{"yielded_at without a reason", `INSERT INTO merge_candidate_queue_entries
+  (run_id, repo, base_ref, state, anchored_head_sha, yielded_at)
+VALUES ($1, 'o/r', 'main', 'held', 'h3', now())`},
+		{"a reason without yielded_at", `INSERT INTO merge_candidate_queue_entries
+  (run_id, repo, base_ref, state, anchored_head_sha, yield_reason)
+VALUES ($1, 'o/r', 'main', 'held', 'h3', 'forge_approval_absent')`},
+		{"an empty reason", `INSERT INTO merge_candidate_queue_entries
+  (run_id, repo, base_ref, state, anchored_head_sha, yield_reason, yielded_at)
+VALUES ($1, 'o/r', 'main', 'held', 'h3', '', now())`},
+	}
+	for _, tc := range refused {
+		if _, err := pool.Exec(ctx, tc.sql, liveRun); err == nil {
+			t.Errorf("%s was accepted; want the 0109 CHECK refusal", tc.name)
+		}
+	}
+
+	downThrough(t, url, "0109")
+
+	if n := columns(); n != 0 {
+		t.Errorf("0109 columns after rolling back 0109 = %d, want 0", n)
+	}
+	var rows, epochCols int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM merge_candidate_queue_entries WHERE run_id IN ($1, $2)`, plainRun, markedRun).Scan(&rows); err != nil {
+		t.Fatalf("read entries after rollback: %v — the 0101 table must survive", err)
+	}
+	if rows != 2 {
+		t.Errorf("queue rows after rolling back 0109 = %d, want 2 (untouched)", rows)
+	}
+	// The rollback lands on 0108, so its admission_epoch column survives.
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'admission_epoch'`).Scan(&epochCols); err != nil {
+		t.Fatalf("read 0108 column after rolling back 0109: %v", err)
+	}
+	if epochCols != 1 {
+		t.Errorf("admission_epoch columns after rolling back 0109 = %d, want 1 (0108 untouched)", epochCols)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n := columns(); n != 4 {
+		t.Errorf("0109 columns after re-applying 0109 = %d, want 4", n)
+	}
+	if _, err := pool.Exec(ctx, refused[0].sql, liveRun); err == nil {
+		t.Error("a live row carrying a marker was accepted after re-applying 0109; want the CHECK refusal")
+	}
+}
+
 // TestIsTransientPGRefusal: the raw-database drop retries only a server
 // refusal (also through a connect error's wrap), never another failure.
 func TestIsTransientPGRefusal(t *testing.T) {
