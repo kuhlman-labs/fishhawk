@@ -512,20 +512,33 @@ func TestMergeQueueMergeOnPass_ForgeApprovalDismissedEjectsNamed(t *testing.T) {
 }
 
 func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
+	// inLockUnblocked: determined before the lock (blocked, no dismissed
+	// review); when the lock is taken the forge flips to a state the removed
+	// mergeable_state shortcut accepted, so the in-lock PR re-read and the
+	// in-lock approval check both see it (the check is undetermined off
+	// "blocked"). The transferred-basis approval check fails closed, so the
+	// locked re-check holds.
+	inLockUnblocked := func(state string) func(w *mqmWorld, r *mcqRun) {
+		return func(w *mqmWorld, r *mcqRun) {
+			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
+			w.srv.cfg.MergeQueue = mqmOnLockQueue{Store: w.srv.cfg.MergeQueue, onLock: func() { w.mergeable(r, state) }}
+		}
+	}
 	cases := []struct {
 		name   string
 		state  string
 		mut    func(w *mqmWorld, r *mcqRun)
 		kind   mergeOnPassKind
 		reason string
+		inLock bool // the hold comes from the locked re-check (one verdict row)
 	}{
-		{"undetermined approval holds", "unknown", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined},
+		{"undetermined approval holds", "unknown", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, false},
 		// R3: the transferred-basis approval check fails closed, so a clean
 		// mergeable_state (the check is undetermined off "blocked") holds.
-		{"clean mergeable_state does not shortcut", "clean", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined},
+		{"clean mergeable_state does not shortcut", "clean", nil, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, false},
 		{"reviews read error holds", "blocked", func(w *mqmWorld, r *mcqRun) {
 			w.gh.set(func() { w.gh.reviewsStatus[r.pr] = 500 })
-		}, mergeOnPassHeld, mergeOnPassReasonNotMergeable},
+		}, mergeOnPassHeld, mergeOnPassReasonNotMergeable, false},
 		// Determined before the lock (blocked, no dismissed review), then the
 		// in-lock approval read fails after the verdict is recorded.
 		{"in-lock approval read failure holds", "blocked", func(w *mqmWorld, r *mcqRun) {
@@ -537,10 +550,16 @@ func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
 					w.mu.Unlock()
 				}
 			}
-		}, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined},
+		}, mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
+		{"in-lock clean mergeable_state does not shortcut", "blocked", inLockUnblocked("clean"),
+			mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
+		{"in-lock unstable mergeable_state does not shortcut", "blocked", inLockUnblocked("unstable"),
+			mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
+		{"in-lock has_hooks mergeable_state does not shortcut", "blocked", inLockUnblocked("has_hooks"),
+			mergeOnPassHeld, mergeOnPassReasonApprovalUndetermined, true},
 		{"determined approval merges", "blocked", func(w *mqmWorld, r *mcqRun) {
 			w.gh.set(func() { w.gh.reviews[r.pr] = `[]` })
-		}, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue},
+		}, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -564,8 +583,8 @@ func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
 				t.Fatalf("ledger claimed %v on a held transferred basis", w.ledger.claims)
 			}
 			// The pre-lock check holds before the verdict is recorded; only the
-			// in-lock row reaches the locked re-check.
-			if n := len(w.rows(r, CategoryMergeVerdictRecorded)); (n == 1) != (tc.name == "in-lock approval read failure holds") {
+			// in-lock rows reach the locked re-check.
+			if n := len(w.rows(r, CategoryMergeVerdictRecorded)); (n == 1) != tc.inLock {
 				t.Fatalf("merge_verdict_recorded rows = %d: the hold came from the wrong check", n)
 			}
 		})
@@ -915,6 +934,18 @@ func TestWithRunMergeLock_UnwiredQueueCallsFn(t *testing.T) {
 	if owned, err := s.mergeQueueOwnsMerge(context.Background(), uuid.New()); owned || err != nil {
 		t.Fatalf("unwired: owned=%v err=%v", owned, err)
 	}
+}
+
+// mqmOnLockQueue runs onLock each time the run's merge-intent lock is taken,
+// then takes the real lock; every other method is the embedded store.
+type mqmOnLockQueue struct {
+	mergequeue.Store
+	onLock func()
+}
+
+func (q mqmOnLockQueue) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	q.onLock()
+	return q.Store.WithMergeIntentLock(ctx, runID, fn)
 }
 
 // mqmLockQueue overrides the merge-intent lock and Settle; every other method
