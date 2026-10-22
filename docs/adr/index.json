@@ -1106,6 +1106,15 @@
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
+    },
+    {
+      "id": "ADR-111",
+      "title": "Documentation freshness for the published site: a PR-time site job, a reference-integrity check, a stated site obligation, and a narrow definition of up to date",
+      "path": "docs/adr/111-documentation-freshness-for-the-published-site.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
     }
   ]
 }
