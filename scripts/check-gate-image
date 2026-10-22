@@ -312,7 +312,13 @@ if [ -n "$found" ]; then printf "docker=present:%s\n" "$found"; else printf "doc
   fi
 
   inspect_rc=0
-  inspect_out="$(docker image inspect --format '{{.Id}} {{join .RepoDigests ","}}' "$IMAGE" 2>&1)" || inspect_rc=$?
+  # `range`, not `join`: a newer Docker engine/CLI (GitHub's hosted runners)
+  # decodes .RepoDigests as []interface{}, and the template `join` func accepts
+  # only []string, so `{{join .RepoDigests ","}}` fails there with "wrong type
+  # for value; expected []string; got []interface {}". This range emits the SAME
+  # comma-joined string for either type, and nothing for an empty list (a
+  # locally built image has no RepoDigests), so the parse below is unchanged.
+  inspect_out="$(docker image inspect --format '{{.Id}} {{range $i, $d := .RepoDigests}}{{if $i}},{{end}}{{$d}}{{end}}' "$IMAGE" 2>&1)" || inspect_rc=$?
   image_id="${inspect_out%% *}"
   case "$image_id" in
     sha256:*) ;;
