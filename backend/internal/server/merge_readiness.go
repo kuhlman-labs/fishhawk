@@ -158,7 +158,10 @@ type approvalDismissedResult struct {
 }
 
 // approvalDismissedCheck reports a pull request whose approval was DISMISSED
-// and not re-given (#4086): GitHub reports mergeable_state=blocked, no
+// and not re-given (#4086). Since ADR-112 (#4619) its ONE caller is the gate
+// view's merge_readiness, where it is an ADVISORY display: the merge endpoint
+// and merge-on-pass judge approvals through the in-lock forge-approval fold
+// (forge_approval.go) instead. GitHub reports mergeable_state=blocked, no
 // reviewer's latest review is APPROVED, and at least one reviewer's latest
 // review is DISMISSED. A vouch commit, a fix-up push or a rebase dismisses a
 // stale approval under "dismiss stale reviews", and the queued merge then

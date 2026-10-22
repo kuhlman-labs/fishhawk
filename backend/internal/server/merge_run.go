@@ -180,12 +180,20 @@ type mergeRunResponse struct {
 //     202 queued answer instead (ADR-093 slice 1, mergeQueueEnqueueArm); an
 //     ineligible run keeps the 409 with an additive merge_queue_ineligible
 //     detail and nothing written.
-//   - 409 approval_dismissed (#4086), AFTER the merge-candidate gate and
-//     BEFORE the verdict append: GitHub reports mergeable_state=="blocked", no
-//     reviewer's latest review is APPROVED and one is DISMISSED, so the queued
-//     merge would never fire. BEST-EFFORT and FAIL-OPEN like the conflict
-//     guard: every uncertainty (see approvalDismissedCheck) admits and is
-//     logged with its reason. A never-reviewed PR still queues.
+//   - 409 forge_approval_required (ADR-112 / #4619), INSIDE the merge-intent
+//     lock after the ownership check and BEFORE the overlap-override record,
+//     the verdict append, the observe, the republish and the claim: when the
+//     run's review stage declares an approval gate, the ONE forge-approval
+//     fold (forge_approval.go) runs at the gate's verified head
+//     (gate.HeadSHA) and anything but approved — a moved head (head_moved),
+//     a snapshot read error, an unparseable recorded spec, a non-GitHub forge
+//     (provider_unsupported) — refuses with NOTHING recorded. An approved
+//     fold writes merge_queue_authorized first; a failed append is 503
+//     merge_authorization_unrecorded (retryable), again with nothing else
+//     recorded. A run that never recorded a spec, or whose review stage
+//     declares no approval gate, makes no fold read. The pre-ADR-112 409
+//     approval_dismissed refusal is removed from this endpoint (the gate
+//     view keeps it as an advisory display).
 //
 // It deliberately does NOT block on a review stage parked at awaiting_approval:
 // in feature_change that stage settles ON merge via resolveReviewStageOnMerge,
@@ -508,24 +516,6 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Dismissed-approval precondition (#4086): a vouch commit, fix-up push or
-	// rebase can dismiss the PR's approval, after which GitHub reports the PR
-	// blocked and the queued merge never fires. AFTER the merge-candidate gate
-	// and BEFORE the verdict append, so that merge records no verdict.
-	// BEST-EFFORT / FAIL-OPEN like the conflict guard: every uncertainty admits
-	// and is logged with its reason (see approvalDismissedCheck).
-	approval := s.approvalDismissedCheck(r.Context(), runRow)
-	if approval.Refusal != nil {
-		s.writeMergeReadinessRefusal(w, r, runID, prURL, approval.Refusal)
-		return
-	}
-	if !approval.Determined {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo,
-			"merge: approval-dismissed check undetermined; proceeding (fail open)",
-			slog.String("run_id", runID.String()),
-			slog.String("undetermined", approval.Undetermined))
-	}
-
 	// ADR-093 slice 2 (E87.5 / #4296, approval conditions D1/D2): the rest
 	// of the inline merge (override record, verdict append, observe,
 	// republish, dispatch claim, dispatch, response) runs under the run's
@@ -563,6 +553,13 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		}
 		if owned && !s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true).Landed {
 			s.writeMergeQueueOwnsMerge(w, r, runID, prURL)
+			return nil
+		}
+
+		// ADR-112 (#4619): the forge-approval fold, AFTER the ownership check
+		// and BEFORE every write below (override, verdict, observe,
+		// republish, claim), so a refusal records nothing.
+		if s.inlineForgeApproval(w, r, runID, runRow, prURL, subject, gate) {
 			return nil
 		}
 
@@ -842,6 +839,58 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: merge-intent lock lapsed after the inline merge ran; its answer stands",
 			slog.String("run_id", runID.String()), slog.String("error", lockErr.Error()))
 	}
+}
+
+// forgeApprovalReasonSnapshotUnreadable is the inline/delegated fold reason
+// for a review snapshot transport failure (the queue path holds instead).
+const forgeApprovalReasonSnapshotUnreadable = "snapshot_unreadable"
+
+// inlineForgeApproval is the inline merge_run's ADR-112 step, run inside the
+// merge-intent lock: handled=true means the response was written (409
+// forge_approval_required or 503 merge_authorization_unrecorded) and nothing
+// was recorded. A run whose review stage declares no approval gate (or that
+// never recorded a spec) makes no fold read. The fold judges gate.HeadSHA, the
+// head the merge-candidate gate verified (H1); an EMPTY gate head on a merged
+// PR (the gate's merged-PR admit) skips the fold so the observe path answers
+// already_merged, and otherwise folds undetermined (head_unknown).
+func (s *Server) inlineForgeApproval(w http.ResponseWriter, r *http.Request, runID uuid.UUID, runRow *run.Run,
+	prURL, subject string, gate mergeCandidateGateResult) bool {
+	ctx := r.Context()
+	declared, _, gerr := forgeApprovalGateFor(runRow)
+	if gerr == nil && !declared {
+		return false
+	}
+	if gate.HeadSHA == "" && gerr == nil && runForge(runRow) == forgeApprovalProviderGitHub &&
+		s.observeMergeAlreadyLanded(ctx, runID, runRow, subject, true).Landed {
+		return false
+	}
+	d, ferr := s.forgeApprovalFold(ctx, runRow, gate.HeadSHA)
+	if ferr != nil {
+		d = d.undetermined(forgeApprovalReasonSnapshotUnreadable, "the forge review snapshot could not be read", ferr)
+	}
+	if d.Merged {
+		return false
+	}
+	if !d.approved() {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: forge approval did not qualify; refusing with nothing recorded",
+			slog.String("run_id", runID.String()), slog.String("fold", d.Result), slog.String("reason", d.Reason),
+			slog.String("detail", d.Detail))
+		s.writeMergeReadinessRefusal(w, r, runID, prURL, forgeApprovalRefusal(d, runRow))
+		return true
+	}
+	if !d.Declared {
+		return false
+	}
+	if _, aerr := s.writeMergeQueueAuthorized(ctx, runRow, d, forgeApprovalAuthorization{Path: mergequeue.DispatchPathInline,
+		ActorKind: audit.ActorUser, ActorSubject: subject}); aerr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge: merge_queue_authorized append failed; refusing with nothing recorded",
+			slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
+		s.writeError(w, r, http.StatusServiceUnavailable, mergeCodeAuthorizationUnrecorded,
+			"the forge approval qualified but its merge_queue_authorized evidence row could not be recorded, so no merge verdict was recorded and nothing merged (ADR-112 R4: evidence before dispatch). Re-invoke the merge to retry.",
+			map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
+		return true
+	}
+	return false
 }
 
 // prMergeConflicting reports whether the run's pull request has a merge
