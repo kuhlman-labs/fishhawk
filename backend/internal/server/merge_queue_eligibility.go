@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"sort"
 	"strings"
 	"time"
 
@@ -21,10 +20,11 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
-// ADR-093 slice 1 (D1, E87.4 / #4295), extended by slice 2 (D3/D6, E87.5 /
-// #4296): the merge-queue ELIGIBILITY predicate. It decides QUEUE ADMISSION
-// itself, not only the merge: POST /v0/runs/{id}/merge enqueues only an
-// eligible run (mergeQueueEligibility, the ENTRY variant), the ADR-092
+// ADR-093 slice 1 (D1, E87.4 / #4295), extended by slice 2 (D3, E87.5 /
+// #4296) and ADR-112 R3 (#4632): the merge-queue ELIGIBILITY predicate. It
+// decides QUEUE ADMISSION itself, not only the merge: POST
+// /v0/runs/{id}/merge enqueues only an eligible run (mergeQueueEligibility,
+// the ENTRY variant), the ADR-092
 // rebase-path enqueue and the pump's admission of a held entry consult the
 // ADMISSION variant (mergeQueueAdmissionEligibility, or
 // mergeQueueAdmissionEligibilityAt for an entry carrying merge intent), and
@@ -38,29 +38,11 @@ import (
 //	    terminal entries must reach its configured count; an unreadable
 //	    round is undeterminable; a terminal entry of an EARLIER round never
 //	    counts), review coverage is complete (reviewCoverageRefusal), and,
-//	    when the review stage declares an approval gate, no reviewer's
-//	    latest non-comment review is CHANGES_REQUESTED (changes_requested,
-//	    every variant) and a LIVE forge approval exists by an
-//	    approvals.members identity (any live approval when members is
-//	    empty). A successfully read spec whose workflow has no review stage,
-//	    or whose review stage declares no approval gate, passes; an absent,
-//	    unreadable or unparseable spec is UNDETERMINABLE (fail closed).
-//	    APPROVAL TRANSFER (ADR-093 D6): with no live approval, a variant
-//	    given a merge-intent anchor (mergeQueueIntentAnchor) still passes
-//	    when the review-gate approval CARRIES to the head. The carrying set
-//	    is seeded by the anchored_head_sha of the merge_queue_entered row at
-//	    the anchor's RECORDED sequence (legacy sequence 0: the newest row
-//	    naming the anchor's base), then walks the branch_rebased and
-//	    conflict_resolution_pushed rows after it in sequence order: a CLEAN
-//	    advance (performed, its new head IS its merge commit) from a
-//	    carrying head adds its new head; a conflict-resolution push never
-//	    carries the approval and clears the set. Transfer holds only when
-//	    the head was reached by at least one clean advance (the anchored
-//	    head itself never transfers: an approval missing there was
-//	    withdrawn, not dismissed by an advance), no reviewer requests
-//	    changes. The result then names ApprovalBasis transferred (live
-//	    otherwise). (The merge variant's in-lock fold applies the full
-//	    ADR-112 CLEAN predicate instead; this walk only ADMITS.)
+//	    when the review stage declares an approval gate, the variant's FORGE
+//	    sub-legs hold (see below). A successfully read spec whose workflow
+//	    has no review stage, or whose review stage declares no approval
+//	    gate, passes; an absent, unreadable or unparseable spec is
+//	    UNDETERMINABLE (fail closed).
 //	(b) acceptance merge-eligible and not stale — acceptanceGateState +
 //	    acceptanceGateAdmitsMerge, and acceptanceStaleRefusal == nil.
 //	(c) required checks at the head — the check-runs listing classified by
@@ -83,13 +65,27 @@ import (
 //	    (requirement_arbitration is a page event, spec.PageEventRequirementArbitration,
 //	    never a concern category), so leg (d) matches no category.
 //
-// ADR-112 (#4619) restricts leg (a)'s FORGE sub-legs (changes_requested, the
-// live approval, the D6 transfer) to the ENTRY and ADMISSION variants: the
-// MERGE variant keeps the Fishhawk sub-legs (review_pending,
-// review_coverage_incomplete) and the spec read, and makes no forge review
-// read at all, because merge-on-pass judges approvals and vetoes through the
-// in-lock forge-approval fold (forge_approval.go). Its ApprovalBasis is
-// therefore always "" and the merge path takes the basis from the fold.
+// Leg (a)'s FORGE sub-legs differ by variant (ADR-112, #4619 / #4632):
+//
+//   - ENTRY, and ADMISSION with NO intent anchor (the ADR-092 rebase-path
+//     enqueue, an entry without merge intent): no reviewer's latest
+//     non-comment review is CHANGES_REQUESTED (changes_requested) and a LIVE
+//     forge approval exists by an approvals.members identity (any live
+//     approval when members is empty), else not_approved. ApprovalBasis is
+//     live when it passes.
+//   - ADMISSION WITH an intent anchor (mergeQueueAdmissionEligibilityAt):
+//     NO approval is evaluated — merge-on-pass's in-lock fold judges it and
+//     waits, then yields, on its absence (R3). Only the R2 VETO is checked,
+//     through the ONE forge-approval fold (forge_approval.go) at the PR head:
+//     vetoed (a write-or-higher CHANGES_REQUESTED) is forge_approval_vetoed
+//     naming the reviewer; a veto_undetermined decision or a snapshot
+//     transport failure is undeterminable; every other fold result passes.
+//     ApprovalBasis is "". (The ADR-093 D6 approval-transfer walk this
+//     variant used to run is gone: R1's clean-advance chain inside the fold
+//     is the surviving transfer rule.)
+//   - MERGE: no forge review read at all, because merge-on-pass judges
+//     approvals and vetoes through the in-lock fold. ApprovalBasis is "" and
+//     the merge path takes the basis from the fold.
 //
 // The predicate NEVER writes. Every read error is undeterminable, which is
 // NOT eligible: uncertainty never enqueues, admits or merges.
@@ -106,18 +102,21 @@ const (
 	mergeQueueReasonChecksRed                = "checks_red"
 	mergeQueueReasonBlockingConcernOpen      = "blocking_concern_open"
 	mergeQueueReasonUndeterminable           = "undeterminable"
+	// mergeQueueReasonForgeApprovalVetoed is the intent-bearing admission's R2
+	// veto (ADR-112, #4632): the fold at the PR head answered vetoed. It is the
+	// queue's forge_approval_vetoed reason, so an admission that fails on it
+	// ALONE yields under that name (R3 row 2).
+	mergeQueueReasonForgeApprovalVetoed = mergeCandidateQueueReasonForgeApprovalVetoed
 )
 
-// Approval bases mergeQueueEligibilityResult.ApprovalBasis reports when leg
-// (a) passed on a declared approval gate: a LIVE forge approval, or the
-// ADR-093 D6 approval TRANSFERRED across clean advances.
-const (
-	mergeQueueApprovalLive        = "live"
-	mergeQueueApprovalTransferred = "transferred"
-)
+// mergeQueueApprovalLive is the approval basis
+// mergeQueueEligibilityResult.ApprovalBasis reports when leg (a) passed on a
+// declared approval gate through a LIVE forge approval (the entry and
+// anchor-less admission variants; the others evaluate no approval).
+const mergeQueueApprovalLive = "live"
 
-// mergeQueueEligibilityVariant selects the caller's leg-(c) and transfer
-// rules.
+// mergeQueueEligibilityVariant selects the caller's leg-(a) forge sub-legs
+// and leg-(c) rules.
 type mergeQueueEligibilityVariant int
 
 const (
@@ -135,7 +134,7 @@ const (
 // mergeQueueIntentAnchor names the merge_queue_entered row that recorded a
 // queue entry's merge intent: its chain Sequence (0 for an entry whose intent
 // predates the recorded sequence) and the entry's BaseRef. The zero value is
-// NO anchor: leg (a) never transfers an approval without one.
+// NO anchor: the admission variant then keeps its live-approval requirement.
 type mergeQueueIntentAnchor struct {
 	Sequence int64
 	BaseRef  string
@@ -152,9 +151,9 @@ type mergeQueueIneligibility struct {
 // mergeQueueEligibilityResult is the predicate's verdict. Eligible is true
 // only when no leg failed and every read succeeded; Undeterminable is true
 // when any leg's read failed (its reason names the leg). ApprovalBasis is
-// mergeQueueApprovalLive or mergeQueueApprovalTransferred when leg (a) passed
-// on a declared approval gate, "" otherwise (no gate declared, or leg (a)
-// did not pass).
+// mergeQueueApprovalLive when leg (a) passed on a declared approval gate
+// through a live approval, "" otherwise (no gate declared, leg (a) did not
+// pass, or the variant evaluates no approval).
 type mergeQueueEligibilityResult struct {
 	Eligible       bool
 	Undeterminable bool
@@ -187,8 +186,10 @@ func (s *Server) mergeQueueAdmissionEligibility(ctx context.Context, runRow *run
 }
 
 // mergeQueueAdmissionEligibilityAt is the ADMISSION predicate for an entry
-// whose merge intent anchor is anchor: leg (a) may carry the review-gate
-// approval across clean advances since the intent (ADR-093 D6).
+// whose merge intent anchor is anchor (mergeQueueAnchorFor). With a non-zero
+// anchor leg (a) evaluates NO approval and checks only the ADR-112 R2 veto
+// through the fold at headSHA (forge_approval_vetoed; veto_undetermined is
+// undeterminable); a zero anchor is the anchor-less admission variant.
 func (s *Server) mergeQueueAdmissionEligibilityAt(ctx context.Context, runRow *run.Run, headSHA string, anchor mergeQueueIntentAnchor) mergeQueueEligibilityResult {
 	return s.evaluateMergeQueueEligibility(ctx, runRow, headSHA, anchor, mergeQueueVariantAdmission)
 }
@@ -292,13 +293,17 @@ func (s *Server) mergeQueueReviewLeg(ctx context.Context, runRow *run.Run, headS
 	if !declared {
 		return "", "", "", nil
 	}
-	// ADR-112 variant restriction (#4619): merge-on-pass applies the ONE
-	// forge-approval fold itself, in-lock (mergeOnPassLocked step 6b), so the
-	// merge variant makes NO forge review read here: no REST listing, no
-	// changes_requested, no approvers and no transfer walk. The entry and
-	// admission variants keep these legs unchanged until #4632.
-	if variant == mergeQueueVariantMerge {
+	switch {
+	case variant == mergeQueueVariantMerge:
+		// ADR-112 variant restriction (#4619): merge-on-pass applies the ONE
+		// forge-approval fold itself, in-lock (mergeOnPassLocked step 6b), so
+		// the merge variant makes NO forge review read here.
 		return "", "", "", nil
+	case variant == mergeQueueVariantAdmission && !anchor.isZero():
+		// ADR-112 R3 (#4632): approval is judged at merge-on-pass, which waits
+		// then yields; intent-bearing admission checks only the R2 veto.
+		code, detail, err := s.mergeQueueAdmissionVetoLeg(ctx, runRow, headSHA)
+		return code, detail, "", err
 	}
 	reviews, err := s.listMergeSettledReviews(ctx, runRow)
 	if err != nil {
@@ -310,35 +315,45 @@ func (s *Server) mergeQueueReviewLeg(ctx context.Context, runRow *run.Run, headS
 	}
 
 	approvers := approvingReviewers(reviews)
-	var notApproved string
 	if len(members) == 0 {
 		if len(approvers) > 0 {
 			return "", "", mergeQueueApprovalLive, nil
 		}
-		notApproved = "the pull request has no live forge approval"
-	} else {
-		forgeID := observationForgeID(runRow.InstallationRef)
-		ids := make([]string, 0, len(approvers))
-		for _, login := range approvers {
-			ids = append(ids, identity.CanonicalMember(login, forgeID))
-		}
-		if listedIdentity(members, ids, forgeID) != "" {
-			return "", "", mergeQueueApprovalLive, nil
-		}
-		notApproved = "no live forge approval is by an approvals.members identity (" + strings.Join(members, ", ") + ")"
+		return mergeQueueReasonNotApproved, "the pull request has no live forge approval", "", nil
 	}
+	forgeID := observationForgeID(runRow.InstallationRef)
+	ids := make([]string, 0, len(approvers))
+	for _, login := range approvers {
+		ids = append(ids, identity.CanonicalMember(login, forgeID))
+	}
+	if listedIdentity(members, ids, forgeID) != "" {
+		return "", "", mergeQueueApprovalLive, nil
+	}
+	return mergeQueueReasonNotApproved,
+		"no live forge approval is by an approvals.members identity (" + strings.Join(members, ", ") + ")", "", nil
+}
 
-	if anchor.isZero() {
-		return mergeQueueReasonNotApproved, notApproved, "", nil
+// mergeQueueAdmissionVetoLeg is leg (a)'s forge sub-leg for an intent-bearing
+// admission (ADR-112 R2/R3, #4632): the ONE fold at headSHA, consulted for its
+// veto only. vetoed answers forge_approval_vetoed with the fold's sanitised
+// detail (it names the reviewer); a veto_undetermined decision or a snapshot
+// transport failure is an error (undeterminable: the entry stays at its
+// place); every other result — approved, absent, dismissed, review_required,
+// any other undetermined reason — passes, because merge-on-pass re-judges the
+// approval in-lock.
+func (s *Server) mergeQueueAdmissionVetoLeg(ctx context.Context, runRow *run.Run, headSHA string) (code, detail string, err error) {
+	d, ferr := s.forgeApprovalFold(ctx, runRow, headSHA)
+	if ferr != nil {
+		d = d.undetermined(forgeApprovalReasonSnapshotUnreadable, "the forge review snapshot could not be read", ferr)
+		return "", "", errors.New(d.Detail)
 	}
-	carried, why, err := s.mergeQueueApprovalTransfers(ctx, runRow, headSHA, anchor)
-	if err != nil {
-		return "", "", "", err
+	switch {
+	case d.Result == forgeApprovalVetoed:
+		return mergeQueueReasonForgeApprovalVetoed, d.Detail, nil
+	case d.Result == forgeApprovalUndetermined && d.Reason == forgeApprovalReasonVetoUndetermined:
+		return "", "", errors.New(d.Detail)
 	}
-	if carried {
-		return "", "", mergeQueueApprovalTransferred, nil
-	}
-	return mergeQueueReasonNotApproved, notApproved + "; the approval does not transfer (ADR-093 D6): " + why, "", nil
+	return "", "", nil
 }
 
 // changesRequestingReviewers folds a chronological reviews listing to each
@@ -370,7 +385,7 @@ func changesRequestingReviewers(reviews []githubclient.PullRequestReview) []stri
 }
 
 // mergeQueueIntentRecord is the merge_queue_entered row that recorded a queue
-// entry's merge intent, decoded.
+// entry's merge intent, decoded (merge-on-pass reads its verdict).
 type mergeQueueIntentRecord struct {
 	Entry           *audit.Entry
 	Sequence        int64
@@ -414,79 +429,6 @@ func (s *Server) mergeQueueIntentRow(ctx context.Context, runID uuid.UUID, ancho
 		found = true
 	}
 	return best, found, nil
-}
-
-// mergeQueueApprovalTransfers is ADR-093 D6: whether the review-gate approval
-// recorded with the merge intent anchor names carries to headSHA. It returns
-// the reason it does not ("" when it does) or a read error.
-func (s *Server) mergeQueueApprovalTransfers(ctx context.Context, runRow *run.Run, headSHA string,
-	anchor mergeQueueIntentAnchor) (bool, string, error) {
-	intent, found, err := s.mergeQueueIntentRow(ctx, runRow.ID, anchor)
-	if err != nil {
-		return false, "", err
-	}
-	if !found {
-		return false, "no merge_queue_entered row records the entry's merge intent", nil
-	}
-	if intent.AnchoredHeadSHA == "" || headSHA == intent.AnchoredHeadSHA {
-		return false, "the head has not advanced since the merge intent, so no advance carries the approval", nil
-	}
-
-	type advanceRow struct {
-		category string
-		entry    *audit.Entry
-	}
-	var advances []advanceRow
-	for _, cat := range []string{CategoryBranchRebased, CategoryConflictResolutionPushed} {
-		rows, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
-		if lerr != nil {
-			return false, "", fmt.Errorf("list %s: %w", cat, lerr)
-		}
-		for _, e := range rows {
-			if e.Sequence > intent.Sequence {
-				advances = append(advances, advanceRow{category: cat, entry: e})
-			}
-		}
-	}
-	sort.Slice(advances, func(i, j int) bool { return advances[i].entry.Sequence < advances[j].entry.Sequence })
-
-	carriers := map[string]bool{intent.AnchoredHeadSHA: true}
-	for _, a := range advances {
-		switch a.category {
-		case CategoryBranchRebased:
-			var p struct {
-				PriorHeadSHA    string `json:"prior_head_sha"`
-				NewHeadSHA      string `json:"new_head_sha"`
-				MergeCommitSHA  string `json:"merge_commit_sha"`
-				AlreadyUpToDate bool   `json:"already_up_to_date"`
-			}
-			if json.Unmarshal(a.entry.Payload, &p) != nil {
-				// An undecodable advance carries nothing; a head reached
-				// through it is not in the set (fail closed).
-				continue
-			}
-			clean := !p.AlreadyUpToDate && p.MergeCommitSHA != "" && p.NewHeadSHA == p.MergeCommitSHA // ADR-093 D6 clean advance
-			if clean && carriers[p.PriorHeadSHA] {
-				carriers[p.NewHeadSHA] = true
-			}
-		case CategoryConflictResolutionPushed:
-			var p struct {
-				HeadSHA string `json:"head_sha"`
-			}
-			_ = json.Unmarshal(a.entry.Payload, &p)
-			carriesApproval := false // ADR-093 D6: a conflict-resolution advance never carries the review-gate approval
-			if carriesApproval {
-				carriers[p.HeadSHA] = true
-			} else {
-				carriers = map[string]bool{}
-			}
-		}
-	}
-	if !carriers[headSHA] {
-		return false, "the head " + headSHA + " was not reached from the intent's head " + intent.AnchoredHeadSHA +
-			" by clean advances only", nil
-	}
-	return true, "", nil
 }
 
 // reviewApprovalGateForRun reads whether the run's review stage declares an
