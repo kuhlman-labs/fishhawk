@@ -974,7 +974,13 @@ func TestE2E_MergeRun_EndpointToolWireAndIdempotence(t *testing.T) {
 
 	// Seed the run into a merge-admissible shape: a PR URL stamped and a
 	// non-terminal (running) state. The fixture run carries no WorkflowSpec, so
-	// the acceptance gate reads not-declared and admits the merge.
+	// the acceptance gate reads not-declared and admits the merge. Its
+	// WorkflowSHA is cleared so the run NEVER recorded a spec: a recorded SHA
+	// with no cached spec is the legacy row shape the ADR-112 forge-approval
+	// fold treats as undetermined (C4), which would refuse this merge 409.
+	if _, err := fx.pool.Exec(ctx, `UPDATE runs SET workflow_sha = '' WHERE id = $1`, fx.runID); err != nil {
+		t.Fatalf("clear workflow_sha: %v", err)
+	}
 	const prURL = "https://github.com/kuhlman-labs/fishhawk/pull/4848"
 	if _, err := fx.runRepo.SetRunPullRequestURL(ctx, fx.runID, prURL); err != nil {
 		t.Fatalf("SetRunPullRequestURL: %v", err)

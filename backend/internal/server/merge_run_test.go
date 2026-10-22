@@ -1462,6 +1462,9 @@ func newMergeRepublishServer(t *testing.T, log *mergeOrderLog, publishErr error,
 	au := newAuditCompleteAuditFake()
 	arts := newFakeArtifactRepo()
 	r := seedPublishableRun(t, rr, au, arts, "abc12345")
+	// The run NEVER recorded a spec (empty WorkflowSHA), so it declares no
+	// ADR-112 forge-approval gate (C4).
+	r.WorkflowSHA = ""
 	prURL := mergePR
 	r.PullRequestURL = &prURL
 
@@ -2219,6 +2222,22 @@ func TestMergeRun_DispatchError_ForgeNotMerged_502(t *testing.T) {
 	}
 }
 
+// specLessRunRepo reads every run as one that NEVER recorded a spec (an empty
+// WorkflowSHA), so a spec-less fixture whose Postgres seed stamps a SHA
+// declares no ADR-112 forge-approval gate; a recorded SHA with no cached spec
+// is the legacy row shape the fold treats as undetermined (C4).
+type specLessRunRepo struct {
+	run.Repository
+}
+
+func (r specLessRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	rr, err := r.Repository.GetRun(ctx, id)
+	if rr != nil && len(rr.WorkflowSpec) == 0 {
+		rr.WorkflowSHA = ""
+	}
+	return rr, err
+}
+
 // TestMergeRun_AlreadyMergedEndToEnd drives the CROSS-BOUNDARY seam on a REAL
 // Postgres chain (HTTP handler → forge read → audit persistence): a resume with
 // a forge reporting merged+SHA+merged_at answers already_merged with
@@ -2231,6 +2250,7 @@ func TestMergeRun_AlreadyMergedEndToEnd(t *testing.T) {
 	f := newObservationFixture(t, reader)
 	merger := &fakeMerger{}
 	f.s.cfg.GateMerger = merger
+	f.s.cfg.RunRepo = specLessRunRepo{Repository: f.s.cfg.RunRepo}
 
 	// RESUME shape: a durable verdict row already exists.
 	if _, err := f.audit.AppendChained(ctx, audit.ChainAppendParams{

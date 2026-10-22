@@ -3206,11 +3206,14 @@ and R5 (yield surfaces) are #4632.
   (`mergeDispatchAuthorizationUnrecorded`); none records a verdict or claims.
   A gate-less merge writes no row. On a resume whose verdict row already
   exists, THIS attempt's authorization row still precedes its claim.
-- **Spec postures (C4).** A run that NEVER recorded a spec, or whose review
+- **Spec postures (C4).** A run that NEVER recorded a spec (an empty
+  `WorkflowSHA` AND no cached `WorkflowSpec`: an ad-hoc run), or whose review
   stage declares no approval gate → no gate (R6): no fold read, admit. A spec
-  that WAS recorded but reads back empty, does not parse, or lacks the run's
-  workflow → undetermined: inline 409, delegated observe-only, queue eject
-  `forge_approval_undetermined`. This DIVERGES from the queue's entry and
+  that WAS recorded (`WorkflowSHA` set) but whose cached bytes are absent (the
+  legacy row shape that predates the `workflow_spec` column), read back empty,
+  do not parse, or lack the run's workflow → undetermined
+  (`spec_undeterminable`, no forge read): inline 409, delegated observe-only,
+  queue eject `forge_approval_undetermined`. This DIVERGES from the queue's entry and
   admission variants (`reviewApprovalGateForRun`), which hold
   (undeterminable) on any spec they cannot determine, absent included.
 - **GitLab (behaviour change).** On a non-GitHub forge whose review stage

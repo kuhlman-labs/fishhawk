@@ -229,18 +229,21 @@ type forgeApprovalGate struct {
 	workflow  *spec.Workflow
 }
 
-// errForgeApprovalSpecEmpty is a run that RECORDED a spec whose cached bytes
-// carry no document (whitespace only).
+// errForgeApprovalSpecEmpty is a run that RECORDED a spec (a non-empty
+// WorkflowSHA) whose cached bytes are absent or carry no document
+// (whitespace only).
 var errForgeApprovalSpecEmpty = errors.New("the run's recorded workflow spec is empty")
 
 // forgeApprovalGateFor resolves whether the run's review stage declares an
 // approval gate (ADR-112 R6, approval condition C4):
 //
-//   - the run NEVER recorded a spec (no cached bytes: a legacy or ad-hoc
-//     run) → not declared, no forge approval needed;
-//   - a spec was recorded but its cached bytes read back EMPTY, do not parse,
-//     or do not carry the run's workflow → an error, which every path treats
-//     as undetermined (refuse inline/delegated; eject on the queue);
+//   - the run NEVER recorded a spec (an empty WorkflowSHA AND no cached
+//     bytes: an ad-hoc run) → not declared, no forge approval needed;
+//   - a spec was recorded (WorkflowSHA set) but its cached bytes are absent
+//     (the legacy row shape that predates the workflow_spec column) or read
+//     back EMPTY, do not parse, or do not carry the run's workflow → an
+//     error, which every path treats as undetermined (refuse inline;
+//     observe-only delegated; eject on the queue);
 //   - a parsed workflow with no review stage, or a review stage with no
 //     approval gate → not declared.
 //
@@ -248,7 +251,13 @@ var errForgeApprovalSpecEmpty = errors.New("the run's recorded workflow spec is 
 // (reviewApprovalGateForRun), which hold on a missing cached spec: the fold
 // admits a run that never recorded one.
 func forgeApprovalGateFor(runRow *run.Run) (declared bool, gate forgeApprovalGate, err error) {
-	if runRow == nil || len(runRow.WorkflowSpec) == 0 {
+	if runRow == nil {
+		return false, forgeApprovalGate{}, nil
+	}
+	if len(runRow.WorkflowSpec) == 0 {
+		if runRow.WorkflowSHA != "" {
+			return false, forgeApprovalGate{}, errForgeApprovalSpecEmpty
+		}
 		return false, forgeApprovalGate{}, nil
 	}
 	if strings.TrimSpace(string(runRow.WorkflowSpec)) == "" {

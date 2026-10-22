@@ -377,17 +377,33 @@ func TestForgeApprovalFold_PermissionCap(t *testing.T) {
 }
 
 // TestForgeApprovalFold_SpecPostures pins C4: a run that never recorded a spec
-// declares no gate and makes no forge read; a recorded spec that reads back
+// (empty WorkflowSHA, no cached bytes) declares no gate and makes no forge
+// read; a recorded spec that is absent (the legacy row shape), reads back
 // empty or does not parse is undetermined.
 func TestForgeApprovalFold_SpecPostures(t *testing.T) {
 	f := newMCQFixture(t)
 	none := faSeed(t, f, nil, mcqReviewSnapshot{})
+	f.exec(`UPDATE runs SET workflow_sha = '' WHERE id = $1`, none.id)
 	d := faFold(t, f, none, faHead)
 	if d.Declared || !d.approved() || d.Basis != forgeApprovalBasisNotRequired {
 		t.Fatalf("spec-less fold = %+v, want not declared / not_required", d)
 	}
 	if n := f.gh.snapshotCalls(); n != 0 {
 		t.Errorf("spec-less fold made %d snapshot reads, want 0", n)
+	}
+	// The legacy row shape: WorkflowSHA set (a spec WAS recorded) but no cached
+	// bytes (the row predates the workflow_spec column) is undetermined, with
+	// no forge read.
+	legacy := faSeed(t, f, nil, mcqReviewSnapshot{})
+	if rr := f.runRow(legacy); rr.WorkflowSHA == "" || len(rr.WorkflowSpec) != 0 {
+		t.Fatalf("legacy fixture sha=%q spec=%d bytes, want a recorded sha and no cached spec", rr.WorkflowSHA, len(rr.WorkflowSpec))
+	}
+	d = faFold(t, f, legacy, faHead)
+	if !d.Declared || d.Result != forgeApprovalUndetermined || d.Reason != forgeApprovalReasonSpecUndeterminable || d.approved() {
+		t.Errorf("legacy spec fold = %s/%s declared=%v, want undetermined/%s", d.Result, d.Reason, d.Declared, forgeApprovalReasonSpecUndeterminable)
+	}
+	if n := f.gh.snapshotCalls(); n != 0 {
+		t.Errorf("legacy spec fold made %d snapshot reads, want 0", n)
 	}
 	for name, spec := range map[string][]byte{"unparseable": []byte("version: [\"2\"\nworkflows: {"), "empty": []byte("  \n")} {
 		r := faSeed(t, f, spec, mcqReviewSnapshot{})

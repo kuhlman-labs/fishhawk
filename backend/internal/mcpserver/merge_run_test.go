@@ -975,6 +975,12 @@ func TestMergeRun_CrossBoundary_RealServerChecksPending(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create run: %v", err)
 	}
+	// The run NEVER recorded a spec, so it declares no ADR-112 forge-approval
+	// gate; a recorded SHA with no cached spec is the legacy row shape the fold
+	// treats as undetermined (C4).
+	if _, err := pool.Exec(ctx, `UPDATE runs SET workflow_sha = '' WHERE id = $1`, row.ID); err != nil {
+		t.Fatalf("clear workflow_sha: %v", err)
+	}
 	if _, err := runRepo.TransitionRun(ctx, row.ID, runpkg.StateRunning); err != nil {
 		t.Fatalf("transition running: %v", err)
 	}

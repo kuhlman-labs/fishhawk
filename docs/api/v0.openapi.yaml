@@ -15494,7 +15494,10 @@ paths:
             `dismiss_review`, `retry_after`, `configure_identity_provider` or
             absent. FAIL-CLOSED: a forge read error, an unparseable recorded
             spec, an unresolvable escalation or permission, or a moved head is
-            `undetermined`. A run that never recorded a workflow spec, or
+            `undetermined`; so is a run that recorded a workflow spec (a
+            workflow SHA) whose cached copy is absent (a legacy row) or
+            empty (`spec_undeterminable`, no forge read). A run that never
+            recorded a workflow spec (no workflow SHA and no cached spec), or
             whose review stage declares no approval gate, makes no forge read
             and is not refused. BEHAVIOUR CHANGE: a GitLab-family run whose
             review stage declares an approval gate is refused with

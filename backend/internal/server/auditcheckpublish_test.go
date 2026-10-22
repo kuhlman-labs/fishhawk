@@ -1375,6 +1375,10 @@ func reopenedAcceptanceStrandFixture(t *testing.T, basis string, merger GitHubMe
 	t.Helper()
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
+	// The run NEVER recorded a spec, so it declares no ADR-112 forge-approval
+	// gate; a recorded SHA with no cached spec is the legacy row shape the fold
+	// treats as undetermined (C4).
+	r.WorkflowSHA = ""
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
 	prURL := fixupRepublishPRURL

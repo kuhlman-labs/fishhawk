@@ -111,7 +111,10 @@ func (g *overlapGitHub) prCompareCalls() int {
 // amendment fakes) with run A made merge-ready: PR url, repo x/y,
 // installation 42, a GateMerger and the overlapGitHub stub. A declares no
 // workflow spec, so the acceptance gate is not-declared and no merge-candidate
-// verify is required: with the guard absent, every fixture admits.
+// verify is required: with the guard absent, every fixture admits. A's
+// WorkflowSHA is cleared so it NEVER recorded a spec (no ADR-112 forge-approval
+// gate declared); a recorded SHA with no cached spec is the legacy row shape
+// the fold treats as undetermined (C4).
 type mergeOverlapFixture struct {
 	*overlapFixture
 	gh     *overlapGitHub
@@ -127,6 +130,7 @@ func newMergeOverlapFixture(t *testing.T) *mergeOverlapFixture {
 	f.s.cfg.GitHub = gh.client(t)
 	f.s.cfg.GateMerger = merger
 	a := f.rr.seedRun()
+	a.WorkflowSHA = ""
 	pr := mergePR
 	ref := "issue:self"
 	a.PullRequestURL = &pr
