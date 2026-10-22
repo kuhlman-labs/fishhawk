@@ -176,7 +176,9 @@ func (a mcqActor) graphQL() any {
 		return nil
 	}
 	m := map[string]any{"__typename": a.Typename, "login": a.Login}
-	if a.Typename == "User" {
+	// A non-User actor carries a databaseId only when the fixture sets one
+	// (a Bot or Mannequin with a real id, R1(d)); zero keeps it absent.
+	if a.Typename == "User" || a.ID != 0 {
 		m["databaseId"] = a.ID
 	}
 	return m

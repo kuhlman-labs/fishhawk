@@ -159,6 +159,17 @@ func TestForgeApprovalFold_Table(t *testing.T) {
 			snap: mcqReviewSnapshot{Reviews: []mcqReviewNode{{ID: 1, State: "APPROVED", SubmittedAt: faAt, Commit: faHead,
 				Author: mcqActor{Typename: "Bot", Login: "wally"}}}},
 			perms: map[string][2]string{"wally": {"write", "write"}}, want: forgeApprovalAbsent},
+		// R1(d): a GraphQL Bot login carries NO "[bot]" suffix, so only the
+		// __typename == "User" check excludes a Bot or Mannequin that has a
+		// non-zero databaseId and write permission.
+		{name: "a Bot with a databaseId and no [bot] suffix is not counted", approvals: faCount1,
+			snap: mcqReviewSnapshot{Reviews: []mcqReviewNode{{ID: 1, State: "APPROVED", SubmittedAt: faAt, Commit: faHead,
+				Author: mcqActor{Typename: "Bot", Login: "renovate", ID: 29139614}}}},
+			perms: map[string][2]string{"renovate": {"write", "write"}}, want: forgeApprovalAbsent, next: forgeApprovalNextApprovePR},
+		{name: "a Mannequin with a databaseId is not counted", approvals: faCount1,
+			snap: mcqReviewSnapshot{Reviews: []mcqReviewNode{{ID: 1, State: "APPROVED", SubmittedAt: faAt, Commit: faHead,
+				Author: mcqActor{Typename: "Mannequin", Login: "imported-alice", ID: 31}}}},
+			perms: map[string][2]string{"imported-alice": {"write", "write"}}, want: forgeApprovalAbsent, next: forgeApprovalNextApprovePR},
 		{name: "a [bot] login is not counted", approvals: faCount1,
 			snap:  mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "ci[bot]", 10)}},
 			perms: map[string][2]string{"ci[bot]": {"write", "write"}}, want: forgeApprovalAbsent},
@@ -440,18 +451,44 @@ func TestForgeApprovalFold_SnapshotErrorAndReadOnce(t *testing.T) {
 }
 
 func TestSanitizeForgeReadDetail(t *testing.T) {
-	in := "Authorization: Bearer ghs_abc token github_pat_x leaked " + strings.Repeat("x", 2048) + "\nsecond line ghp_zzz"
+	// Credential-shaped fixtures are built at runtime so no source line
+	// matches a secrets-scanner pattern.
+	hdr := "Author" + "ization: " + "Bea" + "rer "
+	ghs := "gh" + "s_" + strings.Repeat("a", 36)
+	pat := "github" + "_pat_" + strings.Repeat("b", 22)
+	ghp := "gh" + "p_" + strings.Repeat("c", 36)
+	opaque := strings.Repeat("Zq9", 12) // matches no token pattern: only the header/bearer rules redact it
+
+	in := hdr + ghs + " token " + pat + " leaked " + strings.Repeat("x", 2048) + "\nsecond line " + ghp
 	got := sanitizeForgeReadDetail("read_failed", in)
 	if len(got) > forgeApprovalDetailMaxBytes {
 		t.Errorf("len = %d, want <= %d", len(got), forgeApprovalDetailMaxBytes)
 	}
-	for _, bad := range []string{"ghs_abc", "github_pat_x", "\n", "second line", "ghp_zzz"} {
+	for _, bad := range []string{ghs, "gh" + "s_", pat, "\n", "second line", ghp} {
 		if strings.Contains(got, bad) {
 			t.Errorf("sanitised detail %q still carries %q", got, bad)
 		}
 	}
 	if !strings.HasPrefix(got, "read_failed: ") || !strings.Contains(got, "[redacted]") {
 		t.Errorf("sanitised detail = %q", got)
+	}
+
+	// Opaque tokens match no gh*_ pattern, so these pin the header and bearer
+	// rules: a real bearer authorization header, a token-scheme header (the
+	// header rule alone) and a bare bearer credential (the bearer rule alone).
+	for name, msg := range map[string]string{
+		"bearer header": "upstream said " + hdr + opaque + " rejected",
+		"token header":  "upstream said " + "Author" + "ization: token " + opaque + " rejected",
+		"bare bearer":   "retry with " + "Bea" + "rer " + opaque + " later",
+	} {
+		s := sanitizeForgeReadDetail("read_failed", msg)
+		if strings.Contains(s, opaque) || !strings.Contains(s, "[redacted]") {
+			t.Errorf("%s: sanitised detail %q still carries the opaque token", name, s)
+		}
+	}
+	// A bare ghs_ installation token outside any header.
+	if s := sanitizeForgeReadDetail("read_failed", "token "+ghs+" expired"); strings.Contains(s, ghs) || !strings.Contains(s, "[redacted]") {
+		t.Errorf("ghs token not redacted: %q", s)
 	}
 	if s := sanitizeForgeReadDetail("", "bell\x07ok"); s != "bellok" {
 		t.Errorf("control chars not stripped: %q", s)
