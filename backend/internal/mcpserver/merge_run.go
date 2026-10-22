@@ -95,15 +95,18 @@ const mergeOverlapReasonMaxBytes = 2000
 //     fishhawk_get_run_status (watch merge_candidate_queue) rather than a
 //     clearing verb; QueuePosition / AnchoredHeadSHA / LiveRunID carry the
 //     entry.
-//   - "acceptance_stale", "approval_dismissed" — the #4086 merge-readiness
+//   - "acceptance_stale", "forge_approval_required" — merge-readiness
 //     refusals: the recorded acceptance verdict was invalidated by a later
-//     acceptance_reopened (a fix-up push), or GitHub reports the PR blocked with
-//     no live approval and a dismissed review. IMMEDIATE returns (no poll, no
-//     verdict row) instead of a timeout; the Message is the server's verbatim
-//     and NextAction names the clearing verb — details.next_step for
-//     acceptance_stale (fishhawk_dispatch_stage / fishhawk_await_stage /
-//     fishhawk_retry_stage with the stage_id), the approve_pr ritual for
-//     approval_dismissed.
+//     acceptance_reopened (a fix-up push) (#4086), or the ADR-112
+//     forge-approval fold did not answer approved at the verified head
+//     (#4619). IMMEDIATE returns (no poll, no verdict row) instead of a
+//     timeout; the Message is the server's verbatim and NextAction names the
+//     clearing verb — details.next_step for acceptance_stale
+//     (fishhawk_dispatch_stage / fishhawk_await_stage / fishhawk_retry_stage
+//     with the stage_id) and for forge_approval_required (approve_pr,
+//     dismiss_review, fishhawk_merge_run, or none). approval_dismissed stays
+//     mapped (approve_pr ritual) for older backends; the merge endpoint no
+//     longer emits it.
 //   - "review_coverage_incomplete" — the #4219 decomposed-parent hold: a
 //     succeeded slice is covered by no SUCCESSFUL agent review (the parent's
 //     latest implement-review round and the slice's own latest round both
@@ -140,7 +143,7 @@ const mergeOverlapReasonMaxBytes = 2000
 //     overlap_check_failed and 503 overlap_override_unrecorded stay TOOL
 //     ERRORS: both are retryable failures, not preconditions.
 type MergeRunOutput struct {
-	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, review_coverage_incomplete, queued, overlapping_implement_in_flight, overlap_undetermined"`
+	Status string `json:"status" jsonschema:"one of merged, timeout, run_terminal, checks_pending, conflicting, behind_base, merge_candidate_unverified, merge_candidate_verify_failed, merge_candidate_held, acceptance_stale, approval_dismissed, forge_approval_required, review_coverage_incomplete, queued, overlapping_implement_in_flight, overlap_undetermined"`
 	// RunState is the run's lifecycle state at resolution (succeeded on a
 	// settled merge; failed/cancelled on the run_terminal backstop).
 	RunState string `json:"run_state,omitempty" jsonschema:"the run's lifecycle state at resolution"`
@@ -175,7 +178,7 @@ type MergeRunOutput struct {
 	// NextAction surfaces the operator post-merge dev-host step (the reused
 	// postMergeStep) on status=merged. Per ADR-038 the MCP surface never
 	// mutates the host, so this is SURFACED, not invoked.
-	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued and merge_queue_owns_merge, fishhawk_get_merge_queue (watch the base's line); on overlapping_implement_in_flight, fishhawk_await_stage on the blocking run's stage; on overlap_undetermined, fishhawk_merge_run with allow_overlap (an audited override)"`
+	NextAction *SuggestedAction `json:"next_action,omitempty" jsonschema:"on status=merged, the operator post-merge dev-host step (scripts/dev post-merge) — surfaced for you to run, never invoked by the tool (ADR-038); on behind_base / merge_candidate_unverified / merge_candidate_verify_failed, the verb that clears the merge-candidate refusal (fishhawk_rebase_run_branch, fishhawk_await_stage or fishhawk_fixup_stage); on merge_candidate_held, fishhawk_get_run_status (admission is automatic; watch merge_candidate_queue); on acceptance_stale, the acceptance re-run verb with the stage_id; on approval_dismissed, the approve_pr ritual; on forge_approval_required, details.next_step (approve_pr ritual, dismiss_review naming the CHANGES_REQUESTED reviewer, fishhawk_merge_run for retry_after, none for configure_identity_provider or a forge without approval binding); on review_coverage_incomplete, fishhawk_rerun_review or fishhawk_await_review; on queued and merge_queue_owns_merge, fishhawk_get_merge_queue (watch the base's line); on overlapping_implement_in_flight, fishhawk_await_stage on the blocking run's stage; on overlap_undetermined, fishhawk_merge_run with allow_overlap (an audited override)"`
 	Message    string           `json:"message,omitempty" jsonschema:"actionable explanation on the timeout / run_terminal / checks_pending / conflicting / merge-candidate / merge-readiness / merge-overlap statuses"`
 	// QueuePosition / AnchoredHeadSHA / LiveRunID ride status
 	// merge_candidate_held (ADR-092 / #4200), from the 409's details, and
@@ -338,15 +341,21 @@ Statuses:
                      heads. next_action names fishhawk_dispatch_stage (stage
                      pending), fishhawk_await_stage (re-run in flight) or
                      fishhawk_retry_stage, with the acceptance stage_id.
-  - "approval_dismissed" — GitHub reports the PR blocked, no reviewer's latest
-                     review is APPROVED and a prior review was DISMISSED (a vouch
-                     commit, fix-up push or rebase dismissed the approval), so the
-                     queued merge would never fire. Immediate, no verdict row;
-                     the message names the dismissed review's commit, the
-                     current head and what wrote it. next_action is the
-                     approve_pr ritual. Best-effort: when the forge cannot be
-                     read the merge queues as before. A never-reviewed PR still
-                     queues.
+  - "forge_approval_required" — the ADR-112 forge-approval fold did not
+                     answer approved at the verified head: no write-or-higher
+                     human reviewer satisfying the review gate approved it
+                     (absent, dismissed, review_required), a write-or-higher
+                     reviewer requested changes (vetoed), the approval could
+                     not be determined (undetermined, reviews_truncated; a
+                     moved head is undetermined with detail head_moved), or
+                     the forge cannot bind an approval to a revision
+                     (provider_unsupported; a GitLab run with a declared review
+                     gate fails closed). Immediate, nothing recorded.
+                     next_action follows details.next_step: approve_pr → the
+                     approve_pr ritual; dismiss_review → a gh step naming the
+                     CHANGES_REQUESTED reviewer; retry_after →
+                     fishhawk_merge_run; configure_identity_provider or no
+                     next_step → none (the message names the remedy).
   - "review_coverage_incomplete" — a decomposed parent has a succeeded slice
                      no SUCCESSFUL agent review covers: neither the parent's
                      latest implement-review round nor the slice's own latest
@@ -498,7 +507,7 @@ next_action fishhawk_get_run_status). With the merge queue wired, an ELIGIBLE
 run meeting one of those three gates is enqueued instead (status=queued); an
 ineligible one keeps the 409 status with merge_queue_ineligible set.
 
-The backend's 409 acceptance_stale / approval_dismissed (#4086) and
+The backend's 409 acceptance_stale (#4086), forge_approval_required (ADR-112 / #4619) and
 review_coverage_incomplete (#4219) are likewise NOT tool errors: each is returned IMMEDIATELY under the same status name with
 next_action naming the clearing verb, instead of a timeout. So are the merge
 overlap guard's 409 overlapping_implement_in_flight / overlap_undetermined
@@ -754,10 +763,14 @@ func queueOwnsMergeOutput(ae *apiError, repo string, runID uuid.UUID, start time
 // tool's IMMEDIATE statuses. None clears by waiting out the merge budget: a
 // stale acceptance verdict needs an acceptance re-run, a dismissed approval
 // needs a re-approval, an uncovered slice (#4219) needs a review round that
-// records a verdict.
+// records a verdict, and a non-qualifying ADR-112 forge-approval fold
+// (forge_approval_required) needs what details.next_step names.
+// approval_dismissed stays mapped for the gate view's advisory and older
+// backends; the merge endpoint itself now refuses with forge_approval_required.
 var readinessStatuses = map[string]string{
 	"acceptance_stale":           "acceptance_stale",
 	"approval_dismissed":         "approval_dismissed",
+	"forge_approval_required":    "forge_approval_required",
 	"review_coverage_incomplete": "review_coverage_incomplete",
 }
 
@@ -806,6 +819,8 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 			Consumes:     consumesNone,
 			Reason:       reason,
 		}
+	case "forge_approval_required":
+		next = forgeApprovalNextAction(ae, params, prURL)
 	case "approval_dismissed":
 		if prURL != "" {
 			params["pr_url"] = prURL
@@ -843,7 +858,11 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 	}
 	msg := ae.Message
 	if strings.TrimSpace(msg) == "" {
-		msg = "the merge-readiness check refused the merge (" + ae.Code + "); call " + next.Action + ", then re-invoke fishhawk_merge_run."
+		msg = "the merge-readiness check refused the merge (" + ae.Code + ")"
+		if next != nil {
+			msg += "; call " + next.Action + ", then re-invoke fishhawk_merge_run"
+		}
+		msg += "."
 	}
 	return MergeRunOutput{
 		Status:        status,
@@ -853,6 +872,59 @@ func mergeReadinessOutput(ae *apiError, status string, runID uuid.UUID, start ti
 		Message:       msg,
 		NextAction:    next,
 	}
+}
+
+// forgeApprovalNextAction maps a 409 forge_approval_required (ADR-112 fold,
+// #4619) to its NextAction by details.next_step: approve_pr → the approve_pr
+// ritual; dismiss_review → a gh step naming the CHANGES_REQUESTED reviewer;
+// retry_after → fishhawk_merge_run; configure_identity_provider (and a forge
+// with no approval-to-revision binding, which names no next step) → none, the
+// server's message carrying the remedy.
+func forgeApprovalNextAction(ae *apiError, params map[string]string, prURL string) *SuggestedAction {
+	step, _ := ae.Details["next_step"].(string)
+	fold, _ := ae.Details["fold"].(string)
+	precondition := "no qualifying forge approval covers the verified head (forge_approval_required, fold " + fold + ")"
+	if prURL != "" {
+		params["pr_url"] = prURL
+	}
+	switch step {
+	case "approve_pr":
+		return &SuggestedAction{
+			Action:       "approve_pr",
+			Params:       params,
+			Precondition: precondition,
+			Consumes:     consumesNone,
+			Reason:       "approve the pull request at the current head under a write-or-higher GitHub identity that satisfies the review gate (gh pr review --approve), then re-invoke fishhawk_merge_run",
+		}
+	case "dismiss_review":
+		reviewer, _ := ae.Details["veto_reviewer"].(string)
+		if reviewer != "" {
+			params["reviewer"] = reviewer
+		}
+		return &SuggestedAction{
+			Action:       "dismiss_review",
+			Params:       params,
+			Precondition: precondition,
+			Consumes:     consumesNone,
+			Reason:       "reviewer " + nonEmptyOr(reviewer, "(see message)") + " requested changes: resolve them and have the review re-approved, or dismiss it (gh api -X PUT repos/{owner}/{repo}/pulls/{number}/reviews/{review_id}/dismissals), then re-invoke fishhawk_merge_run",
+		}
+	case "retry_after":
+		return &SuggestedAction{
+			Action:       "fishhawk_merge_run",
+			Params:       params,
+			Precondition: precondition,
+			Consumes:     consumesNone,
+			Reason:       "the approval could not be determined (a forge read failed, the head moved, or the listing was truncated); re-invoke fishhawk_merge_run",
+		}
+	}
+	return nil
+}
+
+func nonEmptyOr(v, fallback string) string {
+	if v == "" {
+		return fallback
+	}
+	return v
 }
 
 // mergeOverlapRun mirrors one entry of the backend's merge overlap guard
