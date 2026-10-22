@@ -64,7 +64,9 @@ var admissionStaleSQL = fmt.Sprintf("interval '%d seconds'", int(AdmissionStaleA
 const entryCols = `e.id, e.run_id, COALESCE(r.account_id::text, ''), e.repo, e.base_ref, e.state,
   COALESCE(e.phase, ''), COALESCE(e.eject_reason, ''), e.enqueued_at, e.anchored_head_sha,
   COALESCE(e.anchored_base_sha, ''), e.anchored_at, e.admitted_at, e.settled_at, e.updated_at,
-  e.merge_intent_at, COALESCE(e.merge_intent_sequence, 0), e.admission_epoch`
+  e.merge_intent_at, COALESCE(e.merge_intent_sequence, 0), e.admission_epoch,
+  COALESCE(e.yield_reason, ''), COALESCE(e.yield_detail, ''), e.yielded_at, e.approval_wait_started_at,
+  COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.yielded_at) * 1000000)::bigint), 0)`
 
 const entryFrom = `
 FROM merge_candidate_queue_entries e
@@ -77,14 +79,17 @@ const basePredicate = `e.repo = $1 AND e.base_ref = $2 AND r.account_id IS NOT D
 func scanEntry(row pgx.Row, extra ...any) (Entry, error) {
 	var e Entry
 	var state, phase string
+	var yieldAgeUS int64
 	dest := append([]any{&e.ID, &e.RunID, &e.AccountID, &e.Repo, &e.BaseRef, &state,
 		&phase, &e.EjectReason, &e.EnqueuedAt, &e.AnchoredHeadSHA,
 		&e.AnchoredBaseSHA, &e.AnchoredAt, &e.AdmittedAt, &e.SettledAt, &e.UpdatedAt,
-		&e.MergeIntentAt, &e.MergeIntentSequence, &e.AdmissionEpoch}, extra...)
+		&e.MergeIntentAt, &e.MergeIntentSequence, &e.AdmissionEpoch,
+		&e.YieldReason, &e.YieldDetail, &e.YieldedAt, &e.ApprovalWaitStartedAt, &yieldAgeUS}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return Entry{}, err
 	}
 	e.State, e.Phase = State(state), Phase(phase)
+	e.YieldAge = time.Duration(yieldAgeUS) * time.Microsecond
 	return e, nil
 }
 
@@ -124,6 +129,11 @@ func lockTx(ctx context.Context, tx pgx.Tx, keys ...int64) error {
 func (s *PostgresStore) Enqueue(ctx context.Context, req EnqueueRequest) (EnqueueResult, error) {
 	if req.RunID == uuid.Nil || req.BaseRef == "" || req.HeadSHA == "" {
 		return EnqueueResult{}, fmt.Errorf("%w: run id, base ref and head sha are required", ErrInvalidRequest)
+	}
+	if req.Yield != nil {
+		if err := req.Yield.validate(); err != nil {
+			return EnqueueResult{}, err
+		}
 	}
 	var out EnqueueResult
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
@@ -187,6 +197,15 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 				}
 				out.Entry, out.IntentRecorded = e, recorded
 			}
+			// A live entry is never marked: merge_run's yield applies only to
+			// an entry that is not holding the line.
+			if req.Yield != nil && out.Entry.State == StateHeld { // Enqueue marker live-row guard
+				e, err := markYieldTx(ctx, tx, out.Entry, *req.Yield)
+				if err != nil {
+					return err
+				}
+				out.Entry, out.Marked = e, true
+			}
 		case cur != nil:
 			dropped, err := settleTx(ctx, tx, cur.ID, StateDropped, ReasonBaseChanged)
 			if err != nil {
@@ -196,13 +215,13 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 			if err != nil {
 				return err
 			}
-			out = EnqueueResult{Entry: e, Outcome: EnqueueBaseChanged, Dropped: &dropped, IntentRecorded: req.MergeIntent}
+			out = EnqueueResult{Entry: e, Outcome: EnqueueBaseChanged, Dropped: &dropped, IntentRecorded: req.MergeIntent, Marked: req.Yield != nil}
 		default:
 			e, err := insertTx(ctx, tx, req, repo)
 			if err != nil {
 				return err
 			}
-			out = EnqueueResult{Entry: e, Outcome: EnqueueInserted, IntentRecorded: req.MergeIntent}
+			out = EnqueueResult{Entry: e, Outcome: EnqueueInserted, IntentRecorded: req.MergeIntent, Marked: req.Yield != nil}
 		}
 		if out.IntentRecorded {
 			return recordIntentTx(ctx, tx, out.Entry.RunID, req.RecordIntent)
@@ -216,16 +235,24 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 }
 
 // insertTx inserts a held row at the base's tail: enqueued_at (the FIFO key),
-// anchored_at and (with MergeIntent) merge_intent_at are one database-clock
-// instant, and merge_intent_sequence is stamped in the same statement.
+// anchored_at, (with MergeIntent) merge_intent_at and (with Yield) yielded_at
+// are one database-clock instant, and merge_intent_sequence and the yield
+// reason and detail are stamped in the same statement.
 func insertTx(ctx context.Context, tx pgx.Tx, req EnqueueRequest, repo string) (Entry, error) {
 	var id uuid.UUID
+	var yieldReason, yieldDetail string
+	if req.Yield != nil {
+		yieldReason, yieldDetail = req.Yield.Reason, req.Yield.Detail
+	}
 	if err := tx.QueryRow(ctx, `INSERT INTO merge_candidate_queue_entries
-  (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at, merge_intent_at, merge_intent_sequence)
+  (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at, merge_intent_at, merge_intent_sequence,
+   yield_reason, yield_detail, yielded_at)
 SELECT $1, $2, $3, 'held', c.ts, $4, NULLIF($5, ''), c.ts, CASE WHEN $6::bool THEN c.ts END,
-  CASE WHEN $6::bool THEN NULLIF($7::bigint, 0) END
+  CASE WHEN $6::bool THEN NULLIF($7::bigint, 0) END,
+  NULLIF($8::text, ''), CASE WHEN $8::text <> '' THEN NULLIF($9::text, '') END, CASE WHEN $8::text <> '' THEN c.ts END
 FROM (SELECT clock_timestamp() AS ts) c
-RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA, req.MergeIntent, req.IntentSequence).Scan(&id); err != nil {
+RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA, req.MergeIntent, req.IntentSequence,
+		yieldReason, yieldDetail).Scan(&id); err != nil {
 		return Entry{}, fmt.Errorf("mergequeue: insert entry: %w", err)
 	}
 	return getEntryTx(ctx, tx, id)
@@ -244,6 +271,20 @@ WHERE id = $1`, cur.ID, headSHA, baseSHA); err != nil {
 	}
 	e, err := getEntryTx(ctx, tx, cur.ID)
 	return e, true, err
+}
+
+// markYieldTx stamps a HELD entry's yield marker: reason and detail are the
+// request's, and yielded_at keeps an existing value (COALESCE), so a re-marked
+// entry stays in the same yield episode and its approval-wait anchor is kept.
+// The caller guarantees the entry is held (a live row is never marked; the
+// 0109 CHECK refuses one).
+func markYieldTx(ctx context.Context, tx pgx.Tx, cur Entry, m YieldMarker) (Entry, error) {
+	if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
+SET yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(yielded_at, clock_timestamp())
+WHERE id = $1`, cur.ID, m.Reason, m.Detail); err != nil {
+		return Entry{}, fmt.Errorf("mergequeue: mark yield: %w", err)
+	}
+	return getEntryTx(ctx, tx, cur.ID)
 }
 
 // markIntentTx stamps an active entry's merge_intent_at, and seq as its
@@ -292,7 +333,7 @@ WHERE id = $1 AND state IN ('held', 'live')`, id, string(state), reason); err !=
 	return getEntryTx(ctx, tx, id)
 }
 
-// AdmitNext admits the base's oldest held entry when the base has no live
+// AdmitNext admits the base's oldest UNMARKED held entry when the base has no live
 // one. See README.md § "AdmitNext".
 func (s *PostgresStore) AdmitNext(ctx context.Context, base Base) (Admission, error) {
 	if err := base.validate(); err != nil {
@@ -335,8 +376,10 @@ WHERE id = $1`, live.ID); err != nil {
 		if s.afterLiveCheck != nil {
 			s.afterLiveCheck(ctx)
 		}
+		// A yielded (marked) held entry is skipped entirely: clearing its
+		// marker is the only way back in (ADR-112 R3).
 		next, err := scanEntry(tx.QueryRow(ctx, `SELECT `+entryCols+entryFrom+`
-WHERE `+basePredicate+` AND e.state = 'held'
+WHERE `+basePredicate+` AND e.state = 'held' AND e.yielded_at IS NULL
 ORDER BY e.enqueued_at, e.id
 LIMIT 1
 FOR UPDATE OF e`, base.Repo, base.BaseRef, acct))
@@ -599,6 +642,147 @@ func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, 
 	return out, nil
 }
 
+// ApprovalWait starts or continues the head-of-line approval wait of a LIVE
+// entry (ADR-112 R3): a compare-and-swap on the admission epoch that stamps
+// approval_wait_started_at once per yield episode (COALESCE: a readvance, a
+// re-admission and a stale re-claim never reset it) and judges window's
+// expiry against it on the database clock, in one transaction. A held or
+// terminal entry, or one re-admitted since epoch, is ErrStateConflict and is
+// not touched; window <= 0 is ErrInvalidRequest. See README.md § "Yield".
+func (s *PostgresStore) ApprovalWait(ctx context.Context, entryID uuid.UUID, epoch int64, window time.Duration) (ApprovalWaitResult, error) {
+	if window <= 0 {
+		return ApprovalWaitResult{}, fmt.Errorf("%w: approval wait window %s, want a positive duration", ErrInvalidRequest, window)
+	}
+	var out ApprovalWaitResult
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // ApprovalWait admission-epoch CAS
+			return epochConflict(cur, epoch)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
+SET approval_wait_started_at = COALESCE(approval_wait_started_at, clock_timestamp())
+WHERE id = $1`, cur.ID); err != nil {
+			return fmt.Errorf("mergequeue: start approval wait: %w", err)
+		}
+		e, err := getEntryTx(ctx, tx, cur.ID)
+		if err != nil {
+			return err
+		}
+		var remainingUS int64
+		if err := tx.QueryRow(ctx, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM
+  (approval_wait_started_at + $2::bigint * interval '1 microsecond') - clock_timestamp()) * 1000000)::bigint)
+FROM merge_candidate_queue_entries WHERE id = $1`, cur.ID, window.Microseconds()).Scan(&remainingUS); err != nil {
+			return fmt.Errorf("mergequeue: judge approval wait: %w", err)
+		}
+		out = ApprovalWaitResult{Entry: e, Expired: remainingUS == 0, Remaining: time.Duration(remainingUS) * time.Microsecond}
+		return nil
+	})
+	if err != nil {
+		return ApprovalWaitResult{}, err
+	}
+	return out, nil
+}
+
+// Yield moves a LIVE entry at epoch to held and marks it yielded, in ONE
+// statement (ADR-112 R3): state held, phase and admitted_at cleared,
+// enqueued_at kept (a cleared row rejoins FIFO at its original place),
+// yield_reason, yield_detail and yielded_at (database clock) stamped, and
+// approval_wait_started_at kept. It is a compare-and-swap on the admission
+// epoch: a held or terminal entry, or one re-admitted since epoch, is
+// ErrStateConflict and is not touched. An empty reason is ErrInvalidRequest.
+func (s *PostgresStore) Yield(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error) {
+	if err := marker.validate(); err != nil {
+		return Entry{}, err
+	}
+	var out Entry
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // Yield admission-epoch CAS
+			return epochConflict(cur, epoch)
+		}
+		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
+SET state = 'held', phase = NULL, admitted_at = NULL,
+    yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = clock_timestamp()
+WHERE id = $1`, cur.ID, marker.Reason, marker.Detail); err != nil {
+			return fmt.Errorf("mergequeue: yield entry: %w", err)
+		}
+		e, err := getEntryTx(ctx, tx, cur.ID)
+		out = e
+		return err
+	})
+	if err != nil {
+		return Entry{}, err
+	}
+	return out, nil
+}
+
+// yieldCASTx runs one compare-and-swap UPDATE on a yielded entry: set is the
+// SET clause, args from $4. The predicate is the marker's identity: state
+// held, the anchored head the caller judged ($2) and the episode's yielded_at
+// ($3). A row matching none is ErrStateConflict and is not touched.
+func (s *PostgresStore) yieldCASTx(ctx context.Context, op string, entryID uuid.UUID, headSHA string, yieldedAt time.Time, set string, args ...any) (Entry, error) {
+	if headSHA == "" || yieldedAt.IsZero() {
+		return Entry{}, fmt.Errorf("%w: %s requires the anchored head sha and yielded_at", ErrInvalidRequest, op)
+	}
+	var out Entry
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		tag, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries SET `+set+`
+WHERE id = $1 AND state = 'held' AND anchored_head_sha = $2 AND yielded_at = $3`, // yield marker CAS
+			append([]any{cur.ID, headSHA, yieldedAt}, args...)...)
+		if err != nil {
+			return fmt.Errorf("mergequeue: %s: %w", op, err)
+		}
+		if tag.RowsAffected() == 0 {
+			return fmt.Errorf("%w: %s: entry %s is %s at head %q yielded at %v, want held at head %q yielded at %v",
+				ErrStateConflict, op, cur.ID, cur.State, cur.AnchoredHeadSHA, cur.YieldedAt, headSHA, yieldedAt)
+		}
+		e, err := getEntryTx(ctx, tx, cur.ID)
+		out = e
+		return err
+	})
+	if err != nil {
+		return Entry{}, err
+	}
+	return out, nil
+}
+
+// ClearYield clears a yielded entry's marker AND its approval-wait anchor (a
+// later non-approval starts a fresh episode), a compare-and-swap on (held,
+// anchored_head_sha, yielded_at) under the base lock: the row rejoins the
+// line FIFO at its original enqueued_at. A row whose head moved, whose
+// episode changed (another yielded_at) or that is no longer held is
+// ErrStateConflict and keeps its marker. See README.md § "Yield".
+func (s *PostgresStore) ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time) (Entry, error) {
+	return s.yieldCASTx(ctx, "clear yield", entryID, headSHA, yieldedAt,
+		`yield_reason = NULL, yield_detail = NULL, yielded_at = NULL, approval_wait_started_at = NULL`)
+}
+
+// UpdateYield rewrites a yielded entry's reason and detail only (a yield
+// transition: yielded_at, the anchor and the wait anchor are kept), the same
+// compare-and-swap as ClearYield. An empty reason is ErrInvalidRequest.
+func (s *PostgresStore) UpdateYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, marker YieldMarker) (Entry, error) {
+	if err := marker.validate(); err != nil {
+		return Entry{}, err
+	}
+	return s.yieldCASTx(ctx, "update yield", entryID, headSHA, yieldedAt,
+		`yield_reason = $4, yield_detail = NULLIF($5, '')`, marker.Reason, marker.Detail)
+}
+
+// ReanchorYielded moves a yielded entry's anchor to the PR's current head
+// (newHeadSHA, newBaseSHA) KEEPING the marker, yielded_at and
+// approval_wait_started_at (the same episode: a head move never clears a
+// marker, so a push loop cannot buy a fresh wait window per push). It is the
+// same compare-and-swap as ClearYield on the OLD head (headSHA): a stale
+// probe is ErrStateConflict and is not touched. An unchanged anchor writes
+// nothing beyond the CAS check.
+func (s *PostgresStore) ReanchorYielded(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, newHeadSHA, newBaseSHA string) (Entry, error) {
+	if newHeadSHA == "" {
+		return Entry{}, fmt.Errorf("%w: reanchor yielded requires the new head sha", ErrInvalidRequest)
+	}
+	return s.yieldCASTx(ctx, "reanchor yielded", entryID, headSHA, yieldedAt,
+		`anchored_head_sha = $4, anchored_base_sha = NULLIF($5, ''),
+    anchored_at = CASE WHEN anchored_head_sha = $4 AND anchored_base_sha IS NOT DISTINCT FROM NULLIF($5, '') THEN anchored_at ELSE clock_timestamp() END`,
+		newHeadSHA, newBaseSHA)
+}
+
 // intentFnTimeout bounds every fn run under the merge-intent lock: the
 // merge_run intent decision's DB work, and (ADR-093 slice 2) merge-on-pass's,
 // the inline merge_run tail's and the delegated arm's forge reads and merge
@@ -766,7 +950,7 @@ func activeForRun(ctx context.Context, q rowQuerier, runID uuid.UUID) (Status, b
     SELECT count(*) FROM merge_candidate_queue_entries h JOIN runs hr ON hr.id = h.run_id
     WHERE h.repo = e.repo AND h.base_ref = e.base_ref AND h.state = 'held'
       AND hr.account_id IS NOT DISTINCT FROM r.account_id
-      AND (h.enqueued_at, h.id) <= (e.enqueued_at, e.id)
+      AND (h.yielded_at IS NOT NULL, h.enqueued_at, h.id) <= (e.yielded_at IS NOT NULL, e.enqueued_at, e.id)
   ) ELSE 0 END,
   (SELECT l.run_id FROM merge_candidate_queue_entries l JOIN runs lr ON lr.id = l.run_id
     WHERE l.repo = e.repo AND l.base_ref = e.base_ref AND l.state = 'live'
@@ -795,14 +979,15 @@ func (s *PostgresStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (Stat
 }
 
 // ListForBase returns the base's active entries in queue order: the live
-// entry first, then held entries by (enqueued_at, id). Never nil.
+// entry first, then unmarked held entries by (enqueued_at, id), then yielded
+// held entries by (enqueued_at, id). Never nil.
 func (s *PostgresStore) ListForBase(ctx context.Context, base Base) ([]Entry, error) {
 	if err := base.validate(); err != nil {
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `SELECT `+entryCols+entryFrom+`
 WHERE `+basePredicate+` AND e.state IN ('held', 'live')
-ORDER BY (e.state = 'live') DESC, e.enqueued_at, e.id`, base.Repo, base.BaseRef, acctArg(base.AccountID))
+ORDER BY (e.state = 'live') DESC, (e.yielded_at IS NOT NULL), e.enqueued_at, e.id`, base.Repo, base.BaseRef, acctArg(base.AccountID))
 	if err != nil {
 		return nil, fmt.Errorf("mergequeue: list base: %w", err)
 	}
