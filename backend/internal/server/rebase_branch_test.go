@@ -31,6 +31,7 @@ const (
 	rebasePriorHeadSHA = "aaaa111111111111111111111111111111111111" // run branch tip before the advance
 	rebaseNewHeadSHA   = "bbbb222222222222222222222222222222222222" // the merge commit / post-merge head
 	rebaseBaseAdvance  = "cccc333333333333333333333333333333333333" // a commit the base advanced by
+	rebaseBaseTipSHA   = "f0f0777777777777777777777777777777777777" // the base ref's tip at the advance (ADR-112 R1(a)(ii))
 	rebaseBranchName   = "fishhawk/run/rebase-abc"
 	rebaseBaseRef      = "main"
 	rebasePRURL        = "https://github.com/x/y/pull/77"
@@ -61,6 +62,13 @@ const (
 //   - onPRCall, when set, is invoked with the 1-based call number of every
 //     GET /pulls before it is answered, so a test can act at a precise point
 //     in the handler (e.g. cancel the request during the post-merge re-read).
+//   - ADR-112 R1(a)(ii) advance integrity, FAITHFUL by default: GET
+//     /git/ref/heads/{branch...} serves rebaseBaseTipSHA (baseTipSHA
+//     overrides; baseTipStatus fails it, 404 = absent), and GET
+//     /git/commits/{sha} answers the merge commit's parents as recorded at
+//     POST /merges — [the last PR head served, the base tip served] — so a
+//     clean advance verifies. wrongParent replaces the second parent;
+//     commitStatus fails the read.
 type rebaseGitHub struct {
 	baseRef       string
 	headRef       string
@@ -73,10 +81,19 @@ type rebaseGitHub struct {
 	mergeStatus   int
 	mergeBody     string
 	onPRCall      func(n int)
+	baseTipSHA    string
+	baseTipStatus int
+	wrongParent   string
+	commitStatus  int
 
-	mu          sync.Mutex
-	prCallCount int
-	mergeCalls  []rebaseMergeCall
+	mu           sync.Mutex
+	prCallCount  int
+	mergeCalls   []rebaseMergeCall
+	lastHeadSent string
+	baseTipSent  string
+	mergeParents map[string][]string
+	commitReads  int
+	baseTipReads int
 }
 
 // rebaseMergeCall is one captured POST /merges request body.
@@ -118,6 +135,7 @@ func newRebaseGitHubClient(t *testing.T, stub *rebaseGitHub) *githubclient.Clien
 				status = stub.prStatusSeq[i]
 			}
 			ref, base, hook := stub.headRef, stub.baseRef, stub.onPRCall
+			stub.lastHeadSent = head
 			stub.mu.Unlock()
 			if hook != nil {
 				hook(idx + 1)
@@ -163,6 +181,14 @@ func newRebaseGitHubClient(t *testing.T, stub *rebaseGitHub) *githubclient.Clien
 			stub.mu.Lock()
 			stub.mergeCalls = append(stub.mergeCalls, call)
 			status, body := stub.mergeStatus, stub.mergeBody
+			second := stub.baseTipSent
+			if stub.wrongParent != "" {
+				second = stub.wrongParent
+			}
+			if stub.mergeParents == nil {
+				stub.mergeParents = map[string][]string{}
+			}
+			parents := []string{stub.lastHeadSent, second}
 			stub.mu.Unlock()
 			if status == 0 {
 				status = http.StatusCreated
@@ -170,9 +196,57 @@ func newRebaseGitHubClient(t *testing.T, stub *rebaseGitHub) *githubclient.Clien
 			if body == "" {
 				body = `{"sha":"` + rebaseNewHeadSHA + `"}`
 			}
+			var created struct {
+				SHA string `json:"sha"`
+			}
+			if status == http.StatusCreated && json.Unmarshal([]byte(body), &created) == nil && created.SHA != "" {
+				stub.mu.Lock()
+				stub.mergeParents[created.SHA] = parents
+				stub.mu.Unlock()
+			}
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(status)
 			_, _ = w.Write([]byte(body))
+		})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			stub.mu.Lock()
+			stub.baseTipReads++
+			status, tip := stub.baseTipStatus, stub.baseTipSHA
+			if tip == "" {
+				tip = rebaseBaseTipSHA
+			}
+			if status == 0 || status == http.StatusOK {
+				stub.baseTipSent = tip
+			}
+			stub.mu.Unlock()
+			if status != 0 && status != http.StatusOK {
+				w.WriteHeader(status)
+				return
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"object":{"sha":%q}}`, tip)
+		})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/commits/{sha}",
+		func(w http.ResponseWriter, r *http.Request) {
+			stub.mu.Lock()
+			stub.commitReads++
+			status := stub.commitStatus
+			parents := stub.mergeParents[r.PathValue("sha")]
+			stub.mu.Unlock()
+			if status != 0 && status != http.StatusOK {
+				w.WriteHeader(status)
+				return
+			}
+			var sb strings.Builder
+			for i, p := range parents {
+				if i > 0 {
+					sb.WriteString(",")
+				}
+				fmt.Fprintf(&sb, `{"sha":%q}`, p)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			fmt.Fprintf(w, `{"sha":%q,"tree":{"sha":"tree-%s"},"parents":[%s]}`, r.PathValue("sha"), r.PathValue("sha"), sb.String())
 		})
 	srv := httptest.NewServer(mux)
 	t.Cleanup(srv.Close)
@@ -2172,8 +2246,12 @@ func laggingRebaseStub() *rebaseGitHub {
 	return stub
 }
 
-// branchRebasedPayload decodes the branch_rebased row's #4199 fields.
+// branchRebasedPayload decodes the branch_rebased row's #4199 fields and the
+// ADR-112 R1(a)(ii) advance-integrity keys (CleanVerified a pointer, so an
+// absent key is distinguishable from false).
 type branchRebasedPayload struct {
+	BaseTipSHA               string `json:"base_tip_sha"`
+	CleanVerified            *bool  `json:"clean_verified"`
 	NewHeadSHA               string `json:"new_head_sha"`
 	MergeCommitSHA           string `json:"merge_commit_sha"`
 	PostMergeHeadRead        string `json:"post_merge_head_read"`
@@ -2480,7 +2558,7 @@ func normalizeRebasePayload(sd *rebaseSeed, raw []byte) string {
 // so the extraction is pinned BYTE-FOR-BYTE on the audit chain, not only on
 // the fields individual tests happen to read.
 const (
-	goldenOperatorBranchRebasedPayload = `{"already_up_to_date":false,"base_ref":"main","branch":"fishhawk/run/rebase-abc","mechanism_note":"fishhawk_rebase_run_branch merges the declared base INTO the run branch server-side, leaving a merge commit; this is not a literal rebase and does not produce linear history.","merge_commit_sha":"bbbb222222222222222222222222222222222222","new_head_sha":"bbbb222222222222222222222222222222222222","post_merge_head_read":"converged","post_merge_observed_head_sha":"bbbb222222222222222222222222222222222222","post_merge_read_attempts":1,"pr_number":77,"prior_head_sha":"aaaa111111111111111111111111111111111111","reason":"advance onto main","reparked_review_stage_id":"<review>","run_id":"<run>"}`
+	goldenOperatorBranchRebasedPayload = `{"already_up_to_date":false,"base_ref":"main","base_tip_sha":"f0f0777777777777777777777777777777777777","branch":"fishhawk/run/rebase-abc","clean_verified":true,"mechanism_note":"fishhawk_rebase_run_branch merges the declared base INTO the run branch server-side, leaving a merge commit; this is not a literal rebase and does not produce linear history.","merge_commit_sha":"bbbb222222222222222222222222222222222222","new_head_sha":"bbbb222222222222222222222222222222222222","post_merge_head_read":"converged","post_merge_observed_head_sha":"bbbb222222222222222222222222222222222222","post_merge_read_attempts":1,"pr_number":77,"prior_head_sha":"aaaa111111111111111111111111111111111111","reason":"advance onto main","reparked_review_stage_id":"<review>","run_id":"<run>"}`
 	goldenOperatorVouchPayload         = `{"reason":"fishhawk_rebase_run_branch advanced fishhawk/run/rebase-abc onto main; this commit was created by the App installation on the operator's authorization (ADR-035 sole writer), not by a foreign pusher","run_id":"<run>","vouched_sha":"bbbb222222222222222222222222222222222222"}`
 )
 
@@ -3022,5 +3100,123 @@ func TestRebase_IneligibleRunAnswersNotQueued(t *testing.T) {
 	}
 	if es := f.entries(r); len(es) != 0 {
 		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+}
+
+// --- ADR-112 R1(a)(ii) advance integrity ---------------------------------
+
+// TestAdvanceRunBranch_CleanVerifiedModes pins one row per advance-integrity
+// mode. Each asserts the branch_rebased payload read back from the audit
+// chain AND that the advance itself succeeded: the parent check never refuses
+// an advance, it only decides clean_verified.
+func TestAdvanceRunBranch_CleanVerifiedModes(t *testing.T) {
+	cases := []struct {
+		name        string
+		mutate      func(*rebaseGitHub)
+		upToDate    bool
+		wantVerify  bool
+		wantBaseTip string
+	}{
+		{"parents are (prior, base tip)", func(*rebaseGitHub) {}, false, true, rebaseBaseTipSHA},
+		{"wrong second parent", func(g *rebaseGitHub) { g.wrongParent = "9999999999999999999999999999999999999999" }, false, false, rebaseBaseTipSHA},
+		{"commit read 500", func(g *rebaseGitHub) { g.commitStatus = http.StatusInternalServerError }, false, false, rebaseBaseTipSHA},
+		{"base-tip read 500", func(g *rebaseGitHub) { g.baseTipStatus = http.StatusInternalServerError }, false, false, ""},
+		{"base-tip 404 (absent)", func(g *rebaseGitHub) { g.baseTipStatus = http.StatusNotFound }, false, false, ""},
+		{"already up to date", func(*rebaseGitHub) {}, true, false, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stub := cleanRebaseStub()
+			if tc.upToDate {
+				stub = upToDateRebaseStub()
+			}
+			tc.mutate(stub)
+			sd := seedRebaseRun(t, stub, rebaseOpts{})
+			out, refusal := sd.s.advanceRunBranch(context.Background(), sd.rr.getRuns[sd.runID],
+				mergeCandidateSystemActor(), "advance-integrity")
+			if refusal != nil {
+				t.Fatalf("advance refused (%s: %s); the parent check must never refuse an advance", refusal.Kind, refusal.Reason)
+			}
+			if out.MergePerformed == tc.upToDate {
+				t.Fatalf("MergePerformed = %v, want %v", out.MergePerformed, !tc.upToDate)
+			}
+			if out.CleanVerified != tc.wantVerify || out.BaseTipSHA != tc.wantBaseTip {
+				t.Errorf("outcome clean_verified=%v base_tip=%q, want %v %q", out.CleanVerified, out.BaseTipSHA, tc.wantVerify, tc.wantBaseTip)
+			}
+			p := decodeBranchRebased(t, sd.au)
+			if p.CleanVerified == nil {
+				t.Fatal("branch_rebased row carries no clean_verified key; it must ALWAYS be written")
+			}
+			if *p.CleanVerified != tc.wantVerify || p.BaseTipSHA != tc.wantBaseTip {
+				t.Errorf("branch_rebased clean_verified=%v base_tip_sha=%q, want %v %q", *p.CleanVerified, p.BaseTipSHA, tc.wantVerify, tc.wantBaseTip)
+			}
+		})
+	}
+}
+
+// TestAdvanceRunBranch_EmptyMergeSHAIsNotVerified: a merge whose sha did not
+// decode reads no commit and records clean_verified false.
+func TestAdvanceRunBranch_EmptyMergeSHAIsNotVerified(t *testing.T) {
+	stub := cleanRebaseStub()
+	stub.mergeBody = `{}`
+	sd := seedRebaseRun(t, stub, rebaseOpts{})
+	out, refusal := sd.s.advanceRunBranch(context.Background(), sd.rr.getRuns[sd.runID], mergeCandidateSystemActor(), "")
+	if refusal != nil {
+		t.Fatalf("refused: %+v", refusal)
+	}
+	if out.CleanVerified {
+		t.Error("CleanVerified = true with an empty merge sha")
+	}
+	stub.mu.Lock()
+	reads := stub.commitReads
+	stub.mu.Unlock()
+	if reads != 0 {
+		t.Errorf("commit reads = %d, want 0 (no merge sha to read)", reads)
+	}
+}
+
+// TestMergeParentsAre pins the exact-list comparison.
+func TestMergeParentsAre(t *testing.T) {
+	for _, tc := range []struct {
+		parents []string
+		want    bool
+	}{
+		{[]string{"p", "b"}, true},
+		{[]string{"b", "p"}, false},
+		{[]string{"p"}, false},
+		{[]string{"p", "b", "x"}, false},
+		{nil, false},
+	} {
+		if got := mergeParentsAre(tc.parents, "p", "b"); got != tc.want {
+			t.Errorf("mergeParentsAre(%v) = %v, want %v", tc.parents, got, tc.want)
+		}
+	}
+}
+
+// TestRebaseRunBranch_EnforceWrongParentDoesNotTransfer is the ADR-096 row on
+// the rebase verb: everything a transfer needs is in place (passed prior head,
+// an independent classifier, enforce mode), but the merge commit's second
+// parent is not the base tip, so the advance is NOT clean — no
+// merge_candidate_verdict_transferred row is written and a pass is triggered.
+func TestRebaseRunBranch_EnforceWrongParentDoesNotTransfer(t *testing.T) {
+	cls := independentClassifier()
+	stub := cleanRebaseStub()
+	stub.wrongParent = "9999999999999999999999999999999999999999"
+	sd, _ := seedTransferRebase(t, stub, MergeCandidateTransferEnforce, cls)
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+
+	if n := len(auditEntries(sd.au, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Fatalf("transferred rows = %d, want 0 (parents unverified)", n)
+	}
+	tr := mcvTriggerPayloads(t, sd.au)
+	if len(tr) != 1 || tr[0].ExpectedHeadSHA != rebaseNewHeadSHA {
+		t.Fatalf("triggers = %+v, want one pass for %s", tr, rebaseNewHeadSHA)
+	}
+	if resp.MergeCandidateVerifyState == mergeCandidateStatePassed {
+		t.Errorf("response state = passed; an unverified advance must not transfer")
+	}
+	if cls.count() != 0 {
+		t.Errorf("classifier calls = %d, want 0 (decided not_clean_advance before classifying)", cls.count())
 	}
 }

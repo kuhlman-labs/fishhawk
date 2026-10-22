@@ -145,13 +145,21 @@ type FileContent struct {
 }
 
 // GitCommit is the slice of a git-commit object Fishhawk needs to author a
-// follow-on commit: the commit's own SHA and the tree it points at.
+// follow-on commit, or to verify how a merge commit was built: the commit's
+// own SHA, the tree it points at, and its parents.
 type GitCommit struct {
 	// SHA is the commit object's SHA.
 	SHA string
 	// TreeSHA is the SHA of the tree the commit points at — the base_tree
 	// for a create-tree call that adds files on top of this commit.
 	TreeSHA string
+	// Parents are the commit's parent SHAs in the order the commit object
+	// records them (a merge commit's first parent is the branch it was
+	// merged into). The ADR-112 R1(a)(ii) clean-advance check compares a
+	// queue/rebase merge commit's parents against [prior head, base tip].
+	// Empty for a root commit; nil from a provider that does not report
+	// parents (GitLab), which a caller must treat as unverifiable.
+	Parents []string
 }
 
 // TreeEntry is one file placed into a new tree by CreateTree. Content is

@@ -644,10 +644,13 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 			return unadmit("the auto-advance merged but its resulting head could not be read back")
 		}
 		if adv.MergePerformed {
-			// Clean only when the new head IS the merge commit; a concurrent
-			// push the post-merge re-read observed is not_clean_advance.
+			// Clean only when the new head IS the merge commit AND that merge
+			// commit's parents were verified as exactly [prior head, base tip]
+			// (ADR-112 R1(a)(ii), adv.CleanVerified): a concurrent push the
+			// post-merge re-read observed, or an unverified parent list, is
+			// not_clean_advance.
 			transfer = &mergeCandidateTransferRequest{Run: runRow, PriorHead: head, NewHead: adv.NewHeadSHA,
-				MergePerformed: adv.MergeCommitSHA != "" && adv.NewHeadSHA == adv.MergeCommitSHA,
+				MergePerformed: adv.MergeCommitSHA != "" && adv.NewHeadSHA == adv.MergeCommitSHA && adv.CleanVerified,
 				Cause:          mergeCandidateCauseBaseAdvance}
 			if e.MergeIntentAt != nil {
 				s.writeMergeQueueRow(ctx, CategoryMergeQueueAdvanced, e, map[string]any{
@@ -655,6 +658,8 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 					"new_head_sha":     adv.NewHeadSHA,
 					"merge_commit_sha": adv.MergeCommitSHA,
 					"clean":            transfer.MergePerformed,
+					"base_tip_sha":     adv.BaseTipSHA,
+					"clean_verified":   adv.CleanVerified,
 					"admission_epoch":  e.AdmissionEpoch,
 				})
 			}

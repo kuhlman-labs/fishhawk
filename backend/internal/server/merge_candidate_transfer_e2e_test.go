@@ -170,3 +170,84 @@ func TestMergeCandidateTransfer_E2E_ShadowDisjointStillRunsPass(t *testing.T) {
 		t.Fatalf("transferred rows = %d in shadow, want 0", n)
 	}
 }
+
+// --- ADR-112 R1(a)(ii): the QUEUE-ADMISSION transfer caller ----------------
+//
+// The admission auto-advance (admitMergeCandidateEntry) is the second ADR-096
+// transfer caller beside the rebase verb. Its clean predicate now includes the
+// merge commit's parent check: with correct parents an independent delta
+// transfers; with the mcqGitHub wrong-parent knob the advance is NOT clean, so
+// no merge_candidate_verdict_transferred row is written and a pass runs.
+
+func TestMergeCandidateTransfer_QueueAdmission_CorrectParentsTransfers(t *testing.T) {
+	f := newMCQFixture(t)
+	_, b := f.transferHandOff(MergeCandidateTransferEnforce, independentClassifier())
+
+	if rows := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferred); len(rows) != 1 || rows[0].ToHead != "b2" {
+		t.Fatalf("transferred rows = %+v, want one b1 → b2", rows)
+	}
+	if tr := f.triggers(b); len(tr) != 0 {
+		t.Fatalf("triggers = %+v, want none (the verdict transferred)", tr)
+	}
+}
+
+func TestMergeCandidateTransfer_QueueAdmission_WrongParentDoesNotTransfer(t *testing.T) {
+	f := newMCQFixture(t)
+	cls := independentClassifier()
+	a, b := f.wave()
+	f.passedAt(b, "b1")
+	f.transfer(MergeCandidateTransferEnforce, cls)
+	f.verdict(a, mergeCandidateResultPassed)
+	f.behind(b, "b1", "b2")
+	f.gh.set(func() { f.gh.wrongParent[b.branch] = "not-the-base-tip" })
+	f.closePR(a, true)
+
+	if n := len(f.rows(b, CategoryMergeCandidateVerdictTransferred)); n != 0 {
+		t.Fatalf("transferred rows = %d, want 0 (merge-commit parents unverified)", n)
+	}
+	if tr := f.triggers(b); len(tr) != 1 || tr[0].ExpectedHeadSHA != "b2" {
+		t.Fatalf("triggers = %+v, want one pass for b2", tr)
+	}
+	refused := f.transferPayloads(b, CategoryMergeCandidateVerdictTransferRefused)
+	if len(refused) != 1 || refused[0].ReasonCode != transferReasonNotCleanAdvance {
+		t.Fatalf("refused rows = %+v, want one not_clean_advance", refused)
+	}
+	if cls.count() != 0 {
+		t.Errorf("classifier calls = %d, want 0", cls.count())
+	}
+}
+
+// TestMergeQueueAdvanced_RecordsCleanVerified pins the merge_queue_advanced
+// row an intent-bearing admission advance writes: clean is the FULL predicate
+// (parents included), and base_tip_sha / clean_verified are recorded.
+func TestMergeQueueAdvanced_RecordsCleanVerified(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		wrongParent string
+		wantClean   bool
+	}{
+		{"parents verified", "", true},
+		{"wrong second parent", "not-the-base-tip", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req := w.ready("adv", "h1", mcvUndelegatedSpecYAML)
+			w.behind(r, "h1", "h2")
+			if tc.wrongParent != "" {
+				w.gh.set(func() { w.gh.wrongParent[r.branch] = tc.wrongParent })
+			}
+			w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+
+			adv := w.rows(r, CategoryMergeQueueAdvanced)
+			if len(adv) != 1 {
+				t.Fatalf("merge_queue_advanced rows = %d, want 1", len(adv))
+			}
+			p := w.payload(adv[0])
+			if p["new_head_sha"] != "h2" || p["clean"] != tc.wantClean || p["clean_verified"] != tc.wantClean ||
+				p["base_tip_sha"] != mcqBaseTip(mcqBase) {
+				t.Fatalf("merge_queue_advanced payload = %v, want clean=clean_verified=%v base_tip_sha=%s",
+					p, tc.wantClean, mcqBaseTip(mcqBase))
+			}
+		})
+	}
+}

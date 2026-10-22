@@ -67,7 +67,10 @@ func (c *Client) GetRepository(ctx context.Context, scope forge.CredentialScope,
 //
 // The onboarding scaffolder (E29.7) calls it to resolve the default
 // branch HEAD commit's TREE sha — create-tree's base_tree must be a tree
-// sha, not a commit sha, so the repo's existing files are preserved.
+// sha, not a commit sha, so the repo's existing files are preserved. The
+// ADR-112 R1(a)(ii) clean-advance check (server/rebase_branch.go) reads
+// Parents, decoded from `parents[].sha` in the order GitHub reports them,
+// to verify a merge commit's parents are exactly [prior head, base tip].
 // Returns ErrNotFound when the repo/commit isn't visible, ErrForbidden on
 // auth issues.
 func (c *Client) GetCommit(ctx context.Context, scope forge.CredentialScope, repo RepoRef, sha string) (*GitCommit, error) {
@@ -106,6 +109,9 @@ func (c *Client) GetCommit(ctx context.Context, scope forge.CredentialScope, rep
 		Tree struct {
 			SHA string `json:"sha"`
 		} `json:"tree"`
+		Parents []struct {
+			SHA string `json:"sha"`
+		} `json:"parents"`
 	}
 	if err := json.NewDecoder(resp.Body).Decode(&body); err != nil {
 		return nil, fmt.Errorf("githubclient: decode commit: %w", err)
@@ -113,7 +119,11 @@ func (c *Client) GetCommit(ctx context.Context, scope forge.CredentialScope, rep
 	if body.Tree.SHA == "" {
 		return nil, fmt.Errorf("githubclient: commit response missing tree.sha")
 	}
-	return &GitCommit{SHA: body.SHA, TreeSHA: body.Tree.SHA}, nil
+	parents := make([]string, 0, len(body.Parents))
+	for _, p := range body.Parents {
+		parents = append(parents, p.SHA)
+	}
+	return &GitCommit{SHA: body.SHA, TreeSHA: body.Tree.SHA, Parents: parents}, nil
 }
 
 // CreateTree creates a new git tree that layers entries on top of
