@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/google/uuid"
@@ -105,6 +106,10 @@ type pullRequestReviewPayload struct {
 		} `json:"user"`
 		State string `json:"state"`
 		Body  string `json:"body"`
+		// CommitID is the head the review was submitted at: the ADR-112
+		// yield re-probe trigger fires only when it is the yielded entry's
+		// anchored head (approval condition C9).
+		CommitID string `json:"commit_id"`
 	} `json:"review"`
 	PullRequest struct {
 		HTMLURL string `json:"html_url"`
@@ -675,6 +680,64 @@ func (s *Server) handlePullRequestReviewSubmitted(ctx context.Context, raw []byt
 		slog.String("reviewer", p.Review.User.Login),
 		slog.String("state", p.Review.State),
 	)
+	if p.Review.State == "approved" {
+		s.reprobeMergeQueueYieldOnApproval(ctx, target.ID, p.Review.CommitID)
+	}
+}
+
+// reprobeMergeQueueYieldOnApproval is the approval webhook's ADR-112 R3
+// trigger (#4632): an approved review re-probes the run's YIELDED queue entry
+// at once instead of on the backoff schedule. Approval condition C9 bounds the
+// amplification: it fires ONLY when the review's commit_id equals the entry's
+// anchored_head_sha, and at most once per run per pump interval
+// (mergeQueueYieldApprovalTriggers). The payload is a trigger only: the
+// re-probe's fold re-reads the forge and is the sole decision. Best-effort: a
+// queue read error, no entry, an entry that is not yielded or a review at
+// another head does nothing (the sweep still re-probes on its schedule).
+func (s *Server) reprobeMergeQueueYieldOnApproval(ctx context.Context, runID uuid.UUID, commitID string) {
+	if s.cfg.MergeQueue == nil || commitID == "" {
+		return
+	}
+	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	if err != nil || !found || !st.Entry.Yielded() || st.Entry.AnchoredHeadSHA != commitID {
+		return
+	}
+	if !mergeQueueYieldApprovalTriggers.allow(runID, time.Now(), MergeCandidateQueuePumpInterval) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"pull_request_review.submitted: yield re-probe already triggered for this run within the pump interval; the sweep re-probes on its schedule",
+			slog.String("run_id", runID.String()))
+		return
+	}
+	s.reprobeMergeQueueYieldDetached(ctx, runID)
+}
+
+// mergeQueueYieldApprovalTriggers is the approval webhook's per-run re-probe
+// limiter (approval condition C9). It is process-local: each replica bounds
+// its own triggers, and the sweep's schedule is the shared fallback.
+var mergeQueueYieldApprovalTriggers = &runTriggerLimiter{last: map[uuid.UUID]time.Time{}}
+
+// runTriggerLimiter admits at most one trigger per run per interval.
+type runTriggerLimiter struct {
+	mu   sync.Mutex
+	last map[uuid.UUID]time.Time
+}
+
+// allow reports whether runID may trigger at now, recording the trigger when
+// it may; entries older than interval are pruned so the map stays bounded by
+// the triggers of one interval.
+func (l *runTriggerLimiter) allow(runID uuid.UUID, now time.Time, interval time.Duration) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for id, at := range l.last {
+		if now.Sub(at) >= interval {
+			delete(l.last, id)
+		}
+	}
+	if _, recent := l.last[runID]; recent {
+		return false
+	}
+	l.last[runID] = now
+	return true
 }
 
 // findRunByPullRequestURL looks up the most-recent Fishhawk run on

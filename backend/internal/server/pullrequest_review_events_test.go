@@ -2614,3 +2614,117 @@ func TestResolveReviewStageOnMerge_StageLookupFailureHoldsMerge(t *testing.T) {
 		t.Errorf("missing pr_merged after the listed retry")
 	}
 }
+
+// ADR-112 R3 (#4632, slice 4): the approval webhook's yield re-probe trigger,
+// over the yield world of merge_queue_yield_reprobe_test.go (the real queue
+// and audit chain, the mcq fake forge on x/y): A is yielded
+// forge_approval_dismissed, anchored at a1.
+
+// prReviewYieldWebhook delivers a pull_request_review.submitted event for r
+// in state at commit, then waits for any detached re-probe it started.
+func prReviewYieldWebhook(w *mqmWorld, r *mcqRun, state, commit string) {
+	w.t.Helper()
+	raw, _ := json.Marshal(map[string]any{
+		"review":       map[string]any{"user": map[string]any{"login": "alice"}, "state": state, "commit_id": commit},
+		"pull_request": map[string]any{"html_url": r.prURL, "number": r.pr},
+	})
+	w.srv.handlePullRequestReviewSubmitted(context.Background(), raw)
+	w.srv.bgMergeQueuePump.Wait()
+}
+
+// TestPullRequestReviewApproved_ReprobesTheAnchoredYield: an approved review
+// at the yielded entry's anchored head re-probes it; the fold (re-reading the
+// forge, which now carries alice's qualifying approval) clears the marker.
+// Counterfactual: dropping the webhook's trigger leaves no cleared row, RED.
+func TestPullRequestReviewApproved_ReprobesTheAnchoredYield(t *testing.T) {
+	w, a, y := newYieldWorld(t)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+
+	prReviewYieldWebhook(w, a, "approved", "a1")
+
+	if n := len(w.rows(a, CategoryPRApprovedOnGitHub)); n != 1 {
+		t.Fatalf("pr_approved_on_github rows = %d, want 1 (the trigger follows the audit row)", n)
+	}
+	cleared := w.rows(a, CategoryMergeQueueYieldCleared)
+	if len(cleared) != 1 || w.payload(cleared[0])["entry_id"] != y.ID.String() {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1 naming %s", len(cleared), y.ID)
+	}
+}
+
+// TestPullRequestReviewApproved_NoReprobeOffTheAnchor pins approval condition
+// C9's trigger predicate: the forge carries a qualifying approval at the
+// anchored head a1 (so ANY re-probe would clear the marker), yet a review at a
+// non-anchored SHA, a non-approved review state and a review with no commit
+// id each trigger nothing: the entry stays yielded. Counterfactual: dropping
+// the commit-SHA match (or the approved-state check) re-probes and clears,
+// RED.
+func TestPullRequestReviewApproved_NoReprobeOffTheAnchor(t *testing.T) {
+	for _, tc := range []struct{ name, state, commit string }{
+		{"review at a non-anchored SHA", "approved", "zzz"},
+		{"commented review at the anchor", "commented", "a1"},
+		{"no commit id", "approved", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w, a, y := newYieldWorld(t)
+			w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+
+			prReviewYieldWebhook(w, a, tc.state, tc.commit)
+
+			if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+				t.Fatalf("merge_queue_yield_cleared rows = %d, want 0 (no re-probe)", n)
+			}
+			if e := w.active(a); e.YieldedAt == nil || !e.YieldedAt.Equal(*y.YieldedAt) {
+				t.Fatalf("entry yielded_at = %v, want the episode %v kept", e.YieldedAt, y.YieldedAt)
+			}
+		})
+	}
+}
+
+// TestPullRequestReviewApproved_ReprobeAtMostOncePerInterval pins approval
+// condition C9's rate bound: the first approved review at the anchor
+// re-probes (the forge still reads the dismissal, so nothing changes); a
+// second approved review within the pump interval, after a qualifying
+// approval landed, triggers NO second re-probe, so the entry stays yielded
+// until the sweep's schedule. Counterfactual: a limiter that always allows
+// re-probes again and clears the marker, RED.
+func TestPullRequestReviewApproved_ReprobeAtMostOncePerInterval(t *testing.T) {
+	w, a, _ := newYieldWorld(t)
+	prReviewYieldWebhook(w, a, "approved", "a1")
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+
+	prReviewYieldWebhook(w, a, "approved", "a1")
+
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 0 (the second trigger is inside the interval)", n)
+	}
+	if e := w.active(a); e.YieldedAt == nil {
+		t.Fatal("the entry was cleared by a rate-limited trigger")
+	}
+}
+
+// TestRunTriggerLimiter_OncePerRunPerInterval: the limiter admits a run once
+// per interval, other runs independently, and prunes an expired trigger.
+func TestRunTriggerLimiter_OncePerRunPerInterval(t *testing.T) {
+	l := &runTriggerLimiter{last: map[uuid.UUID]time.Time{}}
+	a, b := uuid.New(), uuid.New()
+	t0 := time.Date(2026, 10, 22, 0, 0, 0, 0, time.UTC)
+	steps := []struct {
+		run  uuid.UUID
+		at   time.Duration
+		want bool
+	}{
+		{a, 0, true}, {a, 30 * time.Second, false}, {b, 30 * time.Second, true},
+		{a, 59 * time.Second, false}, {a, time.Minute, true}, {b, 89 * time.Second, false},
+	}
+	for i, s := range steps {
+		if got := l.allow(s.run, t0.Add(s.at), time.Minute); got != s.want {
+			t.Fatalf("step %d allow(+%s) = %v, want %v", i, s.at, got, s.want)
+		}
+	}
+	if got := len(l.last); got != 2 {
+		t.Fatalf("tracked runs = %d, want 2", got)
+	}
+	if !l.allow(uuid.New(), t0.Add(10*time.Minute), time.Minute) || len(l.last) != 1 {
+		t.Fatalf("expired triggers not pruned: %d tracked", len(l.last))
+	}
+}
