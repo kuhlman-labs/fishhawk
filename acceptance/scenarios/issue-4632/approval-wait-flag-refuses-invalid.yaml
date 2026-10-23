@@ -1,0 +1,14 @@
+id: scenario:issue-4632/approval-wait-flag-refuses-invalid
+statement: fishhawkd refuses to start when FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT (or --merge-queue-approval-wait) is unparseable or not positive, exiting non-zero with an error naming the setting, and starts normally when it is unset (default 30 minutes).
+verify_hint: 'CLI surface: run the fishhawkd serve command with FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT=notaduration and with =0s; observe a non-zero exit code and stderr/log naming FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT (the resolver runs before the database dial, so no database is needed).'
+steps: 'Posture B: built fishhawkd from the sanctioned checkout (HEAD eeb513ca = target git_sha; cd backend && go build -o /tmp/fh4632/fishhawkd ./cmd/fishhawkd). With FISHHAWKD_DATABASE_URL unset, ran fishhawkd serve --addr 127.0.0.1:18999 with FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT=notaduration, =0s and =-5m. Then ran it with the flag --merge-queue-approval-wait 0s. Then ran it with the variable unset for about 6s, then killed it. Read serve --help.'
+assertions:
+    expected: Non-zero exit naming the setting for unparseable or non-positive values; normal startup when unset (default 30m).
+    observed_at_record: 'notaduration: exit 1, ERROR ''invalid merge-queue approval wait'' ''--merge-queue-approval-wait / FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT: "notaduration" is not a Go duration''. 0s and -5m (env), and 0s (flag): exit 1, ''must be a positive duration''. Unset: ''fishhawkd listening addr=127.0.0.1:18999'' with no approval-wait error. --help shows the default 30m0s.'
+    repro_handle: FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT=0s fishhawkd serve; echo $?
+origin:
+    issue: 4632
+    pr: 0
+    run_id: 7283e39d-9abb-4d23-9ecc-647f02486e0b
+    head_sha: eeb513cafef874a35d0550cd66f040f7c37591a1
+    recorded_at: 2026-10-23T04:14:31Z
