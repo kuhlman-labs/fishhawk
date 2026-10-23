@@ -111,7 +111,7 @@ type orderMerger struct {
 	err              error
 }
 
-func (m *orderMerger) MergePullRequest(_ context.Context, _ *run.Run) error {
+func (m *orderMerger) MergePullRequest(_ context.Context, _ *run.Run, _ string) error {
 	m.called++
 	for _, a := range mergeVerdictRows(m.au) {
 		if a.Category == CategoryMergeVerdictRecorded {
@@ -793,6 +793,29 @@ func TestHandleMergeRun_UnstableDispatch_ChecksPending(t *testing.T) {
 	// The verdict row IS durable despite the checks-pending refusal.
 	if rows := mergeVerdictRows(au); len(rows) != 1 {
 		t.Errorf("merge_verdict_recorded rows = %d, want 1 (verdict durable on the 409)", len(rows))
+	}
+}
+
+// TestMergeRun_UngatedMergeConflictKeepsDispatchFailed502 pins (#4641) that
+// merge_head_moved fires only on a PINNED dispatch: this fixture's
+// merge-candidate gate admits ungated (no GitHub client, ADR-090 D7), so
+// gate.HeadSHA is empty, the dispatch is unpinned (the merger receives ""),
+// and a forge.ErrMergeConflict keeps the generic 502 merge_dispatch_failed.
+func TestMergeRun_UngatedMergeConflictKeepsDispatchFailed502(t *testing.T) {
+	merger := &fakeMerger{err: fmt.Errorf("enable auto-merge: %w", forge.ErrMergeConflict)}
+	s, repo, _ := newAutoDriveMergeServer(t, merger)
+	runID := uuid.New()
+	seedMergeRun(t, repo, runID, run.StateRunning, mergePR, nil, nil)
+
+	w := postMergeRun(t, s, runID, mergeRunRequest{Verdict: "go"}, withMergeOperator)
+	if w.Code != http.StatusBadGateway || !bytes.Contains(w.Body.Bytes(), []byte("merge_dispatch_failed")) {
+		t.Fatalf("status = %d %s, want 502 merge_dispatch_failed (an unpinned conflict is not head-moved)", w.Code, w.Body.String())
+	}
+	if bytes.Contains(w.Body.Bytes(), []byte(mergeCodeHeadMoved)) {
+		t.Errorf("an unpinned ErrMergeConflict must not answer %s: %s", mergeCodeHeadMoved, w.Body.String())
+	}
+	if merger.called != 1 || merger.gotHead != "" {
+		t.Fatalf("merger called %d with head %q, want 1 unpinned call", merger.called, merger.gotHead)
 	}
 }
 

@@ -4900,41 +4900,21 @@ func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *ru
 	return m.gh.MergePullRequestAtHead(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
 }
 
-func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run) error {
+// MergePullRequest is the github-family GitHubMerger leaf (inline merge_run
+// and the delegated may_merge arm). The auto-merge ladder — queue auto-merge,
+// fall back to a synchronous REST merge ONLY on the clean-status class, never
+// on the UNSTABLE-status class (#2717) — lives in githubclient.QueueMerge
+// (#4641), so it is one tested production function. headSHA is the head the
+// merge-candidate gate admitted: non-empty PINS both arms (expectedHeadOid on
+// the auto-merge enable, sha on the REST fallback) and a head mismatch surfaces
+// as forge.ErrMergeConflict; empty keeps the unpinned ladder. The webhook /
+// resolveReviewStageOnMerge path settles the review stage on the merge.
+func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
 	scope, repo, number, err := m.mergeTarget(runRow)
 	if err != nil {
 		return err
 	}
-	// Primary: queue GitHub auto-merge so the PR lands once the repository's
-	// branch protection clears. What that protection actually requires is a
-	// repo property, not a Fishhawk one (E64.44 / #3161): Fishhawk PUBLISHES
-	// the fishhawk_audit_complete check but does not make it required, so an
-	// auto-merge on a repo that does not require it can fire with the review
-	// verdict still pending. The onboarding-readiness merge_gate rung
-	// (backend/internal/mergegate) reports what the forge enforces. The webhook
-	// / resolveReviewStageOnMerge path settles the review stage on the merge.
-	err = m.gh.EnableAutoMerge(ctx, scope, repo, number, forge.MergeMethodSquash)
-	if err == nil {
-		return nil
-	}
-	// Fallback (E48.7 / #1954): enablePullRequestAutoMerge errors on a PR that
-	// is ALREADY merge-ready ("clean status") — the common operator flow where
-	// `gh pr review --approve` plus green required checks settle the PR clean
-	// before the merge verb runs. GitHub refuses to queue auto-merge on a
-	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
-	// enable error surfaces unchanged (no fallback).
-	//
-	// The exclusion is deliberate and load-bearing: this fallback covers ONLY
-	// the clean-status class. An UNSTABLE-status rejection (ErrPullRequestUnstableStatus,
-	// E67.56 / #2717 — the PR's required checks have not all passed) must NOT be
-	// widened into it: a REST squash merge on an UNSTABLE PR would SUCCEED and
-	// land the change before its pending checks report. That class travels
-	// through this seam untouched (errors.Is(err, ErrPullRequestCleanStatus) is
-	// false for it) and the server maps it to a bounded wait, not a merge.
-	if errors.Is(err, forge.ErrPullRequestCleanStatus) {
-		return m.gh.MergePullRequest(ctx, scope, repo, number, forge.MergeMethodSquash)
-	}
-	return err
+	return m.gh.QueueMerge(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
 }
 
 // parseInstallationHostAllowlist splits a comma-separated

@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -50,8 +51,18 @@ const requirementConcernCategory = "requirement"
 // requiring the merger on the Server struct. MergePullRequest merges the
 // run's pull request on GitHub; the existing webhook /
 // resolveReviewStageOnMerge path then settles the review stage.
+//
+// expectedHeadSHA (#4641, ADR-112 residual H3) is the head the merge-candidate
+// gate admitted, which the ADR-112 fold judged and the D1 claim records. A
+// non-empty value PINS the merge: the auto-merge enable carries GitHub's
+// expectedHeadOid and the clean-status REST fallback carries `sha`, so a push
+// landing after the gate is refused by the forge rather than merged unapproved.
+// A head mismatch surfaces as forge.ErrMergeConflict (with a
+// *githubclient.HeadMismatchError naming its basis); the classifier releases
+// the claim. An EMPTY value means no head was evaluated (an ungated D7 admit,
+// a merged-PR admit) and keeps the unpinned ladder.
 type GitHubMerger interface {
-	MergePullRequest(ctx context.Context, runRow *run.Run) error
+	MergePullRequest(ctx context.Context, runRow *run.Run, expectedHeadSHA string) error
 }
 
 // AutoDriveOutcome reports what AutoDriveRunGate did at a run gate so the
@@ -501,6 +512,10 @@ const (
 	// could not be recorded; nothing was claimed and the merger was not called.
 	autoDriveNoteApprovalNotQualified    = "no qualifying forge approval covers the verified head (ADR-112 fold, fail-closed); observe-only"
 	autoDriveNoteAuthorizationUnrecorded = "the forge approval qualified but merge_queue_authorized could not be recorded (ADR-112 R4, fail-closed); observe-only"
+	// #4641 (ADR-112 residual H3): the forge refused the merge pinned to the
+	// gate's admitted head because the PR head moved after it; the claim was
+	// released and the next tick re-gates at the new head.
+	autoDriveNoteHeadMoved = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the merge-dispatch claim was released and the next auto-drive tick re-gates at the new head; observe-only"
 )
 
 // delegatedMergeUnderLock runs the delegated may_merge dispatch tail under the
@@ -585,6 +600,16 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "auto-drive: may_merge met but merge_queue_authorized could not be recorded; observe-only",
 			slog.String("run_id", runRow.ID.String()), slog.String("error", derr.Error()))
 		return observeOnly(autoDriveNoteAuthorizationUnrecorded), nil
+	case mergeDispatchHeadMoved:
+		// derr is the forge's head-mismatch refusal, carried for this log only.
+		basis := mergeHeadMovedBasis(derr)
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"auto-drive: the forge refused the head-pinned merge because the pull request head moved; observe-only, the next tick re-gates at the new head",
+			slog.String("run_id", runRow.ID.String()), slog.String("head_sha", gate.HeadSHA),
+			slog.String("pinned_to", mergeHeadMovedSubject(gate.HeadSHA, forgeApprovalFolded(runRow))),
+			slog.String("refusal_basis", basis), slog.Bool("forge_guarantees_nothing_applied", mergeHeadMovedNothingApplied(basis)),
+			slog.String("error", derr.Error()))
+		return observeOnly(autoDriveNoteHeadMoved), nil
 	}
 	if derr != nil {
 		return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
@@ -629,6 +654,12 @@ const (
 	// mergeDispatchAuthorizationUnrecorded: the fold approved but the
 	// merge_queue_authorized append failed (the returned error): no claim.
 	mergeDispatchAuthorizationUnrecorded
+	// mergeDispatchHeadMoved (#4641): the dispatch was PINNED to a non-empty
+	// liveHead and the forge refused it for a head mismatch
+	// (forge.ErrMergeConflict). The claim was settled (released) and the
+	// returned error is that refusal, for logging only: the caller is
+	// observe-only, never "merge dispatch failed".
+	mergeDispatchHeadMoved
 )
 
 // dispatchAcceptanceGatedMerge is the shared merge-dispatch tail extracted from
@@ -640,7 +671,8 @@ const (
 // and otherwise dispatches the merge through the seam.
 //
 // Returns the classified outcome, the acceptance gate state (for logging /
-// error detail), and — only on mergeDispatchMerged — the seam's dispatch error.
+// error detail), and — only on mergeDispatchMerged and mergeDispatchHeadMoved
+// — the seam's dispatch error.
 // On mergeDispatchAcceptanceNotReady the returned error is the acceptance-audit
 // read error (nil when the gate is simply not-passed rather than unreadable),
 // so the caller can distinguish an evidence hole from a read failure.
@@ -667,9 +699,13 @@ const (
 // ledger and no queue dispatcher to race, so the dispatch proceeds unclaimed.
 //
 // liveHead is the head mergeCandidateGate admitted (mergeCandidateGateResult.
-// HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it, and
-// the claim records it. Empty (an ungated D7 admit, a merged PR) keeps the
-// findHeadSHA resolution and claims at "unresolved" (the claim is run-scoped).
+// HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it, the
+// claim records it, and (#4641, ADR-112 residual H3) the forge dispatch is
+// PINNED to it, so the head the fold judged is the only head that can merge. A
+// pinned dispatch the forge refuses for a head mismatch is
+// mergeDispatchHeadMoved. Empty (an ungated D7 admit, a merged PR) keeps the
+// findHeadSHA resolution, claims at "unresolved" (the claim is run-scoped) and
+// dispatches unpinned.
 func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, liveHead string) (mergeDispatchOutcome, string, error) {
 	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
 	// The admitted set is the SHARED acceptanceGateAdmitsMerge predicate (E66.37
@@ -741,11 +777,14 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 			return mergeDispatchAlreadyClaimed, gateState, nil
 		}
 	}
-	merr := merger.MergePullRequest(ctx, runRow)
+	merr := merger.MergePullRequest(ctx, runRow, liveHead)
 	if merr != nil && claimed {
 		// Ruling R1: release when the forge applied nothing, else
 		// dispatch_failed; recorded on a non-cancellable bounded context.
 		s.settleMergeDispatchClaim(ctx, ledger, claim, merr)
+	}
+	if liveHead != "" && errors.Is(merr, forge.ErrMergeConflict) {
+		return mergeDispatchHeadMoved, gateState, merr
 	}
 	return mergeDispatchMerged, gateState, merr
 }

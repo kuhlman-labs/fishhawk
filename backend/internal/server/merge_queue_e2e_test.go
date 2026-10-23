@@ -30,21 +30,24 @@ import (
 // POST /v0/runs/{id}/merge, the real Postgres queue, the real D1 merge-dispatch
 // ledger (merge_dispatch_claims), the mcq fake GitHub and merge-on-pass. They
 // reuse the mqmWorld fixture read-only and wrap its merger so the inline
-// (unpinned) dispatch is countable and can fail.
+// (auto-merge, pinned to the gate head since #4641) dispatch is countable and
+// can fail.
 
 // mqeMerger wraps the recording pinned merger with a countable, failable
 // inline MergePullRequest (it models auto-merge: it never merges the PR).
 type mqeMerger struct {
 	*mqmMerger
-	mu         sync.Mutex
-	inlineErr  error
-	inlineN    int
-	inlineHook func(ctx context.Context) error
+	mu          sync.Mutex
+	inlineErr   error
+	inlineN     int
+	inlineHeads []string
+	inlineHook  func(ctx context.Context) error
 }
 
-func (m *mqeMerger) MergePullRequest(ctx context.Context, _ *run.Run) error {
+func (m *mqeMerger) MergePullRequest(ctx context.Context, _ *run.Run, head string) error {
 	m.mu.Lock()
 	m.inlineN++
+	m.inlineHeads = append(m.inlineHeads, head)
 	err, hook := m.inlineErr, m.inlineHook
 	m.mu.Unlock()
 	if hook != nil {
@@ -57,6 +60,13 @@ func (m *mqeMerger) inlineCalls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.inlineN
+}
+
+// inlinePins returns the head each inline dispatch was pinned to (#4641).
+func (m *mqeMerger) inlinePins() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.inlineHeads...)
 }
 
 // newMQEWorld is an mqmWorld whose GateMerger is an mqeMerger.
@@ -359,6 +369,109 @@ func TestMergeQueueE2E_InlineChecksPendingThenRetryMerges(t *testing.T) {
 	}
 }
 
+// mqeErrorDetails decodes an error body's code, message and details.
+func mqeErrorDetails(t *testing.T, body []byte) (code, msg string, details map[string]any) {
+	t.Helper()
+	var env struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Message string         `json:"message"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(body, &env); err != nil {
+		t.Fatalf("decode: %v: %s", err, body)
+	}
+	return env.Error.Code, env.Error.Message, env.Error.Details
+}
+
+// TestMergeQueueE2E_InlineDispatchPinsGateHead pins (#4641) that the inline
+// dispatch is PINNED to gate.HeadSHA, the head the merge-candidate gate
+// admitted and the claim records. Counterfactual: passing "" at the
+// merge_run.go call site records an empty pin, RED.
+func TestMergeQueueE2E_InlineDispatchPinsGateHead(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.verified("pin", "h1")
+	if resp := w.mergeRun(r); resp.Code != http.StatusOK {
+		t.Fatalf("merge = %d %s, want 200", resp.Code, resp.Body.String())
+	}
+	if got := m.inlinePins(); len(got) != 1 || got[0] != "h1" {
+		t.Fatalf("inline pins = %q, want [h1]", got)
+	}
+}
+
+// TestMergeQueueE2E_InlineHeadMovedRefusalReleasesClaim pins (#4641) the
+// inline head-moved mapping on the real ledger: a pinned dispatch the forge
+// refuses for a head mismatch answers 409 merge_head_moved naming the pinned
+// head and its refusal_basis, RELEASES the claim (no claim row, a
+// merge_dispatch_settled row outcome released at h1) and the next re-invoke
+// claims again. The run is gate-less, so the message names only the admitted
+// head, never an evaluated approval (ruling C2). Only the precheck / rest_sha
+// bases claim "nothing merged"; graphql_reread is hedged (ruling C3).
+// Counterfactual: deleting the merge_head_moved branch answers 502
+// merge_dispatch_failed, RED.
+func TestMergeQueueE2E_InlineHeadMovedRefusalReleasesClaim(t *testing.T) {
+	for _, tc := range []struct {
+		basis      string
+		guaranteed bool
+	}{
+		{githubclient.HeadMismatchPrecheck, true},
+		{githubclient.HeadMismatchRESTSha, true},
+		{githubclient.HeadMismatchGraphQLReread, false},
+		{"", false}, // a leaf that names no basis
+	} {
+		t.Run("basis "+tc.basis, func(t *testing.T) {
+			w, m := newMQEWorld(t)
+			r := w.verified("hm", "h1")
+			cause := fmt.Errorf("pinned enable: %w", forge.ErrMergeConflict)
+			if tc.basis != "" {
+				cause = fmt.Errorf("%w: %w", forge.ErrMergeConflict,
+					&githubclient.HeadMismatchError{Basis: tc.basis, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})
+			}
+			m.mu.Lock()
+			m.inlineErr = cause
+			m.mu.Unlock()
+			resp := w.mergeRun(r)
+			code, msg, d := mqeErrorDetails(t, resp.Body.Bytes())
+			if resp.Code != http.StatusConflict || code != mergeCodeHeadMoved {
+				t.Fatalf("merge = %d %s, want 409 %s", resp.Code, resp.Body.String(), mergeCodeHeadMoved)
+			}
+			wantBasis := tc.basis
+			if wantBasis == "" {
+				wantBasis = mergeHeadMovedBasisUnknown
+			}
+			if d["head_sha"] != "h1" || d["refusal_basis"] != wantBasis || d["next_step"] != "fishhawk_merge_run" || d["run_id"] != r.id.String() {
+				t.Fatalf("details = %v, want head_sha h1, refusal_basis %s, next_step fishhawk_merge_run", d, wantBasis)
+			}
+			if !strings.Contains(msg, "admitted (h1)") || strings.Contains(msg, "approval was evaluated") {
+				t.Fatalf("message = %q, want the admitted head and no evaluated-approval claim (gate-less run)", msg)
+			}
+			if got := strings.Contains(msg, "Nothing merged"); got != tc.guaranteed {
+				t.Fatalf("message claims nothing merged = %v, want %v: %q", got, tc.guaranteed, msg)
+			}
+			if !strings.Contains(msg, "claim was released") || strings.Contains(msg, "dispatch_failed") {
+				t.Fatalf("message = %q, want the released claim named and no dispatch_failed", msg)
+			}
+			if st, _ := w.claim(r); st != "" {
+				t.Fatalf("claim = %q, want released (no row)", st)
+			}
+			settled := w.rows(r, categoryMergeDispatchSettled)
+			if len(settled) != 1 {
+				t.Fatalf("merge_dispatch_settled rows = %d, want 1", len(settled))
+			}
+			if p := w.payload(settled[0]); p["outcome"] != string(mergeDispatchRelease) || p["head_sha"] != "h1" {
+				t.Fatalf("settled payload = %v, want released at h1", p)
+			}
+			m.mu.Lock()
+			m.inlineErr = nil
+			m.mu.Unlock()
+			if resp := w.mergeRun(r); resp.Code != http.StatusOK {
+				t.Fatalf("re-invoke = %d %s, want 200 (the released claim is claimable)", resp.Code, resp.Body.String())
+			}
+		})
+	}
+}
+
 // Ruling R1 test 3 (concern db4a28ac): a request cancelled mid-dispatch still
 // records dispatch_failed (the write runs on a non-cancellable context), so the
 // claim is never stranded as 'dispatched'; a re-invoke is refused (no
@@ -404,7 +517,7 @@ func TestMergeQueueE2E_InlineCancelledRequestLeavesDispatchFailed(t *testing.T) 
 // behind) on a merge.
 type mqeForgePUTMerger struct{ gh *githubclient.Client }
 
-func (mqeForgePUTMerger) MergePullRequest(context.Context, *run.Run) error {
+func (mqeForgePUTMerger) MergePullRequest(context.Context, *run.Run, string) error {
 	return errors.New("the line e2e drives only the head-pinned merge")
 }
 
@@ -843,16 +956,16 @@ func TestMergeQueueE2E_InlineGenericGraphQLErrorLeavesDispatchFailed(t *testing.
 }
 
 // mqeAutoMerger is the inline GateMerger over the production githubclient
-// auto-merge mutation.
+// auto-merge ladder (QueueMerge, #4641), pinned to the head it is handed.
 type mqeAutoMerger struct{ gh *githubclient.Client }
 
-func (m mqeAutoMerger) MergePullRequest(ctx context.Context, runRow *run.Run) error {
+func (m mqeAutoMerger) MergePullRequest(ctx context.Context, runRow *run.Run, head string) error {
 	repo, err := parseRepoOwnerName(runRow.Repo)
 	if err != nil {
 		return err
 	}
-	return m.gh.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo,
-		parsePRNumberFromURL(runRow.PullRequestURL), forge.MergeMethodSquash)
+	return m.gh.QueueMerge(ctx, forge.FromGitHubInstallationID(*runRow.InstallationID), repo,
+		parsePRNumberFromURL(runRow.PullRequestURL), forge.MergeMethodSquash, head)
 }
 
 // TestMergeQueueE2E_InlineUncertainErrorButMergedKeepsClaimDispatched
