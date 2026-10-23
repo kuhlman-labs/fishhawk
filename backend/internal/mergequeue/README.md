@@ -68,7 +68,11 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   - Active entry on ANOTHER base → that entry is `dropped` with
     `ReasonBaseChanged` and a new `held` row is inserted at the new base's
     tail (`EnqueueBaseChanged`, `Dropped` = the old entry). When the dropped
-    entry was live, its base has no live entry now: the caller pumps it.
+    entry was live, its base has no live entry now: the caller pumps it. The
+    new row is a NEW approval-wait episode (ADR-112 R3's no-reset rule applies
+    within one base): it carries no yield marker (unless this call's `Yield`
+    marks it) and no `approval_wait_started_at`; the dropped row keeps its
+    marker as history (`TestEnqueue_BaseChangeStartsNewWaitEpisode`).
   - Yield marker (`Yield *YieldMarker`, ADR-112 R3, the merge_run queue arm):
     an inserted row (`EnqueueInserted`, `EnqueueBaseChanged`) is inserted
     `held` WITH the marker, `yielded_at` = its enqueue instant; a same-base

@@ -2876,10 +2876,14 @@ below); eject/promote and durability are slices 3-4.
   configured: `review_pending`; an unreadable round: `undeterminable`),
   review coverage complete, and when the review stage declares an approval
   gate a LIVE forge approval by an `approvals.members` identity (any live
-  approval when members is empty) — or the D6 approval TRANSFER (§
-  "Merge-on-pass (ADR-093 D3/D6)") — and no reviewer whose latest
+  approval when members is empty) and no reviewer whose latest
   non-comment review is CHANGES_REQUESTED (`changes_requested`, approval
-  gate declared only). A
+  gate declared only). Those approval sub-legs apply to the ENTRY variant
+  and the anchor-less ADMISSION variant (the ADR-092 rebase-path enqueue);
+  an intent-bearing ADMISSION evaluates NO approval, only the ADR-112 R2
+  veto through the forge-approval fold (merge-on-pass's in-lock fold judges
+  the approval and waits, then yields, ADR-112 R3), and the MERGE variant
+  reads no forge review at all. A
   spec that was READ and declares no review stage or no approval gate passes;
   an absent, unreadable or unparseable spec is `undeterminable` (fail
   closed). (b) acceptance merge-eligible and not stale. (c) required checks
@@ -2901,7 +2905,11 @@ below); eject/promote and durability are slices 3-4.
   (a freshly advanced head is legitimately pending; the verify pass is the
   gate there). The entry-aware variants (`mergeQueueAdmissionEligibilityAt`,
   `mergeQueueMergeEligibility`, which requires checks GREEN) take the entry's
-  intent anchor and report `ApprovalBasis` (`live` | `transferred`).
+  intent anchor. `ApprovalBasis` is `live` when the entry or anchor-less
+  admission variant passed leg (a) on a declared gate through a live
+  approval, and `""` otherwise: an intent-bearing admission and the merge
+  variant evaluate no approval (the ADR-093 D6 approval transfer at
+  admission is removed, #4632; merge-on-pass takes the basis from the fold).
 - **Enqueue arm (`merge_run.go::mergeQueueEnqueueArm`, D2).** With
   `Config.MergeQueue` wired, a `merge_base_behind`,
   `merge_candidate_unverified` (`unverified`, or `in_flight` for a run that
@@ -3292,6 +3300,13 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   refusal whose fresh snapshot reads REVIEW_REQUIRED, CHANGES_REQUESTED or
   BLOCKED; a null reviewDecision is row 5's eject) yields
   `forge_review_required` with the claim released.
+- **Base change (first-officer ruling D).** A base change ends the
+  approval-wait episode. The row re-enters the new base's FIFO at the tail,
+  unmarked, with a fresh approval_wait_started_at. R3's no-reset rule applies
+  within one base. (The store's base-change arm drops the old row
+  `base_changed` and inserts a new one, so neither the marker nor the wait
+  anchor crosses; a same-base head move keeps both, approval condition C2.
+  `TestEnqueue_BaseChangeStartsNewWaitEpisode`.)
 - **Admission.** An intent-bearing admission evaluates no approval leg; it
   keeps the review-round / coverage legs and runs the R2 veto through the
   fold. Row 1 first: a determined non-approval ineligibility drops as before,
@@ -3310,8 +3325,14 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   refuses and writes nothing.
 - **Re-probe (`merge_queue_yield_reprobe.go`).** `RunMergeQueueYieldReprobe`
   ticks at `MergeCandidateQueuePumpInterval` beside the pump. Per base it
-  re-probes AT MOST ONE row, the oldest due under the stateless backoff
-  `yieldReprobeDue(yield age, interval)`. The fold runs at the anchored head
+  re-probes AT MOST ONE row, the oldest due by `(yielded_at, id)` under the
+  exponential backoff `yieldReprobeDue(yield age, since, interval)`: points
+  at interval·2^k up to 16 intervals, then every 16 intervals, and a row is
+  due when a point fell since THIS process's previous sweep, `(age − since,
+  age]` (`(0, age]` on the first sweep after start). The window is the actual
+  time since the previous sweep, so a sweep that overran its tick (dropped
+  ticks) never skips a point and no row past the cap starves on a
+  tick-parity stride (concern 8b3f29f5). The fold runs at the anchored head
   with no store transaction open: approved AND the ONE clear predicate
   `mergeQueueYieldClears` holds → `ClearYield` (CAS on
   `anchored_head_sha` and `yielded_at`) → `merge_queue_yield_cleared` → a
@@ -3373,7 +3394,8 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   (`mergeQueueYieldRemedy`), never the detail. MCP: the three mirrors in
   `mcpserver/client.go` carry the five fields, and `next_actions`'
   `foldMergeQueueYield` adds the remedy per `next_step` (`approve_pr`,
-  `dismiss_review`, `retry_after` → `fishhawk_merge_run`,
+  `dismiss_review`, `retry_after` → `fishhawk_merge_run` (an already
+  offered `fishhawk_merge_run` is rewritten in place, never duplicated),
   `configure_identity_provider`; `none` adds nothing), built only from the
   closed vocabulary; an out-of-vocabulary `yield_reason` renders generically
   and `yield_detail` never reaches it.

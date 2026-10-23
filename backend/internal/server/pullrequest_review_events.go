@@ -693,9 +693,10 @@ func (s *Server) handlePullRequestReviewSubmitted(ctx context.Context, raw []byt
 // (mergeQueueYieldApprovalTriggers). The payload is a trigger only: the
 // re-probe's fold re-reads the forge and is the sole decision. Best-effort: a
 // queue read error, no entry, an entry that is not yielded or a review at
-// another head does nothing (the sweep still re-probes on its schedule).
+// another head (an absent commit_id included: an anchored head is never
+// empty) does nothing (the sweep still re-probes on its schedule).
 func (s *Server) reprobeMergeQueueYieldOnApproval(ctx context.Context, runID uuid.UUID, commitID string) {
-	if s.cfg.MergeQueue == nil || commitID == "" {
+	if s.cfg.MergeQueue == nil {
 		return
 	}
 	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)

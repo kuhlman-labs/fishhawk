@@ -256,9 +256,12 @@ var mergeQueueYieldReasons = map[string]bool{
 //
 // Placement: INSERTED immediately before the first fishhawk_merge_run when
 // the actions offer one (a plain merge re-invoke only re-probes, so the
-// remedy comes first), else APPENDED. Idempotent: an identical action
-// already present is left alone. A no-op with a nil na or run, on a terminal
-// run, or without a yielded merge_candidate_queue block.
+// remedy comes first), else APPENDED. retry_after's remedy IS a
+// fishhawk_merge_run, so with one already offered its reason and
+// precondition are REWRITTEN in place (never a second fishhawk_merge_run),
+// else it is appended. Idempotent: an identical action already present is
+// left alone. A no-op with a nil na or run, on a terminal run, or without a
+// yielded merge_candidate_queue block.
 func foldMergeQueueYield(run *Run, na *NextActions) {
 	if na == nil || run == nil || runStateIsTerminal(run.State) {
 		return
@@ -289,8 +292,15 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 			Reason: yielded + reason + ")" + rejoin + ". A write-level CHANGES_REQUESTED review vetoes the merge: dismiss it on the forge (or have its author approve), make sure a qualifying approval stands, then re-invoke fishhawk_merge_run to re-probe at once",
 		}
 	case "retry_after":
+		why := yielded + reason + ")" + rejoin + ". The forge-approval read was undetermined or truncated; re-invoking fishhawk_merge_run on the queued entry re-probes now instead of waiting for the periodic re-probe's backoff"
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_merge_run" {
+				na.Actions[i].Reason, na.Actions[i].Precondition = why, precondition
+				return
+			}
+		}
 		action = mergeRunAction(run)
-		action.Reason = yielded + reason + ")" + rejoin + ". The forge-approval read was undetermined or truncated; re-invoking fishhawk_merge_run on the queued entry re-probes now instead of waiting for the periodic re-probe's backoff"
+		action.Reason = why
 	case "configure_identity_provider":
 		action = SuggestedAction{
 			Action: "configure_identity_provider",

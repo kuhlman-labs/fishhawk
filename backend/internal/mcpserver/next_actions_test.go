@@ -7222,6 +7222,25 @@ func TestFoldMergeQueueYield_NoOpsAndPlacement(t *testing.T) {
 	if len(na.Actions) != 3 || na.Actions[1].Action != "approve_pr" || na.Actions[2].Action != "fishhawk_merge_run" {
 		t.Fatalf("actions = %+v, want the remedy inserted once before fishhawk_merge_run", na.Actions)
 	}
+
+	// retry_after's remedy IS fishhawk_merge_run: with one already offered it
+	// is rewritten in place, never duplicated, and a second fold is
+	// idempotent. Counterfactual: inserting the remedy before the existing
+	// fishhawk_merge_run offers two, RED.
+	retry := naYieldedRun("forge_approval_undetermined", "retry_after")
+	na = &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}, mergeRunAction(retry)}}
+	foldMergeQueueYield(retry, na)
+	foldMergeQueueYield(retry, na)
+	merges := 0
+	for _, a := range na.Actions {
+		if a.Action == "fishhawk_merge_run" {
+			merges++
+		}
+	}
+	if merges != 1 || len(na.Actions) != 2 || na.Actions[1].Action != "fishhawk_merge_run" ||
+		!strings.Contains(na.Actions[1].Reason, "forge_approval_undetermined") || !strings.Contains(na.Actions[1].Precondition, "retry_after") {
+		t.Fatalf("retry_after actions = %+v, want exactly one fishhawk_merge_run, rewritten to name the yield", na.Actions)
+	}
 }
 
 // TestFoldMergeQueueYield_UntrustedTextNeverReachesNextActions is approval

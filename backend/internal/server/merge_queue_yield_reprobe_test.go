@@ -21,9 +21,10 @@ import (
 // the real Postgres queue, the real audit repository and the mcq fake forge
 // on the non-Fishhawk fixture repository x/y (ADR-110).
 
-// TestYieldReprobeDue_Table pins the stateless schedule: nothing before one
-// tick, then the doubling points interval·{1,2,4,8,16} (each due on exactly
-// the tick that crosses it), then every 16 ticks.
+// TestYieldReprobeDue_Table pins the schedule for sweeps one interval apart
+// (since = interval): nothing before one tick, then the doubling points
+// interval·{1,2,4,8,16} (each due on exactly the tick that crosses it), then
+// every 16 ticks.
 func TestYieldReprobeDue_Table(t *testing.T) {
 	const i = time.Minute
 	for _, tc := range []struct {
@@ -36,12 +37,69 @@ func TestYieldReprobeDue_Table(t *testing.T) {
 		{8 * i, true}, {9 * i, false}, {15 * i, false}, {16 * i, true}, {17 * i, false},
 		{31 * i, false}, {32 * i, true}, {32*i + 59*time.Second, true}, {33 * i, false}, {48 * i, true},
 	} {
-		if got := yieldReprobeDue(tc.age, i); got != tc.want {
-			t.Errorf("yieldReprobeDue(%s, 1m) = %v, want %v", tc.age, got, tc.want)
+		if got := yieldReprobeDue(tc.age, i, i); got != tc.want {
+			t.Errorf("yieldReprobeDue(%s, since 1m, 1m) = %v, want %v", tc.age, got, tc.want)
 		}
 	}
-	if yieldReprobeDue(time.Hour, 0) {
+	if yieldReprobeDue(time.Hour, time.Hour, 0) {
 		t.Error("a non-positive interval is due")
+	}
+}
+
+// TestYieldReprobeDue_OverrunStridePastTheCapBecomesDue pins the window as
+// the time since the previous sweep (concern 8b3f29f5): sweeps that each
+// overran into a 2x-interval stride, sampling a row past the 16-tick cap at
+// odd-interval ages (19.5, 21.5, ... intervals), still reach the 32-interval
+// point (due at 33.5). A first sweep after start (since 0) judges (0, age], so
+// a row between points (3 intervals: past 1 and 2, before 4) is due, which a
+// one-interval-apart sweep is not. Counterfactual: the fixed one-interval
+// window (age − interval, age] never covers a multiple of 16 on that
+// odd-interval stride, and misses the restart row, RED.
+func TestYieldReprobeDue_OverrunStridePastTheCapBecomesDue(t *testing.T) {
+	const i = time.Minute
+	dueAt := time.Duration(-1)
+	for age := 19*i + 30*time.Second; age <= 19*i+30*time.Second+16*i; age += 2 * i {
+		if yieldReprobeDue(age, 2*i, i) {
+			dueAt = age
+			break
+		}
+	}
+	if dueAt != 33*i+30*time.Second {
+		t.Fatalf("2x-interval stride past the cap: first due at %s, want 33m30s (the 32-interval point)", dueAt)
+	}
+	if !yieldReprobeDue(3*i, 0, i) || yieldReprobeDue(3*i, i, i) {
+		t.Fatal("restart window: want (0, age] due at 3 intervals, and (2, 3] intervals not due")
+	}
+	if yieldReprobeDue(30*time.Second, 0, i) {
+		t.Fatal("a row younger than one interval is due on the first sweep")
+	}
+}
+
+// yieldSweptAgo records this process's previous yield sweep as ago in the
+// past (yieldSweepSince's state), so a sweep judges the window it would after
+// a tick of that length.
+func (s *Server) yieldSweptAgo(ago time.Duration) {
+	s.yieldSweepMu.Lock()
+	defer s.yieldSweepMu.Unlock()
+	s.yieldSweepLast = time.Now().Add(-ago)
+}
+
+// TestMergeQueueYieldSweep_FirstSweepAfterStartProbesAPastPointRow: a fresh
+// process (no previous sweep) finds a yielded row 3 minutes old, between the
+// 2- and 4-minute points, and re-probes it (the window is (0, age]); the
+// approved fold clears it. Counterfactual: the fixed one-interval window
+// (2m, 3m] holds no point, so nothing is probed, RED.
+func TestMergeQueueYieldSweep_FirstSweepAfterStartProbesAPastPointRow(t *testing.T) {
+	w, a, _ := newYieldWorld(t)
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '3 minutes' WHERE run_id = $1 AND state = 'held'`, a.id)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+
+	if n := w.srv.sweepMergeQueueYields(context.Background(), time.Minute); n != 1 {
+		t.Fatalf("first sweep after start re-probed %d rows, want 1", n)
+	}
+	w.srv.bgMergeQueuePump.Wait()
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 1 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1", n)
 	}
 }
 
@@ -365,7 +423,11 @@ func TestMergeQueueYieldSurface_ConcurrentSweepsPostOnce(t *testing.T) {
 
 // TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase: two yielded rows on
 // one base are both due, and the sweep re-probes only the OLDEST by
-// yielded_at (A clears and merges; B stays marked though it is approved too).
+// yielded_at. The fixture makes FIFO order and yield order disagree: A was
+// enqueued first (so it lists first) but carries the YOUNGER yielded_at, so
+// only B, the older yield, clears and A stays marked though it is approved
+// too. Counterfactual: deleting the yieldedBefore comparison takes the first
+// listed due row (A), RED.
 func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	w := newMQELineWorld(t)
 	a := w.seed("a", "a1", []byte(mqeSpecYAML))
@@ -379,9 +441,13 @@ func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	w.pumpBase(a) // A yields; B is admitted and waits
 	w.backdateApprovalWait(b)
 	w.pumpBase(b) // B yields
-	// Both 70s/65s old on the database clock: due at the 1-minute point.
-	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '70 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
-	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '65 seconds' WHERE run_id = $1 AND state = 'held'`, b.id)
+	// A (enqueued first) 65s old, B 70s old, on the database clock: both due
+	// at the 1-minute point, B the older yield.
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '65 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '70 seconds' WHERE run_id = $1 AND state = 'held'`, b.id)
+	if ea, eb := w.active(a), w.active(b); !ea.EnqueuedAt.Before(eb.EnqueuedAt) {
+		t.Fatalf("precondition: A enqueued_at %v, want before B's %v (A lists first)", ea.EnqueuedAt, eb.EnqueuedAt)
+	}
 	w.forgeReviews(a, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "a1"))
 	w.forgeReviews(b, []string{"alice"}, mqmReview(4, "alice", "APPROVED", "b1"))
 
@@ -390,11 +456,11 @@ func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	}
 	w.srv.bgMergeQueuePump.Wait()
 
-	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 1 {
-		t.Fatalf("A cleared rows = %d, want 1 (the oldest due row)", n)
+	if n := len(w.rows(b, CategoryMergeQueueYieldCleared)); n != 1 {
+		t.Fatalf("B cleared rows = %d, want 1 (the oldest due row by yielded_at)", n)
 	}
-	if e := w.active(b); e.YieldedAt == nil || len(w.rows(b, CategoryMergeQueueYieldCleared)) != 0 {
-		t.Fatalf("B = %+v, want still marked (not probed this tick)", e)
+	if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
+		t.Fatalf("A = %+v, want still marked (listed first but the younger yield, not probed this tick)", e)
 	}
 }
 
@@ -495,14 +561,25 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield(t 
 // TestMergeQueueYieldReprobe_ForgeReviewRequiredWebhookWithoutForgeChangeKeepsTheYield
 // (H2): an approved review webhook at the anchored head triggers the targeted
 // re-probe, but the forge still reads BLOCKED, so the shared clear predicate
-// keeps the row yielded and nothing is PUT. Counterfactual: applying the
+// keeps the row yielded and nothing is PUT. The trigger is asserted to have
+// RUN (one pr_approved_on_github row, and exactly one more review-snapshot
+// read: the gate-less fold reads nothing, so it is the predicate's), so a
+// silently dropped trigger cannot pass. Counterfactuals: applying the
 // snapshot check only in the sweep (the webhook path clears on the approved
-// gate-less fold) clears and re-attempts, RED.
+// gate-less fold) clears and re-attempts, RED; dropping the webhook's trigger
+// leaves the snapshot reads unchanged, RED.
 func TestMergeQueueYieldReprobe_ForgeReviewRequiredWebhookWithoutForgeChangeKeepsTheYield(t *testing.T) {
 	w, a, y := newRowFourYieldWorld(t)
+	reads := w.gh.snapshotCalls()
 
 	prReviewYieldWebhook(w, a, "approved", "a1")
 
+	if n := len(w.rows(a, CategoryPRApprovedOnGitHub)); n != 1 {
+		t.Fatalf("pr_approved_on_github rows = %d, want 1 (the webhook reached the trigger)", n)
+	}
+	if n := w.gh.snapshotCalls() - reads; n != 1 {
+		t.Fatalf("review-snapshot reads during the webhook = %d, want 1 (the re-probe's fresh snapshot)", n)
+	}
 	w.requireRowFourKept(a, y)
 	w.requirePuts("a1")
 }

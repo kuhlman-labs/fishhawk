@@ -622,6 +622,9 @@ func TestMergeQueueE2E_GatelessRowFourYieldIsNotReprobedIntoALoop(t *testing.T) 
 	ctx := context.Background()
 
 	for i := range 2 {
+		if i > 0 {
+			w.srv.yieldSweptAgo(time.Hour) // the previous sweep one (hour-long) tick ago
+		}
 		if n := w.srv.sweepMergeQueueYields(ctx, time.Hour); n != 1 {
 			t.Fatalf("sweep %d re-probed %d rows, want 1 (the backdated row is due)", i+1, n)
 		}

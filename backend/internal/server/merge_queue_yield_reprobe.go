@@ -10,8 +10,9 @@ package server
 //     merge_queue_yielded row re-appended, approval condition C7, and one
 //     operator-visible merge_queue_yield_posted row per yield episode, both
 //     under the run's merge-intent lock, approval condition C6), and AT MOST
-//     ONE row per base, the oldest due one, is RE-PROBED on a stateless
-//     exponential schedule over its yielded_at age (yieldReprobeDue).
+//     ONE row per base, the oldest due one, is RE-PROBED on an exponential
+//     schedule over its yielded_at age (yieldReprobeDue), judged over the
+//     time since this process's previous sweep.
 //   - ReprobeMergeQueueYield is the targeted, no-backoff re-probe by run id
 //     (the merge_run re-invoke, which FORCES one re-attempt, and the approval
 //     webhook, which does not, slice 4).
@@ -71,26 +72,49 @@ const (
 )
 
 // yieldReprobeDue reports whether a yielded row of age is due a scheduled
-// re-probe on the tick that observes it: the schedule points are interval·2^k
-// (k = 0..log2 of the cap) and then every cap·interval, and a row is due when
-// a point fell inside the last tick, (age − interval, age]. It is pure (no
-// state: the schedule is the row's own database-clock age), so replicas and
-// restarts need no bookkeeping. A row younger than one tick is never due (the
+// re-probe on the sweep that observes it: the schedule points are
+// interval·2^k (k = 0..log2 of the cap) and then every cap·interval, and a
+// row is due when a point fell since this process's previous sweep, inside
+// (age − since, age]. since <= 0 (no previous sweep: a restart) widens the
+// window to (0, age], so every row past its first point is due once. The
+// window is the ACTUAL time since the previous sweep, not one interval: a
+// sweep that overran its tick (time.Ticker drops ticks while the receiver is
+// busy) never skips a point, so no row past the cap starves on a tick-parity
+// stride. The schedule is the row's own database-clock age and since is a
+// duration on this process's clock (no instants cross the two clocks); only
+// since is process state. A row younger than one interval is never due (the
 // first point is one interval): the decision that yielded it just ran.
-func yieldReprobeDue(age, interval time.Duration) bool {
-	if interval <= 0 {
+func yieldReprobeDue(age, since, interval time.Duration) bool {
+	if interval <= 0 || age < interval {
 		return false
 	}
 	capSpan := interval * mergeQueueYieldReprobeMaxBackoffTicks
-	if age <= capSpan {
-		for p := interval; p <= capSpan; p *= 2 {
-			if p > age-interval && p <= age {
-				return true
-			}
+	last := interval // the latest schedule point <= age
+	if age > capSpan {
+		last = age / capSpan * capSpan
+	} else {
+		for last*2 <= age && last*2 <= capSpan {
+			last *= 2
 		}
-		return false
 	}
-	return (age-capSpan)%capSpan < interval
+	lo := time.Duration(0)
+	if since > 0 && age-since > 0 {
+		lo = age - since
+	}
+	return last > lo
+}
+
+// yieldSweepSince records now as this process's latest yield sweep and
+// returns the time since the previous one (0 before the first).
+func (s *Server) yieldSweepSince(now time.Time) time.Duration {
+	s.yieldSweepMu.Lock()
+	defer s.yieldSweepMu.Unlock()
+	var since time.Duration
+	if !s.yieldSweepLast.IsZero() {
+		since = now.Sub(s.yieldSweepLast)
+	}
+	s.yieldSweepLast = now
+	return since
 }
 
 // RunMergeQueueYieldReprobe sweeps every active base on every interval tick
@@ -113,13 +137,15 @@ func (s *Server) RunMergeQueueYieldReprobe(ctx context.Context, interval time.Du
 }
 
 // sweepMergeQueueYields surfaces every yielded row older than one tick and
-// re-probes at most one due row per base, the oldest by (yielded_at, id). It
-// returns how many rows it re-probed. A list error skips the base (or the
-// sweep); the next tick retries.
+// re-probes at most one due row per base, the oldest by (yielded_at, id),
+// judging due over the time since this process's previous sweep
+// (yieldReprobeDue). It returns how many rows it re-probed. A list error
+// skips the base (or the sweep); the next tick retries.
 func (s *Server) sweepMergeQueueYields(ctx context.Context, interval time.Duration) int {
 	if s.cfg.MergeQueue == nil {
 		return 0
 	}
+	since := s.yieldSweepSince(time.Now())
 	bases, err := s.cfg.MergeQueue.ActiveBases(ctx)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -145,7 +171,7 @@ func (s *Server) sweepMergeQueueYields(ctx context.Context, interval time.Durati
 			if e.YieldAge >= interval { // posted-once age check: a fresh yield is not surfaced yet
 				s.surfaceMergeQueueYield(ctx, e)
 			}
-			if yieldReprobeDue(e.YieldAge, interval) && (due == nil || yieldedBefore(e, *due)) {
+			if yieldReprobeDue(e.YieldAge, since, interval) && (due == nil || yieldedBefore(e, *due)) {
 				due = &e
 			}
 		}

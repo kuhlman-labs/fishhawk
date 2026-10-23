@@ -1273,6 +1273,12 @@ type Server struct {
 	// the loop claimed before SIGTERM finishes inside the drain window rather
 	// than being cut at process exit.
 	bgMergeQueuePump sync.WaitGroup
+	// yieldSweepLast is when THIS process's previous yield sweep started
+	// (sweepMergeQueueYields; zero before the first, ADR-112 R3, #4632): a
+	// row is due when a schedule point fell since then. Process-local, under
+	// yieldSweepMu.
+	yieldSweepMu   sync.Mutex
+	yieldSweepLast time.Time
 
 	// refinementFiling is the detached filing arm's in-process per-draft
 	// single-flight guard and status store (#4153), read by the session

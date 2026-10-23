@@ -2121,6 +2121,56 @@ func TestEnqueue_MarkerlessReanchorPreservesMarker(t *testing.T) {
 	check("MarkMergeIntent", "h3")
 }
 
+// TestEnqueue_BaseChangeStartsNewWaitEpisode (first-officer ruling D,
+// #4632): a base change ENDS the approval-wait episode. A YIELDED row on main
+// (marker set, wait anchor backdated an hour) is re-enqueued on release
+// WITHOUT a Yield marker (the ADR-092 rebase path): the old row is dropped
+// base_changed, and the run's new row lands at release's TAIL (behind a row
+// already held there), UNMARKED, with no approval-wait anchor. R3's no-reset
+// rule applies within one base (TestEnqueue_MarkerlessReanchorPreservesMarker
+// keeps the marker on a same-base head move). Counterfactuals: carrying the
+// marker, or the old approval_wait_started_at, onto the new row, RED.
+func TestEnqueue_BaseChangeStartsNewWaitEpisode(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a := f.run()
+	e := f.enqueue(a, "main", "h1").Entry
+	ahead := f.enqueue(f.run(), "release", "r1").Entry
+	epoch := f.admitAt(e.ID)
+	f.approvalWait(e.ID, epoch, time.Hour)
+	if _, err := f.store.Yield(ctx, e.ID, epoch, YieldMarker{Reason: "forge_approval_absent", Detail: "no approval"}); err != nil {
+		t.Fatalf("Yield: %v", err)
+	}
+	f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = approval_wait_started_at - interval '1 hour' WHERE id = $1`, e.ID)
+	old := f.entry(e.ID)
+	if !old.Yielded() || old.ApprovalWaitStartedAt == nil {
+		t.Fatalf("precondition: %+v, want yielded with a wait anchor", old)
+	}
+
+	res := f.enqueue(a, "release", "h1")
+
+	if res.Outcome != EnqueueBaseChanged || res.Dropped == nil || res.Dropped.ID != e.ID || res.Dropped.State != StateDropped || res.Marked {
+		t.Fatalf("base-change Enqueue = %+v, want EnqueueBaseChanged dropping %s, not marked", res, e.ID)
+	}
+	got := f.entry(res.Entry.ID)
+	if got.ID == e.ID || got.BaseRef != "release" || got.State != StateHeld {
+		t.Fatalf("new row = %+v, want a fresh held row on release", got)
+	}
+	if got.Yielded() || got.YieldReason != "" || got.YieldDetail != "" {
+		t.Fatalf("new row marker = %q/%q yielded_at %v, want unmarked (a new episode)", got.YieldReason, got.YieldDetail, got.YieldedAt)
+	}
+	if got.ApprovalWaitStartedAt != nil && !got.ApprovalWaitStartedAt.After(*old.ApprovalWaitStartedAt) {
+		t.Fatalf("new row wait anchor = %v, want NULL or newer than the old %v", got.ApprovalWaitStartedAt, old.ApprovalWaitStartedAt)
+	}
+	list, err := f.store.ListForBase(ctx, Base{Repo: testRepo, BaseRef: "release"})
+	if err != nil {
+		t.Fatalf("ListForBase(release): %v", err)
+	}
+	if len(list) != 2 || list[0].ID != ahead.ID || list[1].ID != got.ID {
+		t.Fatalf("release line = %+v, want [%s, %s] (the moved row at the tail)", list, ahead.ID, got.ID)
+	}
+}
+
 // TestEnqueue_YieldMarkerNeverOnLiveRow (approval condition C10): seed a LIVE
 // same-base entry, Enqueue it with a Yield marker (and merge intent), and READ
 // BACK yielded_at IS NULL: merge_run never marks the entry holding the line,
