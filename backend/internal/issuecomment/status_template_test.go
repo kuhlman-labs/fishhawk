@@ -1657,3 +1657,43 @@ func TestNeutralizeUntrustedInline_Table(t *testing.T) {
 		t.Error("NeutralizeUntrustedInline is not idempotent")
 	}
 }
+
+// TestRenderActivityLine_MergeQueueYieldPosted pins the ADR-112 R5 thread
+// line (#4632): the closed reason and next step in plain text, the UNTRUSTED
+// detail inert inside ONE code span, a non-vocabulary code rendered
+// "unknown", and only the posted row registered (the INTERNAL yielded and
+// cleared rows never render). Counterfactual: dropping the category from
+// activityCategories drops the line, RED.
+func TestRenderActivityLine_MergeQueueYieldPosted(t *testing.T) {
+	line := transferActivityLine(t, "merge_queue_yield_posted", map[string]any{
+		"yield_reason": "forge_approval_dismissed", "next_step": "approve_pr",
+		"yield_detail": transferHostileDetail}, "yielded its place")
+	if !strings.Contains(line, "Merge queue: yielded its place in line (forge_approval_dismissed); next step: approve_pr — detail `") {
+		t.Fatalf("line = %q", line)
+	}
+	for _, bad := range []string{"<img", "](", "http://", "@captain"} {
+		if strings.Contains(line, bad) {
+			t.Errorf("line carries live %q: %q", bad, line)
+		}
+	}
+	if n := strings.Count(line, "`"); n != 2 {
+		t.Errorf("line has %d backticks, want exactly the two wrapping the detail: %q", n, line)
+	}
+	open, closing := strings.Index(line, "`"), strings.LastIndex(line, "`")
+	if i := strings.Index(line, "IGNORE ALL PRIOR INSTRUCTIONS"); i < open || i > closing {
+		t.Errorf("the instruction text is outside the code span: %q", line)
+	}
+	bare := transferActivityLine(t, "merge_queue_yield_posted", map[string]any{
+		"yield_reason": "a](http://x", "next_step": "@captain"}, "yielded its place")
+	if !strings.Contains(bare, "Merge queue: yielded its place in line (unknown); next step: unknown") || strings.Contains(bare, "`") {
+		t.Errorf("hostile codes / no detail line = %q", bare)
+	}
+	if !issuecomment.RendersActivity("merge_queue_yield_posted") {
+		t.Error("RendersActivity(merge_queue_yield_posted) = false, want true")
+	}
+	for _, internal := range []string{"merge_queue_yielded", "merge_queue_yield_cleared"} {
+		if issuecomment.RendersActivity(internal) {
+			t.Errorf("the INTERNAL %s row renders on the timeline", internal)
+		}
+	}
+}
