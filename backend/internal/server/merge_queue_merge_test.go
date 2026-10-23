@@ -512,45 +512,52 @@ func (w *mqmWorld) requireNoMergeWrites(r *mcqRun) {
 	}
 }
 
-// TestMergeQueueMergeOnPass_ForgeApprovalFoldInterimTable pins ADR-112's
-// interim posture (#4619): a non-approved fold at the verified head DROPS or
-// EJECTS with a named reason and writes nothing.
+// TestMergeQueueMergeOnPass_ForgeApprovalFoldInterimTable (converted from
+// #4619's interim drop/eject table to ADR-112 R3, #4632) pins every
+// non-approved fold at the verified head: vetoed YIELDS immediately (row 2);
+// review_required, dismissed, absent, undetermined and reviews_truncated
+// AWAIT approval at the head (row 3). The decision writes no verdict, no
+// authorization row and no claim; applying it (the pump's outside-the-lock
+// half) leaves an immediate yield HELD and marked with no wait anchor, and a
+// wait LIVE and unmarked with the anchor set. Counterfactual: mapping vetoed
+// to a wait leaves the veto row live with approval_wait_started_at set, RED.
 func TestMergeQueueMergeOnPass_ForgeApprovalFoldInterimTable(t *testing.T) {
 	cases := []struct {
 		name   string
 		plant  func(w *mqmWorld, r *mcqRun)
-		state  mergequeue.State
+		kind   mergeOnPassKind
 		reason string
+		next   string
 	}{
-		{"write veto drops", func(w *mqmWorld, r *mcqRun) {
+		{"write veto yields immediately", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", "h1"), mqmReview(2, "bob", "CHANGES_REQUESTED", "h1"))
-		}, mergequeue.StateDropped, mergeCandidateQueueReasonForgeApprovalVetoed},
-		{"review required drops", func(w *mqmWorld, r *mcqRun) {
+		}, mergeOnPassYield, mergeCandidateQueueReasonForgeApprovalVetoed, forgeApprovalNextDismissReview},
+		{"review required waits", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
 			fx := *w.gh.reviewSnapshot[r.pr]
 			fx.ReviewDecision = "REVIEW_REQUIRED"
 			w.gh.setReviewSnapshot(r.pr, fx)
-		}, mergequeue.StateDropped, mergeCandidateQueueReasonForgeApprovalReviewRequired},
-		{"dismissed ejects", func(w *mqmWorld, r *mcqRun) {
+		}, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalReviewRequired, forgeApprovalNextApprovePR},
+		{"dismissed waits", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h1"))
-		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed},
-		{"read-permission member ejects absent", func(w *mqmWorld, r *mcqRun) {
+		}, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalDismissed, forgeApprovalNextApprovePR},
+		{"read-permission member waits absent", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, nil, mqmReview(1, "alice", "APPROVED", "h1"))
 			w.gh.setPermission("alice", "read", "read")
-		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalAbsent},
+		}, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalAbsent, forgeApprovalNextApprovePR},
 		// The operator's #4619 pin: a CLEAN mergeStateStatus with no reviews is
 		// no shortcut.
-		{"clean merge state and no reviews ejects absent", func(w *mqmWorld, r *mcqRun) {
+		{"clean merge state and no reviews waits absent", func(w *mqmWorld, r *mcqRun) {
 			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{MergeStateStatus: "CLEAN", Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
 			w.mergeable(r, "clean")
-		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalAbsent},
-		{"permission 500 ejects undetermined", func(w *mqmWorld, r *mcqRun) {
+		}, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalAbsent, forgeApprovalNextApprovePR},
+		{"permission 500 waits undetermined", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, nil, mqmReview(1, "alice", "APPROVED", "h1"))
 			w.gh.set(func() { w.gh.permStatus["alice"] = 500 })
-		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalUndetermined},
-		{"truncated listing ejects", func(w *mqmWorld, r *mcqRun) {
+		}, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter},
+		{"truncated listing waits", func(w *mqmWorld, r *mcqRun) {
 			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{Truncated: true, Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
-		}, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalReviewsTruncated},
+		}, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalReviewsTruncated, forgeApprovalNextRetryAfter},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -558,9 +565,29 @@ func TestMergeQueueMergeOnPass_ForgeApprovalFoldInterimTable(t *testing.T) {
 			r, req := w.ready("ft", "h1", mqeSpecYAML)
 			tc.plant(w, r)
 			out := w.decide(req)
-			requireOutcome(t, out, mergeOnPassSettle, tc.reason)
-			if out.State != tc.state || !strings.Contains(out.Detail, "fishhawk_merge_run") || len(out.Detail) > 2000 {
-				t.Fatalf("outcome = %+v", out)
+			requireOutcome(t, out, tc.kind, tc.reason)
+			if out.Yield.Reason != tc.reason || out.Yield.NextStep != tc.next || mergeQueueYieldNextStep(tc.reason) != tc.next || len(out.Yield.Detail) > forgeApprovalDetailMaxBytes {
+				t.Fatalf("outcome yield = %+v, want reason %s next_step %s", out.Yield, tc.reason, tc.next)
+			}
+			w.requireNoMergeWrites(r)
+
+			readvances := 0
+			cont := w.srv.applyMergeOnPassOutcome(context.Background(), req.Entry, out, &readvances)
+			e := w.active(r)
+			if tc.kind == mergeOnPassYield {
+				if !cont || e.State != mergequeue.StateHeld || e.YieldReason != tc.reason || e.YieldedAt == nil || e.ApprovalWaitStartedAt != nil {
+					t.Fatalf("immediate yield applied: continue=%v entry=%+v, want held, marked %s, no wait anchor", cont, e, tc.reason)
+				}
+				if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 1 {
+					t.Fatalf("merge_queue_yielded rows = %d, want 1", n)
+				}
+			} else {
+				if cont || e.State != mergequeue.StateLive || e.YieldedAt != nil || e.ApprovalWaitStartedAt == nil {
+					t.Fatalf("wait applied: continue=%v entry=%+v, want live, unmarked, wait anchor set", cont, e)
+				}
+				if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 {
+					t.Fatalf("merge_queue_yielded rows = %d, want 0 before expiry", n)
+				}
 			}
 			w.requireNoMergeWrites(r)
 		})
@@ -608,7 +635,7 @@ func TestMergeQueueMergeOnPass_TransferredBasis(t *testing.T) {
 	t.Run("unverified advance carries nothing", func(t *testing.T) {
 		w := newMQMWorld(t)
 		r, req := w.transferred(func(r *mcqRun) { w.mqeUnverifiedAdvance(r, "h0", "h1") })
-		requireOutcome(t, w.decide(req), mergeOnPassSettle, mergeCandidateQueueReasonForgeApprovalAbsent)
+		requireOutcome(t, w.decide(req), mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalAbsent)
 		w.requireNoMergeWrites(r)
 	})
 }
@@ -807,14 +834,17 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 		{name: "405 ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
 			kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, released: 1},
 		// ADR-112 R3 rows 4/5: only REVIEW_REQUIRED, CHANGES_REQUESTED or
-		// BLOCKED select forge_review_required; the default null decision
-		// (row above) and a snapshot read error are forge_merge_refused.
-		{name: "405 review required ejects forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
-			decision: "REVIEW_REQUIRED", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeReviewRequired, released: 1},
-		{name: "422 changes requested ejects forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrMergeUnprocessable),
-			decision: "CHANGES_REQUESTED", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeReviewRequired, released: 1},
-		{name: "405 blocked ejects forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
-			mergeState: "BLOCKED", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeReviewRequired, released: 1},
+		// BLOCKED select row 4 — YIELD forge_review_required, next_step
+		// approve_pr, the claim released; the default null decision (row
+		// above) and a snapshot read error are row 5, eject forge_merge_refused.
+		// Counterfactual: treating a null reviewDecision as review-required
+		// yields the "null decision and clean state" row, RED.
+		{name: "405 review required yields forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			decision: "REVIEW_REQUIRED", kind: mergeOnPassYield, reason: mergeQueueYieldForgeReviewRequired, released: 1},
+		{name: "422 changes requested yields forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrMergeUnprocessable),
+			decision: "CHANGES_REQUESTED", kind: mergeOnPassYield, reason: mergeQueueYieldForgeReviewRequired, released: 1},
+		{name: "405 blocked yields forge_review_required", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			mergeState: "BLOCKED", kind: mergeOnPassYield, reason: mergeQueueYieldForgeReviewRequired, released: 1},
 		{name: "405 null decision and clean state ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
 			mergeState: "CLEAN", kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonForgeMergeRefused, released: 1},
 		{name: "405 snapshot read error ejects forge_merge_refused", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
@@ -844,6 +874,10 @@ func TestMergeQueueMergeOnPass_ForgeErrors(t *testing.T) {
 			}
 			out := w.decide(req)
 			requireOutcome(t, out, tc.kind, tc.reason)
+			if tc.kind == mergeOnPassYield && (out.Yield.NextStep != forgeApprovalNextApprovePR || out.Yield.Row != mergeQueueYieldRowForgeRefusal ||
+				!strings.Contains(out.Yield.Detail, "reviewDecision")) {
+				t.Fatalf("row-4 yield = %+v, want next_step approve_pr, precedence row 4", out.Yield)
+			}
 			if n := len(w.rows(r, CategoryMergeQueueMerged)); (n == 1) != (tc.kind == mergeOnPassMerged) {
 				t.Fatalf("merge_queue_merged rows = %d for outcome %s", n, tc.kind)
 			}

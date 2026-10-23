@@ -510,31 +510,71 @@ func TestMergeQueueE2E_BaseMovesBetweenPassAndMergeReadvances(t *testing.T) {
 	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
 }
 
-// TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues: under a
-// review approval gate the head of line's in-lock forge-approval fold (ADR-112)
-// reads its only review DISMISSED, so merge-on-pass ejects it
-// forge_approval_dismissed (no claim, no PUT, no verdict) and the line
-// continues: the next entry, approved by a write-level member, merges in the
-// same pump. The entry and admission variants keep their REST legs, so both
-// PRs carry a REST approval that admits them.
+// requireYielded asserts r's active entry is HELD and yielded with reason, its
+// merge_queue_yielded row naming next and site, and returns the entry.
+func (w *mqmWorld) requireYielded(r *mcqRun, reason, next, site string) mergequeue.Entry {
+	w.t.Helper()
+	e := w.active(r)
+	if e.State != mergequeue.StateHeld || e.YieldedAt == nil || e.YieldReason != reason {
+		w.t.Fatalf("run %s entry = %s yielded_at=%v reason=%q, want held and yielded %s", r.id, e.State, e.YieldedAt, e.YieldReason, reason)
+	}
+	rows := w.rows(r, CategoryMergeQueueYielded)
+	if len(rows) != 1 {
+		w.t.Fatalf("merge_queue_yielded rows = %d, want 1", len(rows))
+	}
+	if p := w.payload(rows[0]); p["yield_reason"] != reason || p["next_step"] != next || p["site"] != site || p["entry_id"] != e.ID.String() {
+		w.t.Fatalf("merge_queue_yielded payload = %v, want reason %s next_step %s site %s", p, reason, next, site)
+	}
+	return e
+}
+
+// backdateApprovalWait moves r's active entry's approval_wait_started_at two
+// hours into the past (the database clock's own value, so no cross-clock
+// seed): past the default 30-minute window.
+func (w *mqmWorld) backdateApprovalWait(r *mcqRun) {
+	w.t.Helper()
+	w.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = approval_wait_started_at - interval '2 hours'
+WHERE run_id = $1 AND state IN ('held', 'live') AND approval_wait_started_at IS NOT NULL`, r.id)
+	if e := w.active(r); e.ApprovalWaitStartedAt == nil {
+		w.t.Fatalf("run %s has no approval wait anchor to backdate", r.id)
+	}
+}
+
+// TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues (converted
+// to ADR-112 R3, #4632): under a review approval gate the head of line's
+// in-lock fold reads its only review DISMISSED, so merge-on-pass WAITS at the
+// head: A stays live with its approval-wait anchor, nothing else is admitted
+// and nothing is PUT. Once the anchor is past the window, the next pump
+// YIELDS A (held, marked forge_approval_dismissed, next_step approve_pr; no
+// claim, no verdict, no authorization) and CONTINUES in the SAME pump: B,
+// approved by a write-level member, is admitted and merges. Counterfactual
+// (CF4): the pump stopping after a yield leaves B held behind A with no b1
+// PUT, RED — only the same pump's continuation can admit B here.
 func TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues(t *testing.T) {
 	w := newMQELineWorld(t)
 	a := w.seed("a", "a1", []byte(mqeSpecYAML))
 	b := w.seed("b", "b1", []byte(mqeSpecYAML))
 	w.mqpHeldIntent(a, "a1", false)
 	w.mqpHeldIntent(b, "b1", false)
-	w.gh.set(func() {
-		w.gh.reviews[a.pr] = mqeApprovedBy("alice")
-		w.gh.reviews[b.pr] = mqeApprovedBy("alice")
-	})
 	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
 	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "b1"))
 
 	w.pumpBase(a)
 
-	w.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonForgeApprovalDismissed)
+	if e := w.active(a); e.State != mergequeue.StateLive || e.YieldedAt != nil || e.ApprovalWaitStartedAt == nil {
+		t.Fatalf("A after the first pump = %s yielded_at=%v wait=%v, want live, waiting at the head", e.State, e.YieldedAt, e.ApprovalWaitStartedAt)
+	}
+	if e := w.storeEntry(b); e.State != mergequeue.StateHeld {
+		t.Fatalf("B while A waits = %s, want held (no re-admission during the wait)", e.State)
+	}
+	w.requirePuts()
+
+	w.backdateApprovalWait(a)
+	w.pumpBase(a)
+
+	w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalDismissed, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
 	if n := w.claims(a); n != 0 {
-		t.Fatalf("A claims = %d, want 0 (ejected before any dispatch)", n)
+		t.Fatalf("A claims = %d, want 0 (yielded before any dispatch)", n)
 	}
 	if n := len(w.rows(a, CategoryMergeVerdictRecorded)) + len(w.rows(a, CategoryMergeQueueAuthorized)); n != 0 {
 		t.Fatalf("A verdict/authorization rows = %d, want 0", n)
@@ -543,10 +583,11 @@ func TestMergeQueueE2E_ForgeApprovalDismissedEjectsAndLineContinues(t *testing.T
 	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
 }
 
-// TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired is the
-// gate-less twin: no fold read, so A reaches the pinned merge; the forge
-// refuses it (405), the post-refusal snapshot reads BLOCKED, and A ejects
-// forge_review_required (ADR-112 R3 row 4, temporary until #4632) while B
+// TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired (converted to
+// ADR-112 R3 row 4, #4632) is the gate-less twin: no fold read, so A reaches
+// the pinned merge; the forge refuses it (405, a typed RELEASE outcome), the
+// claim is released, the post-refusal snapshot reads BLOCKED, and A YIELDS
+// forge_review_required with next_step approve_pr (never ejects) while B
 // still merges in the same pump.
 func TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired(t *testing.T) {
 	w := newMQELineWorld(t)
@@ -559,9 +600,93 @@ func TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired(t *testing.T) 
 
 	w.pumpBase(a)
 
-	w.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonForgeReviewRequired)
+	w.requireYielded(a, mergeQueueYieldForgeReviewRequired, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
+	if n := w.claims(a); n != 0 {
+		t.Fatalf("A claims = %d, want 0 (the typed refusal released it)", n)
+	}
 	w.requirePuts("a1", "b1")
 	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance (CF1's e2e vehicle):
+// A waits at the head with no forge approval; its anchor is backdated past the
+// window BEFORE the base moves, so the next pump READVANCES A (Unadmit), the
+// re-admission advances it onto the moved base (a2) and the runner's pass
+// there brings it back to merge-on-pass. Only a PRESERVED anchor makes that
+// post-readvance decision yield; an anchor reset by Unadmit or the
+// re-admission would start a fresh wait and leave A live, RED.
+func TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.forgeReviews(a, nil)
+	w.gh.set(func() { w.gh.mergeSHA[a.branch] = "a2" })
+
+	w.pumpBase(a)
+	first := w.active(a)
+	if first.State != mergequeue.StateLive || first.ApprovalWaitStartedAt == nil {
+		t.Fatalf("A after the first pump = %+v, want live and waiting", first)
+	}
+
+	w.backdateApprovalWait(a)
+	w.gh.set(func() { w.gh.behind["a1"] = []string{"base-x"} })
+	w.pumpBase(a)
+	if e := w.active(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" || e.YieldedAt != nil {
+		t.Fatalf("A after the readvance = %s at %s yielded_at=%v, want live at a2, unmarked", e.State, e.AnchoredHeadSHA, e.YieldedAt)
+	}
+
+	w.passAt(a, "a2")
+
+	e := w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalAbsent, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
+	if e.ApprovalWaitStartedAt == nil || !e.ApprovalWaitStartedAt.Before(first.ApprovalWaitStartedAt.Add(-time.Hour)) {
+		t.Fatalf("A's wait anchor = %v, want the backdated original (first %v minus 2h)", e.ApprovalWaitStartedAt, first.ApprovalWaitStartedAt)
+	}
+	w.requirePuts()
+}
+
+// TestMergeQueueE2E_AdmissionVetoYieldsAndLineContinues pins ADR-112 R3's
+// admission precedence (approval condition C5): an intent-bearing entry whose
+// ONLY ineligibility is a write-level CHANGES_REQUESTED (row 2) YIELDS at its
+// admission (held, marked forge_approval_vetoed, next_step dismiss_review,
+// site admission) and the pump continues to B, which merges; the SAME veto
+// beside a determined non-approval reason (row 1: a high concern) drops
+// not_merge_eligible as before. Counterfactuals: returning no veto from the
+// admission check admits A (no yield row), RED; yielding on any reason set
+// containing the veto yields the co-occurrence case instead of dropping, RED.
+func TestMergeQueueE2E_AdmissionVetoYieldsAndLineContinues(t *testing.T) {
+	t.Run("veto alone yields", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := w.seed("a", "a1", []byte(mqeSpecYAML))
+		b := w.seed("b", "b1", []byte(mqeSpecYAML))
+		w.mqpHeldIntent(a, "a1", false)
+		w.mqpHeldIntent(b, "b1", false)
+		w.forgeReviews(a, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", "a1"), mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
+		w.forgeReviews(b, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "b1"))
+
+		w.pumpBase(a)
+
+		e := w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalVetoed, forgeApprovalNextDismissReview, mergeQueueYieldSiteAdmission)
+		if !strings.Contains(e.YieldDetail, "bob") {
+			t.Fatalf("A yield detail = %q, want the vetoing reviewer named", e.YieldDetail)
+		}
+		w.requirePuts("b1")
+		w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	})
+	t.Run("veto beside a blocking concern drops", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := w.seed("a", "a1", []byte(mqeSpecYAML))
+		w.mqpHeldIntent(a, "a1", false)
+		w.forgeReviews(a, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", "a1"), mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
+		w.raiseConcern(a, "high", "")
+
+		w.pumpBase(a)
+
+		w.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible)
+		if n := len(w.rows(a, CategoryMergeQueueYielded)); n != 0 {
+			t.Fatalf("merge_queue_yielded rows = %d, want 0 (row 1 drops before row 2)", n)
+		}
+		w.requirePuts()
+	})
 }
 
 // mqeEnqueueOnLock enqueues a HELD intent entry the first time the run's
