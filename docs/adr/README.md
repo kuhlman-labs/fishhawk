@@ -348,6 +348,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-119: `amends: [ADR-042]` ("It amends ADR-042: fix-up session resume is permitted on the local runner only under these rules"); ADR-042 gains `amended_by: [ADR-119]`. Per ADR-119 D7, ADR-042's tracker body now names `runner/cmd/fishhawk-runner/fixupresume.go` and `runner/internal/agent/claudecode/**`, and its `applies_to` matches ADR-119's, so a change to resume selects both records (`Select` follows amendments forward only).
 - ADR-120: `amends: [ADR-084, ADR-113]` ("It amends ADR-084 (D4 and rule 4's whole-index injection) and ADR-113 (D4's live index-size checks and frozen-tree contents)"); both gain `amended_by: [ADR-120]`. Its `applies_to` names the paths its Record metadata states.
 - ADR-090: its tracker body (#4170) now carries the in-body "Amendment 1 (2026-10-14)" the record already held, so the record is again a verbatim transcription.
+- ADR-109: its tracker body (#4601) gained "## Amendment A1 (2026-10-23)" (ratified by the Captain), an in-body amendment of its own ledger rules (an orphaned queue dispatch claim is released on forge evidence), so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
