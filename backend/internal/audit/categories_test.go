@@ -877,3 +877,18 @@ func TestKnownCategories_MergeQueueEjectedPromoted(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_MergeQueueResumed pins the E87.7 / #4298 (ADR-093 D8)
+// registration: the restart resume appends merge_queue_resumed before every
+// action it takes on a live head-of-line entry
+// (server/merge_queue_resume_verifying.go). An unregistered category reddens
+// TestKnownCategoriesCoversEmittedCategories and is un-awaitable through
+// fishhawk_await_audit. The row is run-bound-readable under ADR-106 (its
+// payload carries only its own run's ids, pinned server-side by
+// TestMergeQueueResumed_PayloadCarriesOnlyOwnRun); the ADR-106 registry flag
+// that will classify it does not exist yet (E89).
+func TestKnownCategories_MergeQueueResumed(t *testing.T) {
+	if !IsKnownCategory("merge_queue_resumed") {
+		t.Fatal("merge_queue_resumed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
