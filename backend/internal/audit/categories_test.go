@@ -863,3 +863,17 @@ func TestKnownCategories_MergeQueueYield(t *testing.T) {
 		}
 	}
 }
+
+// TestKnownCategories_MergeQueueEjectedPromoted pins the E87.6 / #4297
+// (ADR-093 D4/D7) categories: merge_queue_ejected, the ONE ejection record per
+// ejected merge-queue entry (server/merge_queue_eject.go), and the FORWARD
+// registration merge_queue_promoted, the promote verb's in-transaction row. An
+// unregistered category reddens TestKnownCategoriesCoversEmittedCategories
+// and is un-awaitable through fishhawk_await_audit.
+func TestKnownCategories_MergeQueueEjectedPromoted(t *testing.T) {
+	for _, c := range []string{"merge_queue_ejected", "merge_queue_promoted"} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
+	}
+}

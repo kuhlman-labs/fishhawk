@@ -3236,3 +3236,38 @@ func TestMCQFake_ReviewSnapshotAndPermissionRoutes(t *testing.T) {
 		t.Errorf("permission calls for writer = %d, want 2", n)
 	}
 }
+
+// Mode (4), ADR-093 slice 3 (#4297): an auto-advance conflict ejects
+// advance_conflict, records ONE merge_queue_ejected row handing off to the
+// conflict-resolution path by NAMING fishhawk_rebase_run_branch, and admits the
+// next held entry. The hand-off is named, never auto-started: no
+// stage_conflict_resolution_triggered row.
+func TestAdmission_AdvanceConflictEjectsNamingRebase(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b, c := f.waveABC()
+	f.gh.set(func() {
+		f.gh.behind["b1"] = []string{"base-x"}
+		f.gh.mergeStatus[b.branch] = http.StatusConflict
+	})
+	f.closePR(a, true)
+	f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonAdvanceConflict)
+	f.oneEjection(b, mergeCandidateQueueReasonAdvanceConflict, mergeQueueEjectNextRebaseRunBranch)
+	f.requireState(c, mergequeue.StateLive, "")
+	if n := len(f.rows(b, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Fatalf("stage_conflict_resolution_triggered rows = %d, want 0 (the hand-off is named, not started)", n)
+	}
+}
+
+// Mode (6): a pass that cannot start ejects pass_not_startable and records
+// ONE row naming fishhawk_get_run_status.
+func TestAdmission_PassNotStartableRecordsEjection(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.setStage(b.impl.ID, run.StageStateRunning)
+	f.closePR(a, true)
+	f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonPassNotStartable)
+	p := f.oneEjection(b, mergeCandidateQueueReasonPassNotStartable, mergeQueueEjectNextGetRunStatus)
+	if _, ok := p["fixup_routed"]; ok {
+		t.Fatalf("a non-verify ejection carries fixup_routed: %v", p)
+	}
+}

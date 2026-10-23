@@ -2236,7 +2236,9 @@ const mergeCandidateRunnerSubject = "runner"
 //     the gate it held BEFORE the pass and calls Orchestrator.Advance.
 //  4. On `passed` only, republishAuditCheckOnMergeCandidateVerdict force-
 //     publishes fishhawk_audit_complete AT the verified head (#4397).
-//  5. On `failed` only, routeMergeCandidateFailure applies D6.
+//  5. On `failed` only, routeMergeCandidateFailure applies D6; when the
+//     verdict ejected the run's queue entry, its merge_queue_ejected row is
+//     written after the route, carrying fixup_routed and the refusal.
 func (s *Server) succeedMergeCandidateVerifiedStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, actorKind audit.ActorKind, actorSubject *string) {
 	ctx := r.Context()
@@ -2319,6 +2321,13 @@ func (s *Server) succeedMergeCandidateVerifiedStage(w http.ResponseWriter, r *ht
 			resp.FixupRefusal = "the run could not be read (" + gerr.Error() + "), so no fix-up was routed. " + mergeCandidateFixupRoute
 		} else {
 			resp.FixupRouted, resp.FixupRefusal = s.routeMergeCandidateFailure(ctx, runRow, stageID, &rec.Trigger)
+		}
+		if rec.Ejected != nil {
+			// ADR-093 D4 (#4297): the verdict hook ejected the live entry and
+			// deferred its ONE merge_queue_ejected row to here, AFTER the D6
+			// route, so the row states what D6 actually did.
+			routed := resp.FixupRouted
+			s.writeMergeQueueEjected(ctx, *rec.Ejected, mergeQueueEjection{FixupRouted: &routed, Refusal: resp.FixupRefusal})
 		}
 		if !resp.FixupRouted {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
