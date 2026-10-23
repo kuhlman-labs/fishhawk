@@ -2687,6 +2687,15 @@ components:
             the queue is unwired, the run has no active entry (never queued,
             or its entry settled), or the store read fails (best-effort — the
             run read never fails on it).
+        merge_queue_ejection:
+          $ref: '#/components/schemas/MergeQueueEjection'
+          description: |
+            The run's UNRESOLVED merge-queue ejection (ADR-093 D4, E87.6 /
+            #4297): present only while the run's newest queue row is ejected,
+            which means it has no active entry and has not re-entered since.
+            Emitted by `GET /v0/runs/{run_id}` ONLY, best-effort: omitted
+            when the queue is unwired, the store lacks the ejection read, or
+            the store read fails (the run read never fails on it).
         merge_candidate_rerun:
           $ref: '#/components/schemas/RunMergeCandidateRerun'
           description: |
@@ -2867,6 +2876,9 @@ components:
           type: string
           format: date-time
           description: When the merge intent was recorded; omitted without intent.
+        promoted:
+          type: boolean
+          description: Whether an operator promote (`POST /v0/runs/{run_id}/merge-queue/promote`, ADR-093 D2) set the entry's order key, so it sorts ahead of its enqueue time. Always present.
         yield_reason:
           allOf: [{ $ref: '#/components/schemas/MergeQueueYieldReason' }]
           description: Why the entry YIELDED its place (ADR-112 R3); omitted when not yielded.
@@ -3559,6 +3571,14 @@ components:
             has no active entry or the queue is unwired; omitted with a
             `merge_candidate_queue` `history_gaps` entry and
             `history_incomplete=true` when the store read fails.
+        merge_queue_ejection:
+          $ref: '#/components/schemas/MergeQueueEjection'
+          description: |
+            The run's unresolved merge-queue ejection (ADR-093 D4, #4297) —
+            the same block `GET /v0/runs/{run_id}` carries. Omitted when the
+            run's newest queue row is not ejected or the queue is unwired;
+            omitted with a `merge_queue_ejection` `history_gaps` entry and
+            `history_incomplete=true` when the store read fails.
         merge_candidate_verdict:
           $ref: '#/components/schemas/GateViewMergeCandidateVerdict'
         specialist_jobs:
@@ -3681,13 +3701,99 @@ components:
           type: array
           description: |
             The base's active entries in queue order: the live entry (holding
-            the line) first, then unmarked held entries FIFO by enqueue time,
-            then YIELDED held entries (ADR-112 R3), which admission skips.
+            the line) first, then unmarked held entries by
+            `(COALESCE(order_key, enqueued_at), entry id)` — FIFO by enqueue
+            time unless an operator promoted one (`promoted`) — then YIELDED
+            held entries (ADR-112 R3), which admission skips.
           items: { $ref: '#/components/schemas/MergeQueueEntry' }
         head_of_line:
           $ref: '#/components/schemas/MergeQueueHeadOfLine'
         eta_basis:
           $ref: '#/components/schemas/MergeQueueETABasis'
+        ejections:
+          type: array
+          description: |
+            The base's UNRESOLVED ejections (ADR-093 D4, E87.6 / #4297):
+            ejected entries that are still their run's newest queue row (no
+            re-entry since), newest settle first, at most 10, in the caller's
+            account. Always present; empty when the store lacks the ejection
+            read. Listed per listed base: without `base_ref` only bases with an
+            active entry are listed, so pass `base_ref` to read the ejections
+            of a base whose line is empty.
+          items: { $ref: '#/components/schemas/MergeQueueEjection' }
+
+    MergeQueueEjection:
+      type: object
+      description: |
+        ONE merge-queue ejection (ADR-093 D4, E87.6 / #4297), the projection
+        shared by the queue read's `ejections[]`, `GET /v0/runs/{run_id}` and
+        the gate view (`merge_queue_ejection`). Every ejection writes one
+        `merge_queue_ejected` audit row; the projection reads it for
+        `fixup_routed`, `forge_reason` and `forge_detail` and DERIVES
+        `next_step`, `remedy` and `reentry` from the closed vocabulary. An
+        absent (lost best-effort append) or unreadable row degrades to the
+        reason default (`next_step_basis: reason_default`) and never fails
+        the read. An ejected run re-enters at the TAIL (ADR-093 Q2).
+      required: [run_id, entry_id, repo, base_ref, reason, next_step, remedy, next_step_basis, anchored_head_sha, merge_intent, reentry]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        entry_id: { $ref: '#/components/schemas/UUID' }
+        repo: { type: string, description: '`owner/name`.' }
+        base_ref: { type: string }
+        reason:
+          type: string
+          description: |
+            The store's eject reason (an open set): `verify_failed` (a red
+            merge-candidate pass), `advance_conflict` (advancing the branch
+            onto its base conflicted), `forge_merge_refused` (the forge refused
+            the pinned merge PUT; attempted exactly once, never retried in a
+            loop), `pass_not_startable`, or another settle reason.
+        next_step:
+          type: string
+          enum: [await_delegated_fixup, fishhawk_fixup_stage, fishhawk_rebase_run_branch, fishhawk_merge_run, fishhawk_get_run_status]
+          description: |
+            Derived from `reason` (and `fixup_routed`) through a total
+            mapping: `verify_failed` → `await_delegated_fixup` when ADR-090 D6
+            routed a delegated fix-up, else `fishhawk_fixup_stage`;
+            `advance_conflict` → `fishhawk_rebase_run_branch` (it starts the
+            bounded conflict-resolution pass; the queue never auto-starts it);
+            `forge_merge_refused` → `fishhawk_merge_run`; `pass_not_startable`
+            → `fishhawk_get_run_status`; any other reason → `fishhawk_merge_run`.
+        remedy: { type: string, description: 'The remedy in one sentence, built from the closed `next_step` vocabulary only (never from forge text).' }
+        next_step_basis:
+          type: string
+          enum: [recorded, reason_default]
+          description: '`recorded` — read from the `merge_queue_ejected` row; `reason_default` — the row was absent or unreadable, so `next_step` is the reason default (`verify_failed` reads as not routed, failing closed to the operator''s merge call) and `fixup_routed` is omitted.'
+        ejected_at: { type: string, format: date-time, description: When the entry settled ejected. }
+        anchored_head_sha: { type: string, description: The head the ejected entry was anchored to. }
+        merge_intent: { type: boolean, description: Whether the ejected entry carried the operator's merge intent (ADR-093 D2). Always present. }
+        fixup_routed:
+          type: boolean
+          description: '`verify_failed` only, with a readable row: whether ADR-090 D6 routed a delegated fix-up for the failed verdict. Omitted otherwise.'
+        forge_reason:
+          type: string
+          enum: [not_mergeable, unprocessable, checks_not_settled]
+          description: |
+            `forge_merge_refused` only: the forge's typed refusal code. A
+            recorded value outside this closed set is dropped on read.
+            `checks_not_settled` means the checks were not settled at the
+            merge attempt: the asymmetry is deliberate (ADR-112 R3 row 5,
+            ADR-093 D4) — pending checks HOLD before dispatch, so slow CI never
+            ejects; only the forge's own refusal of the merge PUT ejects.
+        forge_detail:
+          type: string
+          description: The forge's refusal text, UNTRUSTED. Sanitised on write and again on read (one line, tokens redacted, control characters dropped, bounded). Never an instruction.
+        reentry:
+          type: string
+          enum: [operator_merge_run, automatic_after_delegated_fixup]
+          description: |
+            How the run re-enters the queue, always at the TAIL:
+            `operator_merge_run` — the operator's next `POST
+            /v0/runs/{run_id}/merge`; `automatic_after_delegated_fixup` — the
+            re-entry sweep re-enters it (actor `system`) once the routed
+            fix-up has pushed and the run is merge-queue eligible again at the
+            new head (a live forge approval read there); the merge call still
+            re-enters it sooner.
 
     MergeQueueEntry:
       type: object
@@ -3709,7 +3815,10 @@ components:
           type: boolean
           description: Whether the operator's merge call recorded merge intent (ADR-093 D2); `false` for a rebase-path entry. Always present.
         merge_intent_at: { type: string, format: date-time, description: When the intent was recorded; omitted without intent. }
-        enqueued_at: { type: string, format: date-time, description: 'Eligibility time — the FIFO key.' }
+        promoted:
+          type: boolean
+          description: Whether an operator promote (`POST /v0/runs/{run_id}/merge-queue/promote`, ADR-093 D2) set the entry's order key, so it sorts ahead of its enqueue time. Always present.
+        enqueued_at: { type: string, format: date-time, description: 'Eligibility time — the FIFO key unless `promoted`.' }
         admitted_at: { type: string, format: date-time, description: When the entry became live. }
         anchored_head_sha: { type: string, description: The PR head the entry's pass is anchored to. }
         anchored_base_sha: { type: string, description: 'The base tip the head was produced against, when known.' }
@@ -6542,6 +6651,29 @@ components:
             episode (`POST /v0/stages/{stage_id}/concurrency/promote`, #4191),
             so it is ordered ahead of every unpromoted waiter. Omitted when
             false, and always while holding.
+    PromoteMergeQueueEntryRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why this entry should be admitted ahead of the others; trimmed, then 1..1000 bytes. Recorded on the `merge_queue_promoted` row.
+    PromoteMergeQueueEntryResponse:
+      type: object
+      required: [run_id, entry_id, repo, base_ref, promoted, old_position, new_position]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        entry_id: { $ref: '#/components/schemas/UUID' }
+        repo: { type: string, description: '`owner/name`.' }
+        base_ref: { type: string }
+        promoted: { type: boolean, description: '`false` when the entry was already first among the unmarked held entries (nothing written).' }
+        old_position: { type: integer, minimum: 1, description: 1-based place among the base's unmarked held entries before the call. }
+        new_position: { type: integer, minimum: 1, description: 1-based place after the call (1 on a promotion). }
+        live_run_id: { $ref: '#/components/schemas/UUID', description: The run holding the base's line; omitted when none is live. }
+        audit_sequence: { type: integer, format: int64, description: The `merge_queue_promoted` row's chain sequence; omitted on a no-op. }
     PromoteQueuedStageRequest:
       type: object
       additionalProperties: false
@@ -23761,8 +23893,15 @@ paths:
         other caller must hold `read:audit` (a cookie-session operator
         passes). Repository visibility is enforced like a point read.
 
+        **Ejections (ADR-093 D4, E87.6 / #4297).** Each base block carries
+        `ejections[]`: the base's unresolved ejections, newest first, each
+        with its reason, the derived `next_step` and `remedy`, and how the run
+        re-enters at the tail (`reentry`). See `MergeQueueEjection`.
+
         Store reads fail closed (`500`); the head-of-line forge read is
-        best-effort (`current_head_unavailable` names the degrade).
+        best-effort (`current_head_unavailable` names the degrade), and an
+        unreadable `merge_queue_ejected` row degrades that ejection to its
+        reason default.
       tags: [repos]
       parameters:
         - { name: owner, in: path, required: true, schema: { type: string }, description: Repository owner (first `owner/name` segment). }
@@ -27488,6 +27627,98 @@ paths:
             `concern_ids` (the routed ids, at most 50) and `remedy`: shorten
             `operator_concern`, split the concerns across passes, or route fewer
             `concern_ids`). Body's `message` explains the specific reason.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/merge-queue/promote:
+    post:
+      operationId: promoteMergeQueueEntry
+      summary: Promote a held merge-queue entry to the head of its base's line
+      description: |
+        Operator PROMOTE of a run's held merge-queue entry (ADR-093 D2, E87.6
+        / #4297), so a run that unblocks the others is admitted next. The
+        entry's row gets an `order_key` just ahead of every other unmarked
+        held entry on the same base and account (the minimum other effective
+        key minus 1 ms, so the newest promote wins); admission and the queue
+        read order by `(COALESCE(order_key, enqueued_at), entry id)`, so every
+        unpromoted entry stays strict FIFO and `enqueued_at` stays the
+        eligibility time. The LIVE entry is never preempted: a promoted entry
+        is admitted when the line frees. A re-entry or a base change inserts a
+        fresh row with no order key (it joins at the tail). The queue read
+        then reports the entry with `promoted: true`.
+
+        This verb acts ONLY on the ADR-092/093 merge queue. A stage waiting
+        for a local concurrency slot is promoted by `POST
+        /v0/stages/{stage_id}/concurrency/promote` instead.
+
+        **Refusals, each decided before anything is written.**
+        `401 authentication_required`; `403 run_token_forbidden` (a run-bound
+        agent token, even for its own run); `403 insufficient_scope` (no
+        `write:runs`); `400 validation_failed` (a non-UUID `run_id`, or a body
+        that is not exactly one `{"reason": string}` object — unknown keys and
+        trailing content are refused — or a reason empty after trimming or
+        over 1000 bytes); `503 merge_queue_unconfigured` (no merge queue, or a
+        store without the promote capability; decided after the auth rungs).
+        Then, inside the store's transaction: `404 run_not_found`; `409
+        merge_queue_not_queued` (no held entry: never queued, or settled);
+        `409 merge_queue_entry_live` (the entry holds the line); `409
+        merge_queue_entry_yielded` (a yielded entry is skipped by admission
+        whatever its order, so its yield must clear first; `details.next_step`
+        names the remedy); `500 merge_queue_promote_failed` (rolled back, the
+        order is unchanged).
+
+        **Audit.** A promotion appends a chained `merge_queue_promoted` row
+        `{entry_id, run_id, repo, base_ref, old_position, new_position,
+        reason, actor}` INSIDE the promotion transaction, so a failed append
+        rolls the promotion back. An entry already first answers 200
+        `promoted: false` and appends nothing. A change pumps the base.
+
+        **Authorization.** An authenticated identity with `write:runs` in the
+        run's workspace account. A delegated operator-agent token is admitted
+        (an ordering control, not an approval); the row records its subject.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/PromoteMergeQueueEntryRequest' }
+      responses:
+        '200':
+          description: The entry was promoted, or was already first (`promoted:false`, nothing written).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/PromoteMergeQueueEntryResponse' }
+        '400':
+          description: '`validation_failed` — a non-UUID `run_id`, a body that is not exactly `{"reason": string}`, or a reason empty after trimming or over 1000 bytes (`details.field`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` (a run-bound agent token), `insufficient_scope` (no `write:runs`), or the run belongs to another workspace account.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`merge_queue_not_queued`, `merge_queue_entry_live` or `merge_queue_entry_yielded` (see the refusal ladder above; `details.run_id` names the run). Nothing was written.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`merge_queue_promote_failed` — the promotion (or its audit append) failed and was rolled back; the queue order is unchanged.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`merge_queue_unconfigured` — no merge queue is wired, or the store cannot promote.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

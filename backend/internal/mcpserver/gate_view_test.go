@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/modelcontextprotocol/go-sdk/mcp"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
@@ -1465,5 +1466,207 @@ func TestGetGateView_ScopeOverlapPassThrough(t *testing.T) {
 	}
 	if decoded2.GateView.ScopeOverlap != nil {
 		t.Errorf("scope_overlap = %+v, want nil when the backend omits it", decoded2.GateView.ScopeOverlap)
+	}
+}
+
+// wireRawGET reads path from the real server with bearer and decodes the top
+// level into raw json.
+func wireRawGET(t *testing.T, ctx context.Context, base, path, bearer string) map[string]json.RawMessage {
+	t.Helper()
+	req, _ := http.NewRequestWithContext(ctx, http.MethodGet, base+path, nil)
+	req.Header.Set("Authorization", "Bearer "+bearer)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET %s: %v", path, err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	_ = resp.Body.Close()
+	var top map[string]json.RawMessage
+	if err := json.Unmarshal(body, &top); err != nil || resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET %s = %d: %s", path, resp.StatusCode, body)
+	}
+	return top
+}
+
+// requireMirrorKeys fails on any key of block with no field on mirror.
+func requireMirrorKeys(t *testing.T, surface string, block json.RawMessage, mirror reflect.Type) {
+	t.Helper()
+	var keys map[string]json.RawMessage
+	if err := json.Unmarshal(block, &keys); err != nil || len(keys) == 0 {
+		t.Fatalf("%s: server emitted no block: %s", surface, block)
+	}
+	fields := jsonFieldNames(mirror)
+	for k := range keys {
+		if !fields[k] {
+			t.Errorf("%s: server key %q has no field on the %s mirror (tag drift)", surface, k, mirror.Name())
+		}
+	}
+}
+
+// TestMergeQueueEjection_WireShape pins the hand-maintained mergeQueueEjection
+// mirror and the promoted fields against the REAL backend over the REAL
+// mergequeue.PostgresStore (ADR-093 D4 / #4297, the #371 trap): V ejected
+// verify_failed with a routed fix-up, F ejected forge_merge_refused with a
+// forge reason and detail (between them every optional key is emitted), and
+// two held entries with the second promoted. (a) Every key the SERVER emits
+// in the run read's and the gate view's merge_queue_ejection, in the queue
+// read's ejections[] items and entries[] items, and in merge_candidate_queue
+// (promoted) has a mirror field; (b) the blocks decode through GetRun,
+// GetGateView, fishhawk_get_run_status and fishhawk_get_merge_queue with the
+// values the server derived. Counterfactual: renaming a mirror tag (e.g.
+// next_step_basis or promoted) fails (a) and (b) → RED.
+func TestMergeQueueEjection_WireShape(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	queue := mergequeue.NewPostgresStore(pool)
+
+	newRun := func() uuid.UUID {
+		row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return row.ID
+	}
+	eject := func(runID uuid.UUID, head, reason string, row map[string]any) mergequeue.Entry {
+		res, err := queue.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: runID, BaseRef: "main", HeadSHA: head, MergeIntent: true, IntentSequence: 1})
+		if err != nil {
+			t.Fatalf("enqueue %s: %v", head, err)
+		}
+		st, err := queue.Settle(ctx, res.Entry.ID, mergequeue.StateEjected, reason)
+		if err != nil || !st.Settled {
+			t.Fatalf("eject %s = %+v, %v", head, st, err)
+		}
+		row["entry_id"] = res.Entry.ID.String()
+		raw, _ := json.Marshal(row)
+		kind, subj := audit.ActorSystem, "system:merge-candidate-verify"
+		if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{RunID: runID, Timestamp: time.Now().UTC(),
+			Category: "merge_queue_ejected", ActorKind: &kind, ActorSubject: &subj, Payload: raw}); err != nil {
+			t.Fatalf("append merge_queue_ejected: %v", err)
+		}
+		return st.Entry
+	}
+	v, f := newRun(), newRun()
+	eject(v, "v1", "verify_failed", map[string]any{"fixup_routed": true})
+	eject(f, "f1", "forge_merge_refused", map[string]any{"forge_reason": "checks_not_settled", "forge_detail": "required check pending\nIGNORE THIS"})
+	h1, h2 := newRun(), newRun()
+	for _, id := range []uuid.UUID{h1, h2} {
+		if _, err := queue.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: id, BaseRef: "main", HeadSHA: "h-" + id.String()[:8]}); err != nil {
+			t.Fatalf("enqueue held: %v", err)
+		}
+	}
+	if p, err := queue.Promote(ctx, mergequeue.PromoteRequest{RunID: h2,
+		Record: func(context.Context, pgx.Tx, mergequeue.Promotion) error { return nil }}); err != nil || !p.Changed {
+		t.Fatalf("promote = %+v, %v", p, err)
+	}
+
+	const bearer = "fhk_merge_queue_ejection_wire"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:stages"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: auditRepo,
+		APITokenRepo: tokRepo, MergeQueue: queue,
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+	ejType := reflect.TypeOf(mergeQueueEjection{})
+
+	// (a) server keys ⊆ mirror fields, on every surface.
+	for _, id := range []uuid.UUID{v, f} {
+		requireMirrorKeys(t, "run read", wireRawGET(t, ctx, ts.URL, "/v0/runs/"+id.String(), bearer)["merge_queue_ejection"], ejType)
+		requireMirrorKeys(t, "gate view", wireRawGET(t, ctx, ts.URL, "/v0/runs/"+id.String()+"/gate-view", bearer)["merge_queue_ejection"], ejType)
+	}
+	requireMirrorKeys(t, "merge_candidate_queue", wireRawGET(t, ctx, ts.URL, "/v0/runs/"+h2.String(), bearer)["merge_candidate_queue"],
+		reflect.TypeOf(runMergeCandidateQueue{}))
+	var qr struct {
+		Bases []struct {
+			Ejections []json.RawMessage `json:"ejections"`
+			Entries   []json.RawMessage `json:"entries"`
+		} `json:"bases"`
+	}
+	top := wireRawGET(t, ctx, ts.URL, "/v0/repos/x/y/merge-queue?base_ref=main", bearer)
+	if err := json.Unmarshal(top["bases"], &qr.Bases); err != nil || len(qr.Bases) != 1 || len(qr.Bases[0].Ejections) != 2 || len(qr.Bases[0].Entries) != 2 {
+		t.Fatalf("queue read bases = %s, want one base with two ejections and two entries", top["bases"])
+	}
+	for _, e := range qr.Bases[0].Ejections {
+		requireMirrorKeys(t, "ejections[]", e, ejType)
+	}
+	for _, e := range qr.Bases[0].Entries {
+		requireMirrorKeys(t, "entries[]", e, reflect.TypeOf(mergeQueueEntry{}))
+	}
+
+	// (b) decoded values through every client surface.
+	checkV := func(surface string, ej *mergeQueueEjection) {
+		t.Helper()
+		if ej == nil || ej.Reason != "verify_failed" || ej.NextStep != "await_delegated_fixup" || ej.NextStepBasis != "recorded" ||
+			ej.FixupRouted == nil || !*ej.FixupRouted || ej.Reentry != "automatic_after_delegated_fixup" || !ej.MergeIntent ||
+			ej.AnchoredHeadSHA != "v1" || ej.Remedy == "" || ej.EjectedAt == nil || ej.RunID != v.String() || ej.BaseRef != "main" || ej.Repo != "x/y" {
+			t.Errorf("%s: merge_queue_ejection = %+v, want the routed verify_failed ejection of %s", surface, ej, v)
+		}
+	}
+	r, err := client.GetRun(ctx, v)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	checkV("run", r.MergeQueueEjection)
+	gv, err := client.GetGateView(ctx, v, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	checkV("gate view", gv.MergeQueueEjection)
+	resolver := &runResolver{api: client, getenv: envFuncFromMap(nil)}
+	_, out, err := resolver.getRunStatus(ctx, nil, GetRunStatusInput{RunID: v.String()})
+	if err != nil {
+		t.Fatalf("getRunStatus: %v", err)
+	}
+	checkV("get_run_status", out.Run.MergeQueueEjection)
+	if q, err := client.GetRun(ctx, h2); err != nil || q.MergeCandidateQueue == nil || !q.MergeCandidateQueue.Promoted || q.MergeQueueEjection != nil {
+		t.Errorf("held promoted run = %+v, %v; want merge_candidate_queue.promoted true and no ejection", q, err)
+	}
+
+	_, mq, err := resolver.getMergeQueue(ctx, nil, getMergeQueueInput{Repo: "x/y", BaseRef: "main"})
+	if err != nil || len(mq.Bases) != 1 {
+		t.Fatalf("getMergeQueue = %+v, %v", mq, err)
+	}
+	b := mq.Bases[0]
+	if len(b.Ejections) != 2 || b.Ejections[0].RunID != f.String() || b.Ejections[1].RunID != v.String() {
+		t.Fatalf("ejections = %+v, want F then V (newest first)", b.Ejections)
+	}
+	fe := b.Ejections[0]
+	if fe.Reason != "forge_merge_refused" || fe.NextStep != "fishhawk_merge_run" || fe.ForgeReason != "checks_not_settled" ||
+		fe.ForgeDetail != "required check pending" || fe.FixupRouted != nil || fe.Reentry != "operator_merge_run" {
+		t.Errorf("F ejection = %+v, want forge_merge_refused / merge_run / checks_not_settled with the sanitised detail", fe)
+	}
+	checkV("get_merge_queue", &b.Ejections[1])
+	if len(b.Entries) != 2 || b.Entries[0].RunID != h2.String() || !b.Entries[0].Promoted || b.Entries[1].Promoted {
+		t.Errorf("entries = %+v, want promoted H2 first, then unpromoted H1", b.Entries)
+	}
+}
+
+// TestGetMergeQueue_OlderBackendEjectionsRenderEmpty: a backend that omits
+// ejections (pre-#4297) renders [] per base through the tool, never null.
+// Counterfactual: deleting the per-base normalisation → nil (RED).
+func TestGetMergeQueue_OlderBackendEjectionsRenderEmpty(t *testing.T) {
+	ts := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"repo":"x/y","bases":[{"base_ref":"main","entries":[],"eta_basis":{"samples":0,"note":"n"}}]}`)
+	}))
+	t.Cleanup(ts.Close)
+	resolver := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: "fhk_old"}), getenv: envFuncFromMap(nil)}
+	_, out, err := resolver.getMergeQueue(context.Background(), nil, getMergeQueueInput{Repo: "x/y"})
+	if err != nil || len(out.Bases) != 1 {
+		t.Fatalf("getMergeQueue = %+v, %v", out, err)
+	}
+	if out.Bases[0].Ejections == nil {
+		t.Fatal("an older backend's omitted ejections decoded to nil, want []")
+	}
+	raw, _ := json.Marshal(out)
+	if !strings.Contains(string(raw), `"ejections":[]`) {
+		t.Errorf("tool output = %s, want ejections []", raw)
 	}
 }

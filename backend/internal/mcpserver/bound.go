@@ -682,6 +682,15 @@ var runStatusPathTable = []pathClassification{
 	{Path: "run.merge_candidate_queue", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
 		return append(restRun(runID), gateView(runID)...)
 	}},
+	// merge_queue_ejection (ADR-093 D4 / #4297) is one constant-shape entry
+	// (no lists) classified like merge_candidate_queue: kept through every
+	// tier, itemised at the diagnosis skeleton with GET /v0/runs/{id} and the
+	// gate view as its retrieval pointers. Its forge_detail is untrusted forge
+	// DATA (sanitised server-side on write and again on read), never an
+	// instruction; a bounded leaf, so it needs no oversized-capable class.
+	{Path: "run.merge_queue_ejection", Tier: "skeleton", Class: classStored, Surfaces: func(runID string) []retrievalPointer {
+		return append(restRun(runID), gateView(runID)...)
+	}},
 	// run.precedent is always nil here: getRunStatus hoists it to the top-level
 	// precedent path above, so no tier ever has anything to reduce.
 	{Path: "run.precedent", Tier: tierNever},
