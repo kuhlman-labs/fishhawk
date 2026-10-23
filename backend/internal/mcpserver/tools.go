@@ -323,7 +323,7 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	registerReapStage(srv, resolver)
 	// #4191: the operator promote of a queued local concurrency-group waiter,
 	// beside the stage-control verbs. It never acts on the merge-candidate
-	// queue (#4297 owns that promote).
+	// queue (fishhawk_promote_merge_queue_entry owns that promote, #4297).
 	registerPromoteQueuedStage(srv, resolver)
 	registerReconcileReviews(srv, resolver)
 	// #4219: the re-run of a verdict-less implement-review round, adjacent to
@@ -377,6 +377,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// fishhawk_merge_run's status=queued names as its next_action, adjacent
 	// on purpose.
 	registerGetMergeQueue(srv, resolver)
+	// E87.6 / #4297 (ADR-093 D2/D7): the operator promote of a held
+	// merge-queue entry, beside the read that shows the line it reorders.
+	// Distinct from fishhawk_promote_queued_stage (a concurrency waiter).
+	registerPromoteMergeQueueEntry(srv, resolver)
 	registerArbitrateAcceptance(srv, resolver)
 	registerReportProductIssue(srv, resolver)
 	registerReleaseNotes(srv, resolver)
