@@ -3609,8 +3609,16 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   merge intent, still its run's newest row, on a non-terminal run) is judged
   only when DUE on the `yieldReprobeDue` schedule over the row's
   database-clock settled age, process-local (ADR-112 A1.4: after a restart
-  the window is `(0, age]`). It re-enters only when: no stage of the run is
-  `dispatched` or `running` (ADR-115 D4 compliance); its
+  the window is `(0, age]`). One tick reads ONE page of at most
+  `mergeQueueReentryLimit` (50) candidates after a process-local keyset
+  cursor (`mergeQueueReentryPager`, `(settled_at, id)`); a full page moves the
+  cursor to its last row and a short page wraps it to the oldest, so 50
+  candidates that never pass a gate (unrouted, never pushed) cannot hide every
+  newer one from the read (#4297). Across several pages a page's due window
+  reaches back to the start of the previous cycle (the last read of that
+  page at the latest), so no schedule point falls between two reads; with one
+  page it is the time since the previous sweep. It re-enters only when: no
+  stage of the run is `dispatched` or `running` (ADR-115 D4 compliance); its
   `merge_queue_ejected` row says `fixup_routed: true`; a `fixup_pushed` row's
   chain sequence follows that row's; the `merge_queue_entered` row AT the
   entry's `MergeIntentSequence` exists (never the newest such row); the PR
@@ -3630,7 +3638,9 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   `requireRunAccount(memberWrite)`): 401 anonymous, 403
   `run_token_forbidden`, 403 `insufficient_scope`, 400 `validation_failed`
   (the strict `{"reason"}` body), then 503 `merge_queue_unconfigured` (no
-  queue or no `mergequeue.Promoter`), then the store's one transaction: 404
+  queue, no `mergequeue.Promoter`, or no run repository: without it
+  `requireRunAccount` cannot check the run's account and falls through, so
+  the verb fails closed), then the store's one transaction: 404
   `run_not_found`, 409 `merge_queue_not_queued` / `merge_queue_entry_live`
   (the live entry is never preempted) / `merge_queue_entry_yielded`
   (`details.next_step`), 500 `merge_queue_promote_failed` (rolled back).

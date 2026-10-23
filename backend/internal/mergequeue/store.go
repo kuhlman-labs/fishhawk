@@ -1282,17 +1282,25 @@ LIMIT $4`, base.Repo, base.BaseRef, acctArg(base.AccountID), limit)
 // consider: EJECTED with ReentryReason, carrying merge intent, still their
 // run's newest row, and belonging to a run that is not terminal (succeeded,
 // failed, cancelled). Oldest settle first, at most limit, across every
-// account (the sweep, like ActiveBases). Never nil; limit < 1 is
-// ErrInvalidRequest. Eligibility, the fix-up and the forge are the caller's.
-func (s *PostgresStore) ReentryCandidates(ctx context.Context, limit int) ([]Entry, error) {
+// account (the sweep, like ActiveBases), strictly after the exclusive keyset
+// cursor after when it is non-nil. Never nil; limit < 1 is ErrInvalidRequest.
+// Eligibility, the fix-up and the forge are the caller's.
+func (s *PostgresStore) ReentryCandidates(ctx context.Context, after *ReentryCursor, limit int) ([]Entry, error) {
 	if limit < 1 {
 		return nil, fmt.Errorf("%w: re-entry limit %d, want at least 1", ErrInvalidRequest, limit)
 	}
+	args := []any{ReentryReason, string(run.StateSucceeded), string(run.StateFailed), string(run.StateCancelled), limit}
+	cursorSQL := ""
+	if after != nil {
+		cursorSQL = `
+  AND (e.settled_at, e.id) > ($6, $7)`
+		args = append(args, after.SettledAt, after.ID)
+	}
 	return s.collectEntries(ctx, "re-entry candidates", `SELECT `+entryCols+entryFrom+`
 WHERE e.state = 'ejected' AND e.eject_reason = $1 AND e.merge_intent_at IS NOT NULL
-  AND r.state NOT IN ($2, $3, $4) AND `+newestRowSQL+`
+  AND r.state NOT IN ($2, $3, $4) AND `+newestRowSQL+cursorSQL+`
 ORDER BY e.settled_at, e.id
-LIMIT $5`, ReentryReason, string(run.StateSucceeded), string(run.StateFailed), string(run.StateCancelled), limit)
+LIMIT $5`, args...)
 }
 
 // collectEntries runs a multi-row entry read on the pool. Never nil.

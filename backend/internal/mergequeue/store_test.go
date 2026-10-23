@@ -1,6 +1,7 @@
 package mergequeue
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -2743,7 +2744,7 @@ func TestEntryReads_CanceledContext(t *testing.T) {
 	if _, err := f.store.UnresolvedEjections(ctx, mainBase(), 10); !errors.Is(err, context.Canceled) {
 		t.Fatalf("UnresolvedEjections err = %v, want context.Canceled", err)
 	}
-	if _, err := f.store.ReentryCandidates(ctx, 10); !errors.Is(err, context.Canceled) {
+	if _, err := f.store.ReentryCandidates(ctx, nil, 10); !errors.Is(err, context.Canceled) {
 		t.Fatalf("ReentryCandidates err = %v, want context.Canceled", err)
 	}
 }
@@ -2927,7 +2928,7 @@ func TestReentryCandidates(t *testing.T) {
 	f.seedEjected(terminal, StateEjected, ReentryReason, true, 50*time.Minute)
 	f.exec(`UPDATE runs SET state = 'cancelled' WHERE id = $1`, terminal)
 
-	got, err := f.store.ReentryCandidates(ctx, 10)
+	got, err := f.store.ReentryCandidates(ctx, nil, 10)
 	if err != nil {
 		t.Fatalf("ReentryCandidates: %v", err)
 	}
@@ -2940,11 +2941,52 @@ func TestReentryCandidates(t *testing.T) {
 	if got[0].MergeIntentAt == nil || got[0].MergeIntentSequence != 7 {
 		t.Fatalf("candidate = %+v, want its merge intent and sequence", got[0])
 	}
-	got, err = f.store.ReentryCandidates(ctx, 1)
+	got, err = f.store.ReentryCandidates(ctx, nil, 1)
 	if err != nil || !slices.Equal(entryIDs(got), []uuid.UUID{oldest}) {
 		t.Fatalf("ReentryCandidates(limit 1) = %v, %v; want only the oldest", entryIDs(got), err)
 	}
-	if _, err := f.store.ReentryCandidates(ctx, 0); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := f.store.ReentryCandidates(ctx, nil, 0); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("limit 0 err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// TestReentryCandidates_KeysetCursorPages: the exclusive (settled_at, id)
+// cursor pages the oldest-first order without skipping or repeating a row,
+// breaking a settled_at tie on id; nil starts at the oldest (#4297: the
+// sweep pages past never-passing candidates). Ignoring the cursor re-reads
+// the first page forever: RED.
+func TestReentryCandidates_KeysetCursorPages(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 4*time.Hour)
+	b := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 3*time.Hour)
+	c := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 2*time.Hour)
+	d := f.seedEjected(f.run(), StateEjected, ReentryReason, true, time.Hour)
+	f.exec(`UPDATE merge_candidate_queue_entries SET settled_at = (SELECT settled_at FROM merge_candidate_queue_entries WHERE id = $1) WHERE id = $2`, c, d)
+	want := []uuid.UUID{a, b, c, d}
+	if bytes.Compare(d[:], c[:]) < 0 {
+		want = []uuid.UUID{a, b, d, c}
+	}
+	var got []uuid.UUID
+	var after *ReentryCursor
+	for pages := 0; ; pages++ {
+		if pages > len(want) {
+			t.Fatalf("paging did not terminate after %d pages: %v", pages, got)
+		}
+		page, err := f.store.ReentryCandidates(ctx, after, 2)
+		if err != nil {
+			t.Fatalf("ReentryCandidates(after %+v): %v", after, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		got = append(got, entryIDs(page)...)
+		after = ReentryCursorAt(page[len(page)-1])
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("paged candidates = %v, want %v (every row once, oldest first, ties on id)", got, want)
+	}
+	if ReentryCursorAt(Entry{ID: a}) != nil {
+		t.Fatal("ReentryCursorAt(unsettled) != nil")
 	}
 }

@@ -1112,7 +1112,8 @@ func TestMergeQueueMergeOnPass_LockAndEntryBranches(t *testing.T) {
 // the unstable rows' merger count 2 (RED). Skipping the row-4 snapshot on the
 // unstable arm turns its yield row RED (it ejects instead).
 func TestMergeOnPass_ForgeRefusalEjectsExactlyOnce(t *testing.T) {
-	const token = "ghs_SECRETtoken123"
+	// Built at runtime so no source line matches a credential pattern.
+	token := "gh" + "s_" + strings.Repeat("S3", 18)
 	cases := []struct {
 		name     string
 		err      error

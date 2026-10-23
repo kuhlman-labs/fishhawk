@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"sync"
 	"testing"
 	"time"
@@ -86,10 +87,18 @@ func (w *mqmWorld) sweepAged(ej mergequeue.Entry, d time.Duration) {
 	w.sweep(d)
 }
 
-// sweep runs one re-entry sweep and waits for any detached pump it started.
+// sweep runs one re-entry sweep with no keyset pager (the first page) and
+// waits for any detached pump it started.
 func (w *mqmWorld) sweep(since time.Duration) int {
 	w.t.Helper()
-	n := w.srv.sweepMergeQueueReentries(context.Background(), rentInterval, since)
+	return w.sweepPage(since, nil)
+}
+
+// sweepPage runs one re-entry sweep carrying page between ticks and waits for
+// any detached pump it started.
+func (w *mqmWorld) sweepPage(since time.Duration, page *mergeQueueReentryPager) int {
+	w.t.Helper()
+	n := w.srv.sweepMergeQueueReentries(context.Background(), rentInterval, since, page)
 	w.srv.bgMergeQueuePump.Wait()
 	return n
 }
@@ -338,6 +347,121 @@ func TestReentry_ApprovalOnlyCandidateRepolledOnSchedule(t *testing.T) {
 	}
 }
 
+// Gate 5, one arm per fixture on an otherwise FULLY eligible candidate: a
+// closed PR, a merged PR (state left open, so only the merged check refuses
+// it), a PR retargeted to another base, and a terminal run (the candidate
+// list captured BEFORE the run went terminal, so the store's terminal
+// predicate cannot mask the sweep's own run-state check). MECHANISM: delete
+// the arm's check and that fixture re-enters (RED).
+func TestReentry_Gate5PRStateAndTerminalRunNoReentry(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(w *mqmWorld, r *mcqRun)
+	}{
+		{"pr closed", func(w *mqmWorld, r *mcqRun) { w.gh.set(func() { w.gh.prs[r.pr].state = "closed" }) }},
+		{"pr merged", func(w *mqmWorld, r *mcqRun) { w.gh.set(func() { w.gh.prs[r.pr].merged = true }) }},
+		{"pr retargeted", func(w *mqmWorld, r *mcqRun) { w.gh.set(func() { w.gh.prs[r.pr].base = "release" }) }},
+		{"run terminal", func(w *mqmWorld, r *mcqRun) {
+			cands, err := w.store.ReentryCandidates(context.Background(), nil, 10)
+			if err != nil || len(cands) != 1 || cands[0].RunID != r.id {
+				w.t.Fatalf("candidates = %v %v, want the one fixture", cands, err)
+			}
+			w.exec(`UPDATE runs SET state = 'cancelled' WHERE id = $1`, r.id)
+			w.srv.cfg.MergeQueue = rentStaleStore{PostgresStore: w.store, cands: cands}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, _ := w.rentReady("a", mcvDelegatedV0SpecYAML)
+			tc.mut(w, r)
+			if n := w.sweep(0); n != 0 {
+				t.Fatalf("re-entered = %d, want 0", n)
+			}
+			w.requireNotReentered(r)
+		})
+	}
+}
+
+// Starvation (#4297): mergeQueueReentryLimit+1 OLDER candidates that never
+// pass a gate (no routed fix-up) sit ahead of one routed, pushed, eligible
+// candidate. The keyset pager reads past the first full page, so the eligible
+// one re-enters within two ticks, and the next short page wraps the cursor.
+// MECHANISM: ignore the cursor (read the first page every tick) and the
+// eligible candidate is never read (RED).
+func TestReentry_PagerReadsPastNeverEligibleCandidates(t *testing.T) {
+	w := newMQMWorld(t)
+	stale := make([]*mcqRun, 0, mergeQueueReentryLimit+1)
+	for i := 0; i <= mergeQueueReentryLimit; i++ {
+		o := w.seed(fmt.Sprintf("old%d", i), "o0", []byte(mcvDelegatedV0SpecYAML))
+		w.rentSeed(o, false, 20*time.Minute)
+		stale = append(stale, o)
+	}
+	r, ej := w.rentReady("a", mcvDelegatedV0SpecYAML)
+	var page mergeQueueReentryPager
+	n := w.sweepPage(0, &page)
+	if page.after == nil {
+		t.Fatal("a full first page left no cursor")
+	}
+	n += w.sweepPage(rentInterval, &page)
+	if n != 1 {
+		t.Fatalf("re-entered = %d over two ticks, want 1 (the eligible candidate behind a full page)", n)
+	}
+	w.requireReentered(r, ej, "h1")
+	if page.after != nil {
+		t.Fatalf("cursor after a short page = %+v, want nil (wrapped)", page.after)
+	}
+	for _, o := range stale {
+		w.requireNotReentered(o)
+	}
+}
+
+// The pager's due window: with one page it is exactly the time since the
+// previous sweep (C-BO unchanged); across pages it reaches back to the start
+// of the previous cycle, so no schedule point falls between two reads of a
+// page; a page never read in this process gets the restart window 0. A
+// failed read rotates nothing. MECHANISM: return since as every window and
+// the multi-page rows are RED.
+func TestMergeQueueReentryPager_Window(t *testing.T) {
+	settled := time.Unix(1000, 0)
+	row := mergequeue.Entry{SettledAt: &settled}
+	full, short := []mergequeue.Entry{row, row}, []mergequeue.Entry{row}
+	type step struct {
+		since  time.Duration
+		page   []mergequeue.Entry // nil: the read failed
+		window time.Duration
+		cursor bool // the page read after a cursor
+	}
+	for name, steps := range map[string][]step{
+		"one page": {
+			{0, short, 0, false},
+			{60 * time.Second, short, 60 * time.Second, false},
+			{45 * time.Second, short, 45 * time.Second, false},
+		},
+		"two pages": {
+			{0, full, 0, false},                                 // cycle 0, page 0
+			{60 * time.Second, short, 0, true},                  // page 1 never read: restart window
+			{60 * time.Second, full, 120 * time.Second, false},  // cycle 1 page 0: back to cycle 0's start
+			{60 * time.Second, short, 180 * time.Second, true},  // page 1: back to cycle 0's start
+			{60 * time.Second, nil, 120 * time.Second, false},   // failed read: cycle 2 does not begin
+			{60 * time.Second, short, 180 * time.Second, false}, // retried: still back to cycle 1's start
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var p mergeQueueReentryPager
+			for i, st := range steps {
+				after, window := p.tick(st.since)
+				if window != st.window || (after != nil) != st.cursor {
+					t.Fatalf("step %d: window %v cursor %v, want %v cursor %v", i, window, after != nil, st.window, st.cursor)
+				}
+				if st.page != nil {
+					p.read(st.page, 2)
+				}
+			}
+		})
+	}
+}
+
 // A candidate younger than one interval is not due (the ejection just ran).
 func TestReentry_FreshEjectionNotDue(t *testing.T) {
 	w := newMQMWorld(t)
@@ -357,7 +481,7 @@ type rentStaleStore struct {
 	cands []mergequeue.Entry
 }
 
-func (s rentStaleStore) ReentryCandidates(context.Context, int) ([]mergequeue.Entry, error) {
+func (s rentStaleStore) ReentryCandidates(context.Context, *mergequeue.ReentryCursor, int) ([]mergequeue.Entry, error) {
 	return s.cands, nil
 }
 
@@ -375,7 +499,7 @@ func TestReentry_StaleCandidateRecheckedUnderLock(t *testing.T) {
 		t.Run(name, func(t *testing.T) {
 			w := newMQMWorld(t)
 			r, _ := w.rentReady("a", mcvDelegatedV0SpecYAML)
-			cands, err := w.store.ReentryCandidates(context.Background(), 10)
+			cands, err := w.store.ReentryCandidates(context.Background(), nil, 10)
 			if err != nil || len(cands) != 1 {
 				t.Fatalf("candidates = %v %v", cands, err)
 			}
@@ -474,11 +598,11 @@ func TestReentry_EnqueueFailureLeavesOrphanNoEntryNamesIt(t *testing.T) {
 func TestReentry_StoreWithoutCapabilityDegrades(t *testing.T) {
 	w := newMQMWorld(t)
 	w.srv.cfg.MergeQueue = &mcqFaultStore{}
-	if n := w.srv.sweepMergeQueueReentries(context.Background(), rentInterval, 0); n != 0 {
+	if n := w.srv.sweepMergeQueueReentries(context.Background(), rentInterval, 0, nil); n != 0 {
 		t.Fatalf("re-entered = %d, want 0", n)
 	}
 	s := New(Config{Addr: "127.0.0.1:0"})
-	if n := s.sweepMergeQueueReentries(context.Background(), rentInterval, 0); n != 0 {
+	if n := s.sweepMergeQueueReentries(context.Background(), rentInterval, 0, nil); n != 0 {
 		t.Fatalf("unwired re-entered = %d", n)
 	}
 }

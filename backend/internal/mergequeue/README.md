@@ -183,12 +183,16 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   most `limit`. A re-entered run, a `dropped` row and another account's
   ejection are excluded; `limit < 1` is `ErrInvalidRequest`; never nil
   (`TestUnresolvedEjections`). The queue read's `ejections[]`.
-- **`ReentryCandidates(limit)`** (`ReentryReader`): `ejected` rows with
-  `ReentryReason` (`verify_failed`) that carry merge intent, are their run's
-  newest row, and belong to a run that is not terminal (`succeeded`,
-  `failed`, `cancelled`), oldest settle first, at most `limit`, ACROSS every
-  account (the server's re-entry sweep, like `ActiveBases`). `limit < 1` is
-  `ErrInvalidRequest`; never nil (`TestReentryCandidates`). Eligibility, the
+- **`ReentryCandidates(after, limit)`** (`ReentryReader`): `ejected` rows
+  with `ReentryReason` (`verify_failed`) that carry merge intent, are their
+  run's newest row, and belong to a run that is not terminal (`succeeded`,
+  `failed`, `cancelled`), oldest settle first by `(settled_at, id)`, strictly
+  after the exclusive keyset cursor `after` (`ReentryCursor`, from
+  `ReentryCursorAt`; nil starts at the oldest), at most `limit`, ACROSS every
+  account (the server's re-entry sweep, like `ActiveBases`, which pages with
+  it so never-passing candidates cannot crowd newer ones out, #4297).
+  `limit < 1` is `ErrInvalidRequest`; never nil (`TestReentryCandidates`,
+  `TestReentryCandidates_KeysetCursorPages`). Eligibility, the
   fix-up evidence and the forge are the caller's; the store only narrows.
   `Entry.SettledAge` (`clock_timestamp() − settled_at`, computed in the read;
   0 on an active row) is the database-clock age the sweep's backoff keys on,

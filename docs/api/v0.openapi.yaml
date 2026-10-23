@@ -27658,8 +27658,9 @@ paths:
         `write:runs`); `400 validation_failed` (a non-UUID `run_id`, or a body
         that is not exactly one `{"reason": string}` object — unknown keys and
         trailing content are refused — or a reason empty after trimming or
-        over 1000 bytes); `503 merge_queue_unconfigured` (no merge queue, or a
-        store without the promote capability; decided after the auth rungs).
+        over 1000 bytes); `503 merge_queue_unconfigured` (no merge queue, a
+        store without the promote capability, or no run repository to check
+        the run's account against; decided after the auth rungs).
         Then, inside the store's transaction: `404 run_not_found`; `409
         merge_queue_not_queued` (no held entry: never queued, or settled);
         `409 merge_queue_entry_live` (the entry holds the line); `409
@@ -27718,7 +27719,7 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: '`merge_queue_unconfigured` — no merge queue is wired, or the store cannot promote.'
+          description: '`merge_queue_unconfigured` — no merge queue is wired, the store cannot promote, or no run repository is wired.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

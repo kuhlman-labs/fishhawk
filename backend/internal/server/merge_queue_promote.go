@@ -90,9 +90,13 @@ func (s *Server) mergeQueuePromoter() mergequeue.Promoter {
 //	400 validation_failed        — a non-UUID run_id, or a body that is not
 //	                               exactly {"reason": string} with a
 //	                               1..1000-byte trimmed reason.
-//	503 merge_queue_unconfigured — no merge queue, or a store without the
-//	                               Promote capability (after the auth rungs,
-//	                               so an anonymous caller still reads 401).
+//	503 merge_queue_unconfigured — no merge queue, a store without the
+//	                               Promote capability, or no run repository
+//	                               (requireRunAccount cannot resolve the run's
+//	                               account without it and falls through, so
+//	                               the verb fails closed, as the concurrency
+//	                               promote does); after the auth rungs, so an
+//	                               anonymous caller still reads 401.
 //
 // Then the store's single transaction (mergequeue README § "Promote"):
 // 404 run_not_found, 409 merge_queue_not_queued / merge_queue_entry_live (the
@@ -135,9 +139,9 @@ func (s *Server) handleMergeQueuePromote(w http.ResponseWriter, r *http.Request)
 		return
 	}
 	promoter := s.mergeQueuePromoter()
-	if promoter == nil {
+	if promoter == nil || s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, mqPromoteCodeUnconfigured,
-			"the merge-queue promote requires a configured merge queue", nil)
+			"the merge-queue promote requires a configured merge queue and the run repository", nil)
 		return
 	}
 

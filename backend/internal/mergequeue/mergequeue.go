@@ -460,8 +460,27 @@ type EjectionReader interface {
 type ReentryReader interface {
 	// ReentryCandidates returns ejected ReentryReason rows that carry merge
 	// intent, are their run's newest row and belong to a non-terminal run,
-	// oldest settle first, at most limit, across every account.
-	ReentryCandidates(ctx context.Context, limit int) ([]Entry, error)
+	// oldest settle first by (settled_at, id), strictly after the exclusive
+	// keyset cursor after (nil starts at the oldest), at most limit, across
+	// every account.
+	ReentryCandidates(ctx context.Context, after *ReentryCursor, limit int) ([]Entry, error)
+}
+
+// ReentryCursor is an exclusive keyset position in ReentryCandidates' order
+// (settled_at, id): the sweep pages past a full page of candidates that never
+// pass a gate instead of re-reading them every tick (#4297).
+type ReentryCursor struct {
+	SettledAt time.Time
+	ID        uuid.UUID
+}
+
+// ReentryCursorAt is e's position in ReentryCandidates' order, nil when e has
+// no settle time (never a candidate).
+func ReentryCursorAt(e Entry) *ReentryCursor {
+	if e.SettledAt == nil {
+		return nil
+	}
+	return &ReentryCursor{SettledAt: *e.SettledAt, ID: e.ID}
 }
 
 // Store is the held-pass queue. README.md § "Contract" defines every method.

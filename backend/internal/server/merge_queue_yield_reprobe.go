@@ -124,22 +124,23 @@ func (s *Server) yieldSweepSince(now time.Time) time.Duration {
 // RunMergeQueueYieldReprobe sweeps every active base on every interval tick
 // (sweepMergeQueueYields), then runs the ADR-093 D4 automatic re-entry sweep
 // (sweepMergeQueueReentries, merge_queue_reentry.go) on its own
-// process-local previous-sweep clock, returning when ctx is cancelled. It
-// joins bgMergeQueuePump, so Server.Shutdown drains it; the boot-window
-// residual is RunMergeCandidateQueuePump's.
+// process-local previous-sweep clock and keyset pager, returning when ctx is
+// cancelled. It joins bgMergeQueuePump, so Server.Shutdown drains it; the
+// boot-window residual is RunMergeCandidateQueuePump's.
 func (s *Server) RunMergeQueueYieldReprobe(ctx context.Context, interval time.Duration) {
 	s.bgMergeQueuePump.Add(1)
 	defer s.bgMergeQueuePump.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	var reentry mergeQueueReentryClock
+	var reentryPage mergeQueueReentryPager
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.sweepMergeQueueYields(ctx, interval)
-			s.sweepMergeQueueReentries(ctx, interval, reentry.since(time.Now()))
+			s.sweepMergeQueueReentries(ctx, interval, reentry.since(time.Now()), &reentryPage)
 		}
 	}
 }

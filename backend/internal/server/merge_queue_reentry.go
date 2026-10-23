@@ -12,7 +12,14 @@ package server
 // evaluated only when it is DUE on the yield re-probe schedule
 // (yieldReprobeDue) over the row's database-clock settled age, judged over
 // the time since this process's previous re-entry sweep (process-local,
-// ADR-112 A1.4: after a restart the window is (0, age]). A due candidate
+// ADR-112 A1.4: after a restart the window is (0, age]). One sweep reads one
+// page of at most mergeQueueReentryLimit candidates after a process-local
+// keyset cursor (mergeQueueReentryPager), so candidates that never pass a
+// gate cannot crowd every newer one out of the read; a short page wraps the
+// cursor to the oldest. When the candidates span several pages, a page's due
+// window reaches back to the start of the previous cycle (the last time that
+// page was read), so no schedule point falls between two reads of a row; with
+// one page that is exactly the time since the previous sweep. A due candidate
 // re-enters only when EVERY gate holds, and a refused or undeterminable gate
 // skips it until its next due tick (never dropped, never enqueued yielded):
 //
@@ -57,7 +64,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
-// mergeQueueReentryLimit bounds one sweep's candidate read.
+// mergeQueueReentryLimit bounds one sweep's candidate read (one page).
 const mergeQueueReentryLimit = 50
 
 // mergeQueueReentryBasisDelegatedFixup is the merge_queue_entered
@@ -92,11 +99,56 @@ func (c *mergeQueueReentryClock) since(now time.Time) time.Duration {
 	return d
 }
 
-// sweepMergeQueueReentries evaluates every DUE re-entry candidate (see the
-// file comment) and returns how many re-entered. A store without the
-// ReentryReader and EjectionReader capabilities, or a candidate read error,
-// does nothing; the next tick retries.
-func (s *Server) sweepMergeQueueReentries(ctx context.Context, interval, since time.Duration) int {
+// mergeQueueReentryPager is the re-entry sweep's process-local keyset
+// cursor over ReentryCandidates (#4297). A CYCLE reads the pages from the
+// oldest candidate until a short page wraps the cursor; each tick reads one
+// page. The zero value starts a cycle with no earlier one in this process.
+type mergeQueueReentryPager struct {
+	after      *mergequeue.ReentryCursor // next page starts after it; nil = a new cycle
+	started    bool                      // a cycle began in this process
+	sinceCycle time.Duration             // time since the current cycle began
+	hasPrev    bool                      // a cycle began before the current one
+	sincePrev  time.Duration             // time since the previous cycle began
+}
+
+// tick ages the pager by since and returns the cursor this tick's page reads
+// after and the page's due window: the time since the page was last read at
+// the latest, i.e. since the start of the cycle before the one it is read in
+// (0, the restart window (0, age], before this process read it).
+func (p *mergeQueueReentryPager) tick(since time.Duration) (*mergequeue.ReentryCursor, time.Duration) {
+	p.sinceCycle += since
+	p.sincePrev += since
+	switch {
+	case p.after == nil && p.started:
+		return nil, p.sinceCycle // this tick begins a cycle: the previous began at the current one's start
+	case p.after != nil && p.hasPrev:
+		return p.after, p.sincePrev
+	default:
+		return p.after, 0
+	}
+}
+
+// read records a successful page read: a tick that began a cycle rotates the
+// cycle marks, and a full page moves the cursor to its last row while a short
+// page wraps it to the oldest.
+func (p *mergeQueueReentryPager) read(page []mergequeue.Entry, limit int) {
+	if p.after == nil {
+		p.sincePrev, p.hasPrev = p.sinceCycle, p.started
+		p.sinceCycle, p.started = 0, true
+	}
+	p.after = nil
+	if len(page) >= limit {
+		p.after = mergequeue.ReentryCursorAt(page[len(page)-1])
+	}
+}
+
+// sweepMergeQueueReentries evaluates every DUE re-entry candidate on one page
+// (see the file comment) and returns how many re-entered. page carries the
+// keyset cursor between ticks; nil reads the first page with since as its
+// window and keeps no cursor. A store without the ReentryReader and
+// EjectionReader capabilities, or a candidate read error, does nothing; the
+// next tick retries.
+func (s *Server) sweepMergeQueueReentries(ctx context.Context, interval, since time.Duration, page *mergeQueueReentryPager) int {
 	if s.cfg.MergeQueue == nil || s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil || s.cfg.GitHub == nil {
 		return 0
 	}
@@ -107,16 +159,24 @@ func (s *Server) sweepMergeQueueReentries(ctx context.Context, interval, since t
 	if _, ok := s.cfg.MergeQueue.(mergequeue.EjectionReader); !ok {
 		return 0
 	}
-	cands, err := reader.ReentryCandidates(ctx, mergeQueueReentryLimit)
+	var after *mergequeue.ReentryCursor
+	window := since
+	if page != nil {
+		after, window = page.tick(since)
+	}
+	cands, err := reader.ReentryCandidates(ctx, after, mergeQueueReentryLimit)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: listing re-entry candidates failed; the next tick retries",
 			slog.String("error", err.Error()))
 		return 0
 	}
+	if page != nil {
+		page.read(cands, mergeQueueReentryLimit)
+	}
 	n := 0
 	for _, e := range cands {
-		if !yieldReprobeDue(e.SettledAge, since, interval) {
+		if !yieldReprobeDue(e.SettledAge, window, interval) {
 			continue
 		}
 		if s.reenterMergeQueueEntry(ctx, e) == reentryReentered {

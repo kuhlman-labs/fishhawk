@@ -287,6 +287,25 @@ func TestMergeQueuePromote_UnconfiguredAfterAuth(t *testing.T) {
 	}
 }
 
+// TestMergeQueuePromote_NoRunRepoFailsClosed: with a promote-capable store
+// but no run repository (requireRunAccount then cannot check the run's
+// account and falls through), an authorised operator reads 503
+// merge_queue_unconfigured for B (already first held: a no-op promote, so no
+// pump) and for D (a reordering promote), and the queue is unchanged.
+// MECHANISM: delete the RunRepo leg of the rung and B answers 200 (RED on the
+// status assertion, before D could commit a reorder).
+func TestMergeQueuePromote_NoRunRepoFailsClosed(t *testing.T) {
+	w := newMQPWorld(t)
+	w.f.srv.cfg.RunRepo = nil
+	for _, r := range []*mcqRun{w.b, w.d} {
+		rec := mqpPromote(w.f.srv, r.id.String(), promoteBody("x"), &promoteOperator)
+		if code, _ := promoteErrorCode(t, rec); rec.Code != http.StatusServiceUnavailable || code != mqPromoteCodeUnconfigured {
+			t.Fatalf("operator with no run repository = %d %s, want 503 %s:\n%s", rec.Code, code, mqPromoteCodeUnconfigured, rec.Body.String())
+		}
+	}
+	w.unchanged()
+}
+
 // TestMergeQueuePromote_StoreRefusalsMapped: one case per store refusal, each
 // read back as nothing written.
 func TestMergeQueuePromote_StoreRefusalsMapped(t *testing.T) {

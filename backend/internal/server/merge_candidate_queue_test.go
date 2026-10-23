@@ -45,6 +45,9 @@ const mcqBase = "main"
 type mcqPR struct {
 	head, branch, state string
 	merged              bool
+	// base is served as GET /pulls/{n}'s base.ref ("" serves mcqBase); a
+	// non-empty value is a PR retargeted to another base.
+	base string
 	// mergeableState is served as GET /pulls/{n}'s mergeable_state ("" by
 	// default, which merge-on-pass reads as not a positive answer).
 	mergeableState string
@@ -297,8 +300,12 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		pr, ok := g.prs[n]
 		var body string
 		if ok {
+			base := mcqBase
+			if pr.base != "" {
+				base = pr.base
+			}
 			body = fmt.Sprintf(`{"node_id":"PR_%d","state":%q,"merged":%t,"mergeable_state":%q,"head":{"sha":%q,"ref":%q},"base":{"ref":%q}}`,
-				n, pr.state, pr.merged, pr.mergeableState, pr.head, pr.branch, mcqBase)
+				n, pr.state, pr.merged, pr.mergeableState, pr.head, pr.branch, base)
 		}
 		g.mu.Unlock()
 		if !ok {
