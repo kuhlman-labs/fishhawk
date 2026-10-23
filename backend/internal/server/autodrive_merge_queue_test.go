@@ -13,6 +13,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -58,22 +59,37 @@ workflows:
 // admqMerger is a countable delegated GitHubMerger (it models auto-merge: it
 // never merges the PR).
 type admqMerger struct {
-	mu  sync.Mutex
-	n   int
-	err error
+	mu    sync.Mutex
+	n     int
+	heads []string
+	err   error
+	// hook, when set, replaces err: it runs inside the dispatch.
+	hook func(ctx context.Context, runRow *run.Run, head string) error
 }
 
-func (m *admqMerger) MergePullRequest(context.Context, *run.Run) error {
+func (m *admqMerger) MergePullRequest(ctx context.Context, runRow *run.Run, head string) error {
 	m.mu.Lock()
-	defer m.mu.Unlock()
 	m.n++
-	return m.err
+	m.heads = append(m.heads, head)
+	err, hook := m.err, m.hook
+	m.mu.Unlock()
+	if hook != nil {
+		return hook(ctx, runRow, head)
+	}
+	return err
 }
 
 func (m *admqMerger) calls() int {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	return m.n
+}
+
+// pins returns the head each delegated dispatch was pinned to (#4641).
+func (m *admqMerger) pins() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.heads...)
 }
 
 // admqReady seeds a may_merge-ready run at head: review stage settled, a
@@ -130,6 +146,56 @@ func TestAutoDrive_MayMergeNoEntryClaimsAndDispatches(t *testing.T) {
 	requireObserveOnly(t, w.admqDrive(r, m), autoDriveNoteAlreadyClaimed)
 	if m.calls() != 1 {
 		t.Fatalf("merger calls after the second tick = %d, want still 1", m.calls())
+	}
+}
+
+// TestAutoDriveMergeQueue_DelegatedDispatchPinsGateHead pins (#4641) that the
+// delegated arm dispatches PINNED to the head the merge-candidate gate
+// admitted (liveHead), the same head the claim records. Counterfactual:
+// passing "" to merger.MergePullRequest records an empty pin, RED.
+func TestAutoDriveMergeQueue_DelegatedDispatchPinsGateHead(t *testing.T) {
+	w := newMQMWorld(t)
+	r := w.admqReady("pin", "h1")
+	m := &admqMerger{}
+	if out := w.admqDrive(r, m); !out.Acted {
+		t.Fatalf("outcome = %+v, want acted", out)
+	}
+	if got := m.pins(); len(got) != 1 || got[0] != "h1" {
+		t.Fatalf("delegated pins = %q, want [h1]", got)
+	}
+}
+
+// TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly pins (#4641) the
+// delegated head-moved mapping: a pinned dispatch the forge refuses for a head
+// mismatch (forge.ErrMergeConflict) is observe-only autoDriveNoteHeadMoved,
+// never the "merge dispatch failed" error outcome, and the claim is RELEASED
+// (no claim row, a merge_dispatch_settled row outcome released at h1), so the
+// next tick re-gates at the new head. Counterfactual: deleting the
+// mergeDispatchHeadMoved branch returns the error outcome, RED.
+func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
+	w := newMQMWorld(t)
+	r := w.admqReady("hmv", "h1")
+	m := &admqMerger{err: fmt.Errorf("%w: %w", forge.ErrMergeConflict,
+		&githubclient.HeadMismatchError{Basis: githubclient.HeadMismatchPrecheck, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})}
+	runRow, err := w.repo.GetRun(context.Background(), r.id)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	out, derr := w.srv.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), m, nil)
+	if derr != nil {
+		t.Fatalf("AutoDriveRunGate error = %v, want nil (head moved is observe-only)", derr)
+	}
+	requireObserveOnly(t, out, autoDriveNoteHeadMoved)
+	var head string
+	if st, _ := w.claimRow(r, &head); st != "" {
+		t.Fatalf("claim = %q@%s, want released (no row)", st, head)
+	}
+	settled := w.rows(r, categoryMergeDispatchSettled)
+	if len(settled) != 1 {
+		t.Fatalf("merge_dispatch_settled rows = %d, want 1", len(settled))
+	}
+	if p := w.payload(settled[0]); p["outcome"] != string(mergeDispatchRelease) || p["head_sha"] != "h1" || p["path"] != mergequeue.DispatchPathDelegated {
+		t.Fatalf("settled payload = %v, want released/delegated@h1", p)
 	}
 }
 
@@ -410,21 +476,32 @@ func TestAutoDrive_MayMergeDelegatedDispatchThenMergeOnPassDispatchesOnce(t *tes
 // TestAutoDrive_MayMergeRefusalReleasesClaim (ruling R1, delegated arm): a
 // dispatch refusal that applied nothing (checks pending, a 409 head
 // mismatch) RELEASES the delegated claim on the real ledger, so the next
-// tick claims again and dispatches.
+// tick claims again and dispatches. The dispatch is pinned to the admitted
+// head, so a head mismatch is the observe-only head-moved outcome (#4641);
+// checks pending still surfaces as a dispatch error.
 func TestAutoDrive_MayMergeRefusalReleasesClaim(t *testing.T) {
-	for name, refusal := range map[string]error{
-		"checks pending":    fmt.Errorf("enable auto-merge: %w", forge.ErrPullRequestUnstableStatus),
-		"409 head mismatch": fmt.Errorf("merge pr: %w", forge.ErrMergeConflict),
+	for name, tc := range map[string]struct {
+		refusal  error
+		headNote bool
+	}{
+		"checks pending":    {fmt.Errorf("enable auto-merge: %w", forge.ErrPullRequestUnstableStatus), false},
+		"409 head mismatch": {fmt.Errorf("merge pr: %w", forge.ErrMergeConflict), true},
 	} {
 		t.Run(name, func(t *testing.T) {
 			w := newMQMWorld(t)
 			r := w.admqReady("rel", "h1")
-			m := &admqMerger{err: refusal}
+			m := &admqMerger{err: tc.refusal}
 			runRow, err := w.repo.GetRun(context.Background(), r.id)
 			if err != nil {
 				t.Fatalf("GetRun: %v", err)
 			}
-			if _, err := w.srv.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), m, nil); err == nil {
+			out, derr := w.srv.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), m, nil)
+			if tc.headNote {
+				if derr != nil {
+					t.Fatalf("head mismatch error = %v, want the observe-only head-moved outcome", derr)
+				}
+				requireObserveOnly(t, out, autoDriveNoteHeadMoved)
+			} else if derr == nil {
 				t.Fatal("the refused dispatch was not surfaced")
 			}
 			var head string

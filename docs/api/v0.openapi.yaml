@@ -15363,6 +15363,19 @@ paths:
         merged or the operator re-arms it
         (`backend/internal/mergequeue/README.md` § "Merge-dispatch ledger").
 
+        **Head-pinned dispatch (#4641, ADR-112 residual H3).** The inline
+        dispatch, like the delegated `may_merge` one, is PINNED to the head
+        the merge-candidate gate admitted: the head the dispatch claim
+        records and, on a declared approval gate, the head the
+        forge-approval fold judged. On GitHub the auto-merge
+        enable carries GraphQL `expectedHeadOid` and the clean-status REST
+        fallback carries `sha`. This is a behaviour change: gate-less GitHub
+        runs are pinned too. A forge refusal for a head mismatch releases
+        the claim and answers `409 merge_head_moved`. An empty gate head (an
+        ungated ADR-090 D7 admit, including every GitLab-family run, or a
+        merged-PR admit) keeps the unpinned ladder, and an unpinned forge
+        conflict stays `502 merge_dispatch_failed`.
+
         **Merge overlap guard (E83.61 / #4119).** AFTER the conflict guard and
         BEFORE the merge-candidate gate (so the ADR-093 enqueue arm can never
         enqueue an overlap-blocked run), the merge is refused `409
@@ -15525,7 +15538,7 @@ paths:
         '404': { $ref: '#/components/responses/NotFound' }
         '409':
           description: |
-            One of fourteen cases. (1) The run cannot be merged: no PR url or a
+            One of fifteen cases. (1) The run cannot be merged: no PR url or a
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
@@ -15736,7 +15749,29 @@ paths:
             `{run_id, pr_url, verdict_sequence, claim_state, claim_path,
             claim_head_sha, claimed_at, failure_cause}`; a `dispatch_failed`
             claim (an uncertain forge outcome) needs the operator re-arm
-            before a re-invoke.
+            before a re-invoke. (15) `merge_head_moved` (#4641, ADR-112
+            residual H3): the dispatch was PINNED to the head the
+            merge-candidate gate admitted (GitHub auto-merge
+            `expectedHeadOid`; clean-status REST fallback `sha`) and the forge
+            refused it because the pull request head moved after it. The
+            verdict row is recorded and durable, and the dispatch claim, when
+            one was held, is released (a release that does not land is
+            recorded `dispatch_failed` and the message names the re-arm).
+            `details` carry `{run_id, pr_url, verdict_sequence,
+            head_sha, refusal_basis, next_step: "fishhawk_merge_run"}`, where
+            `head_sha` is the pinned head. `refusal_basis` `precheck` (the
+            client read a different head and sent no mutation) and `rest_sha`
+            (GitHub's documented 409 for a `sha` mismatch) guarantee nothing
+            merged; `graphql_reread` (the auto-merge enable answered a GraphQL
+            error and a fresh read showed a different head) and `unknown` are
+            INFERRED, so if that enable had in fact applied, auto-merge may be
+            armed at the pinned head: inspect the pull request. The message
+            names the head the merge-candidate gate admitted, and the head the
+            approval was evaluated at only when the review stage declares an
+            approval gate. Re-invoke once the head settles (and is
+            re-approved, on a declared gate): the re-invoke re-runs the
+            merge-candidate gate (and, on a declared gate, the forge-approval
+            fold) at the new head.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15776,7 +15811,10 @@ paths:
             above (`merge_dispatch_failed`); the merge is retryable — a re-POST
             re-queues without duplicating the verdict. A checks-not-all-passed
             refusal is reported distinctly as `409 merge_checks_pending`, not
-            here, so this 502 is never a remedy-that-cannot-work.
+            here, so this 502 is never a remedy-that-cannot-work. A
+            head-pinned dispatch refused for a head mismatch is likewise the
+            distinct `409 merge_head_moved` (#4641); an UNPINNED forge
+            conflict (an empty gate head) stays here.
 
             Before writing this 502 the endpoint RE-OBSERVES the forge once
             (E45.87 / #3622), so a merge that landed in the observe-to-dispatch

@@ -33,7 +33,7 @@ import (
 // production GraphQL message from run a152a0a5.
 type unstableChecksMerger struct{}
 
-func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run) error {
+func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run, string) error {
 	return fmt.Errorf("%w: %w: enable auto-merge: Pull request Pull request is in unstable status",
 		forge.ErrValidation, forge.ErrPullRequestUnstableStatus)
 }
@@ -50,6 +50,54 @@ func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run) error
 // appears → RED. The description hard-wraps mid-phrase, so whitespace is
 // normalized before matching.
 func TestMergeRun_ToolDescriptionNamesHeldRemedy(t *testing.T) {
+	desc := wireMergeRunDescription(t)
+	for _, want := range []string{
+		"merge_candidate_held",
+		"a stalled line self-heals on the periodic pump",
+		"fishhawk_rebase_run_branch pumps the base manually",
+	} {
+		if !strings.Contains(desc, want) {
+			t.Errorf("fishhawk_merge_run description missing %q:\n%s", want, desc)
+		}
+	}
+	if strings.Contains(desc, "nothing to invoke") {
+		t.Errorf("fishhawk_merge_run description says %q; a stalled held line has a remedy:\n%s", "nothing to invoke", desc)
+	}
+}
+
+// TestMergeRun_ToolDescriptionNamesHeadMoved pins (#4641) that the
+// WIRE-VISIBLE fishhawk_merge_run description lists merge_head_moved as a 409
+// TOOL ERROR with its re-invoke guidance: the merge was pinned to the head the
+// merge-candidate gate admitted, only precheck / rest_sha are forge-guaranteed
+// "nothing applied" (approval condition C3), and a re-invoke re-gates at the
+// new head. Counterfactual: deleting the merge_head_moved entry from the
+// description's Tool errors list → every phrase below vanishes → RED.
+func TestMergeRun_ToolDescriptionNamesHeadMoved(t *testing.T) {
+	desc := wireMergeRunDescription(t)
+	errorsAt := strings.Index(desc, "Tool errors:")
+	if errorsAt < 0 {
+		t.Fatalf("fishhawk_merge_run description has no Tool errors list:\n%s", desc)
+	}
+	toolErrors := desc[errorsAt:]
+	for _, want := range []string{
+		"merge_head_moved (409",
+		"PINNED to the head the merge-candidate gate admitted (details.head_sha)",
+		"details.refusal_basis precheck / rest_sha means the forge applied nothing",
+		"graphql_reread / unknown is inferred, so auto-merge may be armed at the pinned head",
+		"Re-invoke once the head settles",
+		"the re-invoke re-gates at the new head",
+	} {
+		if !strings.Contains(toolErrors, want) {
+			t.Errorf("fishhawk_merge_run Tool errors list missing %q:\n%s", want, toolErrors)
+		}
+	}
+}
+
+// wireMergeRunDescription lists the tools over an in-memory MCP session and
+// returns fishhawk_merge_run's wire description, whitespace-normalized because
+// the description hard-wraps mid-phrase.
+func wireMergeRunDescription(t *testing.T) string {
+	t.Helper()
 	ctx := context.Background()
 	srv := mcp.NewServer(&mcp.Implementation{Name: "fishhawk", Version: "test"}, nil)
 	registerMergeRun(srv, nil)
@@ -80,19 +128,7 @@ func TestMergeRun_ToolDescriptionNamesHeldRemedy(t *testing.T) {
 	if raw == "" {
 		t.Fatal("fishhawk_merge_run is not wire-visible")
 	}
-	desc := strings.Join(strings.Fields(raw), " ")
-	for _, want := range []string{
-		"merge_candidate_held",
-		"a stalled line self-heals on the periodic pump",
-		"fishhawk_rebase_run_branch pumps the base manually",
-	} {
-		if !strings.Contains(desc, want) {
-			t.Errorf("fishhawk_merge_run description missing %q:\n%s", want, desc)
-		}
-	}
-	if strings.Contains(desc, "nothing to invoke") {
-		t.Errorf("fishhawk_merge_run description says %q; a stalled held line has a remedy:\n%s", "nothing to invoke", desc)
-	}
+	return strings.Join(strings.Fields(raw), " ")
 }
 
 // mergeRunFakeBackend is a self-contained backend stub for the merge_run

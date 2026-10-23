@@ -629,7 +629,7 @@ type orderedLogMerger struct {
 	err    error
 }
 
-func (m *orderedLogMerger) MergePullRequest(_ context.Context, _ *run.Run) error {
+func (m *orderedLogMerger) MergePullRequest(_ context.Context, _ *run.Run, _ string) error {
 	m.log.record(mergeOrderMerge)
 	m.called++
 	return m.err

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"strings"
 	"sync"
@@ -19,6 +20,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -162,14 +164,16 @@ func newAutoDriveServer(t *testing.T) (*Server, *autoDriveRepo, *auditFake, *fak
 // fakeMerger records GitHubMerger.MergePullRequest calls and can inject a
 // failure to exercise the dispatch-error path.
 type fakeMerger struct {
-	called int
-	gotRun *run.Run
-	err    error
+	called  int
+	gotRun  *run.Run
+	gotHead string
+	err     error
 }
 
-func (m *fakeMerger) MergePullRequest(_ context.Context, r *run.Run) error {
+func (m *fakeMerger) MergePullRequest(_ context.Context, r *run.Run, head string) error {
 	m.called++
 	m.gotRun = r
+	m.gotHead = head
 	return m.err
 }
 
@@ -1264,6 +1268,34 @@ func TestAutoDriveRunGate_MergeDispatchError(t *testing.T) {
 	}
 	if countAudit(au, CategoryPRMerged) != 0 {
 		t.Error("post-merge settle ran despite a merge failure")
+	}
+}
+
+// TestAutoDriveRunGate_UnpinnedMergeConflictStillFails pins (#4641) that the
+// delegated head-moved mapping needs a PINNED dispatch: with no GitHub client
+// the merge-candidate gate admits ungated (ADR-090 D7), liveHead is empty, the
+// merger receives "", and a forge.ErrMergeConflict keeps the "merge dispatch
+// failed" error outcome rather than the observe-only autoDriveNoteHeadMoved.
+func TestAutoDriveRunGate_UnpinnedMergeConflictStillFails(t *testing.T) {
+	s, repo, au, _ := newAutoDriveServer(t)
+	runID, stages := startAutoDriveRun(t, s, repo)
+	stages[0].State = run.StageStateSucceeded
+	stages[1].State = run.StageStateSucceeded
+	if _, err := repo.TransitionRun(context.Background(), runID, run.StateRunning); err != nil {
+		t.Fatalf("TransitionRun -> running: %v", err)
+	}
+	if _, err := repo.SetRunPullRequestURL(context.Background(), runID, "https://github.com/x/y/pull/12"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+	seedReviewEntry(t, au, runID, 5, drive.Category, drive.Advance{Rule: drive.RuleChecksGreenAwaitingMerge})
+
+	merger := &fakeMerger{err: fmt.Errorf("enable auto-merge: %w", forge.ErrMergeConflict)}
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), merger, nil)
+	if err == nil || out.Note == autoDriveNoteHeadMoved {
+		t.Fatalf("AutoDriveRunGate = %+v, %v; want the merge dispatch error (an unpinned conflict is not head-moved)", out, err)
+	}
+	if merger.called != 1 || merger.gotHead != "" {
+		t.Fatalf("merger called %d with head %q, want 1 unpinned call", merger.called, merger.gotHead)
 	}
 }
 

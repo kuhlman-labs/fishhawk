@@ -1373,8 +1373,91 @@ func rulesetMatchesBranch(conditions *struct {
 // has it queued returns success rather than failing. The dispatcher
 // can call this multiple times across retries without special-
 // casing.
+//
+// EnableAutoMerge is UNPINNED: its mutation carries no expectedHeadOid, so
+// GitHub queues the merge at whatever head the PR has. EnableAutoMergeAtHead
+// is the pinned sibling (#4641).
 func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScope,
 	repo RepoRef, prNumber int, method MergeMethod) error {
+	return c.enableAutoMerge(ctx, scope, repo, prNumber, method, "")
+}
+
+// Head-mismatch refusal bases (#4641). A head-pinned merge refused because
+// the pull request's head is no longer the expected one carries a
+// *HeadMismatchError naming HOW the mismatch was established, because the
+// three arms differ in what they guarantee:
+//
+//   - HeadMismatchPrecheck: EnableAutoMergeAtHead's pre-mutation GET showed a
+//     different head, so NO mutation was sent. Nothing was applied.
+//   - HeadMismatchRESTSha: the pinned REST PUT .../merge answered 409, which
+//     GitHub documents as "sha was provided and pull request head did not
+//     match". The forge refused the merge; nothing was applied.
+//   - HeadMismatchGraphQLReread: the pinned enablePullRequestAutoMerge mutation
+//     answered a GraphQL error and a FRESH GET then showed a different head.
+//     The mismatch is INFERRED: GitHub does not document the error wording for
+//     an expectedHeadOid mismatch, so if the mutation had in fact applied,
+//     auto-merge may be armed at the pinned head. This arm is not a forge
+//     guarantee that nothing was applied.
+const (
+	HeadMismatchPrecheck      = "precheck"
+	HeadMismatchRESTSha       = "rest_sha"
+	HeadMismatchGraphQLReread = "graphql_reread"
+)
+
+// HeadMismatchError is the typed detail of a head-pinned merge refused for a
+// head mismatch (#4641). It always travels wrapped ALONGSIDE ErrMergeConflict
+// (the sentinel callers switch on); errors.As recovers it to read Basis.
+// ObservedHeadSHA is empty when the forge did not report the current head
+// (the REST sha arm).
+type HeadMismatchError struct {
+	Basis           string
+	ExpectedHeadSHA string
+	ObservedHeadSHA string
+}
+
+func (e *HeadMismatchError) Error() string {
+	observed := e.ObservedHeadSHA
+	if observed == "" {
+		observed = "unknown"
+	}
+	return fmt.Sprintf("pull request head moved: expected %s, observed %s (basis %s)",
+		e.ExpectedHeadSHA, observed, e.Basis)
+}
+
+// EnableAutoMergeAtHead is EnableAutoMerge with the head PINNED (#4641): the
+// enablePullRequestAutoMerge input carries expectedHeadOid, which GitHub
+// documents as "The expected head OID of the pull request"
+// (https://docs.github.com/en/graphql/reference/input-objects#enablepullrequestautomergeinput).
+//
+//   - An empty (or whitespace) expectedHeadSHA is refused before any HTTP call,
+//     so the pinned seam never silently degrades into an unpinned enable.
+//   - The GET made for the node id doubles as a PRE-CHECK: a head other than
+//     expectedHeadSHA returns ErrMergeConflict (with a *HeadMismatchError,
+//     basis precheck) and NO mutation is sent.
+//   - The mutation declares `$expectedHeadOid: GitObjectID!` (non-null, so a
+//     missing value is a GraphQL validation error, never a silent unpinned
+//     enable) and passes `expectedHeadOid: $expectedHeadOid`.
+//   - A GraphQL error envelope keeps EnableAutoMerge's clean-status /
+//     unstable-status classification first. ANY other GraphQL error re-reads
+//     the PR once: when that read succeeds and names a head other than
+//     expectedHeadSHA the error is ErrValidation AND ErrMergeConflict (with a
+//     *HeadMismatchError, basis graphql_reread), independent of GitHub's
+//     undocumented error wording. An unmoved head or a failed re-read keeps
+//     the generic ErrValidation: an uncertain outcome, never a typed refusal.
+func (c *Client) EnableAutoMergeAtHead(ctx context.Context, scope forge.CredentialScope,
+	repo RepoRef, prNumber int, method MergeMethod, expectedHeadSHA string) error {
+	if strings.TrimSpace(expectedHeadSHA) == "" {
+		return errors.New("githubclient: enable auto-merge at head: expected head sha required")
+	}
+	return c.enableAutoMerge(ctx, scope, repo, prNumber, method, expectedHeadSHA)
+}
+
+// enableAutoMerge is the shared body of EnableAutoMerge and
+// EnableAutoMergeAtHead. An empty expectedHeadSHA sends the unpinned mutation
+// byte-identically to the pre-#4641 request; a non-empty one pre-checks the
+// head, pins the mutation, and classifies a moved head on a GraphQL error.
+func (c *Client) enableAutoMerge(ctx context.Context, scope forge.CredentialScope,
+	repo RepoRef, prNumber int, method MergeMethod, expectedHeadSHA string) error {
 	installationID, err := installationIDForScope(scope)
 	if err != nil {
 		return err
@@ -1397,18 +1480,37 @@ func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScop
 		return err
 	}
 	nodeID := pr.NodeID
+	pinned := expectedHeadSHA != ""
+	// Pre-check (#4641): the head GitHub reports now is not the head the
+	// caller evaluated, so refuse before sending anything. Nothing applied.
+	if pinned && pr.HeadSHA != expectedHeadSHA {
+		return fmt.Errorf("%w: enable auto-merge pr #%d: mutation not sent: %w", ErrMergeConflict, prNumber,
+			&HeadMismatchError{Basis: HeadMismatchPrecheck, ExpectedHeadSHA: expectedHeadSHA, ObservedHeadSHA: pr.HeadSHA})
+	}
 
 	mutation := `mutation EnableAutoMerge($id: ID!, $method: PullRequestMergeMethod!) {
   enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method }) {
     pullRequest { number url state }
   }
 }`
+	variables := map[string]any{
+		"id":     nodeID,
+		"method": string(method),
+	}
+	if pinned {
+		// ONE variable name everywhere: the declaration, the argument binding
+		// and the variables key are all expectedHeadOid, so a mismatch cannot
+		// resolve the pin to null.
+		mutation = `mutation EnableAutoMerge($id: ID!, $method: PullRequestMergeMethod!, $expectedHeadOid: GitObjectID!) {
+  enablePullRequestAutoMerge(input: { pullRequestId: $id, mergeMethod: $method, expectedHeadOid: $expectedHeadOid }) {
+    pullRequest { number url state }
+  }
+}`
+		variables["expectedHeadOid"] = expectedHeadSHA
+	}
 	body := map[string]any{
-		"query": mutation,
-		"variables": map[string]any{
-			"id":     nodeID,
-			"method": string(method),
-		},
+		"query":     mutation,
+		"variables": variables,
 	}
 	raw, err := json.Marshal(body)
 	if err != nil {
@@ -1464,16 +1566,97 @@ func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScop
 		if strings.Contains(lower, "unstable status") {
 			return fmt.Errorf("%w: %w: enable auto-merge: %s", ErrValidation, ErrPullRequestUnstableStatus, msg)
 		}
+		// A pinned enable refused for any other reason may be the
+		// expectedHeadOid mismatch, whose wording GitHub does not document
+		// (#4641). Never substring-match it: re-read the PR once and classify
+		// a head mismatch only when that read succeeds and names a different,
+		// non-empty head. An unmoved head or a failed read stays the generic
+		// ErrValidation below (an uncertain outcome).
+		if pinned {
+			cur, rerr := c.GetPullRequest(ctx, scope, repo, prNumber)
+			if rerr == nil && cur.HeadSHA != "" && cur.HeadSHA != expectedHeadSHA {
+				return fmt.Errorf("%w: %w: enable auto-merge: %s: %w", ErrValidation, ErrMergeConflict, msg,
+					&HeadMismatchError{Basis: HeadMismatchGraphQLReread, ExpectedHeadSHA: expectedHeadSHA, ObservedHeadSHA: cur.HeadSHA})
+			}
+			if rerr != nil {
+				return fmt.Errorf("%w: enable auto-merge: %s (head re-read failed: %v)", ErrValidation, msg, rerr)
+			}
+		}
 		return fmt.Errorf("%w: enable auto-merge: %s", ErrValidation, msg)
 	}
 	return nil
+}
+
+// QueueMerge is the operator merge ladder for a GitHub pull request (#4641,
+// moved from serve.go's githubAutoMerger so the ladder is one tested
+// production function): queue auto-merge, and fall back to a synchronous REST
+// merge ONLY when GitHub refuses to queue because the PR is already
+// merge-ready.
+//
+// A non-empty expectedHeadSHA PINS both arms: EnableAutoMergeAtHead
+// (expectedHeadOid) and, on the clean-status fallback, MergePullRequestAtHead
+// (`sha`). A head mismatch on either arm surfaces as ErrMergeConflict carrying
+// a *HeadMismatchError (basis precheck, graphql_reread or rest_sha). An empty
+// expectedHeadSHA means no head was evaluated and keeps the unpinned ladder
+// (EnableAutoMerge, then MergePullRequest), request-identical to before.
+// A whitespace-only expectedHeadSHA is NOT treated as empty: it reaches
+// EnableAutoMergeAtHead and is refused, so it never degrades to unpinned.
+func (c *Client) QueueMerge(ctx context.Context, scope forge.CredentialScope,
+	repo RepoRef, prNumber int, method MergeMethod, expectedHeadSHA string) error {
+	pinned := expectedHeadSHA != ""
+	// Primary: queue GitHub auto-merge so the PR lands once the repository's
+	// branch protection clears. What that protection actually requires is a
+	// repo property, not a Fishhawk one (E64.44 / #3161): Fishhawk PUBLISHES
+	// the fishhawk_audit_complete check but does not make it required, so an
+	// auto-merge on a repo that does not require it can fire with the review
+	// verdict still pending. The onboarding-readiness merge_gate rung
+	// (backend/internal/mergegate) reports what the forge enforces.
+	var err error
+	if pinned {
+		err = c.EnableAutoMergeAtHead(ctx, scope, repo, prNumber, method, expectedHeadSHA)
+	} else {
+		err = c.EnableAutoMerge(ctx, scope, repo, prNumber, method)
+	}
+	if err == nil {
+		return nil
+	}
+	// Fallback (E48.7 / #1954): enablePullRequestAutoMerge errors on a PR that
+	// is ALREADY merge-ready ("clean status") — the common operator flow where
+	// `gh pr review --approve` plus green required checks settle the PR clean
+	// before the merge verb runs. GitHub refuses to queue auto-merge on a
+	// synchronously-mergeable PR, so merge it directly via REST. Any OTHER
+	// enable error surfaces unchanged (no fallback).
+	//
+	// The exclusion is deliberate and load-bearing: this fallback covers ONLY
+	// the clean-status class. An UNSTABLE-status rejection (ErrPullRequestUnstableStatus,
+	// E67.56 / #2717 — the PR's required checks have not all passed) must NOT be
+	// widened into it: a REST squash merge on an UNSTABLE PR would SUCCEED and
+	// land the change before its pending checks report. That class travels
+	// through untouched (errors.Is(err, ErrPullRequestCleanStatus) is false for
+	// it) and the server maps it to a bounded wait, not a merge. A head
+	// mismatch (ErrMergeConflict) likewise takes no fallback.
+	if !errors.Is(err, ErrPullRequestCleanStatus) {
+		return err
+	}
+	if !pinned {
+		return c.MergePullRequest(ctx, scope, repo, prNumber, method)
+	}
+	// The pinned fallback sends `sha`, which GitHub documents as the "SHA that
+	// pull request head must match to allow merge"; a 409 means "sha was
+	// provided and pull request head did not match"
+	// (https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request).
+	merr := c.MergePullRequestAtHead(ctx, scope, repo, prNumber, method, expectedHeadSHA)
+	if errors.Is(merr, ErrMergeConflict) {
+		return fmt.Errorf("%w: %w", merr, &HeadMismatchError{Basis: HeadMismatchRESTSha, ExpectedHeadSHA: expectedHeadSHA})
+	}
+	return merr
 }
 
 // MergePullRequest synchronously merges a PR via the REST API (E48.7 / #1954):
 //
 //	PUT /repos/{owner}/{repo}/pulls/{number}/merge
 //
-// It is the fallback the operator merge path takes when EnableAutoMerge is
+// It is QueueMerge's UNPINNED fallback when EnableAutoMerge is
 // rejected with ErrPullRequestCleanStatus — a PR that is already merge-ready
 // (approved, required checks green) cannot be queued for auto-merge, so it is
 // merged directly here instead. The wire `merge_method` is the lower-cased
@@ -1497,7 +1680,8 @@ func (c *Client) MergePullRequest(ctx context.Context, scope forge.CredentialSco
 // after the caller verified it is refused by the forge rather than merged. It is
 // the merge-on-pass seam's GitHub leaf and is ALWAYS synchronous — it never
 // queues auto-merge, because a queued auto-merge waits on checks while the base
-// may move, defeating the pin.
+// may move, defeating the pin. QueueMerge's PINNED clean-status fallback also
+// calls it (#4641).
 //
 // An empty expectedHeadSHA is refused before any HTTP call (an unpinned merge
 // through this method would silently degrade to MergePullRequest). Status
@@ -1588,7 +1772,9 @@ func (c *Client) mergePullRequest(ctx context.Context, scope forge.CredentialSco
 // ErrForbidden on auth issues. Used by:
 //
 //   - `EnableAutoMerge` (#255) — for the node id (the GraphQL
-//     mutation can't be addressed by number).
+//     mutation can't be addressed by number); `EnableAutoMergeAtHead`
+//     (#4641) also reads the head from it as the pre-check, and re-reads
+//     once to classify a moved head on a pinned GraphQL error.
 //   - `auditcomplete.Compute` rule 5 (#282) — for the live head_sha
 //     comparison.
 func (c *Client) GetPullRequest(ctx context.Context, scope forge.CredentialScope,

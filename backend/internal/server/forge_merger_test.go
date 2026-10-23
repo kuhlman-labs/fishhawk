@@ -23,14 +23,22 @@ import (
 type recordingMerger struct {
 	mu    sync.Mutex
 	calls []uuid.UUID
+	heads []string
 	err   error
 }
 
-func (m *recordingMerger) MergePullRequest(_ context.Context, runRow *run.Run) error {
+func (m *recordingMerger) MergePullRequest(_ context.Context, runRow *run.Run, head string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.calls = append(m.calls, runRow.ID)
+	m.heads = append(m.heads, head)
 	return m.err
+}
+
+func (m *recordingMerger) gotHeads() []string {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	return append([]string(nil), m.heads...)
 }
 
 func (m *recordingMerger) callCount() int {
@@ -120,7 +128,7 @@ func TestForgeMerger_GitHubFamily_DelegatesAndNeverConsultsResolver(t *testing.T
 		{ID: uuid.New()},
 	}
 	for _, rr := range runs {
-		if err := m.MergePullRequest(context.Background(), rr); err != nil {
+		if err := m.MergePullRequest(context.Background(), rr, ""); err != nil {
 			t.Fatalf("MergePullRequest(github family) error = %v, want nil", err)
 		}
 	}
@@ -129,9 +137,49 @@ func TestForgeMerger_GitHubFamily_DelegatesAndNeverConsultsResolver(t *testing.T
 	}
 }
 
+// TestForgeMerger_GitHubFamilyThreadsPinnedHead pins (#4641) that the github
+// arm hands the evaluated head to the github leaf unchanged: a pinned call
+// records the head, an unpinned call records "".
+func TestForgeMerger_GitHubFamilyThreadsPinnedHead(t *testing.T) {
+	merger := &recordingMerger{}
+	m := ForgeMerger{GitHub: merger}
+	id42 := int64(42)
+	rr := &run.Run{ID: uuid.New(), InstallationID: &id42}
+	const h1 = "1111111111111111111111111111111111111111"
+	if err := m.MergePullRequest(context.Background(), rr, h1); err != nil {
+		t.Fatalf("MergePullRequest(pinned) error = %v, want nil", err)
+	}
+	if err := m.MergePullRequest(context.Background(), rr, ""); err != nil {
+		t.Fatalf("MergePullRequest(unpinned) error = %v, want nil", err)
+	}
+	if got := merger.gotHeads(); len(got) != 2 || got[0] != h1 || got[1] != "" {
+		t.Fatalf("github leaf heads = %q, want [%q \"\"]", got, h1)
+	}
+}
+
+// TestForgeMerger_NonGitHubPinnedHeadRefused pins ruling R6 (#4641): a
+// non-github family has no pinned auto-merge, so a non-empty pin is REFUSED
+// with ErrHeadPinnedMergeUnsupported before the forge is resolved or called —
+// never silently dropped onto the unpinned EnableAutoMerge ladder.
+func TestForgeMerger_NonGitHubPinnedHeadRefused(t *testing.T) {
+	fake := &fakeMergeForge{name: "gitlab"}
+	resolved := 0
+	m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { resolved++; return fake, nil }}
+	err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "2222222222222222222222222222222222222222")
+	if !errors.Is(err, ErrHeadPinnedMergeUnsupported) {
+		t.Fatalf("MergePullRequest(gitlab, pinned) error = %v, want ErrHeadPinnedMergeUnsupported", err)
+	}
+	if fake.enableCalls != 0 || fake.mergeCalls != 0 {
+		t.Fatalf("forge calls enable=%d merge=%d, want 0/0 (refused before any forge call)", fake.enableCalls, fake.mergeCalls)
+	}
+	if resolved != 0 {
+		t.Fatalf("resolver calls = %d, want 0 (refused before resolution)", resolved)
+	}
+}
+
 func TestForgeMerger_GitHubFamily_NilGitHub_FailsClosed(t *testing.T) {
 	m := ForgeMerger{} // GitHub is a nil interface, Resolver nil.
-	err := m.MergePullRequest(context.Background(), &run.Run{ID: uuid.New()})
+	err := m.MergePullRequest(context.Background(), &run.Run{ID: uuid.New()}, "")
 	if err == nil {
 		t.Fatal("MergePullRequest with nil github leaf = nil, want an error (no panic)")
 	}
@@ -141,7 +189,7 @@ func TestForgeMerger_GitLabFamily_MergesViaResolvedForge(t *testing.T) {
 	fake := &fakeMergeForge{name: "gitlab"}
 	m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return fake, nil }}
 
-	if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL)); err != nil {
+	if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), ""); err != nil {
 		t.Fatalf("MergePullRequest(gitlab) error = %v, want nil", err)
 	}
 	if fake.enableCalls != 1 {
@@ -165,7 +213,7 @@ func TestForgeMerger_GitLabFamily_CleanStatus_FallsBackToMerge(t *testing.T) {
 	t.Run("clean status falls back", func(t *testing.T) {
 		fake := &fakeMergeForge{name: "gitlab", enableErr: forge.ErrPullRequestCleanStatus}
 		m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return fake, nil }}
-		if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL)); err != nil {
+		if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), ""); err != nil {
 			t.Fatalf("error = %v, want nil after fallback", err)
 		}
 		if fake.enableCalls != 1 || fake.mergeCalls != 1 {
@@ -176,7 +224,7 @@ func TestForgeMerger_GitLabFamily_CleanStatus_FallsBackToMerge(t *testing.T) {
 		sentinel := errors.New("boom")
 		fake := &fakeMergeForge{name: "gitlab", enableErr: sentinel}
 		m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return fake, nil }}
-		err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL))
+		err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "")
 		if !errors.Is(err, sentinel) {
 			t.Fatalf("error = %v, want the sentinel returned verbatim", err)
 		}
@@ -252,7 +300,7 @@ func TestForgeMerger_GitLabFamily_Rungs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			m := ForgeMerger{Resolver: tc.resolver}
-			err := m.MergePullRequest(context.Background(), tc.run)
+			err := m.MergePullRequest(context.Background(), tc.run, "")
 			if tc.wantErr && err == nil {
 				t.Fatalf("error = nil, want an error")
 			}
@@ -272,7 +320,7 @@ func TestForgeMerger_GitLabFamily_NilResolver_DefaultsToRegistry(t *testing.T) {
 		// resolves nothing for "gitlab" in the test process → a resolve error,
 		// not a panic.
 		m := ForgeMerger{}
-		err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL))
+		err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "")
 		if err == nil {
 			t.Fatal("MergePullRequest(nil resolver) = nil, want a forge-resolution error")
 		}
@@ -287,7 +335,7 @@ func TestForgeMerger_GitLabFamily_NilResolver_DefaultsToRegistry(t *testing.T) {
 		// Resolver left nil → defaults to forge.Get, which finds the registered
 		// fake.
 		m := ForgeMerger{}
-		if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL)); err != nil {
+		if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), ""); err != nil {
 			t.Fatalf("MergePullRequest(registered gitlab forge) error = %v, want nil", err)
 		}
 		if fake.enableCalls != 1 {
@@ -312,7 +360,7 @@ func TestForgeMerger_GitLabFamily_NoPullRequestURL_FailsClosed(t *testing.T) {
 		t.Fatal("resolver consulted despite an unresolvable target")
 		return nil, nil
 	}}
-	if err := m.MergePullRequest(context.Background(), runRow); err == nil {
+	if err := m.MergePullRequest(context.Background(), runRow, ""); err == nil {
 		t.Fatal("MergePullRequest(no pr url) = nil, want a fail-closed error")
 	}
 }
@@ -322,7 +370,7 @@ func TestForgeMerger_GitLab_RealAdapter_EndToEnd(t *testing.T) {
 	realForge := realGitLabMergeForge(t, &gotBody)
 	m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return realForge, nil }}
 
-	if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL)); err != nil {
+	if err := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), ""); err != nil {
 		t.Fatalf("MergePullRequest(real gitlab adapter) error = %v, want nil", err)
 	}
 	var body map[string]any

@@ -480,8 +480,17 @@ Tool errors:
     merge settles through the forge, a dispatch_failed claim (an uncertain
     forge outcome) needs the operator re-arm unless the pull request reads
     merged; a merge_checks_pending refusal releases the claim, so its
-    re-invoke claims again), merge_dispatch_unclaimed (503 — the dispatch claim
-    could not be written; nothing dispatched; retryable),
+    re-invoke claims again), merge_head_moved (409 — #4641: the merge was
+    PINNED to the head the merge-candidate gate admitted (details.head_sha)
+    and the forge refused it because the pull request head moved after it;
+    a held claim was released (the message names the re-arm if the release
+    did not land). details.refusal_basis precheck / rest_sha means
+    the forge applied nothing; graphql_reread / unknown is inferred, so
+    auto-merge may be armed at the pinned head; inspect the pull request.
+    Re-invoke once the head settles and, on a declared approval gate, is
+    re-approved: the re-invoke re-gates at the new head),
+    merge_dispatch_unclaimed (503 — the dispatch claim could not be written;
+    nothing dispatched; retryable),
     overlap_check_failed (502 — the merge overlap guard could not read the
     forge, the live runs or a run's stages, so it refused; retryable;
     re-invoke, or override with allow_overlap), overlap_override_unrecorded
