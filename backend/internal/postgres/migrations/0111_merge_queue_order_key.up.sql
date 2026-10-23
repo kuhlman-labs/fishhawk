@@ -1,0 +1,18 @@
+-- 0111: merge_candidate_queue_entries.order_key — the operator promote's
+-- ordering key (ADR-093 slice 3 / #4297, the shape 0102 gave
+-- stage_concurrency_slots for #4191). backend/internal/mergequeue is the only
+-- reader and writer; its README is the contract.
+--
+-- NULL means the row is ordered FIFO by enqueued_at. Only
+-- mergequeue.Store.Promote sets it, to 1 ms ahead of every other unmarked
+-- held entry on the same base and account. The effective queue order is
+-- (COALESCE(order_key, enqueued_at), id) in AdmitNext, ListForBase and the
+-- held position, so every row without a promotion keeps strict FIFO.
+-- enqueued_at is never rewritten by a promotion and stays the eligibility
+-- time. Unadmit, Yield, ClearYield and the re-anchors keep order_key; a FRESH
+-- row (a re-entry after a terminal row, or a base change) carries none, so it
+-- joins at the tail (ADR-093 Q2).
+--
+-- No backfill and no index: the base index (0101) already serves the per-base
+-- reads, and a base holds a handful of active rows.
+ALTER TABLE merge_candidate_queue_entries ADD COLUMN order_key TIMESTAMPTZ NULL;
