@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/latency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -2113,7 +2114,7 @@ func TestNotifyStatusUpdateForRun_AnchorEndToEnd(t *testing.T) {
 	}
 
 	body := gh.updateCalls[len(gh.updateCalls)-1].body
-	if !strings.Contains(body, "claude-opus-4-8: approve") || !strings.Contains(body, "gpt-5.5: reject (1 high)") {
+	if !strings.Contains(body, "Plan Reviewer (claude-opus-4-8): approve") || !strings.Contains(body, "Plan Reviewer (gpt-5.5): reject (1 high)") {
 		t.Errorf("anchor missing inline reviewer verdicts:\n%s", body)
 	}
 	if !strings.Contains(body, "Add the living anchor") {
@@ -3148,6 +3149,52 @@ func TestPRReview_OneTerminalVerdict_PostsOneComment(t *testing.T) {
 	}
 	if got := prReviewAuditCount(au); got != 1 {
 		t.Fatalf("expected 1 pr_review_posted row; got %d", got)
+	}
+	assertAllReviewsComment(t, gh)
+}
+
+// TestPRReview_PersonaVerdict_HeaderNamesRole pins the agent-review PR
+// review's role heading end to end on GitHub, the only forge with a PR-review
+// surface (E89.33 / #4669, AC1): one round's standard verdict and security
+// persona verdict — seeded as json.Marshal of the REAL ImplementReviewedPayload
+// — post two CreateReview bodies, each headed by its own role.
+func TestPRReview_PersonaVerdict_HeaderNamesRole(t *testing.T) {
+	runID, _, _, gh, au, _, n := prStatusDeps(t)
+	for _, p := range []planreview.ImplementReviewedPayload{
+		{ReviewerKind: "agent", ReviewerModel: "claude-opus-5-5", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictApprove},
+		{ReviewerKind: "agent", ReviewerModel: "gpt-6-astra", Authority: planreview.AuthorityAdvisory, Verdict: planreview.VerdictReject,
+			Concerns: []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "security", Note: "token logged"}}, Persona: "security"},
+	} {
+		body, err := json.Marshal(p)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(body, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		au.preSeed(runID, "implement_reviewed", m)
+	}
+
+	if err := n.NotifyStatusUpdateForRun(context.Background(), runID); err != nil {
+		t.Fatalf("rebuild: %v", err)
+	}
+	gh.mu.Lock()
+	calls := append([]ghReviewCall(nil), gh.reviewCalls...)
+	gh.mu.Unlock()
+	if len(calls) != 2 {
+		t.Fatalf("expected 2 PR reviews; got %d", len(calls))
+	}
+	for i, want := range []struct{ header, model string }{
+		{"### 🤖 PR Reviewer — agent implement review\n", "claude-opus-5-5"},
+		{"### 🤖 Security Reviewer — agent implement review\n", "gpt-6-astra"},
+	} {
+		if !strings.HasPrefix(calls[i].body, want.header) {
+			t.Errorf("review %d: want heading %q; got:\n%s", i, want.header, calls[i].body)
+		}
+		if !strings.Contains(calls[i].body, "_Advisory review by `"+want.model+"`") {
+			t.Errorf("review %d: attribution must still name %q; got:\n%s", i, want.model, calls[i].body)
+		}
 	}
 	assertAllReviewsComment(t, gh)
 }

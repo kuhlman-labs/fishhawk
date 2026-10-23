@@ -98,10 +98,10 @@ func pageClassEvents(entries []*audit.Entry, stages []*run.Stage) []pageEvent {
 			verdict, model := decodeReviewerVerdict(e.Payload)
 			if verdict == "reject" {
 				stage := strings.TrimSuffix(e.Category, "_reviewed")
-				who := model
-				if who == "" {
-					who = "A reviewer"
-				}
+				// Name the reviewer's role ahead of its model (E89.33 / #4669):
+				// "Security Reviewer (<model>)", or the stage's standard role
+				// ("Plan Reviewer" / "PR Reviewer") alone when no model is known.
+				who := roleWithModel(reviewerRole(stage, reviewerPersonaOf(e.Payload)), model)
 				// A reviewer reject is ADVISORY — the operator arbitrates the
 				// gate. Word it so it cannot read as a GATE rejection (a stale
 				// "🚫 rejected the plan" as the thread's last word when the

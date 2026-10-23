@@ -1294,6 +1294,13 @@ type ReviewFailedPayload struct {
 	// #664 and MCP await-review readers are unaffected. omitempty keeps the
 	// payload byte-identical to pre-#747 entries on the non-timeout path.
 	Timeout bool `json:"timeout,omitempty"`
+
+	// Persona names the reviewer persona (ADR-084 / #3753) whose invocation
+	// failed, so a comment surface can name the failed reviewer's role (E89.33 /
+	// #4669); the Reason prose keeps its "persona <name>: " prefix. Empty for a
+	// standard reviewer and for a reconcile/redispatch-synthesized or pre-round
+	// failure; omitempty keeps every one of those payloads byte-identical.
+	Persona string `json:"persona,omitempty"`
 }
 
 // PlanReviewedPayload is the JSON payload stored in an audit entry

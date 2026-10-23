@@ -23,8 +23,10 @@ const PRReviewEventComment = "COMMENT"
 
 // RenderPRReviewBody renders ONE reviewer's implement_reviewed verdict as the
 // body of an advisory COMMENT-type PR review (E42.2 / #1785). It decodes the
-// entry's planreview.ImplementReviewedPayload and renders: a header line
-// naming the verdict token (with a severity-bucketed concern-count suffix), a
+// entry's planreview.ImplementReviewedPayload and renders: a heading naming
+// the reviewer's role (reviewerRole: "PR Reviewer" for a standard reviewer, the
+// declared persona's role otherwise, E89.33 / #4669), a header line naming the
+// verdict token (with a severity-bucketed concern-count suffix), a
 // severity-bucketed concern list reusing the anchor's
 // `- **<severity>** (<category>): <note>` shape, the free_form block, a
 // concern-resolutions arc when the reviewer judged prior concerns (a
@@ -59,7 +61,7 @@ func RenderPRReviewBody(entry *audit.Entry, runRow *run.Run, externalURL string)
 	}
 
 	var b strings.Builder
-	b.WriteString("### 🤖 Agent implement review\n\n")
+	fmt.Fprintf(&b, "### 🤖 %s — agent implement review\n\n", reviewerRole("implement", p.Persona))
 
 	header := fmt.Sprintf("**Verdict:** `%s`", p.Verdict)
 	if suffix := severityCountSuffix(concerns); suffix != "" {

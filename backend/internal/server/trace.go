@@ -5893,7 +5893,7 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 		// definite 'failed' state, with the #747 timeout discriminator
 		// distinguishing a budget-kill from a transport failure.
 		// hasRejection untouched (#574).
-		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, inv.personaFailureReason(err.Error()), res.timedOut)
+		s.emitInvocationReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, model, inv, err.Error(), res.timedOut)
 		return
 	}
 	verdict := res.verdict

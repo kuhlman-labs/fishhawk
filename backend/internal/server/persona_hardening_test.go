@@ -358,6 +358,11 @@ func TestPersonaHardening_HeldIngestDurability(t *testing.T) {
 			if r, _ := fp["reason"].(string); !strings.HasPrefix(r, "persona "+personaTestName+": ") {
 				t.Errorf("implement_review_failed reason = %q, want the persona prefix", r)
 			}
+			// E89.33 / #4669: the persona's failure names the persona in the
+			// structured field a comment surface renders the role from.
+			if got, _ := fp["persona"].(string); got != personaTestName {
+				t.Errorf("implement_review_failed persona = %v, want %q (raw %s)", fp["persona"], personaTestName, failed[0].Payload)
+			}
 			started := decodeStarted(t, au, "implement_review_started")
 			if started.ConfiguredAgents != 2 || !planreview.Settled(started.ConfiguredAgents, terminalCount(au, "implement")) {
 				t.Errorf("round does not settle: configured_agents %d, terminal entries %d", started.ConfiguredAgents, terminalCount(au, "implement"))
@@ -435,6 +440,12 @@ func TestPersonaHardening_HeldRoundPersonaCarriesSynthesizedConcern(t *testing.T
 	_ = json.Unmarshal(failed[0].Payload, &fp)
 	if r, _ := fp["reason"].(string); r == "" || strings.HasPrefix(r, "persona ") {
 		t.Errorf("implement_review_failed reason = %q, want the standard reviewer's failure with no persona prefix", r)
+	}
+	// E89.33 / #4669: a STANDARD reviewer's failure carries no persona key at
+	// all (absent, not ""), so its payload stays byte-identical to the
+	// pre-change shape.
+	if v, present := fp["persona"]; present {
+		t.Errorf("standard implement_review_failed payload carries persona = %v, want the key absent (raw %s)", v, failed[0].Payload)
 	}
 	started := decodeStarted(t, au, "implement_review_started")
 	if started.ConfiguredAgents != 2 || !planreview.Settled(started.ConfiguredAgents, terminalCount(au, "implement")) {
