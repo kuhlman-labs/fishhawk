@@ -1880,6 +1880,25 @@ Notes:
   `merge_candidate_verdict_false_transfer` never blocks a gate and is not a
   server_check concern.
 
+- The merge-queue yield audit kind `merge_queue_yield_posted` (ADR-112 R5,
+  E89.28 / #4632) has **no dedicated Notifier method**. It renders
+  **data-drivenly** on the run's ISSUE thread (the living-anchor / status
+  activity timeline, not the PR thread) through `activityCategories` +
+  `renderActivityLine`, and its writer, the yield re-probe sweep in
+  `server/merge_queue_yield_reprobe.go`, marks it with `notifyOperatorVisible`
+  after the append. It is written ONCE per yield episode (keyed on
+  `(entry_id, yielded_at)`, the dedup scan and append under the run's
+  merge-intent lock), and only once the entry has stayed yielded longer than
+  one pump tick. Line: "Merge queue: yielded its place in line
+  (<yield_reason>); next step: <next_step> — detail `` `<detail>` ``". The
+  reason and next step render only in their closed `[a-z_]+` shape (else
+  `unknown`); `yield_detail` is UNTRUSTED forge-derived text, sanitised by the
+  server's yield sanitiser before the append and rendered ONLY through
+  `issuecomment.NeutralizeUntrustedInline` inside ONE code span. No line names
+  an actor. The INTERNAL `merge_queue_yielded` (the yield and each reason
+  transition) and `merge_queue_yield_cleared` (the resolution) rows are
+  DELIBERATELY not registered.
+
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier
   method**, but as of E42.6 (#1789) `concern_deferred` renders **data-drivenly**

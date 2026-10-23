@@ -6,7 +6,9 @@
 // merge queue reuses the rows, FIFO order and lock order unchanged, adding
 // only the operator's merge intent (merge_intent_at, 0107), its recorded
 // audit sequence and the admission epoch (0108), the per-run merge-dispatch
-// ledger (0108) and the line-turn read. README.md is the contract.
+// ledger (0108) and the line-turn read. ADR-112 R3 adds the yield marker and
+// the persisted approval-wait anchor (0109): a marked held entry is skipped by
+// AdmitNext until ClearYield clears it. README.md is the contract.
 package mergequeue
 
 import (
@@ -131,9 +133,30 @@ type Entry struct {
 	MergeIntentSequence int64
 	// AdmissionEpoch is bumped by every admission (AdmitNext's admit and its
 	// stale re-claim, 0108). The admission-owned writes (Unadmit, SetPhase,
-	// ReanchorAt, SettleAt) are compare-and-swaps on it.
+	// ReanchorAt, SettleAt, ApprovalWait, Yield) are compare-and-swaps on it.
 	AdmissionEpoch int64
+	// YieldReason and YieldDetail are the yield marker (0109, ADR-112 R3):
+	// "" for NULL. YieldReason is the server's closed vocabulary;
+	// YieldDetail is untrusted forge-derived text every read surface must
+	// sanitise.
+	YieldReason string
+	YieldDetail string
+	// YieldedAt is when the entry yielded (nil: not marked). A marked entry
+	// is held and AdmitNext skips it; (AnchoredHeadSHA, YieldedAt) is the
+	// compare-and-swap key of ClearYield, UpdateYield and ReanchorYielded.
+	YieldedAt *time.Time
+	// ApprovalWaitStartedAt is the persisted head-of-line approval-wait
+	// anchor (nil: no wait started this episode). Set once by ApprovalWait,
+	// never reset by Unadmit, a re-admission or a stale re-claim; cleared only
+	// by ClearYield.
+	ApprovalWaitStartedAt *time.Time
+	// YieldAge is clock_timestamp() - yielded_at, computed in SQL when the
+	// row was read (database clock domain); 0 when unmarked.
+	YieldAge time.Duration
 }
+
+// Yielded reports whether the entry carries a yield marker.
+func (e Entry) Yielded() bool { return e.YieldedAt != nil }
 
 // Base returns the queue the entry belongs to.
 func (e Entry) Base() Base {
@@ -163,6 +186,66 @@ type EnqueueRequest struct {
 	// as merge_intent_sequence in the same statement as merge_intent_at and
 	// only when THIS call records the intent (0 stamps NULL).
 	IntentSequence int64
+	// Yield, when non-nil, enqueues the entry YIELDED (ADR-112 R3, the
+	// merge_run queue arm): a new row is inserted held with the marker; a
+	// same-base HELD entry is re-anchored and marked, keeping an existing
+	// yielded_at (the same episode); a same-base LIVE entry is never marked
+	// (EnqueueResult.Marked=false). A nil Yield never clears or moves an
+	// existing marker.
+	Yield *YieldMarker
+}
+
+// YieldMarker is a yield marker's reason (required, the server's closed
+// vocabulary) and detail (optional, untrusted).
+type YieldMarker struct {
+	Reason string
+	Detail string
+	// Continue, when non-nil, is the entry's last CLEARED yield episode for
+	// Reason (ADR-112 R3, #4632): a same-reason re-yield on the same head
+	// and base keeps that episode's yielded_at, so the re-probe backoff keeps
+	// growing instead of restarting. A write that would stamp a fresh
+	// yielded_at (Yield, or Enqueue marking an unmarked held entry) stamps
+	// Continue.YieldedAt instead ONLY when the entry's anchor after the
+	// write equals Continue's HeadSHA and BaseSHA; any other anchor is a new
+	// episode on the database clock. An already-marked entry keeps its own
+	// yielded_at whatever Continue says.
+	Continue *YieldEpisode
+}
+
+// YieldEpisode is a cleared yield episode: its yielded_at and the anchor it
+// was cleared at ("" BaseSHA for NULL).
+type YieldEpisode struct {
+	YieldedAt time.Time
+	HeadSHA   string
+	BaseSHA   string
+}
+
+// continueArgs are the SQL arguments of m's episode continuation: NULLs
+// when there is none.
+func (m YieldMarker) continueArgs() (yieldedAt *time.Time, headSHA, baseSHA string) {
+	if m.Continue == nil || m.Continue.YieldedAt.IsZero() || m.Continue.HeadSHA == "" {
+		return nil, "", ""
+	}
+	t := m.Continue.YieldedAt
+	return &t, m.Continue.HeadSHA, m.Continue.BaseSHA
+}
+
+// validate refuses an empty reason before any SQL runs.
+func (m YieldMarker) validate() error {
+	if m.Reason == "" {
+		return fmt.Errorf("%w: a yield marker requires a reason", ErrInvalidRequest)
+	}
+	return nil
+}
+
+// ApprovalWaitResult is ApprovalWait's verdict, judged on the database clock.
+type ApprovalWaitResult struct {
+	// Entry is the row after the call (ApprovalWaitStartedAt set).
+	Entry Entry
+	// Expired reports the window has elapsed since ApprovalWaitStartedAt.
+	Expired bool
+	// Remaining is the window left (0 when Expired).
+	Remaining time.Duration
 }
 
 // MergeIntentRequest is MarkMergeIntent's request; a nil request records
@@ -248,6 +331,9 @@ type EnqueueResult struct {
 	// IntentRecorded reports THIS call moved the entry's merge_intent_at
 	// from NULL to set (MergeIntent only; false on a repeat).
 	IntentRecorded bool
+	// Marked reports the entry carries the request's Yield marker after the
+	// call (Yield only; false when the entry is live, which is never marked).
+	Marked bool
 }
 
 // MergeIntentResult is MarkMergeIntent's verdict.
@@ -285,7 +371,8 @@ type SettleResult struct {
 type Status struct {
 	Entry Entry
 	// Position is the 1-based place among the base's held entries (same
-	// account) by (enqueued_at, id); 0 for a live entry.
+	// account) in ListForBase's order (unmarked before yielded, then
+	// enqueued_at, id); 0 for a live entry.
 	Position int
 	// LiveRunID is the run holding the base's line (the entry's own run when
 	// it is live), or nil when the base has no live entry.
@@ -307,6 +394,23 @@ type Store interface {
 	ActiveBases(ctx context.Context) ([]Base, error)
 	MarkMergeIntent(ctx context.Context, entryID uuid.UUID, req *MergeIntentRequest) (MergeIntentResult, error)
 	RecentLineTurns(ctx context.Context, base Base, limit int) ([]time.Duration, error)
+	// ApprovalWait starts (once per episode) or continues the head-of-line
+	// approval wait of a live entry at epoch and judges window's expiry on the
+	// database clock (README.md § "Yield").
+	ApprovalWait(ctx context.Context, entryID uuid.UUID, epoch int64, window time.Duration) (ApprovalWaitResult, error)
+	// Yield moves a live entry at epoch to held with the marker, in one
+	// statement (README.md § "Yield").
+	Yield(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error)
+	// ClearYield clears a held entry's marker and wait anchor, a
+	// compare-and-swap on (anchored_head_sha, yielded_at).
+	ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time) (Entry, error)
+	// UpdateYield rewrites a marked entry's reason and detail, the same
+	// compare-and-swap.
+	UpdateYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, marker YieldMarker) (Entry, error)
+	// ReanchorYielded moves a marked entry's anchor to the PR's current head,
+	// keeping the marker and the episode, the same compare-and-swap on the
+	// OLD head.
+	ReanchorYielded(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, newHeadSHA, newBaseSHA string) (Entry, error)
 	// WithMergeIntentLock runs fn under the run's merge-intent lock; fn's
 	// context is bounded by the intent fn deadline (even when ctx has none)
 	// and must not take another pglock lock (README.md § "Merge-intent lock").

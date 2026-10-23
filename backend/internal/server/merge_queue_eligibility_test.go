@@ -356,9 +356,11 @@ func TestMergeQueueEligibility_UnreadableIsUndeterminable(t *testing.T) {
 	})
 }
 
-// ADR-093 slice 2 (D3/D6, E87.5 / #4296): leg (a) bound to the latest
-// implement-review round, changes_requested, the D6 approval transfer across
-// clean advances, the merge variant and the nil-snapshot downgrade.
+// ADR-093 slice 2 (D3, E87.5 / #4296): leg (a) bound to the latest
+// implement-review round, changes_requested, the merge variant and the
+// nil-snapshot downgrade. ADR-112 R3 (#4632): the intent-bearing admission
+// variant evaluates no approval and checks only the fold's R2 veto (the D6
+// transfer walk it used to run is gone).
 
 // mqeAppend appends one chained row on r BY CONSTRUCTION.
 func (f *mcqFixture) mqeAppend(r *mcqRun, category string, payload map[string]any) *audit.Entry {
@@ -482,24 +484,26 @@ func TestMergeQueueEligibility_ReviewRoundUnreadableIsUndeterminable(t *testing.
 }
 
 // TestMergeQueueEligibility_ChangesRequestedFailsLegA pins changes_requested
-// on every variant when an approval gate is declared (even beside a listed
-// live approval, and with a transfer available), and its absence when the
-// review stage declares no approval gate (approval condition b).
+// on the entry and anchor-less admission variants when an approval gate is
+// declared (even beside a listed live approval), and its absence when the
+// review stage declares no approval gate (approval condition b). Neither the
+// merge variant nor an intent-bearing admission reads the REST listing (the
+// latter's veto is the fold's: TestMergeQueueEligibility_IntentAdmissionChecksOnlyTheVeto).
 func TestMergeQueueEligibility_ChangesRequestedFailsLegA(t *testing.T) {
 	ctx := context.Background()
 	const requested = `[{"id":1,"user":{"login":"alice"},"state":"APPROVED"},{"id":2,"user":{"login":"bob"},"state":"COMMENTED"},` +
 		`{"id":3,"user":{"login":"bob"},"state":"CHANGES_REQUESTED"},{"id":4,"user":{"login":"bob"},"state":"COMMENTED"}]`
 
-	t.Run("every variant", func(t *testing.T) {
+	t.Run("entry and anchor-less admission", func(t *testing.T) {
 		f := newMCQFixture(t)
 		r := f.seed("cr", "h0", []byte(mqeNoVerifySpecYAML))
 		f.gh.set(func() { f.gh.reviews[r.pr] = requested })
 		anchor := f.mqeIntent(r, "h0")
 		row := f.runRow(r)
 		for name, got := range map[string]mergeQueueEligibilityResult{
-			"entry":        f.srv.mergeQueueEligibility(ctx, row, "h0"),
-			"admission":    f.srv.mergeQueueAdmissionEligibility(ctx, row, "h0"),
-			"admission at": f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h0", anchor),
+			"entry":                      f.srv.mergeQueueEligibility(ctx, row, "h0"),
+			"admission":                  f.srv.mergeQueueAdmissionEligibility(ctx, row, "h0"),
+			"admission at a zero anchor": f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h0", mergeQueueIntentAnchor{}),
 		} {
 			t.Run(name, func(t *testing.T) {
 				requireReasons(t, got, mergeQueueReasonChangesRequested)
@@ -509,21 +513,10 @@ func TestMergeQueueEligibility_ChangesRequestedFailsLegA(t *testing.T) {
 				requireBasis(t, got, "")
 			})
 		}
-		// ADR-112 variant restriction: the merge variant reads no forge
-		// review (the in-lock fold judges the veto).
+		// The REST CHANGES_REQUESTED is not in the fold's snapshot, so the
+		// variants that read no REST listing pass.
 		requireReasons(t, f.srv.mergeQueueMergeEligibility(ctx, row, "h0", anchor))
-	})
-
-	t.Run("blocks a transfer", func(t *testing.T) {
-		f := newMCQFixture(t)
-		r := f.seed("crt", "h0", []byte(mqeNoVerifySpecYAML))
-		anchor := f.mqeIntent(r, "h0")
-		f.mqeRebased(r, "h0", "h1", "h1", false)
-		f.gh.set(func() {
-			f.gh.reviews[r.pr] = `[{"id":1,"user":{"login":"alice"},"state":"APPROVED"},{"id":2,"user":{"login":"alice"},"state":"DISMISSED"},` +
-				`{"id":3,"user":{"login":"bob"},"state":"CHANGES_REQUESTED"}]`
-		})
-		requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1", anchor), mergeQueueReasonChangesRequested)
+		requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h0", anchor))
 	})
 
 	t.Run("no approval gate declared", func(t *testing.T) {
@@ -534,109 +527,180 @@ func TestMergeQueueEligibility_ChangesRequestedFailsLegA(t *testing.T) {
 		got := f.srv.mergeQueueEligibility(ctx, f.runRow(r), "h0")
 		requireReasons(t, got)
 		requireBasis(t, got, "")
-	})
-}
-
-// TestMergeQueueEligibility_ApprovalTransfersAcrossCleanAdvance pins D6: a
-// dismissed approval carries across clean advances from the intent's head for
-// the admission variant; the anchorless entry variant never transfers; a live
-// approval reports the live basis. (The merge variant reads no forge review,
-// ADR-112: TestMergeQueueEligibility_MergeVariantMakesNoForgeReviewRead.)
-func TestMergeQueueEligibility_ApprovalTransfersAcrossCleanAdvance(t *testing.T) {
-	ctx := context.Background()
-	f := newMCQFixture(t)
-	r := f.seed("tr", "h0", []byte(mqeSpecYAML))
-	f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
-	anchor := f.mqeIntent(r, "h0")
-	f.mqeRebased(r, "h0", "h1", "h1", false)
-	f.mqeRebased(r, "h1", "h2", "h2", false)
-	row := f.runRow(r)
-
-	got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h2", anchor)
-	requireReasons(t, got)
-	requireBasis(t, got, mergeQueueApprovalTransferred)
-
-	requireReasons(t, f.srv.mergeQueueEligibility(ctx, row, "h2"), mergeQueueReasonNotApproved)
-	requireReasons(t, f.srv.mergeQueueAdmissionEligibility(ctx, row, "h2"), mergeQueueReasonNotApproved)
-
-	f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
-	got = f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h2", anchor)
-	requireReasons(t, got)
-	requireBasis(t, got, mergeQueueApprovalLive)
-}
-
-// TestMergeQueueEligibility_ApprovalNotCarriedAcrossConflictResolution pins
-// that a conflict-resolution push never carries the approval: neither to its
-// own head (the fixture's ONLY route to the head) nor through it to a later
-// clean advance.
-func TestMergeQueueEligibility_ApprovalNotCarriedAcrossConflictResolution(t *testing.T) {
-	ctx := context.Background()
-	t.Run("conflict head", func(t *testing.T) {
-		f := newMCQFixture(t)
-		r := f.seed("cf", "h0", []byte(mqeNoVerifySpecYAML))
-		f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
-		anchor := f.mqeIntent(r, "h0")
-		f.mqeAppend(r, CategoryConflictResolutionPushed, map[string]any{"head_sha": "h1"})
-		requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1", anchor), mergeQueueReasonNotApproved)
-	})
-	t.Run("clean advance after a conflict resolution", func(t *testing.T) {
-		f := newMCQFixture(t)
-		r := f.seed("cf2", "h0", []byte(mqeNoVerifySpecYAML))
-		f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
-		anchor := f.mqeIntent(r, "h0")
-		f.mqeRebased(r, "h0", "h1", "h1", false)
-		f.mqeAppend(r, CategoryConflictResolutionPushed, map[string]any{"head_sha": "h2"})
-		f.mqeRebased(r, "h2", "h3", "h3", false)
-		got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h3", anchor)
-		requireReasons(t, got, mergeQueueReasonNotApproved)
-		if !strings.Contains(got.Reasons[0].Detail, "clean advances only") {
-			t.Fatalf("detail = %q, want the transfer refusal", got.Reasons[0].Detail)
+		// An intent-bearing admission with no gate reads no snapshot either.
+		requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h0", f.mqeIntent(r, "h0")))
+		if n := f.gh.snapshotCalls(); n != 0 {
+			t.Fatalf("snapshot calls = %d, want 0 with no approval gate declared", n)
 		}
 	})
 }
 
-// TestMergeQueueEligibility_ApprovalNotCarriedAcrossNonCleanAdvance pins the
-// clean test: an advance whose new head is not its merge commit, one with no
-// merge commit, and an already-up-to-date one carry nothing.
-func TestMergeQueueEligibility_ApprovalNotCarriedAcrossNonCleanAdvance(t *testing.T) {
+// mqeForgeReviews plants r's GraphQL review snapshot (a User opener) and
+// grants every login in writers write permission (the fold's R1(c) floor).
+func (f *mcqFixture) mqeForgeReviews(r *mcqRun, writers []string, nodes ...mcqReviewNode) {
+	f.t.Helper()
+	f.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{Reviews: nodes, Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
+	for _, l := range writers {
+		f.gh.setPermission(l, "write", "write")
+	}
+}
+
+// TestMergeQueueEligibility_IntentAdmissionChecksOnlyTheVeto pins ADR-112 R3
+// (#4632) on the intent-bearing admission variant: NO approval is evaluated
+// and the R2 veto is the fold's, at the PR head. The REST listing answers 500
+// in every row, so any REST approval read would surface as undeterminable.
+// vetoed is forge_approval_vetoed naming the reviewer; veto_undetermined and a
+// snapshot transport failure are undeterminable; every other fold result
+// passes. The co-occurrence row (approval condition C5) carries the veto
+// BESIDE a determined non-approval reason, so the admission caller can drop
+// on row 1 rather than yield.
+func TestMergeQueueEligibility_IntentAdmissionChecksOnlyTheVeto(t *testing.T) {
 	ctx := context.Background()
-	for name, adv := range map[string]struct {
-		merge    string
-		upToDate bool
+	veto := func(f *mcqFixture, r *mcqRun) {
+		f.mqeForgeReviews(r, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", "h0"), mqmReview(2, "bob", "CHANGES_REQUESTED", "h0"))
+	}
+	cases := []struct {
+		name   string
+		plant  func(f *mcqFixture, r *mcqRun)
+		want   []string
+		undet  bool
+		detail string
 	}{
-		"new head is not the merge commit": {merge: "m1"},
-		"no merge commit":                  {merge: ""},
-		"already up to date":               {merge: "h1", upToDate: true},
-	} {
-		t.Run(name, func(t *testing.T) {
+		{name: "no forge approval admits", plant: func(*mcqFixture, *mcqRun) {}},
+		{name: "dismissed approval admits", plant: func(f *mcqFixture, r *mcqRun) {
+			f.mqeForgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h0"))
+		}},
+		{name: "review required admits", plant: func(f *mcqFixture, r *mcqRun) {
+			f.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{Reviews: []mcqReviewNode{mqmReview(1, "alice", "APPROVED", "h0")},
+				ReviewDecision: "REVIEW_REQUIRED", Author: mcqActor{Typename: "User", Login: "pr-opener", ID: 1}})
+			f.gh.setPermission("alice", "write", "write")
+		}},
+		{name: "approval undetermined admits", plant: func(f *mcqFixture, r *mcqRun) {
+			f.mqeForgeReviews(r, nil, mqmReview(1, "alice", "APPROVED", "h0"))
+			f.gh.set(func() { f.gh.permStatus["alice"] = http.StatusInternalServerError })
+		}},
+		{name: "read-level changes requested is no veto", plant: func(f *mcqFixture, r *mcqRun) {
+			f.mqeForgeReviews(r, nil, mqmReview(2, "bob", "CHANGES_REQUESTED", "h0"))
+			f.gh.setPermission("bob", "read", "read")
+		}},
+		{name: "write-level changes requested is vetoed", plant: veto,
+			want: []string{mergeQueueReasonForgeApprovalVetoed}, detail: "reviewer bob"},
+		{name: "veto undetermined is undeterminable", plant: func(f *mcqFixture, r *mcqRun) {
+			f.mqeForgeReviews(r, nil, mqmReview(2, "bob", "CHANGES_REQUESTED", "h0"))
+			f.gh.set(func() { f.gh.permStatus["bob"] = http.StatusInternalServerError })
+		}, want: []string{mergeQueueReasonUndeterminable}, undet: true, detail: "review gate: " + forgeApprovalReasonVetoUndetermined},
+		{name: "snapshot transport failure is undeterminable", plant: func(f *mcqFixture, r *mcqRun) {
+			f.gh.set(func() { f.gh.graphQLFail[r.pr] = 5 })
+		}, want: []string{mergeQueueReasonUndeterminable}, undet: true, detail: "review gate: " + forgeApprovalReasonSnapshotUnreadable},
+		{name: "veto beside a blocking concern carries both", plant: func(f *mcqFixture, r *mcqRun) {
+			veto(f, r)
+			f.raiseConcern(r, "high", "")
+		}, want: []string{mergeQueueReasonForgeApprovalVetoed, mergeQueueReasonBlockingConcernOpen}, detail: "reviewer bob"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
 			f := newMCQFixture(t)
-			r := f.seed("nc", "h0", []byte(mqeNoVerifySpecYAML))
-			f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
+			r := f.seed("iv", "h0", []byte(mqeNoVerifySpecYAML))
+			f.gh.set(func() { f.gh.reviewsStatus[r.pr] = http.StatusInternalServerError })
 			anchor := f.mqeIntent(r, "h0")
-			f.mqeRebased(r, "h0", "h1", adv.merge, adv.upToDate)
-			requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1", anchor), mergeQueueReasonNotApproved)
+			tc.plant(f, r)
+			got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h0", anchor)
+			requireReasons(t, got, tc.want...)
+			if got.Undeterminable != tc.undet {
+				t.Fatalf("undeterminable = %v, want %v (%+v)", got.Undeterminable, tc.undet, got.Reasons)
+			}
+			requireBasis(t, got, "")
+			if tc.detail != "" && !strings.Contains(got.Reasons[0].Detail, tc.detail) {
+				t.Fatalf("detail = %q, want it to contain %q", got.Reasons[0].Detail, tc.detail)
+			}
+			if n := f.gh.snapshotCalls(); n < 1 {
+				t.Fatalf("snapshot calls = %d, want the fold's read", n)
+			}
 		})
 	}
 }
 
-// TestMergeQueueEligibility_UndecodableAdvanceCarriesNothing pins that a
-// branch_rebased row whose payload does not decode carries no approval.
-func TestMergeQueueEligibility_UndecodableAdvanceCarriesNothing(t *testing.T) {
+// TestMergeQueueEligibility_AnchorlessVariantsKeepApprovalRequirement pins
+// that the entry variant and the anchor-less admission variant (a zero
+// anchor: mergeQueueAnchorFor of an entry without intent) keep the live REST
+// approval requirement and read no snapshot, while an intent-bearing
+// admission of the SAME run admits with no approval at all, basis "".
+func TestMergeQueueEligibility_AnchorlessVariantsKeepApprovalRequirement(t *testing.T) {
+	ctx := context.Background()
 	f := newMCQFixture(t)
-	r := f.seed("ud", "h0", []byte(mqeNoVerifySpecYAML))
+	r := f.seed("al", "h0", []byte(mqeSpecYAML))
 	f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
 	anchor := f.mqeIntent(r, "h0")
-	f.mqeAppend(r, CategoryBranchRebased, map[string]any{"prior_head_sha": "h0", "new_head_sha": "h1",
-		"merge_commit_sha": "h1", "already_up_to_date": "no"})
-	requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(context.Background(), f.runRow(r), "h1", anchor),
-		mergeQueueReasonNotApproved)
+	f.mqeRebased(r, "h0", "h1", "h1", false)
+	f.gh.set(func() { f.gh.prs[r.pr].head = "h1" })
+	row := f.runRow(r)
+
+	requireReasons(t, f.srv.mergeQueueEligibility(ctx, row, "h1"), mergeQueueReasonNotApproved)
+	requireReasons(t, f.srv.mergeQueueAdmissionEligibility(ctx, row, "h1"), mergeQueueReasonNotApproved)
+	requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h1", mergeQueueIntentAnchor{}), mergeQueueReasonNotApproved)
+	if n := f.gh.snapshotCalls(); n != 0 {
+		t.Fatalf("snapshot calls = %d, want 0 on the anchor-less variants", n)
+	}
+	got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h1", anchor)
+	requireReasons(t, got)
+	requireBasis(t, got, "")
+
+	f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+	got = f.srv.mergeQueueEligibility(ctx, row, "h1")
+	requireReasons(t, got)
+	requireBasis(t, got, mergeQueueApprovalLive)
+	requireBasis(t, f.srv.mergeQueueAdmissionEligibility(ctx, row, "h1"), mergeQueueApprovalLive)
+}
+
+// TestMergeQueueEligibility_IntentAdmissionReadsNoTransferWalk converts the
+// ADR-093 D6 transfer pins (#4632): with no forge approval, an intent-bearing
+// admission admits at a head reached through a conflict-resolution push, a
+// non-clean advance or an undecodable advance (none of which ever carried an
+// approval), and reads none of the walk's audit rows — each unreadable in
+// turn still admits.
+func TestMergeQueueEligibility_IntentAdmissionReadsNoTransferWalk(t *testing.T) {
+	ctx := context.Background()
+	for name, advance := range map[string]func(f *mcqFixture, r *mcqRun){
+		"conflict-resolution head": func(f *mcqFixture, r *mcqRun) {
+			f.mqeAppend(r, CategoryConflictResolutionPushed, map[string]any{"head_sha": "h1"})
+		},
+		"non-clean advance": func(f *mcqFixture, r *mcqRun) { f.mqeRebased(r, "h0", "h1", "m1", false) },
+		"undecodable advance": func(f *mcqFixture, r *mcqRun) {
+			f.mqeAppend(r, CategoryBranchRebased, map[string]any{"prior_head_sha": "h0", "new_head_sha": "h1",
+				"merge_commit_sha": "h1", "already_up_to_date": "no"})
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			f := newMCQFixture(t)
+			r := f.seed("tw", "h0", []byte(mqeNoVerifySpecYAML))
+			f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
+			anchor := f.mqeIntent(r, "h0")
+			advance(f, r)
+			f.gh.set(func() { f.gh.prs[r.pr].head = "h1" })
+			requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1", anchor))
+		})
+	}
+	for _, cat := range []string{CategoryMergeQueueEntered, CategoryBranchRebased, CategoryConflictResolutionPushed} {
+		t.Run(cat+" unreadable", func(t *testing.T) {
+			f := newMCQFixture(t)
+			r := f.seed("tu", "h0", []byte(mqeNoVerifySpecYAML))
+			anchor := f.mqeIntent(r, "h0")
+			f.mqeRebased(r, "h0", "h1", "h1", false)
+			f.gh.set(func() { f.gh.prs[r.pr].head = "h1" })
+			row := f.runRow(r)
+			f.srv.cfg.AuditRepo = mqeErrCategoryAudit{Repository: f.audit, category: cat}
+			requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h1", anchor))
+		})
+	}
 }
 
 // TestMergeQueueEligibility_MergeVariantMakesNoForgeReviewRead pins ADR-112's
 // variant restriction (#4619): the merge variant makes ZERO REST review
 // listings and ZERO GraphQL snapshots (a 500 listing and a dismissed-only
-// listing both pass it, basis ""), while the entry and admission variants
-// keep their REST legs and still make zero GraphQL calls.
+// listing both pass it, basis ""); the entry and anchor-less admission
+// variants keep their REST legs and make zero GraphQL calls; the
+// intent-bearing admission (#4632) makes no REST listing and exactly one
+// snapshot read, for its veto.
 func TestMergeQueueEligibility_MergeVariantMakesNoForgeReviewRead(t *testing.T) {
 	ctx := context.Background()
 	f := newMCQFixture(t)
@@ -655,9 +719,13 @@ func TestMergeQueueEligibility_MergeVariantMakesNoForgeReviewRead(t *testing.T) 
 	f.gh.set(func() { delete(f.gh.reviewsStatus, r.pr) })
 	requireReasons(t, f.srv.mergeQueueEligibility(ctx, row, "h0"), mergeQueueReasonNotApproved)
 	requireReasons(t, f.srv.mergeQueueAdmissionEligibility(ctx, row, "h0"), mergeQueueReasonNotApproved)
-	requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h0", anchor), mergeQueueReasonNotApproved)
 	if n := f.gh.snapshotCalls(); n != 0 {
-		t.Fatalf("GraphQL snapshot calls = %d, want 0 on every eligibility variant", n)
+		t.Fatalf("GraphQL snapshot calls = %d, want 0 on the merge, entry and anchor-less admission variants", n)
+	}
+	f.gh.set(func() { f.gh.reviewsStatus[r.pr] = 500 })
+	requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h0", anchor))
+	if n := f.gh.snapshotCalls(); n != 1 {
+		t.Fatalf("GraphQL snapshot calls = %d, want exactly the intent-bearing admission's one", n)
 	}
 }
 
@@ -674,90 +742,18 @@ func (a mqeErrCategoryAudit) ListForRunByCategory(ctx context.Context, id uuid.U
 	return a.Repository.ListForRunByCategory(ctx, id, cat)
 }
 
-// TestMergeQueueEligibility_NoIntentAnchorNoTransfer pins that a transfer
-// needs an anchor naming a recorded intent row, an advance off its head, and
-// readable advance rows.
-func TestMergeQueueEligibility_NoIntentAnchorNoTransfer(t *testing.T) {
-	ctx := context.Background()
-	setup := func(t *testing.T) (*mcqFixture, *mcqRun, mergeQueueIntentAnchor) {
-		f := newMCQFixture(t)
-		r := f.seed("na", "h0", []byte(mqeNoVerifySpecYAML))
-		f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
-		anchor := f.mqeIntent(r, "h0")
-		f.mqeRebased(r, "h0", "h1", "h1", false)
-		return f, r, anchor
-	}
-	t.Run("zero anchor", func(t *testing.T) {
-		f := newMCQFixture(t)
-		r := f.seed("za", "h0", []byte(mqeNoVerifySpecYAML))
-		f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
-		// A row with an EMPTY base_ref, followed by a clean advance, would
-		// match a zero anchor's legacy fallback and transfer, so only the
-		// zero-anchor guard refuses here.
-		f.mqeAppend(r, CategoryMergeQueueEntered, map[string]any{"base_ref": "", "anchored_head_sha": "h0"})
-		f.mqeRebased(r, "h0", "h1", "h1", false)
-		requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1", mergeQueueIntentAnchor{}), mergeQueueReasonNotApproved)
-	})
-	t.Run("anchor names no row", func(t *testing.T) {
-		f, r, anchor := setup(t)
-		got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1", mergeQueueIntentAnchor{Sequence: anchor.Sequence + 1000, BaseRef: mcqBase})
-		requireReasons(t, got, mergeQueueReasonNotApproved)
-		if !strings.Contains(got.Reasons[0].Detail, "no merge_queue_entered row") {
-			t.Fatalf("detail = %q", got.Reasons[0].Detail)
-		}
-	})
-	t.Run("anchor names another base", func(t *testing.T) {
-		f, r, anchor := setup(t)
-		requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h1",
-			mergeQueueIntentAnchor{Sequence: anchor.Sequence, BaseRef: "release"}), mergeQueueReasonNotApproved)
-	})
-	t.Run("head has not advanced", func(t *testing.T) {
-		// The anchored head itself never transfers: an approval missing
-		// there was withdrawn, not dismissed by an advance.
-		f, r, anchor := setup(t)
-		got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, f.runRow(r), "h0", anchor)
-		requireReasons(t, got, mergeQueueReasonNotApproved)
-		if !strings.Contains(got.Reasons[0].Detail, "has not advanced") {
-			t.Fatalf("detail = %q", got.Reasons[0].Detail)
-		}
-	})
-	for _, cat := range []string{CategoryMergeQueueEntered, CategoryBranchRebased, CategoryConflictResolutionPushed} {
-		t.Run(cat+" unreadable", func(t *testing.T) {
-			f, r, anchor := setup(t)
-			row := f.runRow(r)
-			f.srv.cfg.AuditRepo = mqeErrCategoryAudit{Repository: f.audit, category: cat}
-			got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h1", anchor)
-			if !got.Undeterminable || got.Eligible {
-				t.Fatalf("got %+v, want undeterminable", got)
-			}
-		})
-	}
-	t.Run("no audit repository", func(t *testing.T) {
-		f := newMCQFixture(t)
-		f.srv.cfg.AuditRepo = nil
-		if _, _, err := f.srv.mergeQueueIntentRow(ctx, uuid.New(), mergeQueueIntentAnchor{Sequence: 1, BaseRef: mcqBase}); err == nil {
-			t.Fatal("want an error with no audit repository")
-		}
-	})
-}
-
-// TestMergeQueueEligibility_IntentRowSelectedByRecordedSequence pins that the
-// intent row is the one AT the anchor's recorded sequence: a newer orphan row
-// naming another head is ignored. A legacy anchor (sequence 0) falls back to
-// the newest row naming the base.
+// TestMergeQueueEligibility_IntentRowSelectedByRecordedSequence pins
+// mergeQueueIntentRow (merge-on-pass reads the intent's verdict through it):
+// the row AT the anchor's recorded sequence, a newer orphan row naming another
+// head ignored; a legacy anchor (sequence 0) falls back to the newest row
+// naming the base; an anchor naming no row or another base finds nothing; an
+// unreadable or unwired audit repository is an error.
 func TestMergeQueueEligibility_IntentRowSelectedByRecordedSequence(t *testing.T) {
 	ctx := context.Background()
 	f := newMCQFixture(t)
 	r := f.seed("seq", "h0", []byte(mqeNoVerifySpecYAML))
-	f.gh.set(func() { f.gh.reviews[r.pr] = mqeDismissed })
 	anchor := f.mqeIntent(r, "h0")
-	f.mqeRebased(r, "h0", "h1", "h1", false)
 	orphan := f.mqeIntent(r, "hX")
-	row := f.runRow(r)
-
-	got := f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h1", anchor)
-	requireReasons(t, got)
-	requireBasis(t, got, mergeQueueApprovalTransferred)
 
 	rec, found, err := f.srv.mergeQueueIntentRow(ctx, r.id, anchor)
 	if err != nil || !found || rec.Sequence != anchor.Sequence || rec.AnchoredHeadSHA != "h0" || rec.Verdict != "ship it at h0" || rec.Entry == nil {
@@ -767,10 +763,22 @@ func TestMergeQueueEligibility_IntentRowSelectedByRecordedSequence(t *testing.T)
 	if err != nil || !found || legacy.Sequence != orphan.Sequence || legacy.AnchoredHeadSHA != "hX" {
 		t.Fatalf("legacy intent row = %+v found=%v err=%v, want the newest row %d", legacy, found, err, orphan.Sequence)
 	}
-	// The legacy fallback resolves the newest row, whose head hX never
-	// reached h1: no transfer.
-	requireReasons(t, f.srv.mergeQueueAdmissionEligibilityAt(ctx, row, "h1", mergeQueueIntentAnchor{BaseRef: mcqBase}),
-		mergeQueueReasonNotApproved)
+	for name, a := range map[string]mergeQueueIntentAnchor{
+		"names no row":       {Sequence: anchor.Sequence + 1000, BaseRef: mcqBase},
+		"names another base": {Sequence: anchor.Sequence, BaseRef: "release"},
+	} {
+		if rec, found, err := f.srv.mergeQueueIntentRow(ctx, r.id, a); err != nil || found {
+			t.Fatalf("anchor %s: intent row = %+v found=%v err=%v, want not found", name, rec, found, err)
+		}
+	}
+	f.srv.cfg.AuditRepo = mqeErrCategoryAudit{Repository: f.audit, category: CategoryMergeQueueEntered}
+	if _, _, err := f.srv.mergeQueueIntentRow(ctx, r.id, anchor); err == nil {
+		t.Fatal("want an error on an unreadable merge_queue_entered listing")
+	}
+	f.srv.cfg.AuditRepo = nil
+	if _, _, err := f.srv.mergeQueueIntentRow(ctx, uuid.New(), mergeQueueIntentAnchor{Sequence: 1, BaseRef: mcqBase}); err == nil {
+		t.Fatal("want an error with no audit repository")
+	}
 }
 
 // TestMergeQueueEligibility_NilSnapshotOptionalRedHoldsAtAdmission pins leg

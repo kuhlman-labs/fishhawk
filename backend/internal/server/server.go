@@ -951,6 +951,15 @@ type Config struct {
 	// merge_candidate_queue.go and backend/internal/mergequeue/README.md.
 	MergeQueue mergequeue.Store
 
+	// MergeQueueApprovalWait is ADR-112 R3's bounded head-of-line approval
+	// wait (#4632): a non-approved forge-approval fold at the head of the
+	// line holds it for this window, measured from the persisted
+	// approval_wait_started_at on the database clock, then yields. The zero
+	// value is DefaultMergeQueueApprovalWait (30 minutes). fishhawkd sets it
+	// from --merge-queue-approval-wait / FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT
+	// and refuses a non-positive value at startup. See merge_queue_yield.go.
+	MergeQueueApprovalWait time.Duration
+
 	// MergeCandidateTransfer is the ADR-096 verdict-transfer switch (E87.2 /
 	// #4293): off | shadow | enforce plus the classifier. The ZERO VALUE is
 	// off, so an in-process server is unchanged; fishhawkd defaults shadow
@@ -1264,6 +1273,12 @@ type Server struct {
 	// the loop claimed before SIGTERM finishes inside the drain window rather
 	// than being cut at process exit.
 	bgMergeQueuePump sync.WaitGroup
+	// yieldSweepLast is when THIS process's previous yield sweep started
+	// (sweepMergeQueueYields; zero before the first, ADR-112 R3, #4632): a
+	// row is due when a schedule point fell since then. Process-local, under
+	// yieldSweepMu.
+	yieldSweepMu   sync.Mutex
+	yieldSweepLast time.Time
 
 	// refinementFiling is the detached filing arm's in-process per-draft
 	// single-flight guard and status store (#4153), read by the session

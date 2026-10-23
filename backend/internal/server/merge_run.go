@@ -177,9 +177,13 @@ type mergeRunResponse struct {
 //     pass is HELD in its base's queue (fail-open on a queue read error).
 //     With the queue wired, a merge_base_behind / merge_candidate_unverified
 //     / merge_candidate_held refusal of a MERGE-QUEUE ELIGIBLE run becomes a
-//     202 queued answer instead (ADR-093 slice 1, mergeQueueEnqueueArm); an
-//     ineligible run keeps the 409 with an additive merge_queue_ineligible
-//     detail and nothing written.
+//     202 queued answer instead (ADR-093 slice 1, mergeQueueEnqueueArm). With
+//     a head-pinned merger bound, a run whose ONLY ineligibility is the
+//     approval leg (not_approved / changes_requested) is also a 202, queued
+//     YIELDED (ADR-112 R3, #4632: held with its intent and a marker the queue
+//     skips until a re-probe clears it). Any other ineligible or an
+//     undeterminable run keeps the 409 with an additive
+//     merge_queue_ineligible detail and nothing written.
 //   - 409 forge_approval_required (ADR-112 / #4619), INSIDE the merge-intent
 //     lock after the ownership check and BEFORE the overlap-override record,
 //     the verdict append, the observe, the republish and the claim: when the
@@ -498,9 +502,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	gate := s.mergeCandidateGate(r.Context(), runRow)
 	if !gate.admits() {
 		// ADR-093 slice 1 (E87.4 / #4295): an ELIGIBLE run the gate refuses
-		// as behind / unverified / held is ENQUEUED (202 queued) instead; an
-		// ineligible one keeps today's refusal, plus the reason codes, with
-		// nothing written. An overlap override is recorded before the
+		// as behind / unverified / held is ENQUEUED (202 queued) instead, and
+		// one failing ONLY the approval leg is enqueued YIELDED (ADR-112 R3);
+		// any other ineligible one keeps today's refusal, plus the reason
+		// codes, with nothing written. An overlap override is recorded before the
 		// merge-intent append (recordOverlapOverride as the pre-commit step).
 		handled, ineligible := s.mergeQueueEnqueueArm(w, r, runRow, prURL, verdict, id.Subject, gate, recordOverlapOverride)
 		if handled {
@@ -553,6 +558,12 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		}
 		if owned && !s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true).Landed {
 			s.writeMergeQueueOwnsMerge(w, r, runID, prURL)
+			// ADR-112 R3 (#4632): a merge_run re-invoke on a YIELDED entry
+			// re-probes it now (a no-op on an entry that is not yielded),
+			// detached from this lock's fn context; the operator's explicit
+			// invocation forces one re-attempt of a forge_review_required
+			// yield (mergeQueueYieldClears).
+			s.reprobeMergeQueueYieldDetached(r.Context(), runID, true)
 			return nil
 		}
 
@@ -1413,7 +1424,12 @@ const CategoryMergeQueueEntered = "merge_queue_entered"
 // the caller to render today's refusal; ineligible is then the eligibility
 // reason codes (nil when the arm did not evaluate eligibility), rendered as
 // the additive merge_queue_ineligible detail. An ineligible or undeterminable
-// run writes NOTHING: no store row, no audit row.
+// run writes NOTHING: no store row, no audit row, EXCEPT (ADR-112 R3, #4632)
+// a determinable result whose every reason is an approval-leg reason with the
+// queue owning merges (mergeRunApprovalYield): that run is enqueued YIELDED
+// through the same record-before-commit path (recordMergeQueueIntent). An
+// already-queued YIELDED entry is re-probed on every pass through the arm, and
+// a freshly yielded one once after the write (reprobeMergeQueueYieldDetached).
 //
 // An eligible run is enqueued RECORD-BEFORE-COMMIT (approval condition C3):
 // the merge_queue_entered row is appended FIRST, and only then is the entry
@@ -1471,7 +1487,7 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	runID := runRow.ID
 	// A routing read only (the in-flight skip below): the intent decision
 	// re-reads the entry under the run's merge-intent lock.
-	_, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
+	routed, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
 	if err != nil {
 		// Fail closed: an unreadable queue never enqueues; today's refusal.
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -1485,13 +1501,29 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 		return false, nil
 	}
 
+	if found && routed.Entry.Yielded() {
+		// ADR-112 R3 (#4632, approval condition C2(e)): a merge_run re-invoke
+		// on an already-queued YIELDED entry re-probes it now, whatever this
+		// call answers; the fold re-reads the forge and is the sole decision
+		// (forcing one re-attempt of a forge_review_required yield).
+		defer s.reprobeMergeQueueYieldDetached(ctx, runID, true)
+	}
+
 	elig := s.mergeQueueEligibility(ctx, runRow, gate.prHeadSHA)
+	var yield *mergeQueueYield
 	if !elig.Eligible {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: run is not merge-queue eligible; refusing without enqueueing",
-			slog.String("run_id", runID.String()), slog.String("gate_code", gate.Code),
-			slog.Bool("undeterminable", elig.Undeterminable),
-			slog.String("reasons", strings.Join(elig.codes(), ",")))
-		return false, elig.codes()
+		y, ok := s.mergeRunApprovalYield(elig)
+		if !ok {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: run is not merge-queue eligible; refusing without enqueueing",
+				slog.String("run_id", runID.String()), slog.String("gate_code", gate.Code),
+				slog.Bool("undeterminable", elig.Undeterminable),
+				slog.String("reasons", strings.Join(elig.codes(), ",")))
+			return false, elig.codes()
+		}
+		// ADR-112 R3 (#4632): ONLY the approval leg failed and the queue owns
+		// merges, so the run is enqueued YIELDED (held with its intent and a
+		// marker AdmitNext skips) instead of refused.
+		yield = &y
 	}
 
 	if subject == "" {
@@ -1503,7 +1535,7 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	)
 	if lerr := s.cfg.MergeQueue.WithMergeIntentLock(ctx, runID, func(fctx context.Context) error {
 		ran = true
-		res, handled = s.recordMergeQueueIntent(w, r.WithContext(fctx), runRow, prURL, verdict, subject, gate, preCommit)
+		res, handled = s.recordMergeQueueIntent(w, r.WithContext(fctx), runRow, prURL, verdict, subject, gate, yield, preCommit)
 		return nil
 	}); lerr != nil {
 		if !ran {
@@ -1537,6 +1569,12 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	}
 	st, intentSeq, alreadyQueued := res.status, res.intentSeq, res.alreadyQueued
 	s.pumpMergeCandidateQueueDetached(ctx, st.Entry.Base())
+	if res.marked && (!found || !routed.Entry.Yielded()) {
+		// A freshly yielded entry is re-probed at once (an already-yielded
+		// one was deferred above): an approval that landed since the
+		// eligibility read clears it now rather than on the backoff schedule.
+		s.reprobeMergeQueueYieldDetached(ctx, runID, true)
+	}
 
 	resp := mergeRunResponse{
 		RunID:           runID.String(),
@@ -1556,6 +1594,10 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 		holder = "run " + resp.LiveRunID
 	}
 	switch {
+	case st.Entry.Yielded():
+		next := mergeQueueYieldNextStep(st.Entry.YieldReason)
+		resp.Message = fmt.Sprintf("the run was queued on %s with your merge intent but YIELDED its place (ADR-112 R3, yield_reason %s, gate %s): the forge approval does not qualify yet, so the queue skips the entry and the rest of the line keeps merging. Next step: %s. The queue re-probes the approval on its own schedule (and at once on an approval review or a merge re-invoke); once it qualifies the yield clears and the entry rejoins the line at its original place, then merges pinned to the verified head (ADR-093 D3). Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
+			st.Entry.BaseRef, st.Entry.YieldReason, gate.Code, mergeRunYieldNextStepText(next))
 	case s.headPinnedMerger() != nil && st.Entry.State == mergequeue.StateLive:
 		resp.Message = fmt.Sprintf("the run is merge-queue eligible and holds the %s line (ADR-093 D2, gate %s); its merge-candidate pass runs there. Your merge intent persists until the entry settles: the queue merges the run pinned to the verified head on its green pass (ADR-093 D3), so you do not re-invoke the merge. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
 			st.Entry.BaseRef, gate.Code)
@@ -1572,9 +1614,73 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge: run enqueued in the merge queue",
 		slog.String("run_id", runID.String()), slog.String("gate_code", gate.Code),
 		slog.String("queue_state", resp.QueueState), slog.Int("queue_position", resp.QueuePosition),
-		slog.Bool("already_queued", alreadyQueued))
+		slog.Bool("already_queued", alreadyQueued), slog.String("yield_reason", st.Entry.YieldReason))
 	s.writeJSON(w, r, http.StatusAccepted, resp)
 	return true, nil
+}
+
+// mergeRunApprovalYield decides whether an INELIGIBLE queue-entry result
+// enqueues the run YIELDED rather than refusing (ADR-112 R3, #4632). It does
+// only when the queue owns merges (a head-pinned merger is bound), every read
+// succeeded, and EVERY reason is an approval-leg reason: changes_requested
+// yields forge_approval_vetoed (next step dismiss_review, R3 row 2) and
+// not_approved yields forge_approval_absent (next step approve_pr, row 3). Any
+// other reason, alone or beside an approval reason, keeps today's refusal
+// with nothing written.
+func (s *Server) mergeRunApprovalYield(elig mergeQueueEligibilityResult) (mergeQueueYield, bool) {
+	if s.headPinnedMerger() == nil || elig.Undeterminable || len(elig.Reasons) == 0 {
+		return mergeQueueYield{}, false
+	}
+	reason, row, detail := mergeCandidateQueueReasonForgeApprovalAbsent, mergeQueueYieldRowApprovalFold, ""
+	for _, x := range elig.Reasons {
+		switch x.Code {
+		case mergeQueueReasonChangesRequested:
+			reason, row, detail = mergeCandidateQueueReasonForgeApprovalVetoed, mergeQueueYieldRowVeto, x.Detail
+		case mergeQueueReasonNotApproved:
+			if row != mergeQueueYieldRowVeto {
+				detail = x.Detail
+			}
+		default:
+			return mergeQueueYield{}, false
+		}
+	}
+	return newMergeQueueYield(reason, detail, row), true
+}
+
+// mergeRunYieldNextStepText renders a closed next_step for the 202 message.
+// It is built ONLY from the closed vocabulary: the untrusted yield_detail is
+// never interpolated.
+func mergeRunYieldNextStepText(next string) string {
+	switch next {
+	case forgeApprovalNextApprovePR:
+		return "approve_pr (a reviewer who qualifies under the review approval gate approves the pull request at its current head)"
+	case forgeApprovalNextDismissReview:
+		return "dismiss_review (the requested changes are addressed and the changes-requested review is dismissed or superseded by an approval)"
+	case forgeApprovalNextRetryAfter:
+		return "retry_after (the forge review read could not decide; the re-probe retries it)"
+	case forgeApprovalNextConfigureIdentityProvider:
+		return "configure_identity_provider (an operator configures the github identity provider the approval gate's members need)"
+	}
+	return "none (nothing at the forge clears this yield; read fishhawk_get_merge_queue)"
+}
+
+// reprobeMergeQueueYieldDetached runs the targeted, no-backoff yield re-probe
+// for runID (ReprobeMergeQueueYield, force as there) on a bounded admission
+// context tracked by bgMergeQueuePump, so the caller never waits on its forge
+// read. It detaches from any merge-intent lock fn context first
+// (pglock.Detach): the re-probe's clear pumps the base, which takes its own
+// locks. A run with no yielded entry does nothing.
+func (s *Server) reprobeMergeQueueYieldDetached(ctx context.Context, runID uuid.UUID, force bool) {
+	if s.cfg.MergeQueue == nil {
+		return
+	}
+	pctx, cancel := mergeCandidateAdmissionContext(pglock.Detach(ctx))
+	s.bgMergeQueuePump.Add(1)
+	go func() {
+		defer s.bgMergeQueuePump.Done()
+		defer cancel()
+		s.ReprobeMergeQueueYield(pctx, runID, force)
+	}()
 }
 
 // mergeQueueIntent is recordMergeQueueIntent's verdict: the entry read back
@@ -1584,6 +1690,8 @@ type mergeQueueIntent struct {
 	status        mergequeue.Status
 	intentSeq     int64
 	alreadyQueued bool
+	// marked reports THIS call stamped the yield marker (ADR-112 R3).
+	marked bool
 }
 
 // recordMergeQueueIntent is the intent decision of mergeQueueEnqueueArm: it
@@ -1594,11 +1702,21 @@ type mergeQueueIntent struct {
 // transition, and both answers name it. It reads the entry itself: a read
 // taken before the lock may predate a concurrent intent.
 //
+// A non-nil yield enqueues the run YIELDED (ADR-112 R3, #4632): with no
+// entry, or one on another base, a new held row carries the intent and the
+// marker; a same-base HELD entry is re-anchored and gains the intent and the
+// marker in one Enqueue; a same-base LIVE entry only gains the intent
+// (MarkMergeIntent: a live entry is never marked, and merge-on-pass judges
+// its approval). merge_queue_entered records the decision first
+// (record-before-commit, yielded + yield_reason), and merge_queue_yielded
+// (site merge_run) follows a marker that landed. An entry already carrying
+// the intent writes nothing, yielded or not.
+//
 // A non-nil result is the enqueued state. A nil result with handled=true
 // means an error response was written; with handled=false the caller renders
 // today's refusal (the entry was unreadable; nothing was written).
 func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, runRow *run.Run,
-	prURL, verdict, subject string, gate mergeCandidateGateResult, preCommit func() bool) (*mergeQueueIntent, bool) {
+	prURL, verdict, subject string, gate mergeCandidateGateResult, yield *mergeQueueYield, preCommit func() bool) (*mergeQueueIntent, bool) {
 	ctx := r.Context()
 	runID := runRow.ID
 	prior, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
@@ -1611,6 +1729,7 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 	sameBase := found && prior.Entry.BaseRef == gate.prBaseRef
 	alreadyQueued := sameBase && prior.Entry.MergeIntentAt != nil
 	var intentSeq int64
+	var marked *mergequeue.Entry
 	if alreadyQueued && prior.Entry.MergeIntentSequence > 0 {
 		// The entry's STORED intent sequence (0108) names the row that
 		// recorded the intent; a newer orphan row is never named.
@@ -1647,6 +1766,15 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 			fields["queue_state"] = string(prior.Entry.State)
 			fields["queue_position"] = prior.Position
 		}
+		// A same-base LIVE entry is never marked (it holds the line, and
+		// merge-on-pass judges its approval).
+		if yield != nil && sameBase && prior.Entry.State == mergequeue.StateLive {
+			yield = nil
+		}
+		if yield != nil {
+			fields["yielded"] = true
+			fields["yield_reason"] = yield.Reason
+		}
 		payload, _ := json.Marshal(fields)
 		if preCommit != nil && !preCommit() {
 			return nil, true
@@ -1671,14 +1799,32 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 		intentSeq = entry.Sequence
 
 		var werr error
-		if sameBase {
+		if sameBase && yield == nil {
 			_, werr = s.cfg.MergeQueue.MarkMergeIntent(ctx, prior.Entry.ID, &mergequeue.MergeIntentRequest{IntentSequence: intentSeq})
 		} else {
-			var res mergequeue.EnqueueResult
-			res, werr = s.cfg.MergeQueue.Enqueue(ctx, mergequeue.EnqueueRequest{
+			req := mergequeue.EnqueueRequest{
 				RunID: runID, BaseRef: gate.prBaseRef, HeadSHA: gate.prHeadSHA, MergeIntent: true,
 				IntentSequence: intentSeq,
-			})
+			}
+			if yield != nil {
+				m := yield.marker()
+				if sameBase {
+					// A same-reason re-yield of a cleared entry on the same
+					// head and base continues its episode (ADR-112 R3).
+					m.Continue = s.mergeQueueYieldContinuation(ctx, prior.Entry, yield.Reason)
+				}
+				req.Yield = &m
+				if sameBase && prior.Entry.AnchoredHeadSHA == gate.prHeadSHA {
+					// An unchanged head keeps the entry's recorded base anchor.
+					req.BaseSHA = prior.Entry.AnchoredBaseSHA
+				}
+			}
+			var res mergequeue.EnqueueResult
+			res, werr = s.cfg.MergeQueue.Enqueue(ctx, req)
+			if werr == nil && res.Marked {
+				e := res.Entry
+				marked = &e
+			}
 			if werr == nil {
 				if res.Dropped != nil {
 					s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueSettled, *res.Dropped, nil)
@@ -1706,6 +1852,11 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 				map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
 			return nil, true
 		}
+		if marked != nil {
+			// The marker has committed: a failed append is logged at ERROR
+			// and healed by the re-probe sweep (approval condition C7).
+			_ = s.writeMergeQueueYielded(ctx, *marked, *yield, mergeQueueYieldSiteMergeRun, "")
+		}
 	}
 
 	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
@@ -1719,7 +1870,7 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 			map[string]any{"run_id": runID.String(), "pr_url": prURL, "retryable": true})
 		return nil, true
 	}
-	return &mergeQueueIntent{status: st, intentSeq: intentSeq, alreadyQueued: alreadyQueued}, true
+	return &mergeQueueIntent{status: st, intentSeq: intentSeq, alreadyQueued: alreadyQueued, marked: marked != nil}, true
 }
 
 // mergeIntentRowSequence is the chain sequence of the merge_queue_entered row

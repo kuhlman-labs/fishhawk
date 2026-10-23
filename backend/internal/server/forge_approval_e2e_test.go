@@ -298,3 +298,65 @@ func TestForgeApprovalE2E_MergeOnPassHeadMovedAfterRecheck(t *testing.T) {
 	requireOutcome(t, w.decide(req), mergeOnPassReadvance, mergeOnPassReasonHeadMoved)
 	w.requireNoMergeWrites(r)
 }
+
+// TestForgeApprovalE2E_MergeRunYieldsThenApprovalWebhookMerges is the ADR-112
+// R3 (#4632, slice 4) cross-boundary walk on the NON-Fishhawk fixture
+// repository x/y (ADR-110), every hop production code: POST
+// /v0/runs/{A}/merge with no forge approval answers 202 and leaves A HELD and
+// YIELDED (forge_approval_absent) with its merge intent; B, enqueued AFTER A
+// and approved, is admitted past the yielded A (AdmitNext skips the marked
+// row although it is older) and merges pinned to b1; then the
+// pull_request_review approved webhook at A's anchored head re-probes A, the
+// fold over the forge snapshot clears the marker, the detached pump admits A
+// (advancing it onto the base B's merge moved), and the runner's pass at the
+// verified head a2 merges it pinned there, merge_queue_authorized recorded
+// before the merge verdict.
+func TestForgeApprovalE2E_MergeRunYieldsThenApprovalWebhookMerges(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	w.behind(a, "a1", "a2")
+
+	resp := w.mergeRun(a)
+	w.srv.bgMergeQueuePump.Wait()
+	if resp.Code != http.StatusAccepted || !strings.Contains(resp.Body.String(), "YIELDED") {
+		t.Fatalf("merge A = %d %s, want 202 naming the yield", resp.Code, resp.Body.String())
+	}
+	y := w.active(a)
+	if y.State != mergequeue.StateHeld || y.YieldReason != mergeCandidateQueueReasonForgeApprovalAbsent || y.MergeIntentAt == nil {
+		t.Fatalf("A = %s %q intent=%v, want held, yielded absent, with intent", y.State, y.YieldReason, y.MergeIntentAt)
+	}
+
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(b, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "b1"))
+	w.pumpBase(b)
+	w.srv.bgMergeQueuePump.Wait()
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if e := w.active(a); e.State != mergequeue.StateHeld || e.YieldedAt == nil {
+		t.Fatalf("A after B merged = %s yielded_at=%v, want still held and yielded", e.State, e.YieldedAt)
+	}
+
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+	prReviewYieldWebhook(w, a, "approved", "a1")
+
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 1 {
+		t.Fatalf("A merge_queue_yield_cleared rows = %d, want 1", n)
+	}
+	if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" {
+		t.Fatalf("A after the clear = %s at %s, want live at the advanced head a2", e.State, e.AnchoredHeadSHA)
+	}
+
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"), mqmReview(3, "alice", "APPROVED", "a2"))
+	w.passAt(a, "a2")
+
+	w.requirePuts("b1", "a2")
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	auth, verdict := w.rows(a, CategoryMergeQueueAuthorized), w.rows(a, CategoryMergeVerdictRecorded)
+	if len(auth) != 1 || len(verdict) != 1 || auth[0].Sequence >= verdict[0].Sequence {
+		t.Fatalf("A authorized rows = %d, verdict rows = %d, want one each with the authorization first", len(auth), len(verdict))
+	}
+	if p := w.payload(auth[0]); p["head_sha"] != "a2" {
+		t.Fatalf("merge_queue_authorized payload = %v, want head_sha a2", p)
+	}
+}
