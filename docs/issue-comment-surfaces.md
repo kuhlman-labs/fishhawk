@@ -1899,6 +1899,19 @@ Notes:
   transition) and `merge_queue_yield_cleared` (the resolution) rows are
   DELIBERATELY not registered.
 
+- The merge-queue ejection and promote audit kinds `merge_queue_ejected`
+  (ADR-093 D4, E87.6 / #4297) and `merge_queue_promoted` (ADR-093 D7, same
+  issue; forward-registered, its writer is the promote verb) are
+  **INTERNAL, deliberately-not-a-surface** rows: no Notifier method, NOT in
+  `activityCategories`, nothing in `issuecomment` renders or posts them.
+  `merge_queue_ejected` (`server/merge_queue_eject.go`) is written ONCE per
+  ejected queue entry, by the settling call only, naming its reason, a
+  `next_step` from a closed vocabulary (`await_delegated_fixup`,
+  `fishhawk_fixup_stage`, `fishhawk_rebase_run_branch`, `fishhawk_merge_run`,
+  `fishhawk_get_run_status`), `fixup_routed` (verify_failed only), and for a
+  forge refusal `forge_reason` plus a sanitised, UNTRUSTED `forge_detail`.
+  Read them through `GET /v0/runs/{id}/audit`.
+
 - The concern-defer audit kinds — `concern_deferred` and its corrective
   companion `concern_defer_failed` (#1202) — have **no dedicated Notifier
   method**, but as of E42.6 (#1789) `concern_deferred` renders **data-drivenly**

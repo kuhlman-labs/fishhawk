@@ -262,6 +262,9 @@ const (
 // mergeOnPassOutcome is mergeQueueMergeOnPass's answer. State is set only on
 // mergeOnPassSettle (and mergeOnPassMerged: StateMerged); Yield only on
 // mergeOnPassAwaitApproval and mergeOnPassYield (Reason is then Yield.Reason).
+// ForgeReason and ForgeDetail are set only on a forge_merge_refused ejection
+// (ADR-093 D4): the typed refusal code and the forge's untrusted refusal text,
+// which the merge_queue_ejected writer sanitises.
 type mergeOnPassOutcome struct {
 	Kind          mergeOnPassKind
 	State         mergequeue.State
@@ -271,6 +274,8 @@ type mergeOnPassOutcome struct {
 	HeadSHA       string
 	Settled       bool
 	Yield         mergeQueueYield
+	ForgeReason   string
+	ForgeDetail   string
 }
 
 // Merge-on-pass reasons. Hold reasons leave the entry; eject/drop reasons are
@@ -704,15 +709,30 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	case errors.Is(mergeErr, forge.ErrMergeConflict):
 		return readvance(mergeOnPassReasonForgeHeadMismatch,
 			"the forge refused the pinned merge because the head no longer matched "+head+": "+mergeErr.Error())
-	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrMergeUnprocessable):
+	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrMergeUnprocessable),
+		errors.Is(mergeErr, forge.ErrPullRequestUnstableStatus):
+		// ADR-112 R3 row 4 is decided FIRST for every typed refusal, the
+		// unstable-status one included (first-officer ruling C-R4).
 		if decision, status, ok := s.mergeOnPassRefusalNeedsReview(ctx, runRow); ok {
 			// ADR-112 R3 row 4: the claim was released (a typed RELEASE
 			// outcome above), so the entry yields approve_pr, never ejects.
 			return yield(mergeOnPassYield, newMergeQueueYield(mergeQueueYieldForgeReviewRequired,
 				fmt.Sprintf(mergeQueueYieldForgeRefusalDetail, nonEmpty(decision, "null"), nonEmpty(status, "null")), mergeQueueYieldRowForgeRefusal))
 		}
-		return settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused,
+		// ADR-112 R3 row 5 ("Any other forge refusal | Eject (D4)") and
+		// ADR-093 D4 (a forge merge refusal ejects naming the forge's reason
+		// and never retries in a loop): the unstable-status refusal ejects
+		// checks_not_settled like the 405/422 arms instead of holding as
+		// transient, which let the next pump claim and dispatch again. Pending
+		// checks still HOLD before dispatch (onlyChecksNotGreen above): slow
+		// CI never ejects; only the forge's own refusal of the merge PUT does.
+		out := settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused,
 			"the forge refused the pinned merge ("+mergeErr.Error()+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
+		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonFor(mergeErr), mergeErr.Error()
+		if out.ForgeReason == mergeQueueForgeReasonChecksNotSettled {
+			out.ForgeDetail = mergeQueueChecksNotSettledDetail + mergeErr.Error()
+		}
+		return out
 	}
 	return held(mergeOnPassReasonTransient, "the pinned merge failed: "+mergeErr.Error())
 }
