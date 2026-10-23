@@ -7092,6 +7092,43 @@ func TestServe_MergeCandidateTransferMode(t *testing.T) {
 	})
 }
 
+// TestServe_MergeQueueApprovalWait pins the ADR-112 R3 window flag (#4632):
+// unset is the 30-minute default, a positive duration resolves, and 0s, a
+// negative duration and garbage each REFUSE startup naming the flag. The
+// refusing invocation carries bootstrapAbortFlag, so with the validation
+// deleted startup still aborts at the later --review-resolution check and the
+// log assertion is what goes RED.
+func TestServe_MergeQueueApprovalWait(t *testing.T) {
+	t.Run("unset", func(t *testing.T) {
+		t.Setenv("FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT", "")
+		d, err := resolveMergeQueueApprovalWait(envOr("FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT", server.DefaultMergeQueueApprovalWait.String()))
+		if err != nil || d != 30*time.Minute {
+			t.Fatalf("unset = %s, %v; want 30m", d, err)
+		}
+	})
+	t.Run("positive", func(t *testing.T) {
+		if d, err := resolveMergeQueueApprovalWait("45m"); err != nil || d != 45*time.Minute {
+			t.Fatalf("45m = %s, %v", d, err)
+		}
+	})
+	for _, bad := range []string{"0s", "-1m", "garbage"} {
+		t.Run(bad, func(t *testing.T) {
+			if d, err := resolveMergeQueueApprovalWait(bad); err == nil {
+				t.Fatalf("%s resolved to %s", bad, d)
+			}
+			code, log := serveWithProfile(t, "-merge-queue-approval-wait", bad, bootstrapAbortFlag)
+			if code != exitFailure {
+				t.Fatalf("exit = %d, want %d; log:\n%s", code, exitFailure, log)
+			}
+			for _, want := range []string{"invalid merge-queue approval wait", "FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT"} {
+				if !strings.Contains(log, want) {
+					t.Errorf("log does not name %q:\n%s", want, log)
+				}
+			}
+		})
+	}
+}
+
 // TestToChildcompletionConflict pins the ONE orchestrator → childcompletion
 // SliceConflict copy (ADR-096 D4 / #4294): every field, the base attribution
 // included, crosses the bridge, and nil maps to nil. A field the helper drops

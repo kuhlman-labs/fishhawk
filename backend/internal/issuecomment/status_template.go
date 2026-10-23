@@ -257,6 +257,14 @@ var activityCategories = map[string]struct{}{
 	"merge_candidate_verdict_transferred":      {},
 	"merge_candidate_verdict_transfer_refused": {},
 	"merge_candidate_verdict_false_transfer":   {},
+	// Merge-queue yield (ADR-112 R5, #4632). A system-actor audit kind with NO
+	// dedicated Notifier method: server/merge_queue_yield_reprobe.go writes it
+	// ONCE per yield episode, when the entry has stayed yielded longer than
+	// one pump tick, and marks it with notifyOperatorVisible. The INTERNAL
+	// merge_queue_yielded and merge_queue_yield_cleared rows are DELIBERATELY
+	// not registered. The yield detail is UNTRUSTED and renders only through
+	// NeutralizeUntrustedInline inside a code span.
+	"merge_queue_yield_posted": {},
 }
 
 // RendersActivity reports whether category is a member of the
@@ -371,6 +379,8 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return renderVerdictTransferRefusedLine(e.Payload)
 	case "merge_candidate_verdict_false_transfer":
 		return renderVerdictFalseTransferLine(e.Payload)
+	case "merge_queue_yield_posted":
+		return renderMergeQueueYieldPostedLine(e.Payload)
 	case "run_revived_on_reopen":
 		if actor == "" {
 			return "PR reopened; the run was revived to its review gate"
@@ -1371,3 +1381,30 @@ func relativeAge(ts, now time.Time) string {
 }
 
 // shortID lives in notifier.go; reused here for the comment header.
+
+// mergeQueueYieldPostedRow is the subset of a merge_queue_yield_posted row
+// (server/merge_queue_yield_reprobe.go) the activity line reads. yield_reason
+// and next_step are the server's closed vocabulary; yield_detail is UNTRUSTED
+// forge-derived text.
+type mergeQueueYieldPostedRow struct {
+	YieldReason string `json:"yield_reason"`
+	YieldDetail string `json:"yield_detail"`
+	NextStep    string `json:"next_step"`
+}
+
+// renderMergeQueueYieldPostedLine: "Merge queue: yielded its place in line
+// (<reason>); next step: <next_step>", the closed codes through
+// transferClosedCode (anything else reads "unknown") and the UNTRUSTED detail
+// neutralized inside ONE code span.
+func renderMergeQueueYieldPostedLine(payload json.RawMessage) string {
+	var p mergeQueueYieldPostedRow
+	if len(payload) > 0 {
+		_ = json.Unmarshal(payload, &p)
+	}
+	line := fmt.Sprintf("Merge queue: yielded its place in line (%s); next step: %s",
+		transferClosedCode(p.YieldReason), transferClosedCode(p.NextStep))
+	if d := NeutralizeUntrustedInline(p.YieldDetail, transferDetailMaxBytes); d != "" {
+		line += " — detail `" + d + "`"
+	}
+	return line
+}

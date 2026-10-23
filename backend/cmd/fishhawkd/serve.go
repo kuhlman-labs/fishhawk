@@ -2054,6 +2054,9 @@ func runServe(args []string, logSink io.Writer) int {
 	mergeCandidateTransfer := fs.String("merge-candidate-transfer",
 		envOr("FISHHAWKD_MERGE_CANDIDATE_TRANSFER", defaultMergeCandidateTransferMode),
 		"ADR-096 merge-candidate verdict transfer across an independent clean base advance (E87.2 / #4293): off | shadow | enforce; default shadow (ADR-098 D3). shadow never skips a pass and records the would-be decision; enforce transfers a passed verdict and skips the pass; off computes nothing. Any other value fails startup. Needs git and go on fishhawkd's PATH, or every decision is undecidable (fail closed). Contract: backend/README.md.")
+	mergeQueueApprovalWait := fs.String("merge-queue-approval-wait",
+		envOr("FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT", server.DefaultMergeQueueApprovalWait.String()),
+		"ADR-112 R3 head-of-line approval wait (#4632): how long a merge-queue entry whose forge approval does not qualify (review required, dismissed, absent, undetermined, truncated) holds the head of the line before it YIELDS its place. A Go duration; default 30m. A non-positive or unparseable value fails startup. Contract: backend/README.md.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -2351,6 +2354,15 @@ func runServe(args []string, logSink io.Writer) int {
 		return exitFailure
 	}
 
+	// ADR-112 R3 approval wait (#4632). Resolved before anything dials a
+	// database, on the transfer flag's precedent: a typo or a non-positive
+	// window refuses startup rather than falling back to the default.
+	approvalWait, err := resolveMergeQueueApprovalWait(*mergeQueueApprovalWait)
+	if err != nil {
+		logger.Error("invalid merge-queue approval wait", slog.String("error", err.Error()))
+		return exitFailure
+	}
+
 	// OAuth token-mint authz minimum (E39.3 / #1708). Fail closed on an
 	// unrecognized tier rather than silently defaulting — a typo must not
 	// under-gate the mint endpoint.
@@ -2458,6 +2470,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// server.New logs the boot attribution: a WARN naming a non-shadow mode
 	// and, outside off, a WARN per missing git / go binary.
 	cfg.MergeCandidateTransfer = transferCfg
+	cfg.MergeQueueApprovalWait = approvalWait
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
@@ -4070,6 +4083,13 @@ func runServe(args []string, logSink io.Writer) int {
 		go srv.RunMergeCandidateQueuePump(ctx, server.MergeCandidateQueuePumpInterval)
 		logger.Info("merge-candidate queue pump started",
 			slog.Duration("interval", server.MergeCandidateQueuePumpInterval))
+		// ADR-112 R3/R5 (#4632): the yield re-probe, a sibling ticker at the
+		// pump interval: it surfaces a yield once per episode and re-probes
+		// at most one due yielded entry per base per tick.
+		go srv.RunMergeQueueYieldReprobe(ctx, server.MergeCandidateQueuePumpInterval)
+		logger.Info("merge-queue yield re-probe started",
+			slog.Duration("interval", server.MergeCandidateQueuePumpInterval),
+			slog.Duration("approval_wait", approvalWait))
 	}
 
 	errCh := make(chan error, 1)
@@ -4551,6 +4571,21 @@ func resolveMergeCandidateTransferConfig(mode string) (server.MergeCandidateTran
 		Mode:       m,
 		Classifier: &basedelta.Classifier{Loader: &basedelta.GoListLoader{}},
 	}, nil
+}
+
+// resolveMergeQueueApprovalWait validates --merge-queue-approval-wait /
+// FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT: a Go duration that must be positive
+// (server.Config's zero value means the default, so a non-positive window has
+// no meaning to pass through and refuses instead).
+func resolveMergeQueueApprovalWait(raw string) (time.Duration, error) {
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("--merge-queue-approval-wait / FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT: %q is not a Go duration: %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--merge-queue-approval-wait / FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT: %q must be a positive duration", raw)
+	}
+	return d, nil
 }
 
 // alertTriggerConfig is the resolved alert-ingress configuration
