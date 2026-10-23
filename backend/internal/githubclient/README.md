@@ -66,7 +66,7 @@ The forge-surface DTO vocabulary this package used to define — `RepoRef`, `Rep
 
 `EnableAutoMerge` issues GitHub's `enablePullRequestAutoMerge` GraphQL mutation, which returns HTTP 200 with an application-level `errors` array on a refusal. The refusal message is substring-classified into `ErrValidation` plus, for two known precondition classes, an additional wrapped sentinel (Go multi-`%w`, so every existing `errors.Is(err, ErrValidation)` caller is unaffected):
 
-- **`ErrPullRequestCleanStatus`** (message contains `"clean status"`, #1954) — the PR is ALREADY merge-ready, so GitHub refuses to queue auto-merge on something it could merge synchronously right now. The operator merge path (`serve.go` `githubAutoMerger`) **falls back to a synchronous REST squash merge** on this sentinel.
+- **`ErrPullRequestCleanStatus`** (message contains `"clean status"`, #1954) — the PR is ALREADY merge-ready, so GitHub refuses to queue auto-merge on something it could merge synchronously right now. The operator merge ladder (`QueueMerge`, which the `serve.go` `githubAutoMerger` leaf delegates to, #4641) **falls back to a synchronous REST squash merge** on this sentinel.
 - **`ErrPullRequestUnstableStatus`** (message contains `"unstable status"`, E67.56 / #2717) — the PR is in GitHub's UNSTABLE `mergeStateStatus`: its required checks have NOT all passed. GitHub defines UNSTABLE as "mergeable with a non-passing commit status", which covers BOTH a still-pending required context AND one that has already COMPLETED and FAILED — so this sentinel is **not** proof the checks are merely unfinished, and a failed non-required check leaves a PR UNSTABLE forever. This class **takes NO REST fallback**, deliberately: a synchronous REST squash merge on an UNSTABLE PR would SUCCEED and land the change before its pending checks report. The server maps it to a bounded wait (`409 merge_checks_pending`), not a merge.
 
 The two substrings (`"clean status"` vs `"unstable status"`) are disjoint, so neither branch can capture the other's message — pinned by paired positive/negative `errors.Is` assertions across the clean, unstable, and unrelated messages in `client_test.go`. A future GitHub rewording of either message degrades to the plain `ErrValidation` (the status-quo generic path), never a wrong merge.
@@ -75,12 +75,40 @@ The two substrings (`"clean status"` vs `"unstable status"`) are disjoint, so ne
 
 `MergePullRequestAtHead(ctx, scope, repo, prNumber, method, expectedHeadSHA)` is `MergePullRequest` with the head PINNED: the same `PUT /repos/{owner}/{repo}/pulls/{number}/merge`, whose body also carries `sha` ("SHA that pull request head must match to allow merge"). It is the merge queue's merge-on-pass leaf (`serve.go` `githubAutoMerger.MergePullRequestAtHead`, reached through `server.ForgeMerger`'s optional `HeadPinnedMerger`), so a head that moved after the queue verified it is refused by GitHub rather than merged.
 
-- **Synchronous only.** It never touches `EnableAutoMerge` / GraphQL: a queued auto-merge waits on checks while the base may move, which would land a tree the queue never verified against the current base.
+- **Synchronous only.** It never touches `EnableAutoMerge` / GraphQL: a queued auto-merge waits on checks while the base may move, which would land a tree the queue never verified against the current base. It is also `QueueMerge`'s PINNED clean-status fallback (next section).
 - **An empty (or whitespace) `expectedHeadSHA` is refused before any HTTP call**, so the pinned seam can never silently degrade into an unpinned merge.
 - **Status mapping is `MergePullRequest`'s**: 405 → `ErrPullRequestNotMergeable`; 409 (head modified / sha mismatch) → `ErrMergeConflict` — the sentinel merge-on-pass re-advances on; 422 → `ErrValidation` AND `ErrMergeUnprocessable` (multi-`%w`), the typed refusal the merge-dispatch ledger releases on (a generic GraphQL error envelope is `ErrValidation` only, an uncertain outcome; `TestEnableAutoMerge_GenericGraphQLError_NotATypedRefusal`); 401/403/404 via `classifyStatus`.
 - Both methods share one private body (`mergePullRequest`); `MergePullRequest` passes an empty sha and its request stays byte-shaped as before (no `sha` key).
 
 Pinned by `TestMergePullRequestAtHead_{SendsShaAndMethod,EmptyShaRefusedBeforeHTTP,StatusMapping}` and `TestMergePullRequest_OmitsSha` in `client_test.go`. GitHub pins only the HEAD, not the base: a base push in the instant between the queue's base re-probe and this call is a documented merge-on-pass residual (`backend/internal/server/README.md`).
+
+## Head-pinned auto-merge ladder — `EnableAutoMergeAtHead` / `QueueMerge` (#4641)
+
+`EnableAutoMergeAtHead(ctx, scope, repo, prNumber, method, expectedHeadSHA)` is `EnableAutoMerge` with the head PINNED through the `enablePullRequestAutoMerge` input's `expectedHeadOid` ("The expected head OID of the pull request", <https://docs.github.com/en/graphql/reference/input-objects#enablepullrequestautomergeinput>). Both share one private body (`enableAutoMerge`); `EnableAutoMerge` passes an empty head and its request is byte-identical to before (no `expectedHeadOid`, variables exactly `id` + `method`; `TestEnableAutoMerge_UnpinnedRequestUnchanged`).
+
+- **Empty (or whitespace) `expectedHeadSHA` is refused before any HTTP call.**
+- **Pre-check.** The GET that resolves the node id also reads the head; a head other than `expectedHeadSHA` returns `ErrMergeConflict` and NO mutation is sent.
+- **ONE variable name.** The mutation declares `$expectedHeadOid: GitObjectID!`, binds `expectedHeadOid: $expectedHeadOid`, and sets `variables["expectedHeadOid"]`. The non-null `!` makes a missing value a GraphQL validation error, never a silently unpinned enable. `TestEnableAutoMergeAtHead_SendsExpectedHeadOid` resolves the value THROUGH the declared binding, so a renamed declaration with a stale map key reads as absent.
+- **GraphQL error classification.** The clean-status / unstable-status sentinels are classified first (no re-read). ANY other GraphQL error on a pinned call re-reads the PR once. When that read succeeds and names a different, non-empty head, the error is `ErrValidation` AND `ErrMergeConflict` (multi-`%w`). GitHub does not document the wording of an `expectedHeadOid` mismatch, so the client never substring-matches it. An unmoved head, an empty head, or a failed re-read stays the generic `ErrValidation`: an uncertain outcome, never a typed refusal.
+
+`QueueMerge(ctx, scope, repo, prNumber, method, expectedHeadSHA)` is the operator merge ladder, moved here from `serve.go`'s `githubAutoMerger` so one production function carries it. It queues auto-merge first and falls back to a synchronous REST merge ONLY on `ErrPullRequestCleanStatus` (#1954). The UNSTABLE-status class never takes the fallback (#2717), and neither does a head mismatch.
+
+| `expectedHeadSHA` | enable arm | clean-status fallback |
+|---|---|---|
+| non-empty (pinned) | `EnableAutoMergeAtHead` | `MergePullRequestAtHead` (`sha`; a 409 means "sha was provided and pull request head did not match", <https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request>) |
+| empty (no head evaluated) | `EnableAutoMerge` | `MergePullRequest` (no `sha`) |
+
+A whitespace-only head is NOT read as empty. It reaches `EnableAutoMergeAtHead` and is refused, so it cannot degrade to the unpinned row.
+
+**Head-mismatch basis.** Every head-mismatch refusal wraps `ErrMergeConflict` together with a `*HeadMismatchError` (recover it with `errors.As`). Its `Basis` says how the mismatch was established, because the arms differ in what the forge guarantees:
+
+| `Basis` | established by | nothing applied? |
+|---|---|---|
+| `precheck` (`HeadMismatchPrecheck`) | the pre-mutation GET; no mutation sent | yes, guaranteed |
+| `rest_sha` (`HeadMismatchRESTSha`) | the pinned PUT's 409 | yes, forge-documented |
+| `graphql_reread` (`HeadMismatchGraphQLReread`) | a GraphQL error plus a fresh GET showing a moved head | INFERRED, not guaranteed: if the mutation had in fact applied, auto-merge may be armed at the pinned head |
+
+Pinned by `TestEnableAutoMergeAtHead_*` and `TestQueueMerge_*` in `client_test.go`, which run over a recording fake (`pinFake`) that serves the PR GET a sequence of heads.
 
 ## Repository issue enumeration (#2230)
 
