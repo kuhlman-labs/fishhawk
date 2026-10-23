@@ -3620,6 +3620,13 @@ func runServe(args []string, logSink io.Writer) int {
 		cfg.HostAdmissionHold = opsHold
 	}
 
+	// ADR-093 D8 boot instant (#4298, ruling R8a): captured on the DATABASE
+	// clock right before newServer, so before every goroutine that can admit
+	// a merge-queue entry (the auto-drive and scheduler loops, the pump, the
+	// HTTP listener). The boot pump re-claims only admissions older than it.
+	// Pinned by TestServeGo_CapturesMergeQueueBootAtBeforeServing.
+	cfg.MergeQueueBootAt = captureMergeQueueBootAt(context.Background(), cfg.MergeQueue, logger)
+
 	srv = newServer(cfg)
 
 	// Per-repo work-management conventions loader (E45.16 / #2022): fetch
@@ -4577,6 +4584,35 @@ func resolveMergeCandidateTransferConfig(mode string) (server.MergeCandidateTran
 		Mode:       m,
 		Classifier: &basedelta.Classifier{Loader: &basedelta.GoListLoader{}},
 	}, nil
+}
+
+// mergeQueueBootAtTimeout bounds the boot-instant read.
+const mergeQueueBootAtTimeout = 10 * time.Second
+
+// captureMergeQueueBootAt reads the ADR-093 D8 boot instant
+// (mergequeue.Resumer.DatabaseNow, the DATABASE clock) for
+// server.Config.MergeQueueBootAt. A nil queue answers zero silently; a queue
+// that is not a Resumer, or a failed read, answers zero with a WARN. Zero
+// turns the boot re-claim off and leaves the 10-minute stale re-claim
+// (mergequeue.AdmissionStaleAfter) as the only recovery of a dead admission.
+func captureMergeQueueBootAt(ctx context.Context, q mergequeue.Store, logger *slog.Logger) time.Time {
+	if q == nil {
+		return time.Time{}
+	}
+	rs, ok := q.(mergequeue.Resumer)
+	if !ok {
+		logger.Warn("merge queue: the store cannot read the database clock; the boot re-claim is off and only the stale re-claim recovers a dead admission")
+		return time.Time{}
+	}
+	rctx, cancel := context.WithTimeout(ctx, mergeQueueBootAtTimeout)
+	defer cancel()
+	at, err := rs.DatabaseNow(rctx)
+	if err != nil {
+		logger.Warn("merge queue: the boot instant could not be read; the boot re-claim is off and only the stale re-claim recovers a dead admission",
+			slog.String("error", err.Error()))
+		return time.Time{}
+	}
+	return at
 }
 
 // resolveMergeQueueApprovalWait validates --merge-queue-approval-wait /

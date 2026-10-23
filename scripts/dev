@@ -3252,12 +3252,13 @@ _refuse_on_live_runs() {
 # ---------------------------------------------------------------------------
 # Restart-blocker guard for reload / post-merge (E83.30 / #3974)
 #
-# The #2897 guard above protects a live RUNNER process. Two hazards have no
+# The #2897 guard above protects a live RUNNER process. Three hazards have no
 # runner process at all and live inside fishhawkd itself: a decomposition child
-# whose implement stage is not dispatched yet, and a plan/implement review
-# round a restart would LOSE (a current-process round the next boot would not
-# re-dispatch, or a boot re-dispatch still settling — #4077). The daemon owns
-# both predicates, so the guard asks it: GET /v0/restart-blockers returns a
+# whose implement stage is not dispatched yet, a plan/implement review round a
+# restart would LOSE (a current-process round the next boot would not
+# re-dispatch, or a boot re-dispatch still settling — #4077), and a head-of-line
+# merge-queue merge THIS daemon has in flight (merge_in_flight, ADR-093 D8 /
+# #4298). The daemon owns every predicate, so the guard asks it: GET /v0/restart-blockers returns a
 # flat list of {run_id, reason, stage, parent_run_id?, ...} items with no free
 # text.
 #
@@ -3420,6 +3421,8 @@ _refuse_on_restart_blockers() {
         blockers+=("run ${b_run}: ${b_stage} review round a restart would lose — the next boot would not re-dispatch it, or its boot re-dispatch has not settled (review_in_flight)") ;;
       check_failed)
         blockers+=("run ${b_run}: fishhawkd could not decide this run's ${b_stage} state — a stage or audit read failed (check_failed)") ;;
+      merge_in_flight)
+        blockers+=("run ${b_run}: head-of-line queue merge in flight — a restart interrupts the forge merge call, so the next boot must reconcile it and may hold it for the operator re-arm (merge_in_flight)") ;;
       *)
         blockers+=("run ${b_run}: blocker item the guard could not read (${b_reason})") ;;
     esac
@@ -3440,15 +3443,16 @@ _refuse_on_restart_blockers() {
   print -u2 "  what --force breaks: pulling main under an undispatched decomposition child makes its dispatch fail"
   print -u2 "  working_dir_diverged_from_base (post-merge only), and a listed review round's reviewer dies with the"
   print -u2 "  daemon and the next boot records it failed instead of re-dispatching it (an advisory round the next"
-  print -u2 "  boot re-dispatches is never listed); an undecided run may be either."
+  print -u2 "  boot re-dispatches is never listed); a listed queue merge loses its forge call mid-flight, so the"
+  print -u2 "  next boot reconciles it and may hold it for the operator re-arm; an undecided run may be any of these."
   if (( force )); then
     print -u2 "  proceeding anyway because --force was given."
     return 0
   fi
   if [[ "$context" == reload ]]; then
-    print -u2 "  let the review rounds settle (reload --when-quiet waits for them), or re-run with --force to restart anyway."
+    print -u2 "  let the review rounds and queue merges settle (reload --when-quiet waits for them), or re-run with --force to restart anyway."
   else
-    print -u2 "  dispatch the children / let the review rounds settle, or re-run with --force to restart anyway."
+    print -u2 "  dispatch the children / let the review rounds and queue merges settle, or re-run with --force to restart anyway."
   fi
   return 1
 }

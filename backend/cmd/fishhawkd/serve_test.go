@@ -55,6 +55,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergereconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/modeloracle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
@@ -1127,6 +1128,142 @@ func guardedByMergeQueueNonNil(stack []ast.Node, gs *ast.GoStmt) bool {
 		return ok && y.Name == "nil"
 	}
 	return false
+}
+
+// bootAtStore is a mergequeue.Store fake; the embedded nil interface panics on
+// any method the boot-instant capture must not call.
+type bootAtStore struct{ mergequeue.Store }
+
+// bootAtResumer adds the Resumer capability with a canned DatabaseNow answer.
+type bootAtResumer struct {
+	bootAtStore
+	at    time.Time
+	err   error
+	calls int
+}
+
+func (r *bootAtResumer) DatabaseNow(context.Context) (time.Time, error) {
+	r.calls++
+	return r.at, r.err
+}
+
+func (r *bootAtResumer) AdmitNextReclaiming(context.Context, mergequeue.ReclaimRequest) (mergequeue.Admission, error) {
+	panic("captureMergeQueueBootAt must not admit")
+}
+
+// TestCaptureMergeQueueBootAt (ADR-093 D8 / #4298, ruling R8a): a Resumer's
+// database-clock instant becomes the boot instant; a read error, a store that
+// is not a Resumer, or no queue at all answer zero (the boot re-claim off),
+// the first two with a WARN. Counterfactual C3b: returning zero
+// unconditionally fails the resumer arm.
+func TestCaptureMergeQueueBootAt(t *testing.T) {
+	at := time.Date(2026, 10, 23, 12, 0, 0, 0, time.UTC)
+	logged := func() (*slog.Logger, *bytes.Buffer) {
+		var buf bytes.Buffer
+		return slog.New(slog.NewTextHandler(&buf, nil)), &buf
+	}
+	t.Run("resumer", func(t *testing.T) {
+		lg, buf := logged()
+		r := &bootAtResumer{at: at}
+		if got := captureMergeQueueBootAt(context.Background(), r, lg); !got.Equal(at) || r.calls != 1 {
+			t.Fatalf("boot instant = %v after %d reads, want %v after one", got, r.calls, at)
+		}
+		if buf.Len() != 0 {
+			t.Fatalf("a successful read logged %q", buf.String())
+		}
+	})
+	t.Run("resumer_error", func(t *testing.T) {
+		lg, buf := logged()
+		r := &bootAtResumer{at: at, err: errors.New("db down")}
+		if got := captureMergeQueueBootAt(context.Background(), r, lg); !got.IsZero() {
+			t.Fatalf("boot instant = %v on a read error, want zero", got)
+		}
+		if !strings.Contains(buf.String(), "level=WARN") || !strings.Contains(buf.String(), "db down") {
+			t.Fatalf("log = %q, want a WARN naming the read error", buf.String())
+		}
+	})
+	t.Run("not_resumer", func(t *testing.T) {
+		lg, buf := logged()
+		if got := captureMergeQueueBootAt(context.Background(), bootAtStore{}, lg); !got.IsZero() {
+			t.Fatalf("boot instant = %v for a non-Resumer, want zero", got)
+		}
+		if !strings.Contains(buf.String(), "level=WARN") {
+			t.Fatalf("log = %q, want a WARN that the boot re-claim is off", buf.String())
+		}
+	})
+	t.Run("nil_queue", func(t *testing.T) {
+		lg, buf := logged()
+		if got := captureMergeQueueBootAt(context.Background(), nil, lg); !got.IsZero() || buf.Len() != 0 {
+			t.Fatalf("boot instant = %v log %q with no queue, want zero and silence", got, buf.String())
+		}
+	})
+}
+
+// TestServeGo_CapturesMergeQueueBootAtBeforeServing (ADR-093 D8 / #4298,
+// ruling R8a) walks the PARSED runServe body: the assignment
+// `cfg.MergeQueueBootAt = captureMergeQueueBootAt(...)` must precede
+// `srv = newServer(cfg)` and every go statement in runServe, so no goroutine
+// of THIS process can admit an entry before the boot instant and have the
+// boot pump re-claim its own admission. Counterfactual C3a: moving the capture
+// after `go srv.Start()` fails it.
+func TestServeGo_CapturesMergeQueueBootAtBeforeServing(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	var capture, newSrv token.Pos
+	var goStmts []token.Pos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch x := n.(type) {
+		case *ast.GoStmt:
+			goStmts = append(goStmts, x.Pos())
+		case *ast.AssignStmt:
+			if len(x.Lhs) != 1 || len(x.Rhs) != 1 {
+				return true
+			}
+			call, ok := x.Rhs[0].(*ast.CallExpr)
+			if !ok {
+				return true
+			}
+			fun, ok := call.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			if sel, ok := x.Lhs[0].(*ast.SelectorExpr); ok && sel.Sel.Name == "MergeQueueBootAt" && fun.Name == "captureMergeQueueBootAt" {
+				if base, ok := sel.X.(*ast.Ident); ok && base.Name == "cfg" && capture == token.NoPos {
+					capture = x.Pos()
+				}
+			}
+			if id, ok := x.Lhs[0].(*ast.Ident); ok && id.Name == "srv" && fun.Name == "newServer" && newSrv == token.NoPos {
+				newSrv = x.Pos()
+			}
+		}
+		return true
+	})
+	if capture == token.NoPos {
+		t.Fatal("runServe never assigns cfg.MergeQueueBootAt = captureMergeQueueBootAt(...); the boot re-claim would be off")
+	}
+	if newSrv == token.NoPos || capture > newSrv {
+		t.Fatal("cfg.MergeQueueBootAt is not captured before `srv = newServer(cfg)`; the Server would copy a zero boot instant")
+	}
+	if len(goStmts) == 0 {
+		t.Fatal("runServe has no go statement; the ordering check would be vacuous")
+	}
+	for _, g := range goStmts {
+		if g < capture {
+			t.Fatal("a go statement in runServe precedes the boot-instant capture; a goroutine could admit before the boot instant and the boot pump would re-claim THIS process's admission")
+		}
+	}
 }
 
 // TestGithubAutoMerger_FailsClosed asserts the merger refuses — before any
