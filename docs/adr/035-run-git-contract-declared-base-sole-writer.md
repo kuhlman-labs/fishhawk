@@ -1,7 +1,8 @@
 ---
 id: ADR-035
 title: "Own and enforce the git contract of a run (declared base + sole-writer branch lineage)"
-status: unknown
+status: accepted
+date: 2026-06-07
 issue: https://github.com/kuhlman-labs/fishhawk/issues/857
 supersedes: []
 superseded_by: []
@@ -51,3 +52,7 @@ A run **declares**, and Fishhawk **enforces**, the git contract of its branch:
 - **Cross-refs:** ADR-031 (#710), invariant monitor (#837), #856 (fix-up no-changes hang), fix-up lineage #762 / #780 / #784 / #818 / #823.
 
 Parent epic: #389
+
+## Decision
+
+**Accepted (2026-06-07).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-07).**".

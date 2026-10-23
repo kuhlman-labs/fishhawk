@@ -125,3 +125,5 @@ Sequencing: this is the next batch after campaign 9275cbb2 and the reviewer-pers
 ## Relations
 
 Amends ADR-090 (#4018 lineage). Related: ADR-092, ADR-093, ADR-094 (#4239), ADR-043 (verdict transfer principle), #4229, #4250, #4063.
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-098 (D3, the global-surface set, is replaced by ADR-098 D1–D2). D1(a)–(d), D2 and D4–D6 still govern.

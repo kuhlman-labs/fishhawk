@@ -1,9 +1,9 @@
 ---
 id: ADR-057
 title: "Multi-tenancy model and tenant isolation for hosted deployment"
-status: unknown
+status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1823
-supersedes: []
+supersedes: ["ADR-061"]
 superseded_by: []
 amended_by: ["ADR-105"]
 applies_to: []
@@ -85,3 +85,9 @@ Risks: a missed `account_id` predicate is a cross-tenant leak within a cell (RLS
 ## Status
 
 **Accepted (founder-directed).** Decisions above are locked. Next step: break the Consequences into child implementation issues under a multi-tenancy epic, sequencing the two hosting preconditions (login gate, endpoint configurability) first.
+
+## Decision
+
+**Accepted (date not stated).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Accepted (founder-directed).** Decisions above are locked.".
+
+Amendment A1 supersedes ADR-061 (#2069), which was folded into it (confirmed by the Captain 2026-10-23).

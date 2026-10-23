@@ -6,6 +6,7 @@ date: 2026-06-18
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1140
 supersedes: []
 superseded_by: []
+amends: ["ADR-032"]
 amended_by: ["ADR-116"]
 applies_to: []
 ---
@@ -44,3 +45,5 @@ Decomposition (ADR-025) mints one child run per slice (`fanoutIfDecomposed`, `ba
 ## Consequences
 
 Revises **ADR-032** (#714): the consolidated PR head is now produced by a fan-in integration of per-slice branches, not by children rebasing onto a shared branch. Cross-reference this ADR in ADR-032's Consequences. Extends **ADR-035** (#857): the sole-writer invariant now applies per slice branch; the parent owns the consolidated branch only via the fan-in step. New failure mode: fan-in conflict (recoverable). Cost/budget exposure rises with concurrency, mitigated by the cap (guardrails issue). Implementation tracked under epic **[E24] #1139**.
+
+**Amends ADR-032** (confirmed by the Captain 2026-10-23: this record's "Revises ADR-032" is an amendment, not a supersession).

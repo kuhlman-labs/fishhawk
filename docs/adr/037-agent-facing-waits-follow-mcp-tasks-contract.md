@@ -1,7 +1,8 @@
 ---
 id: ADR-037
 title: "Agent-facing waits follow the MCP Tasks / long-running-operation contract (durable handle + authoritative poll)"
-status: unknown
+status: accepted
+date: 2026-06-08
 issue: https://github.com/kuhlman-labs/fishhawk/issues/879
 supersedes: []
 superseded_by: []
@@ -49,3 +50,7 @@ Any convenience block (e.g. `await_review`) is a thin, **calibrated, idempotent,
 Sources: WorkOS "MCP Async Tasks: long-running workflows for AI Agents" (workos.com/blog/mcp-async-tasks-ai-agent-workflows); MCP SEP-1391 Long-Running Operations (github.com/modelcontextprotocol/modelcontextprotocol/issues/1391); Google AIP-151 (google.aip.dev/151); Azure Async Request-Reply (learn.microsoft.com/azure/architecture/patterns/asynchronous-request-reply); MCP Progress utility (modelcontextprotocol.info/specification/draft/basic/utilities/progress/).
 
 Parent epic: #389
+
+## Decision
+
+**Accepted (2026-06-08).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-08).**".

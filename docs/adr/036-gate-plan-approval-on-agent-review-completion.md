@@ -1,7 +1,8 @@
 ---
 id: ADR-036
 title: "Gate plan approval on agent-review completion (block-on-completion, unblock-on-terminal)"
-status: unknown
+status: accepted
+date: 2026-06-08
 issue: https://github.com/kuhlman-labs/fishhawk/issues/874
 supersedes: []
 superseded_by: []
@@ -44,3 +45,7 @@ When a stage has a configured agent reviewer (`reviewers.agent > 0`) that has be
 - **Cross-refs:** ADR-027 (#545, review-agent primitive), ADR-031 (#710, review gate), #664 (`plan_review_failed`), #747 (review timeout), ADR-035 (#857, enforce-not-convention). Motivated by the operator-lapse observed across #797/#858/#862/#867.
 
 Parent epic: #389
+
+## Decision
+
+**Accepted (2026-06-08).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-08).**".

@@ -69,23 +69,4 @@ The tool-level mitigations (#3962, #3948) remain as defense in depth. Implementa
 
 Companion: #3964 (core implementation), and its follow-up for the remaining host-spawn verbs. Related: #3948, #3962, ADR-024, ADR-063.
 
-### Intake signals (advisory)
-
-Derived automatically when this item was filed. Everything below is a candidate for a human: nothing was closed, relabelled or transitioned.
-
-**Possible duplicates**
-- none found
-
-**Parent epic suggestion**
-- none
-
-**Provisional score**
-- 2.0, citing S4, U4
-  - **S4** — Missing the structure the loop needs: absent Done-means, missing label namespace, unlinked parent epic, unrecorded `depends_on` edge, `boarded:false`. Objective and reversible — the `hygiene` action class.
-    (no parent epic linked)
-  - **U4** — Blocks nothing, and nothing blocks it. Schedule on value alone.
-    (no depends_on edge declared)
-
-Scanned 300 existing item(s); the scan window was truncated, so an older duplicate may be missed.
-
-<!-- fishhawk-intake:v1 {"score":{"value":2,"citations":[{"rubric_id":"S4","quote":"Missing the structure the loop needs: absent Done-means, missing label namespace, unlinked parent epic, unrecorded `depends_on` edge, `boarded:false`. Objective and reversible — the `hygiene` action class.","note":"no parent epic linked"},{"rubric_id":"U4","quote":"Blocks nothing, and nothing blocks it. Schedule on value alone.","note":"no depends_on edge declared"}],"unscored":false},"degraded":false,"scanned_items":300,"window_truncated":true,"duration_ms":1715} -->
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-094 ('one group per stage'; 'a named group is repository-scoped and replaces the host default'). The admission constraints still govern; also amended by ADR-100.

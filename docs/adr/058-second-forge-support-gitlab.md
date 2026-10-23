@@ -107,3 +107,5 @@ Ratified 2026-07-12 (operator/founder). Children filed under [E45] #1852: #1854 
 - E36 / #1638 — external-repo alpha readiness; genericizes fishhawk-specific assumptions (a precursor that reduces GitLab-porting friction).
 - ADR-050 / #1540 — acceptance-agent egress chosen for portability "across CI providers" (a design choice that already anticipated non-GitHub CI).
 - Invariant #1 (`docs/ARCHITECTURE.md` §6) — customer source never reaches the backend; satisfied for free on GitLab CI.
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-061 / ADR-057 Amendment A1 (tenant = forge account → forge-agnostic workspace). GitLab second-forge support still governs.

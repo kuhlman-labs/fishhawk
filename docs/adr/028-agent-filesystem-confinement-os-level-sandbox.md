@@ -1,7 +1,7 @@
 ---
 id: ADR-028
 title: "Agent filesystem confinement requires an OS-level sandbox"
-status: unknown
+status: accepted
 date: 2026-06-01
 issue: https://github.com/kuhlman-labs/fishhawk/issues/642
 supersedes: []
@@ -55,3 +55,7 @@ Bash is an unconfinable escape hatch at the CLI-permission layer. Confining the 
 - #611 / PR #643 (the surfacing minimum + the empirical matrix), ADR-022 / #388 (pluggable runner backends — owns the hosted container-confinement requirement), ADR-024 (agent execution), `runner/internal/agent/claudecode/claudecode.go`.
 
 Parent epic: #389
+
+## Decision
+
+**Accepted (2026-06-01).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Decision recorded (local: detection-only per #611; hosted: container mount-confinement…). Closing as resolved.".

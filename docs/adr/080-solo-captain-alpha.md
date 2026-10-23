@@ -91,23 +91,4 @@ Enacted by:
 
 **Risk.** Alpha grows from two open V1 items to roughly ten epics, eight not started. The v0.1.0 preview and the per-role done-means are the mitigations; if T9 stalls, option 3 remains available as a fallback without reopening this ADR's direction.
 
-### Intake signals (advisory)
-
-Derived automatically when this item was filed. Everything below is a candidate for a human: nothing was closed, relabelled or transitioned.
-
-**Possible duplicates**
-- none found
-
-**Parent epic suggestion**
-- none
-
-**Provisional score**
-- 2.0, citing S4, U4
-  - **S4** — Missing the structure the loop needs: absent Done-means, missing label namespace, unlinked parent epic, unrecorded `depends_on` edge, `boarded:false`. Objective and reversible — the `hygiene` action class.
-    (no parent epic linked)
-  - **U4** — Blocks nothing, and nothing blocks it. Schedule on value alone.
-    (no depends_on edge declared)
-
-Scanned 300 existing item(s); the scan window was truncated, so an older duplicate may be missed.
-
-<!-- fishhawk-intake:v1 {"score":{"value":2,"citations":[{"rubric_id":"S4","quote":"Missing the structure the loop needs: absent Done-means, missing label namespace, unlinked parent epic, unrecorded `depends_on` edge, `boarded:false`. Objective and reversible — the `hygiene` action class.","note":"no parent epic linked"},{"rubric_id":"U4","quote":"Blocks nothing, and nothing blocks it. Schedule on value alone.","note":"no depends_on edge declared"}],"unscored":false},"degraded":false,"scanned_items":300,"window_truncated":true,"duration_ms":1915} -->
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-099 (glossary row 'First officer = the operator agent'). The rest of ADR-080 still governs.

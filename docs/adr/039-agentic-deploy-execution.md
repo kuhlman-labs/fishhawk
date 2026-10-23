@@ -1,7 +1,7 @@
 ---
 id: ADR-039
 title: "Agentic deploy execution (skills perform the rollout)"
-status: unknown
+status: proposed
 date: 2026-08-25
 issue: https://github.com/kuhlman-labs/fishhawk/issues/937
 supersedes: []
@@ -42,6 +42,8 @@ Charter §3 N4 states: *Fishhawk does not own deploy mechanics. The governed dep
 This ADR remains OPEN because it is the vehicle for *revisiting* N4 should the deferral trigger fire, **not a parallel track around it**. Nothing here authorizes work toward Option 2; a change of position requires amending N4 per charter §6, which is a founder decision and not an ADR side effect.
 
 Recorded 2026-08-25 after backlog grooming run `d650b22a` flagged this item as vision drift against N4 (`basis: non_goal`). The flag was correct that the item sits on the far side of the N4 line; what it could not see is that `Status: Proposed` with an empty Decision section reads as live design space to a grooming run and to any agent, when in fact the question was already deferred with a concrete trigger. This section removes that ambiguity. The deferral, the revisit trigger, and Option 1's standing status are unchanged by this annotation — only their legibility is.
+
+Status confirmed by the Captain 2026-10-23 as **proposed**: open and deferred ("**Deferred. Charter N4 is the standing answer until this ADR is revisited.**").
 
 ## Consequences
 

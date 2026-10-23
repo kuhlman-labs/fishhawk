@@ -1,7 +1,7 @@
 ---
 id: ADR-044
 title: "model cost observability — warn-not-fail price drift-check, 3-bucket fresh/read/write cache cost model with separate capture, split cost-accuracy from efficiency-metric, daily cadence"
-status: unknown
+status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1336
 supersedes: []
 superseded_by: []
@@ -49,3 +49,7 @@ applies_to: []
 - #1335 — drift-check (warn) + `/v1/models` availability poll automation. The poll's cached output also feeds model-input validation (#1339), not just ops alerts.
 - #1338 — cache-aware cost accounting + efficiency metric (3-bucket fresh/read/write).
 - #1339 — model-input validity validation against the live `/v1/models` snapshot (accept new, surface deprecated/typo, fail-open when unverifiable).
+
+## Decision
+
+**Accepted (date not stated).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Closing — decision recorded **and all children implemented**.".

@@ -1,11 +1,13 @@
 ---
 id: ADR-042
 title: "Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity"
-status: unknown
+status: accepted
+date: 2026-06-21
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1264
 supersedes: []
 superseded_by: []
-applies_to: []
+amended_by: ["ADR-119"]
+applies_to: ["runner/cmd/fishhawk-runner/fixupresume.go", "runner/internal/agent/claudecode/**"]
 ---
 
 # ADR-042: Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity
@@ -41,7 +43,7 @@ Lean **D, with B as the incremental path**, and treat A as explicitly out-of-sco
 
 ## Decision
 
-_TBD — operator. (Agent proposes, human disposes.)_
+**Accepted (2026-06-21).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Decision (recorded — operator went with the recommendation)… **Option D, with B… True cross-stage session resume (Option A/C) is DECLINED**". Note: fix-up session resume later shipped in #4583 (E83.56) without an ADR; a follow-up ADR (ADR-119) addresses this.
 
 ## Consequences
 
@@ -51,3 +53,5 @@ _TBD — operator. (Agent proposes, human disposes.)_
 ## Notes
 
 Drafted to unblock #1166 (its three open design questions — trace provenance, session persistence, token/key scope — are answered above with current-code grounding). Companion to #1152 (the lever this is lever-4 of) and #1164 (the cost-motivation overlap, landed this session). Evidence run 12531de4 (#1164, the most recent fix-up loop showing the current cold-start path).
+
+**Amended by ADR-119** (#4708, ratified by the Captain 2026-10-23): fix-up session resume is permitted on the local runner only under ADR-119's rules, and is off by default. Per ADR-119 D7 this decision applies to `runner/cmd/fishhawk-runner/fixupresume.go` and `runner/internal/agent/claudecode/**`.

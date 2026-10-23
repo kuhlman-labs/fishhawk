@@ -1,7 +1,8 @@
 ---
 id: ADR-034
 title: "Kubernetes deployment model — relationship to ECS, deps, secrets, worker model"
-status: unknown
+status: accepted
+date: 2026-06-07
 issue: https://github.com/kuhlman-labs/fishhawk/issues/845
 supersedes: []
 superseded_by: []
@@ -37,7 +38,7 @@ Sub-decisions to record here: in-cluster-vs-external deps policy; secrets strate
 Defer between (a)/(b)/(c) until the local chart + prod-foundation children land and alpha settles; build the chart so any of the three remains reachable. Lean (a) as the least-regret default.
 
 ## Decision
-_TBD._
+**Accepted (2026-06-07).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Resolved. Deployment-model decision recorded (operator, 2026-06-07): Helm chart with values-per-env…". The question it deferred was settled by ADR-073.
 
 ## Consequences
 - The child issues build a prod-capable chart regardless of this decision; only the *adoption as hosted prod* is gated here.

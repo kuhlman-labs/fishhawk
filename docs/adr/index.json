@@ -98,7 +98,7 @@
       "id": "ADR-010",
       "title": "Marketplace billing path (GitHub vs. direct)",
       "path": "docs/adr/010-marketplace-billing-path-github-vs-direct.md",
-      "status": "unknown",
+      "status": "proposed",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -107,7 +107,7 @@
       "id": "ADR-011",
       "title": "Pricing model (per-engineer vs. per-run)",
       "path": "docs/adr/011-pricing-model-per-engineer-vs-per-run.md",
-      "status": "unknown",
+      "status": "proposed",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -116,7 +116,7 @@
       "id": "ADR-012",
       "title": "Design partner sourcing strategy",
       "path": "docs/adr/012-design-partner-sourcing-strategy.md",
-      "status": "unknown",
+      "status": "proposed",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -225,7 +225,7 @@
       "id": "ADR-022",
       "title": "Pluggable runner backends + runner_kind audit dimension",
       "path": "docs/adr/022-pluggable-runner-backends-runner-kind-audit.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
@@ -270,7 +270,7 @@
       "id": "ADR-026",
       "title": "Backward-compatibility discipline for schema-extension PRs",
       "path": "docs/adr/026-backward-compatibility-for-schema-extension-prs.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -288,7 +288,7 @@
       "id": "ADR-028",
       "title": "Agent filesystem confinement requires an OS-level sandbox",
       "path": "docs/adr/028-agent-filesystem-confinement-os-level-sandbox.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -315,7 +315,7 @@
       "id": "ADR-031",
       "title": "Review gate succeeds only on verified landing (platform-neutral, delivery-agnostic)",
       "path": "docs/adr/031-review-gate-succeeds-only-on-verified-landing.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [
         "ADR-018"
       ],
@@ -326,9 +326,12 @@
       "id": "ADR-032",
       "title": "Decomposition delivery model: one consolidated PR per decomposition",
       "path": "docs/adr/032-decomposition-one-consolidated-pr.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-041"
+      ],
       "applies_to": []
     },
     {
@@ -346,7 +349,7 @@
       "id": "ADR-034",
       "title": "Kubernetes deployment model — relationship to ECS, deps, secrets, worker model",
       "path": "docs/adr/034-kubernetes-deployment-model.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -355,7 +358,7 @@
       "id": "ADR-035",
       "title": "Own and enforce the git contract of a run (declared base + sole-writer branch lineage)",
       "path": "docs/adr/035-run-git-contract-declared-base-sole-writer.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -364,7 +367,7 @@
       "id": "ADR-036",
       "title": "Gate plan approval on agent-review completion (block-on-completion, unblock-on-terminal)",
       "path": "docs/adr/036-gate-plan-approval-on-agent-review-completion.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -373,7 +376,7 @@
       "id": "ADR-037",
       "title": "Agent-facing waits follow the MCP Tasks / long-running-operation contract (durable handle + authoritative poll)",
       "path": "docs/adr/037-agent-facing-waits-follow-mcp-tasks-contract.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -391,7 +394,7 @@
       "id": "ADR-039",
       "title": "Agentic deploy execution (skills perform the rollout)",
       "path": "docs/adr/039-agentic-deploy-execution.md",
-      "status": "unknown",
+      "status": "proposed",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -419,6 +422,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amends": [
+        "ADR-032"
+      ],
       "amended_by": [
         "ADR-116"
       ],
@@ -428,10 +434,16 @@
       "id": "ADR-042",
       "title": "Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity",
       "path": "docs/adr/042-fixup-session-continuity.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
-      "applies_to": []
+      "amended_by": [
+        "ADR-119"
+      ],
+      "applies_to": [
+        "runner/cmd/fishhawk-runner/fixupresume.go",
+        "runner/internal/agent/claudecode/**"
+      ]
     },
     {
       "id": "ADR-043",
@@ -448,7 +460,7 @@
       "id": "ADR-044",
       "title": "model cost observability — warn-not-fail price drift-check, 3-bucket fresh/read/write cache cost model with separate capture, split cost-accuracy from efficiency-metric, daily cadence",
       "path": "docs/adr/044-model-cost-observability.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -457,7 +469,7 @@
       "id": "ADR-045",
       "title": "runner-backend identification — derive runner_kind from the execution channel (host-dispatch ⇒ local, runner self-report, mismatch guardrail), not an operator declaration",
       "path": "docs/adr/045-runner-backend-identification.md",
-      "status": "unknown",
+      "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
@@ -576,8 +588,10 @@
       "id": "ADR-057",
       "title": "Multi-tenancy model and tenant isolation for hosted deployment",
       "path": "docs/adr/057-multi-tenancy-model-tenant-isolation.md",
-      "status": "unknown",
-      "supersedes": [],
+      "status": "accepted",
+      "supersedes": [
+        "ADR-061"
+      ],
       "superseded_by": [],
       "amended_by": [
         "ADR-105"
@@ -619,11 +633,13 @@
       "id": "ADR-061",
       "title": "Multi-tenancy foundation: workspace-scoped tenancy with Postgres RLS isolation",
       "path": "docs/adr/061-multi-tenancy-foundation-workspace-rls.md",
-      "status": "unknown",
+      "status": "superseded",
       "supersedes": [
         "ADR-058"
       ],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-057"
+      ],
       "amended_by": [
         "ADR-105"
       ],
@@ -824,7 +840,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-118"
+        "ADR-118",
+        "ADR-120"
       ],
       "applies_to": []
     },
@@ -1171,6 +1188,9 @@
       "amends": [
         "ADR-055"
       ],
+      "amended_by": [
+        "ADR-120"
+      ],
       "applies_to": []
     },
     {
@@ -1241,6 +1261,40 @@
       "applies_to": [
         "backend/internal/agenteval/**",
         "scripts/check-review-prompt-eval"
+      ]
+    },
+    {
+      "id": "ADR-119",
+      "title": "Fix-up session resume is opt-in and local-only, bound to the reported head and a signed anchor",
+      "path": "docs/adr/119-fixup-session-resume-opt-in.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-042"
+      ],
+      "applies_to": [
+        "runner/cmd/fishhawk-runner/fixupresume.go",
+        "runner/internal/agent/claudecode/**"
+      ]
+    },
+    {
+      "id": "ADR-120",
+      "title": "The decision record scales: lean index lines, a topic map beside the record, a partitioned index",
+      "path": "docs/adr/120-decision-record-scaling.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-084",
+        "ADR-113"
+      ],
+      "applies_to": [
+        "backend/internal/decisionrecord/**",
+        "scripts/check-adr",
+        "docs/adr/index.json",
+        "docs/adr/README.md",
+        "docs/adr/topics.json"
       ]
     }
   ]

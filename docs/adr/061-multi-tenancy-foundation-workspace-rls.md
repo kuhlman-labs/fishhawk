@@ -1,10 +1,10 @@
 ---
 id: ADR-061
 title: "Multi-tenancy foundation: workspace-scoped tenancy with Postgres RLS isolation"
-status: unknown
+status: superseded
 issue: https://github.com/kuhlman-labs/fishhawk/issues/2069
 supersedes: ["ADR-058"]
-superseded_by: []
+superseded_by: ["ADR-057"]
 amended_by: ["ADR-105"]
 applies_to: []
 ---
@@ -70,6 +70,8 @@ Billing/metering; self-serve signup UX; a cross-tenant admin console; DB-per-ten
 
 ## Decision
 _(Founder ratifies: the two settled decisions above are accepted; this section confirms the proposed design + P1–P5 phasing, or amends it. On acceptance this ADR decomposes into a `[E<n>] Multi-tenancy` epic with P1–P5 as depends_on-chained children, driven as a campaign.)_
+
+**Superseded by ADR-057** (confirmed by the Captain 2026-10-23): this proposal was folded into ADR-057 as its Amendment A1 (issue closed as "Duplicate of #1823 (ADR-057)… folded into #1823 as an amendment"). Its content governs through ADR-057.
 
 ## Relations
 Supersedes ADR-058's tenant definition. Related: #1756, ADR-057, E39 (#1705).
