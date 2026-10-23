@@ -233,3 +233,5 @@ Recorded instance: #4293, run e16e6c42. The operator pushed a merge of `main` (h
 - The 250-commit compare cap fails closed, so a very long branch pays a pass it might not need.
 
 **Implementation.** #4368.
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-092 (Q4; pass admission group), ADR-093 (D8 for queue-dispatched merges) and ADR-096 (D2 for independent deltas; D5 fan-in base). D1, D3, D4, D6, D7 and the rest of D2/D5 still govern.

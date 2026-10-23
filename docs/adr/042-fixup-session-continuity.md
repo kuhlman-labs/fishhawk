@@ -1,7 +1,8 @@
 ---
 id: ADR-042
 title: "Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity"
-status: unknown
+status: accepted
+date: 2026-06-21
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1264
 supersedes: []
 superseded_by: []
@@ -41,7 +42,7 @@ Lean **D, with B as the incremental path**, and treat A as explicitly out-of-sco
 
 ## Decision
 
-_TBD — operator. (Agent proposes, human disposes.)_
+**Accepted (2026-06-21).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Decision (recorded — operator went with the recommendation)… **Option D, with B… True cross-stage session resume (Option A/C) is DECLINED**". Note: fix-up session resume later shipped in #4583 (E83.56) without an ADR; a follow-up ADR (ADR-119) addresses this.
 
 ## Consequences
 

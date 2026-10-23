@@ -1,7 +1,7 @@
 ---
 id: ADR-012
 title: "Design partner sourcing strategy"
-status: unknown
+status: proposed
 issue: https://github.com/kuhlman-labs/fishhawk/issues/76
 supersedes: []
 superseded_by: []
@@ -28,6 +28,8 @@ Mix, starting with personal network. Track conversion rate; pivot if no warm par
 ## Decision
 
 _To be recorded._
+
+Status confirmed by the Captain 2026-10-23 as **proposed**: open and deferred ("**Deferral confirmed (2026-07-28): revisit when beta is close.**").
 
 ## Consequences
 

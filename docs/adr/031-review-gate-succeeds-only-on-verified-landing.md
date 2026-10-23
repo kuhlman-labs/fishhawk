@@ -1,7 +1,8 @@
 ---
 id: ADR-031
 title: "Review gate succeeds only on verified landing (platform-neutral, delivery-agnostic)"
-status: unknown
+status: accepted
+date: 2026-06-03
 issue: https://github.com/kuhlman-labs/fishhawk/issues/710
 supersedes: ["ADR-018"]
 superseded_by: []
@@ -43,3 +44,7 @@ A rejected draft added a standalone operator-side "resolve review" endpoint — 
 ADR-018 (amended), #702 (Phase 1), Phase-2 ticket (filed separately), #574, #698 (`/redrive` operator-only precedent), ADR-027 (#545).
 
 Parent epic: #389
+
+## Decision
+
+**Accepted (2026-06-03).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-03).**".

@@ -1,7 +1,7 @@
 ---
 id: ADR-010
 title: "Marketplace billing path (GitHub vs. direct)"
-status: unknown
+status: proposed
 issue: https://github.com/kuhlman-labs/fishhawk/issues/74
 supersedes: []
 superseded_by: []
@@ -27,6 +27,8 @@ Through GitHub for early-stage convenience, per MVP_SPEC §10 #8. Revisit for en
 ## Decision
 
 _To be recorded._
+
+Status confirmed by the Captain 2026-10-23 as **proposed**: open and deferred ("No decision expected until the design-partner phase produces signal").
 
 ## Consequences
 

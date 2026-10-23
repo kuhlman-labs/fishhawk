@@ -97,3 +97,5 @@ All impl issues landed:
 - #319 / #316 (follow-up) — closed-without-merging cancels the review stage + writes `pr_closed_without_merge`
 
 Audit-log categories introduced: `pr_merged`, `pr_approved_on_github`, `pr_review_submitted`, `pr_closed_without_merge`. Reopen handling stays out of scope; the v0 escape hatch is re-trigger via `/fishhawk run`.
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-031 (review-resolution mechanism: verified landing, by webhook or poll, with GitHub merge as the `github_merge` provider). Option B still governs: the PR merge is the review approval, and `/approvals` refuses review stages (409).

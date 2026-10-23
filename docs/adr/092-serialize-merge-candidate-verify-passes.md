@@ -94,3 +94,5 @@ The ADR-089 D6 first-officer design had already planned a `local-verify:<host>` 
   - A full merge queue (Option D) is deferred.
   - #4199's read-after-write false warning is tracked separately.
 - **Implementation.** #4200 (re-scoped to this ADR) and a follow-up for the held-pass queue. #4191's promote verb can act on the held queue (Q4).
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-093 (D4: the merge-to-pass hand-off becomes merge-on-pass). D1–D3 and D5–D6 still govern; amended by ADR-115.

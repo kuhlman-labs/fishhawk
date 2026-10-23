@@ -62,3 +62,5 @@ Resolved sub-questions:
 #655 (MCP gateway + per-agent identity + scoped creds — the hosted/multi-tenant anchor), the mcp-release signed-binary distribution (E19.7/#347), ADR-021 (read-only MCP surface origins), ADR-031 (#710). Surfaced 2026-06-07 connecting a Codex agent to the local MCP.
 
 Parent epic: #389
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-076 (the past-loopback gate; it now requires OAuth with audience-bound tokens). The stdio default, transport-agnostic tool registration and loopback hard-enforcement for bare-bearer HTTP still govern.

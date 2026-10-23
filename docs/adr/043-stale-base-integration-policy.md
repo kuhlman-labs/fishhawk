@@ -76,3 +76,5 @@ merge-vs-rebase is moot: there is no agent commit history to preserve; the runne
 - New surface: a backend per-repo merge serializer + a merge-time re-integrate-and-re-verify step; the 3-dot comparison is a smaller, independently-shippable first slice.
 - Re-review fires only when the re-integration changes the effective tree (conflict/build-break), reusing the #989/#1218/#1250 substrate; the common clean case transfers the verdict.
 - Implementation: **#1294 repurposed** to the Fishhawk-native merge gate (+ 3-dot comparison); **#1295 (GitHub merge queue) closed as non-viable** under the provider-agnostic constraint. Cross-references ADR-031 (forward-gating), ADR-035 (sole-writer), #861 (FreshFetchBase), #989/#1218/#1250 (re-invoke/re-review).
+
+**Partially superseded (clarified by the Captain 2026-10-23):** Partially superseded by ADR-090 (Rev 2 item 3, the post-push staleness residual, for Fishhawk-dispatched merges). Rev 2 items 1–2 (three-dot comparison, push-time fresh-base reapply) still govern; Rev 2's 'merge ownership… OUT' is overtaken by ADR-093.

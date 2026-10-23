@@ -1,7 +1,8 @@
 ---
 id: ADR-045
 title: "runner-backend identification — derive runner_kind from the execution channel (host-dispatch ⇒ local, runner self-report, mismatch guardrail), not an operator declaration"
-status: unknown
+status: accepted
+date: 2026-06-24
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1347
 supersedes: []
 superseded_by: []
@@ -52,3 +53,7 @@ Option 4, with the host-dispatch ⇒ `local` rung as the surgical, highest-lever
 Decision realized and **validated live**. #1346 (merged + deployed) implemented the runner self-report (decision 2 — runner detects `GITHUB_ACTIONS`/`GITHUB_RUN_ID`/`CI` with `CI`-alone NOT treated as github_actions, stamps `runner_kind` into the signed bundle manifest), first-dispatch locking (decision 4 — `runner_kind_resolved` set on the first signed manifest, before the plan-approval dispatch gate), and the mismatch guardrail as a **post-execution `runner_kind_mismatch` audit** (decision 3, warn variant). Validation: a run started with no `runner_kind` auto-resolved `github_actions`→`local` (`runner_kind_resolved` audit `{from:github_actions, to:local}`) before plan-approval, eliminating the #1344 wedge class — the operator no longer declares the backend.
 
 **As-shipped deviation from the recommendation:** the recommendation led with decision 1 (host-endpoint sets `local`, surgical). #1346 chose the more-attestable runner-self-report-via-signed-manifest path instead, which achieves the same outcome (host runs self-resolve to `local`) while keeping the claim tamper-evident (migration-0024 chain unaffected; verifier doesn't read `runner_kind`). Consequently the **PRE-dispatch** form of decisions 1 & 3 (block/correct before execution, vs the post-execution audit shipped) is deferred to **#1355** as optional defense-in-depth — auto-detection already makes mismatches rare. ADR closed; the residual surface is tracked on #1355.
+
+## Decision
+
+**Accepted (2026-06-24).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "Decision realized and **validated live**. #1346 (merged + deployed)…".

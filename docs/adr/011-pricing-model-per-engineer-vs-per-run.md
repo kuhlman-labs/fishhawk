@@ -1,7 +1,7 @@
 ---
 id: ADR-011
 title: "Pricing model (per-engineer vs. per-run)"
-status: unknown
+status: proposed
 issue: https://github.com/kuhlman-labs/fishhawk/issues/75
 supersedes: []
 superseded_by: []
@@ -27,6 +27,8 @@ Per-engineer for v0 paid tier. Most buyer-friendly, easiest to communicate.
 ## Decision
 
 _To be recorded._
+
+Status confirmed by the Captain 2026-10-23 as **proposed**: open and deferred ("This ADR remains parked for *market* signal").
 
 ## Consequences
 

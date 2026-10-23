@@ -174,7 +174,8 @@ which refuses (exit 1, writes nothing) while any record check fails.
   review-gate-resolution *mechanism*, so ADR-018 carries
   `superseded_by: ["ADR-031"]` (front matter only; its body is untouched).
   ADR-018 stays `accepted` — ADR-031 states it "keeps its invariant" — and
-  ADR-031 itself is `unknown` (see below). ADR-040 is transcribed from the
+  ADR-031 itself was recorded `unknown` (`accepted` since the Captain's
+  2026-10-23 status rulings). ADR-040 is transcribed from the
   decision record #997, not from the five implementation issues that also
   carry an `[ADR-040]` title.
 - **Batch 3 (E78.3 / #3724):** ADR-056 – ADR-080, the last batch. Landed with
@@ -184,8 +185,9 @@ which refuses (exit 1, writes nothing) while any record check fails.
     tenant definition."), so ADR-058 carries `superseded_by: ["ADR-061"]`.
     ADR-058's record is titled for GitLab second-forge support but carries the
     "tenant = forge account" definition that ADR-061 supersedes. ADR-058 stays
-    `accepted` (only its tenant definition is replaced) and ADR-061 itself is
-    `unknown` (see below).
+    `accepted` (only its tenant definition is replaced) and ADR-061 itself was
+    recorded `unknown` (`superseded` by ADR-057 since the Captain's 2026-10-23
+    status rulings).
   - ADR-076 supersedes ADR-033's loopback gate ("This **supersedes ADR-033's
     gate**"), so ADR-033 carries `superseded_by: ["ADR-076"]`. ADR-033 stays
     `accepted`: ADR-076 states "ADR-033's other decisions (stdio default;
@@ -297,12 +299,15 @@ Amendments recorded under the upkeep rule since:
   [ADR-103]`. ADR-050 keeps its `accepted` status.
 - ADR-104: `amends: [ADR-022, ADR-024]` ("**Amends:** ADR-024 (Q4, Q5) and
   the ADR-022 addendum (a third identity: host dispatcher)"); ADR-022 and
-  ADR-024 each carry `amended_by: [ADR-104]`. ADR-022 keeps its `unknown`
-  status: an amendment does not change the amended record's status.
+  ADR-024 each carry `amended_by: [ADR-104]`. ADR-022 kept its status (then
+  `unknown`): an amendment does not change the amended record's status.
+  ADR-022 is `accepted` since the Captain's 2026-10-23 status rulings.
 - ADR-105: `amends: [ADR-057, ADR-061]` ("Amends ADR-057 (the repo-ACL key)
   and ADR-061 (workspace ↔ installation, the two-sided adopt)"); ADR-057 and
-  ADR-061 each carry `amended_by: [ADR-105]` and keep their `unknown` status;
-  ADR-061 keeps `supersedes: [ADR-058]`. ADR-105 states no supersession.
+  ADR-061 each carry `amended_by: [ADR-105]` and kept their status (then
+  `unknown`); ADR-061 keeps `supersedes: [ADR-058]`. ADR-105 states no
+  supersession. Since the 2026-10-23 rulings ADR-057 is `accepted` and
+  ADR-061 is `superseded` by ADR-057; ADR-105 keeps `amends: [ADR-061]`.
 - ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
   it"); ADR-025 `amended_by: [ADR-107]`.
 - ADR-109: `amends: [ADR-093]` ("It amends ADR-093"; "ADR-093 D1 says an
@@ -318,6 +323,17 @@ Amendments recorded under the upkeep rule since:
 - ADR-117: no edge (`amends: []` in its Record metadata).
 - ADR-118: `amends: [ADR-068, ADR-084, ADR-117]` ("It amends ADR-068 Decision 3, ADR-084 … and ADR-117 D4"); each gains `amended_by: [ADR-118]`. Its `applies_to` names `backend/internal/agenteval/**` and `scripts/check-review-prompt-eval`, as its Record metadata states.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
+- ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
+  (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
+  not a supersession (now stated in #1140's body: "**Amends ADR-032**").
+  ADR-032 carries `amended_by: [ADR-041]` and is `accepted`.
+- Not an amendment: ADR-057 → ADR-061 is a SUPERSESSION. The Captain
+  confirmed on 2026-10-23 that ADR-061 (#2069, closed as a duplicate) was
+  folded into ADR-057 as its Amendment A1, and both tracker bodies now state
+  it (#1823: "Amendment A1 supersedes ADR-061 (#2069)"). So ADR-057
+  `supersedes: [ADR-061]` and ADR-061 is `superseded` (`superseded_by:
+  [ADR-057]`). ADR-061 keeps `supersedes: [ADR-058]` and `amended_by:
+  [ADR-105]`.
 
 Decision-record selection (`backend/internal/decisionrecord`) follows
 `amended_by` from a selected record to its amendments and ranks a
@@ -344,6 +360,8 @@ ones included) of that record, which takes precedence under the rule above:
   by D1–D2 here". The borderline case: the source labels the relation
   "Supersession" and states a replacement.
 - ADR-099 → ADR-080: "This partially supersedes ADR-080's vocabulary table".
+- ADR-057 → ADR-061: "Amendment A1 supersedes ADR-061 (#2069)" (added to
+  #1823 with the Captain's 2026-10-23 rulings).
 
 The audit scanned every record body for `amend*` and `supersed*`. Every
 record whose `amend*` wording sits in a sentence naming another ADR id, and
@@ -382,9 +400,9 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-007](007-trace-bundle-wire-format.md) | Trace bundle wire format | `accepted` | [#71](https://github.com/kuhlman-labs/fishhawk/issues/71) |
 | [ADR-008](008-signing-scheme-ed25519.md) | Signing scheme (Ed25519, canonicalization, issuance protocol) | `accepted` | [#72](https://github.com/kuhlman-labs/fishhawk/issues/72) |
 | [ADR-009](009-hosted-deployment-target.md) | Hosted deployment target | `accepted` | [#73](https://github.com/kuhlman-labs/fishhawk/issues/73) |
-| [ADR-010](010-marketplace-billing-path-github-vs-direct.md) | Marketplace billing path (GitHub vs. direct) | `unknown` | [#74](https://github.com/kuhlman-labs/fishhawk/issues/74) |
-| [ADR-011](011-pricing-model-per-engineer-vs-per-run.md) | Pricing model (per-engineer vs. per-run) | `unknown` | [#75](https://github.com/kuhlman-labs/fishhawk/issues/75) |
-| [ADR-012](012-design-partner-sourcing-strategy.md) | Design partner sourcing strategy | `unknown` | [#76](https://github.com/kuhlman-labs/fishhawk/issues/76) |
+| [ADR-010](010-marketplace-billing-path-github-vs-direct.md) | Marketplace billing path (GitHub vs. direct) | `proposed` | [#74](https://github.com/kuhlman-labs/fishhawk/issues/74) |
+| [ADR-011](011-pricing-model-per-engineer-vs-per-run.md) | Pricing model (per-engineer vs. per-run) | `proposed` | [#75](https://github.com/kuhlman-labs/fishhawk/issues/75) |
+| [ADR-012](012-design-partner-sourcing-strategy.md) | Design partner sourcing strategy | `proposed` | [#76](https://github.com/kuhlman-labs/fishhawk/issues/76) |
 | [ADR-013](013-apache-bsl-enterprise-boundary.md) | Apache 2.0 / BSL boundary for enterprise modules | `accepted` | [#77](https://github.com/kuhlman-labs/fishhawk/issues/77) |
 | [ADR-014](014-linter-formatter-ci-config-for-go-and-ts.md) | Linter/formatter/CI config for Go and TS | `accepted` | [#78](https://github.com/kuhlman-labs/fishhawk/issues/78) |
 | [ADR-015](015-slack-notification-approach.md) | Slack notification approach (v0.x scope) | `accepted` | [#79](https://github.com/kuhlman-labs/fishhawk/issues/79) |
@@ -394,30 +412,30 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-019](019-fishhawk-as-coordination-layer-not-destination.md) | Fishhawk as coordination layer, not destination | `accepted` | [#320](https://github.com/kuhlman-labs/fishhawk/issues/320) |
 | [ADR-020](020-plan-review-surface-on-originating-issue.md) | Plan review surface: post the plan on the originating issue | `accepted` | [#321](https://github.com/kuhlman-labs/fishhawk/issues/321) |
 | [ADR-021](021-claude-code-integration-mcp-server.md) | Claude Code integration: ship a Fishhawk MCP server | `accepted` | [#322](https://github.com/kuhlman-labs/fishhawk/issues/322) |
-| [ADR-022](022-pluggable-runner-backends-runner-kind-audit.md) | Pluggable runner backends + runner_kind audit dimension | `unknown` | [#388](https://github.com/kuhlman-labs/fishhawk/issues/388) |
+| [ADR-022](022-pluggable-runner-backends-runner-kind-audit.md) | Pluggable runner backends + runner_kind audit dimension | `accepted` | [#388](https://github.com/kuhlman-labs/fishhawk/issues/388) |
 | [ADR-023](023-agent-self-retry-on-transient-stage-failure.md) | Agent self-retry on transient stage failure | `accepted` | [#401](https://github.com/kuhlman-labs/fishhawk/issues/401) |
 | [ADR-024](024-mcp-server-spawning-runner-subprocesses.md) | MCP server spawning runner subprocesses | `accepted` | [#433](https://github.com/kuhlman-labs/fishhawk/issues/433) |
 | [ADR-025](025-scope-policy-timeouts-runtime-decomposition.md) | Scope-policy: workflow-spec timeouts, predicted runtime, and plan-driven decomposition | `accepted` | [#451](https://github.com/kuhlman-labs/fishhawk/issues/451) |
-| [ADR-026](026-backward-compatibility-for-schema-extension-prs.md) | Backward-compatibility discipline for schema-extension PRs | `unknown` | [#472](https://github.com/kuhlman-labs/fishhawk/issues/472) |
+| [ADR-026](026-backward-compatibility-for-schema-extension-prs.md) | Backward-compatibility discipline for schema-extension PRs | `accepted` | [#472](https://github.com/kuhlman-labs/fishhawk/issues/472) |
 | [ADR-027](027-review-agent-stage-primitive.md) | Review-agent stage primitive: per-stage agent + human reviewer counts | `accepted` | [#545](https://github.com/kuhlman-labs/fishhawk/issues/545) |
-| [ADR-028](028-agent-filesystem-confinement-os-level-sandbox.md) | Agent filesystem confinement requires an OS-level sandbox | `unknown` | [#642](https://github.com/kuhlman-labs/fishhawk/issues/642) |
+| [ADR-028](028-agent-filesystem-confinement-os-level-sandbox.md) | Agent filesystem confinement requires an OS-level sandbox | `accepted` | [#642](https://github.com/kuhlman-labs/fishhawk/issues/642) |
 | [ADR-029](029-rule-of-two-audit-network-egress-allow-listing.md) | Rule-of-Two / lethal-trifecta audit + network egress allow-listing | `accepted` | [#650](https://github.com/kuhlman-labs/fishhawk/issues/650) |
 | [ADR-030](030-periodic-cost-budgets-in-workflow-spec.md) | Periodic cost budgets in the workflow spec (advisory + admission-time blocking) | `accepted` | [#687](https://github.com/kuhlman-labs/fishhawk/issues/687) |
-| [ADR-031](031-review-gate-succeeds-only-on-verified-landing.md) | Review gate succeeds only on verified landing (platform-neutral, delivery-agnostic) | `unknown` | [#710](https://github.com/kuhlman-labs/fishhawk/issues/710) |
-| [ADR-032](032-decomposition-one-consolidated-pr.md) | Decomposition delivery model: one consolidated PR per decomposition | `unknown` | [#719](https://github.com/kuhlman-labs/fishhawk/issues/719) |
+| [ADR-031](031-review-gate-succeeds-only-on-verified-landing.md) | Review gate succeeds only on verified landing (platform-neutral, delivery-agnostic) | `accepted` | [#710](https://github.com/kuhlman-labs/fishhawk/issues/710) |
+| [ADR-032](032-decomposition-one-consolidated-pr.md) | Decomposition delivery model: one consolidated PR per decomposition | `accepted` | [#719](https://github.com/kuhlman-labs/fishhawk/issues/719) |
 | [ADR-033](033-mcp-transport-stdio-vs-streamable-http.md) | MCP transport: stdio-only vs. add streamable-HTTP (relationship to the #655 gateway) | `accepted` | [#843](https://github.com/kuhlman-labs/fishhawk/issues/843) |
-| [ADR-034](034-kubernetes-deployment-model.md) | Kubernetes deployment model — relationship to ECS, deps, secrets, worker model | `unknown` | [#845](https://github.com/kuhlman-labs/fishhawk/issues/845) |
-| [ADR-035](035-run-git-contract-declared-base-sole-writer.md) | Own and enforce the git contract of a run (declared base + sole-writer branch lineage) | `unknown` | [#857](https://github.com/kuhlman-labs/fishhawk/issues/857) |
-| [ADR-036](036-gate-plan-approval-on-agent-review-completion.md) | Gate plan approval on agent-review completion (block-on-completion, unblock-on-terminal) | `unknown` | [#874](https://github.com/kuhlman-labs/fishhawk/issues/874) |
-| [ADR-037](037-agent-facing-waits-follow-mcp-tasks-contract.md) | Agent-facing waits follow the MCP Tasks / long-running-operation contract (durable handle + authoritative poll) | `unknown` | [#879](https://github.com/kuhlman-labs/fishhawk/issues/879) |
+| [ADR-034](034-kubernetes-deployment-model.md) | Kubernetes deployment model — relationship to ECS, deps, secrets, worker model | `accepted` | [#845](https://github.com/kuhlman-labs/fishhawk/issues/845) |
+| [ADR-035](035-run-git-contract-declared-base-sole-writer.md) | Own and enforce the git contract of a run (declared base + sole-writer branch lineage) | `accepted` | [#857](https://github.com/kuhlman-labs/fishhawk/issues/857) |
+| [ADR-036](036-gate-plan-approval-on-agent-review-completion.md) | Gate plan approval on agent-review completion (block-on-completion, unblock-on-terminal) | `accepted` | [#874](https://github.com/kuhlman-labs/fishhawk/issues/874) |
+| [ADR-037](037-agent-facing-waits-follow-mcp-tasks-contract.md) | Agent-facing waits follow the MCP Tasks / long-running-operation contract (durable handle + authoritative poll) | `accepted` | [#879](https://github.com/kuhlman-labs/fishhawk/issues/879) |
 | [ADR-038](038-deploy-stage-type-post-merge-release-governance.md) | Add a deploy stage type for post-merge release governance | `accepted` | [#925](https://github.com/kuhlman-labs/fishhawk/issues/925) |
-| [ADR-039](039-agentic-deploy-execution.md) | Agentic deploy execution (skills perform the rollout) | `unknown` | [#937](https://github.com/kuhlman-labs/fishhawk/issues/937) |
+| [ADR-039](039-agentic-deploy-execution.md) | Agentic deploy execution (skills perform the rollout) | `proposed` | [#937](https://github.com/kuhlman-labs/fishhawk/issues/937) |
 | [ADR-040](040-operator-agent-role-contract.md) | Operator agent as a product-defined role contract: versioned playbook, gate-delegation knobs, thin-by-design | `accepted` | [#997](https://github.com/kuhlman-labs/fishhawk/issues/997) |
 | [ADR-041](041-per-child-branch-isolation-fan-in-integration.md) | Per-child branch isolation + fan-in integration for parallel decomposition | `accepted` | [#1140](https://github.com/kuhlman-labs/fishhawk/issues/1140) |
-| [ADR-042](042-fixup-session-continuity.md) | Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity | `unknown` | [#1264](https://github.com/kuhlman-labs/fishhawk/issues/1264) |
+| [ADR-042](042-fixup-session-continuity.md) | Fix-up session continuity: resume the prior implement agent session vs. prompt-level continuity | `accepted` | [#1264](https://github.com/kuhlman-labs/fishhawk/issues/1264) |
 | [ADR-043](043-stale-base-integration-policy.md) | Stale-base integration policy for concurrent agent branches (runner merges base before PR; clean verdict-transfer vs conflict re-invoke+re-review; merge not rebase) | `accepted` | [#1293](https://github.com/kuhlman-labs/fishhawk/issues/1293) |
-| [ADR-044](044-model-cost-observability.md) | model cost observability — warn-not-fail price drift-check, 3-bucket fresh/read/write cache cost model with separate capture, split cost-accuracy from efficiency-metric, daily cadence | `unknown` | [#1336](https://github.com/kuhlman-labs/fishhawk/issues/1336) |
-| [ADR-045](045-runner-backend-identification.md) | runner-backend identification — derive runner_kind from the execution channel (host-dispatch ⇒ local, runner self-report, mismatch guardrail), not an operator declaration | `unknown` | [#1347](https://github.com/kuhlman-labs/fishhawk/issues/1347) |
+| [ADR-044](044-model-cost-observability.md) | model cost observability — warn-not-fail price drift-check, 3-bucket fresh/read/write cache cost model with separate capture, split cost-accuracy from efficiency-metric, daily cadence | `accepted` | [#1336](https://github.com/kuhlman-labs/fishhawk/issues/1336) |
+| [ADR-045](045-runner-backend-identification.md) | runner-backend identification — derive runner_kind from the execution channel (host-dispatch ⇒ local, runner self-report, mismatch guardrail), not an operator declaration | `accepted` | [#1347](https://github.com/kuhlman-labs/fishhawk/issues/1347) |
 | [ADR-046](046-workflow-schema-major-version-coexistence.md) | Workflow schema major-version coexistence model — how workflow-v1 (deploy stage) coexists with and routes against workflow-v0 | `accepted` | [#1380](https://github.com/kuhlman-labs/fishhawk/issues/1380) |
 | [ADR-047](047-campaign-primitive.md) | Campaign primitive — dependency-ordered multi-run sprint driving, generalizing the decomposition fan-out engine to the epic/issue level | `accepted` | [#1437](https://github.com/kuhlman-labs/fishhawk/issues/1437) |
 | [ADR-048](048-repository-onboarding-init-doctor.md) | Repository onboarding — `fishhawk init` + `doctor` (CLI engine), MCP/skill wrapper, and App-PR scaffolding, preset-driven from typed specs | `accepted` | [#1499](https://github.com/kuhlman-labs/fishhawk/issues/1499) |
@@ -429,11 +447,11 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-054](054-compliance-export-surface-posture.md) | Compliance export surface posture (auth scope, redaction, filtering semantics) | `accepted` | [#1582](https://github.com/kuhlman-labs/fishhawk/issues/1582) |
 | [ADR-055](055-approval-identity-quorum-eligibility-forge-verified.md) | Approval identity: quorum + eligibility predicates + forge-verified identity (GitHub/GitLab-agnostic) | `accepted` | [#1698](https://github.com/kuhlman-labs/fishhawk/issues/1698) |
 | [ADR-056](056-external-anchoring-of-the-audit-head.md) | External anchoring of the audit head: tamper-evidence beyond the exported chain | `accepted` | [#1699](https://github.com/kuhlman-labs/fishhawk/issues/1699) |
-| [ADR-057](057-multi-tenancy-model-tenant-isolation.md) | Multi-tenancy model and tenant isolation for hosted deployment | `unknown` | [#1823](https://github.com/kuhlman-labs/fishhawk/issues/1823) |
+| [ADR-057](057-multi-tenancy-model-tenant-isolation.md) | Multi-tenancy model and tenant isolation for hosted deployment | `accepted` | [#1823](https://github.com/kuhlman-labs/fishhawk/issues/1823) |
 | [ADR-058](058-second-forge-support-gitlab.md) | Second-forge support: GitLab repositories, work items, and GitLab CI | `accepted` | [#1851](https://github.com/kuhlman-labs/fishhawk/issues/1851) |
 | [ADR-059](059-evidence-gated-correctness-lens-implement-review.md) | Evidence-gated correctness lens in implement-review | `accepted` | [#1883](https://github.com/kuhlman-labs/fishhawk/issues/1883) |
 | [ADR-060](060-mcp-session-survival-shim.md) | MCP session-survival shim: stdio supervisor as gateway phase 0 | `accepted` | [#1920](https://github.com/kuhlman-labs/fishhawk/issues/1920) |
-| [ADR-061](061-multi-tenancy-foundation-workspace-rls.md) | Multi-tenancy foundation: workspace-scoped tenancy with Postgres RLS isolation | `unknown` | [#2069](https://github.com/kuhlman-labs/fishhawk/issues/2069) |
+| [ADR-061](061-multi-tenancy-foundation-workspace-rls.md) | Multi-tenancy foundation: workspace-scoped tenancy with Postgres RLS isolation | `superseded` | [#2069](https://github.com/kuhlman-labs/fishhawk/issues/2069) |
 | [ADR-062](062-regional-cells-control-plane.md) | Regional-cells control plane: fishhawk-directory service, directory-first region pinning, per-cell inference config | `accepted` | [#2099](https://github.com/kuhlman-labs/fishhawk/issues/2099) |
 | [ADR-063](063-isolate-untrusted-gate-command-execution.md) | Isolate untrusted gate-command execution: container sandbox for .git-metadata, egress, and host-filesystem containment | `accepted` | [#2127](https://github.com/kuhlman-labs/fishhawk/issues/2127) |
 | [ADR-064](064-forge-project-board-work-queue-input.md) | Forge project board as declarative work-queue input and derived status projection | `accepted` | [#2139](https://github.com/kuhlman-labs/fishhawk/issues/2139) |
@@ -489,62 +507,27 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 
 ## Status unknown — needs captain confirmation
 
-- **ADR-010** — Decision section is the placeholder `_To be recorded._`.
-- **ADR-011** — Decision section is the placeholder `_To be recorded._`.
-- **ADR-012** — Decision section is the placeholder `_To be recorded._`.
-- **ADR-022** — Decision (and the addendum's Decision) state a design with no
-  acceptance or ratification statement.
-- **ADR-026** — No Decision section: the body ends Context / Options /
-  `## Recommendation (subject to ADR review)` / Consequences, so no decision is
-  recorded. No date.
-- **ADR-028** (date 2026-06-01, from `## Decision (2026-06-01)`) — the Decision
-  states a design (local: detection-only; hosted: container mount-confinement)
-  with no acceptance or ratification statement. Its only acceptance wording is
-  "Accepted residual: a local agent can still write outside the tree", which
-  qualifies the local residual risk rather than ratifying the decision;
-  "Accepted for v0" in Consequences is a second, non-ratifying use of the same
-  word. The gate cannot judge this one (that Decision-section "Accepted" would
-  pass C-accepted).
-- **ADR-031** — Opens `**Status: Decided (2026-06-03).**` above Context, but the
-  Decision section carries no acceptance statement. Records the supersession of
-  ADR-018's resolution mechanism (ADR-018 `superseded_by: ["ADR-031"]`, ADR-018
-  stays `accepted`: "keeps its invariant"). No date recorded.
-- **ADR-032** — Opens `**Status: Decided (2026-06-03).**` above Context; the
-  Decision section carries no acceptance statement. No date recorded.
-- **ADR-034** — Decision section is the placeholder `_TBD._`.
-- **ADR-035** — Opens `**Status: Decided (2026-06-07).**` above Context; the
-  Decision section carries no acceptance statement. No date recorded.
-- **ADR-036** — Opens `**Status: Decided (2026-06-08).**` above Context; the
-  Decision section carries no acceptance statement. No date recorded.
-- **ADR-037** — Opens `**Status: Decided (2026-06-08).**` above Context; the
-  Decision section carries no acceptance statement. No date recorded.
-- **ADR-039** (date 2026-08-25, from `Recorded 2026-08-25`) — status line
-  `**Status:** Proposed — 2026-06-09`; the Decision is "Deferred. Charter N4 is
-  the standing answer until this ADR is revisited", and the issue is still
-  OPEN. Neither accepted nor a stated rejection.
-- **ADR-042** — Decision section is the placeholder
-  `_TBD — operator. (Agent proposes, human disposes.)_`.
-- **ADR-044** — The Decision states a design with no acceptance or ratification
-  statement; "accepted" appears only about models ("a newly-released model is
-  accepted automatically"), not the decision. No date.
-- **ADR-045** — The Decision states a design with no acceptance or ratification
-  statement; the resolution sits in a separate `## Status — RESOLVED
-  (2026-06-24)` section, which is outside the Decision section (and so
-  contributes no date). A candidate rule extension — also read a leading
-  `**Status: Decided/Accepted (<date>)**` line or a Status/Resolution section —
-  would settle ADR-031, -032, -035, -036, -037 and -045 together; it is not part
-  of the current rule.
-- **ADR-057** — No Decision-headed section: the decisions sit under
-  `## Decisions (founder-directed)`, which the Decision-heading pattern does not
-  match (`Decisions` is not `Decision` — the h35c precision pin), and the
-  acceptance line `**Accepted (founder-directed).** Decisions above are locked.`
-  is in a separate `## Status` section, outside any Decision section. No date.
-  Another instance of the candidate rule extension under ADR-045.
-- **ADR-061** — Decision section is the single italic placeholder
-  `_(Founder ratifies: the two settled decisions above are accepted; this
-  section confirms the proposed design + P1–P5 phasing, or amends it.` … `)_`.
-  The gate's placeholder strip does NOT remove it — the span holds an inner `_`
-  (`depends_on`), the documented cost — so its "accepted" would satisfy
-  C-accepted; `unknown` rests on the per-record rule alone. Records the
-  supersession of ADR-058's tenant definition (ADR-058
-  `superseded_by: ["ADR-061"]`, ADR-058 stays `accepted`). No date.
+None. The Captain resolved all eighteen records listed here on 2026-10-23 ("as
+recommended", from the first officer's ruling sheet). Each ruling is stated in
+the tracker body, and the record is re-transcribed from it:
+
+- `accepted` (13): ADR-022, ADR-026, ADR-028, ADR-031, ADR-032, ADR-034,
+  ADR-035, ADR-036, ADR-037, ADR-042, ADR-044, ADR-045 and ADR-057. Each body
+  gained a `## Decision` section quoting the source that states the decision.
+  ADR-034 and ADR-042 had their Decision placeholder replaced instead.
+  `date` is the decision date the source states. ADR-022, ADR-044 and ADR-057
+  state none ("date not stated").
+- `proposed` (4): ADR-010, ADR-011, ADR-012 and ADR-039. They are open and
+  deferred. The placeholder stays, followed by the Captain's confirmation.
+- `superseded` (1): ADR-061, by ADR-057 (see "Amendment relation").
+
+The same rulings appended a partial-supersession clarification to the bodies
+of ADR-018, ADR-033, ADR-043, ADR-058, ADR-080, ADR-087, ADR-090, ADR-092 and
+ADR-096. They stay `accepted` and keep their links. The automatically appended
+"Intake signals" sections of ADR-080 and ADR-087 were removed from their
+tracker bodies before re-transcription. ADR-090's record keeps the in-repo
+"Amendment 1 (2026-10-14)" section added by #4424, which its tracker body
+does not carry, and takes the clarification after it.
+
+A record the inference rule leaves `unknown` from here on is listed here
+again, quoting its source verbatim (Upkeep rule).

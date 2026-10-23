@@ -1,7 +1,8 @@
 ---
 id: ADR-026
 title: "Backward-compatibility discipline for schema-extension PRs"
-status: unknown
+status: accepted
+date: 2026-05-25
 issue: https://github.com/kuhlman-labs/fishhawk/issues/472
 supersedes: []
 superseded_by: []
@@ -81,3 +82,7 @@ ADR-025 D2's breaking-change-with-coordinated-rollout becomes the **last** time 
 - #466 (cross-binary version coordination) — the mechanism this ADR's enforcement depends on.
 - #463 / PR #463 — sync-schemas tooling (will extend to version-aware).
 - [[feedback-dogfood-local-loop]] — the methodology that made the stale-backend rejection visible.
+
+## Decision
+
+**Accepted (2026-05-25).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Adopted: B + D combination** per the recommendation".

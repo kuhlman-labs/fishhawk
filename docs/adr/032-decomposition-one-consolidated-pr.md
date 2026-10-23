@@ -1,10 +1,12 @@
 ---
 id: ADR-032
 title: "Decomposition delivery model: one consolidated PR per decomposition"
-status: unknown
+status: accepted
+date: 2026-06-03
 issue: https://github.com/kuhlman-labs/fishhawk/issues/719
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-041"]
 applies_to: []
 ---
 
@@ -60,3 +62,7 @@ Underneath: two distinct axes were conflated. **Execution size** (decomposition'
 ADR-031 (#710, `github_merge` resolution — unchanged), #702 / #713 (`push_and_open_pr` default + installation attribution that surfaced this), **#714** (re-scoped implementation), decomposition fan-out (`backend/internal/orchestrator` child-run creation, `children_settled`), METHODOLOGY (autonomy / operator-control of change size).
 
 Parent epic: #389
+
+## Decision
+
+**Accepted (2026-06-03).** Status confirmed by the Captain (repository maintainer) on 2026-10-23 from the record's own source: "**Status: Decided (2026-06-03).**".
