@@ -19,7 +19,8 @@ dependency.
 |---|---|
 | `ParseIndex(raw)` | Strict `adr-index-v1` decode (below). Every refusal wraps `ErrInvalidIndex` and names the record. |
 | `Select(index, changePaths)` | The records whose `applies_to` matches a change path, plus the records that supersede or amend them (transitively), ranked. |
-| `RenderIndex(index)` | The compact index rendering (`IndexRendering` = `adr-index-lines-v1`, below) the persona is shown. |
+| `RenderIndex(index)` | The compact index rendering (`IndexRendering` = `adr-index-lines-v2`, below) the persona is shown. |
+| `RenderedTitle(title)` | A title as `RenderIndex` renders it: unchanged up to `MaxRenderedTitleChars` = 100 code points, else its first 99 plus `…` (#4699, below). |
 | `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index's compact rendering under its own cap, and fit whole records, then Decision-section excerpts, into a separate record budget. Returns a `*Selection`. |
 | `DecisionExcerpt(content)` | A record's Decision section(s), verbatim, and whether it has any (the excerpt `Assemble` falls back to, #4489, below). |
 | `Selection.PromptDocuments(grounded)` | The index, then each included record, then each excerpt, as `prompt.InjectedDocument`s. |
@@ -136,13 +137,31 @@ raw NEL (only ever inside a JSON string) as `\u0085`, so the rendering holds
 exactly one repodoc line break per record and each line decodes back to its
 record (`TestRenderIndex_OneLinePerRecordRoundTrips`).
 
+**Title cap (`adr-index-lines-v2`, #4699).** Each title is rendered through
+`RenderedTitle`: a title over `MaxRenderedTitleChars` = 100 characters (Unicode
+code points, `utf8.RuneCountInString`) is cut to its first 99 code points plus
+U+2026 `…`, so a rendered title is never over 100 characters. The cut is on a
+code-point boundary (valid UTF-8 stays valid; a combining sequence can be
+split), and the `…` is written raw (`encoding/json` does not escape it). A line
+therefore decodes to its record with `Title == RenderedTitle(Title)`; the
+caller's `Index` is not modified, and the stored title in `docs/adr/index.json`
+and the record file is unchanged. Measured on the 113-record index
+(2026-10-23), 53 titles are over the cap and the rendering drops from 27,143 to
+24,200 bytes (2,943 saved). New records cannot add a cut title:
+`scripts/check-adr`'s `C-title-length` refuses a title over 100 characters from
+ADR-119 on (`TITLE_MAX_CHARS`, `TITLE_RULE_FROM`; ADR-001 to ADR-118 are
+grandfathered), and `TestTitleCapMatchesCheckADR` pins the two constants
+together. v1 rendered every title in full.
+
 `Assemble` shows it through `repodoc.Fetched.Derive(IndexRendering, …)`: the
 index document's `content_hash` and `original_bytes` stay the committed file's,
 while `Content`, `rendered_bytes`, the cut and the marker are the rendering's,
 and its audit entries carry `rendering` / `rendering_bytes` (repodoc README §
 "Derived renderings"). The framing says the index is a compact rendering and
-how to read it, and the Source line says `shown as its adr-index-lines-v1
-rendering, not verbatim`.
+how to read it, including that a title over 100 characters is shown as its
+first 99 followed by `…` and that the record file carries the full title, and
+the Source line says `shown as its adr-index-lines-v2 rendering, not
+verbatim`.
 
 ## Byte budget (`Assemble`)
 
@@ -390,7 +409,11 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | index rendering over the cap | index shown truncated within its own cap (the cut, marker and per-document `document_truncated` count rendering bytes and carry `rendering` / `rendering_bytes`); records still shown under the record budget | `TestAssemble_IndexOverCap`, `TestAssemble_IndexOverCap_AttributionCapBytes` |
 | raw index over the cap, rendering under it | the rendering shown whole; hash and `original_bytes` the raw file's | `TestAssemble_IndexShownAsCompactRendering` |
 | index rendering fills >= 95% of the cap | every record that fits the record budget still shown | `TestAssemble_IndexNearCapDoesNotStarveRecords` |
-| shipped index rendering past the production cap, or below the measured headroom floor | verify fails naming the overflow | `TestAssemble_ShippedIndex_RenderingFitsCap`, `TestShippedIndex_WithinInjectionCap`; the check's RED is pinned by `TestAssemble_IndexRenderingOverflow_IsCaught` |
+| shipped index rendering past the production cap, or below the measured record-count floor | verify fails naming the overflow | `TestAssemble_ShippedIndex_RenderingFitsCap`, `TestShippedIndex_WithinInjectionCap`; the check's RED is pinned by `TestAssemble_IndexRenderingOverflow_IsCaught` |
+| shipped rendering's headroom under the production cap below `minHeadroomLines` = 10 of its largest line (#4699 AC4) | verify fails naming the numbers and the tiering remedy | `TestAssemble_ShippedIndex_HeadroomFloor`; its RED (floor one line above the available headroom) is pinned by `TestAssemble_HeadroomFloor_IsCaught` |
+| title over / exactly at the cap (ASCII and 2-byte runes), a cut next to `\n` / NEL | cut to 99 code points plus a raw `…`, exact-100 unchanged, valid UTF-8, one line break per record, strict decode to `RenderedTitle` | `TestRenderIndex_CapsLongTitles`, `TestRenderedTitle` |
+| shipped index: a rendered title other than `RenderedTitle(stored)`, or the cap saving under `minTitleCapSavings` = 2,500 bytes (#4699 AC2, summed per title from `RenderIndex`'s own output) | verify fails | `TestShippedIndex_TitleCapShrinksRendering` |
+| `MaxRenderedTitleChars` and `scripts/check-adr`'s `TITLE_MAX_CHARS` / `TITLE_RULE_FROM` drift apart | verify fails | `TestTitleCapMatchesCheckADR` |
 | record field missing from the rendering, a slice tag without `omitempty`, a raw NEL, an HTML-escaped `<` | rendering refused by test | `TestRenderIndex_RendersEveryRecordField`, `TestRenderIndex_OneLinePerRecordRoundTrips` |
 | shipped index, typical scope, production cap | at least `minTypicalRecordBodies` governing bodies shown in full | `TestAssemble_ShippedIndex_TypicalScopesReachRecordBodies` |
 | cap smaller than the marker | `ErrUnresolvable` (zero-cap guard) | `TestAssemble_CapSmallerThanMarker_FailsClosed` |
@@ -411,14 +434,19 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 ## Residuals
 
 - **Index size.** The persona is shown the index's compact rendering
-  (`RenderIndex`, #4478), not the committed file. Measured 2026-10-16 on 95
-  records: `docs/adr/index.json` is 32,744 raw bytes and its rendering 21,142
-  bytes, leaving 11,626 bytes under the 32 KiB cap — 27 more records at the
-  largest current line (428 bytes), about 35 at the last ten records' average
-  (330 bytes). `TestAssemble_ShippedIndex_RenderingFitsCap` fails the change
-  whose record makes the rendering overflow the cap (and holds the format to
-  at least 25 more records at 428 bytes beyond the 95 measured), as does
-  `TestShippedIndex_WithinInjectionCap`. Concurrent ADR merges can still
+  (`RenderIndex`, #4478), not the committed file. Measured 2026-10-23 on 113
+  records with the #4699 title cap (`adr-index-lines-v2`):
+  `docs/adr/index.json` is 41,625 raw bytes and its rendering 24,200 bytes
+  (27,143 uncapped), leaving 8,568 bytes under the 32 KiB cap — 21 more lines
+  at the largest current line (405 bytes).
+  `TestAssemble_ShippedIndex_HeadroomFloor` fails the ADR landing that leaves
+  fewer than 10 such lines (#4699 AC4): the early warning to tier the index
+  (collapse superseded or older records), which #4699 deferred until about 150
+  ADRs, or to raise the cap — an operator decision, not a flake.
+  `TestAssemble_ShippedIndex_RenderingFitsCap` still fails the change whose
+  record makes the rendering overflow the cap (and keeps its 2026-10-16
+  record-count floor: 25 more records at 428 bytes beyond the 95 measured then),
+  as does `TestShippedIndex_WithinInjectionCap`. Concurrent ADR merges can still
   overflow on main between their verifies, as with any shared-file budget. The
   raw file's size no longer reaches the prompt; how the writer emits the
   optional amendment keys is `docs/adr/README.md`'s.

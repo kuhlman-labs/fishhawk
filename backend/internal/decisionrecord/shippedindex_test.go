@@ -1,14 +1,17 @@
 package decisionrecord
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"testing"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 )
@@ -172,6 +175,108 @@ func TestShippedIndex_WithinInjectionCap(t *testing.T) {
 		if headroom < 0 {
 			t.Fatalf("%s %s renders to %d bytes, %d over repodoc.DefaultMaxBytes (%d): the index would be injected truncated; a more compact index format (or a larger cap) is an operator decision",
 				tc.name, indexPath, shown, -headroom, repodoc.DefaultMaxBytes)
+		}
+	}
+}
+
+// minTitleCapSavings is #4699 AC2: capping rendered titles must save at least
+// this many bytes of the shipped index rendering. The saving only grows: the
+// grandfathered titles (ADR-001 to ADR-118) are never rewritten, and a new
+// title is at most MaxRenderedTitleChars (scripts/check-adr C-title-length), so
+// it saves nothing and costs nothing.
+const minTitleCapSavings = 2500
+
+// jsonString is s as RenderIndex's encoder writes a JSON string
+// (SetEscapeHTML(false)), without the encoder's trailing newline.
+func jsonString(t *testing.T, s string) []byte {
+	t.Helper()
+	var b bytes.Buffer
+	enc := json.NewEncoder(&b)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(s); err != nil {
+		t.Fatalf("encode %q: %v", s, err)
+	}
+	return bytes.TrimSuffix(b.Bytes(), []byte("\n"))
+}
+
+// TestShippedIndex_TitleCapShrinksRendering is #4699's shipped done-means
+// (AC1, AC2): every line of the committed index's RenderIndex rendering
+// decodes strictly to its record with Title == RenderedTitle(stored title), at
+// most MaxRenderedTitleChars code points, and the cap saves at least
+// minTitleCapSavings bytes. The saving is summed per title from RenderIndex's
+// OWN output (approval condition 3), never through a re-render: each line's
+// title value bytes are read raw and compared with the stored title's JSON
+// encoding; an under-cap title must render byte-equal to that encoding, which
+// pins jsonString to RenderIndex's encoder on the real titles.
+func TestShippedIndex_TitleCapShrinksRendering(t *testing.T) {
+	idx, _ := shippedIndex(t)
+	rendered, err := RenderIndex(idx)
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	lines := strings.SplitAfter(string(rendered), "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	if len(lines) != len(idx.Records) {
+		t.Fatalf("rendering has %d lines, want one per record (%d)", len(lines), len(idx.Records))
+	}
+	saved, cut := 0, 0
+	for i, line := range lines {
+		r := idx.Records[i]
+		var back Record
+		dec := json.NewDecoder(strings.NewReader(line))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&back); err != nil {
+			t.Fatalf("line %d (%s) does not decode strictly: %v\n%s", i, r.ID, err, line)
+		}
+		want := r
+		want.Title = RenderedTitle(r.Title)
+		// An empty list is left out of its line (omitempty), so it decodes nil.
+		for _, p := range []*[]string{&back.Supersedes, &back.SupersededBy, &back.Amends, &back.AmendedBy, &back.AppliesTo, &want.Supersedes, &want.SupersededBy, &want.Amends, &want.AmendedBy, &want.AppliesTo} {
+			if len(*p) == 0 {
+				*p = nil
+			}
+		}
+		if !reflect.DeepEqual(back, want) {
+			t.Errorf("line %d decodes to %+v, want %+v (Title == RenderedTitle(stored))", i, back, want)
+		}
+		if n := utf8.RuneCountInString(back.Title); n > MaxRenderedTitleChars {
+			t.Errorf("%s rendered title is %d code points, over %d", r.ID, n, MaxRenderedTitleChars)
+		}
+		var raw map[string]json.RawMessage
+		if err := json.Unmarshal([]byte(line), &raw); err != nil {
+			t.Fatalf("line %d (%s): %v", i, r.ID, err)
+		}
+		full := jsonString(t, r.Title)
+		if utf8.RuneCountInString(r.Title) <= MaxRenderedTitleChars {
+			if !bytes.Equal(raw["title"], full) {
+				t.Errorf("%s: under-cap title rendered as %s, want its encoding %s", r.ID, raw["title"], full)
+			}
+			continue
+		}
+		cut++
+		saved += len(full) - len(raw["title"])
+	}
+	t.Logf("shipped %s: %d records, %d titles over %d characters; %s rendering %d bytes, uncapped %d bytes, saved %d bytes (floor %d)",
+		indexPath, len(idx.Records), cut, MaxRenderedTitleChars, IndexRendering, len(rendered), len(rendered)+saved, saved, minTitleCapSavings)
+	if saved < minTitleCapSavings {
+		t.Errorf("the title cap saves %d bytes of the shipped rendering, below the #4699 floor of %d", saved, minTitleCapSavings)
+	}
+}
+
+// TestTitleCapMatchesCheckADR (#4699): the Go render-time cap and the
+// scripts/check-adr rule for new records are one number, so a record that
+// passes C-title-length is never cut in the rendering. Both constants are read
+// from the script's text.
+func TestTitleCapMatchesCheckADR(t *testing.T) {
+	script := string(readShipped(t, "scripts/check-adr"))
+	for _, want := range []string{
+		fmt.Sprintf("TITLE_MAX_CHARS = %d\n", MaxRenderedTitleChars),
+		"TITLE_RULE_FROM = 119\n",
+	} {
+		if !strings.Contains(script, want) {
+			t.Errorf("scripts/check-adr does not declare %q: the check-adr title rule and decisionrecord.MaxRenderedTitleChars must change together", strings.TrimSpace(want))
 		}
 	}
 }

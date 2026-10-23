@@ -55,7 +55,7 @@ editorial act.
 | Key | Meaning |
 |---|---|
 | `id` | `ADR-NNN`; equals `ADR-` + the filename's 3-digit prefix. |
-| `title` | The issue title without its `[ADR-NNN] ` prefix. |
+| `title` | The issue title without its `[ADR-NNN] ` prefix. From ADR-119 on, at most 100 characters (Unicode code points, Python `len`): a longer issue title is shortened for the record, and `scripts/check-adr` refuses it as `C-title-length` (#4699). ADR-001 – ADR-118 are grandfathered and keep their full titles. |
 | `status` | One of `proposed`, `accepted`, `rejected`, `superseded`, `unknown` — see the inference rule below. |
 | `date` | The date the Decision section or its heading states (`Recorded 2026-04-30`, `Accepted (2026-07-26)`, `Decided 2026-06-09`, `## Decision (2026-05-19)`, `Resolved on 2026-05-26`). Omitted when none is stated. A separate Resolution section's or an implementation-landed date is NOT a decision date. |
 | `issue` | The tracker issue URL the body is transcribed from. |
@@ -144,13 +144,18 @@ alike.
 
 The architect persona is shown a COMPACT rendering of this file, not the file
 itself (`decisionrecord.RenderIndex`, #4478): one JSON object per record, one
-record per line, with every empty list left out. It is that rendering, not the
-committed file, that must fit the 32,768-byte (32 KiB) decision-record index
-cap; `TestAssemble_ShippedIndex_RenderingFitsCap` (and
+record per line, with every empty list left out, and (`adr-index-lines-v2`,
+#4699) every title over 100 characters cut to its first 99 plus `…` at render
+time; the stored title here and in the record is unchanged. It is that
+rendering, not the committed file, that must fit the 32,768-byte (32 KiB)
+decision-record index cap; `TestAssemble_ShippedIndex_RenderingFitsCap` (and
 `TestShippedIndex_WithinInjectionCap`) in `backend/internal/decisionrecord`
-fail the change whose record makes it overflow. Measured 2026-10-16: 95
-records render to 21,142 bytes, room for about 27 more at the largest current
-entry. The gate compares the
+fail the change whose record makes it overflow, and
+`TestAssemble_ShippedIndex_HeadroomFloor` fails the change that leaves less
+than 10 of the largest rendered line of headroom — the signal to tier the
+index or raise the cap, an operator decision. Measured 2026-10-23: 113 records
+render to 24,200 bytes (27,143 uncapped), leaving 8,568 bytes, about 21 more
+at the largest current line (405 bytes). The gate compares the
 index to the records semantically, keyed by path: a record with no entry, an entry naming no record
 file, or an entry field disagreeing with the front matter each fail verify.
 Never hand-edit it — regenerate with:

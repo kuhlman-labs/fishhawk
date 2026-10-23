@@ -1,0 +1,14 @@
+id: scenario:issue-4699/check-adr-refuses-long-title-from-119
+statement: scripts/check-adr, run against a fixture ADR directory where record ADR-119 has a 101-character title and the index matches, exits 1 and prints a [C-title-length] line naming the record file and its character count.
+verify_hint: 'CLI exit code and stdout: copy docs/adr into a temp dir, add a 119-*.md record (id ADR-119, a 101-character title) with a matching index entry, run scripts/check-adr <tmpdir>, and observe exit 1 and a `[C-title-length]` line naming 119-*.md'
+steps: 'Posture B in the sanctioned checkout /tmp/fishhawk-acceptance-tree-3f940bf0-... (HEAD e0b26d7c, the same as the target git_sha). (1) Copied docs/adr to /tmp/fh4699v/f101. (2) Added 119-fixture-title-rule.md with front matter: id ADR-119; a JSON-quoted title of ''A''*50 + '' '' + ''b''*50 (101 characters); status accepted; issue URL; supersedes, superseded_by and applies_to all []. Its body has Status, Context, Decision (''Accepted: the fixture decision is adopted.'') and Consequences sections. (3) Appended a matching entry to index.json with the same title and path. (4) Ran scripts/check-adr /tmp/fh4699v/f101. (5) Repeated with the record numbered 120. (6) Repeated with a title of 101 ''é'' characters under LC_ALL=C.'
+assertions:
+    expected: exit 1 and a [C-title-length] line naming 119-*.md and its character count
+    observed_at_record: 'Exit 1. Output: ''/tmp/fh4699v/f101/119-fixture-title-rule.md: [C-title-length] title is 101 characters, over the 100-character limit for ADR-119 onward; shorten the record''s title (ADR-001 to ADR-118 are grandfathered)''. This was the only violation. ADR-120 and the 101-''é'' title under LC_ALL=C were refused the same way.'
+    repro_handle: python3 -I /tmp/fh4699v/mk.py docs/adr /tmp/fh4699v/f101 119 "$(python3 -c "print('A'*50+' '+'b'*50)")" && scripts/check-adr /tmp/fh4699v/f101
+origin:
+    issue: 4699
+    pr: 4704
+    run_id: 3f940bf0-c2e3-4a60-9771-ffd06e8de785
+    head_sha: e0b26d7ca286b09cb7c22e74b8f09f765cc978a1
+    recorded_at: 2026-10-23T18:20:54Z

@@ -140,6 +140,18 @@
 #   CF44 the writer always writes the optional keys → h46 RED (ADR-001 then
 #        carries empty amends / amended_by).
 #   CF45 the index key-set check accepts any extra key → h44 RED (exit 0).
+#   E89.46 / #4699 title rule (same restore discipline):
+#   CF46 C-title-length made a no-op (`if False and ...`) → h47 RED (exit 0:
+#        h47's index entry carries the identical title, so nothing else fires).
+#   CF47 threshold `>= TITLE_RULE_FROM` → `> TITLE_RULE_FROM` → h47 RED
+#        (ADR-119 is then exempt).
+#   CF48 threshold `>= TITLE_RULE_FROM` → `>= 118` → h48 RED (the grandfathered
+#        ADR-118 is then refused).
+#   CF49 `len(title)` → `len(title.encode('utf-8'))` (bytes, not code points)
+#        → h49 RED (100 'é' is 200 bytes), observed under BOTH the default
+#        locale and LC_ALL=C.
+#   CF50 `len(title) > TITLE_MAX_CHARS` → `>=` → h49 RED (exactly 100 code
+#        points is then refused).
 #   Not counterfactual-run: the unterminated-front-matter branch (deleting it
 #   crashes on close=None rather than greening — h16a still RED via no tag),
 #   the index not-JSON and entry-shape branches (h30a/h30c assert them), and
@@ -312,6 +324,35 @@ EOF
   subst "$1/index.json" '"applies_to": ["infra/terraform/**"]}' \
     '"applies_to": ["infra/terraform/**"]},
     {"id": "'"$2"'", "title": "Gamma decision", "path": "docs/adr/003-gamma.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}'
+}
+
+# add_numbered <dir> <NNN> <title> — a standalone record <NNN>-delta.md (id
+# ADR-<NNN>, accepted, no links) plus its index entry carrying the IDENTICAL
+# title, so C-index stays silent and only the title rule can fire (#4699). The
+# front-matter title is JSON-QUOTED, so a title holding spaces or non-ASCII
+# never trips C-grammar's bare-token form (BARE_RE is ASCII-only, no spaces).
+# <title> must carry no '"' or backslash, which would need JSON escaping.
+add_numbered() {
+  cat > "$1/$2-delta.md" <<EOF
+---
+id: ADR-$2
+title: "$3"
+status: accepted
+issue: https://example.invalid/issues/$2
+supersedes: []
+superseded_by: []
+applies_to: []
+---
+
+# ADR-$2: Delta decision
+
+## Decision
+
+Approved.
+EOF
+  subst "$1/index.json" '"applies_to": ["infra/terraform/**"]}' \
+    '"applies_to": ["infra/terraform/**"]},
+    {"id": "ADR-'"$2"'", "title": "'"$3"'", "path": "docs/adr/'"$2"'-delta.md", "status": "accepted", "supersedes": [], "superseded_by": [], "applies_to": []}'
 }
 
 # expect_only <case> <class> <needle>... — exit 1, ONLY [<class>] tags in the
@@ -792,6 +833,23 @@ PY
     expect_ok "h46: --write-index writes the optional keys only where non-empty" "3 record(s) consistent"
   fi
 fi
+
+# #4699 title rule (C-title-length). repeat_str <s> <n> prints <s> n times.
+repeat_str() { local i=0 r=""; while [ "$i" -lt "$2" ]; do r="$r$1"; i=$((i + 1)); done; printf '%s' "$r"; }
+
+# h47: ADR-119 (the first number the rule covers) with a 101-character ASCII
+# title. Its index entry matches, so only the title rule can fire.
+d="$(fixture h47)"; add_numbered "$d" 119 "$(repeat_str a 101)"
+run_check "$d"; expect_only "h47: ADR-119 with a 101-character title" C-title-length "119-delta.md" "101 characters"
+
+# h48: ADR-118 (the last grandfathered record) with a 249-character title.
+d="$(fixture h48)"; add_numbered "$d" 118 "$(repeat_str a 249)"
+run_check "$d"; expect_ok "h48: grandfathered ADR-118 with a 249-character title passes" "3 record(s) consistent"
+
+# h49: ADR-119 with EXACTLY 100 'é' (100 code points, 200 UTF-8 bytes). It
+# pins both the inclusive boundary and code-point (not byte) counting.
+d="$(fixture h49)"; add_numbered "$d" 119 "$(repeat_str é 100)"
+run_check "$d"; expect_ok "h49: ADR-119 with exactly 100 'é' (200 bytes) passes" "3 record(s) consistent"
 
 echo
 echo "scripts/test-adr: $PASS passed, $FAIL failed"

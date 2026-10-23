@@ -11,6 +11,7 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -920,5 +921,90 @@ func TestRenderIndex_OneLinePerRecordRoundTrips(t *testing.T) {
 		if !reflect.DeepEqual(got, want) {
 			t.Errorf("line %d decodes to %+v, want %+v", i, got, want)
 		}
+	}
+}
+
+// TestRenderedTitle pins the #4699 cut directly: at most MaxRenderedTitleChars
+// code points passes unchanged, a longer title keeps its first
+// MaxRenderedTitleChars-1 code points plus '…'.
+func TestRenderedTitle(t *testing.T) {
+	for _, tc := range []struct {
+		name, in, want string
+	}{
+		{"empty", "", ""},
+		{"short", "Plain title", "Plain title"},
+		{"exactly 99", strings.Repeat("a", 99), strings.Repeat("a", 99)},
+		{"exactly 100", strings.Repeat("a", 100), strings.Repeat("a", 100)},
+		{"101", strings.Repeat("a", 101), strings.Repeat("a", 99) + "…"},
+		{"100 é (200 bytes)", strings.Repeat("é", 100), strings.Repeat("é", 100)},
+		{"101 é", strings.Repeat("é", 101), strings.Repeat("é", 99) + "…"},
+		{"100 then '…'", strings.Repeat("a", 100) + "…", strings.Repeat("a", 99) + "…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := RenderedTitle(tc.in); got != tc.want {
+				t.Errorf("RenderedTitle(%q) = %q, want %q", tc.in, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestRenderIndex_CapsLongTitles (#4699): every title RenderIndex writes is at
+// most MaxRenderedTitleChars code points. The exact-100 ASCII and 100-'é'
+// (200-byte) titles render unchanged, which pins `<=` over code points rather
+// than bytes; 101, 249 and 120-'é' titles render as their first 99 code
+// points plus a RAW '…'; a cut through a title carrying '\n' and U+0085 just
+// before the cut point still leaves one repodoc line break per record. Every
+// line decodes strictly to the record with Title == RenderedTitle(original)
+// and every other field unchanged, and the caller's Index is not modified.
+func TestRenderIndex_CapsLongTitles(t *testing.T) {
+	ascii := func(n int) string { return strings.Repeat("a", n) }
+	breaks := ascii(96) + "\n\u0085" + ascii(3) // 101 runes; '\n' and NEL at runes 97 and 98
+	for _, tc := range []struct {
+		name, title string
+		// wantTitle is the title's EXACT bytes inside the rendered line.
+		wantTitle string
+	}{
+		{"exactly 100 ASCII, unchanged", ascii(100), ascii(100)},
+		{"101 ASCII, cut", ascii(101), ascii(99) + "…"},
+		{"249 ASCII, cut", ascii(249), ascii(99) + "…"},
+		{"100 é (200 bytes), unchanged", strings.Repeat("é", 100), strings.Repeat("é", 100)},
+		{"120 é, cut on a rune boundary", strings.Repeat("é", 120), strings.Repeat("é", 99) + "…"},
+		{"line breaks just before the cut", breaks, ascii(96) + `\n\u0085` + ascii(1) + "…"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := Record{ID: "ADR-007", Title: tc.title, Path: "docs/adr/007-g.md", Status: StatusAccepted, Supersedes: []string{"ADR-002"}, AmendedBy: []string{"ADR-009"}, AppliesTo: []string{"docs/**"}}
+			idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{r}}
+			out, err := RenderIndex(idx)
+			if err != nil {
+				t.Fatalf("RenderIndex: %v", err)
+			}
+			want := `{"id":"ADR-007","title":"` + tc.wantTitle + `","path":"docs/adr/007-g.md","status":"accepted","supersedes":["ADR-002"],"amended_by":["ADR-009"],"applies_to":["docs/**"]}` + "\n"
+			if string(out) != want {
+				t.Errorf("RenderIndex =\n%q\nwant\n%q", out, want)
+			}
+			if idx.Records[0].Title != tc.title {
+				t.Errorf("RenderIndex modified the caller's index: title now %q", idx.Records[0].Title)
+			}
+			if !utf8.Valid(out) {
+				t.Errorf("rendering is not valid UTF-8: %q", out)
+			}
+			if got := countRepodocLineBreaks(string(out)); got != 1 {
+				t.Errorf("rendering holds %d repodoc line breaks, want 1:\n%q", got, out)
+			}
+			var back Record
+			dec := json.NewDecoder(strings.NewReader(string(out)))
+			dec.DisallowUnknownFields()
+			if err := dec.Decode(&back); err != nil {
+				t.Fatalf("line does not decode strictly: %v\n%s", err, out)
+			}
+			if n := utf8.RuneCountInString(back.Title); n > MaxRenderedTitleChars || !utf8.ValidString(back.Title) {
+				t.Errorf("rendered title is %d code points (valid %v), want <= %d", n, utf8.ValidString(back.Title), MaxRenderedTitleChars)
+			}
+			wantBack := r
+			wantBack.Title = RenderedTitle(tc.title)
+			if !reflect.DeepEqual(back, wantBack) {
+				t.Errorf("line decodes to %+v, want %+v", back, wantBack)
+			}
+		})
 	}
 }

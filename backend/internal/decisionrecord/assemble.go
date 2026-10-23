@@ -351,8 +351,9 @@ func (s *Selection) PromptDocuments(grounded bool) []prompt.InjectedDocument {
 }
 
 // indexRenderingNote is the sentence the index framing adds after its opening
-// sentence, describing the RenderIndex format the persona is shown (#4478).
-const indexRenderingNote = "It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. "
+// sentence, describing the RenderIndex format the persona is shown (#4478),
+// including the title cap (RenderedTitle, MaxRenderedTitleChars, #4699).
+const indexRenderingNote = "It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). "
 
 // indexFraming is the system-authored framing of the index document. Apart
 // from the indexRenderingNote sentence (#4478): with no followed successor
