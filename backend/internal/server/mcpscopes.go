@@ -247,6 +247,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// refuses a run-bound token, which carries only mcp:read/write:retries.
 	"fishhawk_promote_queued_stage": {anyOf: []string{"write:runs"}},
 
+	// merge_queue_promote.go handleMergeQueuePromote (ADR-093 D2, E87.6 /
+	// #4297). It also refuses a run-bound token.
+	"fishhawk_promote_merge_queue_entry": {anyOf: []string{"write:runs"}},
+
 	// --- write:stages.
 	"fishhawk_rebase_run_branch":         {anyOf: []string{"write:stages"}}, // rebase_branch.go handleRebaseRunBranch
 	"fishhawk_vouch_commit":              {anyOf: []string{"write:stages"}}, // vouch.go handleVouchCommit

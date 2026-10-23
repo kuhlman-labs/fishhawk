@@ -3535,7 +3535,15 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// not a run-status mode: the read spans every run on the base, in the
 	// caller's account. Bumped by exactly ONE from the base (approval
 	// condition C1): 81 -> 82 (landed after #4234).
-	const wantToolCount = 82
+	//
+	// E87.6 / #4297 (ADR-093 D2/D7) adds exactly ONE tool —
+	// fishhawk_promote_merge_queue_entry, the thin wrapper over POST
+	// /v0/runs/{run_id}/merge-queue/promote. WHEN: a run's merge-queue entry
+	// is held behind others and should be admitted next. ELIGIBILITY:
+	// write:runs; the backend refuses a run-bound token. Its own tool, not a
+	// mode of fishhawk_promote_queued_stage: the two queues differ in key,
+	// lock domain and refusal set. 82 -> 83.
+	const wantToolCount = 83
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

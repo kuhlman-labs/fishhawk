@@ -318,6 +318,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/stages/{stage_id}/acceptance-admission", s.requireStageAccount(memberWrite, s.handleAcceptanceAdmission))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/fixup", s.requireStageAccount(memberWrite, s.handleFixupStage))
 	mux.HandleFunc("POST /v0/stages/{stage_id}/concurrency/promote", s.requireStageAccount(memberWrite, s.handlePromoteQueuedStage))
+	// Operator promote of a held merge-queue entry (ADR-093 D2/D7, E87.6 /
+	// #4297): moves the run's unmarked held entry to the head of its base's
+	// line (merge_queue_promote.go).
+	mux.HandleFunc("POST /v0/runs/{run_id}/merge-queue/promote", s.requireRunAccount(memberWrite, s.handleMergeQueuePromote))
 	// #4101: list a run's (and optionally its decomposition children's) concerns.
 	mux.HandleFunc("GET /v0/runs/{run_id}/concerns", s.requireRunAccount(readAccess, s.handleListRunConcerns))
 	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
