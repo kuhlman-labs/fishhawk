@@ -1,13 +1,13 @@
 id: scenario:issue-4669/role-derives-from-declared-persona-name-verified
 statement: 'The role label derives from the persona name the repository declares under reviewer_personas, with no built-in persona list: a persona named `compliance` is labelled `Compliance Reviewer`, and a name violating the workflow-v2 identifier rule is labelled `Persona Reviewer` and never echoed. Verified by running `scripts/test single -run TestReviewerRole ./backend/internal/issuecomment/` in the repository and observing it pass.'
-steps: 'Posture B in the sanctioned checkout /tmp/fishhawk-acceptance-tree-50d3144b-c509-4b5e-8488-ef77ed37ee6b-17a2c5d0-10f0-4f15-8ed2-773a499e1cf3 (HEAD 3d09fbd6, matching the target''s dev+3d09fbd6): ran scripts/test single -run TestReviewerRole ./backend/internal/issuecomment/ -v, which is go test -race.'
+steps: 'Posture B: confirmed that the sanctioned checkout /tmp/fishhawk-acceptance-tree-50d3144b-c509-4b5e-8488-ef77ed37ee6b-17a2c5d0-10f0-4f15-8ed2-773a499e1cf3 is at HEAD dcdd74ee, the same as the target /healthz git_sha dcdd74ee. Ran scripts/test single -run TestReviewerRole ./backend/internal/issuecomment/ -v there. Read reviewer_role_test.go to confirm the table rows.'
 assertions:
-    expected: The command passes.
-    observed_at_record: 'ok github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment. --- PASS: TestReviewerRole, all subtests PASS: standard_plan, standard_implement, standard_other_stage, architect, security, undeclared-here_compliance, multi-word, trailing_reviewer_word_dropped, only_word_is_reviewer (C5), doubled_reviewer, empty_words_dropped, digits_kept, mention_and_space and markdown_link (C6), upper_case, colon, space, embedded_newline, leading_digit, leading_underscore.'
-    repro_handle: scripts/test single -run TestReviewerRole ./backend/internal/issuecomment/
+    expected: The command passes, with compliance labelled Compliance Reviewer and invalid names labelled Persona Reviewer and never echoed.
+    observed_at_record: '--- PASS: TestReviewerRole, with all 20 subtests passing, then ''ok github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment''. The table pins: compliance -> ''Compliance Reviewer'' (row ''undeclared-here compliance''); a persona named ''reviewer'' -> ''Reviewer'' (C5); malformed names (mention_and_space, markdown_link, upper_case, colon, space, embedded_newline, leading_digit, leading_underscore) fall back to personaFallbackRole, which is asserted to equal ''Persona Reviewer'' (C6). The standard plan and implement rows give Plan Reviewer and PR Reviewer.'
+    repro_handle: cd /tmp/fishhawk-acceptance-tree-50d3144b-… && scripts/test single -run TestReviewerRole ./backend/internal/issuecomment/ -v
 origin:
     issue: 4669
     pr: 4671
     run_id: 50d3144b-c509-4b5e-8488-ef77ed37ee6b
-    head_sha: 3d09fbd6085d260751dc987b9c191b45fe9a64b0
-    recorded_at: 2026-10-23T00:10:39Z
+    head_sha: dcdd74eef6a12dff15167631b172c270e23564d1
+    recorded_at: 2026-10-23T01:11:19Z
