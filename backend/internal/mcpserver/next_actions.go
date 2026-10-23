@@ -109,6 +109,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
 		foldMergeCandidateStaleness(run, na)
+		foldMergeQueueYield(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -127,6 +128,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 		foldProductIssueSuggestion(run, stages, na)
 		foldMergeCandidateStaleness(run, na)
+		foldMergeQueueYield(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -154,6 +156,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
 	foldProductIssueSuggestion(run, stages, na)
 	foldMergeCandidateStaleness(run, na)
+	foldMergeQueueYield(run, na)
 	foldMergeCandidateRerunAlternative(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
@@ -212,6 +215,102 @@ func foldMergeCandidateStaleness(run *Run, na *NextActions) {
 				na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
 				return
 			}
+		}
+	}
+	na.Actions = append(na.Actions, action)
+}
+
+// mergeQueueYieldReasons is the CLOSED yield_reason vocabulary the backend
+// emits (backend/internal/server/merge_queue_yield.go). foldMergeQueueYield
+// names a reason in its prose only when it is in this set; anything else
+// renders as "an unrecognised reason", so no wire text outside the vocabulary
+// reaches next_actions.
+var mergeQueueYieldReasons = map[string]bool{
+	"forge_approval_vetoed":                         true,
+	"forge_approval_review_required":                true,
+	"forge_approval_dismissed":                      true,
+	"forge_approval_absent":                         true,
+	"forge_approval_undetermined":                   true,
+	"forge_approval_reviews_truncated":              true,
+	"forge_approval_provider_unsupported":           true,
+	"forge_approval_identity_provider_unconfigured": true,
+	"forge_review_required":                         true,
+}
+
+// foldMergeQueueYield names the operator's remedy when the run's merge-queue
+// entry YIELDED its place (ADR-112 R3/R5): the queue skips a yielded entry
+// until a re-probe finds a qualifying forge approval and clears the marker,
+// so the remedy is what makes that fold qualify. The action is keyed on the
+// closed next_step vocabulary: approve_pr → the approve_pr ritual step;
+// dismiss_review → the dismiss_review step (dismiss the blocking
+// CHANGES_REQUESTED review on the forge); retry_after → fishhawk_merge_run
+// (a re-invoke on the queued entry re-probes at once, no backoff);
+// configure_identity_provider → that named operator step. none (nothing at
+// the forge clears it) and any unknown step add NOTHING; the run payload's
+// merge_candidate_queue.note still states it.
+//
+// Untrusted text (approval condition C8): every string is built ONLY from the
+// closed next_step / yield_reason vocabulary. yield_detail (forge-derived,
+// untrusted) is NEVER interpolated, nor is any other wire string; an
+// unrecognised yield_reason renders generically.
+//
+// Placement: INSERTED immediately before the first fishhawk_merge_run when
+// the actions offer one (a plain merge re-invoke only re-probes, so the
+// remedy comes first), else APPENDED. Idempotent: an identical action
+// already present is left alone. A no-op with a nil na or run, on a terminal
+// run, or without a yielded merge_candidate_queue block.
+func foldMergeQueueYield(run *Run, na *NextActions) {
+	if na == nil || run == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	q := run.MergeCandidateQueue
+	if q == nil || q.YieldedAt == nil || q.YieldReason == "" {
+		return
+	}
+	reason := "an unrecognised reason"
+	if mergeQueueYieldReasons[q.YieldReason] {
+		reason = q.YieldReason
+	}
+	const yielded = "the run's merge-queue entry YIELDED its place (ADR-112 R3: "
+	const rejoin = "; admission skips it until a re-probe finds a qualifying forge approval at the anchored head and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	precondition := "the run's merge_candidate_queue reads yielded with next_step " + q.NextStep + " (yield_reason " + reason + ")"
+	var action SuggestedAction
+	switch q.NextStep {
+	case "approve_pr":
+		action = SuggestedAction{
+			Action: "approve_pr",
+			Params: prParams(run),
+			Reason: yielded + reason + ")" + rejoin + ". Approve the pull request at its current head (gh pr review --approve) under a write-or-higher identity the review gate admits; the approval webhook at the anchored head, a fishhawk_merge_run re-invoke or the periodic re-probe then clears the yield",
+		}
+	case "dismiss_review":
+		action = SuggestedAction{
+			Action: "dismiss_review",
+			Params: prParams(run),
+			Reason: yielded + reason + ")" + rejoin + ". A write-level CHANGES_REQUESTED review vetoes the merge: dismiss it on the forge (or have its author approve), make sure a qualifying approval stands, then re-invoke fishhawk_merge_run to re-probe at once",
+		}
+	case "retry_after":
+		action = mergeRunAction(run)
+		action.Reason = yielded + reason + ")" + rejoin + ". The forge-approval read was undetermined or truncated; re-invoking fishhawk_merge_run on the queued entry re-probes now instead of waiting for the periodic re-probe's backoff"
+	case "configure_identity_provider":
+		action = SuggestedAction{
+			Action: "configure_identity_provider",
+			Params: map[string]string{"run_id": run.ID},
+			Reason: yielded + reason + ")" + rejoin + ". The review gate's member_of needs a github identity provider and none is configured, so no approval can qualify: configure it (an operator deployment step outside the MCP surface), then re-invoke fishhawk_merge_run",
+		}
+	default:
+		return
+	}
+	action.Precondition = precondition
+	action.Consumes = consumesNone
+	for _, a := range na.Actions {
+		if a.Action == action.Action && a.Reason == action.Reason {
+			return
+		}
+	}
+	for i, a := range na.Actions {
+		if a.Action == "fishhawk_merge_run" {
+			na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
+			return
 		}
 	}
 	na.Actions = append(na.Actions, action)
