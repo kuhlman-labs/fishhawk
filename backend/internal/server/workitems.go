@@ -9,7 +9,6 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -1034,12 +1033,15 @@ func parentEpicAtChildCap(res *workmgmt.EpicChildrenResult) (full bool, count, c
 // explicit title_vars.n does not bypass it — the message says so, because "pass
 // n explicitly" is the remedy every OTHER 422 on this path names and an
 // operator would otherwise reach for it here too.
-func parentEpicFullError(filingType, epicRef string, count, childCap int) *workItemError {
+//
+// The message names the filing type's own title_format rather than assuming a
+// title shape (ADR-110 guard (i), #4626).
+func parentEpicFullError(filingType, titleFormat, epicRef string, count, childCap int) *workItemError {
 	return &workItemError{
 		status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 		msg: fmt.Sprintf(
-			"parent epic %q already carries %d of the provider's maximum %d children, so this filing's parent link would be rejected and its [E<epic>.<n>] title would duplicate an existing one; file under a successor catch-all epic, or file with a different parent_epic (an explicit title_vars.n does not bypass the link cap)",
-			epicRef, count, childCap),
+			"parent epic %q already carries %d of the provider's maximum %d children, so this filing's parent link would be rejected and its title (title_format %q) could duplicate an existing child's; file under a successor catch-all epic, or file with a different parent_epic (an explicit title_vars.n does not bypass the link cap)",
+			epicRef, count, childCap, titleFormat),
 		details: map[string]any{
 			"type":                    filingType,
 			"parent_epic_full":        true,
@@ -1094,7 +1096,7 @@ func (*Server) guardParentEpicCapacity(ctx context.Context, filing workmgmt.Fili
 		return nil
 	}
 	if full, count, childCap := parentEpicAtChildCap(res); full {
-		return parentEpicFullError(filing.Type, epicRef, count, childCap)
+		return parentEpicFullError(filing.Type, conv.Types[filing.Type].TitleFormat, epicRef, count, childCap)
 	}
 	return nil
 }
@@ -1208,25 +1210,26 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 	// the branches either side.
 	if full, count, childCap := parentEpicAtChildCap(res); full {
 		unlock()
-		return nil, true, parentEpicFullError(filing.Type, strings.TrimSpace(filing.Relations.ParentEpic), count, childCap)
+		return nil, true, parentEpicFullError(filing.Type, itemType.TitleFormat, strings.TrimSpace(filing.Relations.ParentEpic), count, childCap)
 	}
 	n, ok := workmgmt.NextChildNumber(itemType.TitleFormat, epic, res.Children)
 	if !ok {
-		// Children exist but none carry the numbered [E<epic>.<n>] form, so the
-		// next number cannot be allocated without colliding with an existing
-		// child (e.g. epic #389's placeholder [E22.X] corpus). Fail closed —
-		// mirror the EpicChildren-error branch's unlock-before-return discipline.
+		// Children exist but none carry the type's numbered title_format with
+		// this {epic}, so the next number cannot be allocated without colliding
+		// with an existing child (e.g. epic #389's placeholder-numbered corpus).
+		// Fail closed — mirror the EpicChildren-error branch's
+		// unlock-before-return discipline.
 		unlock()
 		return nil, true, &workItemError{
 			status: http.StatusUnprocessableEntity, code: "work_item_invalid",
 			msg: fmt.Sprintf(
-				"could not discover the child number for the parent epic %q: it has %d children but none carry the numbered [E%s.<n>] form; pass n explicitly",
-				filing.Relations.ParentEpic, len(res.Children), epic),
+				"could not discover the child number for the parent epic %q: it has %d children but none carry this type's numbered title_format %q with {epic}=%s; pass n explicitly",
+				filing.Relations.ParentEpic, len(res.Children), itemType.TitleFormat, epic),
 			details: map[string]any{
 				"type": filing.Type,
 				"n_discovery_failed": fmt.Sprintf(
-					"parent epic %q has %d children but none match the numbered [E%s.<n>] form",
-					filing.Relations.ParentEpic, len(res.Children), epic),
+					"parent epic %q has %d children but none match the numbered title_format %q with {epic}=%s",
+					filing.Relations.ParentEpic, len(res.Children), itemType.TitleFormat, epic),
 			},
 		}
 	}
@@ -1239,24 +1242,25 @@ func (*Server) deriveChildNumberTitleVar(ctx context.Context, filing *workmgmt.F
 	return unlock, true, nil
 }
 
-// epicTitleRE extracts the epic number from a parent epic's leading
-// `[E<digits>]` title token (the Project #7 `[EX] desc` epic title format).
-// `\d+` stops at the first non-digit, so a `[E22.X]`-style title still
-// yields "22".
-var epicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)`)
-
 // deriveEpicTitleVar auto-derives the {epic} title placeholder from the
 // parent_epic relation (#1184). When the type's title_format references
 // {epic}, parent_epic is set, title_vars omits epic, a GitHub client is
 // wired, and an installation id is available, it fetches the parent epic
-// issue and parses its leading [E<n>] token into filing.TitleVars["epic"]
+// issue and parses its title's epic number into filing.TitleVars["epic"]
 // so a child type need only supply {n}.
 //
+// The parse is DERIVED from the conventions' own epic type title_format
+// (workmgmt.EpicTitleNumber, open form, ADR-110 guard (i) #4626), so a
+// repository declaring a different epic title shape parses its own parents.
+// The open form stops at the digit run, so a parent titled like a child
+// still yields its leading number.
+//
 // It fails CLOSED on every failure mode — no client, no installation, an
-// unparseable parent ref, a GetIssue error, or a parent title with no
-// [E<n>] token — by leaving epic unset, so Apply's renderTitle returns the
-// structured missing-placeholder 422 rather than a wrong title or a crash.
-// It mutates filing in place; the caller passes a pointer.
+// unparseable parent ref, a GetIssue error, no declared epic type, or a
+// parent title that does not match the epic format — by leaving epic unset,
+// so Apply's renderTitle returns the structured missing-placeholder 422
+// rather than a wrong title or a crash. It mutates filing in place; the
+// caller passes a pointer.
 func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.FilingRequest, conv workmgmt.Conventions, scope forge.CredentialScope, owner, name string) {
 	itemType, ok := conv.Types[filing.Type]
 	if !ok || !strings.Contains(itemType.TitleFormat, "{epic}") {
@@ -1279,8 +1283,8 @@ func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.Filing
 	if err != nil {
 		return
 	}
-	m := epicTitleRE.FindStringSubmatch(issue.Title)
-	if m == nil {
+	epic, ok := workmgmt.EpicTitleNumber(conv, issue.Title, false)
+	if !ok {
 		return
 	}
 	// MANDATORY nil-map guard (#1184): allocate before assigning so a filing
@@ -1288,7 +1292,7 @@ func (s *Server) deriveEpicTitleVar(ctx context.Context, filing *workmgmt.Filing
 	if filing.TitleVars == nil {
 		filing.TitleVars = map[string]string{}
 	}
-	filing.TitleVars["epic"] = m[1]
+	filing.TitleVars["epic"] = epic
 }
 
 // areaNamespace is the label namespace derived from the parent epic (#1616).

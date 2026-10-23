@@ -2,8 +2,13 @@ package mcpserver
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"sync"
 	"testing"
 	"time"
@@ -12,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -94,6 +100,20 @@ func contractConventions(provider string) workmgmt.Conventions {
 	return conv
 }
 
+// restoreDefaultConventionsSeams puts both process-wide conventions seams back
+// to their unconfigured posture: Default() from the loader, and a resolver
+// behaving as the server's stub does over that loader (degraded, named
+// conventions_loader_unconfigured).
+func restoreDefaultConventionsSeams() {
+	server.SetConventionsLoader(func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Default(), nil
+	})
+	server.SetConventionsResolver(func(_ context.Context, repo string) (server.ConventionsResolution, error) {
+		return server.ConventionsResolution{Conventions: workmgmt.Default(), Repo: repo,
+			State: server.ConventionsStateDegraded, DegradedReason: server.ConventionsDegradedLoaderUnconfigured}, nil
+	})
+}
+
 func TestDraftEpicFileArm_ContractAgainstRealServer(t *testing.T) {
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
@@ -111,11 +131,13 @@ func TestDraftEpicFileArm_ContractAgainstRealServer(t *testing.T) {
 	server.SetConventionsLoader(func(context.Context, string) (workmgmt.Conventions, error) {
 		return contractConventions(provider.name), nil
 	})
-	t.Cleanup(func() {
-		server.SetConventionsLoader(func(context.Context, string) (workmgmt.Conventions, error) {
-			return workmgmt.Default(), nil
-		})
+	// The file arm resolves through the conventionsResolver seam (ADR-114 /
+	// #4626); install it explicitly so this test does not depend on another
+	// test's restore order.
+	server.SetConventionsResolver(func(_ context.Context, repo string) (server.ConventionsResolution, error) {
+		return server.ConventionsResolution{Conventions: contractConventions(provider.name), Repo: repo, State: server.ConventionsStateDeclared}, nil
 	})
+	t.Cleanup(restoreDefaultConventionsSeams)
 
 	// An approved two-child draft, seeded straight into the repository.
 	draft := refinement.EpicDraft{
@@ -256,5 +278,134 @@ func TestDraftEpicFileArm_ContractAgainstRealServer(t *testing.T) {
 	defer provider.mu.Unlock()
 	if provider.creates != createsBefore || provider.creates != 3 {
 		t.Errorf("provider creates = %d (before replay %d), want exactly 3 and none on the replay", provider.creates, createsBefore)
+	}
+}
+
+// contractDeclFetcher serves this repository's declaration bytes and counts
+// fetches; contractGitHubResolver resolves every repo to github.
+type contractDeclFetcher struct {
+	mu    sync.Mutex
+	body  []byte
+	calls int
+}
+
+func (f *contractDeclFetcher) FetchFile(context.Context, forge.CredentialScope, forge.RepoRef, string, string) (*forge.FileContent, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls++
+	return &forge.FileContent{Content: f.body, SHA: "sha-contract"}, nil
+}
+
+type contractGitHubResolver struct{}
+
+func (contractGitHubResolver) ResolveProvider(context.Context, string) (string, bool, error) {
+	return "github", true, nil
+}
+
+// contractDrafter returns a fixed draft, standing in for the drafting agent.
+type contractDrafter struct{ draft refinement.EpicDraft }
+
+func (d contractDrafter) Draft(context.Context, uuid.UUID, string, workmgmt.Conventions) (refinement.EpicDraft, string, error) {
+	return d.draft, "contract-model", nil
+}
+
+// TestDraftEpicContract_OpenWithRepoPersistsAndRendersGolden is the
+// cross-boundary e2e for repo-scoped refinement (ADR-114 / #4626): the MCP
+// open arm with brief + repo, through the REAL apiClient, the REAL handler and
+// a REAL Postgres refinement repo, with a REAL RepoConventionsLoader installed
+// via SetConventionsResolver over a fetcher serving this repository's
+// declaration. It asserts the persisted refinement_drafts.repo reads back, the
+// preview equals the refinement package's golden, conventions_source
+// round-trips into the MCP mirror, and a file-arm call naming a different repo
+// answers 409.
+func TestDraftEpicContract_OpenWithRepoPersistsAndRendersGolden(t *testing.T) {
+	ctx := context.Background()
+	const target = "kuhlman-labs/fishhawk"
+
+	decl, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", ".fishhawk", "work-management.yaml"))
+	if err != nil {
+		t.Fatalf("read this repository's declaration: %v", err)
+	}
+	goldenRaw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "refinement", "testdata", "repo-declaration-preview.golden.json"))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	var golden struct {
+		Draft   refinement.EpicDraft `json:"draft"`
+		Preview []map[string]any     `json:"preview"`
+	}
+	if err := json.Unmarshal(goldenRaw, &golden); err != nil {
+		t.Fatalf("decode golden: %v", err)
+	}
+
+	fetcher := &contractDeclFetcher{body: decl}
+	loader := server.NewRepoConventionsLoader(server.RepoConventionsLoaderConfig{
+		Resolver:      contractGitHubResolver{},
+		GitHubFetcher: fetcher,
+		GitHubScope: func(context.Context, string, string) (forge.CredentialScope, error) {
+			return forge.FromRef("installation:42"), nil
+		},
+	})
+	server.SetConventionsLoader(loader.Load)
+	server.SetConventionsResolver(loader.Resolve)
+	t.Cleanup(restoreDefaultConventionsSeams)
+
+	pool := pgtest.NewPool(t)
+	repo := refinement.NewPostgresRepository(pool)
+	const bearer = "fhk_draft_epic_contract_open"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:operator",
+		Scopes: []string{"write:approvals", "read:runs"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RefinementRepo: repo, AuditRepo: audit.NewPostgresRepository(pool), APITokenRepo: tokRepo,
+		RefinementDrafter: contractDrafter{draft: golden.Draft},
+	})
+	httpSrv := httptest.NewServer(s.Handler())
+	t.Cleanup(func() {
+		httpSrv.Close()
+		sctx, cancel := context.WithTimeout(context.Background(), timescale.D(10*time.Second))
+		defer cancel()
+		_ = s.Shutdown(sctx)
+	})
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+
+	_, out, err := r.draftEpic(ctx, nil, DraftEpicInput{Brief: "repo-scoped brief", Repo: target})
+	if err != nil {
+		t.Fatalf("open arm with repo: %v", err)
+	}
+	if out.Session == nil {
+		t.Fatal("open arm returned no session")
+	}
+	cs := out.Session.ConventionsSource
+	if cs == nil || cs.State != "declared" || cs.Repo != target || cs.DegradedReason != "" || cs.Fallback != "" {
+		t.Fatalf("conventions_source = %+v, want declared for %s", cs, target)
+	}
+	if !reflect.DeepEqual(out.Session.Preview, golden.Preview) {
+		got, _ := json.MarshalIndent(out.Session.Preview, "", "  ")
+		want, _ := json.MarshalIndent(golden.Preview, "", "  ")
+		t.Errorf("preview diverged from the golden:\n--- got ---\n%s\n--- want ---\n%s", got, want)
+	}
+
+	sessionID, err := uuid.Parse(out.Session.SessionID)
+	if err != nil {
+		t.Fatalf("session_id %q: %v", out.Session.SessionID, err)
+	}
+	drafts, err := repo.ListForSession(ctx, sessionID)
+	if err != nil || len(drafts) != 1 || drafts[0].Repo != target {
+		t.Fatalf("persisted drafts = %+v, %v; want one revision with repo %s", drafts, err, target)
+	}
+
+	// Approve, then file into a DIFFERENT repo: the open-time pin refuses 409.
+	if _, _, err := r.draftEpic(ctx, nil, DraftEpicInput{SessionID: sessionID.String(), Decision: "approved", Reason: "ok"}); err != nil {
+		t.Fatalf("decide: %v", err)
+	}
+	_, _, err = r.draftEpic(ctx, nil, DraftEpicInput{SessionID: sessionID.String(), Repo: "acme/other"})
+	var ae *apiError
+	if !errors.As(err, &ae) || ae.StatusCode != 409 || ae.Code != "refinement_filing_repo_mismatch" {
+		t.Fatalf("file arm into a different repo: err = %v, want 409 refinement_filing_repo_mismatch", err)
+	}
+	if _, err := repo.GetFilingSession(ctx, drafts[0].ID); !errors.Is(err, refinement.ErrNotFound) {
+		t.Errorf("GetFilingSession err = %v, want ErrNotFound (nothing launched)", err)
 	}
 }

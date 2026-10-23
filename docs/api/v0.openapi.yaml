@@ -1839,6 +1839,46 @@ components:
             The latest revision's filing progress (#4153) — where the detached
             file arm is observed. Absent when the revision has no filing session
             and no filing is in flight.
+        conventions_source:
+          allOf: [{ $ref: '#/components/schemas/RefinementConventionsSource' }]
+          description: >-
+            Which work-management conventions rendered the preview (ADR-114 /
+            #4626). Always present on a current backend.
+
+    RefinementConventionsSource:
+      type: object
+      required: [state]
+      description: >-
+        How a refinement session's (or filing's) work-management conventions
+        were resolved (ADR-110 / ADR-114, #4626). A session opened with a
+        `repo` resolves THAT repository's committed
+        `.fishhawk/work-management.yaml`; a session with no target repo uses
+        the shipped default. A resolution that could not look degrades by name
+        — never a silent default.
+      properties:
+        repo:
+          type: string
+          description: The `owner/name` whose conventions were resolved; absent for a session with no target repo.
+        state:
+          type: string
+          enum: [declared, not_declared, degraded, no_repo]
+          description: >-
+            `declared` — the repository's own declaration was fetched, parsed
+            and destination-authorized; `not_declared` — the fetch succeeded
+            and the repository commits no declaration; `degraded` — resolution
+            fell through before any fetch (`degraded_reason` names why);
+            `no_repo` — the session has no target repo.
+        degraded_reason:
+          type: string
+          enum: [provider_resolver_unconfigured, no_provider_account, repo_malformed, forge_unregistered, app_not_installed, forge_credentials_unconfigured, conventions_loader_unconfigured]
+          description: Present only when `state` is `degraded`.
+        fallback:
+          type: string
+          enum: [deployment_override, shipped_default]
+          description: >-
+            Which conventions a non-`declared` resolution carries: the
+            `FISHHAWKD_WORKMGMT_CONVENTIONS` deployment override, or the
+            shipped default. Absent when `state` is `declared`.
 
     RefinementFilingResult:
       type: object
@@ -1869,6 +1909,9 @@ components:
               url: { type: string }
         resumed: { type: boolean, description: "True when items were already recorded for the draft." }
         already_completed: { type: boolean, description: "True when replaying a fully-completed session (no writes performed)." }
+        conventions_source:
+          allOf: [{ $ref: '#/components/schemas/RefinementConventionsSource' }]
+          description: Which conventions the filing resolved for `repo` (ADR-114 / #4626); a degraded resolution names its reason.
         verified:
           type: boolean
           description: >-
@@ -22494,7 +22537,7 @@ paths:
   /v0/refinement/sessions:
     post:
       operationId: createRefinementSession
-      summary: Draft an epic/children preview from a natural-language brief
+      summary: Draft an epic/children preview from a brief, optionally for a target repo
       description: |
         Opens a refinement session (ADR-052 option A, E34.2): mints a session
         id, runs the drafting agent over the `brief`, persists the initial draft
@@ -22506,6 +22549,20 @@ paths:
         Nothing files here — the session is a draft artifact behind the E34.2
         preview + approval gate; the E34.3 filing executor is what turns an
         approved draft into provider work items.
+
+        **Repo-scoped sessions (ADR-114 / #4626).** An optional `repo`
+        (`owner/name`) scopes the session to its target repository: drafting
+        and the preview use THAT repository's declared work-management
+        conventions, the repo is persisted on every revision, and the file arm
+        refuses any other repo (`409 refinement_filing_repo_mismatch`). A
+        malformed `repo` is `400`. A non-admin cookie-session caller without
+        `read` on the repository is `403 repo_forbidden` BEFORE its declaration
+        is fetched (bearer/MCP callers are not visibility-filtered, matching
+        the file arm). The conventions are resolved BEFORE the drafter runs; a
+        resolution error is `502 refinement_conventions_unavailable` and
+        nothing is recorded. The view's `conventions_source` names how they
+        were resolved. Without `repo`, the preview uses the shipped default
+        (`state: no_repo`).
 
         Requires `write:approvals` scope. `503 refinement_drafting_unavailable`
         when no agent-backed drafter is configured; `503
@@ -22521,17 +22578,35 @@ paths:
               required: [brief]
               properties:
                 brief: { type: string, description: The natural-language brief to decompose. }
+                repo:
+                  type: string
+                  description: >-
+                    Optional target repository in `owner/name` form. Scopes the
+                    session to that repository's declared work-management
+                    conventions and pins the file arm to it (ADR-114 / #4626).
       responses:
         '201':
           description: Session created.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/RefinementSession' }
-        '400': { description: "`validation_failed` — malformed JSON or unknown fields." }
+        '400': { description: "`validation_failed` — malformed JSON, unknown fields, or a `repo` not in `owner/name` form (`details.field: repo`)." }
         '401': { $ref: '#/components/responses/Unauthorized' }
-        '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
+        '403':
+          description: |
+            `insufficient_scope` — token lacks `write:approvals`; or
+            `repo_forbidden` — a non-admin cookie-session caller does not hold
+            `read` on the named `repo` (nothing was fetched or recorded).
         '422': { description: "`validation_failed` — `brief` is empty." }
-        '502': { description: "`refinement_drafting_failed` — the drafting agent did not produce a valid draft." }
+        '502':
+          description: |
+            `refinement_drafting_failed` — the drafting agent did not produce a
+            valid draft; or `refinement_conventions_unavailable` — the named
+            `repo`'s work-management conventions could not be resolved (a fetch
+            error, an unparseable declaration, a refused destination, or a
+            provider / installation lookup fault); nothing was recorded.
+            `details` carries `{repo}` only — the cause is in the operator log,
+            keyed by `error_ref` (ADR-114 / #4626).
         '503':
           description: |
             `refinement_repo_unconfigured` — no refinement repository is wired;
@@ -22568,17 +22643,25 @@ paths:
         tokens once E44.5 stamps their account at creation, and is backstopped
         by the #2083 row-level-security policy.
 
-        **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** Once a
-        session has been FILED, it is additionally authorized against the
-        repository its filing session pinned: a non-admin cookie-session caller
+        **Conventions (ADR-114 / #4626).** The preview renders with the
+        session's target repository's work-management conventions: the
+        open-time `repo`, else the repository its filing session pinned, else
+        the shipped default (`no_repo`). `conventions_source` names the
+        resolution; a resolution error is `502
+        refinement_conventions_unavailable`.
+
+        **Repo-scoped visibility (ADR-057 Amendment A2 / #2071).** A session
+        opened with a `repo` (ADR-114 / #4626), or once FILED, is additionally
+        authorized against that repository (the open-time repo, else the one
+        its filing session pinned): a non-admin cookie-session caller
         without at least `read` on that repository at the forge is denied 403
         `repo_forbidden`. This finer repo gate is scoped to READS only: the
         draft-edit and decision endpoints below share this session load but are
         NOT gated on the mirror, because it is a non-authoritative TTL'd cache
-        of a forge read permission and a decision is an approval. A session that
-        has not yet been filed has no repository for this finer gate, but is
-        still bounded by the account gate above rather than reachable
-        workspace-wide.
+        of a forge read permission and a decision is an approval. A session
+        opened without a `repo` and not yet filed has no repository for this
+        finer gate, but is still bounded by the account gate above rather than
+        reachable workspace-wide.
 
         Requires `write:approvals` scope.
       tags: [refinement]
@@ -22600,8 +22683,17 @@ paths:
             `insufficient_scope` — token lacks `write:approvals`;
             `account_forbidden` — the session belongs to a different workspace
             account (E44.24 / #2115); or `repo_forbidden` — the caller does not
-            hold `read` on the repository this session was filed against (#2071).
+            hold `read` on the repository this session was opened for or filed
+            against (#2071, ADR-114).
         '404': { description: "`refinement_session_not_found` — no session with that id." }
+        '502':
+          description: |
+            `refinement_conventions_unavailable` — the session's target
+            repository's work-management conventions could not be resolved (a
+            fetch error, an unparseable declaration, a refused destination, or a
+            provider / installation lookup fault); nothing was recorded.
+            `details` carries `{repo}` only — the cause is in the operator log,
+            keyed by `error_ref` (ADR-114 / #4626).
         '503':
           description: |
             `refinement_repo_unconfigured`; or `service_unavailable` — repo
@@ -22625,6 +22717,12 @@ paths:
         Every successful edit writes a `refinement_draft_edited` audit entry on
         the global chain BEFORE persisting the revision (durable-before-state-
         change): an audit-append failure is a `500` and nothing is persisted.
+
+        The session's target repository's conventions (ADR-114 / #4626) are
+        resolved BEFORE the drafter, the audit append and the persist, on both
+        arms: a resolution error is `502 refinement_conventions_unavailable`
+        and nothing is recorded. The new revision carries the session's
+        open-time `repo` forward.
 
         Gated on the session's workspace account (E44.24 / #2115): a
         cross-account caller is denied 403 `account_forbidden` before the edit
@@ -22675,7 +22773,14 @@ paths:
             E34.5 / #1596): it lands `200` and surfaces as an advisory
             `criteria_precheck` `no_blocking_criterion` finding instead.
         '500': { description: "`audit_append_failed` — the edit's audit entry could not be durably recorded; nothing was persisted." }
-        '502': { description: "`refinement_drafting_failed` — the agent (brief-amendment arm) did not produce a valid draft." }
+        '502':
+          description: |
+            `refinement_drafting_failed` — the agent (brief-amendment arm) did
+            not produce a valid draft; or `refinement_conventions_unavailable` —
+            the session's target repository's work-management conventions could
+            not be resolved; nothing was recorded. `details` carries `{repo}`
+            only — the cause is in the operator log, keyed by `error_ref`
+            (ADR-114 / #4626).
         '503':
           description: |
             `refinement_repo_unconfigured`; `refinement_drafting_unavailable`
@@ -22696,6 +22801,12 @@ paths:
         is written on the global chain BEFORE the decision is persisted
         (durable-before-state-change): the audit entry IS the gate's record, so
         an audit-append failure is a `500` and no approval is recorded.
+
+        The session's target repository's conventions (ADR-114 / #4626) are
+        resolved BEFORE the audit append and the persist — approving a preview
+        that cannot be rendered would be approving it blind — so a resolution
+        error is `502 refinement_conventions_unavailable` and no decision is
+        recorded.
 
         Gated on the session's workspace account (E44.24 / #2115): a
         cross-account caller is denied 403 `account_forbidden` before the
@@ -22737,6 +22848,14 @@ paths:
         '409': { description: "`decision_already_recorded` — the latest revision already carries a decision." }
         '422': { description: "`validation_failed` — `decision` not in {approved, rejected}, or a missing/blank `reason`." }
         '500': { description: "`audit_append_failed` — the decision's audit entry could not be durably recorded; nothing was persisted." }
+        '502':
+          description: |
+            `refinement_conventions_unavailable` — the session's target
+            repository's work-management conventions could not be resolved (a
+            fetch error, an unparseable declaration, a refused destination, or a
+            provider / installation lookup fault); nothing was recorded.
+            `details` carries `{repo}` only — the cause is in the operator log,
+            keyed by `error_ref` (ADR-114 / #4626).
         '503': { description: "`refinement_repo_unconfigured`." }
 
   /v0/refinement/sessions/{session_id}/file:
@@ -22759,7 +22878,12 @@ paths:
         matches the approval hash).
 
         **Detached (#4153).** The handler checks synchronously — scope,
-        session, body, approval/drift, `repo` form, conventions, installation
+        session, body, approval/drift, `repo` form, the open-time repo pin (a
+        session opened with a `repo` files only into that repo: any other is
+        `409 refinement_filing_repo_mismatch`, ADR-114 / #4626), conventions
+        (resolved for `repo`; an error is `502
+        refinement_conventions_unavailable`, and the response's
+        `conventions_source` names the resolution), installation
         resolution, then the filing ledger: a filing session pinning a
         different repo is `409 refinement_filing_repo_mismatch`, and a fully
         completed session replays the recorded result as `200` with
@@ -22835,9 +22959,18 @@ paths:
         '401': { $ref: '#/components/responses/Unauthorized' }
         '403': { description: "`insufficient_scope` — token lacks `write:approvals`." }
         '404': { description: "`refinement_session_not_found`." }
-        '409': { description: "`refinement_not_approved` / `refinement_draft_drifted` / `refinement_filing_repo_mismatch` (the filing session, or the filing in flight, targets a different repo)." }
+        '409': { description: "`refinement_not_approved` / `refinement_draft_drifted` / `refinement_filing_repo_mismatch` (the session was opened for a different repo, or the filing session, or the filing in flight, targets a different repo; `details` `{requested_repo, pinned_repo}`)." }
         '500': { description: "`internal_error` — the filing ledger could not be read." }
-        '502': { description: "`refinement_filing_failed` — the GitHub App installation for the target repo could not be resolved. A mid-sequence filing failure is no longer a 502: it is reported on the session view's `filing` block." }
+        '502':
+          description: |
+            `refinement_filing_failed` — the GitHub App installation for the
+            target repo could not be resolved; or
+            `refinement_conventions_unavailable` — the target repo's
+            work-management conventions could not be resolved (`details`
+            carries `{repo}` only; the cause is in the operator log, keyed by
+            `error_ref`, ADR-114 / #4626). Nothing was launched. A mid-sequence
+            filing failure is no longer a 502: it is reported on the session
+            view's `filing` block.
         '503': { description: "`refinement_repo_unconfigured`." }
 
   /v0/calibration:

@@ -149,6 +149,77 @@ func TestPostgres_AccountIDRoundTrip(t *testing.T) {
 	}
 }
 
+// TestPostgres_RepoRoundTrip pins the open-time repo column (migration 0110,
+// ADR-114 / #4642): a set Repo round-trips through CreateDraft, GetDraft and
+// ListForSession across revisions, and an empty Repo is stored as SQL NULL
+// (read straight from the table, not through the adapter) and reloads as "".
+func TestPostgres_RepoRoundTrip(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := NewPostgresRepository(pool)
+	ctx := context.Background()
+
+	// Set: a repo-scoped session's revisions each carry the repo.
+	sessionID := uuid.New()
+	first, err := repo.CreateDraft(ctx, CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: validDraft(), Repo: "acme/widgets",
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft (repo-scoped): %v", err)
+	}
+	if first.Repo != "acme/widgets" {
+		t.Errorf("CreateDraft returned Repo = %q, want acme/widgets", first.Repo)
+	}
+	got, err := repo.GetDraft(ctx, first.ID)
+	if err != nil {
+		t.Fatalf("GetDraft: %v", err)
+	}
+	if got.Repo != "acme/widgets" {
+		t.Errorf("GetDraft Repo = %q, want acme/widgets (open-time repo persisted)", got.Repo)
+	}
+	if _, err := repo.CreateDraft(ctx, CreateParams{
+		SessionID: sessionID, Brief: "b", Draft: validDraft(), Origin: OriginEdit, Repo: "acme/widgets",
+	}); err != nil {
+		t.Fatalf("CreateDraft (second revision): %v", err)
+	}
+	list, err := repo.ListForSession(ctx, sessionID)
+	if err != nil {
+		t.Fatalf("ListForSession: %v", err)
+	}
+	if len(list) != 2 {
+		t.Fatalf("ListForSession = %d revisions, want 2", len(list))
+	}
+	for i, d := range list {
+		if d.Repo != "acme/widgets" {
+			t.Errorf("revision %d Repo = %q, want acme/widgets", i+1, d.Repo)
+		}
+	}
+
+	// Unset: an empty Repo persists as NULL and reloads as "".
+	unscoped, err := repo.CreateDraft(ctx, CreateParams{
+		SessionID: uuid.New(), Brief: "b", Draft: validDraft(),
+	})
+	if err != nil {
+		t.Fatalf("CreateDraft (repo-less): %v", err)
+	}
+	if unscoped.Repo != "" {
+		t.Errorf("CreateDraft repo-less returned Repo = %q, want empty", unscoped.Repo)
+	}
+	var isNull bool
+	if err := pool.QueryRow(ctx, `SELECT repo IS NULL FROM refinement_drafts WHERE id = $1`, unscoped.ID).Scan(&isNull); err != nil {
+		t.Fatalf("read raw repo column: %v", err)
+	}
+	if !isNull {
+		t.Error("repo-less draft stored a non-NULL repo; want NULL (empty maps to NULL)")
+	}
+	gotNull, err := repo.GetDraft(ctx, unscoped.ID)
+	if err != nil {
+		t.Fatalf("GetDraft (repo-less): %v", err)
+	}
+	if gotNull.Repo != "" {
+		t.Errorf("GetDraft repo-less Repo = %q, want empty (NULL reads back as no repo)", gotNull.Repo)
+	}
+}
+
 func TestPostgres_GetDraftNotFound(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := NewPostgresRepository(pool)

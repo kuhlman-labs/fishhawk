@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"fmt"
 	"log/slog"
-	"regexp"
 	"strconv"
 	"strings"
 	"sync"
@@ -113,6 +112,15 @@ type runLiveValidationPayload struct {
 // covered by the type's label_default). A missing namespace is fail-open (a WARN
 // in applyAndFileWorkItem, still files), so the value is cosmetic — it names the
 // subsystem the walk-filing machinery lives in.
+//
+// It is a FROZEN exemption of the repository-literal guard
+// (conventions_literal_guard_test.go), kept on purpose (#4626, first-officer
+// ruling): the conventions cannot express a walk-only area — a chore
+// label_defaults area would relabel EVERY chore filing, not just walks — so
+// removing it is remaining ADR-110 scope (a conventions-expressible walk label
+// default plus the repository's own declaration edit, then delete this
+// constant). TestLiveValidationWalk_RepoDeclarationKeepsAreaBackend pins that
+// this repository's walks keep area:backend on both arms meanwhile.
 const liveValidationWalkArea = "area:backend"
 
 // liveValWalkLocks serializes the intent-check → intent-append → file critical
@@ -461,13 +469,6 @@ func (s *Server) writeLiveValidationFilingFailedMarker(ctx context.Context, runR
 // cap today). See backend/internal/server/README.md.
 const githubSubIssueParentCap = 100
 
-// walkEpicTitleRE matches ONLY the bracket-CLOSED [E<n>] epic title form. It is
-// deliberately DISTINCT from workitems.go's epicTitleRE (`^\s*\[E(\d+)`), which
-// stops at the first non-digit and so ACCEPTS a CHILD title like [E48.35] —
-// exactly the mis-parenting #2179 exists to prevent. The `\]` anchor after the
-// digit run rejects a child title, so only a true epic parents the walk.
-var walkEpicTitleRE = regexp.MustCompile(`^\s*\[E(\d+)\]`)
-
 // liveValidationRollingKey is the stable per-(repo, epic) identity of the
 // ROLLING live-validation walk (#3323). It is stamped into the rolling walk's
 // body as a hidden idempotency marker (via FilingRequest.IdempotencyKey), so a
@@ -551,8 +552,12 @@ func findHighestOpenRollingCandidate(children []workmgmt.EpicChild, rollingKey s
 //	(2) a zero credential scope;
 //	(3) IssueParent errors;
 //	(4) IssueParent returns no parent (the triggering issue has no sub-issue parent);
-//	(5) the parent's title is not the bracket-closed [E<n>] epic form (e.g. it is
-//	    another child, [E48.35]) — walkEpicTitleRE, NOT the child-accepting epicTitleRE;
+//	(5) the parent's title does not match the CLOSED form of the conventions'
+//	    epic title_format (e.g. it is another child, [E48.35]) —
+//	    workmgmt.EpicTitleNumber(conv, title, true), NOT the child-accepting
+//	    open form deriveEpicTitleVar uses. The closed form requires the
+//	    format's literal after {number} (today's "]"), so a child title whose
+//	    digit run continues is rejected and only a true epic parents the walk;
 //	(6) the resolved provider is unregistered (workmgmt.Get errors) or does not
 //	    implement EpicChildrenQuerier — both degrade the same safe way;
 //	(7) the epic is resolvable but the AUTHORITATIVE child read fails, or — WHEN
@@ -591,9 +596,9 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 	if parent == nil {
 		return none // (4)
 	}
-	m := walkEpicTitleRE.FindStringSubmatch(parent.Title)
-	if m == nil {
-		return none // (5) not the bracket-closed epic form
+	epicVar, ok := workmgmt.EpicTitleNumber(conv, parent.Title, true)
+	if !ok {
+		return none // (5) not the closed epic title form
 	}
 	provider, err := workmgmt.Get(conv.Provider)
 	if err != nil {
@@ -608,7 +613,6 @@ func (s *Server) resolveWalkParentEpic(ctx context.Context, scope forge.Credenti
 		return none // (6) the chore type carries no {n} placeholder → companion
 	}
 	epicRef := "#" + strconv.Itoa(parent.Number)
-	epicVar := m[1]
 	rollingKey := liveValidationRollingKey(repoFullName, epicRef)
 	target := workmgmt.Target{
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},

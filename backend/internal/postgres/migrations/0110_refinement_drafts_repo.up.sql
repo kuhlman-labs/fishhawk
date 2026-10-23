@@ -1,0 +1,14 @@
+-- 0110: refinement_drafts.repo, the open-time target repository of a
+-- refinement session (ADR-114 / #4642, E89.25 / #4626).
+--
+-- A session opened with a target repo ("owner/name") stamps it on every draft
+-- revision, so drafting, preview, edit, decision and filing resolve THAT
+-- repository's work-management conventions, and the file arm refuses a
+-- different repo. NULL = a repo-less session, or a revision written before
+-- 0110: it previews with the shipped default until filed (the pre-0110
+-- behaviour). No backfill.
+--
+-- Additive: one nullable column. A reverted binary's sqlc queries scan a
+-- fixed column list from SELECT * / RETURNING *, so the binary must be
+-- reverted together with 0110's down migration (see the down file).
+ALTER TABLE refinement_drafts ADD COLUMN repo TEXT NULL;

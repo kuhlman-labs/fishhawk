@@ -5762,6 +5762,18 @@ type RefinementSession struct {
 	// detached file arm is observed. nil when the revision has no filing
 	// session and no filing is in flight.
 	Filing *RefinementFilingProgress `json:"filing,omitempty" jsonschema:"the latest revision's filing progress — where the detached file arm is observed; absent when nothing has been filed and no filing is in flight"`
+	// ConventionsSource names which work-management conventions rendered the
+	// preview (ADR-114 / #4626). nil only against a pre-#4626 backend.
+	ConventionsSource *refinementConventionsSource `json:"conventions_source,omitempty" jsonschema:"which work-management conventions rendered the preview: the session's target repo, the resolution state (declared, not_declared, degraded, no_repo), the degraded reason, and the fallback kind"`
+}
+
+// refinementConventionsSource mirrors the backend's conventions_source block
+// (ADR-114 / #4626) on the session view and the file-arm response.
+type refinementConventionsSource struct {
+	Repo           string `json:"repo,omitempty" jsonschema:"the owner/name whose conventions were resolved; absent for a session opened without a repo"`
+	State          string `json:"state" jsonschema:"declared (the repo's own .fishhawk/work-management.yaml), not_declared (the repo commits none; the fallback applies), degraded (the server could not look; degraded_reason names why and the fallback applies), or no_repo (the session has no target repo; the shipped default applies)"`
+	DegradedReason string `json:"degraded_reason,omitempty" jsonschema:"why resolution degraded: no_provider_account, forge_unregistered, app_not_installed, forge_credentials_unconfigured, provider_resolver_unconfigured, repo_malformed, or conventions_loader_unconfigured"`
+	Fallback       string `json:"fallback,omitempty" jsonschema:"which conventions a non-declared resolution carries: deployment_override or shipped_default"`
 }
 
 // RefinementFilingProgress mirrors the backend's RefinementFilingProgress
@@ -5820,12 +5832,16 @@ type RefinementFilingResult struct {
 	Resumed           bool                    `json:"resumed" jsonschema:"true when items were already recorded for the draft"`
 	AlreadyCompleted  bool                    `json:"already_completed" jsonschema:"true when replaying a fully-completed session (no writes performed)"`
 	Verified          bool                    `json:"verified" jsonschema:"always false on this response: verification runs inside the detached filing and is recorded in its completion audit entry"`
+	// ConventionsSource names which conventions the filing resolved (ADR-114
+	// / #4626), so a degraded filing names its reason.
+	ConventionsSource *refinementConventionsSource `json:"conventions_source,omitempty" jsonschema:"which work-management conventions the filing resolved for the target repo; a degraded resolution names its reason"`
 }
 
 // createRefinementSessionRequest mirrors the backend's POST
 // /v0/refinement/sessions body.
 type createRefinementSessionRequest struct {
 	Brief string `json:"brief"`
+	Repo  string `json:"repo,omitempty"`
 }
 
 // editRefinementDraftRequest mirrors the backend's PATCH
@@ -5851,14 +5867,19 @@ type fileRefinementSessionRequest struct {
 // CreateRefinementSession opens a refinement session over a natural-language
 // brief via `POST /v0/refinement/sessions` (E34.2, ADR-052 option A): it drafts
 // the initial epic/children revision and returns the session view. Nothing
-// files here. Requires write:approvals. 4xx/5xx surface as *apiError:
-//   - 400 validation_failed (malformed JSON / unknown fields)
-//   - 403 insufficient_scope (token lacks write:approvals)
+// files here. A non-empty repo ("owner/name") scopes the session to its target
+// repository (ADR-114 / #4626): the preview renders that repo's conventions and
+// the file arm refuses any other repo. Requires write:approvals. 4xx/5xx
+// surface as *apiError:
+//   - 400 validation_failed (malformed JSON / unknown fields / malformed repo)
+//   - 403 insufficient_scope (token lacks write:approvals) / repo_forbidden
 //   - 422 validation_failed (brief is empty)
 //   - 502 refinement_drafting_failed (the drafting agent produced no valid draft)
+//   - 502 refinement_conventions_unavailable (the repo's conventions could not
+//     be resolved; nothing was recorded)
 //   - 503 refinement_repo_unconfigured / refinement_drafting_unavailable
-func (c *apiClient) CreateRefinementSession(ctx context.Context, brief string) (*RefinementSession, error) {
-	body, err := json.Marshal(createRefinementSessionRequest{Brief: brief})
+func (c *apiClient) CreateRefinementSession(ctx context.Context, brief, repo string) (*RefinementSession, error) {
+	body, err := json.Marshal(createRefinementSessionRequest{Brief: brief, Repo: strings.TrimSpace(repo)})
 	if err != nil {
 		return nil, fmt.Errorf("marshal create-refinement-session: %w", err)
 	}

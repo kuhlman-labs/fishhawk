@@ -1225,7 +1225,7 @@ func TestRefinement_ClientRouting_AgentArmsUseLongClient(t *testing.T) {
 	ctx := context.Background()
 
 	// --- long-client arms SUCCEED (routed through httpLong) ---
-	if _, err := api.CreateRefinementSession(ctx, "build widgets"); err != nil {
+	if _, err := api.CreateRefinementSession(ctx, "build widgets", ""); err != nil {
 		t.Errorf("open arm should use the long client and tolerate the delay, got: %v", err)
 	}
 	if _, err := api.EditRefinementDraft(ctx, sid, "add a child", nil); err != nil {
@@ -1252,4 +1252,141 @@ func TestRefinement_ClientRouting_AgentArmsUseLongClient(t *testing.T) {
 	// client — briefAmendment empty, draft non-nil.
 	_, err = api.EditRefinementDraft(ctx, sid, "", &EpicDraft{})
 	assertTimeout("direct-edit", err)
+}
+
+// TestDraftEpic_OpenArm_WithRepo_SendsRepo: the open arm accepts brief + repo
+// (ADR-114 / #4626) and sends repo on the wire; brief alone sends no repo key.
+func TestDraftEpic_OpenArm_WithRepo_SendsRepo(t *testing.T) {
+	fb, srv := newRefineFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	if _, _, err := r.draftEpic(context.Background(), nil, DraftEpicInput{Brief: "build widgets", Repo: " acme/widgets "}); err != nil {
+		t.Fatalf("draftEpic open with repo: %v", err)
+	}
+	if fb.lastMethod != http.MethodPost || fb.lastPath != "/v0/refinement/sessions" {
+		t.Fatalf("wire = %s %s, want POST /v0/refinement/sessions (the open arm, not the file arm)", fb.lastMethod, fb.lastPath)
+	}
+	var reqBody map[string]any
+	_ = json.Unmarshal(fb.lastBody, &reqBody)
+	if reqBody["brief"] != "build widgets" || reqBody["repo"] != "acme/widgets" {
+		t.Errorf("request body = %v, want brief + trimmed repo acme/widgets", reqBody)
+	}
+
+	if _, _, err := r.draftEpic(context.Background(), nil, DraftEpicInput{Brief: "build widgets"}); err != nil {
+		t.Fatalf("draftEpic open: %v", err)
+	}
+	if _, present := func() (any, bool) {
+		var b map[string]any
+		_ = json.Unmarshal(fb.lastBody, &b)
+		v, ok := b["repo"]
+		return v, ok
+	}(); present {
+		t.Errorf("brief-only open sent a repo key: %s", fb.lastBody)
+	}
+}
+
+// TestDraftEpic_IllegalCombo_BriefAndSession_FailsClosedNoHTTP: brief + repo
+// is the open arm, but brief alongside session_id (with or without repo)
+// stays illegal.
+func TestDraftEpic_IllegalCombo_BriefAndSession_FailsClosedNoHTTP(t *testing.T) {
+	fb, srv := newRefineFakeBackend(t)
+	r := newResolver(srv, nil)
+
+	for _, in := range []DraftEpicInput{
+		{Brief: "x", SessionID: testSessionID},
+		{Brief: "x", SessionID: testSessionID, Repo: "acme/widgets"},
+		{Brief: "x", Repo: "acme/widgets", BriefAmendment: "y"},
+	} {
+		_, _, err := r.draftEpic(context.Background(), nil, in)
+		if err == nil || !strings.Contains(err.Error(), "can be combined only with repo") {
+			t.Errorf("input %+v: err = %v, want the open-arm combination error", in, err)
+		}
+	}
+	if fb.calls != 0 {
+		t.Errorf("backend called %d times, want 0", fb.calls)
+	}
+}
+
+// sessionWithConventions renders a session view in state carrying the given
+// conventions_source block (raw JSON; "" omits it).
+func sessionWithConventions(state, cs string) string {
+	block := ""
+	if cs != "" {
+		block = `, "conventions_source": ` + cs
+	}
+	return `{
+		"session_id": "` + testSessionID + `",
+		"state": "` + state + `",
+		"revision_count": 1,
+		"latest_origin": "brief",
+		"latest_draft": ` + string(defaultDraftJSON()) + `,
+		"preview": [],
+		"waves": [[1],[2]],
+		"criteria_precheck": {"needs_attention": false, "children": []},
+		"decisions": []` + block + `
+	}`
+}
+
+// TestDraftEpic_Guidance_ConventionsSource pins the per-state conventions
+// guidance (ADR-114 / #4626): no_repo advises opening with a repo, degraded
+// names its reason and the operator remedy, not_declared names the fallback,
+// declared adds nothing, and an approved repo-scoped session's file arm
+// pre-fills the session's repo.
+func TestDraftEpic_Guidance_ConventionsSource(t *testing.T) {
+	cases := []struct {
+		name, state, cs string
+		wantArm         string
+		wantRepoArg     string
+		wantIn, wantOut []string
+	}{
+		{"no_repo", "awaiting_approval", `{"state":"no_repo","fallback":"shipped_default"}`, "decide", "",
+			[]string{"no target repo", "brief + repo"}, nil},
+		{"degraded", "awaiting_approval", `{"repo":"acme/w","state":"degraded","degraded_reason":"app_not_installed","fallback":"shipped_default"}`, "decide", "",
+			[]string{"app_not_installed", "install the GitHub App", "NOT acme/w's own"}, nil},
+		{"degraded_override", "rejected", `{"repo":"acme/w","state":"degraded","degraded_reason":"no_provider_account","fallback":"deployment_override"}`, "edit", "",
+			[]string{"no_provider_account", "accounts provider row", "deployment-override"}, nil},
+		{"degraded_unknown_reason", "awaiting_approval", `{"repo":"acme/w","state":"degraded","degraded_reason":"something_new","fallback":"shipped_default"}`, "decide", "",
+			[]string{"something_new", "fix the named cause"}, nil},
+		{"not_declared", "awaiting_approval", `{"repo":"acme/w","state":"not_declared","fallback":"shipped_default"}`, "decide", "",
+			[]string{"declares no .fishhawk/work-management.yaml"}, nil},
+		{"declared", "awaiting_approval", `{"repo":"acme/w","state":"declared"}`, "decide", "",
+			nil, []string{"Note:"}},
+		{"absent_block", "awaiting_approval", "", "decide", "", nil, []string{"Note:"}},
+		{"approved_prefills_repo", "approved", `{"repo":"acme/w","state":"declared"}`, "file", "acme/w",
+			[]string{"scoped to"}, []string{"Note:"}},
+		{"approved_no_repo", "approved", `{"state":"no_repo","fallback":"shipped_default"}`, "file", "owner/name",
+			[]string{"no target repo"}, nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newRefineFakeBackend(t)
+			fb.overrideStatus = http.StatusOK
+			fb.overrideBody = sessionWithConventions(tc.state, tc.cs)
+			r := newResolver(srv, nil)
+			_, out, err := r.draftEpic(context.Background(), nil, DraftEpicInput{SessionID: testSessionID})
+			if err != nil {
+				t.Fatalf("preview: %v", err)
+			}
+			if tc.cs != "" && (out.Session.ConventionsSource == nil || out.Session.ConventionsSource.State == "") {
+				t.Fatalf("conventions_source did not decode: %+v", out.Session.ConventionsSource)
+			}
+			if len(out.SessionGuidance) == 0 || out.SessionGuidance[0].Arm != tc.wantArm {
+				t.Fatalf("guidance = %+v, want first arm %s", out.SessionGuidance, tc.wantArm)
+			}
+			g := out.SessionGuidance[0]
+			if tc.wantRepoArg != "" && g.Arguments["repo"] != tc.wantRepoArg {
+				t.Errorf("file arm repo argument = %q, want %q", g.Arguments["repo"], tc.wantRepoArg)
+			}
+			for _, w := range tc.wantIn {
+				if !strings.Contains(g.Reason, w) {
+					t.Errorf("reason %q missing %q", g.Reason, w)
+				}
+			}
+			for _, w := range tc.wantOut {
+				if strings.Contains(g.Reason, w) {
+					t.Errorf("reason %q unexpectedly carries %q", g.Reason, w)
+				}
+			}
+		})
+	}
 }

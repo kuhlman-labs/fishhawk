@@ -5,8 +5,8 @@
 -- revision + its content hash (E34.2's gate record).
 
 -- name: CreateRefinementDraft :one
-INSERT INTO refinement_drafts (id, session_id, brief, draft, model, origin, account_id)
-VALUES ($1, $2, $3, $4, $5, $6, $7)
+INSERT INTO refinement_drafts (id, session_id, brief, draft, model, origin, account_id, repo)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
 RETURNING *;
 
 -- name: GetRefinementDraft :one

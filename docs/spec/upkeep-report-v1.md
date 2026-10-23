@@ -392,8 +392,10 @@ on its own line, and is stamped with an idempotency key minted from
 disposition's `parent_epic` override, else the proposal's, normalized to `#N`.
 Its labels are the proposal's minus every `autonomy:*` label unless
 `authorize_delegation_tier` is true, and for an `advisory` finding minus every
-label outside the `area:`, `type:` and `phase:` namespaces (an authorized
-`autonomy:*` label included); `applied_labels` are the labels actually filed
+label outside the label namespaces the filing type's resolved work-management
+conventions declare, `autonomy` excluded (a type declaring none takes the
+namespaces every declared type names; an undeclared type keeps no label; an
+authorized `autonomy:*` label is stripped too); `applied_labels` are the labels actually filed
 (after the conventions' label completeness), `stripped_labels` the removed
 ones.
 

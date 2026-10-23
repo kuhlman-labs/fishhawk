@@ -55,6 +55,13 @@ type CreateParams struct {
 	// MCP caller (no Identity.AccountID until E44.5) or an anonymous caller
 	// stamps NULL, which stays reachable under the NULL-allow window.
 	AccountID *uuid.UUID
+	// Repo is the session's open-time target repository ("owner/name",
+	// ADR-114 / #4642), or "" for a repo-less session; the adapter stores ""
+	// as NULL. Every revision of a repo-scoped session carries it forward, so
+	// drafting, preview, edit, decision and filing resolve THAT repository's
+	// work-management conventions and the file arm can refuse a different
+	// repo.
+	Repo string
 }
 
 // StoredDraft is a persisted refinement draft with its decoded EpicDraft. It
@@ -74,6 +81,10 @@ type StoredDraft struct {
 	// — so the handler's account-ownership gate compares it exactly as
 	// enforceAccount compares a run's owner.
 	AccountID string
+	// Repo is the session's open-time target repository (ADR-114 / #4642), or
+	// "" when the repo column is NULL (a repo-less session, or a revision
+	// written before migration 0110).
+	Repo string
 }
 
 // Decision is an append-only approve/reject verdict on ONE draft revision. It

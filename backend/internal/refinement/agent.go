@@ -22,18 +22,18 @@ type Inferencer interface {
 }
 
 // Drafter turns a natural-language brief into a validated EpicDraft via an
-// Inferencer. It carries the repo's work-management conventions so the prompt
-// can enumerate the label namespaces each filed child will require (feature
-// items need area:* and autonomy:*), steering the agent to emit
+// Inferencer. It binds NO work-management conventions: each Draft call takes
+// the conventions the caller resolved for the session's target repository
+// (ADR-110 / ADR-114, #4626), so the prompt enumerates the label namespaces
+// THAT repository's filed children will require and steers the agent to emit
 // conventions-complete labels.
 type Drafter struct {
-	inferencer  Inferencer
-	conventions workmgmt.Conventions
+	inferencer Inferencer
 }
 
-// NewDrafter constructs a Drafter over the given Inferencer and conventions.
-func NewDrafter(inf Inferencer, conv workmgmt.Conventions) *Drafter {
-	return &Drafter{inferencer: inf, conventions: conv}
+// NewDrafter constructs a Drafter over the given Inferencer.
+func NewDrafter(inf Inferencer) *Drafter {
+	return &Drafter{inferencer: inf}
 }
 
 // Draft runs the drafting agent for a brief and returns the validated
@@ -45,10 +45,13 @@ func NewDrafter(inf Inferencer, conv workmgmt.Conventions) *Drafter {
 //
 // The sessionID identifies the refinement session the draft belongs to; it is
 // threaded through to persistence by the caller, not used to shape the prompt.
-func (d *Drafter) Draft(ctx context.Context, sessionID uuid.UUID, brief string) (EpicDraft, string, error) {
+// conv is the session's resolved conventions (the target repository's
+// declaration, or the named fallback); only its feature type's required label
+// namespaces reach the prompt.
+func (d *Drafter) Draft(ctx context.Context, sessionID uuid.UUID, brief string, conv workmgmt.Conventions) (EpicDraft, string, error) {
 	_ = sessionID // the caller keys persistence on this; the prompt does not use it.
 
-	resp, model, _, err := d.inferencer.Inference(ctx, d.buildPrompt(brief))
+	resp, model, _, err := d.inferencer.Inference(ctx, buildPrompt(brief, conv))
 	if err != nil {
 		return EpicDraft{}, "", fmt.Errorf("refinement: inference: %w", err)
 	}
@@ -111,7 +114,7 @@ const draftSchema = `{
 // schema and the prose, demand exactly one JSON object with no extra fields and
 // no surrounding prose, so the closed-set decode has the best chance of a
 // first-pass parse.
-func (d *Drafter) buildPrompt(brief string) string {
+func buildPrompt(brief string, conv workmgmt.Conventions) string {
 	var b strings.Builder
 	b.WriteString("You are a work-decomposition drafting agent for the Fishhawk work tracker.\n")
 	b.WriteString("Turn the brief below into a structured epic-with-children draft.\n\n")
@@ -136,7 +139,7 @@ func (d *Drafter) buildPrompt(brief string) string {
 	b.WriteString("  - done_means: string — the completion criterion in prose.\n")
 	b.WriteString("  - acceptance_criteria: array of strings — at least one concrete, checkable criterion.\n")
 	b.WriteString("  - labels: array of strings — classification labels.")
-	if ns := d.childRequiredNamespaces(); len(ns) > 0 {
+	if ns := childRequiredNamespaces(conv); len(ns) > 0 {
 		b.WriteString(" Include a label in each of these namespaces: ")
 		b.WriteString(strings.Join(ns, ", "))
 		b.WriteString(" (e.g. area:backend, autonomy:medium).")
@@ -148,11 +151,12 @@ func (d *Drafter) buildPrompt(brief string) string {
 }
 
 // childRequiredNamespaces returns the label namespaces a filed child (rendered
-// as the feature type) is expected to carry, drawn from the conventions so the
-// prompt steers the agent to conventions-complete labels. Returns nil when the
-// conventions declare no feature type or no required namespaces.
-func (d *Drafter) childRequiredNamespaces() []string {
-	ft, ok := d.conventions.Types["feature"]
+// as the feature type) is expected to carry, drawn from the per-call
+// conventions so the prompt steers the agent to conventions-complete labels.
+// Returns nil when the conventions declare no feature type or no required
+// namespaces.
+func childRequiredNamespaces(conv workmgmt.Conventions) []string {
+	ft, ok := conv.Types["feature"]
 	if !ok {
 		return nil
 	}

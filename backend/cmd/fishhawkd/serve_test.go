@@ -61,6 +61,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/precedent"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pushnotify"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repoacl"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/reviewresolver"
@@ -1802,6 +1803,12 @@ func TestResolveRefinementDrafter(t *testing.T) {
 		if d == nil {
 			t.Fatal("resolveRefinementDrafter returned nil with the local claude adapter enabled")
 		}
+		// The drafter binds no conventions at startup (ADR-110 / ADR-114,
+		// #4626): it is a bare *refinement.Drafter whose Draft takes the
+		// session's resolved conventions per call.
+		if _, ok := d.(*refinement.Drafter); !ok {
+			t.Fatalf("resolveRefinementDrafter = %T, want *refinement.Drafter", d)
+		}
 	})
 
 	t.Run("nil when unconfigured", func(t *testing.T) {
@@ -2566,6 +2573,21 @@ func TestBuildRepoConventionsLoader_OverrideAsFallback(t *testing.T) {
 	}
 	if conv.Provider != workmgmt.Default().Provider {
 		t.Errorf("Provider = %q, want the Default() provider %q", conv.Provider, workmgmt.Default().Provider)
+	}
+
+	// The same loader's Resolve (installed as the conventionsResolver seam,
+	// ADR-114 / #4626) names the nil-resolver fall-through and the fallback
+	// kind instead of returning a silent default.
+	res, err := loader.Resolve(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("Resolve err = %v, want nil", err)
+	}
+	if res.State != server.ConventionsStateDegraded || res.DegradedReason != server.ConventionsDegradedProviderResolverUnconfigured || res.Fallback != server.ConventionsFallbackDeploymentOverride {
+		t.Errorf("Resolve = {state %q, reason %q, fallback %q}, want {degraded, provider_resolver_unconfigured, deployment_override}",
+			res.State, res.DegradedReason, res.Fallback)
+	}
+	if res, err = noOverride.Resolve(context.Background(), "acme/widgets"); err != nil || res.Fallback != server.ConventionsFallbackShippedDefault {
+		t.Errorf("Resolve (no override) = {fallback %q}, %v, want shipped_default, nil", res.Fallback, err)
 	}
 }
 
