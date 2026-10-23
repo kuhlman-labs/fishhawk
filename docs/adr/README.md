@@ -7,6 +7,29 @@ corrects, so a path or option named in a body is kept as named even if it has
 since moved. Enforced by `scripts/check-adr` in `scripts/test verify` (gate
 contract: `scripts/README.md` § "ADR record gate").
 
+## When a change needs an ADR
+
+Drafted by the first officer at the Captain's direction (2026-10-23); it is the Captain's to accept in the PR that adds it. A change needs an ADR (filed with `fishhawk_file_issue` type `adr`, ratified by the Captain under ADR-113) when ANY of these holds. Otherwise an ordinary issue is enough.
+
+1. **Boundary.** It creates or changes a component boundary, a persistence shape (a new table, state or state machine), a protocol or wire contract (a REST, MCP or cross-module shape), or a trust or authorization boundary. These are the `new_architectural_decision` triggers of `docs/spec/plan-standard-v1.schema.json`.
+2. **A ratified ADR.** It contradicts, reverses or departs from a ratified ADR, or a plan condition would fill a gap in one. A plan gate brings such a condition to the first officer BEFORE approval, and only the Captain ratifies its resolution.
+3. **Cross-cutting policy.** It sets a rule that governs many future changes. Examples: stage parallelism (ADR-115), review measurement (ADR-117, ADR-118), repository-agnostic design (ADR-110).
+4. **Safety posture.** It changes the merge path, approvals, the dispatch ledger, credentials or another security control, or it is hard to reverse.
+5. **A real choice.** Several viable options with material trade-offs, where the choice belongs to the Captain.
+6. **Product behaviour.** It changes how Fishhawk behaves for every repository, not just this one (ADR-110).
+
+**An issue is enough** for:
+- implementation inside existing decisions, including the children of an epic that implements an ADR;
+- a bug fix that restores intended behaviour;
+- tests, documentation, refactors and follow-ups.
+
+**Which form an ADR takes:**
+- **An in-body amendment** (an "Amendment A<n>" section added to the ratified ADR's tracker body, then re-transcribed) clarifies or narrows that ADR's own rules. Examples: ADR-112 A1, ADR-114 A1.
+- **A new ADR that `amends`** adds a decision of its own within another ADR's area. Examples: ADR-116, ADR-118, ADR-119, ADR-120.
+- **`supersedes`** is for a FULL replacement only. A partial replacement is an amendment, or a clarifying line on the old record (see the status rule).
+
+**Titles** are at most 100 characters from ADR-119 onward (`C-title-length`).
+
 ## Record layout
 
 ```
