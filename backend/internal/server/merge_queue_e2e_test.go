@@ -994,3 +994,68 @@ func TestMergeQueueE2E_InlineUncertainErrorButMergedKeepsClaimDispatched(t *test
 		t.Fatalf("merge_dispatch_settled rows = %d, want 0", n)
 	}
 }
+
+// TestMergeQueueE2E_RedPassDelegatedFixupReentersAtTail is ADR-093 slice 3's
+// cross-layer walk (D4, E87.6 / #4297): the merge-candidate verdict upload
+// (succeedMergeCandidateVerifiedStage) for a LIVE intent-bearing entry A
+// ahead of held B and C, the real Postgres queue and audit chain, the ADR-090
+// D6 route under a delegated workflow, the merge_queue_ejected row, a
+// fixup_pushed row with a moved PR head on the forge fake, the re-entry sweep,
+// and the per-base queue read over HTTP. A is ejected verify_failed; B is
+// admitted live in the same pump (the line is not wedged); A re-enters with
+// merge intent at the TAIL behind C, under the SYSTEM actor (security c),
+// its entry naming the re-entry row's sequence.
+func TestMergeQueueE2E_RedPassDelegatedFixupReentersAtTail(t *testing.T) {
+	w := newMQMWorld(t)
+	ctx := context.Background()
+	a, b := w.waveSpec(mcvDelegatedV0SpecYAML)
+	intent := w.mqeIntent(a, "a1")
+	if _, err := w.store.MarkMergeIntent(ctx, w.entry(a).ID, &mergequeue.MergeIntentRequest{IntentSequence: intent.Sequence}); err != nil {
+		t.Fatalf("mark intent: %v", err)
+	}
+	c := w.seed("c", "c0", []byte(mcvDelegatedV0SpecYAML))
+	w.enqueueDirect(c, "c0")
+
+	resp := w.shipVerdict(a, "a1", mergeCandidateResultFailed)
+	if !resp.FixupRouted {
+		t.Fatalf("routed = false (refusal %q), want the D6 fix-up routed", resp.FixupRefusal)
+	}
+	ej := w.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+	w.requireState(b, mergequeue.StateLive, "")
+	if p := w.oneEjection(a, mergeCandidateQueueReasonVerifyFailed, mergeQueueEjectNextAwaitDelegatedFixup); p["merge_intent"] != true {
+		t.Fatalf("ejection = %v, want merge intent", p)
+	}
+	if n := len(w.rows(a, CategoryStageFixupTriggered)); n != 1 {
+		t.Fatalf("stage_fixup_triggered rows = %d, want 1", n)
+	}
+	ejected, found, err := w.store.LatestForRun(ctx, a.id)
+	if err != nil || !found || ejected.ID != ej.ID || ejected.MergeIntentSequence != intent.Sequence {
+		t.Fatalf("latest = %+v %v %v, want the ejected intent row", ejected, found, err)
+	}
+
+	// Before the fix-up pushes, the sweep leaves A out.
+	w.exec(`UPDATE merge_candidate_queue_entries SET settled_at = settled_at - interval '10 minutes' WHERE id = $1`, ej.ID)
+	w.setStage(a.impl.ID, run.StageStateSucceeded)
+	if n := w.sweep(0); n != 0 {
+		t.Fatalf("re-entered = %d before the fix-up pushed, want 0", n)
+	}
+	// The delegated fix-up pushes a2 and its stage settles.
+	w.rentPush(a, "a2")
+	if n := w.sweep(0); n != 1 {
+		t.Fatalf("re-entered = %d after the fix-up pushed, want 1", n)
+	}
+	st, _ := w.requireReentered(a, ejected, "a2")
+
+	q := decodeMergeQueue(t, getMergeQueue(t, w.srv, "base_ref="+mcqBase, mqrOperator("")))
+	if len(q.Bases) != 1 {
+		t.Fatalf("bases = %+v, want one", q.Bases)
+	}
+	es := q.Bases[0].Entries
+	if len(es) != 3 || es[0].RunID != b.id.String() || es[0].State != string(mergequeue.StateLive) ||
+		es[1].RunID != c.id.String() || es[2].RunID != a.id.String() {
+		t.Fatalf("queue = %+v, want B live, then C, then the re-entered A at the tail", es)
+	}
+	if es[2].EntryID != st.Entry.ID.String() || !es[2].MergeIntent || es[2].Position != 2 || es[2].AnchoredHeadSHA != "a2" {
+		t.Fatalf("re-entered A = %+v, want the fresh entry with merge intent at position 2 behind C, anchored a2", es[2])
+	}
+}
