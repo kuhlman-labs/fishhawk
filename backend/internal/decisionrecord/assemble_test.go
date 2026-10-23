@@ -788,11 +788,32 @@ func TestAssemble_ShippedIndex_HeadroomFloor(t *testing.T) {
 	}
 }
 
+// TestMinHeadroomLinesIsTen pins the floor's VALUE (#4699 AC4): the shipped
+// rendering must keep 10 lines of its largest rendered line free under the
+// cap. TestAssemble_ShippedIndex_HeadroomFloor passes for any lower floor, so
+// without this a lowered constant would silently weaken the early warning.
+func TestMinHeadroomLinesIsTen(t *testing.T) {
+	if minHeadroomLines != 10 {
+		t.Errorf("minHeadroomLines = %d, want 10: #4699 AC4 sets the headroom floor at 10 lines at the largest rendered line; changing it is an operator decision", minHeadroomLines)
+	}
+}
+
 // TestAssemble_HeadroomFloor_IsCaught is the permanent RED proof of
-// TestAssemble_ShippedIndex_HeadroomFloor's check (#4699): on the same shipped
-// rendering a floor of exactly the lines available passes (the boundary), and
-// one line more fails with the #4699 tiering remedy and the measured numbers.
+// TestAssemble_ShippedIndex_HeadroomFloor's check (#4699). A synthetic
+// rendering whose headroom is EXACTLY minLines times its largest line pins the
+// inclusive comparison (nil at the cap, an error one byte under it). On the
+// shipped rendering the largest floor that fits (headroom / largest lines)
+// passes, and one line more fails with the #4699 tiering remedy and the
+// measured numbers.
 func TestAssemble_HeadroomFloor_IsCaught(t *testing.T) {
+	// One 10-byte line; a 110-byte cap leaves exactly 10 x 10 bytes.
+	exact := strings.Repeat("x", 9) + "\n"
+	if err := headroomFloorError(exact, len(exact)+10*len(exact), 10); err != nil {
+		t.Errorf("headroom exactly 10 x the largest line: headroomFloorError = %v, want nil (the comparison is inclusive)", err)
+	}
+	if err := headroomFloorError(exact, len(exact)+10*len(exact)-1, 10); err == nil {
+		t.Errorf("headroom one byte under 10 x the largest line: headroomFloorError = nil, want an error")
+	}
 	sel := shippedSelection(t)
 	rendering := sel.Index.Content
 	largest := largestLine(rendering)
@@ -803,7 +824,7 @@ func TestAssemble_HeadroomFloor_IsCaught(t *testing.T) {
 	available := headroom / largest
 	t.Logf("shipped rendering %d bytes, headroom %d bytes, largest line %d bytes: %d lines available", len(rendering), headroom, largest, available)
 	if err := headroomFloorError(rendering, repodoc.DefaultMaxBytes, available); err != nil {
-		t.Errorf("floor = %d lines available: headroomFloorError = %v, want nil (the boundary)", available, err)
+		t.Errorf("floor = %d lines available: headroomFloorError = %v, want nil (the largest floor that fits)", available, err)
 	}
 	err := headroomFloorError(rendering, repodoc.DefaultMaxBytes, available+1)
 	if err == nil {
