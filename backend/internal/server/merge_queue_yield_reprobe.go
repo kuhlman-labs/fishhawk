@@ -13,6 +13,10 @@ package server
 //     ONE row per base, the oldest due one, is RE-PROBED on an exponential
 //     schedule over its yielded_at age (yieldReprobeDue), judged over the
 //     time since this process's previous sweep.
+//   - The same tick then runs the ADR-093 D4 automatic re-entry sweep
+//     (sweepMergeQueueReentries, merge_queue_reentry.go), which re-enters an
+//     ejected red pass at the tail once its delegated fix-up has pushed and
+//     the run is eligible again, on the same yieldReprobeDue schedule.
 //   - ReprobeMergeQueueYield is the targeted, no-backoff re-probe by run id
 //     (the merge_run re-invoke, which FORCES one re-attempt, and the approval
 //     webhook, which does not, slice 4).
@@ -118,20 +122,24 @@ func (s *Server) yieldSweepSince(now time.Time) time.Duration {
 }
 
 // RunMergeQueueYieldReprobe sweeps every active base on every interval tick
-// (sweepMergeQueueYields), returning when ctx is cancelled. It joins
-// bgMergeQueuePump, so Server.Shutdown drains it; the boot-window residual is
-// RunMergeCandidateQueuePump's.
+// (sweepMergeQueueYields), then runs the ADR-093 D4 automatic re-entry sweep
+// (sweepMergeQueueReentries, merge_queue_reentry.go) on its own
+// process-local previous-sweep clock, returning when ctx is cancelled. It
+// joins bgMergeQueuePump, so Server.Shutdown drains it; the boot-window
+// residual is RunMergeCandidateQueuePump's.
 func (s *Server) RunMergeQueueYieldReprobe(ctx context.Context, interval time.Duration) {
 	s.bgMergeQueuePump.Add(1)
 	defer s.bgMergeQueuePump.Done()
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
+	var reentry mergeQueueReentryClock
 	for {
 		select {
 		case <-ctx.Done():
 			return
 		case <-ticker.C:
 			s.sweepMergeQueueYields(ctx, interval)
+			s.sweepMergeQueueReentries(ctx, interval, reentry.since(time.Now()))
 		}
 	}
 }
