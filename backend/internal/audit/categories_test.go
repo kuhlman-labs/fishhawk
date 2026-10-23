@@ -850,3 +850,16 @@ func TestKnownCategories_MergeOverlapOverridden(t *testing.T) {
 		t.Fatal("merge_overlap_overridden is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_MergeQueueYield pins the E89.28 / #4632 (ADR-112 R3/R5)
+// registrations: merge-on-pass, admission and merge_run append
+// merge_queue_yielded (server/merge_queue_yield.go), and the yield re-probe
+// appends merge_queue_yield_posted and merge_queue_yield_cleared; a
+// fishhawk_await_audit wait armed on any of them must not be refused.
+func TestKnownCategories_MergeQueueYield(t *testing.T) {
+	for _, c := range []string{"merge_queue_yielded", "merge_queue_yield_posted", "merge_queue_yield_cleared"} {
+		if !IsKnownCategory(c) {
+			t.Fatalf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
+	}
+}
