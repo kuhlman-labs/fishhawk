@@ -786,6 +786,11 @@ func TestStore_CanceledContextFailsAndWritesNothing(t *testing.T) {
 			return err
 		},
 		"RecentLineTurns": func() error { _, err := f.store.RecentLineTurns(ctx, mainBase(), 1); return err },
+		"AdmitNextReclaiming": func() error {
+			_, err := f.store.AdmitNextReclaiming(ctx, ReclaimRequest{Base: mainBase(), AdmittedBefore: f.databaseNow(),
+				Record: func(context.Context, pgx.Tx, Entry) error { return nil }})
+			return err
+		},
 	} {
 		if err := call(); !errors.Is(err, context.Canceled) {
 			t.Errorf("%s err = %v, want context.Canceled", name, err)
@@ -2988,5 +2993,364 @@ func TestReentryCandidates_KeysetCursorPages(t *testing.T) {
 	}
 	if ReentryCursorAt(Entry{ID: a}) != nil {
 		t.Fatal("ReentryCursorAt(unsettled) != nil")
+	}
+}
+
+// --- ADR-093 D8: the restart resume's store seam (#4298) ---
+
+// databaseNow reads the database clock through the store.
+func (f *fixture) databaseNow() time.Time {
+	f.t.Helper()
+	now, err := f.store.DatabaseNow(context.Background())
+	if err != nil || now.IsZero() {
+		f.t.Fatalf("DatabaseNow = %v, %v; want a database instant", now, err)
+	}
+	return now
+}
+
+// setAdmittedAt moves a live row's admitted_at to `offset` from at, an
+// instant READ from the database (never a Go clock).
+func (f *fixture) setAdmittedAt(id uuid.UUID, at time.Time, offset time.Duration) {
+	f.t.Helper()
+	f.exec(`UPDATE merge_candidate_queue_entries SET admitted_at = $2::timestamptz + make_interval(secs => $3::float8) WHERE id = $1`,
+		id, at, offset.Seconds())
+}
+
+// backdateStale moves a live row's admitted_at past AdmissionStaleAfter on the
+// database clock.
+func (f *fixture) backdateStale(id uuid.UUID) {
+	f.t.Helper()
+	f.exec(`UPDATE merge_candidate_queue_entries SET admitted_at = clock_timestamp() - make_interval(secs => $2::float8) WHERE id = $1`,
+		id, (AdmissionStaleAfter + time.Minute).Seconds())
+}
+
+// reclaimRecorder is a ReclaimRecordFunc that counts its calls, keeps the
+// entries it was handed, reads the row's epoch INSIDE the call's transaction
+// and on the pool (the committed value), and fails with err when set.
+type reclaimRecorder struct {
+	pool      *pgxpool.Pool
+	err       error
+	calls     []Entry
+	txEpoch   []int64
+	poolEpoch []int64
+}
+
+func (r *reclaimRecorder) record(ctx context.Context, tx pgx.Tx, e Entry) error {
+	r.calls = append(r.calls, e)
+	var inTx, committed int64
+	if err := tx.QueryRow(ctx, `SELECT admission_epoch FROM merge_candidate_queue_entries WHERE id = $1`, e.ID).Scan(&inTx); err != nil {
+		return err
+	}
+	if err := r.pool.QueryRow(ctx, `SELECT admission_epoch FROM merge_candidate_queue_entries WHERE id = $1`, e.ID).Scan(&committed); err != nil {
+		return err
+	}
+	r.txEpoch, r.poolEpoch = append(r.txEpoch, inTx), append(r.poolEpoch, committed)
+	return r.err
+}
+
+func (f *fixture) reclaiming(base Base, before time.Time, rec *reclaimRecorder) Admission {
+	f.t.Helper()
+	adm, err := f.store.AdmitNextReclaiming(context.Background(), ReclaimRequest{Base: base, AdmittedBefore: before, Record: rec.record})
+	if err != nil {
+		f.t.Fatalf("AdmitNextReclaiming: %v", err)
+	}
+	return adm
+}
+
+// TestAdmitNext_StaleReclaimCoversAdvancing (counterfactual A1): a live entry
+// backdated past AdmissionStaleAfter in phase advancing is re-claimed (epoch
+// +1, read back) exactly like phase admitted; the same backdate in verifying,
+// unverified, passed, merging or settling is never re-claimed.
+func TestAdmitNext_StaleReclaimCoversAdvancing(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	if _, err := f.store.SetPhase(ctx, e.ID, epoch, PhaseAdvancing); err != nil {
+		t.Fatalf("SetPhase(advancing): %v", err)
+	}
+	f.backdateStale(e.ID)
+	adm := f.admitNext(mainBase())
+	if !adm.Admitted || !adm.Readmitted || adm.Entry.ID != e.ID {
+		t.Fatalf("stale advancing AdmitNext = %+v, want re-claimed", adm)
+	}
+	got := f.entry(e.ID)
+	if got.AdmissionEpoch != epoch+1 || got.Phase != PhaseAdvancing || got.State != StateLive {
+		t.Fatalf("re-claimed advancing entry = epoch %d phase %q state %s, want epoch %d, phase advancing kept, live",
+			got.AdmissionEpoch, got.Phase, got.State, epoch+1)
+	}
+	epoch = got.AdmissionEpoch
+	for _, ph := range []Phase{PhaseVerifying, PhaseUnverified, PhasePassed, PhaseMerging, PhaseSettling} {
+		if _, err := f.store.SetPhase(ctx, e.ID, epoch, ph); err != nil {
+			t.Fatalf("SetPhase(%s): %v", ph, err)
+		}
+		f.backdateStale(e.ID)
+		if adm := f.admitNext(mainBase()); adm.Admitted || adm.Readmitted || adm.Entry == nil || adm.Entry.ID != e.ID {
+			t.Errorf("stale %s AdmitNext = %+v, want no re-claim (the live entry returned)", ph, adm)
+		}
+		if got := f.entry(e.ID); got.AdmissionEpoch != epoch {
+			t.Errorf("stale %s entry epoch = %d, want %d unchanged", ph, got.AdmissionEpoch, epoch)
+		}
+	}
+}
+
+// TestAdmitNextReclaiming_BootInstant (counterfactuals A2, A3): a live entry
+// admitted 1 s before the boot instant and NOT stale is re-claimed and
+// recorded once; one admitted after it is untouched and unrecorded; no other
+// phase is ever re-claimed before the instant; a stale entry admitted after
+// the instant is re-claimed AND recorded; an empty live slot admits the first
+// held row like AdmitNext without a record; and the request is validated
+// before any SQL, with nothing written.
+func TestAdmitNextReclaiming_BootInstant(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+
+	// Empty live slot: admits the first held row like AdmitNext, no record.
+	a := f.enqueue(f.run(), "main", "h1").Entry
+	f.enqueue(f.run(), "main", "x1")
+	rec := &reclaimRecorder{pool: f.pool}
+	adm := f.reclaiming(mainBase(), f.databaseNow(), rec)
+	if !adm.Admitted || adm.Readmitted || adm.Entry.ID != a.ID || adm.Entry.Phase != PhaseAdmitted || adm.Entry.AdmissionEpoch != 1 {
+		t.Fatalf("empty-slot AdmitNextReclaiming = %+v, want A admitted (not readmitted) at epoch 1", adm)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("an admission of a held row called Record %d times, want 0", len(rec.calls))
+	}
+
+	// Admitted AFTER the instant (captured first): untouched, unrecorded.
+	b2 := f.enqueue(f.run(), "release", "r1").Entry
+	release := Base{Repo: testRepo, BaseRef: "release"}
+	bootAt := f.databaseNow()
+	epochB := f.admitAt2(release, b2.ID)
+	beforeB := f.entry(b2.ID)
+	if adm := f.reclaiming(release, bootAt, rec); adm.Admitted || adm.Entry == nil || adm.Entry.ID != b2.ID {
+		t.Fatalf("post-instant AdmitNextReclaiming = %+v, want no re-claim", adm)
+	}
+	if got := f.entry(b2.ID); got.AdmissionEpoch != epochB || !got.AdmittedAt.Equal(*beforeB.AdmittedAt) || len(rec.calls) != 0 {
+		t.Fatalf("post-instant entry = epoch %d admitted_at %v (records %d), want epoch %d at %v and no record",
+			got.AdmissionEpoch, got.AdmittedAt, len(rec.calls), epochB, beforeB.AdmittedAt)
+	}
+
+	// Admitted 1 s BEFORE the instant, fresh (not stale): re-claimed, recorded.
+	bootAt = f.databaseNow()
+	f.setAdmittedAt(a.ID, bootAt, -time.Second)
+	stamped := f.entry(a.ID).AdmittedAt
+	adm = f.reclaiming(mainBase(), bootAt, rec)
+	if !adm.Admitted || !adm.Readmitted || adm.Entry.ID != a.ID || adm.Entry.AdmissionEpoch != 2 {
+		t.Fatalf("pre-instant AdmitNextReclaiming = %+v, want A re-claimed at epoch 2", adm)
+	}
+	got := f.entry(a.ID)
+	if got.AdmissionEpoch != 2 || !got.AdmittedAt.After(*stamped) || got.Phase != PhaseAdmitted {
+		t.Fatalf("re-claimed entry = %+v, want epoch 2, a fresh admitted_at, phase kept", got)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].ID != a.ID || rec.calls[0].AdmissionEpoch != 2 ||
+		rec.txEpoch[0] != 2 || rec.poolEpoch[0] != 1 {
+		t.Fatalf("Record calls = %d (tx epoch %v, committed %v), want one for A at epoch 2 seen in-tx, uncommitted (1) outside",
+			len(rec.calls), rec.txEpoch, rec.poolEpoch)
+	}
+	// Re-asked at the same instant: A's admitted_at is now after it.
+	if adm := f.reclaiming(mainBase(), bootAt, rec); adm.Admitted || len(rec.calls) != 1 {
+		t.Fatalf("second AdmitNextReclaiming = %+v (records %d), want no second re-claim", adm, len(rec.calls))
+	}
+
+	// Every non-admission phase before the instant: never re-claimed.
+	epoch := int64(2)
+	for _, ph := range []Phase{PhaseVerifying, PhaseUnverified, PhasePassed, PhaseMerging, PhaseSettling} {
+		if _, err := f.store.SetPhase(ctx, a.ID, epoch, ph); err != nil {
+			t.Fatalf("SetPhase(%s): %v", ph, err)
+		}
+		at := f.databaseNow()
+		f.setAdmittedAt(a.ID, at, -time.Second)
+		if adm := f.reclaiming(mainBase(), at, rec); adm.Admitted || adm.Readmitted {
+			t.Errorf("pre-instant %s AdmitNextReclaiming = %+v, want no re-claim", ph, adm)
+		}
+		if got := f.entry(a.ID); got.AdmissionEpoch != epoch || len(rec.calls) != 1 {
+			t.Errorf("pre-instant %s entry epoch = %d (records %d), want %d and no record", ph, got.AdmissionEpoch, len(rec.calls), epoch)
+		}
+	}
+
+	// A STALE advancing entry admitted after an old instant: the stale
+	// re-claim runs in the reclaiming variant too, and records.
+	if _, err := f.store.SetPhase(ctx, a.ID, epoch, PhaseAdvancing); err != nil {
+		t.Fatalf("SetPhase(advancing): %v", err)
+	}
+	old := f.databaseNow().Add(-time.Hour) // a database instant, offset
+	f.backdateStale(a.ID)
+	if adm := f.reclaiming(mainBase(), old, rec); !adm.Readmitted || adm.Entry.AdmissionEpoch != epoch+1 || len(rec.calls) != 2 {
+		t.Fatalf("stale AdmitNextReclaiming = %+v (records %d), want re-claimed at epoch %d and recorded", adm, len(rec.calls), epoch+1)
+	}
+
+	// Validation: refused before any SQL, with a held row that WOULD be
+	// admitted left held (committed state, not only the error).
+	held := f.enqueue(f.run(), "other", "o1").Entry
+	other := Base{Repo: testRepo, BaseRef: "other"}
+	for name, req := range map[string]ReclaimRequest{
+		"zero instant": {Base: other, Record: rec.record},
+		"nil record":   {Base: other, AdmittedBefore: f.databaseNow()},
+		"invalid base": {Base: Base{Repo: testRepo}, AdmittedBefore: f.databaseNow(), Record: rec.record},
+	} {
+		if _, err := f.store.AdmitNextReclaiming(ctx, req); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("%s: err = %v, want ErrInvalidRequest", name, err)
+		}
+	}
+	if got := f.entry(held.ID); got.State != StateHeld || got.AdmittedAt != nil {
+		t.Fatalf("held row after refused calls = %+v, want still held", got)
+	}
+}
+
+// admitAt2 is admitAt on any base.
+func (f *fixture) admitAt2(base Base, want uuid.UUID) int64 {
+	f.t.Helper()
+	adm := f.admitNext(base)
+	if !adm.Admitted || adm.Entry.ID != want {
+		f.t.Fatalf("AdmitNext(%s) = %+v, want %s admitted", base.BaseRef, adm, want)
+	}
+	return adm.Entry.AdmissionEpoch
+}
+
+// TestAdmitNextReclaiming_RecordFailureRollsBack (counterfactual A4): a Record
+// error is ErrReclaimUnrecorded wrapping it, and the COMMITTED row (read
+// back) keeps its admission epoch and admitted_at; a retry with a working
+// Record then re-claims.
+func TestAdmitNextReclaiming_RecordFailureRollsBack(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	bootAt := f.databaseNow()
+	f.setAdmittedAt(e.ID, bootAt, -time.Second)
+	before := f.entry(e.ID)
+
+	boom := errors.New("audit append failed")
+	rec := &reclaimRecorder{pool: f.pool, err: boom}
+	_, err := f.store.AdmitNextReclaiming(context.Background(), ReclaimRequest{Base: mainBase(), AdmittedBefore: bootAt, Record: rec.record})
+	if !errors.Is(err, ErrReclaimUnrecorded) || !errors.Is(err, boom) {
+		t.Fatalf("AdmitNextReclaiming with a failing Record err = %v, want ErrReclaimUnrecorded wrapping the record error", err)
+	}
+	after := f.entry(e.ID)
+	if after.AdmissionEpoch != epoch || !after.AdmittedAt.Equal(*before.AdmittedAt) || !after.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Fatalf("entry after a failed record = epoch %d admitted_at %v, want epoch %d at %v (rolled back)",
+			after.AdmissionEpoch, after.AdmittedAt, epoch, before.AdmittedAt)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Record calls = %d, want 1", len(rec.calls))
+	}
+	rec.err = nil
+	if adm := f.reclaiming(mainBase(), bootAt, rec); !adm.Readmitted || f.entry(e.ID).AdmissionEpoch != epoch+1 {
+		t.Fatalf("retry = %+v, want re-claimed at epoch %d", adm, epoch+1)
+	}
+}
+
+// TestAdmitNextReclaiming_SkipsYieldedAndPreservesWaitState (R6;
+// counterfactuals A5, A6). (a) No live row: an OLDER yielded held row Y ahead
+// of a younger unmarked held row U: U is admitted, and Y keeps its marker,
+// yielded_at and approval_wait_started_at. (b) A pre-instant live admitted
+// row L carrying an approval-wait anchor (ApprovalWait), a promote order_key
+// and an anchored head/base is re-claimed (epoch +1) with every one of those,
+// enqueued_at and the NULL yield columns read back unchanged.
+func TestAdmitNextReclaiming_SkipsYieldedAndPreservesWaitState(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	rec := &reclaimRecorder{pool: f.pool}
+
+	y, u := uuid.New(), uuid.New()
+	f.seed(y, f.run(), StateHeld, 2*time.Hour)
+	f.seed(u, f.run(), StateHeld, time.Hour)
+	f.markYielded(y, "forge_approval_absent", time.Minute)
+	f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = clock_timestamp() - interval '5 minutes' WHERE id = $1`, y)
+	yBefore := f.entry(y)
+	adm := f.reclaiming(mainBase(), f.databaseNow(), rec)
+	if !adm.Admitted || adm.Readmitted || adm.Entry.ID != u {
+		t.Fatalf("AdmitNextReclaiming = %+v, want the younger unmarked %s admitted (the yielded %s skipped)", adm, u, y)
+	}
+	yAfter := f.entry(y)
+	if yAfter.State != StateHeld || yAfter.YieldReason != yBefore.YieldReason || yAfter.YieldedAt == nil ||
+		!yAfter.YieldedAt.Equal(*yBefore.YieldedAt) || yAfter.ApprovalWaitStartedAt == nil ||
+		!yAfter.ApprovalWaitStartedAt.Equal(*yBefore.ApprovalWaitStartedAt) || !yAfter.UpdatedAt.Equal(yBefore.UpdatedAt) {
+		t.Fatalf("yielded row after admission = %+v, want held with marker, yielded_at and wait anchor unchanged (%+v)", yAfter, yBefore)
+	}
+	if len(rec.calls) != 0 {
+		t.Fatalf("an admission called Record %d times, want 0", len(rec.calls))
+	}
+
+	// (b) on another base: X ahead by enqueue time, L promoted past it.
+	release := Base{Repo: testRepo, BaseRef: "release"}
+	f.enqueue(f.run(), "release", "x1")
+	lRun := f.run()
+	l := f.enqueue(lRun, "release", "l1").Entry
+	if _, err := f.store.Promote(ctx, PromoteRequest{RunID: lRun, Record: func(context.Context, pgx.Tx, Promotion) error { return nil }}); err != nil {
+		t.Fatalf("Promote(L): %v", err)
+	}
+	epoch := f.admitAt2(release, l.ID)
+	f.approvalWait(l.ID, epoch, time.Hour)
+	bootAt := f.databaseNow()
+	f.setAdmittedAt(l.ID, bootAt, -time.Second)
+	before := f.entry(l.ID)
+	if before.OrderKey == nil || before.ApprovalWaitStartedAt == nil || before.AnchoredBaseSHA == "" {
+		t.Fatalf("seeded L = %+v, want an order key, a wait anchor and an anchored base", before)
+	}
+	adm = f.reclaiming(release, bootAt, rec)
+	if !adm.Readmitted || adm.Entry.ID != l.ID || adm.Entry.AdmissionEpoch != epoch+1 {
+		t.Fatalf("AdmitNextReclaiming(L) = %+v, want L re-claimed at epoch %d", adm, epoch+1)
+	}
+	after := f.entry(l.ID)
+	switch {
+	case after.AdmissionEpoch != epoch+1 || after.State != StateLive || after.Phase != before.Phase:
+		t.Fatalf("re-claimed L = %+v, want live at epoch %d, phase %q kept", after, epoch+1, before.Phase)
+	case after.ApprovalWaitStartedAt == nil || !after.ApprovalWaitStartedAt.Equal(*before.ApprovalWaitStartedAt):
+		t.Fatalf("L's approval_wait_started_at = %v, want %v kept (R6: no new approval-wait episode)", after.ApprovalWaitStartedAt, before.ApprovalWaitStartedAt)
+	case after.AnchoredHeadSHA != before.AnchoredHeadSHA || after.AnchoredBaseSHA != before.AnchoredBaseSHA || !after.AnchoredAt.Equal(before.AnchoredAt):
+		t.Fatalf("L's anchor = %q/%q at %v, want %q/%q at %v kept", after.AnchoredHeadSHA, after.AnchoredBaseSHA, after.AnchoredAt,
+			before.AnchoredHeadSHA, before.AnchoredBaseSHA, before.AnchoredAt)
+	case after.OrderKey == nil || !after.OrderKey.Equal(*before.OrderKey) || !after.EnqueuedAt.Equal(before.EnqueuedAt):
+		t.Fatalf("L's order key %v / enqueued_at %v, want %v / %v kept", after.OrderKey, after.EnqueuedAt, before.OrderKey, before.EnqueuedAt)
+	case after.YieldReason != "" || after.YieldDetail != "" || after.YieldedAt != nil:
+		t.Fatalf("L's yield columns = %q/%q/%v, want NULL", after.YieldReason, after.YieldDetail, after.YieldedAt)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].ID != l.ID {
+		t.Fatalf("Record calls = %d, want one for L", len(rec.calls))
+	}
+}
+
+// TestDatabaseNow: the store reads the database clock (an admission made
+// after it stamps a later admitted_at), and a canceled context fails.
+func TestDatabaseNow(t *testing.T) {
+	f := newFixture(t)
+	now := f.databaseNow()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	f.admitAt(e.ID)
+	if got := f.entry(e.ID).AdmittedAt; got == nil || !got.After(now) {
+		t.Fatalf("admitted_at %v after DatabaseNow %v, want later on the same clock", got, now)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if got, err := f.store.DatabaseNow(ctx); !errors.Is(err, context.Canceled) || !got.IsZero() {
+		t.Fatalf("DatabaseNow(canceled) = %v, %v; want the zero time and context.Canceled", got, err)
+	}
+}
+
+// TestSetPhase_D8Steps: the ADR-093 D8 phases round-trip under the epoch CAS
+// (a stale epoch is refused and the phase read back is unchanged).
+func TestSetPhase_D8Steps(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	for _, ph := range []Phase{PhaseAdvancing, PhaseVerifying, PhasePassed, PhaseMerging, PhaseSettling} {
+		got, err := f.store.SetPhase(ctx, e.ID, epoch, ph)
+		if err != nil || got.Phase != ph || f.entry(e.ID).Phase != ph {
+			t.Fatalf("SetPhase(%s) = %+v, %v; want phase %s read back", ph, got, err, ph)
+		}
+		if _, err := f.store.SetPhase(ctx, e.ID, epoch+1, PhaseAdmitted); !errors.Is(err, ErrStateConflict) {
+			t.Fatalf("SetPhase at a stale epoch err = %v, want ErrStateConflict", err)
+		}
+		if got := f.entry(e.ID).Phase; got != ph {
+			t.Fatalf("phase after a refused SetPhase = %q, want %q", got, ph)
+		}
+	}
+	if string(PhaseAdvancing) != "advancing" || string(PhaseMerging) != "merging" || string(PhaseSettling) != "settling" {
+		t.Fatalf("D8 phase values = %q/%q/%q, want advancing/merging/settling", PhaseAdvancing, PhaseMerging, PhaseSettling)
+	}
+	if IntentFnTimeout != intentFnTimeout {
+		t.Fatalf("IntentFnTimeout = %s, want the lock's fn deadline %s", IntentFnTimeout, intentFnTimeout)
 	}
 }
