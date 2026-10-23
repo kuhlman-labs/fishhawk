@@ -157,7 +157,8 @@ Response (gate_view):
     pass waits behind the base's live pass at position N with live_run_id,
     using no runner slot — admission is automatic, and fishhawk_merge_run
     answers merge_candidate_held meanwhile) or live (this run holds the base's
-    line, with phase admitted | verifying | passed | unverified), plus
+    line, with phase admitted | advancing | verifying | passed | unverified
+    | merging | settling: its last recorded step, ADR-093 D8), plus
     base_ref, anchored_head_sha, enqueued_at and a one-line note. Omitted when
     the run has no active entry; omitted with a merge_candidate_queue
     history_gaps entry when the queue read failed.

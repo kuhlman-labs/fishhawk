@@ -24,9 +24,9 @@ import (
 // request (pending + running combined). A bite sets truncated=true.
 const restartBlockersRunScanLimit = 500
 
-// Restart-blocker reasons — a closed three-member set mirrored by the OpenAPI
-// RestartBlocker.reason enum and parsed by scripts/dev's
-// _parse_restart_blockers.
+// Restart-blocker reasons — a closed four-member set (merge_in_flight added
+// by ADR-093 D8 / #4298) mirrored by the OpenAPI RestartBlocker.reason enum
+// and parsed by scripts/dev's _parse_restart_blockers.
 const (
 	// restartBlockerUndispatchedChild: a decomposition child whose implement
 	// stage is still pending / awaiting_host_dispatch AND whose decomposition
@@ -45,12 +45,25 @@ const (
 	// failed, so the daemon could not decide that run's state. scripts/dev treats it as a
 	// REFUSING blocker (fail-closed on a reachable-but-undecided daemon).
 	restartBlockerCheckFailed = "check_failed"
+	// restartBlockerMergeInFlight (ADR-093 D8 / #4298): THIS process has the
+	// run's head-of-line merge-queue merge in flight (s.mergeInFlight, marked
+	// after the merging stamp and cleared after the pump applies the
+	// outcome). A restart interrupts the forge merge call, so the next boot
+	// must reconcile it and may hold it for the operator re-arm. A merging
+	// entry a PRIOR process left is not a blocker: the next boot reconciles
+	// it and a restart loses nothing more (the review-round rule's shape).
+	restartBlockerMergeInFlight = "merge_in_flight"
 )
 
 // restartBlockerStageImplement is the stage an undispatched_child item names.
-// Review items carry orphanedReviewStageKind.label ("plan" / "implement"), so
-// the OpenAPI RestartBlocker.stage enum is exactly those two labels.
+// Review items carry orphanedReviewStageKind.label ("plan" / "implement"), and
+// a merge_in_flight item names restartBlockerStageMerge, so the OpenAPI
+// RestartBlocker.stage enum is exactly those three labels.
 const restartBlockerStageImplement = "implement"
+
+// restartBlockerStageMerge is the stage a merge_in_flight item names: the
+// queue's merge step, not a run stage row.
+const restartBlockerStageMerge = "merge"
 
 // restartBlockersResponse is the GET /v0/restart-blockers body.
 type restartBlockersResponse struct {
@@ -280,6 +293,13 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run, parents ma
 			continue
 		}
 		out = append(out, inFlight)
+	}
+
+	// (c) A head-of-line merge-queue merge THIS process has in flight
+	// (ADR-093 D8 / #4298). The registry is process-local with no DB read, so
+	// this check never yields check_failed.
+	if s.mergeInFlight.has(ru.ID) {
+		out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerMergeInFlight, Stage: restartBlockerStageMerge})
 	}
 	return out
 }

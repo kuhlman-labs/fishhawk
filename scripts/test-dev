@@ -7745,6 +7745,7 @@ _gc_reset
 RB_CHILD='{"items":[{"run_id":"rb-child-1","reason":"undispatched_child","stage":"implement","parent_run_id":"rb-parent-9","stage_state":"pending"}],"scanned_runs":2,"truncated":false}'
 RB_REVIEW='{"items":[{"run_id":"rb-review-2","reason":"review_in_flight","stage":"plan","configured_agents":2,"landed":0}],"scanned_runs":1,"truncated":false}'
 RB_CHECK_FAILED='{"items":[{"run_id":"rb-undecided-3","reason":"check_failed","stage":"implement"}],"scanned_runs":1,"truncated":false}'
+RB_MERGE='{"items":[{"run_id":"rb-merge-4","reason":"merge_in_flight","stage":"merge"}],"scanned_runs":1,"truncated":false}'
 RB_EMPTY='{"items":[],"scanned_runs":3,"truncated":false}'
 RB_MALFORMED='{"error":{"code":"internal_error"}}'
 RB_UNREADABLE='{"items":[{"surprise":true}],"scanned_runs":1,"truncated":false}'
@@ -7853,7 +7854,7 @@ CLEAN
 _rb_m() { [[ -f "$1" ]] && print present || print absent }
 
 if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null || ! command -v curl &>/dev/null; then
-  print "skip: nc, lsof or curl not found — skipping the restart-blocker responder cases (RB-a..RB-j, RB-l, RB-n)"
+  print "skip: nc, lsof or curl not found — skipping the restart-blocker responder cases (RB-a..RB-j, RB-l, RB-n, RB-p)"
 else
   # RB-a DONE-MEANS (negative): an undispatched child makes POST-MERGE refuse
   # (its git pull is what strands the child, #4077), before any git step, and
@@ -7924,6 +7925,28 @@ else
     pass "RB-n check_failed + --force: teardown reached with a warning"
   else
     fail "RB-n check_failed --force (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-p (ADR-093 D8 / #4298) a head-of-line queue merge THIS daemon has in
+  # flight refuses reload, naming the run and the queue-merge text — which the
+  # generic unknown-reason arm does not print (counterfactual C2: deleting the
+  # merge_in_flight case still refuses, but without that text); --force warns
+  # and proceeds.
+  _rb_run_reload "200 OK" "$RB_MERGE"
+  if (( rb_rc != 0 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *rb-merge-4* && "$rb_err" == *"head-of-line queue merge in flight"* ]] \
+     && [[ "$rb_err" == *"next boot must reconcile it"* && "$rb_err" == *"reload --when-quiet waits"* ]]; then
+    pass "RB-p merge_in_flight: cmd_reload refuses before the teardown, naming the run and the queue merge"
+  else
+    fail "RB-p merge_in_flight refusal (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+  _rb_run_reload "200 OK" "$RB_MERGE" --force
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *rb-merge-4* && "$rb_err" == *warning* ]] \
+     && [[ "$rb_err" == *"head-of-line queue merge in flight"* && "$rb_err" != *"refusing to restart"* ]]; then
+    pass "RB-p merge_in_flight + --force: teardown reached with a warning naming the queue merge"
+  else
+    fail "RB-p merge_in_flight --force (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
   fi
   rm -rf "$rb_dir"
 
@@ -8021,6 +8044,7 @@ rb_golden="$(_parse_restart_blockers < "${REPO_ROOT}/testdata/wire/restart_block
 rb_want="00000000-0000-4000-8000-000000000001"$'\t'"undispatched_child"$'\t'"implement"$'\t'"00000000-0000-4000-8000-000000000002"
 rb_want+=$'\n'"00000000-0000-4000-8000-000000000004"$'\t'"review_in_flight"$'\t'"plan"$'\t'
 rb_want+=$'\n'"00000000-0000-4000-8000-000000000005"$'\t'"check_failed"$'\t'"implement"$'\t'
+rb_want+=$'\n'"00000000-0000-4000-8000-000000000007"$'\t'"merge_in_flight"$'\t'"merge"$'\t'
 if [[ "$rb_golden" == "$rb_want" ]]; then
   pass "RB-k _parse_restart_blockers reads the shared Go wire golden (testdata/wire/restart_blockers.json)"
 else

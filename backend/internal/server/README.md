@@ -3031,7 +3031,9 @@ deadline): `backend/internal/mergequeue/README.md`.
 - **Locked steps** (`withRunMergeLock` = `WithMergeIntentLock`; in
   merge-on-pass every forge read is bounded 10s and the pinned merge 30s,
   under the 90s fn deadline):
-  re-read the entry (same id, live, passed, intent, same head) and the PR;
+  re-read the entry (same id, live, phase `passed` OR `merging` — ADR-093
+  D8 ruling R3, so a decision after an uncertain dispatch reaches the claim
+  and holds `merge_already_dispatched` — intent, same head) and the PR;
   a non-queue `merge_verdict_recorded` newer than the intent → hold
   `inline_merge_dispatched`; the merge overlap guard (#4119) → a 409 holds
   and appends a deduped, counts-only `merge_queue_overlap_refused`, a 502
@@ -3074,6 +3076,21 @@ deadline): `backend/internal/mergequeue/README.md`.
   `pr_merged` only when the run has no claim or its claim names the merged
   head, else holds `merged_claim_head_mismatch`. A lock never taken → hold; a lapse after fn → WARN, its
   writes stand.
+- **D8 step stamps and the in-flight registry (ADR-093 D8 /
+  [#4298](https://github.com/kuhlman-labs/fishhawk/issues/4298)).** After
+  the verdict row and the nil-ledger check, and BEFORE the D1 claim, the
+  locked decision records phase `merging` at the entry's epoch (a CAS miss
+  holds `entry_changed` with no claim and no forge call) and marks the run
+  in the per-Server, process-local `mergeInFlight` registry
+  (`merge_queue_resume.go`). After the forge accepts (nil, or observed
+  merged) it records `settling`, best-effort (a miss is logged; the merge is
+  a fact), then runs the merged tail. The pump clears the registry mark only
+  AFTER `applyMergeOnPassOutcome` returns (ruling R8c), so the mark spans
+  the whole decision-plus-apply and `GET /v0/restart-blockers` lists it as
+  `merge_in_flight` (§ "Restart blockers"). The pre-lock check stays
+  `passed`-only: the pump routes a `merging`/`settling` entry to the restart
+  resume (§ "Merge-queue durability (ADR-093 D8)"), skipping it while this
+  process's mark is set.
 - **Outcomes the pump applies.** `merged` → continue; `settle` → `SettleAt`
   (epoch CAS; a conflict stops the pump); `readvance` → `Unadmit(epoch)`,
   the only post-Unadmit continue, capped at `mergeQueueMaxReadvancesPerPump`
@@ -3680,6 +3697,96 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   `TestMergeQueueEjection_*`, `TestRunReadAndGateView_MergeQueueEjectionOnlyWhileNewestRowEjected`,
   `TestOpenAPIDocumentsMergeQueuePromote` / `...Ejection`) and
   `mcpserver`'s `TestMergeQueueEjection_WireShape` (real backend and store).
+
+### Merge-queue durability (ADR-093 D8)
+
+E87.7 / [#4298](https://github.com/kuhlman-labs/fishhawk/issues/4298),
+delivery PARTIAL. A live head-of-line entry records its LAST RECORDED step in
+the free-text `phase` column (no migration): `admitted` → `advancing`
+(stamped right before the behind-probe) → `verifying` → `passed` /
+`unverified` → `merging` (in-lock, before the D1 claim) → `settling` (after
+the forge accepts). The phase is NOT a liveness signal. After a restart the
+pump resumes each live entry from its step; the boot pump
+(`resumeMergeCandidateQueues`, called by `RunMergeCandidateQueuePump` instead
+of its first plain pump) runs that resume first. Code:
+`merge_queue_resume.go` (merging/settling, boot pass, registries),
+`merge_queue_resume_verifying.go` (verifying/unverified, the shared
+`merge_queue_resumed` writer), `merge_candidate_queue.go` (routing, the R7
+gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
+`AdmitNextReclaiming`, § "Crash-left claims (ADR-093 D8)").
+
+| Step after a restart | Resume |
+|---|---|
+| `admitted` / `advancing`, admitted before the boot instant | re-claimed by the boot pump's first admission (`AdmitNextReclaiming`, epoch +1, a `merge_queue_resumed` `reclaim` row written INSIDE the queue transaction — a failed append re-claims nothing), then the admission re-runs; the behind-probe and advance are idempotent |
+| `admitted` / `advancing`, stale | the 10-minute `AdmissionStaleAfter` re-claim (now covering `advancing`), same re-run |
+| `verifying` / `unverified` | `mergeQueueResumeVerifying`: reads verdict ROWS at the anchored head (never the derived `not_required`): passed → `apply_verdict` (the lost hook); failed → `eject` `verify_failed` with `fixup_routed=false`, next_step `fishhawk_fixup_stage` (fail closed, R8b); a live trigger → hold, no row; newest `not_executed` → `record_unverified`, then `redispatch_pass` AT MOST ONCE (intent, reason `runner_failed:`, exactly one such verdict at the head, R7 gate clear, implement stage succeeded/awaiting_approval, PR head = anchor); otherwise hold for `fishhawk_rebase_run_branch` as ADR-092 does |
+| `passed` | ordinary merge-on-pass (§ "Merge-on-pass") |
+| `merging` / `settling`, THIS process mid-merge | skipped (`mergeInFlight.has`) |
+| `merging` / `settling`, PR merged at the QUEUE claim's head | `settle_merged` row (`merge_actor_verified:false`, C6b), a strict `merge_dispatch_settled` `reconciled_merged` for a `dispatch_failed` claim, then the merged tail with `Resume=true` (`merge_queue_merged` only when no row names the entry; a failed dedup read or append holds `resume_unrecorded`). A DECLARED approval gate with no `merge_queue_authorized` row (path `queue`, claim head) holds `authorization_unrecorded` (C6a) |
+| `merging` / `settling`, PR merged, no claim or another path's claim | `settle_pr_merged`, settled merged `pr_merged`, claim untouched |
+| PR merged at a head the claim does not name | hold `merged_claim_head_mismatch` |
+| `merging`, PR open or unreadable, QUEUE claim still `dispatched` and crash-left (C2) | strict `merge_dispatch_settled` {`dispatch_failed`, `orphaned_by_restart`}, then the EXISTING `MarkMergeDispatchFailed(orphaned_by_restart)` (C3), then a hold row {`merge_dispatch_uncertain`, next_step `operator_rearm`, remedy}: confirm on the forge nothing merged, DELETE the `dispatch_failed` claim (mergequeue README operator re-arm); the queue-path re-arm needs NO `fishhawk_merge_run` re-invocation, the next pump re-decides from scratch (C8a). PR closed: `drop_pr_closed` |
+| the same claim younger than the crash-left age | hold `merge_dispatch_in_progress`, nothing written; a later tick re-decides |
+| `settling`, PR open, queue claim `dispatched` | hold `settling_unconfirmed`, no ledger write; depends on the forge converging: once it shows the PR merged, `fishhawk_reconcile_merge` or `fishhawk_record_merge_observation` (or the next pump) settles it; otherwise the forge must converge (C8b) |
+| an inline/delegated claim, a GitLab claim, or a non-orphaned `dispatch_failed` claim | hold `merge_already_dispatched`, no ledger write (C1: only a `queue`-path claim is ever reconciled) |
+| `merging`, no claim | `redecide`: back to `passed` at the epoch, ordinary merge-on-pass decides from scratch with the fold and veto in-lock; no dispatch was ever handed to the forge, so this is not a retry |
+
+- **ADR-109 governs the ledger.** The resume adds NO ledger transition and
+  dispatches NO merge: it makes ONE forge re-read (`merged := pr.Merged //
+  ADR-093 D8: the resume re-read`) under the run's merge-intent lock, and
+  the only claim write is the existing `MarkMergeDispatchFailed` the
+  uncertain classification already uses.
+- **Crash-left age (C2).** `mergeQueueCrashLeftClaimAge` =
+  `mergequeue.IntentFnTimeout` (the ADR-108 merge-intent lock fn deadline,
+  90s) + `mergeOnPassMergeCallTimeout` (the pinned merge call, 30s) +
+  `mergeQueueCrashLeftClaimMargin` (30s) = 150s. Judged on the DATABASE
+  clock (`Resumer.DatabaseNow` against `claimed_at`), never Go
+  `time.Now()`, and only while HOLDING the merge-intent lock; there is no
+  boot-time cutoff. An unreadable clock holds.
+- **R2 note (binds any follow-up).** Any later automatic retry of a
+  crash-left merge MUST re-run the ADR-112 forge-approval fold and veto
+  in-lock, failing closed, before calling the forge. The retry-once and the
+  moved head/base release wait for the ADR-109 amendment; this resume
+  dispatches no merge PUT.
+- **`merge_queue_resumed` (INTERNAL audit category).** Payload `{entry_id,
+  base_ref, step, action, reason?, head_sha, admission_epoch, next_step?,
+  remedy?, claim_state?, claim_path?, claim_head_sha?}`; every id is the
+  run's own (run-bound-readable under ADR-106 once its registry flag lands,
+  E89). Actions, closed: `reclaim`, `apply_verdict`, `eject`,
+  `record_unverified`, `redispatch_pass`, `settle_merged`,
+  `settle_pr_merged`, `drop_pr_closed`, `redecide`, `hold`. Every row is
+  appended BEFORE its action and fails closed (held `resume_unrecorded`,
+  nothing changed, R8d). Only `hold` rows are deduped (same entry, step,
+  action, reason as the run's newest row), so a held entry re-decided every
+  tick writes one row; a state-changing action always appends its own (C7).
+- **Verdict hook guard (C4).** `mergeCandidateQueueOnVerdict` and the
+  transfer re-anchor (`rebase_branch.go`, R8g) leave a `merging`/`settling`
+  entry's phase alone: a late or duplicate verdict never resets,
+  unverifies or ejects an entry whose queue claim may still be dispatched.
+- **R7 stage-live gate.** A RE-CLAIMED admission (boot instant or stale) and
+  the verifying re-dispatch never advance or start work while a stage of the
+  run is `dispatched`/`running` or the implement stage carries a live
+  merge-candidate trigger (`mergeQueueRunStageLive`; a read error counts as
+  live). A gate-held admission stays live at its new epoch with no write and
+  is recorded in the process-local `mergeQueueGateHolds`; the next periodic
+  pump tick re-checks the gate for exactly that entry (C5), so the base
+  waits one tick, not `AdmissionStaleAfter`. Stricter than ADR-115 D4 (it
+  counts the queue's own pass); fresh admissions are unchanged.
+- **Boot instant (R8a).** `runServe` captures `Config.MergeQueueBootAt` with
+  `captureMergeQueueBootAt` (`backend/cmd/fishhawkd/serve.go`,
+  `Resumer.DatabaseNow`) right before `newServer`, i.e. before every
+  goroutine that can admit; zero (no `Resumer`, a read error) turns the boot
+  re-claim off and leaves the stale re-claim. Multi-replica residual: a
+  sibling replica's admission made before this replica's boot instant is
+  re-claimed; the epoch CAS no-ops the sibling's later writes and its side
+  effects are idempotent.
+- **ADR-112 A1.4 sweep times reset BY DESIGN.** The process-local re-probe
+  and re-entry sweep times restart from zero on a restart (the window
+  becomes (0, age]); the boot re-claim never touches `yield_reason`,
+  `yielded_at` or `approval_wait_started_at` (R6).
+- **Restart blocker.** A merge THIS process has in flight is `merge_in_flight`
+  on `GET /v0/restart-blockers`; a merging entry a PRIOR process left is not
+  (§ "Restart blockers").
 
 ## Merge overlap guard (`merge_overlap_guard.go`, E83.61 / [#4119](https://github.com/kuhlman-labs/fishhawk/issues/4119))
 
@@ -4314,6 +4421,7 @@ The server half of plan-declared counterfactuals. The runner executes each entry
 - **Auth and narrowing mirror `handleListRuns`.** Anonymous accepted (no scope check; `scripts/dev` sends no token), `Identity.AccountID` bounds the scan, `requestRepoFilter` → `filter.allows` drops unreadable repos, a filter fault is 503 `service_unavailable` for the whole request. The exposure is a subset of what anonymous `GET /v0/runs` and `GET /v0/runs/{run_id}/stages` already serve. Nil `RunRepo` / `AuditRepo` → 503 `run_repo_unconfigured` / `audit_repo_unconfigured`; a `ListRuns` error → 500.
 - **Wire golden.** `TestRestartBlockers_EndToEnd_Golden` drives the real mux with NO credential and compares the RAW body to `testdata/wire/restart_blockers.json`; `scripts/test-dev` RB-k feeds the same file to `_parse_restart_blockers`. Its review seed is a GATING round (#4077), so the item survives the narrowed predicate regardless of the fixture's reviewer wiring, and its decomposition parent (`attnID(2)`) is seeded LIVE (`running`) so the parent-state filter (#4184) keeps the `undispatched_child` item — the golden stayed byte-identical; the wire shape and both enums are unchanged. Regenerate with `FISHHAWK_UPDATE_WIRE_GOLDEN=1` and re-run `scripts/test-dev` in the same change.
 - **Read cost.** Per run: up to one `ListStagesForRun` (children only), plus one memoized `GetRun` per DISTINCT decomposition parent of a child with a `pending` / `awaiting_host_dispatch` implement stage (#4184), plus, per review stage, one started read and three terminal reads, and for an unsettled current-process round the eligibility reads (one `review_round_redispatched` list, one superseding-category list, and a `GetStage` or `GetRun`). It runs once per `reload` / `post-merge`, and once per poll of `scripts/dev reload --when-quiet` (default every 15 s).
+- **`merge_in_flight` (ADR-093 D8 / [#4298](https://github.com/kuhlman-labs/fishhawk/issues/4298)), stage `merge`.** Check (c): `s.mergeInFlight.has(run)` — THIS process has the run's head-of-line merge-queue merge in flight (marked after the `merging` stamp, cleared by the pump after the outcome is applied, § "Merge-on-pass"). A restart interrupts the forge merge call, so the next boot must reconcile it and may hold it for the operator re-arm. Process-local with no DB read, so it never yields `check_failed`. A `merging` entry a PRIOR process left is NOT a blocker: the next boot reconciles it and a restart loses nothing more (the review-round rule's shape). Tests: `TestRestartBlockers_MergeInFlight`, `TestRestartBlockers_LiveQueueMergeListed_EndToEnd` (real queue, the pinned merger probing the route mid-call).
 - **Consumer contexts.** `scripts/dev` reads `undispatched_child` only in the `post-merge` context (its `git pull` is what strands the child); `reload` ignores it. The endpoint itself reports every item regardless of caller (`scripts/README.md` § "Restart-blocker guard").
 
 ## Repo dashboard rollups (`repodash.go`, E40.3 / #1714)
