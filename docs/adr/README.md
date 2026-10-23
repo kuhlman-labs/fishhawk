@@ -322,6 +322,9 @@ Amendments recorded under the upkeep rule since:
 - ADR-116: `amends: [ADR-041, ADR-115]` ("It amends ADR-041 decision 4 … and ADR-115 D5"); both gain `amended_by: [ADR-116]`.
 - ADR-117: no edge (`amends: []` in its Record metadata).
 - ADR-118: `amends: [ADR-068, ADR-084, ADR-117]` ("It amends ADR-068 Decision 3, ADR-084 … and ADR-117 D4"); each gains `amended_by: [ADR-118]`. Its `applies_to` names `backend/internal/agenteval/**` and `scripts/check-review-prompt-eval`, as its Record metadata states.
+- ADR-119: `amends: [ADR-042]` ("It amends ADR-042: fix-up session resume is permitted on the local runner only under these rules"); ADR-042 gains `amended_by: [ADR-119]`. Per ADR-119 D7, ADR-042's tracker body now names `runner/cmd/fishhawk-runner/fixupresume.go` and `runner/internal/agent/claudecode/**`, and its `applies_to` matches ADR-119's, so a change to resume selects both records (`Select` follows amendments forward only).
+- ADR-120: `amends: [ADR-084, ADR-113]` ("It amends ADR-084 (D4 and rule 4's whole-index injection) and ADR-113 (D4's live index-size checks and frozen-tree contents)"); both gain `amended_by: [ADR-120]`. Its `applies_to` names the paths its Record metadata states.
+- ADR-090: its tracker body (#4170) now carries the in-body "Amendment 1 (2026-10-14)" the record already held, so the record is again a verbatim transcription.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -504,6 +507,8 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-116](116-fan-in-conflict-recovered-in-place.md) | A slice conflict at fan-in parks and is recovered in place (conflict probe, mechanical union, then a hunk-confined resolution pass, then a scoped parent fix-up, with a verified operator resolution always available), never by restarting the whole run | `accepted` | [#4680](https://github.com/kuhlman-labs/fishhawk/issues/4680) |
 | [ADR-117](117-live-review-effectiveness.md) | Live review effectiveness is measured: concern outcomes and human judgements, child-slice concerns imported into the parent, an escape record attributed to the rounds that saw the code, and a presence-conditioned per-reviewer scorecard | `accepted` | [#4690](https://github.com/kuhlman-labs/fishhawk/issues/4690) |
 | [ADR-118](118-review-changes-judged-not-repinned.md) | Review changes are judged, not re-pinned: a per-arm eval gate (standing, experiment and monitor arms; model changes as paired experiments), reviewer configuration as a gate trigger, and one pre-registered offline+live decision rule | `accepted` | [#4698](https://github.com/kuhlman-labs/fishhawk/issues/4698) |
+| [ADR-119](119-fixup-session-resume-opt-in.md) | Fix-up session resume is opt-in and local-only, bound to the reported head and a signed anchor | `accepted` | [#4708](https://github.com/kuhlman-labs/fishhawk/issues/4708) |
+| [ADR-120](120-decision-record-scaling.md) | The decision record scales: lean index lines, a topic map beside the record, a partitioned index | `accepted` | [#4709](https://github.com/kuhlman-labs/fishhawk/issues/4709) |
 
 ## Status unknown — needs captain confirmation
 

@@ -437,7 +437,13 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
-      "applies_to": []
+      "amended_by": [
+        "ADR-119"
+      ],
+      "applies_to": [
+        "runner/cmd/fishhawk-runner/fixupresume.go",
+        "runner/internal/agent/claudecode/**"
+      ]
     },
     {
       "id": "ADR-043",
@@ -834,7 +840,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-118"
+        "ADR-118",
+        "ADR-120"
       ],
       "applies_to": []
     },
@@ -1181,6 +1188,9 @@
       "amends": [
         "ADR-055"
       ],
+      "amended_by": [
+        "ADR-120"
+      ],
       "applies_to": []
     },
     {
@@ -1251,6 +1261,40 @@
       "applies_to": [
         "backend/internal/agenteval/**",
         "scripts/check-review-prompt-eval"
+      ]
+    },
+    {
+      "id": "ADR-119",
+      "title": "Fix-up session resume is opt-in and local-only, bound to the reported head and a signed anchor",
+      "path": "docs/adr/119-fixup-session-resume-opt-in.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-042"
+      ],
+      "applies_to": [
+        "runner/cmd/fishhawk-runner/fixupresume.go",
+        "runner/internal/agent/claudecode/**"
+      ]
+    },
+    {
+      "id": "ADR-120",
+      "title": "The decision record scales: lean index lines, a topic map beside the record, a partitioned index",
+      "path": "docs/adr/120-decision-record-scaling.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-084",
+        "ADR-113"
+      ],
+      "applies_to": [
+        "backend/internal/decisionrecord/**",
+        "scripts/check-adr",
+        "docs/adr/index.json",
+        "docs/adr/README.md",
+        "docs/adr/topics.json"
       ]
     }
   ]
