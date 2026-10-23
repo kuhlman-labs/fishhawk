@@ -6,6 +6,7 @@ date: 2026-07-01
 issue: https://github.com/kuhlman-labs/fishhawk/issues/1540
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-103"]
 applies_to: []
 ---
 

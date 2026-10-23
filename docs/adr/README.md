@@ -279,9 +279,40 @@ touched):
   whether it amends both "without superseding either", and it states no
   supersession. ADR-040 and ADR-089 therefore carry `amended_by: [ADR-097,
   ADR-101]`.
-- NOT encodable: ADR-101's "ADR-085: amended". No ADR-085 record exists, and a
-  link must name an existing record; the change that backfills ADR-085 adds
-  both sides.
+- ADR-101's "ADR-085: amended" was not encodable while no ADR-085 record
+  existed. The change that backfills ADR-085 adds both sides: ADR-101
+  `amends` gains ADR-085, and ADR-085 carries `amended_by: [ADR-101]`. ADR-085
+  stays `accepted`; ADR-101 states no supersession of it.
+
+Amendments recorded under the upkeep rule since:
+
+- ADR-103: `amends: [ADR-050]` ("Adopt **Option D**, as a new ADR that amends
+  ADR-050"; "It supersedes nothing. It amends ADR-050 D4 (a new Rule-of-Two
+  row) and tightens D1's allow-list for this variant"); ADR-050 `amended_by:
+  [ADR-103]`. ADR-050 keeps its `accepted` status.
+- ADR-104: `amends: [ADR-022, ADR-024]` ("**Amends:** ADR-024 (Q4, Q5) and
+  the ADR-022 addendum (a third identity: host dispatcher)"); ADR-022 and
+  ADR-024 each carry `amended_by: [ADR-104]`. ADR-022 keeps its `unknown`
+  status: an amendment does not change the amended record's status.
+- ADR-105: `amends: [ADR-057, ADR-061]` ("Amends ADR-057 (the repo-ACL key)
+  and ADR-061 (workspace ↔ installation, the two-sided adopt)"); ADR-057 and
+  ADR-061 each carry `amended_by: [ADR-105]` and keep their `unknown` status;
+  ADR-061 keeps `supersedes: [ADR-058]`. ADR-105 states no supersession.
+- ADR-107: `amends: [ADR-025]` ("It amends ADR-025 and does not supersede
+  it"); ADR-025 `amended_by: [ADR-107]`.
+- ADR-109: `amends: [ADR-093]` ("It amends ADR-093"; "ADR-093 D1 says an
+  up-to-date PR with a valid pass "may merge inline, as today". This amendment
+  narrows that."); ADR-093 keeps `supersedes: [ADR-090, ADR-092]` and gains
+  `amended_by: [ADR-109]`. ADR-109 states no supersession of ADR-093.
+- ADR-084 is recorded with this batch because ADR-118 amends it. Its tracker body is transcribed after removing the automatically appended "Intake signals" section, as for ADR-113 and ADR-114.
+- ADR-112: `amends: [ADR-093]` ("it **amends ADR-093** (D4, D6, D7, and the mechanics of Q1(a)…)"; "It does not supersede either"); ADR-093 gains `amended_by: [ADR-112]`. Its in-body "Amendment A1" (2026-10-23) is part of the transcribed body, and adds no edge.
+- ADR-113: `amends: [ADR-055]` (Record metadata); ADR-055 `amended_by: [ADR-113]`.
+- ADR-114: no edge. Its in-body "Amendment A1: token callers" (2026-10-23) is part of the transcribed body.
+- ADR-115: `amends: [ADR-063, ADR-092, ADR-093, ADR-094, ADR-112]` (Record metadata). Each gains `amended_by: [ADR-115]`. ADR-092 keeps `superseded_by: [ADR-093]`, and ADR-094 keeps `amended_by` ADR-100.
+- ADR-116: `amends: [ADR-041, ADR-115]` ("It amends ADR-041 decision 4 … and ADR-115 D5"); both gain `amended_by: [ADR-116]`.
+- ADR-117: no edge (`amends: []` in its Record metadata).
+- ADR-118: `amends: [ADR-068, ADR-084, ADR-117]` ("It amends ADR-068 Decision 3, ADR-084 … and ADR-117 D4"); each gains `amended_by: [ADR-118]`. Its `applies_to` names `backend/internal/agenteval/**` and `scripts/check-review-prompt-eval`, as its Record metadata states.
+- ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 
 Decision-record selection (`backend/internal/decisionrecord`) follows
 `amended_by` from a selected record to its amendments and ranks a
@@ -417,6 +448,8 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-078](078-ground-review-agents-widen-context-narrow-capability.md) | Ground the review agents by widening context and narrowing capability: export the reviewed tree, scrub the inherited environment, grant read and search only | `accepted` | [#2519](https://github.com/kuhlman-labs/fishhawk/issues/2519) |
 | [ADR-079](079-product-and-program-management-agent.md) | Product and program management agent for human-ratified charters, release strategy, and readiness | `accepted` | [#3238](https://github.com/kuhlman-labs/fishhawk/issues/3238) |
 | [ADR-080](080-solo-captain-alpha.md) | Solo-captain alpha: the repository is the unit, one developer commands the full crew locally from the bridge | `accepted` | [#3693](https://github.com/kuhlman-labs/fishhawk/issues/3693) |
+| [ADR-084](084-reviewer-personas.md) | Reviewer personas: a separate reviewer invocation with a declared remit, attached per stage or by an escalation, advisory with ingest-time checks, plus deterministic security checks as concern sources | `accepted` | [#3752](https://github.com/kuhlman-labs/fishhawk/issues/3752) |
+| [ADR-085](085-earned-autonomy-recommendations-only.md) | Earned autonomy: recommendations only, from server-attested evidence and a blind shadow record, with asymmetric thresholds (lower fast, raise slowly) and captain ratification through a human-authored spec change | `accepted` | [#3777](https://github.com/kuhlman-labs/fishhawk/issues/3777) |
 | [ADR-087](087-local-stage-concurrency-groups.md) | Local stage concurrency groups: server-coordinated admission of host-dispatched stages | `accepted` | [#3968](https://github.com/kuhlman-labs/fishhawk/issues/3968) |
 | [ADR-088](088-declarative-gate-services.md) | Declarative gate services: a closed, Fishhawk-owned `services:` schema under workflow-v2 `gate_container`, joined to the gate by a shared --network=none namespace (not raw compose, not a bridge network) | `accepted` | [#4042](https://github.com/kuhlman-labs/fishhawk/issues/4042) |
 | [ADR-089](089-first-officer-read-only-crew-seat.md) | First officer: a structurally read-only crew seat whose evidence-backed findings gate actions | `accepted` | [#4149](https://github.com/kuhlman-labs/fishhawk/issues/4149) |
@@ -432,6 +465,22 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-099](099-crew-role-naming.md) | Crew role naming: operator drives, first officer oversees (amends ADR-080 glossary), nautical titles only for command and oversight, functional names for working roles | `accepted` | [#4331](https://github.com/kuhlman-labs/fishhawk/issues/4331) |
 | [ADR-100](100-adaptive-bounded-concurrency.md) | Adaptive, bounded concurrency for host-dispatched stages: a product-owned headroom controller beside the integer limit, operator override, staged shadow→canary→enforce (amends ADR-087 limit rule and ADR-094 D4/Q1) | `accepted` | [#4403](https://github.com/kuhlman-labs/fishhawk/issues/4403) |
 | [ADR-101](101-charter-authorization-mode.md) | Charter authorization mode: lease-based, bounded autonomous operation by a product-spawned operator under a deterministic engine, intersected with delegation; captain seat stays human (amends ADR-040/085/089/097) | `accepted` | [#4412](https://github.com/kuhlman-labs/fishhawk/issues/4412) |
+| [ADR-103](103-adversarial-security-probe.md) | Adversarial security probe: a scheduled acceptance-stage variant drives a disposable target under ADR-050 containment, emits a runner-replayed security_probe artifact, and files findings through a captain gate on a confidential channel (amends ADR-050) | `accepted` | [#4518](https://github.com/kuhlman-labs/fishhawk/issues/4518) |
+| [ADR-104](104-host-dispatcher.md) | Host dispatcher: a host-side, dispatch-only process spawns the parked local stages of auto-started campaign runs | `accepted` | [#4524](https://github.com/kuhlman-labs/fishhawk/issues/4524) |
+| [ADR-105](105-repository-identity-forge-id.md) | Repository identity keyed on the forge's immutable repository id; names resolve through a time-bounded history; an owner change re-establishes trust (amends ADR-057, ADR-061) | `accepted` | [#4550](https://github.com/kuhlman-labs/fishhawk/issues/4550) |
+| [ADR-106](106-run-bound-subject-filtered-audit-read.md) | Run-bound agent tokens get a subject-filtered audit read: how cross-run audit categories are withheld | `accepted` | [#4575](https://github.com/kuhlman-labs/fishhawk/issues/4575) |
+| [ADR-107](107-split-stage-timeout-agent-and-gate-budgets.md) | Amend ADR-025: split the stage timeout into an agent budget and a project-derived verify-gate budget | `accepted` | [#4581](https://github.com/kuhlman-labs/fishhawk/issues/4581) |
+| [ADR-108](108-shared-postgres-lock-holder-budget.md) | Shared Postgres lock-holder budget: one pool-wide pglock budget with reserved headroom and enforced no-nesting for every connection-holding advisory-lock helper | `accepted` | [#4594](https://github.com/kuhlman-labs/fishhawk/issues/4594) |
+| [ADR-109](109-merge-queue-owns-the-merge.md) | Amend ADR-093 D1: the merge queue owns the merge — one database-enforced per-run dispatch ledger across inline, delegated and queue merges, plus the admission-epoch CAS protocol | `accepted` | [#4601](https://github.com/kuhlman-labs/fishhawk/issues/4601) |
+| [ADR-110](110-repository-agnostic-product-features.md) | Product features are repository-agnostic: repository specifics are declared configuration, and this repository is a configured instance, not a special case | `accepted` | [#4605](https://github.com/kuhlman-labs/fishhawk/issues/4605) |
+| [ADR-111](111-documentation-freshness-for-the-published-site.md) | Documentation freshness for the published site: a PR-time site job, a reference-integrity check, a stated site obligation, and a narrow definition of up to date | `accepted` | [#4611](https://github.com/kuhlman-labs/fishhawk/issues/4611) |
+| [ADR-112](112-queue-merge-forge-approval-predicate.md) | Amend ADR-093 D6: a transferred approval needs a fresh, trusted forge approval at the verified head; an undeterminable or missing one HOLDS rather than ejects on a non-blocked PR | `accepted` | [#4622](https://github.com/kuhlman-labs/fishhawk/issues/4622) |
+| [ADR-113](113-forge-verified-adr-ratification.md) | ADR ratification as a forge-verified, hash-bound approval in the plan-gate approvals shape, a deterministic record writer, and catch-rate decoupling (Option B′) | `accepted` | [#4628](https://github.com/kuhlman-labs/fishhawk/issues/4628) |
+| [ADR-114](114-repo-scoped-refinement-sessions.md) | Refinement sessions are optionally repo-scoped at open, and drafting/preview resolve that repo's conventions per repo (not the shipped default) | `accepted` | [#4642](https://github.com/kuhlman-labs/fishhawk/issues/4642) |
+| [ADR-115](115-parallel-stages-up-to-merge.md) | Every stage runs in parallel up to the merge: the merge queue is the only serial point, capacity is the only bound, and a moving base is reconciled at merge time | `accepted` | [#4646](https://github.com/kuhlman-labs/fishhawk/issues/4646) |
+| [ADR-116](116-fan-in-conflict-recovered-in-place.md) | A slice conflict at fan-in parks and is recovered in place (conflict probe, mechanical union, then a hunk-confined resolution pass, then a scoped parent fix-up, with a verified operator resolution always available), never by restarting the whole run | `accepted` | [#4680](https://github.com/kuhlman-labs/fishhawk/issues/4680) |
+| [ADR-117](117-live-review-effectiveness.md) | Live review effectiveness is measured: concern outcomes and human judgements, child-slice concerns imported into the parent, an escape record attributed to the rounds that saw the code, and a presence-conditioned per-reviewer scorecard | `accepted` | [#4690](https://github.com/kuhlman-labs/fishhawk/issues/4690) |
+| [ADR-118](118-review-changes-judged-not-repinned.md) | Review changes are judged, not re-pinned: a per-arm eval gate (standing, experiment and monitor arms; model changes as paired experiments), reviewer configuration as a gate trigger, and one pre-registered offline+live decision rule | `accepted` | [#4698](https://github.com/kuhlman-labs/fishhawk/issues/4698) |
 
 ## Status unknown — needs captain confirmation
 
