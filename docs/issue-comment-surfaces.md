@@ -311,7 +311,9 @@ Notes:
   the PR merge box — not only in the issue anchor and audit chain. Rendered by
   the pure `RenderPRReviewBody` (`pr_review_template.go`, reusing the anchor's
   severity-bucketed concern shape + a `concern_resolutions` arc + a
-  reviewer-model / run attribution line) and posted by a best-effort
+  reviewer-model / run attribution line, under a heading naming the reviewer's
+  role, `### 🤖 <Role> — agent implement review` — see "Reviewer-role
+  attribution" below) and posted by a best-effort
   `maybePostAgentReviewPRReviews` folded into `NotifyStatusUpdateForRun` AFTER
   the anchor edit, mirroring the E42.1 `maybeUpdatePRStatusComment` plumbing —
   the single fan-out point every rebuild hook already calls, so no new
@@ -370,10 +372,11 @@ Notes:
     produces no spurious "awaiting your review" ping.
   - **Reviewer reject (advisory)** — `plan_reviewed` / `implement_reviewed`
     with verdict `reject`. A reviewer reject is ADVISORY — the operator
-    arbitrates the gate — so the ping is worded "🚫 `<model>` flagged a
-    blocking concern on the `<stage>` (advisory reject) — awaiting operator
-    arbitration." (naming the `reviewer_model`, falling back to "A reviewer")
-    and never reads as a gate rejection. The kind token stays
+    arbitrates the gate — so the ping is worded "🚫 `<Role> (<model>)` flagged
+    a blocking concern on the `<stage>` (advisory reject) — awaiting operator
+    arbitration." (naming the reviewer's role ahead of its `reviewer_model`,
+    and the role alone when the model is unknown — see "Reviewer-role
+    attribution" below) and never reads as a gate rejection. The kind token stays
     `<stage>_review_rejected` for dedup parity. **Skipped once resolved
     (#1786):** if a later `approval_submitted` (plan or implement) or
     `stage_fixup_triggered` (implement) has landed by the time the page would
@@ -2820,6 +2823,38 @@ Notes:
   a reader grepping the audit categories doesn't mistake it for a comment
   surface.
 
+
+### Reviewer-role attribution (E89.33 / #4669)
+
+Every agent-authored review surface names the ROLE of the reviewer that wrote
+it, on both forges. The label is `issuecomment.reviewerRole` over the review
+audit payload's `persona` field (`reviewer_role.go`):
+
+- **Standard reviewer** (no `persona`, including every row recorded before
+  #3753): `Plan Reviewer` on plan review, `PR Reviewer` on implement review.
+- **Declared persona**: the snake_case name title-cased plus ` Reviewer`
+  (`architect` → `Architect Reviewer`, `security_portability` → `Security
+  Portability Reviewer`); a trailing `reviewer` word is dropped
+  (`code_reviewer` → `Code Reviewer`, `reviewer` → `Reviewer`). There is NO
+  built-in persona list (ADR-110): any name a repository declares labels
+  correctly.
+- **Malformed name** (breaks the workflow-v2 `reviewer_personas` key rule
+  `^[a-z][a-z0-9_]*$`): the fixed `Persona Reviewer`; the name is never echoed,
+  so a tampered payload cannot inject markdown or an @-mention.
+
+| Surface | Forge | Role attribution |
+|---|---|---|
+| Agent-review PR review | GitHub only (no MR-review surface on GitLab) | heading `### 🤖 <Role> — agent implement review`; the attribution line still names the model |
+| Living anchor review section | GitHub + GitLab | each summary token and per-reviewer `<details><summary>` reads `<Role> (<model>): <verdict>`; the current round's persona-naming `*_review_skipped` / `*_review_failed` rows render as `<Role>: skipped (<reason slug>)` / `<Role> (<model>): failed[ (timeout)]` with no `<details>` (a standard reviewer's skip/fail row still renders nothing; a failure's reason prose never renders) |
+| PR status comment | GitHub | the same review section, through the shared `renderStageReviews` |
+| Reviewer-reject ping | GitHub + GitLab | `🚫 <Role> (<model>) flagged …`, or `🚫 <Role> flagged …` with no model |
+
+Every other surface (plan echo, CI-failure retry, budget alert, slash-command
+reply, run rejected / not applicable, crew pings, campaign hand-off) speaks in
+Fishhawk's own voice and names no reviewer role. A persona failure's role
+comes from `ReviewFailedPayload.persona` (stamped since #4669 at the persona
+invocation-failure sites); a failed row recorded before that names no persona
+and renders no row.
 
 ## Push notification sinks (#2292)
 

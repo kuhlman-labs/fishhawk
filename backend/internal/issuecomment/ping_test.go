@@ -7,6 +7,7 @@ import (
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -52,14 +53,52 @@ func TestPageClassEvents_ReviewerRejectWording(t *testing.T) {
 }
 
 // TestPageClassEvents_ReviewerRejectModelFallback covers the missing-model
-// fallback to "A reviewer".
+// fallback: the ping names the stage's standard role alone (E89.33 / #4669).
 func TestPageClassEvents_ReviewerRejectModelFallback(t *testing.T) {
-	entries := []*audit.Entry{
-		verdictEntry(5, "implement_reviewed", "reject"), // no reviewer_model
+	for _, tc := range []struct{ category, want string }{
+		{"implement_reviewed", "🚫 PR Reviewer flagged"},
+		{"plan_reviewed", "🚫 Plan Reviewer flagged"},
+	} {
+		entries := []*audit.Entry{
+			verdictEntry(5, tc.category, "reject"), // no reviewer_model
+		}
+		got := pageClassEvents(entries, nil)
+		if len(got) != 1 || !strings.HasPrefix(got[0].message, tc.want) {
+			t.Fatalf("%s: expected the %q standard-role fallback; got %+v", tc.category, tc.want, got)
+		}
 	}
-	got := pageClassEvents(entries, nil)
-	if len(got) != 1 || !strings.HasPrefix(got[0].message, "🚫 A reviewer flagged") {
-		t.Fatalf("expected 'A reviewer' fallback; got %+v", got)
+}
+
+// TestPageClassEvents_ReviewerRejectNamesRole pins the advisory reviewer-reject
+// ping's role attribution (E89.33 / #4669): the role precedes the model — the
+// persona's role for a persona reject, the stage's standard role otherwise —
+// seeded from the real planreview payload structs.
+func TestPageClassEvents_ReviewerRejectNamesRole(t *testing.T) {
+	high := []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "design", Note: "boom"}}
+	cases := []struct {
+		name  string
+		entry *audit.Entry
+		want  string
+	}{
+		{"persona plan reject", roleVerdictEntry(t, 5, "plan", "claude-opus-5-5", "architect", planreview.VerdictReject, high),
+			"🚫 Architect Reviewer (claude-opus-5-5) flagged a blocking concern on the plan (advisory reject) — awaiting operator arbitration."},
+		{"standard implement reject", roleVerdictEntry(t, 5, "implement", "gpt-5.5", "", planreview.VerdictReject, high),
+			"🚫 PR Reviewer (gpt-5.5) flagged a blocking concern on the implement (advisory reject) — awaiting operator arbitration."},
+		{"no-model standard plan reject", roleVerdictEntry(t, 5, "plan", "", "", planreview.VerdictReject, high),
+			"🚫 Plan Reviewer flagged a blocking concern on the plan (advisory reject) — awaiting operator arbitration."},
+		{"invalid persona name", roleVerdictEntry(t, 5, "implement", "m", "@ops", planreview.VerdictReject, high),
+			"🚫 Persona Reviewer (m) flagged a blocking concern on the implement (advisory reject) — awaiting operator arbitration."},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := pageClassEvents([]*audit.Entry{tc.entry}, nil)
+			if len(got) != 1 {
+				t.Fatalf("expected one reviewer-reject event; got %+v", got)
+			}
+			if got[0].message != tc.want {
+				t.Errorf("message:\n got %q\nwant %q", got[0].message, tc.want)
+			}
+		})
 	}
 }
 

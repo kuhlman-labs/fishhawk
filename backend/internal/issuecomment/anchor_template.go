@@ -594,9 +594,14 @@ func hasStageType(stages []*run.Stage, stageType string) bool {
 }
 
 // renderStageReviews renders one stage's current-round reviewer verdicts:
-// an inline summary line ("claude-opus-4-8: approve · gpt-5.5: reject (1
-// high)") plus the full free_form text per verdict in an expandable
-// <details>. Empty when the current round has no landed verdicts.
+// an inline summary line ("Plan Reviewer (claude-opus-4-8): approve ·
+// Architect Reviewer (gpt-5.5): reject (1 high)") naming each reviewer's role
+// ahead of its model (E89.33 / #4669), plus the full free_form text per
+// verdict in an expandable <details>. The current round's persona-naming
+// skip/fail rows ("Security Reviewer: skipped (persona_remit_unavailable)")
+// join the summary line but open no <details>. Empty when the current round
+// has no landed verdict and no persona skip/fail row. The PR status comment
+// reuses this renderer, so it names the same roles.
 func renderStageReviews(stageType string, entries []*audit.Entry) string {
 	verdicts := currentRoundReviewVerdicts(stageType, entries)
 	if len(verdicts) == 0 {
@@ -904,6 +909,9 @@ func writeConcernEvidence(b *strings.Builder, evidence string) {
 }
 
 type anchorReviewVerdict struct {
+	// role is the reviewer's role label (reviewerRole): the stage's standard
+	// role, or the declared persona's (E89.33 / #4669).
+	role          string
 	reviewerModel string
 	verdict       string
 	concerns      []anchorReviewConcern
@@ -912,13 +920,11 @@ type anchorReviewVerdict struct {
 }
 
 // summaryToken renders the inline summary form for one verdict, e.g.
-// "gpt-5.5: reject (1 high)". Concern counts are severity-tagged.
+// "Architect Reviewer (gpt-5.5): reject (1 high)": the reviewer's role, its
+// model when known, then the verdict (E89.33 / #4669). Concern counts are
+// severity-tagged.
 func (v anchorReviewVerdict) summaryToken() string {
-	model := v.reviewerModel
-	if model == "" {
-		model = "reviewer"
-	}
-	tok := fmt.Sprintf("%s: %s", model, v.verdict)
+	tok := roleWithModel(v.role, v.reviewerModel) + ": " + v.verdict
 	if c := severityCountSuffix(v.concerns); c != "" {
 		tok += " " + c
 	}
@@ -976,9 +982,20 @@ func severityRank(sev string) int {
 // (Sequence <= the floor) is excluded so it can never read as the
 // current round's state. When no `_review_started` entry exists the
 // floor is 0 and every verdict counts (real audit sequences are >= 1).
+//
+// Each verdict carries its reviewer role (reviewerRole over the payload's
+// persona; a payload with no persona, including one recorded before #3753,
+// is the standard reviewer). Under the same floor the current round's
+// `<stageType>_review_skipped` / `<stageType>_review_failed` rows that NAME a
+// persona are merged in as verdicts with no concerns and no free_form
+// (E89.33 / #4669), so a persona that did not run still reads by role on the
+// summary line. A standard reviewer's skip/fail row is dropped, exactly as
+// before.
 func currentRoundReviewVerdicts(stageType string, entries []*audit.Entry) []anchorReviewVerdict {
 	startedCat := stageType + "_review_started"
 	reviewedCat := stageType + "_reviewed"
+	skippedCat := stageType + "_review_skipped"
+	failedCat := stageType + "_review_failed"
 
 	var floor int64
 	for _, e := range entries {
@@ -989,14 +1006,26 @@ func currentRoundReviewVerdicts(stageType string, entries []*audit.Entry) []anch
 
 	var out []anchorReviewVerdict
 	for _, e := range entries {
-		if e.Category != reviewedCat {
+		if e.Category != reviewedCat && e.Category != skippedCat && e.Category != failedCat {
 			continue
 		}
 		if e.Sequence <= floor {
 			// Stale: belongs to an earlier review round.
 			continue
 		}
-		v := decodeAnchorVerdict(e.Payload)
+		if e.Category == reviewedCat {
+			v := decodeAnchorVerdict(e.Payload)
+			v.role = reviewerRole(stageType, reviewerPersonaOf(e.Payload))
+			v.sequence = e.Sequence
+			out = append(out, v)
+			continue
+		}
+		persona := reviewerPersonaOf(e.Payload)
+		if persona == "" {
+			continue
+		}
+		v := decodeAnchorTerminalRow(e.Category == failedCat, e.Payload)
+		v.role = reviewerRole(stageType, persona)
 		v.sequence = e.Sequence
 		out = append(out, v)
 	}
@@ -1034,6 +1063,33 @@ func decodeAnchorVerdict(payload []byte) anchorReviewVerdict {
 		v.concerns = append(v.concerns, anchorReviewConcern{
 			severity: c.Severity, category: c.Category, note: c.Note, evidence: c.NewEvidence,
 		})
+	}
+	return v
+}
+
+// decodeAnchorTerminalRow renders a persona's *_review_skipped (failed=false)
+// or *_review_failed (failed=true) row as a summary-only verdict: "skipped
+// (<reason>)" or "failed" / "failed (timeout)". A skip reason renders only when
+// it is a machine slug; a failure's reason is unbounded error prose and never
+// renders. The row carries no concerns and no free_form, so it opens no
+// <details>.
+func decodeAnchorTerminalRow(failed bool, payload []byte) anchorReviewVerdict {
+	var p struct {
+		Reason        string `json:"reason"`
+		ReviewerModel string `json:"reviewer_model"`
+		Timeout       bool   `json:"timeout"`
+	}
+	_ = json.Unmarshal(payload, &p)
+	if failed {
+		v := anchorReviewVerdict{reviewerModel: p.ReviewerModel, verdict: "failed"}
+		if p.Timeout {
+			v.verdict = "failed (timeout)"
+		}
+		return v
+	}
+	v := anchorReviewVerdict{verdict: "skipped"}
+	if personaNamePattern.MatchString(p.Reason) {
+		v.verdict = "skipped (" + p.Reason + ")"
 	}
 	return v
 }

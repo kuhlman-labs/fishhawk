@@ -316,7 +316,7 @@ func TestRenderPRStatusBody_CurrentRoundReviewsOnly(t *testing.T) {
 		Audit: entries,
 		Now:   time.Unix(1000, 0).UTC(),
 	})
-	if !strings.Contains(body, "claude-opus-4-8: approve") {
+	if !strings.Contains(body, "PR Reviewer (claude-opus-4-8): approve") {
 		t.Errorf("current-round verdict missing:\n%s", body)
 	}
 	if strings.Contains(body, "stale-model") {
