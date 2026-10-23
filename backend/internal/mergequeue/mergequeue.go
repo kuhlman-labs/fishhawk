@@ -47,8 +47,10 @@ func (s State) Terminal() bool {
 	return s == StateMerged || s == StateEjected || s == StateDropped
 }
 
-// Phase is a live entry's progress. The column has no CHECK: these are the
-// phases ADR-092 writes, and ADR-093 adds its own without a migration.
+// Phase is a live entry's progress: the LAST RECORDED step of its head-of-line
+// cycle, not a liveness signal (a process that died mid-step leaves the phase
+// it last wrote; ADR-093 D8 resumes from it). The column has no CHECK: these
+// are the phases ADR-092 writes, and ADR-093 adds its own without a migration.
 type Phase string
 
 // ADR-092 phases.
@@ -59,6 +61,20 @@ const (
 	PhaseVerifying  Phase = "verifying"
 	PhasePassed     Phase = "passed"
 	PhaseUnverified Phase = "unverified"
+)
+
+// ADR-093 D8 phases (#4298): the head-of-line steps a restart resumes from.
+const (
+	// PhaseAdvancing is stamped by the admission right before its
+	// behind-probe and base advance. Like PhaseAdmitted it is re-claimed
+	// (AdmissionStaleAfter, and Resumer.AdmitNextReclaiming's boot instant).
+	PhaseAdvancing Phase = "advancing"
+	// PhaseMerging is stamped by merge-on-pass in-lock, after its verdict row
+	// and BEFORE its merge-dispatch claim: the forge merge may be in flight.
+	PhaseMerging Phase = "merging"
+	// PhaseSettling is stamped after the forge accepted the merge, before the
+	// merged settle.
+	PhaseSettling Phase = "settling"
 )
 
 // ReasonBaseChanged is the drop reason Enqueue records when a run with an
@@ -72,9 +88,15 @@ const ReasonBaseChanged = "base_changed"
 const ReentryReason = "verify_failed"
 
 // AdmissionStaleAfter bounds how long a live entry may stay in
-// PhaseAdmitted: past it AdmitNext re-claims the admission (a crash
-// mid-admission recovers on the next pump). README.md § "Constants".
+// PhaseAdmitted or PhaseAdvancing: past it AdmitNext re-claims the admission
+// (a crash mid-admission recovers on the next pump). README.md § "Constants".
 const AdmissionStaleAfter = 10 * time.Minute
+
+// IntentFnTimeout is the deadline WithMergeIntentLock puts on its fn (the
+// ADR-108 merge-intent lock fn deadline). Exported for the ADR-093 D8 resume,
+// whose crash-left queue-claim age window is derived from it (README.md §
+// "Merge-dispatch ledger", "Crash-left claims").
+const IntentFnTimeout = intentFnTimeout
 
 // Errors. Each is returned wrapped; match with errors.Is.
 var (
@@ -110,6 +132,10 @@ var (
 	// ErrEntryYielded is a Promote for a yielded (marked) held entry: AdmitNext
 	// skips it whatever its order, so the marker must clear first.
 	ErrEntryYielded = errors.New("mergequeue: entry is yielded; clear its yield before promoting")
+	// ErrReclaimUnrecorded is an AdmitNextReclaiming whose ReclaimRecordFunc
+	// failed: the whole call was rolled back (no epoch bump, no admitted_at
+	// change). It wraps the callback's error.
+	ErrReclaimUnrecorded = errors.New("mergequeue: re-claim not recorded")
 )
 
 // Base is one queue: a repository base ref inside one account. AccountID is
@@ -149,7 +175,7 @@ type Entry struct {
 	// never overwritten; 0 for NULL (no intent, or one recorded before 0108).
 	MergeIntentSequence int64
 	// AdmissionEpoch is bumped by every admission (AdmitNext's admit and its
-	// stale re-claim, 0108). The admission-owned writes (Unadmit, SetPhase,
+	// stale re-claim, 0108; AdmitNextReclaiming's boot re-claim). The admission-owned writes (Unadmit, SetPhase,
 	// ReanchorAt, SettleAt, ApprovalWait, Yield) are compare-and-swaps on it.
 	AdmissionEpoch int64
 	// YieldReason and YieldDetail are the yield marker (0109, ADR-112 R3):
@@ -377,8 +403,9 @@ type MergeIntentResult struct {
 // Admission is AdmitNext's verdict.
 type Admission struct {
 	// Admitted reports THIS call made Entry the base's live entry: either a
-	// held entry was admitted, or (Readmitted) a stale admission was
-	// re-claimed. The caller owns the admission work.
+	// held entry was admitted, or (Readmitted) a stale admission, or one
+	// admitted before AdmitNextReclaiming's boot instant, was re-claimed. The
+	// caller owns the admission work.
 	Admitted   bool
 	Readmitted bool
 	// Entry is the admitted entry when Admitted; otherwise the base's live
@@ -465,6 +492,47 @@ type ReentryReader interface {
 	// every account.
 	ReentryCandidates(ctx context.Context, after *ReentryCursor, limit int) ([]Entry, error)
 }
+
+// Resumer is the restart resume's capability (ADR-093 D8, #4298): a separate
+// interface like Promoter, so every existing fake keeps compiling and a fake
+// without it degrades (the boot re-claim is off; the stale re-claim remains).
+type Resumer interface {
+	// DatabaseNow reads the database clock (clock_timestamp()): the boot
+	// instant a caller passes back as ReclaimRequest.AdmittedBefore, so no Go
+	// clock is ever compared against a stored instant.
+	DatabaseNow(ctx context.Context) (time.Time, error)
+	// AdmitNextReclaiming is AdmitNext, in the SAME admit transaction, that
+	// also re-claims a live admitted/advancing entry admitted before
+	// req.AdmittedBefore, calling req.Record inside the transaction on every
+	// re-claim (README.md § "AdmitNextReclaiming").
+	AdmitNextReclaiming(ctx context.Context, req ReclaimRequest) (Admission, error)
+}
+
+// ReclaimRequest is AdmitNextReclaiming's request.
+type ReclaimRequest struct {
+	Base Base
+	// AdmittedBefore is a DATABASE-clock instant read back from DatabaseNow
+	// (required; the zero time is ErrInvalidRequest): a live entry in
+	// PhaseAdmitted or PhaseAdvancing whose admitted_at is strictly before it
+	// is re-claimed even when it is not yet AdmissionStaleAfter old.
+	AdmittedBefore time.Time
+	// Record is REQUIRED. It runs inside the admit transaction on EVERY
+	// re-claim (the boot instant or AdmissionStaleAfter), after the re-claim
+	// write and before COMMIT; a non-nil error rolls the whole call back and
+	// AdmitNextReclaiming returns it wrapped in ErrReclaimUnrecorded. It is
+	// never called for an admission of a held entry, or when nothing is
+	// re-claimed.
+	Record ReclaimRecordFunc
+}
+
+// ReclaimRecordFunc is AdmitNextReclaiming's record-before-commit callback:
+// reclaimed is the entry after the re-claim (its new admission epoch and
+// admitted_at, its phase unchanged), read inside tx. The re-claim UPDATE
+// touches no key column, so an audit.AppendChainedTx on tx takes no
+// foreign-key lock on the runs row (the PromoteRequest.Record precedent). It
+// runs under the call's base lock and row lock and must not call back into
+// the Store.
+type ReclaimRecordFunc func(ctx context.Context, tx pgx.Tx, reclaimed Entry) error
 
 // ReentryCursor is an exclusive keyset position in ReentryCandidates' order
 // (settled_at, id): the sweep pages past a full page of candidates that never

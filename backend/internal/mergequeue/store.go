@@ -63,6 +63,7 @@ var (
 	_ Promoter       = (*PostgresStore)(nil)
 	_ EjectionReader = (*PostgresStore)(nil)
 	_ ReentryReader  = (*PostgresStore)(nil)
+	_ Resumer        = (*PostgresStore)(nil)
 )
 
 // NewPostgresStore returns the Postgres queue store.
@@ -362,10 +363,50 @@ WHERE id = $1 AND state IN ('held', 'live')`, id, string(state), reason); err !=
 // (effectiveKeySQL, id) when the base has no live one. See README.md §
 // "AdmitNext".
 func (s *PostgresStore) AdmitNext(ctx context.Context, base Base) (Admission, error) {
+	return s.admit(ctx, base, nil)
+}
+
+// AdmitNextReclaiming is AdmitNext that also re-claims a live admitted or
+// advancing entry admitted before req.AdmittedBefore (a database-clock
+// instant), recording every re-claim through req.Record before COMMIT. See
+// README.md § "AdmitNextReclaiming".
+func (s *PostgresStore) AdmitNextReclaiming(ctx context.Context, req ReclaimRequest) (Admission, error) {
+	switch {
+	case req.AdmittedBefore.IsZero():
+		return Admission{}, fmt.Errorf("%w: a re-claiming admission requires the boot instant (AdmittedBefore)", ErrInvalidRequest)
+	case req.Record == nil:
+		return Admission{}, fmt.Errorf("%w: a Record callback is required (a re-claim never commits unrecorded)", ErrInvalidRequest)
+	}
+	return s.admit(ctx, req.Base, &req)
+}
+
+// DatabaseNow reads the database clock (clock_timestamp()).
+func (s *PostgresStore) DatabaseNow(ctx context.Context) (time.Time, error) {
+	var now time.Time
+	if err := s.pool.QueryRow(ctx, `SELECT clock_timestamp()`).Scan(&now); err != nil {
+		return time.Time{}, fmt.Errorf("mergequeue: read database clock: %w", err)
+	}
+	return now, nil
+}
+
+// reclaimablePhasesSQL are the live phases a re-claim may take over: the
+// admission's own steps (ADR-093 D8). verifying, unverified, passed, merging
+// and settling are never re-claimed.
+const reclaimablePhasesSQL = `('` + string(PhaseAdmitted) + `', '` + string(PhaseAdvancing) + `')`
+
+// admit is the ONE admit transaction AdmitNext and AdmitNextReclaiming share
+// (reclaim nil: AdmitNext): the same base lock, live check, held select and
+// re-claim UPDATE, so the yielded-row skip and the re-claim's column
+// preservation are one path (ADR-093 D8 ruling R6).
+func (s *PostgresStore) admit(ctx context.Context, base Base, reclaim *ReclaimRequest) (Admission, error) {
 	if err := base.validate(); err != nil {
 		return Admission{}, err
 	}
 	acct := acctArg(base.AccountID)
+	var admittedBefore *time.Time // NULL for AdmitNext: the disjunct is false
+	if reclaim != nil {
+		admittedBefore = &reclaim.AdmittedBefore
+	}
 	var out Admission
 	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
 		if err := lockTx(ctx, tx, lockKey(base.AccountID, base.Repo, base.BaseRef)); err != nil {
@@ -373,15 +414,18 @@ func (s *PostgresStore) AdmitNext(ctx context.Context, base Base) (Admission, er
 		}
 		var stale bool
 		live, err := scanEntry(tx.QueryRow(ctx, `SELECT `+entryCols+`,
-  (e.phase = '`+string(PhaseAdmitted)+`' AND e.admitted_at <= clock_timestamp() - `+admissionStaleSQL+`)`+entryFrom+`
+  COALESCE(e.phase IN `+reclaimablePhasesSQL+` AND (e.admitted_at <= clock_timestamp() - `+admissionStaleSQL+`
+    OR e.admitted_at < $4::timestamptz), false)`+entryFrom+`
 WHERE `+basePredicate+` AND e.state = 'live'
 ORDER BY e.admitted_at, e.id
 LIMIT 1
-FOR UPDATE OF e`, base.Repo, base.BaseRef, acct), &stale)
+FOR UPDATE OF e`, base.Repo, base.BaseRef, acct, admittedBefore), &stale)
 		switch {
 		case err == nil && stale:
 			// A crash mid-admission: re-claim it so exactly one pump re-runs
-			// the (idempotent) admission work.
+			// the (idempotent) admission work. ONLY admitted_at and the epoch
+			// move: the anchor, order_key, enqueued_at, the yield columns and
+			// approval_wait_started_at are kept (R6).
 			if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
 SET admitted_at = clock_timestamp(), admission_epoch = admission_epoch + 1
 WHERE id = $1`, live.ID); err != nil {
@@ -390,6 +434,11 @@ WHERE id = $1`, live.ID); err != nil {
 			e, err := getEntryTx(ctx, tx, live.ID)
 			if err != nil {
 				return err
+			}
+			if reclaim != nil {
+				if err := reclaim.Record(ctx, tx, e); err != nil { // AdmitNextReclaiming record-before-commit
+					return fmt.Errorf("%w: %w", ErrReclaimUnrecorded, err)
+				}
 			}
 			out = Admission{Admitted: true, Readmitted: true, Entry: &e}
 			return nil
