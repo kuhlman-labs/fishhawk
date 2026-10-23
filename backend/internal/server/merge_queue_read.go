@@ -50,12 +50,15 @@ type mergeQueueReadResponse struct {
 // mergeQueueBaseView is one (account, repository, base ref) queue.
 type mergeQueueBaseView struct {
 	BaseRef string `json:"base_ref"`
-	// Entries are the base's active entries in queue order: the live entry
-	// first, then held entries FIFO by (enqueued_at, id). Never nil.
+	// Entries are the base's active entries in the store's queue order
+	// (ListForBase): the live entry first, then unmarked held entries FIFO by
+	// (enqueued_at, id), then YIELDED held entries (ADR-112 R3: admission
+	// skips them until a re-probe clears the marker). Never nil.
 	Entries []mergeQueueEntryView `json:"entries"`
 	// HeadOfLine is the first entry (the live one, or the next held entry to
-	// admit when none is live) with its PR's current head; omitted when the
-	// base has no active entry.
+	// admit when none is live; a yielded entry only when every held entry is
+	// yielded) with its PR's current head; omitted when the base has no
+	// active entry.
 	HeadOfLine *mergeQueueHeadOfLine `json:"head_of_line,omitempty"`
 	ETABasis   mergeQueueETABasis    `json:"eta_basis"`
 }
@@ -81,9 +84,16 @@ type mergeQueueEntryView struct {
 	AnchoredHeadSHA string     `json:"anchored_head_sha"`
 	AnchoredBaseSHA string     `json:"anchored_base_sha,omitempty"`
 	// ETASeconds is a held entry's estimated wait: Position x the median
-	// line turn. Omitted for the live entry and when the base has no merged
-	// history.
+	// line turn. Omitted for the live entry, for a YIELDED entry (it waits on
+	// the operator, not the line) and when the base has no merged history.
 	ETASeconds *int64 `json:"eta_seconds,omitempty"`
+	// The ADR-112 R5 yield fields (mergeQueueYieldProjection): omitted on an
+	// entry with no yield marker and no approval-wait anchor.
+	YieldReason           string     `json:"yield_reason,omitempty"`
+	YieldDetail           string     `json:"yield_detail,omitempty"`
+	YieldedAt             *time.Time `json:"yielded_at,omitempty"`
+	NextStep              string     `json:"next_step,omitempty"`
+	ApprovalWaitStartedAt *time.Time `json:"approval_wait_started_at,omitempty"`
 	// DispatchClaim is the run's merge-dispatch claim (ADR-093 approval
 	// condition D1, ruling R2): present while a claim exists, so a
 	// dispatch_failed claim holding the line is visible. Omitted with none.
@@ -119,6 +129,45 @@ type mergeQueueHeadOfLine struct {
 	// run_read_failed, forge_unwired, pull_request_unresolvable or
 	// forge_read_failed.
 	CurrentHeadUnavailable string `json:"current_head_unavailable,omitempty"`
+	// The ADR-112 R5 yield fields, as on mergeQueueEntryView.
+	YieldReason           string     `json:"yield_reason,omitempty"`
+	YieldDetail           string     `json:"yield_detail,omitempty"`
+	YieldedAt             *time.Time `json:"yielded_at,omitempty"`
+	NextStep              string     `json:"next_step,omitempty"`
+	ApprovalWaitStartedAt *time.Time `json:"approval_wait_started_at,omitempty"`
+}
+
+// mergeQueueYieldProjection is the ADR-112 R5 yield projection of one entry,
+// shared by every read surface (the queue read's entries and head_of_line,
+// and runMergeCandidateQueuePayload on the run read and the gate view) so
+// they cannot disagree. ON A YIELDED ENTRY: yield_reason (the closed
+// vocabulary, merge_queue_yield.go), yield_detail passed through THE
+// sanitiser mergeQueueYieldDetail (forge-derived, untrusted: tokens
+// redacted, cut at the first line break, control characters dropped,
+// bounded), yielded_at, and next_step DERIVED from the reason through the
+// total mapping mergeQueueYieldNextStep (never stored). approval_wait_started_at
+// is the episode's persisted head-of-line wait anchor, carried whenever set
+// (a live entry waiting at the head, or a yielded one). An entry with neither
+// carries the zero value, so every field is omitted.
+type mergeQueueYieldProjection struct {
+	Reason                string
+	Detail                string
+	YieldedAt             *time.Time
+	NextStep              string
+	ApprovalWaitStartedAt *time.Time
+}
+
+// mergeQueueYieldProjectionFor projects e's yield marker and wait anchor.
+func mergeQueueYieldProjectionFor(e mergequeue.Entry) mergeQueueYieldProjection {
+	p := mergeQueueYieldProjection{ApprovalWaitStartedAt: e.ApprovalWaitStartedAt}
+	if !e.Yielded() {
+		return p
+	}
+	p.Reason = e.YieldReason
+	p.Detail = mergeQueueYieldDetail(e.YieldDetail)
+	p.YieldedAt = e.YieldedAt
+	p.NextStep = mergeQueueYieldNextStep(e.YieldReason)
+	return p
 }
 
 // mergeQueueETABasis is what every eta_seconds on the base is derived from.
@@ -244,6 +293,9 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 			AnchoredHeadSHA: e.AnchoredHeadSHA,
 			AnchoredBaseSHA: e.AnchoredBaseSHA,
 		}
+		y := mergeQueueYieldProjectionFor(e)
+		ev.YieldReason, ev.YieldDetail, ev.YieldedAt, ev.NextStep, ev.ApprovalWaitStartedAt =
+			y.Reason, y.Detail, y.YieldedAt, y.NextStep, y.ApprovalWaitStartedAt
 		claim, found, err := s.cfg.MergeQueue.MergeDispatch(ctx, e.RunID)
 		if err != nil {
 			return mergeQueueBaseView{}, err
@@ -257,7 +309,9 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 		if e.State == mergequeue.StateHeld {
 			held++
 			ev.Position = held
-			if haveMedian {
+			// A yielded entry waits on the operator's remedy, not on the
+			// line, so it carries no ETA (ADR-112 R5).
+			if haveMedian && !e.Yielded() {
 				eta := int64(held) * median
 				ev.ETASeconds = &eta
 			}
@@ -297,6 +351,9 @@ func (s *Server) mergeQueueHeadOfLineFor(ctx context.Context, e mergequeue.Entry
 		Phase:           string(e.Phase),
 		AnchoredHeadSHA: e.AnchoredHeadSHA,
 	}
+	y := mergeQueueYieldProjectionFor(e)
+	out.YieldReason, out.YieldDetail, out.YieldedAt, out.NextStep, out.ApprovalWaitStartedAt =
+		y.Reason, y.Detail, y.YieldedAt, y.NextStep, y.ApprovalWaitStartedAt
 	head, reason := s.mergeQueueCurrentHead(ctx, e)
 	out.CurrentHeadSHA, out.CurrentHeadUnavailable = head, reason
 	return out

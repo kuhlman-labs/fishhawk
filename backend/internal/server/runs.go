@@ -453,6 +453,33 @@ type runMergeCandidateQueuePayload struct {
 	// it was recorded, omitted without intent.
 	MergeIntent   bool       `json:"merge_intent"`
 	MergeIntentAt *time.Time `json:"merge_intent_at,omitempty"`
+	// The ADR-112 R5 yield fields (mergeQueueYieldProjection, the same
+	// projection the merge-queue read carries): on a YIELDED entry
+	// yield_reason, the sanitised yield_detail, yielded_at and the derived
+	// next_step; approval_wait_started_at whenever the episode's head-of-line
+	// wait anchor is set. Omitted otherwise.
+	YieldReason           string     `json:"yield_reason,omitempty"`
+	YieldDetail           string     `json:"yield_detail,omitempty"`
+	YieldedAt             *time.Time `json:"yielded_at,omitempty"`
+	NextStep              string     `json:"next_step,omitempty"`
+	ApprovalWaitStartedAt *time.Time `json:"approval_wait_started_at,omitempty"`
+}
+
+// mergeQueueYieldRemedy is the remedy prose for a yield's next_step, built
+// ONLY from the closed next_step vocabulary (never from yield_detail, which is
+// untrusted forge text). An unknown step reads as none.
+func mergeQueueYieldRemedy(nextStep string) string {
+	switch nextStep {
+	case forgeApprovalNextApprovePR:
+		return "a reviewer the review gate admits, with write permission or higher, approves the pull request at its current head on the forge"
+	case forgeApprovalNextDismissReview:
+		return "the blocking CHANGES_REQUESTED review is dismissed (or its author approves) on the forge, and the pull request carries a qualifying approval"
+	case forgeApprovalNextRetryAfter:
+		return "nothing at the forge; the forge read was undetermined or truncated, so re-invoke fishhawk_merge_run to re-probe now or let the periodic re-probe retry"
+	case forgeApprovalNextConfigureIdentityProvider:
+		return "an operator configures the github identity provider the review gate's member_of requires (outside the MCP surface), then re-invokes fishhawk_merge_run"
+	}
+	return "nothing at the forge clears it (the forge cannot bind an approval to the head); merge outside the queue or change the review gate"
 }
 
 // mergeCandidateQueuePayloadFor projects the run's active queue entry, or
@@ -478,12 +505,21 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 		MergeIntent:     e.MergeIntentAt != nil,
 		MergeIntentAt:   e.MergeIntentAt,
 	}
+	y := mergeQueueYieldProjectionFor(e)
+	out.YieldReason, out.YieldDetail, out.YieldedAt, out.NextStep, out.ApprovalWaitStartedAt =
+		y.Reason, y.Detail, y.YieldedAt, y.NextStep, y.ApprovalWaitStartedAt
 	if st.LiveRunID != nil {
 		out.LiveRunID = st.LiveRunID.String()
 	}
 	if e.State == mergequeue.StateHeld {
 		out.Phase = ""
 		out.Position = st.Position
+		if e.Yielded() {
+			// Built from the closed vocabulary only: yield_detail is carried
+			// in its own sanitised field, never in the note.
+			out.Note = fmt.Sprintf("yielded %s at position %d on %s (ADR-112 R3): the merge queue skips this entry until a re-probe finds a qualifying forge approval and clears the marker, then it rejoins FIFO at its original enqueue time; next step %s: %s. The re-probe runs on the periodic sweep (about 1 minute, backing off) and at once on a fishhawk_merge_run re-invoke or an approval at the anchored head", y.Reason, st.Position, e.BaseRef, y.NextStep, mergeQueueYieldRemedy(y.NextStep))
+			return out, nil
+		}
 		holder := "no run (the next queue event admits it)"
 		if out.LiveRunID != "" {
 			holder = "run " + out.LiveRunID

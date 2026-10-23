@@ -2824,6 +2824,62 @@ components:
           type: string
           format: date-time
           description: When the merge intent was recorded; omitted without intent.
+        yield_reason:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueYieldReason' }]
+          description: Why the entry YIELDED its place (ADR-112 R3); omitted when not yielded.
+        yield_detail:
+          type: string
+          description: |
+            The yield's forge-derived detail, UNTRUSTED text sanitised server-side
+            (tokens redacted, cut at the first line break, control characters
+            dropped, bounded) on every read surface. Omitted when not yielded.
+        yielded_at: { type: string, format: date-time, description: When the entry yielded; omitted when not yielded. }
+        next_step:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueNextStep' }]
+          description: The remedy DERIVED from `yield_reason` (never stored); omitted when not yielded.
+        approval_wait_started_at:
+          type: string
+          format: date-time
+          description: |
+            The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
+            set on the first non-approved fold at the head, never reset by a
+            readvance or re-admission, cleared only when a re-probe clears the
+            yield. Present on a live entry waiting at the head and on a yielded
+            entry; omitted when no wait started.
+
+    MergeQueueYieldReason:
+      type: string
+      description: |
+        ADR-112 R3's closed yield vocabulary. A yielded entry is held with a
+        marker the queue's admission skips; clearing the marker (a re-probe
+        whose forge-approval fold qualifies) is the only way back in, and the
+        entry then rejoins FIFO at its original `enqueued_at`. `vetoed`,
+        `provider_unsupported` and `identity_provider_unconfigured` yield at
+        once; the others wait at the head for the approval window first;
+        `forge_review_required` is precedence row 4 (the forge refused the
+        pinned merge and reports the pull request still needs review or is
+        blocked).
+      enum:
+        - forge_approval_vetoed
+        - forge_approval_review_required
+        - forge_approval_dismissed
+        - forge_approval_absent
+        - forge_approval_undetermined
+        - forge_approval_reviews_truncated
+        - forge_approval_provider_unsupported
+        - forge_approval_identity_provider_unconfigured
+        - forge_review_required
+
+    MergeQueueNextStep:
+      type: string
+      description: |
+        The operator remedy for a yield, a TOTAL mapping of `yield_reason`:
+        `approve_pr` (review_required, dismissed, absent, forge_review_required),
+        `dismiss_review` (vetoed), `retry_after` (undetermined,
+        reviews_truncated; re-invoke `POST /v0/runs/{run_id}/merge` to
+        re-probe now), `configure_identity_provider`
+        (identity_provider_unconfigured), `none` (provider_unsupported).
+      enum: [approve_pr, dismiss_review, retry_after, configure_identity_provider, none]
 
     RunCompletionBlocked:
       type: object
@@ -3580,7 +3636,8 @@ components:
           type: array
           description: |
             The base's active entries in queue order: the live entry (holding
-            the line) first, then held entries FIFO by enqueue time.
+            the line) first, then unmarked held entries FIFO by enqueue time,
+            then YIELDED held entries (ADR-112 R3), which admission skips.
           items: { $ref: '#/components/schemas/MergeQueueEntry' }
         head_of_line:
           $ref: '#/components/schemas/MergeQueueHeadOfLine'
@@ -3616,11 +3673,34 @@ components:
           format: int64
           description: |
             A held entry's estimated wait: `position` x
-            `eta_basis.median_seconds`. Omitted for the live entry and when
-            the base has no merged history. An estimate, not a promise — see
-            `eta_basis`.
+            `eta_basis.median_seconds`. Omitted for the live entry, for a
+            yielded entry (it waits on the operator's remedy, not the line)
+            and when the base has no merged history. An estimate, not a
+            promise — see `eta_basis`.
         dispatch_claim:
           $ref: '#/components/schemas/MergeQueueDispatchClaim'
+        yield_reason:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueYieldReason' }]
+          description: Why the entry YIELDED its place (ADR-112 R3); omitted when not yielded.
+        yield_detail:
+          type: string
+          description: |
+            The yield's forge-derived detail, UNTRUSTED text sanitised server-side
+            (tokens redacted, cut at the first line break, control characters
+            dropped, bounded) on every read surface. Omitted when not yielded.
+        yielded_at: { type: string, format: date-time, description: When the entry yielded; omitted when not yielded. }
+        next_step:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueNextStep' }]
+          description: The remedy DERIVED from `yield_reason` (never stored); omitted when not yielded.
+        approval_wait_started_at:
+          type: string
+          format: date-time
+          description: |
+            The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
+            set on the first non-approved fold at the head, never reset by a
+            readvance or re-admission, cleared only when a re-probe clears the
+            yield. Present on a live entry waiting at the head and on a yielded
+            entry; omitted when no wait started.
 
     MergeQueueDispatchClaim:
       type: object
@@ -3649,8 +3729,9 @@ components:
       type: object
       description: |
         The base's first entry — the live one, or the next held entry to admit
-        when none is live — with its pull request's current head. Omitted when
-        the base has no active entry.
+        when none is live (a yielded entry only when every held entry is
+        yielded) — with its pull request's current head and the yield fields.
+        Omitted when the base has no active entry.
       required: [run_id, entry_id, state, anchored_head_sha]
       properties:
         run_id: { $ref: '#/components/schemas/UUID' }
@@ -3668,6 +3749,28 @@ components:
           type: string
           enum: [run_read_failed, forge_unwired, pull_request_unresolvable, forge_read_failed]
           description: Why `current_head_sha` is absent; the read still answers 200.
+        yield_reason:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueYieldReason' }]
+          description: Why the entry YIELDED its place (ADR-112 R3); omitted when not yielded.
+        yield_detail:
+          type: string
+          description: |
+            The yield's forge-derived detail, UNTRUSTED text sanitised server-side
+            (tokens redacted, cut at the first line break, control characters
+            dropped, bounded) on every read surface. Omitted when not yielded.
+        yielded_at: { type: string, format: date-time, description: When the entry yielded; omitted when not yielded. }
+        next_step:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueNextStep' }]
+          description: The remedy DERIVED from `yield_reason` (never stored); omitted when not yielded.
+        approval_wait_started_at:
+          type: string
+          format: date-time
+          description: |
+            The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
+            set on the first non-approved fold at the head, never reset by a
+            readvance or re-admission, cleared only when a re-probe clears the
+            yield. Present on a live entry waiting at the head and on a yielded
+            entry; omitted when no wait started.
 
     MergeQueueETABasis:
       type: object

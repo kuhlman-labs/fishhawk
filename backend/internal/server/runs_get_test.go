@@ -4064,3 +4064,68 @@ func TestGetRun_MergeCandidateQueue_MergeIntent(t *testing.T) {
 		t.Fatalf("rebase-path block carries merge_intent_at, want it absent")
 	}
 }
+
+// TestGetRun_MergeCandidateQueue_Yielded is ADR-112 R5 on the run read: a
+// YIELDED held entry carries yield_reason, the SANITISED yield_detail,
+// yielded_at, next_step derived from the reason and approval_wait_started_at,
+// and a note naming the yield and its remedy built from the closed vocabulary
+// only (the instruction-style detail text never reaches it); a live entry
+// waiting at the head carries only the wait anchor. Counterfactuals: the
+// projection assignment removed → the fields read empty → RED; the yielded
+// note branch removed → the note is the plain held note → RED; the raw
+// e.YieldDetail assigned → the injected text reaches the wire → RED.
+func TestGetRun_MergeCandidateQueue_Yielded(t *testing.T) {
+	f := newMCQFixture(t)
+	a, _ := f.wave()
+	c := f.seed("c", "c0", []byte(mcvUndelegatedSpecYAML))
+	if _, err := f.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{RunID: c.id, BaseRef: mcqBase, HeadSHA: "c1"}); err != nil {
+		t.Fatalf("enqueue C: %v", err)
+	}
+	f.markYielded(c, mergeCandidateQueueReasonForgeApprovalVetoed, mqrInjectedDetail, time.Minute, 0)
+	f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = clock_timestamp() WHERE id = $1`, f.entry(a).ID)
+
+	w := getRunRaw(t, f.srv, c.id)
+	q, ok := runQueueBlock(t, w)
+	if !ok {
+		t.Fatal("merge_candidate_queue omitted for a yielded run")
+	}
+	if q.State != "held" || q.Position != 2 || q.YieldReason != mergeCandidateQueueReasonForgeApprovalVetoed ||
+		q.YieldDetail != mqrSanitisedDetail || q.YieldedAt == nil || q.NextStep != forgeApprovalNextDismissReview ||
+		q.ApprovalWaitStartedAt == nil {
+		t.Fatalf("C block = %+v, want held pos 2, vetoed / %q / dismiss_review with yielded_at and the wait anchor", q, mqrSanitisedDetail)
+	}
+	for _, want := range []string{"yielded " + mergeCandidateQueueReasonForgeApprovalVetoed, "next step " + forgeApprovalNextDismissReview, "rejoins FIFO", "fishhawk_merge_run"} {
+		if !strings.Contains(q.Note, want) {
+			t.Errorf("C note = %q, want it to contain %q", q.Note, want)
+		}
+	}
+	if strings.Contains(q.Note, "self-heals on the periodic pump") || strings.Contains(q.Note, "approval dismissed") {
+		t.Errorf("C note = %q, want the yield note (no plain held remedy, no yield_detail text)", q.Note)
+	}
+	if strings.Contains(w.Body.String(), "IGNORE ALL PREVIOUS") {
+		t.Errorf("the unsanitised yield detail reached the run read:\n%s", w.Body.String())
+	}
+
+	qa, _ := runQueueBlock(t, getRunRaw(t, f.srv, a.id))
+	if qa == nil || qa.State != "live" || qa.ApprovalWaitStartedAt == nil || qa.YieldReason != "" || qa.NextStep != "" || qa.YieldedAt != nil {
+		t.Fatalf("A block = %+v, want live with the wait anchor and no yield fields", qa)
+	}
+}
+
+// TestMergeQueueYieldRemedy_TotalOverNextSteps pins the note's remedy prose
+// for every next_step the mapping emits, and that an unknown step reads as
+// none rather than an empty remedy.
+func TestMergeQueueYieldRemedy_TotalOverNextSteps(t *testing.T) {
+	seen := map[string]bool{}
+	for _, step := range []string{forgeApprovalNextApprovePR, forgeApprovalNextDismissReview, forgeApprovalNextRetryAfter,
+		forgeApprovalNextConfigureIdentityProvider, mergeQueueYieldNextNone} {
+		got := mergeQueueYieldRemedy(step)
+		if got == "" || seen[got] {
+			t.Errorf("remedy(%q) = %q, want a distinct non-empty remedy", step, got)
+		}
+		seen[got] = true
+	}
+	if mergeQueueYieldRemedy("something_new") != mergeQueueYieldRemedy(mergeQueueYieldNextNone) {
+		t.Errorf("an unknown next_step must read as none")
+	}
+}
