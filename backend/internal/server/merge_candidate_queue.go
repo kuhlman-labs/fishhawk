@@ -39,7 +39,9 @@ import (
 //     mergeCandidateQueueHandOffBudget (#4303); AdmitNext stays on the caller
 //     ctx, so a cancelled pump claims no new entry.
 //   - mergeCandidateQueueOnVerdict (from recordMergeCandidateVerified): a red
-//     pass EJECTS and hands the line on; passed holds it until merge (D4)
+//     pass EJECTS and hands the line on, deferring its merge_queue_ejected row
+//     to the upload handler so the row records the ADR-090 D6 route (ADR-093
+//     D4, merge_queue_eject.go); passed holds it until merge (D4)
 //     or a re-open releases it (#4352);
 //     not_executed holds it in phase unverified.
 //   - mergeCandidateQueueOnPRResolved (from resolveReviewStageOnMerge): merge
@@ -439,7 +441,13 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 		}
 		return true
 	case mergeOnPassSettle:
-		return s.settleMergeCandidateQueueEntryAt(ctx, e, o.State, o.Reason) == admitSettled
+		var ej *mergeQueueEjection
+		if o.ForgeReason != "" {
+			// ADR-093 D4: a typed forge refusal names its code and the
+			// forge's (sanitised) reason on the ejection row.
+			ej = &mergeQueueEjection{ForgeReason: o.ForgeReason, ForgeDetail: o.ForgeDetail}
+		}
+		return s.settleMergeCandidateQueueEntryAtWith(ctx, e, o.State, o.Reason, ej) == admitSettled
 	case mergeOnPassReadvance:
 		if *readvances >= mergeQueueMaxReadvancesPerPump {
 			log("merge queue: merge-on-pass readvance bound reached; the next pump re-decides")
@@ -796,23 +804,31 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 // not_executed → phase unverified (still holds the line; the operator's next
 // fishhawk_rebase_run_branch re-triggers it). A verdict for a head other than
 // the anchored one, or for a run with no live entry, changes nothing.
-func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UUID, headSHA, result string) {
+//
+// It returns the entry THIS call ejected (nil otherwise). The red-pass
+// ejection DEFERS its merge_queue_ejected row (ADR-093 D4, #4297): the caller
+// writes it after routeMergeCandidateFailure, so the row records what ADR-090
+// D6 actually did.
+func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UUID, headSHA, result string) *mergequeue.Entry {
 	if s.cfg.MergeQueue == nil {
-		return
+		return nil
 	}
 	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, runID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge-candidate queue: verdict hook could not read the run's entry",
 			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
-		return
+		return nil
 	}
 	if !found || st.Entry.State != mergequeue.StateLive || st.Entry.AnchoredHeadSHA != headSHA {
-		return
+		return nil
 	}
 	switch result {
 	case mergeCandidateResultFailed:
-		s.settleMergeCandidateQueueEntry(ctx, st.Entry, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+		if ejected, ok := s.settleMergeCandidateQueueEntryWith(ctx, st.Entry, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed,
+			&mergeQueueEjection{Deferred: true}); ok {
+			return &ejected
+		}
 	case mergeCandidateResultPassed:
 		if s.setMergeCandidateQueuePhaseAt(ctx, st.Entry, mergequeue.PhasePassed) == admitLive {
 			if st.Entry.MergeIntentAt != nil {
@@ -825,6 +841,7 @@ func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UU
 	case mergeCandidateResultNotExecuted:
 		s.setMergeCandidateQueuePhase(ctx, st.Entry, mergequeue.PhaseUnverified)
 	}
+	return nil
 }
 
 // mergeCandidateQueueHandOffBudget bounds ONE admission: every entry
@@ -961,25 +978,11 @@ func (s *Server) mergeCandidateQueueForRun(ctx context.Context, runID uuid.UUID)
 }
 
 // settleMergeCandidateQueueEntry settles e terminally, writes the settled row
-// when THIS call settled it, and pumps the base when the entry was live (the
-// line is free) — a settled HELD entry frees nothing.
+// (and, for an ejection, the ONE merge_queue_ejected row with the default
+// detail, ADR-093 D4) when THIS call settled it, and pumps the base when the
+// entry was live (the line is free) — a settled HELD entry frees nothing.
 func (s *Server) settleMergeCandidateQueueEntry(ctx context.Context, e mergequeue.Entry, state mergequeue.State, reason string) {
-	res, err := s.cfg.MergeQueue.Settle(ctx, e.ID, state, reason)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"merge-candidate queue: settle failed",
-			slog.String("run_id", e.RunID.String()), slog.String("state", string(state)),
-			slog.String("reason", reason), slog.String("error", err.Error()))
-		return
-	}
-	if !res.Settled {
-		return
-	}
-	s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueSettled, res.Entry,
-		map[string]any{"from_state": string(e.State)})
-	if e.State == mergequeue.StateLive {
-		s.pumpMergeCandidateQueue(ctx, e.Base())
-	}
+	s.settleMergeCandidateQueueEntryWith(ctx, e, state, reason, nil)
 }
 
 // setMergeCandidateQueuePhase records a live entry's phase at the admission
@@ -1007,26 +1010,11 @@ func (s *Server) setMergeCandidateQueuePhaseAt(ctx context.Context, e mergequeue
 // admission-owned or merge-on-pass decision: SettleAt at e's admission
 // epoch. admitSettled when the entry is terminal after the call (this call
 // settled it, or it already was); admitStale on a CAS conflict or a failed
-// write, with nothing written.
+// write, with nothing written. An ejection this call settled writes the ONE
+// merge_queue_ejected row with the default detail
+// (settleMergeCandidateQueueEntryAtWith).
 func (s *Server) settleMergeCandidateQueueEntryAt(ctx context.Context, e mergequeue.Entry, state mergequeue.State, reason string) admitOutcome {
-	res, err := s.cfg.MergeQueue.SettleAt(ctx, e.ID, e.AdmissionEpoch, state, reason)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"merge-candidate queue: settle failed",
-			slog.String("run_id", e.RunID.String()), slog.String("state", string(state)),
-			slog.String("reason", reason), slog.Int64("admission_epoch", e.AdmissionEpoch),
-			slog.String("error", err.Error()))
-		return admitStale
-	}
-	if !res.Settled {
-		return admitSettled
-	}
-	s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueSettled, res.Entry,
-		map[string]any{"from_state": string(e.State)})
-	if e.State == mergequeue.StateLive {
-		s.pumpMergeCandidateQueue(ctx, e.Base())
-	}
-	return admitSettled
+	return s.settleMergeCandidateQueueEntryAtWith(ctx, e, state, reason, nil)
 }
 
 // writeMergeQueueVerified appends merge_queue_verified for an intent-bearing

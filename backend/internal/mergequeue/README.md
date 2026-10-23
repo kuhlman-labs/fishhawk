@@ -4,7 +4,7 @@ Persisted held-pass queue for ADR-092 D1 (#4200, `docs/adr/092-serialize-merge-c
 At most ONE merge-candidate verify pass is live per `(repository, base ref)`
 inside one account. Every other eligible pass is held FIFO by eligibility time
 and consumes no runner slot. Table: `merge_candidate_queue_entries`
-(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296; the yield marker and the approval-wait anchor by 0109 for ADR-112 R3, #4632).
+(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296; the yield marker and the approval-wait anchor by 0109 for ADR-112 R3, #4632; the promote `order_key` by 0111 for ADR-093 slice 3, #4297).
 ADR-093's merge queue (slice 1) reuses these rows, the FIFO order, the
 one-live-per-base rule and the lock order UNCHANGED; it adds only the
 operator's recorded merge intent and the line-turn read below. The SQL is hand-written pgx, with no sqlc (same precedent as
@@ -24,7 +24,8 @@ One row per queue EPISODE of a run.
 | `state` | `held`, `live` (ACTIVE); `merged`, `ejected`, `dropped` (TERMINAL, never change again). CHECK-constrained. |
 | `phase` | Free TEXT, no CHECK, NULL when unset. ADR-092 writes `admitted`, `verifying`, `passed`, `unverified`; ADR-093 adds its own without a migration. |
 | `eject_reason` | Required (non-empty) for `ejected`/`dropped` (DB CHECK + `ErrInvalidRequest`). |
-| `enqueued_at` | Eligibility time, the FIFO key (ties broken by `id`). Kept across re-anchor and `Unadmit`. |
+| `enqueued_at` | Eligibility time, the FIFO key (ties broken by `id`). Kept across re-anchor and `Unadmit`, and never rewritten by a promotion. |
+| `order_key` | The operator promote's ordering key (0111, ADR-093 slice 3; § "Promote"). NULL = ordered by `enqueued_at`. The EFFECTIVE queue key everywhere order matters (`AdmitNext`, `ListForBase`, the held `Position`) is `(COALESCE(order_key, enqueued_at), id)`, so every unpromoted row is strict FIFO. Set only by `Promote`; kept by `Unadmit`, `Yield`, `ClearYield` and the re-anchors; a FRESH row (a re-entry after a terminal row, a base change) carries none and joins at the tail (`Entry.OrderKey`, `Entry.Promoted()`). |
 | `anchored_head_sha` / `anchored_base_sha` / `anchored_at` | The head the pass is bound to, the base tip it was produced against (NULL when unknown), and when. |
 | `admitted_at` | Set by `AdmitNext`; required while `live` (DB CHECK). |
 | `settled_at` | Set exactly when the row is terminal (DB CHECK). |
@@ -92,8 +93,8 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
     returns `Admitted=true, Readmitted=true` for it, so exactly one pump
     re-runs a crashed admission. A live entry in any other phase is never
     re-claimed.
-  - No live entry → the oldest UNMARKED `held` entry by `(enqueued_at, id)`
-    becomes `live`, phase `admitted`, `admitted_at = now`; `Admitted=true`. A
+  - No live entry → the first UNMARKED `held` entry by
+    `(COALESCE(order_key, enqueued_at), id)` becomes `live`, phase `admitted`, `admitted_at = now`; `Admitted=true`. A
     yielded (marked) entry is skipped entirely, however old
     (`TestAdmitNext_SkipsYieldedRows`).
   - Empty base, or a base holding only yielded entries → zero `Admission`
@@ -149,13 +150,14 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   `ErrInvalidRequest` for a nil run id.
 - **`ActiveForRun(runID)`** → `(Status, found, error)`: the run's active entry,
   its 1-based `Position` among the base's held entries in `ListForBase`'s
-  order (unmarked before yielded; 0 when live), and
+  order (unmarked before yielded, then the effective key; 0 when live), and
   `LiveRunID` (the base's live run; the entry's own run when it is live; nil
   when none). Position and live run count the run's OWN account only.
 - **`ListForBase(base)`**: the base's active entries, live first, then
-  unmarked held by `(enqueued_at, id)`, then yielded held by `(enqueued_at,
-  id)` (`TestListForBaseAndPosition_YieldedOrderedLast`). Never nil. The seed
-  for ADR-093's queue read surface.
+  unmarked held by `(COALESCE(order_key, enqueued_at), id)`, then yielded
+  held by the same key (`TestListForBaseAndPosition_YieldedOrderedLast`,
+  `TestPromote_MovesHeldEntryToHead`). Never nil. The seed for ADR-093's
+  queue read surface.
 - **`ActiveBases()`**: every base with a held or live entry, one per
   `(account, repo, base ref)`, ordered by those fields. Never nil. The
   periodic pump's sweep list; spans every account.
@@ -169,6 +171,38 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   queue read: a line turn spans admission to merge, so until ADR-093 slice 2's
   merge-on-pass lands it INCLUDES the operator's merge step after a `passed`
   verdict (a slow merge lengthens every estimate behind it).
+
+- **`LatestForRun(runID)`** → `(Entry, found, error)` (`EjectionReader`): the
+  run's NEWEST row in any state, by `(enqueued_at, id)` descending; a run's
+  rows are inserted one episode at a time on the database clock, so that is
+  its latest episode. `found=false` for a run that never queued; nil run id
+  is `ErrInvalidRequest` (`TestLatestForRun`).
+- **`UnresolvedEjections(base, limit)`** (`EjectionReader`): the base's
+  `ejected` rows that are STILL their run's newest row (no re-entry, no later
+  episode), newest `settled_at` first, account-scoped like `ListForBase`, at
+  most `limit`. A re-entered run, a `dropped` row and another account's
+  ejection are excluded; `limit < 1` is `ErrInvalidRequest`; never nil
+  (`TestUnresolvedEjections`). The queue read's `ejections[]`.
+- **`ReentryCandidates(after, limit)`** (`ReentryReader`): `ejected` rows
+  with `ReentryReason` (`verify_failed`) that carry merge intent, are their
+  run's newest row, and belong to a run that is not terminal (`succeeded`,
+  `failed`, `cancelled`), oldest settle first by `(settled_at, id)`, strictly
+  after the exclusive keyset cursor `after` (`ReentryCursor`, from
+  `ReentryCursorAt`; nil starts at the oldest), at most `limit`, ACROSS every
+  account (the server's re-entry sweep, like `ActiveBases`, which pages with
+  it so never-passing candidates cannot crowd newer ones out, #4297).
+  `limit < 1` is `ErrInvalidRequest`; never nil (`TestReentryCandidates`,
+  `TestReentryCandidates_KeysetCursorPages`). Eligibility, the
+  fix-up evidence and the forge are the caller's; the store only narrows.
+  `Entry.SettledAge` (`clock_timestamp() − settled_at`, computed in the read;
+  0 on an active row) is the database-clock age the sweep's backoff keys on,
+  so no Go `time.Now()` is compared against `settled_at`.
+
+**Capabilities.** `Promoter`, `EjectionReader` and `ReentryReader` are
+SEPARATE interfaces, not part of `Store`; `PostgresStore` implements all
+three. A caller type-asserts the capability on its `Store`, so a fake that
+embeds a (possibly nil) `Store` and does not implement one degrades instead of
+panicking on a nil embedded call (approval condition M1 of #4297).
 
 Merge intent is written only for a run the server judged queue-eligible
 (`backend/internal/server/README.md`). Known deviation from ADR-093 D6 in
@@ -210,8 +244,8 @@ Go `time.Now()` is compared against a stored instant.
 - **`ClearYield(id, head, yieldedAt)`**: the ONLY way back in. Under the base
   lock, a compare-and-swap on `state = 'held' AND anchored_head_sha = head AND
   yielded_at = yieldedAt`: clears the marker AND `approval_wait_started_at`
-  (a later non-approval starts a fresh episode). The row rejoins FIFO at its
-  original `enqueued_at`. A row whose head moved, whose episode changed
+  (a later non-approval starts a fresh episode). The row rejoins at its
+  original effective key (`enqueued_at`, or a kept promote `order_key`). A row whose head moved, whose episode changed
   (another `yielded_at`) or that is not held → `ErrStateConflict` and the
   marker stays (`TestClearYield_CompareAndSwap`, asserted on read-back).
 - **`UpdateYield(id, head, yieldedAt, YieldMarker)`**: the same CAS; rewrites
@@ -226,6 +260,44 @@ Go `time.Now()` is compared against a stored instant.
 `head` and `yieldedAt` are required on the three marker CASes
 (`ErrInvalidRequest`). `yieldedAt` is the value read back from the row
 (`Entry.YieldedAt`), compared at the column's microsecond precision.
+
+### Promote
+
+ADR-093 D2's operator promote (#4297, the shape #4191 gave concurrency slots
+in `backend/internal/concurrency`). `Promote(PromoteRequest{RunID, Record})` →
+`Promotion{Entry, Changed, OldPosition, NewPosition, LiveRunID}` moves the
+run's held entry to the head of its base's line among the UNMARKED held
+entries in its account.
+
+- **Order.** The run's account (unknown run → `ErrNotFound`), the per-run
+  lock (Enqueue holds it across a base change, so the peeked entry cannot be
+  swapped for another base's row), an unlocked peek of the active entry, the
+  base lock BLOCKING, the entry re-read `FOR UPDATE`.
+- **Refusals.** No active entry (none, or only terminal rows; or settled
+  between the peek and the lock) → `ErrNotQueued`; live → `ErrEntryLive`
+  (the live entry is never preempted); yielded → `ErrEntryYielded` (`AdmitNext`
+  skips a marked row whatever its order); nil `RunID` or nil `Record` →
+  `ErrInvalidRequest` before any SQL. Every refusal writes nothing
+  (`TestPromote_RefusalsWriteNothing`, read back).
+- **Write.** Already first → `Changed=false`, positions 1/1, nothing written,
+  `Record` not called. Otherwise ONE guarded UPDATE sets `order_key` to the
+  minimum effective key of the OTHER unmarked held entries on the base and
+  account minus 1 ms, ONLY while one is still strictly ahead (evaluated in the
+  same statement; a miss is the already-first answer:
+  `TestPromote_AlreadyFirstNoop`). The newest promote therefore wins, and the
+  key survives `Unadmit`, `Yield` (the row sorts last while marked) and
+  `ClearYield` (it rejoins at its promoted place)
+  (`TestPromote_NewestPromoteWinsAndSurvivesUnadmitYieldClear`). Another
+  account's rows never count (`TestPromote_AccountScoped`).
+- **Record.** `Record(ctx, tx, Promotion)` is REQUIRED and runs inside the
+  promotion transaction after the write and before COMMIT, only when the
+  order changed. A non-nil error rolls the WHOLE promotion back and is
+  returned wrapped (`TestPromote_RecordErrorRollsBack`, read as committed
+  state). The server appends `merge_queue_promoted` through it with
+  `audit.AppendChainedTx` on that `tx`: unlike `RecordIntentFunc` (whose
+  append would run on another connection and wait on the insert's own `FOR
+  KEY SHARE`), `Record` receives the transaction, and Promote only UPDATEs a
+  non-key column, so no foreign-key lock on the runs row is taken.
 
 ### Admission-epoch CAS
 
@@ -324,7 +396,9 @@ change nothing (ADR-093 slice 2, rejection item 1):
 ## Reasons
 
 The store writes exactly one reason itself: `base_changed` (`ReasonBaseChanged`).
-Every other reason is the caller's string. ADR-092's set (owned by the server
+Every other reason is the caller's string. It READS one: `ReentryCandidates`
+matches `ReentryReason` (`verify_failed`), the only ejection ADR-093 D4
+re-enters automatically. ADR-092's set (owned by the server
 serializer): dropped `run_terminal`, `run_cancelled`, `pr_merged_externally`,
 `pr_closed`, `base_changed`; ejected `verify_failed`, `advance_conflict`,
 `pass_not_startable`. Re-open releases (#4352, server-owned, dropped):
@@ -350,7 +424,10 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   `ReanchorYielded`): read the entry's base → its base lock → the row
   `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
   stays correct.
-- `AdmitNext`: the base lock → the live check → the oldest unmarked held row.
+- `AdmitNext`: the base lock → the live check → the first unmarked held row
+  by effective key.
+- `Promote`: per-run lock → peek → the entry's base lock → the row `FOR
+  UPDATE` (Enqueue's order with one base).
 
 No path takes a row lock before an advisory lock, and multi-key acquisition is
 ascending, so the order is acyclic. The one-live-per-base guarantee is the
@@ -358,7 +435,8 @@ base lock: `TestAdmitNext_LockSerializesTheLiveCheck` (deterministic, parks an
 admitter between its live check and its held select) and
 `TestAdmitNext_ConcurrentAdmittersAdmitExactlyOne` (8 goroutines) both go RED
 with the lock removed. Reads (`ActiveForRun`, `ListForBase`,
-`RecentLineTurns`, `ActiveBases`) are single statements without the lock.
+`RecentLineTurns`, `ActiveBases`, `LatestForRun`, `UnresolvedEjections`,
+`ReentryCandidates`) are single statements without the lock.
 
 Every time comparison uses the database clock (`clock_timestamp()`); no Go
 `time.Now()` value is passed into SQL (the marker CASes pass back a

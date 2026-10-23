@@ -157,6 +157,15 @@ type gateViewResponse struct {
 	// run has no active entry; omitted with a merge_candidate_queue
 	// history_gaps entry when the store read fails.
 	MergeCandidateQueue *runMergeCandidateQueuePayload `json:"merge_candidate_queue,omitempty"`
+	// MergeQueueEjection is the run's UNRESOLVED merge-queue ejection
+	// (ADR-093 D4, E87.6 / #4297) — the same projection GET /v0/runs/{id}
+	// carries (mergeQueueEjectionFor), so the gate the operator merges from
+	// names why the run left the queue and how it re-enters. Computed only by
+	// handleGetRunGateView. Omitted (nil) when the run's newest queue row is
+	// not ejected, the queue is unwired or the store lacks the capability;
+	// omitted with a merge_queue_ejection history_gaps entry when the store
+	// read fails.
+	MergeQueueEjection *mergeQueueEjectionView `json:"merge_queue_ejection,omitempty"`
 	// MergeCandidateVerdict is the ADR-096 verdict-transfer block (E87.2 /
 	// #4293, ADR-098 D3): the transfer mode, the merge-candidate verdict of the
 	// run's CURRENT head (newest Fishhawk-recorded head on the chain) with its
@@ -427,6 +436,10 @@ const gateViewGapMergeReadiness = "merge_readiness"
 // gateViewGapMergeCandidateQueue names a failed ADR-092 queue read (#4200).
 const gateViewGapMergeCandidateQueue = "merge_candidate_queue"
 
+// gateViewGapMergeQueueEjection names a failed merge_queue_ejection store
+// read (ADR-093 D4 / #4297).
+const gateViewGapMergeQueueEjection = "merge_queue_ejection"
+
 // gateViewGapMergeCandidateVerdict names a failed merge_candidate_verdict
 // read (E87.2 / #4293).
 const gateViewGapMergeCandidateVerdict = "merge_candidate_verdict"
@@ -681,6 +694,22 @@ func (s *Server) gateViewMergeCandidateQueueFor(ctx context.Context, runID uuid.
 			"run_id", runID.String(), "error", err.Error())
 		resp.HistoryIncomplete = true
 		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeCandidateQueue)
+		return nil
+	}
+	return block
+}
+
+// gateViewMergeQueueEjectionFor builds the gate view's merge_queue_ejection
+// block: the run-read projection, or nil plus a history_gaps entry when the
+// store read fails, so an unreadable ejection is named rather than read as
+// "not ejected".
+func (s *Server) gateViewMergeQueueEjectionFor(ctx context.Context, runID uuid.UUID, resp *gateViewResponse) *mergeQueueEjectionView {
+	block, err := s.mergeQueueEjectionFor(ctx, runID)
+	if err != nil {
+		s.cfg.Logger.Warn("gate view: read merge-queue ejection failed; omitting merge_queue_ejection",
+			"run_id", runID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapMergeQueueEjection)
 		return nil
 	}
 	return block
@@ -1201,6 +1230,7 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	// costs forge reads, and the attention scan calls buildGateView per run.
 	resp.MergeReadiness = s.gateViewMergeReadinessFor(r.Context(), runRow, &resp)
 	resp.MergeCandidateQueue = s.gateViewMergeCandidateQueueFor(r.Context(), runID, &resp)
+	resp.MergeQueueEjection = s.gateViewMergeQueueEjectionFor(r.Context(), runID, &resp)
 	resp.MergeCandidateVerdict = s.gateViewMergeCandidateVerdictFor(r.Context(), runRow, &resp)
 	// HERE and not in buildGateView (E85.4 / #4147): up to three forge GETs
 	// per cache entry, which the attention scan must not pay per run.

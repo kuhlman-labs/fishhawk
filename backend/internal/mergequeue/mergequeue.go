@@ -8,7 +8,9 @@
 // audit sequence and the admission epoch (0108), the per-run merge-dispatch
 // ledger (0108) and the line-turn read. ADR-112 R3 adds the yield marker and
 // the persisted approval-wait anchor (0109): a marked held entry is skipped by
-// AdmitNext until ClearYield clears it. README.md is the contract.
+// AdmitNext until ClearYield clears it. ADR-093 slice 3 adds the operator
+// promote's order_key (0111) and the ejection/re-entry reads. README.md is
+// the contract.
 package mergequeue
 
 import (
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -63,6 +66,11 @@ const (
 // reason is the caller's (README.md § "Reasons").
 const ReasonBaseChanged = "base_changed"
 
+// ReentryReason is the eject reason ReentryCandidates matches: a red pass
+// (the server's verify_failed), the only ejection ADR-093 D4 re-enters
+// automatically, after a delegated fix-up. The store never writes it.
+const ReentryReason = "verify_failed"
+
 // AdmissionStaleAfter bounds how long a live entry may stay in
 // PhaseAdmitted: past it AdmitNext re-claims the admission (a crash
 // mid-admission recovers on the next pump). README.md § "Constants".
@@ -93,6 +101,15 @@ var (
 	// run_id of merge_dispatch_claims refused the insert, and the caller must
 	// not call the forge (approval condition D1).
 	ErrAlreadyDispatched = errors.New("mergequeue: merge already dispatched for this run")
+	// ErrNotQueued is a Promote for a run with no active entry (none, or only
+	// terminal rows).
+	ErrNotQueued = errors.New("mergequeue: run has no held merge-queue entry")
+	// ErrEntryLive is a Promote for a run whose entry is live: the entry
+	// holding the line is never preempted, and promoting it means nothing.
+	ErrEntryLive = errors.New("mergequeue: entry is live; the live entry is never preempted")
+	// ErrEntryYielded is a Promote for a yielded (marked) held entry: AdmitNext
+	// skips it whatever its order, so the marker must clear first.
+	ErrEntryYielded = errors.New("mergequeue: entry is yielded; clear its yield before promoting")
 )
 
 // Base is one queue: a repository base ref inside one account. AccountID is
@@ -153,10 +170,22 @@ type Entry struct {
 	// YieldAge is clock_timestamp() - yielded_at, computed in SQL when the
 	// row was read (database clock domain); 0 when unmarked.
 	YieldAge time.Duration
+	// OrderKey is the operator promote's ordering key (0111, ADR-093 slice
+	// 3): nil when the row is ordered by EnqueuedAt. The effective queue key
+	// is COALESCE(OrderKey, EnqueuedAt).
+	OrderKey *time.Time
+	// SettledAge is clock_timestamp() - settled_at, computed in SQL when the
+	// row was read (database clock domain); 0 on an active row. The
+	// re-entry sweep's backoff is keyed on it, so no Go clock is compared
+	// against SettledAt.
+	SettledAge time.Duration
 }
 
 // Yielded reports whether the entry carries a yield marker.
 func (e Entry) Yielded() bool { return e.YieldedAt != nil }
+
+// Promoted reports whether an operator promote set the entry's order key.
+func (e Entry) Promoted() bool { return e.OrderKey != nil }
 
 // Base returns the queue the entry belongs to.
 func (e Entry) Base() Base {
@@ -372,11 +401,86 @@ type Status struct {
 	Entry Entry
 	// Position is the 1-based place among the base's held entries (same
 	// account) in ListForBase's order (unmarked before yielded, then
-	// enqueued_at, id); 0 for a live entry.
+	// COALESCE(order_key, enqueued_at), id); 0 for a live entry.
 	Position int
 	// LiveRunID is the run holding the base's line (the entry's own run when
 	// it is live), or nil when the base has no live entry.
 	LiveRunID *uuid.UUID
+}
+
+// PromoteRequest asks to move a run's held entry to the head of its base's
+// line (ADR-093 D2, the operator promote).
+type PromoteRequest struct {
+	RunID uuid.UUID
+	// Record is REQUIRED. It runs inside the promotion transaction after the
+	// order key is written and before COMMIT, and only when the order
+	// changed; a non-nil error rolls the whole promotion back. The server
+	// appends merge_queue_promoted through it (on tx), so a promotion never
+	// commits unaudited.
+	Record func(ctx context.Context, tx pgx.Tx, p Promotion) error
+}
+
+// Promotion is Promote's verdict.
+type Promotion struct {
+	// Entry is the run's held entry after the call.
+	Entry Entry
+	// Changed is false when the entry was already first among the base's
+	// unmarked held entries (a no-op: nothing written, Record not called,
+	// OldPosition = NewPosition = 1).
+	Changed bool
+	// OldPosition and NewPosition are 1-based places among the base's
+	// unmarked held entries (same account), before and after the write.
+	OldPosition int
+	NewPosition int
+	// LiveRunID is the run holding the base's line, or nil when none.
+	LiveRunID *uuid.UUID
+}
+
+// Promoter is the operator promote (ADR-093 slice 3). PostgresStore
+// implements it; it is a separate capability, not part of Store, so a caller
+// type-asserts it and a fake that does not implement it degrades instead of
+// panicking (README.md § "Promote").
+type Promoter interface {
+	Promote(ctx context.Context, req PromoteRequest) (Promotion, error)
+}
+
+// EjectionReader is the ejection visibility reads (ADR-093 slice 3): a
+// separate capability like Promoter.
+type EjectionReader interface {
+	// LatestForRun returns the run's NEWEST row in any state (found=false:
+	// the run never had one).
+	LatestForRun(ctx context.Context, runID uuid.UUID) (Entry, bool, error)
+	// UnresolvedEjections returns the base's ejected rows that are still
+	// their run's newest row, newest settle first, at most limit.
+	UnresolvedEjections(ctx context.Context, base Base, limit int) ([]Entry, error)
+}
+
+// ReentryReader is the automatic re-entry sweep's read (ADR-093 D4): a
+// separate capability like Promoter.
+type ReentryReader interface {
+	// ReentryCandidates returns ejected ReentryReason rows that carry merge
+	// intent, are their run's newest row and belong to a non-terminal run,
+	// oldest settle first by (settled_at, id), strictly after the exclusive
+	// keyset cursor after (nil starts at the oldest), at most limit, across
+	// every account.
+	ReentryCandidates(ctx context.Context, after *ReentryCursor, limit int) ([]Entry, error)
+}
+
+// ReentryCursor is an exclusive keyset position in ReentryCandidates' order
+// (settled_at, id): the sweep pages past a full page of candidates that never
+// pass a gate instead of re-reading them every tick (#4297).
+type ReentryCursor struct {
+	SettledAt time.Time
+	ID        uuid.UUID
+}
+
+// ReentryCursorAt is e's position in ReentryCandidates' order, nil when e has
+// no settle time (never a candidate).
+func ReentryCursorAt(e Entry) *ReentryCursor {
+	if e.SettledAt == nil {
+		return nil
+	}
+	return &ReentryCursor{SettledAt: *e.SettledAt, ID: e.ID}
 }
 
 // Store is the held-pass queue. README.md § "Contract" defines every method.

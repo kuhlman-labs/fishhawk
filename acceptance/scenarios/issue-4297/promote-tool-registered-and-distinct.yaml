@@ -1,0 +1,14 @@
+id: scenario:issue-4297/promote-tool-registered-and-distinct
+statement: The MCP tool list includes fishhawk_promote_merge_queue_entry, whose description names fishhawk_promote_queued_stage as the verb for local concurrency waiters. Calling it with a non-UUID run_id returns a tool error without changing any queue.
+verify_hint: 'MCP: tools/list on the fishhawk MCP endpoint and read the tool''s description; call fishhawk_promote_merge_queue_entry with run_id "not-a-uuid" and a reason, and expect an error result.'
+steps: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} and minted an fhm_ token (POST /v0/runs/{run}/signing-key, POST /v0/dev/sign over '{}', POST /v0/runs/{run}/mcp-token). POST http://localhost:8090/mcp tools/list with the MCP 2026-07-28 headers and _meta. Read the fishhawk_promote_merge_queue_entry description and schema. POST /mcp tools/call fishhawk_promote_merge_queue_entry {run_id:'not-a-uuid', reason:'unblocks the line'}.
+assertions:
+    expected: Tool listed, its description names fishhawk_promote_queued_stage, and a non-UUID call errors without changing any queue.
+    observed_at_record: 'The tool is listed, with required inputs run_id and reason. Its description says that a stage queued for a local concurrency slot is not a merge-queue entry (''promote that waiter with fishhawk_promote_queued_stage; this tool never touches a concurrency group''). The call returned an error, HTTP 403 insufficient_scope (write:runs required, tool named), and no queue changed. Caveat: the run token stopped the call at the scope check, so the non-UUID validation path itself was not reached; no operator token was obtainable.'
+    repro_handle: POST /mcp tools/list; tools/call fishhawk_promote_merge_queue_entry
+origin:
+    issue: 4297
+    pr: 0
+    run_id: 7057355c-0c86-42f1-a41b-8ddb99de1262
+    head_sha: c36389c605f5764a10007c02673413be188ab52f
+    recorded_at: 2026-10-23T18:28:30Z

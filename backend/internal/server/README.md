@@ -3528,14 +3528,16 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   (`callerAccountUUID`). Without `base_ref` the bases are `ActiveBases`
   filtered to that account and repository.
 - **Body.** Per base: `entries` from `ListForBase` (live first, then
-  unmarked held FIFO, then yielded held) with `position` (1-based among
-  held), `merge_intent` / `merge_intent_at`, anchors, `eta_seconds` (never on
+  unmarked held FIFO unless promoted, then yielded held) with `position`
+  (1-based among held), `merge_intent` / `merge_intent_at`, `promoted`,
+  anchors, `eta_seconds` (never on
   a yielded entry) and the ADR-112 R5 yield fields (§ "ADR-112 R3 yield and
   R5 visibility"); `head_of_line` = the first
   entry with `current_head_sha` read best-effort from the forge (one read per
   base; `current_head_unavailable` = `run_read_failed` | `forge_unwired` |
   `pull_request_unresolvable` | `forge_read_failed`); `eta_basis`
-  `{samples, median_seconds?, note}`.
+  `{samples, median_seconds?, note}`; `ejections[]` (§ "Ejection, re-entry
+  and promote (ADR-093 slice 3)").
 - **ETA basis.** `eta_seconds` = `position` x the median of
   `RecentLineTurns(base, 10)` (admission to merge of the base's newest merged
   entries, database clock, account-scoped), rounded to the second; omitted
@@ -3559,6 +3561,125 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   yield / wait fields. `runs_get_test.go` / `gateview_test.go` pin
   `merge_intent` (and `runs_get_test.go` the yield fields and note) on the
   run read and the gate view.
+
+### Ejection, re-entry and promote (ADR-093 slice 3)
+
+ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-labs/fishhawk/issues/4297)). Four parts, one per file.
+
+- **Ejection record (`merge_queue_eject.go`).** Every ejection appends ONE
+  `merge_queue_ejected` row (actor system, INTERNAL — not an issue-comment
+  surface) `{entry_id, repo, base_ref, reason, merge_intent,
+  anchored_head_sha, next_step, remedy, fixup_routed? (verify_failed),
+  refusal?, forge_reason?, forge_detail?}`, written ONLY by the call whose
+  `Settle`/`SettleAt` settled the entry (a redelivered hook writes nothing).
+  `next_step` is a TOTAL mapping of the reason (`mergeQueueEjectNextStep`):
+  `verify_failed` → `await_delegated_fixup` when ADR-090 D6 routed a
+  delegated fix-up, else `fishhawk_fixup_stage`; `advance_conflict` →
+  `fishhawk_rebase_run_branch` (it starts the bounded conflict-resolution
+  pass; the pump never auto-starts one); `forge_merge_refused` →
+  `fishhawk_merge_run`; `pass_not_startable` → `fishhawk_get_run_status`;
+  anything else → `fishhawk_merge_run`. `remedy` is built from that closed
+  vocabulary only; `forge_detail` is untrusted forge text through the yield
+  sanitiser. The verdict hook defers the row so
+  `succeedMergeCandidateVerifiedStage` writes it AFTER
+  `routeMergeCandidateFailure` and it states what D6 did; every other
+  `verify_failed` arm (the failed start, a failed verdict at admission,
+  merge-on-pass seeing a failed verdict) derives `fixup_routed` from the
+  run's `stage_fixup_triggered` row for that failed verdict, matched by
+  CHAIN SEQUENCE (`mergeQueueVerifyFailedRouted`), and fails closed to not
+  routed. The row is best-effort (after the store commit): a lost row costs
+  the automatic re-entry, never the operator's.
+- **Forge refusals eject exactly once (ADR-112 R3 rows 4–5, ADR-093 D4).** In
+  `mergeOnPassLocked` every typed refusal of the pinned merge PUT
+  (`ErrPullRequestNotMergeable` → `not_mergeable`, `ErrMergeUnprocessable` →
+  `unprocessable`, `ErrPullRequestUnstableStatus` → `checks_not_settled`)
+  first runs the row-4 snapshot (`mergeOnPassRefusalNeedsReview`): review
+  required or `BLOCKED` → the entry YIELDS `forge_review_required` /
+  `approve_pr`. Only otherwise does it eject `forge_merge_refused` naming the
+  code. The unstable-status arm used to hold as transient, so the next pump
+  claimed and dispatched again. **The asymmetry is deliberate — do not
+  "fix" one arm to match the other:** pending checks HOLD before dispatch
+  (the pre-lock `onlyChecksNotGreen` rule), so slow CI never ejects; only the
+  forge's own refusal of the merge PUT ejects, and its `forge_detail` /
+  remedy say the checks were not settled at the merge attempt (remedy:
+  `fishhawk_merge_run` once they settle).
+- **Automatic re-entry (`merge_queue_reentry.go`).** `sweepMergeQueueReentries`
+  runs on the yield re-probe ticker after `sweepMergeQueueYields`. Each
+  `mergequeue.ReentryReader` candidate (an ejected `verify_failed` row with
+  merge intent, still its run's newest row, on a non-terminal run) is judged
+  only when DUE on the `yieldReprobeDue` schedule over the row's
+  database-clock settled age, process-local (ADR-112 A1.4: after a restart
+  the window is `(0, age]`). One tick reads ONE page of at most
+  `mergeQueueReentryLimit` (50) candidates after a process-local keyset
+  cursor (`mergeQueueReentryPager`, `(settled_at, id)`); a full page moves the
+  cursor to its last row and a short page wraps it to the oldest, so 50
+  candidates that never pass a gate (unrouted, never pushed) cannot hide every
+  newer one from the read (#4297). Across several pages a page's due window
+  reaches back to the start of the previous cycle (the last read of that
+  page at the latest), so no schedule point falls between two reads; with one
+  page it is the time since the previous sweep. It re-enters only when: no
+  stage of the run is `dispatched` or `running` (ADR-115 D4 compliance); its
+  `merge_queue_ejected` row says `fixup_routed: true`; a `fixup_pushed` row's
+  chain sequence follows that row's; the `merge_queue_entered` row AT the
+  entry's `MergeIntentSequence` exists (never the newest such row); the PR
+  is open on the base with a moved head; and the ENTRY-variant eligibility
+  passes at the new head with a LIVE forge approval read there (an approval
+  the fix-up push dismissed means no re-entry, and an approval-only failure is
+  SKIPPED, never enqueued yielded; unifying it with the A1.3 clear predicate
+  is #4686). Under the run's merge-intent lock `LatestForRun` must still be
+  that ejected row; then a `merge_queue_entered` row is appended BEFORE the
+  write (actor SYSTEM, `reentry: true`, `reentry_basis
+  delegated_fixup_passed`, `reentry_of_entry_id`, `original_intent_sequence`,
+  the original verdict prose — merge-on-pass still binds to the verified
+  head, never a SHA in that prose) and `Enqueue` inserts a FRESH row at the
+  TAIL carrying that row's sequence. A failed append writes no entry.
+- **Promote (`merge_queue_promote.go`).** `POST
+  /v0/runs/{run_id}/merge-queue/promote` (`write:runs`,
+  `requireRunAccount(memberWrite)`): 401 anonymous, 403
+  `run_token_forbidden`, 403 `insufficient_scope`, 400 `validation_failed`
+  (the strict `{"reason"}` body), then 503 `merge_queue_unconfigured` (no
+  queue, no `mergequeue.Promoter`, or no run repository: without it
+  `requireRunAccount` cannot check the run's account and falls through, so
+  the verb fails closed), then the store's one transaction: 404
+  `run_not_found`, 409 `merge_queue_not_queued` / `merge_queue_entry_live`
+  (the live entry is never preempted) / `merge_queue_entry_yielded`
+  (`details.next_step`), 500 `merge_queue_promote_failed` (rolled back).
+  `merge_queue_promoted` is appended INSIDE the transaction; an entry already
+  first answers `promoted: false` with no row. The MCP tool is
+  `fishhawk_promote_merge_queue_entry`; a stage concurrency waiter's promote
+  stays `fishhawk_promote_queued_stage`.
+- **Visibility (`merge_queue_read.go`, `runs.go`, `gateview.go`).** ONE
+  projection, `mergeQueueEjectionProjectionFor`, feeds the queue read's
+  per-base `ejections[]` (`UnresolvedEjections(base, 10)`, newest first,
+  account-scoped, unresolved only) and the top-level `merge_queue_ejection`
+  block on `GET /v0/runs/{id}` and the gate view (present only while the
+  run's newest queue row — `LatestForRun` — is ejected, so never beside an
+  active entry). It takes from the row only `fixup_routed`, a `forge_reason`
+  inside the closed code set and `forge_detail`, sanitised AGAIN on read;
+  `next_step`, `remedy` and `reentry` (`operator_merge_run` |
+  `automatic_after_delegated_fixup`) are derived. An absent or unreadable row
+  degrades to the reason default (`next_step_basis: reason_default`,
+  `fixup_routed` omitted) and never fails the read. Store-read posture: the
+  queue read fails closed (500) on an `UnresolvedEjections` error like every
+  other store read; the run read omits the block; the gate view omits it
+  with a `merge_queue_ejection` `history_gaps` entry. The reads go through
+  the OPTIONAL `mergequeue.EjectionReader` capability
+  (`mergeQueueEjectionReader`), so a fake embedding only `mergequeue.Store`
+  degrades to absent / empty instead of panicking. Queue-read entries and
+  `merge_candidate_queue` carry `promoted` (order key set), always on the
+  wire. Residual: without `base_ref` the queue read lists only bases with an
+  ACTIVE entry, so a base whose line is empty shows its ejections only to a
+  `base_ref` read (the run read and gate view still show each run's own).
+- **Tests.** Ejection: `merge_queue_eject_test.go`, `merge_queue_merge_test.go`
+  (`TestMergeOnPass_ForgeRefusalEjectsExactlyOnce`, rows 4 and 5 per arm),
+  `merge_candidate_queue_test.go`. Re-entry: `merge_queue_reentry_test.go`
+  (one test per gate, the schedule and the live-stage skip) and the
+  cross-layer `merge_queue_e2e_test.go`. Promote: `merge_queue_promote_test.go`
+  (one per rung), `backend/internal/integration/mcp/merge_queue_promote_test.go`.
+  Visibility: `merge_queue_read_test.go` (`TestMergeQueueRead_EjectionsUnresolvedNewestFirstSanitised`,
+  `TestMergeQueueEjection_*`, `TestRunReadAndGateView_MergeQueueEjectionOnlyWhileNewestRowEjected`,
+  `TestOpenAPIDocumentsMergeQueuePromote` / `...Ejection`) and
+  `mcpserver`'s `TestMergeQueueEjection_WireShape` (real backend and store).
 
 ## Merge overlap guard (`merge_overlap_guard.go`, E83.61 / [#4119](https://github.com/kuhlman-labs/fishhawk/issues/4119))
 

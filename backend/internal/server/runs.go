@@ -395,6 +395,15 @@ type runResponse struct {
 	// the queue is unwired, the run has no active entry (never queued, or its
 	// entry settled), or the read fails (warn-logged, never a failed read).
 	MergeCandidateQueue *runMergeCandidateQueuePayload `json:"merge_candidate_queue,omitempty"`
+	// MergeQueueEjection is the run's UNRESOLVED merge-queue ejection
+	// (ADR-093 D4, E87.6 / #4297): present only when the run's newest queue
+	// row is ejected (so it has no active entry and has not re-entered),
+	// with the reason, the derived next_step and remedy, and how it re-enters
+	// (mergeQueueEjectionProjectionFor, the projection the merge-queue read's
+	// ejections[] and the gate view carry). Populated by handleGetRun ONLY,
+	// best-effort: omitted when the queue is unwired, the store lacks the
+	// mergequeue.EjectionReader capability, or the read fails (warn-logged).
+	MergeQueueEjection *mergeQueueEjectionView `json:"merge_queue_ejection,omitempty"`
 	// MergeCandidateRerun is the ADVISORY verify-only re-run signal (E86.54 /
 	// #4391): the run's newest merge-candidate verdict FAILED and nothing has
 	// re-opened or rewritten the head since, so fishhawk_rebase_run_branch
@@ -431,7 +440,7 @@ type runMergeCandidateQueuePayload struct {
 	// unverified. Omitted while held.
 	Phase string `json:"phase,omitempty"`
 	// Position is the 1-based place among the base's held entries (FIFO by
-	// eligibility time). Omitted (0) for a live entry.
+	// eligibility time unless promoted). Omitted (0) for a live entry.
 	Position int    `json:"position,omitempty"`
 	Repo     string `json:"repo"`
 	BaseRef  string `json:"base_ref"`
@@ -453,6 +462,9 @@ type runMergeCandidateQueuePayload struct {
 	// it was recorded, omitted without intent.
 	MergeIntent   bool       `json:"merge_intent"`
 	MergeIntentAt *time.Time `json:"merge_intent_at,omitempty"`
+	// Promoted is whether an operator promote (ADR-093 D2) set the entry's
+	// order key, so it sorts ahead of its enqueue time. Always on the wire.
+	Promoted bool `json:"promoted"`
 	// The ADR-112 R5 yield fields (mergeQueueYieldProjection, the same
 	// projection the merge-queue read carries): on a YIELDED entry
 	// yield_reason, the sanitised yield_detail, yielded_at and the derived
@@ -504,6 +516,7 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 		EjectReason:     e.EjectReason,
 		MergeIntent:     e.MergeIntentAt != nil,
 		MergeIntentAt:   e.MergeIntentAt,
+		Promoted:        e.Promoted(),
 	}
 	y := mergeQueueYieldProjectionFor(e)
 	out.YieldReason, out.YieldDetail, out.YieldedAt, out.NextStep, out.ApprovalWaitStartedAt =
@@ -2455,6 +2468,14 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 			"run_id", runID.String(), "error", qerr.Error())
 	} else {
 		resp.MergeCandidateQueue = mcq
+	}
+	// Merge-queue ejection (ADR-093 D4 / #4297): single-run read ONLY,
+	// best-effort with the same posture as merge_candidate_queue.
+	if ej, eerr := s.mergeQueueEjectionFor(r.Context(), runID); eerr != nil {
+		s.cfg.Logger.Warn("read merge-queue ejection failed; omitting merge_queue_ejection",
+			"run_id", runID.String(), "error", eerr.Error())
+	} else {
+		resp.MergeQueueEjection = ej
 	}
 	// Verify-only re-run signal (E86.54 / #4391): single-run read ONLY,
 	// best-effort with the same posture as merge_candidate_queue.

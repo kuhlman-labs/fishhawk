@@ -2,10 +2,13 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"net/http"
 	"slices"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
@@ -51,9 +54,11 @@ type mergeQueueReadResponse struct {
 type mergeQueueBaseView struct {
 	BaseRef string `json:"base_ref"`
 	// Entries are the base's active entries in the store's queue order
-	// (ListForBase): the live entry first, then unmarked held entries FIFO by
-	// (enqueued_at, id), then YIELDED held entries (ADR-112 R3: admission
-	// skips them until a re-probe clears the marker). Never nil.
+	// (ListForBase): the live entry first, then unmarked held entries by
+	// (COALESCE(order_key, enqueued_at), id) — FIFO by eligibility time
+	// unless an operator promote set the order key (ADR-093 D2, promoted) —
+	// then YIELDED held entries (ADR-112 R3: admission skips them until a
+	// re-probe clears the marker). Never nil.
 	Entries []mergeQueueEntryView `json:"entries"`
 	// HeadOfLine is the first entry (the live one, or the next held entry to
 	// admit when none is live; a yielded entry only when every held entry is
@@ -61,6 +66,12 @@ type mergeQueueBaseView struct {
 	// active entry.
 	HeadOfLine *mergeQueueHeadOfLine `json:"head_of_line,omitempty"`
 	ETABasis   mergeQueueETABasis    `json:"eta_basis"`
+	// Ejections are the base's UNRESOLVED ejections (ADR-093 D4, slice 3):
+	// ejected rows still their run's newest row (no re-entry since), newest
+	// settle first, at most mergeQueueEjectionLimit, in the caller's account,
+	// each projected by mergeQueueEjectionProjectionFor. Never nil; empty
+	// when the store lacks the mergequeue.EjectionReader capability.
+	Ejections []mergeQueueEjectionView `json:"ejections"`
 }
 
 // mergeQueueEntryView is one active entry.
@@ -77,8 +88,12 @@ type mergeQueueEntryView struct {
 	// MergeIntent is whether the operator's merge_run recorded merge intent
 	// on the entry (ADR-093 D2); false for a rebase-path entry. Always on
 	// the wire.
-	MergeIntent     bool       `json:"merge_intent"`
-	MergeIntentAt   *time.Time `json:"merge_intent_at,omitempty"`
+	MergeIntent   bool       `json:"merge_intent"`
+	MergeIntentAt *time.Time `json:"merge_intent_at,omitempty"`
+	// Promoted is whether an operator promote (ADR-093 D2,
+	// fishhawk_promote_merge_queue_entry) set the entry's order key, so it
+	// sorts ahead of its enqueue time. Always on the wire.
+	Promoted        bool       `json:"promoted"`
 	EnqueuedAt      time.Time  `json:"enqueued_at"`
 	AdmittedAt      *time.Time `json:"admitted_at,omitempty"`
 	AnchoredHeadSHA string     `json:"anchored_head_sha"`
@@ -288,6 +303,7 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 			Phase:           string(e.Phase),
 			MergeIntent:     e.MergeIntentAt != nil,
 			MergeIntentAt:   e.MergeIntentAt,
+			Promoted:        e.Promoted(),
 			EnqueuedAt:      e.EnqueuedAt,
 			AdmittedAt:      e.AdmittedAt,
 			AnchoredHeadSHA: e.AnchoredHeadSHA,
@@ -320,6 +336,10 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 	}
 	if len(entries) > 0 {
 		view.HeadOfLine = s.mergeQueueHeadOfLineFor(ctx, entries[0])
+	}
+	view.Ejections, err = s.mergeQueueEjectionsFor(ctx, b)
+	if err != nil {
+		return mergeQueueBaseView{}, err
 	}
 	return view, nil
 }
@@ -387,4 +407,196 @@ func (s *Server) mergeQueueCurrentHead(ctx context.Context, e mergequeue.Entry) 
 		return "", mergeQueueHeadForgeReadFailed
 	}
 	return pr.HeadSHA, ""
+}
+
+// mergeQueueEjectionLimit bounds a base's ejections[] on the queue read.
+const mergeQueueEjectionLimit = 10
+
+// The closed reentry vocabulary of a merge_queue_ejection projection: how the
+// ejected run gets back into the queue (always at the TAIL, ADR-093 Q2).
+const (
+	// mergeQueueEjectionReentryOperator: the operator's next
+	// fishhawk_merge_run re-enters it.
+	mergeQueueEjectionReentryOperator = "operator_merge_run"
+	// mergeQueueEjectionReentryAutomatic: ADR-090 D6 routed a delegated
+	// fix-up, so the re-entry sweep re-enters it once that fix-up has pushed
+	// and the run is merge-queue eligible again (fishhawk_merge_run still
+	// re-enters it sooner).
+	mergeQueueEjectionReentryAutomatic = "automatic_after_delegated_fixup"
+)
+
+// The next_step_basis vocabulary: where the projection's fixup_routed and
+// forge reason came from.
+const (
+	// mergeQueueEjectionBasisRecorded: the entry's merge_queue_ejected row.
+	mergeQueueEjectionBasisRecorded = "recorded"
+	// mergeQueueEjectionBasisReasonDefault: the row is absent (a lost
+	// best-effort append) or unreadable, so next_step is the eject reason's
+	// default (verify_failed reads as not routed: fail closed to the
+	// operator's fishhawk_merge_run) and fixup_routed is omitted.
+	mergeQueueEjectionBasisReasonDefault = "reason_default"
+)
+
+// mergeQueueEjectionView is the ONE ejection projection (ADR-093 D4, slice
+// 3), shared by the queue read's ejections[], GET /v0/runs/{id} and the gate
+// view (merge_queue_ejection), so the surfaces cannot disagree. The MCP
+// mirror (backend/internal/mcpserver/client.go mergeQueueEjection) decodes
+// it; the json tags MUST byte-match.
+type mergeQueueEjectionView struct {
+	RunID   string `json:"run_id"`
+	EntryID string `json:"entry_id"`
+	Repo    string `json:"repo"`
+	BaseRef string `json:"base_ref"`
+	// Reason is the store's eject reason: verify_failed, advance_conflict,
+	// forge_merge_refused, pass_not_startable, or another settle reason.
+	Reason string `json:"reason"`
+	// NextStep is DERIVED through the total mapping mergeQueueEjectNextStep
+	// from Reason and the recorded fixup_routed, never copied from the row.
+	NextStep string `json:"next_step"`
+	// Remedy is prose built from the closed vocabulary only
+	// (mergeQueueEjectRemedy), never from forge text.
+	Remedy string `json:"remedy"`
+	// NextStepBasis is recorded or reason_default (the row was absent or
+	// unreadable).
+	NextStepBasis   string     `json:"next_step_basis"`
+	EjectedAt       *time.Time `json:"ejected_at,omitempty"`
+	AnchoredHeadSHA string     `json:"anchored_head_sha"`
+	MergeIntent     bool       `json:"merge_intent"`
+	// FixupRouted is set for a verify_failed ejection whose row was read:
+	// whether ADR-090 D6 routed a delegated fix-up. Omitted otherwise.
+	FixupRouted *bool `json:"fixup_routed,omitempty"`
+	// ForgeReason is a forge_merge_refused ejection's typed code
+	// (not_mergeable, unprocessable, checks_not_settled); a recorded value
+	// outside that closed set is dropped.
+	ForgeReason string `json:"forge_reason,omitempty"`
+	// ForgeDetail is the forge's refusal text, UNTRUSTED: sanitised AGAIN on
+	// read (mergeQueueYieldDetail) on top of the writer's pass.
+	ForgeDetail string `json:"forge_detail,omitempty"`
+	// Reentry is operator_merge_run or automatic_after_delegated_fixup.
+	Reentry string `json:"reentry"`
+}
+
+// mergeQueueEjectionRecord is the subset of a merge_queue_ejected payload the
+// projection reads.
+type mergeQueueEjectionRecord struct {
+	EntryID     string `json:"entry_id"`
+	FixupRouted *bool  `json:"fixup_routed"`
+	ForgeReason string `json:"forge_reason"`
+	ForgeDetail string `json:"forge_detail"`
+}
+
+// mergeQueueEjectionRecordFor reads e's NEWEST merge_queue_ejected row
+// (matched by entry_id); false when the audit repository is unwired, the read
+// fails or no row names the entry. A failure never fails the caller's read.
+func (s *Server) mergeQueueEjectionRecordFor(ctx context.Context, e mergequeue.Entry) (mergeQueueEjectionRecord, bool) {
+	if s.cfg.AuditRepo == nil {
+		return mergeQueueEjectionRecord{}, false
+	}
+	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, e.RunID, CategoryMergeQueueEjected)
+	if err != nil {
+		s.cfg.Logger.Warn("merge queue: read merge_queue_ejected failed; the ejection projection degrades to the reason default",
+			"run_id", e.RunID.String(), "entry_id", e.ID.String(), "error", err.Error())
+		return mergeQueueEjectionRecord{}, false
+	}
+	for i := len(rows) - 1; i >= 0; i-- {
+		var rec mergeQueueEjectionRecord
+		if json.Unmarshal(rows[i].Payload, &rec) == nil && rec.EntryID == e.ID.String() {
+			return rec, true
+		}
+	}
+	return mergeQueueEjectionRecord{}, false
+}
+
+// mergeQueueEjectionProjectionFor projects the EJECTED entry e. The row
+// contributes only fixup_routed (verify_failed), a forge reason inside the
+// closed set and the re-sanitised forge detail; next_step, remedy and reentry
+// are derived from the closed vocabulary. An absent or unreadable row
+// degrades to the reason default (next_step_basis reason_default).
+func (s *Server) mergeQueueEjectionProjectionFor(ctx context.Context, e mergequeue.Entry) mergeQueueEjectionView {
+	v := mergeQueueEjectionView{
+		RunID:           e.RunID.String(),
+		EntryID:         e.ID.String(),
+		Repo:            e.Repo,
+		BaseRef:         e.BaseRef,
+		Reason:          e.EjectReason,
+		NextStepBasis:   mergeQueueEjectionBasisReasonDefault,
+		EjectedAt:       e.SettledAt,
+		AnchoredHeadSHA: e.AnchoredHeadSHA,
+		MergeIntent:     e.MergeIntentAt != nil,
+	}
+	routed := false
+	if rec, ok := s.mergeQueueEjectionRecordFor(ctx, e); ok {
+		v.NextStepBasis = mergeQueueEjectionBasisRecorded
+		if e.EjectReason == mergeCandidateQueueReasonVerifyFailed {
+			routed = rec.FixupRouted != nil && *rec.FixupRouted
+			v.FixupRouted = &routed
+		}
+		switch rec.ForgeReason {
+		case mergeQueueForgeReasonNotMergeable, mergeQueueForgeReasonUnprocessable, mergeQueueForgeReasonChecksNotSettled:
+			v.ForgeReason = rec.ForgeReason
+		}
+		v.ForgeDetail = mergeQueueYieldDetail(rec.ForgeDetail)
+	}
+	v.NextStep = mergeQueueEjectNextStep(e.EjectReason, routed)
+	v.Remedy = mergeQueueEjectRemedy(v.NextStep, v.ForgeReason)
+	v.Reentry = mergeQueueEjectionReentryOperator
+	if v.NextStep == mergeQueueEjectNextAwaitDelegatedFixup {
+		v.Reentry = mergeQueueEjectionReentryAutomatic
+	}
+	return v
+}
+
+// mergeQueueEjectionReader is the store's OPTIONAL ejection-read capability
+// (approval condition M1): false when the queue is unwired or the store does
+// not implement mergequeue.EjectionReader (a test fake embedding only
+// mergequeue.Store), so every ejection surface degrades to absent / empty
+// instead of panicking.
+func (s *Server) mergeQueueEjectionReader() (mergequeue.EjectionReader, bool) {
+	if s.cfg.MergeQueue == nil {
+		return nil, false
+	}
+	er, ok := s.cfg.MergeQueue.(mergequeue.EjectionReader)
+	return er, ok
+}
+
+// mergeQueueEjectionsFor projects base b's unresolved ejections, newest
+// first. Never nil; empty without the capability. A store read error is
+// returned (the queue read fails closed on store errors).
+func (s *Server) mergeQueueEjectionsFor(ctx context.Context, b mergequeue.Base) ([]mergeQueueEjectionView, error) {
+	out := []mergeQueueEjectionView{}
+	er, ok := s.mergeQueueEjectionReader()
+	if !ok {
+		return out, nil
+	}
+	rows, err := er.UnresolvedEjections(ctx, b, mergeQueueEjectionLimit)
+	if err != nil {
+		return nil, err
+	}
+	for _, e := range rows {
+		out = append(out, s.mergeQueueEjectionProjectionFor(ctx, e))
+	}
+	return out, nil
+}
+
+// mergeQueueEjectionFor is the run read's and the gate view's
+// merge_queue_ejection block: present only when the run's NEWEST queue row is
+// ejected, which also means it has no active entry (an active entry is
+// always the run's newest row) and has not re-entered since. (nil, nil)
+// without the capability, with no row, or with a newer non-ejected row; a
+// store read error is returned for the caller's degrade (run read: omit;
+// gate view: omit plus a history_gaps entry).
+func (s *Server) mergeQueueEjectionFor(ctx context.Context, runID uuid.UUID) (*mergeQueueEjectionView, error) {
+	er, ok := s.mergeQueueEjectionReader()
+	if !ok {
+		return nil, nil
+	}
+	latest, found, err := er.LatestForRun(ctx, runID)
+	if err != nil {
+		return nil, err
+	}
+	if !found || latest.State != mergequeue.StateEjected {
+		return nil, nil
+	}
+	v := s.mergeQueueEjectionProjectionFor(ctx, latest)
+	return &v, nil
 }

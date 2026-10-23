@@ -14,6 +14,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -519,11 +520,15 @@ func (s *Server) resolveMergeCandidateVerifyTrigger(ctx context.Context, runID, 
 
 // mergeCandidateVerifiedRecord is what recordMergeCandidateVerified reports:
 // the trigger the result settled, the result in force, and whether this call
-// was an idempotent replay that appended nothing.
+// was an idempotent replay that appended nothing. Ejected is the run's queue
+// entry this call's red verdict ejected (nil otherwise): its
+// merge_queue_ejected row is DEFERRED to the caller, which writes it after
+// routeMergeCandidateFailure (ADR-093 D4, #4297).
 type mergeCandidateVerifiedRecord struct {
 	Trigger   mergeCandidateVerifyTrigger
 	Result    string
 	Duplicate bool
+	Ejected   *mergequeue.Entry
 }
 
 // recordMergeCandidateVerified appends the merge_candidate_verified row for the
@@ -617,8 +622,8 @@ func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID
 	// ADR-092 D4: the verdict moves the run's live queue entry (ejects a red
 	// pass and hands the line on). A duplicate replay returned above, so a
 	// runner retry never re-applies it.
-	s.mergeCandidateQueueOnVerdict(ctx, runID, trigger.ExpectedHeadSHA, result)
-	return &mergeCandidateVerifiedRecord{Trigger: trigger, Result: result}, nil
+	ejected := s.mergeCandidateQueueOnVerdict(ctx, runID, trigger.ExpectedHeadSHA, result)
+	return &mergeCandidateVerifiedRecord{Trigger: trigger, Result: result, Ejected: ejected}, nil
 }
 
 // boundMergeCandidateTail keeps the LAST mergeCandidateOutputTailMax bytes of

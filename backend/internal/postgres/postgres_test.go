@@ -8457,6 +8457,93 @@ WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'yield_reas
 	}
 }
 
+// TestMigrateDown_MergeQueueOrderKeyReversal pins 0111 (ADR-093 slice 3 /
+// #4297): after MigrateUp merge_candidate_queue_entries carries a nullable
+// TIMESTAMPTZ order_key with no default, a pre-0111-shaped insert reads it
+// back NULL (no backfill) and a promoted row reads its key back. After rolling
+// back through 0111 the column is gone, the queue rows survive and the schema
+// lands on 0110 (refinement_drafts.repo survives); MigrateUp again restores it.
+func TestMigrateDown_MergeQueueOrderKeyReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	orderKeyColumn := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'order_key'
+  AND is_nullable = 'YES' AND data_type = 'timestamp with time zone' AND column_default IS NULL`).Scan(&n); err != nil {
+			t.Fatalf("read 0111 column: %v", err)
+		}
+		return n
+	}
+	if n := orderKeyColumn(); n != 1 {
+		t.Fatalf("nullable TIMESTAMPTZ order_key columns after MigrateUp = %d, want 1", n)
+	}
+
+	var plainRun, promotedRun uuid.UUID
+	for _, id := range []*uuid.UUID{&plainRun, &promotedRun} {
+		if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'o/r', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(id); err != nil {
+			t.Fatalf("seed run: %v", err)
+		}
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha)
+VALUES ($1, 'o/r', 'main', 'held', 'h1')`, plainRun); err != nil {
+		t.Fatalf("insert pre-0111-shaped row: %v — 0111 must leave it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, order_key)
+VALUES ($1, 'o/r', 'main', 'held', 'h2', now() - interval '1 hour')`, promotedRun); err != nil {
+		t.Fatalf("insert promoted row: %v", err)
+	}
+	var nullKeys, setKeys int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE order_key IS NULL), count(*) FILTER (WHERE order_key IS NOT NULL)
+FROM merge_candidate_queue_entries WHERE run_id IN ($1, $2)`, plainRun, promotedRun).Scan(&nullKeys, &setKeys); err != nil {
+		t.Fatalf("read order keys: %v", err)
+	}
+	if nullKeys != 1 || setKeys != 1 {
+		t.Errorf("rows with NULL order_key = %d, set = %d; want 1, 1 (no default, no backfill)", nullKeys, setKeys)
+	}
+
+	downThrough(t, url, "0111")
+
+	if n := orderKeyColumn(); n != 0 {
+		t.Errorf("order_key columns after rolling back 0111 = %d, want 0", n)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM merge_candidate_queue_entries WHERE run_id IN ($1, $2)`, plainRun, promotedRun).Scan(&rows); err != nil {
+		t.Fatalf("read entries after rollback: %v — the 0101 table must survive", err)
+	}
+	if rows != 2 {
+		t.Errorf("queue rows after rolling back 0111 = %d, want 2 (untouched)", rows)
+	}
+	// The rollback lands on 0110, so its refinement_drafts.repo column survives.
+	var repoCols int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'refinement_drafts' AND column_name = 'repo'`).Scan(&repoCols); err != nil {
+		t.Fatalf("read 0110 column after rolling back 0111: %v", err)
+	}
+	if repoCols != 1 {
+		t.Errorf("refinement_drafts.repo columns after rolling back 0111 = %d, want 1 (0110 untouched)", repoCols)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n := orderKeyColumn(); n != 1 {
+		t.Errorf("order_key columns after re-applying 0111 = %d, want 1", n)
+	}
+}
+
 // TestIsTransientPGRefusal: the raw-database drop retries only a server
 // refusal (also through a connect error's wrap), never another failure.
 func TestIsTransientPGRefusal(t *testing.T) {

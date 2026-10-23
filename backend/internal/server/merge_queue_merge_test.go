@@ -1092,3 +1092,121 @@ func TestMergeQueueMergeOnPass_LockAndEntryBranches(t *testing.T) {
 		w.requireMerges(0)
 	})
 }
+
+// TestMergeOnPass_ForgeRefusalEjectsExactlyOnce pins ADR-093 D4 / ADR-112 R3
+// rows 4 and 5 for every TYPED forge refusal of the pinned merge PUT, the
+// unstable-status one included (first-officer ruling C-R4), through the
+// PUMP: each case runs two pumps and the periodic sweep.
+//   - Row 5 (null decision, clean state): EJECT forge_merge_refused naming the
+//     forge's code, one merge_queue_ejected row with a sanitised forge_detail,
+//     the claim released, the next entry admitted, and the merger called
+//     EXACTLY once.
+//   - Row 4 (REVIEW_REQUIRED, or mergeStateStatus BLOCKED): YIELD
+//     forge_review_required (next_step approve_pr), no ejection row, merger
+//     called once.
+//
+// MECHANISMS: the merger refuses on EVERY call and the merge-variant
+// eligibility passes, so without the eject arm the released claim lets the
+// next pump claim and dispatch again — replacing the eject return with
+// held(transient), or deleting ErrPullRequestUnstableStatus from the arm, makes
+// the unstable rows' merger count 2 (RED). Skipping the row-4 snapshot on the
+// unstable arm turns its yield row RED (it ejects instead).
+func TestMergeOnPass_ForgeRefusalEjectsExactlyOnce(t *testing.T) {
+	// Built at runtime so no source line matches a credential pattern.
+	token := "gh" + "s_" + strings.Repeat("S3", 18)
+	cases := []struct {
+		name     string
+		err      error
+		decision string
+		state    string
+		yield    bool
+		code     string
+	}{
+		{name: "unstable status ejects checks_not_settled", err: fmt.Errorf("pinned merge (token %s): %w", token, forge.ErrPullRequestUnstableStatus),
+			state: "CLEAN", code: mergeQueueForgeReasonChecksNotSettled},
+		{name: "unstable status review required yields", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestUnstableStatus),
+			decision: "REVIEW_REQUIRED", yield: true},
+		{name: "unstable status blocked yields", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestUnstableStatus),
+			state: "BLOCKED", yield: true},
+		{name: "405 ejects not_mergeable", err: fmt.Errorf("pinned merge (token %s): %w", token, forge.ErrPullRequestNotMergeable),
+			code: mergeQueueForgeReasonNotMergeable},
+		{name: "405 review required yields", err: fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+			decision: "REVIEW_REQUIRED", yield: true},
+		{name: "422 ejects unprocessable", err: fmt.Errorf("pinned merge (token %s): %w: %w", token, forge.ErrValidation, forge.ErrMergeUnprocessable),
+			code: mergeQueueForgeReasonUnprocessable},
+		{name: "422 changes requested yields", err: fmt.Errorf("pinned: %w: %w", forge.ErrValidation, forge.ErrMergeUnprocessable),
+			decision: "CHANGES_REQUESTED", yield: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			ctx := context.Background()
+			r, _ := w.ready("fr", "h1", mcvUndelegatedSpecYAML)
+			b := w.seed("frb", "b0", []byte(mcvUndelegatedSpecYAML))
+			if _, err := w.store.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: b.id, BaseRef: mcqBase, HeadSHA: "b0"}); err != nil {
+				t.Fatalf("enqueue B: %v", err)
+			}
+			w.merger.err = tc.err
+			w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{ReviewDecision: tc.decision, MergeStateStatus: tc.state})
+			w.pumpBase(r)
+			w.pumpBase(r)
+			w.srv.PumpMergeCandidateQueues(ctx)
+
+			w.requireMerges(1)
+			if len(w.rows(b, CategoryMergeCandidateQueueAdmitted)) == 0 {
+				t.Fatal("the next entry was not admitted: the line is wedged")
+			}
+			if _, claimed, err := w.srv.mergeDispatchLedger().MergeDispatch(ctx, r.id); err != nil || claimed {
+				t.Fatalf("dispatch claim present = %v (%v), want released", claimed, err)
+			}
+			if tc.yield {
+				if e := w.active(r); e.State != mergequeue.StateHeld || e.YieldReason != mergeQueueYieldForgeReviewRequired {
+					t.Fatalf("A = %s yielded %q, want held and yielded forge_review_required (row 4)", e.State, e.YieldReason)
+				}
+				if rows := w.ejectedRows(r); len(rows) != 0 {
+					t.Fatalf("merge_queue_ejected rows = %v, want none on a row-4 yield", rows)
+				}
+				return
+			}
+			w.requireState(r, mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused)
+			p := w.oneEjection(r, mergeCandidateQueueReasonForgeMergeRefused, mergeQueueEjectNextMergeRun)
+			detail := fmt.Sprint(p["forge_detail"])
+			if p["forge_reason"] != tc.code || strings.Contains(detail, token) || !strings.Contains(detail, "[redacted]") {
+				t.Fatalf("ejection forge_reason %v forge_detail %q, want %s with the token redacted", p["forge_reason"], detail, tc.code)
+			}
+			if tc.code == mergeQueueForgeReasonChecksNotSettled && (!strings.HasPrefix(detail, "the checks were not settled at the merge attempt") ||
+				!strings.Contains(fmt.Sprint(p["remedy"]), "pending checks hold before dispatch")) {
+				t.Fatalf("checks_not_settled detail %q / remedy %v, want the hold/eject asymmetry stated", detail, p["remedy"])
+			}
+			if _, ok := p["fixup_routed"]; ok {
+				t.Fatalf("a forge refusal carries fixup_routed: %v", p)
+			}
+		})
+	}
+}
+
+// TestMergeQueueOnPass_ReviewRequiredRefusalStillYields is the ADR-112 R3
+// row-4 regression guard (first-officer ruling C-R4): a 405 refusal with a
+// REVIEW_REQUIRED snapshot still YIELDS forge_review_required with next_step
+// approve_pr at the decision seam and writes no merge_queue_ejected row.
+func TestMergeQueueOnPass_ReviewRequiredRefusalStillYields(t *testing.T) {
+	for _, err := range []error{
+		fmt.Errorf("pinned: %w", forge.ErrPullRequestNotMergeable),
+		fmt.Errorf("pinned: %w", forge.ErrPullRequestUnstableStatus),
+	} {
+		w := newMQMWorld(t)
+		r, req := w.ready("rr", "h1", mcvUndelegatedSpecYAML)
+		w.merger.err = err
+		w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{ReviewDecision: "REVIEW_REQUIRED"})
+		out := w.decide(req)
+		requireOutcome(t, out, mergeOnPassYield, mergeQueueYieldForgeReviewRequired)
+		if out.Yield.NextStep != forgeApprovalNextApprovePR || out.ForgeReason != "" {
+			t.Fatalf("yield = %+v forge_reason %q, want approve_pr and no forge reason", out.Yield, out.ForgeReason)
+		}
+		n := 0
+		w.srv.applyMergeOnPassOutcome(context.Background(), req.Entry, out, &n)
+		if rows := w.ejectedRows(r); len(rows) != 0 {
+			t.Fatalf("merge_queue_ejected rows = %v, want none", rows)
+		}
+	}
+}

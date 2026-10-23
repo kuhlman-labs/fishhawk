@@ -45,6 +45,9 @@ const mcqBase = "main"
 type mcqPR struct {
 	head, branch, state string
 	merged              bool
+	// base is served as GET /pulls/{n}'s base.ref ("" serves mcqBase); a
+	// non-empty value is a PR retargeted to another base.
+	base string
 	// mergeableState is served as GET /pulls/{n}'s mergeable_state ("" by
 	// default, which merge-on-pass reads as not a positive answer).
 	mergeableState string
@@ -297,8 +300,12 @@ func (g *mcqGitHub) client(t *testing.T) *githubclient.Client {
 		pr, ok := g.prs[n]
 		var body string
 		if ok {
+			base := mcqBase
+			if pr.base != "" {
+				base = pr.base
+			}
 			body = fmt.Sprintf(`{"node_id":"PR_%d","state":%q,"merged":%t,"mergeable_state":%q,"head":{"sha":%q,"ref":%q},"base":{"ref":%q}}`,
-				n, pr.state, pr.merged, pr.mergeableState, pr.head, pr.branch, mcqBase)
+				n, pr.state, pr.merged, pr.mergeableState, pr.head, pr.branch, base)
 		}
 		g.mu.Unlock()
 		if !ok {
@@ -3234,5 +3241,40 @@ func TestMCQFake_ReviewSnapshotAndPermissionRoutes(t *testing.T) {
 	}
 	if n := f.gh.permissionCalls("writer"); n != 2 {
 		t.Errorf("permission calls for writer = %d, want 2", n)
+	}
+}
+
+// Mode (4), ADR-093 slice 3 (#4297): an auto-advance conflict ejects
+// advance_conflict, records ONE merge_queue_ejected row handing off to the
+// conflict-resolution path by NAMING fishhawk_rebase_run_branch, and admits the
+// next held entry. The hand-off is named, never auto-started: no
+// stage_conflict_resolution_triggered row.
+func TestAdmission_AdvanceConflictEjectsNamingRebase(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b, c := f.waveABC()
+	f.gh.set(func() {
+		f.gh.behind["b1"] = []string{"base-x"}
+		f.gh.mergeStatus[b.branch] = http.StatusConflict
+	})
+	f.closePR(a, true)
+	f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonAdvanceConflict)
+	f.oneEjection(b, mergeCandidateQueueReasonAdvanceConflict, mergeQueueEjectNextRebaseRunBranch)
+	f.requireState(c, mergequeue.StateLive, "")
+	if n := len(f.rows(b, CategoryStageConflictResolutionTriggered)); n != 0 {
+		t.Fatalf("stage_conflict_resolution_triggered rows = %d, want 0 (the hand-off is named, not started)", n)
+	}
+}
+
+// Mode (6): a pass that cannot start ejects pass_not_startable and records
+// ONE row naming fishhawk_get_run_status.
+func TestAdmission_PassNotStartableRecordsEjection(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	f.setStage(b.impl.ID, run.StageStateRunning)
+	f.closePR(a, true)
+	f.requireState(b, mergequeue.StateEjected, mergeCandidateQueueReasonPassNotStartable)
+	p := f.oneEjection(b, mergeCandidateQueueReasonPassNotStartable, mergeQueueEjectNextGetRunStatus)
+	if _, ok := p["fixup_routed"]; ok {
+		t.Fatalf("a non-verify ejection carries fixup_routed: %v", p)
 	}
 }

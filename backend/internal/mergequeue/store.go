@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
 // PostgresStore is the pgx-backed Store over merge_candidate_queue_entries
@@ -49,9 +50,20 @@ type PostgresStore struct {
 	// after the active-entry peek and before the base locks — the seam the
 	// settled-between-peek-and-lock test settles the peeked entry on.
 	afterPeek func(ctx context.Context)
+	// afterPromotePeek is a test hook, nil in production: it runs inside
+	// Promote after the unlocked active-entry peek and before the locks.
+	afterPromotePeek func(ctx context.Context)
+	// afterPromotePosition is a test hook, nil in production: it runs inside
+	// Promote after the old-position read and before the guarded write.
+	afterPromotePosition func(ctx context.Context)
 }
 
-var _ Store = (*PostgresStore)(nil)
+var (
+	_ Store          = (*PostgresStore)(nil)
+	_ Promoter       = (*PostgresStore)(nil)
+	_ EjectionReader = (*PostgresStore)(nil)
+	_ ReentryReader  = (*PostgresStore)(nil)
+)
 
 // NewPostgresStore returns the Postgres queue store.
 func NewPostgresStore(pool *pgxpool.Pool) *PostgresStore {
@@ -66,7 +78,13 @@ const entryCols = `e.id, e.run_id, COALESCE(r.account_id::text, ''), e.repo, e.b
   COALESCE(e.anchored_base_sha, ''), e.anchored_at, e.admitted_at, e.settled_at, e.updated_at,
   e.merge_intent_at, COALESCE(e.merge_intent_sequence, 0), e.admission_epoch,
   COALESCE(e.yield_reason, ''), COALESCE(e.yield_detail, ''), e.yielded_at, e.approval_wait_started_at,
-  COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.yielded_at) * 1000000)::bigint), 0)`
+  COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.yielded_at) * 1000000)::bigint), 0),
+  e.order_key, COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.settled_at) * 1000000)::bigint), 0)`
+
+// effectiveKeySQL is an entry's queue-order key on alias e: the promote's
+// order_key when set (0111), else enqueued_at. Every row without a promotion
+// is therefore strict FIFO by eligibility time.
+const effectiveKeySQL = `COALESCE(e.order_key, e.enqueued_at)`
 
 const entryFrom = `
 FROM merge_candidate_queue_entries e
@@ -79,17 +97,19 @@ const basePredicate = `e.repo = $1 AND e.base_ref = $2 AND r.account_id IS NOT D
 func scanEntry(row pgx.Row, extra ...any) (Entry, error) {
 	var e Entry
 	var state, phase string
-	var yieldAgeUS int64
+	var yieldAgeUS, settledAgeUS int64
 	dest := append([]any{&e.ID, &e.RunID, &e.AccountID, &e.Repo, &e.BaseRef, &state,
 		&phase, &e.EjectReason, &e.EnqueuedAt, &e.AnchoredHeadSHA,
 		&e.AnchoredBaseSHA, &e.AnchoredAt, &e.AdmittedAt, &e.SettledAt, &e.UpdatedAt,
 		&e.MergeIntentAt, &e.MergeIntentSequence, &e.AdmissionEpoch,
-		&e.YieldReason, &e.YieldDetail, &e.YieldedAt, &e.ApprovalWaitStartedAt, &yieldAgeUS}, extra...)
+		&e.YieldReason, &e.YieldDetail, &e.YieldedAt, &e.ApprovalWaitStartedAt, &yieldAgeUS,
+		&e.OrderKey, &settledAgeUS}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return Entry{}, err
 	}
 	e.State, e.Phase = State(state), Phase(phase)
 	e.YieldAge = time.Duration(yieldAgeUS) * time.Microsecond
+	e.SettledAge = time.Duration(settledAgeUS) * time.Microsecond
 	return e, nil
 }
 
@@ -234,7 +254,9 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 	return out, nil
 }
 
-// insertTx inserts a held row at the base's tail: enqueued_at (the FIFO key),
+// insertTx inserts a held row at the base's tail with no order_key (a fresh
+// row is never promoted, so a re-entry joins behind every held entry):
+// enqueued_at (the FIFO key),
 // anchored_at, (with MergeIntent) merge_intent_at and (with Yield) yielded_at
 // are one database-clock instant, and merge_intent_sequence and the yield
 // reason and detail are stamped in the same statement.
@@ -336,8 +358,9 @@ WHERE id = $1 AND state IN ('held', 'live')`, id, string(state), reason); err !=
 	return getEntryTx(ctx, tx, id)
 }
 
-// AdmitNext admits the base's oldest UNMARKED held entry when the base has no live
-// one. See README.md § "AdmitNext".
+// AdmitNext admits the base's first UNMARKED held entry by effective key
+// (effectiveKeySQL, id) when the base has no live one. See README.md §
+// "AdmitNext".
 func (s *PostgresStore) AdmitNext(ctx context.Context, base Base) (Admission, error) {
 	if err := base.validate(); err != nil {
 		return Admission{}, err
@@ -383,7 +406,7 @@ WHERE id = $1`, live.ID); err != nil {
 		// marker is the only way back in (ADR-112 R3).
 		next, err := scanEntry(tx.QueryRow(ctx, `SELECT `+entryCols+entryFrom+`
 WHERE `+basePredicate+` AND e.state = 'held' AND e.yielded_at IS NULL
-ORDER BY e.enqueued_at, e.id
+ORDER BY `+effectiveKeySQL+`, e.id
 LIMIT 1
 FOR UPDATE OF e`, base.Repo, base.BaseRef, acct))
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -687,7 +710,8 @@ FROM merge_candidate_queue_entries WHERE id = $1`, cur.ID, window.Microseconds()
 
 // Yield moves a LIVE entry at epoch to held and marks it yielded, in ONE
 // statement (ADR-112 R3): state held, phase and admitted_at cleared,
-// enqueued_at kept (a cleared row rejoins FIFO at its original place),
+// enqueued_at and order_key kept (a cleared row rejoins at its original
+// effective key),
 // yield_reason, yield_detail and yielded_at (database clock, or the
 // marker's continued episode when the anchor matches it: yieldContinueSQL)
 // stamped, and approval_wait_started_at kept. It is a compare-and-swap on the
@@ -761,7 +785,8 @@ WHERE id = $1 AND state = 'held' AND anchored_head_sha = $2 AND yielded_at = $3`
 // ClearYield clears a yielded entry's marker AND its approval-wait anchor (a
 // later non-approval starts a fresh episode), a compare-and-swap on (held,
 // anchored_head_sha, yielded_at) under the base lock: the row rejoins the
-// line FIFO at its original enqueued_at. A row whose head moved, whose
+// line at its original effective key (enqueued_at, or a kept order_key). A
+// row whose head moved, whose
 // episode changed (another yielded_at) or that is no longer held is
 // ErrStateConflict and keeps its marker. See README.md § "Yield".
 func (s *PostgresStore) ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time) (Entry, error) {
@@ -964,7 +989,7 @@ func activeForRun(ctx context.Context, q rowQuerier, runID uuid.UUID) (Status, b
     SELECT count(*) FROM merge_candidate_queue_entries h JOIN runs hr ON hr.id = h.run_id
     WHERE h.repo = e.repo AND h.base_ref = e.base_ref AND h.state = 'held'
       AND hr.account_id IS NOT DISTINCT FROM r.account_id
-      AND (h.yielded_at IS NOT NULL, h.enqueued_at, h.id) <= (e.yielded_at IS NOT NULL, e.enqueued_at, e.id)
+      AND (h.yielded_at IS NOT NULL, COALESCE(h.order_key, h.enqueued_at), h.id) <= (e.yielded_at IS NOT NULL, `+effectiveKeySQL+`, e.id)
   ) ELSE 0 END,
   (SELECT l.run_id FROM merge_candidate_queue_entries l JOIN runs lr ON lr.id = l.run_id
     WHERE l.repo = e.repo AND l.base_ref = e.base_ref AND l.state = 'live'
@@ -993,15 +1018,16 @@ func (s *PostgresStore) ActiveForRun(ctx context.Context, runID uuid.UUID) (Stat
 }
 
 // ListForBase returns the base's active entries in queue order: the live
-// entry first, then unmarked held entries by (enqueued_at, id), then yielded
-// held entries by (enqueued_at, id). Never nil.
+// entry first, then unmarked held entries by (effective key, id), then
+// yielded held entries by (effective key, id); the effective key is
+// effectiveKeySQL. Never nil.
 func (s *PostgresStore) ListForBase(ctx context.Context, base Base) ([]Entry, error) {
 	if err := base.validate(); err != nil {
 		return nil, err
 	}
 	rows, err := s.pool.Query(ctx, `SELECT `+entryCols+entryFrom+`
 WHERE `+basePredicate+` AND e.state IN ('held', 'live')
-ORDER BY (e.state = 'live') DESC, (e.yielded_at IS NOT NULL), e.enqueued_at, e.id`, base.Repo, base.BaseRef, acctArg(base.AccountID))
+ORDER BY (e.state = 'live') DESC, (e.yielded_at IS NOT NULL), `+effectiveKeySQL+`, e.id`, base.Repo, base.BaseRef, acctArg(base.AccountID))
 	if err != nil {
 		return nil, fmt.Errorf("mergequeue: list base: %w", err)
 	}
@@ -1060,6 +1086,232 @@ LIMIT $4`, base.Repo, base.BaseRef, acctArg(base.AccountID), limit)
 	})
 	if err != nil {
 		return nil, fmt.Errorf("mergequeue: scan line turns: %w", err)
+	}
+	return out, nil
+}
+
+// promoteKeySQL writes the promoted entry's order key: 1 ms ahead of the
+// minimum effective key over every OTHER unmarked held entry on the same base
+// and account ($1 repo, $2 base ref, $3 account), so the newest promote wins.
+// enqueued_at and every other row are untouched. The write is GUARDED, in
+// this same statement, on an entry still being strictly ahead of the
+// caller's own (effective key $4, id $5): with none ahead, min() is not a
+// key to write and bool_or over zero rows is NULL, so the guard matches no
+// row (the concurrency store's #4312 shape).
+const promoteKeySQL = `WITH others AS (
+  SELECT min(` + effectiveKeySQL + `) AS k,
+    bool_or((` + effectiveKeySQL + `, e.id) < ($4::timestamptz, $5::uuid)) AS ahead` + entryFrom + `
+  WHERE ` + basePredicate + ` AND e.state = 'held' AND e.yielded_at IS NULL AND e.id <> $5::uuid
+)
+UPDATE merge_candidate_queue_entries SET order_key = others.k - interval '1 millisecond'
+FROM others
+WHERE id = $5::uuid AND state = 'held' AND yielded_at IS NULL AND others.ahead
+RETURNING id`
+
+// Promote moves a run's held entry to the head of its base's line among the
+// unmarked held entries (ADR-093 D2). See README.md § "Promote".
+//
+// One transaction on one pooled connection: the run's account (an unknown
+// run is ErrNotFound), the per-run lock (Enqueue holds it across a base
+// change, so the peeked entry cannot be swapped for another base's row), an
+// unlocked peek of the run's active entry, the base lock taken BLOCKING, the
+// entry re-read FOR UPDATE, then classify: none → ErrNotQueued, live →
+// ErrEntryLive, yielded → ErrEntryYielded. An entry already first answers
+// Changed=false with nothing written and Record not called. Any error,
+// including one returned by req.Record, rolls the whole promotion back.
+func (s *PostgresStore) Promote(ctx context.Context, req PromoteRequest) (Promotion, error) {
+	switch {
+	case req.RunID == uuid.Nil:
+		return Promotion{}, fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	case req.Record == nil:
+		return Promotion{}, fmt.Errorf("%w: a Record callback is required (a promotion never commits unaudited)", ErrInvalidRequest)
+	}
+	var out Promotion
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		out, err = s.promoteTx(ctx, tx, req)
+		return err
+	})
+	if err != nil {
+		return Promotion{}, err
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) promoteTx(ctx context.Context, tx pgx.Tx, req PromoteRequest) (Promotion, error) {
+	var acct string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(account_id::text, '') FROM runs WHERE id = $1`, req.RunID).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Promotion{}, fmt.Errorf("run %s: %w", req.RunID, ErrNotFound)
+	}
+	if err != nil {
+		return Promotion{}, fmt.Errorf("mergequeue: promote: read run: %w", err)
+	}
+	if err := lockTx(ctx, tx, runLockKey(req.RunID)); err != nil {
+		return Promotion{}, err
+	}
+	var peekID uuid.UUID
+	var repo, baseRef string
+	err = tx.QueryRow(ctx, `SELECT id, repo, base_ref FROM merge_candidate_queue_entries
+WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &repo, &baseRef)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Promotion{}, fmt.Errorf("run %s: %w", req.RunID, ErrNotQueued)
+	}
+	if err != nil {
+		return Promotion{}, fmt.Errorf("mergequeue: promote: read active entry: %w", err)
+	}
+	if s.afterPromotePeek != nil {
+		s.afterPromotePeek(ctx)
+	}
+	if err := lockTx(ctx, tx, lockKey(acct, repo, baseRef)); err != nil {
+		return Promotion{}, err
+	}
+	cur, err := getEntryTx(ctx, tx, peekID)
+	if err != nil {
+		return Promotion{}, err
+	}
+	switch {
+	case cur.State == StateLive: // Promote live-entry refusal
+		return Promotion{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrEntryLive)
+	case cur.State != StateHeld:
+		// Settled by a by-entry mutation between the peek and the base lock.
+		return Promotion{}, fmt.Errorf("run %s entry %s is %s: %w", req.RunID, cur.ID, cur.State, ErrNotQueued)
+	case cur.Yielded(): // Promote yielded-entry refusal
+		return Promotion{}, fmt.Errorf("run %s entry %s (%s): %w", req.RunID, cur.ID, cur.YieldReason, ErrEntryYielded)
+	}
+
+	// The held position of an unmarked entry counts only unmarked entries
+	// ahead (yielded ones sort after it), so activeForRun's Position is the
+	// place among the unmarked held entries.
+	before, err := promoteStatus(ctx, tx, req.RunID)
+	if err != nil {
+		return Promotion{}, err
+	}
+	out := Promotion{Entry: before.Entry, OldPosition: before.Position, NewPosition: before.Position, LiveRunID: before.LiveRunID}
+	if before.Position == 1 {
+		return out, nil // already first: write nothing, record nothing
+	}
+	if s.afterPromotePosition != nil {
+		s.afterPromotePosition(ctx)
+	}
+	key := cur.EnqueuedAt
+	if cur.OrderKey != nil {
+		key = *cur.OrderKey
+	}
+	var written uuid.UUID
+	err = tx.QueryRow(ctx, promoteKeySQL, repo, baseRef, acctArg(acct), key, cur.ID).Scan(&written)
+	if errors.Is(err, pgx.ErrNoRows) {
+		// The guard failed: no entry is ahead at the write instant (the last
+		// one left since the position read). The row is held, unmarked and
+		// locked FOR UPDATE, so the UPDATE cannot miss for any other reason;
+		// this is the already-first answer.
+		out.OldPosition, out.NewPosition = 1, 1
+		return out, nil
+	}
+	if err != nil {
+		return Promotion{}, fmt.Errorf("mergequeue: promote: write order key: %w", err)
+	}
+	after, err := promoteStatus(ctx, tx, req.RunID)
+	if err != nil {
+		return Promotion{}, err
+	}
+	out.Entry, out.NewPosition, out.LiveRunID, out.Changed = after.Entry, after.Position, after.LiveRunID, true
+	if err := req.Record(ctx, tx, out); err != nil { // Promote record-before-commit
+		return Promotion{}, fmt.Errorf("mergequeue: promote: record: %w", err)
+	}
+	return out, nil
+}
+
+// promoteStatus is activeForRun inside Promote's transaction, under its
+// locks.
+func promoteStatus(ctx context.Context, tx pgx.Tx, runID uuid.UUID) (Status, error) {
+	st, found, err := activeForRun(ctx, tx, runID)
+	if err != nil {
+		return Status{}, err
+	}
+	if !found {
+		return Status{}, fmt.Errorf("mergequeue: promote: run %s lost its active entry under the lock", runID)
+	}
+	return st, nil
+}
+
+// newestRowSQL keeps only the run's NEWEST row (alias e): no row of the same
+// run with a later (enqueued_at, id). A run's rows are inserted one episode
+// at a time, each on the database clock after the previous one settled, so
+// enqueued_at orders them; a promotion never rewrites it.
+const newestRowSQL = `NOT EXISTS (SELECT 1 FROM merge_candidate_queue_entries n
+    WHERE n.run_id = e.run_id AND (n.enqueued_at, n.id) > (e.enqueued_at, e.id))`
+
+// LatestForRun returns the run's NEWEST row in any state (newestRowSQL's
+// order); found=false when the run never had one.
+func (s *PostgresStore) LatestForRun(ctx context.Context, runID uuid.UUID) (Entry, bool, error) {
+	if runID == uuid.Nil {
+		return Entry{}, false, fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	}
+	e, err := scanEntry(s.pool.QueryRow(ctx, `SELECT `+entryCols+entryFrom+`
+WHERE e.run_id = $1
+ORDER BY e.enqueued_at DESC, e.id DESC
+LIMIT 1`, runID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Entry{}, false, nil
+	}
+	if err != nil {
+		return Entry{}, false, fmt.Errorf("mergequeue: latest entry for run: %w", err)
+	}
+	return e, true, nil
+}
+
+// UnresolvedEjections returns the base's EJECTED rows that are still their
+// run's newest row (no re-entry, no later episode), newest settle first, at
+// most limit, scoped to the base's account like ListForBase. Never nil;
+// limit < 1 is ErrInvalidRequest.
+func (s *PostgresStore) UnresolvedEjections(ctx context.Context, base Base, limit int) ([]Entry, error) {
+	if err := base.validate(); err != nil {
+		return nil, err
+	}
+	if limit < 1 {
+		return nil, fmt.Errorf("%w: ejection limit %d, want at least 1", ErrInvalidRequest, limit)
+	}
+	return s.collectEntries(ctx, "unresolved ejections", `SELECT `+entryCols+entryFrom+`
+WHERE `+basePredicate+` AND e.state = 'ejected' AND `+newestRowSQL+`
+ORDER BY e.settled_at DESC, e.id DESC
+LIMIT $4`, base.Repo, base.BaseRef, acctArg(base.AccountID), limit)
+}
+
+// ReentryCandidates returns the rows ADR-093 D4's automatic re-entry may
+// consider: EJECTED with ReentryReason, carrying merge intent, still their
+// run's newest row, and belonging to a run that is not terminal (succeeded,
+// failed, cancelled). Oldest settle first, at most limit, across every
+// account (the sweep, like ActiveBases), strictly after the exclusive keyset
+// cursor after when it is non-nil. Never nil; limit < 1 is ErrInvalidRequest.
+// Eligibility, the fix-up and the forge are the caller's.
+func (s *PostgresStore) ReentryCandidates(ctx context.Context, after *ReentryCursor, limit int) ([]Entry, error) {
+	if limit < 1 {
+		return nil, fmt.Errorf("%w: re-entry limit %d, want at least 1", ErrInvalidRequest, limit)
+	}
+	args := []any{ReentryReason, string(run.StateSucceeded), string(run.StateFailed), string(run.StateCancelled), limit}
+	cursorSQL := ""
+	if after != nil {
+		cursorSQL = `
+  AND (e.settled_at, e.id) > ($6, $7)`
+		args = append(args, after.SettledAt, after.ID)
+	}
+	return s.collectEntries(ctx, "re-entry candidates", `SELECT `+entryCols+entryFrom+`
+WHERE e.state = 'ejected' AND e.eject_reason = $1 AND e.merge_intent_at IS NOT NULL
+  AND r.state NOT IN ($2, $3, $4) AND `+newestRowSQL+cursorSQL+`
+ORDER BY e.settled_at, e.id
+LIMIT $5`, args...)
+}
+
+// collectEntries runs a multi-row entry read on the pool. Never nil.
+func (s *PostgresStore) collectEntries(ctx context.Context, what, sql string, args ...any) ([]Entry, error) {
+	rows, err := s.pool.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, fmt.Errorf("mergequeue: %s: %w", what, err)
+	}
+	out, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (Entry, error) { return scanEntry(row) })
+	if err != nil {
+		return nil, fmt.Errorf("mergequeue: scan %s: %w", what, err)
 	}
 	return out, nil
 }

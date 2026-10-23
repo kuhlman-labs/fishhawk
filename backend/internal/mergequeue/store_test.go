@@ -1,6 +1,7 @@
 package mergequeue
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -2381,5 +2382,611 @@ func TestListForBaseAndPosition_YieldedOrderedLast(t *testing.T) {
 		if st := f.status(runs[id]); st.Position != want {
 			t.Errorf("position of %s = %d, want %d", id, st.Position, want)
 		}
+	}
+}
+
+// promoteRecorder is a Promote Record callback that records every call and
+// returns err. It also reads the entry's order key on the callback's own tx,
+// pinning that Record runs inside the promotion transaction after the write.
+type promoteRecorder struct {
+	calls     []Promotion
+	keyOnTx   []bool
+	err       error
+	readOnTxE error
+}
+
+func (r *promoteRecorder) record(ctx context.Context, tx pgx.Tx, p Promotion) error {
+	r.calls = append(r.calls, p)
+	var set bool
+	if err := tx.QueryRow(ctx, `SELECT order_key IS NOT NULL FROM merge_candidate_queue_entries WHERE id = $1`, p.Entry.ID).Scan(&set); err != nil {
+		r.readOnTxE = err
+	}
+	r.keyOnTx = append(r.keyOnTx, set)
+	return r.err
+}
+
+func (f *fixture) listRuns(base Base) []uuid.UUID {
+	f.t.Helper()
+	es, err := f.store.ListForBase(context.Background(), base)
+	if err != nil {
+		f.t.Fatalf("ListForBase: %v", err)
+	}
+	return runIDs(es)
+}
+
+func (f *fixture) orderKeyNull(id uuid.UUID) bool {
+	f.t.Helper()
+	return f.count(`id = $1 AND order_key IS NOT NULL`, id) == 0
+}
+
+// TestPromote_MovesHeldEntryToHead: with A, B, C held, promoting C puts it
+// first in ListForBase, at position 1, and makes it the entry AdmitNext
+// admits; Record is called once, inside the transaction, with the verdict.
+// Deleting the promote UPDATE leaves C third; reverting AdmitNext's ORDER BY
+// to (enqueued_at, id) admits A; reverting activeForRun's position tuple
+// reads C at 3: each RED.
+func TestPromote_MovesHeldEntryToHead(t *testing.T) {
+	f := newFixture(t)
+	a, b, c := f.run(), f.run(), f.run()
+	for i, r := range []uuid.UUID{a, b, c} {
+		f.enqueue(r, "main", fmt.Sprintf("h%d", i))
+	}
+	rec := &promoteRecorder{}
+	p, err := f.store.Promote(context.Background(), PromoteRequest{RunID: c, Record: rec.record})
+	if err != nil {
+		t.Fatalf("Promote(C): %v", err)
+	}
+	if !p.Changed || p.OldPosition != 3 || p.NewPosition != 1 || p.Entry.RunID != c || !p.Entry.Promoted() || p.LiveRunID != nil {
+		t.Fatalf("Promotion = %+v, want Changed 3 -> 1 for C, promoted, no live run", p)
+	}
+	if len(rec.calls) != 1 || rec.calls[0].NewPosition != 1 || rec.readOnTxE != nil || !rec.keyOnTx[0] {
+		t.Fatalf("Record calls = %+v (order key on tx %v, err %v), want one call seeing the written key", rec.calls, rec.keyOnTx, rec.readOnTxE)
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{c, a, b}; !slices.Equal(got, want) {
+		t.Fatalf("ListForBase after promote = %v, want C, A, B %v", got, want)
+	}
+	if st := f.status(c); st.Position != 1 || !st.Entry.Promoted() {
+		t.Fatalf("C status = position %d promoted %v, want 1 and promoted", st.Position, st.Entry.Promoted())
+	}
+	for _, r := range []uuid.UUID{a, b} {
+		if st := f.status(r); st.Entry.Promoted() || st.Entry.OrderKey != nil {
+			t.Fatalf("unpromoted entry %s carries an order key %v", r, st.Entry.OrderKey)
+		}
+	}
+	if st := f.status(a); st.Position != 2 {
+		t.Fatalf("A position = %d, want 2", st.Position)
+	}
+	if adm := f.admitNext(mainBase()); !adm.Admitted || adm.Entry.RunID != c {
+		t.Fatalf("AdmitNext after promote = %+v, want C admitted (admission follows the effective key)", adm)
+	}
+}
+
+// TestPromote_RefusalsWriteNothing: one arm per refusal; every arm reads the
+// target's order_key back NULL. live → ErrEntryLive, yielded →
+// ErrEntryYielded, only a terminal row → ErrNotQueued, settled between the
+// peek and the lock → ErrNotQueued, unknown run → ErrNotFound, nil Record or
+// nil run id → ErrInvalidRequest.
+func TestPromote_RefusalsWriteNothing(t *testing.T) {
+	ctx := context.Background()
+	rec := &promoteRecorder{}
+
+	t.Run("live", func(t *testing.T) {
+		f := newFixture(t)
+		live, held := f.run(), f.run()
+		f.enqueue(live, "main", "h1")
+		f.enqueue(held, "main", "h2")
+		f.admitNext(mainBase())
+		_, err := f.store.Promote(ctx, PromoteRequest{RunID: live, Record: rec.record})
+		if !errors.Is(err, ErrEntryLive) {
+			t.Fatalf("Promote(live) err = %v, want ErrEntryLive", err)
+		}
+		if !f.orderKeyNull(f.status(live).Entry.ID) {
+			t.Fatal("live entry carries an order key after a refused promote")
+		}
+	})
+	t.Run("yielded", func(t *testing.T) {
+		f := newFixture(t)
+		ahead, y := f.run(), f.run()
+		f.enqueue(ahead, "main", "h1")
+		e := f.enqueue(y, "main", "h2").Entry
+		f.markYielded(e.ID, "forge_approval_absent", time.Minute)
+		_, err := f.store.Promote(ctx, PromoteRequest{RunID: y, Record: rec.record})
+		if !errors.Is(err, ErrEntryYielded) {
+			t.Fatalf("Promote(yielded) err = %v, want ErrEntryYielded", err)
+		}
+		if !f.orderKeyNull(e.ID) {
+			t.Fatal("yielded entry carries an order key after a refused promote")
+		}
+	})
+	t.Run("terminal only", func(t *testing.T) {
+		f := newFixture(t)
+		r := f.run()
+		e := f.enqueue(r, "main", "h1").Entry
+		if _, err := f.store.Settle(ctx, e.ID, StateEjected, "verify_failed"); err != nil {
+			t.Fatalf("Settle: %v", err)
+		}
+		_, err := f.store.Promote(ctx, PromoteRequest{RunID: r, Record: rec.record})
+		if !errors.Is(err, ErrNotQueued) {
+			t.Fatalf("Promote(terminal only) err = %v, want ErrNotQueued", err)
+		}
+		if !f.orderKeyNull(e.ID) {
+			t.Fatal("terminal row carries an order key")
+		}
+	})
+	t.Run("settled between peek and lock", func(t *testing.T) {
+		f := newFixture(t)
+		ahead, r := f.run(), f.run()
+		f.enqueue(ahead, "main", "h1")
+		e := f.enqueue(r, "main", "h2").Entry
+		f.store.afterPromotePeek = func(context.Context) {
+			if _, err := NewPostgresStore(f.pool).Settle(ctx, e.ID, StateDropped, "pr_closed"); err != nil {
+				t.Errorf("settle in hook: %v", err)
+			}
+		}
+		_, err := f.store.Promote(ctx, PromoteRequest{RunID: r, Record: rec.record})
+		if !errors.Is(err, ErrNotQueued) {
+			t.Fatalf("Promote(settled after peek) err = %v, want ErrNotQueued", err)
+		}
+		if !f.orderKeyNull(e.ID) {
+			t.Fatal("settled row carries an order key")
+		}
+	})
+	t.Run("unknown run", func(t *testing.T) {
+		f := newFixture(t)
+		if _, err := f.store.Promote(ctx, PromoteRequest{RunID: uuid.New(), Record: rec.record}); !errors.Is(err, ErrNotFound) || !errors.Is(err, run.ErrNotFound) {
+			t.Fatalf("Promote(unknown run) err = %v, want ErrNotFound", err)
+		}
+	})
+	t.Run("invalid", func(t *testing.T) {
+		f := newFixture(t)
+		ahead, r := f.run(), f.run()
+		f.enqueue(ahead, "main", "h1")
+		e := f.enqueue(r, "main", "h2").Entry
+		if _, err := f.store.Promote(ctx, PromoteRequest{RunID: r}); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("Promote(nil Record) err = %v, want ErrInvalidRequest", err)
+		}
+		if _, err := f.store.Promote(ctx, PromoteRequest{Record: rec.record}); !errors.Is(err, ErrInvalidRequest) {
+			t.Fatalf("Promote(nil run id) err = %v, want ErrInvalidRequest", err)
+		}
+		if !f.orderKeyNull(e.ID) {
+			t.Fatal("a refused-before-SQL promote wrote an order key")
+		}
+	})
+	if len(rec.calls) != 0 {
+		t.Fatalf("Record called %d times across refusals, want 0", len(rec.calls))
+	}
+}
+
+// TestPromote_RecordErrorRollsBack: a Record error is returned wrapped and the
+// whole promotion rolls back, read as COMMITTED state after the call: the
+// order key is NULL and the order is the original FIFO. A store that ignored
+// Record's error would commit the key: RED.
+func TestPromote_RecordErrorRollsBack(t *testing.T) {
+	f := newFixture(t)
+	a, b := f.run(), f.run()
+	f.enqueue(a, "main", "h1")
+	e := f.enqueue(b, "main", "h2").Entry
+	boom := errors.New("audit append failed")
+	rec := &promoteRecorder{err: boom}
+	_, err := f.store.Promote(context.Background(), PromoteRequest{RunID: b, Record: rec.record})
+	if !errors.Is(err, boom) {
+		t.Fatalf("Promote err = %v, want the Record error wrapped", err)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Record calls = %d, want 1", len(rec.calls))
+	}
+	if !f.orderKeyNull(e.ID) {
+		t.Fatal("order key committed despite the Record error; want the promotion rolled back")
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{a, b}; !slices.Equal(got, want) {
+		t.Fatalf("ListForBase after the rolled-back promote = %v, want the original %v", got, want)
+	}
+}
+
+// TestPromote_AlreadyFirstNoop: the first held entry answers Changed=false,
+// positions 1/1, writes nothing and never calls Record. So does the guarded
+// write's miss: the only entry ahead vanishes (its run is deleted, the
+// cascade the base lock does not cover) between the position read and the
+// write.
+func TestPromote_AlreadyFirstNoop(t *testing.T) {
+	ctx := context.Background()
+	t.Run("first", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := f.run(), f.run()
+		e := f.enqueue(a, "main", "h1").Entry
+		f.enqueue(b, "main", "h2")
+		rec := &promoteRecorder{}
+		p, err := f.store.Promote(ctx, PromoteRequest{RunID: a, Record: rec.record})
+		if err != nil || p.Changed || p.OldPosition != 1 || p.NewPosition != 1 {
+			t.Fatalf("Promote(first) = %+v, %v; want a 1/1 no-op", p, err)
+		}
+		if len(rec.calls) != 0 || !f.orderKeyNull(e.ID) {
+			t.Fatalf("no-op promote called Record %d times or wrote a key", len(rec.calls))
+		}
+	})
+	t.Run("guard misses", func(t *testing.T) {
+		f := newFixture(t)
+		a, b := f.run(), f.run()
+		f.enqueue(a, "main", "h1")
+		e := f.enqueue(b, "main", "h2").Entry
+		f.store.afterPromotePosition = func(context.Context) {
+			if _, err := f.pool.Exec(ctx, `DELETE FROM runs WHERE id = $1`, a); err != nil {
+				t.Errorf("delete run in hook: %v", err)
+			}
+		}
+		rec := &promoteRecorder{}
+		p, err := f.store.Promote(ctx, PromoteRequest{RunID: b, Record: rec.record})
+		if err != nil || p.Changed || p.OldPosition != 1 || p.NewPosition != 1 {
+			t.Fatalf("Promote(guard misses) = %+v, %v; want a 1/1 no-op", p, err)
+		}
+		if len(rec.calls) != 0 || !f.orderKeyNull(e.ID) {
+			t.Fatalf("guard-miss promote called Record %d times or wrote a key", len(rec.calls))
+		}
+	})
+}
+
+// TestPromote_NewestPromoteWinsAndSurvivesUnadmitYieldClear: a second promote
+// goes ahead of the first; the promoted entry keeps its order key across an
+// Unadmit, a Yield (it sorts last while marked) and a ClearYield (it rejoins
+// at its promoted place).
+func TestPromote_NewestPromoteWinsAndSurvivesUnadmitYieldClear(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b, c, d := f.run(), f.run(), f.run(), f.run()
+	for i, r := range []uuid.UUID{a, b, c, d} {
+		f.enqueue(r, "main", fmt.Sprintf("h%d", i))
+	}
+	rec := &promoteRecorder{}
+	for _, r := range []uuid.UUID{c, d} {
+		if _, err := f.store.Promote(ctx, PromoteRequest{RunID: r, Record: rec.record}); err != nil {
+			t.Fatalf("Promote(%s): %v", r, err)
+		}
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{d, c, a, b}; !slices.Equal(got, want) {
+		t.Fatalf("after two promotes = %v, want D, C, A, B %v", got, want)
+	}
+	dEntry := f.status(d).Entry
+	key := *dEntry.OrderKey
+
+	epoch := f.admitAt(dEntry.ID)
+	if _, err := f.store.Unadmit(ctx, dEntry.ID, epoch); err != nil {
+		t.Fatalf("Unadmit: %v", err)
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{d, c, a, b}; !slices.Equal(got, want) {
+		t.Fatalf("after Unadmit = %v, want D back first %v", got, want)
+	}
+	epoch = f.admitAt(dEntry.ID)
+	y, err := f.store.Yield(ctx, dEntry.ID, epoch, YieldMarker{Reason: "forge_approval_absent"})
+	if err != nil {
+		t.Fatalf("Yield: %v", err)
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{c, a, b, d}; !slices.Equal(got, want) {
+		t.Fatalf("while yielded = %v, want D last %v", got, want)
+	}
+	if _, err := f.store.ClearYield(ctx, dEntry.ID, y.AnchoredHeadSHA, *y.YieldedAt); err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{d, c, a, b}; !slices.Equal(got, want) {
+		t.Fatalf("after ClearYield = %v, want D at its promoted place %v", got, want)
+	}
+	if got := f.entry(dEntry.ID).OrderKey; got == nil || !got.Equal(key) {
+		t.Fatalf("D order key after Unadmit/Yield/ClearYield = %v, want kept %v", got, key)
+	}
+}
+
+// TestPromote_RepromoteUsesExistingOrderKey: an entry promoted once and then
+// overtaken by a later promote is promoted again from its existing order key,
+// not its enqueued_at, and goes back to the head.
+func TestPromote_RepromoteUsesExistingOrderKey(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b, c, d := f.run(), f.run(), f.run(), f.run()
+	for i, r := range []uuid.UUID{a, b, c, d} {
+		f.enqueue(r, "main", fmt.Sprintf("h%d", i))
+	}
+	rec := &promoteRecorder{}
+	for _, r := range []uuid.UUID{c, d} {
+		if _, err := f.store.Promote(ctx, PromoteRequest{RunID: r, Record: rec.record}); err != nil {
+			t.Fatalf("Promote(%s): %v", r, err)
+		}
+	}
+	p, err := f.store.Promote(ctx, PromoteRequest{RunID: c, Record: rec.record})
+	if err != nil || !p.Changed || p.OldPosition != 2 || p.NewPosition != 1 {
+		t.Fatalf("re-Promote(C) = %+v, %v; want Changed 2 -> 1", p, err)
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{c, d, a, b}; !slices.Equal(got, want) {
+		t.Fatalf("after re-promote = %v, want C, D, A, B %v", got, want)
+	}
+}
+
+// TestPromote_MidTransactionFailureRollsBack: a statement failing after the
+// peek (the base lock) or after the position read (the order-key write)
+// returns the error and commits nothing.
+func TestPromote_MidTransactionFailureRollsBack(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hook func(f *fixture, cancel context.CancelFunc)
+	}{
+		{"base lock", func(f *fixture, cancel context.CancelFunc) {
+			f.store.afterPromotePeek = func(context.Context) { cancel() }
+		}},
+		{"order key write", func(f *fixture, cancel context.CancelFunc) {
+			f.store.afterPromotePosition = func(context.Context) { cancel() }
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			a, b := f.run(), f.run()
+			f.enqueue(a, "main", "h1")
+			e := f.enqueue(b, "main", "h2").Entry
+			ctx, cancel := context.WithCancel(context.Background())
+			defer cancel()
+			tc.hook(f, cancel)
+			rec := &promoteRecorder{}
+			if _, err := f.store.Promote(ctx, PromoteRequest{RunID: b, Record: rec.record}); !errors.Is(err, context.Canceled) {
+				t.Fatalf("Promote err = %v, want context.Canceled", err)
+			}
+			if len(rec.calls) != 0 || !f.orderKeyNull(e.ID) {
+				t.Fatalf("failed promote called Record %d times or committed a key", len(rec.calls))
+			}
+		})
+	}
+}
+
+// TestEntryReads_CanceledContext: the pool reads surface a canceled context.
+func TestEntryReads_CanceledContext(t *testing.T) {
+	f := newFixture(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, _, err := f.store.LatestForRun(ctx, f.run()); !errors.Is(err, context.Canceled) {
+		t.Fatalf("LatestForRun err = %v, want context.Canceled", err)
+	}
+	if _, err := f.store.UnresolvedEjections(ctx, mainBase(), 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("UnresolvedEjections err = %v, want context.Canceled", err)
+	}
+	if _, err := f.store.ReentryCandidates(ctx, nil, 10); !errors.Is(err, context.Canceled) {
+		t.Fatalf("ReentryCandidates err = %v, want context.Canceled", err)
+	}
+}
+
+// TestPromote_AccountScoped: another account's EARLIER held row on the same
+// repo and base changes neither the promoted key (1 ms ahead of this
+// account's first entry, not the other account's) nor anyone's position.
+func TestPromote_AccountScoped(t *testing.T) {
+	f := newFixture(t)
+	acct := uuid.New()
+	f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "mq-"+acct.String())
+	other := f.run()
+	f.exec(`UPDATE runs SET account_id = $1 WHERE id = $2`, acct, other)
+	otherID := uuid.New()
+	f.seed(otherID, other, StateHeld, time.Hour)
+	a, b := f.run(), f.run()
+	aEntry := f.enqueue(a, "main", "h1").Entry
+	bEntry := f.enqueue(b, "main", "h2").Entry
+	p, err := f.store.Promote(context.Background(), PromoteRequest{RunID: b, Record: (&promoteRecorder{}).record})
+	if err != nil || !p.Changed || p.OldPosition != 2 || p.NewPosition != 1 {
+		t.Fatalf("Promote(B) = %+v, %v; want 2 -> 1 counted in its own account", p, err)
+	}
+	got := f.entry(bEntry.ID).OrderKey
+	if want := aEntry.EnqueuedAt.Add(-time.Millisecond); got == nil || !got.Equal(want) {
+		t.Fatalf("B order key = %v, want A's enqueued_at - 1ms %v (the other account's row must not count)", got, want)
+	}
+	if st := f.status(other); st.Position != 1 || st.Entry.Promoted() {
+		t.Fatalf("other account's entry = position %d promoted %v, want 1 and untouched", st.Position, st.Entry.Promoted())
+	}
+}
+
+// TestEnqueue_ReentryAfterEjectionJoinsTail: an ejected run that re-enters
+// gets a FRESH row at the TAIL (ADR-093 Q2), behind every entry that was
+// behind it. Stamping the fresh row with the run's earliest prior enqueued_at
+// gives it back its original place (position 1): RED.
+func TestEnqueue_ReentryAfterEjectionJoinsTail(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b, c := f.run(), f.run(), f.run()
+	for i, r := range []uuid.UUID{a, b, c} {
+		f.enqueue(r, "main", fmt.Sprintf("h%d", i))
+	}
+	adm := f.admitNext(mainBase())
+	if adm.Entry.RunID != a {
+		t.Fatalf("AdmitNext = %+v, want A", adm)
+	}
+	if _, err := f.store.SettleAt(ctx, adm.Entry.ID, adm.Entry.AdmissionEpoch, StateEjected, "verify_failed"); err != nil {
+		t.Fatalf("eject A: %v", err)
+	}
+	res := f.enqueue(a, "main", "h0-fixed")
+	if res.Outcome != EnqueueInserted || res.Entry.ID == adm.Entry.ID || res.Entry.Promoted() {
+		t.Fatalf("re-enqueue = %+v, want a fresh unpromoted row", res)
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{b, c, a}; !slices.Equal(got, want) {
+		t.Fatalf("ListForBase after re-entry = %v, want B, C, A %v", got, want)
+	}
+	if st := f.status(a); st.Position != 3 {
+		t.Fatalf("re-entered A position = %d, want 3 (the tail)", st.Position)
+	}
+}
+
+// TestLatestForRun: the run's newest row in any state; none for a run that
+// never queued; a nil run id is ErrInvalidRequest.
+func TestLatestForRun(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	r := f.run()
+	if _, found, err := f.store.LatestForRun(ctx, r); found || err != nil {
+		t.Fatalf("LatestForRun(never queued) = found %v, %v; want not found", found, err)
+	}
+	first := f.enqueue(r, "main", "h1").Entry
+	if e, found, err := f.store.LatestForRun(ctx, r); !found || err != nil || e.ID != first.ID || e.State != StateHeld {
+		t.Fatalf("LatestForRun(held) = %+v, %v, %v; want the held row", e, found, err)
+	}
+	if _, err := f.store.Settle(ctx, first.ID, StateEjected, "verify_failed"); err != nil {
+		t.Fatalf("Settle: %v", err)
+	}
+	if e, found, err := f.store.LatestForRun(ctx, r); !found || err != nil || e.ID != first.ID || e.State != StateEjected || e.SettledAge < 0 {
+		t.Fatalf("LatestForRun(ejected) = %+v, %v, %v; want the ejected row", e, found, err)
+	}
+	second := f.enqueue(r, "main", "h2").Entry
+	if e, found, err := f.store.LatestForRun(ctx, r); !found || err != nil || e.ID != second.ID {
+		t.Fatalf("LatestForRun(re-entered) = %+v, %v, %v; want the fresh row %s", e, found, err, second.ID)
+	}
+	if _, _, err := f.store.LatestForRun(ctx, uuid.Nil); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("LatestForRun(nil) err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// seedEjected inserts a terminal row BY CONSTRUCTION, settled settledAgo
+// before the database clock and enqueued an hour before that, with reason
+// and (intent) merge intent.
+func (f *fixture) seedEjected(runID uuid.UUID, state State, reason string, intent bool, settledAgo time.Duration) uuid.UUID {
+	f.t.Helper()
+	var id uuid.UUID
+	if err := f.pool.QueryRow(context.Background(), `INSERT INTO merge_candidate_queue_entries
+  (run_id, repo, base_ref, state, eject_reason, enqueued_at, anchored_head_sha, settled_at, merge_intent_at, merge_intent_sequence)
+SELECT $1, $2, 'main', $3::text, $4, c.ts - make_interval(secs => $5::float8) - interval '1 hour', 'h-ej',
+  c.ts - make_interval(secs => $5::float8), CASE WHEN $6::bool THEN c.ts - interval '2 hours' END, CASE WHEN $6::bool THEN 7 END
+FROM (SELECT clock_timestamp() AS ts) c
+RETURNING id`, runID, testRepo, string(state), reason, settledAgo.Seconds(), intent).Scan(&id); err != nil {
+		f.t.Fatalf("seed ejected row: %v", err)
+	}
+	return id
+}
+
+func entryIDs(es []Entry) []uuid.UUID {
+	out := make([]uuid.UUID, len(es))
+	for i, e := range es {
+		out[i] = e.ID
+	}
+	return out
+}
+
+// TestUnresolvedEjections: the base's ejected rows still newest for their
+// run, newest settle first, account-scoped, bounded by limit. A re-entered
+// run's ejection (a fresh row behind it), a dropped row and another
+// account's ejection on the same base are excluded.
+func TestUnresolvedEjections(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	older := f.seedEjected(f.run(), StateEjected, "verify_failed", true, 2*time.Hour)
+	newer := f.seedEjected(f.run(), StateEjected, "advance_conflict", false, time.Hour)
+	reentered := f.run()
+	f.seedEjected(reentered, StateEjected, "verify_failed", true, 30*time.Minute)
+	f.enqueue(reentered, "main", "h-fixed")
+	f.seedEjected(f.run(), StateDropped, "pr_closed", false, 10*time.Minute)
+	acct := uuid.New()
+	f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "mq-"+acct.String())
+	foreign := f.run()
+	f.exec(`UPDATE runs SET account_id = $1 WHERE id = $2`, acct, foreign)
+	f.seedEjected(foreign, StateEjected, "verify_failed", true, time.Minute)
+
+	got, err := f.store.UnresolvedEjections(ctx, mainBase(), 10)
+	if err != nil {
+		t.Fatalf("UnresolvedEjections: %v", err)
+	}
+	if want := []uuid.UUID{newer, older}; !slices.Equal(entryIDs(got), want) {
+		t.Fatalf("UnresolvedEjections = %v, want newest-first unresolved %v", entryIDs(got), want)
+	}
+	if got[0].EjectReason != "advance_conflict" || got[0].State != StateEjected {
+		t.Fatalf("first ejection = %+v, want the advance_conflict row", got[0])
+	}
+	got, err = f.store.UnresolvedEjections(ctx, mainBase(), 1)
+	if err != nil || !slices.Equal(entryIDs(got), []uuid.UUID{newer}) {
+		t.Fatalf("UnresolvedEjections(limit 1) = %v, %v; want only the newest", entryIDs(got), err)
+	}
+	empty, err := f.store.UnresolvedEjections(ctx, Base{Repo: testRepo, BaseRef: "release"}, 10)
+	if err != nil || empty == nil || len(empty) != 0 {
+		t.Fatalf("UnresolvedEjections(empty base) = %v, %v; want an empty non-nil list", empty, err)
+	}
+	if _, err := f.store.UnresolvedEjections(ctx, mainBase(), 0); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("limit 0 err = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := f.store.UnresolvedEjections(ctx, Base{Repo: testRepo}, 10); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("invalid base err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// TestReentryCandidates: ejected verify_failed rows with merge intent, newest
+// for their run, on a non-terminal run, oldest settle first, across accounts,
+// bounded by limit; SettledAge is the database-clock age of the settle. No
+// intent, another reason, a re-entered run and a terminal run are excluded.
+// Deleting the terminal-run predicate lists the terminal fixture: RED.
+func TestReentryCandidates(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	oldest := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 3*time.Hour)
+	acct := uuid.New()
+	f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, acct, "mq-"+acct.String())
+	foreignRun := f.run()
+	f.exec(`UPDATE runs SET account_id = $1 WHERE id = $2`, acct, foreignRun)
+	foreign := f.seedEjected(foreignRun, StateEjected, ReentryReason, true, 2*time.Hour)
+	f.seedEjected(f.run(), StateEjected, ReentryReason, false, 90*time.Minute)     // no intent
+	f.seedEjected(f.run(), StateEjected, "advance_conflict", true, 80*time.Minute) // another reason
+	f.seedEjected(f.run(), StateDropped, ReentryReason, true, 70*time.Minute)      // not ejected
+	reentered := f.run()
+	f.seedEjected(reentered, StateEjected, ReentryReason, true, time.Hour)
+	f.enqueue(reentered, "main", "h-fixed")
+	terminal := f.run()
+	f.seedEjected(terminal, StateEjected, ReentryReason, true, 50*time.Minute)
+	f.exec(`UPDATE runs SET state = 'cancelled' WHERE id = $1`, terminal)
+
+	got, err := f.store.ReentryCandidates(ctx, nil, 10)
+	if err != nil {
+		t.Fatalf("ReentryCandidates: %v", err)
+	}
+	if want := []uuid.UUID{oldest, foreign}; !slices.Equal(entryIDs(got), want) {
+		t.Fatalf("ReentryCandidates = %v, want oldest-first %v", entryIDs(got), want)
+	}
+	if age := got[0].SettledAge; age < 3*time.Hour || age > 3*time.Hour+timescale.D(time.Minute) {
+		t.Fatalf("SettledAge = %v, want ~3h (database clock)", age)
+	}
+	if got[0].MergeIntentAt == nil || got[0].MergeIntentSequence != 7 {
+		t.Fatalf("candidate = %+v, want its merge intent and sequence", got[0])
+	}
+	got, err = f.store.ReentryCandidates(ctx, nil, 1)
+	if err != nil || !slices.Equal(entryIDs(got), []uuid.UUID{oldest}) {
+		t.Fatalf("ReentryCandidates(limit 1) = %v, %v; want only the oldest", entryIDs(got), err)
+	}
+	if _, err := f.store.ReentryCandidates(ctx, nil, 0); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("limit 0 err = %v, want ErrInvalidRequest", err)
+	}
+}
+
+// TestReentryCandidates_KeysetCursorPages: the exclusive (settled_at, id)
+// cursor pages the oldest-first order without skipping or repeating a row,
+// breaking a settled_at tie on id; nil starts at the oldest (#4297: the
+// sweep pages past never-passing candidates). Ignoring the cursor re-reads
+// the first page forever: RED.
+func TestReentryCandidates_KeysetCursorPages(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 4*time.Hour)
+	b := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 3*time.Hour)
+	c := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 2*time.Hour)
+	d := f.seedEjected(f.run(), StateEjected, ReentryReason, true, time.Hour)
+	f.exec(`UPDATE merge_candidate_queue_entries SET settled_at = (SELECT settled_at FROM merge_candidate_queue_entries WHERE id = $1) WHERE id = $2`, c, d)
+	want := []uuid.UUID{a, b, c, d}
+	if bytes.Compare(d[:], c[:]) < 0 {
+		want = []uuid.UUID{a, b, d, c}
+	}
+	var got []uuid.UUID
+	var after *ReentryCursor
+	for pages := 0; ; pages++ {
+		if pages > len(want) {
+			t.Fatalf("paging did not terminate after %d pages: %v", pages, got)
+		}
+		page, err := f.store.ReentryCandidates(ctx, after, 2)
+		if err != nil {
+			t.Fatalf("ReentryCandidates(after %+v): %v", after, err)
+		}
+		if len(page) == 0 {
+			break
+		}
+		got = append(got, entryIDs(page)...)
+		after = ReentryCursorAt(page[len(page)-1])
+	}
+	if !slices.Equal(got, want) {
+		t.Fatalf("paged candidates = %v, want %v (every row once, oldest first, ties on id)", got, want)
+	}
+	if ReentryCursorAt(Entry{ID: a}) != nil {
+		t.Fatal("ReentryCursorAt(unsettled) != nil")
 	}
 }
