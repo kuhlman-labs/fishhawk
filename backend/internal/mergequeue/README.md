@@ -266,7 +266,21 @@ change nothing (ADR-093 slice 2, rejection item 1):
     `forge.ErrMergeConflict`) or 422 (`forge.ErrMergeUnprocessable`, wrapped
     alongside `forge.ErrValidation`). A bare `forge.ErrValidation` is NOT a
     release: it also carries a generic HTTP-200 GraphQL error envelope,
-    whose outcome is uncertain. **`ReleaseMergeDispatch(claim)`**
+    whose outcome is uncertain. A head-PINNED inline or delegated dispatch
+    the forge refuses for a head mismatch
+    ([#4641](https://github.com/kuhlman-labs/fishhawk/issues/4641)) carries
+    `forge.ErrMergeConflict` on every arm and releases: the client pre-check
+    (no mutation sent) and the pinned REST PUT's 409 (`sha` mismatch) are
+    forge guarantees, but the pinned auto-merge enable's `graphql_reread`
+    basis (a GraphQL error, then a fresh read showing a different head) is
+    INFERRED, so that enable may in fact have armed auto-merge at the pinned
+    head. That is the one release the forge does not guarantee. It is taken
+    because a re-dispatch re-runs the merge-candidate gate (and, on a
+    declared approval gate, the forge-approval fold) at the new head
+    (`backend/internal/server/README.md` § "ADR-112 forge-approval fold",
+    head-pinned bullets). A pinned GraphQL
+    error whose re-read shows the SAME head, or whose re-read fails, stays a
+    bare `forge.ErrValidation`: uncertain. **`ReleaseMergeDispatch(claim)`**
     DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,
     `state = 'dispatched'`, `path`, `head_sha`, `claimed_at`); a claim that
     no longer matches is `ErrStateConflict` and is never deleted, so a

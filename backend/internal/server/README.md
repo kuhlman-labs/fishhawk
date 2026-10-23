@@ -3101,13 +3101,19 @@ deadline): `backend/internal/mergequeue/README.md`.
   queue, a lock not taken within `autoDriveMergeLockAcquireTimeout` (30s), an
   existing claim and a claim error are each observe-only with the merger
   never called; a dispatch failure after the claim is classified (release or
-  `dispatch_failed`) and surfaces the error. The inline path re-observes a
+  `dispatch_failed`) and surfaces the error, except a head-PINNED dispatch
+  the forge refused for a head mismatch, which releases the claim and is
+  observe-only (`autoDriveNoteHeadMoved`, #4641). The inline path re-observes a
   landed merge BEFORE settling the claim (as merge-on-pass does), so a
   merge that landed answers `already_merged` and leaves the claim
   `dispatched`. Inline: a `merge_checks_pending`
   refusal releases the claim, so the re-invoke once the checks pass claims
-  again. Every ledger write after the forge call runs on
-  `context.WithoutCancel` with a bounded timeout and appends
+  again; so does a pinned head-mismatch refusal, `409 merge_head_moved`
+  (#4641). Inline and delegated dispatches are PINNED to the gate's admitted
+  head when it is non-empty (§ "ADR-112 forge-approval fold", head-pinned
+  bullets), as merge-on-pass is to its verified head. Every ledger write
+  after the forge call runs on `context.WithoutCancel` with a bounded
+  timeout and appends
   `merge_dispatch_settled`. A `dispatch_failed` claim is cleared only by
   reconciliation (the PR reads merged) or the operator re-arm (mergequeue
   README § "Merge-dispatch ledger"); the merge-queue read surfaces it on the
@@ -3258,19 +3264,89 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   (real GitHub pre-filters), so the tests exercise the write floor and the
   permission filter; whether GitHub includes DISMISSED in
   `latestOpinionatedReviews` is unconfirmed, and both shapes fail closed.
-- **Residuals.** (H3) The inline and delegated forge merge calls
-  (MergePullRequest) are not pinned to the evaluated head, so a push landing
-  after the in-lock snapshot and before the merge call is merged without a
-  qualifying approval. It is a pre-existing gap; follow-up
-  [#4641](https://github.com/kuhlman-labs/fishhawk/issues/4641) pins REST
-  `sha` / GraphQL `expectedHeadOid`. Merge-on-pass is already head-pinned.
-  A late approval (for example dismiss-stale after a queue advance) clears
-  the yield on the next re-probe (no re-invoke needed).
+- **Head-pinned inline and delegated dispatch
+  ([#4641](https://github.com/kuhlman-labs/fishhawk/issues/4641), closes
+  residual H3).** The `GitHubMerger` seam is
+  `MergePullRequest(ctx, runRow, expectedHeadSHA)`. The inline tail
+  dispatches at `gate.HeadSHA`, the delegated tail
+  (`dispatchAcceptanceGatedMerge`) at `liveHead`: both are the head the
+  merge-candidate gate admitted, the head the D1 claim records and, on a
+  declared approval gate, the head the fold judged. So
+  `merge_queue_authorized.head_sha` (written only on a declared gate), the
+  settled claim's `head_sha` and the pin the forge receives are one value
+  (`merge_head_pin_e2e_test.go`). A push landing after the in-lock snapshot
+  is refused by the forge instead of merged without a qualifying approval.
+- **Both GitHub arms are pinned.** `ForgeMerger` threads the head to the
+  github leaf (`serve.go::githubAutoMerger` → `githubclient.QueueMerge`). The
+  auto-merge enable carries GraphQL `expectedHeadOid` ("The expected head OID
+  of the pull request",
+  <https://docs.github.com/en/graphql/reference/input-objects#enablepullrequestautomergeinput>).
+  The clean-status REST fallback carries `sha` ("SHA that pull request head
+  must match to allow merge"; 409 when it does not,
+  <https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request>). Ladder
+  contract: `backend/internal/githubclient/README.md` § "Head-pinned
+  auto-merge ladder".
+- **Typed refusal, claim released.** A head mismatch is
+  `forge.ErrMergeConflict` carrying a `*githubclient.HeadMismatchError` that
+  names its basis. The existing `classifyMergeDispatchOutcome` releases the
+  claim (`merge_dispatch_settled` outcome `released`). Inline answers 409
+  `merge_head_moved` with details `{run_id, pr_url, verdict_sequence,
+  head_sha (the pin), refusal_basis, next_step: "fishhawk_merge_run"}`; the
+  re-observe still runs first, so a PR that landed answers `already_merged`.
+  Delegated returns `mergeDispatchHeadMoved`, which is observe-only
+  `autoDriveNoteHeadMoved` with an INFO log (`pinned_to`, `refusal_basis`,
+  `forge_guarantees_nothing_applied`), never "merge dispatch failed"; the
+  next tick re-gates at the new head. The message and the log name "the head
+  the merge-candidate gate admitted". They add "the head the approval was
+  evaluated at" (and the fold, for the re-invoke) ONLY when the review stage
+  declares an approval gate (`forgeApprovalFolded`): a gate-less run has no
+  evaluated approval.
+- **What `refusal_basis` guarantees.** `precheck` (the client's GET showed a
+  different head; no mutation was sent) and `rest_sha` (GitHub's documented
+  sha-mismatch 409) are forge guarantees that nothing applied, and only
+  these say "Nothing merged". `graphql_reread` is INFERRED: the pinned enable
+  answered a GraphQL error and a fresh GET then showed a different head.
+  GitHub documents no wording for an `expectedHeadOid` mismatch, so if that
+  mutation had in fact applied, auto-merge may be armed at the pinned head.
+  `unknown` (a leaf with no `HeadMismatchError`) is treated the same. For
+  both, the 409 message says the basis is not a forge guarantee and tells the
+  operator to inspect the pull request. The claim is still released: a
+  re-invoke re-runs the gate (and, on a declared gate, the fold) at the new
+  head, so no Fishhawk re-dispatch merges the moved head unapproved. An
+  auto-merge that enable may have armed is outside that guarantee; it is the
+  same exposure as the residual below.
+- **Empty head keeps the unpinned ladder.** An empty head means no head was
+  evaluated: an ungated D7 admit (every GitLab-family run, any run the gate
+  cannot probe) or a merged-PR admit. An unpinned `ErrMergeConflict` keeps
+  the inline 502 `merge_dispatch_failed` and the delegated "merge dispatch
+  failed". A declared-gate approval cannot reach the dispatch with an empty
+  head, because the fold refuses `head_unknown`.
+- **Behaviour change.** Gate-less GitHub runs are now pinned to the head the
+  merge-candidate gate admitted too (one rule: pin whenever an evaluated head
+  exists). A head that moves between the gate and the dispatch answers 409
+  `merge_head_moved` instead of merging a head the gate never verified.
+- **GitLab (R6).** `ForgeMerger`'s non-github arm refuses a non-empty pin with
+  `ErrHeadPinnedMergeUnsupported` before resolving or calling any forge, so a
+  pin is never silently dropped. It is unreachable today: GitLab runs carry
+  no gate head.
+- **Residuals.** (Auto-merge persistence) The pre-dispatch window is closed
+  (pre-check plus forge pin), but GitHub does not document whether a QUEUED
+  auto-merge re-checks `expectedHeadOid` when it later fires. Its docs say
+  auto-merge is disabled when someone WITHOUT write permission pushes
+  (<https://docs.github.com/en/pull-requests/collaborating-with-pull-requests/incorporating-changes-from-a-pull-request/automatically-merging-a-pull-request>),
+  so a write-access push after a successful pinned enable may leave
+  auto-merge armed at a head the fold never judged. Tracked as
+  [#4676](https://github.com/kuhlman-labs/fishhawk/issues/4676).
+  Merge-on-pass is synchronous (`MergePullRequestAtHead`), so it has no
+  such window. A late approval (for example dismiss-stale after a queue
+  advance) clears the yield on the next re-probe (no re-invoke needed).
 - **Tests.** `forge_approval_test.go` (the fold), `forge_approval_e2e_test.go`
   (inline, delegated and merge-on-pass, including the H2 head-moved row per
   path), `merge_queue_merge_test.go` (the wait/yield table, evidence
   order, failure modes, post-refusal rows 4/5),
-  `merge_queue_eligibility_test.go` (variant restriction).
+  `merge_queue_eligibility_test.go` (variant restriction),
+  `merge_head_pin_e2e_test.go` (the #4641 pin: precheck, GraphQL and REST
+  arms on the inline and delegated paths, plus a gate-less pinned merge).
 
 ### ADR-112 R3 yield and R5 visibility ([#4632](https://github.com/kuhlman-labs/fishhawk/issues/4632))
 
@@ -5031,8 +5107,8 @@ The operator recovery action that re-admits ANY terminal-`failed` run for anothe
 `backend/internal/server/merge_run.go::handleMergeRun` (route `POST /v0/runs/{run_id}/merge`, MCP verb `fishhawk_merge_run`). The one-verb operator merge path: it records the operator's merge verdict as a chained `merge_verdict_recorded` audit entry (modeled on `vouch.go`) and queues the squash merge through the SAME `s.cfg.GateMerger` seam the delegated `may_merge` arm of `AutoDriveRunGate` dispatches through — extracted into the shared `dispatchAcceptanceGatedMerge` helper (`autodrive.go`), so the human merge and the delegated merge converge on one path by construction. The PR-approval review itself stays a `gh pr review --approve` step under the operator's own GitHub identity (the 2026-07-15 option-a decision; App-identity approval deferred to E39).
 
 **Forge-resolved merge seam (`forge_merger.go`, E45.47 / #3464).** `GateMerger` is bound to a `server.ForgeMerger` (serve.go `newForgeMerger`) that routes the merge by the run's forge FAMILY, the same per-family ladder `prStateReaderFor` codifies:
-- a github-family run (`observationForgeID(InstallationRef) == "github"`, including the nil / bare-decimal pre-0076 shape) delegates byte-for-byte to the `githubAutoMerger` leaf. It NEVER consults the resolver, so the existing `TestGithubAutoMerger_*` behavior is unchanged. The github leaf is a NIL INTERFACE when no client is wired, so a github-family merge with no client fails closed with an error rather than panicking on a `githubAutoMerger{gh:nil}`.
-- any other family resolves the target through `resolveObservationTarget` (so a github-shaped URL on a gitlab ref, a malformed URL, or a repo/URL mismatch refuses BEFORE any forge call, and an unimplemented forge never reaches a merge) and the forge through `cfg.ForgeResolver` (defaulting to `forge.Get`, `isNilForge`-guarded), then `EnableAutoMerge(squash)` — on GitLab that queues `merge_when_pipeline_succeeds`. The `ErrPullRequestCleanStatus -> MergePullRequest` fallback ladder is UNIFORM across families; the GitLab adapter never emits that sentinel (a merge-ready MR merges synchronously), so on GitLab the fallback arm is simply never taken. Residual: `resolveObservationTarget` requires `runRow.Repo` to be `owner/name`, so a nested GitLab group path is an `obsTargetMalformed` refusal at the merge seam (the same residual the merge-observation verb carries; `forgeCompareFor` tolerates nested paths because the GitLab adapter ignores `RepoRef`, and the merge reconciler (`backend/internal/mergereconciler`, #3493) goes further — it REQUIRES the URL's full project path to equal `runRow.Repo` (`strings.EqualFold`, slash-trimmed) before polling, so a nested path is admitted only when it matches `runRow.Repo` verbatim, not merely tolerated).
+- a github-family run (`observationForgeID(InstallationRef) == "github"`, including the nil / bare-decimal pre-0076 shape) delegates byte-for-byte to the `githubAutoMerger` leaf, passing the head pin unchanged (#4641: `githubAutoMerger` calls `githubclient.QueueMerge`, which pins both arms to a non-empty head; § "ADR-112 forge-approval fold", head-pinned bullets). It NEVER consults the resolver, so the existing `TestGithubAutoMerger_*` behavior is unchanged. The github leaf is a NIL INTERFACE when no client is wired, so a github-family merge with no client fails closed with an error rather than panicking on a `githubAutoMerger{gh:nil}`.
+- any other family first REFUSES a non-empty head pin with `ErrHeadPinnedMergeUnsupported` before any resolution or forge call (#4641, ruling R6: the arm has no pinned auto-merge, and dropping the pin would merge a head nothing evaluated; unreachable today because GitLab runs carry no gate head). With an empty pin it resolves the target through `resolveObservationTarget` (so a github-shaped URL on a gitlab ref, a malformed URL, or a repo/URL mismatch refuses BEFORE any forge call, and an unimplemented forge never reaches a merge) and the forge through `cfg.ForgeResolver` (defaulting to `forge.Get`, `isNilForge`-guarded), then `EnableAutoMerge(squash)` — on GitLab that queues `merge_when_pipeline_succeeds`. The `ErrPullRequestCleanStatus -> MergePullRequest` fallback ladder is UNIFORM across families; the GitLab adapter never emits that sentinel (a merge-ready MR merges synchronously), so on GitLab the fallback arm is simply never taken. Residual: `resolveObservationTarget` requires `runRow.Repo` to be `owner/name`, so a nested GitLab group path is an `obsTargetMalformed` refusal at the merge seam (the same residual the merge-observation verb carries; `forgeCompareFor` tolerates nested paths because the GitLab adapter ignores `RepoRef`, and the merge reconciler (`backend/internal/mergereconciler`, #3493) goes further — it REQUIRES the URL's full project path to equal `runRow.Repo` (`strings.EqualFold`, slash-trimmed) before polling, so a nested path is admitted only when it matches `runRow.Repo` verbatim, not merely tolerated).
 
 - **Auth ladder** (operator-only, mirrors `vouch.go`): anonymous → `401`; a run-bound `mcp:run:<uuid>` token → `403 run_token_forbidden` (even for its own run — an agent self-merging its PR would bypass the operator gate); any identity missing `write:approvals` → `403 insufficient_scope`, enforced UNCONDITIONALLY (no cookie-session bypass, since the verb queues a real squash merge).
 - **Fail-closed guards, all BEFORE any write**: `404 run_not_found`; `409 run_not_mergeable` when the run has no PR url OR is `failed`/`cancelled`; `409 acceptance_gate_not_passed` when the acceptance gate is pending/failed/outcome-unknown or unreadable (ADR-049 decision #6 — passed / not-declared / skipped-out-of-scope proceed); `503 merge_seam_unconfigured` when `GateMerger` is nil; `409 merge_conflicting` when the PR has a merge conflict against its base. It deliberately does NOT block on a review stage parked at `awaiting_approval` — in `feature_change` that stage settles ON merge via `resolveReviewStageOnMerge`, so blocking would deadlock the human merge.
