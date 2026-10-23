@@ -1,0 +1,14 @@
+id: scenario:issue-4699/check-adr-grandfathers-118-and-below
+statement: scripts/check-adr accepts a title over 100 characters on a record numbered 118 or lower, and accepts a title of exactly 100 characters on ADR-119. The committed docs/adr tree, whose existing titles run up to 252 characters, still checks clean.
+verify_hint: 'CLI exit code: scripts/check-adr with no arguments on the merge candidate exits 0 naming the record count. A temp fixture whose ADR-118 has a 249-character title, and one whose ADR-119 has exactly 100 characters, both exit 0'
+steps: Posture B in the sanctioned checkout (HEAD 192ebe54). (1) Ran scripts/check-adr with no arguments. (2) Built a fixture copy of docs/adr whose ADR-118 front-matter title and index title were both rewritten to a 249-character string, then ran scripts/check-adr on it. (3) Built a fixture with a new ADR-119 whose title is exactly 100 ASCII characters, with a matching index entry, then ran check-adr on it. (4) Built an ADR-119 fixture whose title is exactly 100 'é' and ran check-adr under LC_ALL=C. (5) Ran scripts/test-adr under the default locale and under LC_ALL=C.
+assertions:
+    expected: exit 0 on the committed tree, on an ADR-118 fixture with a 249-character title and on an ADR-119 fixture with a 100-character title
+    observed_at_record: '(1) exit 0: ''113 record(s) consistent with .../docs/adr/index.json''. (2) exit 0, 113 records. (3) exit 0, 114 records. (4) exit 0. (5) ''67 passed, 0 failed'' under both locales.'
+    repro_handle: scripts/check-adr; scripts/check-adr <fixture with ADR-118 249-char title>; scripts/check-adr <fixture with ADR-119 100-char title>
+origin:
+    issue: 4699
+    pr: 4704
+    run_id: 3f940bf0-c2e3-4a60-9771-ffd06e8de785
+    head_sha: 192ebe549e71bea73d9cd162d5e183824b0b802d
+    recorded_at: 2026-10-23T17:42:24Z

@@ -1,0 +1,13 @@
+id: scenario:issue-4699/headroom-floor-holds-and-fails-loud
+statement: 'Issue #4699 AC4: the shipped index rendering''s headroom under repodoc.DefaultMaxBytes is at least 10 times its largest rendered line, and a floor set above the available headroom fails with a message naming #4699 and the tiering option. Check: `cd backend && GOFLAGS=-trimpath go test ./internal/decisionrecord/ -run ''HeadroomFloor'' -v` passes (TestAssemble_ShippedIndex_HeadroomFloor and TestAssemble_HeadroomFloor_IsCaught) and logs the rendering bytes, the largest line and the lines available.'
+steps: 'Posture B in the sanctioned checkout: cd backend && GOFLAGS=-trimpath go test ./internal/decisionrecord/ -count=1 -run ''HeadroomFloor'' -v. Read headroomFloorError and TestAssemble_HeadroomFloor_IsCaught in assemble_test.go to confirm the counterfactual: a floor of available+1 must error, and the error must contain ''#4699'' and ''tier the index''.'
+assertions:
+    expected: 'Headroom >= 10 x the largest line; a floor above the available headroom fails with a message naming #4699 and tiering; the numbers are logged'
+    observed_at_record: 'PASS for TestAssemble_ShippedIndex_HeadroomFloor: ''adr-index-lines-v2 rendering: 24200 bytes, cap 32768, headroom 8568 bytes, largest line 405 bytes, 21 lines available, floor 10 lines''. PASS for TestAssemble_HeadroomFloor_IsCaught: the floor of 22 errors with a message naming #4699 and tiering (''tier the index (collapse superseded or older records), the option #4699 deferred until about 150 ADRs'').'
+    repro_handle: cd backend && GOFLAGS=-trimpath go test ./internal/decisionrecord/ -run 'HeadroomFloor' -v
+origin:
+    issue: 4699
+    pr: 4704
+    run_id: 3f940bf0-c2e3-4a60-9771-ffd06e8de785
+    head_sha: 192ebe549e71bea73d9cd162d5e183824b0b802d
+    recorded_at: 2026-10-23T17:42:24Z

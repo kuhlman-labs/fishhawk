@@ -1,0 +1,14 @@
+id: scenario:issue-4699/check-adr-refuses-long-title-from-119
+statement: scripts/check-adr, run against a fixture ADR directory where record ADR-119 has a 101-character title and the index matches, exits 1 and prints a [C-title-length] line naming the record file and its character count.
+verify_hint: 'CLI exit code and stdout: copy docs/adr into a temp dir, add a 119-*.md record (id ADR-119, a 101-character title) with a matching index entry, run scripts/check-adr <tmpdir>, and observe exit 1 and a `[C-title-length]` line naming 119-*.md'
+steps: Posture B in the sanctioned checkout /tmp/fishhawk-acceptance-tree-3f940bf0-... (HEAD 192ebe54, the same as the target git_sha). Copied docs/adr to /tmp/fh4699/f101. Added 119-fixture-title-rule.md with front matter id ADR-119, title "A"*50 + ' ' + "b"*50 (101 characters, JSON-quoted), status accepted, issue, supersedes/superseded_by/applies_to [], and a '## Decision' section. Appended a matching entry to index.json. Ran scripts/check-adr /tmp/fh4699/f101.
+assertions:
+    expected: exit 1 and a [C-title-length] line naming 119-*.md and its character count
+    observed_at_record: 'exit 1; ''check-adr: /tmp/fh4699/f101/119-fixture-title-rule.md: [C-title-length] title is 101 characters, over the 100-character limit for ADR-119 onward; shorten the record''s title (ADR-001 to ADR-118 are grandfathered)'''
+    repro_handle: python3 mk.py docs/adr /tmp/f101 119 "$(python3 -c 'print("A"*50+" "+"b"*50)')" && scripts/check-adr /tmp/f101
+origin:
+    issue: 4699
+    pr: 4704
+    run_id: 3f940bf0-c2e3-4a60-9771-ffd06e8de785
+    head_sha: 192ebe549e71bea73d9cd162d5e183824b0b802d
+    recorded_at: 2026-10-23T17:42:24Z
