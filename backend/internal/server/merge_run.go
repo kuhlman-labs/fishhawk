@@ -17,6 +17,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -226,6 +227,12 @@ type mergeRunResponse struct {
 // merge_checks_pending: an expected precondition, not a fault, so the operator
 // (and fishhawk_merge_run's bounded wait) is told the checks have not all
 // passed and that a failed check means inspecting the PR rather than waiting.
+// A dispatch PINNED to the gate's admitted head (gate.HeadSHA, #4641) that the
+// forge refuses for a head mismatch (forge.ErrMergeConflict) returns 409
+// merge_head_moved naming the pinned head and its refusal_basis (precheck,
+// rest_sha, graphql_reread; only the first two are forge guarantees that
+// nothing applied): the claim is released and a re-invoke re-gates at the new
+// head. An unpinned ErrMergeConflict keeps the 502.
 // EVERY other error returns 502 merge_dispatch_failed stating the verdict row is
 // durable and the queue step is retryable — a genuine dispatch failure is never
 // masked as "just waiting".
@@ -748,7 +755,13 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			return nil
 		}
 
-		if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow); merr != nil {
+		// #4641 (ADR-112 residual H3): the dispatch is PINNED to gate.HeadSHA,
+		// the SAME head the merge-candidate gate admitted, inlineForgeApproval
+		// folded at and claimInlineMergeDispatch records, so the fold, the
+		// claim, merge_queue_authorized and the forge pin are one value. An
+		// empty gate head (ungated D7 admit, merged PR) keeps the unpinned
+		// ladder.
+		if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow, gate.HeadSHA); merr != nil {
 			checksPending := errors.Is(merr, forge.ErrPullRequestUnstableStatus)
 			// RE-OBSERVE ONCE (E45.87 / #3622), BEFORE the ledger is settled
 			// (matching merge-on-pass): a merge that landed in the
@@ -769,11 +782,15 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 				}
 			}
 			rearm := ""
+			settled := mergeDispatchLedgerOutcome("")
 			// Ruling R1: a checks_pending refusal or a forge 405/409/422
 			// RELEASES the claim (nothing was applied), so the re-invoke can
 			// claim again; any other outcome is uncertain: dispatch_failed.
-			if claimed && s.settleMergeDispatchClaim(r.Context(), mergeQueueDispatchLedger{s.cfg.MergeQueue}, claim, merr) == mergeDispatchUncertain {
-				rearm = mergeDispatchRearmNote
+			if claimed {
+				settled = s.settleMergeDispatchClaim(r.Context(), mergeQueueDispatchLedger{s.cfg.MergeQueue}, claim, merr)
+				if settled == mergeDispatchUncertain {
+					rearm = mergeDispatchRearmNote
+				}
 			}
 			// A checks-not-all-passed refusal (E67.56 / #2717) is an expected
 			// precondition, NOT a dispatch fault: GitHub reports the PR in UNSTABLE
@@ -806,6 +823,15 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 					msg += " fishhawk_audit_complete is pending because: " + auditRes.Missing[0].Detail
 				}
 				s.writeError(w, r, http.StatusConflict, "merge_checks_pending", msg, details)
+				return nil
+			}
+			// #4641: a PINNED dispatch the forge refused for a head mismatch is
+			// 409 merge_head_moved, not the generic 502: the PR head moved after
+			// the merge-candidate gate admitted gate.HeadSHA, and a re-invoke
+			// re-runs the gate and the fold at the new head. An UNPINNED
+			// ErrMergeConflict (empty gate head) keeps the 502.
+			if gate.HeadSHA != "" && errors.Is(merr, forge.ErrMergeConflict) {
+				s.writeMergeHeadMoved(w, r, runRow, prURL, verdictSequence, gate.HeadSHA, merr, claimed, settled, rearm)
 				return nil
 			}
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
@@ -975,7 +1001,99 @@ const (
 	// merge-candidate pass is HELD behind its base's live pass. It clears on
 	// its own (admission is automatic), so the next step is a status read.
 	mergeCodeCandidateHeld = "merge_candidate_held"
+	// mergeCodeHeadMoved (#4641, ADR-112 residual H3): the forge refused the
+	// merge pinned to the head the merge-candidate gate admitted because the
+	// pull request's head moved after it. A re-invoke re-gates at the new head.
+	mergeCodeHeadMoved = "merge_head_moved"
 )
+
+// mergeHeadMovedBasisUnknown is the refusal_basis of a head-mismatch refusal
+// that carried no *githubclient.HeadMismatchError (a leaf that does not name
+// how the mismatch was established).
+const mergeHeadMovedBasisUnknown = "unknown"
+
+// mergeHeadMovedBasis names how a head-pinned merge's head mismatch was
+// established (githubclient.HeadMismatch*), or mergeHeadMovedBasisUnknown.
+func mergeHeadMovedBasis(err error) string {
+	var hm *githubclient.HeadMismatchError
+	if errors.As(err, &hm) && hm.Basis != "" {
+		return hm.Basis
+	}
+	return mergeHeadMovedBasisUnknown
+}
+
+// mergeHeadMovedNothingApplied reports whether basis is one the forge
+// GUARANTEES applied nothing (ruling C3): the client pre-check sent no
+// mutation, and a REST 409 is GitHub's documented sha-mismatch refusal. The
+// graphql_reread basis is INFERRED from a fresh read after a GraphQL error, so
+// an auto-merge may in fact be armed at the pinned head; an unknown basis is
+// treated the same way.
+func mergeHeadMovedNothingApplied(basis string) bool {
+	return basis == githubclient.HeadMismatchPrecheck || basis == githubclient.HeadMismatchRESTSha
+}
+
+// forgeApprovalFolded reports whether the run's review stage declares an
+// ADR-112 approval gate, i.e. whether a dispatch reaching the forge carried an
+// APPROVED fold at the pinned head. A gate-less run has no evaluated approval,
+// so head-moved wording names only the head the merge-candidate gate admitted
+// (ruling C2).
+func forgeApprovalFolded(runRow *run.Run) bool {
+	declared, _, err := forgeApprovalGateFor(runRow)
+	return err == nil && declared
+}
+
+// mergeHeadMovedSubject is the head-moved wording shared by the inline 409 and
+// the delegated INFO log: the head the merge-candidate gate admitted, plus the
+// approval clause ONLY when a declared gate folded (ruling C2).
+func mergeHeadMovedSubject(head string, folded bool) string {
+	subject := "the head the merge-candidate gate admitted (" + head + ")"
+	if folded {
+		subject += ", the head the approval was evaluated at"
+	}
+	return subject
+}
+
+// writeMergeHeadMoved writes the inline 409 merge_head_moved (#4641). settled
+// is the D1 claim's settle outcome when claimed; rearm is
+// mergeDispatchRearmNote when the release did not land.
+func (s *Server) writeMergeHeadMoved(w http.ResponseWriter, r *http.Request, runRow *run.Run, prURL string,
+	verdictSequence int64, head string, merr error, claimed bool, settled mergeDispatchLedgerOutcome, rearm string) {
+	basis, folded := mergeHeadMovedBasis(merr), forgeApprovalFolded(runRow)
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: the forge refused the head-pinned merge; the pull request head moved",
+		slog.String("run_id", runRow.ID.String()), slog.String("head_sha", head),
+		slog.String("refusal_basis", basis), slog.String("error", merr.Error()))
+	msg := "the merge verdict is recorded and durable, but the forge refused the merge pinned to " + mergeHeadMovedSubject(head, folded) +
+		" because the pull request's head moved after it."
+	if mergeHeadMovedNothingApplied(basis) {
+		msg += " Nothing merged: the forge applied nothing (refusal_basis " + basis + ")."
+	} else {
+		msg += " This refusal_basis (" + basis + ") is not a forge guarantee that nothing was applied"
+		if basis == githubclient.HeadMismatchGraphQLReread {
+			msg += ": the auto-merge enable answered an error and a fresh read showed a different head, so the mismatch is INFERRED"
+		}
+		msg += "; if the enable had in fact applied, auto-merge may be armed at the pinned head, so inspect the pull request."
+	}
+	switch {
+	case claimed && settled == mergeDispatchRelease:
+		msg += " The run's merge-dispatch claim was released."
+	case !claimed:
+		msg += " No merge-dispatch claim was held."
+	}
+	msg += " Re-invoke the merge once the head settles: it re-runs the merge-candidate gate"
+	if folded {
+		msg += " and the forge-approval fold"
+	}
+	msg += " at the new head." + rearm
+	s.writeError(w, r, http.StatusConflict, mergeCodeHeadMoved, msg,
+		map[string]any{
+			"run_id":           runRow.ID.String(),
+			"pr_url":           prURL,
+			"verdict_sequence": verdictSequence,
+			"head_sha":         head,
+			"refusal_basis":    basis,
+			"next_step":        "fishhawk_merge_run",
+		})
+}
 
 // Reasons a merge_candidate_check_failed 502 names, carried under the
 // allow-listed `reason` detail key so they survive 5xx redaction.

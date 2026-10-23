@@ -33,7 +33,7 @@ import (
 // production GraphQL message from run a152a0a5.
 type unstableChecksMerger struct{}
 
-func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run) error {
+func (unstableChecksMerger) MergePullRequest(context.Context, *runpkg.Run, string) error {
 	return fmt.Errorf("%w: %w: enable auto-merge: Pull request Pull request is in unstable status",
 		forge.ErrValidation, forge.ErrPullRequestUnstableStatus)
 }

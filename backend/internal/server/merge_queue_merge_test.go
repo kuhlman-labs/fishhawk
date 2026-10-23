@@ -50,7 +50,7 @@ type mqmMerger struct {
 	entered chan struct{}
 }
 
-func (m *mqmMerger) MergePullRequest(context.Context, *run.Run) error {
+func (m *mqmMerger) MergePullRequest(context.Context, *run.Run, string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.inline++
@@ -89,7 +89,7 @@ func (m *mqmMerger) calls() []string {
 // mqmUnpinned is a GateMerger with no pinned merge.
 type mqmUnpinned struct{}
 
-func (mqmUnpinned) MergePullRequest(context.Context, *run.Run) error { return nil }
+func (mqmUnpinned) MergePullRequest(context.Context, *run.Run, string) error { return nil }
 
 // mqmLedger is a recording D1 dispatch ledger: one claim per run unless
 // permissive (then every claim is granted, isolating the merge-intent lock).

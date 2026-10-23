@@ -881,7 +881,7 @@ type fakeGitHubMerger struct {
 	called int
 }
 
-func (m *fakeGitHubMerger) MergePullRequest(_ context.Context, _ *runpkg.Run) error {
+func (m *fakeGitHubMerger) MergePullRequest(_ context.Context, _ *runpkg.Run, _ string) error {
 	m.mu.Lock()
 	defer m.mu.Unlock()
 	m.called++

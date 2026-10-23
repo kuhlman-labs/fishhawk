@@ -23,6 +23,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -838,7 +839,7 @@ func TestNewForgeMerger_NilGitHub_LeavesGitHubSeamNil(t *testing.T) {
 	if fm.GitHub != nil {
 		t.Errorf("ForgeMerger.GitHub = %v (%T), want a nil interface", fm.GitHub, fm.GitHub)
 	}
-	err := m.MergePullRequest(context.Background(), &runpkg.Run{ID: uuid.New()})
+	err := m.MergePullRequest(context.Background(), &runpkg.Run{ID: uuid.New()}, "")
 	if err == nil {
 		t.Error("MergePullRequest(github family, nil leaf) = nil, want an error (no panic)")
 	}
@@ -893,7 +894,7 @@ func TestMergeReconcilerForgeAvailable(t *testing.T) {
 // existing binding untouched.
 type stubGitHubMerger struct{}
 
-func (stubGitHubMerger) MergePullRequest(context.Context, *runpkg.Run) error { return nil }
+func (stubGitHubMerger) MergePullRequest(context.Context, *runpkg.Run, string) error { return nil }
 
 // TestBindGitLabOnlyGateMerger pins bindGitLabOnlyGateMerger's four-row
 // decision table (E45.47 / #3464, binding approval condition 2): it binds the
@@ -1149,7 +1150,7 @@ func TestGithubAutoMerger_FailsClosed(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if err := m.MergePullRequest(ctx, tc.run); err == nil {
+			if err := m.MergePullRequest(ctx, tc.run, ""); err == nil {
 				t.Fatalf("MergePullRequest(%s) = nil, want an error (fail-closed before HTTP)", tc.name)
 			}
 		})
@@ -1167,6 +1168,7 @@ type mergeFallbackGitHub struct {
 	mergeHits   int    // number of REST merge PUTs served
 	graphqlHits int    // number of POST /graphql (auto-merge enable) served
 	mergeBody   []byte // the last REST merge PUT body
+	graphqlReq  []byte // the last POST /graphql request body
 }
 
 func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient.Client {
@@ -1178,8 +1180,9 @@ func newMergeFallbackClient(t *testing.T, fg *mergeFallbackGitHub) *githubclient
 			_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_node","state":"open","head":{"sha":"abc"}}`)
 		})
 	mux.HandleFunc("POST /graphql",
-		func(w http.ResponseWriter, _ *http.Request) {
+		func(w http.ResponseWriter, r *http.Request) {
 			fg.graphqlHits++
+			fg.graphqlReq, _ = io.ReadAll(r.Body)
 			w.Header().Set("Content-Type", "application/json")
 			_, _ = io.WriteString(w, fg.graphqlBody)
 		})
@@ -1220,11 +1223,52 @@ func TestGithubAutoMerger_CleanStatus_RESTFallback(t *testing.T) {
 		graphqlBody: `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`,
 	}
 	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
-	if err := m.MergePullRequest(context.Background(), mergeFallbackRun()); err != nil {
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun(), ""); err != nil {
 		t.Fatalf("MergePullRequest: %v", err)
 	}
 	if fg.mergeHits != 1 {
 		t.Errorf("REST merge fired %d times, want 1 (clean-status must fall back)", fg.mergeHits)
+	}
+}
+
+// TestGithubAutoMerger_PinnedHead_ThreadsToForge pins (#4641) that the serve.go
+// github leaf threads the evaluated head to BOTH forge arms: the auto-merge
+// enable's expectedHeadOid argument resolves (through its declared GraphQL
+// variable) to the head, and the clean-status REST fallback PUT carries it as
+// sha. The fixture's GET answers head "abc", so the client pre-check passes.
+// Counterfactual: passing "" to QueueMerge sends neither pin.
+func TestGithubAutoMerger_PinnedHead_ThreadsToForge(t *testing.T) {
+	fg := &mergeFallbackGitHub{
+		graphqlBody: `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`,
+	}
+	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
+	const head = "abc"
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun(), head); err != nil {
+		t.Fatalf("MergePullRequest(pinned): %v", err)
+	}
+	var req struct {
+		Query     string         `json:"query"`
+		Variables map[string]any `json:"variables"`
+	}
+	if err := json.Unmarshal(fg.graphqlReq, &req); err != nil {
+		t.Fatalf("decode graphql request %q: %v", fg.graphqlReq, err)
+	}
+	bound := regexp.MustCompile(`expectedHeadOid:\s*\$(\w+)`).FindStringSubmatch(req.Query)
+	if bound == nil {
+		t.Fatalf("auto-merge mutation binds no expectedHeadOid argument: %q", req.Query)
+	}
+	if got := req.Variables[bound[1]]; got != head {
+		t.Errorf("variables[%q] (bound to expectedHeadOid) = %v, want %q", bound[1], got, head)
+	}
+	if fg.mergeHits != 1 {
+		t.Fatalf("REST merge PUTs = %d, want 1 (clean-status fallback)", fg.mergeHits)
+	}
+	var body map[string]string
+	if err := json.Unmarshal(fg.mergeBody, &body); err != nil {
+		t.Fatalf("decode merge body %q: %v", fg.mergeBody, err)
+	}
+	if body["sha"] != head {
+		t.Errorf("REST fallback sha = %q, want %q (pinned)", body["sha"], head)
 	}
 }
 
@@ -1241,7 +1285,7 @@ func TestGithubAutoMerger_UnstableStatus_NoRESTFallback(t *testing.T) {
 		graphqlBody: `{"errors":[{"message":"Pull request Pull request is in unstable status","type":"UNPROCESSABLE"}]}`,
 	}
 	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
-	err := m.MergePullRequest(context.Background(), mergeFallbackRun())
+	err := m.MergePullRequest(context.Background(), mergeFallbackRun(), "")
 	if err == nil {
 		t.Fatal("MergePullRequest = nil, want the unstable-status enable error surfaced (no REST fallback)")
 	}
@@ -1260,7 +1304,7 @@ func TestGithubAutoMerger_EnableSuccess_NoFallback(t *testing.T) {
 		graphqlBody: `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`,
 	}
 	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
-	if err := m.MergePullRequest(context.Background(), mergeFallbackRun()); err != nil {
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun(), ""); err != nil {
 		t.Fatalf("MergePullRequest: %v", err)
 	}
 	if fg.mergeHits != 0 {
@@ -1275,7 +1319,7 @@ func TestGithubAutoMerger_UnrelatedEnableError_NoFallback(t *testing.T) {
 		graphqlBody: `{"errors":[{"message":"Auto-merge is not allowed for this repository","type":"UNPROCESSABLE"}]}`,
 	}
 	m := githubAutoMerger{gh: newMergeFallbackClient(t, fg)}
-	if err := m.MergePullRequest(context.Background(), mergeFallbackRun()); err == nil {
+	if err := m.MergePullRequest(context.Background(), mergeFallbackRun(), ""); err == nil {
 		t.Fatal("MergePullRequest = nil, want the unrelated enable error surfaced")
 	}
 	if fg.mergeHits != 0 {

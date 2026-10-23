@@ -29,7 +29,10 @@ import (
 //     reaches a merge) and the forge through Resolver (defaulting to forge.Get,
 //     isNilForge-guarded against a typed-nil), then queues EnableAutoMerge with
 //     the squash method and the SAME ErrPullRequestCleanStatus -> MergePullRequest
-//     fallback ladder githubAutoMerger uses.
+//     fallback ladder githubAutoMerger uses. A non-empty head pin (#4641) is
+//     refused on this arm (ErrHeadPinnedMergeUnsupported) before any forge
+//     resolution: the arm has no pinned auto-merge, and dropping the pin would
+//     merge a head nothing evaluated.
 //
 // The clean-status fallback is uniform across families deliberately: the GitLab
 // adapter never emits forge.ErrPullRequestCleanStatus (a merge-ready MR merges
@@ -127,13 +130,23 @@ func (m ForgeMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run
 }
 
 // MergePullRequest routes the run's merge by forge family per the type doc.
-func (m ForgeMerger) MergePullRequest(ctx context.Context, runRow *run.Run) error {
+// headSHA is the GitHubMerger pin (#4641): the github family threads it to the
+// github leaf unchanged. Every other family REFUSES a non-empty pin with
+// ErrHeadPinnedMergeUnsupported BEFORE resolving or calling any forge (ruling
+// R6: a pin is never silently dropped onto an unpinned auto-merge; GitLab runs
+// carry no evaluated head today, so the refusal is unreachable in practice).
+// An empty headSHA keeps the unpinned ladder.
+func (m ForgeMerger) MergePullRequest(ctx context.Context, runRow *run.Run, headSHA string) error {
 	family := observationForgeID(runRow.InstallationRef)
 	if family == observationForgeGitHub {
 		if m.GitHub == nil {
 			return fmt.Errorf("forge merge: run %s: no github merge client configured", runRow.ID)
 		}
-		return m.GitHub.MergePullRequest(ctx, runRow)
+		return m.GitHub.MergePullRequest(ctx, runRow, headSHA)
+	}
+	if headSHA != "" {
+		return fmt.Errorf("%w: run %s: forge family %q cannot pin an auto-merge to head %s",
+			ErrHeadPinnedMergeUnsupported, runRow.ID, family, headSHA)
 	}
 
 	f, scope, repo, number, err := m.resolveNonGitHub(runRow)
