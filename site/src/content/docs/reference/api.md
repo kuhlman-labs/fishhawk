@@ -168,7 +168,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **179 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **180 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -316,6 +316,7 @@ The v0 REST API exposes **179 operations** across the paths below, generated fro
 | `POST` | `/v0/stages/{stage_id}/retry` | Retry a failed stage |
 | `POST` | `/v0/stages/{stage_id}/acceptance-admission` | Pre-spawn acceptance short-circuit admission |
 | `POST` | `/v0/stages/{stage_id}/fixup` | Route advisory implement-review concerns back to the agent |
+| `POST` | `/v0/runs/{run_id}/merge-queue/promote` | Promote a held merge-queue entry to the head of its base's line |
 | `POST` | `/v0/stages/{stage_id}/concurrency/promote` | Promote a queued waiter to the front of its concurrency group |
 | `POST` | `/v0/concerns/{concern_id}/waive` | Waive an open review concern with an audited reason |
 | `GET` | `/v0/runs/{run_id}/concerns` | List a run's review concerns, optionally with its decomposition children's |
