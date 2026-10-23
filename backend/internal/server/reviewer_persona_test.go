@@ -63,6 +63,9 @@ type personaSpecOpts struct {
 	// decisionRecordIndex, when non-empty, declares the persona's
 	// decision_record.index (ADR-084 D4(b) / E78.5 / #3756).
 	decisionRecordIndex string
+	// personaAgentVersion, when non-empty, declares the persona agent's
+	// agent_version compatibility range (E32.13 / #1743).
+	personaAgentVersion string
 }
 
 // personaSpec renders a complete workflow-v2 document: a plan and an
@@ -76,7 +79,11 @@ func personaSpec(o personaSpecOpts) []byte {
 	var b strings.Builder
 	b.WriteString("version: \"2\"\n")
 	if o.attachOn != "" || len(o.escalatePaths) > 0 {
-		fmt.Fprintf(&b, "reviewer_personas:\n  security:\n    agent:\n      provider: %s\n      model: %s\n    remit:\n      path: %s\n", pp, personaAgentModel, personaRemitPath)
+		fmt.Fprintf(&b, "reviewer_personas:\n  security:\n    agent:\n      provider: %s\n      model: %s\n", pp, personaAgentModel)
+		if o.personaAgentVersion != "" {
+			fmt.Fprintf(&b, "      agent_version: %q\n", o.personaAgentVersion)
+		}
+		fmt.Fprintf(&b, "    remit:\n      path: %s\n", personaRemitPath)
 		if o.severityCap != "" {
 			fmt.Fprintf(&b, "      severity_cap: %s\n", o.severityCap)
 		}
@@ -906,6 +913,48 @@ func TestPersona_InvocationFailure_RecordsPersonaOnFailedPayload(t *testing.T) {
 	}
 	if !strings.HasPrefix(fp.Reason, "persona "+personaTestName+": ") || !strings.Contains(fp.Reason, "persona transport exploded") {
 		t.Errorf("failed payload reason = %q, want the persona-prefixed error prose", fp.Reason)
+	}
+	if got := countAuditCategory(p.au, "plan_reviewed"); got != 1 {
+		t.Errorf("plan_reviewed entries = %d, want 1 (the standard reviewer's verdict)", got)
+	}
+	started := decodeStarted(t, p.au, "plan_review_started")
+	if !planreview.Settled(started.ConfiguredAgents, terminalCount(p.au, "plan")) {
+		t.Errorf("round does not settle: configured_agents %d, terminal entries %d", started.ConfiguredAgents, terminalCount(p.au, "plan"))
+	}
+}
+
+// TestPersona_AgentVersionMismatch_RecordsPersonaOnFailedPayload pins the
+// THIRD persona-aware failure site (E89.33 / #4669): a persona whose probed
+// reviewer CLI is outside its declared agent_version range is never invoked,
+// and its plan_review_failed row names the persona in the structured Persona
+// field beside the persona-prefixed range diagnosis. The assertion reads the
+// COMMITTED audit row back.
+//
+// Counterfactual: route the agent_version-mismatch branch back through
+// emitReviewFailed with inv.personaFailureReason(reason) — the row loses its
+// persona key and this goes RED.
+func TestPersona_AgentVersionMismatch_RecordsPersonaOnFailedPayload(t *testing.T) {
+	const rng = ">=0.30 <0.31"
+	persona := &probingReviewer{version: "0.140.0 (codex-cli)", binary: "codex", model: personaAgentModel}
+	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan", personaAgentVersion: rng}), approvingFake(), persona)
+	p.review(t)
+
+	if persona.reviewed {
+		t.Fatal("an out-of-range persona reviewer must never be invoked")
+	}
+	failed := auditFakeEntries(p.au, "plan_review_failed")
+	if len(failed) != 1 {
+		t.Fatalf("plan_review_failed entries = %d, want 1", len(failed))
+	}
+	var fp planreview.ReviewFailedPayload
+	if err := json.Unmarshal(failed[0].Payload, &fp); err != nil {
+		t.Fatalf("decode plan_review_failed: %v", err)
+	}
+	if fp.Persona != personaTestName {
+		t.Errorf("failed payload persona = %q, want %q (raw %s)", fp.Persona, personaTestName, failed[0].Payload)
+	}
+	if !strings.HasPrefix(fp.Reason, "persona "+personaTestName+": ") || !strings.Contains(fp.Reason, rng) || !strings.Contains(fp.Reason, "0.140.0") {
+		t.Errorf("failed payload reason = %q, want the persona-prefixed agent_version range diagnosis", fp.Reason)
 	}
 	if got := countAuditCategory(p.au, "plan_reviewed"); got != 1 {
 		t.Errorf("plan_reviewed entries = %d, want 1 (the standard reviewer's verdict)", got)
