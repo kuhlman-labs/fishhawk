@@ -77,6 +77,11 @@ func (r *postgresRepo) CreateDraft(ctx context.Context, p CreateParams) (*Stored
 	if id == uuid.Nil {
 		id = uuid.New()
 	}
+	// An empty Repo is a repo-less session: stored NULL, read back as "".
+	var repo *string
+	if p.Repo != "" {
+		repo = &p.Repo
+	}
 	q := refinementdb.New(r.pool)
 	row, err := q.CreateRefinementDraft(ctx, refinementdb.CreateRefinementDraftParams{
 		ID:        id,
@@ -86,6 +91,7 @@ func (r *postgresRepo) CreateDraft(ctx context.Context, p CreateParams) (*Stored
 		Model:     model,
 		Origin:    origin,
 		AccountID: p.AccountID,
+		Repo:      repo,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create refinement draft: %w", err)
@@ -317,6 +323,10 @@ func rowToStoredDraft(r refinementdb.RefinementDraft) (*StoredDraft, error) {
 	if r.AccountID != nil {
 		accountID = r.AccountID.String()
 	}
+	repo := ""
+	if r.Repo != nil {
+		repo = *r.Repo
+	}
 	return &StoredDraft{
 		ID:        r.ID,
 		SessionID: r.SessionID,
@@ -326,6 +336,7 @@ func rowToStoredDraft(r refinementdb.RefinementDraft) (*StoredDraft, error) {
 		Origin:    r.Origin,
 		CreatedAt: r.CreatedAt.Time,
 		AccountID: accountID,
+		Repo:      repo,
 	}, nil
 }
 

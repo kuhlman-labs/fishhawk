@@ -287,7 +287,7 @@ The v0 REST API exposes **179 operations** across the paths below, generated fro
 | `POST` | `/v0/campaigns/{campaign_id}/cancel` | Cancel a campaign |
 | `POST` | `/v0/work-items` | File a work item via the repo's work-management conventions |
 | `POST` | `/v0/work-items/preview` | Preview a work-item filing — conventions plus intake signals, nothing filed |
-| `POST` | `/v0/refinement/sessions` | Draft an epic/children preview from a natural-language brief |
+| `POST` | `/v0/refinement/sessions` | Draft an epic/children preview from a brief, optionally for a target repo |
 | `GET` | `/v0/refinement/sessions/{session_id}` | Get a refinement session's preview + approval state |
 | `PATCH` | `/v0/refinement/sessions/{session_id}/draft` | Edit a refinement draft (agent amendment or direct field edit) |
 | `POST` | `/v0/refinement/sessions/{session_id}/decision` | Approve or reject the latest refinement draft revision |

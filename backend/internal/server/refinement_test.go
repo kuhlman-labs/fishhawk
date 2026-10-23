@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/refinement"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // ---- fakes ----------------------------------------------------------------
@@ -36,10 +37,14 @@ type fakeRefinementDrafter struct {
 	sawCtxErr      error
 	sawHadDeadline bool
 	sawDeadlineIn  time.Duration
+	// sawConv is the per-call conventions the handler resolved for the
+	// session (ADR-114 / #4626).
+	sawConv workmgmt.Conventions
 }
 
-func (f *fakeRefinementDrafter) Draft(ctx context.Context, _ uuid.UUID, _ string) (refinement.EpicDraft, string, error) {
+func (f *fakeRefinementDrafter) Draft(ctx context.Context, _ uuid.UUID, _ string, conv workmgmt.Conventions) (refinement.EpicDraft, string, error) {
 	f.calls++
+	f.sawConv = conv
 	f.sawCtxErr = ctx.Err()
 	if dl, ok := ctx.Deadline(); ok {
 		f.sawHadDeadline = true
@@ -95,6 +100,7 @@ func (r *disconnectRefinementRepo) CreateDraft(ctx context.Context, p refinement
 		Draft:     p.Draft,
 		Model:     p.Model,
 		Origin:    p.Origin,
+		Repo:      p.Repo,
 	}
 	if sd.ID == uuid.Nil {
 		sd.ID = uuid.New()
@@ -1657,21 +1663,27 @@ func TestGetRefinementSession_FilingIncompleteBlock(t *testing.T) {
 }
 
 // TestGetRefinementSession_FilingReadFaults500: a fault reading the filing
-// ledger for the view is a 500, never a silently-omitted filing block.
+// ledger for the view is a 500, never a silently-omitted filing block. A
+// GetFilingSession fault now surfaces first where the GET resolves the
+// session's target repo (the filing-pinned repo, ADR-114 / #4626), still 500.
 func TestGetRefinementSession_FilingReadFaults500(t *testing.T) {
-	cases := map[string]*filingFaultRepo{
-		"get filing session": {getErr: errors.New("filing_sessions down")},
-		"list filed items":   {sess: &refinement.FilingSession{Repo: "o/r"}, listErr: errors.New("filed_items down")},
+	cases := map[string]struct {
+		repo *filingFaultRepo
+		want string
+	}{
+		"get filing session": {&filingFaultRepo{getErr: errors.New("filing_sessions down")}, "target repo"},
+		"list filed items":   {&filingFaultRepo{sess: &refinement.FilingSession{Repo: "o/r"}, listErr: errors.New("filed_items down")}, "filing progress"},
 	}
-	for name, repo := range cases {
+	for name, tc := range cases {
 		t.Run(name, func(t *testing.T) {
+			repo := tc.repo
 			repo.seededRefinementRepo = approvedSeeded(t)
 			s := New(Config{RefinementRepo: repo, AuditRepo: okAuditRepo{}})
 			id := repo.drafts[0].SessionID
 			rec := httptest.NewRecorder()
 			s.handleGetRefinementSession(rec, refinementReq(http.MethodGet, "/v0/refinement/sessions/"+id.String(), id.String(), ""))
-			if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), "filing progress") {
-				t.Fatalf("status = %d, want 500 naming the filing progress (body=%s)", rec.Code, rec.Body.String())
+			if rec.Code != http.StatusInternalServerError || !strings.Contains(rec.Body.String(), tc.want) {
+				t.Fatalf("status = %d, want 500 naming the %s (body=%s)", rec.Code, tc.want, rec.Body.String())
 			}
 		})
 	}

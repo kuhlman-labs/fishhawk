@@ -11,8 +11,12 @@ package server
 // auth-checklist impact inventory — E34.2's scopeRefinementGate precedent).
 //
 // DETACHED ARM (#4153). The handler runs a SYNCHRONOUS gate — scope, session,
-// strict body, the ApprovedDraft approval/drift check, repo parse,
-// conventions, installation resolution, then the two ledger short-circuits
+// strict body, the ApprovedDraft approval/drift check, repo parse, the
+// open-time repo pin (a repo-scoped session refuses any other repo with 409
+// refinement_filing_repo_mismatch, ADR-114 / #4626), conventions (resolved
+// through the conventionsResolver seam; an error is 502
+// refinement_conventions_unavailable and the response names the resolution in
+// conventions_source), installation resolution, then the two ledger short-circuits
 // (a pinned repo different from the request is 409
 // refinement_filing_repo_mismatch; a completed session replays 200
 // already_completed with zero forge calls) — and then launches
@@ -245,18 +249,21 @@ type refinementFiledChildView struct {
 // already_in_progress=true; a completed session's replay (200) carries status
 // filed, already_completed=true and the recorded epic + children.
 type refinementFileResponse struct {
-	Status            string                     `json:"status"`
-	SessionID         string                     `json:"session_id"`
-	DraftID           string                     `json:"draft_id"`
-	Repo              string                     `json:"repo"`
-	ChildCount        int                        `json:"child_count"`
-	BudgetSeconds     int                        `json:"budget_seconds,omitempty"`
-	AlreadyInProgress bool                       `json:"already_in_progress"`
-	Epic              *refinementFiledEpicView   `json:"epic,omitempty"`
-	Children          []refinementFiledChildView `json:"children"`
-	Resumed           bool                       `json:"resumed"`
-	AlreadyCompleted  bool                       `json:"already_completed"`
-	Verified          bool                       `json:"verified"`
+	// ConventionsSource names which conventions the filing resolved (ADR-114
+	// / #4626), so a degraded filing names its reason.
+	ConventionsSource refinementConventionsSourceView `json:"conventions_source"`
+	Status            string                          `json:"status"`
+	SessionID         string                          `json:"session_id"`
+	DraftID           string                          `json:"draft_id"`
+	Repo              string                          `json:"repo"`
+	ChildCount        int                             `json:"child_count"`
+	BudgetSeconds     int                             `json:"budget_seconds,omitempty"`
+	AlreadyInProgress bool                            `json:"already_in_progress"`
+	Epic              *refinementFiledEpicView        `json:"epic,omitempty"`
+	Children          []refinementFiledChildView      `json:"children"`
+	Resumed           bool                            `json:"resumed"`
+	AlreadyCompleted  bool                            `json:"already_completed"`
+	Verified          bool                            `json:"verified"`
 }
 
 // refinementFilingJob is everything the detached filing goroutine needs,
@@ -327,12 +334,25 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	conv, err := conventionsLoader(r.Context(), req.Repo)
-	if err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"could not load work-management conventions", map[string]any{"error": err.Error()})
+	// The open-time repo pin (ADR-114 / #4626), BEFORE conventions, scope
+	// resolution or any filing session: a repo-scoped session files only into
+	// the repo it was opened for — its preview was rendered with that repo's
+	// conventions.
+	if approved.Repo != "" && approved.Repo != req.Repo {
+		s.writeError(w, r, http.StatusConflict, "refinement_filing_repo_mismatch",
+			fmt.Sprintf("%v: session was opened for %q, requested %q", refinement.ErrFilingRepoMismatch, approved.Repo, req.Repo),
+			map[string]any{"requested_repo": req.Repo, "pinned_repo": approved.Repo})
 		return
 	}
+
+	res, err := conventionsResolver(r.Context(), req.Repo)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadGateway, "refinement_conventions_unavailable",
+			"could not resolve the target repository's work-management conventions; nothing was filed",
+			map[string]any{"repo": req.Repo, internalCauseKey: err.Error()})
+		return
+	}
+	conv := res.Conventions
 
 	target := workmgmt.Target{
 		Repo:    workmgmt.Repo{Owner: owner, Name: name},
@@ -384,11 +404,12 @@ func (s *Server) handleFileRefinementSession(w http.ResponseWriter, r *http.Requ
 	}
 	childCount := len(approved.Draft.Children)
 	resp := refinementFileResponse{
-		SessionID:  sessionID.String(),
-		DraftID:    approved.ID.String(),
-		Repo:       req.Repo,
-		ChildCount: childCount,
-		Resumed:    len(recorded) > 0,
+		ConventionsSource: conventionsSourceView(res),
+		SessionID:         sessionID.String(),
+		DraftID:           approved.ID.String(),
+		Repo:              req.Repo,
+		ChildCount:        childCount,
+		Resumed:           len(recorded) > 0,
 	}
 	resp.Epic, resp.Children = filedItemViews(recorded)
 	if sess != nil && sess.CompletedAt != nil {

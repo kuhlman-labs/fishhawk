@@ -430,7 +430,8 @@ it as NOT covered.
 - `CallPathDisclosure(body, frames)` is an UNWIRED helper: no production path
   calls it. The disclosure control is the server-rendered advisory filing (the
   apply files no agent title or body, and narrows advisory labels to the
-  `area:`/`type:`/`phase:` namespaces), so there is no agent text for it to
+  filing type's conventions-declared label namespaces minus `autonomy`, #4626),
+  so there is no agent text for it to
   scan; it is kept for a future surface that must screen agent prose. It
   reports the first caller-frame token (frames at index >= 1; index 0 is the
   public vulnerable symbol) found in `body`: a non-empty filename,

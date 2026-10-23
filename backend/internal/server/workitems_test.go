@@ -1729,7 +1729,8 @@ func TestFileWorkItem_EpicDerivedFromParent(t *testing.T) {
 // nil-map-guard path: title_vars omitted ENTIRELY with parent_epic set must
 // derive {epic} into a freshly-allocated map, render the title, and not
 // panic. Uses a conventions type whose title_format references only {epic}
-// so the rendered title needs no {n}.
+// so the rendered title needs no {n}. The conventions also declare an epic
+// type: the parent-title parse is derived from ITS title_format (#4626).
 func TestFileWorkItem_EpicDerived_TitleVarsOmitted(t *testing.T) {
 	fp := &fakeWorkProvider{}
 	registerFakeProvider(t, fp)
@@ -1744,6 +1745,7 @@ func TestFileWorkItem_EpicDerived_TitleVarsOmitted(t *testing.T) {
 				DefaultFields: workmgmt.DefaultFields{Status: "Backlog", Complexity: "medium"},
 				EpicLink:      "optional",
 			},
+			"epic": workmgmt.Default().Types["epic"],
 		},
 	}
 	prev := conventionsLoader
@@ -3316,6 +3318,10 @@ func TestFileWorkItem_ChildNumberZeroMatchFailsClosed(t *testing.T) {
 	if got == "" || !strings.Contains(got, "#389") {
 		t.Errorf("details.n_discovery_failed = %v, want it present and naming the epic #389", env.Error.Details["n_discovery_failed"])
 	}
+	// Both the message and the detail name the type's title_format (#4626).
+	if !strings.Contains(got, "title_format") || !strings.Contains(env.Error.Message, "title_format") {
+		t.Errorf("message %q / detail %q do not name the type's title_format", env.Error.Message, got)
+	}
 	if fp.fileCalls != 0 {
 		t.Error("provider File dispatched despite a fail-closed zero-match discovery")
 	}
@@ -3900,6 +3906,11 @@ func assertParentEpicFullRefusal(t *testing.T, rec *httptest.ResponseRecorder, w
 		!strings.Contains(env.Error.Message, "does not bypass the link cap") {
 		t.Errorf("message does not name the remedy and the non-bypass: %q", env.Error.Message)
 	}
+	// The prose names the filing type's own title_format, not a hard-coded
+	// title shape (ADR-110 guard (i), #4626).
+	if !strings.Contains(env.Error.Message, "title_format") || strings.Contains(env.Error.Message, "<epic>.<n>") {
+		t.Errorf("message does not name the type's title_format: %q", env.Error.Message)
+	}
 }
 
 // TestFileWorkItem_ParentEpicAtCapRefusedOnDerivedPath is the #3714 done-means
@@ -4261,5 +4272,92 @@ func TestApplyAndFileWorkItem_ThreadsOnCreatedToProvider(t *testing.T) {
 	}
 	if len(observed) != 1 || observed[0].Number != 5150 || observed[0].URL != "https://x/issues/5150" {
 		t.Errorf("caller closure observed %+v, want exactly one call carrying #5150", observed)
+	}
+}
+
+// customEpicConventions returns this repository's parsed declaration with the
+// epic and feature title formats replaced by a non-bracket shape — epic
+// "EPIC-{number}: {summary}", feature "EPIC-{epic}/{n} {summary}" — so only a
+// parse DERIVED from the epic type's title_format can read a parent title
+// (ADR-110 guard (i), #4626).
+func customEpicConventions(t *testing.T) workmgmt.Conventions {
+	t.Helper()
+	conv := parseRepoOwnWorkMgmtDeclaration(t)
+	epic := conv.Types["epic"]
+	epic.TitleFormat = "EPIC-{number}: {summary}"
+	conv.Types["epic"] = epic
+	feature := conv.Types["feature"]
+	feature.TitleFormat = "EPIC-{epic}/{n} {summary}"
+	conv.Types["feature"] = feature
+	return conv
+}
+
+// TestFileWorkItem_EpicTitleVarFromCustomEpicFormat drives the full handler
+// with conventions declaring a custom epic title shape: a parent titled
+// "EPIC-12: Foo" derives {epic}=12 and the child files as "EPIC-12/1 Bar".
+// Restoring the retired literal [E<n>] regexp leaves {epic} unset → 422 → red.
+// The second case pins that the derivation does NOT fall back to the old
+// bracket shape: under the custom conventions a "[E12]" parent derives nothing
+// and the filing fails closed with missing_placeholders.
+//
+// The third case pins the epic-type PRECONDITION (#4626 finding 3): a
+// repository whose child title formats use {epic} must declare an epic type
+// whose title_format carries {number}. Its conventions keep the custom child
+// format but declare NO epic type, and the parent is titled "[E12] Foo" — the
+// shape the shipped default's epic format WOULD parse — so only the fail-closed
+// "no epic type, derive nothing" branch keeps {epic} unset (a fallback to
+// workmgmt.Default()'s epic format would file "EPIC-12/1 Bar"): 422, and the
+// provider's File is never called.
+func TestFileWorkItem_EpicTitleVarFromCustomEpicFormat(t *testing.T) {
+	noEpicType := func(t *testing.T) workmgmt.Conventions {
+		conv := customEpicConventions(t)
+		delete(conv.Types, "epic")
+		return conv
+	}
+	cases := []struct {
+		name        string
+		conv        func(*testing.T) workmgmt.Conventions
+		parentTitle string
+		wantStatus  int
+		wantTitle   string
+	}{
+		{"custom parent derives epic", customEpicConventions, "EPIC-12: Foo", http.StatusCreated, "EPIC-12/1 Bar"},
+		{"bracket parent is not the declared shape", customEpicConventions, "[E12] Foo", http.StatusUnprocessableEntity, ""},
+		{"no epic type declared derives nothing", noEpicType, "[E12] Foo", http.StatusUnprocessableEntity, ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fp := &fakeWorkProvider{}
+			registerFakeProvider(t, fp)
+			installConventions(t, tc.conv(t), nil)
+			s := New(Config{GitHub: newEpicGitHubClient(t, 7788, tc.parentTitle)})
+
+			rec := fileWorkItem(t, s, workItemRequest{
+				Repo:      "kuhlman-labs/fishhawk",
+				Type:      "feature",
+				Summary:   "Bar",
+				TitleVars: map[string]string{"n": "1"}, // epic omitted, derived
+				Labels:    []string{"area:backend", "phase:alpha"},
+				Relations: &workItemRelations{ParentEpic: "#389"},
+			}, "github:operator")
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d, want %d (body=%s)", rec.Code, tc.wantStatus, rec.Body.String())
+			}
+			if tc.wantStatus == http.StatusCreated {
+				if resp := decodeWorkItem(t, rec); resp.Title != tc.wantTitle {
+					t.Errorf("title = %q, want %q (epic derived from the declared epic format)", resp.Title, tc.wantTitle)
+				}
+				return
+			}
+			var env errorEnvelope
+			_ = json.Unmarshal(rec.Body.Bytes(), &env)
+			missing, _ := env.Error.Details["missing_placeholders"].([]any)
+			if len(missing) != 1 || missing[0] != "epic" {
+				t.Errorf("details.missing_placeholders = %v, want [epic]", env.Error.Details["missing_placeholders"])
+			}
+			if fp.called {
+				t.Error("provider File dispatched despite an underivable {epic}")
+			}
+		})
 	}
 }

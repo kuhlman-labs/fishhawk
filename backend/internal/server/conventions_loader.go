@@ -24,6 +24,113 @@ const conventionsFilePath = ".fishhawk/work-management.yaml"
 // round-trip on every filing.
 const defaultConventionsTTL = 5 * time.Minute
 
+// Conventions resolution states (ADR-110 / ADR-114, #4642). A
+// ConventionsResolution reports which one produced its Conventions, so a
+// caller can tell "this repo declared its conventions" from "this repo
+// declared nothing" (the fetch succeeded and found no file) and from "the
+// server could not look" (a pre-fetch fall-through, named by its reason).
+const (
+	// ConventionsStateDeclared: the repo's committed
+	// .fishhawk/work-management.yaml was fetched, parsed and
+	// destination-authorized.
+	ConventionsStateDeclared = "declared"
+	// ConventionsStateNotDeclared: the fetch SUCCEEDED and the forge answered
+	// forge.ErrNotFound — the repo commits no conventions file, so the
+	// fallback conventions apply.
+	ConventionsStateNotDeclared = "not_declared"
+	// ConventionsStateDegraded: resolution fell through BEFORE any fetch, so
+	// the server could not tell whether the repo declares anything;
+	// DegradedReason names why and the fallback conventions apply.
+	ConventionsStateDegraded = "degraded"
+	// ConventionsStateNoRepo: there was no repo to resolve for (an empty
+	// repo); the fallback conventions apply.
+	ConventionsStateNoRepo = "no_repo"
+)
+
+// Degraded reasons: one per pre-fetch fall-through of the resolution chain,
+// plus the seam stub's reason. Each names what an operator has to configure
+// for the repo's own conventions to be read.
+const (
+	// ConventionsDegradedProviderResolverUnconfigured: the loader has no
+	// provider discriminator (nil Resolver).
+	ConventionsDegradedProviderResolverUnconfigured = "provider_resolver_unconfigured"
+	// ConventionsDegradedNoProviderAccount: the discriminator found no
+	// accounts row for the repo owner, or an ambiguous one (the same key
+	// under two providers).
+	ConventionsDegradedNoProviderAccount = "no_provider_account"
+	// ConventionsDegradedRepoMalformed: the repo is not "owner/name".
+	ConventionsDegradedRepoMalformed = "repo_malformed"
+	// ConventionsDegradedForgeUnregistered: the resolved provider has no
+	// fetch path — its forge is not registered (nil fetcher, or a nil github
+	// scope resolver), or the provider is one the loader does not know.
+	ConventionsDegradedForgeUnregistered = "forge_unregistered"
+	// ConventionsDegradedAppNotInstalled: the GitHub App is not installed on
+	// the repo (a zero installation scope).
+	ConventionsDegradedAppNotInstalled = "app_not_installed"
+	// ConventionsDegradedForgeCredentialsUnconfigured: the deployment has no
+	// gitlab credentials (a zero deployment scope).
+	ConventionsDegradedForgeCredentialsUnconfigured = "forge_credentials_unconfigured"
+	// ConventionsDegradedLoaderUnconfigured: no per-repo loader is installed
+	// behind the conventionsResolver seam, so the server cannot tell whether
+	// the repo declares anything (the seam stub's reason).
+	ConventionsDegradedLoaderUnconfigured = "conventions_loader_unconfigured"
+)
+
+// Fallback kinds: which conventions a not_declared / degraded / no_repo
+// resolution carries.
+const (
+	// ConventionsFallbackDeploymentOverride: the break-glass
+	// FISHHAWKD_WORKMGMT_CONVENTIONS override.
+	ConventionsFallbackDeploymentOverride = "deployment_override"
+	// ConventionsFallbackShippedDefault: workmgmt.Default().
+	ConventionsFallbackShippedDefault = "shipped_default"
+)
+
+// ConventionsResolution is one repo's resolved work-management conventions
+// plus how they were resolved (ADR-114 / #4642). State is one of the
+// ConventionsState* values; DegradedReason is set only for
+// ConventionsStateDegraded; Fallback is set for every state except
+// ConventionsStateDeclared (the seam stub, which cannot know where its
+// delegate's conventions came from, leaves it empty). A resolution returned
+// alongside a non-nil error carries only Repo.
+type ConventionsResolution struct {
+	Conventions    workmgmt.Conventions
+	Repo           string
+	State          string
+	DegradedReason string
+	Fallback       string
+}
+
+// conventionsResolver is the process-wide ConventionsResolution seam, the
+// signal-carrying sibling of conventionsLoader (workitems.go). serve.go
+// installs RepoConventionsLoader.Resolve on the SAME loader instance whose
+// Load it installs as conventionsLoader, so the two share one cache. The
+// default stub delegates to conventionsLoader and reports degraded with
+// ConventionsDegradedLoaderUnconfigured: with no per-repo loader installed
+// the server cannot tell whether the repo declared anything, and a missed
+// install then surfaces by name rather than as a silent default. Declared as
+// a package var so tests can inject a resolution without a forge round-trip.
+var conventionsResolver = func(ctx context.Context, repo string) (ConventionsResolution, error) {
+	conv, err := conventionsLoader(ctx, repo)
+	if err != nil {
+		return ConventionsResolution{Repo: repo}, err
+	}
+	return ConventionsResolution{
+		Conventions:    conv,
+		Repo:           repo,
+		State:          ConventionsStateDegraded,
+		DegradedReason: ConventionsDegradedLoaderUnconfigured,
+	}, nil
+}
+
+// SetConventionsResolver installs the process-wide conventions resolver,
+// replacing the stub, mirroring SetConventionsLoader. It is not
+// concurrency-safe with in-flight requests and is intended to be called once
+// at startup.
+func SetConventionsResolver(resolver func(ctx context.Context, repo string) (ConventionsResolution, error)) {
+	conventionsResolver = resolver
+}
+
 // ProviderResolver resolves the ADR-057/ADR-058 tenancy provider
 // discriminator for a repo — the SOLE out-of-file hint the per-repo
 // conventions loader consults before falling back to the break-glass
@@ -96,7 +203,9 @@ type conventionsCacheEntry struct {
 // discriminator → break-glass override → workmgmt.Default(). Once a forge is
 // resolved the loader resolves the CredentialScope ITSELF (github: the
 // server's repo-installation resolution; gitlab: the deployment scope); no
-// resolvable scope is treated exactly like an unregistered forge. Fetch and
+// resolvable scope falls through like an unregistered forge, and Resolve
+// names every such pre-fetch fall-through by its own degraded reason
+// (ADR-114 / #4642). Fetch and
 // parse failures other than forge.ErrNotFound FAIL CLOSED — an
 // auth/transport/server fault must not silently select a different provider.
 // Parses are cached per (provider, repo), TTL-gated: within TTL the cached
@@ -121,7 +230,8 @@ type RepoConventionsLoader struct {
 }
 
 // NewRepoConventionsLoader builds a loader over cfg, defaulting Parse, Now,
-// and TTL. Install its Load via SetConventionsLoader.
+// and TTL. Install its Load via SetConventionsLoader and its Resolve via
+// SetConventionsResolver, on the same instance so they share one cache.
 func NewRepoConventionsLoader(cfg RepoConventionsLoaderConfig) *RepoConventionsLoader {
 	if cfg.Parse == nil {
 		cfg.Parse = workmgmt.Parse
@@ -140,65 +250,98 @@ func NewRepoConventionsLoader(cfg RepoConventionsLoaderConfig) *RepoConventionsL
 }
 
 // Load resolves the work-management conventions for repo ("owner/name"). It
-// is the func installed as the process-wide conventionsLoader seam.
+// is the func installed as the process-wide conventionsLoader seam, and a thin
+// wrapper over Resolve: every existing caller sees exactly the conventions
+// and error it saw before Resolve existed.
 func (l *RepoConventionsLoader) Load(ctx context.Context, repo string) (workmgmt.Conventions, error) {
-	fetcher, scope, provider, ref, ok, err := l.resolveFetch(ctx, repo)
+	res, err := l.Resolve(ctx, repo)
+	return res.Conventions, err
+}
+
+// Resolve resolves the work-management conventions for repo ("owner/name")
+// and reports how (ADR-114 / #4642): declared (fetched and parsed),
+// not_declared (the fetch succeeded and answered forge.ErrNotFound), degraded
+// (a pre-fetch fall-through, with its named reason) or no_repo (an empty repo
+// that fell through). not_declared / degraded / no_repo carry the fallback
+// conventions and name their Fallback kind. Resolver, scope-resolution, fetch,
+// parse and destination-authorization failures return an error (fail
+// closed) and a resolution carrying only Repo. It is the func installed as
+// the process-wide conventionsResolver seam.
+func (l *RepoConventionsLoader) Resolve(ctx context.Context, repo string) (ConventionsResolution, error) {
+	fetcher, scope, provider, ref, reason, err := l.resolveFetch(ctx, repo)
 	if err != nil {
-		return workmgmt.Conventions{}, err
+		return ConventionsResolution{Repo: repo}, err
 	}
-	if !ok {
-		return l.fallback(), nil
+	if reason != "" {
+		conv, kind := l.fallback()
+		res := ConventionsResolution{Conventions: conv, Repo: repo, State: ConventionsStateDegraded, DegradedReason: reason, Fallback: kind}
+		if repo == "" {
+			// Nothing to resolve for: not a degraded lookup of some repo.
+			res.State, res.DegradedReason = ConventionsStateNoRepo, ""
+		}
+		return res, nil
 	}
 	owner, name, _ := strings.Cut(repo, "/")
-	return l.loadCached(ctx, provider, repo, fetcher, scope, forge.RepoRef{Owner: owner, Name: name}, ref)
+	conv, declared, err := l.loadCached(ctx, provider, repo, fetcher, scope, forge.RepoRef{Owner: owner, Name: name}, ref)
+	if err != nil {
+		return ConventionsResolution{Repo: repo}, err
+	}
+	if !declared {
+		conv, kind := l.fallback()
+		return ConventionsResolution{Conventions: conv, Repo: repo, State: ConventionsStateNotDeclared, Fallback: kind}, nil
+	}
+	return ConventionsResolution{Conventions: conv, Repo: repo, State: ConventionsStateDeclared}, nil
 }
 
 // resolveFetch runs the out-of-file resolution chain: the provider
 // discriminator, then that provider's fetcher + self-resolved credential
-// scope. ok=false means "fall through to override/Default" (provider
-// not-found/ambiguous, unregistered forge, or no resolvable credential
-// scope). A resolver or scope-resolution ERROR fails closed instead.
-func (l *RepoConventionsLoader) resolveFetch(ctx context.Context, repo string) (forge.FileFetcher, forge.CredentialScope, string, string, bool, error) {
+// scope. A non-empty reason means "fall through to override/Default" and
+// names the fall-through (one ConventionsDegraded* value per branch). A
+// resolver or scope-resolution ERROR fails closed instead.
+func (l *RepoConventionsLoader) resolveFetch(ctx context.Context, repo string) (forge.FileFetcher, forge.CredentialScope, string, string, string, error) {
 	if l.cfg.Resolver == nil {
-		return nil, forge.CredentialScope{}, "", "", false, nil
+		return nil, forge.CredentialScope{}, "", "", ConventionsDegradedProviderResolverUnconfigured, nil
 	}
 	provider, found, err := l.cfg.Resolver.ResolveProvider(ctx, repo)
 	if err != nil {
-		return nil, forge.CredentialScope{}, "", "", false, fmt.Errorf("resolve conventions provider for %q: %w", repo, err)
+		return nil, forge.CredentialScope{}, "", "", "", fmt.Errorf("resolve conventions provider for %q: %w", repo, err)
 	}
 	if !found {
-		return nil, forge.CredentialScope{}, "", "", false, nil
+		return nil, forge.CredentialScope{}, "", "", ConventionsDegradedNoProviderAccount, nil
 	}
 	owner, name, cut := strings.Cut(repo, "/")
 	if !cut || owner == "" || name == "" {
-		return nil, forge.CredentialScope{}, "", "", false, nil
+		return nil, forge.CredentialScope{}, "", "", ConventionsDegradedRepoMalformed, nil
 	}
 	switch provider {
 	case "github":
 		if l.cfg.GitHubFetcher == nil || l.cfg.GitHubScope == nil {
-			return nil, forge.CredentialScope{}, "", "", false, nil
+			return nil, forge.CredentialScope{}, "", "", ConventionsDegradedForgeUnregistered, nil
 		}
 		scope, err := l.cfg.GitHubScope(ctx, owner, name)
 		if err != nil {
-			return nil, forge.CredentialScope{}, "", "", false, fmt.Errorf("resolve github credential scope for %q: %w", repo, err)
+			return nil, forge.CredentialScope{}, "", "", "", fmt.Errorf("resolve github credential scope for %q: %w", repo, err)
 		}
 		if scope.IsZero() {
 			// App not installed on the repo — no credential to fetch
-			// with, exactly like an unregistered forge.
-			return nil, forge.CredentialScope{}, "", "", false, nil
+			// with.
+			return nil, forge.CredentialScope{}, "", "", ConventionsDegradedAppNotInstalled, nil
 		}
-		return l.cfg.GitHubFetcher, scope, provider, "", true, nil
+		return l.cfg.GitHubFetcher, scope, provider, "", "", nil
 	case "gitlab":
-		if l.cfg.GitLabFetcher == nil || l.cfg.GitLabScope.IsZero() {
-			return nil, forge.CredentialScope{}, "", "", false, nil
+		if l.cfg.GitLabFetcher == nil {
+			return nil, forge.CredentialScope{}, "", "", ConventionsDegradedForgeUnregistered, nil
+		}
+		if l.cfg.GitLabScope.IsZero() {
+			return nil, forge.CredentialScope{}, "", "", ConventionsDegradedForgeCredentialsUnconfigured, nil
 		}
 		// The Repository Files API requires an explicit ref; HEAD is the
 		// repo's default branch.
-		return l.cfg.GitLabFetcher, l.cfg.GitLabScope, provider, "HEAD", true, nil
+		return l.cfg.GitLabFetcher, l.cfg.GitLabScope, provider, "HEAD", "", nil
 	default:
 		// A provider the loader has no fetch path for behaves like an
 		// unregistered forge.
-		return nil, forge.CredentialScope{}, "", "", false, nil
+		return nil, forge.CredentialScope{}, "", "", ConventionsDegradedForgeUnregistered, nil
 	}
 }
 
@@ -215,7 +358,12 @@ func (l *RepoConventionsLoader) resolveFetch(ctx context.Context, repo string) (
 // branches rest on: nothing enters the cache without having passed
 // authorization, so those branches need no re-check — and an edit that writes
 // the cache any earlier silently reopens the redirect hole.
-func (l *RepoConventionsLoader) loadCached(ctx context.Context, provider, repo string, fetcher forge.FileFetcher, scope forge.CredentialScope, ref forge.RepoRef, fetchRef string) (workmgmt.Conventions, error) {
+//
+// declared=false (with a nil error) means the fetch answered
+// forge.ErrNotFound: the repo commits no conventions file, and the caller
+// serves the fallback. Only a declared parse is ever cached, so every cache
+// hit is declared.
+func (l *RepoConventionsLoader) loadCached(ctx context.Context, provider, repo string, fetcher forge.FileFetcher, scope forge.CredentialScope, ref forge.RepoRef, fetchRef string) (conv workmgmt.Conventions, declared bool, err error) {
 	key := provider + "\x00" + repo
 
 	keyLock := l.keyLock(key)
@@ -225,39 +373,39 @@ func (l *RepoConventionsLoader) loadCached(ctx context.Context, provider, repo s
 	now := l.cfg.Now()
 	entry, cached := l.readCache(key)
 	if cached && now.Sub(entry.fetchedAt) < l.cfg.TTL {
-		return entry.conv, nil
+		return entry.conv, true, nil
 	}
 
 	fc, err := fetcher.FetchFile(ctx, scope, ref, conventionsFilePath, fetchRef)
 	if err != nil {
 		if errors.Is(err, forge.ErrNotFound) {
 			// The repo simply has no committed conventions file.
-			return l.fallback(), nil
+			return workmgmt.Conventions{}, false, nil
 		}
 		// FAIL CLOSED: an auth/transport/server failure must not silently
 		// select a different provider via the fallback chain.
-		return workmgmt.Conventions{}, fmt.Errorf("fetch %s from %s: %w", conventionsFilePath, repo, err)
+		return workmgmt.Conventions{}, false, fmt.Errorf("fetch %s from %s: %w", conventionsFilePath, repo, err)
 	}
 	if cached && entry.sha == fc.SHA {
 		entry.fetchedAt = now
 		l.writeCache(key, entry)
-		return entry.conv, nil
+		return entry.conv, true, nil
 	}
-	conv, err := l.cfg.Parse(bytes.NewReader(fc.Content))
+	conv, err = l.cfg.Parse(bytes.NewReader(fc.Content))
 	if err != nil {
 		// FAIL CLOSED: a committed-but-invalid file is an operator error to
 		// surface, not a reason to serve some other repo's conventions.
-		return workmgmt.Conventions{}, fmt.Errorf("parse %s from %s: %w", conventionsFilePath, repo, err)
+		return workmgmt.Conventions{}, false, fmt.Errorf("parse %s from %s: %w", conventionsFilePath, repo, err)
 	}
 	if err := authorizeConventionsDestination(provider, repo, conv, l.cfg.AllowedDestinations); err != nil {
 		// FAIL CLOSED, and deliberately WITHOUT caching and WITHOUT falling
 		// through: caching a refused parse would hide the redirect attempt
 		// behind the TTL, and falling back to the override/Default() would
 		// let repo-committed content SELECT the deployment default.
-		return workmgmt.Conventions{}, err
+		return workmgmt.Conventions{}, false, err
 	}
 	l.writeCache(key, conventionsCacheEntry{sha: fc.SHA, conv: conv, fetchedAt: now})
-	return conv, nil
+	return conv, true, nil
 }
 
 // keyLock returns the per-key fetch-serialization mutex, creating it on first
@@ -290,14 +438,14 @@ func (l *RepoConventionsLoader) writeCache(key string, entry conventionsCacheEnt
 
 // fallback is the tail of the resolution chain: the break-glass
 // FISHHAWKD_WORKMGMT_CONVENTIONS override when installed, else the shipped
-// default.
-func (l *RepoConventionsLoader) fallback() workmgmt.Conventions {
+// default. The second result names which (a ConventionsFallback* value).
+func (l *RepoConventionsLoader) fallback() (workmgmt.Conventions, string) {
 	if l.cfg.Override != nil {
 		if conv, ok := l.cfg.Override(); ok {
-			return conv
+			return conv, ConventionsFallbackDeploymentOverride
 		}
 	}
-	return workmgmt.Default()
+	return workmgmt.Default(), ConventionsFallbackShippedDefault
 }
 
 // GitHubRepoScopeResolver exposes the server's GitHub repo→installation

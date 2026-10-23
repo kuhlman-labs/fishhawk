@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -1920,5 +1921,96 @@ func TestFileOrLinkLiveValidationWalk_UnamendedBodyByteIdentical(t *testing.T) {
 		"- [ ] `ac1` — the webhook fires on a real push\n"
 	if got := liveValFiledBody(t, h); got != want {
 		t.Errorf("unamended body drifted from the pre-#3554 render.\n got: %q\nwant: %q", got, want)
+	}
+}
+
+// TestLiveValidationWalk_EpicArmUsesConventionsEpicFormat (ADR-110 guard (i),
+// #4626): the walk's parent-epic parse is the CLOSED form DERIVED from the
+// conventions' epic title_format, not a hard-coded [E<n>] regexp. With epic
+// "EPIC-{number}: {summary}" and chore "EPIC-{epic}/{n} {summary}" declared,
+// a parent titled "EPIC-48: SDLC dogfooding" takes the epic arm and files
+// "EPIC-48/4 …" under #1940. Restoring the literal bracket regexp degrades the
+// walk to the companion arm (no ParentEpic) → red. The #2179 child-title
+// rejection stays pinned by the [E48.35] fallback mode.
+func TestLiveValidationWalk_EpicArmUsesConventionsEpicFormat(t *testing.T) {
+	conv := parseRepoOwnWorkMgmtDeclaration(t)
+	epic := conv.Types["epic"]
+	epic.TitleFormat = "EPIC-{number}: {summary}"
+	conv.Types["epic"] = epic
+	chore := conv.Types["chore"]
+	chore.TitleFormat = "EPIC-{epic}/{n} {summary}"
+	conv.Types["chore"] = chore
+	installConventions(t, conv, nil)
+
+	children := make([]workmgmt.EpicChild, 0, 3)
+	for i := 1; i <= 3; i++ {
+		children = append(children, workmgmt.EpicChild{Number: 1000 + i, Title: fmt.Sprintf("EPIC-48/%d child %d", i, i)})
+	}
+	h := liveValEpicHarness(t, func(c *liveValConfig) {
+		c.github = newLiveValGitHub(t, "", &liveValParentFixture{number: 1940, title: "EPIC-48: SDLC dogfooding"})
+		c.epicChildren = children
+	})
+	h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+	if len(h.provider.reqs) != 1 {
+		t.Fatalf("filed %d walks, want exactly 1", len(h.provider.reqs))
+	}
+	req := h.provider.reqs[0]
+	if req.Item.Relations.ParentEpic != "#1940" {
+		t.Errorf("parent_epic = %q, want #1940 (the epic arm, parsed from the declared epic format)", req.Item.Relations.ParentEpic)
+	}
+	if len(req.Item.Relations.CompanionTo) != 0 {
+		t.Errorf("companion_to = %v, want empty on the epic arm", req.Item.Relations.CompanionTo)
+	}
+	if want := "EPIC-48/4 Operator live-validation walk (rolling)"; req.Item.Title != want {
+		t.Errorf("walk title = %q, want %q", req.Item.Title, want)
+	}
+}
+
+// TestLiveValidationWalk_RepoDeclarationKeepsAreaBackend pins approval
+// condition / first-officer item 2 (#4626): under THIS repository's own
+// declaration — whose chore type declares NO area label default — and a parent
+// epic carrying NO area:* label, both walk arms still file area:backend (from
+// liveValidationWalkArea, the frozen literal-guard exemption) beside the
+// chore type's type:chore and autonomy:medium. Deleting the constant from
+// either arm's Labels leaves no area label derivable from anywhere → red.
+func TestLiveValidationWalk_RepoDeclarationKeepsAreaBackend(t *testing.T) {
+	inst := int64(77)
+	cases := []struct {
+		name       string
+		harness    func(t *testing.T) *liveValHarness
+		wantParent string
+	}{
+		{"companion arm", func(t *testing.T) *liveValHarness {
+			return newLiveValHarness(t, liveValConfig{marked: true, installID: &inst, github: newLiveValGitHub(t, "", nil)})
+		}, ""},
+		{"rolling epic arm", func(t *testing.T) *liveValHarness {
+			return liveValEpicHarness(t, nil)
+		}, "#1940"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			conv := parseRepoOwnWorkMgmtDeclaration(t)
+			if _, has := conv.Types["chore"].LabelDefaults["area"]; has {
+				t.Fatal("precondition: this repository's chore type now declares an area label default; the walk area may be derivable — revisit liveValidationWalkArea")
+			}
+			installConventions(t, conv, nil)
+			h := tc.harness(t)
+			h.s.fileOrLinkLiveValidationWalk(context.Background(), h.planStage)
+
+			if len(h.provider.reqs) != 1 {
+				t.Fatalf("filed %d walks, want exactly 1", len(h.provider.reqs))
+			}
+			req := h.provider.reqs[0]
+			if req.Item.Relations.ParentEpic != tc.wantParent {
+				t.Fatalf("parent_epic = %q, want %q (the %s)", req.Item.Relations.ParentEpic, tc.wantParent, tc.name)
+			}
+			labels := req.Item.Classification.Labels
+			for _, want := range []string{"area:backend", "type:chore", "autonomy:medium"} {
+				if !slices.Contains(labels, want) {
+					t.Errorf("filed labels = %v, want %q", labels, want)
+				}
+			}
+		})
 	}
 }

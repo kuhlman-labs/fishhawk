@@ -6,6 +6,7 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -942,5 +943,346 @@ func TestConventionsLoader_RepositoryOwnDeclarationBoardsProject7(t *testing.T) 
 	want := workmgmt.Project{Owner: "kuhlman-labs", OwnerType: "user", Number: 7}
 	if conv.Project == nil || *conv.Project != want {
 		t.Errorf("Project = %+v, want %+v", conv.Project, want)
+	}
+}
+
+// absentOverride is an installed override that declines (ok=false), so the
+// chain still ends at the shipped default.
+func absentOverride() (workmgmt.Conventions, bool) { return workmgmt.Conventions{}, false }
+
+// TestRepoConventionsLoader_ResolveNamesEachFallThrough pins ADR-114's
+// degrade-by-name rule (#4642): every pre-fetch fall-through of the
+// resolution chain reports state degraded with ITS OWN reason and the
+// fallback kind it served, and never reaches a fetch. A degraded resolution
+// must stay distinguishable from not_declared (a repo that declares nothing),
+// which only a completed fetch can establish.
+func TestRepoConventionsLoader_ResolveNamesEachFallThrough(t *testing.T) {
+	zeroScope := func(context.Context, string, string) (forge.CredentialScope, error) {
+		return forge.CredentialScope{}, nil
+	}
+	for _, tc := range []struct {
+		name         string
+		repo         string
+		resolver     ProviderResolver
+		noGitHub     bool // nil GitHubFetcher
+		noGitLab     bool // nil GitLabFetcher
+		githubScope  func(context.Context, string, string) (forge.CredentialScope, error)
+		noGitHubAuth bool // nil GitHubScope
+		noGitLabAuth bool // zero GitLabScope
+		override     func() (workmgmt.Conventions, bool)
+		wantReason   string
+		wantFallback string
+		wantProvider string
+	}{
+		{name: "nil resolver", resolver: nil, wantReason: ConventionsDegradedProviderResolverUnconfigured},
+		{name: "no accounts row", resolver: &fakeProviderResolver{found: false}, wantReason: ConventionsDegradedNoProviderAccount},
+		{name: "malformed repo", repo: "widgets", resolver: &fakeProviderResolver{provider: "github", found: true}, wantReason: ConventionsDegradedRepoMalformed},
+		{name: "github nil fetcher", resolver: &fakeProviderResolver{provider: "github", found: true}, noGitHub: true, wantReason: ConventionsDegradedForgeUnregistered},
+		{name: "github nil scope resolver", resolver: &fakeProviderResolver{provider: "github", found: true}, noGitHubAuth: true, wantReason: ConventionsDegradedForgeUnregistered},
+		{name: "gitlab nil fetcher", resolver: &fakeProviderResolver{provider: "gitlab", found: true}, noGitLab: true, wantReason: ConventionsDegradedForgeUnregistered},
+		{name: "unknown provider", resolver: &fakeProviderResolver{provider: "bitbucket", found: true}, wantReason: ConventionsDegradedForgeUnregistered},
+		{name: "github zero scope", resolver: &fakeProviderResolver{provider: "github", found: true}, githubScope: zeroScope, wantReason: ConventionsDegradedAppNotInstalled},
+		{name: "gitlab zero scope", repo: "group/lib", resolver: &fakeProviderResolver{provider: "gitlab", found: true}, noGitLabAuth: true, wantReason: ConventionsDegradedForgeCredentialsUnconfigured},
+		{name: "deployment override", resolver: &fakeProviderResolver{found: false}, override: breakGlass,
+			wantReason: ConventionsDegradedNoProviderAccount, wantFallback: ConventionsFallbackDeploymentOverride, wantProvider: "break-glass"},
+		{name: "declining override", resolver: &fakeProviderResolver{found: false}, override: absentOverride, wantReason: ConventionsDegradedNoProviderAccount},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh, gl := &fakeFileFetcher{}, &fakeFileFetcher{}
+			cfg := RepoConventionsLoaderConfig{
+				Resolver:      tc.resolver,
+				GitHubFetcher: gh,
+				GitLabFetcher: gl,
+				GitHubScope:   githubScopeFixed("42"),
+				GitLabScope:   forge.FromRef("gitlab:deployment"),
+				Override:      tc.override,
+			}
+			if tc.noGitHub {
+				cfg.GitHubFetcher = nil
+			}
+			if tc.noGitLab {
+				cfg.GitLabFetcher = nil
+			}
+			if tc.githubScope != nil {
+				cfg.GitHubScope = tc.githubScope
+			}
+			if tc.noGitHubAuth {
+				cfg.GitHubScope = nil
+			}
+			if tc.noGitLabAuth {
+				cfg.GitLabScope = forge.CredentialScope{}
+			}
+			repo := tc.repo
+			if repo == "" {
+				repo = "acme/widgets"
+			}
+			res, err := NewRepoConventionsLoader(cfg).Resolve(context.Background(), repo)
+			if err != nil {
+				t.Fatalf("Resolve err = %v, want nil (a fall-through degrades, it does not fail)", err)
+			}
+			if res.State != ConventionsStateDegraded || res.DegradedReason != tc.wantReason {
+				t.Errorf("state/reason = %q/%q, want %q/%q", res.State, res.DegradedReason, ConventionsStateDegraded, tc.wantReason)
+			}
+			wantFallback, wantProvider := tc.wantFallback, tc.wantProvider
+			if wantFallback == "" {
+				wantFallback, wantProvider = ConventionsFallbackShippedDefault, workmgmt.Default().Provider
+			}
+			if res.Fallback != wantFallback {
+				t.Errorf("Fallback = %q, want %q", res.Fallback, wantFallback)
+			}
+			if res.Conventions.Provider != wantProvider {
+				t.Errorf("Conventions.Provider = %q, want %q (the fallback's)", res.Conventions.Provider, wantProvider)
+			}
+			if res.Repo != repo {
+				t.Errorf("Repo = %q, want %q", res.Repo, repo)
+			}
+			if gh.calls != 0 || gl.calls != 0 {
+				t.Errorf("fetch calls = github %d / gitlab %d, want 0/0 (a pre-fetch fall-through)", gh.calls, gl.calls)
+			}
+		})
+	}
+}
+
+// TestRepoConventionsLoader_ResolveDeclaredAndNotDeclared: a fetched, parsed,
+// authorized declaration reports declared with no fallback; a fetch that
+// SUCCEEDS and answers forge.ErrNotFound reports not_declared with the
+// fallback it served. Both reach exactly one fetch — the only way to tell a
+// repo that declares nothing from one the server could not look at.
+func TestRepoConventionsLoader_ResolveDeclaredAndNotDeclared(t *testing.T) {
+	t.Run("declared", func(t *testing.T) {
+		gh := &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "s1"}}
+		l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: gh,
+			GitHubScope:   githubScopeFixed("42"),
+			Override:      breakGlass,
+		})
+		res, err := l.Resolve(context.Background(), "acme/widgets")
+		if err != nil {
+			t.Fatalf("Resolve err = %v", err)
+		}
+		if res.State != ConventionsStateDeclared || res.DegradedReason != "" || res.Fallback != "" {
+			t.Errorf("resolution = %q/%q/%q, want declared with no reason and no fallback", res.State, res.DegradedReason, res.Fallback)
+		}
+		if res.Conventions.Project == nil || res.Conventions.Project.Number != 3 {
+			t.Errorf("Conventions.Project = %+v, want the committed file's project 3", res.Conventions.Project)
+		}
+		if gh.calls != 1 {
+			t.Errorf("fetch calls = %d, want 1", gh.calls)
+		}
+		// A cache hit is still declared.
+		again, err := l.Resolve(context.Background(), "acme/widgets")
+		if err != nil || again.State != ConventionsStateDeclared || gh.calls != 1 {
+			t.Errorf("cached Resolve = %q (err %v, fetches %d), want declared from cache with 1 fetch", again.State, err, gh.calls)
+		}
+	})
+
+	for _, tc := range []struct {
+		name         string
+		override     func() (workmgmt.Conventions, bool)
+		wantFallback string
+		wantProvider string
+	}{
+		{"not declared, shipped default", nil, ConventionsFallbackShippedDefault, workmgmt.Default().Provider},
+		{"not declared, deployment override", breakGlass, ConventionsFallbackDeploymentOverride, "break-glass"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh := &fakeFileFetcher{err: forge.ErrNotFound}
+			l := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+				Resolver:      &fakeProviderResolver{provider: "github", found: true},
+				GitHubFetcher: gh,
+				GitHubScope:   githubScopeFixed("42"),
+				Override:      tc.override,
+			})
+			res, err := l.Resolve(context.Background(), "acme/widgets")
+			if err != nil {
+				t.Fatalf("Resolve err = %v", err)
+			}
+			if res.State != ConventionsStateNotDeclared || res.DegradedReason != "" {
+				t.Errorf("state/reason = %q/%q, want not_declared with no reason", res.State, res.DegradedReason)
+			}
+			if res.Fallback != tc.wantFallback || res.Conventions.Provider != tc.wantProvider {
+				t.Errorf("fallback/provider = %q/%q, want %q/%q", res.Fallback, res.Conventions.Provider, tc.wantFallback, tc.wantProvider)
+			}
+			if gh.calls != 1 {
+				t.Errorf("fetch calls = %d, want 1 (not_declared is established BY the fetch)", gh.calls)
+			}
+		})
+	}
+}
+
+// TestRepoConventionsLoader_ResolveNoRepo: an empty repo that falls through
+// reports no_repo — nothing was there to look up — with no degraded reason,
+// whichever pre-fetch branch it falls through on. One row per resolver shape
+// an empty repo can meet: no accounts row (no_provider_account), a NIL
+// Resolver (provider_resolver_unconfigured) and a Resolver answering found
+// (repo_malformed, since "" has no owner/name). Each falls through before any
+// fetch, so the counting fetchers stay at zero.
+func TestRepoConventionsLoader_ResolveNoRepo(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		resolver ProviderResolver
+	}{
+		{"no accounts row", &fakeProviderResolver{found: false}},
+		{"nil resolver", nil},
+		{"resolver finds github", &fakeProviderResolver{provider: "github", found: true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			gh, gl := &fakeFileFetcher{}, &fakeFileFetcher{}
+			res, err := NewRepoConventionsLoader(RepoConventionsLoaderConfig{
+				Resolver:      tc.resolver,
+				GitHubFetcher: gh,
+				GitHubScope:   githubScopeFixed("42"),
+				GitLabFetcher: gl,
+				GitLabScope:   forge.FromRef("gitlab:deployment"),
+			}).Resolve(context.Background(), "")
+			if err != nil {
+				t.Fatalf("Resolve err = %v", err)
+			}
+			if res.State != ConventionsStateNoRepo || res.DegradedReason != "" || res.Fallback != ConventionsFallbackShippedDefault {
+				t.Errorf("resolution = %q/%q/%q, want no_repo / no reason / shipped_default", res.State, res.DegradedReason, res.Fallback)
+			}
+			if gh.calls != 0 || gl.calls != 0 {
+				t.Errorf("fetch calls = github %d / gitlab %d, want 0 (nothing to fetch for)", gh.calls, gl.calls)
+			}
+		})
+	}
+}
+
+// TestRepoConventionsLoader_ResolveFailsClosed: every resolution ERROR —
+// resolver, scope resolution, fetch, parse, destination refusal — is returned
+// as an error with a resolution carrying only the repo: never a fallback.
+func TestRepoConventionsLoader_ResolveFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  RepoConventionsLoaderConfig
+	}{
+		{"resolver error", RepoConventionsLoaderConfig{Resolver: &fakeProviderResolver{err: errors.New("db down")}}},
+		{"scope error", RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: &fakeFileFetcher{},
+			GitHubScope: func(context.Context, string, string) (forge.CredentialScope, error) {
+				return forge.CredentialScope{}, errors.New("installation lookup 502")
+			},
+		}},
+		{"fetch error", RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: &fakeFileFetcher{err: forge.ErrForbidden},
+			GitHubScope:   githubScopeFixed("42"),
+		}},
+		{"unparseable declaration", RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte("provider: [broken"), SHA: "x"}},
+			GitHubScope:   githubScopeFixed("42"),
+		}},
+		{"destination refused", RepoConventionsLoaderConfig{
+			Resolver:      &fakeProviderResolver{provider: "github", found: true},
+			GitHubFetcher: &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubRedirectConventionsYAML), SHA: "x"}},
+			GitHubScope:   githubScopeFixed("42"),
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			tc.cfg.Override = breakGlass
+			res, err := NewRepoConventionsLoader(tc.cfg).Resolve(context.Background(), "acme/widgets")
+			if err == nil {
+				t.Fatal("Resolve err = nil, want the failure (fail closed)")
+			}
+			want := ConventionsResolution{Repo: "acme/widgets"}
+			if !reflect.DeepEqual(res, want) {
+				t.Errorf("resolution on error = %+v, want only the repo (no conventions, state or fallback)", res)
+			}
+		})
+	}
+}
+
+// TestRepoConventionsLoader_LoadUnchangedByResolve: Load is a thin wrapper
+// over Resolve, so for every mode — declared, not_declared, degraded and a
+// failure — Load returns exactly Resolve's conventions and error, which keeps
+// every existing conventionsLoader consumer byte-identical.
+func TestRepoConventionsLoader_LoadUnchangedByResolve(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		cfg  func() RepoConventionsLoaderConfig
+	}{
+		{"declared", func() RepoConventionsLoaderConfig {
+			return RepoConventionsLoaderConfig{
+				Resolver:      &fakeProviderResolver{provider: "github", found: true},
+				GitHubFetcher: &fakeFileFetcher{fc: &forge.FileContent{Path: conventionsFilePath, Content: []byte(testGitHubConventionsYAML), SHA: "s1"}},
+				GitHubScope:   githubScopeFixed("42"),
+			}
+		}},
+		{"not declared", func() RepoConventionsLoaderConfig {
+			return RepoConventionsLoaderConfig{
+				Resolver:      &fakeProviderResolver{provider: "github", found: true},
+				GitHubFetcher: &fakeFileFetcher{err: forge.ErrNotFound},
+				GitHubScope:   githubScopeFixed("42"),
+				Override:      breakGlass,
+			}
+		}},
+		{"degraded", func() RepoConventionsLoaderConfig {
+			return RepoConventionsLoaderConfig{Resolver: &fakeProviderResolver{found: false}}
+		}},
+		{"failure", func() RepoConventionsLoaderConfig {
+			return RepoConventionsLoaderConfig{
+				Resolver:      &fakeProviderResolver{provider: "github", found: true},
+				GitHubFetcher: &fakeFileFetcher{err: forge.ErrForbidden},
+				GitHubScope:   githubScopeFixed("42"),
+			}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			loaded, loadErr := NewRepoConventionsLoader(tc.cfg()).Load(context.Background(), "acme/widgets")
+			res, resolveErr := NewRepoConventionsLoader(tc.cfg()).Resolve(context.Background(), "acme/widgets")
+			if (loadErr == nil) != (resolveErr == nil) || (loadErr != nil && loadErr.Error() != resolveErr.Error()) {
+				t.Fatalf("Load err = %v, Resolve err = %v; want the same", loadErr, resolveErr)
+			}
+			if !reflect.DeepEqual(loaded, res.Conventions) {
+				t.Errorf("Load = %+v, Resolve().Conventions = %+v; want equal", loaded, res.Conventions)
+			}
+		})
+	}
+}
+
+// TestConventionsResolverStub_NamesLoaderUnconfigured: with no per-repo
+// loader installed, the seam stub serves whatever conventionsLoader returns
+// but reports degraded / conventions_loader_unconfigured, so a missed
+// SetConventionsResolver install surfaces by name; a delegate error
+// propagates. SetConventionsResolver replaces the stub.
+func TestConventionsResolverStub_NamesLoaderUnconfigured(t *testing.T) {
+	prevLoader, prevResolver := conventionsLoader, conventionsResolver
+	t.Cleanup(func() { conventionsLoader, conventionsResolver = prevLoader, prevResolver })
+
+	res, err := conventionsResolver(context.Background(), "acme/widgets")
+	if err != nil {
+		t.Fatalf("stub err = %v", err)
+	}
+	if res.State != ConventionsStateDegraded || res.DegradedReason != ConventionsDegradedLoaderUnconfigured || res.Repo != "acme/widgets" {
+		t.Errorf("stub resolution = %+v, want degraded / %s for acme/widgets", res, ConventionsDegradedLoaderUnconfigured)
+	}
+	// The stub cannot know where its delegate's conventions came from, so it
+	// names no Fallback kind.
+	if res.Fallback != "" {
+		t.Errorf("stub Fallback = %q, want empty (the stub cannot know its delegate's source)", res.Fallback)
+	}
+	if !reflect.DeepEqual(res.Conventions, workmgmt.Default()) {
+		t.Errorf("stub conventions = %+v, want the default conventionsLoader's Default()", res.Conventions)
+	}
+
+	conventionsLoader = func(context.Context, string) (workmgmt.Conventions, error) {
+		return workmgmt.Conventions{}, errors.New("loader down")
+	}
+	res, err = conventionsResolver(context.Background(), "acme/widgets")
+	if err == nil || !strings.Contains(err.Error(), "loader down") {
+		t.Fatalf("stub err = %v, want the delegate's error", err)
+	}
+	if !reflect.DeepEqual(res, ConventionsResolution{Repo: "acme/widgets"}) {
+		t.Errorf("stub resolution on error = %+v, want only the repo", res)
+	}
+
+	SetConventionsResolver(func(_ context.Context, repo string) (ConventionsResolution, error) {
+		return ConventionsResolution{Repo: repo, State: ConventionsStateDeclared}, nil
+	})
+	if res, _ := conventionsResolver(context.Background(), "acme/widgets"); res.State != ConventionsStateDeclared {
+		t.Errorf("after SetConventionsResolver state = %q, want the installed resolver's declared", res.State)
 	}
 }

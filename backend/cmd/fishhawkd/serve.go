@@ -860,12 +860,13 @@ func resolveRegionPin(opts regionPinOptions, q account.RegionPinnerQueries, logg
 
 // resolveRefinementDrafter builds the E34.2 refinement drafting agent
 // (server.RefinementDrafter) from the local-claude reviewer options. It returns
-// a *refinement.Drafter over a claudecode client + the default work-management
-// conventions when the local claude adapter is configured, and a literal nil
-// interface (never a typed-nil) otherwise — so the server's nil-Drafter guard
-// degrades ONLY the agent-backed gate arms (create-session, brief-amendment) to
-// 503 while GET / direct edit / decision keep working. It reuses the local
-// claude binary/model already resolved for the plan reviewer.
+// a *refinement.Drafter over a claudecode client when the local claude adapter
+// is configured — binding NO work-management conventions: each Draft call
+// takes the session's resolved conventions (ADR-110 / ADR-114, #4626) — and a
+// literal nil interface (never a typed-nil) otherwise — so the server's
+// nil-Drafter guard degrades ONLY the agent-backed gate arms (create-session,
+// brief-amendment) to 503 while GET / direct edit / decision keep working. It
+// reuses the local claude binary/model already resolved for the plan reviewer.
 func resolveRefinementDrafter(opts planReviewerOptions, logger *slog.Logger) server.RefinementDrafter {
 	if !opts.enableLocalClaudeReviewer {
 		return nil
@@ -878,7 +879,7 @@ func resolveRefinementDrafter(opts planReviewerOptions, logger *slog.Logger) ser
 		slog.String("adapter", "claudecode"),
 		slog.String("binary", opts.localClaudeBinary),
 		slog.String("model", opts.localClaudeModel))
-	return refinement.NewDrafter(client, workmgmt.Default())
+	return refinement.NewDrafter(client)
 }
 
 // resolveRefinementRepo builds the always-on Postgres refinement repository
@@ -3633,7 +3634,12 @@ func runServe(args []string, logSink io.Writer) int {
 	if pool != nil {
 		accountResolver = account.NewResolver(accountdb.New(pool))
 	}
-	server.SetConventionsLoader(buildRepoConventionsLoader(srv, accountResolver, conventionsOverride, allowedDestinations).Load)
+	// Load and Resolve are installed from the SAME loader instance so the
+	// filing paths and the refinement surface (ADR-114 / #4626) share one
+	// cache.
+	conventionsRepoLoader := buildRepoConventionsLoader(srv, accountResolver, conventionsOverride, allowedDestinations)
+	server.SetConventionsLoader(conventionsRepoLoader.Load)
+	server.SetConventionsResolver(conventionsRepoLoader.Resolve)
 	logger.Info("per-repo work-management conventions loader installed",
 		slog.Bool("discriminator_resolver", accountResolver != nil),
 		slog.Bool("break_glass_override", conventionsOverride != nil),

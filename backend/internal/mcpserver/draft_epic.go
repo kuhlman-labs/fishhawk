@@ -49,7 +49,7 @@ type EpicDraftChild struct {
 // endpoint. Exactly one arm must be populated; arm dispatch fails closed with
 // zero HTTP calls otherwise (see draftEpic). The arms:
 //
-//   - open:    brief                          -> POST   /v0/refinement/sessions
+//   - open:    brief [+ repo]                 -> POST   /v0/refinement/sessions
 //   - preview: session_id (alone)             -> GET    /v0/refinement/sessions/{id}
 //   - edit:    session_id + (brief_amendment  -> PATCH  /v0/refinement/sessions/{id}/draft
 //     XOR draft)
@@ -62,7 +62,7 @@ type DraftEpicInput struct {
 	Draft          *EpicDraft `json:"draft,omitempty" jsonschema:"EDIT arm (direct field edit): a full replacement EpicDraft, validated with no agent call. Requires session_id; mutually exclusive with brief_amendment"`
 	Decision       string     `json:"decision,omitempty" jsonschema:"DECIDE arm: approved or rejected, pinning the latest revision. Requires session_id and reason"`
 	Reason         string     `json:"reason,omitempty" jsonschema:"DECIDE arm: the required decision rationale (recorded and audited). Only valid alongside decision"`
-	Repo           string     `json:"repo,omitempty" jsonschema:"FILE arm: the target repository as owner/name to file the approved draft into. Requires session_id; the repo is pinned at first invoke and a re-invoke naming a different repo is rejected"`
+	Repo           string     `json:"repo,omitempty" jsonschema:"the target repository as owner/name. OPEN arm (with brief): scopes the session so the preview renders THAT repository's declared work-management conventions, and the file arm then refuses any other repo. FILE arm (with session_id): the repo to file the approved draft into; the repo is pinned at first invoke (or at open), and a call naming a different repo is rejected"`
 }
 
 // SessionGuidance is one legal next fishhawk_draft_epic move for a session's
@@ -92,7 +92,7 @@ type DraftEpicOutput struct {
 // every fail-closed arm-dispatch error so the message is precise about what
 // failed AND how to fix it (BRAND_FOUNDATIONS §5 error style).
 const legalArmsHelp = `exactly one arm must be populated: ` +
-	`(1) open — brief alone; ` +
+	`(1) open — brief, optionally with repo; ` +
 	`(2) preview — session_id alone; ` +
 	`(3) edit — session_id + exactly one of brief_amendment or draft; ` +
 	`(4) decide — session_id + decision (approved|rejected) + reason; ` +
@@ -124,7 +124,7 @@ fishhawk_approve_plan (that is stage-gated and resolves a run/stage; a
 refinement session is neither).
 
 It wraps five mutually-exclusive arms, exactly one populated per call:
-- open:    brief                                  -> drafts an epic + children from the brief, opens a session
+- open:    brief [+ repo]                         -> drafts an epic + children from the brief, opens a session (repo scopes it to that repository's conventions)
 - preview: session_id (alone)                      -> reads the current draft + derived approval state
 - edit:    session_id + (brief_amendment | draft)  -> appends a new revision (agent re-draft, or a direct EpicDraft edit); either re-gates the session to awaiting_approval
 - decide:  session_id + decision + reason          -> approves or rejects the latest revision (reason required)
@@ -132,6 +132,12 @@ It wraps five mutually-exclusive arms, exactly one populated per call:
 
 Arm dispatch fails closed with NO HTTP call when zero arms or an illegal
 combination is populated, and the error enumerates the legal combinations.
+
+Pass repo on open whenever the target repository is known: the preview then
+renders THAT repository's declared work-management conventions (titles,
+labels, body sections), and the file arm refuses any other repo. Every session
+view carries conventions_source (state declared, not_declared, degraded with a
+degraded_reason, or no_repo) naming which conventions rendered the preview.
 
 Every arm returns the session view (state, drifted, revision_count,
 latest_origin, latest_draft, preview, waves, criteria_precheck, decisions,
@@ -167,7 +173,10 @@ refinement_not_approved (approve before filing), refinement_draft_drifted
 (re-decide the latest revision), refinement_filing_repo_mismatch (re-invoke
 with the pinned repo), refinement_filing_failed (the filing could not be
 started — nothing was launched; fix the cause and re-invoke with the SAME
-repo), refinement_session_not_found, refinement_repo_unconfigured,
+repo), refinement_conventions_unavailable (the target repository's conventions could
+not be read or parsed — nothing was recorded; fix the declaration or the forge
+fault and retry), repo_forbidden (no read access to the repo named on open),
+refinement_session_not_found, refinement_repo_unconfigured,
 refinement_drafting_unavailable / refinement_drafting_failed.
 `),
 	}, resolver.draftEpic)
@@ -186,12 +195,13 @@ func (r *runResolver) draftEpic(ctx context.Context, _ *mcp.CallToolRequest, in 
 	hasReason := strings.TrimSpace(in.Reason) != ""
 	hasRepo := strings.TrimSpace(in.Repo) != ""
 
-	// OPEN arm: brief alone. Any other populated field is an illegal combination.
+	// OPEN arm: brief, optionally with repo (ADR-114 / #4626). Any other
+	// populated field is an illegal combination.
 	if hasBrief {
-		if hasSession || hasAmendment || hasDraft || hasDecision || hasReason || hasRepo {
-			return armError("the open arm (brief) cannot be combined with any other field")
+		if hasSession || hasAmendment || hasDraft || hasDecision || hasReason {
+			return armError("the open arm (brief) can be combined only with repo")
 		}
-		return r.draftEpicOpen(ctx, in.Brief)
+		return r.draftEpicOpen(ctx, in.Brief, in.Repo)
 	}
 
 	// Every remaining arm requires session_id.
@@ -254,8 +264,8 @@ func armError(problem string) (*mcp.CallToolResult, DraftEpicOutput, error) {
 	return nil, DraftEpicOutput{}, fmt.Errorf("fishhawk_draft_epic: %s. %s", problem, legalArmsHelp)
 }
 
-func (r *runResolver) draftEpicOpen(ctx context.Context, brief string) (*mcp.CallToolResult, DraftEpicOutput, error) {
-	sess, err := r.api.CreateRefinementSession(ctx, brief)
+func (r *runResolver) draftEpicOpen(ctx context.Context, brief, repo string) (*mcp.CallToolResult, DraftEpicOutput, error) {
+	sess, err := r.api.CreateRefinementSession(ctx, brief, repo)
 	if err != nil {
 		return nil, DraftEpicOutput{}, fmt.Errorf("draft epic: %w", err)
 	}
@@ -370,13 +380,26 @@ func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 	if g := guidanceForFilingProgress(sess.SessionID, sess.Filing); g != nil {
 		return g
 	}
+	return withConventionsNote(guidanceForApprovalState(sess), sess.ConventionsSource)
+}
+
+// guidanceForApprovalState is guidanceForSession's approval-state arm for a
+// session that is neither filed, drifted nor mid-filing.
+func guidanceForApprovalState(sess *RefinementSession) []SessionGuidance {
 	switch sess.State {
 	case "approved":
+		// Pre-fill the session's own repo when it is known: a repo-scoped
+		// session files only into the repo it was opened for.
+		repo, reason := "owner/name", "the latest revision is approved — file it into the tracker (the repo is pinned at first invoke)"
+		if cs := sess.ConventionsSource; cs != nil && cs.Repo != "" {
+			repo = cs.Repo
+			reason = fmt.Sprintf("the latest revision is approved — file it into %s, the repository the session is scoped to (any other repo is refused)", cs.Repo)
+		}
 		return []SessionGuidance{{
 			State:     "approved",
 			Arm:       "file",
-			Arguments: map[string]string{"session_id": sess.SessionID, "repo": "owner/name"},
-			Reason:    "the latest revision is approved — file it into the tracker (the repo is pinned at first invoke)",
+			Arguments: map[string]string{"session_id": sess.SessionID, "repo": repo},
+			Reason:    reason,
 		}}
 	case "rejected":
 		return []SessionGuidance{{
@@ -412,6 +435,60 @@ func guidanceForSession(sess *RefinementSession) []SessionGuidance {
 			},
 		}
 	}
+}
+
+// conventionsDegradedRemedies maps each degraded reason (ADR-114 / #4626) to
+// the operator remedy that lets the server read the repository's own
+// conventions.
+var conventionsDegradedRemedies = map[string]string{
+	"no_provider_account":             "register the repository owner's accounts provider row",
+	"forge_unregistered":              "configure the repository's forge on the backend",
+	"app_not_installed":               "install the GitHub App on the repository",
+	"forge_credentials_unconfigured":  "configure the forge credentials on the backend",
+	"provider_resolver_unconfigured":  "run the backend with its accounts database so the provider can be resolved",
+	"repo_malformed":                  "name the repository as owner/name",
+	"conventions_loader_unconfigured": "install the per-repo conventions loader (a backend wiring fault)",
+}
+
+// conventionsNote renders the conventions_source advisory appended to a
+// session's guidance: no_repo advises opening with a repo; degraded names its
+// reason and remedy; not_declared names the fallback. "" for declared (and
+// for a pre-#4626 backend with no block).
+func conventionsNote(cs *refinementConventionsSource) string {
+	if cs == nil {
+		return ""
+	}
+	switch cs.State {
+	case "no_repo":
+		return "Note: the preview uses the shipped default conventions because the session has no target repo — open a new session with brief + repo so the preview renders that repository's conventions."
+	case "degraded":
+		remedy := conventionsDegradedRemedies[cs.DegradedReason]
+		if remedy == "" {
+			remedy = "fix the named cause"
+		}
+		return fmt.Sprintf("Note: the preview uses the %s conventions, NOT %s's own, because the server could not read them (%s) — %s, then re-read the session with the preview arm.",
+			fallbackName(cs.Fallback), cs.Repo, cs.DegradedReason, remedy)
+	case "not_declared":
+		return fmt.Sprintf("Note: %s declares no .fishhawk/work-management.yaml, so the preview uses the %s conventions.", cs.Repo, fallbackName(cs.Fallback))
+	}
+	return ""
+}
+
+// fallbackName renders a fallback kind as prose.
+func fallbackName(kind string) string {
+	if kind == "deployment_override" {
+		return "deployment-override"
+	}
+	return "shipped default"
+}
+
+// withConventionsNote appends the conventions advisory to the first (the
+// suggested-default) guidance entry's reason.
+func withConventionsNote(g []SessionGuidance, cs *refinementConventionsSource) []SessionGuidance {
+	if note := conventionsNote(cs); note != "" && len(g) > 0 {
+		g[0].Reason += ". " + note
+	}
+	return g
 }
 
 // flaggedCriteriaOrdinals returns the 1-based ordinals of the children the

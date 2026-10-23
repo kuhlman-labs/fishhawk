@@ -61,9 +61,10 @@ package server
 // advisory fields (upkeep.RenderAdvisoryTitle / RenderAdvisoryFacts) and the
 // agent-authored proposed title and body are ignored, so no agent prose — and
 // no call-path frame naming the repository's own code — reaches the tracker
-// through them. Its labels are narrowed to the area:, type: and phase:
-// namespaces (upkeepAdvisoryLabels); the suffix inside a kept namespace is
-// still agent-chosen until the filing-label allow-list (#3956). The
+// through them. Its labels are narrowed to the label namespaces the filing
+// type's conventions declare, autonomy excluded (upkeepAdvisoryLabels, derived
+// from the resolved conventions since #4626); the suffix inside a kept
+// namespace is still agent-chosen until the filing-label allow-list (#3956). The
 // proposal's autonomy:* labels are
 // STRIPPED unless the captain set authorize_delegation_tier (an advisory
 // filing strips them regardless, by the namespace narrowing); note that the
@@ -84,6 +85,7 @@ import (
 	"fmt"
 	"log/slog"
 	"path"
+	"sort"
 	"strings"
 	"time"
 
@@ -556,7 +558,7 @@ func (s *Server) fileUpkeepFinding(ctx context.Context, job *upkeepFilingJob, f 
 	disp upkeepConsumedDisposition) (*upkeepFindingFiledPayload, *workItemError) {
 	labels, stripped := upkeepFilingLabels(f.ProposedIssue.Labels, disp.AuthorizeDelegationTier)
 	if f.Source == plan.UpkeepSourceAdvisory {
-		labels, stripped = upkeepAdvisoryLabels(labels, stripped)
+		labels, stripped = upkeepAdvisoryLabels(job.conv, f.ProposedIssue.Type, labels, stripped)
 	}
 	parentEpic := disp.ParentEpic
 	if parentEpic == "" && f.ProposedIssue.ParentEpic != nil {
@@ -677,23 +679,74 @@ func upkeepFilingLabels(proposed []string, authorized bool) ([]string, []string)
 	return kept, stripped
 }
 
-// upkeepAdvisoryLabelNamespaces are the only label namespaces an ADVISORY
-// filing carries (#3750). An agent-proposed label is a whitespace-free token
-// of up to 50 runes, so one such as `internal/server/serve.go` or
-// `server.serveH2` would carry a call-path frame to the tracker past the
-// server-rendered title and body.
-var upkeepAdvisoryLabelNamespaces = []string{"area:", "type:", "phase:"}
+// upkeepAutonomyNamespace is never allowed on an ADVISORY filing: the scan may
+// suggest a delegation tier, never set one, and an advisory strips it even when
+// the captain authorized it (#3924).
+const upkeepAutonomyNamespace = "autonomy"
+
+// upkeepAdvisoryNamespaces returns the only label namespaces an ADVISORY
+// filing of type typ carries (#3750), DERIVED from the resolved conventions
+// (ADR-110 guard (i), #4626) instead of a hard-coded list. An agent-proposed
+// label is a whitespace-free token of up to 50 runes, so one such as
+// `internal/server/serve.go` or `server.serveH2` would carry a call-path frame
+// to the tracker past the server-rendered title and body; only a label inside
+// an allowed namespace survives.
+//
+//   - An UNKNOWN type (the conventions declare no such type) yields an EMPTY
+//     allow-list, so every label is stripped: fail closed.
+//   - A declared type that names label namespaces (required_label_namespaces,
+//     label_defaults keys, namespaced default_labels) yields those, minus
+//     autonomy.
+//   - A declared type that names NONE (this repository's adr and epic types,
+//     whose only default label is bare) yields the repository's label
+//     vocabulary instead — the union over every declared type, minus autonomy
+//     — so an adr or epic advisory keeps its area/type/phase labels rather than
+//     stripping to nothing (no regression, #4626 approval condition C5).
+//
+// The result is sorted and lowercased.
+func upkeepAdvisoryNamespaces(conv workmgmt.Conventions, typ string) []string {
+	it, ok := conv.Types[typ]
+	if !ok {
+		return []string{}
+	}
+	if own := upkeepNamespacesWithoutAutonomy(workmgmt.TypeLabelNamespaces(it)); len(own) > 0 {
+		return own
+	}
+	var all []string
+	for _, other := range conv.Types {
+		all = append(all, workmgmt.TypeLabelNamespaces(other)...)
+	}
+	return upkeepNamespacesWithoutAutonomy(all)
+}
+
+// upkeepNamespacesWithoutAutonomy lowercases, de-duplicates and sorts nss,
+// dropping the autonomy namespace. The result is never nil.
+func upkeepNamespacesWithoutAutonomy(nss []string) []string {
+	set := map[string]bool{}
+	for _, ns := range nss {
+		if ns = strings.ToLower(strings.TrimSpace(ns)); ns != "" && ns != upkeepAutonomyNamespace {
+			set[ns] = true
+		}
+	}
+	out := make([]string, 0, len(set))
+	for ns := range set {
+		out = append(out, ns)
+	}
+	sort.Strings(out)
+	return out
+}
 
 // upkeepAdvisoryLabels narrows an advisory finding's labels to
-// upkeepAdvisoryLabelNamespaces, appending every other label (an authorized
-// autonomy:* label included) to stripped. Both results are non-nil.
-func upkeepAdvisoryLabels(labels, stripped []string) ([]string, []string) {
+// upkeepAdvisoryNamespaces(conv, typ), appending every other label (an
+// authorized autonomy:* label included) to stripped. Both results are non-nil.
+func upkeepAdvisoryLabels(conv workmgmt.Conventions, typ string, labels, stripped []string) ([]string, []string) {
+	namespaces := upkeepAdvisoryNamespaces(conv, typ)
 	kept := []string{}
 	for _, l := range labels {
 		norm := strings.ToLower(strings.TrimSpace(l))
 		allowed := false
-		for _, ns := range upkeepAdvisoryLabelNamespaces {
-			if strings.HasPrefix(norm, ns) {
+		for _, ns := range namespaces {
+			if strings.HasPrefix(norm, ns+":") {
 				allowed = true
 				break
 			}

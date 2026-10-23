@@ -1609,3 +1609,217 @@ func TestUpkeepRecordedRow_SelectsHighestSequenceForArtifact(t *testing.T) {
 		t.Error("list failure: want an error")
 	}
 }
+
+// ---------------------------------------------------------------------------
+// Conventions-derived advisory label narrowing (ADR-110 guard (i), #4626)
+// ---------------------------------------------------------------------------
+
+// TestUpkeepAdvisory_NamespacesFromConventions drives the apply end to end
+// with conventions whose bug type declares the namespaces {component, type}
+// (no area, no phase): an approved advisory proposing component:x and area:y
+// files component:x and records area:y stripped. The retired literal
+// {area:, type:, phase:} list would do the reverse → red.
+func TestUpkeepAdvisory_NamespacesFromConventions(t *testing.T) {
+	body := ukAdvisoryBody(t, map[string]func(map[string]any){ukAdvNet: func(issue map[string]any) {
+		issue["labels"] = []string{"component:x", "area:y", "type:bug"}
+	}})
+	f := newUkApplyFixture(t, ukApplyOpts{reportBody: body})
+	conv := ukApplyConventions(f.provider.name, false)
+	bug := conv.Types["bug"]
+	bug.RequiredLabelNamespaces = []string{"component"}
+	conv.Types["bug"] = bug
+	installConventions(t, conv, nil)
+	f.grant(t)
+	f.dispose(t, ukAdvNet, upkeepVerdictApproved, false, "")
+	f.apply(t, approval.DecisionApprove)
+
+	reqs := f.provider.requests()
+	if len(reqs) != 1 {
+		t.Fatalf("File calls = %d, want 1", len(reqs))
+	}
+	filed := reqs[0].Item.Classification.Labels
+	for _, want := range []string{"component:x", "type:bug"} {
+		if !hasLabelFold(filed, want) {
+			t.Errorf("filed labels = %v, want %q (a namespace the bug type declares)", filed, want)
+		}
+	}
+	if hasLabelFold(filed, "area:y") {
+		t.Errorf("filed labels = %v, carry area:y although the bug type declares no area namespace", filed)
+	}
+	if row := f.filed(t)[ukAdvNet]; !reflect.DeepEqual(row.StrippedLabels, []string{"area:y"}) {
+		t.Errorf("stripped_labels = %v, want [area:y]", row.StrippedLabels)
+	}
+}
+
+// TestUpkeepAdvisory_UnknownTypeStripsAll pins the fail-closed branch: a type
+// the conventions do not declare has an EMPTY allow-list, so every label —
+// namespaced or not — is stripped, and the advisory namespace set is empty.
+func TestUpkeepAdvisory_UnknownTypeStripsAll(t *testing.T) {
+	conv := parseRepoOwnWorkMgmtDeclaration(t)
+	if got := upkeepAdvisoryNamespaces(conv, "nosuch"); got == nil || len(got) != 0 {
+		t.Errorf("upkeepAdvisoryNamespaces(unknown) = %#v, want an empty non-nil slice", got)
+	}
+	in := []string{"area:backend", "type:bug", "phase:alpha", "server.serveH2"}
+	kept, stripped := upkeepAdvisoryLabels(conv, "nosuch", in, nil)
+	if kept == nil || len(kept) != 0 {
+		t.Errorf("kept = %#v, want an empty non-nil slice for an unknown type", kept)
+	}
+	if !reflect.DeepEqual(stripped, in) {
+		t.Errorf("stripped = %v, want every label %v", stripped, in)
+	}
+}
+
+// TestUpkeepAdvisory_RepoDeclarationParity pins this repository's OWN
+// declaration (read-only): its bug, chore and feature advisories AND its adr
+// and epic advisories (approval condition C5: no regression) allow exactly
+// {area, phase, type} — the retired literal list — and an advisory of each
+// type keeps area:/type:/phase: labels while stripping autonomy:* and a
+// frame-shaped label. adr and epic declare no namespace of their own, so they
+// take the repository's label vocabulary (the union over every declared type);
+// deleting that fallback strips them to nothing → red.
+func TestUpkeepAdvisory_RepoDeclarationParity(t *testing.T) {
+	conv := parseRepoOwnWorkMgmtDeclaration(t)
+	want := []string{"area", "phase", "type"}
+	in := []string{"area:backend", "Type:Bug", "phase:alpha", "autonomy:high", "internal/server/serve.go"}
+	for _, typ := range []string{"bug", "chore", "feature", "adr", "epic"} {
+		t.Run(typ, func(t *testing.T) {
+			if _, ok := conv.Types[typ]; !ok {
+				t.Fatalf("this repository's declaration has no %q type", typ)
+			}
+			if got := upkeepAdvisoryNamespaces(conv, typ); !reflect.DeepEqual(got, want) {
+				t.Errorf("upkeepAdvisoryNamespaces(%s) = %v, want %v", typ, got, want)
+			}
+			kept, stripped := upkeepAdvisoryLabels(conv, typ, in, nil)
+			if wantKept := []string{"area:backend", "Type:Bug", "phase:alpha"}; !reflect.DeepEqual(kept, wantKept) {
+				t.Errorf("kept = %v, want %v", kept, wantKept)
+			}
+			if wantStripped := []string{"autonomy:high", "internal/server/serve.go"}; !reflect.DeepEqual(stripped, wantStripped) {
+				t.Errorf("stripped = %v, want %v", stripped, wantStripped)
+			}
+		})
+	}
+}
+
+// upkeepNonFishhawkConventionsYAML is a NON-Fishhawk repository's committed
+// .fishhawk/work-management.yaml (#4626 approval condition C5): its types
+// declare DIFFERENT label namespaces — defect names component + team (and
+// autonomy, twice over), task names area (and a namespaced kind:task default),
+// decision names none (its only default label is bare) — so the three
+// upkeepAdvisoryNamespaces rules, which coincide on this repository's own
+// declaration, give three different answers here.
+const upkeepNonFishhawkConventionsYAML = `
+spec_version: work-management-v0
+provider: github_projects
+required_fields: [Summary, Done-means, complexity]
+types:
+  defect:
+    body_skeleton: [Summary]
+    required_label_namespaces: [component, team, autonomy]
+    label_defaults: {autonomy: "autonomy:low"}
+  task:
+    body_skeleton: [Summary]
+    required_label_namespaces: [area]
+    default_labels: ["kind:task"]
+  decision:
+    body_skeleton: [Summary]
+    default_labels: [decision]
+`
+
+// TestUpkeepAdvisoryNamespaces_NonFishhawkFixture pins each arm of the
+// first-officer rule (#4626 approval condition C5) on a non-Fishhawk
+// declaration parsed through the real workmgmt.Parse:
+//
+//	(a) a declared type naming its own namespaces uses EXACTLY those, minus
+//	    autonomy — defect gets {component, team}, BELOW the union;
+//	(b) a declared type naming NONE gets the UNION of every declared type's
+//	    namespaces, minus autonomy — decision gets {area, component, kind, team};
+//	(c) an undeclared type gets the EMPTY set (fail closed).
+//
+// Each row names the mutation it turns RED; on this repository's declaration
+// all three rules coincide at {area, phase, type}, which is why
+// TestUpkeepAdvisory_RepoDeclarationParity alone cannot catch them.
+func TestUpkeepAdvisoryNamespaces_NonFishhawkFixture(t *testing.T) {
+	conv, err := workmgmt.Parse(strings.NewReader(upkeepNonFishhawkConventionsYAML))
+	if err != nil {
+		t.Fatalf("parse fixture: %v", err)
+	}
+	union := []string{"area", "component", "kind", "team"}
+	cases := []struct {
+		name    string
+		typ     string
+		want    []string
+		catches string
+	}{
+		{"(a) explicit declaration narrows below the union", "defect", []string{"component", "team"},
+			"the explicit declaration ignored (union always used); autonomy not excluded"},
+		{"(a) a second explicit declaration", "task", []string{"area", "kind"},
+			"the explicit declaration ignored (union always used)"},
+		{"(b) a type naming none takes the exact union", "decision", union,
+			"the union replaced by the literal area/type/phase list; autonomy not excluded"},
+		{"(c) an undeclared type is empty", "nosuch", []string{},
+			"an undeclared type falling through to the union"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upkeepAdvisoryNamespaces(conv, tc.typ); got == nil || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("upkeepAdvisoryNamespaces(%s) = %#v, want %#v (catches: %s)", tc.typ, got, tc.want, tc.catches)
+			}
+		})
+	}
+
+	// Label level: a defect advisory keeps only its own namespaces, so an
+	// area label — in the repository's vocabulary but not the defect type's —
+	// and an authorized autonomy tier are both stripped.
+	in := []string{"component:ui", "team:core", "area:x", "autonomy:high", "server.serveH2"}
+	kept, stripped := upkeepAdvisoryLabels(conv, "defect", in, nil)
+	if want := []string{"component:ui", "team:core"}; !reflect.DeepEqual(kept, want) {
+		t.Errorf("defect kept = %v, want %v", kept, want)
+	}
+	if want := []string{"area:x", "autonomy:high", "server.serveH2"}; !reflect.DeepEqual(stripped, want) {
+		t.Errorf("defect stripped = %v, want %v", stripped, want)
+	}
+	// A decision advisory keeps every vocabulary label, never autonomy.
+	kept, stripped = upkeepAdvisoryLabels(conv, "decision", in, nil)
+	if want := []string{"component:ui", "team:core", "area:x"}; !reflect.DeepEqual(kept, want) {
+		t.Errorf("decision kept = %v, want %v", kept, want)
+	}
+	if want := []string{"autonomy:high", "server.serveH2"}; !reflect.DeepEqual(stripped, want) {
+		t.Errorf("decision stripped = %v, want %v", stripped, want)
+	}
+}
+
+// TestUpkeepAdvisoryNamespaces_Branches table-drives the derivation's three
+// branches on synthetic conventions: own namespaces (autonomy dropped,
+// lowercased), the vocabulary fallback for a type naming none, and an empty
+// vocabulary when no declared type names any namespace.
+func TestUpkeepAdvisoryNamespaces_Branches(t *testing.T) {
+	conv := workmgmt.Conventions{Types: map[string]workmgmt.ItemType{
+		"bug": {
+			RequiredLabelNamespaces: []string{"Component", "autonomy"},
+			LabelDefaults:           map[string]string{"autonomy": "autonomy:low"},
+			DefaultLabels:           []string{"kind:bug"},
+		},
+		"note":   {DefaultLabels: []string{"note"}},
+		"other":  {RequiredLabelNamespaces: []string{"team"}},
+		"plain2": {},
+	}}
+	bare := workmgmt.Conventions{Types: map[string]workmgmt.ItemType{"note": {DefaultLabels: []string{"note"}}}}
+	cases := []struct {
+		name string
+		conv workmgmt.Conventions
+		typ  string
+		want []string
+	}{
+		{"own namespaces, autonomy dropped", conv, "bug", []string{"component", "kind"}},
+		{"type naming none takes the vocabulary", conv, "note", []string{"component", "kind", "team"}},
+		{"no namespace anywhere", bare, "note", []string{}},
+		{"unknown type", conv, "nosuch", []string{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := upkeepAdvisoryNamespaces(tc.conv, tc.typ); got == nil || !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("upkeepAdvisoryNamespaces(%s) = %#v, want %#v", tc.typ, got, tc.want)
+			}
+		})
+	}
+}

@@ -1,0 +1,56 @@
+You are a work-decomposition drafting agent for the Fishhawk work tracker.
+Turn the brief below into a structured epic-with-children draft.
+
+Brief:
+Render the draft_epic preview with the target repository's declared conventions.
+
+Output CONTRACT — read carefully:
+- Output EXACTLY ONE JSON object and NOTHING else: no prose before or after, no markdown code fence.
+- The object MUST match this JSON Schema exactly. Every field listed is REQUIRED; do NOT add any field not listed (unknown fields are rejected):
+
+{
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["epic", "children"],
+  "properties": {
+    "epic": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["summary", "scope", "out_of_scope"],
+      "properties": {
+        "summary": {"type": "string"},
+        "scope": {"type": "string"},
+        "out_of_scope": {"type": "string"}
+      }
+    },
+    "children": {
+      "type": "array",
+      "minItems": 1,
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["summary", "proposal", "done_means", "acceptance_criteria", "labels", "depends_on"],
+        "properties": {
+          "summary": {"type": "string"},
+          "proposal": {"type": "string"},
+          "done_means": {"type": "string"},
+          "acceptance_criteria": {"type": "array", "items": {"type": "string"}},
+          "labels": {"type": "array", "items": {"type": "string"}},
+          "depends_on": {"type": "array", "items": {"type": "integer"}}
+        }
+      }
+    }
+  }
+}
+
+Field-by-field, the CLOSED field set is:
+- epic.summary: string — one-line epic title.
+- epic.scope: string — what the epic covers.
+- epic.out_of_scope: string — what the epic explicitly excludes (empty string if none).
+- children: array with at least one element. Each element is an object with EXACTLY these fields:
+  - summary: string — one-line child title.
+  - proposal: string — what the child does and how.
+  - done_means: string — the completion criterion in prose.
+  - acceptance_criteria: array of strings — at least one concrete, checkable criterion.
+  - labels: array of strings — classification labels. Include a label in each of these namespaces: area, autonomy, phase (e.g. area:backend, autonomy:medium).
+  - depends_on: array of integers — 1-BASED ordinals of OTHER children in this same array that must finish first (the first child is 1, the second is 2, ...). Use an empty array for a child with no dependencies. Do NOT reference an ordinal outside the array and do NOT reference a child's own ordinal.

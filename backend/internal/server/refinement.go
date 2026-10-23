@@ -9,6 +9,17 @@ package server
 // DERIVED (refinement.ResolveState) — an edit after approval lands a new
 // revision that structurally invalidates the approval.
 //
+// REPO-SCOPED CONVENTIONS (ADR-110 / ADR-114, #4626). A session may name its
+// target repo at open; the repo is persisted on every revision. Drafting,
+// preview, edit, decision and filing resolve THAT repo's work-management
+// conventions through the conventionsResolver seam. The shipped default
+// applies only to a repo-less session (no_repo) or a repo that declares
+// nothing (not_declared); a pre-fetch fall-through degrades with its named
+// reason in the view's conventions_source block. A resolution ERROR is never
+// replaced by a fallback: it answers 502 refinement_conventions_unavailable,
+// and every writing arm resolves BEFORE it audits or persists, so a refusal
+// records nothing.
+//
 // AUDIT ORDERING (operator binding condition, gpt-5.5's HIGH concern): no gate
 // action persists unaudited. Every edit / decision appends its audit entry via
 // AppendGlobalChained BEFORE the refinement write (durable-before-state-change,
@@ -35,9 +46,10 @@ import (
 // RefinementDrafter runs the E34.1 drafting agent for a brief. Its signature
 // matches (*refinement.Drafter).Draft exactly, so the concrete Drafter
 // satisfies it structurally and tests can fake it. Only the agent-backed arms
-// (create-session, brief-amendment) call it.
+// (create-session, brief-amendment) call it, passing the session's resolved
+// conventions (ADR-114 / #4626).
 type RefinementDrafter interface {
-	Draft(ctx context.Context, sessionID uuid.UUID, brief string) (refinement.EpicDraft, string, error)
+	Draft(ctx context.Context, sessionID uuid.UUID, brief string, conv workmgmt.Conventions) (refinement.EpicDraft, string, error)
 }
 
 const (
@@ -70,6 +82,10 @@ const (
 
 type createRefinementSessionRequest struct {
 	Brief string `json:"brief"`
+	// Repo optionally scopes the session to its target repository
+	// ("owner/name", ADR-114 / #4626): the preview renders that repo's
+	// declared conventions, and the file arm refuses any other repo.
+	Repo string `json:"repo,omitempty"`
 }
 
 type patchRefinementDraftRequest struct {
@@ -119,6 +135,30 @@ type refinementSessionView struct {
 	// the latest revision and none is in flight. When the filing session has
 	// completed, State is "filed".
 	Filing *refinementFilingView `json:"filing,omitempty"`
+	// ConventionsSource names which work-management conventions rendered the
+	// preview (ADR-114 / #4626). Always present.
+	ConventionsSource refinementConventionsSourceView `json:"conventions_source"`
+}
+
+// refinementConventionsSourceView is the conventions_source block on the
+// session view and the file-arm response: the resolved repo (omitted for a
+// repo-less session), the resolution state (declared / not_declared /
+// degraded / no_repo), the degraded reason (degraded only) and the fallback
+// kind (every state except declared).
+type refinementConventionsSourceView struct {
+	Repo           string `json:"repo,omitempty"`
+	State          string `json:"state"`
+	DegradedReason string `json:"degraded_reason,omitempty"`
+	Fallback       string `json:"fallback,omitempty"`
+}
+
+func conventionsSourceView(res ConventionsResolution) refinementConventionsSourceView {
+	return refinementConventionsSourceView{
+		Repo:           res.Repo,
+		State:          res.State,
+		DegradedReason: res.DegradedReason,
+		Fallback:       res.Fallback,
+	}
 }
 
 // refinementFilingView is the session view's filing block (#4153). State is
@@ -149,6 +189,14 @@ type refinementFilingView struct {
 // session, run the Drafter over the brief, persist the initial revision
 // (origin=brief), and return the session view. Needs both the repository and
 // the (agent-backed) drafter.
+//
+// An optional repo scopes the session (ADR-114 / #4626): a malformed value is
+// 400; a cookie caller without read visibility of the repo is 403
+// repo_forbidden BEFORE anything is fetched (the ADR-114-ratified exception to
+// #2071's read-only mirror scoping — opening a repo-scoped session fetches and
+// exposes that repo's declaration); the conventions are resolved BEFORE the
+// drafter runs (502 refinement_conventions_unavailable on error, nothing
+// recorded) and the repo is persisted on the revision.
 func (s *Server) handleCreateRefinementSession(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, scopeRefinementGate) {
 		return
@@ -170,6 +218,26 @@ func (s *Server) handleCreateRefinementSession(w http.ResponseWriter, r *http.Re
 			"brief is required", map[string]any{"field": "brief"})
 		return
 	}
+	repo := ""
+	if strings.TrimSpace(req.Repo) != "" {
+		owner, name, valid := splitRepoFullName(req.Repo)
+		if !valid {
+			s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+				"repo must be in owner/name form", map[string]any{"field": "repo", "got": req.Repo})
+			return
+		}
+		repo = owner + "/" + name
+		// Visibility BEFORE resolution: a non-visible repo's declaration is
+		// never fetched. Bearer / MCP callers and admins have a nil filter,
+		// matching the file arm's posture.
+		filter, ok := s.requestRepoFilter(w, r)
+		if !ok {
+			return
+		}
+		if filter != nil && !s.repoVisibleOr403(w, r, filter, repo) {
+			return
+		}
+	}
 
 	// Detach drafting+persist from the request lifetime (#584 precedent,
 	// plan.go:1094). The drafting agent runs for minutes; if the MCP client
@@ -184,8 +252,13 @@ func (s *Server) handleCreateRefinementSession(w http.ResponseWriter, r *http.Re
 	defer cancel()
 	r = r.WithContext(ctx)
 
+	res, ok := s.resolveRefinementConventionsOr502(w, r, repo)
+	if !ok {
+		return
+	}
+
 	sessionID := uuid.New()
-	draft, model, err := s.cfg.RefinementDrafter.Draft(r.Context(), sessionID, req.Brief)
+	draft, model, err := s.cfg.RefinementDrafter.Draft(r.Context(), sessionID, req.Brief, res.Conventions)
 	if err != nil {
 		s.writeError(w, r, http.StatusBadGateway, "refinement_drafting_failed",
 			"the drafting agent failed to produce a valid draft",
@@ -206,13 +279,16 @@ func (s *Server) handleCreateRefinementSession(w http.ResponseWriter, r *http.Re
 		// stamp their account; bearer / MCP callers (no AccountID until E44.5)
 		// stamp NULL and read back under the NULL-allow window.
 		AccountID: identityAccountID(r.Context()),
+		// The open-time target repo (empty = none), carried onto every later
+		// revision and pinned against the file arm.
+		Repo: repo,
 	}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not persist the refinement draft", map[string]any{"error": err.Error()})
 		return
 	}
 
-	s.respondRefinementSession(w, r, http.StatusCreated, sessionID)
+	s.respondRefinementSession(w, r, http.StatusCreated, sessionID, res)
 }
 
 // handleGetRefinementSession implements GET /v0/refinement/sessions/{id}.
@@ -229,17 +305,25 @@ func (s *Server) handleGetRefinementSession(w http.ResponseWriter, r *http.Reque
 	}
 	// A session with no revisions is unknown; respondRefinementSession re-loads
 	// the current drafts + decisions to build the view.
-	if _, ok := s.loadRefinementSession(w, r, sessionID); !ok {
+	drafts, ok := s.loadRefinementSession(w, r, sessionID)
+	if !ok {
 		return
 	}
-	s.respondRefinementSession(w, r, http.StatusOK, sessionID)
+	res, ok := s.resolveSessionConventionsOr502(w, r, drafts)
+	if !ok {
+		return
+	}
+	s.respondRefinementSession(w, r, http.StatusOK, sessionID, res)
 }
 
 // handlePatchRefinementDraft implements PATCH
 // /v0/refinement/sessions/{id}/draft: exactly one of brief_amendment (re-run
 // the Drafter) or draft (direct strict-decoded edit). Each successful edit
 // appends a NEW revision — invalidating a prior approval — and writes a
-// refinement_draft_edited audit entry BEFORE the persist.
+// refinement_draft_edited audit entry BEFORE the persist. The session's
+// conventions are resolved BEFORE the drafter, the audit append and the
+// persist (ADR-114 / #4626), so a 502 records nothing; the latest revision's
+// open-time repo is carried onto the new revision.
 func (s *Server) handlePatchRefinementDraft(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, scopeRefinementGate) {
 		return
@@ -283,23 +367,6 @@ func (s *Server) handlePatchRefinementDraft(w http.ResponseWriter, r *http.Reque
 			s.writeRefinementDraftingUnavailable(w, r)
 			return
 		}
-		// Detach the agent re-draft+persist from the request lifetime, exactly as
-		// the open arm does — same disconnect-survival rationale. Plain `r =`
-		// assignment so the shared audit+persist tail after the if/else inherits
-		// the detached, budgeted context. The direct-edit arm below keeps the
-		// original request context (no agent call, nothing to survive).
-		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), refinementDraftBudget)
-		defer cancel()
-		r = r.WithContext(ctx)
-		newBrief = strings.TrimRight(latest.Brief, "\n") + "\n\n" + strings.TrimSpace(req.BriefAmendment)
-		d, m, err := s.cfg.RefinementDrafter.Draft(r.Context(), sessionID, newBrief)
-		if err != nil {
-			s.writeError(w, r, http.StatusBadGateway, "refinement_drafting_failed",
-				"the drafting agent failed to produce a valid draft",
-				map[string]any{"error": err.Error()})
-			return
-		}
-		newDraft, model, origin = d, m, refinement.OriginAmendment
 	} else {
 		// Direct field edit: strict decode + Validate, no agent call. The stored
 		// brief carries forward unchanged.
@@ -315,6 +382,33 @@ func (s *Server) handlePatchRefinementDraft(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		newDraft, newBrief, origin = d, latest.Brief, refinement.OriginEdit
+	}
+
+	// Resolve BEFORE the drafter, the audit append and the persist: a 502
+	// here records nothing (both arms).
+	res, ok := s.resolveSessionConventionsOr502(w, r, drafts)
+	if !ok {
+		return
+	}
+
+	if hasAmendment {
+		// Detach the agent re-draft+persist from the request lifetime, exactly as
+		// the open arm does — same disconnect-survival rationale. Plain `r =`
+		// assignment so the shared audit+persist tail after the if/else inherits
+		// the detached, budgeted context. The direct-edit arm below keeps the
+		// original request context (no agent call, nothing to survive).
+		ctx, cancel := context.WithTimeout(context.WithoutCancel(r.Context()), refinementDraftBudget)
+		defer cancel()
+		r = r.WithContext(ctx)
+		newBrief = strings.TrimRight(latest.Brief, "\n") + "\n\n" + strings.TrimSpace(req.BriefAmendment)
+		d, m, err := s.cfg.RefinementDrafter.Draft(r.Context(), sessionID, newBrief, res.Conventions)
+		if err != nil {
+			s.writeError(w, r, http.StatusBadGateway, "refinement_drafting_failed",
+				"the drafting agent failed to produce a valid draft",
+				map[string]any{"error": err.Error()})
+			return
+		}
+		newDraft, model, origin = d, m, refinement.OriginAmendment
 	}
 
 	hash, err := refinement.ContentHash(newDraft)
@@ -351,19 +445,24 @@ func (s *Server) handlePatchRefinementDraft(w http.ResponseWriter, r *http.Reque
 		// same-account amendment is a no-op change and a cross-account writer is
 		// already refused by loadRefinementSession above.
 		AccountID: identityAccountID(r.Context()),
+		// Carry the open-time repo forward (ADR-114 / #4626), so the session
+		// stays repo-scoped across revisions.
+		Repo: latest.Repo,
 	}); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not persist the edited revision", map[string]any{"error": err.Error()})
 		return
 	}
 
-	s.respondRefinementSession(w, r, http.StatusOK, sessionID)
+	s.respondRefinementSession(w, r, http.StatusOK, sessionID, res)
 }
 
 // handleDecideRefinementSession implements POST
 // /v0/refinement/sessions/{id}/decision: record an approve/reject pinning the
 // latest revision id + content hash, writing the decision audit entry BEFORE
-// the persist.
+// the persist. The session's conventions are resolved BEFORE the audit append
+// and RecordDecision (ADR-114 / #4626): approving a preview that cannot be
+// rendered would be approving it blind, so a 502 records nothing.
 func (s *Server) handleDecideRefinementSession(w http.ResponseWriter, r *http.Request) {
 	if !s.requireWriteScope(w, r, scopeRefinementGate) {
 		return
@@ -425,6 +524,11 @@ func (s *Server) handleDecideRefinementSession(w http.ResponseWriter, r *http.Re
 	}
 	subject := IdentityFrom(r.Context()).Subject
 
+	conventions, ok := s.resolveSessionConventionsOr502(w, r, drafts)
+	if !ok {
+		return
+	}
+
 	category := "refinement_draft_approved"
 	if req.Decision == refinement.DecisionRejected {
 		category = "refinement_draft_rejected"
@@ -453,7 +557,7 @@ func (s *Server) handleDecideRefinementSession(w http.ResponseWriter, r *http.Re
 		return
 	}
 
-	s.respondRefinementSession(w, r, http.StatusOK, sessionID)
+	s.respondRefinementSession(w, r, http.StatusOK, sessionID, conventions)
 }
 
 // ---- helpers --------------------------------------------------------------
@@ -574,16 +678,17 @@ func (s *Server) enforceRefinementAccount(w http.ResponseWriter, r *http.Request
 // enforceRefinementRepoVisibility applies repo filtering to a refinement
 // session. Returns true when the request may proceed.
 //
-// A refinement session's repo is the repo its FILING session pinned. That is
-// the session's only durable repo: refinement.StoredDraft carries brief,
-// draft, model and origin — no repo — because a session starts life as a
-// brief, before any target repo has been chosen. The repo is pinned exactly
-// once, at first filing invoke (refinement.FilingSession.Repo, E34.3 / #1594),
-// and a re-invoke naming a different repo fails closed there.
+// A refinement session's repo is its OPEN-TIME repo when it was opened
+// repo-scoped (refinement.StoredDraft.Repo, carried onto every revision,
+// ADR-114 / #4626), else the repo its FILING session pinned (pinned exactly
+// once, at first filing invoke — refinement.FilingSession.Repo, E34.3 /
+// #1594 — and a re-invoke naming a different repo fails closed there). A
+// session opened with only a brief has no repo until it is filed.
 //
-// So the gate is: a session that HAS been filed authorizes against its pinned
-// repo for finer, repo-level scoping. A session that has NOT been filed has no
-// repo to authorize against here — but it is no longer reachable workspace-wide:
+// So the gate is: a repo-scoped or filed session authorizes against its repo
+// for finer, repo-level scoping — an UNFILED repo-scoped session included. A
+// session with neither has no repo to authorize against here — but it is no
+// longer reachable workspace-wide:
 // the authoritative account-ownership gate (enforceRefinementAccount, E44.24 /
 // #2115) runs BEFORE this mirror and refuses a cross-account caller on the
 // creation-time account marker, so the unfiled-session exposure this comment
@@ -617,10 +722,14 @@ func (s *Server) enforceRefinementRepoVisibility(w http.ResponseWriter, r *http.
 	return s.repoVisibleOr403(w, r, filter, repo)
 }
 
-// refinementSessionRepo returns the repo pinned by the session's filing
-// session, if one has been opened. found=false means the session has not been
-// filed and therefore has no repo.
+// refinementSessionRepo returns the session's target repo: the latest
+// revision's open-time repo (ADR-114 / #4626), else the repo pinned by the
+// session's filing session, if one has been opened. found=false means the
+// session was opened without a repo and has not been filed.
 func (s *Server) refinementSessionRepo(ctx context.Context, drafts []*refinement.StoredDraft) (string, bool, error) {
+	if repo := drafts[len(drafts)-1].Repo; repo != "" {
+		return repo, true, nil
+	}
 	for i := len(drafts) - 1; i >= 0; i-- {
 		fs, err := s.cfg.RefinementRepo.GetFilingSession(ctx, drafts[i].ID)
 		if errors.Is(err, refinement.ErrNotFound) {
@@ -634,6 +743,57 @@ func (s *Server) refinementSessionRepo(ctx context.Context, drafts []*refinement
 		}
 	}
 	return "", false, nil
+}
+
+// refinementTargetRepo returns the repo whose conventions render the session:
+// the open-time repo, else the filing-pinned repo, else "" (no_repo).
+func (s *Server) refinementTargetRepo(ctx context.Context, drafts []*refinement.StoredDraft) (string, error) {
+	repo, _, err := s.refinementSessionRepo(ctx, drafts)
+	return repo, err
+}
+
+// resolveRefinementConventions resolves the work-management conventions for a
+// refinement session's target repo (ADR-110 / ADR-114, #4626). An empty repo
+// is no_repo over the shipped default; otherwise it is the conventionsResolver
+// seam's answer. A resolver error is returned as-is and NEVER replaced by a
+// fallback.
+func (*Server) resolveRefinementConventions(ctx context.Context, repo string) (ConventionsResolution, error) {
+	if repo == "" {
+		return ConventionsResolution{
+			Conventions: workmgmt.Default(),
+			State:       ConventionsStateNoRepo,
+			Fallback:    ConventionsFallbackShippedDefault,
+		}, nil
+	}
+	return conventionsResolver(ctx, repo)
+}
+
+// resolveRefinementConventionsOr502 is resolveRefinementConventions writing
+// 502 refinement_conventions_unavailable on error. Details carry {repo} only;
+// the cause rides internalCauseKey to the operator log (the errors.go 5xx
+// default-deny convention), never the caller.
+func (s *Server) resolveRefinementConventionsOr502(w http.ResponseWriter, r *http.Request, repo string) (ConventionsResolution, bool) {
+	res, err := s.resolveRefinementConventions(r.Context(), repo)
+	if err != nil {
+		s.writeError(w, r, http.StatusBadGateway, "refinement_conventions_unavailable",
+			"could not resolve the target repository's work-management conventions; nothing was recorded",
+			map[string]any{"repo": repo, internalCauseKey: err.Error()})
+		return ConventionsResolution{}, false
+	}
+	return res, true
+}
+
+// resolveSessionConventionsOr502 resolves an existing session's target repo
+// and then its conventions. A filing-session lookup fault is 500; a
+// resolution fault is 502 refinement_conventions_unavailable.
+func (s *Server) resolveSessionConventionsOr502(w http.ResponseWriter, r *http.Request, drafts []*refinement.StoredDraft) (ConventionsResolution, bool) {
+	repo, err := s.refinementTargetRepo(r.Context(), drafts)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+			"could not load the refinement session's target repo", map[string]any{internalCauseKey: err.Error()})
+		return ConventionsResolution{}, false
+	}
+	return s.resolveRefinementConventionsOr502(w, r, repo)
 }
 
 // decodeRefinementBody strict-decodes a bounded request body into dst, writing
@@ -701,8 +861,10 @@ func (s *Server) appendRefinementAuditCtx(ctx context.Context, category string, 
 
 // respondRefinementSession loads the session's current drafts + decisions,
 // derives the view (state, revision count, preview, wave DAG, decision
-// history), and writes it at status.
-func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request, status int, sessionID uuid.UUID) {
+// history), and writes it at status. conv is the session's ALREADY-resolved
+// conventions (the caller resolved before persisting anything), so the
+// response never resolves a second time.
+func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request, status int, sessionID uuid.UUID, conv ConventionsResolution) {
 	drafts, err := s.cfg.RefinementRepo.ListForSession(r.Context(), sessionID)
 	if err != nil || len(drafts) == 0 {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -723,7 +885,7 @@ func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request
 	}
 
 	latest := drafts[len(drafts)-1]
-	preview, err := refinement.RenderDraft(latest.Draft, refinement.RenderOptions{}, workmgmt.Default())
+	preview, err := refinement.RenderDraft(latest.Draft, refinement.RenderOptions{}, conv.Conventions)
 	if err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"could not render the filing preview", map[string]any{"error": err.Error()})
@@ -748,17 +910,18 @@ func (s *Server) respondRefinementSession(w http.ResponseWriter, r *http.Request
 	}
 
 	view := refinementSessionView{
-		SessionID:        sessionID,
-		State:            state,
-		Drifted:          res.Drifted,
-		RevisionCount:    len(drafts),
-		LatestOrigin:     latest.Origin,
-		LatestDraft:      latest.Draft,
-		Preview:          preview,
-		Waves:            waves,
-		CriteriaPrecheck: refinement.EvaluateDraftCriteria(latest.Draft),
-		Decisions:        make([]refinementDecisionView, 0, len(decisions)),
-		Filing:           filing,
+		SessionID:         sessionID,
+		State:             state,
+		Drifted:           res.Drifted,
+		RevisionCount:     len(drafts),
+		LatestOrigin:      latest.Origin,
+		LatestDraft:       latest.Draft,
+		Preview:           preview,
+		Waves:             waves,
+		CriteriaPrecheck:  refinement.EvaluateDraftCriteria(latest.Draft),
+		Decisions:         make([]refinementDecisionView, 0, len(decisions)),
+		Filing:            filing,
+		ConventionsSource: conventionsSourceView(conv),
 	}
 	for _, d := range decisions {
 		view.Decisions = append(view.Decisions, refinementDecisionView{

@@ -1,6 +1,11 @@
 package refinement
 
 import (
+	"bytes"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
 	"reflect"
 	"strconv"
 	"strings"
@@ -8,6 +13,140 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
+
+// pkgSrcDir is this package's source directory, captured at init (the test
+// binary's working directory is the package dir). Fixture paths anchor on it,
+// never on runtime.Caller, whose file name is module-relative under -trimpath
+// (the testanchor rule, #4179).
+var pkgSrcDir = mustGetwd()
+
+func mustGetwd() string {
+	dir, err := os.Getwd()
+	if err != nil {
+		panic(fmt.Sprintf("pkgSrcDir: os.Getwd: %v", err))
+	}
+	return dir
+}
+
+// repoDeclarationGoldenPath is the pinned draft_epic preview of this
+// repository's own work-management declaration (ADR-110 / ADR-114, #4626).
+const repoDeclarationGoldenPath = "testdata/repo-declaration-preview.golden.json"
+
+// repoDeclarationGolden is the golden file's shape: the input draft travels
+// with its rendered preview, so an operator's live walk can replay the exact
+// draft through the direct-edit arm and compare the session view's preview.
+type repoDeclarationGolden struct {
+	Draft   EpicDraft           `json:"draft"`
+	Preview []workmgmt.WorkItem `json:"preview"`
+}
+
+// repoDeclarationGoldenDraft is the golden's fixed input: an epic whose
+// out_of_scope is folded into its Scope section, plus three children — one
+// carrying area + phase (autonomy defaulted), one carrying area only (phase
+// reported missing), and one with depends_on edges onto both siblings and an
+// explicit autonomy label.
+func repoDeclarationGoldenDraft() EpicDraft {
+	return EpicDraft{
+		Epic: EpicSpec{
+			Summary:    "Repo-scoped refinement previews",
+			Scope:      "Render the draft_epic preview with the target repository's declared conventions.",
+			OutOfScope: "Neutralising the shipped default.",
+		},
+		Children: []ChildDraft{
+			{
+				Summary:            "Persist the open-time repo",
+				Proposal:           "Add a nullable repo column to refinement_drafts.",
+				DoneMeans:          "A repo-scoped session reads its repo back on every revision.",
+				AcceptanceCriteria: []string{"the repo round-trips", "an empty repo is stored as NULL"},
+				Labels:             []string{"area:backend", "phase:beta"},
+			},
+			{
+				Summary:            "Name each conventions fall-through",
+				Proposal:           "Resolve reports declared, not_declared, degraded or no_repo.",
+				DoneMeans:          "A degraded resolution names its reason.",
+				AcceptanceCriteria: []string{"each pre-fetch fall-through has a named reason"},
+				Labels:             []string{"area:backend"},
+			},
+			{
+				Summary:            "Render the preview from the resolved conventions",
+				Proposal:           "Route drafting, preview and filing through the resolver.",
+				DoneMeans:          "The preview matches this golden.",
+				AcceptanceCriteria: []string{"the preview is byte-equal to the golden"},
+				Labels:             []string{"area:backend", "phase:beta", "autonomy:low"},
+				DependsOn:          []int{1, 2},
+			},
+		},
+	}
+}
+
+// renderRepoDeclarationGolden renders the fixed draft through RenderDraft with
+// conv and marshals {draft, preview} with two-space indentation and a trailing
+// newline: the golden file's exact byte form.
+func renderRepoDeclarationGolden(t *testing.T, conv workmgmt.Conventions) []byte {
+	t.Helper()
+	draft := repoDeclarationGoldenDraft()
+	if err := draft.Validate(); err != nil {
+		t.Fatalf("golden draft fails Validate: %v", err)
+	}
+	preview, err := RenderDraft(draft, RenderOptions{}, conv)
+	if err != nil {
+		t.Fatalf("RenderDraft: %v", err)
+	}
+	out, err := json.MarshalIndent(repoDeclarationGolden{Draft: draft, Preview: preview}, "", "  ")
+	if err != nil {
+		t.Fatalf("marshal golden: %v", err)
+	}
+	return append(out, '\n')
+}
+
+// TestRenderDraft_RepoDeclarationGolden pins this repository's draft_epic
+// preview (ADR-110 / ADR-114, #4626) BEFORE refinement moves onto the per-repo
+// conventions loader. The golden was generated once from the unmodified
+// production call RenderDraft(draft, RenderOptions{}, workmgmt.Default()) and
+// committed; there is deliberately no -update flag, because a self-blessing
+// flag would let a regression rewrite its own golden.
+//
+// Determinism (approval condition C6): every field RenderDraft populates on a
+// workmgmt.WorkItem was inspected — Type, Title, Body, Classification (Labels,
+// Complexity, DefaultedLabels, MissingLabelNamespaces), BoardPlacement and
+// Relations. None carries a UUID, an idempotency key or a timestamp; the body
+// is assembled in body_skeleton order, label defaults are walked in sorted key
+// order and the missing-namespace list is sorted, so no field depends on map
+// iteration order. The whole item is therefore compared, not a projection.
+//
+// Two assertions:
+//   - this repository's OWN declaration (.fishhawk/work-management.yaml, parsed
+//     read-only) renders exactly the golden bytes; and
+//   - the PRE-MOVE WITNESS: workmgmt.Default() renders the same bytes today,
+//     because the two differ only in the project block, which RenderDraft
+//     never reads. The ADR-110 neutralisation follow-up deletes this witness
+//     when it strips the default's Project-7 shape.
+func TestRenderDraft_RepoDeclarationGolden(t *testing.T) {
+	want, err := os.ReadFile(filepath.Join(pkgSrcDir, repoDeclarationGoldenPath))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+
+	declPath := filepath.Join(pkgSrcDir, "..", "..", "..", ".fishhawk", "work-management.yaml")
+	f, err := os.Open(declPath)
+	if err != nil {
+		t.Fatalf("open %s: %v — this repository's own declaration must exist", declPath, err)
+	}
+	defer f.Close()
+	conv, err := workmgmt.Parse(f)
+	if err != nil {
+		t.Fatalf("Parse(%s): %v", declPath, err)
+	}
+
+	if got := renderRepoDeclarationGolden(t, conv); !bytes.Equal(got, want) {
+		t.Errorf("RenderDraft with this repository's declaration diverged from %s:\n--- got ---\n%s\n--- want ---\n%s", repoDeclarationGoldenPath, got, want)
+	}
+
+	// Pre-move witness: delete with the shipped default's neutralisation.
+	if got := renderRepoDeclarationGolden(t, workmgmt.Default()); !bytes.Equal(got, want) {
+		t.Errorf("RenderDraft with workmgmt.Default() diverged from %s (pre-move witness):\n--- got ---\n%s\n--- want ---\n%s", repoDeclarationGoldenPath, got, want)
+	}
+}
 
 // equivalentChildRequest builds the FilingRequest RenderChild routes through
 // Apply, so the byte-compat test can call Apply directly with the SAME inputs

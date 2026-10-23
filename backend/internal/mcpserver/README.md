@@ -2813,7 +2813,7 @@ tool with arms keeps the registry at +1). The arms' 1:1 endpoint mapping:
 
 | Arm | Trigger fields | Endpoint |
 |---|---|---|
-| open | `brief` alone | `POST /v0/refinement/sessions` |
+| open | `brief`, optionally + `repo` | `POST /v0/refinement/sessions` |
 | preview | `session_id` alone | `GET /v0/refinement/sessions/{id}` |
 | edit | `session_id` + exactly one of `brief_amendment` \| `draft` | `PATCH /v0/refinement/sessions/{id}/draft` |
 | decide | `session_id` + `decision` (`approved` \| `rejected`) + required `reason` | `POST /v0/refinement/sessions/{id}/decision` |
@@ -2822,7 +2822,20 @@ tool with arms keeps the registry at +1). The arms' 1:1 endpoint mapping:
 `brief_amendment` is the agent re-draft, bounded by a per-session budget of **3**; `draft` is a direct strict-decoded
 `EpicDraft` field edit, unbudgeted. Arm classification lives in `draftEpic`: it fails closed with NO HTTP call
 (`armError` + the `legalArmsHelp` enumeration) when zero arms or an illegal combination is populated (e.g. `brief` with
-any other field, both edit sub-arms, or >1 session sub-arm).
+any field other than `repo`, both edit sub-arms, or >1 session sub-arm). `session_id` + `repo` is still the file arm.
+
+**Repo-scoped open (ADR-114 / #4626).** `brief` + `repo` opens a session scoped to that repository:
+`apiClient.CreateRefinementSession(ctx, brief, repo)` sends `repo` only when non-empty, and the preview renders THAT
+repository's declared conventions. `RefinementSession.ConventionsSource` (and `RefinementFilingResult.ConventionsSource`)
+mirror the backend's `conventions_source` block (`state` declared | not_declared | degraded | no_repo,
+`degraded_reason`, `fallback`). `guidanceForSession` appends a per-state note to the suggested guidance entry
+(`withConventionsNote`): `no_repo` advises opening with `brief` + `repo`; `degraded` names the reason and its operator
+remedy (`conventionsDegradedRemedies`: register the accounts provider row, install the App, configure the forge, ...);
+`not_declared` names the fallback; `declared` adds nothing. An approved session's file-arm guidance pre-fills the
+session's own repo when `conventions_source.repo` is known. The cross-boundary
+`TestDraftEpicContract_OpenWithRepoPersistsAndRendersGolden` drives the open arm through the real client, handler,
+Postgres repo and a real `RepoConventionsLoader` installed via `SetConventionsResolver`, asserting the persisted repo,
+the preview golden, the `conventions_source` round-trip and the file arm's 409 for a different repo.
 
 Every session-view result (open/preview/edit/decide) carries the `RefinementSession` mirror; the file arm carries
 `RefinementFilingResult`; exactly one is set. Every result also carries a `session_guidance` block
@@ -2846,7 +2859,8 @@ statusless 200, is terminal. `draft_epic_contract_test.go` decodes the REAL serv
 (pgtest + `server.Handler()` + a gated in-memory provider) into these mirrors, so a server JSON-tag rename goes red.
 
 Backend error codes surface verbatim through typed `apiError` unwraps: `amendment_budget_exhausted`,
-`decision_already_recorded`, `refinement_not_approved`, `refinement_draft_drifted`, `refinement_filing_repo_mismatch`,
+`decision_already_recorded`, `refinement_not_approved`, `refinement_draft_drifted`, `refinement_filing_repo_mismatch`
+(also the open-time pin, ADR-114), `refinement_conventions_unavailable` (502, nothing recorded),
 and `refinement_filing_failed` — since #4153 a SYNCHRONOUS refusal to start (the target repo's installation could not
 be resolved; nothing was launched), surfaced with the re-invoke-with-the-same-repo remedy; a mid-sequence failure is no
 longer an error, it is the `failed` filing state above. Wire mirrors (`RefinementSession`/`RefinementFilingResult`/

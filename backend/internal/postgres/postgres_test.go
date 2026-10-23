@@ -8376,6 +8376,87 @@ WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'admission_
 	}
 }
 
+// TestMigrateDown_RefinementDraftsRepoReversal pins 0110 (ADR-114 / #4642,
+// E89.25 / #4626): after MigrateUp refinement_drafts carries a nullable TEXT
+// repo column, a pre-0110-shaped insert reads it back NULL (no default, no
+// backfill) and a repo-scoped insert reads its repo back. After rolling back
+// through 0110 the column is gone, the draft rows survive and the schema
+// lands on 0109 (its merge-queue yield columns survive); MigrateUp again restores it.
+func TestMigrateDown_RefinementDraftsRepoReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	repoColumn := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'refinement_drafts' AND column_name = 'repo'
+  AND is_nullable = 'YES' AND data_type = 'text' AND column_default IS NULL`).Scan(&n); err != nil {
+			t.Fatalf("read 0110 column: %v", err)
+		}
+		return n
+	}
+	if n := repoColumn(); n != 1 {
+		t.Fatalf("nullable TEXT refinement_drafts.repo columns after MigrateUp = %d, want 1", n)
+	}
+
+	sessionID := uuid.New()
+	if _, err := pool.Exec(ctx, `INSERT INTO refinement_drafts (id, session_id, brief, draft)
+VALUES (gen_random_uuid(), $1, 'b', '{}')`, sessionID); err != nil {
+		t.Fatalf("insert pre-0110-shaped draft: %v — 0110 must leave it insertable", err)
+	}
+	if _, err := pool.Exec(ctx, `INSERT INTO refinement_drafts (id, session_id, brief, draft, repo)
+VALUES (gen_random_uuid(), $1, 'b', '{}', 'acme/widgets')`, sessionID); err != nil {
+		t.Fatalf("insert repo-scoped draft: %v", err)
+	}
+	var nullRepo, scoped int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FILTER (WHERE repo IS NULL), count(*) FILTER (WHERE repo = 'acme/widgets')
+FROM refinement_drafts WHERE session_id = $1`, sessionID).Scan(&nullRepo, &scoped); err != nil {
+		t.Fatalf("read repo values: %v", err)
+	}
+	if nullRepo != 1 || scoped != 1 {
+		t.Errorf("drafts with NULL repo = %d, with acme/widgets = %d; want 1, 1 (no default, no backfill)", nullRepo, scoped)
+	}
+
+	downThrough(t, url, "0110")
+
+	if n := repoColumn(); n != 0 {
+		t.Errorf("refinement_drafts.repo columns after rolling back 0110 = %d, want 0", n)
+	}
+	var rows int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM refinement_drafts WHERE session_id = $1`, sessionID).Scan(&rows); err != nil {
+		t.Fatalf("read drafts after rollback: %v — the 0046 table must survive", err)
+	}
+	if rows != 2 {
+		t.Errorf("draft rows after rolling back 0110 = %d, want 2 (untouched)", rows)
+	}
+	// The rollback lands on 0109, so its merge-queue yield columns survive.
+	var yieldCols int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'yield_reason'`).Scan(&yieldCols); err != nil {
+		t.Fatalf("read 0109 column after rolling back 0110: %v", err)
+	}
+	if yieldCols != 1 {
+		t.Errorf("yield_reason columns after rolling back 0110 = %d, want 1 (0109 untouched)", yieldCols)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if n := repoColumn(); n != 1 {
+		t.Errorf("refinement_drafts.repo columns after re-applying 0110 = %d, want 1", n)
+	}
+}
+
 // TestIsTransientPGRefusal: the raw-database drop retries only a server
 // refusal (also through a connect error's wrap), never another failure.
 func TestIsTransientPGRefusal(t *testing.T) {

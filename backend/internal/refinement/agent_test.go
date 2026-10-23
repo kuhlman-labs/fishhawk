@@ -1,8 +1,11 @@
 package refinement
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -28,6 +31,92 @@ func (f *fakeInferencer) Inference(_ context.Context, prompt string) (string, st
 	return f.resp, f.model, planreview.Usage{}, f.err
 }
 
+// repoDeclarationPromptGoldenPath is the drafting prompt for this
+// repository's own declaration, captured ONCE from the unmodified pre-move
+// Drafter (NewDrafter(inf, conv).Draft) before the conventions became a
+// per-call argument (ADR-110 / ADR-114, #4626). There is deliberately no
+// -update flag: a self-blessing flag would let a regression rewrite its own
+// golden.
+const repoDeclarationPromptGoldenPath = "testdata/repo-declaration-prompt.golden.txt"
+
+// repoDeclarationPromptBrief is the fixed brief the prompt golden was
+// captured with.
+const repoDeclarationPromptBrief = "Render the draft_epic preview with the target repository's declared conventions."
+
+// parseRepoDeclaration parses this repository's own work-management
+// declaration READ-ONLY. Fishhawk-shape assertions (the area/autonomy/phase
+// enumeration) read it rather than workmgmt.Default(), so the default's later
+// neutralisation does not touch this file.
+func parseRepoDeclaration(t *testing.T) workmgmt.Conventions {
+	t.Helper()
+	declPath := filepath.Join(pkgSrcDir, "..", "..", "..", ".fishhawk", "work-management.yaml")
+	f, err := os.Open(declPath)
+	if err != nil {
+		t.Fatalf("open %s: %v — this repository's own declaration must exist", declPath, err)
+	}
+	defer f.Close()
+	conv, err := workmgmt.Parse(f)
+	if err != nil {
+		t.Fatalf("Parse(%s): %v", declPath, err)
+	}
+	return conv
+}
+
+// TestDrafter_RepoDeclarationPromptGolden asserts the POST-move prompt for
+// this repository's declaration is byte-equal to the golden captured from
+// the unmodified Drafter: moving the conventions from construction time to
+// the Draft call changed no prompt byte.
+func TestDrafter_RepoDeclarationPromptGolden(t *testing.T) {
+	want, err := os.ReadFile(filepath.Join(pkgSrcDir, repoDeclarationPromptGoldenPath))
+	if err != nil {
+		t.Fatalf("read golden: %v", err)
+	}
+	inf := &fakeInferencer{resp: wellFormedDraftJSON, model: "m"}
+	if _, _, err := NewDrafter(inf).Draft(context.Background(), uuid.New(), repoDeclarationPromptBrief, parseRepoDeclaration(t)); err != nil {
+		t.Fatalf("Draft: %v", err)
+	}
+	if got := []byte(inf.gotPrompt); !bytes.Equal(got, want) {
+		t.Errorf("drafting prompt diverged from %s:\n--- got ---\n%s\n--- want ---\n%s", repoDeclarationPromptGoldenPath, got, want)
+	}
+}
+
+// TestDrafter_PromptUsesPerCallConventions pins that the prompt enumerates
+// the PER-CALL conventions' required namespaces: one Drafter, two calls with
+// different conventions, two different enumerations. A Drafter that read a
+// construction-time or default conventions value would omit "component".
+func TestDrafter_PromptUsesPerCallConventions(t *testing.T) {
+	inf := &fakeInferencer{resp: wellFormedDraftJSON, model: "m"}
+	d := NewDrafter(inf)
+
+	custom := workmgmt.Conventions{Types: map[string]workmgmt.ItemType{
+		"feature": {RequiredLabelNamespaces: []string{"component", "type"}},
+	}}
+	if _, _, err := d.Draft(context.Background(), uuid.New(), "brief", custom); err != nil {
+		t.Fatalf("Draft(custom): %v", err)
+	}
+	if !strings.Contains(inf.gotPrompt, "Include a label in each of these namespaces: component, type (") {
+		t.Errorf("prompt does not enumerate the per-call namespaces component, type:\n%s", inf.gotPrompt)
+	}
+
+	if _, _, err := d.Draft(context.Background(), uuid.New(), "brief", parseRepoDeclaration(t)); err != nil {
+		t.Fatalf("Draft(repo declaration): %v", err)
+	}
+	if strings.Contains(inf.gotPrompt, "component") {
+		t.Errorf("second call's prompt still carries the first call's conventions:\n%s", inf.gotPrompt)
+	}
+	if !strings.Contains(inf.gotPrompt, "namespaces: area, autonomy, phase (") {
+		t.Errorf("prompt does not enumerate this repository's namespaces:\n%s", inf.gotPrompt)
+	}
+
+	// No feature type: no namespace sentence at all.
+	if _, _, err := d.Draft(context.Background(), uuid.New(), "brief", workmgmt.Conventions{}); err != nil {
+		t.Fatalf("Draft(empty): %v", err)
+	}
+	if strings.Contains(inf.gotPrompt, "Include a label in each of these namespaces") {
+		t.Errorf("prompt enumerates namespaces for conventions with no feature type:\n%s", inf.gotPrompt)
+	}
+}
+
 func TestDraft_HappyPath(t *testing.T) {
 	// The agent narrates and fences its JSON — Draft must tolerate both and
 	// return the validated draft plus the model id.
@@ -35,9 +124,9 @@ func TestDraft_HappyPath(t *testing.T) {
 		resp:  "Here's the decomposition:\n\n```json\n" + wellFormedDraftJSON + "\n```",
 		model: "claude-opus-4-8",
 	}
-	d := NewDrafter(inf, workmgmt.Default())
+	d := NewDrafter(inf)
 
-	draft, model, err := d.Draft(context.Background(), uuid.New(), "stand up X")
+	draft, model, err := d.Draft(context.Background(), uuid.New(), "stand up X", parseRepoDeclaration(t))
 	if err != nil {
 		t.Fatalf("Draft: %v", err)
 	}
@@ -51,9 +140,9 @@ func TestDraft_HappyPath(t *testing.T) {
 
 func TestDraft_InferenceErrorPropagates(t *testing.T) {
 	inf := &fakeInferencer{err: errors.New("backend down")}
-	d := NewDrafter(inf, workmgmt.Default())
+	d := NewDrafter(inf)
 
-	_, _, err := d.Draft(context.Background(), uuid.New(), "brief")
+	_, _, err := d.Draft(context.Background(), uuid.New(), "brief", parseRepoDeclaration(t))
 	if err == nil {
 		t.Fatal("Draft returned nil error when the Inferencer failed")
 	}
@@ -74,9 +163,9 @@ func TestDraft_InvalidDraftRejectedNamesEdge(t *testing.T) {
 	  ]
 	}`
 	inf := &fakeInferencer{resp: danglingJSON, model: "m"}
-	d := NewDrafter(inf, workmgmt.Default())
+	d := NewDrafter(inf)
 
-	_, _, err := d.Draft(context.Background(), uuid.New(), "brief")
+	_, _, err := d.Draft(context.Background(), uuid.New(), "brief", parseRepoDeclaration(t))
 	if err == nil {
 		t.Fatal("Draft accepted a draft with a dangling depends_on edge")
 	}
@@ -90,16 +179,15 @@ func TestDraft_InvalidDraftRejectedNamesEdge(t *testing.T) {
 
 func TestDraft_DecodeFailurePropagates(t *testing.T) {
 	inf := &fakeInferencer{resp: "not json at all", model: "m"}
-	d := NewDrafter(inf, workmgmt.Default())
+	d := NewDrafter(inf)
 
-	if _, _, err := d.Draft(context.Background(), uuid.New(), "brief"); err == nil {
+	if _, _, err := d.Draft(context.Background(), uuid.New(), "brief", parseRepoDeclaration(t)); err == nil {
 		t.Fatal("Draft accepted undecodable inference output")
 	}
 }
 
 func TestBuildPrompt_EnumeratesClosedFieldSetAndNamespaces(t *testing.T) {
-	d := NewDrafter(&fakeInferencer{}, workmgmt.Default())
-	p := d.buildPrompt("build the thing")
+	p := buildPrompt("build the thing", parseRepoDeclaration(t))
 
 	for _, want := range []string{
 		"build the thing",         // the brief
@@ -128,7 +216,7 @@ func TestBuildPrompt_EnumeratesClosedFieldSetAndNamespaces(t *testing.T) {
 func TestDraft_EndToEnd(t *testing.T) {
 	pool := pgtest.NewPool(t)
 	repo := NewPostgresRepository(pool)
-	conv := workmgmt.Default()
+	conv := parseRepoDeclaration(t)
 
 	// A two-child draft with a dependency edge, so persistence must preserve
 	// both criteria and edges.
@@ -145,10 +233,10 @@ func TestDraft_EndToEnd(t *testing.T) {
 	  ]
 	}` + "\n```"
 	inf := &fakeInferencer{resp: e2eJSON, model: "claude-opus-4-8"}
-	d := NewDrafter(inf, conv)
+	d := NewDrafter(inf)
 	sessionID := uuid.New()
 
-	draft, model, err := d.Draft(context.Background(), sessionID, "stand up the refinement package")
+	draft, model, err := d.Draft(context.Background(), sessionID, "stand up the refinement package", conv)
 	if err != nil {
 		t.Fatalf("Draft: %v", err)
 	}

@@ -1,0 +1,139 @@
+{
+  "draft": {
+    "epic": {
+      "summary": "Repo-scoped refinement previews",
+      "scope": "Render the draft_epic preview with the target repository's declared conventions.",
+      "out_of_scope": "Neutralising the shipped default."
+    },
+    "children": [
+      {
+        "summary": "Persist the open-time repo",
+        "proposal": "Add a nullable repo column to refinement_drafts.",
+        "done_means": "A repo-scoped session reads its repo back on every revision.",
+        "acceptance_criteria": [
+          "the repo round-trips",
+          "an empty repo is stored as NULL"
+        ],
+        "labels": [
+          "area:backend",
+          "phase:beta"
+        ],
+        "depends_on": null
+      },
+      {
+        "summary": "Name each conventions fall-through",
+        "proposal": "Resolve reports declared, not_declared, degraded or no_repo.",
+        "done_means": "A degraded resolution names its reason.",
+        "acceptance_criteria": [
+          "each pre-fetch fall-through has a named reason"
+        ],
+        "labels": [
+          "area:backend"
+        ],
+        "depends_on": null
+      },
+      {
+        "summary": "Render the preview from the resolved conventions",
+        "proposal": "Route drafting, preview and filing through the resolver.",
+        "done_means": "The preview matches this golden.",
+        "acceptance_criteria": [
+          "the preview is byte-equal to the golden"
+        ],
+        "labels": [
+          "area:backend",
+          "phase:beta",
+          "autonomy:low"
+        ],
+        "depends_on": [
+          1,
+          2
+        ]
+      }
+    ]
+  },
+  "preview": [
+    {
+      "type": "epic",
+      "title": "[E1] Repo-scoped refinement previews",
+      "body": "## Summary\n\nRepo-scoped refinement previews\n\n## Scope\n\nRender the draft_epic preview with the target repository's declared conventions.\n\n### Out of scope\n\nNeutralising the shipped default.\n\n## Notes\n\n",
+      "classification": {
+        "labels": [
+          "epic"
+        ],
+        "complexity": "high"
+      },
+      "board_placement": {
+        "status": "Backlog"
+      },
+      "relations": {}
+    },
+    {
+      "type": "feature",
+      "title": "[EX.1] Persist the open-time repo",
+      "body": "## Summary\n\n\n## Proposal\n\nAdd a nullable repo column to refinement_drafts.\n\n## Done-means\n\nA repo-scoped session reads its repo back on every revision.\n\n## Acceptance criteria\n\n- the repo round-trips\n- an empty repo is stored as NULL\n\n## Notes\n\n\n## Relations\n\n",
+      "classification": {
+        "labels": [
+          "type:feature",
+          "area:backend",
+          "phase:beta",
+          "autonomy:medium"
+        ],
+        "complexity": "medium",
+        "defaulted_labels": [
+          "autonomy:medium"
+        ]
+      },
+      "board_placement": {
+        "status": "Backlog"
+      },
+      "relations": {
+        "parent_epic": "#0"
+      }
+    },
+    {
+      "type": "feature",
+      "title": "[EX.2] Name each conventions fall-through",
+      "body": "## Summary\n\n\n## Proposal\n\nResolve reports declared, not_declared, degraded or no_repo.\n\n## Done-means\n\nA degraded resolution names its reason.\n\n## Acceptance criteria\n\n- each pre-fetch fall-through has a named reason\n\n## Notes\n\n\n## Relations\n\n",
+      "classification": {
+        "labels": [
+          "type:feature",
+          "area:backend",
+          "autonomy:medium"
+        ],
+        "complexity": "medium",
+        "defaulted_labels": [
+          "autonomy:medium"
+        ],
+        "missing_label_namespaces": [
+          "phase"
+        ]
+      },
+      "board_placement": {
+        "status": "Backlog"
+      },
+      "relations": {
+        "parent_epic": "#0"
+      }
+    },
+    {
+      "type": "feature",
+      "title": "[EX.3] Render the preview from the resolved conventions",
+      "body": "## Summary\n\n\n## Proposal\n\nRoute drafting, preview and filing through the resolver.\n\n## Done-means\n\nThe preview matches this golden.\n\n## Acceptance criteria\n\n- the preview is byte-equal to the golden\n\n## Notes\n\n\n## Relations\n\nDepends on: #1, #2",
+      "classification": {
+        "labels": [
+          "type:feature",
+          "area:backend",
+          "phase:beta",
+          "autonomy:low"
+        ],
+        "complexity": "medium"
+      },
+      "board_placement": {
+        "status": "Backlog"
+      },
+      "relations": {
+        "parent_epic": "#0"
+      }
+    }
+  ]
+}
