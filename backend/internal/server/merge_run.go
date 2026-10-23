@@ -560,8 +560,10 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			s.writeMergeQueueOwnsMerge(w, r, runID, prURL)
 			// ADR-112 R3 (#4632): a merge_run re-invoke on a YIELDED entry
 			// re-probes it now (a no-op on an entry that is not yielded),
-			// detached from this lock's fn context.
-			s.reprobeMergeQueueYieldDetached(r.Context(), runID)
+			// detached from this lock's fn context; the operator's explicit
+			// invocation forces one re-attempt of a forge_review_required
+			// yield (mergeQueueYieldClears).
+			s.reprobeMergeQueueYieldDetached(r.Context(), runID, true)
 			return nil
 		}
 
@@ -1502,8 +1504,9 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	if found && routed.Entry.Yielded() {
 		// ADR-112 R3 (#4632, approval condition C2(e)): a merge_run re-invoke
 		// on an already-queued YIELDED entry re-probes it now, whatever this
-		// call answers; the fold re-reads the forge and is the sole decision.
-		defer s.reprobeMergeQueueYieldDetached(ctx, runID)
+		// call answers; the fold re-reads the forge and is the sole decision
+		// (forcing one re-attempt of a forge_review_required yield).
+		defer s.reprobeMergeQueueYieldDetached(ctx, runID, true)
 	}
 
 	elig := s.mergeQueueEligibility(ctx, runRow, gate.prHeadSHA)
@@ -1570,7 +1573,7 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 		// A freshly yielded entry is re-probed at once (an already-yielded
 		// one was deferred above): an approval that landed since the
 		// eligibility read clears it now rather than on the backoff schedule.
-		s.reprobeMergeQueueYieldDetached(ctx, runID)
+		s.reprobeMergeQueueYieldDetached(ctx, runID, true)
 	}
 
 	resp := mergeRunResponse{
@@ -1662,12 +1665,12 @@ func mergeRunYieldNextStepText(next string) string {
 }
 
 // reprobeMergeQueueYieldDetached runs the targeted, no-backoff yield re-probe
-// for runID (ReprobeMergeQueueYield) on a bounded admission context tracked by
-// bgMergeQueuePump, so the caller never waits on its forge read. It detaches
-// from any merge-intent lock fn context first (pglock.Detach): the re-probe's
-// clear pumps the base, which takes its own locks. A run with no yielded
-// entry does nothing.
-func (s *Server) reprobeMergeQueueYieldDetached(ctx context.Context, runID uuid.UUID) {
+// for runID (ReprobeMergeQueueYield, force as there) on a bounded admission
+// context tracked by bgMergeQueuePump, so the caller never waits on its forge
+// read. It detaches from any merge-intent lock fn context first
+// (pglock.Detach): the re-probe's clear pumps the base, which takes its own
+// locks. A run with no yielded entry does nothing.
+func (s *Server) reprobeMergeQueueYieldDetached(ctx context.Context, runID uuid.UUID, force bool) {
 	if s.cfg.MergeQueue == nil {
 		return
 	}
@@ -1676,7 +1679,7 @@ func (s *Server) reprobeMergeQueueYieldDetached(ctx context.Context, runID uuid.
 	go func() {
 		defer s.bgMergeQueuePump.Done()
 		defer cancel()
-		s.ReprobeMergeQueueYield(pctx, runID)
+		s.ReprobeMergeQueueYield(pctx, runID, force)
 	}()
 }
 
@@ -1805,6 +1808,11 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 			}
 			if yield != nil {
 				m := yield.marker()
+				if sameBase {
+					// A same-reason re-yield of a cleared entry on the same
+					// head and base continues its episode (ADR-112 R3).
+					m.Continue = s.mergeQueueYieldContinuation(ctx, prior.Entry, yield.Reason)
+				}
 				req.Yield = &m
 				if sameBase && prior.Entry.AnchoredHeadSHA == gate.prHeadSHA {
 					// An unchanged head keeps the entry's recorded base anchor.

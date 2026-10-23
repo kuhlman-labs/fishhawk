@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -71,7 +72,7 @@ func TestMergeQueueYieldReprobe_ApprovedClearsAndTheLineMerges(t *testing.T) {
 	w, a, y := newYieldWorld(t)
 	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 
-	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id) {
+	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id, false) {
 		t.Fatal("the targeted re-probe did not clear an approved yield")
 	}
 	w.srv.bgMergeQueuePump.Wait()
@@ -94,7 +95,7 @@ func TestMergeQueueYieldReprobe_ApprovedClearsAndTheLineMerges(t *testing.T) {
 func TestMergeQueueYieldReprobe_SameReasonWritesNothing(t *testing.T) {
 	w, a, y := newYieldWorld(t)
 
-	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a)); got != reprobeUnchanged {
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeUnchanged {
 		t.Fatalf("outcome = %s, want %s", got, reprobeUnchanged)
 	}
 	if n := len(w.rows(a, CategoryMergeQueueYielded)); n != 1 {
@@ -112,7 +113,7 @@ func TestMergeQueueYieldReprobe_ChangedReasonTransitions(t *testing.T) {
 	w, a, y := newYieldWorld(t)
 	w.forgeReviews(a, []string{"bob"}, mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
 
-	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a)); got != reprobeTransitioned {
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeTransitioned {
 		t.Fatalf("outcome = %s, want %s", got, reprobeTransitioned)
 	}
 	e := w.active(a)
@@ -141,7 +142,7 @@ func TestMergeQueueYieldReprobe_HeadMovedReanchorsKeepingTheMarker(t *testing.T)
 	w, a, y := newYieldWorld(t)
 	w.gh.set(func() { w.gh.prs[a.pr].head = "a3" })
 
-	w.srv.reprobeMergeQueueYield(context.Background(), w.active(a))
+	w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false)
 
 	e := w.active(a)
 	if e.AnchoredHeadSHA != "a3" || e.YieldedAt == nil || !e.YieldedAt.Equal(*y.YieldedAt) ||
@@ -152,7 +153,7 @@ func TestMergeQueueYieldReprobe_HeadMovedReanchorsKeepingTheMarker(t *testing.T)
 
 	admitted := len(w.rows(a, CategoryMergeCandidateQueueAdmitted))
 	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a3"))
-	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id) {
+	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id, false) {
 		t.Fatal("an approval at the re-anchored head did not clear the marker")
 	}
 	w.srv.bgMergeQueuePump.Wait()
@@ -175,7 +176,7 @@ func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 		stale := y
 		old := y.YieldedAt.Add(-time.Hour)
 		stale.YieldedAt = &old
-		if got := w.srv.reprobeMergeQueueYield(ctx, stale); got != reprobeNothing {
+		if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
 			t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
 		}
 		if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
@@ -186,14 +187,14 @@ func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 		w, a, _ := newYieldWorld(t)
 		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 		w.gh.set(func() { w.gh.graphQLFail[a.pr] = 10 })
-		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a)); got != reprobeNothing || w.active(a).YieldedAt == nil {
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing || w.active(a).YieldedAt == nil {
 			t.Fatalf("outcome = %s, want %s with the marker kept", got, reprobeNothing)
 		}
 	})
 	t.Run("merged", func(t *testing.T) {
 		w, a, _ := newYieldWorld(t)
 		w.gh.set(func() { w.gh.prs[a.pr].state, w.gh.prs[a.pr].merged = "closed", true })
-		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a)); got != reprobeNothing || w.active(a).YieldedAt == nil {
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing || w.active(a).YieldedAt == nil {
 			t.Fatalf("outcome = %s, want %s with the marker kept", got, reprobeNothing)
 		}
 	})
@@ -201,7 +202,7 @@ func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 		w, a, y := newYieldWorld(t)
 		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 		w.exec(`UPDATE runs SET state = 'cancelled' WHERE id = $1`, a.id)
-		if got := w.srv.reprobeMergeQueueYield(ctx, y); got != reprobeNothing {
+		if got := w.srv.reprobeMergeQueueYield(ctx, y, false); got != reprobeNothing {
 			t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
 		}
 	})
@@ -209,7 +210,7 @@ func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 		w := newMQELineWorld(t)
 		a := w.seed("a", "a1", []byte(mqeSpecYAML))
 		w.mqpHeldIntent(a, "a1", false)
-		if w.srv.ReprobeMergeQueueYield(ctx, a.id) || w.srv.ReprobeMergeQueueYield(ctx, uuid.New()) {
+		if w.srv.ReprobeMergeQueueYield(ctx, a.id, false) || w.srv.ReprobeMergeQueueYield(ctx, uuid.New(), false) {
 			t.Fatal("an unmarked entry or an unknown run reported a clear")
 		}
 	})
@@ -226,7 +227,7 @@ func TestMergeQueueYieldReprobe_ClearAppendFailureKeepsTheClear(t *testing.T) {
 	w.audit.failCategory = CategoryMergeQueueYieldCleared
 	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 
-	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id) {
+	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id, false) {
 		t.Fatal("the clear did not land")
 	}
 	w.srv.bgMergeQueuePump.Wait()
@@ -417,5 +418,124 @@ func TestRunMergeQueueYieldReprobe_TicksAndStops(t *testing.T) {
 	w.srv.bgMergeQueuePump.Wait()
 	if n := len(w.rows(a, CategoryMergeQueueYieldPosted)); n != 1 {
 		t.Fatalf("posted rows = %d, want 1", n)
+	}
+}
+
+// newRowFourYieldWorld is a gate-less run A ALONE on its base (so a
+// re-admission meets an unmoved base and re-attempts the pinned PUT at a1)
+// whose pinned merge the forge refuses (405, a typed RELEASE outcome) while
+// the fresh snapshot reads BLOCKED: one pump yields A forge_review_required
+// (ADR-112 R3 row 4) after exactly one PUT. yielded_at is then backdated an
+// hour on the database clock (so a one-hour-interval sweep finds the row due
+// and a fresh stamp is told apart), and the backdated entry is returned.
+func newRowFourYieldWorld(t *testing.T) (*mqmWorld, *mcqRun, mergequeue.Entry) {
+	t.Helper()
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.gh.set(func() { w.gh.putStatus[a.pr] = http.StatusMethodNotAllowed })
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{MergeStateStatus: "BLOCKED"})
+	w.pumpBase(a)
+	w.requireYielded(a, mergeQueueYieldForgeReviewRequired, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
+	w.requirePuts("a1")
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - interval '1 hour' WHERE run_id = $1 AND state = 'held'`, a.id)
+	return w, a, w.active(a)
+}
+
+// requireRowFourKept asserts A is still yielded forge_review_required in the
+// episode y, with no merge_queue_yield_cleared row.
+func (w *mqmWorld) requireRowFourKept(a *mcqRun, y mergequeue.Entry) {
+	w.t.Helper()
+	e := w.active(a)
+	if e.State != mergequeue.StateHeld || e.YieldReason != mergeQueueYieldForgeReviewRequired || e.YieldedAt == nil || !e.YieldedAt.Equal(*y.YieldedAt) {
+		w.t.Fatalf("A = %s %q yielded_at %v, want held forge_review_required in the episode %v", e.State, e.YieldReason, e.YieldedAt, y.YieldedAt)
+	}
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+		w.t.Fatalf("merge_queue_yield_cleared rows = %d, want 0", n)
+	}
+}
+
+// TestMergeQueueYieldReprobe_ForgeReviewRequiredClearsOnceTheSnapshotShowsApproved:
+// the row-4 yield's fresh snapshot now reads APPROVED / CLEAN (and the forge
+// accepts the PUT), so the targeted, unforced re-probe clears it and the line
+// merges A pinned to a1.
+func TestMergeQueueYieldReprobe_ForgeReviewRequiredClearsOnceTheSnapshotShowsApproved(t *testing.T) {
+	w, a, _ := newRowFourYieldWorld(t)
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{ReviewDecision: "APPROVED", MergeStateStatus: "CLEAN"})
+	w.gh.set(func() { delete(w.gh.putStatus, a.pr) })
+
+	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id, false) {
+		t.Fatal("an APPROVED/CLEAN snapshot did not clear the forge_review_required yield")
+	}
+	w.srv.bgMergeQueuePump.Wait()
+
+	w.requirePuts("a1", "a1")
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield:
+// the fixture snapshot reads APPROVED / CLEAN (so a read would clear), but the
+// re-probe's fresh snapshot read fails (the gate-less fold makes no forge
+// read, so the predicate's read is the one that fails): the row stays
+// yielded, fail closed. Counterfactual: treating a read error as the
+// condition gone clears it, RED.
+func TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield(t *testing.T) {
+	w, a, y := newRowFourYieldWorld(t)
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{ReviewDecision: "APPROVED", MergeStateStatus: "CLEAN"})
+	w.gh.set(func() { w.gh.graphQLFail[a.pr] = 10 })
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeUnchanged {
+		t.Fatalf("outcome = %s, want %s", got, reprobeUnchanged)
+	}
+	w.srv.bgMergeQueuePump.Wait()
+	w.requireRowFourKept(a, y)
+	w.requirePuts("a1")
+}
+
+// TestMergeQueueYieldReprobe_ForgeReviewRequiredWebhookWithoutForgeChangeKeepsTheYield
+// (H2): an approved review webhook at the anchored head triggers the targeted
+// re-probe, but the forge still reads BLOCKED, so the shared clear predicate
+// keeps the row yielded and nothing is PUT. Counterfactual: applying the
+// snapshot check only in the sweep (the webhook path clears on the approved
+// gate-less fold) clears and re-attempts, RED.
+func TestMergeQueueYieldReprobe_ForgeReviewRequiredWebhookWithoutForgeChangeKeepsTheYield(t *testing.T) {
+	w, a, y := newRowFourYieldWorld(t)
+
+	prReviewYieldWebhook(w, a, "approved", "a1")
+
+	w.requireRowFourKept(a, y)
+	w.requirePuts("a1")
+}
+
+// TestMergeQueueYieldReprobe_ForgeReviewRequiredReyieldKeepsTheEpisode (H3):
+// the operator's merge_run FORCES one re-attempt (the clear skips the
+// snapshot), the forge refuses again on an unchanged state and A re-yields
+// forge_review_required on the same head and base: it KEEPS the backdated
+// yielded_at, so its age (the re-probe backoff) keeps growing from the
+// original episode, and the episode is posted once. Counterfactual: stamping
+// a fresh yielded_at on the same-reason re-yield restarts the age at ~0, RED.
+func TestMergeQueueYieldReprobe_ForgeReviewRequiredReyieldKeepsTheEpisode(t *testing.T) {
+	w, a, y := newRowFourYieldWorld(t)
+
+	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id, true) {
+		t.Fatal("the forced re-probe did not clear the forge_review_required yield")
+	}
+	w.srv.bgMergeQueuePump.Wait()
+
+	w.requirePuts("a1", "a1")
+	e := w.active(a)
+	if e.State != mergequeue.StateHeld || e.YieldReason != mergeQueueYieldForgeReviewRequired || e.YieldedAt == nil ||
+		!e.YieldedAt.Equal(*y.YieldedAt) || e.YieldAge < time.Hour {
+		t.Fatalf("A after the re-yield = %s %q yielded_at %v age %s, want held forge_review_required in the episode %v (age >= 1h)",
+			e.State, e.YieldReason, e.YieldedAt, e.YieldAge, y.YieldedAt)
+	}
+	_, yieldedAt := mergeQueueYieldEpisode(y)
+	rows := w.rows(a, CategoryMergeQueueYielded)
+	if len(rows) != 2 || w.payload(rows[1])["yielded_at"] != yieldedAt {
+		t.Fatalf("merge_queue_yielded rows = %d, want 2, the re-yield naming the episode %s", len(rows), yieldedAt)
+	}
+	w.srv.sweepMergeQueueYields(context.Background(), time.Minute)
+	if n := len(w.rows(a, CategoryMergeQueueYieldPosted)); n != 1 {
+		t.Fatalf("merge_queue_yield_posted rows = %d, want 1 (one episode)", n)
 	}
 }

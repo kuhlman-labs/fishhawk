@@ -2197,6 +2197,80 @@ func TestEnqueue_YieldMarkerArms(t *testing.T) {
 	}
 }
 
+// TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor (ADR-112 R3, #4632):
+// a re-yield whose marker carries the entry's cleared episode keeps that
+// episode's yielded_at (backdated an hour, so a fresh stamp is told apart)
+// when the anchor still equals the episode's head and base, through Yield and
+// through Enqueue marking an unmarked held entry; a moved head, a moved base
+// or no Continue stamps the database clock (a new episode). Counterfactual:
+// dropping the anchor match in yieldContinueSQL continues the episode on the
+// moved head, RED.
+func TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a := f.run()
+	e := f.enqueue(a, "main", "h1").Entry
+	const reason = "forge_review_required"
+	// episode yields e (live) at the anchor's own epoch, backdates the stamp an
+	// hour, clears it, and returns the cleared episode.
+	episode := func(cont *YieldEpisode) (Entry, YieldEpisode) {
+		t.Helper()
+		got, err := f.store.Yield(ctx, e.ID, f.admitAt(e.ID), YieldMarker{Reason: reason, Continue: cont})
+		if err != nil {
+			t.Fatalf("Yield: %v", err)
+		}
+		f.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - interval '1 hour' WHERE id = $1`, e.ID)
+		y := f.entry(e.ID)
+		if _, err := f.store.ClearYield(ctx, e.ID, y.AnchoredHeadSHA, *y.YieldedAt); err != nil {
+			t.Fatalf("ClearYield: %v", err)
+		}
+		return got, YieldEpisode{YieldedAt: *y.YieldedAt, HeadSHA: y.AnchoredHeadSHA, BaseSHA: y.AnchoredBaseSHA}
+	}
+	fresh := func(why string, g Entry, ep YieldEpisode) {
+		t.Helper()
+		if g.YieldedAt == nil || g.YieldedAt.Equal(ep.YieldedAt) || g.YieldAge >= time.Minute {
+			t.Fatalf("%s: yielded_at %v age %s, want a fresh episode (not %v)", why, g.YieldedAt, g.YieldAge, ep.YieldedAt)
+		}
+	}
+
+	_, ep := episode(nil)
+	got, ep2 := episode(&ep)
+	if got.YieldedAt == nil || !got.YieldedAt.Equal(ep.YieldedAt) || got.YieldAge < time.Hour {
+		t.Fatalf("same-anchor Yield yielded_at %v age %s, want the continued %v (age >= 1h)", got.YieldedAt, got.YieldAge, ep.YieldedAt)
+	}
+
+	// The head moved (a marker-less re-enqueue of the cleared held row).
+	f.enqueue(a, "main", "h2")
+	got, ep3 := episode(&ep2)
+	fresh("moved head", got, ep2)
+
+	// The base moved at the same head.
+	f.exec(`UPDATE merge_candidate_queue_entries SET anchored_base_sha = 'base-elsewhere' WHERE id = $1`, e.ID)
+	got, _ = episode(&ep3)
+	fresh("moved base", got, ep3)
+
+	// Enqueue marking the unmarked held row: same anchor continues, a moved
+	// head (the re-anchor in the same transaction) is a new episode.
+	f.exec(`UPDATE merge_candidate_queue_entries SET anchored_base_sha = 'base-h2' WHERE id = $1`, e.ID)
+	_, ep4 := episode(nil)
+	mark := func(head string, cont *YieldEpisode) Entry {
+		t.Helper()
+		res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: a, BaseRef: "main", HeadSHA: head, BaseSHA: "base-" + head,
+			MergeIntent: true, Yield: &YieldMarker{Reason: reason, Continue: cont}})
+		if err != nil || !res.Marked {
+			t.Fatalf("Enqueue(%s, marker) = %+v, %v; want marked", head, res, err)
+		}
+		return f.entry(e.ID)
+	}
+	if g := mark("h2", &ep4); g.YieldedAt == nil || !g.YieldedAt.Equal(ep4.YieldedAt) {
+		t.Fatalf("same-anchor Enqueue mark yielded_at %v, want the continued %v", g.YieldedAt, ep4.YieldedAt)
+	}
+	if _, err := f.store.ClearYield(ctx, e.ID, "h2", ep4.YieldedAt); err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+	fresh("Enqueue mark at a moved head", mark("h3", &ep4), ep4)
+}
+
 // TestUpdateYield_RewritesReasonOnly: the matching (head, yielded_at) rewrites
 // reason and detail and keeps yielded_at, the head and the wait anchor; a
 // stale key is refused and the stored reason is unchanged on read-back.

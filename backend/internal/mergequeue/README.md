@@ -197,6 +197,12 @@ Go `time.Now()` is compared against a stored instant.
   cleared, `enqueued_at` kept) and stamps `yield_reason`, `yield_detail` and
   `yielded_at`; `approval_wait_started_at` is kept. Empty reason →
   `ErrInvalidRequest` (`TestYield_OneTransactionUnderEpochCAS`).
+  `YieldMarker.Continue` (the entry's last cleared episode for that reason,
+  supplied by the server) makes `yielded_at` that episode's instead of the
+  database clock, ONLY when the row's anchor in the same statement equals the
+  episode's head and base; `Enqueue` marking an unmarked held entry applies
+  it after its re-anchor. An already-marked entry keeps its own `yielded_at`
+  (`TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor`).
 - **`ClearYield(id, head, yieldedAt)`**: the ONLY way back in. Under the base
   lock, a compare-and-swap on `state = 'held' AND anchored_head_sha = head AND
   yielded_at = yieldedAt`: clears the marker AND `approval_wait_started_at`

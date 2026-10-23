@@ -275,13 +275,16 @@ WHERE id = $1`, cur.ID, headSHA, baseSHA); err != nil {
 
 // markYieldTx stamps a HELD entry's yield marker: reason and detail are the
 // request's, and yielded_at keeps an existing value (COALESCE), so a re-marked
-// entry stays in the same yield episode and its approval-wait anchor is kept.
-// The caller guarantees the entry is held (a live row is never marked; the
-// 0109 CHECK refuses one).
+// entry stays in the same yield episode and its approval-wait anchor is kept;
+// an unmarked entry continues m.Continue's cleared episode when its anchor
+// matches (yieldContinueSQL), else stamps the database clock. The caller
+// guarantees the entry is held (a live row is never marked; the 0109 CHECK
+// refuses one).
 func markYieldTx(ctx context.Context, tx pgx.Tx, cur Entry, m YieldMarker) (Entry, error) {
+	contAt, contHead, contBase := m.continueArgs()
 	if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
-SET yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(yielded_at, clock_timestamp())
-WHERE id = $1`, cur.ID, m.Reason, m.Detail); err != nil {
+SET yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(yielded_at, `+yieldContinueSQL+`, clock_timestamp())
+WHERE id = $1`, cur.ID, m.Reason, m.Detail, contAt, contHead, contBase); err != nil {
 		return Entry{}, fmt.Errorf("mergequeue: mark yield: %w", err)
 	}
 	return getEntryTx(ctx, tx, cur.ID)
@@ -685,10 +688,12 @@ FROM merge_candidate_queue_entries WHERE id = $1`, cur.ID, window.Microseconds()
 // Yield moves a LIVE entry at epoch to held and marks it yielded, in ONE
 // statement (ADR-112 R3): state held, phase and admitted_at cleared,
 // enqueued_at kept (a cleared row rejoins FIFO at its original place),
-// yield_reason, yield_detail and yielded_at (database clock) stamped, and
-// approval_wait_started_at kept. It is a compare-and-swap on the admission
-// epoch: a held or terminal entry, or one re-admitted since epoch, is
-// ErrStateConflict and is not touched. An empty reason is ErrInvalidRequest.
+// yield_reason, yield_detail and yielded_at (database clock, or the
+// marker's continued episode when the anchor matches it: yieldContinueSQL)
+// stamped, and approval_wait_started_at kept. It is a compare-and-swap on the
+// admission epoch: a held or terminal entry, or one re-admitted since epoch,
+// is ErrStateConflict and is not touched. An empty reason is
+// ErrInvalidRequest.
 func (s *PostgresStore) Yield(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error) {
 	if err := marker.validate(); err != nil {
 		return Entry{}, err
@@ -698,10 +703,11 @@ func (s *PostgresStore) Yield(ctx context.Context, entryID uuid.UUID, epoch int6
 		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // Yield admission-epoch CAS
 			return epochConflict(cur, epoch)
 		}
+		contAt, contHead, contBase := marker.continueArgs()
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
 SET state = 'held', phase = NULL, admitted_at = NULL,
-    yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = clock_timestamp()
-WHERE id = $1`, cur.ID, marker.Reason, marker.Detail); err != nil {
+    yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(`+yieldContinueSQL+`, clock_timestamp())
+WHERE id = $1`, cur.ID, marker.Reason, marker.Detail, contAt, contHead, contBase); err != nil {
 			return fmt.Errorf("mergequeue: yield entry: %w", err)
 		}
 		e, err := getEntryTx(ctx, tx, cur.ID)
@@ -713,6 +719,14 @@ WHERE id = $1`, cur.ID, marker.Reason, marker.Detail); err != nil {
 	}
 	return out, nil
 }
+
+// yieldContinueSQL is the episode continuation of a yield write ($4 the
+// continued yielded_at, $5/$6 its head and base, YieldMarker.Continue): the
+// continued yielded_at when the row's anchor equals it, else NULL (the caller
+// COALESCEs to the database clock, a new episode). It is judged in the write's
+// own statement, so a re-anchor earlier in the same transaction counts.
+const yieldContinueSQL = `CASE WHEN anchored_head_sha = $5::text AND anchored_base_sha IS NOT DISTINCT FROM NULLIF($6::text, '')
+  THEN $4::timestamptz END`
 
 // yieldCASTx runs one compare-and-swap UPDATE on a yielded entry: set is the
 // SET clause, args from $4. The predicate is the marker's identity: state

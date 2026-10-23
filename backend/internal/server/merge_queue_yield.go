@@ -176,11 +176,15 @@ func mergeOnPassFoldYield(fold forgeApprovalDecision) (y mergeQueueYield, immedi
 
 // yieldMergeQueueEntry yields the LIVE entry e at its admission epoch (one
 // store transaction: held, marker stamped, enqueued_at and the wait anchor
-// kept), then appends merge_queue_yielded. It reports whether the entry
-// yielded: a CAS conflict or a failed write leaves it untouched and false. It
-// is called OUTSIDE the merge-intent lock (ADR-112 R3: never inside it).
+// kept), then appends merge_queue_yielded. A same-reason re-yield continues
+// the entry's last cleared episode (mergeQueueYieldContinuation). It reports
+// whether the entry yielded: a CAS conflict or a failed write leaves it
+// untouched and false. It is called OUTSIDE the merge-intent lock (ADR-112
+// R3: never inside it).
 func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y mergeQueueYield, site string) bool {
-	yielded, err := s.cfg.MergeQueue.Yield(ctx, e.ID, e.AdmissionEpoch, y.marker())
+	m := y.marker()
+	m.Continue = s.mergeQueueYieldContinuation(ctx, e, y.Reason)
+	yielded, err := s.cfg.MergeQueue.Yield(ctx, e.ID, e.AdmissionEpoch, m)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: the yield did not land; another admission owns the entry or the write failed",
@@ -191,6 +195,52 @@ func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y
 	}
 	_ = s.writeMergeQueueYielded(ctx, yielded, y, site, "")
 	return true
+}
+
+// mergeQueueYieldContinuation is the episode a re-yield of e for reason
+// continues (ADR-112 R3, #4632): the entry's LAST merge_queue_yield_cleared
+// row, when it names e and the same reason. The store keeps that row's
+// yielded_at only when e's anchor (after the write) is still the head and
+// base it was cleared at (mergequeue.YieldMarker.Continue), so a re-yield for
+// the same reason on the same head and base stays in one episode: the
+// re-probe backoff keeps growing and the episode is posted once, while a moved
+// head or base is a new episode. No such row (none cleared, an unreadable
+// audit chain, a failed cleared append) is nil: a fresh episode. Residual: a
+// continued episode reuses (anchored head, yielded_at), the marker's CAS key,
+// so a re-probe that read the PRIOR marker and races the re-yield may still
+// clear it; that costs one re-attempt, which re-yields in the same episode.
+func (s *Server) mergeQueueYieldContinuation(ctx context.Context, e mergequeue.Entry, reason string) *mergequeue.YieldEpisode {
+	if s.cfg.AuditRepo == nil {
+		return nil
+	}
+	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, e.RunID, CategoryMergeQueueYieldCleared)
+	if err != nil {
+		return nil
+	}
+	var last *mergequeue.YieldEpisode
+	var lastReason string
+	for _, r := range rows {
+		var p struct {
+			EntryID     string `json:"entry_id"`
+			HeadSHA     string `json:"head_sha"`
+			BaseSHA     string `json:"base_sha"`
+			YieldReason string `json:"yield_reason"`
+			YieldedAt   string `json:"yielded_at"`
+		}
+		if json.Unmarshal(r.Payload, &p) != nil || p.EntryID != e.ID.String() {
+			continue
+		}
+		at, perr := time.Parse(time.RFC3339Nano, p.YieldedAt)
+		if perr != nil {
+			last, lastReason = nil, ""
+			continue
+		}
+		last, lastReason = &mergequeue.YieldEpisode{YieldedAt: at, HeadSHA: p.HeadSHA, BaseSHA: p.BaseSHA}, p.YieldReason
+	}
+	if last == nil || lastReason != reason {
+		return nil
+	}
+	return last
 }
 
 // writeMergeQueueYielded appends the chained merge_queue_yielded row for the

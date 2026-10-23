@@ -708,7 +708,7 @@ func (s *Server) reprobeMergeQueueYieldOnApproval(ctx context.Context, runID uui
 			slog.String("run_id", runID.String()))
 		return
 	}
-	s.reprobeMergeQueueYieldDetached(ctx, runID)
+	s.reprobeMergeQueueYieldDetached(ctx, runID, false)
 }
 
 // mergeQueueYieldApprovalTriggers is the approval webhook's per-run re-probe

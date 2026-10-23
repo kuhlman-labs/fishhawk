@@ -2852,8 +2852,10 @@ components:
       description: |
         ADR-112 R3's closed yield vocabulary. A yielded entry is held with a
         marker the queue's admission skips; clearing the marker (a re-probe
-        whose forge-approval fold qualifies) is the only way back in, and the
-        entry then rejoins FIFO at its original `enqueued_at`. `vetoed`,
+        whose forge-approval fold qualifies; for `forge_review_required`, also
+        a fresh forge snapshot that no longer reports review required, changes
+        requested or `BLOCKED`) is the only way back in, and the entry then
+        rejoins FIFO at its original `enqueued_at`. `vetoed`,
         `provider_unsupported` and `identity_provider_unconfigured` yield at
         once; the others wait at the head for the approval window first;
         `forge_review_required` is precedence row 4 (the forge refused the

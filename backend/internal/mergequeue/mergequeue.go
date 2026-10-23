@@ -200,6 +200,34 @@ type EnqueueRequest struct {
 type YieldMarker struct {
 	Reason string
 	Detail string
+	// Continue, when non-nil, is the entry's last CLEARED yield episode for
+	// Reason (ADR-112 R3, #4632): a same-reason re-yield on the same head
+	// and base keeps that episode's yielded_at, so the re-probe backoff keeps
+	// growing instead of restarting. A write that would stamp a fresh
+	// yielded_at (Yield, or Enqueue marking an unmarked held entry) stamps
+	// Continue.YieldedAt instead ONLY when the entry's anchor after the
+	// write equals Continue's HeadSHA and BaseSHA; any other anchor is a new
+	// episode on the database clock. An already-marked entry keeps its own
+	// yielded_at whatever Continue says.
+	Continue *YieldEpisode
+}
+
+// YieldEpisode is a cleared yield episode: its yielded_at and the anchor it
+// was cleared at ("" BaseSHA for NULL).
+type YieldEpisode struct {
+	YieldedAt time.Time
+	HeadSHA   string
+	BaseSHA   string
+}
+
+// continueArgs are the SQL arguments of m's episode continuation: NULLs
+// when there is none.
+func (m YieldMarker) continueArgs() (yieldedAt *time.Time, headSHA, baseSHA string) {
+	if m.Continue == nil || m.Continue.YieldedAt.IsZero() || m.Continue.HeadSHA == "" {
+		return nil, "", ""
+	}
+	t := m.Continue.YieldedAt
+	return &t, m.Continue.HeadSHA, m.Continue.BaseSHA
 }
 
 // validate refuses an empty reason before any SQL runs.

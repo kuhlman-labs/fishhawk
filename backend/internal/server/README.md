@@ -3312,10 +3312,22 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   ticks at `MergeCandidateQueuePumpInterval` beside the pump. Per base it
   re-probes AT MOST ONE row, the oldest due under the stateless backoff
   `yieldReprobeDue(yield age, interval)`. The fold runs at the anchored head
-  with no store transaction open: approved → `ClearYield` (CAS on
+  with no store transaction open: approved AND the ONE clear predicate
+  `mergeQueueYieldClears` holds → `ClearYield` (CAS on
   `anchored_head_sha` and `yielded_at`) → `merge_queue_yield_cleared` → a
-  detached pump (the row rejoins FIFO at its `enqueued_at`); the same reason
-  → nothing; a changed reason → `UpdateYield` + a `merge_queue_yielded`
+  detached pump (the row rejoins FIFO at its `enqueued_at`). The predicate
+  clears every reason on the approved fold EXCEPT `forge_review_required`:
+  that row yielded BECAUSE the fold approved and the forge still refused (a
+  gate-less fold is always approved), so it clears only when a FRESH review
+  snapshot, read even on a gate-less run (`forgeReviewRequiredSnapshot`, the
+  row-4 yield's own read), shows reviewDecision neither `REVIEW_REQUIRED` nor
+  `CHANGES_REQUESTED` (null is not the condition) and mergeStateStatus not
+  `BLOCKED`; an unreadable or undetermined snapshot keeps it yielded (fail
+  closed). Every automatic path (the sweep, the targeted re-probe, the
+  webhook trigger) judges that predicate unforced, so an unchanged forge state
+  never loops clear → re-admit → refused PUT → re-yield; the operator's
+  explicit `merge_run` re-invoke forces ONE re-attempt (`force`). The same
+  reason → nothing; a changed reason → `UpdateYield` + a `merge_queue_yielded`
   transition row; the PR head moved → `ReanchorYielded` to the current head
   KEEPING the marker and the episode (a head move never clears a marker),
   then the new head is judged on the same probe; merged, a transport error
@@ -3323,8 +3335,20 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `merge_run` re-invoke on a queued yielded entry (and the inline
   `merge_queue_owns_merge` refusal on one), and an approved
   `pull_request_review` whose `commit_id` equals the anchored head, at most
-  once per run per pump interval; the webhook is a trigger only, the fold is
-  the sole decision.
+  once per run per pump interval; the webhook is a trigger only, the fold
+  (and, for `forge_review_required`, the fresh snapshot) is the sole
+  decision.
+- **One episode per same-reason re-yield.** A live entry re-yielding for the
+  SAME reason on the same anchored head and base as its LAST cleared episode
+  (`mergeQueueYieldContinuation`, read from the last
+  `merge_queue_yield_cleared` row, which carries `base_sha`) keeps that
+  episode's `yielded_at` (`mergequeue.YieldMarker.Continue`, judged against
+  the anchor in the store's own statement): the backoff age keeps growing
+  and the episode is posted once. A moved head or base, another reason, or a
+  missing cleared row is a new episode. Residual: the continued episode
+  reuses the marker's CAS key, so a re-probe racing the re-yield with the
+  PRIOR marker may clear it once more (one re-attempt, re-yielded in the same
+  episode).
 - **Surfacing and audit.** `merge_queue_yielded` (INTERNAL: entry_id,
   base_ref, head_sha, yield_reason, yield_detail, next_step, site
   `merge_on_pass` | `admission` | `merge_run` | `reprobe` | `reprobe_heal`,

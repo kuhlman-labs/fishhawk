@@ -718,32 +718,50 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 }
 
 // mergeOnPassRefusalNeedsReview is ADR-112 R3 rows 4/5 after a TYPED forge
-// refusal whose claim was released: ONE fresh review snapshot (no permission
-// reads). ok=true ONLY when reviewDecision is REVIEW_REQUIRED or
-// CHANGES_REQUESTED, or mergeStateStatus is BLOCKED (row 4: yield
-// forge_review_required, next_step approve_pr).
-// A null reviewDecision (a base without required-review protection) is NOT
-// "not approved". A non-GitHub forge, an unaddressable run or a snapshot read
-// error is ok=false (row 5, forge_merge_refused). It applies with or without a
-// declared gate.
+// refusal whose claim was released: ONE fresh review snapshot
+// (forgeReviewRequiredSnapshot). ok=true ONLY when it shows the row-4
+// condition (yield forge_review_required, next_step approve_pr). A non-GitHub
+// forge, an unaddressable run or a snapshot read error is ok=false (row 5,
+// forge_merge_refused). It applies with or without a declared gate.
 func (s *Server) mergeOnPassRefusalNeedsReview(ctx context.Context, runRow *run.Run) (reviewDecision, mergeStateStatus string, ok bool) {
-	reader, unsupported, _ := s.forgeApprovalReaderFor(runRow)
-	if unsupported || reader == nil {
-		return "", "", false
-	}
-	rctx, cancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
-	defer cancel()
-	snap, err := reader.ReviewSnapshot(rctx)
+	decision, status, present, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge queue: post-refusal review snapshot unreadable; ejecting forge_merge_refused",
 			slog.String("run_id", runRow.ID.String()), slog.String("detail", sanitizeForgeReadDetail("review_snapshot", err.Error())))
 		return "", "", false
 	}
+	return decision, status, present
+}
+
+// errForgeReviewSnapshotUnavailable is a run whose forge or pull request has
+// no review snapshot to read (a non-GitHub forge, an unaddressable run).
+var errForgeReviewSnapshotUnavailable = errors.New("no review snapshot is readable for this run (non-GitHub forge or unaddressable pull request)")
+
+// forgeReviewRequiredSnapshot reads ONE fresh review snapshot (no permission
+// reads), with or without a declared gate, and reports whether it shows the
+// ADR-112 R3 row-4 condition: reviewDecision REVIEW_REQUIRED or
+// CHANGES_REQUESTED, or mergeStateStatus BLOCKED. A null reviewDecision (a
+// base without required-review protection) is NOT the condition. The error is
+// a snapshot that could not be read (errForgeReviewSnapshotUnavailable, or a
+// transport failure): the condition is then undetermined. The row-4 yield
+// (mergeOnPassRefusalNeedsReview) and its clear (mergeQueueYieldClears) both
+// judge it here.
+func (s *Server) forgeReviewRequiredSnapshot(ctx context.Context, runRow *run.Run) (reviewDecision, mergeStateStatus string, present bool, err error) {
+	reader, unsupported, _ := s.forgeApprovalReaderFor(runRow)
+	if unsupported || reader == nil {
+		return "", "", false, errForgeReviewSnapshotUnavailable
+	}
+	rctx, cancel := context.WithTimeout(ctx, mergeOnPassForgeCallTimeout)
+	defer cancel()
+	snap, err := reader.ReviewSnapshot(rctx)
+	if err != nil {
+		return "", "", false, err
+	}
 	switch {
 	case snap.ReviewDecision == "REVIEW_REQUIRED", snap.ReviewDecision == "CHANGES_REQUESTED", snap.MergeStateStatus == "BLOCKED":
-		return snap.ReviewDecision, snap.MergeStateStatus, true
+		return snap.ReviewDecision, snap.MergeStateStatus, true, nil
 	}
-	return snap.ReviewDecision, snap.MergeStateStatus, false
+	return snap.ReviewDecision, snap.MergeStateStatus, false, nil
 }
 
 // mergeOnPassVerdict is a decoded merge_verdict_recorded row.

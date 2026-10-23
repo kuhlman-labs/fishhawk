@@ -608,6 +608,34 @@ func TestMergeQueueE2E_GatelessBlockedRefusalEjectsReviewRequired(t *testing.T) 
 	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
 }
 
+// TestMergeQueueE2E_GatelessRowFourYieldIsNotReprobedIntoALoop is the
+// row-4 yield's re-probe twin of the test above: A alone on its base, so a
+// cleared row re-admits at an unmoved base and re-attempts the pinned PUT.
+// Two due sweeps and one targeted (webhook-shaped, unforced) re-probe run on
+// an UNCHANGED forge state (405, BLOCKED). The gate-less fold is always
+// approved, so only the fresh-snapshot clear predicate keeps the row: exactly
+// ONE PUT in total, A still yielded, yielded_at unchanged. Counterfactual:
+// clearing on the approved fold alone re-admits A on the first sweep and
+// re-PUTs a1 on every probe, RED.
+func TestMergeQueueE2E_GatelessRowFourYieldIsNotReprobedIntoALoop(t *testing.T) {
+	w, a, y := newRowFourYieldWorld(t)
+	ctx := context.Background()
+
+	for i := range 2 {
+		if n := w.srv.sweepMergeQueueYields(ctx, time.Hour); n != 1 {
+			t.Fatalf("sweep %d re-probed %d rows, want 1 (the backdated row is due)", i+1, n)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+	}
+	if w.srv.ReprobeMergeQueueYield(ctx, a.id, false) {
+		t.Fatal("the targeted re-probe cleared the row on an unchanged forge state")
+	}
+	w.srv.bgMergeQueuePump.Wait()
+
+	w.requirePuts("a1")
+	w.requireRowFourKept(a, y)
+}
+
 // TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance (CF1's e2e vehicle):
 // A waits at the head with no forge approval; its anchor is backdated past the
 // window BEFORE the base moves, so the next pump READVANCES A (Unadmit), the
