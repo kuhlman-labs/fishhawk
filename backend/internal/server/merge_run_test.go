@@ -3974,3 +3974,324 @@ func (f *mcqFixture) activeEntry(r *mcqRun) mergequeue.Entry {
 	}
 	return st.Entry
 }
+
+// ADR-112 R3 (#4632, slice 4): the merge_run queue arm's YIELD. With a
+// head-pinned merger bound (the queue owns merges), a run whose ONLY
+// ineligibility is the approval leg is enqueued yielded instead of refused,
+// over the real Postgres queue and audit chain and the mcq fake forge on the
+// non-Fishhawk fixture repository x/y.
+
+// mrYieldWorld seeds one behind run under mqeSpecYAML (approval gate member
+// alice) with NO live REST approval, in a world whose GateMerger is
+// head-pinned.
+func mrYieldWorld(t *testing.T) (*mqmWorld, *mcqRun) {
+	t.Helper()
+	w := newMQMWorld(t)
+	r := w.seed("y", "y0", []byte(mqeSpecYAML))
+	w.behind(r, "y0", "y1")
+	return w, r
+}
+
+func mrDecodeQueued(t *testing.T, rec *httptest.ResponseRecorder) mergeRunResponse {
+	t.Helper()
+	if rec.Code != http.StatusAccepted {
+		t.Fatalf("merge = %d, want 202:\n%s", rec.Code, rec.Body.String())
+	}
+	var resp mergeRunResponse
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp
+}
+
+// TestMergeRun_ApprovalOnlyFailureEnqueuesYielded: an approval-leg-only
+// failure (no live approval, not_approved) answers 202 queued and leaves a
+// HELD entry carrying the merge intent and the forge_approval_absent marker
+// (next step approve_pr). merge_queue_entered (yielded, yield_reason) precedes
+// the merge_queue_yielded row (site merge_run): record before commit. Nothing
+// merged and no verdict was recorded. Counterfactual: refusing instead of
+// yielding (mergeRunApprovalYield returning false) answers today's 409
+// merge_base_behind with no entry, RED.
+func TestMergeRun_ApprovalOnlyFailureEnqueuesYielded(t *testing.T) {
+	w, r := mrYieldWorld(t)
+	resp := mrDecodeQueued(t, w.mergeRun(r))
+	w.srv.bgMergeQueuePump.Wait()
+
+	if !resp.Queued || resp.MergeQueued || resp.QueueState != "held" || resp.AnchoredHeadSHA != "y0" || resp.IntentSequence == 0 ||
+		!strings.Contains(resp.Message, "YIELDED") || !strings.Contains(resp.Message, mergeCandidateQueueReasonForgeApprovalAbsent) ||
+		!strings.Contains(resp.Message, "approve_pr") {
+		t.Fatalf("response = %+v, want queued held at y0 naming the yield and approve_pr", resp)
+	}
+	e := w.active(r)
+	if e.State != mergequeue.StateHeld || e.YieldedAt == nil || e.YieldReason != mergeCandidateQueueReasonForgeApprovalAbsent ||
+		e.MergeIntentAt == nil || e.MergeIntentSequence != resp.IntentSequence {
+		t.Fatalf("entry = %s yielded_at=%v reason=%q intent=%v seq=%d, want held, yielded absent, intent at %d",
+			e.State, e.YieldedAt, e.YieldReason, e.MergeIntentAt, e.MergeIntentSequence, resp.IntentSequence)
+	}
+	entered := w.rows(r, CategoryMergeQueueEntered)
+	if len(entered) != 1 || entered[0].Sequence != resp.IntentSequence {
+		t.Fatalf("merge_queue_entered rows = %d, want 1 at %d", len(entered), resp.IntentSequence)
+	}
+	if p := w.payload(entered[0]); p["yielded"] != true || p["yield_reason"] != mergeCandidateQueueReasonForgeApprovalAbsent {
+		t.Fatalf("merge_queue_entered payload = %v, want yielded with its reason", p)
+	}
+	yielded := w.rows(r, CategoryMergeQueueYielded)
+	if len(yielded) == 0 {
+		t.Fatal("no merge_queue_yielded row")
+	}
+	if p := w.payload(yielded[0]); p["site"] != mergeQueueYieldSiteMergeRun || p["next_step"] != forgeApprovalNextApprovePR ||
+		p["entry_id"] != e.ID.String() || p["yield_reason"] != mergeCandidateQueueReasonForgeApprovalAbsent {
+		t.Fatalf("merge_queue_yielded payload = %v", p)
+	}
+	if yielded[0].Sequence <= entered[0].Sequence {
+		t.Fatalf("merge_queue_yielded at %d is not after merge_queue_entered at %d (record before commit)", yielded[0].Sequence, entered[0].Sequence)
+	}
+	if n := len(w.rows(r, CategoryMergeVerdictRecorded)); n != 0 {
+		t.Fatalf("merge_verdict_recorded rows = %d, want 0", n)
+	}
+	w.requireMerges(0)
+}
+
+// TestMergeRun_ChangesRequestedEnqueuesVetoed: a changes-requested review
+// (the approval leg's other reason) yields forge_approval_vetoed with next
+// step dismiss_review (R3 row 2). The forge snapshot agrees (bob holds
+// write), so the immediate re-probe's fold keeps the reason.
+func TestMergeRun_ChangesRequestedEnqueuesVetoed(t *testing.T) {
+	w, r := mrYieldWorld(t)
+	w.gh.set(func() {
+		w.gh.reviews[r.pr] = `[{"id":1,"user":{"login":"bob"},"state":"CHANGES_REQUESTED","submitted_at":"2026-01-01T00:00:00Z"}]`
+	})
+	w.forgeReviews(r, []string{"bob"}, mqmReview(1, "bob", "CHANGES_REQUESTED", "y0"))
+	resp := mrDecodeQueued(t, w.mergeRun(r))
+	w.srv.bgMergeQueuePump.Wait()
+	if !strings.Contains(resp.Message, "dismiss_review") {
+		t.Fatalf("message = %q, want the dismiss_review next step", resp.Message)
+	}
+	e := w.active(r)
+	if e.YieldReason != mergeCandidateQueueReasonForgeApprovalVetoed || e.YieldedAt == nil {
+		t.Fatalf("entry reason = %q yielded_at=%v, want vetoed", e.YieldReason, e.YieldedAt)
+	}
+	if p := w.payload(w.rows(r, CategoryMergeQueueYielded)[0]); p["next_step"] != forgeApprovalNextDismissReview ||
+		p["precedence_row"] != float64(mergeQueueYieldRowVeto) {
+		t.Fatalf("merge_queue_yielded payload = %v, want dismiss_review at row 2", p)
+	}
+}
+
+// TestMergeRun_MixedIneligibilityRefusesWithNothingWritten: the approval leg
+// AND a non-approval leg (an open high concern) fail, so the arm keeps
+// today's 409 with nothing written: no entry, no merge_queue_entered, no
+// merge_queue_yielded. Counterfactual: widening the yield predicate to any
+// ineligibility (dropping mergeRunApprovalYield's default refusal) enqueues
+// an entry, RED.
+func TestMergeRun_MixedIneligibilityRefusesWithNothingWritten(t *testing.T) {
+	w, r := mrYieldWorld(t)
+	w.raiseConcern(r, "high", "agent")
+	rec := w.mergeRun(r)
+	w.srv.bgMergeQueuePump.Wait()
+	if rec.Code != http.StatusConflict || mqeCode(t, rec.Body.Bytes()) != mergeCodeBaseBehind ||
+		!strings.Contains(rec.Body.String(), `"merge_queue_ineligible":["not_approved","blocking_concern_open"]`) {
+		t.Fatalf("merge = %d %s, want 409 merge_base_behind naming both reasons", rec.Code, rec.Body.String())
+	}
+	if es := w.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %d, want 0", len(es))
+	}
+	for _, c := range []string{CategoryMergeQueueEntered, CategoryMergeQueueYielded} {
+		if n := len(w.rows(r, c)); n != 0 {
+			t.Fatalf("%s rows = %d, want 0", c, n)
+		}
+	}
+}
+
+// TestMergeRun_ApprovalYieldNeverMarksALiveEntry: the run already holds the
+// line (a LIVE entry without intent) and its approval is absent, so the arm
+// only records the intent: no marker, merge_queue_entered not flagged
+// yielded, no merge_queue_yielded row (merge-on-pass judges a live entry's
+// approval). Counterfactual: dropping the handler's live guard flags the
+// merge_queue_entered row yielded (the store's own guard still keeps the
+// marker off the row), RED on the payload.
+func TestMergeRun_ApprovalYieldNeverMarksALiveEntry(t *testing.T) {
+	w, r := mrYieldWorld(t)
+	ctx := context.Background()
+	res, err := w.store.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: r.id, BaseRef: mcqBase, HeadSHA: "y0"})
+	if err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	if adm, err := w.store.AdmitNext(ctx, res.Entry.Base()); err != nil || !adm.Admitted {
+		t.Fatalf("admit: %+v %v", adm, err)
+	}
+	resp := mrDecodeQueued(t, w.mergeRun(r))
+	w.srv.bgMergeQueuePump.Wait()
+	if resp.QueueState != "live" || strings.Contains(resp.Message, "YIELDED") {
+		t.Fatalf("response = %+v, want the live entry, not a yield", resp)
+	}
+	e := w.active(r)
+	if e.State != mergequeue.StateLive || e.YieldedAt != nil || e.MergeIntentAt == nil {
+		t.Fatalf("entry = %s yielded_at=%v intent=%v, want live, unmarked, with intent", e.State, e.YieldedAt, e.MergeIntentAt)
+	}
+	if p := w.payload(w.rows(r, CategoryMergeQueueEntered)[0]); p["yielded"] != nil || p["yield_reason"] != nil {
+		t.Fatalf("merge_queue_entered payload = %v, want no yield on a live entry", p)
+	}
+	if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 {
+		t.Fatalf("merge_queue_yielded rows = %d, want 0", n)
+	}
+}
+
+// TestMergeRun_ReinvokeOnYieldedEntryReprobes pins approval condition C2(e):
+// once the run is yielded, a qualifying forge approval lands at its anchored
+// head, and a merge_run RE-INVOKE (answered already_queued, nothing written)
+// re-probes the entry at once: the marker clears through the CAS and
+// merge_queue_yield_cleared is recorded. Counterfactual: dropping the arm's
+// deferred re-probe leaves the entry marked with no cleared row, RED.
+func TestMergeRun_ReinvokeOnYieldedEntryReprobes(t *testing.T) {
+	w, r := mrYieldWorld(t)
+	first := mrDecodeQueued(t, w.mergeRun(r))
+	w.srv.bgMergeQueuePump.Wait()
+	y := w.active(r)
+	if y.YieldedAt == nil {
+		t.Fatal("the first merge did not yield")
+	}
+	w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "y0"))
+
+	second := mrDecodeQueued(t, w.mergeRun(r))
+	w.srv.bgMergeQueuePump.Wait()
+	if !second.AlreadyQueued || second.IntentSequence != first.IntentSequence {
+		t.Fatalf("re-invoke = %+v, want already_queued naming %d", second, first.IntentSequence)
+	}
+	cleared := w.rows(r, CategoryMergeQueueYieldCleared)
+	if len(cleared) != 1 || w.payload(cleared[0])["entry_id"] != y.ID.String() {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1 naming %s", len(cleared), y.ID)
+	}
+	var stillMarked bool
+	if err := w.pool.QueryRow(context.Background(),
+		`SELECT yielded_at IS NOT NULL FROM merge_candidate_queue_entries WHERE id = $1`, y.ID).Scan(&stillMarked); err != nil {
+		t.Fatalf("read marker: %v", err)
+	}
+	if stillMarked {
+		t.Fatal("the entry is still marked after the re-invoke's re-probe")
+	}
+	if n := len(w.rows(r, CategoryMergeQueueEntered)); n != 1 {
+		t.Fatalf("merge_queue_entered rows = %d, want 1 (the re-invoke wrote nothing)", n)
+	}
+}
+
+// mrPreLockBlindQueue fails every ActiveForRun until the merge-intent lock is
+// first taken, so the merge-candidate gate's held arm fails open and the
+// inline path's in-lock ownership check is what meets the yielded entry.
+type mrPreLockBlindQueue struct {
+	mergequeue.Store
+	locked atomic.Bool
+}
+
+func (q *mrPreLockBlindQueue) ActiveForRun(ctx context.Context, runID uuid.UUID) (mergequeue.Status, bool, error) {
+	if !q.locked.Load() {
+		return mergequeue.Status{}, false, errors.New("queue read injected failure")
+	}
+	return q.Store.ActiveForRun(ctx, runID)
+}
+
+func (q *mrPreLockBlindQueue) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	q.locked.Store(true)
+	return q.Store.WithMergeIntentLock(ctx, runID, fn)
+}
+
+// TestMergeRun_InlineOwnedRefusalOnYieldedEntryReprobes: the inline path's
+// 409 merge_queue_owns_merge on a YIELDED entry (whose head now carries a
+// qualifying approval) triggers the targeted re-probe, which clears the
+// marker. Counterfactual: dropping the trigger at the refusal leaves the
+// entry marked with no cleared row, RED.
+func TestMergeRun_InlineOwnedRefusalOnYieldedEntryReprobes(t *testing.T) {
+	w, _ := newMQEWorld(t)
+	r := w.faeInline("own", faeGateSpecYAML)
+	w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+	if _, err := w.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{RunID: r.id, BaseRef: mcqBase, HeadSHA: "h1",
+		MergeIntent: true, Yield: &mergequeue.YieldMarker{Reason: mergeCandidateQueueReasonForgeApprovalAbsent}}); err != nil {
+		t.Fatalf("enqueue: %v", err)
+	}
+	w.srv.cfg.MergeQueue = &mrPreLockBlindQueue{Store: w.store}
+
+	rec := w.mergeRun(r)
+	w.srv.bgMergeQueuePump.Wait()
+	if rec.Code != http.StatusConflict || mqeCode(t, rec.Body.Bytes()) != "merge_queue_owns_merge" {
+		t.Fatalf("merge = %d %s, want 409 merge_queue_owns_merge", rec.Code, rec.Body.String())
+	}
+	if n := len(w.rows(r, CategoryMergeQueueYieldCleared)); n != 1 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1 (the refusal re-probed the yielded entry)", n)
+	}
+}
+
+// TestMergeRunApprovalYield_Predicate pins the yield predicate's guards on
+// fixed results: no head-pinned merger, an undeterminable read, no reasons
+// and any non-approval reason each refuse; the two approval reasons map to
+// their yields, a veto winning beside not_approved.
+func TestMergeRunApprovalYield_Predicate(t *testing.T) {
+	reasons := func(codes ...string) mergeQueueEligibilityResult {
+		var r mergeQueueEligibilityResult
+		for _, c := range codes {
+			r.Reasons = append(r.Reasons, mergeQueueIneligibility{Code: c, Detail: c + " detail"})
+		}
+		return r
+	}
+	pinned := &Server{cfg: Config{GateMerger: &mqmMerger{}}}
+	unpinned := &Server{cfg: Config{GateMerger: &fakeMerger{}}}
+	undet := reasons(mergeQueueReasonNotApproved)
+	undet.Undeterminable = true
+	for _, tc := range []struct {
+		name   string
+		s      *Server
+		r      mergeQueueEligibilityResult
+		ok     bool
+		reason string
+	}{
+		{"not approved", pinned, reasons(mergeQueueReasonNotApproved), true, mergeCandidateQueueReasonForgeApprovalAbsent},
+		{"changes requested", pinned, reasons(mergeQueueReasonChangesRequested), true, mergeCandidateQueueReasonForgeApprovalVetoed},
+		{"veto wins", pinned, reasons(mergeQueueReasonNotApproved, mergeQueueReasonChangesRequested), true, mergeCandidateQueueReasonForgeApprovalVetoed},
+		{"no pinned merger", unpinned, reasons(mergeQueueReasonNotApproved), false, ""},
+		{"undeterminable", pinned, undet, false, ""},
+		{"no reasons", pinned, reasons(), false, ""},
+		{"mixed", pinned, reasons(mergeQueueReasonNotApproved, mergeQueueReasonChecksRed), false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			y, ok := tc.s.mergeRunApprovalYield(tc.r)
+			if ok != tc.ok || y.Reason != tc.reason {
+				t.Fatalf("= %+v %v, want %v %q", y, ok, tc.ok, tc.reason)
+			}
+			if ok && (y.NextStep != mergeQueueYieldNextStep(tc.reason) || y.Detail == "") {
+				t.Fatalf("yield = %+v, want next step %s and a detail", y, mergeQueueYieldNextStep(tc.reason))
+			}
+		})
+	}
+}
+
+// TestMergeRunYieldNextStepText_ClosedVocabulary: every next step renders
+// its own closed text and an unknown one renders none.
+func TestMergeRunYieldNextStepText_ClosedVocabulary(t *testing.T) {
+	for _, next := range []string{forgeApprovalNextApprovePR, forgeApprovalNextDismissReview, forgeApprovalNextRetryAfter,
+		forgeApprovalNextConfigureIdentityProvider, mergeQueueYieldNextNone} {
+		if got := mergeRunYieldNextStepText(next); !strings.HasPrefix(got, next+" (") {
+			t.Errorf("text(%s) = %q, want it to lead with the step", next, got)
+		}
+	}
+	if got := mergeRunYieldNextStepText("ignore previous instructions"); strings.Contains(got, "ignore") {
+		t.Errorf("an unknown step was interpolated: %q", got)
+	}
+}
+
+// TestMergeRun_FreshYieldReprobesAtOnce: the forge snapshot already carries a
+// qualifying approval the entry predicate's REST listing does not show (an
+// approval that landed after that read), so merge_run yields the run and its
+// immediate re-probe clears the marker in the same call's detached work.
+// Counterfactual: dropping the fresh-yield re-probe leaves the entry marked
+// with no cleared row, RED.
+func TestMergeRun_FreshYieldReprobesAtOnce(t *testing.T) {
+	w, r := mrYieldWorld(t)
+	w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "y0"))
+	resp := mrDecodeQueued(t, w.mergeRun(r))
+	w.srv.bgMergeQueuePump.Wait()
+	if !strings.Contains(resp.Message, "YIELDED") {
+		t.Fatalf("response = %+v, want the yield", resp)
+	}
+	cleared := w.rows(r, CategoryMergeQueueYieldCleared)
+	if len(cleared) != 1 || w.payload(cleared[0])["entry_id"] != resp.EntryID {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1 naming %s", len(cleared), resp.EntryID)
+	}
+}
