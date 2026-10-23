@@ -5,6 +5,7 @@ status: accepted
 issue: https://github.com/kuhlman-labs/fishhawk/issues/2127
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-115"]
 applies_to: []
 ---
 

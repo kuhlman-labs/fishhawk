@@ -419,6 +419,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-116"
+      ],
       "applies_to": []
     },
     {
@@ -555,6 +558,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-113"
+      ],
       "applies_to": []
     },
     {
@@ -641,6 +647,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-115"
+      ],
       "applies_to": []
     },
     {
@@ -688,6 +697,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-118"
+      ],
       "applies_to": []
     },
     {
@@ -805,6 +817,18 @@
       "applies_to": []
     },
     {
+      "id": "ADR-084",
+      "title": "Reviewer personas: a separate reviewer invocation with a declared remit, attached per stage or by an escalation, advisory with ingest-time checks, plus deterministic security checks as concern sources",
+      "path": "docs/adr/084-reviewer-personas.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amended_by": [
+        "ADR-118"
+      ],
+      "applies_to": []
+    },
+    {
       "id": "ADR-085",
       "title": "Earned autonomy: recommendations only, from server-attested evidence and a blind shadow record, with asymmetric thresholds (lower fast, raise slowly) and captain ratification through a human-authored spec change",
       "path": "docs/adr/085-earned-autonomy-recommendations-only.md",
@@ -890,6 +914,9 @@
       "superseded_by": [
         "ADR-093"
       ],
+      "amended_by": [
+        "ADR-115"
+      ],
       "applies_to": []
     },
     {
@@ -903,7 +930,9 @@
       ],
       "superseded_by": [],
       "amended_by": [
-        "ADR-109"
+        "ADR-109",
+        "ADR-112",
+        "ADR-115"
       ],
       "applies_to": []
     },
@@ -917,7 +946,8 @@
       ],
       "superseded_by": [],
       "amended_by": [
-        "ADR-100"
+        "ADR-100",
+        "ADR-115"
       ],
       "applies_to": []
     },
@@ -1115,6 +1145,103 @@
       "supersedes": [],
       "superseded_by": [],
       "applies_to": []
+    },
+    {
+      "id": "ADR-112",
+      "title": "Amend ADR-093 D6: a transferred approval needs a fresh, trusted forge approval at the verified head; an undeterminable or missing one HOLDS rather than ejects on a non-blocked PR",
+      "path": "docs/adr/112-queue-merge-forge-approval-predicate.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-093"
+      ],
+      "amended_by": [
+        "ADR-115"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-113",
+      "title": "ADR ratification as a forge-verified, hash-bound approval in the plan-gate approvals shape, a deterministic record writer, and catch-rate decoupling (Option B′)",
+      "path": "docs/adr/113-forge-verified-adr-ratification.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-055"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-114",
+      "title": "Refinement sessions are optionally repo-scoped at open, and drafting/preview resolve that repo's conventions per repo (not the shipped default)",
+      "path": "docs/adr/114-repo-scoped-refinement-sessions.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-115",
+      "title": "Every stage runs in parallel up to the merge: the merge queue is the only serial point, capacity is the only bound, and a moving base is reconciled at merge time",
+      "path": "docs/adr/115-parallel-stages-up-to-merge.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-063",
+        "ADR-092",
+        "ADR-093",
+        "ADR-094",
+        "ADR-112"
+      ],
+      "amended_by": [
+        "ADR-116"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-116",
+      "title": "A slice conflict at fan-in parks and is recovered in place (conflict probe, mechanical union, then a hunk-confined resolution pass, then a scoped parent fix-up, with a verified operator resolution always available), never by restarting the whole run",
+      "path": "docs/adr/116-fan-in-conflict-recovered-in-place.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-041",
+        "ADR-115"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-117",
+      "title": "Live review effectiveness is measured: concern outcomes and human judgements, child-slice concerns imported into the parent, an escape record attributed to the rounds that saw the code, and a presence-conditioned per-reviewer scorecard",
+      "path": "docs/adr/117-live-review-effectiveness.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amended_by": [
+        "ADR-118"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-118",
+      "title": "Review changes are judged, not re-pinned: a per-arm eval gate (standing, experiment and monitor arms; model changes as paired experiments), reviewer configuration as a gate trigger, and one pre-registered offline+live decision rule",
+      "path": "docs/adr/118-review-changes-judged-not-repinned.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-068",
+        "ADR-084",
+        "ADR-117"
+      ],
+      "applies_to": [
+        "backend/internal/agenteval/**",
+        "scripts/check-review-prompt-eval"
+      ]
     }
   ]
 }
