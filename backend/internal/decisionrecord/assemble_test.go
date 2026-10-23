@@ -302,12 +302,14 @@ func indexRenderingOf(t *testing.T, raw string) []byte {
 	return rendered
 }
 
-// overCapIndex builds an index over recs whose first record carries a title long
-// enough that the index's RENDERING exceeds capBytes, so Assemble must reshape
-// it.
+// overCapIndex builds an index over recs whose first record carries a second
+// applies_to glob, matching no change path, long enough that the index's
+// RENDERING exceeds capBytes, so Assemble must reshape it. The padding is not
+// in the title, because a rendered title is capped at MaxRenderedTitleChars
+// (#4699).
 func overCapIndex(t *testing.T, capBytes int, recs ...map[string]any) string {
 	t.Helper()
-	recs[0]["title"] = strings.Repeat("long title ", 300)
+	recs[0]["applies_to"] = append(slices.Clone(recs[0]["applies_to"].([]string)), "docs/over-cap-padding/"+strings.Repeat("x", 3300)+"/**")
 	raw := string(indexJSON(t, recs...))
 	if n := len(indexRenderingOf(t, raw)); n <= capBytes {
 		t.Fatalf("fixture index rendering is %d bytes, want > %d", n, capBytes)
@@ -490,7 +492,14 @@ func TestAssemble_IndexNearCapDoesNotStarveRecords(t *testing.T) {
 		rec("ADR-003", "docs/adr/003.md", "accepted", "backend/internal/audit/**"),
 	}
 	const target = capBytes - 40
-	recs[0]["title"] = recs[0]["title"].(string) + strings.Repeat("x", target-len(indexRenderingOf(t, string(indexJSON(t, recs...)))))
+	// The padding goes in a second applies_to glob that matches no change
+	// path, not the title: a rendered title is capped at MaxRenderedTitleChars
+	// (#4699). Each 'x' adds one rendered byte.
+	pad := func(n int) {
+		recs[0]["applies_to"] = []string{"backend/internal/audit/**", "docs/near-cap-padding/" + strings.Repeat("x", n) + "/**"}
+	}
+	pad(0)
+	pad(target - len(indexRenderingOf(t, string(indexJSON(t, recs...)))))
 	idx := string(indexJSON(t, recs...))
 	shown := len(indexRenderingOf(t, idx))
 	if shown*100 < capBytes*95 || shown > capBytes {
@@ -646,6 +655,24 @@ func TestAssemble_IndexShownAsCompactRendering(t *testing.T) {
 	if body := sel.PromptDocuments(false)[0].Body; !strings.Contains(body, "shown as its "+IndexRendering+" rendering, not verbatim") || !strings.Contains(body, indexRenderingNote) {
 		t.Errorf("index prompt document does not disclose the rendering:\n%s", body)
 	}
+	// #4699: the title cap is a new rendering, so its name moved to v2, and the
+	// Source line names it literally.
+	if IndexRendering != "adr-index-lines-v2" {
+		t.Errorf("IndexRendering = %q, want adr-index-lines-v2 (the title-capped rendering, #4699)", IndexRendering)
+	}
+	if body := sel.PromptDocuments(false)[0].Body; !strings.Contains(body, "shown as its adr-index-lines-v2 rendering, not verbatim") {
+		t.Errorf("index Source line does not name adr-index-lines-v2:\n%s", body)
+	}
+	// The framing discloses the cap in the numbers RenderedTitle applies.
+	for _, want := range []string{
+		fmt.Sprintf("a title longer than %d characters", MaxRenderedTitleChars),
+		fmt.Sprintf("its first %d characters followed by '…'", MaxRenderedTitleChars-1),
+		"the record file carries the full title",
+	} {
+		if !strings.Contains(indexRenderingNote, want) {
+			t.Errorf("indexRenderingNote does not disclose the title cap %q:\n%s", want, indexRenderingNote)
+		}
+	}
 }
 
 // indexFitError is the done-means check of #4478: nil when the index's
@@ -697,6 +724,100 @@ func TestAssemble_ShippedIndex_RenderingFitsCap(t *testing.T) {
 	if capacity, floor := sel.TotalRecords+headroom/measuredLargestIndexLine, measuredShippedRecords+minHeadroomRecords; capacity < floor {
 		t.Errorf("the rendering now holds %d records at %d bytes each (%d shipped + %d more), below the documented floor of %d (%d at measurement + %d): the rendering format lost capacity",
 			capacity, measuredLargestIndexLine, sel.TotalRecords, headroom/measuredLargestIndexLine, floor, measuredShippedRecords, minHeadroomRecords)
+	}
+}
+
+// minHeadroomLines is the headroom floor of #4699 AC4: the shipped index
+// rendering must leave room under repodoc.DefaultMaxBytes for at least this many
+// more lines the size of its largest rendered line. Unlike the record-count
+// floor above it is measured on the CURRENT rendering, so it fails the ADR
+// landing that spends the headroom: the early warning to tier the index.
+const minHeadroomLines = 10
+
+// headroomFloorError is the #4699 AC4 check: nil when the headroom capBytes
+// leaves over rendering is at least minLines times rendering's largest line
+// (newline included), otherwise an error naming the numbers and the remedy.
+func headroomFloorError(rendering string, capBytes, minLines int) error {
+	largest := largestLine(rendering)
+	headroom := capBytes - len(rendering)
+	if headroom >= minLines*largest {
+		return nil
+	}
+	return fmt.Errorf("the %s rendering is %d bytes under a %d-byte cap, leaving %d bytes of headroom = %d lines at its largest line (%d bytes), below the %d-line floor. "+
+		"#4699: the decision-record index is within %d lines of its prompt cap; tier the index (collapse superseded or older records), the option #4699 deferred until about 150 ADRs, or raise the cap; an operator decision",
+		IndexRendering, len(rendering), capBytes, headroom, headroom/max(largest, 1), largest, minLines, minLines)
+}
+
+// shippedSelection assembles the SHIPPED docs/adr at the production cap, with
+// no change paths, as TestAssemble_ShippedIndex_RenderingFitsCap does.
+func shippedSelection(t *testing.T) *Selection {
+	t.Helper()
+	r := &repodoc.Resolver{Fetcher: diskFetcher{root: filepath.Join("..", "..", "..")}}
+	req := request(admissionSHA)
+	req.ChangePaths = nil
+	sel, err := Assemble(context.Background(), r, req)
+	if err != nil {
+		t.Fatalf("Assemble over the shipped docs/adr: %v", err)
+	}
+	return sel
+}
+
+// largestLine is the byte length of rendering's largest "\n"-terminated line.
+func largestLine(rendering string) int {
+	n := 0
+	for _, line := range strings.SplitAfter(rendering, "\n") {
+		n = max(n, len(line))
+	}
+	return n
+}
+
+// TestAssemble_ShippedIndex_HeadroomFloor is #4699 AC4: the shipped index
+// rendering leaves at least minHeadroomLines of its largest line under
+// repodoc.DefaultMaxBytes. A failure is the signal to tier the index.
+func TestAssemble_ShippedIndex_HeadroomFloor(t *testing.T) {
+	sel := shippedSelection(t)
+	largest := largestLine(sel.Index.Content)
+	headroom := repodoc.DefaultMaxBytes - len(sel.Index.Content)
+	t.Logf("shipped %s %s rendering: %d bytes, cap %d, headroom %d bytes, largest line %d bytes, %d lines available, floor %d lines",
+		indexPath, IndexRendering, len(sel.Index.Content), repodoc.DefaultMaxBytes, headroom, largest, headroom/max(largest, 1), minHeadroomLines)
+	if sel.Index.Truncated {
+		t.Fatalf("premise: the shipped index rendering was injected truncated: %v", indexFitError(sel))
+	}
+	if err := headroomFloorError(sel.Index.Content, repodoc.DefaultMaxBytes, minHeadroomLines); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestAssemble_HeadroomFloor_IsCaught is the permanent RED proof of
+// TestAssemble_ShippedIndex_HeadroomFloor's check (#4699): on the same shipped
+// rendering a floor of exactly the lines available passes (the boundary), and
+// one line more fails with the #4699 tiering remedy and the measured numbers.
+func TestAssemble_HeadroomFloor_IsCaught(t *testing.T) {
+	sel := shippedSelection(t)
+	rendering := sel.Index.Content
+	largest := largestLine(rendering)
+	headroom := repodoc.DefaultMaxBytes - len(rendering)
+	if largest == 0 || headroom <= 0 {
+		t.Fatalf("premise: shipped rendering %d bytes, largest line %d, headroom %d; want a non-empty rendering under the cap", len(rendering), largest, headroom)
+	}
+	available := headroom / largest
+	t.Logf("shipped rendering %d bytes, headroom %d bytes, largest line %d bytes: %d lines available", len(rendering), headroom, largest, available)
+	if err := headroomFloorError(rendering, repodoc.DefaultMaxBytes, available); err != nil {
+		t.Errorf("floor = %d lines available: headroomFloorError = %v, want nil (the boundary)", available, err)
+	}
+	err := headroomFloorError(rendering, repodoc.DefaultMaxBytes, available+1)
+	if err == nil {
+		t.Fatalf("floor = %d lines, one above the %d available: headroomFloorError = nil, want an error", available+1, available)
+	}
+	for _, want := range []string{
+		"#4699", "tier the index",
+		fmt.Sprintf("%d bytes under a %d-byte cap", len(rendering), repodoc.DefaultMaxBytes),
+		fmt.Sprintf("%d bytes of headroom = %d lines at its largest line (%d bytes)", headroom, available, largest),
+		fmt.Sprintf("below the %d-line floor", available+1),
+	} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("headroomFloorError = %v\nwant it to contain %q", err, want)
+		}
 	}
 }
 
@@ -1065,7 +1186,7 @@ func TestPromptDocuments_SuccessorFraming(t *testing.T) {
 			t.Fatalf("Assemble: %v", err)
 		}
 		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
-			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
 			"1 of its 1 records declare an applies_to path glob matching a path this change touches; " +
 			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-001. " +
 			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
@@ -1262,7 +1383,7 @@ func TestPromptDocuments_AmendmentFraming(t *testing.T) {
 			t.Fatalf("Assemble: %v", err)
 		}
 		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
-			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
 			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede a selected record (followed through supersedes / superseded_by); " +
 			"2 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first; a successor ranks with the records it supersedes): ADR-002, ADR-001. " +
 			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
@@ -1511,7 +1632,7 @@ func TestPromptDocuments_ExcerptFraming(t *testing.T) {
 			t.Fatalf("premise: included %v excerpted %v, want [ADR-003] [ADR-002 ADR-001]", includedIDs(sel), excerptedIDs(sel))
 		}
 		const head = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
-			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line. " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
 			"3 of its 3 records declare an applies_to path glob matching a path this change touches; " +
 			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-003. " +
 			"2 of them did not fit the record budget whole and are shown below as excerpts, their Decision section only, in rank order: ADR-002, ADR-001. " +

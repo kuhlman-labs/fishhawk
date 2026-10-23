@@ -31,6 +31,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"unicode/utf8"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -116,27 +117,52 @@ type Index struct {
 }
 
 // IndexRendering names the compact index rendering RenderIndex produces; it is
-// the repodoc rendering name Assemble derives the index document under.
-const IndexRendering = "adr-index-lines-v1"
+// the repodoc rendering name Assemble derives the index document under. v2
+// (#4699) caps each rendered title at MaxRenderedTitleChars; v1 rendered every
+// title in full.
+const IndexRendering = "adr-index-lines-v2"
+
+// MaxRenderedTitleChars is the most characters — Unicode code points, the
+// unit of utf8.RuneCountInString and of Python's len(str) — a title is
+// rendered at by RenderIndex (#4699). It equals scripts/check-adr's
+// TITLE_MAX_CHARS, the limit a record numbered ADR-119 or higher must meet
+// (TestTitleCapMatchesCheckADR pins the two).
+const MaxRenderedTitleChars = 100
+
+// RenderedTitle is title as RenderIndex renders it (#4699): unchanged when it
+// is at most MaxRenderedTitleChars code points, otherwise its first
+// MaxRenderedTitleChars-1 code points followed by U+2026 '…', so a cut title is
+// exactly MaxRenderedTitleChars code points. The cut is on a code-point
+// boundary, so valid UTF-8 stays valid; it may split a combining sequence.
+func RenderedTitle(title string) string {
+	if utf8.RuneCountInString(title) <= MaxRenderedTitleChars {
+		return title
+	}
+	runes := []rune(title)
+	return string(runes[:MaxRenderedTitleChars-1]) + "…"
+}
 
 // RenderIndex renders idx compactly for a reviewer prompt (#4478): one compact
 // JSON object per record, one record per line ("\n"-terminated), in index
-// order, with every empty list field left out (Record's omitempty tags). The
-// schema_version wrapper is not rendered. Because Record is marshalled
-// directly, every field it declares — the amends / amended_by relations
-// included — renders with no further code.
+// order, with every empty list field left out (Record's omitempty tags) and
+// every title capped by RenderedTitle (#4699). The schema_version wrapper is
+// not rendered. Because Record is marshalled directly, every field it declares
+// — the amends / amended_by relations included — renders with no further
+// code. idx is not modified: the cap applies to each record's range copy.
 //
-// Each line decodes back to its record. encoding/json escapes every byte below
-// 0x20, U+2028 and U+2029 (SetEscapeHTML(false) only stops it escaping '<',
-// '>' and '&'), but NOT U+0085 NEL, which repodoc honours as a line break; so
-// every raw NEL in the output — which can only sit inside a JSON string — is
-// rewritten as the escape \u0085, and the output holds exactly one repodoc
-// line break per record.
+// Each line decodes back to a Record equal to its record except that Title is
+// RenderedTitle(Title). encoding/json escapes every byte below 0x20, U+2028
+// and U+2029 (SetEscapeHTML(false) only stops it escaping '<', '>' and '&'),
+// but NOT U+2026, so a cut title's '…' is written raw, and NOT U+0085 NEL,
+// which repodoc honours as a line break; so every raw NEL in the output —
+// which can only sit inside a JSON string — is rewritten as the escape
+// \u0085, and the output holds exactly one repodoc line break per record.
 func RenderIndex(idx *Index) ([]byte, error) {
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
 	for _, r := range idx.Records {
+		r.Title = RenderedTitle(r.Title)
 		if err := enc.Encode(r); err != nil {
 			return nil, fmt.Errorf("decisionrecord: render index record %q: %w", r.ID, err)
 		}

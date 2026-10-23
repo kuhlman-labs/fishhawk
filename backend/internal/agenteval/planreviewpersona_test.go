@@ -14,6 +14,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionrecord"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/repodoc"
@@ -779,14 +780,16 @@ func TestPersonaArmPrompt_GoverningIndexEntriesSurviveTruncation(t *testing.T) {
 }
 
 // jsonEncodedTitle is title as decisionrecord.RenderIndex writes it inside the
-// compact index rendering: JSON-string encoded with SetEscapeHTML(false), the
-// surrounding quotes stripped.
+// compact index rendering: capped by decisionrecord.RenderedTitle (#4699; a
+// title over decisionrecord.MaxRenderedTitleChars is cut, so the full stored
+// title is not in the rendering), then JSON-string encoded with
+// SetEscapeHTML(false), the surrounding quotes stripped.
 func jsonEncodedTitle(t *testing.T, title string) string {
 	t.Helper()
 	var b bytes.Buffer
 	enc := json.NewEncoder(&b)
 	enc.SetEscapeHTML(false)
-	if err := enc.Encode(title); err != nil {
+	if err := enc.Encode(decisionrecord.RenderedTitle(title)); err != nil {
 		t.Fatalf("encode title %q: %v", title, err)
 	}
 	return strings.TrimSuffix(strings.TrimPrefix(strings.TrimSuffix(b.String(), "\n"), `"`), `"`)

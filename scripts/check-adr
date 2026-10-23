@@ -24,6 +24,11 @@
 #                    amends and amended_by are OPTIONAL list keys, absent = []
 #   C-file           every non-README *.md is named NNN-slug.md (else stray)
 #   C-id             id is ADR-NNN and equals 'ADR-' + the filename prefix
+#   C-title-length   a record numbered ADR-119 or higher (TITLE_RULE_FROM) has
+#                    a title of at most TITLE_MAX_CHARS = 100 characters,
+#                    counted as code points (Python len(str), the unit of Go's
+#                    utf8.RuneCountInString; #4699). ADR-001 to ADR-118 are
+#                    grandfathered; a malformed id is left to C-id
 #   C-status-set     a PRESENT status is in the closed set
 #   C-unique         ids are unique across records
 #   C-ref            every supersedes/superseded_by/amends/amended_by id
@@ -99,6 +104,12 @@ INDEX_FIELDS = ("id", "title", "path", "status",
 OPTIONAL_INDEX_FIELDS = ("amends", "amended_by")
 LINK_KEYS = ("supersedes", "superseded_by", "amends", "amended_by")
 INDEX_SCHEMA = "adr-index-v1"
+# C-title-length (#4699): the most characters (code points) a record's title
+# may carry, from record number TITLE_RULE_FROM on. Equal to backend/internal/
+# decisionrecord's MaxRenderedTitleChars, the length the architect persona's
+# index rendering cuts a title to (TestTitleCapMatchesCheckADR pins both).
+TITLE_MAX_CHARS = 100
+TITLE_RULE_FROM = 119
 
 FILENAME_RE = re.compile(r"^\d{3}-[a-z0-9]+(-[a-z0-9]+)*\.md$")
 ID_RE = re.compile(r"^ADR-\d{3}$")
@@ -314,6 +325,20 @@ def check_records(records):
             out.append((rec["file"], "C-id",
                         "id '%s' does not match the filename (expected '%s')"
                         % (rid, expected)))
+
+    # C-title-length (#4699): only a well-formed id is numbered; C-id reports
+    # the rest.
+    for rec in parsed:
+        rid, title = rec["fm"].get("id"), rec["fm"].get("title")
+        if rid is None or not ID_RE.match(rid) or not isinstance(title, str):
+            continue
+        if int(rid[4:]) >= TITLE_RULE_FROM and len(title) > TITLE_MAX_CHARS:
+            out.append((rec["file"], "C-title-length",
+                        "title is %d characters, over the %d-character limit "
+                        "for ADR-%03d onward; shorten the record's title "
+                        "(ADR-001 to ADR-%03d are grandfathered)"
+                        % (len(title), TITLE_MAX_CHARS, TITLE_RULE_FROM,
+                           TITLE_RULE_FROM - 1)))
 
     # C-status-set (only for a PRESENT status; absence is C-status-present)
     for rec in parsed:

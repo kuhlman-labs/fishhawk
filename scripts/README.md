@@ -3522,6 +3522,15 @@ non-zero exit — never first-hit-and-stop. Each class is a separate branch:
 - **C-file** — every non-README `*.md` is named `NNN-slug.md`; anything else
   is a stray file.
 - **C-id** — `id` is `ADR-NNN` and equals `ADR-` + the filename prefix.
+- **C-title-length** (#4699) — a record numbered ADR-119 or higher
+  (`TITLE_RULE_FROM`) has a `title` of at most `TITLE_MAX_CHARS` = 100
+  characters, counted as code points (Python `len(str)`, the unit of Go's
+  `utf8.RuneCountInString`); ADR-001 – ADR-118 are grandfathered, and a
+  malformed id is left to C-id. The limit equals
+  `decisionrecord.MaxRenderedTitleChars`, the length the architect persona's
+  index rendering cuts a title to, so a record that passes is never cut there
+  (`TestTitleCapMatchesCheckADR` pins the two). `--write-index` refuses on it
+  like any record check.
 - **C-status-set** — a PRESENT `status` is in
   `{proposed, accepted, rejected, superseded, unknown}`.
 - **C-unique** — ids are unique across records.
@@ -3641,7 +3650,10 @@ pattern changed, not necessarily `DECISION_RE`. The header records every
 counterfactual run against the gate (CF28–CF35 cover the E78.2 hardening: each
 bounded-stem condition, the placeholder regex and each of its alternatives, and
 the Decision-heading widening in both directions; CF36/CF37 the two regex
-ambiguities h36/h36b isolate; CF38–CF45 the E78.13 amendment relation).
+ambiguities h36/h36b isolate; CF38–CF45 the E78.13 amendment relation;
+CF46–CF50 the #4699 title rule: the branch made a no-op, the `>= 119` threshold
+moved to `> 119` and to `>= 118`, the length counted in UTF-8 bytes (RED under
+both the default locale and `LC_ALL=C`), and `>` relaxed to `>=`).
 The amendment cases (E78.13 / #4471): h37 dangling `amends` and h38 self
 `amended_by` (C-ref); h39/h40 one-way `amends` / `amended_by` where the
 PARTNER has no such line at all (C-amend-recip-fwd/rev, isolating
@@ -3652,6 +3664,14 @@ h42 a scalar `amends` (C-grammar); h43 the index entry omits a record's
 (C-index); h45 a valid reciprocal amendment with the keys only on the two
 linked entries → 0; h46 `--write-index` writes the keys on the linked entries
 and on no other.
+The title-rule cases (#4699) add a standalone `<NNN>-delta.md` through
+`add_numbered`, whose front-matter title is JSON-quoted (so spaces and
+non-ASCII never trip C-grammar's bare-token form) and whose index entry carries
+the identical title (so C-index stays silent): h47 ADR-119 with a 101-character
+title (ONLY C-title-length, naming the file and the length); h48 the
+grandfathered ADR-118 with a 249-character title → 0; h49 ADR-119 with exactly
+100 `é` (200 bytes) → 0, pinning the inclusive boundary and code-point
+counting.
 
 `scripts/test verify` runs BOTH: `test-adr` in `_verify_gate_harnesses`, and
 `check-adr` itself via `_verify_adr_records` (immediately after
