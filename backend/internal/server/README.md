@@ -3087,7 +3087,11 @@ deadline): `backend/internal/mergequeue/README.md`.
   a fact), then runs the merged tail. The pump clears the registry mark only
   AFTER `applyMergeOnPassOutcome` returns (ruling R8c), so the mark spans
   the whole decision-plus-apply and `GET /v0/restart-blockers` lists it as
-  `merge_in_flight` (§ "Restart blockers"). The pre-lock check stays
+  `merge_in_flight` (§ "Restart blockers"). The registry is a refcount and
+  the pump clears only a mark its own decision made
+  (`mergeOnPassOutcome.InFlightMarked`), so a decision that never marked,
+  or finished before an overlapping one marked, cannot erase another
+  decision's mark while its forge call is in flight. The pre-lock check stays
   `passed`-only: the pump routes a `merging`/`settling` entry to the restart
   resume (§ "Merge-queue durability (ADR-093 D8)"), skipping it while this
   process's mark is set.
@@ -3727,7 +3731,7 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
 | PR merged at a head the claim does not name | hold `merged_claim_head_mismatch` |
 | `merging`, PR open or unreadable, QUEUE claim still `dispatched` and crash-left (C2) | strict `merge_dispatch_settled` {`dispatch_failed`, `orphaned_by_restart`}, then the EXISTING `MarkMergeDispatchFailed(orphaned_by_restart)` (C3), then a hold row {`merge_dispatch_uncertain`, next_step `operator_rearm`, remedy}: confirm on the forge nothing merged, DELETE the `dispatch_failed` claim (mergequeue README operator re-arm); the queue-path re-arm needs NO `fishhawk_merge_run` re-invocation, the next pump re-decides from scratch (C8a). PR closed: `drop_pr_closed` |
 | the same claim younger than the crash-left age | hold `merge_dispatch_in_progress`, nothing written; a later tick re-decides |
-| `settling`, PR open, queue claim `dispatched` | hold `settling_unconfirmed`, no ledger write; depends on the forge converging: once it shows the PR merged, `fishhawk_reconcile_merge` or `fishhawk_record_merge_observation` (or the next pump) settles it; otherwise the forge must converge (C8b) |
+| `settling`, PR open (queue claim `dispatched`) or unreadable | hold `settling_unconfirmed`, no ledger write (an unreadable PR never orphans a settling claim: the step recorded that the forge accepted); depends on the forge converging: once it shows the PR merged, `fishhawk_reconcile_merge` or `fishhawk_record_merge_observation` (or the next pump) settles it; otherwise the forge must converge (C8b) |
 | an inline/delegated claim, a GitLab claim, or a non-orphaned `dispatch_failed` claim | hold `merge_already_dispatched`, no ledger write (C1: only a `queue`-path claim is ever reconciled) |
 | `merging`, no claim | `redecide`: back to `passed` at the epoch, ordinary merge-on-pass decides from scratch with the fold and veto in-lock; no dispatch was ever handed to the forge, so this is not a retry |
 

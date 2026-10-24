@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -357,6 +358,21 @@ func TestMergeQueueResume_MergeArms(t *testing.T) {
 			w.prReadFail = true
 			w.mu.Unlock()
 		}, kind: mergeOnPassHeld, reason: mergeQueueResumeReasonDispatchUncertain, check: claimState(mergequeue.DispatchFailed)},
+		{name: "settling PR read error, aged claim (never orphaned)", setup: func(w *mqmWorld, a *mcqRun) {
+			w.exec(`UPDATE merge_candidate_queue_entries SET phase = 'settling' WHERE run_id = $1 AND state = 'live'`, a.id)
+			w.mu.Lock()
+			w.prReadFail = true
+			w.mu.Unlock()
+		}, kind: mergeOnPassHeld, reason: mergeQueueResumeReasonSettlingUnconfirmed, check: func(t *testing.T, w *mqmWorld, a *mcqRun) {
+			claimState(mergequeue.DispatchDispatched)(t, w, a)
+			if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseSettling {
+				t.Fatalf("entry = %s/%s, want live settling", e.State, e.Phase)
+			}
+			res := w.mqrResumed(a)
+			if len(res) != 1 || res[0]["action"] != mergeQueueResumeActionHold || res[0]["reason"] != mergeQueueResumeReasonSettlingUnconfirmed {
+				t.Fatalf("merge_queue_resumed = %v, want one settling_unconfirmed hold", res)
+			}
+		}},
 		{name: "PR read error, no claim", setup: func(w *mqmWorld, a *mcqRun) {
 			w.exec(`DELETE FROM merge_dispatch_claims WHERE run_id = $1`, a.id)
 			w.mu.Lock()
@@ -626,35 +642,65 @@ func TestMergeQueueResume_BootDoesNotReclaimSameProcessAdmission(t *testing.T) {
 // Ruling R7 (counterfactual B9) and approval condition C5: a re-claimed
 // admission whose run has a live stage never advances, even with the head
 // BEHIND, and holds with no phase write; once the stage settles the next
-// periodic tick re-checks the gate and the admission proceeds.
+// periodic tick re-checks the gate and the admission proceeds. A live
+// trigger AT the anchored head (no verdict there, so the pass is in flight)
+// stamps the entry verifying instead (the gate's in_flight branch). The
+// plain AdmitNext stale re-claim (no restart, admitted past
+// AdmissionStaleAfter) takes the same gate (adm.Readmitted).
 func TestMergeQueueResume_ReclaimNoAdvanceWhileStageLive(t *testing.T) {
-	for _, arm := range []string{"review running", "trigger with implement pending"} {
-		t.Run(arm, func(t *testing.T) {
+	stale := fmt.Sprintf("clock_timestamp() - interval '%d seconds'", int(mergequeue.AdmissionStaleAfter/time.Second)+60)
+	arms := []struct {
+		name      string
+		noVerdict bool // no passed verdict at h1, so a trigger there is in flight
+		setup     func(w *mqmWorld, a *mcqRun)
+		restart   bool // false: the plain AdmitNext stale re-claim
+		phase     mergequeue.Phase
+	}{
+		{name: "review running", restart: true, phase: mergequeue.PhaseAdmitted, setup: func(w *mqmWorld, a *mcqRun) {
+			w.setStage(a.review.ID, run.StageStateRunning)
+		}},
+		{name: "trigger with implement pending", restart: true, phase: mergequeue.PhaseAdmitted, setup: func(w *mqmWorld, a *mcqRun) {
+			w.seedTrigger(a, "x0") // a live trigger for another head
+			w.setStage(a.impl.ID, run.StageStatePending)
+		}},
+		{name: "trigger at the anchored head with implement pending", noVerdict: true, restart: true, phase: mergequeue.PhaseVerifying,
+			setup: func(w *mqmWorld, a *mcqRun) {
+				w.seedTrigger(a, "h1") // the pass at the anchored head is in flight
+				w.setStage(a.impl.ID, run.StageStatePending)
+			}},
+		{name: "stale re-claim with a dispatched stage", phase: mergequeue.PhaseAdmitted, setup: func(w *mqmWorld, a *mcqRun) {
+			w.setStage(a.impl.ID, run.StageStateDispatched)
+			w.exec(`UPDATE merge_candidate_queue_entries SET admitted_at = `+stale+` WHERE run_id = $1 AND state = 'live'`, a.id)
+		}},
+	}
+	for _, arm := range arms {
+		t.Run(arm.name, func(t *testing.T) {
 			w := newMQMWorld(t)
 			a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
-			held := w.mqpHeldIntent(a, "h1", false)
+			held := w.mqpHeldIntent(a, "h1", arm.noVerdict)
 			adm, err := w.store.AdmitNext(context.Background(), held.Base())
 			if err != nil || !adm.Admitted {
 				t.Fatalf("admit: %+v %v", adm, err)
 			}
 			w.behind(a, "h1", "m1")
-			switch arm {
-			case "review running":
-				w.setStage(a.review.ID, run.StageStateRunning)
-			default:
-				w.seedTrigger(a, "x0") // a live trigger for another head
-				w.setStage(a.impl.ID, run.StageStatePending)
+			arm.setup(w, a)
+			if arm.restart {
+				w.mqrRestart()
+				w.mqrBoot()
+			} else {
+				w.srv.PumpMergeCandidateQueues(context.Background())
 			}
-			w.mqrRestart()
-			w.mqrBoot()
 			if n := w.mergesInto(a); n != 0 {
 				t.Fatalf("advances = %d, want 0 while the run is live", n)
 			}
-			e := w.storeEntry(a)
-			if e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseAdmitted || e.AdmissionEpoch != adm.Entry.AdmissionEpoch+1 {
-				t.Fatalf("entry = %s/%s epoch %d, want live admitted at epoch %d", e.State, e.Phase, e.AdmissionEpoch, adm.Entry.AdmissionEpoch+1)
+			if n, m := len(w.gh.mergeCalls()), len(w.merger.calls()); n != 0 || m != 0 {
+				t.Fatalf("merges-API calls = %d, pinned merges = %d, want 0 while the run is live", n, m)
 			}
-			if arm != "review running" {
+			e := w.storeEntry(a)
+			if e.State != mergequeue.StateLive || e.Phase != arm.phase || e.AdmissionEpoch != adm.Entry.AdmissionEpoch+1 {
+				t.Fatalf("entry = %s/%s epoch %d, want live %s at epoch %d", e.State, e.Phase, e.AdmissionEpoch, arm.phase, adm.Entry.AdmissionEpoch+1)
+			}
+			if arm.name != "review running" {
 				return
 			}
 			w.setStage(a.review.ID, run.StageStateAwaitingApproval)
@@ -686,6 +732,137 @@ func TestMergeQueueMergeInFlight_ClearedAfterOutcomeApplied(t *testing.T) {
 	}
 	if w.srv.mergeInFlight.has(r.id) {
 		t.Fatal("in-flight mark survived the pump")
+	}
+}
+
+// #4298 review 48a65a85: the pump clears only the mark its OWN decision made.
+// An overlapping decision on the run (its forge call in flight) holds a mark
+// throughout: a pump whose decision held before the merging stamp (the PR
+// read fails, so it never marked) leaves that mark set, and a pump whose
+// decision marked and merged clears only its own count (the refcount).
+// Restoring the unconditional clear reddens the first check; a set in place
+// of the refcount reddens the second.
+func TestMergeQueueMergeInFlight_OverlappingDecisionKeepsMark(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("ifo", "h1", mcvUndelegatedSpecYAML)
+	w.srv.mergeInFlight.mark(r.id) // the overlapping decision, mid forge call
+	w.mu.Lock()
+	w.prReadFail = true
+	w.mu.Unlock()
+	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+	if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("fixture: entry = %s/%s, want live passed (the decision held before it marked)", e.State, e.Phase)
+	}
+	if !w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("a decision that never marked cleared the overlapping decision's in-flight mark")
+	}
+	w.mu.Lock()
+	w.prReadFail = false
+	w.mu.Unlock()
+	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
+	w.requireState(r, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if !w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("a marking decision's clear erased the overlapping decision's in-flight mark (want a refcount)")
+	}
+	w.srv.mergeInFlight.clear(r.id) // the overlapping decision applies its outcome
+	if w.srv.mergeInFlight.has(r.id) {
+		t.Fatal("the in-flight mark survived every decision's clear")
+	}
+}
+
+// The expectation basis of acceptance criterion
+// resume-verifying-recovers-pass: a FRESH Server's boot pass and pump route
+// a live verifying entry through the pump's verifying/unverified arm.
+// (a) the passed hook was lost: the boot pass applies the verdict row and the
+// entry merges exactly once. (b) the pass is in flight across the restart:
+// no second trigger, and the later recordMergeCandidateVerified(passed)
+// merges once. Deleting the pump's verifying/unverified case reddens (a).
+func TestMergeQueueResume_VerifyingRecoveredAfterRestart(t *testing.T) {
+	t.Run("lost passed hook", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, _ := mqrvSeed(w, "a", "a1", mergequeue.PhaseVerifying, true)
+		mqrvVerdict(w, r, "a1", mergeCandidateResultPassed, "")
+		w.mqrRestart()
+		w.mqrBoot()
+		if got := w.mqrCount("a1"); got != 1 {
+			t.Fatalf("pinned merges at a1 = %d, want 1 (the lost hook applied, merged once)", got)
+		}
+		w.requireState(r, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+		mqrvRequireActions(w, r, mergeQueueResumeActionApplyVerdict)
+		w.srv.PumpMergeCandidateQueues(context.Background())
+		if got := w.mqrCount("a1"); got != 1 {
+			t.Fatalf("pinned merges at a1 after another tick = %d, want 1", got)
+		}
+	})
+	t.Run("pass in flight across the restart", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, _ := mqrvSeed(w, "a", "a1", mergequeue.PhaseVerifying, true)
+		w.seedTrigger(r, "a1")
+		w.mqrRestart()
+		w.mqrBoot()
+		if n := len(w.triggers(r)); n != 1 {
+			t.Fatalf("triggers after the boot pass = %d, want the one seeded (no second trigger)", n)
+		}
+		mqrvRequirePhase(w, r, mergequeue.PhaseVerifying)
+		if got := w.mqrCount("a1"); got != 0 {
+			t.Fatalf("pinned merges at a1 = %d, want 0 while the pass is in flight", got)
+		}
+		w.verdict(r, mergeCandidateResultPassed)
+		w.srv.bgMergeQueuePump.Wait()
+		w.srv.PumpMergeCandidateQueues(context.Background())
+		if got := w.mqrCount("a1"); got != 1 {
+			t.Fatalf("pinned merges at a1 after the verdict = %d, want 1", got)
+		}
+		w.requireState(r, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	})
+}
+
+// Ruling R4 under concurrent boot: two fresh Servers run their boot pass at
+// once on a crash-left entry whose PR the forge reports merged at the queue
+// claim's head. The run's merge-intent lock serialises the resumes and the
+// in-lock re-read makes the loser hold, so there is exactly ONE
+// merge_queue_merged row and ONE settle_merged row, with no merge call.
+func TestMergeQueueResume_ConcurrentBootPumpsOneMergedRow(t *testing.T) {
+	w := newMQMWorld(t)
+	a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
+	w.mqeRebased(a, "pre-h1", "h1", "h1", false)
+	w.mqePassed(a, "h1")
+	w.mqrCrashLeft(a, mqrAged)
+	w.mqrPR(a, true, "closed")
+	before := w.mqrCount("h1")
+	w.mqrRestart()
+	s1 := w.srv
+	w.mqrRestart()
+	s2 := w.srv
+	start := make(chan struct{})
+	var wg sync.WaitGroup
+	for _, s := range []*Server{s1, s2} {
+		wg.Add(1)
+		go func(s *Server) {
+			defer wg.Done()
+			<-start
+			s.resumeMergeCandidateQueues(context.Background())
+		}(s)
+	}
+	close(start)
+	wg.Wait()
+	s1.bgMergeQueuePump.Wait()
+	s2.bgMergeQueuePump.Wait()
+	if got := w.mqrCount("h1"); got != before {
+		t.Fatalf("pinned merges at h1 = %d, want %d (no merge call)", got, before)
+	}
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if n := len(w.rows(a, CategoryMergeQueueMerged)); n != 1 {
+		t.Fatalf("merge_queue_merged rows = %d, want 1", n)
+	}
+	settled := 0
+	for _, p := range w.mqrResumed(a) {
+		if p["action"] == mergeQueueResumeActionSettleMerged {
+			settled++
+		}
+	}
+	if settled != 1 {
+		t.Fatalf("settle_merged rows = %d, want 1 (resumed rows %v)", settled, w.mqrResumed(a))
 	}
 }
 

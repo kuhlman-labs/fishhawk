@@ -291,7 +291,9 @@ const (
 // mergeOnPassAwaitApproval and mergeOnPassYield (Reason is then Yield.Reason).
 // ForgeReason and ForgeDetail are set only on a forge_merge_refused ejection
 // (ADR-093 D4): the typed refusal code and the forge's untrusted refusal text,
-// which the merge_queue_ejected writer sanitises.
+// which the merge_queue_ejected writer sanitises. InFlightMarked reports that
+// THIS decision marked the run in s.mergeInFlight (ADR-093 D8), so the pump
+// clears only its own mark.
 type mergeOnPassOutcome struct {
 	Kind          mergeOnPassKind
 	State         mergequeue.State
@@ -303,6 +305,8 @@ type mergeOnPassOutcome struct {
 	Yield         mergeQueueYield
 	ForgeReason   string
 	ForgeDetail   string
+	// InFlightMarked: this decision marked s.mergeInFlight for the run.
+	InFlightMarked bool
 }
 
 // Merge-on-pass reasons. Hold reasons leave the entry; eject/drop reasons are
@@ -549,8 +553,12 @@ func onlyChecksNotGreen(r mergeQueueEligibilityResult) bool {
 // the merge-intent lock fn's deadline; every forge read takes its own
 // sub-deadline.
 func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, runRow *run.Run,
-	target mergeOnPassTarget, head string, merger HeadPinnedMerger) mergeOnPassOutcome {
+	target mergeOnPassTarget, head string, merger HeadPinnedMerger) (res mergeOnPassOutcome) {
 	e := req.Entry
+	// marked: this decision marked s.mergeInFlight; every outcome past the
+	// mark carries it so the pump clears only its own mark (#4298 48a65a85).
+	marked := false
+	defer func() { res.InFlightMarked = marked }()
 	// basis is the fold's (step 6b); "" until the fold ran.
 	basis := ""
 	held := func(reason, detail string) mergeOnPassOutcome {
@@ -707,6 +715,7 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		}
 	}
 	s.mergeInFlight.mark(e.RunID)
+	marked = true
 	merged := func(observed bool) mergeOnPassOutcome {
 		// The forge accepted the merge: record settling, best-effort (the
 		// merge is a fact), then the merged tail.

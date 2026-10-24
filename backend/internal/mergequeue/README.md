@@ -461,7 +461,9 @@ change nothing (ADR-093 slice 2, rejection item 1):
     "orphaned_by_restart")` (its `merge_dispatch_settled` row carries reason
     `orphaned_by_restart`), then the entry HOLDS with a remedy naming the
     operator re-arm above. The queue-path re-arm needs NO
-    `fishhawk_merge_run` re-invocation: the next pump re-decides.
+    `fishhawk_merge_run` re-invocation: the next pump re-decides. An entry
+    in phase `settling` (the forge accepted) is never orphaned: PR open or
+    an indeterminate read holds `settling_unconfirmed` with no ledger write.
   - Nothing is retried or released automatically: the retry-once and the
     moved head/base release wait for ADR-109 Amendment A1, and any later
     automatic retry must re-run the ADR-112 forge-approval fold and veto

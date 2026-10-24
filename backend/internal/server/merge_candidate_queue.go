@@ -354,8 +354,8 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 // FIRST admission the boot re-claim (mergeQueueBootAdmit, ADR-093 D8).
 //
 // The live-entry branch routes by the entry's last recorded step: passed +
-// intent → merge-on-pass, then the outcome is applied, THEN this process's
-// in-flight mark is cleared (ruling R8c); merging/settling → skipped while
+// intent → merge-on-pass, then the outcome is applied, THEN the decision's
+// own in-flight mark (if it marked) is cleared (ruling R8c); merging/settling → skipped while
 // THIS process has the run's merge in flight, else the restart resume
 // (mergeQueueResumeMerge); verifying/unverified → the verifying recovery
 // (mergeQueueResumeVerifying); an admitted/advancing entry the R7 gate holds
@@ -404,7 +404,11 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 					Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger(),
 				})
 				cont = s.applyMergeOnPassOutcome(mctx, e, o, &readvances)
-				s.mergeInFlight.clear(e.RunID) // ruling R8c: after the outcome is applied
+				if o.InFlightMarked {
+					// Ruling R8c: after the outcome is applied, and only this
+					// decision's own mark (#4298 48a65a85).
+					s.mergeInFlight.clear(e.RunID)
+				}
 			case e.Phase == mergequeue.PhaseMerging || e.Phase == mergequeue.PhaseSettling:
 				if s.mergeInFlight.has(e.RunID) {
 					// THIS process is mid-merge for the run: its own decision

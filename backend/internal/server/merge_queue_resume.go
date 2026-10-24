@@ -18,9 +18,11 @@ package server
 //   - merged with no claim, or another path's claim at the merged head →
 //     settled merged pr_merged, the claim untouched;
 //   - merged at a head the claim does not name → hold;
-//   - not merged (or unreadable) with a crash-left QUEUE claim still
+//   - merging, not merged (or unreadable) with a crash-left QUEUE claim still
 //     dispatched → the EXISTING MarkMergeDispatchFailed(orphaned_by_restart),
 //     then the entry HOLDS naming the operator re-arm (closed: dropped);
+//   - settling (the forge accepted), PR open or unreadable → hold
+//     settling_unconfirmed, no ledger write;
 //   - an inline/delegated claim, or a dispatch_failed one → hold, no ledger
 //     write (approval condition C1);
 //   - no claim → redecide: back to passed, and ordinary merge-on-pass decides
@@ -113,10 +115,14 @@ const mergeQueueResumeSettlingRemedy = "the forge accepted the queue's merge but
 // whether the forge's merge actor or merge commit was checked (C6b).
 const mergeQueueMergeActorVerifiedKey = "merge_actor_verified"
 
-// mergeInFlightRegistry is the per-Server, process-local set of runs whose
-// head-of-line queue merge THIS process has in flight: marked by
-// mergeOnPassLocked after the merging stamp, cleared by the pump AFTER the
-// outcome is applied (ruling R8c). A fresh Server starts empty, so a merging
+// mergeInFlightRegistry is the per-Server, process-local refcount of runs
+// whose head-of-line queue merge THIS process has in flight: mergeOnPassLocked
+// increments it after the merging stamp, and the pump decrements it AFTER the
+// outcome is applied (ruling R8c), only for a decision that marked
+// (mergeOnPassOutcome.InFlightMarked). A refcount, not a set: a decision that
+// marked after an earlier decision released the lock, but before that
+// earlier decision's pump cleared, keeps its mark when the earlier one
+// clears (#4298 review 48a65a85). A fresh Server starts empty, so a merging
 // entry a PRIOR process left is not in it.
 type mergeInFlightRegistry struct {
 	mu   sync.Mutex
@@ -133,7 +139,7 @@ func (r *mergeInFlightRegistry) mark(runID uuid.UUID) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	r.runs[runID] = 1
+	r.runs[runID]++
 }
 
 func (r *mergeInFlightRegistry) clear(runID uuid.UUID) {
@@ -142,7 +148,11 @@ func (r *mergeInFlightRegistry) clear(runID uuid.UUID) {
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	delete(r.runs, runID)
+	if r.runs[runID] <= 1 {
+		delete(r.runs, runID)
+		return
+	}
+	r.runs[runID]--
 }
 
 func (r *mergeInFlightRegistry) has(runID uuid.UUID) bool {
@@ -290,7 +300,20 @@ func (s *Server) mergeQueueResumeMergeLocked(ctx context.Context, e mergequeue.E
 
 	pr, perr := s.mergeOnPassReadPR(ctx, target)
 	if perr != nil {
-		// An indeterminate read (C3): only a crash-left queue claim moves.
+		if cur.Phase == mergequeue.PhaseSettling {
+			// The settling step recorded that the forge ACCEPTED the merge,
+			// so an unreadable PR never orphans the claim: hold with no
+			// ledger write, as the settling + PR-open arm does (#4298
+			// review 74d4ea43).
+			r := mergeQueueResumed{NextStep: "reconcile_merge", Remedy: mergeQueueResumeSettlingRemedy}
+			if hasClaim {
+				r.ClaimState, r.ClaimPath, r.ClaimHeadSHA = string(claim.State), claim.Path, claim.HeadSHA
+			}
+			return holdRow(mergeQueueResumeReasonSettlingUnconfirmed,
+				"reading the pull request failed: "+perr.Error()+"; "+mergeQueueResumeSettlingRemedy, r)
+		}
+		// An indeterminate read (C3) on a merging entry: only a crash-left
+		// queue claim moves.
 		if queueDispatched {
 			return s.mergeQueueResumeOrphan(ctx, cur, claim, false, record, unrecorded, held)
 		}
