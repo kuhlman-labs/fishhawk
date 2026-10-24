@@ -4,7 +4,7 @@ Persisted held-pass queue for ADR-092 D1 (#4200, `docs/adr/092-serialize-merge-c
 At most ONE merge-candidate verify pass is live per `(repository, base ref)`
 inside one account. Every other eligible pass is held FIFO by eligibility time
 and consumes no runner slot. Table: `merge_candidate_queue_entries`
-(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296; the yield marker and the approval-wait anchor by 0109 for ADR-112 R3, #4632; the promote `order_key` by 0111 for ADR-093 slice 3, #4297).
+(migration 0101; `merge_intent_at` added by 0107 for ADR-093 D2, #4295; `merge_intent_sequence`, `admission_epoch` and the `merge_dispatch_claims` ledger by 0108 for ADR-093 slice 2, #4296; the yield marker and the approval-wait anchor by 0109 for ADR-112 R3, #4632; the promote `order_key` by 0111 for ADR-093 slice 3, #4297; ADR-093 D8's resume phases and `Resumer` with no migration, #4298).
 ADR-093's merge queue (slice 1) reuses these rows, the FIFO order, the
 one-live-per-base rule and the lock order UNCHANGED; it adds only the
 operator's recorded merge intent and the line-turn read below. The SQL is hand-written pgx, with no sqlc (same precedent as
@@ -22,7 +22,7 @@ One row per queue EPISODE of a run.
 | Column | Meaning |
 |---|---|
 | `state` | `held`, `live` (ACTIVE); `merged`, `ejected`, `dropped` (TERMINAL, never change again). CHECK-constrained. |
-| `phase` | Free TEXT, no CHECK, NULL when unset. ADR-092 writes `admitted`, `verifying`, `passed`, `unverified`; ADR-093 adds its own without a migration. |
+| `phase` | Free TEXT, no CHECK, NULL when unset. ADR-092 writes `admitted`, `verifying`, `passed`, `unverified`; ADR-093 D8 (#4298) adds `advancing` (stamped before the behind-probe), `merging` (stamped in-lock after the verdict row, BEFORE the merge-dispatch claim) and `settling` (after the forge accepted the merge), without a migration. It records the LAST RECORDED step of the head-of-line cycle, NOT a liveness signal: a process that died mid-step leaves the phase it last wrote, and the server's restart resume continues from it (`backend/internal/server/README.md` § "Merge-queue durability (ADR-093 D8)"). |
 | `eject_reason` | Required (non-empty) for `ejected`/`dropped` (DB CHECK + `ErrInvalidRequest`). |
 | `enqueued_at` | Eligibility time, the FIFO key (ties broken by `id`). Kept across re-anchor and `Unadmit`, and never rewritten by a promotion. |
 | `order_key` | The operator promote's ordering key (0111, ADR-093 slice 3; § "Promote"). NULL = ordered by `enqueued_at`. The EFFECTIVE queue key everywhere order matters (`AdmitNext`, `ListForBase`, the held `Position`) is `(COALESCE(order_key, enqueued_at), id)`, so every unpromoted row is strict FIFO. Set only by `Promote`; kept by `Unadmit`, `Yield`, `ClearYield` and the re-anchors; a FRESH row (a re-entry after a terminal row, a base change) carries none and joins at the tail (`Entry.OrderKey`, `Entry.Promoted()`). |
@@ -31,9 +31,9 @@ One row per queue EPISODE of a run.
 | `settled_at` | Set exactly when the row is terminal (DB CHECK). |
 | `merge_intent_at` | The operator's merge intent on this episode (0107, ADR-093 D2): NULL = none (every ADR-092 rebase/base-advance entry and every pre-0107 row). Stamped once from the database clock by `Enqueue{MergeIntent}` or `MarkMergeIntent`, never cleared; a terminal row keeps it as history, and a re-entry after a terminal row starts a FRESH row without it. |
 | `merge_intent_sequence` | The audit sequence of the `merge_queue_entered` row that recorded the intent (0108, ADR-093 slice 2). Stamped in the SAME statement as `merge_intent_at` (`EnqueueRequest.IntentSequence`, `MergeIntentRequest.IntentSequence`), only on the NULL-to-set transition, never overwritten. NULL (read as `Entry.MergeIntentSequence` 0) = no intent, or an intent recorded before 0108; merge-on-pass then resolves the newest `merge_queue_entered` row naming the base. |
-| `admission_epoch` | `BIGINT NOT NULL DEFAULT 0` (0108). Bumped by every admission: `AdmitNext`'s admit AND its stale re-claim. The admission-owned writes are compare-and-swaps on it (§ "Admission-epoch CAS"). |
+| `admission_epoch` | `BIGINT NOT NULL DEFAULT 0` (0108). Bumped by every admission: `AdmitNext`'s admit AND its stale re-claim, and `AdmitNextReclaiming`'s boot re-claim. The admission-owned writes are compare-and-swaps on it (§ "Admission-epoch CAS"). |
 | `yield_reason` / `yield_detail` / `yielded_at` | The YIELD MARKER (0109, ADR-112 R3; § "Yield"). NULL = not marked. `yield_reason` is the server's closed vocabulary (`backend/internal/server/merge_queue_yield.go`); `yield_detail` is untrusted forge-derived text every read surface sanitises (`Entry.YieldDetail`, `""` for NULL). DB CHECKs: `yielded_at` is set exactly when a non-empty `yield_reason` is, and a `live` row never carries a marker; a terminal row keeps it as history. `AdmitNext` skips a marked row. |
-| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission or a stale re-claim, kept by `Yield`, cleared only by `ClearYield`. |
+| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission, a stale re-claim or the boot re-claim, kept by `Yield`, cleared only by `ClearYield`. |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE
@@ -88,11 +88,16 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
     `TestEnqueue_YieldMarkerNeverOnLiveRow`, `TestEnqueue_YieldMarkerArms`).
 - **`AdmitNext(base)`**.
   - Base has a live entry → no admission; `Entry` = that live entry.
-  - …unless that live entry is in phase `admitted` with `admitted_at` older
-    than `AdmissionStaleAfter`: `admitted_at` is re-stamped and the call
-    returns `Admitted=true, Readmitted=true` for it, so exactly one pump
-    re-runs a crashed admission. A live entry in any other phase is never
-    re-claimed.
+  - …unless that live entry is in phase `admitted` or `advancing` (the
+    admission's own steps) with `admitted_at` older than
+    `AdmissionStaleAfter`: `admitted_at` is re-stamped, the epoch bumped, and
+    the call returns `Admitted=true, Readmitted=true` for it, so exactly one
+    pump re-runs a crashed admission. The re-claim writes ONLY `admitted_at`
+    and `admission_epoch`; the phase, anchor, `order_key`, `enqueued_at`, the
+    yield columns and `approval_wait_started_at` are kept. A live entry in
+    any other phase (`verifying`, `unverified`, `passed`, `merging`,
+    `settling`) is never re-claimed
+    (`TestAdmitNext_StaleReclaimCoversAdvancing`).
   - No live entry → the first UNMARKED `held` entry by
     `(COALESCE(order_key, enqueued_at), id)` becomes `live`, phase `admitted`, `admitted_at = now`; `Admitted=true`. A
     yielded (marked) entry is skipped entirely, however old
@@ -198,9 +203,9 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   0 on an active row) is the database-clock age the sweep's backoff keys on,
   so no Go `time.Now()` is compared against `settled_at`.
 
-**Capabilities.** `Promoter`, `EjectionReader` and `ReentryReader` are
-SEPARATE interfaces, not part of `Store`; `PostgresStore` implements all
-three. A caller type-asserts the capability on its `Store`, so a fake that
+**Capabilities.** `Promoter`, `EjectionReader`, `ReentryReader` and
+`Resumer` (§ "AdmitNextReclaiming") are SEPARATE interfaces, not part of
+`Store`; `PostgresStore` implements all four. A caller type-asserts the capability on its `Store`, so a fake that
 embeds a (possibly nil) `Store` and does not implement one degrades instead of
 panicking on a nil embedded call (approval condition M1 of #4297).
 
@@ -210,6 +215,43 @@ slice 1: that eligibility requires a LIVE forge approval and approval
 transfer across a clean advance is deferred to slice 2, so in a
 dismiss-stale repository a rebase answers `not_queued` until then. The
 store itself never judges eligibility.
+
+### AdmitNextReclaiming
+
+ADR-093 D8's restart resume (#4298) through the `Resumer` capability. The
+server's boot pump runs it as each base's FIRST admission, so an admission a
+dead process left is re-run at once instead of after `AdmissionStaleAfter`.
+
+- **`DatabaseNow()`** → `time.Time`: `SELECT clock_timestamp()`. fishhawkd
+  reads it BEFORE it can admit anything (the boot instant) and passes it back
+  as `AdmittedBefore`, so the comparison stays on the database clock and an
+  admission THIS process makes after boot is never re-claimed (`TestDatabaseNow`).
+- **`AdmitNextReclaiming(ReclaimRequest{Base, AdmittedBefore, Record})`** →
+  `Admission`: `AdmitNext` in the SAME admit transaction (one internal path:
+  the same base lock, live check, held select and re-claim UPDATE, so the
+  yielded-row skip and the re-claim's column preservation cannot drift apart),
+  whose live check ALSO re-claims a live `admitted`/`advancing` entry with
+  `admitted_at < AdmittedBefore`, stale or not. No other phase is re-claimed
+  before the instant (`TestAdmitNextReclaiming_BootInstant`). An empty live
+  slot admits the first unmarked held row exactly as `AdmitNext`, and a
+  yielded row is skipped and keeps its marker, `yielded_at` and wait anchor;
+  a re-claimed row keeps its wait anchor, anchor, `order_key`, `enqueued_at`
+  and NULL yield columns (`TestAdmitNextReclaiming_SkipsYieldedAndPreservesWaitState`,
+  ruling R6). A zero `AdmittedBefore`, a nil `Record` or an invalid base is
+  `ErrInvalidRequest` before any SQL.
+- **`Record(ctx, tx, reclaimed)`** (`ReclaimRecordFunc`) is REQUIRED and runs
+  on EVERY re-claim the call makes (the boot instant or the stale bound),
+  inside the transaction after the re-claim write and before COMMIT, with the
+  re-claimed entry (new epoch and `admitted_at`, phase unchanged). It is never
+  called for an admission of a held row or when nothing is re-claimed. A
+  non-nil error rolls the WHOLE call back (no epoch bump, no `admitted_at`
+  change) and returns `ErrReclaimUnrecorded` wrapping it
+  (`TestAdmitNextReclaiming_RecordFailureRollsBack`, read as committed
+  state). The server appends `merge_queue_resumed` (action `reclaim`) with
+  `audit.AppendChainedTx` on that `tx`: the re-claim UPDATE touches no key
+  column, so, as with `PromoteRequest.Record`, no foreign-key lock on the
+  runs row is taken. Plain `AdmitNext`'s stale re-claim (the periodic ticks)
+  records nothing.
 
 ### Yield
 
@@ -308,7 +350,7 @@ change nothing (ADR-093 slice 2, rejection item 1):
 | Write | Guard | Who |
 |---|---|---|
 | `Unadmit` | live AND `admission_epoch = epoch` | admission transient failure, merge-on-pass readvance |
-| `SetPhase` | live AND epoch | admission, verdict hook, transfer re-anchor |
+| `SetPhase` | live AND epoch | admission (incl. the D8 `advancing` stamp), verdict hook, transfer re-anchor, merge-on-pass's `merging` / `settling` stamps, the D8 resume |
 | `ReanchorAt` | live AND epoch | admission re-anchor |
 | `SettleAt` | live AND epoch (terminal: no-op) | admission settles, merge-on-pass settle outcomes |
 | `ApprovalWait` / `Yield` | live AND epoch | merge-on-pass approval wait and yield, admission veto yield |
@@ -390,8 +432,42 @@ change nothing (ADR-093 slice 2, rejection item 1):
   claim): after confirming on the forge that the PR did not merge and
   resolving the cause, the operator removes the failed claim with
   `DELETE FROM merge_dispatch_claims WHERE run_id = '<run id>' AND state = 'dispatch_failed';`
-  against fishhawkd's database, then re-invokes `fishhawk_merge_run`. A
-  `dispatched` claim is never re-armed: its merge was handed to the forge.
+  against fishhawkd's database. On the INLINE (and delegated) path the
+  operator then re-invokes `fishhawk_merge_run`. On the QUEUE path no
+  `fishhawk_merge_run` re-invocation is needed: the queue's next pump
+  re-decides from scratch (the ADR-112 forge-approval fold and veto run
+  in-lock) and merges at most once. A `dispatched` claim is never re-armed:
+  its merge was handed to the forge.
+- **Crash-left claims (ADR-093 D8, #4298).** A process that dies between
+  `ClaimMergeDispatch` and classifying the forge outcome leaves a
+  `dispatched` claim no live process owns. The server's restart resume
+  (`backend/internal/server/README.md` § "Merge-queue durability (ADR-093
+  D8)") reconciles it with ONE forge re-read under the run's merge-intent
+  lock, and adds NO ledger transition and dispatches NO merge (ADR-109):
+  - Only a `queue`-path claim is ever reconciled. An `inline` or `delegated`
+    claim stays `dispatched` while the forge's auto-merge is armed, which is
+    normal, as is a GitLab claim: the resume never transitions, releases or
+    rewrites one, and any arm meeting one holds with no ledger write.
+  - A queue claim is crash-left only when the resume observes it while
+    HOLDING the merge-intent lock AND its `claimed_at` is older than the
+    database clock (`DatabaseNow`, never Go `time.Now()`) minus
+    `IntentFnTimeout` (the ADR-108 lock fn deadline) + the pinned merge-call
+    timeout + a margin (the server names the constant and its derivation).
+    There is no boot-time cutoff: a younger claim holds with nothing written
+    (`merge_dispatch_in_progress`) and a later tick re-decides.
+  - Merged at the claimed head → the normal merged reconcile and tail.
+    Closed unmerged → the entry settles closed. Not merged (PR open), or an
+    indeterminate read → the EXISTING `MarkMergeDispatchFailed(run,
+    "orphaned_by_restart")` (its `merge_dispatch_settled` row carries reason
+    `orphaned_by_restart`), then the entry HOLDS with a remedy naming the
+    operator re-arm above. The queue-path re-arm needs NO
+    `fishhawk_merge_run` re-invocation: the next pump re-decides. An entry
+    in phase `settling` (the forge accepted) is never orphaned: PR open or
+    an indeterminate read holds `settling_unconfirmed` with no ledger write.
+  - Nothing is retried or released automatically: the retry-once and the
+    moved head/base release wait for ADR-109 Amendment A1, and any later
+    automatic retry must re-run the ADR-112 forge-approval fold and veto
+    in-lock, failing closed, before calling the forge.
 
 ## Reasons
 
@@ -424,8 +500,10 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   `ReanchorYielded`): read the entry's base → its base lock → the row
   `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
   stays correct.
-- `AdmitNext`: the base lock → the live check → the first unmarked held row
-  by effective key.
+- `AdmitNext` / `AdmitNextReclaiming` (one shared admit transaction): the
+  base lock → the live check (and its re-claim, whose `Record` runs under the
+  base lock and the live row's lock, before COMMIT) → the first unmarked held
+  row by effective key.
 - `Promote`: per-run lock → peek → the entry's base lock → the row `FOR
   UPDATE` (Enqueue's order with one base).
 
@@ -441,7 +519,8 @@ with the lock removed. Reads (`ActiveForRun`, `ListForBase`,
 Every time comparison uses the database clock (`clock_timestamp()`); no Go
 `time.Now()` value is passed into SQL (the marker CASes pass back a
 `yielded_at` READ from the row, compared for equality, never against the
-clock).
+clock; `AdmitNextReclaiming`'s `AdmittedBefore` is an instant READ from
+`DatabaseNow`).
 
 ### Merge-intent lock
 
@@ -516,7 +595,8 @@ the BYPASSRLS system context.
 
 | Constant | Value | Why |
 |---|---|---|
-| `AdmissionStaleAfter` | 10 min | Admission work (auto-advance merge + bounded post-merge read + trigger append + re-open) takes seconds; 10 min is far past a slow forge, so a re-claim means a crash, not a slow pump. The re-run is idempotent (advance is a no-op when up to date; the pass start is per-head idempotent). |
+| `AdmissionStaleAfter` | 10 min | Bounds phases `admitted` and `advancing`. Admission work (auto-advance merge + bounded post-merge read + trigger append + re-open) takes seconds; 10 min is far past a slow forge, so a re-claim means a crash, not a slow pump. The re-run is idempotent (advance is a no-op when up to date; the pass start is per-head idempotent). At boot, `AdmitNextReclaiming` re-claims a pre-boot admission at once instead. |
+| `IntentFnTimeout` | 90 s (`intentFnTimeout`) | The merge-intent lock's fn deadline (§ "Merge-intent lock"), exported for the D8 resume's crash-left queue-claim age window (§ "Merge-dispatch ledger"). |
 
 ## Residuals
 

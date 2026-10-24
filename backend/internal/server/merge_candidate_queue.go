@@ -141,6 +141,11 @@ const (
 	// R2 forge veto yielded at its admission epoch (ADR-112 R3 row 2): it is
 	// held and marked, AdmitNext skips it, and the pump continues.
 	admitYielded
+	// admitGateHeld (ADR-093 D8 ruling R7): a RE-CLAIMED admission whose run
+	// has a live stage or merge-candidate trigger is left live at its new
+	// epoch with no write; the pump stops and its next tick re-checks the
+	// gate (mergeQueueGateHolds, approval condition C5).
+	admitGateHeld
 )
 
 // Merge-on-pass verified sources (merge_queue_verified.source).
@@ -342,13 +347,33 @@ func (s *Server) applyMergeCandidateStartToEntry(ctx context.Context, e mergeque
 // recovery Unadmit and strand the entry live in phase admitted until
 // mergequeue.AdmissionStaleAfter.
 func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Base) map[uuid.UUID]mergeCandidateAdmitResult {
+	return s.pumpMergeCandidateQueueWith(ctx, base, false)
+}
+
+// pumpMergeCandidateQueueWith is pumpMergeCandidateQueue; boot makes the
+// FIRST admission the boot re-claim (mergeQueueBootAdmit, ADR-093 D8).
+//
+// The live-entry branch routes by the entry's last recorded step: passed +
+// intent → merge-on-pass, then the outcome is applied, THEN the decision's
+// own in-flight mark (if it marked) is cleared (ruling R8c); merging/settling → skipped while
+// THIS process has the run's merge in flight, else the restart resume
+// (mergeQueueResumeMerge); verifying/unverified → the verifying recovery
+// (mergeQueueResumeVerifying); an admitted/advancing entry the R7 gate holds
+// → the gate is re-checked (C5); anything else holds the line.
+func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeue.Base, boot bool) map[uuid.UUID]mergeCandidateAdmitResult {
 	out := map[uuid.UUID]mergeCandidateAdmitResult{}
 	if s.cfg.MergeQueue == nil {
 		return out
 	}
 	readvances := 0
 	for i := 0; i < mergeCandidateQueueMaxAdmissions; i++ {
-		adm, err := s.cfg.MergeQueue.AdmitNext(ctx, base)
+		var adm mergequeue.Admission
+		var err error
+		if boot && i == 0 {
+			adm, err = s.mergeQueueBootAdmit(ctx, base)
+		} else {
+			adm, err = s.cfg.MergeQueue.AdmitNext(ctx, base)
+		}
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"merge-candidate queue: admit failed; the base is left as it is until the next pump",
@@ -366,16 +391,41 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 				continue
 			}
 			e := *adm.Entry
-			if e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed || e.MergeIntentAt == nil {
+			if e.State != mergequeue.StateLive {
 				return out
 			}
-			// ADR-093 D3: the live head of line passed and carries the
-			// operator's merge intent, so the queue merges it.
+			var cont bool
 			mctx, cancel := mergeCandidateAdmissionContext(pglock.Detach(ctx))
-			o := s.mergeQueueMergeOnPass(mctx, mergeOnPassRequest{
-				Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger(),
-			})
-			cont := s.applyMergeOnPassOutcome(mctx, e, o, &readvances)
+			switch {
+			case e.Phase == mergequeue.PhasePassed && e.MergeIntentAt != nil:
+				// ADR-093 D3: the live head of line passed and carries the
+				// operator's merge intent, so the queue merges it.
+				o := s.mergeQueueMergeOnPass(mctx, mergeOnPassRequest{
+					Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger(),
+				})
+				cont = s.applyMergeOnPassOutcome(mctx, e, o, &readvances)
+				if o.InFlightMarked {
+					// Ruling R8c: after the outcome is applied, and only this
+					// decision's own mark (#4298 48a65a85).
+					s.mergeInFlight.clear(e.RunID)
+				}
+			case e.Phase == mergequeue.PhaseMerging || e.Phase == mergequeue.PhaseSettling:
+				if s.mergeInFlight.has(e.RunID) {
+					// THIS process is mid-merge for the run: its own decision
+					// applies the outcome.
+					break
+				}
+				o := s.mergeQueueResumeMerge(mctx, e)
+				cont = s.applyMergeOnPassOutcome(mctx, e, o, &readvances)
+			case e.Phase == mergequeue.PhaseVerifying || e.Phase == mergequeue.PhaseUnverified:
+				cont = s.mergeQueueResumeVerifying(mctx, e)
+			case (e.Phase == mergequeue.PhaseAdmitted || e.Phase == mergequeue.PhaseAdvancing) && s.mergeQueueGateHolds.take(e):
+				// C5: a re-claimed admission the R7 gate held re-checks the
+				// gate now rather than at AdmissionStaleAfter.
+				res := s.admitMergeCandidateEntryReclaimed(mctx, e, true)
+				out[e.RunID] = res
+				cont = res.outcome == admitSettled || res.outcome == admitLive || res.outcome == admitYielded
+			}
 			cancel()
 			if !cont {
 				return out
@@ -385,7 +435,7 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 		actx, cancel := mergeCandidateAdmissionContext(ctx)
 		s.writeMergeCandidateQueueAudit(actx, CategoryMergeCandidateQueueAdmitted, *adm.Entry,
 			map[string]any{"readmitted": adm.Readmitted})
-		res := s.admitMergeCandidateEntry(actx, *adm.Entry)
+		res := s.admitMergeCandidateEntryReclaimed(actx, *adm.Entry, adm.Readmitted)
 		cancel()
 		out[adm.Entry.RunID] = res
 		stop := res.outcome != admitSettled && res.outcome != admitLive && res.outcome != admitYielded // ADR-093 slice 2 / ADR-112 R3: a settle, a live admission or a yield continues the pump
@@ -476,6 +526,11 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 		return s.yieldMergeQueueEntry(ctx, res.Entry, o.Yield, mergeQueueYieldSiteMergeOnPass)
 	case mergeOnPassYield:
 		return s.yieldMergeQueueEntry(ctx, e, o.Yield, mergeQueueYieldSiteMergeOnPass)
+	case mergeOnPassRedecide:
+		// ADR-093 D8: the resume returned the entry to passed; the pump's
+		// next iteration runs ordinary merge-on-pass from scratch.
+		log("merge queue: the resume returned a merging entry with no dispatch claim to passed; merge-on-pass re-decides")
+		return true
 	}
 	log("merge queue: merge-on-pass holds the entry")
 	return false
@@ -569,7 +624,9 @@ func (s *Server) PumpMergeCandidateQueues(ctx context.Context) int {
 func (s *Server) RunMergeCandidateQueuePump(ctx context.Context, interval time.Duration) {
 	s.bgMergeQueuePump.Add(1)
 	defer s.bgMergeQueuePump.Done()
-	s.PumpMergeCandidateQueues(ctx)
+	// ADR-093 D8: the boot pass resumes every live entry from its last
+	// recorded step first, re-claiming a dead process's admission.
+	s.resumeMergeCandidateQueues(ctx)
 	ticker := time.NewTicker(interval)
 	defer ticker.Stop()
 	for {
@@ -606,6 +663,18 @@ func (s *Server) mergeCandidateQueueRunTerminal(ctx context.Context, runID uuid.
 // already detached from the pump caller's cancellation, so every step here,
 // the recovery Unadmit included, runs to completion or to its own budget.
 func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entry) mergeCandidateAdmitResult {
+	return s.admitMergeCandidateEntryReclaimed(ctx, e, false)
+}
+
+// admitMergeCandidateEntryReclaimed is admitMergeCandidateEntry; reclaimed
+// marks a RE-CLAIMED admission (the boot instant or AdmissionStaleAfter):
+// after the run/PR reads and their settles, and BEFORE eligibility, the
+// behind-probe or any advance, the ADR-115 D4 / ruling R7 gate runs
+// (mergeQueueRunStageLive). Live: an in_flight verify state at the anchored
+// head is the entry's own pass (phase verifying, admitLive); otherwise the
+// entry is held live at its new epoch with no write (admitGateHeld). Every
+// admission stamps phase advancing right before the behind-probe (D8).
+func (s *Server) admitMergeCandidateEntryReclaimed(ctx context.Context, e mergequeue.Entry, reclaimed bool) mergeCandidateAdmitResult {
 	unadmit := func(why string) mergeCandidateAdmitResult {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge-candidate queue: admission failed transiently; entry returned to held at its place",
@@ -663,6 +732,11 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 	if head == "" || branch == "" {
 		return unadmit("the pull request returned an empty head sha or branch")
 	}
+	if reclaimed {
+		if r, held := s.mergeQueueReclaimGate(ctx, runRow, e); held {
+			return r
+		}
+	}
 
 	// ADR-093 slice 1 (E87.4 / #4295): re-evaluate eligibility on the PR's
 	// current head BEFORE the behind probe and auto-advance. Determined
@@ -688,6 +762,15 @@ func (s *Server) admitMergeCandidateEntry(ctx context.Context, e mergequeue.Entr
 			"the run is no longer merge-queue eligible ("+mergeQueueReasonsText(elig.Reasons)+"); fishhawk_merge_run re-enqueues it at the tail once it is")
 	}
 
+	// ADR-093 D8: record the advancing step before the behind-probe.
+	if _, err := s.cfg.MergeQueue.SetPhase(ctx, e.ID, e.AdmissionEpoch, mergequeue.PhaseAdvancing); err != nil {
+		if errors.Is(err, mergequeue.ErrStateConflict) {
+			return mergeCandidateAdmitResult{outcome: admitStale, refusal: &mergeCandidateVerifyRefusal{
+				Reason: "another merge-candidate queue admission owns this entry now (" + err.Error() + ")"}}
+		}
+		return unadmit("the advancing step could not be recorded: " + err.Error())
+	}
+	e.Phase = mergequeue.PhaseAdvancing
 	behind, err := s.cfg.GitHub.CompareCommits(ctx, scope, repo, head, e.BaseRef)
 	if err != nil {
 		return unadmit("the behind-probe failed: " + err.Error())
@@ -821,6 +904,17 @@ func (s *Server) mergeCandidateQueueOnVerdict(ctx context.Context, runID uuid.UU
 		return nil
 	}
 	if !found || st.Entry.State != mergequeue.StateLive || st.Entry.AnchoredHeadSHA != headSHA {
+		return nil
+	}
+	if st.Entry.Phase == mergequeue.PhaseMerging || st.Entry.Phase == mergequeue.PhaseSettling {
+		// ADR-093 D8 (approval condition C4): a late or duplicate verdict
+		// never resets, unverifies or ejects an entry whose queue claim may
+		// still be dispatched; the merge-on-pass decision or the restart
+		// resume settles it.
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"merge-candidate queue: a verdict reached an entry in its merging step; the entry is left as it is",
+			slog.String("run_id", runID.String()), slog.String("phase", string(st.Entry.Phase)),
+			slog.String("head_sha", headSHA), slog.String("result", result))
 		return nil
 	}
 	switch result {
@@ -1089,4 +1183,27 @@ func (s *Server) writeMergeCandidateQueueAudit(ctx context.Context, category str
 			slog.String("run_id", e.RunID.String()), slog.String("category", category),
 			slog.String("error", err.Error()))
 	}
+}
+
+// mergeQueueReclaimGate is the ADR-115 D4 / ruling R7 gate on a RE-CLAIMED
+// admission. held=false lets the admission continue. When the run is live:
+// an in_flight verify state at the anchored head is the entry's own pass, so
+// the entry records phase verifying (admitLive); otherwise it stays live at
+// its new epoch with no write (admitGateHeld) and is marked for the pump's
+// gate re-check (C5).
+func (s *Server) mergeQueueReclaimGate(ctx context.Context, runRow *run.Run, e mergequeue.Entry) (mergeCandidateAdmitResult, bool) {
+	live, why := s.mergeQueueRunStageLive(ctx, e.RunID)
+	if !live {
+		return mergeCandidateAdmitResult{}, false
+	}
+	if st, err := s.mergeCandidateVerifyState(ctx, runRow, e.AnchoredHeadSHA); err == nil && st.State == mergeCandidateStateInFlight {
+		return mergeCandidateAdmitResult{outcome: s.applyMergeCandidateStartToEntry(ctx, e, mergeCandidateStateInFlight, ""),
+			start: &mergeCandidateVerifyStart{State: st.State, StageID: st.StageID}}, true
+	}
+	s.mergeQueueGateHolds.hold(e)
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+		"merge-candidate queue: a re-claimed admission holds while the run is live; the next pump re-checks",
+		slog.String("run_id", e.RunID.String()), slog.String("why", why))
+	return mergeCandidateAdmitResult{outcome: admitGateHeld, refusal: &mergeCandidateVerifyRefusal{
+		Reason: "the merge-candidate queue re-claimed this entry but its run is live (" + why + "); the next pump re-checks"}}, true
 }

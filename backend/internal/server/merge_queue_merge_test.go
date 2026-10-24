@@ -1210,3 +1210,37 @@ func TestMergeQueueOnPass_ReviewRequiredRefusalStillYields(t *testing.T) {
 		}
 	}
 }
+
+// mqmProbeMerger runs probe inside the pinned merge call, then delegates.
+type mqmProbeMerger struct {
+	*mqmMerger
+	probe func()
+}
+
+func (m mqmProbeMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run, head string) error {
+	m.probe()
+	return m.mqmMerger.MergePullRequestAtHead(ctx, runRow, head)
+}
+
+// ADR-093 D8 (counterfactual B3): merge-on-pass records phase merging and
+// marks the in-flight registry BEFORE the forge call (the claim is then
+// dispatched), and settles merged after it.
+func TestMergeOnPass_StampsMergingBeforeForgeCall(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("stamp", "h1", mcvUndelegatedSpecYAML)
+	req = w.realLedger(req)
+	var phase mergequeue.Phase
+	var claimState mergequeue.DispatchState
+	var inFlight bool
+	w.srv.cfg.GateMerger = mqmProbeMerger{mqmMerger: w.merger, probe: func() {
+		phase = w.storeEntry(r).Phase
+		c, _, _ := w.store.MergeDispatch(context.Background(), r.id)
+		claimState = c.State
+		inFlight = w.srv.mergeInFlight.has(r.id)
+	}}
+	requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	if phase != mergequeue.PhaseMerging || claimState != mergequeue.DispatchDispatched || !inFlight {
+		t.Fatalf("during the forge call: phase %q claim %q in-flight %v, want merging, dispatched, true", phase, claimState, inFlight)
+	}
+	w.requireState(r, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}

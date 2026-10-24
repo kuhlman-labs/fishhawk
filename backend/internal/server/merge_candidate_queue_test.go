@@ -1467,6 +1467,14 @@ func (s *mcqFaultStore) names() []string {
 // test unless there is exactly one.
 func (s *mcqFaultStore) onlyCall(t *testing.T, method string, id uuid.UUID) mcqCall {
 	t.Helper()
+	return s.nthOfCalls(t, method, id, 1)
+}
+
+// nthOfCalls requires exactly n calls of method naming id and returns the
+// last. ADR-093 D8: an admission records two phases (advancing before the
+// behind-probe, then verifying or passed), so its SetPhase count is 2.
+func (s *mcqFaultStore) nthOfCalls(t *testing.T, method string, id uuid.UUID, n int) mcqCall {
+	t.Helper()
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	var hits []mcqCall
@@ -1475,10 +1483,10 @@ func (s *mcqFaultStore) onlyCall(t *testing.T, method string, id uuid.UUID) mcqC
 			hits = append(hits, c)
 		}
 	}
-	if len(hits) != 1 {
-		t.Fatalf("%s calls naming %s = %d, want exactly 1", method, id, len(hits))
+	if len(hits) != n {
+		t.Fatalf("%s calls naming %s = %d, want exactly %d", method, id, len(hits), n)
 	}
-	return hits[0]
+	return hits[n-1]
 }
 
 func (s *mcqFaultStore) Enqueue(ctx context.Context, req mergequeue.EnqueueRequest) (mergequeue.EnqueueResult, error) {
@@ -1952,7 +1960,7 @@ func TestMergeCandidateQueue_PeriodicPumpSurvivesSignalCancellation(t *testing.T
 	if st := f.stageState(b.impl.ID); st != run.StageStatePending {
 		t.Fatalf("B implement = %s, want pending (re-opened by the admission)", st)
 	}
-	c := fs.onlyCall(t, "SetPhase", bEntry.ID)
+	c := fs.nthOfCalls(t, "SetPhase", bEntry.ID, 2) // advancing, then verifying (ADR-093 D8)
 	if !c.hasDeadline || c.deadline.After(c.at.Add(mergeCandidateQueueHandOffBudget)) {
 		t.Fatalf("B SetPhase ran with deadline %v (has=%v) at %v, want a deadline within mergeCandidateQueueHandOffBudget (the signal context carries none)",
 			c.deadline, c.hasDeadline, c.at)
@@ -1989,7 +1997,7 @@ func TestMergeCandidateQueue_AdmissionBudgetIsPerEntry(t *testing.T) {
 	}
 	dA := fs.onlyCall(t, "Settle", aID)
 	dB := fs.onlyCall(t, "Settle", bID)
-	dC := fs.onlyCall(t, "SetPhase", cID)
+	dC := fs.nthOfCalls(t, "SetPhase", cID, 2) // advancing, then verifying (ADR-093 D8)
 	for name, d := range map[string]mcqCall{"A settle": dA, "B settle": dB, "C set phase": dC} {
 		if !d.hasDeadline {
 			t.Fatalf("%s ran with no deadline, want a bounded context", name)

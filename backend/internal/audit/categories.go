@@ -358,6 +358,12 @@ import "sort"
 // merge_queue_promoted, ADR-093 D7's promote row whose writer is a later
 // slice of the same issue (server/merge_queue_promote.go) — both INTERNAL,
 // actor system / operator, not issue-comment surfaces.
+// E87.7 / #4298 (ADR-093 D8) added merge_queue_resumed, the restart resume's
+// record of what it did with a live head-of-line entry it found at its last
+// recorded step (server/merge_queue_resume_verifying.go). Its payload names
+// only THIS run's own entry, claim and head, so it is run-bound-readable
+// under ADR-106 (no ADR-106 registry flag exists yet) — INTERNAL, actor
+// system, not an issue-comment surface.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -521,6 +527,7 @@ var KnownCategories = map[string]struct{}{
 	"merge_queue_merged":                      {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass merged the head of line through the forge pinned to the verified head, naming verdict_head_sha and approval basis (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_overlap_refused":             {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass was held by the merge overlap guard; counts only, no other run's ids or paths, one row per distinct decision (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_promoted":                    {}, // E87.6 / #4297 (ADR-093 D7): FORWARD registration — the operator promote verb moved an unmarked held entry to the head of its base's line, appended INSIDE the promotion transaction (server/merge_queue_promote.go, a later slice) — INTERNAL, not an issue-comment surface
+	"merge_queue_resumed":                     {}, // E87.7 / #4298 (ADR-093 D8): the restart resume's record for a live head-of-line entry, naming step, action (reclaim, apply_verdict, eject, record_unverified, redispatch_pass, settle_merged, settle_pr_merged, drop_pr_closed, redecide, hold), reason, head and admission epoch; appended BEFORE the action it records and fail-closed; only this run's own ids (server/merge_queue_resume_verifying.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_verified":                    {}, // E87.5 / #4296 (ADR-093 D3): a merge-intent queue entry's head read passed (pass, transfer, already_passed or not_required) (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_yield_cleared":               {}, // E89.28 / #4632 (ADR-112 R3): a yielded queue entry's re-probe found a qualifying approval and cleared its marker by compare-and-swap; the entry rejoins the line FIFO at its enqueued_at (server/merge_queue_yield_reprobe.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_yield_posted":                {}, // E89.28 / #4632 (ADR-112 R5): a yield older than one pump tick, posted ONCE per (entry_id, yielded_at) episode to the run's issue-thread activity timeline with its reason and next step (server/merge_queue_yield_reprobe.go) — operator-visible

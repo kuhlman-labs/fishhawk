@@ -2846,10 +2846,15 @@ components:
         phase:
           type: string
           description: |
-            A live entry's progress: `admitted`, `verifying`, `passed` (holds
-            the line until its PR merges) or `unverified` (the pass did not
-            execute; the next `rebase-branch` re-triggers it). Omitted while
-            held. An open set: later queue modes add phases.
+            A live entry's LAST RECORDED step (not a liveness signal):
+            `admitted`, `advancing` (the behind-probe and auto-advance),
+            `verifying`, `passed` (holds the line until its PR merges),
+            `unverified` (the pass did not execute; the next `rebase-branch`
+            re-triggers it), `merging` (the queue's merge was claimed and
+            handed to the forge) or `settling` (the forge accepted the merge).
+            After a restart the queue resumes the entry from this step
+            (ADR-093 D8 / #4298). Omitted while held. An open set: later queue
+            modes add phases.
         position:
           type: integer
           minimum: 1
@@ -3806,7 +3811,7 @@ components:
           enum: [held, live]
         phase:
           type: string
-          description: "A live entry's progress (`admitted`, `verifying`, `passed`, `unverified`; an open set). Omitted while held."
+          description: "A live entry's last recorded step, not a liveness signal (`admitted`, `advancing`, `verifying`, `passed`, `unverified`, `merging`, `settling`; an open set; ADR-093 D8). Omitted while held."
         position:
           type: integer
           minimum: 1
@@ -8010,10 +8015,12 @@ components:
         run_id: { $ref: '#/components/schemas/UUID' }
         reason:
           type: string
-          enum: [undispatched_child, review_in_flight, check_failed]
+          enum: [undispatched_child, review_in_flight, check_failed, merge_in_flight]
+          description: '`merge_in_flight` (ADR-093 D8 / #4298) is a head-of-line merge-queue merge this process has in flight.'
         stage:
           type: string
-          enum: [plan, implement]
+          enum: [plan, implement, merge]
+          description: '`merge` names the merge queue''s merge step on a `merge_in_flight` item; the other values are run stage types.'
         parent_run_id:
           type: string
           format: uuid
@@ -18944,6 +18951,14 @@ paths:
           so the daemon could not decide that run's state, including a read
           the re-dispatch decision needs. `scripts/dev` treats it as a REFUSING
           blocker.
+        - `merge_in_flight` — a head-of-line merge-queue merge THIS process
+          has in flight (ADR-093 D8 / #4298): the stage is `merge` (the
+          queue's merge step, not a run stage row). A restart interrupts the
+          forge merge call, so the next boot must reconcile it and may hold
+          it for the operator re-arm. Process-local (no read), so it never
+          yields `check_failed`. A merging entry a PRIOR process left is NOT
+          a blocker: the next boot reconciles it and a restart loses nothing
+          more.
 
         Items carry only ids, enum slugs and counts — no free text — sorted by
         `run_id`, then `reason`, then `stage`.

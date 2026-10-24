@@ -93,15 +93,27 @@ type mergeDispatchLedger interface {
 // or it names a different head than the one that merged. A nil ledger has no
 // claim to read.
 func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string) {
+	ok, reason, detail, err := s.mergeOnPassReconcileMergedStrict(ctx, ledger, runID, mergedHead)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge dispatch: the merge_dispatch_settled row did not land",
+			slog.String("run_id", runID.String()), slog.String("error", err.Error()))
+	}
+	return ok, reason, detail
+}
+
+// mergeOnPassReconcileMergedStrict is mergeOnPassReconcileMerged returning the
+// reconciled_merged row's append error (ok stays true: the reconcile decision
+// stands); the ADR-093 D8 resume holds on it (fail closed, ruling R8d).
+func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string, appendErr error) {
 	if ledger == nil {
-		return true, "", ""
+		return true, "", "", nil
 	}
 	claim, found, err := ledger.MergeDispatch(ctx, runID)
 	if err != nil {
-		return false, mergeOnPassReasonTransient, "the pull request merged but the run's dispatch claim could not be read: " + err.Error()
+		return false, mergeOnPassReasonTransient, "the pull request merged but the run's dispatch claim could not be read: " + err.Error(), nil
 	}
 	if !found {
-		return true, "", ""
+		return true, "", "", nil
 	}
 	if claim.HeadSHA != mergedHead {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -109,12 +121,12 @@ func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDis
 			slog.String("run_id", runID.String()), slog.String("claim_head_sha", claim.HeadSHA),
 			slog.String("merged_head_sha", mergedHead), slog.String("claim_state", string(claim.State)))
 		return false, mergeOnPassReasonMergedClaimMismatch,
-			"the pull request merged at " + mergedHead + " but the run's dispatch claim (" + string(claim.State) + ", " + claim.Path + ") names " + claim.HeadSHA
+			"the pull request merged at " + mergedHead + " but the run's dispatch claim (" + string(claim.State) + ", " + claim.Path + ") names " + claim.HeadSHA, nil
 	}
 	if claim.State == mergequeue.DispatchFailed {
-		s.appendMergeDispatchSettled(ctx, claim, mergeDispatchReconciledMerged, "the forge reports the pull request merged at the claim's head")
+		appendErr = s.appendMergeDispatchSettledStrict(ctx, claim, mergeDispatchReconciledMerged, "the forge reports the pull request merged at the claim's head")
 	}
-	return true, "", ""
+	return true, "", "", appendErr
 }
 
 // mergeDispatchLedgerOutcome classifies a failed forge dispatch made after a D1
@@ -206,21 +218,32 @@ func (s *Server) appendMergeDispatchSettled(ctx context.Context, claim mergequeu
 	if s.cfg.AuditRepo == nil {
 		return
 	}
+	if err := s.appendMergeDispatchSettledStrict(ctx, claim, outcome, reason); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge dispatch: the merge_dispatch_settled row did not land",
+			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
+	}
+}
+
+// appendMergeDispatchSettledStrict appends the categoryMergeDispatchSettled
+// row and returns the append error: the ADR-093 D8 resume writes it BEFORE
+// its ledger transition and holds on a failure (fail closed, ruling R8d).
+func (s *Server) appendMergeDispatchSettledStrict(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string) error {
+	if s.cfg.AuditRepo == nil {
+		return errors.New("merge_dispatch_settled: no audit repository is wired")
+	}
 	payload, _ := json.Marshal(map[string]any{
 		"outcome": outcome, "path": claim.Path, "head_sha": claim.HeadSHA, "reason": reason,
 	})
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        claim.RunID,
 		Timestamp:    time.Now().UTC(),
 		Category:     categoryMergeDispatchSettled,
 		ActorKind:    &kind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	}); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge dispatch: the merge_dispatch_settled row did not land",
-			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
-	}
+	})
+	return err
 }
 
 // mergeOnPassRequest is one merge-on-pass decision: the entry as the pump
@@ -257,6 +280,10 @@ const (
 	// mergeOnPassYield (ADR-112 R3 rows 2-4): yield Yield now (Store.Yield
 	// outside the lock); the pump continues to the next held entry.
 	mergeOnPassYield mergeOnPassKind = "yield"
+	// mergeOnPassRedecide (ADR-093 D8): the restart resume returned a merging
+	// entry with NO dispatch claim to phase passed; the pump continues, and
+	// ordinary merge-on-pass decides from scratch (fold and veto in-lock).
+	mergeOnPassRedecide mergeOnPassKind = "redecide"
 )
 
 // mergeOnPassOutcome is mergeQueueMergeOnPass's answer. State is set only on
@@ -264,7 +291,9 @@ const (
 // mergeOnPassAwaitApproval and mergeOnPassYield (Reason is then Yield.Reason).
 // ForgeReason and ForgeDetail are set only on a forge_merge_refused ejection
 // (ADR-093 D4): the typed refusal code and the forge's untrusted refusal text,
-// which the merge_queue_ejected writer sanitises.
+// which the merge_queue_ejected writer sanitises. InFlightMarked reports that
+// THIS decision marked the run in s.mergeInFlight (ADR-093 D8), so the pump
+// clears only its own mark.
 type mergeOnPassOutcome struct {
 	Kind          mergeOnPassKind
 	State         mergequeue.State
@@ -276,6 +305,8 @@ type mergeOnPassOutcome struct {
 	Yield         mergeQueueYield
 	ForgeReason   string
 	ForgeDetail   string
+	// InFlightMarked: this decision marked s.mergeInFlight for the run.
+	InFlightMarked bool
 }
 
 // Merge-on-pass reasons. Hold reasons leave the entry; eject/drop reasons are
@@ -522,8 +553,12 @@ func onlyChecksNotGreen(r mergeQueueEligibilityResult) bool {
 // the merge-intent lock fn's deadline; every forge read takes its own
 // sub-deadline.
 func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, runRow *run.Run,
-	target mergeOnPassTarget, head string, merger HeadPinnedMerger) mergeOnPassOutcome {
+	target mergeOnPassTarget, head string, merger HeadPinnedMerger) (res mergeOnPassOutcome) {
 	e := req.Entry
+	// marked: this decision marked s.mergeInFlight; every outcome past the
+	// mark carries it so the pump clears only its own mark (#4298 48a65a85).
+	marked := false
+	defer func() { res.InFlightMarked = marked }()
 	// basis is the fold's (step 6b); "" until the fold ran.
 	basis := ""
 	held := func(reason, detail string) mergeOnPassOutcome {
@@ -544,7 +579,12 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	if err != nil {
 		return held(mergeOnPassReasonTransient, "the queue entry could not be re-read: "+err.Error())
 	}
-	if !found || cur.Entry.ID != e.ID || cur.Entry.State != mergequeue.StateLive || cur.Entry.Phase != mergequeue.PhasePassed ||
+	// ADR-093 D8 ruling R3: passed, or merging (an earlier decision of THIS
+	// cycle stamped it and its dispatch is on the ledger: the claim below
+	// decides). The pre-lock check stays passed-only; the pump routes a
+	// merging entry to the resume.
+	inLockPhaseOK := cur.Entry.Phase == mergequeue.PhasePassed || cur.Entry.Phase == mergequeue.PhaseMerging
+	if !found || cur.Entry.ID != e.ID || cur.Entry.State != mergequeue.StateLive || !inLockPhaseOK ||
 		cur.Entry.MergeIntentAt == nil || cur.Entry.AnchoredHeadSHA != head {
 		return held(mergeOnPassReasonEntryChanged, "the queue entry changed before the merge could be decided")
 	}
@@ -666,9 +706,25 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	if req.Ledger == nil {
 		return held(mergeOnPassReasonLedgerUnavailable, "no merge-dispatch ledger is wired, so no dispatch can be claimed")
 	}
+	// ADR-093 D8: record the step BEFORE the claim, so a restart finds a
+	// merging entry wherever a queue dispatch may be in flight. A CAS miss
+	// holds with no claim and no forge call; an unchanged phase writes nothing.
+	if cur.Entry.Phase != mergequeue.PhaseMerging {
+		if _, err := s.cfg.MergeQueue.SetPhase(ctx, e.ID, e.AdmissionEpoch, mergequeue.PhaseMerging); err != nil {
+			return held(mergeOnPassReasonEntryChanged, "the merging step could not be recorded before the dispatch claim: "+err.Error())
+		}
+	}
+	s.mergeInFlight.mark(e.RunID)
+	marked = true
 	merged := func(observed bool) mergeOnPassOutcome {
+		// The forge accepted the merge: record settling, best-effort (the
+		// merge is a fact), then the merged tail.
+		if _, err := s.cfg.MergeQueue.SetPhase(ctx, e.ID, e.AdmissionEpoch, mergequeue.PhaseSettling); err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge queue: the settling step could not be recorded; the merged tail still runs",
+				slog.String("run_id", e.RunID.String()), slog.String("error", err.Error()))
+		}
 		return s.mergeOnPassMerged(ctx, e, head, basis, mergeOnPassMergedRefs{verdictSeq: verdictSeq, verdictHead: verdictHead,
-			intentSeq: intentSeq, authSeq: authSeq, counted: fold.Counted}, observed)
+			intentSeq: intentSeq, authSeq: authSeq, counted: fold.Counted}, mergeOnPassTailOpts{Observed: observed})
 	}
 	observedMerged := func() bool {
 		p, rerr := s.mergeOnPassReadPR(ctx, target)
@@ -803,6 +859,22 @@ func decodeMergeOnPassVerdict(row *audit.Entry) mergeOnPassVerdict {
 	return mergeOnPassVerdict{Sequence: row.Sequence, ViaQueue: p.Via == mergeVerdictViaMergeQueue, HeadSHA: p.HeadSHA}
 }
 
+// survivingMergeVerdict is the run's surviving merge_verdict_recorded row
+// (the EARLIEST: the 0062 once-index admits one per run): its sequence and
+// head ("" when it names none); ok=false when rows holds none.
+func survivingMergeVerdict(rows []*audit.Entry) (int64, string, bool) {
+	var best *audit.Entry
+	for _, r := range rows {
+		if r != nil && (best == nil || r.Sequence < best.Sequence) {
+			best = r
+		}
+	}
+	if best == nil {
+		return 0, "", false
+	}
+	return best.Sequence, decodeMergeOnPassVerdict(best).HeadSHA, true
+}
+
 // recordMergeOnPassVerdict appends the operator's merge_verdict_recorded row
 // for this merge, record-before-commit: the intent row's verdict prose and
 // actor, via merge_queue, intent_sequence, head_sha and entry_id. An existing
@@ -813,18 +885,7 @@ func decodeMergeOnPassVerdict(row *audit.Entry) mergeOnPassVerdict {
 // returned: nothing merges.
 func (s *Server) recordMergeOnPassVerdict(ctx context.Context, runRow *run.Run, e mergequeue.Entry,
 	intent mergeQueueIntentRecord, head string, existing []*audit.Entry) (int64, string, error) {
-	surviving := func(rows []*audit.Entry) (int64, string, bool) {
-		var best *audit.Entry
-		for _, r := range rows {
-			if r != nil && (best == nil || r.Sequence < best.Sequence) {
-				best = r
-			}
-		}
-		if best == nil {
-			return 0, "", false
-		}
-		return best.Sequence, decodeMergeOnPassVerdict(best).HeadSHA, true
-	}
+	surviving := survivingMergeVerdict
 	if seq, vh, ok := surviving(existing); ok {
 		return seq, vh, nil
 	}
@@ -885,15 +946,32 @@ type mergeOnPassMergedRefs struct {
 	counted     []countedApproval
 }
 
+// mergeOnPassTailOpts selects the merged tail's mode, threaded EXPLICITLY
+// (ADR-093 D8 ruling R4). Observed: the merge was observed on the forge, not
+// returned by this decision's call. Resume: the restart resume's tail, under
+// the merge-intent lock: merge_queue_merged is appended only when no existing
+// row names the entry, a failed dedup read or append HOLDS
+// (mergeQueueResumeReasonUnrecorded, nothing settled), and the payload
+// carries resumed:true. Resume=false is the first attempt, unchanged.
+type mergeOnPassTailOpts struct {
+	Observed bool
+	Resume   bool
+}
+
 // mergeOnPassMerged is the merged tail: the merge_queue_merged row, then the
-// merged settle INSIDE the lock (approval condition D3). A failed row append
-// after the forge accepted the merge is logged at ERROR and the outcome is
-// still merged (approval condition (c)); a failed settle leaves Settled false
-// so the pump settles it.
+// merged settle INSIDE the lock (approval condition D3). On the first attempt
+// a failed row append after the forge accepted the merge is logged at ERROR
+// and the outcome is still merged (approval condition (c)); a failed settle
+// leaves Settled false so the pump settles it. opts.Resume changes the row
+// handling only (mergeOnPassTailOpts).
 func (s *Server) mergeOnPassMerged(ctx context.Context, e mergequeue.Entry, head, basis string,
-	refs mergeOnPassMergedRefs, observed bool) mergeOnPassOutcome {
+	refs mergeOnPassMergedRefs, opts mergeOnPassTailOpts) mergeOnPassOutcome {
 	out := mergeOnPassOutcome{Kind: mergeOnPassMerged, State: mergequeue.StateMerged,
 		Reason: mergeCandidateQueueReasonMergedByQueue, HeadSHA: head, ApprovalBasis: basis}
+	resumeHeld := func(detail string) mergeOnPassOutcome {
+		return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: mergeQueueResumeReasonUnrecorded, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+	}
+	observed := opts.Observed
 	fields := map[string]any{
 		"entry_id":         e.ID.String(),
 		"base_ref":         e.BaseRef,
@@ -911,16 +989,32 @@ func (s *Server) mergeOnPassMerged(ctx context.Context, e mergequeue.Entry, head
 		q := refs.counted[0]
 		fields["qualifying_reviewer"] = map[string]any{"login": q.Login, "actor_id": q.ActorID, "permission": q.Permission}
 	}
+	appendRow := true
+	if opts.Resume {
+		fields["resumed"] = true
+		named, err := s.mergeQueueMergedRowNames(ctx, e)
+		if err != nil {
+			return resumeHeld("the merge_queue_merged rows could not be read for the resume's dedup: " + err.Error())
+		}
+		appendRow = !named
+	}
 	payload, _ := json.Marshal(fields)
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
-	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	// !appendRow: a row already names this entry (a crash after the append,
+	// before the settle), so the resume settles without a second row.
+	if !appendRow {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "merge queue resume: merge_queue_merged already names the entry; settling without a second row",
+			slog.String("run_id", e.RunID.String()), slog.String("entry_id", e.ID.String()))
+	} else if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        e.RunID,
 		Timestamp:    time.Now().UTC(),
 		Category:     CategoryMergeQueueMerged,
 		ActorKind:    &kind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	}); err != nil {
+	}); err != nil && opts.Resume {
+		return resumeHeld("merge_queue_merged could not be recorded on the resume: " + err.Error())
+	} else if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelError,
 			"merge queue: the forge accepted the pinned merge but merge_queue_merged could not be recorded; the entry is settled merged",
 			slog.String("run_id", e.RunID.String()), slog.String("head_sha", head), slog.String("error", err.Error()))

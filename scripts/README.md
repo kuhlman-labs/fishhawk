@@ -1989,7 +1989,7 @@ The runner-side half of #2897 — the terminal-egress retry budget that makes a
 
 ## Restart-blocker guard for reload / post-merge (E83.30 / [#3974](https://github.com/kuhlman-labs/fishhawk/issues/3974))
 
-The live-run guard above protects a runner PROCESS. Two hazards have no runner
+The live-run guard above protects a runner PROCESS. Three hazards have no runner
 process and live inside fishhawkd itself:
 
 - a **decomposition child whose `implement` stage is still `pending` /
@@ -2000,9 +2000,15 @@ process and live inside fishhawkd itself:
   sweep RE-DISPATCHES an eligible orphaned round (advisory, reviewer wired,
   under the depth cap, not superseded) against the same plan or head, so the
   daemon reports only a current-process round the next boot would NOT
-  re-dispatch (e.g. a gating round), or a boot re-dispatch still settling.
+  re-dispatch (e.g. a gating round), or a boot re-dispatch still settling; and
+- a **head-of-line merge-queue merge THIS daemon has in flight**
+  (`merge_in_flight`, stage `merge`; ADR-093 D8 /
+  [#4298](https://github.com/kuhlman-labs/fishhawk/issues/4298)) — a restart
+  interrupts the forge merge call, so the next boot must reconcile it and may
+  hold it for the operator re-arm. A merging entry a PRIOR daemon left is not
+  reported: the next boot reconciles it, and a restart loses nothing more.
 
-The daemon owns both predicates, so the guard ASKS it:
+The daemon owns every predicate, so the guard ASKS it:
 `GET /v0/restart-blockers` (contract: `backend/internal/server/README.md`
 § "Restart blockers") returns `{items, scanned_runs, truncated}`, each item
 `{run_id, reason, stage, parent_run_id?, …}` with no free text. A round an
@@ -2035,7 +2041,7 @@ reload-context one — the child hazard was already decided before the pull.
 | Condition | Result |
 |---|---|
 | no blocker | SILENT, proceed |
-| `review_in_flight` (both contexts); `undispatched_child` (`post-merge` only) | refusal naming each run + reason and what `--force` breaks, exit 1 |
+| `review_in_flight` or `merge_in_flight` (both contexts); `undispatched_child` (`post-merge` only) | refusal naming each run + reason and what `--force` breaks, exit 1; a `merge_in_flight` line reads "head-of-line queue merge in flight" and says the next boot must reconcile it and may hold it for the operator re-arm (`scripts/test-dev` RB-p) |
 | only `undispatched_child`, `reload` context | SILENT, proceed |
 | **`check_failed`** — a per-run stage/audit read error from a REACHABLE daemon | **REFUSES** like any blocker, naming the run and saying the daemon could not decide its state; `--force` overrides. Fail-CLOSED on purpose: an unreachable daemon has nothing in flight to orphan, but a reachable one that cannot decide must not risk orphaning work |
 | an item the parser cannot read (`unreadable`) | REFUSES — the daemon said something blocks |
@@ -2059,7 +2065,8 @@ the already-loaded old `scripts/dev`.
 - **Daemon-wide scope.** The check covers every run the fishhawkd this
   checkout's `scripts/dev` manages can see, not only runs bound to this checkout.
   It over-refuses only for a child bound to ANOTHER checkout of the same daemon,
-  which `--force` clears; under-refusing would orphan in-process review rounds.
+  which `--force` clears; under-refusing would orphan in-process review rounds
+  and queue merges.
 - **TOCTOU.** A blocker that appears between the check and the teardown is not
   caught — the same class as #2897. `post-merge`'s second check inside
   `cmd_reload` runs AFTER the pull, so a refusal there leaves main pulled.
@@ -2071,7 +2078,8 @@ the already-loaded old `scripts/dev`.
 `scripts/dev reload --when-quiet` waits until a restart would orphan nothing,
 then reloads. Each poll (`_reload_quiet_check`) runs `_scan_live_runs` and the
 reload-context blocker query (`_fetch_restart_blockers` +
-`_parse_restart_blockers`, `undispatched_child` ignored) and prints one
+`_parse_restart_blockers`, `undispatched_child` ignored, so it waits on every
+other reason, `merge_in_flight` included) and prints one
 `reload --when-quiet: waiting on: <what> (<waited>s of <timeout>s)` line per
 live poll; a quiet first poll prints nothing.
 
@@ -2103,7 +2111,9 @@ runner on the host cannot refuse first). They skip with a printed reason when
 child before git (#4077); RB-b/n/h refuse reload (review, check_failed,
 unreadable) with the marker absent; RB-o pins the reload context — a child-only
 answer proceeds silently, a child next to a review round refuses on the review
-round alone; RB-c/n `--force` proceeds; RB-d/f/g/j fail open (unreachable, 404,
+round alone; RB-p refuses reload on `merge_in_flight` naming the run and the
+"head-of-line queue merge in flight" text the generic unknown-reason arm does not
+print, and its `--force` arm warns and proceeds; RB-c/n `--force` proceeds; RB-d/f/g/j fail open (unreachable, 404,
 malformed, curl absent); RB-e is silent; RB-i warns on `truncated`; RB-l pins
 post-merge's refusal ahead of git/cleanup/reload. RB-k
 parses `testdata/wire/restart_blockers.json` — the SAME golden the backend's

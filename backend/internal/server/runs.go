@@ -436,8 +436,9 @@ type runResponse struct {
 type runMergeCandidateQueuePayload struct {
 	// State is held or live (an entry in a terminal state is never surfaced).
 	State string `json:"state"`
-	// Phase is a live entry's progress: admitted, verifying, passed or
-	// unverified. Omitted while held.
+	// Phase is a live entry's LAST RECORDED step (ADR-093 D8, not a liveness
+	// signal): admitted, advancing, verifying, passed, unverified, merging or
+	// settling. Omitted while held.
 	Phase string `json:"phase,omitempty"`
 	// Position is the 1-based place among the base's held entries (FIFO by
 	// eligibility time unless promoted). Omitted (0) for a live entry.

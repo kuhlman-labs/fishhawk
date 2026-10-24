@@ -21,6 +21,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
@@ -3218,5 +3219,34 @@ func TestRebaseRunBranch_EnforceWrongParentDoesNotTransfer(t *testing.T) {
 	}
 	if cls.count() != 0 {
 		t.Errorf("classifier calls = %d, want 0 (decided not_clean_advance before classifying)", cls.count())
+	}
+}
+
+// TestReanchorOnTransfer_KeepsMergingPhase (ADR-093 D8, ruling R8g): a
+// transfer re-anchor moves the anchor of a live entry in phase merging or
+// settling but KEEPS its phase, so it cannot overwrite the record of a
+// dispatched queue claim; a pre-merge step (verifying) still becomes passed.
+func TestReanchorOnTransfer_KeepsMergingPhase(t *testing.T) {
+	for _, tc := range []struct {
+		phase, want mergequeue.Phase
+	}{
+		{mergequeue.PhaseMerging, mergequeue.PhaseMerging},
+		{mergequeue.PhaseSettling, mergequeue.PhaseSettling},
+		{mergequeue.PhaseVerifying, mergequeue.PhasePassed},
+		{mergequeue.PhaseAdvancing, mergequeue.PhasePassed},
+		{mergequeue.PhasePassed, mergequeue.PhasePassed},
+	} {
+		t.Run(string(tc.phase), func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, _ := mqrvSeed(w, "a", "a1", tc.phase, true)
+			w.srv.reanchorMergeCandidateQueueOnTransfer(context.Background(), r.id, "a2")
+			e := w.active(r)
+			if e.AnchoredHeadSHA != "a2" {
+				t.Fatalf("anchor = %s, want a2 (the re-anchor still moves it)", e.AnchoredHeadSHA)
+			}
+			if e.State != mergequeue.StateLive || e.Phase != tc.want {
+				t.Fatalf("entry = %s/%s, want live/%s", e.State, e.Phase, tc.want)
+			}
+		})
 	}
 }

@@ -417,7 +417,7 @@ type Run struct {
 // outside the package names this type.
 type runMergeCandidateQueue struct {
 	State                 string     `json:"state" jsonschema:"held (waiting behind the base's live pass, no runner slot) or live (this run holds the base's merge-candidate line)"`
-	Phase                 string     `json:"phase,omitempty" jsonschema:"a live entry's progress: admitted, verifying, passed (holds the line until its PR merges) or unverified (the pass did not execute; re-invoke fishhawk_rebase_run_branch). Omitted while held"`
+	Phase                 string     `json:"phase,omitempty" jsonschema:"a live entry's last recorded step (not a liveness signal): admitted, advancing (behind-probe and auto-advance), verifying, passed (holds the line until its PR merges), unverified (the pass did not execute; re-invoke fishhawk_rebase_run_branch), merging (the queue's merge was handed to the forge) or settling (the forge accepted it); after a restart the queue resumes from this step (ADR-093 D8). Omitted while held"`
 	Position              int        `json:"position,omitempty" jsonschema:"1-based place among the base's held entries (FIFO by eligibility time unless promoted); omitted for a live entry"`
 	Repo                  string     `json:"repo"`
 	BaseRef               string     `json:"base_ref" jsonschema:"the base ref whose queue the entry is in"`

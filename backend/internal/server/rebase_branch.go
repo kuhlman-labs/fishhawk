@@ -1110,11 +1110,18 @@ func (s *Server) rebaseMergeCandidateTransferEnforce(ctx context.Context, req me
 
 // reanchorMergeCandidateQueueOnTransfer moves the run's ACTIVE queue entry
 // (held or live) to the transferred head in place, keeping its state, phase
-// and place; a live entry is also set to phase passed (it holds the line
-// until merge, ADR-092 D4). It writes merge_candidate_queue_reanchored with
-// verdict_transferred:true. Best-effort: a failure only logs, and the next
-// admission re-anchors to the live PR head and reads the transferred verdict
-// there.
+// and place; a live entry whose fresh read is in a PRE-MERGE step (admitted,
+// advancing, verifying or unverified) is also set to phase passed (it holds
+// the line until merge, ADR-092 D4). A live entry in phase merging or
+// settling KEEPS its phase (ADR-093 D8, ruling R8g): that phase is the record
+// of a dispatched queue claim the restart resume reconciles, and a transfer
+// re-anchor must not overwrite it. It writes merge_candidate_queue_reanchored
+// with verdict_transferred:true. Best-effort: a failure only logs, and the
+// next admission re-anchors to the live PR head and reads the transferred
+// verdict there. Residual: a concurrent merge-on-pass can stamp merging
+// between this read and the SetPhase(passed) CAS (same epoch); the resulting
+// passed entry with a dispatched queue claim holds merge_already_dispatched
+// rather than merging twice.
 func (s *Server) reanchorMergeCandidateQueueOnTransfer(ctx context.Context, runID uuid.UUID, head string) {
 	if s.cfg.MergeQueue == nil {
 		return
@@ -1140,12 +1147,24 @@ func (s *Server) reanchorMergeCandidateQueueOnTransfer(ctx context.Context, runI
 		}
 		e = re
 	}
-	if e.State == mergequeue.StateLive {
+	if e.State == mergequeue.StateLive && transferReanchorSetsPassed(e.Phase) {
 		s.setMergeCandidateQueuePhase(ctx, e, mergequeue.PhasePassed)
 		e.Phase = mergequeue.PhasePassed
 	}
 	s.writeMergeCandidateQueueAudit(ctx, CategoryMergeCandidateQueueReanchored, e,
 		map[string]any{"verdict_transferred": true})
+}
+
+// transferReanchorSetsPassed reports whether a transfer re-anchor writes
+// phase passed for a live entry in phase p: only from a pre-merge step. A
+// merging or settling entry (ADR-093 D8) and an already-passed one keep
+// their phase.
+func transferReanchorSetsPassed(p mergequeue.Phase) bool {
+	switch p {
+	case mergequeue.PhaseAdmitted, mergequeue.PhaseAdvancing, mergequeue.PhaseVerifying, mergequeue.PhaseUnverified:
+		return true
+	}
+	return false
 }
 
 // writeRebaseNotDeterminable is the fail-CLOSED refusal: a 422 carrying the

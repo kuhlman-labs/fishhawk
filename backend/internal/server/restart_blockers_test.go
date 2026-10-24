@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -764,6 +765,90 @@ func TestRestartBlockers_Narrowing(t *testing.T) {
 	})
 }
 
+// TestRestartBlockers_MergeInFlight (ADR-093 D8 / #4298): a run whose
+// head-of-line queue merge THIS process has in flight is a merge_in_flight
+// blocker naming stage merge; a cleared registry, or a terminal run, blocks
+// nothing. Counterfactual C1: deleting check (c)'s append drops the item.
+func TestRestartBlockers_MergeInFlight(t *testing.T) {
+	t.Run("marked", func(t *testing.T) {
+		f := newRBFixture()
+		f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
+		s := f.server()
+		s.mergeInFlight.mark(attnID(1))
+		got := decodeRestartBlockers(t, getRestartBlockers(t, s, anonymous()))
+		if len(got.Items) != 1 {
+			t.Fatalf("items = %+v, want one merge_in_flight item", got.Items)
+		}
+		it := got.Items[0]
+		if it.RunID != attnID(1).String() || it.Reason != restartBlockerMergeInFlight || it.Stage != restartBlockerStageMerge ||
+			it.ParentRunID != "" || it.StageState != "" || it.ConfiguredAgents != nil || it.Landed != nil {
+			t.Fatalf("item = %+v, want {run 1, merge_in_flight, merge} with no other field", it)
+		}
+	})
+	t.Run("cleared", func(t *testing.T) {
+		f := newRBFixture()
+		f.runs.seed(attnID(1), "acme/app", run.StateRunning, attnT0, "")
+		s := f.server()
+		s.mergeInFlight.mark(attnID(1))
+		s.mergeInFlight.clear(attnID(1))
+		if got := decodeRestartBlockers(t, getRestartBlockers(t, s, anonymous())); len(got.Items) != 0 || got.ScannedRuns != 1 {
+			t.Fatalf("items = %+v scanned = %d, want nothing once the registry is cleared", got.Items, got.ScannedRuns)
+		}
+	})
+	t.Run("terminal_run", func(t *testing.T) {
+		f := newRBFixture()
+		f.runs.seed(attnID(1), "acme/app", run.StateSucceeded, attnT0, "")
+		s := f.server()
+		s.mergeInFlight.mark(attnID(1))
+		if got := decodeRestartBlockers(t, getRestartBlockers(t, s, anonymous())); len(got.Items) != 0 || got.ScannedRuns != 0 {
+			t.Fatalf("items = %+v scanned = %d, want nothing for a terminal run", got.Items, got.ScannedRuns)
+		}
+	})
+}
+
+// TestRestartBlockers_LiveQueueMergeListed_EndToEnd drives the REAL merge
+// queue (Postgres store, D1 ledger, audit chain): while the pinned merger is
+// mid-call for the head-of-line entry, GET /v0/restart-blockers through
+// s.Handler() lists the run as merge_in_flight / merge; once the pump has
+// applied the outcome (ruling R8c) the list is empty. Counterfactual C1:
+// deleting check (c) empties the mid-call list.
+func TestRestartBlockers_LiveQueueMergeListed_EndToEnd(t *testing.T) {
+	w := newMQMWorld(t)
+	a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
+	w.mqeRebased(a, "pre-h1", "h1", "h1", false)
+	w.mqePassed(a, "h1")
+	w.live(a, "h1") // the live head of line: passed, carrying merge intent
+	list := func() restartBlockersResponse {
+		rec := httptest.NewRecorder()
+		w.srv.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/restart-blockers", nil))
+		return decodeRestartBlockers(t, rec)
+	}
+	var during restartBlockersResponse
+	probed := false
+	w.srv.cfg.GateMerger = mqmProbeMerger{mqmMerger: w.merger, probe: func() {
+		probed = true
+		during = list()
+	}}
+	w.srv.PumpMergeCandidateQueues(context.Background())
+	if !probed {
+		t.Fatal("the pinned merger was never called, so the in-flight window was never observed")
+	}
+	want := restartBlocker{RunID: a.id.String(), Reason: restartBlockerMergeInFlight, Stage: restartBlockerStageMerge}
+	found := false
+	for _, it := range during.Items {
+		if it.RunID == want.RunID && it.Reason == want.Reason && it.Stage == want.Stage {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("mid-merge items = %+v, want %+v listed", during.Items, want)
+	}
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if after := list(); len(after.Items) != 0 {
+		t.Fatalf("items after the outcome was applied = %+v, want none", after.Items)
+	}
+}
+
 func restartBlockersGoldenPath(t *testing.T) string {
 	t.Helper()
 	return filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "restart_blockers.json")
@@ -771,7 +856,7 @@ func restartBlockersGoldenPath(t *testing.T) string {
 
 // TestRestartBlockers_EndToEnd_Golden drives the REAL mux (s.Handler()) with
 // NO credential — the anonymous posture scripts/dev relies on — across all
-// three reasons, and compares the RAW response bytes to the shared wire golden
+// four reasons, and compares the RAW response bytes to the shared wire golden
 // testdata/wire/restart_blockers.json. scripts/test-dev's RB-k case feeds the
 // same file to scripts/dev's _parse_restart_blockers, so a field rename on
 // either side fails one of the two. Regenerate with
@@ -792,12 +877,17 @@ func TestRestartBlockers_EndToEnd_Golden(t *testing.T) {
 	// with no stages and no review rounds, so it is scanned and blocks nothing.
 	// It must be non-terminal or the undispatched_child item is filtered (#4184).
 	f.seedParent(attnID(2), run.StateRunning, attnT0.Add(3*time.Minute))
+	// merge_in_flight (ADR-093 D8 / #4298): a run whose head-of-line queue
+	// merge this process has in flight.
+	f.runs.seed(attnID(7), "acme/app", run.StateRunning, attnT0.Add(4*time.Minute), "")
+	s := f.server()
+	s.mergeInFlight.mark(attnID(7))
 
 	rec := httptest.NewRecorder()
-	f.server().Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/restart-blockers", nil))
+	s.Handler().ServeHTTP(rec, httptest.NewRequest(http.MethodGet, "/v0/restart-blockers", nil))
 	got := decodeRestartBlockers(t, rec)
-	if len(got.Items) != 3 || got.ScannedRuns != 4 || got.Truncated {
-		t.Fatalf("items = %+v scanned = %d truncated = %v, want 3 items over 4 runs", got.Items, got.ScannedRuns, got.Truncated)
+	if len(got.Items) != 4 || got.ScannedRuns != 5 || got.Truncated {
+		t.Fatalf("items = %+v scanned = %d truncated = %v, want 4 items over 5 runs", got.Items, got.ScannedRuns, got.Truncated)
 	}
 
 	path := restartBlockersGoldenPath(t)
@@ -826,8 +916,8 @@ func TestOpenAPI_RestartBlockersRouteDocumented(t *testing.T) {
 	for _, want := range []string{
 		"\n  /v0/restart-blockers:\n", "operationId: listRestartBlockers",
 		"\n    RestartBlockerList:\n", "\n    RestartBlocker:\n",
-		"enum: [undispatched_child, review_in_flight, check_failed]",
-		"enum: [plan, implement]", "audit_repo_unconfigured",
+		"enum: [undispatched_child, review_in_flight, check_failed, merge_in_flight]",
+		"enum: [plan, implement, merge]", "audit_repo_unconfigured",
 	} {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/api/v0.openapi.yaml is missing %q", strings.TrimSpace(want))

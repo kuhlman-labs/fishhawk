@@ -1,0 +1,14 @@
+id: scenario:issue-4298/restart-blockers-idle-has-no-merge-item
+statement: On an idle daemon, GET /v0/restart-blockers answers 200 with an items array, scanned_runs and truncated, and no item carries reason merge_in_flight when no head-of-line queue merge is in flight.
+verify_hint: 'HTTP: GET /v0/restart-blockers on the localhost preview returns 200 and no item has reason merge_in_flight.'
+steps: GET http://localhost:8090/v0/restart-blockers on the freshly booted preview (git_sha f61dea31), with no merge queue activity
+assertions:
+    expected: 200 with items, scanned_runs and truncated; no merge_in_flight item
+    observed_at_record: 200 {"items":[],"scanned_runs":0,"truncated":false}; no item has reason merge_in_flight
+    repro_handle: curl -s http://localhost:8090/v0/restart-blockers
+origin:
+    issue: 4298
+    pr: 0
+    run_id: f19fbd6e-2852-40dd-b387-265333c8982a
+    head_sha: f61dea317b43ffa729564203a6263de49abf06fa
+    recorded_at: 2026-10-24T01:27:14Z

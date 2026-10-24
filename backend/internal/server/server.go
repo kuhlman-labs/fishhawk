@@ -951,6 +951,14 @@ type Config struct {
 	// merge_candidate_queue.go and backend/internal/mergequeue/README.md.
 	MergeQueue mergequeue.Store
 
+	// MergeQueueBootAt is the ADR-093 D8 boot instant (#4298): a
+	// DATABASE-clock instant (mergequeue.Resumer.DatabaseNow) runServe
+	// captures before the daemon can admit. The boot pump's first admission
+	// per base re-claims a live admitted/advancing entry admitted before it
+	// (resumeMergeCandidateQueues). Zero turns the boot re-claim off; the
+	// AdmissionStaleAfter re-claim remains.
+	MergeQueueBootAt time.Time
+
 	// MergeQueueApprovalWait is ADR-112 R3's bounded head-of-line approval
 	// wait (#4632): a non-approved forge-approval fold at the head of the
 	// line holds it for this window, measured from the persisted
@@ -1273,6 +1281,16 @@ type Server struct {
 	// the loop claimed before SIGTERM finishes inside the drain window rather
 	// than being cut at process exit.
 	bgMergeQueuePump sync.WaitGroup
+	// mergeQueueBootAt mirrors Config.MergeQueueBootAt (ADR-093 D8).
+	mergeQueueBootAt time.Time
+	// mergeInFlight is the per-Server, process-local registry of runs whose
+	// head-of-line queue merge THIS process has in flight (ADR-093 D8,
+	// merge_queue_resume.go). A fresh Server starts empty.
+	mergeInFlight *mergeInFlightRegistry
+	// mergeQueueGateHolds records the re-claimed admissions the R7
+	// stage-live gate is holding (entry id → admission epoch), so the
+	// periodic pump re-checks the gate for them (approval condition C5).
+	mergeQueueGateHolds *mergeQueueGateHoldRegistry
 	// yieldSweepLast is when THIS process's previous yield sweep started
 	// (sweepMergeQueueYields; zero before the first, ADR-112 R3, #4632): a
 	// row is due when a schedule point fell since then. Process-local, under
@@ -1470,7 +1488,9 @@ func New(cfg Config) *Server {
 		cfg.ReviewBudget = planreview.DefaultReviewBudget
 	}
 
-	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}, transferSem: make(chan struct{}, 1)}
+	s := &Server{cfg: cfg, p95Cache: map[string]p95CacheEntry{}, transferSem: make(chan struct{}, 1),
+		mergeQueueBootAt: cfg.MergeQueueBootAt, mergeInFlight: newMergeInFlightRegistry(),
+		mergeQueueGateHolds: newMergeQueueGateHoldRegistry()}
 	s.logMergeCandidateTransferStartup()
 	if s.nowFunc == nil {
 		s.nowFunc = time.Now
