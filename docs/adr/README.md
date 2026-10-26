@@ -349,6 +349,8 @@ Amendments recorded under the upkeep rule since:
 - ADR-120: `amends: [ADR-084, ADR-113]` ("It amends ADR-084 (D4 and rule 4's whole-index injection) and ADR-113 (D4's live index-size checks and frozen-tree contents)"); both gain `amended_by: [ADR-120]`. Its `applies_to` names the paths its Record metadata states.
 - ADR-090: its tracker body (#4170) now carries the in-body "Amendment 1 (2026-10-14)" the record already held, so the record is again a verbatim transcription.
 - ADR-109: its tracker body (#4601) gained "## Amendment A1 (2026-10-23)" (ratified by the Captain), an in-body amendment of its own ledger rules (an orphaned queue dispatch claim is released on forge evidence), so the body is re-transcribed and no `amends`/`amended_by` edge is added.
+- ADR-121: `amends: [ADR-101, ADR-112, ADR-118]` ("It amends ADR-101 (D2's diff refusal is extended), ADR-112 (the merge verdict gains the protected-path condition …) and ADR-118 (…)"); each gains `amended_by: [ADR-121]`.
+- ADR-122: `amends: [ADR-085, ADR-101, ADR-118]` ("It amends ADR-101 (one provenance-bound D6 exception …), ADR-085 (the recommendation path extended to charter sections) and ADR-118 (…)"); each gains `amended_by: [ADR-122]`.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -533,6 +535,8 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-118](118-review-changes-judged-not-repinned.md) | Review changes are judged, not re-pinned: a per-arm eval gate (standing, experiment and monitor arms; model changes as paired experiments), reviewer configuration as a gate trigger, and one pre-registered offline+live decision rule | `accepted` | [#4698](https://github.com/kuhlman-labs/fishhawk/issues/4698) |
 | [ADR-119](119-fixup-session-resume-opt-in.md) | Fix-up session resume is opt-in and local-only, bound to the reported head and a signed anchor | `accepted` | [#4708](https://github.com/kuhlman-labs/fishhawk/issues/4708) |
 | [ADR-120](120-decision-record-scaling.md) | The decision record scales: lean index lines, a topic map beside the record, a partitioned index | `accepted` | [#4709](https://github.com/kuhlman-labs/fishhawk/issues/4709) |
+| [ADR-121](121-protected-judge.md) | The protected judge: agents cannot change what judges their work without a human | `accepted` | [#4727](https://github.com/kuhlman-labs/fishhawk/issues/4727) |
+| [ADR-122](122-self-improvement-charter.md) | Recursive self-improvement is an opt-in, leased capability that only a human can widen | `accepted` | [#4728](https://github.com/kuhlman-labs/fishhawk/issues/4728) |
 
 ## Status unknown — needs captain confirmation
 
