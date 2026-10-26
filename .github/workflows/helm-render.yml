@@ -34,7 +34,7 @@ jobs:
       # `helm install --dry-run` needs a reachable cluster on Helm v3, and
       # this runner has none. Keep equal to deploy/gate-image's HELM_VERSION.
       - name: Install Helm
-        uses: azure/setup-helm@v4
+        uses: azure/setup-helm@v5
         with:
           version: v4.2.4
 
