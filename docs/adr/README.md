@@ -352,6 +352,8 @@ Amendments recorded under the upkeep rule since:
 - ADR-121: `amends: [ADR-101, ADR-112, ADR-118]` ("It amends ADR-101 (D2's diff refusal is extended), ADR-112 (the merge verdict gains the protected-path condition …) and ADR-118 (…)"); each gains `amended_by: [ADR-121]`.
 - ADR-122: `amends: [ADR-085, ADR-101, ADR-118]` ("It amends ADR-101 (one provenance-bound D6 exception …), ADR-085 (the recommendation path extended to charter sections) and ADR-118 (…)"); each gains `amended_by: [ADR-122]`.
 - ADR-123: `amends: [ADR-113]` ("Amendment to ADR-113 (#4628), **v2**"); ADR-113 gains `amended_by: [ADR-123]` and keeps `status: accepted`.
+- ADR-124: `amends: [ADR-098]` ("Amendment to ADR-098 (which amends ADR-096 D3), **v2.1**"); ADR-098 gains `amended_by: [ADR-124]` and keeps `status: accepted`.
+- ADR-125: `amends: [ADR-082]` ("It amends ADR-082, extending the historian's read path with one written record type"); ADR-082 gains `amended_by: [ADR-125]` and keeps `status: accepted`.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -501,6 +503,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-078](078-ground-review-agents-widen-context-narrow-capability.md) | Ground the review agents by widening context and narrowing capability: export the reviewed tree, scrub the inherited environment, grant read and search only | `accepted` | [#2519](https://github.com/kuhlman-labs/fishhawk/issues/2519) |
 | [ADR-079](079-product-and-program-management-agent.md) | Product and program management agent for human-ratified charters, release strategy, and readiness | `accepted` | [#3238](https://github.com/kuhlman-labs/fishhawk/issues/3238) |
 | [ADR-080](080-solo-captain-alpha.md) | Solo-captain alpha: the repository is the unit, one developer commands the full crew locally from the bridge | `accepted` | [#3693](https://github.com/kuhlman-labs/fishhawk/issues/3693) |
+| [ADR-082](082-historian-precedent.md) | Historian: a derived decision index over the audit chain, deterministic precedent at the gate for the captain, and a thresholded divergence question | `accepted` | [#3728](https://github.com/kuhlman-labs/fishhawk/issues/3728) |
 | [ADR-084](084-reviewer-personas.md) | Reviewer personas: a separate reviewer invocation with a declared remit, attached per stage or by an escalation, advisory with ingest-time checks, plus deterministic security checks as concern sources | `accepted` | [#3752](https://github.com/kuhlman-labs/fishhawk/issues/3752) |
 | [ADR-085](085-earned-autonomy-recommendations-only.md) | Earned autonomy: recommendations only, from server-attested evidence and a blind shadow record, with asymmetric thresholds (lower fast, raise slowly) and captain ratification through a human-authored spec change | `accepted` | [#3777](https://github.com/kuhlman-labs/fishhawk/issues/3777) |
 | [ADR-087](087-local-stage-concurrency-groups.md) | Local stage concurrency groups: server-coordinated admission of host-dispatched stages | `accepted` | [#3968](https://github.com/kuhlman-labs/fishhawk/issues/3968) |
@@ -539,6 +542,8 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-121](121-protected-judge.md) | The protected judge: agents cannot change what judges their work without a human | `accepted` | [#4727](https://github.com/kuhlman-labs/fishhawk/issues/4727) |
 | [ADR-122](122-self-improvement-charter.md) | Recursive self-improvement is an opt-in, leased capability that only a human can widen | `accepted` | [#4728](https://github.com/kuhlman-labs/fishhawk/issues/4728) |
 | [ADR-123](123-forge-verified-stage-approvals.md) | Amend ADR-113: stage approval gates admit only forge-verified credentials, on every channel | `accepted` | [#4750](https://github.com/kuhlman-labs/fishhawk/issues/4750) |
+| [ADR-124](124-verdict-transfer-surface-declaration.md) | Amend ADR-098: the verdict-transfer surface is a repository declaration; absent refuses | `accepted` | [#4754](https://github.com/kuhlman-labs/fishhawk/issues/4754) |
+| [ADR-125](125-captains-log.md) | The captain's log: evidence-bound lessons, confirmed by a human, read back to the driver | `accepted` | [#4756](https://github.com/kuhlman-labs/fishhawk/issues/4756) |
 
 ## Status unknown — needs captain confirmation
 
