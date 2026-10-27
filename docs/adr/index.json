@@ -1195,7 +1195,8 @@
         "ADR-055"
       ],
       "amended_by": [
-        "ADR-120"
+        "ADR-120",
+        "ADR-123"
       ],
       "applies_to": []
     },
@@ -1332,6 +1333,18 @@
         "ADR-085",
         "ADR-101",
         "ADR-118"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-123",
+      "title": "Amend ADR-113: stage approval gates admit only forge-verified credentials, on every channel",
+      "path": "docs/adr/123-forge-verified-stage-approvals.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-113"
       ],
       "applies_to": []
     }
