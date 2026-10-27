@@ -92,8 +92,69 @@ func (s *Server) handleTokenLoginDiscovery(w http.ResponseWriter, r *http.Reques
 	})
 }
 
+// The closed set of token-login verification refusal classes (#4627). A
+// refused VerifyAccessToken is reported to the server log as the provider
+// plus exactly one of these — NEVER the error text, which can carry up to
+// 256 bytes of a forge response body, and a forge body can echo the
+// submitted access token. The HTTP response never names the class at all:
+// every refusal is the same generic 401 token_verification_failed.
+const (
+	// tokenLoginReasonIntrospectionRefused: the forge's introspection
+	// endpoint answered a non-success status (identity.ErrIntrospectionRefused).
+	tokenLoginReasonIntrospectionRefused = "introspection_refused"
+	// tokenLoginReasonIssuerMismatch: introspection named an issuing client
+	// other than the configured device client, or none
+	// (identity.ErrTokenClientMismatch).
+	tokenLoginReasonIssuerMismatch = "issuer_mismatch"
+	// tokenLoginReasonIntrospectionFailed: the introspection exchange itself
+	// failed — transport, refused redirect, unreadable reply
+	// (identity.ErrIntrospectionFailed).
+	tokenLoginReasonIntrospectionFailed = "introspection_failed"
+	// tokenLoginReasonRateLimited: the forge signalled rate limiting on either
+	// request (identity.ErrRateLimited).
+	tokenLoginReasonRateLimited = "rate_limited"
+	// tokenLoginReasonSubjectResolutionFailed: the binding check passed (or
+	// the provider has none) but resolving the subject failed — every
+	// refusal not matched above.
+	tokenLoginReasonSubjectResolutionFailed = "subject_resolution_failed"
+)
+
+// tokenLoginRefusalReason maps a VerifyAccessToken error onto the closed
+// reason set by sentinel identity alone (errors.Is), never by its text.
+func tokenLoginRefusalReason(err error) string {
+	switch {
+	case errors.Is(err, identity.ErrRateLimited):
+		return tokenLoginReasonRateLimited
+	case errors.Is(err, identity.ErrTokenClientMismatch):
+		return tokenLoginReasonIssuerMismatch
+	case errors.Is(err, identity.ErrIntrospectionRefused):
+		return tokenLoginReasonIntrospectionRefused
+	case errors.Is(err, identity.ErrIntrospectionFailed):
+		return tokenLoginReasonIntrospectionFailed
+	default:
+		return tokenLoginReasonSubjectResolutionFailed
+	}
+}
+
+// tokenLoginCredentialEnv names, per provider, the configuration that
+// supplies the credential VerifyAccessToken's client-binding check needs —
+// the 503 message for identity.ErrClientCredentialUnconfigured.
+var tokenLoginCredentialEnv = map[string]string{
+	identity.ProviderGitHub: "FISHHAWKD_OAUTH_CLIENT_SECRET (with FISHHAWKD_OAUTH_CLIENT_ID)",
+	identity.ProviderGitLab: "FISHHAWKD_GITLAB_DEVICE_CLIENT_ID",
+}
+
+// tokenLoginCredentialUnconfiguredMessage renders the 503 message for a
+// provider whose client-binding credential is missing.
+func tokenLoginCredentialUnconfiguredMessage(provider string) string {
+	if env, ok := tokenLoginCredentialEnv[provider]; ok {
+		return "OAuth token login cannot bind the access token to the deployment's device OAuth client: set " + env
+	}
+	return "OAuth token login cannot bind the access token to the deployment's device OAuth client: configure the provider's device OAuth client credential"
+}
+
 // handleTokenLoginMint implements POST /v0/tokens/login. It verifies the
-// posted GitHub user access token to a provider-qualified subject
+// posted forge access token to a provider-qualified subject
 // server-side, enforces mint authz — the subject must hold at least the
 // configured minimum permission on the operator repo AND request only
 // scopes within the operator default set — then mints an OAuth token
@@ -101,10 +162,22 @@ func (s *Server) handleTokenLoginDiscovery(w http.ResponseWriter, r *http.Reques
 // OAuthIssuer capability. This is the "server-side re-verify" mint half
 // of the CLI-driven device flow (E39.3 / #1708).
 //
+// CLIENT BINDING (#4627). Verification is not owner-only: the selected
+// provider's VerifyAccessToken first binds the token to the deployment's
+// OWN device OAuth client through the forge's introspection surface
+// (GitHub check-a-token, GitLab token-info), so a token the same human
+// obtained through any other client cannot mint. Every refusal — a
+// foreign or undeterminable issuer, a failed introspection, a failed
+// subject lookup — is one generic 401 token_verification_failed; the
+// server log gets the provider and a closed-set reason class
+// (tokenLoginRefusalReason), never the error text.
+//
 // Fail-closed config gates (each 503 tokens_unconfigured): a nil
 // APITokenRepo, a repo that does not implement OAuthIssuer, an
-// unconfigured OperatorRepo, or an unconfigured identity provider
-// (VerifyAccessToken returns ErrNotConfigured on the NoOp). The mint is
+// unconfigured OperatorRepo, an unconfigured identity provider
+// (VerifyAccessToken returns ErrNotConfigured on the NoOp), or a provider
+// missing its client-binding credential
+// (identity.ErrClientCredentialUnconfigured; the message names the env var). The mint is
 // deliberately UNAUTHENTICATED at the bearer layer — the access token in
 // the body IS the credential the backend re-verifies. Its tokens stay
 // UNTENANTED by design (#4506): the request carries no account context and
@@ -173,15 +246,29 @@ func (s *Server) handleTokenLoginMint(w http.ResponseWriter, r *http.Request) {
 
 	// Server-side re-verify: turn the CLI-obtained access token into a
 	// verified provider-qualified subject. Never trust a client-supplied
-	// login. ErrNotConfigured (the NoOp provider) degrades to 503; any
-	// other failure means the presented token is bad → 401, not a mint.
+	// login. A provider missing its client-binding credential and
+	// ErrNotConfigured (the NoOp provider) degrade to 503; any other failure
+	// means the presented token is bad or not bound to the deployment's
+	// device client → 401, not a mint.
 	subject, err := idp.VerifyAccessToken(r.Context(), req.AccessToken)
 	if err != nil {
+		if errors.Is(err, identity.ErrClientCredentialUnconfigured) {
+			s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
+				tokenLoginCredentialUnconfiguredMessage(provider),
+				map[string]any{"provider": provider})
+			return
+		}
 		if errors.Is(err, identity.ErrNotConfigured) {
 			s.writeError(w, r, http.StatusServiceUnavailable, "tokens_unconfigured",
 				"OAuth token login requires an identity provider to be configured", nil)
 			return
 		}
+		// C1 (#4627): provider + closed-set reason only. err.Error() can embed
+		// a forge response body that echoes the submitted token, so it never
+		// reaches this log, the response, or an audit row.
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "token-login verification refused",
+			slog.String("provider", provider),
+			slog.String("reason", tokenLoginRefusalReason(err)))
 		s.writeError(w, r, http.StatusUnauthorized, "token_verification_failed",
 			"the presented access token could not be verified", nil)
 		return

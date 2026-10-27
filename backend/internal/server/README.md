@@ -8250,6 +8250,40 @@ provider is refused `400` naming the configured set. A verified subject whose
 `identity.ProviderOf` disagrees with the selected provider is refused `401`
 rather than minted — defence in depth against a mis-stamped row.
 
+**Client binding (#4627).** `VerifyAccessToken` binds the token to the
+deployment's OWN device OAuth client before resolving the subject (GitHub
+check-a-token, GitLab token-info; contract in
+`backend/internal/identity/README.md` § "Client binding"), so a token the same
+human obtained through any other client cannot mint. Outcomes:
+
+- every refusal (foreign or undeterminable issuer, failed introspection,
+  failed subject lookup) is ONE generic `401 token_verification_failed`; the
+  response never says which check failed.
+- a provider missing its introspection credential
+  (`identity.ErrClientCredentialUnconfigured`) is `503 tokens_unconfigured`,
+  `details.provider` set, the message naming the env var:
+  `FISHHAWKD_OAUTH_CLIENT_SECRET` (with `FISHHAWKD_OAUTH_CLIENT_ID`) for github,
+  `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` for gitlab, a generic wording otherwise.
+
+**Refusal logging is a closed set (#4627 C1).** A refused verification writes
+one WARN line, `token-login verification refused`, carrying ONLY `provider` and
+`reason`, one of the `tokenLoginReason*` constants in `tokens.go`, classified
+by sentinel (`errors.Is`), never by text:
+
+| `reason` | Sentinel |
+|---|---|
+| `rate_limited` | `identity.ErrRateLimited` (either request) |
+| `issuer_mismatch` | `identity.ErrTokenClientMismatch` |
+| `introspection_refused` | `identity.ErrIntrospectionRefused` |
+| `introspection_failed` | `identity.ErrIntrospectionFailed` |
+| `subject_resolution_failed` | anything else (the subject lookup) |
+
+The error text never reaches the log, the response body or an audit row: a
+provider error can embed up to 256 bytes of a forge response body, and a forge
+body can echo the submitted access token. Pinned by
+`TestTokenLoginMint_VerificationErrorNeverLeaksUpstreamBody`
+(`tokens_clientbinding_test.go`), which reads all three sinks.
+
 ### `POST /v0/tokens` mint ceiling
 
 `handleCreateToken` (#4503) mints for the caller's OWN subject and refuses, in

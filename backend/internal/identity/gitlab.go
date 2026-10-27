@@ -18,8 +18,9 @@ import (
 //
 //   - VerifyUser drives the RFC 8628 device flow against
 //     POST {base}/oauth/authorize_device + POST {base}/oauth/token.
-//   - VerifyAccessToken re-verifies a CLI-obtained access token
-//     server-side via GET {base}/api/v4/user.
+//   - VerifyAccessToken binds a CLI-obtained access token to the
+//     deployment's device application via GET {base}/oauth/token/info
+//     (#4627), then re-verifies it server-side via GET {base}/api/v4/user.
 //   - PermissionLevel / ResolveMembership read the project and group
 //     members APIs with a BOUNDED PAGINATED EXACT-MATCH walk.
 //
@@ -99,7 +100,8 @@ const (
 // credential is confined to PermissionLevel and ResolveMembership — the
 // reads that ask "what may this OTHER person do". VerifyAccessToken, whose
 // only job is to verify the caller's OWN token, sends ONLY that submitted
-// token and never the deployment credential: putting two credentials on
+// token — on BOTH of its requests, the token-info binding check and the
+// user lookup — and never the deployment credential: putting two credentials on
 // one verification request is an authentication-bypass shape, because if
 // the forge honours the deployment credential then an invalid or revoked
 // submitted token resolves as the deployment-token user and the mint
@@ -118,6 +120,11 @@ type GitLabIdentityProvider struct {
 	// requires, because ExchangeCode sends a client_secret) cannot serve
 	// it. Hence the separate FISHHAWKD_GITLAB_DEVICE_CLIENT_ID with no
 	// fallback to the browser leg's client id.
+	//
+	// It is ALSO the binding credential of VerifyAccessToken (#4627): a
+	// presented token is accepted only when GitLab's token-info endpoint
+	// names exactly this id as the issuing application. Empty →
+	// VerifyAccessToken returns ErrClientCredentialUnconfigured.
 	deviceClientID string
 
 	// token, when non-nil, returns the DEPLOYMENT credential for the
@@ -242,9 +249,11 @@ func (p *GitLabIdentityProvider) VerifyUser(ctx context.Context, prompt DeviceCo
 		switch tok.Error {
 		case "":
 			// Authorized — resolve the subject through the SAME
-			// re-verification path VerifyAccessToken uses, so both entry
-			// points share one subject derivation.
-			return p.VerifyAccessToken(ctx, tok.AccessToken)
+			// subject derivation VerifyAccessToken uses (resolveUser), so
+			// both entry points share one. No token-info binding check
+			// here: this token came from p's own device client by
+			// construction.
+			return p.resolveUser(ctx, tok.AccessToken)
 		case "authorization_pending":
 			continue
 		case "slow_down":
@@ -357,6 +366,104 @@ func (p *GitLabIdentityProvider) pollDeviceToken(ctx context.Context, deviceCode
 // VerifyAccessToken verifies a GitLab access token server-side and returns
 // the provider-qualified subject ("gitlab:<username>").
 //
+// CLIENT BINDING (#4627). Before the subject is resolved, the token must
+// be bound to THIS deployment's device application: verifyTokenApplication
+// asks GitLab's token-info endpoint which application issued it, and
+// anything other than exactly p.deviceClientID refuses — another OAuth
+// application, a personal/project/group access token or a CI job token
+// (no OAuth application), a null or absent application. Without it, a
+// token the same human obtained through any other client would resolve
+// the same subject. An empty deviceClientID returns
+// ErrClientCredentialUnconfigured before any HTTP call (an empty id would
+// otherwise compare equal to a null issuer). Then resolveUser derives the
+// subject exactly as VerifyUser does.
+func (p *GitLabIdentityProvider) VerifyAccessToken(ctx context.Context, accessToken string) (string, error) {
+	if accessToken == "" {
+		return "", fmt.Errorf("identity: access token is empty")
+	}
+	if p.deviceClientID == "" {
+		return "", ErrClientCredentialUnconfigured
+	}
+	if err := p.verifyTokenApplication(ctx, accessToken); err != nil {
+		return "", err
+	}
+	return p.resolveUser(ctx, accessToken)
+}
+
+// gitLabTokenInfo is the subset of GET /oauth/token/info we read. The
+// application is a pointer so an absent or null object is distinguishable
+// from a present one; a null uid decodes to "".
+type gitLabTokenInfo struct {
+	Application *gitLabTokenInfoApplication `json:"application"`
+}
+
+// gitLabTokenInfoApplication is the token-info "application" object; UID
+// is the issuing application's client id.
+type gitLabTokenInfoApplication struct {
+	UID string `json:"uid"`
+}
+
+// verifyTokenApplication performs GET {base}/oauth/token/info (#4627)
+// with the presented token as its ONLY credential (Authorization: Bearer —
+// never the query-string form, never PRIVATE-TOKEN or the deployment
+// credential) and succeeds only on a 2xx whose application.uid is
+// byte-exactly p.deviceClientID. Every other outcome refuses: a non-2xx
+// (ErrIntrospectionRefused; GitLab answers 401 for a token it does not
+// introspect), a rate-limit signal (ErrRateLimited), a transport failure,
+// an oversized or undecodable body (ErrIntrospectionFailed), or a null /
+// absent / foreign application (ErrTokenClientMismatch). No error carries
+// the response body.
+//
+// REDIRECTS. The request goes through credentialClient: a SAME-origin hop
+// (scheme + host + port all equal) is followed, carrying the bearer, and
+// the uid comparison runs on the FINAL response; a CROSS-origin hop —
+// including an https→http downgrade on the same host — is refused before
+// the target is contacted, so the bearer is never sent after it.
+func (p *GitLabIdentityProvider) verifyTokenApplication(ctx context.Context, accessToken string) error {
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/oauth/token/info", nil)
+	if err != nil {
+		return fmt.Errorf("%w: build gitlab token-info request", ErrIntrospectionFailed)
+	}
+	req.Header.Set("Accept", "application/json")
+	req.Header.Set("Authorization", "Bearer "+accessToken)
+
+	resp, err := p.credentialClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: gitlab token-info transport error", ErrIntrospectionFailed)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if rlErr := gitLabRateLimitError(resp); rlErr != nil {
+		return rlErr
+	}
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return fmt.Errorf("%w: gitlab token-info answered %d", ErrIntrospectionRefused, resp.StatusCode)
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, gitLabMaxMemberPageBytes+1))
+	if err != nil {
+		return fmt.Errorf("%w: read gitlab token-info", ErrIntrospectionFailed)
+	}
+	if len(raw) > gitLabMaxMemberPageBytes {
+		return fmt.Errorf("%w: gitlab token-info response exceeded %d bytes", ErrIntrospectionFailed, gitLabMaxMemberPageBytes)
+	}
+	var out gitLabTokenInfo
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return fmt.Errorf("%w: undecodable gitlab token-info reply", ErrIntrospectionFailed)
+	}
+	if out.Application == nil {
+		// Absent or null application: normalise to an empty issuer so the
+		// comparison below refuses it like any other foreign uid.
+		out.Application = &gitLabTokenInfoApplication{}
+	}
+	if out.Application.UID != p.deviceClientID {
+		return fmt.Errorf("%w (GitLab device application)", ErrTokenClientMismatch)
+	}
+	return nil
+}
+
+// resolveUser performs GET {base}/api/v4/user with the access token and
+// returns the provider-qualified subject ("gitlab:<username>"). It is the
+// single subject derivation VerifyUser and VerifyAccessToken share.
+//
 // BINDING CONDITION 1 (E66.4). This request carries EXACTLY ONE
 // credential: the submitted token, as Authorization: Bearer. The
 // deployment credential is deliberately NOT attached — not as a second
@@ -369,11 +476,7 @@ func (p *GitLabIdentityProvider) pollDeviceToken(ctx context.Context, deviceCode
 // TestGitLabVerifyAccessToken_DeploymentCredentialNotSent, whose
 // discriminating case answers 401 to the submitted token and 200 to the
 // deployment credential and requires the call to FAIL.
-func (p *GitLabIdentityProvider) VerifyAccessToken(ctx context.Context, accessToken string) (string, error) {
-	if accessToken == "" {
-		return "", fmt.Errorf("identity: access token is empty")
-	}
-
+func (p *GitLabIdentityProvider) resolveUser(ctx context.Context, accessToken string) (string, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, p.baseURL+"/api/v4/user", nil)
 	if err != nil {
 		return "", fmt.Errorf("identity: build gitlab user request: %w", err)
@@ -636,7 +739,8 @@ func gitLabHasNextLink(header string) bool {
 // permission downgrade to whatever the anonymous view happens to show.
 //
 // Only PermissionLevel and ResolveMembership reach this method.
-// VerifyAccessToken deliberately does not (binding condition 1).
+// VerifyAccessToken (token-info and user lookup alike) deliberately does
+// not (binding condition 1).
 func (p *GitLabIdentityProvider) get(ctx context.Context, endpoint string) (*http.Response, error) {
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 	if err != nil {
@@ -713,8 +817,9 @@ func (p *GitLabIdentityProvider) client() *http.Client {
 // Refusing the hop is the fail-closed answer: a members read is an
 // authorization question, so a redirected one must ERROR (surfaced as a
 // 500 by the mint handler) rather than be answered by an unverified
-// origin. The same refusal covers VerifyAccessToken, where a cross-origin
-// hop would let the redirect target dictate the caller's IDENTITY even
+// origin. The same refusal covers VerifyAccessToken's two requests, where a
+// cross-origin hop would let the redirect target dictate the caller's
+// IDENTITY (or, on the token-info check, the issuing application) even
 // though the stdlib had dropped the bearer.
 //
 // Same-origin redirects are still followed: the credential never leaves
