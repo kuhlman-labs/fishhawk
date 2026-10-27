@@ -851,6 +851,24 @@ gate runs (an `approval_submitted` principal can never reach a merge-settled gat
 (unqualified) member qualified by `--forge` (default `github`) — so the inventory is an upper bound
 when gates carry different lists, since it does not join a row to the gate it was recorded at.
 
+**Credential leg (#4633; decision record pending as ADR-123, #4750).** The gate also refuses a
+LISTED principal whose presenting credential is not forge-verified (`identity.ForgeVerifiedCredential`:
+`session`, `oauth`, `oauth_as`; `backend/internal/server/README.md` § "`approvals.members`
+enforcement"), so the aggregate also groups by the payload's `auth_method` and the
+`predicate_snapshot.members_credential`. A group's credential kind (`credentialKind`) is the
+recorded `members_credential` when present, else derived from `auth_method` (`oauth` → `oauth`,
+`static` → `static`, empty → `unrecorded`, other → `unknown`). Only **credential-bound** rows are
+evaluated (`credentialBound`: the principal is the row's own actor subject, or the actor is the
+synthetic `operator-agent/delegated` subject of a delegated human-kind approval); an agent-kind
+delegation recorded on behalf of the seated captain is not. A credential-bound row on a refused
+kind counts toward `credential_refused`, and an `unrecorded` one toward `credential_unrecorded` —
+**never** a refusal, because the audit row records no `auth_method` for a browser session, an
+authorization-server token or a legacy row, so history cannot decide the kind. Both are tallied
+only for a principal some `enforced_at=approval_row` members gate LISTS (an unlisted principal is
+refused on the subject first, and a merge-settled gate never sees an approval credential), so a
+spec whose members gates are all merge-settled reports zero credential impact. A principal with
+`credential_refused > 0` is `verdict=refused` and counts toward `refused=` and the exit code.
+
 **Window.** `--window` (default `30d`; whole days or a Go duration, via `precedent.ParseWindow`)
 bounds at `now - window`. `--since <RFC3339>` passes the parsed instant to the query VERBATIM (no
 now-relative arithmetic). The two are **mutually exclusive**: passing both explicitly is a usage
@@ -868,11 +886,14 @@ approval-row members gate; and the RLS caveat (`audit_entries` is FORCE row-leve
 rows — a short inventory may be incomplete); then one line per principal and a summary:
 
 ```
-principal=brett@local-mcp approvals=285 verdict=refused refusing_gates=feature_change/plan,...
-principal=github:kuhlman-labs approvals=4 verdict=admitted refusing_gates=-
-principal=operator-agent/driver approvals=3 verdict=agent_never_counted refusing_gates=...
-impact: refused=1 principals=2 approvals=289 refused_approvals=285 agent_rows_now_refused=3
+principal=alice@local approvals=285 verdict=refused refusing_gates=feature_change/plan,... credential_refused=0 credential_unrecorded=0
+principal=github:alice approvals=4 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=1
+principal=github:bob approvals=2 verdict=refused refusing_gates=- credential_refused=2 credential_unrecorded=0
+principal=operator-agent/driver approvals=3 verdict=agent_never_counted refusing_gates=... credential_refused=0 credential_unrecorded=0
+impact: refused=2 principals=3 approvals=291 refused_approvals=287 agent_rows_now_refused=3 credential_refused_approvals=2 credential_unrecorded_approvals=1
 ```
+
+The `credential_*` fields are appended after the pre-#4633 fields, which keep their order.
 
 `refused` / `principals` / `approvals` / `refused_approvals` count HUMAN principals and their
 approve rows. An agent-kind or empty principal (the operator-agent token family, or a delegated
@@ -883,7 +904,7 @@ means it never advances a gate, so it is never an impact. Its rows are still sum
 code.
 
 **Exit codes.** `0` — no human principal would be refused (or no members gate exists); `1` — at
-least one would be refused, or the database read failed (stderr names it, no `impact:` line); `2` —
+least one would be refused (on the subject or the credential leg), or the database read failed (stderr names it, no `impact:` line); `2` —
 usage: missing `--spec`, an unreadable or invalid spec, a bad `--window`, an unparseable `--since`,
 `--window` and `--since` together, a `--forge` outside `github|gitlab`, a stray argument, or no
 `--db`/`FISHHAWKD_DATABASE_URL`. A usage error never touches the database.

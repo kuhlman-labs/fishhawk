@@ -24,13 +24,16 @@ const approverMembersUsage = "Usage: fishhawkd approver-members --spec <path> [-
 
 // approverPrincipalRow is one aggregate group of approve-decision
 // approval_submitted audit rows: the rows sharing an actor subject/kind, a
-// recorded on_behalf_of and a delegated flag, with how many there were.
+// recorded on_behalf_of, a delegated flag, the recorded auth_method and the
+// predicate_snapshot's members_credential (#4633), with how many there were.
 type approverPrincipalRow struct {
-	ActorSubject string
-	ActorKind    string
-	OnBehalfOf   string
-	Delegated    bool
-	Approvals    int
+	ActorSubject      string
+	ActorKind         string
+	OnBehalfOf        string
+	Delegated         bool
+	AuthMethod        string
+	MembersCredential string
+	Approvals         int
 }
 
 // principal is the identity the approvals.members gate evaluates for the
@@ -44,6 +47,44 @@ func (r approverPrincipalRow) principal() string {
 		return r.OnBehalfOf
 	}
 	return r.ActorSubject
+}
+
+// credentialKind is the identity.Credential* kind the group's rows were
+// approved with (#4633): the recorded members_credential when the members
+// leg stamped one, otherwise derived from the payload's auth_method. The
+// audit row records no auth_method for a browser session, an
+// authorization-server token or a pre-#1708 row, so an empty auth_method is
+// unrecorded — the kind cannot be decided from history.
+func (r approverPrincipalRow) credentialKind() string {
+	if r.MembersCredential != "" {
+		return r.MembersCredential
+	}
+	switch r.AuthMethod {
+	case identity.CredentialDeviceFlow:
+		return identity.CredentialDeviceFlow
+	case identity.CredentialStatic:
+		return identity.CredentialStatic
+	case "":
+		return identity.CredentialUnrecorded
+	default:
+		return identity.CredentialUnknown
+	}
+}
+
+// credentialBound reports whether the gate's credential leg evaluates the
+// group's rows: the principal IS the presenting credential's own subject (a
+// direct approval, or a delegated human-kind one recorded under the synthetic
+// delegated subject after the #2381 remap). An agent-kind delegation whose
+// principal is the seated captain is never credential-evaluated.
+func (r approverPrincipalRow) credentialBound() bool {
+	return r.principal() == r.ActorSubject || r.ActorSubject == operatorrole.DelegatedApprovalActorSubject
+}
+
+// credentialRefused reports whether the members credential leg refuses kind
+// (#4633). An unrecorded kind is reported separately, never as a refusal:
+// history cannot tell a session from a static token there.
+func credentialRefused(kind string) bool {
+	return kind != identity.CredentialUnrecorded && !identity.ForgeVerifiedCredential(kind)
 }
 
 // agentKind reports whether the group's principal is an agent (or absent):
@@ -110,8 +151,11 @@ func (g membersGate) name() string { return g.Workflow + "/" + g.Stage }
 // every members-declaring APPROVAL-ROW gate of the spec (an enforced_at=merge
 // review gate is listed but checked against forge identities at merge, #4132),
 // through the same
-// identity.SubjectListed the gate runs, and exits 1 when any human principal
-// would be refused (0 when none would, 2 on a usage error).
+// identity.SubjectListed the gate runs, plus the gate's credential leg
+// (identity.ForgeVerifiedCredential over each credential-bound row's recorded
+// credential kind, #4633) for a principal some approval-row gate lists, and
+// exits 1 when any human principal would be refused (0 when none would, 2 on
+// a usage error).
 func runApproverMembers(args []string, logSink io.Writer) int {
 	return runApproverMembersWith(args, os.Stdout, logSink, loadApproverPrincipals, time.Now)
 }
@@ -234,10 +278,14 @@ func collectMembersGates(s *spec.Spec) []membersGate {
 }
 
 // principalTally is one principal's aggregate across loader groups.
+// credRefused / credUnrecorded count its credential-bound approvals whose
+// credential kind the members credential leg refuses / cannot decide (#4633).
 type principalTally struct {
-	subject   string
-	approvals int
-	agent     bool
+	subject        string
+	approvals      int
+	agent          bool
+	credRefused    int
+	credUnrecorded int
 }
 
 // writeApproverMembersReport prints one line per principal and the summary
@@ -261,6 +309,14 @@ func writeApproverMembersReport(out io.Writer, rows []approverPrincipalRow, gate
 			byKey[key] = t
 		}
 		t.approvals += r.Approvals
+		if r.credentialBound() {
+			switch kind := r.credentialKind(); {
+			case credentialRefused(kind):
+				t.credRefused += r.Approvals
+			case kind == identity.CredentialUnrecorded:
+				t.credUnrecorded += r.Approvals
+			}
+		}
 	}
 	tallies := make([]*principalTally, 0, len(byKey))
 	for _, t := range byKey {
@@ -273,18 +329,30 @@ func writeApproverMembersReport(out io.Writer, rows []approverPrincipalRow, gate
 		return tallies[i].subject < tallies[j].subject
 	})
 
-	var refused, principals, approvals, refusedApprovals, agentRefused int
+	var refused, principals, approvals, refusedApprovals, agentRefused, credRefusedApprovals, credUnrecordedApprovals int
 	for _, t := range tallies {
 		var refusing []string
 		seen := map[string]bool{}
+		listedAtApprovalRow := false
 		for _, g := range gates {
 			if g.EnforcedAt != enforcedAtApprovalRow {
 				continue
 			}
-			if !identity.SubjectListed(g.Members, t.subject, forge) && !seen[g.name()] {
+			if identity.SubjectListed(g.Members, t.subject, forge) {
+				listedAtApprovalRow = true
+			} else if !seen[g.name()] {
 				seen[g.name()] = true
 				refusing = append(refusing, g.name())
 			}
+		}
+		// The credential leg only runs for a principal some approval-row
+		// members gate LISTS (#4633): an unlisted principal is refused by the
+		// subject leg first, and an enforced_at=merge gate never sees an
+		// approval_submitted credential — so a spec whose members gates are
+		// all merge-settled reports zero credential impact.
+		credRefused, credUnrecorded := 0, 0
+		if listedAtApprovalRow {
+			credRefused, credUnrecorded = t.credRefused, t.credUnrecorded
 		}
 		subject := t.subject
 		if subject == "" {
@@ -294,23 +362,25 @@ func writeApproverMembersReport(out io.Writer, rows []approverPrincipalRow, gate
 			if len(refusing) > 0 {
 				agentRefused += t.approvals
 			}
-			_, _ = fmt.Fprintf(out, "principal=%s approvals=%d verdict=agent_never_counted refusing_gates=%s\n",
-				subject, t.approvals, joinOrDash(refusing))
+			_, _ = fmt.Fprintf(out, "principal=%s approvals=%d verdict=agent_never_counted refusing_gates=%s credential_refused=%d credential_unrecorded=%d\n",
+				subject, t.approvals, joinOrDash(refusing), credRefused, credUnrecorded)
 			continue
 		}
 		principals++
 		approvals += t.approvals
+		credRefusedApprovals += credRefused
+		credUnrecordedApprovals += credUnrecorded
 		verdict := "admitted"
-		if len(refusing) > 0 {
+		if len(refusing) > 0 || credRefused > 0 {
 			verdict = "refused"
 			refused++
 			refusedApprovals += t.approvals
 		}
-		_, _ = fmt.Fprintf(out, "principal=%s approvals=%d verdict=%s refusing_gates=%s\n",
-			subject, t.approvals, verdict, joinOrDash(refusing))
+		_, _ = fmt.Fprintf(out, "principal=%s approvals=%d verdict=%s refusing_gates=%s credential_refused=%d credential_unrecorded=%d\n",
+			subject, t.approvals, verdict, joinOrDash(refusing), credRefused, credUnrecorded)
 	}
-	_, _ = fmt.Fprintf(out, "impact: refused=%d principals=%d approvals=%d refused_approvals=%d agent_rows_now_refused=%d\n",
-		refused, principals, approvals, refusedApprovals, agentRefused)
+	_, _ = fmt.Fprintf(out, "impact: refused=%d principals=%d approvals=%d refused_approvals=%d agent_rows_now_refused=%d credential_refused_approvals=%d credential_unrecorded_approvals=%d\n",
+		refused, principals, approvals, refusedApprovals, agentRefused, credRefusedApprovals, credUnrecordedApprovals)
 	return refused
 }
 
@@ -329,6 +399,8 @@ SELECT COALESCE(a.actor_subject, ''),
        COALESCE(a.actor_kind, ''),
        COALESCE(a.payload->>'on_behalf_of', ''),
        COALESCE(a.payload->>'delegated', '') <> '',
+       COALESCE(a.payload->>'auth_method', ''),
+       COALESCE(a.payload->'predicate_snapshot'->>'members_credential', ''),
        count(*)
 FROM audit_entries a
 JOIN runs r ON r.id = a.run_id
@@ -336,8 +408,8 @@ WHERE a.category = 'approval_submitted'
   AND a.payload->>'decision' = $3
   AND a.ts >= $1
   AND ($2 = '' OR r.repo = $2)
-GROUP BY 1, 2, 3, 4
-ORDER BY 1, 2, 3, 4`
+GROUP BY 1, 2, 3, 4, 5, 6
+ORDER BY 1, 2, 3, 4, 5, 6`
 
 // loadApproverPrincipals is the production loader: one aggregate SELECT over
 // audit_entries joined to runs. Like `decision-index backfill` it sets no
@@ -358,7 +430,7 @@ func loadApproverPrincipals(ctx context.Context, dbURL, repo string, since time.
 	for rs.Next() {
 		var r approverPrincipalRow
 		var n int64
-		if err := rs.Scan(&r.ActorSubject, &r.ActorKind, &r.OnBehalfOf, &r.Delegated, &n); err != nil {
+		if err := rs.Scan(&r.ActorSubject, &r.ActorKind, &r.OnBehalfOf, &r.Delegated, &r.AuthMethod, &r.MembersCredential, &n); err != nil {
 			return nil, fmt.Errorf("scan approval_submitted aggregate: %w", err)
 		}
 		r.Approvals = int(n)

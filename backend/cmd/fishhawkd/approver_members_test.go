@@ -105,9 +105,9 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 			},
 			wantExit: exitFailure,
 			want: []string{
-				"principal=brett@local-mcp approvals=285 verdict=refused refusing_gates=feature_change/gate\n",
-				"principal=github:kuhlman-labs approvals=4 verdict=admitted refusing_gates=-\n",
-				"impact: refused=1 principals=2 approvals=289 refused_approvals=285 agent_rows_now_refused=0\n",
+				"principal=brett@local-mcp approvals=285 verdict=refused refusing_gates=feature_change/gate credential_refused=0 credential_unrecorded=0\n",
+				"principal=github:kuhlman-labs approvals=4 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=4\n",
+				"impact: refused=1 principals=2 approvals=289 refused_approvals=285 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=4\n",
 			},
 		},
 		{
@@ -117,7 +117,7 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 				{ActorSubject: "github:kuhlman-labs", ActorKind: user, Approvals: 4},
 			},
 			wantExit: exitOK,
-			want:     []string{"impact: refused=0 principals=1 approvals=4 refused_approvals=0 agent_rows_now_refused=0\n"},
+			want:     []string{"impact: refused=0 principals=1 approvals=4 refused_approvals=0 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=4\n"},
 		},
 		{
 			name:    "delegated row is evaluated against on_behalf_of and aggregated with direct rows",
@@ -128,8 +128,8 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 			},
 			wantExit: exitOK,
 			want: []string{
-				"principal=github:kuhlman-labs approvals=6 verdict=admitted refusing_gates=-\n",
-				"impact: refused=0 principals=1 approvals=6 refused_approvals=0 agent_rows_now_refused=0\n",
+				"principal=github:kuhlman-labs approvals=6 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=6\n",
+				"impact: refused=0 principals=1 approvals=6 refused_approvals=0 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=6\n",
 			},
 			notWant: []string{"principal=operator-agent/delegated"},
 		},
@@ -140,7 +140,7 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 				{ActorSubject: "operator-agent/delegated", ActorKind: agent, OnBehalfOf: "brett@local-mcp", Delegated: true, Approvals: 3},
 			},
 			wantExit: exitFailure,
-			want:     []string{"principal=brett@local-mcp approvals=3 verdict=refused refusing_gates=feature_change/gate\n"},
+			want:     []string{"principal=brett@local-mcp approvals=3 verdict=refused refusing_gates=feature_change/gate credential_refused=0 credential_unrecorded=0\n"},
 		},
 		{
 			name:    "pre-#2381 delegated human row with no on_behalf_of is evaluated as its actor",
@@ -149,7 +149,7 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 				{ActorSubject: "github:kuhlman-labs", ActorKind: user, Delegated: true, Approvals: 1},
 			},
 			wantExit: exitOK,
-			want:     []string{"principal=github:kuhlman-labs approvals=1 verdict=admitted refusing_gates=-\n"},
+			want:     []string{"principal=github:kuhlman-labs approvals=1 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=1\n"},
 		},
 		{
 			// C4: a NON-delegated agent-kind submission on a members gate flips
@@ -164,9 +164,9 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 			},
 			wantExit: exitOK,
 			want: []string{
-				"principal=operator-agent/driver approvals=3 verdict=agent_never_counted refusing_gates=feature_change/gate\n",
-				"principal=operator-agent/delegated approvals=2 verdict=agent_never_counted refusing_gates=feature_change/gate\n",
-				"impact: refused=0 principals=1 approvals=1 refused_approvals=0 agent_rows_now_refused=5\n",
+				"principal=operator-agent/driver approvals=3 verdict=agent_never_counted refusing_gates=feature_change/gate credential_refused=0 credential_unrecorded=0\n",
+				"principal=operator-agent/delegated approvals=2 verdict=agent_never_counted refusing_gates=feature_change/gate credential_refused=0 credential_unrecorded=0\n",
+				"impact: refused=0 principals=1 approvals=1 refused_approvals=0 agent_rows_now_refused=5 credential_refused_approvals=0 credential_unrecorded_approvals=1\n",
 			},
 		},
 		{
@@ -176,7 +176,20 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 				{ActorSubject: "legacy-bot", ActorKind: agent, Approvals: 2},
 			},
 			wantExit: exitOK,
-			want:     []string{"impact: refused=0 principals=0 approvals=0 refused_approvals=0 agent_rows_now_refused=2\n"},
+			want:     []string{"impact: refused=0 principals=0 approvals=0 refused_approvals=0 agent_rows_now_refused=2 credential_refused_approvals=0 credential_unrecorded_approvals=0\n"},
+		},
+		{
+			name:    "listed principal on a static credential is refused by the credential leg",
+			members: listed,
+			rows: []approverPrincipalRow{
+				{ActorSubject: "github:kuhlman-labs", ActorKind: user, AuthMethod: "static", Approvals: 2},
+				{ActorSubject: "github:kuhlman-labs", ActorKind: user, AuthMethod: "oauth", MembersCredential: "oauth", Approvals: 3},
+			},
+			wantExit: exitFailure,
+			want: []string{
+				"principal=github:kuhlman-labs approvals=5 verdict=refused refusing_gates=- credential_refused=2 credential_unrecorded=0\n",
+				"impact: refused=1 principals=1 approvals=5 refused_approvals=5 agent_rows_now_refused=0 credential_refused_approvals=2 credential_unrecorded_approvals=0\n",
+			},
 		},
 		{
 			name:     "plain member is qualified with --forge github",
@@ -184,7 +197,7 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 			extra:    []string{"--forge", "github"},
 			rows:     []approverPrincipalRow{{ActorSubject: "github:kuhlman-labs", ActorKind: user, Approvals: 4}},
 			wantExit: exitOK,
-			want:     []string{"principal=github:kuhlman-labs approvals=4 verdict=admitted refusing_gates=-\n"},
+			want:     []string{"principal=github:kuhlman-labs approvals=4 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=4\n"},
 		},
 		{
 			name:     "plain member qualified with --forge gitlab refuses a github subject",
@@ -192,7 +205,7 @@ func TestApproverMembers_FakeLoaderTable(t *testing.T) {
 			extra:    []string{"--forge", "gitlab"},
 			rows:     []approverPrincipalRow{{ActorSubject: "github:kuhlman-labs", ActorKind: user, Approvals: 4}},
 			wantExit: exitFailure,
-			want:     []string{"principal=github:kuhlman-labs approvals=4 verdict=refused refusing_gates=feature_change/gate\n"},
+			want:     []string{"principal=github:kuhlman-labs approvals=4 verdict=refused refusing_gates=feature_change/gate credential_refused=0 credential_unrecorded=0\n"},
 		},
 	}
 	for _, tc := range cases {
@@ -431,8 +444,10 @@ func TestApproverMembers_PostgresLoader(t *testing.T) {
 	runA, stageA := seedRun("acme/widgets")
 	runB, stageB := seedRun("other/repo")
 	appendEntry(runA, stageA, since.Add(-time.Second), "approval_submitted", "brett@local-mcp", audit.ActorUser, approve)
-	appendEntry(runA, stageA, since, "approval_submitted", "github:kuhlman-labs", audit.ActorUser, approve)
-	appendEntry(runA, stageA, since.Add(time.Minute), "approval_submitted", "github:kuhlman-labs", audit.ActorUser, approve)
+	approveOAuth := map[string]any{"decision": "approve", "auth_method": "oauth",
+		"predicate_snapshot": map[string]any{"members_credential": "oauth"}}
+	appendEntry(runA, stageA, since, "approval_submitted", "github:kuhlman-labs", audit.ActorUser, approveOAuth)
+	appendEntry(runA, stageA, since.Add(time.Minute), "approval_submitted", "github:kuhlman-labs", audit.ActorUser, approveOAuth)
 	appendEntry(runA, stageA, since.Add(time.Minute), "approval_submitted", "github:kuhlman-labs", audit.ActorUser, map[string]any{"decision": "reject"})
 	appendEntry(runA, stageA, since.Add(time.Minute), "approval_predicate_rejected", "github:mallory", audit.ActorUser, approve)
 	appendEntry(runA, stageA, since.Add(2*time.Minute), "approval_submitted", "operator-agent/delegated", audit.ActorAgent,
@@ -444,7 +459,7 @@ func TestApproverMembers_PostgresLoader(t *testing.T) {
 		t.Fatalf("load: %v", err)
 	}
 	want := []approverPrincipalRow{
-		{ActorSubject: "github:kuhlman-labs", ActorKind: "user", Approvals: 2},
+		{ActorSubject: "github:kuhlman-labs", ActorKind: "user", AuthMethod: "oauth", MembersCredential: "oauth", Approvals: 2},
 		{ActorSubject: "operator-agent/delegated", ActorKind: "agent", OnBehalfOf: "github:kuhlman-labs", Delegated: true, Approvals: 1},
 	}
 	if fmt.Sprint(rows) != fmt.Sprint(want) {
@@ -468,13 +483,34 @@ func TestApproverMembers_PostgresLoader(t *testing.T) {
 		t.Fatalf("exit = %d, want 0\nstdout:\n%s\nstderr:\n%s", got, out.String(), errs.String())
 	}
 	if !strings.Contains(out.String(), "principal=github:kuhlman-labs approvals=3 verdict=admitted") ||
-		!strings.Contains(out.String(), "impact: refused=0 principals=1 approvals=3 refused_approvals=0 agent_rows_now_refused=0") {
+		!strings.Contains(out.String(), "impact: refused=0 principals=1 approvals=3 refused_approvals=0 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=1") {
 		t.Errorf("end-to-end report:\n%s", out.String())
 	}
 	out.Reset()
 	if got := runApproverMembersWith([]string{"--spec", specPath, "--db", dbURL, "--since", "2026-10-08T16:56:00Z"},
 		&out, &errs, loadApproverPrincipals, fixedNow); got != exitFailure {
 		t.Errorf("all-repo exit = %d, want %d (brett@local-mcp refused)\n%s", got, exitFailure, out.String())
+	}
+
+	// The credential leg end to end (#4633): a listed principal's STATIC
+	// approval, read back through the real loader, refuses (exit 1).
+	runC, stageC := seedRun("acme/static")
+	appendEntry(runC, stageC, since.Add(time.Minute), "approval_submitted", "github:kuhlman-labs", audit.ActorUser,
+		map[string]any{"decision": "approve", "auth_method": "static",
+			"predicate_snapshot": map[string]any{"members_credential": "static"}})
+	staticRows, err := loadApproverPrincipals(ctx, dbURL, "acme/static", since)
+	if err != nil {
+		t.Fatalf("load static: %v", err)
+	}
+	wantStatic := []approverPrincipalRow{{ActorSubject: "github:kuhlman-labs", ActorKind: "user", AuthMethod: "static", MembersCredential: "static", Approvals: 1}}
+	if fmt.Sprint(staticRows) != fmt.Sprint(wantStatic) {
+		t.Errorf("static rows = %+v\nwant %+v", staticRows, wantStatic)
+	}
+	out.Reset()
+	if got := runApproverMembersWith([]string{"--spec", specPath, "--db", dbURL, "--since", "2026-10-08T16:56:00Z", "--repo", "acme/static"},
+		&out, &errs, loadApproverPrincipals, fixedNow); got != exitFailure ||
+		!strings.Contains(out.String(), "principal=github:kuhlman-labs approvals=1 verdict=refused refusing_gates=- credential_refused=1 credential_unrecorded=0") {
+		t.Errorf("static exit = %d, want %d with a credential refusal\n%s", got, exitFailure, out.String())
 	}
 }
 
@@ -537,7 +573,7 @@ workflows:
 		"note: enforced_at=merge gates (resolveReviewStageOnMerge) are members-checked when the PR merges",
 		"merge_settle_members_refused",
 		"note: each principal is evaluated against EVERY approval-row members gate above",
-		"principal=github:alice approvals=2 verdict=refused refusing_gates=feature_change/plan\n",
+		"principal=github:alice approvals=2 verdict=refused refusing_gates=feature_change/plan credential_refused=0 credential_unrecorded=0\n",
 	} {
 		if !strings.Contains(out.String(), w) {
 			t.Errorf("stdout missing %q:\n%s", w, out.String())
@@ -545,5 +581,134 @@ workflows:
 	}
 	if strings.Contains(out.String(), "not members-checked") {
 		t.Errorf("stdout still carries the pre-#4132 note:\n%s", out.String())
+	}
+}
+
+// TestApproverMembers_CredentialLeg pins the inventory's credential leg
+// (#4633), in step with the gate: a LISTED principal's credential-bound
+// approvals on a credential the gate refuses make it refused (exit 1); a
+// forge-verified kind admits; an unrecorded kind is reported, never refused;
+// an agent-kind captain row is never credential-evaluated; and a spec whose
+// members gates are all merge-settled reports zero credential impact (C4).
+// CF5 vehicle: with credentialRefused returning false, the static case reports
+// admitted and exits 0.
+func TestApproverMembers_CredentialLeg(t *testing.T) {
+	t.Setenv("FISHHAWKD_DATABASE_URL", "")
+	user := string(audit.ActorUser)
+	agent := string(audit.ActorAgent)
+	approvalRowSpec := approverMembersSpec([]string{"github:alice"})
+	mergeOnlySpec := `version: "1.0"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          human: true
+      - id: review
+        type: review
+        executor:
+          human: true
+        inputs:
+          - artifact: pull_request
+            from_stage: plan
+        gates:
+          - type: approval
+            approvals:
+              count: 1
+              members: ["github:alice"]
+`
+	for _, tc := range []struct {
+		name     string
+		spec     string
+		rows     []approverPrincipalRow
+		wantExit int
+		want     []string
+	}{
+		{
+			name:     "static credential refuses a listed principal",
+			spec:     approvalRowSpec,
+			rows:     []approverPrincipalRow{{ActorSubject: "github:alice", ActorKind: user, AuthMethod: "static", Approvals: 3}},
+			wantExit: exitFailure,
+			want: []string{
+				"principal=github:alice approvals=3 verdict=refused refusing_gates=- credential_refused=3 credential_unrecorded=0\n",
+				"impact: refused=1 principals=1 approvals=3 refused_approvals=3 agent_rows_now_refused=0 credential_refused_approvals=3 credential_unrecorded_approvals=0\n",
+			},
+		},
+		{
+			name:     "recorded members_credential wins over auth_method",
+			spec:     approvalRowSpec,
+			rows:     []approverPrincipalRow{{ActorSubject: "github:alice", ActorKind: user, AuthMethod: "", MembersCredential: "session", Approvals: 2}},
+			wantExit: exitOK,
+			want:     []string{"principal=github:alice approvals=2 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=0\n"},
+		},
+		{
+			name:     "unknown auth_method refuses",
+			spec:     approvalRowSpec,
+			rows:     []approverPrincipalRow{{ActorSubject: "github:alice", ActorKind: user, AuthMethod: "ldap", Approvals: 1}},
+			wantExit: exitFailure,
+			want:     []string{"principal=github:alice approvals=1 verdict=refused refusing_gates=- credential_refused=1 credential_unrecorded=0\n"},
+		},
+		{
+			name:     "device-flow credential admits",
+			spec:     approvalRowSpec,
+			rows:     []approverPrincipalRow{{ActorSubject: "github:alice", ActorKind: user, AuthMethod: "oauth", Approvals: 3}},
+			wantExit: exitOK,
+			want: []string{
+				"principal=github:alice approvals=3 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=0\n",
+				"impact: refused=0 principals=1 approvals=3 refused_approvals=0 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=0\n",
+			},
+		},
+		{
+			name:     "unrecorded credential is reported, never refused",
+			spec:     approvalRowSpec,
+			rows:     []approverPrincipalRow{{ActorSubject: "github:alice", ActorKind: user, Approvals: 4}},
+			wantExit: exitOK,
+			want: []string{
+				"principal=github:alice approvals=4 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=4\n",
+				"impact: refused=0 principals=1 approvals=4 refused_approvals=0 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=4\n",
+			},
+		},
+		{
+			name: "delegated human-kind static row is credential-bound",
+			spec: approvalRowSpec,
+			rows: []approverPrincipalRow{{ActorSubject: "operator-agent/delegated", ActorKind: agent, OnBehalfOf: "github:alice",
+				Delegated: true, AuthMethod: "static", Approvals: 2}},
+			wantExit: exitFailure,
+			want:     []string{"principal=github:alice approvals=2 verdict=refused refusing_gates=- credential_refused=2 credential_unrecorded=0\n"},
+		},
+		{
+			name: "agent-kind captain row is not credential-evaluated",
+			spec: approvalRowSpec,
+			rows: []approverPrincipalRow{{ActorSubject: "operator-agent/driver", ActorKind: agent, OnBehalfOf: "github:alice",
+				Delegated: true, AuthMethod: "static", Approvals: 2}},
+			wantExit: exitOK,
+			want:     []string{"principal=github:alice approvals=2 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=0\n"},
+		},
+		{
+			name:     "merge-only spec reports zero credential impact",
+			spec:     mergeOnlySpec,
+			rows:     []approverPrincipalRow{{ActorSubject: "github:alice", ActorKind: user, AuthMethod: "static", Approvals: 3}},
+			wantExit: exitOK,
+			want: []string{
+				"principal=github:alice approvals=3 verdict=admitted refusing_gates=- credential_refused=0 credential_unrecorded=0\n",
+				"impact: refused=0 principals=1 approvals=3 refused_approvals=0 agent_rows_now_refused=0 credential_refused_approvals=0 credential_unrecorded_approvals=0\n",
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			specPath := writeApproverMembersSpec(t, tc.spec)
+			loader := &recordingPrincipalLoader{rows: tc.rows}
+			var out, errs strings.Builder
+			got := runApproverMembersWith([]string{"--spec", specPath, "--db", "postgres://unused"}, &out, &errs, loader.load, fixedNow)
+			if got != tc.wantExit {
+				t.Fatalf("exit = %d, want %d\nstdout:\n%s\nstderr:\n%s", got, tc.wantExit, out.String(), errs.String())
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(out.String(), w) {
+					t.Errorf("stdout missing %q:\n%s", w, out.String())
+				}
+			}
+		})
 	}
 }
