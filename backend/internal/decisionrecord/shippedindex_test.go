@@ -53,12 +53,14 @@ func shippedIndex(t *testing.T) (*Index, []byte) {
 // relation" records. A record not listed here is not pinned.
 var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedBy []string }{
 	"ADR-040": {nil, nil, nil, []string{"ADR-097", "ADR-101"}},
+	"ADR-082": {nil, nil, nil, []string{"ADR-125"}},
 	"ADR-087": {nil, []string{"ADR-094"}, nil, []string{"ADR-100"}},
 	"ADR-089": {nil, nil, nil, []string{"ADR-097", "ADR-101"}},
 	"ADR-091": {nil, nil, nil, []string{"ADR-095"}},
 	"ADR-094": {[]string{"ADR-087"}, nil, nil, []string{"ADR-100", "ADR-115"}},
 	"ADR-095": {nil, nil, []string{"ADR-091"}, nil},
 	"ADR-097": {nil, nil, []string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
+	"ADR-098": {[]string{"ADR-096"}, nil, nil, []string{"ADR-124"}},
 	"ADR-100": {nil, nil, []string{"ADR-087", "ADR-094"}, nil},
 	"ADR-101": {nil, nil, []string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}, []string{"ADR-121", "ADR-122"}},
 	// Amendments recorded under the upkeep rule since #4471.
@@ -90,6 +92,8 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-121": {nil, nil, []string{"ADR-101", "ADR-112", "ADR-118"}, nil},
 	"ADR-122": {nil, nil, []string{"ADR-085", "ADR-101", "ADR-118"}, nil},
 	"ADR-123": {nil, nil, []string{"ADR-113"}, nil},
+	"ADR-124": {nil, nil, []string{"ADR-098"}, nil},
+	"ADR-125": {nil, nil, []string{"ADR-082"}, nil},
 	"ADR-042": {nil, nil, nil, []string{"ADR-119"}},
 	"ADR-119": {nil, nil, []string{"ADR-042"}, nil},
 	"ADR-120": {nil, nil, []string{"ADR-084", "ADR-113"}, nil},
