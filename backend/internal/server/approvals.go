@@ -1636,11 +1636,11 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // (details.predicate:"members") with an approval_predicate_rejected audit
 // row and no approval row.
 //
-// The members leg carries a CREDENTIAL leg (#4633; decision record pending
-// as ADR-123, #4750): when the principal IS the presenting credential's own
+// The members leg carries a CREDENTIAL leg (#4633; ADR-123, #4750, RATIFIED
+// 2026-10-27): when the principal IS the presenting credential's own
 // subject (a direct submission, or a delegated human-kind one), a listed
 // principal whose credential is not a forge-verified kind
-// (identity.ForgeVerifiedCredential over approvalCredentialKind: a static
+// (identity.ForgeVerifiedCredential over identity.CredentialKind: a static
 // or unrecorded api token, an unknown auth_method, no credential marker) is
 // refused 403 approver_predicate_unmet with details.reason
 // credential_not_forge_verified, the same rejection audit and no row. It

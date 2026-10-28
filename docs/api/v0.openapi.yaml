@@ -26053,7 +26053,15 @@ paths:
               `channel: delegated`) and NEVER counts toward the quorum.
               Every `approval_submitted` audit row on such a gate carries
               a `predicate_snapshot` (the evaluation inputs + outcome);
-              gates with no `approvals` block omit it.
+              gates with no `approvals` block omit it. On a gate whose
+              `approvals.members` credential leg evaluated the submission
+              (#4633, ADR-123), the snapshot also carries
+              `members_credential`: the credential kind the members leg
+              evaluated (`session`, `oauth`, `oauth_as`, `static`,
+              `unrecorded`, `mcp_run` or `unknown`). It is a separate
+              field from the row's `auth_method` (ADR-055), which records
+              an api token's minting path and is absent for a session or
+              an authorization-server token.
             - **Duplicate submission** — the same authenticated subject
               already submitted a decision for this stage. The prior
               decision stands, the stage state is unchanged, NO gates
@@ -26186,7 +26194,7 @@ paths:
               list), `members_principal`, `subject`, `escalated` and
               `result`. No approval row is recorded; an
               `approval_predicate_rejected` audit entry is.
-              #4633 (decision record pending as ADR-123, #4750): the SAME
+              #4633 (ADR-123, #4750, RATIFIED 2026-10-27): the SAME
               code also fires when the principal IS listed and is the
               presenting credential's own subject (a direct or a delegated
               human-kind submission), but the credential that authenticated

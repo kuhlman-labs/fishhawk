@@ -51,24 +51,16 @@ func (r approverPrincipalRow) principal() string {
 
 // credentialKind is the identity.Credential* kind the group's rows were
 // approved with (#4633): the recorded members_credential when the members
-// leg stamped one, otherwise derived from the payload's auth_method. The
-// audit row records no auth_method for a browser session, an
+// leg stamped one, otherwise derived from the payload's auth_method through
+// identity.AuthMethodCredentialKind, the mapping the gate's own classifier
+// uses. The audit row records no auth_method for a browser session, an
 // authorization-server token or a pre-#1708 row, so an empty auth_method is
 // unrecorded — the kind cannot be decided from history.
 func (r approverPrincipalRow) credentialKind() string {
 	if r.MembersCredential != "" {
 		return r.MembersCredential
 	}
-	switch r.AuthMethod {
-	case identity.CredentialDeviceFlow:
-		return identity.CredentialDeviceFlow
-	case identity.CredentialStatic:
-		return identity.CredentialStatic
-	case "":
-		return identity.CredentialUnrecorded
-	default:
-		return identity.CredentialUnknown
-	}
+	return identity.AuthMethodCredentialKind(r.AuthMethod)
 }
 
 // credentialBound reports whether the gate's credential leg evaluates the

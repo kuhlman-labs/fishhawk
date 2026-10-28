@@ -38,7 +38,7 @@ An empty list or empty subject returns `false`; "empty list = no restriction" is
 
 ### Credential kinds: `ForgeVerifiedCredential` (#4633)
 
-`credential.go` is the ONE forge-neutral vocabulary for how the credential that authenticated a request was minted, plus its allow-list. The server's approval gate (`approvalCredentialKind` in `checkApprovalPredicates`) and `fishhawkd approver-members` both classify into these constants and consult `ForgeVerifiedCredential`, so the gate and the inventory cannot disagree. The rule's decision record is the proposed ADR-123 (#4750), pending ratification.
+`credential.go` is the ONE forge-neutral vocabulary for how the credential that authenticated a request was minted, plus its allow-list. Kinds are derived ONCE, by `CredentialKind(sessionID, tokenID, oauthAudience, subject, authMethod)`, which takes the auth middleware's trusted markers as arguments (order: `session`; `oauth_as`, checked before `auth_method`; no token marker → `unknown`; `mcp_run`; then `AuthMethodCredentialKind`: `oauth` / `static` / empty → `unrecorded` / other → `unknown`). The server's approval gate (`approvalCredentialKind`, a thin adapter over `CredentialKind`, in `checkApprovalPredicates`) and `fishhawkd approver-members` (`AuthMethodCredentialKind` for a historical row's `auth_method`) both classify through it and consult `ForgeVerifiedCredential`, so the gate and the inventory cannot disagree. The rule's decision record is ADR-123 (#4750), RATIFIED 2026-10-27.
 
 | Kind | Constant | Source | Forge-verified |
 |---|---|---|---|

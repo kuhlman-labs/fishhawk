@@ -851,12 +851,13 @@ gate runs (an `approval_submitted` principal can never reach a merge-settled gat
 (unqualified) member qualified by `--forge` (default `github`) — so the inventory is an upper bound
 when gates carry different lists, since it does not join a row to the gate it was recorded at.
 
-**Credential leg (#4633; decision record pending as ADR-123, #4750).** The gate also refuses a
+**Credential leg (#4633; ADR-123, #4750, RATIFIED 2026-10-27).** The gate also refuses a
 LISTED principal whose presenting credential is not forge-verified (`identity.ForgeVerifiedCredential`:
 `session`, `oauth`, `oauth_as`; `backend/internal/server/README.md` § "`approvals.members`
 enforcement"), so the aggregate also groups by the payload's `auth_method` and the
 `predicate_snapshot.members_credential`. A group's credential kind (`credentialKind`) is the
-recorded `members_credential` when present, else derived from `auth_method` (`oauth` → `oauth`,
+recorded `members_credential` when present, else derived from `auth_method` by
+`identity.AuthMethodCredentialKind`, the mapping the gate shares (`oauth` → `oauth`,
 `static` → `static`, empty → `unrecorded`, other → `unknown`). Only **credential-bound** rows are
 evaluated (`credentialBound`: the principal is the row's own actor subject, or the actor is the
 synthetic `operator-agent/delegated` subject of a delegated human-kind approval); an agent-kind
