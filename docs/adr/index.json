@@ -1091,6 +1091,9 @@
       "amends": [
         "ADR-050"
       ],
+      "amended_by": [
+        "ADR-126"
+      ],
       "applies_to": []
     },
     {
@@ -1264,7 +1267,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-118"
+        "ADR-118",
+        "ADR-126"
       ],
       "applies_to": []
     },
@@ -1384,6 +1388,19 @@
       "superseded_by": [],
       "amends": [
         "ADR-082"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-126",
+      "title": "Security findings are confidential records from intake to fix, with human-only disposition",
+      "path": "docs/adr/126-security-finding-record.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-103",
+        "ADR-117"
       ],
       "applies_to": []
     }

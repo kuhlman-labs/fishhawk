@@ -354,6 +354,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-123: `amends: [ADR-113]` ("Amendment to ADR-113 (#4628), **v2**"); ADR-113 gains `amended_by: [ADR-123]` and keeps `status: accepted`.
 - ADR-124: `amends: [ADR-098]` ("Amendment to ADR-098 (which amends ADR-096 D3), **v2.1**"); ADR-098 gains `amended_by: [ADR-124]` and keeps `status: accepted`.
 - ADR-125: `amends: [ADR-082]` ("It amends ADR-082, extending the historian's read path with one written record type"); ADR-082 gains `amended_by: [ADR-125]` and keeps `status: accepted`.
+- ADR-126: `amends: [ADR-103, ADR-117]` ("It amends ADR-103 D6 (its confidential filing generalizes to every source and creates this record) and ADR-117 A1.5 (`advisory_id` is re-pointed)"); each gains `amended_by: [ADR-126]` and keeps `status: accepted`.
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -544,6 +545,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-123](123-forge-verified-stage-approvals.md) | Amend ADR-113: stage approval gates admit only forge-verified credentials, on every channel | `accepted` | [#4750](https://github.com/kuhlman-labs/fishhawk/issues/4750) |
 | [ADR-124](124-verdict-transfer-surface-declaration.md) | Amend ADR-098: the verdict-transfer surface is a repository declaration; absent refuses | `accepted` | [#4754](https://github.com/kuhlman-labs/fishhawk/issues/4754) |
 | [ADR-125](125-captains-log.md) | The captain's log: evidence-bound lessons, confirmed by a human, read back to the driver | `accepted` | [#4756](https://github.com/kuhlman-labs/fishhawk/issues/4756) |
+| [ADR-126](126-security-finding-record.md) | Security findings are confidential records from intake to fix, with human-only disposition | `accepted` | [#4769](https://github.com/kuhlman-labs/fishhawk/issues/4769) |
 
 ## Status unknown — needs captain confirmation
 
