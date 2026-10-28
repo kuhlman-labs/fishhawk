@@ -657,7 +657,26 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			// The round source (#4077): a trace round's diff is THIS stage's
 			// uploaded bundle, so a restart-orphaned round is re-dispatched from
 			// the stored bundle. Only the review call carries it.
-			reviewCtx := withReviewRoundSource(r.Context(), reviewRoundSource{Origin: reviewRoundOriginTrace})
+			//
+			// The round's reviewed head (ADR-117 A1.7) is the AUTHORITATIVE
+			// verify_run's head_sha — the same event the identity above came
+			// from — never the #797 dedup head_sha (the FIRST verify head).
+			// Fail-open like the identity: ErrNoVerifyTreeSHA stays silent, any
+			// other error WARN-logs, and both degrade to "", which records the
+			// round's reviewed_head as head_unknown rather than blocking it.
+			verifyHead, vherr := bundle.ExtractVerifyHead(bundleBytes)
+			if vherr != nil {
+				if !errors.Is(vherr, bundle.ErrNoVerifyTreeSHA) {
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+						"trace upload: extract verify head failed — proceeding with an unknown reviewed head",
+						slog.String("run_id", runID.String()),
+						slog.String("stage_id", stageID.String()),
+						slog.String("error", vherr.Error()),
+					)
+				}
+				verifyHead = ""
+			}
+			reviewCtx := withReviewRoundSource(r.Context(), reviewRoundSource{Origin: reviewRoundOriginTrace, HeadSHA: verifyHead})
 			// The returned reason is the gating failure (#3913): a reject
 			// verdict, a document-injection failure, or an escalation-attached
 			// persona that could not run — each under the
@@ -3771,7 +3790,18 @@ func (s *Server) runConsolidatedReviewRound(ctx context.Context, runRow *run.Run
 	//
 	// The round source (#4077) records the compare base so a
 	// restart-orphaned round is re-dispatched as ComparePatch(base, head).
-	srcCtx := withReviewRoundSource(ctx, reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base})
+	//
+	// The reviewed head (ADR-117 A1.7) is cmp.HeadSHA, unless the compare named
+	// no head or capped its commit listing (then the last LISTED commit is not
+	// the tip): the round then records head_unknown with that reason.
+	src := reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base}
+	switch {
+	case cmp.HeadSHA == "":
+		src.HeadUnresolvedReason = reviewedHeadReasonCompareNoCommits
+	case cmp.CommitsTruncated:
+		src.HeadUnresolvedReason = reviewedHeadReasonCompareCommitsTruncated
+	}
+	srcCtx := withReviewRoundSource(ctx, src)
 	s.runImplementReviews(srcCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
 	return "", cmp.HeadSHA
 }
@@ -4469,6 +4499,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			)
 		}
 	}
+	// The round's reviewed-head record (ADR-117 A1.7), built from the diff the
+	// round ACTUALLY reviews and the round source the dispatcher set. It rides
+	// the implement_review_started entry only; the prompt is unchanged.
+	roundSrc, roundSrcOK := reviewRoundSourceFrom(ctx)
+	reviewedHead := buildReviewedHead(roundSrc, roundSrcOK, headSHA, treeSHA, changeID, reviewedDiff, trig.DeltaReReview)
 
 	// Diff-truncation notice + operator-facing audit (#2875). The reviewer sees a
 	// PREFIX of the change when the runner cut the patch at 256 KiB or the forge
@@ -5094,7 +5129,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	//
 	// configured_agents counts every persona invocation too (#3753): each one
 	// produces exactly one terminal entry, so the round settles at this count.
-	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), headSHA, treeSHA, changeID)
+	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), headSHA, treeSHA, changeID, reviewedHead)
 	reviewDispatchMu.Unlock()
 
 	// invocations were resolved above (before the prompt build) so the grounding
@@ -8090,6 +8125,42 @@ func truncatedPatchOmittedFiles(diff policy.Diff) []string {
 	if !diff.PatchTruncated || len(diff.ChangedFiles) == 0 {
 		return nil
 	}
+	// Rendered FROM the plain-path classifier (ADR-117 A1.7) so the decorated
+	// audit/prompt list and the reviewed_head path sets can never disagree. A
+	// path's class depends only on the path, so membership lookup in
+	// ChangedFiles order reproduces the pre-A1.7 output byte for byte.
+	_, partial, omitted := classifyTruncatedPatchFiles(diff)
+	partialSet := make(map[string]bool, len(partial))
+	for _, p := range partial {
+		partialSet[p] = true
+	}
+	omittedSet := make(map[string]bool, len(omitted))
+	for _, p := range omitted {
+		omittedSet[p] = true
+	}
+	var out []string
+	for _, f := range diff.ChangedFiles {
+		switch {
+		case omittedSet[f.Path]:
+			out = append(out, f.Path+" (no hunks shown)")
+		case partialSet[f.Path]:
+			out = append(out, f.Path+" (may be cut — its tail may be missing)")
+		default:
+			// Header present and not the last one — fully visible; not reported.
+		}
+	}
+	return out
+}
+
+// classifyTruncatedPatchFiles is truncatedPatchOmittedFiles' classification as
+// PLAIN repo-relative paths (ADR-117 A1.7, E94.3 / #4694), in ChangedFiles
+// order: full has a `diff --git` header that is not the last surviving one,
+// partial IS the last surviving header (its tail may be cut), omitted has no
+// header at all. It applies the SAME gitDiffHeaderIndex + last-surviving-header
+// rule, fail-closed and over-reporting exactly as documented above; the
+// reviewed_head record (buildReviewedHead) reads these sets and the decorated
+// truncation list is rendered from them.
+func classifyTruncatedPatchFiles(diff policy.Diff) (full, partial, omitted []string) {
 	patch := diff.Patch
 	idxByFile := make([]int, len(diff.ChangedFiles))
 	lastIdx := -1
@@ -8100,18 +8171,17 @@ func truncatedPatchOmittedFiles(diff policy.Diff) []string {
 			lastIdx = idx
 		}
 	}
-	var out []string
 	for i, f := range diff.ChangedFiles {
 		switch {
 		case idxByFile[i] < 0:
-			out = append(out, f.Path+" (no hunks shown)")
+			omitted = append(omitted, f.Path)
 		case idxByFile[i] == lastIdx:
-			out = append(out, f.Path+" (may be cut — its tail may be missing)")
+			partial = append(partial, f.Path)
 		default:
-			// Header present and not the last one — fully visible; not reported.
+			full = append(full, f.Path)
 		}
 	}
-	return out
+	return full, partial, omitted
 }
 
 // gitDiffHeaderIndex returns the byte offset of the `diff --git ` header line

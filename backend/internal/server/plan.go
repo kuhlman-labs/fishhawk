@@ -1792,7 +1792,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// configured_agents counts every persona invocation too (#3753): each one
 	// produces exactly one terminal entry (verdict, failed or skipped), so the
 	// round settles at this count.
-	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), "", "", "")
+	s.emitReviewStarted(ctx, runID, stageID, "plan_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), "", "", "", nil)
 
 	// invocations were resolved above (before the prompt build) so the grounding
 	// decision could key on the loop's capability set.
@@ -2062,7 +2062,11 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 // than passed: the implement dispatchers set the source, the boot re-dispatch
 // sets the re-dispatch lineage, the re-run verb sets rerun_of, and an absent
 // value leaves its keys omitted.
-func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, personas []string, headSHA, treeSHA, changeID string) (seq int64, ok bool) {
+//
+// reviewedHead is the implement round's ADR-117 A1.7 reviewed-head record
+// (buildReviewedHead); the plan caller passes nil, so plan_review_started stays
+// byte-identical.
+func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID, category string, authority planreview.AuthorityMode, configuredAgents int, personas []string, headSHA, treeSHA, changeID string, reviewedHead *planreview.ReviewedHead) (seq int64, ok bool) {
 	if s.cfg.AuditRepo == nil {
 		return 0, false
 	}
@@ -2085,6 +2089,9 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 		// value the mismatch comparison uses.
 		ChangeID: changeID,
 	}
+	// The reviewed-head record (ADR-117 A1.7): nil on the plan path, so its
+	// key is omitted there.
+	started.ReviewedHead = reviewedHead
 	// The round source (#4077) is an IMPLEMENT-round fact: only
 	// implement_review_started records it, so a plan round stays byte-identical
 	// even if a caller's context happened to carry one.
