@@ -2,10 +2,12 @@ package server
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -22,13 +24,23 @@ import (
 //   - fanInVerifyGateRun turns the head's recorded `passed` row into the
 //     GateVerifyRun runImplementReviewsForTree injects on a consolidated round.
 //
+//   - FanInVerifySettled (#4785) is the orchestrator's read-only
+//     FanInVerifyGate: in a workflow that orders acceptance BEFORE review
+//     (feature_change), Advance holds the parent's never-dispatched acceptance
+//     stage `pending` while it answers false, and fires
+//     DispatchConsolidatedReview (whose hold below starts the pass).
+//
 // RELEASE needs no code here. The pass re-opened the parent implement stage and
 // re-parked its review stage; the merge_candidate_verified report arm
 // (succeedMergeCandidateVerifiedStage) settles the implement stage to the
 // trigger's recorded PriorState and calls Orchestrator.Advance explicitly
 // (approval condition C1 on #4018), which re-walks the review stage and
 // re-enters DispatchConsolidatedReview; the #1063 existing-children guard keeps
-// the re-opened parent implement from re-minting children.
+// the re-opened parent implement from re-minting children. With acceptance
+// ahead of review (#4785) the pass re-parks no review (it is still pending) and
+// that same Advance reaches the pending acceptance stage instead: it finds the
+// head settled through FanInVerifySettled, dispatches acceptance and re-fires
+// DispatchConsolidatedReview, whose hold now releases the consolidated round.
 
 // holdConsolidatedReviewForFanInVerify reports whether the consolidated review
 // for headSHA must be held (ADR-090 D5). runRow is a decomposed parent (the
@@ -107,6 +119,68 @@ func (s *Server) holdConsolidatedReviewForFanInVerify(ctx context.Context, runRo
 			"consolidated review: unknown merge-candidate verify state — holding the review",
 			append(logAttrs, slog.String("state", state.State))...)
 		return true
+	}
+}
+
+var _ orchestrator.FanInVerifyGate = (*Server)(nil)
+
+// FanInVerifySettled reports whether a decomposed parent's consolidated head
+// has a SETTLED merge-candidate verify (#4785) — the orchestrator's read-only
+// FanInVerifyGate, consulted before it dispatches the parent's acceptance stage
+// in a workflow that orders acceptance ahead of review. It starts nothing:
+// DispatchConsolidatedReview's D5 hold owns the start.
+//
+// The head is resolved with the SAME forgeCompareFor + ComparePatch(base,
+// branch) runConsolidatedReviewRound uses, so this read and the D5 hold bind to
+// the identical head. Answers:
+//
+//   - a child run, a run with no decomposed children, or a forge that is not
+//     wired: settled (true) — DispatchConsolidatedReview skips those too, so
+//     holding would wedge acceptance with nothing to release it;
+//   - passed, not_required and FAILED: settled. FAILED counts as settled ON
+//     PURPOSE: holding acceptance on a failed head would deadlock, because the
+//     operator fix-up's #3116 admission still refuses while acceptance is
+//     pending. The consolidated review's own D5 hold and the ADR-090 merge gate
+//     keep the failed verdict blocking;
+//   - unverified (which covers a not_executed verdict) and in_flight, or any
+//     unknown state: not settled (false);
+//   - a run, children, compare or state read error: the error (the caller
+//     keeps acceptance pending and the next Advance retries).
+func (s *Server) FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (bool, error) {
+	if s.cfg.RunRepo == nil {
+		return true, nil
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		return false, fmt.Errorf("fan-in verify: get run: %w", err)
+	}
+	if runRow.DecomposedFrom != nil {
+		return true, nil
+	}
+	children, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: &runID, Limit: 1})
+	if err != nil {
+		return false, fmt.Errorf("fan-in verify: list children: %w", err)
+	}
+	if len(children) == 0 {
+		return true, nil
+	}
+	comparer, scope, repo, reason := s.forgeCompareFor(runRow)
+	if reason != "" {
+		return true, nil
+	}
+	cmp, err := comparer.ComparePatch(ctx, scope, repo, base, branch)
+	if err != nil {
+		return false, fmt.Errorf("fan-in verify: compare patch: %w", err)
+	}
+	state, err := s.mergeCandidateVerifyState(ctx, runRow, cmp.HeadSHA)
+	if err != nil {
+		return false, fmt.Errorf("fan-in verify: merge-candidate verify state: %w", err)
+	}
+	switch state.State {
+	case mergeCandidateStateNotRequired, mergeCandidateStatePassed, mergeCandidateStateFailed:
+		return true, nil
+	default:
+		return false, nil
 	}
 }
 
