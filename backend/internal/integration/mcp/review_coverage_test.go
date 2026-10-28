@@ -17,6 +17,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
@@ -142,6 +143,10 @@ func newRCHarness(t *testing.T, ctx context.Context, prURL, headSHA string) *rcH
 			HTTP:    &http.Client{Timeout: 10 * time.Second},
 			AppJWT:  func() (string, error) { return "ghs_jwt", nil },
 		},
+		// The first-round re-run resolves its compare base from the
+		// repository's default branch (#4660); this forge fake serves only
+		// the compare, so a fixed source stands in for the forge read.
+		DefaultBranch: defaultbranch.Static("main"),
 	})
 	httpSrv := httptest.NewServer(srv.Handler())
 	t.Cleanup(httpSrv.Close)
