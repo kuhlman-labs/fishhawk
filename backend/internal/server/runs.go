@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegation"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/escalation"
@@ -150,6 +151,16 @@ type runResponse struct {
 	// is exactly the asymmetry the spawn-side helper relies on to insist on
 	// a single-run read. Omitted on every github run.
 	ForgeBaseURL string `json:"forge_base_url,omitempty"`
+	// DefaultBranch is the run's repository base branch resolved from the
+	// forge default_branch through the shared defaultbranch resolver
+	// (#4660), on GET /v0/runs/{id} ONLY. DefaultBranchUnresolvedReason is
+	// the named defaultbranch.Reason when that read failed. Exactly one of
+	// the two is set on the single-run read, and a failed read never fails
+	// the GET. The list endpoint deliberately sets neither: a list read over
+	// N rows would pay up to N forge reads, each capped by the resolver's
+	// lookup timeout.
+	DefaultBranch                 string `json:"default_branch,omitempty"`
+	DefaultBranchUnresolvedReason string `json:"default_branch_unresolved_reason,omitempty"`
 	// Capabilities reports what THIS DEPLOYMENT can serve for the run, so a
 	// consumer never recommends a verb the backend would refuse (#3628). Like
 	// forge_base_url it is populated on the SINGLE-run read ONLY (handleGetRun);
@@ -2282,6 +2293,20 @@ func (s *Server) handleGetRun(w http.ResponseWriter, r *http.Request) {
 	// and falls to the deployment default rather than failing the read.
 	if resp.Forge == webhook.ForgeGitLab {
 		resp.ForgeBaseURL = s.resolveRunForgeBaseURL(r.Context(), got)
+	}
+	// default_branch / default_branch_unresolved_reason (#4660) on the
+	// single-run read ONLY: exactly one is set. A failed read reports the
+	// named reason and never fails the GET. The list endpoint sets neither —
+	// over N rows it would pay up to N forge reads, each capped by the
+	// resolver's lookup timeout.
+	if branch, berr := s.resolveRunDefaultBranch(r.Context(), got); berr != nil {
+		reason, ok := defaultbranch.ReasonOf(berr)
+		if !ok {
+			reason = defaultbranch.ReasonLookupFailed
+		}
+		resp.DefaultBranchUnresolvedReason = string(reason)
+	} else {
+		resp.DefaultBranch = branch
 	}
 	// capabilities (#3628) on the single-run read ONLY, for the same reason
 	// forge_base_url is: the list endpoint pays no per-row read. The slice is
