@@ -566,11 +566,21 @@ type CommitAndPushArgs struct {
 	// refs/remotes/<remote>/<branch> to the pushed HEAD after a
 	// successful push, so subsequent same-clone reads (decomposition
 	// fan-out routing + policy base ref) observe the branch as present.
-	// A URL push (git push <url> HEAD:<branch>) never creates or updates
-	// that tracking ref on its own, so without this the next child in a
-	// local fan-out mis-routes to the first-child `checkout -b` path
-	// (#770). The remote branch tip equals the pushed HEAD, so the ref is
-	// set deterministically with `git update-ref` (no fetch, no auth).
+	// A URL push (git push <url> HEAD:<branch>) does not create or update
+	// that tracking ref, so without this the next child in a local fan-out
+	// mis-routes to the first-child `checkout -b` path (#770). The remote
+	// branch tip equals the pushed HEAD, so the ref is set deterministically
+	// with `git update-ref` (no fetch, no auth).
+	//
+	// "A URL push leaves no tracking ref" is the contract for UpdateTrackingRef
+	// false, and it holds on every git because the push argv carries
+	// urlPushNoTrackingArgs: git >= 2.56 would otherwise write
+	// refs/remotes/<r>/<b> itself whenever exactly one configured remote has
+	// the push URL, while git <= 2.55 never does (#4767). With the guard, this
+	// field's explicit update-ref is the ONLY writer of the tracking ref on
+	// every git. The guard depends on git's push-URL uniqueness rule and
+	// reserves the remote name urlPushNoTrackingRemote; see
+	// runner/README.md "URL-push tracking-ref guard".
 	UpdateTrackingRef bool
 
 	// ScopeFiles is the approved plan's declared paths (#581). When
@@ -1044,11 +1054,12 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		auth.refreshErr = auth.refresh(ctx, args)
 	}
 
-	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
+	pushArgs := append(urlPushNoTrackingArgs(args.RemoteURL), "push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch))
 	if args.ForceWithLease {
 		// A *bare* --force-with-lease compares the push against the local
 		// remote-tracking ref, but git cannot associate that ref with a URL
-		// push (we push to RemoteURL, not the remote name), so a bare lease
+		// push (we push to RemoteURL, not the remote name; on git >= 2.56 the
+		// urlPushNoTrackingArgs guard keeps that true, #4767), so a bare lease
 		// on a shared-branch URL push always rejects with `(stale info)`
 		// regardless of the ref's value (#767). So we always bind the lease to
 		// an EXPLICIT expected-value (--force-with-lease=<branch>:<sha>), which
@@ -1098,10 +1109,11 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 
 	// Materialize the local remote-tracking ref to the just-pushed HEAD
-	// (#770). A URL push doesn't update refs/remotes/<remote>/<branch>, so
-	// without this the next decomposed child reading that ref sees the
-	// shared branch as absent and mis-routes. The remote branch tip equals
-	// headSHA because we just pushed local HEAD to it, so this is exact
+	// (#770). The push above carries urlPushNoTrackingArgs, so it leaves
+	// refs/remotes/<remote>/<branch> alone (git >= 2.56 would otherwise write
+	// it, #4767), and without this the next decomposed child reading that ref
+	// sees the shared branch as absent and mis-routes. The remote branch tip
+	// equals headSHA because we just pushed local HEAD to it, so this is exact
 	// with no fetch and no remote auth.
 	if args.UpdateTrackingRef {
 		trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, args.Branch)
@@ -2639,7 +2651,7 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 	// have written, since `.git/hooks` is outside the working tree its contract
 	// confines it to. HardeningArgs neutralizes that hook (and every other
 	// command-executing config key) for this invocation.
-	pushArgs := append(HardeningArgs(), "push", args.RemoteURL, args.HeadSHA+":refs/heads/"+args.Branch)
+	pushArgs := append(append(HardeningArgs(), urlPushNoTrackingArgs(args.RemoteURL)...), "push", args.RemoteURL, args.HeadSHA+":refs/heads/"+args.Branch)
 	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push committed branch %s: %w", args.Branch, err)
 	}

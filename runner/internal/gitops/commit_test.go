@@ -1921,6 +1921,20 @@ func mustGit(t *testing.T, dir string, args ...string) {
 	}
 }
 
+// gitSubcommand returns the git subcommand of an argv, skipping the leading
+// `-c <key=value>` pairs a command-scope config prefix puts ahead of it (the
+// URL-push guard, #4767). Empty when argv holds no subcommand.
+func gitSubcommand(args []string) string {
+	for i := 0; i < len(args); i++ {
+		if args[i] == "-c" {
+			i++
+			continue
+		}
+		return args[i]
+	}
+	return ""
+}
+
 // TestCommitAndPush_VerifyCommit_AbortsBeforePush is the #728 gate seam:
 // the VerifyCommit hook runs AFTER the scope-only commit exists but
 // BEFORE the push, receives the committed HEAD SHA and the scope drift,
@@ -2181,8 +2195,9 @@ func TestCommitAndPush_VerifyCommit_PassThroughPushes(t *testing.T) {
 }
 
 // TestCommitAndPush_UpdateTrackingRef_MaterializesRemoteRef pins #770: a
-// URL push (git push <url> HEAD:<branch>) never updates the local
-// remote-tracking ref refs/remotes/origin/<branch>, so the decomposition
+// URL push (git push <url> HEAD:<branch>) does not update the local
+// remote-tracking ref refs/remotes/origin/<branch> (on git >= 2.56 because the
+// push carries urlPushNoTrackingArgs, #4767; older git never does), so the decomposition
 // fan-out's remoteBranchExists read sees the shared branch as absent and
 // mis-routes the next child. With UpdateTrackingRef:true the ref is
 // materialized to the pushed HEAD; with it false the ref stays absent
@@ -2379,14 +2394,16 @@ func TestCommitAndPush_FreshFetchBase_ForceWithLease_OverwritesStaleSelfRef(t *t
 
 	// Simulate a partial prior ship: a diverged commit lands on the run branch
 	// on the bare remote via a URL push, which does NOT create a local tracking
-	// ref (so the subsequent FreshFetchBase re-run has none).
+	// ref (so the subsequent FreshFetchBase re-run has none). The push carries
+	// the runner's URL-push guard, as a runner push does: a raw URL push writes
+	// the tracking ref on git >= 2.56 (#4767).
 	if err := os.WriteFile(filepath.Join(repo, "stale.txt"), []byte("stale partial ship\n"), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	mustGit(t, repo, "add", "-A")
 	mustGit(t, repo, "commit", "-m", "stale partial ship")
 	staleSHA := mustGitOut(t, repo, "rev-parse", "HEAD")
-	mustGit(t, repo, "push", bare, "HEAD:"+branch)
+	mustGit(t, repo, append(urlPushNoTrackingArgs(bare), "push", bare, "HEAD:"+branch)...)
 
 	// Confirm no local tracking ref for the run branch exists (the FreshFetchBase
 	// case this test pins).
@@ -2470,7 +2487,7 @@ func TestCommitAndPush_FreshFetchBase_ForceWithLease_AbsentRefPlainPush(t *testi
 	var pushArgs []string
 	p := &Pusher{
 		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
-			if len(args) > 0 && args[0] == "push" {
+			if gitSubcommand(args) == "push" {
 				pushArgs = append([]string(nil), args...)
 			}
 			return exec.CommandContext(ctx, name, args...)
@@ -2552,7 +2569,17 @@ func TestCommitAndPush_FreshFetchBase_ForceWithLease_MovedRefFailsLease(t *testi
 	mustGit(t, repo, "add", "-A")
 	mustGit(t, repo, "commit", "-m", "prior ship")
 	realRemoteHead := mustGitOut(t, repo, "rev-parse", "HEAD")
-	mustGit(t, repo, "push", bare, "HEAD:"+branch)
+	mustGit(t, repo, append(urlPushNoTrackingArgs(bare), "push", bare, "HEAD:"+branch)...)
+
+	// Precondition: no tracking ref for the run branch, or the lease would bind
+	// to it instead of routing through observeRemoteHead and the test would no
+	// longer exercise the moved-ref path (a raw URL push writes one on git >=
+	// 2.56, #4767).
+	trackCmd := exec.Command("git", "rev-parse", "--verify", "--quiet", "refs/remotes/origin/"+branch)
+	trackCmd.Dir = repo
+	if err := trackCmd.Run(); err == nil {
+		t.Fatalf("precondition: expected NO tracking ref for %s", branch)
+	}
 
 	// Return to the authoritative base and make the agent edit.
 	mustGit(t, repo, "reset", "--hard", authoritativeTip)
@@ -4090,7 +4117,7 @@ func TestCommitAndPush_PushEnvCarriesAuthConfig(t *testing.T) {
 		Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
 			c := exec.CommandContext(ctx, name, args...)
 			recorded = append(recorded, append([]string{name}, args...))
-			if len(args) > 0 && args[0] == "push" {
+			if gitSubcommand(args) == "push" {
 				pushCmd = c
 			}
 			return c
