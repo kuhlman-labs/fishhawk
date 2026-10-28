@@ -665,6 +665,72 @@ func TestConflictResolutionStage_PushesAndReports(t *testing.T) {
 	}
 }
 
+// crUnsetIdentity removes the fixture repository's local identity, so the
+// merge commit's identity can only come from the pass itself.
+func crUnsetIdentity(t *testing.T, repo string) {
+	t.Helper()
+	crGit(t, repo, "config", "--unset", "user.name")
+	crGit(t, repo, "config", "--unset", "user.email")
+}
+
+// crCommitIdentity reads sha's author and committer back from the repository.
+func crCommitIdentity(t *testing.T, repo, sha string) string {
+	t.Helper()
+	return crGitOut(t, repo, "log", "-1", "--format=%an <%ae> / %cn <%ce>", sha)
+}
+
+// TestConflictResolution_CommitUsesRequestIdentity (ADR-115 D2, #4648): with
+// NO local identity in the dispatch repository (whose config the throwaway
+// linked worktree shares), the published merge commit's author and committer
+// are the stage's App identity, threaded cfg -> request -> per-command
+// `-c user.*` — never an identity leaked into the shared config.
+func TestConflictResolution_CommitUsesRequestIdentity(t *testing.T) {
+	dispatch, _, featureTip, _ := crDispatchRepo(t)
+	crUnsetIdentity(t, dispatch)
+	fp := &fakePusher{}
+	crStageHarness(t, fp, crResolveInWorkdir)
+	cfg := crStageCfg(dispatch)
+	cfg.commitAuthorName = "cr-app[bot]"
+	cfg.commitAuthorEmail = "cr-app@example.invalid"
+
+	client := &crFakeUpload{}
+	if code := runConflictResolutionStage(context.Background(), cfg, crDispatchRequest(featureTip),
+		client, &upload.IssuedKey{PrivateKey: make([]byte, 64)}, io.Discard); code != exitOK {
+		t.Fatalf("exit code = %d, want %d (ships %+v)", code, exitOK, client.ships)
+	}
+	if fp.pushCommittedArgs == nil {
+		t.Fatal("the merge commit was never pushed")
+	}
+	want := "cr-app[bot] <cr-app@example.invalid> / cr-app[bot] <cr-app@example.invalid>"
+	if got := crCommitIdentity(t, dispatch, fp.pushCommittedArgs.HeadSHA); got != want {
+		t.Errorf("merge commit identity = %q, want %q", got, want)
+	}
+	if out, err := exec.Command("git", "-C", dispatch, "config", "--get", "user.name").Output(); err == nil {
+		t.Errorf("the pass wrote user.name=%q into the shared config", strings.TrimSpace(string(out)))
+	}
+}
+
+// TestConflictResolution_CommitIdentityFallsBackToDefault: a request with no
+// identity commits as gitops.DefaultAuthorName/Email, still without any local
+// identity to lean on.
+func TestConflictResolution_CommitIdentityFallsBackToDefault(t *testing.T) {
+	repo, head := crRepo(t)
+	crUnsetIdentity(t, repo)
+	res := runConflictResolutionPass(context.Background(), repo, "origin", crRequest(head),
+		func(context.Context) error { crWrite(t, repo, "conflict.txt", "ours\n"); return nil }, nil)
+	if res.refused() {
+		t.Fatalf("pass refused: %s (%s)", res.Reason, res.Detail)
+	}
+	d := gitops.DefaultAuthorName + " <" + gitops.DefaultAuthorEmail + ">"
+	if got := crCommitIdentity(t, repo, res.HeadSHA); got != d+" / "+d {
+		t.Errorf("merge commit identity = %q, want the default %q as author and committer", got, d)
+	}
+	name, email := conflictResolutionRequest{AuthorName: "n"}.commitIdentity()
+	if name != "n" || email != gitops.DefaultAuthorEmail {
+		t.Errorf("commitIdentity per-field fallback = (%q, %q), want (n, %q)", name, email, gitops.DefaultAuthorEmail)
+	}
+}
+
 // TestConflictResolutionStage_RefusalReportsNamedReason: a refused pass must
 // still REPORT, carrying the named refusal reason, and must not push. The
 // dispatch checkout is left on `main`, untouched.
