@@ -120,6 +120,7 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.requireRunAccount(readAccess, s.handleListRunAudit))
 	mux.HandleFunc("GET /v0/runs/{run_id}/gate-view", s.requireRunAccount(readAccess, s.handleGetRunGateView))
 	mux.HandleFunc("GET /v0/runs/{run_id}/scope-overlap", s.requireRunAccount(readAccess, s.handleGetRunScopeOverlap))
+	mux.HandleFunc("GET /v0/runs/{run_id}/campaign-pending-amendments", s.requireRunAccount(readAccess, s.handleGetRunCampaignPendingAmendments))
 	mux.HandleFunc("GET /v0/runs/{run_id}/budget", s.requireRunAccount(readAccess, s.handleGetRunBudget))
 	mux.HandleFunc("GET /v0/runs/{run_id}/cache-efficiency", s.requireRunAccount(readAccess, s.handleGetRunCacheEfficiency))
 	mux.HandleFunc("GET /v0/runs/{run_id}/cost", s.requireRunAccount(readAccess, s.handleGetRunCost))
