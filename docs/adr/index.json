@@ -833,6 +833,18 @@
       "applies_to": []
     },
     {
+      "id": "ADR-082",
+      "title": "Historian: a derived decision index over the audit chain, deterministic precedent at the gate for the captain, and a thresholded divergence question",
+      "path": "docs/adr/082-historian-precedent.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amended_by": [
+        "ADR-125"
+      ],
+      "applies_to": []
+    },
+    {
       "id": "ADR-084",
       "title": "Reviewer personas: a separate reviewer invocation with a declared remit, attached per stage or by an escalation, advisory with ingest-time checks, plus deterministic security checks as concern sources",
       "path": "docs/adr/084-reviewer-personas.md",
@@ -1019,6 +1031,9 @@
         "ADR-096"
       ],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-124"
+      ],
       "applies_to": [
         "backend/internal/basedelta/**"
       ]
@@ -1075,6 +1090,9 @@
       "superseded_by": [],
       "amends": [
         "ADR-050"
+      ],
+      "amended_by": [
+        "ADR-126"
       ],
       "applies_to": []
     },
@@ -1195,7 +1213,8 @@
         "ADR-055"
       ],
       "amended_by": [
-        "ADR-120"
+        "ADR-120",
+        "ADR-123"
       ],
       "applies_to": []
     },
@@ -1248,7 +1267,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-118"
+        "ADR-118",
+        "ADR-126"
       ],
       "applies_to": []
     },
@@ -1332,6 +1352,55 @@
         "ADR-085",
         "ADR-101",
         "ADR-118"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-123",
+      "title": "Amend ADR-113: stage approval gates admit only forge-verified credentials, on every channel",
+      "path": "docs/adr/123-forge-verified-stage-approvals.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-113"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-124",
+      "title": "Amend ADR-098: the verdict-transfer surface is a repository declaration; absent refuses",
+      "path": "docs/adr/124-verdict-transfer-surface-declaration.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-098"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-125",
+      "title": "The captain's log: evidence-bound lessons, confirmed by a human, read back to the driver",
+      "path": "docs/adr/125-captains-log.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-082"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-126",
+      "title": "Security findings are confidential records from intake to fix, with human-only disposition",
+      "path": "docs/adr/126-security-finding-record.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-103",
+        "ADR-117"
       ],
       "applies_to": []
     }

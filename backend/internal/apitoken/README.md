@@ -41,6 +41,29 @@ pre-0055 columns, so `rowToToken` maps their `AccountID` to `""`. Those paths
 do not consume the account. A later `sqlc generate` adds the column to them
 too, which is harmless.
 
+## Inventory: OAuth-login tokens minted before the client binding (#4627)
+
+`POST /v0/tokens/login` now binds the presented forge token to the
+deployment's own device OAuth client before it mints. Rows minted before that
+change were verified by token owner only. This change revokes and rewrites
+nothing; for routine review, list the active OAuth-login rows (read-only):
+
+```sql
+SELECT id, subject, provider, scopes, created_at, last_used_at
+  FROM api_tokens
+ WHERE auth_method = 'oauth'
+   AND revoked_at IS NULL
+ ORDER BY created_at;
+```
+
+- Compare `created_at` with the deploy time of the binding; rows minted after
+  it went through the client check.
+- Owner path: `DELETE /v0/tokens/{token_id}` as the token's subject.
+- Operator path, for a reviewed id only:
+  `UPDATE api_tokens SET revoked_at = now() WHERE id = '<reviewed-id>' AND revoked_at IS NULL;`
+- The holder re-mints with `fishhawk token login` against the deployment's
+  own device client.
+
 ## Inventory: pre-existing untenanted tokens held by tenanted members
 
 Tokens minted through `POST /v0/tokens` before #4506 are untenanted whatever

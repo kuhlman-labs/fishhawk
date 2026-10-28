@@ -6,7 +6,7 @@ date: 2026-10-23
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4690
 supersedes: []
 superseded_by: []
-amended_by: ["ADR-118"]
+amended_by: ["ADR-118", "ADR-126"]
 applies_to: []
 ---
 
@@ -213,3 +213,70 @@ Their configuration changes often (a model substitution, #4624; persona attachme
   It amends ADR-068 D3 if adopted as an ADR.
 - **Record metadata.** amends: []; supersedes: []; applies_to: []
 - **Related:** ADR-049, ADR-068, ADR-084, ADR-110, ADR-112, ADR-116, E55.4 (#2245), E80.17 (#4314), E85.3, #4516, #4624, #4684, #4687, #4688.
+
+### Amendment A1: Decision 3 (escape records) and D4 exclusions, persistence and closure
+
+**Ratified by the Captain on 2026-10-27 (v2.1).** v1 was reviewed by claude-fable-5-1 and gpt-6-astra (both said revise), and v2 folds in both reviews. v2.1 folds the v2 confirmation round: astra (two narrow gaps: delegated births, canonical key) and fable (counted births need the A1.3 credential, plus per-source dedupe keys, ordering and the D4 Exclusions row). Implementation is #4694 (run 6be7960b); its implementation must match this text.
+
+**A1.1 Store.**
+- An escape record is an append-only `escape_recorded` audit row on the run's chain. No separate table exists.
+- A record is never edited in place. Each state change is a new row.
+- A run-less escape (for example, an operator PR with no Fishhawk run) is refused under this amendment and needs its own decision.
+
+**A1.2 States and closure.**
+- **Birth.** A record is born `counted` or `pending_judgement`:
+  - A review-finding source (`later_reviewer`) and EVERY agent-recorded escape (A1.4: an agent-kind subject or a delegated request) are born `pending_judgement`.
+  - Other operator-recorded sources are born `counted` with `judgement_basis: not_required`, but ONLY when the recorder presents the A1.3 credential: a non-agent-marked, non-delegated request whose credential kind is `session`, `oauth` or `oauth_as`. Any other recorder's escape (for example a `static` or `unrecorded` api token) is born `pending_judgement`, whatever its source.
+  - Births deduplicate by a stable source-event identity, so neither a replay nor a double submission adds a second birth. The key for each source is:
+    - for `later_reviewer`: the concern's audit sequence;
+    - for an acceptance or CI source: the originating audit sequence;
+    - for a hand-recorded escape: an operator-supplied idempotency key.
+- **Closure.** A pending record closes exactly once, by ONE successor row that names it in `supersedes_sequence`. The server resolves the target sequence and derives `supersedes_sequence` itself, as the target's canonical unsigned base-10 representation with no leading zeroes. That same value drives the successor lookup and the deduplication (`StageID=nil`). The successor's state is `counted` (judgement `defect`) or `dismissed` (`no_defect`). The successor copies the closed record's immutable escape fields, so it cannot restate a different defect.
+- **Atomicity.** These run in one transaction under the run-row lock, using the audit `DedupedChainAppender` with the dedupe spec `(category=escape_recorded, key=supersedes_sequence)`. In that transaction the target is read and must be an `escape_recorded` row on the SAME run's chain in state `pending_judgement`. Otherwise the close is refused: 422 for a counted, cross-run or unknown target, and 409 for an already-closed target, naming the existing successor. The guarantee holds on the production repository; an in-memory fake is list-then-append.
+- **Run state never gates a close.** A terminal, revived or reaped run neither resets nor blocks closure. A missing run fails closed.
+- **Readers** take the single successor as the record's effective state.
+
+**A1.3 Attestation (the close).**
+- **Who may close.** Only a non-agent-marked identity may close a record, and it must present a forge-verified credential: kind `session`, `oauth` or `oauth_as`, derived in ADR-123 D1's order from the trusted middleware markers and sharing #4633's derivation function.
+- **Who is refused.** An agent-kind subject (operator-agent, run-bound, first-officer seat) is refused, and so is any request marked delegated. Both refusals apply independently, on every attestation write path.
+- **Ordering.** The ADR-123 D1 derivation function lands in #4633 (PR #4760). #4694 lands after it, or carries the function for #4760 to adopt. Until the function exists, closes are refused.
+- **What never becomes an attestation:** issue-comment text, an approval, and a webhook sender identity.
+- **Residual (ADR-113, ADR-121 D6).** A process holding an admitted human credential that omits `delegated` is indistinguishable from the human. Attestation proves a non-agent-marked, forge-verified credential, not physical presence.
+- **Relation to D1.**
+  - Until ADR-117 D1's judgement lands (E94.2), this attestation stands in for it.
+  - Every attestation is bound to its escape record, its source concern (when it has one), and an immutable judgement reference.
+  - When D1 lands, D1's judgement is authoritative. Migration maps each attestation to the D1 judgement it records, preserving actor, provenance and history. A conflict requires explicit human reconciliation.
+  - A later D1 relabelling is a new versioned judgement. It is never a second closure and never a silent rewrite of history.
+
+**A1.4 Agent-recorded escapes.**
+- **What counts as agent-recorded.** For birth and measurement eligibility, an escape is agent-recorded when it comes from an agent-kind subject OR from any request marked delegated.
+- **Recording.** Such a caller may RECORD an escape. It is born `pending_judgement` whatever its source, and closes only by A1.3 attestation. A1.3's refusals apply on every ATTESTATION write path; recording stays open.
+- Until closed, it is excluded from every ADR-117 D4 scorecard cell and from the ADR-118 D5 primary cell. The scorecard reports `agent_recorded_pending` as a separate diagnostic count. This adds a row to D4's Exclusions. It only narrows D4: a record stops counting, and nothing becomes countable.
+- `not_required` alone grants no scorecard eligibility. An automatic (non-human-recorded) source needs server-verified provenance before it can be counted.
+
+**A1.5 Security escapes (#4516).**
+- **What a record carries.** A security-category record carries only:
+  - `security_class` (a closed slug);
+  - a validated draft-advisory id;
+  - severity;
+  - the PR, run and head;
+  - its source;
+  - `reviewed_head`.
+- **What is refused.** Description, affected files and free-text notes are refused, on the record and on every public projection.
+- **Attribution.** E94.5 reads files from the advisory.
+- **Residual.** A caller can mislabel a security defect under another category. The tool description directs `category=security` for any vulnerability, and the D4 label audit oversamples non-security escapes with security-adjacent wording.
+
+**A1.6 Visibility.**
+- `escape_recorded` joins the run-bound audit-read deny-list NOW, on the per-run read, the global feed and the MCP read paths.
+- It moves to ADR-106's registry classification when that lands.
+
+**A1.7 Reviewed head.**
+- **What every round records.** Every implement-review round (slice, consolidated, fix-up re-review, boot re-dispatch, operator re-run) records `reviewed_head` on `implement_review_started`. It carries:
+  - the reviewed identity as `tree_sha` and `change_id`;
+  - `sha` with `kind` ∈ {`wip_tree`, `pushed_commit`, `compare_head`} and its origin;
+  - the rendered-diff scope as three disjoint plain-path sets: `files`, `partial_files` and `omitted_files`.
+- **Resolving a WIP head.** A `wip_tree` round resolves to the PR-lineage commit whose tree equals `tree_sha`. When several commits match, the round's recorded lineage disambiguates. If none matches, or the ambiguity cannot be resolved, the round reads `head_unknown`.
+- **Re-dispatch.** Every re-dispatch or re-run records its own immutable input and lineage, and a replay adds no duplicate exposure.
+- **A round with no usable head** (`head_unknown`, a missing start row, or missing scope evidence) is EXCLUDED from attribution and from the corresponding exposure denominators. It is neither blamed nor credited, its share is reported beside the escape rate, and `unreviewed_code` is never inferred from it.
+- **Partial and omitted files** count as not seen by the round.
+- **Use.** Plan-stage attribution keeps its separate plan-revision binding. The field is additive and does not change the review prompt.

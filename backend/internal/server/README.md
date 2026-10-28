@@ -4787,11 +4787,12 @@ The two post-approval hooks in `finishApprovalAdvance`'s tail protect themselves
 
 - `webhook.matchIssueComment` parses the three commands (run / approve / reject) and tags the `Match.Action` accordingly; the `Match.CommentBody` carries any trailing reviewer rationale. `Dispatcher.Handle` routes Action ∈ {approve, reject} to `Dispatcher.handleApprovalCommand`, which delegates to the `ApprovalCommandHandler` interface.
 - **Implementation lives on `Server.HandleApprovalCommand`** (`issue_approval.go`), where the approval, role, and stage-check repos already live.
-  It (1) finds the awaiting-approval stage by listing runs for the repo and matching `trigger_ref = issue:N`, (2) authorizes the sender via the existing `role.Resolver.CanApprove`, (3) submits via `approval.Repo.Submit` with `Surface = SurfaceGitHubComment`, (4) advances the stage (`advanceStage(ctx, stage, …)` — the same compare-and-swap primitive the HTTP path uses, see above), (5) writes the same `approval_submitted` audit row the HTTP path writes, (6) calls `Orchestrator.Advance`, and (7) posts a reply comment via `Notifier.NotifySlashApprovalReply`.
+  It (1) finds the awaiting-approval stage by listing runs for the repo and matching `trigger_ref = issue:N`, (2) authorizes the channel and the sender via `authorizeCommentApproval` (below), (3) submits via `approval.Repo.Submit` with `Surface = SurfaceGitHubComment`, (4) advances the stage (`advanceStage(ctx, stage, …)` — the same compare-and-swap primitive the HTTP path uses, see above), (5) writes the same `approval_submitted` audit row the HTTP path writes, (6) calls `Orchestrator.Advance`, and (7) posts a reply comment via `Notifier.NotifySlashApprovalReply`.
 - Replies are NOT deduped — every command attempt produces its own reply.
-- **Over-cap approve-comment refusal + its breadcrumb (#2583, made observable by E67.24 / #2621).** An approve comment longer than `prompt.MaxApprovalConditionBytes` is refused BEFORE `Submit` (no approval row) on this channel too, because the comment is injected verbatim as a binding approval condition (#558) and must not be silently truncated. A REJECT is never refused — its comment feeds the advisory `PriorRejectionFeedback` channel, not binding conditions. On the reply-comment (`silent=true`) variant the refusal deliberately posts **NO reply**: a passer-by `+1` that happens to exceed the cap should not draw an unsolicited bot comment. BOTH variants append an `approval_comment_refused` audit entry (`CategoryApprovalCommentRefused`, registered in `audit.KnownCategories`) so the drop is visible in the run record rather than invisible — payload `{stage_id, decision, surface, approver, silent, reason:"over_cap_approve_comment", bytes, max_bytes, overflow_bytes}`, stage-anchored, actor `user`. The entry is a trace, not a response: the silent channel stays silent. Best-effort — an append failure WARN-logs and never unwinds the refusal into an admission.
+- **Authorization: the ADR-123 D4 channel refusal, then the legacy check (#4755).** The comment channel — slash command, reply-comment `+1`, and reaction approvals the `reactionpoller` forwards into the same handler — cannot evaluate a workflow-v2 `approvals` predicate, so `authorizeCommentApproval` FAILS CLOSED, replacing the prior best-effort allow. It re-reads the run (`commentGateSpecMajor`: `GetRun` + `spec.ParseBytes`, needing neither an `installation_id` nor the run's workflow id) and REFUSES, in order: cause `spec_unreadable` (run read error, no cached spec, unparseable spec); `workflow_v2_gate` (spec major `>= 2` — approve AND reject, member or not, whether or not the gate declares `approvals`); `role_resolver_unconfigured` (a v0/v1 gate with no `RoleResolver`); `spec_unreadable` again when the v0/v1 gate cannot be resolved (`fetchGateForStage` errors — a workflow id missing from the spec, or a run with no `installation_id`, which makes every v0/v1 **GitLab** comment approval refuse: accepted by design, the old allow was the same bypass class); `role_resolution_failed` (`role.Resolver.CanApprove` errored, e.g. a team-API flap). Otherwise the legacy v0/v1 `approvers` check is unchanged: a stage with no approvers block admits, a listed member admits, and a non-member gets the existing `not in this stage's approvers list` reply (or, on the reply-comment channel, a silent drop) with NO audit row. A channel refusal records nothing, transitions nothing and captures no delegation shadow; it appends an `approval_comment_refused` entry with payload `{stage_id, decision, surface, approver, silent, reason:"comment_channel_refused", cause, spec_major?}` (`spec_major` omitted for `spec_unreadable`) and, unless silent, replies naming the supported channels (MCP `fishhawk_approve_plan` / `fishhawk_reject_plan`, CLI `fishhawk plan approve|reject`, web UI — all `POST /v0/stages/{id}/approvals`). The reply-comment variant posts no reply but is still audited (`silent=true`); each forwarded reaction draws one reply, since only `reply_comment` is silent. Pinned by `issue_approval_channel_test.go`.
+- **Over-cap approve-comment refusal + its breadcrumb (#2583, made observable by E67.24 / #2621).** An approve comment longer than `prompt.MaxApprovalConditionBytes` is refused BEFORE `Submit` (no approval row) on this channel too, because the comment is injected verbatim as a binding approval condition (#558) and must not be silently truncated. A REJECT is never refused — its comment feeds the advisory `PriorRejectionFeedback` channel, not binding conditions. On the reply-comment (`silent=true`) variant the refusal deliberately posts **NO reply**: a passer-by `+1` that happens to exceed the cap should not draw an unsolicited bot comment. BOTH variants append an `approval_comment_refused` audit entry (`CategoryApprovalCommentRefused`, registered in `audit.KnownCategories`) so the drop is visible in the run record rather than invisible — payload `{stage_id, decision, surface, approver, silent, reason:"over_cap_approve_comment", bytes, max_bytes, overflow_bytes}` (the same category as the channel refusal above, told apart by `reason`), stage-anchored, actor `user`. The entry is a trace, not a response: the silent channel stays silent. Best-effort — an append failure WARN-logs and never unwinds the refusal into an admission.
 - Per #253 / ADR-017 the slash command no longer reads `stage_check` state — branch protection is the merge gate.
-- The slash-command path falls open when its deps aren't wired (`approvalCommandConfigured()` returns false), and is best-effort throughout: a comment failure logs but never returns 5xx to GitHub.
+- The slash-command path skips (records nothing) when its deps aren't wired (`approvalCommandConfigured()` returns false), and is best-effort throughout: a comment failure logs but never returns 5xx to GitHub.
 - PR-triggered approvals, `/fishhawk cancel`, and per-stage targeting (`/fishhawk approve plan`) are out of scope — separate followups when those scenarios surface.
 
 ## Live-validation walk auto-filing (`live_validation_filing.go`, E48.35 / #2045)
@@ -8251,6 +8252,40 @@ CLI rather than locked out), and to `github` otherwise. An unconfigured
 provider is refused `400` naming the configured set. A verified subject whose
 `identity.ProviderOf` disagrees with the selected provider is refused `401`
 rather than minted — defence in depth against a mis-stamped row.
+
+**Client binding (#4627).** `VerifyAccessToken` binds the token to the
+deployment's OWN device OAuth client before resolving the subject (GitHub
+check-a-token, GitLab token-info; contract in
+`backend/internal/identity/README.md` § "Client binding"), so a token the same
+human obtained through any other client cannot mint. Outcomes:
+
+- every refusal (foreign or undeterminable issuer, failed introspection,
+  failed subject lookup) is ONE generic `401 token_verification_failed`; the
+  response never says which check failed.
+- a provider missing its introspection credential
+  (`identity.ErrClientCredentialUnconfigured`) is `503 tokens_unconfigured`,
+  `details.provider` set, the message naming the env var:
+  `FISHHAWKD_OAUTH_CLIENT_SECRET` (with `FISHHAWKD_OAUTH_CLIENT_ID`) for github,
+  `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` for gitlab, a generic wording otherwise.
+
+**Refusal logging is a closed set (#4627 C1).** A refused verification writes
+one WARN line, `token-login verification refused`, carrying ONLY `provider` and
+`reason`, one of the `tokenLoginReason*` constants in `tokens.go`, classified
+by sentinel (`errors.Is`), never by text:
+
+| `reason` | Sentinel |
+|---|---|
+| `rate_limited` | `identity.ErrRateLimited` (either request) |
+| `issuer_mismatch` | `identity.ErrTokenClientMismatch` |
+| `introspection_refused` | `identity.ErrIntrospectionRefused` |
+| `introspection_failed` | `identity.ErrIntrospectionFailed` |
+| `subject_resolution_failed` | anything else (the subject lookup) |
+
+The error text never reaches the log, the response body or an audit row: a
+provider error can embed up to 256 bytes of a forge response body, and a forge
+body can echo the submitted access token. Pinned by
+`TestTokenLoginMint_VerificationErrorNeverLeaksUpstreamBody`
+(`tokens_clientbinding_test.go`), which reads all three sinks.
 
 ### `POST /v0/tokens` mint ceiling
 

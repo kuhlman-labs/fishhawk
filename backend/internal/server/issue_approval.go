@@ -17,12 +17,17 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
 // CategoryApprovalCommentRefused is the audit category emitted when the
-// issue-comment approval channel refuses an over-cap approve comment before
-// Submit (#2583's refusal, made observable by E67.24 / #2621). It exists for the
+// issue-comment approval channel refuses a comment before Submit. Two reasons
+// share it, named by the payload's `reason`: `over_cap_approve_comment` (#2583's
+// over-cap approve refusal, made observable by E67.24 / #2621) and
+// `comment_channel_refused` (ADR-123 D4 / #4755: the channel itself refused,
+// with a `cause` — a workflow-v2 gate, or a gate whose approval rules could not
+// be verified). It exists for the
 // SILENT branch above all: a reply-comment ("+1") refusal deliberately posts no
 // reply, so without this entry an operator's approval evaporated with no reply,
 // no approval row, and no trace anywhere. The entry is written on the non-silent
@@ -34,11 +39,15 @@ import (
 const CategoryApprovalCommentRefused = "approval_comment_refused"
 
 // HandleApprovalCommand implements webhook.ApprovalCommandHandler
-// for /fishhawk approve and /fishhawk reject (#238). Mirrors the
-// HTTP approval handler's checks (role authorization, blocking-
-// check enforcement, state-machine advance, orchestrator dispatch)
-// but addresses the result in the issue conversation rather than
-// an HTTP response.
+// for /fishhawk approve and /fishhawk reject (#238), the reply-comment
+// "+1" (E17.3 / #338) and reaction approvals the reactionpoller forwards.
+// Steps: (1) resolve the run's awaiting-approval stage; (2) authorize the
+// CHANNEL and the approver via authorizeCommentApproval — the ADR-123 D4 /
+// #4755 refusal on every workflow-v2 gate (approve and reject) and on any
+// gate whose approval rules cannot be verified, then the legacy v0/v1
+// `approvers` role check; (3) the over-cap comment refusal; (4) Submit,
+// advance, orchestrator dispatch. The result is addressed in the issue
+// conversation rather than an HTTP response.
 //
 // The handler is intentionally conservative on errors: every path
 // posts a reply comment so the reviewer always sees what happened,
@@ -116,7 +125,27 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 		return nil
 	}
 
-	if msg, allowed := s.authorizeSlashApprover(ctx, stage, subject); !allowed {
+	// ADR-123 D4 (#4755): the issue-comment channel cannot evaluate a
+	// workflow-v2 `approvals` predicate, so it is REFUSED on every v2 gate and
+	// fails closed wherever the gate's approval rules cannot be verified. A
+	// refusal records nothing and transitions nothing; it is written as an
+	// approval_comment_refused audit entry on both channels (the reply-comment
+	// one stays silent) so the drop is visible in the run record. It precedes
+	// captureDelegationShadow, so a refused comment stamps no shadow either.
+	authz := s.authorizeCommentApproval(ctx, stage, subject)
+	if authz.refusal != "" {
+		extra := map[string]any{"cause": authz.refusal}
+		if authz.refusal != commentRefusalSpecUnreadable {
+			extra["spec_major"] = authz.specMajor
+		}
+		s.writeApprovalCommentRefusedAudit(ctx, stage, subject, decision, p.Source, silent, approvalCommentRefusedReasonChannel, extra)
+		if !silent {
+			s.replyApproval(ctx, p, commentChannelRefusedReply(authz.refusal, subject))
+		}
+		return nil
+	}
+	if !authz.allowed {
+		msg := authz.denyMsg
 		if silent {
 			// Reply-comment approvals (E17.4 / #339) from a
 			// non-approver are silently dropped: a random "+1"
@@ -159,7 +188,7 @@ func (s *Server) HandleApprovalCommand(ctx context.Context, p webhook.ApprovalCo
 	// unchanged — a silent refusal still posts NO comment; the breadcrumb is a
 	// trace, not a reply.
 	if ok, msg, details := validateApprovalComment(decision, p.Comment); !ok {
-		s.writeApprovalCommentRefusedAudit(ctx, stage, subject, decision, p.Source, silent, details)
+		s.writeApprovalCommentRefusedAudit(ctx, stage, subject, decision, p.Source, silent, approvalCommentRefusedReasonOverCap, overCapRefusalExtra(details))
 		if !silent {
 			s.replyApproval(ctx, p, msg)
 		}
@@ -458,42 +487,145 @@ func replyScope(p webhook.ApprovalCommandParams) forge.CredentialScope {
 	return forge.FromGitHubInstallationID(p.InstallationID)
 }
 
-// authorizeSlashApprover wraps the role-resolver check into a non-
-// HTTP shape. Returns (replyMsg, false) on denial; ("", true) on
-// allow. Mirrors the HTTP handler's best-effort posture: a
-// resolver / spec-fetch failure logs but allows the submission, so
-// transient GitHub flaps don't black-hole the gate.
-func (s *Server) authorizeSlashApprover(ctx context.Context, stage *run.Stage, subject string) (string, bool) {
+// approvalCommentRefusedReasonChannel is the approval_comment_refused payload
+// `reason` for an ADR-123 D4 (#4755) channel refusal: the issue-comment channel
+// itself refused the decision, and the payload's `cause` names why.
+const approvalCommentRefusedReasonChannel = "comment_channel_refused"
+
+// approvalCommentRefusedReasonOverCap is the approval_comment_refused payload
+// `reason` for the over-cap approve-comment refusal (#2583 / E67.24 / #2621).
+const approvalCommentRefusedReasonOverCap = "over_cap_approve_comment"
+
+// The channel-refusal causes (ADR-123 D4 / #4755), recorded as the
+// approval_comment_refused payload's `cause` and named in the refusal reply.
+const (
+	// commentRefusalWorkflowV2Gate: the run's cached spec is workflow-v2 (or a
+	// later major). The channel cannot evaluate a v2 `approvals` predicate, so
+	// it refuses approve AND reject, whether or not the gate declares one.
+	commentRefusalWorkflowV2Gate = "workflow_v2_gate"
+	// commentRefusalSpecUnreadable: the run's cached spec could not be read —
+	// the run read failed, no spec is cached, it does not parse, or the stage's
+	// gate cannot be resolved from it.
+	commentRefusalSpecUnreadable = "spec_unreadable"
+	// commentRefusalResolverUnconfigured: a v0/v1 gate, but no RoleResolver is
+	// wired, so the legacy `approvers` check cannot run.
+	commentRefusalResolverUnconfigured = "role_resolver_unconfigured"
+	// commentRefusalRoleResolutionFailed: the legacy `approvers` check errored
+	// (for example a team-API failure).
+	commentRefusalRoleResolutionFailed = "role_resolution_failed"
+)
+
+// commentApprovalAuthz is authorizeCommentApproval's outcome (ADR-123 D4 /
+// #4755). A non-empty refusal means the CHANNEL is refused (one of the
+// commentRefusal* causes): nothing is recorded and the refusal is audited.
+// Otherwise allowed/denyMsg is the legacy v0/v1 `approvers` verdict, whose deny
+// is a reply (or a silent drop) with no audit row. specMajor is the cached
+// spec's major when it was read; it is zero for a spec_unreadable refusal
+// raised before the spec parsed.
+type commentApprovalAuthz struct {
+	allowed   bool
+	denyMsg   string
+	refusal   string
+	specMajor int
+}
+
+// commentGateSpecMajor re-reads the stage's run and returns the major version
+// of its cached workflow spec (ADR-123 D4 / #4755). It errors on a run read
+// failure, an empty cached spec (errNoCachedWorkflowSpec) and a spec that does
+// not parse. It deliberately requires neither an installation_id nor the run's
+// workflow id in the spec: the version decision rests on the spec bytes alone,
+// so a v2 spec refuses even where the legacy gate lookup could not run.
+// spec.ParseBytes rejects a missing or unsupported version, so a parsed spec's
+// major is authoritative.
+func (s *Server) commentGateSpecMajor(ctx context.Context, stage *run.Stage) (int, error) {
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, stage.RunID)
+	if err != nil {
+		return 0, fmt.Errorf("get run: %w", err)
+	}
+	if len(runRow.WorkflowSpec) == 0 {
+		return 0, errNoCachedWorkflowSpec
+	}
+	parsed, err := spec.ParseBytes(runRow.WorkflowSpec)
+	if err != nil {
+		return 0, fmt.Errorf("parse workflow spec: %w", err)
+	}
+	return spec.VersionMajor(parsed.Version), nil
+}
+
+// authorizeCommentApproval decides whether an issue-comment decision (slash
+// command, reply comment, or forwarded reaction) may reach Submit. It FAILS
+// CLOSED (ADR-123 D4 / #4755), replacing the prior best-effort allow, under
+// which a spec-read, gate-resolution or role-resolution failure — and every
+// workflow-v2 gate, whose `approvals` predicate this channel never evaluated —
+// admitted the decision. In order:
+//
+//  1. the cached spec cannot be read → spec_unreadable;
+//  2. the spec is workflow-v2 or later → workflow_v2_gate, for approve AND
+//     reject and whether or not the gate declares `approvals`. `>= 2` so a
+//     future major refuses too;
+//  3. no RoleResolver → role_resolver_unconfigured;
+//  4. the stage's gate cannot be resolved (for example a workflow id missing
+//     from the spec, or a run without an installation_id) → spec_unreadable;
+//  5. a stage with no legacy `approvers` block → allowed (the legacy
+//     no-approvers outcome, kept);
+//  6. role resolution errors → role_resolution_failed;
+//  7. otherwise the legacy `approvers` verdict: allowed, or a deny message.
+//
+// Only a channel refusal (non-empty refusal) is audited; the legacy deny keeps
+// its unaudited reply / silent drop. The MCP, CLI and web-UI channels
+// (POST /v0/stages/{id}/approvals) are unaffected.
+func (s *Server) authorizeCommentApproval(ctx context.Context, stage *run.Stage, subject string) commentApprovalAuthz {
+	specMajor, err := s.commentGateSpecMajor(ctx, stage)
+	if err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"comment approval refused: cached workflow spec unreadable",
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
+		return commentApprovalAuthz{refusal: commentRefusalSpecUnreadable}
+	}
+	if specMajor >= 2 {
+		return commentApprovalAuthz{refusal: commentRefusalWorkflowV2Gate, specMajor: specMajor}
+	}
 	if s.cfg.RoleResolver == nil {
-		return "", true
+		return commentApprovalAuthz{refusal: commentRefusalResolverUnconfigured, specMajor: specMajor}
 	}
 	gate, err := s.fetchGateForStage(ctx, stage)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"slash-command approval: fetch gate failed",
+			"comment approval refused: fetch gate failed",
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("error", err.Error()))
-		return "", true // best-effort allow
+		return commentApprovalAuthz{refusal: commentRefusalSpecUnreadable, specMajor: specMajor}
 	}
 	if gate == nil || gate.approvers == nil {
-		// No approval gate on the stage. Treat as allowed —
-		// matches the HTTP handler's posture for stages without
-		// an explicit approvers block.
-		return "", true
+		// No legacy approvers block on the stage — the v0/v1 no-approvers
+		// outcome, matching the HTTP handler's posture.
+		return commentApprovalAuthz{allowed: true, specMajor: specMajor}
 	}
 	allowed, err := s.cfg.RoleResolver.CanApprove(ctx, gate.scope, gate.approvers, gate.roles, subject)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"slash-command approval: role resolution failed",
+			"comment approval refused: role resolution failed",
 			slog.String("stage_id", stage.ID.String()),
 			slog.String("subject", subject),
 			slog.String("error", err.Error()))
-		return "", true // best-effort allow
+		return commentApprovalAuthz{refusal: commentRefusalRoleResolutionFailed, specMajor: specMajor}
 	}
 	if !allowed {
-		return fmt.Sprintf("Cannot approve: @%s is not in this stage's approvers list.", subject), false
+		return commentApprovalAuthz{denyMsg: fmt.Sprintf("Cannot approve: @%s is not in this stage's approvers list.", subject), specMajor: specMajor}
 	}
-	return "", true
+	return commentApprovalAuthz{allowed: allowed, specMajor: specMajor}
+}
+
+// commentChannelRefusedReply renders the slash-channel reply for an ADR-123 D4
+// (#4755) channel refusal. It names the channels that CAN decide the gate, so
+// the reviewer's next action is clear.
+func commentChannelRefusedReply(cause, subject string) string {
+	channels := "the MCP verbs `fishhawk_approve_plan` / `fishhawk_reject_plan`, the CLI `fishhawk plan approve` / `fishhawk plan reject`, or the web UI"
+	if cause == commentRefusalWorkflowV2Gate {
+		return fmt.Sprintf("Comment approvals and rejections are not accepted on workflow-v2 gates (ADR-123). Nothing was recorded; the stage is still awaiting approval. Decide the gate with %s. (Caller: @%s)", channels, subject)
+	}
+	return fmt.Sprintf("Fishhawk could not verify this gate's approval rules (`%s`), so nothing was recorded; the stage is still awaiting approval. Decide the gate with %s. (Caller: @%s)", cause, channels, subject)
 }
 
 // writeSlashApprovalAudit mirrors writeApprovalAudit's chain entry
@@ -532,15 +664,16 @@ func (s *Server) writeSlashApprovalAudit(ctx context.Context, stage *run.Stage, 
 	}
 }
 
-// writeApprovalCommentRefusedAudit records an over-cap approve-comment refusal
-// on the issue-comment approval channel (E67.24 / #2621). Modelled on
+// writeApprovalCommentRefusedAudit records a refusal on the issue-comment
+// approval channel: the over-cap approve-comment refusal (E67.24 / #2621) and
+// the ADR-123 D4 channel refusal (#4755), told apart by `reason`. Modelled on
 // writeSlashApprovalAudit's chain entry and appendApprovalConditionsTruncatedAudit's
 // best-effort posture: an append failure WARN-logs and never changes the
 // handler's return value or its reply behavior — the refusal already happened,
 // and unwinding it because a breadcrumb failed would trade a visible drop for an
-// invisible admission. `details` is validateApprovalComment's own details map,
-// so the recorded byte figures are the exact ones the refusal message names.
-func (s *Server) writeApprovalCommentRefusedAudit(ctx context.Context, stage *run.Stage, subject string, decision approval.Decision, source webhook.ApprovalSource, silent bool, details map[string]any) {
+// invisible admission. The payload is {stage_id, decision, surface, approver,
+// silent, reason} plus every key of `extra`.
+func (s *Server) writeApprovalCommentRefusedAudit(ctx context.Context, stage *run.Stage, subject string, decision approval.Decision, source webhook.ApprovalSource, silent bool, reason string, extra map[string]any) {
 	if s.cfg.AuditRepo == nil {
 		// Defence-in-depth: approvalCommandConfigured already requires an
 		// AuditRepo, so this branch is unreachable from the handler.
@@ -554,12 +687,10 @@ func (s *Server) writeApprovalCommentRefusedAudit(ctx context.Context, stage *ru
 		"surface":  string(approvalSurfaceForSource(source)),
 		"approver": approver,
 		"silent":   silent,
-		"reason":   "over_cap_approve_comment",
+		"reason":   reason,
 	}
-	for _, k := range []string{"bytes", "max_bytes", "overflow_bytes"} {
-		if v, ok := details[k]; ok {
-			auditPayload[k] = v
-		}
+	for k, v := range extra {
+		auditPayload[k] = v
 	}
 	payload, _ := json.Marshal(auditPayload)
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -578,6 +709,19 @@ func (s *Server) writeApprovalCommentRefusedAudit(ctx context.Context, stage *ru
 			slog.Bool("silent", silent),
 			slog.String("error", err.Error()))
 	}
+}
+
+// overCapRefusalExtra filters validateApprovalComment's details down to the
+// byte figures the over-cap approval_comment_refused payload carries, so the
+// recorded figures are the exact ones the refusal message names.
+func overCapRefusalExtra(details map[string]any) map[string]any {
+	extra := map[string]any{}
+	for _, k := range []string{"bytes", "max_bytes", "overflow_bytes"} {
+		if v, ok := details[k]; ok {
+			extra[k] = v
+		}
+	}
+	return extra
 }
 
 // replyApproval posts a reply comment to the issue using the

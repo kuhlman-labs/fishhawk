@@ -13114,6 +13114,17 @@ paths:
 
         A verified subject whose provider qualifier disagrees with the
         selected provider is refused `401` rather than minted.
+
+        CLIENT BINDING (#4627). Verification is not owner-only: before the
+        subject is resolved, the token must have been issued to the
+        deployment's OWN device OAuth client — the one discovery advertises.
+        GitHub: the forge's check-a-token introspection, authenticated with
+        the deployment's OAuth client id + secret, must name exactly that
+        client. GitLab: the forge's token-information endpoint must name
+        exactly the configured device application. Fail-closed: another
+        client's token, a personal access token, an App/installation or
+        project/CI token, a missing or null issuer, and any introspection
+        failure are all refused `401`.
       tags: [auth]
       security: []
       requestBody:
@@ -13164,9 +13175,12 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401':
           description: |
-            The presented access token could not be verified, or the verified
+            The presented access token could not be verified, or the token was
+            not issued to the deployment's configured device OAuth client, or
+            its issuing client could not be determined, or the verified
             subject's provider qualifier disagrees with the selected provider
-            (`error: token_verification_failed`).
+            (`error: token_verification_failed`). The response does not say
+            which check failed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -13178,7 +13192,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '503':
+          description: |
+            Token login is not configured (`error: tokens_unconfigured`): no
+            token repository, a repository that cannot mint OAuth tokens, no
+            operator repo, no configured identity provider, or a selected
+            provider missing the credential its client-binding check needs —
+            then `details.provider` names it and the message names the env
+            var (`FISHHAWKD_OAUTH_CLIENT_SECRET` with
+            `FISHHAWKD_OAUTH_CLIENT_ID` for github,
+            `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` for gitlab). Also the
+            auth-boundary `service_unavailable` when the database is
+            unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/tokens/{token_id}:
     delete:

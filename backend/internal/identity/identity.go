@@ -230,6 +230,32 @@ var (
 	// OAuth-unconfigured backend fails closed instead of silently
 	// authorizing.
 	ErrNotConfigured = errors.New("identity: no identity provider configured")
+
+	// ErrClientCredentialUnconfigured means a provider lacks the credential
+	// its token-introspection call needs (GitHub: the device client's id +
+	// secret; GitLab: the device client id), so VerifyAccessToken cannot
+	// bind a presented token to the deployment's device OAuth client. It is
+	// returned BEFORE any HTTP call. The mint handler maps it to 503
+	// tokens_unconfigured — never a fallback to owner-only verification
+	// (#4627).
+	ErrClientCredentialUnconfigured = errors.New("identity: client credential for token introspection not configured")
+
+	// ErrTokenClientMismatch means the forge's introspection answered, but
+	// the issuing client it named is not exactly the provider's configured
+	// device OAuth client — or it named none (#4627).
+	ErrTokenClientMismatch = errors.New("identity: access token was not issued to the configured OAuth client")
+
+	// ErrIntrospectionRefused means the forge's introspection endpoint
+	// answered with a non-success status (other than a rate-limit signal,
+	// which is ErrRateLimited): an invalid token, a token the endpoint does
+	// not recognise for this client, or a redirect the client refused to
+	// follow (#4627).
+	ErrIntrospectionRefused = errors.New("identity: token introspection refused the access token")
+
+	// ErrIntrospectionFailed means the introspection exchange itself failed:
+	// a transport error (including a refused cross-origin redirect), an
+	// unreadable, oversized or undecodable reply (#4627).
+	ErrIntrospectionFailed = errors.New("identity: token introspection failed")
 )
 
 // IdentityProvider is the forge-neutral identity contract. All three
@@ -272,6 +298,21 @@ type IdentityProvider interface {
 	// access token; the backend re-derives the subject from the token
 	// rather than trusting a client-supplied login. Returns
 	// ErrNotConfigured on the NoOp provider (no forge to verify against).
+	//
+	// CLIENT BINDING (#4627). Owner resolution alone is not enough: a token
+	// the same human obtained through ANY other client (another OAuth app, a
+	// personal access token, an automation credential) would resolve the
+	// same subject. So an implementation MUST first verify, through the
+	// forge's own introspection surface, that the token was issued to the
+	// provider's configured device OAuth client, and MUST refuse (non-nil
+	// error) when the issuing client differs or cannot be determined — a
+	// missing or null issuer, a non-success or undecodable introspection
+	// reply, a transport failure. Only then does it resolve the subject.
+	// When it lacks the credential introspection needs it returns
+	// ErrClientCredentialUnconfigured before any HTTP call. Refusals wrap
+	// ErrTokenClientMismatch, ErrIntrospectionRefused,
+	// ErrIntrospectionFailed or ErrRateLimited so a caller can classify
+	// them without reading the error text.
 	VerifyAccessToken(ctx context.Context, accessToken string) (subject string, err error)
 
 	// PermissionLevel returns the subject's forge-neutral permission
