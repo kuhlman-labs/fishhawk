@@ -190,3 +190,27 @@ ADR-093 D6 lets a run's Fishhawk review-gate approval TRANSFER across a clean ba
 **Consequences.** No new migration or audit category. #4632 already implements A1.1–A1.4. Open residuals, tracked in #4675:
 - an age or event bound that ends an episode after a genuine clear followed by a re-block, re-posting the yield notice;
 - `next_actions` must not offer `merge_run` for a row-4 yield on an unchanged forge state, so a driver following it cannot poll the loop back.
+
+### Amendment A2: per-entry re-probe due time and round-robin selection (2026-10-28)
+
+**Ratified by the Captain on 2026-10-28.**
+
+**Why.** Two parts of the R3 re-probe text are revised.
+
+**What A2 replaces.** It replaces A1.4's process-wide due window, and R3's "a bounded re-probe runs on the oldest yielded row per base per pump".
+
+**The defects.**
+- **Starvation (gpt-6-astra review of #4748, run e8fb6a85; also #4675).** Selecting the oldest-by-`yielded_at` due row, under the 16-interval backoff cap, lets blocked older rows win every sweep once their schedule points align. With 17 or more aligned yielded rows, a younger row that has become eligible is never selected.
+- **The process-wide window** advances for every row on each sweep, including rows the sweep never probed.
+
+**A2.1 Per-entry due time.** A yielded row's re-probe is due when a backoff schedule point falls in (age at this row's last service, age]. A row never serviced in this process uses (0, age].
+- A row's service mark advances ONLY when that row is actually probed.
+- The mark is process-local, so the rule needs no migration. A restart resets every row to never-serviced, which leaves every row due and the selection rule below still bounded.
+
+**A2.2 Round-robin selection.** Among the due yielded rows of a base, the pump re-probes the row with the OLDEST service mark. Never-serviced rows go first, and ties are broken by `yielded_at`, oldest first.
+- **The bound:** with N due rows on a base, every due row is probed within N sweeps.
+- **Unchanged:** the immediate re-probe on a `merge_run` re-invoke or an approval webhook for that run, and A1.3's single clear predicate and its no-restart backoff.
+
+**Evidence the implementation must carry.**
+- A test with N = 17 aligned yielded rows (16 permanently blocked, 1 eligible) asserting the eligible row is probed within N sweeps.
+- A counterfactual: reverting to oldest-by-`yielded_at` selection turns that test RED.
