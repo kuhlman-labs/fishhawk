@@ -321,16 +321,14 @@ func validFaninInputs(in sjFaninInputs) bool {
 // SHA was unresolvable. A conflicting slice records its unmerged paths and is
 // aborted, so the next slice merges onto the tree before it; a merge that
 // neither merges nor aborts cleanly leaves the remaining slices error.
+//
+// No `git config` is written into the clone: the merge commit's identity and
+// the maintenance.auto=false / gc.auto=0 pins (`git merge` has no
+// --no-auto-maintenance flag, #3503) ride every git child as command-scope env
+// from hostJobGitRun (ADR-115 D2, #4648).
 func (r *specialistJobRun) mergeSlices(ctx context.Context, clone string, slices []sjFaninSlice, ev *sjFaninEvidence) (string, bool) {
 	broken := false
-	// maintenance.auto=false: `git merge` has no --no-auto-maintenance flag,
-	// and its detached maintenance child would outlive the job (#3503).
-	for _, kv := range [][2]string{{"user.name", faninCommitterName}, {"user.email", faninCommitterEmail}, {"maintenance.auto", "false"}} {
-		if _, code, err := r.git.Run(ctx, clone, "config", kv[0], kv[1]); err != nil || code != 0 {
-			broken = true
-		}
-	}
-	allMerged, unresolved := !broken, false
+	allMerged, unresolved := true, false
 	for _, s := range slices {
 		e := sjFaninSliceEvidence{Name: s.Name, HeadSHA: s.HeadSHA, Outcome: faninSliceError, ConflictPaths: []string{}}
 		switch {

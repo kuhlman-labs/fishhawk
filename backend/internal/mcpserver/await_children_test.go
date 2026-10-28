@@ -1926,3 +1926,151 @@ func TestAwaitChildrenFailureBlockedIsPure(t *testing.T) {
 		})
 	}
 }
+
+// --- release arm (1b): campaign-wide amendment_pending (E86.85 / #4486) ---
+
+// TestAwaitChildren_ReleasesOnOtherParentsSliceAmendment is the issue's
+// criterion and counterfactual (5)'s vehicle: parent A's only child is running,
+// not dispatchable, not terminal and has no amendment, so no other arm can
+// release; a slice of parent B (another item of the same campaign) files a live
+// amendment mid-poll, and A's wait releases amendment_pending naming it.
+func TestAwaitChildren_ReleasesOnOtherParentsSliceAmendment(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parentA, childA, sliceB := uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, childA, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parentA, []string{childA.String()}, 0)
+	campaignID := uuid.NewString()
+	entry := campaignAmendmentEntry(sliceB, uuid.New(), "acme/widgets#2", true)
+	fb.campaignAmendmentsFunc = func(anchor uuid.UUID, reads int) (runCampaignPendingAmendments, bool) {
+		if anchor != parentA {
+			return runCampaignPendingAmendments{}, false
+		}
+		cid := campaignID
+		resp := runCampaignPendingAmendments{RunID: anchor.String(), CampaignID: &cid}
+		if reads >= 2 {
+			resp.Items = []campaignPendingAmendment{entry}
+		}
+		return resp, true
+	}
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parentA))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("status = %q, want amendment_pending — another parent's slice filed a live amendment", out.Status)
+	}
+	if out.PendingAmendmentRunID != sliceB.String() {
+		t.Errorf("pending_amendment_run_id = %q, want B's slice %s", out.PendingAmendmentRunID, sliceB)
+	}
+	if out.PendingAmendmentChildRunID != "" {
+		t.Errorf("pending_amendment_child_run_id = %q, want empty — B's slice is not A's child", out.PendingAmendmentChildRunID)
+	}
+	if out.PendingAmendmentCampaignID != campaignID || out.PendingAmendmentIssueRef != "acme/widgets#2" {
+		t.Errorf("campaign/issue = %q/%q, want %s/acme/widgets#2", out.PendingAmendmentCampaignID, out.PendingAmendmentIssueRef, campaignID)
+	}
+	if out.PendingAmendment == nil || out.PendingAmendment.ID != entry.Amendment.ID {
+		t.Fatalf("pending_amendment = %+v, want %s", out.PendingAmendment, entry.Amendment.ID)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_decide_scope_amendment" ||
+		out.NextStep.Params["run_id"] != sliceB.String() || out.NextStep.Params["amendment_id"] != entry.Amendment.ID {
+		t.Errorf("next_step = %+v, want decide on B's slice %s", out.NextStep, sliceB)
+	}
+	if out.Children == nil || len(out.Children.Children) != 1 {
+		t.Errorf("children snapshot = %+v, want A's fan-out carried on the release", out.Children)
+	}
+	if !strings.Contains(out.Message, "has NOT released for its own reasons") {
+		t.Errorf("message = %q, want the own-reasons disclaimer", out.Message)
+	}
+}
+
+// TestAwaitChildren_OwnChildAmendmentWinsOverCampaign: arm (1) releases first,
+// and the campaign arm skips the child's own row (and the parent's) even when
+// the campaign list carries it.
+func TestAwaitChildren_OwnChildAmendmentWinsOverCampaign(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	stageID := seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	ownID := uuid.NewString()
+	fb.mu.Lock()
+	fb.amendmentsByRun[a] = []ScopeAmendmentItem{{ID: ownID, RunID: a.String(), StageID: stageID.String(), Status: "pending"}}
+	fb.mu.Unlock()
+	seedCampaignAmendments(fb, parent, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true))
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "amendment_pending" || out.PendingAmendment == nil || out.PendingAmendment.ID != ownID {
+		t.Fatalf("status/amendment = %q/%+v, want the child's own %s", out.Status, out.PendingAmendment, ownID)
+	}
+	if out.PendingAmendmentRunID != a.String() || out.PendingAmendmentChildRunID != a.String() {
+		t.Errorf("run ids = %q/%q, want the child %s on both", out.PendingAmendmentRunID, out.PendingAmendmentChildRunID, a)
+	}
+	if out.PendingAmendmentCampaignID != "" || out.PendingAmendmentIssueRef != "" {
+		t.Errorf("campaign fields = %q/%q, want empty on a child's own release", out.PendingAmendmentCampaignID, out.PendingAmendmentIssueRef)
+	}
+	if got := campaignAmendmentReads(fb, parent); got != 0 {
+		t.Errorf("campaign reads = %d, want 0 — arm (1) resolves first", got)
+	}
+
+	// The campaign arm itself skips a row on an own child or on the parent.
+	cs, err := r.childrenStatusForAwait(context.Background(), parent)
+	if err != nil || cs == nil {
+		t.Fatalf("childrenStatusForAwait: %v", err)
+	}
+	seedCampaignAmendments(fb, parent, uuid.NewString(),
+		campaignAmendmentEntry(a, stageID, "acme/widgets#1", true),
+		campaignAmendmentEntry(parent, uuid.New(), "acme/widgets#1", true))
+	if _, ok := r.awaitChildrenCampaignAmendmentRelease(context.Background(), AwaitChildrenOutput{}, parent, cs); ok {
+		t.Error("campaign arm released on a row filed by an own child or the awaited parent; those must be skipped")
+	}
+}
+
+// TestAwaitChildren_NotLiveCampaignAmendmentDoesNotRelease: a pending request
+// on a settled stage elsewhere in the campaign keeps the wait.
+func TestAwaitChildren_NotLiveCampaignAmendmentDoesNotRelease(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	seedCampaignAmendments(fb, parent, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", false))
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout — a not-live amendment must not release", out.Status)
+	}
+	if !strings.Contains(out.Message, "no other run of its campaign filed a live amendment") {
+		t.Errorf("timeout message must name the campaign-wide condition; got %q", out.Message)
+	}
+}
+
+// TestAwaitChildren_CampaignProbeErrorDoesNotFailTheWait: a 500 from the route
+// leaves a resumable timeout, never an error.
+func TestAwaitChildren_CampaignProbeErrorDoesNotFailTheWait(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	seedCampaignAmendments(fb, parent, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true))
+	fb.campaignAmendmentsStatus = 500
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren returned an error on a best-effort campaign probe: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want the resumable timeout", out.Status)
+	}
+	if got := campaignAmendmentReads(fb, parent); got < 2 {
+		t.Errorf("campaign reads = %d, want >= 2 (the failing probe kept being attempted)", got)
+	}
+}

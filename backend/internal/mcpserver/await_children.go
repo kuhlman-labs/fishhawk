@@ -24,7 +24,10 @@ type AwaitChildrenInput struct {
 // AwaitChildrenOutput is the fishhawk_await_children response. Status is one of:
 //
 //   - "amendment_pending"     — some child filed a mid-stage scope amendment that
-//     is still pending. Decide it, then re-invoke.
+//     is still pending, OR (campaign-wide, E86.85 / #4486, only when no child
+//     has one) another run of the parent's campaign filed one whose stage has
+//     not settled. Decide it, then re-invoke. PendingAmendmentCampaignID /
+//     PendingAmendmentIssueRef are set only on the campaign-wide release.
 //   - "children_dispatchable" — some child's implement stage is awaiting a host
 //     dispatch AND its dependency slices are provably merged onto the parent's
 //     consolidated branch, so fishhawk_run_children will actually spawn it.
@@ -80,6 +83,14 @@ type AwaitChildrenOutput struct {
 	// PendingAmendment carries the WHOLE amendment row, reusing
 	// ScopeAmendmentItem exactly as fishhawk_await_stage does.
 	PendingAmendment *ScopeAmendmentItem `json:"pending_amendment,omitempty" jsonschema:"the pending mid-stage scope amendment that released the wait (status amendment_pending): id, requested paths + operations, the agent's reason, and the #983 cap headroom"`
+	// PendingAmendmentRunID names the run that filed PendingAmendment, set on
+	// EVERY amendment_pending release (E86.85 / #4486): the child on arm (1),
+	// the other campaign run on arm (1b).
+	PendingAmendmentRunID string `json:"pending_amendment_run_id,omitempty" jsonschema:"on the amendment_pending status: the run that filed pending_amendment — a child of this parent, or on a campaign-wide release (#4486) ANOTHER run of the parent's campaign. Decide it on this run"`
+	// PendingAmendmentCampaignID / PendingAmendmentIssueRef are set ONLY by the
+	// campaign-wide arm (1b) — their presence tells it from a child's own.
+	PendingAmendmentCampaignID string `json:"pending_amendment_campaign_id,omitempty" jsonschema:"set ONLY on a campaign-wide amendment_pending release (#4486): the campaign whose run OUTSIDE this fan-out filed pending_amendment. Absent when a child filed it"`
+	PendingAmendmentIssueRef   string `json:"pending_amendment_issue_ref,omitempty" jsonschema:"set ONLY on a campaign-wide amendment_pending release (#4486): the campaign item the filing run belongs to"`
 	// DispatchableChildRunIDs names every child that is dispatchable NOW, in
 	// ascending slice order (status children_dispatchable).
 	DispatchableChildRunIDs []string `json:"dispatchable_child_run_ids,omitempty" jsonschema:"the children whose implement stage awaits a host dispatch AND whose dependency slices are already merged onto the consolidated branch, in ascending slice order"`
@@ -135,6 +146,17 @@ Release conditions, checked in this order on EVERY poll including the FIRST:
                               stays recoverable). pending_amendment
                               carries the whole row and next_step is a
                               pre-filled fishhawk_decide_scope_amendment call.
+                              Campaign-wide (#4486): when no child has one, it
+                              also releases on the OLDEST pending amendment
+                              filed by ANY OTHER run of the parent's campaign
+                              whose filing stage has not settled;
+                              pending_amendment_campaign_id and
+                              pending_amendment_issue_ref are set only then,
+                              and pending_amendment_run_id / next_step name the
+                              FILING run. The fan-out has NOT released for its
+                              own reasons: decide, then re-invoke. Best-effort:
+                              an older backend, a token without read:audit or a
+                              read error keeps the wait.
   - "children_dispatchable" — some child's implement stage awaits a host
                               dispatch AND its dependency slices are provably
                               MERGED onto the parent's consolidated branch — the
@@ -226,9 +248,10 @@ than waiting for a transition that will never occur.
 
 CONCURRENT AMENDMENTS ARE SERIAL BY CONTRACT. Several children can have open
 windows at once, and this verb surfaces exactly ONE amendment per release,
-chosen deterministically: the LOWEST SLICE INDEX first (ties broken by run id so
-the order is total), and within that child the OLDEST pending request — the one
-closest to expiring. The loop is: await releases on one amendment; decide it;
+chosen deterministically: this parent's OWN children first — the LOWEST SLICE
+INDEX first (ties broken by run id so the order is total), and within that child
+the OLDEST pending request, the one closest to expiring — then the rest of the
+campaign, oldest requested_at first (#4486). The loop is: await releases on one amendment; decide it;
 re-invoke await, which releases on the next pending one; repeat until it
 releases with another status. Because every child's
 window runs concurrently while your session is free, serial decisions still land
@@ -323,7 +346,8 @@ func (r *runResolver) awaitChildren(ctx context.Context, req *mcp.CallToolReques
 }
 
 // awaitChildrenEvaluate reads ONE snapshot of the parent's fan-out and applies
-// the absolute release conditions in their fixed order: amendment_pending,
+// the absolute release conditions in their fixed order: amendment_pending
+// (the children's own (1), then the campaign-wide (1b), #4486),
 // children_dispatchable, integration_failed, child_failed (#4178), then the
 // all-terminal arm (children_failed / integration_pending / children_settled). It returns
 // (output, true, nil) to release, (zero, false, nil) to keep polling, and a
@@ -353,6 +377,7 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 		out := base
 		out.Status = "amendment_pending"
 		out.PendingAmendmentChildRunID = childID
+		out.PendingAmendmentRunID = childID
 		out.PendingAmendment = item
 		out.NextStep = &SuggestedAction{
 			Action: "fishhawk_decide_scope_amendment",
@@ -376,6 +401,14 @@ func (r *runResolver) awaitChildrenEvaluate(ctx context.Context, parentUUID uuid
 				"surfaced ONE at a time in ascending slice "+
 				"order — decide this one, then re-invoke fishhawk_await_children for the next.",
 			childID, item.ID, amendmentPathList(item), item.Reason, amendmentPollWindowText())
+		return out, true, nil
+	}
+
+	// (1b) campaign-wide amendment_pending (E86.85 / #4486) — after the
+	// children's own so a child's request keeps its slice-order precedence, and
+	// before every other arm because an open decision window anywhere in the
+	// campaign is just as time-critical.
+	if out, ok := r.awaitChildrenCampaignAmendmentRelease(ctx, base, parentUUID, cs); ok {
 		return out, true, nil
 	}
 
@@ -917,6 +950,37 @@ func (r *runResolver) awaitChildrenPendingAmendment(ctx context.Context, cs *Chi
 	return "", nil
 }
 
+// awaitChildrenCampaignAmendmentRelease is release arm (1b), the campaign-wide
+// amendment_pending (E86.85 / #4486). It probes the parent's campaign for the
+// oldest decision-live pending amendment filed OUTSIDE this fan-out: an
+// amendment on one of cs.Children is skipped because arm (1) owns it (in slice
+// order), and so is one on the awaited parent itself, so the message's "another
+// run of the campaign" is always true. Best-effort: campaignLiveAmendment
+// yields nil on any read error, keeping the wait.
+func (r *runResolver) awaitChildrenCampaignAmendmentRelease(ctx context.Context, base AwaitChildrenOutput, parentUUID uuid.UUID, cs *ChildrenStatus) (AwaitChildrenOutput, bool) {
+	own := make(map[string]bool, len(cs.Children)+1)
+	own[parentUUID.String()] = true
+	for _, c := range cs.Children {
+		own[c.RunID] = true
+	}
+	e, campaignID := r.campaignLiveAmendment(ctx, parentUUID, func(c *campaignPendingAmendment) bool {
+		return own[c.Amendment.RunID]
+	})
+	if e == nil {
+		return AwaitChildrenOutput{}, false
+	}
+	item := e.Amendment
+	out := base
+	out.Status = "amendment_pending"
+	out.PendingAmendment = &item
+	out.PendingAmendmentRunID = item.RunID
+	out.PendingAmendmentCampaignID = campaignID
+	out.PendingAmendmentIssueRef = e.IssueRef
+	out.NextStep = campaignAmendmentNextStep(e)
+	out.Message = campaignAmendmentMessage(e, campaignID, fmt.Sprintf("the fan-out of decomposed parent %s", parentUUID))
+	return out, true
+}
+
 // awaitChildrenDispatchable returns the run ids of every child the SERVER would
 // admit right now, in ascending slice order.
 //
@@ -1221,7 +1285,7 @@ func awaitChildrenTimeoutOutput(runID string, timeout int, start time.Time, hear
 			Consumes:     "none",
 			Reason:       "re-arm the in-band wait — a timeout is a resumable idempotent checkpoint, not a terminal state",
 		},
-		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, hit a fan-in failure, had a failed child blocking every remaining child, or settled within %ds. "+
+		Message: fmt.Sprintf("no child of run %s filed an amendment, became dispatchable, hit a fan-in failure, had a failed child blocking every remaining child, or settled, and no other run of its campaign filed a live amendment, within %ds. "+
 			"The wait holds nothing: re-call fishhawk_await_children to resume it (a safe idempotent no-op), "+
 			"or poll fishhawk_get_run_status every %ds (the authoritative path).",
 			runID, timeout, suggestedStageWaitPollIntervalSeconds),
@@ -1238,6 +1302,7 @@ func awaitChildrenNextStep(parentRunID string) *SuggestedAction {
 		Precondition: "children were dispatched detached on this parent",
 		Consumes:     "none",
 		Reason: "the dispatch is detached and this session is free — block here until a child files a mid-stage " +
-			"scope amendment (decidable IN BAND), another child becomes dispatchable, the fan-in fails, a failed child blocks every remaining child, or every child settles",
+			"scope amendment (decidable IN BAND), another run of the campaign files a live one (#4486), another child becomes dispatchable, " +
+			"the fan-in fails, a failed child blocks every remaining child, or every child settles",
 	}
 }
