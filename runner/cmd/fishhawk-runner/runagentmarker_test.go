@@ -322,6 +322,7 @@ var agentSpawnSiteAllowlist = map[string]allowedSpawnSite{
 	"internal/gitdiff/gitdiff.go:Runner.RunPatch":       {1, "git (Cmd test seam)"},
 	"internal/gitops/commit.go:Pusher.runOutEnv":        {1, "git (Cmd test seam)"},
 	"internal/gitops/commit.go:Pusher.probeOut":         {1, "git (Cmd test seam)"},
+	"internal/gitops/snapshot.go:Pusher.runStdinEnv":    {1, "git (Cmd test seam)"},
 	"internal/netsandbox/netsandbox.go:probeExec":       {1, "sandbox-exec availability probe"},
 	"internal/gateiso/sandbox.go:sandboxProbeExec":      {1, "gate-isolation sandbox availability probe"},
 	"internal/gateiso/runtime.go:DefaultProbes":         {1, "container runtime probe"},
