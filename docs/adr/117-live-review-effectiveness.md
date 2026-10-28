@@ -228,7 +228,7 @@ Their configuration changes often (a model substitution, #4624; persona attachme
   - A review-finding source (`later_reviewer`) and EVERY agent-recorded escape (A1.4: an agent-kind subject or a delegated request) are born `pending_judgement`.
   - Other operator-recorded sources are born `counted` with `judgement_basis: not_required`, but ONLY when the recorder presents the A1.3 credential: a non-agent-marked, non-delegated request whose credential kind is `session`, `oauth` or `oauth_as`. Any other recorder's escape (for example a `static` or `unrecorded` api token) is born `pending_judgement`, whatever its source.
   - Births deduplicate by a stable source-event identity, so neither a replay nor a double submission adds a second birth. The key for each source is:
-    - for `later_reviewer`: the concern's audit sequence;
+    - for `later_reviewer`: the concern's stable id, `concern:<concern_uuid>` (erratum E1);
     - for an acceptance or CI source: the originating audit sequence;
     - for a hand-recorded escape: an operator-supplied idempotency key.
 - **Closure.** A pending record closes exactly once, by ONE successor row that names it in `supersedes_sequence`. The server resolves the target sequence and derives `supersedes_sequence` itself, as the target's canonical unsigned base-10 representation with no leading zeroes. That same value drives the successor lookup and the deduplication (`StageID=nil`). The successor's state is `counted` (judgement `defect`) or `dismissed` (`no_defect`). The successor copies the closed record's immutable escape fields, so it cannot restate a different defect.
@@ -280,3 +280,8 @@ Their configuration changes often (a model substitution, #4624; persona attachme
 - **A round with no usable head** (`head_unknown`, a missing start row, or missing scope evidence) is EXCLUDED from attribution and from the corresponding exposure denominators. It is neither blamed nor credited, its share is reported beside the escape rate, and `unreviewed_code` is never inferred from it.
 - **Partial and omitted files** count as not seen by the round.
 - **Use.** Plan-stage attribution keeps its separate plan-revision binding. The field is additive and does not change the review prompt.
+
+**A1 erratum E1 (ratified by the Captain on 2026-10-28).**
+- **The defect.** A1.2's `later_reviewer` birth dedupe key read "the concern's audit sequence". No per-concern audit sequence exists: every concern of a review verdict is inserted in one batch sharing a single origin review sequence. Keying on it would refuse a second distinct finding from the same round.
+- **The correction.** The key is the concern's stable id, `concern:<concern_uuid>`: the stable source-event identity A1.2 intends. A replay of the same concern still dedupes.
+- **Where it came from.** Found by the claude-fable-5-1 and gpt-6-astra plan reviews of #4694 (run 72fab7c0).
