@@ -220,6 +220,100 @@ func TestForgeApprovalE2E_InlineOwnedRefusalWritesNoAuthorization(t *testing.T) 
 	}
 }
 
+// TestForgeApprovalE2E_InlineQueueUnreadableWritesNoAuthorization is the
+// store-read-error twin of the owned refusal: the in-lock merge-queue
+// ownership read fails (admqLockReadErrQueue fails ActiveForRun ONLY inside
+// the lock, so every pre-lock queue read is unaffected), so the merge answers
+// 503 merge_queue_unreadable BEFORE the fold. carol (write) APPROVED at the
+// verified head h1, so a fold that ran would approve and write a
+// merge_queue_authorized row; the committed state shows it never ran.
+func TestForgeApprovalE2E_InlineQueueUnreadableWritesNoAuthorization(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.faeInline("unr", faeGateSpecYAML)
+	w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+	w.srv.cfg.MergeQueue = admqLockReadErrQueue{Store: w.store}
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusServiceUnavailable || mqeCode(t, resp.Body.Bytes()) != "merge_queue_unreadable" {
+		t.Fatalf("merge = %d %s, want 503 merge_queue_unreadable", resp.Code, resp.Body.String())
+	}
+	w.requireNothingRecorded(r, m)
+	if n := w.gh.snapshotCalls(); n != 0 {
+		t.Fatalf("snapshot calls = %d, want 0 (the fold never ran)", n)
+	}
+}
+
+// TestForgeApprovalE2E_InlineMergedAfterGate: the PR merges between the
+// merge-candidate gate (which verified h1 before the lock) and the in-lock
+// snapshot, so the fold RUNS at the non-empty gate head, sees merged and
+// steps aside (d.Merged): 200 already_merged, never 409, with no
+// merge_queue_authorized row and no dispatch. The pre-seeded verdict row
+// makes this the RESUME shape, so the observe rung after the fold reads the
+// forge (allowForgeRead) and confirms the merge before any claim or dispatch.
+// snapshotCalls counts every review-snapshot GraphQL request the mcq fake
+// served; the fixture's snapshot is one untruncated page and no pre-lock step
+// reads it (TestForgeApprovalE2E_InlineOwnedRefusalWritesNoAuthorization pins
+// zero), so exactly one call is the in-lock fold, which distinguishes this
+// from the empty-gate-head skip that reads none.
+func TestForgeApprovalE2E_InlineMergedAfterGate(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.faeInline("mag", faeGateSpecYAML)
+	w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+	w.mqeAppend(r, CategoryMergeVerdictRecorded, map[string]any{"run_id": r.id.String(), "verdict": "ship it", "delegated": false})
+	w.srv.cfg.MergeQueue = mqmOnLockQueue{Store: w.store, onLock: func() {
+		w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+	}}
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("merge = %d %s, want 200 already_merged", resp.Code, resp.Body.String())
+	}
+	if body := decodeMergeResponse(t, resp); !body.AlreadyMerged || body.MergeQueued {
+		t.Fatalf("response = %+v, want already_merged with no merge queued", body)
+	}
+	if n := len(w.rows(r, CategoryMergeQueueAuthorized)); n != 0 {
+		t.Fatalf("merge_queue_authorized rows = %d, want 0", n)
+	}
+	if m.inlineCalls() != 0 {
+		t.Fatalf("inline dispatches = %d, want 0", m.inlineCalls())
+	}
+	if n := w.gh.snapshotCalls(); n != 1 {
+		t.Fatalf("snapshot calls = %d, want 1 (the in-lock fold ran at h1 and saw merged)", n)
+	}
+}
+
+// TestForgeApprovalE2E_InlineEmptyGateHeadMergedSkipsFold: the PR merged
+// before the POST, so the merge-candidate gate admits with an EMPTY head and
+// inlineForgeApproval's empty-gate-head branch confirms the merge through
+// the observe ladder (a live forge read) and skips the fold: 200
+// already_merged, no snapshot read, no merge_queue_authorized row, no
+// dispatch. This is a FIRST POST: the skip's observe appends one
+// merge_observation_recorded row, and the later observe rung finds that row
+// on the chain (tier a) and appends none, so exactly one row.
+func TestForgeApprovalE2E_InlineEmptyGateHeadMergedSkipsFold(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.faeInline("egh", faeGateSpecYAML)
+	w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+	w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("merge = %d %s, want 200 already_merged", resp.Code, resp.Body.String())
+	}
+	if body := decodeMergeResponse(t, resp); !body.AlreadyMerged || body.MergeQueued {
+		t.Fatalf("response = %+v, want already_merged with no merge queued", body)
+	}
+	if n := len(w.rows(r, CategoryMergeQueueAuthorized)); n != 0 {
+		t.Fatalf("merge_queue_authorized rows = %d, want 0", n)
+	}
+	if m.inlineCalls() != 0 {
+		t.Fatalf("inline dispatches = %d, want 0", m.inlineCalls())
+	}
+	if n := w.gh.snapshotCalls(); n != 0 {
+		t.Fatalf("snapshot calls = %d, want 0 (the fold was skipped)", n)
+	}
+	if n := len(w.rows(r, CategoryMergeObservationRecorded)); n != 1 {
+		t.Fatalf("merge_observation_recorded rows = %d, want 1", n)
+	}
+}
+
 // faeDelegated seeds a may_merge-ready run on faeGateSpecYAML at h1.
 func (w *mqmWorld) faeDelegated(name string) *mcqRun {
 	w.t.Helper()
