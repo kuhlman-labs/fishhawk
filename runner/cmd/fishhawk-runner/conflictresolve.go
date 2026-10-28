@@ -125,6 +125,27 @@ type conflictResolutionRequest struct {
 	Branch          string
 	BaseRef         string
 	ExpectedHeadSHA string
+	// AuthorName / AuthorEmail are the merge commit's author and committer
+	// identity: the stage's App bot identity, populated by
+	// runConflictResolutionStage from cfg.commitAuthorName/Email. Empty falls
+	// back to gitops.DefaultAuthorName/Email. The commit carries it per
+	// command, so it never depends on an identity leaked into the shared
+	// $GIT_COMMON_DIR/config (ADR-115 D2, #4648).
+	AuthorName  string
+	AuthorEmail string
+}
+
+// commitIdentity returns the merge commit's identity with the
+// gitops.DefaultAuthorName/Email fallback for an unset field.
+func (r conflictResolutionRequest) commitIdentity() (name, email string) {
+	name, email = r.AuthorName, r.AuthorEmail
+	if name == "" {
+		name = gitops.DefaultAuthorName
+	}
+	if email == "" {
+		email = gitops.DefaultAuthorEmail
+	}
+	return name, email
 }
 
 // conflictResolutionFromPrompt reads the instruction off a fetched prompt,
@@ -513,9 +534,18 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 		return res
 	}
 
+	// The identity is explicit command-scope config (ADR-115 D2, #4648): the
+	// pass runs in a linked worktree whose config is the SHARED
+	// $GIT_COMMON_DIR/config, and the runner no longer writes
+	// user.name/user.email there. Both the merge (which resolves the
+	// committer identity up front, even with --no-commit) and the commit
+	// carry it, so a host with no global identity fails neither.
+	name, email := req.commitIdentity()
+	identity := []string{"-c", "user.name=" + name, "-c", "user.email=" + email}
+
 	// (2) Merge the qualified base ref, stopping before the commit.
 	mergeRef := qualifyMergeRef(ctx, repoDir, remote, req.BaseRef)
-	mergeErr := gitRun(ctx, repoDir, "merge", "--no-commit", "--no-ff", mergeRef)
+	mergeErr := gitRun(ctx, repoDir, append(identity, "merge", "--no-commit", "--no-ff", mergeRef)...)
 
 	unmergedRaw, lsErr := gitOutRaw(ctx, repoDir, "ls-files", "--unmerged", "-z")
 	if lsErr != nil {
@@ -596,8 +626,9 @@ func runConflictResolutionPass(ctx context.Context, repoDir, remote string,
 		conflictPostAddHook(repoDir)
 	}
 	// --no-verify is belt to HardeningArgs' braces: it bypasses the pre-commit
-	// and commit-msg hooks by flag as well as by path.
-	if err := gitRun(obsCtx, repoDir, "commit", "--no-edit", "--no-verify"); err != nil {
+	// and commit-msg hooks by flag as well as by path. The identity is the
+	// command-scope config resolved before the merge.
+	if err := gitRun(obsCtx, repoDir, append(identity, "commit", "--no-edit", "--no-verify")...); err != nil {
 		return refuse(reasonCommitFailed, "commit merge: "+err.Error(), nil)
 	}
 	newHead, err := gitOut(obsCtx, repoDir, "rev-parse", "HEAD")
@@ -1410,6 +1441,7 @@ func runConflictResolutionStage(ctx context.Context, cfg config, req conflictRes
 	// and the terminal reports key off cfg.runID/cfg.stageID, never workingDir.
 	cfg.workingDir = treeDir
 	req.BaseRef = mergeRef
+	req.AuthorName, req.AuthorEmail = cfg.commitAuthorName, cfg.commitAuthorEmail
 	repoDir := treeDir
 
 	invoke := func(ictx context.Context) error {
