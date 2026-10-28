@@ -18,7 +18,7 @@ it.
 | Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off, crew escalation sent, crew escalation round-bound exhausted) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
-| Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
+| Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command — including the ADR-123 D4 refusal reply (#4755) on a workflow-v2 gate or an unverifiable gate, which names the supported channels (MCP, CLI, web UI) and records nothing | No (every command gets its own reply) |
 | Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (best-effort; the completion marker is persisted BEFORE this comment, so once it is durable a re-approval no-ops at the `priorCompletion` gate and never re-posts — the one residual is a re-post if the completion-marker append itself fails after the comment posts) |
 | Split filing refusal (#2412) | _(none at the comment; the sibling `split_filing_refused` marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` → `refuseSplitFilingOverCapPhase` (plan-gate approve of a `split_proposal` whose phase is over the implement cap) | on refusal to file any children (a phase declares more files than the resolved `max_files_changed` cap) | No (best-effort; the `split_filing_refused` marker is persisted BEFORE this comment, so once it is durable a re-approval of the still-over-cap proposal no-ops at the prior-refusal gate and never re-posts) |
 | Split parent close (#2062) | _(none at the comment; the parent thread's own stamped `fishhawk-split-parent-close` marker is the dedup record)_ | _(none)_ | `Server.handleContractChildClosed` (`issues.closed` on a filed split's contract child) | when the contract child closes as landed (any `state_reason` except `not_planned` / `duplicate`) | No (best-effort; the comment is posted BEFORE the close and deduped by re-reading the parent thread for the `fishhawk-split-parent-close` marker, so a redelivery finds the marker and posts nothing — the residual is a duplicate under two GENUINELY CONCURRENT deliveries, deliberately accepted over a lock) |
@@ -639,17 +639,24 @@ Notes:
 - The typed-reply approval path (`+1` / `lgtm` per E17.4) does NOT post its
   own slash reply (`silent=true`) — the user's typed reply *is* the
   acknowledgment. The plan-on-issue comment edit covers the broadcast.
-- **The one case where the slash-command reply surface deliberately posts
-  NOTHING at all** (E67.24 / #2621): an over-cap approve comment arriving on
-  the typed-reply (`silent=true`) channel is refused before `Submit` (#2583 —
-  the comment would become a binding approval condition, so it must not be
-  silently truncated), and the refusal posts no reply, because a passer-by
-  `+1` that happens to exceed the cap should not draw an unsolicited bot
-  comment. The standing-in machine record is the `approval_comment_refused`
+- **The two cases where the slash-command reply surface deliberately posts
+  NOTHING at all**, both refusals on the typed-reply (`silent=true`) channel
+  before `Submit`, because a passer-by `+1` should not draw an unsolicited bot
+  comment: (1) an over-cap approve comment (E67.24 / #2621; #2583 — the
+  comment would become a binding approval condition, so it must not be
+  silently truncated), payload `reason:"over_cap_approve_comment"`; (2) the
+  ADR-123 D4 channel refusal (#4755) — comment approve/reject on a
+  workflow-v2 gate, or on a gate whose approval rules cannot be verified —
+  payload `reason:"comment_channel_refused"` with `cause` ∈
+  `workflow_v2_gate` / `spec_unreadable` / `role_resolver_unconfigured` /
+  `role_resolution_failed` (plus `spec_major` except on `spec_unreadable`).
+  The standing-in machine record for both is the `approval_comment_refused`
   audit category (`Server.writeApprovalCommentRefusedAudit`, also written on
-  the non-silent slash variant with `silent:false`) — so the drop is visible
-  in the run record even though no comment exists to point at. A trace, not
-  a response: the suppression is intentional and stays.
+  the non-silent slash variant with `silent:false`, which additionally posts
+  the refusal reply) — so the drop is visible in the run record even though
+  no comment exists to point at. A trace, not a response: the suppression is
+  intentional and stays. A reaction approval forwarded by the
+  `reactionpoller` is not silent, so its channel refusal draws one reply.
 - The review-lifecycle audit categories — `plan_reviewed` /
   `implement_reviewed` (terminal verdicts), `plan_review_skipped` /
   `implement_review_skipped` (degraded gate), `plan_review_started` /
