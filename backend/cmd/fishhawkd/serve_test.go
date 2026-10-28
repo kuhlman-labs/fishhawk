@@ -2038,7 +2038,7 @@ func TestServeWiresRefinementConfig(t *testing.T) {
 // the assertion honest if the gate ever changes.
 func TestResolveIdentityProvider(t *testing.T) {
 	// Present: a GitHub provider is constructed.
-	present := resolveIdentityProvider("client-id", nil, "", "")
+	present := resolveIdentityProvider("client-id", "client-secret", nil, "", "")
 	if present == nil {
 		t.Fatal("resolveIdentityProvider with a client_id returned nil; want a GitHub provider")
 	}
@@ -2051,12 +2051,19 @@ func TestResolveIdentityProvider(t *testing.T) {
 	// otherwise the REST reads stay anonymous even when serve wires an
 	// accessor. Reflection reads the field's nil-ness without invoking it.
 	accessor := func(context.Context) (string, error) { return "tok", nil }
-	withTok := resolveIdentityProvider("client-id", accessor, "", "")
+	withTok := resolveIdentityProvider("client-id", "client-secret", accessor, "", "")
 	if got := identityProviderTokenIsNil(t, withTok); got {
 		t.Error("resolveIdentityProvider dropped the token accessor; provider.token is nil, want non-nil")
 	}
 	if got := identityProviderTokenIsNil(t, present); !got {
 		t.Error("resolveIdentityProvider(nil) left provider.token non-nil, want nil")
+	}
+
+	// Client secret (#4627): the configured secret must reach the provider's
+	// unexported clientSecret field, or every token-login mint refuses with
+	// ErrClientCredentialUnconfigured (503) in production.
+	if got := identityProviderClientSecret(t, present); got != "client-secret" {
+		t.Errorf("provider clientSecret = %q, want %q: resolveIdentityProvider dropped the OAuth client secret", got, "client-secret")
 	}
 
 	// Endpoint override (E44.2 / #1826): a configured API/OAuth base threads
@@ -2065,14 +2072,14 @@ func TestResolveIdentityProvider(t *testing.T) {
 	if got := identityProviderBaseURLs(t, present); got.api != identity.DefaultAPIBaseURL || got.oauth != identity.DefaultOAuthBaseURL {
 		t.Errorf("default provider base URLs = %+v, want GitHub defaults", got)
 	}
-	configured := resolveIdentityProvider("client-id", nil, "https://ghes.example.com/api/v3", "https://ghes.example.com")
+	configured := resolveIdentityProvider("client-id", "client-secret", nil, "https://ghes.example.com/api/v3", "https://ghes.example.com")
 	if got := identityProviderBaseURLs(t, configured); got.api != "https://ghes.example.com/api/v3" || got.oauth != "https://ghes.example.com" {
 		t.Errorf("configured provider base URLs = %+v, want the GHES hosts", got)
 	}
 
 	// Absent: nil so server.New defaults to NoOp. Feeding it through
 	// server.New proves the end-to-end fallback the seam relies on.
-	absent := resolveIdentityProvider("", nil, "", "")
+	absent := resolveIdentityProvider("", "", nil, "", "")
 	if absent != nil {
 		t.Fatalf("resolveIdentityProvider with no client_id = %#v, want nil", absent)
 	}
@@ -2391,6 +2398,22 @@ func identityProviderTokenIsNil(t *testing.T, p identity.IdentityProvider) bool 
 		t.Fatal("GitHubIdentityProvider has no token field; passthrough test is stale")
 	}
 	return f.IsNil()
+}
+
+// identityProviderClientSecret reads the constructed provider's unexported
+// clientSecret via reflection (#4627), mirroring identityProviderTokenIsNil,
+// so the secret-threading assertion needs no exported test hook.
+func identityProviderClientSecret(t *testing.T, p identity.IdentityProvider) string {
+	t.Helper()
+	gh, ok := p.(*identity.GitHubIdentityProvider)
+	if !ok {
+		t.Fatalf("provider = %T, want *identity.GitHubIdentityProvider", p)
+	}
+	f := reflect.ValueOf(gh).Elem().FieldByName("clientSecret")
+	if !f.IsValid() {
+		t.Fatal("GitHubIdentityProvider has no clientSecret field; secret-threading test is stale")
+	}
+	return f.String()
 }
 
 // identityProviderBaseURLs reads the constructed provider's unexported

@@ -1345,11 +1345,18 @@ func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderReso
 // returns nil so server.New falls back to the deny-by-default NoOp. token
 // is the optional REST-read accessor (nil → anonymous reads). Extracted so
 // the config-gated wiring seam is unit-testable without booting the server.
-func resolveIdentityProvider(oauthClientID string, token func(context.Context) (string, error), apiBaseURL, oauthBaseURL string) identity.IdentityProvider {
+//
+// oauthClientSecret is ALWAYS threaded (identity.WithClientSecret): the
+// token-login mint's client binding (#4627) authenticates GitHub's
+// check-a-token call with the client's own id + secret, and a provider
+// without it refuses every VerifyAccessToken with
+// ErrClientCredentialUnconfigured (503) rather than falling back to
+// owner-only verification.
+func resolveIdentityProvider(oauthClientID, oauthClientSecret string, token func(context.Context) (string, error), apiBaseURL, oauthBaseURL string) identity.IdentityProvider {
 	if oauthClientID == "" {
 		return nil
 	}
-	var opts []identity.Option
+	opts := []identity.Option{identity.WithClientSecret(oauthClientSecret)}
 	// Only override when the deployment configured a non-default endpoint
 	// (E44.2 / #1826). Empty values leave the GitHub hosts untouched, so an
 	// unconfigured deployment constructs exactly as before.
@@ -3349,7 +3356,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// It stays on Mode 1 (per-deployment) endpoints; a per-installation
 		// identity leg needs an interface that carries installation context — a
 		// follow-up, mirroring the deferred web-OAuth leg.
-		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken,
+		// The client secret is threaded too: it authenticates the token-login
+		// client-binding check (#4627). This block already refused to boot
+		// unless id + secret + callback are all set.
+		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, *oauthClientSecret, operatorRepoToken,
 			githubEndpoints.IdentityAPIURL, githubEndpoints.IdentityOAuthURL)
 		// Workspace-membership login gate (E44.3 / ADR-057 Amendment
 		// A2, generalized in E44.8 / #1832): invited account_members
