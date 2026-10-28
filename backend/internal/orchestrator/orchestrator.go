@@ -96,7 +96,8 @@ type GitHubAPI interface {
 
 // ConsolidatedReviewDispatcher dispatches the gating agent implement
 // review against a decomposed parent's consolidated PR diff (#1060) after
-// Advance dispatches the parent's review stage. It is implemented
+// Advance dispatches the parent's review stage — or, when acceptance runs
+// ahead of review, its acceptance stage (#4785). It is implemented
 // server-side (*server.Server): the review machinery depends on the
 // orchestrator, so calling it from here directly would close an import
 // cycle. The dispatch is best-effort and idempotent — the implementation
@@ -104,6 +105,19 @@ type GitHubAPI interface {
 // the orchestrator fires it fire-and-forget.
 type ConsolidatedReviewDispatcher interface {
 	DispatchConsolidatedReview(ctx context.Context, parentRunID uuid.UUID, base, head string)
+}
+
+// FanInVerifyGate answers whether a decomposed parent's consolidated head has a
+// SETTLED ADR-090 merge-candidate verify (#4785): passed, not_required or
+// failed. It is implemented server-side (*server.Server), which owns the
+// merge-candidate verify chain, so the orchestrator cannot read it without an
+// import cycle. Advance consults it before dispatching a decomposed parent's
+// acceptance stage in a workflow that orders acceptance ahead of review, and
+// holds acceptance `pending` while it answers false. The hook is READ-ONLY:
+// starting the verify-only pass stays inside DispatchConsolidatedReview's
+// detached goroutine, so Advance can never re-enter itself through it.
+type FanInVerifyGate interface {
+	FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (bool, error)
 }
 
 // RunCancelledObserver is notified AFTER completeRun resolves a run to the
@@ -167,7 +181,8 @@ type Orchestrator struct {
 	// ConsolidatedReview, when wired, dispatches the gating consolidated
 	// implement review for a decomposed parent run after Advance
 	// dispatches the parent's review stage with the consolidated PR
-	// present (#1060). Nil disables the dispatch — ordinary (non-
+	// present (#1060), or its acceptance stage when acceptance runs ahead
+	// of review (#4785). Nil disables the dispatch — ordinary (non-
 	// decomposed) runs and the CLI/dev posture are unaffected.
 	ConsolidatedReview ConsolidatedReviewDispatcher
 
@@ -188,6 +203,15 @@ type Orchestrator struct {
 	// CLI/dev posture: the predicates read the approved plan verbatim, which
 	// is also the fallback on a resolver error (WARN-logged).
 	EffectiveAcceptance EffectiveAcceptanceResolver
+
+	// FanInVerify, when wired, holds a decomposed parent's never-dispatched
+	// acceptance stage `pending` until the consolidated head's fan-in
+	// merge-candidate verify settles (#4785), in a workflow that orders
+	// acceptance before review. Wired by server.New as a back-reference
+	// exactly like ConsolidatedReview / EffectiveAcceptance. Nil = the
+	// CLI/dev posture: acceptance dispatches as before (the consolidated PR is
+	// still opened first and the consolidated review still fired).
+	FanInVerify FanInVerifyGate
 
 	// MaxParallelChildren is the global default cap on how many decomposed
 	// child runs may dispatch concurrently (E24.6 / #1146), wired from
@@ -249,6 +273,14 @@ type Orchestrator struct {
 	// one mutex per decomposed parent per process lifetime. The cross-process
 	// layer is run.ConsolidatedPROpenLocker, always taken SECOND.
 	consolidatedPROpenLocks sync.Map
+
+	// fanInHolds counts consecutive decomposed-parent acceptance holds per
+	// parent run (#4785), guarded by fanInHoldMu, so the hold log line carries
+	// a hold_attempt that tells a repeated hold (the verify-only pass never
+	// started — no trigger row) from the first. Observability only: in-process,
+	// reset on release and on restart.
+	fanInHoldMu sync.Mutex
+	fanInHolds  map[uuid.UUID]int
 }
 
 // lockConsolidatedPROpen acquires the in-process consolidated-PR-open mutex
@@ -573,6 +605,27 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		}
 	}
 
+	// #4785: a workflow that orders acceptance BEFORE review (feature_change)
+	// reaches a decomposed parent's acceptance stage first, and the ADR-032
+	// review-gate block below never fires there. So the consolidation tail
+	// runs here instead: open the consolidated PR, hold acceptance `pending`
+	// until the consolidated head's fan-in verify settles, then dispatch it
+	// and fire the consolidated review (below). Placed AFTER the acceptance
+	// short-circuit, so a short-circuited acceptance re-enters Advance and
+	// the review gate opens the tail as before.
+	isParentAcceptance := false
+	if next.Type == run.StageTypeAcceptance && r.DecomposedFrom == nil {
+		updated, isParent, held, err := o.consolidateBeforeAcceptance(ctx, r, stages, next)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: consolidate before acceptance: %w", err)
+		}
+		r = updated
+		isParentAcceptance = isParent
+		if held {
+			return OutcomeNoOp, nil
+		}
+	}
+
 	// ADR-032 (#714): a decomposed parent reaching its review gate opens
 	// ONE consolidated PR for the whole decomposition. The children
 	// pushed their commits onto the shared branch and opened no PR of
@@ -625,7 +678,9 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// successful dispatch; the dispatcher no-ops for ordinary runs (a
 	// DecomposedFrom==nil run with a PR but no children, e.g. a normal
 	// feature run) and dedups its own re-fire. base/head match
-	// maybeOpenConsolidatedPR exactly.
+	// maybeOpenConsolidatedPR exactly. The acceptance arm (#4785) fires it
+	// too, once acceptance is released; the later review-gate re-fire dedups
+	// through the dispatcher's started-key guard.
 	//
 	// The base is the repository's resolved default branch (#4660). An
 	// unresolved read SKIPS the review dispatch with a WARN naming the
@@ -633,7 +688,7 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// status stays none, and the operator's remedy is the first-round
 	// review re-run verb, which refuses with the same named reason until the
 	// forge read recovers.
-	if err == nil && isParentReviewGate && o.ConsolidatedReview != nil &&
+	if err == nil && (isParentReviewGate || isParentAcceptance) && o.ConsolidatedReview != nil &&
 		r.PullRequestURL != nil && *r.PullRequestURL != "" {
 		base, berr := o.runBaseBranch(ctx, r)
 		if berr != nil {
@@ -757,6 +812,113 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 		}
 	}
 	return true, nil
+}
+
+// consolidateBeforeAcceptance runs a decomposed parent's consolidation tail
+// ahead of its acceptance stage (#4785), returning (updated run, isParent,
+// held, err).
+//
+//	(a) A run with no implement stage, or no decomposed children, is
+//	    untouched: (r, false, false, nil).
+//	(b) The consolidated PR is opened when the run carries no URL yet, anchored
+//	    on the run's review-type stage (falling back to next) so
+//	    consolidated_pr_opened keeps its review-stage anchor. An open error is
+//	    returned so the next Advance retries — the review-gate posture.
+//	(c) With FanInVerify and ConsolidatedReview wired and the PR present, the
+//	    read-only FanInVerify hook decides. Unsettled: fire
+//	    DispatchConsolidatedReview (which starts the verify-only pass on an
+//	    unverified head and holds otherwise), log, and report held — acceptance
+//	    stays `pending`. A hook error is returned (acceptance stays pending).
+//	(d) Otherwise not held: the caller dispatches acceptance and fires the
+//	    consolidated review.
+//
+// holdAttempts counts consecutive holds per parent in-process so a repeated
+// hold with no trigger row (the pass could not start) is distinguishable in
+// the log from the first one.
+func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.Run, stages []*run.Stage, next *run.Stage) (*run.Run, bool, bool, error) {
+	// Only an implement stage fans out (ADR-025 D4), so a run with none can
+	// never be a decomposed parent: skip the children lookup entirely.
+	hasImplement := false
+	for _, s := range stages {
+		if s.Type == run.StageTypeImplement {
+			hasImplement = true
+			break
+		}
+	}
+	if !hasImplement {
+		return r, false, false, nil
+	}
+	children, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &r.ID,
+		Limit:          1,
+	})
+	if err != nil {
+		return r, false, false, fmt.Errorf("list decomposed children: %w", err)
+	}
+	if len(children) == 0 {
+		return r, false, false, nil
+	}
+
+	if r.PullRequestURL == nil || *r.PullRequestURL == "" {
+		reviewStage := next
+		for _, s := range stages {
+			if s.Type == run.StageTypeReview {
+				reviewStage = s
+				break
+			}
+		}
+		updated, err := o.maybeOpenConsolidatedPR(ctx, r, reviewStage)
+		if err != nil {
+			return r, true, false, fmt.Errorf("open consolidated pr: %w", err)
+		}
+		r = updated
+	}
+
+	base := o.DefaultRef
+	if base == "" {
+		base = "main"
+	}
+	if o.FanInVerify != nil && o.ConsolidatedReview != nil &&
+		r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		fanInSettled, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
+		if err != nil {
+			return r, true, false, fmt.Errorf("fan-in verify state: %w", err)
+		}
+		if !fanInSettled {
+			o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: decomposed parent acceptance held until the consolidated fan-in verify settles; release it by dispatching the parent's re-opened IMPLEMENT stage (the verify-only pass), not the acceptance stage",
+				slog.String("run_id", r.ID.String()),
+				slog.String("acceptance_stage_id", next.ID.String()),
+				slog.String("consolidated_branch", consolidatedBranch(r.ID)),
+				slog.Int("hold_attempt", o.noteFanInAcceptanceHold(r.ID)),
+			)
+			return r, true, true, nil
+		}
+	}
+	o.clearFanInAcceptanceHold(r.ID)
+	return r, true, false, nil
+}
+
+// noteFanInAcceptanceHold increments and returns the in-process consecutive
+// hold count for a parent (#4785). A count above 1 on a parent whose implement
+// stage was never re-opened means the verify-only pass could not start (no
+// trigger row): see the hold residual in the README.
+func (o *Orchestrator) noteFanInAcceptanceHold(runID uuid.UUID) int {
+	o.fanInHoldMu.Lock()
+	defer o.fanInHoldMu.Unlock()
+	if o.fanInHolds == nil {
+		o.fanInHolds = make(map[uuid.UUID]int)
+	}
+	o.fanInHolds[runID]++
+	return o.fanInHolds[runID]
+}
+
+// clearFanInAcceptanceHold drops the parent's hold count once acceptance is
+// released.
+func (o *Orchestrator) clearFanInAcceptanceHold(runID uuid.UUID) {
+	o.fanInHoldMu.Lock()
+	defer o.fanInHoldMu.Unlock()
+	delete(o.fanInHolds, runID)
 }
 
 // maybeOpenConsolidatedPR opens the single consolidated PR for a

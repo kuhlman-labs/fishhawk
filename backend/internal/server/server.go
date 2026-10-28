@@ -1536,6 +1536,9 @@ func New(cfg Config) *Server {
 	// and slice-1's drive gate parks every fan-out parent forever.
 	if cfg.Orchestrator != nil {
 		cfg.Orchestrator.ConsolidatedReview = s
+		// #4785: the read-only fan-in verify readiness hook that holds a
+		// decomposed parent's acceptance until the consolidated head settles.
+		cfg.Orchestrator.FanInVerify = s
 		// #3389: completeRun's cancelled resolution (a PR closed without
 		// merge cancels the review stage, then the run) reaches the same
 		// dropped-retirement recorder the REST and budget cancel sinks call.

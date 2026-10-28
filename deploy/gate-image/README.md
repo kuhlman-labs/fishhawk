@@ -36,6 +36,18 @@ from apt `zsh`, `jq`, `python3` (+ `python3-venv`), `lsof`, `netcat-openbsd`
 `/opt/check-jsonschema`, because bookworm's python is PEP 668
 externally-managed). Deliberately absent: `docker`, `kubectl`, `kind`, `node`.
 
+**git version (#4767).** Debian bookworm's `git`, 2.39.5 today
+(`docker run --rm --entrypoint git fishhawk-gate:local --version`). It is
+codename-pinned through the `golang:${GO_VERSION}-bookworm` base, so it moves
+only within 2.39.x security updates and never crosses git 2.56, which began
+writing a remote-tracking ref on `git push <url>`. It is deliberately NOT
+exact-pinned: a superseded bookworm `.deb` leaves the suite, so an exact
+`git=<ver>` pin would break a rebuild. The URL-push behaviour is neutralized in
+code regardless (`runner/internal/gitops`, `runner/README.md` § "URL-push
+tracking-ref guard"). The CI runner's git (the ubuntu image) DOES float ahead of
+this image and of operator hosts; `TestURLPush_LeavesNoTrackingRef_OnInstalledGit`
+covers whatever it ships. No Dockerfile change, so no image rebuild.
+
 ## Pins and the drift chain
 
 | Dockerfile ARG | Held to (by `scripts/check-gate-image`) |

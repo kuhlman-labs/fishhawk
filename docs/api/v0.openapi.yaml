@@ -5915,6 +5915,76 @@ components:
             system actor with `trigger: status_read`); any other caller only
             reads the hold and never triggers a release. A release failure
             never fails the read: the hold is reported as still active.
+        pending_amendments:
+          $ref: '#/components/schemas/CampaignPendingAmendments'
+          description: |
+            Every pending scope amendment on any run of the campaign (E86.85 /
+            #4486), the same block `GET /v0/runs/{run_id}/campaign-pending-amendments`
+            returns. ABSENT means not computed: the scope-amendment repository
+            is unconfigured, the caller may not read it (a run-bound
+            `mcp:run:<uuid>` token, or a token without `read:audit`), or the
+            read failed (logged; the status read never fails on it). PRESENT
+            with `items: []` means computed, none pending.
+
+    CampaignPendingAmendments:
+      type: object
+      description: |
+        The pending scope amendments on every run of one campaign (E86.85 /
+        #4486): each item's linked run, whatever the item state, plus its
+        `parent_run_id` / `decomposed_from` descendants, bounded at 64 runs.
+        `items` is always an array, oldest `requested_at` first.
+      required: [items, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPendingAmendment' }
+        truncated:
+          type: boolean
+          description: True when the 64-run cap stopped the enumeration, so runs past it were not read.
+
+    CampaignPendingAmendment:
+      type: object
+      description: One pending scope amendment on a run of the campaign.
+      required: [issue_ref, item_run_id, stage_state, decision_live, amendment]
+      properties:
+        issue_ref:
+          type: string
+          description: The campaign item the filing run belongs to.
+        item_run_id:
+          type: string
+          format: uuid
+          description: The campaign item's linked run (the filing run itself, or the ancestor a slice or recovery child descends from).
+        stage_state:
+          type: string
+          description: The filing stage's current state.
+        decision_live:
+          type: boolean
+          description: |
+            True while the filing stage has not settled, so an agent may still
+            be waiting on the decision. A settled (for example failed) stage's
+            still-pending row is listed with `false`.
+        amendment:
+          $ref: '#/components/schemas/ScopeAmendment'
+
+    RunCampaignPendingAmendments:
+      type: object
+      description: The `GET /v0/runs/{run_id}/campaign-pending-amendments` body.
+      required: [run_id, campaign_id, items, truncated]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+          description: The anchor run.
+        campaign_id:
+          type: [string, "null"]
+          format: uuid
+          description: The resolved campaign, or null (never omitted) when the run is in no campaign or its ancestry cannot be resolved.
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPendingAmendment' }
+        truncated:
+          type: boolean
+          description: True when the 64-run cap stopped the enumeration.
 
     CampaignDependencyRefresh:
       type: object
@@ -18496,6 +18566,53 @@ paths:
           description: '`internal_error` — the run read or the live-run listing failed.'
         '503':
           description: '`run_repo_unconfigured` — the run repository is not configured.'
+
+  /v0/runs/{run_id}/campaign-pending-amendments:
+    get:
+      operationId: getRunCampaignPendingAmendments
+      summary: Pending scope amendments on every run of this run's campaign
+      description: |
+        E86.85 / #4486. Every PENDING mid-stage scope amendment on any run of
+        the campaign this run belongs to, so a driver blocked waiting on one
+        run sees an amendment filed by a different run of the same campaign.
+        The campaign is resolved through the run's ancestry (the run itself,
+        a decomposition slice, or a recovery child of a campaign item's run).
+        The run set is every campaign item's linked run, whatever the item
+        state, plus its `parent_run_id` / `decomposed_from` descendants,
+        bounded at 64 runs (`truncated: true` when the cap stopped the
+        enumeration). Items are ordered oldest `requested_at` first.
+        `decision_live` is true while the filing stage has not settled, so an
+        agent may still be waiting on the decision; a settled stage's
+        still-pending row is listed with `decision_live: false`. Read-only.
+
+        A run in no campaign (or whose ancestry cannot be resolved) answers
+        200 with `campaign_id: null` and `items: []`. Any read failure is a
+        500; there is no partial result.
+
+        Auth: the payload names other runs' amendment paths and reasons, so a
+        run-bound `mcp:run:<uuid>` token is refused `403 run_token_forbidden`
+        even for its own run. Every other token caller must hold `read:audit`;
+        a cookie-session operator passes.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The campaign's pending amendments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunCampaignPendingAmendments' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID.'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` — a run-bound `mcp:run:<uuid>` token (own run included); or `insufficient_scope` — a token missing the `read:audit` scope.'
+        '404':
+          description: '`run_not_found` — no run with that id.'
+        '500':
+          description: '`internal_error` — the run read, the campaign-membership walk, the campaign item listing, a descendant run listing, an amendment listing or a stage read failed.'
+        '503':
+          description: '`run_repo_unconfigured`, `campaign_repo_unconfigured` or `scope_amendment_unconfigured` — the run, campaign or scope-amendment repository is not configured.'
 
   /v0/runs/{run_id}/budget:
     get:
