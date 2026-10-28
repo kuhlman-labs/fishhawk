@@ -144,6 +144,58 @@ func TestSnapshot_UntrackedSurvivesIgnoredExcluded(t *testing.T) {
 	}
 }
 
+// TestSnapshot_NewlyIgnoredUntrackedSurvivesGitignoreEdit pins the revert
+// order: a stage that edits .gitignore to ignore an EXISTING untracked file
+// leaves that file out of the snapshot (it is ignored under the working-tree
+// rules), so the revert must clean under those same rules — restoring the
+// edited .gitignore first would un-ignore it and the clean would delete the
+// only copy.
+func TestSnapshot_NewlyIgnoredUntrackedSurvivesGitignoreEdit(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		paths []string
+	}{
+		{"whole tree", nil},
+		{"pathspec", []string{".gitignore", "keep.log"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := newSnapshotRepo(t)
+			ctx := context.Background()
+			p := &Pusher{}
+
+			snapWriteFile(t, repo, "keep.log", "operator data\n")
+			snapWriteFile(t, repo, ".gitignore", "ignored.txt\nkeep.log\n")
+
+			snap, created, err := p.SnapshotWorkTree(ctx, repo, "stage-1", tc.paths)
+			if err != nil || !created {
+				t.Fatalf("SnapshotWorkTree = (%+v, %v, %v), want a created snapshot", snap, created, err)
+			}
+			if got := snapReadFile(t, repo, ".gitignore"); got != "ignored.txt\n" {
+				t.Errorf(".gitignore after snapshot = %q, want HEAD content", got)
+			}
+			if !snapFileExists(repo, "keep.log") {
+				t.Fatal("keep.log deleted by the snapshot revert, though the edited .gitignore excluded it from the snapshot")
+			}
+			if got := snapReadFile(t, repo, "keep.log"); got != "operator data\n" {
+				t.Errorf("keep.log after snapshot = %q, want untouched", got)
+			}
+			if out, err := exec.Command("git", "-C", repo, "rev-parse", "--verify", "--quiet", snap.SHA+"^3").Output(); err == nil {
+				t.Errorf("snapshot has an untracked commit %s, want none (keep.log is ignored by the edited .gitignore)", strings.TrimSpace(string(out)))
+			}
+
+			if err := p.RestoreSnapshot(ctx, repo, snap); err != nil {
+				t.Fatalf("RestoreSnapshot: %v", err)
+			}
+			if got := snapReadFile(t, repo, ".gitignore"); got != "ignored.txt\nkeep.log\n" {
+				t.Errorf(".gitignore after restore = %q, want the edit", got)
+			}
+			if got := snapReadFile(t, repo, "keep.log"); got != "operator data\n" {
+				t.Errorf("keep.log after restore = %q, want untouched", got)
+			}
+		})
+	}
+}
+
 func TestSnapshot_SiblingWorktreesRestoreOwnSnapshot(t *testing.T) {
 	repo := newSnapshotRepo(t)
 	ctx := context.Background()

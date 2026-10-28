@@ -210,31 +210,40 @@ func (p *Pusher) commitIndexTree(ctx context.Context, repoDir string, indexEnv, 
 }
 
 // revertSnapshotted returns the snapshotted part of the working tree to HEAD
-// the way stash push does. With no paths: `reset --hard` then `clean -d`
-// (no -x, so ignored files stay). With paths: unstage them, check the
-// modified/deleted ones out from the index, and clean the untracked ones —
-// every file outside paths is untouched.
+// the way stash push does. With no paths: `clean -d` (no -x, so ignored files
+// stay) then `reset --hard`. With paths: unstage them, clean the untracked
+// ones, then check the modified/deleted ones out from the index — every file
+// outside paths is untouched.
+//
+// The clean always runs BEFORE any tracked file is restored, so it judges
+// "ignored" by the same working-tree rules the snapshot's untracked listing
+// used. Restoring an edited .gitignore first would un-ignore a file the edit
+// newly ignored — a file the snapshot excluded — and the clean would then
+// delete it with no copy saved anywhere (builtin stash orders its clean
+// before its reset for the same reason).
 func (p *Pusher) revertSnapshotted(ctx context.Context, repoDir string, paths []string) error {
 	if len(paths) == 0 {
-		if err := p.run(ctx, repoDir, "reset", "--hard", "-q"); err != nil {
+		if err := p.run(ctx, repoDir, "clean", "--force", "--quiet", "-d"); err != nil {
 			return err
 		}
-		return p.run(ctx, repoDir, "clean", "--force", "--quiet", "-d")
+		return p.run(ctx, repoDir, "reset", "--hard", "-q")
 	}
 	pathspec := append([]string{"--"}, paths...)
 	if err := p.run(ctx, repoDir, append([]string{"reset", "-q"}, pathspec...)...); err != nil {
+		return err
+	}
+	if err := p.run(ctx, repoDir, append([]string{"clean", "--force", "--quiet", "-d"}, pathspec...)...); err != nil {
 		return err
 	}
 	modified, err := p.runOut(ctx, repoDir, append([]string{"ls-files", "-z", "--modified"}, pathspec...)...)
 	if err != nil {
 		return err
 	}
-	if modified != "" {
-		if _, err := p.runStdinEnv(ctx, repoDir, nil, modified, "checkout-index", "-z", "--force", "--stdin"); err != nil {
-			return err
-		}
+	if modified == "" {
+		return nil
 	}
-	return p.run(ctx, repoDir, append([]string{"clean", "--force", "--quiet", "-d"}, pathspec...)...)
+	_, err = p.runStdinEnv(ctx, repoDir, nil, modified, "checkout-index", "-z", "--force", "--stdin")
+	return err
 }
 
 // RestoreSnapshot reapplies snap onto the current HEAD with `git stash apply
