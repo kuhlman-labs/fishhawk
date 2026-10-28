@@ -151,7 +151,11 @@ func CanonicalMember(member, forge string) string {
 // Rule 3 implements the 2026-10-08 ruling that approver gates take the
 // forge-verified "github:<login>" identity and never a static MCP-token
 // subject. It mirrors gitLabLoginFromSubject, which already refuses an
-// unqualified bare login as not provably a forge account. An empty list or an
+// unqualified bare login as not provably a forge account. Rule 3 is a
+// SUBJECT-SHAPE rule only: it cannot tell how the presenting credential was
+// minted, so a static API token whose subject is spelled github:<login> passes
+// it. The credential-kind leg is enforced by the server caller through
+// ForgeVerifiedCredential (#4633). An empty list or an
 // empty subject returns false: an empty list is "no restriction", which is the
 // CALLER's decision (it must not consult SubjectListed then), never "everyone
 // is listed".

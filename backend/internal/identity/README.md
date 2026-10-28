@@ -31,10 +31,26 @@ The ONE implementation of the workflow spec's `approvals.members` rule; the serv
 
 1. A member with a provider prefix (`ProviderOf(m) != ""`, e.g. `github:kuhlman-labs`) is used **verbatim**.
 2. A plain member (`alice`) is qualified with the RUN's forge family: `CanonicalMember("alice", "github") == "github:alice"`.
-3. The SUBJECT is **never** qualified and must already be a FORGE identity (`github:` / `gitlab:`). A plain subject (a static API token such as `brett@local-mcp`, `operator-agent/...`, `anonymous`) and a non-forge-qualified one (the run-bound MCP subject `mcp:run:<uuid>`) match no member — even one spelled identically. This is the 2026-10-08 ruling that approver gates take the forge-verified `github:<login>` identity, never a static MCP-token subject, and mirrors `gitLabLoginFromSubject`'s refusal of an unqualified bare login.
+3. The SUBJECT is **never** qualified and must already be FORGE-SHAPED (`github:` / `gitlab:`). A plain subject (`brett@local-mcp`, `operator-agent/...`, `anonymous`) and a non-forge-qualified one (the run-bound MCP subject `mcp:run:<uuid>`) match no member — even one spelled identically. This mirrors `gitLabLoginFromSubject`'s refusal of an unqualified bare login. Rule 3 is a **subject-shape** rule only: a static API token whose subject is spelled `github:<login>` passes it. Whether the presenting credential was forge-verified is the separate credential-kind leg below, enforced by the server caller (#4633).
 4. Byte-exact comparison after 1/2: no case folding, no trimming — a casing mismatch refuses, never admits.
 
 An empty list or empty subject returns `false`; "empty list = no restriction" is the CALLER's decision (it must not call `SubjectListed` then). Pinned by `TestSubjectListed` / `TestCanonicalMember`; the static-subject and `mcp:run:` rows are the counterfactual vehicle for rule 3 (qualifying the subject turns them true).
+
+### Credential kinds: `ForgeVerifiedCredential` (#4633)
+
+`credential.go` is the ONE forge-neutral vocabulary for how the credential that authenticated a request was minted, plus its allow-list. Kinds are derived ONCE, by `CredentialKind(sessionID, tokenID, oauthAudience, subject, authMethod)`, which takes the auth middleware's trusted markers as arguments (order: `session`; `oauth_as`, checked before `auth_method`; no token marker → `unknown`; `mcp_run`; then `AuthMethodCredentialKind`: `oauth` / `static` / empty → `unrecorded` / other → `unknown`). The server's approval gate (`approvalCredentialKind`, a thin adapter over `CredentialKind`, in `checkApprovalPredicates`) and `fishhawkd approver-members` (`AuthMethodCredentialKind` for a historical row's `auth_method`) both classify through it and consult `ForgeVerifiedCredential`, so the gate and the inventory cannot disagree. The rule's decision record is ADR-123 (#4750), RATIFIED 2026-10-27.
+
+| Kind | Constant | Source | Forge-verified |
+|---|---|---|---|
+| `session` | `CredentialSession` | browser session; `auth.SignIn` is called only from the forge OAuth callback | yes |
+| `oauth` | `CredentialDeviceFlow` | api token with `auth_method='oauth'` (`IssueOAuth`, device-flow mint only) | yes |
+| `oauth_as` | `CredentialOAuthAS` | authorization-server `fho_` token; consent refuses without a forge session | yes |
+| `static` | `CredentialStatic` | `fishhawkd token issue`, or a child token from `POST /v0/tokens` | no |
+| `unrecorded` | `CredentialUnrecorded` | api token with an empty `auth_method` | no |
+| `mcp_run` | `CredentialMCPRun` | run-bound MCP token (`mcp:run:<uuid>`) | no |
+| `unknown` | `CredentialUnknown` | any other `auth_method`, or an identity with no credential marker | no |
+
+It is an ALLOW-LIST: the default branch refuses, so the empty string, an unrecognised value and a differently-cased spelling (`OAUTH`) are all refused. `ForgeVerifiedKinds` lists the three admitted kinds in stable order for refusal details. Pinned by `TestForgeVerifiedCredential`; its false rows are the counterfactual vehicle for the default deny (a default `true` flips them).
 
 ## GitLab implementation (`gitlab.go`, E66.4 / #2392)
 
