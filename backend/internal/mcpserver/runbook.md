@@ -53,7 +53,11 @@ One issue → one run → one PR.
    pending mid-stage scope amendment returns status `amendment_pending` with the
    amendment row and a pre-filled `fishhawk_decide_scope_amendment` `next_step`,
    so dispatch's in-band amendment channel is observable from the same wait —
-   decide, then re-arm the wait for the settlement. A `timeout` is discriminated
+   decide, then re-arm the wait for the settlement. On a campaign run it ALSO
+   releases `amendment_pending` for a live amendment filed by ANY OTHER run of
+   the campaign (#4486; `pending_amendment_campaign_id` set, `next_step`
+   pre-filled with the FILING run) — the awaited stage has not released for its
+   own reasons. A `timeout` is discriminated
    by `timeout_kind` (#3626): `client_wait_cap` says only that YOUR wait cap
    expired, and it is a health claim about the stage ONLY when the message names
    the remaining agent budget a health read actually observed — then it is the
@@ -895,7 +899,16 @@ The PRIMARY signal is `fishhawk_await_stage` (#2588): filing an amendment does
 NOT park the stage — it stays `running` — so the wait carries a second release
 condition and returns status `amendment_pending` with the amendment row (paths,
 reason, cap headroom) and a pre-filled `fishhawk_decide_scope_amendment`
-`next_step`. Decide from that response, then re-arm the wait. The FALLBACK, when
+`next_step`. Decide from that response, then re-arm the wait. A blocked wait
+now also surfaces campaign-wide live amendments (#4486): `fishhawk_await_stage`
+and `fishhawk_await_children` on any run of a campaign release
+`amendment_pending` for the oldest pending amendment on ANOTHER campaign run
+whose stage has not settled, with `pending_amendment_campaign_id`,
+`pending_amendment_issue_ref` and `pending_amendment_run_id` naming it and
+`next_step` deciding it on the FILING run. `fishhawk_get_campaign_status`
+lists every pending one (`pending_amendments`, `decision_live` per entry;
+absent without `read:audit`). `fishhawk_await_review`, `fishhawk_await_audit`,
+`fishhawk_run_stage` and `fishhawk_drive_run` do NOT carry this release. The FALLBACK, when
 you are not holding a wait: watch the runner log for `scope_amendment_pending`
 (the runner-log event), not `scope_amendment_requested` (the audit category);
 missing it lets the agent loop on its wait-poll until the stage is killed.
