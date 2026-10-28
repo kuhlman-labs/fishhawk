@@ -139,7 +139,8 @@ func (g *Graph) reverseClosure(seeds []string) map[string]bool {
 //   - any other path (a non-Go file, or a .go file outside every package
 //     directory) maps to EVERY ancestor directory, its own first, that is a
 //     package directory in the graph. An unmatched .go file is an error; an
-//     unmatched non-Go file maps to nothing (inert).
+//     unmatched non-Go file maps to nothing, and the CALLER decides whether
+//     the declaration makes it inert or it is unclassified (ADR-124 D3).
 func (g *Graph) packagesFor(p string) ([]string, error) {
 	base := path.Base(p)
 	switch base {
