@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"reflect"
 	"strings"
@@ -354,6 +355,99 @@ func TestFanin_Pass(t *testing.T) {
 	rec.assertC3(t)
 	if _, err := os.Stat(execs[0].dir); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("executed clone %s was not discarded: %v", execs[0].dir, err)
+	}
+}
+
+// TestFaninMerge_UsesJobIdentityWithoutConfigWrite (ADR-115 D2, #4648): the
+// fan-in merge commits carry the fan-in identity as author AND committer, set
+// per command by hostJobGitRun, and the merge clone's config gains no
+// user.name, user.email or maintenance.auto key. An AMBIENT identity is set in
+// the process env first, so a runner that dropped IdentityEnv would record
+// "ambient" (or fail under GIT_CONFIG_GLOBAL=/dev/null), never the fan-in one.
+// Non-parallel: t.Setenv.
+func TestFaninMerge_UsesJobIdentityWithoutConfigWrite(t *testing.T) {
+	for _, k := range []string{"GIT_AUTHOR_NAME", "GIT_COMMITTER_NAME"} {
+		t.Setenv(k, "ambient")
+	}
+	for _, k := range []string{"GIT_AUTHOR_EMAIL", "GIT_COMMITTER_EMAIL"} {
+		t.Setenv(k, "ambient@example.invalid")
+	}
+	f := newScanFixture(t)
+	r, rec := faninRun(t, f, []string{"."}, "a", "d")
+	var mu sync.Mutex
+	var idents []string
+	configKeys := map[string]string{}
+	configRead := false
+	rec.inspect = func(dir string) {
+		out, err := exec.Command("git", "-C", dir, "log", "--merges", "--format=%an <%ae> / %cn <%ce>").Output()
+		mu.Lock()
+		defer mu.Unlock()
+		if err != nil {
+			idents = append(idents, "log failed: "+err.Error())
+			return
+		}
+		idents = append(idents, strings.Split(strings.TrimSpace(string(out)), "\n")...)
+		if mats := rec.of("materialize"); len(mats) > 0 {
+			cfgPath := filepath.Join(mats[0].dest, ".git", "config")
+			if _, err := os.Stat(cfgPath); err == nil {
+				configRead = true
+			}
+			for _, key := range []string{"user.name", "user.email", "maintenance.auto"} {
+				if v, err := exec.Command("git", "config", "--file", cfgPath, "--get", key).Output(); err == nil {
+					configKeys[key] = strings.TrimSpace(string(v))
+				}
+			}
+		}
+	}
+	o := executeFaninJob(context.Background(), r)
+	if o.Verdict != sjVerdictPass {
+		t.Fatalf("verdict %s/%s, want pass (%+v)", o.Verdict, o.Reason, o.Evidence)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	want := faninCommitterName + " <" + faninCommitterEmail + "> / " + faninCommitterName + " <" + faninCommitterEmail + ">"
+	if len(idents) != 2 {
+		t.Fatalf("merge commits = %q, want the two fan-in merges", idents)
+	}
+	for _, got := range idents {
+		if got != want {
+			t.Errorf("fan-in merge identity = %q, want %q", got, want)
+		}
+	}
+	if !configRead {
+		t.Fatal("the merge clone's config was never read: the no-write assertion would be vacuous")
+	}
+	if len(configKeys) != 0 {
+		t.Errorf("merge clone config gained %v, want no user.name/user.email/maintenance.auto write", configKeys)
+	}
+}
+
+// TestHostJobGitRun_CarriesPinsAndIdentity (ADR-115 D2, #4648): every
+// specialist-job git child carries the maintenance pins and the fan-in
+// identity as command-scope env, independent of the process-wide install
+// (cleared here). The fixture's repo-local maintenance.auto=true / gc.auto=6700
+// is what a child without the pins reads (GIT_CONFIG_GLOBAL=/dev/null drops the
+// package TestMain's global pin). A malformed inherited GIT_CONFIG_COUNT fails
+// the call without spawning git. Non-parallel: t.Setenv.
+func TestHostJobGitRun_CarriesPinsAndIdentity(t *testing.T) {
+	isolateGitConfigEnv(t)
+	repo := maskedMaintenanceRepo(t)
+	ctx := context.Background()
+	for key, want := range map[string]string{"maintenance.auto": "false", "gc.auto": "0"} {
+		out, code, err := hostJobGitRun(ctx, repo, []string{"config", "--get", key})
+		if err != nil || code != 0 || strings.TrimSpace(out) != want {
+			t.Errorf("hostJobGitRun config --get %s = (%q, %d, %v), want %q", key, out, code, err, want)
+		}
+	}
+	for _, v := range []string{"GIT_AUTHOR_IDENT", "GIT_COMMITTER_IDENT"} {
+		out, code, err := hostJobGitRun(ctx, repo, []string{"var", v})
+		if want := faninCommitterName + " <" + faninCommitterEmail + ">"; err != nil || code != 0 || !strings.HasPrefix(out, want) {
+			t.Errorf("hostJobGitRun var %s = (%q, %d, %v), want prefix %q", v, out, code, err, want)
+		}
+	}
+	t.Setenv("GIT_CONFIG_COUNT", "x")
+	if _, code, err := hostJobGitRun(ctx, repo, []string{"rev-parse", "HEAD"}); err == nil || code != -1 || !strings.Contains(err.Error(), "GIT_CONFIG_COUNT") {
+		t.Errorf("hostJobGitRun under GIT_CONFIG_COUNT=x = (code %d, %v), want -1 and an error naming GIT_CONFIG_COUNT", code, err)
 	}
 }
 
