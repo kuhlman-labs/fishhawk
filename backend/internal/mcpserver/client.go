@@ -4975,6 +4975,11 @@ type CampaignStatus struct {
 	// DispatchHold is the campaign's active hotfix dispatch hold (E83.100 /
 	// #4234); absent when the campaign is not held.
 	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty"`
+	// PendingAmendments is the campaign-wide pending scope-amendment block
+	// (E86.85 / #4486); absent when the backend did not compute it (an older
+	// backend, a read failure, or a caller without read:audit) — which is not
+	// the same claim as a present block with no items.
+	PendingAmendments *campaignPendingAmendments `json:"pending_amendments,omitempty"`
 }
 
 // campaignDispatchHold mirrors the backend's dispatchHoldPayload
