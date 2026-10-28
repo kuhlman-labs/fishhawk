@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -379,6 +380,16 @@ type Config struct {
 	// workflow_dispatch). Built on top of GitHubTokens. Nil when
 	// GitHubTokens is nil.
 	GitHub *githubclient.Client
+
+	// DefaultBranch resolves a run repository's base branch from the forge
+	// default_branch (#4660) — the first-round review re-run's compare base
+	// and the other server-side base reads resolve through
+	// resolveRunDefaultBranch over it. fishhawkd wires the GitHub client's
+	// shared resolver (githubclient.Client.DefaultBranches), the SAME
+	// instance the orchestrator holds. Nil stays nil — server.New derives
+	// nothing — so every read refuses with resolver_unconfigured rather than
+	// guessing a branch.
+	DefaultBranch defaultbranch.Source
 
 	// DeploySecretLookup resolves a webhook deploy delegate's
 	// executor.delegate.secret_env at deploy dispatch (E45.57 / #3497):
