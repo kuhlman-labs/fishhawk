@@ -1453,6 +1453,7 @@ func (s *Server) approveStageAs(ctx context.Context, id Identity, p approveActio
 		snapshot.PredicateResult = "satisfied"
 		snapshot.MembersPrincipal = p.PredicateResolution.MembersPrincipal
 		snapshot.MembersListed = p.PredicateResolution.MembersListed
+		snapshot.MembersCredential = p.PredicateResolution.MembersCredential
 	}
 	// Persist the enriched approval audit BEFORE any advance (#1351) so a
 	// dispatch racing the transition observes it. Best-effort append.
@@ -1630,11 +1631,27 @@ func (s *Server) finishApprovalAdvance(ctx context.Context, p approveActionParam
 // the submission is delegated / agent-kind (never forge-gated), it returns
 // (&predicateResolution{MembersPrincipal, MembersListed: &true}, true)
 // BEFORE resolvePredicates runs — no forge call; otherwise the forge leg runs
-// and its satisfied resolution carries the same two members fields. An
+// and its satisfied resolution carries the same members fields. An
 // unlisted principal is refused 403 approver_predicate_unmet
 // (details.predicate:"members") with an approval_predicate_rejected audit
-// row and no approval row. A listed delegated / agent submission is ADMITTED
-// and still never COUNTED (the #1709 agent floor). This function enforces
+// row and no approval row.
+//
+// The members leg carries a CREDENTIAL leg (#4633; ADR-123, #4750, RATIFIED
+// 2026-10-27): when the principal IS the presenting credential's own
+// subject (a direct submission, or a delegated human-kind one), a listed
+// principal whose credential is not a forge-verified kind
+// (identity.ForgeVerifiedCredential over identity.CredentialKind: a static
+// or unrecorded api token, an unknown auth_method, no credential marker) is
+// refused 403 approver_predicate_unmet with details.reason
+// credential_not_forge_verified, the same rejection audit and no row. It
+// covers every approval-row gate (plan, deploy, approval-row review,
+// grooming/upkeep/comms), all of which reach this function through POST
+// /v0/stages/{stage_id}/approvals. A delegated agent-kind submission
+// (principal = the seated captain) is not credential-evaluated, the
+// in-process campaign auto-driver path never reaches this function, and the
+// count-time half (approveStageAs) does not re-check the credential. A listed
+// delegated / agent submission is ADMITTED and still never COUNTED (the
+// #1709 agent floor). This function enforces
 // members at APPROVAL-ROW gates: a merge-settled review gate
 // (resolveReviewStageOnMerge) records no approval row and never reaches it,
 // and is members-checked at merge time by mergeSettledMembersAdmit
@@ -1811,11 +1828,21 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 	// or a delegated submission's on_behalf_of, never the synthetic
 	// operator-agent/delegated subject), with plain members qualified by the
 	// run's forge. An unlisted principal is refused 403 with no approval row.
+	//
+	// The credential leg (#4633) applies whenever the principal IS the
+	// presenting credential's own subject — a direct submission, or a
+	// delegated human-kind one (#2381 remap). A delegated agent-kind
+	// submission's principal is the seated captain, not its credential's
+	// subject, so it is not credential-evaluated here.
 	var membersRes *predicateResolution
 	if membersGuarded {
 		principal := s.approvalPrincipal(r.Context(), stage, subject, delegated)
 		listed := identity.SubjectListed(effective.members, principal, forge)
 		membersRes = &predicateResolution{MembersPrincipal: principal, MembersListed: &listed}
+		credentialBound := principal == subject // the principal IS the presenting credential's own subject
+		if credentialBound {
+			membersRes.MembersCredential = approvalCredentialKind(IdentityFrom(r.Context()))
+		}
 		if !listed {
 			s.writePredicateRejectionAudit(r.Context(), stage, subject, effective, membersRes)
 			s.writeError(w, r, http.StatusForbidden, "approver_predicate_unmet",
@@ -1829,8 +1856,33 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 					"escalated":         !escReq.IsZero(),
 					"result":            "rejected",
 					"next_actions": []string{
-						"Approve with a listed forge-verified identity (e.g. a `fishhawk token login` credential, whose subject is github:<login>); a static API-token or agent subject never matches",
+						"Approve with a listed forge identity through a forge-verified credential (a `fishhawk token login` device-flow token, an OAuth authorization-server token, or a browser session from the forge sign-in); a static API token cannot satisfy a members leg even when its subject is listed, and an agent subject is never listed",
 						"Or ask the workflow owner to add the principal to the gate's approvals.members list",
+					},
+				})
+			return nil, false
+		}
+		// Listed, but the presenting credential is not a forge-verified kind
+		// (#4633): SubjectListed is a subject-SHAPE rule, so a static API
+		// token whose subject is spelled github:<login> would otherwise pass.
+		if credentialBound && !identity.ForgeVerifiedCredential(membersRes.MembersCredential) {
+			s.writePredicateRejectionAudit(r.Context(), stage, subject, effective, membersRes)
+			s.writeError(w, r, http.StatusForbidden, "approver_predicate_unmet",
+				"the approver is on the gate's approvals.members allow-list, but the credential that authenticated this request is not forge-verified",
+				map[string]any{
+					"stage_id":             stage.ID.String(),
+					"subject":              subject,
+					"members":              effective.members,
+					"members_principal":    principal,
+					"predicate":            "members",
+					"reason":               "credential_not_forge_verified",
+					"credential_kind":      membersRes.MembersCredential,
+					"forge_verified_kinds": identity.ForgeVerifiedKinds,
+					"escalated":            !escReq.IsZero(),
+					"result":               "rejected",
+					"next_actions": []string{
+						"Re-approve as the same principal with a forge-verified credential: a `fishhawk token login` device-flow token (oauth), an OAuth authorization-server token (oauth_as), or a browser session from the forge sign-in (session)",
+						"A static API token, whether minted by `fishhawkd token issue` or as a child token through POST /v0/tokens, cannot satisfy a members leg; it keeps working for non-approval calls",
 					},
 				})
 			return nil, false
@@ -1848,6 +1900,7 @@ func (s *Server) checkApprovalPredicates(w http.ResponseWriter, r *http.Request,
 	if membersRes != nil && resolution != nil {
 		resolution.MembersPrincipal = membersRes.MembersPrincipal
 		resolution.MembersListed = membersRes.MembersListed
+		resolution.MembersCredential = membersRes.MembersCredential
 	}
 	switch outcome {
 	case predicateSatisfied:
@@ -1944,6 +1997,9 @@ func (s *Server) writePredicateRejectionAudit(ctx context.Context, stage *run.St
 		snapshot["members"] = approvals.members
 		snapshot["members_principal"] = resolution.MembersPrincipal
 		snapshot["members_listed"] = resolution.MembersListed
+		if resolution.MembersCredential != "" {
+			snapshot["members_credential"] = resolution.MembersCredential
+		}
 	}
 	actorKind := actorKindForSubject(subject)
 	subj := subject

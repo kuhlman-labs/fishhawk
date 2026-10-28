@@ -26198,7 +26198,15 @@ paths:
               `channel: delegated`) and NEVER counts toward the quorum.
               Every `approval_submitted` audit row on such a gate carries
               a `predicate_snapshot` (the evaluation inputs + outcome);
-              gates with no `approvals` block omit it.
+              gates with no `approvals` block omit it. On a gate whose
+              `approvals.members` credential leg evaluated the submission
+              (#4633, ADR-123), the snapshot also carries
+              `members_credential`: the credential kind the members leg
+              evaluated (`session`, `oauth`, `oauth_as`, `static`,
+              `unrecorded`, `mcp_run` or `unknown`). It is a separate
+              field from the row's `auth_method` (ADR-055), which records
+              an api token's minting path and is absent for a session or
+              an authorization-server token.
             - **Duplicate submission** — the same authenticated subject
               already submitted a decision for this stage. The prior
               decision stands, the stage state is unchanged, NO gates
@@ -26320,8 +26328,8 @@ paths:
               `approvals.members` list is non-empty and the approval's
               principal is not on it (an exact-match allow-list; plain
               members are qualified with the run's forge, the principal
-              never is, so a static-token or agent subject matches
-              nothing). This members check runs FIRST, before any forge
+              never is, so a non-forge subject such as an agent subject is
+              never listed). This members check runs FIRST, before any forge
               call, and applies to delegated and agent-kind submissions
               too: a delegated submission is members-checked against its
               `on_behalf_of` (the real operator, or the seated captain for
@@ -26331,6 +26339,25 @@ paths:
               list), `members_principal`, `subject`, `escalated` and
               `result`. No approval row is recorded; an
               `approval_predicate_rejected` audit entry is.
+              #4633 (ADR-123, #4750, RATIFIED 2026-10-27): the SAME
+              code also fires when the principal IS listed and is the
+              presenting credential's own subject (a direct or a delegated
+              human-kind submission), but the credential that authenticated
+              the request is not forge-verified. The forge-verified kinds
+              are `session` (a browser session from the forge sign-in),
+              `oauth` (a device-flow token) and `oauth_as` (an OAuth
+              authorization-server token); a static API token (`fishhawkd
+              token issue`, or a child token minted through `POST
+              /v0/tokens`), a token with no recorded auth method, any other
+              auth method, and an identity with no credential marker are
+              refused even when the subject is listed. `details` then also
+              carries `reason` (`credential_not_forge_verified`),
+              `credential_kind` (`static`, `unrecorded`, `mcp_run` or
+              `unknown`) and `forge_verified_kinds`; no approval row is
+              recorded, and the `approval_predicate_rejected` audit entry's
+              `predicate_snapshot` records `members_credential`. A
+              delegated agent-kind submission (principal = the seated
+              captain) is not credential-evaluated.
             - `self_decision` — E54.53 / #3041: a run-bound `mcp:run:`
               agent token targeting an ADMITTED human-executor review gate,
               even for its OWN run. Such a gate declares `executor: human`
