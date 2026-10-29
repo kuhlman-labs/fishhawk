@@ -2081,6 +2081,17 @@ Notes:
   anchor (#977); delivery to the agent is poll-based (the agent polls the GET
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
+  On a decomposition child the requested and decided entries also carry an
+  optional `slice_ownership` key (#4679: `slice_index`, `ancestor_slices`,
+  `ancestor_owned`, `conflicts`, `checked`, plus `error` on the request-time
+  fail-open `checked: false` record); a non-child run's payload is unchanged
+  (key absent). A fourth kind, `scope_amendment_refused` (#4679), is written by
+  `server/scope_amendment.go` (`server/slice_ownership.go`) when the
+  slice-ownership guard refuses a child's amendment — phase `request` (agent
+  actor, `{phase, paths, reason, slice_ownership}`, no row created) or phase
+  `decide` (user actor, `{phase, amendment_id, paths, slice_ownership}`, the
+  row stays pending). It is internal-only: no Notifier method, NOT in
+  `activityCategories`, and withheld from run-bound audit reads.
 - The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
   `scope_completeness_exempted`, `scope_completeness_amended`, and
   `scope_completeness_failed` (#1231/#2501/#2548/#2591) — are

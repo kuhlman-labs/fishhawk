@@ -6,6 +6,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -1041,6 +1042,81 @@ func TestNextActions_FailedRunOffersReviveRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNextActions_ImplementFailedCategoryC_ParkedRun pins the #4426 parked
+// variant of the implement_failed arm (T-NA-1): a NON-terminal run whose
+// implement stage failed category C is the server's infrastructure park, so
+// the retry names the park and its budget and fishhawk_revive_run (which needs
+// a terminal-failed run) is not offered. MECHANISM: the parked fixture differs
+// from the terminal twin ONLY in the run state, and from the D twin ONLY in
+// the failure category, so a constant arm cannot satisfy all three.
+func TestNextActions_ImplementFailedCategoryC_ParkedRun(t *testing.T) {
+	todays := func(run *Run, impl Stage, category string) []SuggestedAction {
+		return []SuggestedAction{
+			{
+				Action:       "fishhawk_retry_stage",
+				Params:       map[string]string{"stage_id": impl.ID},
+				Precondition: fmt.Sprintf("the implement stage failed category %q (retry serves categories A/C/D; B routes to fishhawk_resume_run)", category),
+				Consumes:     consumesRetryBudget,
+				Reason:       "retry the failed stage in place after reading the failure reason",
+			},
+			reviveRunAction(run),
+			{
+				Action:       "fishhawk_cancel_run",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "the failure is not retryable",
+				Consumes:     consumesNone,
+				Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
+			},
+		}
+	}
+
+	t.Run("running run with implement failed C is parked", func(t *testing.T) {
+		run := naRun("running")
+		impl := naFailedImplement("C", "runner_lost")
+		na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"), impl, naStage("acceptance", "pending"), naStage("review", "pending")},
+			nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "implement_failed" {
+			t.Fatalf("next_actions = %+v, want state implement_failed", na)
+		}
+		if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_retry_stage" || na.Actions[0].Params["stage_id"] != impl.ID {
+			t.Fatalf("actions = %v, want fishhawk_retry_stage {stage_id: %s} first", actionNames(na), impl.ID)
+		}
+		pre := na.Actions[0].Precondition
+		for _, want := range []string{"FAILED category C", "non-terminal", "parks", fmt.Sprintf("up to %d parks per stage", runmodel.InfraFailureParkRetryBudget), "#4426"} {
+			if !strings.Contains(pre, want) {
+				t.Errorf("retry precondition %q missing %q", pre, want)
+			}
+		}
+		if !strings.Contains(na.Actions[0].Reason, "awaiting_host_dispatch") || !strings.Contains(na.Actions[0].Reason, "fishhawk_run_children") {
+			t.Errorf("retry reason %q must say a local retry parks at awaiting_host_dispatch and a child is re-spawned by fishhawk_run_children", na.Actions[0].Reason)
+		}
+		for _, a := range na.Actions {
+			if a.Action == "fishhawk_revive_run" {
+				t.Fatalf("actions = %v: fishhawk_revive_run must not be offered on a non-terminal parked run", actionNames(na))
+			}
+		}
+		findAction(t, na, "fishhawk_cancel_run")
+	})
+
+	t.Run("failed run keeps today's actions byte-identical", func(t *testing.T) {
+		run := naRun("failed")
+		impl := naFailedImplement("C", "runner_lost")
+		na := implementFailedNextActions(run, nil, nil, &impl)
+		if na.State != "implement_failed" || !reflect.DeepEqual(na.Actions, todays(run, impl, "C")) {
+			t.Errorf("terminal run actions = %+v, want today's %+v", na.Actions, todays(run, impl, "C"))
+		}
+	})
+
+	t.Run("running run with implement failed D keeps today's actions", func(t *testing.T) {
+		run := naRun("running")
+		impl := naFailedImplement("D", "unknown")
+		na := implementFailedNextActions(run, nil, nil, &impl)
+		if na.State != "implement_failed" || !reflect.DeepEqual(na.Actions, todays(run, impl, "D")) {
+			t.Errorf("category-D actions = %+v, want today's %+v (the park is category C only)", na.Actions, todays(run, impl, "D"))
+		}
+	})
 }
 
 // TestNextActions_CategoryAQuotaCitation pins the #2085 quota hint: a

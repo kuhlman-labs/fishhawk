@@ -1691,7 +1691,10 @@ func reviveRunAction(run *Run) SuggestedAction {
 // a slice integration conflict, a RESTART too, #4343), A to an in-place retry
 // (citing a known flake trace event when the failure detail carries one),
 // everything else to retry-or-cancel. The category-A and default (retryable)
-// arms also offer fishhawk_revive_run (#1915) — the batch no-dispatch re-park.
+// arms also offer fishhawk_revive_run (#1915) — the batch no-dispatch re-park —
+// except on a category-C failure whose run is still NON-terminal: that is the
+// server's implement infrastructure park (#4426), revive is inapplicable to a
+// running run, and the retry's precondition names the park and its budget.
 func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextActions {
 	category := ""
 	if impl.FailureCategory != nil {
@@ -1825,6 +1828,35 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 			},
 		}
 	default:
+		cancel := SuggestedAction{
+			Action:       "fishhawk_cancel_run",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the failure is not retryable",
+			Consumes:     consumesNone,
+			Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
+		}
+		// #4426: a category-C implement failure on a NON-terminal run is the
+		// server's infrastructure park — the run stays running and the stage
+		// stays retry-eligible, so fishhawk_revive_run (which needs a
+		// terminal-failed run) is not offered and the retry names the park. A
+		// terminal run, a category-D failure, and the A and B arms keep the
+		// wording below.
+		implementParked := category == "C" && !runStateIsTerminal(run.State)
+		if implementParked {
+			return &NextActions{
+				State: "implement_failed",
+				Actions: []SuggestedAction{
+					{
+						Action:       "fishhawk_retry_stage",
+						Params:       map[string]string{"stage_id": impl.ID},
+						Precondition: fmt.Sprintf("the implement stage FAILED category C while the run stays non-terminal: the server parks a first-execution category-C implement failure instead of failing the run, up to %d parks per stage (#4426)", runpkg.InfraFailureParkRetryBudget),
+						Consumes:     consumesRetryBudget,
+						Reason:       "retry the parked implement stage in place after reading the failure reason: on runner_kind local the retry parks it at awaiting_host_dispatch, and a decomposition child is then re-spawned by fishhawk_run_children (a parent's fishhawk_await_children releases children_dispatchable for it); past the park budget the next category-C failure fails the run",
+					},
+					cancel,
+				},
+			}
+		}
 		return &NextActions{
 			State: "implement_failed",
 			Actions: []SuggestedAction{
@@ -1836,13 +1868,7 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 					Reason:       "retry the failed stage in place after reading the failure reason",
 				},
 				reviveRunAction(run),
-				{
-					Action:       "fishhawk_cancel_run",
-					Params:       map[string]string{"run_id": run.ID},
-					Precondition: "the failure is not retryable",
-					Consumes:     consumesNone,
-					Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
-				},
+				cancel,
 			},
 		}
 	}

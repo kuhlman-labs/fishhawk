@@ -340,6 +340,17 @@ import "sort"
 // scope_amendment_requested / scope_amendment_decided siblings — NOT an
 // issue-comment activity category (the startup backfill would otherwise
 // re-render activity lines onto every stale run's anchor).
+// E89.40 / #4679 added scope_amendment_refused, written by the slice-ownership
+// guard (server/slice_ownership.go, server/scope_amendment.go) when a
+// decomposition child's mid-stage scope amendment names a path a non-ancestor
+// sibling slice declares: at request time (actor agent, no row created, no
+// budget spent) or at an operator's approve (actor user, the row stays
+// pending). INTERNAL like its scope_amendment_* siblings — NOT an
+// issue-comment activity category. It is WITHHELD from run-bound audit reads
+// by an interim deny-list entry in server/reads.go's
+// withholdScopeOverlapFromRunBound, the same deliberate interim deviation from
+// ADR-106 as escape_recorded, owned by E89 #4537, that MUST migrate to
+// ADR-106's per-category registry flag when that lands.
 // E94.3 / #4694 (ADR-117 D3 + Amendment A1, ratified) added escape_recorded,
 // written by POST /v0/runs/{run_id}/escapes (server/escape.go): a birth row
 // or the single closure row that supersedes it, one row per state change
@@ -640,6 +651,7 @@ var KnownCategories = map[string]struct{}{
 	"scheduled_run_started":                   {}, // E79.1 / #3725: a due schedule window started a new run
 	"scope_amendment_decided":                 {},
 	"scope_amendment_lapsed":                  {},
+	"scope_amendment_refused":                 {}, // #4679: the slice-ownership guard refused a decomposition child's scope amendment (request time: no row; decide time: row stays pending) (server/slice_ownership.go) — INTERNAL, not an issue-comment surface; WITHHELD from run-bound audit reads by an interim deny-list entry that MUST migrate to ADR-106's per-category registry flag (owned by E89 #4537)
 	"scope_amendment_requested":               {},
 	"scope_completeness_amended":              {},
 	"scope_completeness_exempted":             {},
@@ -738,8 +750,9 @@ func KnownCategoryList() []string {
 // SuggestCategories returns up to max known categories nearest to input by
 // Levenshtein edit distance, closest first, ties broken lexicographically
 // (deterministic). It is the "did you mean" suggester the fail-loud
-// validation surfaces: SuggestCategories("scope_amendment_pending", 3)
-// ranks "scope_amendment_requested" first. max <= 0 or an empty registry
+// validation surfaces: SuggestCategories("scope_amendment_pending", 4)
+// names "scope_amendment_requested" among its siblings (both callers ask
+// for four since #4679 added scope_amendment_refused). max <= 0 or an empty registry
 // returns nil.
 func SuggestCategories(input string, max int) []string {
 	if max <= 0 {
