@@ -1,0 +1,13 @@
+id: scenario:issue-4758/drive-run-stopped-reason-vocabulary
+statement: The fishhawk_drive_run tool's published output schema lists base_branch_unresolved in the stopped_reason vocabulary, and the base_branch input descriptions of the four verbs no longer say 'defaults to main'.
+verify_hint: List the tools through fishhawkd's HTTP /mcp route (JSON-RPC tools/list). Read the stopped_reason description in fishhawk_drive_run's outputSchema and each verb's base_branch input description.
+steps: With an fhm_ MCP token minted for a plan-gate-parked run (signing-key, /v0/dev/sign over '{}', mcp-token), POST http://localhost:8090/mcp tools/list with the 2026-07-28 headers and _meta. Read fishhawk_drive_run outputSchema.properties.stopped_reason.description, and the inputSchema base_branch description of fishhawk_run_stage, fishhawk_dispatch_stage, fishhawk_drive_run and fishhawk_run_children. Searched the whole tool list for 'defaults to main'.
+assertions:
+    expected: base_branch_unresolved in vocabulary; no 'defaults to main'
+    observed_at_record: stopped_reason vocabulary includes 'base_branch_unresolved'. All four base_branch descriptions say that when omitted, the run's forge default_branch is used and an unresolved one is refused. 'defaults to main' appears 0 times across 84 tools.
+origin:
+    issue: 4758
+    pr: 4831
+    run_id: 03f2976e-d127-4ac8-bcc6-521c0274c2de
+    head_sha: 050ab3cd5f5b966ca29ea036d5b8d9bb3e57e4b3
+    recorded_at: 2026-10-29T23:20:43Z
