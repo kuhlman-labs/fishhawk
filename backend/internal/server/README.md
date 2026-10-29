@@ -46,6 +46,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Charter injection consumer (`charter_injection.go`, E54.2 / #2234)
 - Review-convention consumer (`review_conventions.go`, E55.3 / #2244)
 - Reviewer personas (`reviewer_persona.go`, ADR-084 #3752 / E55.8 #3753)
+- Plan-review seed (#4436)
 - Plan-gate scope/constraint pre-check (#658)
 - Plan-gate test sweep (#942)
 - Routed-concern NOT-ATTEMPTED pre-review signal (#2896)
