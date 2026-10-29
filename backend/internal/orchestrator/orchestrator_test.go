@@ -1594,7 +1594,7 @@ func auditRunIDForCategory(a *recordingAudit, category string, want uuid.UUID) b
 }
 
 func TestCompleteRun_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
-	// #698: when a child fails with a retryable category (C), the
+	// #698: when a child fails with a retryable category, the
 	// event-driven parent-resolution path must NOT resolve the parent
 	// to failed-C; it parks the awaiting_children stage and emits a
 	// one-time parent_awaiting_redrive audit so an operator can
@@ -1608,9 +1608,13 @@ func TestCompleteRun_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
 		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
 	})
 
-	// Child fails now with a retryable infra (C) implement failure.
-	cat := run.FailureC
-	reason := "runner OOM"
+	// Child fails now with a retryable category-A implement failure. A
+	// first-execution category-C child failure no longer terminates the
+	// child — it parks the child itself (#4426,
+	// TestAdvance_DecomposedChildImplementInfraFailure_ParentWaitsThenResumes)
+	// — so category A is the retryable class that reaches this path.
+	cat := run.FailureA
+	reason := "agent crashed"
 	child, childStages := rs.seed(t, "x/y", nil, []stageSeed{
 		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateRunning},
 	})
@@ -1679,13 +1683,17 @@ func TestCompleteRun_FailedChildNonRecoverable_ResolvesFailed(t *testing.T) {
 	// A D-rejection child (approver said no) stays non-recoverable and
 	// still resolves the parent to failed-C with no parking.
 	o, rs, _ := newOrchestrator(t)
-	au := &recordingAudit{}
-	o.Audit = au
+	pa := &parkAudit{recordingAudit: &recordingAudit{}}
+	au := pa.recordingAudit
+	o.Audit = pa
 
 	parentRun, parentStages := rs.seed(t, "x/y", nil, []stageSeed{
 		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
 		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
 	})
+	// The parent's plan_decomposed row marks it a decomposed parent, so its
+	// fan-in category-C failure is not an infrastructure park (#4426).
+	pa.seeded = []*audit.Entry{{Sequence: 1, RunID: &parentRun.ID, StageID: &parentStages[0].ID, Category: "plan_decomposed"}}
 
 	cat := run.FailureD
 	reason := "gate rejected by approver"
@@ -5857,17 +5865,22 @@ func TestAdvance_AcceptanceInfraFailure_BudgetExhaustedFailsRunWithAudit(t *test
 
 // TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun: every shape the
 // predicate does not park keeps today's completeRun -> failed, with no park or
-// budget row: an implement C failure, an acceptance A or B failure, and the C2
-// post-merge shape (review resolved succeeded by the merge, or pr_merged).
+// budget row: a plan, review or deploy C failure (the allow-list is acceptance
+// + implement; implement C's park is pinned by
+// TestAdvance_ImplementInfraFailure_ParksRun, #4426), an acceptance A or B
+// failure, and the C2 post-merge shape (review resolved succeeded by the
+// merge, or pr_merged).
 func TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun(t *testing.T) {
 	cases := []struct {
 		name        string
 		cat         run.FailureCategory
 		reviewState run.StageState
-		implement   bool
+		failedType  run.StageType
 		prMerged    bool
 	}{
-		{name: "implement C", cat: run.FailureC, reviewState: run.StageStatePending, implement: true},
+		{name: "plan C", cat: run.FailureC, reviewState: run.StageStatePending, failedType: run.StageTypePlan},
+		{name: "review C", cat: run.FailureC, reviewState: run.StageStatePending, failedType: run.StageTypeReview},
+		{name: "deploy C", cat: run.FailureC, reviewState: run.StageStatePending, failedType: run.StageTypeDeploy},
 		{name: "acceptance A", cat: run.FailureA, reviewState: run.StageStatePending},
 		{name: "acceptance B", cat: run.FailureB, reviewState: run.StageStatePending},
 		{name: "acceptance C, review resolved by merge", cat: run.FailureC, reviewState: run.StageStateSucceeded},
@@ -5877,8 +5890,8 @@ func TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			o, rs, au := newParkOrchestrator(t)
 			r, acc := seedAcceptanceInfraFailure(t, rs, tc.cat, tc.reviewState)
-			if tc.implement {
-				acc.Type = run.StageTypeImplement
+			if tc.failedType != "" {
+				acc.Type = tc.failedType
 			}
 			if tc.prMerged {
 				au.seeded = append(au.seeded, &audit.Entry{Sequence: 1, Category: "pr_merged"})

@@ -404,13 +404,15 @@ const (
 // itself transitions to succeeded.
 //
 // A failed or cancelled stage completes the run (failed / cancelled), with
-// ONE exception (#4356): a category-C (infrastructure) failure of an
-// acceptance stage PARKS the run instead — Advance returns OutcomeNoOp, the
-// run stays running and the stage stays failed and retry-eligible — unless
-// the merge already overtook it (run.ClassifyInfraFailurePark's post-merge
-// carve-out) or the stage has spent run.InfraFailureParkRetryBudget parks, in
-// which case the run fails and a stage_infra_park_budget_exhausted row says
-// why.
+// ONE exception (#4356, #4426): a category-C (infrastructure) failure of an
+// acceptance or implement stage PARKS the run instead — Advance returns
+// OutcomeNoOp, the run stays running and the stage stays failed and
+// retry-eligible — unless the merge already overtook it
+// (run.ClassifyInfraFailurePark's post-merge carve-out), the failed implement
+// stage is a decomposed parent's fan-in or a re-opened pass (the
+// implement-only exclusions), or the stage has spent
+// run.InfraFailureParkRetryBudget parks, in which case the run fails and a
+// stage_infra_park_budget_exhausted row says why.
 //
 // Errors from the underlying repos surface as wrapped errors;
 // callers usually log + acknowledge rather than retry. The
@@ -457,9 +459,10 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// pending one, the run is over — completing as failed (or
 	// cancelled) is correct, and dispatching downstream stages
 	// would be wrong because the upstream output they depended on
-	// never landed. The #4356 exception: a category-C acceptance
-	// failure parks the run (see run.ClassifyInfraFailurePark) —
-	// nothing downstream is dispatched, the run just stays running.
+	// never landed. The #4356 / #4426 exception: a category-C acceptance,
+	// or first-execution non-decomposed-parent implement, failure parks the
+	// run (see run.ClassifyInfraFailurePark) — nothing downstream is
+	// dispatched, the run just stays running.
 	var next *run.Stage
 	var gated *run.Stage
 	for _, s := range stages {
@@ -470,9 +473,10 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 					return OutcomeNoOp, err
 				}
 				if park == run.InfraParkRetryable {
-					o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: acceptance stage failed category C; run parked retry-eligible",
+					o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: stage failed category C; run parked retry-eligible",
 						slog.String("run_id", r.ID.String()),
 						slog.String("stage_id", s.ID.String()),
+						slog.String("stage_type", string(s.Type)),
 						slog.String("failure_reason", derefString(s.FailureReason)),
 						slog.Int("prior_parks", history.PriorParks),
 						slog.Int("budget", run.InfraFailureParkRetryBudget),
@@ -3347,32 +3351,43 @@ func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, pare
 }
 
 // classifyInfraFailurePark reads the failed stage's park history from the
-// run's audit log and classifies it (#4356). The audit read happens only for
-// a category-C acceptance failure, the one shape the predicate can park, so
-// every other failure keeps its zero-I/O path. With no Audit wired the park
-// cannot be bounded, so the failure takes today's completeRun path. A failed
-// audit read surfaces as an error with NO transition: the run stays as it is
-// and the next Advance re-decides.
+// run's audit log and classifies it (#4356, #4426). The audit read happens
+// only for a category-C acceptance or implement failure, the shapes the
+// predicate can park, so every other failure keeps its zero-I/O path. With no
+// Audit wired the park cannot be bounded, so the failure takes today's
+// completeRun path. A failed audit read on an IMPLEMENT failure counts as a
+// re-opened pass (run.InfraParkHistoryOnReadError, #4426 approval condition
+// C1), so the run fails as it did before #4426 — a failed read never parks.
+// On an ACCEPTANCE failure it surfaces as an error with NO transition: the
+// run stays as it is and the next Advance re-decides.
 func (o *Orchestrator) classifyInfraFailurePark(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage) (run.InfraParkDecision, run.InfraParkHistory, error) {
 	if run.ClassifyInfraFailurePark(stages, failed, run.InfraParkHistory{}) == run.InfraParkNotApplicable {
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
 	}
 	if o.Audit == nil {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; category-C acceptance failure not parked",
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; category-C acceptance / implement failure not parked",
 			slog.String("run_id", r.ID.String()),
-			slog.String("stage_id", failed.ID.String()))
+			slog.String("stage_id", failed.ID.String()),
+			slog.String("stage_type", string(failed.Type)))
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
 	}
 	entries, err := o.Audit.ListForRun(ctx, r.ID)
 	if err != nil {
+		if history, ok := run.InfraParkHistoryOnReadError(stages, failed); ok {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: infra-park history read failed; category-C implement failure treated as a re-opened pass and not parked",
+				slog.String("run_id", r.ID.String()),
+				slog.String("stage_id", failed.ID.String()),
+				slog.String("error", err.Error()))
+			return run.ClassifyInfraFailurePark(stages, failed, history), history, nil
+		}
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, fmt.Errorf("orchestrator: read infra-park history: %w", err)
 	}
 	history := run.ReadInfraParkHistory(entries, failed)
 	return run.ClassifyInfraFailurePark(stages, failed, history), history, nil
 }
 
-// completeRunInfraParkExhausted fails the run for a category-C acceptance
-// failure past run.InfraFailureParkRetryBudget and, only once completeRun
+// completeRunInfraParkExhausted fails the run for a category-C acceptance or
+// implement failure past run.InfraFailureParkRetryBudget and, only once completeRun
 // actually terminalized the run, records why.
 func (o *Orchestrator) completeRunInfraParkExhausted(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage, history run.InfraParkHistory) (Outcome, error) {
 	outcome, err := o.completeRun(ctx, r, stages)
@@ -3535,6 +3550,14 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 			// such child on the parent's chain, de-duplicated per child stage.
 			// This runs BEFORE the dispatch top-up and the return, both of which
 			// are otherwise unchanged.
+			//
+			// #4426: a child whose implement stage failed category C on its
+			// first execution is PARKED too (run.ClassifyInfraFailurePark) — it
+			// stays running with a failed, retry-eligible implement stage — so
+			// it is a third non-terminal-but-settled shape beside
+			// awaiting_scope_decision. It also lands here: the parent keeps
+			// waiting in awaiting_children, and settles on the event-driven
+			// re-entry once the retried child succeeds (or fails terminally).
 			o.surfaceParkedChildren(ctx, parentRunID, children)
 			// Event-driven refill (E24.3 / #1143): not all children are
 			// terminal yet, so the parent stays parked — but a child just

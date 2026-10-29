@@ -375,12 +375,13 @@ func lastActivity(r *run.Run, stages []*run.Stage, entries []*audit.Entry) time.
 // terminal and the run completes. The target is failed if any stage failed,
 // else cancelled if any was cancelled, else succeeded.
 //
-// It mirrors Advance's #4356 park too: a failed stage that
+// It mirrors Advance's #4356 / #4426 park too: a failed stage that
 // run.ClassifyInfraFailurePark classifies InfraParkRetryable (a category-C
-// acceptance failure, decided from the same audit-derived history Advance
-// reads) is NOT settled — Advance would park the run, not complete it. A
-// budget-exhausted or carved-out stage falls through to the settled/failed
-// classification, matching Advance.
+// acceptance, or first-execution non-decomposed-parent implement, failure,
+// decided from the same audit-derived history Advance reads) is NOT settled —
+// Advance would park the run, not complete it. A budget-exhausted or
+// carved-out stage falls through to the settled/failed classification,
+// matching Advance.
 func settledTarget(stages []*run.Stage, entries []*audit.Entry) (run.State, bool) {
 	if len(stages) == 0 {
 		return "", false
