@@ -71,6 +71,14 @@ type fakeBackend struct {
 	getResp    Run
 	getStatus  int
 
+	// fakeDefaultBranch is stamped as default_branch on every GET
+	// /v0/runs/{run_id} response that carries NEITHER default_branch NOR
+	// default_branch_unresolved_reason (#4758), mirroring a post-#4660
+	// fishhawkd that resolves every github run. A gitlab row is stamped
+	// default_branch_unresolved_reason forge_unsupported instead, as
+	// production does. A test that seeds either field keeps its value.
+	fakeDefaultBranch string
+
 	// getRunExtraByID overlays extra top-level JSON fields onto a
 	// keyed getRunByID response — response fields the thin client.go
 	// Run mirror doesn't carry, like the drive read surfaces (#1023)
@@ -343,6 +351,10 @@ type fakeBackend struct {
 	// stranded 'dispatched'. reapFailureStatus (0 -> 200) drives the
 	// report-itself-fails branch.
 	hostDispatchBaseBranch string
+	// hostDispatchBaseBranchByStage overrides hostDispatchBaseBranch per stage
+	// id (#4758), so one fan-out can mix a child whose marker returns a
+	// consolidated base with one whose marker returns none.
+	hostDispatchBaseBranchByStage map[string]string
 	// hostDispatchWaveNotIntegrated models the SERVER's per-wave integration
 	// refusal (E50.13 / #2363), keyed by stage id: a marked stage answers 409
 	// wave_not_integrated WITHOUT transitioning, exactly as the real server
@@ -708,10 +720,27 @@ func stripForgeBaseURL(items []Run) []Run {
 	return out
 }
 
+// stampDefaultBranch applies the single-run read's #4660 base-branch fields
+// the way a post-#4660 fishhawkd does (#4758): a row seeding NEITHER field
+// gets default_branch fb.fakeDefaultBranch, or, on a gitlab row,
+// default_branch_unresolved_reason forge_unsupported. Caller holds fb.mu.
+func (fb *fakeBackend) stampDefaultBranch(row Run) Run {
+	if row.DefaultBranch != "" || row.DefaultBranchUnresolvedReason != "" {
+		return row
+	}
+	if row.Forge == startRunForgeGitLab {
+		row.DefaultBranchUnresolvedReason = "forge_unsupported"
+		return row
+	}
+	row.DefaultBranch = fb.fakeDefaultBranch
+	return row
+}
+
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
 		listStatus:                    http.StatusOK,
+		fakeDefaultBranch:             "main",
 		delegationStatus:              http.StatusOK,
 		getStatus:                     http.StatusOK,
 		stagesStatus:                  http.StatusOK,
@@ -1082,6 +1111,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		errBody := fb.hostDispatchErrBody
 		forceNoop := fb.hostDispatchForceNoop
 		baseBranch := fb.hostDispatchBaseBranch
+		if b, has := fb.hostDispatchBaseBranchByStage[id.String()]; has {
+			baseBranch = b
+		}
 		// Model the CAS marker: flip a seeded pending|awaiting_host_dispatch stage
 		// to dispatched (transitioned:true); an already-dispatched stage is the
 		// idempotent no-op (transitioned:false). The resulting state is echoed back.
@@ -1762,6 +1794,8 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		if override, has := fb.getStatusByID[id]; has {
 			status = override
 		}
+		fallback := fb.stampDefaultBranch(fb.getResp)
+		row = fb.stampDefaultBranch(row)
 		fb.mu.Unlock()
 		if status >= 400 {
 			w.WriteHeader(status)
@@ -1785,7 +1819,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			_ = json.NewEncoder(w).Encode(row)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(fb.getResp)
+		_ = json.NewEncoder(w).Encode(fallback)
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
 		id, perr := uuid.Parse(r.PathValue("run_id"))

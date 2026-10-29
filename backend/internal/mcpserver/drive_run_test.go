@@ -64,6 +64,11 @@ type driveFakeBackend struct {
 	forgeBaseURL            string
 	forgeBaseURLPreLoopOnly bool
 	loopStarted             bool
+	// defaultBranch / defaultBranchUnresolvedReason model the #4660 single-run
+	// base-branch fields (#4758); newDriveFake defaults defaultBranch to
+	// "main" so every legacy fixture keeps resolving an omitted base_branch.
+	defaultBranch                 string
+	defaultBranchUnresolvedReason string
 	// requestLog records every request as "METHOD path" in arrival order, and
 	// getRunCalls counts GET /v0/runs/{id} — the forge-target pins read them.
 	requestLog  []string
@@ -135,7 +140,7 @@ func newDriveFake(runState string, stages []Stage) *driveFakeBackend {
 	// runner_kind defaults to "local" — the drive verb's local-only guard
 	// requires it, so every happy-path fixture is a local run unless a test
 	// overrides runnerKind to exercise the rejection path.
-	return &driveFakeBackend{runID: uuid.New(), runState: runState, runnerKind: "local", stages: stages}
+	return &driveFakeBackend{runID: uuid.New(), runState: runState, runnerKind: "local", stages: stages, defaultBranch: "main"}
 }
 
 // driveFakeGateRule mirrors the backend's action->delegated-condition mapping
@@ -407,7 +412,8 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				DerivedStatus string `json:"derived_status,omitempty"`
 			}{
 				Run: Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, WorkingDir: f.workingDir, PullRequestURL: &pr,
-					Forge: f.forge, ForgeBaseURL: baseURL},
+					Forge: f.forge, ForgeBaseURL: baseURL,
+					DefaultBranch: f.defaultBranch, DefaultBranchUnresolvedReason: f.defaultBranchUnresolvedReason},
 				DerivedStatus: f.derivedStatus,
 			})
 		}
@@ -4670,6 +4676,9 @@ func gitlabParkedImplementFake(baseURL string) *driveFakeBackend {
 	})
 	f.forge = "gitlab"
 	f.forgeBaseURL = baseURL
+	// A gitlab run reports forge_unsupported, as a post-#4660 fishhawkd does,
+	// so every caller below that reaches the spawn passes base_branch (#4758).
+	f.defaultBranch, f.defaultBranchUnresolvedReason = "", "forge_unsupported"
 	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "running")
@@ -4702,7 +4711,7 @@ func TestDriveRun_GitLabRun_ImplementDispatchCarriesForgeFlags(t *testing.T) {
 	defer srv.Close()
 	r.driveMaxWallclock = 5 * time.Second
 
-	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String()})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
@@ -4744,7 +4753,7 @@ func TestDriveRun_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
 	defer srv.Close()
 	r.driveMaxWallclock = 5 * time.Second
 
-	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
@@ -4831,7 +4840,7 @@ func TestDriveRun_RunReadFails_StopsWithoutSpawn(t *testing.T) {
 		},
 	}
 
-	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", WorkingDir: t.TempDir()})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", WorkingDir: t.TempDir(), BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
@@ -5141,5 +5150,78 @@ func TestDriveRun_AcceptanceStageFailedStops(t *testing.T) {
 	f.mu.Unlock()
 	if nActs != 0 {
 		t.Fatalf("recorded %d acts on a parked run, want 0", nActs)
+	}
+}
+
+// --- base branch (#4758) -----------------------------------------------------
+
+// TestDriveRun_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch: base_branch
+// omitted on a github run whose forge default_branch is "trunk" → the implement
+// dispatch argv carries --base-branch trunk and --check-base-ref trunk.
+func TestDriveRun_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch(t *testing.T) {
+	f := gitlabParkedImplementFake("")
+	// Re-point the shared parked-implement fixture at a github run whose
+	// default branch resolves to trunk.
+	f.forge, f.forgeBaseURL = "", ""
+	f.defaultBranch, f.defaultBranchUnresolvedReason = "trunk", ""
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged; warnings=%v", out.StoppedReason, out.Warnings)
+	}
+	argv := rec.argvFor("implement")
+	if argv == nil {
+		t.Fatalf("no implement spawn recorded; spawned %v", rec.list())
+	}
+	if !argvHasPair(argv, "--base-branch", "trunk") || !argvHasPair(argv, "--check-base-ref", "trunk") {
+		t.Fatalf("implement argv should carry --base-branch trunk and --check-base-ref trunk from the run's default_branch: %v", argv)
+	}
+}
+
+// TestDriveRun_UnresolvedDefaultBranch_StopsWithoutSpawn: base_branch omitted
+// on a run whose default branch is unresolved → stopped_reason
+// base_branch_unresolved pre-loop, with a DISPATCHABLE pending plan stage left
+// unspawned: zero spawns, zero host-dispatch markers, zero record-acts, and a
+// warning naming the reason and the remedy.
+func TestDriveRun_UnresolvedDefaultBranch_StopsWithoutSpawn(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "pending", 0), // dispatchable — a deleted control would spawn this
+		stg(driveImplID, "implement", "blocked", 1),
+	})
+	f.defaultBranch, f.defaultBranchUnresolvedReason = "", "repository_not_visible"
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedBaseBranchUnresolved {
+		t.Fatalf("stopped_reason = %q, want %q; warnings=%v", out.StoppedReason, stoppedBaseBranchUnresolved, out.Warnings)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on an unresolved default branch, want nothing", got)
+	}
+	f.mu.Lock()
+	marks, acts := f.hostDispatchCalledN, len(f.recordedActs)
+	f.mu.Unlock()
+	if marks != 0 || acts != 0 {
+		t.Fatalf("host-dispatch markers = %d, record-acts = %d; the stop must commit nothing", marks, acts)
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	for _, want := range []string{"repository_not_visible", "Pass base_branch explicitly"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warnings should name %q: %v", want, out.Warnings)
+		}
 	}
 }
