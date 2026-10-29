@@ -406,8 +406,10 @@ func TestDecideScopeAmendment_DescriptionStatesApprovalBinding(t *testing.T) {
 // fishhawk_retry_stage) QUALIFIED by the lapse rule (a failed stage or failed
 // run stays recoverable) and name the lapse
 // triggers; the decide tool also names the post-lapse recovery and lists
-// amendment_lapsed among its tool errors. (fishhawk_await_stage's description
-// is pinned by TestAwaitStageToolDescription_NamesAmendmentRelease.)
+// amendment_lapsed among its tool errors, plus the #4679 slice-ownership
+// errors (amendment_path_owned_by_sibling_slice, slice_ownership_check_failed).
+// (fishhawk_await_stage's description is pinned by
+// TestAwaitStageToolDescription_NamesAmendmentRelease.)
 func TestScopeAmendmentTools_DescriptionsQualifyLapse(t *testing.T) {
 	ctx := context.Background()
 	cfg := config{backendURL: "http://localhost:8080", apiToken: "tok"}
@@ -450,6 +452,9 @@ func TestScopeAmendmentTools_DescriptionsQualifyLapse(t *testing.T) {
 			"A stage that succeeds, is cancelled or superseded, or a run that succeeds or is cancelled, LAPSES the request",
 			"fishhawk_resume_run add_scope_files",
 			"amendment_lapsed (the stage succeeded",
+			"amendment_path_owned_by_sibling_slice",
+			"there is NO override — deny it with the remedy as the reason, 409",
+			"slice_ownership_check_failed",
 		},
 		"fishhawk_await_children": {
 			"a late decision is still honored on fishhawk_retry_stage unless the stage succeeded, was cancelled or superseded, or the run succeeded or was cancelled, which lapses it",

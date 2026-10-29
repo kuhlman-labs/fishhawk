@@ -78,12 +78,12 @@ func TestIsKnownCategory(t *testing.T) {
 // "requested"), the measured top three are [decided lapsed requested]: all
 // three suggestions are scope_amendment_* siblings and requested is among them.
 func TestSuggestCategories_RanksNearest(t *testing.T) {
-	got := SuggestCategories("scope_amendment_pending", 3)
+	got := SuggestCategories("scope_amendment_pending", 4)
 	if len(got) == 0 {
 		t.Fatal("SuggestCategories returned no suggestions")
 	}
-	if len(got) > 3 {
-		t.Errorf("returned %d suggestions, want <= 3", len(got))
+	if len(got) > 4 {
+		t.Errorf("returned %d suggestions, want <= 4", len(got))
 	}
 	// Every suggestion is a scope_amendment_* sibling, and
 	// scope_amendment_requested is among them — the operator sees it and
@@ -98,7 +98,11 @@ func TestSuggestCategories_RanksNearest(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("scope_amendment_requested not among the three nearest suggestions; got=%v", got)
+		t.Errorf("scope_amendment_requested not among the four nearest suggestions; got=%v", got)
+	}
+	// #4679: the newest sibling is reachable by its own near-miss.
+	if near := SuggestCategories("scope_amendment_refuse", 3); len(near) == 0 || near[0] != "scope_amendment_refused" {
+		t.Errorf("SuggestCategories(scope_amendment_refuse) = %v, want scope_amendment_refused first", near)
 	}
 }
 

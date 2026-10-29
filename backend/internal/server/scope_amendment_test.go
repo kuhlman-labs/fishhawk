@@ -1723,3 +1723,382 @@ func TestDecideScopeAmendment_FailedRunApprove200(t *testing.T) {
 		t.Errorf("row after the approve = (%+v, %v), want approved", got, err)
 	}
 }
+
+// --- #4679 slice-ownership guard ---
+
+// sliceOwnershipFixture is a decomposed parent whose approved plan declares
+// sub_plans 0:{docs/a.md}, 1:{docs/b.md}, 2:{pkg/c.go} depends_on [0], with a
+// minted child per slice. The requester is child 2, holding a running
+// implement stage; slice 0 is its only ancestor and slice 1 a non-ancestor.
+type sliceOwnershipFixture struct {
+	s        *Server
+	rr       *guardCountingRepo
+	art      *fakeArtifactRepo
+	sa       *fakeScopeAmendmentRepo
+	au       *auditFake
+	parentID uuid.UUID
+	children [3]*run.Run
+	stage    *run.Stage
+}
+
+func newSliceOwnershipFixture(t *testing.T) *sliceOwnershipFixture {
+	t.Helper()
+	rr := &guardCountingRepo{orchestratorRepo: newOrchestratorRepo()}
+	art := newFakeArtifactRepo()
+	sa := newFakeScopeAmendmentRepo()
+	au := newAuditFake()
+	f := &sliceOwnershipFixture{
+		s:  New(Config{Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, ScopeAmendmentRepo: sa, AuditRepo: au}),
+		rr: rr, art: art, sa: sa, au: au,
+	}
+	parent := rr.seedRun()
+	planStage := rr.seedStage(parent.ID, 0, run.StageStateSucceeded) // Type=plan
+	slice := func(title, file string, deps ...int) plan.SubPlanSummary {
+		return plan.SubPlanSummary{Title: title, ScopeHint: "x", DependsOn: deps,
+			Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: file, Operation: plan.FileOpModify}}}}
+	}
+	seedPlanArtifactContent(t, art, planStage.ID, &plan.Plan{
+		PlanVersion:  "standard_v1",
+		Summary:      "s",
+		Verification: plan.Verification{TestStrategy: "t", RollbackPlan: "r"},
+		Decomposition: &plan.Decomposition{Rationale: "split", SubPlans: []plan.SubPlanSummary{
+			slice("docs a", "docs/a.md"),
+			slice("docs b", "docs/b.md"),
+			slice("pkg c", "pkg/c.go", 0),
+		}},
+	})
+	f.parentID = parent.ID
+	for i := range f.children {
+		f.children[i] = seedGuardChild(rr, parent.ID, i, run.StateRunning)
+	}
+	f.stage = rr.seedStage(f.children[2].ID, 0, run.StageStateRunning)
+	f.stage.Type = run.StageTypeImplement
+	return f
+}
+
+func (f *sliceOwnershipFixture) request(t *testing.T, runID uuid.UUID, path string) *httptest.ResponseRecorder {
+	t.Helper()
+	body := `{"paths":[{"path":"` + path + `","operation":"modify"}],"reason":"coupled edit"}`
+	return postAmendment(t, f.s, runID, body, func(r *http.Request) *http.Request {
+		return withRunBoundIdentity(r, runID, "write:scope-amendments")
+	})
+}
+
+func (f *sliceOwnershipFixture) decide(t *testing.T, runID, amendmentID uuid.UUID, decision string) *httptest.ResponseRecorder {
+	t.Helper()
+	return postDecision(t, f.s, runID, amendmentID, `{"decision":"`+decision+`","reason":"r"}`, func(r *http.Request) *http.Request {
+		return withOperatorIdentity(r, "write:stages")
+	})
+}
+
+// seedPending creates a PENDING row on child 2's stage directly through the
+// repo, bypassing the request-time check, so the decide-time check is the only
+// control in the path.
+func (f *sliceOwnershipFixture) seedPending(t *testing.T, path string) uuid.UUID {
+	t.Helper()
+	a, err := f.sa.Create(context.Background(), scopeamendment.CreateParams{
+		RunID: f.children[2].ID, StageID: f.stage.ID, Reason: "seeded",
+		Paths: []scopeamendment.PathEntry{{Path: path, Operation: scopeamendment.OperationModify}},
+	})
+	if err != nil {
+		t.Fatalf("seed pending amendment: %v", err)
+	}
+	return a.ID
+}
+
+// payloads returns the decoded payloads of every appended entry in category.
+func (f *sliceOwnershipFixture) payloads(t *testing.T, category string) []map[string]any {
+	t.Helper()
+	f.au.mu.Lock()
+	defer f.au.mu.Unlock()
+	var out []map[string]any
+	for _, p := range f.au.appended {
+		if p.Category != category {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(p.Payload, &m); err != nil {
+			t.Fatalf("decode %s payload: %v", category, err)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+func (f *sliceOwnershipFixture) countRows(t *testing.T) int {
+	t.Helper()
+	n, err := f.sa.CountByStage(context.Background(), f.stage.ID)
+	if err != nil {
+		t.Fatalf("count: %v", err)
+	}
+	return n
+}
+
+func conflictOwners(t *testing.T, details map[string]any) []map[string]any {
+	t.Helper()
+	raw, _ := details["conflicts"].([]any)
+	out := make([]map[string]any, 0, len(raw))
+	for _, c := range raw {
+		m, _ := c.(map[string]any)
+		out = append(out, m)
+	}
+	return out
+}
+
+func TestRequestScopeAmendment_SliceOwnership(t *testing.T) {
+	t.Run("non-ancestor path refused before a row is created", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		w := f.request(t, f.children[2].ID, "docs/b.md")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		code, details := decodeErrorDetails(t, w.Body.Bytes())
+		if code != errCodeAmendmentPathOwnedBySibling {
+			t.Fatalf("code = %q, want %q", code, errCodeAmendmentPathOwnedBySibling)
+		}
+		cs := conflictOwners(t, details)
+		if len(cs) != 1 || cs[0]["owning_slice"] != float64(1) || cs[0]["owning_child_run_id"] != f.children[1].ID.String() {
+			t.Errorf("conflicts = %v, want slice 1 owned by child %s", cs, f.children[1].ID)
+		}
+		if details["reason"] != sliceOwnershipRefusalReason || details["remedy"] != sliceOwnershipRemedy || details["requested_slice"] != float64(2) {
+			t.Errorf("details = %v", details)
+		}
+		if !strings.Contains(w.Body.String(), "docs/b.md is owned by slice 1") {
+			t.Errorf("message does not name the path and owner:\n%s", w.Body.String())
+		}
+		if n := f.countRows(t); n != 0 {
+			t.Errorf("rows on the stage = %d, want 0 (no row, no budget spent)", n)
+		}
+		refused := f.payloads(t, CategoryScopeAmendmentRefused)
+		if len(refused) != 1 || refused[0]["phase"] != "request" {
+			t.Fatalf("scope_amendment_refused entries = %v, want one phase=request", refused)
+		}
+		if len(f.payloads(t, CategoryScopeAmendmentRequested)) != 0 {
+			t.Error("a refused request must not write scope_amendment_requested")
+		}
+	})
+
+	t.Run("ancestor path allowed and recorded", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		if w := f.request(t, f.children[2].ID, "docs/a.md"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		req := f.payloads(t, CategoryScopeAmendmentRequested)
+		if len(req) != 1 {
+			t.Fatalf("requested entries = %d, want 1", len(req))
+		}
+		so, _ := req[0]["slice_ownership"].(map[string]any)
+		owned, _ := so["ancestor_owned"].([]any)
+		if so["checked"] != true || len(owned) != 1 || owned[0].(map[string]any)["owning_slice"] != float64(0) {
+			t.Errorf("slice_ownership = %v, want checked with ancestor_owned naming slice 0", so)
+		}
+	})
+
+	t.Run("own-slice path allowed", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		if w := f.request(t, f.children[2].ID, "pkg/c.go"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+	})
+
+	t.Run("non-child run payload is byte-identical", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		plain := f.rr.seedRun()
+		st := f.rr.seedStage(plain.ID, 0, run.StageStateRunning)
+		st.Type = run.StageTypeImplement
+		if w := f.request(t, plain.ID, "docs/b.md"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		req := f.payloads(t, CategoryScopeAmendmentRequested)
+		if len(req) != 1 {
+			t.Fatalf("requested entries = %d, want 1", len(req))
+		}
+		if _, ok := req[0]["slice_ownership"]; ok {
+			t.Errorf("a non-child payload carries slice_ownership: %v", req[0])
+		}
+	})
+
+	t.Run("plan-load error fails open", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		f.art.listErr = errors.New("artifact store outage")
+		if w := f.request(t, f.children[2].ID, "docs/b.md"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201 (fail-open):\n%s", w.Code, w.Body.String())
+		}
+		req := f.payloads(t, CategoryScopeAmendmentRequested)
+		so, _ := req[0]["slice_ownership"].(map[string]any)
+		if so["checked"] != false || !strings.Contains(so["error"].(string), "artifact store outage") {
+			t.Errorf("slice_ownership = %v, want checked=false naming the error", so)
+		}
+	})
+
+	t.Run("absent parent plan admits", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		bare := f.rr.seedRun() // no plan stage
+		child := seedGuardChild(f.rr, bare.ID, 0, run.StateRunning)
+		st := f.rr.seedStage(child.ID, 0, run.StageStateRunning)
+		st.Type = run.StageTypeImplement
+		if w := f.request(t, child.ID, "docs/b.md"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+		if _, ok := f.payloads(t, CategoryScopeAmendmentRequested)[0]["slice_ownership"]; ok {
+			t.Error("an absent plan must leave slice_ownership absent")
+		}
+	})
+
+	t.Run("sibling list error still refuses, child run id omitted", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		f.rr.listRunsErr = errors.New("list runs down")
+		w := f.request(t, f.children[2].ID, "docs/b.md")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		_, details := decodeErrorDetails(t, w.Body.Bytes())
+		cs := conflictOwners(t, details)
+		if len(cs) != 1 || cs[0]["owning_slice"] != float64(1) {
+			t.Fatalf("conflicts = %v", cs)
+		}
+		if _, ok := cs[0]["owning_child_run_id"]; ok {
+			t.Errorf("owning_child_run_id present despite the list error: %v", cs[0])
+		}
+	})
+
+	// C3(a): a failed refusal append never turns the refusal into a success.
+	t.Run("refusal audit append failure still refuses", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		f.au.appendErrCategory = CategoryScopeAmendmentRefused
+		if w := f.request(t, f.children[2].ID, "docs/b.md"); w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409 despite the append failure:\n%s", w.Code, w.Body.String())
+		}
+		if n := f.countRows(t); n != 0 {
+			t.Errorf("rows on the stage = %d, want 0", n)
+		}
+	})
+}
+
+func TestDecideScopeAmendment_SliceOwnership(t *testing.T) {
+	status := func(t *testing.T, f *sliceOwnershipFixture, id uuid.UUID) scopeamendment.Status {
+		t.Helper()
+		a, err := f.sa.GetByID(context.Background(), id)
+		if err != nil {
+			t.Fatalf("read back: %v", err)
+		}
+		return a.Status
+	}
+
+	t.Run("approve of a conflicting pending row refused, row stays pending", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/b.md")
+		w := f.decide(t, f.children[2].ID, id, "approve")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		if code, _ := decodeErrorDetails(t, w.Body.Bytes()); code != errCodeAmendmentPathOwnedBySibling {
+			t.Errorf("code = %q", code)
+		}
+		if !strings.Contains(w.Body.String(), "There is no override: DENY this amendment") {
+			t.Errorf("message does not tell the operator to deny:\n%s", w.Body.String())
+		}
+		if got := status(t, f, id); got != scopeamendment.StatusPending {
+			t.Errorf("row status = %q, want pending", got)
+		}
+		refused := f.payloads(t, CategoryScopeAmendmentRefused)
+		if len(refused) != 1 || refused[0]["phase"] != "decide" || refused[0]["amendment_id"] != id.String() {
+			t.Fatalf("scope_amendment_refused entries = %v, want one phase=decide naming the amendment", refused)
+		}
+		if len(f.payloads(t, CategoryScopeAmendmentDecided)) != 0 {
+			t.Error("a refused approve must not write scope_amendment_decided")
+		}
+	})
+
+	t.Run("deny always works", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/b.md")
+		if w := f.decide(t, f.children[2].ID, id, "deny"); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if got := status(t, f, id); got != scopeamendment.StatusDenied {
+			t.Errorf("row status = %q, want denied", got)
+		}
+	})
+
+	t.Run("approve of an ancestor-path row lands with slice_ownership", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/a.md")
+		if w := f.decide(t, f.children[2].ID, id, "approve"); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if got := status(t, f, id); got != scopeamendment.StatusApproved {
+			t.Errorf("row status = %q, want approved", got)
+		}
+		dec := f.payloads(t, CategoryScopeAmendmentDecided)
+		so, _ := dec[0]["slice_ownership"].(map[string]any)
+		if owned, _ := so["ancestor_owned"].([]any); so["checked"] != true || len(owned) != 1 {
+			t.Errorf("decided slice_ownership = %v, want checked with one ancestor_owned", so)
+		}
+	})
+
+	t.Run("plan-load error fails closed", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/b.md")
+		f.art.listErr = errors.New("artifact store outage")
+		w := f.decide(t, f.children[2].ID, id, "approve")
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		if code, _ := decodeErrorDetails(t, w.Body.Bytes()); code != errCodeSliceOwnershipCheckFailed {
+			t.Errorf("code = %q, want %q", code, errCodeSliceOwnershipCheckFailed)
+		}
+		if got := status(t, f, id); got != scopeamendment.StatusPending {
+			t.Errorf("row status = %q, want pending", got)
+		}
+	})
+
+	t.Run("already-decided conflicting row keeps amendment_already_decided", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/b.md")
+		if _, err := f.sa.Decide(context.Background(), scopeamendment.DecideParams{ID: id, Status: scopeamendment.StatusDenied, Reason: "no", DecidedBy: "op"}); err != nil {
+			t.Fatalf("pre-decide: %v", err)
+		}
+		w := f.decide(t, f.children[2].ID, id, "approve")
+		if code, _ := decodeErrorDetails(t, w.Body.Bytes()); w.Code != http.StatusConflict || code != "amendment_already_decided" {
+			t.Fatalf("status = %d code = %q, want 409 amendment_already_decided", w.Code, code)
+		}
+	})
+
+	// C3(a): a failed refusal append never turns the refusal into a success.
+	t.Run("refusal audit append failure keeps the row pending", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/b.md")
+		f.au.appendErrCategory = CategoryScopeAmendmentRefused
+		if w := f.decide(t, f.children[2].ID, id, "approve"); w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409 despite the append failure:\n%s", w.Code, w.Body.String())
+		}
+		if got := status(t, f, id); got != scopeamendment.StatusPending {
+			t.Errorf("row status = %q, want pending", got)
+		}
+	})
+
+	// C3(c): the nil-RunRepo skip is reachable only in an unconfigured
+	// deployment. Such a server cannot FILE a pending amendment (the request
+	// route answers 503 without a RunRepo), so the skip can only ever see a
+	// row seeded by construction; production fishhawkd wires RunRepo and
+	// ScopeAmendmentRepo together (cmd/fishhawkd/serve.go).
+	t.Run("nil RunRepo: request route 503s, decide skips the check", func(t *testing.T) {
+		sa := newFakeScopeAmendmentRepo()
+		s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa, AuditRepo: newAuditFake()})
+		runID := uuid.New()
+		w := postAmendment(t, s, runID, validAmendmentBody, func(r *http.Request) *http.Request {
+			return withRunBoundIdentity(r, runID, "write:scope-amendments")
+		})
+		if code, _ := decodeErrorDetails(t, w.Body.Bytes()); w.Code != http.StatusServiceUnavailable || code != "scope_amendment_unconfigured" {
+			t.Fatalf("request without RunRepo: status = %d code = %q, want 503 scope_amendment_unconfigured", w.Code, code)
+		}
+		id := seedAmendment(sa, runID, scopeamendment.StatusPending, "docs/b.md")
+		w = postDecision(t, s, runID, id, `{"decision":"approve","reason":"r"}`, func(r *http.Request) *http.Request {
+			return withOperatorIdentity(r, "write:stages")
+		})
+		if w.Code != http.StatusOK {
+			t.Fatalf("decide without RunRepo: status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+	})
+}

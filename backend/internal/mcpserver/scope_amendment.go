@@ -232,6 +232,12 @@ Returns the decided amendment row. Tool errors:
     the run succeeded or was cancelled before a decision; never approvable —
     recover with fishhawk_resume_run add_scope_files or fishhawk_retry_stage,
     409)
+  - amendment_path_owned_by_sibling_slice (a decomposition child's APPROVE
+    names a path a sibling slice that is not its depends_on ancestor
+    declares, #4679; the row stays pending and there is NO override — deny
+    it with the remedy as the reason, 409)
+  - slice_ownership_check_failed (the slice-ownership check could not read
+    the run or the parent's plan; the row stays pending — retry, 500)
   - self_decision (a run-bound agent token attempted the decision, 403)
   - insufficient_scope (token lacks write:stages, 403)
 `),
