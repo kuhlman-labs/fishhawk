@@ -123,6 +123,10 @@ type GetCampaignStatusOutput struct {
 	// DispatchHold passes the backend's active hotfix dispatch hold through
 	// (E83.100 / #4234).
 	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty" jsonschema:"present while a fishhawk_campaign_hotfix hold_dispatch hold is active: new implement dispatches of the campaign's other (non-expedited) items are refused campaign_dispatch_held until the hotfix item or its run is terminal or expires_at passes. Absent when not held"`
+
+	// PendingAmendments passes the backend's campaign-wide pending
+	// scope-amendment block through (E86.85 / #4486).
+	PendingAmendments *campaignPendingAmendments `json:"pending_amendments,omitempty" jsonschema:"every PENDING scope amendment on any run of the campaign (each item's linked run, whatever the item state, plus its recovery and decomposition descendants), oldest requested_at first; decision_live is true while the filing stage has not settled (an agent may still be waiting), false for a still-pending request on a settled stage. Decide one with fishhawk_decide_scope_amendment on amendment.run_id. ABSENT when the backend did not compute it — an older backend, a read failure, or a caller without read:audit — which is NOT the same claim as a present block with items [] (computed, none pending). truncated marks a run set past the backend's cap (#4486)"`
 }
 
 // appendCampaignItemsInput is the fishhawk_append_campaign_items tool's input.
@@ -973,6 +977,15 @@ scope_overlap block: per in-flight item, the OTHER in-flight items' runs (or the
 decomposition slices) sharing files with it, from one live scope-overlap read per
 item (at most 8; truncated beyond). Advisory: merging one of two overlapping items
 while the other is mid-implement can strand it.
+
+The response passes through a pending_amendments block (#4486): every PENDING
+scope amendment on any run of the campaign — each item's linked run, whatever
+the item state, plus its recovery and decomposition descendants — oldest first,
+each with its issue_ref, stage_state and decision_live (true while the filing
+stage has not settled, so its agent may still be waiting). Decide one with
+fishhawk_decide_scope_amendment on amendment.run_id. The block is ABSENT when
+the backend did not compute it (an older backend, a read failure, or a token
+without read:audit) — not the same claim as items [] (none pending).
 `),
 	}, resolver.getCampaignStatus)
 }
@@ -1010,6 +1023,7 @@ func (r *runResolver) getCampaignStatus(ctx context.Context, _ *mcp.CallToolRequ
 		ScopeOverlap:      r.campaignScopeOverlapFor(ctx, st.Items),
 		DependencyRefresh: st.DependencyRefresh,
 		DispatchHold:      st.DispatchHold,
+		PendingAmendments: st.PendingAmendments,
 	}, nil
 }
 

@@ -2113,6 +2113,10 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	items = holdObservedEdges(items, refresh)
 
 	hold := s.campaignDispatchHoldForStatus(r.Context(), c)
+	// Campaign-wide pending scope amendments (E86.85 / #4486), computed over
+	// the FINAL item slice. Omitted (not computed) for a caller without
+	// read:audit or on a read failure; the status read never fails on it.
+	pending := s.campaignPendingAmendmentsForStatus(r.Context(), c, items)
 
 	elig := campaign.NextEligible(items)
 	out := make([]campaignItemResponse, 0, len(items))
@@ -2139,6 +2143,9 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		body["dispatch_hold"] = toDispatchHoldPayload(hold, ref)
+	}
+	if pending != nil {
+		body["pending_amendments"] = pending
 	}
 	s.writeJSON(w, r, http.StatusOK, body)
 }
