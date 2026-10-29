@@ -18088,6 +18088,20 @@ paths:
         advance that fails the run. The refusal fires BEFORE the state CAS,
         so the stage keeps its state.
 
+        **Failed stage ahead (#4426).** A `pending` or
+        `awaiting_host_dispatch` stage sequenced after a stage that `failed`
+        returns 409 `dispatch_not_admissible` with `details.reason`
+        `earlier_stage_failed` (plus `details.failed_stage_id`,
+        `details.failed_stage_type` and `details.failure_category`), the same
+        rule the orchestrator applies when it walks a run: it never dispatches
+        past a failed stage. A category-C infrastructure failure of an
+        acceptance (#4356) or first-execution implement (#4426) stage parks the
+        run `running` instead of failing it, so the terminal-run refusal does
+        not cover the stages after it; retry or cancel the failed stage first.
+        A failed `deploy` ahead answers `deploy_not_succeeded` instead. The
+        refusal fires BEFORE the state CAS, so the stage keeps its state, and
+        the idempotent already-`dispatched` arm is not checked.
+
         **Decomposed-parent acceptance (#4080).** An `acceptance` stage of a
         run that has decomposed children is refused 409
         `acceptance_integration_incomplete` — on every state arm, the
@@ -18262,7 +18276,13 @@ paths:
               `details.deploy_stage_id` and `details.deploy_state`. It fires
               BEFORE the state CAS, so the stage keeps its state; retry once
               the deploy succeeded (a failed or cancelled deploy never clears
-              it).
+              it). Also the failed-stage-ahead refusal (#4426): a `pending` or
+              `awaiting_host_dispatch` stage sequenced after a `failed` stage
+              (a parked category-C acceptance or implement failure keeps the
+              run `running`) is refused with `details.reason`
+              `earlier_stage_failed`, `details.failed_stage_id`,
+              `details.failed_stage_type` and `details.failure_category`,
+              BEFORE the state CAS; retry or cancel the failed stage first.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not
