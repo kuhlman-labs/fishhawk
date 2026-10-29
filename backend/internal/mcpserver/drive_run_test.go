@@ -5052,6 +5052,52 @@ func TestDriveRun_HandoffPrecedentDegrades(t *testing.T) {
 	}
 }
 
+// TestDriveRun_ImplementStageFailedStops pins the #4426 stop (T-DR-1): a
+// running local run the server PARKED on a category-C implement failure
+// (implement failed, acceptance and review pending) stops with
+// implement_stage_failed and the implement_failed retry decision, marking no
+// host dispatch, spawning nothing and recording no act. Mechanism: without the
+// branch the pending acceptance stage is the earliest non-terminal stage but
+// its implement-succeeded precondition fails, so nothing is dispatchable and
+// the loop falls through to the observe-only gate call and stops stalled.
+func TestDriveRun_ImplementStageFailedStops(t *testing.T) {
+	impl := stg(driveImplID, "implement", "failed", 1)
+	cat := "C"
+	impl.FailureCategory = &cat
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+		stg(uuid.NewSHA1(uuid.Nil, []byte("acceptance")).String(), "acceptance", "pending", 2),
+		stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "pending", 3),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 300 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedImplementStageFailed {
+		t.Fatalf("stopped_reason = %q, want %q", out.StoppedReason, stoppedImplementStageFailed)
+	}
+	if out.NextActions == nil || out.NextActions.State != "implement_failed" || len(out.NextActions.Actions) == 0 ||
+		out.NextActions.Actions[0].Action != "fishhawk_retry_stage" || out.NextActions.Actions[0].Params["stage_id"] != driveImplID {
+		t.Fatalf("next_actions = %+v, want implement_failed leading with fishhawk_retry_stage{stage_id: %s}", out.NextActions, driveImplID)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on a parked run, want nothing", got)
+	}
+	f.mu.Lock()
+	nActs, nMarks := len(f.recordedActs), f.hostDispatchCalledN
+	f.mu.Unlock()
+	if nActs != 0 || nMarks != 0 {
+		t.Fatalf("recorded %d acts and %d host-dispatch marks on a parked run, want 0 and 0", nActs, nMarks)
+	}
+}
+
 // TestDriveRun_AcceptanceStageFailedStops pins the #4356 stop: a running run
 // the server PARKED on a category-C acceptance failure (acceptance failed,
 // review still pending) stops with acceptance_stage_failed and a retry

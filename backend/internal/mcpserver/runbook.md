@@ -238,7 +238,8 @@ revive is a batch retry-shaped re-open, not a budget bypass. Revive is
 **operator-token only** (`write:stages` or `write:retries`); a run-bound agent
 token is refused `403 agent_token_forbidden`. The failed-run `next_actions` arms
 (`implement_failed_category_a`, `implement_failed`) surface it alongside
-`fishhawk_retry_stage`.
+`fishhawk_retry_stage`, except that `implement_failed` omits it for the #4426
+parked variant (a category-C implement failure on a still-running run).
 
 **Provenance.** This one-verb section supersedes the pre-#1915
 retry-without-dispatch dance the 2026-07-12/13 drives used ([#1916](https://github.com/kuhlman-labs/fishhawk/issues/1916)):

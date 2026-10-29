@@ -213,6 +213,14 @@ const (
 	// in-flight walk would otherwise poll to the deadline. Nothing is recorded
 	// or spawned; next_actions lead with fishhawk_retry_stage for the stage.
 	stoppedAcceptanceStageFailed = "acceptance_stage_failed"
+	// stoppedImplementStageFailed is the stop for a non-terminal run whose
+	// implement stage FAILED — the server's category-C implement park (#4426):
+	// the run stays running with a failed implement stage below a pending
+	// acceptance/review, which the loop would otherwise walk past (dispatching
+	// downstream) or poll to the deadline. Nothing is recorded or spawned;
+	// next_actions are implementFailedNextActions, leading with
+	// fishhawk_retry_stage for the stage.
+	stoppedImplementStageFailed = "implement_stage_failed"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -275,7 +283,7 @@ type DriveStep struct {
 type DriveRunOutput struct {
 	RunID              string       `json:"run_id"`
 	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
-	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | context_cancelled"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | implement_stage_failed | context_cancelled"`
 	RunState           string       `json:"run_state"`
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -689,6 +697,17 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		if acc := stageByType(stages, "acceptance"); acc != nil && acc.State == "failed" {
 			out.StoppedReason = stoppedAcceptanceStageFailed
 			out.NextActions = acceptanceStageFailedNextActions(runRow, acc)
+			return nil, out, nil
+		}
+
+		// A failed implement stage on a non-terminal run is the server's
+		// category-C implement park (#4426): stop with the retry decision rather
+		// than walking on to the pending acceptance/review stages below it (the
+		// server never dispatches past a failed stage, and host-dispatch refuses
+		// it 409 earlier_stage_failed). Nothing is recorded or spawned.
+		if impl := stageByType(stages, "implement"); impl != nil && impl.State == "failed" {
+			out.StoppedReason = stoppedImplementStageFailed
+			out.NextActions = implementFailedNextActions(runRow, stageByType(stages, "plan"), stageByType(stages, "review"), impl)
 			return nil, out, nil
 		}
 
