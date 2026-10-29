@@ -24,7 +24,9 @@ settle carries.
   this pump → the admission's answer. Already live → the pass is started for
   the new head directly. `fan_in` is NOT serialized (it gates the
   consolidated review that precedes approval); it still routes through
-  `local-verify:<host>` because routing keys on the live trigger.
+  `local-verify:<host>` because routing keys on the live trigger. The D5
+  fan-in hold starts its pass as `fan_in` whatever the head classifies as
+  (#4812, § "Consolidated fan-in verify hold").
 - **Pending replacement (D2).** `beginMergeCandidateVerifyPass` (the direct
   start): a live trigger for an OLDER head whose implement stage is
   `pending`/`awaiting_host_dispatch` is replaced by appending a trigger for
@@ -1288,3 +1290,28 @@ At a CLEAN base advance Fishhawk performed (the rebase verb's performed forge me
 - **Gate view `merge_candidate_verdict`** (`gateViewMergeCandidateVerdictFor`, handler only). ALWAYS present: `transfer_mode`; `head_sha` — the run's current head as the chain records it (`gateViewCurrentHead`: the highest-sequence head across `pull_request_opened`, `child_pushed`, `fixup_pushed`, `acceptance_scenarios_pushed`, `conflict_resolution_pushed`, `operator_commit_vouched` and a performed `branch_rebased`) — with `state` / `cause` / `source` (`recorded` | `transferred`) / `transferred_from` / `root_head` from `mergeCandidateVerifyState` for EXACTLY that head, so a fix-up or conflict-resolution push after a transfer reports the new head and never the older transferred verdict; `last_transfer_refusal` (the newest refused row); `shadow[]`, each paired AT READ TIME with the newest recorded `merge_candidate_verified` result for its `to_head` (`pass_result`, `false_transfer = would_transfer && pass_result == failed`); `false_transfers[]`. Any read failure (or no audit repository) omits the block and adds a `merge_candidate_verdict` `history_gaps` entry — never a partial block.
 - **Residuals.** A delta REMOVING a package H' imports makes H' fail `go list`, so the decision is `undecidable`, not `reach_overlap` — fail closed and deliberate. A shadow row lost to a restart is a measurement gap, never a skipped pass. The gate view's head is chain-derived: an out-of-band push the operator never vouched is not seen there (the merge gate reads the forge head). A transfer sets the queue entry's phase `passed`, which ADR-093 merge-on-pass merges like a pass.
 - **Tests.** `merge_candidate_transfer_test.go` (one per ladder arm, false transfer in both arrival orders, the prompt-render exclusion), `merge_candidate_transfer_e2e_test.go` (real git + real classifier through the real rebase handler), `merge_candidate_transfer_surface_e2e_test.go` (the same path over the DECLARED surface: a non-Go repository refused `unsupported_language` in enforce and never `would_transfer` in shadow, a nested Go module not a workspace, `surface_undeclared`, `unclassified_path`, a declared-inert transfer carrying `surface_unmatched` / `surface_digest` / provenance, a checkout declaration never read, and a workflow-spec change forcing a pass), `rebase_branch_test.go`, `merge_candidate_queue_test.go`, `gateview_test.go` (`TestGateView_MergeCandidateVerdict*`, `TestGateView_ShadowPairingFalseTransfer`, `TestGateView_LastTransferRefusalHostileReasonInert`) and `mcpserver`'s `TestMergeCandidateVerdict_WireShape`.
+
+## Consolidated fan-in verify hold (`fanin_verify.go`, ADR-090 D5 / #4018, #4812)
+
+`holdConsolidatedReviewForFanInVerify` runs whenever `DispatchConsolidatedReview` has resolved a decomposed parent's consolidated head: the first consolidated round, its re-run (`fishhawk_rerun_review`), the release Advance after a pass reports, and a post-review re-fire. It holds the round until the head's merge-candidate state is `passed` or `not_required`; with acceptance ahead of review, `FanInVerifySettled` holds acceptance on the same head.
+
+- **Forced cause.** An `unverified` head starts its pass with cause `fan_in`, whatever `classifyMergeCandidateHead` answers (logged as `head_cause`). This applies ADR-090 D5 (the consolidated review waits for a passed verify of the fan-in head) and ADR-092 D1 (`fan_in` precedes approval, so it is not serialized); no amending ADR is needed. Before #4812 the hold forwarded the classified cause: a head carrying a base merge classifies `base_advance`, a serialized cause, so the start went into `serializeMergeCandidateVerifyPass`, which for a parent with no active entry and no merge-queue eligibility (its consolidated review has not run) answers `not_queued` and starts nothing. The hold logged that as a started pass and held forever.
+- **Untouched.** ADR-093 queue admission (`merge_candidate_queue.go`) is unchanged. The merge gate still requires a verdict for exactly the merge-time head, and a later base advance at merge goes through the queue as before. Verdicts bind by head, not by cause (`newestMergeCandidateVerdict`, `mergeCandidateVerifyState`), so a `fan_in` pass on a `base_advance` head satisfies every reader of that head.
+- **Start answers** (`fanInHoldOnStart`). Only an `in_flight` answer with `Triggered` true is a start.
+
+  | Answer | Hold | Log |
+  |---|---|---|
+  | refusal | hold | WARN `could not be started`, the refusal |
+  | nil answer | hold | WARN `returned no answer` |
+  | `not_required`, `passed` | release | none |
+  | `in_flight`, triggered | hold | INFO `pass started`, `stage_id`, `triggered=true` |
+  | `in_flight`, untriggered | hold | INFO `already in flight`, `stage_id` |
+  | `failed` | hold | WARN `FAILED`, route `fishhawk_fixup_stage` |
+  | `not_queued` | hold | WARN `start_state=not_queued`: nothing enqueued or started |
+  | `held` | hold | WARN `start_state=held`, `position`, `live_run_id` |
+  | any other state | hold | WARN `start_state=<state>` |
+
+  Only the triggered `in_flight` record contains `pass started`.
+- **Recovery for a parent wedged before #4812** (e.g. c4d9aa3e / #4810): re-run the first consolidated round (`fishhawk_rerun_review`) or Advance the run. Either runs the hold, which now starts the `fan_in` pass; dispatch the re-opened parent implement stage.
+- **Residual: a direct pass beside a queue entry.** The forced `fan_in` start takes the direct `beginMergeCandidateVerifyPass` path and skips `applyMergeCandidateStartToEntry` in two cases: (1) the parent holds an ACTIVE HELD queue entry, and (2) the parent holds a LIVE entry whose head went unverified (e.g. a `not_executed` settle after admission). No queue state is written. Per-head idempotence covers both: a later pump or admission reads `in_flight` or `passed` for the same head, and an admission that advances the branch produces a new head that needs its own pass.
+- **Tests** (`fanin_verify_test.go`). `TestFanInHold_BaseAdvanceHead_StartsFanInPass` (one `fan_in` trigger, implement re-opened, zero `Enqueue`), `TestFanInHold_BaseAdvanceHead_ActiveHeldEntry_StartsDirectPass` (residual case 1: a direct pass, no queue write), `TestFanInAcceptanceHold_BaseAdvanceHead_EndToEnd` (`FanInVerifySettled` false then true, acceptance released, one consolidated round), `TestFanInHold_BaseAdvanceHead_PassedVerdictReleases` and `TestFanInHoldOnStart_Answers` (one row per answer, `not_queued` taken from the real start). Each base-advance test first asserts that the head classifies `base_advance` and that a `base_advance` start routes through the queue.

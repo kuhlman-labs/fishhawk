@@ -20,7 +20,10 @@ import (
 //   - holdConsolidatedReviewForFanInVerify is consulted by
 //     DispatchConsolidatedReview once the compare has resolved the consolidated
 //     head. It triggers the verify-only pass (system actor) when the head is
-//     unverified and holds the round until a verdict lands.
+//     unverified and holds the round until a verdict lands. The pass ALWAYS
+//     starts with cause fan_in (#4812, ADR-092 D1: fan_in precedes approval),
+//     whatever the head classifies as, and fanInHoldOnStart reads the start
+//     answer explicitly: only a triggered in_flight answer is a start.
 //   - fanInVerifyGateRun turns the head's recorded `passed` row into the
 //     GateVerifyRun runImplementReviewsForTree injects on a consolidated round.
 //
@@ -54,9 +57,15 @@ import (
 //   - failed: hold, and start nothing. The merge gate names fishhawk_fixup_stage
 //     and the report arm already applied D6; a fix-up's new head is runner-gated.
 //   - in_flight: hold; the live pass's report releases it.
-//   - unverified: start the pass under the system actor and hold. A start that
-//     answers not_required or passed (the chain moved between the two reads)
-//     releases instead.
+//   - unverified: start the pass under the system actor with cause fan_in and
+//     hold (#4812). The cause is FORCED: a consolidated head carrying a base
+//     merge classifies base_advance (or conflict_resolution), a serialized
+//     cause the ADR-092 queue would route into serializeMergeCandidateVerifyPass,
+//     which answers not_queued (and starts nothing) for a parent whose
+//     consolidated review has not run. The start answer is read by
+//     fanInHoldOnStart: not_required or passed (the chain moved between the two
+//     reads) releases; a triggered in_flight is the only answer logged as a
+//     started pass; every other answer holds with a log naming it.
 //
 // FAIL-CLOSED: a state read error, a refused start, or an unknown state holds
 // with a WARN. Dispatching the gating review on a head whose verify state is
@@ -88,38 +97,95 @@ func (s *Server) holdConsolidatedReviewForFanInVerify(ctx context.Context, runRo
 			append(logAttrs, slog.String("stage_id", state.StageID.String()))...)
 		return true
 	case mergeCandidateStateUnverified:
-		cause := state.Cause
-		if !validMergeCandidateCause(cause) {
-			cause = mergeCandidateCauseFanIn
-		}
+		// #4812, ADR-092 D1 (fan_in precedes approval): the hold gates the
+		// consolidated review that precedes approval, so its pass is never a
+		// queue-serialized cause, even when the head classifies base_advance (an
+		// operator-vouched or server-advanced base merge) or conflict_resolution.
+		// The merge gate still reads a verdict for exactly the merge-time head,
+		// and a later base advance at merge goes through the queue as today.
+		cause := mergeCandidateCauseFanIn
+		logAttrs = append(logAttrs, slog.String("head_cause", state.Cause))
 		start, refusal := s.startMergeCandidateVerifyPass(ctx, runRow.ID, mergeCandidateVerifyParams{
 			Branch:  branch,
 			BaseRef: base,
 			HeadSHA: headSHA,
 			Cause:   cause,
 		}, mergeCandidateSystemActor())
-		if refusal != nil {
-			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-				"consolidated review: merge-candidate verify pass could not be started — holding the review",
-				append(logAttrs, slog.String("refusal", refusal.Reason))...)
-			return true
-		}
-		if start.State == mergeCandidateStateNotRequired || start.State == mergeCandidateStatePassed {
-			return false
-		}
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"consolidated review: merge-candidate verify pass started for the fan-in head — holding the review; dispatch the parent implement stage",
-			append(logAttrs,
-				slog.String("cause", cause),
-				slog.String("stage_id", start.StageID.String()),
-				slog.Bool("triggered", start.Triggered))...)
-		return true
+		return s.fanInHoldOnStart(ctx, logAttrs, cause, start, refusal)
 	default:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"consolidated review: unknown merge-candidate verify state — holding the review",
 			append(logAttrs, slog.String("state", state.State))...)
 		return true
 	}
+}
+
+// fanInHoldOnStart reads the answer of the D5 hold's pass start and reports
+// whether the consolidated review must be held (#4812). Only an in_flight answer
+// that THIS start triggered is logged as a started pass; every other answer is
+// named by its state, so a start that enqueued or started nothing can never
+// read as a live pass:
+//
+//   - a refusal or a nil answer: hold, WARN;
+//   - not_required or passed: release (the chain moved between the two reads);
+//   - in_flight, triggered: hold, INFO "pass started";
+//   - in_flight, untriggered: hold, INFO (a live pass already runs for the head);
+//   - failed: hold, WARN naming the fix-up;
+//   - not_queued, held, or an unknown state: hold, WARN naming start_state.
+func (s *Server) fanInHoldOnStart(ctx context.Context, logAttrs []slog.Attr, cause string,
+	start *mergeCandidateVerifyStart, refusal *mergeCandidateVerifyRefusal) bool {
+	if refusal != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"consolidated review: merge-candidate verify pass could not be started — holding the review",
+			append(logAttrs, slog.String("refusal", refusal.Reason))...)
+		return true
+	}
+	if start == nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"consolidated review: merge-candidate verify start returned no answer — holding the review",
+			append(logAttrs, slog.String("cause", cause))...)
+		return true
+	}
+	if start.State == mergeCandidateStateNotRequired || start.State == mergeCandidateStatePassed {
+		return false
+	}
+	if start.State == mergeCandidateStateInFlight && start.Triggered {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"consolidated review: merge-candidate verify pass started for the fan-in head — holding the review; dispatch the parent implement stage",
+			append(logAttrs,
+				slog.String("cause", cause),
+				slog.String("stage_id", start.StageID.String()),
+				slog.Bool("triggered", true))...)
+		return true
+	}
+	attrs := append(logAttrs, slog.String("cause", cause), slog.String("start_state", start.State))
+	switch start.State {
+	case mergeCandidateStateInFlight:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"consolidated review: merge-candidate verify pass already in flight for the fan-in head — holding the review until it reports",
+			append(attrs, slog.String("stage_id", start.StageID.String()))...)
+	case mergeCandidateStateFailed:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"consolidated review: merge-candidate verify FAILED for the fan-in head — holding the review; route a fix-up with fishhawk_fixup_stage",
+			attrs...)
+	case mergeCandidateStateNotQueued:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"consolidated review: the merge-candidate verify start answered not_queued: nothing was enqueued or started — holding the review",
+			attrs...)
+	case mergeCandidateStateHeld:
+		liveRunID := ""
+		if start.LiveRunID != nil {
+			liveRunID = start.LiveRunID.String()
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"consolidated review: the merge-candidate verify start answered held behind the base's live pass: nothing was started — holding the review",
+			append(attrs, slog.Int("position", start.Position), slog.String("live_run_id", liveRunID))...)
+	default:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"consolidated review: unknown merge-candidate verify start answer — holding the review",
+			attrs...)
+	}
+	return true
 }
 
 var _ orchestrator.FanInVerifyGate = (*Server)(nil)
