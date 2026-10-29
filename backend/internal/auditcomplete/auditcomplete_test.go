@@ -3332,3 +3332,99 @@ func TestConflictResolutionSeamConstant_MatchesStoredRowLiteral(t *testing.T) {
 		}
 	}
 }
+
+// TestCompute_StageNotTerminalHeadline pins the #4801 check-run headline shapes
+// for a mid-flight stage: re-opened + dispatchable names the re-open, a plain
+// dispatchable acceptance reads "(not dispatched)", an in-flight one reads
+// "(in flight)", and a non-acceptance stage carries no suffix.
+func TestCompute_StageNotTerminalHeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		typ      run.StageType
+		state    run.StageState
+		reopened bool
+		suffix   string
+	}{
+		{"reopened_pending", run.StageTypeAcceptance, run.StageStatePending, true, " — re-opened by a fix-up push, not re-dispatched"},
+		{"pending", run.StageTypeAcceptance, run.StageStatePending, false, " (not dispatched)"},
+		{"running", run.StageTypeAcceptance, run.StageStateRunning, false, " (in flight)"},
+		{"reopened_running", run.StageTypeAcceptance, run.StageStateRunning, true, " (in flight)"},
+		{"implement_running", run.StageTypeImplement, run.StageStateRunning, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, runs, arts, ar := happyPath(t)
+			st := mkStage(runID, 4, tc.typ, tc.state)
+			runs.stages = append(runs.stages, st)
+			if tc.reopened {
+				ar.appendChained(t, runID, &st.ID, "acceptance_reopened", json.RawMessage(`{"prior_state":"succeeded"}`))
+			}
+			_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if len(missing) != 1 {
+				t.Fatalf("missing = %+v, want one item", missing)
+			}
+			want := string(tc.typ) + " stage " + st.ID.String()[:8] + " " + string(tc.state) + tc.suffix
+			if missing[0].Headline != want {
+				t.Errorf("headline = %q, want %q", missing[0].Headline, want)
+			}
+		})
+	}
+}
+
+// TestCompute_ReopenedLookupReadError_HeadlineFailsOpen: the acceptance_reopened
+// read failing degrades the headline to the un-reopened shape, never an error.
+func TestCompute_ReopenedLookupReadError_HeadlineFailsOpen(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStatePending)
+	runs.stages = append(runs.stages, acc)
+	ar.appendChained(t, runID, &acc.ID, "acceptance_reopened", nil)
+	ar.catErr = map[string]error{"acceptance_reopened": errors.New("boom")}
+	_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute must not error: %v", err)
+	}
+	if len(missing) != 1 || !strings.HasSuffix(missing[0].Headline, " (not dispatched)") {
+		t.Errorf("missing = %+v, want the generic (not dispatched) headline", missing)
+	}
+}
+
+// TestHeldHeadline pins the title cause: the Kind fallback, the +N suffix, and
+// (C4a) the preference for an ACCEPTANCE stage_not_terminal item over a
+// positionally-first one.
+func TestHeldHeadline(t *testing.T) {
+	if got := auditcomplete.HeldHeadline(nil); got != "" {
+		t.Errorf("empty = %q, want empty", got)
+	}
+	one := []auditcomplete.MissingItem{{Kind: auditcomplete.MissingReviewPending, Detail: "d"}}
+	if got := auditcomplete.HeldHeadline(one); got != string(auditcomplete.MissingReviewPending) {
+		t.Errorf("kind fallback = %q", got)
+	}
+	two := []auditcomplete.MissingItem{
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "implement stage aaaaaaaa running"},
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "acceptance stage bbbbbbbb pending (not dispatched)"},
+	}
+	if got, want := auditcomplete.HeldHeadline(two), "acceptance stage bbbbbbbb pending (not dispatched) (+1 more)"; got != want {
+		t.Errorf("acceptance-preferred = %q, want %q", got, want)
+	}
+	noAcc := []auditcomplete.MissingItem{
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "implement stage aaaaaaaa running"},
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "plan stage cccccccc running"},
+	}
+	if got, want := auditcomplete.HeldHeadline(noAcc), "implement stage aaaaaaaa running (+1 more)"; got != want {
+		t.Errorf("first-item fallback = %q, want %q", got, want)
+	}
+}
+
+// TestMissingItem_HeadlineNeverOnTheWire pins the REST surface: Headline is a
+// check-run rendering hint and must not marshal.
+func TestMissingItem_HeadlineNeverOnTheWire(t *testing.T) {
+	b, err := json.Marshal(auditcomplete.MissingItem{Kind: auditcomplete.MissingStageNotTerminal, Detail: "d", Headline: "h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(b)), "headline") {
+		t.Errorf("marshalled MissingItem = %s, want no headline key", b)
+	}
+}
