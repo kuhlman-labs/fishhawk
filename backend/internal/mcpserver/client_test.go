@@ -5249,3 +5249,32 @@ func TestMergeRunWith_OverlapOverrideWireShape(t *testing.T) {
 		t.Fatalf("err = %v, want a 409 overlapping_implement_in_flight *apiError with details", err)
 	}
 }
+
+// TestRunMirror_DecodesDefaultBranch decodes RAW bytes keyed exactly as the
+// backend runResponse emits them (#4660) into the client Run mirror (#4758).
+// The fake-backend tests marshal the client's OWN Run struct, so a tag typo
+// round-trips symmetrically there; this is the tag pin that does not depend on
+// a fake.
+func TestRunMirror_DecodesDefaultBranch(t *testing.T) {
+	var resolved Run
+	if err := json.Unmarshal([]byte(`{"id":"r1","default_branch":"trunk"}`), &resolved); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if resolved.DefaultBranch != "trunk" {
+		t.Errorf("DefaultBranch = %q, want trunk from the backend key default_branch", resolved.DefaultBranch)
+	}
+	var unresolved Run
+	if err := json.Unmarshal([]byte(`{"id":"r1","default_branch_unresolved_reason":"forge_unsupported"}`), &unresolved); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if unresolved.DefaultBranchUnresolvedReason != "forge_unsupported" {
+		t.Errorf("DefaultBranchUnresolvedReason = %q, want forge_unsupported from the backend key default_branch_unresolved_reason", unresolved.DefaultBranchUnresolvedReason)
+	}
+	var absent Run
+	if err := json.Unmarshal([]byte(`{"id":"r1"}`), &absent); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if absent.DefaultBranch != "" || absent.DefaultBranchUnresolvedReason != "" {
+		t.Errorf("keys omitted (older backend / list read) must decode to empty; got %q / %q", absent.DefaultBranch, absent.DefaultBranchUnresolvedReason)
+	}
+}

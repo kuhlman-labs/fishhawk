@@ -23,10 +23,12 @@ import (
 // Scope, by design: an AST scan of a FIXED file list. It does not catch a
 // branch name assembled at runtime, or a literal in a file outside the list.
 //
-// #4758 [E93.11] is where this list grows: when the four MCP spawn verbs
-// resolve their base through this package, extend guardedFiles with
-// ../mcpserver/run_stage.go, dispatch_stage.go, drive_run.go and
-// run_children.go in that change.
+// The list grew in #4758 [E93.11]: the four MCP spawn verbs
+// (mcpserver/run_stage.go, dispatch_stage.go, drive_run.go and
+// run_children.go) now derive an omitted base_branch from the run's
+// default_branch (resolved through this package server-side) and refuse when
+// it is unresolved, so they carry no literal main either. The allow-list stays
+// EMPTY.
 
 // pkgSrcDir is the package source dir captured at init (go test runs the
 // binary from it), never runtime.Caller (backend/internal/testanchor).
@@ -40,7 +42,7 @@ func mustGetwd() string {
 	return dir
 }
 
-// guardedFiles are the production files #4660 changed, relative to
+// guardedFiles are the production files #4660 and #4758 changed, relative to
 // backend/internal.
 var guardedFiles = []string{
 	"defaultbranch/defaultbranch.go",
@@ -53,6 +55,10 @@ var guardedFiles = []string{
 	"server/deploy_rollback.go",
 	"server/runs.go",
 	"../cmd/fishhawkd/serve.go",
+	"mcpserver/run_stage.go",
+	"mcpserver/dispatch_stage.go",
+	"mcpserver/drive_run.go",
+	"mcpserver/run_children.go",
 }
 
 // literalMainAllowList maps "<file>:<func>" to the reviewed reason a literal

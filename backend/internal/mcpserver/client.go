@@ -264,6 +264,19 @@ type Run struct {
 	// producer that derived its target from a list read would refuse
 	// spuriously. The json tag MUST byte-match the backend's runResponse field.
 	ForgeBaseURL string `json:"forge_base_url,omitempty" jsonschema:"a gitlab run's instance root (single-run read only); absent for a github run"`
+	// DefaultBranch and DefaultBranchUnresolvedReason mirror the backend
+	// runResponse.default_branch / default_branch_unresolved_reason (#4660):
+	// the run's repository base branch resolved from the forge at READ time,
+	// or the closed defaultbranch reason it could not be. The backend emits
+	// them on the SINGLE-run read ONLY (handleGetRun) and a post-#4660
+	// fishhawkd sets exactly one; both are absent on a list read and on an
+	// older backend. resolveSpawnBaseBranch (#4758) derives every runner
+	// spawn's omitted base_branch from them. The json tags MUST byte-match the
+	// backend's runResponse fields or this mirror silently decodes to empty
+	// and every omitted base_branch refuses as not_reported — the #371-class
+	// hand-maintained-wire-mirror trap.
+	DefaultBranch                 string `json:"default_branch,omitempty" jsonschema:"the run's forge default branch (single-run read only); a post-#4660 fishhawkd sets exactly one of default_branch and default_branch_unresolved_reason, and both are absent on a list read and on an older backend"`
+	DefaultBranchUnresolvedReason string `json:"default_branch_unresolved_reason,omitempty" jsonschema:"why the run's default branch could not be resolved (single-run read only); a post-#4660 fishhawkd sets exactly one of default_branch and default_branch_unresolved_reason, and both are absent on a list read and on an older backend"`
 	// Capabilities mirrors the backend runResponse.capabilities block (#3628):
 	// what THIS DEPLOYMENT can serve for the run. The backend emits it on the
 	// SINGLE-run read ONLY (handleGetRun) — the list route omits it — so a Run

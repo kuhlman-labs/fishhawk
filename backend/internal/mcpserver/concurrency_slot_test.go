@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
@@ -97,11 +98,12 @@ type slotSpawnRecorder struct {
 	mu       sync.Mutex
 	binaries []string
 	stages   []string
+	argvs    [][]string // argvs[i] pairs with stages[i] (#4758)
 	err      error
 	errFor   map[string]bool // stage ids whose spawn fails
 }
 
-func (s *slotSpawnRecorder) spawn(binary string, _, _ []string, _, stageID string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
+func (s *slotSpawnRecorder) spawn(binary string, argv, _ []string, _, stageID string, _ detachedFailureReporter, _ detachedStageStateProbe) (string, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	if s.err != nil || s.errFor[stageID] {
@@ -109,7 +111,15 @@ func (s *slotSpawnRecorder) spawn(binary string, _, _ []string, _, stageID strin
 	}
 	s.binaries = append(s.binaries, binary)
 	s.stages = append(s.stages, stageID)
+	s.argvs = append(s.argvs, append([]string(nil), argv...))
 	return "/dev/null", nil
+}
+
+// spawnedArgvs returns a copy of every recorded spawn's argv.
+func (s *slotSpawnRecorder) spawnedArgvs() [][]string {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]string(nil), s.argvs...)
 }
 
 func (s *slotSpawnRecorder) spawned() []string {
@@ -589,8 +599,20 @@ func newE2ESlotFixture(t *testing.T) *e2eSlotFixture {
 
 // newE2ESlotFixtureWith is newE2ESlotFixture with the server's Postgres
 // concurrency store passed through wrap (nil: unwrapped), the seam a test uses
-// to act INSIDE an in-flight admission.
+// to act INSIDE an in-flight admission. The server resolves every run's
+// default branch to "main" (a defaultbranch.Static source, #4758).
 func newE2ESlotFixtureWith(t *testing.T, wrap func(concurrency.Store) concurrency.Store) *e2eSlotFixture {
+	t.Helper()
+	return newE2ESlotFixtureWithDefaultBranch(t, wrap, defaultbranch.Static("main"))
+}
+
+// newE2ESlotFixtureWithDefaultBranch is newE2ESlotFixtureWith with the real
+// server's default-branch source passed explicitly (#4758): src reaches
+// server.Config.DefaultBranch, so GET /v0/runs/{run_id} carries
+// default_branch (or default_branch_unresolved_reason) exactly as fishhawkd
+// would. A nil src is an UNCONFIGURED resolver: every run then reports
+// resolver_unconfigured.
+func newE2ESlotFixtureWithDefaultBranch(t *testing.T, wrap func(concurrency.Store) concurrency.Store, src defaultbranch.Source) *e2eSlotFixture {
 	t.Helper()
 	ctx := context.Background()
 	pool := pgtest.NewPool(t)
@@ -601,9 +623,10 @@ func newE2ESlotFixtureWith(t *testing.T, wrap func(concurrency.Store) concurrenc
 	}
 	const bearer = "fhk_slot_waiter_e2e"
 	s := server.New(server.Config{
-		RunRepo:     runRepo,
-		AuditRepo:   audit.NewPostgresRepository(pool),
-		Concurrency: store,
+		RunRepo:       runRepo,
+		AuditRepo:     audit.NewPostgresRepository(pool),
+		Concurrency:   store,
+		DefaultBranch: src,
 		APITokenRepo: &stubMCPAPITokens{tok: &apitoken.Token{
 			ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "write:runs", "write:approvals"}, PlainText: bearer,
 		}},

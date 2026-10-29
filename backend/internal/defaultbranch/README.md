@@ -38,8 +38,10 @@ Through the real `githubclient`, a response missing `default_branch` is a plain 
 
 ## Consumers (#4660)
 
-Slice A: the orchestrator's consolidated PR, fan-in base and consolidated-review trigger (`orchestrator/README.md` § "Base-branch resolution"); the server's first-round review re-run (`server/README.md` § "Default-branch resolution"); `githubclient.ListRulesetRequiredChecks`. Each refuses on its own existing failure surface with no new audit category. Not covered: the four MCP spawn verbs (#4758), the webhook dispatchers' `DefaultRef`, and `runnerbackend.GitHubActions`' `workflow_dispatch` ref, which keeps its own `main` default.
+Slice A: the orchestrator's consolidated PR, fan-in base and consolidated-review trigger (`orchestrator/README.md` § "Base-branch resolution"); the server's first-round review re-run (`server/README.md` § "Default-branch resolution"); `githubclient.ListRulesetRequiredChecks`. Each refuses on its own existing failure surface with no new audit category. The four MCP spawn verbs (#4758: `fishhawk_run_stage`, `fishhawk_dispatch_stage`, `fishhawk_drive_run`, `fishhawk_run_children`) consume this package's result over the wire: an omitted `base_branch` resolves to the run's `default_branch` from `GET /v0/runs/{run_id}`, and the verb refuses naming `default_branch_unresolved_reason` (or the MCP-local `not_reported`) when it is unresolved (`mcpserver/README.md` § "Base branch"). Not covered: the webhook dispatchers' `DefaultRef`, and `runnerbackend.GitHubActions`' `workflow_dispatch` ref, which keeps its own `main` default.
 
 ## Tests
 
 `defaultbranch_test.go`: one test per reason and per cache rule (positive/negative hit and expiry, caller-cancel exclusion, own-timeout negative caching, key separation and case folding, the bound, concurrent `-race` resolve), `Static`, and the error type.
+
+`guard_test.go`: the literal-main guard (`TestNoLiteralMainBaseInResolvedPaths`) parses a FIXED list of production files with `go/ast` and fails on any `main` / `…/main` string literal outside a reviewed allow-list, which is EMPTY. The list grew in #4758 to cover the four MCP spawn-verb files (`mcpserver/run_stage.go`, `dispatch_stage.go`, `drive_run.go`, `run_children.go`).
