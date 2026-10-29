@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"strings"
 
@@ -16,18 +17,23 @@ import (
 // The #4079 incident: a decomposition child passed its agent pass, then
 // CommitAndPush's FreshFetchBase arm stashed the agent's edits and the fetch of
 // the consolidated base failed. The work survived only as an anonymous entry on
-// the repository's SHARED stash stack, and the operator rescued it by hand. The
+// the repository's SHARED stash stack, and the operator rescued it by hand.
+// (Since ADR-115 D2 / #4648 CommitAndPush saves those edits as a stash-shaped
+// snapshot commit at refs/fishhawk/stash/<stage> instead, never on the shared
+// stack; the "-stash" pin below pins that snapshot commit.) The
 // helpers below make every recovery point a NAMED ref and let a child's
 // gate-verified work resume without re-running the agent.
 //
 // The ref namespace is refs/fishhawk/checkpoints/<run_id>/<stage_id> (the held,
 // gate-verified commit a push-kind checkpoint resumes from) plus the same path
-// with a "-stash" suffix (the stash commit holding stranded edits) and, since
+// with a "-stash" suffix (the stash-shaped snapshot commit holding stranded
+// edits) and, since
 // #4190, a "-verify" suffix (the head of the last verify_run a committed-tree
 // gate failed, verifyheadpin.go). All are LOCAL-ONLY: they are never pushed and
 // are invisible to branch-based tooling.
-// They exist so git gc (which prunes only unreachable objects), a stash drop by
-// another session, or a worktree teardown cannot orphan the work. refs/fishhawk/*
+// They exist so git gc (which prunes only unreachable objects), the stage-end
+// snapshot sweep (dropStageSnapshot), or a worktree teardown cannot orphan the
+// work. refs/fishhawk/*
 // is shared by every worktree of the repository (only refs/worktree/, refs/bisect/
 // and refs/rewritten/ are per-worktree), so a retry dispatched into a different
 // worktree of the same repository still sees them.
@@ -66,14 +72,63 @@ func checkpointStashRef(runID, stageID string) string {
 	return checkpointRef(runID, stageID) + checkpointStashSuffix
 }
 
+// checkpointGitRun executes `git -C repoDir <args...>` and returns its combined
+// output. It runs under gitops.LockRetryLocaleEnv so a lockfile-contention
+// failure carries the untranslated message gitops.IsLockContention matches. A
+// package-level seam so a test can inject or observe an attempt.
+var checkpointGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoDir}, args...)...)
+	cmd.Env = append(os.Environ(), gitops.LockRetryLocaleEnv()...)
+	return cmd.CombinedOutput()
+}
+
+// checkpointGit runs a checkpoint ref write through gitops.RetryLockContention:
+// refs/fishhawk/* is shared by every worktree of the repository, so a sibling
+// stage's git briefly holding the ref's (or packed-refs') lock waits within the
+// gitops bound instead of losing the pin. Any other failure (a CAS mismatch, an
+// invalid ref name) returns on the first attempt, unchanged (ADR-115 D2, #4648).
+func checkpointGit(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+	return gitops.RetryLockContention(ctx, func() ([]byte, error) { return checkpointGitRun(ctx, repoDir, args...) })
+}
+
 // pinCheckpointRef points ref at sha with `git update-ref`. An empty sha or an
 // invalid ref name is git's own refusal.
 func pinCheckpointRef(ctx context.Context, repoDir, ref, sha string) error {
-	out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "update-ref", ref, sha).CombinedOutput()
+	out, err := checkpointGit(ctx, repoDir, "update-ref", ref, sha)
 	if err != nil {
 		return fmt.Errorf("git update-ref %s %s: %w (%s)", ref, sha, err, strings.TrimSpace(string(out)))
 	}
 	return nil
+}
+
+// dropSnapshotRef deletes a stage's snapshot ref; a seam so a test can inject
+// a delete failure.
+var dropSnapshotRef = func(ctx context.Context, repoDir, key string) error {
+	return (&gitops.Pusher{}).DropSnapshotRef(ctx, repoDir, key)
+}
+
+// dropStageSnapshot is the stage-end sweep of CommitAndPush's pre-commit
+// snapshot ref, refs/fishhawk/stash/<stageID> (ADR-115 D2, #4648). CommitAndPush
+// drops its snapshot on success, so the ref survives only where a restore
+// CONFLICT retained it for the typed error; the #4079 base-fetch arm has
+// already pinned its own durable copy under refs/fishhawk/checkpoints/ before
+// this runs. Best-effort and log-only, like releaseRefs: an absent ref (the
+// common case) logs nothing, a delete failure logs stage_snapshot_drop_failed,
+// and neither ever changes the stage outcome.
+func dropStageSnapshot(ctx context.Context, repoDir, runID, stageID string, logSink io.Writer) {
+	ref := gitops.SnapshotRef(stageID)
+	if exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "--verify", "--quiet", ref).Run() != nil {
+		return // absent (or no stage id: the bare prefix is no ref): nothing to sweep
+	}
+	if err := dropSnapshotRef(ctx, repoDir, stageID); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"stage_snapshot_drop_failed","run_id":%q,"stage_id":%q,"ref":%q,"detail":%q}`+"\n",
+			runID, stageID, ref, err.Error())
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"stage_snapshot_dropped","run_id":%q,"stage_id":%q,"ref":%q}`+"\n",
+		runID, stageID, ref)
 }
 
 // releaseCheckpointRefs deletes every checkpoint ref of a stage once its work is
@@ -98,7 +153,7 @@ func releaseRefs(ctx context.Context, repoDir, runID, stageID string, refs []str
 		if exec.CommandContext(ctx, "git", "-C", repoDir, "rev-parse", "--verify", "--quiet", ref).Run() != nil {
 			continue // absent: nothing to release
 		}
-		if out, err := exec.CommandContext(ctx, "git", "-C", repoDir, "update-ref", "-d", ref).CombinedOutput(); err != nil {
+		if out, err := checkpointGit(ctx, repoDir, "update-ref", "-d", ref); err != nil {
 			_, _ = fmt.Fprintf(logSink,
 				`{"event":"checkpoint_ref_release_failed","run_id":%q,"stage_id":%q,"ref":%q,"detail":%q}`+"\n",
 				runID, stageID, ref, strings.TrimSpace(err.Error()+" "+string(out)))
@@ -170,15 +225,17 @@ func checkpointFailureSuffix(armedRef, stashRef string) string {
 // maybeArmBaseFetchFailureCheckpoint is the #4079 sibling of
 // maybeArmPushFailureCheckpoint, called at the same `commit+push` error site.
 // It is SILENT unless the error is gitops.ErrBaseFetchFailed: CommitAndPush
-// stashed the agent's edits and then failed fetching (or checking out) the base,
-// so no commit exists and #3621's ErrPushFailed arm cannot fire.
+// snapshotted the agent's edits (a stash-shaped commit at
+// refs/fishhawk/stash/<stage>) and then failed fetching (or checking out) the
+// base, so no commit exists and #3621's ErrPushFailed arm cannot fire.
 //
 // It does two independent things and returns the refs it pinned:
 //
-//  1. STASH PIN, unconditionally: whenever the error names a stash commit, that
-//     commit is pinned at checkpointStashRef — even with no verified tree, the
-//     incident's exact shape (its verify was skipped, not passed). This alone
-//     keeps the edits durable.
+//  1. STASH PIN, unconditionally: whenever the error names a snapshot commit
+//     (BaseFetchError.StashSHA), that commit is pinned at checkpointStashRef —
+//     even with no verified tree, the incident's exact shape (its verify was
+//     skipped, not passed). This alone keeps the edits durable past the
+//     stage-end dropStageSnapshot sweep.
 //  2. PUSH-KIND ARM, only when every precondition holds, each refusal named on
 //     a push_checkpoint_not_armed line: a decomposition child that is not a
 //     fix-up (not_decomposed_child); the backend advertised push-resume

@@ -2726,3 +2726,293 @@ func TestAwaitStageTimeoutOutput_LegacyMessagesUnchanged(t *testing.T) {
 		}
 	}
 }
+
+// --- campaign-wide amendment release (E86.85 / #4486) ---
+
+// TestAwaitStage_ReleasesOnCampaignAmendmentMidPoll is counterfactual (6)'s
+// vehicle: the awaited stage stays running and the run non-terminal, and the
+// campaign route returns another run's live amendment only from its SECOND read
+// (read 1 is the fast-path probe), so only the tick arm can release it.
+func TestAwaitStage_ReleasesOnCampaignAmendmentMidPoll(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, filing := uuid.New(), uuid.New()
+	seedStageWait(fb, runID, "implement", "running", false)
+	campaignID := uuid.NewString()
+	entry := campaignAmendmentEntry(filing, uuid.New(), "acme/widgets#2", true)
+	fb.campaignAmendmentsFunc = func(anchor uuid.UUID, reads int) (runCampaignPendingAmendments, bool) {
+		if anchor != runID {
+			return runCampaignPendingAmendments{}, false
+		}
+		cid := campaignID
+		resp := runCampaignPendingAmendments{RunID: anchor.String(), CampaignID: &cid}
+		if reads >= 2 {
+			resp.Items = []campaignPendingAmendment{entry}
+		}
+		return resp, true
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(), Stage: "implement", TimeoutSeconds: 3,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("Status = %q, want amendment_pending — another campaign run's live amendment must release the wait", out.Status)
+	}
+	if out.Terminal || out.State != "running" {
+		t.Errorf("Terminal/State = %v/%q, want false/running (the awaited stage has not settled)", out.Terminal, out.State)
+	}
+	if out.PendingAmendment == nil || out.PendingAmendment.ID != entry.Amendment.ID {
+		t.Fatalf("PendingAmendment = %+v, want %s", out.PendingAmendment, entry.Amendment.ID)
+	}
+	if out.PendingAmendmentRunID != filing.String() {
+		t.Errorf("pending_amendment_run_id = %q, want the FILING run %s", out.PendingAmendmentRunID, filing)
+	}
+	if out.PendingAmendmentCampaignID != campaignID {
+		t.Errorf("pending_amendment_campaign_id = %q, want %s", out.PendingAmendmentCampaignID, campaignID)
+	}
+	if out.PendingAmendmentIssueRef != "acme/widgets#2" {
+		t.Errorf("pending_amendment_issue_ref = %q, want acme/widgets#2", out.PendingAmendmentIssueRef)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_decide_scope_amendment" {
+		t.Fatalf("NextStep = %+v, want fishhawk_decide_scope_amendment", out.NextStep)
+	}
+	if out.NextStep.Params["run_id"] != filing.String() || out.NextStep.Params["amendment_id"] != entry.Amendment.ID {
+		t.Errorf("NextStep params = %v, want the FILING run %s + amendment %s", out.NextStep.Params, filing, entry.Amendment.ID)
+	}
+	if !strings.Contains(out.Message, "has NOT released for its own reasons") || !strings.Contains(out.Message, campaignID) {
+		t.Errorf("message must say the awaited stage did not release for its own reasons and name the campaign; got %q", out.Message)
+	}
+	if got := campaignAmendmentReads(fb, runID); got < 2 {
+		t.Errorf("campaign reads = %d, want >= 2 (fast path + a tick)", got)
+	}
+}
+
+// TestAwaitStage_ReleasesOnCampaignAmendmentAtArmTime: the fast-path call
+// releases with no poll tick (every stage read carries wait=0).
+func TestAwaitStage_ReleasesOnCampaignAmendmentAtArmTime(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID, filing := uuid.New(), uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	entry := campaignAmendmentEntry(filing, uuid.New(), "acme/widgets#2", true)
+	seedCampaignAmendments(fb, runID, uuid.NewString(), entry)
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 30 * time.Second
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{
+		RunID: runID.String(), Stage: "implement", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" || out.PendingAmendmentRunID != filing.String() {
+		t.Fatalf("Status/run = %q/%q, want amendment_pending on the filing run %s at arm time", out.Status, out.PendingAmendmentRunID, filing)
+	}
+	fb.mu.Lock()
+	waits := append([]int(nil), fb.stageWaitWaitsByStageID[stageID]...)
+	fb.mu.Unlock()
+	if len(waits) != 2 {
+		t.Errorf("stage reads = %d (%v), want 2 (arm read + settledness re-read)", len(waits), waits)
+	}
+	for i, w := range waits {
+		if w > 0 {
+			t.Errorf("read[%d] ?wait = %d; a fast-path release takes no poll tick", i, w)
+		}
+	}
+}
+
+// TestAwaitStage_OwnStageAmendmentWinsOverCampaign: the awaited stage's own
+// request releases first, with no campaign fields and the awaited run as
+// pending_amendment_run_id; the campaign route is never read.
+func TestAwaitStage_OwnStageAmendmentWinsOverCampaign(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	ownID := seedAmendment(fb, runID, stageID, "pending", "pkg/own.go")
+	seedCampaignAmendments(fb, runID, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true))
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 30 * time.Second
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "amendment_pending" || out.PendingAmendment == nil || out.PendingAmendment.ID != ownID.String() {
+		t.Fatalf("Status/amendment = %q/%+v, want amendment_pending on the OWN amendment %s", out.Status, out.PendingAmendment, ownID)
+	}
+	if out.PendingAmendmentCampaignID != "" || out.PendingAmendmentIssueRef != "" {
+		t.Errorf("campaign fields = %q/%q, want empty on the own-stage release", out.PendingAmendmentCampaignID, out.PendingAmendmentIssueRef)
+	}
+	if out.PendingAmendmentRunID != runID.String() {
+		t.Errorf("pending_amendment_run_id = %q, want the awaited run %s", out.PendingAmendmentRunID, runID)
+	}
+	if got := campaignAmendmentReads(fb, runID); got != 0 {
+		t.Errorf("campaign reads = %d, want 0 — the own-stage arm resolves first", got)
+	}
+}
+
+// TestAwaitStage_CampaignAmendmentOnAwaitedStageIsSkipped: the campaign list
+// also carries the awaited stage's own row; the campaign arm skips it because
+// the own arm owns it (and keeps its settled-wins re-read), so that row never
+// releases through the campaign arm.
+func TestAwaitStage_CampaignAmendmentOnAwaitedStageIsSkipped(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	seedCampaignAmendments(fb, runID, uuid.NewString(), campaignAmendmentEntry(runID, stageID, "acme/widgets#1", true))
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout — the awaited stage's own row is the own arm's, never the campaign arm's", out.Status)
+	}
+	if got := campaignAmendmentReads(fb, runID); got < 2 {
+		t.Errorf("campaign reads = %d, want >= 2 (the probe ran and found only a skipped row)", got)
+	}
+}
+
+// TestAwaitStage_SettledWinsOverCampaignAmendment: the stage settles while the
+// campaign read is in flight; the re-read prefers settled.
+func TestAwaitStage_SettledWinsOverCampaignAmendment(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	stageID := seedStageWait(fb, runID, "implement", "running", false)
+	entry := campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true)
+	campaignID := uuid.NewString()
+	fb.campaignAmendmentsFunc = func(anchor uuid.UUID, reads int) (runCampaignPendingAmendments, bool) {
+		if anchor == runID && reads == 1 {
+			env := fb.stageWaitByStageID[stageID]
+			env.State = "succeeded"
+			env.Terminal = true
+			fb.stageWaitByStageID[stageID] = env
+		}
+		cid := campaignID
+		return runCampaignPendingAmendments{RunID: anchor.String(), CampaignID: &cid, Items: []campaignPendingAmendment{entry}}, true
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 5})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "settled" || out.State != "succeeded" || !out.Terminal {
+		t.Fatalf("Status/State/Terminal = %q/%q/%v, want settled/succeeded/true — settledness wins the race", out.Status, out.State, out.Terminal)
+	}
+	if out.PendingAmendment != nil || out.PendingAmendmentCampaignID != "" {
+		t.Errorf("settled release carried amendment fields %+v / %q", out.PendingAmendment, out.PendingAmendmentCampaignID)
+	}
+}
+
+// TestAwaitStage_NotLiveCampaignAmendmentDoesNotRelease: a pending request on
+// a settled stage of another run is listed but never releases.
+func TestAwaitStage_NotLiveCampaignAmendmentDoesNotRelease(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedStageWait(fb, runID, "implement", "running", false)
+	seedCampaignAmendments(fb, runID, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", false))
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout — a not-live amendment must not release", out.Status)
+	}
+}
+
+// TestAwaitStage_CampaignProbeErrorDoesNotFailTheWait: a 500 from the route
+// leaves a resumable timeout, never an error.
+func TestAwaitStage_CampaignProbeErrorDoesNotFailTheWait(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedStageWait(fb, runID, "implement", "running", false)
+	seedCampaignAmendments(fb, runID, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true))
+	fb.campaignAmendmentsStatus = http.StatusInternalServerError
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitStage returned an error on a best-effort campaign probe: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want the resumable timeout", out.Status)
+	}
+	if got := campaignAmendmentReads(fb, runID); got < 2 {
+		t.Errorf("campaign reads = %d, want >= 2 (the failing probe kept being attempted)", got)
+	}
+}
+
+// TestAwaitStage_NotInCampaignDoesNotRelease: campaign_id null keeps the wait.
+func TestAwaitStage_NotInCampaignDoesNotRelease(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	seedStageWait(fb, runID, "implement", "running", false)
+	fb.mu.Lock()
+	fb.campaignAmendmentsByAnchor[runID] = runCampaignPendingAmendments{RunID: runID.String()}
+	fb.mu.Unlock()
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = time.Millisecond
+
+	_, out, err := r.awaitStage(context.Background(), nil, AwaitStageInput{RunID: runID.String(), Stage: "implement", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitStage: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("Status = %q, want timeout for a run in no campaign", out.Status)
+	}
+}
+
+// TestAwaitStageToolDescription_NamesCampaignAmendmentRelease pins the tool
+// text for the #4486 release.
+func TestAwaitStageToolDescription_NamesCampaignAmendmentRelease(t *testing.T) {
+	ctx := context.Background()
+	_, srv := newFakeBackend(t)
+	server := mcp.NewServer(&mcp.Implementation{Name: "test-server", Version: "0"}, nil)
+	registerAwaitStage(server, newResolver(srv, nil))
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := server.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+	res, err := clientSession.ListTools(ctx, nil)
+	if err != nil {
+		t.Fatalf("ListTools: %v", err)
+	}
+	var desc string
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_await_stage" {
+			desc = tool.Description
+		}
+	}
+	flat := strings.Join(strings.Fields(strings.ToLower(desc)), " ")
+	for _, want := range []string{
+		"campaign-wide amendment release (#4486)",
+		"pending_amendment_campaign_id",
+		"pending_amendment_run_id names the filing run",
+		"decision_live",
+		"settledness still wins",
+		"fishhawk_await_review, fishhawk_await_audit and fishhawk_run_stage do not carry this release",
+	} {
+		if !strings.Contains(flat, want) {
+			t.Errorf("await_stage description must carry %q; got:\n%s", want, desc)
+		}
+	}
+}

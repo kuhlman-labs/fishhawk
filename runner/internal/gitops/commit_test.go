@@ -3,6 +3,7 @@ package gitops
 import (
 	"context"
 	"encoding/base64"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"net/http"
@@ -2894,10 +2895,9 @@ func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
 		t.Errorf("StashPatch must contain the agent's stashed edit, got: %q", bre.StashPatch)
 	}
 
-	// (b) The stash entry survives the conflicted pop — recoverable.
-	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
-		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
-	}
+	// (b) The snapshot commit survives the conflicted restore — recoverable by
+	// the SHA the typed error names, with refs/stash untouched (#4648).
+	assertConflictSnapshotRetained(t, repo, bre)
 
 	// (c) The working tree is clean with no unmerged paths after reset --hard.
 	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
@@ -2914,6 +2914,28 @@ func TestCommitAndPush_FreshFetchBase_StashPopConflict(t *testing.T) {
 	}
 	if strings.TrimSpace(string(out)) != "" {
 		t.Errorf("run branch %q was pushed to the bare remote on a conflicted pop: %q", branch, string(out))
+	}
+}
+
+// assertConflictSnapshotRetained pins the ADR-115 D2 (#4648) recovery channel
+// for a conflicted restore: the typed error names a snapshot commit
+// (SnapshotSHA) and carries the `git stash apply <sha>` recovery in its text,
+// a refs/fishhawk/stash/ ref still resolves to that commit, and the shared
+// refs/stash stack was never written.
+func assertConflictSnapshotRetained(t *testing.T, repo string, bre *BaseRebaseConflictError) {
+	t.Helper()
+	if bre.SnapshotSHA == "" {
+		t.Fatalf("BaseRebaseConflictError names no snapshot commit: %v", bre)
+	}
+	if !strings.Contains(bre.Error(), "git stash apply "+bre.SnapshotSHA) {
+		t.Errorf("conflict error %q does not carry the `git stash apply %s` recovery", bre.Error(), bre.SnapshotSHA)
+	}
+	refs := mustGitOut(t, repo, "for-each-ref", "--format=%(objectname)", "refs/fishhawk/stash/")
+	if !strings.Contains(refs, bre.SnapshotSHA) {
+		t.Errorf("no refs/fishhawk/stash/ ref retains snapshot %s after the conflict (refs: %q)", bre.SnapshotSHA, refs)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q; the shared refs/stash stack must never be written", list)
 	}
 }
 
@@ -3002,11 +3024,9 @@ func TestCommitAndPush_RebaseFromRemote_SiblingAppendConflict_CapturesContext(t 
 		t.Errorf("StashPatch must contain the child's own stashed addition, got: %q", bre.StashPatch)
 	}
 
-	// Clean-abort invariants hold unchanged (#866): stash preserved, tree
+	// Clean-abort invariants hold unchanged (#866): snapshot retained, tree
 	// clean, remote tip untouched.
-	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
-		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
-	}
+	assertConflictSnapshotRetained(t, repo, bre)
 	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
 		t.Errorf("ls-files --unmerged not empty after abort: %q", unmerged)
 	}
@@ -3101,9 +3121,7 @@ func TestCommitAndPush_FreshFetchBase_ConflictCaptureFailure(t *testing.T) {
 	}
 
 	// Clean-abort invariants hold unchanged.
-	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
-		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
-	}
+	assertConflictSnapshotRetained(t, repo, bre)
 	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
 		t.Errorf("ls-files --unmerged not empty after abort: %q", unmerged)
 	}
@@ -3197,8 +3215,8 @@ func TestCommitAndPush_FreshFetchBase_LsFilesProbeFailure(t *testing.T) {
 	if errors.Is(err, ErrBaseRebaseConflict) {
 		t.Errorf("CommitAndPush error = %v, must NOT be ErrBaseRebaseConflict (conflict unconfirmed)", err)
 	}
-	if msg := err.Error(); !strings.Contains(msg, "ls-files") || !strings.Contains(msg, "stash pop") {
-		t.Errorf("error %q must surface both the stash pop failure and the ls-files detection failure", msg)
+	if msg := err.Error(); !strings.Contains(msg, "ls-files") || !strings.Contains(msg, "stash apply") {
+		t.Errorf("error %q must surface both the snapshot-restore failure and the ls-files detection failure", msg)
 	}
 
 	// (b) The best-effort reset --hard ran — the tree is clean.
@@ -3299,10 +3317,12 @@ func TestCommitAndPush_RebaseFromRemote_StashPopConflict(t *testing.T) {
 		t.Fatalf("CommitAndPush error = %v, want ErrBaseRebaseConflict", err)
 	}
 
-	// (b) The stash entry survives the conflicted pop — recoverable.
-	if list := mustGitOut(t, repo, "stash", "list"); strings.TrimSpace(list) == "" {
-		t.Error("stash list is empty; the conflicted pop must leave the stash entry recoverable")
+	// (b) The snapshot commit survives the conflicted restore — recoverable.
+	var bre *BaseRebaseConflictError
+	if !errors.As(err, &bre) {
+		t.Fatalf("CommitAndPush error = %v, want *BaseRebaseConflictError via errors.As", err)
 	}
+	assertConflictSnapshotRetained(t, repo, bre)
 
 	// (c) The working tree is clean with no unmerged paths after reset --hard.
 	if unmerged := mustGitOut(t, repo, "ls-files", "--unmerged"); strings.TrimSpace(unmerged) != "" {
@@ -3438,18 +3458,23 @@ func TestAuthConfigEnv(t *testing.T) {
 	wantHeader := "AUTHORIZATION: basic " +
 		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 
-	// https + token: the 5-entry env, empty reset entry FIRST, Basic header
-	// second, both scoped to the https host key.
+	// https + token: the 9-entry env — the maintenance pins at indices 0-1
+	// (ADR-115 D2, #4648), then the empty reset entry BEFORE the Basic
+	// header, both scoped to the https host key.
 	env, err := authConfigEnv(httpsURL, token)
 	if err != nil {
 		t.Fatalf("authConfigEnv(https+token): %v", err)
 	}
 	want := []string{
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=" + httpsKey,
-		"GIT_CONFIG_VALUE_0=",
-		"GIT_CONFIG_KEY_1=" + httpsKey,
-		"GIT_CONFIG_VALUE_1=" + wantHeader,
+		"GIT_CONFIG_COUNT=4",
+		"GIT_CONFIG_KEY_0=maintenance.auto",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=gc.auto",
+		"GIT_CONFIG_VALUE_1=0",
+		"GIT_CONFIG_KEY_2=" + httpsKey,
+		"GIT_CONFIG_VALUE_2=",
+		"GIT_CONFIG_KEY_3=" + httpsKey,
+		"GIT_CONFIG_VALUE_3=" + wantHeader,
 	}
 	if !slices.Equal(env, want) {
 		t.Errorf("authConfigEnv(https+token) =\n  %v\nwant\n  %v", env, want)
@@ -3474,11 +3499,15 @@ func TestAuthConfigEnv(t *testing.T) {
 	}
 	const httpKey = "http.http://127.0.0.1:8080/.extraheader"
 	wantHTTP := []string{
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=" + httpKey,
-		"GIT_CONFIG_VALUE_0=",
-		"GIT_CONFIG_KEY_1=" + httpKey,
-		"GIT_CONFIG_VALUE_1=" + wantHeader,
+		"GIT_CONFIG_COUNT=4",
+		"GIT_CONFIG_KEY_0=maintenance.auto",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=gc.auto",
+		"GIT_CONFIG_VALUE_1=0",
+		"GIT_CONFIG_KEY_2=" + httpKey,
+		"GIT_CONFIG_VALUE_2=",
+		"GIT_CONFIG_KEY_3=" + httpKey,
+		"GIT_CONFIG_VALUE_3=" + wantHeader,
 	}
 	if !slices.Equal(httpEnv, wantHTTP) {
 		t.Errorf("authConfigEnv(http+token) =\n  %v\nwant\n  %v", httpEnv, wantHTTP)
@@ -3954,8 +3983,8 @@ func TestRemoteHasBranch_DumbHTTP_EnvScopedAuth(t *testing.T) {
 }
 
 // TestAuthEnvForRemote is the unit table for the base-establishment auth-env
-// resolver (#1951): an https remote yields the 5 GIT_CONFIG entries keyed to the
-// remote host; ssh/file remotes, an unconfigured remote name, and an empty token
+// resolver (#1951): an https remote yields the 9 GIT_CONFIG entries (the
+// maintenance pins, then the reset+set pair keyed to the remote host); ssh/file remotes, an unconfigured remote name, and an empty token
 // all degrade to nil (ambient auth).
 func TestAuthEnvForRemote(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
@@ -3978,11 +4007,15 @@ func TestAuthEnvForRemote(t *testing.T) {
 		got := AuthEnvForRemote(context.Background(), repo, "origin", token)
 		header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 		want := []string{
-			"GIT_CONFIG_COUNT=2",
-			"GIT_CONFIG_KEY_0=http.https://github.com/.extraheader",
-			"GIT_CONFIG_VALUE_0=",
-			"GIT_CONFIG_KEY_1=http.https://github.com/.extraheader",
-			"GIT_CONFIG_VALUE_1=" + header,
+			"GIT_CONFIG_COUNT=4",
+			"GIT_CONFIG_KEY_0=maintenance.auto",
+			"GIT_CONFIG_VALUE_0=false",
+			"GIT_CONFIG_KEY_1=gc.auto",
+			"GIT_CONFIG_VALUE_1=0",
+			"GIT_CONFIG_KEY_2=http.https://github.com/.extraheader",
+			"GIT_CONFIG_VALUE_2=",
+			"GIT_CONFIG_KEY_3=http.https://github.com/.extraheader",
+			"GIT_CONFIG_VALUE_3=" + header,
 		}
 		if !slices.Equal(got, want) {
 			t.Errorf("AuthEnvForRemote(https) = %v, want %v", got, want)
@@ -4145,11 +4178,15 @@ func TestCommitAndPush_PushEnvCarriesAuthConfig(t *testing.T) {
 	header := "AUTHORIZATION: basic " +
 		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 	wantEnv := []string{
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=" + key,
-		"GIT_CONFIG_VALUE_0=",
-		"GIT_CONFIG_KEY_1=" + key,
-		"GIT_CONFIG_VALUE_1=" + header,
+		"GIT_CONFIG_COUNT=4",
+		"GIT_CONFIG_KEY_0=maintenance.auto",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=gc.auto",
+		"GIT_CONFIG_VALUE_1=0",
+		"GIT_CONFIG_KEY_2=" + key,
+		"GIT_CONFIG_VALUE_2=",
+		"GIT_CONFIG_KEY_3=" + key,
+		"GIT_CONFIG_VALUE_3=" + header,
 	}
 	if !envContainsAll(pushCmd.Env, wantEnv) {
 		t.Errorf("push cmd.Env missing auth entries;\nwant superset of %v\ngot %v", wantEnv, pushCmd.Env)
@@ -4224,14 +4261,26 @@ func TestCommitAndPush_RebaseFetchEnvCarriesAuthConfig(t *testing.T) {
 	header := "AUTHORIZATION: basic " +
 		base64.StdEncoding.EncodeToString([]byte("x-access-token:"+token))
 	wantEnv := []string{
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=" + key,
-		"GIT_CONFIG_VALUE_0=",
-		"GIT_CONFIG_KEY_1=" + key,
-		"GIT_CONFIG_VALUE_1=" + header,
+		"GIT_CONFIG_COUNT=4",
+		"GIT_CONFIG_KEY_0=maintenance.auto",
+		"GIT_CONFIG_VALUE_0=false",
+		"GIT_CONFIG_KEY_1=gc.auto",
+		"GIT_CONFIG_VALUE_1=0",
+		"GIT_CONFIG_KEY_2=" + key,
+		"GIT_CONFIG_VALUE_2=",
+		"GIT_CONFIG_KEY_3=" + key,
+		"GIT_CONFIG_VALUE_3=" + header,
 	}
 	if !envContainsAll(fetchCmd.Env, wantEnv) {
 		t.Errorf("RebaseFromRemote fetch cmd.Env missing auth entries;\nwant superset of %v\ngot %v", wantEnv, fetchCmd.Env)
+	}
+	// Approval condition C1 (#4648): the base fetch's stderr is classified by
+	// IsLockContention, so it runs under the C locale — the EFFECTIVE (last)
+	// LC_ALL/LANG of the child env must be C.
+	for _, name := range []string{"LC_ALL", "LANG"} {
+		if got, _ := lookupEnv(fetchCmd.Env, name); got != "C" {
+			t.Errorf("RebaseFromRemote fetch effective %s = %q, want C (lock-retry classified op must run under the C locale)", name, got)
+		}
 	}
 
 	// The token stays off argv even though it is threaded via env.
@@ -4476,9 +4525,9 @@ func TestStagedPaths_IndexColumnOnly(t *testing.T) {
 // TestCleanDriftPaths_RevertsNamedLeavesUndeclared: one CleanDriftPaths call
 // reverts a tracked modification, a tracked deletion, and an untracked file
 // while an undeclared dirty path is untouched — the concrete test for the
-// pathspec-scoped stash semantics the helper relies on (git-stash(1),
-// pathspec after `--`, --include-untracked). The stash entry is dropped, so
-// the stash stack ends empty.
+// pathspec-scoped snapshot semantics the helper relies on (#4648: tracked and
+// untracked drift saved and reverted in one step). The snapshot ref is
+// dropped, and the shared stash stack is never written.
 func TestCleanDriftPaths_RevertsNamedLeavesUndeclared(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -4524,8 +4573,54 @@ func TestCleanDriftPaths_RevertsNamedLeavesUndeclared(t *testing.T) {
 		t.Errorf("operator.txt = %q, want the undeclared path left alone", got)
 	}
 	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
-		t.Errorf("stash list = %q, want empty (drift entry dropped)", list)
+		t.Errorf("stash list = %q, want empty (the shared stash stack is never written)", list)
 	}
+	assertNoSnapshotRefs(t, repo)
+}
+
+// assertNoSnapshotRefs asserts no refs/fishhawk/stash/ ref is left behind.
+func assertNoSnapshotRefs(t *testing.T, repo string) {
+	t.Helper()
+	if refs := mustGitOut(t, repo, "for-each-ref", "--format=%(refname)", "refs/fishhawk/stash/"); refs != "" {
+		t.Errorf("snapshot refs left behind: %q", refs)
+	}
+}
+
+// TestCleanDriftPaths_NoSharedStash pins ADR-115 D2 (#4648) for the drift
+// cleanup: with an operator's entry already on the shared stash stack, a
+// CleanDriftPaths that reverts real drift leaves that entry as the stack's
+// only entry at the same SHA, reverts the drift, and leaves no snapshot ref.
+func TestCleanDriftPaths_NoSharedStash(t *testing.T) {
+	repo := initRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# operator stash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "stash", "push", "-m", "operator wip")
+	operatorSHA := mustGitOut(t, repo, "rev-parse", "refs/stash")
+
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# drift\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "drift-new.txt"), []byte("net new\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := CleanDriftPaths(context.Background(), repo, []string{"README.md", "drift-new.txt"}); err != nil {
+		t.Fatalf("CleanDriftPaths: %v", err)
+	}
+
+	if got, _ := os.ReadFile(filepath.Join(repo, "README.md")); string(got) != "# initial\n" {
+		t.Errorf("README.md = %q, want the drift reverted", got)
+	}
+	if _, err := os.Stat(filepath.Join(repo, "drift-new.txt")); !os.IsNotExist(err) {
+		t.Errorf("drift-new.txt still exists; untracked drift must be removed")
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "refs/stash"); got != operatorSHA {
+		t.Errorf("refs/stash = %s, want the operator's entry %s untouched", got, operatorSHA)
+	}
+	if n := mustGitOut(t, repo, "rev-list", "--walk-reflogs", "--count", "refs/stash"); n != "1" {
+		t.Errorf("stash stack holds %s entries, want exactly the operator's 1", n)
+	}
+	assertNoSnapshotRefs(t, repo)
 }
 
 // TestCleanDriftPaths_NoOpKeepsOperatorStash pins the entry-created guard: a
@@ -4598,8 +4693,9 @@ func TestRestoreHeadPreserving_RoundTripsOperatorEdit(t *testing.T) {
 		t.Errorf("README.md = %q, want the operator edit byte-identical across the restore", got)
 	}
 	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
-		t.Errorf("stash list = %q, want empty after a clean pop", list)
+		t.Errorf("stash list = %q, want empty (the shared stash stack is never written)", list)
 	}
+	assertNoSnapshotRefs(t, repo)
 }
 
 // TestRestoreHeadPreserving_EmptyPreserveDelegates: an empty preserve set is
@@ -4629,17 +4725,23 @@ func TestRestoreHeadPreserving_EmptyPreserveDelegates(t *testing.T) {
 	}
 }
 
-// TestRestoreHeadPreserving_PopConflict_LeavesStashRecoverable: when
-// reapplying the preserved edit onto the restored ref conflicts, the popStash
-// (#989) machinery aborts cleanly — the checkout stands, the working tree is
-// clean, and the operator's content stays recoverable via `git stash list`
-// (git-stash(1): a conflicted pop does not drop the entry). Never silently
-// destroyed.
-func TestRestoreHeadPreserving_PopConflict_LeavesStashRecoverable(t *testing.T) {
+// TestRestoreHeadPreserving_ConflictRetainsSnapshot: when reapplying the
+// preserved edit onto the restored ref conflicts, the RestoreSnapshot (#989)
+// machinery aborts cleanly — the checkout stands, the working tree is clean,
+// and the operator's content stays recoverable in the RETAINED snapshot
+// commit the error names (#4648), while an operator entry already on the
+// shared stash stack is untouched. Never silently destroyed.
+func TestRestoreHeadPreserving_ConflictRetainsSnapshot(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
 	}
 	repo := initRepo(t)
+	// An operator entry already on the shared stash stack.
+	if err := os.WriteFile(filepath.Join(repo, "operator-stash.txt"), []byte("operator stash\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "stash", "push", "--include-untracked", "-m", "operator wip")
+	operatorSHA := mustGitOut(t, repo, "rev-parse", "refs/stash")
 
 	// A branch whose README diverges from main's, so a stash taken on it
 	// cannot reapply onto main without a conflict.
@@ -4667,8 +4769,22 @@ func TestRestoreHeadPreserving_PopConflict_LeavesStashRecoverable(t *testing.T) 
 	if status := mustGitOut(t, repo, "status", "--porcelain"); status != "" {
 		t.Errorf("status = %q, want a clean tree after the conflict abort", status)
 	}
-	if list := mustGitOut(t, repo, "stash", "list"); list == "" {
-		t.Error("stash list empty — the operator's preserved edit must stay recoverable after a pop conflict")
+	var bre *BaseRebaseConflictError
+	if !errors.As(err, &bre) || bre.SnapshotSHA == "" {
+		t.Fatalf("err = %v, want a *BaseRebaseConflictError naming the snapshot commit", err)
+	}
+	if !strings.Contains(err.Error(), "git stash apply "+bre.SnapshotSHA) {
+		t.Errorf("err %q does not carry the `git stash apply %s` recovery", err.Error(), bre.SnapshotSHA)
+	}
+	refs := mustGitOut(t, repo, "for-each-ref", "--format=%(objectname)", "refs/fishhawk/stash/")
+	if refs != bre.SnapshotSHA {
+		t.Errorf("refs/fishhawk/stash/ = %q, want exactly the retained snapshot %s", refs, bre.SnapshotSHA)
+	}
+	if got := mustGitOut(t, repo, "show", bre.SnapshotSHA+":README.md"); got != "# operator edit on diverged" {
+		t.Errorf("snapshot README.md = %q, want the operator's preserved edit", got)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "refs/stash"); got != operatorSHA {
+		t.Errorf("refs/stash = %s, want the operator's entry %s untouched", got, operatorSHA)
 	}
 }
 
@@ -6771,11 +6887,13 @@ func baseFetchFailureRepo(t *testing.T) (repo, bare, headBefore string) {
 }
 
 // assertBaseFetchError pins the #4079 contract on one CommitAndPush error: the
-// sentinel matches, the typed error names a stash commit that EXISTS and holds
-// BOTH agent edits (the tracked one in the stash tree, the untracked one in its
-// third parent), HEAD did not move, the work tree is clean, the original
-// error text survives as the prefix, and the push-transport sentinel does NOT
-// match (a base-fetch failure has no commit to resume from).
+// sentinel matches, the typed error names a stash-shaped snapshot commit that
+// EXISTS and holds BOTH agent edits (the tracked one in its tree, the
+// untracked one in its third parent), HEAD did not move, the work tree is
+// clean, the original error text survives as the prefix, and the
+// push-transport sentinel does NOT match (a base-fetch failure has no commit
+// to resume from). Since #4648 the snapshot is RETAINED at a
+// refs/fishhawk/stash/ ref and the shared refs/stash stack is never written.
 func assertBaseFetchError(t *testing.T, repo, headBefore, wantPrefix, wantRef string, err error) {
 	t.Helper()
 	if err == nil {
@@ -6814,7 +6932,13 @@ func assertBaseFetchError(t *testing.T, repo, headBefore, wantPrefix, wantRef st
 		t.Errorf("HEAD moved to %s on a base-fetch failure; want it unchanged at %s", got, headBefore)
 	}
 	if st := mustGitOut(t, repo, "status", "--porcelain"); st != "" {
-		t.Errorf("work tree not clean after the stash (the stash must not be popped): %q", st)
+		t.Errorf("work tree not clean after the snapshot (it must not be restored): %q", st)
+	}
+	if refs := mustGitOut(t, repo, "for-each-ref", "--format=%(objectname)", "refs/fishhawk/stash/"); refs != bfe.StashSHA {
+		t.Errorf("refs/fishhawk/stash/ = %q, want exactly the retained snapshot %s", refs, bfe.StashSHA)
+	}
+	if list := mustGitOut(t, repo, "stash", "list"); list != "" {
+		t.Errorf("stash list = %q; the shared refs/stash stack must never be written", list)
 	}
 }
 
@@ -7188,14 +7312,15 @@ func TestCommitAndPush_PinnedBase_CheckoutFailure_WrapsBaseFetchError(t *testing
 	}
 }
 
-// TestCommitAndPush_PinnedBase_StashFailure_FailsBeforeCheckout pins the pinned
-// arm's stash-failure branch: the pin exists, `stash --include-untracked`
-// fails, and the arm returns the plain stash error — NOT a BaseFetchError,
-// because nothing was stashed — with HEAD unmoved and nothing pushed.
-func TestCommitAndPush_PinnedBase_StashFailure_FailsBeforeCheckout(t *testing.T) {
+// TestCommitAndPush_PinnedBase_SnapshotFailure_FailsBeforeCheckout pins the
+// pinned arm's snapshot-failure branch: the pin exists, the snapshot's
+// `commit-tree` fails, and the arm returns the plain snapshot error — NOT a
+// BaseFetchError, because nothing was saved — with HEAD unmoved, the agent's
+// edits still in the working tree, no snapshot ref, and nothing pushed.
+func TestCommitAndPush_PinnedBase_SnapshotFailure_FailsBeforeCheckout(t *testing.T) {
 	repo, bare, headBefore := baseFetchFailureRepo(t)
 	const branch = "fishhawk/run-3973/slice-stash"
-	p := &Pusher{Cmd: failingProbeCmd("stash", "--include-untracked")}
+	p := &Pusher{Cmd: failingProbeCmd("commit-tree")}
 	_, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
 		RepoDir:        repo,
 		Branch:         branch,
@@ -7204,13 +7329,17 @@ func TestCommitAndPush_PinnedBase_StashFailure_FailsBeforeCheckout(t *testing.T)
 		FreshFetchBase: "main",
 		PinnedBaseSHA:  headBefore,
 	})
-	if err == nil || !strings.HasPrefix(err.Error(), "gitops: stash:") {
-		t.Fatalf("CommitAndPush = %v; want the pinned arm's stash error", err)
+	if err == nil || !strings.HasPrefix(err.Error(), "gitops: snapshot agent edits:") {
+		t.Fatalf("CommitAndPush = %v; want the pinned arm's snapshot error", err)
 	}
 	var bfe *BaseFetchError
 	if errors.As(err, &bfe) || errors.Is(err, ErrBaseFetchFailed) {
-		t.Errorf("a failed stash has no stash to name and must NOT be a BaseFetchError: %v", err)
+		t.Errorf("a failed snapshot has nothing to name and must NOT be a BaseFetchError: %v", err)
 	}
+	if st := mustGitOut(t, repo, "status", "--porcelain"); !strings.Contains(st, "README.md") || !strings.Contains(st, "agent.txt") {
+		t.Errorf("status = %q; a failed snapshot must leave the agent's edits in the working tree", st)
+	}
+	assertNoSnapshotRefs(t, repo)
 	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != headBefore {
 		t.Errorf("HEAD moved to %s, want it unchanged at %s", got, headBefore)
 	}
@@ -7247,15 +7376,15 @@ func TestCommitAndPush_PinnedBase_PopConflict_SurfacesErrBaseRebaseConflict(t *t
 
 // TestCommitAndPush_PinnedBase_RevParseFailure_FailsClosed pins the pinned
 // arm's post-reapply `rev-parse HEAD` failure: the error names the pinned base
-// read and nothing is pushed. Only the FIRST `rev-parse HEAD` after the stash
-// pop fails, so every earlier probe runs for real.
+// read and nothing is pushed. Only the FIRST `rev-parse HEAD` after the
+// snapshot restore fails, so every earlier probe runs for real.
 func TestCommitAndPush_PinnedBase_RevParseFailure_FailsClosed(t *testing.T) {
 	repo, bare, headBefore := baseFetchFailureRepo(t)
 	const branch = "fishhawk/run-3973/slice-revparse"
 	popped, failed := false, false
 	p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
 		joined := strings.Join(args, " ")
-		if joined == "stash pop" {
+		if strings.HasPrefix(joined, "stash apply ") {
 			popped = true
 		}
 		if popped && !failed && joined == "rev-parse HEAD" {
@@ -7343,4 +7472,402 @@ func TestOutOfScopePaths(t *testing.T) {
 			t.Errorf("OutOfScopePaths on an unknown sha = %v, nil; want an error", got)
 		}
 	})
+}
+
+// TestGitChildrenCarryMaintenancePins pins the maintenance pins on gitops' exec
+// choke points (ADR-115 D2, #4648): in a fixture whose LOCAL config turns
+// auto-maintenance on (masking the TestMain global pin), a runOut/probeOut
+// child reads maintenance.auto=false and gc.auto=0 — command scope beats
+// repo-local — and would read true/6700 with the pins absent.
+func TestGitChildrenCarryMaintenancePins(t *testing.T) {
+	repo := maskedMaintenanceRepo(t)
+	p := &Pusher{}
+	for key, want := range map[string]string{"maintenance.auto": "false", "gc.auto": "0"} {
+		got, err := p.runOut(context.Background(), repo, "config", "--get", key)
+		if err != nil {
+			t.Fatalf("runOut config --get %s: %v", key, err)
+		}
+		if strings.TrimSpace(got) != want {
+			t.Errorf("runOut child reads %s = %q, want %q (maintenance pin missing)", key, strings.TrimSpace(got), want)
+		}
+		got, _, err = p.probeOut(context.Background(), repo, "config", "--get", key)
+		if err != nil {
+			t.Fatalf("probeOut config --get %s: %v", key, err)
+		}
+		if strings.TrimSpace(got) != want {
+			t.Errorf("probeOut child reads %s = %q, want %q (maintenance pin missing)", key, strings.TrimSpace(got), want)
+		}
+	}
+}
+
+// TestAuthConfigEnvCarriesMaintenancePins pins the authenticated-op env: a
+// child run with authConfigEnv's entries through runOutEnv reads the
+// maintenance pins (they REPLACE the inherited command-scope set, so they must
+// be carried explicitly) and still sees the extraheader reset entry before the
+// set entry, the set entry last.
+func TestAuthConfigEnvCarriesMaintenancePins(t *testing.T) {
+	repo := maskedMaintenanceRepo(t)
+	const remote = "https://forge.example.invalid/owner/repo.git"
+	env, err := authConfigEnv(remote, "tok")
+	if err != nil {
+		t.Fatalf("authConfigEnv: %v", err)
+	}
+	p := &Pusher{}
+	for key, want := range map[string]string{"maintenance.auto": "false", "gc.auto": "0"} {
+		got, err := p.runOutEnv(context.Background(), repo, env, "config", "--get", key)
+		if err != nil {
+			t.Fatalf("config --get %s: %v", key, err)
+		}
+		if strings.TrimSpace(got) != want {
+			t.Errorf("authenticated child reads %s = %q, want %q", key, strings.TrimSpace(got), want)
+		}
+	}
+	out, err := p.runOutEnv(context.Background(), repo, env, "config", "--get-all", "http.https://forge.example.invalid/.extraheader")
+	if err != nil {
+		t.Fatalf("config --get-all extraheader: %v", err)
+	}
+	vals := strings.Split(strings.TrimRight(out, "\n"), "\n")
+	wantHeader := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:tok"))
+	if len(vals) != 2 || vals[0] != "" || vals[1] != wantHeader {
+		t.Errorf("extraheader values = %q, want [\"\" (reset), %q (set, last)]", vals, wantHeader)
+	}
+}
+
+// TestRunOutEnv_RefusesMalformedGitConfigCount pins the fail-closed branch of
+// the maintenance-pin merge: an inherited non-decimal GIT_CONFIG_COUNT is
+// returned as the git error naming the variable, WITHOUT spawning (git itself
+// would refuse to run under it), on both exec choke points. Not parallel: it
+// uses t.Setenv.
+func TestRunOutEnv_RefusesMalformedGitConfigCount(t *testing.T) {
+	t.Setenv("GIT_CONFIG_COUNT", "x")
+	spawned := 0
+	p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		spawned++
+		return exec.CommandContext(ctx, name, args...)
+	}}
+	dir := t.TempDir()
+	if _, err := p.runOutEnv(context.Background(), dir, nil, "version"); err == nil || !strings.Contains(err.Error(), "GIT_CONFIG_COUNT") {
+		t.Errorf("runOutEnv under GIT_CONFIG_COUNT=x = %v, want an error naming GIT_CONFIG_COUNT", err)
+	}
+	_, code, err := p.probeOut(context.Background(), dir, "version")
+	if err == nil || !strings.Contains(err.Error(), "GIT_CONFIG_COUNT") || code != -1 {
+		t.Errorf("probeOut under GIT_CONFIG_COUNT=x = (code %d, %v), want code -1 and an error naming GIT_CONFIG_COUNT", code, err)
+	}
+	if spawned != 0 {
+		t.Errorf("a malformed inherited count spawned %d git children, want 0", spawned)
+	}
+}
+
+// TestCommitAndPush_NoAutoMaintenanceChild is the behavioural maintenance pin
+// (the #3503 GIT_TRACE2_EVENT pattern): with repo-local maintenance.auto=true
+// and gc.auto=1 plus loose objects, a CommitAndPush spawns no `maintenance` or
+// `gc` child. The trace must carry the commit's own start record before the
+// negative assertion is trusted. Not parallel: it uses t.Setenv.
+func TestCommitAndPush_NoAutoMaintenanceChild(t *testing.T) {
+	repo := initRepo(t)
+	mustGit(t, repo, "config", "maintenance.auto", "true")
+	mustGit(t, repo, "config", "gc.auto", "1")
+	for i := 0; i < 8; i++ {
+		if err := os.WriteFile(filepath.Join(repo, fmt.Sprintf("loose-%d.txt", i)), []byte(fmt.Sprintf("loose %d\n", i)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	mustGit(t, repo, "init", "-q", "--bare", "--initial-branch=main", bare)
+	// The ORIGIN's receive-pack is the remote side of a file-path push, not
+	// the runner's git: an older git (the gate image's 2.39) spawns
+	// `git gc --auto --quiet` from it directly under receive.autogc (default
+	// true), which maintenance.auto does not gate and the scrubbed file
+	// transport's GIT_CONFIG_* cannot reach. Off here so only the work
+	// repo's own children are judged.
+	mustGit(t, bare, "config", "receive.autogc", "false")
+
+	tracePath := filepath.Join(t.TempDir(), "trace2.json")
+	t.Setenv("GIT_TRACE2_EVENT", tracePath)
+	if _, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:       repo,
+		Branch:        "fishhawk/run-4648/maint",
+		CommitMessage: "agent change",
+		RemoteURL:     bare,
+	}); err != nil {
+		t.Fatalf("CommitAndPush: %v", err)
+	}
+	traceBytes, err := os.ReadFile(tracePath)
+	if err != nil {
+		t.Fatalf("read trace: %v", err)
+	}
+	var sawCommit bool
+	var spawned []string
+	for _, line := range strings.Split(strings.TrimSpace(string(traceBytes)), "\n") {
+		var evt trace2Event
+		if json.Unmarshal([]byte(line), &evt) != nil {
+			continue
+		}
+		if evt.Event == "start" && slices.Contains(evt.Argv, "commit") {
+			sawCommit = true
+		}
+		if evt.Event == "child_start" {
+			for _, arg := range evt.Argv {
+				if arg == "maintenance" || arg == "gc" {
+					spawned = append(spawned, strings.Join(evt.Argv, " "))
+				}
+			}
+		}
+	}
+	if !sawCommit {
+		t.Fatalf("trace2 carries no start record for the commit — trace unexercised:\n%s", traceBytes)
+	}
+	if len(spawned) > 0 {
+		t.Errorf("CommitAndPush spawned auto-maintenance children %q; the maintenance pins did not reach the runner's git", spawned)
+	}
+}
+
+// TestCommitAndPush_TrackingRefRetriesLockContention pins the ref-lock retry on
+// the UpdateTrackingRef `update-ref` (ADR-115 D2, #4648): the tracking ref's
+// lockfile is held when the first update-ref is constructed and released
+// 300 ms later (past git's own 100 ms lock wait), and CommitAndPush still
+// succeeds with the tracking ref at the pushed HEAD after more than one
+// attempt. Approval condition C1: the classified child runs under the C locale.
+func TestCommitAndPush_TrackingRefRetriesLockContention(t *testing.T) {
+	repo := initRepo(t)
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	mustGit(t, repo, "init", "-q", "--bare", "--initial-branch=main", bare)
+	const branch = "fishhawk/run-4648/tracking"
+	trackingRef := "refs/remotes/origin/" + branch
+	lock := filepath.Join(repo, ".git", filepath.FromSlash(trackingRef)+".lock")
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(repo, "agent.txt"), []byte("agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// The seam runs on the calling goroutine (RetryLockContention retries
+	// synchronously), so the attempt bookkeeping needs no lock.
+	var attempts []*exec.Cmd
+	released := make(chan struct{})
+	p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		c := exec.CommandContext(ctx, name, args...)
+		if len(args) >= 2 && args[0] == "update-ref" && args[1] == trackingRef {
+			attempts = append(attempts, c)
+			if len(attempts) == 1 {
+				go func() {
+					time.Sleep(lockRetryTestD(300 * time.Millisecond))
+					_ = os.Remove(lock)
+					close(released)
+				}()
+			}
+		}
+		return c
+	}}
+	res, err := p.CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:           repo,
+		Branch:            branch,
+		CommitMessage:     "agent change",
+		RemoteURL:         bare,
+		UpdateTrackingRef: true,
+	})
+	if err != nil {
+		t.Fatalf("CommitAndPush with a briefly-held tracking-ref lock: %v", err)
+	}
+	<-released
+	if len(attempts) < 2 {
+		t.Errorf("update-ref ran %d time(s), want > 1 (the held lock must have been retried)", len(attempts))
+	}
+	if got := mustGitOut(t, repo, "rev-parse", trackingRef); got != res.HeadSHA {
+		t.Errorf("%s = %s, want the pushed HEAD %s", trackingRef, got, res.HeadSHA)
+	}
+	// cmd.Env is assigned after the seam returns, so it is read from the
+	// recorded commands now the call has completed: every classified attempt's
+	// EFFECTIVE (last) LC_ALL/LANG must be C (approval condition C1).
+	for i, c := range attempts {
+		for _, name := range []string{"LC_ALL", "LANG"} {
+			if got, _ := lookupEnv(c.Env, name); got != "C" {
+				t.Errorf("update-ref attempt %d effective %s = %q, want C", i+1, name, got)
+			}
+		}
+	}
+}
+
+// seedOperatorStashEntry puts an operator entry on repo's shared stash stack
+// without touching the working tree (a reflog-backed refs/stash at HEAD) and
+// returns its SHA.
+func seedOperatorStashEntry(t *testing.T, repo string) string {
+	t.Helper()
+	mustGit(t, repo, "update-ref", "--create-reflog", "-m", "operator wip", "refs/stash", "HEAD")
+	return mustGitOut(t, repo, "rev-parse", "refs/stash")
+}
+
+// assertOperatorStashUntouched asserts refs/stash still names exactly the
+// operator's one entry.
+func assertOperatorStashUntouched(t *testing.T, repo, operatorSHA string) {
+	t.Helper()
+	if got := mustGitOut(t, repo, "rev-parse", "refs/stash"); got != operatorSHA {
+		t.Errorf("refs/stash = %s, want the operator's entry %s untouched", got, operatorSHA)
+	}
+	if n := mustGitOut(t, repo, "rev-list", "--walk-reflogs", "--count", "refs/stash"); n != "1" {
+		t.Errorf("stash stack holds %s entries, want exactly the operator's 1", n)
+	}
+}
+
+// TestCommitAndPush_FetchFailureNamesSnapshot pins #4079 under ADR-115 D2
+// (#4648) with a stage SnapshotKey: the base-fetch failure's StashSHA is the
+// snapshot retained at refs/fishhawk/stash/<key> (README.md edit in its tree,
+// agent.txt in its untracked parent), and an operator entry already on the
+// shared stash stack is untouched.
+func TestCommitAndPush_FetchFailureNamesSnapshot(t *testing.T) {
+	repo, bare, headBefore := baseFetchFailureRepo(t)
+	operator := seedOperatorStashEntry(t, repo)
+	const base = "fishhawk/run-deadbeef-consolidated"
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         "fishhawk/run-deadbeef/slice-9",
+		CommitMessage:  "slice",
+		RemoteURL:      bare,
+		FreshFetchBase: base,
+		SnapshotKey:    "stage-4648",
+	})
+	var bfe *BaseFetchError
+	if !errors.As(err, &bfe) {
+		t.Fatalf("CommitAndPush = %v, want a *BaseFetchError", err)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", SnapshotRef("stage-4648")); got != bfe.StashSHA {
+		t.Errorf("%s = %s, want the named snapshot %s", SnapshotRef("stage-4648"), got, bfe.StashSHA)
+	}
+	if got := mustGitOut(t, repo, "show", bfe.StashSHA+":README.md"); got != "# the verified slice edit" {
+		t.Errorf("snapshot README.md = %q, want the agent edit", got)
+	}
+	if got := mustGitOut(t, repo, "show", bfe.StashSHA+"^3:agent.txt"); got != "new agent file" {
+		t.Errorf("snapshot untracked parent agent.txt = %q, want the agent's new file", got)
+	}
+	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != headBefore {
+		t.Errorf("HEAD moved to %s, want %s", got, headBefore)
+	}
+	assertOperatorStashUntouched(t, repo, operator)
+}
+
+// TestCommitAndPush_StashConflictNamesSnapshot pins the conflict half: a
+// restore conflict on the FreshFetchBase arm returns a *BaseRebaseConflictError
+// whose SnapshotSHA is the commit still at refs/fishhawk/stash/<key> and whose
+// Error() names it with the `git stash apply <sha>` recovery, with the
+// operator's shared stash entry untouched.
+func TestCommitAndPush_StashConflictNamesSnapshot(t *testing.T) {
+	repo := initRepo(t)
+	bare := filepath.Join(t.TempDir(), "origin.git")
+	mustGit(t, repo, "init", "-q", "--bare", "--initial-branch=main", bare)
+	mustGit(t, repo, "push", "-q", bare, "main")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# remote advanced\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	mustGit(t, repo, "commit", "-q", "-am", "advance")
+	mustGit(t, repo, "push", "-q", bare, "main")
+	mustGit(t, repo, "reset", "-q", "--hard", "HEAD~1")
+	operator := seedOperatorStashEntry(t, repo)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# agent edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := (&Pusher{}).CommitAndPush(context.Background(), CommitAndPushArgs{
+		RepoDir:        repo,
+		Branch:         "fishhawk/run-4648/conflict",
+		CommitMessage:  "agent change",
+		RemoteURL:      bare,
+		FreshFetchBase: "main",
+		SnapshotKey:    "stage-conflict",
+	})
+	var bre *BaseRebaseConflictError
+	if !errors.As(err, &bre) {
+		t.Fatalf("CommitAndPush = %v, want a *BaseRebaseConflictError", err)
+	}
+	retained := mustGitOut(t, repo, "rev-parse", SnapshotRef("stage-conflict"))
+	if bre.SnapshotSHA != retained {
+		t.Errorf("SnapshotSHA = %q, want the retained snapshot %s", bre.SnapshotSHA, retained)
+	}
+	if want := "edits preserved in snapshot commit " + retained + " (recover with `git stash apply " + retained + "`)"; !strings.Contains(err.Error(), want) {
+		t.Errorf("Error() = %q, want it to contain %q", err.Error(), want)
+	}
+	if got := mustGitOut(t, repo, "show", retained+":README.md"); got != "# agent edit" {
+		t.Errorf("retained snapshot README.md = %q, want the agent edit", got)
+	}
+	assertOperatorStashUntouched(t, repo, operator)
+}
+
+// TestBaseRebaseConflictError_NoSnapshotWording pins Error()'s fallback when no
+// call site named a snapshot: it never invents a SHA and never points at the
+// shared stash stack.
+func TestBaseRebaseConflictError_NoSnapshotWording(t *testing.T) {
+	msg := (&BaseRebaseConflictError{ConflictPaths: []string{"a.txt"}}).Error()
+	if !strings.Contains(msg, "retained snapshot commit") || strings.Contains(msg, "git stash list") || strings.Contains(msg, "git stash apply") {
+		t.Errorf("Error() = %q, want the retained-snapshot fallback wording with no stash-stack or apply hint", msg)
+	}
+}
+
+// TestRestoreAgentEdits_NothingSavedIsNoOp pins restoreAgentEdits' saved=false
+// guard: with nothing snapshotted it runs no git at all — never a
+// `stash apply` of an empty SHA or of anything on the shared stack.
+func TestRestoreAgentEdits_NothingSavedIsNoOp(t *testing.T) {
+	spawned := 0
+	p := &Pusher{Cmd: func(ctx context.Context, name string, args ...string) *exec.Cmd {
+		spawned++
+		return exec.CommandContext(ctx, name, args...)
+	}}
+	if err := p.restoreAgentEdits(context.Background(), t.TempDir(), Snapshot{}, false); err != nil {
+		t.Errorf("restoreAgentEdits(saved=false) = %v, want nil", err)
+	}
+	if spawned != 0 {
+		t.Errorf("restoreAgentEdits(saved=false) spawned %d git children, want 0", spawned)
+	}
+}
+
+// TestPerCallSnapshotKey_Unique pins that two calls never share a snapshot
+// ref: concurrent CleanDriftPaths / RestoreHeadPreserving / keyless
+// CommitAndPush calls in sibling worktrees each get their own key.
+func TestPerCallSnapshotKey_Unique(t *testing.T) {
+	a, b := perCallSnapshotKey("drift"), perCallSnapshotKey("drift")
+	if a == b || !strings.HasPrefix(a, "drift-") || len(a) <= len("drift-") {
+		t.Errorf("perCallSnapshotKey = %q, %q; want two distinct drift-<suffix> keys", a, b)
+	}
+}
+
+// TestRestoreHeadPreserving_CheckoutFailureNamesSnapshot pins the forced-
+// checkout failure branch: the preserved operator edit is already saved, so the
+// error names the retained snapshot commit and its `git stash apply <sha>`
+// recovery, and the ref still holds the edit — operator content is never
+// silently destroyed.
+func TestRestoreHeadPreserving_CheckoutFailureNamesSnapshot(t *testing.T) {
+	repo := initRepo(t)
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("# operator edit\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := RestoreHeadPreserving(context.Background(), repo, "no-such-ref", []string{"README.md"})
+	if err == nil {
+		t.Fatal("RestoreHeadPreserving(no-such-ref) = nil, want the checkout failure")
+	}
+	sha := mustGitOut(t, repo, "for-each-ref", "--format=%(objectname)", "refs/fishhawk/stash/")
+	if sha == "" || strings.Contains(sha, "\n") {
+		t.Fatalf("refs/fishhawk/stash/ = %q, want exactly one retained snapshot", sha)
+	}
+	if !strings.Contains(err.Error(), "git stash apply "+sha) {
+		t.Errorf("err %q does not name the retained snapshot %s with its recovery", err.Error(), sha)
+	}
+	if got := mustGitOut(t, repo, "show", sha+":README.md"); got != "# operator edit" {
+		t.Errorf("snapshot README.md = %q, want the operator edit", got)
+	}
+}
+
+// TestDriftHelpers_SnapshotFailure pins the snapshot-failure branches of
+// CleanDriftPaths and RestoreHeadPreserving: outside a repository the snapshot
+// cannot be taken, and each returns its own annotated error rather than
+// proceeding to a drop or a forced checkout.
+func TestDriftHelpers_SnapshotFailure(t *testing.T) {
+	notRepo := t.TempDir()
+	if err := CleanDriftPaths(context.Background(), notRepo, []string{"a.txt"}); err == nil || !strings.HasPrefix(err.Error(), "gitops: snapshot drift paths:") {
+		t.Errorf("CleanDriftPaths(not a repo) = %v, want the snapshot drift paths error", err)
+	}
+	if err := RestoreHeadPreserving(context.Background(), notRepo, "main", []string{"a.txt"}); err == nil || !strings.HasPrefix(err.Error(), "gitops: snapshot operator edits:") {
+		t.Errorf("RestoreHeadPreserving(not a repo) = %v, want the snapshot operator edits error", err)
+	}
 }
