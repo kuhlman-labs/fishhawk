@@ -482,12 +482,16 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 	// the check for a legitimately-unlisted category. Parsed before the
 	// category-filter branch below; the no-category path is unaffected.
 	if category != "" && q.Get("allow_unknown") != "true" && !audit.IsKnownCategory(category) {
+		// Four suggestions, not three (#4679): registering
+		// scope_amendment_refused pushed scope_amendment_requested to
+		// fourth-nearest for the canonical wrong-surface string
+		// scope_amendment_pending.
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"category is not a known audit category; pass allow_unknown=true to bypass this check",
 			map[string]any{
 				"field":       "category",
 				"got":         category,
-				"suggestions": audit.SuggestCategories(category, 3),
+				"suggestions": audit.SuggestCategories(category, 4),
 			})
 		return
 	}
@@ -767,6 +771,13 @@ func withholdDelegationShadow(entries []*audit.Entry, requestedCategory string) 
 // (server/README.md § "Escape records"): reverting it would expose every
 // already-written escape row to run-bound reads.
 //
+// `scope_amendment_refused` entries (#4679) are withheld on the same interim
+// footing: the row's slice_ownership names sibling slices' titles, declared
+// paths and child run ids. It is the same deliberate deviation from ADR-106,
+// MUST migrate into the per-category registry flag with escape_recorded (owned
+// by E89 #4537), and is guarded until then by
+// TestWithholdScopeOverlapFromRunBound_ScopeAmendmentRefusedWithheld.
+//
 // It returns a NEW slice and never filters in place: the input may be a
 // repository's shared backing array.
 func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []*audit.Entry {
@@ -775,7 +786,8 @@ func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []
 	}
 	out := make([]*audit.Entry, 0, len(entries))
 	for _, e := range entries {
-		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden || e.Category == CategoryEscapeRecorded) {
+		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden || e.Category == CategoryEscapeRecorded ||
+			e.Category == CategoryScopeAmendmentRefused) {
 			continue
 		}
 		out = append(out, e)
