@@ -168,7 +168,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **180 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **181 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -322,6 +322,7 @@ The v0 REST API exposes **180 operations** across the paths below, generated fro
 | `GET` | `/v0/runs/{run_id}/concerns` | List a run's review concerns, optionally with its decomposition children's |
 | `POST` | `/v0/runs/{run_id}/concerns/waive` | Waive several of one run's open concerns with one audited reason |
 | `POST` | `/v0/runs/{run_id}/concerns/resolve` | Resolve routed concerns as addressed on the operator's evidence (human-only) |
+| `POST` | `/v0/runs/{run_id}/escapes` | Record an escaped defect, or close a pending one with a human attestation |
 | `POST` | `/v0/runs/{run_id}/divergence/{sequence}/answer` | Answer a divergence question — one-off, or a change of doctrine |
 | `POST` | `/v0/concerns/{concern_id}/defer` | Defer an open review concern into a follow-up work item |
 | `GET` | `/v0/artifacts/{artifact_id}` | Get an artifact |

@@ -3543,7 +3543,13 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// write:runs; the backend refuses a run-bound token. Its own tool, not a
 	// mode of fishhawk_promote_queued_stage: the two queues differ in key,
 	// lock domain and refusal set. 82 -> 83.
-	const wantToolCount = 83
+	//
+	// E94.3 / #4694 (ADR-117 D3 + A1) adds exactly ONE tool —
+	// fishhawk_record_escape, the wrapper over POST /v0/runs/{run_id}/escapes.
+	// WHEN: a defect got past the live reviews, or a pending escape needs a
+	// human judgement. ELIGIBILITY: write:runs; the backend refuses every
+	// run-bound token and makes a closure human-only. 83 -> 84.
+	const wantToolCount = 84
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",

@@ -2504,3 +2504,237 @@ func TestListGlobalAudit_RunBoundWithholdsMergeOverlapOverride(t *testing.T) {
 		t.Fatalf("operator category read: %d merge_overlap_overridden rows, want 1", n)
 	}
 }
+
+// escapeWithholdMarker is a unique token planted in a seeded escape_recorded
+// payload, so any read that leaks the row's body is caught by a substring
+// check independent of the category name.
+const escapeWithholdMarker = "escape-marker-7f3c9a1e-run-bound-must-not-read"
+
+// newEscapeWithholdFixture is newRunBoundWithholdFixture for an
+// escape_recorded row whose payload carries escapeWithholdMarker. It is
+// stage-less, like every production escape row (escapeChainParams).
+func newEscapeWithholdFixture(t *testing.T) scopeOverlapWithholdFixture {
+	t.Helper()
+	f := newRunBoundWithholdFixture(t, CategoryEscapeRecorded)
+	au := f.s.cfg.AuditRepo.(chainReadingAudit).auditFake
+	au.seeded[0].Payload = json.RawMessage(`{"escape_version":1,"record_kind":"birth","escape":{"description":"` + escapeWithholdMarker + `"}}`)
+	return f
+}
+
+// TestWithholdScopeOverlapFromRunBound_EscapeRecordedWithheld is the guard
+// for the escape_recorded entry in withholdScopeOverlapFromRunBound (approval
+// condition C2; ADR-117 A1.6). It is the test that must move with the entry
+// when the deny-list migrates into ADR-106's per-category registry flag
+// (E89 #4537), and the one that fails if a rollback drops the entry: a
+// run-bound subject reads no escape_recorded row on EITHER the per-run read
+// or the global feed, while an operator reads it on both.
+func TestWithholdScopeOverlapFromRunBound_EscapeRecordedWithheld(t *testing.T) {
+	t.Run("predicate", func(t *testing.T) {
+		rid := uuid.New()
+		in := []*audit.Entry{
+			{RunID: &rid, Sequence: 1, Category: CategoryEscapeRecorded},
+			{RunID: &rid, Sequence: 2, Category: "plan_generated"},
+		}
+		out := withholdScopeOverlapFromRunBound(in, "mcp:run:"+rid.String())
+		if len(out) != 1 || out[0].Category != "plan_generated" {
+			t.Fatalf("run-bound withhold kept %d rows (first %q), want only plan_generated", len(out), out[0].Category)
+		}
+		if got := withholdScopeOverlapFromRunBound(in, "github:op"); len(got) != 2 {
+			t.Fatalf("operator withhold kept %d rows, want 2 (unchanged)", len(got))
+		}
+	})
+	f := newEscapeWithholdFixture(t)
+	runBound := Identity{Subject: "mcp:run:" + f.runB.String(), TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+	op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+	reads := map[string]func(string, Identity) *httptest.ResponseRecorder{
+		"per-run read": func(cat string, id Identity) *httptest.ResponseRecorder {
+			q := ""
+			if cat != "" {
+				q = "?category=" + cat
+			}
+			return f.listRunAudit(q, id)
+		},
+		"global feed": func(cat string, id Identity) *httptest.ResponseRecorder {
+			q := ""
+			if cat != "" {
+				q = "&category=" + cat
+			}
+			return f.listGlobalAudit(q, id)
+		},
+	}
+	for name, read := range reads {
+		t.Run(name, func(t *testing.T) {
+			for _, cat := range []string{"", CategoryEscapeRecorded} {
+				w := read(cat, runBound)
+				if n := countAuditItemsInCategory(readAuditItems(t, w), CategoryEscapeRecorded); n != 0 {
+					t.Fatalf("run-bound %s (category=%q): %d escape_recorded rows, want 0 — the escape_recorded entry is missing from withholdScopeOverlapFromRunBound", name, cat, n)
+				}
+				if strings.Contains(w.Body.String(), escapeWithholdMarker) {
+					t.Fatalf("run-bound %s (category=%q) leaks the escape payload:\n%s", name, cat, w.Body.String())
+				}
+				if n := countAuditItemsInCategory(readAuditItems(t, read(cat, op)), CategoryEscapeRecorded); n != 1 {
+					t.Fatalf("operator %s (category=%q): %d escape_recorded rows, want 1", name, cat, n)
+				}
+			}
+		})
+	}
+}
+
+// TestListRunAudit_RunBoundWithholdsEscapeRecorded pins A1.6 on GET
+// /v0/runs/{run_id}/audit for every run-bound subject shape (the run's own
+// token, another run's token, a malformed suffix): no escape_recorded row on
+// the unfiltered read, the category-named read, or ahead of pagination; the
+// operator still reads it.
+func TestListRunAudit_RunBoundWithholdsEscapeRecorded(t *testing.T) {
+	f := newEscapeWithholdFixture(t)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		id := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+		t.Run(subject, func(t *testing.T) {
+			w := f.listRunAudit("", id)
+			items := readAuditItems(t, w)
+			if n := countAuditItemsInCategory(items, CategoryEscapeRecorded); n != 0 {
+				t.Fatalf("unfiltered read: %d escape_recorded rows, want 0", n)
+			}
+			if n := countAuditItemsInCategory(items, "plan_generated"); n != 1 {
+				t.Fatalf("unfiltered read: %d ordinary rows, want 1", n)
+			}
+			if strings.Contains(w.Body.String(), escapeWithholdMarker) {
+				t.Fatalf("unfiltered read leaks the escape payload:\n%s", w.Body.String())
+			}
+			w = f.listRunAudit("?category="+CategoryEscapeRecorded, id)
+			if items := readAuditItems(t, w); len(items) != 0 {
+				t.Fatalf("category-named read: %d items, want 0:\n%s", len(items), w.Body.String())
+			}
+			items = readAuditItems(t, f.listRunAudit("?limit=1", id))
+			if len(items) != 1 || items[0].Category != "plan_generated" {
+				t.Fatalf("limit=1 read = %+v, want the ordinary row (withhold before pagination)", items)
+			}
+		})
+	}
+	t.Run("operator sees the row", func(t *testing.T) {
+		op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+		w := f.listRunAudit("?category="+CategoryEscapeRecorded, op)
+		if n := countAuditItemsInCategory(readAuditItems(t, w), CategoryEscapeRecorded); n != 1 {
+			t.Fatalf("operator category read: %d escape_recorded rows, want 1", n)
+		}
+		if n := countAuditItemsInCategory(readAuditItems(t, f.listRunAudit("", op)), CategoryEscapeRecorded); n != 1 {
+			t.Fatalf("operator unfiltered read: %d escape_recorded rows, want 1", n)
+		}
+	})
+}
+
+// TestListGlobalAudit_RunBoundWithholdsEscapeRecorded is the GET /v0/audit
+// twin (the read behind fishhawk_get_run_status's recent_audit).
+func TestListGlobalAudit_RunBoundWithholdsEscapeRecorded(t *testing.T) {
+	f := newEscapeWithholdFixture(t)
+	for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+		id := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+		t.Run(subject, func(t *testing.T) {
+			w := f.listGlobalAudit("", id)
+			if n := countAuditItemsInCategory(readAuditItems(t, w), CategoryEscapeRecorded); n != 0 {
+				t.Fatalf("unfiltered read: %d escape_recorded rows, want 0", n)
+			}
+			if strings.Contains(w.Body.String(), escapeWithholdMarker) {
+				t.Fatalf("unfiltered read leaks the escape payload:\n%s", w.Body.String())
+			}
+			if items := readAuditItems(t, f.listGlobalAudit("&category="+CategoryEscapeRecorded, id)); len(items) != 0 {
+				t.Fatalf("category-named read: %d items, want 0", len(items))
+			}
+			items := readAuditItems(t, f.listGlobalAudit("&limit=1", id))
+			if len(items) != 1 || items[0].Category != "plan_generated" {
+				t.Fatalf("limit=1 read = %+v, want the ordinary row (withhold before pagination)", items)
+			}
+		})
+	}
+	op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+	if n := countAuditItemsInCategory(readAuditItems(t, f.listGlobalAudit("&category="+CategoryEscapeRecorded, op)), CategoryEscapeRecorded); n != 1 {
+		t.Fatalf("operator category read: %d escape_recorded rows, want 1", n)
+	}
+}
+
+// TestEscapeRecorded_RunBoundEgressCarriesNoPayload pins R9a: the egress
+// surfaces OTHER than the two audit list reads never carry an escape row's
+// payload or name its category to a run-bound caller. (a) The diagnostics
+// bundle renders no audit payload and its failing-surface pick skips
+// stage-less rows, which every escape row is; the audit_sequence_range span
+// is the documented residual. (b) Both audit export projections refuse a
+// run-bound token holding every scope mcptoken.go mints, because none is
+// read:audit-export. (c) The product-report body a run-bound token files is
+// built from that same bundle. These pin EXISTING controls; the counterfactual
+// for the new withhold is the list-read tests above.
+func TestEscapeRecorded_RunBoundEgressCarriesNoPayload(t *testing.T) {
+	escapeRow := func(seq int64, runID uuid.UUID) *audit.Entry {
+		rid := runID
+		return &audit.Entry{
+			ID: uuid.New(), RunID: &rid, Sequence: seq, Category: CategoryEscapeRecorded,
+			Payload: json.RawMessage(`{"escape":{"description":"` + escapeWithholdMarker + `"}}`),
+		}
+	}
+	assertClean := func(t *testing.T, where, body string) {
+		t.Helper()
+		if strings.Contains(body, escapeWithholdMarker) {
+			t.Fatalf("%s carries the escape payload marker:\n%s", where, body)
+		}
+		if strings.Contains(body, CategoryEscapeRecorded) {
+			t.Fatalf("%s names %s:\n%s", where, CategoryEscapeRecorded, body)
+		}
+	}
+
+	t.Run("diagnostics", func(t *testing.T) {
+		runID := uuid.New()
+		failID := uuid.New()
+		runRow := &run.Run{ID: runID, Repo: "acme/widgets", WorkflowID: "feature_change", WorkflowSHA: "specsha", RunnerKind: run.RunnerKindLocal, State: run.StateFailed}
+		stages := []*run.Stage{{ID: failID, Sequence: 0, Type: run.StageTypeImplement, State: run.StageStateFailed, FailureCategory: failureCat(run.FailureA)}}
+		af := &scAuditFake{allEntries: []*audit.Entry{
+			{Sequence: 10, StageID: &failID, Category: "agent_failed"},
+			escapeRow(11, runID),
+		}}
+		s := newDiagServer(t, runRow, stages, af)
+		req := httptest.NewRequest(http.MethodGet, "/v0/runs/"+runID.String()+"/diagnostics", nil)
+		req.SetPathValue("run_id", runID.String())
+		w := httptest.NewRecorder()
+		s.handleGetRunDiagnostics(w, withIdentity(req, Identity{Subject: "mcp:run:" + runID.String(), TokenID: "tok-run", Scopes: []string{"mcp:read"}}))
+		if w.Code != http.StatusOK {
+			t.Fatalf("diagnostics status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		assertClean(t, "diagnostics bundle", w.Body.String())
+		if !strings.Contains(w.Body.String(), "agent_failed") {
+			t.Fatalf("diagnostics bundle does not name the failing surface (fixture not exercised):\n%s", w.Body.String())
+		}
+	})
+
+	t.Run("audit export", func(t *testing.T) {
+		runID := uuid.New()
+		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: &scAuditFake{allEntries: []*audit.Entry{escapeRow(1, runID)}}})
+		minted := Identity{Subject: "mcp:run:" + runID.String(), TokenID: "tok-run",
+			Scopes: []string{"mcp:read", "write:retries", "write:scope-amendments", scopeWriteMessages}}
+		for path, h := range map[string]http.HandlerFunc{
+			"/v0/audit/export":     s.handleAuditExport,
+			"/v0/audit/export.csv": s.handleAuditExportCSV,
+		} {
+			w := httptest.NewRecorder()
+			h(w, withIdentity(httptest.NewRequest(http.MethodGet, path, nil), minted))
+			if w.Code != http.StatusForbidden || !bodyHasCode(w, "insufficient_scope") {
+				t.Fatalf("%s as run-bound: status = %d body = %s, want 403 insufficient_scope", path, w.Code, w.Body.String())
+			}
+			assertClean(t, path+" refusal", w.Body.String())
+		}
+	})
+
+	t.Run("product report", func(t *testing.T) {
+		fp := &fakeFeedbackProvider{}
+		af := &scAuditFake{}
+		s, runID := productReportFixture(t, fp, af)
+		af.allEntries = append(af.allEntries, escapeRow(102, runID))
+		rec := postProductReport(s, runID, "mcp:run:"+runID.String(), "")
+		if rec.Code != http.StatusCreated {
+			t.Fatalf("product report status = %d, want 201:\n%s", rec.Code, rec.Body.String())
+		}
+		if !fp.filed {
+			t.Fatal("provider.File was not called (fixture not exercised)")
+		}
+		assertClean(t, "product report title", fp.filedReport.Title)
+		assertClean(t, "product report body", fp.filedReport.Body)
+		assertClean(t, "product report response", rec.Body.String())
+	})
+}
