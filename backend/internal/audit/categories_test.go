@@ -179,6 +179,17 @@ func TestKnownCategories_EscalationFired(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_EscapeRecorded pins the E94.3 / #4694 category: the
+// escape verb (server/escape.go) appends it on every birth and closure, and an
+// unregistered category reddens TestKnownCategoriesCoversEmittedCategories and
+// is un-awaitable. It is INTERNAL, so it must NOT be an issue-comment activity
+// category.
+func TestKnownCategories_EscapeRecorded(t *testing.T) {
+	if !IsKnownCategory("escape_recorded") {
+		t.Fatal("escape_recorded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_DelegationShadowEvaluated pins the E82.1 / #3778
 // category: the shadow stamp's emit site (server/delegation_shadow.go) writes
 // it after every human decision on a delegable class, and an unregistered

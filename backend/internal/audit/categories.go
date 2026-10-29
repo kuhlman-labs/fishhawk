@@ -340,6 +340,14 @@ import "sort"
 // scope_amendment_requested / scope_amendment_decided siblings — NOT an
 // issue-comment activity category (the startup backfill would otherwise
 // re-render activity lines onto every stale run's anchor).
+// E94.3 / #4694 (ADR-117 D3 + Amendment A1, ratified) added escape_recorded,
+// written by POST /v0/runs/{run_id}/escapes (server/escape.go): a birth row
+// or the single closure row that supersedes it, one row per state change
+// (A1.1). INTERNAL — no issue-comment activity line. It is WITHHELD from
+// run-bound audit reads (A1.6) by an interim deny-list entry in
+// server/reads.go's withholdScopeOverlapFromRunBound — a deliberate interim
+// deviation from ADR-106, owned by E89 #4537, that MUST migrate to ADR-106's
+// per-category registry flag when that lands.
 // E83.61 / #4119 added merge_overlap_overridden, the operator's audited
 // override of the merge overlap guard (server/merge_overlap_guard.go),
 // appended record-before-commit — INTERNAL, not an issue-comment surface.
@@ -478,6 +486,7 @@ var KnownCategories = map[string]struct{}{
 	"document_truncated":                      {},
 	"dispatch_watchdog_elapsed":               {},
 	"escalation_fired":                        {},
+	"escape_recorded":                         {}, // E94.3 / #4694 (ADR-117 D3 + A1): one append-only row per escape state change — a birth or its single-successor closure (server/escape.go) — INTERNAL, not an issue-comment surface; WITHHELD from run-bound audit reads (A1.6) by an interim deny-list entry that MUST migrate to ADR-106's per-category registry flag when that lands
 	"escalation_persona_attached":             {}, // E55.9 / #3754: fired escalations attached reviewer personas to a review round (server/escalation_persona.go)
 	"first_officer_action_refused":            {}, // E85.6 / #4148 (ADR-089 D2): a 403 served to a first-officer seat identity, written from writeError on the global chain (server/first_officer_identity.go) — INTERNAL, not an issue-comment surface
 	"first_officer_seat_attached":             {}, // E85.6 / #4148 (ADR-089 D1): the captain attached a first-officer seat (token id, scopes; never the plaintext) — INTERNAL, not an issue-comment surface
