@@ -74,6 +74,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Bulk concern waive + the condition-claim shorthand (`bulk_waive.go`, `condition_claims.go`, E64.77 / #3318)
 - Merge readiness + operator-evidence resolve (`merge_readiness.go`, `resolve_concerns.go`, `gateview.go`, E83.53 / [#4086](https://github.com/kuhlman-labs/fishhawk/issues/4086))
 - Escape records (`escape.go`, E94.3 / [#4694](https://github.com/kuhlman-labs/fishhawk/issues/4694))
+- Child-slice concern rollup, the late child-review import and the `open_at_merge` merge stamp (`concern_rollup.go`, E94.1 / [#4692](https://github.com/kuhlman-labs/fishhawk/issues/4692)) — contract in [`backend/internal/concern/README.md`](../concern/README.md) § "Child-slice rollup + the outcome column", not a topic file here
 
 ### [Acceptance stage and live validation](docs/acceptance.md)
 

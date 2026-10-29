@@ -86,6 +86,8 @@ type ReviewConcern struct {
 	SeverityClampedFrom  string             `json:"severity_clamped_from"`
 	Provenance           string             `json:"provenance"`
 	CheckKey             string             `json:"check_key"`
+	Outcome              string             `json:"outcome"`
+	RolledUpFrom         *uuid.UUID         `json:"rolled_up_from"`
 }
 
 type Run struct {

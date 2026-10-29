@@ -5946,3 +5946,109 @@ func TestAdvance_AcceptanceInfraFailure_AuditFailurePaths(t *testing.T) {
 		}
 	})
 }
+
+// recordingSliceConcernImporter is a SliceConcernImporter that records each
+// call and, at call time, how many slices_integrated rows the audit fake had
+// already received — so a test can pin the import as running BEFORE the
+// slices_integrated append (E94.1 / #4692).
+type recordingSliceConcernImporter struct {
+	mu    sync.Mutex
+	audit *recordingAudit
+	err   error
+	calls []sliceConcernImportCall
+}
+
+type sliceConcernImportCall struct {
+	parent                   uuid.UUID
+	children                 []uuid.UUID
+	slicesIntegratedPriorCnt int
+}
+
+func (r *recordingSliceConcernImporter) ImportSliceConcerns(_ context.Context, parentRunID uuid.UUID, childRunIDs []uuid.UUID) error {
+	prior := 0
+	if r.audit != nil {
+		r.audit.mu.Lock()
+		for _, e := range r.audit.appended {
+			if e.Category == "slices_integrated" {
+				prior++
+			}
+		}
+		r.audit.mu.Unlock()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, sliceConcernImportCall{parent: parentRunID, children: append([]uuid.UUID(nil), childRunIDs...), slicesIntegratedPriorCnt: prior})
+	return r.err
+}
+
+// newSliceConcernFanIn seeds a parent with two succeeded slices, ready for a
+// clean IntegrateSlices pass, and returns the orchestrator, audit fake and ids.
+func newSliceConcernFanIn(t *testing.T) (*Orchestrator, *recordingAudit, *run.Run, []uuid.UUID) {
+	t.Helper()
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultBranch = defaultbranch.Static("main")
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	c0 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	c1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	return o, au, parent, []uuid.UUID{c0.ID, c1.ID}
+}
+
+// TestIntegrateSlices_ImportsSliceConcernsBeforeSlicesIntegrated pins the
+// E94.1 / #4692 fan-in hook: the importer is called once with the parent id
+// and every succeeded child id, before the slices_integrated append.
+func TestIntegrateSlices_ImportsSliceConcernsBeforeSlicesIntegrated(t *testing.T) {
+	o, au, parent, children := newSliceConcernFanIn(t)
+	imp := &recordingSliceConcernImporter{audit: au}
+	o.SliceConcerns = imp
+
+	if _, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if len(imp.calls) != 1 {
+		t.Fatalf("ImportSliceConcerns calls = %d, want 1", len(imp.calls))
+	}
+	call := imp.calls[0]
+	if call.parent != parent.ID {
+		t.Errorf("import parent = %s, want %s", call.parent, parent.ID)
+	}
+	if !reflect.DeepEqual(call.children, children) {
+		t.Errorf("import children = %v, want %v (every succeeded child, slice order)", call.children, children)
+	}
+	if call.slicesIntegratedPriorCnt != 0 {
+		t.Errorf("slices_integrated rows already written at import time = %d, want 0 (import runs BEFORE the append)", call.slicesIntegratedPriorCnt)
+	}
+	if n := countAuditCategory(au, "slices_integrated"); n != 1 {
+		t.Errorf("slices_integrated rows = %d, want 1", n)
+	}
+}
+
+// TestIntegrateSlices_ImportErrorWritesNoSlicesIntegrated pins the fail-closed
+// posture (E94.1 / #4692): an import error is returned and no
+// slices_integrated row is written, so the parent stays parked.
+func TestIntegrateSlices_ImportErrorWritesNoSlicesIntegrated(t *testing.T) {
+	o, au, parent, _ := newSliceConcernFanIn(t)
+	o.SliceConcerns = &recordingSliceConcernImporter{audit: au, err: errors.New("concern store down")}
+
+	_, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err == nil || !strings.Contains(err.Error(), "import slice concerns") {
+		t.Fatalf("IntegrateSlices err = %v, want an import slice concerns error", err)
+	}
+	if n := countAuditCategory(au, "slices_integrated"); n != 0 {
+		t.Errorf("slices_integrated rows after an import error = %d, want 0 (fail closed)", n)
+	}
+}
+
+// TestIntegrateSlices_NilImporterUnchanged pins the nil (CLI/dev) posture: no
+// importer, the fan-in integrates exactly as before.
+func TestIntegrateSlices_NilImporterUnchanged(t *testing.T) {
+	o, au, parent, _ := newSliceConcernFanIn(t)
+	if _, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if n := countAuditCategory(au, "slices_integrated"); n != 1 {
+		t.Errorf("slices_integrated rows = %d, want 1", n)
+	}
+}

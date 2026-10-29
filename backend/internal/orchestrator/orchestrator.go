@@ -146,6 +146,18 @@ type EffectiveAcceptanceResolver interface {
 	EffectiveAcceptanceVerification(ctx context.Context, runID uuid.UUID, p *plan.Plan) (plan.Verification, error)
 }
 
+// SliceConcernImporter copies every open HIGH or MEDIUM review concern of a
+// decomposed parent's succeeded children into the parent's own concern ledger
+// at fan-in (E94.1 / #4692, ADR-117 D2), so the parent's fix-up routing, the
+// consolidated review and the merge-eligibility leg see them. It is
+// implemented server-side (*server.Server), which owns the concern store and
+// the audit chain, so the orchestrator cannot call it directly without an
+// import cycle. It is idempotent: an already-imported child concern is a
+// no-op, so every fan-in pass may call it with the full succeeded set.
+type SliceConcernImporter interface {
+	ImportSliceConcerns(ctx context.Context, parentRunID uuid.UUID, childRunIDs []uuid.UUID) error
+}
+
 // Orchestrator wires the run repository to a GitHub client to
 // advance a run's stages. Construct directly via the public fields;
 // every dependency is required (the orchestrator no-ops if any is
@@ -212,6 +224,15 @@ type Orchestrator struct {
 	// CLI/dev posture: acceptance dispatches as before (the consolidated PR is
 	// still opened first and the consolidated review still fired).
 	FanInVerify FanInVerifyGate
+
+	// SliceConcerns, when wired, imports the succeeded children's open HIGH
+	// and MEDIUM concerns into the parent's ledger on every fan-in pass
+	// (E94.1 / #4692, ADR-117 D2), immediately before slices_integrated is
+	// written. Wired by server.New as a back-reference exactly like
+	// ConsolidatedReview / RunCancelled. Nil = the CLI/dev posture: nothing
+	// is imported. A non-nil importer's error FAILS the fan-in pass closed:
+	// no slices_integrated row is written and the parent stays parked.
+	SliceConcerns SliceConcernImporter
 
 	// MaxParallelChildren is the global default cap on how many decomposed
 	// child runs may dispatch concurrently (E24.6 / #1146), wired from
@@ -2348,12 +2369,36 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		}
 	}
 
+	// Import the succeeded children's open HIGH/MEDIUM concerns into the
+	// parent's ledger BEFORE slices_integrated (E94.1 / #4692, ADR-117 D2).
+	// Every fan-in reaches this point — the consolidate / integrate-wave
+	// verbs, the child-completion sweeper and the event-driven arm — and the
+	// import is idempotent, so a between-wave pass imports the newly
+	// succeeded children and re-imports nothing. Fail-closed: an import error
+	// writes no slices_integrated row and the parent stays parked for the
+	// next pass, because integrating without the import is the defect.
+	if err := o.importSliceConcerns(ctx, parent.ID, succeeded); err != nil {
+		return nil, fmt.Errorf("import slice concerns into parent %s: %w", parent.ID, err)
+	}
 	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated, integrationCommitSHAs, fold)
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator integrated decomposed slices",
 		slog.String("parent_run_id", parent.ID.String()),
 		slog.String("consolidated_branch", consolidated),
 		slog.Int("slice_count", len(childIDs)))
 	return nil, nil
+}
+
+// importSliceConcerns hands the succeeded children's ids to the wired
+// SliceConcernImporter (E94.1 / #4692). Nil importer = nothing imported.
+func (o *Orchestrator) importSliceConcerns(ctx context.Context, parentID uuid.UUID, succeeded []*run.Run) error {
+	if o.SliceConcerns == nil {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(succeeded))
+	for _, c := range succeeded {
+		ids = append(ids, c.ID)
+	}
+	return o.SliceConcerns.ImportSliceConcerns(ctx, parentID, ids)
 }
 
 // sliceHeadAbsent reports whether the slice head branch is CONFIRMED absent:

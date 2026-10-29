@@ -162,6 +162,65 @@ func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, rea
 	return rowToConcern(row), nil
 }
 
+func (r *postgresRepo) ImportRolledUp(ctx context.Context, p ImportRolledUpParams) ([]*Concern, error) {
+	if p.ParentRunID == uuid.Nil {
+		return nil, errors.New("concern: parent run_id required")
+	}
+	if p.ParentStageID == uuid.Nil {
+		return nil, errors.New("concern: parent stage_id required")
+	}
+	if len(p.Sources) == 0 {
+		return nil, nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("concern: import rolled up: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := concerndb.New(tx)
+	var out []*Concern
+	for _, src := range p.Sources {
+		if src == nil {
+			continue
+		}
+		row, err := q.ImportRolledUpReviewConcern(ctx, concerndb.ImportRolledUpReviewConcernParams{
+			ID:            uuid.New(),
+			ParentRunID:   p.ParentRunID,
+			ParentStageID: p.ParentStageID,
+			StateReason:   RolledUpStateReason(src),
+			SourceID:      src.ID,
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// Already imported into this parent (the unique index's
+			// ON CONFLICT DO NOTHING): no second copy.
+		case err != nil:
+			return nil, fmt.Errorf("concern: import rolled up %s: %w", src.ID, err)
+		default:
+			out = append(out, rowToConcern(row))
+		}
+		if err := q.MarkReviewConcernCarried(ctx, src.ID); err != nil {
+			return nil, fmt.Errorf("concern: mark %s carried: %w", src.ID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("concern: import rolled up: commit: %w", err)
+	}
+	return out, nil
+}
+
+func (r *postgresRepo) StampOpenAtMerge(ctx context.Context, runIDs []uuid.UUID) (int64, error) {
+	if len(runIDs) == 0 {
+		return 0, nil
+	}
+	q := concerndb.New(r.pool)
+	n, err := q.StampReviewConcernsOpenAtMerge(ctx, runIDs)
+	if err != nil {
+		return 0, fmt.Errorf("concern: stamp open_at_merge: %w", err)
+	}
+	return n, nil
+}
+
 func rowsToConcerns(rows []concerndb.ReviewConcern) []*Concern {
 	out := make([]*Concern, 0, len(rows))
 	for _, row := range rows {
@@ -191,6 +250,8 @@ func rowToConcern(r concerndb.ReviewConcern) *Concern {
 		SeverityClampedFrom:  r.SeverityClampedFrom,
 		Provenance:           r.Provenance,
 		CheckKey:             r.CheckKey,
+		Outcome:              Outcome(r.Outcome),
+		RolledUpFrom:         r.RolledUpFrom,
 	}
 	if r.CreatedAt.Valid {
 		out.CreatedAt = r.CreatedAt.Time

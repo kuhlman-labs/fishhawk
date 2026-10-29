@@ -903,3 +903,17 @@ func TestKnownCategories_MergeQueueResumed(t *testing.T) {
 		t.Fatal("merge_queue_resumed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_ConcernRolledUp pins the E94.1 / #4692 (ADR-117 D2)
+// registration: server/concern_rollup.go writes one concern_rolled_up row on
+// the parent per import pass that copied child-slice concerns into the parent
+// ledger. An unregistered category reddens
+// TestKnownCategoriesCoversEmittedCategories and is un-awaitable through
+// fishhawk_await_audit. The row carries its child runs' and stages' ids and is
+// readable on the parent's per-run chain; the ADR-106 registry flag that will
+// classify it does not exist yet.
+func TestKnownCategories_ConcernRolledUp(t *testing.T) {
+	if !IsKnownCategory("concern_rolled_up") {
+		t.Fatal("concern_rolled_up is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}

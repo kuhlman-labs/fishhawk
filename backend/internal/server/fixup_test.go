@@ -2523,6 +2523,10 @@ type fakeConcernRepo struct {
 	// applyResolutionErr, when set, makes ApplyResolution fail without
 	// transitioning — the #3395 recovery's per-row best-effort branch.
 	applyResolutionErr error
+	// importErr / stampErr, when set, make ImportRolledUp / StampOpenAtMerge
+	// fail without writing (E94.1 / #4692 failure-mode tests).
+	importErr error
+	stampErr  error
 }
 
 func newFakeConcernRepo() *fakeConcernRepo { return &fakeConcernRepo{} }
@@ -2656,6 +2660,94 @@ func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to 
 	row.State = to
 	row.StateReason = reason
 	return row, nil
+}
+
+// ImportRolledUp mirrors the store's semantics (E94.1 / #4692): a copy per
+// source on the parent run and stage, deduped on (run_id, rolled_up_from), and
+// every source's outcome set to carried (also when its copy already existed).
+func (f *fakeConcernRepo) ImportRolledUp(_ context.Context, p concern.ImportRolledUpParams) ([]*concern.Concern, error) {
+	if f.importErr != nil {
+		return nil, f.importErr
+	}
+	if p.ParentRunID == uuid.Nil || p.ParentStageID == uuid.Nil {
+		return nil, errors.New("fake concern: parent run and stage required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*concern.Concern
+	for _, src := range p.Sources {
+		if src == nil {
+			continue
+		}
+		exists := false
+		for _, row := range f.rows {
+			if row.RunID == p.ParentRunID && row.RolledUpFrom != nil && *row.RolledUpFrom == src.ID {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			from := src.ID
+			cp := &concern.Concern{
+				ID:                   uuid.New(),
+				RunID:                p.ParentRunID,
+				StageID:              p.ParentStageID,
+				StageKind:            concern.StageKindImplement,
+				OriginReviewSequence: src.OriginReviewSequence,
+				ReviewerModel:        src.ReviewerModel,
+				Severity:             src.Severity,
+				Category:             src.Category,
+				Note:                 src.Note,
+				State:                concern.StateRaised,
+				StateReason:          concern.RolledUpStateReason(src),
+				SuggestedPatch:       src.SuggestedPatch,
+				NewEvidence:          src.NewEvidence,
+				SettledRef:           src.SettledRef,
+				ReviewerRole:         src.ReviewerRole,
+				QuoteUnverified:      src.QuoteUnverified,
+				SeverityClampedFrom:  src.SeverityClampedFrom,
+				Provenance:           src.Provenance,
+				CheckKey:             src.CheckKey,
+				RolledUpFrom:         &from,
+			}
+			f.rows = append(f.rows, cp)
+			out = append(out, cp)
+		}
+		for _, row := range f.rows {
+			if row.ID == src.ID && (row.Outcome == "" || row.Outcome == concern.OutcomeCarried) {
+				row.Outcome = concern.OutcomeCarried
+			}
+		}
+	}
+	return out, nil
+}
+
+// StampOpenAtMerge mirrors the store's state and outcome filter (E94.1 /
+// #4692): open or superseded rows of the given runs with no outcome recorded.
+func (f *fakeConcernRepo) StampOpenAtMerge(_ context.Context, runIDs []uuid.UUID) (int64, error) {
+	if f.stampErr != nil {
+		return 0, f.stampErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int64
+	for _, row := range f.rows {
+		in := false
+		for _, id := range runIDs {
+			if row.RunID == id {
+				in = true
+				break
+			}
+		}
+		if !in || row.Outcome != "" {
+			continue
+		}
+		if row.State.IsOpen() || row.State == concern.StateSuperseded {
+			row.Outcome = concern.OutcomeOpenAtMerge
+			n++
+		}
+	}
+	return n, nil
 }
 
 // seedConcernRow inserts one concern row directly, returning it.
