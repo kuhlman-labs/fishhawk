@@ -135,6 +135,38 @@ type Spec struct {
 	// DisallowUnknownFields decode, so this field MUST stay in lockstep with
 	// the schema's top-level reviewer_personas property.
 	ReviewerPersonas map[string]ReviewerPersona `json:"reviewer_personas,omitempty" yaml:"reviewer_personas,omitempty"`
+	// VerdictTransfer is the repository's declared merge-candidate
+	// verdict-transfer surface (ADR-124 / #4657, amending ADR-098): one
+	// top-level block per repository, read from the run's cached ADMISSION
+	// spec by basedelta.ResolveSurface. nil means undeclared, which the
+	// classifier refuses as surface_undeclared. A v2-only surface: no v0/v1
+	// schema declares it, so an older spec never populates it and never
+	// transfers (ADR-124 Consequences). Round-trips through ParseBytes'
+	// DisallowUnknownFields decode, so this field MUST stay in lockstep with
+	// the schema's top-level verdict_transfer property ($defs/verdict_transfer).
+	VerdictTransfer *VerdictTransfer `json:"verdict_transfer,omitempty" yaml:"verdict_transfer,omitempty"`
+}
+
+// VerdictTransfer is the workflow-v2 `verdict_transfer` block (ADR-124 D1):
+// the verdict-wide (G) patterns, the shared-artifact directory prefixes, the
+// doc-check inputs, the declared-inert and opaque patterns, and the name of
+// the completeness check. The schema enforces only the member types and the
+// closed member set; semantic validation (an empty G, a malformed pattern, a
+// non-canonical directory) is deliberately left to the classifier, which
+// refuses transfer for each (ADR-124 D2), so a bad declaration never fails a
+// repository's unrelated runs at admission. Validate checks nothing here.
+//
+// CompletenessCheck is a DECLARATIVE reference to the conformance test or
+// harness that proves the declaration complete (ADR-124 D4). fishhawkd NEVER
+// executes, evaluates or interpolates it: it is plain text whose presence
+// alone lets enforce mode act; without it the repository stays in shadow.
+type VerdictTransfer struct {
+	GlobalSurface      []string `json:"global_surface,omitempty" yaml:"global_surface,omitempty"`
+	SharedArtifactDirs []string `json:"shared_artifact_dirs,omitempty" yaml:"shared_artifact_dirs,omitempty"`
+	DocCheckInputs     []string `json:"doc_check_inputs,omitempty" yaml:"doc_check_inputs,omitempty"`
+	InertPaths         []string `json:"inert_paths,omitempty" yaml:"inert_paths,omitempty"`
+	OpaquePaths        []string `json:"opaque_paths,omitempty" yaml:"opaque_paths,omitempty"`
+	CompletenessCheck  string   `json:"completeness_check,omitempty" yaml:"completeness_check,omitempty"`
 }
 
 // TestConvention is one test-location convention (#1004): production
