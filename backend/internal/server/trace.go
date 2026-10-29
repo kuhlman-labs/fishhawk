@@ -4285,6 +4285,20 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		return ""
 	}
 
+	// Paths the operator authorized at approval time via the #730
+	// approval-condition prose fold or the #824 add_scope_files structured
+	// fold that are NOT already in the raw plan scope.files (#829). The
+	// implement-stage prompt folds these into its effective scope, but this
+	// review prompt is built directly from approvedPlan, so we recompute the
+	// folds here (reusing the same resolvers handleGetStagePrompt uses) and
+	// thread the remainder through (trig.AmendedScopeFiles below) so the
+	// reviewer treats them as in-scope rather than flagging them as scope drift.
+	approvalScopeAdds := s.amendedScopeFilesForReview(ctx, runRow, approvedPlan)
+	// A decomposed parent's fan-out scope (#4425): every sub_plan-only path and
+	// every slice's add_scope_files_to_slice grant, from the SAME resolver the
+	// parent fix-up serve reads (decomposedParentScopeChannels). Nil for every
+	// run that is not a decomposed parent.
+	parentFanOut := s.parentFanOutScopeForReview(ctx, runRow, approvedPlan)
 	trig := prompt.Trigger{
 		Repo:         runRow.Repo,
 		ApprovedPlan: approvedPlan,
@@ -4298,15 +4312,6 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		// reviewer distinguish an operator-stageable drift path from a
 		// genuinely missing file. Empty/nil when there was no drift.
 		ScopeDrift: scopeDrift,
-		// Paths the operator authorized at approval time via the #730
-		// approval-condition prose fold or the #824 add_scope_files structured
-		// fold that are NOT already in the raw plan scope.files (#829). The
-		// implement-stage prompt folds these into its effective scope, but this
-		// review prompt is built directly from approvedPlan, so we recompute the
-		// folds here (reusing the same resolvers handleGetStagePrompt uses) and
-		// thread the remainder through so the reviewer treats them as in-scope
-		// rather than flagging them as scope drift.
-		AmendedScopeFiles: s.amendedScopeFilesForReview(ctx, runRow, approvedPlan),
 		// The operator's binding approve-with-conditions text (#1021), via
 		// the same resolver the implement-stage prompt uses (decomposed-
 		// child/retry-parent fallback included). The conditions AMEND the
@@ -4334,6 +4339,12 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		// no gate ran, extraction error) keeps the prompt byte-identical.
 		GateEvidence: gateEvidence,
 	}
+	// #4425: a decomposed parent's consolidated branch carries every slice's
+	// commit, so its sub_plan-only paths and slice grants must be in the
+	// reviewer's approval-amended list or criterion 4 flags an edit to one of
+	// them as scope drift (a parent fix-up admitted by the #4338 serve, or the
+	// first consolidated round). Approval adds first, fan-out paths after.
+	trig.AmendedScopeFiles = appendFanOutPaths(approvalScopeAdds, parentFanOut)
 	// Decomposed-parent rollup (#2820): a fan-out CHILD's APPROVED mid-stage scope
 	// amendment lives under the CHILD run id, so a path an operator authorized on a
 	// slice reaches this parent's consolidated diff with no provenance on the
@@ -4496,7 +4507,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 
 	// Operator-scope-undelivered pre-review signal (#1407): the operator may
 	// have DELIBERATELY added a scope path — either an add_scope_files path
-	// folded at plan approval (already computed as trig.AmendedScopeFiles) or
+	// folded at plan approval (already computed as approvalScopeAdds) or
 	// an approved mid-stage scope amendment — that the implement commit left
 	// UNTOUCHED. Today that is conflated with benign plan-scope under-staging
 	// and surfaces only at the implement-review reject → fixup round-trip
@@ -4512,7 +4523,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// signal would surface as an operator-scope-undelivered MISS on the parent,
 	// trading the #2820 false drift signal for a false miss signal. It is folded
 	// only into the review-facing provenance (scopeProvenanceForReview), never the
-	// operator-scope-undelivered union.
+	// operator-scope-undelivered union. The #4425 parent fan-out channels
+	// (parentFanOut: sub_plan-only paths and slice grants) are likewise a
+	// slice's permission, not a work-order on the parent, so they stay out of
+	// this signal too: the union reads the UNWIDENED approvalScopeAdds, not
+	// trig.AmendedScopeFiles (which now also carries the fan-out paths).
 	//
 	// #3029: the DELIVERY question is "has this implement STAGE committed the
 	// path", not "did THIS PASS touch it" — a fix-up re-review's diff is the
@@ -4526,7 +4541,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// untouched: this moves the evaluation set only, never what the reviewer reads.
 	eval := s.resolveStageCumulativeEval(ctx, runRow, runID, stageID, headSHA, diff)
 	evalDiff := eval.Diff
-	operatorAdded := append([]string(nil), trig.AmendedScopeFiles...)
+	operatorAdded := append([]string(nil), approvalScopeAdds...)
 	operatorAdded = append(operatorAdded, s.approvedAmendmentScopePaths(ctx, runID)...)
 	if undelivered, undeliveredIndeterminate := operatorScopeUndelivered(operatorAdded, evalDiff); len(undelivered) > 0 {
 		// Populate the prompt signal so the reviewer sees the miss as a
@@ -4885,7 +4900,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// operator-scope-undelivered signal used, so the two surfaces can never
 	// contradict each other, and carry the set label onto the block so the
 	// reviewer is told which set the labels were derived from.
-	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, evalDiff, gateEvidence); prov != nil {
+	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, parentFanOut, evalDiff, gateEvidence); prov != nil {
 		if gateEvidence == nil {
 			gateEvidence = &prompt.GateEvidence{}
 			trig.GateEvidence = gateEvidence
@@ -5173,6 +5188,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 // no scope.files the reviewer has no baseline to drift against, so there is
 // nothing to amend and it returns nil. Returns nil (not an empty slice) when
 // there is no amendment, keeping the review prompt byte-identical to today.
+//
+// It stays the APPROVAL-ONLY list (it also feeds the #1407
+// operator-scope-undelivered union). A decomposed parent's fan-out union
+// (parentFanOutScopeForReview, #4425) is appended to Trigger.AmendedScopeFiles
+// at the runImplementReviewsForTree call site, never here.
 func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run, approvedPlan *plan.Plan) []string {
 	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
 		return nil
@@ -5318,14 +5338,26 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 // honestly as UnexplainedCount rather than being hidden.
 //
 // The effective set is rebuilt in the SAME fold order handleGetStagePrompt
-// applies (server/prompt.go): plan scope.files, then trig.AmendedScopeFiles
-// (approval-add-scope-files), approvedAmendmentScopePaths (scope-amendment),
-// the decomposed parent's children's approved amendments (child-scope-amendment,
-// #2820 — carrying a per-path Detail naming the authorizing amendment),
-// and — on a fix-up pass only — resolveFixupAllowCreate (fixup-allow-create)
-// and the coupled *_test.go stem siblings over the accumulated set
-// (fixup-coupled-test-sibling), deduped by path with first-source-wins
-// (plan wins over any fold), matching foldScopePaths semantics.
+// applies (server/prompt.go): plan scope.files, then the flat approval
+// add_scope_files (approval-add-scope-files: trig.AmendedScopeFiles minus the
+// fan-out paths appended to it), approvedAmendmentScopePaths
+// (scope-amendment), then a decomposed parent's fan-out union (#4425, fanOut
+// from parentFanOutScopeForReview: parent-sub-plan-scope and
+// parent-slice-add-scope-files, each with a per-path Detail and its DECLARED
+// operation), the decomposed parent's children's approved amendments
+// (child-scope-amendment, #2820 — carrying a per-path Detail naming the
+// authorizing amendment), and — on a fix-up pass only —
+// resolveFixupAllowCreate (fixup-allow-create) and the coupled *_test.go stem
+// siblings over the accumulated set (fixup-coupled-test-sibling), deduped by
+// path with first-source-wins (plan wins over any fold), matching
+// foldScopePaths semantics. The fan-out folds after the flat approval adds,
+// exactly as decomposedParentFixupScope runs after the serve's add_scope_files
+// fold, so a path in both keeps the flat channel's label and modify operation
+// and the coupled-test fold over accum reproduces the served set (a sub_plan
+// delete yields no sibling only when nothing earlier declared the path). The
+// reconstruction is a set and UnexplainedCount compares sizes, so the fold
+// order decides only the label of a path present in two channels — and, through
+// the operation it records, its coupled sibling.
 //
 // Each plan/fold path is marked touched by membership in the committed diff
 // using the same set walk + trailing-slash / non-repo-relative skips as
@@ -5339,7 +5371,7 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 // nil when there is nothing to report (no folds, no untouched plan path, no
 // unexplained residual, and not a fix-up pass), keeping the prompt
 // byte-identical for the common plain-plan-scope case.
-func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uuid.UUID, approvedPlan *plan.Plan, trig prompt.Trigger, diff policy.Diff, ev *prompt.GateEvidence) *prompt.GateScopeProvenance {
+func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uuid.UUID, approvedPlan *plan.Plan, trig prompt.Trigger, fanOut []parentFanOutScopePath, diff policy.Diff, ev *prompt.GateEvidence) *prompt.GateScopeProvenance {
 	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
 		return nil
 	}
@@ -5415,8 +5447,43 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 			})
 		}
 	}
-	addFold(trig.AmendedScopeFiles, "approval-add-scope-files")
+	// trig.AmendedScopeFiles also carries the #4425 fan-out paths (appended at
+	// the call site), and parentFanOutScopeForReview excludes every flat
+	// approval add, so the flat channel is exactly the entries that are not
+	// fan-out paths. The fan-out paths fold below under their own labels.
+	fanOutPaths := make(map[string]struct{}, len(fanOut))
+	for _, entry := range fanOut {
+		fanOutPaths[entry.Path] = struct{}{}
+	}
+	var approvalAdds []string
+	for _, p := range trig.AmendedScopeFiles {
+		if _, ok := fanOutPaths[p]; !ok {
+			approvalAdds = append(approvalAdds, p)
+		}
+	}
+	addFold(approvalAdds, "approval-add-scope-files")
 	addFold(s.approvedAmendmentScopePaths(ctx, runID), "scope-amendment")
+	// Decomposed-parent fan-out union (#4425): every sub_plan-only path and
+	// every slice's add_scope_files_to_slice grant, so an edit to one on the
+	// consolidated branch does not read as an unexplained residual. Same
+	// first-source-wins dedup and touched marking as addFold; the DECLARED
+	// operation rides into accum so the fix-up coupled-test fold reproduces the
+	// served set. Nil for every run that is not a decomposed parent.
+	for _, fp := range fanOut {
+		if _, ok := inScope[fp.Path]; ok {
+			continue
+		}
+		inScope[fp.Path] = struct{}{}
+		foldSource[fp.Path] = fp.Source
+		op := fp.Operation
+		if op == "" {
+			op = "modify"
+		}
+		accum = append(accum, scopeFile{Path: fp.Path, Operation: op})
+		folds = append(folds, prompt.GateScopeFold{
+			Path: fp.Path, Source: fp.Source, Touched: touched(fp.Path), Detail: fp.Detail,
+		})
+	}
 	// Decomposed-parent children's approved amendments (#2820): a slice's
 	// operator-approved amendment path folds in as in-scope so it does not read as
 	// an unexplained residual on the parent. Resolved once in runImplementReviews
