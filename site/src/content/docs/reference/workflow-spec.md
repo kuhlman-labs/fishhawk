@@ -139,6 +139,7 @@ The live major — write new specs here.
 | `test_conventions` | array of `test_convention` | optional |  | Optional per-repo test-location conventions that generalize the plan-gate test sweep (#1004) beyond the built-in Go (name.go -> name_test.go) and colocated-TypeScript defaults. Each entry maps production files matching a glob to candidate test-file path templates. Declared entries are ADDITIVE to the built-in defaults (Go + colocated TS stay covered regardless), so a repo typically declares only its Python / Ruby / parallel-tree conventions. Advisory-only and fail-open: the sweep never blocks a plan. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 | `review_conventions` | object | optional |  | Named repo-declared review conventions (ADR-068 / E55.2 / #2243): a map from a snake_case convention name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property, the same idiom `workflows` uses) to one entry naming a repo-relative document that a review stage SELECTS by name through its `reviewers.conventions` list. A convention is DECLARED here and never auto-discovered — no file is read because it exists at a conventional path. Every declared entry must be selected by at least one stage of the RESOLVED document (one declared and selected nowhere is refused as a control that does nothing), and every selected name must resolve to an entry here; both rules, plus the canonical repo-relative path rule, are enforced at semantic validation by the backend and `fishhawk validate`. GRAMMAR ONLY in this change: nothing renders a convention into a reviewer prompt yet — rendering and severity_cap enforcement are #2244 (E55.3) and the review-prompt wiring is #2797. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
 | `reviewer_personas` | object | optional |  | Named reviewer personas (ADR-084 / E55.8 / #3753): a map from a snake_case persona name (^[a-z][a-z0-9_]*$, the v2 identifier rule — a non-matching key is refused as an additional property) to a persona declaring a model configuration and a remit document. A plan or implement stage ATTACHES personas by name through its `reviewers.personas` list; each attached persona runs as a SEPARATE reviewer invocation with its OWN prompt (the stage's review prompt plus the persona's remit and, for a persona declaring `decision_record`, the decision-record index and the records selected for the change), in addition to the stage's standard `reviewers.agents`, whose prompt is unchanged. A persona inherits the stage's review authority and counts toward the round's configured reviewers. A persona is DECLARED here and never auto-discovered. Every declared persona must be attached by at least one stage of the RESOLVED document OR required by at least one workflow escalation's `require.reviewers` (ADR-084 D2(c) / E55.9 / #3754) — one declared and attached nowhere is refused as a control that does nothing, and every attached name must resolve to an entry here; both rules, plus the remit path rule and the persona agent's agent_version syntax, are enforced at semantic validation by the backend and `fishhawk validate`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain — a field is accepted because the schema declares it, not because the document declared a high enough minor). |
+| `verdict_transfer` | `verdict_transfer` | optional |  | The repository's merge-candidate verdict-transfer surface (ADR-124 / #4657, amending ADR-098): ONE top-level block per repository, never one per workflow, so no workflow carries a narrower surface. It is read from the run's cached ADMISSION spec, so a pull request cannot change the surface its own transfer decision uses, and an edit applies to runs admitted after it merges. An ABSENT block refuses every transfer (`undecidable:surface_undeclared`). Only the member types and the closed member set are schema-enforced: an empty, incomplete or malformed declaration is a classification refusal, never an admission failure. Members: `$defs/verdict_transfer`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain). |
 
 #### workflow-v2 — definitions
 
@@ -458,6 +459,19 @@ One declarative path predicate (E53.1 / #2224): the SINGLE match rule that E53.3
 | `labels` | array of string | optional | minItems: `1` | Issue/PR label names. Satisfied when the change carries ANY of them. |
 | `change_kind` | array of string | optional | minItems: `1` | Change-kind tokens. Satisfied when the change's kind is ANY of them. |
 | `trigger` | array of string | optional | minItems: `1` | Trigger forms this predicate accepts. `diff` is a code-diff run; `scheduled` and `on_demand` are the non-diff forms (ADR-067 decoupled stage types from producing a diff, so a scheduled groomer or on-demand incident intake is routable by the same mechanism). A change with no trigger normalizes to `diff`. Satisfied when the change's trigger is ANY listed form. |
+
+##### `verdict_transfer`
+
+The repository's declared verdict-transfer surface (ADR-124 / #4657). ADR-096 verdict transfer lets a merge candidate keep its verify verdict across a base advance when the base delta and the pull-request delta are independent; the daemon's transfer mode (off, shadow or enforce; default shadow) decides whether a decision is only recorded or acted on. The block is read ONLY from the run's cached ADMISSION spec, never from a checkout. No member is required and no list has a minimum length: semantic validation is the classifier's, and each problem there refuses transfer (the merge-candidate pass then runs) rather than failing admission. An absent block refuses as `undecidable:surface_undeclared`; a block with no `global_surface` entry as `undecidable:surface_incomplete`; a malformed entry as `undecidable:invalid_surface:<entry>`; a workspace with no supported import-graph adapter (today: a Go workspace, a `go.work` or `go.mod` at the repository root; a nested module is not sufficient) as `undecidable:unsupported_language`; a changed path no class covers as `undecidable:unclassified_path`; an opaque path as `undecidable:opaque_path`. Every changed path on both sides is classified with a fixed precedence, the first match deciding: `global_surface`, then `opaque_paths`, then the import-graph adapter's coverage, then `inert_paths`. The workflow spec `.fishhawk/workflows.yaml` itself always forces the pass (self-covering). A valid pattern that matches no current file is prospective coverage: it is recorded on the transfer row as a diagnostic and never refused. Every transfer and shadow row records the classifier version, the declaration's content digest and its admission provenance.
+
+| Field | Type | Required | Constraints | Description |
+|---|---|---|---|---|
+| `global_surface` | array of string | optional |  | The ADR-098 D1 verdict-wide (G) class: root-anchored doublestar patterns over repository-relative, slash-separated paths. A changed path matching one, on either the pull-request delta or the base delta, forces the merge-candidate pass (`global_surface:<path>`). G is checked first, so it wins over every other class. At least one entry is needed for the declaration to be usable: a block with none refuses as `undecidable:surface_incomplete` at classification, never at admission. |
+| `shared_artifact_dirs` | array of string | optional |  | The ADR-096 D1(d) shared-artifact directory prefixes: repository-relative directories, each ending in `/`. A pull-request-delta path and a base-delta path that ANY declared directory both contain are dependent (`shared_artifact:<dir>`), whatever other class covers them; an inert entry never exempts a path from this rule. A prefix equal to `/`, not ending in `/`, or not canonical refuses as `undecidable:invalid_surface:<entry>`. |
+| `doc_check_inputs` | array of string | optional |  | The ADR-098 D1 doc-check (D) inputs: root-anchored doublestar patterns. Until ADR-098's D-i/D-ii relaxation lands (#4317), a match on either side forces the pass (`doc_check:<path>`), a conservative superset of the eventual rule. |
+| `inert_paths` | array of string | optional |  | Declared-inert patterns (root-anchored doublestar), consulted ONLY for a changed path that no other class covers. They are checked after `global_surface`, `opaque_paths` and the import-graph adapter's coverage, so an inert entry never removes a path from graph reach or from the shared-artifact rule; it only stops an otherwise-unclassified path refusing as `undecidable:unclassified_path`. Inertness is declared, never defaulted. |
+| `opaque_paths` | array of string | optional |  | Root-anchored doublestar patterns naming subtrees whose change the classifier refuses to reason about: a changed path matching one (and no `global_surface` pattern) refuses transfer as `undecidable:opaque_path:<path>`. |
+| `completeness_check` | string | optional |  | A DECLARATIVE reference naming the conformance test or harness that proves this declaration covers every verify input (ADR-124 D4). fishhawkd NEVER executes, evaluates or interpolates it: the value is plain text, and only its presence matters. Enforce mode acts only for a declaration naming one; without it (absent, empty or whitespace only) the repository's transfer decisions stay in shadow. |
 
 
 ### `workflow-v1`
@@ -943,6 +957,13 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/stage_permissions/properties/network` | added | new at the newer major |
 | `/$defs/stage_permissions/properties/shell` | added | new at the newer major |
 | `/$defs/stage_permissions/properties/write` | added | new at the newer major |
+| `/$defs/verdict_transfer` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/completeness_check` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/doc_check_inputs` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/global_surface` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/inert_paths` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/opaque_paths` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/shared_artifact_dirs` | added | new at the newer major |
 | `/$defs/workflow/properties/actions` | added | new at the newer major |
 | `/$defs/workflow/properties/applies_to` | added | new at the newer major |
 | `/$defs/workflow/properties/auto_advance` | added | new at the newer major |
@@ -958,6 +979,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/properties/review_conventions` | added | new at the newer major |
 | `/properties/reviewer_personas` | added | new at the newer major |
 | `/properties/roles` | removed | present in the older major, absent at the newer |
+| `/properties/verdict_transfer` | added | new at the newer major |
 | `/properties/version` | changed | enum members differ |
 
 ### workflow-v0 → workflow-v2
@@ -1064,6 +1086,13 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/$defs/stage_permissions/properties/network` | added | new at the newer major |
 | `/$defs/stage_permissions/properties/shell` | added | new at the newer major |
 | `/$defs/stage_permissions/properties/write` | added | new at the newer major |
+| `/$defs/verdict_transfer` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/completeness_check` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/doc_check_inputs` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/global_surface` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/inert_paths` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/opaque_paths` | added | new at the newer major |
+| `/$defs/verdict_transfer/properties/shared_artifact_dirs` | added | new at the newer major |
 | `/$defs/workflow/properties/actions` | added | new at the newer major |
 | `/$defs/workflow/properties/applies_to` | added | new at the newer major |
 | `/$defs/workflow/properties/auto_advance` | added | new at the newer major |
@@ -1079,6 +1108,7 @@ Shape deltas only — a field whose description changed but whose type, required
 | `/properties/review_conventions` | added | new at the newer major |
 | `/properties/reviewer_personas` | added | new at the newer major |
 | `/properties/roles` | removed | present in the older major, absent at the newer |
+| `/properties/verdict_transfer` | added | new at the newer major |
 | `/properties/version` | changed | enum members differ |
 
 ## The six primitives
