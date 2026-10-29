@@ -166,6 +166,13 @@ func (s *Server) runPlanWarnings(ctx context.Context, runID, stageID uuid.UUID, 
 		warnings = append(warnings, w)
 	}
 
+	// SHARED PATH across decomposition slices (#4679), appended LAST so every
+	// earlier advisory keeps its position. One advisory per cross-slice
+	// ownership overlap the decomposition validator does not refuse (directory
+	// containment or trailing-slash spelling; raw-equal duplicates are already
+	// refused in every wave). Reads only the parsed plan.
+	warnings = append(warnings, sliceSharedPathWarnings(&parsedPlan)...)
+
 	if len(warnings) == 0 {
 		return nil
 	}

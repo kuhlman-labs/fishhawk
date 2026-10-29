@@ -2580,6 +2580,72 @@ func TestWithholdScopeOverlapFromRunBound_EscapeRecordedWithheld(t *testing.T) {
 	}
 }
 
+// TestWithholdScopeOverlapFromRunBound_ScopeAmendmentRefusedWithheld is the
+// guard for the scope_amendment_refused entry in
+// withholdScopeOverlapFromRunBound (#4679, approval condition C2): the row's
+// slice_ownership names sibling slices' titles, declared paths and child run
+// ids, so a run-bound subject reads no scope_amendment_refused row on EITHER
+// the per-run read or the global feed — unfiltered or category-named — while an
+// operator reads it on both. It moves with the entry when the deny-list
+// migrates into ADR-106's per-category registry flag (E89 #4537).
+// Counterfactual: deleting `e.Category == CategoryScopeAmendmentRefused` from
+// the predicate exposes the row → RED.
+func TestWithholdScopeOverlapFromRunBound_ScopeAmendmentRefusedWithheld(t *testing.T) {
+	t.Run("predicate", func(t *testing.T) {
+		rid := uuid.New()
+		in := []*audit.Entry{
+			{RunID: &rid, Sequence: 1, Category: CategoryScopeAmendmentRefused},
+			{RunID: &rid, Sequence: 2, Category: "plan_generated"},
+		}
+		out := withholdScopeOverlapFromRunBound(in, "mcp:run:"+rid.String())
+		if len(out) != 1 || out[0].Category != "plan_generated" {
+			t.Fatalf("run-bound withhold kept %d rows (first %q), want only plan_generated", len(out), out[0].Category)
+		}
+		if got := withholdScopeOverlapFromRunBound(in, "github:op"); len(got) != 2 {
+			t.Fatalf("operator withhold kept %d rows, want 2 (unchanged)", len(got))
+		}
+	})
+	f := newRunBoundWithholdFixture(t, CategoryScopeAmendmentRefused)
+	op := Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{scopeGateViewRead}}
+	reads := map[string]func(string, Identity) *httptest.ResponseRecorder{
+		"per-run read": func(cat string, id Identity) *httptest.ResponseRecorder {
+			q := ""
+			if cat != "" {
+				q = "?category=" + cat
+			}
+			return f.listRunAudit(q, id)
+		},
+		"global feed": func(cat string, id Identity) *httptest.ResponseRecorder {
+			q := ""
+			if cat != "" {
+				q = "&category=" + cat
+			}
+			return f.listGlobalAudit(q, id)
+		},
+	}
+	for name, read := range reads {
+		t.Run(name, func(t *testing.T) {
+			for _, subject := range scopeOverlapWithholdSubjects(f.runB) {
+				runBound := Identity{Subject: subject, TokenID: "tok-run", Scopes: []string{"mcp:read", scopeGateViewRead}}
+				for _, cat := range []string{"", CategoryScopeAmendmentRefused} {
+					w := read(cat, runBound)
+					if n := countAuditItemsInCategory(readAuditItems(t, w), CategoryScopeAmendmentRefused); n != 0 {
+						t.Fatalf("run-bound %s %s (category=%q): %d scope_amendment_refused rows, want 0 — the entry is missing from withholdScopeOverlapFromRunBound", subject, name, cat, n)
+					}
+					if strings.Contains(w.Body.String(), scopeOverlapWithholdMarker) {
+						t.Fatalf("run-bound %s %s (category=%q) leaks the refusal payload:\n%s", subject, name, cat, w.Body.String())
+					}
+				}
+			}
+			for _, cat := range []string{"", CategoryScopeAmendmentRefused} {
+				if n := countAuditItemsInCategory(readAuditItems(t, read(cat, op)), CategoryScopeAmendmentRefused); n != 1 {
+					t.Fatalf("operator %s (category=%q): %d scope_amendment_refused rows, want 1", name, cat, n)
+				}
+			}
+		})
+	}
+}
+
 // TestListRunAudit_RunBoundWithholdsEscapeRecorded pins A1.6 on GET
 // /v0/runs/{run_id}/audit for every run-bound subject shape (the run's own
 // token, another run's token, a malformed suffix): no escape_recorded row on

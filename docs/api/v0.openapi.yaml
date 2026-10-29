@@ -30477,6 +30477,23 @@ paths:
         remaining_budget}`) — the operator's `fishhawk_await_audit`
         anchor. Delivery is poll-based: the agent polls the GET
         until the status leaves `pending` (bounded ~5 minutes).
+
+        **Slice-ownership guard (#4679).** On a decomposition child,
+        a requested path that overlaps (identical, or directory
+        containment) a path ANOTHER slice of the parent's approved
+        decomposition declares is refused 409
+        `amendment_path_owned_by_sibling_slice` unless that slice is a
+        transitive `depends_on` ancestor of the requester. The check
+        runs BEFORE the row is created, so a refusal creates no row
+        and spends no budget; it is recorded as an internal
+        `scope_amendment_refused` audit entry (phase `request`). An
+        admitted child request carries `slice_ownership` on its
+        `scope_amendment_requested` payload. A run or plan read error
+        here fails OPEN (`slice_ownership.checked: false`) — the
+        decision route re-checks fail-closed. The guard covers only
+        this route and the decision route; `fishhawk_resume_run`
+        `add_scope_files` and the scope-completeness `amend` decision
+        are not covered (#4798).
       tags: [runner]
       security: []
       parameters:
@@ -30535,6 +30552,14 @@ paths:
             `stage_not_implement` — the run's resolved active stage
             (dispatched/running, else first non-terminal) is not an
             implement stage.
+            `amendment_path_owned_by_sibling_slice` — a decomposition
+            child named a path a sibling slice that is not its
+            `depends_on` ancestor declares (#4679). No row is created
+            and no budget is spent. `details` carries `reason`
+            (`path_owned_by_non_ancestor_slice`), `requested_slice`,
+            `ancestor_slices`, `conflicts[]` (`path`, `owning_slice`,
+            `owning_title`, `owning_path`, `owning_child_run_id` when
+            resolvable, `overlap_kind`) and `remedy`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30659,6 +30684,24 @@ paths:
         cancelled or superseded, or its run succeeded or was cancelled;
         #4127) returns 409
         (`amendment_lapsed`) and is never approvable.
+
+        **Slice-ownership guard (#4679).** An APPROVE of a pending
+        amendment on a decomposition child re-runs the request route's
+        slice-ownership check: a path a sibling slice that is not its
+        `depends_on` ancestor declares returns 409
+        `amendment_path_owned_by_sibling_slice` (the row stays
+        `pending`; a `scope_amendment_refused` audit entry with phase
+        `decide` is recorded). There is no override — deny the
+        amendment with the remedy as the reason. A run or plan read
+        error fails CLOSED: 500 `slice_ownership_check_failed`, the
+        row untouched, retryable. Deny is never checked, and a
+        non-pending row keeps its `amendment_already_decided` /
+        `amendment_lapsed` answer. A row still reading `pending` that
+        has already lapsed can get the ownership 409 instead of
+        `amendment_lapsed` (message fidelity only; the row is
+        untouched). The guard covers only the request and decision
+        routes; `fishhawk_resume_run` `add_scope_files` and the
+        scope-completeness `amend` decision are not covered (#4798).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -30716,6 +30759,19 @@ paths:
             `amendment_already_decided` — decisions are immutable.
             `amendment_lapsed` — the request lapsed undecided (#4127);
             `details` carries `status`, `decision_reason` and `stage_id`.
+            `amendment_path_owned_by_sibling_slice` — an approve names a
+            path a non-ancestor sibling slice declares (#4679); the row
+            stays `pending` and there is no override (deny it).
+            `details` as on the request route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `slice_ownership_check_failed` — the approve's
+            slice-ownership check could not read the run or the parent's
+            approved plan (#4679); fail-closed, the row is untouched and
+            the call is retryable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
