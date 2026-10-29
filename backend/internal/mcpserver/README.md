@@ -560,7 +560,7 @@ The ladder is resolved SERVER-SIDE, in `handleStartCampaignItemRun`:
 
 1. **An explicit per-item `working_dir` wins** — including when it DIFFERS from the campaign binding, which is **accepted as a deliberate override**, not refused. This diverges from `resolveWorkingDirForRun`, which REFUSES a conflict against a RUN binding, and the asymmetry is deliberate: a run has exactly one checkout and its branch lineage already lives there, so a conflict is incoherent; a campaign is a BATCH, and an item legitimately executing in a different checkout is conceivable. The divergence is logged, and the minted run row carries the value that actually applied, so the applied resolution is observable rather than inferred.
 2. **Otherwise the campaign's binding is inherited** — re-validated through the same absolute-path gate an explicit value passes. Trusting the stored value would let a relative binding written straight to the campaign row bypass validation by arriving through a different door, which is the whole point of re-validating.
-3. **Otherwise a `runner_kind: local` item is refused** `working_dir_required`.
+3. **Otherwise an item whose RESOLVED `runner_kind` is `local` is refused** `working_dir_required` — resolved through the runner-kind ladder below, so a campaign that recorded `runner_kind: local` with no checkout is refused rather than minting a checkout-less local run (#4485).
 
 **Rung 3 MOVED out of this package (a deliberate relocation).** #2498 fired the "a local item needs a resolvable checkout" refusal in `startCampaignItemRun` before any backend round-trip. That is no longer possible: an omitted `working_dir` is no longer necessarily missing — the campaign may bind it — and this layer cannot see the campaign row without a read. So the SEMANTIC refusal moved to the handler (which already loads the campaign) as a distinct `working_dir_required` 400, and the tool maps that code back to the same actionable operator message, naming BOTH remedies (bind it once at `start_campaign`, or pass it for this item). It stays transport-INDEPENDENT in #2498's sense — it fires for stdio and HTTP clients alike — and now also covers direct REST callers, which the MCP-only guard never did. The cost is one backend round-trip on that refusal; it mints nothing. The alternative (having the tool read the campaign first) needs a new client read, duplicates the ladder in two layers, and still leaves REST callers unguarded.
 
@@ -569,6 +569,21 @@ The ladder is resolved SERVER-SIDE, in `handleStartCampaignItemRun`:
 **MCP roots is not the alternative.** Passing the path as a tool parameter rather than asking the client is load-bearing: MCP roots is deprecated as of protocol revision 2026-07-28 (SEP-2577), whose migration guidance directs servers to take paths via tool parameters, and server-initiated requests are refused mid-tool-call on that revision (SEP-2322). This inference was rejected deliberately; a later proposal to reintroduce a roots-based path should re-read this note first (it is falsifiable by a future revision restoring roots).
 
 `nextActionsFor` stamps the binding onto the params of every emitted action whose verb is one of the four (`foldWorkingDirParams`), and does nothing for an unbound run — so a driving loop propagates the binding without re-deriving it, and an unbound run never advertises an empty-string path.
+
+### `runner_kind` is recorded once at start_campaign and resolved per item ([#4485](https://github.com/kuhlman-labs/fishhawk/issues/4485))
+
+Before #4485 an item run whose call omitted `runner_kind` silently minted `github_actions` even on a campaign bound to a local `working_dir`. `fishhawk_start_campaign` now takes an OPTIONAL `runner_kind` (`local` / `github_actions` / `gitlab_ci`) and records it on the CAMPAIGN row (`campaigns.runner_kind`, migration `0113`, `''` = not recorded, echoed as `runner_kind` on the Campaign). `handleStartCampaignItemRun` resolves the minted run's kind SERVER-SIDE (`resolveCampaignItemRunnerKind`), BEFORE the `working_dir` ladder and before any mutation:
+
+1. **An explicit per-item `runner_kind` wins** (`source: explicit`) — an override, recorded on the run row; a value that differs from the campaign's is logged.
+2. **Otherwise the campaign's recorded `runner_kind`** (`source: campaign`) — re-validated against `run.ValidRunnerKinds`, so an invalid value written straight onto the campaign row is refused 400 `validation_failed` (`details.field` = `runner_kind`) rather than inherited.
+3. **Otherwise `local` when the campaign binds `working_dir`** (`source: campaign_working_dir`) — a bound checkout only means anything to a local runner; this rung also covers every campaign created before the column.
+4. **Otherwise `github_actions`** (`source: default`) — the unchanged default.
+
+The `working_dir_required` rung keys on the RESOLVED kind, not the request field. The 201 body carries `runner_kind_resolution {runner_kind, source}` and the `campaign_issue_started` audit payload records `runner_kind` + `runner_kind_source`, so the applied kind and why it applied are always stated. The create-time refusal for an unknown `runner_kind` fires with the other body checks, before any forge round-trip, and persists no campaign.
+
+**This package never defaults `runner_kind` client-side** — on either verb. An omitted value must reach the backend absent, or the `working_dir` fallback rung is unreachable (`TestStartCampaignItemRun_OmittedOptionalFields_LeavesBodyEmpty`, `TestStartCampaign_ThreadsRunnerKindThroughRealClient`).
+
+**`runner_kind_resolution` survives the ADR-077 floor tier.** `StartCampaignItemRunOutput.RunnerKindResolution` is deliberately NOT `omitempty`: the floor rebuilds the response from a zero value and re-installs only non-omitempty fields (`carryNonOmitemptyFields`), so an omittable field would vanish exactly when the response is reduced hardest. It is classified `computed` in `floorCarryTable` (`TestStartCampaignItemRun_FloorTier_CarriesRunnerKindResolution`).
 
 ### `campaign_dangling_dependency` remedy branches ([#2953](https://github.com/kuhlman-labs/fishhawk/issues/2953))
 

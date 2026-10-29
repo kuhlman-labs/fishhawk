@@ -48,13 +48,18 @@ type StartCampaignInput struct {
 	GroomingAllowSuperseded bool `json:"grooming_allow_superseded,omitempty" jsonschema:"OPTIONAL with grooming_run_id: build from this order even though a NEWER approved grooming run — one the backend POSITIVELY IDENTIFIED and names in the refusal — has superseded it. Default false REFUSES that case; prefer grooming the newer run. Set true only when you deliberately want the older ratified order; the choice is recorded in the campaign's durable provenance. It applies to a NAMED superseding run and to NOTHING ELSE: a supersession check that could not prove the order is current (grooming_order_supersession_undetermined) or could not be run at all (grooming_order_supersession_unreadable) is refused whatever this flag says, because an incomplete check names no run to acknowledge"`
 	// WorkingDir is the OPTIONAL campaign-level checkout binding (E48.87 /
 	// #2527): bound ONCE here, inherited by every item run.
-	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign's item runs execute in. Bound ONCE on the campaign so EVERY item run inherits it — pass it here instead of repeating an identical path on every fishhawk_start_campaign_item_run call. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused. Omit it only if the campaign's item runs are github_actions, or if you intend to pass working_dir per item: a LOCAL item run whose campaign carries no binding and that passes none is refused working_dir_required. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
+	WorkingDir string `json:"working_dir,omitempty" jsonschema:"absolute path to the checkout this campaign's item runs execute in. Bound ONCE on the campaign so EVERY item run inherits it — pass it here instead of repeating an identical path on every fishhawk_start_campaign_item_run call. YOU, the calling agent, resolve your own checkout (you are running inside one) rather than asking the operator for a path. A non-absolute value is refused. A campaign that binds working_dir but records no runner_kind mints LOCAL item runs. Omit it only if the campaign's item runs are github_actions, or if you intend to pass working_dir per item: a LOCAL item run whose campaign carries no binding and that passes none is refused working_dir_required. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
 
 	// Provider is the OPTIONAL work-item provider selector (#3645): a
 	// forge-neutral override of the repo's conventions-resolved work-item
 	// provider for THIS campaign. Deliberately a work-item provider ID and not
 	// a github|gitlab `forge` enum — the id space includes `jira`, and `forge`
 	// on fishhawk_start_run means which forge HOSTS the repo.
+	// RunnerKind is the OPTIONAL campaign-level runner kind (#4485): recorded
+	// ONCE here, inherited by every item run. Deliberately NOT defaulted
+	// client-side — an omitted value lets the backend resolve it.
+	RunnerKind string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend for this campaign's item runs: 'local', 'github_actions' or 'gitlab_ci'. Recorded on the campaign and inherited by EVERY item run, so you do not repeat it on each fishhawk_start_campaign_item_run call. Bind 'local' here (together with working_dir) for a local campaign. Omit it to record none: item runs then take 'local' when the campaign binds working_dir, else github_actions. An invalid value is refused validation_failed"`
+
 	Provider string `json:"provider,omitempty" jsonschema:"OPTIONAL the work-item provider id to assemble this campaign against: 'github_projects', 'gitlab' or 'jira'. Defaults to the repo's work-management conventions (the .fishhawk/work-management.yaml provider: field, falling back to github_projects). Reach for it when the conventions-resolved provider is not one this deployment has registered — the 501 provider_unimplemented refusal names the registered set, and passing one of those ids here corrects the call in-band with no daemon restart. An unregistered id is refused 400 validation_failed before any forge round-trip. 'gitlab' serves both campaign sources (epic_ref and items) since #3658; only a GitLab Premium group-epic ref is refused campaign_epic_ref_group_unsupported"`
 }
 
@@ -306,7 +311,12 @@ your own checkout, you are running inside one), bound ONCE so every item run
 inherits it — pass it here instead of repeating an identical path on every
 fishhawk_start_campaign_item_run call. A non-absolute working_dir is refused
 before any backend call; a local item run whose campaign carries no binding and
-that passes none is refused working_dir_required. A write tool:
+that passes none is refused working_dir_required. runner_kind is optional too:
+'local', 'github_actions' or 'gitlab_ci', recorded on the campaign and inherited
+by every item run — bind runner_kind 'local' here together with working_dir for
+a local campaign. Omitted, item runs take 'local' when the campaign binds
+working_dir, else github_actions; an invalid value is refused
+validation_failed. A write tool:
 needs an operator token with write:campaigns scope (a runner-bound token is
 rejected 403). An epic whose dependency edges point outside its own children
 fails campaign_dangling_dependency; a requested item that is not a child of the
@@ -576,12 +586,16 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 	}
 
 	created, err := r.api.CreateCampaign(ctx, campaignCreateRequest{
-		Repo:           repo,
-		EpicRef:        in.EpicRef,
-		PausePolicy:    in.PausePolicy,
-		OperatorAgent:  operatorAgent,
-		Items:          in.Items,
-		WorkingDir:     workingDir,
+		Repo:          repo,
+		EpicRef:       in.EpicRef,
+		PausePolicy:   in.PausePolicy,
+		OperatorAgent: operatorAgent,
+		Items:         in.Items,
+		WorkingDir:    workingDir,
+		// The OPTIONAL campaign-level runner kind (#4485), forwarded trimmed and
+		// NEVER defaulted here: the backend validates it, and an omitted value is
+		// what lets the item-run ladder fall back on the working_dir binding.
+		RunnerKind:     strings.TrimSpace(in.RunnerKind),
 		GroomingSource: groomingSource,
 		// The OPTIONAL work-item provider selector (#3645). Forwarded verbatim
 		// — the backend is the registry authority, so the client does not
@@ -773,7 +787,10 @@ func (r *runResolver) startCampaign(ctx context.Context, _ *mcp.CallToolRequest,
 
 // StartCampaignItemRunInput is the fishhawk_start_campaign_item_run tool's
 // input. campaign_id + issue_ref + workflow_id are required; workflow_ref,
-// runner_kind and working_dir are optional. working_dir OVERRIDES the
+// runner_kind and working_dir are optional. runner_kind OVERRIDES the
+// campaign's recorded runner_kind (#4485); omitted, the backend resolves it
+// from the campaign (recorded kind, else local for a working_dir binding, else
+// github_actions), so it is deliberately never defaulted here. working_dir OVERRIDES the
 // campaign's own binding (E48.87 / #2527) and is needed only when the campaign
 // carries none — a local item with neither is refused working_dir_required by
 // the backend, which is the only layer that can see the binding. There is
@@ -785,7 +802,7 @@ type StartCampaignItemRunInput struct {
 	IssueRef    string `json:"issue_ref" jsonschema:"the campaign item's issue ref to start (must be one of the campaign's items and currently startable per the DAG: either eligible, or a deps-satisfied cancelled item, which is restarted with a fresh run)"`
 	WorkflowID  string `json:"workflow_id" jsonschema:"the workflow id to run for this issue (e.g. 'feature_change')"`
 	WorkflowRef string `json:"workflow_ref,omitempty" jsonschema:"OPTIONAL git ref to fetch the workflow spec at; omit for the repo's default branch"`
-	RunnerKind  string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend: 'github_actions' (default) or 'local'. Pass 'local' for the local dogfood loop so the run executes through the local runner"`
+	RunnerKind  string `json:"runner_kind,omitempty" jsonschema:"OPTIONAL execution backend for this item run: 'local', 'github_actions' or 'gitlab_ci'. Omit it to inherit the campaign's recorded runner_kind; a campaign that records none gives 'local' when it binds working_dir, else github_actions. A value passed here is a per-item OVERRIDE recorded on the minted run. The result's runner_kind_resolution states the applied kind and its source"`
 	// WorkingDir binds the minted run's local checkout (E48.69 / #2498) and is
 	// an OVERRIDE of the campaign's own binding (E48.87 / #2527).
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"OPTIONAL absolute path to the checkout this campaign item's run executes in, OVERRIDING the campaign's own working_dir binding. Needed only when the campaign carries NO binding (bind it once at fishhawk_start_campaign instead of repeating it here): omit it and the item run inherits the campaign's. A local item run whose campaign has no binding and that passes none is refused working_dir_required. A value that differs from the campaign binding is accepted as a deliberate override — use it when this one item genuinely executes in a different checkout. A non-absolute value is refused for any runner_kind. Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots."`
@@ -796,6 +813,13 @@ type StartCampaignItemRunInput struct {
 type StartCampaignItemRunOutput struct {
 	Run  Run          `json:"run"`
 	Item CampaignItem `json:"item"`
+	// RunnerKindResolution states the runner kind the minted run was given and
+	// the ladder rung that chose it (#4485). Deliberately NOT omitempty: the
+	// ADR-077 floor tier re-installs only non-omitempty fields
+	// (carryNonOmitemptyFields), so an omitempty field would vanish exactly when
+	// the response is reduced hardest. Null only against a backend that predates
+	// it.
+	RunnerKindResolution *campaignRunnerKindResolution `json:"runner_kind_resolution" jsonschema:"the runner kind the minted run was given and why: source 'explicit' (this call's runner_kind), 'campaign' (the campaign's recorded runner_kind), 'campaign_working_dir' (the campaign records none but binds working_dir, so local) or 'default' (neither, so github_actions). Null only against a backend that predates it"`
 	// Elisions is the ADR-077 byte-bound block (#2510). This is the verb that
 	// concretely broke on 2026-08-07 at 75,963 characters — a mutating verb
 	// whose run had ALREADY been minted when the response failed to render — so
@@ -831,16 +855,21 @@ dependency; then it mints the run, links it, and moves the item to running. Poll
 fishhawk_get_campaign_status again after starting — the status read settles each
 run as it reaches terminal and advances the campaign in DAG order.
 
-campaign_id, issue_ref, and workflow_id are required. Pass runner_kind 'local'
-for the local dogfood loop. working_dir is OPTIONAL and only OVERRIDES the
+campaign_id, issue_ref, and workflow_id are required. runner_kind is OPTIONAL:
+omit it to inherit the campaign's recorded runner_kind (bind 'local' once at
+fishhawk_start_campaign); a campaign that records none gives 'local' when it
+binds working_dir, else github_actions. A value passed here is a per-item
+override recorded on the minted run. The result's runner_kind_resolution states
+the applied kind and its source. working_dir is OPTIONAL and only OVERRIDES the
 campaign's own binding: bind the checkout once at fishhawk_start_campaign and
 every item run inherits it, so you do not repeat an identical absolute path per
 item. Pass it here only when the campaign carries no binding, or when this one
 item genuinely executes in a DIFFERENT checkout (a differing value is accepted as
 a deliberate override, and the minted run row records what actually applied).
 Whatever resolves binds the minted run, so
-run_stage/dispatch_stage/run_children/drive_run for that item all inherit it. A
-local item with neither a campaign binding nor a per-item value is refused
+run_stage/dispatch_stage/run_children/drive_run for that item all inherit it. An
+item whose resolved runner_kind is local with neither a campaign binding nor a
+per-item value is refused
 working_dir_required rather than falling through to the client's cwd; a
 non-absolute working_dir is refused for
 any runner_kind. A write tool: needs an operator token with
@@ -938,7 +967,7 @@ func (r *runResolver) startCampaignItemRun(ctx context.Context, req *mcp.CallToo
 		return nil, StartCampaignItemRunOutput{}, fmt.Errorf("start campaign item run: %w", err)
 	}
 	bounded, berr := boundRunRowOutput(
-		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item}, res.Run.ID, r.responseBudget(req),
+		StartCampaignItemRunOutput{Run: res.Run, Item: res.Item, RunnerKindResolution: res.RunnerKindResolution}, res.Run.ID, r.responseBudget(req),
 		func(o *StartCampaignItemRunOutput) []*Run { return []*Run{&o.Run} },
 		func(o *StartCampaignItemRunOutput, e *Elisions) { o.Elisions = e },
 		// The campaign id is not carried on the CampaignItem, so the floor's

@@ -135,6 +135,12 @@ type Assembly struct {
 	// grooming-sourced (every epic_ref / explicit-items campaign). The server
 	// marshals it; the campaign package never interprets these bytes.
 	GroomingSource []byte
+	// RunnerKind is the OPTIONAL campaign-level runner kind (#4485), threaded
+	// straight through Persist onto the campaign. Empty = not recorded (each item
+	// run then resolves its runner kind from the WorkingDir binding or the
+	// github_actions default). The server sets it from the validated create
+	// request.
+	RunnerKind string
 	// GroomingGuard is the OPTIONAL grooming-currency guard (E54.17 / #2817),
 	// threaded straight through Persist onto CreateCampaignParams. It rides the
 	// campaign's OWN INSERT for the SAME reason GroomingSource does: Persist is not
@@ -357,6 +363,9 @@ func Persist(ctx context.Context, repo Repository, repoName string, a *Assembly)
 		// provenance record written after the fact could be lost while the
 		// campaign survived. Nil = not grooming-sourced.
 		GroomingSource: a.GroomingSource,
+		// Thread the optional campaign-level runner kind straight through
+		// (#4485): empty = not recorded.
+		RunnerKind: a.RunnerKind,
 		// Thread the optional grooming-currency guard straight through (E54.17 /
 		// #2817). Non-nil selects the guarded INSERT, which decides currency in the
 		// campaign row's own statement — no window between the check and the row

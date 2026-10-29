@@ -5323,6 +5323,16 @@ components:
             binding — each item run then needs its own `working_dir`, and a
             `local` one with neither is refused `working_dir_required`.
           example: /Users/op/checkouts/fishhawk
+        runner_kind:
+          type: string
+          enum: [github_actions, local, gitlab_ci]
+          description: |
+            OPTIONAL campaign-level runner kind (#4485): the `runner_kind` every
+            item run minted from this campaign inherits when
+            `POST /v0/campaigns/{campaign_id}/runs` passes none. Omitted when
+            the campaign records none — item runs then take `local` when the
+            campaign binds `working_dir`, else `github_actions`.
+          example: local
         grooming_source:
           type: object
           description: |
@@ -6254,7 +6264,19 @@ components:
         runner_kind:
           type: string
           enum: [github_actions, local]
-          description: OPTIONAL execution backend; defaults to `github_actions`. Pass `local` for the local dogfood loop.
+          description: >-
+            OPTIONAL execution backend for this item run, and an OVERRIDE of the
+            campaign's recorded `runner_kind` (#4485). The minted run's runner
+            kind is resolved through a four-rung ladder: (1) this explicit value
+            wins, and is recorded on the run row; (2) otherwise the campaign's
+            recorded `runner_kind` is inherited, re-validated against the known
+            runner kinds so an invalid value written onto the campaign row is
+            refused 400 `validation_failed` (`details.field` = `runner_kind`);
+            (3) otherwise `local` when the campaign binds a `working_dir` (this
+            also covers every campaign created before `runner_kind` was
+            recorded); (4) otherwise `github_actions`. The 201 body's
+            `runner_kind_resolution` states the applied kind and its source.
+            Omit it to inherit.
         working_dir:
           type: string
           description: >-
@@ -6268,7 +6290,8 @@ components:
             logged; (2) otherwise the campaign's `working_dir` is inherited,
             re-validated through the same absolute-path gate so a relative value
             smuggled onto the campaign row is still refused 400
-            `validation_failed`; (3) otherwise a `runner_kind: local` item is
+            `validation_failed`; (3) otherwise an item whose RESOLVED
+            `runner_kind` is `local` (passed, or inherited from the campaign) is
             refused 400 `working_dir_required`. A non-empty non-absolute value
             here is refused with 400 `validation_failed` (`details.field` =
             `working_dir`), the same guard POST /v0/runs applies. Omit it when
@@ -6278,11 +6301,34 @@ components:
       type: object
       description: |
         The 201 body of POST /v0/campaigns/{campaign_id}/runs: the minted run
-        plus the linked campaign item (now `running`, with `run_id` set).
-      required: [run, item]
+        plus the linked campaign item (now `running`, with `run_id` set), and
+        the runner-kind resolution that chose the run's `runner_kind` (#4485).
+      required: [run, item, runner_kind_resolution]
       properties:
         run: { $ref: '#/components/schemas/Run' }
         item: { $ref: '#/components/schemas/CampaignItem' }
+        runner_kind_resolution:
+          type: object
+          description: |
+            The runner kind the minted run was given and the ladder rung that
+            chose it. The same two values are recorded on the
+            `campaign_issue_started` audit entry as `runner_kind` and
+            `runner_kind_source`.
+          required: [runner_kind, source]
+          properties:
+            runner_kind:
+              type: string
+              enum: [github_actions, local, gitlab_ci]
+              description: The runner kind the minted run was given.
+            source:
+              type: string
+              enum: [explicit, campaign, campaign_working_dir, default]
+              description: |
+                Why it applied: `explicit` (the request's `runner_kind`),
+                `campaign` (the campaign's recorded `runner_kind`),
+                `campaign_working_dir` (the campaign records none but binds
+                `working_dir`, so `local`) or `default` (neither, so
+                `github_actions`).
 
     WaivedConcern:
       type: object
@@ -21967,6 +22013,20 @@ paths:
                     run in the batch. Omit it for no binding (the unchanged
                     default).
                   example: /Users/op/checkouts/fishhawk
+                runner_kind:
+                  type: string
+                  enum: [github_actions, local, gitlab_ci]
+                  description: >-
+                    OPTIONAL campaign-level runner kind (#4485): recorded ONCE
+                    here and inherited by every item run minted from this
+                    campaign when `POST /v0/campaigns/{campaign_id}/runs` passes
+                    no per-item `runner_kind`. Bind `local` together with
+                    `working_dir` for a local campaign. An unknown value is
+                    refused 400 `validation_failed` (`details.field` =
+                    `runner_kind`) BEFORE any forge round-trip. Omit it to
+                    record none: item runs then take `local` when the campaign
+                    binds `working_dir`, else `github_actions`.
+                  example: local
                 provider:
                   type: string
                   description: |
@@ -22024,7 +22084,8 @@ paths:
             `grooming_source.limit` negative, `pause_policy` not a recognized
             value, `operator_agent` not a valid operator-agent block (malformed
             or an unknown knob), `working_dir` non-empty but not absolute
-            (E48.87 / #2527), `provider` non-empty but naming an id this
+            (E48.87 / #2527), `runner_kind` non-empty but not a known runner
+            kind (#4485 — `details.field` = `runner_kind`), `provider` non-empty but naming an id this
             deployment has not registered (#3645 — `details.field` =
             `provider`, `details.got` the offending value,
             `details.registered` the exact accepted set), body malformed /
@@ -22699,10 +22760,13 @@ paths:
             absolute, or the campaign's own `working_dir` binding is not
             absolute and so cannot be inherited (E48.87 / #2527 — the inherited
             value is re-validated through the same gate an explicit one passes,
-            so a binding written straight to the campaign row cannot bypass it);
-            `working_dir_required` — a `runner_kind: local` item whose campaign
-            carries NO `working_dir` binding and whose body passed none, so the
-            run has no checkout to execute in. Bind `working_dir` once at
+            so a binding written straight to the campaign row cannot bypass it),
+            or the campaign's recorded `runner_kind` is not a known runner kind
+            and so cannot be inherited (#4485 — `details.field` =
+            `runner_kind`); `working_dir_required` — an item whose RESOLVED
+            `runner_kind` is `local` (passed in the body, or recorded on the
+            campaign, #4485) whose campaign carries NO `working_dir` binding and
+            whose body passed none, so the run has no checkout to execute in. Bind `working_dir` once at
             campaign create (every item run inherits it) or pass it for this
             item. Nothing is written on either refusal.
         '401': { $ref: '#/components/responses/Unauthorized' }

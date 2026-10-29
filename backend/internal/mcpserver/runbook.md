@@ -561,7 +561,10 @@ above).
 
 **1. Start the campaign.** `fishhawk_start_campaign` (`repo` required, plus ONE of
 `epic_ref` / `items`; optional `pause_policy` of `pause_campaign` (default) /
-`pause_item`, fixed at create time). It resolves each item's `depends_on` edges,
+`pause_item`, fixed at create time). For a local campaign **bind
+`runner_kind:local` and `working_dir` here, once** — both are recorded on the
+campaign and every item run inherits them (#4485, E48.87 / #2527). It resolves
+each item's `depends_on` edges,
 wave-orders the DAG, and persists the campaign — the batch counterpart to
 `fishhawk_start_run`. Two ways to scope the batch:
 - **WITH `epic_ref`** it resolves the epic's children. The `epic_ref` names an
@@ -625,19 +628,26 @@ GitHub Actions. The response carries the readiness `rollup`
 `resume` (a paged gate is handled), `complete` (terminal). Poll it as your
 drive tick; do not track batch state out-of-band.
 
-**3. Start ONE item — `runner_kind:local` AND `working_dir` always.**
-`fishhawk_start_campaign_item_run` (`campaign_id` + `issue_ref` +
-`workflow_id`) when `next_action` is `start_run`. **Always pass
-`runner_kind:local`** — the same execution/tag-mismatch hazard as
+**3. Start ONE item — the campaign's `runner_kind:local` and `working_dir`
+apply.** `fishhawk_start_campaign_item_run` (`campaign_id` + `issue_ref` +
+`workflow_id`) when `next_action` is `start_run`. Every item run must be
+`runner_kind:local` — the same execution/tag-mismatch hazard as
 `fishhawk_start_run` (see the `runner_kind:local` section above): a
-`github_actions`-tagged item never dispatches on this host. **Pass `working_dir`
-alongside it** — the absolute path to your checkout (you resolve your own, you are
-running inside one). It is REQUIRED for a `local` item (an omitted value is refused,
-not silently defaulted to the client's cwd; a non-absolute value is refused for any
-kind) and it binds the minted run, so **every later verb for that item —
-`fishhawk_drive_run` / `run_stage` / `dispatch_stage` / `run_children` — inherits it
-and you omit `working_dir` on those calls** (E48.69 / #2498; same inheritance the
-solo-run `working_dir` section above describes). The call refuses an
+`github_actions`-tagged item never dispatches on this host. Bind both once at
+`fishhawk_start_campaign` (step 1) and **omit them here**: an item call that
+passes no `runner_kind` inherits the campaign's recorded one, else gets `local`
+when the campaign binds `working_dir`, else `github_actions` (#4485); an item
+call that passes no `working_dir` inherits the campaign's binding (E48.87 /
+#2527). Pass either per item only as a deliberate OVERRIDE (recorded on the
+minted run). Read `runner_kind_resolution` in the result — `runner_kind` plus its
+`source` (`explicit` / `campaign` / `campaign_working_dir` / `default`) — to
+confirm the item is `local` before driving it. A `local` item with no
+resolvable checkout is refused `working_dir_required` (never silently defaulted
+to the client's cwd; a non-absolute value is refused for any kind). The resolved
+checkout binds the minted run, so **every later verb for that item —
+`fishhawk_drive_run` / `run_stage` / `dispatch_stage` / `run_children` — inherits
+it and you omit `working_dir` on those calls** (E48.69 / #2498; same inheritance
+the solo-run `working_dir` section above describes). The call refuses an
 ineligible item with `item_not_eligible`, naming the blocking dependency; a
 paused/terminal campaign refuses with `campaign_not_startable`; an unknown ref is
 `campaign_item_not_found`. It mints the run, links it to the item, and moves the
