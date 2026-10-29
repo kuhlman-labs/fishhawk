@@ -1,0 +1,14 @@
+id: scenario:issue-4485/create-refuses-invalid-runner-kind
+statement: POST /v0/campaigns with an otherwise well-formed body whose runner_kind is not a known runner kind (e.g. "kubernetes") returns 400 with error code validation_failed and details.field = runner_kind, before any forge round-trip.
+verify_hint: 'HTTP: POST /v0/campaigns with body {"repo":"acme/widgets","items":["1"],"runner_kind":"kubernetes"}; expect status 400, error code validation_failed, details.field runner_kind. Also decided in-repo by TestCreateCampaign_InvalidRunnerKind_Rejected.'
+steps: '1) Live attempt: POST http://localhost:8090/v0/campaigns {"repo":"acme/widgets","items":["1"],"runner_kind":"kubernetes"}. The acceptance egress sandbox refused it with 403 (POST /v0/campaigns is a run-minting/dispatch verb under ADR-050 default-deny), and no operator write:campaigns token is available. 2) Posture B, as the verify_hint names: in the sanctioned checkout (HEAD 1600bb9f, which equals the target git_sha), ran cd backend && env -u FISHHAWK_TEST_PG_URL go test ./internal/server/ -count=1 -run TestCreateCampaign_InvalidRunnerKind_Rejected -v'
+assertions:
+    expected: 400 validation_failed with details.field=runner_kind, before any forge round-trip
+    observed_at_record: '--- PASS: TestCreateCampaign_InvalidRunnerKind_Rejected. The handler logged ''status=400 code=validation_failed message="runner_kind must be one of github_actions, gitlab_ci, local" path=/v0/campaigns''. The test asserts details.field=runner_kind and got=kubernetes, that the message is rendered with validRunnerKindsMessage, that zero campaigns are persisted, and that the epic-children forge query never ran.'
+    repro_handle: cd backend && go test ./internal/server/ -run TestCreateCampaign_InvalidRunnerKind_Rejected -v
+origin:
+    issue: 4485
+    pr: 4827
+    run_id: de2060fc-b915-4346-8478-bad877ab86ec
+    head_sha: 1600bb9fa2d382dd0da99c69c692878dfa4ab85b
+    recorded_at: 2026-10-29T21:31:10Z
