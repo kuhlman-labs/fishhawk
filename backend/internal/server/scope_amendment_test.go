@@ -2078,6 +2078,25 @@ func TestDecideScopeAmendment_SliceOwnership(t *testing.T) {
 		}
 	})
 
+	// A nil ArtifactRepo is not a second skip: with RunRepo wired, a
+	// decomposition child's approve fails CLOSED rather than reading the
+	// unreadable parent plan as ABSENT and admitting the path.
+	t.Run("nil ArtifactRepo fails closed", func(t *testing.T) {
+		f := newSliceOwnershipFixture(t)
+		id := f.seedPending(t, "docs/b.md")
+		f.s.cfg.ArtifactRepo = nil
+		w := f.decide(t, f.children[2].ID, id, "approve")
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		if code, _ := decodeErrorDetails(t, w.Body.Bytes()); code != errCodeSliceOwnershipCheckFailed {
+			t.Errorf("code = %q, want %q", code, errCodeSliceOwnershipCheckFailed)
+		}
+		if got := status(t, f, id); got != scopeamendment.StatusPending {
+			t.Errorf("row status = %q, want pending", got)
+		}
+	})
+
 	// C3(c): the nil-RunRepo skip is reachable only in an unconfigured
 	// deployment. Such a server cannot FILE a pending amendment (the request
 	// route answers 503 without a RunRepo), so the skip can only ever see a

@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
@@ -157,7 +158,9 @@ func classifySliceOwnership(subPlans []plan.SubPlanSummary, sliceIdx int, paths 
 // decomposition, or SliceIndex out of range): the same ABSENT partition
 // resolveSliceDependencies documents. A run or plan read ERROR returns a
 // non-nil error; the request route fails open on it, the decide route fails
-// closed. OwningChildRunID is filled best-effort from the parent's minted
+// closed. So does a decomposition child with no ArtifactRepo: the parent's
+// plan is unreadable, not absent, and loadApprovedPlanForRun's own nil-repo
+// (nil, nil) would otherwise read as ABSENT and admit the approve. OwningChildRunID is filled best-effort from the parent's minted
 // children: a sibling-list error WARN-logs and leaves the ids empty, because
 // the decision depends only on the plan.
 func (s *Server) amendmentSliceOwnership(ctx context.Context, runID uuid.UUID, paths []scopeamendment.PathEntry) (*sliceOwnershipCheck, error) {
@@ -172,6 +175,9 @@ func (s *Server) amendmentSliceOwnership(ctx context.Context, runID uuid.UUID, p
 		return nil, nil
 	}
 	parentID := *runRow.DecomposedFrom
+	if s.cfg.ArtifactRepo == nil {
+		return nil, errors.New("artifact repository unconfigured: the parent's approved plan cannot be read")
+	}
 	p, err := s.loadApprovedPlanForRun(ctx, parentID)
 	if err != nil {
 		return nil, fmt.Errorf("load parent plan: %w", err)

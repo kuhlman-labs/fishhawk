@@ -699,7 +699,10 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 	// precedence. A nil RunRepo skips it: that is an unconfigured deployment
 	// only — fishhawkd's serve.go wires RunRepo and ScopeAmendmentRepo in the
 	// same Postgres block, and the request route 503s without a RunRepo, so
-	// such a deployment can file no pending amendment.
+	// such a deployment can file no pending amendment. A nil ArtifactRepo is
+	// NOT a skip: for a decomposition child amendmentSliceOwnership returns an
+	// error (the parent's plan is unreadable), so the approve answers 500
+	// slice_ownership_check_failed.
 	var sliceOwnership *sliceOwnershipCheck
 	if status == scopeamendment.StatusApproved && existing.Status == scopeamendment.StatusPending && s.cfg.RunRepo != nil {
 		ownership, oerr := s.amendmentSliceOwnership(r.Context(), existing.RunID, existing.Paths)
