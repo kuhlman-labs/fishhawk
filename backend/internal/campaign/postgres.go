@@ -52,6 +52,7 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 			IdempotencyKey: p.IdempotencyKey,
 			WorkingDir:     p.WorkingDir,
 			GroomingSource: p.GroomingSource,
+			RunnerKind:     p.RunnerKind,
 			// The six guard params. AccountID is the domain "" (untenanted) / UUID
 			// string; accountIDArg maps "" -> nil (SQL NULL), which the query's
 			// `IS NOT DISTINCT FROM $13::uuid` matches only against another
@@ -95,6 +96,9 @@ func (r *postgresRepo) CreateCampaign(ctx context.Context, p CreateCampaignParam
 		// its provenance are created atomically — there is no window in which a
 		// grooming-sourced campaign exists unprovenanced. Nil persists as NULL.
 		GroomingSource: p.GroomingSource,
+		// RunnerKind is the OPTIONAL campaign-level runner kind (#4485). Empty
+		// persists as the '' not-recorded default.
+		RunnerKind: p.RunnerKind,
 	})
 	if err != nil {
 		return nil, fmt.Errorf("create campaign: %w", err)
@@ -852,6 +856,10 @@ func rowToCampaign(c campaigndb.Campaign) *Campaign {
 	if len(c.GroomingSource) > 0 {
 		out.GroomingSource = c.GroomingSource
 	}
+	// The campaign-level runner kind (#4485), read straight back from the NOT
+	// NULL column through this ONE mapper, so it is visible on every campaign
+	// read path. Empty is the not-recorded default.
+	out.RunnerKind = c.RunnerKind
 	return out
 }
 

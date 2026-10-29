@@ -194,6 +194,56 @@ func TestCreateCampaign_WorkingDir_BodyAndDecode(t *testing.T) {
 	}
 }
 
+// TestCreateCampaign_RunnerKind_BodyAndDecode pins the apiClient wire
+// contract for the campaign-level runner kind (#4485): a non-empty value
+// reaches the POST body, an empty one omits the key, and a Campaign response
+// carrying runner_kind decodes onto the struct.
+func TestCreateCampaign_RunnerKind_BodyAndDecode(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.createCampaignResp = Campaign{
+		ID: uuid.NewString(), Repo: "acme/widgets", EpicRef: "#25", State: "pending",
+		PausePolicy: "pause_campaign", RunnerKind: "local",
+	}
+	r := newResolver(srv, nil)
+
+	got, err := r.api.CreateCampaign(context.Background(), campaignCreateRequest{Repo: "acme/widgets", EpicRef: "#25", RunnerKind: "local"})
+	if err != nil {
+		t.Fatalf("CreateCampaign: %v", err)
+	}
+	if fb.createCampaignBody.RunnerKind != "local" {
+		t.Errorf("POST body runner_kind = %q, want local", fb.createCampaignBody.RunnerKind)
+	}
+	if got.RunnerKind != "local" {
+		t.Errorf("decoded Campaign.RunnerKind = %q, want local", got.RunnerKind)
+	}
+	body, err := json.Marshal(campaignCreateRequest{Repo: "acme/widgets", EpicRef: "#25"})
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	if strings.Contains(string(body), "runner_kind") {
+		t.Errorf("an unrecorded create body carries a runner_kind key: %s", body)
+	}
+}
+
+// TestStartCampaignItemRun_DecodesRunnerKindResolution: the client decodes the
+// 201 body's runner_kind_resolution block (#4485).
+func TestStartCampaignItemRun_DecodesRunnerKindResolution(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+		RunnerKindResolution: &campaignRunnerKindResolution{RunnerKind: "github_actions", Source: "default"},
+	}
+	r := newResolver(srv, nil)
+
+	res, err := r.api.StartCampaignItemRun(context.Background(), uuid.New(), "issue:1", "feature_change", "", "", "")
+	if err != nil {
+		t.Fatalf("StartCampaignItemRun: %v", err)
+	}
+	if res.RunnerKindResolution == nil ||
+		*res.RunnerKindResolution != (campaignRunnerKindResolution{RunnerKind: "github_actions", Source: "default"}) {
+		t.Errorf("decoded runner_kind_resolution = %+v, want {github_actions default}", res.RunnerKindResolution)
+	}
+}
+
 // TestCreateCampaign_SatisfiedDependencies_SurviveDecode is the MCP-boundary
 // half of the #2953 seam (operator condition 5): a create response carrying a
 // satisfied_dependencies block must survive the client decode and reach the tool

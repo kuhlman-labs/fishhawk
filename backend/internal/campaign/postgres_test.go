@@ -934,6 +934,144 @@ func TestPostgres_CreateCampaign_WorkingDir_RoundTripsEveryReadPath(t *testing.T
 	}
 }
 
+// TestPostgres_CreateCampaign_RunnerKind_RoundTripsEveryReadPath covers the
+// campaigns.runner_kind column added by 0113 (#4485) the same way the
+// working_dir round-trip above does, and for the same reason: the generated sqlc
+// file is HAND-EDITED, and a column list or Scan missed in one statement is
+// invisible to inspection. Every query in queries.sql that returns a campaigns
+// row is exercised, each with its OWN column list and its OWN row.Scan:
+//
+//   - CreateCampaign (the unguarded INSERT ... RETURNING list)
+//   - CreateCampaignGuardedByGroomingCurrency (the guarded INSERT ... SELECT,
+//     whose positional parameters the new column renumbered)
+//   - GetCampaign
+//   - GetCampaignByIdempotencyKey
+//   - ListCampaigns (the :many scan)
+//   - LockCampaignForUpdate, driven DIRECTLY through campaigndb
+//   - UpdateCampaignState (via TransitionCampaign's returned row)
+//
+// The not-recorded default is pinned too: a campaign created with no runner
+// kind reads back "" everywhere, never NULL.
+func TestPostgres_CreateCampaign_RunnerKind_RoundTripsEveryReadPath(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	repo := campaign.NewPostgresRepository(pool)
+	ctx := context.Background()
+	const repoName = "acme/widgets"
+
+	// Not recorded → "" on create AND read-back (every pre-#4485 row).
+	def, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{Repo: repoName, EpicRef: "issue:11"})
+	if err != nil {
+		t.Fatalf("create campaign (no runner kind): %v", err)
+	}
+	if def.RunnerKind != "" {
+		t.Errorf("default RunnerKind = %q, want \"\" (not recorded)", def.RunnerKind)
+	}
+	gotDef, err := repo.GetCampaign(ctx, def.ID)
+	if err != nil {
+		t.Fatalf("get campaign (no runner kind): %v", err)
+	}
+	if gotDef.RunnerKind != "" {
+		t.Errorf("read-back RunnerKind = %q, want \"\" (not recorded)", gotDef.RunnerKind)
+	}
+
+	// A recorded runner kind survives the unguarded create + every read path.
+	const rk = "local"
+	key := "idem-runnerkind-" + uuid.NewString()
+	c, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:           repoName,
+		EpicRef:        "issue:12",
+		RunnerKind:     rk,
+		IdempotencyKey: &key,
+	})
+	if err != nil {
+		t.Fatalf("create campaign with runner_kind: %v", err)
+	}
+	if c.RunnerKind != rk {
+		t.Errorf("CreateCampaign returned RunnerKind = %q, want %q", c.RunnerKind, rk)
+	}
+
+	// The guarded INSERT ... SELECT writes and returns it too. No newer
+	// grooming candidate is seeded, so the guard admits the row.
+	guarded, err := repo.CreateCampaign(ctx, campaign.CreateCampaignParams{
+		Repo:       repoName,
+		EpicRef:    "",
+		RunnerKind: rk,
+		WorkingDir: "/srv/checkouts/widgets",
+		GroomingGuard: &campaign.GroomingCurrencyGuard{
+			SourceRunID:     uuid.New(),
+			Repo:            repoName,
+			WorkflowID:      "backlog_grooming",
+			SourceCreatedAt: time.Now(),
+		},
+	})
+	if err != nil {
+		t.Fatalf("create guarded campaign with runner_kind: %v", err)
+	}
+	if guarded.RunnerKind != rk {
+		t.Errorf("guarded CreateCampaign returned RunnerKind = %q, want %q", guarded.RunnerKind, rk)
+	}
+	if guarded.WorkingDir != "/srv/checkouts/widgets" {
+		t.Errorf("guarded CreateCampaign returned WorkingDir = %q, want the bound path (positional parameters shifted?)", guarded.WorkingDir)
+	}
+	gotGuarded, err := repo.GetCampaign(ctx, guarded.ID)
+	if err != nil {
+		t.Fatalf("get guarded campaign: %v", err)
+	}
+	if gotGuarded.RunnerKind != rk {
+		t.Errorf("GetCampaign (guarded row) RunnerKind = %q, want %q", gotGuarded.RunnerKind, rk)
+	}
+
+	got, err := repo.GetCampaign(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("get campaign: %v", err)
+	}
+	if got.RunnerKind != rk {
+		t.Errorf("GetCampaign RunnerKind = %q, want %q", got.RunnerKind, rk)
+	}
+
+	byKey, err := repo.GetCampaignByIdempotencyKey(ctx, repoName, key)
+	if err != nil {
+		t.Fatalf("get campaign by idempotency key: %v", err)
+	}
+	if byKey.RunnerKind != rk {
+		t.Errorf("GetCampaignByIdempotencyKey RunnerKind = %q, want %q", byKey.RunnerKind, rk)
+	}
+
+	listed, err := repo.ListCampaigns(ctx, campaign.ListCampaignsFilter{Repo: repoName, Limit: 100})
+	if err != nil {
+		t.Fatalf("list campaigns: %v", err)
+	}
+	var found *campaign.Campaign
+	for _, row := range listed {
+		if row.ID == c.ID {
+			found = row
+			break
+		}
+	}
+	if found == nil {
+		t.Fatalf("campaign %s absent from ListCampaigns", c.ID)
+	}
+	if found.RunnerKind != rk {
+		t.Errorf("ListCampaigns RunnerKind = %q, want %q", found.RunnerKind, rk)
+	}
+
+	locked, err := campaigndb.New(pool).LockCampaignForUpdate(ctx, c.ID)
+	if err != nil {
+		t.Fatalf("lock campaign for update: %v", err)
+	}
+	if locked.RunnerKind != rk {
+		t.Errorf("LockCampaignForUpdate RunnerKind = %q, want %q", locked.RunnerKind, rk)
+	}
+
+	transitioned, err := repo.TransitionCampaign(ctx, c.ID, campaign.StateRunning)
+	if err != nil {
+		t.Fatalf("transition campaign: %v", err)
+	}
+	if transitioned.RunnerKind != rk {
+		t.Errorf("TransitionCampaign RunnerKind = %q, want %q", transitioned.RunnerKind, rk)
+	}
+}
+
 // TestPostgres_CreateCampaign_OperatorAgent covers the operator_agent column
 // added by 0041 (E25.12): a campaign created with no override round-trips as
 // nil (the unchanged-behavior done-means), and a non-nil raw JSONB block
