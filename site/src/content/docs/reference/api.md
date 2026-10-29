@@ -147,6 +147,15 @@ keeps its state. It is the same
 rule the server applies when it advances a run on its own: a post-deploy
 acceptance stage runs only once every earlier deploy stage succeeded.
 
+The marker likewise refuses a `pending` or `awaiting_host_dispatch` stage
+sequenced after a stage that failed: 409 `dispatch_not_admissible` with
+`details.reason` `earlier_stage_failed` and the failed stage's id, type and
+failure category, and the stage keeps its state. A category-C
+(infrastructure) failure of an acceptance stage, or of an implement stage on
+its first execution, leaves the run `running` so the failed stage can be
+retried; retry or cancel the failed stage before dispatching anything after
+it. A failed deploy stage ahead answers `deploy_not_succeeded` instead.
+
 The same marker can also hold new dispatches while the host is short of
 memory, which the table does not spell out either. The hold is off by
 default and interim (the planned adaptive concurrency controller replaces
