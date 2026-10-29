@@ -1,13 +1,18 @@
 package orchestrator
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -105,7 +110,7 @@ func seedAcceptanceAheadParent(t *testing.T, rs *stubRuns, implState run.StageSt
 func newFanInAcceptanceOrchestrator(t *testing.T, answers ...bool) (*Orchestrator, *stubRuns, *stubGitHub, *recordingAudit, *recordingConsolidatedReview, *recordingFanInVerify) {
 	t.Helper()
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.New(&countingRepoGetter{branch: "main"})
 	au := &recordingAudit{}
 	o.Audit = au
 	rec := &recordingConsolidatedReview{}
@@ -338,6 +343,52 @@ func TestAdvance_DecomposedParentAcceptance_NilHook_DispatchesWithPR(t *testing.
 	}
 	if len(rec.calls) != 1 {
 		t.Errorf("DispatchConsolidatedReview calls = %d, want 1", len(rec.calls))
+	}
+}
+
+// UNRESOLVED default branch (#4660): with the consolidated PR already
+// stamped, a base the resolver cannot read applies NO hold and never guesses a
+// literal. The hook is not consulted, acceptance dispatches as before, the
+// consolidated-review fire skips, and a WARN names the reason with the run id.
+func TestAdvance_DecomposedParentAcceptance_UnresolvedDefaultBranchDispatchesWithoutHold(t *testing.T) {
+	o, rs, gh, _, rec, hook := newFanInAcceptanceOrchestrator(t, false)
+	o.DefaultBranch = defaultbranch.New(&countingRepoGetter{err: forge.ErrNotFound})
+	var logBuf bytes.Buffer
+	o.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	p := seedAcceptanceAheadParent(t, rs, run.StageStateSucceeded)
+	pr := "https://github.com/kuhlman-labs/fishhawk/pull/9"
+	p.run.PullRequestURL = &pr
+
+	out, err := o.Advance(context.Background(), p.run.ID)
+	if err != nil {
+		t.Fatalf("Advance: %v (an unresolved base must not fail the advance)", err)
+	}
+	if out != OutcomeDispatched {
+		t.Errorf("Outcome = %q, want dispatched", out)
+	}
+	if hook.callCount() != 0 {
+		t.Errorf("FanInVerifySettled calls = %d, want 0 on an unresolved base", hook.callCount())
+	}
+	if p.acceptance.State != run.StageStateAwaitingHostDispatch {
+		t.Errorf("acceptance state = %q, want awaiting_host_dispatch (no hold on an unresolved base)", p.acceptance.State)
+	}
+	if len(rec.calls) != 0 {
+		t.Errorf("DispatchConsolidatedReview calls = %+v, want none on an unresolved base", rec.calls)
+	}
+	if len(gh.createPRCalls) != 0 {
+		t.Errorf("CreatePullRequest calls = %d, want 0 (PR already stamped)", len(gh.createPRCalls))
+	}
+	var warned bool
+	for _, line := range strings.Split(strings.TrimSpace(logBuf.String()), "\n") {
+		if strings.Contains(line, `"level":"WARN"`) &&
+			strings.Contains(line, "acceptance hold not applied: default branch unresolved") &&
+			strings.Contains(line, `"reason":"`+string(defaultbranch.ReasonRepositoryNotVisible)+`"`) &&
+			strings.Contains(line, `"run_id":"`+p.run.ID.String()+`"`) {
+			warned = true
+		}
+	}
+	if !warned {
+		t.Errorf("no WARN naming the unresolved reason and run_id; logs:\n%s", logBuf.String())
 	}
 }
 

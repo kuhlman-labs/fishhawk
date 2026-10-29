@@ -829,6 +829,8 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 //	    DispatchConsolidatedReview (which starts the verify-only pass on an
 //	    unverified head and holds otherwise), log, and report held — acceptance
 //	    stays `pending`. A hook error is returned (acceptance stays pending).
+//	    The hook's base is the resolved default branch (#4660); an
+//	    unresolved one is WARN-logged with its reason and consults no hook.
 //	(d) Otherwise not held: the caller dispatches acceptance and fires the
 //	    consolidated review.
 //
@@ -874,12 +876,24 @@ func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.R
 		r = updated
 	}
 
-	base := o.DefaultRef
-	if base == "" {
-		base = "main"
-	}
 	if o.FanInVerify != nil && o.ConsolidatedReview != nil &&
 		r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		// The fan-in base is the repository's resolved default branch
+		// (#4660), never a literal. An unresolved read applies NO hold:
+		// acceptance dispatches as before (the merge gate still blocks on
+		// the unverified head) and the consolidated-review fire after the
+		// dispatch skips with its own WARN.
+		base, berr := o.runBaseBranch(ctx, r)
+		if berr != nil {
+			reason, _ := defaultbranch.ReasonOf(berr)
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed parent acceptance hold not applied: default branch unresolved",
+				slog.String("run_id", r.ID.String()),
+				slog.String("acceptance_stage_id", next.ID.String()),
+				slog.String("reason", string(reason)),
+				slog.String("error", berr.Error()))
+			o.clearFanInAcceptanceHold(r.ID)
+			return r, true, false, nil
+		}
 		fanInSettled, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
 		if err != nil {
 			return r, true, false, fmt.Errorf("fan-in verify state: %w", err)

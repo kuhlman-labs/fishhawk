@@ -815,7 +815,7 @@ func TestFanInAcceptanceHold_EndToEnd(t *testing.T) {
 	f.rr.mu.Lock()
 	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
 	f.rr.mu.Unlock()
-	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultRef: "main"}
+	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
 	f.s.cfg.Orchestrator = o
 	sf := newSigningFake()
 	f.s.cfg.SigningRepo = sf
