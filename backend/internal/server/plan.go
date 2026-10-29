@@ -537,14 +537,22 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// us with an artifact row and no audit entry, which is the
 	// auditability inverse of what we want — surface 500 so the
 	// runner retries (idempotent at the artifact layer via GetByHash).
-	auditPayload, _ := json.Marshal(map[string]any{
+	generated := map[string]any{
 		"run_id":         runID.String(),
 		"stage_id":       stageID.String(),
 		"artifact_id":    created.ID.String(),
 		"content_hash":   contentHash,
 		"schema_version": schemaVersion,
 		"size_bytes":     len(body),
-	})
+	}
+	// Plan-review seed (#4436): the commit the plan agent's tree sat at, from
+	// the runner's planSeedHeader, lands on this SAME chained row so
+	// runPlanReviews can export the review tree there. Recorded only on a
+	// first upload whose body verified: the idempotent re-upload returned
+	// above and never rewrites it. A malformed value records
+	// seed_sha_malformed and never fails the upload.
+	recordPlanSeedHeader(generated, r.Header.Get(planSeedHeader))
+	auditPayload, _ := json.Marshal(generated)
 	systemKind := audit.ActorKind("system")
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:     runID,
@@ -1679,16 +1687,23 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	invocations := s.resolveReviewerInvocations(reviewersCfg)
 
 	// Review grounding (#2486): when the whole loop is grounding-capable, export
-	// the working dir's resolved HEAD (no change exists yet at plan stage) as a
-	// read-only tree and name that commit in the prompt. groundReview returns
-	// an empty treeDir + no-op cleanup on every degrade (kill switch, a
-	// reviewer that cannot ground, no working dir, export failure) and stamps
-	// the degrade reason on trig (#4066), so the prompt then renders the
-	// matching diff-only clause and the loop runs ungrounded. cleanup ownership
-	// is decided at dispatch below (C6): the synchronous gating path defers it
-	// in this scope; the detached advisory path hands it into the goroutine so
-	// the export survives the detached reviewers' lifetime.
-	treeDir, treeCleanup := s.groundReview(ctx, runRow, "HEAD", invocations, &trig)
+	// the PLAN SEED (#4436) — the commit the plan agent's working tree sat at,
+	// recorded on the stage's newest plan_generated row — as a read-only tree
+	// and name that commit in the prompt. It is never the shared checkout's
+	// HEAD, which can sit behind the planner's lineage worktree after any
+	// unpulled merge. With no resolvable seed, seed.SHA is empty and the export
+	// fails closed to the no_ref degrade (no tree, diff-only); the reason rides
+	// ctx to plan_review_started.seed_unresolved. groundReview returns an empty
+	// treeDir + no-op cleanup on every degrade (kill switch, a reviewer that
+	// cannot ground, no working dir, no seed, export failure) and stamps the
+	// degrade reason on trig (#4066), so the prompt then renders the matching
+	// diff-only clause and the loop runs ungrounded. cleanup ownership is
+	// decided at dispatch below (C6): the synchronous gating path defers it in
+	// this scope; the detached advisory path hands it into the goroutine so the
+	// export survives the detached reviewers' lifetime.
+	seed := s.resolvePlanReviewSeed(ctx, runID, stageID)
+	ctx = withPlanReviewSeed(ctx, seed)
+	treeDir, treeCleanup := s.groundReview(ctx, runRow, seed.SHA, invocations, &trig)
 
 	// Deferred crew delivery (E77.7 / #3741): the OPEN findings/notices
 	// addressed to the reviewer, resolved ONCE per round (every reviewer reads
@@ -2060,8 +2075,9 @@ func (s *Server) planBudgetEvidence(ctx context.Context, runRow *run.Run, parsed
 // The round source and the re-dispatch lineage (#4077), and the operator
 // re-run lineage (#4219), are read from ctx (review_round_context.go) rather
 // than passed: the implement dispatchers set the source, the boot re-dispatch
-// sets the re-dispatch lineage, the re-run verb sets rerun_of, and an absent
-// value leaves its keys omitted.
+// sets the re-dispatch lineage, the re-run verb sets rerun_of, runPlanReviews
+// sets the plan seed (#4436, plan rounds only), and an absent value leaves its
+// keys omitted.
 //
 // reviewedHead is the implement round's ADR-117 A1.7 reviewed-head record
 // (buildReviewedHead); the plan caller passes nil, so plan_review_started stays
@@ -2107,6 +2123,15 @@ func (s *Server) emitReviewStarted(ctx context.Context, runID, stageID uuid.UUID
 	if rd, ok := reviewRedispatchFrom(ctx); ok {
 		started.RedispatchOf = rd.Of
 		started.RedispatchDepth = rd.Depth
+	}
+	// The plan seed (#4436) is a PLAN-round fact: the commit the round's review
+	// tree targeted, or why none resolved. implement_review_started stays
+	// byte-identical.
+	if category == "plan_review_started" {
+		if ps, ok := planReviewSeedFrom(ctx); ok {
+			started.SeedSHA = ps.SHA
+			started.SeedUnresolved = ps.Unresolved
+		}
 	}
 	// The operator re-run lineage (#4219) is an IMPLEMENT-round fact: only
 	// the re-run verb sets the marker (withReviewRerun), and it re-runs

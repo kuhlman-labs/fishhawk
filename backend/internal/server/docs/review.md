@@ -632,6 +632,40 @@ catch arm. This package keeps the forge reads, the build-then-attribute order, e
   byte-identical, per-persona fail-closed degrade, configured_agents accounting — or the move silently drops a
   declared control.
 
+## Plan-review seed (#4436)
+
+`plan_review_seed.go`. The plan review exports its read-only tree at the PLAN SEED — the commit the plan agent's
+working tree sat at — never at `run.WorkingDir`'s HEAD. Since #3973 the planner runs in a lineage worktree seeded
+from the freshly fetched declared base, so after any unpulled merge the shared checkout's HEAD is OLDER than what
+the planner read, and reviewers grounded on it rejected current plans for citing "nonexistent" symbols.
+
+- **Transport.** The runner (`capturePlanSeed`, `runner/cmd/fishhawk-runner/planseed.go`) resolves the plan agent's
+  working-tree HEAD just before the agent starts and ships it in `X-Fishhawk-Plan-Seed-SHA` (`planSeedHeader`; twin
+  of `upload.PlanSeedHeader`, both pinned to `testdata/wire/plan_seed_header.json`). Like the reachability header it
+  rides beside the signed body and is NOT covered by `X-Fishhawk-Signature`.
+- **Record.** `handleShipPlan` → `recordPlanSeedHeader` on the SAME chained `plan_generated` row: a value matching
+  `^[0-9a-f]{40}([0-9a-f]{24})?$` (`validPlanSeedSHA`; hex-only also keeps it from being read as a git option) lands
+  as `seed_sha`; anything else records `seed_sha_malformed: true` without storing the raw value and never fails the
+  upload; no header records nothing. Only a first upload whose body verified records it — the idempotent
+  re-upload returns before the audit write, so a replay cannot rewrite it.
+- **Resolve.** `runPlanReviews` → `resolvePlanReviewSeed` reads the stage's NEWEST `plan_generated` row
+  (`newestStageEntry`). Newest-row is the reviewed plan on both production paths: `handleShipPlan` appends it
+  immediately before `runPlanReviews`, and the boot re-dispatch refuses a plan round once a newer `plan_generated`
+  exists (`redispatchSlugSupersededByNewPlan`). It does NOT match on sha256(planBody): artifact content is JSONB,
+  so the re-dispatch's re-read body is not byte-equal to the upload.
+- **Fails closed.** No resolved seed → `groundReview` gets an empty ref → `no_ref`: NO tree is exported and the
+  prompt renders the diff-only clause; it never substitutes the checkout HEAD. Reasons, on
+  `plan_review_started.seed_unresolved` and WARN-logged: `seed_not_recorded` (no row, or no `seed_sha` — a
+  pre-#4436 runner), `seed_malformed` (`seed_sha_malformed`, an undecodable row, or a `seed_sha` failing
+  `validPlanSeedSHA` on read), `seed_lookup_failed` (the audit read failed). A recorded seed absent from the object
+  store takes `ExportTree`'s fetch-on-miss (#4066), else `ref_unavailable`; `seed_sha` is still recorded.
+- **Prompt + audit.** The grounded REPOSITORY ACCESS section names the exported commit (`Trigger.ReviewTreeCommit`),
+  so the prompt states the seed with no `backend/internal/prompt/` change; `plan_review_started.seed_sha` records
+  it in full. Both keys are plan-only: `implement_review_started` stays byte-identical.
+- **Stale runner.** A runner built before #4436 sends no header, so every plan review runs diff-only
+  (`seed_not_recorded`) until `bin/fishhawk-runner` is rebuilt (`scripts/dev post-merge`).
+- Tests: `plan_review_seed_test.go` (`TestPlanReviewSeed_*`, `TestPlanSeedHeader_MatchesSharedWireFixture`).
+
 ## Plan-gate scope/constraint pre-check (#658)
 
 `scope_precheck.go::runScopePrecheck` — called from `handleShipPlan` (`plan.go`) right after the `plan_generated` audit append and before `runPlanReviews`.

@@ -1840,6 +1840,17 @@ func statusError(op string, resp *http.Response) error {
 // plan_reachability.go); a drift silently disables the advisory.
 const ReachabilityHeader = "X-Fishhawk-Plan-Reachability"
 
+// PlanSeedHeader is the request header ShipPlan carries the PLAN SEED in
+// (#4436): the commit the plan agent's working tree sat at when the agent
+// started. The backend records it as plan_generated.seed_sha and exports the
+// plan review's read-only tree there, never at the shared checkout's HEAD.
+// Like ReachabilityHeader it rides beside the signed body and is NOT covered by
+// X-Fishhawk-Signature. CROSS-MODULE twin of the backend's planSeedHeader
+// (backend/internal/server/plan_review_seed.go); both are pinned to the shared
+// fixture testdata/wire/plan_seed_header.json, so a drift fails both modules'
+// tests instead of silently degrading every plan review to diff-only.
+const PlanSeedHeader = "X-Fishhawk-Plan-Seed-SHA"
+
 // RunnerCapabilitiesHeader is the request header FetchPrompt carries the
 // RUNNER half of the E45.86 / #3621 capability handshake on — modelled on the
 // ReachabilityHeader precedent above. It is a comma-separated token list
@@ -1951,6 +1962,13 @@ type ShipPlanArgs struct {
 	// the module boundary, so a tag drift silently fails the advisory open.
 	// Locked by the exact-wire-key serialization test in upload_test.go.
 	Reachability *reachability.Result
+
+	// SeedSHA is the plan seed (#4436): the commit the plan agent's working
+	// tree sat at when the agent started. Non-empty sends it in PlanSeedHeader;
+	// empty (an unresolvable HEAD) sends no header, and the backend then runs
+	// the plan review diff-only. NOT covered by the body signature, like
+	// Reachability.
+	SeedSHA string
 }
 
 // reachabilityHeaderValue serializes args.Reachability to the compact JSON the
@@ -2079,6 +2097,9 @@ func (c *Client) ShipPlan(ctx context.Context, args ShipPlanArgs) (*ShipPlanResu
 		req.Header.Set("Accept", "application/json")
 		if reachHeader != "" {
 			req.Header.Set(ReachabilityHeader, reachHeader)
+		}
+		if args.SeedSHA != "" {
+			req.Header.Set(PlanSeedHeader, args.SeedSHA)
 		}
 		req.ContentLength = int64(len(args.Plan))
 
