@@ -765,6 +765,103 @@ components:
             When the minted key expires (database clock; `AttestationTTL`,
             5 minutes). Only the minting attester's same-nonce heartbeats
             slide it. Present only together with `attestation_key`.
+    EscapeRecordRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        RECORD body for `POST /v0/runs/{run_id}/escapes` (E94.3 / #4694).
+        There is NO `security_finding_id` (ADR-126 D7 deferred to E96 /
+        #4774); strict decoding refuses it 400.
+      required: [source, severity, category]
+      properties:
+        source:
+          type: string
+          enum: [later_reviewer, follow_up_bug, operator_battery, human_finding, ci_red_on_main]
+        severity:
+          type: string
+          enum: [high, medium, low]
+        category:
+          type: string
+          enum: [correctness, security, reliability, concurrency, performance, data_integrity, test_coverage, documentation, other]
+          description: '`security` for ANY vulnerability (A1.5 allow-list applies).'
+        description:
+          type: string
+          maxLength: 4000
+          description: Required unless `category=security`; refused (422) on a security escape, even empty.
+        files:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { type: string }
+          description: Clean repo-relative paths. Required unless `category=security`; refused (422) on a security escape.
+        head_sha:
+          type: string
+          pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'
+          description: Required when the run's PR is not observably merged (422 `escape_subject_unresolved`).
+        introducing_commits:
+          type: array
+          maxItems: 20
+          items: { type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' }
+          description: 'Recorded with `introducing_commits_source: operator_supplied`; refused (422) on a security escape.'
+        concern_id:
+          $ref: '#/components/schemas/UUID'
+        idempotency_key:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+          description: |
+            Required for every source except `later_reviewer`, refused on
+            `later_reviewer` (which requires `concern_id` and dedupes on
+            `concern:<concern_uuid>`). On `category=security` it must be a
+            canonical lowercase UUID.
+        security_class:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_]{0,63}$'
+          description: Required iff `category=security`. Interim vocabulary; closes when #4774 defines the class list (#4783).
+        advisory_id:
+          type: string
+          description: Required iff `category=security`. A GHSA id (`^GHSA(-[0-9a-z]{4}){3}$`) on a GitHub run; an opaque bounded token on any other forge.
+        delegated:
+          type: boolean
+          description: ADR-040 delegated-action marker (caller-asserted); makes the birth `pending_judgement` (`agent_recorded`).
+    EscapeCloseRequest:
+      type: object
+      additionalProperties: false
+      description: CLOSE body for `POST /v0/runs/{run_id}/escapes`; any other key is 400.
+      required: [supersedes_sequence, attestation]
+      properties:
+        supersedes_sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The audit sequence of the `pending_judgement` birth to close.
+        attestation:
+          type: object
+          additionalProperties: false
+          required: [judgement]
+          properties:
+            judgement:
+              type: string
+              enum: [defect, no_defect]
+              description: '`defect` closes `counted`; `no_defect` closes `dismissed`.'
+            note:
+              type: string
+              maxLength: 2000
+              description: Optional; refused (422) when the target is a security escape.
+        delegated:
+          type: boolean
+          description: A delegated close is refused 403 `escape_attestation_requires_human`.
+    EscapeRecordResponse:
+      type: object
+      required: [run_id, audit_sequence, record_kind, state, judgement_basis]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        audit_sequence: { type: integer, format: int64 }
+        record_kind: { type: string, enum: [birth, closure] }
+        state: { type: string, enum: [counted, pending_judgement, dismissed] }
+        judgement_basis: { type: string, enum: [not_required, awaiting_attestation, operator_attestation] }
+        pending_reason: { type: string, enum: [review_finding_source, agent_recorded, credential_not_forge_verified] }
+        source_event_key: { type: string, description: 'A birth''s dedupe key: `concern:<uuid>` or `idempotency_key:<key>`.' }
+        supersedes_sequence: { type: string, description: 'A closure''s target birth sequence (base-10).' }
     Error:
       type: object
       required: [error]
@@ -17458,6 +17555,25 @@ paths:
         re-dispatch. Advisory reviewers then run detached; a recorded verdict
         clears the review-coverage hold.
 
+        **`reviewed_head` on `implement_review_started` (ADR-117 A1.7,
+        #4694).** Beside `round_origin` and `head_sha`, every implement-review
+        round — trace (first and slice), consolidated, fix-up / delta
+        re-review, boot re-dispatch and this operator re-run — records an
+        additive `reviewed_head` object naming what the round actually judged:
+        `status` (`recorded` | `head_unknown` with `unknown_reason`), `kind`
+        (`wip_tree` | `pushed_commit` | `compare_head`), `origin`, `sha`,
+        `tree_sha`, `change_id`, `base_sha`, `diff_mode` (`full` | `delta`),
+        `patch_rendered`, `truncated`, `inventory_best_effort`,
+        `changed_file_count`, and three pairwise-disjoint plain-path sets
+        `files` / `partial_files` / `omitted_files` whose union is the
+        reviewed diff's changed files (partial and omitted files count as NOT
+        seen). A re-run round writes its OWN row with its own
+        `reviewed_head`. `head_sha` keeps its #797 dedup-key meaning; the
+        review prompt does not change; a row written before #4694 has no
+        `reviewed_head` and reads as head unknown. A `later_reviewer` escape
+        (`POST /v0/runs/{run_id}/escapes`) copies its concern round's
+        `reviewed_head`.
+
         **First consolidated round (#4282).** A DECOMPOSED PARENT
         (`decomposed_from` null, at least one decomposed child) with NO
         `implement_review_started` — its consolidated dispatch never started
@@ -18396,10 +18512,12 @@ paths:
         export stay complete. This is not access control: any caller holding
         `read:audit` may request the category explicitly.
 
-        **Run-bound withhold (E83.60 / #4118).** For a run-bound
-        `mcp:run:<uuid>` caller, entries of category `plan_scope_overlap`
-        (which name OTHER runs) are omitted from every non-chain read, a read
-        that names the category included, BEFORE pagination; such a caller's
+        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #4694).** For
+        a run-bound `mcp:run:<uuid>` caller, entries of category
+        `plan_scope_overlap` and `merge_overlap_overridden` (which name OTHER
+        runs) and `escape_recorded` (ADR-117 A1.6: the escape record the run's
+        reviews are measured against) are omitted from every non-chain read,
+        a read that names the category included, BEFORE pagination; such a caller's
         `chain=true` read is refused `403 run_token_forbidden`. Operators are
         unchanged.
       tags: [audit]
@@ -18979,10 +19097,12 @@ paths:
         recent-activity read) still returns up to N visible entries. This is
         not access control.
 
-        **Run-bound withhold (E83.60 / #4118).** For a run-bound
-        `mcp:run:<uuid>` caller, entries of category `plan_scope_overlap`
-        (which name OTHER runs) are omitted even when the request names the
-        category, BEFORE pagination. This one IS access control by subject;
+        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #4694).** For
+        a run-bound `mcp:run:<uuid>` caller, entries of category
+        `plan_scope_overlap` and `merge_overlap_overridden` (which name OTHER
+        runs) and `escape_recorded` (ADR-117 A1.6) are omitted even when the
+        request names the category, BEFORE pagination. This one IS access
+        control by subject;
         operators are unchanged.
       tags: [audit]
       parameters:
@@ -28601,6 +28721,152 @@ paths:
           description: |
             `concern_store_unconfigured`: the concern or audit repository is
             not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v0/runs/{run_id}/escapes:
+    post:
+      operationId: recordEscape
+      summary: Record an escaped defect, or close a pending one with a human attestation
+      description: |
+        E94.3 / #4694; ADR-117 D3 + Amendment A1 (RATIFIED, with A1.2 as
+        amended by erratum E1). An **escape** is a defect that got past the
+        live reviews. It is stored as append-only `escape_recorded` audit rows
+        on THIS run's chain, one row per state change: a **birth** and at
+        most ONE **closure** successor. A body carrying `supersedes_sequence`
+        is a CLOSE; any other body is a RECORD. Both decode strictly (an
+        unknown key is `400 validation_failed` naming it in `details.field`).
+
+        **Birth rule (A1.2 / A1.4), arms in order.** A `later_reviewer`
+        source is born `pending_judgement` (`pending_reason:
+        review_finding_source`); an agent-recorded escape (an agent-kind
+        subject, or `delegated: true`) is `pending_judgement`
+        (`agent_recorded`); a recorder whose credential is not forge-verified
+        (`session` | `oauth` | `oauth_as`; a static api token is not) is
+        `pending_judgement` (`credential_not_forge_verified`); otherwise the
+        birth is `counted` with `judgement_basis: not_required`.
+
+        **Keys.** A `later_reviewer` birth dedupes on
+        `concern:<concern_uuid>` (#4690 ADR-117 A1.2 as amended by erratum E1
+        (re-transcription PR #4784)) and carries the `reviewed_head` of the
+        review round that raised the concern, resolved over the concern's run
+        chain and copied JSON-equal (absent when that round recorded none; on
+        a `category=security` escape only the scalar identity fields `status`,
+        `kind`, `sha`, `tree_sha`, `change_id`, `origin` are kept). Every other
+        source dedupes on `idempotency_key:<key>`; a security escape on those
+        sources needs a canonical lowercase UUID key. Dedupe is per run chain.
+
+        **Security (A1.5).** `category=security` is for ANY vulnerability. A
+        security escape carries ONLY `source`, `severity`, `category`,
+        `security {class, advisory_id}`, `subject`, its source reference and
+        (for `later_reviewer`) the projected `reviewed_head`. `description`,
+        `files` and `introducing_commits` are refused 422, and so is a closure
+        `attestation.note`. There is no `security_finding_id` field (ADR-126
+        D7 deferred to E96 / #4774).
+
+        **Closure (A1.2 / A1.3).** Attestation is HUMAN-ONLY and needs a
+        forge-verified credential: an agent subject or `delegated: true` is
+        `403 escape_attestation_requires_human`; any other non-forge-verified
+        credential is `403 escape_attestation_requires_forge_credential`.
+        Under the run-row lock, in one transaction: a prior successor of the
+        same target is `409 escape_already_closed`; an absent target is `422
+        escape_target_not_found`; a target that is not `pending_judgement` is
+        `422 escape_target_not_pending`. The successor copies the target's
+        `escape` object JSON-equal; `defect` closes `counted`, `no_defect`
+        closes `dismissed`, `judgement_basis: operator_attestation`.
+
+        **Reader contract.** A birth with no successor is in its birth state;
+        a birth with a successor takes the single closure row's `state`.
+
+        **Visibility.** `escape_recorded` is INTERNAL (no issue-comment
+        activity line) and is withheld from run-bound tokens on `GET
+        /v0/runs/{run_id}/audit` and `GET /v0/audit`, including a
+        category-named read.
+
+        Auth: authenticated (`401 authentication_required` precedes the
+        account check); the run's account; any run-bound `mcp:run:` subject
+        is refused `403 run_token_forbidden`; then `write:runs`. Run state never gates a
+        record or a close. Every refusal appends nothing.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/EscapeRecordRequest'
+                - $ref: '#/components/schemas/EscapeCloseRequest'
+      responses:
+        '201':
+          description: The birth or closure row was appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EscapeRecordResponse' }
+        '400':
+          description: |
+            `validation_failed` (`details.field`): a non-UUID `run_id`; an
+            empty, oversized or trailing-content body; an unknown key
+            (including `security_finding_id`); or any field rule — an unknown
+            `source` / `severity` / `category`; a missing `description` or
+            `files` on a non-security escape; a bad repo path, `head_sha` or
+            `introducing_commits` entry; `concern_id` missing on
+            `later_reviewer` or present elsewhere; `idempotency_key` present
+            on `later_reviewer`, missing or malformed elsewhere, or not a
+            canonical UUID on a security escape; `security_class` /
+            `advisory_id` missing or invalid on a security escape or present
+            on another category; a non-positive `supersedes_sequence`; a
+            missing `attestation` or bad `attestation.judgement`; an
+            over-long `attestation.note`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `account_forbidden` (another account's bearer),
+            `run_token_forbidden` (a run-bound subject),
+            `insufficient_scope` (no `write:runs`),
+            `escape_attestation_requires_human` (`details.refused_actor`
+            `agent_token` | `delegated`), or
+            `escape_attestation_requires_forge_credential`
+            (`details.credential_kind`, `details.forge_verified_kinds`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `escape_already_recorded` (`details.source_event_key`,
+            `details.existing_sequence`) or `escape_already_closed`
+            (`details.successor_sequence`). Nothing is appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `escape_security_free_text_refused` (`details.field`:
+            `description` | `files` | `introducing_commits` |
+            `attestation.note`); `escape_subject_unresolved` (no `head_sha`
+            and the run's PR is not observably merged);
+            `escape_concern_not_found` (the concern, its run, or a concern in
+            another account — answered identically); `escape_target_not_found`;
+            `escape_target_not_pending`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error`: a read, lookup or append failed. Nothing is appended.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`escape_unconfigured`: no run or audit repository, or (for `later_reviewer`) no concern repository.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

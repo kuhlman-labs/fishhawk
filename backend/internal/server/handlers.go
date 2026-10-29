@@ -89,6 +89,9 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/retrigger-ci", s.requireRunAccount(memberWrite, s.handleRetriggerCI))
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge", s.requireRunAccount(memberWrite, s.handleMergeRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance-arbitration", s.requireRunAccount(memberWrite, s.handleAcceptanceArbitration))
+	// Escape record + close (E94.3 / #4694, ADR-117 D3 + A1). The outer
+	// wrapper answers an anonymous caller 401 BEFORE the ownership check.
+	mux.HandleFunc("POST /v0/runs/{run_id}/escapes", s.escapeRequireAuthenticated(s.requireRunAccount(memberWrite, s.handleRecordEscape)))
 	// Per-entry grooming disposition capture + read-back (E54.30 / #2843).
 	// CAPTURE is operator-only (the handler refuses a run-bound agent token AND
 	// a delegated operator-agent token); the READ-BACK needs read access only.

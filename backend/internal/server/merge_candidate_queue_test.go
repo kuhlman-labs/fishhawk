@@ -2111,10 +2111,14 @@ func TestShutdown_DrainsMergeCandidateQueuePump(t *testing.T) {
 	case <-time.After(timescale.D(10 * time.Second)):
 		t.Fatal("Shutdown did not return after the pump admission finished")
 	}
+	// Bounded, not non-blocking: the loop's deferred bgMergeQueuePump.Done()
+	// runs inside RunMergeCandidateQueuePump, but the fixture closes done only
+	// after that call returns, so Shutdown's Wait can return a moment before
+	// done closes. The drain itself is pinned by the first select above.
 	select {
 	case <-done:
-	default:
-		t.Fatal("Shutdown returned before the pump loop exited")
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("the pump loop did not exit after Shutdown drained it")
 	}
 	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
 		t.Fatalf("B after the drained admission = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)

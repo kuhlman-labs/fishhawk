@@ -73,6 +73,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Acceptance-criteria amendment at the plan gate (`acceptance_amendments.go`, E67.11 / #2581)
 - Bulk concern waive + the condition-claim shorthand (`bulk_waive.go`, `condition_claims.go`, E64.77 / #3318)
 - Merge readiness + operator-evidence resolve (`merge_readiness.go`, `resolve_concerns.go`, `gateview.go`, E83.53 / [#4086](https://github.com/kuhlman-labs/fishhawk/issues/4086))
+- Escape records (`escape.go`, E94.3 / [#4694](https://github.com/kuhlman-labs/fishhawk/issues/4694))
 
 ### [Acceptance stage and live validation](docs/acceptance.md)
 
