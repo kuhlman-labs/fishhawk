@@ -426,7 +426,7 @@ func TestMaterializeTree_ExportIgnoredDependentNeverIndependent(t *testing.T) {
 		t.Cleanup(cleanup)
 		archived = append(archived, dir)
 	}
-	if res := cls.Classify(context.Background(), Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: archived}); !res.Independent {
+	if res := cls.Classify(context.Background(), Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: archived, Surface: goModSurface}); !res.Independent {
 		t.Fatalf("fixture: archive-export classification = %+v, want independent (c dropped)", res)
 	}
 
@@ -438,7 +438,7 @@ func TestMaterializeTree_ExportIgnoredDependentNeverIndependent(t *testing.T) {
 		}
 		trees = append(trees, dest)
 	}
-	res := cls.Classify(context.Background(), Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: trees})
+	res := cls.Classify(context.Background(), Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: trees, Surface: goModSurface})
 	if res.Independent || res.Reason != "reach_overlap:c" {
 		t.Fatalf("Classify over materialized trees = %+v, want reach_overlap:c", res)
 	}
@@ -937,9 +937,9 @@ func classifyPRUnion(t *testing.T, edit string) {
 		trees = append(trees, dest)
 	}
 	res := (&Classifier{Loader: &GoListLoader{Env: emptyModCache(t)}}).Classify(context.Background(),
-		Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: trees})
-	if res.Independent {
-		t.Fatalf("Classify = %+v, want NOT independent (q imports the advanced b)", res)
+		Input{DeltaPaths: in.DeltaPaths, PRPaths: in.PRPaths, Workspaces: trees, Surface: goModSurface})
+	if res.Independent || res.Reason != "reach_overlap:q" {
+		t.Fatalf("Classify = %+v, want reach_overlap:q (q imports the advanced b)", res)
 	}
 }
 

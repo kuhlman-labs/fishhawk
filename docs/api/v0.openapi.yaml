@@ -2233,6 +2233,47 @@ components:
             consumer then refuses rather than targeting gitlab.com by
             accident). Omitted on every `github` run.
           example: https://gitlab.example.com
+        default_branch:
+          type: string
+          description: |
+            The run repository's base branch, resolved from the forge's
+            `default_branch` through the shared, TTL-cached default-branch
+            resolver (#4660): the same branch the consolidated PR, fan-in,
+            consolidated review, first-round review re-run and an unpinned
+            deploy / rollback `workflow_dispatch` use. Present ONLY on
+            `GET /v0/runs/{run_id}`, and mutually exclusive with
+            `default_branch_unresolved_reason`: exactly one of the two is set
+            on that route. The list endpoint NEVER carries either — over N
+            rows it would pay up to N forge reads, each capped by the
+            resolver's lookup timeout. A failed read never fails the GET.
+          example: trunk
+        default_branch_unresolved_reason:
+          type: string
+          enum:
+            - resolver_unconfigured
+            - forge_unsupported
+            - no_installation
+            - repository_invalid
+            - repository_not_visible
+            - forbidden
+            - default_branch_missing
+            - lookup_failed
+          description: |
+            Why `default_branch` could not be resolved (#4660), present ONLY
+            on `GET /v0/runs/{run_id}` and only when `default_branch` is
+            absent. `resolver_unconfigured`: the deployment wires no
+            default-branch resolver (no GitHub client). `forge_unsupported`:
+            a GitLab run (the consumers of this branch are GitHub-only).
+            `no_installation`: the run carries no installation id.
+            `repository_invalid`: the run's `repo` is not `owner/name`.
+            `repository_not_visible`: the forge answered not-found.
+            `forbidden`: the forge rejected the credential.
+            `default_branch_missing`: the forge reported no default branch.
+            `lookup_failed`: any other read failure (transport, timeout, 5xx,
+            decode). A server-side consumer that needs the branch refuses
+            with the same reason on its own failure surface rather than
+            guessing a branch.
+          example: repository_not_visible
         capabilities:
           type: object
           description: |
@@ -5971,6 +6012,76 @@ components:
             system actor with `trigger: status_read`); any other caller only
             reads the hold and never triggers a release. A release failure
             never fails the read: the hold is reported as still active.
+        pending_amendments:
+          $ref: '#/components/schemas/CampaignPendingAmendments'
+          description: |
+            Every pending scope amendment on any run of the campaign (E86.85 /
+            #4486), the same block `GET /v0/runs/{run_id}/campaign-pending-amendments`
+            returns. ABSENT means not computed: the scope-amendment repository
+            is unconfigured, the caller may not read it (a run-bound
+            `mcp:run:<uuid>` token, or a token without `read:audit`), or the
+            read failed (logged; the status read never fails on it). PRESENT
+            with `items: []` means computed, none pending.
+
+    CampaignPendingAmendments:
+      type: object
+      description: |
+        The pending scope amendments on every run of one campaign (E86.85 /
+        #4486): each item's linked run, whatever the item state, plus its
+        `parent_run_id` / `decomposed_from` descendants, bounded at 64 runs.
+        `items` is always an array, oldest `requested_at` first.
+      required: [items, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPendingAmendment' }
+        truncated:
+          type: boolean
+          description: True when the 64-run cap stopped the enumeration, so runs past it were not read.
+
+    CampaignPendingAmendment:
+      type: object
+      description: One pending scope amendment on a run of the campaign.
+      required: [issue_ref, item_run_id, stage_state, decision_live, amendment]
+      properties:
+        issue_ref:
+          type: string
+          description: The campaign item the filing run belongs to.
+        item_run_id:
+          type: string
+          format: uuid
+          description: The campaign item's linked run (the filing run itself, or the ancestor a slice or recovery child descends from).
+        stage_state:
+          type: string
+          description: The filing stage's current state.
+        decision_live:
+          type: boolean
+          description: |
+            True while the filing stage has not settled, so an agent may still
+            be waiting on the decision. A settled (for example failed) stage's
+            still-pending row is listed with `false`.
+        amendment:
+          $ref: '#/components/schemas/ScopeAmendment'
+
+    RunCampaignPendingAmendments:
+      type: object
+      description: The `GET /v0/runs/{run_id}/campaign-pending-amendments` body.
+      required: [run_id, campaign_id, items, truncated]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+          description: The anchor run.
+        campaign_id:
+          type: [string, "null"]
+          format: uuid
+          description: The resolved campaign, or null (never omitted) when the run is in no campaign or its ancestry cannot be resolved.
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPendingAmendment' }
+        truncated:
+          type: boolean
+          description: True when the 64-run cap stopped the enumeration.
 
     CampaignDependencyRefresh:
       type: object
@@ -7546,8 +7657,10 @@ components:
           type: string
           description: |
             The git ref or sha that was deployed (ADR-038's "ref/sha"). The
-            deploy reconciler records the dispatch `git_ref` here (e.g.
-            `main`), a symbolic name; the resolved commit rides `sha`.
+            deploy reconciler records the dispatch `git_ref` here (the pinned
+            `executor.delegate.git_ref`, else the repository's resolved forge
+            default branch, #4660), a symbolic name; the resolved commit rides
+            `sha`.
           example: "1111111111111111111111111111111111111111"
         sha:
           type: string
@@ -17476,12 +17589,15 @@ paths:
         `consolidated_review_not_due` (the consolidated PR is not open yet,
         or the parent has no implement stage — the orchestrator dispatches
         the round when the PR opens); `implement_stage_terminal` /
-        `advanced_past_review`; `forge_compare_unavailable`. An eligible
+        `advanced_past_review`; `forge_compare_unavailable`;
+        `default_branch_unresolved` (the forge default-branch read that
+        supplies the compare base failed; `details.default_branch_unresolved_reason`
+        names why, #4660). An eligible
         parent gets `review_round_rerun_requested` with
         `rerun_of_sequence: 0` and `first_round: true` (no `head_sha`), then
         the same round body the orchestrator's consolidated dispatch runs —
-        permission-drift check, forge compare of the default ref (`main`
-        unless configured) against the consolidated branch, the ADR-090 D5
+        permission-drift check, forge compare of the repository's resolved
+        forge default branch (#4660) against the consolidated branch, the ADR-090 D5
         fan-in verify hold, the truncation signal, the reviewers — runs
         SYNCHRONOUSLY. The new round carries `round_origin: consolidated`
         and NO `rerun_of`; it carries no re-run marker, so a concurrent
@@ -17576,7 +17692,9 @@ paths:
             `review_rerun_ineligible` carries `details.reason`
             `reviewer_unwired`, `no_agent_reviewers`, `gating_authority`,
             `consolidated_review_not_due`, `implement_stage_terminal`,
-            `advanced_past_review` or `forge_compare_unavailable`, plus
+            `advanced_past_review`, `forge_compare_unavailable` or
+            `default_branch_unresolved` (with
+            `details.default_branch_unresolved_reason`, #4660), plus
             `stage_id` once the parent implement stage resolved. Nothing was
             written.
           content:
@@ -18566,6 +18684,53 @@ paths:
           description: '`internal_error` — the run read or the live-run listing failed.'
         '503':
           description: '`run_repo_unconfigured` — the run repository is not configured.'
+
+  /v0/runs/{run_id}/campaign-pending-amendments:
+    get:
+      operationId: getRunCampaignPendingAmendments
+      summary: Pending scope amendments on every run of this run's campaign
+      description: |
+        E86.85 / #4486. Every PENDING mid-stage scope amendment on any run of
+        the campaign this run belongs to, so a driver blocked waiting on one
+        run sees an amendment filed by a different run of the same campaign.
+        The campaign is resolved through the run's ancestry (the run itself,
+        a decomposition slice, or a recovery child of a campaign item's run).
+        The run set is every campaign item's linked run, whatever the item
+        state, plus its `parent_run_id` / `decomposed_from` descendants,
+        bounded at 64 runs (`truncated: true` when the cap stopped the
+        enumeration). Items are ordered oldest `requested_at` first.
+        `decision_live` is true while the filing stage has not settled, so an
+        agent may still be waiting on the decision; a settled stage's
+        still-pending row is listed with `decision_live: false`. Read-only.
+
+        A run in no campaign (or whose ancestry cannot be resolved) answers
+        200 with `campaign_id: null` and `items: []`. Any read failure is a
+        500; there is no partial result.
+
+        Auth: the payload names other runs' amendment paths and reasons, so a
+        run-bound `mcp:run:<uuid>` token is refused `403 run_token_forbidden`
+        even for its own run. Every other token caller must hold `read:audit`;
+        a cookie-session operator passes.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The campaign's pending amendments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunCampaignPendingAmendments' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID.'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` — a run-bound `mcp:run:<uuid>` token (own run included); or `insufficient_scope` — a token missing the `read:audit` scope.'
+        '404':
+          description: '`run_not_found` — no run with that id.'
+        '500':
+          description: '`internal_error` — the run read, the campaign-membership walk, the campaign item listing, a descendant run listing, an amendment listing or a stage read failed.'
+        '503':
+          description: '`run_repo_unconfigured`, `campaign_repo_unconfigured` or `scope_amendment_unconfigured` — the run, campaign or scope-amendment repository is not configured.'
 
   /v0/runs/{run_id}/budget:
     get:
@@ -29970,7 +30135,14 @@ paths:
           description: |
             The external rollback trigger failed (`rollback_dispatch_failed`):
             the `workflow_dispatch` returned non-204, or the webhook POST
-            errored / returned a non-2xx status.
+            errored / returned a non-2xx status. A github_actions delegate
+            with no pinned `git_ref` dispatches on the repository's forge
+            default branch (#4660); when that read fails the rollback is
+            refused BEFORE any dispatch with `details.reason`
+            `default_branch_unresolved` and
+            `details.default_branch_unresolved_reason` naming why (pin
+            `executor.delegate.git_ref`, or restore the forge read), and no
+            `deployment_rollback_initiated` row is written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

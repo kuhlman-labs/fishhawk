@@ -48,6 +48,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
@@ -630,6 +631,134 @@ func TestNewStageOrchestrator_ThreadsExternalURL(t *testing.T) {
 	}
 	if o.ExternalURL != want {
 		t.Errorf("orchestrator ExternalURL = %q, want %q (cfg.ExternalURL not threaded)", o.ExternalURL, want)
+	}
+}
+
+// TestNewStageOrchestrator_WiresDefaultBranch pins the construction-site
+// wiring (#4660): newStageOrchestrator threads cfg.DefaultBranch into the
+// orchestrator as the SAME instance, so the orchestrator's base reads share the
+// server's resolver cache.
+//
+// COUNTERFACTUAL (CF-A9): delete `DefaultBranch: cfg.DefaultBranch` from
+// newStageOrchestrator → the orchestrator's DefaultBranch is nil → RED.
+func TestNewStageOrchestrator_WiresDefaultBranch(t *testing.T) {
+	src := defaultbranch.New(nil)
+	o := newStageOrchestrator(server.Config{DefaultBranch: src}, slog.Default())
+	if got, ok := o.DefaultBranch.(*defaultbranch.Resolver); !ok || got != src {
+		t.Fatalf("orchestrator DefaultBranch = %#v, want the cfg.DefaultBranch instance %p", o.DefaultBranch, src)
+	}
+}
+
+// TestDefaultBranchSource pins the production Source (#4660): a nil GitHub
+// client yields an UNTYPED nil interface (a typed-nil *Resolver would read as
+// configured), and a real client yields exactly gh.DefaultBranches() — the
+// resolver ListRulesetRequiredChecks also reads through, so the ruleset read,
+// the server and the orchestrator share ONE cache.
+//
+// COUNTERFACTUAL (CF-A9): make defaultBranchSource return nil for a non-nil
+// client → RED.
+func TestDefaultBranchSource(t *testing.T) {
+	if src := defaultBranchSource(nil); src != nil {
+		t.Fatalf("defaultBranchSource(nil) = %#v, want an untyped nil interface", src)
+	}
+	gh := &githubclient.Client{}
+	got, ok := defaultBranchSource(gh).(*defaultbranch.Resolver)
+	if !ok || got == nil || got != gh.DefaultBranches() {
+		t.Fatalf("defaultBranchSource(gh) = %#v, want gh.DefaultBranches() %p", got, gh.DefaultBranches())
+	}
+}
+
+// TestWireDefaultBranch_SharesOneResolver (approval condition C1): the
+// function runServe calls sets cfg.DefaultBranch from cfg.GitHub, and the
+// orchestrator built from that cfg holds the SAME instance.
+//
+// COUNTERFACTUAL: delete the assignment in wireDefaultBranch → cfg.DefaultBranch
+// stays nil → RED.
+func TestWireDefaultBranch_SharesOneResolver(t *testing.T) {
+	gh := &githubclient.Client{}
+	cfg := server.Config{GitHub: gh}
+	wireDefaultBranch(&cfg)
+	want := gh.DefaultBranches()
+	if got, ok := cfg.DefaultBranch.(*defaultbranch.Resolver); !ok || got != want {
+		t.Fatalf("cfg.DefaultBranch = %#v, want gh.DefaultBranches() %p", cfg.DefaultBranch, want)
+	}
+	o := newStageOrchestrator(cfg, slog.Default())
+	if got, ok := o.DefaultBranch.(*defaultbranch.Resolver); !ok || got != want {
+		t.Fatalf("orchestrator DefaultBranch = %#v, want the same instance %p", o.DefaultBranch, want)
+	}
+
+	none := server.Config{}
+	wireDefaultBranch(&none)
+	if none.DefaultBranch != nil {
+		t.Fatalf("cfg.DefaultBranch without a GitHub client = %#v, want nil", none.DefaultBranch)
+	}
+}
+
+// TestServeGo_WiresDefaultBranchBeforeOrchestrator (approval condition C1)
+// pins runServe's ACTUAL configuration path: its parsed body calls
+// `wireDefaultBranch(&cfg)` after the LAST `cfg.GitHub = …` assignment (both
+// the App and the dev-stub branches) and before `newStageOrchestrator(cfg, …)`,
+// so the server and the orchestrator runServe builds share the GitHub client's
+// resolver. It walks the AST, so a comment naming the call cannot satisfy it.
+//
+// COUNTERFACTUAL: delete the `wireDefaultBranch(&cfg)` call from runServe →
+// RED (no call found).
+func TestServeGo_WiresDefaultBranchBeforeOrchestrator(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	var wirePos, orchPos, lastGitHubAssign token.Pos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			id, ok := n.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			switch id.Name {
+			case "wireDefaultBranch":
+				if len(n.Args) == 1 {
+					if u, ok := n.Args[0].(*ast.UnaryExpr); ok && u.Op == token.AND {
+						if x, ok := u.X.(*ast.Ident); ok && x.Name == "cfg" && wirePos == token.NoPos {
+							wirePos = n.Pos()
+						}
+					}
+				}
+			case "newStageOrchestrator":
+				if orchPos == token.NoPos {
+					orchPos = n.Pos()
+				}
+			}
+		case *ast.AssignStmt:
+			for _, lhs := range n.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "GitHub" {
+					if x, ok := sel.X.(*ast.Ident); ok && x.Name == "cfg" && n.Pos() > lastGitHubAssign {
+						lastGitHubAssign = n.Pos()
+					}
+				}
+			}
+		}
+		return true
+	})
+	if wirePos == token.NoPos {
+		t.Fatal("runServe never calls wireDefaultBranch(&cfg); cfg.DefaultBranch would stay nil and every server-side base read would refuse resolver_unconfigured")
+	}
+	if orchPos == token.NoPos || lastGitHubAssign == token.NoPos {
+		t.Fatalf("runServe anchors missing: newStageOrchestrator at %v, last cfg.GitHub assignment at %v", orchPos, lastGitHubAssign)
+	}
+	if wirePos < lastGitHubAssign || wirePos > orchPos {
+		t.Fatalf("wireDefaultBranch(&cfg) at %v must sit after the last cfg.GitHub assignment (%v) and before newStageOrchestrator (%v)", wirePos, lastGitHubAssign, orchPos)
 	}
 }
 
@@ -7428,8 +7557,9 @@ func TestChildCompletionAdvancer_ConflictCarriesBaseAttribution(t *testing.T) {
 		Artifacts: &conflictAdapterArtifacts{arts: []*artifact.Artifact{{
 			ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planJSON,
 		}}},
-		GitHub: &conflictAdapterGitHub{},
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		GitHub:        &conflictAdapterGitHub{},
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DefaultBranch: defaultbranch.Static("main"),
 	}
 	a := childCompletionAdvancer{o: o}
 	ctx := context.Background()

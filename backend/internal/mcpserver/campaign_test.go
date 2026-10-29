@@ -3998,3 +3998,64 @@ func TestCampaignHotfixTool_ThroughRealServer(t *testing.T) {
 		t.Errorf("operator-agent call err = %v, want operator_agent_forbidden with its remedy", err)
 	}
 }
+
+// TestGetCampaignStatus_PassesThroughPendingAmendments (E86.85 / #4486): a
+// present pending_amendments block passes through intact, a present EMPTY block
+// stays present, and an absent block stays ABSENT on the tool output's wire
+// bytes — absent (not computed) is not the same claim as items [].
+func TestGetCampaignStatus_PassesThroughPendingAmendments(t *testing.T) {
+	base := func(id uuid.UUID) CampaignStatus {
+		return CampaignStatus{
+			Campaign:   Campaign{ID: id.String(), Repo: "acme/widgets", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign"},
+			Items:      []CampaignItem{},
+			Rollup:     CampaignRollup{Eligible: []string{}, Blocked: []string{}, Running: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+			NextAction: CampaignNextAction{Action: "wait"},
+		}
+	}
+	entry := campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true)
+	for _, tc := range []struct {
+		name    string
+		block   *campaignPendingAmendments
+		wantRaw string // substring of the output JSON; "" asserts the key absent
+	}{
+		{"present", &campaignPendingAmendments{Items: []campaignPendingAmendment{entry}, Truncated: true}, `"pending_amendments":{"items":[{"issue_ref":"acme/widgets#2"`},
+		{"present_empty", &campaignPendingAmendments{Items: []campaignPendingAmendment{}}, `"pending_amendments":{"items":[],"truncated":false}`},
+		{"absent", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			id := uuid.New()
+			st := base(id)
+			st.PendingAmendments = tc.block
+			fb.campaignStatusByID[id] = st
+			r := newResolver(srv, nil)
+
+			_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus: %v", err)
+			}
+			raw, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if tc.wantRaw == "" {
+				if strings.Contains(string(raw), `"pending_amendments"`) || out.PendingAmendments != nil {
+					t.Fatalf("absent block surfaced: %s", raw)
+				}
+				return
+			}
+			if !strings.Contains(string(raw), tc.wantRaw) {
+				t.Fatalf("output JSON = %s, want it to carry %s", raw, tc.wantRaw)
+			}
+			if tc.block.Truncated && !out.PendingAmendments.Truncated {
+				t.Error("truncated flag dropped in pass-through")
+			}
+			if len(tc.block.Items) == 1 {
+				got := out.PendingAmendments.Items[0]
+				if got.Amendment.ID != entry.Amendment.ID || got.Amendment.RunID != entry.Amendment.RunID || !got.DecisionLive || got.StageState != "running" {
+					t.Errorf("passed-through entry = %+v, want %+v", got, entry)
+				}
+			}
+		})
+	}
+}

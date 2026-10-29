@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/dberr"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -76,6 +77,10 @@ const (
 const (
 	rerunSlugNoAgentReviewers = "no_agent_reviewers"
 	rerunSlugConsolidatedDue  = "consolidated_review_not_due"
+	// rerunSlugDefaultBranchUnresolved (#4660): the repository's forge
+	// default_branch — the consolidated round's compare base — could not be
+	// read; details.default_branch_unresolved_reason names why.
+	rerunSlugDefaultBranchUnresolved = "default_branch_unresolved"
 )
 
 // rerunMergeCandidateUnreadable is details.merge_candidate_state on a
@@ -485,6 +490,8 @@ func firstRoundRefusalHint(slug string) string {
 		return "no reviewer backend is wired on this deployment"
 	case redispatchSlugForgeCompareUnavail:
 		return "the forge compare that sources the consolidated diff is not wired for this run"
+	case rerunSlugDefaultBranchUnresolved:
+		return "the forge default-branch read that supplies the compare base failed (details.default_branch_unresolved_reason names why); nothing was recorded, so retry once the read recovers"
 	}
 	return "the parent implement stage no longer wants a review round"
 }
@@ -495,12 +502,16 @@ func firstRoundRefusalHint(slug string) string {
 // no_review_round. Otherwise firstRoundIneligibleSlug's ladder answers 409
 // review_rerun_ineligible before any write.
 //
-// An eligible parent gets review_round_rerun_requested (rerun_of_sequence 0,
-// first_round true, authority advisory, round_origin consolidated) appended
-// chained, then runConsolidatedReviewRound runs SYNCHRONOUSLY on a context
-// detached from the request, over the same base and branch the orchestrator's
-// consolidated trigger uses (orchestrator.go: DefaultRef, else "main"; the
-// consolidated branch). The permission-drift check re-runs with it, under the
+// An eligible parent then resolves its compare base — the repository's forge
+// default branch, the same base the orchestrator's consolidated trigger uses
+// (#4660) — BEFORE anything is written: an unresolved read answers 409
+// review_rerun_ineligible with details.reason default_branch_unresolved and
+// details.default_branch_unresolved_reason, write-free. A resolved base gets
+// review_round_rerun_requested (rerun_of_sequence 0, first_round true,
+// authority advisory, round_origin consolidated) appended chained, then
+// runConsolidatedReviewRound runs SYNCHRONOUSLY on a context detached from the
+// request, over that base and the consolidated branch. The permission-drift
+// check re-runs with it, under the
 // fan-in re-entry semantics every consolidated re-dispatch already has. The
 // latest implement round is then re-read: one present → 200 with
 // rerun_of_sequence 0 and its sequence (a concurrent orchestrator dispatch of
@@ -550,6 +561,19 @@ func (s *Server) rerunFirstConsolidatedRound(w http.ResponseWriter, r *http.Requ
 		return
 	}
 	stageID := target.implStage.ID
+	// Resolve the base AHEAD of the audit append (#4660): an unresolved
+	// default branch refuses write-free, so no review_round_rerun_requested
+	// announces a round that cannot start.
+	base, berr := s.resolveRunDefaultBranch(ctx, runRow)
+	if berr != nil {
+		reason, _ := defaultbranch.ReasonOf(berr)
+		details["reason"] = rerunSlugDefaultBranchUnresolved
+		details["default_branch_unresolved_reason"] = string(reason)
+		details["stage_id"] = stageID.String()
+		s.writeError(w, r, http.StatusConflict, rerunCodeIneligible,
+			"no implement-review round has been dispatched on this decomposed parent and its first consolidated round cannot be started: "+rerunSlugDefaultBranchUnresolved+" ("+string(reason)+") — "+firstRoundRefusalHint(rerunSlugDefaultBranchUnresolved), details)
+		return
+	}
 	body, _ := json.Marshal(reviewRoundRerunRequestedPayload{
 		Stage:            stage.label,
 		StageID:          stageID.String(),
@@ -576,10 +600,6 @@ func (s *Server) rerunFirstConsolidatedRound(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	base := "main"
-	if s.cfg.Orchestrator != nil && s.cfg.Orchestrator.DefaultRef != "" {
-		base = s.cfg.Orchestrator.DefaultRef
-	}
 	// Detached from the request so a client disconnect mid-compare cannot
 	// cancel a round the audit row already announced.
 	failSlug, headSHA := s.runConsolidatedReviewRound(context.WithoutCancel(ctx), runRow, stageID, base,

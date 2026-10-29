@@ -271,6 +271,15 @@ type mergeCandidateVerifyRefusal struct {
 // The re-open hands run.FixupStage the pass's OWN counts (0 prior, max 1,
 // ceiling 1), so the fix-up counter is never read or spent.
 //
+// The re-open also sets TolerateUndispatchedAcceptance (#4785): a pass
+// re-opens implement while a never-dispatched (`pending`) acceptance stage
+// waits ahead of review — the decomposed-parent acceptance hold, where the
+// orchestrator keeps acceptance pending until the consolidated head's fan-in
+// verify settles. It is not cause-restricted: mergeCandidateVerifyState can
+// report another cause (e.g. base_advance) for the consolidated head, and a
+// cause-restricted tolerance would wedge the hold. No review is re-parked
+// there (openReviewStageFor answers nil for a pending review).
+//
 // ADR-092 (#4200): with Config.MergeQueue (and a forge) wired, a serialized
 // cause (base_advance, conflict_resolution) is routed through the held-pass
 // queue (serializeMergeCandidateVerifyPass, merge_candidate_queue.go) instead
@@ -397,9 +406,10 @@ func (s *Server) beginMergeCandidateVerifyPass(ctx context.Context, runID uuid.U
 	}
 
 	if _, err := run.FixupStage(ctx, s.cfg.RunRepo, impl.ID, run.FixupOptions{
-		PriorPassCount: 0,
-		MaxPasses:      1,
-		HardCeiling:    1,
+		PriorPassCount:                 0,
+		MaxPasses:                      1,
+		HardCeiling:                    1,
+		TolerateUndispatchedAcceptance: true,
 	}); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge-candidate verify: re-opening the implement stage failed; settling the trigger as not_executed",

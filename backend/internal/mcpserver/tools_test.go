@@ -657,6 +657,19 @@ type fakeBackend struct {
 	scopeOverlapByRun  map[uuid.UUID]scopeOverlap
 	scopeOverlapStatus int
 	scopeOverlapCalls  []uuid.UUID
+
+	// E86.85 / #4486: GET /v0/runs/{run_id}/campaign-pending-amendments.
+	// campaignAmendmentsByAnchor seeds the per-anchor body; an unkeyed anchor
+	// answers 404 (the older-backend / unrouted shape) unless
+	// campaignAmendmentsFunc answers it. campaignAmendmentsFunc, when non-nil,
+	// is invoked under fb.mu with (anchor, read count) and wins when it returns
+	// ok, so a test can make an amendment APPEAR at the Nth read.
+	// campaignAmendmentsStatus (default 200) forces that status with an error
+	// body on EVERY read; campaignAmendmentsReads counts reads per anchor.
+	campaignAmendmentsByAnchor map[uuid.UUID]runCampaignPendingAmendments
+	campaignAmendmentsFunc     func(anchor uuid.UUID, reads int) (runCampaignPendingAmendments, bool)
+	campaignAmendmentsStatus   int
+	campaignAmendmentsReads    map[uuid.UUID]int
 }
 
 // recordedReapExpectedState reads the expected_state precondition the fake
@@ -793,8 +806,44 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		cancelCampaignStatus:          http.StatusOK,
 		scopeOverlapByRun:             map[uuid.UUID]scopeOverlap{},
 		scopeOverlapStatus:            http.StatusOK,
+		campaignAmendmentsByAnchor:    map[uuid.UUID]runCampaignPendingAmendments{},
+		campaignAmendmentsStatus:      http.StatusOK,
+		campaignAmendmentsReads:       map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
+	// GET /v0/runs/{run_id}/campaign-pending-amendments (E86.85 / #4486).
+	mux.HandleFunc("GET /v0/runs/{run_id}/campaign-pending-amendments", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.campaignAmendmentsReads[id]++
+		status := fb.campaignAmendmentsStatus
+		body, ok := fb.campaignAmendmentsByAnchor[id]
+		if fb.campaignAmendmentsFunc != nil {
+			if fbody, fok := fb.campaignAmendmentsFunc(id, fb.campaignAmendmentsReads[id]); fok {
+				body, ok = fbody, true
+			}
+		}
+		fb.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"code":"internal_error","message":"campaign pending amendments failed"}`))
+			return
+		}
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"not_found","message":"no route"}`))
+			return
+		}
+		if body.Items == nil {
+			body.Items = []campaignPendingAmendment{}
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	})
 	// GET /v0/runs/{run_id}/scope-overlap (E83.60 / #4118).
 	mux.HandleFunc("GET /v0/runs/{run_id}/scope-overlap", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

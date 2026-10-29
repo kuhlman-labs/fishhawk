@@ -137,7 +137,10 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 
 	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 
-	if drive != nil && drive.NextAction != nil {
+	// #4801: a stale checks-green merge_pr stamp must not outrank the
+	// acceptance move on the acceptance-unsettled concerns arm — the merge is
+	// held there. Every other drive action still folds first.
+	if drive != nil && drive.NextAction != nil && (na.State != stateConcernsOpenAcceptanceUnsettled || drive.NextAction.Action != driveNextActionMergePR) {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 	}
 
@@ -1282,6 +1285,16 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 				}
 				return &NextActions{State: "implement_concerns_open_gate_closed", Actions: hint.gateClosedActions(run, nil)}
 			}
+			// #4801: the gate is OPEN (implement succeeded, review parked) but a
+			// fix-up push re-opened (or nothing ran) the acceptance stage, so the
+			// merge cannot fire until it settles. Lead with the acceptance move
+			// and drop merge_and_file_follow_up — a merge offer here names a verb
+			// the endpoint refuses (#3116 class). The commit-yourself flow
+			// (implement awaiting_approval is its own gate, acceptance not yet
+			// reached) keeps today's arm.
+			if impl.State == "succeeded" && acceptanceHoldsMerge(acceptance) {
+				return &NextActions{State: stateConcernsOpenAcceptanceUnsettled, Actions: hint.acceptanceUnsettledActions(run, impl.ID, acceptance)}
+			}
 			// Open concerns: embed the hint's options as actions. The
 			// entries derive FROM the computed ReviewActionHint value
 			// (review_action_hint.go), so the two surfaces agree by
@@ -1310,6 +1323,21 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 	default:
 		return nil
 	}
+}
+
+// stateConcernsOpenAcceptanceUnsettled is the #4801 concerns-open arm: the
+// fix-up gate is open but the acceptance stage is non-terminal, so the merge is
+// held. stateConcernsOpenAcceptanceReopened is its relabel when a stage-scoped
+// acceptance_reopened audit entry says a fix-up push is why
+// (foldAcceptanceRedispatchAdvisory).
+const stateConcernsOpenAcceptanceUnsettled = "implement_concerns_open_acceptance_unsettled"
+
+const stateConcernsOpenAcceptanceReopened = "implement_concerns_open_acceptance_reopened"
+
+// acceptanceHoldsMerge reports whether the acceptance stage still holds the
+// merge: it exists and has not settled on this head (#4801).
+func acceptanceHoldsMerge(acceptance *Stage) bool {
+	return acceptance != nil && !stageStateIsTerminal(acceptance.State)
 }
 
 // supersededImplementCount reads the run-status concerns block's
@@ -2690,7 +2718,27 @@ func naOffersMerge(na *NextActions) bool {
 // no NON-TERMINAL acceptance stage (none at all, or every one of them already
 // settled). That last guard is what keeps a HEALTHY merge byte-identical.
 func foldAcceptanceRedispatchAdvisory(run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
-	if run == nil || na == nil || !naOffersMerge(na) {
+	if run == nil || na == nil {
+		return
+	}
+	// #4801: the concerns-open acceptance-unsettled arm carries no merge to
+	// fold onto, but its lead acceptance action is where the acceptance_reopened
+	// evidence belongs. Relabel and sharpen that lead only; the action is
+	// selected by NAME plus provenance, never by index, so a drive-folded poll
+	// is never rewritten.
+	if na.State == stateConcernsOpenAcceptanceUnsettled {
+		acc := blockingAcceptanceStage(stages)
+		if acc == nil || !acceptanceReopenedIn(recent, acc.ID) {
+			return
+		}
+		state := runpkg.StageState(acc.State)
+		na.State = stateConcernsOpenAcceptanceReopened
+		if i := acceptanceUnsettledLeadIndex(na.Actions, acc); i >= 0 {
+			na.Actions[i].Reason = runpkg.AcceptanceBlockerAdvisory(shortStageID(acc.ID), state, true, mergeAdvisoryTail)
+		}
+		return
+	}
+	if !naOffersMerge(na) {
 		return
 	}
 	// Selected by NON-TERMINALITY (blockingAcceptanceStage), not by
