@@ -109,6 +109,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Merge queue (ADR-093 slice 1, E87.4 / [#4295](https://github.com/kuhlman-labs/fishhawk/issues/4295))
 - Merge overlap guard (`merge_overlap_guard.go`, E83.61 / [#4119](https://github.com/kuhlman-labs/fishhawk/issues/4119))
 - Merge-candidate verdict transfer (ADR-096 D1/D2/D5, ADR-098 D3, E87.2 / #4293)
+- Consolidated fan-in verify hold (`fanin_verify.go`, ADR-090 D5 / #4018, #4812)
 
 ### [Host dispatch, decomposition, stage lifecycle and fix-ups](docs/dispatch.md)
 
