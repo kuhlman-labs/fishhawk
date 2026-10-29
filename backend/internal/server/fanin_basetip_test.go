@@ -32,6 +32,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -348,7 +349,7 @@ func newBaseTipHarness(t *testing.T, implState run.StageState) *baseTipHarness {
 	child1 := seedChild(1, run.StateRunning)
 
 	o := &orchestrator.Orchestrator{
-		Runs: rr, GitHub: client, Audit: au, Artifacts: art, DefaultRef: "main",
+		Runs: rr, GitHub: client, Audit: au, Artifacts: art, DefaultBranch: defaultbranch.Static("main"),
 		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
 	}
 	s := New(Config{
@@ -455,7 +456,7 @@ func TestFanInOnBaseTip_SinglePassMerge(t *testing.T) {
 	}
 
 	// The runner reports passed for exactly H through the real report arm.
-	h.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: h.rr, ConsolidatedReview: h.s}
+	h.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: h.rr, ConsolidatedReview: h.s, DefaultBranch: defaultbranch.Static("main")}
 	sf := newSigningFake()
 	h.s.cfg.SigningRepo = sf
 	priv, _ := sf.issue(t, h.parent.ID)

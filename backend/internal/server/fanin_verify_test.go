@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -569,7 +570,7 @@ func TestFanInHold_EndToEndRelease_ApprovalGatedImplement(t *testing.T) {
 	f.rr.mu.Lock()
 	f.parent.PullRequestURL = &prURL
 	f.rr.mu.Unlock()
-	f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s}
+	f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, DefaultBranch: defaultbranch.Static("main")}
 	sf := newSigningFake()
 	f.s.cfg.SigningRepo = sf
 	priv, _ := sf.issue(t, f.parent.ID)
@@ -814,7 +815,7 @@ func TestFanInAcceptanceHold_EndToEnd(t *testing.T) {
 	f.rr.mu.Lock()
 	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
 	f.rr.mu.Unlock()
-	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultRef: "main"}
+	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
 	f.s.cfg.Orchestrator = o
 	sf := newSigningFake()
 	f.s.cfg.SigningRepo = sf

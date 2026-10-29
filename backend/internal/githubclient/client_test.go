@@ -6,6 +6,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -18,6 +19,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 )
 
@@ -89,6 +91,15 @@ type fakeGitHub struct {
 	listRulesetsStatus int
 	listRulesetsBody   string
 
+	// getRepoStatus / getRepoDefaultBranch answer GET /repos/{owner}/{repo},
+	// the default-branch read ListRulesetRequiredChecks resolves through
+	// (#4660). hitsMu guards the request counters below.
+	getRepoStatus        int
+	getRepoDefaultBranch string
+	hitsMu               sync.Mutex
+	getRepoHits          int
+	listRulesetsHits     int
+
 	getRulesetStatus int
 	getRulesetBody   map[int64]string
 
@@ -151,6 +162,8 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 		getBranchProtectionStatus: http.StatusOK,
 		getBranchProtectionBody:   `{"required_status_checks":{"contexts":["ci/build","lint"]}}`,
 		listRulesetsStatus:        http.StatusOK,
+		getRepoStatus:             http.StatusOK,
+		getRepoDefaultBranch:      "main",
 		listRulesetsBody:          `[]`,
 		getRulesetStatus:          http.StatusOK,
 		getRulesetBody:            map[int64]string{},
@@ -317,8 +330,21 @@ func newFakeGitHub(t *testing.T) (*fakeGitHub, *httptest.Server) {
 			}
 		})
 
+	mux.HandleFunc("GET /repos/{owner}/{repo}",
+		func(w http.ResponseWriter, _ *http.Request) {
+			fg.hitsMu.Lock()
+			fg.getRepoHits++
+			fg.hitsMu.Unlock()
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(fg.getRepoStatus)
+			_, _ = fmt.Fprintf(w, `{"default_branch":%q}`, fg.getRepoDefaultBranch)
+		})
+
 	mux.HandleFunc("GET /repos/{owner}/{repo}/rulesets",
 		func(w http.ResponseWriter, r *http.Request) {
+			fg.hitsMu.Lock()
+			fg.listRulesetsHits++
+			fg.hitsMu.Unlock()
 			capture(r)
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(fg.listRulesetsStatus)
@@ -1958,6 +1984,134 @@ func TestListRulesetRequiredChecks_Forbidden(t *testing.T) {
 		RepoRef{Owner: "x", Name: "y"}, "main")
 	if err == nil || !errors.Is(err, ErrForbidden) {
 		t.Errorf("err = %v, want ErrForbidden", err)
+	}
+}
+
+func (fg *fakeGitHub) hits() (repo, rulesets int) {
+	fg.hitsMu.Lock()
+	defer fg.hitsMu.Unlock()
+	return fg.getRepoHits, fg.listRulesetsHits
+}
+
+// TestListRulesetRequiredChecks_ResolvesDefaultBranchOnce pins R3 (#4660):
+// the ruleset read resolves the default branch through the Client's SHARED
+// resolver, so a second call inside the positive TTL reads GET /repos/x/y
+// zero more times.
+func TestListRulesetRequiredChecks_ResolvesDefaultBranchOnce(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	c, _ := newTestClient(t, srv, nil)
+	for i := 0; i < 2; i++ {
+		if _, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
+			RepoRef{Owner: "x", Name: "y"}, "main"); err != nil {
+			t.Fatalf("ListRulesetRequiredChecks #%d: %v", i, err)
+		}
+	}
+	repoHits, rulesetHits := fg.hits()
+	if repoHits != 1 {
+		t.Fatalf("GET /repos/x/y hits = %d, want 1 (the shared resolver caches the default branch)", repoHits)
+	}
+	if rulesetHits != 2 {
+		t.Fatalf("ruleset list hits = %d, want 2", rulesetHits)
+	}
+}
+
+// TestListRulesetRequiredChecks_MatchesForgeDefaultBranch: a repository
+// whose forge default branch is `trunk` evaluates `~DEFAULT_BRANCH` as trunk
+// — the ruleset applies to branch trunk and NOT to branch main.
+func TestListRulesetRequiredChecks_MatchesForgeDefaultBranch(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getRepoDefaultBranch = "trunk"
+	fg.listRulesetsBody = `[{"id":1,"target":"branch","enforcement":"active"}]`
+	fg.getRulesetBody = map[int64]string{
+		1: `{"conditions":{"ref_name":{"include":["~DEFAULT_BRANCH"]}},"rules":[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"audit_complete"}]}}]}`,
+	}
+	c, _ := newTestClient(t, srv, nil)
+	repo := RepoRef{Owner: "acme", Name: "widgets"}
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42), repo, "trunk")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks(trunk): %v", err)
+	}
+	if len(got) != 1 || got[0].RulesetID != 1 {
+		t.Fatalf("branch trunk: got %+v, want ruleset 1 (~DEFAULT_BRANCH = trunk)", got)
+	}
+	got, err = c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42), repo, "main")
+	if err != nil {
+		t.Fatalf("ListRulesetRequiredChecks(main): %v", err)
+	}
+	if len(got) != 0 {
+		t.Fatalf("branch main: got %+v, want none (main is not the default branch)", got)
+	}
+}
+
+// TestListRulesetRequiredChecks_UnresolvedRefuses: an unresolved default
+// branch returns the typed refusal and issues NO ruleset request.
+func TestListRulesetRequiredChecks_UnresolvedRefuses(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getRepoStatus = http.StatusNotFound
+	c, _ := newTestClient(t, srv, nil)
+
+	got, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
+		RepoRef{Owner: "x", Name: "y"}, "main")
+	if reason, ok := defaultbranch.ReasonOf(err); !ok || reason != defaultbranch.ReasonRepositoryNotVisible {
+		t.Fatalf("err = %v, want an UnresolvedError with reason repository_not_visible", err)
+	}
+	if got != nil {
+		t.Errorf("checks = %+v, want nil", got)
+	}
+	if _, rulesetHits := fg.hits(); rulesetHits != 0 {
+		t.Fatalf("ruleset list hits = %d, want 0 (no ruleset read on an unresolved default branch)", rulesetHits)
+	}
+}
+
+// TestListRulesetRequiredChecks_UnresolvedNegativeCached: a failed read is
+// negative-cached. A 404 is used because the retry transport retries 5xx
+// GETs, which would make the request count nondeterministic.
+func TestListRulesetRequiredChecks_UnresolvedNegativeCached(t *testing.T) {
+	fg, srv := newFakeGitHub(t)
+	fg.getRepoStatus = http.StatusNotFound
+	c, _ := newTestClient(t, srv, nil)
+	for i := 0; i < 2; i++ {
+		_, err := c.ListRulesetRequiredChecks(context.Background(), forge.FromGitHubInstallationID(42),
+			RepoRef{Owner: "x", Name: "y"}, "main")
+		if _, ok := defaultbranch.ReasonOf(err); !ok {
+			t.Fatalf("call %d: err = %v, want an UnresolvedError", i, err)
+		}
+	}
+	if repoHits, _ := fg.hits(); repoHits != 1 {
+		t.Fatalf("GET /repos/x/y hits = %d, want 1 (failure negative-cached)", repoHits)
+	}
+}
+
+func TestClientDefaultBranches_SameInstance(t *testing.T) {
+	c := &Client{}
+	a := c.DefaultBranches()
+	if a == nil {
+		t.Fatal("DefaultBranches() = nil")
+	}
+	if b := c.DefaultBranches(); a != b {
+		t.Fatalf("DefaultBranches() returned %p then %p, want the same instance", a, b)
+	}
+	if other := (&Client{}).DefaultBranches(); other == a {
+		t.Fatal("two Clients share one resolver, want one per Client")
+	}
+
+	// A racing first build keeps ONE instance (run under -race).
+	fresh := &Client{}
+	got := make([]*defaultbranch.Resolver, 16)
+	var wg sync.WaitGroup
+	for i := range got {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			got[i] = fresh.DefaultBranches()
+		}(i)
+	}
+	wg.Wait()
+	for i, r := range got {
+		if r == nil || r != got[0] {
+			t.Fatalf("concurrent DefaultBranches()[%d] = %p, want the single instance %p", i, r, got[0])
+		}
 	}
 }
 

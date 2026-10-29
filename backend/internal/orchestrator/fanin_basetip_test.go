@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -84,7 +85,7 @@ func newFoldFixture(t *testing.T, n int) *foldFixture {
 		renames:    map[comparePair]map[string]string{},
 	}
 	o.GitHub = gh
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}

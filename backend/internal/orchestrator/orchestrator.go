@@ -36,6 +36,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -165,10 +166,13 @@ type Orchestrator struct {
 	// but the audit is dropped (logged at warn).
 	Audit audit.Repository
 
-	// DefaultRef is the git ref to dispatch against. Matches the
-	// webhook dispatcher's default; v0.x persists the ref on the
-	// run row so subsequent dispatches can target the same ref.
-	DefaultRef string
+	// DefaultBranch resolves a repository's base branch from the forge
+	// default_branch (#4660) for the consolidated PR, the fan-in base and
+	// the consolidated-review trigger. Nil means every base read refuses
+	// with resolver_unconfigured — never a guessed branch. fishhawkd wires
+	// the githubclient's shared resolver (githubclient.Client.DefaultBranches)
+	// so these reads share one TTL cache with the server.
+	DefaultBranch defaultbranch.Source
 
 	// ActionsWorkflowFile is the customer-side .github/workflows/
 	// file. Defaults to "fishhawk.yml" at use time.
@@ -677,13 +681,25 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// maybeOpenConsolidatedPR exactly. The acceptance arm (#4785) fires it
 	// too, once acceptance is released; the later review-gate re-fire dedups
 	// through the dispatcher's started-key guard.
+	//
+	// The base is the repository's resolved default branch (#4660). An
+	// unresolved read SKIPS the review dispatch with a WARN naming the
+	// reason — the stage dispatch above already happened, the run's review
+	// status stays none, and the operator's remedy is the first-round
+	// review re-run verb, which refuses with the same named reason until the
+	// forge read recovers.
 	if err == nil && (isParentReviewGate || isParentAcceptance) && o.ConsolidatedReview != nil &&
 		r.PullRequestURL != nil && *r.PullRequestURL != "" {
-		base := o.DefaultRef
-		if base == "" {
-			base = "main"
+		base, berr := o.runBaseBranch(ctx, r)
+		if berr != nil {
+			reason, _ := defaultbranch.ReasonOf(berr)
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: consolidated review not dispatched: default branch unresolved",
+				slog.String("run_id", r.ID.String()),
+				slog.String("reason", string(reason)),
+				slog.String("error", berr.Error()))
+		} else {
+			o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
 		}
-		o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
 	}
 
 	return out, err
@@ -813,6 +829,8 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 //	    DispatchConsolidatedReview (which starts the verify-only pass on an
 //	    unverified head and holds otherwise), log, and report held — acceptance
 //	    stays `pending`. A hook error is returned (acceptance stays pending).
+//	    The hook's base is the resolved default branch (#4660); an
+//	    unresolved one is WARN-logged with its reason and consults no hook.
 //	(d) Otherwise not held: the caller dispatches acceptance and fires the
 //	    consolidated review.
 //
@@ -858,12 +876,24 @@ func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.R
 		r = updated
 	}
 
-	base := o.DefaultRef
-	if base == "" {
-		base = "main"
-	}
 	if o.FanInVerify != nil && o.ConsolidatedReview != nil &&
 		r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		// The fan-in base is the repository's resolved default branch
+		// (#4660), never a literal. An unresolved read applies NO hold:
+		// acceptance dispatches as before (the merge gate still blocks on
+		// the unverified head) and the consolidated-review fire after the
+		// dispatch skips with its own WARN.
+		base, berr := o.runBaseBranch(ctx, r)
+		if berr != nil {
+			reason, _ := defaultbranch.ReasonOf(berr)
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed parent acceptance hold not applied: default branch unresolved",
+				slog.String("run_id", r.ID.String()),
+				slog.String("acceptance_stage_id", next.ID.String()),
+				slog.String("reason", string(reason)),
+				slog.String("error", berr.Error()))
+			o.clearFanInAcceptanceHold(r.ID)
+			return r, true, false, nil
+		}
 		fanInSettled, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
 		if err != nil {
 			return r, true, false, fmt.Errorf("fan-in verify state: %w", err)
@@ -1010,9 +1040,9 @@ func (o *Orchestrator) openConsolidatedPRLocked(ctx context.Context, r *run.Run,
 	}
 
 	head := consolidatedBranch(r.ID)
-	base := o.DefaultRef
-	if base == "" {
-		base = "main"
+	base, err := o.baseBranch(ctx, scope, repo)
+	if err != nil {
+		return r, fmt.Errorf("resolve base branch: %w", err)
 	}
 
 	// Gather the inputs the aligned PR body (#1774) needs. Every load is
@@ -2177,9 +2207,9 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		return nil, fmt.Errorf("parse repo %q: %w", parent.Repo, err)
 	}
 
-	base := o.DefaultRef
-	if base == "" {
-		base = "main"
+	base, err := o.baseBranch(ctx, scope, repo)
+	if err != nil {
+		return nil, fmt.Errorf("resolve base ref: %w", err)
 	}
 	baseSHA, exists, err := o.GitHub.GetBranchSHA(ctx, scope, repo, base)
 	if err != nil {
@@ -3881,7 +3911,6 @@ func (o *Orchestrator) backends() *runnerbackend.Resolver {
 	reg := runnerbackend.Registry{
 		run.RunnerKindGitHubActions: &runnerbackend.GitHubActions{
 			Client:              o.GitHub,
-			DefaultRef:          o.DefaultRef,
 			ActionsWorkflowFile: o.ActionsWorkflowFile,
 			Logger:              o.Logger,
 		},
@@ -4230,6 +4259,30 @@ func (o *Orchestrator) logger() *slog.Logger {
 		return o.Logger
 	}
 	return slog.Default()
+}
+
+// baseBranch resolves repo's base branch through o.DefaultBranch (#4660):
+// the forge default_branch, or a typed *defaultbranch.UnresolvedError naming
+// why not. It is the ONE base read for the consolidated PR, the fan-in base
+// and the consolidated-review trigger; none of them falls back to a literal
+// branch.
+func (o *Orchestrator) baseBranch(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (string, error) {
+	return defaultbranch.Resolve(ctx, o.DefaultBranch, scope, repo)
+}
+
+// runBaseBranch is baseBranch for a run row: scope from the run's
+// installation id (nil -> the zero scope -> no_installation) and repo from
+// its owner/name (unparseable -> repository_invalid).
+func (o *Orchestrator) runBaseBranch(ctx context.Context, r *run.Run) (string, error) {
+	var scope forge.CredentialScope
+	if r.InstallationID != nil {
+		scope = forge.FromGitHubInstallationID(*r.InstallationID)
+	}
+	repo, err := parseRepo(r.Repo)
+	if err != nil {
+		return "", defaultbranch.Unresolved(forge.RepoRef{}, defaultbranch.ReasonRepositoryInvalid, err)
+	}
+	return o.baseBranch(ctx, scope, repo)
 }
 
 // parseRepo splits "owner/name" — duplicated from

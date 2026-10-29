@@ -46,6 +46,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
@@ -3039,6 +3040,12 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
 
+	// Default-branch resolver (#4660): wired once cfg.GitHub is final (both
+	// the App and the dev-stub branches above) and BEFORE the orchestrator is
+	// built below, so the server and the orchestrator hold the SAME shared
+	// resolver instance — one TTL cache per repository.
+	wireDefaultBranch(&cfg)
+
 	// Dev-mode consequence WARN (E45.76 / #3601). Emitted ONCE, here, because
 	// this is the first point at which BOTH dev surfaces are resolved
 	// (cfg.DevFixtures is assigned in the pool block above, cfg.DevStubForge
@@ -4333,10 +4340,31 @@ func (a childCompletionAdvancer) DispatchChildren(ctx context.Context, parentRun
 // miswiring fails a serve-level test rather than passing behind the
 // orchestrator-fake behavioral tests. Drive is nil-safe (Engine.Record/
 // Recorded guard a nil receiver); it mirrors server.go's drive wiring.
+// defaultBranchSource is the production default-branch Source (#4660): the
+// GitHub client's shared resolver, or an UNTYPED nil for a nil client — never
+// a typed-nil pointer inside the interface, which would read as configured.
+func defaultBranchSource(gh *githubclient.Client) defaultbranch.Source {
+	if gh == nil {
+		return nil
+	}
+	return gh.DefaultBranches()
+}
+
+// wireDefaultBranch sets cfg.DefaultBranch from cfg.GitHub. runServe calls it
+// after the GitHub client is final and before newStageOrchestrator, which
+// threads the SAME instance into the orchestrator.
+func wireDefaultBranch(cfg *server.Config) {
+	cfg.DefaultBranch = defaultBranchSource(cfg.GitHub)
+}
+
 func newStageOrchestrator(cfg server.Config, logger *slog.Logger) *orchestrator.Orchestrator {
 	return &orchestrator.Orchestrator{
-		Runs:                cfg.RunRepo,
-		GitHub:              cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+		Runs:   cfg.RunRepo,
+		GitHub: cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+		// DefaultBranch is the server's shared resolver (#4660), so the
+		// consolidated PR, fan-in base and consolidated-review trigger share
+		// its cache with the server-side reads.
+		DefaultBranch:       cfg.DefaultBranch,
 		Logger:              logger,
 		Artifacts:           cfg.ArtifactRepo,
 		Audit:               cfg.AuditRepo,
