@@ -1674,6 +1674,12 @@ func (s *Server) reopenAcceptanceOnFixupPush(ctx context.Context, runID uuid.UUI
 			slog.String("run_id", runID.String()),
 			slog.String("acceptance_stage_id", dec.Stage.ID.String()),
 			slog.String("error", err.Error()))
+	} else {
+		// #4801: FORCE the republish so the check title names the re-open
+		// ("Held: acceptance stage … re-opened by a fix-up push"). A generic
+		// pending check is typically already published at this head, and the
+		// publisher's (head, state) dedup would suppress the unforced one.
+		_, _ = s.recomputeAndForcePublishAuditComplete(ctx, runID)
 	}
 	s.notifyStatusUpdate(ctx, runID, "acceptance_reopened")
 }

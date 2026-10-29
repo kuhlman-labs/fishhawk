@@ -105,7 +105,7 @@ The alternative considered and rejected: a CONTENT fingerprint in the dedup cach
 
 ## `output.text` carries the missing list (E64.59 / #3190)
 
-`buildParams` renders the structured `missing` list into `forge.CreateCheckRunParams.OutputText` (GitHub's `output.text`) on BOTH the pending and fail branches, via the shared `renderMissingText` helper — one `- **kind** — detail` line per item under a lead line. The pending branch also sets `OutputTitle`, because GitHub requires `title` + `summary` whenever `output` is present.
+`buildParams` renders the structured `missing` list into `forge.CreateCheckRunParams.OutputText` (GitHub's `output.text`) on BOTH the pending and fail branches, via the shared `renderMissingText` helper — one `- **kind** — detail` line per item under a lead line. The pending branch also sets `OutputTitle`, because GitHub requires `title` + `summary` whenever `output` is present. Since #4801 a pending check with a non-empty `missing` list is titled `Held: <auditcomplete.HeldHeadline(missing)>` (e.g. `Held: acceptance stage 88538e1a pending — re-opened by a fix-up push, not re-dispatched`) and its `OutputSummary` LEADS with the same `Held: <headline>. ` — GitLab's commit-status description reads the summary, so it carries the cause with no GitLab change. An empty pending list keeps `CheckName` and the generic summary byte-identical; pass/fail are unchanged.
 
 The one-line `OutputSummary` keeps its existing shape; the DETAIL rides in `output.text`, which is exactly the field #3190 observed as `null` on the stranded check. An empty missing list omits `output.text` entirely rather than publishing a bare lead line.
 

@@ -7279,3 +7279,208 @@ func TestFoldMergeQueueYield_UntrustedTextNeverReachesNextActions(t *testing.T) 
 		}
 	}
 }
+
+// --- #4801: concerns open, fix-up gate open, acceptance unsettled ----------
+
+// naUnsettledStages is the live #4801 shape: succeedFixupPushStage advanced
+// implement (review parked at awaiting_approval) before the fix-up push
+// re-opened the settled acceptance stage.
+func naUnsettledStages(accState string) ([]Stage, Stage) {
+	acc := naStage("acceptance", accState)
+	return []Stage{
+		naStage("plan", "succeeded"),
+		naStage("implement", "succeeded"),
+		acc,
+		naStage("review", "awaiting_approval"),
+	}, acc
+}
+
+func naHasAction(na *NextActions, names ...string) bool {
+	for _, a := range na.Actions {
+		for _, n := range names {
+			if a.Action == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestNextActions_ConcernsOpenAcceptanceUnsettledHoldsMerge pins the #4801
+// classifier arm across every non-terminal acceptance state and every hint
+// budget branch: the acceptance move leads (a dispatch carrying stage_id when
+// dispatchable, a single poll and NO dispatch when in flight), the merge is
+// never offered, and the route-back moves survive.
+func TestNextActions_ConcernsOpenAcceptanceUnsettledHoldsMerge(t *testing.T) {
+	hints := []struct {
+		name     string
+		hint     *ReviewActionHint
+		wantTail []string
+	}{
+		{"remaining", &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}, []string{"fishhawk_fixup_stage", "fishhawk_defer_concern"}},
+		{"override", &ReviewActionHint{Concerns: 2, OverrideAvailable: true}, []string{"fishhawk_defer_concern", "fishhawk_fixup_stage"}},
+		{"ceiling", &ReviewActionHint{Concerns: 2}, []string{"commit_and_vouch", "fishhawk_start_run"}},
+	}
+	for _, accState := range []string{"pending", "awaiting_host_dispatch", "dispatched", "running"} {
+		for _, h := range hints {
+			t.Run(accState+"/"+h.name, func(t *testing.T) {
+				prURL := "https://github.com/x/y/pull/42"
+				r := naRun("running")
+				r.PullRequestURL = &prURL
+				stages, acc := naUnsettledStages(accState)
+				na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), h.hint, nil, false, false, false, "", "", releaseSignals{})
+				if na.State != stateConcernsOpenAcceptanceUnsettled {
+					t.Fatalf("state = %q, want %q (actions %v)", na.State, stateConcernsOpenAcceptanceUnsettled, actionNames(na))
+				}
+				if naHasAction(na, "merge_and_file_follow_up", "fishhawk_merge_run") {
+					t.Fatalf("actions = %v, want NO merge while acceptance is unsettled", actionNames(na))
+				}
+				lead := na.Actions[0]
+				dispatchable := accState == "pending" || accState == "awaiting_host_dispatch"
+				if dispatchable {
+					if lead.Action != "fishhawk_dispatch_stage" || lead.Params["stage"] != "acceptance" {
+						t.Fatalf("lead = %s %v, want fishhawk_dispatch_stage(stage=acceptance)", lead.Action, lead.Params)
+					}
+					if lead.Params["stage_id"] != acc.ID {
+						t.Errorf("lead stage_id = %q, want the acceptance stage id %q", lead.Params["stage_id"], acc.ID)
+					}
+				} else {
+					if naHasAction(na, "fishhawk_dispatch_stage") {
+						t.Fatalf("actions = %v, an in-flight acceptance must not be offered a dispatch", actionNames(na))
+					}
+					if lead.Action != "fishhawk_get_run_status" || !strings.Contains(lead.Reason, "already in flight") {
+						t.Fatalf("lead = %s %q, want the wait-shaped poll", lead.Action, lead.Reason)
+					}
+				}
+				if !strings.Contains(lead.Reason, acc.ID[:8]) {
+					t.Errorf("lead reason = %q, want the acceptance short id", lead.Reason)
+				}
+				got := actionNames(na)
+				tail := got[len(got)-len(h.wantTail):]
+				if strings.Join(tail, ",") != strings.Join(h.wantTail, ",") {
+					t.Errorf("actions = %v, want the route-back tail %v in order", got, h.wantTail)
+				}
+			})
+		}
+	}
+}
+
+// TestNextActions_ConcernsOpenSettledAcceptanceKeepsMerge is the regression
+// guard: a SUCCEEDED acceptance stage leaves the pre-#4801 arm byte-identical,
+// merge_and_file_follow_up included.
+func TestNextActions_ConcernsOpenSettledAcceptanceKeepsMerge(t *testing.T) {
+	r := naRun("running")
+	stages, _ := naUnsettledStages("succeeded")
+	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
+	na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, nil, false, false, false, "", "", releaseSignals{})
+	if na.State != "implement_concerns_open" {
+		t.Fatalf("state = %q, want implement_concerns_open", na.State)
+	}
+	want := actionNames(&NextActions{Actions: hint.suggestedActions(r, stages[1].ID)})
+	if got := actionNames(na); strings.Join(got, ",") != strings.Join(want, ",") || !naHasAction(na, "merge_and_file_follow_up") {
+		t.Errorf("actions = %v, want the unchanged %v with merge_and_file_follow_up", got, want)
+	}
+}
+
+// TestNextActions_ZeroConcernsAcceptancePendingLeadsWithDispatch is the C4(b)
+// zero-concern shape: hint nil routes through the acceptance arm, which leads
+// with the acceptance dispatch and offers no merge.
+func TestNextActions_ZeroConcernsAcceptancePendingLeadsWithDispatch(t *testing.T) {
+	r := naRun("running")
+	stages, _ := naUnsettledStages("pending")
+	na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_dispatch_stage" || na.Actions[0].Params["stage"] != "acceptance" {
+		t.Fatalf("actions = %v, want an acceptance dispatch lead", actionNames(na))
+	}
+	if naHasAction(na, "merge_and_file_follow_up", "fishhawk_merge_run") {
+		t.Errorf("actions = %v, want no merge while acceptance is pending", actionNames(na))
+	}
+}
+
+// TestNextActions_DriveMergePRNotPrependedWhileAcceptanceUnsettled pins the
+// drive fold guard: a stale merge_pr stamp is not prepended on the #4801 arm,
+// but still is on implement_concerns_open (the guard is not over-broad), and a
+// non-merge drive action still folds first.
+func TestNextActions_DriveMergePRNotPrependedWhileAcceptanceUnsettled(t *testing.T) {
+	hint := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 1}
+	mergePR := &DriveStatus{Drive: true, NextAction: &RunNextAction{Action: driveNextActionMergePR}}
+
+	r := naRun("running")
+	stages, _ := naUnsettledStages("pending")
+	na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, mergePR, false, false, false, "", "", releaseSignals{})
+	if na.State != stateConcernsOpenAcceptanceUnsettled || naHasAction(na, "fishhawk_merge_run") || na.Actions[0].Action != "fishhawk_dispatch_stage" {
+		t.Fatalf("state %q actions %v: a drive merge_pr must not outrank the acceptance dispatch", na.State, actionNames(na))
+	}
+
+	other := &DriveStatus{Drive: true, NextAction: &RunNextAction{Action: "run_acceptance_stage"}}
+	na = nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, other, false, false, false, "", "", releaseSignals{})
+	if na.Actions[0].Action != "run_acceptance_stage" {
+		t.Errorf("actions = %v, want a non-merge drive action still folded first", actionNames(na))
+	}
+
+	settled, _ := naUnsettledStages("succeeded")
+	na = nextActionsFor(r, settled, nil, naReviewStatus("implement", "complete"), hint, mergePR, false, false, false, "", "", releaseSignals{})
+	if na.State != "implement_concerns_open" || na.Actions[0].Action != "fishhawk_merge_run" {
+		t.Errorf("state %q actions %v, want merge_pr still prepended on implement_concerns_open", na.State, actionNames(na))
+	}
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_ConcernsOpenReopened pins the #4801 fold
+// branch: a stage-scoped acceptance_reopened entry relabels the unsettled arm
+// _reopened and sharpens the lead's reason; an entry scoped to another stage,
+// or unscoped, leaves it unsettled with the generic reason.
+func TestFoldAcceptanceRedispatchAdvisory_ConcernsOpenReopened(t *testing.T) {
+	hint := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 1}
+	build := func(accState string) (*Run, []Stage, Stage, *NextActions) {
+		r := naRun("running")
+		stages, acc := naUnsettledStages(accState)
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, nil, false, false, false, "", "", releaseSignals{})
+		if na.State != stateConcernsOpenAcceptanceUnsettled {
+			t.Fatalf("precondition: state = %q", na.State)
+		}
+		return r, stages, acc, na
+	}
+
+	for _, accState := range []string{"pending", "running"} {
+		t.Run("scoped/"+accState, func(t *testing.T) {
+			r, stages, acc, na := build(accState)
+			foldAcceptanceRedispatchAdvisory(r, stages, []AuditEntry{naReopenedEntry(acc.ID)}, na)
+			if na.State != stateConcernsOpenAcceptanceReopened {
+				t.Fatalf("state = %q, want %q", na.State, stateConcernsOpenAcceptanceReopened)
+			}
+			if !strings.Contains(na.Actions[0].Reason, "re-opened by a fix-up push") || !strings.Contains(na.Actions[0].Reason, acc.ID[:8]) {
+				t.Errorf("lead reason = %q, want the re-open wording naming the stage", na.Actions[0].Reason)
+			}
+			if naHasAction(na, "merge_and_file_follow_up", "fishhawk_merge_run") {
+				t.Errorf("actions = %v, the fold must not add a merge", actionNames(na))
+			}
+		})
+	}
+
+	unscoped := AuditEntry{Category: categoryAcceptanceReopened, Sequence: 9}
+	for name, entry := range map[string]AuditEntry{"other_stage": naReopenedEntry(uuid.NewString()), "unscoped": unscoped} {
+		t.Run(name, func(t *testing.T) {
+			r, stages, _, na := build("pending")
+			before := na.Actions[0].Reason
+			foldAcceptanceRedispatchAdvisory(r, stages, []AuditEntry{entry}, na)
+			if na.State != stateConcernsOpenAcceptanceUnsettled || na.Actions[0].Reason != before {
+				t.Errorf("state %q reason %q, want unsettled with the generic reason", na.State, na.Actions[0].Reason)
+			}
+		})
+	}
+
+	// C4(d): selection is by name + provenance, never by index — a drive-folded
+	// poll AHEAD of the arm's own in-flight poll is never rewritten.
+	t.Run("drive_poll_not_rewritten", func(t *testing.T) {
+		r, stages, acc, na := build("running")
+		drivePoll := pollAction(r, 30, "drive-folded poll")
+		na.Actions = append([]SuggestedAction{drivePoll}, na.Actions...)
+		foldAcceptanceRedispatchAdvisory(r, stages, []AuditEntry{naReopenedEntry(acc.ID)}, na)
+		if na.Actions[0].Reason != "drive-folded poll" {
+			t.Errorf("drive-folded poll reason rewritten to %q", na.Actions[0].Reason)
+		}
+		if !strings.Contains(na.Actions[1].Reason, "re-opened by a fix-up push") {
+			t.Errorf("arm poll reason = %q, want the re-open wording", na.Actions[1].Reason)
+		}
+	})
+}
