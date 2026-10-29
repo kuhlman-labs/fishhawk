@@ -29405,6 +29405,20 @@ paths:
             description: |
               Hex-encoded 64-byte Ed25519 signature over
               sha256(plan_bytes).
+        - name: X-Fishhawk-Plan-Seed-SHA
+          in: header
+          required: false
+          description: |
+            Runner-asserted plan seed (#4436): the commit the plan agent's
+            working tree sat at, as a full lowercase hex object name (40 or
+            64 characters). Recorded as `seed_sha` on the `plan_generated`
+            audit entry; a malformed value records `seed_sha_malformed: true`
+            instead and never fails the upload. NOT covered by
+            `X-Fishhawk-Signature`. The plan review exports its read-only
+            tree at this commit; without a valid value it runs diff-only.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{40}([0-9a-f]{24})?$'
       requestBody:
         required: true
         content:

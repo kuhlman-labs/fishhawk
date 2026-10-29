@@ -16108,7 +16108,8 @@ func TestReviewedHead_DeltaReReview_ScopesDeltaFiles(t *testing.T) {
 
 // TestReviewedHead_PlanRoundUnchanged: a REAL plan upload's plan_review_started
 // row never carries reviewed_head, so its payload is byte-identical to before
-// A1.7.
+// A1.7 apart from the #4436 seed_unresolved key: this upload sends no plan seed
+// header, so the round records seed_not_recorded.
 func TestReviewedHead_PlanRoundUnchanged(t *testing.T) {
 	rr := newOrchestratorRepo()
 	art := newFakeArtifactRepo()
@@ -16132,7 +16133,7 @@ func TestReviewedHead_PlanRoundUnchanged(t *testing.T) {
 	if len(raws) != 1 {
 		t.Fatalf("plan_review_started = %d, want 1", len(raws))
 	}
-	if want := `{"configured_agents":2,"authority":"advisory"}`; raws[0] != want {
+	if want := `{"configured_agents":2,"authority":"advisory","seed_unresolved":"seed_not_recorded"}`; raws[0] != want {
 		t.Errorf("plan_review_started payload = %s, want byte-identical %s (no reviewed_head)", raws[0], want)
 	}
 }

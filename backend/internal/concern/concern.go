@@ -262,9 +262,58 @@ type Concern struct {
 	// CheckKey is the server check's de-duplication key (E80.3 / #3760), so a
 	// re-run of the same check across review rounds does not mint a duplicate
 	// row. '' for every non-server_check row.
-	CheckKey  string
-	CreatedAt time.Time
-	UpdatedAt time.Time
+	CheckKey string
+	// Outcome is the concern's recorded outcome (E94.1 / #4692, ADR-117 D1),
+	// orthogonal to State: OutcomeCarried on a decomposition child's concern
+	// copied into its parent's ledger, OutcomeOpenAtMerge on a concern still
+	// open (or superseded) when its run merged, '' when none is recorded —
+	// every row minted before migration 0112. Writing it never touches State,
+	// StateReason or UpdatedAt. It is never rendered into a review prompt.
+	Outcome Outcome
+	// RolledUpFrom is, on a parent copy imported at a decomposed parent's
+	// fan-in (E94.1 / #4692, ADR-117 D2), the id of the child concern it was
+	// copied from; nil on every other row.
+	RolledUpFrom *uuid.UUID
+	CreatedAt    time.Time
+	UpdatedAt    time.Time
+}
+
+// Outcome is a concern's recorded outcome (E94.1 / #4692, ADR-117 D1). It is
+// orthogonal to State: State is the lifecycle position the gates read, Outcome
+// records what became of the concern. The empty string means no outcome is recorded. This
+// change writes two values; the rest of the D1 vocabulary lands later with no
+// further migration of the column (tolerant TEXT, no CHECK).
+type Outcome string
+
+// Outcomes written today.
+const (
+	// OutcomeCarried marks a decomposition child's open HIGH/MEDIUM concern
+	// that was copied into its parent's ledger at fan-in.
+	OutcomeCarried Outcome = "carried"
+	// OutcomeOpenAtMerge marks a concern still raised, addressed_pending,
+	// reopened or superseded, with no outcome recorded, when its run merged.
+	OutcomeOpenAtMerge Outcome = "open_at_merge"
+)
+
+// RolledUpStateReason is the state_reason a parent copy carries (E94.1 /
+// #4692): it names the child run and the child concern the copy was imported
+// from, so an operator reading the parent ledger can walk back to the source.
+func RolledUpStateReason(src *Concern) string {
+	if src == nil {
+		return "imported from a decomposition child's review ledger"
+	}
+	return fmt.Sprintf("imported from decomposition child run %s, concern %s", src.RunID, src.ID)
+}
+
+// RolledUpSupersededReason is the state_reason a parent copy carries when the
+// retry sweep that discarded its child source supersedes it in the same pass
+// (E94.1 / #4692, approval condition C1(b)): it names the child concern and
+// the child supersession, so no parent copy outlives its source.
+func RolledUpSupersededReason(src *Concern, childReason string) string {
+	if src == nil {
+		return "child source concern superseded: " + childReason
+	}
+	return fmt.Sprintf("child source concern %s on run %s superseded: %s", src.ID, src.RunID, childReason)
 }
 
 // ProvenanceServerCheck is the provenance of a concern the server synthesized
@@ -459,4 +508,37 @@ type Repository interface {
 	// InvalidTransitionError for the caller to log; it never downgrades
 	// the reopened state.
 	ApplyResolution(ctx context.Context, id uuid.UUID, to State, reason string) (*Concern, error)
+
+	// ImportRolledUp copies each source concern into the parent run's ledger
+	// as a raised implement-stage row on ParentStageID (E94.1 / #4692, ADR-117
+	// D2), in ONE transaction. The copy keeps the source's origin review
+	// sequence, reviewer model and role, severity, category, note, evidence,
+	// ingest markers, provenance and check_key verbatim, carries
+	// RolledUpStateReason as its state_reason and links back through
+	// RolledUpFrom. Every source with a copy has its outcome set to
+	// OutcomeCarried — also when its copy already existed, so a pass
+	// interrupted between the two writes heals on retry. A source already
+	// imported into this parent is skipped silently: the (run_id,
+	// rolled_up_from) unique index is the idempotence authority. A source no
+	// longer OPEN when its copy is written is skipped too, with no copy and no
+	// carried outcome: the copy statement locks the source and re-checks its
+	// state, so a concurrent retry sweep's supersession either lands first
+	// (no copy) or waits for this transaction (and the sweep's parent scan
+	// sees the copy). Returns ONLY the newly inserted copies.
+	ImportRolledUp(ctx context.Context, p ImportRolledUpParams) ([]*Concern, error)
+
+	// StampOpenAtMerge sets OutcomeOpenAtMerge on every concern of the given
+	// runs whose state is raised, addressed_pending, reopened or superseded
+	// and whose outcome is still '' (E94.1 / #4692, ADR-117 D1). It never
+	// touches state, state_reason or updated_at, and never overwrites a
+	// recorded outcome, so it is idempotent. Returns the rows stamped; an
+	// empty runIDs slice stamps nothing and runs no query.
+	StampOpenAtMerge(ctx context.Context, runIDs []uuid.UUID) (int64, error)
+}
+
+// ImportRolledUpParams bundles the inputs to ImportRolledUp.
+type ImportRolledUpParams struct {
+	ParentRunID   uuid.UUID
+	ParentStageID uuid.UUID
+	Sources       []*Concern
 }

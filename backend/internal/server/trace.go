@@ -6125,6 +6125,16 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 				slog.Int64("verdict_sequence", entry.Sequence),
 			)
 		}
+		// Late child-slice import (E94.1 / #4692, ADR-117 D2): a decomposition
+		// child's advisory review runs detached and routinely lands AFTER the
+		// child succeeded and the parent's fan-in ran, so its new concerns are
+		// copied into the parent's ledger here. It runs only AFTER both
+		// retry-supersession reads, and never for a verdict superseded at
+		// either (approval condition C1(a)): a discarded attempt's concerns
+		// must not reach the parent.
+		if !superseded && len(freshRows) > 0 {
+			s.importLateSliceConcerns(ctx, runID)
+		}
 		// Buffer the delta-verification resolutions (#984) instead of
 		// applying them here (E48.103 / #2551): they are applied once
 		// after the loop, through the veto pass that can see what the
@@ -6260,6 +6270,7 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 		)
 		return
 	}
+	var superseded []*concern.Concern
 	for _, c := range rows {
 		if c.StageID != stageID || c.StageKind != concern.StageKindImplement || !c.State.IsOpen() {
 			continue
@@ -6274,8 +6285,14 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 				"concern_id", c.ID,
 				"error", err.Error(),
 			)
+			continue
 		}
+		superseded = append(superseded, c)
 	}
+	// A decomposition child's superseded concern may already have a parent
+	// copy (E94.1 / #4692): supersede it in the same pass, so no parent copy
+	// outlives its source (approval condition C1(b)).
+	s.supersedeRolledUpCopies(ctx, runID, superseded, reason)
 }
 
 // runSupplementalReinvokeReview dispatches the bounded, ADDITIVE supplemental

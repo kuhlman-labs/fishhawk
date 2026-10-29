@@ -8544,6 +8544,129 @@ WHERE table_name = 'refinement_drafts' AND column_name = 'repo'`).Scan(&repoCols
 	}
 }
 
+// TestMigrateDown_ReviewConcernsOutcomeRollupReversal pins 0112 (E94.1 /
+// #4692): after MigrateUp review_concerns carries outcome TEXT NOT NULL with an
+// empty-string default and a nullable UUID rolled_up_from, a pre-0112-shaped
+// insert reads back an empty outcome and a NULL rolled_up_from, and
+// review_concerns_rolled_up_once_idx refuses a second (run_id, rolled_up_from)
+// row while allowing many NULLs. Rolling back through 0112 drops both columns
+// and the index, keeps the rows, and lands on 0111
+// (merge_candidate_queue_entries.order_key survives); MigrateUp again restores
+// them.
+func TestMigrateDown_ReviewConcernsOutcomeRollupReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	columns := func() (outcome, rolledUp int) {
+		t.Helper()
+		if err := pool.QueryRow(ctx, `SELECT
+  count(*) FILTER (WHERE column_name = 'outcome' AND data_type = 'text' AND is_nullable = 'NO' AND column_default LIKE '''''::text%'),
+  count(*) FILTER (WHERE column_name = 'rolled_up_from' AND data_type = 'uuid' AND is_nullable = 'YES' AND column_default IS NULL)
+FROM information_schema.columns WHERE table_name = 'review_concerns'`).Scan(&outcome, &rolledUp); err != nil {
+			t.Fatalf("read 0112 columns: %v", err)
+		}
+		return outcome, rolledUp
+	}
+	index := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_indexes WHERE indexname = 'review_concerns_rolled_up_once_idx'`).Scan(&n); err != nil {
+			t.Fatalf("read 0112 index: %v", err)
+		}
+		return n
+	}
+	if o, r := columns(); o != 1 || r != 1 {
+		t.Fatalf("outcome / rolled_up_from columns after MigrateUp = %d / %d, want 1 / 1 (TEXT NOT NULL DEFAULT '', nullable UUID)", o, r)
+	}
+	if n := index(); n != 1 {
+		t.Fatalf("review_concerns_rolled_up_once_idx after MigrateUp = %d, want 1", n)
+	}
+
+	var runID, stageID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'acme-widgets/storefront', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+VALUES (gen_random_uuid(), $1, 1, 'implement', 'agent', 'fishhawk/runner@v1', 'pending') RETURNING id`, runID).Scan(&stageID); err != nil {
+		t.Fatalf("seed stage: %v", err)
+	}
+	insert := func(rolledUpFrom *uuid.UUID) error {
+		_, err := pool.Exec(ctx, `INSERT INTO review_concerns (id, run_id, stage_id, stage_kind, origin_review_sequence, severity, note, rolled_up_from)
+VALUES (gen_random_uuid(), $1, $2, 'implement', 1, 'high', 'n', $3)`, runID, stageID, rolledUpFrom)
+		return err
+	}
+	// Pre-0112-shaped insert: neither new column named.
+	var legacyOutcome string
+	var legacyRolled *uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO review_concerns (id, run_id, stage_id, stage_kind, origin_review_sequence, severity, note)
+VALUES (gen_random_uuid(), $1, $2, 'implement', 1, 'high', 'legacy') RETURNING outcome, rolled_up_from`, runID, stageID).Scan(&legacyOutcome, &legacyRolled); err != nil {
+		t.Fatalf("insert pre-0112-shaped row: %v — 0112 must leave it insertable", err)
+	}
+	if legacyOutcome != "" || legacyRolled != nil {
+		t.Errorf("pre-0112-shaped row reads outcome=%q rolled_up_from=%v, want empty / NULL", legacyOutcome, legacyRolled)
+	}
+	for i := 0; i < 2; i++ {
+		if err := insert(nil); err != nil {
+			t.Fatalf("insert NULL rolled_up_from #%d: %v — NULLs must never conflict", i, err)
+		}
+	}
+	src := uuid.New()
+	if err := insert(&src); err != nil {
+		t.Fatalf("insert first copy: %v", err)
+	}
+	if err := insert(&src); err == nil {
+		t.Error("a second (run_id, rolled_up_from) row was accepted; review_concerns_rolled_up_once_idx must refuse it")
+	}
+	var rowsBefore int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM review_concerns WHERE run_id = $1`, runID).Scan(&rowsBefore); err != nil {
+		t.Fatal(err)
+	}
+
+	downThrough(t, url, "0112")
+
+	if o, r := columns(); o != 0 || r != 0 {
+		t.Errorf("outcome / rolled_up_from columns after rolling back 0112 = %d / %d, want 0 / 0", o, r)
+	}
+	if n := index(); n != 0 {
+		t.Errorf("review_concerns_rolled_up_once_idx after rolling back 0112 = %d, want 0", n)
+	}
+	var rowsAfter int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM review_concerns WHERE run_id = $1`, runID).Scan(&rowsAfter); err != nil {
+		t.Fatalf("read concerns after rollback: %v", err)
+	}
+	if rowsAfter != rowsBefore {
+		t.Errorf("review_concerns rows after rolling back 0112 = %d, want %d (untouched)", rowsAfter, rowsBefore)
+	}
+	var orderKey int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'order_key'`).Scan(&orderKey); err != nil {
+		t.Fatalf("read 0111 column after rolling back 0112: %v", err)
+	}
+	if orderKey != 1 {
+		t.Errorf("merge_candidate_queue_entries.order_key after rolling back 0112 = %d, want 1 (0111 untouched)", orderKey)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	if o, r := columns(); o != 1 || r != 1 {
+		t.Errorf("outcome / rolled_up_from after re-applying 0112 = %d / %d, want 1 / 1", o, r)
+	}
+	if n := index(); n != 1 {
+		t.Errorf("review_concerns_rolled_up_once_idx after re-applying 0112 = %d, want 1", n)
+	}
+}
+
 // TestIsTransientPGRefusal: the raw-database drop retries only a server
 // refusal (also through a connect error's wrap), never another failure.
 func TestIsTransientPGRefusal(t *testing.T) {

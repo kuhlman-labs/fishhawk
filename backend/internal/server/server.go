@@ -1547,6 +1547,10 @@ func New(cfg Config) *Server {
 		// EFFECTIVE verification (operator adds/retirements applied), so an
 		// operator-added drivable criterion is actually driven.
 		cfg.Orchestrator.EffectiveAcceptance = s
+		// E94.1 / #4692 (ADR-117 D2): every fan-in pass imports the
+		// succeeded children's open HIGH/MEDIUM concerns into the parent's
+		// ledger before slices_integrated is written.
+		cfg.Orchestrator.SliceConcerns = s
 	}
 	// Channels behind the Router seam (ADR-015 #79), built as a list so a
 	// channel that needs no GitHub client (push, #2292) is still reachable.

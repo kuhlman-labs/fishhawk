@@ -458,6 +458,7 @@ var KnownCategories = map[string]struct{}{
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
 	"concern_note_backfilled":                 {},
+	"concern_rolled_up":                       {}, // E94.1 / ADR-117 D2 (#4692): child-slice HIGH/MEDIUM concerns copied into the parent ledger; written by server/concern_rollup.go; operator-visible through issuecomment's activityCategories
 	"concern_relitigation_suppressed":         {},
 	"concern_resolution_vetoed":               {},
 	"concern_resolve_failed":                  {}, // E83.53 / #4086: corrective after a failed resolve transition (server/resolve_concerns.go)

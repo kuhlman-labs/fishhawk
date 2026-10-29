@@ -1274,6 +1274,24 @@ type ReviewStartedPayload struct {
 	// plan_review_started entry and on every implement round written before
 	// A1.7, which a reader treats as head_unknown. See ReviewedHead.
 	ReviewedHead *ReviewedHead `json:"reviewed_head,omitempty"`
+
+	// SeedSHA is, on a plan_review_started entry only, the PLAN SEED the
+	// round's review tree targeted (#4436): the commit the plan agent's working
+	// tree sat at, recorded by the runner on the plan upload as
+	// plan_generated.seed_sha. The round exports its read-only tree there,
+	// never at the shared checkout's HEAD. Empty (omitted) on every
+	// implement_review_started entry, on a plan round with no resolved seed,
+	// and on every entry written before #4436.
+	SeedSHA string `json:"seed_sha,omitempty"`
+
+	// SeedUnresolved is, on a plan_review_started entry only, WHY no plan seed
+	// was resolved (#4436): seed_not_recorded (no plan_generated row, or one
+	// with no seed_sha — a pre-#4436 runner), seed_malformed (the recorded
+	// value is not a hex object name) or seed_lookup_failed (the audit read
+	// failed). The round then exported NO tree and ran diff-only — it never
+	// falls back to the shared checkout's HEAD. Empty (omitted) when a seed was
+	// resolved, on every implement round, and on every entry before #4436.
+	SeedUnresolved string `json:"seed_unresolved,omitempty"`
 }
 
 // ReviewedHead statuses (ADR-117 A1.7).

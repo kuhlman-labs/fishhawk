@@ -4,6 +4,8 @@ import (
 	"errors"
 	"strings"
 	"testing"
+
+	"github.com/google/uuid"
 )
 
 // TestTransition_FullMatrix pins every edge of the lifecycle machine.
@@ -283,5 +285,22 @@ func TestConcern_IsServerCheck(t *testing.T) {
 	}
 	if ProvenanceServerCheck != "server_check" {
 		t.Errorf("ProvenanceServerCheck = %q, want %q (persisted on every server-check row)", ProvenanceServerCheck, "server_check")
+	}
+}
+
+// TestRolledUpStateReason_NamesChildRunAndConcern pins the copy's state_reason
+// (E94.1 / #4692): it names both the child run and the child concern.
+func TestRolledUpStateReason_NamesChildRunAndConcern(t *testing.T) {
+	src := &Concern{ID: uuid.New(), RunID: uuid.New()}
+	got := RolledUpStateReason(src)
+	if !strings.Contains(got, src.RunID.String()) || !strings.Contains(got, src.ID.String()) {
+		t.Errorf("RolledUpStateReason = %q, want it to name run %s and concern %s", got, src.RunID, src.ID)
+	}
+	sup := RolledUpSupersededReason(src, "superseded by stage retry")
+	if !strings.Contains(sup, src.ID.String()) || !strings.Contains(sup, "superseded by stage retry") {
+		t.Errorf("RolledUpSupersededReason = %q, want the child concern id and the child reason", sup)
+	}
+	if RolledUpStateReason(nil) == "" || RolledUpSupersededReason(nil, "r") == "" {
+		t.Error("nil source must still yield a non-empty reason")
 	}
 }
