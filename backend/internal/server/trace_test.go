@@ -6451,6 +6451,69 @@ func addressedPendingConcern() prompt.PriorConcern {
 	return prompt.PriorConcern{ID: uuid.NewString(), State: string(concern.StateAddressedPending), Severity: "high", Category: "scope"}
 }
 
+// TestScopeProvenanceForReview_ParentFanOutFold pins the #4425 fan-out fold on
+// a fix-up pass: each fan-out entry folds under its own source with its
+// Detail and touched mark, a flat approval add keeps approval-add-scope-files
+// (it folds BEFORE the parent union, as on the serve side), the DECLARED
+// operation decides the coupled-test fold (a sub_plan delete yields no
+// sibling, a modify or empty operation does), and the residual is 0 with the
+// fan-out and positive without it for the same DeclaredFiles.
+func TestScopeProvenanceForReview_ParentFanOutFold(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	fanOut := []parentFanOutScopePath{
+		{Path: "pkg/a/a.go", Operation: "modify", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 0 scope.files"},
+		{Path: "pkg/d/d.go", Operation: "delete", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 1 scope.files"},
+		{Path: "pkg/e/e.go", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 1 scope.files"},
+		{Path: "pkg/g/grant.go", Operation: "modify", Source: "parent-slice-add-scope-files", Detail: "granted to slice 2 at plan approval via add_scope_files_to_slice"},
+	}
+	flat := []string{"pkg/flat/flat.go"}
+	trig := prompt.Trigger{
+		AmendedScopeFiles: appendFanOutPaths(flat, fanOut),
+		PriorConcerns:     []prompt.PriorConcern{addressedPendingConcern()},
+	}
+	// plan.go, flat.go, the four fan-out paths, and the coupled siblings of
+	// every create/modify .go path: plan_test, flat_test, a_test, e_test,
+	// grant_test — never d_test.
+	const declared = 11
+	ev := &prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: declared}}
+	diff := provenanceDiff("pkg/plan.go", "pkg/a/a.go")
+
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, fanOut, diff, ev)
+	if prov == nil || !prov.FixupPass {
+		t.Fatalf("prov = %+v, want a fix-up pass", prov)
+	}
+	for _, want := range []prompt.GateScopeFold{
+		{Path: "pkg/flat/flat.go", Source: "approval-add-scope-files"},
+		{Path: "pkg/a/a.go", Source: "parent-sub-plan-scope", Touched: true, Detail: fanOut[0].Detail},
+		{Path: "pkg/d/d.go", Source: "parent-sub-plan-scope", Detail: fanOut[1].Detail},
+		{Path: "pkg/e/e.go", Source: "parent-sub-plan-scope", Detail: fanOut[2].Detail},
+		{Path: "pkg/g/grant.go", Source: "parent-slice-add-scope-files", Detail: fanOut[3].Detail},
+		{Path: "pkg/a/a_test.go", Source: "fixup-coupled-test-sibling"},
+		{Path: "pkg/e/e_test.go", Source: "fixup-coupled-test-sibling"},
+		{Path: "pkg/g/grant_test.go", Source: "fixup-coupled-test-sibling"},
+	} {
+		got, ok := foldByPath(prov.Folds, want.Path)
+		if !ok || got != want {
+			t.Errorf("fold %s = %+v (present %v), want %+v", want.Path, got, ok, want)
+		}
+	}
+	if f, ok := foldByPath(prov.Folds, "pkg/d/d_test.go"); ok {
+		t.Errorf("a sub_plan DELETE folded a coupled test sibling %+v; the serve grants none", f)
+	}
+	if prov.UnexplainedCount != 0 {
+		t.Errorf("UnexplainedCount = %d with the fan-out, want 0 (folds %+v)", prov.UnexplainedCount, prov.Folds)
+	}
+
+	// The same DeclaredFiles with the fan-out absent (what the review computed
+	// before #4425): the trigger carries only the flat adds.
+	without := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), prompt.Trigger{AmendedScopeFiles: flat, PriorConcerns: trig.PriorConcerns}, nil, diff, ev)
+	if without == nil || without.UnexplainedCount <= 0 {
+		t.Errorf("without the fan-out: prov = %+v, want a positive residual", without)
+	}
+}
+
 // TestScopeProvenanceForReview_ChannelSourceLabels pins that each fold channel
 // contributes an entry with the correct source label (#1914): approval
 // add_scope_files, approved mid-stage amendment, fix-up allow_create, and the
@@ -6463,7 +6526,7 @@ func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0"})
 		trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
 		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-			provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+			provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 		if prov == nil {
 			t.Fatal("prov = nil, want folds")
 		}
@@ -6478,7 +6541,7 @@ func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
 		seedApprovedAmendment(t, sa, runID, stageID, "pkg/amend.go")
 		s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
 		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-			provenancePlan("pkg/plan.go"), prompt.Trigger{}, provenanceDiff("pkg/plan.go"), nil)
+			provenancePlan("pkg/plan.go"), prompt.Trigger{}, nil, provenanceDiff("pkg/plan.go"), nil)
 		if prov == nil {
 			t.Fatal("prov = nil, want folds")
 		}
@@ -6495,7 +6558,7 @@ func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
 		trig := prompt.Trigger{PriorConcerns: []prompt.PriorConcern{addressedPendingConcern()}}
 		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-			provenancePlan("backend/internal/foo/main.go"), trig, provenanceDiff("backend/internal/foo/main.go"), nil)
+			provenancePlan("backend/internal/foo/main.go"), trig, nil, provenanceDiff("backend/internal/foo/main.go"), nil)
 		if prov == nil {
 			t.Fatal("prov = nil, want folds")
 		}
@@ -6525,6 +6588,7 @@ func TestScopeProvenanceForReview_TouchedMarking(t *testing.T) {
 	// Plan has two files; only one is touched → the other is an untouched plan path.
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
 		provenancePlan("pkg/plan_touched.go", "pkg/plan_untouched.go"), trig,
+		nil,
 		provenanceDiff("pkg/plan_touched.go", "pkg/touched.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
@@ -6553,7 +6617,7 @@ func TestScopeProvenanceForReview_PlanPathDedup(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/dup.go", "pkg/extra.go"}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/dup.go"), trig, provenanceDiff("pkg/dup.go"), nil)
+		provenancePlan("pkg/dup.go"), trig, nil, provenanceDiff("pkg/dup.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
 	}
@@ -6578,7 +6642,7 @@ func TestScopeProvenanceForReview_UnexplainedArithmetic(t *testing.T) {
 
 	// Reconstructed size = 2 (plan + add). DeclaredFiles 5 → residual 3.
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		base(), trig, provenanceDiff("pkg/plan.go"),
+		base(), trig, nil, provenanceDiff("pkg/plan.go"),
 		&prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 5}})
 	if prov == nil || prov.UnexplainedCount != 3 {
 		t.Fatalf("UnexplainedCount = %v, want 3", prov)
@@ -6586,7 +6650,7 @@ func TestScopeProvenanceForReview_UnexplainedArithmetic(t *testing.T) {
 
 	// DeclaredFiles 1 < reconstructed 2 → clamp to 0.
 	provClamp := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		base(), trig, provenanceDiff("pkg/plan.go"),
+		base(), trig, nil, provenanceDiff("pkg/plan.go"),
 		&prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 1}})
 	if provClamp == nil || provClamp.UnexplainedCount != 0 {
 		t.Fatalf("UnexplainedCount = %v, want 0 (clamp)", provClamp)
@@ -6602,13 +6666,13 @@ func TestScopeProvenanceForReview_NilScopeFacts(t *testing.T) {
 
 	// ev nil.
 	if prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil); prov == nil ||
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil); prov == nil ||
 		len(prov.Folds) != 1 || prov.UnexplainedCount != 0 {
 		t.Fatalf("nil ev: prov = %+v, want 1 fold and UnexplainedCount 0", prov)
 	}
 	// ev non-nil but ScopeFacts nil.
 	if prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"),
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"),
 		&prompt.GateEvidence{}); prov == nil || len(prov.Folds) != 1 || prov.UnexplainedCount != 0 {
 		t.Fatalf("nil ScopeFacts: prov = %+v, want 1 fold and UnexplainedCount 0", prov)
 	}
@@ -6623,7 +6687,7 @@ func TestScopeProvenanceForReview_AmendmentListError_BestEffort(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil, want the add fold despite the amendment list error")
 	}
@@ -6647,7 +6711,7 @@ func TestScopeProvenanceForReview_SkippedPathsMarkedTouched(t *testing.T) {
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/", "/abs.go", "../esc.go", "pkg/real.go"}}
 	// Diff touches nothing but the plan file.
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
 	}
@@ -6690,6 +6754,7 @@ func TestScopeProvenanceForReview_ReconstructionParity(t *testing.T) {
 	trig := prompt.Trigger{PriorConcerns: []prompt.PriorConcern{addressedPendingConcern()}}
 	prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
 		provenancePlan("backend/internal/foo/main.go"), trig,
+		nil,
 		provenanceDiff("backend/internal/foo/main.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
@@ -6734,6 +6799,7 @@ func TestScopeProvenanceForReview_ChildScopeAmendmentFold(t *testing.T) {
 	ev := &prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 2}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
 		provenancePlan("backend/internal/foo/main.go"), trig,
+		nil,
 		provenanceDiff("backend/internal/foo/main.go", "backend/internal/foo/childonly.go"), ev)
 	if prov == nil {
 		t.Fatal("prov = nil, want the child-scope-amendment fold")
@@ -6763,6 +6829,7 @@ func TestScopeProvenanceForReview_ChildScopeAmendmentFold(t *testing.T) {
 	// shrinks the residual.
 	provNoFold := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
 		provenancePlan("backend/internal/foo/main.go"), prompt.Trigger{},
+		nil,
 		provenanceDiff("backend/internal/foo/main.go", "backend/internal/foo/childonly.go"), ev)
 	if provNoFold == nil || provNoFold.UnexplainedCount != 1 {
 		t.Fatalf("without the child fold: UnexplainedCount = %v, want 1", provNoFold)
@@ -6776,7 +6843,7 @@ func TestScopeProvenanceForReview_NonDecomposed_NoChildFold(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
 	}
@@ -6826,7 +6893,7 @@ func TestScopeProvenance_RenameSourceIsTouched_2398(t *testing.T) {
 	}}
 
 	prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-		credstoreMovePlan(), prompt.Trigger{}, diff, nil)
+		credstoreMovePlan(), prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want a provenance naming the renames")
 	}
@@ -6907,7 +6974,7 @@ func TestScopeProvenance_CopySourceStaysUntouched(t *testing.T) {
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "pkg/copy.go", OldPath: "pkg/old.go", Status: policy.StatusCopied},
 	}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want an untouched plan path")
 	}
@@ -6944,7 +7011,7 @@ func TestScopeProvenance_RenameOldPathAbsent_Indeterminate(t *testing.T) {
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "pkg/moved.go", Status: policy.StatusRenamed}, // empty OldPath
 	}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want an indeterminate provenance")
 	}
@@ -6991,7 +7058,7 @@ func TestScopeProvenance_CopyOldPathAbsent_NotIndeterminate(t *testing.T) {
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "x.go", Status: policy.StatusCopied}, // empty OldPath
 	}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want an untouched plan path")
 	}
@@ -7035,7 +7102,7 @@ func TestScopeProvenance_FoldedRenameSource_PreservesProvenance(t *testing.T) {
 		renameRow("frontend/added.tsx", "frontend/moved.tsx"),
 	}}
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"frontend/added.tsx"}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, trig, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, trig, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want a provenance naming the folded rename")
 	}
