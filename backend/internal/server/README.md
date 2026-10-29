@@ -117,6 +117,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Decomposition wave-order host-dispatch guard (`decomposition_dispatch_guard.go`, E48.99 / #2546)
 - Per-wave integration guard + `base_branch` derivation (`decomposition_dispatch_guard.go`, E50.13 / #2363)
 - Decomposed-parent fix-up policy increment (#4391)
+- Decomposed-parent review scope baseline (#4425)
 - Concurrency-group promote (`stage_concurrency_promote.go`, E83.81 / [#4191](https://github.com/kuhlman-labs/fishhawk/issues/4191))
 - Stage terminal-wait long-poll (#1252, E24.X)
 - Runner terminal-failure self-report on reap-failure (`reap_failure.go`, E45.73 / #3598)
