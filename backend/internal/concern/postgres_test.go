@@ -12,6 +12,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	concerndb "github.com/kuhlman-labs/fishhawk/backend/internal/concern/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -893,6 +894,98 @@ func TestImportRolledUp_Concurrent(t *testing.T) {
 	}
 	if n := len(h.byRun(t, h.parentRun)); n != 1 {
 		t.Errorf("parent rows after two concurrent imports = %d, want 1", n)
+	}
+}
+
+// TestImportRolledUp_SkipsSourceNoLongerOpen (concern 92d4e9da, C1): a source
+// read open by the caller and superseded before the copy is written — a retry
+// sweep landing between the fan-in's read and its import — gets no copy and
+// keeps an empty outcome. The caller's snapshot still says raised, so only the
+// copy statement's own state re-check can refuse it.
+func TestImportRolledUp_SkipsSourceNoLongerOpen(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 7},
+		concern.RaisedConcern{Severity: "high", Note: "swept before the copy"})[0]
+	if _, err := h.repo.ApplyResolution(context.Background(), src.ID, concern.StateSuperseded, "superseded by stage retry (retry seq 9)"); err != nil {
+		t.Fatalf("supersede source: %v", err)
+	}
+	if src.State != concern.StateRaised {
+		t.Fatalf("precondition: the caller's snapshot reads %s, want the stale raised", src.State)
+	}
+	if copies := h.importSources(t, src); len(copies) != 0 {
+		t.Errorf("copies of a superseded source = %d, want 0: the copy statement must re-check the source is still open", len(copies))
+	}
+	if n := len(h.byRun(t, h.parentRun)); n != 0 {
+		t.Errorf("parent rows = %d, want 0", n)
+	}
+	if got := h.get(t, src.ID); got.Outcome != "" {
+		t.Errorf("superseded source outcome = %q, want empty: a source with no copy is not carried", got.Outcome)
+	}
+}
+
+// TestImportRolledUp_LocksSourceAgainstConcurrentSupersession (concern
+// 92d4e9da, C1): while an import transaction holds its uncommitted copy, a
+// concurrent supersession of the source WAITS for that transaction, so the
+// sweep's later parent-ledger scan sees the committed copy. Deterministic: the
+// test waits until Postgres reports the supersession blocked on a lock (or
+// fails if it completes first), then commits.
+func TestImportRolledUp_LocksSourceAgainstConcurrentSupersession(t *testing.T) {
+	h := newRollupHarness(t)
+	ctx := context.Background()
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 8},
+		concern.RaisedConcern{Severity: "high", Note: "swept during the copy"})[0]
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := concerndb.New(tx).ImportRolledUpReviewConcern(ctx, concerndb.ImportRolledUpReviewConcernParams{
+		ID: uuid.New(), ParentRunID: h.parentRun, ParentStageID: h.parentStage,
+		StateReason: concern.RolledUpStateReason(src), SourceID: src.ID,
+	}); err != nil {
+		t.Fatalf("copy inside the open import transaction: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.repo.ApplyResolution(ctx, src.ID, concern.StateSuperseded, "superseded by stage retry (retry seq 9)")
+		done <- err
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for blocked := false; !blocked; {
+		select {
+		case err := <-done:
+			t.Fatalf("the source's supersession completed (err %v) while the import transaction held an uncommitted copy: the copy statement does not lock its source, so a retry sweep's parent scan can run before the copy exists and strand it raised", err)
+		default:
+		}
+		var waiting int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		blocked = waiting > 0
+		if !blocked && time.Now().After(deadline) {
+			t.Fatal("the source's supersession neither blocked nor completed within 30s")
+		}
+		if !blocked {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit import: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("supersession after the import committed: %v", err)
+	}
+	var copies int
+	for _, r := range h.byRun(t, h.parentRun) {
+		if r.RolledUpFrom != nil && *r.RolledUpFrom == src.ID {
+			copies++
+		}
+	}
+	if copies != 1 {
+		t.Errorf("parent copies visible once the supersession returned = %d, want 1 (the sweep's parent scan must see it)", copies)
+	}
+	if got := h.get(t, src.ID); got.State != concern.StateSuperseded {
+		t.Errorf("source state = %s, want superseded", got.State)
 	}
 }
 

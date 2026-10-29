@@ -193,7 +193,9 @@ func (r *postgresRepo) ImportRolledUp(ctx context.Context, p ImportRolledUpParam
 		switch {
 		case errors.Is(err, pgx.ErrNoRows):
 			// Already imported into this parent (the unique index's
-			// ON CONFLICT DO NOTHING): no second copy.
+			// ON CONFLICT DO NOTHING): no second copy. Or the source is no
+			// longer open — a concurrent sweep closed it after the caller
+			// read it — so no copy, and the carried mark below skips it.
 		case err != nil:
 			return nil, fmt.Errorf("concern: import rolled up %s: %w", src.ID, err)
 		default:

@@ -2663,8 +2663,9 @@ func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to 
 }
 
 // ImportRolledUp mirrors the store's semantics (E94.1 / #4692): a copy per
-// source on the parent run and stage, deduped on (run_id, rolled_up_from), and
-// every source's outcome set to carried (also when its copy already existed).
+// source on the parent run and stage, deduped on (run_id, rolled_up_from), a
+// source whose STORED row is no longer open skipped, and the outcome of every
+// source with a copy set to carried (also when its copy already existed).
 func (f *fakeConcernRepo) ImportRolledUp(_ context.Context, p concern.ImportRolledUpParams) ([]*concern.Concern, error) {
 	if f.importErr != nil {
 		return nil, f.importErr
@@ -2679,12 +2680,17 @@ func (f *fakeConcernRepo) ImportRolledUp(_ context.Context, p concern.ImportRoll
 		if src == nil {
 			continue
 		}
-		exists := false
+		exists, srcOpen := false, false
 		for _, row := range f.rows {
 			if row.RunID == p.ParentRunID && row.RolledUpFrom != nil && *row.RolledUpFrom == src.ID {
 				exists = true
-				break
 			}
+			if row.ID == src.ID && row.State.IsOpen() {
+				srcOpen = true
+			}
+		}
+		if !exists && !srcOpen {
+			continue
 		}
 		if !exists {
 			from := src.ID

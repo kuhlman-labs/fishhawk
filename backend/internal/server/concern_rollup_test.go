@@ -913,3 +913,98 @@ func TestSliceConcernRollup_PostgresCrossLayer(t *testing.T) {
 		t.Errorf("rendered status body lacks the count line:\n%s", body)
 	}
 }
+
+// sweepBeforeImportRepo runs beforeImport once, after importSliceConcerns has
+// read its open sources and before the copies are written: the window a
+// concurrent detached verdict's retry sweep can land in (concern 92d4e9da).
+type sweepBeforeImportRepo struct {
+	concern.Repository
+	beforeImport func()
+	ran          bool
+}
+
+func (r *sweepBeforeImportRepo) ImportRolledUp(ctx context.Context, p concern.ImportRolledUpParams) ([]*concern.Concern, error) {
+	if !r.ran && r.beforeImport != nil {
+		r.ran = true
+		r.beforeImport()
+	}
+	return r.Repository.ImportRolledUp(ctx, p)
+}
+
+// TestSliceConcernRollup_SweepBetweenReadAndImportLeavesNoOpenCopy is approval
+// condition C1 under the fan-in / detached-verdict interleaving (concern
+// 92d4e9da), on Postgres: the fan-in reads the child's open HIGH; the
+// production retry sweep then supersedes it and scans the parent ledger
+// (finding no copy yet); only then does the import write. The parent ledger
+// holds no open copy, the merge leg is unblocked, the source is not carried
+// and no concern_rolled_up row is written.
+func TestSliceConcernRollup_SweepBetweenReadAndImportLeavesNoOpenCopy(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := run.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	concernRepo := &sweepBeforeImportRepo{Repository: concern.NewPostgresRepository(pool)}
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: runRepo, AuditRepo: auditRepo, ConcernRepo: concernRepo})
+
+	mkRun := func(parent *uuid.UUID) (*run.Run, *run.Stage) {
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{Repo: "acme-widgets/storefront", WorkflowID: "feature_change", WorkflowSHA: "cafef00d", TriggerSource: run.TriggerCLI, DecomposedFrom: parent})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		st, err := runRepo.CreateStage(ctx, run.CreateStageParams{RunID: r.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1"})
+		if err != nil {
+			t.Fatalf("create stage: %v", err)
+		}
+		return r, st
+	}
+	parent, _ := mkRun(nil)
+	child, childImpl := mkRun(&parent.ID)
+	seeded, err := concernRepo.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: child.ID, StageID: childImpl.ID, StageKind: concern.StageKindImplement, ReviewerModel: "gpt-6-astra", OriginReviewSequence: 1,
+		Concerns: []concern.RaisedConcern{{Severity: "high", Note: "discarded attempt"}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	src := seeded[0]
+	concernRepo.beforeImport = func() {
+		s.supersedeOpenImplementConcerns(ctx, child.ID, childImpl.ID, "superseded by stage retry (retry seq 9)", nil)
+	}
+
+	if err := s.ImportSliceConcerns(ctx, parent.ID, []uuid.UUID{child.ID}); err != nil {
+		t.Fatalf("ImportSliceConcerns: %v", err)
+	}
+	rows, err := concernRepo.GetByIDs(ctx, []uuid.UUID{src.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !concernRepo.ran || rows[0].State != concern.StateSuperseded {
+		t.Fatalf("precondition: the sweep ran between the read and the import (ran=%v) and superseded the source (state %s)", concernRepo.ran, rows[0].State)
+	}
+	parentRows, err := concernRepo.ListByRun(ctx, parent.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var open []*concern.Concern
+	for _, r := range parentRows {
+		if r.RolledUpFrom != nil && r.State.IsOpen() {
+			open = append(open, r)
+		}
+	}
+	if len(open) != 0 {
+		t.Errorf("open parent copies of a source superseded before the copy was written = %d (states %v), want 0: no parent copy may outlive its source (C1)", len(open), copyStates(open))
+	}
+	if reason, detail, err := s.mergeQueueConcernLeg(ctx, parent); err != nil || reason != "" {
+		t.Errorf("parent merge leg = %q / %q / %v, want unblocked", reason, detail, err)
+	}
+	if rows[0].Outcome != "" {
+		t.Errorf("superseded source outcome = %q, want empty: a source with no copy is not carried", rows[0].Outcome)
+	}
+	entries, err := auditRepo.ListForRunByCategory(ctx, parent.ID, CategoryConcernRolledUp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Errorf("concern_rolled_up rows = %d, want 0 (nothing was imported)", len(entries))
+	}
+}

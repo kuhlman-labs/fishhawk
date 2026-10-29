@@ -515,11 +515,16 @@ type Repository interface {
 	// sequence, reviewer model and role, severity, category, note, evidence,
 	// ingest markers, provenance and check_key verbatim, carries
 	// RolledUpStateReason as its state_reason and links back through
-	// RolledUpFrom. Every source's outcome is set to OutcomeCarried — also when
-	// its copy already existed, so a pass interrupted between the two writes
-	// heals on retry. A source already imported into this parent is skipped
-	// silently: the (run_id, rolled_up_from) unique index is the idempotence
-	// authority. Returns ONLY the newly inserted copies.
+	// RolledUpFrom. Every source with a copy has its outcome set to
+	// OutcomeCarried — also when its copy already existed, so a pass
+	// interrupted between the two writes heals on retry. A source already
+	// imported into this parent is skipped silently: the (run_id,
+	// rolled_up_from) unique index is the idempotence authority. A source no
+	// longer OPEN when its copy is written is skipped too, with no copy and no
+	// carried outcome: the copy statement locks the source and re-checks its
+	// state, so a concurrent retry sweep's supersession either lands first
+	// (no copy) or waits for this transaction (and the sweep's parent scan
+	// sees the copy). Returns ONLY the newly inserted copies.
 	ImportRolledUp(ctx context.Context, p ImportRolledUpParams) ([]*Concern, error)
 
 	// StampOpenAtMerge sets OutcomeOpenAtMerge on every concern of the given

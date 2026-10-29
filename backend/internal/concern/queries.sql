@@ -49,6 +49,19 @@ RETURNING *;
 -- review_concerns_rolled_up_once_idx (0112) is the idempotence authority: a
 -- source already imported into this parent matches the conflict target and
 -- returns no row (pgx.ErrNoRows), never a second copy.
+-- The source is read under FOR NO KEY UPDATE and must still be OPEN (the
+-- state set duplicated from the Go state machine's IsOpen — keep in sync), so
+-- a concurrent retry sweep's supersession of the source either commits first
+-- (this statement re-checks the committed row, matches nothing and returns
+-- pgx.ErrNoRows: no copy) or waits for this transaction to commit (and the
+-- sweep's later parent-ledger scan then sees the copy and supersedes it). No
+-- interleaving leaves a raised copy of a superseded source.
+WITH src AS (
+    SELECT * FROM review_concerns
+     WHERE id = sqlc.arg(source_id)::uuid
+       AND state IN ('raised', 'addressed_pending', 'reopened')
+       FOR NO KEY UPDATE
+)
 INSERT INTO review_concerns (
     id, run_id, stage_id, stage_kind, origin_review_sequence,
     reviewer_model, severity, category, note, state, state_reason,
@@ -61,15 +74,18 @@ SELECT sqlc.arg(id)::uuid, sqlc.arg(parent_run_id)::uuid, sqlc.arg(parent_stage_
        src.suggested_patch, src.new_evidence, src.settled_ref, src.reviewer_role,
        src.quote_unverified, src.severity_clamped_from, src.provenance, src.check_key,
        src.id
-  FROM review_concerns AS src
- WHERE src.id = sqlc.arg(source_id)::uuid
+  FROM src
 ON CONFLICT (run_id, rolled_up_from) WHERE rolled_up_from IS NOT NULL DO NOTHING
 RETURNING *;
 
 -- name: MarkReviewConcernCarried :exec
 -- E94.1 / #4692: record the carried outcome on a source concern imported into
 -- its parent. Touches outcome only — never state, state_reason or updated_at.
-UPDATE review_concerns SET outcome = 'carried' WHERE id = $1 AND outcome IN ('', 'carried');
+-- Only a source that HAS a copy is carried: a source the import skipped
+-- because a concurrent sweep closed it first keeps its outcome.
+UPDATE review_concerns AS src SET outcome = 'carried'
+ WHERE src.id = $1 AND src.outcome IN ('', 'carried')
+   AND EXISTS (SELECT 1 FROM review_concerns AS cp WHERE cp.rolled_up_from = src.id);
 
 -- name: StampReviewConcernsOpenAtMerge :execrows
 -- E94.1 / #4692 (ADR-117 D1): at merge, stamp open_at_merge on every concern
