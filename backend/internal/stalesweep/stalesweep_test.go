@@ -1091,3 +1091,72 @@ func TestFind_AcceptanceInfraFailureParked(t *testing.T) {
 		}
 	})
 }
+
+// TestFind_ImplementInfraFailureParked (T-STALE-1, #4426): the settled walk
+// mirrors Advance's implement park. A stale running run (no PR evidence) whose
+// first-execution implement stage failed category C is NOT settled, so it
+// classifies abandoned; a spent budget, a decomposed parent (plan_decomposed)
+// or a re-opened pass (a stage_fixup_triggered row scoped to the implement
+// stage) is settled and reconciles failed, exactly as Advance would complete
+// it.
+func TestFind_ImplementInfraFailureParked(t *testing.T) {
+	seed := func(m *memRuns, a *memAudit, extra func(r *run.Run, impl *run.Stage)) *run.Run {
+		r := m.addRun(run.StateRunning, stale, nil, "")
+		m.addStage(r.ID, run.StageTypePlan, run.StageStateSucceeded, stale)
+		impl := m.addStage(r.ID, run.StageTypeImplement, run.StageStateFailed, stale)
+		cat := run.FailureC
+		impl.FailureCategory = &cat
+		m.addStage(r.ID, run.StageTypeAcceptance, run.StageStatePending, stale)
+		m.addStage(r.ID, run.StageTypeReview, run.StageStatePending, stale)
+		if extra != nil {
+			extra(r, impl)
+		}
+		return r
+	}
+	scopedRow := func(a *memAudit, r *run.Run, stageID *uuid.UUID, seq int64, category string, payload map[string]any) {
+		a.seed(r.ID, category, stale, payload)
+		a.rows[len(a.rows)-1].StageID = stageID
+		a.rows[len(a.rows)-1].Sequence = seq
+	}
+
+	t.Run("no history: parked, not settled", func(t *testing.T) {
+		m, a := newMemRuns(), newMemAudit()
+		r := seed(m, a, nil)
+		cands, _ := sweep(t, m, a, noRunners, testOpts())
+		if c := candidateFor(t, cands, r.ID); c.Class != ClassAbandoned {
+			t.Fatalf("candidate = %s/%s, want abandoned (a parked implement run is not settled)", c.Class, c.Action)
+		}
+	})
+	settledCases := []struct {
+		name  string
+		extra func(a *memAudit) func(r *run.Run, impl *run.Stage)
+	}{
+		{"three prior parks", func(a *memAudit) func(*run.Run, *run.Stage) {
+			return func(r *run.Run, impl *run.Stage) {
+				for i := 0; i < run.InfraFailureParkRetryBudget; i++ {
+					scopedRow(a, r, &impl.ID, int64(i+1), run.CategoryStageInfraParked, map[string]any{"failed_at": fmt.Sprintf("2026-01-0%dT00:00:00Z", i+1), "retry_ordinal": i})
+				}
+			}
+		}},
+		{"plan_decomposed", func(a *memAudit) func(*run.Run, *run.Stage) {
+			return func(r *run.Run, impl *run.Stage) {
+				scopedRow(a, r, &impl.ID, 1, "plan_decomposed", map[string]any{})
+			}
+		}},
+		{"stage_fixup_triggered on the implement stage", func(a *memAudit) func(*run.Run, *run.Stage) {
+			return func(r *run.Run, impl *run.Stage) {
+				scopedRow(a, r, &impl.ID, 1, "stage_fixup_triggered", map[string]any{})
+			}
+		}},
+	}
+	for _, tc := range settledCases {
+		t.Run(tc.name+": settled failed", func(t *testing.T) {
+			m, a := newMemRuns(), newMemAudit()
+			r := seed(m, a, tc.extra(a))
+			cands, _ := sweep(t, m, a, noRunners, testOpts())
+			if c := candidateFor(t, cands, r.ID); c.Class != ClassStagesSettled || c.Action != ActionReconcileFailed || c.Target != run.StateFailed {
+				t.Fatalf("candidate = %s/%s/%s, want stages_settled/reconcile_failed/failed", c.Class, c.Action, c.Target)
+			}
+		})
+	}
+}

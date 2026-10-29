@@ -4829,6 +4829,12 @@ type Campaign struct {
 	// its own working_dir, and a local one without either is refused). Mirrors
 	// Run.WorkingDir.
 	WorkingDir string `json:"working_dir,omitempty" jsonschema:"the absolute checkout path bound to this campaign; every item run minted from it inherits this unless the per-item call overrides it. Absent when the campaign carries no binding"`
+	// RunnerKind is the campaign-level runner kind (#4485): the runner_kind
+	// every item run minted from this campaign inherits when
+	// fishhawk_start_campaign_item_run passes none. Omitted when the campaign
+	// records none (item runs then resolve 'local' from a working_dir binding,
+	// else github_actions).
+	RunnerKind string `json:"runner_kind,omitempty" jsonschema:"the runner kind recorded on this campaign ('local', 'github_actions' or 'gitlab_ci'); every item run minted from it inherits this unless the per-item call overrides it. Absent when the campaign records none: item runs then take 'local' when the campaign binds working_dir, else github_actions"`
 	// GroomingSource is the DURABLE provenance of a campaign created from an
 	// approved grooming run's ratified order (E54.6 / #2238), read back from the
 	// campaigns.grooming_source column — so it is present on every read of the
@@ -5051,6 +5057,11 @@ type campaignCreateRequest struct {
 	// an empty value so a campaign without a binding sends no working_dir key.
 	// The backend validates it is absolute (400 validation_failed otherwise).
 	WorkingDir string `json:"working_dir,omitempty"`
+	// RunnerKind is the OPTIONAL campaign-level runner kind (#4485) every item
+	// run minted from the campaign inherits. omitempty drops an empty value so a
+	// campaign that records none sends no runner_kind key. The backend validates
+	// it against the known runner kinds (400 validation_failed otherwise).
+	RunnerKind string `json:"runner_kind,omitempty"`
 	// GroomingSource is the OPTIONAL THIRD campaign source (E54.6 / #2238): an
 	// approved grooming run whose ratified priority order becomes the campaign
 	// queue. A nil pointer drops the key entirely, so a campaign created from an
@@ -5469,20 +5480,34 @@ type startCampaignItemRunRequest struct {
 
 // StartCampaignItemRunResult mirrors the backend's POST
 // /v0/campaigns/{campaign_id}/runs 201 body: the minted run plus the linked
-// campaign item (now running, with run_id set).
+// campaign item (now running, with run_id set), and the runner-kind resolution
+// that chose the run's runner_kind (#4485). RunnerKindResolution is nil only
+// against a backend that predates it.
 type StartCampaignItemRunResult struct {
-	Run  Run          `json:"run"`
-	Item CampaignItem `json:"item"`
+	Run                  Run                           `json:"run"`
+	Item                 CampaignItem                  `json:"item"`
+	RunnerKindResolution *campaignRunnerKindResolution `json:"runner_kind_resolution,omitempty"`
+}
+
+// campaignRunnerKindResolution mirrors the backend's runner_kind_resolution
+// block (#4485): the runner kind the minted item run was given and the ladder
+// rung that chose it.
+type campaignRunnerKindResolution struct {
+	RunnerKind string `json:"runner_kind" jsonschema:"the runner kind the minted run was given"`
+	Source     string `json:"source" jsonschema:"why it applied: 'explicit' (the per-item runner_kind), 'campaign' (the campaign's recorded runner_kind), 'campaign_working_dir' (the campaign records none but binds working_dir, so local) or 'default' (neither, so github_actions)"`
 }
 
 // StartCampaignItemRun starts a run for an eligible campaign item via
 // `POST /v0/campaigns/{campaign_id}/runs` (E26.2 / #1481) — the operator-driven,
 // campaign-aware run start that DAG-gates each run and links it to the campaign
 // so the rollup advances as the operator drives the loop. workflowRef empty =
-// the repo's default branch; runnerKind empty = github_actions ("local" for the
-// local dogfood loop). A write tool: requires write:campaigns. 4xx/5xx surfaces:
+// the repo's default branch; runnerKind empty lets the backend resolve it
+// (#4485): the campaign's recorded runner_kind, else local when the campaign
+// binds working_dir, else github_actions — the result's RunnerKindResolution
+// names which. A write tool: requires write:campaigns. 4xx/5xx surfaces:
 //   - 400 validation_failed (campaign_id not a UUID, empty issue_ref/workflow_id,
-//     bad runner_kind, unknown fields)
+//     bad runner_kind, unknown fields, or an invalid runner_kind INHERITED from
+//     the campaign row, #4485)
 //   - 403 insufficient_scope (token lacks write:campaigns)
 //   - 404 campaign_not_found / campaign_item_not_found
 //   - 409 campaign_not_startable (the campaign is paused, cancelled or
@@ -5492,7 +5517,8 @@ type StartCampaignItemRunResult struct {
 //   - 400 validation_failed (a non-absolute working_dir; E48.69 / #2498 — the
 //     backend refuses a relative binding the same way POST /v0/runs does — or a
 //     non-absolute binding INHERITED from the campaign row, E48.87 / #2527)
-//   - 400 working_dir_required (a local item whose campaign carries no
+//   - 400 working_dir_required (an item whose RESOLVED runner kind is local —
+//     passed, or recorded on the campaign (#4485) — whose campaign carries no
 //     working_dir binding and whose call passed none; E48.87 / #2527 — bind it
 //     once at start_campaign, or pass it for this item)
 //   - 502 campaign_run_start_failed (the installation/spec could not be resolved)

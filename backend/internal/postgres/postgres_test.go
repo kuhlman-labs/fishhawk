@@ -8667,6 +8667,70 @@ WHERE table_name = 'merge_candidate_queue_entries' AND column_name = 'order_key'
 	}
 }
 
+// TestMigrateDown_CampaignsRunnerKindReversal pins 0113 (#4485): MigrateUp
+// adds campaigns.runner_kind, rolling back through 0113 drops it while the
+// campaigns table survives, and a row written BEFORE the column existed reads
+// back empty (never NULL) once 0113 is re-applied — the not-recorded default every
+// pre-existing campaign takes.
+func TestMigrateDown_CampaignsRunnerKindReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	runnerKindColumn := func() int {
+		var n int
+		if err := pool.QueryRow(ctx,
+			`SELECT count(*) FROM information_schema.columns
+			  WHERE table_name = 'campaigns' AND column_name = 'runner_kind'`).Scan(&n); err != nil {
+			t.Fatalf("query campaigns.runner_kind: %v", err)
+		}
+		return n
+	}
+
+	if n := runnerKindColumn(); n != 1 {
+		t.Errorf("campaigns.runner_kind count after MigrateUp = %d, want 1 (0113 added it)", n)
+	}
+
+	downThrough(t, url, "0113")
+	if n := runnerKindColumn(); n != 0 {
+		t.Errorf("campaigns.runner_kind count after MigrateDown = %d, want 0 (0113 reverted)", n)
+	}
+	var campaignsTable int
+	if err := pool.QueryRow(ctx,
+		`SELECT count(*) FROM information_schema.tables WHERE table_name = 'campaigns'`).Scan(&campaignsTable); err != nil {
+		t.Fatalf("query campaigns table: %v", err)
+	}
+	if campaignsTable != 1 {
+		t.Errorf("'campaigns' table count after MigrateDown = %d, want 1 (0113 is an ALTER)", campaignsTable)
+	}
+
+	// A pre-0113 row, inserted without the column, takes the DEFAULT when 0113
+	// is re-applied.
+	id := uuid.New()
+	if _, err := pool.Exec(ctx,
+		`INSERT INTO campaigns (id, repo, epic_ref, state) VALUES ($1, 'acme/widgets', 'issue:1', 'pending')`, id); err != nil {
+		t.Fatalf("insert pre-0113 campaign: %v", err)
+	}
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp again: %v", err)
+	}
+	var rk *string
+	if err := pool.QueryRow(ctx, `SELECT runner_kind FROM campaigns WHERE id = $1`, id).Scan(&rk); err != nil {
+		t.Fatalf("read runner_kind of pre-0113 campaign: %v", err)
+	}
+	if rk == nil || *rk != "" {
+		t.Errorf("pre-0113 campaign runner_kind after re-applying 0113 = %v, want '' (not recorded, never NULL)", rk)
+	}
+}
+
 // TestIsTransientPGRefusal: the raw-database drop retries only a server
 // refusal (also through a connect error's wrap), never another failure.
 func TestIsTransientPGRefusal(t *testing.T) {

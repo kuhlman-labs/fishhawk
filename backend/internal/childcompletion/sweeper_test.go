@@ -1859,3 +1859,66 @@ func TestTick_CancelledParentAllChildrenCancelled_SettlesStageNoAdvance(t *testi
 		t.Errorf("Advance calls = %v, want exactly [%s] (today's run-state-blind behaviour)", ad.advanced, parentRun.ID)
 	}
 }
+
+// TestTick_InfraParkedChildKeepsParentAwaiting (T-SWEEP-1, #4426): a child
+// whose implement stage failed category C on its first execution is PARKED —
+// it stays running with a failed, retry-eligible implement stage — so the
+// sweeper treats it as any other non-terminal child: the parent stays in
+// awaiting_children, Advance is never called and no children_settled row is
+// written. Once the retried child succeeds, the next Tick settles the parent.
+func TestTick_InfraParkedChildKeepsParentAwaiting(t *testing.T) {
+	parentRun := uuid.New()
+	parentStage := &run.Stage{ID: uuid.New(), RunID: parentRun, State: run.StageStateAwaitingChildren}
+	c2 := mkChild(uuid.New(), run.StateRunning)
+
+	rs := &fakeRunRepo{
+		awaitingChildren: []*run.Stage{parentStage},
+		childrenByParent: map[uuid.UUID][]*run.Run{
+			parentRun: {mkChild(uuid.New(), run.StateSucceeded), c2},
+		},
+		stagesByRun: map[uuid.UUID][]*run.Stage{
+			c2.ID: {mkFailedImplement(c2.ID, run.FailureC, "runner_lost")},
+		},
+	}
+	au := &fakeAudit{}
+	ad := &recordingAdvancer{}
+	s := &Sweeper{Runs: rs, Audit: au, Advance: ad, Logger: slog.Default()}
+
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	if len(rs.transitions) != 0 {
+		t.Errorf("transitions = %d, want 0 while a child is parked", len(rs.transitions))
+	}
+	rs.mu.Unlock()
+	au.mu.Lock()
+	if len(au.appended) != 0 {
+		t.Errorf("audit appended = %v, want none while a child is parked", au.appended)
+	}
+	au.mu.Unlock()
+	if len(ad.advanced) != 0 {
+		t.Errorf("Advance calls = %v, want none while a child is parked", ad.advanced)
+	}
+
+	// The operator retried C2 and it succeeded.
+	rs.mu.Lock()
+	c2.State = run.StateSucceeded
+	rs.mu.Unlock()
+	if err := s.Tick(context.Background()); err != nil {
+		t.Fatalf("Tick: %v", err)
+	}
+	rs.mu.Lock()
+	defer rs.mu.Unlock()
+	if len(rs.transitions) != 1 || rs.transitions[0].To != run.StageStateSucceeded {
+		t.Fatalf("transitions = %+v, want one -> succeeded", rs.transitions)
+	}
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	if len(au.appended) != 1 || au.appended[0].Category != "children_settled" {
+		t.Errorf("audit appended = %v, want one children_settled", au.appended)
+	}
+	if len(ad.advanced) != 1 || ad.advanced[0] != parentRun {
+		t.Errorf("Advance calls = %v, want [%s]", ad.advanced, parentRun)
+	}
+}
