@@ -2238,6 +2238,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Plan seed (#4436): the commit the plan agent's tree sits at as it starts
+	// — after the lineage-worktree relocation of cfg.workingDir and every
+	// pre-agent HEAD move (none of which apply to a plan stage). Gated on the
+	// predicate the post-invoke plan upload uses, which ships it so the plan
+	// review grounds there. Captured BEFORE the watcher goroutine below starts:
+	// that closure reads cfg, so a later write would race it.
+	if cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+		cfg.planSeedSHA = capturePlanSeed(ctx, cfg.workingDir, logSink)
+	}
+
 	// Mid-stage scope-amendment watcher (#1035): for implement stages,
 	// emit an in-band scope_amendment_pending event the moment the agent
 	// files a request, so the fishhawk_run_stage relay surfaces the
@@ -3958,6 +3968,7 @@ func uploadPlan(ctx context.Context, cfg config, logSink io.Writer, client uploa
 		Plan:         planBytes,
 		PrivateKey:   issued.PrivateKey,
 		Reachability: analyzePlanReachability(cfg, planBytes, logSink),
+		SeedSHA:      cfg.planSeedSHA,
 	})
 	if err != nil {
 		return fmt.Errorf("ship plan: %w", err)

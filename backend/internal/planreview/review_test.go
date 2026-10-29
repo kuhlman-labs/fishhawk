@@ -1266,6 +1266,18 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 			},
 			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","round_origin":"fixup_push","round_base_sha":"b1","redispatch_of":41,"redispatch_depth":2}`,
 		},
+		{
+			// #4436: a plan round that resolved its seed records it.
+			name: "plan path seed sha only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory"), SeedSHA: "s1"},
+			want: `{"configured_agents":2,"authority":"advisory","seed_sha":"s1"}`,
+		},
+		{
+			// #4436: a plan round with no resolved seed records why.
+			name: "plan path seed unresolved only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory"), SeedUnresolved: "seed_not_recorded"},
+			want: `{"configured_agents":2,"authority":"advisory","seed_unresolved":"seed_not_recorded"}`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

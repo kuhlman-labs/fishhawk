@@ -29,11 +29,15 @@ type groundingFakeReviewer struct {
 	treeDir            string
 	prompt             string
 	dirExistedAtReview bool
-	reviewGroundedHit  bool
-	started            chan struct{}
-	release            chan struct{}
-	verdict            *planreview.ReviewVerdict
-	model              string
+	// treeFiles lists the export's top-level entries AT REVIEW TIME (the
+	// export is removed once the loop returns), so a test can tell WHICH
+	// commit was archived (#4436).
+	treeFiles         []string
+	reviewGroundedHit bool
+	started           chan struct{}
+	release           chan struct{}
+	verdict           *planreview.ReviewVerdict
+	model             string
 	// err, when non-nil, is returned from the review call instead of a verdict —
 	// the reviewer-transport-failure branch (#2486 C6 failure path). The record
 	// still runs first, so treeDir is captured before the error returns.
@@ -62,6 +66,12 @@ func (g *groundingFakeReviewer) record(ctx context.Context, treeDir, promptText 
 	if treeDir != "" {
 		_, err := os.Stat(treeDir)
 		g.dirExistedAtReview = err == nil
+		g.treeFiles = nil
+		if ents, rerr := os.ReadDir(treeDir); rerr == nil {
+			for _, e := range ents {
+				g.treeFiles = append(g.treeFiles, e.Name())
+			}
+		}
 	}
 	g.mu.Unlock()
 	if g.started != nil {
@@ -630,17 +640,19 @@ func TestImplementReviewGrounded_MixedPanelUngroundedThroughLoop(t *testing.T) {
 
 // TestPlanReviewGrounded_AdvisoryExportsAndCleansUp covers the plan.go grounding
 // path (#2486): an advisory plan review over a run with a working dir exports the
-// resolved HEAD, the grounding-capable reviewer receives the tree and a prompt
-// naming the commit, and the export is removed after the detached loop returns.
+// recorded plan seed (#4436; here the fixture's only commit), the
+// grounding-capable reviewer receives the tree and a prompt naming the commit,
+// and the export is removed after the detached loop returns.
 func TestPlanReviewGrounded_AdvisoryExportsAndCleansUp(t *testing.T) {
-	repo, _ := gitFixtureRepo(t)
+	repo, headSHA := gitFixtureRepo(t)
 	runID, stageID := uuid.New(), uuid.New()
 	reviewer := &groundingFakeReviewer{
 		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
 		model:   "claude-sonnet-4-6",
 	}
-	s, _, _, _, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
+	s, _, _, au, rr := newPlanServerWithReviewer(t, runID, stageID, reviewer, specAdvisoryReviewers)
 	rr.getRuns[runID].WorkingDir = repo
+	seedPlanGeneratedSeed(t, au, runID, stageID, headSHA)
 
 	if s.runPlanReviews(context.Background(), runID, stageID, validPlanBytes(t), nil, nil, nil, nil, nil) {
 		t.Fatal("advisory runPlanReviews returned true")
