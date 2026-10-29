@@ -367,7 +367,9 @@ func TestForgeApprovalFold_Table(t *testing.T) {
 }
 
 // TestForgeApprovalFold_PermissionCap: 11 candidates, the first 10 read and
-// the 11th write, is undetermined with ZERO permission reads.
+// the 11th write, is undetermined with ZERO permission reads: the cap is
+// judged on the candidate count BEFORE any permission read, so no reviewer's
+// permission (rev101..rev111) is read at all.
 func TestForgeApprovalFold_PermissionCap(t *testing.T) {
 	f := newMCQFixture(t)
 	var nodes []mcqReviewNode
@@ -384,6 +386,12 @@ func TestForgeApprovalFold_PermissionCap(t *testing.T) {
 	d := faFold(t, f, r, faHead)
 	if d.Result != forgeApprovalUndetermined || d.Reason != forgeApprovalReasonPermissionCap {
 		t.Fatalf("fold = %s/%s, want undetermined/%s", d.Result, d.Reason, forgeApprovalReasonPermissionCap)
+	}
+	for i := int64(101); i <= 111; i++ {
+		login := "rev" + strconv.FormatInt(i, 10)
+		if n := f.gh.permissionCalls(login); n != 0 {
+			t.Errorf("permission reads for %s = %d, want 0 (the cap is judged before any read)", login, n)
+		}
 	}
 }
 
