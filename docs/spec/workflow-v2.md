@@ -27,13 +27,15 @@ review_conventions:     # optional; named review-convention documents, selected 
   <convention_name>: {path: ...}
 reviewer_personas:      # optional; named reviewer personas (model config + remit + optional decision record), attached per stage
   <persona_name>: {agent: {provider: ...}, remit: {path: ...}}
+verdict_transfer:       # optional; the repository's verdict-transfer surface (ADR-124)
+  global_surface: [...]
 workflows:              # required; at least one workflow
   <workflow_id>:
     description: "..."
     stages: [...]
 ```
 
-The document root is closed (`additionalProperties: false`) over exactly these six keys: `version`, `defaults`, `test_conventions`, `review_conventions`, `reviewer_personas`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
+The document root is closed (`additionalProperties: false`) over exactly these seven keys: `version`, `defaults`, `test_conventions`, `review_conventions`, `reviewer_personas`, `verdict_transfer`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
 
 `<workflow_id>` and every stage `id` are `snake_case` — `^[a-z][a-z0-9_]*$`.
 
@@ -1619,6 +1621,48 @@ reviewer_personas:
 
 **Not yet.** `severity_cap` is grammar only until E55.10 (#3755) clamps a persona's concerns at ingest and attributes them by reviewer role. Runner-hosted reviewers (E63 / #2307) must carry personas when they land (ADR-084 rule 6).
 
+## Verdict transfer (`verdict_transfer`)
+
+An optional **top-level** `verdict_transfer` block declaring the repository's **merge-candidate verdict-transfer surface** (ADR-124 / #4657, amending ADR-098). ADR-096 verdict transfer lets a merge candidate keep its verify verdict across a base advance when the base delta and the pull request's own delta are independent; the daemon's transfer mode (`off` | `shadow` | `enforce`, default `shadow`) decides whether a transfer decision is only recorded or acted on. The surface is the repository's to declare (ADR-110): the product carries no built-in pattern set and never applies one implicitly.
+
+```yaml
+verdict_transfer:
+  global_surface:            # verdict-wide (G): a change here always re-verifies
+    - "go.work"
+    - "**/go.mod"
+    - "ci/**"
+  shared_artifact_dirs:      # directories both deltas may meet in
+    - "web/"
+  doc_check_inputs: []       # doc-check (D) inputs
+  inert_paths:               # paths no verify input reads
+    - "**/README.md"
+    - "docs/**"
+  opaque_paths: []           # subtrees the classifier must not reason about
+  completeness_check: "go test ./internal/coverage -run TestDeclarationComplete"
+```
+
+Quote every entry: a bare `**` scalar is a YAML alias.
+
+- **One block per repository.** `verdict_transfer` sits at the document root, never inside a workflow, so no workflow can carry a narrower surface.
+- **Read from the admission spec.** The block is resolved from the run's cached **admission** spec, never from a checkout, so a pull request cannot change the surface its own transfer decision uses, and an edit applies to runs admitted after it merges. A change to the workflow spec itself (`.fishhawk/workflows.yaml`) always forces the pass, whatever the block declares: the spec is self-covering.
+- **Members.** No member is required and no list has a minimum length; the schema enforces only the member types and the closed member set (an unknown member is refused at admission).
+  - **`global_surface`** — the ADR-098 D1 verdict-wide (G) class: root-anchored doublestar patterns over repository-relative, slash-separated paths. A changed path matching one, on either delta, forces the pass.
+  - **`shared_artifact_dirs`** — ADR-096 D1(d) shared-artifact directory prefixes, each ending in `/`. A pull-request path and a base-delta path that any declared directory both contain are dependent, whatever else covers them.
+  - **`doc_check_inputs`** — the ADR-098 D1 doc-check (D) inputs. Until ADR-098's D-i/D-ii relaxation lands (#4317), a match on either side forces the pass (`doc_check:<path>`).
+  - **`inert_paths`** — declared-inert patterns, consulted only for a changed path that no other class covers.
+  - **`opaque_paths`** — subtrees whose change refuses transfer (`undecidable:opaque_path:<path>`).
+  - **`completeness_check`** — a declarative reference naming the conformance test or harness that proves the declaration covers every verify input (ADR-124 D4). fishhawkd never executes, evaluates or interpolates it; only its presence matters.
+- **Refusals, not admission failures.** An empty, incomplete or malformed declaration still parses; the classifier refuses transfer for it and the merge-candidate pass runs:
+  - no block → `undecidable:surface_undeclared` (a v0/v1 spec, which cannot declare one, never transfers);
+  - no `global_surface` entry → `undecidable:surface_incomplete`;
+  - a malformed entry (a pattern syntax error, an absolute or non-canonical path, a directory not ending in `/`) → `undecidable:invalid_surface:<entry>`;
+  - no supported import-graph adapter for the **workspace** → `undecidable:unsupported_language`. Today the one adapter is Go, and it applies when a `go.work` or `go.mod` sits at the repository root; a Go module nested elsewhere in the tree is not sufficient;
+  - a changed path that no class covers → `undecidable:unclassified_path`.
+- **Precedence.** Inside a supported workspace every changed path, on both deltas, is classified by the first match of: `global_surface`, then `opaque_paths`, then the adapter's import-graph coverage (a non-Go path under a package directory belongs to that package), then `inert_paths`. An inert entry never removes a path from graph reach or from the shared-artifact rule; it only stops an otherwise-unclassified path from refusing. Inertness is declared, never defaulted.
+- **Prospective coverage.** A valid pattern that matches no current file is not an error: it is recorded on the transfer row as a diagnostic and never refused, and it is not evidence of completeness.
+- **Enforce waits for a completeness check.** Enforce mode acts only for a declaration naming `completeness_check`; without one (absent, empty or whitespace only) the repository's decisions stay in shadow.
+- **Recorded identity.** Every transfer and shadow row records the classifier version, the declaration's content digest and its admission provenance.
+
 ## Identifier namespaces
 
 | Field | Pattern / values | Notes |
@@ -1705,6 +1749,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, `max_autonomy` may not leave the resolved matrix identical, and `require.reviewers` must name declared personas, have an agent-reviewing `plan` / `implement` stage to join, and not name a persona every such stage already attaches. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 - Every `reviewer_personas` entry's `remit.path` — and its `decision_record.index`, when declared — is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document or required by at least one escalation's `require.reviewers` (see [Reviewer personas](#reviewer-personas)).
+- `verdict_transfer` carries **no** rule here, deliberately: an empty, incomplete or malformed declaration still validates, and the merge-candidate classifier refuses transfer for it instead (see [Verdict transfer](#verdict-transfer-verdict_transfer)), so a bad declaration never blocks a repository's unrelated runs.
 
 `fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), the `agent_instruction_paths` implement-only and `writable`-entry rules (E80.12 / #3942), the post-deploy acceptance `deployment`-input bindings (E35.1 / #1598), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.
 
@@ -1755,7 +1800,7 @@ A predicate carries four optional criteria, each a non-empty list:
 
 ## Control surface: what is enforced, and where
 
-The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`, `review_conventions`, `reviewer_personas`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
+The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, `permissions`, `review_conventions`, `reviewer_personas`, `verdict_transfer`) do **not** share one enforcement status, and reading them as if they did — "declared, therefore guaranteed", or the tidier and equally false "everything here is unenforced" — misstates what the product actually holds. This table is the consolidated per-control account. It states nothing the sections above do not; it keeps the honest split in one place so no reader has to reassemble it. A "declared" control is validated, audited and surfaced, but it is not a guarantee until a seam reads it. The same split, in the same words, governs this repository's own governance in [`docs/METHODOLOGY.md`](../METHODOLOGY.md); the two are written to be read against each other.
 
 | Control | What it constrains | Enforcement status |
 |---|---|---|
@@ -1765,6 +1810,7 @@ The control-surface fields (`reviewers.authority`, `applies_to`, `escalations`, 
 | `escalations` | Raises the approval count, membership conjunction, minimum permission, or autonomy ceiling for a change matching a predicate, or attaches a reviewer persona to its review (`require.reviewers`). | **Enforced where declared**, at the approval gate and in delegation resolution, and — for `require.reviewers` — at the plan- and implement-review loops; a workflow declaring none short-circuits before any extra read. A `match.paths` criterion is **refused at validation on a workflow that declares no plan stage** — no `scope.files` producer, so it could never fire (E53.16 / #2382). The *mechanism* is shipped and tested; whether it holds on any given path depends on a declaration existing there. See [Escalations](#escalations). |
 | `review_conventions` / `reviewers.conventions` | Which repo-declared convention documents a plan or implement stage's agent reviewers are handed, how severely a finding resting on one may be weighed (`severity_cap`), and whether a missing document fails the review (`required`). | **Enforced at the review loop** (E55.3 / #2244): selected conventions are resolved at the run's admission commit and rendered into the review prompt; `severity_cap` is clamped server-side at verdict ingest; a missing required document fails the review closed; an implement diff editing a declared conventions file draws exactly one `conventions_file_modified` concern per round (server-added when no reviewer raised it and none is already open, waived or deferred); a `conventions_override_attempt` concern cannot be routed to a fix-up. Whether a model reports rather than follows an override is **not** enforced — a quality aid under a protected declaration. See [Runtime semantics](#runtime-semantics-e553--2244). |
 | `reviewer_personas` / `reviewers.personas` | Which named personas (a model configuration plus a remit document) review a plan or implement stage as extra reviewer invocations with their own prompts. | **Enforced at the review loop** for attachment and remit injection: each attached persona runs with the stage's authority and counts toward the round, and an unresolvable remit fails closed for that persona only (`persona_remit_unavailable`) — except that, under gating authority, an escalation-attached persona that cannot run fails the reviewed stage with a named `escalation_persona_unavailable` reason (#3913). A persona an escalation's `require.reviewers` names attaches only to a review whose paths match it (E55.9 / #3754). A persona's `decision_record` injects the index and the records whose `applies_to` matches the change, base-pinned and within the injection cap, into that persona's prompt only; an unreadable index or record fails closed for that persona only (E78.5 / #3756). `remit.severity_cap` is **validated only** until E55.10 (#3755). See [Reviewer personas](#reviewer-personas). |
+| `verdict_transfer` | Whether a merge candidate may keep its verify verdict across a base advance (ADR-124). | **Read from the run's admission spec at the merge-candidate transfer decision**, never at admission: every undecidable case refuses transfer and the pass runs. The daemon's transfer mode decides whether a decision is recorded only (`shadow`, the default) or acted on (`enforce`), and enforce acts only for a declaration naming `completeness_check`. |
 | `permissions.network` | The egress host(s) a stage's agent may reach. | **Enforced on an agent-executor `acceptance` stage**, where it normalizes into `egress` and the runner's default-deny proxy applies it — the pre-existing ADR-050 control. On **every other stage** it is a declaration only, until E51 (#2133). The run-status per-entry `enforced` flag encodes exactly this split. |
 | `permissions.write` | The paths a stage's agent is expected to write. | Declared, audited (`stage_permissions_declared`) and surfaced (`permissions[]`), but **not enforced anywhere**, until E51 (#2133). |
 | `permissions.shell` | The stage's shell posture (`none` / `restricted` / `unrestricted`). | Declared, audited and surfaced, but **not enforced anywhere**, until E51 (#2133). |

@@ -3,6 +3,7 @@ package basedelta
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -21,11 +22,20 @@ func pkg(dir, moduleDir string, importDirs ...string) Package {
 	return Package{ImportPath: modPrefix + dir, Dir: dir, ModuleDir: moduleDir, Imports: imps}
 }
 
-// fakeLoader serves a fixed graph (or error) per workspace dir.
+// fakeLoader serves a fixed graph (or error) per workspace dir; a workspace
+// in unsupported has no adapter (Supports refuses it) whatever Load serves.
 type fakeLoader struct {
-	graphs map[string]*Graph
-	errs   map[string]error
-	panics bool
+	graphs      map[string]*Graph
+	errs        map[string]error
+	unsupported map[string]bool
+	panics      bool
+}
+
+func (f *fakeLoader) Supports(ws string) error {
+	if f.unsupported[ws] {
+		return fmt.Errorf("%w: fake", ErrUnsupportedLanguage)
+	}
+	return nil
 }
 
 func (f *fakeLoader) Load(_ context.Context, ws string) (*Graph, error) {
@@ -52,6 +62,9 @@ func baseGraph() *Graph {
 	})
 }
 
+// goModSurface is a minimal valid declaration: G covers go.mod only.
+var goModSurface = &Surface{Global: []string{"go.mod"}}
+
 func oneWS(g *Graph) *Classifier {
 	return &Classifier{Loader: &fakeLoader{graphs: map[string]*Graph{"ws": g}}}
 }
@@ -72,6 +85,10 @@ func TestClassify_Table(t *testing.T) {
 		pkg("backend/internal/r", "backend", "backend/internal/p"),
 	})
 	two := &Classifier{Loader: &fakeLoader{graphs: map[string]*Graph{"bprime": hPrime, "head": head}}}
+	// This repository's golden: every pre-declaration result holds under its
+	// declaration (README.md is independent via the inert class, frontend/*
+	// stays shared_artifact, tools/x.go stays unmapped_go_path).
+	surface := thisRepoSurface(t)
 
 	cases := []struct {
 		name       string
@@ -141,7 +158,7 @@ func TestClassify_Table(t *testing.T) {
 			if ws == nil {
 				ws = []string{"ws"}
 			}
-			got := tc.c.Classify(context.Background(), Input{DeltaPaths: tc.delta, PRPaths: tc.pr, Workspaces: ws})
+			got := tc.c.Classify(context.Background(), Input{DeltaPaths: tc.delta, PRPaths: tc.pr, Workspaces: ws, Surface: surface})
 			if got != tc.want {
 				t.Fatalf("Classify = %+v, want %+v", got, tc.want)
 			}
@@ -154,9 +171,10 @@ func TestClassify_Table(t *testing.T) {
 func TestClassify_NonCanonicalGlobalPathNeverIndependent(t *testing.T) {
 	t.Parallel()
 	c := oneWS(baseGraph())
+	s := thisRepoSurface(t)
 	for _, in := range []Input{
-		{DeltaPaths: []string{"./docs/ARCHITECTURE.md"}, PRPaths: []string{"backend/internal/d/d.go"}, Workspaces: []string{"ws"}},
-		{DeltaPaths: []string{"backend/internal/d/d.go"}, PRPaths: []string{"./docs/ARCHITECTURE.md"}, Workspaces: []string{"ws"}},
+		{DeltaPaths: []string{"./docs/ARCHITECTURE.md"}, PRPaths: []string{"backend/internal/d/d.go"}, Workspaces: []string{"ws"}, Surface: s},
+		{DeltaPaths: []string{"backend/internal/d/d.go"}, PRPaths: []string{"./docs/ARCHITECTURE.md"}, Workspaces: []string{"ws"}, Surface: s},
 	} {
 		got := c.Classify(context.Background(), in)
 		if got.Independent || got.Reason != "undecidable:invalid_path:./docs/ARCHITECTURE.md" {
@@ -172,6 +190,7 @@ func TestClassify_LoaderError(t *testing.T) {
 		DeltaPaths: []string{"backend/internal/a/README.md"},
 		PRPaths:    []string{"backend/internal/d/notes.txt"},
 		Workspaces: []string{"ws"},
+		Surface:    goModSurface,
 	})
 	if got != (Result{false, "undecidable:load:go list: package x: boom"}) {
 		t.Fatalf("Classify = %+v", got)
@@ -181,7 +200,7 @@ func TestClassify_LoaderError(t *testing.T) {
 func TestClassify_NilGraph(t *testing.T) {
 	t.Parallel()
 	c := &Classifier{Loader: &fakeLoader{graphs: map[string]*Graph{}}}
-	got := c.Classify(context.Background(), Input{DeltaPaths: []string{"README.md"}, PRPaths: []string{"x.txt"}, Workspaces: []string{"ws"}})
+	got := c.Classify(context.Background(), Input{DeltaPaths: []string{"README.md"}, PRPaths: []string{"x.txt"}, Workspaces: []string{"ws"}, Surface: goModSurface})
 	if got != (Result{false, "undecidable:load:nil_graph"}) {
 		t.Fatalf("Classify = %+v", got)
 	}
@@ -189,7 +208,7 @@ func TestClassify_NilGraph(t *testing.T) {
 
 func TestClassify_GuardInputs(t *testing.T) {
 	t.Parallel()
-	in := Input{DeltaPaths: []string{"README.md"}, PRPaths: []string{"x.txt"}, Workspaces: []string{"ws"}}
+	in := Input{DeltaPaths: []string{"README.md"}, PRPaths: []string{"x.txt"}, Workspaces: []string{"ws"}, Surface: goModSurface}
 	var nilC *Classifier
 	if got := nilC.Classify(context.Background(), in); got.Reason != "undecidable:nil_classifier" {
 		t.Fatalf("nil classifier = %+v", got)
@@ -217,7 +236,7 @@ func TestClassify_GuardInputs(t *testing.T) {
 func TestClassify_Panic(t *testing.T) {
 	t.Parallel()
 	c := &Classifier{Loader: &fakeLoader{panics: true}}
-	got := c.Classify(context.Background(), Input{DeltaPaths: []string{"README.md"}, PRPaths: []string{"x.txt"}, Workspaces: []string{"ws"}})
+	got := c.Classify(context.Background(), Input{DeltaPaths: []string{"README.md"}, PRPaths: []string{"x.txt"}, Workspaces: []string{"ws"}, Surface: goModSurface})
 	if got != (Result{false, "undecidable:panic"}) {
 		t.Fatalf("Classify = %+v", got)
 	}
@@ -226,6 +245,8 @@ func TestClassify_Panic(t *testing.T) {
 // slowLoader takes `each` per Load but honours ctx, so a deadline shared by
 // every Load cuts the second one while a per-Load deadline would not.
 type slowLoader struct{ each time.Duration }
+
+func (slowLoader) Supports(string) error { return nil }
 
 func (s slowLoader) Load(ctx context.Context, _ string) (*Graph, error) {
 	select {
@@ -245,6 +266,7 @@ func TestClassify_OneDeadlineCoversAllLoads(t *testing.T) {
 		DeltaPaths: []string{"backend/internal/a/a.go"},
 		PRPaths:    []string{"backend/internal/d/d.go"},
 		Workspaces: []string{"bprime", "head"},
+		Surface:    goModSurface,
 	})
 	if got != (Result{false, "undecidable:deadline_exceeded"}) {
 		t.Fatalf("Classify = %+v, want undecidable:deadline_exceeded", got)
@@ -261,11 +283,13 @@ func TestClassify_OrderIndependent(t *testing.T) {
 		DeltaPaths: []string{"backend/internal/d/d.go", "backend/internal/a/a.go", "backend/internal/a/a.go"},
 		PRPaths:    []string{"backend/internal/c/c.go", "backend/internal/b/b.go"},
 		Workspaces: []string{"ws"},
+		Surface:    goModSurface,
 	})
 	b := c.Classify(context.Background(), Input{
 		DeltaPaths: []string{"backend/internal/a/a.go", "backend/internal/d/d.go"},
 		PRPaths:    []string{"backend/internal/b/b.go", "backend/internal/c/c.go"},
 		Workspaces: []string{"ws"},
+		Surface:    goModSurface,
 	})
 	if a != b || a.Reason != "reach_overlap:backend/internal/b" {
 		t.Fatalf("permuted inputs disagree: %+v vs %+v", a, b)
@@ -284,5 +308,203 @@ func TestBoundReason(t *testing.T) {
 	}
 	if got := boundReason("a\r\nb"); got != "a  b" {
 		t.Fatalf("boundReason newline = %q", got)
+	}
+}
+
+// --- ADR-124: the declared surface and the workspace adapter ---------------
+
+// disjoint is a delta/PR pair in unrelated packages of baseGraph: with no
+// refusal in the path it classifies independent, so each guard below is the
+// only thing between it and a transfer.
+func disjoint(s *Surface) Input {
+	return Input{DeltaPaths: []string{"backend/internal/a/a.go"}, PRPaths: []string{"backend/internal/d/d.go"},
+		Workspaces: []string{"ws"}, Surface: s}
+}
+
+func TestClassify_UndeclaredSurfaceFailsClosed(t *testing.T) {
+	t.Parallel()
+	if got := oneWS(baseGraph()).Classify(context.Background(), disjoint(nil)); got != (Result{false, "undecidable:surface_undeclared"}) {
+		t.Fatalf("Classify = %+v, want undecidable:surface_undeclared", got)
+	}
+	// Positive control: the same input under a declaration is independent.
+	if got := oneWS(baseGraph()).Classify(context.Background(), disjoint(goModSurface)); !got.Independent {
+		t.Fatalf("control Classify = %+v, want independent", got)
+	}
+}
+
+func TestClassify_InvalidSurfaceFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		s    *Surface
+		bad  string
+	}{
+		{"malformed_glob", &Surface{Global: []string{"scripts/["}}, "scripts/["},
+		{"absolute", &Surface{Global: []string{"go.mod", "/etc/**"}}, "/etc/**"},
+		{"dot_slash", &Surface{Global: []string{"go.mod"}, Inert: []string{"./x/**"}}, "./x/**"},
+		{"dotdot", &Surface{Global: []string{"go.mod"}, Opaque: []string{"../x"}}, "../x"},
+		{"backslash", &Surface{Global: []string{"go.mod"}, DocCheck: []string{`a\b`}}, `a\b`},
+		{"empty", &Surface{Global: []string{"go.mod", ""}}, ""},
+		{"dir_without_slash", &Surface{Global: []string{"go.mod"}, SharedDirs: []string{"web"}}, "web"},
+		{"dir_non_canonical", &Surface{Global: []string{"go.mod"}, SharedDirs: []string{"a//b/"}}, "a//b/"},
+	} {
+		got := oneWS(baseGraph()).Classify(context.Background(), disjoint(tc.s))
+		if want := (Result{false, "undecidable:invalid_surface:" + tc.bad}); got != want {
+			t.Errorf("%s: Classify = %+v, want %+v", tc.name, got, want)
+		}
+	}
+}
+
+func TestClassify_IncompleteSurfaceFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, s := range []*Surface{{}, {Inert: []string{"**"}}} {
+		if got := oneWS(baseGraph()).Classify(context.Background(), disjoint(s)); got != (Result{false, "undecidable:surface_incomplete"}) {
+			t.Errorf("Classify(%+v) = %+v, want undecidable:surface_incomplete", s, got)
+		}
+	}
+}
+
+// The fake marks the workspace unsupported but its Load serves a graph that
+// covers both paths, isolating the adapter check from any loader refusal.
+func TestClassify_UnsupportedWorkspaceRefusedBeforeEveryPathRule(t *testing.T) {
+	t.Parallel()
+	c := &Classifier{Loader: &fakeLoader{graphs: map[string]*Graph{"ws": baseGraph()}, unsupported: map[string]bool{"ws": true}}}
+	in := disjoint(goModSurface)
+	if got := c.Classify(context.Background(), in); got != (Result{false, "undecidable:unsupported_language"}) {
+		t.Errorf("disjoint: Classify = %+v, want undecidable:unsupported_language", got)
+	}
+	in.DeltaPaths = []string{"go.mod", "backend/internal/a/a.go"}
+	if got := c.Classify(context.Background(), in); got != (Result{false, "undecidable:unsupported_language"}) {
+		t.Errorf("with a G path: Classify = %+v, want undecidable:unsupported_language (decided before rule (b))", got)
+	}
+	// A Supports error that is not the sentinel is a load failure.
+	l := &fakeLoader{graphs: map[string]*Graph{"ws": baseGraph()}}
+	bad := &Classifier{Loader: &supportsErrLoader{fakeLoader: l, err: errors.New("stat: denied")}}
+	if got := bad.Classify(context.Background(), disjoint(goModSurface)); got != (Result{false, "undecidable:load:stat: denied"}) {
+		t.Errorf("resolution error: Classify = %+v", got)
+	}
+	// The loader's own defence-in-depth refusal maps to the same code.
+	ld := &Classifier{Loader: &fakeLoader{errs: map[string]error{"ws": fmt.Errorf("%w: x", ErrUnsupportedLanguage)}}}
+	if got := ld.Classify(context.Background(), disjoint(goModSurface)); got != (Result{false, "undecidable:unsupported_language"}) {
+		t.Errorf("Load refusal: Classify = %+v", got)
+	}
+}
+
+type supportsErrLoader struct {
+	*fakeLoader
+	err error
+}
+
+func (l *supportsErrLoader) Supports(string) error { return l.err }
+
+// A REAL GoListLoader over non-Go workspaces: Python only, and Python plus a
+// nested Go module (not a workspace root). The declaration would make every
+// path G or inert, so only the adapter check stands between them and
+// independent.
+func TestClassify_NonGoRepositoryNeverIndependent(t *testing.T) {
+	t.Parallel()
+	s := &Surface{Global: []string{"requirements.txt"}, Inert: []string{"**"}, CompletenessCheck: "check"}
+	for name, files := range map[string]map[string]string{
+		"python_only": {"app/main.py": "print(1)\n", "lib/util.py": "X = 1\n", "requirements.txt": "x\n"},
+		"nested_go_module": {"app/main.py": "print(1)\n", "lib/util.py": "X = 1\n", "requirements.txt": "x\n",
+			"tools/go.mod": "module example.com/t\n\ngo 1.25.0\n", "tools/x.go": "package t\n"},
+	} {
+		base, head := t.TempDir(), t.TempDir()
+		writeTree(t, base, files)
+		writeTree(t, head, files)
+		got := (&Classifier{Loader: &GoListLoader{Env: emptyModCache(t)}}).Classify(context.Background(), Input{
+			DeltaPaths: []string{"lib/util.py"}, PRPaths: []string{"app/main.py"}, Workspaces: []string{base, head}, Surface: s})
+		if got != (Result{false, "undecidable:unsupported_language"}) {
+			t.Errorf("%s: Classify = %+v, want undecidable:unsupported_language", name, got)
+		}
+	}
+}
+
+func TestClassify_UnclassifiedPathFailsClosed(t *testing.T) {
+	t.Parallel()
+	for _, in := range []Input{
+		{DeltaPaths: []string{"tools/gen.py"}, PRPaths: []string{"backend/internal/d/d.go"}},
+		{DeltaPaths: []string{"backend/internal/d/d.go"}, PRPaths: []string{"tools/gen.py"}},
+	} {
+		in.Workspaces, in.Surface = []string{"ws"}, goModSurface
+		if got := oneWS(baseGraph()).Classify(context.Background(), in); got != (Result{false, "undecidable:unclassified_path:tools/gen.py"}) {
+			t.Errorf("Classify(%v/%v) = %+v, want undecidable:unclassified_path:tools/gen.py", in.DeltaPaths, in.PRPaths, got)
+		}
+	}
+}
+
+// An inert-declared README under package a still seeds a: inert only rescues
+// a path the graph does not cover.
+func TestClassify_InertNeverRemovesGraphReach(t *testing.T) {
+	t.Parallel()
+	s := &Surface{Global: []string{"go.mod"}, Inert: []string{"**/README.md"}}
+	got := oneWS(baseGraph()).Classify(context.Background(), Input{
+		DeltaPaths: []string{"backend/internal/a/README.md"}, PRPaths: []string{"backend/internal/b/b.go"},
+		Workspaces: []string{"ws"}, Surface: s})
+	if got != (Result{false, "reach_overlap:backend/internal/b"}) {
+		t.Fatalf("Classify = %+v, want reach_overlap:backend/internal/b", got)
+	}
+}
+
+func TestClassify_WorkflowSpecSelfCovered(t *testing.T) {
+	t.Parallel()
+	s := &Surface{Global: []string{"go.mod"}, Inert: []string{"**"}}
+	for _, in := range []Input{
+		{DeltaPaths: []string{WorkflowSpecPath}, PRPaths: []string{"backend/internal/d/d.go"}},
+		{DeltaPaths: []string{"backend/internal/d/d.go"}, PRPaths: []string{WorkflowSpecPath}},
+	} {
+		in.Workspaces, in.Surface = []string{"ws"}, s
+		if got := oneWS(baseGraph()).Classify(context.Background(), in); got != (Result{false, "global_surface:" + WorkflowSpecPath}) {
+			t.Errorf("Classify = %+v, want global_surface:%s", got, WorkflowSpecPath)
+		}
+	}
+}
+
+func TestClassify_PathPrecedence(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		s         *Surface
+		delta, pr string
+		want      Result
+	}{
+		{"g_beats_opaque", &Surface{Global: []string{"gen/**"}, Opaque: []string{"gen/**"}},
+			"gen/x", "backend/internal/d/d.go", Result{false, "global_surface:gen/x"}},
+		{"opaque_beats_graph", &Surface{Global: []string{"go.mod"}, Opaque: []string{"backend/internal/a/**"}},
+			"backend/internal/a/a.go", "backend/internal/d/d.go", Result{false, "undecidable:opaque_path:backend/internal/a/a.go"}},
+		{"opaque_pr_side", &Surface{Global: []string{"go.mod"}, Opaque: []string{"vendor/**"}},
+			"backend/internal/a/a.go", "vendor/x.go", Result{false, "undecidable:opaque_path:vendor/x.go"}},
+		{"inert_never_exempts_shared_artifact", &Surface{Global: []string{"go.mod"}, SharedDirs: []string{"web/"}, Inert: []string{"web/**"}},
+			"web/a.ts", "web/b.ts", Result{false, "shared_artifact:web"}},
+		{"doc_check", &Surface{Global: []string{"go.mod"}, DocCheck: []string{"notes/**"}, Inert: []string{"notes/**"}},
+			"notes/x.md", "backend/internal/d/d.go", Result{false, "doc_check:notes/x.md"}},
+		{"inert_declared_unmapped_go", &Surface{Global: []string{"go.mod"}, Inert: []string{"tools/**"}},
+			"tools/x.go", "backend/internal/d/d.go", Result{true, "independent"}},
+		{"undeclared_unmapped_go_keeps_reason", &Surface{Global: []string{"go.mod"}},
+			"tools/x.go", "backend/internal/d/d.go", Result{false, "undecidable:unmapped_go_path:tools/x.go"}},
+	} {
+		got := oneWS(baseGraph()).Classify(context.Background(), Input{
+			DeltaPaths: []string{tc.delta}, PRPaths: []string{tc.pr}, Workspaces: []string{"ws"}, Surface: tc.s})
+		if got != tc.want {
+			t.Errorf("%s: Classify = %+v, want %+v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// Approval condition C1: a delta path and a PR path are dependent when ANY
+// declared shared-artifact dir contains both, whatever the declaration order.
+func TestClassify_SharedArtifactOrderIndependent(t *testing.T) {
+	t.Parallel()
+	in := Input{DeltaPaths: []string{"assets/narrow/a.txt"}, PRPaths: []string{"assets/other/b.txt"}, Workspaces: []string{"ws"}}
+	fwd := &Surface{Global: []string{"go.mod"}, SharedDirs: []string{"assets/narrow/", "assets/"}, Inert: []string{"assets/**"}}
+	rev := &Surface{Global: []string{"go.mod"}, SharedDirs: []string{"assets/", "assets/narrow/"}, Inert: []string{"assets/**"}}
+	for name, s := range map[string]*Surface{"narrow_first": fwd, "wide_first": rev} {
+		in.Surface = s
+		if got := oneWS(baseGraph()).Classify(context.Background(), in); got != (Result{false, "shared_artifact:assets"}) {
+			t.Errorf("%s: Classify = %+v, want shared_artifact:assets", name, got)
+		}
+	}
+	if fwd.Digest() != rev.Digest() {
+		t.Errorf("surface_digest differs by shared-dir order: %s vs %s", fwd.Digest(), rev.Digest())
 	}
 }
