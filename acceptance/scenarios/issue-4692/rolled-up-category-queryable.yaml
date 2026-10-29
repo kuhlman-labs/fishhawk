@@ -1,0 +1,14 @@
+id: scenario:issue-4692/rolled-up-category-queryable
+statement: 'The audit read surface accepts the new category: GET /v0/runs/{run_id}/audit?category=concern_rolled_up for an existing run returns 200 with an entries list, and not the 400 validation_failed that an unknown category draws.'
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/audit?category=concern_rolled_up on any run in the preview returns 200, not 400 validation_failed.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} and read run_id from the 201 body. 2) GET /v0/runs/{run_id}/audit?category=concern_rolled_up. 3) Control: GET /v0/runs/{run_id}/audit?category=bogus_category_xyz.'
+assertions:
+    expected: 200 with an entries list, not 400 validation_failed
+    observed_at_record: concern_rolled_up returned 200 {"items":[],"next_cursor":""}. The unknown category returned 400 validation_failed ('category is not a known audit category').
+    repro_handle: curl -s 'http://localhost:8090/v0/runs/<run_id>/audit?category=concern_rolled_up'
+origin:
+    issue: 4692
+    pr: 4820
+    run_id: bea6ba75-2fd4-4973-bf1a-2af557d7f19f
+    head_sha: f1cb91b944b94eb14c4e9161bfb70dd5f4040647
+    recorded_at: 2026-10-29T17:58:35Z
