@@ -69,9 +69,10 @@ const (
 // enumerate: the counts registered at #4211. A floor is raised by hand when
 // routes land and never lowered silently — a drop means a route vanished or
 // the enumeration broke, and the per-route loop would otherwise pass
-// vacuously.
+// vacuously. E94.3 / #4694 raised runs 56 -> 61: the 60 run-family
+// patterns registered by then plus POST /v0/runs/{run_id}/escapes.
 var sweepFamilyFloors = map[string]int{
-	sweepFamilyRuns:     56,
+	sweepFamilyRuns:     61,
 	sweepFamilyStages:   12,
 	sweepFamilyConcerns: 2,
 }
