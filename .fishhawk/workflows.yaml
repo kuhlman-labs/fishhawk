@@ -90,6 +90,100 @@ reviewer_personas:
       path: docs/review/security-remit.md
       severity_cap: medium
 
+# The repository's merge-candidate verdict-transfer surface (ADR-124 v2.1): pasted verbatim from
+# backend/internal/basedelta/testdata/fishhawk-verdict-transfer.yaml (whose rationale comments it
+# keeps). Tier I under ADR-121 (it decides whether a verify pass runs): changing it needs the
+# Captain's adoption, recorded on the PR that lands it.
+verdict_transfer:
+  global_surface:
+    - "go.work"  # every Go leg (lint, test loops, release-ldflags builds), `_verify_scope_buckets`, check-gate-image
+    - "**/go.mod"  # every Go leg; check-gate-image reads `*/go.mod` go directives
+    - "**/go.sum"  # every Go leg (module checksums)
+    - "scripts/**"  # every leg and harness is a script here; check-pipefail-grep scans `scripts/*`
+    - ".golangci.yml"  # `cmd_lint`
+    - "deploy/gate-image/**"  # check-gate-image, test-in-gate-image read the Dockerfile ARG pins
+    - ".fishhawk/**"  # the workflow spec read by the product and its spec tests (#4292)
+    - "docs/spec/**"  # sync-schemas sources; test-site-reference (docgen) reads the schemas and examples
+    - "docs/api/**"  # test-site-reference (docgen) reads `v0.openapi.yaml`
+    - "site/**"  # check-site-voice, check-site-ia, test-site-reference rewrites the reference pages
+    - "docs/adr/**"  # check-adr
+    - "docs/ARCHITECTURE.md"  # `_verify_doc_line_budget`
+    - "backend/internal/postgres/migrations/**"  # migration numbering is a whole-tree invariant (#4292)
+    - "backend/internal/audit/categories.go"  # the audit-category registry checked against every emitter (#4292)
+    - "testdata/**"  # root cross-module parity fixtures read by tests outside the dir (widened from `testdata/wire/**`); test-dev reads `testdata/wire/restart_blockers.json`
+    - "deploy/helm/**"  # test-helm-render renders `deploy/helm/fishhawk`
+    - "backend/cmd/fishhawkd/**"  # test-helm-render greps fishhawkd's source as data
+    - "backend/Dockerfile"  # test-dev checks TARGETARCH and the release-ldflags stanza
+    - "Makefile"  # test-dev greps the s3-init target
+    - ".github/workflows/**"  # check-gate-image reads go-version and golangci-lint pins
+    - "cli/internal/docgen/**"  # test-site-reference regenerates the site reference with it
+    - "cli/internal/cmdinfo/**"  # test-site-reference (the CLI page is rendered from cmdinfo)
+    - "cli/cmd/fishhawk-docgen/**"  # test-site-reference runs `go run ./cmd/fishhawk-docgen` (C6)
+    - "backend/internal/version/**"  # test-release-ldflags and test-dev read `version.go` as data
+    - "cli/internal/version/**"  # test-release-ldflags and test-dev read `version.go` as data
+    - "runner/internal/version/**"  # test-release-ldflags and test-dev read `version.go` as data
+    - "backend/internal/plan/schemas/**"  # sync-schemas mirror
+    - "backend/internal/spec/schemas/**"  # sync-schemas mirror
+    - "backend/internal/crewmessage/schemas/**"  # sync-schemas mirror
+    - "backend/internal/specialistjob/schemas/**"  # sync-schemas mirror
+    - "backend/internal/operatorrole/schemas/**"  # sync-schemas mirror
+    - "backend/internal/workmgmt/schemas/**"  # sync-schemas mirror
+    - "backend/internal/operatorrole/defaults/**"  # sync-schemas mirror
+    - "backend/internal/workmgmt/defaults/**"  # sync-schemas mirror
+    - "backend/internal/spec/presets/**"  # sync-schemas mirror
+    - "cli/internal/spec/schemas/**"  # sync-schemas mirror
+    - "cli/internal/spec/presets/**"  # sync-schemas mirror
+    - "runner/internal/plan/schemas/**"  # sync-schemas mirror
+    - "backend/internal/spec/testdata/predicate-fixtures.json"  # sync-schemas mirror
+    - "backend/internal/spec/testdata/review-conventions-fixtures.json"  # sync-schemas mirror
+    - "backend/internal/spec/testdata/tier-expansion-fixtures.json"  # sync-schemas mirror
+    - "cli/internal/spec/testdata/predicate-fixtures.json"  # sync-schemas mirror
+    - "cli/internal/spec/testdata/review-conventions-fixtures.json"  # sync-schemas mirror
+    - "cli/internal/spec/testdata/tier-expansion-fixtures.json"  # sync-schemas mirror
+    - "backend/internal/server/testdata/acceptance-verdict-fixtures.json"  # sync-schemas mirror
+    - "runner/cmd/fishhawk-runner/testdata/acceptance-verdict-fixtures.json"  # sync-schemas mirror
+  shared_artifact_dirs:
+    - "docs/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - "frontend/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - "infra/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - "acceptance/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - "auth/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - ".github/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - ".agents/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - ".claude/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - ".githooks/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+    - "deploy/"  # non-Go tree whose consumers the import graph cannot see (ADR-096 D1(d))
+  doc_check_inputs: []  # the doc paths stay in global_surface until #4317 (ADR-124 Consequences)
+  inert_paths:
+    - "README.md"  # root README: narrative prose no verify leg reads
+    - "**/README.md"  # module and directory READMEs; under a Go package the graph decides first
+    - "AGENTS.md"  # agent instruction prose
+    - "CLAUDE.md"  # agent instruction prose
+    - "CODE_OF_CONDUCT.md"  # community prose
+    - "CONTRIBUTING.md"  # community prose
+    - "SECURITY.md"  # community prose
+    - "LICENSE"  # licence text
+    - "NOTICE"  # licence notice
+    - ".dockerignore"  # image build context filter; no verify leg reads it
+    - ".editorconfig"  # editor settings
+    - ".env.example"  # local env template
+    - ".gitignore"  # git ignore rules
+    - "docker-compose.yml"  # local dev stack; no verify leg reads it
+    - "docs/**"  # documentation outside G (G precedence keeps docs/spec, docs/api, docs/adr and ARCHITECTURE.md verdict-wide)
+    - "frontend/**"  # Web UI; its CI gates run outside scripts/test verify
+    - ".agents/**"  # operator-authored skills
+    - ".claude/**"  # operator-authored harness config
+    - ".githooks/**"  # opt-in local hooks
+    - ".github/**"  # outside workflows/, which G keeps verdict-wide
+    - "infra/**"  # terraform; no verify leg reads it
+    - "acceptance/**"  # acceptance scenarios; no verify leg reads them
+    - "auth/**"  # composite action; no verify leg reads it
+    - "deploy/**"  # outside helm and gate-image, which G keeps verdict-wide
+    - "backend/sqlc.yaml"  # sqlc config; generated db code is committed
+    - "runner/action.yml"  # action metadata; no verify leg reads it
+  opaque_paths: []  # nothing here is opaque
+  completeness_check: "go test ./backend/internal/basedelta -run 'TestVerifyLegsCoveredByDeclaration|TestSchemaSyncDestinationsCoveredByDeclaration|TestDeclarationKeepsADR096D3Floor|TestThisRepository_EveryTrackedPathClassified'"
+
 workflows:
   # ---------------------------------------------------------------------------
   # backlog_grooming — decide what to build.
