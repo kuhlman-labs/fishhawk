@@ -1442,6 +1442,25 @@ What a resolve does, and what it is not:
 
 Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` or concern UUID, empty `concern_ids`, blank `evidence` — all caught before the HTTP hop), `validation_failed` (400 — over the 50-id cap, evidence over 4000 bytes, a duplicate, or an id from another run carrying `details.rule` `concern_run_mismatch`), `resolve_requires_human` / `insufficient_scope` / `account_forbidden` (403), `concern_not_found` (404), `concern_resolve_conflict` (409 — an id not in `addressed_pending`, which refuses the WHOLE batch; the message names the state and the recovery: route a `raised`/`reopened` concern with a fix-up first, and an already-closed concern has nothing to resolve), `concern_store_unconfigured` (503).
 
+## Escape records (`fishhawk_record_escape`)
+
+`fishhawk_record_escape` (E94.3 / [#4694](https://github.com/kuhlman-labs/fishhawk/issues/4694); ADR-117 D3 + Amendment A1, RATIFIED, with A1.2 as amended by erratum E1) wraps `POST /v0/runs/{run_id}/escapes`. An **escape** is a defect that got past the live reviews; the backend stores it as append-only `escape_recorded` rows on the run's audit chain — a birth and at most ONE closure. The client method `(c *apiClient) RecordEscape` lives in `escape.go`, next to the tool, not in `client.go`. The tool's I/O types (`recordEscapeInput`, `recordEscapeAttestation`, `recordEscapeResult`, `recordEscapeOutput`) are unexported, like `fishhawk_delegation_confirm`'s, so the export baseline (§ "Exported surface") is unchanged. The long-form contract (refusal ladder, birth rule, keys, closure state machine, residuals) is `backend/internal/server/README.md` § "Escape records".
+
+One tool, two shapes — `supersedes_sequence` makes the call a CLOSE:
+
+| Shape | Fields | Notes |
+|---|---|---|
+| RECORD | `run_id`, `source`, `severity`, `category`, `description` + `files` (non-security), `head_sha?`, `introducing_commits?`, `concern_id` (`later_reviewer`) or `idempotency_key` (every other source), `security_class` + `advisory_id` (security only), `delegated?` | Optional keys are omitted when empty, so a security RECORD never forwards a present-but-empty `description` / `files` (the backend refuses either as free text). |
+| CLOSE | `run_id`, `supersedes_sequence`, `attestation {judgement: defect \| no_defect, note?}`, `delegated?` | Exactly those keys are forwarded. |
+
+- **Who.** `write:runs` (`server/mcpscopes.go`, no run-bound allowance): the backend refuses every `mcp:run:` subject `run_token_forbidden`. Recording is open to agents (an agent-recorded birth is `pending_judgement`); a CLOSE is human-only and needs a forge-verified credential (`escape_attestation_requires_human` / `escape_attestation_requires_forge_credential`).
+- **`delegated`** follows `drive_run.go`'s `DriveStep.Delegated` (the ADR-040 marker). It is caller-asserted: on a RECORD it makes the birth pending, and a delegated CLOSE is refused.
+- **Security.** `category=security` for any vulnerability; only the class slug and the forge advisory id travel, the `idempotency_key` is a canonical UUID, and there is no `security_finding_id` field (ADR-126 D7 deferred).
+- **Keys.** A `later_reviewer` escape dedupes on `concern:<concern_uuid>` and carries its concern round's `reviewed_head`; other sources dedupe on `idempotency_key:<key>`.
+- **Local pre-flight** (before the HTTP hop, zero requests): a non-UUID `run_id`, a CLOSE without `attestation`, a CLOSE carrying RECORD fields, and `attestation` without `supersedes_sequence`.
+
+Every backend refusal surfaces as a tool error wrapping the typed `*apiError` (status + code): `authentication_required`, `run_token_forbidden`, `insufficient_scope`, `account_forbidden`, the two attestation refusals, `validation_failed` (`details.field`), `run_not_found`, `escape_already_recorded`, `escape_already_closed`, `escape_security_free_text_refused`, `escape_subject_unresolved`, `escape_concern_not_found`, `escape_target_not_found`, `escape_target_not_pending`, `escape_unconfigured`, `internal_error`. `escape_recorded` is withheld from run-bound audit reads, so a run-bound `fishhawk_list_audit` never returns it. Tests: `escape_test.go` (forwarded bodies, local pre-flight, typed refusals); `backend/internal/integration/mcp/escape_record_test.go` (the real binary against Postgres).
+
 ## Concern defer (`fishhawk_defer_concern`)
 
 `fishhawk_defer_concern` (E22.X / [#1202](https://github.com/kuhlman-labs/fishhawk/issues/1202)) converts one **open** review concern (`raised`, `addressed_pending`, or `reopened`) into a conventions-complete, boarded, epic-linked **follow-up work item** AND transitions the concern to the terminal `deferred` state — in a single call. It is the "not now, but track it" verb, sitting between `fishhawk_fixup_stage` (route the concern back to the agent now) and `fishhawk_waive_concern` (resolve with no follow-up). It consumes **no** fix-up budget. It wraps `POST /v0/concerns/{concern_id}/defer`.
