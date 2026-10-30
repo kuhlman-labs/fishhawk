@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // ForgeMerger is the forge-RESOLVED merge seam bound at every GitHubMerger site
@@ -28,11 +30,31 @@ import (
 //     mismatch refuses BEFORE any forge call and an unimplemented forge never
 //     reaches a merge) and the forge through Resolver (defaulting to forge.Get,
 //     isNilForge-guarded against a typed-nil), then queues EnableAutoMerge with
-//     the squash method and the SAME ErrPullRequestCleanStatus -> MergePullRequest
-//     fallback ladder githubAutoMerger uses. A non-empty head pin (#4641) is
-//     refused on this arm (ErrHeadPinnedMergeUnsupported) before any forge
-//     resolution: the arm has no pinned auto-merge, and dropping the pin would
-//     merge a head nothing evaluated.
+//     the run's RESOLVED merge method and the SAME ErrPullRequestCleanStatus ->
+//     MergePullRequest fallback ladder githubAutoMerger uses. A non-empty head
+//     pin (#4641) is refused on this arm (ErrHeadPinnedMergeUnsupported) before
+//     any forge resolution: the arm has no pinned auto-merge, and dropping the
+//     pin would merge a head nothing evaluated.
+//
+// Merge method (E93.2 / #4658). Every entry point resolves the method ONCE per
+// call from the run's cached ADMISSION spec (run.WorkflowSpec) through
+// ResolveRunMergeMethod — the workflow-v2 `merge_method` declaration, absent =
+// squash — and passes it to every family's leaf; no arm hard-codes one. An
+// unparseable admission spec fails closed with ErrMergeMethodUndeterminable
+// BEFORE any leaf call or forge resolution. A forge family that statically
+// cannot apply the method (gitlab x rebase: GitLab has no per-request merge
+// method) is refused by the CALLERS before their merge-dispatch claim
+// (staticMergeMethodRefusal); the GitLab adapter's pre-HTTP refusal is defence
+// in depth, surfaced here as a forge_unsupported MergeMethodRefusalError. A
+// refusal the forge itself returns is ATTRIBUTED deterministically, never by
+// matching forge wording (#4641): on a typed refusal the github arm re-reads the
+// repository's documented merge settings (MergeMethodPolicyReader) and wraps
+// the refusal as a forge_disallows MergeMethodRefusalError only when the
+// declared method is disallowed. That re-read is BEST-EFFORT under the caller's
+// deadline (merge-on-pass hands this seam a 30s call context the merge itself
+// also consumed): a read error, a spent deadline or an allowed method leaves the
+// refusal unchanged, so a refusal that keeps its plain not_mergeable /
+// unprocessable surface does NOT prove the declared method was allowed.
 //
 // The clean-status fallback is uniform across families deliberately: the GitLab
 // adapter never emits forge.ErrPullRequestCleanStatus (a merge-ready MR merges
@@ -58,9 +80,289 @@ type ForgeMerger struct {
 	// forge.Get, so production needs no wiring — serve.go registers the forges
 	// at startup and the lookup is late-bound per merge call.
 	Resolver func(id string) (forge.Forge, error)
+	// Logger receives the merge-method attribution lines (method names and
+	// closed-set codes only, never forge or error text). Nil defaults to
+	// slog.Default().
+	Logger *slog.Logger
 }
 
 var _ GitHubMerger = ForgeMerger{}
+
+// ErrMergeMethodUndeterminable means the run's cached admission spec does not
+// parse, so the merge method it declares cannot be read (E93.2 / #4658). Every
+// merge entry point fails closed on it BEFORE any forge call or resolver
+// lookup — never a silent squash.
+var ErrMergeMethodUndeterminable = errors.New("forge merge: merge method undeterminable: the run's admission spec does not parse")
+
+// Merge-method sources a refusal cites.
+const (
+	MergeMethodSourceDeclared = "declared"
+	MergeMethodSourceDefault  = "default"
+)
+
+// RunMergeMethod is a run's resolved merge method (E93.2 / #4658).
+type RunMergeMethod struct {
+	// Method is the forge merge method every leaf receives.
+	Method forge.MergeMethod
+	// Declared is the lowercase spec value the method came from (squash when
+	// the default applied).
+	Declared string
+	// Source is MergeMethodSourceDeclared or MergeMethodSourceDefault.
+	Source string
+}
+
+// Name is the lowercase closed-set name (squash, merge, rebase).
+func (r RunMergeMethod) Name() string { return forge.MergeMethodName(r.Method) }
+
+// Citation names where the method came from, for operator-facing text.
+func (r RunMergeMethod) Citation() string {
+	return mergeMethodCitation(r.Source)
+}
+
+func mergeMethodCitation(source string) string {
+	switch source {
+	case MergeMethodSourceDeclared:
+		return ".fishhawk/workflows.yaml merge_method (the run's admission spec)"
+	case MergeMethodSourceDefault:
+		return "default (no merge_method declared)"
+	}
+	return "undeterminable (the run's admission spec does not parse)"
+}
+
+// ResolveRunMergeMethod resolves the run's merge method from its cached
+// admission spec (spec.ResolveMergeMethod over run.WorkflowSpec, then
+// forge.MergeMethodFromDeclaration): no cached spec or no declaration is the
+// squash default; a spec that does not parse is ErrMergeMethodUndeterminable.
+// It reads no state and makes no forge call.
+func ResolveRunMergeMethod(runRow *run.Run) (RunMergeMethod, error) {
+	d, err := spec.ResolveMergeMethod(runRow.WorkflowSpec)
+	if err != nil {
+		return RunMergeMethod{}, fmt.Errorf("%w: run %s: %w", ErrMergeMethodUndeterminable, runRow.ID, err)
+	}
+	m, err := forge.MergeMethodFromDeclaration(d.Method)
+	if err != nil {
+		return RunMergeMethod{}, fmt.Errorf("%w: run %s: %w", ErrMergeMethodUndeterminable, runRow.ID, err)
+	}
+	source := MergeMethodSourceDefault
+	if d.Declared {
+		source = MergeMethodSourceDeclared
+	}
+	return RunMergeMethod{Method: m, Declared: d.Method, Source: source}, nil
+}
+
+// MergeMethodPolicyReader is the OPTIONAL settings read a merge leaf may
+// implement (serve.go's githubAutoMerger, over githubclient.AllowedMergeMethods)
+// so ForgeMerger can attribute a typed merge refusal to a disallowed declared
+// method from the repository's documented settings rather than forge wording.
+type MergeMethodPolicyReader interface {
+	AllowedMergeMethods(ctx context.Context, runRow *run.Run) (forge.AllowedMergeMethods, error)
+}
+
+// Merge-method refusal reasons (the closed set a MergeMethodRefusalError
+// carries).
+const (
+	// MergeMethodRefusalForgeDisallows: the repository's merge settings
+	// disallow the declared method (attributed from a settings re-read).
+	MergeMethodRefusalForgeDisallows = "forge_disallows"
+	// MergeMethodRefusalForgeUnsupported: the run's forge family cannot apply
+	// the method per merge request (gitlab x rebase).
+	MergeMethodRefusalForgeUnsupported = "forge_unsupported"
+	// MergeMethodRefusalUndeterminable: the run's admission spec does not
+	// parse, so the method cannot be read (the pre-claim check fails closed).
+	MergeMethodRefusalUndeterminable = "merge_method_undeterminable"
+)
+
+// MergeMethodRefusalError is a merge refusal attributed to the run's merge
+// method (E93.2 / #4658). Method, Source, Reason and Allowed are closed-set
+// values (Allowed is built from forge.AllowedMergeMethods.Names(), never from
+// forge text). Cause is the original refusal; it is reachable through Unwrap
+// so every existing classification of its sentinel still holds, but NEITHER
+// Error() NOR FieldDetail() renders it, so no surface built from this error can
+// carry forge response text or a credential.
+type MergeMethodRefusalError struct {
+	// Method is the lowercase method name ("" when undeterminable).
+	Method string
+	// Source is MergeMethodSourceDeclared / MergeMethodSourceDefault ("" when
+	// undeterminable).
+	Source string
+	// Reason is one of the MergeMethodRefusal* constants.
+	Reason string
+	// Allowed lists the methods the forge (settings or family) allows.
+	Allowed []string
+	// Cause is the original error (never rendered).
+	Cause error
+}
+
+// Citation names where the method came from.
+func (e *MergeMethodRefusalError) Citation() string { return mergeMethodCitation(e.Source) }
+
+// FieldDetail renders the refusal from its closed-set fields only — never
+// Cause — for every surface that must not carry forge text.
+func (e *MergeMethodRefusalError) FieldDetail() string {
+	allowed := "none"
+	if len(e.Allowed) > 0 {
+		allowed = strings.Join(e.Allowed, ", ")
+	}
+	var what string
+	switch e.Reason {
+	case MergeMethodRefusalForgeDisallows:
+		what = "is not allowed by the repository's merge settings"
+	case MergeMethodRefusalForgeUnsupported:
+		what = "cannot be applied per merge request by the run's forge family"
+	default:
+		return fmt.Sprintf("merge method undeterminable (%s); reason %s; allowed merge methods: %s",
+			e.Citation(), e.Reason, allowed)
+	}
+	return fmt.Sprintf("merge method %s (%s) %s; reason %s; allowed merge methods: %s",
+		e.Method, e.Citation(), what, e.Reason, allowed)
+}
+
+func (e *MergeMethodRefusalError) Error() string {
+	return "merge_method_refused: " + e.FieldDetail()
+}
+
+// Unwrap exposes the reason's forge sentinel plus the original refusal (Cause
+// omitted when it IS that sentinel), so errors.Is matches both.
+func (e *MergeMethodRefusalError) Unwrap() []error {
+	var sentinel error
+	switch e.Reason {
+	case MergeMethodRefusalForgeDisallows:
+		sentinel = forge.ErrMergeMethodNotAllowed
+	case MergeMethodRefusalForgeUnsupported:
+		sentinel = forge.ErrMergeMethodUnsupported
+	default:
+		sentinel = ErrMergeMethodUndeterminable
+	}
+	if e.Cause == nil || e.Cause == sentinel {
+		return []error{sentinel}
+	}
+	return []error{sentinel, e.Cause}
+}
+
+// staticMergeMethodRefusal is the PRE-CLAIM predicate every server merge path
+// calls before its merge-dispatch claim (E93.2 / #4658): it resolves the run's
+// method and refuses one the run's forge family cannot apply per merge request
+// (forge.MergeMethodsForFamily over observationForgeID, ForgeMerger's own
+// routing ladder, so it agrees with the arm that would carry the merge). It
+// FAILS CLOSED: an unparseable admission spec is a MergeMethodRefusalUndeterminable
+// refusal, never nil. It makes no forge call and reads no state.
+func staticMergeMethodRefusal(runRow *run.Run) *MergeMethodRefusalError {
+	family := observationForgeID(runRow.InstallationRef)
+	table := forge.MergeMethodsForFamily(family)
+	mm, err := ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return &MergeMethodRefusalError{
+			Reason:  MergeMethodRefusalUndeterminable,
+			Allowed: table.Names(),
+			Cause:   err,
+		}
+	}
+	if table.Allows(mm.Method) {
+		return nil
+	}
+	return &MergeMethodRefusalError{
+		Method:  mm.Name(),
+		Source:  mm.Source,
+		Reason:  MergeMethodRefusalForgeUnsupported,
+		Allowed: table.Names(),
+		Cause:   forge.ErrMergeMethodUnsupported,
+	}
+}
+
+// mergeMethodAttributionTimeout bounds the settings re-read; it is derived from
+// the caller's context, so the caller's own deadline also bounds it.
+const mergeMethodAttributionTimeout = 10 * time.Second
+
+// isMergeMethodRefusalCandidate reports whether err is a typed merge refusal a
+// disallowed method could have caused: not-mergeable, unprocessable, or a
+// validation refusal that is not the clean-status / unstable-status class. A
+// merge conflict (a moved head) never is.
+func isMergeMethodRefusalCandidate(err error) bool {
+	if errors.Is(err, forge.ErrMergeConflict) {
+		return false
+	}
+	if errors.Is(err, forge.ErrPullRequestNotMergeable) || errors.Is(err, forge.ErrMergeUnprocessable) {
+		return true
+	}
+	return errors.Is(err, forge.ErrValidation) &&
+		!errors.Is(err, forge.ErrPullRequestCleanStatus) &&
+		!errors.Is(err, forge.ErrPullRequestUnstableStatus)
+}
+
+// attributeMergeMethodRefusal attributes a merge error to the run's merge
+// method deterministically (see the type doc): nil stays nil; an adapter
+// ErrMergeMethodUnsupported becomes a forge_unsupported refusal; a CANDIDATE
+// refusal with a reader triggers ONE settings re-read under
+// mergeMethodAttributionTimeout derived from ctx, and only a DISALLOWED method
+// wraps it as forge_disallows. A read error, a spent deadline, no reader or an
+// allowed method return err UNCHANGED — never a misattribution. Every log line
+// carries method names and closed-set codes only, never err or read-error text.
+func (m ForgeMerger) attributeMergeMethodRefusal(ctx context.Context, runRow *run.Run, mm RunMergeMethod, err error, reader MergeMethodPolicyReader) error {
+	if err == nil {
+		return nil
+	}
+	var already *MergeMethodRefusalError
+	if errors.As(err, &already) {
+		return err
+	}
+	if errors.Is(err, forge.ErrMergeMethodUnsupported) {
+		table := forge.MergeMethodsForFamily(observationForgeID(runRow.InstallationRef))
+		return &MergeMethodRefusalError{
+			Method:  mm.Name(),
+			Source:  mm.Source,
+			Reason:  MergeMethodRefusalForgeUnsupported,
+			Allowed: table.Names(),
+			Cause:   err,
+		}
+	}
+	if reader == nil || !isMergeMethodRefusalCandidate(err) {
+		return err
+	}
+	logger := m.Logger
+	if logger == nil {
+		logger = slog.Default()
+	}
+	if ctx.Err() != nil {
+		logger.Info("forge merge: merge-method attribution skipped: caller deadline spent",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("merge_method", mm.Name()),
+			slog.String("merge_method_source", mm.Source))
+		return err
+	}
+	rctx, cancel := context.WithTimeout(ctx, mergeMethodAttributionTimeout)
+	defer cancel()
+	allowed, rerr := reader.AllowedMergeMethods(rctx, runRow)
+	if rerr != nil {
+		logger.Warn("forge merge: merge-method attribution skipped: repository merge settings unreadable",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("merge_method", mm.Name()),
+			slog.String("merge_method_source", mm.Source))
+		return err
+	}
+	if allowed.Allows(mm.Method) {
+		return err
+	}
+	logger.Info("forge merge: merge refusal attributed to the declared merge method",
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("merge_method", mm.Name()),
+		slog.String("merge_method_source", mm.Source),
+		slog.String("reason", MergeMethodRefusalForgeDisallows),
+		slog.Any("allowed_merge_methods", allowed.Names()))
+	return &MergeMethodRefusalError{
+		Method:  mm.Name(),
+		Source:  mm.Source,
+		Reason:  MergeMethodRefusalForgeDisallows,
+		Allowed: allowed.Names(),
+		Cause:   err,
+	}
+}
+
+// githubPolicyReader is the github leaf's optional settings reader, nil when
+// the leaf does not implement it.
+func (m ForgeMerger) githubPolicyReader() MergeMethodPolicyReader {
+	r, _ := m.GitHub.(MergeMethodPolicyReader)
+	return r
+}
 
 // HeadPinnedMerger is the OPTIONAL server-side head-pinned merge seam the merge
 // queue's merge-on-pass consumes (ADR-093 D3, E87.5 / #4296): merge the run's
@@ -102,6 +404,10 @@ func (m ForgeMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run
 	if strings.TrimSpace(headSHA) == "" {
 		return fmt.Errorf("forge merge: run %s: head-pinned merge needs a head sha", runRow.ID)
 	}
+	mm, err := ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return err
+	}
 	family := observationForgeID(runRow.InstallationRef)
 	if family == observationForgeGitHub {
 		if m.GitHub == nil {
@@ -113,7 +419,7 @@ func (m ForgeMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run
 		}
 		cctx, cancel := context.WithTimeout(ctx, headPinnedMergeCallTimeout)
 		defer cancel()
-		return pinned.MergePullRequestAtHead(cctx, runRow, headSHA)
+		return m.attributeMergeMethodRefusal(ctx, runRow, mm, pinned.MergePullRequestAtHead(cctx, runRow, headSHA), m.githubPolicyReader())
 	}
 
 	f, scope, repo, number, err := m.resolveNonGitHub(runRow)
@@ -126,7 +432,7 @@ func (m ForgeMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run
 	}
 	cctx, cancel := context.WithTimeout(ctx, headPinnedMergeCallTimeout)
 	defer cancel()
-	return pinned.MergePullRequestAtHead(cctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
+	return m.attributeMergeMethodRefusal(ctx, runRow, mm, pinned.MergePullRequestAtHead(cctx, scope, repo, number, mm.Method, headSHA), nil)
 }
 
 // MergePullRequest routes the run's merge by forge family per the type doc.
@@ -135,14 +441,19 @@ func (m ForgeMerger) MergePullRequestAtHead(ctx context.Context, runRow *run.Run
 // ErrHeadPinnedMergeUnsupported BEFORE resolving or calling any forge (ruling
 // R6: a pin is never silently dropped onto an unpinned auto-merge; GitLab runs
 // carry no evaluated head today, so the refusal is unreachable in practice).
-// An empty headSHA keeps the unpinned ladder.
+// An empty headSHA keeps the unpinned ladder. The merge method resolves first
+// (ResolveRunMergeMethod), before any leaf call or forge resolution.
 func (m ForgeMerger) MergePullRequest(ctx context.Context, runRow *run.Run, headSHA string) error {
+	mm, err := ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return err
+	}
 	family := observationForgeID(runRow.InstallationRef)
 	if family == observationForgeGitHub {
 		if m.GitHub == nil {
 			return fmt.Errorf("forge merge: run %s: no github merge client configured", runRow.ID)
 		}
-		return m.GitHub.MergePullRequest(ctx, runRow, headSHA)
+		return m.attributeMergeMethodRefusal(ctx, runRow, mm, m.GitHub.MergePullRequest(ctx, runRow, headSHA), m.githubPolicyReader())
 	}
 	if headSHA != "" {
 		return fmt.Errorf("%w: run %s: forge family %q cannot pin an auto-merge to head %s",
@@ -153,7 +464,7 @@ func (m ForgeMerger) MergePullRequest(ctx context.Context, runRow *run.Run, head
 	if err != nil {
 		return err
 	}
-	err = f.EnableAutoMerge(ctx, scope, repo, number, forge.MergeMethodSquash)
+	err = f.EnableAutoMerge(ctx, scope, repo, number, mm.Method)
 	if err == nil {
 		return nil
 	}
@@ -161,9 +472,9 @@ func (m ForgeMerger) MergePullRequest(ctx context.Context, runRow *run.Run, head
 	// GitHub, which the github family never reaches here — kept so the ladder is
 	// one shape across families. The gitlab adapter never emits this sentinel.
 	if errors.Is(err, forge.ErrPullRequestCleanStatus) {
-		return f.MergePullRequest(ctx, scope, repo, number, forge.MergeMethodSquash)
+		err = f.MergePullRequest(ctx, scope, repo, number, mm.Method)
 	}
-	return err
+	return m.attributeMergeMethodRefusal(ctx, runRow, mm, err, nil)
 }
 
 // resolveNonGitHub resolves a NON-github-family run's merge target and forge:

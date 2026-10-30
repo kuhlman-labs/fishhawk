@@ -916,6 +916,123 @@ func TestAdvance_AutoMergeStage_FailureLeavesStageDispatched(t *testing.T) {
 	}
 }
 
+// mmSpecDoc is a minimal non-Fishhawk workflow-v2 admission spec; a non-empty
+// decl is appended as the top-level merge_method declaration (E93.2 / #4658).
+func mmSpecDoc(decl string) []byte {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	if decl != "" {
+		doc += "merge_method: " + decl + "\n"
+	}
+	return []byte(doc)
+}
+
+// seedAutoMergeRun seeds an implement-succeeded run whose review stage carries
+// the check-only gate that routes Advance to the auto-merge path.
+func seedAutoMergeRun(t *testing.T, rs *stubRuns, specBytes []byte, installationRef *string) (*run.Run, []*run.Stage) {
+	t.Helper()
+	r, stages := rs.seed(t, "acme/widgets", int64Ptr(99), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	stages[1].Gate = &run.Gate{Kind: run.GateKindCheck}
+	prURL := "https://github.com/acme/widgets/pull/42"
+	r.PullRequestURL = &prURL
+	r.WorkflowSpec = specBytes
+	r.InstallationRef = installationRef
+	return r, stages
+}
+
+// TestAdvance_AutoMergeStage_MergeMethod pins the orchestrator's auto-merge
+// method (E93.2 / #4658): the run's cached admission spec decides it, absent =
+// squash.
+func TestAdvance_AutoMergeStage_MergeMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		want forge.MergeMethod
+	}{
+		{"declared merge", mmSpecDoc("merge"), forge.MergeMethodMerge},
+		{"declared rebase on github", mmSpecDoc("rebase"), forge.MergeMethodRebase},
+		{"no declaration", mmSpecDoc(""), forge.MergeMethodSquash},
+		{"no cached spec", nil, forge.MergeMethodSquash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh := newOrchestrator(t)
+			r, _ := seedAutoMergeRun(t, rs, tc.spec, nil)
+			if _, err := o.Advance(context.Background(), r.ID); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if len(gh.autoMergeCalls) != 1 || gh.autoMergeCalls[0].Method != tc.want {
+				t.Fatalf("auto-merge calls = %+v, want one with Method %s", gh.autoMergeCalls, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdvance_AutoMergeStage_MergeMethodRefusedBeforeCall pins the two
+// pre-call refusals: an unparseable admission spec, and the STATIC forge-family
+// refusal (gitlab x rebase). Both error with ZERO auto-merge calls and leave
+// the stage dispatched. The gitlab case carries a GitHub InstallationID AND
+// InstallationRef gitlab:7 — an artificial shape that isolates the control: a
+// production GitLab run carries no GitHub installation and is skipped before
+// the call, which would mask the static check.
+func TestAdvance_AutoMergeStage_MergeMethodRefusedBeforeCall(t *testing.T) {
+	gitlabRef := "gitlab:7"
+	for _, tc := range []struct {
+		name   string
+		spec   []byte
+		ref    *string
+		wantIs error
+	}{
+		{"unparseable spec", []byte("version: [\n"), nil, nil},
+		{"gitlab x rebase", mmSpecDoc("rebase"), &gitlabRef, forge.ErrMergeMethodUnsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh := newOrchestrator(t)
+			r, stages := seedAutoMergeRun(t, rs, tc.spec, tc.ref)
+			_, err := o.Advance(context.Background(), r.ID)
+			if err == nil {
+				t.Fatal("Advance err = nil, want a pre-call refusal")
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("err = %v, want errors.Is %v", err, tc.wantIs)
+			}
+			if len(gh.autoMergeCalls) != 0 {
+				t.Errorf("auto-merge calls = %+v, want none (refused before the call)", gh.autoMergeCalls)
+			}
+			if stages[1].State != run.StageStateDispatched {
+				t.Errorf("stage state = %q, want dispatched", stages[1].State)
+			}
+		})
+	}
+	// Positive control for the static row: gitlab x merge reaches the call.
+	o, rs, gh := newOrchestrator(t)
+	r, _ := seedAutoMergeRun(t, rs, mmSpecDoc("merge"), &gitlabRef)
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("gitlab x merge: Advance: %v", err)
+	}
+	if len(gh.autoMergeCalls) != 1 || gh.autoMergeCalls[0].Method != forge.MergeMethodMerge {
+		t.Errorf("gitlab x merge: auto-merge calls = %+v, want one MERGE", gh.autoMergeCalls)
+	}
+}
+
 func TestAdvance_AutoMergeStage_MissingPRURL_Errors(t *testing.T) {
 	// The implement stage's PR artifact upload backfills
 	// runs.pull_request_url (#216). When that hasn't happened yet

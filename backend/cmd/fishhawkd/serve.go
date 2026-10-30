@@ -4871,7 +4871,8 @@ func campaignOperatorIdentity() server.Identity {
 
 // githubAutoMerger is the GITHUB-FAMILY LEAF of server.ForgeMerger (E45.47 /
 // #3464): may_merge dispatches a github-family run's pull request through
-// GitHub's auto-merge (EnableAutoMerge, squash), and the existing webhook /
+// GitHub's auto-merge (EnableAutoMerge, with the run's resolved merge method,
+// server.ResolveRunMergeMethod — absent = squash, E93.2 / #4658), and the existing webhook /
 // resolveReviewStageOnMerge path settles the review stage. Fails before any
 // HTTP call when the run lacks the installation id or PR url the merge needs.
 // server.ForgeMerger delegates github-family runs here byte-for-byte and routes
@@ -4941,6 +4942,23 @@ func mergeReconcilerPollSources(gh *githubclient.Client) (mergereconciler.PRGett
 // merge queue's merge-on-pass consumes (ADR-093 D3, E87.5 / #4296).
 var _ server.HeadPinnedMerger = githubAutoMerger{}
 
+// githubAutoMerger also implements the optional server.MergeMethodPolicyReader
+// ForgeMerger's merge-method attribution consumes (E93.2 / #4658).
+var _ server.MergeMethodPolicyReader = githubAutoMerger{}
+
+// AllowedMergeMethods reads the run's repository merge-method settings
+// (githubclient.AllowedMergeMethods, one GraphQL query on the run's
+// installation token) for ForgeMerger's best-effort refusal attribution. It
+// fails before any HTTP call on the same missing installation id / PR url
+// mergeTarget refuses.
+func (m githubAutoMerger) AllowedMergeMethods(ctx context.Context, runRow *runpkg.Run) (forge.AllowedMergeMethods, error) {
+	scope, repo, _, err := m.mergeTarget(runRow)
+	if err != nil {
+		return forge.AllowedMergeMethods{}, err
+	}
+	return m.gh.AllowedMergeMethods(ctx, scope, repo)
+}
+
 // mergeTarget resolves the run's GitHub merge target — the installation scope,
 // repo and PR number — failing closed before any HTTP call when the run lacks
 // the installation id or a parseable PR url. Shared by MergePullRequest and
@@ -4960,18 +4978,23 @@ func (githubAutoMerger) mergeTarget(runRow *runpkg.Run) (forge.CredentialScope, 
 }
 
 // MergePullRequestAtHead is the head-pinned merge-on-pass leaf (ADR-093 D3,
-// E87.5 / #4296): a SYNCHRONOUS REST squash merge whose body carries sha, so
+// E87.5 / #4296): a SYNCHRONOUS REST merge with the run's resolved merge method
+// (E93.2 / #4658) whose body carries sha, so
 // GitHub refuses (409 -> forge.ErrMergeConflict) a head that moved after the
 // queue verified it. It NEVER calls EnableAutoMerge and never takes the
 // clean-status ladder MergePullRequest uses: a queued auto-merge waits on
 // checks while the base may move, which would merge a tree the queue never
 // verified against the current base.
 func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
+	mm, err := server.ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return err
+	}
 	scope, repo, number, err := m.mergeTarget(runRow)
 	if err != nil {
 		return err
 	}
-	return m.gh.MergePullRequestAtHead(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
+	return m.gh.MergePullRequestAtHead(ctx, scope, repo, number, mm.Method, headSHA)
 }
 
 // MergePullRequest is the github-family GitHubMerger leaf (inline merge_run
@@ -4981,14 +5004,20 @@ func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *ru
 // (#4641), so it is one tested production function. headSHA is the head the
 // merge-candidate gate admitted: non-empty PINS both arms (expectedHeadOid on
 // the auto-merge enable, sha on the REST fallback) and a head mismatch surfaces
-// as forge.ErrMergeConflict; empty keeps the unpinned ladder. The webhook /
-// resolveReviewStageOnMerge path settles the review stage on the merge.
+// as forge.ErrMergeConflict; empty keeps the unpinned ladder. Both arms carry
+// the run's resolved merge method (server.ResolveRunMergeMethod, E93.2 /
+// #4658). The webhook / resolveReviewStageOnMerge path settles the review
+// stage on the merge.
 func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
+	mm, err := server.ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return err
+	}
 	scope, repo, number, err := m.mergeTarget(runRow)
 	if err != nil {
 		return err
 	}
-	return m.gh.QueueMerge(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
+	return m.gh.QueueMerge(ctx, scope, repo, number, mm.Method, headSHA)
 }
 
 // parseInstallationHostAllowlist splits a comma-separated
