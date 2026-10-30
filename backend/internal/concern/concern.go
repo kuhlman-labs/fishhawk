@@ -25,6 +25,7 @@
 package concern
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -84,6 +85,19 @@ const (
 var (
 	// ErrNotFound means no concern row matches the lookup.
 	ErrNotFound = errors.New("concern: not found")
+
+	// ErrLabelConflict means ApplyLabel's optimistic guard matched no row: the
+	// concern's judgement or duplicate_of changed between the caller's read
+	// and the write (a concurrent relabel), so the label was NOT applied.
+	ErrLabelConflict = errors.New("concern: label conflict: judgement or duplicate_of changed since it was read")
+
+	// ErrDuplicateTargetNotInRun is the sentinel a duplicate_of refusal under
+	// JudgementRuleDuplicateOfNotFound unwraps to (E94.8 / #4841, M1): the
+	// target is missing OR belongs to another run, indistinguishably. It is
+	// deliberately NOT ErrNotFound, so a target that vanishes between a
+	// caller's pre-check and ApplyLabel maps to the same 400 duplicate_of rule
+	// and never to the labelled concern's 404.
+	ErrDuplicateTargetNotInRun = errors.New("concern: duplicate_of target is not a concern of this run")
 )
 
 // InvalidTransitionError reports a state-machine violation. It is a
@@ -430,6 +444,23 @@ const (
 	// JudgementRuleTradeoffCostWithoutTradeoff: a tradeoff_cost was sent with
 	// a judgement other than tradeoff.
 	JudgementRuleTradeoffCostWithoutTradeoff = "tradeoff_cost_without_tradeoff"
+	// JudgementRuleTradeoffCostTooLong: the tradeoff_cost exceeds the REST
+	// layer's byte cap; it is refused, never truncated (E94.8 / #4841).
+	JudgementRuleTradeoffCostTooLong = "tradeoff_cost_too_long"
+	// JudgementRuleDuplicateOfExcludesJudgement: a label sent duplicate_of
+	// together with a judgement or a tradeoff_cost. A duplicate inherits its
+	// chain root's judgement, so it records none of its own (E94.8 / #4841).
+	JudgementRuleDuplicateOfExcludesJudgement = "duplicate_of_excludes_judgement"
+	// JudgementRuleDuplicateOfNotFound: the duplicate_of target is not a
+	// concern of the labelled concern's run. It covers a MISSING target and a
+	// target of ANOTHER run with one rule and one message naming only the
+	// labelled concern's own run (E94.8 / #4841, approval condition M1), so a
+	// caller cannot probe another run's, or another account's, concern ids.
+	JudgementRuleDuplicateOfNotFound = "duplicate_of_not_found"
+	// JudgementRuleDuplicateOfNotEarlier: the same-run target does not sort
+	// strictly before the labelled concern in the run ledger (LedgerBefore),
+	// which also refuses a self-link (E94.8 / #4841).
+	JudgementRuleDuplicateOfNotEarlier = "duplicate_of_not_earlier"
 )
 
 // JudgementError is a refused human judgement (E94.7 / #4840). Field names the
@@ -441,10 +472,19 @@ type JudgementError struct {
 	Rule    string
 	Message string
 	Prefix  string
+	// sentinel is what Unwrap returns: ErrDuplicateTargetNotInRun on a
+	// JudgementRuleDuplicateOfNotFound refusal, nil otherwise.
+	sentinel error
 }
 
 func (e JudgementError) Error() string {
 	return "concern: " + e.Message
+}
+
+// Unwrap lets errors.Is match ErrDuplicateTargetNotInRun on a
+// JudgementRuleDuplicateOfNotFound refusal; every other rule unwraps to nil.
+func (e JudgementError) Unwrap() error {
+	return e.sentinel
 }
 
 // reasonPrefixes are the Captain's interim waive-reason prefixes (FO ruling
@@ -571,6 +611,106 @@ func checkTradeoffCost(j Judgement, tradeoffCost string) error {
 		return JudgementError{Field: "tradeoff_cost", Rule: JudgementRuleTradeoffCostWithoutTradeoff,
 			Message: fmt.Sprintf("tradeoff_cost is recorded only with judgement %q, got judgement %q: drop tradeoff_cost or send judgement %q",
 				JudgementTradeoff, j, JudgementTradeoff)}
+	}
+	return nil
+}
+
+// LedgerBefore reports whether a sorts strictly before b in a run's concern
+// ledger (E94.8 / #4841): origin_review_sequence, then created_at, then the id's
+// 16 bytes — exactly ListReviewConcernsByRun's ORDER BY (PostgreSQL orders uuid
+// by memcmp). It is a strict total order over immutable columns, so
+// LedgerBefore(a, a) is false and no two rows precede each other.
+func LedgerBefore(a, b *Concern) bool {
+	if a.OriginReviewSequence != b.OriginReviewSequence {
+		return a.OriginReviewSequence < b.OriginReviewSequence
+	}
+	if !a.CreatedAt.Equal(b.CreatedAt) {
+		return a.CreatedAt.Before(b.CreatedAt)
+	}
+	return bytes.Compare(a.ID[:], b.ID[:]) < 0
+}
+
+// CheckDuplicateTarget is the ONE duplicate_of guard (E94.8 / #4841, ADR-117
+// D1): the REST handler calls it before any audit append and ApplyLabel calls
+// it again before the write. target is the duplicate_of row, nil when no row
+// has that id. It refuses, as a JudgementError on field duplicate_of:
+//
+//   - JudgementRuleDuplicateOfNotFound when target is nil OR belongs to another
+//     run. Both cases return the IDENTICAL error, whose message and fields name
+//     only c's own run (approval condition M1): never the target's run,
+//     account or existence. It unwraps to ErrDuplicateTargetNotInRun.
+//   - JudgementRuleDuplicateOfNotEarlier when target does not sort strictly
+//     before c (LedgerBefore), which also refuses a self-link. Because the
+//     ledger order is a strict total order, every admitted link points
+//     strictly earlier, so a chain of admitted links can never form a cycle.
+func CheckDuplicateTarget(c, target *Concern) error {
+	if c == nil {
+		return errors.New("concern: duplicate_of check: labelled concern required")
+	}
+	if target == nil || target.RunID != c.RunID {
+		return duplicateOfNotFound(c)
+	}
+	if !LedgerBefore(target, c) {
+		return JudgementError{Field: "duplicate_of", Rule: JudgementRuleDuplicateOfNotEarlier,
+			Message: fmt.Sprintf("duplicate_of %s (origin review sequence %d) does not sort before concern %s (origin review sequence %d) in run %s's ledger: a duplicate must name an EARLIER concern of its run; label the other concern as the duplicate instead",
+				target.ID, target.OriginReviewSequence, c.ID, c.OriginReviewSequence, c.RunID)}
+	}
+	return nil
+}
+
+// duplicateOfNotFound builds the one refusal for a missing or foreign
+// duplicate_of target. It is computed from the labelled concern ONLY, so the
+// two cases cannot differ by a byte.
+func duplicateOfNotFound(c *Concern) error {
+	return JudgementError{Field: "duplicate_of", Rule: JudgementRuleDuplicateOfNotFound,
+		Message:  fmt.Sprintf("duplicate_of names no concern of run %s: a duplicate must name an earlier concern of the same run", c.RunID),
+		sentinel: ErrDuplicateTargetNotInRun}
+}
+
+// Label is what ApplyLabel records (E94.8 / #4841, ADR-117 D1 phase 3): EITHER
+// a human Judgement (with TradeoffCost only for a tradeoff) OR DuplicateOf, the
+// id of an earlier same-run concern whose chain root's judgement this one
+// inherits. ActorKind is the user|agent kind of the verb's audit row; Backfill
+// records judgement_backfill. PriorJudgement and PriorDuplicateOf are the RAW
+// values the caller read (and audited) before the write: the store applies the
+// label only while the row still holds them, else ErrLabelConflict.
+type Label struct {
+	Judgement        Judgement
+	TradeoffCost     string
+	DuplicateOf      *uuid.UUID
+	ActorKind        string
+	Backfill         bool
+	PriorJudgement   Judgement
+	PriorDuplicateOf *uuid.UUID
+}
+
+// Validate refuses a Label the store must not record, before any read: exactly
+// one of Judgement and DuplicateOf must be set. Both set refuses
+// JudgementRuleDuplicateOfExcludesJudgement on field duplicate_of, and a
+// TradeoffCost beside DuplicateOf refuses the same rule on field tradeoff_cost.
+// Neither set refuses JudgementRuleRequired. A judgement must be a human one
+// (checkHumanJudgement) with a consistent cost (checkTradeoffCost). A blank
+// ActorKind is refused.
+func (l Label) Validate() error {
+	if l.DuplicateOf != nil {
+		if l.Judgement != "" {
+			return JudgementError{Field: "duplicate_of", Rule: JudgementRuleDuplicateOfExcludesJudgement,
+				Message: "duplicate_of and judgement are exclusive: a duplicate inherits its chain root's judgement; send one or the other"}
+		}
+		if l.TradeoffCost != "" {
+			return JudgementError{Field: "tradeoff_cost", Rule: JudgementRuleDuplicateOfExcludesJudgement,
+				Message: "duplicate_of and tradeoff_cost are exclusive: a duplicate inherits its chain root's judgement and records no cost of its own"}
+		}
+	} else {
+		if err := checkHumanJudgement(l.Judgement); err != nil {
+			return err
+		}
+		if err := checkTradeoffCost(l.Judgement, l.TradeoffCost); err != nil {
+			return err
+		}
+	}
+	if strings.TrimSpace(l.ActorKind) == "" {
+		return errors.New("concern: label: actor kind required")
 	}
 	return nil
 }
@@ -885,6 +1025,21 @@ type Repository interface {
 	// (no copy) or waits for this transaction (and the sweep's parent scan
 	// sees the copy). Returns ONLY the newly inserted copies.
 	ImportRolledUp(ctx context.Context, p ImportRolledUpParams) ([]*Concern, error)
+
+	// ApplyLabel records a human relabel (E94.8 / #4841, ADR-117 D1 phase 3):
+	// l.Validate() runs before any read; then the concern is read (ErrNotFound
+	// when absent) and, for a duplicate label, its target is read and
+	// CheckDuplicateTarget applied — a target with no row is refused exactly
+	// like a foreign one (JudgementRuleDuplicateOfNotFound, unwrapping to
+	// ErrDuplicateTargetNotInRun, never ErrNotFound). ONE UPDATE then writes
+	// judgement (unlabelled for a duplicate label), judgement_actor_kind,
+	// judgement_delegated = judgement_bulk = false, judgement_backfill,
+	// tradeoff_cost ('' for a duplicate) and duplicate_of (NULL for a judgement
+	// label, clearing a prior link), guarded on l.PriorJudgement and
+	// l.PriorDuplicateOf: a row that no longer holds them is ErrLabelConflict
+	// with nothing written. It NEVER touches state, state_reason, outcome or
+	// updated_at: a label is not a lifecycle event.
+	ApplyLabel(ctx context.Context, id uuid.UUID, l Label) (*Concern, error)
 
 	// StampOpenAtMerge sets OutcomeOpenAtMerge on every concern of the given
 	// runs whose state is raised, addressed_pending, reopened or superseded

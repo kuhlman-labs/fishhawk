@@ -1440,3 +1440,251 @@ func TestApplyHumanDisposition_RefusesInvalidTransition(t *testing.T) {
 		t.Errorf("unknown id err = %v, want ErrNotFound", err)
 	}
 }
+
+// lifecycleCols reads the columns a label must never touch straight from the
+// pool, updated_at as text, so a test compares them byte for byte (E94.8 /
+// #4841).
+func (h rollupHarness) lifecycleCols(t *testing.T, id uuid.UUID) string {
+	t.Helper()
+	var state, reason, outcome, updated string
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT state, state_reason, outcome, updated_at::text FROM review_concerns WHERE id = $1", id).
+		Scan(&state, &reason, &outcome, &updated); err != nil {
+		t.Fatalf("read lifecycle columns: %v", err)
+	}
+	return strings.Join([]string{state, reason, outcome, updated}, "|")
+}
+
+// labelAt inserts one concern on runID at origin sequence seq, in its own
+// InsertRaised call so the ledger order is deterministic.
+func (h rollupHarness) labelAt(t *testing.T, runID, stageID uuid.UUID, seq int64, note string) *concern.Concern {
+	t.Helper()
+	return h.insertOn(t, runID, stageID, concern.InsertRaisedParams{OriginReviewSequence: seq},
+		concern.RaisedConcern{Severity: "high", Note: note})[0]
+}
+
+// TestApplyLabel_RecordsJudgement: a judgement label records the judgement,
+// actor kind, backfill and cost, writes delegated and bulk false, and leaves
+// state, state_reason, outcome and updated_at BYTE-EQUAL (C3). The row is
+// waived with an outcome and a stale delegated/bulk pair first, so an
+// overwrite of any of them is observable.
+func TestApplyLabel_RecordsJudgement(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	row := h.labelAt(t, h.parentRun, h.parentStage, 3, "relabelled")
+	if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateWaived, "waived long ago"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	h.rawSet(t, row.ID, "outcome = 'waived', judgement = 'defect', judgement_delegated = true, judgement_bulk = true")
+	before := h.lifecycleCols(t, row.ID)
+
+	ret, err := h.repo.ApplyLabel(ctx, row.ID, concern.Label{
+		Judgement: concern.JudgementTradeoff, TradeoffCost: "slower cold start", ActorKind: "user", Backfill: true,
+		PriorJudgement: concern.JudgementDefect,
+	})
+	if err != nil {
+		t.Fatalf("ApplyLabel: %v", err)
+	}
+	for name, got := range map[string]*concern.Concern{"returned": ret, "re-read": h.get(t, row.ID)} {
+		if got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "user" || got.TradeoffCost != "slower cold start" || !got.JudgementBackfill {
+			t.Errorf("%s: judgement %q actor %q cost %q backfill %v, want tradeoff / user / slower cold start / true",
+				name, got.Judgement, got.JudgementActorKind, got.TradeoffCost, got.JudgementBackfill)
+		}
+		if got.JudgementDelegated || got.JudgementBulk || got.DuplicateOf != nil {
+			t.Errorf("%s: delegated %v bulk %v duplicate_of %v, want false / false / nil", name, got.JudgementDelegated, got.JudgementBulk, got.DuplicateOf)
+		}
+	}
+	if after := h.lifecycleCols(t, row.ID); after != before {
+		t.Errorf("state|state_reason|outcome|updated_at changed by a label:\n before %s\n after  %s", before, after)
+	}
+}
+
+// TestApplyLabel_DuplicateLinksAndClears: a duplicate label sets duplicate_of
+// and stores judgement unlabelled with no cost (the row's own stale judgement
+// is cleared), so ResolveJudgements reads the root's judgement; a later
+// judgement label clears duplicate_of.
+func TestApplyLabel_DuplicateLinksAndClears(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	dup := h.labelAt(t, h.parentRun, h.parentStage, 3, "duplicate")
+	h.rawSet(t, root.ID, "judgement = 'defect'")
+	h.rawSet(t, dup.ID, "judgement = 'tradeoff', tradeoff_cost = 'stale cost'")
+
+	got, err := h.repo.ApplyLabel(ctx, dup.ID, concern.Label{DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementTradeoff})
+	if err != nil {
+		t.Fatalf("duplicate label: %v", err)
+	}
+	if got.DuplicateOf == nil || *got.DuplicateOf != root.ID || got.Judgement != concern.JudgementUnlabelled || got.TradeoffCost != "" {
+		t.Errorf("after duplicate label: duplicate_of %v judgement %q cost %q, want %s / unlabelled / empty", got.DuplicateOf, got.Judgement, got.TradeoffCost, root.ID)
+	}
+	eff := concern.ResolveJudgements(h.byRun(t, h.parentRun))[dup.ID]
+	if eff.Judgement != concern.JudgementDefect || eff.InheritedFrom == nil || *eff.InheritedFrom != root.ID {
+		t.Errorf("effective judgement of the duplicate = %+v, want defect inherited from %s", eff, root.ID)
+	}
+
+	got, err = h.repo.ApplyLabel(ctx, dup.ID, concern.Label{
+		Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled, PriorDuplicateOf: &root.ID,
+	})
+	if err != nil {
+		t.Fatalf("judgement relabel: %v", err)
+	}
+	if reread := h.get(t, dup.ID); got.DuplicateOf != nil || reread.DuplicateOf != nil || reread.Judgement != concern.JudgementNoDefect {
+		t.Errorf("after a judgement relabel: duplicate_of %v (re-read %v) judgement %q, want nil / nil / no_defect", got.DuplicateOf, reread.DuplicateOf, reread.Judgement)
+	}
+}
+
+// TestApplyLabel_DuplicateKeepsInheritingAfterHumanWaive pins approval
+// condition M2 (option a, ADR-117 D1): a human verb's judgement on a
+// duplicate-linked concern is RECORDED on the row, but the EFFECTIVE judgement
+// stays the chain root's until the concern is relabelled with an explicit
+// judgement.
+func TestApplyLabel_DuplicateKeepsInheritingAfterHumanWaive(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	dup := h.labelAt(t, h.parentRun, h.parentStage, 3, "duplicate")
+	h.rawSet(t, root.ID, "judgement = 'defect'")
+	if _, err := h.repo.ApplyLabel(ctx, dup.ID, concern.Label{DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled}); err != nil {
+		t.Fatalf("duplicate label: %v", err)
+	}
+	if _, err := h.repo.ApplyHumanDisposition(ctx, dup.ID, concern.StateWaived, "false_positive: dup", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "user",
+	}); err != nil {
+		t.Fatalf("human waive: %v", err)
+	}
+	stored := h.get(t, dup.ID)
+	if stored.Judgement != concern.JudgementNoDefect || stored.DuplicateOf == nil || *stored.DuplicateOf != root.ID {
+		t.Fatalf("after the waive: stored judgement %q duplicate_of %v, want no_defect recorded and the link kept", stored.Judgement, stored.DuplicateOf)
+	}
+	eff := concern.ResolveJudgements(h.byRun(t, h.parentRun))[dup.ID]
+	if eff.Judgement != concern.JudgementDefect || eff.InheritedFrom == nil || *eff.InheritedFrom != root.ID {
+		t.Errorf("effective judgement after a human waive on a duplicate = %+v, want the root's defect inherited from %s", eff, root.ID)
+	}
+}
+
+// TestApplyLabel_RefusesCrossRunTarget calls the STORE directly, so no
+// handler pre-check masks the guard (C4). The target is in another run at a
+// LOWER sequence, so the ordering rule would admit it. M1: the refusal is the
+// same as for a missing target and never names the target's run.
+func TestApplyLabel_RefusesCrossRunTarget(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	foreign := h.labelAt(t, h.childRun, h.childStg, 1, "another run's concern")
+	row := h.labelAt(t, h.parentRun, h.parentStage, 5, "labelled")
+	before := h.lifecycleCols(t, row.ID)
+
+	crossErr := func() error {
+		_, err := h.repo.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &foreign.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+		return err
+	}()
+	var je concern.JudgementError
+	if !errors.As(crossErr, &je) || je.Rule != concern.JudgementRuleDuplicateOfNotFound || !errors.Is(crossErr, concern.ErrDuplicateTargetNotInRun) || errors.Is(crossErr, concern.ErrNotFound) {
+		t.Fatalf("cross-run err = %v, want a %s refusal (ErrDuplicateTargetNotInRun, not ErrNotFound)", crossErr, concern.JudgementRuleDuplicateOfNotFound)
+	}
+	if strings.Contains(crossErr.Error(), h.childRun.String()) {
+		t.Errorf("cross-run refusal %q names the foreign run %s", crossErr, h.childRun)
+	}
+	got := h.get(t, row.ID)
+	if got.DuplicateOf != nil || got.Judgement != concern.JudgementUnlabelled {
+		t.Errorf("after a refused cross-run label: duplicate_of %v judgement %q, want nil / unlabelled", got.DuplicateOf, got.Judgement)
+	}
+	if after := h.lifecycleCols(t, row.ID); after != before {
+		t.Errorf("a refused label changed the row: %s -> %s", before, after)
+	}
+
+	missing := uuid.New()
+	_, missingErr := h.repo.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &missing, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+	if missingErr == nil || missingErr.Error() != crossErr.Error() {
+		t.Errorf("missing-target refusal %q differs from the cross-run refusal %q; M1 requires them identical", missingErr, crossErr)
+	}
+	if errors.Is(missingErr, concern.ErrNotFound) || !errors.Is(missingErr, concern.ErrDuplicateTargetNotInRun) {
+		t.Errorf("missing-target err = %v, want ErrDuplicateTargetNotInRun and never ErrNotFound (LOW 2)", missingErr)
+	}
+}
+
+// TestApplyLabel_RefusesNotEarlier: a self-link and a link to a LATER
+// same-run concern are refused with nothing written.
+func TestApplyLabel_RefusesNotEarlier(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	earlier := h.labelAt(t, h.parentRun, h.parentStage, 1, "earlier")
+	later := h.labelAt(t, h.parentRun, h.parentStage, 3, "later")
+	for name, tc := range map[string]struct{ labelled, target uuid.UUID }{
+		"self":    {earlier.ID, earlier.ID},
+		"reverse": {earlier.ID, later.ID},
+	} {
+		target := tc.target
+		_, err := h.repo.ApplyLabel(ctx, tc.labelled, concern.Label{DuplicateOf: &target, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+		var je concern.JudgementError
+		if !errors.As(err, &je) || je.Rule != concern.JudgementRuleDuplicateOfNotEarlier {
+			t.Errorf("%s: err = %v, want a %s refusal", name, err, concern.JudgementRuleDuplicateOfNotEarlier)
+		}
+		if got := h.get(t, tc.labelled); got.DuplicateOf != nil {
+			t.Errorf("%s: duplicate_of = %v after a refusal, want nil", name, got.DuplicateOf)
+		}
+	}
+}
+
+// TestApplyLabel_StalePriorConflicts: a label whose prior judgement or prior
+// duplicate_of no longer matches the row is ErrLabelConflict with nothing
+// written (C5). The row is changed DIRECTLY after the caller's read, as a
+// concurrent relabel would.
+func TestApplyLabel_StalePriorConflicts(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	row := h.labelAt(t, h.parentRun, h.parentStage, 3, "raced")
+	read := h.get(t, row.ID)
+
+	h.rawSet(t, row.ID, "judgement = 'defect'")
+	_, err := h.repo.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: read.Judgement})
+	if !errors.Is(err, concern.ErrLabelConflict) {
+		t.Fatalf("stale prior judgement: err = %v, want ErrLabelConflict", err)
+	}
+	if got := h.get(t, row.ID); got.Judgement != concern.JudgementDefect {
+		t.Errorf("after a stale-judgement conflict: judgement %q, want the intervening defect kept", got.Judgement)
+	}
+
+	h.rawSet(t, row.ID, "judgement = 'unlabelled', duplicate_of = $2", root.ID)
+	_, err = h.repo.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+	if !errors.Is(err, concern.ErrLabelConflict) {
+		t.Fatalf("stale prior duplicate_of: err = %v, want ErrLabelConflict", err)
+	}
+	if got := h.get(t, row.ID); got.DuplicateOf == nil || *got.DuplicateOf != root.ID || got.Judgement != concern.JudgementUnlabelled {
+		t.Errorf("after a stale-link conflict: duplicate_of %v judgement %q, want the intervening link kept", got.DuplicateOf, got.Judgement)
+	}
+}
+
+// TestApplyLabel_RefusesInvalid: every invalid label is refused before any
+// read or write, and an unknown labelled id is ErrNotFound.
+func TestApplyLabel_RefusesInvalid(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	row := h.labelAt(t, h.parentRun, h.parentStage, 3, "never labelled")
+	before := h.lifecycleCols(t, row.ID)
+	for name, l := range map[string]concern.Label{
+		"judgement and duplicate_of": {Judgement: concern.JudgementDefect, DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"cost with duplicate_of":     {TradeoffCost: "c", DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"neither":                    {ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"unlabelled":                 {Judgement: concern.JudgementUnlabelled, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"tradeoff without cost":      {Judgement: concern.JudgementTradeoff, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"blank actor kind":           {Judgement: concern.JudgementDefect, PriorJudgement: concern.JudgementUnlabelled},
+	} {
+		if _, err := h.repo.ApplyLabel(ctx, row.ID, l); err == nil {
+			t.Errorf("%s: ApplyLabel = nil error, want a refusal", name)
+		}
+		got := h.get(t, row.ID)
+		if got.Judgement != concern.JudgementUnlabelled || got.DuplicateOf != nil || got.JudgementActorKind != "" || got.TradeoffCost != "" {
+			t.Fatalf("%s: after a refused label: judgement %q duplicate_of %v actor %q cost %q, want nothing written",
+				name, got.Judgement, got.DuplicateOf, got.JudgementActorKind, got.TradeoffCost)
+		}
+	}
+	if after := h.lifecycleCols(t, row.ID); after != before {
+		t.Errorf("refused labels changed the row: %s -> %s", before, after)
+	}
+	if _, err := h.repo.ApplyLabel(ctx, uuid.New(), concern.Label{Judgement: concern.JudgementDefect, ActorKind: "user"}); !errors.Is(err, concern.ErrNotFound) {
+		t.Errorf("unknown labelled id: err = %v, want ErrNotFound", err)
+	}
+}
