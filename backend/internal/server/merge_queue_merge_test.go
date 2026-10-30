@@ -1185,6 +1185,79 @@ func TestMergeOnPass_ForgeRefusalEjectsExactlyOnce(t *testing.T) {
 	}
 }
 
+// TestMergeOnPass_ChecksNotSettledKeepsRealisticForgeText (#4705): a
+// checks_not_settled forge_detail is the short fixed lead plus the forge's
+// text sanitised BEFORE the lead is added, so a realistic unstable-status
+// refusal (built the way githubclient builds it) survives the
+// forgeApprovalDetailMaxBytes bound WHOLE at the outcome, the
+// merge_queue_ejected write sink and the read projection. The lead is
+// pinned here as a literal, independently of mergeQueueChecksNotSettledDetail,
+// so the fixture preconditions hold whatever the production lead is: the
+// sanitised forge text is at least 150 bytes (more than the old 165-byte
+// lead left room for) and lead + text fit the bound. MECHANISMS: restoring
+// the old 165-byte lead cuts the forge text at both sinks (RED on the
+// outcome and on both sink equalities); composing with the raw
+// mergeErr.Error() puts the token in the outcome's ForgeDetail (RED in
+// "outcome" — the sinks re-sanitise, so only the outcome observes that
+// control).
+func TestMergeOnPass_ChecksNotSettledKeepsRealisticForgeText(t *testing.T) {
+	// Built at runtime so no source line matches a credential pattern.
+	token := "gh" + "s_" + strings.Repeat("S3", 18)
+	refusal := fmt.Errorf("%w: %w: enable auto-merge: Pull request Pull request is in unstable status (installation token %s)",
+		forge.ErrValidation, forge.ErrPullRequestUnstableStatus, token)
+	const lead = "the checks were not settled at the merge attempt: "
+	forgeText := mergeQueueYieldDetail(refusal.Error())
+	if len(forgeText) < 150 || len(lead)+len(forgeText) > forgeApprovalDetailMaxBytes {
+		t.Fatalf("fixture: sanitised forge text %d bytes, lead + text %d bytes; want >= 150 and <= %d",
+			len(forgeText), len(lead)+len(forgeText), forgeApprovalDetailMaxBytes)
+	}
+	want := lead + forgeText
+	t.Run("outcome", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.ready("ns", "h1", mcvUndelegatedSpecYAML)
+		w.merger.err = refusal
+		w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{MergeStateStatus: "CLEAN"})
+		out := w.decide(req)
+		requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonForgeMergeRefused)
+		if out.State != mergequeue.StateEjected || out.ForgeReason != mergeQueueForgeReasonChecksNotSettled {
+			t.Fatalf("outcome state %s forge_reason %q, want ejected %s", out.State, out.ForgeReason, mergeQueueForgeReasonChecksNotSettled)
+		}
+		if !strings.HasPrefix(out.ForgeDetail, lead) || strings.Contains(out.ForgeDetail, token) || out.ForgeDetail != want {
+			t.Fatalf("outcome forge_detail = %q, want %q (the lead, then the whole sanitised forge text)", out.ForgeDetail, want)
+		}
+	})
+	t.Run("sinks", func(t *testing.T) {
+		w := newMQMWorld(t)
+		ctx := context.Background()
+		r, _ := w.ready("ns", "h1", mcvUndelegatedSpecYAML)
+		b := w.seed("nsb", "b0", []byte(mcvUndelegatedSpecYAML))
+		if _, err := w.store.Enqueue(ctx, mergequeue.EnqueueRequest{RunID: b.id, BaseRef: mcqBase, HeadSHA: "b0"}); err != nil {
+			t.Fatalf("enqueue B: %v", err)
+		}
+		w.merger.err = refusal
+		w.gh.setReviewSnapshot(r.pr, mcqReviewSnapshot{MergeStateStatus: "CLEAN"})
+		w.pumpBase(r)
+
+		w.requireMerges(1)
+		if len(w.rows(b, CategoryMergeCandidateQueueAdmitted)) == 0 {
+			t.Fatal("the next entry was not admitted: the line is wedged")
+		}
+		w.requireState(r, mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused)
+		p := w.oneEjection(r, mergeCandidateQueueReasonForgeMergeRefused, mergeQueueEjectNextMergeRun)
+		if p["forge_reason"] != mergeQueueForgeReasonChecksNotSettled {
+			t.Fatalf("merge_queue_ejected forge_reason = %v, want %s", p["forge_reason"], mergeQueueForgeReasonChecksNotSettled)
+		}
+		ej, found, err := w.store.LatestForRun(ctx, r.id)
+		if err != nil || !found || ej.State != mergequeue.StateEjected {
+			t.Fatalf("latest entry = %+v found %v err %v, want the ejected entry", ej, found, err)
+		}
+		written, read := fmt.Sprint(p["forge_detail"]), w.srv.mergeQueueEjectionProjectionFor(ctx, ej).ForgeDetail
+		if written != want || read != want {
+			t.Fatalf("forge_detail: write sink %q, read sink %q; want both %q (the lead, then the whole sanitised forge text)", written, read, want)
+		}
+	})
+}
+
 // TestMergeQueueOnPass_ReviewRequiredRefusalStillYields is the ADR-112 R3
 // row-4 regression guard (first-officer ruling C-R4): a 405 refusal with a
 // REVIEW_REQUIRED snapshot still YIELDS forge_review_required with next_step
