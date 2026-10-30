@@ -51,6 +51,28 @@ UPDATE review_concerns
    AND state = sqlc.arg(from_state)
 RETURNING *;
 
+-- name: UpdateReviewConcernStateJudged :one
+-- E94.7 / #4840 (ADR-117 D1 phase 2): the HUMAN verbs' transition
+-- (ApplyHumanDisposition). The same from-state guard as
+-- UpdateReviewConcernState, plus the verb's outcome and every judgement column
+-- in the SAME UPDATE: judgement_backfill is written false (the verb judges
+-- now, not after the fact) and duplicate_of is never touched (phase 3, #4841).
+-- A re-judgement overwrites the stored judgement.
+UPDATE review_concerns
+   SET state = $2,
+       state_reason = $3,
+       outcome = sqlc.arg(outcome),
+       judgement = sqlc.arg(judgement),
+       judgement_actor_kind = sqlc.arg(judgement_actor_kind),
+       judgement_delegated = sqlc.arg(judgement_delegated),
+       judgement_bulk = sqlc.arg(judgement_bulk),
+       judgement_backfill = false,
+       tradeoff_cost = sqlc.arg(tradeoff_cost),
+       updated_at = now()
+ WHERE id = $1
+   AND state = sqlc.arg(from_state)
+RETURNING *;
+
 -- name: ImportRolledUpReviewConcern :one
 -- E94.1 / #4692 (ADR-117 D2): copy one decomposition child's concern into its
 -- parent's ledger as a raised implement-stage row. The source's origin round,

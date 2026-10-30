@@ -469,3 +469,88 @@ func (q *Queries) UpdateReviewConcernState(ctx context.Context, arg UpdateReview
 	)
 	return i, err
 }
+
+const updateReviewConcernStateJudged = `-- name: UpdateReviewConcernStateJudged :one
+UPDATE review_concerns
+   SET state = $2,
+       state_reason = $3,
+       outcome = $4,
+       judgement = $5,
+       judgement_actor_kind = $6,
+       judgement_delegated = $7,
+       judgement_bulk = $8,
+       judgement_backfill = false,
+       tradeoff_cost = $9,
+       updated_at = now()
+ WHERE id = $1
+   AND state = $10
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of
+`
+
+type UpdateReviewConcernStateJudgedParams struct {
+	ID                 uuid.UUID `json:"id"`
+	State              string    `json:"state"`
+	StateReason        string    `json:"state_reason"`
+	Outcome            string    `json:"outcome"`
+	Judgement          string    `json:"judgement"`
+	JudgementActorKind string    `json:"judgement_actor_kind"`
+	JudgementDelegated bool      `json:"judgement_delegated"`
+	JudgementBulk      bool      `json:"judgement_bulk"`
+	TradeoffCost       string    `json:"tradeoff_cost"`
+	FromState          string    `json:"from_state"`
+}
+
+// E94.7 / #4840 (ADR-117 D1 phase 2): the HUMAN verbs' transition
+// (ApplyHumanDisposition). The same from-state guard as
+// UpdateReviewConcernState, plus the verb's outcome and every judgement column
+// in the SAME UPDATE: judgement_backfill is written false (the verb judges
+// now, not after the fact) and duplicate_of is never touched (phase 3, #4841).
+// A re-judgement overwrites the stored judgement.
+func (q *Queries) UpdateReviewConcernStateJudged(ctx context.Context, arg UpdateReviewConcernStateJudgedParams) (ReviewConcern, error) {
+	row := q.db.QueryRow(ctx, updateReviewConcernStateJudged,
+		arg.ID,
+		arg.State,
+		arg.StateReason,
+		arg.Outcome,
+		arg.Judgement,
+		arg.JudgementActorKind,
+		arg.JudgementDelegated,
+		arg.JudgementBulk,
+		arg.TradeoffCost,
+		arg.FromState,
+	)
+	var i ReviewConcern
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.StageID,
+		&i.StageKind,
+		&i.OriginReviewSequence,
+		&i.ReviewerModel,
+		&i.Severity,
+		&i.Category,
+		&i.Note,
+		&i.State,
+		&i.StateReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SuggestedPatch,
+		&i.NewEvidence,
+		&i.SettledRef,
+		&i.ReviewerRole,
+		&i.QuoteUnverified,
+		&i.SeverityClampedFrom,
+		&i.Provenance,
+		&i.CheckKey,
+		&i.Outcome,
+		&i.RolledUpFrom,
+		&i.Judgement,
+		&i.JudgementActorKind,
+		&i.JudgementDelegated,
+		&i.JudgementBulk,
+		&i.JudgementBackfill,
+		&i.TradeoffCost,
+		&i.DuplicateOf,
+	)
+	return i, err
+}
