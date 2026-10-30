@@ -196,9 +196,11 @@ func TestForgeApprovalE2E_InlineRefusals(t *testing.T) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.gh.set(func() { w.gh.graphQLFail[r.pr] = 5 })
 		}, forgeApprovalUndetermined, forgeApprovalReasonSnapshotUnreadable, forgeApprovalNextRetryAfter, false, ""},
+		// E93.2 / #4658 (approval condition C2): the pre-claim merge-method
+		// check fails CLOSED on the unparseable admission spec before the fold.
 		{"unparseable recorded spec", func(w *mqmWorld, r *mcqRun) {
 			w.exec(`UPDATE runs SET workflow_spec = $1 WHERE id = $2`, []byte(faeUnparseableSpecYAML), r.id)
-		}, forgeApprovalUndetermined, forgeApprovalReasonSpecUndeterminable, forgeApprovalNextRetryAfter, true, ""},
+		}, "", MergeMethodRefusalUndeterminable, "", true, ""},
 		{"gitlab run with a declared gate", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.exec(`UPDATE runs SET installation_ref = 'gitlab:5' WHERE id = $1`, r.id)
@@ -223,6 +225,16 @@ func TestForgeApprovalE2E_InlineRefusals(t *testing.T) {
 			resp := w.mergeRun(r)
 			if resp.Code != http.StatusConflict {
 				t.Fatalf("merge = %d %s, want 409", resp.Code, resp.Body.String())
+			}
+			if tc.reason == MergeMethodRefusalUndeterminable {
+				if d := mmrErrorDetails(t, resp.Body.Bytes(), mergeCodeMergeMethodRefused); d["reason"] != tc.reason {
+					t.Fatalf("details = %v, want reason %s", d, tc.reason)
+				}
+				w.requireNothingRecorded(r, m)
+				if tc.noGraph && w.gh.snapshotCalls() != 0 {
+					t.Fatalf("snapshot calls = %d, want 0", w.gh.snapshotCalls())
+				}
+				return
 			}
 			d := faeRefusal(t, resp.Body.Bytes())
 			detail, _ := d["detail"].(string)

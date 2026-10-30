@@ -387,3 +387,31 @@ func TestMergeQueueEjectNextStep_Total(t *testing.T) {
 		}
 	}
 }
+
+// TestMergeQueueForgeReason_MergeMethodRefused (E93.2 / #4658): a
+// *MergeMethodRefusalError riding alongside ErrPullRequestNotMergeable maps to
+// merge_method_refused (decided BEFORE not_mergeable), and its remedy names
+// the settings-or-by-hand remedy and the admission-spec semantics, never forge
+// text. Counterfactual: deleting the merge_method_refused case maps the
+// dual-sentinel refusal to not_mergeable (RED).
+func TestMergeQueueForgeReason_MergeMethodRefused(t *testing.T) {
+	ref := &MergeMethodRefusalError{Method: "merge", Source: MergeMethodSourceDeclared, Reason: MergeMethodRefusalForgeDisallows,
+		Allowed: []string{"squash"}, Cause: fmt.Errorf("%w: %s", forge.ErrPullRequestNotMergeable, fmmSecretText)}
+	if !errors.Is(ref, forge.ErrPullRequestNotMergeable) {
+		t.Fatalf("fixture: the refusal must also carry ErrPullRequestNotMergeable (isolates the case ordering)")
+	}
+	for _, err := range []error{ref, fmt.Errorf("pinned merge: %w", ref)} {
+		if got := mergeQueueForgeReasonFor(err); got != mergeQueueForgeReasonMergeMethodRefused {
+			t.Errorf("mergeQueueForgeReasonFor(%T) = %q, want %q", err, got, mergeQueueForgeReasonMergeMethodRefused)
+		}
+	}
+	r := mergeQueueEjectRemedy(mergeQueueEjectNextMergeRun, mergeQueueForgeReasonMergeMethodRefused)
+	for _, want := range []string{"merge settings", "by hand", "admitted after it merges", "fishhawk_merge_run"} {
+		if !strings.Contains(r, want) {
+			t.Errorf("remedy = %q, want it to contain %q", r, want)
+		}
+	}
+	if strings.Contains(r, "ghs_SENTINEL") {
+		t.Errorf("remedy carries forge text: %q", r)
+	}
+}

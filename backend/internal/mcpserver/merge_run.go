@@ -151,7 +151,7 @@ type MergeRunOutput struct {
 	// dispatched through the shared GitHubMerger seam. FALSE on checks_pending —
 	// GitHub refused to queue the merge because the required checks have not all
 	// passed, so nothing is queued yet.
-	MergeQueued bool `json:"merge_queued" jsonschema:"true when the endpoint dispatched the squash merge through the shared merger seam; false on checks_pending (GitHub would not queue it — the required checks have not all passed)"`
+	MergeQueued bool `json:"merge_queued" jsonschema:"true when the endpoint dispatched the forge merge (the repository's declared merge method, default squash) through the shared merger seam; false on checks_pending (GitHub would not queue it — the required checks have not all passed)"`
 	// VerdictRecorded is true when THIS call appended the merge_verdict_recorded
 	// row; AlreadyRecorded is true when the endpoint found an existing row and
 	// skipped the duplicate append (still re-dispatching the merge). Exactly one
@@ -220,7 +220,7 @@ type MergeRunOutput struct {
 }
 
 // mergeRunNote is the split-identity reminder surfaced on every response.
-const mergeRunNote = "The PR-approval review (gh pr review --approve) stays a step under your own GitHub identity — App-identity approval is deferred to E39. Queueing the merge before approval is safe: GitHub fires the squash merge once this repository's branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether that check gates the merge depends on the repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge actually enforces (E64.44 / #3161)."
+const mergeRunNote = "The PR-approval review (gh pr review --approve) stays a step under your own GitHub identity — App-identity approval is deferred to E39. Queueing the merge before approval is safe: GitHub fires the merge once this repository's branch protection is satisfied. Fishhawk PUBLISHES the fishhawk_audit_complete check; whether that check gates the merge depends on the repository's branch protection — fishhawk_doctor's merge_gate rung reports what the forge actually enforces (E64.44 / #3161)."
 
 // registerMergeRun wires the fishhawk_merge_run tool (E48.7 / #1954): the
 // one operator verb that takes a gate-approved run from verdict to
@@ -234,7 +234,8 @@ func registerMergeRun(srv *mcp.Server, resolver *runResolver) {
 		Description: strings.TrimSpace(`
 Use this AFTER a run's PR gate is settled and you have approved the PR (gh
 pr review --approve under your own identity): fishhawk_merge_run records
-your operator merge verdict, queues the squash merge through the same
+your operator merge verdict, queues the forge merge (the repository's
+declared merge method, default squash) through the same
 GitHubMerger seam the delegated drive_run may_merge arm uses, awaits the
 webhook-settled terminal run state, and surfaces the operator post-merge
 dev-host step (E48.7 / #1954). It replaces the four-step hand ceremony
@@ -480,7 +481,11 @@ Tool errors:
     merge settles through the forge, a dispatch_failed claim (an uncertain
     forge outcome) needs the operator re-arm unless the pull request reads
     merged; a merge_checks_pending refusal releases the claim, so its
-    re-invoke claims again), merge_head_moved (409 — #4641: the merge was
+    re-invoke claims again), merge_method_refused (409 — the run's forge
+    cannot apply, or the repository's settings disallow, the declared merge
+    method; details name merge_method, its source, reason and
+    allowed_merge_methods; a refusal before the claim recorded nothing, one
+    after the dispatch carries verdict_sequence), merge_head_moved (409 — #4641: the merge was
     PINNED to the head the merge-candidate gate admitted (details.head_sha)
     and the forge refused it because the pull request head moved after it;
     a held claim is released on refusal_basis precheck / rest_sha and left
@@ -570,7 +575,7 @@ func isConflicting(err error) (*apiError, bool) {
 func conflictingOutput(ae *apiError, start time.Time) MergeRunOutput {
 	prURL, _ := ae.Details["pr_url"].(string)
 	mergeableState, _ := ae.Details["mergeable_state"].(string)
-	msg := "the pull request has a merge conflict against its base, so GitHub can never queue the squash merge. Waiting cannot resolve it. Resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit (so the fishhawk_audit_complete check re-posts on the new head), re-approve the pull request, and re-invoke fishhawk_merge_run."
+	msg := "the pull request has a merge conflict against its base, so GitHub can never queue the merge. Waiting cannot resolve it. Resolve the conflict on the run branch, then vouch the resulting commit with fishhawk_vouch_commit (so the fishhawk_audit_complete check re-posts on the new head), re-approve the pull request, and re-invoke fishhawk_merge_run."
 	if mergeableState != "" {
 		msg += " (GitHub reports mergeable_state=" + mergeableState + ".)"
 	}
@@ -1166,7 +1171,7 @@ func checksPendingOutput(seq int64, start time.Time, details map[string]any) Mer
 		VerdictSequence: seq,
 		WaitedSeconds:   time.Since(start).Seconds(),
 		Note:            mergeRunNote,
-		Message: "the merge verdict is recorded and durable, but GitHub will not queue the squash merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." +
+		Message: "the merge verdict is recorded and durable, but GitHub will not queue the merge because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke fishhawk_merge_run once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request rather than waiting." +
 			auditCompleteDetailSuffix(details),
 	}
 }
@@ -1645,7 +1650,7 @@ func (r *runResolver) awaitMergeTerminal(ctx context.Context, runID uuid.UUID, s
 // FAILED / CANCELLED terminal state while the merge entry is still pending
 // (ADR-036) — states past which the queued merge will most likely never
 // settle. It deliberately does NOT arm on 'succeeded': feature_change is
-// terminal-on-succeeded, so a succeeded_pr_open run whose squash merge is
+// terminal-on-succeeded, so a succeeded_pr_open run whose forge merge is
 // still queued (no pr_merged / post_merge_observed entry yet) is the NORMAL
 // happy path, and treating it as run_terminal would abandon the await the
 // instant it started rather than letting the merge settle (or time out

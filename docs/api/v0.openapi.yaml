@@ -3915,10 +3915,16 @@ components:
           description: '`verify_failed` only, with a readable row: whether ADR-090 D6 routed a delegated fix-up for the failed verdict. Omitted otherwise.'
         forge_reason:
           type: string
-          enum: [not_mergeable, unprocessable, checks_not_settled]
+          enum: [not_mergeable, unprocessable, checks_not_settled, merge_method_refused]
           description: |
             `forge_merge_refused` only: the forge's typed refusal code. A
             recorded value outside this closed set is dropped on read.
+            `merge_method_refused` (E93.2 / #4658) means the run's declared
+            merge method cannot be applied: the repository's merge settings
+            disallow it (attributed after the dispatch), or the run's forge
+            family cannot apply it per merge request (ejected pre-lock, before
+            any claim); its `forge_detail` is built from closed-set fields
+            only (method, source, reason, allowed methods), never forge text.
             `checks_not_settled` means the checks were not settled at the
             merge attempt: the asymmetry is deliberate (ADR-112 R3 row 5,
             ADR-093 D4) — pending checks HOLD before dispatch, so slow CI never
@@ -15689,23 +15695,25 @@ paths:
   /v0/runs/{run_id}/merge:
     post:
       operationId: mergeRun
-      summary: Record an operator merge verdict and queue the squash merge (skipped when already merged)
+      summary: Record an operator merge verdict and queue the forge merge with the repository's declared merge method, default squash (skipped when already merged)
       description: |
         The one-verb operator merge path (E48.7 / #1954). Records the
         operator's merge verdict as a chained `merge_verdict_recorded` audit
-        entry (modeled on `vouch-commit`) and queues the squash merge through
+        entry (modeled on `vouch-commit`) and queues the forge merge — with
+        the merge method the run's cached admission spec declares
+        (workflow-v2 `merge_method`; absent = squash, E93.2 / #4658) — through
         the SAME merge seam the delegated `may_merge` arm of the auto-driver
         uses — so the human merge and the delegated merge converge on one path.
         The seam is forge-resolved by the run's `installation_ref` family
         (E45.47 / #3464): a GitHub run enables GitHub auto-merge, a GitLab run
-        queues `merge_when_pipeline_succeeds` (squash) on the merge request.
+        queues `merge_when_pipeline_succeeds` (squash for squash, an explicit squash=false for merge) on the merge request.
         The PR-approval review itself stays a `gh pr review --approve` step
         under the operator's own GitHub identity (App-identity approval is
         deferred to E39).
 
         The endpoint does NOT wait for the merge to land: it only
         ENABLES/queues GitHub's merge (a PR already merge-ready falls back to a
-        synchronous REST squash merge), and the `pr_merged` / run-completion
+        synchronous REST merge with the resolved method), and the `pr_merged` / run-completion
         settle is left to the `pull_request`-closed webhook. The
         `fishhawk_merge_run` MCP tool awaits the terminal run state client-side.
 
@@ -15987,7 +15995,7 @@ paths:
       responses:
         '200':
           description: |
-            Merge verdict recorded (or already recorded) and the squash merge
+            Merge verdict recorded (or already recorded) and the forge merge
             queued through the merge seam.
           content:
             application/json:
@@ -16068,7 +16076,7 @@ paths:
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
-            in unstable status and refuses to queue the squash merge
+            in unstable status and refuses to queue the merge
             (`merge_checks_pending`, E67.56 / #2717). On `merge_checks_pending`
             the verdict row is recorded and durable and `details` carry
             `{verdict_sequence, pr_url, reason:"checks_pending"}`; an immediate
@@ -16302,7 +16310,27 @@ paths:
             approval gate. Re-invoke once the head settles (and is
             re-approved, on a declared gate): the re-invoke re-runs the
             merge-candidate gate (and, on a declared gate, the forge-approval
-            fold) at the new head.
+            fold) at the new head. (16) `merge_method_refused` (E93.2 /
+            #4658): the run's declared merge method cannot carry this merge.
+            PRE-CLAIM (right after the merge-seam check, before any write):
+            the run's forge family cannot apply the method per merge request
+            (GitLab x `rebase`), or the run's admission spec does not parse
+            (reason `merge_method_undeterminable`); NOTHING is recorded and
+            `details` carry exactly `{run_id, pr_url, merge_method,
+            merge_method_source, merge_method_citation, reason,
+            allowed_merge_methods, next_step: "merge_by_hand"}` (no
+            `verdict_sequence`). POST-DISPATCH: the forge refused the merge
+            and a re-read of the repository's merge settings shows the
+            declared method disallowed (reason `forge_disallows`); the verdict
+            row is durable, the claim settles through the unchanged
+            classifier (a REST 405/422 releases it; a GraphQL validation
+            envelope leaves it `dispatch_failed` and the message names the
+            operator re-arm), and `details` carry the same keys plus
+            `verdict_sequence` with `next_step:
+            "allow_merge_method_or_merge_by_hand"`. Every value is a closed-set
+            name; no forge response text is carried. The declaration is fixed
+            by the run's admission spec: an edit applies to runs admitted
+            after it merges.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -16337,7 +16365,7 @@ paths:
             true}` where `reason` is `forge_read` or `audit_read`; the raw
             cause stays in the operator log.
 
-            `merge_dispatch_failed`: the verdict row is recorded and durable, but queuing the squash
+            `merge_dispatch_failed`: the verdict row is recorded and durable, but queuing the forge
             merge failed for a reason OTHER than the checks-pending precondition
             above (`merge_dispatch_failed`); the merge is retryable — a re-POST
             re-queues without duplicating the verdict. A checks-not-all-passed

@@ -1061,3 +1061,19 @@ func mqrOpenAPI(t *testing.T) string {
 	}
 	return string(raw)
 }
+
+// TestMergeQueueEjectionProjection_MergeMethodRefusedSurvivesClosedSet (E93.2
+// / #4658): a recorded forge_reason merge_method_refused is a closed-set
+// member, so it is projected with its own remedy. Counterfactual: dropping the
+// member from the closed set filters it out (RED).
+func TestMergeQueueEjectionProjection_MergeMethodRefusedSurvivesClosedSet(t *testing.T) {
+	f := newMCQFixture(t)
+	r := f.seed("mmr", "b0", []byte(mcvUndelegatedSpecYAML))
+	e := f.mqrEject(r, mcqBase, "b1", mergeCandidateQueueReasonForgeMergeRefused, true)
+	f.mqrEjectedRow(r, e, map[string]any{"forge_reason": mergeQueueForgeReasonMergeMethodRefused})
+	v := f.srv.mergeQueueEjectionProjectionFor(context.Background(), e)
+	if v.ForgeReason != mergeQueueForgeReasonMergeMethodRefused ||
+		v.Remedy != mergeQueueEjectRemedy(mergeQueueEjectNextMergeRun, mergeQueueForgeReasonMergeMethodRefused) {
+		t.Fatalf("projection = %+v, want forge_reason merge_method_refused with its remedy", v)
+	}
+}

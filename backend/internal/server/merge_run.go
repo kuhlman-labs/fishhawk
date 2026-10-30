@@ -26,7 +26,7 @@ import (
 
 // CategoryMergeVerdictRecorded is the audit-log category for the chained entry
 // handleMergeRun writes when an operator records their merge verdict and queues
-// the squash merge (E48.7 / #1954). It is a durable, operator-authored
+// the forge merge (E48.7 / #1954). It is a durable, operator-authored
 // declaration modeled on operator_commit_vouched (vouch.go): the payload names
 // the run, the verdict prose, the PR url, and delegated:false (this is the
 // human merge path, distinct from the delegated may_merge arm). Internal audit
@@ -99,7 +99,8 @@ type mergeRunResponse struct {
 // handleMergeRun implements POST /v0/runs/{run_id}/merge (E48.7 / #1954): the
 // one-verb operator merge path. It records the operator's merge verdict as a
 // chained merge_verdict_recorded audit entry (modeled on vouch.go) and queues
-// the squash merge through the SAME GitHubMerger seam the delegated may_merge
+// the forge merge — with the repository's declared merge method, default squash
+// (E93.2 / #4658) — through the SAME GitHubMerger seam the delegated may_merge
 // arm of AutoDriveRunGate dispatches through (dispatchAcceptanceGatedMerge), so
 // the human merge and the delegated merge converge on one path by construction.
 // The PR-approval review itself stays a gh step under the operator's own GitHub
@@ -112,7 +113,7 @@ type mergeRunResponse struct {
 //     run_token_forbidden, even for its own run — an agent self-merging its own
 //     PR would bypass the operator gate;
 //   - any identity missing write:approvals → 403 insufficient_scope, enforced
-//     UNCONDITIONALLY (no cookie-session bypass): queueing a real squash merge
+//     UNCONDITIONALLY (no cookie-session bypass): queueing a real forge merge
 //     is a scoped operator action.
 //
 // Guards, ALL fail-closed and evaluated BEFORE any write:
@@ -237,6 +238,12 @@ type mergeRunResponse struct {
 // claim is left dispatch_failed (#4749) and a re-invoke answers
 // merge_already_dispatched until reconciliation or the operator re-arm. An
 // unpinned ErrMergeConflict keeps the 502.
+// A dispatch error ForgeMerger attributed to the run's merge method
+// (*MergeMethodRefusalError, E93.2 / #4658) returns 409 merge_method_refused
+// with field-built details (never forge text); the claim settles through the
+// unchanged classifyMergeDispatchOutcome. A run whose forge family statically
+// cannot apply its declared method (or whose admission spec does not parse) is
+// refused 409 merge_method_refused BEFORE any write (staticMergeMethodRefusal).
 // EVERY other error returns 502 merge_dispatch_failed stating the verdict row is
 // durable and the queue step is retryable — a genuine dispatch failure is never
 // masked as "just waiting".
@@ -258,7 +265,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	// write:approvals enforced UNCONDITIONALLY (no cookie-session bypass): the
-	// merge verb records an approval-class verdict AND dispatches a real squash
+	// merge verb records an approval-class verdict AND dispatches a real forge
 	// merge, so an authenticated-but-unscoped identity must not reach it.
 	if !hasScope(id, "write:approvals") {
 		s.writeError(w, r, http.StatusForbidden, "insufficient_scope",
@@ -439,6 +446,17 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.GateMerger == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "merge_seam_unconfigured",
 			"merge endpoint requires a configured merge client", nil)
+		return
+	}
+
+	// Pre-claim merge-method refusal (E93.2 / #4658): a run whose forge family
+	// cannot apply its declared merge method per merge request (gitlab x
+	// rebase), or whose admission spec does not parse, is refused HERE —
+	// before the conflict guard, the overlap override, the merge-candidate
+	// gate's enqueue arm, the merge-intent lock, the forge-approval fold, the
+	// verdict append and the merge-dispatch claim — so nothing is recorded.
+	if refusal := staticMergeMethodRefusal(runRow); refusal != nil {
+		s.writeMergeMethodPreClaimRefusal(w, r, runID, prURL, refusal)
 		return
 	}
 
@@ -811,7 +829,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: checks not all passed (unstable status)",
 					slog.String("run_id", runID.String()), slog.String("error", merr.Error()))
 				details := map[string]any{"run_id": runID.String(), "verdict_sequence": verdictSequence, "pr_url": prURL, "reason": "checks_pending"}
-				msg := "the merge verdict is recorded and durable, but the squash merge cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting." + rearm
+				msg := "the merge verdict is recorded and durable, but " + mergeMethodPhrase(runRow) + " cannot be queued because the pull request's required checks have not all passed (GitHub reports the pull request in unstable status). An immediate retry cannot succeed. If the checks are still pending, re-invoke once they complete; if a required check has already FAILED, the merge will never queue — inspect the pull request instead of waiting." + rearm
 				// E64.59 / #3190: when the blocking check is OUR OWN
 				// fishhawk_audit_complete sitting at pending, say WHY and WHAT TO
 				// DO. Purely additive — the existing keys are untouched, and a
@@ -839,6 +857,15 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 				s.writeMergeHeadMoved(w, r, runRow, prURL, verdictSequence, gate.HeadSHA, merr, claimed, settled, rearm)
 				return nil
 			}
+			// E93.2 / #4658: a refusal ForgeMerger attributed to the run's
+			// merge method (the repository's settings disallow it, or the
+			// adapter cannot apply it) is a named 409, built from the refusal's
+			// closed-set fields only — never merr.Error() or its Cause.
+			var mref *MergeMethodRefusalError
+			if errors.As(merr, &mref) {
+				s.writeMergeMethodPostDispatchRefusal(w, r, runID, prURL, verdictSequence, mref, claimed, settled, rearm)
+				return nil
+			}
 			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: dispatch merge failed",
 				slog.String("run_id", runID.String()), slog.String("error", merr.Error()),
 				slog.String("forge_merge_state", obs.ForgeState))
@@ -849,7 +876,7 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			// writeError logs the FULL pre-redaction map against the error_ref, so
 			// the operator's log record carries it alongside the raw cause.
 			s.writeError(w, r, http.StatusBadGateway, "merge_dispatch_failed",
-				"the merge verdict is recorded and durable, but queuing the squash merge failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run."+rearm,
+				"the merge verdict is recorded and durable, but queuing "+mergeMethodPhrase(runRow)+" failed; retry the merge. The pull request was re-read from the forge and did NOT confirm a merge (forge_merge_state="+obs.ForgeState+"). If the pull request has in fact already merged, POST /v0/runs/{run_id}/record-merge-observation to record the merge observation, then POST /v0/runs/{run_id}/reconcile-merge to settle the run."+rearm,
 				map[string]any{
 					"run_id":            runID.String(),
 					"error":             merr.Error(),
@@ -2127,4 +2154,106 @@ func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request
 			"claim_state": string(existing.State), "claim_path": existing.Path, "claim_head_sha": existing.HeadSHA,
 			"claimed_at": existing.ClaimedAt, "failure_cause": existing.FailureCause})
 	return mergequeue.DispatchClaim{}, false, true
+}
+
+// mergeCodeMergeMethodRefused is the 409 code for a merge the run's declared
+// merge method cannot carry (E93.2 / #4658): the run's forge family cannot
+// apply it per merge request (or its admission spec does not parse), refused
+// before any write; or the repository's merge settings disallow it, attributed
+// by ForgeMerger after the dispatch.
+const mergeCodeMergeMethodRefused = "merge_method_refused"
+
+// Merge-method refusal next_step values.
+const (
+	mergeMethodNextStepMergeByHand      = "merge_by_hand"
+	mergeMethodNextStepAllowOrMergeHand = "allow_merge_method_or_merge_by_hand"
+)
+
+// mergeMethodPhrase names the merge the run dispatches with its resolved
+// method and where the method came from, for operator-facing text (E93.2 /
+// #4658). It renders only closed-set values, never spec bytes.
+func mergeMethodPhrase(runRow *run.Run) string {
+	mm, err := ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return "the forge merge (merge method undeterminable: the run's admission spec does not parse)"
+	}
+	return "the forge merge (merge method " + mm.Name() + ": " + mm.Citation() + ")"
+}
+
+// mergeMethodRefusalDetails is the field-built detail map every
+// merge_method_refused surface shares: closed-set values only, never the
+// refusal's Cause.
+func mergeMethodRefusalDetails(runID uuid.UUID, prURL string, ref *MergeMethodRefusalError, nextStep string) map[string]any {
+	allowed := ref.Allowed
+	if allowed == nil {
+		allowed = []string{}
+	}
+	return map[string]any{
+		"run_id":                runID.String(),
+		"pr_url":                prURL,
+		"merge_method":          ref.Method,
+		"merge_method_source":   ref.Source,
+		"merge_method_citation": ref.Citation(),
+		"reason":                ref.Reason,
+		"allowed_merge_methods": allowed,
+		"next_step":             nextStep,
+	}
+}
+
+// writeMergeMethodPreClaimRefusal writes the PRE-CLAIM 409 merge_method_refused
+// (E93.2 / #4658): nothing was recorded and nothing merged. The declaration is
+// fixed by the run's admission spec, so the remedy for THIS merge request is a
+// merge by hand; a workflow-spec edit applies only to runs admitted after it
+// merges.
+func (s *Server) writeMergeMethodPreClaimRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string, ref *MergeMethodRefusalError) {
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: merge method refused before the claim; nothing recorded",
+		slog.String("run_id", runID.String()),
+		slog.String("merge_method", ref.Method),
+		slog.String("merge_method_source", ref.Source),
+		slog.String("reason", ref.Reason),
+		slog.Any("allowed_merge_methods", ref.Allowed))
+	var msg string
+	if ref.Reason == MergeMethodRefusalUndeterminable {
+		msg = "the run's merge method cannot be determined: " + ref.FieldDetail() +
+			". Nothing was recorded and nothing merged. The run's admission spec is fixed for this run, so merge THIS merge request by hand."
+	} else {
+		msg = "the run's forge family cannot apply the declared merge method per merge request: " + ref.FieldDetail() +
+			". Nothing was recorded and nothing merged. The declaration is fixed by the run's admission spec, so merge THIS merge request by hand; a workflow-spec edit declaring merge_method squash or merge applies to runs admitted after it merges."
+	}
+	s.writeError(w, r, http.StatusConflict, mergeCodeMergeMethodRefused, msg,
+		mergeMethodRefusalDetails(runID, prURL, ref, mergeMethodNextStepMergeByHand))
+}
+
+// writeMergeMethodPostDispatchRefusal writes the POST-DISPATCH 409
+// merge_method_refused (E93.2 / #4658): the verdict row is durable and the
+// claim settled through the unchanged classifyMergeDispatchOutcome. The message
+// is built from the refusal's fields and the claim outcome only — never
+// merr.Error() or Cause. When the claim was left dispatch_failed (a GraphQL
+// validation envelope classifies uncertain), the remedy names the operator
+// RE-ARM explicitly (approval condition C5), not only the appended rearm note.
+func (s *Server) writeMergeMethodPostDispatchRefusal(w http.ResponseWriter, r *http.Request, runID uuid.UUID, prURL string,
+	verdictSequence int64, ref *MergeMethodRefusalError, claimed bool, settled mergeDispatchLedgerOutcome, rearm string) {
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelInfo, "merge: the forge refused the merge for the run's merge method",
+		slog.String("run_id", runID.String()),
+		slog.String("merge_method", ref.Method),
+		slog.String("merge_method_source", ref.Source),
+		slog.String("reason", ref.Reason),
+		slog.Any("allowed_merge_methods", ref.Allowed))
+	msg := "the merge verdict is recorded and durable, but the forge refused the merge: " + ref.FieldDetail() + "."
+	held := claimed && settled == mergeDispatchUncertain
+	switch {
+	case held:
+		msg += " The run's merge-dispatch claim is dispatch_failed, so the operator must RE-ARM the claim AND change the repository's merge settings to allow merge method " +
+			ref.Method + " before a re-invoke can dispatch; otherwise merge THIS pull request by hand."
+	case claimed && settled == mergeDispatchRelease:
+		msg += " The run's merge-dispatch claim was released. Change the repository's merge settings to allow merge method " +
+			ref.Method + " for THIS run and re-invoke the merge, or merge THIS pull request by hand."
+	default:
+		msg += " Change the repository's merge settings to allow merge method " +
+			ref.Method + " for THIS run and re-invoke the merge, or merge THIS pull request by hand."
+	}
+	msg += " The declaration is fixed by the run's admission spec: a workflow-spec edit applies to runs admitted after it merges." + rearm
+	details := mergeMethodRefusalDetails(runID, prURL, ref, mergeMethodNextStepAllowOrMergeHand)
+	details["verdict_sequence"] = verdictSequence
+	s.writeError(w, r, http.StatusConflict, mergeCodeMergeMethodRefused, msg, details)
 }
