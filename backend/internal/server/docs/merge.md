@@ -450,6 +450,40 @@ attributes nothing and the real recompute still flags the run foreign, so
 the `fishhawk_vouch_commit` instruction is decidable from committed
 evidence rather than from reading the handler.
 
+**FIX-UP BASE (E89.6 / #4574).** The attribution above admits the merge
+commit to the ADR-035 ledger, but `fixup_expected_head_sha` was resolved from
+the reported-head categories only, so after a rebase the runner refused every
+operator fix-up with `fixup_base_mismatch` (category C, run 3fa73698).
+`prompt.go::resolveFixupExpectedHeadSHA` now seeds at the newest reported head
+(unchanged, via `newestReportedHead`) and
+`fixup_expected_head.go::advanceFixupHeadThroughBaseMerges` walks the run's
+`branch_rebased` / `branch_reset` rows recorded AFTER the seed (chain
+`Sequence` above the seed's), in audit-sequence order
+(`walkRecordedBaseMerges`). A `branch_rebased` row advances the head to its
+`merge_commit_sha` only when it is a clean advance under the shared ADR-112
+predicate `isCleanAdvance` (a merge performed, `new_head_sha` == merge commit,
+`clean_verified` true) AND its `prior_head_sha` is the head walked so far; a
+concurrent push, an unverified or legacy advance, an already-up-to-date row
+and a rebase of a head the walk never reached all leave the head where it was,
+so the runner's unchanged equality check still refuses them. `clean_verified`
+is load-bearing: the lease re-check runs BEFORE `MergeBranch`, so a foreign
+push in that window becomes the merge's first parent, and only the verified
+parents [prior head, base tip] prove the merge carries none. A `branch_reset`
+row moves the head to its `reset_to_sha` when that sha is already on the
+walked chain; a reset anywhere else (or an undecodable reset row) resolves the
+seed. A failed read of either category WARNs and resolves the SEED, never ""
+(which would switch the runner to its checkout-only path); with no reported
+head the field stays "" (a rebase alone never invents a head).
+`acceptance_expected_head_sha` is deliberately unchanged
+(`resolveNewestReportedHeadSHA` returns the un-advanced seed). Pinned by
+`TestWalkRecordedBaseMerges` (one row per mode),
+`TestResolveFixupExpectedHeadSHA_AdvancesThroughRecordedRebase` (the REAL
+rebase handler; also asserts the acceptance resolver still returns the seed),
+`..._ConcurrentPushRebaseDoesNotAdvance`, `..._LaterFixupPushSupersedesRebase`,
+`..._BaseMergeReadErrorKeepsRecordedHead`, `..._NoRecordedHeadStaysEmpty`
+(`fixup_expected_head_test.go`) and the Postgres + MCP e2e
+`integration/mcp::TestE2E_Fixup_ExpectedHeadAdvancesThroughRecordedRebase`.
+
 Other invariants:
 
 - **Consumes NO fix-up budget.** The verb adds no stage and writes no
