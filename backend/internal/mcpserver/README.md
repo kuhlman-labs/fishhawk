@@ -1434,6 +1434,10 @@ Inputs:
 |---|---|---|
 | `concern_id` | **yes** | The stable concern UUID, from `fishhawk_get_run_status`'s `run.concerns.items[].id`. |
 | `reason` | **yes** | Audited rationale. Recorded on the `concern_waived` audit entry **before** the state change (append failure → `audit_append_failed`, no mutation), stored as the concern's `state_reason`, and rendered **verbatim** in later re-review prompts as the not-re-litigable waive context — make it self-contained. |
+| `judgement` | **yes** (backend-enforced) | The human judgement (ADR-117 D1, [#4840](https://github.com/kuhlman-labs/fishhawk/issues/4840)): `defect`, `defect_pre_existing`, `no_defect`, `tradeoff`, `preference`, `stale` or `insufficient_evidence`; `unlabelled` is refused. A reason prefixed `false_positive:`, `accepted_tradeoff:` or `preference:` maps to `no_defect`, `tradeoff` or `preference`: (a) a judgement matching the prefix is accepted, (b) a judgement with no prefix is accepted, (c) a prefix alone becomes the judgement, (d) a judgement contradicting the prefix is refused (`details.rule` `judgement_conflicts_reason_prefix`). |
+| `tradeoff_cost` | with `tradeoff` | The stated cost of a `tradeoff` judgement (including a prefix-derived one); refused with any other judgement. |
+
+**The judgement fields are `omitempty` and never pre-checked by the tool** — the advertised schema does not require them and no local refusal answers before the HTTP hop, so the backend is the single refusal authority and its control stays observable through every MCP-level test (`TestConcernJudgementInputs_NotSchemaRequired`, `TestWaiveConcern_NoLocalJudgementPreCheck`, and the client-body pin `TestConcernVerbClients_ForwardJudgement`, which also asserts an omitted pair is ABSENT from the body). The same holds for the three sibling verbs below. The descriptions still say REQUIRED. The suggested-action hints that offer `fishhawk_waive_concern` / `fishhawk_defer_concern` (`drive_run.go`'s `driveFixupConcernActions`, `review_action_hint.go`'s `deferConcernAction`) carry a `judgement` placeholder, `concernJudgementPlaceholder`, naming the allowed set; pinned beside the builders by `TestDriveFixupConcernActions_JudgementParam` and `TestDeferConcernAction_JudgementParam`.
 
 What a waive does:
 
@@ -1441,7 +1445,7 @@ What a waive does:
 - There is **no un-waive**. If the concern turns out to matter, a new concern from a later review is the path back.
 - **Auth:** same write-scope pair as fix-up (`write:stages` or `write:fixups`); a run-bound token may waive only its own run's concerns (`cross_run_waive`, 403).
 
-Error surfaces propagated as tool errors: `validation_failed` (400 — empty reason / bad UUID, both also caught locally before the HTTP hop), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — the concern is already `waived`/`superseded`/`addressed`; details carry the rejected `from`/`to` pair), `concern_store_unconfigured` (503).
+Error surfaces propagated as tool errors: `validation_failed` (400 — empty reason / bad UUID, both also caught locally before the HTTP hop; or a missing, unknown or `unlabelled` judgement, a `tradeoff` without `tradeoff_cost`, a cost without a `tradeoff`, or a prefix conflict, all backend-only), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — the concern is already `waived`/`superseded`/`addressed`; details carry the rejected `from`/`to` pair), `concern_store_unconfigured` (503).
 
 ## Bulk concern waiver (`fishhawk_waive_concerns`)
 
@@ -1454,6 +1458,8 @@ Error surfaces propagated as tool errors: `validation_failed` (400 — empty rea
 | `run_id` | **yes** | The run whose concerns to waive. Every id must belong to THIS run. |
 | `concern_ids` | **yes** | At most 50 per batch; duplicates and non-UUIDs are refused. |
 | `reason` | **yes** | Recorded on EVERY `concern_waived` entry in the batch and as each concern's `state_reason`. |
+| `judgement` | **yes** (backend-enforced) | ONE human judgement for the whole batch; same set and the same reason-prefix rules (a)-(d) as the single waive, and a prefix conflict refuses the whole batch. The concern rows record `judgement_bulk` true only when the batch names MORE than one concern; a one-id call is an individual judgement, while its `concern_waived` row still carries the verb marker `bulk_waive: true`. |
+| `tradeoff_cost` | with `tradeoff` | As for the single waive. |
 | `delegated` | no | ADR-040 delegated-action path; evaluated ONCE for the run before anything is appended. |
 
 The two halves have deliberately different atomicity, and a caller must not assume all-or-nothing across both:
@@ -1461,7 +1467,7 @@ The two halves have deliberately different atomicity, and a caller must not assu
 - **PRE-VALIDATION is all-or-nothing and mutates NOTHING.** The first violation refuses the whole batch naming the offending id.
 - **the APPLY loop is per-item.** The batch is not a database transaction (each concern carries its own audit row), so a concurrent transition that raced the validation fails ONE concern while the rest still apply. Read `results[]` — it is in REQUEST order and each entry carries `applied` plus either `state`/`state_reason` or `error_code`/`error`. `waived + failed == len(concern_ids)`.
 
-`error_code` reuses the single verb's vocabulary (`concern_waive_conflict`, `audit_append_failed`, `internal_error`). Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` UUID, empty `concern_ids`, blank `reason` — all caught before the HTTP hop), `validation_failed` (400 — over the cap, a non-UUID, a duplicate (deduped on the PARSED uuid, so two spellings of one id collide), or an id from another run carrying `details.rule` `concern_run_mismatch`), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — an id is not open; the WHOLE batch is refused), `concern_store_unconfigured` (503).
+`error_code` reuses the single verb's vocabulary (`concern_waive_conflict`, `audit_append_failed`, `internal_error`). Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` UUID, empty `concern_ids`, blank `reason` — all caught before the HTTP hop), `validation_failed` (400 — over the cap, a non-UUID, a duplicate (deduped on the PARSED uuid, so two spellings of one id collide), or an id from another run carrying `details.rule` `concern_run_mismatch`; or a judgement refusal, backend-only), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — an id is not open; the WHOLE batch is refused), `concern_store_unconfigured` (503).
 
 ## Resolve with operator evidence (`fishhawk_resolve_concerns`)
 
@@ -1472,6 +1478,8 @@ The two halves have deliberately different atomicity, and a caller must not assu
 | `run_id` | **yes** | The run whose concerns to resolve. Every id must belong to THIS run. |
 | `concern_ids` | **yes** | At most 50 per batch; duplicates (deduped on the PARSED uuid) and non-UUIDs are refused. Every id must be `addressed_pending`. Non-UUIDs are also caught locally. |
 | `evidence` | **yes** | What you executed or observed that shows the fix landed; at most 4000 bytes. Recorded on EVERY `concern_resolved_with_evidence` entry and stored as each concern's `state_reason`, prefixed `operator evidence: `. |
+| `judgement` | **yes** (backend-enforced) | ONE human judgement for the batch, from the waive's set (`unlabelled` refused); usually `defect` or `defect_pre_existing` for a fixed concern. No reason-prefix derivation applies. `judgement_bulk` is recorded true only for a batch of more than one concern. |
+| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff` judgement, refused with any other. |
 
 What a resolve does, and what it is not:
 
@@ -1482,7 +1490,7 @@ What a resolve does, and what it is not:
 - **Not yet on the issue thread or the gate view.** This verb does not refresh the status comment. The `concern_resolved_with_evidence` activity line, the gate view's settled `resolution_basis: operator_evidence` and the API docs land in a sibling change of #4086.
 - **Not yet visible to the historian.** `decisionindex`'s decision-bearing set does not include `concern_resolved_with_evidence`, so operator-evidence resolutions do not reach the precedent index (`fishhawk_precedent`) or historian consults yet. The operator files that follow-up.
 
-Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` or concern UUID, empty `concern_ids`, blank `evidence` — all caught before the HTTP hop), `validation_failed` (400 — over the 50-id cap, evidence over 4000 bytes, a duplicate, or an id from another run carrying `details.rule` `concern_run_mismatch`), `resolve_requires_human` / `insufficient_scope` / `account_forbidden` (403), `concern_not_found` (404), `concern_resolve_conflict` (409 — an id not in `addressed_pending`, which refuses the WHOLE batch; the message names the state and the recovery: route a `raised`/`reopened` concern with a fix-up first, and an already-closed concern has nothing to resolve), `concern_store_unconfigured` (503).
+Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` or concern UUID, empty `concern_ids`, blank `evidence` — all caught before the HTTP hop), `validation_failed` (400 — over the 50-id cap, evidence over 4000 bytes, a duplicate, or an id from another run carrying `details.rule` `concern_run_mismatch`; or a judgement refusal, backend-only), `resolve_requires_human` / `insufficient_scope` / `account_forbidden` (403), `concern_not_found` (404), `concern_resolve_conflict` (409 — an id not in `addressed_pending`, which refuses the WHOLE batch; the message names the state and the recovery: route a `raised`/`reopened` concern with a fix-up first, and an already-closed concern has nothing to resolve), `concern_store_unconfigured` (503).
 
 ## Escape records (`fishhawk_record_escape`)
 
@@ -1519,6 +1527,8 @@ Inputs:
 | `type` | no | Override the auto-selected work-item type (`bug` for a defect category, else `chore`). |
 | `labels` | no | Labels merged on top of the type's default labels. |
 | `note` | no | Operator addendum folded into the follow-up body and the concern's `state_reason`. |
+| `judgement` | **yes** (backend-enforced) | The human judgement, from the waive's set (`unlabelled` refused). No reason-prefix derivation applies. Refused before any work item is filed. |
+| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff` judgement, refused with any other. |
 
 What a defer does:
 
@@ -1528,7 +1538,7 @@ What a defer does:
 
 Returns the filed follow-up issue (`{type, title, number, url, provider, applied_labels}`) and the updated concern row (state `deferred`, `state_reason` naming the issue).
 
-Error surfaces propagated as tool errors: `validation_failed` (400 / bad UUID, caught locally before the HTTP hop), `cross_run_defer` (403), `concern_not_found` (404), `concern_defer_conflict` (422 — non-open concern or a post-filing race), `work_item_invalid` (422), `provider_unimplemented` (501), `work_item_filing_failed` (502 — the concern stays open), `concern_store_unconfigured` (503).
+Error surfaces propagated as tool errors: `validation_failed` (400 / bad UUID, caught locally before the HTTP hop; a judgement refusal is backend-only and files nothing), `cross_run_defer` (403), `concern_not_found` (404), `concern_defer_conflict` (422 — non-open concern or a post-filing race), `work_item_invalid` (422), `provider_unimplemented` (501), `work_item_filing_failed` (502 — the concern stays open), `concern_store_unconfigured` (503).
 
 ## Divergence answer (`fishhawk_answer_divergence`)
 

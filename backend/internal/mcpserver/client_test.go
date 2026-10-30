@@ -3313,9 +3313,14 @@ func TestBulkWaiveConcerns_PostsRunScopedPath(t *testing.T) {
 			`{"concern_id":"`+ids[1]+`","applied":false,"error_code":"concern_waive_conflict","error":"raced"}]}`)
 	})
 
-	res, err := c.BulkWaiveConcerns(context.Background(), runID, ids, "r", false)
+	res, err := c.BulkWaiveConcerns(context.Background(), runID, ids, "r", "tradeoff", "one extra round trip per merge", false)
 	if err != nil {
 		t.Fatalf("BulkWaiveConcerns: %v", err)
+	}
+	// The judgement and its cost reach the backend body verbatim (ADR-117 D1,
+	// #4840): the backend, not the client, is the authority that checks them.
+	if gotRaw["judgement"] != "tradeoff" || gotRaw["tradeoff_cost"] != "one extra round trip per merge" {
+		t.Errorf("body judgement/tradeoff_cost = %v/%v, want tradeoff + the cost", gotRaw["judgement"], gotRaw["tradeoff_cost"])
 	}
 	if gotMethod != http.MethodPost || gotPath != "/v0/runs/"+runID.String()+"/concerns/waive" {
 		t.Errorf("request = %s %s, want POST /v0/runs/%s/concerns/waive", gotMethod, gotPath, runID)
@@ -3338,6 +3343,70 @@ func TestBulkWaiveConcerns_PostsRunScopedPath(t *testing.T) {
 	}
 	if res.Results[1].Applied || res.Results[1].ErrorCode != "concern_waive_conflict" {
 		t.Errorf("results[1] = %+v, want applied=false error_code=concern_waive_conflict", res.Results[1])
+	}
+}
+
+// TestConcernVerbClients_ForwardJudgement pins the client half of ADR-117 D1
+// (#4840) on all four human concern verbs: a supplied judgement and
+// tradeoff_cost reach the request body under exactly those keys (the server's
+// json tags), and an omitted pair is ABSENT from the body (omitempty), never
+// an empty string, so the backend's own required-judgement refusal is the one
+// that answers. The client never refuses a missing judgement itself.
+func TestConcernVerbClients_ForwardJudgement(t *testing.T) {
+	id, runID := uuid.New(), uuid.New()
+	calls := []struct {
+		name string
+		path string
+		call func(c *apiClient, judgement, cost string) error
+	}{
+		{"waive", "/v0/concerns/" + id.String() + "/waive", func(c *apiClient, j, tc string) error {
+			_, err := c.WaiveConcern(context.Background(), id, "r", j, tc)
+			return err
+		}},
+		{"bulk waive", "/v0/runs/" + runID.String() + "/concerns/waive", func(c *apiClient, j, tc string) error {
+			_, err := c.BulkWaiveConcerns(context.Background(), runID, []string{id.String()}, "r", j, tc, false)
+			return err
+		}},
+		{"resolve", "/v0/runs/" + runID.String() + "/concerns/resolve", func(c *apiClient, j, tc string) error {
+			_, err := c.ResolveConcerns(context.Background(), runID, []string{id.String()}, "re-ran it", j, tc)
+			return err
+		}},
+		{"defer", "/v0/concerns/" + id.String() + "/defer", func(c *apiClient, j, tc string) error {
+			_, err := c.DeferConcern(context.Background(), id, DeferConcernParams{ParentEpic: "#1", Judgement: j, TradeoffCost: tc})
+			return err
+		}},
+	}
+	for _, tc := range calls {
+		t.Run(tc.name, func(t *testing.T) {
+			var gotPath string
+			var gotRaw map[string]any
+			c := releaseTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotPath = r.URL.Path
+				gotRaw = nil
+				_ = json.NewDecoder(r.Body).Decode(&gotRaw)
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, `{}`)
+			})
+
+			if err := tc.call(c, "tradeoff", "slower merge path"); err != nil {
+				t.Fatalf("call with a judgement: %v", err)
+			}
+			if gotPath != tc.path {
+				t.Errorf("path = %q, want %q", gotPath, tc.path)
+			}
+			if gotRaw["judgement"] != "tradeoff" || gotRaw["tradeoff_cost"] != "slower merge path" {
+				t.Errorf("body = %#v, want judgement tradeoff + tradeoff_cost forwarded verbatim", gotRaw)
+			}
+
+			if err := tc.call(c, "", ""); err != nil {
+				t.Fatalf("call without a judgement must reach the backend (no local pre-check): %v", err)
+			}
+			for _, k := range []string{"judgement", "tradeoff_cost"} {
+				if v, present := gotRaw[k]; present {
+					t.Errorf("body key %q = %#v on an omitted value, want the key absent", k, v)
+				}
+			}
+		})
 	}
 }
 

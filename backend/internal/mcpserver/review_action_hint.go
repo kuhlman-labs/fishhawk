@@ -283,12 +283,22 @@ func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 // budget/ceiling branch conditions live once, in reviewActionHintFor, and
 // this method only reads the result (RemainingFixupBudget /
 // OverrideAvailable carry the branch).
+// concernJudgementPlaceholder is the `judgement` param placeholder every
+// suggested human concern verb carries (fishhawk_waive_concern and
+// fishhawk_defer_concern here and in drive_run.go's driveFixupConcernActions;
+// ADR-117 D1, #4840). It names the closed human set the backend accepts, and
+// that tradeoff also needs tradeoff_cost, so an operator following the hint
+// does not meet a 400 validation_failed. It deliberately omits unlabelled,
+// which the backend refuses.
+const concernJudgementPlaceholder = "<REQUIRED human judgement: defect | defect_pre_existing | no_defect | tradeoff | preference | stale | insufficient_evidence; tradeoff also needs tradeoff_cost>"
+
 // deferConcernAction is the fishhawk_defer_concern entry shared by every arm
 // that surfaces an open concern. Extracted so the gate-closed arms (#3116) and
 // the three budget/ceiling arms carry ONE definition: deferring is always legal
 // while a concern is open and consumes NO fix-up budget (#1202), which is
 // exactly why it survives into the arms where the fix-up verb does not.
-// parent_epic + n are the non-derivable title coordinates the operator supplies.
+// parent_epic + n are the non-derivable title coordinates the operator supplies;
+// judgement is the human judgement the backend requires (ADR-117 D1, #4840).
 func deferConcernAction(concerns int) SuggestedAction {
 	return SuggestedAction{
 		Action: "fishhawk_defer_concern",
@@ -296,6 +306,7 @@ func deferConcernAction(concerns int) SuggestedAction {
 			"concern_ids": "run.concerns.items[].id",
 			"parent_epic": "<epic the follow-up rolls up to, e.g. #1196>",
 			"n":           "<child number for the [E<epic>.<n>] title>",
+			"judgement":   concernJudgementPlaceholder,
 		},
 		Precondition: "the concern is worth a separate change but should not block the merge",
 		Consumes:     consumesNone,
