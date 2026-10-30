@@ -24843,8 +24843,16 @@ paths:
                       (`pull_request_opened` / `child_pushed` /
                       `fixup_pushed`), the same audit source the ADR-035
                       branch-lineage verifier treats as the run's legitimate
-                      tips. Present only when `fixup` is true and resolution
-                      succeeded. Before invoking the agent the runner fetches
+                      tips — advanced through the clean Fishhawk-recorded base
+                      merges (`branch_rebased`: a merge Fishhawk performed
+                      whose new head is the merge commit and whose parents
+                      were verified as [prior head, base tip]) recorded after
+                      it, so a fix-up after `fishhawk_rebase_run_branch`
+                      expects the merge commit (E89.6 / #4574). A concurrent
+                      push, an unverified advance or a reset off that chain
+                      leaves the recorded head. Present only when `fixup` is
+                      true and resolution succeeded. Before invoking the agent
+                      the runner fetches
                       + checks out `fixup_branch` and fails fast when the
                       fetched tip differs from this value (#967). Absent
                       (older backend, or backend-side resolution failure)
@@ -25500,7 +25508,7 @@ paths:
                     description: Existing PR branch a fix-up pass commits onto; present only when `fixup` is true. Matches the runner's branch formula — non-decomposed `fishhawk/run-<shortID(run_id)>/stage-<shortID(stage_id)>`, decomposed `fishhawk/run-<shortID(decomposed_from_run_id)>` (#784).
                   fixup_expected_head_sha:
                     type: string
-                    description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
+                    description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source — advanced through the clean Fishhawk-recorded base merges (`branch_rebased` rows recording a performed merge whose new head is the merge commit and whose parents were verified as [prior head, base tip]) recorded after it, so a fix-up after `fishhawk_rebase_run_branch` expects the merge commit (E89.6 / #4574); a concurrent push, an unverified advance or a reset off that chain leaves the recorded head. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
                   fixup_policy_increment:
                     type: boolean
                     description: True ONLY on a decomposed PARENT's fix-up (#4391) — the parent analogue of #765's per-child increment base. The runner measures both `git_diff` emitters against the fetched consolidated tip (no-fetch merge-base, falling back to the cumulative diff on failure), so the in-band constraint check and the backend's `reEvaluatePolicy` see only the fix-up's own increment. Absent on an ordinary run's fix-up, a decomposed child's fix-up, a non-fix-up dispatch and a verify-only merge-candidate pass.
