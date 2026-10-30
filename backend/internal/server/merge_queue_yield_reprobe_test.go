@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -75,13 +77,200 @@ func TestYieldReprobeDue_OverrunStridePastTheCapBecomesDue(t *testing.T) {
 	}
 }
 
-// yieldSweptAgo records this process's previous yield sweep as ago in the
-// past (yieldSweepSince's state), so a sweep judges the window it would after
-// a tick of that length.
+// TestYieldReprobeDueAfter_Table pins the A2.1 per-entry window (servicedAge,
+// age] (ADR-112 Amendment A2.1): a never-serviced row (servicedAge 0) judges
+// (0, age]; a serviced row is due only once a schedule point falls past the
+// age it was serviced at; nothing younger than one interval is due; and past
+// the 16-interval cap only multiples of 16 intervals are points.
+func TestYieldReprobeDueAfter_Table(t *testing.T) {
+	const i = time.Minute
+	for _, tc := range []struct {
+		age, serviced time.Duration
+		want          bool
+	}{
+		{3 * i, 0, true}, {i, 0, true}, {59 * time.Second, 0, false},
+		{3 * i, 2*i + 30*time.Second, false}, {4 * i, 2*i + 30*time.Second, true},
+		{30 * time.Second, 0, false},
+		{31 * i, 16 * i, false}, {32 * i, 16 * i, true},
+		{31 * i, 17 * i, false}, // 24 intervals is no point past the cap
+		{47 * i, 32 * i, false}, {48 * i, 32 * i, true}, {48 * i, 48 * i, false},
+	} {
+		if got := yieldReprobeDueAfter(tc.age, tc.serviced, i); got != tc.want {
+			t.Errorf("yieldReprobeDueAfter(%s, serviced %s, 1m) = %v, want %v", tc.age, tc.serviced, got, tc.want)
+		}
+	}
+	if yieldReprobeDueAfter(time.Hour, 0, 0) {
+		t.Error("a non-positive interval is due")
+	}
+}
+
+// TestYieldServicedBefore_Table pins the A2.2 order (ADR-112 Amendment A2.2):
+// a never-serviced row (seq 0) before a serviced one even when its yield is
+// younger; between serviced rows the lower seq first regardless of
+// yielded_at; equal seq by yielded_at, then by id.
+func TestYieldServicedBefore_Table(t *testing.T) {
+	t0 := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	mk := func(id string, ago time.Duration) mergequeue.Entry {
+		at := t0.Add(-ago)
+		return mergequeue.Entry{ID: uuid.MustParse(id), YieldedAt: &at}
+	}
+	older := mk("00000000-0000-0000-0000-000000000002", 2*time.Hour)
+	younger := mk("00000000-0000-0000-0000-000000000001", time.Hour)
+	tieLo := mk("00000000-0000-0000-0000-000000000003", 3*time.Hour)
+	tieHi := mk("00000000-0000-0000-0000-000000000004", 3*time.Hour)
+	for _, tc := range []struct {
+		name       string
+		aSeq, bSeq uint64
+		a, b       mergequeue.Entry
+		want       bool
+	}{
+		{"never serviced before serviced, though younger", 0, 3, younger, older, true},
+		{"serviced after never serviced, though older", 3, 0, older, younger, false},
+		{"lower seq first, though younger", 2, 5, younger, older, true},
+		{"higher seq after, though older", 5, 2, older, younger, false},
+		{"equal seq: older yield first", 4, 4, older, younger, true},
+		{"equal seq: younger yield after", 4, 4, younger, older, false},
+		{"both never serviced: older yield first", 0, 0, older, younger, true},
+		{"equal seq and yield: lower id first", 1, 1, tieLo, tieHi, true},
+		{"equal seq and yield: higher id after", 1, 1, tieHi, tieLo, false},
+	} {
+		if got := yieldServicedBefore(tc.aSeq, tc.a, tc.bSeq, tc.b); got != tc.want {
+			t.Errorf("%s: yieldServicedBefore = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// yieldSweptAgo rewinds every A2.1 service mark's age by ago (floor 0),
+// keeping its seq: a mark a sweep recorded just now then reads as one
+// recorded a tick of length ago earlier, the window the previous-sweep clock
+// it replaced judged.
 func (s *Server) yieldSweptAgo(ago time.Duration) {
 	s.yieldSweepMu.Lock()
 	defer s.yieldSweepMu.Unlock()
-	s.yieldSweepLast = time.Now().Add(-ago)
+	for id, m := range s.yieldServiced {
+		m.age = max(m.age-ago, 0)
+		s.yieldServiced[id] = m
+	}
+}
+
+// yieldMark reads entry id's A2.1 service mark under yieldSweepMu.
+func (s *Server) yieldMark(id uuid.UUID) (yieldServicedMark, bool) {
+	s.yieldSweepMu.Lock()
+	defer s.yieldSweepMu.Unlock()
+	m, ok := s.yieldServiced[id]
+	return m, ok
+}
+
+// yrListFaultQueue overrides the sweep's two listings; a nil func delegates
+// to the embedded store, as does every other method.
+type yrListFaultQueue struct {
+	mergequeue.Store
+	activeBases func(context.Context) ([]mergequeue.Base, error)
+	list        func(context.Context, mergequeue.Base) ([]mergequeue.Entry, error)
+}
+
+func (q yrListFaultQueue) ActiveBases(ctx context.Context) ([]mergequeue.Base, error) {
+	if q.activeBases != nil {
+		return q.activeBases(ctx)
+	}
+	return q.Store.ActiveBases(ctx)
+}
+
+func (q yrListFaultQueue) ListForBase(ctx context.Context, b mergequeue.Base) ([]mergequeue.Entry, error) {
+	if q.list != nil {
+		return q.list(ctx, b)
+	}
+	return q.Store.ListForBase(ctx, b)
+}
+
+// backdateYielded moves every held, yielded row's yielded_at d into the past
+// on the database clock: d of schedule time passes, and the earlier
+// yielded_at keeps each row's episode (and so its service mark).
+func (w *mqmWorld) backdateYielded(d time.Duration) {
+	w.t.Helper()
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - $1::bigint * interval '1 microsecond'
+WHERE state = 'held' AND yielded_at IS NOT NULL`, d.Microseconds())
+}
+
+// TestMergeQueueYieldSweep_ServicedMarks pins the A2.1 mark's lifecycle, one
+// assertion per mode. Each subtest yields A, ages it to 32 intervals (an hour
+// each) and sweeps once, which probes A and records its mark.
+func TestMergeQueueYieldSweep_ServicedMarks(t *testing.T) {
+	const interval = time.Hour
+	ctx := context.Background()
+	serviced := func(t *testing.T) (*mqmWorld, *mcqRun, mergequeue.Entry) {
+		t.Helper()
+		w, a, _ := newYieldWorld(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours 10 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+		if n := w.srv.sweepMergeQueueYields(ctx, interval); n != 1 {
+			t.Fatalf("precondition: the first sweep re-probed %d rows, want 1", n)
+		}
+		e := w.active(a)
+		if m, ok := w.srv.yieldMark(e.ID); !ok || m.seq != 1 || !m.yieldedAt.Equal(*e.YieldedAt) || m.age < 32*interval {
+			t.Fatalf("precondition: A's mark = %+v (present %v), want seq 1 at the listed episode, age >= 32h", m, ok)
+		}
+		return w, a, e
+	}
+
+	// (1) MECHANISM: the stale mark's age (~32 intervals) exceeds the new
+	// episode's latest point (1 interval), so without the episode check the
+	// row is not due and the sweep probes 0 rows.
+	t.Run("a later yielded_at is a new episode", func(t *testing.T) {
+		w, a, _ := serviced(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '1 hour 5 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+		if n := w.srv.sweepMergeQueueYields(ctx, interval); n != 1 {
+			t.Fatalf("sweep after a new episode re-probed %d rows, want 1 (judged over (0, age])", n)
+		}
+		e := w.active(a)
+		if m, ok := w.srv.yieldMark(e.ID); !ok || m.seq != 2 || !m.yieldedAt.Equal(*e.YieldedAt) {
+			t.Fatalf("A's mark = %+v (present %v), want seq 2 at the new episode %v", m, ok, e.YieldedAt)
+		}
+	})
+
+	// (2) A fully listed sweep that no longer lists the entry prunes its mark.
+	t.Run("pruned after a fully listed sweep", func(t *testing.T) {
+		w, _, e := serviced(t)
+		w.srv.cfg.MergeQueue = yrListFaultQueue{Store: w.store, list: func(ctx context.Context, b mergequeue.Base) ([]mergequeue.Entry, error) {
+			entries, err := w.store.ListForBase(ctx, b)
+			var kept []mergequeue.Entry
+			for _, x := range entries {
+				if x.ID != e.ID {
+					kept = append(kept, x)
+				}
+			}
+			return kept, err
+		}}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		if m, ok := w.srv.yieldMark(e.ID); ok {
+			t.Fatalf("A's mark = %+v after a fully listed sweep that no longer lists A, want pruned", m)
+		}
+	})
+
+	// (3) MECHANISM: the failed listing contributes no ids, so an unguarded
+	// prune drops the mark.
+	t.Run("kept when a base listing fails", func(t *testing.T) {
+		w, _, e := serviced(t)
+		w.srv.cfg.MergeQueue = yrListFaultQueue{Store: w.store, list: func(context.Context, mergequeue.Base) ([]mergequeue.Entry, error) {
+			return nil, errors.New("injected ListForBase failure")
+		}}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		if _, ok := w.srv.yieldMark(e.ID); !ok {
+			t.Fatal("A's mark was pruned by a sweep whose base listing failed, want kept")
+		}
+	})
+
+	// (4) A failed ActiveBases lists nothing, so an unguarded prune drops the
+	// mark.
+	t.Run("kept when ActiveBases fails", func(t *testing.T) {
+		w, _, e := serviced(t)
+		w.srv.cfg.MergeQueue = yrListFaultQueue{Store: w.store, activeBases: func(context.Context) ([]mergequeue.Base, error) {
+			return nil, errors.New("injected ActiveBases failure")
+		}}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		if _, ok := w.srv.yieldMark(e.ID); !ok {
+			t.Fatal("A's mark was pruned by a sweep whose ActiveBases failed, want kept")
+		}
+	})
 }
 
 // TestMergeQueueYieldSweep_FirstSweepAfterStartProbesAPastPointRow: a fresh
@@ -422,11 +611,12 @@ func TestMergeQueueYieldSurface_ConcurrentSweepsPostOnce(t *testing.T) {
 }
 
 // TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase: two yielded rows on
-// one base are both due, and the sweep re-probes only the OLDEST by
-// yielded_at. The fixture makes FIFO order and yield order disagree: A was
-// enqueued first (so it lists first) but carries the YOUNGER yielded_at, so
-// only B, the older yield, clears and A stays marked though it is approved
-// too. Counterfactual: deleting the yieldedBefore comparison takes the first
+// one base are both due and both never serviced, so ADR-112 Amendment A2.2's
+// tie-break by yielded_at decides: the sweep re-probes only the OLDEST yield.
+// The fixture makes FIFO order and yield order disagree: A was enqueued first
+// (so it lists first) but carries the YOUNGER yielded_at, so only B, the
+// older yield, clears and A stays marked though it is approved too.
+// Counterfactual: deleting the yieldedBefore comparison takes the first
 // listed due row (A), RED.
 func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	w := newMQELineWorld(t)
@@ -461,6 +651,135 @@ func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	}
 	if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
 		t.Fatalf("A = %+v, want still marked (listed first but the younger yield, not probed this tick)", e)
+	}
+}
+
+// TestMergeQueueYieldSweep_YoungerDueRowIsProbedUnderContention (CF7's
+// vehicle) pins ADR-112 Amendment A2.1: only the PROBED row's service mark
+// advances. A and B are yielded on one base, A enqueued first (it lists
+// first) with the older yield; aged 32 intervals + 10 s (A) and + 5 s (B) at
+// an hour-long interval, A's only review DISMISSED and B's APPROVED. Between
+// sweeps every yielded row ages one interval. Sweep 1 probes A (both never
+// serviced, A the older yield); sweep 2 finds A serviced past its latest
+// point and B never serviced, so B is probed and clears, and the detached
+// pump merges b1 while A stays yielded. MECHANISM: if every due row's mark
+// advances (CF7), sweep 1 marks A and B though only A is probed; both next
+// become due together at the 48-interval point, where A wins again, so B is
+// never probed, RED.
+func TestMergeQueueYieldSweep_YoungerDueRowIsProbedUnderContention(t *testing.T) {
+	const interval = time.Hour
+	ctx := context.Background()
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "DISMISSED", "b1"))
+	w.pumpBase(a)
+	w.backdateApprovalWait(a)
+	w.pumpBase(a) // A yields; B is admitted and waits
+	w.backdateApprovalWait(b)
+	w.pumpBase(b) // B yields
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours 10 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours 5 seconds' WHERE run_id = $1 AND state = 'held'`, b.id)
+	ea, eb := w.active(a), w.active(b)
+	if !ea.Yielded() || !eb.Yielded() || !ea.EnqueuedAt.Before(eb.EnqueuedAt) || !ea.YieldedAt.Before(*eb.YieldedAt) {
+		t.Fatalf("precondition: A (enqueued %v, yielded %v) and B (enqueued %v, yielded %v), want both yielded, A enqueued first with the older yield",
+			ea.EnqueuedAt, ea.YieldedAt, eb.EnqueuedAt, eb.YieldedAt)
+	}
+	listed, err := w.store.ListForBase(ctx, ea.Base())
+	if err != nil || len(listed) != 2 || listed[0].ID != ea.ID {
+		t.Fatalf("precondition: ListForBase = %d entries (err %v), want 2 with A first", len(listed), err)
+	}
+	w.forgeReviews(b, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "b1"))
+
+	clearedAt := 0
+	for k := 1; k <= 40 && clearedAt == 0; k++ {
+		if k > 1 {
+			w.backdateYielded(interval)
+		}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		w.srv.bgMergeQueuePump.Wait()
+		if len(w.rows(b, CategoryMergeQueueYieldCleared)) == 1 {
+			clearedAt = k
+		}
+	}
+	if clearedAt == 0 {
+		t.Fatal("B (approved, the younger due yield) was never re-probed in 40 sweeps: A won every contended sweep")
+	}
+	t.Logf("B cleared at sweep %d", clearedAt)
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
+		t.Fatalf("A = %+v, want still yielded (its only review is dismissed)", e)
+	}
+}
+
+// TestMergeQueueYieldSweep_RoundRobinReachesTheEligibleRowBehindSixteenBlocked
+// is ADR-112 Amendment A2's N=17 evidence (CF8's vehicle): 17 runs on ONE
+// base yield in FIFO order (r1 the oldest yield, r17 the youngest), aged on
+// the database clock to 32 intervals + (18 − i) s at an hour-long interval.
+// r1..r16 keep a DISMISSED review (permanently blocked) and r17 is APPROVED.
+// Every yielded row ages one interval between sweeps, and each sweep
+// re-probes exactly one row. Sweeps 1-16 (ages in [32, 48) intervals, latest
+// point 32) probe r1..r16 once each, oldest yield first among the
+// never-serviced; each is then not due until the 48-interval point. At sweep
+// 17 all 17 rows are due and round-robin (A2.2) picks r17, never serviced, so
+// r17 clears and the detached pump merges it while r1..r16 stay yielded.
+// MECHANISM: oldest-by-yielded_at (CF8) picks r1 again at sweep 17, so r17 is
+// not probed within 17 sweeps, RED.
+func TestMergeQueueYieldSweep_RoundRobinReachesTheEligibleRowBehindSixteenBlocked(t *testing.T) {
+	const interval, n = time.Hour, 17
+	ctx := context.Background()
+	w := newMQELineWorld(t)
+	head := func(i int) string { return fmt.Sprintf("r%dh", i+1) }
+	runs := make([]*mcqRun, n)
+	for i := range runs {
+		runs[i] = w.seed(fmt.Sprintf("r%d", i+1), head(i), []byte(mqeSpecYAML))
+	}
+	for i, r := range runs {
+		w.mqpHeldIntent(r, head(i), false)
+		w.forgeReviews(r, []string{"alice"}, mqmReview(int64(i+1), "alice", "DISMISSED", head(i)))
+	}
+	w.pumpBase(runs[0]) // r1 is admitted and waits
+	for _, r := range runs {
+		w.backdateApprovalWait(r)
+		w.pumpBase(r) // r yields; the next run is admitted and waits
+	}
+	for i, r := range runs {
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours' - $2::int * interval '1 second'
+WHERE run_id = $1 AND state = 'held'`, r.id, n+1-(i+1))
+		if e := w.active(r); !e.Yielded() || e.State != mergequeue.StateHeld {
+			t.Fatalf("precondition: r%d = %s yielded_at %v, want held and yielded", i+1, e.State, e.YieldedAt)
+		}
+	}
+	last := runs[n-1]
+	w.forgeReviews(last, []string{"alice"}, mqmReview(100, "alice", "APPROVED", head(n-1)))
+
+	clearedAt := 0
+	for k := 1; k <= n && clearedAt == 0; k++ {
+		if k > 1 {
+			w.backdateYielded(interval)
+		}
+		if got := w.srv.sweepMergeQueueYields(ctx, interval); got != 1 {
+			t.Fatalf("sweep %d re-probed %d rows, want exactly 1", k, got)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		if len(w.rows(last, CategoryMergeQueueYieldCleared)) == 1 {
+			clearedAt = k
+		}
+	}
+	if clearedAt == 0 {
+		t.Fatalf("r%d (approved, the youngest yield) was not re-probed within %d sweeps: the blocked rows starved it", n, n)
+	}
+	t.Logf("r%d cleared at sweep %d", n, clearedAt)
+	w.requirePuts(head(n - 1))
+	w.requireState(last, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	for i, r := range runs[:n-1] {
+		if e := w.active(r); e.YieldedAt == nil || len(w.rows(r, CategoryMergeQueueYieldCleared)) != 0 {
+			t.Fatalf("r%d = %+v, want still yielded (its only review is dismissed)", i+1, e)
+		}
 	}
 }
 
