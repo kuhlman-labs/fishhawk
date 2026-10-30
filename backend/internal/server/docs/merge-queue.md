@@ -348,11 +348,15 @@ deadline): `backend/internal/mergequeue/README.md`.
   `inline_merge_dispatched`; the merge overlap guard (#4119) → a 409 holds
   and appends a deduped, counts-only `merge_queue_overlap_refused`, a 502
   holds, no override; the base re-probe (`CompareCommits(head, base)`
-  behind > 0 → readvance); the `merge_queue_entered` row at the RECORDED
+  behind > 0 → readvance; an entry with an established approval wait runs
+  the fold first, writing nothing, so an expired wait yields with the
+  fold's reason: § "ADR-112 R3 yield and R5 visibility", expired-wait
+  enforcement, #4748); the `merge_queue_entered` row at the RECORDED
   intent sequence (missing → hold); **step 6b, the ADR-112 fold** at the
   verified head (§ "ADR-112 forge-approval fold"): a snapshot transport
-  failure holds `transient` writing nothing, a snapshot head ≠ the verified
-  head readvances `head_moved`, any other non-approved result returns
+  failure is an undetermined result that returns `await_approval`
+  (`forge_approval_undetermined`, #4748) writing nothing, a snapshot head ≠
+  the verified head readvances `head_moved`, any other non-approved result returns
   `await_approval` or `yield` (§ "ADR-112 R3 yield and R5 visibility"),
   approved writes `merge_queue_authorized` (an append
   failure holds `authorization_unrecorded`); record-before-commit
@@ -384,7 +388,8 @@ deadline): `backend/internal/mergequeue/README.md`.
   `dispatch_failed` and the entry holds (mergequeue README §
   "Merge-dispatch ledger"). A PR the forge reports merged settles
   `pr_merged` only when the run has no claim or its claim names the merged
-  head, else holds `merged_claim_head_mismatch`. A lock never taken → hold; a lapse after fn → WARN, its
+  head, else holds `merged_claim_head_mismatch` (an unreadable claim holds
+  `merged_claim_unread`, #4748 M1). A lock never taken → hold; a lapse after fn → WARN, its
   writes stand.
 - **D8 step stamps and the in-flight registry (ADR-093 D8 /
   [#4298](https://github.com/kuhlman-labs/fishhawk/issues/4298)).** After
@@ -412,7 +417,10 @@ deadline): `backend/internal/mergequeue/README.md`.
   OUTSIDE the merge-intent lock: not expired → hold and stop, expired →
   `Yield` + `merge_queue_yielded` and continue; `yield` → `Yield` +
   `merge_queue_yielded` and continue (a yield does not count against the
-  readvance cap). Otherwise the pump continues only after a settle, a
+  readvance cap); `expired_yielded` → continue (the expired-wait
+  enforcement, which runs between the decision and this apply, already
+  yielded a readvance or transient hold of an anchored entry under the
+  run's merge-intent lock, #4748). Otherwise the pump continues only after a settle, a
   live admission or an admission yield (`stop := res.outcome != admitSettled
   && res.outcome != admitLive && res.outcome != admitYielded`). Admission-owned writes (`Unadmit`, `SetPhase`, `ReanchorAt`,
   `SettleAt`) are compare-and-swaps on the entry's `admission_epoch`, so a
@@ -770,6 +778,60 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   refusal whose fresh snapshot reads REVIEW_REQUIRED, CHANGES_REQUESTED or
   BLOCKED; a null reviewDecision is row 5's eject) yields
   `forge_review_required` with the claim released.
+- **Expired-wait enforcement (#4748, `mergeOnPassEnforceExpiredWait`).**
+  Once an episode is ESTABLISHED (`approval_wait_started_at` set), the
+  deadline is also enforced on the pre-claim paths that return before the
+  await_approval outcome: every readvance (base moved, head moved) and every
+  approval-uncertain TRANSIENT hold carries the yield an expired wait applies
+  (`mergeOnPassOutcome.ExpiryYield`). Non-transient holds are OUTSIDE this
+  enforcement (`not_mergeable_yet`, `overlap_refused`,
+  `inline_merge_dispatched`, `intent_row_missing`, `verify_not_passed`,
+  `merge_lock_unavailable`, `entry_changed`, and `merged_claim_unread`
+  below); the deadline is enforced on pre-claim readvances and
+  approval-uncertain transient holds only. The pump hands the decision to the
+  enforcement, which, after a no-lock pre-filter (an ExpiryYield, no in-flight
+  mark of the decision's own, a readvance or hold, an established anchor: a
+  readvance or hold never STARTS an episode), takes the run's merge-intent
+  lock, the same lock that guards `SetPhase(merging)` and
+  `ClaimMergeDispatch` (first-officer ruling C1). Inside it, in order: re-read
+  the entry (live, same epoch, phase passed), the in-process in-flight
+  registry, the D1 claim (a claim, dispatched or dispatch_failed, holds:
+  ADR-109), then `Store.ApprovalWait`; only when expired does it `Store.Yield`
+  and append `merge_queue_yielded` (site `merge_on_pass`), still inside the
+  lock, and the pump continues (`expired_yielded`, not counted against the
+  readvance bound). Any refusal holds with no ExpiryYield (the next pump
+  re-decides); not expired applies the readvance or hold unchanged. It makes
+  NO forge call: the forge reads (the base-move fold, the review snapshots)
+  stay in the decision, before it. This is an APPLICATION of ADR-112 R3 step
+  8, not a new direction. R3 reads: "Merge-on-pass. Step 4 and the in-lock
+  step 8 wait or yield as above; they never drop an entry carrying intent."
+  and "Never inside the lock: the wait is a held outcome repeated across
+  pumps, never held inside the merge-intent lock (its fn bound is 90 s). It
+  takes no ledger claim." The judgement is in-lock per R3 step 8; the wait
+  remains a held outcome outside the lock per R3's "never inside the lock"
+  bullet (one bounded ApprovalWait judgement plus one Yield inside the 90 s
+  fn bound, never a held wait; the await path is unchanged and
+  `TestMergeQueueYield_WaitAndYieldRunOutsideTheMergeIntentLock` still pins
+  it outside the lock).
+  - A review-snapshot read failure at step 6b is an UNDETERMINED approval
+    result: it waits at the head (await_approval), then yields
+    `forge_approval_undetermined` (`retry_after`); it no longer holds
+    transient.
+  - A base move on an anchored entry runs the fold at the verified head
+    first (writing nothing), so an expiry yield names the real reason: a read
+    error → `forge_approval_undetermined`; merged → settle merged; head moved
+    → readvance `head_moved`; approved → no ExpiryYield; any other result → the
+    fold's yield. That path yields ONLY on expiry, a qualified veto included
+    (#4748 R4): an anchored vetoed entry re-advances and meets the veto's
+    immediate yield at step 6b on its next pass. An entry with no anchor
+    re-advances with the generic `forge_approval_undetermined` ExpiryYield and
+    no fold read.
+  - A `head_moved` readvance past expiry yields at the OLD anchored head; the
+    re-probe's reanchor arm then moves it to the current head (ADR-112 A1.1).
+  - The reconcile-merged hold (the PR merged, the run's dispatch claim
+    unreadable) is `merged_claim_unread`, never transient, so it carries no
+    ExpiryYield and never yields (M1).
+  - The ADR-093 D8 resume is not routed through the enforcement.
 - **Base change (first-officer ruling D).** A base change ends the
   approval-wait episode. The row re-enters the new base's FIFO at the tail,
   unmarked, with a fresh approval_wait_started_at. R3's no-reset rule applies
@@ -795,14 +857,24 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   refuses and writes nothing.
 - **Re-probe (`merge_queue_yield_reprobe.go`).** `RunMergeQueueYieldReprobe`
   ticks at `MergeCandidateQueuePumpInterval` beside the pump. Per base it
-  re-probes AT MOST ONE row, the oldest due by `(yielded_at, id)` under the
-  exponential backoff `yieldReprobeDue(yield age, since, interval)`: points
-  at interval·2^k up to 16 intervals, then every 16 intervals, and a row is
-  due when a point fell since THIS process's previous sweep, `(age − since,
-  age]` (`(0, age]` on the first sweep after start). The window is the actual
-  time since the previous sweep, so a sweep that overran its tick (dropped
-  ticks) never skips a point and no row past the cap starves on a
-  tick-parity stride (concern 8b3f29f5). The fold runs at the anchored head
+  re-probes AT MOST ONE due row under the exponential backoff (points at
+  interval·2^k up to 16 intervals, then every 16 intervals). ADR-112
+  Amendment A2.1: each row carries a per-entry, process-local SERVICE MARK
+  (the yielded_at and age at which this process last probed it, and a
+  strictly increasing service seq), advanced ONLY for the probed row, even
+  when its probe did nothing; a row is due when a point fell in
+  `(servicedAge, age]` (`yieldReprobeDueAfter`), and a never-serviced row or
+  a later `yielded_at` (a new episode) judges `(0, age]`. Marks are pruned
+  only after a FULLY listed sweep (ActiveBases and every ListForBase
+  succeeded), so a failed listing never drops a mark. A2.2: among a base's
+  due rows the probed one is the OLDEST service mark first, never-serviced
+  first, ties by `(yielded_at, id)` (`yieldServicedBefore`), so N due rows on
+  a base are each probed within N sweeps. Judging each row against its own
+  mark means a sweep that overran its tick never skips a point and no row
+  past the cap starves on a tick-parity stride (concern 8b3f29f5). The ADR-093
+  D4 re-entry sweep keeps its own previous-sweep window (`yieldReprobeDue(age,
+  since, interval)`). The targeted re-probe never touches the marks. The
+  fold runs at the anchored head
   with no store transaction open: approved AND the ONE clear predicate
   `mergeQueueYieldClears` holds → `ClearYield` (CAS on
   `anchored_head_sha` and `yielded_at`) → `merge_queue_yield_cleared` → a
@@ -885,7 +957,16 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `TestMergeOnPassVetoUndetermined_YieldRowAgreesWithReadSurface`: the
   `merge_queue_yielded` row's `next_step` equals the read projection's),
   `merge_queue_e2e_test.go` (dismissed waits then yields and B merges in the
-  SAME pump; gate-less BLOCKED yields; the anchor survives a readvance),
+  SAME pump; gate-less BLOCKED yields; the anchor survives a readvance; #4748:
+  an expired wait yields on repeated base movement, on a repeated transient
+  hold, after a snapshot failure, and on a head-moved readvance, then
+  re-anchors and clears; an approved base-move fold re-advances past an
+  expired wait), `merge_queue_merge_test.go`
+  (`TestMergeQueueMergeOnPass_BaseMovedWithEstablishedWait`, the R4 table;
+  `TestMergeQueueMergeOnPass_FoldFailureModes`, the M1 row),
+  `merge_queue_yield_test.go` (`TestMergeOnPassEnforceExpiredWait_Guards`;
+  `TestMergeOnPassExpiredWaitYield_ConcurrentDispatchClaimSuppressesYield`,
+  the C1 lock),
   `merge_queue_eligibility_test.go` (no approval leg on intent admission;
   veto alone yields; non-approval + veto drops). Re-probe:
   `merge_queue_yield_reprobe_test.go` (due table, clear, transition,
@@ -1157,10 +1238,12 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
   sibling replica's admission made before this replica's boot instant is
   re-claimed; the epoch CAS no-ops the sibling's later writes and its side
   effects are idempotent.
-- **ADR-112 A1.4 sweep times reset BY DESIGN.** The process-local re-probe
-  and re-entry sweep times restart from zero on a restart (the window
-  becomes (0, age]); the boot re-claim never touches `yield_reason`,
-  `yielded_at` or `approval_wait_started_at` (R6).
+- **ADR-112 A1.4 sweep times reset BY DESIGN.** A restart resets every
+  ADR-112 A2.1 re-probe service mark (every yielded row becomes never
+  serviced, judged over (0, age], so each is due once) and the re-entry
+  sweep's previous-sweep time (its window becomes (0, age]); the boot
+  re-claim never touches `yield_reason`, `yielded_at` or
+  `approval_wait_started_at` (R6).
 - **Restart blocker.** A merge THIS process has in flight is `merge_in_flight`
   on `GET /v0/restart-blockers`; a merging entry a PRIOR process left is not
   (§ "Restart blockers").

@@ -1302,12 +1302,17 @@ type Server struct {
 	// stage-live gate is holding (entry id → admission epoch), so the
 	// periodic pump re-checks the gate for them (approval condition C5).
 	mergeQueueGateHolds *mergeQueueGateHoldRegistry
-	// yieldSweepLast is when THIS process's previous yield sweep started
-	// (sweepMergeQueueYields; zero before the first, ADR-112 R3, #4632): a
-	// row is due when a schedule point fell since then. Process-local, under
-	// yieldSweepMu.
-	yieldSweepMu   sync.Mutex
-	yieldSweepLast time.Time
+	// yieldServiced is THIS process's per-entry yield re-probe service mark
+	// (sweepMergeQueueYields, ADR-112 Amendment A2.1, #4622/#4748): the
+	// yield episode and age at which the sweep last probed the entry, and its
+	// place in yieldServiceSeq's service order. Only the probed row's mark
+	// advances; a row with no mark (or a later yielded_at) is never serviced.
+	// The sweep probes the due row with the OLDEST mark first (A2.2), and
+	// prunes marks only after a fully listed sweep. Lazily initialised;
+	// process-local (a restart resets every mark), under yieldSweepMu.
+	yieldSweepMu    sync.Mutex
+	yieldServiced   map[uuid.UUID]yieldServicedMark
+	yieldServiceSeq uint64
 
 	// refinementFiling is the detached filing arm's in-process per-draft
 	// single-flight guard and status store (#4153), read by the session

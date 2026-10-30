@@ -648,7 +648,10 @@ func TestMergeQueueE2E_TwoPRsMergeBackToBack(t *testing.T) {
 // after the entry's pass and before its merge, so merge-on-pass re-advances
 // it at its place; the re-admission advances onto the new base, the runner's
 // pass there merges it pinned to the new head, and the stale head is never
-// PUT.
+// PUT. #4748 (CF2's vehicle): the entry never waited, so after the readvance
+// approval_wait_started_at is still NULL. Without the enforcement's
+// no-episode pre-filter, its in-lock ApprovalWait (COALESCE) STAMPS a fresh
+// anchor on an entry that never waited, RED.
 func TestMergeQueueE2E_BaseMovesBetweenPassAndMergeReadvances(t *testing.T) {
 	w := newMQELineWorld(t)
 	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
@@ -671,6 +674,9 @@ func TestMergeQueueE2E_BaseMovesBetweenPassAndMergeReadvances(t *testing.T) {
 	w.requirePuts()
 	if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" {
 		t.Fatalf("entry after the readvance = %s at %s, want live at a2 (re-advanced in place)", e.State, e.AnchoredHeadSHA)
+	}
+	if e := w.active(a); e.ApprovalWaitStartedAt != nil {
+		t.Fatalf("approval_wait_started_at after the readvance = %v, want NULL (the entry never waited)", e.ApprovalWaitStartedAt)
 	}
 
 	w.passAt(a, "a2")
@@ -792,7 +798,7 @@ func TestMergeQueueE2E_GatelessRowFourYieldIsNotReprobedIntoALoop(t *testing.T) 
 
 	for i := range 2 {
 		if i > 0 {
-			w.srv.yieldSweptAgo(time.Hour) // the previous sweep one (hour-long) tick ago
+			w.srv.yieldSweptAgo(time.Hour) // rewind every ADR-112 A2.1 service mark one (hour-long) tick
 		}
 		if n := w.srv.sweepMergeQueueYields(ctx, time.Hour); n != 1 {
 			t.Fatalf("sweep %d re-probed %d rows, want 1 (the backdated row is due)", i+1, n)
@@ -808,13 +814,16 @@ func TestMergeQueueE2E_GatelessRowFourYieldIsNotReprobedIntoALoop(t *testing.T) 
 	w.requireRowFourKept(a, y)
 }
 
-// TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance (CF1's e2e vehicle):
-// A waits at the head with no forge approval; its anchor is backdated past the
-// window BEFORE the base moves, so the next pump READVANCES A (Unadmit), the
-// re-admission advances it onto the moved base (a2) and the runner's pass
-// there brings it back to merge-on-pass. Only a PRESERVED anchor makes that
-// post-readvance decision yield; an anchor reset by Unadmit or the
-// re-admission would start a fresh wait and leave A live, RED.
+// TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance (reworked for
+// #4748): A waits at the head with no forge approval; the base moves BEFORE
+// the window expires, so the next pump READVANCES A (Unadmit) and the
+// re-admission advances it onto the moved base (a2). The read-back anchor
+// EQUALS the first one, which pins Unadmit and the re-admission keeping it
+// (an anchor reset by either starts a fresh wait, RED). Then the anchor is
+// backdated past the window, and the runner's pass at a2 brings A back to
+// merge-on-pass, which yields forge_approval_absent at the preserved anchor.
+// (An anchor already expired at the readvance now yields at the readvance by
+// design: TestMergeQueueE2E_ExpiredApprovalWaitYieldsOnRepeatedBaseMovement.)
 func TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance(t *testing.T) {
 	w := newMQELineWorld(t)
 	a := w.seed("a", "a1", []byte(mqeSpecYAML))
@@ -828,20 +837,288 @@ func TestMergeQueueE2E_ApprovalWaitAnchorSurvivesReadvance(t *testing.T) {
 		t.Fatalf("A after the first pump = %+v, want live and waiting", first)
 	}
 
-	w.backdateApprovalWait(a)
 	w.gh.set(func() { w.gh.behind["a1"] = []string{"base-x"} })
 	w.pumpBase(a)
-	if e := w.active(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" || e.YieldedAt != nil {
+	e := w.active(a)
+	if e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" || e.YieldedAt != nil {
 		t.Fatalf("A after the readvance = %s at %s yielded_at=%v, want live at a2, unmarked", e.State, e.AnchoredHeadSHA, e.YieldedAt)
 	}
+	if e.ApprovalWaitStartedAt == nil || !e.ApprovalWaitStartedAt.Equal(*first.ApprovalWaitStartedAt) {
+		t.Fatalf("A's wait anchor after the readvance = %v, want the first one %v (kept by Unadmit and the re-admission)", e.ApprovalWaitStartedAt, first.ApprovalWaitStartedAt)
+	}
 
+	w.backdateApprovalWait(a)
 	w.passAt(a, "a2")
 
-	e := w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalAbsent, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
-	if e.ApprovalWaitStartedAt == nil || !e.ApprovalWaitStartedAt.Before(first.ApprovalWaitStartedAt.Add(-time.Hour)) {
-		t.Fatalf("A's wait anchor = %v, want the backdated original (first %v minus 2h)", e.ApprovalWaitStartedAt, first.ApprovalWaitStartedAt)
+	y := w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalAbsent, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
+	if y.ApprovalWaitStartedAt == nil || !y.ApprovalWaitStartedAt.Before(first.ApprovalWaitStartedAt.Add(-time.Hour)) {
+		t.Fatalf("A's wait anchor = %v, want the backdated original (first %v minus 2h)", y.ApprovalWaitStartedAt, first.ApprovalWaitStartedAt)
 	}
 	w.requirePuts()
+}
+
+// requireNoDispatchEvidence asserts r claimed nothing and recorded no merge
+// verdict and no authorization row.
+func (w *mqmWorld) requireNoDispatchEvidence(r *mcqRun) {
+	w.t.Helper()
+	if n := w.claims(r); n != 0 {
+		w.t.Fatalf("claims = %d, want 0", n)
+	}
+	if n := len(w.rows(r, CategoryMergeVerdictRecorded)) + len(w.rows(r, CategoryMergeQueueAuthorized)); n != 0 {
+		w.t.Fatalf("verdict/authorization rows = %d, want 0", n)
+	}
+}
+
+// requireWaiting asserts r's entry is live, unmarked and waiting (its
+// approval-wait anchor set) at head.
+func (w *mqmWorld) requireWaiting(r *mcqRun, head string) mergequeue.Entry {
+	w.t.Helper()
+	e := w.active(r)
+	if e.State != mergequeue.StateLive || e.YieldedAt != nil || e.ApprovalWaitStartedAt == nil || e.AnchoredHeadSHA != head {
+		w.t.Fatalf("run %s entry = %s at %s yielded_at=%v wait=%v, want live, unmarked, waiting at %s",
+			r.id, e.State, e.AnchoredHeadSHA, e.YieldedAt, e.ApprovalWaitStartedAt, head)
+	}
+	return e
+}
+
+// requireHeldBehind asserts b is still held behind the head of line, with no
+// PUT at all.
+func (w *mqmWorld) requireHeldBehind(b *mcqRun) {
+	w.t.Helper()
+	if e := w.storeEntry(b); e.State != mergequeue.StateHeld {
+		w.t.Fatalf("B = %s, want held behind the head of line", e.State)
+	}
+	w.requirePuts()
+}
+
+// TestMergeQueueE2E_ExpiredApprovalWaitYieldsOnRepeatedBaseMovement (#4748;
+// CF1 and CF5 vehicle): A (review gate, its only review DISMISSED) and B
+// (approved) are queued. A waits at the head; then the base moves under every
+// pass, so every later decision returns at the base re-probe as a readvance
+// and never reaches await_approval. Before expiry A re-advances (a2, a3) and B
+// stays held. Once A's anchor is past the window, the next base-moved
+// readvance YIELDS A with the FOLD's reason (the base-move fold at the new
+// head; next_step approve_pr; site merge_on_pass), with no claim, verdict or
+// authorization row, and the SAME pump admits B, which merges. MECHANISM:
+// without the enforcement A readvances forever and B is never admitted
+// (CF1); without the base-move fold the expiry yield is the generic
+// forge_approval_undetermined and the reason assertion fails (CF5).
+func TestMergeQueueE2E_ExpiredApprovalWaitYieldsOnRepeatedBaseMovement(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "b1"))
+
+	w.pumpBase(a)
+	w.requireWaiting(a, "a1")
+	w.requireHeldBehind(b)
+
+	w.behind(a, "a1", "a2")
+	w.pumpBase(a)
+	if e := w.active(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" || e.YieldedAt != nil {
+		t.Fatalf("A after the first base move = %s at %s yielded_at=%v, want live at a2, unmarked", e.State, e.AnchoredHeadSHA, e.YieldedAt)
+	}
+	w.requireHeldBehind(b)
+
+	w.behind(a, "a2", "a3")
+	w.passAt(a, "a2")
+	if e := w.active(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a3" || e.YieldedAt != nil {
+		t.Fatalf("A after the second base move = %s at %s yielded_at=%v, want live at a3, unmarked", e.State, e.AnchoredHeadSHA, e.YieldedAt)
+	}
+	w.requireHeldBehind(b)
+
+	w.backdateApprovalWait(a)
+	w.behind(a, "a3", "a4")
+	w.passAt(a, "a3")
+
+	e := w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalDismissed, forgeApprovalNextApprovePR, mergeQueueYieldSiteMergeOnPass)
+	if e.AnchoredHeadSHA != "a3" {
+		t.Fatalf("A yielded at %s, want a3 (the head the expired readvance decided at)", e.AnchoredHeadSHA)
+	}
+	w.requireNoDispatchEvidence(a)
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// TestMergeQueueE2E_ExpiredApprovalWaitYieldsOnRepeatedTransientHold (#4748;
+// CF1 vehicle): A waits (dismissed); then every base re-probe fails (compare
+// 500), so A holds transient and B stays held. Once A's anchor is past the
+// window, the next pump YIELDS A forge_approval_undetermined (next_step
+// retry_after) and B merges. MECHANISM: a transient hold returns before the
+// fold, so without the enforcement no expiry judgement ever runs and A holds
+// the line forever.
+func TestMergeQueueE2E_ExpiredApprovalWaitYieldsOnRepeatedTransientHold(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "b1"))
+
+	w.pumpBase(a)
+	w.requireWaiting(a, "a1")
+
+	w.gh.set(func() { w.gh.compareStatus["a1"] = http.StatusInternalServerError })
+	w.pumpBase(a)
+	w.requireWaiting(a, "a1")
+	w.requireHeldBehind(b)
+
+	w.backdateApprovalWait(a)
+	w.pumpBase(a)
+
+	w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+	w.requireNoDispatchEvidence(a)
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// TestMergeQueueE2E_SnapshotFailureWaitsThenYields (#4748; CF4 vehicle):
+// every review snapshot of A fails from its FIRST merge-on-pass decision (the
+// admission's veto read precedes the failure). After pump 1, before any
+// backdate, A is live WITH an approval-wait anchor and B is held. After the
+// backdate the pump yields A forge_approval_undetermined (retry_after) and B
+// merges. Once the forge heals and A is approved, a targeted re-probe clears
+// A. MECHANISM: as a transient hold the failure never calls ApprovalWait, so A
+// has no anchor after pump 1, the no-episode pre-filter skips the
+// enforcement, and A holds the line forever.
+func TestMergeQueueE2E_SnapshotFailureWaitsThenYields(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "b1"))
+	armed := false
+	w.audit.onAppend = func(category string) {
+		// A's admission records its pass; every later snapshot of A fails.
+		if category == CategoryMergeQueueVerified && !armed {
+			armed = true
+			w.gh.set(func() { w.gh.graphQLFail[a.pr] = 1000 })
+		}
+	}
+
+	w.pumpBase(a)
+	if !armed {
+		t.Fatal("A's admission recorded no merge_queue_verified row")
+	}
+	w.requireWaiting(a, "a1")
+	w.requireHeldBehind(b)
+
+	w.backdateApprovalWait(a)
+	w.pumpBase(a)
+
+	w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+	w.requireNoDispatchEvidence(a)
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+
+	w.gh.set(func() {
+		w.gh.graphQLFail[a.pr] = 0
+		w.gh.mergeSHA[a.branch] = "a2"
+	})
+	if !w.srv.ReprobeMergeQueueYield(context.Background(), a.id, false) {
+		t.Fatal("the targeted re-probe did not clear A once the forge healed and A is approved")
+	}
+	w.srv.bgMergeQueuePump.Wait()
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 1 {
+		t.Fatalf("A merge_queue_yield_cleared rows = %d, want 1", n)
+	}
+}
+
+// TestMergeQueueE2E_ApprovedFoldOnBaseMoveReadvancesPastAnExpiredWait (#4748;
+// CF6 vehicle): A waited once (dismissed) and is then APPROVED; its anchor is
+// backdated past the window and the base moves. The base-move fold approves,
+// so A READVANCES (it does not yield), re-advances onto a2, passes there and
+// merges, with no merge_queue_yielded row. MECHANISM: without the approved
+// arm's ExpiryYield clear the readvance keeps the generic ExpiryYield and the
+// expired wait yields an approved entry.
+func TestMergeQueueE2E_ApprovedFoldOnBaseMoveReadvancesPastAnExpiredWait(t *testing.T) {
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+
+	w.pumpBase(a)
+	w.requireWaiting(a, "a1")
+
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+	w.backdateApprovalWait(a)
+	w.behind(a, "a1", "a2")
+	w.pumpBase(a)
+
+	if e := w.active(a); e.State != mergequeue.StateLive || e.AnchoredHeadSHA != "a2" || e.YieldedAt != nil {
+		t.Fatalf("A after the base move = %s at %s yielded_at=%v, want live at a2, unmarked (re-advanced, not yielded)", e.State, e.AnchoredHeadSHA, e.YieldedAt)
+	}
+	w.forgeReviews(a, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "a2"))
+	w.passAt(a, "a2")
+
+	w.requirePuts("a2")
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if n := len(w.rows(a, CategoryMergeQueueYielded)); n != 0 {
+		t.Fatalf("merge_queue_yielded rows = %d, want 0", n)
+	}
+}
+
+// TestMergeQueueE2E_HeadMovedReadvancePastExpiryYieldsThenReanchorsAndClears
+// (#4748 R5; CF1 vehicle): A (review gate, its only review DISMISSED) waits at
+// a1; its anchor is backdated past the window and the PR head moves to a1b.
+// The next decision is a head_moved readvance carrying the generic
+// ExpiryYield, and the enforcement YIELDS A forge_approval_undetermined
+// (retry_after, site merge_on_pass) anchored at the OLD head a1, with no
+// claim, verdict or authorization row. A targeted re-probe with no approval
+// at a1b takes the reanchor arm (ADR-112 A1.1): A is still yielded with the
+// SAME yielded_at, anchored at a1b. After an APPROVED review at a1b a second
+// targeted re-probe clears A at a1b, and the detached pump re-admits A
+// unmarked at a1b and merges it pinned there. MECHANISM: without the
+// enforcement the readvance re-advances A (no merge_queue_yielded row; A live
+// at a1b).
+func TestMergeQueueE2E_HeadMovedReadvancePastExpiryYieldsThenReanchorsAndClears(t *testing.T) {
+	w := newMQELineWorld(t)
+	ctx := context.Background()
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+
+	w.pumpBase(a)
+	w.requireWaiting(a, "a1")
+
+	w.backdateApprovalWait(a)
+	w.gh.set(func() { w.gh.prs[a.pr].head = "a1b" })
+	w.pumpBase(a)
+
+	y := w.requireYielded(a, mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+	if y.AnchoredHeadSHA != "a1" {
+		t.Fatalf("A yielded anchored at %s, want the old head a1", y.AnchoredHeadSHA)
+	}
+	w.requireNoDispatchEvidence(a)
+
+	if w.srv.ReprobeMergeQueueYield(ctx, a.id, false) {
+		t.Fatal("the targeted re-probe cleared A with no approval at a1b")
+	}
+	re := w.active(a)
+	if re.State != mergequeue.StateHeld || re.YieldedAt == nil || !re.YieldedAt.Equal(*y.YieldedAt) || re.AnchoredHeadSHA != "a1b" {
+		t.Fatalf("A after the reanchor re-probe = %s yielded_at=%v (was %v) at %s, want held, same yielded_at, anchored a1b",
+			re.State, re.YieldedAt, y.YieldedAt, re.AnchoredHeadSHA)
+	}
+
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1b"))
+	if !w.srv.ReprobeMergeQueueYield(ctx, a.id, false) {
+		t.Fatal("the targeted re-probe did not clear A approved at a1b")
+	}
+	w.srv.bgMergeQueuePump.Wait()
+	cleared := w.rows(a, CategoryMergeQueueYieldCleared)
+	if len(cleared) != 1 || w.payload(cleared[0])["head_sha"] != "a1b" {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1 at a1b", len(cleared))
+	}
+	// The re-admission at a1b (unmarked) needs no merge-candidate pass
+	// there, so the same detached pump merges A pinned to a1b.
+	w.requirePuts("a1b")
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
 }
 
 // TestMergeQueueE2E_AdmissionVetoYieldsAndLineContinues pins ADR-112 R3's
