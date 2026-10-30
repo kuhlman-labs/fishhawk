@@ -97,12 +97,14 @@ type mqmLedger struct {
 	mu         sync.Mutex
 	permissive bool
 	claimErr   error
-	claimed    map[uuid.UUID]string
-	claims     []string
-	failed     []string
-	released   []string
-	heads      map[uuid.UUID]string
-	failedRun  map[uuid.UUID]bool
+	// readErr, when set, is MergeDispatch's error (the claim read fails).
+	readErr   error
+	claimed   map[uuid.UUID]string
+	claims    []string
+	failed    []string
+	released  []string
+	heads     map[uuid.UUID]string
+	failedRun map[uuid.UUID]bool
 }
 
 func newMQMLedger() *mqmLedger {
@@ -112,6 +114,9 @@ func newMQMLedger() *mqmLedger {
 func (l *mqmLedger) MergeDispatch(_ context.Context, runID uuid.UUID) (mergequeue.DispatchClaim, bool, error) {
 	l.mu.Lock()
 	defer l.mu.Unlock()
+	if l.readErr != nil {
+		return mergequeue.DispatchClaim{}, false, l.readErr
+	}
 	p, ok := l.claimed[runID]
 	if !ok {
 		return mergequeue.DispatchClaim{}, false, nil
@@ -671,20 +676,52 @@ func TestMergeQueueMergeOnPass_LiveApprovalMergesWithEvidence(t *testing.T) {
 	}
 }
 
-// TestMergeQueueMergeOnPass_FoldFailureModes pins the two non-settle fold
-// outcomes: a snapshot transport failure HOLDS transient writing nothing (and
-// the healed next decision merges), and a failed merge_queue_authorized
-// append HOLDS authorization_unrecorded with no verdict and no claim.
+// TestMergeQueueMergeOnPass_FoldFailureModes pins the non-settle fold
+// outcomes: a snapshot transport failure is an UNDETERMINED approval result
+// (#4748) that WAITS at the head (await_approval, forge_approval_undetermined)
+// writing nothing, and the healed next decision merges (CF4: back to a
+// transient hold, the kind is held, RED); a failed merge_queue_authorized
+// append HOLDS authorization_unrecorded with no verdict and no claim; and
+// #4748 M1: a PR the forge reports merged whose dispatch claim cannot be read
+// holds merged_claim_unread with NO ExpiryYield, so the expired-wait
+// enforcement never yields it. MECHANISM (CF9): with the transient reason the
+// held closure attaches the generic ExpiryYield, and the enforcement, whose
+// claim re-read then succeeds with no claim, yields an already-merged entry,
+// which the re-probe never clears: the no-yield assertion turns RED.
 func TestMergeQueueMergeOnPass_FoldFailureModes(t *testing.T) {
-	t.Run("snapshot failure holds, then merges", func(t *testing.T) {
+	t.Run("snapshot failure waits, then merges", func(t *testing.T) {
 		w := newMQMWorld(t)
 		r, req := w.ready("sf", "h1", mqeSpecYAML)
 		w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
 		w.gh.set(func() { w.gh.graphQLFail[r.pr] = 3 })
-		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonTransient)
+		out := w.decide(req)
+		requireOutcome(t, out, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalUndetermined)
+		if out.Yield.Reason != mergeCandidateQueueReasonForgeApprovalUndetermined || out.Yield.NextStep != forgeApprovalNextRetryAfter ||
+			out.Yield.Row != mergeQueueYieldRowApprovalFold || out.ExpiryYield != nil {
+			t.Fatalf("snapshot-failure yield = %+v expiry=%v, want forge_approval_undetermined retry_after row 3, no ExpiryYield", out.Yield, out.ExpiryYield)
+		}
 		w.requireNoMergeWrites(r)
 		w.gh.set(func() { w.gh.graphQLFail[r.pr] = 0 })
 		requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	})
+	t.Run("merged with an unreadable claim never yields", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.ready("mu", "h1", mqeSpecYAML)
+		req = w.mqmExpiredWait(r, req)
+		w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+		w.ledger.readErr = errors.New("injected claim read failure")
+		out := w.decide(req)
+		// The claim read heals before the enforcement runs (CF9's mechanism).
+		w.ledger.readErr = nil
+		enforced := w.srv.mergeOnPassEnforceExpiredWait(context.Background(), req, out)
+		if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 || w.active(r).Yielded() {
+			t.Fatalf("merge_queue_yielded rows = %d, entry yielded = %v: an expired wait yielded a merged PR", n, w.active(r).Yielded())
+		}
+		requireOutcome(t, out, mergeOnPassHeld, mergeOnPassReasonMergedClaimUnread)
+		if out.ExpiryYield != nil || enforced.Kind != mergeOnPassHeld || enforced.Reason != mergeOnPassReasonMergedClaimUnread {
+			t.Fatalf("outcome expiry=%v enforced=%s/%s, want no ExpiryYield and the hold unchanged", out.ExpiryYield, enforced.Kind, enforced.Reason)
+		}
+		w.requireNoMergeWrites(r)
 	})
 	t.Run("authorization append failure holds", func(t *testing.T) {
 		w := newMQMWorld(t)
@@ -694,6 +731,119 @@ func TestMergeQueueMergeOnPass_FoldFailureModes(t *testing.T) {
 		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonAuthorizationUnrecorded)
 		w.requireNoMergeWrites(r)
 	})
+}
+
+// mqmExpiredWait stamps r's live entry's approval-wait anchor through the
+// real store, backdates it past the default window and returns req with the
+// re-read entry (an ESTABLISHED, expired episode).
+func (w *mqmWorld) mqmExpiredWait(r *mcqRun, req mergeOnPassRequest) mergeOnPassRequest {
+	w.t.Helper()
+	if _, err := w.store.ApprovalWait(context.Background(), req.Entry.ID, req.Entry.AdmissionEpoch, time.Hour); err != nil {
+		w.t.Fatalf("stamp the approval wait: %v", err)
+	}
+	w.backdateApprovalWait(r)
+	req.Entry = w.active(r)
+	return req
+}
+
+// TestMergeQueueMergeOnPass_BaseMovedWithEstablishedWait (#4748, CF5's
+// decision vehicle) pins step 6's base-moved arm. The decision writes nothing
+// (w.decide), so each row asserts the readvance and the ExpiryYield the pump's
+// enforcement would apply. An entry whose wait is ESTABLISHED runs the fold at
+// the verified head before re-advancing: approved → no ExpiryYield; dismissed
+// → the fold's yield; fold error → forge_approval_undetermined; merged →
+// settle merged; head moved → readvance head_moved. With NO anchor the
+// readvance carries the generic ExpiryYield and makes no fold read.
+//
+// The R4 choice: the base-move path yields ONLY on expiry. An anchored VETOED
+// entry readvances like an unanchored one, carrying the veto's yield
+// (forge_approval_vetoed, row 2) as its ExpiryYield; it meets the veto's
+// immediate yield at step 6b on its next pass, and an expired anchored one
+// yields with the veto's reason. Reinstating an immediate yield there turns
+// the vetoed row RED. Deleting the fold (CF5) turns the dismissed, vetoed,
+// approved, merged and head-moved rows RED.
+func TestMergeQueueMergeOnPass_BaseMovedWithEstablishedWait(t *testing.T) {
+	cases := []struct {
+		name      string
+		noAnchor  bool
+		plant     func(w *mqmWorld, r *mcqRun)
+		kind      mergeOnPassKind
+		reason    string
+		expiry    string // "" = nil ExpiryYield
+		expiryRow int
+	}{
+		{"approved fold re-advances with no expiry yield", false, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+		}, mergeOnPassReadvance, mergeOnPassReasonBaseMoved, "", 0},
+		{"dismissed carries the fold's yield", false, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h1"))
+		}, mergeOnPassReadvance, mergeOnPassReasonBaseMoved, mergeCandidateQueueReasonForgeApprovalDismissed, mergeQueueYieldRowApprovalFold},
+		{"vetoed re-advances carrying the veto's yield", false, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", "h1"), mqmReview(2, "bob", "CHANGES_REQUESTED", "h1"))
+		}, mergeOnPassReadvance, mergeOnPassReasonBaseMoved, mergeCandidateQueueReasonForgeApprovalVetoed, mergeQueueYieldRowVeto},
+		{"fold error carries an undetermined yield", false, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+			w.gh.set(func() { w.gh.graphQLFail[r.pr] = 100 })
+		}, mergeOnPassReadvance, mergeOnPassReasonBaseMoved, mergeCandidateQueueReasonForgeApprovalUndetermined, mergeQueueYieldRowApprovalFold},
+		{"fold merged settles merged", false, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h1"))
+			w.onResponse = func(path string) {
+				if strings.Contains(path, "/compare/") {
+					w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+				}
+			}
+		}, mergeOnPassSettle, mergeCandidateQueueReasonPRMerged, "", 0},
+		{"fold head moved re-advances head_moved", false, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h1"))
+			w.onResponse = func(path string) {
+				if strings.Contains(path, "/compare/") {
+					w.gh.set(func() { w.gh.prs[r.pr].head = "h2" })
+				}
+			}
+		}, mergeOnPassReadvance, mergeOnPassReasonHeadMoved, mergeCandidateQueueReasonForgeApprovalUndetermined, mergeQueueYieldRowApprovalFold},
+		{"no anchor re-advances with the generic yield and no fold read", true, func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "h1"))
+		}, mergeOnPassReadvance, mergeOnPassReasonBaseMoved, mergeCandidateQueueReasonForgeApprovalUndetermined, mergeQueueYieldRowApprovalFold},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req := w.ready("bm", "h1", mqeSpecYAML)
+			if !tc.noAnchor {
+				if _, err := w.store.ApprovalWait(context.Background(), req.Entry.ID, req.Entry.AdmissionEpoch, time.Hour); err != nil {
+					t.Fatalf("stamp the approval wait: %v", err)
+				}
+				req.Entry = w.active(r)
+			}
+			tc.plant(w, r)
+			w.gh.set(func() { w.gh.behind["h1"] = []string{"base-x"} })
+			reads := w.gh.snapshotCalls()
+			out := w.decide(req)
+			requireOutcome(t, out, tc.kind, tc.reason)
+			switch {
+			case tc.expiry == "" && out.ExpiryYield != nil:
+				t.Fatalf("ExpiryYield = %+v, want nil", *out.ExpiryYield)
+			case tc.expiry != "" && (out.ExpiryYield == nil || out.ExpiryYield.Reason != tc.expiry || out.ExpiryYield.Row != tc.expiryRow ||
+				out.ExpiryYield.NextStep != mergeQueueYieldNextStep(tc.expiry)):
+				t.Fatalf("ExpiryYield = %+v, want reason %s row %d", out.ExpiryYield, tc.expiry, tc.expiryRow)
+			}
+			if out.Yield != (mergeQueueYield{}) {
+				t.Fatalf("immediate yield = %+v, want none on the base-move path (R4)", out.Yield)
+			}
+			if tc.noAnchor {
+				if n := w.gh.snapshotCalls() - reads; n != 0 {
+					t.Fatalf("snapshot reads = %d, want 0 (no established wait: no fold)", n)
+				}
+				if e := w.active(r); e.ApprovalWaitStartedAt != nil {
+					t.Fatalf("approval_wait_started_at = %v, want NULL (the decision writes nothing)", e.ApprovalWaitStartedAt)
+				}
+			}
+			w.requireNoMergeWrites(r)
+			if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 {
+				t.Fatalf("merge_queue_yielded rows = %d, want 0 (the decision writes nothing)", n)
+			}
+		})
+	}
 }
 
 func TestMergeQueueMergeOnPass_OverlapRefusalHoldsUnmerged(t *testing.T) {

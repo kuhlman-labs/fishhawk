@@ -92,8 +92,10 @@ type mergeDispatchLedger interface {
 // merged against the run's D1 claim (ruling R1 reconciliation): settle merged
 // only when there is no claim, or the claim names the merged head; a
 // dispatch_failed claim that reconciles appends merge_dispatch_settled
-// reconciled_merged. ok=false holds with reason: the claim could not be read,
-// or it names a different head than the one that merged. A nil ledger has no
+// reconciled_merged. ok=false holds with reason: the claim could not be read
+// (merged_claim_unread, #4748 M1: never transient, so the hold carries no
+// approval-wait ExpiryYield and an already-merged entry is never yielded), or
+// it names a different head than the one that merged. A nil ledger has no
 // claim to read.
 func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string) {
 	ok, reason, detail, err := s.mergeOnPassReconcileMergedStrict(ctx, ledger, runID, mergedHead)
@@ -113,7 +115,7 @@ func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger me
 	}
 	claim, found, err := ledger.MergeDispatch(ctx, runID)
 	if err != nil {
-		return false, mergeOnPassReasonTransient, "the pull request merged but the run's dispatch claim could not be read: " + err.Error(), nil
+		return false, mergeOnPassReasonMergedClaimUnread, "the pull request merged but the run's dispatch claim could not be read: " + err.Error(), nil
 	}
 	if !found {
 		return true, "", "", nil
@@ -344,6 +346,11 @@ const (
 	// entry with NO dispatch claim to phase passed; the pump continues, and
 	// ordinary merge-on-pass decides from scratch (fold and veto in-lock).
 	mergeOnPassRedecide mergeOnPassKind = "redecide"
+	// mergeOnPassExpiredYielded (ADR-112 R3, #4748): the expired-wait
+	// enforcement (mergeOnPassEnforceExpiredWait) yielded the entry under the
+	// run's merge-intent lock instead of applying a readvance or a hold; the
+	// pump continues to the next held entry.
+	mergeOnPassExpiredYielded mergeOnPassKind = "expired_yielded"
 )
 
 // mergeOnPassOutcome is mergeQueueMergeOnPass's answer. State is set only on
@@ -353,7 +360,13 @@ const (
 // (ADR-093 D4): the typed refusal code and the forge's untrusted refusal text,
 // which the merge_queue_ejected writer sanitises. InFlightMarked reports that
 // THIS decision marked the run in s.mergeInFlight (ADR-093 D8), so the pump
-// clears only its own mark.
+// clears only its own mark. ExpiryYield (ADR-112 R3, #4748) is the yield the
+// expired-wait enforcement applies INSTEAD of this outcome when the entry's
+// ESTABLISHED approval wait has expired: it is set only on readvance and
+// transient-hold outcomes (every head_moved and base_moved readvance, and
+// every mergeOnPassReasonTransient hold), never by the ADR-093 D8 resume
+// (merge_queue_resume.go keeps its own closures). A post-claim outcome may
+// carry it too; InFlightMarked makes the enforcement skip it.
 type mergeOnPassOutcome struct {
 	Kind          mergeOnPassKind
 	State         mergequeue.State
@@ -367,20 +380,26 @@ type mergeOnPassOutcome struct {
 	ForgeDetail   string
 	// InFlightMarked: this decision marked s.mergeInFlight for the run.
 	InFlightMarked bool
+	// ExpiryYield: the yield an expired approval wait applies (nil: none).
+	ExpiryYield *mergeQueueYield
 }
 
 // Merge-on-pass reasons. Hold reasons leave the entry; eject/drop reasons are
 // the queue's (mergequeue README § "Reasons").
 const (
-	mergeOnPassReasonNoIntent              = "no_merge_intent"
-	mergeOnPassReasonNotLive               = "not_live"
-	mergeOnPassReasonNotPassed             = "not_passed"
-	mergeOnPassReasonNoPinnedMerge         = "no_pinned_merge"
-	mergeOnPassReasonTransient             = "transient"
-	mergeOnPassReasonVerifyNotPassed       = "verify_not_passed"
-	mergeOnPassReasonNotMergeable          = "not_mergeable_yet"
-	mergeOnPassReasonEntryChanged          = "entry_changed"
-	mergeOnPassReasonMergedClaimMismatch   = "merged_claim_head_mismatch"
+	mergeOnPassReasonNoIntent            = "no_merge_intent"
+	mergeOnPassReasonNotLive             = "not_live"
+	mergeOnPassReasonNotPassed           = "not_passed"
+	mergeOnPassReasonNoPinnedMerge       = "no_pinned_merge"
+	mergeOnPassReasonTransient           = "transient"
+	mergeOnPassReasonVerifyNotPassed     = "verify_not_passed"
+	mergeOnPassReasonNotMergeable        = "not_mergeable_yet"
+	mergeOnPassReasonEntryChanged        = "entry_changed"
+	mergeOnPassReasonMergedClaimMismatch = "merged_claim_head_mismatch"
+	// mergeOnPassReasonMergedClaimUnread (#4748 M1): the pull request merged
+	// and the run's dispatch claim could not be read. Not transient: the
+	// hold carries no ExpiryYield, so an expired wait never yields a merged PR.
+	mergeOnPassReasonMergedClaimUnread     = "merged_claim_unread"
 	mergeOnPassReasonInlineMergeDispatched = "inline_merge_dispatched"
 	mergeOnPassReasonOverlapRefused        = "overlap_refused"
 	mergeOnPassReasonIntentRowMissing      = "intent_row_missing"
@@ -474,13 +493,18 @@ func (s *Server) mergeOnPassReadPR(ctx context.Context, t mergeOnPassTarget) (*f
 func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassRequest) mergeOnPassOutcome {
 	e := req.Entry
 	held := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+		out := mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+		if reason == mergeOnPassReasonTransient { // ADR-112 R3 (#4748): an approval-uncertain hold carries its expiry yield
+			out.ExpiryYield = mergeOnPassUndeterminedExpiryYield(reason, detail)
+		}
+		return out
 	}
 	settle := func(state mergequeue.State, reason, detail string) mergeOnPassOutcome {
 		return mergeOnPassOutcome{Kind: mergeOnPassSettle, State: state, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
 	}
 	readvance := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA,
+			ExpiryYield: mergeOnPassUndeterminedExpiryYield(reason, detail)} // ADR-112 R3 (#4748)
 	}
 
 	if e.MergeIntentAt == nil { // ADR-093: merge-on-pass needs the operator's merge intent
@@ -622,10 +646,15 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	// basis is the fold's (step 6b); "" until the fold ran.
 	basis := ""
 	held := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+		out := mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+		if reason == mergeOnPassReasonTransient { // ADR-112 R3 (#4748): an approval-uncertain hold carries its expiry yield
+			out.ExpiryYield = mergeOnPassUndeterminedExpiryYield(reason, detail)
+		}
+		return out
 	}
 	readvance := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis,
+			ExpiryYield: mergeOnPassUndeterminedExpiryYield(reason, detail)} // ADR-112 R3 (#4748)
 	}
 	settle := func(state mergequeue.State, reason, detail string) mergeOnPassOutcome {
 		return mergeOnPassOutcome{Kind: mergeOnPassSettle, State: state, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
@@ -715,21 +744,53 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	}
 	baseMoved := len(behind) > 0 // ADR-093 D3 base re-probe
 	if baseMoved {
-		return readvance(mergeOnPassReasonBaseMoved, e.BaseRef+" moved past the verified head "+head)
+		// ADR-112 R3 (#4748): an entry with NO established approval wait
+		// re-advances with the generic ExpiryYield and no fold read. An
+		// anchored entry first runs the fold at head, writing nothing, so an
+		// expiry yield names the real reason. R4: this path yields ONLY on
+		// expiry, a qualified veto included; a veto's immediate yield stays
+		// at step 6b on the entry's next pass.
+		out := readvance(mergeOnPassReasonBaseMoved, e.BaseRef+" moved past the verified head "+head)
+		if cur.Entry.ApprovalWaitStartedAt == nil {
+			return out
+		}
+		// ADR-112 R3: an established wait judges the fold before re-advancing.
+		fold, ferr := s.forgeApprovalFold(ctx, runRow, head)
+		switch {
+		case ferr != nil:
+			y := mergeOnPassSnapshotUndeterminedYield(ferr)
+			out.ExpiryYield = &y
+		case fold.Merged:
+			if ok, reason, detail := s.mergeOnPassReconcileMerged(ctx, req.Ledger, e.RunID, fold.ObservedHead); !ok {
+				return held(reason, detail)
+			}
+			return settle(mergequeue.StateMerged, mergeCandidateQueueReasonPRMerged, "the pull request is already merged")
+		case fold.Reason == forgeApprovalReasonHeadMoved:
+			return readvance(mergeOnPassReasonHeadMoved, fold.Detail)
+		case fold.approved():
+			out.ExpiryYield = nil // the fold approved: no wait to enforce
+		default:
+			y, _ := mergeOnPassFoldYield(fold) // #4748 R4: the base-move path yields only on expiry; a veto's immediate yield stays at step 6b
+			out.ExpiryYield = &y
+		}
+		return out
 	}
 
 	// 6b. ADR-112 (#4619): the ONE forge-approval fold at the verified head,
 	// AFTER the base re-probe and BEFORE the verdict, the single source of
-	// approvals and vetoes on this path. A snapshot transport failure holds
-	// (a read failure, not a decision: nothing is written); a head the
-	// snapshot reports moved re-advances (H1); every other non-approved
-	// result WAITS at the head or YIELDS (ADR-112 R3, mergeOnPassFoldYield;
-	// the pump applies either outside this lock) with no verdict row, no
-	// authorization row and no claim. An approved fold on a declared gate
-	// writes merge_queue_authorized BEFORE the verdict; a failed append holds.
+	// approvals and vetoes on this path. A snapshot transport failure is an
+	// UNDETERMINED approval result (#4748): it WAITS at the head through the
+	// ordinary await_approval path (the pump stamps or continues the anchor
+	// with Store.ApprovalWait), then yields forge_approval_undetermined at
+	// expiry; a head the snapshot reports moved re-advances (H1); every other
+	// non-approved result WAITS at the head or YIELDS (ADR-112 R3,
+	// mergeOnPassFoldYield; the pump applies either outside this lock). None
+	// of these writes a verdict row, an authorization row or a claim. An
+	// approved fold on a declared gate writes merge_queue_authorized BEFORE
+	// the verdict; a failed append holds.
 	fold, ferr := s.forgeApprovalFold(ctx, runRow, head)
 	if ferr != nil {
-		return held(mergeOnPassReasonTransient, sanitizeForgeReadDetail("review_snapshot", ferr.Error()))
+		return yield(mergeOnPassAwaitApproval, mergeOnPassSnapshotUndeterminedYield(ferr))
 	}
 	basis = fold.Basis
 	switch {

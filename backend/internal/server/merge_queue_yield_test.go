@@ -3,10 +3,12 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
 	"log/slog"
 	"net/http"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -292,5 +294,217 @@ func TestMergeQueueYield_WaitAndYieldRunOutsideTheMergeIntentLock(t *testing.T) 
 	defer probe.mu.Unlock()
 	if strings.Join(probe.calls, ",") != "approval_wait,approval_wait,yield" || probe.inLock {
 		t.Fatalf("store calls = %v inLock=%v, want approval_wait,approval_wait,yield outside any lock", probe.calls, probe.inLock)
+	}
+}
+
+// TestMergeOnPassEnforceExpiredWait_Guards (#4748; CF3 vehicle) is a
+// direct-call table over the real store, one assertion per branch of the
+// expired-wait enforcement. The outcome fed in is a base_moved readvance
+// carrying the generic ExpiryYield on an entry whose anchor is backdated past
+// the window, unless the row says otherwise. Pass-through rows return o
+// UNCHANGED; the pre-filter rows also take no lock. Refusing rows hold with no
+// ExpiryYield. Every non-yielding row asserts no marker and no
+// merge_queue_yielded row. MECHANISM for the claim rows: the anchor is
+// expired, so with the claim guard deleted ApprovalWait reports expired and
+// the helper yields a run whose dispatch is claimed, RED. Masking note: on the
+// pump path the registry guard is masked by InFlightMarked (the pump clears
+// its own mark after apply), so only the direct row pins it.
+func TestMergeOnPassEnforceExpiredWait_Guards(t *testing.T) {
+	ctx := context.Background()
+	type setup struct {
+		w   *mqmWorld
+		r   *mcqRun
+		req *mergeOnPassRequest
+		o   *mergeOnPassOutcome
+	}
+	cases := []struct {
+		name     string
+		noAnchor bool
+		fresh    bool // the anchor is stamped but NOT backdated (not expired)
+		mutate   func(s setup)
+		kind     mergeOnPassKind // "" = o unchanged
+		reason   string
+		noLock   bool
+	}{
+		{name: "nil ExpiryYield passes through", mutate: func(s setup) { s.o.ExpiryYield = nil }, noLock: true},
+		{name: "a decision that marked in flight passes through", mutate: func(s setup) { s.o.InFlightMarked = true }, noLock: true},
+		{name: "a settle passes through", mutate: func(s setup) { s.o.Kind = mergeOnPassSettle }, noLock: true},
+		{name: "no established episode passes through", noAnchor: true, noLock: true},
+		{name: "a re-admitted entry holds", mutate: func(s setup) {
+			s.w.exec(`UPDATE merge_candidate_queue_entries SET admission_epoch = admission_epoch + 1 WHERE id = $1`, s.req.Entry.ID)
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonEntryChanged},
+		{name: "a merging entry holds", mutate: func(s setup) {
+			s.w.exec(`UPDATE merge_candidate_queue_entries SET phase = 'merging' WHERE id = $1`, s.req.Entry.ID)
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonEntryChanged},
+		{name: "the in-flight registry holds", mutate: func(s setup) { s.w.srv.mergeInFlight.mark(s.r.id) },
+			kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "a dispatched claim holds", mutate: func(s setup) {
+			if _, ok, err := s.w.ledger.ClaimMergeDispatch(ctx, s.r.id, mergeDispatchPathQueue, "h1"); !ok || err != nil {
+				s.w.t.Fatalf("seed claim: %v %v", ok, err)
+			}
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "a dispatch_failed claim holds", mutate: func(s setup) {
+			if _, ok, err := s.w.ledger.ClaimMergeDispatch(ctx, s.r.id, mergeDispatchPathQueue, "h1"); !ok || err != nil {
+				s.w.t.Fatalf("seed claim: %v %v", ok, err)
+			}
+			_ = s.w.ledger.MarkMergeDispatchFailed(ctx, s.r.id, "uncertain")
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "a claim read error holds", mutate: func(s setup) { s.w.ledger.readErr = errors.New("injected claim read failure") },
+			kind: mergeOnPassHeld, reason: mergeOnPassReasonLedgerUnavailable},
+		{name: "no ledger holds", mutate: func(s setup) { s.req.Ledger = nil },
+			kind: mergeOnPassHeld, reason: mergeOnPassReasonLedgerUnavailable},
+		{name: "an untaken lock holds", mutate: func(s setup) {
+			s.w.srv.cfg.MergeQueue = mqmLockQueue{Store: s.w.store, lockErr: errors.New("no lock")}
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonLockUnavailable},
+		{name: "an unexpired wait passes through", fresh: true},
+		{name: "an expired wait yields", kind: mergeOnPassExpiredYielded, reason: mergeCandidateQueueReasonForgeApprovalUndetermined},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req := w.ready("eg", "h1", mqeSpecYAML)
+			switch {
+			case tc.fresh:
+				if _, err := w.store.ApprovalWait(ctx, req.Entry.ID, req.Entry.AdmissionEpoch, time.Hour); err != nil {
+					t.Fatalf("stamp the approval wait: %v", err)
+				}
+				req.Entry = w.active(r)
+			case !tc.noAnchor:
+				req = w.mqmExpiredWait(r, req)
+			}
+			var locks atomic.Int32
+			w.srv.cfg.MergeQueue = mqmOnLockQueue{Store: w.store, onLock: func() { locks.Add(1) }}
+			o := mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: mergeOnPassReasonBaseMoved, Detail: "main moved", HeadSHA: "h1",
+				ExpiryYield: mergeOnPassUndeterminedExpiryYield(mergeOnPassReasonBaseMoved, "main moved")}
+			if tc.mutate != nil {
+				tc.mutate(setup{w: w, r: r, req: &req, o: &o})
+			}
+
+			got := w.srv.mergeOnPassEnforceExpiredWait(ctx, req, o)
+
+			if tc.kind == "" {
+				if got != o {
+					t.Fatalf("outcome = %+v, want o unchanged %+v", got, o)
+				}
+			} else {
+				requireOutcome(t, got, tc.kind, tc.reason)
+				if got.ExpiryYield != nil {
+					t.Fatalf("enforcement outcome carries ExpiryYield %+v, want nil", *got.ExpiryYield)
+				}
+			}
+			if tc.noLock && locks.Load() != 0 {
+				t.Fatalf("merge-intent lock taken %d times, want 0 (pre-filter)", locks.Load())
+			}
+			e := w.active(r)
+			rows := w.rows(r, CategoryMergeQueueYielded)
+			if tc.kind == mergeOnPassExpiredYielded {
+				if e.State != mergequeue.StateHeld || !e.Yielded() || e.YieldReason != tc.reason || len(rows) != 1 ||
+					w.payload(rows[0])["site"] != mergeQueueYieldSiteMergeOnPass || got.Yield.NextStep != forgeApprovalNextRetryAfter {
+					t.Fatalf("expired yield: entry = %s %q yielded=%v rows=%d yield=%+v, want held, marked, one merge_on_pass row",
+						e.State, e.YieldReason, e.Yielded(), len(rows), got.Yield)
+				}
+				return
+			}
+			if e.Yielded() || len(rows) != 0 {
+				t.Fatalf("entry yielded=%v merge_queue_yielded rows=%d, want neither", e.Yielded(), len(rows))
+			}
+			if tc.noAnchor && e.ApprovalWaitStartedAt != nil {
+				t.Fatalf("approval_wait_started_at = %v, want NULL (an entry that never waited is never stamped)", e.ApprovalWaitStartedAt)
+			}
+			// The claim rows seed their own claim, so only the merge and the
+			// verdict/authorization rows are asserted absent here.
+			w.requireMerges(0)
+			if n := len(w.rows(r, CategoryMergeVerdictRecorded)) + len(w.rows(r, CategoryMergeQueueAuthorized)); n != 0 {
+				t.Fatalf("verdict/authorization rows = %d, want 0", n)
+			}
+		})
+	}
+}
+
+// TestMergeOnPassExpiredWaitYield_ConcurrentDispatchClaimSuppressesYield
+// (#4748, first-officer ruling C1; CF10 vehicle) pins that the expiry
+// judgement runs under the run's merge-intent lock, the lock that guards
+// SetPhase(merging) and ClaimMergeDispatch. A is anchored past the window,
+// its base moves and B is queued behind it. The decision answers a readvance
+// carrying an ExpiryYield; then, at the enforcement's lock acquisition and
+// EXACTLY once (approval condition L-b: the follow-up pump's D8 resume
+// re-takes the lock), a competing dispatch takes the same lock and records
+// SetPhase(merging) plus a queue claim. The enforcement must hold, A must
+// keep its phase and claim with no marker, and the follow-up pump routes A to
+// the D8 resume, so B stays held with no b1 PUT. MECHANISM: the competing
+// claim lands after the decision and before the enforcement's lock; with the
+// re-read, claim and ApprovalWait judgement moved before withRunMergeLock
+// (CF10) the judgement sees passed and no claim, the hook then claims, and
+// fn's Yield CAS (live + epoch only; SetPhase keeps the epoch) lands: A
+// yields while claimed and the pump admits B, RED.
+func TestMergeOnPassExpiredWaitYield_ConcurrentDispatchClaimSuppressesYield(t *testing.T) {
+	w := newMQELineWorld(t)
+	ctx := context.Background()
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "b1"))
+
+	w.pumpBase(a)
+	w.requireWaiting(a, "a1")
+	w.backdateApprovalWait(a)
+	w.behind(a, "a1", "a2")
+
+	store := w.srv.cfg.MergeQueue
+	ae := w.active(a)
+	req := mergeOnPassRequest{Entry: ae, IntentSequence: ae.MergeIntentSequence, Ledger: w.srv.mergeDispatchLedger()}
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassReadvance, mergeOnPassReasonBaseMoved)
+	if out.ExpiryYield == nil {
+		t.Fatal("the base-moved readvance carries no ExpiryYield")
+	}
+
+	var once sync.Once
+	competed := false
+	w.srv.cfg.MergeQueue = mqmOnLockQueue{Store: store, onLock: func() {
+		once.Do(func() {
+			competed = true
+			err := store.WithMergeIntentLock(ctx, a.id, func(lctx context.Context) error {
+				if _, err := store.SetPhase(lctx, ae.ID, ae.AdmissionEpoch, mergequeue.PhaseMerging); err != nil {
+					return err
+				}
+				_, err := store.ClaimMergeDispatch(lctx, a.id, mergeDispatchPathQueue, "a1")
+				return err
+			})
+			if err != nil {
+				t.Errorf("the competing dispatch did not land: %v", err)
+			}
+		})
+	}}
+
+	enforced := w.srv.mergeOnPassEnforceExpiredWait(ctx, req, out)
+	if !competed {
+		t.Fatal("the enforcement took no merge-intent lock")
+	}
+	if enforced.Kind != mergeOnPassHeld || (enforced.Reason != mergeOnPassReasonAlreadyDispatched && enforced.Reason != mergeOnPassReasonEntryChanged) {
+		t.Fatalf("enforcement = %s/%s (%s), want held merge_already_dispatched or entry_changed", enforced.Kind, enforced.Reason, enforced.Detail)
+	}
+	readvances := 0
+	if w.srv.applyMergeOnPassOutcome(ctx, req.Entry, enforced, &readvances) {
+		t.Fatal("the pump continued past a held enforcement")
+	}
+	e := w.active(a)
+	if e.Yielded() || len(w.rows(a, CategoryMergeQueueYielded)) != 0 {
+		t.Fatalf("A yielded=%v rows=%d, want no marker and no merge_queue_yielded row (its dispatch is claimed)", e.Yielded(), len(w.rows(a, CategoryMergeQueueYielded)))
+	}
+	if e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseMerging || w.claims(a) != 1 {
+		t.Fatalf("A = %s/%s claims=%d, want live, merging, its claim kept", e.State, e.Phase, w.claims(a))
+	}
+
+	w.pumpBase(a)
+	if st := w.storeEntry(b); st.State != mergequeue.StateHeld {
+		t.Fatalf("B after the follow-up pump = %s, want held (A routes to the D8 resume)", st.State)
+	}
+	for _, p := range w.gh.putCalls() {
+		if p.SHA == "b1" {
+			t.Fatal("b1 was PUT while A's dispatch is claimed")
+		}
 	}
 }
