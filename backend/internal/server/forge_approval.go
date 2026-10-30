@@ -23,7 +23,8 @@ package server
 //	    `[bot]` suffix, not `ghost`).
 //
 // A CHANGES_REQUESTED vetoes only from an identity-valid author at or above
-// the same floor (R2); an unresolvable veto is undetermined. Every Detail
+// the same floor (R2); an unresolvable veto is undetermined and names
+// dismiss_review with that reviewer (veto_undetermined). Every Detail
 // leaves the fold already sanitised (sanitizeForgeReadDetail).
 
 import (
@@ -65,8 +66,9 @@ const (
 	// what clears it. Nothing is recorded.
 	mergeCodeForgeApprovalRequired = "forge_approval_required"
 	// mergeCodeAuthorizationUnrecorded (503, retryable): the fold approved
-	// but the merge_queue_authorized append failed, so nothing else was
-	// recorded and the merge was not dispatched.
+	// but the merge_queue_authorized append (or an evidence read it depends
+	// on) failed, so nothing else was recorded and the merge was not
+	// dispatched.
 	mergeCodeAuthorizationUnrecorded = "merge_authorization_unrecorded"
 )
 
@@ -177,8 +179,10 @@ type forgeApprovalDecision struct {
 	// Merged is true when the snapshot reported the pull request merged; the
 	// fold then answers undetermined and a caller routes to its observe path.
 	Merged bool
-	// VetoReviewer names the write-or-higher CHANGES_REQUESTED author on a
-	// vetoed decision (the dismiss_review next step names them).
+	// VetoReviewer names the CHANGES_REQUESTED author the dismiss_review next
+	// step names: the write-or-higher author on a vetoed decision, or, on a
+	// veto_undetermined decision, the author whose repository permission
+	// could not be read.
 	VetoReviewer string
 
 	// Policy the decision was judged under (merge_queue_authorized).
@@ -419,8 +423,15 @@ func approvalsMinPermission(a *spec.Approvals) string {
 	return a.MinPermission
 }
 
-// forgeApprovalReviewStage returns the run's review stage row; a missing row
-// or a read error is an error (undetermined).
+// errForgeApprovalNoReviewStage is a run whose stage rows carry no review
+// stage: legitimately absent evidence, distinct from a stage READ failure.
+var errForgeApprovalNoReviewStage = errors.New("the run has no review stage row")
+
+// forgeApprovalReviewStage returns the run's review stage row. A run with no
+// review stage row answers errForgeApprovalNoReviewStage; no wired run
+// repository or a ListStagesForRun failure is any other error. The
+// escalations caller treats every error as undetermined;
+// reviewGateApprovalSequence distinguishes the sentinel.
 func (s *Server) forgeApprovalReviewStage(ctx context.Context, runID uuid.UUID) (*run.Stage, error) {
 	if s.cfg.RunRepo == nil {
 		return nil, errors.New("no run repository is wired")
@@ -436,7 +447,7 @@ func (s *Server) forgeApprovalReviewStage(ctx context.Context, runID uuid.UUID) 
 		}
 	}
 	if out == nil {
-		return nil, errors.New("the run has no review stage row")
+		return nil, errForgeApprovalNoReviewStage
 	}
 	return out, nil
 }
@@ -668,9 +679,9 @@ func (s *Server) foldSnapshot(ctx context.Context, runRow *run.Run, d forgeAppro
 	}
 
 	var (
-		vetoer, vetoUndetermined, approvalUndetermined string
-		counted                                        []countedApproval
-		chains                                         [][]string
+		vetoer, vetoUndetermined, vetoUndeterminedBy, approvalUndetermined string
+		counted                                                            []countedApproval
+		chains                                                             [][]string
 	)
 	for _, c := range candidates {
 		rv := c.op.review
@@ -689,6 +700,7 @@ func (s *Server) foldSnapshot(ctx context.Context, runRow *run.Run, d forgeAppro
 			case forgePermissionUndetermined:
 				if vetoUndetermined == "" {
 					vetoUndetermined = rv.Author.Login + ": " + nonEmpty(why, "permission "+nonEmpty(role, "unresolved"))
+					vetoUndeterminedBy = rv.Author.Login
 				}
 			}
 			continue
@@ -738,7 +750,10 @@ func (s *Server) foldSnapshot(ctx context.Context, runRow *run.Run, d forgeAppro
 		d.Detail = sanitizeForgeReadDetail("vetoed", "reviewer "+vetoer+" (write or higher) requested changes on the pull request")
 		return d, nil
 	case vetoUndetermined != "":
-		d.NextStep = forgeApprovalNextRetryAfter
+		// Any permission-read error class (404, 500, timeout) names
+		// dismiss_review: classifyForgePermission does not distinguish them,
+		// and the operator's actionable step is the review, not a retry.
+		d.NextStep, d.VetoReviewer = forgeApprovalNextDismissReview, vetoUndeterminedBy
 		return d.undetermined(forgeApprovalReasonVetoUndetermined, "a CHANGES_REQUESTED author's permission could not be resolved ("+vetoUndetermined+")", nil), nil
 	case len(counted) > 0:
 		d.Counted = counted
@@ -792,8 +807,8 @@ func forgeApprovalMemberOf(ctx context.Context, idp identity.IdentityProvider, g
 }
 
 // undetermined stamps an undetermined result with a sanitised detail. A
-// next step already set (retry_after on the cap) is kept; otherwise
-// retry_after.
+// next step already set (retry_after on the cap, dismiss_review on
+// veto_undetermined) is kept; otherwise retry_after.
 func (d forgeApprovalDecision) undetermined(reason, msg string, cause error) forgeApprovalDecision {
 	d.Result, d.Reason = forgeApprovalUndetermined, reason
 	if d.NextStep == "" {
@@ -889,6 +904,9 @@ func forgeApprovalNextStepProse(d forgeApprovalDecision) string {
 	case forgeApprovalNextApprovePR:
 		return "Approve the pull request at the current head under a write-or-higher GitHub identity that satisfies the review gate (gh pr review --approve), then re-invoke the merge."
 	case forgeApprovalNextDismissReview:
+		if d.Reason == forgeApprovalReasonVetoUndetermined {
+			return "Reviewer " + d.VetoReviewer + "'s CHANGES_REQUESTED review could not be judged because their repository permission could not be read: have that review dismissed (or re-approved), then re-invoke the merge."
+		}
 		return "Reviewer " + d.VetoReviewer + " requested changes: resolve them and have the review dismissed or re-approved, then re-invoke the merge."
 	case forgeApprovalNextRetryAfter:
 		return "The approval could not be determined; re-invoke the merge after the forge recovers or the head settles."
@@ -1018,15 +1036,25 @@ func countedSubjects(c []countedApproval) []string {
 }
 
 // reviewGateApprovalSequence is the newest approval_submitted row on the
-// run's review stage (0 when none).
+// run's review stage. It is 0 for legitimately absent evidence: the run has
+// no review stage row, or its review stage has no approval_submitted row. A
+// stage READ failure (or no wired run repository) is an evidence-read error,
+// exactly as an approval_submitted or merge_candidate_verified list error
+// is, so writeMergeQueueAuthorized refuses BEFORE any append and never
+// records review_gate_approval_seq 0 for it: inline answers 503
+// merge_authorization_unrecorded, the queue holds authorization_unrecorded,
+// delegated is observe-only (mergeDispatchAuthorizationUnrecorded).
 func (s *Server) reviewGateApprovalSequence(ctx context.Context, runID uuid.UUID) (int64, error) {
 	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "approval_submitted")
 	if err != nil {
 		return 0, fmt.Errorf("list approval_submitted: %w", err)
 	}
 	stage, err := s.forgeApprovalReviewStage(ctx, runID)
+	if errors.Is(err, errForgeApprovalNoReviewStage) {
+		return 0, nil
+	}
 	if err != nil {
-		return 0, nil //nolint:nilerr // a run with no review stage row has no review-gate approval to reference
+		return 0, fmt.Errorf("resolve the review stage: %w", err)
 	}
 	var seq int64
 	for _, e := range rows {

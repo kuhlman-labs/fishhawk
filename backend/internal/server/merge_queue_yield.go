@@ -80,8 +80,12 @@ const mergeQueueYieldNextNone = "none"
 
 // mergeQueueYieldNextStep is the TOTAL mapping yield_reason → next_step
 // (approve_pr | dismiss_review | retry_after | configure_identity_provider |
-// none). Read surfaces derive next_step through it, so it is never stored; it
-// agrees with the fold's own NextStep for every fold result that names one
+// none) and the ONLY source of a yield's next_step: the merge_queue_yielded
+// row records it (newMergeQueueYield), and GET merge-queue and the run payload
+// derive it from the stored reason, so the recorded and derived values always
+// agree. It agrees with the fold's own NextStep for every fold result EXCEPT
+// undetermined/veto_undetermined, whose fold names dismiss_review (the inline
+// 409) while its queue yield, forge_approval_undetermined, maps to retry_after
 // (TestMergeQueueYieldNextStep_AgreesWithFold).
 func mergeQueueYieldNextStep(reason string) string {
 	switch reason {
@@ -147,8 +151,8 @@ func mergeQueueYieldDetail(detail string) string {
 // is IMMEDIATE (ADR-112 R3): vetoed and provider_unsupported (including a
 // member_of gate with no identity provider, keyed on fold.Reason) yield at
 // once; review_required, dismissed, absent, reviews_truncated and
-// undetermined wait at the head first. next_step is the fold's own NextStep
-// when it names one (the mapping agrees), else the mapping's.
+// undetermined wait at the head first. next_step is always the mapping's,
+// never the fold's, so the recorded row and every read surface agree.
 func mergeOnPassFoldYield(fold forgeApprovalDecision) (y mergeQueueYield, immediate bool) {
 	reason, row := mergeCandidateQueueReasonForgeApprovalUndetermined, mergeQueueYieldRowApprovalFold
 	switch {
@@ -167,11 +171,7 @@ func mergeOnPassFoldYield(fold forgeApprovalDecision) (y mergeQueueYield, immedi
 	case fold.Result == forgeApprovalReviewsTruncated:
 		reason = mergeCandidateQueueReasonForgeApprovalReviewsTruncated
 	}
-	y = newMergeQueueYield(reason, fold.Detail, row)
-	if fold.NextStep != "" {
-		y.NextStep = fold.NextStep
-	}
-	return y, immediate
+	return newMergeQueueYield(reason, fold.Detail, row), immediate
 }
 
 // yieldMergeQueueEntry yields the LIVE entry e at its admission epoch (one

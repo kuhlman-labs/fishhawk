@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"log/slog"
+	"net/http"
 	"strings"
 	"sync"
 	"testing"
@@ -56,6 +57,11 @@ func TestMergeOnPassFoldYield_Table(t *testing.T) {
 		// An undetermined fold naming no next step takes the mapping's.
 		{"undetermined without a next step", forgeApprovalDecision{Result: forgeApprovalUndetermined, Reason: forgeApprovalReasonSpecUndeterminable},
 			mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter, mergeQueueYieldRowApprovalFold, false},
+		// #4764: a veto_undetermined fold names dismiss_review (the inline
+		// 409), but its queue yield records the mapping's retry_after, never
+		// the fold's own NextStep.
+		{"veto undetermined", forgeApprovalDecision{Result: forgeApprovalUndetermined, Reason: forgeApprovalReasonVetoUndetermined, NextStep: forgeApprovalNextDismissReview},
+			mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter, mergeQueueYieldRowApprovalFold, false},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -67,24 +73,40 @@ func TestMergeOnPassFoldYield_Table(t *testing.T) {
 	}
 }
 
-// TestMergeQueueYieldNextStep_AgreesWithFold pins the derivation: next_step
-// is derived from yield_reason on every read surface, so for every fold that
-// names its own NextStep the mapping must answer the same, and the mapping is
-// total over the closed vocabulary (an unknown reason is none).
+// TestMergeQueueYieldNextStep_AgreesWithFold pins the derivation: the
+// mapping is the ONLY source of a yield's next_step, so for every fold the
+// queue-recorded next_step (the yield's, written to merge_queue_yielded)
+// equals the mapping every read surface derives; for every fold EXCEPT
+// undetermined/veto_undetermined the mapping also equals the fold's own
+// NextStep (veto_undetermined's fold names dismiss_review for the inline 409
+// while its queue yield maps to retry_after, #4764); and the mapping is total
+// over the closed vocabulary (an unknown reason is none).
 func TestMergeQueueYieldNextStep_AgreesWithFold(t *testing.T) {
-	folds := []forgeApprovalDecision{
-		{Result: forgeApprovalVetoed, NextStep: forgeApprovalNextDismissReview},
-		{Result: forgeApprovalProviderUnsupported, Reason: forgeApprovalReasonNoIdentityProvider, NextStep: forgeApprovalNextConfigureIdentityProvider},
-		{Result: forgeApprovalReviewRequired, NextStep: forgeApprovalNextApprovePR},
-		{Result: forgeApprovalDismissed, NextStep: forgeApprovalNextApprovePR},
-		{Result: forgeApprovalAbsent, NextStep: forgeApprovalNextApprovePR},
-		{Result: forgeApprovalReviewsTruncated, NextStep: forgeApprovalNextRetryAfter},
-		{Result: forgeApprovalUndetermined, NextStep: forgeApprovalNextRetryAfter},
+	folds := []struct {
+		fold           forgeApprovalDecision
+		agreesWithFold bool
+		want           string
+	}{
+		{forgeApprovalDecision{Result: forgeApprovalVetoed, NextStep: forgeApprovalNextDismissReview}, true, forgeApprovalNextDismissReview},
+		{forgeApprovalDecision{Result: forgeApprovalProviderUnsupported, Reason: forgeApprovalReasonNoIdentityProvider, NextStep: forgeApprovalNextConfigureIdentityProvider},
+			true, forgeApprovalNextConfigureIdentityProvider},
+		{forgeApprovalDecision{Result: forgeApprovalReviewRequired, NextStep: forgeApprovalNextApprovePR}, true, forgeApprovalNextApprovePR},
+		{forgeApprovalDecision{Result: forgeApprovalDismissed, NextStep: forgeApprovalNextApprovePR}, true, forgeApprovalNextApprovePR},
+		{forgeApprovalDecision{Result: forgeApprovalAbsent, NextStep: forgeApprovalNextApprovePR}, true, forgeApprovalNextApprovePR},
+		{forgeApprovalDecision{Result: forgeApprovalReviewsTruncated, NextStep: forgeApprovalNextRetryAfter}, true, forgeApprovalNextRetryAfter},
+		{forgeApprovalDecision{Result: forgeApprovalUndetermined, NextStep: forgeApprovalNextRetryAfter}, true, forgeApprovalNextRetryAfter},
+		{forgeApprovalDecision{Result: forgeApprovalUndetermined, Reason: forgeApprovalReasonVetoUndetermined, NextStep: forgeApprovalNextDismissReview},
+			false, forgeApprovalNextRetryAfter},
 	}
-	for _, f := range folds {
-		y, _ := mergeOnPassFoldYield(f)
-		if got := mergeQueueYieldNextStep(y.Reason); got != f.NextStep {
-			t.Errorf("mapping(%s) = %s, fold NextStep %s", y.Reason, got, f.NextStep)
+	for _, tc := range folds {
+		y, _ := mergeOnPassFoldYield(tc.fold)
+		mapping := mergeQueueYieldNextStep(y.Reason)
+		if y.NextStep != mapping || y.NextStep != tc.want {
+			t.Errorf("fold %s/%s: queue-recorded next_step %s, mapping(%s) %s, want both %s",
+				tc.fold.Result, tc.fold.Reason, y.NextStep, y.Reason, mapping, tc.want)
+		}
+		if tc.agreesWithFold && mapping != tc.fold.NextStep {
+			t.Errorf("mapping(%s) = %s, fold NextStep %s", y.Reason, mapping, tc.fold.NextStep)
 		}
 	}
 	vocabulary := map[string]string{
@@ -170,6 +192,42 @@ func TestWriteMergeQueueYielded_AppendFailureKeepsTheYield(t *testing.T) {
 		!strings.Contains(logged, "yielded_at="+e.YieldedAt.UTC().Format(time.RFC3339Nano)) {
 		t.Fatalf("log = %q, want an ERROR naming entry_id and yielded_at", logged)
 	}
+}
+
+// TestMergeOnPassVetoUndetermined_YieldRowAgreesWithReadSurface (#4764) is
+// the cross-layer pin that the recorded next_step and the derived one agree
+// for a veto_undetermined yield: alice (write) approved and bob requested
+// changes at h1, but bob's permission read answers 500, so the real in-lock
+// fold is undetermined/veto_undetermined (its own NextStep dismiss_review).
+// Merge-on-pass waits; yielding the entry through the real store writes
+// merge_queue_yielded, whose next_step must equal what GET merge-queue and
+// the run payload derive (mergeQueueYieldProjectionFor): retry_after.
+// Counterfactual: re-inserting the fold.NextStep override in
+// mergeOnPassFoldYield records dismiss_review, RED.
+func TestMergeOnPassVetoUndetermined_YieldRowAgreesWithReadSurface(t *testing.T) {
+	w := newMQMWorld(t)
+	r, req := w.ready("vu", "h1", mqeSpecYAML)
+	w.forgeReviews(r, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"), mqmReview(2, "bob", "CHANGES_REQUESTED", "h1"))
+	w.gh.set(func() { w.gh.permStatus["bob"] = http.StatusInternalServerError })
+
+	out := w.decide(req)
+	requireOutcome(t, out, mergeOnPassAwaitApproval, mergeCandidateQueueReasonForgeApprovalUndetermined)
+	if out.Yield.NextStep != forgeApprovalNextRetryAfter {
+		t.Errorf("outcome yield = %+v, want next_step %s", out.Yield, forgeApprovalNextRetryAfter)
+	}
+	if !w.srv.yieldMergeQueueEntry(context.Background(), req.Entry, out.Yield, mergeQueueYieldSiteMergeOnPass) {
+		t.Fatal("the yield did not land")
+	}
+	rows := w.rows(r, CategoryMergeQueueYielded)
+	if len(rows) != 1 {
+		t.Fatalf("merge_queue_yielded rows = %d, want 1", len(rows))
+	}
+	p := w.payload(rows[0])
+	derived := mergeQueueYieldProjectionFor(w.active(r)).NextStep
+	if p["yield_reason"] != mergeCandidateQueueReasonForgeApprovalUndetermined || p["next_step"] != derived || derived != forgeApprovalNextRetryAfter {
+		t.Fatalf("merge_queue_yielded payload = %v, read-surface next_step %s, want both next_step %s", p, derived, forgeApprovalNextRetryAfter)
+	}
+	w.requireNoMergeWrites(r)
 }
 
 // lockedWriter serialises a shared log buffer.

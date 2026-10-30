@@ -519,7 +519,7 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   with the run's installation token, is ≥ max(min_permission, write);
   (d) its author is a real user. A `CHANGES_REQUESTED` vetoes only from a
   write-or-higher identity-valid author (the same floor); an unresolvable
-  veto is undetermined.
+  veto is undetermined (`veto_undetermined`, next step `dismiss_review`).
 - **Precedence.** provider_unsupported > reviews_truncated > vetoed >
   undetermined (veto) > [qualifying approval: reviewDecision
   `REVIEW_REQUIRED` → review_required, else approved] > undetermined
@@ -561,6 +561,25 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   (`mergeDispatchAuthorizationUnrecorded`); none records a verdict or claims.
   A gate-less merge writes no row. On a resume whose verdict row already
   exists, THIS attempt's authorization row still precedes its claim.
+  `review_gate_approval_seq` (`reviewGateApprovalSequence`, #4764) is 0 for
+  legitimately absent evidence: the run has no review stage row, or its
+  review stage has no `approval_submitted` row. A review-stage READ failure
+  (`ListStagesForRun` errors) or no wired run repository is an evidence-read
+  error, refused exactly like an `approval_submitted` or
+  `merge_candidate_verified` read error or an append failure (inline 503
+  `merge_authorization_unrecorded`, queue holds `authorization_unrecorded`,
+  delegated observe-only), BEFORE any append: it never writes
+  `review_gate_approval_seq` 0.
+- **Unresolvable veto names `dismiss_review` (#4764).** Every
+  `veto_undetermined` fold (a `CHANGES_REQUESTED` author whose permission
+  read failed, under ANY error class: 404, 500, timeout;
+  `classifyForgePermission` does not tell them apart) names next step
+  `dismiss_review` and sets `VetoReviewer` to that author, so the inline 409
+  `forge_approval_required` carries `next_step` `dismiss_review` and
+  `veto_reviewer`, and its message says the review could not be judged. The
+  admission veto leg still answers undeterminable on it, and a queue yield
+  records the mapping's `retry_after` for its `forge_approval_undetermined`
+  reason (§ "ADR-112 R3 yield and R5 visibility").
 - **Spec postures (C4).** A run that NEVER recorded a spec (an empty
   `WorkflowSHA` AND no cached `WorkflowSpec`: an ad-hoc run), or whose review
   stage declares no approval gate → no gate (R6): no fold read, admit. A spec
@@ -671,9 +690,14 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   Merge-on-pass is synchronous (`MergePullRequestAtHead`), so it has no
   such window. A late approval (for example dismiss-stale after a queue
   advance) clears the yield on the next re-probe (no re-invoke needed).
-- **Tests.** `forge_approval_test.go` (the fold), `forge_approval_e2e_test.go`
+- **Tests.** `forge_approval_test.go` (the fold;
+  `TestFoldSnapshot_VetoUndeterminedNamesDismissReview` over three read
+  error classes; `TestReviewGateApprovalSequence_ReadErrorRefuses` and
+  `TestWriteMergeQueueAuthorized_StageReadErrorWritesNothing`, which reads
+  the audit chain back), `forge_approval_e2e_test.go`
   (inline, delegated and merge-on-pass, including the H2 head-moved row per
-  path), `merge_queue_merge_test.go` (the wait/yield table, evidence
+  path, the unresolvable-veto 409 row and
+  `TestForgeApprovalE2E_InlineStageReadErrorRefuses`), `merge_queue_merge_test.go` (the wait/yield table, evidence
   order, failure modes, post-refusal rows 4/5),
   `merge_queue_eligibility_test.go` (variant restriction),
   `merge_head_pin_e2e_test.go` (the #4641 pin: precheck, GraphQL and REST
@@ -696,7 +720,13 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   provider, keyed on the fold's REASON), and `forge_review_required` (row 4).
   `next_step` is DERIVED through the total mapping `mergeQueueYieldNextStep`
   (`approve_pr` | `dismiss_review` | `retry_after` |
-  `configure_identity_provider` | `none`), never stored. `yield_detail` is
+  `configure_identity_provider` | `none`), never stored on the entry; the
+  `merge_queue_yielded` row's `next_step` is the same mapping value
+  (`mergeOnPassFoldYield` never takes the fold's own `NextStep`, #4764), so
+  the recorded row and every read surface agree. The mapping matches the
+  fold's own `NextStep` for every result except `veto_undetermined`, whose
+  fold names `dismiss_review` (the inline 409) while its yield
+  `forge_approval_undetermined` maps to `retry_after`. `yield_detail` is
   forge-derived and UNTRUSTED: THE sanitiser `mergeQueueYieldDetail` (tokens
   redacted, first line only, control characters dropped, bounded) runs at
   the queue write and at every read sink.
@@ -826,6 +856,10 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   row that is OLDEST by `enqueued_at`; Yield under the epoch CAS; ClearYield
   CAS read-back; a marker never written on a live row). Merge-on-pass and
   pump: `merge_queue_merge_test.go` (the wait/yield table, row 4),
+  `merge_queue_yield_test.go` (`TestMergeOnPassFoldYield_Table`,
+  `TestMergeQueueYieldNextStep_AgreesWithFold`, and the cross-layer
+  `TestMergeOnPassVetoUndetermined_YieldRowAgreesWithReadSurface`: the
+  `merge_queue_yielded` row's `next_step` equals the read projection's),
   `merge_queue_e2e_test.go` (dismissed waits then yields and B merges in the
   SAME pump; gate-less BLOCKED yields; the anchor survives a readvance),
   `merge_queue_eligibility_test.go` (no approval leg on intent admission;
