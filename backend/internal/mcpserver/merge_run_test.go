@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"sort"
 	"strconv"
 	"strings"
@@ -1575,7 +1576,7 @@ func TestMergeRun_ChecksPending_CarriesAcceptanceAdvisory(t *testing.T) {
 			t.Errorf("message = %q, want it to contain %q", out.Message, want)
 		}
 	}
-	if !strings.Contains(out.Message, "GitHub will not queue the squash merge") {
+	if !strings.Contains(out.Message, "GitHub will not queue the merge because") {
 		t.Errorf("the existing checks_pending sentence was modified: %q", out.Message)
 	}
 }
@@ -2934,5 +2935,50 @@ func TestMergeRun_ForgeApprovalRequired_NextStepMapping(t *testing.T) {
 		Details: map[string]any{"next_step": "configure_identity_provider"}}, "forge_approval_required", uuid.New(), time.Now())
 	if out.NextAction != nil || !strings.Contains(out.Message, "forge_approval_required") {
 		t.Errorf("empty-message output = %+v", out)
+	}
+}
+
+// TestMergeRun_ToolDescriptionNamesMergeMethodRefused (E93.2 / #4658): the
+// wire-visible fishhawk_merge_run Tool errors list names the 409
+// merge_method_refused code. Counterfactual: deleting the entry reddens it.
+func TestMergeRun_ToolDescriptionNamesMergeMethodRefused(t *testing.T) {
+	desc := wireMergeRunDescription(t)
+	errorsAt := strings.Index(desc, "Tool errors:")
+	if errorsAt < 0 {
+		t.Fatalf("fishhawk_merge_run description has no Tool errors list:\n%s", desc)
+	}
+	for _, want := range []string{"merge_method_refused (409", "allowed_merge_methods"} {
+		if !strings.Contains(desc[errorsAt:], want) {
+			t.Errorf("fishhawk_merge_run Tool errors list missing %q", want)
+		}
+	}
+}
+
+// TestMergeWording_MethodNeutral (E93.2 / #4658): the MCP layer cannot know
+// the resolved merge method (the server's own messages carry it), so no
+// wire-visible merge wording names a squash merge: the tool description,
+// mergeRunNote, the MergeQueued schema description, the onboarding server
+// instructions, the embedded runbook and the next_actions merge entry.
+// Counterfactual: restoring "queues the squash merge" in any of them reddens.
+func TestMergeWording_MethodNeutral(t *testing.T) {
+	field, ok := reflect.TypeOf(MergeRunOutput{}).FieldByName("MergeQueued")
+	if !ok {
+		t.Fatal("MergeRunOutput has no MergeQueued field")
+	}
+	surfaces := map[string]string{
+		"tool description":       wireMergeRunDescription(t),
+		"mergeRunNote":           mergeRunNote,
+		"MergeQueued jsonschema": field.Tag.Get("jsonschema"),
+		"onboarding":             onboardingInstructions,
+		"runbook":                runbookMarkdown,
+		"next_actions merge":     mergeRunAction(&Run{}).Reason,
+	}
+	for name, text := range surfaces {
+		if text == "" {
+			t.Errorf("%s: empty surface", name)
+		}
+		if strings.Contains(strings.ToLower(text), "squash merge") {
+			t.Errorf("%s names a squash merge; the merge method is the repository's declaration:\n%s", name, text)
+		}
 	}
 }

@@ -620,8 +620,26 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 			slog.String("claim_outcome", claimOutcome),
 			slog.String("error", derr.Error()))
 		return observeOnly(autoDriveNoteHeadMoved), nil
+	case mergeDispatchMethodUnsupported:
+		// E93.2 / #4658: refused BEFORE the fold and the claim; derr is the
+		// *MergeMethodRefusalError, rendered from its closed-set fields only.
+		var ref *MergeMethodRefusalError
+		errors.As(derr, &ref)
+		s.logMergeMethodRefusal(ctx, runRow, ref,
+			"auto-drive: may_merge met but the run's merge method is refused before the claim; observe-only")
+		return observeOnly("merge_method_refused (" + ref.Reason + "): " + ref.FieldDetail() +
+			"; nothing was claimed and the merger was not called; observe-only"), nil
 	}
 	if derr != nil {
+		// E93.2 / #4658: a dispatch refusal ForgeMerger attributed to the
+		// run's merge method names it, built from the refusal's fields only;
+		// the log line carries the method attributes and no error text.
+		var ref *MergeMethodRefusalError
+		if errors.As(derr, &ref) {
+			s.logMergeMethodRefusal(ctx, runRow, ref,
+				"auto-drive: the forge refused the delegated merge for the run's merge method")
+			return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge_method_refused: " + ref.FieldDetail()}, derr
+		}
 		return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
 	}
 	// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
@@ -670,7 +688,25 @@ const (
 	// returned error is that refusal, for logging only: the caller is
 	// observe-only, never "merge dispatch failed".
 	mergeDispatchHeadMoved
+	// mergeDispatchMethodUnsupported (E93.2 / #4658): staticMergeMethodRefusal
+	// refused the run's merge method (its forge family cannot apply it per
+	// merge request, or its admission spec does not parse) AFTER the
+	// acceptance and nil-merger checks and BEFORE the forge-approval fold, the
+	// republish and the claim: no row, no claim, the merger is never called.
+	// The returned error is the *MergeMethodRefusalError.
+	mergeDispatchMethodUnsupported
 )
+
+// logMergeMethodRefusal logs a merge-method refusal with its closed-set fields
+// only — never the refusal's Cause or any error text (E93.2 / #4658).
+func (s *Server) logMergeMethodRefusal(ctx context.Context, runRow *run.Run, ref *MergeMethodRefusalError, msg string) {
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, msg,
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("merge_method", ref.Method),
+		slog.String("merge_method_source", ref.Source),
+		slog.String("reason", ref.Reason),
+		slog.Any("allowed_merge_methods", ref.Allowed))
+}
 
 // dispatchAcceptanceGatedMerge is the shared merge-dispatch tail extracted from
 // AutoDriveRunGate's may_merge arm (E48.7 / #1954): it confirms the acceptance
@@ -682,7 +718,10 @@ const (
 //
 // Returns the classified outcome, the acceptance gate state (for logging /
 // error detail), and — only on mergeDispatchMerged and mergeDispatchHeadMoved
-// — the seam's dispatch error.
+// — the seam's dispatch error; on mergeDispatchMethodUnsupported the error is
+// the pre-claim *MergeMethodRefusalError (E93.2 / #4658: the run's forge
+// family cannot apply its declared merge method, or its admission spec does
+// not parse — refused before the fold, the republish and the claim).
 // On mergeDispatchAcceptanceNotReady the returned error is the acceptance-audit
 // read error (nil when the gate is simply not-passed rather than unreadable),
 // so the caller can distinguish an evidence hole from a read failure.
@@ -749,6 +788,12 @@ func (s *Server) dispatchAcceptanceGatedMergeSettled(ctx context.Context, runRow
 	}
 	if merger == nil {
 		return mergeDispatchNoMerger, gateState, "", nil
+	}
+	// E93.2 / #4658: the pre-claim merge-method refusal, AFTER the acceptance
+	// and nil-merger checks and BEFORE the forge-approval fold (so no
+	// merge_queue_authorized row), the republish and the claim.
+	if ref := staticMergeMethodRefusal(runRow); ref != nil {
+		return mergeDispatchMethodUnsupported, gateState, "", ref
 	}
 	// ADR-112 (#4619): the ONE forge-approval fold at the gate's verified
 	// head, AFTER the acceptance and nil-merger checks and BEFORE the

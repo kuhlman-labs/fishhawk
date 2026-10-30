@@ -504,8 +504,16 @@ func (c *Client) ListMergeRequestsForCommit(ctx context.Context, projectID int, 
 // (ADR-093 D3, E87.5 / #4296): GitLab answers 409 when it differs from the
 // source branch HEAD, so a head that moved after verification is refused
 // rather than merged. Empty SHA is omitted from the request (unpinned).
+//
+// SquashSet makes Squash TRI-STATE (E93.2 / #4658): when SquashSet is true the
+// body ALWAYS carries "squash": <Squash> — an explicit true, or an explicit
+// false that overrides an MR author's squash selection (an omitted key falls
+// back to it). When SquashSet is false the pre-existing behaviour holds byte
+// for byte: "squash": true only when Squash is true, else the key is omitted.
+// An additive flag rather than a *bool Squash so no existing caller churns.
 type MergeMergeRequestParams struct {
 	Squash                    bool
+	SquashSet                 bool
 	MergeWhenPipelineSucceeds bool
 	SquashCommitMessage       string
 	SHA                       string
@@ -526,7 +534,10 @@ func (c *Client) MergeMergeRequest(ctx context.Context, projectID, iid int, p Me
 	}
 
 	body := map[string]any{}
-	if p.Squash {
+	switch {
+	case p.SquashSet:
+		body["squash"] = p.Squash
+	case p.Squash:
 		body["squash"] = true
 	}
 	if p.MergeWhenPipelineSucceeds {

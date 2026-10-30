@@ -4265,6 +4265,16 @@ func (o *Orchestrator) dispatchAutoMergeStage(ctx context.Context, r *run.Run, n
 // pull_request_url to be backfilled — that happens when the
 // implement stage's PR artifact lands (#216), which is upstream of
 // the review stage.
+//
+// The merge method is the run's declared one (E93.2 / #4658): the
+// workflow-v2 `merge_method` read from the run's cached admission spec
+// (spec.ResolveMergeMethod over r.WorkflowSpec), absent = squash. An
+// unparseable admission spec is an error, and a method the run's forge
+// family cannot apply per merge request (forge.MergeMethodsForFamily over
+// forge.FamilyOfInstallationRef — gitlab x rebase) is refused with
+// forge.ErrMergeMethodUnsupported; both BEFORE the merge call. This path
+// holds no merge-dispatch claim, so "pre-claim" here is "before the merge
+// call".
 func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 	if o.GitHub == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping auto-merge",
@@ -4277,6 +4287,10 @@ func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 			slog.String("run_id", r.ID.String()),
 		)
 		return nil
+	}
+	method, err := autoMergeMethod(r)
+	if err != nil {
+		return err
 	}
 	if r.PullRequestURL == nil || *r.PullRequestURL == "" {
 		return errors.New("orchestrator: run missing pull_request_url; cannot enable auto-merge")
@@ -4291,11 +4305,27 @@ func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 		return fmt.Errorf("orchestrator: parse pr url %q: %w", *r.PullRequestURL, err)
 	}
 
-	// Default to SQUASH for v0 — matches the typical PR merge
-	// conventions on GitHub repos and is what Fishhawk's own
-	// CLAUDE.md prescribes. Spec-level merge_method is a v0.x
-	// follow-up.
-	return o.GitHub.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, forge.MergeMethodSquash)
+	return o.GitHub.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, method)
+}
+
+// autoMergeMethod resolves the run's merge method for enableAutoMerge and
+// refuses a statically unsupported forge family x method, naming only the
+// method and the family.
+func autoMergeMethod(r *run.Run) (forge.MergeMethod, error) {
+	d, err := spec.ResolveMergeMethod(r.WorkflowSpec)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: merge method undeterminable: the run's admission spec does not parse: %w", err)
+	}
+	method, err := forge.MergeMethodFromDeclaration(d.Method)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: merge method undeterminable: %w", err)
+	}
+	family := forge.FamilyOfInstallationRef(r.InstallationRef)
+	if !forge.MergeMethodsForFamily(family).Allows(method) {
+		return "", fmt.Errorf("%w: orchestrator: merge method %s cannot be applied per merge request on forge family %q; nothing was merged",
+			forge.ErrMergeMethodUnsupported, d.Method, family)
+	}
+	return method, nil
 }
 
 // pullRequestNumberFromURL parses the trailing /pull/<n> segment

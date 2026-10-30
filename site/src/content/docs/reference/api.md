@@ -236,7 +236,7 @@ The v0 REST API exposes **182 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/rebase-branch` | Advance a run branch onto its declared base (operator-gated) |
 | `POST` | `/v0/runs/{run_id}/vouch-commit` | Vouch a foreign commit as run-authored lineage |
 | `POST` | `/v0/runs/{run_id}/retrigger-ci` | Re-run a run PR's failed CI at the current head |
-| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the squash merge (skipped when already merged) |
+| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the forge merge with the repository's declared merge method, default squash (skipped when already merged) |
 | `POST` | `/v0/runs/{run_id}/grooming-dispositions` | Record per-entry grooming dispositions (operator-only) |
 | `GET` | `/v0/runs/{run_id}/grooming-dispositions` | Read back the recorded grooming dispositions for a run |
 | `POST` | `/v0/runs/{run_id}/upkeep-dispositions` | Record per-finding upkeep dispositions (captain-only) |

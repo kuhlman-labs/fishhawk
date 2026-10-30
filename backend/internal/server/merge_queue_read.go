@@ -466,8 +466,8 @@ type mergeQueueEjectionView struct {
 	// whether ADR-090 D6 routed a delegated fix-up. Omitted otherwise.
 	FixupRouted *bool `json:"fixup_routed,omitempty"`
 	// ForgeReason is a forge_merge_refused ejection's typed code
-	// (not_mergeable, unprocessable, checks_not_settled); a recorded value
-	// outside that closed set is dropped.
+	// (not_mergeable, unprocessable, checks_not_settled, merge_method_refused);
+	// a recorded value outside that closed set is dropped.
 	ForgeReason string `json:"forge_reason,omitempty"`
 	// ForgeDetail is the forge's refusal text, UNTRUSTED: sanitised AGAIN on
 	// read (mergeQueueYieldDetail) on top of the writer's pass.
@@ -532,7 +532,8 @@ func (s *Server) mergeQueueEjectionProjectionFor(ctx context.Context, e mergeque
 			v.FixupRouted = &routed
 		}
 		switch rec.ForgeReason {
-		case mergeQueueForgeReasonNotMergeable, mergeQueueForgeReasonUnprocessable, mergeQueueForgeReasonChecksNotSettled:
+		case mergeQueueForgeReasonNotMergeable, mergeQueueForgeReasonUnprocessable, mergeQueueForgeReasonChecksNotSettled,
+			mergeQueueForgeReasonMergeMethodRefused:
 			v.ForgeReason = rec.ForgeReason
 		}
 		v.ForgeDetail = mergeQueueYieldDetail(rec.ForgeDetail)

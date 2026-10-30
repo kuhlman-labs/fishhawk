@@ -535,6 +535,18 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 	if runRow.State.IsTerminal() {
 		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonRunTerminal, "the run is "+string(runRow.State))
 	}
+	// E93.2 / #4658: the pre-lock merge-method refusal, right after the run
+	// read and BEFORE the installation guard, the PR read, eligibility, the
+	// republish and the merge-intent lock (so before the fold, the verdict,
+	// SetPhase(merging) and the claim). An EJECT, not a hold: the run's
+	// admission declaration never changes, so a hold would block the head of
+	// the line forever (the verify_failed eject below is the pre-lock
+	// precedent). Detail and ForgeDetail are field-built, never forge text.
+	if ref := staticMergeMethodRefusal(runRow); ref != nil {
+		out := settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused, ref.FieldDetail())
+		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonMergeMethodRefused, ref.FieldDetail()
+		return out
+	}
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return held(mergeOnPassReasonTransient, "the run has no installation to read its pull request")
 	}
@@ -903,9 +915,17 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		// transient, which let the next pump claim and dispatch again. Pending
 		// checks still HOLD before dispatch (onlyChecksNotGreen above): slow
 		// CI never ejects; only the forge's own refusal of the merge PUT does.
+		// E93.2 / #4658: a refusal ForgeMerger attributed to the run's merge
+		// method renders from its closed-set fields only (FieldDetail), never
+		// mergeErr.Error() or its Cause.
+		refusalText := mergeErr.Error()
+		var mref *MergeMethodRefusalError
+		if errors.As(mergeErr, &mref) {
+			refusalText = mref.FieldDetail()
+		}
 		out := settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused,
-			"the forge refused the pinned merge ("+mergeErr.Error()+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
-		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonFor(mergeErr), mergeErr.Error()
+			"the forge refused the pinned merge ("+refusalText+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
+		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonFor(mergeErr), refusalText
 		if out.ForgeReason == mergeQueueForgeReasonChecksNotSettled {
 			out.ForgeDetail = mergeQueueChecksNotSettledDetail + mergeQueueYieldDetail(mergeErr.Error())
 		}

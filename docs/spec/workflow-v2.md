@@ -29,13 +29,14 @@ reviewer_personas:      # optional; named reviewer personas (model config + remi
   <persona_name>: {agent: {provider: ...}, remit: {path: ...}}
 verdict_transfer:       # optional; the repository's verdict-transfer surface (ADR-124)
   global_surface: [...]
+merge_method: squash    # optional; the repository's forge merge method (squash | merge | rebase; absent = squash)
 workflows:              # required; at least one workflow
   <workflow_id>:
     description: "..."
     stages: [...]
 ```
 
-The document root is closed (`additionalProperties: false`) over exactly these seven keys: `version`, `defaults`, `test_conventions`, `review_conventions`, `reviewer_personas`, `verdict_transfer`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
+The document root is closed (`additionalProperties: false`) over exactly these eight keys: `version`, `defaults`, `test_conventions`, `review_conventions`, `reviewer_personas`, `verdict_transfer`, `merge_method`, and `workflows`. There is **no top-level `roles` map** at major 2 — approval membership lives on the gate's own `approvals` block.
 
 `<workflow_id>` and every stage `id` are `snake_case` — `^[a-z][a-z0-9_]*$`.
 
@@ -1227,7 +1228,7 @@ gates:
 
 `sla` is the gate's D-category timeout. `autonomy` and `actions` on a gate override the workflow-level block **wholesale** — see [Placement, and the wholesale gate override](#placement-and-the-wholesale-gate-override).
 
-A **check** gate carries no other spec-level field. When a review stage carries one, Fishhawk queues an auto-merge (squash) against the implement stage's pull request and transitions the review stage to `succeeded` immediately; the forge's own auto-merge machinery performs the merge once the required checks pass. Fishhawk's role is to queue and step out of the way. Required CI checks are not declared in the spec — they are derived from branch protection at run-create time and snapshotted onto the run.
+A **check** gate carries no other spec-level field. When a review stage carries one, Fishhawk queues an auto-merge, with the repository's declared [merge method](#merge-method-merge_method) (default `squash`), against the implement stage's pull request and transitions the review stage to `succeeded` immediately; the forge's own auto-merge machinery performs the merge once the required checks pass. Fishhawk's role is to queue and step out of the way. Required CI checks are not declared in the spec — they are derived from branch protection at run-create time and snapshotted onto the run.
 
 ### `approvals` — the sole approval predicate
 
@@ -1663,6 +1664,24 @@ Quote every entry: a bare `**` scalar is a YAML alias.
 - **Enforce waits for a completeness check.** Enforce mode acts only for a declaration naming `completeness_check`; without one (absent, empty or whitespace only) the repository's decisions stay in shadow.
 - **Recorded identity.** Every transfer and shadow row records the classifier version, the declaration's content digest and its admission provenance.
 
+## Merge method (`merge_method`)
+
+An optional **top-level** scalar declaring the repository's **forge merge method** (E93.2 / #4658): `squash`, `merge` or `rebase`. Absent means `squash`, the product default ADR-110 names, so a repository that declares nothing keeps today's squash merge. The method is the repository's to declare (ADR-110): no merge path hard-codes one.
+
+```yaml
+merge_method: merge
+```
+
+- **One per repository.** `merge_method` sits at the document root, never inside a workflow, so every workflow of a repository merges the same way.
+- **Read from the admission spec.** The method is resolved from the run's cached **admission** spec (the source `verdict_transfer` uses), never from a checkout, so a pull request cannot change the method its own merge uses, and an edit applies to runs admitted after it merges. An admission spec that does not parse resolves to no method: every merge path refuses rather than falling back to `squash`.
+- **Every merge path.** The resolved method is what inline `merge_run`, a delegated merge, merge-on-pass, and the check-gated auto-merge stage each dispatch with.
+- **v2 only.** v0 and v1 stay frozen: their closed roots refuse the key, and a v0/v1 run always merges with `squash`.
+- **GitHub.** All three values apply per pull request (the GraphQL `mergeMethod` / REST `merge_method`), subject to the repository's own merge settings. A method those settings disallow is refused by the forge; Fishhawk re-reads the repository's settings to attribute that refusal and reports it as `merge_method_refused`. The attribution is best-effort under the caller's deadline, so a plain `not_mergeable` refusal does not prove the method was allowed.
+- **GitLab.** A merge request merge has no per-request merge method, so the mapping is:
+  - `squash` → `squash: true`;
+  - `merge` → an explicit `squash: false`, which overrides a merge request author's squash selection; the project's merge-method setting then decides the commit shape (and a project squash option of `always` or `never` can still override the request);
+  - `rebase` → refused **before** the merge-dispatch claim on every merge path (`merge_method_refused`, reason `forge_unsupported`), so nothing is claimed and the forge is never called. Declare `squash` or `merge` for a GitLab repository, and merge a run admitted under `rebase` by hand.
+
 ## Identifier namespaces
 
 | Field | Pattern / values | Notes |
@@ -1749,6 +1768,7 @@ The schema enforces structure. Layers above it enforce what JSON Schema cannot e
 - Every `escalations` entry actually **raises** something (see [Escalations](#escalations)): `count` and `min_permission` must exceed the workflow's least-restrictive baseline, `member_of` may not name a group every approval gate already requires, `require.approvals` needs an approval gate to raise, `max_autonomy` may not leave the resolved matrix identical, and `require.reviewers` must name declared personas, have an agent-reviewing `plan` / `implement` stage to join, and not name a persona every such stage already attaches. A `match.paths` criterion is additionally refused on a workflow that declares no plan stage (E53.16 / #2382), for the same reason `applies_to.paths` is — there is no `scope.files` producer for it to match against, so the escalation could never fire. `fishhawk validate` mirrors all of these except the `max_autonomy` no-op check, which needs the autonomy resolver the CLI deliberately does not carry.
 - Every `review_conventions` entry's `path` is a canonical repo-relative path, and its `applies_to` is a well-formed predicate declaring no `change_kind`. A stage's `reviewers.conventions` is valid only on a `plan` or `implement` stage, names only declared entries, and requires at least one agent reviewer; every declared entry is selected by at least one stage of the resolved document (see [Review conventions](#review-conventions)).
 - Every `reviewer_personas` entry's `remit.path` — and its `decision_record.index`, when declared — is a canonical repo-relative path and its `agent.agent_version` (when present) a well-formed range. A stage's `reviewers.personas` is valid only on a `plan` or `implement` stage, names only declared personas, and requires at least one agent reviewer; every declared persona is attached by at least one stage of the resolved document or required by at least one escalation's `require.reviewers` (see [Reviewer personas](#reviewer-personas)).
+- `merge_method` carries **no** rule here: the schema's closed enum is the whole check. Whether a forge can apply the declared method is decided at merge time, per run, never at admission (see [Merge method](#merge-method-merge_method)).
 - `verdict_transfer` carries **no** rule here, deliberately: an empty, incomplete or malformed declaration still validates, and the merge-candidate classifier refuses transfer for it instead (see [Verdict transfer](#verdict-transfer-verdict_transfer)), so a bad declaration never blocks a repository's unrelated runs.
 
 `fishhawk validate` (the CLI) validates in two tiers. It reports schema errors, the removed-form messages, the reuse-resolution rejections, the workflow/stage semantic sweeps (agent_version, reviewers.authority, applies_to, schedule, escalations, review_conventions, reviewer_personas), and — since E52.13 / #2323 — **stage-reference resolution**: duplicate stage ids, the `needs:` shorthand, and `inputs[].from_stage` referent/ordering, reported at the identical paths the backend uses. What remains backend-only is the stage-BINDING class: the ADR-038 type/executor/constraint bindings, the plan `schema: standard_v1` rule, the produces-artifact bindings (deployment / acceptance / grooming_report / upkeep_report / comms_report and the E52.7 post-hoc-constraint↔pull_request rule), the `agent_instruction_paths` implement-only and `writable`-entry rules (E80.12 / #3942), the post-deploy acceptance `deployment`-input bindings (E35.1 / #1598), and the `max_autonomy` no-op check that needs the autonomy resolver the CLI deliberately does not carry — these surface server-side at run creation.

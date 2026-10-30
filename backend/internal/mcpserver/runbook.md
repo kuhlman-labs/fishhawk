@@ -90,7 +90,8 @@ One issue → one run → one PR.
    operator verdict (`gh pr review --approve`, under your own GitHub identity —
    App-identity approval is deferred to E39) before every merge — no
    exceptions. Then call **`fishhawk_merge_run`**: one verb records your merge
-   verdict as a chained audit entry, queues the squash merge through the same
+   verdict as a chained audit entry, queues the forge merge (the repository's
+   declared merge method, default squash) through the same
    seam `drive_run`'s `may_merge` arm uses, awaits the terminal run state, and
    surfaces your post-merge dev-host step (`scripts/dev post-merge`, surfaced
    for you to run — ADR-038 keeps host mutation out of the MCP surface). The
