@@ -10,13 +10,18 @@ package server
 //     merge_queue_yielded row re-appended, approval condition C7, and one
 //     operator-visible merge_queue_yield_posted row per yield episode, both
 //     under the run's merge-intent lock, approval condition C6), and AT MOST
-//     ONE row per base, the oldest due one, is RE-PROBED on an exponential
-//     schedule over its yielded_at age (yieldReprobeDue), judged over the
-//     time since this process's previous sweep.
+//     ONE due row per base is RE-PROBED on an exponential schedule over its
+//     yielded_at age. Due is judged against the row's OWN service mark
+//     (ADR-112 Amendment A2.1, yieldReprobeDueFor: the age at which this
+//     process last probed it), and the probed row is the due one with the
+//     oldest mark, never-serviced first, ties by yielded_at (A2.2,
+//     yieldServicedBefore), so N due rows on a base are each probed within N
+//     sweeps.
 //   - The same tick then runs the ADR-093 D4 automatic re-entry sweep
 //     (sweepMergeQueueReentries, merge_queue_reentry.go), which re-enters an
 //     ejected red pass at the tail once its delegated fix-up has pushed and
-//     the run is eligible again, on the same yieldReprobeDue schedule.
+//     the run is eligible again, on the same schedule (yieldReprobeDue) over
+//     its own previous-sweep window.
 //   - ReprobeMergeQueueYield is the targeted, no-backoff re-probe by run id
 //     (the merge_run re-invoke, which FORCES one re-attempt, and the approval
 //     webhook, which does not, slice 4).
@@ -75,10 +80,9 @@ const (
 	reprobeReanchored   mergeQueueYieldReprobeOutcome = "reanchored"
 )
 
-// yieldReprobeDue reports whether a yielded row of age is due a scheduled
-// re-probe on the sweep that observes it: the schedule points are
-// interval·2^k (k = 0..log2 of the cap) and then every cap·interval, and a
-// row is due when a point fell since this process's previous sweep, inside
+// yieldReprobeDue reports whether a row of age is due a scheduled probe on
+// the sweep that observes it, judged over the time since the caller's
+// previous sweep: a schedule point (yieldReprobeLastPoint) fell inside
 // (age − since, age]. since <= 0 (no previous sweep: a restart) widens the
 // window to (0, age], so every row past its first point is due once. The
 // window is the ACTUAL time since the previous sweep, not one interval: a
@@ -86,39 +90,100 @@ const (
 // busy) never skips a point, so no row past the cap starves on a tick-parity
 // stride. The schedule is the row's own database-clock age and since is a
 // duration on this process's clock (no instants cross the two clocks); only
-// since is process state. A row younger than one interval is never due (the
-// first point is one interval): the decision that yielded it just ran.
+// since is process state. The ADR-093 D4 re-entry sweep judges its rows with
+// it; the yield re-probe judges against per-entry service marks instead
+// (yieldReprobeDueAfter, ADR-112 Amendment A2.1).
 func yieldReprobeDue(age, since, interval time.Duration) bool {
 	if interval <= 0 || age < interval {
 		return false
-	}
-	capSpan := interval * mergeQueueYieldReprobeMaxBackoffTicks
-	last := interval // the latest schedule point <= age
-	if age > capSpan {
-		last = age / capSpan * capSpan
-	} else {
-		for last*2 <= age && last*2 <= capSpan {
-			last *= 2
-		}
 	}
 	lo := time.Duration(0)
 	if since > 0 && age-since > 0 {
 		lo = age - since
 	}
-	return last > lo
+	return yieldReprobeLastPoint(age, interval) > lo
 }
 
-// yieldSweepSince records now as this process's latest yield sweep and
-// returns the time since the previous one (0 before the first).
-func (s *Server) yieldSweepSince(now time.Time) time.Duration {
+// yieldReprobeLastPoint is the latest schedule point <= age (age >= interval
+// > 0): the points are interval·2^k (k = 0..log2 of the cap) and then every
+// cap·interval. A row younger than one interval has no point (the first is
+// one interval): the decision that yielded it just ran.
+func yieldReprobeLastPoint(age, interval time.Duration) time.Duration {
+	capSpan := interval * mergeQueueYieldReprobeMaxBackoffTicks
+	last := interval
+	if age > capSpan {
+		return age / capSpan * capSpan
+	}
+	for last*2 <= age && last*2 <= capSpan {
+		last *= 2
+	}
+	return last
+}
+
+// yieldReprobeDueAfter reports whether a yielded row of age is due a
+// scheduled re-probe given the age at which this process last serviced it
+// (ADR-112 Amendment A2.1): a schedule point fell inside (servicedAge, age].
+// servicedAge 0 (never serviced, or a new episode) judges (0, age], so a row
+// past its first point is due once. A row younger than one interval is never
+// due.
+func yieldReprobeDueAfter(age, servicedAge, interval time.Duration) bool {
+	if interval <= 0 || age < interval {
+		return false
+	}
+	return yieldReprobeLastPoint(age, interval) > servicedAge
+}
+
+// yieldServicedMark is one entry's ADR-112 Amendment A2.1 service mark: the
+// yield episode (yieldedAt) and database-clock age at which this process's
+// sweep last re-probed it, and seq, its place in the process-local service
+// order (strictly increasing from 1; 0 is never serviced).
+type yieldServicedMark struct {
+	yieldedAt time.Time
+	age       time.Duration
+	seq       uint64
+}
+
+// yieldReprobeDueFor judges e (yielded) against its own service mark and
+// returns whether it is due and its service seq (0: never serviced). The mark
+// applies only while e.YieldedAt is NOT after the mark's: a later yielded_at
+// is a new episode, judged as never serviced over (0, age].
+func (s *Server) yieldReprobeDueFor(e mergequeue.Entry, interval time.Duration) (due bool, seq uint64) {
+	var servicedAge time.Duration
+	s.yieldSweepMu.Lock()
+	if m, ok := s.yieldServiced[e.ID]; ok && e.YieldedAt != nil && !e.YieldedAt.After(m.yieldedAt) {
+		servicedAge, seq = m.age, m.seq
+	}
+	s.yieldSweepMu.Unlock()
+	return yieldReprobeDueAfter(e.YieldAge, servicedAge, interval), seq
+}
+
+// markYieldReprobeServiced advances e's service mark to its current episode
+// and age, at the next service seq. Only the probed row's mark advances, even
+// when its probe did nothing (ADR-112 Amendment A2.1).
+func (s *Server) markYieldReprobeServiced(e mergequeue.Entry) {
+	if e.YieldedAt == nil {
+		return
+	}
 	s.yieldSweepMu.Lock()
 	defer s.yieldSweepMu.Unlock()
-	var since time.Duration
-	if !s.yieldSweepLast.IsZero() {
-		since = now.Sub(s.yieldSweepLast)
+	if s.yieldServiced == nil {
+		s.yieldServiced = make(map[uuid.UUID]yieldServicedMark)
 	}
-	s.yieldSweepLast = now
-	return since
+	s.yieldServiceSeq++
+	s.yieldServiced[e.ID] = yieldServicedMark{yieldedAt: *e.YieldedAt, age: e.YieldAge, seq: s.yieldServiceSeq}
+}
+
+// pruneYieldReprobeServiced drops the mark of every entry not in seen. The
+// sweep calls it only after a FULLY listed sweep, so a failed listing never
+// drops a live row's mark.
+func (s *Server) pruneYieldReprobeServiced(seen map[uuid.UUID]struct{}) {
+	s.yieldSweepMu.Lock()
+	defer s.yieldSweepMu.Unlock()
+	for id := range s.yieldServiced {
+		if _, ok := seen[id]; !ok {
+			delete(s.yieldServiced, id)
+		}
+	}
 }
 
 // RunMergeQueueYieldReprobe sweeps every active base on every interval tick
@@ -146,50 +211,70 @@ func (s *Server) RunMergeQueueYieldReprobe(ctx context.Context, interval time.Du
 }
 
 // sweepMergeQueueYields surfaces every yielded row older than one tick and
-// re-probes at most one due row per base, the oldest by (yielded_at, id),
-// judging due over the time since this process's previous sweep
-// (yieldReprobeDue). It returns how many rows it re-probed. A list error
+// re-probes at most one due row per base: due against the row's own service
+// mark (yieldReprobeDueFor, ADR-112 Amendment A2.1), and among due rows the
+// oldest mark first, never-serviced first, ties by (yielded_at, id)
+// (yieldServicedBefore, A2.2). Only the probed row's mark advances. Marks of
+// entries no longer listed are pruned, but only when ActiveBases and every
+// ListForBase succeeded. It returns how many rows it re-probed. A list error
 // skips the base (or the sweep); the next tick retries.
 func (s *Server) sweepMergeQueueYields(ctx context.Context, interval time.Duration) int {
 	if s.cfg.MergeQueue == nil {
 		return 0
 	}
-	since := s.yieldSweepSince(time.Now())
 	bases, err := s.cfg.MergeQueue.ActiveBases(ctx)
+	listed := err == nil // every listing succeeded: only then may marks be pruned
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: listing active bases for the yield re-probe failed; the next tick retries",
 			slog.String("error", err.Error()))
-		return 0
 	}
+	seen := make(map[uuid.UUID]struct{})
 	probed := 0
 	for _, b := range bases {
 		entries, err := s.cfg.MergeQueue.ListForBase(ctx, b)
 		if err != nil {
+			listed = false
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"merge queue: listing a base for the yield re-probe failed; the next tick retries",
 				slog.String("repo", b.Repo), slog.String("base_ref", b.BaseRef), slog.String("error", err.Error()))
 			continue
 		}
 		var due *mergequeue.Entry
+		var dueSeq uint64
 		for i := range entries {
 			e := entries[i]
+			seen[e.ID] = struct{}{}
 			if e.State != mergequeue.StateHeld || !e.Yielded() {
 				continue
 			}
 			if e.YieldAge >= interval { // posted-once age check: a fresh yield is not surfaced yet
 				s.surfaceMergeQueueYield(ctx, e)
 			}
-			if yieldReprobeDue(e.YieldAge, since, interval) && (due == nil || yieldedBefore(e, *due)) {
-				due = &e
+			if ok, seq := s.yieldReprobeDueFor(e, interval); ok && (due == nil || yieldServicedBefore(seq, e, dueSeq, *due)) {
+				due, dueSeq = &e, seq
 			}
 		}
 		if due != nil {
 			s.reprobeMergeQueueYield(ctx, *due, false)
+			s.markYieldReprobeServiced(*due)
 			probed++
 		}
 	}
+	if listed {
+		s.pruneYieldReprobeServiced(seen)
+	}
 	return probed
+}
+
+// yieldServicedBefore is ADR-112 Amendment A2.2's re-probe order: a (service
+// seq aSeq) before b (bSeq) when its service mark is older, a never-serviced
+// row (seq 0) first, and between equal marks by (yielded_at, id).
+func yieldServicedBefore(aSeq uint64, a mergequeue.Entry, bSeq uint64, b mergequeue.Entry) bool {
+	if aSeq != bSeq { // ADR-112 A2.2: the oldest service mark first; never serviced (0) first
+		return aSeq < bSeq
+	}
+	return yieldedBefore(a, b)
 }
 
 // yieldedBefore orders yielded entries by (yielded_at, id).

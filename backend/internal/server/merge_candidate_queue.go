@@ -61,7 +61,8 @@ import (
 //     intent-bearing entry and applies its outcome; it continues only after
 //     a settle, a live admission, a bounded merge-on-pass readvance, or an
 //     ADR-112 R3 yield (#4632: a non-approved fold waits at the head for the
-//     approval window, then yields; an admission veto yields at once).
+//     approval window, then yields; an admission veto yields at once; #4748:
+//     an anchored entry's readvance or transient hold yields at expiry).
 //
 // Every queue move writes one INTERNAL audit row, best-effort and after the
 // store's own transaction committed. The store is the source of truth; a lost
@@ -354,7 +355,10 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 // FIRST admission the boot re-claim (mergeQueueBootAdmit, ADR-093 D8).
 //
 // The live-entry branch routes by the entry's last recorded step: passed +
-// intent → merge-on-pass, then the outcome is applied, THEN the decision's
+// intent → merge-on-pass, then the expired-wait enforcement
+// (mergeOnPassEnforceExpiredWait, ADR-112 R3 / #4748: an anchored entry's
+// pre-claim readvance or transient hold yields at expiry, judged under the
+// run's merge-intent lock), then the outcome is applied, THEN the decision's
 // own in-flight mark (if it marked) is cleared (ruling R8c); merging/settling → skipped while
 // THIS process has the run's merge in flight, else the restart resume
 // (mergeQueueResumeMerge); verifying/unverified → the verifying recovery
@@ -400,11 +404,11 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 			case e.Phase == mergequeue.PhasePassed && e.MergeIntentAt != nil:
 				// ADR-093 D3: the live head of line passed and carries the
 				// operator's merge intent, so the queue merges it.
-				o := s.mergeQueueMergeOnPass(mctx, mergeOnPassRequest{
-					Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger(),
-				})
+				req := mergeOnPassRequest{Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger()}
+				decided := s.mergeQueueMergeOnPass(mctx, req)
+				o := s.mergeOnPassEnforceExpiredWait(mctx, req, decided) // ADR-112 R3: an expired wait yields on a pre-claim readvance or transient hold
 				cont = s.applyMergeOnPassOutcome(mctx, e, o, &readvances)
-				if o.InFlightMarked {
+				if decided.InFlightMarked {
 					// Ruling R8c: after the outcome is applied, and only this
 					// decision's own mark (#4298 48a65a85).
 					s.mergeInFlight.clear(e.RunID)
@@ -465,6 +469,9 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 //     next held entry. A yield does not count against the readvance bound:
 //     AdmitNext skips a yielded row, so it cannot return in this pump. A CAS
 //     conflict stops.
+//   - expired_yielded (ADR-112 R3, #4748): the expired-wait enforcement
+//     already yielded the entry under the merge-intent lock; CONTINUE, not
+//     counted against the readvance bound (AdmitNext skips a yielded row).
 //   - held: stop; the next pump re-decides.
 //
 // It runs OUTSIDE the merge-intent lock (the pump's detached context): the
@@ -526,6 +533,10 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 		return s.yieldMergeQueueEntry(ctx, res.Entry, o.Yield, mergeQueueYieldSiteMergeOnPass)
 	case mergeOnPassYield:
 		return s.yieldMergeQueueEntry(ctx, e, o.Yield, mergeQueueYieldSiteMergeOnPass)
+	case mergeOnPassExpiredYielded:
+		log("merge queue: the expired approval wait yielded the entry; the pump continues",
+			slog.String("next_step", o.Yield.NextStep))
+		return true
 	case mergeOnPassRedecide:
 		// ADR-093 D8: the resume returned the entry to passed; the pump's
 		// next iteration runs ordinary merge-on-pass from scratch.

@@ -10,12 +10,15 @@ package server
 // with a marker AdmitNext skips; clearing the marker is the only way back in.
 //
 // This file is the yield's closed vocabulary (yield_reason and its TOTAL
-// next_step mapping), the fold → yield mapping, the sanitised yield detail and
-// the merge_queue_yielded writer. The pump applies a wait or a yield outside
-// the merge-intent lock (applyMergeOnPassOutcome); the re-probe that clears a
-// marker is merge_queue_yield_reprobe.go. Contract:
-// backend/internal/server/README.md and backend/internal/mergequeue/README.md
-// § "Yield".
+// next_step mapping), the fold → yield mapping, the sanitised yield detail,
+// the merge_queue_yielded writer and the expired-wait enforcement
+// (mergeOnPassEnforceExpiredWait, #4748). The pump applies a wait or a yield
+// outside the merge-intent lock (applyMergeOnPassOutcome); only the
+// expired-wait enforcement runs inside the run's merge-intent lock, and there
+// it makes one bounded ApprovalWait judgement plus one Yield, never a held
+// wait. The re-probe that clears a marker is merge_queue_yield_reprobe.go.
+// Contract: backend/internal/server/docs/merge-queue.md and
+// backend/internal/mergequeue/README.md § "Yield".
 
 import (
 	"context"
@@ -174,13 +177,139 @@ func mergeOnPassFoldYield(fold forgeApprovalDecision) (y mergeQueueYield, immedi
 	return newMergeQueueYield(reason, fold.Detail, row), immediate
 }
 
+// mergeOnPassUndeterminedExpiryYield is the generic ExpiryYield of a
+// readvance or transient hold (#4748): forge_approval_undetermined, row 3,
+// with a server-authored detail naming the readvance or hold reason and its
+// detail, sanitised through newMergeQueueYield.
+func mergeOnPassUndeterminedExpiryYield(reason, detail string) *mergeQueueYield {
+	y := newMergeQueueYield(mergeCandidateQueueReasonForgeApprovalUndetermined,
+		"the approval wait expired before merge-on-pass could determine the head's approval ("+reason+": "+detail+")",
+		mergeQueueYieldRowApprovalFold)
+	return &y
+}
+
+// mergeOnPassSnapshotUndeterminedYield is the yield of a review-snapshot read
+// failure (#4748): an undetermined approval result, forge_approval_undetermined
+// row 3, waited on and then yielded like any other row-3 result.
+func mergeOnPassSnapshotUndeterminedYield(err error) mergeQueueYield {
+	return newMergeQueueYield(mergeCandidateQueueReasonForgeApprovalUndetermined,
+		sanitizeForgeReadDetail("review_snapshot", err.Error()), mergeQueueYieldRowApprovalFold)
+}
+
+// mergeOnPassEnforceExpiredWait is ADR-112 R3's approval-wait deadline on the
+// pre-claim paths that return before the await_approval outcome (#4748): a
+// readvance (base moved, head moved) or a transient hold carrying an
+// ExpiryYield, for an entry whose wait episode is ESTABLISHED. Any other
+// outcome — another kind, no ExpiryYield, a decision that marked the run in
+// flight, a non-transient hold (not_mergeable_yet, overlap_refused,
+// inline_merge_dispatched, intent_row_missing, verify_not_passed,
+// merge_lock_unavailable, entry_changed, merged_claim_unread, ...) or an entry
+// that never waited — is returned unchanged.
+//
+// The judgement runs under the run's merge-intent lock, the SAME lock that
+// guards SetPhase(merging) and ClaimMergeDispatch (first-officer ruling C1),
+// as ADR-112 R3 step 8 places it: it re-reads the entry (live, same epoch,
+// phase passed), the in-process in-flight registry and the D1 claim, then
+// judges expiry with Store.ApprovalWait, and only then yields. It makes NO
+// forge call: store reads, the ApprovalWait and Yield compare-and-swaps and
+// the merge_queue_yielded row only. Any refusal holds with no ExpiryYield, so
+// the pump stops and the next pump re-decides; not expired returns o.
+func (s *Server) mergeOnPassEnforceExpiredWait(ctx context.Context, req mergeOnPassRequest, o mergeOnPassOutcome) mergeOnPassOutcome {
+	if o.ExpiryYield == nil || o.InFlightMarked || (o.Kind != mergeOnPassReadvance && o.Kind != mergeOnPassHeld) {
+		return o
+	}
+	if req.Entry.ApprovalWaitStartedAt == nil { // no established episode: a readvance or hold never starts one
+		return o
+	}
+	e := req.Entry
+	out, ran := o, false
+	lockErr := s.withRunMergeLock(ctx, e.RunID, func(lctx context.Context) error {
+		ran = true
+		cur, refused, expired := s.mergeOnPassJudgeExpiredWait(lctx, req)
+		switch {
+		case refused != nil:
+			out = *refused
+		case expired:
+			out = s.mergeOnPassYieldExpiredWait(lctx, cur, *o.ExpiryYield)
+		}
+		return nil
+	})
+	if !ran {
+		detail := "the run's merge-intent lock could not be taken to judge the expired approval wait"
+		if lockErr != nil {
+			detail += ": " + lockErr.Error()
+		}
+		return mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonLockUnavailable, detail)
+	}
+	if lockErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge queue: the expired-wait enforcement's lock lapsed after its judgement ran; its writes stand",
+			slog.String("run_id", e.RunID.String()), slog.String("outcome", string(out.Kind)),
+			slog.String("error", lockErr.Error()))
+	}
+	return out
+}
+
+// mergeOnPassJudgeExpiredWait is the enforcement's in-lock judgement: the
+// entry re-read, the in-flight registry, the D1 claim, then ApprovalWait.
+// refused is the hold to return; otherwise expired reports the wait expired
+// and cur is the entry ApprovalWait read back. Called ONLY under the run's
+// merge-intent lock.
+func (s *Server) mergeOnPassJudgeExpiredWait(ctx context.Context, req mergeOnPassRequest) (cur mergequeue.Entry, refused *mergeOnPassOutcome, expired bool) {
+	e := req.Entry
+	refuse := func(reason, detail string) (mergequeue.Entry, *mergeOnPassOutcome, bool) {
+		h := mergeOnPassExpiredWaitHeld(e, reason, detail)
+		return mergequeue.Entry{}, &h, false
+	}
+	st, found, err := s.cfg.MergeQueue.ActiveForRun(ctx, e.RunID)
+	if err != nil || !found || st.Entry.ID != e.ID || st.Entry.State != mergequeue.StateLive ||
+		st.Entry.Phase != mergequeue.PhasePassed || st.Entry.AdmissionEpoch != e.AdmissionEpoch {
+		return refuse(mergeOnPassReasonEntryChanged, "the queue entry changed before its expired approval wait could be judged")
+	}
+	if s.mergeInFlight.has(e.RunID) {
+		return refuse(mergeOnPassReasonAlreadyDispatched, "a merge is in flight for this run; the expired approval wait does not yield it")
+	}
+	if req.Ledger == nil {
+		return refuse(mergeOnPassReasonLedgerUnavailable, "no merge-dispatch ledger is wired, so the run's dispatch claim cannot be read")
+	}
+	_, claimed, err := req.Ledger.MergeDispatch(ctx, e.RunID)
+	if err != nil {
+		return refuse(mergeOnPassReasonLedgerUnavailable, "the run's dispatch claim could not be read: "+err.Error())
+	}
+	if claimed { // ADR-109: a claimed dispatch is held, never yielded
+		return refuse(mergeOnPassReasonAlreadyDispatched, "a merge dispatch is claimed for this run; the expired approval wait does not yield it")
+	}
+	res, err := s.cfg.MergeQueue.ApprovalWait(ctx, e.ID, e.AdmissionEpoch, s.mergeQueueApprovalWait())
+	if err != nil {
+		return refuse(mergeOnPassReasonEntryChanged, "the approval wait could not be judged: "+err.Error())
+	}
+	return res.Entry, nil, res.Expired
+}
+
+// mergeOnPassYieldExpiredWait yields cur with y under the lock and answers
+// mergeOnPassExpiredYielded, or holds entry_changed when the Yield CAS did
+// not land.
+func (s *Server) mergeOnPassYieldExpiredWait(ctx context.Context, cur mergequeue.Entry, y mergeQueueYield) mergeOnPassOutcome {
+	if !s.yieldMergeQueueEntry(ctx, cur, y, mergeQueueYieldSiteMergeOnPass) {
+		return mergeOnPassExpiredWaitHeld(cur, mergeOnPassReasonEntryChanged, "the expired approval wait's yield did not land")
+	}
+	return mergeOnPassOutcome{Kind: mergeOnPassExpiredYielded, Reason: y.Reason, Detail: y.Detail, HeadSHA: cur.AnchoredHeadSHA, Yield: y}
+}
+
+// mergeOnPassExpiredWaitHeld is an enforcement refusal: held, no ExpiryYield.
+func mergeOnPassExpiredWaitHeld(e mergequeue.Entry, reason, detail string) mergeOnPassOutcome {
+	return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+}
+
 // yieldMergeQueueEntry yields the LIVE entry e at its admission epoch (one
 // store transaction: held, marker stamped, enqueued_at and the wait anchor
 // kept), then appends merge_queue_yielded. A same-reason re-yield continues
 // the entry's last cleared episode (mergeQueueYieldContinuation). It reports
 // whether the entry yielded: a CAS conflict or a failed write leaves it
-// untouched and false. It is called OUTSIDE the merge-intent lock (ADR-112
-// R3: never inside it).
+// untouched and false. The pump's await and immediate yields call it OUTSIDE
+// the merge-intent lock (ADR-112 R3: the wait is never held inside it); only
+// the expired-wait enforcement (mergeOnPassEnforceExpiredWait) calls it inside
+// the run's merge-intent lock, after one bounded ApprovalWait judgement.
 func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y mergeQueueYield, site string) bool {
 	m := y.marker()
 	m.Continue = s.mergeQueueYieldContinuation(ctx, e, y.Reason)
