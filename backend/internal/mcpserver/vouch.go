@@ -15,7 +15,7 @@ import (
 // — the vouch is an audited operator declaration.
 type VouchCommitInput struct {
 	RunID  string `json:"run_id" jsonschema:"the Fishhawk run UUID whose branch carries the commit being vouched; resolved like the other run-keyed verbs"`
-	SHA    string `json:"sha" jsonschema:"the full commit SHA on the run branch to declare as run-authored lineage"`
+	SHA    string `json:"sha" jsonschema:"the FULL commit SHA (40 hex, or 64 for a SHA-256 repository) on the run branch to declare as run-authored lineage; an abbreviated sha is refused (expand it with git rev-parse)"`
 	Reason string `json:"reason" jsonschema:"required operator rationale — why this foreign commit is legitimate run-authored lineage; recorded verbatim on the operator_commit_vouched audit entry"`
 }
 
@@ -65,12 +65,18 @@ backend resolves the run's live PR head and stamps the
 fishhawk_audit_complete check ONLY when the vouched sha equals it, so this
 verb can never post the run's recomputed check state onto an unrelated
 commit. A mismatch or an unresolvable head records the vouch and SKIPS the
-publish, naming both shas (or the resolution failure) on the warning; an
-ABBREVIATED sha takes the mismatch arm, so vouch the FULL sha.
+publish, naming both shas (or the resolution failure) on the warning.
+
+The sha MUST be the FULL commit id (40 hex, or 64 for a SHA-256 repository;
+upper-case is accepted and recorded lowercase). An ABBREVIATED sha is REFUSED
+before anything is recorded (#4435): fishhawk_audit_complete matches the PR
+head against the recorded vouches by full sha and never by prefix, so a
+recorded abbreviation would never clear foreign_commit. Expand it with
+git rev-parse <abbreviated-sha>.
 
 Inputs:
   - run_id : the run whose branch carries the commit.
-  - sha    : the commit SHA to vouch.
+  - sha    : the FULL commit SHA to vouch.
   - reason : required operator rationale, recorded on the audit entry.
 
 Returns the recorded declaration (run_id, vouched_sha, reason) plus the
@@ -82,6 +88,8 @@ the vouch is still durable; re-invoke naming the live head to re-post.
 
 Tool errors:
   - invalid UUID (caught before the HTTP hop)
+  - sha that is not a full 40/64-hex commit id (caught before the HTTP hop;
+    the backend refuses it too with validation_failed, 400)
   - validation_failed (empty sha or reason, 400)
   - run_token_forbidden (a run-bound agent token attempted the vouch, 403)
   - insufficient_scope (token lacks write:stages, 403)
@@ -99,15 +107,39 @@ func (r *runResolver) vouchCommit(ctx context.Context, _ *mcp.CallToolRequest, i
 	if err != nil {
 		return nil, VouchCommitOutput{}, fmt.Errorf("run_id %q is not a valid UUID: %w", in.RunID, err)
 	}
-	if strings.TrimSpace(in.SHA) == "" {
+	sha := strings.TrimSpace(in.SHA)
+	if sha == "" {
 		return nil, VouchCommitOutput{}, fmt.Errorf("sha is required: name the commit to vouch as run-authored lineage")
 	}
 	if strings.TrimSpace(in.Reason) == "" {
 		return nil, VouchCommitOutput{}, fmt.Errorf("reason is required: the vouch is an audited operator declaration")
 	}
-	res, err := r.api.VouchCommit(ctx, runID, strings.TrimSpace(in.SHA), strings.TrimSpace(in.Reason))
+	if !isFullObjectName(sha) {
+		return nil, VouchCommitOutput{}, fmt.Errorf("sha %q is not a full commit id: it must be 40 hex characters (64 for a SHA-256 repository); an abbreviated sha is refused because fishhawk_audit_complete matches the pull-request head by full sha and never by prefix — expand it with `git rev-parse <abbreviated-sha>`", sha)
+	}
+	res, err := r.api.VouchCommit(ctx, runID, sha, strings.TrimSpace(in.Reason))
 	if err != nil {
 		return nil, VouchCommitOutput{}, fmt.Errorf("vouch commit: %w", err)
 	}
 	return nil, VouchCommitOutput{Result: *res}, nil
+}
+
+// isFullObjectName reports whether s is a full git object name: exactly 40
+// (SHA-1) or 64 (SHA-256) hex characters, case-insensitive. It mirrors the
+// backend's isDeployCommitSHA predicate (package server, which this package
+// cannot import) purely as a fast fail before the HTTP hop; the backend
+// refusal is authoritative, so drift here can only reject early or defer to
+// the backend, never admit an abbreviated sha into the record.
+func isFullObjectName(s string) bool {
+	if len(s) != 40 && len(s) != 64 {
+		return false
+	}
+	for _, c := range s {
+		switch {
+		case c >= '0' && c <= '9', c >= 'a' && c <= 'f', c >= 'A' && c <= 'F':
+		default:
+			return false
+		}
+	}
+	return true
 }

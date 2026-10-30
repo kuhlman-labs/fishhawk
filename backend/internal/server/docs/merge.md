@@ -95,6 +95,22 @@ Distinct from reset (#867, which DROPS an on-top commit): vouch
 
 Mechanics:
 
+- **The `sha` must be a FULL object name (#4435).** The handler reuses
+  `isDeployCommitSHA` (exactly 40 hex for SHA-1 or 64 for SHA-256,
+  case-insensitive) and refuses anything else with `400 validation_failed`
+  (details `field: sha`, `got` bounded to `vouchShaEchoLimit` bytes,
+  `got_length`) BEFORE the run lookup, the audit append and the publish, so a
+  refusal writes and posts nothing. Rule 5 of `fishhawk_audit_complete`
+  matches the PR head against the recorded vouches by exact full-string
+  equality, so an abbreviated sha used to return 200 yet never clear
+  `foreign_commit`. An accepted sha is canonicalized with `strings.ToLower`
+  before it is recorded, echoed and used as the publish head, so an upper-case
+  paste exact-matches the forge's lowercase head. The `fishhawk_vouch_commit`
+  MCP tool refuses the same input locally (`isFullObjectName`, a mirror of the
+  predicate; the backend refusal is authoritative). A legacy abbreviated row
+  recorded before the refusal stays verbatim in rule 5's known set, is never
+  prefix-matched, and its `foreign_commit` detail renders full shas and names
+  it as an abbreviation to re-vouch in full (`abbreviatedPrefixesOf`).
 - The handler appends an `operator_commit_vouched` audit entry
   (operator/`ActorUser` actor; payload
   `{run_id, vouched_sha, reason}`, with `vouched_sha` keyed on the
@@ -175,10 +191,10 @@ Mechanics:
   startable, at which point it fails closed (`rebase_conflict`).
 
 - **The re-post is BOUND to the run's own live PR head (E64.26 /
-  #3129).** Read this together with the record-verbatim bullet below —
-  the two properties are deliberately different. The RECORD is verbatim
-  and unbounded: any sha the operator names is appended and the response
-  is a 200. The PUBLISH is bounded: before republishing, the handler
+  #3129).** Read this together with the fail-closed invariant below —
+  the two properties are deliberately different. The RECORD is unverified
+  and unbounded: any well-formed full sha the operator names is appended
+  (canonicalized to lowercase) and the response is a 200. The PUBLISH is bounded: before republishing, the handler
   resolves the run's live pull-request head via
   `resolveVouchPublishHead` — the same determinability ladder
   `rebase_branch.go` uses (installation → `parseRepoOwnerName` →
@@ -186,7 +202,7 @@ Mechanics:
   rung an ERROR, never an empty-string-means-ok) — and stamps the check
   ONLY when the vouched sha equals that head (`shaEqualsHead`, a
   case-insensitive FULL-string compare on the trimmed spellings; an
-  ABBREVIATED sha therefore takes the mismatch arm by design). A
+  ABBREVIATED sha never reaches it, being refused at vouch time, #4435). A
   MISMATCH skips the publish and reports it on
   `audit_check_republish_warning` naming BOTH shas; an UNRESOLVABLE head
   fails closed the same way, naming the resolution failure. The check is
@@ -204,8 +220,8 @@ Mechanics:
 
 Invariants:
 
-- **Fail-closed preserved**: the handler records the declaration
-  verbatim without verifying the SHA exists on the branch, so an
+- **Fail-closed preserved**: the handler records the declaration as the
+  canonical full sha without verifying the SHA exists on the branch, so an
   UN-vouched foreign commit still fails category-B and still blocks
   resolution. A vouch read error sets `complete=false` (the ledger
   fails open at detection, matching the head-category contract).

@@ -15323,12 +15323,24 @@ paths:
         vouch KEEPS the operator commit and attributes it. Use vouch when
         the commit is a legitimate remediation to retain.
 
+        **The `sha` must be a FULL commit id (#4435).** Exactly 40 hex
+        characters (SHA-1) or 64 (SHA-256); anything else — an abbreviated
+        sha included — is refused `400 validation_failed` (`details.field` is
+        `sha`) BEFORE anything is recorded or published. The reason is that
+        rule 5 of `fishhawk_audit_complete` matches the PR head against the
+        recorded vouches by exact full sha and never by prefix, so a recorded
+        abbreviation would answer 200 yet never clear `foreign_commit`. An
+        upper-case full sha is accepted and recorded in canonical LOWERCASE so
+        it exact-matches the forge's head. A vouch recorded before this
+        refusal landed keeps its stored spelling and is still never
+        prefix-matched; re-vouch the full sha.
+
         **Fail-closed is preserved.** The handler records the declaration
-        verbatim — it does NOT verify the SHA exists on the branch or in the
-        compare set. Vouching a wrong/non-existent SHA simply adds an
-        unreachable ledger entry and un-wedges nothing; an UN-vouched foreign
-        commit still fails category-B at the report boundary and still blocks
-        merge resolution.
+        as the canonical full sha — it does NOT verify the SHA exists on the
+        branch or in the compare set. Vouching a well-formed but wrong or
+        non-existent full SHA simply adds an unreachable ledger entry and
+        un-wedges nothing; an UN-vouched foreign commit still fails category-B
+        at the report boundary and still blocks merge resolution.
 
         **Re-posts the `fishhawk_audit_complete` check (E64.14 / #3109),
         BOUND to the run's own live pull-request head (E64.26 / #3129).**
@@ -15338,17 +15350,18 @@ paths:
         determinability ladder `rebase-branch` uses (installation → repo → PR
         number from the run's tracked pull request → live head sha) and stamps
         the check only when the vouched sha equals it (a case-insensitive
-        FULL-string compare, so an ABBREVIATED sha takes the mismatch arm).
+        FULL-string compare; an abbreviated sha never reaches it, being
+        refused above).
         Three arms: MATCH publishes; MISMATCH skips the publish and names BOTH
         shas on `audit_check_republish_warning`; an UNRESOLVABLE head fails
         closed the same way, naming the resolution failure. The check is never
         posted at an unverified sha. Without this bound an operator carrying
         `write:stages` could have this run's recomputed check state stamped
         onto any commit in the repository, including the head of an unrelated
-        pull request. WHAT DID NOT CHANGE: the record stays verbatim for any
-        sha — the `operator_commit_vouched` append and the 200 are identical
-        for a matching and a non-matching sha, and there is no new response
-        field, error code or status code. An
+        pull request. WHAT DID NOT CHANGE: the record is unverified for any
+        well-formed full sha — the `operator_commit_vouched` append and the 200
+        are identical for a matching and a non-matching full sha, and there is
+        no new response field, error code or status code. An
         operator-pushed commit appears in no head-report audit category, so the
         publisher's normal head resolution would re-post against a stale sha and
         leave the check absent from the live merge head — the exact base-advance
@@ -15389,9 +15402,15 @@ paths:
               properties:
                 sha:
                   type: string
+                  pattern: '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$'
                   description: |
-                    The commit SHA on the run branch to declare as
-                    run-authored lineage.
+                    The FULL commit SHA on the run branch to declare as
+                    run-authored lineage: 40 hex characters (SHA-1) or 64
+                    (SHA-256). An abbreviated or otherwise non-full sha is
+                    refused `400 validation_failed` (#4435), because
+                    `fishhawk_audit_complete` matches the PR head by full sha
+                    and never by prefix. Upper-case hex is accepted and
+                    recorded lowercase.
                 reason:
                   type: string
                   description: |
@@ -15407,7 +15426,7 @@ paths:
                 type: object
                 properties:
                   run_id: { $ref: '#/components/schemas/UUID' }
-                  vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage.' }
+                  vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage, in canonical lowercase.' }
                   reason: { type: string }
                   audit_check_republished:
                     type: boolean
@@ -15435,7 +15454,10 @@ paths:
                       when the re-post succeeded and when no publisher is wired.
         '400':
           description: |
-            Malformed body or an empty `sha`/`reason`. Body's `error` is
+            Malformed body, an empty `sha`/`reason`, or a `sha` that is not a
+            full 40-hex (SHA-1) or 64-hex (SHA-256) commit id (#4435; an
+            abbreviated sha is refused, with `details.field` `sha` and the
+            bounded `details.got` / `details.got_length`). Body's `error` is
             `validation_failed`.
           content:
             application/json:
