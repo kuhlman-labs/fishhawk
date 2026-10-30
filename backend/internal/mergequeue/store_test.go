@@ -1973,11 +1973,12 @@ func TestYield_OneTransactionUnderEpochCAS(t *testing.T) {
 	}
 }
 
-// TestClearYield_CompareAndSwap (CF3 vehicle): a stale yielded_at (another
-// episode) and a stale head (after a marker-preserving reanchor) are both
-// refused, and the marker is still set on READ-BACK (error identity alone is
-// not the assertion); the matching keys clear the marker and the wait anchor,
-// and the row is admitted ahead of a younger held row (FIFO at enqueued_at).
+// TestClearYield_CompareAndSwap (CF3 vehicle): a stale yield revision and a
+// stale head (after a marker-preserving reanchor) are both refused, and the
+// marker is still set on READ-BACK (error identity alone is not the
+// assertion); the matching keys clear the marker and close the approval wait
+// while RETAINING its anchor (docs/adr/112 A3.7), and the row is admitted
+// ahead of a younger held row (FIFO at enqueued_at).
 func TestClearYield_CompareAndSwap(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -1990,7 +1991,7 @@ func TestClearYield_CompareAndSwap(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Yield: %v", err)
 	}
-	yieldedAt := *y.YieldedAt
+	yieldedAt, rev := *y.YieldedAt, y.YieldRevision
 
 	stillMarked := func(why string) {
 		t.Helper()
@@ -1998,10 +1999,10 @@ func TestClearYield_CompareAndSwap(t *testing.T) {
 			t.Fatalf("%s: entry = %+v, want the marker (yielded at %v) and wait anchor still set", why, got, yieldedAt)
 		}
 	}
-	if _, err := f.store.ClearYield(ctx, ea.ID, "h1", yieldedAt.Add(-time.Second)); !errors.Is(err, ErrStateConflict) {
-		t.Fatalf("ClearYield(prior episode) err = %v, want ErrStateConflict", err)
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h1", rev-1, false); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("ClearYield(prior revision) err = %v, want ErrStateConflict", err)
 	}
-	stillMarked("stale yielded_at")
+	stillMarked("stale revision")
 
 	// A marker-less re-enqueue at a new head moves the anchor and keeps the
 	// marker, so a probe judged at the OLD head is stale.
@@ -2009,26 +2010,27 @@ func TestClearYield_CompareAndSwap(t *testing.T) {
 		t.Fatalf("marker-less re-enqueue = %+v, want reanchored, not marked by this call", res)
 	}
 	stillMarked("marker-less reanchor")
-	if _, err := f.store.ClearYield(ctx, ea.ID, "h1", yieldedAt); !errors.Is(err, ErrStateConflict) {
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h1", rev, false); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("ClearYield(stale head) err = %v, want ErrStateConflict", err)
 	}
 	stillMarked("stale head")
-	if _, err := f.store.ClearYield(ctx, eb.ID, "x1", yieldedAt); !errors.Is(err, ErrStateConflict) {
+	if _, err := f.store.ClearYield(ctx, eb.ID, "x1", 0, false); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("ClearYield(unmarked row) err = %v, want ErrStateConflict", err)
 	}
-	if _, err := f.store.ClearYield(ctx, ea.ID, "", yieldedAt); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := f.store.ClearYield(ctx, ea.ID, "", rev, false); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("ClearYield(no head) err = %v, want ErrInvalidRequest", err)
 	}
-	if _, err := f.store.ClearYield(ctx, ea.ID, "h2", time.Time{}); !errors.Is(err, ErrInvalidRequest) {
-		t.Fatalf("ClearYield(no yielded_at) err = %v, want ErrInvalidRequest", err)
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h2", -1, false); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("ClearYield(negative revision) err = %v, want ErrInvalidRequest", err)
 	}
 
-	cleared, err := f.store.ClearYield(ctx, ea.ID, "h2", yieldedAt)
+	cleared, err := f.store.ClearYield(ctx, ea.ID, "h2", rev, false)
 	if err != nil {
 		t.Fatalf("ClearYield: %v", err)
 	}
-	if cleared.Yielded() || cleared.YieldReason != "" || cleared.ApprovalWaitStartedAt != nil || !cleared.EnqueuedAt.Equal(ea.EnqueuedAt) {
-		t.Fatalf("cleared entry = %+v, want no marker, no wait anchor, same enqueued_at", cleared)
+	if cleared.Yielded() || cleared.YieldReason != "" || cleared.ApprovalWaitStartedAt == nil || cleared.ApprovalWaitOpen ||
+		!cleared.EnqueuedAt.Equal(ea.EnqueuedAt) {
+		t.Fatalf("cleared entry = %+v, want no marker, the wait anchor retained and closed, same enqueued_at", cleared)
 	}
 	f.admitAt(ea.ID) // ahead of the younger B: FIFO at its original enqueued_at
 }
@@ -2054,7 +2056,7 @@ func TestReanchorYielded_KeepsMarkerAndEpisode(t *testing.T) {
 	}
 	yieldedAt := *y.YieldedAt
 
-	moved, err := f.store.ReanchorYielded(ctx, ea.ID, "h1", yieldedAt, "h2", "b2")
+	moved, err := f.store.ReanchorYielded(ctx, ea.ID, "h1", y.YieldRevision, "h2", "b2")
 	if err != nil {
 		t.Fatalf("ReanchorYielded: %v", err)
 	}
@@ -2066,13 +2068,13 @@ func TestReanchorYielded_KeepsMarkerAndEpisode(t *testing.T) {
 			t.Fatalf("re-anchored yielded entry = %+v, want head h2, the same marker, yielded_at and wait anchor", g)
 		}
 	}
-	if _, err := f.store.ReanchorYielded(ctx, ea.ID, "h1", yieldedAt, "h3", ""); !errors.Is(err, ErrStateConflict) {
+	if _, err := f.store.ReanchorYielded(ctx, ea.ID, "h1", moved.YieldRevision, "h3", ""); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("stale ReanchorYielded err = %v, want ErrStateConflict", err)
 	}
 	if got := f.entry(ea.ID); got.AnchoredHeadSHA != "h2" {
 		t.Fatalf("stale ReanchorYielded moved the head to %q", got.AnchoredHeadSHA)
 	}
-	if _, err := f.store.ReanchorYielded(ctx, ea.ID, "h2", yieldedAt, "", ""); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := f.store.ReanchorYielded(ctx, ea.ID, "h2", moved.YieldRevision, "", ""); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("ReanchorYielded(no new head) err = %v, want ErrInvalidRequest", err)
 	}
 	if adm := f.admitNext(mainBase()); !adm.Admitted || adm.Entry.ID == ea.ID {
@@ -2080,7 +2082,7 @@ func TestReanchorYielded_KeepsMarkerAndEpisode(t *testing.T) {
 	}
 
 	// The new head's approval clears at the NEW head; A rejoins at its place.
-	if _, err := f.store.ClearYield(ctx, ea.ID, "h2", yieldedAt); err != nil {
+	if _, err := f.store.ClearYield(ctx, ea.ID, "h2", moved.YieldRevision, false); err != nil {
 		t.Fatalf("ClearYield at the new head: %v", err)
 	}
 	if got := f.entry(ea.ID); got.Yielded() {
@@ -2253,23 +2255,24 @@ func TestEnqueue_YieldMarkerArms(t *testing.T) {
 	}
 }
 
-// TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor (ADR-112 R3, #4632):
-// a re-yield whose marker carries the entry's cleared episode keeps that
-// episode's yielded_at (backdated an hour, so a fresh stamp is told apart)
-// when the anchor still equals the episode's head and base, through Yield and
-// through Enqueue marking an unmarked held entry; a moved head, a moved base
-// or no Continue stamps the database clock (a new episode). Counterfactual:
-// dropping the anchor match in yieldContinueSQL continues the episode on the
-// moved head, RED.
-func TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor(t *testing.T) {
+// TestYield_ContinuesLastClearedEpisodeOnSameBaseRef (docs/adr/112 A3.7,
+// T15): a re-yield whose marker carries the entry's cleared episode keeps
+// that episode's yielded_at (backdated an hour, so a fresh stamp is told
+// apart) when the entry's base ref equals the episode's, WHATEVER the head or
+// reason: an episode cleared at head h1 for one reason continues on a
+// re-yield at h2 for another, through Yield and through Enqueue marking an
+// unmarked held entry; an episode on another base ref, or no Continue, stamps
+// the database clock (a new episode). Counterfactual CF16: restoring the
+// head/base-SHA condition in yieldContinueSQL makes the moved-head re-yield a
+// fresh episode, RED (the heads differ).
+func TestYield_ContinuesLastClearedEpisodeOnSameBaseRef(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
 	a := f.run()
 	e := f.enqueue(a, "main", "h1").Entry
-	const reason = "forge_review_required"
-	// episode yields e (live) at the anchor's own epoch, backdates the stamp an
-	// hour, clears it, and returns the cleared episode.
-	episode := func(cont *YieldEpisode) (Entry, YieldEpisode) {
+	// episode yields e (live) at the anchor's own epoch for reason, backdates
+	// the stamp an hour, clears it, and returns the cleared episode.
+	episode := func(reason string, cont *YieldEpisode) (Entry, YieldEpisode) {
 		t.Helper()
 		got, err := f.store.Yield(ctx, e.ID, f.admitAt(e.ID), YieldMarker{Reason: reason, Continue: cont})
 		if err != nil {
@@ -2277,10 +2280,10 @@ func TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor(t *testing.T) {
 		}
 		f.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - interval '1 hour' WHERE id = $1`, e.ID)
 		y := f.entry(e.ID)
-		if _, err := f.store.ClearYield(ctx, e.ID, y.AnchoredHeadSHA, *y.YieldedAt); err != nil {
+		if _, err := f.store.ClearYield(ctx, e.ID, y.AnchoredHeadSHA, y.YieldRevision, false); err != nil {
 			t.Fatalf("ClearYield: %v", err)
 		}
-		return got, YieldEpisode{YieldedAt: *y.YieldedAt, HeadSHA: y.AnchoredHeadSHA, BaseSHA: y.AnchoredBaseSHA}
+		return got, YieldEpisode{YieldedAt: *y.YieldedAt, BaseRef: y.BaseRef}
 	}
 	fresh := func(why string, g Entry, ep YieldEpisode) {
 		t.Helper()
@@ -2289,45 +2292,40 @@ func TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor(t *testing.T) {
 		}
 	}
 
-	_, ep := episode(nil)
-	got, ep2 := episode(&ep)
+	_, ep := episode("forge_approval_absent", nil)
+	got, ep2 := episode("forge_approval_absent", &ep)
 	if got.YieldedAt == nil || !got.YieldedAt.Equal(ep.YieldedAt) || got.YieldAge < time.Hour {
-		t.Fatalf("same-anchor Yield yielded_at %v age %s, want the continued %v (age >= 1h)", got.YieldedAt, got.YieldAge, ep.YieldedAt)
+		t.Fatalf("same-base Yield yielded_at %v age %s, want the continued %v (age >= 1h)", got.YieldedAt, got.YieldAge, ep.YieldedAt)
 	}
 
-	// The head moved (a marker-less re-enqueue of the cleared held row).
+	// The head moved (a marker-less re-enqueue of the cleared held row) and
+	// the reason changed: the episode still continues (A3.7).
 	f.enqueue(a, "main", "h2")
-	got, ep3 := episode(&ep2)
-	fresh("moved head", got, ep2)
+	got, ep3 := episode("merge_checks_red", &ep2)
+	if got.YieldedAt == nil || !got.YieldedAt.Equal(ep2.YieldedAt) || got.AnchoredHeadSHA != "h2" {
+		t.Fatalf("moved-head, other-reason Yield yielded_at %v head %s, want the continued %v at h2", got.YieldedAt, got.AnchoredHeadSHA, ep2.YieldedAt)
+	}
 
-	// The base moved at the same head.
-	f.exec(`UPDATE merge_candidate_queue_entries SET anchored_base_sha = 'base-elsewhere' WHERE id = $1`, e.ID)
-	got, _ = episode(&ep3)
-	fresh("moved base", got, ep3)
+	// An episode cleared on another base ref is a new episode.
+	other := ep3
+	other.BaseRef = "release"
+	got, _ = episode("merge_checks_red", &other)
+	fresh("another base ref", got, other)
 
-	// Enqueue marking the unmarked held row: same anchor continues, a moved
-	// head (the re-anchor in the same transaction) is a new episode.
-	f.exec(`UPDATE merge_candidate_queue_entries SET anchored_base_sha = 'base-h2' WHERE id = $1`, e.ID)
-	_, ep4 := episode(nil)
-	mark := func(head string, cont *YieldEpisode) Entry {
-		t.Helper()
-		res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: a, BaseRef: "main", HeadSHA: head, BaseSHA: "base-" + head,
-			MergeIntent: true, Yield: &YieldMarker{Reason: reason, Continue: cont}})
-		if err != nil || !res.Marked {
-			t.Fatalf("Enqueue(%s, marker) = %+v, %v; want marked", head, res, err)
-		}
-		return f.entry(e.ID)
+	// Enqueue marking the unmarked held row: the same base continues even at
+	// a moved head (the re-anchor in the same transaction).
+	_, ep4 := episode("merge_checks_pending", nil)
+	res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: a, BaseRef: "main", HeadSHA: "h3", BaseSHA: "base-h3",
+		MergeIntent: true, Yield: &YieldMarker{Reason: "forge_approval_absent", Continue: &ep4}})
+	if err != nil || !res.Marked {
+		t.Fatalf("Enqueue(h3, marker) = %+v, %v; want marked", res, err)
 	}
-	if g := mark("h2", &ep4); g.YieldedAt == nil || !g.YieldedAt.Equal(ep4.YieldedAt) {
-		t.Fatalf("same-anchor Enqueue mark yielded_at %v, want the continued %v", g.YieldedAt, ep4.YieldedAt)
+	if g := f.entry(e.ID); g.YieldedAt == nil || !g.YieldedAt.Equal(ep4.YieldedAt) || g.AnchoredHeadSHA != "h3" {
+		t.Fatalf("Enqueue mark at a moved head: yielded_at %v head %s, want the continued %v at h3", g.YieldedAt, g.AnchoredHeadSHA, ep4.YieldedAt)
 	}
-	if _, err := f.store.ClearYield(ctx, e.ID, "h2", ep4.YieldedAt); err != nil {
-		t.Fatalf("ClearYield: %v", err)
-	}
-	fresh("Enqueue mark at a moved head", mark("h3", &ep4), ep4)
 }
 
-// TestUpdateYield_RewritesReasonOnly: the matching (head, yielded_at) rewrites
+// TestUpdateYield_RewritesReasonOnly: the matching (head, revision) rewrites
 // reason and detail and keeps yielded_at, the head and the wait anchor; a
 // stale key is refused and the stored reason is unchanged on read-back.
 func TestUpdateYield_RewritesReasonOnly(t *testing.T) {
@@ -2335,17 +2333,18 @@ func TestUpdateYield_RewritesReasonOnly(t *testing.T) {
 	ctx := context.Background()
 	e := f.enqueue(f.run(), "main", "h1").Entry
 	yieldedAt := f.markYielded(e.ID, "forge_approval_absent", time.Minute)
+	rev := f.entry(e.ID).YieldRevision
 
-	if _, err := f.store.UpdateYield(ctx, e.ID, "h0", yieldedAt, YieldMarker{Reason: "forge_approval_vetoed"}); !errors.Is(err, ErrStateConflict) {
+	if _, err := f.store.UpdateYield(ctx, e.ID, "h0", rev, YieldMarker{Reason: "forge_approval_vetoed"}); !errors.Is(err, ErrStateConflict) {
 		t.Fatalf("UpdateYield(stale head) err = %v, want ErrStateConflict", err)
 	}
 	if got := f.entry(e.ID); got.YieldReason != "forge_approval_absent" {
 		t.Fatalf("reason after a stale UpdateYield = %q, want unchanged", got.YieldReason)
 	}
-	if _, err := f.store.UpdateYield(ctx, e.ID, "h1", yieldedAt, YieldMarker{}); !errors.Is(err, ErrInvalidRequest) {
+	if _, err := f.store.UpdateYield(ctx, e.ID, "h1", rev, YieldMarker{}); !errors.Is(err, ErrInvalidRequest) {
 		t.Fatalf("UpdateYield(empty reason) err = %v, want ErrInvalidRequest", err)
 	}
-	got, err := f.store.UpdateYield(ctx, e.ID, "h1", yieldedAt, YieldMarker{Reason: "forge_approval_vetoed", Detail: "changes requested"})
+	got, err := f.store.UpdateYield(ctx, e.ID, "h1", rev, YieldMarker{Reason: "forge_approval_vetoed", Detail: "changes requested"})
 	if err != nil {
 		t.Fatalf("UpdateYield: %v", err)
 	}
@@ -2805,7 +2804,7 @@ func TestPromote_NewestPromoteWinsAndSurvivesUnadmitYieldClear(t *testing.T) {
 	if got, want := f.listRuns(mainBase()), []uuid.UUID{c, a, b, d}; !slices.Equal(got, want) {
 		t.Fatalf("while yielded = %v, want D last %v", got, want)
 	}
-	if _, err := f.store.ClearYield(ctx, dEntry.ID, y.AnchoredHeadSHA, *y.YieldedAt); err != nil {
+	if _, err := f.store.ClearYield(ctx, dEntry.ID, y.AnchoredHeadSHA, y.YieldRevision, false); err != nil {
 		t.Fatalf("ClearYield: %v", err)
 	}
 	if got, want := f.listRuns(mainBase()), []uuid.UUID{d, c, a, b}; !slices.Equal(got, want) {
@@ -3495,5 +3494,408 @@ func TestSetPhase_D8Steps(t *testing.T) {
 	}
 	if IntentFnTimeout != intentFnTimeout {
 		t.Fatalf("IntentFnTimeout = %s, want the lock's fn deadline %s", IntentFnTimeout, intentFnTimeout)
+	}
+}
+
+// --- docs/adr/112 Amendment A3 (#4780): the yield revision, the row-4 flag,
+// the retained approval anchor and the merge-gate window with its budget.
+// Every time offset is set in SQL relative to clock_timestamp().
+
+// gateWait calls GateWait, failing on an error.
+func (f *fixture) gateWait(id uuid.UUID, epoch int64, window time.Duration) GateWaitResult {
+	f.t.Helper()
+	res, err := f.store.GateWait(context.Background(), id, epoch, window)
+	if err != nil {
+		f.t.Fatalf("GateWait(%s, %d): %v", id, epoch, err)
+	}
+	return res
+}
+
+// readvance unadmits e at epoch and re-admits it, returning the new epoch.
+func (f *fixture) readvance(id uuid.UUID, epoch int64) int64 {
+	f.t.Helper()
+	if _, err := f.store.Unadmit(context.Background(), id, epoch); err != nil {
+		f.t.Fatalf("Unadmit: %v", err)
+	}
+	return f.admitAt(id)
+}
+
+// TestGateWait_OpensOncePerEpoch (T5, CF8 vehicle): the first call in an
+// admission epoch spends one token (3 to 2) and stamps the window's start and
+// epoch; a second call in the SAME epoch (a (b) hold, then a (c) hold) spends
+// nothing and continues the same start; a call in a NEW epoch (after a
+// readvance) opens a FRESH window. MECHANISM: the old window's start is
+// backdated a minute, so only the epoch comparison tells the re-advanced
+// epoch's fresh start from the kept one.
+func TestGateWait_OpensOncePerEpoch(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+
+	first := f.gateWait(e.ID, epoch, time.Hour)
+	if !first.Opened || first.Expired || first.NoToken || first.Entry.GateHoldTokens != 2 ||
+		first.Entry.GateWaitEpoch == nil || *first.Entry.GateWaitEpoch != epoch || first.Entry.GateWaitStartedAt == nil {
+		t.Fatalf("first GateWait = %+v, want opened, one token spent (2 left), window stamped at epoch %d", first, epoch)
+	}
+	second := f.gateWait(e.ID, epoch, time.Hour)
+	if second.Opened || second.Entry.GateHoldTokens != 2 || !second.Entry.GateWaitStartedAt.Equal(*first.Entry.GateWaitStartedAt) {
+		t.Fatalf("same-epoch GateWait = %+v, want the window continued with no spend", second)
+	}
+
+	f.exec(`UPDATE merge_candidate_queue_entries SET gate_wait_started_at = gate_wait_started_at - interval '1 minute' WHERE id = $1`, e.ID)
+	old := *f.entry(e.ID).GateWaitStartedAt
+	epoch2 := f.readvance(e.ID, epoch)
+	third := f.gateWait(e.ID, epoch2, time.Hour)
+	if !third.Opened || third.Entry.GateHoldTokens != 1 || *third.Entry.GateWaitEpoch != epoch2 || !third.Entry.GateWaitStartedAt.After(old) {
+		t.Fatalf("new-epoch GateWait = %+v, want a fresh window at epoch %d (start after %v), one more token spent", third, epoch2, old)
+	}
+}
+
+// TestGateWait_BudgetExhaustedReturnsNoToken (T6, CF9 vehicle): windows
+// opened in three distinct epochs with no elapsed refill time empty the
+// budget; the fourth epoch answers NoToken and writes NOTHING (re-read: the
+// third window and its epoch stand, zero tokens). MECHANISM: no refill time
+// passes, so only the decrement empties the bucket.
+func TestGateWait_BudgetExhaustedReturnsNoToken(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	for i := 0; i < GateHoldBudget; i++ {
+		if i > 0 {
+			epoch = f.readvance(e.ID, epoch)
+		}
+		if res := f.gateWait(e.ID, epoch, time.Hour); !res.Opened {
+			t.Fatalf("window %d = %+v, want opened", i+1, res)
+		}
+	}
+	before := f.entry(e.ID)
+	epoch4 := f.readvance(e.ID, epoch)
+	res := f.gateWait(e.ID, epoch4, time.Hour)
+	if !res.NoToken || res.Opened || res.Expired {
+		t.Fatalf("fourth-epoch GateWait = %+v, want NoToken", res)
+	}
+	after := f.entry(e.ID)
+	if after.GateHoldTokens != 0 || *after.GateWaitEpoch != epoch || !after.GateWaitStartedAt.Equal(*before.GateWaitStartedAt) ||
+		!after.GateTokensRefilledAt.Equal(*before.GateTokensRefilledAt) {
+		t.Fatalf("after NoToken = tokens %d epoch %v start %v, want nothing written (0, %d, %v)",
+			after.GateHoldTokens, after.GateWaitEpoch, after.GateWaitStartedAt, epoch, before.GateWaitStartedAt)
+	}
+}
+
+// TestGateWait_RefillRestoresOneTokenPerHour (T7, CF10 vehicle): an empty
+// bucket whose refill clock is 61 minutes old accrues one token and the open
+// spends it (0 left); one 181 minutes old accrues three, capped at the
+// budget before the spend (2 left), and its refill clock restarts at now.
+func TestGateWait_RefillRestoresOneTokenPerHour(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		ago     string
+		left    int
+		restart bool
+	}{
+		{"one hour accrues one token", "61 minutes", 0, false},
+		{"three hours cap at the budget", "181 minutes", GateHoldBudget - 1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			e := f.enqueue(f.run(), "main", "h1").Entry
+			epoch := f.admitAt(e.ID)
+			f.exec(`UPDATE merge_candidate_queue_entries SET gate_hold_tokens = 0,
+  gate_tokens_refilled_at = clock_timestamp() - $2::interval WHERE id = $1`, e.ID, tc.ago)
+			res := f.gateWait(e.ID, epoch, time.Hour)
+			if !res.Opened || res.Entry.GateHoldTokens != tc.left {
+				t.Fatalf("GateWait after %s = %+v, want opened with %d tokens left", tc.ago, res, tc.left)
+			}
+			var restarted, kept bool
+			if err := f.pool.QueryRow(context.Background(), `SELECT gate_tokens_refilled_at > clock_timestamp() - interval '1 minute',
+  gate_tokens_refilled_at <= clock_timestamp() FROM merge_candidate_queue_entries WHERE id = $1`, e.ID).Scan(&restarted, &kept); err != nil {
+				t.Fatalf("read the refill clock: %v", err)
+			}
+			if restarted != tc.restart || !kept {
+				t.Fatalf("refill clock restarted=%v (want %v), not past now=%v", restarted, tc.restart, kept)
+			}
+		})
+	}
+}
+
+// TestGateWait_FutureRefillClockAccruesNothing (approval condition "GateWait
+// refill"): a refill clock two hours in the FUTURE yields k clamped to 0 (a
+// negative k is never carried), so a bucket of one token opens and leaves 0,
+// and the clock is pulled back to now (it never moves past now).
+// Counterfactual: without the clamp at 0 the negative k empties the bucket
+// and the open answers NoToken, RED.
+func TestGateWait_FutureRefillClockAccruesNothing(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	f.exec(`UPDATE merge_candidate_queue_entries SET gate_hold_tokens = 1,
+  gate_tokens_refilled_at = clock_timestamp() + interval '2 hours' WHERE id = $1`, e.ID)
+	res := f.gateWait(e.ID, epoch, time.Hour)
+	if !res.Opened || res.NoToken || res.Entry.GateHoldTokens != 0 {
+		t.Fatalf("GateWait with a future refill clock = %+v, want opened with 0 tokens left", res)
+	}
+	var notPastNow bool
+	if err := f.pool.QueryRow(context.Background(), `SELECT gate_tokens_refilled_at <= clock_timestamp()
+FROM merge_candidate_queue_entries WHERE id = $1`, e.ID).Scan(&notPastNow); err != nil || !notPastNow {
+		t.Fatalf("refill clock after the open: not past now=%v (%v), want true", notPastNow, err)
+	}
+}
+
+// TestGateWait_NeverTouchesApprovalAnchor (T8, CF11 vehicle): across an
+// open, a continue and an expiry the approval anchor stays NULL and no
+// approval wait opens.
+func TestGateWait_NeverTouchesApprovalAnchor(t *testing.T) {
+	f := newFixture(t)
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	check := func(why string) {
+		t.Helper()
+		if g := f.entry(e.ID); g.ApprovalWaitStartedAt != nil || g.ApprovalWaitOpen {
+			t.Fatalf("%s: approval anchor %v open=%v, want NULL and closed", why, g.ApprovalWaitStartedAt, g.ApprovalWaitOpen)
+		}
+	}
+	f.gateWait(e.ID, epoch, time.Hour)
+	check("open")
+	f.gateWait(e.ID, epoch, time.Hour)
+	check("continue")
+	f.exec(`UPDATE merge_candidate_queue_entries SET gate_wait_started_at = clock_timestamp() - interval '2 hours' WHERE id = $1`, e.ID)
+	if res := f.gateWait(e.ID, epoch, time.Hour); !res.Expired {
+		t.Fatalf("backdated window = %+v, want expired", res)
+	}
+	check("expiry")
+}
+
+// TestGateWait_CASAndExpiry (T9): a held row and a stale epoch are
+// ErrStateConflict with NOTHING written (re-read: full budget, no window); a
+// non-positive window is ErrInvalidRequest; expiry is judged on the database
+// clock against the window's start (a fresh window has time remaining, a
+// backdated one is expired with none).
+func TestGateWait_CASAndExpiry(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	untouched := func(why string) {
+		t.Helper()
+		if g := f.entry(e.ID); g.GateHoldTokens != GateHoldBudget || g.GateWaitStartedAt != nil || g.GateWaitEpoch != nil {
+			t.Fatalf("%s: entry = tokens %d window %v/%v, want nothing written", why, g.GateHoldTokens, g.GateWaitStartedAt, g.GateWaitEpoch)
+		}
+	}
+	if _, err := f.store.GateWait(ctx, e.ID, 0, time.Hour); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("GateWait(held) err = %v, want ErrStateConflict", err)
+	}
+	untouched("held")
+	epoch := f.admitAt(e.ID)
+	if _, err := f.store.GateWait(ctx, e.ID, epoch-1, time.Hour); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("GateWait(stale epoch) err = %v, want ErrStateConflict", err)
+	}
+	untouched("stale epoch")
+	for _, w := range []time.Duration{0, -time.Minute} {
+		if _, err := f.store.GateWait(ctx, e.ID, epoch, w); !errors.Is(err, ErrInvalidRequest) {
+			t.Errorf("GateWait(window %s) err = %v, want ErrInvalidRequest", w, err)
+		}
+	}
+	untouched("invalid window")
+	if res := f.gateWait(e.ID, epoch, time.Hour); res.Expired || res.Remaining <= 0 || res.Remaining > time.Hour {
+		t.Fatalf("fresh window = %+v, want unexpired with (0, 1h] remaining", res)
+	}
+	f.exec(`UPDATE merge_candidate_queue_entries SET gate_wait_started_at = clock_timestamp() - interval '61 minutes' WHERE id = $1`, e.ID)
+	if res := f.gateWait(e.ID, epoch, time.Hour); !res.Expired || res.Remaining != 0 || res.Opened {
+		t.Fatalf("backdated window = %+v, want expired with nothing remaining, not re-opened", res)
+	}
+}
+
+// yieldLive admits e and yields it with m, returning the yielded entry.
+func (f *fixture) yieldLive(id uuid.UUID, m YieldMarker) Entry {
+	f.t.Helper()
+	y, err := f.store.Yield(context.Background(), id, f.admitAt(id), m)
+	if err != nil {
+		f.t.Fatalf("Yield: %v", err)
+	}
+	return y
+}
+
+// TestYieldRevision_EveryMarkerWriteBumps (T10, CF12 vehicle): a marked
+// insert starts at revision 1, and Yield, UpdateYield, ReanchorYielded,
+// ClearYield and Enqueue's mark of an unmarked held row each bump the
+// revision by exactly one; a marker-less re-anchor does not.
+func TestYieldRevision_EveryMarkerWriteBumps(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	ins, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: f.run(), BaseRef: "main", HeadSHA: "m1", Yield: &YieldMarker{Reason: "forge_approval_absent"}})
+	if err != nil || ins.Entry.YieldRevision != 1 {
+		t.Fatalf("marked insert revision = %d (%v), want 1", ins.Entry.YieldRevision, err)
+	}
+	a := f.run()
+	e := f.enqueue(a, "main", "h1").Entry
+	if e.YieldRevision != 0 {
+		t.Fatalf("unmarked insert revision = %d, want 0", e.YieldRevision)
+	}
+	want := int64(0)
+	step := func(op string, got Entry, err error) {
+		t.Helper()
+		if err != nil {
+			t.Fatalf("%s: %v", op, err)
+		}
+		want++
+		if got.YieldRevision != want || f.entry(e.ID).YieldRevision != want {
+			t.Fatalf("%s: revision = %d (read %d), want %d", op, got.YieldRevision, f.entry(e.ID).YieldRevision, want)
+		}
+	}
+	y, err := f.store.Yield(ctx, e.ID, f.admitAt(e.ID), YieldMarker{Reason: "forge_approval_absent"})
+	step("Yield", y, err)
+	u, err := f.store.UpdateYield(ctx, e.ID, "h1", y.YieldRevision, YieldMarker{Reason: "merge_checks_red"})
+	step("UpdateYield", u, err)
+	r, err := f.store.ReanchorYielded(ctx, e.ID, "h1", u.YieldRevision, "h2", "")
+	step("ReanchorYielded", r, err)
+	c, err := f.store.ClearYield(ctx, e.ID, "h2", r.YieldRevision, false)
+	step("ClearYield", c, err)
+	res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: a, BaseRef: "main", HeadSHA: "h2", Yield: &YieldMarker{Reason: "forge_approval_absent"}})
+	step("Enqueue mark", res.Entry, err)
+	plain := f.enqueue(a, "main", "h3")
+	if plain.Entry.YieldRevision != want {
+		t.Fatalf("marker-less re-anchor revision = %d, want unchanged %d", plain.Entry.YieldRevision, want)
+	}
+}
+
+// TestClearYield_StaleRevisionRefused (T11, CF13 vehicle): a probe reads the
+// entry at revision r; the marker clears, then re-yields CONTINUING the same
+// yielded_at at the same head; the delayed probe's ClearYield at r is
+// ErrStateConflict and a READ shows the marker still set. MECHANISM: the
+// continued episode reuses (head, yielded_at), so only the revision separates
+// the old marker from the new.
+func TestClearYield_StaleRevisionRefused(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	read := f.yieldLive(e.ID, YieldMarker{Reason: "merge_checks_red"})
+	if _, err := f.store.ClearYield(ctx, e.ID, "h1", read.YieldRevision, false); err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+	again := f.yieldLive(e.ID, YieldMarker{Reason: "merge_checks_red", Continue: &YieldEpisode{YieldedAt: *read.YieldedAt, BaseRef: "main"}})
+	if !again.YieldedAt.Equal(*read.YieldedAt) || again.AnchoredHeadSHA != read.AnchoredHeadSHA {
+		t.Fatalf("re-yield = %v at %s, want the continued %v at the same head", again.YieldedAt, again.AnchoredHeadSHA, read.YieldedAt)
+	}
+	if _, err := f.store.ClearYield(ctx, e.ID, "h1", read.YieldRevision, false); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale ClearYield err = %v, want ErrStateConflict", err)
+	}
+	if g := f.entry(e.ID); !g.Yielded() || g.YieldReason != "merge_checks_red" {
+		t.Fatalf("after the stale clear = %+v, want the newer marker standing", g)
+	}
+}
+
+// TestUpdateYield_StaleRevisionCannotOverwriteNewerReason (T12): a probe
+// reads revision r; a newer probe transitions the reason (same head and
+// yielded_at); the delayed probe's UpdateYield at r is ErrStateConflict and a
+// READ shows the newer reason intact.
+func TestUpdateYield_StaleRevisionCannotOverwriteNewerReason(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	read := f.yieldLive(e.ID, YieldMarker{Reason: "merge_checks_pending"})
+	if _, err := f.store.UpdateYield(ctx, e.ID, "h1", read.YieldRevision, YieldMarker{Reason: "merge_checks_red"}); err != nil {
+		t.Fatalf("newer UpdateYield: %v", err)
+	}
+	if _, err := f.store.UpdateYield(ctx, e.ID, "h1", read.YieldRevision, YieldMarker{Reason: "merge_review_pending"}); !errors.Is(err, ErrStateConflict) {
+		t.Fatalf("stale UpdateYield err = %v, want ErrStateConflict", err)
+	}
+	if g := f.entry(e.ID); g.YieldReason != "merge_checks_red" || !g.YieldedAt.Equal(*read.YieldedAt) {
+		t.Fatalf("after the stale update = %q at %v, want merge_checks_red in the episode %v", g.YieldReason, g.YieldedAt, read.YieldedAt)
+	}
+}
+
+// TestRow4Flag_Lifecycle (T13, CF14 vehicle): a Row4 Yield sets row4_flag;
+// an UpdateYield to merge_checks_red (no Row4) keeps it; ClearYield(clearRow4
+// false) keeps it; a later ClearYield(clearRow4 true) clears it.
+func TestRow4Flag_Lifecycle(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	y := f.yieldLive(e.ID, YieldMarker{Reason: "forge_review_required", Row4: true})
+	if !y.Row4Flag {
+		t.Fatal("a Row4 Yield did not set row4_flag")
+	}
+	u, err := f.store.UpdateYield(ctx, e.ID, "h1", y.YieldRevision, YieldMarker{Reason: "merge_checks_red"})
+	if err != nil || !u.Row4Flag || !f.entry(e.ID).Row4Flag {
+		t.Fatalf("UpdateYield to merge_checks_red: flag=%v (%v), want kept", u.Row4Flag, err)
+	}
+	c, err := f.store.ClearYield(ctx, e.ID, "h1", u.YieldRevision, false)
+	if err != nil || !c.Row4Flag || !f.entry(e.ID).Row4Flag {
+		t.Fatalf("ClearYield(clearRow4=false): flag=%v (%v), want kept", c.Row4Flag, err)
+	}
+	y2 := f.yieldLive(e.ID, YieldMarker{Reason: "merge_checks_red"})
+	if !y2.Row4Flag {
+		t.Fatal("a non-Row4 Yield cleared row4_flag")
+	}
+	c2, err := f.store.ClearYield(ctx, e.ID, "h1", y2.YieldRevision, true)
+	if err != nil || c2.Row4Flag || f.entry(e.ID).Row4Flag {
+		t.Fatalf("ClearYield(clearRow4=true): flag=%v (%v), want cleared", c2.Row4Flag, err)
+	}
+}
+
+// TestClearYield_RetainsApprovalAnchorAndClosesWait (T14, CF15 vehicle):
+// ApprovalWait stamps the anchor and opens the wait; a yield keeps both; a
+// clear RETAINS the anchor (docs/adr/112 A3.7) and closes the wait.
+func TestClearYield_RetainsApprovalAnchorAndClosesWait(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	wait := f.approvalWait(e.ID, epoch, time.Hour)
+	if !wait.Entry.ApprovalWaitOpen {
+		t.Fatal("ApprovalWait did not open the wait")
+	}
+	y, err := f.store.Yield(ctx, e.ID, epoch, YieldMarker{Reason: "forge_approval_absent"})
+	if err != nil || !y.ApprovalWaitOpen {
+		t.Fatalf("Yield: open=%v (%v), want the wait kept open", y.ApprovalWaitOpen, err)
+	}
+	c, err := f.store.ClearYield(ctx, e.ID, "h1", y.YieldRevision, false)
+	if err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+	for _, g := range []Entry{c, f.entry(e.ID)} {
+		if g.ApprovalWaitStartedAt == nil || !g.ApprovalWaitStartedAt.Equal(*wait.Entry.ApprovalWaitStartedAt) || g.ApprovalWaitOpen {
+			t.Fatalf("cleared entry anchor %v open=%v, want the anchor %v retained and the wait closed",
+				g.ApprovalWaitStartedAt, g.ApprovalWaitOpen, wait.Entry.ApprovalWaitStartedAt)
+		}
+	}
+}
+
+// TestApprovalWait_RetainedAnchorAfterClear (approval condition "A3.7
+// approval anchor, rule (i)", the STORE pair): (i) an approval wait whose
+// anchor is past the window, then a yield and a clear, then a re-admission
+// in a LATER epoch: ApprovalWait reports EXPIRED at once (the anchor is
+// continued, no fresh window) and re-opens the wait; (ii) a readvance after
+// the clear leaves the retained anchor with the wait CLOSED, so a
+// non-approval hold is never expired by it. Counterfactuals: restoring
+// ClearYield's `approval_wait_started_at = NULL` stamps a fresh anchor in
+// (i), not expired, RED; dropping ClearYield's `approval_wait_open = false`
+// leaves the wait open in (ii), RED.
+func TestApprovalWait_RetainedAnchorAfterClear(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	e := f.enqueue(f.run(), "main", "h1").Entry
+	epoch := f.admitAt(e.ID)
+	f.approvalWait(e.ID, epoch, time.Hour)
+	f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = clock_timestamp() - interval '2 hours' WHERE id = $1`, e.ID)
+	anchor := *f.entry(e.ID).ApprovalWaitStartedAt
+	y, err := f.store.Yield(ctx, e.ID, epoch, YieldMarker{Reason: "forge_approval_absent"})
+	if err != nil {
+		t.Fatalf("Yield: %v", err)
+	}
+	if _, err := f.store.ClearYield(ctx, e.ID, "h1", y.YieldRevision, false); err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+
+	// (ii) a readvance after the clear: the anchor is retained, the wait closed.
+	epoch2 := f.admitAt(e.ID)
+	epoch3 := f.readvance(e.ID, epoch2)
+	if g := f.entry(e.ID); g.ApprovalWaitStartedAt == nil || !g.ApprovalWaitStartedAt.Equal(anchor) || g.ApprovalWaitOpen {
+		t.Fatalf("(ii) after a readvance = anchor %v open=%v, want %v retained and the wait closed", g.ApprovalWaitStartedAt, g.ApprovalWaitOpen, anchor)
+	}
+
+	// (i) an approval-fold block in the later epoch: expired at once.
+	res := f.approvalWait(e.ID, epoch3, time.Hour)
+	if !res.Expired || res.Remaining != 0 || !res.Entry.ApprovalWaitStartedAt.Equal(anchor) || !res.Entry.ApprovalWaitOpen {
+		t.Fatalf("(i) ApprovalWait in a later epoch = %+v, want expired at once on the retained anchor %v, the wait re-opened", res, anchor)
 	}
 }
