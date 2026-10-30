@@ -187,12 +187,15 @@ func TestRedPass_RouteRefusedNamesFixupStage(t *testing.T) {
 	}
 }
 
-// Exactly once: a redelivered settle of the same entry writes no second row.
-// MECHANISM: writing the row regardless of SettleResult.Settled appends a
-// second row on the redelivery.
+// Exactly once: a redelivered settle of the same entry writes no second row,
+// and a real NON-ejected settle (b dropped) writes none. MECHANISM: writing
+// the row regardless of SettleResult.Settled appends a second row on the
+// redelivery; a writer that appended merge_queue_ejected on every settling
+// call writes a row for b's drop (RED on b's rows). Sibling:
+// TestEjectionRow_DroppedSettleWritesNone pins the drop alone.
 func TestEjectionRow_WrittenOnlyByTheSettlingCall(t *testing.T) {
 	f := newMCQFixture(t)
-	a, _ := f.wave()
+	a, b := f.wave()
 	st, found, err := f.store.ActiveForRun(context.Background(), a.id)
 	if err != nil || !found {
 		t.Fatalf("active entry: %v %v", found, err)
@@ -211,9 +214,21 @@ func TestEjectionRow_WrittenOnlyByTheSettlingCall(t *testing.T) {
 		t.Fatalf("redelivered SettleAt = %v, want admitSettled", out)
 	}
 	f.oneEjection(a, mergeCandidateQueueReasonPassNotStartable, mergeQueueEjectNextGetRunStatus)
-	// A non-ejected settle writes none.
-	if rows := f.rows(a, CategoryMergeQueueEjected); len(rows) != 1 {
-		t.Fatalf("rows = %d", len(rows))
+	// A real non-ejected settle: b's entry (live or held after a's settle
+	// pumped the base, read fresh) dropped writes no row.
+	bst, found, err := f.store.ActiveForRun(context.Background(), b.id)
+	if err != nil || !found {
+		t.Fatalf("b active entry: %v %v", found, err)
+	}
+	if _, ok := f.srv.settleMergeCandidateQueueEntryWith(context.Background(), bst.Entry, mergequeue.StateDropped,
+		mergeCandidateQueueReasonRunTerminal, nil); !ok {
+		t.Fatal("dropping b's entry did not settle it")
+	}
+	if rows := f.ejectedRows(a); len(rows) != 1 {
+		t.Fatalf("a merge_queue_ejected rows = %d, want 1", len(rows))
+	}
+	if rows := f.ejectedRows(b); len(rows) != 0 {
+		t.Fatalf("b merge_queue_ejected rows = %v, want none for a drop", rows)
 	}
 }
 

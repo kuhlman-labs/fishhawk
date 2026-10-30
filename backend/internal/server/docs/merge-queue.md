@@ -933,7 +933,12 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   (the pre-lock `onlyChecksNotGreen` rule), so slow CI never ejects; only the
   forge's own refusal of the merge PUT ejects, and its `forge_detail` /
   remedy say the checks were not settled at the merge attempt (remedy:
-  `fishhawk_merge_run` once they settle).
+  `fishhawk_merge_run` once they settle). The `checks_not_settled`
+  `forge_detail` is a short fixed lead (`mergeQueueChecksNotSettledDetail`)
+  plus the forge's text sanitised BEFORE the lead is added, so a realistic
+  forge message survives the 300-byte `forgeApprovalDetailMaxBytes` bound
+  both sinks re-apply; the remedy (closed vocabulary) carries the asymmetry
+  (#4705).
 - **Automatic re-entry (`merge_queue_reentry.go`).** `sweepMergeQueueReentries`
   runs on the yield re-probe ticker after `sweepMergeQueueYields`. Each
   `mergequeue.ReentryReader` candidate (an ejected `verify_failed` row with

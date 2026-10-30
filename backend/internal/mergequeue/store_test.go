@@ -2630,6 +2630,143 @@ func TestPromote_AlreadyFirstNoop(t *testing.T) {
 	})
 }
 
+// parkPromote installs an afterPromotePosition hook that parks the FIRST
+// Promote to reach it (after its base lock and position read, before its
+// order-key write) until release closes; parked closes when it is parked.
+// Every later caller passes straight through: a sync.Once would block them
+// inside the hook until the first returns, so a second Promote would wait
+// there whether or not the base lock held it.
+func (f *fixture) parkPromote() (parked, release chan struct{}) {
+	parked, release = make(chan struct{}), make(chan struct{})
+	var first atomic.Bool
+	f.store.afterPromotePosition = func(context.Context) {
+		if first.CompareAndSwap(false, true) {
+			close(parked)
+			<-release
+		}
+	}
+	return parked, release
+}
+
+// promoteResult is one goroutine's Promote answer.
+type promoteResult struct {
+	p   Promotion
+	err error
+}
+
+// TestPromote_ConcurrentPromotesSerializeOnTheBaseLock: A promotes r3 and
+// parks holding the base lock; B promotes r2 and must wait for A. B then reads
+// A's committed key (OldPosition 3) and goes ahead of it, so the order is r2,
+// r3, r1. Each goroutine records into its OWN promoteRecorder, so a -race RED
+// cannot come from shared fake state. MECHANISM: with Promote's base lock
+// removed, B completes while A is parked (RED), reads OldPosition 2 because A
+// has written nothing, and A then keys ahead of B (order r3, r2, r1: RED).
+func TestPromote_ConcurrentPromotesSerializeOnTheBaseLock(t *testing.T) {
+	f := newFixture(t)
+	r1, r2, r3 := f.run(), f.run(), f.run()
+	for i, r := range []uuid.UUID{r1, r2, r3} {
+		f.enqueue(r, "main", fmt.Sprintf("h%d", i))
+	}
+	parked, release := f.parkPromote()
+	recA, recB := &promoteRecorder{}, &promoteRecorder{}
+	aDone, bDone := make(chan promoteResult, 1), make(chan promoteResult, 1)
+	go func() {
+		p, err := f.store.Promote(context.Background(), PromoteRequest{RunID: r3, Record: recA.record})
+		aDone <- promoteResult{p, err}
+	}()
+	<-parked
+	go func() {
+		p, err := f.store.Promote(context.Background(), PromoteRequest{RunID: r2, Record: recB.record})
+		bDone <- promoteResult{p, err}
+	}()
+	var early *promoteResult
+	select {
+	case res := <-bDone:
+		early = &res
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+	close(release)
+	a := <-aDone
+	if early != nil {
+		t.Fatalf("Promote(r2) completed while Promote(r3) was parked holding the base lock: %+v, %v", early.p, early.err)
+	}
+	b := <-bDone
+	if a.err != nil || b.err != nil {
+		t.Fatalf("Promote errors: A %v, B %v", a.err, b.err)
+	}
+	if !a.p.Changed || a.p.OldPosition != 3 || a.p.NewPosition != 1 || len(recA.calls) != 1 {
+		t.Fatalf("A = %+v (records %d), want Changed 3 -> 1 recorded once", a.p, len(recA.calls))
+	}
+	if !b.p.Changed || b.p.OldPosition != 3 || b.p.NewPosition != 1 || len(recB.calls) != 1 {
+		t.Fatalf("B = %+v (records %d), want Changed 3 -> 1 (it saw A's committed key) recorded once", b.p, len(recB.calls))
+	}
+	if got, want := f.listRuns(mainBase()), []uuid.UUID{r2, r3, r1}; !slices.Equal(got, want) {
+		t.Fatalf("ListForBase = %v, want r2, r3, r1 %v", got, want)
+	}
+	ka, kb := f.status(r3).Entry.OrderKey, f.status(r2).Entry.OrderKey
+	if ka == nil || kb == nil || !kb.Before(*ka) {
+		t.Fatalf("order keys A %v B %v, want B's strictly before A's", ka, kb)
+	}
+}
+
+// TestPromote_ConcurrentAdmitNextWaitsForThePromotion: A promotes r3 and
+// parks holding the base lock; a concurrent AdmitNext must wait for A and
+// then admit the promoted head r3, not the FIFO head r1. MECHANISM: with
+// Promote's base lock removed, AdmitNext completes while A is parked and
+// admits r1: RED.
+func TestPromote_ConcurrentAdmitNextWaitsForThePromotion(t *testing.T) {
+	f := newFixture(t)
+	r1, r2, r3 := f.run(), f.run(), f.run()
+	for i, r := range []uuid.UUID{r1, r2, r3} {
+		f.enqueue(r, "main", fmt.Sprintf("h%d", i))
+	}
+	parked, release := f.parkPromote()
+	rec := &promoteRecorder{}
+	aDone := make(chan promoteResult, 1)
+	go func() {
+		p, err := f.store.Promote(context.Background(), PromoteRequest{RunID: r3, Record: rec.record})
+		aDone <- promoteResult{p, err}
+	}()
+	<-parked
+	type admitResult struct {
+		adm Admission
+		err error
+	}
+	admDone := make(chan admitResult, 1)
+	go func() {
+		adm, err := f.store.AdmitNext(context.Background(), mainBase())
+		admDone <- admitResult{adm, err}
+	}()
+	var early *admitResult
+	select {
+	case res := <-admDone:
+		early = &res
+	case <-time.After(timescale.D(300 * time.Millisecond)):
+	}
+	close(release)
+	a := <-aDone
+	if early != nil {
+		admitted := uuid.Nil
+		if early.adm.Entry != nil {
+			admitted = early.adm.Entry.RunID
+		}
+		t.Fatalf("AdmitNext completed while Promote(r3) was parked holding the base lock: admitted run %s (r1 %s, r3 %s), err %v", admitted, r1, r3, early.err)
+	}
+	adm := <-admDone
+	if a.err != nil || adm.err != nil {
+		t.Fatalf("errors: Promote %v, AdmitNext %v", a.err, adm.err)
+	}
+	if !a.p.Changed || a.p.OldPosition != 3 || a.p.NewPosition != 1 {
+		t.Fatalf("Promote(r3) = %+v, want Changed 3 -> 1", a.p)
+	}
+	if !adm.adm.Admitted || adm.adm.Entry == nil || adm.adm.Entry.RunID != r3 {
+		t.Fatalf("AdmitNext = %+v, want r3 (the promoted head) admitted, not the FIFO head r1", adm.adm)
+	}
+	if live := f.count(`state = 'live'`); live != 1 || f.status(r3).Entry.State != StateLive {
+		t.Fatalf("live entries = %d (r3 %s), want r3 the only live entry", live, f.status(r3).Entry.State)
+	}
+}
+
 // TestPromote_NewestPromoteWinsAndSurvivesUnadmitYieldClear: a second promote
 // goes ahead of the first; the promoted entry keeps its order key across an
 // Unadmit, a Yield (it sorts last while marked) and a ClearYield (it rejoins
@@ -2958,8 +3095,13 @@ func TestReentryCandidates(t *testing.T) {
 // TestReentryCandidates_KeysetCursorPages: the exclusive (settled_at, id)
 // cursor pages the oldest-first order without skipping or repeating a row,
 // breaking a settled_at tie on id; nil starts at the oldest (#4297: the
-// sweep pages past never-passing candidates). Ignoring the cursor re-reads
-// the first page forever: RED.
+// sweep pages past never-passing candidates). The b/c settled_at tie
+// STRADDLES the 2-row page boundary (#4705): page 1 ends on the lower-id
+// tied row, so a settled_at-only cursor skips the higher-id tied row (>) or
+// repeats it (>=), and only the (settled_at, id) row comparison passes. A
+// tie inside one page (the earlier c/d fixture) stays GREEN under a
+// settled_at-only cursor. Ignoring the cursor re-reads the first page
+// forever: RED.
 func TestReentryCandidates_KeysetCursorPages(t *testing.T) {
 	f := newFixture(t)
 	ctx := context.Background()
@@ -2967,11 +3109,12 @@ func TestReentryCandidates_KeysetCursorPages(t *testing.T) {
 	b := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 3*time.Hour)
 	c := f.seedEjected(f.run(), StateEjected, ReentryReason, true, 2*time.Hour)
 	d := f.seedEjected(f.run(), StateEjected, ReentryReason, true, time.Hour)
-	f.exec(`UPDATE merge_candidate_queue_entries SET settled_at = (SELECT settled_at FROM merge_candidate_queue_entries WHERE id = $1) WHERE id = $2`, c, d)
-	want := []uuid.UUID{a, b, c, d}
-	if bytes.Compare(d[:], c[:]) < 0 {
-		want = []uuid.UUID{a, b, d, c}
+	f.exec(`UPDATE merge_candidate_queue_entries SET settled_at = (SELECT settled_at FROM merge_candidate_queue_entries WHERE id = $1) WHERE id = $2`, b, c)
+	lo, hi := b, c
+	if bytes.Compare(c[:], b[:]) < 0 {
+		lo, hi = c, b
 	}
+	want := []uuid.UUID{a, lo, hi, d}
 	var got []uuid.UUID
 	var after *ReentryCursor
 	for pages := 0; ; pages++ {

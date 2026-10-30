@@ -65,11 +65,14 @@ const (
 )
 
 // mergeQueueChecksNotSettledDetail leads a checks_not_settled refusal's
-// forge_detail. The asymmetry is DELIBERATE (ADR-112 R3 row 5, ADR-093 D4):
-// pending checks HOLD before dispatch (merge-on-pass's onlyChecksNotGreen
-// rule), so slow CI never ejects; only a refusal from the forge's own merge
-// PUT ejects, and it is attempted exactly once.
-const mergeQueueChecksNotSettledDetail = "the checks were not settled at the merge attempt (the forge refused the pinned merge; pending checks hold before dispatch, only the forge's own refusal ejects): "
+// forge_detail. The lead stays short so the forge's own text, sanitised
+// BEFORE the lead is added (mergeQueueYieldDetail), keeps most of the
+// forgeApprovalDetailMaxBytes budget both sinks re-apply (#4705). The
+// remedy (mergeQueueEjectRemedy, closed vocabulary) states the DELIBERATE
+// asymmetry (ADR-112 R3 row 5, ADR-093 D4): pending checks HOLD before
+// dispatch, so slow CI never ejects; only the forge's own refusal of the
+// merge PUT ejects, and it is attempted exactly once.
+const mergeQueueChecksNotSettledDetail = "the checks were not settled at the merge attempt: "
 
 // mergeQueueForgeReasonFor maps a TYPED forge merge refusal to its code, or
 // "" for any other error.

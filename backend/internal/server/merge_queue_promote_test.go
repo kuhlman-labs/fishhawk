@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -352,6 +353,57 @@ func TestMergeQueuePromote_StoreRefusalsMapped(t *testing.T) {
 			t.Fatalf("merge_queue_promoted rows = %+v, want none", rows)
 		}
 	})
+}
+
+// TestMergeQueuePromote_YieldedFallbackNamesNone pins the ErrEntryYielded
+// fallback in writeMergeQueuePromoteError: the yield_reason and its next_step
+// are named ONLY when the follow-up ActiveForRun read succeeds, finds the
+// entry and finds it still yielded; every other answer falls back to
+// next_step none with no yield_reason. One arm per leg of the guard, each
+// faking a Status that carries a yielded entry (or a forge_approval_absent
+// reason) the guard must ignore. MECHANISM: dropping `rerr == nil` turns
+// "read error" RED, dropping `found` turns "not found" RED, dropping
+// `st.Entry.Yielded()` turns "no longer yielded" RED — each then emits
+// yield_reason and next_step approve_pr.
+func TestMergeQueuePromote_YieldedFallbackNamesNone(t *testing.T) {
+	runID := uuid.New()
+	yieldedAt := time.Now()
+	yielded := mergequeue.Status{Entry: mergequeue.Entry{ID: uuid.New(), RunID: runID, State: mergequeue.StateHeld,
+		YieldReason: mergeCandidateQueueReasonForgeApprovalAbsent, YieldedAt: &yieldedAt}}
+	unmarked := yielded
+	unmarked.Entry.YieldedAt = nil
+	cases := []struct {
+		name   string
+		status mergequeue.Status
+		found  bool
+		err    error
+	}{
+		{name: "read error", status: yielded, found: true, err: errors.New("injected ActiveForRun failure")},
+		{name: "not found", status: yielded, found: false},
+		{name: "no longer yielded", status: unmarked, found: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			q := &mcqFaultStore{activeForRun: func(uuid.UUID) (mergequeue.Status, bool, error) { return tc.status, tc.found, tc.err }}
+			srv := New(Config{Addr: "127.0.0.1:0", MergeQueue: q})
+			req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/merge-queue/promote", nil)
+			rec := httptest.NewRecorder()
+			srv.writeMergeQueuePromoteError(rec, req, runID, fmt.Errorf("promote: %w", mergequeue.ErrEntryYielded))
+			code, details := promoteErrorCode(t, rec)
+			if rec.Code != http.StatusConflict || code != mqPromoteCodeEntryYielded {
+				t.Fatalf("yielded fallback = %d %s, want 409 %s:\n%s", rec.Code, code, mqPromoteCodeEntryYielded, rec.Body.String())
+			}
+			if n := q.called("ActiveForRun"); n != 1 {
+				t.Fatalf("ActiveForRun calls = %d, want 1 (the fallback reads the entry)", n)
+			}
+			if _, ok := details["yield_reason"]; ok || details["next_step"] != mergeQueueYieldNextNone || details["run_id"] != runID.String() {
+				t.Fatalf("details = %v, want next_step %s, run_id %s and no yield_reason", details, mergeQueueYieldNextNone, runID)
+			}
+			if !strings.Contains(rec.Body.String(), "("+mergeQueueYieldNextNone+")") {
+				t.Fatalf("message does not name (%s):\n%s", mergeQueueYieldNextNone, rec.Body.String())
+			}
+		})
+	}
 }
 
 // TestMergeQueuePromote_AuditAppendFailureRollsBack: the merge_queue_promoted
