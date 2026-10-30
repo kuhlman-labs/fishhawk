@@ -219,6 +219,8 @@ The provisioned preview runs untrusted merge-candidate code. When the preview sh
 
 The dogfood `scripts/dev preview` implements exactly this (a normalized non-superuser `fishhawk_preview` role, E31.19 / #1577); mirror the posture in a custom provision command.
 
+**The agent cannot signal the preview (macOS, #4855).** The acceptance agent runs under the runner's Seatbelt profile, which carries signal confinement: no process in its tree can signal a process outside its own sandbox instance, so a `kill`, `pkill` or `killall` aimed at the preview, the host `fishhawkd` or another stage's processes fails `EPERM` (the #4855 incident: a `pkill` by name from the agent's shell stopped the host `fishhawkd` and the stage's own preview mid-stage). Processes the agent itself started stay killable. Tearing the preview down stays the runner's job, through the teardown hook above. Linux has no equivalent; there the agent can still signal any same-user process. Contract, empirical matrix and residuals: `runner/internal/netsandbox/README.md` § "Signal confinement".
+
 ## Worked example: docker-compose
 
 A self-contained provision/teardown pair using Docker Compose. It builds and serves the merge candidate at `FISHHAWK_PREVIEW_SHA` and exposes `/healthz` with a matching `git_sha`.

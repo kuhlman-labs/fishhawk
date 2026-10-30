@@ -6,6 +6,8 @@ OS-level confinement of the acceptance agent's WHOLE process tree (E72 / [#3393]
 
 The ADR-050 containment was carried ENTIRELY in environment variables — `HTTP(S)_PROXY` → the egress proxy, `NO_PROXY` cleared, `FISHHAWK_FORGE_WRITES=deny` (#3500), forge credentials withheld by `acceptenv`. Env binds cooperating processes only. In the #3393 incident a nested `fishhawk-runner` spawned with `env -i` inherited none of it; the runner's credential ladder (`gh auth token` reads the operator keyring, the backend installation-token endpoint is signature-authed off a run id) is NOT env-sourced, so withholding credentials from the env did not stop it, and it pushed to the real repository. A Seatbelt profile applied by `sandbox-exec(1)` is inherited by every descendant regardless of its env: a direct `connect()` to anything but the admitted loopback ports fails with `EPERM` in the kernel.
 
+Neither control stops a descendant SIGNALLING a process outside its tree: in the #4855 incident an acceptance agent's `pkill` by name stopped the host `fishhawkd` and its own preview mid-stage. `WithSignalConfinement` closes that in the same profile (§ "Signal confinement" below).
+
 The network deny stops the push; it does not stop a descendant READING the host's forge credentials (`~/.config/gh`, `~/.git-credentials`, `~/.ssh/*`, `gh auth token` against the keychain, the ssh-agent socket) and carrying them out through any channel the proxy admits. `WithCredentialDeny` (E72.40 / [#3792](https://github.com/kuhlman-labs/fishhawk/issues/3792)) closes those surfaces in the same profile; the runner's synthetic HOME and git pins (`acceptenv.IsolateCredentials`) are the cooperating-process half, this is the half a descendant cannot opt out of.
 
 ## Mechanism and profile grammar
@@ -22,6 +24,17 @@ The network deny stops the push; it does not stop a descendant READING the host'
 Admitted ports: the proxy's own port ALWAYS; plus each `allowHosts` entry whose host is `localhost` or a loopback IP literal (`127.0.0.0/8`, `::1`) — a host-only loopback entry expands to 80 + 443, matching `egressproxy`'s host-only rule. Every NON-loopback entry (`api.anthropic.com`, the forge host, a LAN IP) is silently NOT admitted direct: it is reachable only via the proxy (`HTTPS_PROXY` CONNECT), which is today's sanctioned path. Fail-closed inputs: a non-loopback `proxyAddr`, a proxy address without a port, or a non-numeric / out-of-range port anywhere returns an error — never an over-broad or malformed profile.
 
 Two Seatbelt facts the grammar is built on (verified on Darwin 25.6): `remote ip` accepts ONLY `localhost` or `*` as the host — an IP literal such as `127.0.0.1:8090` or `::1:8090` is a profile SYNTAX error (`host must be * or localhost in network address`, exit 65) — and `localhost:<port>` matches BOTH `127.0.0.1` and `::1`. So every admitted endpoint renders as `localhost:<port>`; `TestSeatbelt_…/ipv6_loopback_admitted_via_localhost` pins the IPv6 half.
+
+### Signal confinement: `Profile(proxyAddr, allowHosts, WithSignalConfinement())` (#4855)
+
+Renders immediately after `(allow default)`, BEFORE the credential section and the IP rules, whatever order the options are passed in:
+
+```
+(deny signal)
+(allow signal (target same-sandbox))
+```
+
+A process under the profile can signal only processes in its OWN sandbox instance: everything it started (child, double-forked grandchild re-parented to launchd, a process group it created with `setpgid`) stays killable; the host `fishhawkd`, the acceptance preview, another stage's runner or agent, and a process under a SEPARATE `sandbox-exec` instance of the same profile are refused with `EPERM`. The allow is exactly the App Sandbox base profile's own (`/System/Library/Sandbox/Profiles/application.sb`) — no pid, process-name or path exception. Two rejected spellings: `(deny signal (target others))` did NOT deny an outside kill on Darwin 27.0.1 (the victim died, `kill` exited 0), and `(allow signal (target pgrp))` admitted an outside victim in the agent's process group. The runner applies this option on every applied acceptance profile; `Probe` carries the same clause, so a host that rejects the grammar reports `unavailable` (pre-spawn, loud) instead of failing `sandbox-exec` at agent spawn.
 
 ### Credential denies: `Profile(proxyAddr, allowHosts, WithCredentialDeny(d))`
 
@@ -48,7 +61,7 @@ Two Seatbelt facts the grammar is built on (verified on Darwin 25.6): `remote ip
 
 `Wrap(argv, profile)` returns `["sandbox-exec", "-p", profile, argv...]` — argv appended verbatim, never interpolated. The runner passes `Wrap(nil, profile)` as `Invocation.ExecWrapper`; the adapter appends the agent binary + args through `agent.WrapArgv`, so the sandboxed process is still the direct child and process-group leader (kill-tree, Setpgid, out-of-tree detector unchanged).
 
-`Probe(ctx)`: darwin, `sandbox-exec` on PATH, and a deny-all profile applies against `/usr/bin/true`. Anything else is `unavailable` with a reason naming what is missing. Non-darwin reports `UnavailableNonDarwin` (below).
+`Probe(ctx)`: darwin, `sandbox-exec` on PATH, and a deny-all profile carrying the signal section applies against `/usr/bin/true`. Anything else is `unavailable` with a reason naming what is missing. Non-darwin reports `UnavailableNonDarwin` (below).
 
 ## Empirical matrix (Darwin 25.6, `TestSeatbelt_DeniesDirectEgress_ProxyPathSurvives` + planning probes)
 
@@ -74,6 +87,22 @@ With `WithCredentialDeny` (Darwin 25.6, `TestSeatbelt_DeniesCredentialSurfaces_P
 | symlinked `.ssh` / `.git-credentials` / `.config` under a second home: via the home path, via the resolved target directly, via a fresh alias symlink (case `h`) | `Operation not permitted` |
 | TLS to `api.github.com` from Go `net/http` under the mach-lookup deny (planning probe) | 200 — the system trust store is unaffected |
 
+With `WithSignalConfinement` composed with the credential and network rules (Darwin 27.0.1, `TestSeatbelt_SignalConfinement_RefusesOutsideProcesses`; every victim is a throwaway `/bin/sleep 3600.<unique>` — or, for `killall`, which matches by process name only, a uniquely named symlink to `/bin/sleep` — that the test started and first asserted alive; every by-name pattern is anchored to that throwaway):
+
+| Under the composed profile | Result |
+|---|---|
+| `kill -TERM <outside pid>` (case `a`, the safe by-pid probe, run first) | `Operation not permitted`; victim alive |
+| `kill -0 <outside pid>` (case `b`) | `Operation not permitted` (exists-but-forbidden, not `ESRCH`) |
+| `pkill -TERM -f '^/bin/sleep 3600\.<unique>$'` (case `c`) | `signalling pid <victim>: Operation not permitted`; victim alive |
+| `killall -TERM <unique name>` (case `d`) | non-zero; victim alive |
+| kill / pkill of a victim under a SEPARATE `sandbox-exec` instance of the same profile (case `e`) | refused; victim alive |
+| own child, double-forked grandchild, own `setpgid` group (case `f`) | killed (`SIGTERM`, exit 143) |
+| admitted preview port; forge via the proxy (case `g`) | 200 |
+| the same kill / pkill / killall under the profile rendered WITHOUT the signal section (case `h`, in-test counterfactual) | victim dies |
+| real `claude -p` (2.1.314) and `codex exec` (0.153.4) each running one shell tool call under the composed profile, through the egress proxy (implement-stage smoke, #4855) | exit 0 |
+
+The setuid `/bin/ps` cannot be exec'd under ANY `sandbox-exec` profile on this host (`execvp … Operation not permitted`, the network-only profile included) — pre-existing and unrelated to the signal section; `pgrep` works.
+
 Declared non-isolation: the `<home>/Library/Keychains` file-read clause is not behaviourally separable from the mach-lookup clause (each alone refused the read in planning probes); only the golden render (`TestProfile_CredentialDeny_Golden`) pins it.
 | `sandbox-exec -p '(version 1)(allow default)' true` nested inside | `sandbox_apply: Operation not permitted`, exit 71 (residual 1) |
 
@@ -83,12 +112,12 @@ The e2e's case (d) is **NON-HERMETIC** (it dials a public IP literal); its asser
 
 | Value | Behaviour | Event (exactly one per stage) |
 |---|---|---|
-| `auto` (default, empty) | apply when `Probe` says available; otherwise proceed env-only, LOUDLY | `acceptance_net_sandbox_applied {mechanism:"seatbelt", admitted_ports}` / `acceptance_net_sandbox_unavailable {reason, enforcement:"env-only"}` |
+| `auto` (default, empty) | apply when `Probe` says available; otherwise proceed env-only, LOUDLY | `acceptance_net_sandbox_applied {mechanism:"seatbelt", admitted_ports, signals_confined:true}` / `acceptance_net_sandbox_unavailable {reason, enforcement:"env-only", signals_confined:false}` |
 | `require` | unavailable fails the stage category-C BEFORE any spawn | `acceptance_net_sandbox_required {reason}` → `runner_failed` |
-| `off` | never probe, never wrap — the kill switch | `acceptance_net_sandbox_disabled` |
+| `off` | never probe, never wrap — the kill switch (for the signal section too: it has no separate switch) | `acceptance_net_sandbox_disabled {signals_confined:false}` |
 | anything else | category-C pre-spawn | `acceptance_net_sandbox_config` naming the valid values |
 
-A profile render error (`acceptance_net_sandbox_profile`) is also category-C: never spawn under a malformed profile — including a `WithCredentialDeny` resolution error (a non-not-exist `EvalSymlinks` failure on a credential path). The runner passes `WithCredentialDeny` only while `FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION` is not `off` (decision, event fields and kill-switch contract: `runner/README.md` § "Acceptance-stage egress containment"); under `off` the profile is byte-identical to the network-only render. The variable is runner-process config and is dropped from the agent env by `acceptenv`'s default-deny allow-list (`TestAcceptenv_ExcludesPreviewVars`).
+A profile render error (`acceptance_net_sandbox_profile`) is also category-C: never spawn under a malformed profile — including a `WithCredentialDeny` resolution error (a non-not-exist `EvalSymlinks` failure on a credential path). The runner passes `WithCredentialDeny` only while `FISHHAWK_ACCEPTANCE_CREDENTIAL_ISOLATION` is not `off` (decision, event fields and kill-switch contract: `runner/README.md` § "Acceptance-stage egress containment"); under `off` the profile is byte-identical to the signal-only render (`WithSignalConfinement` plus the network rules). The variable is runner-process config and is dropped from the agent env by `acceptenv`'s default-deny allow-list (`TestAcceptenv_ExcludesPreviewVars`).
 
 ## Residuals (stated, not closed here)
 
@@ -101,6 +130,7 @@ A profile render error (`acceptance_net_sandbox_profile`) is also category-C: ne
 7. **A pre-existing hard link** to a credential file elsewhere is not covered (a hard link has no path relation to the denied one). An agent cannot MANUFACTURE one: `ln` and `cp` of a denied file fail `Operation not permitted`.
 8. **Symlinks are resolved once, at render.** A new alias the agent creates is covered (it resolves to a denied vnode path); a symlink the OPERATOR re-points mid-stage is not re-resolved.
 9. **Linux**: none of the credential denies apply (residual 3); the synthetic HOME is the only control there, and absolute-path reads, OpenSSH (which reads the passwd home, not `$HOME`) and Secret Service over D-Bus remain reachable.
+10. **Signal confinement is macOS-only.** On Linux (residual 3) an acceptance agent can still signal any same-user process, including the host `fishhawkd` and its preview; the only control there is the deferred prompt half of #4855. The macOS half covers the acceptance stage only — implement and fix-up shells are #4858.
 
 ## Relationship to ADR-063
 
