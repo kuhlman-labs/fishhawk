@@ -1018,6 +1018,100 @@ func TestCompute_Rule5_VouchOtherSha_StillForeign(t *testing.T) {
 	}
 }
 
+// TestCompute_Rule5_LegacyAbbreviatedVouch_NotPrefixMatched_Named pins the two
+// halves of the #4435 read side. A legacy operator_commit_vouched row whose
+// vouched_sha is an 8-character PREFIX of the live head (recorded before the
+// vouch endpoint refused abbreviations) is never matched by prefix, so the head
+// stays foreign_commit; and the detail names the FULL live sha plus the
+// abbreviated entry, with the re-vouch instruction. The row is seeded directly
+// in the fake audit repo by construction, never through the (now refusing)
+// vouch handler. Counterfactual: disabling the abbreviatedPrefixesOf
+// annotation branch in rule5 turns the substring assertion RED.
+func TestCompute_Rule5_LegacyAbbreviatedVouch_NotPrefixMatched_Named(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const live = "0a9e170000000000000000000000000000000000"
+	short := live[:8]
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(short))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, live, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (an abbreviated vouch is never prefix-matched); missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, "PR HEAD "+live+" ") {
+		t.Errorf("detail should render the live head in FULL: %s", detail)
+	}
+	if want := "known entry " + short + " is an ABBREVIATED sha"; !strings.Contains(detail, want) {
+		t.Errorf("detail should name the abbreviated entry (%q): %s", want, detail)
+	}
+	if !strings.Contains(detail, "fishhawk_vouch_commit") {
+		t.Errorf("detail should carry the full-sha re-vouch instruction: %s", detail)
+	}
+}
+
+// TestCompute_Rule5_ForeignCommit_DetailRendersFullShas pins the rendering of
+// the foreign_commit detail: every known sha appears in FULL (no 7-character
+// truncation) in sorted order, and a known entry that is NOT a shorter prefix of
+// the live head (a short non-prefix one, a longer 64-hex one) draws no
+// abbreviated-prefix annotation.
+func TestCompute_Rule5_ForeignCommit_DetailRendersFullShas(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	const (
+		live       = "deadbeef1111deadbeef1111deadbeef11111111"
+		vouched    = "0a9e170000000000000000000000000000000000"
+		shortOther = "ffffff"
+	)
+	// A 64-hex entry is LONGER than the 40-hex head: it can never be an
+	// abbreviation of it, and must not draw an annotation (or a slice panic).
+	longOther := strings.Repeat("ee", 32)
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(longOther))
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(shortOther))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, live, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail; missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, "PR HEAD "+live+" ") {
+		t.Errorf("detail should render the live head in FULL: %s", detail)
+	}
+	// Sorted: the "0a…" vouch, the "abc…" artifact head, the "ee…" 64-hex, then "ffffff".
+	ordered := []string{vouched, recordedSHA, longOther, shortOther}
+	last := -1
+	for _, sha := range ordered {
+		i := strings.Index(detail, sha)
+		if i < 0 {
+			t.Fatalf("detail should list known sha %q in full: %s", sha, detail)
+		}
+		if i <= last {
+			t.Errorf("known shas are not in sorted order (%q out of place): %s", sha, detail)
+		}
+		last = i
+	}
+	if strings.Contains(detail, "ABBREVIATED") {
+		t.Errorf("a short known entry that is not a prefix of the head must draw no annotation: %s", detail)
+	}
+}
+
 // TestCompute_Rule5_VouchReadError_Pending: a transient read failure on the
 // operator_commit_vouched category aborts the gather as head_fetch_failed
 // (pending), never a silent under-population that false-flags a vouched head

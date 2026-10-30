@@ -1004,17 +1004,44 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 		return
 	}
 
+	// Render every SHA in FULL and sorted: truncating to 7 characters made an
+	// abbreviated vouch of the head read as both foreign and known (#4435).
 	known := make([]string, 0, len(gather.knownSHAs))
 	for sha := range gather.knownSHAs {
-		known = append(known, shortSHA(sha))
+		known = append(known, sha)
+	}
+	sort.Strings(known)
+	detail := fmt.Sprintf(
+		"PR HEAD %s is not a Fishhawk-recorded commit (known: %s)",
+		liveSHA,
+		strings.Join(known, ", "))
+	// Matching above is exact by design, so a recorded ABBREVIATION of the head
+	// (a vouch recorded before the vouch endpoint refused them) never clears the
+	// check. Name it so the operator knows to re-vouch with the full sha.
+	if abbrev := abbreviatedPrefixesOf(liveSHA, gather.knownSHAs); len(abbrev) > 0 {
+		detail += fmt.Sprintf(
+			"; known entry %s is an ABBREVIATED sha that prefixes the PR HEAD but is never matched by prefix — re-vouch the full sha %s with fishhawk_vouch_commit",
+			strings.Join(abbrev, ", "), liveSHA)
 	}
 	*out = append(*out, MissingItem{
-		Kind: MissingForeignCommit,
-		Detail: fmt.Sprintf(
-			"PR HEAD %s is not a Fishhawk-recorded commit (known: %s)",
-			shortSHA(liveSHA),
-			strings.Join(known, ", ")),
+		Kind:   MissingForeignCommit,
+		Detail: detail,
 	})
+}
+
+// abbreviatedPrefixesOf returns, sorted, every known entry that is strictly
+// shorter than liveSHA and a case-insensitive prefix of it: the recorded
+// abbreviations of the PR head that exact-match rule 5 can never clear. It
+// only NAMES them for the detail; it never feeds the match.
+func abbreviatedPrefixesOf(liveSHA string, known map[string]struct{}) []string {
+	var out []string
+	for sha := range known {
+		if sha != "" && len(sha) < len(liveSHA) && strings.EqualFold(liveSHA[:len(sha)], sha) {
+			out = append(out, sha)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // foreignCommitInputs bundles the values rule5 needs to make the
@@ -1365,15 +1392,6 @@ func parseRepo(s string) (forge.RepoRef, error) {
 		return forge.RepoRef{}, fmt.Errorf("auditcomplete: repo %q must be owner/name", s)
 	}
 	return forge.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
-}
-
-// shortSHA renders the leading 7 of a SHA for human-readable
-// missing-item details. Leaves shorter SHAs untouched.
-func shortSHA(sha string) string {
-	if len(sha) > 7 {
-		return sha[:7]
-	}
-	return sha
 }
 
 // childPageSize is the ListRuns page size the decomposition resolution walks
