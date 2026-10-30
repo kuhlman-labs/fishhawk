@@ -979,6 +979,18 @@ type Config struct {
 	// and refuses a non-positive value at startup. See merge_queue_yield.go.
 	MergeQueueApprovalWait time.Duration
 
+	// MergeQueueGateWait is docs/adr/112 A3.2's per-admission-epoch
+	// merge-gate window (#4780): a head of line whose required checks are
+	// pending, unreported or unreadable (A3.1(b)) or whose implement-review
+	// round is settling (A3.1(c)) holds the line for this window, opened at
+	// its first such hold in the epoch from a persisted 3-hold budget
+	// (mergequeue.Store.GateWait, database clock), then yields
+	// merge_checks_pending / merge_review_pending. Zero (or non-positive) is
+	// the approval wait (mergeQueueApprovalWait). fishhawkd sets it from
+	// --merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT. See
+	// merge_queue_merge.go (mergeOnPassEnforceGateWait).
+	MergeQueueGateWait time.Duration
+
 	// MergeCandidateTransfer is the ADR-096 verdict-transfer switch (E87.2 /
 	// #4293): off | shadow | enforce plus the classifier. The ZERO VALUE is
 	// off, so an in-process server is unchanged; fishhawkd defaults shadow
