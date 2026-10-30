@@ -33,7 +33,12 @@ One row per queue EPISODE of a run.
 | `merge_intent_sequence` | The audit sequence of the `merge_queue_entered` row that recorded the intent (0108, ADR-093 slice 2). Stamped in the SAME statement as `merge_intent_at` (`EnqueueRequest.IntentSequence`, `MergeIntentRequest.IntentSequence`), only on the NULL-to-set transition, never overwritten. NULL (read as `Entry.MergeIntentSequence` 0) = no intent, or an intent recorded before 0108; merge-on-pass then resolves the newest `merge_queue_entered` row naming the base. |
 | `admission_epoch` | `BIGINT NOT NULL DEFAULT 0` (0108). Bumped by every admission: `AdmitNext`'s admit AND its stale re-claim, and `AdmitNextReclaiming`'s boot re-claim. The admission-owned writes are compare-and-swaps on it (§ "Admission-epoch CAS"). |
 | `yield_reason` / `yield_detail` / `yielded_at` | The YIELD MARKER (0109, ADR-112 R3; § "Yield"). NULL = not marked. `yield_reason` is the server's closed vocabulary (`backend/internal/server/merge_queue_yield.go`); `yield_detail` is untrusted forge-derived text every read surface sanitises (`Entry.YieldDetail`, `""` for NULL). DB CHECKs: `yielded_at` is set exactly when a non-empty `yield_reason` is, and a `live` row never carries a marker; a terminal row keeps it as history. `AdmitNext` skips a marked row. |
-| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission, a stale re-claim or the boot re-claim, kept by `Yield`, cleared only by `ClearYield`. |
+| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission, a stale re-claim, the boot re-claim or (docs/adr/112 A3.7, 0115) `ClearYield`: RETAINED for the whole episode, so a later approval-fold block in the same episode judges expired at once. |
+| `approval_wait_open` | `BOOLEAN NOT NULL DEFAULT false` (0115, A3.7): an approval wait is open. Set by `ApprovalWait`, cleared by `ClearYield`; 0115 backfills it `true` on every row whose anchor is set (pre-0115 `ClearYield` nulled the anchor, so every set anchor was an open wait). The server's #4748 readvance deadline fires only while it is set (`Entry.ApprovalWaitOpen`). |
+| `yield_revision` | `BIGINT NOT NULL DEFAULT 0` (0115, A3.6): bumped by EVERY marker write (`Yield`, `Enqueue`'s mark, a marked insert = 1, `UpdateYield`, `ClearYield`, `ReanchorYielded`); a marker-less re-anchor does not. The yielded-row compare-and-swap key with `anchored_head_sha` (`Entry.YieldRevision`). |
+| `row4_flag` | `BOOLEAN NOT NULL DEFAULT false` (0115, A3.6): the row-4 obligation. ORed in by a marker write whose `YieldMarker.Row4` is true (no reason transition clears it); cleared only by `ClearYield(clearRow4=true)` (`Entry.Row4Flag`). 0115 backfills it `true` on every row yielded `forge_review_required` (pre-0115 the obligation was that stored reason). |
+| `gate_wait_started_at` / `gate_wait_epoch` | The per-admission-epoch merge-gate window (0115, A3.2): its start and the admission epoch that opened it; both NULL or both set (DB CHECK). Written only by `GateWait`. |
+| `gate_hold_tokens` / `gate_tokens_refilled_at` | The merge-gate hold budget (0115, A3.7): `SMALLINT NOT NULL DEFAULT 3`, CHECK `BETWEEN 0 AND 3` (`GateHoldBudget`), and its refill clock (NULL = never spent). Written only by `GateWait`; kept by every other write, a clear and a head move included. |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE
@@ -270,38 +275,64 @@ Go `time.Now()` is compared against a stored instant.
   (`started + window <= now`) and `Remaining` (0 when expired) in the same
   transaction. `window <= 0` is `ErrInvalidRequest`. The anchor survives
   `Unadmit`, the re-admission and a stale re-claim
-  (`TestApprovalWait_AnchorSurvivesUnadmitAndReadmission`). Call it OUTSIDE
-  the merge-intent lock.
-- **`Yield(id, epoch, YieldMarker{Reason, Detail})`**: live at `epoch` only
-  (epoch CAS). ONE statement moves the row to `held` (phase and `admitted_at`
-  cleared, `enqueued_at` kept) and stamps `yield_reason`, `yield_detail` and
-  `yielded_at`; `approval_wait_started_at` is kept. Empty reason →
+  (`TestApprovalWait_AnchorSurvivesUnadmitAndReadmission`) and, docs/adr/112
+  A3.7, a `ClearYield`: a later epoch's call on a retained anchor past the
+  window reports `Expired` at once (`TestApprovalWait_RetainedAnchorAfterClear`).
+  It sets `approval_wait_open`. Call it OUTSIDE the merge-intent lock.
+- **`GateWait(id, epoch, window)`** → `GateWaitResult{Entry, Opened, Expired,
+  NoToken, Remaining}` (docs/adr/112 A3.2/A3.7): live at `epoch` only (epoch
+  CAS; `ErrStateConflict`, nothing written); `window <= 0` is
+  `ErrInvalidRequest`. ONE window per admission epoch: when `gate_wait_epoch
+  = epoch` it CONTINUES (no spend: a (b) hold then a (c) hold in one epoch
+  spends one token) and `Expired` is judged against `gate_wait_started_at`;
+  otherwise it opens a FRESH window in one statement: the previous window's
+  hold, bounded by `window`, is first charged to the refill clock (holding
+  never refills), then `k = floor((now − gate_tokens_refilled_at) /
+  GateHoldRefill)` CLAMPED to `[0, GateHoldBudget]` (a future clock accrues
+  nothing; no negative remainder), one token is spent atomically with the
+  window stamp, and the refill clock moves to now (full, capped, NULL or
+  future) or keeps its remainder, never past now. An empty budget answers
+  `NoToken` and writes nothing. It never reads or writes the approval wait
+  (`TestGateWait_*`). Call it OUTSIDE the merge-intent lock.
+- **`Yield(id, epoch, YieldMarker{Reason, Detail, Row4})`**: live at `epoch`
+  only (epoch CAS). ONE statement moves the row to `held` (phase and
+  `admitted_at` cleared, `enqueued_at` kept), stamps `yield_reason`,
+  `yield_detail` and `yielded_at`, bumps `yield_revision` and ORs `Row4` into
+  `row4_flag`; `approval_wait_started_at` is kept. Empty reason →
   `ErrInvalidRequest` (`TestYield_OneTransactionUnderEpochCAS`).
-  `YieldMarker.Continue` (the entry's last cleared episode for that reason,
-  supplied by the server) makes `yielded_at` that episode's instead of the
-  database clock, ONLY when the row's anchor in the same statement equals the
-  episode's head and base; `Enqueue` marking an unmarked held entry applies
-  it after its re-anchor. An already-marked entry keeps its own `yielded_at`
-  (`TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor`).
-- **`ClearYield(id, head, yieldedAt)`**: the ONLY way back in. Under the base
-  lock, a compare-and-swap on `state = 'held' AND anchored_head_sha = head AND
-  yielded_at = yieldedAt`: clears the marker AND `approval_wait_started_at`
-  (a later non-approval starts a fresh episode). The row rejoins at its
-  original effective key (`enqueued_at`, or a kept promote `order_key`). A row whose head moved, whose episode changed
-  (another `yielded_at`) or that is not held → `ErrStateConflict` and the
-  marker stays (`TestClearYield_CompareAndSwap`, asserted on read-back).
-- **`UpdateYield(id, head, yieldedAt, YieldMarker)`**: the same CAS; rewrites
-  reason and detail only (a yield transition). `TestUpdateYield_RewritesReasonOnly`.
-- **`ReanchorYielded(id, head, yieldedAt, newHead, newBase)`**: the same CAS on
-  the OLD head; moves the anchor to the PR's current head and KEEPS the
-  marker, `yielded_at` and `approval_wait_started_at` (the same episode). A
-  head move never clears a marker, so a push loop cannot buy a fresh wait
-  window per push; the new head is judged by the next probe and cleared at
-  the NEW head (`TestReanchorYielded_KeepsMarkerAndEpisode`).
+  `YieldMarker.Continue` (the entry's last cleared episode on its base ref,
+  supplied by the server, docs/adr/112 A3.7) makes `yielded_at` that
+  episode's instead of the database clock when the row's `base_ref` equals
+  the episode's, WHATEVER the head or reason; `Enqueue` marking an unmarked
+  held entry applies it after its re-anchor. An already-marked entry keeps
+  its own `yielded_at` (`TestYield_ContinuesLastClearedEpisodeOnSameBaseRef`).
+- **`ClearYield(id, head, revision, clearRow4)`**: the ONLY way back in. Under
+  the base lock, a compare-and-swap on `state = 'held' AND yielded_at IS NOT
+  NULL AND anchored_head_sha = head AND yield_revision = revision`: clears
+  the marker and CLOSES the approval wait (`approval_wait_open = false`)
+  while RETAINING `approval_wait_started_at` (A3.7), and clears `row4_flag`
+  only when `clearRow4`. The row rejoins at its original effective key
+  (`enqueued_at`, or a kept promote `order_key`). A row whose head moved,
+  whose marker was rewritten since (another revision) or that is not held →
+  `ErrStateConflict` and the marker stays (`TestClearYield_CompareAndSwap`,
+  `TestClearYield_StaleRevisionRefused`, asserted on read-back).
+- **`UpdateYield(id, head, revision, YieldMarker)`**: the same CAS; rewrites
+  reason and detail and ORs `Row4` into `row4_flag` (a yield transition).
+  `TestUpdateYield_RewritesReasonOnly`,
+  `TestUpdateYield_StaleRevisionCannotOverwriteNewerReason`, `TestRow4Flag_Lifecycle`.
+- **`ReanchorYielded(id, head, revision, newHead, newBase)`**: the same CAS
+  on the OLD head; moves the anchor to the PR's current head and KEEPS the
+  marker, `yielded_at`, `approval_wait_started_at`, `row4_flag` and the hold
+  budget (the same episode). A head move never clears a marker, so a push
+  loop cannot buy a fresh wait window per push; the new head is judged by the
+  same probe and cleared at the NEW head (`TestReanchorYielded_KeepsMarkerAndEpisode`).
 
-`head` and `yieldedAt` are required on the three marker CASes
-(`ErrInvalidRequest`). `yieldedAt` is the value read back from the row
-(`Entry.YieldedAt`), compared at the column's microsecond precision.
+Every marker write bumps `yield_revision` in its own statement
+(`TestYieldRevision_EveryMarkerWriteBumps`), so a delayed probe that read an
+earlier revision misses the CAS even when the episode continued the same
+(head, `yielded_at`). `head` is required and `revision` must be non-negative
+on the three marker CASes (`ErrInvalidRequest`); `revision` is the value read
+back from the row (`Entry.YieldRevision`).
 
 ### Promote
 
@@ -353,8 +384,8 @@ change nothing (ADR-093 slice 2, rejection item 1):
 | `SetPhase` | live AND epoch | admission (incl. the D8 `advancing` stamp), verdict hook, transfer re-anchor, merge-on-pass's `merging` / `settling` stamps, the D8 resume |
 | `ReanchorAt` | live AND epoch | admission re-anchor |
 | `SettleAt` | live AND epoch (terminal: no-op) | admission settles, merge-on-pass settle outcomes |
-| `ApprovalWait` / `Yield` | live AND epoch | merge-on-pass approval wait and yield, admission veto yield |
-| `ClearYield` / `UpdateYield` / `ReanchorYielded` | held AND `anchored_head_sha` AND `yielded_at` | the yield re-probe |
+| `ApprovalWait` / `GateWait` / `Yield` | live AND epoch | merge-on-pass approval and merge-gate waits and yields, admission yields |
+| `ClearYield` / `UpdateYield` / `ReanchorYielded` | held AND marked AND `anchored_head_sha` AND `yield_revision` | the yield re-probe |
 | `Settle` / `Reanchor` | active (unconditional) | EXTERNAL facts only: PR resolved, cancel / re-open release, run terminal, the rebase transfer re-anchor, the merged settle after the forge accepted a queue merge |
 
 ### Merge-dispatch ledger
@@ -503,7 +534,7 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   as absent (fresh row), never re-anchored
   (`TestEnqueue_EntrySettledBetweenPeekAndLockGetsFreshRow`).
 - By-entry mutations (`Unadmit`, `SetPhase`, `Reanchor`, `Settle`,
-  `MarkMergeIntent`, `ApprovalWait`, `Yield`, `ClearYield`, `UpdateYield`,
+  `MarkMergeIntent`, `ApprovalWait`, `GateWait`, `Yield`, `ClearYield`, `UpdateYield`,
   `ReanchorYielded`): read the entry's base → its base lock → the row
   `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
   stays correct.
@@ -603,6 +634,8 @@ the BYPASSRLS system context.
 | Constant | Value | Why |
 |---|---|---|
 | `AdmissionStaleAfter` | 10 min | Bounds phases `admitted` and `advancing`. Admission work (auto-advance merge + bounded post-merge read + trigger append + re-open) takes seconds; 10 min is far past a slow forge, so a re-claim means a crash, not a slow pump. The re-run is idempotent (advance is a no-op when up to date; the pass start is per-head idempotent). At boot, `AdmitNextReclaiming` re-claims a pre-boot admission at once instead. |
+| `GateHoldBudget` | 3 | docs/adr/112 A3.7's hold budget N: at most three merge-gate windows per refill period; the 0115 CHECK's upper bound. |
+| `GateHoldRefill` | 1 h | A3.7's refill period R: one token per hour the row spends not holding. |
 | `IntentFnTimeout` | 90 s (`intentFnTimeout`) | The merge-intent lock's fn deadline (§ "Merge-intent lock"), exported for the D8 resume's crash-left queue-claim age window (§ "Merge-dispatch ledger"). |
 
 ## Residuals

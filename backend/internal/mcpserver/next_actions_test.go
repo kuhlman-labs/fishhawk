@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -21,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -7245,6 +7247,9 @@ func TestFoldMergeQueueYield_RemedyPerNextStep(t *testing.T) {
 		{"forge_approval_vetoed", "dismiss_review", "dismiss_review"},
 		{"forge_approval_undetermined", "retry_after", "fishhawk_merge_run"},
 		{"forge_approval_identity_provider_unconfigured", "configure_identity_provider", "configure_identity_provider"},
+		{"merge_checks_red", "retrigger_ci", "fishhawk_retrigger_ci"},
+		{"merge_checks_pending", "retry_after", "fishhawk_merge_run"},
+		{"merge_review_pending", "retry_after", "fishhawk_merge_run"},
 		{"forge_approval_provider_unsupported", "none", ""},
 		{"forge_approval_absent", "something_new", ""},
 	}
@@ -7263,8 +7268,8 @@ func TestFoldMergeQueueYield_RemedyPerNextStep(t *testing.T) {
 				!strings.Contains(na.Actions[0].Reason, tc.reason) || !strings.Contains(na.Actions[0].Precondition, tc.next) {
 				t.Fatalf("actions = %+v, want one %s naming %s", na.Actions, tc.want, tc.reason)
 			}
-			if tc.want == "fishhawk_merge_run" && na.Actions[0].Params["run_id"] != run.ID {
-				t.Errorf("merge_run params = %v, want run_id %s", na.Actions[0].Params, run.ID)
+			if (tc.want == "fishhawk_merge_run" || tc.want == "fishhawk_retrigger_ci") && na.Actions[0].Params["run_id"] != run.ID {
+				t.Errorf("%s params = %v, want run_id %s", tc.want, na.Actions[0].Params, run.ID)
 			}
 		})
 	}
@@ -7352,6 +7357,192 @@ func TestFoldMergeQueueYield_UntrustedTextNeverReachesNextActions(t *testing.T) 
 		}
 		if reason == hostileReason && !strings.Contains(string(blob), "an unrecognised reason") {
 			t.Errorf("an out-of-vocabulary yield_reason must render generically:\n%s", blob)
+		}
+	}
+}
+
+// TestFoldMergeQueueYield_RetriggerCI is docs/adr/112 A3 (#4780) through the
+// fold: a merge_checks_red / retrigger_ci yield names fishhawk_retrigger_ci
+// with params {run_id} only, consumes none, is INSERTED before an offered
+// fishhawk_merge_run, is idempotent, and its prose comes from the closed
+// vocabulary only (the hostile yield_detail never appears) and states the
+// A3.4 clear rule (every merge-gate leg passing), never "a qualifying forge
+// approval". Counterfactual: dropping the retrigger_ci case adds nothing →
+// RED; keeping the approval rejoin clause for a merge-gate reason → RED on
+// the forbidden phrase.
+func TestFoldMergeQueueYield_RetriggerCI(t *testing.T) {
+	run := naYieldedRun("merge_checks_red", "retrigger_ci")
+	na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}, mergeRunAction(run)}}
+	foldMergeQueueYield(run, na)
+	foldMergeQueueYield(run, na)
+	if len(na.Actions) != 3 || na.Actions[1].Action != "fishhawk_retrigger_ci" || na.Actions[2].Action != "fishhawk_merge_run" {
+		t.Fatalf("actions = %+v, want fishhawk_retrigger_ci inserted once before fishhawk_merge_run", na.Actions)
+	}
+	a := na.Actions[1]
+	if len(a.Params) != 1 || a.Params["run_id"] != run.ID || a.Consumes != consumesNone {
+		t.Errorf("retrigger action params = %v consumes = %q, want exactly {run_id: %s} consuming none", a.Params, a.Consumes, run.ID)
+	}
+	for _, want := range []string{"merge_checks_red", "failed or was cancelled at the anchored head", "fishhawk_retrigger_ci",
+		"check_run trigger", "fishhawk_merge_run re-invoke", "every merge-gate leg passing"} {
+		if !strings.Contains(a.Reason, want) {
+			t.Errorf("retrigger reason %q lacks %q", a.Reason, want)
+		}
+	}
+	if !strings.Contains(a.Precondition, "retrigger_ci") {
+		t.Errorf("precondition %q does not name next_step retrigger_ci", a.Precondition)
+	}
+	blob, _ := json.Marshal(na)
+	for _, bad := range []string{"qualifying forge approval", naYieldHostileDetail, "IGNORE ALL PREVIOUS"} {
+		if strings.Contains(string(blob), bad) {
+			t.Errorf("merge_checks_red next_actions carry %q:\n%s", bad, blob)
+		}
+	}
+
+	// Appended when no merge is offered.
+	na = &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}}}
+	foldMergeQueueYield(run, na)
+	if len(na.Actions) != 2 || na.Actions[1].Action != "fishhawk_retrigger_ci" {
+		t.Fatalf("actions = %+v, want fishhawk_retrigger_ci appended", na.Actions)
+	}
+}
+
+// TestFoldMergeQueueYield_MergeGateRetryAfterIsReasonAware: the A3 retry_after
+// reasons (merge_checks_pending, merge_review_pending) name the leg the
+// re-probe waits on and the A3.4 clear rule, and never the forge-read
+// ("undetermined or truncated") or approval prose; forge_approval_undetermined
+// keeps the forge-read prose. Counterfactual: dropping the reason switch in
+// the retry_after case → the merge-gate rows read the forge-read prose, RED.
+func TestFoldMergeQueueYield_MergeGateRetryAfterIsReasonAware(t *testing.T) {
+	cases := []struct {
+		reason string
+		want   []string
+		bad    []string
+	}{
+		{"merge_checks_pending", []string{"pending, unreported or unreadable at the anchored head", "check_run trigger", "every merge-gate leg passing"},
+			[]string{"undetermined or truncated", "qualifying forge approval"}},
+		{"merge_review_pending", []string{"implement-review round at the anchored head is still settling", "every merge-gate leg passing"},
+			[]string{"undetermined or truncated", "qualifying forge approval"}},
+		{"forge_approval_undetermined", []string{"undetermined or truncated", "qualifying forge approval"},
+			[]string{"merge-gate leg"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			run := naYieldedRun(tc.reason, "retry_after")
+			na := &NextActions{}
+			foldMergeQueueYield(run, na)
+			if len(na.Actions) != 1 || na.Actions[0].Action != "fishhawk_merge_run" {
+				t.Fatalf("actions = %+v, want one fishhawk_merge_run", na.Actions)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(na.Actions[0].Reason, w) {
+					t.Errorf("reason %q lacks %q", na.Actions[0].Reason, w)
+				}
+			}
+			for _, b := range tc.bad {
+				if strings.Contains(na.Actions[0].Reason, b) {
+					t.Errorf("reason %q carries %q", na.Actions[0].Reason, b)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI is the ONE
+// three-way vocabulary drift pin (docs/adr/112 A3, #4780): the server's
+// closed yield_reason → next_step map (server.MergeQueueYieldVocabulary),
+// this package's mergeQueueYieldReasons and docs/api/v0.openapi.yaml's
+// MergeQueueYieldReason enum carry EQUAL reason sets; the set of next steps
+// the server maps to EQUALS the MergeQueueNextStep enum; and every mapped
+// next step other than none is HANDLED by a foldMergeQueueYield case (the
+// fold adds an action for it). On a failure, update every site:
+// backend/internal/server/merge_queue_yield.go (mergeQueueYieldReasons,
+// mergeQueueYieldNextStep), backend/internal/mcpserver/next_actions.go
+// (mergeQueueYieldReasons, foldMergeQueueYield), docs/api/v0.openapi.yaml
+// (MergeQueueYieldReason, MergeQueueNextStep), docs/api/v0.md, then
+// scripts/gen-site-reference. Counterfactual: removing merge_checks_red from
+// mergeQueueYieldReasons → RED on the set comparison.
+func TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI(t *testing.T) {
+	const sites = "backend/internal/server/merge_queue_yield.go, backend/internal/mcpserver/next_actions.go, docs/api/v0.openapi.yaml, docs/api/v0.md (then scripts/gen-site-reference)"
+	serverVocab := server.MergeQueueYieldVocabulary()
+
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "docs", "api", "v0.openapi.yaml"))
+	if err != nil {
+		t.Fatalf("read openapi: %v", err)
+	}
+	var doc struct {
+		Components struct {
+			Schemas map[string]struct {
+				Enum []string `yaml:"enum"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse openapi: %v", err)
+	}
+	openReasons := doc.Components.Schemas["MergeQueueYieldReason"].Enum
+	openSteps := doc.Components.Schemas["MergeQueueNextStep"].Enum
+	if len(openReasons) == 0 || len(openSteps) == 0 {
+		t.Fatalf("openapi MergeQueueYieldReason enum %v / MergeQueueNextStep enum %v: want both non-empty", openReasons, openSteps)
+	}
+
+	setOf := func(xs []string) map[string]bool {
+		m := make(map[string]bool, len(xs))
+		for _, x := range xs {
+			m[x] = true
+		}
+		return m
+	}
+	keys := func(m map[string]bool) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		slices.Sort(out)
+		return out
+	}
+	serverReasons := map[string]bool{}
+	serverSteps := map[string]bool{}
+	for r, step := range serverVocab {
+		serverReasons[r] = true
+		serverSteps[step] = true
+	}
+	mcpReasons := map[string]bool{}
+	for r, ok := range mergeQueueYieldReasons {
+		if ok {
+			mcpReasons[r] = true
+		}
+	}
+	if !maps.Equal(serverReasons, mcpReasons) {
+		t.Errorf("yield_reason drift: server %v, mcpserver %v; update %s", keys(serverReasons), keys(mcpReasons), sites)
+	}
+	if o := setOf(openReasons); !maps.Equal(serverReasons, o) {
+		t.Errorf("yield_reason drift: server %v, openapi %v; update %s", keys(serverReasons), keys(o), sites)
+	}
+	if o := setOf(openSteps); !maps.Equal(serverSteps, o) {
+		t.Errorf("next_step drift: server maps to %v, openapi MergeQueueNextStep %v; update %s", keys(serverSteps), keys(o), sites)
+	}
+	for _, want := range []string{"merge_checks_red", "merge_checks_pending", "merge_review_pending"} {
+		if !serverReasons[want] || !mcpReasons[want] || !setOf(openReasons)[want] {
+			t.Errorf("%s missing on a side (server %v, mcpserver %v, openapi %v); update %s",
+				want, serverReasons[want], mcpReasons[want], setOf(openReasons)[want], sites)
+		}
+	}
+	if !serverSteps["retrigger_ci"] || !setOf(openSteps)["retrigger_ci"] || serverVocab["merge_checks_red"] != "retrigger_ci" {
+		t.Errorf("merge_checks_red → %q, openapi steps %v: want retrigger_ci on every side; update %s", serverVocab["merge_checks_red"], openSteps, sites)
+	}
+
+	// Every mapped next step but none is handled by a fold case.
+	for r, step := range serverVocab {
+		na := &NextActions{}
+		foldMergeQueueYield(naYieldedRun(r, step), na)
+		if step == "none" {
+			if len(na.Actions) != 0 {
+				t.Errorf("%s → none: fold added %+v, want nothing", r, na.Actions)
+			}
+			continue
+		}
+		if len(na.Actions) != 1 || !strings.Contains(na.Actions[0].Reason, r) {
+			t.Errorf("%s → %s: fold added %+v, want one action naming the reason; add a foldMergeQueueYield case (%s)", r, step, na.Actions, sites)
 		}
 	}
 }

@@ -4118,14 +4118,105 @@ func TestGetRun_MergeCandidateQueue_Yielded(t *testing.T) {
 func TestMergeQueueYieldRemedy_TotalOverNextSteps(t *testing.T) {
 	seen := map[string]bool{}
 	for _, step := range []string{forgeApprovalNextApprovePR, forgeApprovalNextDismissReview, forgeApprovalNextRetryAfter,
-		forgeApprovalNextConfigureIdentityProvider, mergeQueueYieldNextNone} {
-		got := mergeQueueYieldRemedy(step)
+		forgeApprovalNextConfigureIdentityProvider, mergeQueueYieldNextRetriggerCI, mergeQueueYieldNextNone} {
+		got := mergeQueueYieldRemedy("", step)
 		if got == "" || seen[got] {
 			t.Errorf("remedy(%q) = %q, want a distinct non-empty remedy", step, got)
 		}
 		seen[got] = true
 	}
-	if mergeQueueYieldRemedy("something_new") != mergeQueueYieldRemedy(mergeQueueYieldNextNone) {
+	if mergeQueueYieldRemedy("", "something_new") != mergeQueueYieldRemedy("", mergeQueueYieldNextNone) {
 		t.Errorf("an unknown next_step must read as none")
+	}
+}
+
+// TestMergeQueueYieldRemedy_TotalOverReasons walks EVERY closed yield_reason
+// through its derived next_step (docs/adr/112 A3, #4780): only a reason whose
+// step is none reaches the "nothing at the forge clears it" default;
+// merge_checks_red names fishhawk_retrigger_ci; retry_after is reason-aware
+// (merge_checks_pending names the checks, merge_review_pending the review
+// round, and every forge_approval_* retry_after keeps the forge-read text).
+// Counterfactuals: retrigger_ci routed to the default branch → merge_checks_red
+// reaches the default text, RED; the reason-aware retry_after switch removed →
+// the two merge-gate reasons read the forge-read text, RED.
+func TestMergeQueueYieldRemedy_TotalOverReasons(t *testing.T) {
+	const fallback = "nothing at the forge clears it"
+	forgeRead := mergeQueueYieldRemedy(mergeCandidateQueueReasonForgeApprovalUndetermined, forgeApprovalNextRetryAfter)
+	for reason, step := range MergeQueueYieldVocabulary() {
+		got := mergeQueueYieldRemedy(reason, step)
+		if got == "" {
+			t.Errorf("remedy(%s, %s) is empty", reason, step)
+		}
+		if reaches := strings.Contains(got, fallback); reaches != (step == mergeQueueYieldNextNone) {
+			t.Errorf("remedy(%s, %s) = %q: reaches the default %v, want %v (only a none step may)", reason, step, got, reaches, step == mergeQueueYieldNextNone)
+		}
+		if step == forgeApprovalNextRetryAfter && !mergeQueueYieldIsMergeGate(reason) && got != forgeRead {
+			t.Errorf("remedy(%s, retry_after) = %q, want the forge-read text %q", reason, got, forgeRead)
+		}
+	}
+	for _, tc := range []struct {
+		reason string
+		want   []string
+		absent string
+	}{
+		{mergeQueueYieldMergeChecksRed, []string{"fishhawk_retrigger_ci", "failed or cancelled", "check_run trigger", "original place"}, "forge read"},
+		{mergeQueueYieldMergeChecksPending, []string{"required checks are pending, unreported or unreadable at the anchored head", "every required check passes"}, "forge read"},
+		{mergeQueueYieldMergeReviewPending, []string{"implement-review round at the anchored head is still settling"}, "forge read"},
+	} {
+		got := mergeQueueYieldRemedy(tc.reason, mergeQueueYieldNextStep(tc.reason))
+		for _, w := range tc.want {
+			if !strings.Contains(got, w) {
+				t.Errorf("remedy(%s) = %q, want it to contain %q", tc.reason, got, w)
+			}
+		}
+		if strings.Contains(got, tc.absent) {
+			t.Errorf("remedy(%s) = %q, must not name the %s", tc.reason, got, tc.absent)
+		}
+	}
+}
+
+// TestGetRun_MergeCandidateQueue_MergeGateYieldNote: a HELD entry yielded for
+// a merge-gate reason (docs/adr/112 A3.2) reads a note naming the merge-gate
+// clear rule (A3.4: every merge-gate leg passing at the anchored head) and the
+// check_run trigger, and NEVER the approval clear rule; an approval yield keeps
+// the approval rule. Counterfactual: the merge-gate branch of the note removed
+// → the merge_checks_red note says "qualifying forge approval", RED.
+func TestGetRun_MergeCandidateQueue_MergeGateYieldNote(t *testing.T) {
+	f := newMCQFixture(t)
+	f.wave()
+	for _, tc := range []struct {
+		name, reason, step string
+	}{
+		{"red", mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI},
+		{"pending", mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter},
+		{"review", mergeQueueYieldMergeReviewPending, forgeApprovalNextRetryAfter},
+		{"approval", mergeCandidateQueueReasonForgeApprovalAbsent, forgeApprovalNextApprovePR},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			c := f.seed("g"+tc.name, "g"+tc.name+"0", []byte(mcvUndelegatedSpecYAML))
+			if _, err := f.store.Enqueue(context.Background(), mergequeue.EnqueueRequest{RunID: c.id, BaseRef: mcqBase, HeadSHA: "g" + tc.name + "1"}); err != nil {
+				t.Fatalf("enqueue: %v", err)
+			}
+			f.markYielded(c, tc.reason, "", time.Minute, 0)
+			q, ok := runQueueBlock(t, getRunRaw(t, f.srv, c.id))
+			if !ok || q.State != "held" || q.YieldReason != tc.reason || q.NextStep != tc.step {
+				t.Fatalf("block = %+v (present %v), want held %s / %s", q, ok, tc.reason, tc.step)
+			}
+			gate := mergeQueueYieldIsMergeGate(tc.reason)
+			remedy := "next step " + tc.step + ": " + mergeQueueYieldRemedy(tc.reason, tc.step)
+			for _, c := range []struct {
+				want    string
+				present bool
+			}{
+				{"qualifying forge approval", !gate},
+				{"every merge-gate leg passing at the anchored head", gate},
+				{"check_run trigger", gate},
+				{remedy, true},
+			} {
+				if strings.Contains(q.Note, c.want) != c.present {
+					t.Errorf("note = %q: contains %q = %v, want %v", q.Note, c.want, !c.present, c.present)
+				}
+			}
+		})
 	}
 }

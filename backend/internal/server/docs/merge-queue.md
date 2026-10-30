@@ -206,12 +206,24 @@ below); eject/promote and durability are slices 3-4.
   spec that was READ and declares no review stage or no approval gate passes;
   an absent, unreadable or unparseable spec is `undeterminable` (fail
   closed). (b) acceptance merge-eligible and not stale. (c) required checks
-  green at the PR head, classified by `mergeoutcome.ClassifyMergeCI` against
-  `runs.required_checks_snapshot`; **zero observed check runs is never green
-  — it is `undeterminable`, and a nil snapshot is judged on the observed set
-  only when at least one check run exists;** with a nil snapshot an observed
-  red is NOT GREEN, not red: the admission variant admits, the merge variant
-  holds `checks_not_green`, the entry variant keeps `checks_red`. (d) no open blocking concern: an
+  at the PR head, the PR-head MERGE-GATE leg (docs/adr/112 A3.1, #4780),
+  classified by `mergeoutcome.ClassifyMergeGateCI` (never `ClassifyMergeCI`,
+  which E82.2's post-merge observation keeps) against
+  `runs.required_checks_snapshot`: per check suite the LATEST attempt
+  decides, completed or not; a completed latest attempt in the fail set or
+  CANCELLED is red (`checks_red`, A3.1(a)); any failing suite fails the name,
+  with NO superseded- or cancelled-run tolerance; anything else that is not
+  a pass (a pending latest attempt, a stale or unknown conclusion, an
+  unreported name) is not green (`checks_not_green`, A3.1(b)). **Zero
+  observed check runs is never green.** The MERGE variant answers EVERY
+  checks-read failure (no GitHub client, no head, an unparseable repo, a
+  listing error, a truncated listing) and zero runs as the determined
+  `checks_not_green` with a detail naming the cause, never `undeterminable`
+  (A3.2 bounds them with the merge-gate window); the ENTRY variant keeps read
+  failures and zero runs `undeterminable` (merge_run refuses them, A3.3
+  "Unchanged"). With a nil snapshot an observed red is NOT GREEN, not red:
+  the admission variant admits, the merge variant holds `checks_not_green`,
+  the entry variant keeps `checks_red`. (d) no open blocking concern: an
   open concern whose provenance is `concern.ProvenanceFirstOfficer`
   (`"first_officer"`) or whose severity is `planreview.SeverityHigh`
   (`"high"`); medium/low stay advisory (ADR-027). No requirement-arbitration
@@ -220,9 +232,15 @@ below); eject/promote and durability are slices 3-4.
   `review_coverage_incomplete`, `acceptance_not_eligible`,
   `acceptance_stale`, `checks_not_green`, `checks_red`,
   `blocking_concern_open`, `undeterminable`. The ADMISSION variant differs
-  only in leg (c): it refuses an observed RED required check and nothing else
-  (a freshly advanced head is legitimately pending; the verify pass is the
-  gate there). The entry-aware variants (`mergeQueueAdmissionEligibilityAt`,
+  only in leg (c): it refuses an observed RED required check (now including
+  a completed-cancelled latest attempt) and nothing else (a freshly advanced
+  head is legitimately pending; the verify pass is the gate there); its
+  checks-read failures stay `undeterminable` (an A3 residual).
+  `mergeGateLegsOf` is the ONE mapping of reason codes onto A3.1's retryable
+  set (Red = `checks_red`, Pending = `checks_not_green`, Review =
+  `review_pending` / `review_coverage_incomplete`, Veto =
+  `forge_approval_vetoed`, Other = any other determined code,
+  Undeterminable); merge-on-pass, admission and the re-probe all read it. The entry-aware variants (`mergeQueueAdmissionEligibilityAt`,
   `mergeQueueMergeEligibility`, which requires checks GREEN) take the entry's
   intent anchor. `ApprovalBasis` is `live` when the entry or anchor-less
   admission variant passed leg (a) on a declared gate through a live
@@ -331,10 +349,19 @@ deadline): `backend/internal/mergequeue/README.md`.
 - **Pre-lock checks.** Run missing/terminal → drop `run_terminal`; PR merged
   → settle merged `pr_merged`, closed → drop `pr_closed`, head ≠ anchored
   head → readvance; verify failed → eject `verify_failed`, not
-  passed/not_required → hold; `mergeQueueMergeEligibility` at the anchor
-  {recorded intent sequence, base}: undeterminable or only
-  `checks_not_green` → hold, any other reason → drop `not_merge_eligible`
-  (re-enter at the tail with `fishhawk_merge_run`, ADR-093 Q2). The merge
+  passed/not_required → hold; step 4, `mergeQueueMergeEligibility` at the
+  anchor {recorded intent sequence, base}, read through `mergeGateLegsOf`
+  (docs/adr/112 A3.2, #4780): eligible continues; undeterminable (only a
+  non-check leg in the merge variant) → hold `not_mergeable_yet` (an A3
+  residual); any non-retryable determined reason, alone or beside a
+  retryable one → drop `not_merge_eligible` (re-enter at the tail with
+  `fishhawk_merge_run`, ADR-093 Q2); otherwise the merge-gate yield
+  (`mergeGateYieldFor`, tier (a) > (b) > (c)): red (A3.1(a)) yields
+  `merge_checks_red` / `retrigger_ci` AT ONCE, pending (A3.1(b)) or a
+  settling review round (A3.1(c)) returns `await_gate` and holds on the
+  merge-gate window (§ "docs/adr/112 Amendment A3: merge-gate legs hold or
+  yield, never drop"), then yields `merge_checks_pending` /
+  `merge_review_pending` / `retry_after`. The merge
   variant makes NO forge review read (ADR-112 variant restriction): the
   approval is judged only in-lock, by the fold (step 6b below). Then a
   best-effort `fishhawk_audit_complete` republish at the head.
@@ -749,10 +776,17 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `forge_approval_vetoed`, `_review_required`, `_dismissed`, `_absent`,
   `_undetermined`, `_reviews_truncated`, `_provider_unsupported`,
   `_identity_provider_unconfigured` (a `member_of` gate with no identity
-  provider, keyed on the fold's REASON), and `forge_review_required` (row 4).
-  `next_step` is DERIVED through the total mapping `mergeQueueYieldNextStep`
-  (`approve_pr` | `dismiss_review` | `retry_after` |
-  `configure_identity_provider` | `none`), never stored on the entry; the
+  provider, keyed on the fold's REASON), `forge_review_required` (row 4),
+  and the docs/adr/112 A3 merge-gate reasons (row 1) `merge_checks_red`,
+  `merge_checks_pending` and `merge_review_pending` (the yield_reason
+  `merge_checks_pending` is distinct from the merge endpoint's 409 error
+  code of the same name). `next_step` is DERIVED through the total mapping
+  `mergeQueueYieldNextStep` (`approve_pr` | `dismiss_review` | `retry_after`
+  | `retrigger_ci` | `configure_identity_provider` | `none`; `merge_checks_red`
+  → `retrigger_ci`, the other two merge-gate reasons → `retry_after`), never
+  stored on the entry; `MergeQueueYieldVocabulary()` exposes a fresh copy for
+  the server / MCP / OpenAPI drift pin
+  (`mcpserver`'s `TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI`); the
   `merge_queue_yielded` row's `next_step` is the same mapping value
   (`mergeOnPassFoldYield` never takes the fold's own `NextStep`, #4764), so
   the recorded row and every read surface agree. The mapping matches the
@@ -779,8 +813,9 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   BLOCKED; a null reviewDecision is row 5's eject) yields
   `forge_review_required` with the claim released.
 - **Expired-wait enforcement (#4748, `mergeOnPassEnforceExpiredWait`).**
-  Once an episode is ESTABLISHED (`approval_wait_started_at` set), the
-  deadline is also enforced on the pre-claim paths that return before the
+  Once an approval wait is OPEN in this admission epoch
+  (`approval_wait_started_at` set AND `approval_wait_open`, docs/adr/112
+  A3.7 rule (i)), the deadline is also enforced on the pre-claim paths that return before the
   await_approval outcome: every readvance (base moved, head moved) and every
   approval-uncertain TRANSIENT hold carries the yield an expired wait applies
   (`mergeOnPassOutcome.ExpiryYield`). Non-transient holds are OUTSIDE this
@@ -790,8 +825,10 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   below); the deadline is enforced on pre-claim readvances and
   approval-uncertain transient holds only. The pump hands the decision to the
   enforcement, which, after a no-lock pre-filter (an ExpiryYield, no in-flight
-  mark of the decision's own, a readvance or hold, an established anchor: a
-  readvance or hold never STARTS an episode), takes the run's merge-intent
+  mark of the decision's own, a readvance or hold, an OPEN approval wait: a
+  readvance or hold never STARTS an episode, and an anchor RETAINED across a
+  clear with no open wait never fires, so readvance, transient and
+  merge-gate holds after a clear follow their own rules), takes the run's merge-intent
   lock, the same lock that guards `SetPhase(merging)` and
   `ClaimMergeDispatch` (first-officer ruling C1). Inside it, in order: re-read
   the entry (live, same epoch, phase passed), the in-process in-flight
@@ -841,11 +878,12 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `TestEnqueue_BaseChangeStartsNewWaitEpisode`.)
 - **Admission.** An intent-bearing admission evaluates no approval leg; it
   keeps the review-round / coverage legs and runs the R2 veto through the
-  fold. Row 1 first: a determined non-approval ineligibility drops as before,
-  even with a veto present; a veto ALONE yields at the admission epoch
-  (`admitYielded`, the pump continues); `veto_undetermined` is
-  undeterminable. The entry and anchor-less (ADR-092 rebase-path) variants
-  keep their approval requirement.
+  fold, then applies docs/adr/112 A3.3's four-row table (§ "docs/adr/112
+  Amendment A3: merge-gate legs hold or yield, never drop"): a veto, alone
+  or beside a red check, yields at the admission epoch (`admitYielded`, the
+  pump continues); `veto_undetermined` is undeterminable. The entry and
+  anchor-less (ADR-092 rebase-path) variants keep their approval
+  requirement.
 - **Entry (`merge_run` queue arm).** With a head-pinned merger bound, an
   ineligibility made ONLY of approval-leg reasons (`not_approved` →
   `forge_approval_absent`, `changes_requested` → `forge_approval_vetoed`)
@@ -873,45 +911,42 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   mark means a sweep that overran its tick never skips a point and no row
   past the cap starves on a tick-parity stride (concern 8b3f29f5). The ADR-093
   D4 re-entry sweep keeps its own previous-sweep window (`yieldReprobeDue(age,
-  since, interval)`). The targeted re-probe never touches the marks. The
-  fold runs at the anchored head
-  with no store transaction open: approved AND the ONE clear predicate
-  `mergeQueueYieldClears` holds → `ClearYield` (CAS on
-  `anchored_head_sha` and `yielded_at`) → `merge_queue_yield_cleared` → a
-  detached pump (the row rejoins FIFO at its `enqueued_at`). The predicate
-  clears every reason on the approved fold EXCEPT `forge_review_required`:
-  that row yielded BECAUSE the fold approved and the forge still refused (a
-  gate-less fold is always approved), so it clears only when a FRESH review
-  snapshot, read even on a gate-less run (`forgeReviewRequiredSnapshot`, the
-  row-4 yield's own read), shows reviewDecision neither `REVIEW_REQUIRED` nor
-  `CHANGES_REQUESTED` (null is not the condition) and mergeStateStatus not
-  `BLOCKED`; an unreadable or undetermined snapshot keeps it yielded (fail
-  closed). Every automatic path (the sweep, the targeted re-probe, the
-  webhook trigger) judges that predicate unforced, so an unchanged forge state
-  never loops clear → re-admit → refused PUT → re-yield; the operator's
-  explicit `merge_run` re-invoke forces ONE re-attempt (`force`). The same
-  reason → nothing; a changed reason → `UpdateYield` + a `merge_queue_yielded`
-  transition row; the PR head moved → `ReanchorYielded` to the current head
-  KEEPING the marker and the episode (a head move never clears a marker),
-  then the new head is judged on the same probe; merged, a transport error
-  or a CAS conflict → nothing. Targeted, no-backoff re-probes: a
-  `merge_run` re-invoke on a queued yielded entry (and the inline
-  `merge_queue_owns_merge` refusal on one), and an approved
-  `pull_request_review` whose `commit_id` equals the anchored head, at most
-  once per run per pump interval; the webhook is a trigger only, the fold
-  (and, for `forge_review_required`, the fresh snapshot) is the sole
-  decision.
-- **One episode per same-reason re-yield.** A live entry re-yielding for the
-  SAME reason on the same anchored head and base as its LAST cleared episode
+  since, interval)`). The targeted re-probe never touches the marks. Each
+  probe runs with no store transaction open, in docs/adr/112 A3.4's order
+  (§ "docs/adr/112 Amendment A3: merge-gate legs hold or yield, never
+  drop"): gate-independent PR-head discovery (a moved head →
+  `ReanchorYielded` to the current head KEEPING the marker and the episode;
+  a head move never clears a marker), the fold at the anchored head, the
+  merge-gate legs (an undeterminable result → nothing, fail closed), then
+  the tier (`mergeQueueYieldTier`). Not blocked → `ClearYield` (CAS on
+  `anchored_head_sha` and `yield_revision`) → `merge_queue_yield_cleared` →
+  a detached pump (the row rejoins FIFO at its `enqueued_at`). Blocked with
+  the same reason → nothing; with another reason → `UpdateYield` + a
+  `merge_queue_yielded` transition row; merged, closed, a transport error or
+  a CAS conflict → nothing. Every automatic path (the sweep, the targeted
+  re-probe, the approval and check_run webhook triggers) judges unforced, so
+  an unchanged forge state never loops clear → re-admit → refused PUT →
+  re-yield; the operator's explicit `merge_run` re-invoke forces ONE
+  re-attempt (`force`, A3.9: it skips ONLY the row-4 fresh snapshot).
+  Targeted, no-backoff re-probes: a `merge_run` re-invoke on a queued
+  yielded entry (and the inline `merge_queue_owns_merge` refusal on one), an
+  approved `pull_request_review` whose `commit_id` equals the anchored head
+  (at most once per run per pump interval), and a completed `check_run` at
+  the anchored head (A3.8); a webhook is a trigger only, the probe is the
+  sole decision.
+- **One episode per base ref (docs/adr/112 A3.7).** A live entry re-yielding
+  on the same base ref as its LAST cleared episode
   (`mergeQueueYieldContinuation`, read from the last
-  `merge_queue_yield_cleared` row, which carries `base_sha`) keeps that
-  episode's `yielded_at` (`mergequeue.YieldMarker.Continue`, judged against
-  the anchor in the store's own statement): the backoff age keeps growing
-  and the episode is posted once. A moved head or base, another reason, or a
-  missing cleared row is a new episode. Residual: the continued episode
-  reuses the marker's CAS key, so a re-probe racing the re-yield with the
-  PRIOR marker may clear it once more (one re-attempt, re-yielded in the same
-  episode).
+  `merge_queue_yield_cleared` row naming the entry id and base ref) keeps
+  that episode's `yielded_at`, WHATEVER the reason or head
+  (`mergequeue.YieldMarker.Continue`, judged in the store's own statement):
+  the backoff age keeps growing and the episode is posted once. Another base
+  ref or a missing cleared row is a new episode. A re-probe racing the
+  re-yield with the PRIOR marker cannot clear or overwrite it: every marker
+  write bumps `yield_revision` and the yielded-row writes compare-and-swap on
+  it (A3.6). Residual: the posted-once notice is keyed on `yielded_at`, so a
+  new blocker after a clear in a continued episode is not re-posted (widens
+  #4675).
 - **Surfacing and audit.** `merge_queue_yielded` (INTERNAL: entry_id,
   base_ref, head_sha, yield_reason, yield_detail, next_step, site
   `merge_on_pass` | `admission` | `merge_run` | `reprobe` | `reprobe_heal`,
@@ -936,11 +971,17 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   (`mergeQueueYieldRemedy`), never the detail. MCP: the three mirrors in
   `mcpserver/client.go` carry the five fields, and `next_actions`'
   `foldMergeQueueYield` adds the remedy per `next_step` (`approve_pr`,
-  `dismiss_review`, `retry_after` → `fishhawk_merge_run` (an already
-  offered `fishhawk_merge_run` is rewritten in place, never duplicated),
-  `configure_identity_provider`; `none` adds nothing), built only from the
-  closed vocabulary; an out-of-vocabulary `yield_reason` renders generically
-  and `yield_detail` never reaches it.
+  `dismiss_review`, `retrigger_ci` → `fishhawk_retrigger_ci` {run_id},
+  `retry_after` → `fishhawk_merge_run` (an already offered
+  `fishhawk_merge_run` is rewritten in place, never duplicated; the prose
+  names the pending checks or settling review round for the merge-gate
+  reasons), `configure_identity_provider`; `none` adds nothing), built only
+  from the closed vocabulary; for a merge-gate reason the run note and the
+  fold's prose say the re-probe clears the marker when every merge-gate leg
+  passes at the anchored head, never "a qualifying forge approval"; an
+  out-of-vocabulary `yield_reason` renders generically and `yield_detail`
+  never reaches it (contract: `backend/internal/mcpserver/README.md` §
+  "Yielded entries").
 - **Rollback.** Revert the slice PRs together (store, eligibility,
   merge-on-pass, re-probe), or first clear the markers with `UPDATE
   merge_candidate_queue_entries SET yield_reason=NULL, yield_detail=NULL,
@@ -980,6 +1021,173 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `TestMergeQueueYieldMirrors_DecodeServerWireLiterals` (strict decode of
   the server's spelling into all three mirrors) and
   `TestFoldMergeQueueYield_*`.
+
+### docs/adr/112 Amendment A3: merge-gate legs hold or yield, never drop ([#4780](https://github.com/kuhlman-labs/fishhawk/issues/4780))
+
+Authority: docs/adr/112 Amendment A3 (A3.1-A3.9, ratified 2026-10-30;
+`docs/adr/112-queue-merge-forge-approval-predicate.md`). Before A3 a red
+required check at step 4 dropped an intent-bearing head of line
+`not_merge_eligible` and lost the operator's merge intent. Under A3 a
+RETRYABLE merge-gate leg never drops an intent-bearing entry before
+dispatch: it holds the line for a bounded window or yields its place. Store
+contract (columns, CAS keys, `GateWait`, budget): `backend/internal/mergequeue/README.md`
+§ "Yield".
+
+- **A3.1 the legs (`merge_queue_eligibility.go`).** The PR-head checks leg
+  classifies with `mergeoutcome.ClassifyMergeGateCI` (per suite the latest
+  attempt decides; completed in the fail set or cancelled = red; § "Merge
+  queue" leg (c) above). `mergeGateLegsOf` maps the reason codes onto A3.1's
+  retryable set: (a) Red = `checks_red`; (b) Pending = `checks_not_green`,
+  which in the MERGE variant includes zero runs and every checks-read
+  failure; (c) Review = `review_pending` / `review_coverage_incomplete`.
+  Veto (`forge_approval_vetoed`), Other (any other determined code) and
+  Undeterminable sit beside them.
+- **A3.2 merge-on-pass step 4 (`merge_queue_merge.go`).** (a) yields
+  `merge_checks_red` / `retrigger_ci` at once (`await_gate`, Immediate);
+  (b) and (c) return `await_gate` and `mergeOnPassEnforceGateWait` calls
+  `Store.GateWait(entry, epoch, s.mergeQueueGateWait())` OUTSIDE the
+  merge-intent lock: an open, unexpired window holds the line (the base
+  frozen, the pump stops); Expired or NoToken takes the lock, runs
+  `mergeOnPassPreYieldRefusal` (entry re-read, in-flight registry, D1 claim;
+  a refusal holds) and yields `merge_checks_pending` or
+  `merge_review_pending` / `retry_after`. Pending beside review reads
+  `merge_checks_pending`; red beside any non-retryable determined reason
+  drops `not_merge_eligible`; a GateWait write error holds. The window is
+  `Config.MergeQueueGateWait` (fishhawkd `--merge-queue-gate-wait` /
+  `FISHHAWKD_MERGE_QUEUE_GATE_WAIT`, default the approval wait;
+  `backend/README.md`), opens at the entry's FIRST (b)/(c) hold in an
+  admission epoch (never at admission), continues within the epoch ((b)
+  then (c) spends one token) and never reads or writes
+  `approval_wait_started_at`.
+- **A3.3 admission (`merge_candidate_queue.go`).** An intent-bearing
+  admission's ineligible branch, FIRST matching row: (1) Undeterminable →
+  unadmit, intent kept; (2) Other → drop `not_merge_eligible`, even beside a
+  veto or a retryable leg; (3) Veto, alone or beside Red → the veto yield
+  (R3 row 2); (4) Red and/or Review with no veto → the merge-gate yield
+  (`mergeGateYieldFor`) at the admission epoch (`admitYielded`, FIFO
+  position kept, the pump continues). An entry without intent keeps the
+  drop. Unchanged: the ENTRY site (`merge_run`'s enqueue arm) still refuses a
+  red check or zero runs with its `merge_queue_ineligible` hint
+  (`TestMergeRun_EntrySiteStillRefusesRedAndZeroRuns`).
+- **A3.4 one clear predicate (`merge_queue_yield_reprobe.go`).** The
+  re-probe clears a marker only when the fold is approved, every merge-gate
+  leg passes at the anchored head under the merge variant, and, while
+  `row4_flag` is set or the stored reason is `forge_review_required` (unless
+  forced), a fresh snapshot no longer reads
+  `REVIEW_REQUIRED`, `CHANGES_REQUESTED` or `BLOCKED`. PR-head discovery is
+  gate-independent: the probe reads the PR first and re-anchors a moved head
+  (`ReanchorYielded`), so a gate-less repair push is found even though a
+  gate-less fold is always approved. That read is a HARD precondition: a run
+  with no GitHub client, no installation or no tracked PR, or a failed read,
+  does nothing (marker kept, nothing written), so its yield never clears
+  automatically, the operator's `merge_run` re-invoke included (it runs the
+  same probe). Merge-on-pass holds such a run transient on the same missing
+  installation, so an unread clear would only re-admit an entry that cannot
+  merge (`TestMergeQueueYieldReprobe_NothingBranches`).
+- **A3.5 tiers (`mergeQueueYieldTier`).** 1 veto > 2 merge-gate (red >
+  pending > review) > 3 row-4 (flag set or reason `forge_review_required`,
+  fresh snapshot present) > 4 any
+  other non-approved fold (`mergeOnPassFoldYield`). Blocked with the stored
+  reason → nothing; another reason → `UpdateYield` + a `merge_queue_yielded`
+  transition row. The merge-gate reasons are precedence row 1
+  (`mergeQueueYieldRowEligibility`).
+- **A3.6 `row4_flag` and `yield_revision`.** A `forge_review_required` yield
+  sets `row4_flag`; no reason transition clears it; only a successful clear
+  whose own snapshot showed the condition gone clears it (a forced clear
+  keeps it). 0115 backfills the flag on every pre-0115
+  `forge_review_required` yield, and tier 3 also reads that stored reason,
+  so a row-4 marker a pre-0115 or reverted binary wrote without the flag
+  keeps its obligation (concern fd0cf884,
+  `TestMigrateDown_MergeQueueGateWaitReversal`,
+  `TestMergeQueueYieldReprobe_UpgradedForgeReviewRequiredWithoutFlagKeepsTheYield`). Every marker write (Yield, Enqueue's mark, UpdateYield,
+  ClearYield, ReanchorYielded) bumps `yield_revision`, and the yielded-row
+  writes compare-and-swap on `(anchored_head_sha, yield_revision)`, so a
+  delayed probe holding an older revision cannot clear or overwrite a newer
+  marker.
+- **A3.7 episode, windows and budget.** The continuation key is the entry's
+  last cleared episode on the same base ref, whatever the reason or head
+  (§ "One episode per base ref"). `approval_wait_started_at` is RETAINED
+  across a clear or re-admission (once per episode): a later approval-fold
+  block in the same episode gets no fresh window, so `Store.ApprovalWait`
+  reports it expired and that await_approval yields its `forge_approval_*`
+  reason at once (intended). `approval_wait_open` means only "an approval
+  wait is open in THIS epoch"; `mergeOnPassEnforceExpiredWait` applies the
+  approval anchor's expiry only while it is true, so a retained anchor never
+  expires a readvance, transient or merge-gate hold. The merge-gate window is
+  per admission epoch, drawn from a persisted per-entry budget of
+  `mergequeue.GateHoldBudget` (3) tokens refilled one per
+  `GateHoldRefill` (1 h) not holding: `k = floor((now -
+  gate_tokens_refilled_at) / 60 min)` CLAMPED to `[0, 3]`, no negative
+  remainder, the refill clock never past now. An empty budget yields at
+  once. A base retarget (A1.2) is a new row with a full budget and no
+  anchors.
+- **A3.8 the check_run trigger (`merge_queue_checkrun_trigger.go`).**
+  `webhook.go` routes a `check_run` delivery (beside `ingestCheckRun` and
+  the CI-policy re-evaluation; best-effort, never a 5xx) to
+  `triggerMergeQueueYieldOnCheckRun`: action `completed` at a yielded,
+  intent-bearing entry's anchored head, for a name in the run's required
+  checks snapshot (any observed name when the snapshot is nil or empty),
+  probes `ReprobeMergeQueueYield(ctx, runID, false)`. A per-run, PROCESS-LOCAL
+  coalescer gives single flight, dedupe by check-run id, the approval
+  webhook's per-run minimum interval (`MergeCandidateQueuePumpInterval`),
+  and coalescing that never drops: a trigger during an in-flight probe or
+  inside the interval records exactly ONE follow-up PER PROCESS. Duplicates
+  across replicas are harmless because the clear CASes on
+  `(anchored_head_sha, yield_revision)`; the sweep remains the shared
+  fallback. A scheduled follow-up's timer holds no drain slot; probes start
+  only through `spawnMergeQueueYieldProbe`, which `Server.Shutdown` closes
+  before its drain, so a timer firing during or after the drain starts
+  nothing (concern 548f1a65,
+  `TestCheckRunTrigger_ShutdownStartsNoScheduledFollowUp`).
+- **A3.9 force.** The operator's `merge_run` re-invoke forces the probe,
+  which skips ONLY the row-4 fresh snapshot; it never skips the fold, the
+  veto, the merge-gate legs or the CAS, and a forced clear keeps
+  `row4_flag`.
+- **Surfaces.** The run payload's note and remedy, the `merge_run` 202 and
+  `next_actions` are reason-aware: `retrigger_ci` names
+  `fishhawk_retrigger_ci`, and a merge-gate yield clears when every
+  merge-gate leg passes, never on "a qualifying forge approval" (`runs.go`
+  `mergeQueueYieldRemedy`, `merge_run.go` `mergeRunYieldNextStepText`,
+  `mcpserver` `foldMergeQueueYield`; OpenAPI `MergeQueueYieldReason` /
+  `MergeQueueNextStep`, pinned three ways by
+  `TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI`).
+- **Operator walk expectation: the cancelled-sibling CI shape YIELDS.** A
+  concurrency-cancelled sibling run's red `CI Pass`, or a completed-cancelled
+  latest attempt, is red under A3.1(a): the entry yields `merge_checks_red`
+  / `retrigger_ci` and does NOT merge through (no superseded- or
+  cancelled-run tolerance; A3 declines it). This diverges from #4780's issue
+  text, which asked for the newest completed run to win; re-run the checks
+  with `fishhawk_retrigger_ci` and the check_run trigger clears the yield.
+- **Residuals (A3, stated, not fixed).** Admission's checks-read uncertainty
+  still unadmits and can stall the base; undeterminable review, spec,
+  acceptance or concern reads keep the unbounded hold; a re-opened round
+  that posts a blocking concern drops as row 2 of A3.3; the posted-once
+  notice is keyed on `yielded_at` (widens #4675); a hold that ends early is
+  charged as holding for up to its full window, so the refill can lag A3.7, never lead it. Out of scope: #4803 (no
+  verify-only exemption is added to the merge overlap guard,
+  `merge_overlap_guard.go` is unchanged), #4832, #4835.
+- **Tests.** Classifier: `mergeoutcome`'s `TestClassifyMergeGateCI`,
+  `TestClassifyMergeCI_UnchangedByGateRules`. Legs:
+  `TestMergeQueueChecksLeg_A31`, `TestMergeGateLegsOf`. Store
+  (`mergequeue/store_test.go`): `TestGateWait_*`,
+  `TestYieldRevision_EveryMarkerWriteBumps`,
+  `TestClearYield_StaleRevisionRefused`,
+  `TestUpdateYield_StaleRevisionCannotOverwriteNewerReason`,
+  `TestRow4Flag_Lifecycle`, `TestClearYield_RetainsApprovalAnchorAndClosesWait`,
+  `TestApprovalWait_RetainedAnchorAfterClear`,
+  `TestYield_ContinuesLastClearedEpisodeOnSameBaseRef`. Server:
+  `TestMergeGateYieldFor`, `TestMergeOnPassEnforceExpiredWait_ClosedApprovalWaitNeverFires`,
+  `TestReprobe_A34_*`, `TestReprobe_A35_TierTransitions`, `TestReprobe_A36_*`,
+  `TestReprobe_A37`, `TestReprobe_A39_ForceSkipsOnlySnapshot`,
+  `TestMergeOnPass_A32_Step4`, `TestMergeOnPassEnforceGateWait`,
+  `TestMergeOnPass_GateHoldNeverSetsApprovalAnchor`,
+  `TestMergeOnPass_GateWindowStartsAtFirstHoldNotAdmission`,
+  `TestAdmission_A33Table`, `TestCheckRunTrigger_*`,
+  `TestWebhook_CheckRunRoutesToYieldTrigger`, and the cross-layer
+  `TestMergeQueueE2E_A3MergeGateLegsHoldOrYieldNeverDrop`. Surfaces:
+  `TestMergeQueueYieldRemedy_*`, `TestMergeRunYieldNextStepText_*`,
+  `mcpserver`'s `TestFoldMergeQueueYield_*` and the server-to-MCP e2e
+  `integration/mcp`'s `TestE2E_MergeQueue_MergeChecksRedYieldOffersRetriggerCI`.
 
 ### Merge queue read (`merge_queue_read.go`)
 
@@ -1069,7 +1277,8 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   code. The unstable-status arm used to hold as transient, so the next pump
   claimed and dispatched again. **The asymmetry is deliberate — do not
   "fix" one arm to match the other:** pending checks HOLD before dispatch
-  (the pre-lock `onlyChecksNotGreen` rule), so slow CI never ejects; only the
+  (step 4's merge-gate window, then a `merge_checks_pending` yield,
+  docs/adr/112 A3.2), so slow CI never ejects; only the
   forge's own refusal of the merge PUT ejects, and its `forge_detail` /
   remedy say the checks were not settled at the merge attempt (remedy:
   `fishhawk_merge_run` once they settle). The `checks_not_settled`

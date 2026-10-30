@@ -3041,24 +3041,37 @@ components:
           description: |
             The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
             set on the first non-approved fold at the head, never reset by a
-            readvance or re-admission, cleared only when a re-probe clears the
-            yield. Present on a live entry waiting at the head and on a yielded
-            entry; omitted when no wait started.
+            readvance, a re-admission or (docs/adr/112 A3.7) a re-probe clear:
+            it is RETAINED for the whole episode, so a later approval-fold block
+            in the same episode gets no fresh window and yields at once. A
+            merge-gate hold never sets it. Present on a live entry that waited at
+            the head and on a yielded entry; omitted when no wait started.
 
     MergeQueueYieldReason:
       type: string
       description: |
-        ADR-112 R3's closed yield vocabulary. A yielded entry is held with a
-        marker the queue's admission skips; clearing the marker (a re-probe
-        whose forge-approval fold qualifies; for `forge_review_required`, also
-        a fresh forge snapshot that no longer reports review required, changes
-        requested or `BLOCKED`) is the only way back in, and the entry then
-        rejoins FIFO at its original `enqueued_at`. `vetoed`,
-        `provider_unsupported` and `identity_provider_unconfigured` yield at
-        once; the others wait at the head for the approval window first;
-        `forge_review_required` is precedence row 4 (the forge refused the
-        pinned merge and reports the pull request still needs review or is
-        blocked).
+        ADR-112 R3's closed yield vocabulary, extended by docs/adr/112
+        Amendment A3 (#4780). A yielded entry is held with a marker the queue's
+        admission skips; clearing the marker is the only way back in, and the
+        entry then rejoins FIFO at its original `enqueued_at`. Under A3.4 ONE
+        clear predicate applies to every reason: the re-probe clears the marker
+        only when the forge-approval fold qualifies, every merge-gate leg passes
+        at the anchored head, and (while the entry's row-4 flag is set, unless
+        an operator merge re-invoke forces the probe) a fresh forge snapshot no
+        longer reports review required, changes requested or `BLOCKED`.
+        `vetoed`, `provider_unsupported` and `identity_provider_unconfigured`
+        yield at once; the other `forge_approval_*` reasons wait at the head for
+        the approval window first; `forge_review_required` is precedence row 4
+        (the forge refused the pinned merge and reports the pull request still
+        needs review or is blocked). The merge-gate reasons (A3.1/A3.2,
+        precedence row 1) are `merge_checks_red` (a required check's latest
+        attempt failed or was cancelled at the anchored head; yields at once),
+        `merge_checks_pending` (a required check is pending, unreported or
+        unreadable there) and `merge_review_pending` (the implement-review round
+        there is still settling); the last two hold the line for a per-admission
+        merge-gate window first. The `yield_reason` `merge_checks_pending` is
+        DISTINCT from the 409 error code of the same name on
+        `POST /v0/runs/{run_id}/merge`: the two live in separate value spaces.
       enum:
         - forge_approval_vetoed
         - forge_approval_review_required
@@ -3069,6 +3082,9 @@ components:
         - forge_approval_provider_unsupported
         - forge_approval_identity_provider_unconfigured
         - forge_review_required
+        - merge_checks_red
+        - merge_checks_pending
+        - merge_review_pending
 
     MergeQueueNextStep:
       type: string
@@ -3076,10 +3092,16 @@ components:
         The operator remedy for a yield, a TOTAL mapping of `yield_reason`:
         `approve_pr` (review_required, dismissed, absent, forge_review_required),
         `dismiss_review` (vetoed), `retry_after` (undetermined,
-        reviews_truncated; re-invoke `POST /v0/runs/{run_id}/merge` to
-        re-probe now), `configure_identity_provider`
-        (identity_provider_unconfigured), `none` (provider_unsupported).
-      enum: [approve_pr, dismiss_review, retry_after, configure_identity_provider, none]
+        reviews_truncated, merge_checks_pending, merge_review_pending; for the
+        forge reads re-invoke `POST /v0/runs/{run_id}/merge` to re-probe now,
+        for the merge-gate reasons the check_run trigger or the periodic
+        re-probe clears the yield once the legs pass), `retrigger_ci`
+        (merge_checks_red: re-run the failed or cancelled checks, e.g. with
+        `fishhawk_retrigger_ci`; the check_run trigger, the periodic re-probe
+        or a merge re-invoke then clears the yield under docs/adr/112 A3.4),
+        `configure_identity_provider` (identity_provider_unconfigured), `none`
+        (provider_unsupported).
+      enum: [approve_pr, dismiss_review, retry_after, configure_identity_provider, retrigger_ci, none]
 
     RunCompletionBlocked:
       type: object
@@ -4001,9 +4023,11 @@ components:
           description: |
             The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
             set on the first non-approved fold at the head, never reset by a
-            readvance or re-admission, cleared only when a re-probe clears the
-            yield. Present on a live entry waiting at the head and on a yielded
-            entry; omitted when no wait started.
+            readvance, a re-admission or (docs/adr/112 A3.7) a re-probe clear:
+            it is RETAINED for the whole episode, so a later approval-fold block
+            in the same episode gets no fresh window and yields at once. A
+            merge-gate hold never sets it. Present on a live entry that waited at
+            the head and on a yielded entry; omitted when no wait started.
 
     MergeQueueDispatchClaim:
       type: object
@@ -4071,9 +4095,11 @@ components:
           description: |
             The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
             set on the first non-approved fold at the head, never reset by a
-            readvance or re-admission, cleared only when a re-probe clears the
-            yield. Present on a live entry waiting at the head and on a yielded
-            entry; omitted when no wait started.
+            readvance, a re-admission or (docs/adr/112 A3.7) a re-probe clear:
+            it is RETAINED for the whole episode, so a later approval-fold block
+            in the same episode gets no fresh window and yields at once. A
+            merge-gate hold never sets it. Present on a live entry that waited at
+            the head and on a yielded entry; omitted when no wait started.
 
     MergeQueueETABasis:
       type: object

@@ -26,24 +26,33 @@ package server
 //     (the merge_run re-invoke, which FORCES one re-attempt, and the approval
 //     webhook, which does not, slice 4).
 //
-// A re-probe runs the ONE forge-approval fold at the row's anchored head with
-// no store transaction open: the clear predicate holds (mergeQueueYieldClears:
-// the fold approved and, for a forge_review_required row, a fresh snapshot
-// showing the row-4 condition gone) → ClearYield (CAS on anchored head and
-// yielded_at) → merge_queue_yield_cleared → a detached pump of the base (the
-// row rejoins FIFO at its enqueued_at); an approved fold the predicate refuses
-// → nothing; the same non-approved reason → nothing;
-// a changed reason → UpdateYield (same CAS) and a merge_queue_yielded
-// transition row; the PR head moved → ReanchorYielded to the current head,
-// KEEPING the marker and the episode (approval condition C2: a head move never
-// clears a marker), then the new head is judged on the same probe; merged, a
-// transport error or a CAS conflict → nothing. Contract:
+// A re-probe judges the row with no store transaction open, in the order of
+// docs/adr/112 Amendment A3.4 (#4780): (1) GATE-INDEPENDENT PR-head
+// discovery: the PR is read (merged, closed, a read error, or no GitHub
+// client, installation or tracked PR to read it → nothing; a hard
+// precondition, so such a yield never clears automatically) and a
+// moved head re-anchors the row with ReanchorYielded (CAS on head and
+// yield_revision), KEEPING the marker, yielded_at, the approval anchor, the
+// row-4 flag and the budget (approval condition C2, A3.7: a head move never
+// clears a marker), and the probe judges the new head; (2) the forge-approval
+// fold at the anchored head (its head_moved branch stays as the race
+// fallback); (3) the merge-gate legs (mergeQueueMergeEligibility at the
+// anchored head; an undeterminable result → nothing, fail closed); (4) the
+// tier (mergeQueueYieldTier, A3.5: veto > merge-gate > row-4 > fold). Not
+// blocked → ClearYield (CAS on anchored head and yield_revision, A3.6) →
+// merge_queue_yield_cleared → a detached pump of the base (the row rejoins
+// FIFO at its enqueued_at); blocked with the stored reason → nothing; blocked
+// with another reason → UpdateYield (same CAS) and a merge_queue_yielded
+// transition row; a CAS conflict → nothing. force (the operator's merge_run,
+// A3.9) skips ONLY the row-4 fresh snapshot. Contract:
 // backend/internal/server/README.md and backend/internal/mergequeue/README.md
 // § "Yield".
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -294,9 +303,12 @@ func mergeQueueYieldEpisode(e mergequeue.Entry) (entryID, yieldedAt string) {
 	return e.ID.String(), e.YieldedAt.UTC().Format(time.RFC3339Nano)
 }
 
-// mergeQueueYieldRow is the ADR-112 R3 precedence row a stored reason names.
+// mergeQueueYieldRow is the ADR-112 R3 precedence row a stored reason names
+// (the three merge-gate reasons are row 1, docs/adr/112 A3.2).
 func mergeQueueYieldRow(reason string) int {
 	switch reason {
+	case mergeQueueYieldMergeChecksRed, mergeQueueYieldMergeChecksPending, mergeQueueYieldMergeReviewPending:
+		return mergeQueueYieldRowEligibility
 	case mergeCandidateQueueReasonForgeApprovalVetoed:
 		return mergeQueueYieldRowVeto
 	case mergeQueueYieldForgeReviewRequired:
@@ -395,10 +407,11 @@ func (s *Server) writeMergeQueueYieldPosted(ctx context.Context, e mergequeue.En
 }
 
 // ReprobeMergeQueueYield re-probes runID's yielded entry NOW, with no
-// backoff: the merge_run re-invoke and the approval webhook's trigger (the
-// fold re-reads the forge and is the sole decision). force is the operator's
-// explicit merge_run, which may re-attempt a forge_review_required yield once
-// (mergeQueueYieldClears); every automatic trigger passes false. It reports
+// backoff: the merge_run re-invoke and the approval and check_run webhook
+// triggers (the probe re-reads the forge and is the sole decision). force is
+// the operator's explicit merge_run, which skips ONLY the row-4 fresh
+// snapshot (mergeQueueYieldTier, docs/adr/112 A3.9); every automatic trigger
+// passes false. It reports
 // whether the marker was cleared (the base is then pumped, detached). A run
 // with no active entry, or one not yielded, does nothing.
 func (s *Server) ReprobeMergeQueueYield(ctx context.Context, runID uuid.UUID, force bool) bool {
@@ -412,11 +425,11 @@ func (s *Server) ReprobeMergeQueueYield(ctx context.Context, runID uuid.UUID, fo
 	return s.reprobeMergeQueueYield(ctx, st.Entry, force) == reprobeCleared
 }
 
-// reprobeMergeQueueYield re-judges the yielded entry e at its anchored head
-// (see the file comment; force as ReprobeMergeQueueYield). No store
-// transaction is open across the fold.
+// reprobeMergeQueueYield re-judges the yielded entry e (see the file
+// comment; force as ReprobeMergeQueueYield). No store transaction is open
+// across a forge read.
 func (s *Server) reprobeMergeQueueYield(ctx context.Context, e mergequeue.Entry, force bool) mergeQueueYieldReprobeOutcome {
-	if e.State != mergequeue.StateHeld || !e.Yielded() || s.cfg.RunRepo == nil {
+	if e.State != mergequeue.StateHeld || !e.Yielded() || s.cfg.RunRepo == nil || s.cfg.GitHub == nil {
 		return reprobeNothing
 	}
 	log := func(msg string, err error) {
@@ -433,93 +446,163 @@ func (s *Server) reprobeMergeQueueYield(ctx context.Context, e mergequeue.Entry,
 	if runRow.State.IsTerminal() {
 		return reprobeNothing
 	}
+	nothing := reprobeNothing // reprobeReanchored once this probe moved the anchor
+	reanchor := func(head string) bool {
+		moved, err := s.cfg.MergeQueue.ReanchorYielded(ctx, e.ID, e.AnchoredHeadSHA, e.YieldRevision, head, "")
+		if err != nil {
+			log("merge queue: the yield re-probe could not re-anchor the moved head; another write owns the entry", err)
+			return false
+		}
+		e, nothing = moved, reprobeReanchored
+		return true
+	}
+
+	// (1) A3.4: gate-independent PR-head discovery. A gate-less fold is
+	// approved without reading the PR, so the head is read here. The read is
+	// a HARD precondition: no GitHub client, no installation, no tracked PR
+	// or a read error → nothing, so such a yield clears only once the read
+	// succeeds. Clearing it unread would only re-admit an entry merge-on-pass
+	// itself holds transient on the same missing installation
+	// (mergeQueueMergeOnPass), and the fold and the checks leg read the same
+	// forge.
+	pr, err := s.mergeQueueReentryReadPR(ctx, runRow)
+	if err != nil {
+		log("merge queue: the yield re-probe could not read the pull request; the next tick retries", err)
+		return reprobeNothing
+	}
+	if pr.Merged || pr.State == "closed" {
+		return reprobeNothing
+	}
+	if pr.HeadSHA != "" && pr.HeadSHA != e.AnchoredHeadSHA && !reanchor(pr.HeadSHA) { // A3.4 head discovery
+		return reprobeNothing
+	}
+
+	// (2) The forge-approval fold at the anchored head.
 	fold, err := s.forgeApprovalFold(ctx, runRow, e.AnchoredHeadSHA)
 	if err != nil {
 		log("merge queue: the yield re-probe's review snapshot failed; the next tick retries", err)
-		return reprobeNothing
+		return nothing
 	}
 	if fold.Merged {
-		return reprobeNothing
+		return nothing
 	}
-	if fold.Reason == forgeApprovalReasonHeadMoved { // C2(a): re-anchor the yielded row, keep the marker
-		if fold.ObservedHead == "" {
-			return reprobeNothing
+	if fold.Reason == forgeApprovalReasonHeadMoved { // the race fallback: re-anchor the yielded row, keep the marker
+		if fold.ObservedHead == "" || fold.ObservedHead == e.AnchoredHeadSHA || !reanchor(fold.ObservedHead) {
+			return nothing
 		}
-		moved, err := s.cfg.MergeQueue.ReanchorYielded(ctx, e.ID, e.AnchoredHeadSHA, *e.YieldedAt, fold.ObservedHead, "")
-		if err != nil {
-			log("merge queue: the yield re-probe could not re-anchor the moved head; another write owns the entry", err)
-			return reprobeNothing
-		}
-		e = moved
 		fold, err = s.forgeApprovalFold(ctx, runRow, e.AnchoredHeadSHA)
 		if err != nil || fold.Merged || fold.Reason == forgeApprovalReasonHeadMoved {
 			return reprobeReanchored
 		}
 	}
-	if fold.approved() {
-		if !s.mergeQueueYieldClears(ctx, runRow, e, force) {
-			return reprobeUnchanged
-		}
-		cleared, err := s.cfg.MergeQueue.ClearYield(ctx, e.ID, e.AnchoredHeadSHA, *e.YieldedAt)
+
+	// (3) The merge-gate legs at the anchored head (merge variant).
+	elig := s.mergeQueueMergeEligibility(ctx, runRow, e.AnchoredHeadSHA,
+		mergeQueueIntentAnchor{Sequence: e.MergeIntentSequence, BaseRef: e.BaseRef})
+	if elig.Undeterminable { // fail closed: an unreadable leg never clears
+		log("merge queue: the yield re-probe could not determine every merge-gate leg; the entry stays yielded",
+			errors.New(mergeQueueReasonsText(elig.Reasons)))
+		return nothing
+	}
+
+	// (4) The tier.
+	y, blocked, row4Gone, ok := s.mergeQueueYieldTier(ctx, runRow, e, fold, elig, force)
+	if !ok {
+		return nothing
+	}
+	if !blocked {
+		cleared, err := s.cfg.MergeQueue.ClearYield(ctx, e.ID, e.AnchoredHeadSHA, e.YieldRevision, row4Gone)
 		if err != nil {
-			log("merge queue: the yield re-probe found a qualifying approval but the clear did not land", err)
-			return reprobeNothing
+			log("merge queue: the yield re-probe found every leg passing but the clear did not land", err)
+			return nothing
 		}
 		s.writeMergeQueueYieldCleared(ctx, e, cleared, fold)
 		s.pumpMergeCandidateQueueDetached(ctx, e.Base())
 		return reprobeCleared
 	}
-	y, _ := mergeOnPassFoldYield(fold)
 	if y.Reason == e.YieldReason { // same reason: dedup, nothing written
+		if nothing == reprobeReanchored {
+			return reprobeReanchored
+		}
 		return reprobeUnchanged
 	}
-	updated, err := s.cfg.MergeQueue.UpdateYield(ctx, e.ID, e.AnchoredHeadSHA, *e.YieldedAt, y.marker())
+	updated, err := s.cfg.MergeQueue.UpdateYield(ctx, e.ID, e.AnchoredHeadSHA, e.YieldRevision, y.marker())
 	if err != nil {
 		log("merge queue: the yield re-probe's reason transition did not land", err)
-		return reprobeNothing
+		return nothing
 	}
 	_ = s.writeMergeQueueYielded(ctx, updated, y, mergeQueueYieldSiteReprobe, e.YieldReason)
 	return reprobeTransitioned
 }
 
-// mergeQueueYieldClears is THE clear predicate for a yielded entry e whose
-// fold at the anchored head APPROVED; every clear through the re-probe (the
-// sweep, the targeted re-probe, the webhook trigger, the merge_run re-invoke)
-// judges it here. Every reason but forge_review_required clears on the
-// approved fold. A forge_review_required yield (ADR-112 R3 row 4) exists
-// BECAUSE the fold approved and the forge still refused, so the fold alone is
-// no evidence (a gate-less run's fold is always approved): it clears only when
-// a FRESH review snapshot, read even on a gate-less run, shows the row-4
-// condition gone (forgeReviewRequiredSnapshot). An unreadable or undetermined
-// snapshot keeps the row yielded (fail closed). force (the operator's explicit
-// merge_run) skips the snapshot: one re-attempt per invocation, and a refusal
-// re-yields in the same episode (mergeQueueYieldContinuation).
-func (s *Server) mergeQueueYieldClears(ctx context.Context, runRow *run.Run, e mergequeue.Entry, force bool) bool {
-	if e.YieldReason != mergeQueueYieldForgeReviewRequired || force {
-		return true
+// mergeQueueYieldTier is THE clear predicate and reason tiering for a yielded
+// entry e (docs/adr/112 A3.4/A3.5); every clear through the re-probe (the
+// sweep, the targeted re-probe, the approval and check_run triggers, the
+// merge_run re-invoke) judges it here. fold is the forge-approval fold and
+// elig the merge-variant eligibility, both at e's anchored head. The FIRST
+// matching tier blocks:
+//
+//  1. veto: the fold vetoed (forge_approval_vetoed);
+//  2. merge-gate: a retryable merge-gate leg (mergeGateYieldFor over
+//     mergeGateLegsOf(elig): merge_checks_red > merge_checks_pending >
+//     merge_review_pending);
+//  3. row-4: e.Row4Flag is set (or the stored reason is
+//     forge_review_required: a marker a pre-0115 or reverted binary wrote
+//     without the flag) and force is false, and a FRESH review
+//     snapshot (forgeReviewRequiredSnapshot, read even on a gate-less run)
+//     shows REVIEW_REQUIRED, CHANGES_REQUESTED or BLOCKED
+//     (forge_review_required); a snapshot read error is ok=false (the row
+//     stays yielded, fail closed);
+//  4. fold: any other non-approved fold (mergeOnPassFoldYield).
+//
+// Otherwise blocked is false: the row clears. row4Gone reports the snapshot
+// read on THIS probe showed the row-4 condition gone, the only evidence that
+// clears row4_flag (A3.6): a forced clear never reads it, so it keeps the
+// flag. force (A3.9, the operator's merge_run) skips ONLY the tier-3
+// snapshot: never the fold, the veto, the merge-gate legs or the CAS.
+func (s *Server) mergeQueueYieldTier(ctx context.Context, runRow *run.Run, e mergequeue.Entry, fold forgeApprovalDecision, elig mergeQueueEligibilityResult, force bool) (y mergeQueueYield, blocked bool, row4Gone bool, ok bool) {
+	if fold.Result == forgeApprovalVetoed { // A3.5 tier 1: the veto
+		vy, _ := mergeOnPassFoldYield(fold)
+		return vy, true, false, true
 	}
-	decision, status, present, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
-	if err != nil {
-		entryID, yieldedAt := mergeQueueYieldEpisode(e)
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"merge queue: the forge_review_required re-probe could not read a fresh review snapshot; the entry stays yielded",
-			slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
-			slog.String("detail", sanitizeForgeReadDetail("review_snapshot", err.Error())))
-		return false
+	if gy, gated := mergeGateYieldFor(mergeGateLegsOf(elig), elig); gated { // A3.5 tier 2: the merge-gate legs
+		return gy, true, false, true
 	}
-	if present {
-		entryID, yieldedAt := mergeQueueYieldEpisode(e)
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
-			"merge queue: the forge still reports the pull request needs review or is blocked; the forge_review_required entry stays yielded",
-			slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
-			slog.String("review_decision", decision), slog.String("merge_state_status", status))
+	// A3.5 tier 3: the row-4 fresh snapshot; force skips only this. The stored
+	// reason also carries the obligation: a forge_review_required marker a
+	// pre-0115 (or reverted) binary wrote never set row4_flag.
+	if (e.Row4Flag || e.YieldReason == mergeQueueYieldForgeReviewRequired) && !force {
+		decision, status, present, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
+		if err != nil {
+			entryID, yieldedAt := mergeQueueYieldEpisode(e)
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"merge queue: the forge_review_required re-probe could not read a fresh review snapshot; the entry stays yielded",
+				slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
+				slog.String("detail", sanitizeForgeReadDetail("review_snapshot", err.Error())))
+			return mergeQueueYield{}, false, false, false
+		}
+		if present {
+			entryID, yieldedAt := mergeQueueYieldEpisode(e)
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+				"merge queue: the forge still reports the pull request needs review or is blocked; the forge_review_required entry stays yielded",
+				slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
+				slog.String("review_decision", decision), slog.String("merge_state_status", status))
+			return newMergeQueueYield(mergeQueueYieldForgeReviewRequired,
+				fmt.Sprintf(mergeQueueYieldForgeRefusalDetail, decision, status), mergeQueueYieldRowForgeRefusal), true, false, true
+		}
+		row4Gone = true
 	}
-	return !present
+	if !fold.approved() { // A3.5 tier 4: the fold
+		fy, _ := mergeOnPassFoldYield(fold)
+		return fy, true, row4Gone, true
+	}
+	return mergeQueueYield{}, false, row4Gone, true
 }
 
 // writeMergeQueueYieldCleared appends the INTERNAL merge_queue_yield_cleared
 // row (the episode's resolution) for prior, the entry as it was yielded, now
-// cleared. The ClearYield CAS has committed, so a failed append is logged at
+// cleared. Its (entry_id, base_ref, yielded_at) is the key a later re-yield
+// continues (mergeQueueYieldContinuation, docs/adr/112 A3.7). The ClearYield CAS has committed, so a failed append is logged at
 // ERROR naming entry_id and yielded_at and the row is never rolled back
 // (approval condition C7).
 func (s *Server) writeMergeQueueYieldCleared(ctx context.Context, prior, cleared mergequeue.Entry, fold forgeApprovalDecision) {
@@ -528,13 +611,14 @@ func (s *Server) writeMergeQueueYieldCleared(ctx context.Context, prior, cleared
 	}
 	entryID, yieldedAt := mergeQueueYieldEpisode(prior)
 	payload, _ := json.Marshal(map[string]any{
-		"entry_id":     entryID,
-		"base_ref":     cleared.BaseRef,
-		"head_sha":     cleared.AnchoredHeadSHA,
-		"base_sha":     cleared.AnchoredBaseSHA,
-		"yield_reason": prior.YieldReason,
-		"yielded_at":   yieldedAt,
-		"basis":        fold.Basis,
+		"entry_id":       entryID,
+		"base_ref":       cleared.BaseRef,
+		"head_sha":       cleared.AnchoredHeadSHA,
+		"base_sha":       cleared.AnchoredBaseSHA,
+		"yield_reason":   prior.YieldReason,
+		"yielded_at":     yieldedAt,
+		"yield_revision": cleared.YieldRevision,
+		"basis":          fold.Basis,
 	})
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

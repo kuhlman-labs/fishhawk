@@ -396,16 +396,6 @@ func TestMergeQueueMergeOnPass_GateHolds(t *testing.T) {
 			w.gh.set(func() { w.gh.prs[1].head = "hx" })
 			req.Entry.AnchoredHeadSHA = "hx"
 		}, mergeOnPassReasonVerifyNotPassed},
-		{"checks pending", func(w *mqmWorld, _ *mergeOnPassRequest) {
-			w.gh.set(func() {
-				w.gh.checks["h1"] = `[{"id":1,"name":"ci","status":"in_progress","started_at":"2026-01-01T00:00:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
-			})
-		}, mergeOnPassReasonNotMergeable},
-		{"nil snapshot optional red", func(w *mqmWorld, _ *mergeOnPassRequest) {
-			w.gh.set(func() {
-				w.gh.checks["h1"] = `[{"id":1,"name":"lint","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
-			})
-		}, mergeOnPassReasonNotMergeable},
 		{"pr read error", func(w *mqmWorld, _ *mergeOnPassRequest) { w.gh.set(func() { delete(w.gh.prs, 1) }) }, mergeOnPassReasonTransient},
 		{"base probe error", func(w *mqmWorld, _ *mergeOnPassRequest) { w.gh.set(func() { w.gh.compareStatus["h1"] = 500 }) }, mergeOnPassReasonTransient},
 	}
@@ -1466,4 +1456,333 @@ func TestMergeOnPass_StampsMergingBeforeForgeCall(t *testing.T) {
 		t.Fatalf("during the forge call: phase %q claim %q in-flight %v, want merging, dispatched, true", phase, claimState, inFlight)
 	}
 	w.requireState(r, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+}
+
+// Check-run listings the A3 step-4 tests plant (docs/adr/112 A3.1).
+const (
+	mqmPendingCI = `[{"id":1,"name":"ci","status":"in_progress","started_at":"2026-01-01T00:00:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
+	mqmRedCI     = `[{"id":1,"name":"ci","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
+	mqmRedLint   = `[{"id":1,"name":"lint","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
+)
+
+// mqmRequireCI names "ci" a required check of r (a RequiredChecksSnapshot),
+// so a red "ci" is A3.1(a) checks_red rather than nil-snapshot not-green.
+func (w *mqmWorld) mqmRequireCI(r *mcqRun) {
+	w.t.Helper()
+	w.exec(`UPDATE runs SET required_checks_snapshot = '{"contexts":["ci"]}' WHERE id = $1`, r.id)
+}
+
+// TestMergeOnPass_A32_Step4 pins docs/adr/112 A3.2's step-4 classification
+// (#4780): a red required check is await_gate IMMEDIATE merge_checks_red /
+// retrigger_ci; pending checks and a settling review round are await_gate
+// (not immediate) merge_checks_pending / merge_review_pending (retry_after);
+// pending beside review is merge_checks_pending (A3.5 tier 2); red beside a
+// blocking concern settles dropped not_merge_eligible (a non-retryable leg);
+// a non-check undeterminable leg holds not_mergeable_yet. The decision
+// writes nothing: no settle, no yield, intent kept. CF22: restoring the drop
+// for checks_red turns the red row's settle RED.
+func TestMergeOnPass_A32_Step4(t *testing.T) {
+	cases := []struct {
+		name      string
+		spec      string
+		plant     func(w *mqmWorld, r *mcqRun)
+		kind      mergeOnPassKind
+		reason    string
+		next      string
+		immediate bool
+	}{
+		{"red yields at once", mcvUndelegatedSpecYAML, func(w *mqmWorld, r *mcqRun) {
+			w.mqmRequireCI(r)
+			w.gh.set(func() { w.gh.checks["h1"] = mqmRedCI })
+		}, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI, true},
+		{"pending awaits the gate", mcvUndelegatedSpecYAML, func(w *mqmWorld, _ *mcqRun) {
+			w.gh.set(func() { w.gh.checks["h1"] = mqmPendingCI })
+		}, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, false},
+		{"nil snapshot optional red is pending", mcvUndelegatedSpecYAML, func(w *mqmWorld, _ *mcqRun) {
+			w.gh.set(func() { w.gh.checks["h1"] = mqmRedLint })
+		}, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, false},
+		{"zero check runs is pending", mcvUndelegatedSpecYAML, func(w *mqmWorld, _ *mcqRun) {
+			w.gh.set(func() { w.gh.checks["h1"] = `[]` })
+		}, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, false},
+		{"settling review awaits the gate", mqeGatedReviewersSpec, func(w *mqmWorld, r *mcqRun) {
+			w.mqeAppend(r, "implement_review_started", map[string]any{"configured_agents": 1})
+		}, mergeOnPassAwaitGate, mergeQueueYieldMergeReviewPending, forgeApprovalNextRetryAfter, false},
+		{"pending beside review is merge_checks_pending", mqeGatedReviewersSpec, func(w *mqmWorld, r *mcqRun) {
+			w.mqeAppend(r, "implement_review_started", map[string]any{"configured_agents": 1})
+			w.gh.set(func() { w.gh.checks["h1"] = mqmPendingCI })
+		}, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, false},
+		{"red beside a blocking concern drops", mcvUndelegatedSpecYAML, func(w *mqmWorld, r *mcqRun) {
+			w.mqmRequireCI(r)
+			w.gh.set(func() { w.gh.checks["h1"] = mqmRedCI })
+			w.raiseConcern(r, "high", "")
+		}, mergeOnPassSettle, mergeCandidateQueueReasonNotMergeEligible, "", false},
+		{"non-check undeterminable holds", mcvUndelegatedSpecYAML, func(w *mqmWorld, r *mcqRun) {
+			// No concern repository: leg (d) is undeterminable, a
+			// non-check leg, beside a pending (nil-snapshot red) check.
+			w.gh.set(func() { w.gh.checks["h1"] = mqmRedLint })
+			w.srv.cfg.ConcernRepo = nil
+		}, mergeOnPassHeld, mergeOnPassReasonNotMergeable, "", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req := w.ready("s4", "h1", tc.spec)
+			tc.plant(w, r)
+			out := w.decide(req)
+			requireOutcome(t, out, tc.kind, tc.reason)
+			if out.Immediate != tc.immediate {
+				t.Fatalf("Immediate = %v, want %v", out.Immediate, tc.immediate)
+			}
+			if tc.kind == mergeOnPassAwaitGate {
+				if out.Yield.Reason != tc.reason || out.Yield.NextStep != tc.next || out.Yield.Row != mergeQueueYieldRowEligibility {
+					t.Fatalf("Yield = %+v, want reason %s next_step %s row %d", out.Yield, tc.reason, tc.next, mergeQueueYieldRowEligibility)
+				}
+				if out.ExpiryYield != nil {
+					t.Fatalf("ExpiryYield = %+v, want nil (a merge-gate wait is not an approval wait)", *out.ExpiryYield)
+				}
+			}
+			if tc.kind == mergeOnPassSettle && out.State != mergequeue.StateDropped {
+				t.Fatalf("state = %q, want dropped", out.State)
+			}
+			e := w.active(r)
+			if e.State != mergequeue.StateLive || e.MergeIntentAt == nil || e.YieldedAt != nil {
+				t.Fatalf("entry = %s intent=%v yielded_at=%v, want live, intent kept, unmarked (the decision writes nothing)", e.State, e.MergeIntentAt, e.YieldedAt)
+			}
+			w.requireMerges(0)
+			if len(w.ledger.claims) != 0 {
+				t.Fatalf("ledger claimed %v before an A3 step-4 outcome", w.ledger.claims)
+			}
+		})
+	}
+}
+
+// mqmGateWaitErrQueue fails every GateWait write.
+type mqmGateWaitErrQueue struct{ mergequeue.Store }
+
+func (mqmGateWaitErrQueue) GateWait(context.Context, uuid.UUID, int64, time.Duration) (mergequeue.GateWaitResult, error) {
+	return mergequeue.GateWaitResult{}, errors.New("gate wait write failed")
+}
+
+// mqmGateDecision seeds a ready entry at h1 with listing planted at h1,
+// decides it and returns the request and the step-4 outcome.
+func (w *mqmWorld) mqmGateDecision(listing string, red bool) (*mcqRun, mergeOnPassRequest, mergeOnPassOutcome) {
+	w.t.Helper()
+	r, req := w.ready("gw", "h1", mcvUndelegatedSpecYAML)
+	if red {
+		w.mqmRequireCI(r)
+	}
+	w.gh.set(func() { w.gh.checks["h1"] = listing })
+	out := w.decide(req)
+	if out.Kind != mergeOnPassAwaitGate {
+		w.t.Fatalf("decision = %s/%s, want await_gate", out.Kind, out.Reason)
+	}
+	return r, req, out
+}
+
+// TestMergeOnPassEnforceGateWait pins docs/adr/112 A3.2's merge-gate wait
+// enforcement, one subtest per mode: an open window holds (await_gate, the
+// pump stops, no marker); an expired window yields the step-4 reason; an
+// empty hold budget yields at once; a red (immediate) yield is refused by a
+// claimed D1 dispatch, the in-flight registry and a changed entry (each
+// held, no yield); a GateWait write error holds. CF23: deleting the
+// mergeOnPassPreYieldRefusal call turns the claimed-dispatch, in-flight and
+// changed-entry subtests RED (each yields).
+func TestMergeOnPassEnforceGateWait(t *testing.T) {
+	ctx := context.Background()
+	requireNoYield := func(w *mqmWorld, r *mcqRun) {
+		w.t.Helper()
+		if e := w.active(r); e.State != mergequeue.StateLive || e.YieldedAt != nil {
+			w.t.Fatalf("entry = %s yielded_at=%v, want live and unmarked", e.State, e.YieldedAt)
+		}
+		if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 {
+			w.t.Fatalf("merge_queue_yielded rows = %d, want 0", n)
+		}
+	}
+	t.Run("open window holds", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req, out := w.mqmGateDecision(mqmPendingCI, false)
+		got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+		requireOutcome(t, got, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksPending)
+		if got.GateRemaining <= 0 {
+			t.Fatalf("GateRemaining = %s, want the open window's remaining time", got.GateRemaining)
+		}
+		requireNoYield(w, r)
+		e := w.active(r)
+		if e.GateWaitStartedAt == nil || e.GateWaitEpoch == nil || *e.GateWaitEpoch != req.Entry.AdmissionEpoch || e.GateHoldTokens != mergequeue.GateHoldBudget-1 {
+			t.Fatalf("gate window = %v epoch %v tokens %d, want opened at epoch %d with one token spent", e.GateWaitStartedAt, e.GateWaitEpoch, e.GateHoldTokens, req.Entry.AdmissionEpoch)
+		}
+		if e.ApprovalWaitStartedAt != nil {
+			t.Fatalf("approval_wait_started_at = %v, want NULL (a merge-gate hold never touches it)", e.ApprovalWaitStartedAt)
+		}
+		readvances := 0
+		if w.srv.applyMergeOnPassOutcome(ctx, req.Entry, got, &readvances) {
+			t.Fatal("the pump continued past an open merge-gate window, want it to stop")
+		}
+		requireNoYield(w, r)
+	})
+	t.Run("expired window yields the step-4 reason", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req, out := w.mqmGateDecision(mqmPendingCI, false)
+		if got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out); got.Kind != mergeOnPassAwaitGate {
+			t.Fatalf("first hold = %s, want await_gate", got.Kind)
+		}
+		w.exec(`UPDATE merge_candidate_queue_entries SET gate_wait_started_at = gate_wait_started_at - interval '2 hours' WHERE id = $1`, req.Entry.ID)
+		got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+		requireOutcome(t, got, mergeOnPassExpiredYielded, mergeQueueYieldMergeChecksPending)
+		e := w.requireYielded(r, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+		if e.MergeIntentAt == nil || e.ApprovalWaitStartedAt != nil {
+			t.Fatalf("yielded entry intent=%v approval anchor=%v, want intent kept and no approval anchor", e.MergeIntentAt, e.ApprovalWaitStartedAt)
+		}
+	})
+	t.Run("no hold token yields at once", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req, out := w.mqmGateDecision(mqmPendingCI, false)
+		w.exec(`UPDATE merge_candidate_queue_entries SET gate_hold_tokens = 0, gate_tokens_refilled_at = clock_timestamp() WHERE id = $1`, req.Entry.ID)
+		got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+		requireOutcome(t, got, mergeOnPassExpiredYielded, mergeQueueYieldMergeChecksPending)
+		w.requireYielded(r, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+	})
+	t.Run("red yields at once with no window", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req, out := w.mqmGateDecision(mqmRedCI, true)
+		got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+		requireOutcome(t, got, mergeOnPassExpiredYielded, mergeQueueYieldMergeChecksRed)
+		e := w.requireYielded(r, mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI, mergeQueueYieldSiteMergeOnPass)
+		if e.GateWaitStartedAt != nil || e.GateHoldTokens != mergequeue.GateHoldBudget {
+			t.Fatalf("gate window = %v tokens %d, want none opened and the budget untouched", e.GateWaitStartedAt, e.GateHoldTokens)
+		}
+		p := w.payload(w.rows(r, CategoryMergeQueueYielded)[0])
+		if int(p["precedence_row"].(float64)) != mergeQueueYieldRowEligibility {
+			t.Fatalf("precedence_row = %v, want %d", p["precedence_row"], mergeQueueYieldRowEligibility)
+		}
+	})
+	refusals := []struct {
+		name   string
+		mut    func(w *mqmWorld, r *mcqRun, req *mergeOnPassRequest)
+		reason string
+	}{
+		{"claimed dispatch holds", func(w *mqmWorld, r *mcqRun, _ *mergeOnPassRequest) {
+			if _, claimed, err := w.ledger.ClaimMergeDispatch(ctx, r.id, "inline", "h1"); err != nil || !claimed {
+				t.Fatalf("seed claim: claimed=%v err=%v", claimed, err)
+			}
+		}, mergeOnPassReasonAlreadyDispatched},
+		{"in-flight registry holds", func(w *mqmWorld, r *mcqRun, _ *mergeOnPassRequest) {
+			w.srv.mergeInFlight.mark(r.id)
+		}, mergeOnPassReasonAlreadyDispatched},
+		{"changed entry holds", func(w *mqmWorld, _ *mcqRun, req *mergeOnPassRequest) {
+			w.exec(`UPDATE merge_candidate_queue_entries SET admission_epoch = admission_epoch + 1 WHERE id = $1`, req.Entry.ID)
+		}, mergeOnPassReasonEntryChanged},
+		{"no ledger holds", func(_ *mqmWorld, _ *mcqRun, req *mergeOnPassRequest) { req.Ledger = nil }, mergeOnPassReasonLedgerUnavailable},
+	}
+	for _, rc := range refusals {
+		t.Run(rc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, req, out := w.mqmGateDecision(mqmRedCI, true)
+			rc.mut(w, r, &req)
+			got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+			requireOutcome(t, got, mergeOnPassHeld, rc.reason)
+			if got.ExpiryYield != nil {
+				t.Fatalf("refusal carries ExpiryYield %+v, want none", *got.ExpiryYield)
+			}
+			if e := w.storeEntry(r); e.State != mergequeue.StateLive {
+				t.Fatalf("entry = %s, want live (refused, not yielded)", e.State)
+			}
+			if n := len(w.rows(r, CategoryMergeQueueYielded)); n != 0 {
+				t.Fatalf("merge_queue_yielded rows = %d, want 0", n)
+			}
+		})
+	}
+	t.Run("gate wait write error holds", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req, out := w.mqmGateDecision(mqmPendingCI, false)
+		w.srv.cfg.MergeQueue = mqmGateWaitErrQueue{w.store}
+		got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+		requireOutcome(t, got, mergeOnPassHeld, mergeOnPassReasonEntryChanged)
+		w.srv.cfg.MergeQueue = w.store
+		requireNoYield(w, r)
+	})
+	t.Run("lock unavailable holds", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req, out := w.mqmGateDecision(mqmRedCI, true)
+		w.srv.cfg.MergeQueue = mqmLockQueue{Store: w.store, lockErr: errors.New("lock busy")}
+		got := w.srv.mergeOnPassEnforceGateWait(ctx, req, out)
+		w.srv.cfg.MergeQueue = w.store
+		requireOutcome(t, got, mergeOnPassHeld, mergeOnPassReasonLockUnavailable)
+		requireNoYield(w, r)
+	})
+	t.Run("other kinds pass through", func(t *testing.T) {
+		w := newMQMWorld(t)
+		o := mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: mergeOnPassReasonTransient}
+		if got := w.srv.mergeOnPassEnforceGateWait(ctx, mergeOnPassRequest{}, o); got.Kind != o.Kind || got.Reason != o.Reason {
+			t.Fatalf("got %s/%s, want the outcome unchanged", got.Kind, got.Reason)
+		}
+	})
+}
+
+// TestMergeOnPass_GateHoldNeverSetsApprovalAnchor (docs/adr/112 A3.2/A3.7):
+// a (b) hold and its expiry yield, driven through the pump's real path
+// (decide, both enforcements, apply), leave approval_wait_started_at NULL.
+// CF24: calling ApprovalWait in the await_gate arm stamps it, RED.
+func TestMergeOnPass_GateHoldNeverSetsApprovalAnchor(t *testing.T) {
+	ctx := context.Background()
+	w := newMQMWorld(t)
+	r, req := w.ready("ga", "h1", mcvUndelegatedSpecYAML)
+	w.gh.set(func() { w.gh.checks["h1"] = mqmPendingCI })
+	step := func() bool {
+		o := w.srv.mergeOnPassEnforceExpiredWait(ctx, req, w.decide(req))
+		o = w.srv.mergeOnPassEnforceGateWait(ctx, req, o)
+		readvances := 0
+		return w.srv.applyMergeOnPassOutcome(ctx, req.Entry, o, &readvances)
+	}
+	if step() {
+		t.Fatal("the pump continued past the open window")
+	}
+	if e := w.active(r); e.ApprovalWaitStartedAt != nil || e.GateWaitStartedAt == nil {
+		t.Fatalf("after the hold: approval anchor %v gate window %v, want NULL and set", e.ApprovalWaitStartedAt, e.GateWaitStartedAt)
+	}
+	w.exec(`UPDATE merge_candidate_queue_entries SET gate_wait_started_at = gate_wait_started_at - interval '2 hours' WHERE id = $1`, req.Entry.ID)
+	if !step() {
+		t.Fatal("the pump stopped after the expired merge-gate wait yielded")
+	}
+	e := w.requireYielded(r, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+	if e.ApprovalWaitStartedAt != nil || e.ApprovalWaitOpen {
+		t.Fatalf("after the yield: approval anchor %v open=%v, want NULL and closed", e.ApprovalWaitStartedAt, e.ApprovalWaitOpen)
+	}
+}
+
+// TestMergeOnPass_GateWindowStartsAtFirstHoldNotAdmission (docs/adr/112
+// A3.2): with admitted_at backdated far past the window, the first (b) hold
+// opens the window NOW (await_gate, not a yield); CI turns green inside it
+// and the next decision merges. CF25: a window measured from admitted_at
+// yields on the first hold, RED.
+func TestMergeOnPass_GateWindowStartsAtFirstHoldNotAdmission(t *testing.T) {
+	ctx := context.Background()
+	w := newMQMWorld(t)
+	r, req := w.ready("gs", "h1", mcvUndelegatedSpecYAML)
+	w.exec(`UPDATE merge_candidate_queue_entries SET admitted_at = clock_timestamp() - interval '3 hours' WHERE id = $1`, req.Entry.ID)
+	req.Entry = w.active(r)
+	w.gh.set(func() { w.gh.checks["h1"] = mqmPendingCI })
+	got := w.srv.mergeOnPassEnforceGateWait(ctx, req, w.decide(req))
+	requireOutcome(t, got, mergeOnPassAwaitGate, mergeQueueYieldMergeChecksPending)
+	w.gh.set(func() { w.gh.checks["h1"] = mcqGreenChecks })
+	requireOutcome(t, w.srv.mergeOnPassEnforceGateWait(ctx, req, w.decide(req)), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	w.requireMerges(1)
+}
+
+// TestMergeQueueGateWait_DefaultsToApprovalWait pins the knob's fallback
+// (docs/adr/112 A3.2): zero answers the approval wait (itself defaulted), a
+// positive value answers itself.
+func TestMergeQueueGateWait_DefaultsToApprovalWait(t *testing.T) {
+	s := &Server{}
+	if got := s.mergeQueueGateWait(); got != DefaultMergeQueueApprovalWait {
+		t.Fatalf("zero config = %s, want the approval wait default %s", got, DefaultMergeQueueApprovalWait)
+	}
+	s.cfg.MergeQueueApprovalWait = 7 * time.Minute
+	if got := s.mergeQueueGateWait(); got != 7*time.Minute {
+		t.Fatalf("zero gate wait = %s, want the approval wait 7m", got)
+	}
+	s.cfg.MergeQueueGateWait = 3 * time.Minute
+	if got := s.mergeQueueGateWait(); got != 3*time.Minute {
+		t.Fatalf("gate wait = %s, want 3m", got)
+	}
 }
