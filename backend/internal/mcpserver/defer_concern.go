@@ -25,7 +25,7 @@ type DeferConcernInput struct {
 	Labels       []string `json:"labels,omitempty" jsonschema:"optional labels merged on top of the type's default labels"`
 	Note         string   `json:"note,omitempty" jsonschema:"optional operator addendum folded into the follow-up body and the concern's state_reason"`
 	Judgement    string   `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. No reason-prefix derivation applies to a defer. Missing or invalid: 400 validation_failed, refused before any follow-up is filed"`
-	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement: REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement (at most 4000 bytes; refused with rule tradeoff_cost_too_long, never truncated): REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
 }
 
 // DeferConcernOutput surfaces the filed follow-up work item plus the
@@ -97,14 +97,16 @@ Inputs:
     defect_pre_existing, no_defect, tradeoff, preference, stale,
     insufficient_evidence (unlabelled is refused).
   - tradeoff_cost : REQUIRED with a tradeoff judgement, refused with any
-    other.
+    other; at most 4000 bytes (refused, not truncated).
 
 Returns the filed follow-up issue (number, url, title, applied labels) and
 the updated concern row (state deferred, state_reason naming the issue).
 Returns a tool error on:
   - invalid concern_id UUID (caught before the HTTP hop)
   - validation_failed (400: a missing, unknown or unlabelled judgement,
-    or a tradeoff/tradeoff_cost mismatch — checked by the backend only,
+    a tradeoff/tradeoff_cost mismatch, or a tradeoff_cost over 4000
+    bytes (details.rule tradeoff_cost_too_long) — checked by the backend
+    only,
     before any follow-up is filed)
   - concern_not_found (404)
   - cross_run_defer (a run-bound token reaching another run's concern, 403)

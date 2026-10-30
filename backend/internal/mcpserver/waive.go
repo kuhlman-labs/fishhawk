@@ -25,7 +25,7 @@ type WaiveConcernInput struct {
 	ConcernID    string `json:"concern_id" jsonschema:"the stable concern UUID to waive (from fishhawk_get_run_status's run.concerns.items[].id)"`
 	Reason       string `json:"reason" jsonschema:"REQUIRED operator rationale; recorded on the concern_waived audit entry, stored as the concern's state_reason, and shown verbatim to later re-reviews as the not-re-litigable waive context"`
 	Judgement    string `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. A reason prefixed false_positive:, accepted_tradeoff: or preference: stands in for an omitted judgement (no_defect, tradeoff, preference); a judgement that matches the prefix is accepted, and one that contradicts it is refused (rule judgement_conflicts_reason_prefix). Missing or invalid: 400 validation_failed"`
-	TradeoffCost string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement: REQUIRED when the judgement is tradeoff (including one derived from an accepted_tradeoff: reason prefix) and refused with any other judgement (400 validation_failed)"`
+	TradeoffCost string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement (at most 4000 bytes; refused with rule tradeoff_cost_too_long, never truncated): REQUIRED when the judgement is tradeoff (including one derived from an accepted_tradeoff: reason prefix) and refused with any other judgement (400 validation_failed)"`
 }
 
 // WaiveConcernOutput surfaces the updated concern row: state waived,
@@ -78,7 +78,7 @@ Inputs:
     defect_pre_existing, no_defect, tradeoff, preference, stale,
     insufficient_evidence (unlabelled is refused).
   - tradeoff_cost : REQUIRED with a tradeoff judgement, refused with any
-    other.
+    other; at most 4000 bytes (refused, not truncated).
 
 Reason-prefix rules (waive only): a reason starting false_positive:,
 accepted_tradeoff: or preference: maps to no_defect, tradeoff or
@@ -91,7 +91,8 @@ Returns the updated concern row (state waived, state_reason set).
 Returns a tool error on:
   - invalid UUID or empty reason (caught before the HTTP hop)
   - validation_failed (400: a missing, unknown or unlabelled judgement, a
-    tradeoff without tradeoff_cost, a cost without a tradeoff, or a
+    tradeoff without tradeoff_cost, a cost without a tradeoff, a cost
+    over 4000 bytes — details.rule tradeoff_cost_too_long — or a
     judgement contradicting the reason prefix — details.rule
     judgement_conflicts_reason_prefix). The judgement is checked by the
     backend only.
@@ -134,7 +135,7 @@ type WaiveConcernsInput struct {
 	ConcernIDs   []string `json:"concern_ids" jsonschema:"the stable concern UUIDs to waive (from fishhawk_get_run_status's run.concerns.items[].id or fishhawk_get_gate_view). At most 50 per batch; duplicates are rejected"`
 	Reason       string   `json:"reason" jsonschema:"REQUIRED operator rationale, recorded on EVERY concern_waived audit entry in the batch and stored as each concern's state_reason. One reason covers the batch — make it self-contained, since later re-reviews read it verbatim"`
 	Judgement    string   `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement covering the WHOLE batch (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. A reason prefixed false_positive:, accepted_tradeoff: or preference: stands in for an omitted judgement (no_defect, tradeoff, preference); a judgement that matches the prefix is accepted, and one that contradicts it refuses the whole batch (rule judgement_conflicts_reason_prefix). Missing or invalid: 400 validation_failed"`
-	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement: REQUIRED when the judgement is tradeoff (including one derived from an accepted_tradeoff: reason prefix) and refused with any other judgement (400 validation_failed)"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement (at most 4000 bytes; refused with rule tradeoff_cost_too_long, never truncated): REQUIRED when the judgement is tradeoff (including one derived from an accepted_tradeoff: reason prefix) and refused with any other judgement (400 validation_failed)"`
 	Delegated    bool     `json:"delegated,omitempty" jsonschema:"opt the batch into the ADR-040 delegated-action path; the may_waive condition is evaluated ONCE for the run before anything is appended"`
 }
 
@@ -170,7 +171,8 @@ concerns can both be waived. Waiving is terminal — there is no un-waive.
 Judgement: ONE REQUIRED human judgement covers the batch — one of
 defect, defect_pre_existing, no_defect, tradeoff, preference, stale,
 insufficient_evidence (unlabelled is refused) — plus tradeoff_cost with
-a tradeoff (refused with any other judgement). The reason-prefix rules
+a tradeoff (refused with any other judgement; at most 4000 bytes, refused
+rather than truncated). The reason-prefix rules
 are fishhawk_waive_concern's: false_positive:, accepted_tradeoff: and
 preference: map to no_defect, tradeoff and preference; a prefix alone
 becomes the judgement, a matching one is accepted, a contradicting one
@@ -203,9 +205,10 @@ Returns a tool error on:
   - validation_failed (400: over the 50-id cap, a duplicate id, a
     non-UUID id, or an id belonging to another run — details.rule
     concern_run_mismatch; or a missing, unknown or unlabelled judgement,
-    a tradeoff/tradeoff_cost mismatch, or a judgement contradicting the
-    reason prefix — details.rule judgement_conflicts_reason_prefix). The
-    judgement is checked by the backend only.
+    a tradeoff/tradeoff_cost mismatch, a tradeoff_cost over 4000 bytes
+    (details.rule tradeoff_cost_too_long), or a judgement contradicting
+    the reason prefix — details.rule judgement_conflicts_reason_prefix).
+    The judgement is checked by the backend only.
   - concern_not_found (404: an id with no row)
   - concern_waive_conflict (422: an id is not open — the WHOLE batch is
     refused and nothing is waived)

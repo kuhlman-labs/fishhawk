@@ -52,10 +52,10 @@ consumes only the first two):
   `initialize` handshake, the public alias of the package-private
   `onboardingInstructions`.
 
-## Exported surface: why 382 identifiers, not 3
+## Exported surface: why 385 identifiers, not 3
 
-The package presents **382** exported top-level identifiers, but only the three
-above are intended entry points. The other 379 are the tool I/O
+The package presents **385** exported top-level identifiers, but only the three
+above are intended entry points. The other 382 are the tool I/O
 request/response structs. The MCP SDK's jsonschema reflection requires each
 tool's input/output type — and its exported fields — to build the tool's
 schema. Strictly it is the FIELDS that must be exported, not the type name:
@@ -1453,7 +1453,7 @@ Inputs:
 | `concern_id` | **yes** | The stable concern UUID, from `fishhawk_get_run_status`'s `run.concerns.items[].id`. |
 | `reason` | **yes** | Audited rationale. Recorded on the `concern_waived` audit entry **before** the state change (append failure → `audit_append_failed`, no mutation), stored as the concern's `state_reason`, and rendered **verbatim** in later re-review prompts as the not-re-litigable waive context — make it self-contained. |
 | `judgement` | **yes** (backend-enforced) | The human judgement (ADR-117 D1, [#4840](https://github.com/kuhlman-labs/fishhawk/issues/4840)): `defect`, `defect_pre_existing`, `no_defect`, `tradeoff`, `preference`, `stale` or `insufficient_evidence`; `unlabelled` is refused. A reason prefixed `false_positive:`, `accepted_tradeoff:` or `preference:` maps to `no_defect`, `tradeoff` or `preference`: (a) a judgement matching the prefix is accepted, (b) a judgement with no prefix is accepted, (c) a prefix alone becomes the judgement, (d) a judgement contradicting the prefix is refused (`details.rule` `judgement_conflicts_reason_prefix`). |
-| `tradeoff_cost` | with `tradeoff` | The stated cost of a `tradeoff` judgement (including a prefix-derived one); refused with any other judgement. |
+| `tradeoff_cost` | with `tradeoff` | The stated cost of a `tradeoff` judgement (including a prefix-derived one); refused with any other judgement. At most 4000 bytes, refused rather than truncated (`details.rule` `tradeoff_cost_too_long`, E94.8 / [#4841](https://github.com/kuhlman-labs/fishhawk/issues/4841)); the cap is the backend's one `concernJudgementFromRequest` check, shared by all four judgement verbs and `fishhawk_label_concern`. |
 
 **The judgement fields are `omitempty` and never pre-checked by the tool** — the advertised schema does not require them and no local refusal answers before the HTTP hop, so the backend is the single refusal authority and its control stays observable through every MCP-level test (`TestConcernJudgementInputs_NotSchemaRequired`, `TestWaiveConcern_NoLocalJudgementPreCheck`, and the client-body pin `TestConcernVerbClients_ForwardJudgement`, which also asserts an omitted pair is ABSENT from the body). The same holds for the three sibling verbs below. The descriptions still say REQUIRED. The suggested-action hints that offer `fishhawk_waive_concern` / `fishhawk_defer_concern` (`drive_run.go`'s `driveFixupConcernActions`, `review_action_hint.go`'s `deferConcernAction`) carry a `judgement` placeholder, `concernJudgementPlaceholder`, naming the allowed set; pinned beside the builders by `TestDriveFixupConcernActions_JudgementParam` and `TestDeferConcernAction_JudgementParam`.
 
@@ -1463,7 +1463,7 @@ What a waive does:
 - There is **no un-waive**. If the concern turns out to matter, a new concern from a later review is the path back.
 - **Auth:** same write-scope pair as fix-up (`write:stages` or `write:fixups`); a run-bound token may waive only its own run's concerns (`cross_run_waive`, 403).
 
-Error surfaces propagated as tool errors: `validation_failed` (400 — empty reason / bad UUID, both also caught locally before the HTTP hop; or a missing, unknown or `unlabelled` judgement, a `tradeoff` without `tradeoff_cost`, a cost without a `tradeoff`, or a prefix conflict, all backend-only), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — the concern is already `waived`/`superseded`/`addressed`; details carry the rejected `from`/`to` pair), `concern_store_unconfigured` (503).
+Error surfaces propagated as tool errors: `validation_failed` (400 — empty reason / bad UUID, both also caught locally before the HTTP hop; or a missing, unknown or `unlabelled` judgement, a `tradeoff` without `tradeoff_cost`, a cost without a `tradeoff`, a `tradeoff_cost` over 4000 bytes (`tradeoff_cost_too_long`), or a prefix conflict, all backend-only), `cross_run_waive` (403), `concern_not_found` (404), `concern_waive_conflict` (422 — the concern is already `waived`/`superseded`/`addressed`; details carry the rejected `from`/`to` pair), `concern_store_unconfigured` (503).
 
 ## Bulk concern waiver (`fishhawk_waive_concerns`)
 
@@ -1477,7 +1477,7 @@ Error surfaces propagated as tool errors: `validation_failed` (400 — empty rea
 | `concern_ids` | **yes** | At most 50 per batch; duplicates and non-UUIDs are refused. |
 | `reason` | **yes** | Recorded on EVERY `concern_waived` entry in the batch and as each concern's `state_reason`. |
 | `judgement` | **yes** (backend-enforced) | ONE human judgement for the whole batch; same set and the same reason-prefix rules (a)-(d) as the single waive, and a prefix conflict refuses the whole batch. The concern rows record `judgement_bulk` true only when the batch names MORE than one concern; a one-id call is an individual judgement, while its `concern_waived` row still carries the verb marker `bulk_waive: true`. |
-| `tradeoff_cost` | with `tradeoff` | As for the single waive. |
+| `tradeoff_cost` | with `tradeoff` | As for the single waive, including the 4000-byte cap. |
 | `delegated` | no | ADR-040 delegated-action path; evaluated ONCE for the run before anything is appended. |
 
 The two halves have deliberately different atomicity, and a caller must not assume all-or-nothing across both:
@@ -1497,7 +1497,7 @@ The two halves have deliberately different atomicity, and a caller must not assu
 | `concern_ids` | **yes** | At most 50 per batch; duplicates (deduped on the PARSED uuid) and non-UUIDs are refused. Every id must be `addressed_pending`. Non-UUIDs are also caught locally. |
 | `evidence` | **yes** | What you executed or observed that shows the fix landed; at most 4000 bytes. Recorded on EVERY `concern_resolved_with_evidence` entry and stored as each concern's `state_reason`, prefixed `operator evidence: `. |
 | `judgement` | **yes** (backend-enforced) | ONE human judgement for the batch, from the waive's set (`unlabelled` refused); usually `defect` or `defect_pre_existing` for a fixed concern. No reason-prefix derivation applies. `judgement_bulk` is recorded true only for a batch of more than one concern. |
-| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff` judgement, refused with any other. |
+| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff` judgement, refused with any other; at most 4000 bytes (`tradeoff_cost_too_long`, refused, not truncated). |
 
 What a resolve does, and what it is not:
 
@@ -1509,6 +1509,25 @@ What a resolve does, and what it is not:
 - **Not yet visible to the historian.** `decisionindex`'s decision-bearing set does not include `concern_resolved_with_evidence`, so operator-evidence resolutions do not reach the precedent index (`fishhawk_precedent`) or historian consults yet. The operator files that follow-up.
 
 Error surfaces propagated as tool errors: a local pre-flight refusal (bad `run_id` or concern UUID, empty `concern_ids`, blank `evidence` — all caught before the HTTP hop), `validation_failed` (400 — over the 50-id cap, evidence over 4000 bytes, a duplicate, or an id from another run carrying `details.rule` `concern_run_mismatch`; or a judgement refusal, backend-only), `resolve_requires_human` / `insufficient_scope` / `account_forbidden` (403), `concern_not_found` (404), `concern_resolve_conflict` (409 — an id not in `addressed_pending`, which refuses the WHOLE batch; the message names the state and the recovery: route a `raised`/`reopened` concern with a fix-up first, and an already-closed concern has nothing to resolve), `concern_store_unconfigured` (503).
+
+## Relabel and duplicate_of (`fishhawk_label_concern`)
+
+`fishhawk_label_concern` (E94.8 / [#4841](https://github.com/kuhlman-labs/fishhawk/issues/4841), ADR-117 D1 phase 3) lets a HUMAN operator set or correct the judgement on ANY concern, in any state, or mark it `duplicate_of` an earlier concern of the SAME run, which then inherits its chain root's judgement on every read surface. It wraps `POST /v0/concerns/{concern_id}/label`; the client method lives in `label_concern.go`, next to the tool, not in `client.go`. The backend contract (guards, ordering rule, audit rows, status map) is `backend/internal/server/docs/review.md` § "Relabel and duplicate_of"; this section covers only the MCP side.
+
+| Field | Required | Notes |
+|---|---|---|
+| `concern_id` | **yes** | The concern to label; any state. A non-UUID is caught locally. |
+| `judgement` | one of | The waive's set (`unlabelled` refused). Exclusive with `duplicate_of`. A judgement label clears a prior `duplicate_of` link. |
+| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff`, refused otherwise and with `duplicate_of`; at most 4000 bytes. |
+| `duplicate_of` | one of | An EARLIER concern of the SAME run (ledger order: origin review sequence, created_at, id). A non-UUID is caught locally. |
+| `backfill` | no | Records `judgement_backfill`; on a WAIVED concern an omitted judgement is derived from the stored waive reason's interim prefix. |
+
+- **Thin wrapper, no local rule checks.** The tool validates only the two UUIDs. Exclusivity, the duplicate_of guards and every judgement rule are the backend's (`TestLabelConcern_NoLocalRulePreCheck` sends BOTH `judgement` and `duplicate_of` and asserts both reach the backend). `judgement`, `tradeoff_cost` and `duplicate_of` are `omitempty` on the body; `backfill` is always sent (`TestLabelConcern_JudgementBody` / `_DuplicateBody` pin the exact bytes).
+- **Human-only, never delegated.** The backend refuses every agent subject (`operator-agent/`, a run-bound `mcp:run:` token, a first-officer seat) with 403 `label_requires_human`. Scopes are the waive pair (`write:stages` or `write:fixups`; the `server/mcpscopes.go` row).
+- **Tenant isolation (M1).** A missing target and another run's target return the IDENTICAL 400 `duplicate_of_not_found`, naming only the labelled concern's own run. `TestE2E_LabelConcern_RelabelDuplicateAndChains` (`backend/internal/integration/mcp/`) pins that through the real binary and on the raw REST body.
+- **Output** `{concern: LabelledConcern}` mirrors the backend's `labelConcernResponse` (`id`, `run_id`, `stage_id`, `stage_kind`, `state` plus the embedded judgement view), so a duplicate reads its inherited judgement and `judgement_inherited_from`.
+
+Error surfaces propagated as tool errors: a local pre-flight refusal (bad `concern_id` or `duplicate_of` UUID), `validation_failed` (400 — `details.rule` one of `duplicate_of_excludes_judgement`, `duplicate_of_not_found`, `duplicate_of_not_earlier`, `judgement_required`, an unknown or `unlabelled` judgement, a tradeoff/cost mismatch, `tradeoff_cost_too_long`, `judgement_conflicts_reason_prefix`), `label_requires_human` / `insufficient_scope` / `account_forbidden` (403), `concern_not_found` (404), `concern_label_conflict` (409 — a concurrent relabel landed first), `audit_append_failed` (500 — nothing written), `concern_store_unconfigured` (503).
 
 ## Escape records (`fishhawk_record_escape`)
 
@@ -1546,7 +1565,7 @@ Inputs:
 | `labels` | no | Labels merged on top of the type's default labels. |
 | `note` | no | Operator addendum folded into the follow-up body and the concern's `state_reason`. |
 | `judgement` | **yes** (backend-enforced) | The human judgement, from the waive's set (`unlabelled` refused). No reason-prefix derivation applies. Refused before any work item is filed. |
-| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff` judgement, refused with any other. |
+| `tradeoff_cost` | with `tradeoff` | Required with a `tradeoff` judgement, refused with any other; at most 4000 bytes (`tradeoff_cost_too_long`, refused, not truncated). |
 
 What a defer does:
 

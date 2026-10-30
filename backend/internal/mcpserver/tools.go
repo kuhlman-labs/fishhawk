@@ -346,6 +346,9 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// E83.53 / #4086: the human-only resolve-with-evidence counterpart to the
 	// operator_evidence_routed veto, adjacent to the waive it is NOT.
 	registerResolveConcerns(srv, resolver)
+	// E94.8 / #4841 (ADR-117 D1 phase 3): the human-only relabel and
+	// duplicate_of verb, adjacent to the judgement-recording verbs it corrects.
+	registerLabelConcern(srv, resolver)
 	// E94.3 / #4694 (ADR-117 D3 + A1): record an escaped defect on its run,
 	// or close a pending one with a human, forge-verified attestation.
 	registerRecordEscape(srv, resolver)
