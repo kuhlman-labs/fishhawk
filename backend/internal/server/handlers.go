@@ -337,6 +337,9 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/divergence/{sequence}/answer", s.requireRunAccount(memberWrite, s.handleAnswerDivergence))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.requireConcernAccount(memberWrite, s.handleWaiveConcern))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", s.requireConcernAccount(memberWrite, s.handleDeferConcern))
+	// E94.8 / #4841 (ADR-117 D1 phase 3): a HUMAN relabels a concern's judgement
+	// or marks it duplicate_of an earlier concern of its run (label_concern.go).
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/label", s.requireConcernAccount(memberWrite, s.handleLabelConcern))
 	mux.HandleFunc("GET /v0/artifacts/{artifact_id}", s.handleGetArtifact)
 	mux.HandleFunc("GET /v0/tokens", s.handleListTokens)
 	mux.HandleFunc("POST /v0/tokens", s.handleCreateToken)

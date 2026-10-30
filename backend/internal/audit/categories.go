@@ -457,6 +457,8 @@ var KnownCategories = map[string]struct{}{
 	"concern_auto_closed":                     {},
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
+	"concern_label_failed":                    {}, // E94.8 / #4841: corrective after a failed relabel write that followed the concern_labelled intent (server/label_concern.go) — INTERNAL
+	"concern_labelled":                        {}, // E94.8 / #4841 (ADR-117 D1 phase 3): a human relabelled a concern's judgement or duplicate_of, recorded before the write (server/label_concern.go) — INTERNAL, not issue-comment activity
 	"concern_note_backfilled":                 {},
 	"concern_rolled_up":                       {}, // E94.1 / ADR-117 D2 (#4692): child-slice HIGH/MEDIUM concerns copied into the parent ledger; written by server/concern_rollup.go; operator-visible through issuecomment's activityCategories
 	"concern_relitigation_suppressed":         {},

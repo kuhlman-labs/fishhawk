@@ -4776,9 +4776,15 @@ components:
           enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
           description: |
             The HUMAN judgement of the concern (E94.2 / #4693, ADR-117 D1). Always
-            present. Only the four human verbs write it (E94.7 / #4840): waive,
-            bulk waive, resolve-with-evidence and defer, each of which REQUIRES
-            one; a re-judgement overwrites. A concern no human has judged reads
+            present. Only human verbs write it: waive, bulk waive,
+            resolve-with-evidence and defer (E94.7 / #4840), each of which
+            REQUIRES one, and the relabel verb `POST
+            /v0/concerns/{concern_id}/label` (E94.8 / #4841), which sets or
+            corrects it on a concern in any state; a re-judgement overwrites. A
+            human verb's judgement on a duplicate-linked concern is recorded on
+            the concern row and its audit row, but the duplicate keeps reading
+            its root's judgement until it is relabelled with an explicit one. A
+            concern no human has judged reads
             `unlabelled` — system writers (a reviewer confirm, the clean-round
             auto-close, a condition claim) never write it, and a blank or unknown
             stored value also reads `unlabelled`. A duplicate reads its chain
@@ -4789,7 +4795,7 @@ components:
           description: For a duplicate whose chain resolved, the chain-root concern that supplied `judgement`. Omitted otherwise.
         duplicate_of:
           $ref: '#/components/schemas/UUID'
-          description: The earlier same-run concern this one duplicates. Omitted otherwise.
+          description: The earlier same-run concern this one duplicates, written only by `POST /v0/concerns/{concern_id}/label` (E94.8 / #4841). Omitted otherwise.
         judgement_actor_kind:
           type: string
           description: Who recorded the judgement — `user` or `agent`, the same actor kind the verb's audit row carries. Omitted when nobody has.
@@ -4807,7 +4813,7 @@ components:
             false.
         judgement_backfill:
           type: boolean
-          description: The judgement was recorded after the fact. Omitted when false.
+          description: The judgement was recorded after the fact (the relabel verb's `backfill`, E94.8 / #4841). Omitted when false.
         tradeoff_cost:
           type: string
           description: The stated cost of a `tradeoff` judgement. Omitted when empty.
@@ -6463,6 +6469,80 @@ components:
         state_reason:
           type: string
           description: The operator's audited waive reason.
+
+    LabelConcernRequest:
+      type: object
+      description: |
+        Body of `POST /v0/concerns/{concern_id}/label` (E94.8 / #4841). Send
+        exactly one of `judgement` and `duplicate_of`.
+      properties:
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+          description: |
+            The HUMAN judgement to record; `unlabelled` and any value outside
+            the enum are refused 400. May be omitted with `backfill: true` on
+            a waived concern whose reason carries an interim prefix.
+            Exclusive with `duplicate_of`.
+        tradeoff_cost:
+          type: string
+          description: |
+            The stated cost of a `tradeoff` judgement: REQUIRED (non-blank)
+            with `tradeoff`, refused with any other judgement and with
+            `duplicate_of`. At most 4000 bytes: a longer cost is refused 400
+            `tradeoff_cost_too_long`, never truncated.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: |
+            An EARLIER concern of the SAME run whose chain root's judgement
+            this concern inherits. Exclusive with `judgement` and
+            `tradeoff_cost`. Refused 400 `duplicate_of_not_found` (missing or
+            another run's, indistinguishably) or `duplicate_of_not_earlier`.
+        backfill:
+          type: boolean
+          default: false
+          description: |
+            Records `judgement_backfill: true`. On a WAIVED concern only, lets
+            the stored waive reason's interim prefix supply the judgement.
+
+    LabelledConcern:
+      type: object
+      description: |
+        The 200 body of `POST /v0/concerns/{concern_id}/label`: the concern's
+        identity and (unchanged) state plus its outcome and judgement keys as
+        `GateViewConcern` renders them, resolved over the run's ledger, so a
+        duplicate shows the judgement it inherits. If that ledger read fails
+        after the write, the row's own judgement is rendered (a duplicate
+        then reads `unlabelled` with no `judgement_inherited_from`).
+      required: [id, run_id, stage_id, stage_kind, state, judgement]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_kind:
+          type: string
+          enum: [plan, implement]
+        state:
+          type: string
+          description: The concern's lifecycle state, untouched by the label.
+        outcome:
+          type: string
+          description: Same semantics as `GateViewConcern.outcome` (`duplicate_of:<concern id>` for a duplicate).
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
+          description: Same semantics as `GateViewConcern.judgement`.
+        judgement_inherited_from:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.judgement_inherited_from`.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.duplicate_of`.
+        judgement_actor_kind: { type: string }
+        judgement_delegated: { type: boolean }
+        judgement_bulk: { type: boolean }
+        judgement_backfill: { type: boolean }
+        tradeoff_cost: { type: string }
 
     DeferredConcernResult:
       type: object
@@ -28546,6 +28626,9 @@ paths:
                     with any other judgement (`tradeoff_cost_without_tradeoff`,
                     so a stray cost is never silently dropped). Recorded on the
                     concern row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
                 delegated:
                   type: boolean
                   default: false
@@ -28579,8 +28662,10 @@ paths:
             prefix), `judgement_unknown`, `judgement_unlabelled`,
             `judgement_conflicts_reason_prefix` (rule (d): the message names
             both the judgement and the prefix, and `details.reason_prefix`
-            carries the prefix), `tradeoff_cost_required` or
-            `tradeoff_cost_without_tradeoff`. Body's `error` is
+            carries the prefix), `tradeoff_cost_required`,
+            `tradeoff_cost_without_tradeoff` or
+            `tradeoff_cost_too_long` (a cost over 4000 bytes, never
+            truncated; `details` carry `bytes` and `max`). Body's `error` is
             `validation_failed`.
           content:
             application/json:
@@ -28810,6 +28895,9 @@ paths:
                     with any other judgement (`tradeoff_cost_without_tradeoff`,
                     so a stray cost is never silently dropped). Recorded on the
                     concern row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
                 delegated:
                   type: boolean
                   default: false
@@ -28872,7 +28960,7 @@ paths:
             judgements), with `rule` one of `judgement_required`,
             `judgement_unknown`, `judgement_unlabelled`,
             `judgement_conflicts_reason_prefix` (with `details.reason_prefix`),
-            `tradeoff_cost_required` or `tradeoff_cost_without_tradeoff`.
+            `tradeoff_cost_required`, `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long` (a cost over 4000 bytes, never truncated; `details` carry `bytes` and `max`).
             Every one refuses the whole batch with NOTHING waived.
           content:
             application/json:
@@ -29020,6 +29108,9 @@ paths:
                     judgement (`tradeoff_cost_without_tradeoff`, so a stray
                     cost is never silently dropped). Recorded on the concern
                     row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
       responses:
         '200':
           description: |
@@ -29067,7 +29158,7 @@ paths:
             or `tradeoff_cost`), `rule` and `allowed` (the seven human
             judgements), with `rule` one of `judgement_required`,
             `judgement_unknown`, `judgement_unlabelled`,
-            `tradeoff_cost_required` or `tradeoff_cost_without_tradeoff`.
+            `tradeoff_cost_required`, `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long` (a cost over 4000 bytes, never truncated; `details` carry `bytes` and `max`).
             Every one refuses the whole batch with nothing resolved.
           content:
             application/json:
@@ -29500,6 +29591,9 @@ paths:
                     judgement (`tradeoff_cost_without_tradeoff`, so a stray
                     cost is never silently dropped). Recorded on the concern
                     row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
                 parent_epic:
                   type: string
                   description: |
@@ -29552,7 +29646,7 @@ paths:
             or `tradeoff_cost`), `rule` and `allowed` (the seven human
             judgements), with `rule` one of `judgement_required`,
             `judgement_unknown`, `judgement_unlabelled`,
-            `tradeoff_cost_required` or `tradeoff_cost_without_tradeoff`.
+            `tradeoff_cost_required`, `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long` (a cost over 4000 bytes, never truncated; `details` carry `bytes` and `max`).
             Nothing is filed. Body's `error` is `validation_failed`.
           content:
             application/json:
@@ -29611,6 +29705,161 @@ paths:
           description: |
             Concern, audit, or run store not configured on this
             deployment. Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/concerns/{concern_id}/label:
+    post:
+      operationId: labelConcern
+      summary: Relabel a concern's judgement, or mark it a duplicate of an earlier concern
+      description: |
+        The relabel verb (ADR-117 D1 phase 3, E94.8 / #4841). A HUMAN operator
+        sets or corrects the `judgement` on ANY concern, in any state, or marks
+        it `duplicate_of` an EARLIER concern of the SAME run, which then
+        inherits its chain root's judgement at read time (the gate view and
+        `GET /v0/runs/{run_id}/concerns`). Exactly one of `judgement` and
+        `duplicate_of` is sent. A label NEVER touches `state`,
+        `state_reason`, `outcome` or `updated_at`: it is not a lifecycle event.
+
+        **Human-only.** ADR-117 D1: a judgement is written only by a
+        human-initiated verb. ANY agent subject — an `operator-agent/` token,
+        a run-bound `mcp:run:<uuid>` token (even on its own run) or a
+        first-officer seat (`first_officer/…`) — is refused 403
+        `label_requires_human` before the body is read. There is no
+        delegated path. Scopes: `write:stages` or `write:fixups` (the waive
+        pair); no new scope.
+
+        **duplicate_of guards** (one pure function,
+        `concern.CheckDuplicateTarget`, applied by the handler before any
+        audit append and again by the store before the write):
+        - the target must be a concern of the labelled concern's run. A
+          MISSING target and a target of ANOTHER run (therefore possibly
+          another account) are refused with the IDENTICAL 400
+          `duplicate_of_not_found`, whose message and `details` name only the
+          labelled concern's own run, never the target's run, account or
+          existence;
+        - the target must sort strictly before the labelled concern in the
+          run ledger (`origin_review_sequence`, then `created_at`, then id):
+          400 `duplicate_of_not_earlier` otherwise, which also refuses a
+          self-link. Because the order is strict and total, a chain of
+          admitted links can never form a cycle.
+
+        A duplicate label stores `judgement` `unlabelled` and an empty
+        `tradeoff_cost` on the row (the inherited one is resolved at read
+        time); a later judgement label clears `duplicate_of`. A human waive,
+        resolve or defer of a duplicate-linked concern records its judgement
+        on the row and its audit row, but the EFFECTIVE judgement stays
+        inherited until the concern is relabelled with an explicit one.
+
+        **backfill.** `backfill: true` records `judgement_backfill: true`. On
+        a WAIVED concern only, it also lets the stored waive reason's interim
+        prefix (`false_positive:`, `accepted_tradeoff:`, `preference:`)
+        supply the judgement, under the waive's prefix rules (a contradicting
+        explicit judgement is refused `judgement_conflicts_reason_prefix`; an
+        `accepted_tradeoff:` import still needs an explicit `tradeoff_cost`).
+        A raised, resolved or deferred concern's reason is never read.
+
+        **Audit-before-write ordering.** Every refusal above writes nothing.
+        The handler then appends a `concern_labelled` entry FIRST (payload:
+        `concern_id`, `stage_kind`, `severity`, `category`, `state`,
+        `prior_judgement`, `prior_duplicate_of` when set, `judgement` or
+        `duplicate_of`, `tradeoff_cost` only when set, `backfill`,
+        `provenance` only when set), so a relabel is a new versioned
+        judgement on the chain, never a silent rewrite; append failure is 500
+        `audit_append_failed` with no write. The write is guarded on the
+        prior `judgement` and `duplicate_of` the handler read: a concurrent
+        relabel in between is 409 `concern_label_conflict`. Any write failure
+        after the intent appends a corrective `concern_label_failed` entry.
+        Both categories are internal (no issue-comment activity line). The
+        `tradeoff_cost` is stored verbatim, up to 4000 bytes, on the row, the
+        audit payload and the hash chain, with no secret scrubbing — the same
+        posture as a waive reason.
+      tags: [stages]
+      parameters:
+        - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabelConcernRequest' }
+      responses:
+        '200':
+          description: The label was applied; the concern's judgement as the read surfaces render it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabelledConcern' }
+        '400':
+          description: |
+            Body's `error` is `validation_failed`, nothing written, for: a
+            malformed body, a non-UUID `concern_id` or a non-UUID
+            `duplicate_of` (`details.field`); or a refused label, with
+            `details` carrying `field` and `rule`:
+            - `duplicate_of_excludes_judgement`: `duplicate_of` sent with a
+              `judgement` (`field` `duplicate_of`) or a `tradeoff_cost`
+              (`field` `tradeoff_cost`);
+            - `duplicate_of_not_found`: the target is missing or belongs to
+              another run, indistinguishably (`details.run_id` is the labelled
+              concern's own run). A target that vanishes between the
+              handler's check and the write maps here too (the store's
+              distinct sentinel), never to the labelled concern's 404;
+            - `duplicate_of_not_earlier`: the target does not sort strictly
+              before the labelled concern (including itself);
+            - the judgement rules of the waive (`details.allowed` lists the
+              seven human judgements): `judgement_required` (neither field,
+              or `backfill` with no usable prefix), `judgement_unknown`,
+              `judgement_unlabelled`, `judgement_conflicts_reason_prefix`
+              (with `details.reason_prefix`), `tradeoff_cost_required`,
+              `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long`
+              (over 4000 bytes, never truncated; `details` carry `bytes` and
+              `max`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            `authentication_required`: the caller is anonymous.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `insufficient_scope` (neither `write:stages` nor `write:fixups`),
+            `label_requires_human` (an agent subject: `operator-agent/`,
+            `mcp:run:<uuid>` or a first-officer seat; `details.subject`), or
+            `account_forbidden` (the concern's run belongs to another
+            account).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `concern_not_found`: no concern with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `concern_label_conflict`: the concern's `judgement` or
+            `duplicate_of` changed between the handler's read and the write (a
+            concurrent relabel). Nothing was written; a `concern_label_failed`
+            entry follows the intent. Re-read the concern and label it again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `audit_append_failed` (the `concern_labelled` intent could not be
+            appended; nothing written, no corrective entry) or
+            `internal_error` (a concern read failed, or the write failed after
+            the intent, followed by a `concern_label_failed` entry).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Concern or audit store not configured on this deployment.
+            Body's `error` is `concern_store_unconfigured`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
