@@ -921,3 +921,21 @@ func TestKnownCategories_ConcernRolledUp(t *testing.T) {
 		t.Fatal("concern_rolled_up is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
+
+// TestKnownCategories_ConcernLabelled pins the E94.8 / #4841 (ADR-117 D1
+// phase 3) registration of the relabel verb's two rows: concern_labelled, the
+// intent row server/label_concern.go appends BEFORE the write, and
+// concern_label_failed, its corrective row after a write that failed once the
+// intent was durable. Both are INTERNAL (not issue-comment activity). An
+// unregistered category reddens TestKnownCategoriesCoversEmittedCategories and
+// is un-awaitable through fishhawk_await_audit.
+//
+// Counterfactual: delete either map entry from KnownCategories and this test
+// goes RED naming it.
+func TestKnownCategories_ConcernLabelled(t *testing.T) {
+	for _, c := range []string{"concern_labelled", "concern_label_failed"} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
+	}
+}

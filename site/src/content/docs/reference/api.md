@@ -193,7 +193,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **182 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **183 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -351,6 +351,7 @@ The v0 REST API exposes **182 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/escapes` | Record an escaped defect, or close a pending one with a human attestation |
 | `POST` | `/v0/runs/{run_id}/divergence/{sequence}/answer` | Answer a divergence question — one-off, or a change of doctrine |
 | `POST` | `/v0/concerns/{concern_id}/defer` | Defer an open review concern into a follow-up work item |
+| `POST` | `/v0/concerns/{concern_id}/label` | Relabel a concern's judgement, or mark it a duplicate of an earlier concern |
 | `GET` | `/v0/artifacts/{artifact_id}` | Get an artifact |
 | `POST` | `/v0/runs/{run_id}/signing-key` | Issue a per-run Ed25519 signing key |
 | `POST` | `/v0/runs/{run_id}/trace` | Upload a signed trace bundle |
