@@ -1,0 +1,14 @@
+id: scenario:issue-4780/gate-wait-knob-validated-at-startup
+statement: fishhawkd refuses to start, before dialing the database, when FISHHAWKD_MERGE_QUEUE_GATE_WAIT (or --merge-queue-gate-wait) is non-positive or not a Go duration, exiting non-zero with stderr naming both the flag and the env var; unset, the merge-gate window equals the approval wait.
+verify_hint: run the fishhawkd serve CLI with FISHHAWKD_MERGE_QUEUE_GATE_WAIT=0s and observe the exit code and stderr (CLI surface)
+steps: 'Built fishhawkd from the sanctioned checkout (HEAD 4e029d13 = target git_sha). Ran `env -i PATH HOME FISHHAWKD_DATABASE_URL=postgres://x:y@127.0.0.1:1/z FISHHAWKD_MERGE_QUEUE_GATE_WAIT=<v> fishhawkd serve` for v=0s, -5m, abc, then `fishhawkd serve --merge-queue-gate-wait=0s` and `--merge-queue-gate-wait=10`. Controls: FISHHAWKD_MERGE_QUEUE_GATE_WAIT=1h, and the knob unset.'
+assertions:
+    expected: Refuses to start before the DB dial, exits non-zero, stderr names the flag and the env var; unset equals the approval wait
+    observed_at_record: All five invalid cases exited 1 at once, with stderr 'invalid merge-queue gate wait' naming '--merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT' ('must be a positive duration' or 'is not a Go duration'). No DB dial was attempted. The 1h control passed validation, then tried the DB (dial errors) and logged gate_wait=3600000000000. With the knob unset, the log showed approval_wait=1800000000000 and gate_wait=1800000000000 (equal).
+    repro_handle: FISHHAWKD_MERGE_QUEUE_GATE_WAIT=0s FISHHAWKD_DATABASE_URL=postgres://x:y@127.0.0.1:1/z fishhawkd serve; echo $?
+origin:
+    issue: 4780
+    pr: 0
+    run_id: 3a390a2e-4b65-40cb-a939-b3ee7e5e4c0c
+    head_sha: 4e029d135864035edbdba96841e2b8aabbb80b9d
+    recorded_at: 2026-10-30T20:50:09Z
