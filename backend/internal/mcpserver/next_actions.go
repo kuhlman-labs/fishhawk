@@ -227,7 +227,10 @@ func foldMergeCandidateStaleness(run *Run, na *NextActions) {
 // emits (backend/internal/server/merge_queue_yield.go). foldMergeQueueYield
 // names a reason in its prose only when it is in this set; anything else
 // renders as "an unrecognised reason", so no wire text outside the vocabulary
-// reaches next_actions.
+// reaches next_actions. The three merge_* reasons are the docs/adr/112 A3
+// merge-gate yields (#4780). The set is pinned against the server's
+// vocabulary and the OpenAPI MergeQueueYieldReason enum by
+// TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI.
 var mergeQueueYieldReasons = map[string]bool{
 	"forge_approval_vetoed":                         true,
 	"forge_approval_review_required":                true,
@@ -238,19 +241,38 @@ var mergeQueueYieldReasons = map[string]bool{
 	"forge_approval_provider_unsupported":           true,
 	"forge_approval_identity_provider_unconfigured": true,
 	"forge_review_required":                         true,
+	"merge_checks_red":                              true,
+	"merge_checks_pending":                          true,
+	"merge_review_pending":                          true,
+}
+
+// mergeQueueYieldIsMergeGate reports whether a CLOSED-vocabulary reason is a
+// docs/adr/112 A3 merge-gate yield (A3.1/A3.2, R3 row 1): it clears only when
+// every merge-gate leg passes at the anchored head (A3.4), never on a forge
+// approval alone.
+func mergeQueueYieldIsMergeGate(reason string) bool {
+	switch reason {
+	case "merge_checks_red", "merge_checks_pending", "merge_review_pending":
+		return true
+	}
+	return false
 }
 
 // foldMergeQueueYield names the operator's remedy when the run's merge-queue
-// entry YIELDED its place (ADR-112 R3/R5): the queue skips a yielded entry
-// until a re-probe finds a qualifying forge approval and clears the marker,
-// so the remedy is what makes that fold qualify. The action is keyed on the
-// closed next_step vocabulary: approve_pr → the approve_pr ritual step;
-// dismiss_review → the dismiss_review step (dismiss the blocking
-// CHANGES_REQUESTED review on the forge); retry_after → fishhawk_merge_run
-// (a re-invoke on the queued entry re-probes at once, no backoff);
-// configure_identity_provider → that named operator step. none (nothing at
-// the forge clears it) and any unknown step add NOTHING; the run payload's
-// merge_candidate_queue.note still states it.
+// entry YIELDED its place (ADR-112 R3/R5, docs/adr/112 A3): the queue skips a
+// yielded entry until a re-probe finds the clear predicate holding (A3.4: the
+// forge-approval fold qualifies AND every merge-gate leg passes at the
+// anchored head) and clears the marker, so the remedy is what makes the
+// blocking leg pass. The action is keyed on the closed next_step vocabulary:
+// approve_pr → the approve_pr ritual step; dismiss_review → the
+// dismiss_review step (dismiss the blocking CHANGES_REQUESTED review on the
+// forge); retrigger_ci → fishhawk_retrigger_ci (merge_checks_red: a required
+// check failed or was cancelled at the anchored head; re-run it); retry_after
+// → fishhawk_merge_run (a re-invoke on the queued entry re-probes at once, no
+// backoff; for merge_checks_pending / merge_review_pending the prose names
+// the leg the re-probe waits on); configure_identity_provider → that named
+// operator step. none (nothing at the forge clears it) and any unknown step
+// add NOTHING; the run payload's merge_candidate_queue.note still states it.
 //
 // Untrusted text (approval condition C8): every string is built ONLY from the
 // closed next_step / yield_reason vocabulary. yield_detail (forge-derived,
@@ -278,7 +300,12 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 		reason = q.YieldReason
 	}
 	const yielded = "the run's merge-queue entry YIELDED its place (ADR-112 R3: "
-	const rejoin = "; admission skips it until a re-probe finds a qualifying forge approval at the anchored head and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	rejoin := "; admission skips it until a re-probe finds a qualifying forge approval at the anchored head and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	if mergeQueueYieldIsMergeGate(reason) {
+		// docs/adr/112 A3.4: a merge-gate yield never clears on an approval
+		// alone.
+		rejoin = "; admission skips it until a re-probe finds every merge-gate leg passing at the anchored head (docs/adr/112 A3.4) and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	}
 	precondition := "the run's merge_candidate_queue reads yielded with next_step " + q.NextStep + " (yield_reason " + reason + ")"
 	var action SuggestedAction
 	switch q.NextStep {
@@ -294,8 +321,20 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 			Params: prParams(run),
 			Reason: yielded + reason + ")" + rejoin + ". A write-level CHANGES_REQUESTED review vetoes the merge: dismiss it on the forge (or have its author approve), make sure a qualifying approval stands, then re-invoke fishhawk_merge_run to re-probe at once",
 		}
+	case "retrigger_ci":
+		action = SuggestedAction{
+			Action: "fishhawk_retrigger_ci",
+			Params: map[string]string{"run_id": run.ID},
+			Reason: yielded + reason + ")" + rejoin + ". A required check failed or was cancelled at the anchored head: re-run it with fishhawk_retrigger_ci; the check_run trigger, the periodic re-probe or a fishhawk_merge_run re-invoke then clears the yield once every required check passes",
+		}
 	case "retry_after":
 		why := yielded + reason + ")" + rejoin + ". The forge-approval read was undetermined or truncated; re-invoking fishhawk_merge_run on the queued entry re-probes now instead of waiting for the periodic re-probe's backoff"
+		switch reason {
+		case "merge_checks_pending":
+			why = yielded + reason + ")" + rejoin + ". Required checks are pending, unreported or unreadable at the anchored head: let them finish; the check_run trigger or the periodic re-probe clears the yield once every required check passes, and re-invoking fishhawk_merge_run on the queued entry re-probes now"
+		case "merge_review_pending":
+			why = yielded + reason + ")" + rejoin + ". The implement-review round at the anchored head is still settling: the periodic re-probe clears the yield once its verdicts land and every merge-gate leg passes, and re-invoking fishhawk_merge_run on the queued entry re-probes now"
+		}
 		for i, a := range na.Actions {
 			if a.Action == "fishhawk_merge_run" {
 				na.Actions[i].Reason, na.Actions[i].Precondition = why, precondition
