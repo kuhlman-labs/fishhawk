@@ -78,6 +78,15 @@
     "verdict_transfer": {
       "$ref": "#/$defs/verdict_transfer",
       "description": "The repository's merge-candidate verdict-transfer surface (ADR-124 / #4657, amending ADR-098): ONE top-level block per repository, never one per workflow, so no workflow carries a narrower surface. It is read from the run's cached ADMISSION spec, so a pull request cannot change the surface its own transfer decision uses, and an edit applies to runs admitted after it merges. An ABSENT block refuses every transfer (`undecidable:surface_undeclared`). Only the member types and the closed member set are schema-enforced: an empty, incomplete or malformed declaration is a classification refusal, never an admission failure. Members: `$defs/verdict_transfer`. Declared by workflow-v2; accepted whenever present (v2 has no minor chain)."
+    },
+    "merge_method": {
+      "type": "string",
+      "enum": [
+        "squash",
+        "merge",
+        "rebase"
+      ],
+      "description": "The repository's forge merge method (ADR-110 portability; E93.2 / #4658): the method every merge path of a run dispatches with — inline merge_run, a delegated merge, merge-on-pass and the check-gated auto-merge stage. ONE top-level declaration per repository, never one per workflow. It is read from the run's cached ADMISSION spec, so a pull request cannot change the method its own merge uses, and an edit applies to runs admitted after it merges. ABSENT means `squash`, the product default, so a repository that declares nothing keeps today's squash merge. Declared by workflow-v2 only: v0 and v1 stay frozen, refuse the key, and always merge with squash. GitHub honours all three values per pull request, subject to the repository's own merge settings; a method those settings disallow is refused by the forge and reported as merge_method_refused. GitLab mapping: `squash` sends squash=true; `merge` sends an explicit squash=false, so a merge request author's squash selection is overridden and the project's merge-method setting decides the commit shape; `rebase` is refused BEFORE the merge-dispatch claim, because a GitLab merge request merge has no per-request merge method."
     }
   },
   "$defs": {
