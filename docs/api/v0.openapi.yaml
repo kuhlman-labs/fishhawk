@@ -4741,7 +4741,8 @@ components:
             it, or its binding approval condition was confirmed delivered),
             `carried` (a decomposition child's concern copied into its parent),
             `open_at_merge` (still open or superseded when its run merged),
-            `waived` / `deferred` (the human verbs; no writer yet), or
+            `waived` / `deferred` (the human waive, bulk waive and defer verbs,
+            E94.7 / #4840; a human resolve-with-evidence records `fixed`), or
             `duplicate_of:<concern id>` for a duplicate. A move back into an open
             state clears `fixed`. Omitted when none is recorded.
         judgement:
@@ -4749,12 +4750,14 @@ components:
           enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
           description: |
             The HUMAN judgement of the concern (E94.2 / #4693, ADR-117 D1). Always
-            present. A concern no human has judged reads `unlabelled` — system
-            writers (a reviewer confirm, the clean-round auto-close, a condition
-            claim) never write it, and a blank or unknown stored value also reads
-            `unlabelled`. A duplicate reads its chain root's judgement, resolved over
-            the owning run's own concerns; a dangling, cross-run or cyclic chain
-            reads `unlabelled`.
+            present. Only the four human verbs write it (E94.7 / #4840): waive,
+            bulk waive, resolve-with-evidence and defer, each of which REQUIRES
+            one; a re-judgement overwrites. A concern no human has judged reads
+            `unlabelled` — system writers (a reviewer confirm, the clean-round
+            auto-close, a condition claim) never write it, and a blank or unknown
+            stored value also reads `unlabelled`. A duplicate reads its chain
+            root's judgement, resolved over the owning run's own concerns; a
+            dangling, cross-run or cyclic chain reads `unlabelled`.
         judgement_inherited_from:
           $ref: '#/components/schemas/UUID'
           description: For a duplicate whose chain resolved, the chain-root concern that supplied `judgement`. Omitted otherwise.
@@ -4763,13 +4766,19 @@ components:
           description: The earlier same-run concern this one duplicates. Omitted otherwise.
         judgement_actor_kind:
           type: string
-          description: Who recorded the judgement. Omitted when nobody has.
+          description: Who recorded the judgement — `user` or `agent`, the same actor kind the verb's audit row carries. Omitted when nobody has.
         judgement_delegated:
           type: boolean
           description: The judgement was recorded under a delegation. Omitted when false.
         judgement_bulk:
           type: boolean
-          description: The judgement was recorded by a bulk verb. Omitted when false.
+          description: |
+            COUNT-based (FO ruling D2, E94.7 / #4840): true if and only if one
+            judgement covered more than one concern in one request (a bulk waive
+            or a resolve naming more than one id). A bulk verb called with one id
+            is an individual judgement and records false; the VERB fact is the
+            `concern_waived` audit row's `bulk_waive: true` marker. Omitted when
+            false.
         judgement_backfill:
           type: boolean
           description: The judgement was recorded after the fact. Omitted when false.
@@ -28437,6 +28446,22 @@ paths:
         (`concern_waive_conflict`), keeping the chain truthful in every
         interleaving.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** A waive
+        REQUIRES a human `judgement` (or a recognised `reason` prefix
+        that supplies one; see the property). It is validated after
+        the scope check and `reason`, and BEFORE the concern read, the
+        `cross_run_waive` / `concern_requires_human` 403s, the
+        delegation check and the intent entry, so a refusal appends and
+        mutates nothing. The `concern_waived` payload gains `judgement`, plus
+        `tradeoff_cost` ONLY when set (the key is absent otherwise). The
+        transition records, in the same from-state-guarded update:
+        `outcome` `waived`, the `judgement`, `tradeoff_cost`,
+        `judgement_actor_kind` (the `user` | `agent` kind on the audit
+        row), `judgement_delegated` (true on the `delegated: true` path),
+        `judgement_bulk` false and `judgement_backfill` false; a
+        re-judgement overwrites. Read them back through the gate view
+        (`GateViewConcern`). A judgement never enters a reviewer prompt.
+
         Effects of a successful waive: the concern stops appearing in
         `GET /v0/runs/{run_id}`'s open-states-only `concerns` block, can
         no longer be selected by the fix-up endpoint's `concern_ids`,
@@ -28469,6 +28494,32 @@ paths:
                     `state_reason`, and shown verbatim to later
                     re-reviews as the waive context — make it
                     self-contained.
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    The HUMAN judgement the waive records (ADR-117 D1 phase 2,
+                    E94.7 / #4840). REQUIRED unless `reason` opens with a
+                    recognised prefix; `unlabelled` (the read of an unjudged
+                    concern) and any value outside the enum are refused 400.
+                    Interim reason prefixes (FO ruling D1), matched exactly and
+                    lowercase after leading whitespace: `false_positive:` ->
+                    `no_defect`, `accepted_tradeoff:` -> `tradeoff`,
+                    `preference:` -> `preference`. (a) A judgement with a
+                    MATCHING prefix is accepted; (b) a judgement with no prefix
+                    is accepted; (c) a prefix alone supplies the judgement;
+                    (d) a judgement that CONTRADICTS the prefix is refused 400
+                    `judgement_conflicts_reason_prefix`. Recorded on the
+                    concern row and on the `concern_waived` payload.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, including a prefix-derived
+                    one (no cost is inferred from the reason), and refused
+                    with any other judgement (`tradeoff_cost_without_tradeoff`,
+                    so a stray cost is never silently dropped). Recorded on the
+                    concern row and on the audit payload.
                 delegated:
                   type: boolean
                   default: false
@@ -28494,8 +28545,17 @@ paths:
               schema: { $ref: '#/components/schemas/WaivedConcern' }
         '400':
           description: |
-            Malformed body, missing/empty `reason`, or a non-UUID
-            `concern_id`. Body's `error` is `validation_failed`.
+            Malformed body, missing/empty `reason`, a non-UUID
+            `concern_id`, or a refused judgement (E94.7 / #4840):
+            `details` carry `field` (`judgement` or `tradeoff_cost`), `rule`
+            and `allowed` (the seven human judgements), with `rule` one of
+            `judgement_required` (no judgement and no recognised reason
+            prefix), `judgement_unknown`, `judgement_unlabelled`,
+            `judgement_conflicts_reason_prefix` (rule (d): the message names
+            both the judgement and the prefix, and `details.reason_prefix`
+            carries the prefix), `tradeoff_cost_required` or
+            `tradeoff_cost_without_tradeoff`. Body's `error` is
+            `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28654,6 +28714,18 @@ paths:
         for that concern; a transition failure after the append appends the
         corrective `concern_waive_failed` entry.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** ONE `judgement`
+        (and `tradeoff_cost`) covers the batch, under the same rules and
+        reason-prefix rules (a)-(d) as the single waive; it is validated before
+        any concern read, so a refusal refuses the WHOLE batch with nothing
+        appended. Every `concern_waived` row carries `judgement`, plus
+        `tradeoff_cost` only when set. Each concern records `outcome`
+        `waived` and the judgement fields as the single waive does, with
+        `judgement_bulk` COUNT-based (FO ruling D2): true if and only if the
+        batch names more than one concern. A one-id batch records
+        `judgement_bulk` false while its `concern_waived` row still carries
+        `bulk_waive: true` (the verb record), so both facts survive.
+
         Auth mirrors the single waive: `write:stages` OR `write:fixups`; an mcp
         run-bound token (subject `mcp:run:<uuid>`) may only bulk-waive its own
         run, compared against the PATH run id (403 `cross_run_waive`).
@@ -28686,6 +28758,32 @@ paths:
                     `concern_waived` entry in the batch and stored as each
                     concern's `state_reason`. One reason covers the batch — make
                     it self-contained, since later re-reviews read it verbatim.
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    The HUMAN judgement the batch records (ADR-117 D1 phase 2,
+                    E94.7 / #4840). REQUIRED unless `reason` opens with a
+                    recognised prefix; `unlabelled` (the read of an unjudged
+                    concern) and any value outside the enum are refused 400.
+                    Interim reason prefixes (FO ruling D1), matched exactly and
+                    lowercase after leading whitespace: `false_positive:` ->
+                    `no_defect`, `accepted_tradeoff:` -> `tradeoff`,
+                    `preference:` -> `preference`. (a) A judgement with a
+                    MATCHING prefix is accepted; (b) a judgement with no prefix
+                    is accepted; (c) a prefix alone supplies the judgement;
+                    (d) a judgement that CONTRADICTS the prefix is refused 400
+                    `judgement_conflicts_reason_prefix`. Recorded on the
+                    concern row and on every `concern_waived` row in the batch.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, including a prefix-derived
+                    one (no cost is inferred from the reason), and refused
+                    with any other judgement (`tradeoff_cost_without_tradeoff`,
+                    so a stray cost is never silently dropped). Recorded on the
+                    concern row and on the audit payload.
                 delegated:
                   type: boolean
                   default: false
@@ -28742,8 +28840,14 @@ paths:
             raw spelling sent), `canonical_concern_id` and `first_spelling`; or
             an id belonging to ANOTHER run — the last carrying
             `details.rule` `concern_run_mismatch` alongside `concern_id`,
-            `concern_run_id` and `path_run_id`. Every one refuses the whole batch
-            with NOTHING waived.
+            `concern_run_id` and `path_run_id`; or a refused judgement
+            (E94.7 / #4840): `details` carry `field` (`judgement` or
+            `tradeoff_cost`), `rule` and `allowed` (the seven human
+            judgements), with `rule` one of `judgement_required`,
+            `judgement_unknown`, `judgement_unlabelled`,
+            `judgement_conflicts_reason_prefix` (with `details.reason_prefix`),
+            `tradeoff_cost_required` or `tradeoff_cost_without_tradeoff`.
+            Every one refuses the whole batch with NOTHING waived.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28826,6 +28930,16 @@ paths:
         status comment, whose activity section renders
         `Concern <id8> resolved with operator evidence: <evidence>`.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** The batch REQUIRES
+        ONE `judgement` (no reason prefix applies), validated after `evidence`
+        and before any concern read, so a refusal refuses the whole batch with
+        nothing appended. Every `concern_resolved_with_evidence` entry carries
+        `judgement`, plus `tradeoff_cost` only when set. Each concern records
+        `outcome` `fixed`, the `judgement`, `tradeoff_cost`,
+        `judgement_actor_kind`, `judgement_delegated` false, `judgement_bulk`
+        (COUNT-based, FO ruling D2: true if and only if the batch names more
+        than one concern) and `judgement_backfill` false.
+
         Auth: authenticated; `write:stages` OR `write:fixups`; the run's
         account (403 `account_forbidden` for another workspace's bearer); and
         HUMAN-ONLY — ANY agent subject (an `operator-agent/…` token or a
@@ -28841,7 +28955,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [concern_ids, evidence]
+              required: [concern_ids, evidence, judgement]
               properties:
                 concern_ids:
                   type: array
@@ -28862,6 +28976,24 @@ paths:
                     on every `concern_resolved_with_evidence` entry and stored
                     as each concern's `state_reason` behind the
                     `operator evidence: ` prefix.
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    REQUIRED HUMAN judgement the resolve records (ADR-117 D1
+                    phase 2, E94.7 / #4840). `unlabelled` (the read of an
+                    unjudged concern) and any value outside the enum are
+                    refused 400. No reason prefix applies here — the prefixes
+                    are a waive-reason convention. Recorded on the concern row
+                    and on every `concern_resolved_with_evidence` entry.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, and refused with any other
+                    judgement (`tradeoff_cost_without_tradeoff`, so a stray
+                    cost is never silently dropped). Recorded on the concern
+                    row and on the audit payload.
       responses:
         '200':
           description: |
@@ -28903,9 +29035,14 @@ paths:
             over 4000 bytes (`details` carries `bytes` and `max`); an empty
             `concern_ids`; more than 50 ids; a non-UUID id; a duplicate id
             compared on the PARSED uuid (`details` carries `concern_id`,
-            `canonical_concern_id` and `first_spelling`); or an id belonging to
-            ANOTHER run (`details.rule` `concern_run_mismatch`). Every one
-            refuses the whole batch with nothing resolved.
+            `canonical_concern_id` and `first_spelling`); an id belonging to
+            ANOTHER run (`details.rule` `concern_run_mismatch`); or a refused
+            judgement (E94.7 / #4840): `details` carry `field` (`judgement`
+            or `tradeoff_cost`), `rule` and `allowed` (the seven human
+            judgements), with `rule` one of `judgement_required`,
+            `judgement_unknown`, `judgement_unlabelled`,
+            `tradeoff_cost_required` or `tradeoff_cost_without_tradeoff`.
+            Every one refuses the whole batch with nothing resolved.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -29293,6 +29430,16 @@ paths:
         no longer be selected by the fix-up endpoint's `concern_ids`, and
         its `state_reason` names the filed issue. The defer is terminal.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** A defer
+        REQUIRES a human `judgement` (no reason prefix applies). It is
+        validated after the scope check and BEFORE the concern read, the
+        `cross_run_defer` / `concern_requires_human` 403s and any filing,
+        so a refusal never leaves an orphan issue. The `concern_deferred`
+        payload gains `judgement`, plus `tradeoff_cost` only when set. The
+        transition records `outcome` `deferred`, the `judgement`,
+        `tradeoff_cost`, `judgement_actor_kind`, `judgement_delegated`
+        false, `judgement_bulk` false and `judgement_backfill` false.
+
         Auth mirrors the waive endpoint: `write:stages` or `write:fixups`
         scope; an mcp run-bound token (subject `mcp:run:<uuid>`) may
         defer only its own run's concerns (403 `cross_run_defer`
@@ -29301,13 +29448,32 @@ paths:
       parameters:
         - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
               additionalProperties: false
+              required: [judgement]
               properties:
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    REQUIRED HUMAN judgement the defer records (ADR-117 D1
+                    phase 2, E94.7 / #4840). `unlabelled` (the read of an
+                    unjudged concern) and any value outside the enum are
+                    refused 400. No reason prefix applies here — the prefixes
+                    are a waive-reason convention. Recorded on the concern row
+                    and on the `concern_deferred` payload.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, and refused with any other
+                    judgement (`tradeoff_cost_without_tradeoff`, so a stray
+                    cost is never silently dropped). Recorded on the concern
+                    row and on the audit payload.
                 parent_epic:
                   type: string
                   description: |
@@ -29355,8 +29521,13 @@ paths:
               schema: { $ref: '#/components/schemas/DeferredConcernResult' }
         '400':
           description: |
-            Malformed body or a non-UUID `concern_id`. Body's `error` is
-            `validation_failed`.
+            Malformed or absent body, a non-UUID `concern_id`, or a refused
+            judgement (E94.7 / #4840): `details` carry `field` (`judgement`
+            or `tradeoff_cost`), `rule` and `allowed` (the seven human
+            judgements), with `rule` one of `judgement_required`,
+            `judgement_unknown`, `judgement_unlabelled`,
+            `tradeoff_cost_required` or `tradeoff_cost_without_tradeoff`.
+            Nothing is filed. Body's `error` is `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
