@@ -295,6 +295,9 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// resolve_concerns.go handleResolveConcerns (E83.53 / #4086) — the waive
 	// predicate; the handler additionally refuses every agent subject.
 	"fishhawk_resolve_concerns": {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	// label_concern.go handleLabelConcern (E94.8 / #4841) — the waive
+	// predicate; the handler additionally refuses every agent subject.
+	"fishhawk_label_concern": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 	// divergence_answer.go handleAnswerDivergence (E75.5 / #3733) — the waive/defer posture.
 	"fishhawk_answer_divergence": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 
