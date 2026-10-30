@@ -450,7 +450,7 @@ func mergeOnPassExpiredWaitHeld(e mergequeue.Entry, reason, detail string) merge
 // the run's merge-intent lock, after one bounded ApprovalWait judgement.
 func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y mergeQueueYield, site string) bool {
 	m := y.marker()
-	m.Continue = s.mergeQueueYieldContinuation(ctx, e, y.Reason)
+	m.Continue = s.mergeQueueYieldContinuation(ctx, e)
 	yielded, err := s.cfg.MergeQueue.Yield(ctx, e.ID, e.AdmissionEpoch, m)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -475,9 +475,10 @@ func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y
 // unreadable audit chain, a failed cleared append) is nil: a fresh episode. A
 // delayed re-probe that read the PRIOR marker cannot clear or overwrite the
 // continued one: the yielded-row writes compare-and-swap on yield_revision
-// (A3.6). reason is ignored (approval condition H2 keeps the parameter until
-// the merge_run.go caller drops it).
-func (s *Server) mergeQueueYieldContinuation(ctx context.Context, e mergequeue.Entry, _ string) *mergequeue.YieldEpisode {
+// (A3.6). It takes no reason: the continuation is reason-independent
+// (approval condition H2 dropped the ignored parameter with the merge_run.go
+// caller).
+func (s *Server) mergeQueueYieldContinuation(ctx context.Context, e mergequeue.Entry) *mergequeue.YieldEpisode {
 	if s.cfg.AuditRepo == nil {
 		return nil
 	}

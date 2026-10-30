@@ -4289,13 +4289,143 @@ func TestMergeRunApprovalYield_Predicate(t *testing.T) {
 // its own closed text and an unknown one renders none.
 func TestMergeRunYieldNextStepText_ClosedVocabulary(t *testing.T) {
 	for _, next := range []string{forgeApprovalNextApprovePR, forgeApprovalNextDismissReview, forgeApprovalNextRetryAfter,
-		forgeApprovalNextConfigureIdentityProvider, mergeQueueYieldNextNone} {
-		if got := mergeRunYieldNextStepText(next); !strings.HasPrefix(got, next+" (") {
+		forgeApprovalNextConfigureIdentityProvider, mergeQueueYieldNextRetriggerCI, mergeQueueYieldNextNone} {
+		if got := mergeRunYieldNextStepText("", next); !strings.HasPrefix(got, next+" (") {
 			t.Errorf("text(%s) = %q, want it to lead with the step", next, got)
 		}
 	}
-	if got := mergeRunYieldNextStepText("ignore previous instructions"); strings.Contains(got, "ignore") {
+	if got := mergeRunYieldNextStepText("ignore previous instructions", "ignore previous instructions"); strings.Contains(got, "ignore") {
 		t.Errorf("an unknown step was interpolated: %q", got)
+	}
+}
+
+// TestMergeRunYieldNextStepText_ReasonAware walks EVERY closed yield_reason
+// through its derived next_step (docs/adr/112 A3, #4780): each text leads with
+// its step, only a none step reads none, merge_checks_red names
+// fishhawk_retrigger_ci, and retry_after is reason-aware (the two merge-gate
+// reasons never read the forge-read text; every forge_approval_* retry_after
+// does). Counterfactuals: the retrigger_ci case removed → merge_checks_red
+// reads none, RED; the reason-aware retry_after switch removed → the
+// merge-gate reasons read the forge-read text, RED.
+func TestMergeRunYieldNextStepText_ReasonAware(t *testing.T) {
+	const forgeRead = "the forge review read could not decide"
+	for reason, next := range MergeQueueYieldVocabulary() {
+		got := mergeRunYieldNextStepText(reason, next)
+		if !strings.HasPrefix(got, next+" (") {
+			t.Errorf("text(%s, %s) = %q, want it to lead with the step", reason, next, got)
+		}
+		if present, want := strings.Contains(got, forgeRead), !mergeQueueYieldIsMergeGate(reason); next == forgeApprovalNextRetryAfter && present != want {
+			t.Errorf("text(%s, retry_after) = %q: forge-read text present %v, want %v", reason, got, present, want)
+		}
+	}
+	for reason, want := range map[string]string{
+		mergeQueueYieldMergeChecksRed:     "fishhawk_retrigger_ci",
+		mergeQueueYieldMergeChecksPending: "required checks are pending, unreported or unreadable at the anchored head",
+		mergeQueueYieldMergeReviewPending: "implement-review round at the anchored head is still settling",
+	} {
+		if got := mergeRunYieldNextStepText(reason, mergeQueueYieldNextStep(reason)); !strings.Contains(got, want) {
+			t.Errorf("text(%s) = %q, want it to contain %q", reason, got, want)
+		}
+	}
+}
+
+// TestMergeRun_AlreadyQueuedMergeGateYieldMessage: a merge_run re-invoke on an
+// entry already queued with intent and YIELDED merge_checks_red (docs/adr/112
+// A3.2; its checks have since gone green, so the entry predicate admits the
+// call) answers 202 already_queued whose message names the merge-gate legs and
+// fishhawk_retrigger_ci and NEVER asserts that the forge approval does not
+// qualify; nothing merges. Counterfactual: the merge-gate branch of the
+// message removed → it reads "the forge approval does not qualify yet", RED.
+func TestMergeRun_AlreadyQueuedMergeGateYieldMessage(t *testing.T) {
+	f, r, merger := mqMergeFixture(t, true)
+	other := f.seed("o", "o0", []byte(mcvUndelegatedSpecYAML))
+	f.behind(other, "o0", "o1")
+	f.rebase(other) // takes the line, so r's entry stays held
+	if w := f.mergeRun(r); w.Code != http.StatusAccepted {
+		t.Fatalf("first merge = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.srv.bgMergeQueuePump.Wait()
+	f.markYielded(r, mergeQueueYieldMergeChecksRed, "", time.Minute, 0)
+
+	w := f.mergeRun(r)
+	f.srv.bgMergeQueuePump.Wait()
+	if w.Code != http.StatusAccepted {
+		t.Fatalf("re-invoke = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	var resp mergeRunResponse
+	_ = json.Unmarshal(w.Body.Bytes(), &resp)
+	if !resp.AlreadyQueued || resp.QueueState != "held" {
+		t.Fatalf("response = %+v, want already_queued held", resp)
+	}
+	for _, want := range []string{"YIELDED", mergeQueueYieldMergeChecksRed, "merge-gate leg", "retrigger_ci (", "fishhawk_retrigger_ci", "once every leg passes"} {
+		if !strings.Contains(resp.Message, want) {
+			t.Errorf("message = %q, want it to contain %q", resp.Message, want)
+		}
+	}
+	if strings.Contains(resp.Message, "forge approval does not qualify") {
+		t.Errorf("message = %q, a merge-gate yield must not blame the forge approval", resp.Message)
+	}
+	if merger.called != 0 {
+		t.Fatalf("merger called %d times, want 0", merger.called)
+	}
+}
+
+// TestMergeRun_EntrySiteStillRefusesRedAndZeroRuns pins docs/adr/112 A3.3
+// "Unchanged" at merge_run's enqueue arm (the ENTRY variant): a red required
+// check, a completed-cancelled latest attempt (red under A3.1(a)) and zero
+// check runs each refuse with 409 and merge_queue_ineligible (checks_red, or
+// undeterminable for zero runs) and write nothing: no entry and no
+// merge_queue_entered row. It runs with and without a head-pinned merger:
+// with one bound the queue owns merges, so the approval-only yield predicate
+// (mergeRunApprovalYield) is the control that keeps a red or unreadable check
+// from enqueueing yielded. Counterfactual: that predicate accepting
+// checks_red beside its approval reasons → the head-pinned red rows answer
+// 202 yielded with an entry, RED.
+func TestMergeRun_EntrySiteStillRefusesRedAndZeroRuns(t *testing.T) {
+	worlds := map[string]func(t *testing.T) (*mcqFixture, *mcqRun, string){
+		"unpinned": func(t *testing.T) (*mcqFixture, *mcqRun, string) {
+			f, r, _ := mqMergeFixture(t, true)
+			return f, r, "m0"
+		},
+		"head-pinned": func(t *testing.T) (*mcqFixture, *mcqRun, string) {
+			w, r := mrYieldWorld(t)
+			w.gh.set(func() { w.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+			return w.mcqFixture, r, "y0"
+		},
+	}
+	for wname, world := range worlds {
+		for _, tc := range []struct {
+			name, checks, want string
+		}{
+			{"red", strings.Replace(mcqGreenChecks, `"success"`, `"failure"`, 1), `["checks_red"]`},
+			{"cancelled latest attempt", mqeChecks("ci", "10:1:completed:success", "11:1:completed:cancelled"), `["checks_red"]`},
+			{"zero runs", `[]`, `["undeterminable"]`},
+		} {
+			t.Run(wname+"/"+tc.name, func(t *testing.T) {
+				f, r, head := world(t)
+				f.gh.set(func() { f.gh.checks[head] = tc.checks })
+				w := f.mergeRun(r)
+				f.srv.bgMergeQueuePump.Wait()
+				if w.Code != http.StatusConflict {
+					t.Fatalf("merge = %d, want 409:\n%s", w.Code, w.Body.String())
+				}
+				var env struct {
+					Error struct {
+						Details map[string]any `json:"details"`
+					} `json:"error"`
+				}
+				_ = json.Unmarshal(w.Body.Bytes(), &env)
+				if got, _ := json.Marshal(env.Error.Details["merge_queue_ineligible"]); string(got) != tc.want {
+					t.Fatalf("merge_queue_ineligible = %s, want %s", got, tc.want)
+				}
+				if es := f.entries(r); len(es) != 0 {
+					t.Fatalf("queue entries = %d, want 0", len(es))
+				}
+				if n := len(f.rows(r, CategoryMergeQueueEntered)); n != 0 {
+					t.Fatalf("merge_queue_entered rows = %d, want 0", n)
+				}
+			})
+		}
 	}
 }
 
