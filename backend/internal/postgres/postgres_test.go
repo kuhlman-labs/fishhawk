@@ -8746,3 +8746,92 @@ func TestIsTransientPGRefusal(t *testing.T) {
 		}
 	}
 }
+
+// TestMigrateDown_ReviewConcernsJudgementReversal pins 0114 (E94.2 phase 1 /
+// #4693, ADR-117 D1): a row inserted at 0113 (before the judgement columns
+// exist) reads judgement 'unlabelled' after MigrateUp — the column DEFAULT is
+// the ONLY source of that value, because nothing ever writes it — with the
+// three flags false, actor kind and tradeoff_cost empty, duplicate_of NULL and
+// its outcome untouched; rolling 0114 back drops the seven columns and keeps
+// every row.
+func TestMigrateDown_ReviewConcernsJudgementReversal(t *testing.T) {
+	t.Parallel()
+	url := startContainer(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := postgres.Connect(context.Background(), url)
+	if err != nil {
+		t.Fatalf("Connect: %v", err)
+	}
+	defer pool.Close()
+	ctx := context.Background()
+
+	columns := func() int {
+		t.Helper()
+		var n int
+		if err := pool.QueryRow(ctx, `SELECT count(*) FROM information_schema.columns
+WHERE table_name = 'review_concerns' AND column_name IN
+  ('judgement', 'judgement_actor_kind', 'judgement_delegated', 'judgement_bulk', 'judgement_backfill', 'tradeoff_cost', 'duplicate_of')`).Scan(&n); err != nil {
+			t.Fatalf("read 0114 columns: %v", err)
+		}
+		return n
+	}
+	if n := columns(); n != 7 {
+		t.Fatalf("0114 columns after MigrateUp = %d, want 7", n)
+	}
+
+	// Land on 0113 and insert a row the judgement columns do not exist for yet.
+	downThrough(t, url, "0114")
+	if n := columns(); n != 0 {
+		t.Fatalf("0114 columns at 0113 = %d, want 0", n)
+	}
+	var runID, stageID, rowID uuid.UUID
+	if err := pool.QueryRow(ctx, `INSERT INTO runs (id, repo, workflow_id, workflow_sha, trigger_source, state)
+VALUES (gen_random_uuid(), 'acme-widgets/storefront', 'w', 'sha', 'cli', 'running') RETURNING id`).Scan(&runID); err != nil {
+		t.Fatalf("seed run: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO stages (id, run_id, sequence, stage_type, executor_kind, executor_ref, state)
+VALUES (gen_random_uuid(), $1, 1, 'implement', 'agent', 'fishhawk/runner@v1', 'pending') RETURNING id`, runID).Scan(&stageID); err != nil {
+		t.Fatalf("seed stage: %v", err)
+	}
+	if err := pool.QueryRow(ctx, `INSERT INTO review_concerns (id, run_id, stage_id, stage_kind, origin_review_sequence, severity, note, outcome)
+VALUES (gen_random_uuid(), $1, $2, 'implement', 1, 'high', 'legacy', 'carried') RETURNING id`, runID, stageID).Scan(&rowID); err != nil {
+		t.Fatalf("insert pre-0114-shaped row: %v", err)
+	}
+
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp over the pre-0114 row: %v", err)
+	}
+	var (
+		judgement, actorKind, cost, outcome string
+		delegated, bulk, backfill           bool
+		duplicateOf                         *uuid.UUID
+	)
+	if err := pool.QueryRow(ctx, `SELECT judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of, outcome
+FROM review_concerns WHERE id = $1`, rowID).Scan(&judgement, &actorKind, &delegated, &bulk, &backfill, &cost, &duplicateOf, &outcome); err != nil {
+		t.Fatalf("read the pre-0114 row after MigrateUp: %v", err)
+	}
+	if judgement != "unlabelled" {
+		t.Errorf("pre-0114 row judgement = %q, want unlabelled (the column default)", judgement)
+	}
+	if actorKind != "" || delegated || bulk || backfill || cost != "" || duplicateOf != nil {
+		t.Errorf("pre-0114 row reads actor_kind=%q delegated=%v bulk=%v backfill=%v tradeoff_cost=%q duplicate_of=%v, want empty / false / NULL",
+			actorKind, delegated, bulk, backfill, cost, duplicateOf)
+	}
+	if outcome != "carried" {
+		t.Errorf("pre-0114 row outcome = %q, want carried (0114 never touches outcome)", outcome)
+	}
+
+	downThrough(t, url, "0114")
+	if n := columns(); n != 0 {
+		t.Errorf("0114 columns after rolling back 0114 = %d, want 0", n)
+	}
+	var survived int
+	if err := pool.QueryRow(ctx, `SELECT count(*) FROM review_concerns WHERE id = $1 AND outcome = 'carried'`, rowID).Scan(&survived); err != nil {
+		t.Fatalf("read the row after rolling back 0114: %v", err)
+	}
+	if survived != 1 {
+		t.Errorf("rows with the pre-0114 id + outcome after rollback = %d, want 1 (rollback keeps every row)", survived)
+	}
+}

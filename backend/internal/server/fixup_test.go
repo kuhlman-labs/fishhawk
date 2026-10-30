@@ -2523,6 +2523,9 @@ type fakeConcernRepo struct {
 	// applyResolutionErr, when set, makes ApplyResolution fail without
 	// transitioning — the #3395 recovery's per-row best-effort branch.
 	applyResolutionErr error
+	// applyDispositionErr, when set, makes ApplyDisposition fail without
+	// transitioning — the system writers' per-row best-effort branch.
+	applyDispositionErr error
 	// importErr / stampErr, when set, make ImportRolledUp / StampOpenAtMerge
 	// fail without writing (E94.1 / #4692 failure-mode tests).
 	importErr error
@@ -2637,10 +2640,20 @@ func (f *fakeConcernRepo) MarkAddressedPending(ctx context.Context, ids []uuid.U
 		if err := concern.Transition(row.State, concern.StateAddressedPending); err != nil {
 			return err
 		}
+		clearStaleFixedOnReopen(row, concern.StateAddressedPending)
 		row.State = concern.StateAddressedPending
 		row.StateReason = reason
 	}
 	return nil
+}
+
+// clearStaleFixedOnReopen mirrors UpdateReviewConcernState's NULL-outcome arm
+// (E94.2 / #4693): a move back into an open state clears an outcome of exactly
+// fixed; every other outcome is kept.
+func clearStaleFixedOnReopen(row *concern.Concern, to concern.State) {
+	if to.IsOpen() && row.Outcome == concern.OutcomeFixed {
+		row.Outcome = ""
+	}
 }
 
 func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to concern.State, reason string) (*concern.Concern, error) {
@@ -2657,8 +2670,36 @@ func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to 
 	if err := concern.Transition(row.State, to); err != nil {
 		return nil, err
 	}
+	clearStaleFixedOnReopen(row, to)
 	row.State = to
 	row.StateReason = reason
+	return row, nil
+}
+
+// ApplyDisposition mirrors the store (E94.2 / #4693): an empty outcome is
+// refused before any write; otherwise the same transition as ApplyResolution
+// plus the outcome. It writes state, state_reason and outcome ONLY — never a
+// judgement field — so the fake stays honest to the store.
+func (f *fakeConcernRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to concern.State, reason string, d concern.Disposition) (*concern.Concern, error) {
+	if f.applyDispositionErr != nil {
+		return nil, f.applyDispositionErr
+	}
+	if d.Outcome == "" {
+		return nil, errors.New("fake concern: apply disposition: outcome required")
+	}
+	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := rows[0]
+	if err := concern.Transition(row.State, to); err != nil {
+		return nil, err
+	}
+	row.State = to
+	row.StateReason = reason
+	row.Outcome = d.Outcome
 	return row, nil
 }
 
@@ -2771,6 +2812,44 @@ func seedConcernRow(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID,
 		t.Fatalf("seed concern: %v", err)
 	}
 	return rows[0]
+}
+
+// TestFakeConcernRepo_MirrorsDispositionStore keeps the fake honest to the
+// store's E94.2 / #4693 semantics so server tests cannot diverge from it: an
+// empty-outcome disposition is refused with nothing written, a confirm records
+// fixed and leaves the judgement alone, and a reopen clears exactly fixed
+// (concern/postgres_test.go TestUpdateState_ReopenClearsFixedOutcome pins the
+// store side).
+func TestFakeConcernRepo_MirrorsDispositionStore(t *testing.T) {
+	ctx := context.Background()
+	cr := newFakeConcernRepo()
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 1, "n")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{row.ID}, "routed"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	row.Judgement = concern.JudgementDefect
+	if _, err := cr.ApplyDisposition(ctx, row.ID, concern.StateAddressed, "confirmed", concern.Disposition{}); err == nil {
+		t.Error("empty-outcome ApplyDisposition returned nil error, want a refusal")
+	}
+	if row.State != concern.StateAddressedPending || row.Outcome != "" {
+		t.Fatalf("after a refused disposition: state = %s outcome = %q, want addressed_pending / empty", row.State, row.Outcome)
+	}
+	if _, err := cr.ApplyDisposition(ctx, row.ID, concern.StateAddressed, "confirmed", concern.Disposition{Outcome: concern.OutcomeFixed}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if row.Outcome != concern.OutcomeFixed || row.Judgement != concern.JudgementDefect {
+		t.Errorf("after confirm: outcome = %q judgement = %q, want fixed / defect", row.Outcome, row.Judgement)
+	}
+	if _, err := cr.ApplyResolution(ctx, row.ID, concern.StateReopened, "reopened"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if row.Outcome != "" {
+		t.Errorf("after reopen: outcome = %q, want empty — a reopen clears a stale fixed", row.Outcome)
+	}
+	if n, _ := cr.StampOpenAtMerge(ctx, []uuid.UUID{runID}); n != 1 || row.Outcome != concern.OutcomeOpenAtMerge {
+		t.Errorf("merge stamp = %d, outcome %q; want 1 and open_at_merge", n, row.Outcome)
+	}
 }
 
 // fixupServerWithConcerns is fixupServer plus a wired concern store, for

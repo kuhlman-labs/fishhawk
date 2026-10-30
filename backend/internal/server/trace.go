@@ -7384,8 +7384,9 @@ func (s *Server) autoCloseUnjudgedRoutedConcerns(ctx context.Context, runID, sta
 		// concern.validTransitions, so no new state and no migration. Per-row
 		// failures (including an InvalidTransitionError from a row that changed
 		// state under us) WARN-log and continue, mirroring
-		// applyConcernResolutions' best-effort posture.
-		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateAddressed, reason); aerr != nil {
+		// applyConcernResolutions' best-effort posture. A system writer's close:
+		// outcome fixed, no judgement column touched (E94.2 / #4693).
+		if _, aerr := s.cfg.ConcernRepo.ApplyDisposition(ctx, row.ID, concern.StateAddressed, reason, concern.Disposition{Outcome: concern.OutcomeFixed}); aerr != nil {
 			warn("apply resolution failed",
 				slog.String("concern_id", row.ID.String()),
 				slog.String("error", aerr.Error()),
@@ -7787,7 +7788,16 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 		if to == concern.StateAddressed && reviewedHeadSHA != "" {
 			note += " [verified at " + reviewedHeadSHA + "]"
 		}
-		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, note); aerr != nil {
+		// A confirm is a SYSTEM writer's close (E94.2 / #4693, ADR-117 D1): it
+		// records outcome fixed through ApplyDisposition, which never touches a
+		// judgement column. reopened / superseded record no outcome.
+		var aerr error
+		if to == concern.StateAddressed {
+			_, aerr = s.cfg.ConcernRepo.ApplyDisposition(ctx, cid, to, note, concern.Disposition{Outcome: concern.OutcomeFixed})
+		} else {
+			_, aerr = s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, note)
+		}
+		if aerr != nil {
 			// InvalidTransitionError lands here — including the
 			// confirm-after-reopen case across heterogeneous reviewers,
 			// satisfying concern.go's never-silently-swallow contract.

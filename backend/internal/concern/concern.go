@@ -266,26 +266,63 @@ type Concern struct {
 	// Outcome is the concern's recorded outcome (E94.1 / #4692, ADR-117 D1),
 	// orthogonal to State: OutcomeCarried on a decomposition child's concern
 	// copied into its parent's ledger, OutcomeOpenAtMerge on a concern still
-	// open (or superseded) when its run merged, '' when none is recorded —
-	// every row minted before migration 0112. Writing it never touches State,
-	// StateReason or UpdatedAt. It is never rendered into a review prompt.
+	// open (or superseded) when its run merged, OutcomeFixed on a concern a
+	// system writer closed (E94.2 / #4693), '' when none is recorded — every
+	// row minted before migration 0112. The carried / open_at_merge writes
+	// never touch State, StateReason or UpdatedAt; fixed is written WITH its
+	// transition (ApplyDisposition) and cleared by a move back into an open
+	// state. It is never rendered into a review prompt.
 	Outcome Outcome
 	// RolledUpFrom is, on a parent copy imported at a decomposed parent's
 	// fan-in (E94.1 / #4692, ADR-117 D2), the id of the child concern it was
 	// copied from; nil on every other row.
 	RolledUpFrom *uuid.UUID
-	CreatedAt    time.Time
-	UpdatedAt    time.Time
+	// Judgement is the stored HUMAN judgement of the concern (E94.2 / #4693,
+	// ADR-117 D1), orthogonal to State and Outcome. Stored verbatim from the
+	// tolerant judgement column; read it through NormalizeJudgement (or, for a
+	// duplicate, ResolveJudgements). Every row minted before migration 0114,
+	// and every row only a system writer has touched, reads JudgementUnlabelled:
+	// system writers never write it. It is never rendered into a review prompt.
+	Judgement Judgement
+	// JudgementActorKind names who recorded Judgement, '' when nobody has.
+	JudgementActorKind string
+	// JudgementDelegated, JudgementBulk and JudgementBackfill record how the
+	// judgement was made: under a delegation, by a bulk verb, after the fact.
+	JudgementDelegated bool
+	JudgementBulk      bool
+	JudgementBackfill  bool
+	// TradeoffCost is the stated cost of a JudgementTradeoff, '' otherwise.
+	TradeoffCost string
+	// DuplicateOf is the id of an earlier same-run concern this one duplicates,
+	// nil otherwise. A duplicate's effective judgement is its chain root's
+	// (ResolveJudgements) and its effective outcome duplicate_of:<id>
+	// (EffectiveOutcome).
+	DuplicateOf *uuid.UUID
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+}
+
+// EffectiveOutcome is the outcome a read surface reports (E94.2 / #4693,
+// ADR-117 D1): DuplicateOutcomePrefix + the target id for a duplicate, the
+// stored Outcome otherwise (” when none is recorded).
+func (c Concern) EffectiveOutcome() string {
+	if c.DuplicateOf != nil {
+		return DuplicateOutcomePrefix + c.DuplicateOf.String()
+	}
+	return string(c.Outcome)
 }
 
 // Outcome is a concern's recorded outcome (E94.1 / #4692, ADR-117 D1). It is
 // orthogonal to State: State is the lifecycle position the gates read, Outcome
-// records what became of the concern. The empty string means no outcome is recorded. This
-// change writes two values; the rest of the D1 vocabulary lands later with no
-// further migration of the column (tolerant TEXT, no CHECK).
+// records what became of the concern. The empty string means no outcome is
+// recorded. The column is tolerant TEXT with no CHECK.
 type Outcome string
 
-// Outcomes written today.
+// The ADR-117 D1 outcome vocabulary. Written today: OutcomeCarried and
+// OutcomeOpenAtMerge (E94.1 / #4692) and OutcomeFixed (the system writers,
+// E94.2 / #4693). OutcomeWaived and OutcomeDeferred have no writer yet: they
+// land with the human verbs (ADR-117 D1 phase 2). A duplicate's outcome is
+// never stored: EffectiveOutcome derives DuplicateOutcomePrefix + target id.
 const (
 	// OutcomeCarried marks a decomposition child's open HIGH/MEDIUM concern
 	// that was copied into its parent's ledger at fan-in.
@@ -293,7 +330,110 @@ const (
 	// OutcomeOpenAtMerge marks a concern still raised, addressed_pending,
 	// reopened or superseded, with no outcome recorded, when its run merged.
 	OutcomeOpenAtMerge Outcome = "open_at_merge"
+	// OutcomeFixed marks a concern closed as delivered: a reviewer confirmed
+	// it, a clean round auto-closed it, or its binding approval condition was
+	// confirmed delivered. A transition back into an open state clears it
+	// (UpdateReviewConcernState), so a reopened concern is stamped
+	// open_at_merge like any other open one.
+	OutcomeFixed Outcome = "fixed"
+	// OutcomeWaived marks a concern the operator waived (no writer yet).
+	OutcomeWaived Outcome = "waived"
+	// OutcomeDeferred marks a concern deferred to a follow-up (no writer yet).
+	OutcomeDeferred Outcome = "deferred"
 )
+
+// DuplicateOutcomePrefix prefixes a duplicate's effective outcome:
+// "duplicate_of:<target concern id>".
+const DuplicateOutcomePrefix = "duplicate_of:"
+
+// Judgement is the HUMAN judgement of a concern (E94.2 / #4693, ADR-117 D1):
+// what the operator decided the concern WAS, orthogonal to its lifecycle State
+// and its Outcome. The vocabulary is closed; the column is tolerant TEXT, so
+// read every stored value through NormalizeJudgement.
+type Judgement string
+
+// The closed judgement vocabulary.
+const (
+	JudgementDefect               Judgement = "defect"
+	JudgementDefectPreExisting    Judgement = "defect_pre_existing"
+	JudgementNoDefect             Judgement = "no_defect"
+	JudgementTradeoff             Judgement = "tradeoff"
+	JudgementPreference           Judgement = "preference"
+	JudgementStale                Judgement = "stale"
+	JudgementInsufficientEvidence Judgement = "insufficient_evidence"
+	// JudgementUnlabelled is the judgement of a concern no human has judged:
+	// the column default, and the read of any blank or unknown stored value.
+	JudgementUnlabelled Judgement = "unlabelled"
+)
+
+// NormalizeJudgement maps a stored judgement onto the closed vocabulary: a
+// value in the set reads as itself; blank or anything outside the set reads
+// JudgementUnlabelled. It is the tolerant read of the CHECK-less column.
+func NormalizeJudgement(stored string) Judgement {
+	switch j := Judgement(stored); j {
+	case JudgementDefect, JudgementDefectPreExisting, JudgementNoDefect, JudgementTradeoff,
+		JudgementPreference, JudgementStale, JudgementInsufficientEvidence, JudgementUnlabelled:
+		return j
+	}
+	return JudgementUnlabelled
+}
+
+// EffectiveJudgement is one concern's judgement as a read surface reports it.
+// InheritedFrom names the chain root that supplied Judgement when the concern
+// is a duplicate whose chain resolved; nil for a non-duplicate and for a
+// duplicate whose chain did not resolve.
+type EffectiveJudgement struct {
+	Judgement     Judgement
+	InheritedFrom *uuid.UUID
+}
+
+// ResolveJudgements resolves every row's effective judgement over ONE set of
+// rows (a single run's ledger). A row with no DuplicateOf reads its own
+// normalized judgement. A duplicate walks its DuplicateOf links WITHIN the set
+// to the first non-duplicate row and inherits that root's normalized
+// judgement, with InheritedFrom naming the root. A link to an id outside the
+// set (a dangling id, or another run's concern), a revisited id (a cycle,
+// including a self-link) or a walk longer than len(rows) steps reads
+// JudgementUnlabelled with a nil InheritedFrom. The walk is bounded by a
+// visited set AND the step cap, so it always terminates.
+func ResolveJudgements(rows []*Concern) map[uuid.UUID]EffectiveJudgement {
+	byID := make(map[uuid.UUID]*Concern, len(rows))
+	for _, r := range rows {
+		if r != nil {
+			byID[r.ID] = r
+		}
+	}
+	out := make(map[uuid.UUID]EffectiveJudgement, len(byID))
+	for id, r := range byID {
+		out[id] = resolveJudgement(r, byID)
+	}
+	return out
+}
+
+func resolveJudgement(r *Concern, byID map[uuid.UUID]*Concern) EffectiveJudgement {
+	if r.DuplicateOf == nil {
+		return EffectiveJudgement{Judgement: NormalizeJudgement(string(r.Judgement))}
+	}
+	unresolved := EffectiveJudgement{Judgement: JudgementUnlabelled}
+	visited := map[uuid.UUID]struct{}{r.ID: {}}
+	cur := r
+	for steps := 0; cur.DuplicateOf != nil; steps++ {
+		if steps >= len(byID) {
+			return unresolved
+		}
+		next, ok := byID[*cur.DuplicateOf]
+		if !ok {
+			return unresolved
+		}
+		if _, seen := visited[next.ID]; seen {
+			return unresolved
+		}
+		visited[next.ID] = struct{}{}
+		cur = next
+	}
+	root := cur.ID
+	return EffectiveJudgement{Judgement: NormalizeJudgement(string(cur.Judgement)), InheritedFrom: &root}
+}
 
 // RolledUpStateReason is the state_reason a parent copy carries (E94.1 /
 // #4692): it names the child run and the child concern the copy was imported
@@ -509,6 +649,17 @@ type Repository interface {
 	// the reopened state.
 	ApplyResolution(ctx context.Context, id uuid.UUID, to State, reason string) (*Concern, error)
 
+	// ApplyDisposition is ApplyResolution that ALSO records d.Outcome, in the
+	// same from-state-guarded UPDATE (E94.2 / #4693, ADR-117 D1): the same
+	// state-machine validation, the same InvalidTransitionError on a refused
+	// edge. It is the system writers' close path (a reviewer confirm, the
+	// clean-round auto-close, a condition claim), which record OutcomeFixed.
+	// It NEVER touches a judgement column, so a never-judged row keeps reading
+	// unlabelled and an earlier human judgement survives an automated close.
+	// An empty d.Outcome is refused with an error before any write: a caller
+	// with no outcome to record uses ApplyResolution.
+	ApplyDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d Disposition) (*Concern, error)
+
 	// ImportRolledUp copies each source concern into the parent run's ledger
 	// as a raised implement-stage row on ParentStageID (E94.1 / #4692, ADR-117
 	// D2), in ONE transaction. The copy keeps the source's origin review
@@ -541,4 +692,11 @@ type ImportRolledUpParams struct {
 	ParentRunID   uuid.UUID
 	ParentStageID uuid.UUID
 	Sources       []*Concern
+}
+
+// Disposition is what ApplyDisposition records beside the state transition.
+// It carries ONLY an outcome (E94.2 phase 1 / #4693): a system writer cannot
+// express a judgement through it.
+type Disposition struct {
+	Outcome Outcome
 }

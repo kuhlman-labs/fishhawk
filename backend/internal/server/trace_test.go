@@ -14159,13 +14159,13 @@ func TestAutoCloseUnjudgedRoutedConcerns_ApplyResolutionError_NoAuditEntry(t *te
 	s, au, cr, runID, stageID := vetoRoundServer()
 	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
 	seedPushedFixupPass(t, au, runID, stageID, row.ID)
-	cr.applyResolutionErr = errors.New("concern store write failed")
+	cr.applyDispositionErr = errors.New("concern store write failed")
 
 	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
 		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
 	}, 1, "")
 
-	cr.applyResolutionErr = nil
+	cr.applyDispositionErr = nil
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending — the write failed", got.State)
 	}

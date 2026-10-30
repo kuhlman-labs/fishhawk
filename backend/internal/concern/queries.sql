@@ -33,9 +33,19 @@ SELECT * FROM review_concerns
 -- from-state guard in the WHERE clause makes the transition atomic
 -- under concurrent writers: a racing update matches zero rows and the
 -- caller re-reads to re-validate against the state machine.
+-- E94.2 / #4693 (ADR-117 D1): a non-NULL outcome is recorded in the same
+-- UPDATE (ApplyDisposition). A NULL outcome leaves it alone EXCEPT that a move
+-- back into an open state clears an outcome of exactly 'fixed', so a reopened
+-- concern is again eligible for StampReviewConcernsOpenAtMerge (which only
+-- stamps an empty outcome); carried and open_at_merge are never cleared. The open
+-- state set is duplicated from the Go state machine's IsOpen — keep in sync.
+-- No judgement column is ever written here.
 UPDATE review_concerns
    SET state = $2,
        state_reason = $3,
+       outcome = COALESCE(sqlc.narg(outcome)::text,
+                          CASE WHEN $2 IN ('raised', 'addressed_pending', 'reopened') AND outcome = 'fixed'
+                               THEN '' ELSE outcome END),
        updated_at = now()
  WHERE id = $1
    AND state = sqlc.arg(from_state)

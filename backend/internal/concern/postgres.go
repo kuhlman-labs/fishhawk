@@ -122,7 +122,7 @@ func (r *postgresRepo) MarkAddressedPending(ctx context.Context, ids []uuid.UUID
 			// already in the target state.
 			continue
 		}
-		if _, err := r.transition(ctx, c, StateAddressedPending, reason); err != nil {
+		if _, err := r.transition(ctx, c, StateAddressedPending, reason, nil); err != nil {
 			return err
 		}
 	}
@@ -134,15 +134,30 @@ func (r *postgresRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to Sta
 	if err != nil {
 		return nil, err
 	}
-	return r.transition(ctx, current[0], to, reason)
+	return r.transition(ctx, current[0], to, reason, nil)
+}
+
+func (r *postgresRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d Disposition) (*Concern, error) {
+	if d.Outcome == "" {
+		return nil, fmt.Errorf("concern: apply disposition %s: outcome required (use ApplyResolution to record none)", id)
+	}
+	current, err := r.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	outcome := string(d.Outcome)
+	return r.transition(ctx, current[0], to, reason, &outcome)
 }
 
 // transition validates the lifecycle edge against the Go state machine
 // and applies it with a from-state guard so a concurrent writer cannot
 // race past the validation (the guarded UPDATE matching zero rows means
 // the state moved underneath us — surfaced as an error, never silently
-// applied).
-func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, reason string) (*Concern, error) {
+// applied). A non-nil outcome is recorded in the same UPDATE; a nil one
+// leaves the outcome alone except that a move back into an open state clears
+// a stale OutcomeFixed (UpdateReviewConcernState). No judgement column is
+// ever written here.
+func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, reason string, outcome *string) (*Concern, error) {
 	if err := Transition(c.State, to); err != nil {
 		return nil, err
 	}
@@ -151,6 +166,7 @@ func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, rea
 		ID:          c.ID,
 		State:       string(to),
 		StateReason: reason,
+		Outcome:     outcome,
 		FromState:   string(c.State),
 	})
 	if errors.Is(err, pgx.ErrNoRows) {
@@ -254,6 +270,13 @@ func rowToConcern(r concerndb.ReviewConcern) *Concern {
 		CheckKey:             r.CheckKey,
 		Outcome:              Outcome(r.Outcome),
 		RolledUpFrom:         r.RolledUpFrom,
+		Judgement:            Judgement(r.Judgement),
+		JudgementActorKind:   r.JudgementActorKind,
+		JudgementDelegated:   r.JudgementDelegated,
+		JudgementBulk:        r.JudgementBulk,
+		JudgementBackfill:    r.JudgementBackfill,
+		TradeoffCost:         r.TradeoffCost,
+		DuplicateOf:          r.DuplicateOf,
 	}
 	if r.CreatedAt.Valid {
 		out.CreatedAt = r.CreatedAt.Time

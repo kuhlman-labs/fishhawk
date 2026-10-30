@@ -12,7 +12,7 @@ import (
 )
 
 const getReviewConcernsByIDs = `-- name: GetReviewConcernsByIDs :many
-SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from FROM review_concerns
+SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of FROM review_concerns
  WHERE id = ANY($1::uuid[])
 `
 
@@ -49,6 +49,13 @@ func (q *Queries) GetReviewConcernsByIDs(ctx context.Context, ids []uuid.UUID) (
 			&i.CheckKey,
 			&i.Outcome,
 			&i.RolledUpFrom,
+			&i.Judgement,
+			&i.JudgementActorKind,
+			&i.JudgementDelegated,
+			&i.JudgementBulk,
+			&i.JudgementBackfill,
+			&i.TradeoffCost,
+			&i.DuplicateOf,
 		); err != nil {
 			return nil, err
 		}
@@ -62,7 +69,7 @@ func (q *Queries) GetReviewConcernsByIDs(ctx context.Context, ids []uuid.UUID) (
 
 const importRolledUpReviewConcern = `-- name: ImportRolledUpReviewConcern :one
 WITH src AS (
-    SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from FROM review_concerns
+    SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of FROM review_concerns
      WHERE id = $5::uuid
        AND state IN ('raised', 'addressed_pending', 'reopened')
        FOR NO KEY UPDATE
@@ -81,7 +88,7 @@ SELECT $1::uuid, $2::uuid, $3::uuid, 'implement', src.origin_review_sequence,
        src.id
   FROM src
 ON CONFLICT (run_id, rolled_up_from) WHERE rolled_up_from IS NOT NULL DO NOTHING
-RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of
 `
 
 type ImportRolledUpReviewConcernParams struct {
@@ -139,6 +146,13 @@ func (q *Queries) ImportRolledUpReviewConcern(ctx context.Context, arg ImportRol
 		&i.CheckKey,
 		&i.Outcome,
 		&i.RolledUpFrom,
+		&i.Judgement,
+		&i.JudgementActorKind,
+		&i.JudgementDelegated,
+		&i.JudgementBulk,
+		&i.JudgementBackfill,
+		&i.TradeoffCost,
+		&i.DuplicateOf,
 	)
 	return i, err
 }
@@ -152,7 +166,7 @@ INSERT INTO review_concerns (
     severity_clamped_from, provenance, check_key
 )
 VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
-RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of
 `
 
 type InsertReviewConcernParams struct {
@@ -222,12 +236,19 @@ func (q *Queries) InsertReviewConcern(ctx context.Context, arg InsertReviewConce
 		&i.CheckKey,
 		&i.Outcome,
 		&i.RolledUpFrom,
+		&i.Judgement,
+		&i.JudgementActorKind,
+		&i.JudgementDelegated,
+		&i.JudgementBulk,
+		&i.JudgementBackfill,
+		&i.TradeoffCost,
+		&i.DuplicateOf,
 	)
 	return i, err
 }
 
 const listOpenReviewConcernsByRun = `-- name: ListOpenReviewConcernsByRun :many
-SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from FROM review_concerns
+SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of FROM review_concerns
  WHERE run_id = $1
    AND state IN ('raised', 'addressed_pending', 'reopened')
  ORDER BY origin_review_sequence ASC, created_at ASC, id ASC
@@ -268,6 +289,13 @@ func (q *Queries) ListOpenReviewConcernsByRun(ctx context.Context, runID uuid.UU
 			&i.CheckKey,
 			&i.Outcome,
 			&i.RolledUpFrom,
+			&i.Judgement,
+			&i.JudgementActorKind,
+			&i.JudgementDelegated,
+			&i.JudgementBulk,
+			&i.JudgementBackfill,
+			&i.TradeoffCost,
+			&i.DuplicateOf,
 		); err != nil {
 			return nil, err
 		}
@@ -280,7 +308,7 @@ func (q *Queries) ListOpenReviewConcernsByRun(ctx context.Context, runID uuid.UU
 }
 
 const listReviewConcernsByRun = `-- name: ListReviewConcernsByRun :many
-SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from FROM review_concerns
+SELECT id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of FROM review_concerns
  WHERE run_id = $1
  ORDER BY origin_review_sequence ASC, created_at ASC, id ASC
 `
@@ -319,6 +347,13 @@ func (q *Queries) ListReviewConcernsByRun(ctx context.Context, runID uuid.UUID) 
 			&i.CheckKey,
 			&i.Outcome,
 			&i.RolledUpFrom,
+			&i.Judgement,
+			&i.JudgementActorKind,
+			&i.JudgementDelegated,
+			&i.JudgementBulk,
+			&i.JudgementBackfill,
+			&i.TradeoffCost,
+			&i.DuplicateOf,
 		); err != nil {
 			return nil, err
 		}
@@ -364,27 +399,39 @@ const updateReviewConcernState = `-- name: UpdateReviewConcernState :one
 UPDATE review_concerns
    SET state = $2,
        state_reason = $3,
+       outcome = COALESCE($4::text,
+                          CASE WHEN $2 IN ('raised', 'addressed_pending', 'reopened') AND outcome = 'fixed'
+                               THEN '' ELSE outcome END),
        updated_at = now()
  WHERE id = $1
-   AND state = $4
-RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from
+   AND state = $5
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of
 `
 
 type UpdateReviewConcernStateParams struct {
 	ID          uuid.UUID `json:"id"`
 	State       string    `json:"state"`
 	StateReason string    `json:"state_reason"`
+	Outcome     *string   `json:"outcome"`
 	FromState   string    `json:"from_state"`
 }
 
 // from-state guard in the WHERE clause makes the transition atomic
 // under concurrent writers: a racing update matches zero rows and the
 // caller re-reads to re-validate against the state machine.
+// E94.2 / #4693 (ADR-117 D1): a non-NULL outcome is recorded in the same
+// UPDATE (ApplyDisposition). A NULL outcome leaves it alone EXCEPT that a move
+// back into an open state clears an outcome of exactly 'fixed', so a reopened
+// concern is again eligible for StampReviewConcernsOpenAtMerge (which only
+// stamps an empty outcome); carried and open_at_merge are never cleared. The open
+// state set is duplicated from the Go state machine's IsOpen — keep in sync.
+// No judgement column is ever written here.
 func (q *Queries) UpdateReviewConcernState(ctx context.Context, arg UpdateReviewConcernStateParams) (ReviewConcern, error) {
 	row := q.db.QueryRow(ctx, updateReviewConcernState,
 		arg.ID,
 		arg.State,
 		arg.StateReason,
+		arg.Outcome,
 		arg.FromState,
 	)
 	var i ReviewConcern
@@ -412,6 +459,13 @@ func (q *Queries) UpdateReviewConcernState(ctx context.Context, arg UpdateReview
 		&i.CheckKey,
 		&i.Outcome,
 		&i.RolledUpFrom,
+		&i.Judgement,
+		&i.JudgementActorKind,
+		&i.JudgementDelegated,
+		&i.JudgementBulk,
+		&i.JudgementBackfill,
+		&i.TradeoffCost,
+		&i.DuplicateOf,
 	)
 	return i, err
 }

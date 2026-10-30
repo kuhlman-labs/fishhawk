@@ -106,6 +106,22 @@ attribution existed omit all three fields. A concern routed into a fix-up by id
 keeps `reviewer_role` and `quote_unverified` on the `stage_fixup_triggered`
 audit entry, and the fix-up prompt names the persona that raised it.
 
+Concerns also carry an outcome and a human judgement, which the table does not
+spell out. The open and settled rows of `GET /v0/runs/{run_id}/gate-view` and
+the items of `GET /v0/runs/{run_id}/concerns` report `outcome` — `fixed` when a
+reviewer confirmed the concern, a clean re-review closed it, or its approval
+condition was confirmed delivered; `carried`; `open_at_merge`; `waived`;
+`deferred`; or `duplicate_of:<id>` — and omit it when none is recorded. A
+concern that reopens loses `fixed`. They always report `judgement`, one of
+`defect`, `defect_pre_existing`, `no_defect`, `tradeoff`, `preference`,
+`stale`, `insufficient_evidence` or `unlabelled`. The server's own closes never
+set a judgement, so a concern no person has judged reads `unlabelled`, and a
+judgement a person recorded earlier survives them. A duplicate reports the
+judgement of the concern at the end of its `duplicate_of` chain within the same
+run, naming it in `judgement_inherited_from`; a chain that leaves the run,
+points nowhere or loops reads `unlabelled`. Neither field is shown to a
+reviewer.
+
 A run's `trigger_source` can also be `scheduled`, which the table does not
 spell out either. Only the scheduler inside `fishhawkd` (off unless the daemon
 runs with `--enable-scheduler`) creates such a run, for a workflow that
