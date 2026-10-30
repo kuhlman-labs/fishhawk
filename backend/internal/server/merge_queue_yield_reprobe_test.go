@@ -412,22 +412,21 @@ func TestMergeQueueYieldReprobe_HeadMovedReanchorsKeepingTheMarker(t *testing.T)
 	}
 }
 
-// TestMergeQueueYieldReprobe_NothingBranches: a stale episode (the CAS
-// conflict), a transport failure, a merged PR, a terminal run and an entry
+// TestMergeQueueYieldReprobe_NothingBranches: a stale revision (the CAS
+// conflict, docs/adr/112 A3.6), a transport failure, a merged PR, a terminal run and an entry
 // that is not yielded each write nothing and leave the marker in place.
 func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 	ctx := context.Background()
-	t.Run("stale episode", func(t *testing.T) {
+	t.Run("stale revision", func(t *testing.T) {
 		w, a, y := newYieldWorld(t)
 		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 		stale := y
-		old := y.YieldedAt.Add(-time.Hour)
-		stale.YieldedAt = &old
+		stale.YieldRevision = y.YieldRevision - 1
 		if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
 			t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
 		}
 		if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
-			t.Fatalf("a stale-episode probe cleared the marker: %+v", e)
+			t.Fatalf("a stale-revision probe cleared the marker: %+v", e)
 		}
 	})
 	t.Run("transport failure", func(t *testing.T) {
@@ -861,16 +860,16 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredClearsOnceTheSnapshotShowsApp
 // TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield:
 // the fixture snapshot reads APPROVED / CLEAN (so a read would clear), but the
 // re-probe's fresh snapshot read fails (the gate-less fold makes no forge
-// read, so the predicate's read is the one that fails): the row stays
-// yielded, fail closed. Counterfactual: treating a read error as the
-// condition gone clears it, RED.
+// read, so the tier-3 read is the one that fails): the row stays yielded and
+// nothing is written, fail closed (mergeQueueYieldTier ok=false).
+// Counterfactual: treating a read error as the condition gone clears it, RED.
 func TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield(t *testing.T) {
 	w, a, y := newRowFourYieldWorld(t)
 	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{ReviewDecision: "APPROVED", MergeStateStatus: "CLEAN"})
 	w.gh.set(func() { w.gh.graphQLFail[a.pr] = 10 })
 
-	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeUnchanged {
-		t.Fatalf("outcome = %s, want %s", got, reprobeUnchanged)
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeNothing {
+		t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
 	}
 	w.srv.bgMergeQueuePump.Wait()
 	w.requireRowFourKept(a, y)
@@ -934,4 +933,301 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredReyieldKeepsTheEpisode(t *tes
 	if n := len(w.rows(a, CategoryMergeQueueYieldPosted)); n != 1 {
 		t.Fatalf("merge_queue_yield_posted rows = %d, want 1 (one episode)", n)
 	}
+}
+
+// --- docs/adr/112 Amendment A3 (#4780): the re-probe's head discovery,
+// clear predicate, tiers, row-4 flag, revision CAS and force rule, driven
+// through the existing mcq fake forge (prs, checks, reviewSnapshot).
+
+// yrRequireCI declares "ci" as r's required check (the run's
+// RequiredChecksSnapshot), so a red "ci" is A3.1(a) checks_red.
+func (w *mqmWorld) yrRequireCI(r *mcqRun) {
+	w.t.Helper()
+	w.exec(`UPDATE runs SET required_checks_snapshot = '{"contexts":["ci"]}' WHERE id = $1`, r.id)
+}
+
+// yrChecks serves one completed "ci" check run with conclusion at head.
+func (w *mqmWorld) yrChecks(head, conclusion string) {
+	w.gh.set(func() {
+		w.gh.checks[head] = `[{"id":2,"name":"ci","status":"completed","conclusion":"` + conclusion +
+			`","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
+	})
+}
+
+// yrYieldStored admits r's held intent entry and yields it with reason
+// through the store (no merge-on-pass), returning the yielded entry.
+func (w *mqmWorld) yrYieldStored(r *mcqRun, reason string) mergequeue.Entry {
+	w.t.Helper()
+	ctx := context.Background()
+	e := w.active(r)
+	adm, err := w.store.AdmitNext(ctx, e.Base())
+	if err != nil || !adm.Admitted || adm.Entry.ID != e.ID {
+		w.t.Fatalf("admit %s: %+v %v", r.id, adm, err)
+	}
+	y, err := w.store.Yield(ctx, e.ID, adm.Entry.AdmissionEpoch, newMergeQueueYield(reason, "seeded", mergeQueueYieldRow(reason)).marker())
+	if err != nil {
+		w.t.Fatalf("yield %s: %v", r.id, err)
+	}
+	return y
+}
+
+// newGatelessRedYieldWorld seeds a GATE-LESS run held with intent at a1,
+// "ci" required and red at a1, yielded merge_checks_red through the store.
+func newGatelessRedYieldWorld(t *testing.T) (*mqmWorld, *mcqRun, mergequeue.Entry) {
+	t.Helper()
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.yrRequireCI(a)
+	w.yrChecks("a1", "failure")
+	return w, a, w.yrYieldStored(a, mergeQueueYieldMergeChecksRed)
+}
+
+// TestReprobe_A34_ApprovedFoldWithFailingLegDoesNotClear (T20, CF18
+// vehicle): a GATED run yielded on a dismissal now carries a qualifying
+// approval at the anchored head, but its required check is red there: the
+// clear predicate (A3.4) refuses, the row stays yielded and transitions to
+// merge_checks_red / retrigger_ci, and nothing is cleared. MECHANISM: the
+// fold alone approves, so only the merge-gate legs block.
+func TestReprobe_A34_ApprovedFoldWithFailingLegDoesNotClear(t *testing.T) {
+	w, a, y := newYieldWorld(t)
+	w.yrRequireCI(a)
+	w.yrChecks("a1", "failure")
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeTransitioned {
+		t.Fatalf("outcome = %s, want %s", got, reprobeTransitioned)
+	}
+	e := w.active(a)
+	if e.State != mergequeue.StateHeld || e.YieldReason != mergeQueueYieldMergeChecksRed || !e.YieldedAt.Equal(*y.YieldedAt) {
+		t.Fatalf("A = %s %q yielded_at %v, want held merge_checks_red in the episode %v", e.State, e.YieldReason, e.YieldedAt, y.YieldedAt)
+	}
+	rows := w.rows(a, CategoryMergeQueueYielded)
+	if p := w.payload(rows[len(rows)-1]); p["next_step"] != mergeQueueYieldNextRetriggerCI || p["precedence_row"] != float64(mergeQueueYieldRowEligibility) {
+		t.Fatalf("transition payload = %v, want retrigger_ci row 1", p)
+	}
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 0", n)
+	}
+}
+
+// TestReprobe_A35_TierTransitions (T21): one subtest per A3.5 tier
+// transition.
+func TestReprobe_A35_TierTransitions(t *testing.T) {
+	ctx := context.Background()
+	t.Run("veto beats merge-gate", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		w.forgeReviews(a, []string{"bob"}, mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeCandidateQueueReasonForgeApprovalVetoed {
+			t.Fatalf("reason = %q, want forge_approval_vetoed (tier 1 over a red leg)", e.YieldReason)
+		}
+	})
+	t.Run("merge-gate beats row-4", func(t *testing.T) {
+		w, a, _ := newRowFourYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeQueueYieldMergeChecksRed || !e.Row4Flag {
+			t.Fatalf("reason = %q flag=%v, want merge_checks_red with row4_flag kept", e.YieldReason, e.Row4Flag)
+		}
+	})
+	t.Run("row-4 beats a non-approved fold", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET row4_flag = true WHERE run_id = $1 AND state = 'held'`, a.id)
+		snap := w.gh.reviewSnapshot[a.pr]
+		w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{Reviews: snap.Reviews, Author: snap.Author, MergeStateStatus: "BLOCKED"})
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeQueueYieldForgeReviewRequired {
+			t.Fatalf("reason = %q, want forge_review_required (tier 3 over a dismissed fold)", e.YieldReason)
+		}
+	})
+	t.Run("row-4 then red then green while BLOCKED reads forge_review_required", func(t *testing.T) {
+		w, a, _ := newRowFourYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeQueueYieldMergeChecksRed {
+			t.Fatalf("after red = %q, want merge_checks_red", e.YieldReason)
+		}
+		w.yrChecks("a1", "success")
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeTransitioned {
+			t.Fatalf("after green = %s, want transitioned", got)
+		}
+		if e := w.active(a); e.YieldReason != mergeQueueYieldForgeReviewRequired || !e.Yielded() {
+			t.Fatalf("after green while BLOCKED = %q yielded=%v, want forge_review_required", e.YieldReason, e.Yielded())
+		}
+	})
+}
+
+// TestReprobe_A36_FlagSurvivesBlockedGoneWhileRed (T22, CF19 vehicle): a
+// row-4 yield turns red (merge_checks_red), the snapshot then reads BLOCKED
+// GONE while red, then CI goes green with BLOCKED back: the row stays yielded
+// as forge_review_required and is NOT cleared. MECHANISM: the gone read
+// happens while tier 2 blocks, so only the persisted flag (never cleared by a
+// reason transition or a gone read without a clear) keeps the row-4
+// obligation; with UpdateYield assigning row4_flag = marker.Row4 the red
+// transition drops it and the last probe clears, RED.
+func TestReprobe_A36_FlagSurvivesBlockedGoneWhileRed(t *testing.T) {
+	ctx := context.Background()
+	w, a, _ := newRowFourYieldWorld(t)
+	w.yrRequireCI(a)
+	w.yrChecks("a1", "failure")
+	w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{ReviewDecision: "APPROVED", MergeStateStatus: "CLEAN"})
+	w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+	if e := w.active(a); e.YieldReason != mergeQueueYieldMergeChecksRed || !e.Row4Flag {
+		t.Fatalf("gone while red = %q flag=%v, want merge_checks_red with the flag kept", e.YieldReason, e.Row4Flag)
+	}
+	w.yrChecks("a1", "success")
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{MergeStateStatus: "BLOCKED"})
+	if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got == reprobeCleared {
+		t.Fatal("the row cleared while the forge reads BLOCKED again")
+	}
+	if e := w.active(a); e.YieldReason != mergeQueueYieldForgeReviewRequired || !e.Yielded() {
+		t.Fatalf("green with BLOCKED back = %q yielded=%v, want forge_review_required", e.YieldReason, e.Yielded())
+	}
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 0", n)
+	}
+}
+
+// TestReprobe_A36_DelayedProbeCannotClearOrOverwriteNewer (T23): a probe
+// holding the entry read at revision r runs AFTER a newer probe transitioned
+// the reason (same head and yielded_at): its clear (the forge now approves)
+// and its transition both miss the revision CAS, and a READ shows the newer
+// marker and reason intact.
+func TestReprobe_A36_DelayedProbeCannotClearOrOverwriteNewer(t *testing.T) {
+	ctx := context.Background()
+	w, a, _ := newYieldWorld(t)
+	stale := w.active(a)
+	w.forgeReviews(a, []string{"bob"}, mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
+	if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeTransitioned {
+		t.Fatalf("newer probe = %s, want transitioned", got)
+	}
+	newer := w.active(a)
+
+	w.forgeReviews(a, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "a1"))
+	if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
+		t.Fatalf("delayed clear = %s, want nothing", got)
+	}
+	w.forgeReviews(a, []string{"alice"}, mqmReview(4, "alice", "DISMISSED", "a1"))
+	stale.YieldReason = mergeCandidateQueueReasonForgeApprovalAbsent // the delayed probe's own stale read differs from the fold
+	if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
+		t.Fatalf("delayed transition = %s, want nothing", got)
+	}
+	e := w.active(a)
+	if !e.Yielded() || e.YieldReason != mergeCandidateQueueReasonForgeApprovalVetoed || e.YieldRevision != newer.YieldRevision ||
+		len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
+		t.Fatalf("after the delayed probes = %q rev %d yielded=%v, want the newer vetoed marker at rev %d", e.YieldReason, e.YieldRevision, e.Yielded(), newer.YieldRevision)
+	}
+}
+
+// TestReprobe_A39_ForceSkipsOnlySnapshot (T24, CF20 vehicle): (1) a forced
+// probe with the row-4 flag set and every leg green clears WITHOUT a
+// snapshot read and KEEPS row4_flag (read after the line merges); (2) a
+// forced probe with a red leg does NOT clear: force never skips the
+// merge-gate legs.
+func TestReprobe_A39_ForceSkipsOnlySnapshot(t *testing.T) {
+	ctx := context.Background()
+	t.Run("green legs clear without a snapshot and keep the flag", func(t *testing.T) {
+		w, a, y := newRowFourYieldWorld(t)
+		w.gh.set(func() { delete(w.gh.putStatus, a.pr) })
+		reads := w.gh.snapshotCalls()
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), true); got != reprobeCleared {
+			t.Fatalf("forced probe = %s, want cleared", got)
+		}
+		if n := w.gh.snapshotCalls() - reads; n != 0 {
+			t.Fatalf("snapshot reads during the forced probe = %d, want 0", n)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		var flag bool
+		if err := w.pool.QueryRow(ctx, `SELECT row4_flag FROM merge_candidate_queue_entries WHERE id = $1`, y.ID).Scan(&flag); err != nil || !flag {
+			t.Fatalf("row4_flag after a forced clear = %v (%v), want kept", flag, err)
+		}
+	})
+	t.Run("a red leg is never forced", func(t *testing.T) {
+		w, a, _ := newRowFourYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), true); got == reprobeCleared {
+			t.Fatal("a forced probe cleared a red leg")
+		}
+		if e := w.active(a); !e.Yielded() || e.YieldReason != mergeQueueYieldMergeChecksRed {
+			t.Fatalf("A = %q yielded=%v, want merge_checks_red", e.YieldReason, e.Yielded())
+		}
+	})
+}
+
+// TestReprobe_A34_GatelessRepairPushReanchorsAndClears (T25, CF21 vehicle):
+// a GATE-LESS run yielded merge_checks_red at a1; the repair push moves the
+// PR head to a2, whose checks are green: ONE probe re-anchors to a2 and
+// clears there, keeping the episode's yielded_at. MECHANISM: a gate-less
+// fold is approved without reading the PR, so only the gate-independent PR
+// read discovers a2; without it the legs are judged red at a1, RED.
+func TestReprobe_A34_GatelessRepairPushReanchorsAndClears(t *testing.T) {
+	w, a, y := newGatelessRedYieldWorld(t)
+	w.gh.set(func() { w.gh.prs[a.pr].head = "a2" })
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeCleared {
+		t.Fatalf("outcome = %s, want cleared", got)
+	}
+	w.srv.bgMergeQueuePump.Wait()
+	rows := w.rows(a, CategoryMergeQueueYieldCleared)
+	if len(rows) != 1 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1", len(rows))
+	}
+	_, yieldedAt := mergeQueueYieldEpisode(y)
+	if p := w.payload(rows[0]); p["head_sha"] != "a2" || p["yielded_at"] != yieldedAt || p["yield_reason"] != mergeQueueYieldMergeChecksRed {
+		t.Fatalf("cleared payload = %v, want head a2 in the episode %s", p, yieldedAt)
+	}
+}
+
+// TestReprobe_A37 (T26): docs/adr/112 A3.7's episode. (1) A flap: a
+// merge_checks_red yield clears on green and the line re-yields (the forge
+// refuses the pinned merge while BLOCKED, forge_review_required): the
+// re-yield CONTINUES the cleared episode's yielded_at whatever the reason,
+// so the A2.1 service mark still applies (the backoff keeps growing), and
+// the hold budget is untouched by the clear and the re-yield. (2) A head
+// move keeps the episode (yielded_at and the approval anchor).
+func TestReprobe_A37(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a flap continues the episode, the backoff and the budget", func(t *testing.T) {
+		w, a, y := newGatelessRedYieldWorld(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - interval '1 hour', gate_hold_tokens = 1 WHERE id = $1`, y.ID)
+		y = w.active(a)
+		w.srv.markYieldReprobeServiced(y)
+		w.yrChecks("a1", "success")
+		w.gh.set(func() { w.gh.putStatus[a.pr] = http.StatusMethodNotAllowed })
+		w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{MergeStateStatus: "BLOCKED"})
+
+		if !w.srv.ReprobeMergeQueueYield(ctx, a.id, false) {
+			t.Fatal("green checks did not clear the merge_checks_red yield")
+		}
+		w.srv.bgMergeQueuePump.Wait()
+
+		e := w.active(a)
+		if !e.Yielded() || e.YieldReason != mergeQueueYieldForgeReviewRequired || !e.YieldedAt.Equal(*y.YieldedAt) {
+			t.Fatalf("after the flap = %q yielded_at %v, want forge_review_required continuing %v", e.YieldReason, e.YieldedAt, y.YieldedAt)
+		}
+		if _, seq := w.srv.yieldReprobeDueFor(e, time.Minute); seq == 0 {
+			t.Fatal("the re-yield lost its service mark (a fresh episode), want the backoff continued")
+		}
+		if e.GateHoldTokens != 1 {
+			t.Fatalf("hold tokens after the flap = %d, want 1 (untouched)", e.GateHoldTokens)
+		}
+	})
+	t.Run("a head move keeps the episode", func(t *testing.T) {
+		w, a, y := newYieldWorld(t)
+		w.gh.set(func() { w.gh.prs[a.pr].head = "a3" })
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got == reprobeCleared || got == reprobeNothing {
+			t.Fatalf("outcome = %s, want the row re-anchored and still yielded", got)
+		}
+		e := w.active(a)
+		if e.AnchoredHeadSHA != "a3" || !e.YieldedAt.Equal(*y.YieldedAt) || !e.ApprovalWaitStartedAt.Equal(*y.ApprovalWaitStartedAt) {
+			t.Fatalf("after the head move = %s %v %v, want a3 with the episode (%v, %v)", e.AnchoredHeadSHA, e.YieldedAt, e.ApprovalWaitStartedAt, y.YieldedAt, y.ApprovalWaitStartedAt)
+		}
+	})
 }

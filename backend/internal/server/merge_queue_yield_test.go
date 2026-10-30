@@ -121,6 +121,9 @@ func TestMergeQueueYieldNextStep_AgreesWithFold(t *testing.T) {
 		mergeCandidateQueueReasonForgeApprovalProviderUnsupported:          mergeQueueYieldNextNone,
 		mergeCandidateQueueReasonForgeApprovalIdentityProviderUnconfigured: forgeApprovalNextConfigureIdentityProvider,
 		mergeQueueYieldForgeReviewRequired:                                 forgeApprovalNextApprovePR,
+		mergeQueueYieldMergeChecksRed:                                      mergeQueueYieldNextRetriggerCI,
+		mergeQueueYieldMergeChecksPending:                                  forgeApprovalNextRetryAfter,
+		mergeQueueYieldMergeReviewPending:                                  forgeApprovalNextRetryAfter,
 		"not_a_yield_reason":                                               mergeQueueYieldNextNone,
 	}
 	for reason, want := range vocabulary {
@@ -506,5 +509,170 @@ func TestMergeOnPassExpiredWaitYield_ConcurrentDispatchClaimSuppressesYield(t *t
 		if p.SHA == "b1" {
 			t.Fatal("b1 was PUT while A's dispatch is claimed")
 		}
+	}
+}
+
+// TestMergeQueueYieldVocabulary_FreshMap (T17): the accessor maps every
+// closed yield_reason (the three docs/adr/112 A3 merge-gate reasons
+// included) to the mapping's next_step, and returns a FRESH map each call
+// (mutating one never reaches the server's mapping or a later read).
+func TestMergeQueueYieldVocabulary_FreshMap(t *testing.T) {
+	v := MergeQueueYieldVocabulary()
+	if len(v) != len(mergeQueueYieldReasons) {
+		t.Fatalf("vocabulary size = %d, want %d", len(v), len(mergeQueueYieldReasons))
+	}
+	for _, r := range mergeQueueYieldReasons {
+		if got, ok := v[r]; !ok || got != mergeQueueYieldNextStep(r) {
+			t.Errorf("vocabulary[%s] = %q (present=%v), want %q", r, got, ok, mergeQueueYieldNextStep(r))
+		}
+	}
+	for r, want := range map[string]string{
+		mergeQueueYieldMergeChecksRed:     mergeQueueYieldNextRetriggerCI,
+		mergeQueueYieldMergeChecksPending: forgeApprovalNextRetryAfter,
+		mergeQueueYieldMergeReviewPending: forgeApprovalNextRetryAfter,
+	} {
+		if v[r] != want {
+			t.Errorf("vocabulary[%s] = %q, want %q", r, v[r], want)
+		}
+	}
+	v[mergeQueueYieldMergeChecksRed] = "mutated"
+	if again := MergeQueueYieldVocabulary(); again[mergeQueueYieldMergeChecksRed] != mergeQueueYieldNextRetriggerCI {
+		t.Fatal("mutating one vocabulary map reached a later read")
+	}
+}
+
+// TestMergeGateYieldFor (T18): docs/adr/112 A3.5 tier 2 orders (a) red >
+// (b) pending > (c) review; the detail names the deciding tier's reasons,
+// the red case names fishhawk_retrigger_ci then fishhawk_merge_run, and every
+// lower retryable leg read is named as "also blocking"; a result with no
+// retryable leg is ok=false. Every merge-gate yield is row 1 with the
+// mapping's next step.
+func TestMergeGateYieldFor(t *testing.T) {
+	red := mergeQueueIneligibility{Code: mergeQueueReasonChecksRed, Detail: "ci failed"}
+	pending := mergeQueueIneligibility{Code: mergeQueueReasonChecksNotGreen, Detail: "ci in progress"}
+	review := mergeQueueIneligibility{Code: mergeQueueReasonReviewPending, Detail: "1 of 2 reviews terminal"}
+	concern := mergeQueueIneligibility{Code: mergeQueueReasonBlockingConcernOpen, Detail: "a high concern is open"}
+	for _, tc := range []struct {
+		name    string
+		reasons []mergeQueueIneligibility
+		want    string
+		has     []string
+		hasNot  []string
+	}{
+		{"red beats pending and review", []mergeQueueIneligibility{review, pending, red}, mergeQueueYieldMergeChecksRed,
+			[]string{"ci failed", "fishhawk_retrigger_ci, then fishhawk_merge_run", "also blocking: checks_not_green: ci in progress; review_pending"}, nil},
+		{"pending beats review", []mergeQueueIneligibility{review, pending}, mergeQueueYieldMergeChecksPending,
+			[]string{"ci in progress", "also blocking: review_pending"}, []string{"fishhawk_retrigger_ci"}},
+		{"review alone", []mergeQueueIneligibility{review}, mergeQueueYieldMergeReviewPending,
+			[]string{"1 of 2 reviews terminal"}, []string{"also blocking", "fishhawk_retrigger_ci"}},
+		{"a non-retryable leg is never named as blocking the tier", []mergeQueueIneligibility{concern, pending}, mergeQueueYieldMergeChecksPending,
+			[]string{"ci in progress"}, []string{"a high concern"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			r := mergeQueueEligibilityResult{Reasons: tc.reasons}
+			y, ok := mergeGateYieldFor(mergeGateLegsOf(r), r)
+			if !ok || y.Reason != tc.want || y.NextStep != mergeQueueYieldNextStep(tc.want) || y.Row != mergeQueueYieldRowEligibility {
+				t.Fatalf("mergeGateYieldFor = %+v ok=%v, want %s row 1", y, ok, tc.want)
+			}
+			for _, h := range tc.has {
+				if !strings.Contains(y.Detail, h) {
+					t.Errorf("detail %q does not name %q", y.Detail, h)
+				}
+			}
+			for _, h := range tc.hasNot {
+				if strings.Contains(y.Detail, h) {
+					t.Errorf("detail %q names %q", y.Detail, h)
+				}
+			}
+		})
+	}
+	for _, r := range []mergeQueueEligibilityResult{
+		{}, {Reasons: []mergeQueueIneligibility{concern}},
+		{Reasons: []mergeQueueIneligibility{{Code: mergeQueueReasonForgeApprovalVetoed, Detail: "bob"}}},
+	} {
+		if y, ok := mergeGateYieldFor(mergeGateLegsOf(r), r); ok {
+			t.Errorf("mergeGateYieldFor(%v) = %+v, want ok=false (no retryable leg)", r.codes(), y)
+		}
+	}
+	if m := (mergeQueueYield{Reason: mergeQueueYieldForgeReviewRequired}).marker(); !m.Row4 {
+		t.Error("a forge_review_required marker does not set Row4")
+	}
+	if m := (mergeQueueYield{Reason: mergeQueueYieldMergeChecksRed}).marker(); m.Row4 {
+		t.Error("a merge_checks_red marker sets Row4")
+	}
+	for _, r := range []string{mergeQueueYieldMergeChecksRed, mergeQueueYieldMergeChecksPending, mergeQueueYieldMergeReviewPending} {
+		if got := mergeQueueYieldRow(r); got != mergeQueueYieldRowEligibility {
+			t.Errorf("mergeQueueYieldRow(%s) = %d, want 1", r, got)
+		}
+	}
+}
+
+// TestMergeOnPassEnforceExpiredWait_ClosedApprovalWaitNeverFires (T19, the
+// SERVER half (ii) of approval condition "A3.7 approval anchor, rule (i)";
+// CF17 vehicle): a live entry whose approval anchor is RETAINED past the
+// window but whose approval wait is CLOSED (a clear closed it; seeded by
+// construction) and whose decision is a base_moved readvance carrying an
+// ExpiryYield is returned UNCHANGED with no lock taken, no marker and no
+// merge_queue_yielded row. MECHANISM: the anchor is expired, so with the
+// open-bit condition deleted the enforcement yields
+// forge_approval_undetermined, RED.
+func TestMergeOnPassEnforceExpiredWait_ClosedApprovalWaitNeverFires(t *testing.T) {
+	ctx := context.Background()
+	w := newMQMWorld(t)
+	r, req := w.ready("eg", "h1", mqeSpecYAML)
+	req = w.mqmExpiredWait(r, req)
+	w.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_open = false WHERE id = $1`, req.Entry.ID)
+	req.Entry = w.active(r)
+	if req.Entry.ApprovalWaitStartedAt == nil || req.Entry.ApprovalWaitOpen {
+		t.Fatalf("fixture: anchor %v open=%v, want a retained anchor with the wait closed", req.Entry.ApprovalWaitStartedAt, req.Entry.ApprovalWaitOpen)
+	}
+	var locks atomic.Int32
+	w.srv.cfg.MergeQueue = mqmOnLockQueue{Store: w.store, onLock: func() { locks.Add(1) }}
+	o := mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: mergeOnPassReasonBaseMoved, Detail: "main moved", HeadSHA: "h1",
+		ExpiryYield: mergeOnPassUndeterminedExpiryYield(mergeOnPassReasonBaseMoved, "main moved")}
+
+	if got := w.srv.mergeOnPassEnforceExpiredWait(ctx, req, o); got != o {
+		t.Fatalf("outcome = %+v, want o unchanged %+v", got, o)
+	}
+	if locks.Load() != 0 {
+		t.Fatalf("merge-intent lock taken %d times, want 0 (pre-filter)", locks.Load())
+	}
+	if e := w.active(r); e.Yielded() || len(w.rows(r, CategoryMergeQueueYielded)) != 0 {
+		t.Fatalf("entry yielded=%v rows=%d, want neither (a retained anchor never expires a readvance)", e.Yielded(), len(w.rows(r, CategoryMergeQueueYielded)))
+	}
+}
+
+// TestMergeQueueYield_AwaitApprovalAfterAClearYieldsAtOnce (the SERVER half
+// (i) of approval condition "A3.7 approval anchor, rule (i)"): A waits at the
+// head on a DISMISSED review, its anchor expires and it yields; the marker is
+// then cleared (the store's ClearYield, as a re-probe would) and ONE pump
+// re-admits A in a later epoch, where the fold still reads DISMISSED: the
+// await_approval judges the RETAINED anchor expired and A yields again in
+// that same pump, continuing the cleared episode's yielded_at. MECHANISM: the
+// anchor is two hours old, so with ClearYield nulling it again the pump
+// stamps a fresh anchor and waits, RED.
+func TestMergeQueueYield_AwaitApprovalAfterAClearYieldsAtOnce(t *testing.T) {
+	ctx := context.Background()
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	y := w.yieldDismissed(a)
+	anchor := *y.ApprovalWaitStartedAt
+	if _, err := w.store.ClearYield(ctx, y.ID, y.AnchoredHeadSHA, y.YieldRevision, false); err != nil {
+		t.Fatalf("ClearYield: %v", err)
+	}
+	w.srv.writeMergeQueueYieldCleared(ctx, y, w.active(a), forgeApprovalDecision{})
+
+	w.pumpBase(a)
+
+	e := w.active(a)
+	if e.State != mergequeue.StateHeld || !e.Yielded() || e.YieldReason != mergeCandidateQueueReasonForgeApprovalDismissed {
+		t.Fatalf("A after one pump = %s %q yielded=%v, want yielded forge_approval_dismissed at once", e.State, e.YieldReason, e.Yielded())
+	}
+	if e.ApprovalWaitStartedAt == nil || !e.ApprovalWaitStartedAt.Equal(anchor) || e.AdmissionEpoch <= y.AdmissionEpoch {
+		t.Fatalf("A anchor %v epoch %d, want the retained %v in a later epoch than %d", e.ApprovalWaitStartedAt, e.AdmissionEpoch, anchor, y.AdmissionEpoch)
+	}
+	if !e.YieldedAt.Equal(*y.YieldedAt) {
+		t.Fatalf("A yielded_at %v, want the continued episode %v (docs/adr/112 A3.7)", e.YieldedAt, y.YieldedAt)
 	}
 }
