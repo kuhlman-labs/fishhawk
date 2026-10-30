@@ -489,21 +489,41 @@ type runMergeCandidateQueuePayload struct {
 	ApprovalWaitStartedAt *time.Time `json:"approval_wait_started_at,omitempty"`
 }
 
-// mergeQueueYieldRemedy is the remedy prose for a yield's next_step, built
-// ONLY from the closed next_step vocabulary (never from yield_detail, which is
-// untrusted forge text). An unknown step reads as none.
-func mergeQueueYieldRemedy(nextStep string) string {
+// mergeQueueYieldRemedy is the remedy prose for a yield's reason and
+// next_step, built ONLY from the closed vocabulary (never from yield_detail,
+// which is untrusted forge text). retry_after is reason-aware: the merge-gate
+// yields (docs/adr/112 A3.1(b)/(c)) name the leg the re-probe waits on, and
+// every forge_approval_* reason keeps the forge-read remedy. An unknown step
+// reads as none, which no closed reason with another step reaches
+// (TestMergeQueueYieldRemedy_TotalOverReasons).
+func mergeQueueYieldRemedy(reason, nextStep string) string {
 	switch nextStep {
 	case forgeApprovalNextApprovePR:
 		return "a reviewer the review gate admits, with write permission or higher, approves the pull request at its current head on the forge"
 	case forgeApprovalNextDismissReview:
 		return "the blocking CHANGES_REQUESTED review is dismissed (or its author approves) on the forge, and the pull request carries a qualifying approval"
+	case mergeQueueYieldNextRetriggerCI:
+		return "re-run the failed or cancelled checks with fishhawk_retrigger_ci; the check_run trigger or the periodic re-probe clears the yield once every required check passes, then the entry rejoins its original place"
 	case forgeApprovalNextRetryAfter:
+		switch reason {
+		case mergeQueueYieldMergeChecksPending:
+			return "nothing at the forge; required checks are pending, unreported or unreadable at the anchored head, so let them finish; the check_run trigger or the periodic re-probe clears the yield once every required check passes"
+		case mergeQueueYieldMergeReviewPending:
+			return "nothing at the forge; the implement-review round at the anchored head is still settling, so the periodic re-probe clears the yield once its verdicts land and every merge-gate leg passes"
+		}
 		return "nothing at the forge; the forge read was undetermined or truncated, so re-invoke fishhawk_merge_run to re-probe now or let the periodic re-probe retry"
 	case forgeApprovalNextConfigureIdentityProvider:
 		return "an operator configures the github identity provider the review gate's member_of requires (outside the MCP surface), then re-invokes fishhawk_merge_run"
 	}
 	return "nothing at the forge clears it (the forge cannot bind an approval to the head); merge outside the queue or change the review gate"
+}
+
+// mergeQueueYieldIsMergeGate reports whether reason is a merge-gate yield
+// (docs/adr/112 A3.2: the eligibility legs, R3 row 1), keyed on the one
+// reason-to-row mapping (mergeQueueYieldRow) so the remedy surfaces cannot
+// drift from it.
+func mergeQueueYieldIsMergeGate(reason string) bool {
+	return mergeQueueYieldRow(reason) == mergeQueueYieldRowEligibility
 }
 
 // mergeCandidateQueuePayloadFor projects the run's active queue entry, or
@@ -542,7 +562,13 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 		if e.Yielded() {
 			// Built from the closed vocabulary only: yield_detail is carried
 			// in its own sanitised field, never in the note.
-			out.Note = fmt.Sprintf("yielded %s at position %d on %s (ADR-112 R3): the merge queue skips this entry until a re-probe finds a qualifying forge approval and clears the marker, then it rejoins FIFO at its original enqueue time; next step %s: %s. The re-probe runs on the periodic sweep (about 1 minute, backing off) and at once on a fishhawk_merge_run re-invoke or an approval at the anchored head", y.Reason, st.Position, e.BaseRef, y.NextStep, mergeQueueYieldRemedy(y.NextStep))
+			clears, trigger := "a re-probe finds a qualifying forge approval", "an approval at the anchored head"
+			if mergeQueueYieldIsMergeGate(y.Reason) {
+				// docs/adr/112 A3.4: a merge-gate yield clears only when every
+				// merge-gate leg passes, never on an approval alone.
+				clears, trigger = "a re-probe finds every merge-gate leg passing at the anchored head", "a completed required check run at the anchored head (the check_run trigger)"
+			}
+			out.Note = fmt.Sprintf("yielded %s at position %d on %s (ADR-112 R3): the merge queue skips this entry until %s and clears the marker, then it rejoins FIFO at its original enqueue time; next step %s: %s. The re-probe runs on the periodic sweep (about 1 minute, backing off) and at once on a fishhawk_merge_run re-invoke or %s", y.Reason, st.Position, e.BaseRef, clears, y.NextStep, mergeQueueYieldRemedy(y.Reason, y.NextStep), trigger)
 			return out, nil
 		}
 		holder := "no run (the next queue event admits it)"

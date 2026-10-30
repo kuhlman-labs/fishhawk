@@ -1762,8 +1762,15 @@ func (s *Server) mergeQueueEnqueueArm(w http.ResponseWriter, r *http.Request, ru
 	switch {
 	case st.Entry.Yielded():
 		next := mergeQueueYieldNextStep(st.Entry.YieldReason)
-		resp.Message = fmt.Sprintf("the run was queued on %s with your merge intent but YIELDED its place (ADR-112 R3, yield_reason %s, gate %s): the forge approval does not qualify yet, so the queue skips the entry and the rest of the line keeps merging. Next step: %s. The queue re-probes the approval on its own schedule (and at once on an approval review or a merge re-invoke); once it qualifies the yield clears and the entry rejoins the line at its original place, then merges pinned to the verified head (ADR-093 D3). Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
-			st.Entry.BaseRef, st.Entry.YieldReason, gate.Code, mergeRunYieldNextStepText(next))
+		blocked, probes, clears := "the forge approval does not qualify yet", "the approval", "once it qualifies"
+		if mergeQueueYieldIsMergeGate(st.Entry.YieldReason) {
+			// docs/adr/112 A3.4: a merge-gate yield clears on every merge-gate
+			// leg passing at the anchored head, never on an approval alone.
+			blocked, probes, clears = "a merge-gate leg (required checks or the implement-review round) does not pass yet at the anchored head",
+				"the merge-gate legs", "once every leg passes"
+		}
+		resp.Message = fmt.Sprintf("the run was queued on %s with your merge intent but YIELDED its place (ADR-112 R3, yield_reason %s, gate %s): %s, so the queue skips the entry and the rest of the line keeps merging. Next step: %s. The queue re-probes %s on its own schedule (and at once on an approval review, a completed required check run or a merge re-invoke); %s the yield clears and the entry rejoins the line at its original place, then merges pinned to the verified head (ADR-093 D3). Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
+			st.Entry.BaseRef, st.Entry.YieldReason, gate.Code, blocked, mergeRunYieldNextStepText(st.Entry.YieldReason, next), probes, clears)
 	case s.headPinnedMerger() != nil && st.Entry.State == mergequeue.StateLive:
 		resp.Message = fmt.Sprintf("the run is merge-queue eligible and holds the %s line (ADR-093 D2, gate %s); its merge-candidate pass runs there. Your merge intent persists until the entry settles: the queue merges the run pinned to the verified head on its green pass (ADR-093 D3), so you do not re-invoke the merge. Watch it with fishhawk_get_merge_queue or fishhawk_get_run_status. Nothing merged yet.",
 			st.Entry.BaseRef, gate.Code)
@@ -1813,16 +1820,26 @@ func (s *Server) mergeRunApprovalYield(elig mergeQueueEligibilityResult) (mergeQ
 	return newMergeQueueYield(reason, detail, row), true
 }
 
-// mergeRunYieldNextStepText renders a closed next_step for the 202 message.
-// It is built ONLY from the closed vocabulary: the untrusted yield_detail is
-// never interpolated.
-func mergeRunYieldNextStepText(next string) string {
+// mergeRunYieldNextStepText renders a yield's closed next_step for the 202
+// message, reason-aware for retry_after (the merge-gate yields, docs/adr/112
+// A3.1(b)/(c), wait on a check or a review round, not on a forge read). It is
+// built ONLY from the closed vocabulary: the untrusted yield_detail is never
+// interpolated.
+func mergeRunYieldNextStepText(reason, next string) string {
 	switch next {
 	case forgeApprovalNextApprovePR:
 		return "approve_pr (a reviewer who qualifies under the review approval gate approves the pull request at its current head)"
 	case forgeApprovalNextDismissReview:
 		return "dismiss_review (the requested changes are addressed and the changes-requested review is dismissed or superseded by an approval)"
+	case mergeQueueYieldNextRetriggerCI:
+		return "retrigger_ci (a required check failed or was cancelled at the anchored head; re-run it with fishhawk_retrigger_ci, and the yield clears once every required check passes)"
 	case forgeApprovalNextRetryAfter:
+		switch reason {
+		case mergeQueueYieldMergeChecksPending:
+			return "retry_after (required checks are pending, unreported or unreadable at the anchored head; the re-probe clears the yield once every required check passes)"
+		case mergeQueueYieldMergeReviewPending:
+			return "retry_after (the implement-review round at the anchored head is still settling; the re-probe clears the yield once its verdicts land)"
+		}
 		return "retry_after (the forge review read could not decide; the re-probe retries it)"
 	case forgeApprovalNextConfigureIdentityProvider:
 		return "configure_identity_provider (an operator configures the github identity provider the approval gate's members need)"
@@ -1975,9 +1992,10 @@ func (s *Server) recordMergeQueueIntent(w http.ResponseWriter, r *http.Request, 
 			if yield != nil {
 				m := yield.marker()
 				if sameBase {
-					// A same-reason re-yield of a cleared entry on the same
-					// head and base continues its episode (ADR-112 R3).
-					m.Continue = s.mergeQueueYieldContinuation(ctx, prior.Entry, yield.Reason)
+					// A re-yield of a cleared entry on the same base ref
+					// continues its last cleared episode, whatever the
+					// reason or head (docs/adr/112 A3.7).
+					m.Continue = s.mergeQueueYieldContinuation(ctx, prior.Entry)
 				}
 				req.Yield = &m
 				if sameBase && prior.Entry.AnchoredHeadSHA == gate.prHeadSHA {
