@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -33,12 +34,26 @@ func postResolve(t *testing.T, s *Server, runID string, body any) *httptest.Resp
 	return postResolveAs(t, s, runID, body, withAuth)
 }
 
+// postResolveAs posts a resolve. A string body is sent as raw bytes; a typed
+// body with no judgement, or a map body with no judgement key, is resolved as
+// defect (E94.7 / #4840), so the tests that predate the requirement keep
+// pinning what they pin. Refusal tests post a string.
 func postResolveAs(t *testing.T, s *Server, runID string, body any, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
 	var raw []byte
 	switch b := body.(type) {
 	case string:
 		raw = []byte(b)
+	case resolveConcernsRequest:
+		if b.Judgement == "" {
+			b.Judgement = string(concern.JudgementDefect)
+		}
+		raw, _ = json.Marshal(b)
+	case map[string]any:
+		if _, ok := b["judgement"]; !ok {
+			b["judgement"] = string(concern.JudgementDefect)
+		}
+		raw, _ = json.Marshal(b)
 	default:
 		raw, _ = json.Marshal(body)
 	}
@@ -524,7 +539,7 @@ func TestResolveConcerns_GenericTransitionError_InternalError(t *testing.T) {
 	s, au, cr := resolveServer(t)
 	runID := uuid.New()
 	row := seedResolvableConcern(t, cr, runID, "a")
-	cr.applyResolutionErr = errors.New("db write failed")
+	cr.applyHumanDispositionErr = errors.New("db write failed")
 
 	w := postResolve(t, s, runID.String(), resolveConcernsRequest{ConcernIDs: []string{row.ID.String()}, Evidence: "e"})
 	resp := decodeResolve(t, w)
@@ -601,7 +616,7 @@ func TestResolveConcerns_Route_CrossAccount_Forbidden(t *testing.T) {
 	ownerRow := seedResolvableConcern(t, cr, runID, "owner target")
 
 	post := func(bearer string, row *concern.Concern) *httptest.ResponseRecorder {
-		raw, _ := json.Marshal(resolveConcernsRequest{ConcernIDs: []string{row.ID.String()}, Evidence: "re-ran it"})
+		raw, _ := json.Marshal(resolveConcernsRequest{ConcernIDs: []string{row.ID.String()}, Evidence: "re-ran it", Judgement: "defect"})
 		req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/concerns/resolve", bytes.NewReader(raw))
 		req.Header.Set("Authorization", "Bearer "+bearer)
 		w := httptest.NewRecorder()
@@ -702,4 +717,133 @@ func TestResolveConcerns_StatusRefresh(t *testing.T) {
 			t.Errorf("status refreshes = %d, want 0 for a refused batch", len(rec.status))
 		}
 	})
+}
+
+// --- Human judgement (ADR-117 D1 phase 2, E94.7 / #4840) --------------------
+
+// resolveBody renders a raw resolve body naming ids, with extra fields
+// (judgement, tradeoff_cost) merged in; it bypasses postResolveAs's default.
+func resolveBody(t *testing.T, evidence string, extra map[string]any, ids ...uuid.UUID) string {
+	t.Helper()
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
+	body := map[string]any{"concern_ids": strs, "evidence": evidence}
+	for k, v := range extra {
+		body[k] = v
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal resolve body: %v", err)
+	}
+	return string(raw)
+}
+
+// TestResolveConcerns_RefusesMissingJudgement (CF3): a human resolve with
+// evidence and NO judgement refuses the batch 400 field=judgement before any
+// intent entry. With the guard deleted each item appends its intent row and
+// fails in the store, a 200 with a failed item.
+func TestResolveConcerns_RefusesMissingJudgement(t *testing.T) {
+	s, au, cr := resolveServer(t)
+	runID := uuid.New()
+	row := seedResolvableConcern(t, cr, runID, "a")
+
+	w := postResolve(t, s, runID.String(), resolveBody(t, "re-ran the reproduction; it passes", nil, row.ID))
+	assertJudgementRefused(t, w, "judgement", concern.JudgementRuleRequired)
+	assertUnjudged(t, cr, concern.StateAddressedPending, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernResolvedWithEvidence, CategoryConcernResolveFailed)
+}
+
+// TestResolveConcerns_RefusesTradeoffWithoutCost (CF5): a tradeoff resolve with
+// no tradeoff_cost is refused 400 field=tradeoff_cost.
+func TestResolveConcerns_RefusesTradeoffWithoutCost(t *testing.T) {
+	s, au, cr := resolveServer(t)
+	runID := uuid.New()
+	row := seedResolvableConcern(t, cr, runID, "a")
+
+	w := postResolve(t, s, runID.String(), resolveBody(t, "fixed with a cache", map[string]any{"judgement": "tradeoff"}, row.ID))
+	assertJudgementRefused(t, w, "tradeoff_cost", concern.JudgementRuleTradeoffCostRequired)
+	assertUnjudged(t, cr, concern.StateAddressedPending, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernResolvedWithEvidence, CategoryConcernResolveFailed)
+}
+
+// TestResolveConcerns_ReasonPrefixesDoNotApply: the waive-reason prefixes are a
+// waive convention, so resolve passes no prefix source. Evidence opening with
+// `false_positive:` neither supplies a judgement nor conflicts with one.
+func TestResolveConcerns_ReasonPrefixesDoNotApply(t *testing.T) {
+	s, _, cr := resolveServer(t)
+	runID := uuid.New()
+	a := seedResolvableConcern(t, cr, runID, "a")
+	b := seedResolvableConcern(t, cr, runID, "b")
+
+	w := postResolve(t, s, runID.String(), resolveBody(t, "false_positive: reproduced, now passes", nil, a.ID))
+	assertJudgementRefused(t, w, "judgement", concern.JudgementRuleRequired)
+	assertUnjudged(t, cr, concern.StateAddressedPending, a.ID)
+
+	w = postResolve(t, s, runID.String(), resolveBody(t, "false_positive: reproduced, now passes", map[string]any{"judgement": "defect"}, b.ID))
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (no prefix rule on resolve):\n%s", w.Code, w.Body.String())
+	}
+	assertJudgedRow(t, cr, b.ID, judgedRow{
+		State: concern.StateAddressed, Outcome: concern.OutcomeFixed, Judgement: concern.JudgementDefect,
+		ActorKind: string(audit.ActorUser),
+	})
+}
+
+// TestResolveConcerns_RecordsJudgementBulkFlag (FO ruling D2): a 2-id resolve
+// records judgement_bulk true on both rows; a 1-id resolve records false.
+func TestResolveConcerns_RecordsJudgementBulkFlag(t *testing.T) {
+	for _, n := range []int{2, 1} {
+		t.Run(strconv.Itoa(n)+" ids", func(t *testing.T) {
+			s, _, cr := resolveServer(t)
+			runID := uuid.New()
+			var ids []uuid.UUID
+			for i := 0; i < n; i++ {
+				ids = append(ids, seedResolvableConcern(t, cr, runID, "c"+strconv.Itoa(i)).ID)
+			}
+			if w := postResolve(t, s, runID.String(), resolveBody(t, "re-ran it", map[string]any{"judgement": "defect"}, ids...)); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			for _, id := range ids {
+				assertJudgedRow(t, cr, id, judgedRow{
+					State: concern.StateAddressed, Outcome: concern.OutcomeFixed, Judgement: concern.JudgementDefect,
+					ActorKind: string(audit.ActorUser), Bulk: n > 1,
+				})
+			}
+		})
+	}
+}
+
+// TestResolveConcerns_AuditCarriesJudgement: concern_resolved_with_evidence and
+// the committed row carry the judgement (outcome fixed), and tradeoff_cost only
+// on a tradeoff resolve; the key is ABSENT otherwise.
+func TestResolveConcerns_AuditCarriesJudgement(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		extra map[string]any
+		want  concern.Judgement
+		cost  string
+	}{
+		{"defect", map[string]any{"judgement": "defect"}, concern.JudgementDefect, ""},
+		{"tradeoff", map[string]any{"judgement": "tradeoff", "tradeoff_cost": "an extra round trip"}, concern.JudgementTradeoff, "an extra round trip"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, cr := resolveServer(t)
+			runID := uuid.New()
+			row := seedResolvableConcern(t, cr, runID, "a")
+			if w := postResolve(t, s, runID.String(), resolveBody(t, "re-ran it", tc.extra, row.ID)); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			payloads := auditPayloadsByCategory(t, au, CategoryConcernResolvedWithEvidence)
+			if len(payloads) != 1 {
+				t.Fatalf("concern_resolved_with_evidence entries = %d, want 1", len(payloads))
+			}
+			assertJudgementPayload(t, payloads[0], tc.want, tc.cost)
+			assertJudgedRow(t, cr, row.ID, judgedRow{
+				State: concern.StateAddressed, Outcome: concern.OutcomeFixed, Judgement: tc.want,
+				ActorKind: string(audit.ActorUser), TradeoffCost: tc.cost,
+			})
+		})
+	}
 }

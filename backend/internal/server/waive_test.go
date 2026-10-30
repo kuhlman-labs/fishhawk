@@ -33,12 +33,7 @@ func waiveServer(t *testing.T) (*Server, *auditFake, *fakeConcernRepo) {
 
 func postWaive(t *testing.T, s *Server, concernID string, body waiveConcernRequest) *httptest.ResponseRecorder {
 	t.Helper()
-	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+concernID+"/waive", bytes.NewReader(raw))
-	req.SetPathValue("concern_id", concernID)
-	w := httptest.NewRecorder()
-	s.handleWaiveConcern(w, withAuth(req))
-	return w
+	return postWaiveAs(t, s, concernID, body, withAuth)
 }
 
 // concernWaivedEntries returns the appended concern_waived params.
@@ -270,7 +265,7 @@ func TestWaiveConcern_UnauthenticatedReturns401(t *testing.T) {
 	s, _, cr := waiveServer(t)
 	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "n")
 
-	raw, _ := json.Marshal(waiveConcernRequest{Reason: "r"})
+	raw, _ := json.Marshal(waiveConcernRequest{Reason: "r", Judgement: "no_defect"})
 	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+row.ID.String()+"/waive", bytes.NewReader(raw))
 	req.SetPathValue("concern_id", row.ID.String())
 	w := httptest.NewRecorder()
@@ -285,7 +280,7 @@ func TestWaiveConcern_MissingScopeReturns403(t *testing.T) {
 	s, _, cr := waiveServer(t)
 	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "n")
 
-	raw, _ := json.Marshal(waiveConcernRequest{Reason: "r"})
+	raw, _ := json.Marshal(waiveConcernRequest{Reason: "r", Judgement: "no_defect"})
 	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+row.ID.String()+"/waive", bytes.NewReader(raw))
 	req.SetPathValue("concern_id", row.ID.String())
 	id := Identity{Subject: "token:reader", TokenID: "tok-read", Scopes: []string{"read:runs"}}
@@ -305,7 +300,7 @@ func TestWaiveConcern_MCPTokenMismatchedRunReturns403(t *testing.T) {
 	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "n")
 	otherRunID := uuid.New() // does not match row.RunID
 
-	raw, _ := json.Marshal(waiveConcernRequest{Reason: "r"})
+	raw, _ := json.Marshal(waiveConcernRequest{Reason: "r", Judgement: "no_defect"})
 	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+row.ID.String()+"/waive", bytes.NewReader(raw))
 	req.SetPathValue("concern_id", row.ID.String())
 	w := httptest.NewRecorder()
@@ -331,7 +326,7 @@ func TestWaiveConcern_MCPTokenOwnRunSucceeds(t *testing.T) {
 	s, _, cr := waiveServer(t)
 	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "n")
 
-	raw, _ := json.Marshal(waiveConcernRequest{Reason: "own-run waive"})
+	raw, _ := json.Marshal(waiveConcernRequest{Reason: "own-run waive", Judgement: "no_defect"})
 	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+row.ID.String()+"/waive", bytes.NewReader(raw))
 	req.SetPathValue("concern_id", row.ID.String())
 	w := httptest.NewRecorder()
@@ -475,7 +470,7 @@ func TestWaiveConcern_OperatorAgentActorAttribution(t *testing.T) {
 	s, au, cr := waiveServer(t)
 	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 100, "naming nit")
 
-	raw, _ := json.Marshal(waiveConcernRequest{Reason: "accepted trade-off"})
+	raw, _ := json.Marshal(waiveConcernRequest{Reason: "accepted trade-off", Judgement: "no_defect"})
 	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+row.ID.String()+"/waive", bytes.NewReader(raw))
 	req.SetPathValue("concern_id", row.ID.String())
 	w := httptest.NewRecorder()
@@ -527,4 +522,344 @@ func TestWaiveConcern_SinglePath_OmitsBulkWaiveMarker(t *testing.T) {
 	if payload["concern_id"] != row.ID.String() || payload["reason"] != "accepted trade-off" {
 		t.Errorf("payload = %v, want the concern id + operator reason unchanged by the extraction", payload)
 	}
+}
+
+// --- Human judgement (ADR-117 D1 phase 2, E94.7 / #4840) --------------------
+
+// auditPayloadsByCategory decodes the RAW payload bytes of every appended entry
+// of category, so a test can tell an absent key from an empty one.
+func auditPayloadsByCategory(t *testing.T, au *auditFake, category string) []map[string]any {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var out []map[string]any
+	for _, e := range au.appended {
+		if e.Category != category {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(e.Payload, &m); err != nil {
+			t.Fatalf("decode %s payload: %v\n%s", category, err, e.Payload)
+		}
+		out = append(out, m)
+	}
+	return out
+}
+
+// assertJudgementPayload asserts one decoded audit payload's judgement keys:
+// `judgement` equals judgement, and `tradeoff_cost` equals cost when cost is
+// non-empty and is ABSENT (not an empty string) otherwise.
+func assertJudgementPayload(t *testing.T, p map[string]any, judgement concern.Judgement, cost string) {
+	t.Helper()
+	if p["judgement"] != string(judgement) {
+		t.Errorf("payload judgement = %v, want %q (payload %v)", p["judgement"], judgement, p)
+	}
+	got, has := p["tradeoff_cost"]
+	switch {
+	case cost == "" && has:
+		t.Errorf("payload carries tradeoff_cost = %v; want the key ABSENT for judgement %q", got, judgement)
+	case cost != "" && got != cost:
+		t.Errorf("payload tradeoff_cost = %v, want %q", got, cost)
+	}
+}
+
+// assertJudgementRefused asserts the 400 validation_failed a refused judgement
+// returns, with details naming field, rule and the allowed set, and returns the
+// details. A wrong status is an Errorf so the caller's committed-state reads
+// still run and a deleted guard reports what it let through.
+func assertJudgementRefused(t *testing.T, w *httptest.ResponseRecorder, field, rule string) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusBadRequest {
+		t.Errorf("status = %d, want 400 validation_failed field=%s rule=%s:\n%s", w.Code, field, rule, w.Body.String())
+		return nil
+	}
+	code, details := bulkWaiveErrorEnvelope(t, w)
+	if code != "validation_failed" {
+		t.Errorf("error code = %q, want validation_failed", code)
+	}
+	if details["field"] != field || details["rule"] != rule {
+		t.Errorf("details = %v, want field=%s rule=%s", details, field, rule)
+	}
+	if allowed, _ := details["allowed"].([]any); len(allowed) != len(concern.HumanJudgements()) {
+		t.Errorf("details.allowed = %v, want the %d human judgements", details["allowed"], len(concern.HumanJudgements()))
+	}
+	return details
+}
+
+// assertUnjudged reads each concern back AFTER the call returned and asserts it
+// is still in state with no judgement, actor kind or outcome recorded.
+func assertUnjudged(t *testing.T, cr *fakeConcernRepo, state concern.State, ids ...uuid.UUID) {
+	t.Helper()
+	for _, id := range ids {
+		rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+		if err != nil {
+			t.Fatalf("read back concern %s: %v", id, err)
+		}
+		row := rows[0]
+		if row.State != state || concern.NormalizeJudgement(string(row.Judgement)) != concern.JudgementUnlabelled ||
+			row.JudgementActorKind != "" || row.Outcome != "" || row.TradeoffCost != "" {
+			t.Errorf("concern %s committed state %s judgement %q actor %q outcome %q cost %q; want %s and unjudged",
+				id, row.State, row.Judgement, row.JudgementActorKind, row.Outcome, row.TradeoffCost, state)
+		}
+	}
+}
+
+// judgedRow is the judgement record a human verb commits on a concern row.
+type judgedRow struct {
+	State        concern.State
+	Outcome      concern.Outcome
+	Judgement    concern.Judgement
+	ActorKind    string
+	Delegated    bool
+	Bulk         bool
+	TradeoffCost string
+}
+
+// assertJudgedRow reads the concern back AFTER the call returned and compares
+// its committed judgement record; judgement_backfill must read false.
+func assertJudgedRow(t *testing.T, cr concern.Repository, id uuid.UUID, want judgedRow) {
+	t.Helper()
+	rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+	if err != nil {
+		t.Fatalf("read back concern %s: %v", id, err)
+	}
+	row := rows[0]
+	got := judgedRow{
+		State: row.State, Outcome: row.Outcome, Judgement: row.Judgement, ActorKind: row.JudgementActorKind,
+		Delegated: row.JudgementDelegated, Bulk: row.JudgementBulk, TradeoffCost: row.TradeoffCost,
+	}
+	if got != want {
+		t.Errorf("concern %s committed %+v, want %+v", id, got, want)
+	}
+	if row.JudgementBackfill {
+		t.Errorf("concern %s judgement_backfill = true, want false on a human judgement", id)
+	}
+}
+
+// assertNoAuditRows asserts no entry of any of the categories was appended.
+func assertNoAuditRows(t *testing.T, au *auditFake, categories ...string) {
+	t.Helper()
+	for _, c := range categories {
+		if n := len(auditEntriesByCategory(au, c)); n != 0 {
+			t.Errorf("%s entries = %d, want 0 (a refused judgement appends nothing)", c, n)
+		}
+	}
+}
+
+// TestWaiveConcern_RefusesMissingJudgement (CF1): a HUMAN waive with an
+// unprefixed reason and NO judgement is refused 400 validation_failed
+// field=judgement BEFORE the intent entry. With the guard deleted the handler
+// appends the intent row and the store refuses the transition (500 plus a
+// corrective row), so the 400, the untouched row and the zero rows all fail.
+func TestWaiveConcern_RefusesMissingJudgement(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "naming nit")
+
+	w := postWaiveRaw(t, s, row.ID.String(), `{"reason":"not blocking this merge"}`, withAuth)
+	assertJudgementRefused(t, w, "judgement", concern.JudgementRuleRequired)
+	assertUnjudged(t, cr, concern.StateRaised, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+}
+
+// TestWaiveConcern_RefusesTradeoffWithoutCost (CF5): a tradeoff judgement with
+// a blank or whitespace-only tradeoff_cost is refused 400 field=tradeoff_cost.
+func TestWaiveConcern_RefusesTradeoffWithoutCost(t *testing.T) {
+	for name, body := range map[string]string{
+		"absent cost":     `{"reason":"slower cold start accepted","judgement":"tradeoff"}`,
+		"whitespace cost": `{"reason":"slower cold start accepted","judgement":"tradeoff","tradeoff_cost":" \t "}`,
+	} {
+		t.Run(name, func(t *testing.T) {
+			s, au, cr := waiveServer(t)
+			row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "cold start")
+			w := postWaiveRaw(t, s, row.ID.String(), body, withAuth)
+			assertJudgementRefused(t, w, "tradeoff_cost", concern.JudgementRuleTradeoffCostRequired)
+			assertUnjudged(t, cr, concern.StateRaised, row.ID)
+			assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+		})
+	}
+}
+
+// TestWaiveConcern_RefusesTradeoffCostWithoutTradeoff (approval condition T1,
+// an INFERRED criterion): a tradeoff_cost sent with any judgement other than
+// tradeoff is refused, never accepted and dropped.
+func TestWaiveConcern_RefusesTradeoffCostWithoutTradeoff(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "naming nit")
+	w := postWaiveRaw(t, s, row.ID.String(), `{"reason":"not a defect","judgement":"no_defect","tradeoff_cost":"none really"}`, withAuth)
+	assertJudgementRefused(t, w, "tradeoff_cost", concern.JudgementRuleTradeoffCostWithoutTradeoff)
+	assertUnjudged(t, cr, concern.StateRaised, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+}
+
+// TestWaiveConcern_RefusesUnlabelledAndUnknownJudgement: unlabelled (the read
+// of an unjudged row) and any value outside the closed set (matched exactly, so
+// `No_Defect` is unknown) are refused for THAT reason — also beside a
+// recognised reason prefix, which is checked only after the value is valid.
+func TestWaiveConcern_RefusesUnlabelledAndUnknownJudgement(t *testing.T) {
+	for _, tc := range []struct{ name, body, rule string }{
+		{"unlabelled", `{"reason":"r","judgement":"unlabelled"}`, concern.JudgementRuleUnlabelled},
+		{"unknown", `{"reason":"r","judgement":"bogus"}`, concern.JudgementRuleUnknown},
+		{"wrong case", `{"reason":"r","judgement":"No_Defect"}`, concern.JudgementRuleUnknown},
+		{"unknown beside a prefix", `{"reason":"false_positive: upstream guard","judgement":"bogus"}`, concern.JudgementRuleUnknown},
+		{"unrecognised prefix case", `{"reason":"False_Positive: upstream guard"}`, concern.JudgementRuleRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, cr := waiveServer(t)
+			row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "nit")
+			w := postWaiveRaw(t, s, row.ID.String(), tc.body, withAuth)
+			assertJudgementRefused(t, w, "judgement", tc.rule)
+			assertUnjudged(t, cr, concern.StateRaised, row.ID)
+			assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+		})
+	}
+}
+
+// TestWaiveConcern_ReasonPrefixJudgementRules pins FO ruling D1's accepting
+// rules on the committed row: (a) an explicit judgement with a MATCHING prefix,
+// (b) an explicit judgement with no prefix, (c) a prefix alone supplying the
+// judgement. A prefix-derived tradeoff still needs a stated cost: none is
+// inferred from the reason.
+func TestWaiveConcern_ReasonPrefixJudgementRules(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       concern.Judgement
+		cost       string
+		refuseRule string // non-empty: the body is refused with this rule
+	}{
+		{name: "(a) matching prefix", body: `{"reason":"false_positive: the guard is upstream","judgement":"no_defect"}`, want: concern.JudgementNoDefect},
+		{name: "(a) matching tradeoff prefix", body: `{"reason":"accepted_tradeoff: cold start","judgement":"tradeoff","tradeoff_cost":"200ms"}`, want: concern.JudgementTradeoff, cost: "200ms"},
+		{name: "(b) no prefix", body: `{"reason":"real but out of scope","judgement":"defect"}`, want: concern.JudgementDefect},
+		{name: "(c) false_positive:", body: `{"reason":"false_positive: the guard is upstream"}`, want: concern.JudgementNoDefect},
+		{name: "(c) leading whitespace", body: `{"reason":"  false_positive: the guard is upstream"}`, want: concern.JudgementNoDefect},
+		{name: "(c) accepted_tradeoff:", body: `{"reason":"accepted_tradeoff: cold start","tradeoff_cost":"200ms"}`, want: concern.JudgementTradeoff, cost: "200ms"},
+		{name: "(c) preference:", body: `{"reason":"preference: naming"}`, want: concern.JudgementPreference},
+		{name: "(c) accepted_tradeoff: without a cost", body: `{"reason":"accepted_tradeoff: cold start"}`, refuseRule: concern.JudgementRuleTradeoffCostRequired},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, cr := waiveServer(t)
+			row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "nit")
+			w := postWaiveRaw(t, s, row.ID.String(), tc.body, withAuth)
+			if tc.refuseRule != "" {
+				assertJudgementRefused(t, w, "tradeoff_cost", tc.refuseRule)
+				assertUnjudged(t, cr, concern.StateRaised, row.ID)
+				assertNoAuditRows(t, au, CategoryConcernWaived)
+				return
+			}
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			assertJudgedRow(t, cr, row.ID, judgedRow{
+				State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: tc.want,
+				ActorKind: string(audit.ActorUser), TradeoffCost: tc.cost,
+			})
+			payloads := auditPayloadsByCategory(t, au, CategoryConcernWaived)
+			if len(payloads) != 1 {
+				t.Fatalf("concern_waived entries = %d, want 1", len(payloads))
+			}
+			assertJudgementPayload(t, payloads[0], tc.want, tc.cost)
+		})
+	}
+}
+
+// TestWaiveConcern_RefusesContradictingReasonPrefix (CF10, FO ruling D1 rule
+// (d), an INFERRED criterion): an explicit judgement contradicting the reason
+// prefix is refused 400 judgement_conflicts_reason_prefix, naming BOTH values,
+// with nothing written. HumanDisposition.Validate takes no reason, so no
+// downstream guard masks a deleted conflict check: the waive would commit.
+func TestWaiveConcern_RefusesContradictingReasonPrefix(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "nil deref")
+	w := postWaiveRaw(t, s, row.ID.String(), `{"reason":"false_positive: the guard is upstream","judgement":"defect"}`, withAuth)
+	details := assertJudgementRefused(t, w, "judgement", concern.JudgementRuleConflictsReasonPrefix)
+	if details != nil {
+		if details["reason_prefix"] != "false_positive:" {
+			t.Errorf("details.reason_prefix = %v, want false_positive:", details["reason_prefix"])
+		}
+		env := decodeErrorEnvelope(t, w)
+		if !strings.Contains(env.Message, `"defect"`) || !strings.Contains(env.Message, "false_positive:") {
+			t.Errorf("message = %q, want it to name both the judgement \"defect\" and the prefix false_positive:", env.Message)
+		}
+	}
+	assertUnjudged(t, cr, concern.StateRaised, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+}
+
+// TestWaiveConcern_AuditCarriesJudgement: the concern_waived payload and the
+// committed row carry the judgement, and tradeoff_cost only for a tradeoff (the
+// key is ABSENT otherwise, decoded from the raw payload bytes).
+func TestWaiveConcern_AuditCarriesJudgement(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       concern.Judgement
+		cost       string
+	}{
+		{"defect", `{"reason":"real, tracked separately","judgement":"defect_pre_existing"}`, concern.JudgementDefectPreExisting, ""},
+		{"tradeoff", `{"reason":"cold start accepted","judgement":"tradeoff","tradeoff_cost":"200ms p99"}`, concern.JudgementTradeoff, "200ms p99"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, au, cr := waiveServer(t)
+			row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "nit")
+			if w := postWaiveRaw(t, s, row.ID.String(), tc.body, withAuth); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			payloads := auditPayloadsByCategory(t, au, CategoryConcernWaived)
+			if len(payloads) != 1 {
+				t.Fatalf("concern_waived entries = %d, want 1", len(payloads))
+			}
+			assertJudgementPayload(t, payloads[0], tc.want, tc.cost)
+			assertJudgedRow(t, cr, row.ID, judgedRow{
+				State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: tc.want,
+				ActorKind: string(audit.ActorUser), TradeoffCost: tc.cost,
+			})
+		})
+	}
+}
+
+// TestWaiveConcern_RecordsJudgementActorKind: the committed row's actor kind is
+// the user|agent kind the concern_waived row carries — user for a human token,
+// agent for an operator-agent token — and a single waive records
+// judgement_bulk false.
+func TestWaiveConcern_RecordsJudgementActorKind(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		auth func(*http.Request) *http.Request
+		want audit.ActorKind
+	}{
+		{"human token", withAuth, audit.ActorUser},
+		{"operator-agent token", withOperatorAgentAuth, audit.ActorAgent},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, _, cr := waiveServer(t)
+			row := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "nit")
+			if w := postWaiveRaw(t, s, row.ID.String(), `{"reason":"style only","judgement":"preference"}`, tc.auth); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			assertJudgedRow(t, cr, row.ID, judgedRow{
+				State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: concern.JudgementPreference,
+				ActorKind: string(tc.want),
+			})
+		})
+	}
+}
+
+// TestWaiveConcern_Delegated_RecordsJudgementDelegated: a waive the solo_low
+// delegation admitted records judgement_delegated true on the committed row.
+func TestWaiveConcern_Delegated_RecordsJudgementDelegated(t *testing.T) {
+	s, repo, _, cr := delegatedWaiveServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedLowConcernRow(t, cr, runID, stageID)
+	repo.seedRun(&run.Run{
+		ID:           runID,
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+	w := postWaiveRaw(t, s, row.ID.String(), `{"reason":"style nit","judgement":"preference","delegated":true}`, withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	assertJudgedRow(t, cr, row.ID, judgedRow{
+		State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: concern.JudgementPreference,
+		ActorKind: string(audit.ActorUser), Delegated: true,
+	})
 }

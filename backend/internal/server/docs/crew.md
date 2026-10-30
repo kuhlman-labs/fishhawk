@@ -272,7 +272,7 @@ refuses startup rather than falling back.
 
 **Call sites — each after the decision's own entry is on the chain:**
 
-- `applyConcernWaive` (waive.go), after `ApplyResolution` — so the bulk waive
+- `applyConcernWaive` (waive.go), after `ApplyHumanDisposition` — so the bulk waive
   inherits it through the shared body;
 - `handleDeferConcern` (defer_concern.go), after the `concern_deferred` entry
   appends (a failed append skips the hook);
