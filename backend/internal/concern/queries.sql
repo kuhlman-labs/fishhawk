@@ -73,6 +73,30 @@ UPDATE review_concerns
    AND state = sqlc.arg(from_state)
 RETURNING *;
 
+-- name: SetReviewConcernLabel :one
+-- E94.8 / #4841 (ADR-117 D1 phase 3): the relabel verb's write (ApplyLabel).
+-- ONE UPDATE setting the judgement columns and duplicate_of: judgement is the
+-- label's (unlabelled for a duplicate label, whose effective judgement is
+-- inherited), judgement_delegated and judgement_bulk are false (one human, one
+-- concern), tradeoff_cost is '' for a duplicate, and duplicate_of is NULL for
+-- a judgement label (clearing a prior link). The optimistic guard matches only
+-- while the row still holds the prior judgement and duplicate_of the caller
+-- read and audited; zero rows is a concurrent relabel (ErrLabelConflict). It
+-- NEVER sets state, state_reason, outcome or updated_at: a label is not a
+-- lifecycle event (the StampReviewConcernsOpenAtMerge posture).
+UPDATE review_concerns
+   SET judgement = sqlc.arg(judgement),
+       judgement_actor_kind = sqlc.arg(judgement_actor_kind),
+       judgement_delegated = false,
+       judgement_bulk = false,
+       judgement_backfill = sqlc.arg(judgement_backfill),
+       tradeoff_cost = sqlc.arg(tradeoff_cost),
+       duplicate_of = sqlc.narg(duplicate_of)::uuid
+ WHERE id = sqlc.arg(id)
+   AND judgement = sqlc.arg(prior_judgement)
+   AND duplicate_of IS NOT DISTINCT FROM sqlc.narg(prior_duplicate_of)::uuid
+RETURNING *;
+
 -- name: ImportRolledUpReviewConcern :one
 -- E94.1 / #4692 (ADR-117 D2): copy one decomposition child's concern into its
 -- parent's ledger as a raised implement-stage row. The source's origin round,

@@ -177,6 +177,61 @@ func (r *postgresRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, 
 	return transitionResult(c, row, err)
 }
 
+func (r *postgresRepo) ApplyLabel(ctx context.Context, id uuid.UUID, l Label) (*Concern, error) {
+	if err := l.Validate(); err != nil {
+		return nil, fmt.Errorf("concern: apply label %s: %w", id, err)
+	}
+	current, err := r.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	c := current[0]
+	judgement, tradeoffCost := string(l.Judgement), l.TradeoffCost
+	if l.DuplicateOf != nil {
+		var target *Concern
+		targets, err := r.GetByIDs(ctx, []uuid.UUID{*l.DuplicateOf})
+		switch {
+		case errors.Is(err, ErrNotFound):
+			// A target with no row is refused exactly like a foreign one
+			// (M1): CheckDuplicateTarget(c, nil), never ErrNotFound.
+		case err != nil:
+			return nil, fmt.Errorf("concern: apply label %s: read duplicate_of target: %w", id, err)
+		default:
+			target = targets[0]
+		}
+		if err := CheckDuplicateTarget(c, target); err != nil {
+			return nil, fmt.Errorf("concern: apply label %s: %w", id, err)
+		}
+		judgement, tradeoffCost = string(JudgementUnlabelled), ""
+	}
+	q := concerndb.New(r.pool)
+	row, err := q.SetReviewConcernLabel(ctx, concerndb.SetReviewConcernLabelParams{
+		Judgement:          judgement,
+		JudgementActorKind: l.ActorKind,
+		JudgementBackfill:  l.Backfill,
+		TradeoffCost:       tradeoffCost,
+		DuplicateOf:        l.DuplicateOf,
+		ID:                 c.ID,
+		PriorJudgement:     string(l.PriorJudgement),
+		PriorDuplicateOf:   l.PriorDuplicateOf,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: concern %s no longer holds judgement %q and duplicate_of %s", ErrLabelConflict, c.ID, l.PriorJudgement, uuidOrNone(l.PriorDuplicateOf))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("concern: apply label %s: %w", id, err)
+	}
+	return rowToConcern(row), nil
+}
+
+// uuidOrNone renders an optional id for an error message.
+func uuidOrNone(id *uuid.UUID) string {
+	if id == nil {
+		return "none"
+	}
+	return id.String()
+}
+
 // transition validates the lifecycle edge against the Go state machine
 // and applies it with a from-state guard so a concurrent writer cannot
 // race past the validation (the guarded UPDATE matching zero rows means

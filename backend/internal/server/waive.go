@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -262,7 +263,20 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 // returns ok=false. Every verb calls it after its own body checks and BEFORE
 // any concern read, delegation check, audit append or work-item filing, so a
 // refused judgement leaves no intent row and no orphan issue.
+//
+// FIRST it refuses a tradeoff_cost over maxOperatorConcernBytes (E94.8 /
+// #4841): 400 validation_failed, rule tradeoff_cost_too_long, details {field,
+// rule, bytes, max}. The cost is persisted verbatim on the row and in the
+// verb's audit payload, so it is refused rather than truncated; exactly
+// maxOperatorConcernBytes is accepted. This one helper serves every human
+// concern verb, so the cap cannot drift between them.
 func (s *Server) concernJudgementFromRequest(w http.ResponseWriter, r *http.Request, judgement, tradeoffCost, prefixSource string) (concern.Judgement, string, bool) {
+	if len(tradeoffCost) > maxOperatorConcernBytes {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			fmt.Sprintf("tradeoff_cost is %d bytes; the maximum is %d (it is not truncated)", len(tradeoffCost), maxOperatorConcernBytes),
+			map[string]any{"field": "tradeoff_cost", "rule": concern.JudgementRuleTradeoffCostTooLong, "bytes": len(tradeoffCost), "max": maxOperatorConcernBytes})
+		return "", "", false
+	}
 	j, err := concern.ResolveHumanJudgement(judgement, tradeoffCost, prefixSource)
 	if err == nil {
 		return j, tradeoffCost, true
