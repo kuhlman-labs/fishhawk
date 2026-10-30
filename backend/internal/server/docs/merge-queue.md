@@ -1078,6 +1078,47 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   forge message survives the 300-byte `forgeApprovalDetailMaxBytes` bound
   both sinks re-apply; the remedy (closed vocabulary) carries the asymmetry
   (#4705).
+- **`forge_reason` `merge_method_refused` (E93.2 / #4658).** A new value
+  inside ADR-093 D4's existing ejection-reason mechanism, not a new direction.
+  It names a merge the run's declared merge method (workflow-v2
+  `merge_method` in the run's cached ADMISSION spec; absent = squash) cannot
+  carry, on two arms:
+  - **Pre-lock static eject.** `mergeQueueMergeOnPass` calls
+    `staticMergeMethodRefusal` right after the run read and the run-terminal
+    drop, BEFORE the installation guard, the PR read, eligibility, the
+    republish and the merge-intent lock — so before the fold, the verdict,
+    `SetPhase(merging)` and `ClaimMergeDispatch`. A forge family that cannot
+    apply the method per merge request (GitLab x `rebase`), or an admission
+    spec that does not parse (`merge_method_undeterminable`, fail-closed),
+    settles the entry EJECTED `forge_merge_refused` with this `forge_reason`.
+    An eject, not a hold: the admission declaration never changes, so a hold
+    would block the head of the line forever (the pre-lock `verify_failed`
+    eject is the precedent). A production GitLab run holds earlier paths
+    (no GitHub installation), so this arm is defence in depth.
+  - **Post-dispatch attribution.** `ForgeMerger` re-reads the repository's
+    documented merge settings after a typed refusal and wraps it as a
+    `*MergeMethodRefusalError` only when the declared method is disallowed.
+    The typed-refusal arm above is UNCHANGED in order: the claim settles
+    first through the unchanged `classifyMergeDispatchOutcome` (its release
+    set is byte-for-byte unchanged), and ADR-112 R3 row 4 is decided FIRST —
+    so a method refusal on a run whose fresh snapshot shows review required
+    YIELDS `approve_pr` rather than ejecting `merge_method_refused`.
+    `mergeQueueForgeReasonFor` decides `merge_method_refused` BEFORE
+    `not_mergeable` (the refusal rides alongside the original sentinel).
+  - **Field-built details.** Both arms set the settle detail and
+    `forge_detail` from `FieldDetail()` (method, source, citation, reason,
+    allowed methods) — never `mergeErr.Error()` or the refusal's Cause — so
+    no forge response text or credential reaches the ejection row. The
+    remedy: change the repository's merge settings for THIS run or merge by
+    hand; a declaration edit applies to runs admitted after it merges.
+  - **Attribution is best-effort.** The settings re-read is bounded by the
+    caller's context, which on merge-on-pass is the 30s call context the
+    merge itself consumed; a slow merge can leave no time for the read, so a
+    `not_mergeable` refusal does NOT prove the declared method was allowed.
+  The inline (`409 merge_method_refused`, nothing recorded) and delegated
+  (observe-only, before the fold and the claim) paths refuse the same static
+  combination before their claim; the projection's closed `forge_reason` set
+  (`merge_queue_read.go`) admits the value.
 - **Automatic re-entry (`merge_queue_reentry.go`).** `sweepMergeQueueReentries`
   runs on the yield re-probe ticker after `sweepMergeQueueYields`. Each
   `mergequeue.ReentryReader` candidate (an ejected `verify_failed` row with
