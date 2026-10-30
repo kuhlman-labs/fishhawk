@@ -943,7 +943,7 @@ func (s *Server) writeMergeQueueAuthorized(ctx context.Context, runRow *run.Run,
 	if err != nil {
 		return 0, err
 	}
-	verifyRef, err := s.verifyPassReference(ctx, runRow.ID, d.VerifiedHead)
+	verifyRef, err := s.verifyPassReference(ctx, runRow, d.VerifiedHead)
 	if err != nil {
 		return 0, err
 	}
@@ -1065,25 +1065,34 @@ func (s *Server) reviewGateApprovalSequence(ctx context.Context, runID uuid.UUID
 	return seq, nil
 }
 
-// verifyPassReference is the newest passed merge_candidate_verified sequence
-// at head, or "not_required" when none exists.
-func (s *Server) verifyPassReference(ctx context.Context, runID uuid.UUID, head string) (any, error) {
-	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, CategoryMergeCandidateVerified)
+// verifyPassReference is the verify_pass reference merge_queue_authorized
+// records (#4749). It resolves the SAME predicate the merge gate admitted the
+// head through (mergeCandidateVerifyState), so a head admitted by an
+// enforce-mode merge_candidate_verdict_transferred row names THAT row's
+// sequence plus transferred_from / root_head, and a recorded pass names its
+// merge_candidate_verified row. not_required is reserved for a head that
+// predicate determined needs no verify. Any other state (unverified,
+// in_flight, failed, a transfer ignored in off/shadow mode) fails closed:
+// writeMergeQueueAuthorized then refuses before any append, so every caller
+// holds or refuses as on any other evidence-read error.
+func (s *Server) verifyPassReference(ctx context.Context, runRow *run.Run, head string) (any, error) {
+	st, err := s.mergeCandidateVerifyState(ctx, runRow, head)
 	if err != nil {
-		return nil, fmt.Errorf("list %s: %w", CategoryMergeCandidateVerified, err)
+		return nil, fmt.Errorf("verify_pass: read the merge-candidate verify state at %s: %w", head, err)
 	}
-	var seq int64
-	for _, e := range rows {
-		var p mergeCandidateVerifiedPayload
-		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA != head || p.Result != mergeCandidateResultPassed {
-			continue
-		}
-		if e.Sequence > seq {
-			seq = e.Sequence
-		}
-	}
-	if seq == 0 {
+	if st.State == mergeCandidateStateNotRequired {
 		return forgeApprovalBasisNotRequired, nil
 	}
-	return map[string]any{"merge_candidate_verified_sequence": seq}, nil
+	if st.State != mergeCandidateStatePassed || st.VerdictSequence == 0 {
+		return nil, fmt.Errorf("verify_pass: the merge-candidate verify state at %s is %s, not an admitted verdict", head, st.State)
+	}
+	if st.Source == mergeCandidateSourceTransferred {
+		return map[string]any{
+			"source": mergeCandidateSourceTransferred,
+			"merge_candidate_verdict_transferred_sequence": st.VerdictSequence,
+			"transferred_from": st.TransferredFrom,
+			"root_head":        st.RootHead,
+		}, nil
+	}
+	return map[string]any{"source": mergeCandidateSourceRecorded, "merge_candidate_verified_sequence": st.VerdictSequence}, nil
 }

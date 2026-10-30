@@ -9,6 +9,7 @@ import (
 	"reflect"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -232,6 +233,37 @@ func TestForgeApprovalFold_Table(t *testing.T) {
 			perms:     map[string][2]string{"wally": {"write", "write"}},
 			setup: func(_ *testing.T, f *mcqFixture, _ *mcqRun) {
 				f.srv.cfg.IdentityProviders = map[string]identity.IdentityProvider{"github": &fakeIdentityProvider{member: true}}
+			}, want: forgeApprovalApproved},
+		// #4749: the negative member_of control. Each reviewer below has write
+		// permission and passes every other predicate; only the provider's
+		// answer differs from the approving positive controls.
+		{name: "member_of false membership is absent",
+			approvals: faCount1 + "              member_of: acme/team\n",
+			snap:      mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "wally", 10)}},
+			perms:     map[string][2]string{"wally": {"write", "write"}},
+			setup: func(_ *testing.T, f *mcqFixture, _ *mcqRun) {
+				faInstallGroups(f, map[string]bool{"acme/team": false})
+			}, want: forgeApprovalAbsent, reason: forgeApprovalReasonNoQualifying, next: forgeApprovalNextApprovePR},
+		{name: "member_of multi-group partially satisfied (team false) is absent",
+			approvals: faCount1 + "              member_of: acme/team\n", esc: faEscAddGroup,
+			snap:  mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "wally", 10)}},
+			perms: map[string][2]string{"wally": {"write", "write"}},
+			setup: func(_ *testing.T, f *mcqFixture, _ *mcqRun) {
+				faInstallGroups(f, map[string]bool{"acme/security": true, "acme/team": false})
+			}, want: forgeApprovalAbsent, reason: forgeApprovalReasonNoQualifying, next: forgeApprovalNextApprovePR},
+		{name: "member_of multi-group partially satisfied (security false) is absent",
+			approvals: faCount1 + "              member_of: acme/team\n", esc: faEscAddGroup,
+			snap:  mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "wally", 10)}},
+			perms: map[string][2]string{"wally": {"write", "write"}},
+			setup: func(_ *testing.T, f *mcqFixture, _ *mcqRun) {
+				faInstallGroups(f, map[string]bool{"acme/security": false, "acme/team": true})
+			}, want: forgeApprovalAbsent, reason: forgeApprovalReasonNoQualifying, next: forgeApprovalNextApprovePR},
+		{name: "member_of multi-group fully satisfied approves",
+			approvals: faCount1 + "              member_of: acme/team\n", esc: faEscAddGroup,
+			snap:  mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "wally", 10)}},
+			perms: map[string][2]string{"wally": {"write", "write"}},
+			setup: func(_ *testing.T, f *mcqFixture, _ *mcqRun) {
+				faInstallGroups(f, map[string]bool{"acme/security": true, "acme/team": true})
 			}, want: forgeApprovalApproved},
 		{name: "a GitLab-ref run is provider_unsupported with no next step", approvals: faCount1,
 			snap: mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "wally", 10)}},
@@ -820,5 +852,184 @@ func TestWriteMergeQueueAuthorized(t *testing.T) {
 	}
 	if rows, _ := f.audit.ListForRunByCategory(ctx, r.id, CategoryMergeQueueAuthorized); len(rows) != 1 {
 		t.Errorf("rows after failed append = %d, want 1", len(rows))
+	}
+}
+
+// TestVerifyPassReference pins the merge_queue_authorized verify_pass
+// reference (#4749): it resolves the SAME predicate that admitted the head
+// (mergeCandidateVerifyState), so a transferred verdict names its transfer
+// row, not_required appears only on a head the predicate determined needs no
+// verify, and every other state fails closed — with writeMergeQueueAuthorized
+// then appending NOTHING. Counterfactuals: the transferred branch made
+// never-true records the recorded shape; the fail-closed return replaced by
+// not_required records a row for an unverified head, RED.
+func TestVerifyPassReference(t *testing.T) {
+	const root = "9999999999999999999999999999999999999999"
+	ctx := context.Background()
+	seqOf := func(t *testing.T, f *mcvFixture, category string) int64 {
+		t.Helper()
+		rows, err := f.au.ListForRunByCategory(ctx, f.runID, category)
+		if err != nil || len(rows) != 1 || rows[0].Sequence == 0 {
+			t.Fatalf("%s rows = %d (%v), want one sequenced row", category, len(rows), err)
+		}
+		return rows[0].Sequence
+	}
+	transferFixture := func(t *testing.T, mode MergeCandidateTransferMode) *mcvFixture {
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		f.s.cfg.MergeCandidateTransfer.Mode = mode
+		f.seedRebased(mcvHead, mcvHead, false)
+		f.seedRebased(mcvOtherHead, mcvOtherHead, false)
+		f.seedVerdict(mcvOtherHead, mergeCandidateResultPassed)
+		f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, mergeCandidateTransferPayload{
+			FromHead: mcvOtherHead, ToHead: mcvHead, RootHead: root, ReasonCode: transferReasonIndependent})
+		return f
+	}
+	// requireRefusedWritesNothing drives writeMergeQueueAuthorized with an
+	// APPROVED decision at the head: it must error with zero rows appended.
+	requireRefusedWritesNothing := func(t *testing.T, f *mcvFixture) {
+		t.Helper()
+		d := forgeApprovalDecision{Declared: true, Result: forgeApprovalApproved, VerifiedHead: mcvHead, Basis: forgeApprovalBasisLive}
+		if seq, err := f.s.writeMergeQueueAuthorized(ctx, f.runRow(t), d, forgeApprovalAuthorization{Path: "inline"}); err == nil || seq != 0 {
+			t.Fatalf("writeMergeQueueAuthorized = %d, %v; want a refusal", seq, err)
+		}
+		if rows, err := f.au.ListForRunByCategory(ctx, f.runID, CategoryMergeQueueAuthorized); err != nil || len(rows) != 0 {
+			t.Fatalf("merge_queue_authorized rows = %d (%v), want 0", len(rows), err)
+		}
+	}
+
+	t.Run("no verify command is not_required", func(t *testing.T) {
+		f := newMCVFixture(t, mcvNoVerifySpecYAML)
+		f.seedRebased(mcvHead, mcvHead, false)
+		ref, err := f.s.verifyPassReference(ctx, f.runRow(t), mcvHead)
+		if err != nil || ref != forgeApprovalBasisNotRequired {
+			t.Fatalf("ref = %v, %v; want not_required", ref, err)
+		}
+	})
+	t.Run("recorded pass names its merge_candidate_verified row", func(t *testing.T) {
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		f.seedRebased(mcvHead, mcvHead, false)
+		f.seedVerdict(mcvHead, mergeCandidateResultPassed)
+		ref, err := f.s.verifyPassReference(ctx, f.runRow(t), mcvHead)
+		want := map[string]any{"source": mergeCandidateSourceRecorded,
+			"merge_candidate_verified_sequence": seqOf(t, f, CategoryMergeCandidateVerified)}
+		if err != nil || !reflect.DeepEqual(ref, want) {
+			t.Fatalf("ref = %v, %v; want %v", ref, err, want)
+		}
+	})
+	t.Run("enforce-mode transfer names its transfer row", func(t *testing.T) {
+		f := transferFixture(t, MergeCandidateTransferEnforce)
+		ref, err := f.s.verifyPassReference(ctx, f.runRow(t), mcvHead)
+		want := map[string]any{"source": mergeCandidateSourceTransferred,
+			"merge_candidate_verdict_transferred_sequence": seqOf(t, f, CategoryMergeCandidateVerdictTransferred),
+			"transferred_from": mcvOtherHead, "root_head": root}
+		if err != nil || !reflect.DeepEqual(ref, want) {
+			t.Fatalf("ref = %v, %v; want %v", ref, err, want)
+		}
+	})
+	t.Run("a transfer with transfer mode off fails closed", func(t *testing.T) {
+		f := transferFixture(t, MergeCandidateTransferOff)
+		if ref, err := f.s.verifyPassReference(ctx, f.runRow(t), mcvHead); err == nil || ref != nil {
+			t.Fatalf("ref = %v, %v; want an error (a revoked transfer is never not_required)", ref, err)
+		}
+		requireRefusedWritesNothing(t, f)
+	})
+	t.Run("a classified head with no verdict fails closed", func(t *testing.T) {
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		f.seedRebased(mcvHead, mcvHead, false)
+		ref, err := f.s.verifyPassReference(ctx, f.runRow(t), mcvHead)
+		if err == nil || ref != nil || !strings.Contains(err.Error(), "not an admitted verdict") {
+			t.Fatalf("ref = %v, %v; want the not-an-admitted-verdict error", ref, err)
+		}
+		requireRefusedWritesNothing(t, f)
+	})
+	t.Run("an audit read error fails closed", func(t *testing.T) {
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		f.seedRebased(mcvHead, mcvHead, false)
+		f.seedVerdict(mcvHead, mergeCandidateResultPassed)
+		injected := errors.New("injected audit read failure")
+		f.au.listByCategoryErr = injected
+		if ref, err := f.s.verifyPassReference(ctx, f.runRow(t), mcvHead); !errors.Is(err, injected) || ref != nil {
+			t.Fatalf("ref = %v, %v; want an error wrapping %v", ref, err, injected)
+		}
+	})
+}
+
+// faGroupIDP is a per-group identity provider (#4749): ResolveMembership
+// answers from groups and records every group asked, under a mutex (#3226).
+type faGroupIDP struct {
+	fakeIdentityProvider
+	groups map[string]bool
+	mu     sync.Mutex
+	asked  []string
+}
+
+func (p *faGroupIDP) ResolveMembership(_ context.Context, group, _ string) (bool, error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.asked = append(p.asked, group)
+	return p.groups[group], nil
+}
+
+func (p *faGroupIDP) askedGroups() []string {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]string(nil), p.asked...)
+}
+
+// faInstallGroups wires a faGroupIDP answering groups as f's github provider.
+func faInstallGroups(f *mcqFixture, groups map[string]bool) *faGroupIDP {
+	idp := &faGroupIDP{groups: groups}
+	f.srv.cfg.IdentityProviders = map[string]identity.IdentityProvider{"github": idp}
+	return idp
+}
+
+// TestForgeApproval_MemberOfNegativeRefusesWithoutAuthorization pins the
+// ADR-112 fold's negative member_of control end to end (#4749): for a false
+// single-group membership and both partially-satisfied multi-group shapes the
+// fold is absent (no_qualifying_approval) with the provider CONSULTED,
+// writeMergeQueueAuthorized refuses, the delegated arm's fold step does not
+// proceed, and no merge_queue_authorized row and no merge-dispatch claim
+// exist. Counterfactuals: the fold's `if !member { continue }` and
+// forgeApprovalMemberOf's `if !ok { return false, nil }` each made a no-op
+// count the reviewer, so the fold approves and an authorization row lands,
+// RED.
+func TestForgeApproval_MemberOfNegativeRefusesWithoutAuthorization(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		esc    string
+		groups map[string]bool
+	}{
+		{"single group false", "", map[string]bool{"acme/team": false}},
+		{"multi-group team false", faEscAddGroup, map[string]bool{"acme/security": true, "acme/team": false}},
+		{"multi-group security false", faEscAddGroup, map[string]bool{"acme/security": false, "acme/team": true}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMCQFixture(t)
+			r := faSeed(t, f, faSpec(faCount1+"              member_of: acme/team\n", tc.esc),
+				mcqReviewSnapshot{Reviews: []mcqReviewNode{faUser(1, "APPROVED", faHead, "wally", 10)}})
+			f.gh.setPermission("wally", "write", "write")
+			idp := faInstallGroups(f, tc.groups)
+			ctx := context.Background()
+			d := faFold(t, f, r, faHead)
+			if d.Result != forgeApprovalAbsent || d.Reason != forgeApprovalReasonNoQualifying {
+				t.Fatalf("fold = %s/%s (%s), want absent/%s", d.Result, d.Reason, d.Detail, forgeApprovalReasonNoQualifying)
+			}
+			if len(idp.askedGroups()) == 0 {
+				t.Fatal("ResolveMembership was never consulted; the member_of predicate did not run")
+			}
+			if seq, err := f.srv.writeMergeQueueAuthorized(ctx, f.runRow(r), d, forgeApprovalAuthorization{Path: "inline"}); err == nil || seq != 0 {
+				t.Fatalf("writeMergeQueueAuthorized = %d, %v; want a refusal", seq, err)
+			}
+			if outcome, _ := f.srv.delegatedForgeApproval(ctx, f.runRow(r), faHead); outcome == mergeDispatchMerged {
+				t.Fatalf("delegated fold outcome = %v, want a non-proceeding outcome", outcome)
+			}
+			if rows, err := f.audit.ListForRunByCategory(ctx, r.id, CategoryMergeQueueAuthorized); err != nil || len(rows) != 0 {
+				t.Fatalf("merge_queue_authorized rows = %d (%v), want 0", len(rows), err)
+			}
+			var claims int
+			if err := f.pool.QueryRow(ctx, `SELECT count(*) FROM merge_dispatch_claims WHERE run_id = $1`, r.id).Scan(&claims); err != nil || claims != 0 {
+				t.Fatalf("merge-dispatch claims = %d (%v), want 0", claims, err)
+			}
+		})
 	}
 }

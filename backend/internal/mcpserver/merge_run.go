@@ -483,8 +483,10 @@ Tool errors:
     re-invoke claims again), merge_head_moved (409 — #4641: the merge was
     PINNED to the head the merge-candidate gate admitted (details.head_sha)
     and the forge refused it because the pull request head moved after it;
-    a held claim was released (the message names the re-arm if the release
-    did not land). details.refusal_basis precheck / rest_sha means
+    a held claim is released on refusal_basis precheck / rest_sha and left
+    dispatch_failed on graphql_reread, needing the operator re-arm (the
+    message names the re-arm, also when a release did not land; #4749).
+    details.refusal_basis precheck / rest_sha means
     the forge applied nothing; graphql_reread / unknown is inferred, so
     auto-merge may be armed at the pinned head; inspect the pull request.
     Re-invoke once the head settles and, on a declared approval gate, is

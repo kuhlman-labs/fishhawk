@@ -15815,8 +15815,10 @@ paths:
         forge-approval fold judged. On GitHub the auto-merge
         enable carries GraphQL `expectedHeadOid` and the clean-status REST
         fallback carries `sha`. This is a behaviour change: gate-less GitHub
-        runs are pinned too. A forge refusal for a head mismatch releases
-        the claim and answers `409 merge_head_moved`. An empty gate head (an
+        runs are pinned too. A forge refusal for a head mismatch answers
+        `409 merge_head_moved`; it releases the claim on refusal_basis
+        `precheck` / `rest_sha` and leaves it `dispatch_failed` on
+        `graphql_reread` (#4749), needing the operator re-arm. An empty gate head (an
         ungated ADR-090 D7 admit, including every GitLab-family run, or a
         merged-PR admit) keeps the unpinned ladder, and an unpinned forge
         conflict stays `502 merge_dispatch_failed`.
@@ -16193,15 +16195,20 @@ paths:
             D1), so the forge was not called again; `details` carry
             `{run_id, pr_url, verdict_sequence, claim_state, claim_path,
             claim_head_sha, claimed_at, failure_cause}`; a `dispatch_failed`
-            claim (an uncertain forge outcome) needs the operator re-arm
+            claim (an uncertain forge outcome, a `graphql_reread`
+            head-moved refusal included, #4749) needs the operator re-arm
             before a re-invoke. (15) `merge_head_moved` (#4641, ADR-112
             residual H3): the dispatch was PINNED to the head the
             merge-candidate gate admitted (GitHub auto-merge
             `expectedHeadOid`; clean-status REST fallback `sha`) and the forge
             refused it because the pull request head moved after it. The
             verdict row is recorded and durable, and the dispatch claim, when
-            one was held, is released (a release that does not land is
-            recorded `dispatch_failed` and the message names the re-arm).
+            one was held, is released on refusal_basis `precheck` /
+            `rest_sha` (a release that does not land is recorded
+            `dispatch_failed` and the message names the re-arm) and left
+            `dispatch_failed` on `graphql_reread` or an unrecognised basis
+            (#4749): a re-invoke then answers `merge_already_dispatched` until
+            the operator re-arm.
             `details` carry `{run_id, pr_url, verdict_sequence,
             head_sha, refusal_basis, next_step: "fishhawk_merge_run"}`, where
             `head_sha` is the pinned head. `refusal_basis` `precheck` (the

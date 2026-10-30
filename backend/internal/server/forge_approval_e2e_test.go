@@ -5,11 +5,13 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -27,6 +29,11 @@ import (
 var faeGateSpecYAML = strings.Replace(strings.Replace(mqeSpecYAML,
 	"              members: [\"github:alice\"]\n", "", 1),
 	"  feature_change:\n", "  feature_change:\n    operator_agent:\n      may_merge: gates_resolved_ci_green\n", 1)
+
+// faeMemberOfSpecYAML is faeGateSpecYAML whose approval gate requires
+// member_of acme/team (#4749).
+var faeMemberOfSpecYAML = strings.Replace(faeGateSpecYAML,
+	"              count: 1\n", "              count: 1\n              member_of: acme/team\n", 1)
 
 // faeUnparseableSpecYAML is admqSpecYAML plus a v0.5 review approval gate
 // with no approvers: the merge-candidate gate admits it, but the fold's spec
@@ -104,6 +111,51 @@ func TestForgeApprovalE2E_InlineWriteNonMemberMergesWithEvidenceFirst(t *testing
 	if m.inlineCalls() != 1 {
 		t.Fatalf("inline dispatches = %d, want 1", m.inlineCalls())
 	}
+	// #4749: verify_pass names the recorded h1 merge_candidate_verified row.
+	passed := w.rows(r, CategoryMergeCandidateVerified)
+	if len(passed) != 1 {
+		t.Fatalf("merge_candidate_verified rows = %d, want 1", len(passed))
+	}
+	want := map[string]any{"source": mergeCandidateSourceRecorded, "merge_candidate_verified_sequence": float64(passed[0].Sequence)}
+	if got := p["verify_pass"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("verify_pass = %v, want %v", got, want)
+	}
+}
+
+// TestForgeApprovalE2E_InlineTransferredVerdictNamesTransferRow (#4749): a
+// gated inline run whose h1 (a base-advance head) has NO recorded verdict,
+// only an enforce-mode merge_candidate_verdict_transferred row h0 -> h1, is
+// admitted by the gate's transfer-aware predicate, and merge_queue_authorized
+// records verify_pass as THAT transfer row (sequence, transferred_from,
+// root_head), never not_required.
+func TestForgeApprovalE2E_InlineTransferredVerdictNamesTransferRow(t *testing.T) {
+	w, m := newMQEWorld(t)
+	w.srv.cfg.MergeCandidateTransfer.Mode = MergeCandidateTransferEnforce
+	r := w.seed("xfer", "h1", []byte(faeGateSpecYAML))
+	w.mqeRebased(r, "pre-h1", "h1", "h1", false)
+	transfer := w.mqeAppend(r, CategoryMergeCandidateVerdictTransferred, map[string]any{
+		"from_head": "h0", "to_head": "h1", "root_head": "h0", "reason_code": transferReasonIndependent})
+	if n := len(w.rows(r, CategoryMergeCandidateVerified)); n != 0 {
+		t.Fatalf("merge_candidate_verified rows = %d, want 0 (h1 is admitted only by the transfer)", n)
+	}
+	w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusOK {
+		t.Fatalf("merge = %d %s, want 200", resp.Code, resp.Body.String())
+	}
+	auth := w.rows(r, CategoryMergeQueueAuthorized)
+	if len(auth) != 1 {
+		t.Fatalf("merge_queue_authorized rows = %d, want 1", len(auth))
+	}
+	want := map[string]any{"source": mergeCandidateSourceTransferred,
+		"merge_candidate_verdict_transferred_sequence": float64(transfer.Sequence),
+		"transferred_from": "h0", "root_head": "h0"}
+	if got := w.payload(auth[0])["verify_pass"]; !reflect.DeepEqual(got, want) {
+		t.Fatalf("verify_pass = %v, want %v (never not_required)", got, want)
+	}
+	if m.inlineCalls() != 1 {
+		t.Fatalf("inline dispatches = %d, want 1", m.inlineCalls())
+	}
 }
 
 // TestForgeApprovalE2E_InlineRefusals pins every inline non-approved shape:
@@ -117,43 +169,56 @@ func TestForgeApprovalE2E_InlineRefusals(t *testing.T) {
 		reason   string
 		nextStep string
 		noGraph  bool
+		// spec is the run's workflow spec; "" is faeGateSpecYAML.
+		spec string
 	}{
 		{"read-permission approval", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, nil, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.gh.setPermission("carol", "read", "read")
-		}, forgeApprovalAbsent, forgeApprovalReasonNoQualifying, forgeApprovalNextApprovePR, false},
+		}, forgeApprovalAbsent, forgeApprovalReasonNoQualifying, forgeApprovalNextApprovePR, false, ""},
 		{"none permission approval", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, nil, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.gh.setPermission("carol", "", "none")
-		}, forgeApprovalAbsent, forgeApprovalReasonNoQualifying, forgeApprovalNextApprovePR, false},
+		}, forgeApprovalAbsent, forgeApprovalReasonNoQualifying, forgeApprovalNextApprovePR, false, ""},
 		{"dismissed approval", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "DISMISSED", "h1"))
-		}, forgeApprovalDismissed, forgeApprovalReasonDismissed, forgeApprovalNextApprovePR, false},
+		}, forgeApprovalDismissed, forgeApprovalReasonDismissed, forgeApprovalNextApprovePR, false, ""},
 		{"write veto", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol", "dave"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "dave", "CHANGES_REQUESTED", "h1"))
-		}, forgeApprovalVetoed, forgeApprovalReasonVeto, forgeApprovalNextDismissReview, false},
+		}, forgeApprovalVetoed, forgeApprovalReasonVeto, forgeApprovalNextDismissReview, false, ""},
 		// #4764: a CHANGES_REQUESTED author whose permission read fails names
 		// dismiss_review and that reviewer, not retry_after.
 		{"unresolvable veto", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "dave", "CHANGES_REQUESTED", "h1"))
 			w.gh.set(func() { w.gh.permStatus["dave"] = http.StatusInternalServerError })
-		}, forgeApprovalUndetermined, forgeApprovalReasonVetoUndetermined, forgeApprovalNextDismissReview, false},
+		}, forgeApprovalUndetermined, forgeApprovalReasonVetoUndetermined, forgeApprovalNextDismissReview, false, ""},
 		{"snapshot transport failure", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.gh.set(func() { w.gh.graphQLFail[r.pr] = 5 })
-		}, forgeApprovalUndetermined, forgeApprovalReasonSnapshotUnreadable, forgeApprovalNextRetryAfter, false},
+		}, forgeApprovalUndetermined, forgeApprovalReasonSnapshotUnreadable, forgeApprovalNextRetryAfter, false, ""},
 		{"unparseable recorded spec", func(w *mqmWorld, r *mcqRun) {
 			w.exec(`UPDATE runs SET workflow_spec = $1 WHERE id = $2`, []byte(faeUnparseableSpecYAML), r.id)
-		}, forgeApprovalUndetermined, forgeApprovalReasonSpecUndeterminable, forgeApprovalNextRetryAfter, true},
+		}, forgeApprovalUndetermined, forgeApprovalReasonSpecUndeterminable, forgeApprovalNextRetryAfter, true, ""},
 		{"gitlab run with a declared gate", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.exec(`UPDATE runs SET installation_ref = 'gitlab:5' WHERE id = $1`, r.id)
-		}, forgeApprovalProviderUnsupported, forgeApprovalReasonForgeUnsupported, "", true},
+		}, forgeApprovalProviderUnsupported, forgeApprovalReasonForgeUnsupported, "", true, ""},
+		// ADR-112 negative member_of (#4749): a write reviewer passing every
+		// other predicate whose membership the provider answers false is not
+		// counted, so nothing is recorded.
+		{"member_of false membership", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+			w.srv.cfg.IdentityProviders = map[string]identity.IdentityProvider{"github": &fakeIdentityProvider{member: false}}
+		}, forgeApprovalAbsent, forgeApprovalReasonNoQualifying, forgeApprovalNextApprovePR, false, faeMemberOfSpecYAML},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			w, m := newMQEWorld(t)
-			r := w.faeInline("rf", faeGateSpecYAML)
+			spec := tc.spec
+			if spec == "" {
+				spec = faeGateSpecYAML
+			}
+			r := w.faeInline("rf", spec)
 			tc.plant(w, r)
 			resp := w.mergeRun(r)
 			if resp.Code != http.StatusConflict {

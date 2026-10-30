@@ -231,8 +231,12 @@ type mergeRunResponse struct {
 // forge refuses for a head mismatch (forge.ErrMergeConflict) returns 409
 // merge_head_moved naming the pinned head and its refusal_basis (precheck,
 // rest_sha, graphql_reread; only the first two are forge guarantees that
-// nothing applied): the claim is released and a re-invoke re-gates at the new
-// head. An unpinned ErrMergeConflict keeps the 502.
+// nothing applied): on precheck / rest_sha (and a bare REST 409 naming no
+// basis) the claim is released and a re-invoke re-gates at the new head; on
+// graphql_reread, or a head mismatch with an empty or unrecognised basis, the
+// claim is left dispatch_failed (#4749) and a re-invoke answers
+// merge_already_dispatched until reconciliation or the operator re-arm. An
+// unpinned ErrMergeConflict keeps the 502.
 // EVERY other error returns 502 merge_dispatch_failed stating the verdict row is
 // durable and the queue step is retryable — a genuine dispatch failure is never
 // masked as "just waiting".
@@ -785,7 +789,8 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 			settled := mergeDispatchLedgerOutcome("")
 			// Ruling R1: a checks_pending refusal or a forge 405/409/422
 			// RELEASES the claim (nothing was applied), so the re-invoke can
-			// claim again; any other outcome is uncertain: dispatch_failed.
+			// claim again; any other outcome, a graphql_reread head mismatch
+			// included (#4749), is uncertain: dispatch_failed.
 			if claimed {
 				settled = s.settleMergeDispatchClaim(r.Context(), mergeQueueDispatchLedger{s.cfg.MergeQueue}, claim, merr)
 				if settled == mergeDispatchUncertain {
@@ -1027,7 +1032,9 @@ func mergeHeadMovedBasis(err error) string {
 // mutation, and a REST 409 is GitHub's documented sha-mismatch refusal. The
 // graphql_reread basis is INFERRED from a fresh read after a GraphQL error, so
 // an auto-merge may in fact be armed at the pinned head; an unknown basis is
-// treated the same way.
+// treated the same way. Only these two bases RELEASE the D1 claim on a head
+// mismatch: graphql_reread and an empty or unrecognised basis leave it
+// dispatch_failed (mergeDispatchHeadMismatchUncertain, #4749).
 func mergeHeadMovedNothingApplied(basis string) bool {
 	return basis == githubclient.HeadMismatchPrecheck || basis == githubclient.HeadMismatchRESTSha
 }
@@ -1054,8 +1061,11 @@ func mergeHeadMovedSubject(head string, folded bool) string {
 }
 
 // writeMergeHeadMoved writes the inline 409 merge_head_moved (#4641). settled
-// is the D1 claim's settle outcome when claimed; rearm is
-// mergeDispatchRearmNote when the release did not land.
+// is the D1 claim's settle outcome when claimed, the authority for the claim
+// state the message reports; rearm is mergeDispatchRearmNote when the claim
+// was left dispatch_failed. The uncertain-basis sentence names the basis ONLY
+// when the classification itself was uncertain (#4749); a releasable refusal
+// whose release did not land is reported as exactly that.
 func (s *Server) writeMergeHeadMoved(w http.ResponseWriter, r *http.Request, runRow *run.Run, prURL string,
 	verdictSequence int64, head string, merr error, claimed bool, settled mergeDispatchLedgerOutcome, rearm string) {
 	basis, folded := mergeHeadMovedBasis(merr), forgeApprovalFolded(runRow)
@@ -1073,13 +1083,24 @@ func (s *Server) writeMergeHeadMoved(w http.ResponseWriter, r *http.Request, run
 		}
 		msg += "; if the enable had in fact applied, auto-merge may be armed at the pinned head, so inspect the pull request."
 	}
+	held := claimed && settled == mergeDispatchUncertain
 	switch {
 	case claimed && settled == mergeDispatchRelease:
 		msg += " The run's merge-dispatch claim was released."
+	case held && classifyMergeDispatchOutcome(merr) == mergeDispatchUncertain:
+		msg += " The run's merge-dispatch claim was NOT released because refusal_basis " + basis +
+			" does not prove the forge applied nothing, so it is dispatch_failed."
+	case held:
+		msg += " The run's merge-dispatch claim release did not land, so it is dispatch_failed."
 	case !claimed:
 		msg += " No merge-dispatch claim was held."
 	}
-	msg += " Re-invoke the merge once the head settles: it re-runs the merge-candidate gate"
+	if held {
+		msg += " Once the operator re-arms the claim (or reconciliation clears it), re-invoke"
+	} else {
+		msg += " Re-invoke"
+	}
+	msg += " the merge once the head settles: it re-runs the merge-candidate gate"
 	if folded {
 		msg += " and the forge-approval fold"
 	}

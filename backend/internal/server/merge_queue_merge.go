@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -72,9 +73,11 @@ const mergeDispatchPathQueue = "queue"
 // dispatch_failed; the returned claim is that existing one), and the forge
 // must then never be called. Any error is a failed claim: nothing is
 // dispatched. After a claim the forge outcome is classified ONCE
-// (classifyMergeDispatchOutcome): a RELEASE outcome (the forge applied
-// nothing) deletes the exact claim via ReleaseMergeDispatch, a compare-and-
-// swap; an UNCERTAIN one moves it to dispatch_failed (MarkMergeDispatchFailed),
+// (classifyMergeDispatchOutcome): a RELEASE outcome (the forge guarantees it
+// applied nothing: a typed refusal, and for a head mismatch only the precheck
+// and rest_sha bases) deletes the exact claim via ReleaseMergeDispatch, a
+// compare-and-swap; an UNCERTAIN one (a graphql_reread head mismatch
+// included, #4749) moves it to dispatch_failed (MarkMergeDispatchFailed),
 // never deleted, so only reconciliation or the operator re-arm clears it.
 type mergeDispatchLedger interface {
 	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (claim mergequeue.DispatchClaim, claimed bool, err error)
@@ -136,15 +139,33 @@ type mergeDispatchLedgerOutcome string
 const (
 	// mergeDispatchRelease: the forge guarantees nothing was applied (our own
 	// pre-call checks_pending refusal, a REST merge PUT 405 / 409 / 422, each a
-	// typed sentinel), so the claim is released and a later dispatch may claim
-	// again.
+	// typed sentinel, and a head mismatch only on the precheck or rest_sha
+	// basis), so the claim is released and a later dispatch may claim again.
 	mergeDispatchRelease mergeDispatchLedgerOutcome = "released"
 	// mergeDispatchUncertain: the merge may have been applied (5xx, timeout,
 	// transport error, ctx cancel, 403 that may be a rate limit, a generic
-	// GraphQL error envelope, anything else), so the claim moves to
-	// dispatch_failed.
+	// GraphQL error envelope, a head mismatch on the graphql_reread or an
+	// empty or unrecognised basis (#4749), anything else), so the claim moves
+	// to dispatch_failed.
 	mergeDispatchUncertain mergeDispatchLedgerOutcome = "dispatch_failed"
 )
+
+// mergeDispatchHeadMismatchUncertain reports whether err carries a
+// *githubclient.HeadMismatchError whose basis is not a forge guarantee that
+// nothing applied (graphql_reread, an empty or unrecognised basis): such a
+// head mismatch is UNCERTAIN (#4749). A GraphQL execution error can
+// accompany an applied mutation, and a moved head proves only that the head
+// moved, not that the enable was refused. A bare forge.ErrMergeConflict with
+// no HeadMismatchError (the REST merge PUT 409, GitHub's documented sha
+// refusal) is not a head-mismatch detail and is decided by the typed-refusal
+// case.
+func mergeDispatchHeadMismatchUncertain(err error) bool {
+	var hm *githubclient.HeadMismatchError
+	if !errors.As(err, &hm) {
+		return false
+	}
+	return !mergeHeadMovedNothingApplied(hm.Basis)
+}
 
 // classifyMergeDispatchOutcome is the ONE classification of a failed forge
 // dispatch after a claim, shared by the inline, delegated and queue paths.
@@ -153,6 +174,10 @@ func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 	case err == nil:
 		return mergeDispatchUncertain
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return mergeDispatchUncertain
+	case mergeDispatchHeadMismatchUncertain(err):
+		// Before the typed-refusal case: the head mismatch rides on
+		// ErrMergeConflict, which would otherwise release.
 		return mergeDispatchUncertain
 	case errors.Is(err, forge.ErrPullRequestUnstableStatus),
 		errors.Is(err, forge.ErrPullRequestNotMergeable),
@@ -167,7 +192,9 @@ func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 
 // categoryMergeDispatchSettled records what became of a D1 dispatch claim
 // after a failed forge dispatch, or on reconciliation: outcome released,
-// dispatch_failed or reconciled_merged, with the path, head and reason.
+// dispatch_failed or reconciled_merged, with the path, head and reason. A
+// settle whose cause carries a *githubclient.HeadMismatchError also records
+// refusal_basis, expected_head_sha and observed_head_sha (#4749).
 const categoryMergeDispatchSettled = "merge_dispatch_settled"
 
 // Reconciliation outcome on merge_dispatch_settled: a dispatch_failed claim
@@ -184,7 +211,9 @@ const mergeDispatchRecordTimeout = 10 * time.Second
 // claim) or dispatch_failed. The write runs on context.WithoutCancel(ctx) with
 // mergeDispatchRecordTimeout, then an audit row (categoryMergeDispatchSettled)
 // is appended best-effort; an uncertain outcome logs at WARN. A release that
-// did not land is reported as uncertain: the claim was not deleted.
+// did not land is reported as uncertain: the claim was not deleted. The
+// returned outcome is the ledger state the claim was LEFT in, so a caller
+// reporting the claim reads it, never a re-derived classification.
 func (s *Server) settleMergeDispatchClaim(ctx context.Context, ledger mergeDispatchLedger, claim mergequeue.DispatchClaim, cause error) mergeDispatchLedgerOutcome {
 	outcome := classifyMergeDispatchOutcome(cause)
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeDispatchRecordTimeout)
@@ -208,17 +237,39 @@ func (s *Server) settleMergeDispatchClaim(ctx context.Context, ledger mergeDispa
 			slog.String("run_id", claim.RunID.String()), slog.String("path", claim.Path),
 			slog.String("head_sha", claim.HeadSHA), slog.String("error", cause.Error()))
 	}
-	s.appendMergeDispatchSettled(wctx, claim, string(outcome), cause.Error())
+	s.appendMergeDispatchSettledRow(wctx, claim, string(outcome), cause.Error(), mergeDispatchHeadMismatchDetail(cause))
 	return outcome
+}
+
+// mergeDispatchHeadMismatchDetail is the head-movement detail a settle
+// records as separate merge_dispatch_settled keys (#4749) when cause carries
+// a *githubclient.HeadMismatchError: refusal_basis, expected_head_sha and
+// observed_head_sha (empty when the forge did not report it). nil otherwise.
+func mergeDispatchHeadMismatchDetail(cause error) map[string]any {
+	var hm *githubclient.HeadMismatchError
+	if !errors.As(cause, &hm) {
+		return nil
+	}
+	return map[string]any{
+		"refusal_basis":     hm.Basis,
+		"expected_head_sha": hm.ExpectedHeadSHA,
+		"observed_head_sha": hm.ObservedHeadSHA,
+	}
 }
 
 // appendMergeDispatchSettled appends the categoryMergeDispatchSettled row,
 // best-effort (the ledger write is the authority).
 func (s *Server) appendMergeDispatchSettled(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string) {
+	s.appendMergeDispatchSettledRow(ctx, claim, outcome, reason, nil)
+}
+
+// appendMergeDispatchSettledRow is appendMergeDispatchSettled with optional
+// extra payload keys; the base keys (outcome, path, head_sha, reason) win.
+func (s *Server) appendMergeDispatchSettledRow(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
-	if err := s.appendMergeDispatchSettledStrict(ctx, claim, outcome, reason); err != nil {
+	if err := s.appendMergeDispatchSettledPayload(ctx, claim, outcome, reason, extra); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge dispatch: the merge_dispatch_settled row did not land",
 			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
 	}
@@ -228,12 +279,21 @@ func (s *Server) appendMergeDispatchSettled(ctx context.Context, claim mergequeu
 // row and returns the append error: the ADR-093 D8 resume writes it BEFORE
 // its ledger transition and holds on a failure (fail closed, ruling R8d).
 func (s *Server) appendMergeDispatchSettledStrict(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string) error {
+	return s.appendMergeDispatchSettledPayload(ctx, claim, outcome, reason, nil)
+}
+
+// appendMergeDispatchSettledPayload is the one merge_dispatch_settled row
+// builder: the base keys plus any extra keys, returning the append error.
+func (s *Server) appendMergeDispatchSettledPayload(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) error {
 	if s.cfg.AuditRepo == nil {
 		return errors.New("merge_dispatch_settled: no audit repository is wired")
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"outcome": outcome, "path": claim.Path, "head_sha": claim.HeadSHA, "reason": reason,
-	})
+	fields := make(map[string]any, len(extra)+4)
+	for k, v := range extra {
+		fields[k] = v
+	}
+	fields["outcome"], fields["path"], fields["head_sha"], fields["reason"] = outcome, claim.Path, claim.HeadSHA, reason
+	payload, _ := json.Marshal(fields)
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
 	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:        claim.RunID,

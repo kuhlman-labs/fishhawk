@@ -190,11 +190,15 @@ type mergeCandidateVerifiedPayload struct {
 	// already treats the head as re-triggerable without consulting it.
 	VoidsSequence int64 `json:"voids_sequence,omitempty"`
 
-	// Source, TransferredFrom and RootHead are READ-side annotations
-	// newestMergeCandidateVerdict sets; they are never stored on this row.
+	// Source, TransferredFrom, RootHead and Sequence are READ-side
+	// annotations newestMergeCandidateVerdict sets; they are never stored on
+	// this row. Sequence is the chain sequence of the winning row (the
+	// merge_candidate_verified row, or the enforce-mode
+	// merge_candidate_verdict_transferred row, #4749).
 	Source          string `json:"-"`
 	TransferredFrom string `json:"-"`
 	RootHead        string `json:"-"`
+	Sequence        int64  `json:"-"`
 }
 
 // mergeCandidateOutputEvidence is the untrusted verify-output evidence one
@@ -879,6 +883,9 @@ func (s *Server) refuseMergeCandidatePassToIncapableRunner(ctx context.Context, 
 // runner pass for exactly this head) or transferred (an enforce-mode
 // merge_candidate_verdict_transferred row), in which case TransferredFrom and
 // RootHead name the prior head and the chain's recorded root.
+// VerdictSequence (#4749) is the chain sequence of the verdict row behind a
+// passed or failed state: the merge_candidate_verified row (recorded) or the
+// merge_candidate_verdict_transferred row (transferred); 0 otherwise.
 type mergeCandidateState struct {
 	State           string
 	Cause           string
@@ -886,6 +893,7 @@ type mergeCandidateState struct {
 	Source          string
 	TransferredFrom string
 	RootHead        string
+	VerdictSequence int64
 }
 
 // Verdict sources mergeCandidateState.Source reports.
@@ -946,7 +954,7 @@ func (s *Server) mergeCandidateVerifyState(ctx context.Context, runRow *run.Run,
 	}
 	if verdict != nil && (verdict.Result == mergeCandidateResultPassed || verdict.Result == mergeCandidateResultFailed) {
 		return mergeCandidateState{State: verdict.Result, Cause: cause, Source: verdict.Source,
-			TransferredFrom: verdict.TransferredFrom, RootHead: verdict.RootHead}, nil
+			TransferredFrom: verdict.TransferredFrom, RootHead: verdict.RootHead, VerdictSequence: verdict.Sequence}, nil
 	}
 	stageID, live, err := s.liveMergeCandidateTriggerForHead(ctx, runRow.ID, headSHA)
 	if err != nil {
@@ -1058,7 +1066,7 @@ func (s *Server) newestMergeCandidateVerdict(ctx context.Context, runID uuid.UUI
 		if json.Unmarshal(e.Payload, &p) != nil || p.HeadSHA != headSHA {
 			continue
 		}
-		p.Source = mergeCandidateSourceRecorded
+		p.Source, p.Sequence = mergeCandidateSourceRecorded, e.Sequence
 		newest, newestSeq = &p, e.Sequence
 	}
 	if s.mergeCandidateTransferMode() != MergeCandidateTransferEnforce {
@@ -1083,6 +1091,7 @@ func (s *Server) newestMergeCandidateVerdict(ctx context.Context, runID uuid.UUI
 		newest = &mergeCandidateVerifiedPayload{
 			HeadSHA: headSHA, Cause: mergeCandidateCauseBaseAdvance, Result: mergeCandidateResultPassed,
 			Source: mergeCandidateSourceTransferred, TransferredFrom: t.FromHead, RootHead: root,
+			Sequence: e.Sequence,
 		}
 		newestSeq = e.Sequence
 	}

@@ -108,6 +108,8 @@ A whitespace-only head is NOT read as empty. It reaches `EnableAutoMergeAtHead` 
 | `rest_sha` (`HeadMismatchRESTSha`) | the pinned PUT's 409 | yes, forge-documented |
 | `graphql_reread` (`HeadMismatchGraphQLReread`) | a GraphQL error plus a fresh GET showing a moved head | INFERRED, not guaranteed: if the mutation had in fact applied, auto-merge may be armed at the pinned head |
 
+The server's D1 merge-dispatch ledger RELEASES the run's claim only on `precheck` and `rest_sha`; `graphql_reread` (and an empty or unrecognised basis) leaves it `dispatch_failed` for reconciliation or the operator re-arm (#4749, `../mergequeue/README.md` § "Merge-dispatch ledger").
+
 Pinned by `TestEnableAutoMergeAtHead_*` and `TestQueueMerge_*` in `client_test.go`, which run over a recording fake (`pinFake`) that serves the PR GET a sequence of heads.
 
 ## Repository issue enumeration (#2230)
