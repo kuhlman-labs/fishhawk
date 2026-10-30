@@ -4,8 +4,11 @@ import (
 	"errors"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // TestTransition_FullMatrix pins every edge of the lifecycle machine.
@@ -303,4 +306,143 @@ func TestRolledUpStateReason_NamesChildRunAndConcern(t *testing.T) {
 	if RolledUpStateReason(nil) == "" || RolledUpSupersededReason(nil, "r") == "" {
 		t.Error("nil source must still yield a non-empty reason")
 	}
+}
+
+// TestNormalizeJudgement: each closed-set value reads as itself; blank and
+// anything outside the set read unlabelled (the tolerant read of the CHECK-less
+// column, E94.2 / #4693).
+func TestNormalizeJudgement(t *testing.T) {
+	for _, j := range []Judgement{
+		JudgementDefect, JudgementDefectPreExisting, JudgementNoDefect, JudgementTradeoff,
+		JudgementPreference, JudgementStale, JudgementInsufficientEvidence, JudgementUnlabelled,
+	} {
+		if got := NormalizeJudgement(string(j)); got != j {
+			t.Errorf("NormalizeJudgement(%q) = %q, want itself", j, got)
+		}
+	}
+	for _, in := range []string{"", "bogus", "Defect", " defect"} {
+		if got := NormalizeJudgement(in); got != JudgementUnlabelled {
+			t.Errorf("NormalizeJudgement(%q) = %q, want unlabelled", in, got)
+		}
+	}
+}
+
+// TestEffectiveOutcome: a duplicate reports duplicate_of:<target>; every other
+// row its stored outcome.
+func TestEffectiveOutcome(t *testing.T) {
+	target := uuid.New()
+	if got := (Concern{Outcome: OutcomeFixed, DuplicateOf: &target}).EffectiveOutcome(); got != "duplicate_of:"+target.String() {
+		t.Errorf("duplicate EffectiveOutcome = %q, want duplicate_of:%s", got, target)
+	}
+	if got := (Concern{Outcome: OutcomeFixed}).EffectiveOutcome(); got != "fixed" {
+		t.Errorf("EffectiveOutcome = %q, want fixed", got)
+	}
+	if got := (Concern{}).EffectiveOutcome(); got != "" {
+		t.Errorf("EffectiveOutcome with none recorded = %q, want empty", got)
+	}
+}
+
+// TestResolveJudgements pins every duplicate-chain mode (E94.2 / #4693,
+// ADR-117 D1). Each resolution runs in a goroutine bounded by a scaled
+// deadline, so a walk that fails to terminate fails the test instead of
+// hanging the package.
+func TestResolveJudgements(t *testing.T) {
+	mk := func(j Judgement, dup *uuid.UUID) *Concern {
+		return &Concern{ID: uuid.New(), Judgement: j, DuplicateOf: dup}
+	}
+	idp := func(c *Concern) *uuid.UUID { id := c.ID; return &id }
+	resolve := func(t *testing.T, rows []*Concern) map[uuid.UUID]EffectiveJudgement {
+		t.Helper()
+		done := make(chan map[uuid.UUID]EffectiveJudgement, 1)
+		go func() { done <- ResolveJudgements(rows) }()
+		select {
+		case got := <-done:
+			return got
+		case <-time.After(timescale.D(2 * time.Second)):
+			t.Fatal("ResolveJudgements did not return: the duplicate walk failed to terminate")
+			return nil
+		}
+	}
+	type want struct {
+		j    Judgement
+		from *uuid.UUID
+	}
+	check := func(t *testing.T, got map[uuid.UUID]EffectiveJudgement, c *Concern, w want) {
+		t.Helper()
+		e, ok := got[c.ID]
+		if !ok {
+			t.Fatalf("row %s missing from the resolution", c.ID)
+		}
+		if e.Judgement != w.j {
+			t.Errorf("judgement = %q, want %q", e.Judgement, w.j)
+		}
+		switch {
+		case w.from == nil && e.InheritedFrom != nil:
+			t.Errorf("inherited_from = %s, want nil", e.InheritedFrom)
+		case w.from != nil && (e.InheritedFrom == nil || *e.InheritedFrom != *w.from):
+			t.Errorf("inherited_from = %v, want %s", e.InheritedFrom, w.from)
+		}
+	}
+
+	t.Run("non-duplicate reads its own normalized judgement", func(t *testing.T) {
+		a, blank := mk(JudgementPreference, nil), mk("", nil)
+		got := resolve(t, []*Concern{a, blank})
+		check(t, got, a, want{j: JudgementPreference})
+		check(t, got, blank, want{j: JudgementUnlabelled})
+	})
+	t.Run("direct duplicate inherits its root", func(t *testing.T) {
+		root := mk(JudgementDefect, nil)
+		dup := mk(JudgementNoDefect, idp(root))
+		got := resolve(t, []*Concern{root, dup})
+		check(t, got, dup, want{j: JudgementDefect, from: idp(root)})
+		check(t, got, root, want{j: JudgementDefect})
+	})
+	t.Run("chain A<-B<-C inherits from A", func(t *testing.T) {
+		a := mk(JudgementStale, nil)
+		b := mk(JudgementNoDefect, idp(a))
+		c := mk(JudgementNoDefect, idp(b))
+		got := resolve(t, []*Concern{c, b, a})
+		check(t, got, c, want{j: JudgementStale, from: idp(a)})
+		check(t, got, b, want{j: JudgementStale, from: idp(a)})
+	})
+	t.Run("chain ending at an unlabelled root", func(t *testing.T) {
+		root := mk(JudgementUnlabelled, nil)
+		dup := mk(JudgementDefect, idp(root))
+		check(t, resolve(t, []*Concern{root, dup}), dup, want{j: JudgementUnlabelled, from: idp(root)})
+	})
+	t.Run("root with a blank stored judgement", func(t *testing.T) {
+		root := mk("", nil)
+		dup := mk(JudgementDefect, idp(root))
+		check(t, resolve(t, []*Concern{root, dup}), dup, want{j: JudgementUnlabelled, from: idp(root)})
+	})
+	t.Run("dangling target reads unlabelled", func(t *testing.T) {
+		missing := uuid.New()
+		dup := mk(JudgementDefect, &missing)
+		check(t, resolve(t, []*Concern{dup}), dup, want{j: JudgementUnlabelled})
+	})
+	t.Run("two-node cycle reads unlabelled", func(t *testing.T) {
+		a, b := mk(JudgementDefect, nil), mk(JudgementDefect, nil)
+		a.DuplicateOf, b.DuplicateOf = idp(b), idp(a)
+		got := resolve(t, []*Concern{a, b})
+		check(t, got, a, want{j: JudgementUnlabelled})
+		check(t, got, b, want{j: JudgementUnlabelled})
+	})
+	t.Run("self-link reads unlabelled", func(t *testing.T) {
+		a := mk(JudgementDefect, nil)
+		a.DuplicateOf = idp(a)
+		check(t, resolve(t, []*Concern{a}), a, want{j: JudgementUnlabelled})
+	})
+	t.Run("a chain into a cycle reads unlabelled", func(t *testing.T) {
+		a, b := mk(JudgementDefect, nil), mk(JudgementDefect, nil)
+		a.DuplicateOf, b.DuplicateOf = idp(b), idp(a)
+		tail := mk(JudgementDefect, idp(a))
+		check(t, resolve(t, []*Concern{tail, a, b}), tail, want{j: JudgementUnlabelled})
+	})
+	t.Run("nil rows are skipped", func(t *testing.T) {
+		a := mk(JudgementDefect, nil)
+		got := resolve(t, []*Concern{nil, a})
+		if len(got) != 1 {
+			t.Errorf("resolutions = %d, want 1", len(got))
+		}
+	})
 }

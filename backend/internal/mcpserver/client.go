@@ -1263,6 +1263,18 @@ type GateViewConcern struct {
 	// byte-match rule as the fields above.
 	Disputed bool              `json:"disputed"`
 	Disputes []gateViewDispute `json:"disputes,omitempty"`
+	// Outcome + judgement mirror the server's concernJudgementView (E94.2 /
+	// #4693, ADR-117 D1). Same byte-match requirement: a client tag that does
+	// not spell the server's key silently decodes to the zero value.
+	Outcome                string `json:"outcome,omitempty" jsonschema:"the concern's recorded outcome: fixed, waived, deferred, carried, open_at_merge, or duplicate_of:<concern id> for a duplicate; absent when none is recorded"`
+	Judgement              string `json:"judgement" jsonschema:"the human judgement: defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence or unlabelled. A never-judged concern reads unlabelled; a duplicate reads its chain root's judgement"`
+	JudgementInheritedFrom string `json:"judgement_inherited_from,omitempty" jsonschema:"for a duplicate, the id of the chain-root concern whose judgement it reports; absent otherwise"`
+	DuplicateOf            string `json:"duplicate_of,omitempty" jsonschema:"the id of the earlier same-run concern this one duplicates; absent otherwise"`
+	JudgementActorKind     string `json:"judgement_actor_kind,omitempty" jsonschema:"who recorded the judgement; absent when nobody has"`
+	JudgementDelegated     bool   `json:"judgement_delegated,omitempty" jsonschema:"true when the judgement was recorded under a delegation"`
+	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true when the judgement was recorded by a bulk verb"`
+	JudgementBackfill      bool   `json:"judgement_backfill,omitempty" jsonschema:"true when the judgement was recorded after the fact"`
+	TradeoffCost           string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement; absent otherwise"`
 }
 
 // gateViewDispute is one refused `confirmed` resolution: why the confirmation
@@ -1320,6 +1332,18 @@ type GateViewSettledConcern struct {
 	// ResolutionBasis mirrors the server's gateViewSettledConcern
 	// resolution_basis (#4086). Same byte-match requirement.
 	ResolutionBasis string `json:"resolution_basis,omitempty" jsonschema:"operator_evidence when a human operator resolved this addressed concern with fishhawk_resolve_concerns (distinct from waived); absent for a reviewer-confirmed addressed concern and every other settled state"`
+	// Outcome + judgement mirror the server's concernJudgementView (E94.2 /
+	// #4693, ADR-117 D1). Same byte-match requirement: a client tag that does
+	// not spell the server's key silently decodes to the zero value.
+	Outcome                string `json:"outcome,omitempty" jsonschema:"the concern's recorded outcome: fixed, waived, deferred, carried, open_at_merge, or duplicate_of:<concern id> for a duplicate; absent when none is recorded"`
+	Judgement              string `json:"judgement" jsonschema:"the human judgement: defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence or unlabelled. A never-judged concern reads unlabelled; a duplicate reads its chain root's judgement"`
+	JudgementInheritedFrom string `json:"judgement_inherited_from,omitempty" jsonschema:"for a duplicate, the id of the chain-root concern whose judgement it reports; absent otherwise"`
+	DuplicateOf            string `json:"duplicate_of,omitempty" jsonschema:"the id of the earlier same-run concern this one duplicates; absent otherwise"`
+	JudgementActorKind     string `json:"judgement_actor_kind,omitempty" jsonschema:"who recorded the judgement; absent when nobody has"`
+	JudgementDelegated     bool   `json:"judgement_delegated,omitempty" jsonschema:"true when the judgement was recorded under a delegation"`
+	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true when the judgement was recorded by a bulk verb"`
+	JudgementBackfill      bool   `json:"judgement_backfill,omitempty" jsonschema:"true when the judgement was recorded after the fact"`
+	TradeoffCost           string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement; absent otherwise"`
 }
 
 // GateViewSuppressedRelitig is one suppressed relitigation (#1913).

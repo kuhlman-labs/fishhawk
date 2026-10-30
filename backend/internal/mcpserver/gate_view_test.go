@@ -1670,3 +1670,78 @@ func TestGetMergeQueue_OlderBackendEjectionsRenderEmpty(t *testing.T) {
 		t.Errorf("tool output = %s, want ejections []", raw)
 	}
 }
+
+// TestGetGateView_OutcomeJudgementWireDecode pins the outcome + judgement keys
+// (E94.2 / #4693, ADR-117 D1) across the server -> MCP seam. The backend body
+// is RAW JSON spelled with the server's exact concernJudgementView keys, so a
+// client json tag that misspells one decodes to the zero value and fails here
+// instead of self-cancelling against a client-built fixture.
+func TestGetGateView_OutcomeJudgementWireDecode(t *testing.T) {
+	runID := uuid.New()
+	root, dup := uuid.New().String(), uuid.New().String()
+
+	var body any
+	if err := json.Unmarshal([]byte(`{
+	  "run_id": "`+runID.String()+`",
+	  "open": [{
+	    "id": "`+uuid.New().String()+`",
+	    "stage_kind": "implement",
+	    "severity": "high",
+	    "category": "correctness",
+	    "state": "raised",
+	    "note": "open duplicate",
+	    "has_suggested_patch": false,
+	    "outcome": "duplicate_of:`+root+`",
+	    "judgement": "defect",
+	    "judgement_inherited_from": "`+root+`",
+	    "duplicate_of": "`+root+`"
+	  }],
+	  "settled": [{
+	    "id": "`+dup+`",
+	    "stage_kind": "implement",
+	    "state": "waived",
+	    "severity": "medium",
+	    "category": "scope",
+	    "note": "settled row",
+	    "outcome": "fixed",
+	    "judgement": "tradeoff",
+	    "judgement_actor_kind": "user",
+	    "judgement_delegated": true,
+	    "judgement_bulk": true,
+	    "judgement_backfill": true,
+	    "tradeoff_cost": "slower cold start"
+	  }],
+	  "suppressed_relitigations": [],
+	  "history_incomplete": false
+	}`), &body); err != nil {
+		t.Fatalf("build backend body: %v", err)
+	}
+	srv, _ := newGateViewBackend(t, http.StatusOK, body)
+
+	res := callGateView(t, srv, map[string]any{"run_id": runID.String()})
+	if res.IsError {
+		t.Fatalf("tool error: %+v", res.Content)
+	}
+	raw, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var out GetGateViewOutput
+	if err := json.Unmarshal(raw, &out); err != nil {
+		t.Fatalf("decode tool output: %v\n%s", err, raw)
+	}
+	if len(out.GateView.Open) != 1 || len(out.GateView.Settled) != 1 {
+		t.Fatalf("open=%d settled=%d, want 1 each", len(out.GateView.Open), len(out.GateView.Settled))
+	}
+	o := out.GateView.Open[0]
+	if o.Outcome != "duplicate_of:"+root || o.Judgement != "defect" || o.JudgementInheritedFrom != root || o.DuplicateOf != root {
+		t.Errorf("open concern outcome/judgement/inherited/duplicate = %q %q %q %q, want duplicate_of:%s defect %s %s",
+			o.Outcome, o.Judgement, o.JudgementInheritedFrom, o.DuplicateOf, root, root, root)
+	}
+	st := out.GateView.Settled[0]
+	if st.Outcome != "fixed" || st.Judgement != "tradeoff" || st.JudgementActorKind != "user" ||
+		!st.JudgementDelegated || !st.JudgementBulk || !st.JudgementBackfill || st.TradeoffCost != "slower cold start" {
+		t.Errorf("settled concern = outcome %q judgement %q actor %q delegated %v bulk %v backfill %v cost %q, want fixed tradeoff user true true true %q",
+			st.Outcome, st.Judgement, st.JudgementActorKind, st.JudgementDelegated, st.JudgementBulk, st.JudgementBackfill, st.TradeoffCost, "slower cold start")
+	}
+}

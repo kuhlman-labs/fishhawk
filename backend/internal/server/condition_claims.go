@@ -321,7 +321,9 @@ func (s *Server) resolveConditionClaimedPlanConcerns(ctx context.Context, runID 
 			warn(raw, "append concern_addressed_by_condition entry failed: "+aerr.Error())
 			continue
 		}
-		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, concern.StateAddressedByCondition, reason); aerr != nil {
+		// A system writer's close (E94.2 / #4693, ADR-117 D1): outcome fixed,
+		// no judgement column touched.
+		if _, aerr := s.cfg.ConcernRepo.ApplyDisposition(ctx, cid, concern.StateAddressedByCondition, reason, concern.Disposition{Outcome: concern.OutcomeFixed}); aerr != nil {
 			// InvalidTransitionError (e.g. a reopen that raced this hook) lands
 			// here — warn-skip, never wedge the review loop.
 			warn(raw, "apply resolution failed: "+aerr.Error())

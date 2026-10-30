@@ -88,6 +88,13 @@ type ReviewConcern struct {
 	CheckKey             string             `json:"check_key"`
 	Outcome              string             `json:"outcome"`
 	RolledUpFrom         *uuid.UUID         `json:"rolled_up_from"`
+	Judgement            string             `json:"judgement"`
+	JudgementActorKind   string             `json:"judgement_actor_kind"`
+	JudgementDelegated   bool               `json:"judgement_delegated"`
+	JudgementBulk        bool               `json:"judgement_bulk"`
+	JudgementBackfill    bool               `json:"judgement_backfill"`
+	TradeoffCost         string             `json:"tradeoff_cost"`
+	DuplicateOf          *uuid.UUID         `json:"duplicate_of"`
 }
 
 type Run struct {
