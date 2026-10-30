@@ -149,6 +149,34 @@ func (r *postgresRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to St
 	return r.transition(ctx, current[0], to, reason, &outcome)
 }
 
+func (r *postgresRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d HumanDisposition) (*Concern, error) {
+	if err := d.Validate(); err != nil {
+		return nil, fmt.Errorf("concern: apply human disposition %s: %w", id, err)
+	}
+	current, err := r.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	c := current[0]
+	if err := Transition(c.State, to); err != nil {
+		return nil, err
+	}
+	q := concerndb.New(r.pool)
+	row, err := q.UpdateReviewConcernStateJudged(ctx, concerndb.UpdateReviewConcernStateJudgedParams{
+		ID:                 c.ID,
+		State:              string(to),
+		StateReason:        reason,
+		Outcome:            string(d.Outcome),
+		Judgement:          string(d.Judgement),
+		JudgementActorKind: d.ActorKind,
+		JudgementDelegated: d.Delegated,
+		JudgementBulk:      d.JudgementBulk,
+		TradeoffCost:       d.TradeoffCost,
+		FromState:          string(c.State),
+	})
+	return transitionResult(c, row, err)
+}
+
 // transition validates the lifecycle edge against the Go state machine
 // and applies it with a from-state guard so a concurrent writer cannot
 // race past the validation (the guarded UPDATE matching zero rows means
@@ -156,7 +184,8 @@ func (r *postgresRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to St
 // applied). A non-nil outcome is recorded in the same UPDATE; a nil one
 // leaves the outcome alone except that a move back into an open state clears
 // a stale OutcomeFixed (UpdateReviewConcernState). No judgement column is
-// ever written here.
+// ever written here: the human verbs' judged transition is
+// ApplyHumanDisposition (UpdateReviewConcernStateJudged).
 func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, reason string, outcome *string) (*Concern, error) {
 	if err := Transition(c.State, to); err != nil {
 		return nil, err
@@ -169,6 +198,13 @@ func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, rea
 		Outcome:     outcome,
 		FromState:   string(c.State),
 	})
+	return transitionResult(c, row, err)
+}
+
+// transitionResult maps a from-state-guarded UPDATE's result: zero rows means
+// the state moved underneath the caller (surfaced as an error, never silently
+// applied).
+func transitionResult(c *Concern, row concerndb.ReviewConcern, err error) (*Concern, error) {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("concern: %s state changed concurrently (was %s)", c.ID, c.State)
 	}

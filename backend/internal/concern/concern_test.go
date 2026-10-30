@@ -446,3 +446,175 @@ func TestResolveJudgements(t *testing.T) {
 		}
 	})
 }
+
+// TestHumanJudgements pins the human set: the closed vocabulary minus
+// unlabelled, and a fresh slice per call.
+func TestHumanJudgements(t *testing.T) {
+	got := HumanJudgements()
+	want := []Judgement{JudgementDefect, JudgementDefectPreExisting, JudgementNoDefect, JudgementTradeoff,
+		JudgementPreference, JudgementStale, JudgementInsufficientEvidence}
+	if len(got) != len(want) {
+		t.Fatalf("HumanJudgements() = %v, want %v", got, want)
+	}
+	for i := range want {
+		if got[i] != want[i] {
+			t.Errorf("HumanJudgements()[%d] = %q, want %q", i, got[i], want[i])
+		}
+	}
+	got[0] = "mutated"
+	if HumanJudgements()[0] != JudgementDefect {
+		t.Error("HumanJudgements returned a shared slice")
+	}
+}
+
+// TestJudgementFromReasonPrefix pins the three interim prefixes (FO ruling
+// D1): exact, lowercase, after leading whitespace only.
+func TestJudgementFromReasonPrefix(t *testing.T) {
+	for _, tc := range []struct {
+		reason string
+		want   Judgement
+		ok     bool
+	}{
+		{"false_positive: the guard exists", JudgementNoDefect, true},
+		{"  \n\taccepted_tradeoff: slower", JudgementTradeoff, true},
+		{"preference: naming", JudgementPreference, true},
+		{"False_Positive: upper case", "", false},
+		{"false_positive no colon", "", false},
+		{"see false_positive: mid-string", "", false},
+		{"", "", false},
+	} {
+		got, ok := JudgementFromReasonPrefix(tc.reason)
+		if got != tc.want || ok != tc.ok {
+			t.Errorf("JudgementFromReasonPrefix(%q) = %q, %v; want %q, %v", tc.reason, got, ok, tc.want, tc.ok)
+		}
+	}
+}
+
+// TestResolveHumanJudgement is the validator table (E94.7 / #4840): one row
+// per refusal rule and one per FO ruling D1 rule (a)-(d). CF6 (the tradeoff
+// rule) and CF9 (the prefix-conflict check) are declared against it.
+func TestResolveHumanJudgement(t *testing.T) {
+	for _, tc := range []struct {
+		name                       string
+		judgement, cost, prefixSrc string
+		want                       Judgement
+		wantRule, wantField        string
+		wantPrefix                 string
+		wantMsg                    []string
+	}{
+		{name: "required", wantRule: JudgementRuleRequired, wantField: "judgement"},
+		{name: "required with an unprefixed reason", prefixSrc: "looks fine", wantRule: JudgementRuleRequired, wantField: "judgement"},
+		{name: "unknown case variant", judgement: "No_Defect", wantRule: JudgementRuleUnknown, wantField: "judgement"},
+		{name: "unknown bogus", judgement: "bogus", wantRule: JudgementRuleUnknown, wantField: "judgement"},
+		{name: "unknown beats a prefix conflict", judgement: "bogus", prefixSrc: "false_positive: x", wantRule: JudgementRuleUnknown, wantField: "judgement"},
+		{name: "unlabelled", judgement: "unlabelled", wantRule: JudgementRuleUnlabelled, wantField: "judgement"},
+		{name: "tradeoff blank cost", judgement: "tradeoff", wantRule: JudgementRuleTradeoffCostRequired, wantField: "tradeoff_cost"},
+		{name: "tradeoff whitespace cost", judgement: "tradeoff", cost: " \t", wantRule: JudgementRuleTradeoffCostRequired, wantField: "tradeoff_cost"},
+		{name: "prefix-derived tradeoff blank cost", prefixSrc: "accepted_tradeoff: slower", wantRule: JudgementRuleTradeoffCostRequired, wantField: "tradeoff_cost"},
+		{name: "cost without tradeoff", judgement: "defect", cost: "c", wantRule: JudgementRuleTradeoffCostWithoutTradeoff, wantField: "tradeoff_cost"},
+		{name: "tradeoff with cost", judgement: "tradeoff", cost: "slower", want: JudgementTradeoff},
+		{name: "(a) explicit + matching prefix", judgement: "no_defect", prefixSrc: "false_positive: the guard exists", want: JudgementNoDefect},
+		{name: "(b) explicit + no prefix", judgement: "defect", prefixSrc: "real but minor", want: JudgementDefect},
+		{name: "(b) explicit, no prefix source", judgement: "stale", want: JudgementStale},
+		{name: "(c) false_positive: alone", prefixSrc: "false_positive: the guard exists", want: JudgementNoDefect},
+		{name: "(c) accepted_tradeoff: alone", prefixSrc: "accepted_tradeoff: slower", cost: "slower", want: JudgementTradeoff},
+		{name: "(c) preference: alone", prefixSrc: "preference: naming", want: JudgementPreference},
+		{
+			name: "(d) explicit contradicts prefix", judgement: "defect", prefixSrc: "false_positive: the guard exists",
+			wantRule: JudgementRuleConflictsReasonPrefix, wantField: "judgement", wantPrefix: "false_positive:",
+			wantMsg: []string{`"defect"`, `"false_positive:"`, `"no_defect"`},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := ResolveHumanJudgement(tc.judgement, tc.cost, tc.prefixSrc)
+			if tc.wantRule == "" {
+				if err != nil || got != tc.want {
+					t.Fatalf("ResolveHumanJudgement = %q, %v; want %q, nil", got, err, tc.want)
+				}
+				return
+			}
+			var je JudgementError
+			if !errors.As(err, &je) {
+				t.Fatalf("ResolveHumanJudgement = %q, %v; want a JudgementError rule %s", got, err, tc.wantRule)
+			}
+			if got != "" || je.Rule != tc.wantRule || je.Field != tc.wantField || je.Prefix != tc.wantPrefix {
+				t.Errorf("got %q, JudgementError{Field %q Rule %q Prefix %q}; want \"\", {%q %q %q}",
+					got, je.Field, je.Rule, je.Prefix, tc.wantField, tc.wantRule, tc.wantPrefix)
+			}
+			for _, sub := range tc.wantMsg {
+				if !strings.Contains(je.Message, sub) {
+					t.Errorf("message %q does not name %s", je.Message, sub)
+				}
+			}
+		})
+	}
+}
+
+// TestResolveHumanJudgement_RefusesTradeoffCostWithoutTradeoff pins the
+// INFERRED rule tradeoff_cost_without_tradeoff (approval condition T1): a cost
+// sent with any judgement other than tradeoff is refused rather than silently
+// dropped — explicit, prefix-derived and on the store's Validate alike.
+func TestResolveHumanJudgement_RefusesTradeoffCostWithoutTradeoff(t *testing.T) {
+	for _, tc := range []struct{ judgement, prefixSrc string }{
+		{"defect", ""},
+		{"no_defect", ""},
+		{"", "preference: naming"},
+	} {
+		_, err := ResolveHumanJudgement(tc.judgement, "a stated cost", tc.prefixSrc)
+		var je JudgementError
+		if !errors.As(err, &je) || je.Rule != JudgementRuleTradeoffCostWithoutTradeoff || je.Field != "tradeoff_cost" {
+			t.Errorf("ResolveHumanJudgement(%q, cost, %q) err = %v, want rule %s on tradeoff_cost",
+				tc.judgement, tc.prefixSrc, err, JudgementRuleTradeoffCostWithoutTradeoff)
+		}
+	}
+	err := HumanDisposition{Outcome: OutcomeWaived, Judgement: JudgementDefect, ActorKind: "user", TradeoffCost: "c"}.Validate()
+	var je JudgementError
+	if !errors.As(err, &je) || je.Rule != JudgementRuleTradeoffCostWithoutTradeoff {
+		t.Errorf("Validate with a cost on defect = %v, want rule %s", err, JudgementRuleTradeoffCostWithoutTradeoff)
+	}
+}
+
+// TestHumanDispositionValidate pins every refusal of the store-side guard
+// (E94.7 / #4840) and the three accepted outcomes.
+func TestHumanDispositionValidate(t *testing.T) {
+	ok := HumanDisposition{Outcome: OutcomeWaived, Judgement: JudgementNoDefect, ActorKind: "user"}
+	for _, o := range []Outcome{OutcomeWaived, OutcomeFixed, OutcomeDeferred} {
+		d := ok
+		d.Outcome = o
+		if err := d.Validate(); err != nil {
+			t.Errorf("Validate(outcome %s) = %v, want nil", o, err)
+		}
+	}
+	if err := (HumanDisposition{Outcome: OutcomeWaived, Judgement: JudgementTradeoff, ActorKind: "agent", TradeoffCost: "c"}).Validate(); err != nil {
+		t.Errorf("Validate(tradeoff with cost) = %v, want nil", err)
+	}
+	for _, tc := range []struct {
+		name     string
+		mutate   func(*HumanDisposition)
+		wantRule string // "" = a plain error, not a JudgementError
+	}{
+		{"outcome carried", func(d *HumanDisposition) { d.Outcome = OutcomeCarried }, ""},
+		{"outcome blank", func(d *HumanDisposition) { d.Outcome = "" }, ""},
+		{"actor kind blank", func(d *HumanDisposition) { d.ActorKind = " " }, ""},
+		{"judgement blank", func(d *HumanDisposition) { d.Judgement = "" }, JudgementRuleRequired},
+		{"judgement unlabelled", func(d *HumanDisposition) { d.Judgement = JudgementUnlabelled }, JudgementRuleUnlabelled},
+		{"judgement unknown", func(d *HumanDisposition) { d.Judgement = "bogus" }, JudgementRuleUnknown},
+		{"tradeoff without cost", func(d *HumanDisposition) { d.Judgement = JudgementTradeoff }, JudgementRuleTradeoffCostRequired},
+	} {
+		d := ok
+		tc.mutate(&d)
+		err := d.Validate()
+		if err == nil {
+			t.Errorf("%s: Validate = nil, want a refusal", tc.name)
+			continue
+		}
+		var je JudgementError
+		isJE := errors.As(err, &je)
+		if tc.wantRule == "" && isJE {
+			t.Errorf("%s: Validate = JudgementError %s, want a plain error", tc.name, je.Rule)
+		}
+		if tc.wantRule != "" && (!isJE || je.Rule != tc.wantRule) {
+			t.Errorf("%s: Validate = %v, want JudgementError rule %s", tc.name, err, tc.wantRule)
+		}
+	}
+}
