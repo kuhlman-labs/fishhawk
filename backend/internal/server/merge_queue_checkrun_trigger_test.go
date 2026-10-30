@@ -506,6 +506,88 @@ func TestCheckRunTrigger_BoundedState(t *testing.T) {
 	})
 }
 
+// TestCheckRunTrigger_ShutdownStartsNoScheduledFollowUp (concern 548f1a65):
+// a follow-up scheduled inside the interval, through the production spawn
+// (spawnMergeQueueYieldProbe), whose timer fires after Server.Shutdown
+// returned, or while Shutdown is draining another tracked admission, starts
+// no probe. bgMergeQueuePump is waited after the fire, so a probe the spawn
+// registered would run and be counted. Counterfactual: dropping the
+// spawn's closed check starts the follow-up probe in both rows, RED.
+func TestCheckRunTrigger_ShutdownStartsNoScheduledFollowUp(t *testing.T) {
+	for _, duringDrain := range []bool{false, true} {
+		name := "timer fires after Shutdown returned"
+		if duringDrain {
+			name = "timer fires during the drain"
+		}
+		t.Run(name, func(t *testing.T) {
+			w := newCtrWorld(t, nil, func(id uuid.UUID) mergequeue.Entry { return ctrYielded(id, "h1") })
+			interval := timescale.D(time.Minute)
+			c := newCtrCoalescer(interval)
+			fire := func(id int64) checkRunTriggerResult {
+				return c.tr.fire(w.run.ID, id, c.probe, w.srv.spawnMergeQueueYieldProbe)
+			}
+			if got := fire(1); got != checkRunTriggerProbed {
+				t.Fatalf("first trigger = %s, want probed", got)
+			}
+			w.srv.bgMergeQueuePump.Wait()
+			c.clock.advance(interval / 4)
+			if got := fire(2); got != checkRunTriggerCoalesced {
+				t.Fatalf("trigger inside the interval = %s, want coalesced", got)
+			}
+			timers := c.clock.armed()
+			if len(timers) != 1 {
+				t.Fatalf("armed follow-ups = %d, want 1", len(timers))
+			}
+			c.clock.advance(timers[0].d)
+
+			if !duringDrain {
+				if err := w.srv.Shutdown(context.Background()); err != nil {
+					t.Fatalf("Shutdown: %v", err)
+				}
+				timers[0].f()
+			} else {
+				release := make(chan struct{})
+				w.srv.bgMergeQueuePump.Add(1) // a tracked admission holds the drain open
+				go func() {
+					defer w.srv.bgMergeQueuePump.Done()
+					<-release
+				}()
+				done := make(chan error, 1)
+				go func() { done <- w.srv.Shutdown(context.Background()) }()
+				deadline := time.Now().Add(timescale.D(5 * time.Second))
+				for !w.srv.yieldProbeSpawnClosedForTest() {
+					if time.Now().After(deadline) {
+						t.Fatal("Shutdown did not reach its drain within the bound")
+					}
+					time.Sleep(time.Millisecond)
+				}
+				timers[0].f()
+				select {
+				case err := <-done:
+					t.Fatalf("Shutdown returned (%v) before the tracked admission was released; the fire did not land during the drain", err)
+				default:
+				}
+				close(release)
+				if err := <-done; err != nil {
+					t.Fatalf("Shutdown: %v", err)
+				}
+			}
+			w.srv.bgMergeQueuePump.Wait()
+			if n := c.probes(); n != 1 {
+				t.Fatalf("probes = %d, want 1 (the follow-up started no probe once Shutdown closed the spawn)", n)
+			}
+		})
+	}
+}
+
+// yieldProbeSpawnClosedForTest reports whether Shutdown has closed the
+// check_run yield re-probe spawn.
+func (s *Server) yieldProbeSpawnClosedForTest() bool {
+	s.yieldProbeSpawnMu.Lock()
+	defer s.yieldProbeSpawnMu.Unlock()
+	return s.yieldProbeSpawnClosed
+}
+
 // TestWebhook_CheckRunRoutesToYieldTrigger drives the real webhook handler
 // with a signed check_run delivery: a required check completing at the
 // yielded entry's anchored head runs the re-probe (the queue's second read

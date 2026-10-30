@@ -1304,6 +1304,13 @@ type Server struct {
 	// the loop claimed before SIGTERM finishes inside the drain window rather
 	// than being cut at process exit.
 	bgMergeQueuePump sync.WaitGroup
+	// yieldProbeSpawnMu guards yieldProbeSpawnClosed, which Shutdown sets
+	// before it drains bgMergeQueuePump: spawnMergeQueueYieldProbe adds to
+	// the group only under the lock and only while it is unset, so a check_run
+	// follow-up timer firing during or after the drain starts nothing the
+	// drain would not wait for (docs/adr/112 A3.8, concern 548f1a65).
+	yieldProbeSpawnMu     sync.Mutex
+	yieldProbeSpawnClosed bool
 	// mergeQueueBootAt mirrors Config.MergeQueueBootAt (ADR-093 D8).
 	mergeQueueBootAt time.Time
 	// mergeInFlight is the per-Server, process-local registry of runs whose
@@ -1721,11 +1728,17 @@ func (s *Server) Start() error {
 // merge-candidate queue pump with any admission it is running
 // (bgMergeQueuePump, #4303) to finish, bounded by the same shutdown context
 // so a hung reviewer or a wedged forge can't block shutdown past the
-// deadline.
+// deadline. Before the drain it closes the check_run yield re-probe spawn
+// (yieldProbeSpawnClosed), so a follow-up timer that fires during or after
+// the drain starts no probe.
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(shutdownCtx)
+
+	s.yieldProbeSpawnMu.Lock()
+	s.yieldProbeSpawnClosed = true
+	s.yieldProbeSpawnMu.Unlock()
 
 	// Drain in-flight detached reviews and grooming applies, bounded by
 	// the shutdown context. A WaitGroup can't be select-ed on directly,

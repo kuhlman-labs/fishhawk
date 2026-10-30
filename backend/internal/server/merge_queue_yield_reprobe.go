@@ -28,7 +28,9 @@ package server
 //
 // A re-probe judges the row with no store transaction open, in the order of
 // docs/adr/112 Amendment A3.4 (#4780): (1) GATE-INDEPENDENT PR-head
-// discovery: the PR is read (merged, closed or a read error → nothing) and a
+// discovery: the PR is read (merged, closed, a read error, or no GitHub
+// client, installation or tracked PR to read it → nothing; a hard
+// precondition, so such a yield never clears automatically) and a
 // moved head re-anchors the row with ReanchorYielded (CAS on head and
 // yield_revision), KEEPING the marker, yielded_at, the approval anchor, the
 // row-4 flag and the budget (approval condition C2, A3.7: a head move never
@@ -456,7 +458,13 @@ func (s *Server) reprobeMergeQueueYield(ctx context.Context, e mergequeue.Entry,
 	}
 
 	// (1) A3.4: gate-independent PR-head discovery. A gate-less fold is
-	// approved without reading the PR, so the head is read here.
+	// approved without reading the PR, so the head is read here. The read is
+	// a HARD precondition: no GitHub client, no installation, no tracked PR
+	// or a read error → nothing, so such a yield clears only once the read
+	// succeeds. Clearing it unread would only re-admit an entry merge-on-pass
+	// itself holds transient on the same missing installation
+	// (mergeQueueMergeOnPass), and the fold and the checks leg read the same
+	// forge.
 	pr, err := s.mergeQueueReentryReadPR(ctx, runRow)
 	if err != nil {
 		log("merge queue: the yield re-probe could not read the pull request; the next tick retries", err)
@@ -538,7 +546,9 @@ func (s *Server) reprobeMergeQueueYield(ctx context.Context, e mergequeue.Entry,
 //  2. merge-gate: a retryable merge-gate leg (mergeGateYieldFor over
 //     mergeGateLegsOf(elig): merge_checks_red > merge_checks_pending >
 //     merge_review_pending);
-//  3. row-4: e.Row4Flag is set and force is false, and a FRESH review
+//  3. row-4: e.Row4Flag is set (or the stored reason is
+//     forge_review_required: a marker a pre-0115 or reverted binary wrote
+//     without the flag) and force is false, and a FRESH review
 //     snapshot (forgeReviewRequiredSnapshot, read even on a gate-less run)
 //     shows REVIEW_REQUIRED, CHANGES_REQUESTED or BLOCKED
 //     (forge_review_required); a snapshot read error is ok=false (the row
@@ -558,7 +568,10 @@ func (s *Server) mergeQueueYieldTier(ctx context.Context, runRow *run.Run, e mer
 	if gy, gated := mergeGateYieldFor(mergeGateLegsOf(elig), elig); gated { // A3.5 tier 2: the merge-gate legs
 		return gy, true, false, true
 	}
-	if e.Row4Flag && !force { // A3.5 tier 3: the row-4 fresh snapshot; force skips only this
+	// A3.5 tier 3: the row-4 fresh snapshot; force skips only this. The stored
+	// reason also carries the obligation: a forge_review_required marker a
+	// pre-0115 (or reverted) binary wrote never set row4_flag.
+	if (e.Row4Flag || e.YieldReason == mergeQueueYieldForgeReviewRequired) && !force {
 		decision, status, present, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
 		if err != nil {
 			entryID, yieldedAt := mergeQueueYieldEpisode(e)

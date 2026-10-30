@@ -8841,9 +8841,11 @@ FROM review_concerns WHERE id = $1`, rowID).Scan(&judgement, &actorKind, &delega
 // carries the seven merge-gate columns with defaults a pre-0115-shaped insert
 // satisfies (revision 0, no row-4 flag, no gate window, a full budget of 3,
 // no approval wait open), a token count outside [0,3] and a half-set gate
-// window are refused, and a pre-0115 approval anchor is backfilled as an open
-// wait. After rolling back through 0115 the seven columns and both CHECKs are
-// gone and the rows survive.
+// window are refused, a pre-0115 approval anchor is backfilled as an open
+// wait, and a pre-0115 forge_review_required yield is backfilled with
+// row4_flag (concern fd0cf884; another reason is not). After rolling back
+// through 0115 the seven columns and both CHECKs are gone and the rows
+// survive.
 func TestMigrateDown_MergeQueueGateWaitReversal(t *testing.T) {
 	t.Parallel()
 	url := startContainer(t)
@@ -8929,6 +8931,13 @@ FROM merge_candidate_queue_entries WHERE run_id = $1`, plainRun).Scan(&defaults)
 VALUES ($1, 'o/r', 'main', 'held', 'h2', now())`, otherRun); err != nil {
 		t.Fatalf("insert a pre-0115 anchored row: %v", err)
 	}
+	// Concern fd0cf884: a pre-0115 row-4 yield (its obligation was the stored
+	// reason) and a yield for another reason.
+	row4Run, redRun := seedRun(), seedRun()
+	if _, err := pool.Exec(ctx, `INSERT INTO merge_candidate_queue_entries (run_id, repo, base_ref, state, anchored_head_sha, yield_reason, yielded_at)
+VALUES ($1, 'o/r', 'main', 'held', 'h3', 'forge_review_required', now()), ($2, 'o/r', 'main', 'held', 'h4', 'merge_checks_red', now())`, row4Run, redRun); err != nil {
+		t.Fatalf("insert pre-0115 yielded rows: %v", err)
+	}
 	if err := postgres.MigrateUp(url); err != nil {
 		t.Fatalf("MigrateUp again: %v", err)
 	}
@@ -8940,5 +8949,16 @@ VALUES ($1, 'o/r', 'main', 'held', 'h2', now())`, otherRun); err != nil {
 	}
 	if plainOpen || !anchoredOpen {
 		t.Errorf("approval_wait_open after re-applying 0115 = unanchored %v / anchored %v, want false / true (backfill)", plainOpen, anchoredOpen)
+	}
+	var row4Flag, redFlag, plainFlag bool
+	if err := pool.QueryRow(ctx, `SELECT
+  (SELECT row4_flag FROM merge_candidate_queue_entries WHERE run_id = $1),
+  (SELECT row4_flag FROM merge_candidate_queue_entries WHERE run_id = $2),
+  (SELECT row4_flag FROM merge_candidate_queue_entries WHERE run_id = $3)`, row4Run, redRun, plainRun).Scan(&row4Flag, &redFlag, &plainFlag); err != nil {
+		t.Fatalf("read the row4_flag backfill: %v", err)
+	}
+	if !row4Flag || redFlag || plainFlag {
+		t.Errorf("row4_flag after re-applying 0115 = forge_review_required %v / merge_checks_red %v / unyielded %v, want true / false / false (an upgraded row-4 yield keeps its obligation)",
+			row4Flag, redFlag, plainFlag)
 	}
 }

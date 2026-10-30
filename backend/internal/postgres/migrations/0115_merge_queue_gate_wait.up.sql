@@ -12,7 +12,10 @@
 -- row4_flag is the persisted row-4 obligation (A3.6): set by any marker write
 -- whose reason is forge_review_required (OR, so no reason transition clears
 -- it) and cleared only by a ClearYield that read the fresh snapshot showing
--- the row-4 condition gone.
+-- the row-4 condition gone. Pre-0115 the obligation was the stored reason
+-- itself, so every row yielded forge_review_required is backfilled with the
+-- flag; without it an upgraded row-4 yield would clear on an approved fold
+-- while the forge still reports BLOCKED.
 --
 -- gate_wait_started_at / gate_wait_epoch are the per-admission-epoch
 -- merge-gate window (A3.2): its start and the admission epoch that opened it.
@@ -44,3 +47,6 @@ ALTER TABLE merge_candidate_queue_entries
 
 UPDATE merge_candidate_queue_entries SET approval_wait_open = true
 WHERE approval_wait_started_at IS NOT NULL;
+
+UPDATE merge_candidate_queue_entries SET row4_flag = true
+WHERE yielded_at IS NOT NULL AND yield_reason = 'forge_review_required';

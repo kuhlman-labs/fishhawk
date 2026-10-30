@@ -5,6 +5,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -412,9 +413,24 @@ func TestMergeQueueYieldReprobe_HeadMovedReanchorsKeepingTheMarker(t *testing.T)
 	}
 }
 
+// yrFailPRRead answers the REST read of pull request number with a 500 and
+// sends every other request (the review snapshot, the check runs) on to the
+// fake forge.
+type yrFailPRRead struct{ number int }
+
+func (f yrFailPRRead) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", f.number)) {
+		return &http.Response{StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error",
+			Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
 // TestMergeQueueYieldReprobe_NothingBranches: a stale revision (the CAS
-// conflict, docs/adr/112 A3.6), a transport failure, a merged PR, a terminal run and an entry
-// that is not yielded each write nothing and leave the marker in place.
+// conflict, docs/adr/112 A3.6), a transport failure, a failed pull-request
+// read or no GitHub client (step (1)'s precondition), a merged PR, a terminal
+// run and an entry that is not yielded each write nothing and leave the
+// marker in place.
 func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 	ctx := context.Background()
 	t.Run("stale revision", func(t *testing.T) {
@@ -433,6 +449,35 @@ func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 		w, a, _ := newYieldWorld(t)
 		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 		w.gh.set(func() { w.gh.graphQLFail[a.pr] = 10 })
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing || w.active(a).YieldedAt == nil {
+			t.Fatalf("outcome = %s, want %s with the marker kept", got, reprobeNothing)
+		}
+	})
+	// Concern bd5b2e63: step (1)'s PR read is a hard precondition. The fold is
+	// approved at a1 and every merge-gate leg passes, so only the failed REST
+	// read keeps the marker. Counterfactual: falling through to the fold on a
+	// read error clears it, RED.
+	t.Run("pull request read fails", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+		w.srv.bgMergeQueuePump.Wait()
+		gh := *w.srv.cfg.GitHub
+		gh.HTTP = &http.Client{Transport: yrFailPRRead{number: a.pr}, Timeout: timescale.D(30 * time.Second)}
+		w.srv.cfg.GitHub = &gh
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing {
+			t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		if e := w.active(a); e.YieldedAt == nil || e.YieldReason != mergeCandidateQueueReasonForgeApprovalDismissed ||
+			len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 || len(w.rows(a, CategoryMergeQueueYielded)) != 1 {
+			t.Fatalf("a failed PR read wrote: %+v", e)
+		}
+	})
+	t.Run("no GitHub client", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+		w.srv.bgMergeQueuePump.Wait()
+		w.srv.cfg.GitHub = nil
 		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing || w.active(a).YieldedAt == nil {
 			t.Fatalf("outcome = %s, want %s with the marker kept", got, reprobeNothing)
 		}
@@ -898,6 +943,30 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredWebhookWithoutForgeChangeKeep
 	if n := w.gh.snapshotCalls() - reads; n != 1 {
 		t.Fatalf("review-snapshot reads during the webhook = %d, want 1 (the re-probe's fresh snapshot)", n)
 	}
+	w.requireRowFourKept(a, y)
+	w.requirePuts("a1")
+}
+
+// TestMergeQueueYieldReprobe_UpgradedForgeReviewRequiredWithoutFlagKeepsTheYield
+// (concern fd0cf884): a forge_review_required yield written before 0115 (or by
+// a reverted binary) carries no row4_flag. The fold is approved (gate-less),
+// every merge-gate leg passes and the forge would accept the PUT, but the
+// fresh snapshot still reads BLOCKED: the stored reason alone keeps tier 3,
+// so the row stays yielded and nothing is PUT. Counterfactual: keying tier 3
+// on Row4Flag only skips the snapshot and clears it, RED.
+func TestMergeQueueYieldReprobe_UpgradedForgeReviewRequiredWithoutFlagKeepsTheYield(t *testing.T) {
+	w, a, y := newRowFourYieldWorld(t)
+	w.exec(`UPDATE merge_candidate_queue_entries SET row4_flag = false WHERE run_id = $1 AND state = 'held'`, a.id)
+	w.gh.set(func() { delete(w.gh.putStatus, a.pr) })
+	e := w.active(a)
+	if e.Row4Flag || e.YieldReason != mergeQueueYieldForgeReviewRequired {
+		t.Fatalf("seed = flag %v reason %q, want a flagless forge_review_required yield", e.Row4Flag, e.YieldReason)
+	}
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), e, false); got != reprobeUnchanged {
+		t.Fatalf("outcome = %s, want %s (the forge still reports BLOCKED)", got, reprobeUnchanged)
+	}
+	w.srv.bgMergeQueuePump.Wait()
 	w.requireRowFourKept(a, y)
 	w.requirePuts("a1")
 }

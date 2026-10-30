@@ -69,7 +69,9 @@ type checkRunYieldTrigger struct {
 	now      func() time.Time
 	// after runs f once d has elapsed (time.AfterFunc in production). The
 	// wait holds no WaitGroup slot, so a pending follow-up never delays
-	// Server.Shutdown; only the probe itself is tracked (spawn).
+	// Server.Shutdown; only the probe itself is tracked (spawn), and a spawn
+	// after Shutdown began its drain starts nothing
+	// (spawnMergeQueueYieldProbe).
 	after func(d time.Duration, f func())
 
 	mu   sync.Mutex
@@ -293,8 +295,18 @@ func checkRunYieldTriggerApplies(runRow *run.Run, e mergequeue.Entry, name, head
 }
 
 // spawnMergeQueueYieldProbe runs fn on a goroutine tracked by
-// bgMergeQueuePump, so Server.Shutdown drains an in-flight probe.
+// bgMergeQueuePump, so Server.Shutdown drains an in-flight probe. Once
+// Shutdown has closed the spawn (yieldProbeSpawnClosed, set before its drain)
+// fn is dropped: a follow-up timer firing during or after the drain starts no
+// probe the drain would not wait for (concern 548f1a65). The run's coalescer
+// state stays in flight, harmless in a stopping process; the yield sweep
+// re-probes after the restart.
 func (s *Server) spawnMergeQueueYieldProbe(fn func()) {
+	s.yieldProbeSpawnMu.Lock()
+	defer s.yieldProbeSpawnMu.Unlock()
+	if s.yieldProbeSpawnClosed {
+		return
+	}
 	s.bgMergeQueuePump.Add(1)
 	go func() {
 		defer s.bgMergeQueuePump.Done()

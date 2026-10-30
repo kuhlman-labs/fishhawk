@@ -1072,13 +1072,21 @@ contract (columns, CAS keys, `GateWait`, budget): `backend/internal/mergequeue/R
 - **A3.4 one clear predicate (`merge_queue_yield_reprobe.go`).** The
   re-probe clears a marker only when the fold is approved, every merge-gate
   leg passes at the anchored head under the merge variant, and, while
-  `row4_flag` is set (unless forced), a fresh snapshot no longer reads
+  `row4_flag` is set or the stored reason is `forge_review_required` (unless
+  forced), a fresh snapshot no longer reads
   `REVIEW_REQUIRED`, `CHANGES_REQUESTED` or `BLOCKED`. PR-head discovery is
   gate-independent: the probe reads the PR first and re-anchors a moved head
   (`ReanchorYielded`), so a gate-less repair push is found even though a
-  gate-less fold is always approved.
+  gate-less fold is always approved. That read is a HARD precondition: a run
+  with no GitHub client, no installation or no tracked PR, or a failed read,
+  does nothing (marker kept, nothing written), so its yield never clears
+  automatically, the operator's `merge_run` re-invoke included (it runs the
+  same probe). Merge-on-pass holds such a run transient on the same missing
+  installation, so an unread clear would only re-admit an entry that cannot
+  merge (`TestMergeQueueYieldReprobe_NothingBranches`).
 - **A3.5 tiers (`mergeQueueYieldTier`).** 1 veto > 2 merge-gate (red >
-  pending > review) > 3 row-4 (flag set, fresh snapshot present) > 4 any
+  pending > review) > 3 row-4 (flag set or reason `forge_review_required`,
+  fresh snapshot present) > 4 any
   other non-approved fold (`mergeOnPassFoldYield`). Blocked with the stored
   reason → nothing; another reason → `UpdateYield` + a `merge_queue_yielded`
   transition row. The merge-gate reasons are precedence row 1
@@ -1086,7 +1094,12 @@ contract (columns, CAS keys, `GateWait`, budget): `backend/internal/mergequeue/R
 - **A3.6 `row4_flag` and `yield_revision`.** A `forge_review_required` yield
   sets `row4_flag`; no reason transition clears it; only a successful clear
   whose own snapshot showed the condition gone clears it (a forced clear
-  keeps it). Every marker write (Yield, Enqueue's mark, UpdateYield,
+  keeps it). 0115 backfills the flag on every pre-0115
+  `forge_review_required` yield, and tier 3 also reads that stored reason,
+  so a row-4 marker a pre-0115 or reverted binary wrote without the flag
+  keeps its obligation (concern fd0cf884,
+  `TestMigrateDown_MergeQueueGateWaitReversal`,
+  `TestMergeQueueYieldReprobe_UpgradedForgeReviewRequiredWithoutFlagKeepsTheYield`). Every marker write (Yield, Enqueue's mark, UpdateYield,
   ClearYield, ReanchorYielded) bumps `yield_revision`, and the yielded-row
   writes compare-and-swap on `(anchored_head_sha, yield_revision)`, so a
   delayed probe holding an older revision cannot clear or overwrite a newer
@@ -1121,7 +1134,11 @@ contract (columns, CAS keys, `GateWait`, budget): `backend/internal/mergequeue/R
   inside the interval records exactly ONE follow-up PER PROCESS. Duplicates
   across replicas are harmless because the clear CASes on
   `(anchored_head_sha, yield_revision)`; the sweep remains the shared
-  fallback.
+  fallback. A scheduled follow-up's timer holds no drain slot; probes start
+  only through `spawnMergeQueueYieldProbe`, which `Server.Shutdown` closes
+  before its drain, so a timer firing during or after the drain starts
+  nothing (concern 548f1a65,
+  `TestCheckRunTrigger_ShutdownStartsNoScheduledFollowUp`).
 - **A3.9 force.** The operator's `merge_run` re-invoke forces the probe,
   which skips ONLY the row-4 fresh snapshot; it never skips the fold, the
   veto, the merge-gate legs or the CAS, and a forced clear keeps
