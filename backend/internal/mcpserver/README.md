@@ -379,8 +379,8 @@ ADR-093 slice 1 ([E87.4 / #4295](https://github.com/kuhlman-labs/fishhawk/issues
   | `details.next_step` | `next_action` |
   |---|---|
   | `approve_pr` (fold `absent` / `dismissed` / `review_required`) | the `approve_pr` ritual (`run_id`, `pr_url`) |
-  | `dismiss_review` (fold `vetoed`) | `dismiss_review`, a gh step naming the write-or-higher `CHANGES_REQUESTED` reviewer (`details.veto_reviewer` → `params.reviewer`) |
-  | `retry_after` (fold `undetermined`, incl. `reason: head_moved`, or `reviews_truncated`) | `fishhawk_merge_run` |
+  | `dismiss_review` (fold `vetoed`, or fold `undetermined` with `reason: veto_undetermined`) | `dismiss_review`, a gh step naming the `CHANGES_REQUESTED` reviewer (`details.veto_reviewer` → `params.reviewer`): the write-or-higher vetoer, or the reviewer whose permission could not be read |
+  | `retry_after` (fold `undetermined` other than `reason: veto_undetermined`, incl. `reason: head_moved`, or `reviews_truncated`) | `fishhawk_merge_run` |
   | `configure_identity_provider` (`member_of` with no github identity provider) | none — the message names the remedy |
   | absent (fold `provider_unsupported` on a forge with no approval-to-revision binding, e.g. a GitLab run with a declared gate) | none |
 

@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"strings"
 	"sync"
@@ -131,6 +132,12 @@ func TestForgeApprovalE2E_InlineRefusals(t *testing.T) {
 		{"write veto", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol", "dave"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "dave", "CHANGES_REQUESTED", "h1"))
 		}, forgeApprovalVetoed, forgeApprovalReasonVeto, forgeApprovalNextDismissReview, false},
+		// #4764: a CHANGES_REQUESTED author whose permission read fails names
+		// dismiss_review and that reviewer, not retry_after.
+		{"unresolvable veto", func(w *mqmWorld, r *mcqRun) {
+			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "dave", "CHANGES_REQUESTED", "h1"))
+			w.gh.set(func() { w.gh.permStatus["dave"] = http.StatusInternalServerError })
+		}, forgeApprovalUndetermined, forgeApprovalReasonVetoUndetermined, forgeApprovalNextDismissReview, false},
 		{"snapshot transport failure", func(w *mqmWorld, r *mcqRun) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 			w.gh.set(func() { w.gh.graphQLFail[r.pr] = 5 })
@@ -156,6 +163,9 @@ func TestForgeApprovalE2E_InlineRefusals(t *testing.T) {
 			detail, _ := d["detail"].(string)
 			if d["fold"] != tc.fold || d["reason"] != tc.reason || d["next_step"] != tc.nextStep || len(detail) > forgeApprovalDetailMaxBytes {
 				t.Fatalf("details = %v, want fold %s reason %s next_step %q", d, tc.fold, tc.reason, tc.nextStep)
+			}
+			if tc.nextStep == forgeApprovalNextDismissReview && d["veto_reviewer"] != "dave" {
+				t.Fatalf("details = %v, want veto_reviewer dave", d)
 			}
 			w.requireNothingRecorded(r, m)
 			if tc.noGraph && w.gh.snapshotCalls() != 0 {
@@ -194,6 +204,31 @@ func TestForgeApprovalE2E_InlineAuthorizationAppendFailure(t *testing.T) {
 	resp := w.mergeRun(r)
 	if resp.Code != http.StatusServiceUnavailable || mqeCode(t, resp.Body.Bytes()) != mergeCodeAuthorizationUnrecorded {
 		t.Fatalf("merge = %d %s, want 503 %s", resp.Code, resp.Body.String(), mergeCodeAuthorizationUnrecorded)
+	}
+	w.requireNothingRecorded(r, m)
+}
+
+// TestForgeApprovalE2E_InlineStageReadErrorRefuses (#4764) drives POST
+// /v0/runs/{id}/merge through the in-lock fold (carol, write, APPROVED at h1,
+// so the fold approves) to writeMergeQueueAuthorized with the review-stage
+// read failing: ListStagesForRun fails only once the fold's snapshot was read,
+// so every earlier merge-path stage read succeeds. The merge answers 503
+// merge_authorization_unrecorded with nothing recorded: no
+// merge_queue_authorized row carrying review_gate_approval_seq 0, no
+// verdict, no claim, no dispatch. Counterfactual: swallowing the stage-read
+// error writes the row and merges, RED.
+func TestForgeApprovalE2E_InlineStageReadErrorRefuses(t *testing.T) {
+	w, m := newMQEWorld(t)
+	r := w.faeInline("sre", faeGateSpecYAML)
+	w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
+	w.srv.cfg.RunRepo = faStageReadRepo{Repository: w.srv.cfg.RunRepo, fail: errors.New("stages read failed"),
+		failWhen: func() bool { return w.gh.snapshotCalls() > 0 }}
+	resp := w.mergeRun(r)
+	if resp.Code != http.StatusServiceUnavailable || mqeCode(t, resp.Body.Bytes()) != mergeCodeAuthorizationUnrecorded {
+		t.Fatalf("merge = %d %s, want 503 %s", resp.Code, resp.Body.String(), mergeCodeAuthorizationUnrecorded)
+	}
+	if n := w.gh.snapshotCalls(); n == 0 {
+		t.Fatal("the fold read no snapshot, so the stage read never failed in-lock")
 	}
 	w.requireNothingRecorded(r, m)
 }
