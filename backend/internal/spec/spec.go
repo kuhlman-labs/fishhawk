@@ -145,6 +145,62 @@ type Spec struct {
 	// DisallowUnknownFields decode, so this field MUST stay in lockstep with
 	// the schema's top-level verdict_transfer property ($defs/verdict_transfer).
 	VerdictTransfer *VerdictTransfer `json:"verdict_transfer,omitempty" yaml:"verdict_transfer,omitempty"`
+	// MergeMethod is the repository's declared forge merge method
+	// (ADR-110 portability; E93.2 / #4658): one of MergeMethodSquash,
+	// MergeMethodMerge or MergeMethodRebase, or empty when undeclared. One
+	// top-level value per repository, read from the run's cached ADMISSION
+	// spec through ResolveMergeMethod, which maps empty to the squash
+	// default. A v2-only surface: no v0/v1 schema declares it, so an older
+	// spec never populates it and always merges squash. Round-trips through
+	// ParseBytes' DisallowUnknownFields decode, so this field MUST stay in
+	// lockstep with the schema's top-level merge_method property.
+	MergeMethod string `json:"merge_method,omitempty" yaml:"merge_method,omitempty"`
+}
+
+// The closed set of workflow-v2 `merge_method` values (the schema's enum).
+// MergeMethodSquash is also the product default an undeclared repository
+// resolves to.
+const (
+	MergeMethodSquash = "squash"
+	MergeMethodMerge  = "merge"
+	MergeMethodRebase = "rebase"
+)
+
+// MergeMethodDecision is a run's resolved merge method. Method is always one
+// of the MergeMethod* constants; Declared reports whether the admission spec
+// named it (true) or the squash default applied (false), so a refusal can
+// cite which.
+type MergeMethodDecision struct {
+	Method   string
+	Declared bool
+}
+
+// ResolveMergeMethod resolves the merge method from a run's cached admission
+// spec bytes (run.WorkflowSpec), the one resolver every merge path shares:
+//
+//   - nil or zero-length bytes (no cached spec: a CLI or pre-cache run)
+//     resolve to {squash, false}, today's behaviour;
+//   - bytes ParseBytes refuses return that error, and the caller FAILS
+//     CLOSED rather than silently merging squash — the spec it would read
+//     the declaration from is undeterminable;
+//   - a spec that declares no merge_method, including every v0/v1 document,
+//     resolves to {squash, false};
+//   - otherwise the declared value, with Declared true.
+//
+// The schema's enum has already constrained a declared value to the closed
+// set by the time ParseBytes returns.
+func ResolveMergeMethod(specBytes []byte) (MergeMethodDecision, error) {
+	if len(specBytes) == 0 {
+		return MergeMethodDecision{Method: MergeMethodSquash}, nil
+	}
+	s, err := ParseBytes(specBytes)
+	if err != nil {
+		return MergeMethodDecision{}, err
+	}
+	if s.MergeMethod == "" {
+		return MergeMethodDecision{Method: MergeMethodSquash}, nil
+	}
+	return MergeMethodDecision{Method: s.MergeMethod, Declared: true}, nil
 }
 
 // VerdictTransfer is the workflow-v2 `verdict_transfer` block (ADR-124 D1):
