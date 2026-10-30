@@ -30,6 +30,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode"
 
 	"github.com/google/uuid"
 )
@@ -270,8 +271,11 @@ type Concern struct {
 	// system writer closed (E94.2 / #4693), '' when none is recorded — every
 	// row minted before migration 0112. The carried / open_at_merge writes
 	// never touch State, StateReason or UpdatedAt; fixed is written WITH its
-	// transition (ApplyDisposition) and cleared by a move back into an open
-	// state. It is never rendered into a review prompt.
+	// transition (ApplyDisposition, or ApplyHumanDisposition for a human
+	// resolve) and cleared by a move back into an open state; waived and
+	// deferred are written with their human verb's transition
+	// (ApplyHumanDisposition, E94.7 / #4840). It is never rendered into a
+	// review prompt.
 	Outcome Outcome
 	// RolledUpFrom is, on a parent copy imported at a decomposed parent's
 	// fan-in (E94.1 / #4692, ADR-117 D2), the id of the child concern it was
@@ -282,15 +286,27 @@ type Concern struct {
 	// tolerant judgement column; read it through NormalizeJudgement (or, for a
 	// duplicate, ResolveJudgements). Every row minted before migration 0114,
 	// and every row only a system writer has touched, reads JudgementUnlabelled:
-	// system writers never write it. It is never rendered into a review prompt.
+	// system writers never write it. The four human verbs write it through
+	// ApplyHumanDisposition (E94.7 / #4840); a later human verb overwrites it.
+	// It is never rendered into a review prompt.
 	Judgement Judgement
-	// JudgementActorKind names who recorded Judgement, '' when nobody has.
+	// JudgementActorKind names who recorded Judgement (the user|agent kind the
+	// verb's audit row carries), '' when nobody has.
 	JudgementActorKind string
-	// JudgementDelegated, JudgementBulk and JudgementBackfill record how the
-	// judgement was made: under a delegation, by a bulk verb, after the fact.
+	// JudgementDelegated is true when the judgement was recorded under a
+	// delegation.
 	JudgementDelegated bool
-	JudgementBulk      bool
-	JudgementBackfill  bool
+	// JudgementBulk is true if and only if one human judgement covered more
+	// than one concern in one request: a bulk waive or a resolve naming more
+	// than one id (E94.7 / #4840, FO ruling D2 — COUNT-based, not verb-based).
+	// A bulk verb called with one id is an individual judgement and records
+	// false. The verb fact lives elsewhere: the concern_waived audit row's
+	// bulk_waive:true marks a bulk-waive call whatever its count.
+	JudgementBulk bool
+	// JudgementBackfill is true when the judgement was recorded after the
+	// fact rather than by the verb that dispositioned the concern; the human
+	// verbs write false.
+	JudgementBackfill bool
 	// TradeoffCost is the stated cost of a JudgementTradeoff, '' otherwise.
 	TradeoffCost string
 	// DuplicateOf is the id of an earlier same-run concern this one duplicates,
@@ -319,10 +335,12 @@ func (c Concern) EffectiveOutcome() string {
 type Outcome string
 
 // The ADR-117 D1 outcome vocabulary. Written today: OutcomeCarried and
-// OutcomeOpenAtMerge (E94.1 / #4692) and OutcomeFixed (the system writers,
-// E94.2 / #4693). OutcomeWaived and OutcomeDeferred have no writer yet: they
-// land with the human verbs (ADR-117 D1 phase 2). A duplicate's outcome is
-// never stored: EffectiveOutcome derives DuplicateOutcomePrefix + target id.
+// OutcomeOpenAtMerge (E94.1 / #4692), OutcomeFixed (the system writers,
+// E94.2 / #4693, and the human resolve-with-evidence verb), and OutcomeWaived
+// and OutcomeDeferred (the human waive, bulk waive and defer verbs through
+// ApplyHumanDisposition, ADR-117 D1 phase 2, E94.7 / #4840). A duplicate's
+// outcome is never stored: EffectiveOutcome derives DuplicateOutcomePrefix +
+// target id.
 const (
 	// OutcomeCarried marks a decomposition child's open HIGH/MEDIUM concern
 	// that was copied into its parent's ledger at fan-in.
@@ -331,14 +349,17 @@ const (
 	// reopened or superseded, with no outcome recorded, when its run merged.
 	OutcomeOpenAtMerge Outcome = "open_at_merge"
 	// OutcomeFixed marks a concern closed as delivered: a reviewer confirmed
-	// it, a clean round auto-closed it, or its binding approval condition was
-	// confirmed delivered. A transition back into an open state clears it
+	// it, a clean round auto-closed it, its binding approval condition was
+	// confirmed delivered, or a human resolved it with evidence
+	// (ApplyHumanDisposition). A transition back into an open state clears it
 	// (UpdateReviewConcernState), so a reopened concern is stamped
 	// open_at_merge like any other open one.
 	OutcomeFixed Outcome = "fixed"
-	// OutcomeWaived marks a concern the operator waived (no writer yet).
+	// OutcomeWaived marks a concern the operator waived (single or bulk
+	// waive, ApplyHumanDisposition).
 	OutcomeWaived Outcome = "waived"
-	// OutcomeDeferred marks a concern deferred to a follow-up (no writer yet).
+	// OutcomeDeferred marks a concern deferred to a follow-up
+	// (ApplyHumanDisposition).
 	OutcomeDeferred Outcome = "deferred"
 )
 
@@ -376,6 +397,182 @@ func NormalizeJudgement(stored string) Judgement {
 		return j
 	}
 	return JudgementUnlabelled
+}
+
+// HumanJudgements returns the judgements a human verb may record (E94.7 /
+// #4840): the closed vocabulary minus JudgementUnlabelled, which is the read
+// of an UNjudged row and never a judgement a human makes. A fresh slice per
+// call, in vocabulary order, for error details.
+func HumanJudgements() []Judgement {
+	return []Judgement{
+		JudgementDefect, JudgementDefectPreExisting, JudgementNoDefect, JudgementTradeoff,
+		JudgementPreference, JudgementStale, JudgementInsufficientEvidence,
+	}
+}
+
+// The JudgementError rules (E94.7 / #4840). Each is a stable machine-readable
+// name the REST layer returns in a 400 validation_failed's details.rule.
+const (
+	// JudgementRuleRequired: no judgement was sent and no recognised reason
+	// prefix supplies one.
+	JudgementRuleRequired = "judgement_required"
+	// JudgementRuleUnknown: the judgement is outside the closed vocabulary.
+	JudgementRuleUnknown = "judgement_unknown"
+	// JudgementRuleUnlabelled: the judgement is unlabelled, which no human
+	// verb may record.
+	JudgementRuleUnlabelled = "judgement_unlabelled"
+	// JudgementRuleConflictsReasonPrefix: an explicit judgement contradicts
+	// the judgement a recognised waive-reason prefix maps to (FO ruling D1).
+	JudgementRuleConflictsReasonPrefix = "judgement_conflicts_reason_prefix"
+	// JudgementRuleTradeoffCostRequired: a tradeoff judgement carries no
+	// tradeoff_cost.
+	JudgementRuleTradeoffCostRequired = "tradeoff_cost_required"
+	// JudgementRuleTradeoffCostWithoutTradeoff: a tradeoff_cost was sent with
+	// a judgement other than tradeoff.
+	JudgementRuleTradeoffCostWithoutTradeoff = "tradeoff_cost_without_tradeoff"
+)
+
+// JudgementError is a refused human judgement (E94.7 / #4840). Field names the
+// request field at fault (judgement or tradeoff_cost), Rule one of the
+// JudgementRule* names, Message the operator-facing sentence. Prefix is the
+// recognised reason prefix, set ONLY on JudgementRuleConflictsReasonPrefix.
+type JudgementError struct {
+	Field   string
+	Rule    string
+	Message string
+	Prefix  string
+}
+
+func (e JudgementError) Error() string {
+	return "concern: " + e.Message
+}
+
+// reasonPrefixes are the Captain's interim waive-reason prefixes (FO ruling
+// D1), each mapped to the judgement it states. Matched exactly, lowercase.
+var reasonPrefixes = []struct {
+	prefix    string
+	judgement Judgement
+}{
+	{"false_positive:", JudgementNoDefect},
+	{"accepted_tradeoff:", JudgementTradeoff},
+	{"preference:", JudgementPreference},
+}
+
+// matchReasonPrefix reports the recognised reason prefix reason opens with
+// after leading whitespace, and the judgement it maps to. The match is exact
+// and case-sensitive: `False_Positive:` is no prefix.
+func matchReasonPrefix(reason string) (prefix string, j Judgement, ok bool) {
+	s := strings.TrimLeftFunc(reason, unicode.IsSpace)
+	for _, p := range reasonPrefixes {
+		if strings.HasPrefix(s, p.prefix) {
+			return p.prefix, p.judgement, true
+		}
+	}
+	return "", "", false
+}
+
+// JudgementFromReasonPrefix returns the judgement a recognised waive-reason
+// prefix maps to (false_positive: -> no_defect, accepted_tradeoff: ->
+// tradeoff, preference: -> preference), and false when reason opens with none.
+func JudgementFromReasonPrefix(reason string) (Judgement, bool) {
+	_, j, ok := matchReasonPrefix(reason)
+	return j, ok
+}
+
+// ResolveHumanJudgement is the ONE validator of a human verb's judgement input
+// (E94.7 / #4840, ADR-117 D1 phase 2). judgement and tradeoffCost are the
+// request's fields; prefixSource is the waive reason for waive and bulk waive
+// and "" for resolve and defer (the prefixes are a waive-reason convention).
+// It returns the judgement to record, or a JudgementError. FO ruling D1:
+//
+//	(a) an explicit judgement with a MATCHING reason prefix -> the judgement;
+//	(b) an explicit judgement with no prefix -> the judgement;
+//	(c) a prefix alone -> the judgement the prefix maps to;
+//	(d) an explicit judgement with a CONTRADICTING prefix -> refused,
+//	    JudgementRuleConflictsReasonPrefix.
+//
+// An explicit unlabelled or unknown value is refused for THAT reason before
+// the conflict check. A tradeoff (explicit or prefix-derived) requires a
+// non-blank tradeoffCost, and a non-empty tradeoffCost with any other
+// judgement is refused: no cost is inferred from the reason, and none is
+// silently dropped.
+func ResolveHumanJudgement(judgement, tradeoffCost, prefixSource string) (Judgement, error) {
+	explicit := Judgement(judgement)
+	prefix, derived, hasPrefix := matchReasonPrefix(prefixSource)
+	if explicit != "" {
+		if err := checkHumanJudgement(explicit); err != nil {
+			return "", err
+		}
+	}
+	if hasPrefix && explicit != "" && explicit != derived {
+		return "", JudgementError{
+			Field: "judgement",
+			Rule:  JudgementRuleConflictsReasonPrefix,
+			Message: fmt.Sprintf("judgement %q contradicts reason prefix %q, which maps to %q; send a matching judgement or drop the prefix",
+				explicit, prefix, derived),
+			Prefix: prefix,
+		}
+	}
+	j := explicit
+	if j == "" {
+		if !hasPrefix {
+			return "", checkHumanJudgement("")
+		}
+		j = derived
+	}
+	if err := checkTradeoffCost(j, tradeoffCost); err != nil {
+		return "", err
+	}
+	return j, nil
+}
+
+// humanJudgementList renders HumanJudgements for an error message.
+func humanJudgementList() string {
+	hj := HumanJudgements()
+	names := make([]string, len(hj))
+	for i, j := range hj {
+		names[i] = string(j)
+	}
+	return strings.Join(names, ", ")
+}
+
+// checkHumanJudgement refuses a judgement no human verb may record: blank
+// (JudgementRuleRequired), unlabelled (JudgementRuleUnlabelled) or outside the
+// closed vocabulary (JudgementRuleUnknown). Shared by ResolveHumanJudgement
+// and HumanDisposition.Validate.
+func checkHumanJudgement(j Judgement) error {
+	switch j {
+	case "":
+		return JudgementError{Field: "judgement", Rule: JudgementRuleRequired,
+			Message: "judgement is required: send one of " + humanJudgementList()}
+	case JudgementUnlabelled:
+		return JudgementError{Field: "judgement", Rule: JudgementRuleUnlabelled,
+			Message: fmt.Sprintf("judgement %q is the read of an unjudged concern, not a human judgement: send one of %s", j, humanJudgementList())}
+	}
+	for _, h := range HumanJudgements() {
+		if j == h {
+			return nil
+		}
+	}
+	return JudgementError{Field: "judgement", Rule: JudgementRuleUnknown,
+		Message: fmt.Sprintf("judgement %q is not one of %s", j, humanJudgementList())}
+}
+
+// checkTradeoffCost is the tradeoff rule shared by ResolveHumanJudgement and
+// HumanDisposition.Validate: a tradeoff requires a non-blank cost, and a cost
+// with any other judgement is refused: Concern.TradeoffCost is the stated cost
+// of a JudgementTradeoff and empty otherwise.
+func checkTradeoffCost(j Judgement, tradeoffCost string) error {
+	if j == JudgementTradeoff && strings.TrimSpace(tradeoffCost) == "" {
+		return JudgementError{Field: "tradeoff_cost", Rule: JudgementRuleTradeoffCostRequired,
+			Message: fmt.Sprintf("tradeoff_cost is required when judgement is %q: state what the accepted tradeoff costs", JudgementTradeoff)}
+	}
+	if j != JudgementTradeoff && tradeoffCost != "" {
+		return JudgementError{Field: "tradeoff_cost", Rule: JudgementRuleTradeoffCostWithoutTradeoff,
+			Message: fmt.Sprintf("tradeoff_cost is recorded only with judgement %q, got judgement %q: drop tradeoff_cost or send judgement %q",
+				JudgementTradeoff, j, JudgementTradeoff)}
+	}
+	return nil
 }
 
 // EffectiveJudgement is one concern's judgement as a read surface reports it.
@@ -660,6 +857,17 @@ type Repository interface {
 	// with no outcome to record uses ApplyResolution.
 	ApplyDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d Disposition) (*Concern, error)
 
+	// ApplyHumanDisposition is the HUMAN verbs' close path (E94.7 / #4840,
+	// ADR-117 D1 phase 2): waive and bulk waive (OutcomeWaived), resolve with
+	// evidence (OutcomeFixed) and defer (OutcomeDeferred). It is
+	// ApplyResolution that ALSO records d's outcome, judgement, actor kind,
+	// delegated and bulk flags and tradeoff cost in the SAME from-state-guarded
+	// UPDATE, writes judgement_backfill false and never touches duplicate_of.
+	// d.Validate() runs before any read or write, so an invalid disposition is
+	// refused with nothing written; a refused edge is InvalidTransitionError as
+	// for ApplyResolution. A later human verb overwrites an earlier judgement.
+	ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d HumanDisposition) (*Concern, error)
+
 	// ImportRolledUp copies each source concern into the parent run's ledger
 	// as a raised implement-stage row on ParentStageID (E94.1 / #4692, ADR-117
 	// D2), in ONE transaction. The copy keeps the source's origin review
@@ -699,4 +907,39 @@ type ImportRolledUpParams struct {
 // express a judgement through it.
 type Disposition struct {
 	Outcome Outcome
+}
+
+// HumanDisposition is what ApplyHumanDisposition records beside the state
+// transition (E94.7 / #4840): the verb's outcome and the human judgement.
+// ActorKind is the user|agent kind the verb's audit row carries; Delegated is
+// true for a judgement made under a delegation; JudgementBulk follows the
+// COUNT rule on Concern.JudgementBulk; TradeoffCost is set only with
+// JudgementTradeoff.
+type HumanDisposition struct {
+	Outcome                  Outcome
+	Judgement                Judgement
+	ActorKind                string
+	Delegated, JudgementBulk bool
+	TradeoffCost             string
+}
+
+// Validate refuses a HumanDisposition the store must not record: an outcome
+// other than waived, fixed or deferred; a blank, unlabelled or unknown
+// judgement (a JudgementError); a blank actor kind; or an inconsistent
+// tradeoff cost (a JudgementError, the same rule ResolveHumanJudgement
+// applies). It takes no reason, so it never re-checks a waive-reason prefix.
+func (d HumanDisposition) Validate() error {
+	switch d.Outcome {
+	case OutcomeWaived, OutcomeFixed, OutcomeDeferred:
+	default:
+		return fmt.Errorf("concern: human disposition: outcome %q is not %s, %s or %s",
+			d.Outcome, OutcomeWaived, OutcomeFixed, OutcomeDeferred)
+	}
+	if err := checkHumanJudgement(d.Judgement); err != nil {
+		return err
+	}
+	if strings.TrimSpace(d.ActorKind) == "" {
+		return errors.New("concern: human disposition: actor kind required")
+	}
+	return checkTradeoffCost(d.Judgement, d.TradeoffCost)
 }

@@ -14,14 +14,18 @@ import (
 // concern_id is required; parent_epic is the epic placement the operator
 // supplies (the follow-up's epic roll-up is an operator judgment) — the
 // entire body, and now the {n} child number (#1958), are derived
-// server-side.
+// server-side. Judgement and TradeoffCost (ADR-117 D1, #4840) are REQUIRED by
+// the backend but omitempty here and not pre-checked: the server is the
+// single refusal authority.
 type DeferConcernInput struct {
-	ConcernID  string   `json:"concern_id" jsonschema:"the stable concern UUID to defer (from fishhawk_get_run_status's run.concerns.items[].id)"`
-	ParentEpic string   `json:"parent_epic" jsonschema:"the epic the follow-up rolls up to (an issue reference like '#1196'); its leading [E<n>] title token is fetched to derive the {epic} title placeholder. Operator judgment — not derivable from the concern"`
-	N          string   `json:"n,omitempty" jsonschema:"OPTIONAL child number for the [E<epic>.<n>] title (e.g. '4'). The backend now discovers it server-side from the parent epic's existing children (open and closed) and allocates the next one, so you no longer have to guess it (#1958). Pass n only to override that discovery"`
-	Type       string   `json:"type,omitempty" jsonschema:"optional override of the auto-selected work-item type (bug for a defect category, else chore)"`
-	Labels     []string `json:"labels,omitempty" jsonschema:"optional labels merged on top of the type's default labels"`
-	Note       string   `json:"note,omitempty" jsonschema:"optional operator addendum folded into the follow-up body and the concern's state_reason"`
+	ConcernID    string   `json:"concern_id" jsonschema:"the stable concern UUID to defer (from fishhawk_get_run_status's run.concerns.items[].id)"`
+	ParentEpic   string   `json:"parent_epic" jsonschema:"the epic the follow-up rolls up to (an issue reference like '#1196'); its leading [E<n>] title token is fetched to derive the {epic} title placeholder. Operator judgment — not derivable from the concern"`
+	N            string   `json:"n,omitempty" jsonschema:"OPTIONAL child number for the [E<epic>.<n>] title (e.g. '4'). The backend now discovers it server-side from the parent epic's existing children (open and closed) and allocates the next one, so you no longer have to guess it (#1958). Pass n only to override that discovery"`
+	Type         string   `json:"type,omitempty" jsonschema:"optional override of the auto-selected work-item type (bug for a defect category, else chore)"`
+	Labels       []string `json:"labels,omitempty" jsonschema:"optional labels merged on top of the type's default labels"`
+	Note         string   `json:"note,omitempty" jsonschema:"optional operator addendum folded into the follow-up body and the concern's state_reason"`
+	Judgement    string   `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. No reason-prefix derivation applies to a defer. Missing or invalid: 400 validation_failed, refused before any follow-up is filed"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement: REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
 }
 
 // DeferConcernOutput surfaces the filed follow-up work item plus the
@@ -89,11 +93,19 @@ Inputs:
   - n           : OPTIONAL child number for the [E<epic>.<n>] title; derived
     server-side when omitted, supplied only to override.
   - type, labels, note : optional overrides / addendum.
+  - judgement   : REQUIRED human judgement, one of defect,
+    defect_pre_existing, no_defect, tradeoff, preference, stale,
+    insufficient_evidence (unlabelled is refused).
+  - tradeoff_cost : REQUIRED with a tradeoff judgement, refused with any
+    other.
 
 Returns the filed follow-up issue (number, url, title, applied labels) and
 the updated concern row (state deferred, state_reason naming the issue).
 Returns a tool error on:
   - invalid concern_id UUID (caught before the HTTP hop)
+  - validation_failed (400: a missing, unknown or unlabelled judgement,
+    or a tradeoff/tradeoff_cost mismatch — checked by the backend only,
+    before any follow-up is filed)
   - concern_not_found (404)
   - cross_run_defer (a run-bound token reaching another run's concern, 403)
   - concern_defer_conflict (the concern is not open, or a post-filing
@@ -115,11 +127,13 @@ func (r *runResolver) deferConcern(ctx context.Context, _ *mcp.CallToolRequest, 
 		return nil, DeferConcernOutput{}, fmt.Errorf("concern_id %q is not a valid UUID: %w", in.ConcernID, err)
 	}
 	res, err := r.api.DeferConcern(ctx, concernID, DeferConcernParams{
-		ParentEpic: in.ParentEpic,
-		N:          in.N,
-		Type:       in.Type,
-		Labels:     in.Labels,
-		Note:       in.Note,
+		ParentEpic:   in.ParentEpic,
+		N:            in.N,
+		Type:         in.Type,
+		Labels:       in.Labels,
+		Note:         in.Note,
+		Judgement:    in.Judgement,
+		TradeoffCost: in.TradeoffCost,
 	})
 	if err != nil {
 		return nil, DeferConcernOutput{}, fmt.Errorf("defer concern: %w", err)

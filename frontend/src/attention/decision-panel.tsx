@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import { api } from '@/api/client';
-import type { AttentionItem } from '@/api/types';
+import type { AttentionItem, ConcernJudgement } from '@/api/types';
 import { DECISION_VERBS } from './decision-verbs';
 import {
   AcknowledgeCheckbox,
@@ -114,8 +114,57 @@ function ScopeAmendmentDecision({ item, onResolved, onCancel }: PanelProps) {
   );
 }
 
+/*
+ * The closed set of HUMAN concern judgements (ADR-117 D1 phase 2, E94.7 /
+ * #4840), in the server's concern.HumanJudgements order. `unlabelled` is the
+ * read of an unjudged concern and is never offered.
+ */
+const JUDGEMENT_OPTIONS: { value: ConcernJudgement; label: string }[] = [
+  { value: 'defect', label: 'defect — a real defect in this change' },
+  { value: 'defect_pre_existing', label: 'defect_pre_existing — real, but predates this change' },
+  { value: 'no_defect', label: 'no_defect — not a defect (false positive)' },
+  { value: 'tradeoff', label: 'tradeoff — a real cost, knowingly accepted' },
+  { value: 'preference', label: 'preference — a matter of taste, not correctness' },
+  { value: 'stale', label: 'stale — no longer applies to the current code' },
+  { value: 'insufficient_evidence', label: 'insufficient_evidence — cannot be judged as raised' },
+];
+
+function JudgementSelect({
+  value,
+  onChange,
+  disabled,
+}: {
+  value: ConcernJudgement | '';
+  onChange: (v: ConcernJudgement | '') => void;
+  disabled?: boolean;
+}) {
+  return (
+    <label className="block">
+      <span className="text-xs tracking-wide text-neutral-500 uppercase">Judgement</span>
+      <select
+        value={value}
+        onChange={(e) =>
+          onChange(JUDGEMENT_OPTIONS.find((o) => o.value === e.target.value)?.value ?? '')
+        }
+        disabled={disabled}
+        className="mt-1 w-full rounded-md border border-neutral-300 bg-white px-2 py-1 font-mono text-xs disabled:opacity-50 dark:border-neutral-700 dark:bg-neutral-950"
+        aria-label="Judgement"
+      >
+        <option value="">Choose a judgement…</option>
+        {JUDGEMENT_OPTIONS.map((o) => (
+          <option key={o.value} value={o.value}>
+            {o.label}
+          </option>
+        ))}
+      </select>
+    </label>
+  );
+}
+
 function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
   const [reason, setReason] = useState('');
+  const [judgement, setJudgement] = useState<ConcernJudgement | ''>('');
+  const [tradeoffCost, setTradeoffCost] = useState('');
   const [parentEpic, setParentEpic] = useState('');
   const [note, setNote] = useState('');
   const { submitting, error, submit } = useDecisionSubmit(onResolved);
@@ -127,12 +176,39 @@ function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
   const verbs =
     item.kind === 'split_verdict' ? DECISION_VERBS.split_verdict : DECISION_VERBS.paged_concern; // ['Waive', 'Defer']
 
+  // Both verbs REQUIRE a judgement (E94.7 / #4840), and a tradeoff also its
+  // stated cost. The cost is sent ONLY with a tradeoff: a cost left over from
+  // an earlier tradeoff choice would otherwise be refused server-side
+  // (tradeoff_cost_without_tradeoff).
+  const isTradeoff = judgement === 'tradeoff';
+  const judgementBlank = judgement === '' || (isTradeoff && !tradeoffCost.trim());
+  // Fail closed: with no judgement chosen nothing is sent (the buttons are
+  // also disabled via requiredBlank).
+  const submitJudged = (
+    run: (fields: { judgement: ConcernJudgement; tradeoff_cost?: string }) => Promise<unknown>,
+  ) => {
+    if (judgement === '') return;
+    return submit(() =>
+      run({ judgement, tradeoff_cost: isTradeoff ? tradeoffCost.trim() : undefined }),
+    );
+  };
+
   return (
     <div className="flex flex-col gap-3 text-sm">
       <p className="text-xs text-neutral-500 dark:text-neutral-400">
         Waive resolves the concern with your reason. Defer files a follow-up issue under the parent
-        epic and consumes no fix-up budget — both are terminal.
+        epic and consumes no fix-up budget — both are terminal, and both record your judgement (a
+        tradeoff also records its cost).
       </p>
+      <JudgementSelect value={judgement} onChange={setJudgement} disabled={submitting} />
+      {isTradeoff && (
+        <TextField
+          label="Tradeoff cost"
+          value={tradeoffCost}
+          onChange={setTradeoffCost}
+          disabled={submitting}
+        />
+      )}
       <ReasonField label="Waive reason" value={reason} onChange={setReason} disabled={submitting} />
       <TextField
         label="Defer: parent epic (e.g. #1196)"
@@ -152,15 +228,19 @@ function ConcernDecision({ item, onResolved, onCancel }: PanelProps) {
         verbs={[
           {
             label: verbs[0], // Waive
-            requiredBlank: !reason.trim(),
-            onClick: () => submit(() => api.waiveConcern(concernId, { reason: reason.trim() })),
+            requiredBlank: !reason.trim() || judgementBlank,
+            onClick: () =>
+              submitJudged((fields) =>
+                api.waiveConcern(concernId, { reason: reason.trim(), ...fields }),
+              ),
           },
           {
             label: verbs[1], // Defer
-            requiredBlank: !parentEpic.trim(),
+            requiredBlank: !parentEpic.trim() || judgementBlank,
             onClick: () =>
-              submit(() =>
+              submitJudged((fields) =>
                 api.deferConcern(concernId, {
+                  ...fields,
                   parent_epic: parentEpic.trim(),
                   note: note.trim() || undefined,
                 }),

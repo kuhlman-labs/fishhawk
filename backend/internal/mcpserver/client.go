@@ -1272,7 +1272,7 @@ type GateViewConcern struct {
 	DuplicateOf            string `json:"duplicate_of,omitempty" jsonschema:"the id of the earlier same-run concern this one duplicates; absent otherwise"`
 	JudgementActorKind     string `json:"judgement_actor_kind,omitempty" jsonschema:"who recorded the judgement; absent when nobody has"`
 	JudgementDelegated     bool   `json:"judgement_delegated,omitempty" jsonschema:"true when the judgement was recorded under a delegation"`
-	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true when the judgement was recorded by a bulk verb"`
+	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true if and only if one human judgement covered more than one concern in one request (a bulk waive or a resolve naming more than one id); a bulk verb called with one id records false"`
 	JudgementBackfill      bool   `json:"judgement_backfill,omitempty" jsonschema:"true when the judgement was recorded after the fact"`
 	TradeoffCost           string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement; absent otherwise"`
 }
@@ -1341,7 +1341,7 @@ type GateViewSettledConcern struct {
 	DuplicateOf            string `json:"duplicate_of,omitempty" jsonschema:"the id of the earlier same-run concern this one duplicates; absent otherwise"`
 	JudgementActorKind     string `json:"judgement_actor_kind,omitempty" jsonschema:"who recorded the judgement; absent when nobody has"`
 	JudgementDelegated     bool   `json:"judgement_delegated,omitempty" jsonschema:"true when the judgement was recorded under a delegation"`
-	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true when the judgement was recorded by a bulk verb"`
+	JudgementBulk          bool   `json:"judgement_bulk,omitempty" jsonschema:"true if and only if one human judgement covered more than one concern in one request (a bulk waive or a resolve naming more than one id); a bulk verb called with one id records false"`
 	JudgementBackfill      bool   `json:"judgement_backfill,omitempty" jsonschema:"true when the judgement was recorded after the fact"`
 	TradeoffCost           string `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement; absent otherwise"`
 }
@@ -3086,9 +3086,14 @@ type reviseResult struct {
 // waiveConcernRequest mirrors the backend's
 // `POST /v0/concerns/{concern_id}/waive` body
 // (`backend/internal/server/waive.go::waiveConcernRequest`). Reason is
-// REQUIRED — the backend refuses an empty reason with 400.
+// REQUIRED — the backend refuses an empty reason with 400. Judgement and
+// TradeoffCost (ADR-117 D1, #4840) are omitempty: the backend is the single
+// authority that requires a judgement, so the client forwards whatever the
+// caller supplied and never refuses one locally.
 type waiveConcernRequest struct {
-	Reason string `json:"reason"`
+	Reason       string `json:"reason"`
+	Judgement    string `json:"judgement,omitempty"`
+	TradeoffCost string `json:"tradeoff_cost,omitempty"`
 }
 
 // WaivedConcern mirrors the backend's waive 200 body: the updated
@@ -3107,17 +3112,21 @@ type WaivedConcern struct {
 }
 
 // WaiveConcern transitions one open review concern to the terminal
-// waived state with a required, audited reason via
-// `POST /v0/concerns/{concern_id}/waive` (E22.X / #984). 4xx surfaces:
-//   - 400 validation_failed (empty reason)
+// waived state with a required, audited reason and a human judgement via
+// `POST /v0/concerns/{concern_id}/waive` (E22.X / #984; judgement ADR-117 D1,
+// #4840). 4xx surfaces:
+//   - 400 validation_failed (empty reason; a missing, unknown or unlabelled
+//     judgement; a tradeoff without tradeoff_cost or a cost without a
+//     tradeoff; a judgement contradicting the reason prefix —
+//     details.rule judgement_conflicts_reason_prefix)
 //   - 403 cross_run_waive (a run-bound token reaching another run's
 //     concern) or insufficient_scope
 //   - 404 concern_not_found
 //   - 422 concern_waive_conflict (the concern is not in an open state —
 //     already waived/superseded/addressed; details carry the from/to pair)
 //   - 503 concern_store_unconfigured
-func (c *apiClient) WaiveConcern(ctx context.Context, id uuid.UUID, reason string) (*WaivedConcern, error) {
-	body, err := json.Marshal(waiveConcernRequest{Reason: reason})
+func (c *apiClient) WaiveConcern(ctx context.Context, id uuid.UUID, reason, judgement, tradeoffCost string) (*WaivedConcern, error) {
+	body, err := json.Marshal(waiveConcernRequest{Reason: reason, Judgement: judgement, TradeoffCost: tradeoffCost})
 	if err != nil {
 		return nil, fmt.Errorf("marshal waive: %w", err)
 	}
@@ -3293,23 +3302,30 @@ func (c *apiClient) ListCommsDispositions(ctx context.Context, runID uuid.UUID) 
 // deferConcernRequest mirrors the backend's defer 200 request body
 // (`backend/internal/server/defer_concern.go::deferConcernRequest`). The
 // follow-up body is auto-drafted server-side; the operator supplies only
-// the title coordinates + optional overrides.
+// the title coordinates + optional overrides, plus the human judgement
+// (ADR-117 D1, #4840), which is omitempty because the backend is the single
+// authority that requires it. Its fields stay identical to
+// DeferConcernParams, which DeferConcern converts directly.
 type deferConcernRequest struct {
-	ParentEpic string   `json:"parent_epic,omitempty"`
-	N          string   `json:"n,omitempty"`
-	Type       string   `json:"type,omitempty"`
-	Labels     []string `json:"labels,omitempty"`
-	Note       string   `json:"note,omitempty"`
+	ParentEpic   string   `json:"parent_epic,omitempty"`
+	N            string   `json:"n,omitempty"`
+	Type         string   `json:"type,omitempty"`
+	Labels       []string `json:"labels,omitempty"`
+	Note         string   `json:"note,omitempty"`
+	Judgement    string   `json:"judgement,omitempty"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty"`
 }
 
 // DeferConcernParams bundles the caller-supplied defer inputs the tool
 // layer collects, so DeferConcern's signature stays readable.
 type DeferConcernParams struct {
-	ParentEpic string
-	N          string
-	Type       string
-	Labels     []string
-	Note       string
+	ParentEpic   string
+	N            string
+	Type         string
+	Labels       []string
+	Note         string
+	Judgement    string
+	TradeoffCost string
 }
 
 // DeferredConcern mirrors the backend defer 200 body's `concern` block:
@@ -3353,6 +3369,9 @@ type DeferredConcernResult struct {
 // item and transitions the concern to the terminal deferred state via
 // `POST /v0/concerns/{concern_id}/defer` (E22.X / #1202). 4xx/5xx
 // surfaces:
+//   - 400 validation_failed (a missing, unknown or unlabelled judgement, a
+//     tradeoff without tradeoff_cost, or a cost without a tradeoff —
+//     ADR-117 D1, #4840; refused before any work item is filed)
 //   - 403 cross_run_defer (a run-bound token reaching another run's
 //     concern) or insufficient_scope
 //   - 404 concern_not_found
@@ -7266,28 +7285,37 @@ type BulkWaiveResult struct {
 }
 
 // bulkWaiveRequestBody mirrors the backend's bulkWaiveRequest
-// (`backend/internal/server/bulk_waive.go::bulkWaiveRequest`).
+// (`backend/internal/server/bulk_waive.go::bulkWaiveRequest`). Judgement and
+// TradeoffCost (ADR-117 D1, #4840) are omitempty: the backend requires the
+// judgement, and the client never refuses one locally.
 type bulkWaiveRequestBody struct {
-	ConcernIDs []string `json:"concern_ids"`
-	Reason     string   `json:"reason"`
-	Delegated  bool     `json:"delegated,omitempty"`
+	ConcernIDs   []string `json:"concern_ids"`
+	Reason       string   `json:"reason"`
+	Judgement    string   `json:"judgement,omitempty"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty"`
+	Delegated    bool     `json:"delegated,omitempty"`
 }
 
 // BulkWaiveConcerns waives a LIST of one run's open concerns with ONE audited
-// reason via `POST /v0/runs/{run_id}/concerns/waive` (E64.77 / #3318). The
-// PRE-VALIDATION half is all-or-nothing (nothing is waived when it refuses);
-// the APPLY half is per-item. 4xx/5xx surfaces:
+// reason and ONE human judgement via `POST /v0/runs/{run_id}/concerns/waive`
+// (E64.77 / #3318; judgement ADR-117 D1, #4840). The PRE-VALIDATION half is
+// all-or-nothing (nothing is waived when it refuses); the APPLY half is
+// per-item. 4xx/5xx surfaces:
 //   - 400 validation_failed (blank reason, empty concern_ids, over the 50-id
 //     cap, a duplicate id, a non-UUID id, or an id belonging to another run —
-//     the last carrying details.rule "concern_run_mismatch")
+//     the last carrying details.rule "concern_run_mismatch"; or a missing,
+//     unknown or unlabelled judgement, a tradeoff/tradeoff_cost mismatch, or a
+//     judgement contradicting the reason prefix)
 //   - 403 cross_run_waive (a run-bound token reaching another run) or
 //     insufficient_scope
 //   - 404 concern_not_found (an id with no row)
 //   - 422 concern_waive_conflict (an id not in an open state — the WHOLE batch
 //     is refused and nothing is waived)
 //   - 503 concern_store_unconfigured
-func (c *apiClient) BulkWaiveConcerns(ctx context.Context, runID uuid.UUID, concernIDs []string, reason string, delegated bool) (*BulkWaiveResult, error) {
-	body, err := json.Marshal(bulkWaiveRequestBody{ConcernIDs: concernIDs, Reason: reason, Delegated: delegated})
+func (c *apiClient) BulkWaiveConcerns(ctx context.Context, runID uuid.UUID, concernIDs []string, reason, judgement, tradeoffCost string, delegated bool) (*BulkWaiveResult, error) {
+	body, err := json.Marshal(bulkWaiveRequestBody{
+		ConcernIDs: concernIDs, Reason: reason, Judgement: judgement, TradeoffCost: tradeoffCost, Delegated: delegated,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal bulk waive: %w", err)
 	}

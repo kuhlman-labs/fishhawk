@@ -776,7 +776,7 @@ func TestGateViewMergeReadiness_WireShape(t *testing.T) {
 	t.Cleanup(ts.Close)
 
 	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
-	if res, err := client.ResolveConcerns(ctx, row.ID, []string{raised[0].ID.String()}, "re-ran the reproduction"); err != nil || res.Resolved != 1 {
+	if res, err := client.ResolveConcerns(ctx, row.ID, []string{raised[0].ID.String()}, "re-ran the reproduction", "defect", ""); err != nil || res.Resolved != 1 {
 		t.Fatalf("ResolveConcerns = %+v, %v; want one resolved", res, err)
 	}
 

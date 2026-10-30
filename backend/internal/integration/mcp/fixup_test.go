@@ -794,8 +794,10 @@ func TestE2E_Fixup_WaivedConcernsSuppressHintAndAgreeWithGateView(t *testing.T) 
 		res, werr := session.CallTool(ctx, &mcp.CallToolParams{
 			Name: "fishhawk_waive_concern",
 			Arguments: map[string]any{
-				"concern_id": row.ID.String(),
-				"reason":     "accepted trade-off; not blocking the merge",
+				"concern_id":    row.ID.String(),
+				"reason":        "accepted trade-off; not blocking the merge",
+				"judgement":     "tradeoff",
+				"tradeoff_cost": "the concern ships unaddressed",
 			},
 		})
 		if werr != nil {

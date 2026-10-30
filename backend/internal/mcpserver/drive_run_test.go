@@ -5225,3 +5225,55 @@ func TestDriveRun_UnresolvedDefaultBranch_StopsWithoutSpawn(t *testing.T) {
 		}
 	}
 }
+
+// TestDriveFixupConcernActions_JudgementParam pins, beside its builder, the
+// `judgement` placeholder the out-of-band concern roster carries (ADR-117 D1,
+// #4840): the backend refuses a waive or a defer without a human judgement, so
+// both entries name every allowed value (and that tradeoff needs
+// tradeoff_cost), never the refused unlabelled. The cancel entry takes no
+// judgement and must not carry one. The base params still flow through.
+func TestDriveFixupConcernActions_JudgementParam(t *testing.T) {
+	base := map[string]string{"run_id": "r-1"}
+	actions := driveFixupConcernActions(base)
+	byName := map[string]SuggestedAction{}
+	for _, a := range actions {
+		byName[a.Action] = a
+	}
+	for _, name := range []string{"fishhawk_waive_concern", "fishhawk_defer_concern"} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("roster has no %s entry: %+v", name, actions)
+		}
+		j, ok := a.Params["judgement"]
+		if !ok {
+			t.Errorf("%s params = %v, want a judgement placeholder", name, a.Params)
+			continue
+		}
+		for _, v := range concernJudgementValues {
+			if !strings.Contains(j, v) {
+				t.Errorf("%s judgement placeholder %q does not name %q", name, j, v)
+			}
+		}
+		for _, want := range []string{"REQUIRED", "tradeoff_cost"} {
+			if !strings.Contains(j, want) {
+				t.Errorf("%s judgement placeholder %q does not say %q", name, j, want)
+			}
+		}
+		if strings.Contains(j, "unlabelled") {
+			t.Errorf("%s judgement placeholder %q offers unlabelled, which the backend refuses", name, j)
+		}
+		if a.Params["run_id"] != "r-1" {
+			t.Errorf("%s params = %v, want the base run_id folded in", name, a.Params)
+		}
+	}
+	cancel, ok := byName["fishhawk_cancel_run"]
+	if !ok {
+		t.Fatalf("roster has no fishhawk_cancel_run entry: %+v", actions)
+	}
+	if _, present := cancel.Params["judgement"]; present {
+		t.Errorf("fishhawk_cancel_run params = %v, want no judgement", cancel.Params)
+	}
+	if _, present := base["judgement"]; present {
+		t.Errorf("the shared base params map was mutated: %v", base)
+	}
+}

@@ -2526,6 +2526,9 @@ type fakeConcernRepo struct {
 	// applyDispositionErr, when set, makes ApplyDisposition fail without
 	// transitioning — the system writers' per-row best-effort branch.
 	applyDispositionErr error
+	// applyHumanDispositionErr, when set, makes ApplyHumanDisposition fail
+	// without transitioning — the human verbs' store-failure branch.
+	applyHumanDispositionErr error
 	// importErr / stampErr, when set, make ImportRolledUp / StampOpenAtMerge
 	// fail without writing (E94.1 / #4692 failure-mode tests).
 	importErr error
@@ -2703,6 +2706,39 @@ func (f *fakeConcernRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to
 	return row, nil
 }
 
+// ApplyHumanDisposition mirrors the store (E94.7 / #4840): d.Validate() runs
+// before any read or write, the edge is validated by the real machine, and the
+// outcome plus every judgement field is recorded in one step, with backfill
+// written false and DuplicateOf untouched.
+func (f *fakeConcernRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to concern.State, reason string, d concern.HumanDisposition) (*concern.Concern, error) {
+	if f.applyHumanDispositionErr != nil {
+		return nil, f.applyHumanDispositionErr
+	}
+	if err := d.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := rows[0]
+	if err := concern.Transition(row.State, to); err != nil {
+		return nil, err
+	}
+	row.State = to
+	row.StateReason = reason
+	row.Outcome = d.Outcome
+	row.Judgement = d.Judgement
+	row.JudgementActorKind = d.ActorKind
+	row.JudgementDelegated = d.Delegated
+	row.JudgementBulk = d.JudgementBulk
+	row.JudgementBackfill = false
+	row.TradeoffCost = d.TradeoffCost
+	return row, nil
+}
+
 // ImportRolledUp mirrors the store's semantics (E94.1 / #4692): a copy per
 // source on the parent run and stage, deduped on (run_id, rolled_up_from), a
 // source whose STORED row is no longer open skipped, and the outcome of every
@@ -2849,6 +2885,48 @@ func TestFakeConcernRepo_MirrorsDispositionStore(t *testing.T) {
 	}
 	if n, _ := cr.StampOpenAtMerge(ctx, []uuid.UUID{runID}); n != 1 || row.Outcome != concern.OutcomeOpenAtMerge {
 		t.Errorf("merge stamp = %d, outcome %q; want 1 and open_at_merge", n, row.Outcome)
+	}
+
+	// The human arm (E94.7 / #4840, concern/postgres_test.go
+	// TestApplyHumanDisposition_* pin the store side): an invalid disposition
+	// is refused with nothing written; a valid one records the outcome and
+	// every judgement field, writes backfill false and leaves DuplicateOf alone.
+	human := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 2, "h")
+	dup := uuid.New()
+	human.DuplicateOf = &dup
+	human.JudgementBackfill = true
+	for name, d := range map[string]concern.HumanDisposition{
+		"blank judgement":     {Outcome: concern.OutcomeWaived, ActorKind: "user"},
+		"unlabelled":          {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementUnlabelled, ActorKind: "user"},
+		"tradeoff no cost":    {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "user"},
+		"blank actor kind":    {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect},
+		"non-human outcome":   {Outcome: concern.OutcomeCarried, Judgement: concern.JudgementNoDefect, ActorKind: "user"},
+		"cost with no_defect": {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "user", TradeoffCost: "c"},
+	} {
+		if _, err := cr.ApplyHumanDisposition(ctx, human.ID, concern.StateWaived, "w", d); err == nil {
+			t.Errorf("%s: ApplyHumanDisposition returned nil error, want a refusal", name)
+		}
+		if human.State != concern.StateRaised || human.Judgement != "" || human.Outcome != "" {
+			t.Fatalf("%s: after a refused human disposition: state %s judgement %q outcome %q, want raised / unwritten", name, human.State, human.Judgement, human.Outcome)
+		}
+	}
+	got, err := cr.ApplyHumanDisposition(ctx, human.ID, concern.StateWaived, "accepted", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "agent",
+		Delegated: true, JudgementBulk: true, TradeoffCost: "slower cold start",
+	})
+	if err != nil {
+		t.Fatalf("human disposition: %v", err)
+	}
+	if got.State != concern.StateWaived || got.StateReason != "accepted" || got.Outcome != concern.OutcomeWaived ||
+		got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "agent" || !got.JudgementDelegated ||
+		!got.JudgementBulk || got.JudgementBackfill || got.TradeoffCost != "slower cold start" ||
+		got.DuplicateOf == nil || *got.DuplicateOf != dup {
+		t.Errorf("after human disposition: %+v, want waived / tradeoff / agent / delegated / bulk / no backfill / cost / duplicate_of kept", got)
+	}
+	if _, err := cr.ApplyHumanDisposition(ctx, human.ID, concern.StateDeferred, "d", concern.HumanDisposition{
+		Outcome: concern.OutcomeDeferred, Judgement: concern.JudgementDefect, ActorKind: "user",
+	}); err == nil {
+		t.Error("waived -> deferred human disposition returned nil error, want InvalidTransitionError")
 	}
 }
 

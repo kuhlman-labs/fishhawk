@@ -1485,3 +1485,41 @@ func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
 		t.Errorf("annotated message is not the base message plus a suffix:\n base = %q\n got  = %q", open.Message, blocking.Message)
 	}
 }
+
+// TestDeferConcernAction_JudgementParam pins, beside its builder, the exact
+// Params map of the shared fishhawk_defer_concern hint: the existing
+// concern_ids / parent_epic / n placeholders plus the `judgement` placeholder
+// the backend now requires (ADR-117 D1, #4840). The placeholder names every
+// allowed human value and that tradeoff needs tradeoff_cost, never the refused
+// unlabelled.
+func TestDeferConcernAction_JudgementParam(t *testing.T) {
+	a := deferConcernAction(2)
+	want := map[string]string{
+		"concern_ids": "run.concerns.items[].id",
+		"parent_epic": "<epic the follow-up rolls up to, e.g. #1196>",
+		"n":           "<child number for the [E<epic>.<n>] title>",
+		"judgement":   concernJudgementPlaceholder,
+	}
+	if len(a.Params) != len(want) {
+		t.Errorf("params = %v, want exactly %v", a.Params, want)
+	}
+	for k, v := range want {
+		if a.Params[k] != v {
+			t.Errorf("params[%q] = %q, want %q", k, a.Params[k], v)
+		}
+	}
+	j := a.Params["judgement"]
+	for _, v := range concernJudgementValues {
+		if !strings.Contains(j, v) {
+			t.Errorf("judgement placeholder %q does not name %q", j, v)
+		}
+	}
+	for _, s := range []string{"REQUIRED", "tradeoff_cost"} {
+		if !strings.Contains(j, s) {
+			t.Errorf("judgement placeholder %q does not say %q", j, s)
+		}
+	}
+	if strings.Contains(j, "unlabelled") {
+		t.Errorf("judgement placeholder %q offers unlabelled, which the backend refuses", j)
+	}
+}

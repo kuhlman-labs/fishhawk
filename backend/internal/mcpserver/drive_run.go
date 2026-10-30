@@ -1721,19 +1721,21 @@ func withParams(base, extra map[string]string) map[string]string {
 // waive the concern (no follow-up), defer it into a pre-drafted follow-up, or
 // cancel the run. fishhawk_merge_run is deliberately absent — it only becomes a
 // legal move once the open concerns are resolved (waived/deferred), so naming it
-// here would surface an action that is not yet actionable at this gate.
+// here would surface an action that is not yet actionable at this gate. The
+// waive and defer entries carry the `judgement` placeholder (ADR-117 D1, #4840)
+// because the backend refuses either verb without one.
 func driveFixupConcernActions(params map[string]string) []SuggestedAction {
 	return []SuggestedAction{
 		{
 			Action:       "fishhawk_waive_concern",
-			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id"}),
+			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "judgement": concernJudgementPlaceholder}),
 			Precondition: "an open concern is a false positive or does not block the merge",
 			Consumes:     consumesNone,
 			Reason:       "resolve the concern with NO follow-up and NO fix-up budget; the waive rationale is shown verbatim to later re-reviews, then re-invoke fishhawk_drive_run",
 		},
 		{
 			Action:       "fishhawk_defer_concern",
-			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "parent_epic": "<epic the follow-up rolls up to, e.g. #2091>"}),
+			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "parent_epic": "<epic the follow-up rolls up to, e.g. #2091>", "judgement": concernJudgementPlaceholder}),
 			Precondition: "an open concern is worth a separate change but should not block the merge",
 			Consumes:     consumesNone,
 			Reason:       "file a pre-drafted follow-up work item and resolve the concern in one call (no fix-up budget spent), then re-invoke fishhawk_drive_run",

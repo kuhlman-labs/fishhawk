@@ -1314,3 +1314,129 @@ judgement_bulk = true, judgement_backfill = true, tradeoff_cost = 'slower cold s
 		t.Errorf("EffectiveOutcome = %q, want duplicate_of:%s", ret.EffectiveOutcome(), root.ID)
 	}
 }
+
+// TestApplyHumanDisposition_RecordsJudgementColumns pins the human writer
+// (E94.7 / #4840, ADR-117 D1 phase 2): ONE judged UPDATE records the
+// transition, the outcome and every judgement column, writes
+// judgement_backfill false and leaves duplicate_of untouched. The row is
+// pre-seeded with backfill true and a duplicate_of BY CONSTRUCTION so both
+// behaviours are observable, and the re-read through GetByIDs exercises the
+// hand-synced UpdateReviewConcernStateJudged scan list end to end.
+func TestApplyHumanDisposition_RecordsJudgementColumns(t *testing.T) {
+	h := newRollupHarness(t)
+	rows := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "judged"}, concern.RaisedConcern{Severity: "low", Note: "earlier"})
+	row, earlier := rows[0], rows[1]
+	h.rawSet(t, row.ID, "judgement_backfill = true, duplicate_of = $2", earlier.ID)
+
+	ret, err := h.repo.ApplyHumanDisposition(context.Background(), row.ID, concern.StateWaived, "accepted_tradeoff: slower cold start",
+		concern.HumanDisposition{
+			Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "agent",
+			Delegated: true, JudgementBulk: true, TradeoffCost: "slower cold start",
+		})
+	if err != nil {
+		t.Fatalf("ApplyHumanDisposition: %v", err)
+	}
+	for name, got := range map[string]*concern.Concern{"returned": ret, "re-read": h.get(t, row.ID)} {
+		if got.State != concern.StateWaived || got.StateReason != "accepted_tradeoff: slower cold start" || got.Outcome != concern.OutcomeWaived {
+			t.Errorf("%s: state %s (%q) outcome %q, want waived / the reason / waived", name, got.State, got.StateReason, got.Outcome)
+		}
+		if got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "agent" || got.TradeoffCost != "slower cold start" {
+			t.Errorf("%s: judgement %q actor %q cost %q, want tradeoff / agent / slower cold start", name, got.Judgement, got.JudgementActorKind, got.TradeoffCost)
+		}
+		if !got.JudgementDelegated || !got.JudgementBulk || got.JudgementBackfill {
+			t.Errorf("%s: delegated %v bulk %v backfill %v, want true / true / false", name, got.JudgementDelegated, got.JudgementBulk, got.JudgementBackfill)
+		}
+		if got.DuplicateOf == nil || *got.DuplicateOf != earlier.ID {
+			t.Errorf("%s: duplicate_of = %v, want %s untouched", name, got.DuplicateOf, earlier.ID)
+		}
+		if got.Severity != "high" || got.Note != "judged" || got.RunID != h.parentRun {
+			t.Errorf("%s: severity %q note %q run %s — the scan list misaligned", name, got.Severity, got.Note, got.RunID)
+		}
+	}
+}
+
+// TestApplyHumanDisposition_ReJudgementOverwrites: a later human verb
+// overwrites the stored judgement (the latest human decision wins), and its
+// flags are its own — a resolve's bulk/delegated do not survive an individual
+// waive after a reopen.
+func TestApplyHumanDisposition_ReJudgementOverwrites(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	row := h.routedOn(t, "resolved, reopened, waived")
+	if _, err := h.repo.ApplyHumanDisposition(ctx, row.ID, concern.StateAddressed, "evidence: commit abc", concern.HumanDisposition{
+		Outcome: concern.OutcomeFixed, Judgement: concern.JudgementDefect, ActorKind: "user", Delegated: true, JudgementBulk: true,
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateReopened, "reopened"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := h.repo.ApplyHumanDisposition(ctx, row.ID, concern.StateWaived, "w", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "agent",
+	}); err != nil {
+		t.Fatalf("waive: %v", err)
+	}
+	got := h.get(t, row.ID)
+	if got.Judgement != concern.JudgementNoDefect || got.JudgementActorKind != "agent" || got.JudgementDelegated || got.JudgementBulk || got.Outcome != concern.OutcomeWaived {
+		t.Errorf("after re-judgement: judgement %q actor %q delegated %v bulk %v outcome %q, want no_defect / agent / false / false / waived",
+			got.Judgement, got.JudgementActorKind, got.JudgementDelegated, got.JudgementBulk, got.Outcome)
+	}
+}
+
+// TestApplyHumanDisposition_RefusesInvalid: every invalid disposition is
+// refused BEFORE any write (CF7). raised -> waived is a VALID edge, so without
+// the Validate guard each call would commit — the assertion reads COMMITTED
+// state, not the error's identity.
+func TestApplyHumanDisposition_RefusesInvalid(t *testing.T) {
+	h := newRollupHarness(t)
+	row := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "never judged"})[0]
+	for _, tc := range []struct {
+		name string
+		d    concern.HumanDisposition
+	}{
+		{"blank judgement", concern.HumanDisposition{Outcome: concern.OutcomeWaived, ActorKind: "user"}},
+		{"unlabelled", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementUnlabelled, ActorKind: "user"}},
+		{"tradeoff without cost", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "user"}},
+		{"blank actor kind", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect}},
+		{"cost without tradeoff", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "user", TradeoffCost: "c"}},
+		{"non-human outcome", concern.HumanDisposition{Outcome: concern.OutcomeCarried, Judgement: concern.JudgementNoDefect, ActorKind: "user"}},
+	} {
+		if _, err := h.repo.ApplyHumanDisposition(context.Background(), row.ID, concern.StateWaived, "w", tc.d); err == nil {
+			t.Errorf("%s: ApplyHumanDisposition returned nil error, want a refusal", tc.name)
+		}
+		got := h.get(t, row.ID)
+		if got.State != concern.StateRaised || got.Judgement != concern.JudgementUnlabelled || got.JudgementActorKind != "" || got.Outcome != "" || got.TradeoffCost != "" {
+			t.Fatalf("%s: after a refused disposition: state %s judgement %q actor %q outcome %q cost %q, want raised / unlabelled / empty (nothing written)",
+				tc.name, got.State, got.Judgement, got.JudgementActorKind, got.Outcome, got.TradeoffCost)
+		}
+	}
+}
+
+// TestApplyHumanDisposition_RefusesInvalidTransition: the state machine still
+// guards the edge; a refused edge records no outcome and no judgement.
+func TestApplyHumanDisposition_RefusesInvalidTransition(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	row := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "waived without a judgement"})[0]
+	if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateWaived, "waived"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	_, err := h.repo.ApplyHumanDisposition(ctx, row.ID, concern.StateDeferred, "deferred", concern.HumanDisposition{
+		Outcome: concern.OutcomeDeferred, Judgement: concern.JudgementDefect, ActorKind: "user",
+	})
+	var ite concern.InvalidTransitionError
+	if !errors.As(err, &ite) {
+		t.Fatalf("waived -> deferred err = %v, want InvalidTransitionError", err)
+	}
+	if got := h.get(t, row.ID); got.State != concern.StateWaived || got.Outcome != "" || got.Judgement != concern.JudgementUnlabelled {
+		t.Errorf("after a refused edge: state %s outcome %q judgement %q, want waived / empty / unlabelled", got.State, got.Outcome, got.Judgement)
+	}
+	if _, err := h.repo.ApplyHumanDisposition(ctx, uuid.New(), concern.StateWaived, "w", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementDefect, ActorKind: "user",
+	}); !errors.Is(err, concern.ErrNotFound) {
+		t.Errorf("unknown id err = %v, want ErrNotFound", err)
+	}
+}
