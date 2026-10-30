@@ -7807,3 +7807,254 @@ func TestGithubAutoMerger_MergePullRequestAtHead_FailsClosed(t *testing.T) {
 		t.Errorf("requests served merge=%d graphql=%d, want 0/0", fg.mergeHits, fg.graphqlHits)
 	}
 }
+
+// mmWireGitHub is the E93.2 / #4658 cross-boundary GitHub stand-in: it records
+// the GraphQL auto-merge enable's `method` variable, the REST merge PUT's
+// merge_method + sha, and answers the repository merge-settings query
+// (mergeCommitAllowed / squashMergeAllowed / rebaseMergeAllowed) separately
+// from the enable mutation.
+type mmWireGitHub struct {
+	mu            sync.Mutex
+	enableBody    string
+	settingsBody  string
+	mergeStatus   int
+	enableMethods []any
+	settingsHits  int
+	restMethods   []string
+	restSHAs      []string
+}
+
+func newMMWireClient(t *testing.T, fg *mmWireGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_node","state":"open","head":{"sha":"abc"}}`)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		fg.mu.Lock()
+		defer fg.mu.Unlock()
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &req)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(req.Query, "mergeCommitAllowed") {
+			fg.settingsHits++
+			_, _ = io.WriteString(w, fg.settingsBody)
+			return
+		}
+		fg.enableMethods = append(fg.enableMethods, req.Variables["method"])
+		_, _ = io.WriteString(w, fg.enableBody)
+	})
+	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge", func(w http.ResponseWriter, r *http.Request) {
+		fg.mu.Lock()
+		defer fg.mu.Unlock()
+		var body map[string]string
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		fg.restMethods = append(fg.restMethods, body["merge_method"])
+		fg.restSHAs = append(fg.restSHAs, body["sha"])
+		st := fg.mergeStatus
+		if st == 0 {
+			st = http.StatusOK
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(st)
+		_, _ = io.WriteString(w, `{"merged":true,"sha":"deadbeef"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{BaseURL: srv.URL, Tokens: fakeTokenProvider{}, HTTP: &http.Client{Timeout: 5 * time.Second}}
+}
+
+// mmWireSpec is a minimal non-Fishhawk workflow-v2 admission spec; decl, when
+// non-empty, is appended as the top-level merge_method declaration.
+func mmWireSpec(decl string) []byte {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	if decl != "" {
+		doc += "merge_method: " + decl + "\n"
+	}
+	return []byte(doc)
+}
+
+func mmWireRun(specBytes []byte) *runpkg.Run {
+	inst := int64(42)
+	pr := "https://github.com/acme/widgets/pull/7"
+	return &runpkg.Run{ID: uuid.New(), InstallationID: &inst, PullRequestURL: &pr, WorkflowSpec: specBytes}
+}
+
+const (
+	mmEnableOK         = `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`
+	mmEnableCleanState = `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`
+)
+
+// TestForgeMerger_MergeMethodCrossBoundary is the E93.2 / #4658 CROSS-BOUNDARY
+// test: a run row's cached admission spec (run.WorkflowSpec) flows through
+// newForgeMerger -> server.ForgeMerger -> githubAutoMerger -> a REAL
+// githubclient -> the wire. A `merge_method: merge` declaration sends GraphQL
+// mergeMethod MERGE, a clean-status rejection falls back to REST merge_method
+// `merge`, and the pinned merge sends REST merge_method `merge` + sha; with no
+// declaration every arm sends SQUASH / `squash`, byte-identical to before.
+func TestForgeMerger_MergeMethodCrossBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		spec     []byte
+		wantGQL  string
+		wantREST string
+	}{
+		{"declared merge", mmWireSpec("merge"), "MERGE", "merge"},
+		{"declared rebase", mmWireSpec("rebase"), "REBASE", "rebase"},
+		{"no declaration", mmWireSpec(""), "SQUASH", "squash"},
+		{"no cached spec", nil, "SQUASH", "squash"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("auto-merge enable", func(t *testing.T) {
+				fg := &mmWireGitHub{enableBody: mmEnableOK}
+				m := newForgeMerger(newMMWireClient(t, fg))
+				if err := m.MergePullRequest(context.Background(), mmWireRun(tc.spec), ""); err != nil {
+					t.Fatalf("MergePullRequest: %v", err)
+				}
+				if len(fg.enableMethods) != 1 || fg.enableMethods[0] != tc.wantGQL {
+					t.Errorf("GraphQL mergeMethod = %v, want [%s]", fg.enableMethods, tc.wantGQL)
+				}
+				if len(fg.restMethods) != 0 {
+					t.Errorf("REST merges = %v, want none", fg.restMethods)
+				}
+			})
+			t.Run("clean-status REST fallback", func(t *testing.T) {
+				fg := &mmWireGitHub{enableBody: mmEnableCleanState}
+				m := newForgeMerger(newMMWireClient(t, fg))
+				if err := m.MergePullRequest(context.Background(), mmWireRun(tc.spec), ""); err != nil {
+					t.Fatalf("MergePullRequest: %v", err)
+				}
+				if len(fg.restMethods) != 1 || fg.restMethods[0] != tc.wantREST {
+					t.Errorf("REST merge_method = %v, want [%s]", fg.restMethods, tc.wantREST)
+				}
+			})
+			t.Run("pinned REST merge", func(t *testing.T) {
+				fg := &mmWireGitHub{enableBody: mmEnableOK}
+				pinned, ok := newForgeMerger(newMMWireClient(t, fg)).(server.HeadPinnedMerger)
+				if !ok {
+					t.Fatal("newForgeMerger does not implement server.HeadPinnedMerger")
+				}
+				if err := pinned.MergePullRequestAtHead(context.Background(), mmWireRun(tc.spec), "abc"); err != nil {
+					t.Fatalf("MergePullRequestAtHead: %v", err)
+				}
+				if len(fg.restMethods) != 1 || fg.restMethods[0] != tc.wantREST || fg.restSHAs[0] != "abc" {
+					t.Errorf("REST merge = %v sha %v, want [%s] sha abc", fg.restMethods, fg.restSHAs, tc.wantREST)
+				}
+				if len(fg.enableMethods) != 0 {
+					t.Errorf("GraphQL enables = %v, want none on the pinned path", fg.enableMethods)
+				}
+			})
+		})
+	}
+}
+
+// TestForgeMerger_MergeMethodAttributionCrossBoundary: a REST 405 plus a
+// repository settings read answering mergeCommitAllowed:false attributes the
+// refusal as ErrMergeMethodNotAllowed while keeping ErrPullRequestNotMergeable;
+// a settings read answering ALLOWED leaves the plain refusal unchanged.
+func TestForgeMerger_MergeMethodAttributionCrossBoundary(t *testing.T) {
+	t.Run("disallowed", func(t *testing.T) {
+		fg := &mmWireGitHub{
+			mergeStatus:  http.StatusMethodNotAllowed,
+			settingsBody: `{"data":{"repository":{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}}`,
+		}
+		pinned := newForgeMerger(newMMWireClient(t, fg)).(server.HeadPinnedMerger)
+		err := pinned.MergePullRequestAtHead(context.Background(), mmWireRun(mmWireSpec("merge")), "abc")
+		if !errors.Is(err, forge.ErrMergeMethodNotAllowed) {
+			t.Errorf("err = %v, want errors.Is ErrMergeMethodNotAllowed", err)
+		}
+		if !errors.Is(err, forge.ErrPullRequestNotMergeable) {
+			t.Errorf("err = %v, want errors.Is ErrPullRequestNotMergeable (original sentinel kept)", err)
+		}
+		var ref *server.MergeMethodRefusalError
+		if !errors.As(err, &ref) {
+			t.Fatalf("err = %v, want a *server.MergeMethodRefusalError", err)
+		}
+		if ref.Method != "merge" || ref.Source != server.MergeMethodSourceDeclared || ref.Reason != server.MergeMethodRefusalForgeDisallows {
+			t.Errorf("refusal = %+v, want merge/declared/forge_disallows", ref)
+		}
+		if want := []string{"squash", "rebase"}; strings.Join(ref.Allowed, ",") != strings.Join(want, ",") {
+			t.Errorf("Allowed = %v, want %v", ref.Allowed, want)
+		}
+		if fg.settingsHits != 1 {
+			t.Errorf("settings reads = %d, want 1", fg.settingsHits)
+		}
+	})
+	t.Run("allowed", func(t *testing.T) {
+		fg := &mmWireGitHub{
+			mergeStatus:  http.StatusMethodNotAllowed,
+			settingsBody: `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}}`,
+		}
+		pinned := newForgeMerger(newMMWireClient(t, fg)).(server.HeadPinnedMerger)
+		err := pinned.MergePullRequestAtHead(context.Background(), mmWireRun(mmWireSpec("merge")), "abc")
+		if !errors.Is(err, forge.ErrPullRequestNotMergeable) || errors.Is(err, forge.ErrMergeMethodNotAllowed) {
+			t.Errorf("err = %v, want the plain not-mergeable refusal (method allowed)", err)
+		}
+		if fg.settingsHits != 1 {
+			t.Errorf("settings reads = %d, want 1", fg.settingsHits)
+		}
+	})
+}
+
+// TestGithubAutoMerger_UnparseableSpecFailsClosed: the leaf resolves the
+// method itself and refuses an unparseable admission spec with zero requests.
+func TestGithubAutoMerger_UnparseableSpecFailsClosed(t *testing.T) {
+	fg := &mmWireGitHub{enableBody: mmEnableOK}
+	m := githubAutoMerger{gh: newMMWireClient(t, fg)}
+	r := mmWireRun([]byte("version: [\n"))
+	if err := m.MergePullRequest(context.Background(), r, ""); !errors.Is(err, server.ErrMergeMethodUndeterminable) {
+		t.Errorf("MergePullRequest err = %v, want ErrMergeMethodUndeterminable", err)
+	}
+	if err := m.MergePullRequestAtHead(context.Background(), r, "abc"); !errors.Is(err, server.ErrMergeMethodUndeterminable) {
+		t.Errorf("MergePullRequestAtHead err = %v, want ErrMergeMethodUndeterminable", err)
+	}
+	if len(fg.enableMethods)+len(fg.restMethods)+fg.settingsHits != 0 {
+		t.Errorf("requests served, want none")
+	}
+}
+
+// TestGithubAutoMerger_AllowedMergeMethods: the leaf's settings read fails
+// before any HTTP call on a missing installation id and otherwise reads the
+// repository's settings through githubclient.
+func TestGithubAutoMerger_AllowedMergeMethods(t *testing.T) {
+	fg := &mmWireGitHub{settingsBody: `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":false,"rebaseMergeAllowed":true}}}`}
+	m := githubAutoMerger{gh: newMMWireClient(t, fg)}
+	got, err := m.AllowedMergeMethods(context.Background(), mmWireRun(nil))
+	if err != nil {
+		t.Fatalf("AllowedMergeMethods: %v", err)
+	}
+	if got != (forge.AllowedMergeMethods{Merge: true, Rebase: true}) {
+		t.Errorf("got %+v", got)
+	}
+	noInst := mmWireRun(nil)
+	noInst.InstallationID = nil
+	if _, err := m.AllowedMergeMethods(context.Background(), noInst); err == nil {
+		t.Error("no installation id: err = nil")
+	}
+	if fg.settingsHits != 1 {
+		t.Errorf("settings reads = %d, want 1", fg.settingsHits)
+	}
+}
