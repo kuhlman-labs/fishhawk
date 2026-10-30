@@ -29,8 +29,15 @@ var probeNetSandbox = netsandbox.Probe
 // loopback entries are admitted direct. iso is the resolved credential
 // isolation (#3792): only while iso.active does the profile carry
 // netsandbox.WithCredentialDeny(iso.deny), so under off the profile is
-// byte-identical to the network-only one. A non-empty failReason is a
-// category-C stage failure the caller reports BEFORE any spawn.
+// byte-identical to the network-only one plus the signal section. Every
+// applied profile carries the signal-confinement option (#4855): no process
+// in the agent's tree can signal one outside its own sandbox instance (the
+// host fishhawkd, the preview, another stage's runner or agent), while
+// everything the agent started stays signalable. The probe proves the host
+// accepts that grammar, so a host that rejects it lands on the unavailable
+// branch, never on a sandbox-exec failure at agent spawn. A non-empty
+// failReason is a category-C stage failure the caller reports BEFORE any
+// spawn.
 //
 // Branches (each asserted by acceptancesandbox_test.go):
 //   - invalid mode              -> acceptance_net_sandbox_config (fail)
@@ -42,7 +49,11 @@ var probeNetSandbox = netsandbox.Probe
 //     never spawn under a malformed or over-broad profile — including a
 //     credential path that fails to resolve)
 //   - available                 -> acceptance_net_sandbox_applied
-//     {mechanism:"seatbelt", admitted_ports}, wrapper = sandbox-exec -p <profile>
+//     {mechanism:"seatbelt", admitted_ports, signals_confined:true},
+//     wrapper = sandbox-exec -p <profile>
+//
+// The disabled and unavailable events carry signals_confined:false: no
+// kernel signal denial applied, so none is claimed.
 //
 // The disabled, unavailable and applied events also carry the credential
 // isolation fields (credentialIsolationFields): credential_isolation,
@@ -59,7 +70,7 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 	}
 	if mode == netsandbox.ModeOff {
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"acceptance_net_sandbox_disabled","mode":%q,"enforcement":"env-only"%s}`+"\n",
+			`{"event":"acceptance_net_sandbox_disabled","mode":%q,"enforcement":"env-only","signals_confined":false%s}`+"\n",
 			mode, credentialIsolationFields(iso, false))
 		return nil, "", ""
 	}
@@ -71,7 +82,7 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 			return nil, "acceptance_net_sandbox_required", reason
 		}
 		_, _ = fmt.Fprintf(logSink,
-			`{"event":"acceptance_net_sandbox_unavailable","mode":%q,"reason":%q,"enforcement":"env-only"%s}`+"\n",
+			`{"event":"acceptance_net_sandbox_unavailable","mode":%q,"reason":%q,"enforcement":"env-only","signals_confined":false%s}`+"\n",
 			mode, reason, credentialIsolationFields(iso, false))
 		return nil, "", ""
 	}
@@ -85,7 +96,9 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 			`{"event":"acceptance_net_sandbox_profile","detail":%q}`+"\n", detail)
 		return nil, "acceptance_net_sandbox_profile", detail
 	}
-	var opts []netsandbox.ProfileOption
+	// The signal-confinement option rides every applied profile (#4855);
+	// its only kill switch is FISHHAWK_ACCEPTANCE_NET_SANDBOX=off.
+	opts := []netsandbox.ProfileOption{netsandbox.WithSignalConfinement()}
 	if iso.active {
 		opts = append(opts, netsandbox.WithCredentialDeny(iso.deny))
 	}
@@ -97,7 +110,7 @@ func configureAcceptanceNetSandbox(ctx context.Context, getenv func(string) stri
 	}
 	ports, _ := json.Marshal(netsandbox.AdmittedPorts(profile))
 	_, _ = fmt.Fprintf(logSink,
-		`{"event":"acceptance_net_sandbox_applied","mode":%q,"mechanism":"seatbelt","admitted_ports":%s%s}`+"\n",
+		`{"event":"acceptance_net_sandbox_applied","mode":%q,"mechanism":"seatbelt","admitted_ports":%s,"signals_confined":true%s}`+"\n",
 		mode, ports, credentialIsolationFields(iso, iso.active))
 	// The adapter appends the binary + args (agent.WrapArgv), so the wrapper
 	// is the sandbox-exec prefix with NO argv.

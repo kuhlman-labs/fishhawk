@@ -24,6 +24,13 @@
 // credential from without any env var. A zero-option Profile render is
 // byte-identical to the network-only profile.
 //
+// WithSignalConfinement (#4855) confines signal delivery: a process under the
+// profile may signal only processes in its OWN sandbox instance (everything
+// it started, however deep), never the host fishhawkd, the acceptance
+// preview, another stage's runner or agent, or a process under a separate
+// sandbox-exec instance. A `pkill`/`killall` by name from inside the sandbox
+// is refused with EPERM for every outside match.
+//
 // The package is a stdlib-only leaf mirroring gateiso/sandbox.go's
 // probe/wrap shape. Long-form contract, the empirical matrix, and the
 // stated residuals (nested sandbox_apply refused, unix sockets outside the
@@ -101,8 +108,12 @@ func probeExec(ctx context.Context, name string, args ...string) error {
 	return nil
 }
 
-// probeProfile is the deny-all profile the probe applies against /usr/bin/true.
-const probeProfile = "(version 1)\n(allow default)\n" + denyClause + "\n"
+// probeProfile is the deny-all profile the probe applies against
+// /usr/bin/true. It carries signalClause too (#4855), so a host whose
+// Seatbelt rejects the signal grammar the runner applies reports
+// unavailable here — a loud, pre-spawn degradation — instead of failing
+// sandbox-exec at agent spawn.
+const probeProfile = "(version 1)\n(allow default)\n" + signalClause + denyClause + "\n"
 
 // probe is Probe with its host probes injected.
 func probe(ctx context.Context, goos string, lookPath func(string) (string, error), run func(context.Context, string, ...string) error) (bool, string) {
@@ -125,6 +136,15 @@ const (
 	// rendered after it are the only exceptions. Unix-domain sockets are
 	// NOT covered by `remote ip` and stay open (stated residual).
 	denyClause = `(deny network-outbound (remote ip "*:*"))`
+	// signalClause (#4855) refuses every signal except one whose target is
+	// in the SAME sandbox instance as the sender. `(deny signal (target
+	// others))` is deliberately NOT used: on Darwin 27.0.1 it did not deny an
+	// outside kill (the victim died, kill exited 0). `(target pgrp)` is not
+	// safe either — it admitted an outside victim in the agent's process
+	// group. The allow is exactly the App Sandbox base profile's own
+	// (/System/Library/Sandbox/Profiles/application.sb) and carries no pid,
+	// process-name or path exception.
+	signalClause = "(deny signal)\n(allow signal (target same-sandbox))\n"
 )
 
 // Profile renders the deterministic Seatbelt profile for one acceptance
@@ -147,10 +167,11 @@ const (
 // or a non-numeric / out-of-range port anywhere, returns an error — fail
 // closed rather than render an over-broad or malformed profile.
 //
-// opts add optional sections (WithCredentialDeny), rendered between
-// `(allow default)` and the IP deny; with no opts the render is
-// byte-identical to the network-only profile. An option's error fails the
-// whole render the same way.
+// opts add optional sections (WithSignalConfinement, then
+// WithCredentialDeny), rendered in that fixed order between `(allow
+// default)` and the IP deny regardless of the order opts are passed; with
+// no opts the render is byte-identical to the network-only profile. An
+// option's error fails the whole render the same way.
 func Profile(proxyAddr string, allowHosts []string, opts ...ProfileOption) (string, error) {
 	var o profileOptions
 	for _, opt := range opts {
@@ -205,6 +226,9 @@ func Profile(proxyAddr string, allowHosts []string, opts ...ProfileOption) (stri
 	}
 	var b strings.Builder
 	b.WriteString("(version 1)\n(allow default)\n")
+	if o.signals {
+		b.WriteString(signalClause)
+	}
 	// The credential section renders BEFORE the IP rules, never after the
 	// port allows: a `(deny network-outbound (remote unix-socket ...))`
 	// rendered after `(allow network-outbound (remote ip "localhost:<p>"))`
@@ -225,7 +249,16 @@ func Profile(proxyAddr string, allowHosts []string, opts ...ProfileOption) (stri
 type ProfileOption func(*profileOptions)
 
 type profileOptions struct {
-	cred *CredentialDeny
+	signals bool
+	cred    *CredentialDeny
+}
+
+// WithSignalConfinement (#4855) adds the signal section: no process under
+// the profile can signal a process outside its own sandbox instance, while
+// every process it started — child, double-forked grandchild, its own
+// process group — stays signalable.
+func WithSignalConfinement() ProfileOption {
+	return func(o *profileOptions) { o.signals = true }
 }
 
 // KeychainMachService is the mach service every keychain read goes
