@@ -13,7 +13,7 @@ applies_to: []
 
 # ADR-112: Amend ADR-093 D6: a transferred approval needs a fresh, trusted forge approval at the verified head; an undeterminable or missing one HOLDS rather than ejects on a non-blocked PR
 
-**Status: accepted (v4.1, ratified by the Captain 2026-10-22). Amended by A1 (R3 clarifications), ratified by the Captain 2026-10-23.**
+**Status: accepted (v4.1, ratified by the Captain 2026-10-22). Amended by A1 (R3 clarifications), ratified by the Captain 2026-10-23; by A2 (re-probe due time and round-robin), ratified 2026-10-28; and by A3 (retryable merge-gate legs wait or yield, never drop intent before dispatch), ratified 2026-10-30.**
 - **Review history:**
   - v1: Codex (reject, 10 findings) and fable (approve_with_concerns, 12 findings).
   - v2: Opus, substituting for Codex during its quota outage (reject, 14 findings), and fable (approve_with_concerns, 6 new findings).
@@ -214,3 +214,197 @@ ADR-093 D6 lets a run's Fishhawk review-gate approval TRANSFER across a clean ba
 **Evidence the implementation must carry.**
 - A test with N = 17 aligned yielded rows (16 permanently blocked, 1 eligible) asserting the eligible row is probed within N sweeps.
 - A counterfactual: reverting to oldest-by-`yielded_at` selection turns that test RED.
+
+### Amendment A3: retryable merge-gate legs wait or yield; they never drop merge intent before dispatch (2026-10-30)
+
+**Ratified by the Captain on 2026-10-30.** Reviewed over six rounds by fable and codex (gpt-6-astra). Final verdicts: approve_with_concerns from both, with every concern folded into this text. Motivated by #4780.
+
+**What A3 amends.**
+- **R3**: precedence row 1, for a closed set of legs; the admission bullet, for the same legs.
+- **A1.3**: (a)'s last sentence ("every other yield reason keeps R3's fold-approved rule"), narrowed by A3.4(3); (b)'s single clear predicate; and (c)'s same-reason / same-head continuation key, which A3.7 replaces.
+- **A1.1 / A1.2**: the anchor's lifetime, added to by A3.7.
+- **R3 / A1.1**: the marker compare-and-swap key moves from (`anchored_head_sha`, `yielded_at`) to (`anchored_head_sha`, `yield_revision`) (A3.6).
+- **R5**: the `next_step` and `yield_reason` vocabulary, and the matching OpenAPI enums.
+
+**What stands.** Everything else stands:
+- R2, R4 and A2;
+- ADR-109's dispatch ledger;
+- R3's rule that a wait is never held inside the merge-intent lock.
+
+Every A3 path runs before any dispatch claim. After dispatch, nothing changes:
+- R3 rows 4 and 5 still apply: a typed release yields as row 4, and anything else ejects;
+- an UNCERTAIN claim is never re-armed (ADR-109).
+
+**Why: confirmed mechanisms in today's tree.**
+1. **Merge-on-pass drops on a red check or a pending review.** Only an undeterminable result or `checks_not_green` holds (`merge_queue_merge.go:598-603`).
+2. **Admission drops on any determined row-1 reason, even beside a veto.** Only an exclusive veto yields; an undeterminable result unadmits (`merge_candidate_queue.go:752-773`).
+3. **Any failing suite fails its check name** (`mergeoutcome/ci.go:207-248`). A concurrency-cancelled workflow run concludes its aggregate job (`CI Pass`, `ci.yml:385-399`) `failure`, and that red outweighs a green sibling run.
+4. **Zero reported check runs HOLD with no bound.** The result is undeterminable, which becomes `held: not_mergeable_yet`, which has no expiry (`merge_queue_eligibility.go:538-540`, `merge_queue_yield.go:204`).
+
+The motivating incidents (#4780, 2026-10-28/29) were five green-pass entries that lost their intent or stalled. Each needed operator diagnosis and a manual `merge_run`. Nothing unsafe merged. #4803 is an overlap-guard hold, not a drop, and is out of scope.
+
+**A3.1 The retryable merge-gate set (closed).** These legs are RETRYABLE for an entry that carries merge intent. "Retryable" does not mean temporary: a yielded row may stay yielded until someone repairs it, while its base proceeds.
+
+**Check outcome.** Judged in the PR-head merge-gate leg only; the post-merge CI observation (E82.2) is unchanged.
+- **Unit of judgement.** For each required check name, each check SUITE contributes its LATEST attempt: its highest check-run id for that name.
+- **Pass set.** A latest attempt passes only with a conclusion in the classifier's pass set (`success`, `neutral`, `skipped`).
+- **Pass rule.** The check passes only when EVERY suite's latest attempt passes. Cross-suite aggregation is today's conservative rule, unchanged: a suite never hides another suite's failure.
+- **What changes inside a suite.** Today the highest COMPLETED attempt is selected (`ci.go:250`), so an older pass stands in for a newer pending attempt. The merge-gate variant ADDS a rule: the latest attempt counts whether or not it has completed, so a newer pending attempt blocks an older pass. This is a variant or parameter of the classifier. E82.2's post-merge observation keeps its current semantics.
+
+**(a) Checks red.** Some suite's latest attempt is COMPLETED and either:
+- in the failing set (`failure`, `timed_out`, `action_required`, `startup_failure`); or
+- `cancelled`. A completed cancellation is terminal. The remedy is a re-run, which creates a newer attempt in that suite.
+
+**(b) Checks pending or indeterminate.** Applies at merge-on-pass only. Covers any check outcome that is neither pass nor (a):
+- a queued or in-progress latest attempt;
+- `stale` or any unknown conclusion;
+- a required name with no runs, including zero check runs at the head;
+- a read that failed, was truncated or came back empty;
+- no required-check list while observed checks are not all green (today's `checks_not_green`).
+
+Across suites and across check names, (a) wins over (b).
+
+**(c) Review pending.** A Fishhawk-side review leg fails with `review_pending` or `review_coverage_incomplete`. An intent-bearing entry had a settled, covered round when `merge_run` recorded intent, so this comes from a round re-opened or started after that.
+
+**Everything else keeps existing row-1 behaviour.** That includes:
+- merge conflict, unmergeable, closed PR;
+- a head not recorded by Fishhawk;
+- the overlap guard;
+- an open blocking concern;
+- undeterminable review, spec, acceptance or concern reads.
+
+**A3.2 Merge-on-pass (step 4, pre-lock, pre-claim).**
+- **(a) yields immediately:** `yield_reason: merge_checks_red`, `next_step: retrigger_ci`. The remedy names `fishhawk_retrigger_ci`, then a re-run of `merge_run`.
+- **(b) and (c) are HELD.** HELD means an await-kind outcome with an R3 bounded wait, not `mergeOnPassHeld`. The window and its budget follow A3.7. At expiry the yield reuses `mergeOnPassEnforceExpiredWait`'s protections: entry re-read, in-flight registry, dispatch ledger.
+  - Its expiry test is the merge-gate window of the CURRENT admission epoch. That window starts at the epoch's FIRST qualifying (b) or (c) hold. The start is persisted in a new column, set atomically when the token is spent, and kept for every later (b) or (c) observation in that epoch. It is never `admitted_at`, so advancement and verification time do not consume it. It is never `approval_wait_started_at`: a (b) or (c) hold neither sets nor reads that column.
+  - The window's duration is `FISHHAWKD_MERGE_QUEUE_GATE_WAIT`. It defaults to the approval wait.
+  - The yield keeps the step-4 reason. A veto masked at step 4 surfaces at the next re-probe.
+
+  The yield is:
+  - **(b):** `merge_checks_pending`, `next_step: retry_after`;
+  - **(c):** `merge_review_pending`, `next_step: retry_after`.
+- **Bound.** (b) bounds every checks-read failure at merge-on-pass.
+
+**A3.3 Admission.** Evaluation order is unchanged: the review leg returns before the veto read. For an entry carrying merge intent, the FIRST matching row decides:
+
+| # | At admission | Outcome |
+|---|---|---|
+| 1 | Any undeterminable result | Unadmit, intent kept (unchanged) |
+| 2 | Any determined NON-retryable row-1 reason | Drop (unchanged) |
+| 3 | An observed veto, alone or with (a) | Veto yield, R3 row 2 |
+| 4 | (a) and/or (c), no observed veto | Merge-gate yield, reason by A3.5 tier 2 |
+
+- **The yield** goes through R3's Yield compare-and-swap at the row's admission epoch. The row keeps its FIFO position and episode state.
+- **A veto masked by (c)** at admission (the review leg returns first) surfaces at the next re-probe.
+- **Unchanged:**
+  - An entry WITHOUT recorded intent keeps today's refusal.
+  - The `merge_run` entry site still refuses a red check, or zero check runs, with a hint.
+
+**A3.4 One clear predicate, merge-gate aware (extends A1.3(b)).** An automatic clear clears a yielded intent-bearing row only when, at that clear, ALL hold:
+1. A1.3's predicate holds: the fold is approved and there is no qualifying veto.
+2. If the row-4 flag is set (A3.6), a FRESH snapshot taken at this clear satisfies A1.3(a).
+3. Every A3.1 leg PASSES at the anchored head under the MERGE variant's rules: green required, zero runs is not green, and a failed, truncated or empty read does not pass.
+
+The automatic clears are the pump re-probe, the targeted re-probe, the approval webhook, and the A3.8 trigger. The clear is a compare-and-swap on (`anchored_head_sha`, `yield_revision`) (A3.6).
+
+Head discovery on a re-probe does not depend on the approval gate. A gate-less row still reads the PR head, so a repair push re-anchors the row (A1.1), and the row can clear once the new head passes.
+
+**A3.5 Reason precedence for observed blockers (all sites).** The stored `yield_reason` names the highest current tier:
+1. a veto;
+2. a retryable merge-gate leg, ordered (a) > (b) > (c);
+3. the row-4 condition, when the flag is set and a fresh snapshot shows it present (`forge_review_required`);
+4. otherwise, any non-approved fold, keeping R2's result and reason mapping (`absent`, `dismissed`, `undetermined`, `reviews_truncated`, `provider_unsupported`).
+
+When both tier 3 and tier 4 hold, tier 3 takes precedence. Re-probes move the reason through these tiers with R3's in-place update, which keeps the episode, `yielded_at` and the anchor. `yield_detail` names any lower tier it has read.
+
+**A3.6 The row-4 flag and the yield revision (columns).**
+- **The flag.** When an episode records a row-4 yield, the row's persisted row-4 flag is set. No reason transition clears it. It clears only on a SUCCESSFUL automatic clear (A3.4, with condition 2 met at that clear), or when the episode ends. A forced clear (A3.9) is not automatic, so the flag survives it.
+- **The revision.** A monotone `yield_revision` advances on every yield, clear, re-yield, reason change, flag change and re-anchor. EVERY marker write compare-and-swaps on it. A delayed re-probe therefore cannot clear a newer yield, overwrite a newer reason, or bypass a newer obligation.
+
+**A3.7 Episode, windows and the hold cap (replaces A1.3(c)'s continuation key).**
+- **Episode.** Keyed by the row's base REF. A head move re-anchors (A1.1). A base-tip advance does not end it. A1.2's base-ref retarget, or the entry settling, ends it.
+- **Approval window (tiers 3 and 4).** `approval_wait_started_at` is set by the episode's first approval-fold wait and is RETAINED across a clear or re-admission. A later approval-fold block in the same episode does not get a fresh frozen-base window.
+- **Merge-gate window ((b) and (c)).** Each admission epoch can open ONE fresh bounded window. Every re-advance legitimately restarts CI, and while a window is open the base is frozen (R3 head of line). An entry whose CI completes inside one window therefore merges on that hold.
+- **Hold budget (a token bucket, persisted per row).** Opening a window spends one token. An epoch whose (b) is followed by (c) spends only one.
+  - Capacity: `N` = 3.
+  - Refill: one token per `R` = 60 min that the row spends NOT holding (yielded or waiting), capped at `N`.
+  - With no token, a (b) or (c) yields at once.
+- **What the budget guarantees.**
+  - **Bounded occupancy.** Over any interval starting with a full bucket, an entry opens at most `N + floor(T_nonholding / R)` merge-gate windows. Each window is bounded by `FISHHAWKD_MERGE_QUEUE_GATE_WAIT`. One window per `R` is the sustained refill rate, not a rolling cap.
+  - **Renewed opportunity.** An entry whose budget is spent always regains a usable window. It merges on a hold in which CI and review complete within that window and approval holds. A3 does not claim eventual merge in general; the residual unbounded holds below still apply.
+- **Continuation.** A re-yield continues from the entry's LAST CLEARED row on the same base ref, whatever the reason or head. It keeps that row's `yielded_at` backoff (A1.3(c)), the hold budget, and the approval anchor. Store and audit lookups that key today on head and base SHA, or on the same reason, change to this key.
+- **A2 is unchanged:** service marks and round-robin selection.
+
+**A3.8 Check-run trigger, bounded.** A `check_run` completed webhook triggers a targeted re-probe when the run's NAME is in the required set and its head matches the anchored head of an intent-bearing yielded row. The trigger is:
+- single-flight per run;
+- deduplicated by check-run id;
+- subject to the approval webhook's per-run minimum interval;
+- coalesced, never dropped. A trigger that arrives while a probe is in flight, or inside the minimum interval, schedules exactly one follow-up probe.
+
+The trigger's name filter is the snapshot's contexts. When the snapshot is nil or empty, the filter is every observed check name. This fallback applies to the trigger filter only. It does not change A3.1's classification: under a nil snapshot, a red optional check is still (b).
+
+Each re-probe adds one check-runs listing to its cost, bounded by that interval and the sweep's backoff. The existing triggers remain: re-running `merge_run`, and the approval webhook.
+
+**A3.9 Operator force.** An explicit `merge_run` still forces one re-attempt per call. As today, it bypasses ONLY A1.3(a)'s fresh-snapshot condition. It never bypasses:
+- A3.4(3);
+- verify, the fold or the veto;
+- any dispatch safety check;
+- A1/A2 episode, dedupe and backoff rules.
+
+**Consequences (stated decisions).**
+- **One approval window per episode; merge-gate windows from a refilling budget.** The approval wait (tiers 3 and 4) gets R3's frozen-base window once per episode. Merge-gate holds draw on A3.7's token bucket: a burst of `N` = 3, then one window per `R` = 60 min. An entry that keeps getting re-advanced on a busy base costs one CI run per cycle, and it merges once a window lands with its CI finishing inside it.
+- **Retryable means repairable, not self-clearing.** A yielded row can wait indefinitely for CI repair or a review, while the base proceeds.
+
+**Residuals.**
+- Admission's checks-read uncertainty still unadmits (row 1). That is unchanged. Because unadmission stops the pump (`merge_candidate_queue.go:445`), it can stall the WHOLE base, not just that row. Follow-up.
+- Undeterminable review, spec, acceptance or concern reads keep today's unbounded hold (follow-up).
+- A re-opened round that posts a blocking concern drops as row 1 after A3 waited for it.
+- R5's posted-once yield notice is keyed on `yielded_at`. Under the A3.7 continuation, a genuinely new blocker after a clear is NOT re-posted. This widens A1's #4675 residual; the read surface and `next_actions` stay current.
+- A concurrency-cancelled sibling run (#4780's fifth shape) now yields `merge_checks_red` with `retrigger_ci`. It does not merge through. Superseded-run tolerance was deliberately not adopted, because a run that was cancelled does not prove it was superseded.
+- Out of scope:
+  - the overlap-guard hold on a verify-only pass (#4803);
+  - an inline `merge_run` that merges ahead of a live entry (#4832);
+  - the runner's fetch race (#4835).
+
+**Costs.**
+- One migration adding these columns to `merge_candidate_queue_entries`:
+  - `row4_flag`;
+  - `yield_revision`;
+  - the hold-budget tokens and their refill timestamp;
+  - the per-epoch gate-window start.
+- A new knob, `FISHHAWKD_MERGE_QUEUE_GATE_WAIT`.
+- OpenAPI additions to the `MergeQueueYieldReason` and `MergeQueueNextStep` enums (`v0.openapi.yaml`), plus `v0.md`.
+- Each re-probe makes one extra check-runs listing.
+
+**Evidence the implementation must carry.** Each item is a test, and each control has a counterfactual that turns its test RED:
+- (a) yields immediately, and (b) and (c) hold and then yield at expiry. None of them ever settles `dropped`.
+- Every row of the admission table, including a combined (a)+(c).
+- Check judgement:
+  - an older pass with a newer pending attempt in the same suite reads pending;
+  - an independent red suite blocks;
+  - a completed `cancelled` latest attempt reads (a);
+  - `stale` reads (b);
+  - (a) wins over (b) across suites.
+- A3.4: an approved fold with a failing leg does not clear.
+- A3.5: each tier transition, including row-4 → merge-gate → (CI green, BLOCKED) → `forge_review_required`.
+- A3.6:
+  - row-4, then merge-gate, then BLOCKED briefly gone while checks are red, then green with BLOCKED back: stays yielded;
+  - a delayed re-probe holding an old `yield_revision` fails its clear compare-and-swap after a newer re-yield.
+- A3.7:
+  - a merge-gate hold after a re-advance gets a fresh window;
+  - with the budget empty, a (b) yields at once;
+  - after `R` of non-holding time, one token is restored, and a recovered entry then merges on its next hold (eventual progress);
+  - a (b) then (c) in one epoch spends one token;
+  - a (b) hold never sets or reads `approval_wait_started_at`;
+  - delayed verification followed by CI completing inside the actual hold window merges, because the window starts at the first hold, not at admission;
+  - a flap (red, then a green clear, then red) continues the backoff and the hold count;
+  - the approval anchor is retained across a clear;
+  - a head move keeps the episode;
+  - a base retarget resets it;
+  - with no approval gate, a yielded red H1 followed by a green repair push H2 is re-anchored and cleared.
+- A3.8:
+  - required-name filtering, including the nil-snapshot fallback;
+  - coalescing;
+  - dedupe;
+  - a trigger inside the interval schedules one follow-up and is not dropped.
+- A3.6: a delayed re-probe cannot overwrite a newer tier-2 reason.
