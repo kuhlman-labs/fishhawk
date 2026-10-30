@@ -786,7 +786,7 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 			"the forge refused the pinned merge ("+mergeErr.Error()+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
 		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonFor(mergeErr), mergeErr.Error()
 		if out.ForgeReason == mergeQueueForgeReasonChecksNotSettled {
-			out.ForgeDetail = mergeQueueChecksNotSettledDetail + mergeErr.Error()
+			out.ForgeDetail = mergeQueueChecksNotSettledDetail + mergeQueueYieldDetail(mergeErr.Error())
 		}
 		return out
 	}

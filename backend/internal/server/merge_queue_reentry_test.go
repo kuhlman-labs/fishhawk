@@ -4,13 +4,16 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // ADR-093 slice 3 (D4, E87.6 / #4297): the automatic re-entry sweep. Each
@@ -381,6 +384,128 @@ func TestReentry_Gate5PRStateAndTerminalRunNoReentry(t *testing.T) {
 			w.requireNotReentered(r)
 		})
 	}
+}
+
+// Gate 5's PR-read refusals (#4705): a run with no installation (NULL or 0),
+// a repo that is not owner/name, or no tracked pull request (no URL, or a URL
+// naming no /pull/N) is skipped WITHOUT reading the forge. Each arm starts
+// from the fully eligible fixture, so the refusal is the only one; gates 1-4
+// make no forge call, so any proxied forge response during the sweep means
+// the PR read was attempted. The "control" arm proves the counter observes a
+// PR read. MECHANISMS: narrowing the installation guard to `== nil` lets the
+// zero-installation arm read the PR (counter RED, and the direct call no
+// longer refuses); a PR-number guard of `< 0` makes both URL arms GET
+// /pulls/0 (counter RED, error text RED); ignoring the parseRepoOwnerName
+// error sends an empty RepoRef, so the direct-call error no longer names
+// "is not owner/name" (RED); deleting the nil-installation guard
+// dereferences nil (panic, RED).
+func TestReentry_ReadPRRefusalsSkipWithoutAForgeRead(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		args func(r *mcqRun) []any
+		want string
+	}{
+		{name: "nil installation", sql: `UPDATE runs SET installation_id = NULL WHERE id = $1`, want: "no installation"},
+		{name: "zero installation", sql: `UPDATE runs SET installation_id = 0 WHERE id = $1`, want: "no installation"},
+		{name: "unparsable repo", sql: `UPDATE runs SET repo = 'x-y' WHERE id = $1`, want: "is not owner/name"},
+		{name: "no pull request url", sql: `UPDATE runs SET pull_request_url = NULL WHERE id = $1`, want: "no tracked pull request"},
+		{name: "non-pull-request url", sql: `UPDATE runs SET pull_request_url = $2 WHERE id = $1`,
+			args: func(r *mcqRun) []any { return []any{fmt.Sprintf("https://github.com/x/y/issues/%d", r.pr)} },
+			want: "no tracked pull request"},
+	}
+	countForgeReads := func(w *mqmWorld) *atomic.Int64 {
+		var n atomic.Int64
+		w.mu.Lock()
+		w.onResponse = func(string) { n.Add(1) }
+		w.mu.Unlock()
+		return &n
+	}
+	t.Run("control: an unrefused read reaches the forge", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, _ := w.rentReady("a", mcvDelegatedV0SpecYAML)
+		reads := countForgeReads(w)
+		runRow, err := w.srv.cfg.RunRepo.GetRun(context.Background(), r.id)
+		if err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if _, err := w.srv.mergeQueueReentryReadPR(context.Background(), runRow); err != nil {
+			t.Fatalf("read PR on the eligible fixture: %v", err)
+		}
+		if reads.Load() == 0 {
+			t.Fatal("forge reads = 0 after a PR read: the counter observes nothing")
+		}
+	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, _ := w.rentReady("a", mcvDelegatedV0SpecYAML)
+			args := []any{r.id}
+			if tc.args != nil {
+				args = append(args, tc.args(r)...)
+			}
+			w.exec(tc.sql, args...)
+			reads := countForgeReads(w)
+			runRow, err := w.srv.cfg.RunRepo.GetRun(context.Background(), r.id)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if _, err := w.srv.mergeQueueReentryReadPR(context.Background(), runRow); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("mergeQueueReentryReadPR err = %v, want one naming %q", err, tc.want)
+			}
+			if n := w.sweep(0); n != 0 {
+				t.Fatalf("re-entered = %d, want 0", n)
+			}
+			if n := reads.Load(); n != 0 {
+				t.Fatalf("forge reads = %d, want 0 (the refusal precedes any forge request)", n)
+			}
+			w.requireNotReentered(r)
+		})
+	}
+}
+
+// reentryCommitted reports whether r has at least one re-entry row AND a
+// committed active queue entry other than the ejected ej: the re-entry
+// appends its merge_queue_entered row BEFORE the Enqueue, so the row alone
+// does not prove the entry landed.
+func (w *mqmWorld) reentryCommitted(r *mcqRun, ej mergequeue.Entry) bool {
+	w.t.Helper()
+	if len(w.reentryRows(r)) == 0 {
+		return false
+	}
+	st, found, err := w.store.ActiveForRun(context.Background(), r.id)
+	if err != nil {
+		w.t.Fatalf("active entry: %v", err)
+	}
+	return found && st.Entry.ID != ej.ID
+}
+
+// TestRunMergeQueueYieldReprobe_ReentersThroughTheTicker drives the
+// production loop end to end: its ticker, its process-local clock (the first
+// tick's since is 0, the restart window) and its keyset pager re-enter the
+// fully eligible candidate with no hand-driven sweep, and it re-enters
+// EXACTLY once although the ticker keeps ticking. The poll waits until the
+// re-entered entry is COMMITTED (not just its row), because cancelling the
+// loop between the row append and the Enqueue would orphan the row.
+// MECHANISM: removing the sweepMergeQueueReentries call from the loop leaves
+// no re-entry: RED at the scaled deadline.
+func TestRunMergeQueueYieldReprobe_ReentersThroughTheTicker(t *testing.T) {
+	w := newMQMWorld(t)
+	r, ej := w.rentReady("a", mcvDelegatedV0SpecYAML)
+	ctx, cancel := context.WithCancel(context.Background())
+	go w.srv.RunMergeQueueYieldReprobe(ctx, 5*time.Millisecond)
+	deadline := time.Now().Add(timescale.D(10 * time.Second))
+	for !w.reentryCommitted(r, ej) {
+		if time.Now().After(deadline) {
+			cancel()
+			w.srv.bgMergeQueuePump.Wait()
+			t.Fatal("the reprobe loop re-entered nothing before the deadline")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	w.srv.bgMergeQueuePump.Wait()
+	w.requireReentered(r, ej, "h1")
 }
 
 // Starvation (#4297): mergeQueueReentryLimit+1 OLDER candidates that never
