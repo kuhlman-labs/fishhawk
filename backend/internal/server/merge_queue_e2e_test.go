@@ -403,25 +403,41 @@ func TestMergeQueueE2E_InlineDispatchPinsGateHead(t *testing.T) {
 // TestMergeQueueE2E_InlineHeadMovedRefusalReleasesClaim pins (#4641) the
 // inline head-moved mapping on the real ledger: a pinned dispatch the forge
 // refuses for a head mismatch answers 409 merge_head_moved naming the pinned
-// head and its refusal_basis, RELEASES the claim (no claim row, a
-// merge_dispatch_settled row outcome released at h1) and the next re-invoke
-// claims again. The run is gate-less, so the message names only the admitted
-// head, never an evaluated approval (ruling C2). Only the precheck / rest_sha
-// bases claim "nothing merged"; graphql_reread is hedged (ruling C3).
-// Counterfactual: deleting the merge_head_moved branch answers 502
-// merge_dispatch_failed, RED.
+// head and its refusal_basis. On a basis the forge guarantees applied nothing
+// (precheck, rest_sha) and on a bare REST 409 naming no basis it RELEASES the
+// claim (no claim row, a merge_dispatch_settled row outcome released at h1)
+// and the next re-invoke claims again. On graphql_reread (#4749) the claim is
+// LEFT dispatch_failed, the settled row records the head-movement detail, the
+// message names the held claim with the uncertain-basis clause, and the
+// re-invoke answers merge_already_dispatched without a second dispatch. A
+// precheck refusal whose release does not land (approval condition C1) is
+// reported from the SETTLE outcome: dispatch_failed, without the
+// uncertain-basis clause. The run is gate-less, so the message names only the
+// admitted head, never an evaluated approval (ruling C2). Only the precheck /
+// rest_sha bases claim "nothing merged"; graphql_reread is hedged (ruling C3).
+// Counterfactuals: deleting the merge_head_moved branch answers 502
+// merge_dispatch_failed; neutralising mergeDispatchHeadMismatchUncertain
+// releases the graphql_reread claim (re-invoke 200), RED.
 func TestMergeQueueE2E_InlineHeadMovedRefusalReleasesClaim(t *testing.T) {
+	const uncertainClause = "does not prove the forge applied nothing"
 	for _, tc := range []struct {
-		basis      string
-		guaranteed bool
+		name         string
+		basis        string
+		guaranteed   bool
+		released     bool // hard-coded expectation, never derived from the production predicate
+		releaseFails bool
 	}{
-		{githubclient.HeadMismatchPrecheck, true},
-		{githubclient.HeadMismatchRESTSha, true},
-		{githubclient.HeadMismatchGraphQLReread, false},
-		{"", false}, // a leaf that names no basis
+		{"basis precheck", githubclient.HeadMismatchPrecheck, true, true, false},
+		{"basis rest_sha", githubclient.HeadMismatchRESTSha, true, true, false},
+		{"basis graphql_reread", githubclient.HeadMismatchGraphQLReread, false, false, false},
+		{"basis ", "", false, true, false}, // a leaf that names no basis (the bare REST 409)
+		{"basis precheck release fails", githubclient.HeadMismatchPrecheck, true, false, true},
 	} {
-		t.Run("basis "+tc.basis, func(t *testing.T) {
+		t.Run(tc.name, func(t *testing.T) {
 			w, m := newMQEWorld(t)
+			if tc.releaseFails {
+				w.srv.cfg.MergeQueue = mqeReleaseFailQueue{Store: w.store}
+			}
 			r := w.verified("hm", "h1")
 			cause := fmt.Errorf("pinned enable: %w", forge.ErrMergeConflict)
 			if tc.basis != "" {
@@ -449,27 +465,67 @@ func TestMergeQueueE2E_InlineHeadMovedRefusalReleasesClaim(t *testing.T) {
 			if got := strings.Contains(msg, "Nothing merged"); got != tc.guaranteed {
 				t.Fatalf("message claims nothing merged = %v, want %v: %q", got, tc.guaranteed, msg)
 			}
-			if !strings.Contains(msg, "claim was released") || strings.Contains(msg, "dispatch_failed") {
-				t.Fatalf("message = %q, want the released claim named and no dispatch_failed", msg)
-			}
-			if st, _ := w.claim(r); st != "" {
-				t.Fatalf("claim = %q, want released (no row)", st)
-			}
 			settled := w.rows(r, categoryMergeDispatchSettled)
 			if len(settled) != 1 {
 				t.Fatalf("merge_dispatch_settled rows = %d, want 1", len(settled))
 			}
-			if p := w.payload(settled[0]); p["outcome"] != string(mergeDispatchRelease) || p["head_sha"] != "h1" {
-				t.Fatalf("settled payload = %v, want released at h1", p)
+			sp := w.payload(settled[0])
+			if tc.basis != "" && (sp["refusal_basis"] != tc.basis || sp["expected_head_sha"] != "h1" || sp["observed_head_sha"] != "h2") {
+				t.Fatalf("settled payload = %v, want refusal_basis %s expected h1 observed h2", sp, tc.basis)
+			}
+			if tc.released {
+				if !strings.Contains(msg, "claim was released") || strings.Contains(msg, "dispatch_failed") {
+					t.Fatalf("message = %q, want the released claim named and no dispatch_failed", msg)
+				}
+				if st, _ := w.claim(r); st != "" {
+					t.Fatalf("claim = %q, want released (no row)", st)
+				}
+				if sp["outcome"] != string(mergeDispatchRelease) || sp["head_sha"] != "h1" {
+					t.Fatalf("settled payload = %v, want released at h1", sp)
+				}
+				m.mu.Lock()
+				m.inlineErr = nil
+				m.mu.Unlock()
+				if resp := w.mergeRun(r); resp.Code != http.StatusOK {
+					t.Fatalf("re-invoke = %d %s, want 200 (the released claim is claimable)", resp.Code, resp.Body.String())
+				}
+				return
+			}
+			if strings.Contains(msg, "claim was released") || !strings.Contains(msg, "dispatch_failed") {
+				t.Fatalf("message = %q, want the held dispatch_failed claim and no released claim", msg)
+			}
+			if got, want := strings.Contains(msg, uncertainClause), !tc.releaseFails; got != want {
+				t.Fatalf("message uncertain-basis clause = %v, want %v: %q", got, want, msg)
+			}
+			if tc.releaseFails && !strings.Contains(msg, "claim release did not land, so it is dispatch_failed") {
+				t.Fatalf("message = %q, want the release that did not land named", msg)
+			}
+			if st, path := w.claim(r); st != string(mergequeue.DispatchFailed) || path != mergequeue.DispatchPathInline {
+				t.Fatalf("claim = %q/%q, want dispatch_failed/inline", st, path)
+			}
+			if sp["outcome"] != string(mergeDispatchUncertain) || sp["head_sha"] != "h1" {
+				t.Fatalf("settled payload = %v, want dispatch_failed at h1", sp)
 			}
 			m.mu.Lock()
 			m.inlineErr = nil
 			m.mu.Unlock()
-			if resp := w.mergeRun(r); resp.Code != http.StatusOK {
-				t.Fatalf("re-invoke = %d %s, want 200 (the released claim is claimable)", resp.Code, resp.Body.String())
+			again := w.mergeRun(r)
+			if again.Code != http.StatusConflict || mqeCode(t, again.Body.Bytes()) != "merge_already_dispatched" {
+				t.Fatalf("re-invoke = %d %s, want 409 merge_already_dispatched (the claim is held)", again.Code, again.Body.String())
+			}
+			if n := m.inlineCalls(); n != 1 {
+				t.Fatalf("inline dispatches = %d, want 1 (the held claim admits no second dispatch)", n)
 			}
 		})
 	}
+}
+
+// mqeReleaseFailQueue fails ReleaseMergeDispatch, so a releasable refusal's
+// settle leaves the claim dispatch_failed (approval condition C1).
+type mqeReleaseFailQueue struct{ mergequeue.Store }
+
+func (mqeReleaseFailQueue) ReleaseMergeDispatch(context.Context, mergequeue.DispatchClaim) error {
+	return errors.New("injected release failure")
 }
 
 // Ruling R1 test 3 (concern db4a28ac): a request cancelled mid-dispatch still

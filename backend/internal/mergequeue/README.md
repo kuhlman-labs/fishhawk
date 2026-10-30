@@ -383,16 +383,23 @@ change nothing (ADR-093 slice 2, rejection item 1):
     whose outcome is uncertain. A head-PINNED inline or delegated dispatch
     the forge refuses for a head mismatch
     ([#4641](https://github.com/kuhlman-labs/fishhawk/issues/4641)) carries
-    `forge.ErrMergeConflict` on every arm and releases: the client pre-check
-    (no mutation sent) and the pinned REST PUT's 409 (`sha` mismatch) are
-    forge guarantees, but the pinned auto-merge enable's `graphql_reread`
-    basis (a GraphQL error, then a fresh read showing a different head) is
-    INFERRED, so that enable may in fact have armed auto-merge at the pinned
-    head. That is the one release the forge does not guarantee. It is taken
-    because a re-dispatch re-runs the merge-candidate gate (and, on a
-    declared approval gate, the forge-approval fold) at the new head
-    (`backend/internal/server/README.md` § "ADR-112 forge-approval fold",
-    head-pinned bullets). A pinned GraphQL
+    `forge.ErrMergeConflict` on every arm with a
+    `*githubclient.HeadMismatchError`, and its basis decides the claim
+    ([#4749](https://github.com/kuhlman-labs/fishhawk/issues/4749)): the
+    client pre-check (`precheck`, no mutation sent) and the pinned REST PUT's
+    409 (`rest_sha`, `sha` mismatch) are forge guarantees and release. The
+    pinned auto-merge enable's `graphql_reread` basis (a GraphQL error, then
+    a fresh read showing a different head) is INFERRED: a GraphQL execution
+    error can accompany an applied mutation, so that enable may in fact have
+    armed auto-merge at the pinned head. It is UNCERTAIN: the claim moves to
+    `dispatch_failed` and only reconciliation or the operator re-arm clears
+    it; an empty or unrecognised basis is treated the same (fail closed). A
+    bare `forge.ErrMergeConflict` with no `HeadMismatchError` (the REST PUT
+    409 on the queue's leaf, the unpinned ladder, GitLab) still releases.
+    The settle's `merge_dispatch_settled` row records `refusal_basis`,
+    `expected_head_sha` and `observed_head_sha` as separate keys
+    (`backend/internal/server/docs/merge-queue.md` § "ADR-112 forge-approval
+    fold", head-pinned bullets). A pinned GraphQL
     error whose re-read shows the SAME head, or whose re-read fails, stays a
     bare `forge.ErrValidation`: uncertain. **`ReleaseMergeDispatch(claim)`**
     DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,

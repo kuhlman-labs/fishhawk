@@ -86,6 +86,8 @@ func TestMergeRun_ToolDescriptionNamesHeadMoved(t *testing.T) {
 		"graphql_reread / unknown is inferred, so auto-merge may be armed at the pinned head",
 		"Re-invoke once the head settles",
 		"the re-invoke re-gates at the new head",
+		// #4749: graphql_reread holds the claim dispatch_failed.
+		"left dispatch_failed on graphql_reread, needing the operator re-arm",
 	} {
 		if !strings.Contains(toolErrors, want) {
 			t.Errorf("fishhawk_merge_run Tool errors list missing %q:\n%s", want, toolErrors)

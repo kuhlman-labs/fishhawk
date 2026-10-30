@@ -433,8 +433,10 @@ deadline): `backend/internal/mergequeue/README.md`.
   existing claim and a claim error are each observe-only with the merger
   never called; a dispatch failure after the claim is classified (release or
   `dispatch_failed`) and surfaces the error, except a head-PINNED dispatch
-  the forge refused for a head mismatch, which releases the claim and is
-  observe-only (`autoDriveNoteHeadMoved`, #4641). The inline path re-observes a
+  the forge refused for a head mismatch, which settles the claim by its
+  refusal basis (released on precheck / rest_sha, `dispatch_failed` on
+  graphql_reread, #4749) and is observe-only (`autoDriveNoteHeadMoved`,
+  #4641). The inline path re-observes a
   landed merge BEFORE settling the claim (as merge-on-pass does), so a
   merge that landed answers `already_merged` and leaves the claim
   `dispatched`. Inline: a `merge_checks_pending`
@@ -569,7 +571,16 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   `merge_candidate_verified` read error or an append failure (inline 503
   `merge_authorization_unrecorded`, queue holds `authorization_unrecorded`,
   delegated observe-only), BEFORE any append: it never writes
-  `review_gate_approval_seq` 0.
+  `review_gate_approval_seq` 0. `verify_pass` (`verifyPassReference`,
+  #4749) resolves the SAME predicate that admitted the head
+  (`mergeCandidateVerifyState`): a recorded pass is `{source: recorded,
+  merge_candidate_verified_sequence}`, an enforce-mode transfer is `{source:
+  transferred, merge_candidate_verdict_transferred_sequence,
+  transferred_from, root_head}`, and `not_required` appears ONLY on a head
+  that predicate determined needs no verify (no verify command, a
+  runner-gated or otherwise unclassified head). Any other state (unverified,
+  in_flight, failed, a transfer ignored in off/shadow mode) fails closed
+  before any append, refused exactly like an evidence-read error.
 - **Unresolvable veto names `dismiss_review` (#4764).** Every
   `veto_undetermined` fold (a `CHANGES_REQUESTED` author whose permission
   read failed, under ANY error class: 404, 500, timeout;
@@ -636,17 +647,26 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   <https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request>). Ladder
   contract: `backend/internal/githubclient/README.md` § "Head-pinned
   auto-merge ladder".
-- **Typed refusal, claim released.** A head mismatch is
+- **Typed refusal; the basis decides the claim (#4749).** A head mismatch is
   `forge.ErrMergeConflict` carrying a `*githubclient.HeadMismatchError` that
-  names its basis. The existing `classifyMergeDispatchOutcome` releases the
-  claim (`merge_dispatch_settled` outcome `released`). Inline answers 409
+  names its basis. `classifyMergeDispatchOutcome` releases the claim
+  (`merge_dispatch_settled` outcome `released`) ONLY on `precheck` or
+  `rest_sha`; `graphql_reread`, or an empty or unrecognised basis, is
+  uncertain (`mergeDispatchHeadMismatchUncertain`): the claim is
+  `dispatch_failed` and a re-invoke answers `merge_already_dispatched` until
+  reconciliation or the operator re-arm. The settled row carries
+  `refusal_basis`, `expected_head_sha` and `observed_head_sha`. The reported
+  claim state is the SETTLE outcome (a release that did not land is
+  `dispatch_failed` too, worded as exactly that). Inline answers 409
   `merge_head_moved` with details `{run_id, pr_url, verdict_sequence,
   head_sha (the pin), refusal_basis, next_step: "fishhawk_merge_run"}`; the
   re-observe still runs first, so a PR that landed answers `already_merged`.
   Delegated returns `mergeDispatchHeadMoved`, which is observe-only
   `autoDriveNoteHeadMoved` with an INFO log (`pinned_to`, `refusal_basis`,
-  `forge_guarantees_nothing_applied`), never "merge dispatch failed"; the
-  next tick re-gates at the new head. The message and the log name "the head
+  `forge_guarantees_nothing_applied`, `claim_outcome` = the settle outcome),
+  never "merge dispatch failed"; on a released claim the next tick re-gates
+  at the new head, on a `dispatch_failed` one every later tick is
+  observe-only already-claimed. The message and the log name "the head
   the merge-candidate gate admitted". They add "the head the approval was
   evaluated at" (and the fold, for the re-invoke) ONLY when the review stage
   declares an approval gate (`forgeApprovalFolded`): a gate-less run has no
@@ -660,11 +680,15 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   mutation had in fact applied, auto-merge may be armed at the pinned head.
   `unknown` (a leaf with no `HeadMismatchError`) is treated the same. For
   both, the 409 message says the basis is not a forge guarantee and tells the
-  operator to inspect the pull request. The claim is still released: a
-  re-invoke re-runs the gate (and, on a declared gate, the fold) at the new
-  head, so no Fishhawk re-dispatch merges the moved head unapproved. An
-  auto-merge that enable may have armed is outside that guarantee; it is the
-  same exposure as the residual below.
+  operator to inspect the pull request. For `graphql_reread` the claim is
+  NOT released (#4749): it is `dispatch_failed`, the message says the
+  refusal_basis does not prove the forge applied nothing, and a re-invoke
+  answers `merge_already_dispatched` until the operator re-arm (GitHub's
+  ordinary refusal of a stale `expectedHeadOid` also lands here, so that
+  case now costs a re-arm). `unknown` from a bare REST 409 (no
+  `HeadMismatchError`) still releases: a re-invoke re-runs the gate (and, on
+  a declared gate, the fold) at the new head, so no Fishhawk re-dispatch
+  merges the moved head unapproved.
 - **Empty head keeps the unpinned ladder.** An empty head means no head was
   evaluated: an ungated D7 admit (every GitLab-family run, any run the gate
   cannot probe) or a merged-PR admit. An unpinned `ErrMergeConflict` keeps
