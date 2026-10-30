@@ -7484,6 +7484,47 @@ func TestServe_MergeQueueApprovalWait(t *testing.T) {
 	}
 }
 
+// TestResolveMergeQueueGateWait pins the docs/adr/112 A3.2 merge-gate window
+// flag (#4780): empty answers the approval wait, a positive duration resolves,
+// and 0s, a negative duration and garbage each REFUSE startup naming the flag
+// and its env var. The refusing invocation carries bootstrapAbortFlag, so with
+// the validation deleted startup still aborts at the later --review-resolution
+// check and the log assertion is what goes RED.
+func TestResolveMergeQueueGateWait(t *testing.T) {
+	t.Run("empty is the approval wait", func(t *testing.T) {
+		if d, err := resolveMergeQueueGateWait("", 17*time.Minute); err != nil || d != 17*time.Minute {
+			t.Fatalf("empty = %s, %v; want the approval wait 17m", d, err)
+		}
+	})
+	t.Run("positive", func(t *testing.T) {
+		if d, err := resolveMergeQueueGateWait("12m", 30*time.Minute); err != nil || d != 12*time.Minute {
+			t.Fatalf("12m = %s, %v", d, err)
+		}
+	})
+	for _, bad := range []string{"0s", "-1m", "garbage"} {
+		t.Run(bad, func(t *testing.T) {
+			d, err := resolveMergeQueueGateWait(bad, 30*time.Minute)
+			if err == nil {
+				t.Fatalf("%s resolved to %s", bad, d)
+			}
+			for _, want := range []string{"--merge-queue-gate-wait", "FISHHAWKD_MERGE_QUEUE_GATE_WAIT"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+			code, log := serveWithProfile(t, "-merge-queue-gate-wait", bad, bootstrapAbortFlag)
+			if code != exitFailure {
+				t.Fatalf("exit = %d, want %d; log:\n%s", code, exitFailure, log)
+			}
+			for _, want := range []string{"invalid merge-queue gate wait", "FISHHAWKD_MERGE_QUEUE_GATE_WAIT"} {
+				if !strings.Contains(log, want) {
+					t.Errorf("log does not name %q:\n%s", want, log)
+				}
+			}
+		})
+	}
+}
+
 // TestToChildcompletionConflict pins the ONE orchestrator → childcompletion
 // SliceConflict copy (ADR-096 D4 / #4294): every field, the base attribution
 // included, crosses the bridge, and nil maps to nil. A field the helper drops

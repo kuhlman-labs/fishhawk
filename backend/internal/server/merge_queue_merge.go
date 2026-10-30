@@ -33,7 +33,15 @@ import (
 // with the head PINNED to the verified SHA.
 //
 // A non-approved fold never drops or ejects an entry carrying intent: it
-// waits at the head, then yields (ADR-112 R3, merge_queue_yield.go).
+// waits at the head, then yields (ADR-112 R3, merge_queue_yield.go). Nor
+// does a retryable merge-gate leg at step 4 (docs/adr/112 A3.2, #4780): a red
+// or cancelled required check (A3.1(a)) yields merge_checks_red /
+// retrigger_ci at once; pending, unreported or unreadable checks (A3.1(b))
+// and a settling implement-review round (A3.1(c)) hold the line on a
+// per-admission-epoch merge-gate window (mergeOnPassEnforceGateWait,
+// Store.GateWait), then yield merge_checks_pending / merge_review_pending.
+// These A3 paths all run BEFORE any dispatch claim; after a claim, ADR-112
+// R3 rows 4 and 5 (a forge refusal) are unchanged.
 //
 // It returns an OUTCOME the pump applies with the admission-epoch CAS; the one
 // queue write it makes itself is the merged settle after the forge accepted
@@ -347,15 +355,26 @@ const (
 	// ordinary merge-on-pass decides from scratch (fold and veto in-lock).
 	mergeOnPassRedecide mergeOnPassKind = "redecide"
 	// mergeOnPassExpiredYielded (ADR-112 R3, #4748): the expired-wait
-	// enforcement (mergeOnPassEnforceExpiredWait) yielded the entry under the
-	// run's merge-intent lock instead of applying a readvance or a hold; the
-	// pump continues to the next held entry.
+	// enforcement (mergeOnPassEnforceExpiredWait) or the merge-gate wait
+	// enforcement (mergeOnPassEnforceGateWait, docs/adr/112 A3.2) yielded the
+	// entry under the run's merge-intent lock instead of applying a
+	// readvance, a hold or a merge-gate wait; the pump continues to the next
+	// held entry.
 	mergeOnPassExpiredYielded mergeOnPassKind = "expired_yielded"
+	// mergeOnPassAwaitGate (docs/adr/112 A3.2, #4780): step 4 read a
+	// retryable merge-gate leg (A3.1) and nothing non-retryable. An AWAIT
+	// kind, never mergeOnPassHeld: Yield is the step-4 yield
+	// (mergeGateYieldFor). Immediate (A3.1(a) red) yields at once;
+	// otherwise ((b) pending, (c) review) the entry holds the line on the
+	// epoch's merge-gate window (Store.GateWait) and yields at its expiry
+	// or with no hold token left. mergeOnPassEnforceGateWait applies it.
+	mergeOnPassAwaitGate mergeOnPassKind = "await_gate"
 )
 
 // mergeOnPassOutcome is mergeQueueMergeOnPass's answer. State is set only on
 // mergeOnPassSettle (and mergeOnPassMerged: StateMerged); Yield only on
-// mergeOnPassAwaitApproval and mergeOnPassYield (Reason is then Yield.Reason).
+// mergeOnPassAwaitApproval, mergeOnPassAwaitGate and mergeOnPassYield (Reason
+// is then Yield.Reason).
 // ForgeReason and ForgeDetail are set only on a forge_merge_refused ejection
 // (ADR-093 D4): the typed refusal code and the forge's untrusted refusal text,
 // which the merge_queue_ejected writer sanitises. InFlightMarked reports that
@@ -382,6 +401,12 @@ type mergeOnPassOutcome struct {
 	InFlightMarked bool
 	// ExpiryYield: the yield an expired approval wait applies (nil: none).
 	ExpiryYield *mergeQueueYield
+	// GateRemaining (mergeOnPassAwaitGate only): the open merge-gate
+	// window's remaining time, for the pump's wait log.
+	GateRemaining time.Duration
+	// Immediate (mergeOnPassAwaitGate only, docs/adr/112 A3.2): the
+	// merge-gate yield is (a) red and yields at once, with no window.
+	Immediate bool
 }
 
 // Merge-on-pass reasons. Hold reasons leave the entry; eject/drop reasons are
@@ -592,12 +617,23 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 		return held(mergeOnPassReasonVerifyNotPassed, "the head's merge-candidate verify state is "+st.State)
 	}
 
-	// 4. Eligibility, merge variant, with the intent anchor (D6 transfer).
+	// 4. Eligibility, merge variant, with the intent anchor (D6 transfer),
+	// classified onto docs/adr/112 A3.1's legs (A3.2): an undeterminable
+	// non-check leg holds (the merge variant answers every checks-read
+	// failure as checks_not_green, so this is never a check read; A3
+	// residual); any non-retryable determined reason drops, even beside a
+	// retryable one; otherwise the retryable legs await the merge gate:
+	// (a) red yields at once, (b) pending and (c) review hold on the epoch's
+	// window (mergeOnPassEnforceGateWait). Never a drop for a retryable leg.
 	anchor := mergeQueueIntentAnchor{Sequence: req.IntentSequence, BaseRef: e.BaseRef}
 	elig := s.mergeQueueMergeEligibility(ctx, runRow, head, anchor)
 	if !elig.Eligible {
-		if elig.Undeterminable || onlyChecksNotGreen(elig) {
+		legs := mergeGateLegsOf(elig)
+		if legs.Undeterminable {
 			return held(mergeOnPassReasonNotMergeable, mergeQueueReasonsText(elig.Reasons))
+		}
+		if y, ok := mergeGateYieldFor(legs, elig); ok && !legs.Other {
+			return mergeOnPassOutcome{Kind: mergeOnPassAwaitGate, Reason: y.Reason, Detail: y.Detail, HeadSHA: head, Yield: y, Immediate: legs.Red}
 		}
 		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible,
 			"the run is no longer merge-queue eligible ("+mergeQueueReasonsText(elig.Reasons)+"); fishhawk_merge_run re-enqueues it at the tail once it is")
@@ -631,18 +667,85 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 	return out
 }
 
-// onlyChecksNotGreen reports a result whose every reason is checks_not_green
-// (a pending check: hold, never drop).
-func onlyChecksNotGreen(r mergeQueueEligibilityResult) bool {
-	if len(r.Reasons) == 0 {
-		return false
+// mergeQueueGateWait is the configured merge-gate window (docs/adr/112
+// A3.2): Config.MergeQueueGateWait when positive, else the approval wait.
+func (s *Server) mergeQueueGateWait() time.Duration {
+	if s.cfg.MergeQueueGateWait > 0 {
+		return s.cfg.MergeQueueGateWait
 	}
-	for _, x := range r.Reasons {
-		if x.Code != mergeQueueReasonChecksNotGreen {
-			return false
+	return s.mergeQueueApprovalWait()
+}
+
+// mergeOnPassEnforceGateWait applies a step-4 await_gate outcome (docs/adr/112
+// A3.2, #4780); any other kind is returned unchanged. Immediate ((a) red) goes
+// straight to the protected yield. Otherwise ((b) pending, (c) review)
+// Store.GateWait opens or continues the epoch's merge-gate window OUTSIDE the
+// merge-intent lock: a write error holds (the pump stops, the next pump
+// re-decides); an open, unexpired window returns o (the entry holds the line,
+// the base frozen); Expired or NoToken (the hold budget is empty) yields.
+//
+// The protected yield takes the run's merge-intent lock, runs the pre-yield
+// refusal (mergeOnPassPreYieldRefusal: entry re-read, in-flight registry, D1
+// claim; a refusal holds with no yield), re-judges GateWait for a window
+// (idempotent within the epoch: it continues, never spends) and yields o.Yield
+// through yieldMergeQueueEntry, answering mergeOnPassExpiredYielded. It never
+// calls ApprovalWait: a merge-gate hold never touches approval_wait_started_at.
+func (s *Server) mergeOnPassEnforceGateWait(ctx context.Context, req mergeOnPassRequest, o mergeOnPassOutcome) mergeOnPassOutcome {
+	if o.Kind != mergeOnPassAwaitGate {
+		return o
+	}
+	e := req.Entry
+	if !o.Immediate {
+		res, err := s.cfg.MergeQueue.GateWait(ctx, e.ID, e.AdmissionEpoch, s.mergeQueueGateWait())
+		if err != nil {
+			return mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonEntryChanged, "the merge-gate wait could not be recorded: "+err.Error())
+		}
+		if !res.Expired && !res.NoToken {
+			o.GateRemaining = res.Remaining
+			return o
 		}
 	}
-	return true
+	out, ran := o, false
+	lockErr := s.withRunMergeLock(ctx, e.RunID, func(lctx context.Context) error {
+		ran = true
+		if h := s.mergeOnPassPreYieldRefusal(lctx, req); h != nil {
+			out = *h
+			return nil
+		}
+		cur := e
+		if !o.Immediate {
+			res, err := s.cfg.MergeQueue.GateWait(lctx, e.ID, e.AdmissionEpoch, s.mergeQueueGateWait())
+			if err != nil {
+				out = mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonEntryChanged, "the merge-gate wait could not be judged: "+err.Error())
+				return nil
+			}
+			if !res.Expired && !res.NoToken {
+				out.GateRemaining = res.Remaining
+				return nil
+			}
+			cur = res.Entry
+		}
+		if !s.yieldMergeQueueEntry(lctx, cur, o.Yield, mergeQueueYieldSiteMergeOnPass) {
+			out = mergeOnPassExpiredWaitHeld(cur, mergeOnPassReasonEntryChanged, "the merge-gate yield did not land")
+			return nil
+		}
+		out = mergeOnPassOutcome{Kind: mergeOnPassExpiredYielded, Reason: o.Yield.Reason, Detail: o.Yield.Detail, HeadSHA: cur.AnchoredHeadSHA, Yield: o.Yield}
+		return nil
+	})
+	if !ran {
+		detail := "the run's merge-intent lock could not be taken to yield the merge-gate wait"
+		if lockErr != nil {
+			detail += ": " + lockErr.Error()
+		}
+		return mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonLockUnavailable, detail)
+	}
+	if lockErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge queue: the merge-gate wait enforcement's lock lapsed after its judgement ran; its writes stand",
+			slog.String("run_id", e.RunID.String()), slog.String("outcome", string(out.Kind)),
+			slog.String("error", lockErr.Error()))
+	}
+	return out
 }
 
 // mergeOnPassLocked is the locked half of mergeQueueMergeOnPass. ctx carries
@@ -912,9 +1015,12 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		// ADR-093 D4 (a forge merge refusal ejects naming the forge's reason
 		// and never retries in a loop): the unstable-status refusal ejects
 		// checks_not_settled like the 405/422 arms instead of holding as
-		// transient, which let the next pump claim and dispatch again. Pending
-		// checks still HOLD before dispatch (onlyChecksNotGreen above): slow
-		// CI never ejects; only the forge's own refusal of the merge PUT does.
+		// transient, which let the next pump claim and dispatch again. Before
+		// dispatch, step 4 never drops or ejects on a retryable merge-gate leg
+		// (docs/adr/112 A3.2): pending checks hold on the merge-gate window and
+		// then yield merge_checks_pending, red checks yield merge_checks_red,
+		// so slow CI never ejects; only the forge's own refusal of the merge
+		// PUT does.
 		// E93.2 / #4658: a refusal ForgeMerger attributed to the run's merge
 		// method renders from its closed-set fields only (FieldDetail), never
 		// mergeErr.Error() or its Cause.

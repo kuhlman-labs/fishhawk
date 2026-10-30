@@ -1392,3 +1392,180 @@ func TestMergeQueueE2E_RedPassDelegatedFixupReentersAtTail(t *testing.T) {
 		t.Fatalf("re-entered A = %+v, want the fresh entry with merge intent at position 2 behind C, anchored a2", es[2])
 	}
 }
+
+// mqeA3Listing is a check-runs listing of one completed or in-progress run.
+func mqeA3Run(id, suite int, name, status, conclusion string) string {
+	c := ""
+	if conclusion != "" {
+		c = `"conclusion":"` + conclusion + `","completed_at":"2026-01-01T00:01:00Z",`
+	}
+	return fmt.Sprintf(`{"id":%d,"name":%q,"status":%q,%s"started_at":"2026-01-01T00:00:00Z","check_suite":{"id":%d},"app":{"slug":"github-actions"}}`,
+		id, name, status, c, suite)
+}
+
+// mqeA3OnVerified plants fn once, right after the admission records the
+// head's pass (merge_queue_verified), so merge-on-pass, not admission, meets
+// the planted state.
+func (w *mqmWorld) mqeA3OnVerified(fn func()) {
+	done := false
+	w.audit.onAppend = func(category string) {
+		if category == CategoryMergeQueueVerified && !done {
+			done = true
+			fn()
+		}
+	}
+}
+
+// TestMergeQueueE2E_A3MergeGateLegsHoldOrYieldNeverDrop is docs/adr/112 A3's
+// cross-layer e2e (#4780): the real PostgresStore, eligibility, merge-on-pass
+// with both enforcements, the pump, the re-probe and the fake forge. A
+// retryable merge-gate leg at the verified head never drops an intent-bearing
+// entry: (a) red yields merge_checks_red / retrigger_ci at once (row 1,
+// intent kept, no settle), then green clears it and the pump merges; (b)
+// zero check runs holds on the merge-gate window (approval anchor untouched),
+// expiry yields merge_checks_pending / retry_after, green clears and merges;
+// (c) a re-opened review round holds as merge_review_pending, then its
+// verdict lands and the entry merges; (d) a concurrency-cancelled sibling
+// suite's red CI Pass beside a green sibling yields merge_checks_red (A3
+// residual: no superseded tolerance, never a merge-through); (e) red beside a
+// high concern settles dropped not_merge_eligible; (f) three re-advanced
+// holds spend the budget and the fourth yields at once; (g) a budget
+// recovered by a 61-minute refill gets a window and merges on that hold.
+func TestMergeQueueE2E_A3MergeGateLegsHoldOrYieldNeverDrop(t *testing.T) {
+	ctx := context.Background()
+	redCI := "[" + mqeA3Run(1, 1, "ci", "completed", "failure") + "]"
+	pendingCI := "[" + mqeA3Run(1, 1, "ci", "in_progress", "") + "]"
+	seedA := func(w *mqmWorld, spec string) *mcqRun {
+		a := w.seed("a", "a1", []byte(spec))
+		w.exec(`UPDATE runs SET required_checks_snapshot = '{"contexts":["ci"]}' WHERE id = $1`, a.id)
+		w.mqpHeldIntent(a, "a1", false)
+		return a
+	}
+	setChecks := func(w *mqmWorld, listing string) { w.gh.set(func() { w.gh.checks["a1"] = listing }) }
+	clearAndMerge := func(w *mqmWorld, a *mcqRun) {
+		w.t.Helper()
+		setChecks(w, mcqGreenChecks)
+		if !w.srv.ReprobeMergeQueueYield(ctx, a.id, false) {
+			w.t.Fatal("the re-probe did not clear A once every merge-gate leg passed")
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		w.requirePuts("a1")
+		w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	}
+	requireNoSettle := func(w *mqmWorld, a *mcqRun) {
+		w.t.Helper()
+		if n := len(w.rows(a, CategoryMergeCandidateQueueSettled)); n != 0 {
+			w.t.Fatalf("merge_candidate_queue_settled rows = %d, want 0 (never a drop)", n)
+		}
+	}
+
+	t.Run("a red yields at once then clears and merges", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := seedA(w, mcvUndelegatedSpecYAML)
+		w.mqeA3OnVerified(func() { setChecks(w, redCI) })
+		w.pumpBase(a)
+		e := w.requireYielded(a, mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI, mergeQueueYieldSiteMergeOnPass)
+		if p := w.payload(w.rows(a, CategoryMergeQueueYielded)[0]); int(p["precedence_row"].(float64)) != mergeQueueYieldRowEligibility {
+			t.Fatalf("precedence_row = %v, want %d", p["precedence_row"], mergeQueueYieldRowEligibility)
+		}
+		if e.MergeIntentAt == nil {
+			t.Fatal("merge intent lost on the yield")
+		}
+		requireNoSettle(w, a)
+		w.requirePuts()
+		clearAndMerge(w, a)
+	})
+	t.Run("b zero check runs holds then yields pending then merges", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := seedA(w, mcvUndelegatedSpecYAML)
+		w.mqeA3OnVerified(func() { setChecks(w, `[]`) })
+		w.pumpBase(a)
+		e := w.active(a)
+		if e.State != mergequeue.StateLive || e.GateWaitStartedAt == nil || e.ApprovalWaitStartedAt != nil || e.YieldedAt != nil {
+			t.Fatalf("A = %s gate window %v approval anchor %v yielded %v, want live holding on the gate window, no approval anchor",
+				e.State, e.GateWaitStartedAt, e.ApprovalWaitStartedAt, e.YieldedAt)
+		}
+		w.exec(`UPDATE merge_candidate_queue_entries SET gate_wait_started_at = gate_wait_started_at - interval '2 hours' WHERE id = $1`, e.ID)
+		w.pumpBase(a)
+		y := w.requireYielded(a, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+		if y.ApprovalWaitStartedAt != nil {
+			t.Fatalf("approval anchor = %v after a merge-gate yield, want NULL", y.ApprovalWaitStartedAt)
+		}
+		requireNoSettle(w, a)
+		clearAndMerge(w, a)
+	})
+	t.Run("c settling review holds then merges", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := seedA(w, mqeGatedReviewersSpec)
+		w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "a1"))
+		// A settled round admits A; a re-opened round lands after its pass.
+		w.mqeAppend(a, "implement_review_started", map[string]any{"configured_agents": 1})
+		w.mqeAppend(a, "implement_reviewed", map[string]any{})
+		w.mqeA3OnVerified(func() { w.mqeAppend(a, "implement_review_started", map[string]any{"configured_agents": 1}) })
+		w.pumpBase(a)
+		if e := w.active(a); e.State != mergequeue.StateLive || e.GateWaitStartedAt == nil || e.YieldedAt != nil {
+			t.Fatalf("A = %s gate window %v yielded %v, want live holding as merge_review_pending", e.State, e.GateWaitStartedAt, e.YieldedAt)
+		}
+		w.requirePuts()
+		w.mqeAppend(a, "implement_reviewed", map[string]any{})
+		w.pumpBase(a)
+		w.requirePuts("a1")
+		w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	})
+	t.Run("d cancelled sibling suite yields merge_checks_red", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+		w.exec(`UPDATE runs SET required_checks_snapshot = '{"contexts":["CI Pass"]}' WHERE id = $1`, a.id)
+		w.mqpHeldIntent(a, "a1", false)
+		w.mqeA3OnVerified(func() {
+			setChecks(w, "["+mqeA3Run(1, 1, "CI Pass", "completed", "cancelled")+","+mqeA3Run(2, 2, "CI Pass", "completed", "success")+"]")
+		})
+		w.pumpBase(a)
+		w.requireYielded(a, mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI, mergeQueueYieldSiteMergeOnPass)
+		requireNoSettle(w, a)
+		w.requirePuts()
+	})
+	t.Run("e red beside a high concern drops", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := seedA(w, mcvUndelegatedSpecYAML)
+		w.mqeA3OnVerified(func() { setChecks(w, redCI); w.raiseConcern(a, "high", "") })
+		w.pumpBase(a)
+		w.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible)
+		if n := len(w.rows(a, CategoryMergeQueueYielded)); n != 0 {
+			t.Fatalf("merge_queue_yielded rows = %d, want 0", n)
+		}
+		w.requirePuts()
+	})
+	t.Run("f three re-advanced holds spend the budget then the fourth yields", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := seedA(w, mcvUndelegatedSpecYAML)
+		setChecks(w, pendingCI)
+		for i := 0; i < mergequeue.GateHoldBudget; i++ {
+			w.pumpBase(a)
+			e := w.active(a)
+			if e.State != mergequeue.StateLive || e.GateHoldTokens != mergequeue.GateHoldBudget-1-i || e.YieldedAt != nil {
+				t.Fatalf("hold %d: A = %s tokens %d yielded %v, want live with %d tokens", i+1, e.State, e.GateHoldTokens, e.YieldedAt, mergequeue.GateHoldBudget-1-i)
+			}
+			if _, err := w.store.Unadmit(ctx, e.ID, e.AdmissionEpoch); err != nil { // a readvance: the next admission is a new epoch
+				t.Fatalf("unadmit: %v", err)
+			}
+		}
+		w.pumpBase(a)
+		w.requireYielded(a, mergeQueueYieldMergeChecksPending, forgeApprovalNextRetryAfter, mergeQueueYieldSiteMergeOnPass)
+		requireNoSettle(w, a)
+	})
+	t.Run("g a refilled budget gets a window and merges on that hold", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := seedA(w, mcvUndelegatedSpecYAML)
+		w.exec(`UPDATE merge_candidate_queue_entries SET gate_hold_tokens = 0, gate_tokens_refilled_at = clock_timestamp() - interval '61 minutes' WHERE run_id = $1`, a.id)
+		setChecks(w, pendingCI)
+		w.pumpBase(a)
+		if e := w.active(a); e.State != mergequeue.StateLive || e.GateWaitStartedAt == nil || e.YieldedAt != nil {
+			t.Fatalf("A = %s gate window %v yielded %v, want live holding on a window the refill paid for", e.State, e.GateWaitStartedAt, e.YieldedAt)
+		}
+		setChecks(w, mcqGreenChecks)
+		w.pumpBase(a)
+		w.requirePuts("a1")
+		w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	})
+}

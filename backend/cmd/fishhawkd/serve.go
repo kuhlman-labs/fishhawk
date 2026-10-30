@@ -2066,6 +2066,9 @@ func runServe(args []string, logSink io.Writer) int {
 	mergeQueueApprovalWait := fs.String("merge-queue-approval-wait",
 		envOr("FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT", server.DefaultMergeQueueApprovalWait.String()),
 		"ADR-112 R3 head-of-line approval wait (#4632): how long a merge-queue entry whose forge approval does not qualify (review required, dismissed, absent, undetermined, truncated) holds the head of the line before it YIELDS its place. A Go duration; default 30m. A non-positive or unparseable value fails startup. Contract: backend/README.md.")
+	mergeQueueGateWait := fs.String("merge-queue-gate-wait",
+		envOr("FISHHAWKD_MERGE_QUEUE_GATE_WAIT", ""),
+		"docs/adr/112 A3.2 merge-gate window (#4780): how long a merge-queue head of line whose required checks are pending, unreported or unreadable, or whose implement-review round is settling, holds the head of the line (once per admission epoch, from a 3-hold budget refilled one per hour) before it YIELDS merge_checks_pending or merge_review_pending. A Go duration; empty (the default) means the --merge-queue-approval-wait value. A non-positive or unparseable value fails startup. Contract: backend/README.md.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -2371,6 +2374,13 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Error("invalid merge-queue approval wait", slog.String("error", err.Error()))
 		return exitFailure
 	}
+	// docs/adr/112 A3.2 merge-gate window (#4780), resolved the same way:
+	// empty is the approval wait; anything else must be a positive duration.
+	gateWait, err := resolveMergeQueueGateWait(*mergeQueueGateWait, approvalWait)
+	if err != nil {
+		logger.Error("invalid merge-queue gate wait", slog.String("error", err.Error()))
+		return exitFailure
+	}
 
 	// OAuth token-mint authz minimum (E39.3 / #1708). Fail closed on an
 	// unrecognized tier rather than silently defaulting — a typo must not
@@ -2480,6 +2490,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// and, outside off, a WARN per missing git / go binary.
 	cfg.MergeCandidateTransfer = transferCfg
 	cfg.MergeQueueApprovalWait = approvalWait
+	cfg.MergeQueueGateWait = gateWait
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
@@ -4119,7 +4130,7 @@ func runServe(args []string, logSink io.Writer) int {
 		go srv.RunMergeQueueYieldReprobe(ctx, server.MergeCandidateQueuePumpInterval)
 		logger.Info("merge-queue yield re-probe started",
 			slog.Duration("interval", server.MergeCandidateQueuePumpInterval),
-			slog.Duration("approval_wait", approvalWait))
+			slog.Duration("approval_wait", approvalWait), slog.Duration("gate_wait", gateWait))
 	}
 
 	errCh := make(chan error, 1)
@@ -4664,6 +4675,25 @@ func resolveMergeQueueApprovalWait(raw string) (time.Duration, error) {
 	}
 	if d <= 0 {
 		return 0, fmt.Errorf("--merge-queue-approval-wait / FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT: %q must be a positive duration", raw)
+	}
+	return d, nil
+}
+
+// resolveMergeQueueGateWait validates --merge-queue-gate-wait /
+// FISHHAWKD_MERGE_QUEUE_GATE_WAIT (docs/adr/112 A3.2): empty answers
+// approvalWait (the merge-gate window defaults to the approval wait); any
+// other value must be a positive Go duration, and a non-positive or
+// unparseable one refuses startup naming the flag and the env var.
+func resolveMergeQueueGateWait(raw string, approvalWait time.Duration) (time.Duration, error) {
+	if raw == "" {
+		return approvalWait, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("--merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT: %q is not a Go duration: %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT: %q must be a positive duration", raw)
 	}
 	return d, nil
 }
