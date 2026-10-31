@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -437,9 +438,23 @@ func (s *Server) triggerDeployGitHubActions(ctx context.Context, stage *run.Stag
 
 	branch := delegate.GitRef
 	if branch == "" {
-		// The deploy targets the merged change; default to the repo's default
-		// branch when the spec pins no explicit git_ref.
-		branch = "main"
+		// The deploy targets the merged change: when the spec pins no explicit
+		// git_ref, dispatch on the repository's forge default_branch (#4660),
+		// never a guessed branch. An unresolved read fails the stage category C
+		// on the existing deployment_dispatch_failed row and dispatches nothing.
+		resolved, rerr := s.resolveRunDefaultBranch(ctx, runRow)
+		if rerr != nil {
+			reason, _ := defaultbranch.ReasonOf(rerr)
+			return s.failDeployTrigger(ctx, stage,
+				fmt.Sprintf("deploy trigger: the repository's default branch could not be resolved (%s); pin executor.delegate.git_ref in the workflow spec or restore the forge default-branch read", reason),
+				map[string]any{
+					"error":                            rerr.Error(),
+					"workflow_ref":                     delegate.WorkflowRef,
+					"default_branch_unresolved_reason": string(reason),
+					"remedy":                           "pin executor.delegate.git_ref, or restore the forge default-branch read",
+				})
+		}
+		branch = resolved
 	}
 	correlation := map[string]string{
 		"fishhawk_run_id":   stage.RunID.String(),

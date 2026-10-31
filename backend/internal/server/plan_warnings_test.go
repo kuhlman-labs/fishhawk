@@ -1982,3 +1982,56 @@ func TestRunPlanWarnings_PartialDelivery_OrderedAfterOverCapAndArchitectural(t *
 		t.Errorf("partial-delivery advisory must be last; warnings = %v", got.Warnings)
 	}
 }
+
+// sliceSharedPathSubs is the #4679 fixture: slice 0 declares the directory
+// docs/guide/ (wave 0), slice 1 pkg/a.go (wave 0), and slice 2 — depending on
+// slice 1 only — declares docs/guide/intro.md (wave 1). The two docs paths
+// overlap by containment, which the raw-equal decomposition validator does not
+// refuse; intro selects a non-overlapping file for the clean control.
+func sliceSharedPathSubs(intro string) []warningsSubPlan {
+	return []warningsSubPlan{
+		{title: "guide dir", files: []plan.ScopeFile{{Path: "docs/guide/", Operation: plan.FileOpModify}}},
+		{title: "pkg a", files: []plan.ScopeFile{{Path: "pkg/a.go", Operation: plan.FileOpModify}}},
+		{title: "guide intro", files: []plan.ScopeFile{{Path: intro, Operation: plan.FileOpModify}}, dependsOn: []int{1}},
+	}
+}
+
+// TestRunPlanWarnings_SliceSharedPath: a cross-wave containment overlap draws
+// one advisory naming the file, both slices, their waves and the remedy,
+// appended AFTER every earlier advisory (here the new-architectural-decision
+// one, which keeps position 0); a plan without the overlap records none.
+func TestRunPlanWarnings_SliceSharedPath(t *testing.T) {
+	s, au := newNilRunRepoWarningsServer(t)
+	body := withNewArchitecturalDecision(t, warningsPlanBody(t, sliceSharedPathSubs("docs/guide/intro.md")), nadDecl("ADR-082"))
+
+	got := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), body)
+	if got == nil || len(got.Warnings) != 2 {
+		t.Fatalf("want 2 warnings (architectural decision, then shared path), got %+v", got)
+	}
+	if !strings.Contains(got.Warnings[0], "NEW ARCHITECTURAL DECISION") {
+		t.Errorf("warnings[0] = %q, want the pre-existing advisory kept first", got.Warnings[0])
+	}
+	w := got.Warnings[1]
+	for _, want := range []string{
+		"docs/guide/intro.md", "docs/guide/",
+		`slice 0 ("guide dir", wave 0)`, `slice 2 ("guide intro", wave 1)`,
+		"in different waves", "the fan-in can conflict",
+		"single owner", "integration slice",
+	} {
+		if !strings.Contains(w, want) {
+			t.Errorf("shared-path advisory missing %q:\n%s", want, w)
+		}
+	}
+	if entries := planWarningsEntries(t, au); len(entries) != 1 || len(entries[0].Warnings) != 2 {
+		t.Fatalf("plan_warnings entries = %+v, want one row carrying both advisories", entries)
+	}
+
+	clean := s.runPlanWarnings(context.Background(), uuid.New(), uuid.New(), warningsPlanBody(t, sliceSharedPathSubs("docs/other.md")))
+	if clean != nil {
+		for _, cw := range clean.Warnings {
+			if strings.Contains(cw, "decomposition shared path") {
+				t.Errorf("a plan with no overlap recorded a shared-path advisory: %q", cw)
+			}
+		}
+	}
+}

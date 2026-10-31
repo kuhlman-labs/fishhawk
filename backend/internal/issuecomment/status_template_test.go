@@ -1697,3 +1697,36 @@ func TestRenderActivityLine_MergeQueueYieldPosted(t *testing.T) {
 		}
 	}
 }
+
+// TestRenderActivityLine_ConcernRolledUp pins the E94.1 / #4692 count-only
+// line on a full payload and the bare phrase on a malformed one, and proves the
+// row is neither filtered as noise nor leaks its category name, an actor, an id
+// or reviewer prose.
+func TestRenderActivityLine_ConcernRolledUp(t *testing.T) {
+	childRun := uuid.New().String()
+	full := transferActivityLine(t, "concern_rolled_up", map[string]any{
+		"site": "fan_in", "parent_stage_id": uuid.New().String(), "count": 3, "high": 1, "medium": 2,
+		"concerns": []map[string]any{{"concern_id": uuid.New().String(), "child_run_id": childRun, "severity": "high", "reviewer_model": "gpt-6-astra"}},
+	}, "Child-slice concerns")
+	if !strings.Contains(full, "Child-slice concerns imported into the parent: 3 (1 high, 2 medium)") {
+		t.Fatalf("full payload line = %q", full)
+	}
+	for _, bad := range []string{childRun, "gpt-6-astra", "@", "concern_rolled_up"} {
+		if strings.Contains(full, bad) {
+			t.Errorf("line leaks %q: %q", bad, full)
+		}
+	}
+	for name, payload := range map[string]map[string]any{
+		"zero count":     {"count": 0, "high": 0, "medium": 0},
+		"negative split": {"count": 2, "high": -1, "medium": 3},
+		"wrong type":     {"count": "three"},
+	} {
+		line := transferActivityLine(t, "concern_rolled_up", payload, "Child-slice concerns")
+		if !strings.Contains(line, "Child-slice concerns imported into the parent") || strings.Contains(line, "(") {
+			t.Errorf("%s: malformed payload line = %q, want the bare phrase", name, line)
+		}
+	}
+	if !issuecomment.RendersActivity("concern_rolled_up") {
+		t.Error("RendersActivity(concern_rolled_up) = false, want true")
+	}
+}

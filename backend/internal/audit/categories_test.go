@@ -78,12 +78,12 @@ func TestIsKnownCategory(t *testing.T) {
 // "requested"), the measured top three are [decided lapsed requested]: all
 // three suggestions are scope_amendment_* siblings and requested is among them.
 func TestSuggestCategories_RanksNearest(t *testing.T) {
-	got := SuggestCategories("scope_amendment_pending", 3)
+	got := SuggestCategories("scope_amendment_pending", 4)
 	if len(got) == 0 {
 		t.Fatal("SuggestCategories returned no suggestions")
 	}
-	if len(got) > 3 {
-		t.Errorf("returned %d suggestions, want <= 3", len(got))
+	if len(got) > 4 {
+		t.Errorf("returned %d suggestions, want <= 4", len(got))
 	}
 	// Every suggestion is a scope_amendment_* sibling, and
 	// scope_amendment_requested is among them — the operator sees it and
@@ -98,7 +98,11 @@ func TestSuggestCategories_RanksNearest(t *testing.T) {
 		}
 	}
 	if !found {
-		t.Errorf("scope_amendment_requested not among the three nearest suggestions; got=%v", got)
+		t.Errorf("scope_amendment_requested not among the four nearest suggestions; got=%v", got)
+	}
+	// #4679: the newest sibling is reachable by its own near-miss.
+	if near := SuggestCategories("scope_amendment_refuse", 3); len(near) == 0 || near[0] != "scope_amendment_refused" {
+		t.Errorf("SuggestCategories(scope_amendment_refuse) = %v, want scope_amendment_refused first", near)
 	}
 }
 
@@ -176,6 +180,17 @@ func TestKnownCategoryList_NonEmptyAndSorted(t *testing.T) {
 func TestKnownCategories_EscalationFired(t *testing.T) {
 	if !IsKnownCategory("escalation_fired") {
 		t.Fatal("escalation_fired is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_EscapeRecorded pins the E94.3 / #4694 category: the
+// escape verb (server/escape.go) appends it on every birth and closure, and an
+// unregistered category reddens TestKnownCategoriesCoversEmittedCategories and
+// is un-awaitable. It is INTERNAL, so it must NOT be an issue-comment activity
+// category.
+func TestKnownCategories_EscapeRecorded(t *testing.T) {
+	if !IsKnownCategory("escape_recorded") {
+		t.Fatal("escape_recorded is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
 	}
 }
 
@@ -878,6 +893,18 @@ func TestKnownCategories_MergeQueueEjectedPromoted(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_MergeQueueIntentWithdrawn pins the E87.17 / #4685
+// (ADR-112 R3) registration: the withdraw-intent verb appends
+// merge_queue_intent_withdrawn inside its withdrawal transaction
+// (server/merge_queue_withdraw.go). An unregistered category reddens
+// TestKnownCategoriesCoversEmittedCategories and is un-awaitable through
+// fishhawk_await_audit.
+func TestKnownCategories_MergeQueueIntentWithdrawn(t *testing.T) {
+	if !IsKnownCategory("merge_queue_intent_withdrawn") {
+		t.Fatal("merge_queue_intent_withdrawn is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_MergeQueueResumed pins the E87.7 / #4298 (ADR-093 D8)
 // registration: the restart resume appends merge_queue_resumed before every
 // action it takes on a live head-of-line entry
@@ -890,5 +917,37 @@ func TestKnownCategories_MergeQueueEjectedPromoted(t *testing.T) {
 func TestKnownCategories_MergeQueueResumed(t *testing.T) {
 	if !IsKnownCategory("merge_queue_resumed") {
 		t.Fatal("merge_queue_resumed is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_ConcernRolledUp pins the E94.1 / #4692 (ADR-117 D2)
+// registration: server/concern_rollup.go writes one concern_rolled_up row on
+// the parent per import pass that copied child-slice concerns into the parent
+// ledger. An unregistered category reddens
+// TestKnownCategoriesCoversEmittedCategories and is un-awaitable through
+// fishhawk_await_audit. The row carries its child runs' and stages' ids and is
+// readable on the parent's per-run chain; the ADR-106 registry flag that will
+// classify it does not exist yet.
+func TestKnownCategories_ConcernRolledUp(t *testing.T) {
+	if !IsKnownCategory("concern_rolled_up") {
+		t.Fatal("concern_rolled_up is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
+// TestKnownCategories_ConcernLabelled pins the E94.8 / #4841 (ADR-117 D1
+// phase 3) registration of the relabel verb's two rows: concern_labelled, the
+// intent row server/label_concern.go appends BEFORE the write, and
+// concern_label_failed, its corrective row after a write that failed once the
+// intent was durable. Both are INTERNAL (not issue-comment activity). An
+// unregistered category reddens TestKnownCategoriesCoversEmittedCategories and
+// is un-awaitable through fishhawk_await_audit.
+//
+// Counterfactual: delete either map entry from KnownCategories and this test
+// goes RED naming it.
+func TestKnownCategories_ConcernLabelled(t *testing.T) {
+	for _, c := range []string{"concern_labelled", "concern_label_failed"} {
+		if !IsKnownCategory(c) {
+			t.Errorf("%s is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it", c)
+		}
 	}
 }

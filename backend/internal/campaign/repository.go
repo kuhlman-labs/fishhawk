@@ -119,6 +119,11 @@ type CreateCampaignParams struct {
 	// and its provenance are created atomically. Nil persists as NULL — not
 	// grooming-sourced. The campaign package never interprets these bytes.
 	GroomingSource []byte
+	// RunnerKind is the OPTIONAL campaign-level runner kind (#4485) every item
+	// run minted from the campaign inherits. Empty persists as the '' not-recorded
+	// default. Carried verbatim: validation against the known runner kinds is the
+	// caller's (the REST handler), not this package's.
+	RunnerKind string
 	// GroomingGuard is the OPTIONAL grooming-currency guard (E54.17 / #2817).
 	// Nil (the unchanged default for every epic_ref / explicit-items /
 	// allow_superseded campaign) takes the byte-identical unguarded CreateCampaign

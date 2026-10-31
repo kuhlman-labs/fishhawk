@@ -48,6 +48,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/codex"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge/stub"
@@ -630,6 +631,134 @@ func TestNewStageOrchestrator_ThreadsExternalURL(t *testing.T) {
 	}
 	if o.ExternalURL != want {
 		t.Errorf("orchestrator ExternalURL = %q, want %q (cfg.ExternalURL not threaded)", o.ExternalURL, want)
+	}
+}
+
+// TestNewStageOrchestrator_WiresDefaultBranch pins the construction-site
+// wiring (#4660): newStageOrchestrator threads cfg.DefaultBranch into the
+// orchestrator as the SAME instance, so the orchestrator's base reads share the
+// server's resolver cache.
+//
+// COUNTERFACTUAL (CF-A9): delete `DefaultBranch: cfg.DefaultBranch` from
+// newStageOrchestrator → the orchestrator's DefaultBranch is nil → RED.
+func TestNewStageOrchestrator_WiresDefaultBranch(t *testing.T) {
+	src := defaultbranch.New(nil)
+	o := newStageOrchestrator(server.Config{DefaultBranch: src}, slog.Default())
+	if got, ok := o.DefaultBranch.(*defaultbranch.Resolver); !ok || got != src {
+		t.Fatalf("orchestrator DefaultBranch = %#v, want the cfg.DefaultBranch instance %p", o.DefaultBranch, src)
+	}
+}
+
+// TestDefaultBranchSource pins the production Source (#4660): a nil GitHub
+// client yields an UNTYPED nil interface (a typed-nil *Resolver would read as
+// configured), and a real client yields exactly gh.DefaultBranches() — the
+// resolver ListRulesetRequiredChecks also reads through, so the ruleset read,
+// the server and the orchestrator share ONE cache.
+//
+// COUNTERFACTUAL (CF-A9): make defaultBranchSource return nil for a non-nil
+// client → RED.
+func TestDefaultBranchSource(t *testing.T) {
+	if src := defaultBranchSource(nil); src != nil {
+		t.Fatalf("defaultBranchSource(nil) = %#v, want an untyped nil interface", src)
+	}
+	gh := &githubclient.Client{}
+	got, ok := defaultBranchSource(gh).(*defaultbranch.Resolver)
+	if !ok || got == nil || got != gh.DefaultBranches() {
+		t.Fatalf("defaultBranchSource(gh) = %#v, want gh.DefaultBranches() %p", got, gh.DefaultBranches())
+	}
+}
+
+// TestWireDefaultBranch_SharesOneResolver (approval condition C1): the
+// function runServe calls sets cfg.DefaultBranch from cfg.GitHub, and the
+// orchestrator built from that cfg holds the SAME instance.
+//
+// COUNTERFACTUAL: delete the assignment in wireDefaultBranch → cfg.DefaultBranch
+// stays nil → RED.
+func TestWireDefaultBranch_SharesOneResolver(t *testing.T) {
+	gh := &githubclient.Client{}
+	cfg := server.Config{GitHub: gh}
+	wireDefaultBranch(&cfg)
+	want := gh.DefaultBranches()
+	if got, ok := cfg.DefaultBranch.(*defaultbranch.Resolver); !ok || got != want {
+		t.Fatalf("cfg.DefaultBranch = %#v, want gh.DefaultBranches() %p", cfg.DefaultBranch, want)
+	}
+	o := newStageOrchestrator(cfg, slog.Default())
+	if got, ok := o.DefaultBranch.(*defaultbranch.Resolver); !ok || got != want {
+		t.Fatalf("orchestrator DefaultBranch = %#v, want the same instance %p", o.DefaultBranch, want)
+	}
+
+	none := server.Config{}
+	wireDefaultBranch(&none)
+	if none.DefaultBranch != nil {
+		t.Fatalf("cfg.DefaultBranch without a GitHub client = %#v, want nil", none.DefaultBranch)
+	}
+}
+
+// TestServeGo_WiresDefaultBranchBeforeOrchestrator (approval condition C1)
+// pins runServe's ACTUAL configuration path: its parsed body calls
+// `wireDefaultBranch(&cfg)` after the LAST `cfg.GitHub = …` assignment (both
+// the App and the dev-stub branches) and before `newStageOrchestrator(cfg, …)`,
+// so the server and the orchestrator runServe builds share the GitHub client's
+// resolver. It walks the AST, so a comment naming the call cannot satisfy it.
+//
+// COUNTERFACTUAL: delete the `wireDefaultBranch(&cfg)` call from runServe →
+// RED (no call found).
+func TestServeGo_WiresDefaultBranchBeforeOrchestrator(t *testing.T) {
+	file, err := parser.ParseFile(token.NewFileSet(), "serve.go", nil, 0)
+	if err != nil {
+		t.Fatalf("parse serve.go: %v", err)
+	}
+	var fn *ast.FuncDecl
+	for _, d := range file.Decls {
+		if fd, ok := d.(*ast.FuncDecl); ok && fd.Recv == nil && fd.Name.Name == "runServe" {
+			fn = fd
+			break
+		}
+	}
+	if fn == nil || fn.Body == nil {
+		t.Fatal("serve.go has no runServe function body to inspect")
+	}
+	var wirePos, orchPos, lastGitHubAssign token.Pos
+	ast.Inspect(fn.Body, func(n ast.Node) bool {
+		switch n := n.(type) {
+		case *ast.CallExpr:
+			id, ok := n.Fun.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			switch id.Name {
+			case "wireDefaultBranch":
+				if len(n.Args) == 1 {
+					if u, ok := n.Args[0].(*ast.UnaryExpr); ok && u.Op == token.AND {
+						if x, ok := u.X.(*ast.Ident); ok && x.Name == "cfg" && wirePos == token.NoPos {
+							wirePos = n.Pos()
+						}
+					}
+				}
+			case "newStageOrchestrator":
+				if orchPos == token.NoPos {
+					orchPos = n.Pos()
+				}
+			}
+		case *ast.AssignStmt:
+			for _, lhs := range n.Lhs {
+				if sel, ok := lhs.(*ast.SelectorExpr); ok && sel.Sel.Name == "GitHub" {
+					if x, ok := sel.X.(*ast.Ident); ok && x.Name == "cfg" && n.Pos() > lastGitHubAssign {
+						lastGitHubAssign = n.Pos()
+					}
+				}
+			}
+		}
+		return true
+	})
+	if wirePos == token.NoPos {
+		t.Fatal("runServe never calls wireDefaultBranch(&cfg); cfg.DefaultBranch would stay nil and every server-side base read would refuse resolver_unconfigured")
+	}
+	if orchPos == token.NoPos || lastGitHubAssign == token.NoPos {
+		t.Fatalf("runServe anchors missing: newStageOrchestrator at %v, last cfg.GitHub assignment at %v", orchPos, lastGitHubAssign)
+	}
+	if wirePos < lastGitHubAssign || wirePos > orchPos {
+		t.Fatalf("wireDefaultBranch(&cfg) at %v must sit after the last cfg.GitHub assignment (%v) and before newStageOrchestrator (%v)", wirePos, lastGitHubAssign, orchPos)
 	}
 }
 
@@ -2038,7 +2167,7 @@ func TestServeWiresRefinementConfig(t *testing.T) {
 // the assertion honest if the gate ever changes.
 func TestResolveIdentityProvider(t *testing.T) {
 	// Present: a GitHub provider is constructed.
-	present := resolveIdentityProvider("client-id", nil, "", "")
+	present := resolveIdentityProvider("client-id", "client-secret", nil, "", "")
 	if present == nil {
 		t.Fatal("resolveIdentityProvider with a client_id returned nil; want a GitHub provider")
 	}
@@ -2051,12 +2180,19 @@ func TestResolveIdentityProvider(t *testing.T) {
 	// otherwise the REST reads stay anonymous even when serve wires an
 	// accessor. Reflection reads the field's nil-ness without invoking it.
 	accessor := func(context.Context) (string, error) { return "tok", nil }
-	withTok := resolveIdentityProvider("client-id", accessor, "", "")
+	withTok := resolveIdentityProvider("client-id", "client-secret", accessor, "", "")
 	if got := identityProviderTokenIsNil(t, withTok); got {
 		t.Error("resolveIdentityProvider dropped the token accessor; provider.token is nil, want non-nil")
 	}
 	if got := identityProviderTokenIsNil(t, present); !got {
 		t.Error("resolveIdentityProvider(nil) left provider.token non-nil, want nil")
+	}
+
+	// Client secret (#4627): the configured secret must reach the provider's
+	// unexported clientSecret field, or every token-login mint refuses with
+	// ErrClientCredentialUnconfigured (503) in production.
+	if got := identityProviderClientSecret(t, present); got != "client-secret" {
+		t.Errorf("provider clientSecret = %q, want %q: resolveIdentityProvider dropped the OAuth client secret", got, "client-secret")
 	}
 
 	// Endpoint override (E44.2 / #1826): a configured API/OAuth base threads
@@ -2065,14 +2201,14 @@ func TestResolveIdentityProvider(t *testing.T) {
 	if got := identityProviderBaseURLs(t, present); got.api != identity.DefaultAPIBaseURL || got.oauth != identity.DefaultOAuthBaseURL {
 		t.Errorf("default provider base URLs = %+v, want GitHub defaults", got)
 	}
-	configured := resolveIdentityProvider("client-id", nil, "https://ghes.example.com/api/v3", "https://ghes.example.com")
+	configured := resolveIdentityProvider("client-id", "client-secret", nil, "https://ghes.example.com/api/v3", "https://ghes.example.com")
 	if got := identityProviderBaseURLs(t, configured); got.api != "https://ghes.example.com/api/v3" || got.oauth != "https://ghes.example.com" {
 		t.Errorf("configured provider base URLs = %+v, want the GHES hosts", got)
 	}
 
 	// Absent: nil so server.New defaults to NoOp. Feeding it through
 	// server.New proves the end-to-end fallback the seam relies on.
-	absent := resolveIdentityProvider("", nil, "", "")
+	absent := resolveIdentityProvider("", "", nil, "", "")
 	if absent != nil {
 		t.Fatalf("resolveIdentityProvider with no client_id = %#v, want nil", absent)
 	}
@@ -2391,6 +2527,22 @@ func identityProviderTokenIsNil(t *testing.T, p identity.IdentityProvider) bool 
 		t.Fatal("GitHubIdentityProvider has no token field; passthrough test is stale")
 	}
 	return f.IsNil()
+}
+
+// identityProviderClientSecret reads the constructed provider's unexported
+// clientSecret via reflection (#4627), mirroring identityProviderTokenIsNil,
+// so the secret-threading assertion needs no exported test hook.
+func identityProviderClientSecret(t *testing.T, p identity.IdentityProvider) string {
+	t.Helper()
+	gh, ok := p.(*identity.GitHubIdentityProvider)
+	if !ok {
+		t.Fatalf("provider = %T, want *identity.GitHubIdentityProvider", p)
+	}
+	f := reflect.ValueOf(gh).Elem().FieldByName("clientSecret")
+	if !f.IsValid() {
+		t.Fatal("GitHubIdentityProvider has no clientSecret field; secret-threading test is stale")
+	}
+	return f.String()
 }
 
 // identityProviderBaseURLs reads the constructed provider's unexported
@@ -7332,6 +7484,47 @@ func TestServe_MergeQueueApprovalWait(t *testing.T) {
 	}
 }
 
+// TestResolveMergeQueueGateWait pins the docs/adr/112 A3.2 merge-gate window
+// flag (#4780): empty answers the approval wait, a positive duration resolves,
+// and 0s, a negative duration and garbage each REFUSE startup naming the flag
+// and its env var. The refusing invocation carries bootstrapAbortFlag, so with
+// the validation deleted startup still aborts at the later --review-resolution
+// check and the log assertion is what goes RED.
+func TestResolveMergeQueueGateWait(t *testing.T) {
+	t.Run("empty is the approval wait", func(t *testing.T) {
+		if d, err := resolveMergeQueueGateWait("", 17*time.Minute); err != nil || d != 17*time.Minute {
+			t.Fatalf("empty = %s, %v; want the approval wait 17m", d, err)
+		}
+	})
+	t.Run("positive", func(t *testing.T) {
+		if d, err := resolveMergeQueueGateWait("12m", 30*time.Minute); err != nil || d != 12*time.Minute {
+			t.Fatalf("12m = %s, %v", d, err)
+		}
+	})
+	for _, bad := range []string{"0s", "-1m", "garbage"} {
+		t.Run(bad, func(t *testing.T) {
+			d, err := resolveMergeQueueGateWait(bad, 30*time.Minute)
+			if err == nil {
+				t.Fatalf("%s resolved to %s", bad, d)
+			}
+			for _, want := range []string{"--merge-queue-gate-wait", "FISHHAWKD_MERGE_QUEUE_GATE_WAIT"} {
+				if !strings.Contains(err.Error(), want) {
+					t.Errorf("error %q does not name %q", err, want)
+				}
+			}
+			code, log := serveWithProfile(t, "-merge-queue-gate-wait", bad, bootstrapAbortFlag)
+			if code != exitFailure {
+				t.Fatalf("exit = %d, want %d; log:\n%s", code, exitFailure, log)
+			}
+			for _, want := range []string{"invalid merge-queue gate wait", "FISHHAWKD_MERGE_QUEUE_GATE_WAIT"} {
+				if !strings.Contains(log, want) {
+					t.Errorf("log does not name %q:\n%s", want, log)
+				}
+			}
+		})
+	}
+}
+
 // TestToChildcompletionConflict pins the ONE orchestrator → childcompletion
 // SliceConflict copy (ADR-096 D4 / #4294): every field, the base attribution
 // included, crosses the bridge, and nil maps to nil. A field the helper drops
@@ -7405,8 +7598,9 @@ func TestChildCompletionAdvancer_ConflictCarriesBaseAttribution(t *testing.T) {
 		Artifacts: &conflictAdapterArtifacts{arts: []*artifact.Artifact{{
 			ID: uuid.New(), StageID: planStageID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planJSON,
 		}}},
-		GitHub: &conflictAdapterGitHub{},
-		Logger: slog.New(slog.NewTextHandler(io.Discard, nil)),
+		GitHub:        &conflictAdapterGitHub{},
+		Logger:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		DefaultBranch: defaultbranch.Static("main"),
 	}
 	a := childCompletionAdvancer{o: o}
 	ctx := context.Background()
@@ -7652,5 +7846,256 @@ func TestGithubAutoMerger_MergePullRequestAtHead_FailsClosed(t *testing.T) {
 	}
 	if fg.mergeHits != 0 || fg.graphqlHits != 0 {
 		t.Errorf("requests served merge=%d graphql=%d, want 0/0", fg.mergeHits, fg.graphqlHits)
+	}
+}
+
+// mmWireGitHub is the E93.2 / #4658 cross-boundary GitHub stand-in: it records
+// the GraphQL auto-merge enable's `method` variable, the REST merge PUT's
+// merge_method + sha, and answers the repository merge-settings query
+// (mergeCommitAllowed / squashMergeAllowed / rebaseMergeAllowed) separately
+// from the enable mutation.
+type mmWireGitHub struct {
+	mu            sync.Mutex
+	enableBody    string
+	settingsBody  string
+	mergeStatus   int
+	enableMethods []any
+	settingsHits  int
+	restMethods   []string
+	restSHAs      []string
+}
+
+func newMMWireClient(t *testing.T, fg *mmWireGitHub) *githubclient.Client {
+	t.Helper()
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = io.WriteString(w, `{"number":7,"node_id":"PR_node","state":"open","head":{"sha":"abc"}}`)
+	})
+	mux.HandleFunc("POST /graphql", func(w http.ResponseWriter, r *http.Request) {
+		fg.mu.Lock()
+		defer fg.mu.Unlock()
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &req)
+		w.Header().Set("Content-Type", "application/json")
+		if strings.Contains(req.Query, "mergeCommitAllowed") {
+			fg.settingsHits++
+			_, _ = io.WriteString(w, fg.settingsBody)
+			return
+		}
+		fg.enableMethods = append(fg.enableMethods, req.Variables["method"])
+		_, _ = io.WriteString(w, fg.enableBody)
+	})
+	mux.HandleFunc("PUT /repos/{owner}/{repo}/pulls/{number}/merge", func(w http.ResponseWriter, r *http.Request) {
+		fg.mu.Lock()
+		defer fg.mu.Unlock()
+		var body map[string]string
+		raw, _ := io.ReadAll(r.Body)
+		_ = json.Unmarshal(raw, &body)
+		fg.restMethods = append(fg.restMethods, body["merge_method"])
+		fg.restSHAs = append(fg.restSHAs, body["sha"])
+		st := fg.mergeStatus
+		if st == 0 {
+			st = http.StatusOK
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(st)
+		_, _ = io.WriteString(w, `{"merged":true,"sha":"deadbeef"}`)
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	return &githubclient.Client{BaseURL: srv.URL, Tokens: fakeTokenProvider{}, HTTP: &http.Client{Timeout: 5 * time.Second}}
+}
+
+// mmWireSpec is a minimal non-Fishhawk workflow-v2 admission spec; decl, when
+// non-empty, is appended as the top-level merge_method declaration.
+func mmWireSpec(decl string) []byte {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	if decl != "" {
+		doc += "merge_method: " + decl + "\n"
+	}
+	return []byte(doc)
+}
+
+func mmWireRun(specBytes []byte) *runpkg.Run {
+	inst := int64(42)
+	pr := "https://github.com/acme/widgets/pull/7"
+	return &runpkg.Run{ID: uuid.New(), InstallationID: &inst, PullRequestURL: &pr, WorkflowSpec: specBytes}
+}
+
+const (
+	mmEnableOK         = `{"data":{"enablePullRequestAutoMerge":{"pullRequest":{"number":7,"state":"OPEN"}}}}`
+	mmEnableCleanState = `{"errors":[{"message":"Pull request is in clean status","type":"UNPROCESSABLE"}]}`
+)
+
+// TestForgeMerger_MergeMethodCrossBoundary is the E93.2 / #4658 CROSS-BOUNDARY
+// test: a run row's cached admission spec (run.WorkflowSpec) flows through
+// newForgeMerger -> server.ForgeMerger -> githubAutoMerger -> a REAL
+// githubclient -> the wire. A `merge_method: merge` declaration sends GraphQL
+// mergeMethod MERGE, a clean-status rejection falls back to REST merge_method
+// `merge`, and the pinned merge sends REST merge_method `merge` + sha; with no
+// declaration every arm sends SQUASH / `squash`, byte-identical to before.
+func TestForgeMerger_MergeMethodCrossBoundary(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		spec     []byte
+		wantGQL  string
+		wantREST string
+	}{
+		{"declared merge", mmWireSpec("merge"), "MERGE", "merge"},
+		{"declared rebase", mmWireSpec("rebase"), "REBASE", "rebase"},
+		{"no declaration", mmWireSpec(""), "SQUASH", "squash"},
+		{"no cached spec", nil, "SQUASH", "squash"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Run("auto-merge enable", func(t *testing.T) {
+				fg := &mmWireGitHub{enableBody: mmEnableOK}
+				m := newForgeMerger(newMMWireClient(t, fg))
+				if err := m.MergePullRequest(context.Background(), mmWireRun(tc.spec), ""); err != nil {
+					t.Fatalf("MergePullRequest: %v", err)
+				}
+				if len(fg.enableMethods) != 1 || fg.enableMethods[0] != tc.wantGQL {
+					t.Errorf("GraphQL mergeMethod = %v, want [%s]", fg.enableMethods, tc.wantGQL)
+				}
+				if len(fg.restMethods) != 0 {
+					t.Errorf("REST merges = %v, want none", fg.restMethods)
+				}
+			})
+			t.Run("clean-status REST fallback", func(t *testing.T) {
+				fg := &mmWireGitHub{enableBody: mmEnableCleanState}
+				m := newForgeMerger(newMMWireClient(t, fg))
+				if err := m.MergePullRequest(context.Background(), mmWireRun(tc.spec), ""); err != nil {
+					t.Fatalf("MergePullRequest: %v", err)
+				}
+				if len(fg.restMethods) != 1 || fg.restMethods[0] != tc.wantREST {
+					t.Errorf("REST merge_method = %v, want [%s]", fg.restMethods, tc.wantREST)
+				}
+			})
+			t.Run("pinned REST merge", func(t *testing.T) {
+				fg := &mmWireGitHub{enableBody: mmEnableOK}
+				pinned, ok := newForgeMerger(newMMWireClient(t, fg)).(server.HeadPinnedMerger)
+				if !ok {
+					t.Fatal("newForgeMerger does not implement server.HeadPinnedMerger")
+				}
+				if err := pinned.MergePullRequestAtHead(context.Background(), mmWireRun(tc.spec), "abc"); err != nil {
+					t.Fatalf("MergePullRequestAtHead: %v", err)
+				}
+				if len(fg.restMethods) != 1 || fg.restMethods[0] != tc.wantREST || fg.restSHAs[0] != "abc" {
+					t.Errorf("REST merge = %v sha %v, want [%s] sha abc", fg.restMethods, fg.restSHAs, tc.wantREST)
+				}
+				if len(fg.enableMethods) != 0 {
+					t.Errorf("GraphQL enables = %v, want none on the pinned path", fg.enableMethods)
+				}
+			})
+		})
+	}
+}
+
+// TestForgeMerger_MergeMethodAttributionCrossBoundary: a REST 405 plus a
+// repository settings read answering mergeCommitAllowed:false attributes the
+// refusal as ErrMergeMethodNotAllowed while keeping ErrPullRequestNotMergeable;
+// a settings read answering ALLOWED leaves the plain refusal unchanged.
+func TestForgeMerger_MergeMethodAttributionCrossBoundary(t *testing.T) {
+	t.Run("disallowed", func(t *testing.T) {
+		fg := &mmWireGitHub{
+			mergeStatus:  http.StatusMethodNotAllowed,
+			settingsBody: `{"data":{"repository":{"mergeCommitAllowed":false,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}}`,
+		}
+		pinned := newForgeMerger(newMMWireClient(t, fg)).(server.HeadPinnedMerger)
+		err := pinned.MergePullRequestAtHead(context.Background(), mmWireRun(mmWireSpec("merge")), "abc")
+		if !errors.Is(err, forge.ErrMergeMethodNotAllowed) {
+			t.Errorf("err = %v, want errors.Is ErrMergeMethodNotAllowed", err)
+		}
+		if !errors.Is(err, forge.ErrPullRequestNotMergeable) {
+			t.Errorf("err = %v, want errors.Is ErrPullRequestNotMergeable (original sentinel kept)", err)
+		}
+		var ref *server.MergeMethodRefusalError
+		if !errors.As(err, &ref) {
+			t.Fatalf("err = %v, want a *server.MergeMethodRefusalError", err)
+		}
+		if ref.Method != "merge" || ref.Source != server.MergeMethodSourceDeclared || ref.Reason != server.MergeMethodRefusalForgeDisallows {
+			t.Errorf("refusal = %+v, want merge/declared/forge_disallows", ref)
+		}
+		if want := []string{"squash", "rebase"}; strings.Join(ref.Allowed, ",") != strings.Join(want, ",") {
+			t.Errorf("Allowed = %v, want %v", ref.Allowed, want)
+		}
+		if fg.settingsHits != 1 {
+			t.Errorf("settings reads = %d, want 1", fg.settingsHits)
+		}
+	})
+	t.Run("allowed", func(t *testing.T) {
+		fg := &mmWireGitHub{
+			mergeStatus:  http.StatusMethodNotAllowed,
+			settingsBody: `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":true,"rebaseMergeAllowed":true}}}`,
+		}
+		pinned := newForgeMerger(newMMWireClient(t, fg)).(server.HeadPinnedMerger)
+		err := pinned.MergePullRequestAtHead(context.Background(), mmWireRun(mmWireSpec("merge")), "abc")
+		if !errors.Is(err, forge.ErrPullRequestNotMergeable) || errors.Is(err, forge.ErrMergeMethodNotAllowed) {
+			t.Errorf("err = %v, want the plain not-mergeable refusal (method allowed)", err)
+		}
+		if fg.settingsHits != 1 {
+			t.Errorf("settings reads = %d, want 1", fg.settingsHits)
+		}
+	})
+}
+
+// TestGithubAutoMerger_UnparseableSpecFailsClosed: the leaf resolves the
+// method itself and refuses an unparseable admission spec with zero requests.
+func TestGithubAutoMerger_UnparseableSpecFailsClosed(t *testing.T) {
+	fg := &mmWireGitHub{enableBody: mmEnableOK}
+	m := githubAutoMerger{gh: newMMWireClient(t, fg)}
+	r := mmWireRun([]byte("version: [\n"))
+	if err := m.MergePullRequest(context.Background(), r, ""); !errors.Is(err, server.ErrMergeMethodUndeterminable) {
+		t.Errorf("MergePullRequest err = %v, want ErrMergeMethodUndeterminable", err)
+	}
+	if err := m.MergePullRequestAtHead(context.Background(), r, "abc"); !errors.Is(err, server.ErrMergeMethodUndeterminable) {
+		t.Errorf("MergePullRequestAtHead err = %v, want ErrMergeMethodUndeterminable", err)
+	}
+	if len(fg.enableMethods)+len(fg.restMethods)+fg.settingsHits != 0 {
+		t.Errorf("requests served, want none")
+	}
+}
+
+// TestGithubAutoMerger_AllowedMergeMethods: the leaf's settings read fails
+// before any HTTP call on a missing installation id and otherwise reads the
+// repository's settings through githubclient.
+func TestGithubAutoMerger_AllowedMergeMethods(t *testing.T) {
+	fg := &mmWireGitHub{settingsBody: `{"data":{"repository":{"mergeCommitAllowed":true,"squashMergeAllowed":false,"rebaseMergeAllowed":true}}}`}
+	m := githubAutoMerger{gh: newMMWireClient(t, fg)}
+	got, err := m.AllowedMergeMethods(context.Background(), mmWireRun(nil))
+	if err != nil {
+		t.Fatalf("AllowedMergeMethods: %v", err)
+	}
+	if got != (forge.AllowedMergeMethods{Merge: true, Rebase: true}) {
+		t.Errorf("got %+v", got)
+	}
+	noInst := mmWireRun(nil)
+	noInst.InstallationID = nil
+	if _, err := m.AllowedMergeMethods(context.Background(), noInst); err == nil {
+		t.Error("no installation id: err = nil")
+	}
+	if fg.settingsHits != 1 {
+		t.Errorf("settings reads = %d, want 1", fg.settingsHits)
 	}
 }

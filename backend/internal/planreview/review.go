@@ -8,6 +8,7 @@
 package planreview
 
 import (
+	"encoding/json"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -1265,6 +1266,118 @@ type ReviewStartedPayload struct {
 	// stamps. 0 (omitted) on every other round, so an ordinary payload — and
 	// every payload written before #4219 — stays byte-identical and decodes 0.
 	RerunOf int64 `json:"rerun_of,omitempty"`
+
+	// ReviewedHead is the implement-review round's REVIEWED-HEAD record
+	// (ADR-117 A1.7, E94.3 / #4694): which head the round judged, of what kind,
+	// and which changed files its rendered diff actually showed. It is
+	// additive and never enters the review prompt. nil (omitted) on every
+	// plan_review_started entry and on every implement round written before
+	// A1.7, which a reader treats as head_unknown. See ReviewedHead.
+	ReviewedHead *ReviewedHead `json:"reviewed_head,omitempty"`
+
+	// SeedSHA is, on a plan_review_started entry only, the PLAN SEED the
+	// round's review tree targeted (#4436): the commit the plan agent's working
+	// tree sat at, recorded by the runner on the plan upload as
+	// plan_generated.seed_sha. The round exports its read-only tree there,
+	// never at the shared checkout's HEAD. Empty (omitted) on every
+	// implement_review_started entry, on a plan round with no resolved seed,
+	// and on every entry written before #4436.
+	SeedSHA string `json:"seed_sha,omitempty"`
+
+	// SeedUnresolved is, on a plan_review_started entry only, WHY no plan seed
+	// was resolved (#4436): seed_not_recorded (no plan_generated row, or one
+	// with no seed_sha — a pre-#4436 runner), seed_malformed (the recorded
+	// value is not a hex object name) or seed_lookup_failed (the audit read
+	// failed). The round then exported NO tree and ran diff-only — it never
+	// falls back to the shared checkout's HEAD. Empty (omitted) when a seed was
+	// resolved, on every implement round, and on every entry before #4436.
+	SeedUnresolved string `json:"seed_unresolved,omitempty"`
+}
+
+// ReviewedHead statuses (ADR-117 A1.7).
+const (
+	// ReviewedHeadRecorded: the round's reviewed head was resolved and SHA
+	// names it.
+	ReviewedHeadRecorded = "recorded"
+	// ReviewedHeadUnknown: the round had no usable head; UnknownReason says
+	// why and SHA is empty. The rendered-diff path sets are still recorded.
+	ReviewedHeadUnknown = "head_unknown"
+)
+
+// ReviewedHead kinds (ADR-117 A1.7): what SHA is.
+const (
+	// ReviewedHeadKindWipTree: a trace round's authoritative verify_run head,
+	// a soft-reset WIP commit the runner never pushes. TreeSHA and ChangeID
+	// (read from the SAME verify_run event) are the reviewed identity; mapping
+	// it to the PR lineage by tree_sha is E94.4 / E94.5's job.
+	ReviewedHeadKindWipTree = "wip_tree"
+	// ReviewedHeadKindPushedCommit: a fix-up re-review's pushed head.
+	ReviewedHeadKindPushedCommit = "pushed_commit"
+	// ReviewedHeadKindCompareHead: a consolidated round's compare head.
+	ReviewedHeadKindCompareHead = "compare_head"
+)
+
+// ReviewedHead diff modes (ADR-117 A1.7).
+const (
+	// ReviewedHeadDiffFull: the round reviewed the full change.
+	ReviewedHeadDiffFull = "full"
+	// ReviewedHeadDiffDelta: a #1725 delta re-review, which reviewed only the
+	// fix-up delta; the path sets describe that delta.
+	ReviewedHeadDiffDelta = "delta"
+)
+
+// ReviewedHead is the reviewed-head record ADR-117 A1.7 requires on every
+// implement_review_started entry (E94.3 / #4694). Every implement round — the
+// trace (first and decomposition-slice) round, the consolidated round, the
+// fix-up / delta re-review, the boot re-dispatch and the operator re-run —
+// records one; a plan round never does.
+//
+// Files, PartialFiles and OmittedFiles are PLAIN repo-relative paths (never the
+// decorated "<path> (<why>)" strings the truncation audit carries), always
+// present as arrays (possibly empty), pairwise disjoint, and their union is
+// exactly the reviewed diff's distinct changed paths in ChangedFiles order.
+// Files were fully shown; PartialFiles is the last surviving file header of a
+// truncated patch (its tail may be cut); OmittedFiles had no hunks shown. A1.7
+// counts partial and omitted files as NOT seen.
+type ReviewedHead struct {
+	Status        string `json:"status"`
+	UnknownReason string `json:"unknown_reason,omitempty"`
+	Kind          string `json:"kind,omitempty"`
+	Origin        string `json:"origin,omitempty"`
+	SHA           string `json:"sha,omitempty"`
+	TreeSHA       string `json:"tree_sha,omitempty"`
+	ChangeID      string `json:"change_id,omitempty"`
+	BaseSHA       string `json:"base_sha,omitempty"`
+	DiffMode      string `json:"diff_mode"`
+	// PatchRendered is false when the reviewed diff carried no patch text at
+	// all, in which case every changed path is in OmittedFiles.
+	PatchRendered bool `json:"patch_rendered"`
+	Truncated     bool `json:"truncated"`
+	// InventoryBestEffort marks a forge-capped changed-file inventory (a
+	// truncated compare), whose sets may themselves be incomplete.
+	InventoryBestEffort bool     `json:"inventory_best_effort,omitempty"`
+	ChangedFileCount    int      `json:"changed_file_count"`
+	Files               []string `json:"files"`
+	PartialFiles        []string `json:"partial_files"`
+	OmittedFiles        []string `json:"omitted_files"`
+}
+
+// MarshalJSON writes the three path sets as JSON arrays even when a caller left
+// one nil, so a reader never meets `null` for files / partial_files /
+// omitted_files (A1.7: always present, possibly empty).
+func (h ReviewedHead) MarshalJSON() ([]byte, error) {
+	type plain ReviewedHead
+	p := plain(h)
+	if p.Files == nil {
+		p.Files = []string{}
+	}
+	if p.PartialFiles == nil {
+		p.PartialFiles = []string{}
+	}
+	if p.OmittedFiles == nil {
+		p.OmittedFiles = []string{}
+	}
+	return json.Marshal(p)
 }
 
 // ReviewFailedPayload is the JSON payload stored in an audit entry with

@@ -71,6 +71,14 @@ type fakeBackend struct {
 	getResp    Run
 	getStatus  int
 
+	// fakeDefaultBranch is stamped as default_branch on every GET
+	// /v0/runs/{run_id} response that carries NEITHER default_branch NOR
+	// default_branch_unresolved_reason (#4758), mirroring a post-#4660
+	// fishhawkd that resolves every github run. A gitlab row is stamped
+	// default_branch_unresolved_reason forge_unsupported instead, as
+	// production does. A test that seeds either field keeps its value.
+	fakeDefaultBranch string
+
 	// getRunExtraByID overlays extra top-level JSON fields onto a
 	// keyed getRunByID response — response fields the thin client.go
 	// Run mirror doesn't carry, like the drive read surfaces (#1023)
@@ -343,6 +351,10 @@ type fakeBackend struct {
 	// stranded 'dispatched'. reapFailureStatus (0 -> 200) drives the
 	// report-itself-fails branch.
 	hostDispatchBaseBranch string
+	// hostDispatchBaseBranchByStage overrides hostDispatchBaseBranch per stage
+	// id (#4758), so one fan-out can mix a child whose marker returns a
+	// consolidated base with one whose marker returns none.
+	hostDispatchBaseBranchByStage map[string]string
 	// hostDispatchWaveNotIntegrated models the SERVER's per-wave integration
 	// refusal (E50.13 / #2363), keyed by stage id: a marked stage answers 409
 	// wave_not_integrated WITHOUT transitioning, exactly as the real server
@@ -657,6 +669,19 @@ type fakeBackend struct {
 	scopeOverlapByRun  map[uuid.UUID]scopeOverlap
 	scopeOverlapStatus int
 	scopeOverlapCalls  []uuid.UUID
+
+	// E86.85 / #4486: GET /v0/runs/{run_id}/campaign-pending-amendments.
+	// campaignAmendmentsByAnchor seeds the per-anchor body; an unkeyed anchor
+	// answers 404 (the older-backend / unrouted shape) unless
+	// campaignAmendmentsFunc answers it. campaignAmendmentsFunc, when non-nil,
+	// is invoked under fb.mu with (anchor, read count) and wins when it returns
+	// ok, so a test can make an amendment APPEAR at the Nth read.
+	// campaignAmendmentsStatus (default 200) forces that status with an error
+	// body on EVERY read; campaignAmendmentsReads counts reads per anchor.
+	campaignAmendmentsByAnchor map[uuid.UUID]runCampaignPendingAmendments
+	campaignAmendmentsFunc     func(anchor uuid.UUID, reads int) (runCampaignPendingAmendments, bool)
+	campaignAmendmentsStatus   int
+	campaignAmendmentsReads    map[uuid.UUID]int
 }
 
 // recordedReapExpectedState reads the expected_state precondition the fake
@@ -695,10 +720,27 @@ func stripForgeBaseURL(items []Run) []Run {
 	return out
 }
 
+// stampDefaultBranch applies the single-run read's #4660 base-branch fields
+// the way a post-#4660 fishhawkd does (#4758): a row seeding NEITHER field
+// gets default_branch fb.fakeDefaultBranch, or, on a gitlab row,
+// default_branch_unresolved_reason forge_unsupported. Caller holds fb.mu.
+func (fb *fakeBackend) stampDefaultBranch(row Run) Run {
+	if row.DefaultBranch != "" || row.DefaultBranchUnresolvedReason != "" {
+		return row
+	}
+	if row.Forge == startRunForgeGitLab {
+		row.DefaultBranchUnresolvedReason = "forge_unsupported"
+		return row
+	}
+	row.DefaultBranch = fb.fakeDefaultBranch
+	return row
+}
+
 func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 	t.Helper()
 	fb := &fakeBackend{
 		listStatus:                    http.StatusOK,
+		fakeDefaultBranch:             "main",
 		delegationStatus:              http.StatusOK,
 		getStatus:                     http.StatusOK,
 		stagesStatus:                  http.StatusOK,
@@ -793,8 +835,44 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		cancelCampaignStatus:          http.StatusOK,
 		scopeOverlapByRun:             map[uuid.UUID]scopeOverlap{},
 		scopeOverlapStatus:            http.StatusOK,
+		campaignAmendmentsByAnchor:    map[uuid.UUID]runCampaignPendingAmendments{},
+		campaignAmendmentsStatus:      http.StatusOK,
+		campaignAmendmentsReads:       map[uuid.UUID]int{},
 	}
 	mux := http.NewServeMux()
+	// GET /v0/runs/{run_id}/campaign-pending-amendments (E86.85 / #4486).
+	mux.HandleFunc("GET /v0/runs/{run_id}/campaign-pending-amendments", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		id, perr := uuid.Parse(r.PathValue("run_id"))
+		if perr != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		fb.mu.Lock()
+		fb.campaignAmendmentsReads[id]++
+		status := fb.campaignAmendmentsStatus
+		body, ok := fb.campaignAmendmentsByAnchor[id]
+		if fb.campaignAmendmentsFunc != nil {
+			if fbody, fok := fb.campaignAmendmentsFunc(id, fb.campaignAmendmentsReads[id]); fok {
+				body, ok = fbody, true
+			}
+		}
+		fb.mu.Unlock()
+		if status != http.StatusOK {
+			w.WriteHeader(status)
+			_, _ = w.Write([]byte(`{"code":"internal_error","message":"campaign pending amendments failed"}`))
+			return
+		}
+		if !ok {
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = w.Write([]byte(`{"code":"not_found","message":"no route"}`))
+			return
+		}
+		if body.Items == nil {
+			body.Items = []campaignPendingAmendment{}
+		}
+		_ = json.NewEncoder(w).Encode(body)
+	})
 	// GET /v0/runs/{run_id}/scope-overlap (E83.60 / #4118).
 	mux.HandleFunc("GET /v0/runs/{run_id}/scope-overlap", func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -1033,6 +1111,9 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		errBody := fb.hostDispatchErrBody
 		forceNoop := fb.hostDispatchForceNoop
 		baseBranch := fb.hostDispatchBaseBranch
+		if b, has := fb.hostDispatchBaseBranchByStage[id.String()]; has {
+			baseBranch = b
+		}
 		// Model the CAS marker: flip a seeded pending|awaiting_host_dispatch stage
 		// to dispatched (transitioned:true); an already-dispatched stage is the
 		// idempotent no-op (transitioned:false). The resulting state is echoed back.
@@ -1713,6 +1794,8 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 		if override, has := fb.getStatusByID[id]; has {
 			status = override
 		}
+		fallback := fb.stampDefaultBranch(fb.getResp)
+		row = fb.stampDefaultBranch(row)
 		fb.mu.Unlock()
 		if status >= 400 {
 			w.WriteHeader(status)
@@ -1736,7 +1819,7 @@ func newFakeBackend(t *testing.T) (*fakeBackend, *httptest.Server) {
 			_ = json.NewEncoder(w).Encode(row)
 			return
 		}
-		_ = json.NewEncoder(w).Encode(fb.getResp)
+		_ = json.NewEncoder(w).Encode(fallback)
 	})
 	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, r *http.Request) {
 		id, perr := uuid.Parse(r.PathValue("run_id"))
@@ -3543,7 +3626,31 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// write:runs; the backend refuses a run-bound token. Its own tool, not a
 	// mode of fishhawk_promote_queued_stage: the two queues differ in key,
 	// lock domain and refusal set. 82 -> 83.
-	const wantToolCount = 83
+	//
+	// E94.3 / #4694 (ADR-117 D3 + A1) adds exactly ONE tool —
+	// fishhawk_record_escape, the wrapper over POST /v0/runs/{run_id}/escapes.
+	// WHEN: a defect got past the live reviews, or a pending escape needs a
+	// human judgement. ELIGIBILITY: write:runs; the backend refuses every
+	// run-bound token and makes a closure human-only. 83 -> 84.
+	//
+	// E94.8 / #4841 (ADR-117 D1 phase 3, 2026-10-30) adds exactly ONE tool —
+	// fishhawk_label_concern, the wrapper over POST
+	// /v0/concerns/{concern_id}/label. WHEN: a recorded judgement must be
+	// corrected, a concern duplicates an earlier one of its run, or historical
+	// labels are imported with backfill. ELIGIBILITY: write:stages or
+	// write:fixups, any concern in any state; the backend refuses EVERY agent
+	// token (label_requires_human). Its own tool, not a waive mode: it changes
+	// no lifecycle state and records concern_labelled. 84 -> 85.
+	//
+	// E87.17 / #4685 (ADR-112 R3) adds exactly ONE tool —
+	// fishhawk_withdraw_merge_intent, the wrapper over POST
+	// /v0/runs/{run_id}/merge-queue/withdraw. WHEN: a run's merge-queue entry
+	// has YIELDED and the operator wants its merge out of the queue, to merge
+	// inline with fishhawk_merge_run. ELIGIBILITY: write:runs; the backend
+	// refuses a run-bound token, and refuses a live, unmarked, no-intent or
+	// dispatch-claimed entry. Its own tool, not a promote mode: it settles the
+	// entry instead of reordering it. 85 -> 86.
+	const wantToolCount = 86
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3613,6 +3720,53 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawResolveConcerns {
 		t.Error("fishhawk_resolve_concerns is not in the registered tool list — the resolve-with-evidence verb is unreachable")
+	}
+	// fishhawk_label_concern (E94.8 / #4841) must likewise be wire-visible: the
+	// 84 -> 85 bump alone would stay green if its registration were dropped and
+	// a DIFFERENT tool added in the same change.
+	var sawLabelConcern bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_label_concern" {
+			sawLabelConcern = true
+			break
+		}
+	}
+	if !sawLabelConcern {
+		t.Error("fishhawk_label_concern is not in the registered tool list — the relabel and duplicate_of verb is unreachable")
+	}
+	// fishhawk_withdraw_merge_intent (E87.17 / #4685) must likewise be
+	// wire-visible, and its description must lead with WHEN and state the
+	// eligibility that keeps it to a YIELDED entry without a dispatch claim:
+	// the 85 -> 86 bump alone would stay green if its registration were
+	// dropped and a DIFFERENT tool added in the same change.
+	var withdrawDesc string
+	var sawWithdraw bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_withdraw_merge_intent" {
+			sawWithdraw = true
+			withdrawDesc = tool.Description
+			break
+		}
+	}
+	if !sawWithdraw {
+		t.Error("fishhawk_withdraw_merge_intent is not in the registered tool list — a yielded entry's merge intent cannot be withdrawn, so an inline merge stays blocked")
+	} else {
+		if !strings.HasPrefix(withdrawDesc, "Use this when") {
+			t.Errorf("fishhawk_withdraw_merge_intent description must lead with WHEN; got %q", withdrawDesc[:min(len(withdrawDesc), 80)])
+		}
+		for _, want := range []string{"ELIGIBILITY", "YIELDED", "#4685", "merge_dispatch_claimed"} {
+			if !strings.Contains(withdrawDesc, want) {
+				t.Errorf("fishhawk_withdraw_merge_intent description is missing %q", want)
+			}
+		}
+	}
+	// fishhawk_get_merge_queue's "do NOT re-invoke fishhawk_merge_run" advice
+	// must name the withdrawal as the exit for a YIELDED entry (#4685), or the
+	// read that shows the yield leaves the operator with no verb.
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_get_merge_queue" && !strings.Contains(tool.Description, "fishhawk_withdraw_merge_intent") {
+			t.Error("fishhawk_get_merge_queue description does not name fishhawk_withdraw_merge_intent for a YIELDED entry")
+		}
 	}
 	// fishhawk_answer_divergence (E75.5 / #3733) must be wire-visible for the
 	// same reason.

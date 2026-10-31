@@ -89,12 +89,21 @@ type stageConcurrencyPromotedPayload struct {
 	Actor       string `json:"actor"`
 }
 
-// parsePromoteBody strictly decodes the body: ONE JSON object whose only key
+// parsePromoteBody is parseReasonBody with the promote verbs' missing-reason
+// message (the concurrency promote and the merge-queue promote share it).
+func (s *Server) parsePromoteBody(w http.ResponseWriter, r *http.Request) (reason string, ok bool) {
+	return s.parseReasonBody(w, r, "reason is required: say why this waiter should be admitted ahead of the others")
+}
+
+// parseReasonBody strictly decodes the body: ONE JSON object whose only key
 // is "reason" (unknown keys, a trailing document and a non-object refused),
 // then requires a reason that is non-empty after TrimSpace and at most
-// promoteReasonMax bytes. ok=false means a 400 was written. It does not use
+// promoteReasonMax bytes; missingReason is the verb's own message for an
+// empty one. ok=false means a 400 was written. It does not use
 // decodeSingleJSONBody, which accepts unknown keys (approval condition 2).
-func (s *Server) parsePromoteBody(w http.ResponseWriter, r *http.Request) (reason string, ok bool) {
+// Shared by the promote verbs and the merge-queue withdraw-intent verb
+// (#4685).
+func (s *Server) parseReasonBody(w http.ResponseWriter, r *http.Request, missingReason string) (reason string, ok bool) {
 	var body promoteQueuedStageRequest
 	if r.Body != nil {
 		dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, promoteBodyMax))
@@ -118,8 +127,7 @@ func (s *Server) parsePromoteBody(w http.ResponseWriter, r *http.Request) (reaso
 	}
 	reason = strings.TrimSpace(body.Reason)
 	if reason == "" {
-		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
-			"reason is required: say why this waiter should be admitted ahead of the others",
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed", missingReason,
 			map[string]any{"field": "reason"})
 		return "", false
 	}

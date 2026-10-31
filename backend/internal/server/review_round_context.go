@@ -41,9 +41,19 @@ const (
 // reviewRoundSource is where an implement-review round's diff came from.
 // BaseSHA is set only for the compare-sourced origins (fixup_push,
 // consolidated); a trace round's diff lives in the stored bundle.
+//
+// HeadSHA and HeadUnresolvedReason feed the round's reviewed_head record
+// (ADR-117 A1.7, buildReviewedHead) and persist ONLY through it — neither is a
+// payload key of its own. HeadSHA is a trace round's AUTHORITATIVE verify head
+// (bundle.ExtractVerifyHead), distinct from the #797 dedup head_sha;
+// HeadUnresolvedReason, when set, records the round's head as unknown with that
+// reason (a consolidated compare that named no head, or a truncated commit
+// listing whose last commit is not the tip).
 type reviewRoundSource struct {
-	Origin  string
-	BaseSHA string
+	Origin               string
+	BaseSHA              string
+	HeadSHA              string
+	HeadUnresolvedReason string
 }
 
 // reviewRedispatch is the re-dispatch marker: Of is the audit sequence of the

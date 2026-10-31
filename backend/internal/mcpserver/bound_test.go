@@ -493,7 +493,7 @@ func TestImplementReviewsElidedIsClassifiedTierNever(t *testing.T) {
 // bandedElisions drives the whole matrix: every tier band from a generous
 // budget down to the floor, returning each band's emitted elisions.
 //
-// The 15 KiB band is inside the diagnosis-skeleton fit window (#3043). Adding
+// The 16 KiB band is inside the diagnosis-skeleton fit window (#3043). Adding
 // run.concerns.open_implement as an itemised skeleton omission (consistent with
 // its siblings run.concerns.open / by_state, since skeletonRunStatus never
 // copies Run.Concerns) grew the skeleton to a constant 12465 bytes, so it no
@@ -507,7 +507,12 @@ func TestImplementReviewsElidedIsClassifiedTierNever(t *testing.T) {
 // residue is a constant ~17512 bytes), so the window is now [~13650, ~17511]
 // and 15 KiB (15360) still sits INSIDE it — ~1.7 KiB above the floor (was
 // ~1.9 KiB) and ~2.1 KiB below the ceiling. The band is re-measured, not
-// relaxed: no assertion was weakened to restore green.
+// relaxed: no assertion was weakened to restore green. #4758 classified
+// run.default_branch and run.default_branch_unresolved_reason as skeleton
+// rows, and the re-measured fit window moved to [15424, 17792) bytes (the
+// skeleton tier engages at a 15424-byte budget, T9 at 17792), so 15 KiB
+// (15360) fell to the floor tier — hence 16 KiB (16384), ~960 bytes above the
+// floor and ~1.4 KiB below the ceiling. Re-measured, not relaxed.
 // Without a band in that window no probe would engage the skeleton tier at all,
 // and the skeleton-ONLY next_actions.actions computed elision — which
 // TestElisions_ComputedCarryNoPointer requires — would vanish from the matrix.
@@ -516,7 +521,7 @@ func TestImplementReviewsElidedIsClassifiedTierNever(t *testing.T) {
 func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 	t.Helper()
 	out := map[int]*Elisions{}
-	for _, b := range []int{28 * 1024, 20 * 1024, 15 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
+	for _, b := range []int{28 * 1024, 20 * 1024, 16 * 1024, 12 * 1024, 8 * 1024, 6 * 1024, 5 * 1024, minimalRunStatusMaxBytes} {
 		bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(b))
 		if err != nil {
 			t.Fatalf("budget %d: %v", b, err)
@@ -540,12 +545,14 @@ func bandedElisions(t *testing.T, runID string) map[int]*Elisions {
 // elision entries grew the skeleton from 12465 to 13446 bytes and the 13 KiB
 // band fell below the floor. E45.83 / #3618's run.concerns.superseded_implement
 // row grew it again, 13446 -> 13650 bytes, with the T9 ceiling unmoved. The
-// skeleton is a constant 13650 bytes; the fit
-// window is [~13650, ~17511], so 15 KiB (15360) sits ~1.7 KiB above the floor
-// and ~2.1 KiB below the T9 ceiling — comfortably inside, one band suffices.
+// skeleton was then a constant 13650 bytes in a [~13650, ~17511] window. #4758's
+// run.default_branch / run.default_branch_unresolved_reason rows moved the
+// re-measured window to [15424, 17792) bytes, dropping 15 KiB (15360) to the
+// floor tier, so the band is now 16 KiB (16384): ~960 bytes above the floor
+// and ~1.4 KiB below the T9 ceiling — inside, one band suffices.
 func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
 	runID := uuid.NewString()
-	const band = 15 * 1024
+	const band = 16 * 1024
 	bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(band))
 	if err != nil {
 		t.Fatalf("band %d: %v", band, err)
@@ -555,7 +562,7 @@ func TestElisions_SkeletonBandEngagesSkeletonTier(t *testing.T) {
 	}
 	if bounded.Elisions.Tier != "skeleton" {
 		raw, _ := json.Marshal(bounded)
-		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured skeleton size ~13650B, serialized here %dB) — re-pick the band inside the new window",
+		t.Fatalf("band %d engaged tier %q, want \"skeleton\"; the skeleton fit window shifted (measured fit window [15424, 17792) bytes, serialized here %dB) — re-pick the band inside the new window",
 			band, bounded.Elisions.Tier, len(raw))
 	}
 	found := false
@@ -1716,7 +1723,7 @@ func TestNextActionsSignature_SurvivesEveryTier(t *testing.T) {
 // retention.
 func TestElisions_SkeletonItemisesSupersededImplement(t *testing.T) {
 	runID := uuid.NewString()
-	const band = 15 * 1024
+	const band = 16 * 1024
 	bounded, err := boundRunStatusOutput(maximalRunStatusOutput(runID), runID, fixedBudget(band))
 	if err != nil {
 		t.Fatalf("band %d: %v", band, err)

@@ -22,6 +22,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/webhook"
 )
 
@@ -1575,6 +1576,17 @@ func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 	if got := len(gh.calls()); got != 1 {
 		t.Fatalf("after the fix-up synchronize: %d check runs, want 1", got)
 	}
+	// #4801: the stranded pending check NAMES its cause in output.title and
+	// leads output.summary with it (GitLab's description reads the summary).
+	first := gh.calls()[0].params
+	for _, want := range []string{"Held: acceptance stage " + shortStageID(acc.ID), "re-opened by a fix-up push"} {
+		if !strings.Contains(first.OutputTitle, want) {
+			t.Errorf("first check output.title = %q, want it to contain %q", first.OutputTitle, want)
+		}
+	}
+	if !strings.HasPrefix(first.OutputSummary, "Held:") {
+		t.Errorf("first check output.summary = %q, want it to start with Held:", first.OutputSummary)
+	}
 
 	// Before the re-run, the merge is refused as acceptance_stale, naming the
 	// re-dispatch and the fix-up head, with no republish and no dispatch.
@@ -1599,6 +1611,9 @@ func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 	}
 	forgeText := calls[len(calls)-1].params.OutputText
 	wantStage := shortStageID(acc.ID)
+	if title := calls[len(calls)-1].params.OutputTitle; !strings.Contains(title, "Held: acceptance stage "+wantStage) || !strings.Contains(title, "(in flight)") {
+		t.Errorf("last check output.title = %q, want the in-flight Held: headline", title)
+	}
 	for _, want := range []string{"stage_not_terminal", wantStage, "re-opened by a fix-up push", "re-run is already in flight", "Wait for the re-run to settle"} {
 		if !strings.Contains(forgeText, want) {
 			t.Errorf("forge output.text = %q, want it to contain %q", forgeText, want)
@@ -1643,5 +1658,46 @@ func TestFixupStrandedMerge_DerivedDetailReachesForgeAndOperator(t *testing.T) {
 	}
 	if !strings.Contains(env.Error.Message, "fishhawk_audit_complete is pending because:") {
 		t.Errorf("409 message must state the cause inline: %q", env.Error.Message)
+	}
+}
+
+// TestFixupReopen_ForcesHeldRepublishPastDedup is the #4801 C2 seam case: a
+// generic pending fishhawk_audit_complete is ALREADY published at the head when
+// the fix-up push re-opens acceptance (the live sequence). The publisher's
+// (head, state) dedup would suppress an unforced republish, so the reopen path
+// must FORCE it for the "Held:" cause to reach the forge. Counterfactual:
+// replacing the forced call in reopenAcceptanceOnFixupPush with the unforced
+// recomputeAndPublishAuditComplete leaves only the generic check — RED.
+func TestFixupReopen_ForcesHeldRepublishPastDedup(t *testing.T) {
+	s, rr, _, gh, r, acc := reopenedAcceptanceStrandFixture(t, "", &fakeMerger{})
+	ctx := context.Background()
+
+	if ok, err := s.publishAuditCheckAtHead(ctx, r.ID, stagecheck.StatePending, nil, nil, ""); err != nil || !ok {
+		t.Fatalf("seed generic pending publish = (%v, %v), want (true, nil)", ok, err)
+	}
+	before := gh.calls()
+	if len(before) != 1 || strings.Contains(before[0].params.OutputTitle, "Held:") {
+		t.Fatalf("precondition: want one generic pending check, got %d (%v)", len(before), publishStatuses(before))
+	}
+
+	s.reopenAcceptanceOnFixupPush(ctx, r.ID, fixupHeadSHA)
+	if got := stageStateOnOrchestratorRepo(t, rr, r.ID, acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance stage state = %q, want pending", got)
+	}
+	// The unforced synchronize republish that follows on the live path dedups.
+	s.recomputeAndPublishAuditComplete(ctx, r.ID)
+
+	calls := gh.calls()
+	if len(calls) < 2 {
+		t.Fatalf("check runs = %d, want a forced republish after the reopen", len(calls))
+	}
+	last := calls[len(calls)-1].params
+	if last.HeadSHA != before[0].params.HeadSHA {
+		t.Errorf("republish head = %q, want the same head %q", last.HeadSHA, before[0].params.HeadSHA)
+	}
+	for _, want := range []string{"Held: acceptance stage", "re-opened by a fix-up push"} {
+		if !strings.Contains(last.OutputTitle, want) {
+			t.Errorf("republished output.title = %q, want it to contain %q", last.OutputTitle, want)
+		}
 	}
 }

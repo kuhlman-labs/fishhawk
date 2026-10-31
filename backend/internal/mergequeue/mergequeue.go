@@ -9,8 +9,11 @@
 // ledger (0108) and the line-turn read. ADR-112 R3 adds the yield marker and
 // the persisted approval-wait anchor (0109): a marked held entry is skipped by
 // AdmitNext until ClearYield clears it. ADR-093 slice 3 adds the operator
-// promote's order_key (0111) and the ejection/re-entry reads. README.md is
-// the contract.
+// promote's order_key (0111) and the ejection/re-entry reads. docs/adr/112
+// Amendment A3 adds the yield revision, the row-4 flag, the per-epoch
+// merge-gate window and its hold budget, and the approval-wait open bit
+// (0115). ADR-112 R3's withdraw-intent verb (#4685) settles a yielded entry
+// dropped intent_withdrawn (IntentWithdrawer). README.md is the contract.
 package mergequeue
 
 import (
@@ -79,8 +82,13 @@ const (
 
 // ReasonBaseChanged is the drop reason Enqueue records when a run with an
 // active entry re-enters on a different base ref. Every other eject/drop
-// reason is the caller's (README.md § "Reasons").
+// reason is the caller's, except ReasonIntentWithdrawn (README.md §
+// "Reasons").
 const ReasonBaseChanged = "base_changed"
+
+// ReasonIntentWithdrawn is the drop reason WithdrawIntent records when the
+// operator withdraws a yielded entry's merge intent (ADR-112 R3, #4685).
+const ReasonIntentWithdrawn = "intent_withdrawn"
 
 // ReentryReason is the eject reason ReentryCandidates matches: a red pass
 // (the server's verify_failed), the only ejection ADR-093 D4 re-enters
@@ -132,6 +140,18 @@ var (
 	// ErrEntryYielded is a Promote for a yielded (marked) held entry: AdmitNext
 	// skips it whatever its order, so the marker must clear first.
 	ErrEntryYielded = errors.New("mergequeue: entry is yielded; clear its yield before promoting")
+	// ErrNoIntent is a WithdrawIntent on an active entry that carries no
+	// merge intent: there is nothing to withdraw.
+	ErrNoIntent = errors.New("mergequeue: entry carries no merge intent")
+	// ErrEntryNotYielded is a WithdrawIntent on a held but UNMARKED entry:
+	// only a yielded entry's intent is withdrawable (an unmarked one is
+	// progressing to the queue's own merge).
+	ErrEntryNotYielded = errors.New("mergequeue: entry is not yielded; only a yielded entry's merge intent can be withdrawn")
+	// ErrDispatchClaimed is a WithdrawIntent for a run that holds an ADR-109
+	// merge-dispatch claim in any state (dispatched or dispatch_failed): the
+	// withdrawal never reads the claim as permission to clear it and never
+	// writes the ledger.
+	ErrDispatchClaimed = errors.New("mergequeue: run holds a merge-dispatch claim")
 	// ErrReclaimUnrecorded is an AdmitNextReclaiming whose ReclaimRecordFunc
 	// failed: the whole call was rolled back (no epoch bump, no admitted_at
 	// change). It wraps the callback's error.
@@ -176,7 +196,7 @@ type Entry struct {
 	MergeIntentSequence int64
 	// AdmissionEpoch is bumped by every admission (AdmitNext's admit and its
 	// stale re-claim, 0108; AdmitNextReclaiming's boot re-claim). The admission-owned writes (Unadmit, SetPhase,
-	// ReanchorAt, SettleAt, ApprovalWait, Yield) are compare-and-swaps on it.
+	// ReanchorAt, SettleAt, ApprovalWait, GateWait, Yield) are compare-and-swaps on it.
 	AdmissionEpoch int64
 	// YieldReason and YieldDetail are the yield marker (0109, ADR-112 R3):
 	// "" for NULL. YieldReason is the server's closed vocabulary;
@@ -185,14 +205,37 @@ type Entry struct {
 	YieldReason string
 	YieldDetail string
 	// YieldedAt is when the entry yielded (nil: not marked). A marked entry
-	// is held and AdmitNext skips it; (AnchoredHeadSHA, YieldedAt) is the
-	// compare-and-swap key of ClearYield, UpdateYield and ReanchorYielded.
+	// is held and AdmitNext skips it.
 	YieldedAt *time.Time
+	// YieldRevision is bumped by EVERY marker write (0115, docs/adr/112
+	// A3.6): Yield, Enqueue's mark (and an insert carrying a marker),
+	// UpdateYield, ClearYield and ReanchorYielded. (AnchoredHeadSHA,
+	// YieldRevision) is the compare-and-swap key of ClearYield, UpdateYield
+	// and ReanchorYielded.
+	YieldRevision int64
+	// Row4Flag is the persisted row-4 obligation (0115, A3.6): set by a
+	// marker write whose YieldMarker.Row4 is true (OR: no reason transition
+	// clears it), cleared only by ClearYield(clearRow4=true).
+	Row4Flag bool
 	// ApprovalWaitStartedAt is the persisted head-of-line approval-wait
 	// anchor (nil: no wait started this episode). Set once by ApprovalWait,
-	// never reset by Unadmit, a re-admission or a stale re-claim; cleared only
-	// by ClearYield.
+	// never reset by Unadmit, a re-admission, a stale re-claim or (A3.7) a
+	// ClearYield: it is RETAINED for the whole episode.
 	ApprovalWaitStartedAt *time.Time
+	// ApprovalWaitOpen reports an approval wait is open (0115, A3.7): set by
+	// ApprovalWait, cleared by ClearYield. A retained anchor with no open
+	// wait never expires a non-approval hold.
+	ApprovalWaitOpen bool
+	// GateWaitStartedAt and GateWaitEpoch are the per-admission-epoch
+	// merge-gate window (0115, A3.2): its start and the admission epoch that
+	// opened it (both nil, or both set). GateWait opens and judges it.
+	GateWaitStartedAt *time.Time
+	GateWaitEpoch     *int64
+	// GateHoldTokens is the merge-gate hold budget (0115, A3.7: 0 to
+	// GateHoldBudget) and GateTokensRefilledAt its refill timestamp (nil:
+	// never spent).
+	GateHoldTokens       int
+	GateTokensRefilledAt *time.Time
 	// YieldAge is clock_timestamp() - yielded_at, computed in SQL when the
 	// row was read (database clock domain); 0 when unmarked.
 	YieldAge time.Duration
@@ -255,34 +298,37 @@ type EnqueueRequest struct {
 type YieldMarker struct {
 	Reason string
 	Detail string
-	// Continue, when non-nil, is the entry's last CLEARED yield episode for
-	// Reason (ADR-112 R3, #4632): a same-reason re-yield on the same head
-	// and base keeps that episode's yielded_at, so the re-probe backoff keeps
-	// growing instead of restarting. A write that would stamp a fresh
-	// yielded_at (Yield, or Enqueue marking an unmarked held entry) stamps
-	// Continue.YieldedAt instead ONLY when the entry's anchor after the
-	// write equals Continue's HeadSHA and BaseSHA; any other anchor is a new
-	// episode on the database clock. An already-marked entry keeps its own
-	// yielded_at whatever Continue says.
+	// Row4, when true, sets the entry's row4_flag (docs/adr/112 A3.6) in
+	// the same statement as the marker: the server sets it for a
+	// forge_review_required yield. False never clears the flag.
+	Row4 bool
+	// Continue, when non-nil, is the entry's last CLEARED yield episode
+	// (docs/adr/112 A3.7, #4780): a re-yield on the same base ref keeps that
+	// episode's yielded_at, WHATEVER the reason or head, so the re-probe
+	// backoff keeps growing instead of restarting. A write that would stamp
+	// a fresh yielded_at (Yield, or Enqueue marking an unmarked held entry)
+	// stamps Continue.YieldedAt instead ONLY when the entry's base_ref equals
+	// Continue.BaseRef; any other base is a new episode on the database
+	// clock. An already-marked entry keeps its own yielded_at whatever
+	// Continue says.
 	Continue *YieldEpisode
 }
 
-// YieldEpisode is a cleared yield episode: its yielded_at and the anchor it
-// was cleared at ("" BaseSHA for NULL).
+// YieldEpisode is a cleared yield episode: its yielded_at and the base ref
+// it was cleared on.
 type YieldEpisode struct {
 	YieldedAt time.Time
-	HeadSHA   string
-	BaseSHA   string
+	BaseRef   string
 }
 
 // continueArgs are the SQL arguments of m's episode continuation: NULLs
 // when there is none.
-func (m YieldMarker) continueArgs() (yieldedAt *time.Time, headSHA, baseSHA string) {
-	if m.Continue == nil || m.Continue.YieldedAt.IsZero() || m.Continue.HeadSHA == "" {
-		return nil, "", ""
+func (m YieldMarker) continueArgs() (yieldedAt *time.Time, baseRef string) {
+	if m.Continue == nil || m.Continue.YieldedAt.IsZero() || m.Continue.BaseRef == "" {
+		return nil, ""
 	}
 	t := m.Continue.YieldedAt
-	return &t, m.Continue.HeadSHA, m.Continue.BaseSHA
+	return &t, m.Continue.BaseRef
 }
 
 // validate refuses an empty reason before any SQL runs.
@@ -300,6 +346,29 @@ type ApprovalWaitResult struct {
 	// Expired reports the window has elapsed since ApprovalWaitStartedAt.
 	Expired bool
 	// Remaining is the window left (0 when Expired).
+	Remaining time.Duration
+}
+
+// GateHoldBudget is the merge-gate hold budget N (docs/adr/112 A3.7): a
+// full bucket, and the 0115 CHECK's upper bound.
+const GateHoldBudget = 3
+
+// GateHoldRefill is the budget's refill period R (A3.7): one token per R the
+// row spends not holding.
+const GateHoldRefill = time.Hour
+
+// GateWaitResult is GateWait's verdict, judged on the database clock.
+type GateWaitResult struct {
+	// Entry is the row after the call.
+	Entry Entry
+	// Opened reports THIS call opened the epoch's window (one token spent).
+	Opened bool
+	// Expired reports the window has elapsed since GateWaitStartedAt.
+	Expired bool
+	// NoToken reports the epoch had no window and the budget is empty after
+	// the refill: nothing was written and the caller yields at once.
+	NoToken bool
+	// Remaining is the window left (0 when Expired or NoToken).
 	Remaining time.Duration
 }
 
@@ -471,6 +540,34 @@ type Promoter interface {
 	Promote(ctx context.Context, req PromoteRequest) (Promotion, error)
 }
 
+// WithdrawIntentRequest asks to withdraw the merge intent of a run's YIELDED
+// held entry (ADR-112 R3, #4685).
+type WithdrawIntentRequest struct {
+	RunID uuid.UUID
+	// Record is REQUIRED. It runs inside the withdrawal transaction after the
+	// settle and before COMMIT; a non-nil error rolls the whole withdrawal
+	// back. The server appends merge_queue_intent_withdrawn through it (on
+	// tx), so a withdrawal never commits unaudited.
+	Record func(ctx context.Context, tx pgx.Tx, w Withdrawal) error
+}
+
+// Withdrawal is WithdrawIntent's verdict.
+type Withdrawal struct {
+	// Entry is the row after the settle: dropped with ReasonIntentWithdrawn,
+	// its merge_intent_at, merge_intent_sequence and yield columns retained.
+	Entry Entry
+	// LiveRunID is the run holding the base's line, or nil when none.
+	LiveRunID *uuid.UUID
+}
+
+// IntentWithdrawer is the withdraw-intent verb (ADR-112 R3, #4685): a
+// separate capability like Promoter, so every existing fake keeps compiling
+// and a fake without it degrades instead of panicking (README.md § "Withdraw
+// intent").
+type IntentWithdrawer interface {
+	WithdrawIntent(ctx context.Context, req WithdrawIntentRequest) (Withdrawal, error)
+}
+
 // EjectionReader is the ejection visibility reads (ADR-093 slice 3): a
 // separate capability like Promoter.
 type EjectionReader interface {
@@ -573,16 +670,22 @@ type Store interface {
 	// Yield moves a live entry at epoch to held with the marker, in one
 	// statement (README.md § "Yield").
 	Yield(ctx context.Context, entryID uuid.UUID, epoch int64, marker YieldMarker) (Entry, error)
-	// ClearYield clears a held entry's marker and wait anchor, a
-	// compare-and-swap on (anchored_head_sha, yielded_at).
-	ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time) (Entry, error)
+	// GateWait opens (once per admission epoch, spending one hold token) or
+	// continues the merge-gate window of a live entry at epoch and judges
+	// window's expiry on the database clock; it never touches the approval
+	// wait (README.md § "Yield", docs/adr/112 A3.2/A3.7).
+	GateWait(ctx context.Context, entryID uuid.UUID, epoch int64, window time.Duration) (GateWaitResult, error)
+	// ClearYield clears a held entry's marker and closes its approval wait
+	// (the anchor is retained), a compare-and-swap on (anchored_head_sha,
+	// yield_revision); clearRow4 also clears row4_flag.
+	ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, revision int64, clearRow4 bool) (Entry, error)
 	// UpdateYield rewrites a marked entry's reason and detail, the same
 	// compare-and-swap.
-	UpdateYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, marker YieldMarker) (Entry, error)
+	UpdateYield(ctx context.Context, entryID uuid.UUID, headSHA string, revision int64, marker YieldMarker) (Entry, error)
 	// ReanchorYielded moves a marked entry's anchor to the PR's current head,
 	// keeping the marker and the episode, the same compare-and-swap on the
 	// OLD head.
-	ReanchorYielded(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, newHeadSHA, newBaseSHA string) (Entry, error)
+	ReanchorYielded(ctx context.Context, entryID uuid.UUID, headSHA string, revision int64, newHeadSHA, newBaseSHA string) (Entry, error)
 	// WithMergeIntentLock runs fn under the run's merge-intent lock; fn's
 	// context is bounded by the intent fn deadline (even when ctx has none)
 	// and must not take another pglock lock (README.md § "Merge-intent lock").

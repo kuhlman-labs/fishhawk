@@ -1329,6 +1329,49 @@ func TestProvisionLineageWorktree_NonTransientAddErrorNotRetried(t *testing.T) {
 	}
 }
 
+// TestWorktreeAdminGit_RetriesLockContention (ADR-115 D2, #4648): a
+// worktree-admin op that meets a sibling worktree's held ref lock (the real
+// lockfile message, injected once through the worktreeAdminGitRun seam) is
+// retried inside gitops.RetryLockContention and then succeeds against real git.
+// The lock retry is NOT the commondir-transient loop: no
+// worktree_admin_git_retry event is emitted for it. The real seam's children
+// ran under LC_ALL=C/LANG=C (C1), read from the child env.
+func TestWorktreeAdminGit_RetriesLockContention(t *testing.T) {
+	repo := initRepo(t)
+	pinHostLocale(t)
+	calls := recordGitChildren(t)
+	orig := worktreeAdminGitRun
+	t.Cleanup(func() { worktreeAdminGitRun = orig })
+	attempts := 0
+	worktreeAdminGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+		attempts++
+		if attempts == 1 {
+			return []byte("fatal: cannot lock ref 'refs/heads/run-lock000': Unable to create '" + repoDir +
+					"/.git/refs/heads/run-lock000.lock': File exists.\n\nAnother git process seems to be running in this repository"),
+				errProbe("exit status 128")
+		}
+		return orig(ctx, repoDir, args...)
+	}
+
+	var log bytes.Buffer
+	out, err := worktreeAdminGit(context.Background(), repo, &log, "worktree", "list", "--porcelain")
+	if err != nil {
+		t.Fatalf("worktreeAdminGit after one lock contention: %v (%s)", err, out)
+	}
+	if attempts != 2 {
+		t.Errorf("attempts = %d, want exactly 2 (one contended, one real)", attempts)
+	}
+	if !strings.HasPrefix(string(out), "worktree ") {
+		t.Errorf("output = %q, want the real `worktree list` result", out)
+	}
+	if strings.Contains(log.String(), `"event":"worktree_admin_git_retry"`) {
+		t.Errorf("a lock-contention retry was reported as the commondir transient:\n%s", log.String())
+	}
+	if n := assertLockRetryLocale(t, calls(), "worktree list --porcelain"); n != 1 {
+		t.Errorf("recorded real worktree-admin children = %d, want 1", n)
+	}
+}
+
 // gitPorcelain returns `git status --porcelain` output for dir.
 func gitPorcelain(t *testing.T, dir string) string {
 	t.Helper()

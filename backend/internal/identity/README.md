@@ -9,7 +9,7 @@ The `IdentityProvider` interface (`identity.go`) speaks provider-qualified subje
 `GitHubIdentityProvider` (`github.go`) is a hand-rolled REST + OAuth-device-flow implementation (mirroring `githubclient`/`githuboidc`: net/http + encoding/json, test-overridable base URLs):
 
 - `VerifyUser` drives the device flow to a subject.
-- `VerifyAccessToken` re-verifies a CLI-obtained access token server-side to a subject (the "server-side re-verify" half of the CLI-driven device-flow login, E39.3 / #1708).
+- `VerifyAccessToken` re-verifies a CLI-obtained access token server-side to a subject (the "server-side re-verify" half of the CLI-driven device-flow login, E39.3 / #1708), after binding it to the deployment's own device OAuth client (#4627; see "Client binding").
 - `PermissionLevel` maps GitHub's `role_name`.
 - `ResolveMembership` resolves org (`GET /orgs/{org}/members/{login}`) or team (`.../teams/{team}/memberships/{login}`).
 - `Permission.AtLeast` orders the tiers for "at least" gating.
@@ -31,10 +31,26 @@ The ONE implementation of the workflow spec's `approvals.members` rule; the serv
 
 1. A member with a provider prefix (`ProviderOf(m) != ""`, e.g. `github:kuhlman-labs`) is used **verbatim**.
 2. A plain member (`alice`) is qualified with the RUN's forge family: `CanonicalMember("alice", "github") == "github:alice"`.
-3. The SUBJECT is **never** qualified and must already be a FORGE identity (`github:` / `gitlab:`). A plain subject (a static API token such as `brett@local-mcp`, `operator-agent/...`, `anonymous`) and a non-forge-qualified one (the run-bound MCP subject `mcp:run:<uuid>`) match no member — even one spelled identically. This is the 2026-10-08 ruling that approver gates take the forge-verified `github:<login>` identity, never a static MCP-token subject, and mirrors `gitLabLoginFromSubject`'s refusal of an unqualified bare login.
+3. The SUBJECT is **never** qualified and must already be FORGE-SHAPED (`github:` / `gitlab:`). A plain subject (`brett@local-mcp`, `operator-agent/...`, `anonymous`) and a non-forge-qualified one (the run-bound MCP subject `mcp:run:<uuid>`) match no member — even one spelled identically. This mirrors `gitLabLoginFromSubject`'s refusal of an unqualified bare login. Rule 3 is a **subject-shape** rule only: a static API token whose subject is spelled `github:<login>` passes it. Whether the presenting credential was forge-verified is the separate credential-kind leg below, enforced by the server caller (#4633).
 4. Byte-exact comparison after 1/2: no case folding, no trimming — a casing mismatch refuses, never admits.
 
 An empty list or empty subject returns `false`; "empty list = no restriction" is the CALLER's decision (it must not call `SubjectListed` then). Pinned by `TestSubjectListed` / `TestCanonicalMember`; the static-subject and `mcp:run:` rows are the counterfactual vehicle for rule 3 (qualifying the subject turns them true).
+
+### Credential kinds: `ForgeVerifiedCredential` (#4633)
+
+`credential.go` is the ONE forge-neutral vocabulary for how the credential that authenticated a request was minted, plus its allow-list. Kinds are derived ONCE, by `CredentialKind(sessionID, tokenID, oauthAudience, subject, authMethod)`, which takes the auth middleware's trusted markers as arguments (order: `session`; `oauth_as`, checked before `auth_method`; no token marker → `unknown`; `mcp_run`; then `AuthMethodCredentialKind`: `oauth` / `static` / empty → `unrecorded` / other → `unknown`). The server's approval gate (`approvalCredentialKind`, a thin adapter over `CredentialKind`, in `checkApprovalPredicates`) and `fishhawkd approver-members` (`AuthMethodCredentialKind` for a historical row's `auth_method`) both classify through it and consult `ForgeVerifiedCredential`, so the gate and the inventory cannot disagree. The rule's decision record is ADR-123 (#4750), RATIFIED 2026-10-27.
+
+| Kind | Constant | Source | Forge-verified |
+|---|---|---|---|
+| `session` | `CredentialSession` | browser session; `auth.SignIn` is called only from the forge OAuth callback | yes |
+| `oauth` | `CredentialDeviceFlow` | api token with `auth_method='oauth'` (`IssueOAuth`, device-flow mint only) | yes |
+| `oauth_as` | `CredentialOAuthAS` | authorization-server `fho_` token; consent refuses without a forge session | yes |
+| `static` | `CredentialStatic` | `fishhawkd token issue`, or a child token from `POST /v0/tokens` | no |
+| `unrecorded` | `CredentialUnrecorded` | api token with an empty `auth_method` | no |
+| `mcp_run` | `CredentialMCPRun` | run-bound MCP token (`mcp:run:<uuid>`) | no |
+| `unknown` | `CredentialUnknown` | any other `auth_method`, or an identity with no credential marker | no |
+
+It is an ALLOW-LIST: the default branch refuses, so the empty string, an unrecognised value and a differently-cased spelling (`OAUTH`) are all refused. `ForgeVerifiedKinds` lists the three admitted kinds in stable order for refusal details. Pinned by `TestForgeVerifiedCredential`; its false rows are the counterfactual vehicle for the default deny (a default `true` flips them).
 
 ## GitLab implementation (`gitlab.go`, E66.4 / #2392)
 
@@ -45,7 +61,7 @@ No functional-option variadic is offered: in-package tests construct the struct 
 | Method | Endpoint | Notes |
 |---|---|---|
 | `VerifyUser` | `POST {base}/oauth/authorize_device` → `POST {base}/oauth/token` | RFC 8628 device flow, `scope=read_api`, grant `urn:ietf:params:oauth:grant-type:device_code` |
-| `VerifyAccessToken` | `GET {base}/api/v4/user` | subject is `gitlab:<username>`; **submitted bearer only** |
+| `VerifyAccessToken` | `GET {base}/oauth/token/info` → `GET {base}/api/v4/user` | token-info `application.uid` must equal the device client id (#4627); subject is `gitlab:<username>`; **submitted bearer only** on both |
 | `PermissionLevel` | `GET {base}/api/v4/projects/{id}/members/all` | bounded paginated exact-match walk |
 | `ResolveMembership` | `GET {base}/api/v4/groups/{id}/members/all` | same walk; `ref` is a group `full_path` |
 
@@ -57,13 +73,13 @@ Every subject is `<provider>:<login>`. `PermissionLevel` and `ResolveMembership`
 
 The deployment credential (`FISHHAWKD_GITLAB_TOKEN`, sent as `PRIVATE-TOKEN`) is **confined to `PermissionLevel` and `ResolveMembership`** — the reads that ask "what may this OTHER person do".
 
-`VerifyAccessToken` sends **only** the submitted `Authorization: Bearer` and never the deployment credential, on any status. Two credentials on a request whose only job is to verify the caller's own token is an authentication-bypass shape: if the forge honours the deployment credential, an invalid or revoked submitted token resolves as the deployment-token user and the mint issues a fishhawkd token for an identity the caller never proved. Pinned by `TestGitLabVerifyAccessToken_DeploymentCredentialNotSent`, whose discriminating case answers 401 to the submitted token and 200 to the deployment credential and requires the call to FAIL.
+`VerifyAccessToken` sends **only** the submitted `Authorization: Bearer` and never the deployment credential, on any status — on both its token-info binding check and its user lookup. Two credentials on a request whose only job is to verify the caller's own token is an authentication-bypass shape: if the forge honours the deployment credential, an invalid or revoked submitted token resolves as the deployment-token user and the mint issues a fishhawkd token for an identity the caller never proved. Pinned by `TestGitLabVerifyAccessToken_DeploymentCredentialNotSent`, whose discriminating case answers 401 to the submitted token and 200 to the deployment credential and requires the call to FAIL.
 
 A **nil** accessor sends no auth header — the anonymous-read degrade. It fails CLOSED (GitLab answers an unauthenticated caller 404 on a private project's members endpoint → `PermissionNone` → the mint gate denies) but is non-functional for the common private-repo case, so the fishhawkd wiring WARNs at boot. An accessor that **errors** propagates rather than falling back to anonymous: a broken credential must be loud, not a silent permission downgrade.
 
 ### Credential-bearing requests refuse cross-origin redirects
 
-Every request that carries a credential — the members reads (`PRIVATE-TOKEN`) and `VerifyAccessToken` (the submitted bearer) — goes out on a client copy whose `CheckRedirect` **refuses any hop that leaves the original request's origin** (`credentialClient` / `refuseCrossOriginRedirect`). Same-origin hops are still followed, bounded by `gitLabMaxRedirects = 10` (restating the cap that setting `CheckRedirect` displaces).
+Every request that carries a credential — the members reads (`PRIVATE-TOKEN`) and both `VerifyAccessToken` requests (the submitted bearer: token-info and the user lookup) — goes out on a client copy whose `CheckRedirect` **refuses any hop that leaves the original request's origin** (`credentialClient` / `refuseCrossOriginRedirect`). Same-origin hops are still followed, bounded by `gitLabMaxRedirects = 10` (restating the cap that setting `CheckRedirect` displaces).
 
 Go's redirect handling strips only a known set of sensitive headers (`Authorization`, `Cookie`, `WWW-Authenticate`) on a cross-host hop; a **nonstandard** header is copied verbatim — and GitLab's credential header, `PRIVATE-TOKEN`, is exactly that. Without the refusal, a GitLab instance or any proxy in front of it that answers a members read with a `302` to a host it controls receives `FISHHAWKD_GITLAB_TOKEN` in full, and that host's reply is accepted as the authorization answer. On `VerifyAccessToken` the stdlib would have dropped the bearer, but the redirect target would still dictate the **subject** the mint issues a token for.
 
@@ -119,4 +135,20 @@ Wired via config-gated factories into a FORGE-KEYED map: `serve.go::resolveIdent
 
 Shipping a per-installation construction path exercised only by tests would be dead routing (binding condition 1 forbids it). A per-installation identity leg needs an interface that carries installation context — an operator-filed follow-up, mirroring the deferred web-OAuth leg (`backend/internal/auth`). `serve.go` still consumes the resolver's `forge_base_url` for the REST client and gitlab forge via `installationBaseURLResolver`; only the `oauth_base_url`/identity leg is deferred.
 
-**First consumer (E39.3 / #1708):** the token-login mint handler (`server/tokens.go::handleTokenLoginMint`, `POST /v0/tokens/login`) calls `VerifyAccessToken` then gates the mint on `PermissionLevel(OperatorRepo, subject).AtLeast(OperatorMinPermission)` plus an operator-default-scope ceiling; `GET /v0/tokens/login` advertises the OAuth `client_id` for the CLI's device flow.
+## Client binding (#4627)
+
+`VerifyAccessToken` does not stop at "who owns this token". Owner resolution alone accepts a token the same human obtained through ANY client — another OAuth app, a personal access token, an automation credential — so before the subject is resolved, each provider binds the token to the deployment's OWN device OAuth client through the forge's introspection surface, fail-closed:
+
+| Provider | Introspection call | Accepted only when | Credential |
+|---|---|---|---|
+| GitHub | `POST {api}/applications/{client_id}/token` `{"access_token":…}` (check-a-token) | `200` and `app.client_id` byte-equals `clientID` | Basic `clientID:clientSecret`, **no** Bearer header |
+| GitLab | `GET {base}/oauth/token/info` | `2xx` and `application.uid` byte-equals `deviceClientID` | the presented token as `Authorization: Bearer` only |
+
+- **Refusal classes** (each a non-nil error wrapping a sentinel, so callers classify without reading text): `ErrTokenClientMismatch` (a foreign, empty, null or absent issuer; comparison is exact and case-sensitive), `ErrIntrospectionRefused` (a non-success status — GitHub answers `404` for a token not valid for the client, GitLab `401` for one that is not an OAuth grant), `ErrIntrospectionFailed` (transport error, refused redirect, oversized or undecodable reply), `ErrRateLimited`. No introspection error string carries a response body: GitHub's `200` body echoes the token.
+- **`ErrClientCredentialUnconfigured`** is returned before any HTTP call when the provider lacks the introspection credential (GitHub: `clientID` or the secret from `WithClientSecret`; GitLab: `deviceClientID`, which would otherwise compare equal to a null issuer). The mint handler maps it to `503 tokens_unconfigured` naming the env var — never a fallback to owner-only verification.
+- **Redirects.** GitHub's check refuses ANY redirect (`refuseAnyRedirect` returns `http.ErrUseLastResponse`, so a `3xx` is refused as a non-200 and the Basic credential never follows a hop). GitLab's token-info keeps `credentialClient`'s policy: a same-origin hop (scheme + host + port) is followed carrying the bearer and the uid comparison runs on the FINAL response; a cross-origin hop, including `https` → `http` on the same host, is refused before the target is contacted.
+- **Not on `VerifyUser`**: its token comes from the provider's own device flow by construction. GitLab's `VerifyUser` and `VerifyAccessToken` share one subject derivation (`resolveUser`).
+- **GitLab mapping of the "App/installation token" class**: project/group access tokens and CI job tokens (no OAuth application), refused like a personal access token.
+- **Counterfactual vehicles**: `TestVerifyAccessToken_RefusesTokenNotIssuedToClient` / `_RefusesForeignOrMissingIssuer` / `_UnconfiguredClientCredential` / `_IntrospectionRedirectRefused` / `_IntrospectionFailureRefuses` and their `TestGitLabVerifyAccessToken_*` twins plus `_TokenInfoSameOriginRedirectFollowed` / `_TokenInfoSchemeDowngradeRedirectRefused`. Each fake forge's user lookup resolves EVERY token in its table, so only the binding refuses.
+
+**First consumer (E39.3 / #1708):** the token-login mint handler (`server/tokens.go::handleTokenLoginMint`, `POST /v0/tokens/login`) calls `VerifyAccessToken` (client binding, then subject) then gates the mint on `PermissionLevel(OperatorRepo, subject).AtLeast(OperatorMinPermission)` plus an operator-default-scope ceiling; `GET /v0/tokens/login` advertises the OAuth `client_id` for the CLI's device flow.
