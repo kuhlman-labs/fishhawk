@@ -10,11 +10,12 @@
 // authConfigEnv builds GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/GIT_CONFIG_VALUE_n
 // entries (git >= 2.31) that set `http.<host>.extraheader` for the duration of
 // exactly the git commands that talk to the remote with the token (the fetch
-// paths, observeRemoteHead's ls-remote, and the push). The first entry resets
-// the extra-header list to empty (git-config(1): an empty value clears it),
-// neutralizing any persisted or ambient extraheader — e.g. one actions/checkout
-// wrote — so it cannot ride along as a duplicate Authorization header (the
-// #199/#200 failure); the second sets the fresh Basic-auth header. The token
+// paths, observeRemoteHead's ls-remote, and the push). After the maintenance
+// pins (ConfigEnv, ADR-115 D2), one entry resets the extra-header list to
+// empty (git-config(1): an empty value clears it), neutralizing any persisted
+// or ambient extraheader — e.g. one actions/checkout wrote — so it cannot ride
+// along as a duplicate Authorization header (the #199/#200 failure); the next
+// sets the fresh Basic-auth header. The token
 // stays off argv (env, not `-c`), preserving the no-command-line-credential
 // discipline, and NOTHING is written to any config file, so there is no cleanup
 // to guarantee on ANY exit path — including SIGKILL. This is the #1933 fix: the
@@ -31,7 +32,9 @@ package gitops
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"net/url"
@@ -39,6 +42,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"time"
 )
 
 // DefaultRemote is the git remote ShipBranch pushes to. Always
@@ -261,15 +265,16 @@ func (e *pushFailedError) Error() string { return e.err.Error() }
 func (e *pushFailedError) Unwrap() []error { return []error{e.err, ErrPushFailed} }
 
 // ErrBaseFetchFailed is the PRE-COMMIT base-fetch sentinel (#4079): one of
-// CommitAndPush's two stash-then-fetch arms (RebaseFromRemote, FreshFetchBase)
-// had already stashed the agent's uncommitted edits when the `git fetch` of the
-// base — or the `git checkout -B <branch> FETCH_HEAD` that follows it — failed.
-// The pinned FreshFetchBase sub-arm (PinnedBaseSHA, #3973) fetches nothing but
-// returns the same typed error when its `git checkout -B <branch> <pin>` fails
-// after the stash, so the recovery contract below holds there too.
+// CommitAndPush's two snapshot-then-fetch arms (RebaseFromRemote,
+// FreshFetchBase) had already saved the agent's uncommitted edits as a snapshot
+// commit when the `git fetch` of the base — or the `git checkout -B <branch>
+// FETCH_HEAD` that follows it — failed. The pinned FreshFetchBase sub-arm
+// (PinnedBaseSHA, #3973) fetches nothing but returns the same typed error when
+// its `git checkout -B <branch> <pin>` fails after the snapshot, so the
+// recovery contract below holds there too.
 // HEAD and the index are untouched (a failed fetch moves nothing, and
 // git-checkout refuses before switching), the working tree is CLEAN, and the
-// agent's edits live ONLY in the stash commit named on the typed
+// agent's edits live ONLY in the snapshot commit named on the typed
 // BaseFetchError. That is the incident shape: the consolidated base ref did not
 // resolve, the fetch failed, and the slice's work survived only because an
 // operator found the stash entry by hand.
@@ -280,13 +285,14 @@ func (e *pushFailedError) Unwrap() []error { return []error{e.err, ErrPushFailed
 var ErrBaseFetchFailed = errors.New("gitops: base fetch failed after the agent edits were stashed")
 
 // BaseFetchError is the typed form of ErrBaseFetchFailed. StashSHA is the
-// commit `refs/stash` named IMMEDIATELY after this invocation's own
-// `git stash --include-untracked` succeeded — never read later from stash@{0},
-// because the stash stack is shared by every worktree of the repository and
-// another session may push onto it in between. Empty when the capture itself
-// failed (best-effort: the capture never blocks the commit path).
+// snapshot commit this invocation's own SnapshotWorkTree created (ADR-115 D2,
+// #4648) — stored at refs/fishhawk/stash/<SnapshotKey>, never on the shared
+// refs/stash stack, so no other session's stash push can make it name the
+// wrong commit. The field keeps its #4079 name because the snapshot is
+// stash-SHAPED: `git stash apply <sha>` restores it exactly as it would a
+// stash entry. Empty when there was nothing to save.
 //
-// The stash is deliberately NOT popped on this path: the caller's deferred
+// The snapshot is deliberately NOT restored on this path: the caller's deferred
 // working-tree restore runs on a clean tree today, and a dirty tree would change
 // its behavior. The SHA is what keeps the edits recoverable
 // (`git stash apply <sha>`), and the runner pins it under a durable ref.
@@ -295,7 +301,7 @@ type BaseFetchError struct {
 	// the shared branch for RebaseFromRemote). On the pinned FreshFetchBase
 	// sub-arm it is the declared base, FreshFetchBase, though no fetch ran.
 	Ref string
-	// StashSHA is the stash commit holding the agent's edits.
+	// StashSHA is the stash-shaped snapshot commit holding the agent's edits.
 	StashSHA string
 	// Err is the original failure, carrying the unchanged
 	// "gitops: fetch <ref>: …" / "gitops: checkout <branch>: …" text.
@@ -305,7 +311,7 @@ type BaseFetchError struct {
 func (e *BaseFetchError) Error() string {
 	msg := e.Err.Error()
 	if e.StashSHA != "" {
-		msg += "; agent edits preserved in stash commit " + e.StashSHA + " (recover with `git stash apply " + e.StashSHA + "`)"
+		msg += "; agent edits preserved in snapshot commit " + e.StashSHA + " (recover with `git stash apply " + e.StashSHA + "`)"
 	}
 	return msg
 }
@@ -314,17 +320,6 @@ func (e *BaseFetchError) Error() string {
 // ErrBaseFetchFailed and every assertion on the underlying git error still
 // holds.
 func (e *BaseFetchError) Unwrap() []error { return []error{e.Err, ErrBaseFetchFailed} }
-
-// captureStashSHA resolves refs/stash right after a successful
-// `git stash --include-untracked`. Best-effort: an error returns "" so the
-// commit path proceeds exactly as before.
-func (p *Pusher) captureStashSHA(ctx context.Context, repoDir string) string {
-	out, err := p.runOut(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/stash")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(out)
-}
 
 // ErrFixupWorkStranded is the category-B sentinel for a fix-up pass that
 // reported no changes while leaving its work behind rather than on the branch
@@ -379,14 +374,16 @@ var ErrFixupPushNotLanded = errors.New("gitops: fix-up push did not land on the 
 var ErrVerifyInfraFailure = errors.New("gitops: verify command failed for an infrastructure reason")
 
 // ErrBaseRebaseConflict is the sentinel returned when reapplying the agent's
-// stashed working-tree edits onto a freshly-fetched authoritative base fails
-// with a merge conflict — the agent edited lines the base advanced past, so the
-// `git stash pop` onto the clean fetched base conflicts (#866, ADR-035
-// follow-up). It is returned BEFORE any push (origin untouched), after the
-// conflicted pop is aborted with `git reset --hard` (working tree reset to the
-// clean fetched base; the stash entry is left in the stash list and recoverable
-// via `git stash list`). The runner classifies it category-B (re-base/re-plan).
-// Only a real pop CONFLICT trips this; an unrelated stash-pop failure keeps the
+// snapshotted working-tree edits onto a freshly-fetched authoritative base
+// fails with a merge conflict — the agent edited lines the base advanced past,
+// so the `git stash apply <snapshot>` onto the clean fetched base conflicts
+// (#866, ADR-035 follow-up). It is returned BEFORE any push (origin untouched),
+// after the conflicted apply is aborted with `git reset --hard` (working tree
+// reset to the clean fetched base; the snapshot commit is RETAINED at its
+// refs/fishhawk/stash/ ref and named on the typed error, recoverable with
+// `git stash apply <sha>` — ADR-115 D2, #4648; the shared refs/stash stack is
+// never used). The runner classifies it category-B (re-base/re-plan).
+// Only a real CONFLICT trips this; an unrelated restore failure keeps the
 // prior generic git-error wrap. Recovery is a clean abort, not auto-resolution —
 // auto-merging divergent edits would risk shipping an unreviewed (silent-bad)
 // tree, the exact class the fail-loud path avoids.
@@ -399,7 +396,8 @@ var ErrBaseRebaseConflict = errors.New("gitops: stash pop conflicted reapplying 
 const conflictCaptureByteCap = 64 << 10
 
 // BaseRebaseConflictError is the typed form of ErrBaseRebaseConflict (#989):
-// it carries the conflict context popStash captures during the clean abort so
+// it carries the conflict context RestoreSnapshot captures during the clean
+// abort so
 // the runner can re-invoke the agent ONCE on the fresh base with both sides of
 // the conflict in hand, instead of immediately failing the stage category-B.
 // Unwrap returns the ErrBaseRebaseConflict sentinel, so every existing
@@ -417,19 +415,29 @@ type BaseRebaseConflictError struct {
 	// only window the markers exist). Truncated to conflictCaptureByteCap.
 	ConflictHunks string
 
-	// StashPatch is the agent's stashed patch (`git stash show -p`), captured
-	// AFTER the reset — a pop conflict preserves the stash entry. Truncated
+	// StashPatch is the agent's snapshotted patch (`git stash show -p <sha>`),
+	// captured AFTER the reset — a conflict retains the snapshot. Truncated
 	// to conflictCaptureByteCap.
 	StashPatch string
 
-	// popErr is the original `git stash pop` failure, preserved for the
+	// SnapshotSHA is the retained snapshot commit holding the agent's edits
+	// (ADR-115 D2, #4648), set by the call site that restored it. Empty when
+	// the restoring caller did not name one.
+	SnapshotSHA string
+
+	// popErr is the original `git stash apply` failure, preserved for the
 	// error message.
 	popErr error
 }
 
 func (e *BaseRebaseConflictError) Error() string {
-	msg := ErrBaseRebaseConflict.Error() +
-		": working tree reset to fetched base, stashed edits preserved (git stash list) — re-base the run or replan"
+	msg := ErrBaseRebaseConflict.Error() + ": working tree reset to fetched base, "
+	if e.SnapshotSHA != "" {
+		msg += "edits preserved in snapshot commit " + e.SnapshotSHA + " (recover with `git stash apply " + e.SnapshotSHA + "`)"
+	} else {
+		msg += "edits preserved in the retained snapshot commit"
+	}
+	msg += " — re-base the run or replan"
 	if len(e.ConflictPaths) > 0 {
 		msg += " (conflicted paths: " + strings.Join(e.ConflictPaths, ", ") + ")"
 	}
@@ -519,7 +527,7 @@ type CommitAndPushArgs struct {
 	// rebases the local work on top instead of creating a new branch
 	// with checkout -b. Used for subsequent decomposed-child runs
 	// where the shared branch already exists on the remote.
-	// Uncommitted agent edits are stashed before the fetch+rebase
+	// Uncommitted agent edits are snapshotted before the fetch+rebase
 	// and restored afterwards.
 	RebaseFromRemote bool
 
@@ -528,8 +536,8 @@ type CommitAndPushArgs struct {
 	// branch must be cut from via a fresh fetch of origin/<base>
 	// instead of the ambient local HEAD. It is the standalone
 	// single-writer analogue of the decomposed-child RebaseFromRemote
-	// fetch path: it reuses the same stash -> fetch -> checkout -B
-	// FETCH_HEAD -> stash pop machinery so the agent's uncommitted
+	// fetch path: it reuses the same snapshot -> fetch -> checkout -B
+	// FETCH_HEAD -> restore machinery so the agent's uncommitted
 	// edits survive while only the base changes. It exists to prevent
 	// a foreign commit another writer made in the same shared local
 	// checkout (the #797 shape) from riding in as the run branch base.
@@ -550,27 +558,45 @@ type CommitAndPushArgs struct {
 	// child's wave base, or its own slice branch tip). It applies ONLY on the
 	// FreshFetchBase arm (RebaseFromRemote false, FreshFetchBase non-empty)
 	// and only when non-empty. There, CommitAndPush does NOT fetch the base:
-	// it verifies the pin is a commit in RepoDir BEFORE stashing (an absent
+	// it verifies the pin is a commit in RepoDir BEFORE snapshotting (an absent
 	// object fails closed with the edits still in the working tree, never a
-	// silent re-fetch of a moved tip), then stashes, cuts Branch from the pin
+	// silent re-fetch of a moved tip), then snapshots, cuts Branch from the pin
 	// with `checkout -B`, reapplies the edits, and records BaseSHA = the pin.
 	// A base that moved mid-stage therefore cannot cause a commit-time
-	// stash-pop conflict, and the commit is cut from the base the gates
+	// snapshot-restore conflict, and the commit is cut from the base the gates
 	// verified; merge time reconciles any later movement. FreshFetchBase still
 	// names the base on a *BaseFetchError from the pinned checkout. Empty (the
 	// default) keeps the fetch path byte-identical for fix-ups, degrade paths
 	// and every unpinned caller. The RebaseFromRemote arm ignores it.
 	PinnedBaseSHA string
 
+	// SnapshotKey names the ref the base-moving arms (RebaseFromRemote,
+	// FreshFetchBase) save the agent's uncommitted edits under across the
+	// checkout: refs/fishhawk/stash/<SnapshotKey> (ADR-115 D2, #4648). The
+	// runner passes the stage id, so its stage-end sweep can delete a
+	// snapshot a conflict retained. Empty uses a per-call random key. The
+	// shared refs/stash stack is never used.
+	SnapshotKey string
+
 	// UpdateTrackingRef, when true, sets the local remote-tracking ref
 	// refs/remotes/<remote>/<branch> to the pushed HEAD after a
 	// successful push, so subsequent same-clone reads (decomposition
 	// fan-out routing + policy base ref) observe the branch as present.
-	// A URL push (git push <url> HEAD:<branch>) never creates or updates
-	// that tracking ref on its own, so without this the next child in a
-	// local fan-out mis-routes to the first-child `checkout -b` path
-	// (#770). The remote branch tip equals the pushed HEAD, so the ref is
-	// set deterministically with `git update-ref` (no fetch, no auth).
+	// A URL push (git push <url> HEAD:<branch>) does not create or update
+	// that tracking ref, so without this the next child in a local fan-out
+	// mis-routes to the first-child `checkout -b` path (#770). The remote
+	// branch tip equals the pushed HEAD, so the ref is set deterministically
+	// with `git update-ref` (no fetch, no auth).
+	//
+	// "A URL push leaves no tracking ref" is the contract for UpdateTrackingRef
+	// false, and it holds on every git because the push argv carries
+	// urlPushNoTrackingArgs: git >= 2.56 would otherwise write
+	// refs/remotes/<r>/<b> itself whenever exactly one configured remote has
+	// the push URL, while git <= 2.55 never does (#4767). With the guard, this
+	// field's explicit update-ref is the ONLY writer of the tracking ref on
+	// every git. The guard depends on git's push-URL uniqueness rule and
+	// reserves the remote name urlPushNoTrackingRemote; see
+	// runner/README.md "URL-push tracking-ref guard".
 	UpdateTrackingRef bool
 
 	// ScopeFiles is the approved plan's declared paths (#581). When
@@ -777,19 +803,22 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		return &CommitAndPushResult{NoChanges: true, BaseSHA: baseSHA}, nil
 	}
 
-	// Configure author + email LOCALLY (`config --local`) so we
-	// don't pollute any global gitconfig the customer's runner may
-	// have. Local config dies with the working tree.
-	if err := p.run(ctx, args.RepoDir, "config", "user.name", authorName); err != nil {
-		return nil, fmt.Errorf("gitops: config user.name: %w", err)
-	}
-	if err := p.run(ctx, args.RepoDir, "config", "user.email", authorEmail); err != nil {
-		return nil, fmt.Errorf("gitops: config user.email: %w", err)
+	// The author/committer identity rides on the commit invocation itself
+	// (ADR-115 D2, #4648). It is never written with `git config user.*`: in a
+	// linked worktree that writes the SHARED $GIT_COMMON_DIR/config, which
+	// every sibling worktree's stage and the operator's own commits read.
+	identEnv := IdentityEnv(authorName, authorEmail)
+	// The pre-commit snapshot of the agent's edits (the three base-moving
+	// arms below) is stored at refs/fishhawk/stash/<key>, never on the shared
+	// refs/stash stack a sibling worktree or the operator may push or pop.
+	snapKey := args.SnapshotKey
+	if snapKey == "" {
+		snapKey = perCallSnapshotKey("commit")
 	}
 
 	if args.RebaseFromRemote {
 		// Shared-branch path for subsequent decomposed children: the remote
-		// branch already exists. Stash uncommitted agent edits, fetch the
+		// branch already exists. Snapshot uncommitted agent edits, fetch the
 		// remote tip over the run's own credential, reset the local branch
 		// to it, restore the edits, then fall through to add+commit+push.
 		//
@@ -800,59 +829,58 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// carries the run's installation token to the fetch as process-scoped
 		// git config (#1933), authenticating it without writing to any config
 		// file.
-		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
-			return nil, fmt.Errorf("gitops: stash: %w", err)
+		//
+		// #4079: the snapshot commit is named by SnapshotWorkTree itself, so
+		// a fetch/checkout failure below can say where the agent's edits are
+		// with no read of a shared stack another session may have pushed onto.
+		snap, saved, err := p.snapshotAgentEdits(ctx, args.RepoDir, snapKey)
+		if err != nil {
+			return nil, err
 		}
-		// #4079: name THIS invocation's stash commit now, before anything else
-		// can push onto the shared stash stack, so a fetch/checkout failure
-		// below can say where the agent's edits are.
-		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
 		// Fetch the remote branch tip into FETCH_HEAD. A URL fetch does not
 		// create or update any refs/remotes/<name>/<branch> tracking ref, so
 		// the subsequent checkout references FETCH_HEAD explicitly.
-		if err := p.runEnv(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.Branch); err != nil {
-			return nil, &BaseFetchError{Ref: args.Branch, StashSHA: stashSHA, Err: fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)}
+		if err := p.runEnvLockRetry(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.Branch); err != nil {
+			return nil, &BaseFetchError{Ref: args.Branch, StashSHA: snap.SHA, Err: fmt.Errorf("gitops: fetch %s: %w", args.Branch, err)}
 		}
 		// Create/reset the local branch to the fetched remote tip. The agent's
-		// edits are stashed (uncommitted), so there are no local commits to
+		// edits are snapshotted (uncommitted), so there are no local commits to
 		// rebase — this is equivalent to the prior fetch+checkout+pull --rebase
 		// with the branch fast-forwarded to the remote tip.
-		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
-			return nil, &BaseFetchError{Ref: args.Branch, StashSHA: stashSHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
+		if err := p.runEnvLockRetry(ctx, args.RepoDir, nil, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
+			return nil, &BaseFetchError{Ref: args.Branch, StashSHA: snap.SHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
 		}
-		if err := p.popStash(ctx, args.RepoDir); err != nil {
+		if err := p.restoreAgentEdits(ctx, args.RepoDir, snap, saved); err != nil {
 			return nil, err
 		}
 	} else if args.FreshFetchBase != "" && args.PinnedBaseSHA != "" {
 		// Pinned sub-branch of the FreshFetchBase arm (#3973): cut the run
 		// branch from the dispatch-time base the stage was judged against, with
 		// NO base fetch, so a PR merged into the base mid-stage can neither
-		// stash-pop-conflict the commit nor move the recorded base.
+		// snapshot-restore-conflict the commit nor move the recorded base.
 		//
-		// The object check runs BEFORE the stash: nothing has been stashed yet,
-		// so an absent pin fails closed with the agent's edits still in the
-		// working tree. It is deliberately NOT a BaseFetchError (there is no
-		// stash to name) and never falls back to fetching a moved tip.
+		// The object check runs BEFORE the snapshot: nothing has been saved
+		// yet, so an absent pin fails closed with the agent's edits still in
+		// the working tree. It is deliberately NOT a BaseFetchError (there is
+		// no snapshot to name) and never falls back to fetching a moved tip.
 		pin := args.PinnedBaseSHA
 		if _, err := p.runOut(ctx, args.RepoDir, "rev-parse", "--verify", "--quiet", pin+"^{commit}"); err != nil {
-			return nil, fmt.Errorf("gitops: pinned base %s is not a commit in the repository (nothing stashed; the agent edits remain in the working tree): %w", pin, err)
+			return nil, fmt.Errorf("gitops: pinned base %s is not a commit in the repository (nothing snapshotted; the agent edits remain in the working tree): %w", pin, err)
 		}
-		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
-			return nil, fmt.Errorf("gitops: stash: %w", err)
+		snap, saved, err := p.snapshotAgentEdits(ctx, args.RepoDir, snapKey)
+		if err != nil {
+			return nil, err
 		}
-		// #4079: capture this invocation's stash commit immediately, at the
-		// same position the fetch arm below captures it.
-		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
 		// A failed checkout keeps #4079's contract exactly: the same typed
-		// error, Err text and un-popped stash the fetch arm returns, so
-		// ErrBaseFetchFailed matches and the runner pins and names the stash.
-		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, pin); err != nil {
-			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: stashSHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
+		// error, Err text and un-restored snapshot the fetch arm returns, so
+		// ErrBaseFetchFailed matches and the runner pins and names it.
+		if err := p.runEnvLockRetry(ctx, args.RepoDir, nil, "checkout", "-B", args.Branch, pin); err != nil {
+			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: snap.SHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
 		}
 		// The pin is the commit the edits were made on, so the reapply lands
-		// where it was taken; popStash's ErrBaseRebaseConflict machinery is
-		// unchanged for the case where it was not.
-		if err := p.popStash(ctx, args.RepoDir); err != nil {
+		// where it was taken; RestoreSnapshot's ErrBaseRebaseConflict machinery
+		// is unchanged for the case where it was not.
+		if err := p.restoreAgentEdits(ctx, args.RepoDir, snap, saved); err != nil {
 			return nil, err
 		}
 		pinnedBase, err := p.runOut(ctx, args.RepoDir, "rev-parse", "HEAD")
@@ -866,27 +894,25 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// ambient local HEAD, so a foreign commit another writer made in the
 		// same shared checkout (the #797 shape) cannot become the branch base.
 		// Mirrors the RebaseFromRemote machinery above: authenticate the fetch
-		// over RemoteURL (sidestepping a broken ambient origin, #772), stash
-		// the agent's uncommitted scope edits, fetch the base tip into
+		// over RemoteURL (sidestepping a broken ambient origin, #772),
+		// snapshot the agent's uncommitted scope edits, fetch the base tip into
 		// FETCH_HEAD, cut the branch from that fetched tip, then reapply the
-		// edits onto the clean base. A stash-pop conflict (agent edited lines
-		// the base advanced past) is detected specifically by popStash and
-		// surfaces as ErrBaseRebaseConflict (category-B) after a clean
+		// edits onto the clean base. A restore conflict (agent edited lines
+		// the base advanced past) is detected specifically by RestoreSnapshot
+		// and surfaces as ErrBaseRebaseConflict (category-B) after a clean
 		// reset --hard abort, with no push and never a silent bad tree.
-		if err := p.run(ctx, args.RepoDir, "stash", "--include-untracked"); err != nil {
-			return nil, fmt.Errorf("gitops: stash: %w", err)
+		snap, saved, err := p.snapshotAgentEdits(ctx, args.RepoDir, snapKey)
+		if err != nil {
+			return nil, err
 		}
-		// #4079: capture this invocation's stash commit immediately (see the
-		// RebaseFromRemote arm above).
-		stashSHA := p.captureStashSHA(ctx, args.RepoDir)
 		// Base-freshness positioning (ADR-043 rev 2, #1294): this fetch sits as
 		// LATE in CommitAndPush as the reapply-before-commit invariant allows.
 		// Since #3973 it runs only for UNPINNED callers (fix-ups, degrade
 		// paths, a child whose wave base was absent at dispatch); a pinned
 		// stage takes the arm above and cuts from its dispatch-time base.
-		// The fetch -> checkout -B FETCH_HEAD -> popStash sequence MUST complete
+		// The fetch -> checkout -B FETCH_HEAD -> restore sequence MUST complete
 		// before the staging/commit below: the checkout resets the working tree
-		// to the fetched base and popStash reapplies the agent's edits onto it,
+		// to the fetched base and the restore reapplies the agent's edits onto it,
 		// so the fetch cannot be deferred past the commit without committing
 		// against the stale ambient base. The residual staleness window is
 		// therefore the (intentionally small) interval between this fetch and
@@ -902,15 +928,15 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		// the fetch as process-scoped git config (#1933, #772).
 		//
 		// A failure of either step below is a BaseFetchError (#4079): the edits
-		// are stashed, HEAD has not moved, and the stash SHA is the recovery
-		// point the runner pins and names in the failure reason.
-		if err := p.runEnv(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.FreshFetchBase); err != nil {
-			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: stashSHA, Err: fmt.Errorf("gitops: fetch %s: %w", args.FreshFetchBase, err)}
+		// are in the snapshot commit, HEAD has not moved, and the snapshot SHA
+		// is the recovery point the runner pins and names in the failure reason.
+		if err := p.runEnvLockRetry(ctx, args.RepoDir, authEnv, "fetch", args.RemoteURL, args.FreshFetchBase); err != nil {
+			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: snap.SHA, Err: fmt.Errorf("gitops: fetch %s: %w", args.FreshFetchBase, err)}
 		}
-		if err := p.run(ctx, args.RepoDir, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
-			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: stashSHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
+		if err := p.runEnvLockRetry(ctx, args.RepoDir, nil, "checkout", "-B", args.Branch, "FETCH_HEAD"); err != nil {
+			return nil, &BaseFetchError{Ref: args.FreshFetchBase, StashSHA: snap.SHA, Err: fmt.Errorf("gitops: checkout %s: %w", args.Branch, err)}
 		}
-		if err := p.popStash(ctx, args.RepoDir); err != nil {
+		if err := p.restoreAgentEdits(ctx, args.RepoDir, snap, saved); err != nil {
 			return nil, err
 		}
 		// Re-capture baseSHA from the freshly-fetched tip (now HEAD) so the
@@ -954,7 +980,7 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	} else if err := p.run(ctx, args.RepoDir, "add", "-A"); err != nil {
 		return nil, fmt.Errorf("gitops: add: %w", err)
 	}
-	if err := p.run(ctx, args.RepoDir, "commit", "--signoff", "-m", args.CommitMessage); err != nil {
+	if err := p.runEnv(ctx, args.RepoDir, identEnv, "commit", "--signoff", "-m", args.CommitMessage); err != nil {
 		return nil, fmt.Errorf("gitops: commit: %w", err)
 	}
 
@@ -1044,11 +1070,12 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 		auth.refreshErr = auth.refresh(ctx, args)
 	}
 
-	pushArgs := []string{"push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch)}
+	pushArgs := append(urlPushNoTrackingArgs(args.RemoteURL), "push", args.RemoteURL, fmt.Sprintf("HEAD:%s", args.Branch))
 	if args.ForceWithLease {
 		// A *bare* --force-with-lease compares the push against the local
 		// remote-tracking ref, but git cannot associate that ref with a URL
-		// push (we push to RemoteURL, not the remote name), so a bare lease
+		// push (we push to RemoteURL, not the remote name; on git >= 2.56 the
+		// urlPushNoTrackingArgs guard keeps that true, #4767), so a bare lease
 		// on a shared-branch URL push always rejects with `(stale info)`
 		// regardless of the ref's value (#767). So we always bind the lease to
 		// an EXPLICIT expected-value (--force-with-lease=<branch>:<sha>), which
@@ -1098,14 +1125,15 @@ func (p *Pusher) CommitAndPush(ctx context.Context, args CommitAndPushArgs) (*Co
 	}
 
 	// Materialize the local remote-tracking ref to the just-pushed HEAD
-	// (#770). A URL push doesn't update refs/remotes/<remote>/<branch>, so
-	// without this the next decomposed child reading that ref sees the
-	// shared branch as absent and mis-routes. The remote branch tip equals
-	// headSHA because we just pushed local HEAD to it, so this is exact
+	// (#770). The push above carries urlPushNoTrackingArgs, so it leaves
+	// refs/remotes/<remote>/<branch> alone (git >= 2.56 would otherwise write
+	// it, #4767), and without this the next decomposed child reading that ref
+	// sees the shared branch as absent and mis-routes. The remote branch tip
+	// equals headSHA because we just pushed local HEAD to it, so this is exact
 	// with no fetch and no remote auth.
 	if args.UpdateTrackingRef {
 		trackingRef := fmt.Sprintf("refs/remotes/%s/%s", remote, args.Branch)
-		if err := p.run(ctx, args.RepoDir, "update-ref", trackingRef, headSHA); err != nil {
+		if err := p.runEnvLockRetry(ctx, args.RepoDir, nil, "update-ref", trackingRef, headSHA); err != nil {
 			return nil, fmt.Errorf("gitops: update tracking ref %s: %w", trackingRef, err)
 		}
 	}
@@ -1181,83 +1209,64 @@ func (p *Pusher) StageScoped(ctx context.Context, repoDir string, scopeFiles []s
 	return drift, nil
 }
 
-// popStash reapplies the stashed agent edits onto the freshly-checked-out base
-// via `git stash pop`. On success it returns nil. On a non-zero pop it probes
-// for a real merge conflict with `git ls-files --unmerged` (a pop CONFLICT
-// leaves unmerged index entries at stages 1/2/3; a non-conflict failure does
-// not). When conflicted it aborts the half-applied pop with `git reset --hard`
-// — restoring the working tree to the clean fetched base (HEAD) without touching
-// the stash stack, so the stashed edits stay recoverable via `git stash list`
-// (a pop conflict does not drop the stash) — and returns a typed
-// *BaseRebaseConflictError carrying the best-effort-captured conflict context
-// (paths, conflict-marker hunks, stash patch) that unwraps to
-// ErrBaseRebaseConflict (#989).
-// A non-conflict pop failure returns the original wrapped git error unchanged,
-// preserving today's generic fail-loud behavior for that case.
-//
-// If conflict detection ITSELF fails (the `git ls-files --unmerged` probe errors
-// — corrupt git state, permission error), popStash still attempts a best-effort
-// `git reset --hard` before returning so the clean-abort guarantee holds even
-// when the conflict cannot be confirmed: a partially-applied conflicted pop must
-// not be left in the working tree (#893). The reset's own failure is tolerated
-// and annotated rather than masking the primary pop failure; the branch returns a
-// non-nil fail-loud error in every sub-case (no push), and is NOT
-// ErrBaseRebaseConflict because the conflict was never confirmed.
-func (p *Pusher) popStash(ctx context.Context, repoDir string) error {
-	popErr := p.run(ctx, repoDir, "stash", "pop")
-	if popErr == nil {
+// snapshotAgentEdits saves the agent's uncommitted edits (tracked changes and
+// untracked, non-ignored files) as a stash-shaped snapshot commit at
+// SnapshotRef(key) and reverts the working tree to HEAD, so the base-moving
+// checkout that follows starts clean (ADR-115 D2, #4648). It replaces the
+// former `git stash --include-untracked`, whose shared refs/stash stack a
+// sibling worktree's stage or the operator could push onto or pop between
+// this invocation's push and its pop. saved is false when there was nothing to
+// save; the restore is then skipped.
+func (p *Pusher) snapshotAgentEdits(ctx context.Context, repoDir, key string) (snap Snapshot, saved bool, err error) {
+	snap, saved, err = p.SnapshotWorkTree(ctx, repoDir, key, nil)
+	if err != nil {
+		return snap, saved, fmt.Errorf("gitops: snapshot agent edits: %w", err)
+	}
+	return snap, saved, nil
+}
+
+// restoreAgentEdits reapplies a snapshotAgentEdits snapshot onto the
+// freshly-checked-out base with RestoreSnapshot (the same `git stash apply`
+// merge machinery the former `git stash pop` used, so the #866/#893/#989
+// conflict contract holds unchanged) and, on success, drops its ref
+// best-effort — a leftover is swept at stage end. On a restore conflict the
+// ref is RETAINED and the typed *BaseRebaseConflictError names the snapshot
+// commit (SnapshotSHA), so the edits stay recoverable with
+// `git stash apply <sha>`. saved=false (nothing was saved) is a no-op.
+func (p *Pusher) restoreAgentEdits(ctx context.Context, repoDir string, snap Snapshot, saved bool) error {
+	if !saved {
 		return nil
 	}
-	unmerged, lsErr := p.runOut(ctx, repoDir, "ls-files", "--unmerged")
-	if lsErr != nil {
-		// Conflict detection itself failed (corrupt git state, permission
-		// error). The pop may have partially applied, so attempt a best-effort
-		// `git reset --hard` to honour the clean-abort invariant even though the
-		// conflict could not be confirmed (#893). Tolerate and annotate the
-		// reset's own failure rather than masking the primary pop failure: a
-		// failed reset leaves the tree for manual recovery but is surfaced
-		// explicitly. The branch returns a non-nil fail-loud error in every
-		// case — no push — and is NOT ErrBaseRebaseConflict (conflict unconfirmed).
-		if resetErr := p.run(ctx, repoDir, "reset", "--hard"); resetErr != nil {
-			return fmt.Errorf("gitops: stash pop (conflict detection via ls-files failed: %v; best-effort reset --hard also failed: %v): %w", lsErr, resetErr, popErr)
-		}
-		return fmt.Errorf("gitops: stash pop (conflict detection via ls-files failed: %v; working tree reset to fetched base): %w", lsErr, popErr)
+	if err := p.RestoreSnapshot(ctx, repoDir, snap); err != nil {
+		return withSnapshotSHA(err, snap)
 	}
-	if strings.TrimSpace(unmerged) == "" {
-		// Not a merge conflict — some other stash-pop failure. Preserve the
-		// prior generic behavior.
-		return fmt.Errorf("gitops: stash pop: %w", popErr)
+	_ = p.DropSnapshot(ctx, repoDir, snap)
+	return nil
+}
+
+// withSnapshotSHA stamps snap's commit onto a *BaseRebaseConflictError in
+// err's chain, so the conflict error names where the edits are kept. Any
+// other error is returned unchanged.
+func withSnapshotSHA(err error, snap Snapshot) error {
+	var bre *BaseRebaseConflictError
+	if errors.As(err, &bre) {
+		bre.SnapshotSHA = snap.SHA
 	}
-	// Real pop conflict: abort the half-applied pop so the working tree returns
-	// to the clean fetched base; the stash entry is left intact and recoverable.
-	//
-	// Capture the conflict context BEST-EFFORT for the runner's bounded
-	// re-invoke (#989), never blocking or reordering the clean-abort sequence
-	// (#866/#893 invariants): the conflicted paths come from the unmerged
-	// listing already in hand; the conflict-marker hunks only exist between
-	// this probe and the `reset --hard` abort, so `git diff` is read here; the
-	// stash patch is read after the reset (a pop conflict preserves the stash
-	// entry). Any capture command failing degrades its field to empty — the
-	// abort still runs and the returned error still unwraps to
-	// ErrBaseRebaseConflict.
-	conflictPaths := unmergedConflictPaths(unmerged)
-	var conflictHunks string
-	if d, derr := p.runOut(ctx, repoDir, "diff"); derr == nil {
-		conflictHunks = truncateCapture(d)
+	return err
+}
+
+// perCallSnapshotKey returns a snapshot key unique to one call, for a caller
+// that has no stage-scoped key (CleanDriftPaths, RestoreHeadPreserving, a
+// CommitAndPush with no SnapshotKey): two concurrent calls in sibling
+// worktrees can never share a snapshot ref.
+func perCallSnapshotKey(kind string) string {
+	var b [8]byte
+	if _, err := rand.Read(b[:]); err != nil {
+		// crypto/rand does not fail on supported platforms; fall back to a
+		// time-derived suffix rather than a shared constant.
+		return fmt.Sprintf("%s-%d", kind, time.Now().UnixNano())
 	}
-	if err := p.run(ctx, repoDir, "reset", "--hard"); err != nil {
-		return fmt.Errorf("gitops: reset --hard after conflicted stash pop: %w", err)
-	}
-	var stashPatch string
-	if sp, serr := p.runOut(ctx, repoDir, "stash", "show", "-p", "stash@{0}"); serr == nil {
-		stashPatch = truncateCapture(sp)
-	}
-	return &BaseRebaseConflictError{
-		ConflictPaths: conflictPaths,
-		ConflictHunks: conflictHunks,
-		StashPatch:    stashPatch,
-		popErr:        popErr,
-	}
+	return kind + "-" + hex.EncodeToString(b[:])
 }
 
 // unmergedConflictPaths parses `git ls-files --unmerged` output (lines of
@@ -1604,7 +1613,7 @@ func CheckoutRemoteBranch(ctx context.Context, repoDir, remote, branch, pushToke
 	if err := pruneStrandedCreatedFiles(ctx, p, repoDir, trackingRef, createdPaths); err != nil {
 		return "", err
 	}
-	if err := p.run(ctx, repoDir, "checkout", "-B", branch, trackingRef); err != nil {
+	if err := p.runEnvLockRetry(ctx, repoDir, nil, "checkout", "-B", branch, trackingRef); err != nil {
 		return "", fmt.Errorf("gitops: checkout -B %s %s: %w", branch, trackingRef, err)
 	}
 	return tip, nil
@@ -1756,7 +1765,7 @@ func canonWorktreePath(pth string) string {
 func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branch string, authEnv []string) (trackingRef, tipSHA string, err error) {
 	remote = orDefault(remote, DefaultRemote)
 	trackingRef = fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
-	if err := p.runEnv(ctx, repoDir, authEnv, "fetch", remote,
+	if err := p.runEnvLockRetry(ctx, repoDir, authEnv, "fetch", remote,
 		fmt.Sprintf("+refs/heads/%s:%s", branch, trackingRef)); err != nil {
 		return "", "", fmt.Errorf("gitops: fetch %s from %s: %w", branch, remote, err)
 	}
@@ -2138,7 +2147,8 @@ func RemoteConfigured(ctx context.Context, repoDir, remote string) bool {
 // shared config — the run-0ae81e43 fix-up_base_checkout failure, where a stale
 // http.extraheader left in the operator's shared worktree config killed the
 // fetch (#1951). It returns the GIT_CONFIG_COUNT/GIT_CONFIG_KEY_n/
-// GIT_CONFIG_VALUE_n entries (reset entry + fresh AUTHORIZATION header),
+// GIT_CONFIG_VALUE_n entries (maintenance pins, then reset entry + fresh
+// AUTHORIZATION header),
 // scoped to whichever single git invocation they are passed to via
 // runEnv/runOutEnv — nothing is written to any config file.
 //
@@ -2218,16 +2228,15 @@ func DirtyPaths(ctx context.Context, repoDir string) ([]string, error) {
 	return paths, nil
 }
 
-// CleanDriftPaths reverts the given drift paths via a pathspec-limited
-// `git stash push --include-untracked -- <paths...>` followed by `git stash
-// drop` (#943). One mechanism covers tracked-modified, tracked-deleted, and
-// untracked drift in a single step; --include-untracked extends the pathspec
-// to untracked files (git >= 2.13). When the named paths turn out to be clean
-// the push is a "No local changes" no-op (exit 0, no stash entry created) and
-// that is treated as success — the entry-created probe below guards the drop
-// so a pre-existing operator stash entry is never destroyed. If the drop
-// fails, the entry is left on the stash stack (recoverable via `git stash
-// list`) and an annotated error is returned for the caller to log.
+// CleanDriftPaths reverts the given drift paths (#943) by saving them as a
+// pathspec-limited snapshot (SnapshotWorkTree with paths: tracked-modified,
+// tracked-deleted and untracked drift in one step; ignored files are left
+// alone) and then dropping that snapshot's ref. It never touches the shared
+// refs/stash stack (ADR-115 D2, #4648): the snapshot lives at a per-call
+// refs/fishhawk/stash/ ref, so an operator's or a sibling worktree's stash
+// entry can be neither popped nor dropped by it. Paths that turn out to be
+// clean save nothing and are a no-op success. If the drop fails the ref is
+// left in place and named in the returned error for the caller to log.
 //
 // Known limitation: a rename's source-path deletion is not in the drift list
 // (porcelainPath returns the destination), so a renamed-as-drift source may
@@ -2237,76 +2246,57 @@ func CleanDriftPaths(ctx context.Context, repoDir string, paths []string) error 
 		return nil
 	}
 	p := &Pusher{}
-	created, err := stashPushPaths(ctx, p, repoDir, "fishhawk: drift-excluded paths", paths)
+	snap, saved, err := p.SnapshotWorkTree(ctx, repoDir, perCallSnapshotKey("drift"), paths)
 	if err != nil {
-		return fmt.Errorf("gitops: stash drift paths: %w", err)
+		return fmt.Errorf("gitops: snapshot drift paths: %w", err)
 	}
-	if !created {
+	if !saved {
 		// The named paths were already clean — nothing to revert.
 		return nil
 	}
-	if err := p.run(ctx, repoDir, "stash", "drop"); err != nil {
-		return fmt.Errorf("gitops: drop drift stash (entry left recoverable via `git stash list`): %w", err)
+	if err := p.DropSnapshot(ctx, repoDir, snap); err != nil {
+		return fmt.Errorf("gitops: drop drift snapshot (left at %s, commit %s): %w", snap.Ref, snap.SHA, err)
 	}
 	return nil
 }
 
 // RestoreHeadPreserving is RestoreHead with a preserved-paths carve-out
 // (#943): the named paths — operator edits that pre-dated the agent — are
-// stashed before the forced checkout (which would otherwise discard tracked
-// modifications) and reapplied after it. An empty preserve set delegates to
-// RestoreHead unchanged. The reapply reuses popStash's #989 conflict
-// handling: a pop conflict aborts cleanly (reset --hard), leaves the stash
-// entry intact and recoverable via `git stash list`, and returns a typed
-// error for the caller to log — operator content is never silently
-// destroyed. Like RestoreHead, callers invoke this best-effort and log-only.
+// saved as a pathspec-limited snapshot before the forced checkout (which would
+// otherwise discard tracked modifications) and reapplied after it with
+// RestoreSnapshot. An empty preserve set delegates to RestoreHead unchanged.
+// The snapshot lives at a per-call refs/fishhawk/stash/ ref, never on the
+// shared refs/stash stack (ADR-115 D2, #4648). The reapply carries the #989
+// conflict handling: a conflict aborts cleanly (reset --hard), RETAINS the
+// snapshot ref, and returns a typed error naming it — as does a failed forced
+// checkout — so operator content is never silently destroyed. The ref is
+// dropped only after a clean reapply. Like RestoreHead, callers invoke this
+// best-effort and log-only.
 func RestoreHeadPreserving(ctx context.Context, repoDir, ref string, preserve []string) error {
 	if len(preserve) == 0 {
 		return RestoreHead(ctx, repoDir, ref)
 	}
 	p := &Pusher{}
-	created, err := stashPushPaths(ctx, p, repoDir, "fishhawk: operator pre-existing edits", preserve)
+	snap, saved, err := p.SnapshotWorkTree(ctx, repoDir, perCallSnapshotKey("preserve"), preserve)
 	if err != nil {
-		return fmt.Errorf("gitops: stash operator edits: %w", err)
+		return fmt.Errorf("gitops: snapshot operator edits: %w", err)
 	}
 	if err := p.run(ctx, repoDir, "checkout", "--force", ref); err != nil {
-		if created {
-			return fmt.Errorf("gitops: restore HEAD to %s (operator edits stashed; recover via `git stash pop`): %w", ref, err)
+		if saved {
+			return fmt.Errorf("gitops: restore HEAD to %s (operator edits kept in snapshot commit %s at %s; recover with `git stash apply %s`): %w", ref, snap.SHA, snap.Ref, snap.SHA, err)
 		}
 		return fmt.Errorf("gitops: restore HEAD to %s: %w", ref, err)
 	}
-	if !created {
+	if !saved {
 		return nil
 	}
-	if err := p.popStash(ctx, repoDir); err != nil {
-		return fmt.Errorf("gitops: reapply operator edits after restore (stash entry recoverable via `git stash list`): %w", err)
+	if err := p.RestoreSnapshot(ctx, repoDir, snap); err != nil {
+		return fmt.Errorf("gitops: reapply operator edits after restore (kept in snapshot commit %s at %s; recover with `git stash apply %s`): %w", snap.SHA, snap.Ref, snap.SHA, withSnapshotSHA(err, snap))
+	}
+	if err := p.DropSnapshot(ctx, repoDir, snap); err != nil {
+		return fmt.Errorf("gitops: operator edits reapplied, but dropping snapshot %s failed: %w", snap.Ref, err)
 	}
 	return nil
-}
-
-// stashPushPaths runs a pathspec-limited `git stash push --include-untracked`
-// and reports whether an entry was actually created. The created probe
-// (refs/stash before vs after) is load-bearing: stash push exits 0 with "No
-// local changes to save" when the named paths are clean, and a blind follow-up
-// drop/pop would then destroy or replay a PRE-EXISTING stash entry the
-// operator owns.
-func stashPushPaths(ctx context.Context, p *Pusher, repoDir, message string, paths []string) (created bool, err error) {
-	before := stashTip(ctx, p, repoDir)
-	args := append([]string{"stash", "push", "--include-untracked", "-m", message, "--"}, paths...)
-	if err := p.run(ctx, repoDir, args...); err != nil {
-		return false, err
-	}
-	after := stashTip(ctx, p, repoDir)
-	return after != "" && after != before, nil
-}
-
-// stashTip resolves refs/stash, returning "" when the stash stack is empty.
-func stashTip(ctx context.Context, p *Pusher, repoDir string) string {
-	out, err := p.runOut(ctx, repoDir, "rev-parse", "--verify", "--quiet", "refs/stash")
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(out)
 }
 
 // StagedPaths enumerates every repo-relative path whose content is STAGED in
@@ -2366,12 +2356,16 @@ func porcelainPath(line string) string {
 // >= 2.31) that set `http.<host>.extraheader` for the duration of the one git
 // invocation they are passed to via runEnv/runOutEnv:
 //
-//   - entry 0 sets the SAME key to an EMPTY value, which per git-config(1)
+//   - entries 0-1 are the maintenance pins (ConfigEnv: maintenance.auto=false,
+//     gc.auto=0), so an authenticated fetch/push starts no auto-maintenance
+//     pass in a repository a sibling worktree shares (ADR-115 D2, #4648);
+//   - entry 2 sets the extraheader key to an EMPTY value, which per git-config(1)
 //     resets the extra-header list to empty — neutralizing any persisted or
 //     ambient extraheader (one actions/checkout wrote, or a stale value a prior
 //     runner version left in a shared worktree config) so it cannot ride along
 //     as a duplicate Authorization header (the #199/#200 failure);
-//   - entry 1 sets the fresh `AUTHORIZATION: basic <b64(x-access-token:token)>`.
+//   - entry 3 sets the fresh `AUTHORIZATION: basic <b64(x-access-token:token)>`
+//     (the reset still precedes the set).
 //
 // Because the header lives in the process environment, not a config file,
 // nothing needs cleanup on ANY exit path — including SIGKILL, which a
@@ -2402,13 +2396,7 @@ func authConfigEnv(remoteURL, pushToken string) ([]string, error) {
 	}
 	key := "http." + host + ".extraheader"
 	header := "AUTHORIZATION: basic " + base64.StdEncoding.EncodeToString([]byte("x-access-token:"+pushToken))
-	return []string{
-		"GIT_CONFIG_COUNT=2",
-		"GIT_CONFIG_KEY_0=" + key,
-		"GIT_CONFIG_VALUE_0=",
-		"GIT_CONFIG_KEY_1=" + key,
-		"GIT_CONFIG_VALUE_1=" + header,
-	}, nil
+	return ConfigEnv([2]string{key, ""}, [2]string{key, header}), nil
 }
 
 // pushHost extracts the `<scheme>://<host>/` string git config keys
@@ -2435,6 +2423,22 @@ func (p *Pusher) run(ctx context.Context, dir string, gitArgs ...string) error {
 // cmd.Env = os.Environ() + env for that single invocation.
 func (p *Pusher) runEnv(ctx context.Context, dir string, env []string, gitArgs ...string) error {
 	_, err := p.runOutEnv(ctx, dir, env, gitArgs...)
+	return err
+}
+
+// runEnvLockRetry is runEnv funnelled through RetryLockContention: a ref,
+// packed-refs or index lock a sibling worktree's git briefly holds waits
+// within the bounded retry instead of failing the call, while every other
+// failure (a CAS mismatch included) returns on the first attempt exactly as
+// runEnv would (ADR-115 D2, #4648). The child carries LockRetryLocaleEnv after
+// env, so the lockfile message IsLockContention classifies is git's
+// untranslated English text whatever the host locale.
+func (p *Pusher) runEnvLockRetry(ctx context.Context, dir string, env []string, gitArgs ...string) error {
+	pinned := append(append(make([]string, 0, len(env)+2), env...), LockRetryLocaleEnv()...)
+	_, err := RetryLockContention(ctx, func() ([]byte, error) {
+		out, err := p.runOutEnv(ctx, dir, pinned, gitArgs...)
+		return []byte(out), err
+	})
 	return err
 }
 
@@ -2482,7 +2486,12 @@ func NonInteractiveEnv() []string {
 }
 
 // runOutEnv is runOut with extra process-environment entries. The child ALWAYS
-// runs with cmd.Env = os.Environ() + NonInteractiveEnv() + env: the
+// runs with cmd.Env = AppendConfigEnv(os.Environ() + NonInteractiveEnv()) + env:
+// the maintenance pins (maintenance.auto=false, gc.auto=0) ride as
+// command-scope config after any inherited GIT_CONFIG_* set, so no runner git
+// child starts an auto-maintenance pass under a sibling worktree (ADR-115 D2,
+// #4648; a malformed inherited GIT_CONFIG_COUNT is returned as the git error
+// without spawning — git would refuse it anyway); and the
 // non-interactive pin must not have holes, so it is applied unconditionally
 // rather than only when a caller env is present (a nil caller env used to
 // leave cmd.Env nil and the child inherited unpinned). A non-empty env scopes
@@ -2501,9 +2510,13 @@ func (p *Pusher) runOutEnv(ctx context.Context, dir string, env []string, gitArg
 	if cmdFn == nil {
 		cmdFn = exec.CommandContext
 	}
+	base, err := AppendConfigEnv(append(os.Environ(), NonInteractiveEnv()...))
+	if err != nil {
+		return "", fmt.Errorf("git %s: %w", strings.Join(gitArgs, " "), err)
+	}
 	cmd := cmdFn(ctx, binary, gitArgs...)
 	cmd.Dir = dir
-	cmd.Env = append(append(os.Environ(), NonInteractiveEnv()...), env...)
+	cmd.Env = append(base, env...)
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr
@@ -2639,7 +2652,7 @@ func (p *Pusher) PushCommittedBranch(ctx context.Context, args PushCommittedBran
 	// have written, since `.git/hooks` is outside the working tree its contract
 	// confines it to. HardeningArgs neutralizes that hook (and every other
 	// command-executing config key) for this invocation.
-	pushArgs := append(HardeningArgs(), "push", args.RemoteURL, args.HeadSHA+":refs/heads/"+args.Branch)
+	pushArgs := append(append(HardeningArgs(), urlPushNoTrackingArgs(args.RemoteURL)...), "push", args.RemoteURL, args.HeadSHA+":refs/heads/"+args.Branch)
 	if err := p.runEnv(ctx, args.RepoDir, authEnv, pushArgs...); err != nil {
 		return nil, fmt.Errorf("gitops: push committed branch %s: %w", args.Branch, err)
 	}
@@ -2926,7 +2939,9 @@ func safeConfigPart(part string) string {
 //
 // It carries NonInteractiveEnv() for the same reason runOutEnv does: the pin
 // must have no holes, and a probe that blocked on a credential prompt would
-// wedge the runner exactly as run f199dcf1 did.
+// wedge the runner exactly as run f199dcf1 did. It carries the maintenance
+// pins (AppendConfigEnv) for the same reason too; a malformed inherited
+// GIT_CONFIG_COUNT returns code -1 without spawning.
 func (p *Pusher) probeOut(ctx context.Context, dir string, gitArgs ...string) (string, int, error) {
 	binary := p.Binary
 	if binary == "" {
@@ -2936,9 +2951,13 @@ func (p *Pusher) probeOut(ctx context.Context, dir string, gitArgs ...string) (s
 	if cmdFn == nil {
 		cmdFn = exec.CommandContext
 	}
+	base, err := AppendConfigEnv(append(os.Environ(), NonInteractiveEnv()...))
+	if err != nil {
+		return "", -1, fmt.Errorf("git %s: %w", strings.Join(gitArgs, " "), err)
+	}
 	cmd := cmdFn(ctx, binary, gitArgs...)
 	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), NonInteractiveEnv()...)
+	cmd.Env = base
 	var stdout, stderr bytes.Buffer
 	cmd.Stdout = &stdout
 	cmd.Stderr = &stderr

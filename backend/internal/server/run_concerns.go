@@ -43,6 +43,10 @@ type runConcernListItem struct {
 	OriginReviewSequence int64  `json:"origin_review_sequence"`
 	HasSuggestedPatch    bool   `json:"has_suggested_patch"`
 	Provenance           string `json:"provenance,omitempty"`
+	// Outcome and judgement (E94.2 / #4693, ADR-117 D1), the gate view's
+	// keys. Judgement resolves against the OWNING run's rows only, so a
+	// duplicate_of link into another run reads unlabelled.
+	concernJudgementView
 }
 
 // runConcernListChild summarizes one decomposition child on an
@@ -246,7 +250,11 @@ func (s *Server) handleListRunConcerns(w http.ResponseWriter, r *http.Request) {
 // appendRunConcernItems appends rows matching stateFilter to items, in the
 // store's order. child is nil for the parent's own rows; for a decomposition
 // child's rows it stamps child_run_id and slice_index.
+//
+// Judgements resolve over rows — ONE run's full ledger, before the state
+// filter — never over a merged parent+child set (E94.2 / #4693).
 func appendRunConcernItems(items []runConcernListItem, rows []*concern.Concern, stateFilter string, child *run.Run) []runConcernListItem {
+	judgements := concern.ResolveJudgements(rows)
 	for _, c := range rows {
 		if stateFilter == runConcernsStateOpen && !c.State.IsOpen() {
 			continue
@@ -265,6 +273,7 @@ func appendRunConcernItems(items []runConcernListItem, rows []*concern.Concern, 
 			OriginReviewSequence: c.OriginReviewSequence,
 			HasSuggestedPatch:    c.SuggestedPatch != "",
 			Provenance:           c.Provenance,
+			concernJudgementView: newConcernJudgementView(c, judgements),
 		}
 		if child != nil {
 			item.ChildRunID = child.ID.String()

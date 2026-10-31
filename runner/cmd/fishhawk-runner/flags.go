@@ -166,6 +166,13 @@ type config struct {
 	// keep today's commit-time fetch and diff re-anchor unchanged.
 	pinnedBaseSHA string
 
+	// planSeedSHA is set at runtime (not a flag) by run() just before the agent
+	// is invoked on a plan-producing stage (#4436): the commit the plan agent's
+	// working tree sat at (capturePlanSeed). uploadPlan ships it in
+	// upload.PlanSeedHeader so the plan review exports its tree there. Empty on
+	// every other stage and when HEAD could not be resolved.
+	planSeedSHA string
+
 	// scopeFiles is set at runtime (not a flag) from the fetched
 	// prompt's scope_files on implement stages (#581). When non-empty
 	// it bounds the implement commit + policy diff to exactly these

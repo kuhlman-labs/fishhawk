@@ -1,0 +1,14 @@
+id: scenario:issue-4693/gate-view-shows-judgement-and-outcome
+statement: GET /v0/runs/{run_id}/gate-view carries a judgement on every open and settled concern, reading unlabelled for a concern no human has judged, and carries outcome on a concern that has one recorded.
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/gate-view returns 200; every open[] and settled[] item has a judgement key (unlabelled for existing concerns) and an outcome key when one was recorded (e.g. carried / open_at_merge / fixed).'
+steps: 'Seed: POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"}, read run_id and the implement stage id. Persist a review concern: build a gzip JSONL trace bundle with a manifest line {seq:1,kind:manifest,data:{bundle_schema:v1}} and a git_diff line whose patch ADDS ''var tok = "ghp_''+36*''A''+''"'' to config/settings.go; POST /v0/runs/{run}/signing-key, sign the bundle bytes via POST /v0/dev/sign, POST /v0/runs/{run}/trace?stage_id={implement}&variant=raw with X-Fishhawk-Signature (202). The server''s deterministic diff-secrets check mints one server_check concern. Mint an fhm_ bearer (sign ''{}'' and POST /v0/runs/{run}/mcp-token). To record an outcome on a second run seeded the same way: sign and POST /v0/runs/{run}/pull-request?stage_id={implement} {pr_number:4242, pr_url:https://github.com/kuhlman-labs/fishhawk/pull/4242, branch, head_sha ''ab''*20, base_sha ''cd''*20, title, files_changed_count:1} (201), then POST /v0/dev/forge/deliveries {forge:github, event:pull_request, payload:{action:closed, installation.id, repository.full_name, pull_request:{html_url, number, merged:true, merged_by, head.sha, base.sha}}} (receiver status 202; pr_merged audit row written). Then GET /v0/runs/{run}/gate-view on both runs.'
+assertions:
+    expected: 200; every open[]/settled[] item has judgement (unlabelled for never-judged) and outcome when one was recorded
+    observed_at_record: 'Run 9c610156 (no outcome recorded): open[0] judgement=''unlabelled'', no outcome key. Run c05eae17 (after the stub-forge merged delivery): open[0] judgement=''unlabelled'', outcome=''open_at_merge''. settled[] was empty on both runs, because no sandbox credential can settle a concern. Both 200.'
+    repro_handle: 'GET http://localhost:8090/v0/runs/c05eae17-6b41-4a53-8355-2c4e8ea55600/gate-view (bearer: run-bound fhm_ token)'
+origin:
+    issue: 4693
+    pr: 4844
+    run_id: 09dcfa08-94b9-4282-9a6b-c9e3b14c1ca3
+    head_sha: ec13f129a06219719636006a5a621dbc63aa750f
+    recorded_at: 2026-10-30T07:41:54Z

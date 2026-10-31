@@ -1847,11 +1847,17 @@ func TestAwaitChildrenFailureBlockedIsPure(t *testing.T) {
 	parked := func(id string, slice int, deps ...int) ChildStatus {
 		return ChildStatus{RunID: id, SliceIndex: slice, State: "running", ImplementStageState: "awaiting_host_dispatch", DependsOn: deps}
 	}
+	// infraParked is a #4426 PARKED child: a non-terminal run whose implement
+	// stage failed category C (distinct from parked(), an undispatched child).
+	infraParked := func(id string, slice int, deps ...int) ChildStatus {
+		return ChildStatus{RunID: id, SliceIndex: slice, State: "running", ImplementStageState: "failed", ImplementFailureCategory: "C", DependsOn: deps}
+	}
 	cases := []struct {
 		name        string
 		children    []ChildStatus
 		wantFailed  []string
 		wantBlocked []string
+		wantParked  []string
 	}{
 		{
 			name:        "issue scenario releases",
@@ -1915,14 +1921,439 @@ func TestAwaitChildrenFailureBlockedIsPure(t *testing.T) {
 			children: []ChildStatus{{RunID: "r0", SliceIndex: 0, State: "succeeded", ImplementStageState: "succeeded"},
 				parked("r1", 1, 0)},
 		},
+		// R5 (#4426): a parked sibling is STALLED, not progressing.
+		{
+			name:       "R5 failed child beside only a parked sibling releases",
+			children:   []ChildStatus{{RunID: "r0", SliceIndex: 0, State: "failed", ImplementStageState: "failed", ImplementFailureCategory: "C"}, infraParked("r1", 1)},
+			wantFailed: []string{"r0"},
+			wantParked: []string{"r1"},
+		},
+		{
+			name:        "R5 failed child beside a parked sibling and a failure-blocked dependent releases",
+			children:    []ChildStatus{failed0, infraParked("r1", 1), parked("r2", 2, 0)},
+			wantFailed:  []string{"r0"},
+			wantBlocked: []string{"r2"},
+			wantParked:  []string{"r1"},
+		},
+		{
+			name: "R5 a progressing sibling beside the parked one keeps the wait",
+			children: []ChildStatus{failed0, infraParked("r2", 2),
+				{RunID: "r1", SliceIndex: 1, State: "running", ImplementStageState: "running"}},
+		},
+		{
+			name:     "a parked child with no failed sibling does not release child_failed",
+			children: []ChildStatus{{RunID: "r0", SliceIndex: 0, State: "succeeded", ImplementStageState: "succeeded"}, infraParked("r1", 1)},
+		},
+		{
+			// A category-A failed stage on a running run is a transient window,
+			// not a park, so it is neither parked nor undispatched.
+			name: "a running child with a category-A failed stage keeps the wait",
+			children: []ChildStatus{failed0,
+				{RunID: "r1", SliceIndex: 1, State: "running", ImplementStageState: "failed", ImplementFailureCategory: "A"}},
+		},
 	}
 	for _, c := range cases {
 		t.Run(c.name, func(t *testing.T) {
-			failed, blocked := awaitChildrenFailureBlocked(&ChildrenStatus{Children: c.children})
+			failed, blocked, parkedIDs := awaitChildrenFailureBlocked(&ChildrenStatus{Children: c.children})
 			if strings.Join(failed, ",") != strings.Join(c.wantFailed, ",") ||
-				strings.Join(blocked, ",") != strings.Join(c.wantBlocked, ",") {
-				t.Errorf("awaitChildrenFailureBlocked = (%v, %v), want (%v, %v)", failed, blocked, c.wantFailed, c.wantBlocked)
+				strings.Join(blocked, ",") != strings.Join(c.wantBlocked, ",") ||
+				strings.Join(parkedIDs, ",") != strings.Join(c.wantParked, ",") {
+				t.Errorf("awaitChildrenFailureBlocked = (%v, %v, %v), want (%v, %v, %v)", failed, blocked, parkedIDs, c.wantFailed, c.wantBlocked, c.wantParked)
 			}
 		})
+	}
+}
+
+// TestAwaitChildParkedIsPure pins the #4426 parked-child predicate over
+// hand-built children, including the fail-closed unknown-state row.
+func TestAwaitChildParkedIsPure(t *testing.T) {
+	for _, c := range []struct {
+		name  string
+		child ChildStatus
+		want  bool
+	}{
+		{"running run with implement failed C is parked", ChildStatus{State: "running", ImplementStageState: "failed", ImplementFailureCategory: "C"}, true},
+		{"pending run with implement failed C is parked", ChildStatus{State: "pending", ImplementStageState: "failed", ImplementFailureCategory: "C"}, true},
+		{"terminal-failed run is not parked", ChildStatus{State: "failed", ImplementStageState: "failed", ImplementFailureCategory: "C"}, false},
+		{"unknown run state fails closed", ChildStatus{State: "unknown", ImplementStageState: "failed", ImplementFailureCategory: "C"}, false},
+		{"category A is not a park", ChildStatus{State: "running", ImplementStageState: "failed", ImplementFailureCategory: "A"}, false},
+		{"category D is not a park", ChildStatus{State: "running", ImplementStageState: "failed", ImplementFailureCategory: "D"}, false},
+		{"a running stage is not a park", ChildStatus{State: "running", ImplementStageState: "running"}, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			if got := awaitChildParked(c.child); got != c.want {
+				t.Errorf("awaitChildParked(%+v) = %v, want %v", c.child, got, c.want)
+			}
+		})
+	}
+}
+
+// seedParkedChild seeds a #4426 PARKED child — run state running, implement
+// stage failed category C — and returns its implement stage id.
+func seedParkedChild(fb *fakeBackend, childID uuid.UUID, sliceIndex int, dependsOn []int) uuid.UUID {
+	stageID := seedChildWithSlice(fb, childID, "running", "failed", sliceIndex, dependsOn)
+	setChildImplementFailure(fb, childID, "C", "runner_lost")
+	return stageID
+}
+
+// TestAwaitChildren_ChildParkedReleases pins the #4426 child_parked release
+// and its precedence (T-AC-1). MECHANISM: a parked child's run is non-terminal
+// and its implement stage is failed — neither dispatchable nor in flight — so
+// without (3c) no arm fires and the call times out; without the R5 widening
+// row (d)'s non-terminal parked sibling closes child_failed.
+func TestAwaitChildren_ChildParkedReleases(t *testing.T) {
+	t.Run("a: parked beside an in-flight sibling releases child_parked", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "running", "running", 0, nil)
+		stageB := seedParkedChild(fb, b, 1, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+
+		in := awaitIn(parent)
+		in.TimeoutSeconds = 1
+		_, out, err := r.awaitChildren(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "child_parked" {
+			t.Fatalf("status = %q, want child_parked", out.Status)
+		}
+		if strings.Join(out.ParkedChildRunIDs, ",") != b.String() {
+			t.Errorf("parked_child_run_ids = %v, want [%s]", out.ParkedChildRunIDs, b)
+		}
+		if len(out.FailedChildRunIDs) != 0 || len(out.BlockedChildRunIDs) != 0 {
+			t.Errorf("failed/blocked = %v / %v, want none on child_parked", out.FailedChildRunIDs, out.BlockedChildRunIDs)
+		}
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_retry_stage" || out.NextStep.Params["stage_id"] != stageB.String() {
+			t.Fatalf("next_step = %+v, want fishhawk_retry_stage {stage_id: %s}", out.NextStep, stageB)
+		}
+		if !strings.Contains(out.NextStep.Precondition, "#4426") {
+			t.Errorf("next_step.precondition %q must name the park (#4426)", out.NextStep.Precondition)
+		}
+		for _, want := range []string{b.String(), "awaiting_children", "Do NOT cancel the parked child", "consolidate", "re-invoke fishhawk_await_children"} {
+			if !strings.Contains(out.Message, want) {
+				t.Errorf("message %q missing %q", out.Message, want)
+			}
+		}
+	})
+
+	t.Run("b: a dispatchable sibling wins over a parked child", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		seedParkedChild(fb, a, 0, nil)
+		seedChildWithSlice(fb, b, "running", "awaiting_host_dispatch", 1, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "children_dispatchable" {
+			t.Fatalf("status = %q, want children_dispatchable", out.Status)
+		}
+	})
+
+	t.Run("c: a newer fan-in failure wins over a parked child", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "succeeded", "succeeded", 0, nil)
+		seedParkedChild(fb, b, 1, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+		seedFanInEntry(t, fb, parent, auditCategorySliceHeadMissing,
+			sliceHeadMissingPayload{ChildRunID: a.String(), SliceIndex: intPtr(0), Branch: "fishhawk/run-p/slice-0", Detail: "absent"})
+
+		_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "integration_failed" {
+			t.Fatalf("status = %q, want integration_failed", out.Status)
+		}
+	})
+
+	t.Run("d: R5 a terminal failure beside a parked sibling keeps child_failed", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b := uuid.New(), uuid.New(), uuid.New()
+		stageA := seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+		setChildImplementFailure(fb, a, "C", "runner_lost")
+		seedParkedChild(fb, b, 1, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String()}, 0)
+
+		in := awaitIn(parent)
+		in.TimeoutSeconds = 1
+		_, out, err := r.awaitChildren(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "child_failed" {
+			t.Fatalf("status = %q, want child_failed — a terminal failure keeps precedence over a parked sibling (R5)", out.Status)
+		}
+		if strings.Join(out.FailedChildRunIDs, ",") != a.String() {
+			t.Errorf("failed_child_run_ids = %v, want [%s]", out.FailedChildRunIDs, a)
+		}
+		if strings.Join(out.ParkedChildRunIDs, ",") != b.String() {
+			t.Errorf("parked_child_run_ids = %v, want [%s]", out.ParkedChildRunIDs, b)
+		}
+		if len(out.BlockedChildRunIDs) != 0 {
+			t.Errorf("blocked_child_run_ids = %v, want none", out.BlockedChildRunIDs)
+		}
+		// Today's child_failed derivation for a TERMINAL-failed category-C
+		// child: the retry with the terminal wording, never the park's.
+		if out.NextStep == nil || out.NextStep.Action != "fishhawk_retry_stage" || out.NextStep.Params["stage_id"] != stageA.String() {
+			t.Fatalf("next_step = %+v, want fishhawk_retry_stage {stage_id: %s}", out.NextStep, stageA)
+		}
+		wantPre := `the implement stage failed category "C" (retry serves categories A/C/D; B routes to fishhawk_resume_run)`
+		if out.NextStep.Precondition != wantPre {
+			t.Errorf("next_step.precondition = %q, want today's terminal wording %q", out.NextStep.Precondition, wantPre)
+		}
+		if !strings.Contains(out.Message, b.String()) {
+			t.Errorf("message %q must name the parked child %s", out.Message, b)
+		}
+		if strings.Contains(out.Message, "Every remaining undispatched child") {
+			t.Errorf("message %q must drop the every-remaining-child sentence when nothing is blocked", out.Message)
+		}
+	})
+
+	t.Run("e: R5 failed, parked and a failure-blocked dependent", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+		setChildImplementFailure(fb, a, "A", "")
+		seedParkedChild(fb, b, 1, nil)
+		seedChildWithSlice(fb, c, "pending", "pending", 2, []int{0})
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+		in := awaitIn(parent)
+		in.TimeoutSeconds = 1
+		_, out, err := r.awaitChildren(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "child_failed" {
+			t.Fatalf("status = %q, want child_failed", out.Status)
+		}
+		if strings.Join(out.FailedChildRunIDs, ",") != a.String() ||
+			strings.Join(out.BlockedChildRunIDs, ",") != c.String() ||
+			strings.Join(out.ParkedChildRunIDs, ",") != b.String() {
+			t.Errorf("failed/blocked/parked = %v / %v / %v, want [%s] / [%s] / [%s]",
+				out.FailedChildRunIDs, out.BlockedChildRunIDs, out.ParkedChildRunIDs, a, c, b)
+		}
+		for _, want := range []string{"Every remaining undispatched child (" + c.String() + ")", b.String()} {
+			if !strings.Contains(out.Message, want) {
+				t.Errorf("message %q missing %q", out.Message, want)
+			}
+		}
+	})
+
+	t.Run("f: a progressing sibling keeps child_failed closed and child_parked releases", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a, b, c := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "failed", "failed", 0, nil)
+		setChildImplementFailure(fb, a, "A", "")
+		seedChildWithSlice(fb, b, "running", "running", 1, nil)
+		stageC := seedParkedChild(fb, c, 2, nil)
+		seedPlanDecomposed(fb, parent, []string{a.String(), b.String(), c.String()}, 0)
+
+		in := awaitIn(parent)
+		in.TimeoutSeconds = 1
+		_, out, err := r.awaitChildren(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "child_parked" {
+			t.Fatalf("status = %q, want child_parked", out.Status)
+		}
+		if strings.Join(out.ParkedChildRunIDs, ",") != c.String() {
+			t.Errorf("parked_child_run_ids = %v, want [%s]", out.ParkedChildRunIDs, c)
+		}
+		if out.NextStep == nil || out.NextStep.Params["stage_id"] != stageC.String() {
+			t.Errorf("next_step = %+v, want the retry of %s", out.NextStep, stageC)
+		}
+	})
+
+	t.Run("g: an unknown-state child with a failed implement fails closed", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a := uuid.New(), uuid.New()
+		seedParkedChild(fb, a, 0, nil)
+		fb.mu.Lock()
+		fb.getStatusByID[a] = 500
+		fb.mu.Unlock()
+		seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+
+		in := awaitIn(parent)
+		in.TimeoutSeconds = 1
+		_, out, err := r.awaitChildren(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "timeout" {
+			t.Fatalf("status = %q, want timeout — an unreadable child run never reads as parked", out.Status)
+		}
+	})
+
+	t.Run("h: a running child with a category-A failed stage is not parked", func(t *testing.T) {
+		fb, r := newAwaitResolver(t)
+		parent, a := uuid.New(), uuid.New()
+		seedChildWithSlice(fb, a, "running", "failed", 0, nil)
+		setChildImplementFailure(fb, a, "A", "agent exited non-zero")
+		seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+
+		in := awaitIn(parent)
+		in.TimeoutSeconds = 1
+		_, out, err := r.awaitChildren(context.Background(), nil, in)
+		if err != nil {
+			t.Fatalf("awaitChildren: %v", err)
+		}
+		if out.Status != "timeout" {
+			t.Fatalf("status = %q, want timeout — a category-A failure on a running run is a transient window, not a park", out.Status)
+		}
+	})
+}
+
+// --- release arm (1b): campaign-wide amendment_pending (E86.85 / #4486) ---
+
+// TestAwaitChildren_ReleasesOnOtherParentsSliceAmendment is the issue's
+// criterion and counterfactual (5)'s vehicle: parent A's only child is running,
+// not dispatchable, not terminal and has no amendment, so no other arm can
+// release; a slice of parent B (another item of the same campaign) files a live
+// amendment mid-poll, and A's wait releases amendment_pending naming it.
+func TestAwaitChildren_ReleasesOnOtherParentsSliceAmendment(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parentA, childA, sliceB := uuid.New(), uuid.New(), uuid.New()
+	seedChildWithSlice(fb, childA, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parentA, []string{childA.String()}, 0)
+	campaignID := uuid.NewString()
+	entry := campaignAmendmentEntry(sliceB, uuid.New(), "acme/widgets#2", true)
+	fb.campaignAmendmentsFunc = func(anchor uuid.UUID, reads int) (runCampaignPendingAmendments, bool) {
+		if anchor != parentA {
+			return runCampaignPendingAmendments{}, false
+		}
+		cid := campaignID
+		resp := runCampaignPendingAmendments{RunID: anchor.String(), CampaignID: &cid}
+		if reads >= 2 {
+			resp.Items = []campaignPendingAmendment{entry}
+		}
+		return resp, true
+	}
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parentA))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "amendment_pending" {
+		t.Fatalf("status = %q, want amendment_pending — another parent's slice filed a live amendment", out.Status)
+	}
+	if out.PendingAmendmentRunID != sliceB.String() {
+		t.Errorf("pending_amendment_run_id = %q, want B's slice %s", out.PendingAmendmentRunID, sliceB)
+	}
+	if out.PendingAmendmentChildRunID != "" {
+		t.Errorf("pending_amendment_child_run_id = %q, want empty — B's slice is not A's child", out.PendingAmendmentChildRunID)
+	}
+	if out.PendingAmendmentCampaignID != campaignID || out.PendingAmendmentIssueRef != "acme/widgets#2" {
+		t.Errorf("campaign/issue = %q/%q, want %s/acme/widgets#2", out.PendingAmendmentCampaignID, out.PendingAmendmentIssueRef, campaignID)
+	}
+	if out.PendingAmendment == nil || out.PendingAmendment.ID != entry.Amendment.ID {
+		t.Fatalf("pending_amendment = %+v, want %s", out.PendingAmendment, entry.Amendment.ID)
+	}
+	if out.NextStep == nil || out.NextStep.Action != "fishhawk_decide_scope_amendment" ||
+		out.NextStep.Params["run_id"] != sliceB.String() || out.NextStep.Params["amendment_id"] != entry.Amendment.ID {
+		t.Errorf("next_step = %+v, want decide on B's slice %s", out.NextStep, sliceB)
+	}
+	if out.Children == nil || len(out.Children.Children) != 1 {
+		t.Errorf("children snapshot = %+v, want A's fan-out carried on the release", out.Children)
+	}
+	if !strings.Contains(out.Message, "has NOT released for its own reasons") {
+		t.Errorf("message = %q, want the own-reasons disclaimer", out.Message)
+	}
+}
+
+// TestAwaitChildren_OwnChildAmendmentWinsOverCampaign: arm (1) releases first,
+// and the campaign arm skips the child's own row (and the parent's) even when
+// the campaign list carries it.
+func TestAwaitChildren_OwnChildAmendmentWinsOverCampaign(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	stageID := seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	ownID := uuid.NewString()
+	fb.mu.Lock()
+	fb.amendmentsByRun[a] = []ScopeAmendmentItem{{ID: ownID, RunID: a.String(), StageID: stageID.String(), Status: "pending"}}
+	fb.mu.Unlock()
+	seedCampaignAmendments(fb, parent, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true))
+
+	_, out, err := r.awaitChildren(context.Background(), nil, awaitIn(parent))
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "amendment_pending" || out.PendingAmendment == nil || out.PendingAmendment.ID != ownID {
+		t.Fatalf("status/amendment = %q/%+v, want the child's own %s", out.Status, out.PendingAmendment, ownID)
+	}
+	if out.PendingAmendmentRunID != a.String() || out.PendingAmendmentChildRunID != a.String() {
+		t.Errorf("run ids = %q/%q, want the child %s on both", out.PendingAmendmentRunID, out.PendingAmendmentChildRunID, a)
+	}
+	if out.PendingAmendmentCampaignID != "" || out.PendingAmendmentIssueRef != "" {
+		t.Errorf("campaign fields = %q/%q, want empty on a child's own release", out.PendingAmendmentCampaignID, out.PendingAmendmentIssueRef)
+	}
+	if got := campaignAmendmentReads(fb, parent); got != 0 {
+		t.Errorf("campaign reads = %d, want 0 — arm (1) resolves first", got)
+	}
+
+	// The campaign arm itself skips a row on an own child or on the parent.
+	cs, err := r.childrenStatusForAwait(context.Background(), parent)
+	if err != nil || cs == nil {
+		t.Fatalf("childrenStatusForAwait: %v", err)
+	}
+	seedCampaignAmendments(fb, parent, uuid.NewString(),
+		campaignAmendmentEntry(a, stageID, "acme/widgets#1", true),
+		campaignAmendmentEntry(parent, uuid.New(), "acme/widgets#1", true))
+	if _, ok := r.awaitChildrenCampaignAmendmentRelease(context.Background(), AwaitChildrenOutput{}, parent, cs); ok {
+		t.Error("campaign arm released on a row filed by an own child or the awaited parent; those must be skipped")
+	}
+}
+
+// TestAwaitChildren_NotLiveCampaignAmendmentDoesNotRelease: a pending request
+// on a settled stage elsewhere in the campaign keeps the wait.
+func TestAwaitChildren_NotLiveCampaignAmendmentDoesNotRelease(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	seedCampaignAmendments(fb, parent, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", false))
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want timeout — a not-live amendment must not release", out.Status)
+	}
+	if !strings.Contains(out.Message, "no other run of its campaign filed a live amendment") {
+		t.Errorf("timeout message must name the campaign-wide condition; got %q", out.Message)
+	}
+}
+
+// TestAwaitChildren_CampaignProbeErrorDoesNotFailTheWait: a 500 from the route
+// leaves a resumable timeout, never an error.
+func TestAwaitChildren_CampaignProbeErrorDoesNotFailTheWait(t *testing.T) {
+	fb, r := newAwaitResolver(t)
+	parent, a := uuid.New(), uuid.New()
+	seedChildWithSlice(fb, a, "running", "running", 0, nil)
+	seedPlanDecomposed(fb, parent, []string{a.String()}, 0)
+	seedCampaignAmendments(fb, parent, uuid.NewString(), campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true))
+	fb.campaignAmendmentsStatus = 500
+
+	in := awaitIn(parent)
+	in.TimeoutSeconds = 1
+	_, out, err := r.awaitChildren(context.Background(), nil, in)
+	if err != nil {
+		t.Fatalf("awaitChildren returned an error on a best-effort campaign probe: %v", err)
+	}
+	if out.Status != "timeout" {
+		t.Fatalf("status = %q, want the resumable timeout", out.Status)
+	}
+	if got := campaignAmendmentReads(fb, parent); got < 2 {
+		t.Errorf("campaign reads = %d, want >= 2 (the failing probe kept being attempted)", got)
 	}
 }

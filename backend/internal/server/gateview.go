@@ -960,6 +960,55 @@ type gateViewConcern struct {
 	// (reopen_without_named_concern), which do NOT set Disputed — a refused
 	// reopen is not a confirmation that failed to settle the concern.
 	Disputes []gateViewDispute `json:"disputes,omitempty"`
+	concernJudgementView
+}
+
+// concernJudgementView is a concern's outcome and human judgement as every
+// read surface reports them (E94.2 / #4693, ADR-117 D1), embedded (so its keys
+// flatten) in gateViewConcern, gateViewSettledConcern and runConcernListItem.
+// Outcome is concern.Concern.EffectiveOutcome (duplicate_of:<id> for a
+// duplicate), omitted when none is recorded. Judgement is ALWAYS present: the
+// row's normalized judgement, or for a duplicate its chain root's
+// (concern.ResolveJudgements, resolved over ONE run's rows), with
+// JudgementInheritedFrom naming that root; a never-judged row reads
+// unlabelled. The remaining keys are the stored judgement record, omitted at
+// their zero value. None of it is ever rendered into a review prompt.
+type concernJudgementView struct {
+	Outcome                string     `json:"outcome,omitempty"`
+	Judgement              string     `json:"judgement"`
+	JudgementInheritedFrom *uuid.UUID `json:"judgement_inherited_from,omitempty"`
+	DuplicateOf            *uuid.UUID `json:"duplicate_of,omitempty"`
+	JudgementActorKind     string     `json:"judgement_actor_kind,omitempty"`
+	JudgementDelegated     bool       `json:"judgement_delegated,omitempty"`
+	JudgementBulk          bool       `json:"judgement_bulk,omitempty"`
+	JudgementBackfill      bool       `json:"judgement_backfill,omitempty"`
+	TradeoffCost           string     `json:"tradeoff_cost,omitempty"`
+}
+
+// newConcernJudgementView renders c's outcome and judgement. resolved is
+// concern.ResolveJudgements over c's own run's rows; a row absent from it
+// (never expected) falls back to its own normalized judgement.
+func newConcernJudgementView(c *concern.Concern, resolved map[uuid.UUID]concern.EffectiveJudgement) concernJudgementView {
+	eff, ok := resolved[c.ID]
+	if !ok {
+		eff = concern.EffectiveJudgement{Judgement: concern.NormalizeJudgement(string(c.Judgement))}
+	}
+	var dup *uuid.UUID
+	if c.DuplicateOf != nil {
+		d := *c.DuplicateOf
+		dup = &d
+	}
+	return concernJudgementView{
+		Outcome:                c.EffectiveOutcome(),
+		Judgement:              string(eff.Judgement),
+		JudgementInheritedFrom: eff.InheritedFrom,
+		DuplicateOf:            dup,
+		JudgementActorKind:     c.JudgementActorKind,
+		JudgementDelegated:     c.JudgementDelegated,
+		JudgementBulk:          c.JudgementBulk,
+		JudgementBackfill:      c.JudgementBackfill,
+		TradeoffCost:           c.TradeoffCost,
+	}
 }
 
 // gateViewDispute is one refused resolution, reconstructed from a
@@ -1065,6 +1114,7 @@ type gateViewSettledConcern struct {
 	// deferral — and when the concern_resolved_with_evidence read failed (that
 	// failure is a history_gaps entry).
 	ResolutionBasis string `json:"resolution_basis,omitempty"`
+	concernJudgementView
 }
 
 // gateViewResolutionBasisOperatorEvidence is the settled ledger's
@@ -1438,13 +1488,19 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 	// Fetch the audit history, category by category, so a single-category read
 	// failure names that gap while the rest of the joins still build.
 	history := s.loadGateViewHistory(ctx, runID, &resp)
+	// Judgements resolve ONCE over the run's FULL ledger, before the
+	// stage_kind filter, so a duplicate whose root is a concern of the other
+	// stage kind still inherits (E94.2 / #4693).
+	judgements := concern.ResolveJudgements(rows)
 
 	for _, c := range rows {
 		if stageKind != "" && c.StageKind != stageKind {
 			continue
 		}
 		if c.State.IsOpen() {
-			resp.Open = append(resp.Open, gateViewOpenConcern(c, history))
+			open := gateViewOpenConcern(c, history)
+			open.concernJudgementView = newConcernJudgementView(c, judgements)
+			resp.Open = append(resp.Open, open)
 			continue
 		}
 		resp.Settled = append(resp.Settled, gateViewSettledConcern{
@@ -1459,10 +1515,11 @@ func (s *Server) buildGateView(ctx context.Context, runID uuid.UUID, stageKind s
 			NewEvidence:   c.NewEvidence,
 			SettledRef:    c.SettledRef,
 			// Persona ingest markers (E55.10 / #3755).
-			ReviewerRole:        c.ReviewerRole,
-			QuoteUnverified:     c.QuoteUnverified,
-			SeverityClampedFrom: c.SeverityClampedFrom,
-			ResolutionBasis:     gateViewResolutionBasis(c, history),
+			ReviewerRole:         c.ReviewerRole,
+			QuoteUnverified:      c.QuoteUnverified,
+			SeverityClampedFrom:  c.SeverityClampedFrom,
+			ResolutionBasis:      gateViewResolutionBasis(c, history),
+			concernJudgementView: newConcernJudgementView(c, judgements),
 		})
 	}
 

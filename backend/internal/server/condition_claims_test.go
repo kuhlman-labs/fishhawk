@@ -321,12 +321,12 @@ func TestResolveConditionClaimedPlanConcerns_ImplementStageRowSkipped(t *testing
 func TestResolveConditionClaimedPlanConcerns_ApplyResolutionFailureAfterAppend(t *testing.T) {
 	au := newAuditFake()
 	base := newFakeConcernRepo()
-	// ApplyResolution fails AFTER the audit entry has appended — a state change
-	// (e.g. a reopen) raced the hook between the IsOpen read and the transition.
-	cr := &raceConcernRepo{
-		fakeConcernRepo: base,
-		applyErr:        concern.InvalidTransitionError{From: concern.StateRaised, To: concern.StateAddressedByCondition},
-	}
+	// The transition write fails AFTER the audit entry has appended — a state
+	// change (e.g. a reopen) raced the hook between the IsOpen read and the
+	// transition. The write is ApplyDisposition since E94.2 / #4693 (the claim
+	// records outcome fixed), so the failure is injected there.
+	base.applyDispositionErr = concern.InvalidTransitionError{From: concern.StateRaised, To: concern.StateAddressedByCondition}
+	cr := base
 	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
 
 	runID, stageID := uuid.New(), uuid.New()
@@ -734,5 +734,37 @@ func TestResolveConditionClaimedPlanConcerns_ConcernKindRecordedWhenEmpty(t *tes
 		t.Error("severity key is ABSENT for an empty-severity concern; it must be present-and-empty")
 	} else if got != "" {
 		t.Errorf("severity = %v, want the empty string", got)
+	}
+}
+
+// TestConditionClaim_RecordsOutcomeFixed (E94.2 / #4693, ADR-117 D1): a
+// condition claim is a system writer's close — addressed_by_condition with
+// outcome fixed and the judgement untouched (a never-judged row reads
+// unlabelled, a pre-labelled one keeps its label). The rows start with an
+// empty outcome and nothing else on this path writes one.
+func TestConditionClaim_RecordsOutcomeFixed(t *testing.T) {
+	s, au, cr := conditionClaimsServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	fresh := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 5, "the retry cap is not enforced")
+	labelled := seedConcernRow(t, cr, runID, stageID, concern.StageKindPlan, 6, "the timeout is unbounded")
+	labelled.Judgement = concern.JudgementNoDefect
+	seedApprovalEntry(au, runID, 42, "approve", "brett", []string{fresh.ID.String(), labelled.ID.String()})
+
+	s.resolveConditionClaimedPlanConcerns(context.Background(), runID, 200, "claude-opus-4-8", "approve_with_concerns", nil)
+
+	for _, c := range []struct {
+		row  *concern.Concern
+		want concern.Judgement
+	}{{fresh, concern.JudgementUnlabelled}, {labelled, concern.JudgementNoDefect}} {
+		rows, _ := cr.GetByIDs(context.Background(), []uuid.UUID{c.row.ID})
+		if rows[0].State != concern.StateAddressedByCondition {
+			t.Fatalf("%s state = %q, want addressed_by_condition", c.row.Note, rows[0].State)
+		}
+		if rows[0].Outcome != concern.OutcomeFixed {
+			t.Errorf("%s outcome = %q, want fixed — a condition claim records fixed", c.row.Note, rows[0].Outcome)
+		}
+		if j := concern.NormalizeJudgement(string(rows[0].Judgement)); j != c.want {
+			t.Errorf("%s judgement = %q, want %q", c.row.Note, j, c.want)
+		}
 	}
 }

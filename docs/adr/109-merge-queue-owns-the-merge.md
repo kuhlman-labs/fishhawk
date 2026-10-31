@@ -123,3 +123,118 @@ The run is stuck until it is cancelled.
   - a closed PR settles.
 - **Implementation:** #4298 already delivers points 1, 3 (indeterminate → `dispatch_failed`) and 4, under ADR-109 as written. The release-on-forge-evidence arm in point 3 is added by #4298 if A1 is ratified before its implement stage, or otherwise by a follow-up child.
 - **Record metadata:** an in-body amendment to ADR-109. No new edge.
+
+## Amendment A2 (2026-10-31): the resume releases an orphaned queue claim before the fold (#4862)
+
+**Ratified by the Captain 2026-10-31 (v2).** Drafted by the first officer on 2026-10-31 under the Captain's choice of option (a) of #4862, with the step-8 release kept as a backstop. v1 was reviewed by claude-fable-5-1 and gpt-6-astra (codex), both "revise", and their findings are folded in. Neither found a safety hole in the placement.
+
+**Context.** Verified at dc752ab1. All paths are under `backend/internal/`.
+
+A1 releases an orphaned queue claim only in step 8 of `mergeOnPassLocked`. Step 8 runs after the step-6b ADR-112 fold has approved; an unapproved fold returns at `server/merge_queue_merge.go:1056-1062`. The ADR-093 D8 resume's `orphaned_claim_open` arm already establishes, under the run's merge-intent lock (`server/merge_queue_resume.go:260`), every fact A1's safety proof uses:
+- the claim is a `queue` claim still `dispatched` (`:317`);
+- the PR reads open and unmerged (`:319-375`);
+- the claim is crash-left on the database clock (`:420`, `:479-495`).
+
+Even so, that arm writes nothing to the ledger and returns the entry to `passed` (`:424-433`), leaving the release to step 8. When the fold is not approved, step 8 never runs, so the claim outlives the merge attempt. The resulting behaviour is inconsistent:
+
+1. **The fold's yields skip the claim.** The `await_approval` yield at expiry and a veto's immediate yield go through `applyMergeOnPassOutcome` → `yieldMergeQueueEntry` (`server/merge_candidate_queue.go:538-552`), which never reads the claim. `Store.Yield` compares only liveness and the admission epoch (`mergequeue/store.go:885-905`). The entry yields with an orphaned `dispatched` claim still standing.
+2. **Two yields refuse on any claim.** Both run `mergeOnPassPreYieldRefusal` (`server/merge_queue_yield.go:402`), which refuses on ANY claim and holds the head of the line with no yield marker:
+   - the ADR-112 R3 expired-wait enforcement, on a readvance or a transient hold with an open approval wait (`server/merge_queue_yield.go:338-349`);
+   - the ADR-112 A3.2 merge-gate wait, including the immediate red-check yield (`server/merge_queue_merge.go:848`).
+
+   With red checks, approval does not unstick the entry. Only green CI or the operator can.
+3. **Withdraw-intent is blocked.** A yielded entry that carries the orphaned claim cannot use ADR-112 R3's withdraw-intent verb (#4685). `withdrawIntentTx` refuses any claim (`mergequeue/store.go:1488-1492`). Such an entry leaves the queue in one of two ways:
+   - an automatic clear, which needs an approved fold and passing merge-gate legs, followed by step 8;
+   - observing the PR merged or closed, or cancelling the run.
+
+ADR-112 R3's Ledger bullet assumes the opposite: "a wait, and every yield except row 4's, happens BEFORE any dispatch claim".
+
+**Why the resume, not an earlier step of merge-on-pass.** Merge-on-pass's pre-lock steps return before the lock is taken:
+- the head-moved readvance (`server/merge_queue_merge.go:741`);
+- step 4's `await_gate` (`:773`).
+
+A release placed inside the lock therefore misses the merge-gate case. The resume runs first. Every orphan created after A2 passes through it, because merge-on-pass stamps `merging` under the lock BEFORE it claims (`:1086-1107`), and the pump routes a `merging` entry to the resume (`server/merge_candidate_queue.go:427`).
+
+**Decision.** A1 point 2 (Placement) is amended. Everything else in A1 stands.
+
+1. **Release at the resume.**
+   - **Where.** The ADR-093 D8 resume's `orphaned_claim_open` arm RELEASES the orphaned claim before the entry returns to `passed`.
+   - **Guards.** They are unchanged:
+     - a live `merging` entry at its admission epoch;
+     - a `queue` claim still `dispatched`;
+     - crash-left by A1's predicate on the database clock;
+     - observed under the merge-intent lock;
+     - a forge read showing the PR open and unmerged.
+   - **What it never touches.** A `settling` entry, an inline, delegated or GitLab claim, a `dispatch_failed` claim and a young claim are never released. The closed and indeterminate arms are unchanged.
+   - **Order:**
+     1. the `merge_queue_resumed` {`redecide`, `orphaned_claim_open`} row;
+     2. the strict `merge_dispatch_settled` {`released`, `released_orphaned_claim`} row (record before action);
+     3. the exact-claim compare-and-swap DELETE (`ReleaseMergeDispatch`);
+     4. `SetPhase(passed)` at the epoch, then redecide.
+
+     The implementation reuses `mergeOnPassReleaseOrphanedClaim` (steps 2–3) at the new site, so there is ONE release body.
+   - **Failures.** Each one stops the decision and holds. The next tick re-reads the authoritative state; no state guarantee beyond that re-read is claimed.
+     - **An append fails** (either row): hold `resume_unrecorded`; the ledger is unchanged. Each tick may write one `redecide` row that is not followed by its action, as A1 already documents for a failing release.
+     - **The DELETE fails, or its outcome is unknown:** hold `orphaned_claim_release_failed`. The claim may or may not still stand. The next resume re-judges it: still orphaned means another release attempt, and gone means the no-claim arm.
+     - **The phase write fails:** hold. The claim is already gone. If the entry is still `merging` at the same epoch, the next resume takes the no-claim arm (`server/merge_queue_resume.go:397-405`). A genuine CAS conflict means the entry left that epoch, and the next pump handles whatever is live.
+   - **Lock lapse.** The resume now logs a WARN when its merge-intent lock lapsed after the judgement ran, as merge-on-pass does (`server/merge_queue_merge.go:798-803`). The DELETE remains an exact-claim CAS.
+2. **Step 8 stays as a backstop.** `mergeOnPassReleaseOrphanedClaim` in step 8 is unchanged. It covers:
+   - **(a)** an orphan stranded on a non-`merging` entry before A2 shipped. Such a claim releases at step 8 once that entry's fold approves.
+   - **(b)** step 1's in-lock acceptance of a `merging` entry after a stale pre-lock read (ADR-093 D8 ruling R3, `server/merge_queue_merge.go:927`).
+3. **No claim survives a successful resume release.** An orphaned claim released by the resume never reaches the fold. Every ADR-112 R3 and A3 wait and yield, the pre-yield refusal, and withdraw-intent then apply to the entry unchanged, and R3's premise holds for every orphan created after A2. `mergeOnPassPreYieldRefusal` keeps ADR-109's rule unchanged ("a claimed dispatch is held, never yielded"), and no yield exception is added.
+4. **The resume's ledger writes, enumerated.** The resume never CLAIMS and never DISPATCHES a merge. Its ledger writes are exactly two:
+   - the existing `dispatch_failed` marking (`orphaned_by_restart`) on the closed and indeterminate arms;
+   - A2's release.
+
+   This narrows the #4298 approval rulings R1/R2 and the `merge-queue.md` statement that A1's release "is merge-on-pass's, not the resume's".
+
+**Transition.** A2 does not reach an orphan already stranded on a `passed` or yielded entry when it ships. Such an entry holds or stays yielded until its fold approves and step 8 releases it, or until the operator cancels the run. On 2026-10-31 the `kuhlman-labs/fishhawk` `main` merge queue had zero entries, so no such orphan exists in this deployment.
+
+**Why it is safe.** A1's argument does not depend on the fold, and A2 changes only where the release happens. The proof is A1's, with its assumptions inherited and stated:
+- **Assumption 1.** An open, unmerged PR read after the A1 age floor means the crashed dispatch applied nothing.
+- **Assumption 2.** A lapsed lock's context deadline bounds the holder's client work. It does not prove the forge stopped, so the floor is a margin, not a proof.
+
+Two properties stay separate:
+- **At-most-once merge.** The pinned PUT carries `sha`, so the forge is the compare-and-swap and the PR merges once.
+- **Authorization.** The only merge Fishhawk dispatches after a release is the ordinary pinned one, after steps 1–9 under the lock (head, base, approved fold, R4 authorization, verdict). Releasing earlier skips no approval. Queue ownership, not the claim, keeps inline `merge_run` out during the longer window in which the claim is gone.
+
+**Late-PUT residual.** A PUT from the crashed process that lands after the release is observed by the next decision's PR read. It settles `pr_merged` with no claim and no `merge_queue_merged` tail (`server/merge_queue_merge.go:139-141`, `:938`). That is safe, but its attribution is weaker than A1's in-lock `observedMerged()`.
+
+**Out of scope (pre-existing, filed as #4876).** Concurrent pumps on one live head of line can apply a stale fold yield, decided under the lock but written outside it, after another pump has claimed a dispatch. `Store.Yield` checks only liveness and the epoch, so the entry can yield with a fresh claim standing (gpt-6-astra review). A2 does not create or close this race. The fix, re-checking the entry and claim under the lock before a fold yield is applied, is tracked in #4876.
+
+**Consequences.**
+- **Schema and audit.** No schema change and no new audit category. The existing `merge_dispatch_settled` reason `released_orphaned_claim` is written from a second site.
+- **Docs.**
+  - `server/docs/merge-queue.md`:
+    - the "release is CONDITIONAL on that decision's fold approving … holds the head until it arrives" prose;
+    - the resume table row;
+    - the "SOLE added automatic ledger transition … merge-on-pass's, not the resume's" bullet.
+  - `merge_queue_resume.go` comments: lines 12-14, 106-110, 119-120, 408-416 and 432.
+  - `merge_queue_merge.go` comments: lines 273-281, 487 and 1112-1116.
+  - `merge_candidate_queue.go` comment: lines 563-564.
+  - ADR-112 needs no substantive change. A one-line cross-reference to ADR-109 A2 is optional in R3's Ledger bullet.
+- **Tests, each with a counterfactual:**
+  - **Unapproved fold.** An orphan on an unapproved fold is released at the resume. The entry then waits and yields at expiry with no claim row, and no fresh claim or PUT happens before approval.
+  - **Red checks.** An orphan with red checks yields `merge_checks_red` instead of holding.
+  - **Other expiries.** An orphan with an R3 readvance or transient expiry, or with a pending-check or review-gate expiry, yields instead of holding.
+  - **Withdraw-intent.** It succeeds on a yielded entry whose orphan the resume released.
+  - **Order.** The rows land as resumed → settled → DELETE → phase.
+  - **Failures.**
+    - Each append failure holds `resume_unrecorded` with the ledger unchanged.
+    - A failed DELETE or a CAS miss holds `orphaned_claim_release_failed`, and the next resume re-judges.
+    - A crash after the DELETE but before the phase write: the next resume takes the no-claim arm.
+    - A phase CAS conflict holds.
+  - **Exclusions, all NOT released:**
+    - a young claim, including the exact age boundary;
+    - a zero `claimed_at`, or an unreadable database clock;
+    - a stale entry or epoch, or a `settling` entry;
+    - an inline, delegated or `dispatch_failed` claim;
+    - the closed and indeterminate arms, which still mark `dispatch_failed`;
+    - a run with this process's merge in flight, which is still skipped.
+  - **Flipped test.** The aged half of `TestMergeQueueResume_YoungQueueClaimHolds`, which asserted no resume ledger write, flips.
+  - **Competing resumes.** A second resume after the release holds `entry_changed`.
+  - **Late merge.** A PR that reads merged after a resume release, with no claim, settles `pr_merged` with zero PUTs.
+  - **Step-8 backstop.** A yielded entry carrying a pre-A2 orphan, re-admitted and approved, releases at step 8.
+- **Implementation:** #4862 is re-scoped to this amendment's implementation once A2 is ratified.
+- **Record metadata:** an in-body amendment to ADR-109, with no new edge. ADR-112 A3's "after dispatch, nothing changes" is unaffected, because once the claim is released no dispatch exists.
+

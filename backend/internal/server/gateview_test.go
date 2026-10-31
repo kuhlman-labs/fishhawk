@@ -18,6 +18,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
@@ -3241,5 +3242,184 @@ func TestGateView_FanInConflict_NilAuditRepoNoGap(t *testing.T) {
 	resp := gateViewResponse{}
 	if fc := s.fanInConflictForRun(context.Background(), uuid.New(), &resp); fc != nil || resp.HistoryIncomplete || len(resp.HistoryGaps) != 0 {
 		t.Errorf("nil AuditRepo = (%+v, %v, %v), want (nil, false, none)", fc, resp.HistoryIncomplete, resp.HistoryGaps)
+	}
+}
+
+// TestGateView_NeverJudgedConcernReadsUnlabelled (E94.2 / #4693, ADR-117 D1):
+// the fake rows leave Judgement at its empty zero value, so only the read
+// normalization turns it into unlabelled — on open AND settled rows, under the
+// wire key the MCP client decodes.
+func TestGateView_NeverJudgedConcernReadsUnlabelled(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 10, "high", "correctness", "open, never judged", "")
+	settled := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindImplement, "m", 11, "medium", "scope", "settled, never judged", "")
+	settled.State = concern.StateWaived
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	if len(resp.Open) != 1 || len(resp.Settled) != 1 {
+		t.Fatalf("open=%d settled=%d, want 1 each", len(resp.Open), len(resp.Settled))
+	}
+	if got := resp.Open[0].Judgement; got != string(concern.JudgementUnlabelled) {
+		t.Errorf("open judgement = %q, want unlabelled", got)
+	}
+	if got := resp.Settled[0].Judgement; got != string(concern.JudgementUnlabelled) {
+		t.Errorf("settled judgement = %q, want unlabelled", got)
+	}
+	body := getGateView(t, s, runID, "").Body.String()
+	if n := strings.Count(body, `"judgement":"unlabelled"`); n != 2 {
+		t.Errorf(`body carries "judgement":"unlabelled" %d times, want 2 (open + settled)`+"\nbody: %s", n, body)
+	}
+	for _, absent := range []string{`"outcome"`, `"duplicate_of"`, `"judgement_inherited_from"`, `"tradeoff_cost"`, `"judgement_actor_kind"`} {
+		if strings.Contains(body, absent) {
+			t.Errorf("body carries %s for a row with none recorded, want it omitted\nbody: %s", absent, body)
+		}
+	}
+}
+
+// TestGateView_OutcomeAndJudgement pins the outcome and judgement keys on open
+// and settled rows, duplicate inheritance (outcome duplicate_of:<target>, the
+// root's judgement, judgement_inherited_from) and that a duplicate whose root
+// is a PLAN concern still inherits under stage_kind=implement — judgements
+// resolve over the full ledger before the filter.
+func TestGateView_OutcomeAndJudgement(t *testing.T) {
+	s, repo, _, cr := gateViewServer(t)
+	runID := seedGateRun(t, repo)
+	stageID := uuid.New()
+	fixed := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 10, "high", "correctness", "confirmed", "")
+	fixed.State, fixed.Outcome = concern.StateAddressed, concern.OutcomeFixed
+	carried := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 11, "high", "correctness", "carried", "")
+	carried.Outcome = concern.OutcomeCarried
+	root := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 12, "high", "correctness", "root", "")
+	root.State, root.Judgement, root.JudgementActorKind, root.TradeoffCost = concern.StateWaived, concern.JudgementDefect, "user", "c"
+	dup := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 13, "high", "correctness", "duplicate", "")
+	dup.Judgement, dup.DuplicateOf = concern.JudgementNoDefect, &root.ID
+	planRoot := seedGateConcern(t, cr, runID, uuid.New(), concern.StageKindPlan, "m", 5, "high", "scope", "plan root", "")
+	planRoot.State, planRoot.Judgement = concern.StateWaived, concern.JudgementStale
+	crossKind := seedGateConcern(t, cr, runID, stageID, concern.StageKindImplement, "m", 14, "high", "scope", "dup of a plan concern", "")
+	crossKind.Judgement, crossKind.DuplicateOf = concern.JudgementNoDefect, &planRoot.ID
+
+	resp := decodeGateView(t, getGateView(t, s, runID, ""))
+	open := map[uuid.UUID]gateViewConcern{}
+	for _, c := range resp.Open {
+		open[c.ID] = c
+	}
+	settled := map[uuid.UUID]gateViewSettledConcern{}
+	for _, c := range resp.Settled {
+		settled[c.ID] = c
+	}
+	if got := settled[fixed.ID]; got.Outcome != "fixed" || got.Judgement != "unlabelled" {
+		t.Errorf("confirmed row outcome/judgement = %q/%q, want fixed/unlabelled", got.Outcome, got.Judgement)
+	}
+	if got := open[carried.ID]; got.Outcome != "carried" {
+		t.Errorf("carried open row outcome = %q, want carried", got.Outcome)
+	}
+	if got := settled[root.ID]; got.Judgement != "defect" || got.JudgementActorKind != "user" || got.TradeoffCost != "c" || got.JudgementInheritedFrom != nil || got.Outcome != "" {
+		t.Errorf("root = judgement %q actor %q cost %q inherited %v outcome %q, want defect user c nil ''",
+			got.Judgement, got.JudgementActorKind, got.TradeoffCost, got.JudgementInheritedFrom, got.Outcome)
+	}
+	d := open[dup.ID]
+	if d.Judgement != "defect" {
+		t.Errorf("duplicate judgement = %q, want defect (its root's — it stores no_defect)", d.Judgement)
+	}
+	if d.Outcome != concern.DuplicateOutcomePrefix+root.ID.String() {
+		t.Errorf("duplicate outcome = %q, want duplicate_of:%s", d.Outcome, root.ID)
+	}
+	if d.JudgementInheritedFrom == nil || *d.JudgementInheritedFrom != root.ID || d.DuplicateOf == nil || *d.DuplicateOf != root.ID {
+		t.Errorf("duplicate inherited_from/duplicate_of = %v/%v, want %s/%s", d.JudgementInheritedFrom, d.DuplicateOf, root.ID, root.ID)
+	}
+
+	filtered := decodeGateView(t, getGateView(t, s, runID, "stage_kind=implement"))
+	var cross *gateViewConcern
+	for i := range filtered.Open {
+		if filtered.Open[i].ID == crossKind.ID {
+			cross = &filtered.Open[i]
+		}
+		if filtered.Open[i].ID == planRoot.ID {
+			t.Errorf("the plan root is listed under stage_kind=implement")
+		}
+	}
+	if cross == nil {
+		t.Fatal("cross-kind duplicate missing from the implement view")
+	}
+	if cross.Judgement != "stale" || cross.JudgementInheritedFrom == nil || *cross.JudgementInheritedFrom != planRoot.ID {
+		t.Errorf("cross-kind duplicate = judgement %q inherited %v, want stale from %s (resolved before the stage_kind filter)",
+			cross.Judgement, cross.JudgementInheritedFrom, planRoot.ID)
+	}
+}
+
+// TestGateView_JudgementRoundTripPostgres crosses the whole seam against REAL
+// Postgres: migration 0114 -> the hand-edited sqlc Scan lists -> rowToConcern
+// -> ResolveJudgements -> the gate-view JSON. A confirmed row closed through
+// the REAL store's ApplyDisposition reads fixed + unlabelled; a duplicate
+// (its duplicate_of and its root's judgement set raw — no Phase-1 verb writes
+// them) inherits the root's defect; an untouched row reads unlabelled.
+func TestGateView_JudgementRoundTripPostgres(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runs := run.NewPostgresRepository(pool)
+	concerns := concern.NewPostgresRepository(pool)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: runs, AuditRepo: newAuditFake(), ConcernRepo: concerns})
+
+	rn, err := runs.CreateRun(ctx, run.CreateRunParams{
+		Repo: "acme-widgets/storefront", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: run.TriggerCLI,
+	})
+	if err != nil {
+		t.Fatalf("create run: %v", err)
+	}
+	st, err := runs.CreateStage(ctx, run.CreateStageParams{
+		RunID: rn.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+	})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	rows, err := concerns.InsertRaised(ctx, concern.InsertRaisedParams{
+		RunID: rn.ID, StageID: st.ID, StageKind: concern.StageKindImplement, ReviewerModel: "gpt-6-astra", OriginReviewSequence: 4,
+		Concerns: []concern.RaisedConcern{
+			{Severity: "high", Category: "correctness", Note: "confirmed"},
+			{Severity: "high", Category: "correctness", Note: "root"},
+			{Severity: "medium", Category: "correctness", Note: "duplicate"},
+		},
+	})
+	if err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+	confirmed, root, dup := rows[0], rows[1], rows[2]
+	if err := concerns.MarkAddressedPending(ctx, []uuid.UUID{confirmed.ID}, "routed"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	if _, err := concerns.ApplyDisposition(ctx, confirmed.ID, concern.StateAddressed, "confirmed", concern.Disposition{Outcome: concern.OutcomeFixed}); err != nil {
+		t.Fatalf("ApplyDisposition: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE review_concerns SET judgement = 'defect' WHERE id = $1`, root.ID); err != nil {
+		t.Fatalf("raw-set root judgement: %v", err)
+	}
+	if _, err := pool.Exec(ctx, `UPDATE review_concerns SET judgement = 'no_defect', duplicate_of = $2 WHERE id = $1`, dup.ID, root.ID); err != nil {
+		t.Fatalf("raw-set duplicate_of: %v", err)
+	}
+
+	w := getGateView(t, s, rn.ID, "")
+	resp := decodeGateView(t, w)
+	byID := map[uuid.UUID]concernJudgementView{}
+	for _, c := range resp.Open {
+		byID[c.ID] = c.concernJudgementView
+	}
+	for _, c := range resp.Settled {
+		byID[c.ID] = c.concernJudgementView
+	}
+	if got := byID[confirmed.ID]; got.Outcome != "fixed" || got.Judgement != "unlabelled" {
+		t.Errorf("confirmed row = outcome %q judgement %q, want fixed / unlabelled", got.Outcome, got.Judgement)
+	}
+	if got := byID[root.ID]; got.Judgement != "defect" || got.Outcome != "" {
+		t.Errorf("root row = outcome %q judgement %q, want '' / defect", got.Outcome, got.Judgement)
+	}
+	if got := byID[dup.ID]; got.Judgement != "defect" || got.Outcome != "duplicate_of:"+root.ID.String() ||
+		got.JudgementInheritedFrom == nil || *got.JudgementInheritedFrom != root.ID {
+		t.Errorf("duplicate row = outcome %q judgement %q inherited %v, want duplicate_of:%s / defect / %s",
+			got.Outcome, got.Judgement, got.JudgementInheritedFrom, root.ID, root.ID)
+	}
+	body := w.Body.String()
+	if !strings.Contains(body, `"duplicate_of":"`+root.ID.String()+`"`) || !strings.Contains(body, `"outcome":"fixed"`) {
+		t.Errorf("body missing the duplicate_of / outcome wire keys\nbody: %s", body)
 	}
 }

@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -13,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -808,7 +811,9 @@ func TestMergeQueueEligibility_NilSnapshotOptionalRedHoldsAtAdmission(t *testing
 }
 
 // TestMergeQueueEligibility_MergeVariantRequiresGreen pins the merge variant's
-// leg (c): pending and zero check runs hold it like the entry variant.
+// leg (c): pending and zero check runs are not green. Zero runs is the
+// determined checks_not_green on this variant (docs/adr/112 A3.1(b)), never
+// undeterminable.
 func TestMergeQueueEligibility_MergeVariantRequiresGreen(t *testing.T) {
 	ctx := context.Background()
 	f := newMCQFixture(t)
@@ -821,7 +826,195 @@ func TestMergeQueueEligibility_MergeVariantRequiresGreen(t *testing.T) {
 	requireReasons(t, f.srv.mergeQueueMergeEligibility(ctx, row, "h0", mergeQueueIntentAnchor{}), mergeQueueReasonChecksNotGreen)
 	f.gh.set(func() { f.gh.checks["h0"] = `[]` })
 	got := f.srv.mergeQueueMergeEligibility(ctx, row, "h0", mergeQueueIntentAnchor{})
-	if !got.Undeterminable {
-		t.Fatalf("zero check runs: got %+v, want undeterminable", got)
+	requireReasons(t, got, mergeQueueReasonChecksNotGreen)
+	if got.Undeterminable {
+		t.Fatalf("zero check runs: got %+v, want determined checks_not_green", got)
+	}
+}
+
+// docs/adr/112 A3.1 (#4780): leg (c) is the PR-head merge-gate leg, judged by
+// mergeoutcome.ClassifyMergeGateCI on every variant.
+
+// mqeTruncatedChecksClient is base re-pointed at a server whose check-runs
+// listing reports more runs than it serves, so ListCheckRunsForRef answers
+// truncated.
+func mqeTruncatedChecksClient(t *testing.T, base *githubclient.Client) *githubclient.Client {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasSuffix(r.URL.Path, "/check-runs") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"total_count":500,"check_runs":%s}`, mcqGreenChecks)
+	}))
+	t.Cleanup(srv.Close)
+	c := *base
+	c.BaseURL, c.ResolveBaseURL = srv.URL, nil
+	return &c
+}
+
+// mqeChecks builds a check_runs JSON array of `name` attempts, each
+// "id:suite:status[:conclusion]".
+func mqeChecks(name string, attempts ...string) string {
+	var out []string
+	for _, a := range attempts {
+		p := strings.Split(a, ":")
+		rr := `{"id":` + p[0] + `,"name":"` + name + `","status":"` + p[2] + `","started_at":"2026-01-01T00:00:00Z","check_suite":{"id":` + p[1] + `}`
+		if len(p) > 3 {
+			rr += `,"conclusion":"` + p[3] + `","completed_at":"2026-01-01T00:01:00Z"`
+		}
+		out = append(out, rr+`}`)
+	}
+	return "[" + strings.Join(out, ",") + "]"
+}
+
+// TestMergeQueueChecksLeg_A31 pins leg (c) per variant (docs/adr/112 A3.1,
+// A3.2 "Bound", A3.3 "Unchanged"). The MERGE variant answers every
+// checks-read failure and zero runs as the determined checks_not_green (never
+// undeterminable, never eligible); the ENTRY variant keeps them
+// undeterminable and refuses a completed-cancelled latest attempt as
+// checks_red; the ADMISSION variant passes empty and pending listings,
+// refuses a cancelled latest attempt as checks_red, and keeps a read failure
+// undeterminable.
+func TestMergeQueueChecksLeg_A31(t *testing.T) {
+	ctx := context.Background()
+	const snapCI = `UPDATE runs SET required_checks_snapshot = '{"contexts":["ci"]}' WHERE id = $1`
+	listing500 := func(f *mcqFixture) { f.gh.set(func() { f.gh.checksStatus["h0"] = http.StatusInternalServerError }) }
+	empty := func(f *mcqFixture) { f.gh.set(func() { f.gh.checks["h0"] = `[]` }) }
+	cancelledLatest := func(f *mcqFixture) {
+		f.gh.set(func() { f.gh.checks["h0"] = mqeChecks("ci", "10:1:completed:success", "11:1:completed:cancelled") })
+	}
+	newerPending := func(f *mcqFixture) {
+		f.gh.set(func() { f.gh.checks["h0"] = mqeChecks("ci", "10:1:completed:success", "11:1:in_progress") })
+	}
+	cases := []struct {
+		name     string
+		variant  mergeQueueEligibilityVariant
+		snapshot bool // a required-checks snapshot naming ci
+		setup    func(f *mcqFixture)
+		want     []string
+		undet    bool
+		detail   string
+	}{
+		{name: "merge: check-runs 500 is checks_not_green", variant: mergeQueueVariantMerge, setup: listing500,
+			want: []string{mergeQueueReasonChecksNotGreen}, detail: "required checks could not be read at h0"},
+		{name: "merge: truncated listing is checks_not_green", variant: mergeQueueVariantMerge,
+			setup: func(f *mcqFixture) { f.srv.cfg.GitHub = mqeTruncatedChecksClient(f.t, f.srv.cfg.GitHub) },
+			want:  []string{mergeQueueReasonChecksNotGreen}, detail: "truncated"},
+		{name: "merge: empty listing is checks_not_green", variant: mergeQueueVariantMerge, setup: empty,
+			want: []string{mergeQueueReasonChecksNotGreen}, detail: "no check runs are reported at h0"},
+		{name: "merge: no GitHub client is checks_not_green", variant: mergeQueueVariantMerge,
+			setup: func(f *mcqFixture) { f.srv.cfg.GitHub = nil },
+			want:  []string{mergeQueueReasonChecksNotGreen}, detail: "no GitHub client is wired"},
+		{name: "merge: newer in_progress attempt is checks_not_green", variant: mergeQueueVariantMerge, snapshot: true, setup: newerPending,
+			want: []string{mergeQueueReasonChecksNotGreen}, detail: "required_check_pending"},
+		{name: "merge: cancelled latest attempt is checks_red", variant: mergeQueueVariantMerge, snapshot: true, setup: cancelledLatest,
+			want: []string{mergeQueueReasonChecksRed}, detail: "cancelled"},
+		{name: "merge: green", variant: mergeQueueVariantMerge, snapshot: true},
+		{name: "entry: check-runs 500 is undeterminable", variant: mergeQueueVariantEntry, setup: listing500,
+			want: []string{mergeQueueReasonUndeterminable}, undet: true, detail: "required checks: "},
+		{name: "entry: empty listing is undeterminable", variant: mergeQueueVariantEntry, setup: empty,
+			want: []string{mergeQueueReasonUndeterminable}, undet: true, detail: "no check runs are reported"},
+		{name: "entry: cancelled latest attempt is checks_red", variant: mergeQueueVariantEntry, snapshot: true, setup: cancelledLatest,
+			want: []string{mergeQueueReasonChecksRed}},
+		{name: "entry: newer in_progress attempt is checks_not_green", variant: mergeQueueVariantEntry, snapshot: true, setup: newerPending,
+			want: []string{mergeQueueReasonChecksNotGreen}},
+		{name: "admission: empty listing passes", variant: mergeQueueVariantAdmission, snapshot: true, setup: empty},
+		{name: "admission: pending passes", variant: mergeQueueVariantAdmission, snapshot: true, setup: newerPending},
+		{name: "admission: cancelled latest attempt is checks_red", variant: mergeQueueVariantAdmission, snapshot: true, setup: cancelledLatest,
+			want: []string{mergeQueueReasonChecksRed}},
+		{name: "admission: check-runs 500 stays undeterminable", variant: mergeQueueVariantAdmission, setup: listing500,
+			want: []string{mergeQueueReasonUndeterminable}, undet: true},
+		{name: "nil snapshot cancelled: merge is checks_not_green", variant: mergeQueueVariantMerge, setup: cancelledLatest,
+			want: []string{mergeQueueReasonChecksNotGreen}, detail: "no required-checks snapshot"},
+		{name: "nil snapshot cancelled: admission passes", variant: mergeQueueVariantAdmission, setup: cancelledLatest},
+		{name: "nil snapshot cancelled: entry is checks_red", variant: mergeQueueVariantEntry, setup: cancelledLatest,
+			want: []string{mergeQueueReasonChecksRed}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newMCQFixture(t)
+			r := f.seed("a31", "h0", []byte(mcvUndelegatedSpecYAML))
+			if tc.snapshot {
+				f.exec(snapCI, r.id)
+			}
+			if tc.setup != nil {
+				tc.setup(f)
+			}
+			row := f.runRow(r)
+			var got mergeQueueEligibilityResult
+			switch tc.variant {
+			case mergeQueueVariantMerge:
+				got = f.srv.mergeQueueMergeEligibility(ctx, row, "h0", mergeQueueIntentAnchor{})
+			case mergeQueueVariantEntry:
+				got = f.srv.mergeQueueEligibility(ctx, row, "h0")
+			default:
+				got = f.srv.mergeQueueAdmissionEligibility(ctx, row, "h0")
+			}
+			requireReasons(t, got, tc.want...)
+			if got.Undeterminable != tc.undet {
+				t.Fatalf("undeterminable = %v, want %v (%+v)", got.Undeterminable, tc.undet, got.Reasons)
+			}
+			if tc.detail != "" && !strings.Contains(got.Reasons[0].Detail, tc.detail) {
+				t.Fatalf("detail = %q, want it to contain %q", got.Reasons[0].Detail, tc.detail)
+			}
+		})
+	}
+
+	// The merge variant's remaining read failures (no head, an unparseable
+	// repo) answer checks_not_green with no error; the entry variant errors.
+	t.Run("merge: no head and malformed repo are checks_not_green", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r := f.seed("a31r", "h0", []byte(mcvUndelegatedSpecYAML))
+		row := f.runRow(r)
+		for name, call := range map[string]func() (string, string, error){
+			"no head": func() (string, string, error) { return f.srv.mergeQueueChecksLeg(ctx, row, "", mergeQueueVariantMerge) },
+			"malformed repo": func() (string, string, error) {
+				bad := *row
+				bad.Repo = "not-a-repo"
+				return f.srv.mergeQueueChecksLeg(ctx, &bad, "h0", mergeQueueVariantMerge)
+			},
+		} {
+			code, detail, err := call()
+			if err != nil || code != mergeQueueReasonChecksNotGreen || !strings.Contains(detail, "could not be read") {
+				t.Fatalf("%s: code=%q detail=%q err=%v, want checks_not_green naming the read failure", name, code, detail, err)
+			}
+		}
+	})
+}
+
+// TestMergeGateLegsOf pins the ONE mapping of reason codes onto A3.1's
+// merge-gate legs (docs/adr/112 A3.1), over every reason code.
+func TestMergeGateLegsOf(t *testing.T) {
+	cases := map[string]mergeGateLegs{
+		mergeQueueReasonChecksRed:                {Red: true},
+		mergeQueueReasonChecksNotGreen:           {Pending: true},
+		mergeQueueReasonReviewPending:            {Review: true},
+		mergeQueueReasonReviewCoverageIncomplete: {Review: true},
+		mergeQueueReasonForgeApprovalVetoed:      {Veto: true},
+		mergeQueueReasonUndeterminable:           {Undeterminable: true},
+		mergeQueueReasonNotApproved:              {Other: true},
+		mergeQueueReasonChangesRequested:         {Other: true},
+		mergeQueueReasonAcceptanceNotEligible:    {Other: true},
+		mergeQueueReasonAcceptanceStale:          {Other: true},
+		mergeQueueReasonBlockingConcernOpen:      {Other: true},
+	}
+	for code, want := range cases {
+		got := mergeGateLegsOf(mergeQueueEligibilityResult{Reasons: []mergeQueueIneligibility{{Code: code}}})
+		if got != want {
+			t.Errorf("%s: legs = %+v, want %+v", code, got, want)
+		}
+	}
+	if got := mergeGateLegsOf(mergeQueueEligibilityResult{Eligible: true}); got != (mergeGateLegs{}) {
+		t.Fatalf("eligible: legs = %+v, want none", got)
+	}
+	// Combined: every leg read, and the result's own Undeterminable carried.
+	got := mergeGateLegsOf(mergeQueueEligibilityResult{Undeterminable: true, Reasons: []mergeQueueIneligibility{
+		{Code: mergeQueueReasonChecksRed}, {Code: mergeQueueReasonReviewPending}, {Code: mergeQueueReasonBlockingConcernOpen},
+		{Code: mergeQueueReasonForgeApprovalVetoed},
+	}})
+	if want := (mergeGateLegs{Red: true, Review: true, Other: true, Veto: true, Undeterminable: true}); got != want {
+		t.Fatalf("combined: legs = %+v, want %+v", got, want)
 	}
 }

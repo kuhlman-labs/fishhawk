@@ -56,14 +56,19 @@ type PostgresStore struct {
 	// afterPromotePosition is a test hook, nil in production: it runs inside
 	// Promote after the old-position read and before the guarded write.
 	afterPromotePosition func(ctx context.Context)
+	// afterWithdrawPeek is a test hook, nil in production: it runs inside
+	// WithdrawIntent after the unlocked active-entry peek and before the
+	// base lock.
+	afterWithdrawPeek func(ctx context.Context)
 }
 
 var (
-	_ Store          = (*PostgresStore)(nil)
-	_ Promoter       = (*PostgresStore)(nil)
-	_ EjectionReader = (*PostgresStore)(nil)
-	_ ReentryReader  = (*PostgresStore)(nil)
-	_ Resumer        = (*PostgresStore)(nil)
+	_ Store            = (*PostgresStore)(nil)
+	_ Promoter         = (*PostgresStore)(nil)
+	_ IntentWithdrawer = (*PostgresStore)(nil)
+	_ EjectionReader   = (*PostgresStore)(nil)
+	_ ReentryReader    = (*PostgresStore)(nil)
+	_ Resumer          = (*PostgresStore)(nil)
 )
 
 // NewPostgresStore returns the Postgres queue store.
@@ -80,7 +85,9 @@ const entryCols = `e.id, e.run_id, COALESCE(r.account_id::text, ''), e.repo, e.b
   e.merge_intent_at, COALESCE(e.merge_intent_sequence, 0), e.admission_epoch,
   COALESCE(e.yield_reason, ''), COALESCE(e.yield_detail, ''), e.yielded_at, e.approval_wait_started_at,
   COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.yielded_at) * 1000000)::bigint), 0),
-  e.order_key, COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.settled_at) * 1000000)::bigint), 0)`
+  e.order_key, COALESCE(GREATEST(0, (EXTRACT(EPOCH FROM clock_timestamp() - e.settled_at) * 1000000)::bigint), 0),
+  e.yield_revision, e.row4_flag, e.approval_wait_open, e.gate_wait_started_at, e.gate_wait_epoch,
+  e.gate_hold_tokens, e.gate_tokens_refilled_at`
 
 // effectiveKeySQL is an entry's queue-order key on alias e: the promote's
 // order_key when set (0111), else enqueued_at. Every row without a promotion
@@ -104,7 +111,9 @@ func scanEntry(row pgx.Row, extra ...any) (Entry, error) {
 		&e.AnchoredBaseSHA, &e.AnchoredAt, &e.AdmittedAt, &e.SettledAt, &e.UpdatedAt,
 		&e.MergeIntentAt, &e.MergeIntentSequence, &e.AdmissionEpoch,
 		&e.YieldReason, &e.YieldDetail, &e.YieldedAt, &e.ApprovalWaitStartedAt, &yieldAgeUS,
-		&e.OrderKey, &settledAgeUS}, extra...)
+		&e.OrderKey, &settledAgeUS,
+		&e.YieldRevision, &e.Row4Flag, &e.ApprovalWaitOpen, &e.GateWaitStartedAt, &e.GateWaitEpoch,
+		&e.GateHoldTokens, &e.GateTokensRefilledAt}, extra...)
 	if err := row.Scan(dest...); err != nil {
 		return Entry{}, err
 	}
@@ -260,22 +269,25 @@ WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &peek
 // enqueued_at (the FIFO key),
 // anchored_at, (with MergeIntent) merge_intent_at and (with Yield) yielded_at
 // are one database-clock instant, and merge_intent_sequence and the yield
-// reason and detail are stamped in the same statement.
+// reason and detail are stamped in the same statement. A marked insert is a
+// marker write: its yield_revision is 1 and its row4_flag the marker's Row4.
 func insertTx(ctx context.Context, tx pgx.Tx, req EnqueueRequest, repo string) (Entry, error) {
 	var id uuid.UUID
 	var yieldReason, yieldDetail string
+	var row4 bool
 	if req.Yield != nil {
-		yieldReason, yieldDetail = req.Yield.Reason, req.Yield.Detail
+		yieldReason, yieldDetail, row4 = req.Yield.Reason, req.Yield.Detail, req.Yield.Row4
 	}
 	if err := tx.QueryRow(ctx, `INSERT INTO merge_candidate_queue_entries
   (run_id, repo, base_ref, state, enqueued_at, anchored_head_sha, anchored_base_sha, anchored_at, merge_intent_at, merge_intent_sequence,
-   yield_reason, yield_detail, yielded_at)
+   yield_reason, yield_detail, yielded_at, yield_revision, row4_flag)
 SELECT $1, $2, $3, 'held', c.ts, $4, NULLIF($5, ''), c.ts, CASE WHEN $6::bool THEN c.ts END,
   CASE WHEN $6::bool THEN NULLIF($7::bigint, 0) END,
-  NULLIF($8::text, ''), CASE WHEN $8::text <> '' THEN NULLIF($9::text, '') END, CASE WHEN $8::text <> '' THEN c.ts END
+  NULLIF($8::text, ''), CASE WHEN $8::text <> '' THEN NULLIF($9::text, '') END, CASE WHEN $8::text <> '' THEN c.ts END,
+  CASE WHEN $8::text <> '' THEN 1 ELSE 0 END, $8::text <> '' AND $10::bool
 FROM (SELECT clock_timestamp() AS ts) c
 RETURNING id`, req.RunID, repo, req.BaseRef, req.HeadSHA, req.BaseSHA, req.MergeIntent, req.IntentSequence,
-		yieldReason, yieldDetail).Scan(&id); err != nil {
+		yieldReason, yieldDetail, row4).Scan(&id); err != nil {
 		return Entry{}, fmt.Errorf("mergequeue: insert entry: %w", err)
 	}
 	return getEntryTx(ctx, tx, id)
@@ -299,15 +311,17 @@ WHERE id = $1`, cur.ID, headSHA, baseSHA); err != nil {
 // markYieldTx stamps a HELD entry's yield marker: reason and detail are the
 // request's, and yielded_at keeps an existing value (COALESCE), so a re-marked
 // entry stays in the same yield episode and its approval-wait anchor is kept;
-// an unmarked entry continues m.Continue's cleared episode when its anchor
-// matches (yieldContinueSQL), else stamps the database clock. The caller
+// an unmarked entry continues m.Continue's cleared episode when its base ref
+// matches (yieldContinueSQL), else stamps the database clock. It is a marker
+// write: yield_revision is bumped and row4_flag ORs m.Row4. The caller
 // guarantees the entry is held (a live row is never marked; the 0109 CHECK
 // refuses one).
 func markYieldTx(ctx context.Context, tx pgx.Tx, cur Entry, m YieldMarker) (Entry, error) {
-	contAt, contHead, contBase := m.continueArgs()
+	contAt, contBase := m.continueArgs()
 	if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
-SET yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(yielded_at, `+yieldContinueSQL+`, clock_timestamp())
-WHERE id = $1`, cur.ID, m.Reason, m.Detail, contAt, contHead, contBase); err != nil {
+SET yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(yielded_at, `+yieldContinueSQL+`, clock_timestamp()),
+    yield_revision = yield_revision + 1, row4_flag = row4_flag OR $6::bool
+WHERE id = $1`, cur.ID, m.Reason, m.Detail, contAt, contBase, m.Row4); err != nil {
 		return Entry{}, fmt.Errorf("mergequeue: mark yield: %w", err)
 	}
 	return getEntryTx(ctx, tx, cur.ID)
@@ -720,8 +734,11 @@ func (s *PostgresStore) MarkMergeIntent(ctx context.Context, entryID uuid.UUID, 
 // ApprovalWait starts or continues the head-of-line approval wait of a LIVE
 // entry (ADR-112 R3): a compare-and-swap on the admission epoch that stamps
 // approval_wait_started_at once per yield episode (COALESCE: a readvance, a
-// re-admission and a stale re-claim never reset it) and judges window's
-// expiry against it on the database clock, in one transaction. A held or
+// re-admission, a stale re-claim and, docs/adr/112 A3.7, a ClearYield never
+// reset it, so a later approval-fold block in the same episode gets no fresh
+// window and judges EXPIRED at once), marks the wait open
+// (approval_wait_open) and judges window's expiry against the anchor on the
+// database clock, in one transaction. A held or
 // terminal entry, or one re-admitted since epoch, is ErrStateConflict and is
 // not touched; window <= 0 is ErrInvalidRequest. See README.md § "Yield".
 func (s *PostgresStore) ApprovalWait(ctx context.Context, entryID uuid.UUID, epoch int64, window time.Duration) (ApprovalWaitResult, error) {
@@ -734,7 +751,7 @@ func (s *PostgresStore) ApprovalWait(ctx context.Context, entryID uuid.UUID, epo
 			return epochConflict(cur, epoch)
 		}
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
-SET approval_wait_started_at = COALESCE(approval_wait_started_at, clock_timestamp())
+SET approval_wait_started_at = COALESCE(approval_wait_started_at, clock_timestamp()), approval_wait_open = true
 WHERE id = $1`, cur.ID); err != nil {
 			return fmt.Errorf("mergequeue: start approval wait: %w", err)
 		}
@@ -757,13 +774,111 @@ FROM merge_candidate_queue_entries WHERE id = $1`, cur.ID, window.Microseconds()
 	return out, nil
 }
 
+// gateRefillSQL is the hold budget's refill period in seconds, built from the
+// Go constant (an integer, never input).
+var gateRefillSQL = fmt.Sprintf("%d", int64(GateHoldRefill/time.Second))
+
+// gateOpenSQL opens an admission epoch's merge-gate window ($1 entry, $2
+// epoch, $3 window in microseconds) in ONE statement on the database clock
+// (docs/adr/112 A3.2/A3.7, approval condition "GateWait refill"):
+//
+//   - charge: the previous window's hold, bounded by the window, is charged
+//     to the refill clock (clock = gate_tokens_refilled_at + LEAST(window,
+//     now - gate_wait_started_at)), so the time a row spends holding never
+//     refills it; clock never passes now (the previous spend stamped
+//     gate_tokens_refilled_at <= gate_wait_started_at);
+//   - refill: k = floor((now - clock) / GateHoldRefill), CLAMPED to [0,
+//     GateHoldBudget] (a refill clock in the future accrues nothing; no
+//     negative remainder is carried); available = LEAST(budget, tokens + k);
+//   - spend: with available > 0, one token is spent, the window stamped
+//     (gate_wait_started_at = now, gate_wait_epoch = $2) in the same
+//     statement, and gate_tokens_refilled_at moves to now when the bucket was
+//     full or capped, the clock was NULL or in the future, else to clock +
+//     k * refill (the remainder kept), never past now. With available = 0
+//     NOTHING is written and no row is returned.
+var gateOpenSQL = `WITH c AS (SELECT clock_timestamp() AS now),
+a AS (
+  SELECT e.gate_hold_tokens::bigint AS tokens, c.now,
+    CASE WHEN e.gate_tokens_refilled_at IS NOT NULL AND e.gate_wait_started_at IS NOT NULL
+      THEN e.gate_tokens_refilled_at + LEAST($3::bigint * interval '1 microsecond', GREATEST(interval '0', c.now - e.gate_wait_started_at))
+      ELSE e.gate_tokens_refilled_at END AS clock
+  FROM merge_candidate_queue_entries e, c WHERE e.id = $1),
+r AS (
+  SELECT a.*, CASE WHEN a.clock IS NULL THEN 0
+    ELSE floor(EXTRACT(EPOCH FROM a.now - a.clock) / ` + gateRefillSQL + `)::bigint END AS kraw
+  FROM a),
+k AS (
+  SELECT r.*, GREATEST(0, LEAST(` + fmt.Sprint(GateHoldBudget) + `, r.kraw)) AS k FROM r)
+UPDATE merge_candidate_queue_entries e SET
+  gate_hold_tokens = LEAST(` + fmt.Sprint(GateHoldBudget) + `, k.tokens + k.k) - 1,
+  gate_wait_started_at = k.now, gate_wait_epoch = $2,
+  gate_tokens_refilled_at = CASE
+    WHEN k.clock IS NULL OR k.clock > k.now OR k.tokens + k.kraw >= ` + fmt.Sprint(GateHoldBudget) + ` THEN k.now
+    ELSE k.clock + k.k * interval '` + gateRefillSQL + ` seconds' END
+FROM k
+WHERE e.id = $1 AND LEAST(` + fmt.Sprint(GateHoldBudget) + `, k.tokens + k.k) > 0
+RETURNING e.id`
+
+// GateWait opens or continues the merge-gate window of a LIVE entry at epoch
+// (docs/adr/112 A3.2/A3.7), a compare-and-swap on state live and the
+// admission epoch, in one transaction on the database clock only. When
+// gate_wait_epoch already equals epoch the window CONTINUES (no spend: a (b)
+// hold then a (c) hold in one epoch spends one token) and expiry is judged
+// against gate_wait_started_at. Otherwise the epoch opens a FRESH window:
+// the refill accrues lazily and one hold token is spent atomically with the
+// stamp (gateOpenSQL); an empty budget answers NoToken and writes nothing.
+// It never reads or writes approval_wait_started_at or approval_wait_open. A
+// held or terminal entry, or one re-admitted since epoch, is ErrStateConflict
+// and is not touched; window <= 0 is ErrInvalidRequest. See README.md §
+// "Yield".
+func (s *PostgresStore) GateWait(ctx context.Context, entryID uuid.UUID, epoch int64, window time.Duration) (GateWaitResult, error) {
+	if window <= 0 {
+		return GateWaitResult{}, fmt.Errorf("%w: merge-gate wait window %s, want a positive duration", ErrInvalidRequest, window)
+	}
+	var out GateWaitResult
+	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
+		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // GateWait admission-epoch CAS
+			return epochConflict(cur, epoch)
+		}
+		if cur.GateWaitEpoch == nil || *cur.GateWaitEpoch != epoch { // GateWait once-per-epoch window
+			var id uuid.UUID
+			err := tx.QueryRow(ctx, gateOpenSQL, cur.ID, epoch, window.Microseconds()).Scan(&id)
+			if errors.Is(err, pgx.ErrNoRows) { // GateWait empty budget: nothing written
+				out = GateWaitResult{Entry: cur, NoToken: true}
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("mergequeue: open merge-gate window: %w", err)
+			}
+			out.Opened = true
+		}
+		e, err := getEntryTx(ctx, tx, cur.ID)
+		if err != nil {
+			return err
+		}
+		var remainingUS int64
+		if err := tx.QueryRow(ctx, `SELECT GREATEST(0, (EXTRACT(EPOCH FROM
+  (gate_wait_started_at + $2::bigint * interval '1 microsecond') - clock_timestamp()) * 1000000)::bigint)
+FROM merge_candidate_queue_entries WHERE id = $1`, cur.ID, window.Microseconds()).Scan(&remainingUS); err != nil {
+			return fmt.Errorf("mergequeue: judge merge-gate window: %w", err)
+		}
+		out.Entry, out.Expired, out.Remaining = e, remainingUS == 0, time.Duration(remainingUS)*time.Microsecond
+		return nil
+	})
+	if err != nil {
+		return GateWaitResult{}, err
+	}
+	return out, nil
+}
+
 // Yield moves a LIVE entry at epoch to held and marks it yielded, in ONE
 // statement (ADR-112 R3): state held, phase and admitted_at cleared,
 // enqueued_at and order_key kept (a cleared row rejoins at its original
 // effective key),
 // yield_reason, yield_detail and yielded_at (database clock, or the
-// marker's continued episode when the anchor matches it: yieldContinueSQL)
-// stamped, and approval_wait_started_at kept. It is a compare-and-swap on the
+// marker's continued episode when the base ref matches it: yieldContinueSQL)
+// stamped, yield_revision bumped, row4_flag ORed with marker.Row4, and
+// approval_wait_started_at kept. It is a compare-and-swap on the
 // admission epoch: a held or terminal entry, or one re-admitted since epoch,
 // is ErrStateConflict and is not touched. An empty reason is
 // ErrInvalidRequest.
@@ -776,11 +891,12 @@ func (s *PostgresStore) Yield(ctx context.Context, entryID uuid.UUID, epoch int6
 		if cur.State != StateLive || cur.AdmissionEpoch != epoch { // Yield admission-epoch CAS
 			return epochConflict(cur, epoch)
 		}
-		contAt, contHead, contBase := marker.continueArgs()
+		contAt, contBase := marker.continueArgs()
 		if _, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries
 SET state = 'held', phase = NULL, admitted_at = NULL,
-    yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(`+yieldContinueSQL+`, clock_timestamp())
-WHERE id = $1`, cur.ID, marker.Reason, marker.Detail, contAt, contHead, contBase); err != nil {
+    yield_reason = $2, yield_detail = NULLIF($3, ''), yielded_at = COALESCE(`+yieldContinueSQL+`, clock_timestamp()),
+    yield_revision = yield_revision + 1, row4_flag = row4_flag OR $6::bool
+WHERE id = $1`, cur.ID, marker.Reason, marker.Detail, contAt, contBase, marker.Row4); err != nil {
 			return fmt.Errorf("mergequeue: yield entry: %w", err)
 		}
 		e, err := getEntryTx(ctx, tx, cur.ID)
@@ -794,32 +910,34 @@ WHERE id = $1`, cur.ID, marker.Reason, marker.Detail, contAt, contHead, contBase
 }
 
 // yieldContinueSQL is the episode continuation of a yield write ($4 the
-// continued yielded_at, $5/$6 its head and base, YieldMarker.Continue): the
-// continued yielded_at when the row's anchor equals it, else NULL (the caller
-// COALESCEs to the database clock, a new episode). It is judged in the write's
-// own statement, so a re-anchor earlier in the same transaction counts.
-const yieldContinueSQL = `CASE WHEN anchored_head_sha = $5::text AND anchored_base_sha IS NOT DISTINCT FROM NULLIF($6::text, '')
-  THEN $4::timestamptz END`
+// continued yielded_at, $5 its base ref, YieldMarker.Continue): the continued
+// yielded_at when the row's base_ref equals it, WHATEVER the head or reason
+// (docs/adr/112 A3.7), else NULL (the caller COALESCEs to the database clock,
+// a new episode).
+const yieldContinueSQL = `CASE WHEN base_ref = $5::text THEN $4::timestamptz END`
 
 // yieldCASTx runs one compare-and-swap UPDATE on a yielded entry: set is the
-// SET clause, args from $4. The predicate is the marker's identity: state
-// held, the anchored head the caller judged ($2) and the episode's yielded_at
-// ($3). A row matching none is ErrStateConflict and is not touched.
-func (s *PostgresStore) yieldCASTx(ctx context.Context, op string, entryID uuid.UUID, headSHA string, yieldedAt time.Time, set string, args ...any) (Entry, error) {
-	if headSHA == "" || yieldedAt.IsZero() {
-		return Entry{}, fmt.Errorf("%w: %s requires the anchored head sha and yielded_at", ErrInvalidRequest, op)
+// SET clause, args from $4; every such write bumps yield_revision. The
+// predicate is the marker's identity (docs/adr/112 A3.6): state held, marked,
+// the anchored head the caller judged ($2) and the revision it read ($3). A
+// continued episode reuses (anchored head, yielded_at), so only the revision
+// tells a delayed probe's stale read from a newer marker. A row matching none
+// is ErrStateConflict and is not touched.
+func (s *PostgresStore) yieldCASTx(ctx context.Context, op string, entryID uuid.UUID, headSHA string, revision int64, set string, args ...any) (Entry, error) {
+	if headSHA == "" || revision < 0 {
+		return Entry{}, fmt.Errorf("%w: %s requires the anchored head sha and a non-negative yield revision", ErrInvalidRequest, op)
 	}
 	var out Entry
 	err := s.withEntry(ctx, entryID, func(tx pgx.Tx, cur Entry) error {
-		tag, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries SET `+set+`
-WHERE id = $1 AND state = 'held' AND anchored_head_sha = $2 AND yielded_at = $3`, // yield marker CAS
-			append([]any{cur.ID, headSHA, yieldedAt}, args...)...)
+		tag, err := tx.Exec(ctx, `UPDATE merge_candidate_queue_entries SET `+set+`, yield_revision = yield_revision + 1
+WHERE id = $1 AND state = 'held' AND yielded_at IS NOT NULL AND anchored_head_sha = $2 AND yield_revision = $3`, // yield marker CAS
+			append([]any{cur.ID, headSHA, revision}, args...)...)
 		if err != nil {
 			return fmt.Errorf("mergequeue: %s: %w", op, err)
 		}
 		if tag.RowsAffected() == 0 {
-			return fmt.Errorf("%w: %s: entry %s is %s at head %q yielded at %v, want held at head %q yielded at %v",
-				ErrStateConflict, op, cur.ID, cur.State, cur.AnchoredHeadSHA, cur.YieldedAt, headSHA, yieldedAt)
+			return fmt.Errorf("%w: %s: entry %s is %s at head %q revision %d (yielded at %v), want held and marked at head %q revision %d",
+				ErrStateConflict, op, cur.ID, cur.State, cur.AnchoredHeadSHA, cur.YieldRevision, cur.YieldedAt, headSHA, revision)
 		}
 		e, err := getEntryTx(ctx, tx, cur.ID)
 		out = e
@@ -831,41 +949,46 @@ WHERE id = $1 AND state = 'held' AND anchored_head_sha = $2 AND yielded_at = $3`
 	return out, nil
 }
 
-// ClearYield clears a yielded entry's marker AND its approval-wait anchor (a
-// later non-approval starts a fresh episode), a compare-and-swap on (held,
-// anchored_head_sha, yielded_at) under the base lock: the row rejoins the
-// line at its original effective key (enqueued_at, or a kept order_key). A
-// row whose head moved, whose
-// episode changed (another yielded_at) or that is no longer held is
+// ClearYield clears a yielded entry's marker and CLOSES its approval wait
+// (approval_wait_open = false), a compare-and-swap on (held, marked,
+// anchored_head_sha, yield_revision) under the base lock: the row rejoins the
+// line at its original effective key (enqueued_at, or a kept order_key).
+// docs/adr/112 A3.7: approval_wait_started_at is RETAINED (a later
+// approval-fold block in the same episode gets no fresh window), and
+// row4_flag is cleared only when clearRow4 is true (the caller read the fresh
+// snapshot showing the row-4 condition gone). A row whose head moved, whose
+// marker was rewritten since (another revision) or that is no longer held is
 // ErrStateConflict and keeps its marker. See README.md § "Yield".
-func (s *PostgresStore) ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time) (Entry, error) {
-	return s.yieldCASTx(ctx, "clear yield", entryID, headSHA, yieldedAt,
-		`yield_reason = NULL, yield_detail = NULL, yielded_at = NULL, approval_wait_started_at = NULL`)
+func (s *PostgresStore) ClearYield(ctx context.Context, entryID uuid.UUID, headSHA string, revision int64, clearRow4 bool) (Entry, error) {
+	return s.yieldCASTx(ctx, "clear yield", entryID, headSHA, revision,
+		`yield_reason = NULL, yield_detail = NULL, yielded_at = NULL, approval_wait_open = false,
+    row4_flag = row4_flag AND NOT $4::bool`, clearRow4)
 }
 
-// UpdateYield rewrites a yielded entry's reason and detail only (a yield
-// transition: yielded_at, the anchor and the wait anchor are kept), the same
+// UpdateYield rewrites a yielded entry's reason and detail (a yield
+// transition: yielded_at, the anchor and the wait anchor are kept) and ORs
+// marker.Row4 into row4_flag (no transition clears it), the same
 // compare-and-swap as ClearYield. An empty reason is ErrInvalidRequest.
-func (s *PostgresStore) UpdateYield(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, marker YieldMarker) (Entry, error) {
+func (s *PostgresStore) UpdateYield(ctx context.Context, entryID uuid.UUID, headSHA string, revision int64, marker YieldMarker) (Entry, error) {
 	if err := marker.validate(); err != nil {
 		return Entry{}, err
 	}
-	return s.yieldCASTx(ctx, "update yield", entryID, headSHA, yieldedAt,
-		`yield_reason = $4, yield_detail = NULLIF($5, '')`, marker.Reason, marker.Detail)
+	return s.yieldCASTx(ctx, "update yield", entryID, headSHA, revision,
+		`yield_reason = $4, yield_detail = NULLIF($5, ''), row4_flag = row4_flag OR $6::bool`, marker.Reason, marker.Detail, marker.Row4)
 }
 
 // ReanchorYielded moves a yielded entry's anchor to the PR's current head
-// (newHeadSHA, newBaseSHA) KEEPING the marker, yielded_at and
-// approval_wait_started_at (the same episode: a head move never clears a
-// marker, so a push loop cannot buy a fresh wait window per push). It is the
-// same compare-and-swap as ClearYield on the OLD head (headSHA): a stale
-// probe is ErrStateConflict and is not touched. An unchanged anchor writes
-// nothing beyond the CAS check.
-func (s *PostgresStore) ReanchorYielded(ctx context.Context, entryID uuid.UUID, headSHA string, yieldedAt time.Time, newHeadSHA, newBaseSHA string) (Entry, error) {
+// (newHeadSHA, newBaseSHA) KEEPING the marker, yielded_at, the approval
+// anchor, row4_flag and the hold budget (the same episode: a head move never
+// clears a marker, so a push loop cannot buy a fresh wait window per push).
+// It is the same compare-and-swap as ClearYield on the OLD head (headSHA): a
+// stale probe is ErrStateConflict and is not touched. It is a marker write,
+// so yield_revision is bumped even on an unchanged anchor.
+func (s *PostgresStore) ReanchorYielded(ctx context.Context, entryID uuid.UUID, headSHA string, revision int64, newHeadSHA, newBaseSHA string) (Entry, error) {
 	if newHeadSHA == "" {
 		return Entry{}, fmt.Errorf("%w: reanchor yielded requires the new head sha", ErrInvalidRequest)
 	}
-	return s.yieldCASTx(ctx, "reanchor yielded", entryID, headSHA, yieldedAt,
+	return s.yieldCASTx(ctx, "reanchor yielded", entryID, headSHA, revision,
 		`anchored_head_sha = $4, anchored_base_sha = NULLIF($5, ''),
     anchored_at = CASE WHEN anchored_head_sha = $4 AND anchored_base_sha IS NOT DISTINCT FROM NULLIF($5, '') THEN anchored_at ELSE clock_timestamp() END`,
 		newHeadSHA, newBaseSHA)
@@ -1282,6 +1405,123 @@ func promoteStatus(ctx context.Context, tx pgx.Tx, runID uuid.UUID) (Status, err
 		return Status{}, fmt.Errorf("mergequeue: promote: run %s lost its active entry under the lock", runID)
 	}
 	return st, nil
+}
+
+// WithdrawIntent withdraws the merge intent of a run's YIELDED held entry by
+// settling it dropped with ReasonIntentWithdrawn (ADR-112 R3, #4685). See
+// README.md § "Withdraw intent".
+//
+// One transaction on one pooled connection, Promote's lock order: the run's
+// account (an unknown run is ErrNotFound), the per-run lock, an unlocked peek
+// of the run's active entry (none is ErrNotQueued), the base lock BLOCKING,
+// the entry re-read FOR UPDATE, then classify: live → ErrEntryLive, settled
+// since the peek → ErrNotQueued, no intent → ErrNoIntent, unmarked →
+// ErrEntryNotYielded; then any merge_dispatch_claims row for the run →
+// ErrDispatchClaimed (the ledger is read, never written). Nothing is written
+// on any refusal. Then the settle, and req.Record before COMMIT; any error,
+// including Record's, rolls the whole withdrawal back.
+func (s *PostgresStore) WithdrawIntent(ctx context.Context, req WithdrawIntentRequest) (Withdrawal, error) {
+	switch {
+	case req.RunID == uuid.Nil:
+		return Withdrawal{}, fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	case req.Record == nil:
+		return Withdrawal{}, fmt.Errorf("%w: a Record callback is required (a withdrawal never commits unaudited)", ErrInvalidRequest)
+	}
+	var out Withdrawal
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		out, err = s.withdrawIntentTx(ctx, tx, req)
+		return err
+	})
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) withdrawIntentTx(ctx context.Context, tx pgx.Tx, req WithdrawIntentRequest) (Withdrawal, error) {
+	var acct string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(account_id::text, '') FROM runs WHERE id = $1`, req.RunID).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Withdrawal{}, fmt.Errorf("run %s: %w", req.RunID, ErrNotFound)
+	}
+	if err != nil {
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: read run: %w", err)
+	}
+	if err := lockTx(ctx, tx, runLockKey(req.RunID)); err != nil {
+		return Withdrawal{}, err
+	}
+	var peekID uuid.UUID
+	var repo, baseRef string
+	err = tx.QueryRow(ctx, `SELECT id, repo, base_ref FROM merge_candidate_queue_entries
+WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &repo, &baseRef)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Withdrawal{}, fmt.Errorf("run %s: %w", req.RunID, ErrNotQueued)
+	}
+	if err != nil {
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: read active entry: %w", err)
+	}
+	if s.afterWithdrawPeek != nil {
+		s.afterWithdrawPeek(ctx)
+	}
+	if err := lockTx(ctx, tx, lockKey(acct, repo, baseRef)); err != nil {
+		return Withdrawal{}, err
+	}
+	cur, err := getEntryTx(ctx, tx, peekID)
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	switch {
+	case cur.State == StateLive: // WithdrawIntent live-entry refusal
+		return Withdrawal{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrEntryLive)
+	case cur.State != StateHeld:
+		// Settled by a by-entry mutation between the peek and the base lock.
+		return Withdrawal{}, fmt.Errorf("run %s entry %s is %s: %w", req.RunID, cur.ID, cur.State, ErrNotQueued)
+	case cur.MergeIntentAt == nil: // WithdrawIntent no-intent refusal
+		return Withdrawal{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrNoIntent)
+	case !cur.Yielded(): // WithdrawIntent unmarked-entry refusal
+		return Withdrawal{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrEntryNotYielded)
+	}
+	claim, claimed, err := mergeDispatchTx(ctx, tx, req.RunID)
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	if claimed { // WithdrawIntent dispatch-claim refusal
+		return Withdrawal{}, fmt.Errorf("run %s (claim %s, path %s, head %s): %w",
+			req.RunID, claim.State, claim.Path, claim.HeadSHA, ErrDispatchClaimed)
+	}
+	e, err := settleTx(ctx, tx, cur.ID, StateDropped, ReasonIntentWithdrawn)
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	out := Withdrawal{Entry: e}
+	var live pgtype.UUID
+	err = tx.QueryRow(ctx, `SELECT l.run_id FROM merge_candidate_queue_entries l JOIN runs lr ON lr.id = l.run_id
+WHERE l.repo = $1 AND l.base_ref = $2 AND l.state = 'live' AND lr.account_id IS NOT DISTINCT FROM $3
+ORDER BY l.admitted_at, l.id LIMIT 1`, repo, baseRef, acctArg(acct)).Scan(&live)
+	switch {
+	case err == nil && live.Valid:
+		id := uuid.UUID(live.Bytes)
+		out.LiveRunID = &id
+	case err != nil && !errors.Is(err, pgx.ErrNoRows):
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: read live entry: %w", err)
+	}
+	if err := req.Record(ctx, tx, out); err != nil { // WithdrawIntent record-before-commit
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: record: %w", err)
+	}
+	return out, nil
+}
+
+// mergeDispatchTx is MergeDispatch inside a caller's transaction.
+func mergeDispatchTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID) (DispatchClaim, bool, error) {
+	c, err := scanClaim(tx.QueryRow(ctx, `SELECT `+claimCols+` FROM merge_dispatch_claims WHERE run_id = $1`, runID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DispatchClaim{}, false, nil
+	}
+	if err != nil {
+		return DispatchClaim{}, false, fmt.Errorf("mergequeue: withdraw intent: read merge dispatch claim: %w", err)
+	}
+	return c, true, nil
 }
 
 // newestRowSQL keeps only the run's NEWEST row (alias e): no row of the same

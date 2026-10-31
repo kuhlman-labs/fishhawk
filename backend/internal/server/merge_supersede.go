@@ -696,6 +696,11 @@ func (s *Server) handleReconcileMerge(w http.ResponseWriter, r *http.Request) {
 	// completeRun (walking a still-pending run to running first). Best-effort,
 	// exactly as the merged path's advance is. The settle-only arm reaches
 	// here having moved nothing.
+	//
+	// A merge settled by this recovery verb records the ADR-117 D1
+	// open_at_merge outcome too (E94.1 / #4692); the stamp's outcome filter
+	// makes it idempotent with the merged-webhook path.
+	s.stampConcernsOpenAtMerge(r.Context(), runID)
 	s.advanceRunAfterReviewResolve(r.Context(), runID)
 
 	state := ""

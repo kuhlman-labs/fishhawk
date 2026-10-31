@@ -82,6 +82,12 @@ type GitHubIdentityProvider struct {
 	// client secret.
 	clientID string
 
+	// clientSecret is the OAuth client secret. It is used ONLY as the Basic
+	// credential of the check-a-token introspection call VerifyAccessToken
+	// makes (#4627), sent on a redirect-refusing client; it is never logged,
+	// never put in an error string and never sent anywhere else.
+	clientSecret string
+
 	// apiBaseURL / oauthBaseURL default to the GitHub hosts. Both are
 	// overridable so in-package tests point them at an httptest server.
 	apiBaseURL   string
@@ -120,12 +126,24 @@ func WithBaseURLs(apiBase, oauthBase string) Option {
 	}
 }
 
+// WithClientSecret sets the OAuth client secret that authenticates the
+// check-a-token call binding a presented access token to clientID (#4627).
+// Without it VerifyAccessToken returns ErrClientCredentialUnconfigured;
+// fishhawkd threads FISHHAWKD_OAUTH_CLIENT_SECRET here.
+func WithClientSecret(secret string) Option {
+	return func(p *GitHubIdentityProvider) {
+		p.clientSecret = secret
+	}
+}
+
 // NewGitHubIdentityProvider constructs a GitHub identity provider from
 // the OAuth App client_id and an optional REST token accessor (nil →
 // anonymous REST reads). It returns the interface, following the
 // githuboidc.New idiom; the production defaults (GitHub hosts, a 30s
 // HTTP client, a ctx-aware sleep, time.Now) are filled in here. Optional
-// Options (e.g. WithBaseURLs) are applied last, overriding the defaults.
+// Options (e.g. WithBaseURLs, WithClientSecret) are applied last,
+// overriding the defaults. VerifyAccessToken needs WithClientSecret: the
+// client binding it enforces is authenticated by the client's own secret.
 func NewGitHubIdentityProvider(clientID string, token func(context.Context) (string, error), opts ...Option) IdentityProvider {
 	p := &GitHubIdentityProvider{
 		clientID:     clientID,
@@ -248,16 +266,114 @@ func (p *GitHubIdentityProvider) VerifyUser(ctx context.Context, prompt DeviceCo
 
 // VerifyAccessToken re-verifies a CLI-obtained GitHub user access token
 // server-side and returns the provider-qualified subject
-// ("github:<login>"). It reuses resolveLogin — the same GET {api}/user
+// ("github:<login>").
+//
+// CLIENT BINDING (#4627). Before the subject is resolved, the token must
+// be bound to THIS deployment's device OAuth client: verifyTokenClient asks
+// GitHub's check-a-token endpoint, authenticated with the client's own
+// id + secret, which client issued it, and anything other than exactly
+// p.clientID refuses. Without that, a token the same human obtained
+// through any other client (another OAuth app, a personal access token,
+// an App/installation token) would resolve the same subject. A provider
+// built without the client secret returns ErrClientCredentialUnconfigured
+// before any HTTP call — never a silent fallback to owner-only checks.
+//
+// Subject derivation then reuses resolveLogin — the same GET {api}/user
 // exchange VerifyUser performs after the device flow authorizes — so a
-// token minted through the CLI's own device flow (E39.3 / #1708)
-// resolves to the identical subject the interactive path would. An
-// empty token is rejected before any HTTP call.
+// token minted through the CLI's own device flow (E39.3 / #1708) resolves
+// to the identical subject the interactive path would. VerifyUser needs
+// no binding check: its token comes from p's own device flow by
+// construction. An empty token is rejected before any HTTP call.
 func (p *GitHubIdentityProvider) VerifyAccessToken(ctx context.Context, accessToken string) (string, error) {
 	if accessToken == "" {
 		return "", fmt.Errorf("identity: access token is empty")
 	}
+	if p.clientID == "" || p.clientSecret == "" {
+		return "", ErrClientCredentialUnconfigured
+	}
+	if err := p.verifyTokenClient(ctx, accessToken); err != nil {
+		return "", err
+	}
 	return p.resolveLogin(ctx, accessToken)
+}
+
+// githubCheckTokenMaxBytes caps how much of the check-a-token reply is
+// decoded: the documented body is a small object, so anything larger is
+// refused rather than buffered.
+const githubCheckTokenMaxBytes = 1 << 20
+
+// verifyTokenClient performs GitHub's check-a-token call (#4627):
+//
+//	POST {api}/applications/{client_id}/token   {"access_token": "<token>"}
+//
+// authenticated with Basic clientID:clientSecret — and NO Bearer header,
+// which GitHub documents would replace the Basic credential. It succeeds
+// only on a 200 whose app.client_id is byte-exactly p.clientID; every
+// other outcome refuses: a 404 (GitHub's answer for an invalid token), any
+// other status, a rate-limit signal (ErrRateLimited), an undecodable body,
+// a missing app object or an empty client_id.
+//
+// No returned error carries the response body: the 200 body echoes the
+// token itself, so every error names the status class only.
+//
+// The request goes out on a per-call client copy that refuses ANY
+// redirect (refuseAnyRedirect), so a 3xx comes back as a non-200 and is
+// refused, and the Basic credential never follows a hop.
+func (p *GitHubIdentityProvider) verifyTokenClient(ctx context.Context, accessToken string) error {
+	body, err := json.Marshal(map[string]string{"access_token": accessToken})
+	if err != nil {
+		return fmt.Errorf("%w: marshal check request", ErrIntrospectionFailed)
+	}
+	endpoint := p.apiBase() + "/applications/" + url.PathEscape(p.clientID) + "/token"
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+	if err != nil {
+		return fmt.Errorf("%w: build check request", ErrIntrospectionFailed)
+	}
+	req.Header.Set("Accept", "application/vnd.github+json")
+	req.Header.Set("X-GitHub-Api-Version", "2022-11-28")
+	req.Header.Set("Content-Type", "application/json")
+	req.SetBasicAuth(p.clientID, p.clientSecret)
+
+	resp, err := p.introspectionClient().Do(req)
+	if err != nil {
+		return fmt.Errorf("%w: check request transport error", ErrIntrospectionFailed)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if rlErr := rateLimitError(resp); rlErr != nil {
+		return rlErr
+	}
+	if resp.StatusCode != http.StatusOK {
+		return fmt.Errorf("%w: check-a-token answered %d", ErrIntrospectionRefused, resp.StatusCode)
+	}
+	var out struct {
+		App struct {
+			ClientID string `json:"client_id"`
+		} `json:"app"`
+	}
+	if err := json.NewDecoder(io.LimitReader(resp.Body, githubCheckTokenMaxBytes)).Decode(&out); err != nil {
+		return fmt.Errorf("%w: undecodable check-a-token reply", ErrIntrospectionFailed)
+	}
+	if out.App.ClientID != p.clientID {
+		return ErrTokenClientMismatch
+	}
+	return nil
+}
+
+// introspectionClient returns a per-call copy of the configured client
+// whose redirect policy refuses every hop. The struct copy shares the
+// Transport (and its pool) and Timeout; only CheckRedirect differs.
+func (p *GitHubIdentityProvider) introspectionClient() *http.Client {
+	c := *p.client()
+	c.CheckRedirect = refuseAnyRedirect
+	return &c
+}
+
+// refuseAnyRedirect is the check-a-token redirect policy: never follow.
+// http.ErrUseLastResponse hands the 3xx itself back to the caller, which
+// refuses it as a non-200, so the Basic client credential and the token in
+// the body never reach a redirect target.
+func refuseAnyRedirect(*http.Request, []*http.Request) error {
+	return http.ErrUseLastResponse
 }
 
 // requestDeviceCode performs POST {oauth}/login/device/code.
