@@ -380,6 +380,89 @@ func (q *Queries) MarkReviewConcernCarried(ctx context.Context, id uuid.UUID) er
 	return err
 }
 
+const setReviewConcernLabel = `-- name: SetReviewConcernLabel :one
+UPDATE review_concerns
+   SET judgement = $1,
+       judgement_actor_kind = $2,
+       judgement_delegated = false,
+       judgement_bulk = false,
+       judgement_backfill = $3,
+       tradeoff_cost = $4,
+       duplicate_of = $5::uuid
+ WHERE id = $6
+   AND judgement = $7
+   AND duplicate_of IS NOT DISTINCT FROM $8::uuid
+RETURNING id, run_id, stage_id, stage_kind, origin_review_sequence, reviewer_model, severity, category, note, state, state_reason, created_at, updated_at, suggested_patch, new_evidence, settled_ref, reviewer_role, quote_unverified, severity_clamped_from, provenance, check_key, outcome, rolled_up_from, judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, tradeoff_cost, duplicate_of
+`
+
+type SetReviewConcernLabelParams struct {
+	Judgement          string     `json:"judgement"`
+	JudgementActorKind string     `json:"judgement_actor_kind"`
+	JudgementBackfill  bool       `json:"judgement_backfill"`
+	TradeoffCost       string     `json:"tradeoff_cost"`
+	DuplicateOf        *uuid.UUID `json:"duplicate_of"`
+	ID                 uuid.UUID  `json:"id"`
+	PriorJudgement     string     `json:"prior_judgement"`
+	PriorDuplicateOf   *uuid.UUID `json:"prior_duplicate_of"`
+}
+
+// E94.8 / #4841 (ADR-117 D1 phase 3): the relabel verb's write (ApplyLabel).
+// ONE UPDATE setting the judgement columns and duplicate_of: judgement is the
+// label's (unlabelled for a duplicate label, whose effective judgement is
+// inherited), judgement_delegated and judgement_bulk are false (one human, one
+// concern), tradeoff_cost is ” for a duplicate, and duplicate_of is NULL for
+// a judgement label (clearing a prior link). The optimistic guard matches only
+// while the row still holds the prior judgement and duplicate_of the caller
+// read and audited; zero rows is a concurrent relabel (ErrLabelConflict). It
+// NEVER sets state, state_reason, outcome or updated_at: a label is not a
+// lifecycle event (the StampReviewConcernsOpenAtMerge posture).
+func (q *Queries) SetReviewConcernLabel(ctx context.Context, arg SetReviewConcernLabelParams) (ReviewConcern, error) {
+	row := q.db.QueryRow(ctx, setReviewConcernLabel,
+		arg.Judgement,
+		arg.JudgementActorKind,
+		arg.JudgementBackfill,
+		arg.TradeoffCost,
+		arg.DuplicateOf,
+		arg.ID,
+		arg.PriorJudgement,
+		arg.PriorDuplicateOf,
+	)
+	var i ReviewConcern
+	err := row.Scan(
+		&i.ID,
+		&i.RunID,
+		&i.StageID,
+		&i.StageKind,
+		&i.OriginReviewSequence,
+		&i.ReviewerModel,
+		&i.Severity,
+		&i.Category,
+		&i.Note,
+		&i.State,
+		&i.StateReason,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.SuggestedPatch,
+		&i.NewEvidence,
+		&i.SettledRef,
+		&i.ReviewerRole,
+		&i.QuoteUnverified,
+		&i.SeverityClampedFrom,
+		&i.Provenance,
+		&i.CheckKey,
+		&i.Outcome,
+		&i.RolledUpFrom,
+		&i.Judgement,
+		&i.JudgementActorKind,
+		&i.JudgementDelegated,
+		&i.JudgementBulk,
+		&i.JudgementBackfill,
+		&i.TradeoffCost,
+		&i.DuplicateOf,
+	)
+	return i, err
+}
+
 const stampReviewConcernsOpenAtMerge = `-- name: StampReviewConcernsOpenAtMerge :execrows
 UPDATE review_concerns SET outcome = 'open_at_merge' WHERE run_id = ANY($1::uuid[]) AND outcome = '' AND state IN ('raised', 'addressed_pending', 'reopened', 'superseded')
 `

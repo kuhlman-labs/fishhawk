@@ -21,7 +21,7 @@ type ResolveConcernsInput struct {
 	ConcernIDs   []string `json:"concern_ids" jsonschema:"the stable concern UUIDs to resolve (from fishhawk_get_gate_view or fishhawk_get_run_status's run.concerns.items[].id). Every id must be addressed_pending. At most 50 per batch; duplicates are rejected"`
 	Evidence     string   `json:"evidence" jsonschema:"REQUIRED operator evidence note (at most 4000 bytes): what you executed or observed that shows the routed concern is fixed. Recorded on EVERY concern_resolved_with_evidence audit entry and stored as each concern's state_reason (prefixed 'operator evidence: ')"`
 	Judgement    string   `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement covering the WHOLE batch (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. A fixed concern is usually defect or defect_pre_existing. No reason-prefix derivation applies to a resolve. Missing or invalid: 400 validation_failed"`
-	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement: REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement (at most 4000 bytes; refused with rule tradeoff_cost_too_long, never truncated): REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
 }
 
 // ResolveConcernsOutput surfaces the per-item outcome list plus the counts.
@@ -72,7 +72,8 @@ type resolveConcernsRequestBody struct {
 //   - 400 validation_failed (blank or over-cap evidence, empty concern_ids,
 //     over the 50-id cap, a duplicate id, a non-UUID id, or an id belonging to
 //     another run — details.rule "concern_run_mismatch"; or a missing, unknown
-//     or unlabelled judgement, or a tradeoff/tradeoff_cost mismatch)
+//     or unlabelled judgement, a tradeoff/tradeoff_cost mismatch, or a
+//     tradeoff_cost over 4000 bytes — details.rule "tradeoff_cost_too_long")
 //   - 401 authentication_required
 //   - 403 resolve_requires_human (any agent token), insufficient_scope, or
 //     account_forbidden
@@ -129,7 +130,8 @@ JUDGEMENT: ONE REQUIRED human judgement covers the batch — one of
 defect, defect_pre_existing, no_defect, tradeoff, preference, stale,
 insufficient_evidence (unlabelled is refused); a fixed concern is
 usually defect or defect_pre_existing. tradeoff_cost is required with a
-tradeoff and refused with any other judgement. Each concern records
+tradeoff and refused with any other judgement, and is at most 4000
+bytes (refused, not truncated). Each concern records
 outcome fixed, and judgement_bulk true only when the batch names more
 than one concern.
 
@@ -156,7 +158,9 @@ Returns a tool error on:
   - validation_failed (400: over the 50-id cap, evidence over 4000
     bytes, a duplicate id, or an id from another run — details.rule
     concern_run_mismatch; or a missing, unknown or unlabelled judgement,
-    or a tradeoff/tradeoff_cost mismatch — checked by the backend only)
+    a tradeoff/tradeoff_cost mismatch, or a tradeoff_cost over 4000
+    bytes — details.rule tradeoff_cost_too_long — checked by the backend
+    only)
   - resolve_requires_human (403: an agent token)
   - concern_not_found (404)
   - concern_resolve_conflict (409: an id not in addressed_pending — the

@@ -878,3 +878,49 @@ func TestBulkWaiveConcerns_AuditCarriesJudgement(t *testing.T) {
 		})
 	})
 }
+
+// TestBulkWaiveConcerns_Delegated_RecordsJudgementDelegated (E94.8 / #4841,
+// the carried Phase-2 read-back; operator acceptance criterion
+// bulk-delegated-judgement-read-back): a bulk delegated:true waive through
+// delegatedWaiveServer commits judgement_delegated=true on EVERY committed row,
+// read back from the store after the call returned. The batch is one concern
+// by construction: may_waive's only condition, solo_low, admits exactly one
+// open concern, so a wider delegated batch is unsatisfiable (see
+// TestBulkWaive_Delegated_SoloLowMet_StampsRuleOnEveryRow). The loop covers
+// every id sent, so a wider batch a future condition admits is covered too.
+func TestBulkWaiveConcerns_Delegated_RecordsJudgementDelegated(t *testing.T) {
+	s, repo, au, cr := delegatedWaiveServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedLowConcernRow(t, cr, runID, stageID)
+	repo.seedRun(&run.Run{
+		ID:           runID,
+		Repo:         "acme/widgets",
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+	ids := []uuid.UUID{row.ID}
+
+	w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "style nit, not blocking",
+		map[string]any{"judgement": "preference", "delegated": true}, ids...), withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 on a satisfied solo_low delegation:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeBulkWaive(t, w); resp.Waived != len(ids) || resp.Failed != 0 {
+		t.Fatalf("waived/failed = %d/%d, want %d/0: %+v", resp.Waived, resp.Failed, len(ids), resp)
+	}
+	for _, id := range ids {
+		rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+		if err != nil {
+			t.Fatalf("read back concern %s: %v", id, err)
+		}
+		got := rows[0]
+		if got.State != concern.StateWaived || got.Judgement != concern.JudgementPreference || !got.JudgementDelegated || got.JudgementBulk {
+			t.Errorf("concern %s committed state %s judgement %q delegated %v bulk %v, want waived / preference / delegated / not bulk (one concern)",
+				id, got.State, got.Judgement, got.JudgementDelegated, got.JudgementBulk)
+		}
+	}
+	if n := len(auditEntriesByCategory(au, CategoryConcernWaived)); n != len(ids) {
+		t.Errorf("concern_waived entries = %d, want %d", n, len(ids))
+	}
+}

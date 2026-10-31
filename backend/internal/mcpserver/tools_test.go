@@ -3632,7 +3632,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// WHEN: a defect got past the live reviews, or a pending escape needs a
 	// human judgement. ELIGIBILITY: write:runs; the backend refuses every
 	// run-bound token and makes a closure human-only. 83 -> 84.
-	const wantToolCount = 84
+	//
+	// E94.8 / #4841 (ADR-117 D1 phase 3, 2026-10-30) adds exactly ONE tool —
+	// fishhawk_label_concern, the wrapper over POST
+	// /v0/concerns/{concern_id}/label. WHEN: a recorded judgement must be
+	// corrected, a concern duplicates an earlier one of its run, or historical
+	// labels are imported with backfill. ELIGIBILITY: write:stages or
+	// write:fixups, any concern in any state; the backend refuses EVERY agent
+	// token (label_requires_human). Its own tool, not a waive mode: it changes
+	// no lifecycle state and records concern_labelled. 84 -> 85.
+	const wantToolCount = 85
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3702,6 +3711,19 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawResolveConcerns {
 		t.Error("fishhawk_resolve_concerns is not in the registered tool list — the resolve-with-evidence verb is unreachable")
+	}
+	// fishhawk_label_concern (E94.8 / #4841) must likewise be wire-visible: the
+	// 84 -> 85 bump alone would stay green if its registration were dropped and
+	// a DIFFERENT tool added in the same change.
+	var sawLabelConcern bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_label_concern" {
+			sawLabelConcern = true
+			break
+		}
+	}
+	if !sawLabelConcern {
+		t.Error("fishhawk_label_concern is not in the registered tool list — the relabel and duplicate_of verb is unreachable")
 	}
 	// fishhawk_answer_divergence (E75.5 / #3733) must be wire-visible for the
 	// same reason.
