@@ -893,6 +893,18 @@ func TestKnownCategories_MergeQueueEjectedPromoted(t *testing.T) {
 	}
 }
 
+// TestKnownCategories_MergeQueueIntentWithdrawn pins the E87.17 / #4685
+// (ADR-112 R3) registration: the withdraw-intent verb appends
+// merge_queue_intent_withdrawn inside its withdrawal transaction
+// (server/merge_queue_withdraw.go). An unregistered category reddens
+// TestKnownCategoriesCoversEmittedCategories and is un-awaitable through
+// fishhawk_await_audit.
+func TestKnownCategories_MergeQueueIntentWithdrawn(t *testing.T) {
+	if !IsKnownCategory("merge_queue_intent_withdrawn") {
+		t.Fatal("merge_queue_intent_withdrawn is not in KnownCategories; fishhawk_await_audit would reject a wait armed on it")
+	}
+}
+
 // TestKnownCategories_MergeQueueResumed pins the E87.7 / #4298 (ADR-093 D8)
 // registration: the restart resume appends merge_queue_resumed before every
 // action it takes on a live head-of-line entry

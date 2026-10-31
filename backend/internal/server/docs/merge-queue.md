@@ -948,7 +948,10 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `merge_queue_yielded` (site `merge_run`); 202 `queued` names the yield and
   the next step. A same-base LIVE entry is never marked; any other
   ineligibility keeps the 409 with nothing written; the inline path still
-  refuses and writes nothing.
+  refuses and writes nothing. A yielded entry's intent blocks the inline
+  `merge_run` (ADR-109) until a qualifying approval clears the yield, the run
+  is cancelled, or the operator withdraws the intent (§ "Withdraw intent
+  (ADR-112 R3, #4685)").
 - **Re-probe (`merge_queue_yield_reprobe.go`).** `RunMergeQueueYieldReprobe`
   ticks at `MergeCandidateQueuePumpInterval` beside the pump. Per base it
   re-probes AT MOST ONE due row under the exponential backoff (points at
@@ -1503,6 +1506,62 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   `TestMergeQueueEjection_*`, `TestRunReadAndGateView_MergeQueueEjectionOnlyWhileNewestRowEjected`,
   `TestOpenAPIDocumentsMergeQueuePromote` / `...Ejection`) and
   `mcpserver`'s `TestMergeQueueEjection_WireShape` (real backend and store).
+
+### Withdraw intent (ADR-112 R3, [#4685](https://github.com/kuhlman-labs/fishhawk/issues/4685))
+
+`merge_queue_withdraw.go`: `POST /v0/runs/{run_id}/merge-queue/withdraw`
+takes a YIELDED entry's merge out of the queue. The store settles the entry
+`dropped` with the store-owned reason `intent_withdrawn` (mergequeue README §
+"Withdraw intent"); `merge_intent_at` is never cleared.
+
+- **Ladder** (the promote's, every rung before any write): 401
+  `authentication_required`; 403 `run_token_forbidden` (a run-bound token,
+  even its own run); 403 `insufficient_scope` (no `write:runs`); 403
+  `account_forbidden` from `requireRunAccount(memberWrite)`; 400
+  `validation_failed` (a non-UUID `run_id`, or the strict `{"reason"}` body
+  through the shared `parseReasonBody`); 503 `merge_queue_unconfigured` (no
+  queue, no `mergequeue.IntentWithdrawer`, or no run repository). A delegated
+  operator-agent token is admitted on purpose, as for the promote: the verb
+  only exits the queue, and the inline merge it unblocks keeps every gate.
+- **Lock.** The store call runs inside `WithMergeIntentLock` with merge_run's
+  bounded acquire (`boundMergeLockAcquire`, `mergeRunLockAcquireTimeout`): a
+  lock never taken is 503 `merge_lock_unavailable` with nothing written; a
+  lapse after the call ran is a WARN and keeps the call's answer (the store
+  transaction already committed or refused). Every `ClaimMergeDispatch`
+  caller (the inline tail, the delegated arm, merge-on-pass) holds the same
+  lock through `withRunMergeLock`, so the claim the store reads cannot land
+  concurrently (`TestMergeQueueWithdraw_TakesMergeIntentLockBeforeClaimRead`).
+- **Refusals** (the store's transaction, nothing written): 404
+  `run_not_found`; 409 `merge_queue_not_queued` (never queued, settled, or
+  already withdrawn); 409 `merge_queue_entry_live` (never withdrawn
+  mid-pass); 409 `merge_queue_no_intent`; 409 `merge_queue_entry_not_yielded`
+  (an unmarked entry is progressing to the queue's own merge; cancel the run
+  to stop it); 409 `merge_dispatch_claimed` for ANY claim on the run, the
+  claim untouched, with `details.claim_state` / `claim_path` /
+  `claim_head_sha` read best-effort and `next_step` `operator_rearm`
+  (`dispatch_failed`) or `fishhawk_get_merge_queue` (`dispatched`); 500
+  `merge_queue_withdraw_failed` (rolled back).
+- **Audit.** `merge_queue_intent_withdrawn` is appended INSIDE the
+  transaction through `promoteAuditAppend` (an append failure rolls the
+  withdrawal back): `{entry_id, run_id, repo, base_ref, anchored_head_sha,
+  merge_intent_at, intent_sequence, yield_reason, yielded_at, reason,
+  actor}`, actor_kind from the subject. No `yield_detail`: it is untrusted
+  forge text, and without it the row carries only this run's ids
+  (run-bound-readable under ADR-106). INTERNAL, not an issue-comment surface.
+- **After a withdrawal** the queue owns nothing: `mergeQueueOwnsMerge` and the
+  delegated arm read `ActiveForRun`, the merge-candidate gate's held arm reads
+  only a held entry, and the re-entry sweep needs an ejected newest row. The
+  next `POST /v0/runs/{id}/merge` runs the inline path (the fold, the gate,
+  the dispatch claim); one the gate routes to the queue (`merge_base_behind`
+  / `merge_candidate_unverified`) records intent on a FRESH entry. 200
+  `{run_id, entry_id, repo, base_ref, withdrawn: true, settled_state,
+  settle_reason, intent_sequence?, yield_reason, live_run_id?,
+  audit_sequence}`; the MCP mirror must byte-match the tags. No pump: a
+  yielded entry never held the line.
+- **Tests.** `merge_queue_withdraw_test.go` (one per rung, refusal and lock
+  arm, `TestMergeQueueWithdraw_UnblocksInlineMergeRun` over the mqe world,
+  `TestOpenAPI_MergeQueueWithdrawDocumented`) and the store's
+  `TestWithdrawIntent_*`.
 
 ### Merge-queue durability (ADR-093 D8)
 

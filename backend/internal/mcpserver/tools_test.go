@@ -3641,7 +3641,16 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	// write:fixups, any concern in any state; the backend refuses EVERY agent
 	// token (label_requires_human). Its own tool, not a waive mode: it changes
 	// no lifecycle state and records concern_labelled. 84 -> 85.
-	const wantToolCount = 85
+	//
+	// E87.17 / #4685 (ADR-112 R3) adds exactly ONE tool —
+	// fishhawk_withdraw_merge_intent, the wrapper over POST
+	// /v0/runs/{run_id}/merge-queue/withdraw. WHEN: a run's merge-queue entry
+	// has YIELDED and the operator wants its merge out of the queue, to merge
+	// inline with fishhawk_merge_run. ELIGIBILITY: write:runs; the backend
+	// refuses a run-bound token, and refuses a live, unmarked, no-intent or
+	// dispatch-claimed entry. Its own tool, not a promote mode: it settles the
+	// entry instead of reordering it. 85 -> 86.
+	const wantToolCount = 86
 
 	if len(res.Tools) != wantToolCount {
 		t.Errorf("registered tool count = %d, want %d (a new tool must be added here with a when/eligibility-leading description)",
@@ -3724,6 +3733,40 @@ func TestToolDescriptions_ConformToHouseStyle(t *testing.T) {
 	}
 	if !sawLabelConcern {
 		t.Error("fishhawk_label_concern is not in the registered tool list — the relabel and duplicate_of verb is unreachable")
+	}
+	// fishhawk_withdraw_merge_intent (E87.17 / #4685) must likewise be
+	// wire-visible, and its description must lead with WHEN and state the
+	// eligibility that keeps it to a YIELDED entry without a dispatch claim:
+	// the 85 -> 86 bump alone would stay green if its registration were
+	// dropped and a DIFFERENT tool added in the same change.
+	var withdrawDesc string
+	var sawWithdraw bool
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_withdraw_merge_intent" {
+			sawWithdraw = true
+			withdrawDesc = tool.Description
+			break
+		}
+	}
+	if !sawWithdraw {
+		t.Error("fishhawk_withdraw_merge_intent is not in the registered tool list — a yielded entry's merge intent cannot be withdrawn, so an inline merge stays blocked")
+	} else {
+		if !strings.HasPrefix(withdrawDesc, "Use this when") {
+			t.Errorf("fishhawk_withdraw_merge_intent description must lead with WHEN; got %q", withdrawDesc[:min(len(withdrawDesc), 80)])
+		}
+		for _, want := range []string{"ELIGIBILITY", "YIELDED", "#4685", "merge_dispatch_claimed"} {
+			if !strings.Contains(withdrawDesc, want) {
+				t.Errorf("fishhawk_withdraw_merge_intent description is missing %q", want)
+			}
+		}
+	}
+	// fishhawk_get_merge_queue's "do NOT re-invoke fishhawk_merge_run" advice
+	// must name the withdrawal as the exit for a YIELDED entry (#4685), or the
+	// read that shows the yield leaves the operator with no verb.
+	for _, tool := range res.Tools {
+		if tool.Name == "fishhawk_get_merge_queue" && !strings.Contains(tool.Description, "fishhawk_withdraw_merge_intent") {
+			t.Error("fishhawk_get_merge_queue description does not name fishhawk_withdraw_merge_intent for a YIELDED entry")
+		}
 	}
 	// fishhawk_answer_divergence (E75.5 / #3733) must be wire-visible for the
 	// same reason.

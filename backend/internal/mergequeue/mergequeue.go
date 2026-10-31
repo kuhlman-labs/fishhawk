@@ -12,7 +12,8 @@
 // promote's order_key (0111) and the ejection/re-entry reads. docs/adr/112
 // Amendment A3 adds the yield revision, the row-4 flag, the per-epoch
 // merge-gate window and its hold budget, and the approval-wait open bit
-// (0115). README.md is the contract.
+// (0115). ADR-112 R3's withdraw-intent verb (#4685) settles a yielded entry
+// dropped intent_withdrawn (IntentWithdrawer). README.md is the contract.
 package mergequeue
 
 import (
@@ -81,8 +82,13 @@ const (
 
 // ReasonBaseChanged is the drop reason Enqueue records when a run with an
 // active entry re-enters on a different base ref. Every other eject/drop
-// reason is the caller's (README.md § "Reasons").
+// reason is the caller's, except ReasonIntentWithdrawn (README.md §
+// "Reasons").
 const ReasonBaseChanged = "base_changed"
+
+// ReasonIntentWithdrawn is the drop reason WithdrawIntent records when the
+// operator withdraws a yielded entry's merge intent (ADR-112 R3, #4685).
+const ReasonIntentWithdrawn = "intent_withdrawn"
 
 // ReentryReason is the eject reason ReentryCandidates matches: a red pass
 // (the server's verify_failed), the only ejection ADR-093 D4 re-enters
@@ -134,6 +140,18 @@ var (
 	// ErrEntryYielded is a Promote for a yielded (marked) held entry: AdmitNext
 	// skips it whatever its order, so the marker must clear first.
 	ErrEntryYielded = errors.New("mergequeue: entry is yielded; clear its yield before promoting")
+	// ErrNoIntent is a WithdrawIntent on an active entry that carries no
+	// merge intent: there is nothing to withdraw.
+	ErrNoIntent = errors.New("mergequeue: entry carries no merge intent")
+	// ErrEntryNotYielded is a WithdrawIntent on a held but UNMARKED entry:
+	// only a yielded entry's intent is withdrawable (an unmarked one is
+	// progressing to the queue's own merge).
+	ErrEntryNotYielded = errors.New("mergequeue: entry is not yielded; only a yielded entry's merge intent can be withdrawn")
+	// ErrDispatchClaimed is a WithdrawIntent for a run that holds an ADR-109
+	// merge-dispatch claim in any state (dispatched or dispatch_failed): the
+	// withdrawal never reads the claim as permission to clear it and never
+	// writes the ledger.
+	ErrDispatchClaimed = errors.New("mergequeue: run holds a merge-dispatch claim")
 	// ErrReclaimUnrecorded is an AdmitNextReclaiming whose ReclaimRecordFunc
 	// failed: the whole call was rolled back (no epoch bump, no admitted_at
 	// change). It wraps the callback's error.
@@ -520,6 +538,34 @@ type Promotion struct {
 // panicking (README.md § "Promote").
 type Promoter interface {
 	Promote(ctx context.Context, req PromoteRequest) (Promotion, error)
+}
+
+// WithdrawIntentRequest asks to withdraw the merge intent of a run's YIELDED
+// held entry (ADR-112 R3, #4685).
+type WithdrawIntentRequest struct {
+	RunID uuid.UUID
+	// Record is REQUIRED. It runs inside the withdrawal transaction after the
+	// settle and before COMMIT; a non-nil error rolls the whole withdrawal
+	// back. The server appends merge_queue_intent_withdrawn through it (on
+	// tx), so a withdrawal never commits unaudited.
+	Record func(ctx context.Context, tx pgx.Tx, w Withdrawal) error
+}
+
+// Withdrawal is WithdrawIntent's verdict.
+type Withdrawal struct {
+	// Entry is the row after the settle: dropped with ReasonIntentWithdrawn,
+	// its merge_intent_at, merge_intent_sequence and yield columns retained.
+	Entry Entry
+	// LiveRunID is the run holding the base's line, or nil when none.
+	LiveRunID *uuid.UUID
+}
+
+// IntentWithdrawer is the withdraw-intent verb (ADR-112 R3, #4685): a
+// separate capability like Promoter, so every existing fake keeps compiling
+// and a fake without it degrades instead of panicking (README.md § "Withdraw
+// intent").
+type IntentWithdrawer interface {
+	WithdrawIntent(ctx context.Context, req WithdrawIntentRequest) (Withdrawal, error)
 }
 
 // EjectionReader is the ejection visibility reads (ADR-093 slice 3): a

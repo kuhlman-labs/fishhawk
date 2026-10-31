@@ -208,9 +208,15 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   0 on an active row) is the database-clock age the sweep's backoff keys on,
   so no Go `time.Now()` is compared against `settled_at`.
 
-**Capabilities.** `Promoter`, `EjectionReader`, `ReentryReader` and
-`Resumer` (§ "AdmitNextReclaiming") are SEPARATE interfaces, not part of
-`Store`; `PostgresStore` implements all four. A caller type-asserts the capability on its `Store`, so a fake that
+- **`WithdrawIntent(WithdrawIntentRequest{RunID, Record})`** →
+  `Withdrawal{Entry, LiveRunID}` (`IntentWithdrawer`): settles the run's
+  YIELDED held entry `dropped` with `ReasonIntentWithdrawn` in one
+  transaction, `Record` before COMMIT (§ "Withdraw intent").
+
+**Capabilities.** `Promoter`, `IntentWithdrawer` (§ "Withdraw intent"),
+`EjectionReader`, `ReentryReader` and `Resumer` (§ "AdmitNextReclaiming")
+are SEPARATE interfaces, not part of `Store`; `PostgresStore` implements all
+five. A caller type-asserts the capability on its `Store`, so a fake that
 embeds a (possibly nil) `Store` and does not implement one degrades instead of
 panicking on a nil embedded call (approval condition M1 of #4297).
 
@@ -371,6 +377,54 @@ entries in its account.
   append would run on another connection and wait on the insert's own `FOR
   KEY SHARE`), `Record` receives the transaction, and Promote only UPDATEs a
   non-key column, so no foreign-key lock on the runs row is taken.
+
+### Withdraw intent
+
+ADR-112 R3's withdraw-intent verb (#4685). A yielded entry still carries the
+operator's merge intent, so the queue owns the run's merge (ADR-109) and the
+inline `merge_run` is refused. `WithdrawIntent(WithdrawIntentRequest{RunID,
+Record})` → `Withdrawal{Entry, LiveRunID}` takes the merge out of the queue by
+SETTLING the entry, never by clearing `merge_intent_at` (0107's "set once,
+never cleared" holds; no migration).
+
+- **Order.** Promote's: the run's account (unknown run → `ErrNotFound`), the
+  per-run lock, an unlocked peek of the active entry, the base lock BLOCKING,
+  the entry re-read `FOR UPDATE`.
+- **Refusals**, classified on the re-read row in this order: no active entry
+  (none, only terminal rows, or settled between the peek and the lock) →
+  `ErrNotQueued`; live → `ErrEntryLive` (never withdrawn mid-pass); no merge
+  intent → `ErrNoIntent`; held but UNMARKED → `ErrEntryNotYielded` (it is
+  progressing to the queue's own head-pinned merge); then any
+  `merge_dispatch_claims` row for the run, `dispatched` or
+  `dispatch_failed`, read inside the transaction → `ErrDispatchClaimed`,
+  naming the claim's state, path and head. Nil `RunID` or nil `Record` →
+  `ErrInvalidRequest` before any SQL. Every refusal writes nothing
+  (`TestWithdrawIntent_RefusalsWriteNothing`, read back, including the
+  claim).
+- **Write.** `settleTx(..., StateDropped, ReasonIntentWithdrawn)`: only
+  `state`, `eject_reason` and `settled_at` change, so `enqueued_at`,
+  `merge_intent_at`, `merge_intent_sequence` and the yield columns are
+  retained as history (`TestWithdrawIntent_SettlesYieldedEntryDropped`).
+  `LiveRunID` is the base's live run, read inside the transaction.
+- **Record.** REQUIRED, called after the settle and before COMMIT; a non-nil
+  error rolls the whole withdrawal back (`TestWithdrawIntent_RecordErrorRollsBack`).
+  The server appends `merge_queue_intent_withdrawn` through it on `tx`; the
+  settle touches no key column, so (the `PromoteRequest.Record` precedent)
+  the append takes no foreign-key lock on the runs row.
+- **Ledger.** The claim is READ, never written: a `dispatch_failed` claim is
+  never silently cleared, and still needs reconciliation or the operator
+  re-arm (§ "Merge-dispatch ledger"). The server calls `WithdrawIntent` under
+  `WithMergeIntentLock`, the lock every `ClaimMergeDispatch` caller holds,
+  so no claim lands between the read and the settle.
+- **Every intent lookup then reads the intent as absent.** The entry is
+  terminal: `ActiveForRun` (the server's queue-ownership check and the
+  delegated arm) and the held arm of the merge-candidate gate find nothing,
+  `AdmitNext` never sees it, and `ReentryCandidates` / `UnresolvedEjections`
+  need an `ejected` newest row, so a later red-pass eject of the dropped row
+  settles nothing and the run never re-enters
+  (`TestWithdrawIntent_SuppressesAutoReentry`). A later `merge_run` that the
+  merge-candidate gate routes back to the queue records intent on a FRESH
+  row.
 
 ### Admission-epoch CAS
 
@@ -556,8 +610,9 @@ change nothing (ADR-093 slice 2, rejection item 1):
 
 ## Reasons
 
-The store writes exactly one reason itself: `base_changed` (`ReasonBaseChanged`).
-Every other reason is the caller's string. It READS one: `ReentryCandidates`
+The store writes two reasons itself: `base_changed` (`ReasonBaseChanged`,
+`Enqueue`'s base change) and `intent_withdrawn` (`ReasonIntentWithdrawn`,
+`WithdrawIntent`, both dropped). Every other reason is the caller's string. It READS one: `ReentryCandidates`
 matches `ReentryReason` (`verify_failed`), the only ejection ADR-093 D4
 re-enters automatically. ADR-092's set (owned by the server
 serializer): dropped `run_terminal`, `run_cancelled`, `pr_merged_externally`,
@@ -589,8 +644,8 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   base lock → the live check (and its re-claim, whose `Record` runs under the
   base lock and the live row's lock, before COMMIT) → the first unmarked held
   row by effective key.
-- `Promote`: per-run lock → peek → the entry's base lock → the row `FOR
-  UPDATE` (Enqueue's order with one base).
+- `Promote` and `WithdrawIntent`: per-run lock → peek → the entry's base
+  lock → the row `FOR UPDATE` (Enqueue's order with one base).
 
 No path takes a row lock before an advisory lock, and multi-key acquisition is
 ascending, so the order is acyclic. The one-live-per-base guarantee is the

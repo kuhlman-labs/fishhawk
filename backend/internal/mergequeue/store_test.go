@@ -3899,3 +3899,367 @@ func TestApprovalWait_RetainedAnchorAfterClear(t *testing.T) {
 		t.Fatalf("(i) ApprovalWait in a later epoch = %+v, want expired at once on the retained anchor %v, the wait re-opened", res, anchor)
 	}
 }
+
+// --- ADR-112 R3 withdraw intent (#4685) ---
+
+// withdrawRecorder records every WithdrawIntent Record call and the entry's
+// state as the callback reads it ON tx (the settle visible, nothing
+// committed).
+type withdrawRecorder struct {
+	calls     []Withdrawal
+	stateOnTx []string
+	readOnTxE error
+	err       error
+}
+
+func (r *withdrawRecorder) record(ctx context.Context, tx pgx.Tx, w Withdrawal) error {
+	r.calls = append(r.calls, w)
+	var st string
+	if err := tx.QueryRow(ctx, `SELECT state FROM merge_candidate_queue_entries WHERE id = $1`, w.Entry.ID).Scan(&st); err != nil {
+		r.readOnTxE = err
+	}
+	r.stateOnTx = append(r.stateOnTx, st)
+	return r.err
+}
+
+// yieldedIntent enqueues runID held on main at head, YIELDED by construction
+// (the merge_run queue arm's Enqueue{MergeIntent, Yield}) with intent
+// sequence seq, and returns the row read back.
+func (f *fixture) yieldedIntent(runID uuid.UUID, head string, seq int64) Entry {
+	f.t.Helper()
+	res, err := f.store.Enqueue(context.Background(), EnqueueRequest{RunID: runID, BaseRef: "main", HeadSHA: head,
+		MergeIntent: true, IntentSequence: seq, Yield: &YieldMarker{Reason: "forge_approval_absent", Detail: "no approving review"}})
+	if err != nil {
+		f.t.Fatalf("Enqueue(%s yielded intent): %v", runID, err)
+	}
+	e := f.entry(res.Entry.ID)
+	if e.State != StateHeld || !e.Yielded() || e.MergeIntentAt == nil {
+		f.t.Fatalf("seeded entry = %+v, want held, yielded, with intent", e)
+	}
+	return e
+}
+
+// claimRow reads runID's merge_dispatch_claims row back (found=false: none).
+func (f *fixture) claimRow(runID uuid.UUID) (DispatchClaim, bool) {
+	f.t.Helper()
+	c, found, err := f.store.MergeDispatch(context.Background(), runID)
+	if err != nil {
+		f.t.Fatalf("MergeDispatch(%s): %v", runID, err)
+	}
+	return c, found
+}
+
+// sameEntryState reports whether two reads of one row agree on everything a
+// withdrawal could write: state, reason, settle, intent and marker.
+func sameEntryState(a, b Entry) bool {
+	eqT := func(x, y *time.Time) bool { return (x == nil) == (y == nil) && (x == nil || x.Equal(*y)) }
+	return a.ID == b.ID && a.State == b.State && a.EjectReason == b.EjectReason && eqT(a.SettledAt, b.SettledAt) &&
+		eqT(a.MergeIntentAt, b.MergeIntentAt) && a.MergeIntentSequence == b.MergeIntentSequence &&
+		eqT(a.YieldedAt, b.YieldedAt) && a.YieldReason == b.YieldReason && a.YieldRevision == b.YieldRevision
+}
+
+// TestWithdrawIntent_SettlesYieldedEntryDropped: with A live, B held and Y
+// held YIELDED with intent, withdrawing Y settles it dropped intent_withdrawn
+// in one transaction, read back as COMMITTED state: ActiveForRun(Y) finds
+// nothing, LatestForRun(Y) is the dropped row with its merge_intent_at,
+// merge_intent_sequence and yield marker retained, Record ran exactly once
+// on tx seeing the settle, and A and B are untouched. Replacing the settle
+// with a re-read (CF1's store half) leaves Y held: RED.
+func TestWithdrawIntent_SettlesYieldedEntryDropped(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	a, b, y := f.run(), f.run(), f.run()
+	f.enqueue(a, "main", "ha")
+	f.enqueue(b, "main", "hb")
+	f.admitNext(mainBase())
+	before := f.yieldedIntent(y, "hy", 41)
+
+	rec := &withdrawRecorder{}
+	w, err := f.store.WithdrawIntent(ctx, WithdrawIntentRequest{RunID: y, Record: rec.record})
+	if err != nil {
+		t.Fatalf("WithdrawIntent(Y): %v", err)
+	}
+	if w.Entry.ID != before.ID || w.Entry.State != StateDropped || w.Entry.EjectReason != ReasonIntentWithdrawn ||
+		w.LiveRunID == nil || *w.LiveRunID != a {
+		t.Fatalf("Withdrawal = %+v (live %v), want Y's entry dropped %s behind live A", w.Entry, w.LiveRunID, ReasonIntentWithdrawn)
+	}
+	if len(rec.calls) != 1 || rec.readOnTxE != nil || rec.stateOnTx[0] != string(StateDropped) {
+		t.Fatalf("Record calls = %d (state on tx %v, err %v), want one call seeing the settle", len(rec.calls), rec.stateOnTx, rec.readOnTxE)
+	}
+
+	if _, found, err := f.store.ActiveForRun(ctx, y); err != nil || found {
+		t.Fatalf("ActiveForRun(Y) after withdraw = found %v, err %v; want no active entry", found, err)
+	}
+	got, found, err := f.store.LatestForRun(ctx, y)
+	if err != nil || !found {
+		t.Fatalf("LatestForRun(Y) = found %v, err %v", found, err)
+	}
+	if got.ID != before.ID || got.State != StateDropped || got.EjectReason != ReasonIntentWithdrawn || got.SettledAt == nil {
+		t.Fatalf("Y's row after withdraw = %+v, want the same row dropped %s", got, ReasonIntentWithdrawn)
+	}
+	if got.MergeIntentAt == nil || !got.MergeIntentAt.Equal(*before.MergeIntentAt) || got.MergeIntentSequence != 41 ||
+		!got.Yielded() || got.YieldReason != before.YieldReason || !got.EnqueuedAt.Equal(before.EnqueuedAt) {
+		t.Fatalf("Y's row after withdraw = %+v, want merge_intent_at, sequence 41, marker and enqueued_at retained (%+v)", got, before)
+	}
+	if order := f.listRuns(mainBase()); !slices.Equal(order, []uuid.UUID{a, b}) {
+		t.Fatalf("ListForBase after withdraw = %v, want A, B", order)
+	}
+	if st := f.status(a); st.Entry.State != StateLive {
+		t.Fatalf("A = %s, want still live", st.Entry.State)
+	}
+	if st := f.status(b); st.Entry.State != StateHeld || st.Entry.Yielded() || st.Position != 1 {
+		t.Fatalf("B = %+v (position %d), want still held first, unmarked", st.Entry, st.Position)
+	}
+}
+
+// TestWithdrawIntent_RefusalsWriteNothing: one row per refusal, each seeded
+// BY CONSTRUCTION so the refusal under test is the only guard in the path,
+// and each read back as COMMITTED state unchanged (the entry's state, reason,
+// intent and marker, and the run's dispatch claim) with Record never called.
+// Deleting the no-intent, unmarked-entry or dispatch-claim guard settles that
+// row's entry dropped: RED on the state read-back. The live-entry refusal is
+// pinned by error identity only: without it the row falls through to the
+// not-held guard (ErrNotQueued), which also writes nothing (a masking
+// downstream guard, declared).
+func TestWithdrawIntent_RefusalsWriteNothing(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name string
+		// seed returns the run and the entry id to read back (uuid.Nil: none).
+		seed      func(f *fixture) (uuid.UUID, uuid.UUID)
+		want      error
+		wantClaim DispatchState // "" = no claim
+	}{
+		{name: "no entry", want: ErrNotQueued, seed: func(f *fixture) (uuid.UUID, uuid.UUID) { return f.run(), uuid.Nil }},
+		{name: "terminal only", want: ErrNotQueued, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			e := f.yieldedIntent(r, "h1", 3)
+			if _, err := f.store.Settle(ctx, e.ID, StateEjected, ReentryReason); err != nil {
+				f.t.Fatalf("Settle: %v", err)
+			}
+			return r, e.ID
+		}},
+		{name: "settled between peek and lock", want: ErrNotQueued, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			e := f.yieldedIntent(r, "h1", 3)
+			f.store.afterWithdrawPeek = func(context.Context) {
+				if _, err := NewPostgresStore(f.pool).Settle(ctx, e.ID, StateDropped, "pr_closed"); err != nil {
+					f.t.Errorf("settle in hook: %v", err)
+				}
+			}
+			return r, e.ID
+		}},
+		{name: "live", want: ErrEntryLive, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h1", MergeIntent: true})
+			if err != nil {
+				f.t.Fatalf("Enqueue: %v", err)
+			}
+			f.admitAt(res.Entry.ID)
+			return r, res.Entry.ID
+		}},
+		{name: "yielded without intent", want: ErrNoIntent, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h1",
+				Yield: &YieldMarker{Reason: "forge_approval_absent"}})
+			if err != nil {
+				f.t.Fatalf("Enqueue: %v", err)
+			}
+			if e := f.entry(res.Entry.ID); !e.Yielded() || e.MergeIntentAt != nil {
+				f.t.Fatalf("seed = %+v, want yielded with no intent", e)
+			}
+			return r, res.Entry.ID
+		}},
+		{name: "unmarked held with intent", want: ErrEntryNotYielded, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			res, err := f.store.Enqueue(ctx, EnqueueRequest{RunID: r, BaseRef: "main", HeadSHA: "h1", MergeIntent: true})
+			if err != nil {
+				f.t.Fatalf("Enqueue: %v", err)
+			}
+			if e := f.entry(res.Entry.ID); e.Yielded() || e.MergeIntentAt == nil || e.State != StateHeld {
+				f.t.Fatalf("seed = %+v, want held, unmarked, with intent", e)
+			}
+			return r, res.Entry.ID
+		}},
+		{name: "dispatch_failed claim", want: ErrDispatchClaimed, wantClaim: DispatchFailed, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			e := f.yieldedIntent(r, "h1", 3)
+			if _, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathInline, "h0"); err != nil {
+				f.t.Fatalf("claim: %v", err)
+			}
+			if err := f.store.MarkMergeDispatchFailed(ctx, r, "forge 500"); err != nil {
+				f.t.Fatalf("mark failed: %v", err)
+			}
+			return r, e.ID
+		}},
+		{name: "dispatched claim", want: ErrDispatchClaimed, wantClaim: DispatchDispatched, seed: func(f *fixture) (uuid.UUID, uuid.UUID) {
+			r := f.run()
+			e := f.yieldedIntent(r, "h1", 3)
+			if _, err := f.store.ClaimMergeDispatch(ctx, r, DispatchPathQueue, "h1"); err != nil {
+				f.t.Fatalf("claim: %v", err)
+			}
+			return r, e.ID
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFixture(t)
+			r, id := tc.seed(f)
+			var before Entry
+			if id != uuid.Nil && tc.name != "settled between peek and lock" {
+				before = f.entry(id)
+			}
+			claimBefore, claimedBefore := f.claimRow(r)
+			rec := &withdrawRecorder{}
+			_, err := f.store.WithdrawIntent(ctx, WithdrawIntentRequest{RunID: r, Record: rec.record})
+			// COMMITTED state first (the claim, then the entry), so a deleted
+			// guard turns RED on what it protects, not only on the error.
+			claimAfter, claimedAfter := f.claimRow(r)
+			if claimedAfter != claimedBefore || claimAfter.State != claimBefore.State || claimAfter.Path != claimBefore.Path ||
+				claimAfter.FailureCause != claimBefore.FailureCause || !claimAfter.ClaimedAt.Equal(claimBefore.ClaimedAt) {
+				t.Fatalf("claim changed by a refused withdraw: before %+v (%v), after %+v (%v)", claimBefore, claimedBefore, claimAfter, claimedAfter)
+			}
+			switch {
+			case tc.name == "settled between peek and lock":
+				if e := f.entry(id); e.State != StateDropped || e.EjectReason != "pr_closed" {
+					t.Fatalf("entry = %s/%s, want the hook's dropped pr_closed (not re-settled)", e.State, e.EjectReason)
+				}
+			case id != uuid.Nil:
+				if after := f.entry(id); !sameEntryState(before, after) {
+					t.Fatalf("entry changed by a refused withdraw:\nbefore %+v\nafter  %+v", before, after)
+				}
+			default:
+				if n := f.count(`run_id = $1`, r); n != 0 {
+					t.Fatalf("rows for an unqueued run = %d, want 0", n)
+				}
+			}
+			if len(rec.calls) != 0 {
+				t.Fatalf("Record called %d times on a refusal, want 0", len(rec.calls))
+			}
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("WithdrawIntent err = %v, want %v", err, tc.want)
+			}
+			if tc.wantClaim != "" && (!claimedAfter || claimAfter.State != tc.wantClaim) {
+				t.Fatalf("claim = %+v (found %v), want %s still standing", claimAfter, claimedAfter, tc.wantClaim)
+			}
+			if tc.wantClaim == DispatchFailed && claimAfter.FailureCause != "forge 500" {
+				t.Fatalf("dispatch_failed cause = %q, want the original 'forge 500' (never cleared or re-armed)", claimAfter.FailureCause)
+			}
+			if tc.wantClaim != "" && !strings.Contains(err.Error(), string(tc.wantClaim)) {
+				t.Fatalf("err = %v, want it to name the claim state %s", err, tc.wantClaim)
+			}
+		})
+	}
+}
+
+// TestWithdrawIntent_RecordErrorRollsBack: a Record error is returned wrapped
+// and the whole withdrawal rolls back, read as COMMITTED state: the entry is
+// still the run's active held, yielded, intent-carrying row. A store that
+// ignored Record's error would commit the drop: RED.
+func TestWithdrawIntent_RecordErrorRollsBack(t *testing.T) {
+	f := newFixture(t)
+	r := f.run()
+	before := f.yieldedIntent(r, "h1", 9)
+	boom := errors.New("audit append failed")
+	rec := &withdrawRecorder{err: boom}
+	_, err := f.store.WithdrawIntent(context.Background(), WithdrawIntentRequest{RunID: r, Record: rec.record})
+	// COMMITTED state first: a store that ignored Record's error commits the
+	// drop, and this read turns RED on it.
+	if after := f.entry(before.ID); !sameEntryState(before, after) || after.State != StateHeld || !after.Yielded() {
+		t.Fatalf("entry after a failed Record = %+v, want the original held yielded row %+v", after, before)
+	}
+	if st := f.status(r); st.Entry.ID != before.ID {
+		t.Fatalf("active entry after a failed Record = %s, want %s", st.Entry.ID, before.ID)
+	}
+	if len(rec.calls) != 1 {
+		t.Fatalf("Record calls = %d, want 1", len(rec.calls))
+	}
+	if !errors.Is(err, boom) {
+		t.Fatalf("WithdrawIntent err = %v, want the Record error wrapped", err)
+	}
+}
+
+// TestWithdrawIntent_InvalidAndUnknown: a nil run id and a nil Record are
+// refused before any SQL (the entry read back unchanged); an unknown run is
+// ErrNotFound, which also matches run.ErrNotFound.
+func TestWithdrawIntent_InvalidAndUnknown(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	r := f.run()
+	before := f.yieldedIntent(r, "h1", 2)
+	rec := &withdrawRecorder{}
+	if _, err := f.store.WithdrawIntent(ctx, WithdrawIntentRequest{Record: rec.record}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("WithdrawIntent(nil run id) err = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := f.store.WithdrawIntent(ctx, WithdrawIntentRequest{RunID: r}); !errors.Is(err, ErrInvalidRequest) {
+		t.Fatalf("WithdrawIntent(nil Record) err = %v, want ErrInvalidRequest", err)
+	}
+	if _, err := f.store.WithdrawIntent(ctx, WithdrawIntentRequest{RunID: uuid.New(), Record: rec.record}); !errors.Is(err, ErrNotFound) || !errors.Is(err, run.ErrNotFound) {
+		t.Fatalf("WithdrawIntent(unknown run) err = %v, want ErrNotFound", err)
+	}
+	if !sameEntryState(before, f.entry(before.ID)) || len(rec.calls) != 0 {
+		t.Fatalf("entry changed or Record called (%d) by a refused withdraw", len(rec.calls))
+	}
+}
+
+// TestWithdrawIntent_SuppressesAutoReentry (approval condition 3): a
+// withdrawn intent stays absent from the ADR-093 D4 re-entry read. Runs W and
+// C have the same shape: an OLDER row ejected verify_failed with intent, and
+// a newer re-entered row held YIELDED with intent. PRE-withdraw, W's newest
+// row is yielded with intent, and neither run is a ReentryCandidates row
+// (the held re-entry is newest). W is withdrawn; C is the control. Then both
+// newest rows meet the event that makes a yielded entry a re-entry candidate
+// — a red pass ejecting it verify_failed (Settle) — and the read is taken
+// again: C's row IS a candidate (the path reaches candidacy, so the
+// assertion below is not vacuous), while W's dropped row is terminal, so the
+// eject settles nothing and no W row is ever a candidate. Skipping the
+// withdraw's settle (CF1's store half) leaves W held, the eject lands, and W
+// is listed: RED.
+func TestWithdrawIntent_SuppressesAutoReentry(t *testing.T) {
+	f := newFixture(t)
+	ctx := context.Background()
+	w, c := f.run(), f.run()
+	f.seedEjected(w, StateEjected, ReentryReason, true, 2*time.Hour)
+	f.seedEjected(c, StateEjected, ReentryReason, true, 2*time.Hour)
+	wEntry := f.yieldedIntent(w, "hw", 5)
+	cEntry := f.yieldedIntent(c, "hc", 6)
+	candidates := func() map[uuid.UUID][]uuid.UUID {
+		t.Helper()
+		es, err := f.store.ReentryCandidates(ctx, nil, 100)
+		if err != nil {
+			t.Fatalf("ReentryCandidates: %v", err)
+		}
+		out := map[uuid.UUID][]uuid.UUID{}
+		for _, e := range es {
+			out[e.RunID] = append(out[e.RunID], e.ID)
+		}
+		return out
+	}
+
+	if st := f.status(w); st.Entry.ID != wEntry.ID || !st.Entry.Yielded() || st.Entry.MergeIntentAt == nil {
+		t.Fatalf("pre-withdraw W = %+v, want its yielded intent entry active", st.Entry)
+	}
+	if got := candidates(); len(got[w]) != 0 || len(got[c]) != 0 {
+		t.Fatalf("pre-withdraw re-entry candidates = %v, want neither run (each newest row is held)", got)
+	}
+
+	if _, err := f.store.WithdrawIntent(ctx, WithdrawIntentRequest{RunID: w, Record: (&withdrawRecorder{}).record}); err != nil {
+		t.Fatalf("WithdrawIntent(W): %v", err)
+	}
+
+	for _, e := range []Entry{wEntry, cEntry} {
+		if _, err := f.store.Settle(ctx, e.ID, StateEjected, ReentryReason); err != nil {
+			t.Fatalf("red-pass eject of %s: %v", e.ID, err)
+		}
+	}
+	got := candidates()
+	if !slices.Equal(got[c], []uuid.UUID{cEntry.ID}) {
+		t.Fatalf("control C candidates = %v, want its ejected row %s (the fixture path must reach candidacy)", got[c], cEntry.ID)
+	}
+	if len(got[w]) != 0 {
+		t.Fatalf("withdrawn W candidates = %v, want none: a withdrawn intent is never re-entered", got[w])
+	}
+	if latest, _, err := f.store.LatestForRun(ctx, w); err != nil || latest.ID != wEntry.ID || latest.State != StateDropped || latest.EjectReason != ReasonIntentWithdrawn {
+		t.Fatalf("W newest row = %+v (%v), want its withdrawn row still dropped %s", latest, err, ReasonIntentWithdrawn)
+	}
+}
