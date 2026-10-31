@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -171,7 +172,7 @@ func seedConsolidateFixture(t *testing.T, gh *consolidateGitHub, implementAwaiti
 	}
 
 	arts := newFakeArtifactRepo()
-	o := &orchestrator.Orchestrator{Runs: rr, GitHub: gh, Audit: au, Artifacts: arts, DefaultRef: "main"}
+	o := &orchestrator.Orchestrator{Runs: rr, GitHub: gh, Audit: au, Artifacts: arts, DefaultBranch: defaultbranch.Static("main")}
 	s := New(Config{RunRepo: rr, AuditRepo: au, ArtifactRepo: arts, Orchestrator: o})
 	// Isolate the endpoint from the fire-and-forget consolidated implement
 	// review New() wires (#1060) — it is out of scope for this endpoint's

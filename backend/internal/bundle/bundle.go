@@ -1073,6 +1073,43 @@ func ExtractVerifyIdentity(bundleBytes []byte) (treeSHA, changeID string, err er
 	return tree, change, nil
 }
 
+// ExtractVerifyHead returns the head_sha carried by the bundle's AUTHORITATIVE
+// verify_run event — the SAME last event with a non-empty tree_sha that
+// ExtractVerifyIdentity reads — or ErrNoVerifyTreeSHA if the bundle parsed
+// cleanly but carried no such event (ADR-117 A1.7, E94.3 / #4694). It is the
+// head a trace review round actually JUDGED, recorded as the round's
+// reviewed_head.sha.
+//
+// Deliberately DISTINCT from ExtractHeadSHA, which returns the FIRST non-empty
+// head_sha as the #797 dedup key: on a multi-iteration fix loop the first head
+// is an absorbed earlier iteration's, not the certified one. head is empty —
+// with a nil error — when the authoritative event carries no head_sha. Only a
+// corrupt gzip frame / malformed line propagates as a different error.
+func ExtractVerifyHead(bundleBytes []byte) (string, error) {
+	lines, err := ReadEvents(bundleBytes)
+	if err != nil {
+		return "", err
+	}
+	tree, head := "", ""
+	for _, line := range lines {
+		if line.Kind != EventKindVerifyRun {
+			continue
+		}
+		var payload verifyRunPayload
+		if err := json.Unmarshal(line.Data, &payload); err != nil {
+			return "", fmt.Errorf("bundle: parse verify_run payload: %w", err)
+		}
+		if payload.TreeSHA != "" {
+			tree = payload.TreeSHA
+			head = payload.HeadSHA
+		}
+	}
+	if tree == "" {
+		return "", ErrNoVerifyTreeSHA
+	}
+	return head, nil
+}
+
 // ExtractGateEvidence returns the digested gate results carried in the
 // bundle's gate_evidence event (#963), or the zero value plus
 // ErrNoGateEvidence when the bundle parsed cleanly but carried none —

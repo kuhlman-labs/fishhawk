@@ -13,6 +13,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -200,7 +201,7 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 
-	target, ghaRunID, externalURL, hook, derr := s.dispatchRollback(r.Context(), runRow, deployStage, delegate, stored.Handle)
+	target, gitRef, ghaRunID, externalURL, hook, derr := s.dispatchRollback(r.Context(), runRow, deployStage, delegate, stored.Handle)
 	if derr != nil {
 		s.writeError(w, r, derr.status, derr.code, derr.message, derr.details)
 		return
@@ -219,7 +220,7 @@ func (s *Server) handleRollbackDeployment(w http.ResponseWriter, r *http.Request
 		"target":           target,
 		"workflow_ref":     delegate.WorkflowRef,
 		"url":              delegate.URL,
-		"git_ref":          rollbackGitRef(delegate),
+		"git_ref":          gitRef,
 		"gha_run_id":       ghaRunID,
 		"external_run_url": externalURL,
 		"rollback":         true,
@@ -292,15 +293,22 @@ func (e *rollbackDispatchError) Error() string { return e.code + ": " + e.messag
 // deployment rollback_handle each target carries to the pipeline (E35.3 /
 // #1600). A dispatch failure returns a *rollbackDispatchError the handler maps
 // to the response.
-func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (target string, ghaRunID int64, externalURL string, hook *webhookDeployResult, derr *rollbackDispatchError) {
+//
+// gitRef is the ref the deployment_rollback_initiated payload records: for
+// github_actions the ref ACTUALLY dispatched (the pinned git_ref, else the
+// resolved forge default branch, #4660); for webhook the delegate's git_ref
+// verbatim ("" when unpinned) — a webhook rollback dispatches no ref, so it
+// never reads the forge.
+func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (target, gitRef string, ghaRunID int64, externalURL string, hook *webhookDeployResult, derr *rollbackDispatchError) {
 	switch delegate.Target {
 	case spec.DelegateTargetGitHubActions:
-		target, ghaRunID, externalURL, derr = s.dispatchRollbackGitHubActions(ctx, runRow, stage, delegate, rollbackHandle)
-		return target, ghaRunID, externalURL, nil, derr
+		target, gitRef, ghaRunID, externalURL, derr = s.dispatchRollbackGitHubActions(ctx, runRow, stage, delegate, rollbackHandle)
+		return target, gitRef, ghaRunID, externalURL, nil, derr
 	case spec.DelegateTargetWebhook:
-		return s.dispatchRollbackWebhook(ctx, runRow, stage, delegate, rollbackHandle)
+		target, ghaRunID, externalURL, hook, derr = s.dispatchRollbackWebhook(ctx, runRow, stage, delegate, rollbackHandle)
+		return target, delegate.GitRef, ghaRunID, externalURL, hook, derr
 	default:
-		return "", 0, "", nil, &rollbackDispatchError{
+		return "", "", 0, "", nil, &rollbackDispatchError{
 			status:  http.StatusUnprocessableEntity,
 			code:    "rollback_unconfigured",
 			message: fmt.Sprintf("deploy delegate target %q is not supported", delegate.Target),
@@ -309,9 +317,9 @@ func (s *Server) dispatchRollback(ctx context.Context, runRow *run.Run, stage *r
 	}
 }
 
-func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (string, int64, string, *rollbackDispatchError) {
+func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.Run, stage *run.Stage, delegate *spec.DelegateConfig, rollbackHandle string) (string, string, int64, string, *rollbackDispatchError) {
 	if delegate.WorkflowRef == "" {
-		return "", 0, "", &rollbackDispatchError{
+		return "", "", 0, "", &rollbackDispatchError{
 			status: http.StatusUnprocessableEntity, code: "rollback_unconfigured",
 			message: "github_actions delegate is missing workflow_ref",
 		}
@@ -321,27 +329,30 @@ func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.
 		// client. Unlike slice-1's trigger (which parks at dispatched in the
 		// un-wired posture), an operator-triggered rollback fails loud so the
 		// caller knows nothing fired.
-		return "", 0, "", &rollbackDispatchError{
+		return "", "", 0, "", &rollbackDispatchError{
 			status: http.StatusServiceUnavailable, code: "rollback_unconfigured",
 			message: "github_actions rollback requires a configured GitHub client",
 		}
 	}
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		return "", 0, "", &rollbackDispatchError{
+		return "", "", 0, "", &rollbackDispatchError{
 			status: http.StatusUnprocessableEntity, code: "rollback_unconfigured",
 			message: "run has no installation_id; cannot dispatch the rollback workflow",
 		}
 	}
 	repo, err := parseRepoRef(runRow.Repo)
 	if err != nil {
-		return "", 0, "", &rollbackDispatchError{
+		return "", "", 0, "", &rollbackDispatchError{
 			status: http.StatusUnprocessableEntity, code: "rollback_unconfigured",
 			message: err.Error(), details: map[string]any{"repo": runRow.Repo},
 		}
 	}
 	scope := forge.FromGitHubInstallationID(*runRow.InstallationID)
 
-	branch := rollbackGitRef(delegate)
+	branch, derr := s.rollbackGitRef(ctx, runRow, delegate)
+	if derr != nil {
+		return "", "", 0, "", derr
+	}
 	correlation := map[string]string{
 		"fishhawk_run_id":     stage.RunID.String(),
 		"fishhawk_stage_id":   stage.ID.String(),
@@ -361,7 +372,7 @@ func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.
 	dispatchedAt := time.Now().UTC()
 	if err := s.cfg.GitHub.DispatchWorkflow(ctx, scope, repo,
 		delegate.WorkflowRef, branch, githubclient.DispatchInputs(inputs)); err != nil {
-		return "", 0, "", &rollbackDispatchError{
+		return "", "", 0, "", &rollbackDispatchError{
 			status: http.StatusBadGateway, code: "rollback_dispatch_failed",
 			message: "workflow_dispatch of the rollback path failed",
 			details: map[string]any{"error": err.Error(), "workflow_ref": delegate.WorkflowRef, "git_ref": branch},
@@ -391,7 +402,7 @@ func (s *Server) dispatchRollbackGitHubActions(ctx context.Context, runRow *run.
 		ghaRunID = resolved.ID
 		externalURL = resolved.HTMLURL
 	}
-	return spec.DelegateTargetGitHubActions, ghaRunID, externalURL, nil
+	return spec.DelegateTargetGitHubActions, branch, ghaRunID, externalURL, nil
 }
 
 // dispatchRollbackWebhook POSTs the rollback payload through the SAME shared
@@ -481,11 +492,27 @@ func deployDelegateForRun(runRow *run.Run) (*spec.DelegateConfig, error) {
 }
 
 // rollbackGitRef resolves the git ref the rollback workflow_dispatch targets:
-// the delegate's explicit git_ref, or "main" when the spec pins none (matching
-// slice-1's trigger default).
-func rollbackGitRef(delegate *spec.DelegateConfig) string {
+// the delegate's explicit git_ref verbatim (no forge read), else the
+// repository's forge default_branch (#4660, matching the forward trigger). An
+// unresolved read refuses 502 rollback_dispatch_failed naming the reason, so
+// nothing is dispatched and no deployment_rollback_initiated row is written.
+func (s *Server) rollbackGitRef(ctx context.Context, runRow *run.Run, delegate *spec.DelegateConfig) (string, *rollbackDispatchError) {
 	if delegate.GitRef != "" {
-		return delegate.GitRef
+		return delegate.GitRef, nil
 	}
-	return "main"
+	branch, err := s.resolveRunDefaultBranch(ctx, runRow)
+	if err != nil {
+		reason, _ := defaultbranch.ReasonOf(err)
+		return "", &rollbackDispatchError{
+			status: http.StatusBadGateway, code: "rollback_dispatch_failed",
+			message: fmt.Sprintf("the repository's default branch could not be resolved (%s); pin executor.delegate.git_ref in the workflow spec or restore the forge default-branch read", reason),
+			details: map[string]any{
+				"reason":                           "default_branch_unresolved",
+				"default_branch_unresolved_reason": string(reason),
+				"error":                            err.Error(),
+				"workflow_ref":                     delegate.WorkflowRef,
+			},
+		}
+	}
+	return branch, nil
 }

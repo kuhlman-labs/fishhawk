@@ -129,7 +129,13 @@ type campaignResponse struct {
 	// inherits when the per-item call passes none. omitempty so an unbound
 	// campaign carries no working_dir key — the same convention runResponse
 	// uses for the run-level binding.
-	WorkingDir string    `json:"working_dir,omitempty"`
+	WorkingDir string `json:"working_dir,omitempty"`
+	// RunnerKind is the OPTIONAL campaign-level runner kind (#4485): the
+	// runner_kind every item run minted from this campaign inherits when the
+	// per-item call passes none. omitempty so a campaign with no recorded kind
+	// carries no runner_kind key (its item runs then resolve 'local' from a
+	// working_dir binding, else the github_actions default).
+	RunnerKind string    `json:"runner_kind,omitempty"`
 	CreatedAt  time.Time `json:"created_at"`
 	UpdatedAt  time.Time `json:"updated_at"`
 	// Idempotent is set true ONLY on an idempotent-replay response: a POST
@@ -379,6 +385,15 @@ type createCampaignRequest struct {
 	// item run then needs #2498's explicit per-item value (a local one is
 	// refused working_dir_required without either).
 	WorkingDir string `json:"working_dir,omitempty"`
+	// RunnerKind is the OPTIONAL campaign-level runner kind (#4485): recorded
+	// ONCE here, every item run minted from this campaign inherits it when POST
+	// /v0/campaigns/{id}/runs passes no per-item runner_kind. When non-empty it
+	// must be one of run.ValidRunnerKinds (400 validation_failed otherwise).
+	// Omit it to record none: each item run then resolves through the rest of
+	// the ladder — 'local' when the campaign binds working_dir, else the
+	// github_actions default. Bind 'local' together with working_dir for a
+	// local campaign.
+	RunnerKind string `json:"runner_kind,omitempty"`
 	// GroomingSource is the OPTIONAL THIRD campaign source (E54.6 / #2238): an
 	// approved grooming run whose ratified priority order becomes this
 	// campaign's queue. Its PRESENCE selects the source and it is MUTUALLY
@@ -453,6 +468,9 @@ func toCampaignResponse(c *campaign.Campaign) campaignResponse {
 		// The campaign-level checkout binding (E48.87 / #2527). Empty → omitted,
 		// so an unbound campaign carries no working_dir key.
 		WorkingDir: c.WorkingDir,
+		// The campaign-level runner kind (#4485). Empty → omitted, so a campaign
+		// with no recorded kind carries no runner_kind key.
+		RunnerKind: c.RunnerKind,
 		// Durable grooming provenance, raw JSON passthrough (E54.6 / #2238):
 		// nil bytes → omitted. Read from the COLUMN, so a campaign names its
 		// source order for as long as the row exists — the create response is a
@@ -845,6 +863,17 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "working_dir", "got": req.WorkingDir})
 		return
 	}
+	// runner_kind is the OPTIONAL campaign-level runner kind (#4485). When
+	// non-empty it must be a known runner kind — a bogus value stored on the
+	// campaign would be inherited by every item run. Validated HERE, with the
+	// other body checks and BEFORE the provider selector, so a typo costs no
+	// forge round-trip and persists no campaign.
+	if _, ok := run.ValidRunnerKinds[req.RunnerKind]; req.RunnerKind != "" && !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			validRunnerKindsMessage,
+			map[string]any{"field": "runner_kind", "got": req.RunnerKind})
+		return
+	}
 	// provider is the OPTIONAL work-item provider selector (#3645), validated
 	// here — with the other body checks and BEFORE the conventions load, the
 	// provider dispatch and the installation lookup — so a typo costs no forge
@@ -923,6 +952,10 @@ func (s *Server) handleCreateCampaign(w http.ResponseWriter, r *http.Request) {
 	// it reaches the persisted campaign (E48.87 / #2527). Empty = no binding;
 	// every item run then falls back to #2498's explicit per-item working_dir.
 	assembly.WorkingDir = req.WorkingDir
+	// Thread the validated campaign-level runner kind onto the assembly so it
+	// reaches the persisted campaign (#4485). Empty = not recorded; every item
+	// run then resolves it from the working_dir binding or the default.
+	assembly.RunnerKind = req.RunnerKind
 	// Thread the non-empty Idempotency-Key onto the assembly so it is stored on
 	// the campaign (E25.13), making a later replay resolvable. Empty = nil = no
 	// key (the unchanged default).
@@ -2113,6 +2146,10 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	items = holdObservedEdges(items, refresh)
 
 	hold := s.campaignDispatchHoldForStatus(r.Context(), c)
+	// Campaign-wide pending scope amendments (E86.85 / #4486), computed over
+	// the FINAL item slice. Omitted (not computed) for a caller without
+	// read:audit or on a read failure; the status read never fails on it.
+	pending := s.campaignPendingAmendmentsForStatus(r.Context(), c, items)
 
 	elig := campaign.NextEligible(items)
 	out := make([]campaignItemResponse, 0, len(items))
@@ -2139,6 +2176,9 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 			}
 		}
 		body["dispatch_hold"] = toDispatchHoldPayload(hold, ref)
+	}
+	if pending != nil {
+		body["pending_amendments"] = pending
 	}
 	s.writeJSON(w, r, http.StatusOK, body)
 }
@@ -2429,8 +2469,10 @@ const (
 
 // startCampaignItemRunRequest is the POST /v0/campaigns/{campaign_id}/runs body.
 // issue_ref + workflow_id are required; workflow_ref (empty = the repo's default
-// branch) and runner_kind (empty = github_actions; pass "local" for the local
-// dogfood loop) are optional. There is deliberately NO idempotency_key field:
+// branch) and runner_kind are optional. runner_kind is a per-item OVERRIDE
+// (#4485): empty resolves through resolveCampaignItemRunnerKind's ladder — the
+// campaign's recorded runner_kind, else 'local' when the campaign binds
+// working_dir, else github_actions. There is deliberately NO idempotency_key field:
 // the server does not dedup this create-link-transition sequence, so advertising
 // one would be a field the server ignores (#1443 honesty). A caller that needs
 // idempotency gates on the DAG eligibility instead — a re-POST against an
@@ -2470,11 +2512,19 @@ type startCampaignItemRunRequest struct {
 // running on its first dispatch. A non-empty non-absolute working_dir 400s
 // validation_failed, mirroring POST /v0/runs.
 //
+// The minted run's runner kind is resolved FIRST, through the four-rung #4485
+// ladder in resolveCampaignItemRunnerKind — an explicit per-item runner_kind
+// (an override, recorded on the run row) > the campaign's recorded runner_kind
+// (re-validated against run.ValidRunnerKinds) > 'local' when the campaign binds
+// working_dir > the github_actions default. The applied kind and its source are
+// stated in the 201 body's runner_kind_resolution and the campaign_issue_started
+// audit payload.
+//
 // The minted run's checkout is resolved through the E48.87 / #2527 ladder —
 // explicit per-item value (accepted even when it conflicts, as a deliberate
 // override) > the campaign's own working_dir binding (re-validated absolute) >
-// a working_dir_required 400 for a local item with neither. The ladder runs
-// BEFORE any mutation (item restart, run mint, link) so a refusal leaves no
+// a working_dir_required 400 for an item whose RESOLVED runner kind is local
+// with neither. Both ladders run BEFORE any mutation (item restart, run mint, link) so a refusal leaves no
 // committed state.
 //
 // The nil-CampaignRepo guard is checked BEFORE the write-scope check so an
@@ -2578,6 +2628,29 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Resolve the minted run's runner kind (#4485) BEFORE the checkout ladder,
+	// which keys its working_dir_required rung on the RESOLVED kind: a campaign
+	// that recorded runner_kind local with no checkout is refused rather than
+	// minting a checkout-less local run.
+	runnerKind, kindSource := resolveCampaignItemRunnerKind(req.RunnerKind, c)
+	// An INHERITED value is re-validated — the smuggled-row guard, mirroring
+	// the working_dir re-validation below: a bogus kind written onto a campaign
+	// row by a direct DB write cannot bypass the create-time check by arriving
+	// through a different door.
+	if _, ok := run.ValidRunnerKinds[runnerKind]; kindSource == runnerKindSourceCampaign && !ok {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"the campaign's recorded runner_kind is not a valid runner kind ("+validRunnerKindsMessage+"); pass runner_kind for this item",
+			map[string]any{"field": "runner_kind", "got": runnerKind, "campaign_id": id.String()})
+		return
+	}
+	if kindSource == runnerKindSourceExplicit && c.RunnerKind != "" && req.RunnerKind != c.RunnerKind {
+		s.cfg.Logger.Info("campaign item run overrides the campaign runner_kind",
+			"campaign_id", id.String(),
+			"issue_ref", req.IssueRef,
+			"campaign_runner_kind", c.RunnerKind,
+			"override_runner_kind", req.RunnerKind)
+	}
+
 	// Resolve the minted run's checkout through the campaign ladder (E48.87 /
 	// #2527). The campaign binds the checkout ONCE at create; this is where an
 	// item run inherits it, so the operator stops re-typing an identical
@@ -2598,8 +2671,9 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	//     smuggled onto a campaign row (a direct DB write, or a row predating
 	//     the create-time guard) cannot bypass validation by arriving through a
 	//     different door.
-	//  3. Otherwise, a LOCAL item with no resolvable checkout is refused
-	//     working_dir_required. This is #2498's rung-3 refusal relocated from
+	//  3. Otherwise, an item whose RESOLVED runner kind is local (#4485: an
+	//     explicit value, or one inherited from the campaign) with no
+	//     resolvable checkout is refused working_dir_required. This is #2498's rung-3 refusal relocated from
 	//     the MCP tool to here, because the MCP layer cannot see the campaign's
 	//     binding without a read; it stays transport-independent (it fires for
 	//     stdio and HTTP MCP clients alike) and now also covers direct REST
@@ -2622,7 +2696,7 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 			return
 		}
 		workingDir = c.WorkingDir
-	case req.RunnerKind == string(run.RunnerKindLocal):
+	case runnerKind == run.RunnerKindLocal:
 		s.writeError(w, r, http.StatusBadRequest, "working_dir_required",
 			"a local item run needs a resolvable checkout: bind working_dir once at fishhawk_start_campaign so every item run inherits it, or pass an absolute working_dir for this item",
 			map[string]any{"field": "working_dir", "campaign_id": id.String(), "issue_ref": req.IssueRef})
@@ -2873,8 +2947,9 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	// Mint the run via the reused seam, carrying runner_kind so the local loop
-	// gets runner_kind:local. A resolution failure (installation/spec) surfaces
+	// Mint the run via the reused seam, carrying the LADDER-RESOLVED runner kind
+	// (#4485) so a local campaign's item runs get runner_kind:local without the
+	// caller re-typing it. A resolution failure (installation/spec) surfaces
 	// 502 — the same upstream-dependency class as the create handler's
 	// epic_children_query_failed — leaving the item un-started for a retry.
 	runRow, err := s.StartRunForCampaignIssue(r.Context(), StartRunForCampaignIssueParams{
@@ -2882,7 +2957,7 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		IssueRef:    req.IssueRef,
 		WorkflowID:  req.WorkflowID,
 		WorkflowRef: req.WorkflowRef,
-		RunnerKind:  req.RunnerKind,
+		RunnerKind:  runnerKind,
 		// The LADDER-RESOLVED checkout (E48.87 / #2527), not req.WorkingDir: an
 		// item run that passed none inherits the campaign's binding here, and the
 		// minted run row therefore records the resolution that actually applied.
@@ -2929,6 +3004,9 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 		"campaign_id": id.String(),
 		"issue_ref":   item.IssueRef,
 		"run_id":      runRow.ID.String(),
+		// The applied runner kind and why it applied (#4485).
+		"runner_kind":        runnerKind,
+		"runner_kind_source": kindSource,
 	})
 
 	// Derive the campaign forward: a pending campaign becomes running on its
@@ -2954,7 +3032,47 @@ func (s *Server) handleStartCampaignItemRun(w http.ResponseWriter, r *http.Reque
 	s.writeJSON(w, r, http.StatusCreated, map[string]any{
 		"run":  toRunResponse(runRow),
 		"item": toCampaignItemResponse(updatedItem),
+		// The applied runner kind and its source (#4485), so a caller that
+		// omitted runner_kind sees which rung of the ladder decided it.
+		"runner_kind_resolution": campaignRunnerKindResolution{RunnerKind: runnerKind, Source: kindSource},
 	})
+}
+
+// The runner_kind_resolution sources (#4485), one per rung of
+// resolveCampaignItemRunnerKind's ladder.
+const (
+	runnerKindSourceExplicit           = "explicit"
+	runnerKindSourceCampaign           = "campaign"
+	runnerKindSourceCampaignWorkingDir = "campaign_working_dir"
+	runnerKindSourceDefault            = "default"
+)
+
+// campaignRunnerKindResolution is the 201 body's runner_kind_resolution: the
+// runner kind the minted run was given and the ladder rung that chose it.
+type campaignRunnerKindResolution struct {
+	RunnerKind string `json:"runner_kind"`
+	Source     string `json:"source"`
+}
+
+// resolveCampaignItemRunnerKind resolves a campaign item run's runner kind
+// (#4485). An explicit per-item value wins (an override); else the campaign's
+// recorded runner_kind; else 'local' when the campaign binds a working_dir —
+// the rule that also covers every campaign created before runner_kind was
+// recorded, since a bound checkout only means anything to a local runner; else
+// the unchanged github_actions default. It returns the kind and the source
+// naming the rung. Validation is the caller's: an explicit value was checked at
+// decode, and an inherited one is re-validated by the handler.
+func resolveCampaignItemRunnerKind(explicit string, c *campaign.Campaign) (string, string) {
+	if explicit != "" {
+		return explicit, runnerKindSourceExplicit
+	}
+	if c.RunnerKind != "" {
+		return c.RunnerKind, runnerKindSourceCampaign
+	}
+	if strings.TrimSpace(c.WorkingDir) != "" {
+		return run.RunnerKindLocal, runnerKindSourceCampaignWorkingDir
+	}
+	return run.RunnerKindGitHubActions, runnerKindSourceDefault
 }
 
 // containsRef reports whether ref is in refs.

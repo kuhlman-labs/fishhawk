@@ -11,6 +11,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -73,6 +74,53 @@ func newTestGitLabProvider(f *fakeGitLab) *GitLabIdentityProvider {
 		sleep:          func(context.Context, time.Duration) error { return nil },
 		now:            time.Now,
 	}
+}
+
+// tokenInfoPath is GitLab's token-information endpoint, the client-binding
+// check VerifyAccessToken makes before resolving the subject (#4627).
+const tokenInfoPath = "/oauth/token/info"
+
+// allowTokenInfo routes a token-info answer that binds EVERY token to
+// newTestGitLabProvider's device client, for tests whose subject is the
+// /api/v4/user exchange.
+func (f *fakeGitLab) allowTokenInfo() {
+	f.route(tokenInfoPath, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+	})
+}
+
+// glIssued is one token in the fake forge's token table: either a 2xx
+// token-info body naming its issuing application, or the non-2xx status
+// GitLab's token-info answers for a token that is not an OAuth grant.
+type glIssued struct {
+	status int // 0 → 200
+	info   string
+}
+
+// serveGitLabTokenTable routes token-info over table while /api/v4/user
+// resolves EVERY known token to "alice" — so subject resolution alone would
+// accept all of them, and only the client binding refuses.
+func (f *fakeGitLab) serveGitLabTokenTable(table map[string]glIssued) {
+	f.route(tokenInfoPath, func(w http.ResponseWriter, r *http.Request) {
+		iss, ok := table[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+		if !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		if iss.status != 0 {
+			w.WriteHeader(iss.status)
+			_, _ = w.Write([]byte(`{"error":"invalid_token"}`))
+			return
+		}
+		_, _ = w.Write([]byte(iss.info))
+	})
+	f.route("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+		if _, ok := table[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]; !ok {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+	})
 }
 
 // membersPage renders a members-endpoint page body.
@@ -567,6 +615,7 @@ func TestGitLabVerifyAccessToken(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newFakeGitLab(t)
+			f.allowTokenInfo()
 			f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
 				w.WriteHeader(tc.status)
 				_, _ = w.Write([]byte(tc.body))
@@ -613,6 +662,13 @@ func TestGitLabVerifyAccessToken_DeploymentCredentialNotSent(t *testing.T) {
 	t.Run("no PRIVATE-TOKEN header on the verification request", func(t *testing.T) {
 		f := newFakeGitLab(t)
 		var gotAuth, gotPrivate string
+		var infoAuth, infoPrivate, infoQuery string
+		f.route(tokenInfoPath, func(w http.ResponseWriter, r *http.Request) {
+			infoAuth = r.Header.Get("Authorization")
+			infoPrivate = r.Header.Get("PRIVATE-TOKEN")
+			infoQuery = r.URL.RawQuery
+			_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+		})
 		f.route("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
 			gotAuth = r.Header.Get("Authorization")
 			gotPrivate = r.Header.Get("PRIVATE-TOKEN")
@@ -638,10 +694,43 @@ func TestGitLabVerifyAccessToken_DeploymentCredentialNotSent(t *testing.T) {
 			t.Errorf("PRIVATE-TOKEN = %q, want it ABSENT: the deployment credential must never ride on the "+
 				"request that verifies the caller's own token", gotPrivate)
 		}
+		// The token-info binding check (#4627) carries the same single
+		// credential: the submitted bearer, never PRIVATE-TOKEN, never the
+		// query-string form.
+		if infoAuth != "Bearer submitted-token" {
+			t.Errorf("token-info Authorization = %q, want Bearer submitted-token", infoAuth)
+		}
+		if infoPrivate != "" {
+			t.Errorf("token-info PRIVATE-TOKEN = %q, want it ABSENT", infoPrivate)
+		}
+		if infoQuery != "" {
+			t.Errorf("token-info query = %q, want none: the token must never ride in the URL", infoQuery)
+		}
+	})
+
+	t.Run("discriminating: token-info accepts the deployment credential, call must fail", func(t *testing.T) {
+		f := newFakeGitLab(t)
+		f.route(tokenInfoPath, func(w http.ResponseWriter, r *http.Request) {
+			if r.Header.Get("PRIVATE-TOKEN") == "deployment-token" {
+				_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+				return
+			}
+			w.WriteHeader(http.StatusUnauthorized)
+		})
+		f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+		})
+		p := newTestGitLabProvider(f)
+		p.token = func(context.Context) (string, error) { return "deployment-token", nil }
+
+		if subject, err := p.VerifyAccessToken(context.Background(), "foreign-token"); err == nil {
+			t.Fatalf("VerifyAccessToken resolved %q: the deployment credential bound the token-info check", subject)
+		}
 	})
 
 	t.Run("discriminating: forge accepts the deployment credential, call must fail", func(t *testing.T) {
 		f := newFakeGitLab(t)
+		f.allowTokenInfo()
 		f.route("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
 			// A GitLab that honours the deployment credential: the
 			// PRIVATE-TOKEN header alone is enough to resolve a user,
@@ -676,6 +765,7 @@ func TestGitLabVerifyAccessToken_DeploymentCredentialNotSent(t *testing.T) {
 // than as a hard authentication failure.
 func TestGitLabVerifyAccessToken_RateLimited(t *testing.T) {
 	f := newFakeGitLab(t)
+	f.allowTokenInfo()
 	f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Retry-After", "60")
 		w.WriteHeader(http.StatusTooManyRequests)
@@ -1187,24 +1277,337 @@ func TestGitLabMembers_CrossOriginRedirect_RefusedAndCredentialNotLeaked(t *test
 // attacker-controlled target that replies with a valid-looking user object
 // would dictate the subject the mint issues a fishhawkd token for.
 func TestGitLabVerifyAccessToken_CrossOriginRedirect_Refused(t *testing.T) {
-	attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		_, _ = w.Write([]byte(`{"id":99,"username":"attacker"}`))
-	}))
-	t.Cleanup(attacker.Close)
+	t.Run("user lookup", func(t *testing.T) {
+		attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"id":99,"username":"attacker"}`))
+		}))
+		t.Cleanup(attacker.Close)
 
+		f := newFakeGitLab(t)
+		f.allowTokenInfo()
+		f.route("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, attacker.URL+"/api/v4/user", http.StatusFound)
+		})
+		p := newTestGitLabProvider(f)
+
+		subject, err := p.VerifyAccessToken(context.Background(), "glpat-user")
+		if err == nil {
+			t.Fatalf("VerifyAccessToken = %q, want an error refusing the cross-origin redirect", subject)
+		}
+		if subject != "" {
+			t.Errorf("subject = %q, want empty — a redirected identity read must not resolve a subject", subject)
+		}
+	})
+
+	// The token-info binding check (#4627): a cross-origin target that
+	// names the configured device application must not bind the token.
+	t.Run("token-info", func(t *testing.T) {
+		var attackerHits atomic.Int64
+		attacker := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			attackerHits.Add(1)
+			_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+		}))
+		t.Cleanup(attacker.Close)
+
+		f := newFakeGitLab(t)
+		f.route(tokenInfoPath, func(w http.ResponseWriter, r *http.Request) {
+			http.Redirect(w, r, attacker.URL+tokenInfoPath, http.StatusFound)
+		})
+		f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+		})
+
+		subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), "foreign-token")
+		if err == nil {
+			t.Fatalf("VerifyAccessToken = %q, want a refusal of the cross-origin token-info redirect", subject)
+		}
+		if !errors.Is(err, ErrIntrospectionFailed) {
+			t.Errorf("err = %v, want ErrIntrospectionFailed", err)
+		}
+		if n := attackerHits.Load(); n != 0 {
+			t.Errorf("redirect target received %d request(s), want 0", n)
+		}
+	})
+}
+
+// TestGitLabVerifyAccessToken_ConfiguredClientAccepted: a token whose
+// token-info names exactly the configured device application resolves.
+func TestGitLabVerifyAccessToken_ConfiguredClientAccepted(t *testing.T) {
 	f := newFakeGitLab(t)
-	f.route("/api/v4/user", func(w http.ResponseWriter, r *http.Request) {
-		http.Redirect(w, r, attacker.URL+"/api/v4/user", http.StatusFound)
+	var infoAuth string
+	f.route(tokenInfoPath, func(w http.ResponseWriter, r *http.Request) {
+		infoAuth = r.Header.Get("Authorization")
+		_, _ = w.Write([]byte(`{"resource_owner_id":7,"scope":["read_api"],"application":{"uid":"device-client"}}`))
+	})
+	f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+	})
+
+	subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), "gloas-ours")
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+	if subject != "gitlab:alice" {
+		t.Errorf("subject = %q, want gitlab:alice", subject)
+	}
+	if infoAuth != "Bearer gloas-ours" {
+		t.Errorf("token-info Authorization = %q, want Bearer gloas-ours", infoAuth)
+	}
+}
+
+// TestGitLabVerifyAccessToken_RefusesTokenNotIssuedToClient: another OAuth
+// application's token, a personal access token, a project access token and
+// a CI job token all resolve at /api/v4/user in this fake, so only the
+// token-info binding refuses them (counterfactual vehicle: skipping the
+// verifyTokenApplication call turns every subtest RED).
+func TestGitLabVerifyAccessToken_RefusesTokenNotIssuedToClient(t *testing.T) {
+	table := map[string]glIssued{
+		"gloas-ours":    {info: `{"application":{"uid":"device-client"}}`},
+		"gloas-other":   {info: `{"application":{"uid":"other-oauth-application"}}`},
+		"glpat-user":    {status: http.StatusUnauthorized},
+		"glpat-project": {status: http.StatusUnauthorized},
+		"glcbt-job":     {status: http.StatusUnauthorized},
+	}
+	for _, tc := range []struct {
+		name, token string
+		want        error
+	}{
+		{"other-oauth-application", "gloas-other", ErrTokenClientMismatch},
+		{"personal-access-token", "glpat-user", ErrIntrospectionRefused},
+		{"project-access-token", "glpat-project", ErrIntrospectionRefused},
+		{"ci-job-token", "glcbt-job", ErrIntrospectionRefused},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitLab(t)
+			f.serveGitLabTokenTable(table)
+			subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), tc.token)
+			if err == nil {
+				t.Fatalf("VerifyAccessToken(%s) = %q, want a refusal: the token was not issued to the device application", tc.name, subject)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	t.Run("control: the configured application's token is accepted by the same fake", func(t *testing.T) {
+		f := newFakeGitLab(t)
+		f.serveGitLabTokenTable(table)
+		if subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), "gloas-ours"); err != nil || subject != "gitlab:alice" {
+			t.Fatalf("VerifyAccessToken(gloas-ours) = %q, %v; want gitlab:alice", subject, err)
+		}
+	})
+}
+
+// TestGitLabVerifyAccessToken_RefusesForeignOrMissingIssuer: token-info
+// answers 2xx but names no application, a null uid, or a foreign or
+// case-variant uid. Only the exact uid equality refuses these
+// (counterfactual vehicle for that comparison).
+func TestGitLabVerifyAccessToken_RefusesForeignOrMissingIssuer(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"null uid", `{"application":{"uid":null}}`},
+		{"null application", `{"application":null}`},
+		{"application absent", `{"resource_owner_id":7}`},
+		{"foreign uid", `{"application":{"uid":"other-oauth-application"}}`},
+		{"case-variant uid", `{"application":{"uid":"DEVICE-CLIENT"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitLab(t)
+			f.route(tokenInfoPath, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			})
+			f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+			})
+			subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), "gloas-x")
+			if err == nil {
+				t.Fatalf("VerifyAccessToken = %q, want a refusal for token-info %s", subject, tc.name)
+			}
+			if !errors.Is(err, ErrTokenClientMismatch) {
+				t.Errorf("err = %v, want ErrTokenClientMismatch", err)
+			}
+		})
+	}
+}
+
+// TestGitLabVerifyAccessToken_IntrospectionFailureRefuses: every token-info
+// outcome other than a 2xx naming the device application refuses; the
+// user lookup would accept each token.
+func TestGitLabVerifyAccessToken_IntrospectionFailureRefuses(t *testing.T) {
+	// A VALID body naming the configured application, padded past the cap
+	// with trailing whitespace — so even its truncated prefix decodes, and
+	// only the size refusal (not a decode error) stops it binding the token.
+	oversized := `{"application":{"uid":"device-client"}}` + strings.Repeat(" ", gitLabMaxMemberPageBytes)
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    error
+	}{
+		// Non-success bodies name the configured application, so only the
+		// status check (not a decode or uid mismatch) refuses them.
+		{"server error", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+		}, ErrIntrospectionRefused},
+		{"rate limited", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusTooManyRequests)
+			_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+		}, ErrRateLimited},
+		{"undecodable body", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`not json`))
+		}, ErrIntrospectionFailed},
+		{"oversized body", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(oversized))
+		}, ErrIntrospectionFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitLab(t)
+			f.route(tokenInfoPath, tc.handler)
+			f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+			})
+			subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), "gloas-x")
+			if err == nil {
+				t.Fatalf("VerifyAccessToken = %q, want a refusal", subject)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	t.Run("unreachable forge", func(t *testing.T) {
+		f := newFakeGitLab(t)
+		p := newTestGitLabProvider(f)
+		f.Close()
+		subject, err := p.VerifyAccessToken(context.Background(), "gloas-x")
+		if err == nil {
+			t.Fatalf("VerifyAccessToken = %q, want a refusal", subject)
+		}
+		if !errors.Is(err, ErrIntrospectionFailed) {
+			t.Errorf("err = %v, want ErrIntrospectionFailed", err)
+		}
+	})
+}
+
+// TestGitLabVerifyAccessToken_UnconfiguredDeviceClient: an empty device
+// client id returns ErrClientCredentialUnconfigured BEFORE any HTTP call.
+// The fixture's token-info answers a NULL uid and the user lookup answers,
+// so without the gate the empty configured id would compare equal to the
+// empty issuer and resolve a subject: the gate is the only refusal.
+func TestGitLabVerifyAccessToken_UnconfiguredDeviceClient(t *testing.T) {
+	f := newFakeGitLab(t)
+	f.route(tokenInfoPath, func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"application":{"uid":null}}`))
+	})
+	f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
 	})
 	p := newTestGitLabProvider(f)
+	p.deviceClientID = ""
 
-	subject, err := p.VerifyAccessToken(context.Background(), "glpat-user")
-	if err == nil {
-		t.Fatalf("VerifyAccessToken = %q, want an error refusing the cross-origin redirect", subject)
+	subject, err := p.VerifyAccessToken(context.Background(), "glpat-x")
+	if !errors.Is(err, ErrClientCredentialUnconfigured) {
+		t.Fatalf("VerifyAccessToken = %q, %v; want ErrClientCredentialUnconfigured", subject, err)
 	}
-	if subject != "" {
-		t.Errorf("subject = %q, want empty — a redirected identity read must not resolve a subject", subject)
+	if n := f.requestCount(); n != 0 {
+		t.Errorf("made %d request(s); the device-client gate must refuse before any HTTP call", n)
 	}
+}
+
+// TestGitLabVerifyAccessToken_TokenInfoSameOriginRedirectFollowed pins C2:
+// the token-info call keeps credentialClient's policy, so a SAME-origin hop
+// is followed (with the bearer) and the uid comparison runs on the FINAL
+// response — a foreign uid at the final hop still refuses.
+func TestGitLabVerifyAccessToken_TokenInfoSameOriginRedirectFollowed(t *testing.T) {
+	for _, tc := range []struct {
+		name, finalBody string
+		wantErr         error
+	}{
+		{"final hop names the device application", `{"application":{"uid":"device-client"}}`, nil},
+		{"final hop names a foreign application", `{"application":{"uid":"other-oauth-application"}}`, ErrTokenClientMismatch},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitLab(t)
+			var finalAuth string
+			f.route(tokenInfoPath, func(w http.ResponseWriter, r *http.Request) {
+				http.Redirect(w, r, "/oauth/token/info/", http.StatusFound)
+			})
+			f.route("/oauth/token/info/", func(w http.ResponseWriter, r *http.Request) {
+				finalAuth = r.Header.Get("Authorization")
+				_, _ = w.Write([]byte(tc.finalBody))
+			})
+			f.route("/api/v4/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+			})
+
+			subject, err := newTestGitLabProvider(f).VerifyAccessToken(context.Background(), "gloas-x")
+			if finalAuth != "Bearer gloas-x" {
+				t.Errorf("final hop Authorization = %q, want the bearer carried across the same-origin hop", finalAuth)
+			}
+			if tc.wantErr == nil {
+				if err != nil || subject != "gitlab:alice" {
+					t.Fatalf("VerifyAccessToken = %q, %v; want gitlab:alice after a followed same-origin hop", subject, err)
+				}
+				return
+			}
+			if !errors.Is(err, tc.wantErr) {
+				t.Fatalf("VerifyAccessToken = %q, %v; want %v from the final hop's uid", subject, err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestGitLabVerifyAccessToken_TokenInfoSchemeDowngradeRedirectRefused pins
+// C2's scheme rule: an https→http hop is CROSS-origin and refused.
+//
+// Construction: httptest cannot serve TLS and plaintext on one port, so the
+// GitLab instance is an httptest TLS server and the downgrade target a
+// separate plaintext server on the same host (127.0.0.1). The plaintext
+// target binds any token to the device application, so a followed hop
+// would accept it; it must record ZERO requests. The second subtest
+// isolates the scheme alone: same host AND port, only the scheme differs,
+// and the redirect policy still refuses.
+func TestGitLabVerifyAccessToken_TokenInfoSchemeDowngradeRedirectRefused(t *testing.T) {
+	t.Run("https instance redirects to plaintext http", func(t *testing.T) {
+		var plainHits atomic.Int64
+		plain := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			plainHits.Add(1)
+			_, _ = w.Write([]byte(`{"application":{"uid":"device-client"}}`))
+		}))
+		t.Cleanup(plain.Close)
+
+		tlsSrv := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			switch r.URL.Path {
+			case tokenInfoPath:
+				http.Redirect(w, r, plain.URL+tokenInfoPath, http.StatusFound)
+			case "/api/v4/user":
+				_, _ = w.Write([]byte(`{"id":7,"username":"alice"}`))
+			default:
+				w.WriteHeader(http.StatusNotFound)
+			}
+		}))
+		t.Cleanup(tlsSrv.Close)
+
+		p := &GitLabIdentityProvider{baseURL: tlsSrv.URL, deviceClientID: "device-client", httpClient: tlsSrv.Client()}
+		subject, err := p.VerifyAccessToken(context.Background(), "gloas-x")
+		if err == nil {
+			t.Fatalf("VerifyAccessToken = %q, want the https→http token-info redirect refused", subject)
+		}
+		if !errors.Is(err, ErrIntrospectionFailed) {
+			t.Errorf("err = %v, want ErrIntrospectionFailed", err)
+		}
+		if n := plainHits.Load(); n != 0 {
+			t.Errorf("plaintext target received %d request(s), want 0: the bearer must never be sent after a cross-origin hop", n)
+		}
+	})
+
+	t.Run("same host and port, scheme only differs", func(t *testing.T) {
+		from, _ := url.Parse("https://gitlab.acme.test:8443/oauth/token/info")
+		to, _ := url.Parse("http://gitlab.acme.test:8443/oauth/token/info")
+		if err := refuseCrossOriginRedirect(&http.Request{URL: to}, []*http.Request{{URL: from}}); err == nil {
+			t.Fatal("refuseCrossOriginRedirect allowed an https→http hop on the same host:port; the scheme is part of the origin")
+		}
+	})
 }
 
 // TestGitLabMembers_SameOriginRedirect_Followed is the other half of the

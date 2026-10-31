@@ -262,11 +262,16 @@ const (
 
 // worktreeAdminGitRun executes `git -C repoDir <args...>` and returns its
 // combined stdout+stderr. It is a package-level seam so a test can inject a
-// first-attempt transient (the git-internal commondir enumeration race) then
-// delegate to real git, exercising worktreeAdminGit's retry deterministically
-// without needing a real concurrent git process to reproduce the race.
+// first-attempt transient (the git-internal commondir enumeration race, or a
+// worktree-registry lock contention) then delegate to real git, exercising
+// worktreeAdminGit's retries deterministically without needing a real
+// concurrent git process to reproduce the race. It runs under
+// gitops.LockRetryLocaleEnv so a lockfile-contention failure carries the
+// untranslated message gitops.IsLockContention matches (ADR-115 D2, #4648).
 var worktreeAdminGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
-	return exec.CommandContext(ctx, "git", append([]string{"-C", repoDir}, args...)...).CombinedOutput()
+	cmd := exec.CommandContext(ctx, "git", append([]string{"-C", repoDir}, args...)...)
+	cmd.Env = append(os.Environ(), gitops.LockRetryLocaleEnv()...)
+	return cmd.CombinedOutput()
 }
 
 // isTransientWorktreeAdminErr reports whether a failed worktree-admin git op's
@@ -287,9 +292,12 @@ func isTransientWorktreeAdminErr(combinedOutput string) bool {
 
 // worktreeAdminGit runs a worktree-admin git op through the worktreeAdminGitRun
 // seam, retrying on the isTransientWorktreeAdminErr signature with a short
-// backoff up to worktreeAdminGitMaxAttempts. Each retry emits exactly one
-// worktree_admin_git_retry event (mirroring the runner's verify_infra_flake_retry
-// diagnostic). A non-transient error returns immediately on the first attempt —
+// backoff up to worktreeAdminGitMaxAttempts. Each attempt itself runs through
+// gitops.RetryLockContention, so a sibling stage's git briefly holding a
+// worktree-registry, ref or packed-refs lock waits within the gitops bound
+// (ADR-115 D2, #4648) while this commondir-transient loop is unchanged. Each
+// commondir retry emits exactly one worktree_admin_git_retry event (mirroring
+// the runner's verify_infra_flake_retry diagnostic). A non-transient error returns immediately on the first attempt —
 // unretried and unmasked — as does a transient once the attempt cap is reached or
 // the context is done; in every terminal case the captured combined output is
 // returned alongside the error so the caller's error wrapping stays actionable.
@@ -297,7 +305,7 @@ func worktreeAdminGit(ctx context.Context, repoDir string, logSink io.Writer, ar
 	var out []byte
 	var err error
 	for attempt := 1; attempt <= worktreeAdminGitMaxAttempts; attempt++ {
-		out, err = worktreeAdminGitRun(ctx, repoDir, args...)
+		out, err = gitops.RetryLockContention(ctx, func() ([]byte, error) { return worktreeAdminGitRun(ctx, repoDir, args...) })
 		if err == nil {
 			return out, nil
 		}

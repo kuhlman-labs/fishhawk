@@ -7,6 +7,7 @@ issue: https://github.com/kuhlman-labs/fishhawk/issues/4698
 supersedes: []
 superseded_by: []
 amends: ["ADR-068", "ADR-084", "ADR-117"]
+amended_by: ["ADR-121", "ADR-122"]
 applies_to: ["backend/internal/agenteval/**", "scripts/check-review-prompt-eval"]
 ---
 

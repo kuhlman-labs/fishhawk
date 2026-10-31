@@ -614,6 +614,45 @@ func TestMergeMergeRequest_SquashRequestShape(t *testing.T) {
 	}
 }
 
+// TestMergeMergeRequest_SquashTriState pins the E93.2 / #4658 tri-state squash
+// wire: SquashSet carries an explicit true OR an explicit false (the key
+// PRESENT with value false, overriding an MR author's squash selection), and
+// the zero value keeps today's omission.
+func TestMergeMergeRequest_SquashTriState(t *testing.T) {
+	cases := []struct {
+		name        string
+		params      MergeMergeRequestParams
+		wantPresent bool
+		wantValue   bool
+	}{
+		{"set true", MergeMergeRequestParams{SquashSet: true, Squash: true}, true, true},
+		{"set false", MergeMergeRequestParams{SquashSet: true, Squash: false, MergeWhenPipelineSucceeds: true}, true, false},
+		{"unset zero value", MergeMergeRequestParams{MergeWhenPipelineSucceeds: true}, false, false},
+		{"unset squash true (legacy)", MergeMergeRequestParams{Squash: true}, true, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
+				var got map[string]any
+				if err := json.Unmarshal(rec.body, &got); err != nil {
+					t.Fatalf("unmarshal %q: %v", rec.body, err)
+				}
+				v, present := got["squash"]
+				if present != tc.wantPresent {
+					t.Fatalf("squash key present = %v, want %v (body %s)", present, tc.wantPresent, rec.body)
+				}
+				if present && v != tc.wantValue {
+					t.Errorf("squash = %v, want %v", v, tc.wantValue)
+				}
+				return jsonResponse(http.StatusOK, `{"iid":7}`), nil
+			})
+			if _, err := c.MergeMergeRequest(context.Background(), 42, 7, tc.params); err != nil {
+				t.Fatalf("MergeMergeRequest: %v", err)
+			}
+		})
+	}
+}
+
 func TestMergeMergeRequest_AutoMergeRequestShape(t *testing.T) {
 	c := clientWith(t, func(rec *opRequest) (*http.Response, error) {
 		var got map[string]any

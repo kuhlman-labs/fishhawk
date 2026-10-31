@@ -56,7 +56,7 @@ type RunChildrenInput struct {
 	Workflow     string `json:"workflow" jsonschema:"workflow ID matching the run's workflow (passed through to each child's runner)"`
 	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the children run in. OPTIONAL when the parent run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path). Each child provisions its OWN per-child worktree under this checkout's shared gitdir (--parallel-isolate), so the operator's tracked tree is untouched Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots. The INHERITED binding is confined identically, so a bound checkout stays usable exactly when it is itself inside a root."`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the parent run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
-	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"fallback base branch for a child's implement stage; defaults to main. The SERVER is the authority for a dependent fan-out child — the host-dispatch marker returns the consolidated base_branch and this value is used only when it returns none"`
+	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"fallback base branch for a child's implement stage; when omitted, the PARENT run's forge default_branch (GET /v0/runs/{run_id}); refused naming default_branch_unresolved_reason when it is unresolved (a gitlab run always reports forge_unsupported, so pass it). The SERVER is the authority for a dependent fan-out child — the host-dispatch marker returns the consolidated base_branch and this value is used only when it returns none"`
 	MaxParallel  int    `json:"max_parallel,omitempty" jsonschema:"optional operator concurrency override; clamp-DOWN-only against the orchestrator-resolved effective cap (it can lower an unlimited/looser cap, never raise it). Omit (0) to use the effective cap as-is"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary, then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	Verbose      bool   `json:"verbose,omitempty" jsonschema:"accepted for back-compat and ignored: a detached child returns no event stream to this call, so there is nothing to make verbose"`
@@ -284,11 +284,6 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		return nil, RunChildrenOutput{}, err
 	}
 
-	fallbackBase := in.BaseBranch
-	if fallbackBase == "" {
-		fallbackBase = "main"
-	}
-
 	var warnings []string
 
 	// Forge target of the PARENT, resolved once (E45.46 / #3463): children
@@ -296,6 +291,15 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 	// so the parent's single-run read is the authority for every child argv.
 	// FAIL CLOSED before any marker or spawn — a refusal here dispatches nothing.
 	forgeTarget, err := r.resolveRunForgeTarget(ctx, parentUUID)
+	if err != nil {
+		return nil, RunChildrenOutput{}, err
+	}
+	// The fallback base of every child, from the SAME parent read (#4758):
+	// an explicit base_branch, else the parent's forge default_branch, else
+	// a refusal naming the reason — before the child partition and every
+	// per-child worktree, marker and spawn. A dependent child's marker-
+	// returned base still WINS over it (server authority, #2363).
+	fallbackBase, err := forgeTarget.resolveSpawnBaseBranch(parentUUID, in.BaseBranch)
 	if err != nil {
 		return nil, RunChildrenOutput{}, err
 	}

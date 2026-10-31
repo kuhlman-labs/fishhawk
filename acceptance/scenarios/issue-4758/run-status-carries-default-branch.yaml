@@ -1,0 +1,14 @@
+id: scenario:issue-4758/run-status-carries-default-branch
+statement: The fishhawk_get_run_status tool result's run object carries default_branch, or default_branch_unresolved_reason when the preview cannot resolve one (a preview without a GitHub App reports resolver_unconfigured or no_installation).
+verify_hint: Create or pick a run on the preview. Call the fishhawk_get_run_status tool through fishhawkd's HTTP /mcp route (JSON-RPC tools/call) and read run.default_branch / run.default_branch_unresolved_reason. Cross-check against GET /v0/runs/{run_id}.
+steps: POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} and read run_id. POST /v0/runs/{run}/signing-key; POST /v0/dev/sign over '{}'; POST /v0/runs/{run}/mcp-token to get an fhm_ token. POST http://localhost:8090/mcp tools/call fishhawk_get_run_status {run_id} with headers Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/call, Mcp-Name fishhawk_get_run_status, and _meta protocolVersion/clientCapabilities/clientInfo. Read run.default_branch*. Cross-checked with GET /v0/runs/{run}.
+assertions:
+    expected: run carries default_branch or default_branch_unresolved_reason (no_installation/resolver_unconfigured on a preview)
+    observed_at_record: The tool result's run carries default_branch_unresolved_reason=no_installation and no default_branch. GET /v0/runs/{run} carries the same value.
+    repro_handle: POST http://localhost:8090/mcp {jsonrpc:2.0,method:tools/call,params:{name:fishhawk_get_run_status,arguments:{run_id}}}
+origin:
+    issue: 4758
+    pr: 4831
+    run_id: 03f2976e-d127-4ac8-bcc6-521c0274c2de
+    head_sha: 050ab3cd5f5b966ca29ea036d5b8d9bb3e57e4b3
+    recorded_at: 2026-10-29T23:20:43Z

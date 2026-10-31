@@ -121,6 +121,19 @@ type FixupOptions struct {
 	// fix-up". Only the acceptance-blocker branches read it: every other
 	// refusal keeps its wording.
 	AcceptanceBlockerTail string
+
+	// TolerateUndispatchedAcceptance, when true, lets the push_and_open_pr
+	// re-open proceed past a NEVER-DISPATCHED acceptance stage (state
+	// `pending`) ahead of a pending review (#4785). It is set ONLY by the
+	// merge-candidate verify pass (server.beginMergeCandidateVerifyPass): a
+	// decomposed parent's acceptance is held `pending` until the consolidated
+	// head's fan-in verify settles, and that verify pass must re-open the
+	// parent implement stage meanwhile. It tolerates ONLY `pending`:
+	// awaiting_host_dispatch, dispatched and running keep the #3116 refusal.
+	// No review is re-parked (the review is still pending; acceptance runs
+	// after the re-opened implement settles). The zero value keeps every other
+	// caller BYTE-IDENTICAL.
+	TolerateUndispatchedAcceptance bool
 }
 
 // fixupAcceptanceBlockerTail is the default remedy tail of the
@@ -417,7 +430,7 @@ func admitFixup(ctx context.Context, repo Repository, stageID uuid.UUID, opts Fi
 			if tail == "" {
 				tail = fixupAcceptanceBlockerTail
 			}
-			review, err := findOpenReviewStage(ctx, repo, stage.RunID, tail)
+			review, err := findOpenReviewStage(ctx, repo, stage.RunID, tail, opts.TolerateUndispatchedAcceptance)
 			if err != nil {
 				return nil, err
 			}
@@ -616,7 +629,11 @@ func RestoreFixupStage(ctx context.Context, repo Repository, implementStageID uu
 // acceptanceBlockerTail is the remedy clause appended to the acceptance
 // branch's sentence: fixupAcceptanceBlockerTail for a fix-up, or the caller's
 // FixupOptions.AcceptanceBlockerTail (#4304). The other branches ignore it.
-func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID, acceptanceBlockerTail string) (*Stage, error) {
+//
+// tolerateUndispatchedAcceptance (FixupOptions.TolerateUndispatchedAcceptance,
+// #4785) turns ONLY a `pending` acceptance blocker into a no-re-park admit
+// (nil, nil); every other acceptance state keeps the refusal.
+func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID, acceptanceBlockerTail string, tolerateUndispatchedAcceptance bool) (*Stage, error) {
 	stages, err := repo.ListStagesForRun(ctx, runID)
 	if err != nil {
 		return nil, fmt.Errorf("FixupStage: list stages for run: %w", err)
@@ -650,6 +667,13 @@ func findOpenReviewStage(ctx context.Context, repo Repository, runID uuid.UUID, 
 
 	// The review gate has NOT opened yet. Classify what is holding it closed.
 	if acc := blockingAcceptanceStage(stages); acc != nil {
+		if tolerateUndispatchedAcceptance && acc.State == StageStatePending {
+			// #4785: the merge-candidate verify pass re-opens implement while a
+			// decomposed parent's never-dispatched acceptance is held. No
+			// review to re-park: it is still pending, and acceptance runs
+			// after the re-opened implement settles.
+			return nil, nil
+		}
 		// (a) A not-yet-terminal acceptance stage runs ahead of review, so the
 		// review gate cannot open until it settles. Split the guidance by what
 		// the operator can actually DO about it.

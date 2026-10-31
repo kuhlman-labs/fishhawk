@@ -14,9 +14,9 @@ import (
 
 const createCampaign = `-- name: CreateCampaign :one
 
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind
 `
 
 type CreateCampaignParams struct {
@@ -29,6 +29,7 @@ type CreateCampaignParams struct {
 	IdempotencyKey *string   `json:"idempotency_key"`
 	WorkingDir     string    `json:"working_dir"`
 	GroomingSource []byte    `json:"grooming_source"`
+	RunnerKind     string    `json:"runner_kind"`
 }
 
 // Campaign / campaign-item queries consumed by the postgres adapter for the
@@ -46,6 +47,7 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		arg.IdempotencyKey,
 		arg.WorkingDir,
 		arg.GroomingSource,
+		arg.RunnerKind,
 	)
 	var i Campaign
 	err := row.Scan(
@@ -60,31 +62,32 @@ func (q *Queries) CreateCampaign(ctx context.Context, arg CreateCampaignParams) 
 		&i.IdempotencyKey,
 		&i.WorkingDir,
 		&i.GroomingSource,
+		&i.RunnerKind,
 	)
 	return i, err
 }
 
 const createCampaignGuardedByGroomingCurrency = `-- name: CreateCampaignGuardedByGroomingCurrency :one
 
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind)
 SELECT
     $1, $2, $3, $4, $5,
-    $6, $7, $8, $9
+    $6, $7, $8, $9, $10
 WHERE NOT EXISTS (
     SELECT 1
       FROM runs newer
       JOIN stages st ON st.run_id = newer.id AND st.stage_type = 'plan'
       JOIN artifacts a ON a.stage_id = st.id AND a.kind = 'grooming_report'
-     WHERE newer.id <> $10
-       AND newer.repo = $11
-       AND newer.workflow_id = $12
-       AND newer.account_id IS NOT DISTINCT FROM $13::uuid
-       AND newer.installation_id IS NOT DISTINCT FROM $14::bigint
-       AND (newer.created_at, newer.id) > ($15::timestamptz, $10::uuid)
+     WHERE newer.id <> $11
+       AND newer.repo = $12
+       AND newer.workflow_id = $13
+       AND newer.account_id IS NOT DISTINCT FROM $14::uuid
+       AND newer.installation_id IS NOT DISTINCT FROM $15::bigint
+       AND (newer.created_at, newer.id) > ($16::timestamptz, $11::uuid)
        AND EXISTS (SELECT 1 FROM approvals ap WHERE ap.stage_id = st.id AND ap.decision = 'approve')
        AND NOT EXISTS (SELECT 1 FROM approvals ap WHERE ap.stage_id = st.id AND ap.decision = 'reject')
 )
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind
 `
 
 type CreateCampaignGuardedByGroomingCurrencyParams struct {
@@ -97,6 +100,7 @@ type CreateCampaignGuardedByGroomingCurrencyParams struct {
 	IdempotencyKey       *string    `json:"idempotency_key"`
 	WorkingDir           string     `json:"working_dir"`
 	GroomingSource       []byte     `json:"grooming_source"`
+	RunnerKind           string     `json:"runner_kind"`
 	SourceRunID          uuid.UUID  `json:"source_run_id"`
 	SourceRepo           string     `json:"source_repo"`
 	SourceWorkflowID     string     `json:"source_workflow_id"`
@@ -128,6 +132,7 @@ func (q *Queries) CreateCampaignGuardedByGroomingCurrency(ctx context.Context, a
 		arg.IdempotencyKey,
 		arg.WorkingDir,
 		arg.GroomingSource,
+		arg.RunnerKind,
 		arg.SourceRunID,
 		arg.SourceRepo,
 		arg.SourceWorkflowID,
@@ -148,6 +153,7 @@ func (q *Queries) CreateCampaignGuardedByGroomingCurrency(ctx context.Context, a
 		&i.IdempotencyKey,
 		&i.WorkingDir,
 		&i.GroomingSource,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -197,7 +203,7 @@ func (q *Queries) CreateCampaignItem(ctx context.Context, arg CreateCampaignItem
 }
 
 const getCampaign = `-- name: GetCampaign :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir, grooming_source FROM campaigns WHERE id = $1
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir, grooming_source, runner_kind FROM campaigns WHERE id = $1
 `
 
 func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -216,6 +222,7 @@ func (q *Queries) GetCampaign(ctx context.Context, id uuid.UUID) (Campaign, erro
 		&i.AccountID,
 		&i.WorkingDir,
 		&i.GroomingSource,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -236,7 +243,7 @@ func (q *Queries) GetCampaignAccountID(ctx context.Context, id uuid.UUID) (*uuid
 }
 
 const getCampaignByIdempotencyKey = `-- name: GetCampaignByIdempotencyKey :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind FROM campaigns
  WHERE repo = $1
    AND idempotency_key = $2
 `
@@ -265,6 +272,7 @@ func (q *Queries) GetCampaignByIdempotencyKey(ctx context.Context, arg GetCampai
 		&i.IdempotencyKey,
 		&i.WorkingDir,
 		&i.GroomingSource,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -377,7 +385,7 @@ func (q *Queries) ListCampaignItemsForRun(ctx context.Context, runID *uuid.UUID)
 }
 
 const listCampaigns = `-- name: ListCampaigns :many
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir, grooming_source FROM campaigns
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, account_id, working_dir, grooming_source, runner_kind FROM campaigns
  WHERE ($1::text = '' OR repo = $1)
    AND ($2::text = '' OR state = $2)
    AND ($3::uuid IS NULL OR account_id = $3 OR account_id IS NULL)
@@ -426,6 +434,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 			&i.AccountID,
 			&i.WorkingDir,
 			&i.GroomingSource,
+			&i.RunnerKind,
 		); err != nil {
 			return nil, err
 		}
@@ -438,7 +447,7 @@ func (q *Queries) ListCampaigns(ctx context.Context, arg ListCampaignsParams) ([
 }
 
 const lockCampaignForUpdate = `-- name: LockCampaignForUpdate :one
-SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source FROM campaigns WHERE id = $1 FOR UPDATE
+SELECT id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind FROM campaigns WHERE id = $1 FOR UPDATE
 `
 
 func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Campaign, error) {
@@ -456,6 +465,7 @@ func (q *Queries) LockCampaignForUpdate(ctx context.Context, id uuid.UUID) (Camp
 		&i.IdempotencyKey,
 		&i.WorkingDir,
 		&i.GroomingSource,
+		&i.RunnerKind,
 	)
 	return i, err
 }
@@ -703,7 +713,7 @@ const updateCampaignState = `-- name: UpdateCampaignState :one
 UPDATE campaigns
    SET state = $2
  WHERE id = $1
-RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source
+RETURNING id, repo, epic_ref, state, created_at, updated_at, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind
 `
 
 type UpdateCampaignStateParams struct {
@@ -726,6 +736,7 @@ func (q *Queries) UpdateCampaignState(ctx context.Context, arg UpdateCampaignSta
 		&i.IdempotencyKey,
 		&i.WorkingDir,
 		&i.GroomingSource,
+		&i.RunnerKind,
 	)
 	return i, err
 }

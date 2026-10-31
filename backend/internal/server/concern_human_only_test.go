@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"net/http"
@@ -60,11 +59,34 @@ func seedServerCheckRow(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.U
 	return rows[0]
 }
 
-// postWaiveAs is postWaive with an explicit identity.
+// defaultTestJudgement fills a test body's judgement when the test set none
+// (E94.7 / #4840), so the tests that predate the requirement keep pinning what
+// they pin. A reason opening with a recognised prefix is left alone: the
+// prefix supplies the judgement (FO ruling D1 rule c), and a default would
+// turn it into a rule (d) conflict. Refusal tests post raw bytes instead.
+func defaultTestJudgement(judgement, reason string, def concern.Judgement) string {
+	if judgement != "" {
+		return judgement
+	}
+	if _, ok := concern.JudgementFromReasonPrefix(reason); ok {
+		return ""
+	}
+	return string(def)
+}
+
+// postWaiveAs is postWaive with an explicit identity. A body with no
+// judgement and no reason prefix is waived as no_defect (defaultTestJudgement).
 func postWaiveAs(t *testing.T, s *Server, concernID string, body waiveConcernRequest, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	body.Judgement = defaultTestJudgement(body.Judgement, body.Reason, concern.JudgementNoDefect)
 	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+concernID+"/waive", bytes.NewReader(raw))
+	return postWaiveRaw(t, s, concernID, string(raw), auth)
+}
+
+// postWaiveRaw posts raw bytes to the single waive, with no judgement default.
+func postWaiveRaw(t *testing.T, s *Server, concernID, raw string, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+concernID+"/waive", strings.NewReader(raw))
 	req.SetPathValue("concern_id", concernID)
 	w := httptest.NewRecorder()
 	s.handleWaiveConcern(w, auth(req))

@@ -1,0 +1,6 @@
+retired:
+  - id: scenario:issue-3722/accepted-requires-acceptance-statement
+    reason: "superseded by the 2026-10-23 ADR status rulings (#4707, 3330b71e): ADR-010/011/012 are now proposed and ADR-022 accepted, so docs/adr/index.json no longer lists any unknown status. The gate half (a flipped accepted status without an acceptance word fails scripts/check-adr) stays pinned by scripts/test-adr cases h12/h13 (C-accepted), which run inside scripts/test verify. Retired by the first officer after the stale expectation failed run d9862ab0 (#4685), which touches nothing under docs/adr."
+    run_id: d9862ab0-618e-4c40-8d5e-741ad22cef77
+    pr: 4871
+    retired_at: 2026-10-31T09:10:00Z

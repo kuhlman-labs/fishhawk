@@ -45,6 +45,10 @@ const CategoryOperatorCommitVouched = auditcomplete.CategoryOperatorCommitVouche
 // the seam cannot drift on a literal typo.
 const lineageVouchedSHAField = auditcomplete.VouchedSHAField
 
+// vouchShaEchoLimit bounds how many bytes of a refused sha the 400 details echo
+// back (#4435), so a pathological request body cannot inflate the error body.
+const vouchShaEchoLimit = 80
+
 // vouchCommitRequest is the JSON body of POST
 // /v0/runs/{run_id}/vouch-commit. Both fields are required: the vouch is
 // an audited operator declaration, so it must name the commit and carry a
@@ -113,12 +117,17 @@ type vouchCommitResponse struct {
 //     enforced UNCONDITIONALLY (no cookie-session bypass): a non-token
 //     operator identity must not be able to append vouch lineage either.
 //
-// The handler records the operator's declaration verbatim — it does NOT
-// verify the SHA exists on the branch or in the compare set. This is
-// deliberate and safe: vouching a non-existent or wrong SHA simply adds an
-// unreachable ledger entry and un-wedges nothing (the real foreign commit
-// still flags), so the fail-closed property (an unvouched foreign commit
-// still fails category-B) holds.
+// The handler records the operator's declaration as the canonical (lowercase)
+// FULL sha — it does NOT verify the SHA exists on the branch or in the compare
+// set. A sha that is not a full 40-hex (SHA-1) or 64-hex (SHA-256) object name
+// is REFUSED with 400 validation_failed and nothing is written or published
+// (#4435): rule 5 of fishhawk_audit_complete matches the PR head against the
+// recorded vouches by exact full-string equality, so a recorded abbreviation
+// would answer 200 yet never clear foreign_commit. Vouching a well-formed but
+// non-existent or wrong full SHA remains safe: it simply adds an unreachable
+// ledger entry and un-wedges nothing (the real foreign commit still flags), so
+// the fail-closed property (an unvouched foreign commit still fails category-B)
+// holds.
 //
 // The vouch is ALSO the re-post trigger for the fishhawk_audit_complete Check
 // Run on the operator's head (E64.14 / #3109). After the declaration is
@@ -144,11 +153,11 @@ type vouchCommitResponse struct {
 // fails closed the way the rebase verb does — skip the publish, never stamp
 // the check at an unverified sha.
 //
-// What did NOT change: the RECORD stays verbatim for any sha. The
-// operator_commit_vouched append and the 200 are byte-identical for a matching
-// and a non-matching sha, the ADR-035 escape hatch is untouched, and vouching
-// a wrong sha still un-wedges nothing. No new response field, no new error
-// code, no status-code change.
+// What did NOT change: the RECORD stays unverified for any well-formed full
+// sha. The operator_commit_vouched append and the 200 are byte-identical for a
+// matching and a non-matching full sha, the ADR-035 escape hatch is untouched,
+// and vouching a wrong sha still un-wedges nothing. No new response field, no
+// new error code (the non-full refusal reuses validation_failed).
 func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 	id := IdentityFrom(r.Context())
 	if id.IsAnonymous() {
@@ -214,6 +223,24 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "sha"})
 		return
 	}
+	// Refuse anything that is not a FULL object name BEFORE any write or publish
+	// (#4435): fishhawk_audit_complete rule 5 matches the PR head against the
+	// recorded vouches by exact full-string equality, so a recorded abbreviated
+	// sha would return 200 here yet never clear foreign_commit.
+	if !isDeployCommitSHA(sha) {
+		got := sha
+		if len(got) > vouchShaEchoLimit {
+			got = got[:vouchShaEchoLimit]
+		}
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			"sha must be the full 40-character (SHA-1) or 64-character (SHA-256) hex commit id: an abbreviated sha is refused because fishhawk_audit_complete matches the pull-request head by full sha and never by prefix; expand it with `git rev-parse <abbreviated-sha>`",
+			map[string]any{"field": "sha", "got": got, "got_length": len(sha)})
+		return
+	}
+	// Canonicalize to lowercase so the recorded vouched_sha exact-matches the
+	// forge's lowercase head in rule 5's known set (#4435). Upper-case hex names
+	// the same object (#3129 keeps the case-insensitive acceptance).
+	sha = strings.ToLower(sha)
 	reason := strings.TrimSpace(reqBody.Reason)
 	if reason == "" {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
@@ -312,8 +339,9 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 			resp.AuditCheckRepublishWarning = "the vouch is recorded and durable, but the fishhawk_audit_complete check was NOT re-posted: the run's live pull-request head could not be resolved, and publishing at an unverified commit is refused (" + headErr.Error() + "); re-invoke fishhawk_vouch_commit once the pull request is readable"
 		case !shaEqualsHead(sha, liveHead):
 			// MISMATCH. Name BOTH shas so the operator can see what was vouched
-			// versus what is live — this is also what tells an operator who
-			// pasted an ABBREVIATED sha to re-vouch with the full one.
+			// versus what is live. An abbreviated sha no longer reaches this arm
+			// (refused above, #4435); it is a well-formed full sha naming some
+			// other commit.
 			resp.AuditCheckRepublishWarning = "the vouch IS recorded and durable, but the fishhawk_audit_complete check was NOT re-posted: the vouched commit " + sha + " is not the run's live pull-request head " + liveHead + ", and the check is only ever stamped on the run's own head (#3129); re-invoke fishhawk_vouch_commit naming the live head to re-post the check"
 		default:
 			republished, pubErr := s.recomputeAndPublishAuditCompleteAtHead(r.Context(), runID, sha)
@@ -330,9 +358,9 @@ func (s *Server) handleVouchCommit(w http.ResponseWriter, r *http.Request) {
 // run's live pull-request head. The compare is a case-insensitive FULL-string
 // compare on the trimmed spellings: forge shas are lowercase hex, so folding
 // case only tolerates an operator pasting mixed case and can never widen the
-// bound past the run's own head. An ABBREVIATED sha deliberately does NOT
-// match — the mismatch warning names both shas, which is what tells the
-// operator to re-vouch with the full sha.
+// bound past the run's own head. An ABBREVIATED sha never reaches this compare
+// (handleVouchCommit refuses it, #4435), and the full-string compare stays as
+// defense in depth: it does not match by prefix.
 func shaEqualsHead(vouched, liveHead string) bool {
 	return strings.EqualFold(strings.TrimSpace(vouched), strings.TrimSpace(liveHead))
 }

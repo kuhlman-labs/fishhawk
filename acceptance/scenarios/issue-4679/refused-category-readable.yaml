@@ -1,0 +1,14 @@
+id: scenario:issue-4679/refused-category-readable
+statement: 'The audit read accepts the new category: GET /v0/runs/{run_id}/audit?category=scope_amendment_refused returns 200 with an items list (empty for a run that never had an amendment refused) instead of the 400 validation_failed unknown-category refusal a nonsense category gets.'
+verify_hint: 'HTTP: seed a run with POST /v0/dev/fixtures {"scenario":"plan-gate-parked"}, then GET /v0/runs/{run_id}/audit?category=scope_amendment_refused with an operator bearer; expect 200 and no error.code. Control: ?category=not_a_real_category returns 400 validation_failed.'
+steps: POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} (run f88639a4-fa3e-4962-bc3c-bcc147ec71ec). GET /v0/runs/{run_id}/audit?category=scope_amendment_refused, then GET /v0/runs/{run_id}/audit?category=not_a_real_category.
+assertions:
+    expected: 200 with an items list for scope_amendment_refused; 400 validation_failed for a nonsense category.
+    observed_at_record: 200 with items [] and no error.code; control returned 400 validation_failed.
+    repro_handle: curl 'http://localhost:8090/v0/runs/{run_id}/audit?category=scope_amendment_refused'
+origin:
+    issue: 4679
+    pr: 4821
+    run_id: 713f258d-c727-4803-b6b0-2f3e2ef3be3f
+    head_sha: 57114bb0f2ae08950eade9d1d5ec16644cf997a8
+    recorded_at: 2026-10-29T19:39:12Z

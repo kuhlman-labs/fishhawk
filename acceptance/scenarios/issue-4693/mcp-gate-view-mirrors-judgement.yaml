@@ -1,0 +1,14 @@
+id: scenario:issue-4693/mcp-gate-view-mirrors-judgement
+statement: The fishhawk_get_gate_view MCP tool returns the same judgement and outcome fields on its open and settled concerns as the REST gate view.
+verify_hint: 'MCP: fishhawk_get_gate_view for the run returns concerns carrying judgement (unlabelled when never judged) and outcome when recorded, matching GET /v0/runs/{run_id}/gate-view.'
+steps: 'Seed: POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"}, read run_id and the implement stage id. Persist a review concern: build a gzip JSONL trace bundle with a manifest line {seq:1,kind:manifest,data:{bundle_schema:v1}} and a git_diff line whose patch ADDS ''var tok = "ghp_''+36*''A''+''"'' to config/settings.go; POST /v0/runs/{run}/signing-key, sign the bundle bytes via POST /v0/dev/sign, POST /v0/runs/{run}/trace?stage_id={implement}&variant=raw with X-Fishhawk-Signature (202). The server''s deterministic diff-secrets check mints one server_check concern. Mint an fhm_ bearer (sign ''{}'' and POST /v0/runs/{run}/mcp-token). To record an outcome on a second run seeded the same way: sign and POST /v0/runs/{run}/pull-request?stage_id={implement} {pr_number:4242, pr_url:https://github.com/kuhlman-labs/fishhawk/pull/4242, branch, head_sha ''ab''*20, base_sha ''cd''*20, title, files_changed_count:1} (201), then POST /v0/dev/forge/deliveries {forge:github, event:pull_request, payload:{action:closed, installation.id, repository.full_name, pull_request:{html_url, number, merged:true, merged_by, head.sha, base.sha}}} (receiver status 202; pr_merged audit row written). Then POST http://localhost:8090/mcp tools/call fishhawk_get_gate_view {run_id} on both runs (Mcp-Protocol-Version 2026-07-28, Mcp-Method tools/call, Mcp-Name fishhawk_get_gate_view, _meta io.modelcontextprotocol/protocolVersion/clientCapabilities/clientInfo), and GET /v0/runs/{run}/gate-view to compare.'
+assertions:
+    expected: same judgement and outcome fields as REST gate view
+    observed_at_record: 'MCP structuredContent.gate_view.open[0]: judgement ''unlabelled'' and no outcome on the unmerged run; judgement ''unlabelled'' and outcome ''open_at_merge'' on the merged run. The projected (id, state, outcome, judgement) set is identical to the REST gate view.'
+    repro_handle: POST http://localhost:8090/mcp tools/call fishhawk_get_gate_view {run_id:c05eae17-6b41-4a53-8355-2c4e8ea55600}
+origin:
+    issue: 4693
+    pr: 4844
+    run_id: 09dcfa08-94b9-4282-9a6b-c9e3b14c1ca3
+    head_sha: ec13f129a06219719636006a5a621dbc63aa750f
+    recorded_at: 2026-10-30T07:41:54Z

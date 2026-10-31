@@ -2118,3 +2118,47 @@ func TestPublishResultAtHead_UnforcedByDefault(t *testing.T) {
 		t.Fatalf("PublishResultAtHead must not force: published=%v calls=%d, want false/1", again, len(gh.calls))
 	}
 }
+
+// --- #4801: a held pending check names its cause in the title and summary ---
+
+// TestBuildParams_PendingHeldTitleNamesCause pins the "Held: <headline>" title
+// and summary lead on a pending check whose missing list names a cause, and
+// that an EMPTY pending list keeps the CheckName title and the generic summary.
+// It reads the params the fake forge RECORDED.
+func TestBuildParams_PendingHeldTitleNamesCause(t *testing.T) {
+	const generic = "Audit chain is still being assembled. Fishhawk will update this check when the run terminates."
+	headline := "acceptance stage 88538e1a pending — re-opened by a fix-up push, not re-dispatched"
+	publish := func(t *testing.T, st stagecheck.State, missing []auditcomplete.MissingItem) forge.CreateCheckRunParams {
+		t.Helper()
+		runID, gh, pub := happyDeps(t)
+		if _, err := pub.Publish(context.Background(), runID, st, missing); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if len(gh.calls) != 1 {
+			t.Fatalf("calls = %d, want 1", len(gh.calls))
+		}
+		return gh.calls[0].params
+	}
+	cause := []auditcomplete.MissingItem{{Kind: auditcomplete.MissingStageNotTerminal, Detail: "d", Headline: headline}}
+
+	held := publish(t, stagecheck.StatePending, cause)
+	if want := "Held: " + headline; held.OutputTitle != want {
+		t.Errorf("title = %q, want %q", held.OutputTitle, want)
+	}
+	if want := "Held: " + headline + ". " + generic; held.OutputSummary != want {
+		t.Errorf("summary = %q, want %q", held.OutputSummary, want)
+	}
+
+	empty := publish(t, stagecheck.StatePending, nil)
+	if empty.OutputTitle != auditcheckpublisher.CheckName || empty.OutputSummary != generic {
+		t.Errorf("empty pending = (%q, %q), want (%q, the generic summary)", empty.OutputTitle, empty.OutputSummary, auditcheckpublisher.CheckName)
+	}
+
+	// Pass and fail are unchanged: no "Held:" anywhere.
+	for _, st := range []stagecheck.State{stagecheck.StatePass, stagecheck.StateFail} {
+		p := publish(t, st, cause)
+		if strings.Contains(p.OutputTitle, "Held:") || strings.Contains(p.OutputSummary, "Held:") {
+			t.Errorf("%s: title %q summary %q carry the pending Held: lead", st, p.OutputTitle, p.OutputSummary)
+		}
+	}
+}

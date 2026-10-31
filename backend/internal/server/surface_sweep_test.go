@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan/planfixture"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 )
 
 // subPlanScope is one decomposition sub-plan's title + own scope.files for
@@ -1385,3 +1386,41 @@ workflows:
         constraints:
           - max_files_changed: 3
 `)
+
+// TestRunSurfaceSweep_SliceSharedPath_RendersToPlanReview is the #4679
+// cross-layer test: a decomposition whose slices declare overlapping paths by
+// containment (docs/guide/ vs docs/guide/intro.md) is swept by runSurfaceSweep,
+// mapped by planGateEvidence and rendered by prompt.Build("plan_review"); the
+// reviewer prompt carries the CROSS-SLICE COUPLING line naming both slices and
+// both paths. No registered lockstep pattern covers docs/guide/*, so the line
+// can only come from sliceSharedPathFindings.
+func TestRunSurfaceSweep_SliceSharedPath_RendersToPlanReview(t *testing.T) {
+	s, au, runRow := newScopePrecheckServer(t, specImplementPathConstraints)
+	body := warningsPlanBody(t, sliceSharedPathSubs("docs/guide/intro.md"))
+
+	sweep := s.runSurfaceSweep(context.Background(), runRow.ID, runRow.ID, body)
+	if sweep == nil {
+		t.Fatal("runSurfaceSweep returned nil (fail-open) — expected a computed payload")
+	}
+	if got := lastSurfaceSweepEntry(t, au); len(got.CrossSliceFindings) != 1 || got.CrossSliceFindings[0].Pattern != surfacePatternSliceSharedPath {
+		t.Fatalf("cross_slice_findings = %+v, want one %q finding", got.CrossSliceFindings, surfacePatternSliceSharedPath)
+	}
+
+	ev := planGateEvidence(nil, sweep, nil, nil, nil)
+	parsedPlan, err := plan.Parse(body)
+	if err != nil {
+		t.Fatalf("parse plan: %v", err)
+	}
+	rendered, err := prompt.Build("plan_review", prompt.Trigger{
+		Repo:             "x/y",
+		ApprovedPlan:     parsedPlan,
+		PlanGateEvidence: ev,
+	})
+	if err != nil {
+		t.Fatalf("prompt.Build: %v", err)
+	}
+	const wantLine = `CROSS-SLICE COUPLING (shared path across decomposition slices): these lockstep files are split across slices — "guide dir" owns [docs/guide/], "guide intro" owns [docs/guide/intro.md].`
+	if !strings.Contains(rendered, wantLine) {
+		t.Errorf("plan-review prompt missing the shared-path line:\nwant substring: %s\n\ngot:\n%s", wantLine, rendered)
+	}
+}

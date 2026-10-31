@@ -17,6 +17,8 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -593,9 +595,13 @@ workflows:
 
 // seedFirstRoundParent makes f's run the #4282 shape: a decomposed parent with
 // two succeeded slices, its consolidated PR open, its approved plan stored (the
-// implement review renders it), and NO implement round.
+// implement review renders it), and NO implement round. It wires a
+// Static("main") default-branch source (#4660) so the round's compare base
+// resolves; a test that exercises the resolution itself overwrites
+// f.s.cfg.DefaultBranch after seeding.
 func seedFirstRoundParent(t *testing.T, f *redispatchFixture) {
 	t.Helper()
+	f.s.cfg.DefaultBranch = defaultbranch.Static("main")
 	f.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
 	for i := range 2 {
 		c := f.rr.seedRun()
@@ -626,8 +632,10 @@ func firstRoundRows(t *testing.T, f *redispatchFixture) ([]reviewRoundRerunReque
 // consolidated dispatch never started a round is held by the coverage hold,
 // whose next_step is now the re-run verb; the verb records the request
 // (first_round, rerun_of_sequence 0), runs the consolidated round body
-// synchronously over ComparePatch(<default ref>, <consolidated branch>), the
-// reviewer returns a verdict, and the hold clears.
+// synchronously over ComparePatch(<resolved default branch>, <consolidated
+// branch>), the reviewer returns a verdict, and the hold clears. The trunk arm
+// runs a non-Fishhawk acme/widgets repository through the PRODUCTION resolver
+// over a getter reporting trunk (#4660, ADR-110 3(a)).
 //
 // Drift-check fixture state (approval condition C2): newRedispatchFixture
 // wires no ConcernRepo, so permissionDriftRunnable is false and the drift
@@ -638,18 +646,28 @@ func firstRoundRows(t *testing.T, f *redispatchFixture) ([]reviewRoundRerunReque
 // handleRerunReview → 409 → RED.
 func TestRerunReview_FirstConsolidatedRound(t *testing.T) {
 	for _, tc := range []struct {
-		name, defaultRef, wantBase string
+		name, repo, wantBase string
+		// forgeBranch, when set, wires the production resolver over a getter
+		// reporting it; otherwise a Static(wantBase) source.
+		forgeBranch string
 	}{
-		{"no orchestrator default ref", "", "main"},
-		{"orchestrator default ref", "trunk", "trunk"},
+		{name: "static default branch", wantBase: "main"},
+		{name: "forge default branch trunk", repo: "acme/widgets", forgeBranch: "trunk", wantBase: "trunk"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			gh, paths := recordingCompareClient(t, cannedCompareOneFile)
 			f := newRedispatchFixture(t, redispatchFixtureOpts{github: gh})
-			if tc.defaultRef != "" {
-				f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.rr, DefaultRef: tc.defaultRef}
+			if tc.repo != "" {
+				f.runRow.Repo = tc.repo
 			}
 			seedFirstRoundParent(t, f)
+			var getter *repoGetterFake
+			if tc.forgeBranch != "" {
+				getter = &repoGetterFake{branch: tc.forgeBranch}
+				f.s.cfg.DefaultBranch = defaultbranch.New(getter)
+			} else {
+				f.s.cfg.DefaultBranch = defaultbranch.Static(tc.wantBase)
+			}
 
 			ref, err := f.s.reviewCoverageRefusal(context.Background(), f.runRow)
 			if err != nil || ref == nil || ref.Details["next_step"] != reviewCoverageNextRerun {
@@ -699,6 +717,59 @@ func TestRerunReview_FirstConsolidatedRound(t *testing.T) {
 			}
 			if ref, err := f.s.reviewCoverageRefusal(context.Background(), f.runRow); err != nil || ref != nil {
 				t.Errorf("coverage refusal after the first round = %+v err %v, want nil (the hold clears)", ref, err)
+			}
+			if getter != nil {
+				if c := getter.calls(); len(c) != 1 || c[0].String() != tc.repo {
+					t.Errorf("forge default-branch reads = %v, want exactly one for %s", c, tc.repo)
+				}
+			}
+		})
+	}
+}
+
+// TestRerunReview_FirstRoundDefaultBranchUnresolved (#4660): an otherwise
+// ELIGIBLE decomposed parent whose forge default branch cannot be resolved is
+// refused 409 review_rerun_ineligible, reason default_branch_unresolved, with
+// the named resolver reason — and the refusal is WRITE-FREE: the resolution
+// runs AHEAD of the review_round_rerun_requested append, so the audit repo is
+// read back and must hold no such row, no round, and no compare call.
+//
+// COUNTERFACTUAL (CF-A8): move the resolution back below the AppendChained →
+// assertNothingRerun reads a review_round_rerun_requested row → RED.
+func TestRerunReview_FirstRoundDefaultBranchUnresolved(t *testing.T) {
+	cases := []struct {
+		name       string
+		source     defaultbranch.Source
+		wantReason defaultbranch.Reason
+	}{
+		{"nil resolver", nil, defaultbranch.ReasonResolverUnconfigured},
+		{"forge forbidden", defaultbranch.New(&repoGetterFake{err: forge.ErrForbidden}), defaultbranch.ReasonForbidden},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gh, paths := recordingCompareClient(t, cannedCompareOneFile)
+			f := newRedispatchFixture(t, redispatchFixtureOpts{github: gh})
+			f.runRow.Repo = "acme/widgets"
+			seedFirstRoundParent(t, f)
+			f.s.cfg.DefaultBranch = tc.source
+			rec := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+			f.s.waitBackgroundReviews()
+			if rec.Code != http.StatusConflict {
+				t.Fatalf("status = %d, want 409:\n%s", rec.Code, rec.Body.String())
+			}
+			code, details := rerunErr(t, rec)
+			if code != rerunCodeIneligible || details["reason"] != rerunSlugDefaultBranchUnresolved ||
+				details["default_branch_unresolved_reason"] != string(tc.wantReason) ||
+				details["stage_id"] != f.implStage.ID.String() {
+				t.Errorf("error = %s %v, want %s reason %s default_branch_unresolved_reason %s on the parent implement stage",
+					code, details, rerunCodeIneligible, rerunSlugDefaultBranchUnresolved, tc.wantReason)
+			}
+			if !strings.Contains(rec.Body.String(), "retry once the read recovers") {
+				t.Errorf("message does not carry the default-branch hint:\n%s", rec.Body.String())
+			}
+			assertNothingRerun(t, f, 0)
+			if p := paths(); len(p) != 0 {
+				t.Errorf("compare calls = %v, want none", p)
 			}
 		})
 	}

@@ -46,6 +46,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/decisionindex"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/delegationconfirm"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/deployreconciler"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
@@ -1345,11 +1346,18 @@ func buildRepoConventionsLoader(srv *server.Server, resolver server.ProviderReso
 // returns nil so server.New falls back to the deny-by-default NoOp. token
 // is the optional REST-read accessor (nil → anonymous reads). Extracted so
 // the config-gated wiring seam is unit-testable without booting the server.
-func resolveIdentityProvider(oauthClientID string, token func(context.Context) (string, error), apiBaseURL, oauthBaseURL string) identity.IdentityProvider {
+//
+// oauthClientSecret is ALWAYS threaded (identity.WithClientSecret): the
+// token-login mint's client binding (#4627) authenticates GitHub's
+// check-a-token call with the client's own id + secret, and a provider
+// without it refuses every VerifyAccessToken with
+// ErrClientCredentialUnconfigured (503) rather than falling back to
+// owner-only verification.
+func resolveIdentityProvider(oauthClientID, oauthClientSecret string, token func(context.Context) (string, error), apiBaseURL, oauthBaseURL string) identity.IdentityProvider {
 	if oauthClientID == "" {
 		return nil
 	}
-	var opts []identity.Option
+	opts := []identity.Option{identity.WithClientSecret(oauthClientSecret)}
 	// Only override when the deployment configured a non-default endpoint
 	// (E44.2 / #1826). Empty values leave the GitHub hosts untouched, so an
 	// unconfigured deployment constructs exactly as before.
@@ -2058,6 +2066,9 @@ func runServe(args []string, logSink io.Writer) int {
 	mergeQueueApprovalWait := fs.String("merge-queue-approval-wait",
 		envOr("FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT", server.DefaultMergeQueueApprovalWait.String()),
 		"ADR-112 R3 head-of-line approval wait (#4632): how long a merge-queue entry whose forge approval does not qualify (review required, dismissed, absent, undetermined, truncated) holds the head of the line before it YIELDS its place. A Go duration; default 30m. A non-positive or unparseable value fails startup. Contract: backend/README.md.")
+	mergeQueueGateWait := fs.String("merge-queue-gate-wait",
+		envOr("FISHHAWKD_MERGE_QUEUE_GATE_WAIT", ""),
+		"docs/adr/112 A3.2 merge-gate window (#4780): how long a merge-queue head of line whose required checks are pending, unreported or unreadable, or whose implement-review round is settling, holds the head of the line (once per admission epoch, from a 3-hold budget refilled one per hour) before it YIELDS merge_checks_pending or merge_review_pending. A Go duration; empty (the default) means the --merge-queue-approval-wait value. A non-positive or unparseable value fails startup. Contract: backend/README.md.")
 	enableInvariantMonitor := fs.Bool("enable-invariant-monitor",
 		envOr("FISHHAWKD_ENABLE_INVARIANT_MONITOR", "false") == "true",
 		"start the self-consistency invariant monitor (#764); periodically auto-reconciles the safe {all stages terminal, run non-terminal} class and surfaces (audit + WARN log) the unrecoverable {review awaiting_approval, null pull_request_url on a push-and-open-pr run} class. Off by default to match the other tickers' dev-loop posture.")
@@ -2363,6 +2374,13 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Error("invalid merge-queue approval wait", slog.String("error", err.Error()))
 		return exitFailure
 	}
+	// docs/adr/112 A3.2 merge-gate window (#4780), resolved the same way:
+	// empty is the approval wait; anything else must be a positive duration.
+	gateWait, err := resolveMergeQueueGateWait(*mergeQueueGateWait, approvalWait)
+	if err != nil {
+		logger.Error("invalid merge-queue gate wait", slog.String("error", err.Error()))
+		return exitFailure
+	}
 
 	// OAuth token-mint authz minimum (E39.3 / #1708). Fail closed on an
 	// unrecognized tier rather than silently defaulting — a typo must not
@@ -2472,6 +2490,7 @@ func runServe(args []string, logSink io.Writer) int {
 	// and, outside off, a WARN per missing git / go binary.
 	cfg.MergeCandidateTransfer = transferCfg
 	cfg.MergeQueueApprovalWait = approvalWait
+	cfg.MergeQueueGateWait = gateWait
 
 	// Wire the MCP tool registry into the /mcp route (ADR-076 / #2390). The
 	// route takes a FACTORY rather than importing mcpserver itself: an import
@@ -3032,6 +3051,12 @@ func runServe(args []string, logSink io.Writer) int {
 		logger.Warn("FISHHAWKD_GITHUB_APP_ID not set; webhook dispatch and GitHub-side actions will be disabled")
 	}
 
+	// Default-branch resolver (#4660): wired once cfg.GitHub is final (both
+	// the App and the dev-stub branches above) and BEFORE the orchestrator is
+	// built below, so the server and the orchestrator hold the SAME shared
+	// resolver instance — one TTL cache per repository.
+	wireDefaultBranch(&cfg)
+
 	// Dev-mode consequence WARN (E45.76 / #3601). Emitted ONCE, here, because
 	// this is the first point at which BOTH dev surfaces are resolved
 	// (cfg.DevFixtures is assigned in the pool block above, cfg.DevStubForge
@@ -3349,7 +3374,10 @@ func runServe(args []string, logSink io.Writer) int {
 		// It stays on Mode 1 (per-deployment) endpoints; a per-installation
 		// identity leg needs an interface that carries installation context — a
 		// follow-up, mirroring the deferred web-OAuth leg.
-		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, operatorRepoToken,
+		// The client secret is threaded too: it authenticates the token-login
+		// client-binding check (#4627). This block already refused to boot
+		// unless id + secret + callback are all set.
+		cfg.IdentityProvider = resolveIdentityProvider(*oauthClientID, *oauthClientSecret, operatorRepoToken,
 			githubEndpoints.IdentityAPIURL, githubEndpoints.IdentityOAuthURL)
 		// Workspace-membership login gate (E44.3 / ADR-057 Amendment
 		// A2, generalized in E44.8 / #1832): invited account_members
@@ -4102,7 +4130,7 @@ func runServe(args []string, logSink io.Writer) int {
 		go srv.RunMergeQueueYieldReprobe(ctx, server.MergeCandidateQueuePumpInterval)
 		logger.Info("merge-queue yield re-probe started",
 			slog.Duration("interval", server.MergeCandidateQueuePumpInterval),
-			slog.Duration("approval_wait", approvalWait))
+			slog.Duration("approval_wait", approvalWait), slog.Duration("gate_wait", gateWait))
 	}
 
 	errCh := make(chan error, 1)
@@ -4323,10 +4351,31 @@ func (a childCompletionAdvancer) DispatchChildren(ctx context.Context, parentRun
 // miswiring fails a serve-level test rather than passing behind the
 // orchestrator-fake behavioral tests. Drive is nil-safe (Engine.Record/
 // Recorded guard a nil receiver); it mirrors server.go's drive wiring.
+// defaultBranchSource is the production default-branch Source (#4660): the
+// GitHub client's shared resolver, or an UNTYPED nil for a nil client — never
+// a typed-nil pointer inside the interface, which would read as configured.
+func defaultBranchSource(gh *githubclient.Client) defaultbranch.Source {
+	if gh == nil {
+		return nil
+	}
+	return gh.DefaultBranches()
+}
+
+// wireDefaultBranch sets cfg.DefaultBranch from cfg.GitHub. runServe calls it
+// after the GitHub client is final and before newStageOrchestrator, which
+// threads the SAME instance into the orchestrator.
+func wireDefaultBranch(cfg *server.Config) {
+	cfg.DefaultBranch = defaultBranchSource(cfg.GitHub)
+}
+
 func newStageOrchestrator(cfg server.Config, logger *slog.Logger) *orchestrator.Orchestrator {
 	return &orchestrator.Orchestrator{
-		Runs:                cfg.RunRepo,
-		GitHub:              cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+		Runs:   cfg.RunRepo,
+		GitHub: cfg.GitHub, // nil-safe; orchestrator skips dispatch when GitHub is nil
+		// DefaultBranch is the server's shared resolver (#4660), so the
+		// consolidated PR, fan-in base and consolidated-review trigger share
+		// its cache with the server-side reads.
+		DefaultBranch:       cfg.DefaultBranch,
 		Logger:              logger,
 		Artifacts:           cfg.ArtifactRepo,
 		Audit:               cfg.AuditRepo,
@@ -4630,6 +4679,25 @@ func resolveMergeQueueApprovalWait(raw string) (time.Duration, error) {
 	return d, nil
 }
 
+// resolveMergeQueueGateWait validates --merge-queue-gate-wait /
+// FISHHAWKD_MERGE_QUEUE_GATE_WAIT (docs/adr/112 A3.2): empty answers
+// approvalWait (the merge-gate window defaults to the approval wait); any
+// other value must be a positive Go duration, and a non-positive or
+// unparseable one refuses startup naming the flag and the env var.
+func resolveMergeQueueGateWait(raw string, approvalWait time.Duration) (time.Duration, error) {
+	if raw == "" {
+		return approvalWait, nil
+	}
+	d, err := time.ParseDuration(raw)
+	if err != nil {
+		return 0, fmt.Errorf("--merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT: %q is not a Go duration: %w", raw, err)
+	}
+	if d <= 0 {
+		return 0, fmt.Errorf("--merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT: %q must be a positive duration", raw)
+	}
+	return d, nil
+}
+
 // alertTriggerConfig is the resolved alert-ingress configuration
 // (E35.4 / #1601). The zero value — no sources — is the ingress OFF.
 type alertTriggerConfig struct {
@@ -4833,7 +4901,8 @@ func campaignOperatorIdentity() server.Identity {
 
 // githubAutoMerger is the GITHUB-FAMILY LEAF of server.ForgeMerger (E45.47 /
 // #3464): may_merge dispatches a github-family run's pull request through
-// GitHub's auto-merge (EnableAutoMerge, squash), and the existing webhook /
+// GitHub's auto-merge (EnableAutoMerge, with the run's resolved merge method,
+// server.ResolveRunMergeMethod — absent = squash, E93.2 / #4658), and the existing webhook /
 // resolveReviewStageOnMerge path settles the review stage. Fails before any
 // HTTP call when the run lacks the installation id or PR url the merge needs.
 // server.ForgeMerger delegates github-family runs here byte-for-byte and routes
@@ -4903,6 +4972,23 @@ func mergeReconcilerPollSources(gh *githubclient.Client) (mergereconciler.PRGett
 // merge queue's merge-on-pass consumes (ADR-093 D3, E87.5 / #4296).
 var _ server.HeadPinnedMerger = githubAutoMerger{}
 
+// githubAutoMerger also implements the optional server.MergeMethodPolicyReader
+// ForgeMerger's merge-method attribution consumes (E93.2 / #4658).
+var _ server.MergeMethodPolicyReader = githubAutoMerger{}
+
+// AllowedMergeMethods reads the run's repository merge-method settings
+// (githubclient.AllowedMergeMethods, one GraphQL query on the run's
+// installation token) for ForgeMerger's best-effort refusal attribution. It
+// fails before any HTTP call on the same missing installation id / PR url
+// mergeTarget refuses.
+func (m githubAutoMerger) AllowedMergeMethods(ctx context.Context, runRow *runpkg.Run) (forge.AllowedMergeMethods, error) {
+	scope, repo, _, err := m.mergeTarget(runRow)
+	if err != nil {
+		return forge.AllowedMergeMethods{}, err
+	}
+	return m.gh.AllowedMergeMethods(ctx, scope, repo)
+}
+
 // mergeTarget resolves the run's GitHub merge target — the installation scope,
 // repo and PR number — failing closed before any HTTP call when the run lacks
 // the installation id or a parseable PR url. Shared by MergePullRequest and
@@ -4922,18 +5008,23 @@ func (githubAutoMerger) mergeTarget(runRow *runpkg.Run) (forge.CredentialScope, 
 }
 
 // MergePullRequestAtHead is the head-pinned merge-on-pass leaf (ADR-093 D3,
-// E87.5 / #4296): a SYNCHRONOUS REST squash merge whose body carries sha, so
+// E87.5 / #4296): a SYNCHRONOUS REST merge with the run's resolved merge method
+// (E93.2 / #4658) whose body carries sha, so
 // GitHub refuses (409 -> forge.ErrMergeConflict) a head that moved after the
 // queue verified it. It NEVER calls EnableAutoMerge and never takes the
 // clean-status ladder MergePullRequest uses: a queued auto-merge waits on
 // checks while the base may move, which would merge a tree the queue never
 // verified against the current base.
 func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
+	mm, err := server.ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return err
+	}
 	scope, repo, number, err := m.mergeTarget(runRow)
 	if err != nil {
 		return err
 	}
-	return m.gh.MergePullRequestAtHead(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
+	return m.gh.MergePullRequestAtHead(ctx, scope, repo, number, mm.Method, headSHA)
 }
 
 // MergePullRequest is the github-family GitHubMerger leaf (inline merge_run
@@ -4943,14 +5034,20 @@ func (m githubAutoMerger) MergePullRequestAtHead(ctx context.Context, runRow *ru
 // (#4641), so it is one tested production function. headSHA is the head the
 // merge-candidate gate admitted: non-empty PINS both arms (expectedHeadOid on
 // the auto-merge enable, sha on the REST fallback) and a head mismatch surfaces
-// as forge.ErrMergeConflict; empty keeps the unpinned ladder. The webhook /
-// resolveReviewStageOnMerge path settles the review stage on the merge.
+// as forge.ErrMergeConflict; empty keeps the unpinned ladder. Both arms carry
+// the run's resolved merge method (server.ResolveRunMergeMethod, E93.2 /
+// #4658). The webhook / resolveReviewStageOnMerge path settles the review
+// stage on the merge.
 func (m githubAutoMerger) MergePullRequest(ctx context.Context, runRow *runpkg.Run, headSHA string) error {
+	mm, err := server.ResolveRunMergeMethod(runRow)
+	if err != nil {
+		return err
+	}
 	scope, repo, number, err := m.mergeTarget(runRow)
 	if err != nil {
 		return err
 	}
-	return m.gh.QueueMerge(ctx, scope, repo, number, forge.MergeMethodSquash, headSHA)
+	return m.gh.QueueMerge(ctx, scope, repo, number, mm.Method, headSHA)
 }
 
 // parseInstallationHostAllowlist splits a comma-separated

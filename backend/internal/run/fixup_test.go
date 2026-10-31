@@ -907,6 +907,67 @@ func TestFixupStage_RefusalNamesWaitForInFlightAcceptance(t *testing.T) {
 	}
 }
 
+// #4785: the merge-candidate verify pass sets TolerateUndispatchedAcceptance
+// so it can re-open a decomposed parent's implement stage while the parent's
+// never-dispatched acceptance stage is held `pending` ahead of a pending review.
+// The option tolerates ONLY `pending`; every other non-terminal acceptance
+// state keeps the #3116 refusal even with it set. The option-absent behaviour
+// is pinned by the unedited #3116 tests above.
+func TestFixupStage_TolerateUndispatchedAcceptance_ReopensWithoutRepark(t *testing.T) {
+	repo, impl, review, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStatePending)
+	ctx := context.Background()
+
+	dec, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+		PriorPassCount:                 0,
+		MaxPasses:                      1,
+		HardCeiling:                    1,
+		TolerateUndispatchedAcceptance: true,
+	})
+	if err != nil {
+		t.Fatalf("FixupStage with TolerateUndispatchedAcceptance on a pending acceptance: %v, want admit", err)
+	}
+	if dec.Stage.State != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending (re-opened)", dec.Stage.State)
+	}
+	if dec.ReparkedReview != nil {
+		t.Errorf("ReparkedReview = %+v, want nil (the review is still pending; nothing to re-park)", dec.ReparkedReview)
+	}
+	if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStatePending {
+		t.Errorf("implement state in repo = %q, want pending", cur.State)
+	}
+	if cur, _ := repo.GetStage(ctx, review.ID); cur.State != run.StageStatePending {
+		t.Errorf("review state = %q, want unchanged (pending)", cur.State)
+	}
+	if cur, _ := repo.GetStage(ctx, acc.ID); cur.State != run.StageStatePending {
+		t.Errorf("acceptance state = %q, want unchanged (pending)", cur.State)
+	}
+
+	// FixupApplicable shares admitFixup, so the dry-run agrees.
+	repo2, impl2, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, run.StageStatePending)
+	if err := run.FixupApplicable(ctx, repo2, impl2.ID, run.FixupOptions{MaxPasses: 1, HardCeiling: 1, TolerateUndispatchedAcceptance: true}); err != nil {
+		t.Errorf("FixupApplicable with the option on a pending acceptance = %v, want nil", err)
+	}
+
+	for _, accState := range []run.StageState{run.StageStateAwaitingHostDispatch, run.StageStateDispatched, run.StageStateRunning} {
+		t.Run("still_refused_"+string(accState), func(t *testing.T) {
+			repo, impl, _, _ := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStatePending, accState)
+			ctx := context.Background()
+
+			_, err := run.FixupStage(ctx, repo, impl.ID, run.FixupOptions{
+				MaxPasses:                      1,
+				HardCeiling:                    1,
+				TolerateUndispatchedAcceptance: true,
+			})
+			if !errors.Is(err, run.ErrFixupNotApplicable) {
+				t.Fatalf("err = %v, want ErrFixupNotApplicable (the option tolerates only a pending acceptance)", err)
+			}
+			if cur, _ := repo.GetStage(ctx, impl.ID); cur.State != run.StageStateSucceeded {
+				t.Errorf("implement state = %q, want unchanged (succeeded)", cur.State)
+			}
+		})
+	}
+}
+
 func TestFixupStage_RefusalGateNotOpenWithoutAcceptance(t *testing.T) {
 	// Branch (b): review not yet open and NO acceptance stage is holding it —
 	// re-poll, do not point at a stage that does not exist.
