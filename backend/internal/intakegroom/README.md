@@ -207,8 +207,9 @@ The non-goal shape is anchored on the list dash AND the opening bold span, so
 running prose that names `N3`, an inline bold span, a table row carrying an
 N-id, and an unbolded bullet all fail to parse. It matches anywhere in the
 document rather than under a §3 heading, so renumbering the section does not
-silently empty it. `TestParseNonGoals_ParsesTheShippedCharter` pins N1..N8 of
-this repository's `.fishhawk/charter.md` and fails (never skips) when the file
+silently empty it. `TestParseNonGoals_ParsesTheShippedCharter` pins the active
+non-goals of this repository's `.fishhawk/charter.md` (N1–N6, N8 and N9),
+excludes retired N7's historical prose, and fails (never skips) when the file
 is unreadable.
 
 `Charter.NonGoals` is set from the same content as `RubricIDs`, so the two can

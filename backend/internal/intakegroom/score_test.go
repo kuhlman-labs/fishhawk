@@ -289,7 +289,8 @@ func TestParseNonGoals_ParsesTheShippedCharter(t *testing.T) {
 	}
 	n := ParseNonGoals(string(raw))
 
-	want := []string{"N1", "N2", "N3", "N4", "N5", "N6", "N7", "N8"}
+	// N7 is retained in historical prose only; N9 is the active project boundary.
+	want := []string{"N1", "N2", "N3", "N4", "N5", "N6", "N8", "N9"}
 	if got := n.IDs(); strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("IDs = %v, want the shipped §3 non-goals in charter order %v", got, want)
 	}
