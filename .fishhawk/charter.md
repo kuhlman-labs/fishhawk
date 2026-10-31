@@ -32,6 +32,12 @@ decide and where; the crew advises, disagrees on the record, and escalates what 
 may not settle. An organization is a fleet of such repositories, each with its own
 captain — the enterprise case is the same model repeated, not a different product.
 
+The repository remains the unit of **governance**. A future **project** may be a
+unit of **coordination**: a shared outcome, dependencies and readiness across
+repository-local campaigns. It confers no authority over a member repository's
+charter, approvals, credentials or merge gates. This is a post-alpha direction;
+the phase boundary and revisit trigger are in §2, not an expansion of alpha.
+
 The durable model is asymmetric and is not transitional scaffolding: **humans set
 direction and approve outcomes; agents implement.** Every design decision should
 make that asymmetry cheaper to operate, not erode it.
@@ -117,6 +123,31 @@ ids are retired and never recycled (§6).
 | **D6** | A second eligible approver, or quorum. |
 | **D7** | A second forge as a blocker — GitLab support stays shipped; its live walk is beta (ADR-080 #3693). |
 | **D8** | Earned autonomy landing in alpha — the crew's record recommending changes to its own delegation is designed in alpha and may land after it; the captain always ratifies. |
+| **D9** | Project coordination across repositories — visibility, coordinated execution and coordinated releases are outside alpha; the repository-local crew and bridge remain the alpha obligation. |
+
+### Improvement and project directions
+
+The crew's record should make recurring operator toil visible and support
+reviewable proposals to improve the process. Intervention counts, waiting time
+and active human effort are different quantities; fewer interventions alone do
+not prove better outcomes. This advances V3 and T12 without adding an alpha exit
+criterion. Evidence-based crew selection is later depth, not an alpha blocker.
+The concrete proposals are drafts: [ADR-127 / #4880](https://github.com/kuhlman-labs/fishhawk/issues/4880)
+(interventions), [ADR-128 / #4881](https://github.com/kuhlman-labs/fishhawk/issues/4881)
+(process improvements), and [ADR-129 / #4882](https://github.com/kuhlman-labs/fishhawk/issues/4882)
+(crew recommendations). Existing rules for human adoption, protected judges and
+self-improvement enablement still govern; this direction grants no new authority.
+
+Project coordination proceeds from visibility to coordinated execution, with
+coordinated releases considered only after delivery and partial-failure recovery
+have been demonstrated. **Revisit trigger:** a concrete product change spanning
+at least two repositories demonstrates recurring manual coordination that the
+existing campaign surfaces cannot represent. Record the example and the expected
+reduction in coordination work before prioritizing implementation. Until then,
+project work advances a later phase (V5, D9). Its proposed architecture is
+[ADR-130 / #4883](https://github.com/kuhlman-labs/fishhawk/issues/4883), pending
+ratification; coordinated execution needs its own authorization and recovery
+decision before it can ship.
 
 ---
 
@@ -143,9 +174,18 @@ grooming run should flag it as such rather than ranking it.
   is not.
 - **N6 — No user-extensible stage types and no workflow conditionals.** The stage
   set is a small closed set. Conditional logic is where governance dies.
-- **N7 — No multi-repo workflows.** A separate product question.
 - **N8 — Flexibility is not a goal.** Fishhawk is opinionated on purpose. "Make it
   configurable" is usually the wrong answer to a disagreement about process.
+- **N9 — No project-level authority bypass or atomic cross-repository merge.**
+  Project coordination cannot override a member repository's policy, approvals,
+  permissions or merge gates. Partial delivery is explicit; rollback and
+  compensation remain separately authorized repository-local work.
+
+**Retired N7 (2026-10-31).** The former non-goal, "No multi-repo workflows. A
+separate product question", is retained here for historical citations only. The
+maintainer opened project coordination as a post-alpha direction; D9 now carries
+the phase exclusion and N9 the permanent authority boundary. N7 is not an active
+drift rule and its identifier is never reused.
 
 ---
 
@@ -227,3 +267,11 @@ that constrains it.
 Rubric ids are stable identifiers. Reuse of a retired id for a different meaning
 would silently rewrite the justification of every past ranking that cited it: retire
 ids, never recycle them.
+
+**Amendment 2026-10-31.** At the maintainer's express request in the project
+strategy discussion: distinguish repository governance from future project
+coordination; add D9 and N9, retire N7, and record the revisit trigger and
+improvement direction. The alpha done-means are unchanged. ADR-127–130 remain
+draft proposals; this charter amendment does not ratify their technical decisions
+or enable new runtime capabilities. The amendment takes effect after merge as
+specified above.
