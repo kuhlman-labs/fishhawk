@@ -7150,6 +7150,31 @@ components:
         new_position: { type: integer, minimum: 1, description: 1-based place after the call (1 on a promotion). }
         live_run_id: { $ref: '#/components/schemas/UUID', description: The run holding the base's line; omitted when none is live. }
         audit_sequence: { type: integer, format: int64, description: The `merge_queue_promoted` row's chain sequence; omitted on a no-op. }
+    WithdrawMergeQueueIntentRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why this run's merge should leave the merge queue; trimmed, then 1..1000 bytes. Recorded on the `merge_queue_intent_withdrawn` row.
+    MergeQueueWithdrawResponse:
+      type: object
+      required: [run_id, entry_id, repo, base_ref, withdrawn, settled_state, settle_reason, yield_reason, audit_sequence]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        entry_id: { $ref: '#/components/schemas/UUID', description: The withdrawn entry (now terminal). }
+        repo: { type: string, description: '`owner/name`.' }
+        base_ref: { type: string }
+        withdrawn: { type: boolean, description: Always `true` on a 200. }
+        settled_state: { type: string, enum: [dropped], description: The entry's terminal state. }
+        settle_reason: { type: string, enum: [intent_withdrawn], description: The store-owned drop reason. }
+        intent_sequence: { type: integer, format: int64, description: The withdrawn intent's `merge_queue_entered` sequence; omitted when the intent was recorded before 0108. }
+        yield_reason: { type: string, description: The yield reason the entry carried when it was withdrawn. }
+        live_run_id: { $ref: '#/components/schemas/UUID', description: The run holding the base's line; omitted when none is live. }
+        audit_sequence: { type: integer, format: int64, description: The `merge_queue_intent_withdrawn` row's chain sequence. }
     PromoteQueuedStageRequest:
       type: object
       additionalProperties: false
@@ -28454,6 +28479,109 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
           description: '`merge_queue_unconfigured` — no merge queue is wired, the store cannot promote, or no run repository is wired.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/runs/{run_id}/merge-queue/withdraw:
+    post:
+      operationId: withdrawMergeQueueIntent
+      summary: Withdraw the merge intent of a yielded merge-queue entry
+      description: |
+        The ADR-112 R3 withdraw-intent verb (E87.17 / #4685). A run whose
+        merge-queue entry has YIELDED (`yield_reason` on the queue read) still
+        carries the operator's merge intent, so the queue owns its merge and
+        an inline merge is refused. This verb takes the merge out of the
+        queue: it settles the run's yielded held entry `dropped` with the
+        store-owned reason `intent_withdrawn`. The entry is terminal, so every
+        intent lookup treats the intent as absent, and a later
+        `POST /v0/runs/{run_id}/merge` runs the inline path with every one of
+        its own gates (the forge-approval fold, the merge-candidate gate, the
+        dispatch claim). `merge_intent_at` is never cleared: a merge the
+        merge-candidate gate routes back to the queue records intent on a
+        FRESH entry. Nothing is merged and no pump is triggered.
+
+        **Eligibility.** Only a YIELDED entry. A held entry that has not
+        yielded is progressing to the queue's own head-pinned merge (ADR-109:
+        the queue owns the merge) and is refused; cancelling the run stops it.
+        A live entry is never withdrawn mid-pass. Any merge-dispatch claim on
+        the run, `dispatched` or `dispatch_failed`, refuses the withdrawal:
+        the verb never writes the ledger, so a `dispatch_failed` claim still
+        needs reconciliation or the operator re-arm.
+
+        **Refusals, each decided before anything is written.**
+        `401 authentication_required`; `403 run_token_forbidden` (a run-bound
+        agent token, even for its own run); `403 insufficient_scope` (no
+        `write:runs`); `403 account_forbidden` (the run belongs to another
+        workspace account); `400 validation_failed` (a non-UUID `run_id`, or a
+        body that is not exactly one `{"reason": string}` object, or a reason
+        empty after trimming or over 1000 bytes); `503
+        merge_queue_unconfigured` (no merge queue, a store without the
+        capability, or no run repository; decided after the auth rungs); `503
+        merge_lock_unavailable` (the run's merge-intent lock could not be
+        taken within the bounded wait). Then, inside the store's transaction,
+        under the run's merge-intent lock: `404 run_not_found`; `409
+        merge_queue_not_queued` (no active entry: never queued, settled, or
+        already withdrawn); `409 merge_queue_entry_live`; `409
+        merge_queue_no_intent` (the entry carries no merge intent); `409
+        merge_queue_entry_not_yielded`; `409 merge_dispatch_claimed`
+        (`details.claim_state`, `claim_path`, `claim_head_sha` when readable,
+        and `next_step`: `operator_rearm` for `dispatch_failed`, else
+        `fishhawk_get_merge_queue`); `500 merge_queue_withdraw_failed` (rolled
+        back, nothing changed).
+
+        **Audit.** A withdrawal appends a chained `merge_queue_intent_withdrawn`
+        row `{entry_id, run_id, repo, base_ref, anchored_head_sha,
+        merge_intent_at, intent_sequence, yield_reason, yielded_at, reason,
+        actor}` INSIDE the withdrawal transaction, so a failed append rolls
+        the withdrawal back. The payload carries only this run's ids and no
+        `yield_detail` (untrusted forge text).
+
+        **Authorization.** An authenticated identity with `write:runs` in the
+        run's workspace account. A delegated operator-agent token is admitted:
+        the verb only exits the queue, and the inline merge keeps every gate.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WithdrawMergeQueueIntentRequest' }
+      responses:
+        '200':
+          description: The yielded entry was settled `dropped` `intent_withdrawn` and the row appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MergeQueueWithdrawResponse' }
+        '400':
+          description: '`validation_failed` — a non-UUID `run_id`, a body that is not exactly `{"reason": string}`, or a reason empty after trimming or over 1000 bytes (`details.field`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` (a run-bound agent token), `insufficient_scope` (no `write:runs`), or `account_forbidden` (the run belongs to another workspace account).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`merge_queue_not_queued`, `merge_queue_entry_live`, `merge_queue_no_intent`, `merge_queue_entry_not_yielded` or `merge_dispatch_claimed` (see the refusal ladder above; `details.run_id` names the run). Nothing was written.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`merge_queue_withdraw_failed` — the withdrawal (or its audit append) failed and was rolled back; the entry and its intent are unchanged.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`merge_queue_unconfigured` (no merge queue, a store without the capability, or no run repository) or `merge_lock_unavailable` (the merge-intent lock was not taken; nothing written, retryable).'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

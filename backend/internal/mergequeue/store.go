@@ -56,14 +56,19 @@ type PostgresStore struct {
 	// afterPromotePosition is a test hook, nil in production: it runs inside
 	// Promote after the old-position read and before the guarded write.
 	afterPromotePosition func(ctx context.Context)
+	// afterWithdrawPeek is a test hook, nil in production: it runs inside
+	// WithdrawIntent after the unlocked active-entry peek and before the
+	// base lock.
+	afterWithdrawPeek func(ctx context.Context)
 }
 
 var (
-	_ Store          = (*PostgresStore)(nil)
-	_ Promoter       = (*PostgresStore)(nil)
-	_ EjectionReader = (*PostgresStore)(nil)
-	_ ReentryReader  = (*PostgresStore)(nil)
-	_ Resumer        = (*PostgresStore)(nil)
+	_ Store            = (*PostgresStore)(nil)
+	_ Promoter         = (*PostgresStore)(nil)
+	_ IntentWithdrawer = (*PostgresStore)(nil)
+	_ EjectionReader   = (*PostgresStore)(nil)
+	_ ReentryReader    = (*PostgresStore)(nil)
+	_ Resumer          = (*PostgresStore)(nil)
 )
 
 // NewPostgresStore returns the Postgres queue store.
@@ -1400,6 +1405,123 @@ func promoteStatus(ctx context.Context, tx pgx.Tx, runID uuid.UUID) (Status, err
 		return Status{}, fmt.Errorf("mergequeue: promote: run %s lost its active entry under the lock", runID)
 	}
 	return st, nil
+}
+
+// WithdrawIntent withdraws the merge intent of a run's YIELDED held entry by
+// settling it dropped with ReasonIntentWithdrawn (ADR-112 R3, #4685). See
+// README.md § "Withdraw intent".
+//
+// One transaction on one pooled connection, Promote's lock order: the run's
+// account (an unknown run is ErrNotFound), the per-run lock, an unlocked peek
+// of the run's active entry (none is ErrNotQueued), the base lock BLOCKING,
+// the entry re-read FOR UPDATE, then classify: live → ErrEntryLive, settled
+// since the peek → ErrNotQueued, no intent → ErrNoIntent, unmarked →
+// ErrEntryNotYielded; then any merge_dispatch_claims row for the run →
+// ErrDispatchClaimed (the ledger is read, never written). Nothing is written
+// on any refusal. Then the settle, and req.Record before COMMIT; any error,
+// including Record's, rolls the whole withdrawal back.
+func (s *PostgresStore) WithdrawIntent(ctx context.Context, req WithdrawIntentRequest) (Withdrawal, error) {
+	switch {
+	case req.RunID == uuid.Nil:
+		return Withdrawal{}, fmt.Errorf("%w: run id is required", ErrInvalidRequest)
+	case req.Record == nil:
+		return Withdrawal{}, fmt.Errorf("%w: a Record callback is required (a withdrawal never commits unaudited)", ErrInvalidRequest)
+	}
+	var out Withdrawal
+	err := pgx.BeginFunc(ctx, s.pool, func(tx pgx.Tx) error {
+		var err error
+		out, err = s.withdrawIntentTx(ctx, tx, req)
+		return err
+	})
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	return out, nil
+}
+
+func (s *PostgresStore) withdrawIntentTx(ctx context.Context, tx pgx.Tx, req WithdrawIntentRequest) (Withdrawal, error) {
+	var acct string
+	err := tx.QueryRow(ctx, `SELECT COALESCE(account_id::text, '') FROM runs WHERE id = $1`, req.RunID).Scan(&acct)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Withdrawal{}, fmt.Errorf("run %s: %w", req.RunID, ErrNotFound)
+	}
+	if err != nil {
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: read run: %w", err)
+	}
+	if err := lockTx(ctx, tx, runLockKey(req.RunID)); err != nil {
+		return Withdrawal{}, err
+	}
+	var peekID uuid.UUID
+	var repo, baseRef string
+	err = tx.QueryRow(ctx, `SELECT id, repo, base_ref FROM merge_candidate_queue_entries
+WHERE run_id = $1 AND state IN ('held', 'live')`, req.RunID).Scan(&peekID, &repo, &baseRef)
+	if errors.Is(err, pgx.ErrNoRows) {
+		return Withdrawal{}, fmt.Errorf("run %s: %w", req.RunID, ErrNotQueued)
+	}
+	if err != nil {
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: read active entry: %w", err)
+	}
+	if s.afterWithdrawPeek != nil {
+		s.afterWithdrawPeek(ctx)
+	}
+	if err := lockTx(ctx, tx, lockKey(acct, repo, baseRef)); err != nil {
+		return Withdrawal{}, err
+	}
+	cur, err := getEntryTx(ctx, tx, peekID)
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	switch {
+	case cur.State == StateLive: // WithdrawIntent live-entry refusal
+		return Withdrawal{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrEntryLive)
+	case cur.State != StateHeld:
+		// Settled by a by-entry mutation between the peek and the base lock.
+		return Withdrawal{}, fmt.Errorf("run %s entry %s is %s: %w", req.RunID, cur.ID, cur.State, ErrNotQueued)
+	case cur.MergeIntentAt == nil: // WithdrawIntent no-intent refusal
+		return Withdrawal{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrNoIntent)
+	case !cur.Yielded(): // WithdrawIntent unmarked-entry refusal
+		return Withdrawal{}, fmt.Errorf("run %s entry %s: %w", req.RunID, cur.ID, ErrEntryNotYielded)
+	}
+	claim, claimed, err := mergeDispatchTx(ctx, tx, req.RunID)
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	if claimed { // WithdrawIntent dispatch-claim refusal
+		return Withdrawal{}, fmt.Errorf("run %s (claim %s, path %s, head %s): %w",
+			req.RunID, claim.State, claim.Path, claim.HeadSHA, ErrDispatchClaimed)
+	}
+	e, err := settleTx(ctx, tx, cur.ID, StateDropped, ReasonIntentWithdrawn)
+	if err != nil {
+		return Withdrawal{}, err
+	}
+	out := Withdrawal{Entry: e}
+	var live pgtype.UUID
+	err = tx.QueryRow(ctx, `SELECT l.run_id FROM merge_candidate_queue_entries l JOIN runs lr ON lr.id = l.run_id
+WHERE l.repo = $1 AND l.base_ref = $2 AND l.state = 'live' AND lr.account_id IS NOT DISTINCT FROM $3
+ORDER BY l.admitted_at, l.id LIMIT 1`, repo, baseRef, acctArg(acct)).Scan(&live)
+	switch {
+	case err == nil && live.Valid:
+		id := uuid.UUID(live.Bytes)
+		out.LiveRunID = &id
+	case err != nil && !errors.Is(err, pgx.ErrNoRows):
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: read live entry: %w", err)
+	}
+	if err := req.Record(ctx, tx, out); err != nil { // WithdrawIntent record-before-commit
+		return Withdrawal{}, fmt.Errorf("mergequeue: withdraw intent: record: %w", err)
+	}
+	return out, nil
+}
+
+// mergeDispatchTx is MergeDispatch inside a caller's transaction.
+func mergeDispatchTx(ctx context.Context, tx pgx.Tx, runID uuid.UUID) (DispatchClaim, bool, error) {
+	c, err := scanClaim(tx.QueryRow(ctx, `SELECT `+claimCols+` FROM merge_dispatch_claims WHERE run_id = $1`, runID))
+	if errors.Is(err, pgx.ErrNoRows) {
+		return DispatchClaim{}, false, nil
+	}
+	if err != nil {
+		return DispatchClaim{}, false, fmt.Errorf("mergequeue: withdraw intent: read merge dispatch claim: %w", err)
+	}
+	return c, true, nil
 }
 
 // newestRowSQL keeps only the run's NEWEST row (alias e): no row of the same

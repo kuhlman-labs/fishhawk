@@ -326,6 +326,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// #4297): moves the run's unmarked held entry to the head of its base's
 	// line (merge_queue_promote.go).
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge-queue/promote", s.requireRunAccount(memberWrite, s.handleMergeQueuePromote))
+	// ADR-112 R3 withdraw-intent verb (E87.17 / #4685): settles a YIELDED
+	// entry dropped intent_withdrawn so the queue no longer owns the merge
+	// (merge_queue_withdraw.go). Same tier and ladder as the promote.
+	mux.HandleFunc("POST /v0/runs/{run_id}/merge-queue/withdraw", s.requireRunAccount(memberWrite, s.handleMergeQueueWithdraw))
 	// #4101: list a run's (and optionally its decomposition children's) concerns.
 	mux.HandleFunc("GET /v0/runs/{run_id}/concerns", s.requireRunAccount(readAccess, s.handleListRunConcerns))
 	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
