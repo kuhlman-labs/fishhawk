@@ -39,8 +39,9 @@ var adr098SharedSnapshot = []string{
 }
 
 // Preserve the ADR-098 migration baseline and append only the registered
-// agent-context gate inputs (#4886). Shared dirs and class semantics stay intact.
-func TestThisRepoDeclaration_ExtendsADR098WithAgentContextInputs(t *testing.T) {
+// agent-context gate inputs (#4886), plus frontend verification. Shared dirs
+// and class semantics stay intact.
+func TestThisRepoDeclaration_ExtendsADR098WithContextAndFrontend(t *testing.T) {
 	t.Parallel()
 	s := thisRepoSurface(t)
 	wantGlobal := append([]string{}, adr098GlobalSnapshot...)
@@ -49,8 +50,17 @@ func TestThisRepoDeclaration_ExtendsADR098WithAgentContextInputs(t *testing.T) {
 			wantGlobal = append(wantGlobal, input.glob)
 		}
 	}
-	if !reflect.DeepEqual(s.Global, wantGlobal) {
-		t.Errorf("global_surface = %v\nwant ADR-098 plus context gate inputs %v", s.Global, wantGlobal)
+	var withoutFrontend []string
+	frontend := 0
+	for _, pattern := range s.Global {
+		if pattern == "frontend/**" {
+			frontend++
+			continue
+		}
+		withoutFrontend = append(withoutFrontend, pattern)
+	}
+	if frontend != 1 || !reflect.DeepEqual(withoutFrontend, wantGlobal) {
+		t.Errorf("global_surface = %v\nwant ADR-098 plus context gate inputs %v and exactly frontend/**", s.Global, wantGlobal)
 	}
 	if !reflect.DeepEqual(s.SharedDirs, adr098SharedSnapshot) {
 		t.Errorf("shared_artifact_dirs = %v, want %v", s.SharedDirs, adr098SharedSnapshot)

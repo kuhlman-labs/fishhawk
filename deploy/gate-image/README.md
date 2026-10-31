@@ -20,7 +20,7 @@ toolchain. It has two consumers:
 | Property | Value |
 |---|---|
 | Base | `golang:${GO_VERSION}-bookworm` (official multi-arch image) |
-| Build context | `deploy/gate-image/` alone; the image copies NO repository files |
+| Build context | `deploy/gate-image/`, plus named context `frontend=./frontend`; only package.json and pnpm-lock.yaml are copied |
 | Entrypoint / user | none / none — callers pass `--entrypoint ''` and `--user uid:gid` |
 | Runtime env | works as an arbitrary uid with `HOME=/tmp`, except that such a uid has no `/etc/passwd` entry in the image (`whoami` fails, so test-helm-render r9h fails); both callers SUPPLY one: `--in-gate-image` mounts one (step 6), and the runner's container path mounts a runner-generated read-only `/etc/passwd` on every exec (#2137; when that read or write degrades, `gate_passwd_unavailable`, the gap returns for that exec); `GOTOOLCHAIN=local` is baked in |
 | Docker | none: no engine, CLI, plugin or socket, enforced in both check modes |
@@ -34,7 +34,7 @@ from apt `zsh`, `jq`, `python3` (+ `python3-venv`), `lsof`, `netcat-openbsd`
 `diffutils`, `file`, `ca-certificates`; fetched and checksum-verified
 `golangci-lint`, `helm`, `check-jsonschema` (in a venv at
 `/opt/check-jsonschema`, because bookworm's python is PEP 668
-externally-managed). Deliberately absent: `docker`, `kubectl`, `kind`, `node`.
+externally-managed). Node 22.21.1 (official multi-arch image) and pnpm 10.33.3 support the frontend gate. Deliberately absent: `docker`, `kubectl`, `kind`.
 
 **git version (#4767).** Debian bookworm's `git`, 2.39.5 today
 (`docker run --rm --entrypoint git fishhawk-gate:local --version`). It is
@@ -84,7 +84,7 @@ patch pin.
 ## Local build
 
 ```sh
-docker buildx build --load -t fishhawk-gate:local deploy/gate-image
+docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image
 scripts/check-gate-image --image fishhawk-gate:local
 ```
 
@@ -226,10 +226,11 @@ validation plus weekly published-image drift) and `gate-image-publish.yml`
 workflow is replaced by these tracked sources to prevent documentation drift.
 
 Static pins are checked on every CI run. Changes to image files, its validation
-scripts or its build/publish workflows trigger the expensive build. Both
+scripts, frontend dependency manifests or its build/publish workflows trigger
+the expensive build. The same inputs guard promotion to `:main`. Both
 architectures build natively with per-architecture BuildKit caches, export Docker
-archives, load those same archives for dynamic pin checks, and (amd64) run lint
-parity. Main pushes retain the tested archives for one day; PRs upload none.
+archives, load those same archives for dynamic pin checks and offline frontend
+checks, and (amd64) run lint parity. Main pushes retain the tested archives for one day; PRs upload none.
 
 Only after the same CI run's `CI Pass` succeeds does the publisher receive
 `packages: write`. It downloads both named artifacts, loads/pushes the images,
@@ -261,3 +262,19 @@ The two scripts run inside `scripts/test verify` via `_verify_gate_harnesses`
 (the Go test in its `go test` loop), with no
 network and no real Docker. The live image build and in-image smoke are
 operator-validated (the workflow above).
+
+## Offline frontend gate
+
+Build from the repository root with the named context shown above. The frontend context contributes only `package.json` and `pnpm-lock.yaml`; no source, host node_modules or credentials are baked into the image. Node's exact version and pnpm's exact version are Dockerfile ARGs. The build checks the pnpm pin against `packageManager`, then fetches the lockfile packages without executing install scripts into `/opt/fishhawk-pnpm-store` for the target architecture.
+
+`scripts/check-frontend` copies this store into a disposable writable directory, installs with `--offline --frozen-lockfile --ignore-scripts`, then executes all five frontend CI checks. It works under the gate's arbitrary uid and `--network=none`. Missing cache/tooling returns infrastructure exit 75, never a successful skip. Rebuild the local image after frontend lockfile/package-manager changes as well as gate-tool changes, using the candidate checkout when it adds dependencies; published images rebuild on either manifest change. Do not replace a live run's selected image mid-stage.
+
+Before adopting a rebuilt image, run the following against a disposable checkout (the checks write node_modules, build output and TypeScript caches):
+
+```sh
+docker run --rm --network=none --entrypoint '' \
+  -e FISHHAWK_GATE_CONTAINER=1 -e HOME=/tmp \
+  -v "$PWD:/work" -w /work fishhawk-gate:local scripts/check-frontend
+```
+
+The gate-image CI build runs this offline frontend smoke on both architectures. The standard dynamic pin check continues to verify Go, lint, Helm and JSON Schema tooling.

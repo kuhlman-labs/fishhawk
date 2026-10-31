@@ -42,6 +42,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: deploy/gate-image
+          build-contexts: frontend=./frontend
           platforms: linux/${{ matrix.arch }}
           outputs: type=docker,dest=${{ runner.temp }}/gate-${{ matrix.arch }}.tar
           provenance: false
@@ -54,6 +55,12 @@ jobs:
         run: docker load --input "$RUNNER_TEMP/gate-$ARCH.tar"
       - name: Dynamic pin check
         run: scripts/check-gate-image --image fishhawk-gate:ci-${{ matrix.arch }} --platform linux/${{ matrix.arch }}
+      - name: Offline frontend gate
+        run: |
+          docker run --rm --network=none --entrypoint '' \
+            --user "$(id -u):$(id -g)" \
+            -e FISHHAWK_GATE_CONTAINER=1 -e HOME=/tmp \
+            -v "$PWD:/work" -w /work fishhawk-gate:ci-${{ matrix.arch }} scripts/check-frontend
       - name: Lint parity
         if: matrix.arch == 'amd64'
         env:

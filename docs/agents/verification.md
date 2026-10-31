@@ -6,6 +6,10 @@ preconditions and failure semantics; [testing rules](testing.md) cover fixtures.
 
 ## Gates and scope
 
+The repository implement stages run `scripts/verify-change`: path-aware frontend
+checks followed by the full Go/schema gate. See scripts/README § Workflow
+verification for offline dependencies and infrastructure exit 75.
+
 - `scripts/test` runs `go test -race` in every registered module; `coverage`
   also checks aggregate coverage. `verify` adds lint, document/schema gates and
   gate harnesses before tests, folding patch coverage into that same test loop.
@@ -40,7 +44,8 @@ standalone gofmt. Do not make that persistent change without authorization.
 `--in-gate-image` gives CI parity to Docker-free legs, not full runner isolation.
 Its override is `FISHHAWK_TEST_GATE_IMAGE`; `FISHHAWK_GATE_IMAGE` configures
 spawned runners instead. Rebuild the operator's local gate image after Dockerfile
-or pin changes. A runner build with `--network=none` cannot build this networked
+or pin changes, and after frontend dependency-manifest changes. Use the named
+frontend build context documented in the image README. A runner build with `--network=none` cannot build this networked
 Dockerfile; see [gate-image documentation](../../deploy/gate-image/README.md).
 
 On unexplained red, check host load first, then tools, Docker and reproducibility

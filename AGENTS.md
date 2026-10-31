@@ -33,7 +33,7 @@ package, such as `go build ./backend/...`; root `go build ./...` fails.
 
 ```sh
 scripts/test single -run TestName ./backend/internal/version/  # focused test
-scripts/test verify                     # required before push / PR
+scripts/verify-change                   # frontend when relevant, then full verify
 scripts/test verify --packages backend/internal/foo           # iteration only
 scripts/test verify --no-tests          # excludes tests and patch coverage
 scripts/test coverage                   # aggregate coverage

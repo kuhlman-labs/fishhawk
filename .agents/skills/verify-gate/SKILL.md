@@ -5,8 +5,9 @@ description: Run and interpret Fishhawk verification safely. Use before push/PR,
 
 # Run the verify gate
 
-`scripts/test verify` is the committed-tree gate. Its stage order and coverage
-contracts are owned by [scripts/README.md](../../../scripts/README.md) and routed
+`scripts/verify-change` is the repository committed-tree gate: path-aware
+frontend checks followed by `scripts/test verify`. Offline dependencies, exit 75,
+stage order and coverage contracts are owned by [scripts/README.md](../../../scripts/README.md) and routed
 by the [verification guide](../../../docs/agents/verification.md). Lint and static
 checks run before the test loop; scoped and no-tests runs do not establish a full
 pass. Avoid maintaining a second copy of the gate's leg list here.
@@ -32,7 +33,7 @@ git status --short
 
 | Situation | Command |
 |---|---|
-| Before a PR / final check | `scripts/test verify` |
+| Before a PR / final check | `scripts/verify-change` |
 | Iterating on known packages | `scripts/test verify --packages backend/internal/foo,runner/internal/bar` (repo-relative). It skips patch coverage, so finish with a full run |
 | One test | `scripts/test single -run TestName ./backend/internal/foo/` |
 | Lint only | `scripts/test lint` |

@@ -104,6 +104,10 @@ jobs:
               # Static pin validation runs on EVERY change in repository-checks.
               # Rebuild only when the image, its validation or its publisher changes.
               - 'deploy/gate-image/**'
+              - 'frontend/package.json'
+              - 'frontend/pnpm-lock.yaml'
+              - 'scripts/check-frontend'
+              - 'scripts/verify-change'
               - 'scripts/ci-image-current'
               - 'scripts/check-gate-image'
               - 'scripts/test'

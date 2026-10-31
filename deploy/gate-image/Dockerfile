@@ -4,12 +4,14 @@
 # defined in-repo and pin-checked, and the image `scripts/test lint|verify
 # --in-gate-image` runs for CI parity. Long form: deploy/gate-image/README.md.
 #
-# BUILD CONTEXT: deploy/gate-image/ alone. The image installs tools and copies
-# NO repository files, so a checkout is always bind-mounted at run time:
-#   docker buildx build --load -t fishhawk-gate:local deploy/gate-image
+# BUILD CONTEXT: deploy/gate-image/ plus frontend=./frontend. The image copies
+# only frontend dependency manifests via the named frontend context; the
+# candidate checkout is always bind-mounted at run time:
+#   docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image
 #
-# PINS. Each ARG default below is a pin site, and scripts/check-gate-image holds
-# them to the rest of the repository:
+# PINS. scripts/check-gate-image holds the four Go/gate-tool ARGs to the
+# rest of the repository. Node is pinned by its source-image tag; the build
+# checks PNPM_VERSION against frontend/package.json before fetching packages:
 #   GO_VERSION              exact MAJOR.MINOR.PATCH; its MAJOR.MINOR must equal
 #                           every go.work / */go.mod `go` directive and every
 #                           workflow `go-version:` literal, and no go.work /
@@ -57,7 +59,7 @@
 #                                  file, ca-certificates
 #   fetched, below                 golangci-lint, helm (test-helm-render,
 #                                  test-site-reference), check-jsonschema
-# Deliberately absent: docker, kubectl, kind and node. Each harness that names
+# Deliberately absent: docker, kubectl and kind. Each harness that names
 # them stubs a fake on PATH or skips with a printed reason.
 #
 # RUNTIME CONTRACT. No ENTRYPOINT (the runner passes --entrypoint '') and no
@@ -70,6 +72,8 @@
 # (#2137).
 
 ARG GO_VERSION=1.26.9
+ARG NODE_VERSION=22.21.1
+FROM node:${NODE_VERSION}-bookworm-slim AS frontend_tools
 
 FROM golang:${GO_VERSION}-bookworm
 
@@ -77,6 +81,7 @@ ARG TARGETARCH
 ARG GOLANGCI_LINT_VERSION=v2.12.2
 ARG HELM_VERSION=v4.2.4
 ARG CHECK_JSONSCHEMA_VERSION=0.38.0
+ARG PNPM_VERSION=10.33.3
 
 LABEL org.opencontainers.image.source="https://github.com/kuhlman-labs/fishhawk" \
       org.opencontainers.image.description="Fishhawk verify gate toolchain (deploy/gate-image)"
@@ -148,3 +153,14 @@ RUN set -eux; \
 # Never download a different Go than the one pinned above: a go.mod asking for a
 # newer toolchain fails loudly instead of reaching the network.
 ENV GOTOOLCHAIN=local
+
+# Named context is frontend/ only, never the operator checkout or credentials.
+COPY --from=frontend_tools /usr/local/bin/node /usr/local/bin/node
+COPY --from=frontend_tools /usr/local/lib/node_modules/npm /usr/local/lib/node_modules/npm
+RUN ln -s ../lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
+ && npm install --global --ignore-scripts "pnpm@${PNPM_VERSION}"
+COPY --from=frontend package.json pnpm-lock.yaml /opt/fishhawk-frontend/
+RUN cd /opt/fishhawk-frontend \
+ && test "$(node -p "require('./package.json').packageManager")" = "pnpm@${PNPM_VERSION}" \
+ && pnpm fetch --frozen-lockfile --ignore-scripts --store-dir /opt/fishhawk-pnpm-store \
+ && chmod -R a+rX /opt/fishhawk-pnpm-store

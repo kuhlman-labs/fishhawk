@@ -5576,6 +5576,10 @@ func checkJSONSchemaBlocks(md string) []checkJSONSchemaBlock {
 		major, _ := strconv.Atoi(m[1])
 		blk := checkJSONSchemaBlock{Major: major}
 		appendArgs(&blk, m[2])
+		// A resolved pipeline carries the input path before --schemafile.
+		if before, _, ok := strings.Cut(line, "| check-jsonschema"); ok && strings.Contains(before, "fishhawk validate --emit-resolved") {
+			appendArgs(&blk, before)
+		}
 		cont := strings.HasSuffix(strings.TrimSpace(line), `\`)
 		i++
 		for cont && i < len(lines) {
@@ -5672,7 +5676,7 @@ func TestSpecReadmeListsShippedSpecUnderDeclaredMajor(t *testing.T) {
 	// Whole-document-scan defense (condition 1): FOUR workflow-vN invocations
 	// exist today — v0, v1, v2 (all in the "Validating locally" fence), and a
 	// SECOND v2 inside the `fishhawk validate --emit-resolved ... | check-jsonschema`
-	// pipeline. Only the plain v2 block lists .fishhawk/workflows.yaml, so the
+	// pipeline. Only the resolved v2 block lists .fishhawk/workflows.yaml, so the
 	// exactly-one assertion above holds; pinning the count makes a fifth
 	// invocation a deliberate test update.
 	const wantBlocks = 4

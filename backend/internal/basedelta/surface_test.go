@@ -116,7 +116,7 @@ func TestMatchGlobal_RootAnchored(t *testing.T) {
 	s := thisRepoSurface(t)
 	for _, p := range []string{
 		"testdata/wire/x.json", "backend/go.mod", "go.mod", "go.work", "docs/ARCHITECTURE.md",
-		"scripts/test", "backend/internal/postgres/migrations/0102_x.up.sql",
+		"scripts/test", "frontend/src/a.ts", "backend/internal/postgres/migrations/0102_x.up.sql",
 		"cli/cmd/fishhawk-docgen/main.go", "deploy/helm/fishhawk/values.yaml",
 	} {
 		if _, ok := s.MatchGlobal(p); !ok {
@@ -125,7 +125,7 @@ func TestMatchGlobal_RootAnchored(t *testing.T) {
 	}
 	for _, p := range []string{
 		"backend/internal/x/testdata/y.json", "docs/README.md", "backend/internal/server/server.go",
-		"frontend/src/a.ts", "README.md", "x/scripts/y", "backend/internal/spec/testdata/other.json",
+		"x/frontend/src/a.ts", "README.md", "x/scripts/y", "backend/internal/spec/testdata/other.json",
 	} {
 		if pat, ok := s.MatchGlobal(p); ok {
 			t.Errorf("%s should not be global (matched %q)", p, pat)

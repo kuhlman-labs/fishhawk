@@ -4113,6 +4113,16 @@ the gate's exit reddens c3, and removing `test-review-prompt-eval` from the
 guards stay exit 2 under deletion (a downstream redirect or ref-resolution
 failure also exits 2), so c19 and c23 assert the guard's own message.
 
+## Workflow verification (`scripts/verify-change`)
+
+The repository's feature, hotfix and routine implement stages execute `scripts/verify-change`, which runs `scripts/check-frontend` when the merge-base-to-worktree diff or untracked paths touch `frontend/`, the wrapper/check script, the gate image, or frontend CI. Deletions and both rename sides count; NUL-delimited paths preserve whitespace/newlines. An unavailable base or failed path inventory widens to frontend checking. The base defaults to `origin/main`; `FISHHAWK_DIFF_BASE` is the existing development-only override. Scoped Go verification never narrows the frontend leg.
+
+The wrapper then invokes `scripts/test verify`, forwarding arguments and the runner's scoped-package/lock environment. Frontend failures stop before that invocation. A verify lock refusal remains exit 73; no retry/poll is added. Missing frontend tools or an unavailable container offline store return 75 (infrastructure, not a code verdict). `scripts/test verify` alone remains the Go/schema/harness gate; `--in-gate-image` retains its existing Docker-free-leg behavior.
+
+`scripts/check-frontend` matches CI: frozen dependency installation, then `format:check`, `lint`, `typecheck`, `test`, `build`. The pnpm version must equal `frontend/package.json`'s `packageManager`. Install scripts are disabled; the explicitly invoked checks execute the candidate scripts. On a host, installation may use the registry. With `FISHHAWK_GATE_CONTAINER=1`, it uses only a writable temporary copy of `/opt/fishhawk-pnpm-store`, installed at image build time from the frontend lockfile. A candidate requiring uncached dependencies needs a gate-image rebuild from that candidate before the gate can judge it; there is no network fallback in the container. See `deploy/gate-image/README.md`.
+
+`scripts/test-verify-change` drives the real wrapper through disposable git histories, including deletion/rename/untracked paths, unknown bases, failure ordering and exit-code propagation. It runs in `_verify_gate_harnesses`. `frontend/**` is now a verdict-wide input in the live declaration and its committed example, because a frontend base change can invalidate the broader workflow verification result (ADR-124).
+
 ## Agent context gate (#4886)
 
 `scripts/check-agent-context` validates repository-owned prompt entrypoints,

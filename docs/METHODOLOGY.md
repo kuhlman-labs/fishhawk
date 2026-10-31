@@ -470,3 +470,9 @@ Fishhawk's product thesis is that humans setting direction and approving outcome
 ---
 
 *See also:* [`MVP_SPEC.md`](MVP_SPEC.md) §12 for the methodology commitment in the v0 spec, and [`BRAND_FOUNDATIONS.md`](BRAND_FOUNDATIONS.md) §9 for how this shows up in the brand.
+
+## Repository routine lane
+
+The repository's `routine_change` admits `type:chore` issues but bounds the produced diff to root README prose, the site's start/concepts/operating Markdown pages, and go.mod/go.sum in the eight existing Go modules. Canonical docs, schemas, ADRs, review remits/evidence, tests, source-format changes, agent instructions, generated site reference pages and JavaScript dependencies use `feature_change` (or operator authoring where forbidden there). The allow-list is post-hoc, not a plan-time routing predicate.
+
+Routine retains `autonomy: high` with explicit gating dual implement review and `verification_reported` plus `ci_green`; high autonomy does not exempt it from either verdict. Feature/hotfix keep advisory reviewers and their existing approval policies. Hotfix stage reuse preserves its 15-file ceiling, 20m runtime policy, explicit gated approve/waive/merge and all instruction-path prohibitions. Server authorization and preview/gate credential controls now select the security persona; feature changes on those surfaces are capped at medium autonomy.

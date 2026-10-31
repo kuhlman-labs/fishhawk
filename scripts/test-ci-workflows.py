@@ -63,7 +63,9 @@ class WorkflowContracts(unittest.TestCase):
             "site": ["site/pnpm-lock.yaml", "site/src/content/docs/reference/api.md"],
             "helm": ["deploy/helm/fishhawk/values.yaml", "scripts/test-helm-render"],
             "infra": ["infra/terraform/iam.tf", ".github/workflows/infra-apply.yml"],
-            "gate-image": ["deploy/gate-image/Dockerfile", ".github/workflows/gate-image-publish.yml"],
+            "gate-image": ["deploy/gate-image/Dockerfile", ".github/workflows/gate-image-publish.yml",
+                           "frontend/package.json", "frontend/pnpm-lock.yaml",
+                           "scripts/check-frontend", "scripts/verify-change"],
         }
         for lane, paths in cases.items():
             for path in paths:
@@ -101,6 +103,13 @@ class WorkflowContracts(unittest.TestCase):
         commands = "\n".join(step.get("run", "") for step in build["steps"])
         self.assertIn('docker load --input "$RUNNER_TEMP/gate-$ARCH.tar"', commands)
         self.assertIn("scripts/check-gate-image --image fishhawk-gate:ci-", commands)
+        image_build = next(s for s in build["steps"] if "build-push-action" in s.get("uses", ""))
+        self.assertEqual(image_build["with"]["build-contexts"], "frontend=./frontend")
+        offline = next(s for s in build["steps"] if s.get("name") == "Offline frontend gate")
+        self.assertIn("--network=none", offline["run"])
+        self.assertIn("fishhawk-gate:ci-${{ matrix.arch }} scripts/check-frontend", offline["run"])
+        archive = next(s for s in build["steps"] if "upload-artifact" in s.get("uses", ""))
+        self.assertLess(build["steps"].index(offline), build["steps"].index(archive))
         publisher = workflow("gate-image-publish.yml")
         self.assertEqual(set(publisher["on"]), {"workflow_call"})
         steps = publisher["jobs"]["publish"]["steps"]
@@ -148,6 +157,27 @@ class WorkflowContracts(unittest.TestCase):
 
 
 class ImageFreshness(unittest.TestCase):
+    def test_frontend_gate_inputs_prevent_stale_promotion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.check_output(["git", "-c", "user.name=CI test", "-c",
+                    "user.email=ci@example.invalid", "-c", "commit.gpgsign=false", *args], cwd=root, text=True).strip()
+            git("init", "--quiet")
+            git("commit", "--quiet", "--allow-empty", "-m", "base")
+            for path in ["frontend/package.json", "frontend/pnpm-lock.yaml",
+                         "scripts/check-frontend", "scripts/verify-change"]:
+                with self.subTest(path=path):
+                    base = git("rev-parse", "HEAD")
+                    file = root / path
+                    file.parent.mkdir(parents=True, exist_ok=True)
+                    file.write_text("changed input")
+                    git("add", ".")
+                    git("commit", "--quiet", "-m", "change input")
+                    result = subprocess.run([str(ROOT / "scripts/ci-image-current"), "gate", base, "HEAD"],
+                        cwd=root, capture_output=True, text=True)
+                    self.assertEqual(result.returncode, 1, result.stderr)
+
     def test_unrelated_commits_can_promote_but_changed_inputs_and_unknown_refs_cannot(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

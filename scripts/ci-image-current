@@ -19,6 +19,7 @@ case "$kind" in
     ;;
   gate)
     paths=(deploy/gate-image scripts/check-gate-image scripts/test
+      frontend/package.json frontend/pnpm-lock.yaml scripts/check-frontend scripts/verify-change
       .github/workflows/ci.yml ':(glob).github/workflows/gate-image*.yml')
     ;;
   *) echo "unknown image kind: $kind" >&2; exit 2 ;;

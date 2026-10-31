@@ -86,8 +86,8 @@ func TestClassify_Table(t *testing.T) {
 	})
 	two := &Classifier{Loader: &fakeLoader{graphs: map[string]*Graph{"bprime": hPrime, "head": head}}}
 	// This repository's golden: every pre-declaration result holds under its
-	// declaration (README.md is independent via the inert class, frontend/*
-	// stays shared_artifact, tools/x.go stays unmapped_go_path).
+	// declaration, except frontend/* now forces verification through G.
+	// README.md stays inert; infra/* exercises shared-artifact behavior.
 	surface := thisRepoSurface(t)
 
 	cases := []struct {
@@ -122,10 +122,12 @@ func TestClassify_Table(t *testing.T) {
 			Result{false, "global_surface:cli/go.mod"}},
 		{"go_work_in_pr", oneWS(baseGraph()), []string{"cli/internal/x/x.go"}, []string{"go.work"}, nil,
 			Result{false, "global_surface:go.work"}},
-		{"shared_artifact", oneWS(baseGraph()), []string{"frontend/src/a.ts"}, []string{"frontend/src/b.ts"}, nil,
-			Result{false, "shared_artifact:frontend/src"}},
-		{"shared_artifact_floor", oneWS(baseGraph()), []string{"frontend/a.ts"}, []string{"frontend/src/b.ts"}, nil,
-			Result{false, "shared_artifact:frontend"}},
+		{"frontend_global", oneWS(baseGraph()), []string{"frontend/src/a.ts"}, []string{"backend/internal/q/q.go"}, nil,
+			Result{false, "global_surface:frontend/src/a.ts"}},
+		{"shared_artifact", oneWS(baseGraph()), []string{"infra/src/a.tf"}, []string{"infra/src/b.tf"}, nil,
+			Result{false, "shared_artifact:infra/src"}},
+		{"shared_artifact_floor", oneWS(baseGraph()), []string{"infra/a.tf"}, []string{"infra/src/b.tf"}, nil,
+			Result{false, "shared_artifact:infra"}},
 		{"same_path_both_sides", oneWS(baseGraph()), []string{"README.md"}, []string{"README.md"}, nil,
 			Result{false, "shared_artifact:README.md"}},
 		{"inert_disjoint", oneWS(baseGraph()), []string{"README.md"}, []string{"backend/internal/d/d.go"}, nil,

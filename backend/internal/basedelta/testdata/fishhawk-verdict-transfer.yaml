@@ -25,6 +25,7 @@ verdict_transfer:
     - ".fishhawk/**"  # the workflow spec read by the product and its spec tests (#4292)
     - "docs/spec/**"  # sync-schemas sources; test-site-reference (docgen) reads the schemas and examples
     - "docs/api/**"  # test-site-reference (docgen) reads `v0.openapi.yaml`
+    - "frontend/**"  # scripts/verify-change: format, lint, typecheck, vitest and build
     - "site/**"  # check-site-voice, check-site-ia, test-site-reference rewrites the reference pages
     - "docs/adr/**"  # check-adr
     - "docs/ARCHITECTURE.md"  # `_verify_doc_line_budget`
@@ -123,7 +124,6 @@ verdict_transfer:
     - ".gitignore"  # git ignore rules
     - "docker-compose.yml"  # local dev stack; no verify leg reads it
     - "docs/**"  # documentation outside G (G precedence keeps docs/spec, docs/api, docs/adr and ARCHITECTURE.md verdict-wide)
-    - "frontend/**"  # Web UI; its CI gates run outside scripts/test verify
     - ".agents/**"  # operator-authored skills
     - ".claude/**"  # operator-authored harness config
     - ".githooks/**"  # opt-in local hooks

@@ -48,6 +48,14 @@ review_conventions:
         - "backend/internal/auth/**"
         - "backend/internal/githubapp/**"
         - "verifier/**"
+        - "backend/internal/server/**"
+        - "runner/internal/gateiso/**"
+        - "runner/cmd/fishhawk-runner/acceptance*.go"
+        - "scripts/dev"
+        - "scripts/test"
+        - "scripts/verify-change"
+        - "scripts/check-frontend"
+        - "deploy/gate-image/**"
         - "backend/internal/prompt/**"
         - "backend/internal/agentpaths/**"
         - "runner/internal/constraint/**"
@@ -105,6 +113,7 @@ verdict_transfer:
     - ".fishhawk/**"  # the workflow spec read by the product and its spec tests (#4292)
     - "docs/spec/**"  # sync-schemas sources; test-site-reference (docgen) reads the schemas and examples
     - "docs/api/**"  # test-site-reference (docgen) reads `v0.openapi.yaml`
+    - "frontend/**"  # scripts/verify-change: format, lint, typecheck, vitest and build
     - "site/**"  # check-site-voice, check-site-ia, test-site-reference rewrites the reference pages
     - "docs/adr/**"  # check-adr
     - "docs/ARCHITECTURE.md"  # `_verify_doc_line_budget`
@@ -203,7 +212,6 @@ verdict_transfer:
     - ".gitignore"  # git ignore rules
     - "docker-compose.yml"  # local dev stack; no verify leg reads it
     - "docs/**"  # documentation outside G (G precedence keeps docs/spec, docs/api, docs/adr and ARCHITECTURE.md verdict-wide)
-    - "frontend/**"  # Web UI; its CI gates run outside scripts/test verify
     - ".agents/**"  # operator-authored skills
     - ".claude/**"  # operator-authored harness config
     - ".githooks/**"  # opt-in local hooks
@@ -508,6 +516,14 @@ workflows:
             - "backend/internal/auth/**"
             - "backend/internal/githubapp/**"
             - "verifier/**"
+            - "backend/internal/server/**"
+            - "runner/internal/gateiso/**"
+            - "runner/cmd/fishhawk-runner/acceptance*.go"
+            - "scripts/dev"
+            - "scripts/test"
+            - "scripts/verify-change"
+            - "scripts/check-frontend"
+            - "deploy/gate-image/**"
         require:
           max_autonomy: medium
           reviewers: [security]
@@ -560,6 +576,7 @@ workflows:
         # review concurrently — independent models disagree in useful ways,
         # and a concern only one of them raises is still surfaced.
         reviewers:
+          authority: advisory
           agents:
             - provider: claudecode
               model: claude-fable-5-1
@@ -670,7 +687,7 @@ workflows:
           # Making a killed gate self-describing (and retryable as infra
           # rather than agent-output-invalid) is tracked separately in #3383.
           verify:
-            command: "scripts/test verify"
+            command: "scripts/verify-change"
             timeout: "40m"
             max_iterations: 1
         # Advisory implement review: the same two providers read the diff
@@ -678,6 +695,7 @@ workflows:
         # scope-drift flag when the diff exceeds what the plan declared.
         # Verdicts land shortly after the stage's trace is uploaded.
         reviewers:
+          authority: advisory
           agents:
             - provider: claudecode
               model: claude-fable-5-1
@@ -771,6 +789,7 @@ workflows:
           required_outcomes:
             - tests_added_or_updated
             - ci_green
+            - verification_reported
         # limit_usd is the one enforced per-stage lever (#2328), set at about
         # three times the largest observed spend for this stage type so it never
         # fires on a normal stage. Basis, 2026-10-16: the per-stage sum of every
@@ -874,13 +893,9 @@ workflows:
   #
   # feature_change's in-run shape (plan -> implement -> preview acceptance ->
   # human review) with tighter stage budgets, a smaller diff cap, a 20m
-  # stage-runtime policy and delegation NARROWER than feature_change. Copied
-  # from docs/spec/examples/workflow-v2-hotfix-change.yaml, which is the
-  # contract (docs/spec/workflow-v2.md § "Incident hotfix preset"); only the
-  # repository-specific knobs are adapted to match feature_change above:
-  # executor models, efforts and concurrency, reviewer models, conventions,
-  # personas and escalations, the verify command and its timeout, the full
-  # forbidden_paths list, and the approver members.
+  # stage-runtime policy and delegation NARROWER than feature_change. Stages
+  # extend feature_change; incident policy follows the shipped hotfix preset.
+  # Models, review, verification, acceptance and approval gates stay in sync.
   #
   # The alert ingress auto-starts this workflow by default for an alert
   # source, but only when that source sets `auto_start: true`; none here
@@ -888,6 +903,7 @@ workflows:
   # is a follow-on `release` run the operator starts after merge.
   # ---------------------------------------------------------------------------
   hotfix_change:
+    extends: feature_change
     description: >-
       Incident hotfix: feature_change's shape at emergency cadence. The agent plans and implements; a human approves the plan and the PR. Tighter budgets, a smaller diff cap, and no delegated approve, waive or merge.
     # The alert ingress (E35.4 / #1601) routes an `alert` run as the `diff`
@@ -942,6 +958,14 @@ workflows:
             - "backend/internal/auth/**"
             - "backend/internal/githubapp/**"
             - "verifier/**"
+            - "backend/internal/server/**"
+            - "runner/internal/gateiso/**"
+            - "runner/cmd/fishhawk-runner/acceptance*.go"
+            - "scripts/dev"
+            - "scripts/test"
+            - "scripts/verify-change"
+            - "scripts/check-frontend"
+            - "deploy/gate-image/**"
         require:
           reviewers: [security]
       - match:
@@ -963,103 +987,22 @@ workflows:
       max_retries: 1
     # No periodic `budgets`: advisory would change nothing for the run, and
     # blocking would refuse an incident fix at admission.
+    # Only stage differences are repeated. Workflow-level policy, routing,
+    # actions and escalations above do NOT inherit through extends.
     stages:
       - id: plan
-        type: plan
-        executor:
-          agent: claude-code
-          # Same pins as feature_change's plan stage.
-          model: claude-opus-5-5
-          reasoning_effort: xhigh
-        # Dual advisory review runs concurrently, so it costs no wall-clock;
-        # the human gate below decides. Same reviewers, conventions and
-        # persona as feature_change's plan stage.
-        reviewers:
-          authority: advisory
-          agents:
-            - provider: claudecode
-              model: claude-fable-5-1
-              reasoning_effort: high
-            - provider: codex
-              model: gpt-6-astra
-              reasoning_effort: high
-          human: 1
-          conventions: [security_conventions]
-          personas: [architect]
-        inputs:
-          - source: github_issue
-            required: true
-        produces:
-          - artifact: plan
-            schema: standard_v1
-            persistence:
-              - target: originating_issue
-                mode: rendered_comment
-                update_on_change: true
-              - target: fishhawk_audit_log
-                mode: canonical
-        # limit_usd is the enforced ceiling; max_tokens and max_runtime are
-        # declared but calibration-pending (#2328). The preset's values are
-        # kept as-is. Advisory: a breach records stage_budget_exceeded and the
-        # run proceeds.
         budget:
           max_tokens: 150000
           max_runtime: 10m
           limit_usd: 3
           enforcement: advisory
-        # Retained: alert text is untrusted input, and this gate puts the plan
-        # derived from it in front of a human before any code is written.
-        gates:
-          - type: approval
-            approvals:
-              count: 1
-              # Forge-verified approver identity, as on feature_change.
-              members: ["github:kuhlman-labs"]
-              not: [author, agent]
-
       - id: implement
+        # Keep type explicit for the runner-side instruction-path fixture.
         type: implement
-        # Same concurrency as feature_change's implement (ADR-087 / #3964).
-        concurrency:
-          limit: 2
-        executor:
-          agent: claude-code
-          model: claude-opus-5-5
-          reasoning_effort: xhigh
-          verify:
-            command: "scripts/test verify"
-            # NOT tightened: equal to feature_change's verify timeout. A full
-            # `scripts/test verify` on this repo can run past 15m, and a gate
-            # killed by its timeout reads as a verify failure with no failing
-            # test (#3383).
-            timeout: "40m"
-            max_iterations: 1
-        reviewers:
-          authority: advisory
-          agents:
-            - provider: claudecode
-              model: claude-fable-5-1
-              reasoning_effort: high
-            - provider: codex
-              model: gpt-6-astra
-              reasoning_effort: high
-          human: 1
-          conventions: [security_conventions]
-        inputs:
-          - artifact: plan
-            from_stage: plan
-        produces:
-          - artifact: pull_request
         constraints:
-          # A hotfix is a narrow change; a wider one is a feature_change.
           max_files_changed: 15
-          # No `agent_instruction_paths` relaxation: the built-in constraint
-          # (#3942) stays at its default, so unlike feature_change the ROOT
-          # AGENTS.md is not writable either. An incident fix has no reason to
-          # edit agent instructions. The globs below are routine_change's
-          # agent-instruction set plus feature_change's remaining entries and
-          # the preset's GitLab CI paths. Pinned by the twin
-          # TestRepoSpecForbidsAgentInstructionPaths tests.
+          # The inherited AGENTS.md built-in exemption cannot override these
+          # forbidden_paths: hotfix still forbids every instruction file.
           forbidden_paths:
             - ".github/workflows/**"
             - ".gitlab-ci.yml"
@@ -1081,67 +1024,23 @@ workflows:
             - "scripts/test-is-run-agent"
             - "LICENSE"
             - "NOTICE"
-          required_outcomes:
-            - tests_added_or_updated
-            - ci_green
         budget:
           max_tokens: 300000
           max_runtime: 20m
           limit_usd: 8
           enforcement: advisory
-
-      # Pre-merge acceptance against the PREVIEW instance, as in
-      # feature_change. Not post-deploy verification — see the header.
       - id: acceptance
-        type: acceptance
-        # Same serialization as feature_change's acceptance: every local
-        # acceptance shares the single preview (localhost:8090).
-        concurrency:
-          group: local-acceptance
-          limit: 1
-        executor:
-          agent: claude-code
-          model: claude-opus-5-5
-          reasoning_effort: medium
-        inputs:
-          - artifact: plan
-            from_stage: plan
-          - artifact: pull_request
-            from_stage: implement
-        egress:
-          target_hosts:
-            - localhost:8090
-        produces:
-          - artifact: acceptance
         budget:
           max_tokens: 150000
           max_runtime: 10m
           limit_usd: 3
           enforcement: advisory
-
-      # The merge gate. A human executor, and an approval excluding the
-      # change's author and any agent identity. No gate-level autonomy or
-      # actions block (see the workflow-level comment).
-      - id: review
-        type: review
-        executor:
-          human: true
-        inputs:
-          - artifact: pull_request
-            from_stage: implement
-        gates:
-          - type: approval
-            approvals:
-              count: 1
-              # Forge-verified approver identity, as on feature_change.
-              members: ["github:kuhlman-labs"]
-              not: [author, agent]
+      # review is inherited intact, including its human approval gate.
 
   # ---------------------------------------------------------------------------
   # routine_change — the same cycle, compressed.
   #
-  # Documentation, dependency bumps, formatting fixes and tests for existing
-  # behavior: changes where the cost of a mistake is contained and CI is a
+  # Ordinary prose and existing Go-module dependency updates: CI and review are a
   # sufficient check. No plan stage and no human approval gate — implement,
   # then let branch protection decide.
   # ---------------------------------------------------------------------------
@@ -1163,7 +1062,7 @@ workflows:
     applies_to:
       labels: ["type:chore"]
     description: >-
-      Workflow for documentation, dependency bumps, lint and format fixes, and tests for existing behavior. The agent may merge once all gates pass.
+      Workflow for ordinary README/site prose and dependency updates in the existing Go modules. Canonical docs, agent instructions, tests, source formatting and JavaScript dependencies use feature_change. The agent may merge after verification, gating dual review and CI pass.
     auto_advance: true
     # The agent carries the change to merge unattended. Nothing was
     # human-approved upstream, so the delegation has to cover the whole
@@ -1192,8 +1091,22 @@ workflows:
           limit: 2
         executor:
           agent: claude-code
-          # Routine work (docs, tests, dependency bumps) holds up at `medium`.
+          model: claude-opus-5-5
+          # Narrow routine work uses medium effort.
           reasoning_effort: medium
+          verify:
+            command: "scripts/verify-change"
+            timeout: "40m"
+            max_iterations: 1
+        reviewers:
+          authority: gating
+          agents:
+            - provider: claudecode
+              model: claude-fable-5-1
+              reasoning_effort: high
+            - provider: codex
+              model: gpt-6-astra
+              reasoning_effort: high
         produces:
           - artifact: pull_request
         constraints:
@@ -1201,22 +1114,38 @@ workflows:
           # An allow-list, not a deny-list: on a workflow that merges
           # without human approval, anything not named here fails the stage.
           allowed_paths:
-            - "docs/**"
-            - "**/*.md"
-            - "go.mod"
-            - "go.sum"
-            - "**/*_test.go"
-          # `**/*.md` and `docs/**` above would otherwise admit agent
-          # instructions on a workflow that merges without human approval:
-          # skills and settings under the agent-config directories, and the
-          # instruction files every CLI auto-loads (AGENTS.md,
-          # AGENTS.override.md, CLAUDE.md, CLAUDE.local.md) at any depth. All
-          # are loaded as instructions by later agent sessions, so on this
-          # workflow they are not the agent's to write, the root AGENTS.md
-          # included. (feature_change keeps only the root AGENTS.md
-          # writable: the conventions require updating it, and that workflow
-          # has human plan approval and review.)
+            - "README.md"
+            - "site/src/content/docs/start/*.md"
+            - "site/src/content/docs/concepts/*.md"
+            - "site/src/content/docs/operating/*.md"
+            - "backend/go.mod"
+            - "backend/go.sum"
+            - "cli/go.mod"
+            - "cli/go.sum"
+            - "credstore/go.mod"
+            - "credstore/go.sum"
+            - "directory/go.mod"
+            - "directory/go.sum"
+            - "pricing/go.mod"
+            - "pricing/go.sum"
+            - "redaction/go.mod"
+            - "redaction/go.sum"
+            - "runner/go.mod"
+            - "runner/go.sum"
+            - "verifier/go.mod"
+            - "verifier/go.sum"
+          # Defense in depth if the allow-list grows: no canonical contracts,
+          # review prompts/evidence, tests or instruction/config directories.
           forbidden_paths:
+            - "docs/spec/**"
+            - "docs/api/**"
+            - "docs/adr/**"
+            - "docs/review/**"
+            - "docs/compliance/**"
+            - "**/*_test.go"
+            - "site/src/content/docs/reference/**"
+            - ".fishhawk/**"
+            - ".github/**"
             # Agent-config directories at ANY depth and in ANY letter case:
             # codex finds .agents/skills at every level, and on a
             # case-insensitive filesystem (macOS) a CLI opening `.agents`
@@ -1238,12 +1167,13 @@ workflows:
             - "scripts/test-is-run-agent"
           required_outcomes:
             - ci_green
-      # 2. Review — the gate, held by CI rather than a person.
+            - verification_reported
+      # 2. Review — branch-protection check after recorded implement reviews.
       - id: review
         type: review
         executor:
           agent: claude-code
-          # Same level as the feature_change reviewers.
+          # This executor does not replace implement.reviewers above.
           reasoning_effort: high
         gates:
           # A `check` gate carries no approval predicate: it lets the run

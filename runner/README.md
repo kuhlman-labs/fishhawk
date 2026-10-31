@@ -576,7 +576,7 @@ and 6 of #2137).** The implement gate proves the pieces, not the full
 in-container verify. First run the opt-in fixture (n) against a locally built
 gate image —
 `FISHHAWK_GATE_SELFHOST_IMAGE=fishhawk-gate:local scripts/test single -run TestGateContainer_SelfHostPgtestSuite ./runner/cmd/fishhawk-runner/`
-(build: `docker buildx build --load -t fishhawk-gate:local deploy/gate-image`)
+(build: `docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image`)
 — which drives pgx + golang-migrate (the real `pgtest` external branch) over
 the mounted socket, and record its PASS line. Then run one full
 container-path verify through the runner and collect POSITIVE evidence, not
