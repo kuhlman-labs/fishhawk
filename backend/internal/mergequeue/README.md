@@ -451,15 +451,22 @@ change nothing (ADR-093 slice 2, rejection item 1):
     `released` | `dispatch_failed`, `path`, `head_sha`, `reason`); an
     uncertain one also logs at WARN.
 - **Reconciliation before a re-arm.** Every path re-reads the PR before it
-  touches the ledger (the inline and queue paths re-observe a landed merge
-  BEFORE settling a claim after a failed dispatch, so a merge that landed
-  leaves the claim `dispatched`). The next merge-on-pass or `merge_run`
-  touching a run with a claim re-reads the PR: merged → merge-on-pass reads
-  the claim and settles the entry merged (`pr_merged`) only when there is
-  no claim or the claim names the merged head, else it holds
-  `merged_claim_head_mismatch` (WARN); the inline answer is
-  `already_merged`. On both paths a reconciled `dispatch_failed` claim
-  appends `merge_dispatch_settled` `reconciled_merged`. Unmerged → the claim
+  touches the ledger (the inline, DELEGATED and queue paths re-observe a
+  landed merge BEFORE settling a claim after a failed dispatch, so a merge
+  that landed leaves the claim `dispatched`; the delegated path does so with
+  or without a claim, except on its own checks_pending refusal, and reports
+  the acted outcome `mergeDispatchLandedOnReobserve`, #4617). The next
+  merge-on-pass or `merge_run` touching a run with a claim re-reads the PR:
+  merged → merge-on-pass reads the claim and settles the entry merged
+  (`pr_merged`) only when there is no claim or the claim names the merged
+  head, else it holds `merged_claim_head_mismatch` (WARN); the inline answer
+  is `already_merged`. A claim recorded at head `unresolved` (an empty gate
+  head; inline or delegated only, never a queue claim) names ANY merged head,
+  in merge-on-pass and in the ADR-093 D8 resume (#4617). On both paths a
+  reconciled `dispatch_failed` claim appends `merge_dispatch_settled`
+  `reconciled_merged`, at most ONCE per run: deduped on (run, outcome),
+  atomic on Postgres (`AppendChainedDeduped` under the run-row lock), with a
+  non-atomic list-then-append fallback for the in-memory fakes. Unmerged → the claim
   stands (except a crash-left queue claim still `dispatched`, which
   merge-on-pass releases: "Crash-left claims" below): merge-on-pass holds
   `merge_already_dispatched` (WARN), the inline answer is
