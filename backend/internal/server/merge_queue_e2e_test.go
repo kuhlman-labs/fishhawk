@@ -19,6 +19,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
@@ -1390,6 +1391,74 @@ func TestMergeQueueE2E_RedPassDelegatedFixupReentersAtTail(t *testing.T) {
 	}
 	if es[2].EntryID != st.Entry.ID.String() || !es[2].MergeIntent || es[2].Position != 2 || es[2].AnchoredHeadSHA != "a2" {
 		t.Fatalf("re-entered A = %+v, want the fresh entry with merge intent at position 2 behind C, anchored a2", es[2])
+	}
+}
+
+// TestMergeQueueE2E_AcceptanceScenarioCommitAfterFixupReenters is #4703's
+// cross-layer walk: the real verdict upload ejects A verify_failed with the
+// D6 fix-up routed, the fix-up pushes a2, and then (1) a FOREIGN head f3 with
+// no audit row leaves A out, while (2) the acceptance runner's scenario-corpus
+// commit a3 on a2, recorded through the REAL recordAcceptanceScenariosPushed
+// producer, re-enters A at the tail anchored a3 with reentry_head_chain
+// [a2 a3]: the producer's payload, the audit chain, the qualifying-head walk,
+// the Postgres queue and the HTTP queue read.
+func TestMergeQueueE2E_AcceptanceScenarioCommitAfterFixupReenters(t *testing.T) {
+	w := newMQMWorld(t)
+	ctx := context.Background()
+	a, b := w.waveSpec(mcvDelegatedV0SpecYAML)
+	intent := w.mqeIntent(a, "a1")
+	if _, err := w.store.MarkMergeIntent(ctx, w.entry(a).ID, &mergequeue.MergeIntentRequest{IntentSequence: intent.Sequence}); err != nil {
+		t.Fatalf("mark intent: %v", err)
+	}
+	resp := w.shipVerdict(a, "a1", mergeCandidateResultFailed)
+	if !resp.FixupRouted {
+		t.Fatalf("routed = false (refusal %q), want the D6 fix-up routed", resp.FixupRefusal)
+	}
+	ej := w.requireState(a, mergequeue.StateEjected, mergeCandidateQueueReasonVerifyFailed)
+	w.requireState(b, mergequeue.StateLive, "")
+	ejected, found, err := w.store.LatestForRun(ctx, a.id)
+	if err != nil || !found || ejected.ID != ej.ID {
+		t.Fatalf("latest = %+v %v %v, want the ejected intent row", ejected, found, err)
+	}
+	w.exec(`UPDATE merge_candidate_queue_entries SET settled_at = settled_at - interval '10 minutes' WHERE id = $1`, ej.ID)
+	w.setStage(a.impl.ID, run.StageStateSucceeded)
+	push := w.rentPush(a, "a2")
+
+	// Phase 1: a foreign push moves the head with no audit row.
+	w.gh.set(func() { w.gh.prs[a.pr].head = "f3" })
+	if n := w.sweep(0); n != 0 {
+		t.Fatalf("re-entered = %d at a foreign head, want 0", n)
+	}
+	w.requireNotReentered(a)
+
+	// Phase 2: the acceptance runner pushes its scenario commit on a2.
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+a.id.String()+"/stages/"+a.impl.ID.String()+"/pull-request", nil)
+	subj := "runner"
+	w.srv.recordAcceptanceScenariosPushed(rec, req, a.id, a.impl, &pullRequestBody{
+		Outcome: outcomeAcceptanceScenariosPushed, Branch: a.branch, HeadSHA: "a3", BaseSHA: "a2",
+	}, "run_token", audit.ActorSystem, &subj)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("acceptance scenario push report = %d %s, want 200", rec.Code, rec.Body.String())
+	}
+	if rows := w.rows(a, CategoryAcceptanceScenariosPushed); len(rows) != 1 {
+		t.Fatalf("acceptance_scenarios_pushed rows = %d, want 1", len(rows))
+	}
+	w.gh.set(func() { w.gh.prs[a.pr].head = "a3" })
+	if n := w.sweep(0); n != 1 {
+		t.Fatalf("re-entered = %d after the scenario commit, want 1", n)
+	}
+	st, p := w.requireReentered(a, ejected, "a3")
+	requireReentryChain(t, p, push, []string{"a2", "a3"})
+
+	q := decodeMergeQueue(t, getMergeQueue(t, w.srv, "base_ref="+mcqBase, mqrOperator("")))
+	if len(q.Bases) != 1 {
+		t.Fatalf("bases = %+v, want one", q.Bases)
+	}
+	es := q.Bases[0].Entries
+	if len(es) != 2 || es[0].RunID != b.id.String() || es[1].RunID != a.id.String() ||
+		es[1].EntryID != st.Entry.ID.String() || !es[1].MergeIntent || es[1].AnchoredHeadSHA != "a3" {
+		t.Fatalf("queue = %+v, want B live, then the re-entered A at the tail anchored a3", es)
 	}
 }
 
