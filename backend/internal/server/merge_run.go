@@ -783,7 +783,9 @@ func (s *Server) handleMergeRun(w http.ResponseWriter, r *http.Request) {
 		// claim, merge_queue_authorized and the forge pin are one value. An
 		// empty gate head (ungated D7 admit, merged PR) keeps the unpinned
 		// ladder.
-		if merr := s.cfg.GateMerger.MergePullRequest(r.Context(), runRow, gate.HeadSHA); merr != nil {
+		// #4617: the dispatch is bounded by mergeTailMergeCallTimeout; the
+		// re-observe and the settle below keep the lock fn context.
+		if merr := dispatchMergeBounded(r.Context(), s.cfg.GateMerger, runRow, gate.HeadSHA); merr != nil {
 			checksPending := errors.Is(merr, forge.ErrPullRequestUnstableStatus)
 			// RE-OBSERVE ONCE (E45.87 / #3622), BEFORE the ledger is settled
 			// (matching merge-on-pass): a merge that landed in the
@@ -1490,7 +1492,10 @@ func (s *Server) observeMergeAlreadyLanded(ctx context.Context, runID uuid.UUID,
 		// Resume-only gate: a FIRST post never reads the forge.
 		return mergeObserveResult{ForgeState: "not_observed"}
 	}
-	obs, reason, forgeErr := s.observeForgeMerge(ctx, runRow)
+	// #4617: the forge read is bounded (mergeTailForgeReadTimeout); a
+	// deadline is obsForgeUnavailable and falls through. The observation
+	// append below keeps the unbounded parent ctx.
+	obs, reason, forgeErr := s.observeForgeMergeBounded(ctx, runRow)
 	if reason != obsForgeOK {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
 			"merge: observe rung: forge read did not confirm a merge; proceeding to dispatch (fail open)",
@@ -2082,6 +2087,50 @@ func mergeIntentRowSequence(rows []*audit.Entry, baseRef string) int64 {
 // can shorten it.
 var mergeRunLockAcquireTimeout = 30 * time.Second
 
+// Per-call bounds on the inline and delegated merge tails' forge calls (#4617,
+// approval condition (f)): each call is abandoned at its own bound, well under
+// the 90s mergequeue.IntentFnTimeout the merge-intent lock fn runs under. Vars
+// so a slow-forge test can shorten them; the shipped defaults are the
+// merge-on-pass bounds. Worst-case in-lock sum: inline = fold 15s + tier-(b)
+// observe 10s + republish 10s + merge 30s + post-error re-observe 10s = 75s;
+// delegated = fold 15s + republish 10s + merge 30s + landed read 10s = 65s. The
+// post-dispatch ledger write runs on its own WithoutCancel
+// mergeDispatchRecordTimeout, and every child context still inherits the lock
+// fn's earlier deadline. A hung dispatch fails the merge (dispatch_failed); a
+// hung observe read falls through (Landed:false) and a hung republish is
+// best-effort, so the merge then dispatches normally.
+var (
+	// mergeTailForgeReadTimeout bounds ONE forge read on the observe rung
+	// (observeForgeMergeBounded): the inline tier-(b) read and the delegated
+	// landed read.
+	mergeTailForgeReadTimeout = mergeOnPassForgeCallTimeout
+	// mergeTailRepublishTimeout bounds the pre-dispatch audit-check recompute
+	// and publish (republishAuditCheckBeforeMergeAtHead).
+	mergeTailRepublishTimeout = mergeOnPassForgeCallTimeout
+	// mergeTailMergeCallTimeout bounds the merge dispatch
+	// (dispatchMergeBounded).
+	mergeTailMergeCallTimeout = mergeOnPassMergeCallTimeout
+)
+
+// observeForgeMergeBounded is observeForgeMerge under mergeTailForgeReadTimeout.
+// A deadline is a GetPullRequest error, so it classifies obsForgeUnavailable:
+// never a merge, the caller falls through.
+func (s *Server) observeForgeMergeBounded(ctx context.Context, runRow *run.Run) (*mergeObservation, obsForgeReason, error) {
+	cctx, cancel := context.WithTimeout(ctx, mergeTailForgeReadTimeout)
+	defer cancel()
+	return s.observeForgeMerge(cctx, runRow)
+}
+
+// dispatchMergeBounded is merger.MergePullRequest under
+// mergeTailMergeCallTimeout. A deadline is an uncertain outcome
+// (classifyMergeDispatchOutcome): a claim moves to dispatch_failed. Callers
+// settle and re-observe on their own (lock fn) context, never this child.
+func dispatchMergeBounded(ctx context.Context, merger GitHubMerger, runRow *run.Run, head string) error {
+	mctx, cancel := context.WithTimeout(ctx, mergeTailMergeCallTimeout)
+	defer cancel()
+	return merger.MergePullRequest(mctx, runRow, head)
+}
+
 // errMergeLockAcquireTimedOut is the inline fn's refusal to start once the
 // acquire bound fired first.
 var errMergeLockAcquireTimedOut = errors.New("merge: merge-intent lock acquire wait exceeded its bound")
@@ -2141,7 +2190,7 @@ func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request
 	if head == "" {
 		// The ungated D7 admit carries no head; the claim is run-scoped, so
 		// the unresolved head is recorded as such.
-		head = "unresolved"
+		head = mergeDispatchClaimHeadUnresolved
 	}
 	existing, err := s.cfg.MergeQueue.ClaimMergeDispatch(r.Context(), runID, mergequeue.DispatchPathInline, head)
 	if err == nil {
@@ -2157,7 +2206,13 @@ func (s *Server) claimInlineMergeDispatch(w http.ResponseWriter, r *http.Request
 	}
 	if obs := s.observeMergeAlreadyLanded(r.Context(), runID, runRow, subject, true); obs.Landed {
 		if existing.State == mergequeue.DispatchFailed {
-			s.appendMergeDispatchSettled(r.Context(), existing, mergeDispatchReconciledMerged, "the forge reports the pull request merged")
+			// #4617: the ONE deduped reconciled_merged writer, so a claim
+			// merge-on-pass already reconciled gains no second row.
+			// Best-effort: the merge landed either way.
+			if aerr := s.appendReconciledMergedOnce(r.Context(), existing, "the forge reports the pull request merged"); aerr != nil {
+				s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn, "merge: reconciled_merged could not be recorded",
+					slog.String("run_id", runID.String()), slog.String("error", aerr.Error()))
+			}
 		}
 		s.writeAlreadyMergedResponse(w, r, runID, prURL, verdictSequence, alreadyRecorded, obs)
 		return mergequeue.DispatchClaim{}, false, true

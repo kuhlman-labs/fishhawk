@@ -417,8 +417,13 @@ deadline): `backend/internal/mergequeue/README.md`.
   `dispatch_failed` and the entry holds (mergequeue README §
   "Merge-dispatch ledger"). A PR the forge reports merged settles
   `pr_merged` only when the run has no claim or its claim names the merged
-  head, else holds `merged_claim_head_mismatch` (an unreadable claim holds
-  `merged_claim_unread`, #4748 M1). A lock never taken → hold; a lapse after fn → WARN, its
+  head (`mergeDispatchClaimNamesHead`: an inline or delegated claim recorded
+  at head `unresolved`, an empty gate head, names ANY merged head, #4617),
+  else holds `merged_claim_head_mismatch` (an unreadable claim holds
+  `merged_claim_unread`, #4748 M1). A `dispatch_failed` claim it reconciles
+  appends ONE `merge_dispatch_settled` `reconciled_merged` row per run
+  (`appendReconciledMergedOnce`, deduped on (run, outcome); a re-decide after
+  a `SettleAt` CAS conflict appends no second row). A lock never taken → hold; a lapse after fn → WARN, its
   writes stand.
 - **D8 step stamps and the in-flight registry (ADR-093 D8 /
   [#4298](https://github.com/kuhlman-labs/fishhawk/issues/4298)).** After
@@ -473,10 +478,40 @@ deadline): `backend/internal/mergequeue/README.md`.
   the forge refused for a head mismatch, which settles the claim by its
   refusal basis (released on precheck / rest_sha, `dispatch_failed` on
   graphql_reread, #4749) and is observe-only (`autoDriveNoteHeadMoved`,
-  #4641). The inline path re-observes a
-  landed merge BEFORE settling the claim (as merge-on-pass does), so a
-  merge that landed answers `already_merged` and leaves the claim
-  `dispatched`. Inline: a `merge_checks_pending`
+  #4641). The inline AND delegated paths re-observe a landed merge after a
+  dispatch error and BEFORE settling the claim (as merge-on-pass does), so a
+  merge that landed leaves the claim `dispatched` with no
+  `merge_dispatch_settled` row: inline answers `already_merged`; delegated
+  (`delegatedMergeLanded`, #4617) reports ACTED
+  `mergeDispatchLandedOnReobserve` (`autoDriveNoteMergeLandedOnReobserve`,
+  nil error), and runs with or without a claim, so with no ledger wired a
+  landed merge still reports acted, never "merge dispatch failed".
+  `delegatedMergeLanded` is side-effect-free (no `merge_observation_recorded`
+  row): chain evidence (`runPRObservablyMerged`), then one bounded forge read
+  that must report merged with a merge commit and `merged_at`; any
+  uncertainty is "not landed" and the settle runs as before. Neither path
+  re-observes on its OWN checks_pending refusal
+  (`forge.ErrPullRequestUnstableStatus`), which dispatched nothing; it
+  settles (releases) as before. It is checked before the delegated
+  head-moved mapping, so a landed merge is never reported as head-moved.
+- **Per-call forge timeouts on the inline and delegated tails (#4617,
+  approval condition (f)).** Each forge call is abandoned at its own
+  package-var bound, well under the 90s `mergequeue.IntentFnTimeout` the lock
+  fn runs under. Shipped defaults (the merge-on-pass bounds, not
+  requirements): `mergeTailMergeCallTimeout` 30s on the merge dispatch
+  (`dispatchMergeBounded`); `mergeTailForgeReadTimeout` 10s on one observe
+  forge read (`observeForgeMergeBounded`: the inline tier-(b) read and the
+  delegated landed read); `mergeTailRepublishTimeout` 10s on the pre-dispatch
+  audit-check recompute and publish (`republishAuditCheckBeforeMergeAtHead`,
+  which the queue's pre-lock republish shares). Worst-case in-lock sums:
+  inline 75s, delegated 65s (derivation on the vars in `merge_run.go`). A
+  hung DISPATCH fails the merge (inline 502 `merge_dispatch_failed`,
+  delegated "merge dispatch failed"; a deadline is uncertain, so the claim is
+  `dispatch_failed`); a hung observe READ falls through (`obsForgeUnavailable`)
+  and the merge dispatches; a hung REPUBLISH is best-effort and the merge
+  dispatches. The ledger settle and the re-observe keep the lock fn context,
+  never the expired child. Tests: `merge_tail_hardening_test.go`.
+- **Dispatch-path settles.** Inline: a `merge_checks_pending`
   refusal releases the claim, so the re-invoke once the checks pass claims
   again; so does a pinned head-mismatch refusal, `409 merge_head_moved`
   (#4641). Inline and delegated dispatches are PINNED to the gate's admitted
@@ -1432,8 +1467,8 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
 | `verifying` / `unverified` | `mergeQueueResumeVerifying`: reads verdict ROWS at the anchored head (never the derived `not_required`): passed → `apply_verdict` (the lost hook); failed → `eject` `verify_failed` with `fixup_routed=false`, next_step `fishhawk_fixup_stage` (fail closed, R8b); a live trigger → hold, no row; newest `not_executed` → `record_unverified`, then `redispatch_pass` AT MOST ONCE (intent, reason `runner_failed:`, exactly one such verdict at the head, R7 gate clear, implement stage succeeded/awaiting_approval, PR head = anchor); otherwise hold for `fishhawk_rebase_run_branch` as ADR-092 does |
 | `passed` | ordinary merge-on-pass (§ "Merge-on-pass") |
 | `merging` / `settling`, THIS process mid-merge | skipped (`mergeInFlight.has`) |
-| `merging` / `settling`, PR merged at the QUEUE claim's head | `settle_merged` row (`merge_actor_verified:false`, C6b), a strict `merge_dispatch_settled` `reconciled_merged` for a `dispatch_failed` claim, then the merged tail with `Resume=true` (`merge_queue_merged` only when no row names the entry; a failed dedup read or append holds `resume_unrecorded`). A DECLARED approval gate with no `merge_queue_authorized` row (path `queue`, claim head) holds `authorization_unrecorded` (C6a) |
-| `merging` / `settling`, PR merged, no claim or another path's claim | `settle_pr_merged`, settled merged `pr_merged`, claim untouched |
+| `merging` / `settling`, PR merged at the QUEUE claim's head | `settle_merged` row (`merge_actor_verified:false`, C6b), the deduped `merge_dispatch_settled` `reconciled_merged` (`appendReconciledMergedOnce`) for a `dispatch_failed` claim — a row already on the chain is success, not a hold (#4617) — then the merged tail with `Resume=true` (`merge_queue_merged` only when no row names the entry; a failed dedup read or append holds `resume_unrecorded`). A DECLARED approval gate with no `merge_queue_authorized` row (path `queue`, claim head) holds `authorization_unrecorded` (C6a) |
+| `merging` / `settling`, PR merged, no claim or another path's claim | `settle_pr_merged`, settled merged `pr_merged`, claim untouched. An inline or delegated claim at head `unresolved` counts as another path's claim at the merged head (`mergeDispatchClaimNamesHead`, #4617). Asymmetry: this resume writes NO `reconciled_merged` row and leaves an unresolved `dispatch_failed` non-queue claim unchanged; that claim heals on the next inline `merge_run` (`claimInlineMergeDispatch`'s deduped `reconciled_merged`), whereas merge-on-pass appends the deduped row |
 | PR merged at a head the claim does not name | hold `merged_claim_head_mismatch` |
 | `merging`, PR OPEN and unmerged, QUEUE claim still `dispatched` and crash-left (C2) | ADR-109 Amendment A1 ([#4711](https://github.com/kuhlman-labs/fishhawk/issues/4711)): one `merge_queue_resumed` {`redecide`, `orphaned_claim_open`, next_step `passed`, claim fields} row, then back to `passed` at the epoch (a CAS miss holds `entry_changed`), NO ledger write; ordinary merge-on-pass then releases the claim in step 8 (below) and merges through the ordinary path. A failing release writes ONE `redecide` row per pump tick (each tick's resume hands the re-stamped `merging` entry back; its merge-on-pass holds `orphaned_claim_release_failed` again), plus one `released_orphaned_claim` row per tick when the row landed and the CAS failed |
 | `merging`, PR UNREADABLE (indeterminate), QUEUE claim still `dispatched` and crash-left (C2) | strict `merge_dispatch_settled` {`dispatch_failed`, `orphaned_by_restart`}, then the EXISTING `MarkMergeDispatchFailed(orphaned_by_restart)` (C3), then a hold row {`merge_dispatch_uncertain`, next_step `operator_rearm`, remedy}: confirm on the forge nothing merged, DELETE the `dispatch_failed` claim (mergequeue README operator re-arm); the queue-path re-arm needs NO `fishhawk_merge_run` re-invocation, the next pump re-decides from scratch (C8a). PR closed: the same transition, then `drop_pr_closed` |
