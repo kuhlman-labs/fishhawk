@@ -7751,3 +7751,127 @@ func TestFoldAcceptanceRedispatchAdvisory_ConcernsOpenReopened(t *testing.T) {
 		}
 	})
 }
+
+// naOrphanRun is a running run whose LIVE merge-queue entry carries the
+// dispatch_claim_orphan label (ADR-109 A1, #4711).
+func naOrphanRun(label string, approvalWaiting bool) *Run {
+	r := naRun("running")
+	pr := "https://github.com/x/y/pull/7"
+	r.PullRequestURL = &pr
+	r.MergeCandidateQueue = &runMergeCandidateQueue{
+		State: "live", Phase: "passed", Repo: "x/y", BaseRef: "main", AnchoredHeadSHA: "h1",
+		DispatchClaimOrphan: label,
+	}
+	if approvalWaiting {
+		at := time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC)
+		r.MergeCandidateQueue.ApprovalWaitStartedAt = &at
+	}
+	return r
+}
+
+// TestFoldMergeQueueOrphanedClaim pins the fold (ADR-109 A1, #4711):
+// orphaned_by_restart INSERTS operator_rearm {run_id} before
+// fishhawk_merge_run (consumes none; the reason names the DELETE re-arm and
+// that no fishhawk_merge_run re-invoke is needed), else appends it; orphaned
+// APPENDS fishhawk_get_merge_queue {repo, base_ref} with a CONDITIONAL reason
+// (approval condition 1): with the approval-wait anchor set it names the
+// needed approval and the claim holding the head, and no row ever says
+// "nothing to do". Absent, unknown, terminal, no block and nil are no-ops; a
+// second fold adds nothing. Counterfactuals: an early return at the top →
+// every positive row RED; an unconditional orphaned reason → the
+// approval-wait row RED.
+func TestFoldMergeQueueOrphanedClaim(t *testing.T) {
+	t.Run("orphaned_by_restart inserted before the merge", func(t *testing.T) {
+		run := naOrphanRun("orphaned_by_restart", false)
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}, mergeRunAction(run)}}
+		foldMergeQueueOrphanedClaim(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
+		if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_await_review", "operator_rearm", "fishhawk_merge_run"}) {
+			t.Fatalf("actions = %v, want operator_rearm inserted once before fishhawk_merge_run", got)
+		}
+		a := na.Actions[1]
+		if !reflect.DeepEqual(a.Params, map[string]string{"run_id": run.ID}) || a.Consumes != consumesNone ||
+			!strings.Contains(a.Precondition, "orphaned_by_restart") {
+			t.Errorf("operator_rearm = %+v, want params {run_id}, consumes none, precondition naming the label", a)
+		}
+		for _, s := range []string{"DELETE the run's dispatch_failed claim", "No fishhawk_merge_run re-invoke is needed", "did not merge", "Merge-dispatch ledger"} {
+			if !strings.Contains(a.Reason, s) {
+				t.Errorf("reason = %q, want it to name %q", a.Reason, s)
+			}
+		}
+	})
+	t.Run("orphaned_by_restart appended without a merge", func(t *testing.T) {
+		run := naOrphanRun("orphaned_by_restart", false)
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}}}
+		foldMergeQueueOrphanedClaim(run, na)
+		if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_await_review", "operator_rearm"}) {
+			t.Fatalf("actions = %v, want operator_rearm appended", got)
+		}
+	})
+	for _, tc := range []struct {
+		name      string
+		waiting   bool
+		wantParts []string
+	}{
+		{"orphaned, approval not known missing", false, []string{"forge-approval fold approves releases it", "If the pull request still needs a qualifying forge approval, the claim holds the head"}},
+		{"orphaned while the fold has not approved", true, []string{"the pull request still needs a qualifying forge approval", "the claim holds the head until that approval arrives", "Approve the pull request"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naOrphanRun("orphaned", tc.waiting)
+			na := &NextActions{Actions: []SuggestedAction{mergeRunAction(run)}}
+			foldMergeQueueOrphanedClaim(run, na)
+			foldMergeQueueOrphanedClaim(run, na)
+			if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_merge_run", "fishhawk_get_merge_queue"}) {
+				t.Fatalf("actions = %v, want fishhawk_get_merge_queue appended once", got)
+			}
+			a := na.Actions[1]
+			if !reflect.DeepEqual(a.Params, map[string]string{"repo": "x/y", "base_ref": "main"}) || a.Consumes != consumesNone {
+				t.Errorf("fishhawk_get_merge_queue = %+v, want params {repo, base_ref} and consumes none", a)
+			}
+			for _, s := range tc.wantParts {
+				if !strings.Contains(a.Reason, s) {
+					t.Errorf("reason = %q, want it to say %q", a.Reason, s)
+				}
+			}
+			if strings.Contains(strings.ToLower(a.Reason), "nothing to do") {
+				t.Errorf("reason = %q, must never say \"nothing to do\"", a.Reason)
+			}
+		})
+	}
+	t.Run("no-ops", func(t *testing.T) {
+		terminal := naOrphanRun("orphaned_by_restart", false)
+		terminal.State = "succeeded"
+		for name, r := range map[string]*Run{
+			"absent": naOrphanRun("", false), "unknown": naOrphanRun("released", false),
+			"terminal": terminal, "no_block": naRun("running"),
+		} {
+			na := &NextActions{}
+			foldMergeQueueOrphanedClaim(r, na)
+			if len(na.Actions) != 0 {
+				t.Errorf("%s: actions = %+v, want none", name, na.Actions)
+			}
+		}
+		foldMergeQueueOrphanedClaim(nil, nil)
+		foldMergeQueueOrphanedClaim(naOrphanRun("orphaned", false), nil)
+	})
+}
+
+// TestNextActions_MergeQueueOrphanedClaimOnEveryPath: every nextActionsFor
+// return path (ci_failed, review_coverage_incomplete and the classify table)
+// carries the operator_rearm for an orphaned_by_restart claim.
+// Counterfactual: deleting one call site → that path's row RED.
+func TestNextActions_MergeQueueOrphanedClaimOnEveryPath(t *testing.T) {
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_host_dispatch")}
+	for name, drive := range map[string]*DriveStatus{
+		"ci_failed":                  {Drive: true, DerivedStatus: "ci_failed"},
+		"review_coverage_incomplete": {Drive: true, DerivedStatus: stateReviewCoverageIncomplete},
+		"classify":                   nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			na := nextActionsFor(naOrphanRun("orphaned_by_restart", false), stages, nil, nil, nil, drive, false, false, false, "", "", releaseSignals{})
+			if !slices.Contains(actionNames(na), "operator_rearm") {
+				t.Fatalf("actions = %v, want operator_rearm", actionNames(na))
+			}
+		})
+	}
+}

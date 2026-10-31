@@ -487,6 +487,62 @@ type runMergeCandidateQueuePayload struct {
 	YieldedAt             *time.Time `json:"yielded_at,omitempty"`
 	NextStep              string     `json:"next_step,omitempty"`
 	ApprovalWaitStartedAt *time.Time `json:"approval_wait_started_at,omitempty"`
+	// DispatchClaimOrphan labels a LIVE entry's crash-left queue dispatch
+	// claim (ADR-109 A1, #4711): orphaned or orphaned_by_restart, the label
+	// the merge-queue read's dispatch_claim.orphan carries
+	// (mergeQueueDispatchClaimOrphan). Omitted for a held entry, with no or
+	// an unlabelled claim, and when the claim or clock read fails (never a
+	// failed run read or gate view).
+	DispatchClaimOrphan string `json:"dispatch_claim_orphan,omitempty"`
+}
+
+// The live-entry note's dispatch-claim orphan clauses (ADR-109 A1, #4711),
+// constant-shape. The orphaned clauses are CONDITIONAL on the forge-approval
+// fold: step 8 releases the claim only in a decision whose fold approved, and
+// a claimed entry never yields (ADR-109), so while the pull request lacks a
+// qualifying approval the claim holds the head.
+const (
+	// mergeQueueNoteOrphanedAwaitingApproval: orphaned, and the entry's
+	// approval-wait anchor is set (the fold did not approve).
+	mergeQueueNoteOrphanedAwaitingApproval = "; its queue dispatch claim is orphaned (crash-left, ADR-109 A1) and the pull request still needs a qualifying forge approval at its current head: " +
+		"the claim holds the head until that approval arrives (a claimed entry never yields), then the next merge-on-pass decision releases it and merges through the ordinary path"
+	// mergeQueueNoteOrphaned: orphaned, approval not known to be missing.
+	mergeQueueNoteOrphaned = "; its queue dispatch claim is orphaned (crash-left, ADR-109 A1): the next merge-on-pass decision whose forge-approval fold approves releases it and merges through the ordinary path; " +
+		"if the pull request still needs a qualifying approval, the claim holds the head until it arrives"
+	// mergeQueueNoteOrphanedByRestart: the operator re-arm.
+	mergeQueueNoteOrphanedByRestart = "; its queue dispatch claim is dispatch_failed (orphaned_by_restart) and holds the line for the operator re-arm: confirm on the forge that the pull request did not merge, " +
+		"then DELETE the run's dispatch_failed claim (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); no fishhawk_merge_run re-invoke is needed, the queue's next pump re-decides"
+)
+
+// mergeQueueOrphanNoteClause is the live note's clause for label, keyed on
+// whether the approval-wait anchor is set; "" for no label.
+func mergeQueueOrphanNoteClause(label string, approvalWaiting bool) string {
+	switch label {
+	case mergeQueueClaimOrphaned:
+		if approvalWaiting {
+			return mergeQueueNoteOrphanedAwaitingApproval
+		}
+		return mergeQueueNoteOrphaned
+	case mergeQueueClaimOrphanedByRestart:
+		return mergeQueueNoteOrphanedByRestart
+	}
+	return ""
+}
+
+// mergeCandidateDispatchClaimOrphanFor labels the LIVE entry e's dispatch
+// claim, best-effort: a claim read error warn-logs and returns "" (the field
+// is omitted, the read never fails).
+func (s *Server) mergeCandidateDispatchClaimOrphanFor(ctx context.Context, e mergequeue.Entry) string {
+	claim, found, err := s.cfg.MergeQueue.MergeDispatch(ctx, e.RunID)
+	if err != nil {
+		s.cfg.Logger.Warn("merge queue: read the run's dispatch claim failed; omitting dispatch_claim_orphan",
+			"run_id", e.RunID.String(), "error", err.Error())
+		return ""
+	}
+	if !found {
+		return ""
+	}
+	return mergeQueueDispatchClaimOrphanFor(claim, s.mergeQueueReadClock(ctx))
 }
 
 // mergeQueueYieldRemedy is the remedy prose for a yield's reason and
@@ -578,7 +634,9 @@ func (s *Server) mergeCandidateQueuePayloadFor(ctx context.Context, runID uuid.U
 		out.Note = fmt.Sprintf("held at position %d on %s behind %s (ADR-092): no runner slot is used and admission is automatic when the line frees — the queue advances a behind branch, re-anchors and starts the pass; a stalled line self-heals on the periodic pump (about 1 minute), and fishhawk_rebase_run_branch pumps the base manually", st.Position, e.BaseRef, holder)
 		return out, nil
 	}
-	out.Note = "live: this run holds the " + e.BaseRef + " merge-candidate line (ADR-092) until its pull request merges, its pass fails or the run ends; phase " + string(e.Phase)
+	out.DispatchClaimOrphan = s.mergeCandidateDispatchClaimOrphanFor(ctx, e)
+	out.Note = "live: this run holds the " + e.BaseRef + " merge-candidate line (ADR-092) until its pull request merges, its pass fails or the run ends; phase " + string(e.Phase) +
+		mergeQueueOrphanNoteClause(out.DispatchClaimOrphan, e.ApprovalWaitStartedAt != nil)
 	return out, nil
 }
 
