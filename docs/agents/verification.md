@@ -65,3 +65,22 @@ Helm render tests skip when helm is absent; report that gap. Registry probes
 have their own reachability/sentinel skip conditions. Review-prompt evidence is
 an additional path-triggered check outside verify; see
 [change checklists](change-checklists.md).
+
+## Required GitHub Actions validation
+
+[scripts/README.md](../../scripts/README.md) § "Required GitHub Actions validation"
+owns the full contract (#4885). Pin hosted runners to `ubuntu-24.04` /
+`ubuntu-24.04-arm`; upgrade deliberately, never through `ubuntu-latest`.
+
+`CI Pass` depends on always-on `repository-checks` (`verify --no-tests`,
+recorded review-prompt evidence, workflow lint/contracts), the filtered Go
+matrix/coverage, frontend/OpenAPI/site builds, and reusable Helm/Terraform/
+gate-image checks. Filters must include embedded schemas, migrations, fixtures
+and canonical inputs, not just source extensions. Keep new validation jobs in
+`ci-pass.needs` and update `scripts/test-ci-workflows.py`.
+
+Main image publishing runs only after that gate for the same push, with
+serialized, freshness-checked promotion. Gate images publish the tested
+archives without rebuilding. Production environment settings are live GitHub
+configuration and must satisfy `infra/terraform/README.md` before apply;
+YAML comments are not protection rules.

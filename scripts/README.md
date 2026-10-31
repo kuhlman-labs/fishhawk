@@ -754,16 +754,71 @@ fi
 # then: print one summary line per entry of "${failed[@]}" and exit 1 if any
 ```
 
+## Required GitHub Actions validation (#4885)
+
+`ci.yml` owns the required `CI Pass` rollup. Its always-on
+`repository-checks` job runs `scripts/test verify --no-tests`, the recorded
+review-prompt evidence check, actionlint, and `test-ci-workflows.py`.
+All hosted workflows pin Ubuntu 24.04 (`ubuntu-24.04-arm` for native ARM).
+The `ubuntu-latest` migration to 26.04 (actions/runner-images#14748) must not
+change the OS implicitly; a runner upgrade is a separate validated change.
+The repository job installs zsh 5.9-6ubuntu2 explicitly
+so `test-dev` cannot silently skip on a hosted runner without zsh.
+The prompt check uses the PR base SHA or the push's BEFORE SHA, with full
+history; comparing a main push to `origin/main` would compare the commit to
+itself and incorrectly skip evidence validation. No model key is needed.
+
+Path-filtered Go tests include module assets (embedded JSON, migrations and
+fixtures), canonical schemas/API/ADR inputs, scripts, and workflow changes.
+Site builds, Helm render, Terraform fmt/validate and gate-image builds feed
+`CI Pass` through job dependencies; reusable workflows have no independent PR
+triggers. Static image pin checks run for every change; image rebuilds run
+only for image/validation/publisher inputs. `test-ci-workflows.py` pins the
+cross-workflow dependencies, representative routing inputs, release authority,
+queue limits and deployment protection checks. It requires PyYAML 6.0.3 in a
+disposable venv. actionlint 1.7.12 does not recognize GitHub's `concurrency.queue`
+yet: CI suppresses only that exact diagnostic and the contract test validates
+`queue` values and their cancellation pairing. All concrete jobs have timeouts.
+
+Main image publishers are reusable workflows called after successful `CI Pass`
+on the same push. Each publisher serializes mutable-tag promotion and checks
+that its image inputs still match main (a later docs-only commit is harmless). Backend images get the full commit in both binary
+metadata and their `sha-<full>` tag (the short alias remains compatible); `:main` is promoted after signing. Gate
+images are built and validated once per architecture on native runners, passed
+as immutable workflow artifacts, then pushed and assembled without rebuilding.
+An obsolete run may retain its commit tag, but cannot overwrite `:main` after
+newer image inputs have arrived. Rerun all jobs of a main CI run to regenerate expired
+one-day image artifacts before retrying publication. A failed publication is a
+failed CI workflow run even though the validation-only `CI Pass` is green.
+
+Release lint/tests and binary compilation run with contents-read permission.
+Signing and GitHub Release publication run in separate jobs, using artifact
+handoff and strict missing-asset checks. Backend image build/push remains in
+the publisher to preserve BuildKit provenance/SBOM attestations; no test code
+runs with publication credentials. SBOM generation cannot auto-upload assets
+before checksum signing and the final immutable-release publication.
+
+Fishhawk fan-out uses `queue: max`: up to 100 pending siblings are retained,
+with one running at a time. The backend fan-out cap must remain below that
+queue capacity; GitHub cancels arrivals above capacity. PR updates cancel older
+checks for that PR. Main pushes use independent run groups so GitHub cannot
+replace a pending code push with a docs-only push and lose its image trigger.
+Image publishers also use `queue: max`: CI completion order need not match
+commit order, so an older run must not replace a newer pending publisher.
+The freshness check rejects obsolete inputs when each publisher runs.
+
 ## CI test legs ([#3882](https://github.com/kuhlman-labs/fishhawk/issues/3882))
 
 `scripts/ci-test-leg` is the partition behind CI's `go-test` matrix. CI used
 to run `scripts/test coverage` (every module, serially, on one 4-vCPU runner,
-~15-20 min); it now runs five legs in parallel and a `go-coverage` job merges
+~15-20 min); it now runs seven legs in parallel and a `go-coverage` job merges
 their profiles and applies the same `--threshold 80 --exclude '/db/'` gate.
 
 | Leg | Tests |
 |---|---|
-| `backend-heavy` | `backend/internal/{mcpserver,server,postgres,integration/mcp}` |
+| `backend-mcp` | `backend/internal/mcpserver` |
+| `backend-server` | `backend/internal/server` |
+| `backend-storage` | `backend/internal/{postgres,integration/mcp}` |
 | `backend-rest` | every other `backend` package |
 | `runner-main-a` | `runner/cmd/fishhawk-runner`, `-run '^TestRun'` |
 | `runner-main-b` | `runner/cmd/fishhawk-runner`, `-skip '^TestRun'` |

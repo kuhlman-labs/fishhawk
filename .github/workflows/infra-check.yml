@@ -4,7 +4,7 @@
 #
 # We deliberately don't run `terraform plan` here:
 #  - plan needs AWS read access; the GHA OIDC role is currently
-#    locked to main + tags (the apply path), and loosening it for
+#    locked to protected deployment environments, and loosening it for
 #    PR contexts would widen the blast radius;
 #  - plan also needs the per-env state, and loading that from a
 #    fork-PR context is unsafe.
@@ -13,10 +13,8 @@
 name: infra-check
 
 on:
-  pull_request:
-    paths:
-      - "infra/terraform/**"
-      - ".github/workflows/infra-*.yml"
+  workflow_call:
+  workflow_dispatch:
 
 permissions:
   contents: read
@@ -27,7 +25,8 @@ defaults:
 
 jobs:
   fmt-validate:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 

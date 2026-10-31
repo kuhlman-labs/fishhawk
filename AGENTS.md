@@ -69,6 +69,7 @@ ADRs before choosing boundaries.
 | Handler authorization or audit category | [change checklists](docs/agents/change-checklists.md): token-impact inventory, migration, category registry and comment surfaces |
 | New Go module | `new-go-module`; [change checklists](docs/agents/change-checklists.md) |
 | Tests, fixtures, cross-module wire types | [testing rules](docs/agents/testing.md) |
+| GitHub Actions, CI or publishing | [verification guide](docs/agents/verification.md) § Required GitHub Actions validation; [scripts contract](scripts/README.md) |
 | Verify / unexplained red | `verify-gate` / `diagnose-red`; [verification guide](docs/agents/verification.md) |
 | Deploy, sync, stop, clean | `deploy-local`, `sync-main`, `teardown-local`, `dev-clean`; [operations](docs/agents/operations.md) |
 | Ratified ADR | `record-adr`; update record, README table, index and supersession/amendment links |

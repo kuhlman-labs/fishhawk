@@ -114,22 +114,13 @@ data "aws_iam_policy_document" "github_actions_assume" {
       values   = ["sts.amazonaws.com"]
     }
 
-    # Tightened in slice 4 (E13.7.4): only the main branch and
-    # backend release tags can assume this role. Pull-request
-    # contexts (sub = "repo:.../pull/N/merge") and feature
-    # branches (sub = "repo:.../ref:refs/heads/<branch>") match
-    # neither pattern and so cannot deploy.
-    #
-    # workflow_dispatch from main-branch context produces
-    # "repo:<repo>:ref:refs/heads/main", which the first pattern
-    # covers — so manual rollback works from the Actions UI.
+    # An Actions job with `environment:` receives an environment subject,
+    # not a branch subject. GitHub's environment policy enforces main-only
+    # deployment; infra-apply verifies that policy before requesting OIDC.
     condition {
-      test     = "StringLike"
+      test     = "StringEquals"
       variable = "token.actions.githubusercontent.com:sub"
-      values = [
-        "repo:${var.github_repo}:ref:refs/heads/main",
-        "repo:${var.github_repo}:ref:refs/tags/backend/v*",
-      ]
+      values   = ["repo:${var.github_repo}:environment:${var.environment}"]
     }
   }
 }

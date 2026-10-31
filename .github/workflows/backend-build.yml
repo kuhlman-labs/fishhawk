@@ -1,9 +1,8 @@
 # fishhawkd container build (E13.3 / #60).
 #
-# Triggered by push to main when backend code (or this workflow
-# itself) changes. Publishes:
+# Called by CI only after CI Pass succeeds for a main push. Publishes:
 #   ghcr.io/kuhlman-labs/fishhawkd:main
-#   ghcr.io/kuhlman-labs/fishhawkd:sha-<short>
+#   ghcr.io/kuhlman-labs/fishhawkd:sha-<full>
 #
 # Tagged releases use a separate workflow (backend-release.yml)
 # that mirrors the runner-release pattern: re-runs lint+tests at
@@ -20,20 +19,7 @@
 name: Backend Build
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'backend/**'
-      - 'go.work'
-      - 'go.work.sum'
-      - 'runner/go.mod'
-      - 'runner/go.sum'
-      - 'cli/go.mod'
-      - 'cli/go.sum'
-      - 'verifier/go.mod'
-      - 'verifier/go.sum'
-      - '.github/workflows/backend-build.yml'
-      - '.dockerignore'
+  workflow_call:
 
 permissions:
   contents: read
@@ -43,7 +29,13 @@ permissions:
 jobs:
   build-and-push:
     name: Build, sign, and push fishhawkd image
-    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: publish-backend-main
+      cancel-in-progress: false
+      queue: max
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -64,7 +56,7 @@ jobs:
         with:
           images: ghcr.io/kuhlman-labs/fishhawkd
           tags: |
-            type=ref,event=branch
+            type=sha,prefix=sha-,format=long
             type=sha,prefix=sha-
           labels: |
             org.opencontainers.image.title=fishhawkd
@@ -84,6 +76,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=sha-${{ github.sha }}
+            GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=backend-build
           cache-to: type=gha,mode=max,scope=backend-build
           provenance: true
@@ -100,3 +93,20 @@ jobs:
           # Sign by digest so the signature stays attached to the
           # exact image bytes — re-tagging doesn't break verify.
           cosign sign --yes "ghcr.io/kuhlman-labs/fishhawkd@${DIGEST}"
+
+      - name: Promote signed image only while its inputs match main
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          git fetch --no-tags origin main
+          current="$(git rev-parse FETCH_HEAD)"
+          rc=0
+          scripts/ci-image-current backend "$GITHUB_SHA" "$current" || rc=$?
+          case "$rc" in
+            0) ;;
+            1) exit 0 ;;
+            *) exit "$rc" ;;
+          esac
+          docker buildx imagetools create --prefer-index=false \
+            --tag ghcr.io/kuhlman-labs/fishhawkd:main \
+            "ghcr.io/kuhlman-labs/fishhawkd@$DIGEST"

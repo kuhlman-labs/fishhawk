@@ -10,18 +10,29 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # PR updates supersede older checks. Main pushes must each be evaluated:
+  # a shared latest-pending slot can discard a code push before a docs push.
+  # Publishers have their own serialization below.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:
   detect:
     name: Detect changed paths
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      pull-requests: read
     outputs:
       go: ${{ steps.filter.outputs.go }}
       ts: ${{ steps.filter.outputs.ts }}
       openapi: ${{ steps.filter.outputs.openapi }}
       docker: ${{ steps.filter.outputs.docker }}
+      site: ${{ steps.filter.outputs.site }}
+      helm: ${{ steps.filter.outputs.helm }}
+      infra: ${{ steps.filter.outputs.infra }}
+      gate-image: ${{ steps.filter.outputs.gate-image }}
     steps:
       - uses: actions/checkout@v7
       - uses: dorny/paths-filter@v4
@@ -29,67 +40,87 @@ jobs:
         with:
           filters: |
             go:
+              # Include embedded schemas, migrations, fixtures and module-local
+              # assets, not only Go source. Unknown module additions widen via go.work.
+              - 'backend/**'
+              - 'runner/**'
+              - 'cli/**'
+              - 'verifier/**'
+              - 'directory/**'
+              - 'pricing/**'
+              - 'redaction/**'
+              - 'credstore/**'
               - '**/*.go'
               - '**/go.mod'
               - '**/go.sum'
-              - 'go.work'
-              - 'go.work.sum'
-              - '.golangci.yml'
-              # Go-test fixtures (e.g. backend/internal/agenteval/testdata/corpus)
-              # are consumed by Go tests (TestScore, TestCalibrateCorpusReplay), so a
-              # fixture-only change must run the Go job — otherwise it merges
-              # unvalidated and can red-line main post-merge (#1298/#1301).
               - '**/testdata/**'
-              # The scripts that define the Go gate itself (#3882): a change
-              # to the leg partition, the shared test env, or the coverage
-              # merge must run the gate it changes.
-              - 'scripts/ci-test-leg'
-              - 'scripts/test'
-              - 'scripts/check-coverage.py'
-              - '.github/workflows/ci.yml'
+              - 'testdata/**'
+              - 'go.work*'
+              - '.golangci.yml'
+              - '.fishhawk/**'
+              - 'docs/spec/**'
+              - 'docs/api/**'
+              - 'docs/adr/**'
+              - 'docs/review/**'
+              - 'scripts/**'
+              - '.github/workflows/**'
             ts:
               - 'frontend/**'
-              - 'package.json'
-              - 'pnpm-lock.yaml'
-              - '.eslintrc*'
-              - 'eslint.config.*'
-              - '.prettierrc*'
               - '.github/workflows/ci.yml'
             openapi:
               - 'docs/api/**'
               - '.github/workflows/ci.yml'
-            # The fishhawkd image build (backend/Dockerfile) resolves the
-            # whole go.work workspace inside the container. A module added
-            # to go.work without being wired into the Dockerfile's COPY
-            # steps breaks `go mod download` — invisible to the `go` job
-            # (which builds against the on-disk workspace) and previously
-            # only caught post-merge by backend-build.yml (#733). Trigger
-            # the build-only docker job on anything that changes the module
-            # graph or the build context: go.mod/go.sum (any module),
-            # go.work, the Dockerfile, and the ignore file.
             docker:
+              # All workspace source copied by backend/Dockerfile.
+              - 'backend/**'
+              - 'runner/**'
+              - 'cli/**'
+              - 'verifier/**'
+              - 'directory/**'
+              - 'pricing/**'
+              - 'redaction/**'
+              - 'credstore/**'
               - '**/go.mod'
               - '**/go.sum'
-              - 'go.work'
-              - 'go.work.sum'
-              - 'backend/Dockerfile'
+              - 'go.work*'
               - '.dockerignore'
               - '.github/workflows/ci.yml'
+              - '.github/workflows/backend-build.yml'
+              - 'scripts/ci-image-current'
+            site:
+              - 'site/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/docs.yml'
+            helm:
+              - 'deploy/helm/**'
+              - 'scripts/test-helm-render'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/helm-render.yml'
+            infra:
+              - 'infra/terraform/**'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/infra-*.yml'
+            gate-image:
+              # Static pin validation runs on EVERY change in repository-checks.
+              # Rebuild only when the image, its validation or its publisher changes.
+              - 'deploy/gate-image/**'
+              - 'scripts/ci-image-current'
+              - 'scripts/check-gate-image'
+              - 'scripts/test'
+              - '.github/workflows/ci.yml'
+              - '.github/workflows/gate-image*.yml'
 
-  # The Go gate runs as PARALLEL jobs: go-lint (~2.5 min), a go-test matrix
-  # of test legs, and go-coverage, which merges the legs' profiles and
-  # applies the 80% aggregate gate. Before #3882 the tests ran as one serial
-  # `scripts/test coverage` loop over every module (~15-20 min); split into
-  # legs the critical path is the slowest leg plus the merge. All gate on
-  # `detect` and the same `go == 'true'` filter, and all are listed in
-  # `ci-pass.needs` so the required rollup inherits every result.
-  go-lint:
-    name: Go (lint)
-    needs: detect
-    if: ${{ needs.detect.outputs.go == 'true' }}
-    runs-on: ubuntu-latest
+  # Always run the repository gate, including non-Go-only changes. The Go
+  # test matrix remains path-filtered; verify --no-tests never reruns it.
+  repository-checks:
+    name: Repository validation
+    # Pin the distro alongside the apt package version below.
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0
 
       - uses: actions/setup-go@v7
         with:
@@ -104,34 +135,7 @@ jobs:
           # started cold (#3882).
           cache-dependency-path: '**/go.sum'
 
-      - name: Detect registered modules
-        id: have-modules
-        run: |
-          if [ -f go.work ] && grep -q '^use ' go.work; then
-            echo "yes=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "yes=false" >> "$GITHUB_OUTPUT"
-            echo "::notice::No Go modules registered in go.work yet. Skipping lint."
-          fi
-
-      - name: Schema sync (docs/spec ↔ embedded copies)
-        if: steps.have-modules.outputs.yes == 'true'
-        run: |
-          # Each canonical schema/default under docs/spec/ is mirrored into
-          # one or more embedded copies vendored into the Go modules.
-          # scripts/sync-schemas is the single source of truth for those
-          # pairs; re-run it and fail if anything changed, so a newly added
-          # pair (e.g. operator-role, work-management) is covered here
-          # automatically without editing this gate. Update both sides in
-          # the same PR and run scripts/sync-schemas before committing.
-          scripts/sync-schemas
-          if ! git diff --exit-code; then
-            echo "::error::Embedded schema copies drifted from docs/spec/. Run scripts/sync-schemas and commit the result." >&2
-            exit 1
-          fi
-
       - name: Install golangci-lint
-        if: steps.have-modules.outputs.yes == 'true'
         run: |
           # golangci-lint must be built with a Go at least as new as the
           # workspace: v2.8.0 (go1.25) panics on a go 1.26 workspace with
@@ -156,24 +160,44 @@ jobs:
       # **/*.go) so an ordinary code change reuses the warm cache rather than
       # thrashing the exact key on every push.
       - name: Cache golangci-lint analysis cache
-        if: steps.have-modules.outputs.yes == 'true'
         uses: actions/cache@v6
         with:
           path: ~/.cache/golangci-lint
-          key: golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-${{ github.sha }}
+          key: golangci-ubuntu24.04-${{ runner.arch }}-${{ hashFiles('.golangci.yml') }}-${{ github.sha }}
           restore-keys: |
-            golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-
-            golangci-${{ runner.os }}-
+            golangci-ubuntu24.04-${{ runner.arch }}-${{ hashFiles('.golangci.yml') }}-
+            golangci-ubuntu24.04-${{ runner.arch }}-
 
-      - name: Lint each module
-        if: steps.have-modules.outputs.yes == 'true'
-        # `scripts/test lint` is byte-for-byte the per-module
-        # `golangci-lint run ./...` (AGENTS.md "Build, test, lint") and fails
-        # closed when golangci-lint is missing (installed in the step above).
-        # `go build ./...` is redundant here: lint typechecks/builds every
-        # package (and go-test compiles them again) — exactly what the runner's
-        # `scripts/test verify` gate already relies on.
-        run: scripts/test lint
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.2.4
+      - name: Install the dev-harness shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y zsh=5.9-6ubuntu2
+          command -v zsh
+      - name: Verify repository contracts and gate harnesses
+        run: scripts/test verify --no-tests
+      - name: Check recorded review-prompt evidence
+        env:
+          BASE_SHA: ${{ github.event.pull_request.base.sha || github.event.before }}
+        run: scripts/check-review-prompt-eval --base "$BASE_SHA"
+      - name: Install actionlint
+        env:
+          GOBIN: ${{ runner.temp }}/actionlint-bin
+        run: go install github.com/rhysd/actionlint/cmd/actionlint@v1.7.12
+      - name: Lint workflows
+        # v1.7.12 predates GitHub's queue:max. Ignore only that diagnostic;
+        # test-ci-workflows.py validates the queue values and cancellation pair.
+        run: >-
+          "$RUNNER_TEMP/actionlint-bin/actionlint" -color
+          -ignore '^unexpected key "queue" for "concurrency" section\.'
+      - name: Install workflow test parser
+        run: |
+          python3 -m venv "$RUNNER_TEMP/ci-tools"
+          "$RUNNER_TEMP/ci-tools/bin/pip" install PyYAML==6.0.3
+      - name: Test CI workflow contracts
+        run: '"$RUNNER_TEMP/ci-tools/bin/python" scripts/test-ci-workflows.py'
 
   # Test legs (#3882). scripts/ci-test-leg owns the partition: every package
   # of every go.work module lands in exactly one leg by construction (new
@@ -189,11 +213,12 @@ jobs:
     name: Go (test ${{ matrix.leg }})
     needs: detect
     if: ${{ needs.detect.outputs.go == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        leg: [backend-heavy, backend-rest, runner-main-a, runner-main-b, rest]
+        leg: [backend-mcp, backend-server, backend-storage, backend-rest, runner-main-a, runner-main-b, rest]
     steps:
       - uses: actions/checkout@v7
 
@@ -214,9 +239,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-test-${{ runner.os }}-${{ matrix.leg }}-${{ hashFiles('**/go.sum') }}
+          key: go-test-ubuntu24.04-${{ runner.arch }}-1.26-${{ matrix.leg }}-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            go-test-${{ runner.os }}-${{ matrix.leg }}-
+            go-test-ubuntu24.04-${{ runner.arch }}-1.26-${{ matrix.leg }}-
 
       # Download EVERY go.work module's dependencies, not just the ones this
       # leg compiles. basedelta's TestGoListLoader_RealRepository runs `go list`
@@ -247,7 +272,8 @@ jobs:
     name: Go (coverage gate)
     needs: [detect, go-test]
     if: ${{ needs.detect.outputs.go == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -287,7 +313,8 @@ jobs:
     name: TypeScript (lint + build + test)
     needs: detect
     if: ${{ needs.detect.outputs.ts == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     defaults:
       run:
         working-directory: frontend
@@ -330,7 +357,8 @@ jobs:
     name: OpenAPI (lint)
     needs: detect
     if: ${{ needs.detect.outputs.openapi == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
       - uses: actions/setup-node@v7
@@ -349,7 +377,8 @@ jobs:
     name: Docker build (fishhawkd image, no push)
     needs: detect
     if: ${{ needs.detect.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
 
@@ -372,10 +401,48 @@ jobs:
           load: false
           build-args: |
             VERSION=ci-${{ github.sha }}
+            GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=backend-build
           cache-to: type=gha,mode=max,scope=ci-docker-build
           provenance: false
           sbom: false
+
+  site:
+    name: Documentation site
+    needs: detect
+    if: needs.detect.outputs.site == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: site
+    steps:
+      - uses: actions/checkout@v7
+      - uses: pnpm/action-setup@v6
+        with:
+          package_json_file: site/package.json
+      - uses: actions/setup-node@v7
+        with:
+          node-version: '22'
+          cache: pnpm
+          cache-dependency-path: site/pnpm-lock.yaml
+      - run: pnpm install --frozen-lockfile
+      - run: pnpm build
+
+  helm:
+    needs: detect
+    if: needs.detect.outputs.helm == 'true'
+    uses: ./.github/workflows/helm-render.yml
+
+  infra:
+    needs: detect
+    if: needs.detect.outputs.infra == 'true'
+    uses: ./.github/workflows/infra-check.yml
+
+  gate-image:
+    needs: detect
+    if: needs.detect.outputs.gate-image == 'true'
+    uses: ./.github/workflows/gate-image.yml
 
   # Rollup gate. The repo ruleset requires only this job; it inherits
   # the result of every job listed in `needs`. Add new jobs to that
@@ -383,9 +450,10 @@ jobs:
   # touching the ruleset.
   ci-pass:
     name: CI Pass
-    needs: [detect, go-lint, go-test, go-coverage, ts, openapi, docker-build]
+    needs: [detect, repository-checks, go-test, go-coverage, ts, openapi, docker-build, site, helm, infra, gate-image]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Verify required jobs
         run: |
@@ -400,3 +468,26 @@ jobs:
             exit 1
           fi
           echo "All required jobs passed (or were correctly skipped)."
+
+  publish-backend:
+    needs: [detect, ci-pass]
+    if: >-
+      always() && needs.ci-pass.result == 'success' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.detect.outputs.docker == 'true'
+    permissions:
+      contents: read
+      packages: write
+      id-token: write
+    uses: ./.github/workflows/backend-build.yml
+
+  publish-gate:
+    needs: [detect, ci-pass]
+    if: >-
+      always() && needs.ci-pass.result == 'success' &&
+      github.event_name == 'push' && github.ref == 'refs/heads/main' &&
+      needs.detect.outputs.gate-image == 'true'
+    permissions:
+      contents: read
+      packages: write
+    uses: ./.github/workflows/gate-image-publish.yml

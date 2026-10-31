@@ -97,9 +97,9 @@ To avoid retyping the backend args, save them to `backend.dev.hcl` (gitignored) 
 
 ## CI apply
 
-Two GitHub Actions workflows run apply against the cloud:
+Two GitHub Actions workflows cover validation and apply:
 
-- **`.github/workflows/infra-check.yml`** — every PR touching `infra/terraform/**` runs `terraform fmt -check` + `terraform validate`. No AWS credentials required; PR authors don't need access to the AWS account.
+- **`.github/workflows/infra-check.yml`** — a reusable check required by `CI Pass` for PRs touching `infra/terraform/**`; runs `terraform fmt -check` + `terraform validate`. No AWS credentials required; PR authors don't need access to the AWS account.
 - **`.github/workflows/infra-apply.yml`** — push to main with infra changes auto-applies **dev**. `workflow_dispatch` with an environment input applies **dev** or **prod** explicitly.
 
 Both apply paths assume the per-environment OIDC role (`vars.AWS_DEPLOY_ROLE_ARN` from the active GitHub environment), so:
@@ -116,7 +116,37 @@ Each GitHub environment carries four variables (set via repo Settings → Enviro
 | `TF_STATE_BUCKET` | `fishhawk-tfstate-<account-id>` |
 | `TF_LOCK_TABLE` | `fishhawk-tfstate-lock` |
 
-The `prod` environment also gets a **required-reviewers** protection rule in the same Settings → Environments page; `dev` is wide-open for the auto-deploy-on-main path.
+Both environments MUST use custom deployment branch policies with exactly one
+entry: branch `main` (not a tag or wildcard). `prod` additionally requires at
+least one reviewer and `prevent_self_review: true`. Disable administrator bypass
+in the environment UI as well (the public REST environment response does not
+expose that setting, so the preflight cannot attest it).
+`infra-apply.yml` reads those live settings in a job without OIDC permission and
+fails closed before AWS authentication if they are missing, malformed or
+unreadable. Its apply job also depends on the reusable fmt/validate check.
+Manual dispatch from a non-main ref is refused. The environment's own rules
+remain the enforcement boundary between the preflight and credential issuance.
+
+Operator rollout tracked in #4887 for #4885 (repository changes alone do not configure GitHub
+or AWS):
+
+1. Set the branch policies above for `dev` and `prod` in Settings → Environments.
+2. Select the actual production reviewer(s), prevent self-review, and disable
+   administrator bypass. Do this BEFORE applying the changed IAM trust policy.
+3. With existing operator AWS credentials, review and apply the trust-policy
+   change for each environment. It matches
+   `repo:kuhlman-labs/fishhawk:environment:<env>` because environment jobs do not
+   receive branch/tag OIDC subjects. If immutable/custom subject claims are
+   enabled for the repository, adjust the exact subject before applying.
+4. Verify role permissions and supply the environment's non-committed tfvars
+   before attempting an apply. The historical role grants ECS deployment
+   operations, not unrestricted Terraform infrastructure administration; this
+   PR deliberately adds no AWS privileges. This legacy ECS stack is awaiting
+   retirement under ADR-073; do not enable or deploy it merely to test CI.
+
+Until these operator steps are completed, apply is expected to refuse. A
+successful `terraform validate` is not evidence that live IAM/protections or
+tfvars are configured.
 
 Expected resources through slice 3 (~50):
 
@@ -142,7 +172,7 @@ Slice 3 (~5 more):
 - 1 dedicated migration task definition (`fishhawkd migrate up`)
 - 1 Secrets Manager *version* — Terraform reads the RDS-managed master password and writes the libpq URL into the existing `database_url` secret
 
-Slice 4 has zero net-new AWS resources; it's purely the GitHub Actions workflow plus a tightening of the OIDC role's trust policy (`sub` now restricts to `main` branch + `backend/v*` tags).
+Slice 4 has zero net-new AWS resources; it's purely the GitHub Actions workflow plus a tightening of the OIDC role's trust policy (`sub` now matches the protected deployment environment; the environment restricts deployment to `main`).
 
 ## Post-apply manual steps
 
