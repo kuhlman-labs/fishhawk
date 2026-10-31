@@ -87,6 +87,11 @@ const mergeDispatchPathQueue = "queue"
 // compare-and-swap; an UNCERTAIN one (a graphql_reread head mismatch
 // included, #4749) moves it to dispatch_failed (MarkMergeDispatchFailed),
 // never deleted, so only reconciliation or the operator re-arm clears it.
+// ADR-109 Amendment A1 (#4711) adds ONE automatic release: merge-on-pass step
+// 8 releases a crash-left QUEUE claim still 'dispatched' (the same CAS
+// DELETE) when the PR reads open and unmerged under the lock
+// (mergeOnPassReleaseOrphanedClaim); a dispatch_failed claim is never
+// released there.
 type mergeDispatchLedger interface {
 	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (claim mergequeue.DispatchClaim, claimed bool, err error)
 	MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error
@@ -210,6 +215,11 @@ const categoryMergeDispatchSettled = "merge_dispatch_settled"
 // Reconciliation outcome on merge_dispatch_settled: a dispatch_failed claim
 // whose PR the forge reports merged.
 const mergeDispatchReconciledMerged = "reconciled_merged"
+
+// mergeDispatchReasonReleasedOrphanedClaim is the merge_dispatch_settled
+// reason (outcome released) for ADR-109 Amendment A1's release of an orphaned
+// queue claim in merge-on-pass step 8 (#4711).
+const mergeDispatchReasonReleasedOrphanedClaim = "released_orphaned_claim"
 
 // mergeDispatchRecordTimeout bounds the post-dispatch ledger write, which
 // runs on context.WithoutCancel so a cancelled request or an expired parent
@@ -351,8 +361,9 @@ const (
 	// outside the lock); the pump continues to the next held entry.
 	mergeOnPassYield mergeOnPassKind = "yield"
 	// mergeOnPassRedecide (ADR-093 D8): the restart resume returned a merging
-	// entry with NO dispatch claim to phase passed; the pump continues, and
-	// ordinary merge-on-pass decides from scratch (fold and veto in-lock).
+	// entry with NO dispatch claim, or with an orphaned queue claim whose PR
+	// reads open (ADR-109 A1, released in step 8), to phase passed; the pump
+	// continues, and ordinary merge-on-pass decides (fold and veto in-lock).
 	mergeOnPassRedecide mergeOnPassKind = "redecide"
 	// mergeOnPassExpiredYielded (ADR-112 R3, #4748): the expired-wait
 	// enforcement (mergeOnPassEnforceExpiredWait) or the merge-gate wait
@@ -435,6 +446,10 @@ const (
 	mergeOnPassReasonBaseMoved             = "base_moved"
 	mergeOnPassReasonHeadMoved             = "head_moved"
 	mergeOnPassReasonForgeHeadMismatch     = "forge_head_mismatch"
+	// mergeOnPassReasonOrphanReleaseFailed (ADR-109 A1, #4711): step 8 judged
+	// the run's queue claim orphaned but its merge_dispatch_settled row or
+	// its release did not land. Not transient: no approval-wait ExpiryYield.
+	mergeOnPassReasonOrphanReleaseFailed = "orphaned_claim_release_failed"
 	// mergeOnPassReasonAuthorizationUnrecorded: the fold approved but the
 	// merge_queue_authorized append failed (ADR-112 R4): no verdict row, no
 	// claim; the next pump re-decides.
@@ -938,7 +953,8 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return held(mergeOnPassReasonVerdictUnrecorded, "the merge verdict could not be recorded (record before commit): "+err.Error())
 	}
 
-	// 8. Approval condition D1: claim the run's ONE merge dispatch.
+	// 8. Approval condition D1: claim the run's ONE merge dispatch (an
+	// orphaned queue claim is released first: ADR-109 A1, below).
 	if req.Ledger == nil {
 		return held(mergeOnPassReasonLedgerUnavailable, "no merge-dispatch ledger is wired, so no dispatch can be claimed")
 	}
@@ -969,6 +985,23 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	claim, claimed, err := req.Ledger.ClaimMergeDispatch(ctx, e.RunID, mergeDispatchPathQueue, head)
 	if err != nil {
 		return held(mergeOnPassReasonTransient, "the merge dispatch could not be claimed: "+err.Error())
+	}
+	if !claimed {
+		// ADR-109 Amendment A1 (#4711): steps 1-7 of THIS decision re-read the
+		// entry and an open, unmerged PR, and re-ran the head, base, fold, R4
+		// authorization and verdict under the lock, so a crash-left queue
+		// claim still 'dispatched' is released here and claimed afresh; the
+		// merge below is the ordinary one (no bespoke retry).
+		released, reason, detail := s.mergeOnPassReleaseOrphanedClaim(ctx, req.Ledger, claim)
+		if reason != "" {
+			return held(reason, detail)
+		}
+		if released {
+			claim, claimed, err = req.Ledger.ClaimMergeDispatch(ctx, e.RunID, mergeDispatchPathQueue, head)
+			if err != nil {
+				return held(mergeOnPassReasonTransient, "the merge dispatch could not be claimed after the orphaned claim's release: "+err.Error())
+			}
+		}
 	}
 	if !claimed {
 		// Reconciliation (ruling R1) is the pre-lock and in-lock PR reads
@@ -1038,6 +1071,42 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return out
 	}
 	return held(mergeOnPassReasonTransient, "the pinned merge failed: "+mergeErr.Error())
+}
+
+// mergeOnPassReleaseOrphanedClaim is ADR-109 Amendment A1's release arm
+// (#4711), called from merge-on-pass step 8 when the run's claim already
+// exists. It acts ONLY on a QUEUE-path claim still 'dispatched' and
+// crash-left on the database clock (mergeQueueClaimCrashLeft: older than
+// mergeQueueCrashLeftClaimAge; a zero claimed_at fails closed); an inline,
+// delegated or dispatch_failed claim, or a young one, returns
+// (false, "", ""): the caller's merge_already_dispatched hold. For an orphan
+// the strict merge_dispatch_settled {released, released_orphaned_claim} row
+// is appended FIRST (record before action), then ReleaseMergeDispatch, the
+// exact-claim CAS DELETE on state 'dispatched'. Either failure returns
+// orphaned_claim_release_failed with the claim standing (an append failure
+// changes nothing; a release failure leaves the row before a claim the next
+// decision re-judges). released=true: the claim is gone and the caller
+// claims afresh.
+func (s *Server) mergeOnPassReleaseOrphanedClaim(ctx context.Context, ledger mergeDispatchLedger, claim mergequeue.DispatchClaim) (released bool, holdReason, detail string) {
+	if claim.Path != mergeDispatchPathQueue || claim.State != mergequeue.DispatchDispatched {
+		return false, "", ""
+	}
+	if aged, _ := s.mergeQueueClaimCrashLeft(ctx, claim); !aged {
+		return false, "", ""
+	}
+	if err := s.appendMergeDispatchSettledStrict(ctx, claim, string(mergeDispatchRelease), mergeDispatchReasonReleasedOrphanedClaim); err != nil {
+		return false, mergeOnPassReasonOrphanReleaseFailed,
+			"the orphaned queue claim's merge_dispatch_settled row could not be recorded, so the claim was not released: " + err.Error()
+	}
+	if err := ledger.ReleaseMergeDispatch(ctx, claim); err != nil {
+		return false, mergeOnPassReasonOrphanReleaseFailed,
+			"the orphaned queue claim could not be released and still stands: " + err.Error()
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"merge queue: released an orphaned queue dispatch claim whose pull request reads open and unmerged (ADR-109 A1); claiming afresh",
+		slog.String("run_id", claim.RunID.String()), slog.String("path", claim.Path),
+		slog.String("head_sha", claim.HeadSHA), slog.Time("claimed_at", claim.ClaimedAt))
+	return true, "", ""
 }
 
 // mergeOnPassRefusalNeedsReview is ADR-112 R3 rows 4/5 after a TYPED forge

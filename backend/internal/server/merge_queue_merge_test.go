@@ -15,6 +15,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -1785,4 +1786,272 @@ func TestMergeQueueGateWait_DefaultsToApprovalWait(t *testing.T) {
 	if got := s.mergeQueueGateWait(); got != 3*time.Minute {
 		t.Fatalf("gate wait = %s, want 3m", got)
 	}
+}
+
+// ADR-109 Amendment A1 (#4711): merge-on-pass step 8 releases an orphaned
+// QUEUE claim. Each test seeds the crash-left state with mqrCrashLeft (a real
+// 502 decision, the claim put back to 'dispatched' with claimed_at backdated
+// against clock_timestamp(), #3048), returns the entry to phase passed in SQL
+// and decides DIRECTLY over the real ledger: routing through the resume would
+// let its own young / non-queue holds mask the step-8 guards.
+
+// mqmOrphan seeds run a on spec with alice's approval at h1, crash-left at
+// claimedAt and back in phase passed, and returns the real-ledger request.
+func (w *mqmWorld) mqmOrphan(spec, claimedAt string) (*mcqRun, mergeOnPassRequest) {
+	w.t.Helper()
+	a := w.seed("a", "h1", []byte(spec))
+	w.mqeRebased(a, "pre-h1", "h1", "h1", false)
+	w.mqePassed(a, "h1")
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+	w.mqrCrashLeft(a, claimedAt)
+	w.exec(`UPDATE merge_candidate_queue_entries SET phase = 'passed' WHERE run_id = $1 AND state = 'live'`, a.id)
+	e := w.active(a)
+	return a, w.realLedger(mergeOnPassRequest{Entry: e, IntentSequence: e.MergeIntentSequence})
+}
+
+// mqmReleasedRows counts a's merge_dispatch_settled rows with outcome
+// released.
+func (w *mqmWorld) mqmReleasedRows(a *mcqRun) int {
+	n := 0
+	for _, row := range w.rows(a, categoryMergeDispatchSettled) {
+		if w.payload(row)["outcome"] == string(mergeDispatchRelease) {
+			n++
+		}
+	}
+	return n
+}
+
+// mqmRequireClaimUnchanged asserts a's stored claim still matches want.
+func (w *mqmWorld) mqmRequireClaimUnchanged(a *mcqRun, want mergequeue.DispatchClaim) {
+	w.t.Helper()
+	got := w.mqrClaim(a)
+	if got.State != want.State || got.Path != want.Path || got.HeadSHA != want.HeadSHA ||
+		got.FailureCause != want.FailureCause || !got.ClaimedAt.Equal(want.ClaimedAt) {
+		w.t.Fatalf("claim = %+v, want unchanged %+v", got, want)
+	}
+}
+
+// DONE-MEANS (A1): an aged queue claim still 'dispatched' whose PR reads open
+// at h1 is released in step 8 (one merge_dispatch_settled {released,
+// released_orphaned_claim} row AFTER this decision's fresh R4 row), claimed
+// afresh and merged ONCE through the ordinary pinned merge. MECHANISM: the
+// fixture's claim still stands, so without the release ClaimMergeDispatch
+// answers claimed=false and the decision holds merge_already_dispatched with
+// zero merges.
+func TestMergeQueueMergeOnPass_OrphanedQueueClaimReleasedThenMerges(t *testing.T) {
+	w := newMQMWorld(t)
+	a, req := w.mqmOrphan(mqeSpecYAML, mqrAged)
+	seed := w.mqrClaim(a)
+	authBefore, settledBefore := w.rows(a, CategoryMergeQueueAuthorized), w.rows(a, categoryMergeDispatchSettled)
+	before := w.mqrCount("h1")
+	requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+	if got := w.mqrCount("h1"); got != before+1 {
+		t.Fatalf("pinned merges at h1 = %d, want %d (one ordinary merge)", got, before+1)
+	}
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	settled := w.rows(a, categoryMergeDispatchSettled)
+	if len(settled) != len(settledBefore)+1 {
+		t.Fatalf("merge_dispatch_settled rows = %d, want %d", len(settled), len(settledBefore)+1)
+	}
+	released := settled[len(settled)-1]
+	sp := w.payload(released)
+	if sp["outcome"] != string(mergeDispatchRelease) || sp["reason"] != mergeDispatchReasonReleasedOrphanedClaim ||
+		sp["path"] != mergeDispatchPathQueue || sp["head_sha"] != "h1" {
+		t.Fatalf("merge_dispatch_settled = %v, want released/released_orphaned_claim for queue@h1", sp)
+	}
+	auth := w.rows(a, CategoryMergeQueueAuthorized)
+	if len(auth) != len(authBefore)+1 {
+		t.Fatalf("merge_queue_authorized rows = %d, want %d (a fresh R4 row)", len(auth), len(authBefore)+1)
+	}
+	fresh := auth[len(auth)-1]
+	for _, row := range append(append([]*audit.Entry{}, authBefore...), settledBefore...) {
+		if fresh.Sequence <= row.Sequence {
+			t.Fatalf("fresh merge_queue_authorized sequence %d is not after the seeding decision's row %d", fresh.Sequence, row.Sequence)
+		}
+	}
+	if released.Sequence <= fresh.Sequence {
+		t.Fatalf("released row %d precedes this decision's R4 row %d; A1 releases only after steps 1-7", released.Sequence, fresh.Sequence)
+	}
+	if c := w.mqrClaim(a); c.State != mergequeue.DispatchDispatched || c.Path != mergeDispatchPathQueue || c.HeadSHA != "h1" ||
+		!c.ClaimedAt.After(seed.ClaimedAt) {
+		t.Fatalf("claim = %+v, want a FRESH dispatched queue claim at h1 claimed after %v", c, seed.ClaimedAt)
+	}
+}
+
+// TestMergeQueueMergeOnPass_OrphanReleaseGuards: one row per A1 guard. Every
+// row is the released fixture but for its one condition, and holds
+// merge_already_dispatched (or, unapproved, awaits approval before step 8)
+// with zero merges, zero released rows and the claim read back unchanged.
+// (a) young (130s, inside the 150s window): CF force the crash-left check
+// true → released + merged. (b)/(c) inline/delegated: CF delete the path
+// condition → released + merged. (d) dispatch_failed queue claim: the real
+// CAS (state = 'dispatched') would refuse a release, so the row asserts zero
+// released ROWS: with the state condition deleted the row-first ordering
+// writes one. (e) a zero claimed_at (the fake ledger's claim): CF delete
+// mergeQueueClaimCrashLeft's IsZero return → the fake releases and merges.
+// (f) an unapproved fold returns await_approval at step 6b, so step 8 never
+// runs: the claim holds the head until approval arrives (ADR-109 A1 point 2).
+func TestMergeQueueMergeOnPass_OrphanReleaseGuards(t *testing.T) {
+	cases := []struct {
+		name      string
+		spec, age string
+		setup     func(w *mqmWorld, a *mcqRun)
+		kind      mergeOnPassKind
+		reason    string
+	}{
+		{name: "young queue claim", spec: mcvUndelegatedSpecYAML, age: mqrYoung,
+			kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "inline claim", spec: mcvUndelegatedSpecYAML, age: mqrAged, setup: func(w *mqmWorld, a *mcqRun) {
+			w.exec(`UPDATE merge_dispatch_claims SET path = 'inline' WHERE run_id = $1`, a.id)
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "delegated claim", spec: mcvUndelegatedSpecYAML, age: mqrAged, setup: func(w *mqmWorld, a *mcqRun) {
+			w.exec(`UPDATE merge_dispatch_claims SET path = 'delegated' WHERE run_id = $1`, a.id)
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "dispatch_failed queue claim", spec: mcvUndelegatedSpecYAML, age: mqrAged, setup: func(w *mqmWorld, a *mcqRun) {
+			w.exec(`UPDATE merge_dispatch_claims SET state = 'dispatch_failed', failed_at = clock_timestamp(), failure_cause = $2 WHERE run_id = $1`,
+				a.id, mergeQueueResumeReasonOrphanedByRestart)
+		}, kind: mergeOnPassHeld, reason: mergeOnPassReasonAlreadyDispatched},
+		{name: "fold not approved", spec: mqeSpecYAML, age: mqrAged, setup: func(w *mqmWorld, a *mcqRun) {
+			w.forgeReviews(a, nil)
+		}, kind: mergeOnPassAwaitApproval, reason: mergeCandidateQueueReasonForgeApprovalAbsent},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			a, req := w.mqmOrphan(tc.spec, tc.age)
+			if tc.setup != nil {
+				tc.setup(w, a)
+			}
+			want := w.mqrClaim(a)
+			releasedBefore, before := w.mqmReleasedRows(a), w.mqrCount("h1")
+			requireOutcome(t, w.decide(req), tc.kind, tc.reason)
+			if got := w.mqrCount("h1"); got != before {
+				t.Fatalf("pinned merges = %d, want %d", got, before)
+			}
+			if n := w.mqmReleasedRows(a); n != releasedBefore {
+				t.Fatalf("released merge_dispatch_settled rows = %d, want %d", n, releasedBefore)
+			}
+			w.mqmRequireClaimUnchanged(a, want)
+		})
+	}
+	t.Run("zero claimed_at", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, req := w.ready("zc", "h1", mcvUndelegatedSpecYAML)
+		w.ledger.claimed[r.id], w.ledger.heads[r.id] = mergeDispatchPathQueue, "h1"
+		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonAlreadyDispatched)
+		w.requireMerges(0)
+		if len(w.ledger.released) != 0 || w.mqmReleasedRows(r) != 0 {
+			t.Fatalf("released = %v rows %d, want none (a zero claimed_at is not crash-left)", w.ledger.released, w.mqmReleasedRows(r))
+		}
+	})
+}
+
+// mqmReleaseErrQueue fails ReleaseMergeDispatch; mqmReclaimErrQueue fails
+// every ClaimMergeDispatch after the first.
+type mqmReleaseErrQueue struct{ *mergequeue.PostgresStore }
+
+func (mqmReleaseErrQueue) ReleaseMergeDispatch(context.Context, mergequeue.DispatchClaim) error {
+	return errors.New("injected release failure")
+}
+
+type mqmReclaimErrQueue struct {
+	*mergequeue.PostgresStore
+	calls *atomic.Int32
+}
+
+func (q mqmReclaimErrQueue) ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, head string) (mergequeue.DispatchClaim, error) {
+	if q.calls.Add(1) > 1 {
+		return mergequeue.DispatchClaim{}, errors.New("injected re-claim failure")
+	}
+	return q.PostgresStore.ClaimMergeDispatch(ctx, runID, path, head)
+}
+
+// TestMergeQueueMergeOnPass_OrphanReleaseFailsClosed: (a) the strict
+// merge_dispatch_settled append fails → hold orphaned_claim_release_failed,
+// zero merges and the COMMITTED claim unchanged (CF: ignore the append error
+// → release + merge); (b) the release CAS fails → the same named hold, after
+// the row (record before action; CF: ignore the release error → the re-claim
+// conflicts and the decision holds merge_already_dispatched instead, RED on
+// the REASON only); (c) the fresh claim after a release fails → transient,
+// no claim row, and the next decision claims and merges (coverage of the
+// re-claim error path). (a) and (b) then drive TWO pump ticks: each tick's
+// resume hands the merging entry back (ONE merge_queue_resumed redecide row
+// per tick) and its merge-on-pass fails the release again, leaving phase
+// merging (approval condition 4).
+func TestMergeQueueMergeOnPass_OrphanReleaseFailsClosed(t *testing.T) {
+	ticks := func(t *testing.T, w *mqmWorld, a *mcqRun, want mergequeue.DispatchClaim, releasedPerTick int) {
+		t.Helper()
+		w.srv.mergeInFlight.clear(a.id) // the pump clears the decision's own mark
+		released := w.mqmReleasedRows(a)
+		before := w.mqrCount("h1")
+		for tick := 1; tick <= 2; tick++ {
+			w.srv.PumpMergeCandidateQueues(context.Background())
+			if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseMerging {
+				t.Fatalf("tick %d: A = %s/%s, want live merging", tick, e.State, e.Phase)
+			}
+			res := w.mqrResumed(a)
+			if len(res) != tick {
+				t.Fatalf("tick %d: merge_queue_resumed rows = %d, want exactly %d (one redecide per tick)", tick, len(res), tick)
+			}
+			if p := res[tick-1]; p["action"] != mergeQueueResumeActionRedecide || p["reason"] != mergeQueueResumeReasonOrphanedClaimOpen {
+				t.Fatalf("tick %d: merge_queue_resumed = %v, want redecide/orphaned_claim_open", tick, p)
+			}
+			if n := w.mqmReleasedRows(a); n != released+tick*releasedPerTick {
+				t.Fatalf("tick %d: released rows = %d, want %d", tick, n, released+tick*releasedPerTick)
+			}
+			if got := w.mqrCount("h1"); got != before {
+				t.Fatalf("tick %d: pinned merges = %d, want %d", tick, got, before)
+			}
+			w.mqmRequireClaimUnchanged(a, want)
+		}
+	}
+	t.Run("settled row append fails", func(t *testing.T) {
+		w := newMQMWorld(t)
+		a, req := w.mqmOrphan(mcvUndelegatedSpecYAML, mqrAged)
+		want := w.mqrClaim(a)
+		before := w.mqrCount("h1")
+		w.audit.failCategory = categoryMergeDispatchSettled
+		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonOrphanReleaseFailed)
+		if got := w.mqrCount("h1"); got != before {
+			t.Fatalf("pinned merges = %d, want %d", got, before)
+		}
+		w.mqmRequireClaimUnchanged(a, want)
+		ticks(t, w, a, want, 0)
+	})
+	t.Run("release fails", func(t *testing.T) {
+		w := newMQMWorld(t)
+		a, _ := w.mqmOrphan(mcvUndelegatedSpecYAML, mqrAged)
+		want := w.mqrClaim(a)
+		released, before := w.mqmReleasedRows(a), w.mqrCount("h1")
+		w.srv.cfg.MergeQueue = mqmReleaseErrQueue{w.store}
+		e := w.active(a)
+		req := w.realLedger(mergeOnPassRequest{Entry: e, IntentSequence: e.MergeIntentSequence})
+		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonOrphanReleaseFailed)
+		if got := w.mqrCount("h1"); got != before {
+			t.Fatalf("pinned merges = %d, want %d", got, before)
+		}
+		if n := w.mqmReleasedRows(a); n != released+1 {
+			t.Fatalf("released rows = %d, want %d (recorded before the failed CAS)", n, released+1)
+		}
+		w.mqmRequireClaimUnchanged(a, want)
+		ticks(t, w, a, want, 1)
+	})
+	t.Run("re-claim fails after the release", func(t *testing.T) {
+		w := newMQMWorld(t)
+		a, _ := w.mqmOrphan(mcvUndelegatedSpecYAML, mqrAged)
+		before := w.mqrCount("h1")
+		w.srv.cfg.MergeQueue = mqmReclaimErrQueue{PostgresStore: w.store, calls: new(atomic.Int32)}
+		e := w.active(a)
+		req := w.realLedger(mergeOnPassRequest{Entry: e, IntentSequence: e.MergeIntentSequence})
+		requireOutcome(t, w.decide(req), mergeOnPassHeld, mergeOnPassReasonTransient)
+		if got := w.mqrCount("h1"); got != before {
+			t.Fatalf("pinned merges = %d, want %d", got, before)
+		}
+		w.requireClaim(a, "")
+		w.srv.cfg.MergeQueue = w.store
+		requireOutcome(t, w.decide(w.realLedger(req)), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+		if got := w.mqrCount("h1"); got != before+1 {
+			t.Fatalf("pinned merges after recovery = %d, want %d", got, before+1)
+		}
+	})
 }
