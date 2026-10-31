@@ -103,13 +103,16 @@ type mergeDispatchLedger interface {
 
 // mergeOnPassReconcileMerged reconciles a pull request the forge reports
 // merged against the run's D1 claim (ruling R1 reconciliation): settle merged
-// only when there is no claim, or the claim names the merged head; a
+// only when there is no claim, or the claim names the merged head
+// (mergeDispatchClaimNamesHead: the exact head, or the unresolved head an
+// inline/delegated claim records when the gate head is empty, #4617); a
 // dispatch_failed claim that reconciles appends merge_dispatch_settled
-// reconciled_merged. ok=false holds with reason: the claim could not be read
+// reconciled_merged, at most once per run (appendReconciledMergedOnce).
+// ok=false holds with reason: the claim could not be read
 // (merged_claim_unread, #4748 M1: never transient, so the hold carries no
 // approval-wait ExpiryYield and an already-merged entry is never yielded), or
-// it names a different head than the one that merged. A nil ledger has no
-// claim to read.
+// it names a different concrete head than the one that merged. A nil ledger
+// has no claim to read.
 func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string) {
 	ok, reason, detail, err := s.mergeOnPassReconcileMergedStrict(ctx, ledger, runID, mergedHead)
 	if err != nil {
@@ -121,7 +124,10 @@ func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDis
 
 // mergeOnPassReconcileMergedStrict is mergeOnPassReconcileMerged returning the
 // reconciled_merged row's append error (ok stays true: the reconcile decision
-// stands); the ADR-093 D8 resume holds on it (fail closed, ruling R8d).
+// stands); the ADR-093 D8 resume holds on it (fail closed, ruling R8d). A
+// reconciled_merged row already on the run's chain is not an error: the deduped
+// writer reports it as success, so a re-decide after a SettleAt CAS conflict
+// records the reconciliation once (#4617).
 func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string, appendErr error) {
 	if ledger == nil {
 		return true, "", "", nil
@@ -133,7 +139,7 @@ func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger me
 	if !found {
 		return true, "", "", nil
 	}
-	if claim.HeadSHA != mergedHead {
+	if !mergeDispatchClaimNamesHead(claim, mergedHead) {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: the pull request merged at a head the run's dispatch claim does not name; holding",
 			slog.String("run_id", runID.String()), slog.String("claim_head_sha", claim.HeadSHA),
@@ -142,9 +148,27 @@ func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger me
 			"the pull request merged at " + mergedHead + " but the run's dispatch claim (" + string(claim.State) + ", " + claim.Path + ") names " + claim.HeadSHA, nil
 	}
 	if claim.State == mergequeue.DispatchFailed {
-		appendErr = s.appendMergeDispatchSettledStrict(ctx, claim, mergeDispatchReconciledMerged, "the forge reports the pull request merged at the claim's head")
+		reason := "the forge reports the pull request merged at the claim's head"
+		if claim.HeadSHA == mergeDispatchClaimHeadUnresolved {
+			reason = "the forge reports the pull request merged at " + mergedHead + "; the claim recorded no head"
+		}
+		appendErr = s.appendReconciledMergedOnce(ctx, claim, reason)
 	}
 	return true, "", "", appendErr
+}
+
+// mergeDispatchClaimNamesHead reports whether a D1 claim names head, the head
+// the pull request merged at: the claim's recorded head equals it, or the
+// claim recorded mergeDispatchClaimHeadUnresolved. An unresolved claim
+// matches ANY merged head: no head was pinned or recorded and its dispatch was
+// unpinned, so the merged head cannot contradict the claim, and holding would
+// only delay the entry's pr_merged settle until the PR-resolution webhook
+// (#4617). A concrete claim head that differs still does not match. The ONE
+// predicate merge-on-pass reconciliation (mergeOnPassReconcileMergedStrict)
+// and the ADR-093 D8 resume's merged switch (mergeQueueResumeMergeLocked)
+// share.
+func mergeDispatchClaimNamesHead(claim mergequeue.DispatchClaim, head string) bool {
+	return claim.HeadSHA == head || claim.HeadSHA == mergeDispatchClaimHeadUnresolved
 }
 
 // mergeDispatchLedgerOutcome classifies a failed forge dispatch made after a D1
@@ -213,8 +237,17 @@ func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 const categoryMergeDispatchSettled = "merge_dispatch_settled"
 
 // Reconciliation outcome on merge_dispatch_settled: a dispatch_failed claim
-// whose PR the forge reports merged.
+// whose PR the forge reports merged. Recorded at most once per run
+// (appendReconciledMergedOnce).
 const mergeDispatchReconciledMerged = "reconciled_merged"
+
+// mergeDispatchClaimHeadUnresolved is the head an inline or delegated D1 claim
+// records when the gate head is empty (an ungated D7 admit, or a merged PR):
+// the claim is run-scoped and its dispatch is unpinned. Queue claims never
+// record it: merge-on-pass step 8 and ADR-109 Amendment A1's re-claim (#4711)
+// both claim at the entry's non-empty head. mergeDispatchClaimNamesHead lets
+// such a claim reconcile against whatever head the PR merged at (#4617).
+const mergeDispatchClaimHeadUnresolved = "unresolved"
 
 // mergeDispatchReasonReleasedOrphanedClaim is the merge_dispatch_settled
 // reason (outcome released) for ADR-109 Amendment A1's release of an orphaned
@@ -302,12 +335,20 @@ func (s *Server) appendMergeDispatchSettledStrict(ctx context.Context, claim mer
 	return s.appendMergeDispatchSettledPayload(ctx, claim, outcome, reason, nil)
 }
 
-// appendMergeDispatchSettledPayload is the one merge_dispatch_settled row
-// builder: the base keys plus any extra keys, returning the append error.
+// appendMergeDispatchSettledPayload appends one merge_dispatch_settled row
+// built by mergeDispatchSettledParams, returning the append error.
 func (s *Server) appendMergeDispatchSettledPayload(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) error {
 	if s.cfg.AuditRepo == nil {
 		return errors.New("merge_dispatch_settled: no audit repository is wired")
 	}
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, mergeDispatchSettledParams(claim, outcome, reason, extra))
+	return err
+}
+
+// mergeDispatchSettledParams is the one merge_dispatch_settled row builder:
+// any extra keys first, then the base keys (outcome, path, head_sha, reason)
+// win, under the system actor mergeCandidateSystemSubject.
+func mergeDispatchSettledParams(claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) audit.ChainAppendParams {
 	fields := make(map[string]any, len(extra)+4)
 	for k, v := range extra {
 		fields[k] = v
@@ -315,14 +356,69 @@ func (s *Server) appendMergeDispatchSettledPayload(ctx context.Context, claim me
 	fields["outcome"], fields["path"], fields["head_sha"], fields["reason"] = outcome, claim.Path, claim.HeadSHA, reason
 	payload, _ := json.Marshal(fields)
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
-	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	return audit.ChainAppendParams{
 		RunID:        claim.RunID,
 		Timestamp:    time.Now().UTC(),
 		Category:     categoryMergeDispatchSettled,
 		ActorKind:    &kind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	})
+	}
+}
+
+// appendReconciledMergedOnce is the ONE writer of merge_dispatch_settled
+// outcome reconciled_merged (#4617): merge-on-pass reconciliation
+// (mergeOnPassReconcileMergedStrict), the ADR-093 D8 resume's merged tail
+// (mergeQueueResumeMergedTail) and the inline claim's reconciliation
+// (claimInlineMergeDispatch) all route through it. The dedupe key is (run,
+// outcome): a PR merges once, so every reconciled_merged row on a run
+// describes the same merge. A row already recorded is success (nil), so a
+// re-decide after a SettleAt CAS conflict, or a resume after an earlier
+// reconcile, never appends a second row nor holds.
+//
+// Capability path: a repository implementing audit.DedupedChainAppender (the
+// production Postgres repository) scans and appends in ONE transaction under
+// the run-row lock; a *audit.DedupedDuplicateError is the already-recorded
+// branch (nil, with a DEBUG line naming the surviving sequence). Fallback (the
+// in-memory fakes): list the category, audit.CheckDedupeSpec, then append. It
+// is NOT atomic, and a list error logs WARN and proceeds: a duplicate row is
+// the lesser harm than a lost one (the appendRetirementDropOnce posture). The
+// residual is stated plainly: only the Postgres path is atomic.
+func (s *Server) appendReconciledMergedOnce(ctx context.Context, claim mergequeue.DispatchClaim, reason string) error {
+	if s.cfg.AuditRepo == nil {
+		return errors.New("merge_dispatch_settled: no audit repository is wired")
+	}
+	spec := audit.DedupeSpec{PayloadKey: "outcome", PayloadValue: mergeDispatchReconciledMerged}
+	p := mergeDispatchSettledParams(claim, mergeDispatchReconciledMerged, reason, nil)
+	alreadyRecorded := func(err error) bool {
+		var dup *audit.DedupedDuplicateError
+		if !errors.As(err, &dup) {
+			return false
+		}
+		var existing int64
+		if dup.Existing != nil {
+			existing = dup.Existing.Sequence
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+			"merge dispatch: reconciled_merged is already recorded for this run; no second row is appended",
+			slog.String("run_id", claim.RunID.String()), slog.Int64("existing_sequence", existing))
+		return true
+	}
+	if d, ok := s.cfg.AuditRepo.(audit.DedupedChainAppender); ok {
+		_, err := d.AppendChainedDeduped(ctx, p, spec)
+		if alreadyRecorded(err) {
+			return nil
+		}
+		return err
+	}
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, claim.RunID, categoryMergeDispatchSettled); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge dispatch: listing merge_dispatch_settled failed; appending reconciled_merged without the idempotency guard",
+			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
+	} else if err := audit.CheckDedupeSpec(entries, &p, spec); alreadyRecorded(err) {
+		return nil
+	}
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, p)
 	return err
 }
 

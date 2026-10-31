@@ -15,10 +15,15 @@ package server
 // re-read under the run's merge-intent lock and reconciles:
 //
 //   - merged at a QUEUE claim's head → the normal merged tail (Resume=true:
-//     merge_queue_merged written only when no row names the entry);
+//     merge_queue_merged written only when no row names the entry); a
+//     reconciled_merged row already on the chain is success (#4617);
 //   - merged with no claim, or another path's claim at the merged head →
-//     settled merged pr_merged, the claim untouched;
-//   - merged at a head the claim does not name → hold;
+//     settled merged pr_merged, the claim untouched; an inline/delegated
+//     claim at head `unresolved` names any merged head
+//     (mergeDispatchClaimNamesHead, #4617), so it settles here too, with no
+//     reconciled_merged row (an unresolved dispatch_failed claim heals on
+//     the next inline merge_run's claimInlineMergeDispatch);
+//   - merged at a concrete head the claim does not name → hold;
 //   - merging, PR open and unmerged, with a crash-left QUEUE claim still
 //     dispatched → redecide (orphaned_claim_open): back to passed with NO
 //     ledger write, and ordinary merge-on-pass RELEASES the orphaned claim in
@@ -336,15 +341,17 @@ func (s *Server) mergeQueueResumeMergeLocked(ctx context.Context, e mergequeue.E
 
 	if merged {
 		switch {
-		case hasClaim && claim.HeadSHA != pr.HeadSHA:
+		case hasClaim && !mergeDispatchClaimNamesHead(claim, pr.HeadSHA):
 			r := claimFields(claim)
 			return holdRow(mergeOnPassReasonMergedClaimMismatch,
 				"the pull request merged at "+pr.HeadSHA+" but the run's dispatch claim names "+claim.HeadSHA, r)
 		case hasClaim && claim.Path == mergeDispatchPathQueue:
 			return s.mergeQueueResumeMergedTail(ctx, cur, claim, pr, record, unrecorded, held)
 		}
-		// No claim, or another path's claim at the merged head: the merge is
-		// a fact; the claim is untouched (C1).
+		// No claim, or another path's claim at the merged head (an
+		// inline/delegated claim at head `unresolved` included, #4617): the
+		// merge is a fact; the claim is untouched (C1) and no
+		// reconciled_merged row is written here.
 		r := mergeQueueResumed{Action: mergeQueueResumeActionSettlePRMerged, Reason: mergeCandidateQueueReasonPRMerged}
 		if hasClaim {
 			r.ClaimState, r.ClaimPath, r.ClaimHeadSHA = string(claim.State), claim.Path, claim.HeadSHA
@@ -490,8 +497,10 @@ func (s *Server) mergeQueueClaimCrashLeft(ctx context.Context, claim mergequeue.
 // mergeQueueResumeMergedTail settles a PR merged at its QUEUE claim's head:
 // the tail references (ruling R4) are read back; a DECLARED approval gate
 // with no matching merge_queue_authorized row holds (C6a); then the
-// settle_merged row (merge_actor_verified, C6b), the strict reconciled_merged
-// row for a dispatch_failed claim, and the merged tail with Resume=true.
+// settle_merged row (merge_actor_verified, C6b), the deduped reconciled_merged
+// row for a dispatch_failed claim (appendReconciledMergedOnce: a row already
+// recorded is success, a real append error holds resume_unrecorded, #4617),
+// and the merged tail with Resume=true.
 func (s *Server) mergeQueueResumeMergedTail(ctx context.Context, cur mergequeue.Entry, claim mergequeue.DispatchClaim, pr *forge.PullRequest,
 	record func(mergeQueueResumed) bool, unrecorded func(string) mergeOnPassOutcome,
 	held func(string, string) mergeOnPassOutcome) mergeOnPassOutcome {
@@ -522,7 +531,7 @@ func (s *Server) mergeQueueResumeMergedTail(ctx context.Context, cur mergequeue.
 		return unrecorded("merge_queue_resumed")
 	}
 	if claim.State == mergequeue.DispatchFailed {
-		if err := s.appendMergeDispatchSettledStrict(ctx, claim, mergeDispatchReconciledMerged,
+		if err := s.appendReconciledMergedOnce(ctx, claim,
 			"the forge reports the pull request merged at the claim's head"); err != nil {
 			return unrecorded("merge_dispatch_settled (" + err.Error() + ")")
 		}
