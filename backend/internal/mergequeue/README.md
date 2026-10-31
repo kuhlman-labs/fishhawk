@@ -460,7 +460,8 @@ change nothing (ADR-093 slice 2, rejection item 1):
   `merged_claim_head_mismatch` (WARN); the inline answer is
   `already_merged`. On both paths a reconciled `dispatch_failed` claim
   appends `merge_dispatch_settled` `reconciled_merged`. Unmerged → the claim
-  stands: merge-on-pass holds
+  stands (except a crash-left queue claim still `dispatched`, which
+  merge-on-pass releases: "Crash-left claims" below): merge-on-pass holds
   `merge_already_dispatched` (WARN), the inline answer is
   `409 merge_already_dispatched` naming the claim, and the merge-queue read
   surfaces it on the entry (`dispatch_claim`: state, path, head, age,
@@ -474,38 +475,72 @@ change nothing (ADR-093 slice 2, rejection item 1):
   operator then re-invokes `fishhawk_merge_run`. On the QUEUE path no
   `fishhawk_merge_run` re-invocation is needed: the queue's next pump
   re-decides from scratch (the ADR-112 forge-approval fold and veto run
-  in-lock) and merges at most once. A `dispatched` claim is never re-armed:
-  its merge was handed to the forge.
-- **Crash-left claims (ADR-093 D8, #4298).** A process that dies between
-  `ClaimMergeDispatch` and classifying the forge outcome leaves a
-  `dispatched` claim no live process owns. The server's restart resume
-  (`backend/internal/server/README.md` § "Merge-queue durability (ADR-093
-  D8)") reconciles it with ONE forge re-read under the run's merge-intent
-  lock, and adds NO ledger transition and dispatches NO merge (ADR-109):
-  - Only a `queue`-path claim is ever reconciled. An `inline` or `delegated`
-    claim stays `dispatched` while the forge's auto-merge is armed, which is
-    normal, as is a GitLab claim: the resume never transitions, releases or
-    rewrites one, and any arm meeting one holds with no ledger write.
-  - A queue claim is crash-left only when the resume observes it while
-    HOLDING the merge-intent lock AND its `claimed_at` is older than the
-    database clock (`DatabaseNow`, never Go `time.Now()`) minus
-    `IntentFnTimeout` (the ADR-108 lock fn deadline) + the pinned merge-call
-    timeout + a margin (the server names the constant and its derivation).
-    There is no boot-time cutoff: a younger claim holds with nothing written
-    (`merge_dispatch_in_progress`) and a later tick re-decides.
+  in-lock) and merges at most once. A `dispatched` claim is never re-armed
+  by the operator: its merge was handed to the forge (a crash-left queue
+  one is released by ADR-109 Amendment A1, below).
+- **Crash-left claims (ADR-093 D8, #4298; ADR-109 Amendment A1, #4711).** A
+  process that dies between `ClaimMergeDispatch` and classifying the forge
+  outcome leaves a `dispatched` claim no live process owns. The server's
+  restart resume (`backend/internal/server/README.md` § "Merge-queue
+  durability (ADR-093 D8)") reconciles it with ONE forge re-read under the
+  run's merge-intent lock, and itself adds NO ledger transition and
+  dispatches NO merge (ADR-109); A1's release happens in merge-on-pass:
+  - Only a `queue`-path claim is ever reconciled or released. An `inline` or
+    `delegated` claim stays `dispatched` while the forge's auto-merge is
+    armed, which is normal, as is a GitLab claim: neither the resume nor
+    merge-on-pass ever transitions, releases or rewrites one, and any arm
+    meeting one holds with no ledger write.
+  - A queue claim is crash-left only when it is observed while HOLDING the
+    merge-intent lock AND its `claimed_at` is older than the database clock
+    (`DatabaseNow`, never Go `time.Now()`) minus `IntentFnTimeout` (the
+    ADR-108 lock fn deadline) + the pinned merge-call timeout + a margin (the
+    server names the constant and its derivation); a zero `claimed_at`, an
+    unreadable clock or a store with no database clock is never crash-left
+    (fail closed). There is no boot-time cutoff: a younger claim holds with
+    nothing written (`merge_dispatch_in_progress`) and a later tick
+    re-decides.
   - Merged at the claimed head → the normal merged reconcile and tail.
-    Closed unmerged → the entry settles closed. Not merged (PR open), or an
-    indeterminate read → the EXISTING `MarkMergeDispatchFailed(run,
-    "orphaned_by_restart")` (its `merge_dispatch_settled` row carries reason
-    `orphaned_by_restart`), then the entry HOLDS with a remedy naming the
-    operator re-arm above. The queue-path re-arm needs NO
-    `fishhawk_merge_run` re-invocation: the next pump re-decides. An entry
-    in phase `settling` (the forge accepted) is never orphaned: PR open or
-    an indeterminate read holds `settling_unconfirmed` with no ledger write.
-  - Nothing is retried or released automatically: the retry-once and the
-    moved head/base release wait for ADR-109 Amendment A1, and any later
-    automatic retry must re-run the ADR-112 forge-approval fold and veto
-    in-lock, failing closed, before calling the forge.
+    Closed unmerged → the EXISTING `MarkMergeDispatchFailed(run,
+    "orphaned_by_restart")` and the entry settles closed.
+  - Not merged, PR OPEN (A1) → the resume records `merge_queue_resumed`
+    `{redecide, orphaned_claim_open}` and returns the entry to `passed` with
+    no ledger write. Ordinary merge-on-pass then re-runs steps 1-7 under the
+    lock (entry, PR, head, base, the ADR-112 forge-approval fold, the R4
+    `merge_queue_authorized` row, the verdict) and, in step 8's not-claimed
+    branch ONLY, releases the claim: a strict `merge_dispatch_settled`
+    `{released, released_orphaned_claim}` row FIRST, then
+    `ReleaseMergeDispatch` (the CAS DELETE on `state = 'dispatched'`), then a
+    fresh `ClaimMergeDispatch` and the ordinary pinned merge (at most one
+    extra pinned merge call per restart; no bespoke retry). A failed row or
+    release holds `orphaned_claim_release_failed` with the claim standing.
+    The release is CONDITIONAL on that decision's fold approving: while the
+    fold is not approved the decision waits at step 6b (`await_approval`),
+    the PR still needs a qualifying approval, and the orphaned claim keeps
+    holding the head of the line until it arrives or the operator acts; the
+    ADR-109 pre-yield refusal still never yields a claimed entry.
+  - Not merged, PR read INDETERMINATE (a failed read) → the EXISTING
+    `MarkMergeDispatchFailed(run, "orphaned_by_restart")` (its
+    `merge_dispatch_settled` row carries reason `orphaned_by_restart`), then
+    the entry HOLDS with a remedy naming the operator re-arm above. The
+    queue-path re-arm needs NO `fishhawk_merge_run` re-invocation: the next
+    pump re-decides. An entry in phase `settling` (the forge accepted) is
+    never orphaned: PR open or an indeterminate read holds
+    `settling_unconfirmed` with no ledger write.
+  - What A1 changed and what stays operator-only: the open-PR release above
+    is the ONE automatic release of a `dispatched` claim. A `dispatch_failed`
+    claim (an uncertain outcome, or `orphaned_by_restart`, including those
+    left before A1) is NEVER released automatically: only reconciliation or
+    the operator re-arm clears it. Nothing is retried in a loop; the
+    retry-once and the moved head/base release are not implemented, and any
+    later automatic retry must re-run the ADR-112 forge-approval fold and
+    veto in-lock, failing closed, before calling the forge.
+  - Visibility: the merge-queue read labels a queue claim
+    `dispatch_claim.orphan` (`orphaned`: still `dispatched` and crash-left on
+    the database clock; `orphaned_by_restart`: `dispatch_failed` with that
+    cause, awaiting the re-arm), and the run read's
+    `merge_candidate_queue.dispatch_claim_orphan` carries the same label. A
+    released claim is deleted, so its record is the `released_orphaned_claim`
+    audit row.
 
 ## Reasons
 

@@ -151,14 +151,17 @@ func TestMergeQueueResume_MergingPRAlreadyMerged_SettlesWithoutMerge(t *testing.
 	}
 }
 
-// DONE-MEANS 2, restated per R1 (and C2/C3, counterfactual B2): PR open and
-// unmerged at the claim's head, claim aged past the window → zero merge
-// calls, the claim moves to dispatch_failed with cause orphaned_by_restart,
-// one merge_dispatch_settled {dispatch_failed, orphaned_by_restart} precedes
-// one hold row naming the operator re-arm, and B is not admitted. A second
-// restart writes nothing. After the documented re-arm the next pump
-// re-decides and merges ONCE at h1.
-func TestMergeQueueResume_MergingUnmerged_HeldRemedyNamed(t *testing.T) {
+// DONE-MEANS 2, restated per R1 (and C2/C3, counterfactual B2), re-targeted
+// by ADR-109 Amendment A1 (#4711) to the INDETERMINATE arm, since A1 moves
+// the open-unmerged PR to merge-on-pass's release: the PR cannot be read,
+// claim aged past the window → zero merge calls, the claim moves to
+// dispatch_failed with cause orphaned_by_restart, one merge_dispatch_settled
+// {dispatch_failed, orphaned_by_restart} precedes one hold row naming the
+// operator re-arm, and B is not admitted. A second restart (PR readable and
+// open) writes nothing. After the documented re-arm the next pump re-decides
+// and merges ONCE at h1. CF: route the indeterminate read to redecide → the
+// claim stays dispatched, RED.
+func TestMergeQueueResume_IndeterminateRead_HeldRemedyNamed(t *testing.T) {
 	w := newMQMWorld(t)
 	a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
 	w.mqeRebased(a, "pre-h1", "h1", "h1", false)
@@ -166,8 +169,14 @@ func TestMergeQueueResume_MergingUnmerged_HeldRemedyNamed(t *testing.T) {
 	b := w.mqrCrashLeft(a, mqrAged)
 	settledBefore := len(w.rows(a, categoryMergeDispatchSettled))
 	before := w.mqrCount("h1")
+	w.mu.Lock()
+	w.prReadFail = true
+	w.mu.Unlock()
 	w.mqrRestart()
 	w.mqrBoot()
+	w.mu.Lock()
+	w.prReadFail = false
+	w.mu.Unlock()
 	if got := w.mqrCount("h1"); got != before {
 		t.Fatalf("pinned merges = %d, want %d", got, before)
 	}
@@ -220,7 +229,9 @@ func TestMergeQueueResume_MergingUnmerged_HeldRemedyNamed(t *testing.T) {
 
 // C2: a queue claim seeded just INSIDE the crash-left window (relative to the
 // database clock) holds with nothing written; the same claim aged past the
-// window moves to dispatch_failed.
+// window, its PR open and unmerged, is handed to merge-on-pass (ADR-109 A1:
+// redecide orphaned_claim_open) with NO resume ledger write. CF: re-add a
+// MarkMergeDispatchFailed on the hand-over arm → RED on the read-back.
 func TestMergeQueueResume_YoungQueueClaimHolds(t *testing.T) {
 	w := newMQMWorld(t)
 	a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
@@ -238,9 +249,13 @@ func TestMergeQueueResume_YoungQueueClaimHolds(t *testing.T) {
 		t.Fatalf("rows written for a young claim: settled=%d resumed=%d", n, len(w.mqrResumed(a)))
 	}
 	w.exec(`UPDATE merge_dispatch_claims SET claimed_at = `+mqrAged+` WHERE run_id = $1`, a.id)
-	requireOutcome(t, w.srv.mergeQueueResumeMerge(context.Background(), w.active(a)), mergeOnPassHeld, mergeQueueResumeReasonDispatchUncertain)
-	if c := w.mqrClaim(a); c.State != mergequeue.DispatchFailed {
-		t.Fatalf("aged claim = %+v, want dispatch_failed", c)
+	aged := w.mqrClaim(a)
+	requireOutcome(t, w.srv.mergeQueueResumeMerge(context.Background(), w.active(a)), mergeOnPassRedecide, mergeQueueResumeReasonOrphanedClaimOpen)
+	if c := w.mqrClaim(a); c.State != mergequeue.DispatchDispatched || c.FailureCause != "" || !c.ClaimedAt.Equal(aged.ClaimedAt) {
+		t.Fatalf("aged claim = %+v, want still dispatched and unchanged (the resume makes no ledger write)", c)
+	}
+	if n := len(w.rows(a, categoryMergeDispatchSettled)); n != settledBefore {
+		t.Fatalf("merge_dispatch_settled rows = %d, want %d (no resume ledger write)", n, settledBefore)
 	}
 }
 
@@ -327,6 +342,19 @@ func TestMergeQueueResume_MergeArms(t *testing.T) {
 				t.Fatalf("merge_dispatch_settled outcomes = %v, want a final reconciled_merged", got)
 			}
 		}},
+		{name: "open unmerged, aged queue claim (ADR-109 A1 hand-over)", setup: func(*mqmWorld, *mcqRun) {},
+			kind: mergeOnPassRedecide, reason: mergeQueueResumeReasonOrphanedClaimOpen, check: func(t *testing.T, w *mqmWorld, a *mcqRun) {
+				claimState(mergequeue.DispatchDispatched)(t, w, a)
+				if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+					t.Fatalf("entry = %s/%s, want live passed", e.State, e.Phase)
+				}
+				res := w.mqrResumed(a)
+				if len(res) != 1 || res[0]["action"] != mergeQueueResumeActionRedecide || res[0]["reason"] != mergeQueueResumeReasonOrphanedClaimOpen ||
+					res[0]["next_step"] != string(mergequeue.PhasePassed) || res[0]["claim_state"] != string(mergequeue.DispatchDispatched) ||
+					res[0]["claim_path"] != mergeDispatchPathQueue || res[0]["claim_head_sha"] != "h1" {
+					t.Fatalf("merge_queue_resumed = %v, want one redecide/orphaned_claim_open naming the dispatched queue claim at h1", res)
+				}
+			}},
 		{name: "closed unmerged dispatched claim", setup: func(w *mqmWorld, a *mcqRun) {
 			w.mqrPR(a, false, "closed")
 		}, kind: mergeOnPassSettle, reason: mergeCandidateQueueReasonPRClosed, check: claimState(mergequeue.DispatchFailed)},
@@ -451,6 +479,67 @@ func TestMergeQueueResume_MergingNoClaimRedecides(t *testing.T) {
 	}
 }
 
+// ADR-109 Amendment A1 (#4711), end to end through a restart: a crash-left
+// queue claim still 'dispatched' whose PR reads open and unmerged → the
+// resume hands the entry back (ONE merge_queue_resumed {redecide,
+// orphaned_claim_open} row), merge-on-pass re-runs steps 1-7 (a fresh
+// merge_queue_authorized row), releases the claim (merge_dispatch_settled
+// {released, released_orphaned_claim}, AFTER the redecide row), claims afresh
+// and merges ONCE at h1; B is admitted after A, and a second restart writes
+// nothing. CF-A: route the open arm back to mergeQueueResumeOrphan → the
+// claim is dispatch_failed with zero merges, RED. CF-B: the release body
+// returns (false, "", "") → hold merge_already_dispatched, zero merges, RED.
+func TestMergeQueueResume_OrphanedOpenClaimReleasedThenMergesOnce(t *testing.T) {
+	w := newMQMWorld(t)
+	a := w.seed("a", "h1", []byte(mqeSpecYAML))
+	w.mqeRebased(a, "pre-h1", "h1", "h1", false)
+	w.mqePassed(a, "h1")
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "APPROVED", "h1"))
+	b := w.mqrCrashLeft(a, mqrAged)
+	authBefore := len(w.rows(a, CategoryMergeQueueAuthorized))
+	before := w.mqrCount("h1")
+	w.mqrRestart()
+	w.mqrBoot()
+	if got := w.mqrCount("h1"); got != before+1 {
+		t.Fatalf("pinned merges at h1 after the restart = %d, want %d (merged once)", got, before+1)
+	}
+	w.requireState(a, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	res := w.rows(a, CategoryMergeQueueResumed)
+	if len(res) != 1 {
+		t.Fatalf("merge_queue_resumed rows = %d, want 1", len(res))
+	}
+	if p := w.payload(res[0]); p["action"] != mergeQueueResumeActionRedecide || p["reason"] != mergeQueueResumeReasonOrphanedClaimOpen {
+		t.Fatalf("merge_queue_resumed = %v, want redecide/orphaned_claim_open", p)
+	}
+	var released *audit.Entry
+	for _, row := range w.rows(a, categoryMergeDispatchSettled) {
+		if p := w.payload(row); p["outcome"] == string(mergeDispatchRelease) && p["reason"] == mergeDispatchReasonReleasedOrphanedClaim {
+			if released != nil {
+				t.Fatal("more than one released_orphaned_claim row")
+			}
+			released = row
+		}
+	}
+	if released == nil || released.Sequence <= res[0].Sequence {
+		t.Fatalf("released row = %v, want one after the redecide row %d", released, res[0].Sequence)
+	}
+	if n := len(w.rows(a, CategoryMergeQueueAuthorized)); n != authBefore+1 {
+		t.Fatalf("merge_queue_authorized rows = %d, want %d (a fresh R4 row)", n, authBefore+1)
+	}
+	if e := w.storeEntry(b); e.State != mergequeue.StateLive && e.State != mergequeue.StateMerged {
+		t.Fatalf("B = %s, want admitted after A settled", e.State)
+	}
+	resumed, settled := len(w.rows(a, CategoryMergeQueueResumed)), len(w.rows(a, categoryMergeDispatchSettled))
+	w.mqrRestart()
+	w.mqrBoot()
+	if r, st := len(w.rows(a, CategoryMergeQueueResumed)), len(w.rows(a, categoryMergeDispatchSettled)); r != resumed || st != settled {
+		t.Fatalf("rows after a second restart: resumed %d settled %d, want %d and %d", r, st, resumed, settled)
+	}
+	if got := w.mqrCount("h1"); got != before+1 {
+		t.Fatalf("pinned merges after a second restart = %d, want %d", got, before+1)
+	}
+}
+
 // Counterfactual B5 (ruling R4): a merge_queue_merged row naming the entry
 // already exists (a crash after the append, before the settle) → the resume
 // settles with still exactly one row.
@@ -476,14 +565,24 @@ func TestMergeQueueResume_AppendFailuresHoldUnchanged(t *testing.T) {
 	cases := []struct {
 		name, fail string
 		merged     bool
-		claim      mergequeue.DispatchState
+		// prFail: the PR read fails (the indeterminate arm).
+		prFail bool
+		claim  mergequeue.DispatchState
+		// hold, when set, is the direct resume's held reason with the append
+		// still failing.
+		hold string
 	}{
-		{"merge_queue_resumed", CategoryMergeQueueResumed, true, mergequeue.DispatchDispatched},
-		{"merge_dispatch_settled", categoryMergeDispatchSettled, false, mergequeue.DispatchDispatched},
-		{"merge_queue_merged", CategoryMergeQueueMerged, true, mergequeue.DispatchDispatched},
-		// The hold row after the crash-left transition: the settled row and the
-		// ledger move landed first, so the claim reads dispatch_failed.
-		{"merge_queue_resumed unmerged", CategoryMergeQueueResumed, false, mergequeue.DispatchFailed},
+		{"merge_queue_resumed", CategoryMergeQueueResumed, true, false, mergequeue.DispatchDispatched, ""},
+		{"merge_dispatch_settled", categoryMergeDispatchSettled, false, false, mergequeue.DispatchDispatched, ""},
+		{"merge_queue_merged", CategoryMergeQueueMerged, true, false, mergequeue.DispatchDispatched, ""},
+		// The hold row after the crash-left transition on the INDETERMINATE
+		// arm (ADR-109 A1 moved the open PR off it): the settled row and the
+		// ledger move landed first, so the claim reads dispatch_failed, and
+		// never without its merge_dispatch_settled row.
+		{"merge_queue_resumed unmerged", CategoryMergeQueueResumed, false, true, mergequeue.DispatchFailed, ""},
+		// The A1 hand-over's redecide row (PR open): nothing changed, the
+		// claim stays dispatched and the entry holds resume_unrecorded.
+		{"merge_queue_resumed open hand-over", CategoryMergeQueueResumed, false, false, mergequeue.DispatchDispatched, mergeQueueResumeReasonUnrecorded},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -495,6 +594,10 @@ func TestMergeQueueResume_AppendFailuresHoldUnchanged(t *testing.T) {
 			if tc.merged {
 				w.mqrPR(a, true, "closed")
 			}
+			w.mu.Lock()
+			w.prReadFail = tc.prFail
+			w.mu.Unlock()
+			seed := w.mqrClaim(a)
 			w.audit.failCategory = tc.fail
 			w.mqrRestart()
 			w.mqrBoot()
@@ -504,6 +607,22 @@ func TestMergeQueueResume_AppendFailuresHoldUnchanged(t *testing.T) {
 			if c := w.mqrClaim(a); c.State != tc.claim {
 				t.Fatalf("claim = %+v, want %s", c, tc.claim)
 			}
+			if tc.claim == mergequeue.DispatchFailed {
+				got := w.rows(a, categoryMergeDispatchSettled)
+				if len(got) == 0 || w.payload(got[len(got)-1])["reason"] != mergeQueueResumeReasonOrphanedByRestart {
+					t.Fatalf("claim is dispatch_failed without its merge_dispatch_settled orphaned_by_restart row")
+				}
+			}
+			if tc.hold != "" {
+				requireOutcome(t, w.srv.mergeQueueResumeMerge(context.Background(), w.active(a)), mergeOnPassHeld, tc.hold)
+				if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseMerging {
+					t.Fatalf("A = %s/%s after the held resume, want live merging", e.State, e.Phase)
+				}
+				w.mqmRequireClaimUnchanged(a, seed)
+			}
+			w.mu.Lock()
+			w.prReadFail = false
+			w.mu.Unlock()
 			w.audit.failCategory = ""
 			if tc.fail == CategoryMergeQueueMerged {
 				w.srv.PumpMergeCandidateQueues(context.Background())
