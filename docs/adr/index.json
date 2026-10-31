@@ -1082,6 +1082,15 @@
       "applies_to": []
     },
     {
+      "id": "ADR-102",
+      "title": "Verify-command exit-code contract: 0 pass, 75 temp-fail, 73 lock-refused, other = change failed, as the primary verify classifier in place of tool-text scraping",
+      "path": "docs/adr/102-verify-exit-code-contract.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
       "id": "ADR-103",
       "title": "Adversarial security probe: a scheduled acceptance-stage variant drives a disposable target under ADR-050 containment, emits a runner-replayed security_probe artifact, and files findings through a captain gate on a confidential channel (amends ADR-050)",
       "path": "docs/adr/103-adversarial-security-probe.md",
