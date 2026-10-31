@@ -71,6 +71,45 @@ var versionFiles = []legInput{
 	g("backend/internal/version/version.go"), g("runner/internal/version/version.go"), g("cli/internal/version/version.go"),
 }
 
+// The checker reads these sources and tests existence of these linked targets.
+// Keep the list aligned with the routes; unlinked documentation stays inert.
+var agentContextInputs = []legInput{
+	g("AGENTS*.md"),
+	g("CLAUDE*.md"),
+	g("docs/agents/**"),
+	g(".agents/**"),
+	g(".claude/**"),
+	g("backend/internal/agenteval/README.md"),
+	g("backend/internal/basedelta/README.md"),
+	g("backend/internal/decisionrecord/README.md"),
+	g("backend/internal/repodoc/README.md"),
+	g("backend/internal/testanchor/README.md"),
+	g("backend/internal/timescale/README.md"),
+	g("backend/internal/wirecontract/README.md"),
+	g("cli/README.md"),
+	g("deploy/gate-image/README.md"),
+	g("docs/ARCHITECTURE.md"),
+	g("docs/BRAND_FOUNDATIONS.md"),
+	g("docs/GROOMING_RUNBOOK.md"),
+	g("docs/METHODOLOGY.md"),
+	g("docs/MVP_SPEC.md"),
+	g("docs/OPERATING_MODEL.md"),
+	g("docs/adr/README.md"),
+	g("docs/api/v0.md"),
+	g("docs/board-capability-matrix.md"),
+	g("docs/compliance/planreview-catchrate-evidence.md"),
+	g("docs/compliance/prompt-injection-evidence.md"),
+	g("docs/deploy/kubernetes.md"),
+	g("docs/deploy/self-hosted.md"),
+	g("docs/issue-comment-surfaces.md"),
+	g("docs/spec/workflow-v2.md"),
+	g("frontend/README.md"),
+	g("runner/README.md"),
+	g("runner/internal/gateiso/README.md"),
+	g("scripts/README.md"),
+	g("site/README.md"),
+}
+
 var realLegTable = legTable{
 	verify: map[string]legSpec{
 		// cmd_lint's host-toolchain precondition (#4245) runs
@@ -98,6 +137,7 @@ var realLegTable = legTable{
 		"_verify_adr_records":          {scripts: []string{"check-adr"}, inputs: []legInput{g("docs/adr/**")}},
 		"_verify_gate_image_pins":      {scripts: []string{"check-gate-image"}, inputs: gateImagePinInputs},
 		"_verify_pipefail_grep":        {scripts: []string{"check-pipefail-grep"}, inputs: []legInput{g("scripts/*")}},
+		"_verify_agent_context":        {scripts: []string{"check-agent-context"}, inputs: agentContextInputs},
 		"_verify_scope_buckets":        {inputs: []legInput{g("go.work")}},
 		"cmd_test":                     {inputs: goTestInputs},
 		"cmd_test_scoped":              {inputs: goTestInputs},
@@ -105,6 +145,7 @@ var realLegTable = legTable{
 		"_verify_patch_coverage":       {scripts: []string{"check-coverage.py"}, inputs: []legInput{g("scripts/**")}},
 	},
 	harnesses: map[string]legSpec{
+		"test-agent-context":       hermetic,
 		"test-check-coverage":      hermetic,
 		"test-patch-coverage":      hermetic,
 		"test-container-lease":     hermetic,

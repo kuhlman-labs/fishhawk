@@ -1,6 +1,6 @@
 ---
 name: teardown-local
-description: Tear down the local Fishhawk dev environment — stop fishhawkd (and its TLS proxy / webhook relay), the acceptance preview, the Web UI dev server, the Docker Desktop k8s release, and the compose containers (Postgres, RustFS, Jaeger) — optionally destroying the dev data volumes. Use when asked to stop/shut down/tear down/turn off the local stack or free its ports. For disk cleanup without stopping services, use dev-clean.
+description: Stop the local Fishhawk stack, previews, UI server and Kubernetes release. Destroy data volumes only when explicitly requested.
 disable-model-invocation: true
 ---
 

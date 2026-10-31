@@ -12,7 +12,8 @@ verify lock" below), then runs, in order: `cmd_lint`, the ARCHITECTURE.md
 doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
 gate, the site IA gate, the ADR record gate, the gate-image pin check
 (`_verify_gate_image_pins`, E51.17), the pipefail grep guard
-(`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), and finally
+(`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), the agent-context
+gate (`_verify_agent_context`, #4886), and finally
 the test loop (scoped, or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
 coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
 loop). `verify --no-tests` stops before the test loop; see "Gate image" below.
@@ -1471,12 +1472,34 @@ unarmed; plus the #3122 generation-sweep cases above).
 
 ## `scripts/dev` lifecycle: `up` / `reload` / `post-merge` / `sweep` / `gocache`
 
-Long-form contract for the `scripts/dev` behaviours `AGENTS.md` § "Rebuild
-matrix" states as rules. The rebuild table and the activation table themselves
-stay in `AGENTS.md`. All of this is pinned by `scripts/test-dev`, which
+Long-form contract and rebuild/activation tables for `scripts/dev`.
+All of this is pinned by `scripts/test-dev`, which
 `scripts/test verify` runs via `_verify_gate_harnesses` since #2455 (skipped
 in-loop when zsh is absent from PATH), so a `scripts/dev` regression fails
 in-loop rather than only when a human runs the harness.
+
+### Rebuild matrix and activation
+
+| If PR touches | Rebuild |
+|---|---|
+| `backend/cmd/fishhawkd/` or `backend/internal/{server,prompt,plan,spec,runner,webhook,notifier,github,storage,db,...}` | `fishhawkd` |
+| `backend/cmd/fishhawk-mcp/` | `fishhawk-mcp` |
+| `backend/internal/mcpserver/` (extracted MCP tool library, E66.7 / #2408) | `fishhawk-mcp`, `fishhawkd` |
+| `backend/cmd/fishhawk-mcp-shim/` | `fishhawk-mcp-shim` |
+| `runner/cmd/fishhawk-runner/` or `runner/internal/...` | `fishhawk-runner` |
+| `cli/cmd/fishhawk/` or `cli/internal/...` | `fishhawk` CLI |
+| `backend/internal/plan/` or `backend/internal/spec/` (shared libs) | `fishhawkd`, `fishhawk-mcp`, `fishhawk-runner`, `fishhawk` (NOT the shim — it carries its own trigger glob, so it rebuilds rarely) |
+
+**Only a `README.md` basename is carved out of the matrix (#2403).** A README-only diff rebuilds nothing beyond the `fishhawkd` baseline and fires no MCP banner. Every other doc-shaped file (a `CHANGELOG.md`, a nested `docs/*.md`) and every embedded asset still triggers, deliberately: the predicate `_path_affects_build` is a deny-list that fails toward over-notifying. Long-form: `scripts/README.md` § "Rebuild detection and the `README.md` carve-out".
+
+**Rebuilt-on-disk is not the same as live.** What it takes for a rebuilt binary to actually take effect differs per binary:
+
+| Binary | Activation after a rebuild |
+|---|---|
+| `fishhawkd` | rebuilt **and restarted** by `scripts/dev up`/`reload` |
+| `fishhawk-runner` | picked up automatically — spawned fresh from `bin/` on each `fishhawk_run_stage` |
+| `fishhawk-mcp` | **auto-swapped** by the registered [`fishhawk-mcp-shim`](../backend/cmd/fishhawk-mcp-shim/README.md) (ADR-060 / #1922) — the shim SHOULD hot-swap the rebuilt child, and `up`/`reload` print a one-line auto-swap note saying so. **That is an expectation, not an observation** (#2831): `scripts/dev` cannot probe the harness-owned shim, so CONFIRM with a version-returning tool call reflecting the new GitSHA. If it still reports the old SHA the swap did not happen — run `bin/fishhawk-mcp-shim --status` for the recorded reason (`deferred_in_flight` names the request holding it off; `deferred_no_initialize_recorded` means the session cannot be replayed at all), then `/mcp`. A manual `/mcp` reconnect is also the fallback when the shim is **not** registered (the Claude Code harness owns the MCP server process, so `scripts/dev` cannot restart it) |
+| `fishhawk-mcp-shim` | rebuilt on disk but a **shim-binary** change needs a manual `/mcp` reconnect — the shim swaps its *child*, not itself, so the harness-owned shim process stays on the old code until you reconnect |
 
 ### The local `serve` flags
 
@@ -1577,7 +1600,7 @@ STRIPS its own `--force` / `--when-quiet` from the argv it forwards to
 
 `scripts/dev up` auto-detects which binaries need rebuilding by diffing
 `origin/main...HEAD` (falling back to `main...HEAD` with a warning if origin is
-unreachable) against the rebuild matrix in `AGENTS.md`. `fishhawkd` always
+unreachable) against the rebuild matrix above. `fishhawkd` always
 rebuilds as the baseline; the others rebuild only when their source changed.
 `scripts/dev up --all` forces all five. Each rebuild prints a line naming the
 trigger (`baseline`, `--all`, or the path that matched).
@@ -3994,7 +4017,7 @@ runs (`bash`, `git`, `mktemp`, `rm`) plus, where a case wants one, a stub
 `go` that records its cwd and argv and exits as told. No network, no
 Docker, no model, never the real `go`; `origin/main` is seeded with
 `git update-ref`, not a push into a bare repo, so no detached
-`git maintenance` child outlives a fixture (AGENTS.md Traps, #3503). 52
+`git maintenance` child outlives a fixture (docs/agents/testing.md, #3503). 52
 assertions: c1 no trigger → 0, gate not run; c2 committed trigger change +
 passing gate → 0, gate run from `backend/` as
 `run ./internal/agenteval/catchrategate`; c3 failing gate → 1 naming the
@@ -4034,3 +4057,21 @@ the gate's exit reddens c3, and removing `test-review-prompt-eval` from the
 #4313 persona trigger entries reddens their c10 rows, c28 and c29. The mktemp and flag-shaped-base
 guards stay exit 2 under deletion (a downstream redirect or ref-resolution
 failure also exits 2), so c19 and c23 assert the guard's own message.
+
+## Agent context gate (#4886)
+
+`scripts/check-agent-context` validates repository-owned prompt entrypoints,
+task-guide inline local file links and the canonical/mirror skill directories.
+It uses Python 3.9+ standard library only. `scripts/test-agent-context` exercises
+isolated clean/over-budget/missing-file/broken-link/invalid-import/skill-mirror
+fixtures. Verify runs both the harness and the real checkout check before the
+no-tests return. A missing/nonexecutable checker skips with a diagnostic for
+minimal wrapper fixture trees; a normal checkout must ship both executables.
+
+Budgets, navigation syntax/limitations, source ownership and migration/scenario
+coverage live in [docs/agents/README.md](../docs/agents/README.md). Changing a link
+target's existence can change the result; the basedelta table and matching live/
+example declarations therefore enumerate the checked guides, linked targets
+and skill surfaces as global inputs. These changes require re-verification;
+unlinked documentation retains its existing classification. Add new route
+targets to the leg inputs and both declarations together.

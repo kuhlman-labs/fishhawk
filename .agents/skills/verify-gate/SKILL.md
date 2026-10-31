@@ -1,20 +1,15 @@
 ---
 name: verify-gate
-description: Run Fishhawk's `scripts/test verify` gate (lint, schema-sync, gate harnesses, tests, patch coverage) safely and read its result. Use before pushing or opening a PR, when asked to "run verify", "run the gate", "run the tests", or to check a change passes CI locally. Covers the per-repo verify lock, host-load and toolchain preflights, scoped runs, and what each failure means.
+description: Run and interpret Fishhawk verification safely. Use before push/PR, or when asked to run verify, tests or the CI gate.
 ---
 
 # Run the verify gate
 
-`scripts/test verify` is the same gate the runner applies to a committed tree. In order, it runs:
-
-1. `golangci-lint` (including gofmt/goimports)
-2. the `docs/ARCHITECTURE.md` doc-line budget
-3. schema-sync drift
-4. the gate harnesses (`scripts/test-*`)
-5. the site voice and site IA gates, then the ADR record gate
-6. `go test -race` in every module, plus the patch-scoped coverage gate (≥85% of changed lines)
-
-The order matters, because a lint failure aborts before the slow test loop.
+`scripts/test verify` is the committed-tree gate. Its stage order and coverage
+contracts are owned by [scripts/README.md](../../../scripts/README.md) and routed
+by the [verification guide](../../../docs/agents/verification.md). Lint and static
+checks run before the test loop; scoped and no-tests runs do not establish a full
+pass. Avoid maintaining a second copy of the gate's leg list here.
 
 ## 1. Preflight — do all of these first
 
@@ -22,17 +17,15 @@ The order matters, because a lint failure aborts before the slow test loop.
 pgrep -fl '[f]ishhawk-runner .*--run-id' || echo no-live-runner
 uptime; sysctl -n hw.ncpu
 go env GOVERSION
-golangci-lint version
+scripts/check-gate-image --host
 docker info >/dev/null 2>&1 && echo docker-ok || echo docker-DOWN
 git status --short
 ```
 
 - **Live runner.** It may be holding the per-repository verify lock. A shell `verify` that meets a live holder **refuses immediately**. That refusal is final for that invocation: do NOT retry or poll it. Narrow to `scripts/test single -run TestX ./path/to/pkg/...` instead, or wait for the run to finish.
 - **Load average above ~4× the core count.** The host is starved, and unrelated tests will flake. Use the `diagnose-red` skill (orphaned agent processes) before running anything.
-- **Go newer than the 1.26 pin.** This can turn clean main red (e.g. jsonv2 under Go 1.27). Tell the user and propose `go env -w GOTOOLCHAIN=go1.26.9`. It writes their global Go env, so ask first.
-- **golangci-lint.** It must be v2.x, and CI pins **v2.12.2**. A newer local binary can pass while CI's gofmt fails. Pre-check formatting with the pinned version:
-  `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 fmt --diff`
-- **Docker down.** Backend tests need it for the shared testcontainers Postgres. Start Docker first.
+- **Toolchain mismatch.** The host checker compares the exact lint version, its build Go and standalone gofmt with the checked-in gate-image pins. Treat `host_toolchain_mismatch` as environmental, never a reason to edit code. Put the matching tools first on PATH or use `--in-gate-image`. Read the current Go version from `deploy/gate-image/Dockerfile`; prefer a per-command toolchain/PATH change. Changing persistent `go env -w` settings needs authorization and does not switch standalone gofmt.
+- **Postgres prerequisite.** Host tests use Docker/testcontainers. A runner gate container instead uses its supplied `FISHHAWK_TEST_PG_URL` and has no Docker daemon; a missing or failing service there is a failure, never a skip.
 - **Dirty tree.** That's allowed: patch coverage diffs merge-base → work tree, so uncommitted edits are gated too.
 
 ## 2. Run
@@ -50,7 +43,7 @@ A full verify takes many minutes. Run it in the background (or with your shell t
 
 | Failure | Meaning / fix |
 |---|---|
-| golangci-lint / gofmt | Fix the code; `gofmt -w` / `goimports -w` on the named files |
+| golangci-lint / gofmt | Fix the code; the matching pinned `gofmt -w` / `goimports -w` on the named files |
 | `Schema sync` drift | A `docs/spec/` canonical file changed without mirroring it: run `scripts/sync-schemas` and commit the mirrors |
 | Doc-line budget | A `docs/ARCHITECTURE.md` line is over 1000 chars; move the prose to the package README |
 | `check-adr` | Record/index mismatch: `scripts/check-adr --write-index` (see the `record-adr` skill) |
@@ -59,10 +52,11 @@ A full verify takes many minutes. Run it in the background (or with your shell t
 | `TestCrossModuleWireParity` | A cross-module wire struct drifted: see `backend/internal/wirecontract/README.md` |
 | Patch coverage below 85% | Add tests that exercise the changed lines. Never set `FISHHAWK_SKIP_PATCH_COVERAGE` to get a pass |
 | A test unrelated to the diff | Likely environmental (host load, toolchain, Docker): use the `diagnose-red` skill before touching code |
+| `host_toolchain_mismatch` | Fix the tool environment or use the gate image; do not change code |
 | Refused: verify lock held | See preflight. Don't retry |
 
 A skipped harness (`zsh` or `helm` absent) is a printed skip, not a failure. Report it as an uncovered area.
 
 ## 4. Report
 
-State pass/fail, the first failing stage, and the exact failing test or file. Paste the actual error lines; don't paraphrase them. Also mention any skips.
+State pass/fail and the failed gate leg. If the test loop ran, report every failing module and its failing tests/build errors from the aggregate summary. Include the relevant diagnostics and every skip; distinguish scoped/no-tests evidence from a full pass.

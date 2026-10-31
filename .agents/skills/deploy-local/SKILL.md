@@ -1,6 +1,6 @@
 ---
 name: deploy-local
-description: Deploy (bring up, rebuild, or restart) the Fishhawk stack on this machine — Postgres + RustFS containers, the five Go binaries, migrations, and fishhawkd on :8080 — or the Helm chart on Docker Desktop Kubernetes. Use when asked to deploy/run/start/restart the stack locally, "bring fishhawkd up", "reload the backend", "deploy to local k8s". To stop it, use teardown-local.
+description: Start, rebuild or restart the local Fishhawk stack or Docker Desktop Kubernetes deployment. Use for local deployment; use sync-main after a merge.
 ---
 
 # Deploy Fishhawk locally
@@ -48,7 +48,7 @@ uptime
 - **Live runner** → `reload` restarts fishhawkd and can strand that run's stage in `running`. `reload` refuses on its own; STOP and ask the user before passing `--force`. Same if the user has an in-flight `fishhawk_await_*` on another run.
 - **Want to wait instead of forcing** → `scripts/dev reload --when-quiet`. It waits, bounded, until no runner is live and no reload-relevant restart blocker is reported, then runs the normal guards. `reload` ignores `undispatched_child`; only `post-merge` refuses on it. Knobs and exit codes: `scripts/README.md` § "`reload --when-quiet`".
 - **Dirty tree** → fine for `up`/`reload` (binaries get stamped `-dirty`). Pulling `main` after a merge is the `sync-main` skill.
-- **Load average far above core count** → warn the user; a starved host makes the readiness gate flaky (orphaned agent busy-loops, see AGENTS.md Traps).
+- **Load average far above core count** → warn the user; a starved host makes the readiness gate flaky (see [operations](../../../docs/agents/operations.md)).
 
 ## 3. Deploy
 
@@ -84,14 +84,14 @@ One short block: mode, URL, pid, `git_sha`, which binaries rebuilt, and **the MC
 | `did not become healthy within 10s` | Read the printed log tail / `tail -50 logs/fishhawkd.log`; usually a migration or config error |
 | `postgres did not become ready` | `docker logs fishhawk-postgres` |
 | `Operation not permitted` on repo read | Grant the app hosting the agent (terminal, Claude Code, Codex) Full Disk Access in System Settings → Privacy & Security, then restart it |
-| Build fails only under a newer local Go | `go env -w GOTOOLCHAIN=go1.26.9` (AGENTS.md Traps, #3237) |
+| Build fails only under a newer local Go | Compare with the gate-image Go pin and use matching tools; persistent `go env -w` changes require authorization (see operations guide) |
 | k8s: `STALE fishhawkd image` / identity mismatch | See `docs/deploy/kubernetes.md` § "Image identity"; `FISHHAWK_K8S_SKIP_IDENTITY=1` only with the user's OK |
 | k8s: `x509: certificate signed by unknown authority` in `docker build` | TLS-inspecting proxy — `docs/deploy/kubernetes.md` |
-| `.git` pack `Operation timed out` | Repo is in iCloud `~/Documents`; rehydrate the evicted file and retry |
+| `.git` pack `Operation timed out` | Check whether this checkout is in an iCloud-synced directory; rehydrate a confirmed evicted file |
 
 ## References
 
 - `scripts/dev` (`_usage` for every subcommand), `scripts/README.md`
-- `AGENTS.md` § Rebuild matrix (rebuild + activation tables, the short rules) and § Traps
+- [scripts/README.md](../../../scripts/README.md) § Rebuild matrix and activation; [operations](../../../docs/agents/operations.md) for host/container traps
 - `scripts/README.md` § "`scripts/dev` lifecycle" (readiness nonce gate, MCP banner, schema-major banner, `sweep`, ZERR trap), § "Live-run guard for reload / post-merge" (the `reload` half), § "Restart-blocker guard for reload / post-merge" and § "`reload --when-quiet`", § "Local k8s ergonomics"
 - `docs/deploy/kubernetes.md`, `docs/local-tls.md` (`FISHHAWK_DEV_TLS=1`), `docs/local-webhook-relay.md` (`FISHHAWK_DEV_WEBHOOK_RELAY=1`)
