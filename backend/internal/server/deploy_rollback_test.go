@@ -16,6 +16,7 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
 
@@ -55,6 +56,7 @@ func TestRollbackDeployment_GitHubActions_DispatchesAndRecordsInitiated(t *testi
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
 	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":515151,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/515151","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
 		stage.RunID.String(), stage.ID.String())
@@ -188,6 +190,7 @@ func TestRollbackDeployment_OperatorWithWriteDeploy_Proceeds(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
 	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":616161,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/616161","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
 		stage.RunID.String(), stage.ID.String())
@@ -209,6 +212,7 @@ func TestRollbackDeployment_OwnRunMCPToken_NoWriteDeploy_Proceeds(t *testing.T) 
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
 	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":717171,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/717171","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
 		stage.RunID.String(), stage.ID.String())
@@ -335,6 +339,7 @@ func TestRollbackDeployment_AuditAppendFailure(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	au.appendErr = fmt.Errorf("audit store down")
 	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
 
@@ -552,6 +557,7 @@ func TestRollbackDeployment_GitHubActions_CarriesStoredHandle(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
 	stored := seedStoredDeployment(t, s, stage.ID, "rev-abc")
 	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":515151,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/515151","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q,"fishhawk_rollback":"true"}}]}`,
@@ -595,6 +601,7 @@ func TestRollbackDeployment_GitHubActions_NoHandleOmitsInput(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, _ := seedSettledDeployRun(rr, deploySpecNoConstraints, run.StageStateSucceeded, instID(99))
 	stored := seedStoredDeployment(t, s, stage.ID, "")
 

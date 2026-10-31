@@ -13,6 +13,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
@@ -55,10 +56,22 @@ func seedDeferRun(repo *approvalRunRepo, runID uuid.UUID) {
 	})
 }
 
+// postDefer posts a defer. A body with no judgement is deferred as no_defect
+// (E94.7 / #4840), so the tests that predate the requirement keep pinning what
+// they pin; refusal tests use postDeferRaw.
 func postDefer(t *testing.T, s *Server, concernID string, body deferConcernRequest, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	if body.Judgement == "" {
+		body.Judgement = string(concern.JudgementNoDefect)
+	}
 	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+concernID+"/defer", bytes.NewReader(raw))
+	return postDeferRaw(t, s, concernID, string(raw), auth)
+}
+
+// postDeferRaw posts raw bytes to the defer, with no judgement default.
+func postDeferRaw(t *testing.T, s *Server, concernID, raw string, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/concerns/"+concernID+"/defer", strings.NewReader(raw))
 	req.SetPathValue("concern_id", concernID)
 	w := httptest.NewRecorder()
 	s.handleDeferConcern(w, auth(req))
@@ -278,19 +291,19 @@ func TestDeferConcern_FilingFailure_LeavesConcernOpen(t *testing.T) {
 	}
 }
 
-// raceConcernRepo wraps fakeConcernRepo to force ApplyResolution to fail
-// AFTER a successful File — simulating a concurrent writer that raced the
-// defer's transition.
+// raceConcernRepo wraps fakeConcernRepo to force ApplyHumanDisposition (the
+// defer's close path since E94.7 / #4840) to fail AFTER a successful File —
+// simulating a concurrent writer that raced the defer's transition.
 type raceConcernRepo struct {
 	*fakeConcernRepo
 	applyErr error
 }
 
-func (r *raceConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to concern.State, reason string) (*concern.Concern, error) {
+func (r *raceConcernRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to concern.State, reason string, d concern.HumanDisposition) (*concern.Concern, error) {
 	if r.applyErr != nil {
 		return nil, r.applyErr
 	}
-	return r.fakeConcernRepo.ApplyResolution(ctx, id, to, reason)
+	return r.fakeConcernRepo.ApplyHumanDisposition(ctx, id, to, reason, d)
 }
 
 // TestDeferConcern_PostFilingRace_CorrectiveAudit pins the binding
@@ -698,5 +711,76 @@ func TestDeferConcern_PhaseFallsBackToOriginatingRunIssue(t *testing.T) {
 	}
 	if !containsStr2(resp.Issue.DefaultedLabels, "phase:beta") {
 		t.Errorf("response issue defaulted_labels = %v, want it to include phase:beta", resp.Issue.DefaultedLabels)
+	}
+}
+
+// --- Human judgement (ADR-117 D1 phase 2, E94.7 / #4840) --------------------
+
+// TestDeferConcern_RefusesMissingJudgement (CF4): a defer with NO judgement is
+// refused 400 field=judgement before the concern read and, crucially, before
+// any work item is filed. With the guard deleted the handler files an issue
+// and only then fails in the store, so File having run (and the 500) fails it.
+func TestDeferConcern_RefusesMissingJudgement(t *testing.T) {
+	s, repo, au, cr, fp := deferServer(t)
+	runID := uuid.New()
+	seedDeferRun(repo, runID)
+	row := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "retry loop has no backoff")
+
+	w := postDeferRaw(t, s, row.ID.String(), `{"parent_epic":"#389","n":"3"}`, withAuth)
+	assertJudgementRefused(t, w, "judgement", concern.JudgementRuleRequired)
+	if fp.called {
+		t.Errorf("provider File was called; a refused judgement must file no work item")
+	}
+	assertUnjudged(t, cr, concern.StateRaised, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernDeferred, CategoryConcernDeferFailed)
+}
+
+// TestDeferConcern_RefusesTradeoffWithoutCost (CF5): a tradeoff defer with no
+// tradeoff_cost is refused 400 field=tradeoff_cost, filing nothing.
+func TestDeferConcern_RefusesTradeoffWithoutCost(t *testing.T) {
+	s, repo, au, cr, fp := deferServer(t)
+	runID := uuid.New()
+	seedDeferRun(repo, runID)
+	row := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "retry loop has no backoff")
+
+	w := postDeferRaw(t, s, row.ID.String(), `{"parent_epic":"#389","n":"3","judgement":"tradeoff"}`, withAuth)
+	assertJudgementRefused(t, w, "tradeoff_cost", concern.JudgementRuleTradeoffCostRequired)
+	if fp.called {
+		t.Errorf("provider File was called; a refused judgement must file no work item")
+	}
+	assertUnjudged(t, cr, concern.StateRaised, row.ID)
+	assertNoAuditRows(t, au, CategoryConcernDeferred, CategoryConcernDeferFailed)
+}
+
+// TestDeferConcern_AuditCarriesJudgement: concern_deferred and the committed row
+// carry the judgement (outcome deferred, judgement_bulk false: one concern),
+// and tradeoff_cost only on a tradeoff defer; the key is ABSENT otherwise.
+func TestDeferConcern_AuditCarriesJudgement(t *testing.T) {
+	for _, tc := range []struct {
+		name, body string
+		want       concern.Judgement
+		cost       string
+	}{
+		{"defect", `{"parent_epic":"#389","n":"3","judgement":"defect"}`, concern.JudgementDefect, ""},
+		{"tradeoff", `{"parent_epic":"#389","n":"3","judgement":"tradeoff","tradeoff_cost":"ships without a backoff"}`, concern.JudgementTradeoff, "ships without a backoff"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, repo, au, cr, _ := deferServer(t)
+			runID := uuid.New()
+			seedDeferRun(repo, runID)
+			row := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "retry loop has no backoff")
+			if w := postDeferRaw(t, s, row.ID.String(), tc.body, withAuth); w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			payloads := auditPayloadsByCategory(t, au, CategoryConcernDeferred)
+			if len(payloads) != 1 {
+				t.Fatalf("concern_deferred entries = %d, want 1", len(payloads))
+			}
+			assertJudgementPayload(t, payloads[0], tc.want, tc.cost)
+			assertJudgedRow(t, cr, row.ID, judgedRow{
+				State: concern.StateDeferred, Outcome: concern.OutcomeDeferred, Judgement: tc.want,
+				ActorKind: string(audit.ActorUser), TradeoffCost: tc.cost,
+			})
+		})
 	}
 }

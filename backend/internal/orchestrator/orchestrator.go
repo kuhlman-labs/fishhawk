@@ -36,6 +36,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/budget"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -95,7 +96,8 @@ type GitHubAPI interface {
 
 // ConsolidatedReviewDispatcher dispatches the gating agent implement
 // review against a decomposed parent's consolidated PR diff (#1060) after
-// Advance dispatches the parent's review stage. It is implemented
+// Advance dispatches the parent's review stage — or, when acceptance runs
+// ahead of review, its acceptance stage (#4785). It is implemented
 // server-side (*server.Server): the review machinery depends on the
 // orchestrator, so calling it from here directly would close an import
 // cycle. The dispatch is best-effort and idempotent — the implementation
@@ -103,6 +105,19 @@ type GitHubAPI interface {
 // the orchestrator fires it fire-and-forget.
 type ConsolidatedReviewDispatcher interface {
 	DispatchConsolidatedReview(ctx context.Context, parentRunID uuid.UUID, base, head string)
+}
+
+// FanInVerifyGate answers whether a decomposed parent's consolidated head has a
+// SETTLED ADR-090 merge-candidate verify (#4785): passed, not_required or
+// failed. It is implemented server-side (*server.Server), which owns the
+// merge-candidate verify chain, so the orchestrator cannot read it without an
+// import cycle. Advance consults it before dispatching a decomposed parent's
+// acceptance stage in a workflow that orders acceptance ahead of review, and
+// holds acceptance `pending` while it answers false. The hook is READ-ONLY:
+// starting the verify-only pass stays inside DispatchConsolidatedReview's
+// detached goroutine, so Advance can never re-enter itself through it.
+type FanInVerifyGate interface {
+	FanInVerifySettled(ctx context.Context, runID uuid.UUID, base, branch string) (bool, error)
 }
 
 // RunCancelledObserver is notified AFTER completeRun resolves a run to the
@@ -131,6 +146,18 @@ type EffectiveAcceptanceResolver interface {
 	EffectiveAcceptanceVerification(ctx context.Context, runID uuid.UUID, p *plan.Plan) (plan.Verification, error)
 }
 
+// SliceConcernImporter copies every open HIGH or MEDIUM review concern of a
+// decomposed parent's succeeded children into the parent's own concern ledger
+// at fan-in (E94.1 / #4692, ADR-117 D2), so the parent's fix-up routing, the
+// consolidated review and the merge-eligibility leg see them. It is
+// implemented server-side (*server.Server), which owns the concern store and
+// the audit chain, so the orchestrator cannot call it directly without an
+// import cycle. It is idempotent: an already-imported child concern is a
+// no-op, so every fan-in pass may call it with the full succeeded set.
+type SliceConcernImporter interface {
+	ImportSliceConcerns(ctx context.Context, parentRunID uuid.UUID, childRunIDs []uuid.UUID) error
+}
+
 // Orchestrator wires the run repository to a GitHub client to
 // advance a run's stages. Construct directly via the public fields;
 // every dependency is required (the orchestrator no-ops if any is
@@ -151,10 +178,13 @@ type Orchestrator struct {
 	// but the audit is dropped (logged at warn).
 	Audit audit.Repository
 
-	// DefaultRef is the git ref to dispatch against. Matches the
-	// webhook dispatcher's default; v0.x persists the ref on the
-	// run row so subsequent dispatches can target the same ref.
-	DefaultRef string
+	// DefaultBranch resolves a repository's base branch from the forge
+	// default_branch (#4660) for the consolidated PR, the fan-in base and
+	// the consolidated-review trigger. Nil means every base read refuses
+	// with resolver_unconfigured — never a guessed branch. fishhawkd wires
+	// the githubclient's shared resolver (githubclient.Client.DefaultBranches)
+	// so these reads share one TTL cache with the server.
+	DefaultBranch defaultbranch.Source
 
 	// ActionsWorkflowFile is the customer-side .github/workflows/
 	// file. Defaults to "fishhawk.yml" at use time.
@@ -163,7 +193,8 @@ type Orchestrator struct {
 	// ConsolidatedReview, when wired, dispatches the gating consolidated
 	// implement review for a decomposed parent run after Advance
 	// dispatches the parent's review stage with the consolidated PR
-	// present (#1060). Nil disables the dispatch — ordinary (non-
+	// present (#1060), or its acceptance stage when acceptance runs ahead
+	// of review (#4785). Nil disables the dispatch — ordinary (non-
 	// decomposed) runs and the CLI/dev posture are unaffected.
 	ConsolidatedReview ConsolidatedReviewDispatcher
 
@@ -184,6 +215,24 @@ type Orchestrator struct {
 	// CLI/dev posture: the predicates read the approved plan verbatim, which
 	// is also the fallback on a resolver error (WARN-logged).
 	EffectiveAcceptance EffectiveAcceptanceResolver
+
+	// FanInVerify, when wired, holds a decomposed parent's never-dispatched
+	// acceptance stage `pending` until the consolidated head's fan-in
+	// merge-candidate verify settles (#4785), in a workflow that orders
+	// acceptance before review. Wired by server.New as a back-reference
+	// exactly like ConsolidatedReview / EffectiveAcceptance. Nil = the
+	// CLI/dev posture: acceptance dispatches as before (the consolidated PR is
+	// still opened first and the consolidated review still fired).
+	FanInVerify FanInVerifyGate
+
+	// SliceConcerns, when wired, imports the succeeded children's open HIGH
+	// and MEDIUM concerns into the parent's ledger on every fan-in pass
+	// (E94.1 / #4692, ADR-117 D2), immediately before slices_integrated is
+	// written. Wired by server.New as a back-reference exactly like
+	// ConsolidatedReview / RunCancelled. Nil = the CLI/dev posture: nothing
+	// is imported. A non-nil importer's error FAILS the fan-in pass closed:
+	// no slices_integrated row is written and the parent stays parked.
+	SliceConcerns SliceConcernImporter
 
 	// MaxParallelChildren is the global default cap on how many decomposed
 	// child runs may dispatch concurrently (E24.6 / #1146), wired from
@@ -245,6 +294,14 @@ type Orchestrator struct {
 	// one mutex per decomposed parent per process lifetime. The cross-process
 	// layer is run.ConsolidatedPROpenLocker, always taken SECOND.
 	consolidatedPROpenLocks sync.Map
+
+	// fanInHolds counts consecutive decomposed-parent acceptance holds per
+	// parent run (#4785), guarded by fanInHoldMu, so the hold log line carries
+	// a hold_attempt that tells a repeated hold (the verify-only pass never
+	// started — no trigger row) from the first. Observability only: in-process,
+	// reset on release and on restart.
+	fanInHoldMu sync.Mutex
+	fanInHolds  map[uuid.UUID]int
 }
 
 // lockConsolidatedPROpen acquires the in-process consolidated-PR-open mutex
@@ -347,13 +404,15 @@ const (
 // itself transitions to succeeded.
 //
 // A failed or cancelled stage completes the run (failed / cancelled), with
-// ONE exception (#4356): a category-C (infrastructure) failure of an
-// acceptance stage PARKS the run instead — Advance returns OutcomeNoOp, the
-// run stays running and the stage stays failed and retry-eligible — unless
-// the merge already overtook it (run.ClassifyInfraFailurePark's post-merge
-// carve-out) or the stage has spent run.InfraFailureParkRetryBudget parks, in
-// which case the run fails and a stage_infra_park_budget_exhausted row says
-// why.
+// ONE exception (#4356, #4426): a category-C (infrastructure) failure of an
+// acceptance or implement stage PARKS the run instead — Advance returns
+// OutcomeNoOp, the run stays running and the stage stays failed and
+// retry-eligible — unless the merge already overtook it
+// (run.ClassifyInfraFailurePark's post-merge carve-out), the failed implement
+// stage is a decomposed parent's fan-in or a re-opened pass (the
+// implement-only exclusions), or the stage has spent
+// run.InfraFailureParkRetryBudget parks, in which case the run fails and a
+// stage_infra_park_budget_exhausted row says why.
 //
 // Errors from the underlying repos surface as wrapped errors;
 // callers usually log + acknowledge rather than retry. The
@@ -400,9 +459,10 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// pending one, the run is over — completing as failed (or
 	// cancelled) is correct, and dispatching downstream stages
 	// would be wrong because the upstream output they depended on
-	// never landed. The #4356 exception: a category-C acceptance
-	// failure parks the run (see run.ClassifyInfraFailurePark) —
-	// nothing downstream is dispatched, the run just stays running.
+	// never landed. The #4356 / #4426 exception: a category-C acceptance,
+	// or first-execution non-decomposed-parent implement, failure parks the
+	// run (see run.ClassifyInfraFailurePark) — nothing downstream is
+	// dispatched, the run just stays running.
 	var next *run.Stage
 	var gated *run.Stage
 	for _, s := range stages {
@@ -413,9 +473,10 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 					return OutcomeNoOp, err
 				}
 				if park == run.InfraParkRetryable {
-					o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: acceptance stage failed category C; run parked retry-eligible",
+					o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: stage failed category C; run parked retry-eligible",
 						slog.String("run_id", r.ID.String()),
 						slog.String("stage_id", s.ID.String()),
+						slog.String("stage_type", string(s.Type)),
 						slog.String("failure_reason", derefString(s.FailureReason)),
 						slog.Int("prior_parks", history.PriorParks),
 						slog.Int("budget", run.InfraFailureParkRetryBudget),
@@ -569,6 +630,27 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 		}
 	}
 
+	// #4785: a workflow that orders acceptance BEFORE review (feature_change)
+	// reaches a decomposed parent's acceptance stage first, and the ADR-032
+	// review-gate block below never fires there. So the consolidation tail
+	// runs here instead: open the consolidated PR, hold acceptance `pending`
+	// until the consolidated head's fan-in verify settles, then dispatch it
+	// and fire the consolidated review (below). Placed AFTER the acceptance
+	// short-circuit, so a short-circuited acceptance re-enters Advance and
+	// the review gate opens the tail as before.
+	isParentAcceptance := false
+	if next.Type == run.StageTypeAcceptance && r.DecomposedFrom == nil {
+		updated, isParent, held, err := o.consolidateBeforeAcceptance(ctx, r, stages, next)
+		if err != nil {
+			return OutcomeNoOp, fmt.Errorf("orchestrator: consolidate before acceptance: %w", err)
+		}
+		r = updated
+		isParentAcceptance = isParent
+		if held {
+			return OutcomeNoOp, nil
+		}
+	}
+
 	// ADR-032 (#714): a decomposed parent reaching its review gate opens
 	// ONE consolidated PR for the whole decomposition. The children
 	// pushed their commits onto the shared branch and opened no PR of
@@ -621,14 +703,28 @@ func (o *Orchestrator) Advance(ctx context.Context, runID uuid.UUID) (Outcome, e
 	// successful dispatch; the dispatcher no-ops for ordinary runs (a
 	// DecomposedFrom==nil run with a PR but no children, e.g. a normal
 	// feature run) and dedups its own re-fire. base/head match
-	// maybeOpenConsolidatedPR exactly.
-	if err == nil && isParentReviewGate && o.ConsolidatedReview != nil &&
+	// maybeOpenConsolidatedPR exactly. The acceptance arm (#4785) fires it
+	// too, once acceptance is released; the later review-gate re-fire dedups
+	// through the dispatcher's started-key guard.
+	//
+	// The base is the repository's resolved default branch (#4660). An
+	// unresolved read SKIPS the review dispatch with a WARN naming the
+	// reason — the stage dispatch above already happened, the run's review
+	// status stays none, and the operator's remedy is the first-round
+	// review re-run verb, which refuses with the same named reason until the
+	// forge read recovers.
+	if err == nil && (isParentReviewGate || isParentAcceptance) && o.ConsolidatedReview != nil &&
 		r.PullRequestURL != nil && *r.PullRequestURL != "" {
-		base := o.DefaultRef
-		if base == "" {
-			base = "main"
+		base, berr := o.runBaseBranch(ctx, r)
+		if berr != nil {
+			reason, _ := defaultbranch.ReasonOf(berr)
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: consolidated review not dispatched: default branch unresolved",
+				slog.String("run_id", r.ID.String()),
+				slog.String("reason", string(reason)),
+				slog.String("error", berr.Error()))
+		} else {
+			o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
 		}
-		o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
 	}
 
 	return out, err
@@ -743,6 +839,127 @@ func (o *Orchestrator) runStagesAllTerminal(ctx context.Context, runID uuid.UUID
 	return true, nil
 }
 
+// consolidateBeforeAcceptance runs a decomposed parent's consolidation tail
+// ahead of its acceptance stage (#4785), returning (updated run, isParent,
+// held, err).
+//
+//	(a) A run with no implement stage, or no decomposed children, is
+//	    untouched: (r, false, false, nil).
+//	(b) The consolidated PR is opened when the run carries no URL yet, anchored
+//	    on the run's review-type stage (falling back to next) so
+//	    consolidated_pr_opened keeps its review-stage anchor. An open error is
+//	    returned so the next Advance retries — the review-gate posture.
+//	(c) With FanInVerify and ConsolidatedReview wired and the PR present, the
+//	    read-only FanInVerify hook decides. Unsettled: fire
+//	    DispatchConsolidatedReview (which starts the verify-only pass on an
+//	    unverified head and holds otherwise), log, and report held — acceptance
+//	    stays `pending`. A hook error is returned (acceptance stays pending).
+//	    The hook's base is the resolved default branch (#4660); an
+//	    unresolved one is WARN-logged with its reason and consults no hook.
+//	(d) Otherwise not held: the caller dispatches acceptance and fires the
+//	    consolidated review.
+//
+// holdAttempts counts consecutive holds per parent in-process so a repeated
+// hold with no trigger row (the pass could not start) is distinguishable in
+// the log from the first one.
+func (o *Orchestrator) consolidateBeforeAcceptance(ctx context.Context, r *run.Run, stages []*run.Stage, next *run.Stage) (*run.Run, bool, bool, error) {
+	// Only an implement stage fans out (ADR-025 D4), so a run with none can
+	// never be a decomposed parent: skip the children lookup entirely.
+	hasImplement := false
+	for _, s := range stages {
+		if s.Type == run.StageTypeImplement {
+			hasImplement = true
+			break
+		}
+	}
+	if !hasImplement {
+		return r, false, false, nil
+	}
+	children, err := o.Runs.ListRuns(ctx, run.ListRunsFilter{
+		DecomposedFrom: &r.ID,
+		Limit:          1,
+	})
+	if err != nil {
+		return r, false, false, fmt.Errorf("list decomposed children: %w", err)
+	}
+	if len(children) == 0 {
+		return r, false, false, nil
+	}
+
+	if r.PullRequestURL == nil || *r.PullRequestURL == "" {
+		reviewStage := next
+		for _, s := range stages {
+			if s.Type == run.StageTypeReview {
+				reviewStage = s
+				break
+			}
+		}
+		updated, err := o.maybeOpenConsolidatedPR(ctx, r, reviewStage)
+		if err != nil {
+			return r, true, false, fmt.Errorf("open consolidated pr: %w", err)
+		}
+		r = updated
+	}
+
+	if o.FanInVerify != nil && o.ConsolidatedReview != nil &&
+		r.PullRequestURL != nil && *r.PullRequestURL != "" {
+		// The fan-in base is the repository's resolved default branch
+		// (#4660), never a literal. An unresolved read applies NO hold:
+		// acceptance dispatches as before (the merge gate still blocks on
+		// the unverified head) and the consolidated-review fire after the
+		// dispatch skips with its own WARN.
+		base, berr := o.runBaseBranch(ctx, r)
+		if berr != nil {
+			reason, _ := defaultbranch.ReasonOf(berr)
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: decomposed parent acceptance hold not applied: default branch unresolved",
+				slog.String("run_id", r.ID.String()),
+				slog.String("acceptance_stage_id", next.ID.String()),
+				slog.String("reason", string(reason)),
+				slog.String("error", berr.Error()))
+			o.clearFanInAcceptanceHold(r.ID)
+			return r, true, false, nil
+		}
+		fanInSettled, err := o.FanInVerify.FanInVerifySettled(ctx, r.ID, base, consolidatedBranch(r.ID))
+		if err != nil {
+			return r, true, false, fmt.Errorf("fan-in verify state: %w", err)
+		}
+		if !fanInSettled {
+			o.ConsolidatedReview.DispatchConsolidatedReview(ctx, r.ID, base, consolidatedBranch(r.ID))
+			o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator advance no-op: decomposed parent acceptance held until the consolidated fan-in verify settles; release it by dispatching the parent's re-opened IMPLEMENT stage (the verify-only pass), not the acceptance stage",
+				slog.String("run_id", r.ID.String()),
+				slog.String("acceptance_stage_id", next.ID.String()),
+				slog.String("consolidated_branch", consolidatedBranch(r.ID)),
+				slog.Int("hold_attempt", o.noteFanInAcceptanceHold(r.ID)),
+			)
+			return r, true, true, nil
+		}
+	}
+	o.clearFanInAcceptanceHold(r.ID)
+	return r, true, false, nil
+}
+
+// noteFanInAcceptanceHold increments and returns the in-process consecutive
+// hold count for a parent (#4785). A count above 1 on a parent whose implement
+// stage was never re-opened means the verify-only pass could not start (no
+// trigger row): see the hold residual in the README.
+func (o *Orchestrator) noteFanInAcceptanceHold(runID uuid.UUID) int {
+	o.fanInHoldMu.Lock()
+	defer o.fanInHoldMu.Unlock()
+	if o.fanInHolds == nil {
+		o.fanInHolds = make(map[uuid.UUID]int)
+	}
+	o.fanInHolds[runID]++
+	return o.fanInHolds[runID]
+}
+
+// clearFanInAcceptanceHold drops the parent's hold count once acceptance is
+// released.
+func (o *Orchestrator) clearFanInAcceptanceHold(runID uuid.UUID) {
+	o.fanInHoldMu.Lock()
+	defer o.fanInHoldMu.Unlock()
+	delete(o.fanInHolds, runID)
+}
+
 // maybeOpenConsolidatedPR opens the single consolidated PR for a
 // decomposed parent run reaching its review gate (#714 / ADR-032) and
 // stamps pull_request_url on the run, returning the (reloaded) run so
@@ -848,9 +1065,9 @@ func (o *Orchestrator) openConsolidatedPRLocked(ctx context.Context, r *run.Run,
 	}
 
 	head := consolidatedBranch(r.ID)
-	base := o.DefaultRef
-	if base == "" {
-		base = "main"
+	base, err := o.baseBranch(ctx, scope, repo)
+	if err != nil {
+		return r, fmt.Errorf("resolve base branch: %w", err)
 	}
 
 	// Gather the inputs the aligned PR body (#1774) needs. Every load is
@@ -2015,9 +2232,9 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		return nil, fmt.Errorf("parse repo %q: %w", parent.Repo, err)
 	}
 
-	base := o.DefaultRef
-	if base == "" {
-		base = "main"
+	base, err := o.baseBranch(ctx, scope, repo)
+	if err != nil {
+		return nil, fmt.Errorf("resolve base ref: %w", err)
 	}
 	baseSHA, exists, err := o.GitHub.GetBranchSHA(ctx, scope, repo, base)
 	if err != nil {
@@ -2156,12 +2373,36 @@ func (o *Orchestrator) integrateSlices(ctx context.Context, parent *run.Run) (*S
 		}
 	}
 
+	// Import the succeeded children's open HIGH/MEDIUM concerns into the
+	// parent's ledger BEFORE slices_integrated (E94.1 / #4692, ADR-117 D2).
+	// Every fan-in reaches this point — the consolidate / integrate-wave
+	// verbs, the child-completion sweeper and the event-driven arm — and the
+	// import is idempotent, so a between-wave pass imports the newly
+	// succeeded children and re-imports nothing. Fail-closed: an import error
+	// writes no slices_integrated row and the parent stays parked for the
+	// next pass, because integrating without the import is the defect.
+	if err := o.importSliceConcerns(ctx, parent.ID, succeeded); err != nil {
+		return nil, fmt.Errorf("import slice concerns into parent %s: %w", parent.ID, err)
+	}
 	o.emitSlicesIntegrated(ctx, parent.ID, childIDs, consolidated, integrationCommitSHAs, fold)
 	o.logger().LogAttrs(ctx, slog.LevelInfo, "orchestrator integrated decomposed slices",
 		slog.String("parent_run_id", parent.ID.String()),
 		slog.String("consolidated_branch", consolidated),
 		slog.Int("slice_count", len(childIDs)))
 	return nil, nil
+}
+
+// importSliceConcerns hands the succeeded children's ids to the wired
+// SliceConcernImporter (E94.1 / #4692). Nil importer = nothing imported.
+func (o *Orchestrator) importSliceConcerns(ctx context.Context, parentID uuid.UUID, succeeded []*run.Run) error {
+	if o.SliceConcerns == nil {
+		return nil
+	}
+	ids := make([]uuid.UUID, 0, len(succeeded))
+	for _, c := range succeeded {
+		ids = append(ids, c.ID)
+	}
+	return o.SliceConcerns.ImportSliceConcerns(ctx, parentID, ids)
 }
 
 // sliceHeadAbsent reports whether the slice head branch is CONFIRMED absent:
@@ -3110,32 +3351,43 @@ func (o *Orchestrator) emitPlanDecomposed(ctx context.Context, parentRunID, pare
 }
 
 // classifyInfraFailurePark reads the failed stage's park history from the
-// run's audit log and classifies it (#4356). The audit read happens only for
-// a category-C acceptance failure, the one shape the predicate can park, so
-// every other failure keeps its zero-I/O path. With no Audit wired the park
-// cannot be bounded, so the failure takes today's completeRun path. A failed
-// audit read surfaces as an error with NO transition: the run stays as it is
-// and the next Advance re-decides.
+// run's audit log and classifies it (#4356, #4426). The audit read happens
+// only for a category-C acceptance or implement failure, the shapes the
+// predicate can park, so every other failure keeps its zero-I/O path. With no
+// Audit wired the park cannot be bounded, so the failure takes today's
+// completeRun path. A failed audit read on an IMPLEMENT failure counts as a
+// re-opened pass (run.InfraParkHistoryOnReadError, #4426 approval condition
+// C1), so the run fails as it did before #4426 — a failed read never parks.
+// On an ACCEPTANCE failure it surfaces as an error with NO transition: the
+// run stays as it is and the next Advance re-decides.
 func (o *Orchestrator) classifyInfraFailurePark(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage) (run.InfraParkDecision, run.InfraParkHistory, error) {
 	if run.ClassifyInfraFailurePark(stages, failed, run.InfraParkHistory{}) == run.InfraParkNotApplicable {
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
 	}
 	if o.Audit == nil {
-		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; category-C acceptance failure not parked",
+		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: Audit not configured; category-C acceptance / implement failure not parked",
 			slog.String("run_id", r.ID.String()),
-			slog.String("stage_id", failed.ID.String()))
+			slog.String("stage_id", failed.ID.String()),
+			slog.String("stage_type", string(failed.Type)))
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, nil
 	}
 	entries, err := o.Audit.ListForRun(ctx, r.ID)
 	if err != nil {
+		if history, ok := run.InfraParkHistoryOnReadError(stages, failed); ok {
+			o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: infra-park history read failed; category-C implement failure treated as a re-opened pass and not parked",
+				slog.String("run_id", r.ID.String()),
+				slog.String("stage_id", failed.ID.String()),
+				slog.String("error", err.Error()))
+			return run.ClassifyInfraFailurePark(stages, failed, history), history, nil
+		}
 		return run.InfraParkNotApplicable, run.InfraParkHistory{}, fmt.Errorf("orchestrator: read infra-park history: %w", err)
 	}
 	history := run.ReadInfraParkHistory(entries, failed)
 	return run.ClassifyInfraFailurePark(stages, failed, history), history, nil
 }
 
-// completeRunInfraParkExhausted fails the run for a category-C acceptance
-// failure past run.InfraFailureParkRetryBudget and, only once completeRun
+// completeRunInfraParkExhausted fails the run for a category-C acceptance or
+// implement failure past run.InfraFailureParkRetryBudget and, only once completeRun
 // actually terminalized the run, records why.
 func (o *Orchestrator) completeRunInfraParkExhausted(ctx context.Context, r *run.Run, stages []*run.Stage, failed *run.Stage, history run.InfraParkHistory) (Outcome, error) {
 	outcome, err := o.completeRun(ctx, r, stages)
@@ -3298,6 +3550,14 @@ func (o *Orchestrator) maybeAdvanceDecomposedParent(ctx context.Context, parentR
 			// such child on the parent's chain, de-duplicated per child stage.
 			// This runs BEFORE the dispatch top-up and the return, both of which
 			// are otherwise unchanged.
+			//
+			// #4426: a child whose implement stage failed category C on its
+			// first execution is PARKED too (run.ClassifyInfraFailurePark) — it
+			// stays running with a failed, retry-eligible implement stage — so
+			// it is a third non-terminal-but-settled shape beside
+			// awaiting_scope_decision. It also lands here: the parent keeps
+			// waiting in awaiting_children, and settles on the event-driven
+			// re-entry once the retried child succeeds (or fails terminally).
 			o.surfaceParkedChildren(ctx, parentRunID, children)
 			// Event-driven refill (E24.3 / #1143): not all children are
 			// terminal yet, so the parent stays parked — but a child just
@@ -3719,7 +3979,6 @@ func (o *Orchestrator) backends() *runnerbackend.Resolver {
 	reg := runnerbackend.Registry{
 		run.RunnerKindGitHubActions: &runnerbackend.GitHubActions{
 			Client:              o.GitHub,
-			DefaultRef:          o.DefaultRef,
 			ActionsWorkflowFile: o.ActionsWorkflowFile,
 			Logger:              o.Logger,
 		},
@@ -4006,6 +4265,16 @@ func (o *Orchestrator) dispatchAutoMergeStage(ctx context.Context, r *run.Run, n
 // pull_request_url to be backfilled — that happens when the
 // implement stage's PR artifact lands (#216), which is upstream of
 // the review stage.
+//
+// The merge method is the run's declared one (E93.2 / #4658): the
+// workflow-v2 `merge_method` read from the run's cached admission spec
+// (spec.ResolveMergeMethod over r.WorkflowSpec), absent = squash. An
+// unparseable admission spec is an error, and a method the run's forge
+// family cannot apply per merge request (forge.MergeMethodsForFamily over
+// forge.FamilyOfInstallationRef — gitlab x rebase) is refused with
+// forge.ErrMergeMethodUnsupported; both BEFORE the merge call. This path
+// holds no merge-dispatch claim, so "pre-claim" here is "before the merge
+// call".
 func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 	if o.GitHub == nil {
 		o.logger().LogAttrs(ctx, slog.LevelWarn, "orchestrator: GitHub not configured; skipping auto-merge",
@@ -4018,6 +4287,10 @@ func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 			slog.String("run_id", r.ID.String()),
 		)
 		return nil
+	}
+	method, err := autoMergeMethod(r)
+	if err != nil {
+		return err
 	}
 	if r.PullRequestURL == nil || *r.PullRequestURL == "" {
 		return errors.New("orchestrator: run missing pull_request_url; cannot enable auto-merge")
@@ -4032,11 +4305,27 @@ func (o *Orchestrator) enableAutoMerge(ctx context.Context, r *run.Run) error {
 		return fmt.Errorf("orchestrator: parse pr url %q: %w", *r.PullRequestURL, err)
 	}
 
-	// Default to SQUASH for v0 — matches the typical PR merge
-	// conventions on GitHub repos and is what Fishhawk's own
-	// CLAUDE.md prescribes. Spec-level merge_method is a v0.x
-	// follow-up.
-	return o.GitHub.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, forge.MergeMethodSquash)
+	return o.GitHub.EnableAutoMerge(ctx, forge.FromGitHubInstallationID(*r.InstallationID), repo, prNumber, method)
+}
+
+// autoMergeMethod resolves the run's merge method for enableAutoMerge and
+// refuses a statically unsupported forge family x method, naming only the
+// method and the family.
+func autoMergeMethod(r *run.Run) (forge.MergeMethod, error) {
+	d, err := spec.ResolveMergeMethod(r.WorkflowSpec)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: merge method undeterminable: the run's admission spec does not parse: %w", err)
+	}
+	method, err := forge.MergeMethodFromDeclaration(d.Method)
+	if err != nil {
+		return "", fmt.Errorf("orchestrator: merge method undeterminable: %w", err)
+	}
+	family := forge.FamilyOfInstallationRef(r.InstallationRef)
+	if !forge.MergeMethodsForFamily(family).Allows(method) {
+		return "", fmt.Errorf("%w: orchestrator: merge method %s cannot be applied per merge request on forge family %q; nothing was merged",
+			forge.ErrMergeMethodUnsupported, d.Method, family)
+	}
+	return method, nil
 }
 
 // pullRequestNumberFromURL parses the trailing /pull/<n> segment
@@ -4068,6 +4357,30 @@ func (o *Orchestrator) logger() *slog.Logger {
 		return o.Logger
 	}
 	return slog.Default()
+}
+
+// baseBranch resolves repo's base branch through o.DefaultBranch (#4660):
+// the forge default_branch, or a typed *defaultbranch.UnresolvedError naming
+// why not. It is the ONE base read for the consolidated PR, the fan-in base
+// and the consolidated-review trigger; none of them falls back to a literal
+// branch.
+func (o *Orchestrator) baseBranch(ctx context.Context, scope forge.CredentialScope, repo forge.RepoRef) (string, error) {
+	return defaultbranch.Resolve(ctx, o.DefaultBranch, scope, repo)
+}
+
+// runBaseBranch is baseBranch for a run row: scope from the run's
+// installation id (nil -> the zero scope -> no_installation) and repo from
+// its owner/name (unparseable -> repository_invalid).
+func (o *Orchestrator) runBaseBranch(ctx context.Context, r *run.Run) (string, error) {
+	var scope forge.CredentialScope
+	if r.InstallationID != nil {
+		scope = forge.FromGitHubInstallationID(*r.InstallationID)
+	}
+	repo, err := parseRepo(r.Repo)
+	if err != nil {
+		return "", defaultbranch.Unresolved(forge.RepoRef{}, defaultbranch.ReasonRepositoryInvalid, err)
+	}
+	return o.baseBranch(ctx, scope, repo)
 }
 
 // parseRepo splits "owner/name" — duplicated from

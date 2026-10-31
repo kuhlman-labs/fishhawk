@@ -6,6 +6,7 @@ date: 2026-10-11
 issue: https://github.com/kuhlman-labs/fishhawk/issues/4316
 supersedes: ["ADR-096"]
 superseded_by: []
+amended_by: ["ADR-124"]
 applies_to: ["backend/internal/basedelta/**"]
 ---
 

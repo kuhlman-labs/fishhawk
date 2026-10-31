@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
@@ -28,13 +29,32 @@ import (
 // fold is the ONLY channel that can serve it.
 const sliceGrantPath = "backend/internal/agenteval/injection_test.go"
 
-// parentFixupScopeFixture serves one implement stage of the #4338 fan-out.
+// parentFixupScopeFixture serves one implement stage of the #4338 fan-out. The
+// review-side fields (#4425) let the SAME server state drive the implement
+// review: audit captures appended rows, concerns holds the fix-up-routed
+// concern the review's fixupPass keys on, and reviewer records each prompt.
 type parentFixupScopeFixture struct {
 	s           *Server
 	parentRunID uuid.UUID
 	runID       uuid.UUID
 	stageID     uuid.UUID
 	priv        ed25519.PrivateKey
+	audit       *feedbackAuditRepo
+	concerns    *fakeConcernRepo
+	reviewer    *fakePlanReviewer
+}
+
+// parentFixupScopeOpts extends the fixture for the review-baseline tests
+// (#4425) without moving any byte the #4338 serve tests pin: every field's
+// zero value reproduces newParentFixupScopeFixture exactly.
+type parentFixupScopeOpts struct {
+	remove []string
+	// flatAdd is recorded as the parent approval's flat add_scope_files.
+	flatAdd []string
+	// subPlan1Extra is appended to sub_plan 1's scope.files.
+	subPlan1Extra []plan.ScopeFile
+	// slice1Grant, when set, is granted to slice 1 at approval.
+	slice1Grant string
 }
 
 // newParentFixupScopeFixture builds a decomposed parent P whose plan declares
@@ -52,8 +72,19 @@ type parentFixupScopeFixture struct {
 //   - "parent_merge_candidate": P's fix-up plus a live merge-candidate trigger,
 //     so the serve is a verify-only pass with no fix-up block.
 //   - "parent_probe_error": P's fix-up whose children probe errors.
+//
+// Every fix-up shape also seeds an addressed_pending implement concern on the
+// served stage (the review's fixupPass trigger), and every run carries the
+// gating-reviewer workflow spec with a capturing reviewer, so the implement
+// review of the same stage takes the fix-up re-review branch for real.
 func newParentFixupScopeFixture(t *testing.T, shape string, remove []string) *parentFixupScopeFixture {
 	t.Helper()
+	return newParentFixupScopeFixtureWith(t, shape, parentFixupScopeOpts{remove: remove})
+}
+
+func newParentFixupScopeFixtureWith(t *testing.T, shape string, opts parentFixupScopeOpts) *parentFixupScopeFixture {
+	t.Helper()
+	remove := opts.remove
 	rr := newPromptRunRepo()
 	sf := newSigningFake()
 	art := newFakeArtifactRepo()
@@ -73,7 +104,8 @@ func newParentFixupScopeFixture(t *testing.T, shape string, remove []string) *pa
 			Rationale: "scope split",
 			SubPlans: []plan.SubPlanSummary{
 				{Title: "Part A", ScopeHint: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
-				{Title: "Part B", ScopeHint: "B", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}}},
+				{Title: "Part B", ScopeHint: "B", Scope: &plan.Scope{Files: append(
+					[]plan.ScopeFile{{Path: "pkg/b/b.go", Operation: plan.FileOpModify}}, opts.subPlan1Extra...)}},
 			},
 		},
 	}
@@ -104,12 +136,15 @@ func newParentFixupScopeFixture(t *testing.T, shape string, remove []string) *pa
 	}
 
 	idx0, idx1 := 0, 1
-	rr.getRuns[parentID] = &run.Run{ID: parentID, Repo: "o/r", WorkflowID: "feature_change"}
+	rr.getRuns[parentID] = &run.Run{ID: parentID, Repo: "o/r", WorkflowID: "feature_change",
+		WorkflowSpec: specImplementGatingReviewers}
 	if shape != "ordinary" {
 		rr.getRuns[c0ID] = &run.Run{ID: c0ID, Repo: "o/r", WorkflowID: "feature_change",
-			ParentRunID: &parentID, DecomposedFrom: &parentID, SliceIndex: &idx0}
+			WorkflowSpec: specImplementGatingReviewers,
+			ParentRunID:  &parentID, DecomposedFrom: &parentID, SliceIndex: &idx0}
 		rr.getRuns[c1ID] = &run.Run{ID: c1ID, Repo: "o/r", WorkflowID: "feature_change",
-			ParentRunID: &parentID, DecomposedFrom: &parentID, SliceIndex: &idx1}
+			WorkflowSpec: specImplementGatingReviewers,
+			ParentRunID:  &parentID, DecomposedFrom: &parentID, SliceIndex: &idx1}
 	}
 	if shape == "parent_probe_error" {
 		rr.listRunsErr = errors.New("list runs: connection reset")
@@ -120,13 +155,20 @@ func newParentFixupScopeFixture(t *testing.T, shape string, remove []string) *pa
 	seedAmendment(sar, c1ID, scopeamendment.StatusPending, "pkg/pending/p.go")
 	seedAmendment(sar, c0ID, scopeamendment.StatusDenied, "pkg/denied/d.go")
 
+	sliceGrants := map[string][]string{"0": {sliceGrantPath}}
+	if opts.slice1Grant != "" {
+		sliceGrants["1"] = []string{opts.slice1Grant}
+	}
 	approval := map[string]any{
 		"decision":                 "approve",
 		"stage_id":                 planStageID.String(),
-		"add_scope_files_to_slice": map[string][]string{"0": {sliceGrantPath}},
+		"add_scope_files_to_slice": sliceGrants,
 	}
 	if len(remove) > 0 {
 		approval["remove_scope_files"] = remove
+	}
+	if len(opts.flatAdd) > 0 {
+		approval["add_scope_files"] = opts.flatAdd
 	}
 	approvalPayload, _ := json.Marshal(approval)
 	pid := parentID
@@ -138,9 +180,17 @@ func newParentFixupScopeFixture(t *testing.T, shape string, remove []string) *pa
 	if shape == "child" {
 		runID, stageID = c0ID, c0ImplID
 	}
+	concerns := newFakeConcernRepo()
 	if shape != "parent_no_fixup" {
 		byRunID[runID] = append(byRunID[runID], makeFixupEntry(runID, stageID,
 			[]planreview.Concern{{Severity: planreview.SeverityHigh, Category: "coverage", Note: "tighten the bound"}}))
+		// The routed concern the fix-up trigger moved to addressed_pending: what
+		// makes the implement review of this stage a fix-up re-review.
+		concerns.rows = append(concerns.rows, &concern.Concern{
+			ID: uuid.New(), RunID: runID, StageID: stageID, StageKind: concern.StageKindImplement,
+			Severity: string(planreview.SeverityHigh), Category: "coverage", Note: "tighten the bound",
+			State: concern.StateAddressedPending,
+		})
 	}
 	if shape == "parent_merge_candidate" {
 		payload, _ := json.Marshal(mergeCandidateVerifyTrigger{
@@ -154,16 +204,24 @@ func newParentFixupScopeFixture(t *testing.T, shape string, remove []string) *pa
 	}
 
 	priv, _ := sf.issue(t, runID)
+	auditRepo := &feedbackAuditRepo{byRunID: byRunID}
+	reviewer := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove},
+		model:   "claude-opus-4-7",
+	}
 	s := New(Config{
 		Addr:               "127.0.0.1:0",
 		RunRepo:            rr,
 		SigningRepo:        sf,
 		ArtifactRepo:       art,
 		ScopeAmendmentRepo: sar,
-		AuditRepo:          &feedbackAuditRepo{byRunID: byRunID},
+		AuditRepo:          auditRepo,
+		ConcernRepo:        concerns,
+		PlanReviewers:      singleReviewerSet{reviewer},
 	})
 	s.promptIssueGetterOverride = &stubIssueGetter{}
-	return &parentFixupScopeFixture{s: s, parentRunID: parentID, runID: runID, stageID: stageID, priv: priv}
+	return &parentFixupScopeFixture{s: s, parentRunID: parentID, runID: runID, stageID: stageID, priv: priv,
+		audit: auditRepo, concerns: concerns, reviewer: reviewer}
 }
 
 // serve fetches the stage's prompt through BOTH surfaces — the signed
@@ -393,5 +451,143 @@ func TestDecomposedParentFixupScope_EmptyScopeOrNilPlanUnchanged(t *testing.T) {
 	base := wantScope(nil, "backend/internal/server/prompt.go")
 	if got := f.s.decomposedParentFixupScope(context.Background(), runRow, nil, base, nil); !reflect.DeepEqual(got, base) {
 		t.Errorf("nil plan: got %+v, want the base scope unchanged", got)
+	}
+}
+
+// TestParentFanOutScopeForReview_Projection pins the #4425 review projection
+// of decomposedParentScopeChannels: on a decomposed parent it lists the
+// sub_plan-only paths (Detail naming the first declaring sub_plan, operation
+// preserved) then the slice grants (Detail naming the slice), never the
+// top-level prompt.go; every other shape — no child registered, a child, a
+// children-probe error — gets nil (today's baseline).
+func TestParentFanOutScopeForReview_Projection(t *testing.T) {
+	want := []parentFanOutScopePath{
+		{Path: "pkg/a/a.go", Operation: "modify", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 0 scope.files"},
+		{Path: "pkg/b/b.go", Operation: "modify", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 1 scope.files"},
+		{Path: "pkg/b/gone.go", Operation: "delete", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 1 scope.files"},
+		{Path: sliceGrantPath, Operation: "modify", Source: "parent-slice-add-scope-files", Detail: "granted to slice 0 at plan approval via add_scope_files_to_slice"},
+		{Path: "pkg/grant1/g1.go", Operation: "modify", Source: "parent-slice-add-scope-files", Detail: "granted to slice 1 at plan approval via add_scope_files_to_slice"},
+	}
+	opts := parentFixupScopeOpts{
+		subPlan1Extra: []plan.ScopeFile{
+			{Path: "pkg/b/gone.go", Operation: plan.FileOpDelete},
+			// Declared top-level AND in sub_plan 1: never projected.
+			{Path: "backend/internal/server/prompt.go", Operation: plan.FileOpDelete},
+		},
+		slice1Grant: "pkg/grant1/g1.go",
+	}
+	project := func(f *parentFixupScopeFixture) []parentFanOutScopePath {
+		runRow, err := f.s.cfg.RunRepo.GetRun(context.Background(), f.runID)
+		if err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		approvedPlan, err := f.s.loadApprovedPlanForRun(context.Background(), f.runID)
+		if err != nil || approvedPlan == nil {
+			t.Fatalf("load plan: %v (nil=%v)", err, approvedPlan == nil)
+		}
+		return f.s.parentFanOutScopeForReview(context.Background(), runRow, approvedPlan)
+	}
+	if got := project(newParentFixupScopeFixtureWith(t, "parent", opts)); !reflect.DeepEqual(got, want) {
+		t.Errorf("parent projection =\n  %+v\nwant\n  %+v", got, want)
+	}
+	for _, shape := range []string{"ordinary", "child", "parent_probe_error"} {
+		if got := project(newParentFixupScopeFixtureWith(t, shape, opts)); got != nil {
+			t.Errorf("%s: projection = %+v, want nil (not a decomposed parent)", shape, got)
+		}
+	}
+
+	f := newParentFixupScopeFixture(t, "parent", nil)
+	runRow := &run.Run{ID: f.parentRunID}
+	if got := f.s.parentFanOutScopeForReview(context.Background(), runRow, nil); got != nil {
+		t.Errorf("nil plan: projection = %+v, want nil", got)
+	}
+	empty := &plan.Plan{Decomposition: &plan.Decomposition{SubPlans: []plan.SubPlanSummary{
+		{Title: "A", Scope: &plan.Scope{Files: []plan.ScopeFile{{Path: "pkg/a/a.go", Operation: plan.FileOpModify}}}},
+	}}}
+	if got := f.s.parentFanOutScopeForReview(context.Background(), runRow, empty); got != nil {
+		t.Errorf("empty top-level scope: projection = %+v, want nil (the serve never widens an empty scope)", got)
+	}
+}
+
+// TestParentFanOutScopeForReview_FlatAddKeepsItsChannel pins the C2 parity
+// rule: a path recorded both as a flat approval add_scope_files AND in a
+// sub_plan is NOT projected, so the review folds it under the flat channel
+// (modify) ahead of the parent union, exactly as the serve does.
+func TestParentFanOutScopeForReview_FlatAddKeepsItsChannel(t *testing.T) {
+	f := newParentFixupScopeFixtureWith(t, "parent", parentFixupScopeOpts{
+		flatAdd:       []string{"pkg/x/x.go"},
+		subPlan1Extra: []plan.ScopeFile{{Path: "pkg/x/x.go", Operation: plan.FileOpDelete}},
+	})
+	runRow, _ := f.s.cfg.RunRepo.GetRun(context.Background(), f.runID)
+	approvedPlan, _ := f.s.loadApprovedPlanForRun(context.Background(), f.runID)
+	for _, fp := range f.s.parentFanOutScopeForReview(context.Background(), runRow, approvedPlan) {
+		if fp.Path == "pkg/x/x.go" {
+			t.Errorf("flat-add path projected as %+v; the flat channel must keep it", fp)
+		}
+	}
+}
+
+// TestSubPlanScopeChannel_MatchesFullPlanWalk pins the indexed walk to
+// scopeFilesFromApprovedPlanFull (the same first-seen rule, so serve's fold
+// entries cannot drift) and pins each entry's index to the FIRST declaring
+// sub_plan (-1 for top-level) — the index the review Detail renders (C4).
+func TestSubPlanScopeChannel_MatchesFullPlanWalk(t *testing.T) {
+	p := &plan.Plan{
+		Scope: plan.Scope{Files: []plan.ScopeFile{{Path: "t.go", Operation: plan.FileOpModify}}},
+		Decomposition: &plan.Decomposition{SubPlans: []plan.SubPlanSummary{
+			{Title: "zero", Scope: &plan.Scope{Files: []plan.ScopeFile{
+				{Path: "a.go", Operation: plan.FileOpCreate}, {Path: "t.go", Operation: plan.FileOpDelete},
+			}}},
+			{Title: "one", Scope: &plan.Scope{Files: []plan.ScopeFile{
+				{Path: "a.go", Operation: plan.FileOpDelete}, {Path: "b.go", Operation: plan.FileOpModify},
+			}}},
+			{Title: "two (no scope)"},
+		}},
+	}
+	got := subPlanScopeChannel(p)
+	full := scopeFilesFromApprovedPlanFull(p)
+	if len(got) != len(full) {
+		t.Fatalf("channel = %+v, full walk = %+v", got, full)
+	}
+	wantIdx := []int{-1, 0, 1}
+	for i, e := range got {
+		if e.entry.Path != full[i].Path || e.entry.Operation != full[i].Operation {
+			t.Errorf("entry %d = %+v, full walk = %+v", i, e.entry, full[i])
+		}
+		if e.subPlanIndex != wantIdx[i] {
+			t.Errorf("entry %d (%s) sub_plan index = %d, want %d", i, e.entry.Path, e.subPlanIndex, wantIdx[i])
+		}
+	}
+	if subPlanScopeChannel(nil) != nil {
+		t.Error("nil plan: want nil channel")
+	}
+}
+
+// TestParentScopeChannels_WithoutAndAppend pins the channel removal and the
+// fan-out append: removal drops a path from both channels, and appendFanOutPaths
+// keeps base order, dedups against it and stays nil for an ordinary run.
+func TestParentScopeChannels_WithoutAndAppend(t *testing.T) {
+	ch := parentScopeChannels{
+		subPlan:     []parentSubPlanEntry{{entry: scopeamendment.PathEntry{Path: "a.go"}}, {entry: scopeamendment.PathEntry{Path: "b.go"}}},
+		sliceGrants: []parentSliceGrant{{path: "b.go", sliceKey: "0"}, {path: "g.go", sliceKey: "1"}},
+	}
+	got := ch.without([]string{"b.go"})
+	if !reflect.DeepEqual(got.subPlanEntries(), []scopeamendment.PathEntry{{Path: "a.go"}}) ||
+		!reflect.DeepEqual(got.sliceGrantPaths(), []string{"g.go"}) {
+		t.Errorf("without(b.go) = %+v", got)
+	}
+	if !reflect.DeepEqual(ch.without(nil), ch) {
+		t.Error("without(nil) must be the identity")
+	}
+	if got := appendFanOutPaths(nil, nil); got != nil {
+		t.Errorf("appendFanOutPaths(nil, nil) = %v, want nil", got)
+	}
+	base := []string{"flat.go", "a.go"}
+	fan := []parentFanOutScopePath{{Path: "a.go"}, {Path: "g.go"}, {Path: "g.go"}}
+	if got := appendFanOutPaths(base, fan); !reflect.DeepEqual(got, []string{"flat.go", "a.go", "g.go"}) {
+		t.Errorf("appendFanOutPaths = %v", got)
+	}
+	if !reflect.DeepEqual(base, []string{"flat.go", "a.go"}) {
+		t.Errorf("appendFanOutPaths mutated its base: %v", base)
 	}
 }

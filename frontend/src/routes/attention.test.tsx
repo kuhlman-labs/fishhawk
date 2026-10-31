@@ -276,6 +276,9 @@ describe('<Attention>', () => {
       await screen.findByText(split.title);
       const card = cardOf(split.title);
       fireEvent.click(within(card).getByRole('button', { name: /^decide$/i }));
+      fireEvent.change(within(card).getByLabelText('Judgement'), {
+        target: { value: 'no_defect' },
+      });
       fireEvent.change(within(card).getByLabelText('Waive reason'), {
         target: { value: 'still open' },
       });

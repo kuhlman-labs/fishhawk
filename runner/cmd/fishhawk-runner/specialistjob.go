@@ -645,18 +645,29 @@ func refuseJobGitWrite(args []string) error {
 
 // hostJobGitRun is the production jobGit runner: hardened host git with the
 // operator's global and system config pinned off and stdout capped.
+//
+// Every child carries the fan-in identity per command (gitops.IdentityEnv) and
+// the git maintenance pins (gitops.AppendConfigEnv) explicitly rather than
+// through `git config` writes or the process-wide install (ADR-115 D2, #4648):
+// GIT_CONFIG_GLOBAL=/dev/null leaves no ambient identity for the fan-in merge
+// commit, and a `git merge` has no --no-auto-maintenance flag, so its detached
+// maintenance child would otherwise outlive the job (#3503).
 func hostJobGitRun(ctx context.Context, dir string, args []string) (string, int, error) {
-	cmd := exec.CommandContext(ctx, "git", append(gitops.HardeningArgs(), args...)...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(),
+	env, err := gitops.AppendConfigEnv(append(append(os.Environ(),
 		"GIT_CONFIG_NOSYSTEM=1",
 		"GIT_CONFIG_GLOBAL=/dev/null",
 		"GIT_TERMINAL_PROMPT=0",
-	)
+	), gitops.IdentityEnv(faninCommitterName, faninCommitterEmail)...))
+	if err != nil {
+		return "", -1, err
+	}
+	cmd := exec.CommandContext(ctx, "git", append(gitops.HardeningArgs(), args...)...)
+	cmd.Dir = dir
+	cmd.Env = env
 	var stdout cappedBuffer
 	stdout.limit = specialistJobGitOutputLimit
 	cmd.Stdout = &stdout
-	err := cmd.Run()
+	err = cmd.Run()
 	var exitErr *exec.ExitError
 	switch {
 	case err == nil:

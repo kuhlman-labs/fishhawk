@@ -98,6 +98,7 @@ func TestE2E_ResolveConcerns_Addressed(t *testing.T) {
 			"run_id":      fx.runID.String(),
 			"concern_ids": []string{concernID.String()},
 			"evidence":    evidence,
+			"judgement":   "defect",
 		},
 	})
 	if err != nil {

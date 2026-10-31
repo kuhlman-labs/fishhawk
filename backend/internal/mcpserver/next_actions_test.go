@@ -6,7 +6,9 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
 	"io"
+	"maps"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -20,6 +22,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"gopkg.in/yaml.v3"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
@@ -1041,6 +1044,81 @@ func TestNextActions_FailedRunOffersReviveRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestNextActions_ImplementFailedCategoryC_ParkedRun pins the #4426 parked
+// variant of the implement_failed arm (T-NA-1): a NON-terminal run whose
+// implement stage failed category C is the server's infrastructure park, so
+// the retry names the park and its budget and fishhawk_revive_run (which needs
+// a terminal-failed run) is not offered. MECHANISM: the parked fixture differs
+// from the terminal twin ONLY in the run state, and from the D twin ONLY in
+// the failure category, so a constant arm cannot satisfy all three.
+func TestNextActions_ImplementFailedCategoryC_ParkedRun(t *testing.T) {
+	todays := func(run *Run, impl Stage, category string) []SuggestedAction {
+		return []SuggestedAction{
+			{
+				Action:       "fishhawk_retry_stage",
+				Params:       map[string]string{"stage_id": impl.ID},
+				Precondition: fmt.Sprintf("the implement stage failed category %q (retry serves categories A/C/D; B routes to fishhawk_resume_run)", category),
+				Consumes:     consumesRetryBudget,
+				Reason:       "retry the failed stage in place after reading the failure reason",
+			},
+			reviveRunAction(run),
+			{
+				Action:       "fishhawk_cancel_run",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "the failure is not retryable",
+				Consumes:     consumesNone,
+				Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
+			},
+		}
+	}
+
+	t.Run("running run with implement failed C is parked", func(t *testing.T) {
+		run := naRun("running")
+		impl := naFailedImplement("C", "runner_lost")
+		na := nextActionsFor(run, []Stage{naStage("plan", "succeeded"), impl, naStage("acceptance", "pending"), naStage("review", "pending")},
+			nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if na == nil || na.State != "implement_failed" {
+			t.Fatalf("next_actions = %+v, want state implement_failed", na)
+		}
+		if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_retry_stage" || na.Actions[0].Params["stage_id"] != impl.ID {
+			t.Fatalf("actions = %v, want fishhawk_retry_stage {stage_id: %s} first", actionNames(na), impl.ID)
+		}
+		pre := na.Actions[0].Precondition
+		for _, want := range []string{"FAILED category C", "non-terminal", "parks", fmt.Sprintf("up to %d parks per stage", runmodel.InfraFailureParkRetryBudget), "#4426"} {
+			if !strings.Contains(pre, want) {
+				t.Errorf("retry precondition %q missing %q", pre, want)
+			}
+		}
+		if !strings.Contains(na.Actions[0].Reason, "awaiting_host_dispatch") || !strings.Contains(na.Actions[0].Reason, "fishhawk_run_children") {
+			t.Errorf("retry reason %q must say a local retry parks at awaiting_host_dispatch and a child is re-spawned by fishhawk_run_children", na.Actions[0].Reason)
+		}
+		for _, a := range na.Actions {
+			if a.Action == "fishhawk_revive_run" {
+				t.Fatalf("actions = %v: fishhawk_revive_run must not be offered on a non-terminal parked run", actionNames(na))
+			}
+		}
+		findAction(t, na, "fishhawk_cancel_run")
+	})
+
+	t.Run("failed run keeps today's actions byte-identical", func(t *testing.T) {
+		run := naRun("failed")
+		impl := naFailedImplement("C", "runner_lost")
+		na := implementFailedNextActions(run, nil, nil, &impl)
+		if na.State != "implement_failed" || !reflect.DeepEqual(na.Actions, todays(run, impl, "C")) {
+			t.Errorf("terminal run actions = %+v, want today's %+v", na.Actions, todays(run, impl, "C"))
+		}
+	})
+
+	t.Run("running run with implement failed D keeps today's actions", func(t *testing.T) {
+		run := naRun("running")
+		impl := naFailedImplement("D", "unknown")
+		na := implementFailedNextActions(run, nil, nil, &impl)
+		if na.State != "implement_failed" || !reflect.DeepEqual(na.Actions, todays(run, impl, "D")) {
+			t.Errorf("category-D actions = %+v, want today's %+v (the park is category C only)", na.Actions, todays(run, impl, "D"))
+		}
+	})
 }
 
 // TestNextActions_CategoryAQuotaCitation pins the #2085 quota hint: a
@@ -7169,6 +7247,9 @@ func TestFoldMergeQueueYield_RemedyPerNextStep(t *testing.T) {
 		{"forge_approval_vetoed", "dismiss_review", "dismiss_review"},
 		{"forge_approval_undetermined", "retry_after", "fishhawk_merge_run"},
 		{"forge_approval_identity_provider_unconfigured", "configure_identity_provider", "configure_identity_provider"},
+		{"merge_checks_red", "retrigger_ci", "fishhawk_retrigger_ci"},
+		{"merge_checks_pending", "retry_after", "fishhawk_merge_run"},
+		{"merge_review_pending", "retry_after", "fishhawk_merge_run"},
 		{"forge_approval_provider_unsupported", "none", ""},
 		{"forge_approval_absent", "something_new", ""},
 	}
@@ -7187,8 +7268,8 @@ func TestFoldMergeQueueYield_RemedyPerNextStep(t *testing.T) {
 				!strings.Contains(na.Actions[0].Reason, tc.reason) || !strings.Contains(na.Actions[0].Precondition, tc.next) {
 				t.Fatalf("actions = %+v, want one %s naming %s", na.Actions, tc.want, tc.reason)
 			}
-			if tc.want == "fishhawk_merge_run" && na.Actions[0].Params["run_id"] != run.ID {
-				t.Errorf("merge_run params = %v, want run_id %s", na.Actions[0].Params, run.ID)
+			if (tc.want == "fishhawk_merge_run" || tc.want == "fishhawk_retrigger_ci") && na.Actions[0].Params["run_id"] != run.ID {
+				t.Errorf("%s params = %v, want run_id %s", tc.want, na.Actions[0].Params, run.ID)
 			}
 		})
 	}
@@ -7277,5 +7358,520 @@ func TestFoldMergeQueueYield_UntrustedTextNeverReachesNextActions(t *testing.T) 
 		if reason == hostileReason && !strings.Contains(string(blob), "an unrecognised reason") {
 			t.Errorf("an out-of-vocabulary yield_reason must render generically:\n%s", blob)
 		}
+	}
+}
+
+// TestFoldMergeQueueYield_RetriggerCI is docs/adr/112 A3 (#4780) through the
+// fold: a merge_checks_red / retrigger_ci yield names fishhawk_retrigger_ci
+// with params {run_id} only, consumes none, is INSERTED before an offered
+// fishhawk_merge_run, is idempotent, and its prose comes from the closed
+// vocabulary only (the hostile yield_detail never appears) and states the
+// A3.4 clear rule (every merge-gate leg passing), never "a qualifying forge
+// approval". Counterfactual: dropping the retrigger_ci case adds nothing →
+// RED; keeping the approval rejoin clause for a merge-gate reason → RED on
+// the forbidden phrase.
+func TestFoldMergeQueueYield_RetriggerCI(t *testing.T) {
+	run := naYieldedRun("merge_checks_red", "retrigger_ci")
+	na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}, mergeRunAction(run)}}
+	foldMergeQueueYield(run, na)
+	foldMergeQueueYield(run, na)
+	if len(na.Actions) != 3 || na.Actions[1].Action != "fishhawk_retrigger_ci" || na.Actions[2].Action != "fishhawk_merge_run" {
+		t.Fatalf("actions = %+v, want fishhawk_retrigger_ci inserted once before fishhawk_merge_run", na.Actions)
+	}
+	a := na.Actions[1]
+	if len(a.Params) != 1 || a.Params["run_id"] != run.ID || a.Consumes != consumesNone {
+		t.Errorf("retrigger action params = %v consumes = %q, want exactly {run_id: %s} consuming none", a.Params, a.Consumes, run.ID)
+	}
+	for _, want := range []string{"merge_checks_red", "failed or was cancelled at the anchored head", "fishhawk_retrigger_ci",
+		"check_run trigger", "fishhawk_merge_run re-invoke", "every merge-gate leg passing"} {
+		if !strings.Contains(a.Reason, want) {
+			t.Errorf("retrigger reason %q lacks %q", a.Reason, want)
+		}
+	}
+	if !strings.Contains(a.Precondition, "retrigger_ci") {
+		t.Errorf("precondition %q does not name next_step retrigger_ci", a.Precondition)
+	}
+	blob, _ := json.Marshal(na)
+	for _, bad := range []string{"qualifying forge approval", naYieldHostileDetail, "IGNORE ALL PREVIOUS"} {
+		if strings.Contains(string(blob), bad) {
+			t.Errorf("merge_checks_red next_actions carry %q:\n%s", bad, blob)
+		}
+	}
+
+	// Appended when no merge is offered.
+	na = &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}}}
+	foldMergeQueueYield(run, na)
+	if len(na.Actions) != 2 || na.Actions[1].Action != "fishhawk_retrigger_ci" {
+		t.Fatalf("actions = %+v, want fishhawk_retrigger_ci appended", na.Actions)
+	}
+}
+
+// TestFoldMergeQueueYield_MergeGateRetryAfterIsReasonAware: the A3 retry_after
+// reasons (merge_checks_pending, merge_review_pending) name the leg the
+// re-probe waits on and the A3.4 clear rule, and never the forge-read
+// ("undetermined or truncated") or approval prose; forge_approval_undetermined
+// keeps the forge-read prose. Counterfactual: dropping the reason switch in
+// the retry_after case → the merge-gate rows read the forge-read prose, RED.
+func TestFoldMergeQueueYield_MergeGateRetryAfterIsReasonAware(t *testing.T) {
+	cases := []struct {
+		reason string
+		want   []string
+		bad    []string
+	}{
+		{"merge_checks_pending", []string{"pending, unreported or unreadable at the anchored head", "check_run trigger", "every merge-gate leg passing"},
+			[]string{"undetermined or truncated", "qualifying forge approval"}},
+		{"merge_review_pending", []string{"implement-review round at the anchored head is still settling", "every merge-gate leg passing"},
+			[]string{"undetermined or truncated", "qualifying forge approval"}},
+		{"forge_approval_undetermined", []string{"undetermined or truncated", "qualifying forge approval"},
+			[]string{"merge-gate leg"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.reason, func(t *testing.T) {
+			run := naYieldedRun(tc.reason, "retry_after")
+			na := &NextActions{}
+			foldMergeQueueYield(run, na)
+			if len(na.Actions) != 1 || na.Actions[0].Action != "fishhawk_merge_run" {
+				t.Fatalf("actions = %+v, want one fishhawk_merge_run", na.Actions)
+			}
+			for _, w := range tc.want {
+				if !strings.Contains(na.Actions[0].Reason, w) {
+					t.Errorf("reason %q lacks %q", na.Actions[0].Reason, w)
+				}
+			}
+			for _, b := range tc.bad {
+				if strings.Contains(na.Actions[0].Reason, b) {
+					t.Errorf("reason %q carries %q", na.Actions[0].Reason, b)
+				}
+			}
+		})
+	}
+}
+
+// TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI is the ONE
+// three-way vocabulary drift pin (docs/adr/112 A3, #4780): the server's
+// closed yield_reason → next_step map (server.MergeQueueYieldVocabulary),
+// this package's mergeQueueYieldReasons and docs/api/v0.openapi.yaml's
+// MergeQueueYieldReason enum carry EQUAL reason sets; the set of next steps
+// the server maps to EQUALS the MergeQueueNextStep enum; and every mapped
+// next step other than none is HANDLED by a foldMergeQueueYield case (the
+// fold adds an action for it). On a failure, update every site:
+// backend/internal/server/merge_queue_yield.go (mergeQueueYieldReasons,
+// mergeQueueYieldNextStep), backend/internal/mcpserver/next_actions.go
+// (mergeQueueYieldReasons, foldMergeQueueYield), docs/api/v0.openapi.yaml
+// (MergeQueueYieldReason, MergeQueueNextStep), docs/api/v0.md, then
+// scripts/gen-site-reference. Counterfactual: removing merge_checks_red from
+// mergeQueueYieldReasons → RED on the set comparison.
+func TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI(t *testing.T) {
+	const sites = "backend/internal/server/merge_queue_yield.go, backend/internal/mcpserver/next_actions.go, docs/api/v0.openapi.yaml, docs/api/v0.md (then scripts/gen-site-reference)"
+	serverVocab := server.MergeQueueYieldVocabulary()
+
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "docs", "api", "v0.openapi.yaml"))
+	if err != nil {
+		t.Fatalf("read openapi: %v", err)
+	}
+	var doc struct {
+		Components struct {
+			Schemas map[string]struct {
+				Enum []string `yaml:"enum"`
+			} `yaml:"schemas"`
+		} `yaml:"components"`
+	}
+	if err := yaml.Unmarshal(raw, &doc); err != nil {
+		t.Fatalf("parse openapi: %v", err)
+	}
+	openReasons := doc.Components.Schemas["MergeQueueYieldReason"].Enum
+	openSteps := doc.Components.Schemas["MergeQueueNextStep"].Enum
+	if len(openReasons) == 0 || len(openSteps) == 0 {
+		t.Fatalf("openapi MergeQueueYieldReason enum %v / MergeQueueNextStep enum %v: want both non-empty", openReasons, openSteps)
+	}
+
+	setOf := func(xs []string) map[string]bool {
+		m := make(map[string]bool, len(xs))
+		for _, x := range xs {
+			m[x] = true
+		}
+		return m
+	}
+	keys := func(m map[string]bool) []string {
+		out := make([]string, 0, len(m))
+		for k := range m {
+			out = append(out, k)
+		}
+		slices.Sort(out)
+		return out
+	}
+	serverReasons := map[string]bool{}
+	serverSteps := map[string]bool{}
+	for r, step := range serverVocab {
+		serverReasons[r] = true
+		serverSteps[step] = true
+	}
+	mcpReasons := map[string]bool{}
+	for r, ok := range mergeQueueYieldReasons {
+		if ok {
+			mcpReasons[r] = true
+		}
+	}
+	if !maps.Equal(serverReasons, mcpReasons) {
+		t.Errorf("yield_reason drift: server %v, mcpserver %v; update %s", keys(serverReasons), keys(mcpReasons), sites)
+	}
+	if o := setOf(openReasons); !maps.Equal(serverReasons, o) {
+		t.Errorf("yield_reason drift: server %v, openapi %v; update %s", keys(serverReasons), keys(o), sites)
+	}
+	if o := setOf(openSteps); !maps.Equal(serverSteps, o) {
+		t.Errorf("next_step drift: server maps to %v, openapi MergeQueueNextStep %v; update %s", keys(serverSteps), keys(o), sites)
+	}
+	for _, want := range []string{"merge_checks_red", "merge_checks_pending", "merge_review_pending"} {
+		if !serverReasons[want] || !mcpReasons[want] || !setOf(openReasons)[want] {
+			t.Errorf("%s missing on a side (server %v, mcpserver %v, openapi %v); update %s",
+				want, serverReasons[want], mcpReasons[want], setOf(openReasons)[want], sites)
+		}
+	}
+	if !serverSteps["retrigger_ci"] || !setOf(openSteps)["retrigger_ci"] || serverVocab["merge_checks_red"] != "retrigger_ci" {
+		t.Errorf("merge_checks_red → %q, openapi steps %v: want retrigger_ci on every side; update %s", serverVocab["merge_checks_red"], openSteps, sites)
+	}
+
+	// Every mapped next step but none is handled by a fold case.
+	for r, step := range serverVocab {
+		na := &NextActions{}
+		foldMergeQueueYield(naYieldedRun(r, step), na)
+		if step == "none" {
+			if len(na.Actions) != 0 {
+				t.Errorf("%s → none: fold added %+v, want nothing", r, na.Actions)
+			}
+			continue
+		}
+		if len(na.Actions) != 1 || !strings.Contains(na.Actions[0].Reason, r) {
+			t.Errorf("%s → %s: fold added %+v, want one action naming the reason; add a foldMergeQueueYield case (%s)", r, step, na.Actions, sites)
+		}
+	}
+}
+
+// --- #4801: concerns open, fix-up gate open, acceptance unsettled ----------
+
+// naUnsettledStages is the live #4801 shape: succeedFixupPushStage advanced
+// implement (review parked at awaiting_approval) before the fix-up push
+// re-opened the settled acceptance stage.
+func naUnsettledStages(accState string) ([]Stage, Stage) {
+	acc := naStage("acceptance", accState)
+	return []Stage{
+		naStage("plan", "succeeded"),
+		naStage("implement", "succeeded"),
+		acc,
+		naStage("review", "awaiting_approval"),
+	}, acc
+}
+
+func naHasAction(na *NextActions, names ...string) bool {
+	for _, a := range na.Actions {
+		for _, n := range names {
+			if a.Action == n {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+// TestNextActions_ConcernsOpenAcceptanceUnsettledHoldsMerge pins the #4801
+// classifier arm across every non-terminal acceptance state and every hint
+// budget branch: the acceptance move leads (a dispatch carrying stage_id when
+// dispatchable, a single poll and NO dispatch when in flight), the merge is
+// never offered, and the route-back moves survive.
+func TestNextActions_ConcernsOpenAcceptanceUnsettledHoldsMerge(t *testing.T) {
+	hints := []struct {
+		name     string
+		hint     *ReviewActionHint
+		wantTail []string
+	}{
+		{"remaining", &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}, []string{"fishhawk_fixup_stage", "fishhawk_defer_concern"}},
+		{"override", &ReviewActionHint{Concerns: 2, OverrideAvailable: true}, []string{"fishhawk_defer_concern", "fishhawk_fixup_stage"}},
+		{"ceiling", &ReviewActionHint{Concerns: 2}, []string{"commit_and_vouch", "fishhawk_start_run"}},
+	}
+	for _, accState := range []string{"pending", "awaiting_host_dispatch", "dispatched", "running"} {
+		for _, h := range hints {
+			t.Run(accState+"/"+h.name, func(t *testing.T) {
+				prURL := "https://github.com/x/y/pull/42"
+				r := naRun("running")
+				r.PullRequestURL = &prURL
+				stages, acc := naUnsettledStages(accState)
+				na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), h.hint, nil, false, false, false, "", "", releaseSignals{})
+				if na.State != stateConcernsOpenAcceptanceUnsettled {
+					t.Fatalf("state = %q, want %q (actions %v)", na.State, stateConcernsOpenAcceptanceUnsettled, actionNames(na))
+				}
+				if naHasAction(na, "merge_and_file_follow_up", "fishhawk_merge_run") {
+					t.Fatalf("actions = %v, want NO merge while acceptance is unsettled", actionNames(na))
+				}
+				lead := na.Actions[0]
+				dispatchable := accState == "pending" || accState == "awaiting_host_dispatch"
+				if dispatchable {
+					if lead.Action != "fishhawk_dispatch_stage" || lead.Params["stage"] != "acceptance" {
+						t.Fatalf("lead = %s %v, want fishhawk_dispatch_stage(stage=acceptance)", lead.Action, lead.Params)
+					}
+					if lead.Params["stage_id"] != acc.ID {
+						t.Errorf("lead stage_id = %q, want the acceptance stage id %q", lead.Params["stage_id"], acc.ID)
+					}
+				} else {
+					if naHasAction(na, "fishhawk_dispatch_stage") {
+						t.Fatalf("actions = %v, an in-flight acceptance must not be offered a dispatch", actionNames(na))
+					}
+					if lead.Action != "fishhawk_get_run_status" || !strings.Contains(lead.Reason, "already in flight") {
+						t.Fatalf("lead = %s %q, want the wait-shaped poll", lead.Action, lead.Reason)
+					}
+				}
+				if !strings.Contains(lead.Reason, acc.ID[:8]) {
+					t.Errorf("lead reason = %q, want the acceptance short id", lead.Reason)
+				}
+				got := actionNames(na)
+				tail := got[len(got)-len(h.wantTail):]
+				if strings.Join(tail, ",") != strings.Join(h.wantTail, ",") {
+					t.Errorf("actions = %v, want the route-back tail %v in order", got, h.wantTail)
+				}
+			})
+		}
+	}
+}
+
+// TestNextActions_ConcernsOpenSettledAcceptanceKeepsMerge is the regression
+// guard: a SUCCEEDED acceptance stage leaves the pre-#4801 arm byte-identical,
+// merge_and_file_follow_up included.
+func TestNextActions_ConcernsOpenSettledAcceptanceKeepsMerge(t *testing.T) {
+	r := naRun("running")
+	stages, _ := naUnsettledStages("succeeded")
+	hint := &ReviewActionHint{Concerns: 2, RemainingFixupBudget: 1}
+	na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, nil, false, false, false, "", "", releaseSignals{})
+	if na.State != "implement_concerns_open" {
+		t.Fatalf("state = %q, want implement_concerns_open", na.State)
+	}
+	want := actionNames(&NextActions{Actions: hint.suggestedActions(r, stages[1].ID)})
+	if got := actionNames(na); strings.Join(got, ",") != strings.Join(want, ",") || !naHasAction(na, "merge_and_file_follow_up") {
+		t.Errorf("actions = %v, want the unchanged %v with merge_and_file_follow_up", got, want)
+	}
+}
+
+// TestNextActions_ZeroConcernsAcceptancePendingLeadsWithDispatch is the C4(b)
+// zero-concern shape: hint nil routes through the acceptance arm, which leads
+// with the acceptance dispatch and offers no merge.
+func TestNextActions_ZeroConcernsAcceptancePendingLeadsWithDispatch(t *testing.T) {
+	r := naRun("running")
+	stages, _ := naUnsettledStages("pending")
+	na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), nil, nil, false, false, false, "", "", releaseSignals{})
+	if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_dispatch_stage" || na.Actions[0].Params["stage"] != "acceptance" {
+		t.Fatalf("actions = %v, want an acceptance dispatch lead", actionNames(na))
+	}
+	if naHasAction(na, "merge_and_file_follow_up", "fishhawk_merge_run") {
+		t.Errorf("actions = %v, want no merge while acceptance is pending", actionNames(na))
+	}
+}
+
+// TestNextActions_DriveMergePRNotPrependedWhileAcceptanceUnsettled pins the
+// drive fold guard: a stale merge_pr stamp is not prepended on the #4801 arm,
+// but still is on implement_concerns_open (the guard is not over-broad), and a
+// non-merge drive action still folds first.
+func TestNextActions_DriveMergePRNotPrependedWhileAcceptanceUnsettled(t *testing.T) {
+	hint := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 1}
+	mergePR := &DriveStatus{Drive: true, NextAction: &RunNextAction{Action: driveNextActionMergePR}}
+
+	r := naRun("running")
+	stages, _ := naUnsettledStages("pending")
+	na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, mergePR, false, false, false, "", "", releaseSignals{})
+	if na.State != stateConcernsOpenAcceptanceUnsettled || naHasAction(na, "fishhawk_merge_run") || na.Actions[0].Action != "fishhawk_dispatch_stage" {
+		t.Fatalf("state %q actions %v: a drive merge_pr must not outrank the acceptance dispatch", na.State, actionNames(na))
+	}
+
+	other := &DriveStatus{Drive: true, NextAction: &RunNextAction{Action: "run_acceptance_stage"}}
+	na = nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, other, false, false, false, "", "", releaseSignals{})
+	if na.Actions[0].Action != "run_acceptance_stage" {
+		t.Errorf("actions = %v, want a non-merge drive action still folded first", actionNames(na))
+	}
+
+	settled, _ := naUnsettledStages("succeeded")
+	na = nextActionsFor(r, settled, nil, naReviewStatus("implement", "complete"), hint, mergePR, false, false, false, "", "", releaseSignals{})
+	if na.State != "implement_concerns_open" || na.Actions[0].Action != "fishhawk_merge_run" {
+		t.Errorf("state %q actions %v, want merge_pr still prepended on implement_concerns_open", na.State, actionNames(na))
+	}
+}
+
+// TestFoldAcceptanceRedispatchAdvisory_ConcernsOpenReopened pins the #4801 fold
+// branch: a stage-scoped acceptance_reopened entry relabels the unsettled arm
+// _reopened and sharpens the lead's reason; an entry scoped to another stage,
+// or unscoped, leaves it unsettled with the generic reason.
+func TestFoldAcceptanceRedispatchAdvisory_ConcernsOpenReopened(t *testing.T) {
+	hint := &ReviewActionHint{Concerns: 1, RemainingFixupBudget: 1}
+	build := func(accState string) (*Run, []Stage, Stage, *NextActions) {
+		r := naRun("running")
+		stages, acc := naUnsettledStages(accState)
+		na := nextActionsFor(r, stages, nil, naReviewStatus("implement", "complete"), hint, nil, false, false, false, "", "", releaseSignals{})
+		if na.State != stateConcernsOpenAcceptanceUnsettled {
+			t.Fatalf("precondition: state = %q", na.State)
+		}
+		return r, stages, acc, na
+	}
+
+	for _, accState := range []string{"pending", "running"} {
+		t.Run("scoped/"+accState, func(t *testing.T) {
+			r, stages, acc, na := build(accState)
+			foldAcceptanceRedispatchAdvisory(r, stages, []AuditEntry{naReopenedEntry(acc.ID)}, na)
+			if na.State != stateConcernsOpenAcceptanceReopened {
+				t.Fatalf("state = %q, want %q", na.State, stateConcernsOpenAcceptanceReopened)
+			}
+			if !strings.Contains(na.Actions[0].Reason, "re-opened by a fix-up push") || !strings.Contains(na.Actions[0].Reason, acc.ID[:8]) {
+				t.Errorf("lead reason = %q, want the re-open wording naming the stage", na.Actions[0].Reason)
+			}
+			if naHasAction(na, "merge_and_file_follow_up", "fishhawk_merge_run") {
+				t.Errorf("actions = %v, the fold must not add a merge", actionNames(na))
+			}
+		})
+	}
+
+	unscoped := AuditEntry{Category: categoryAcceptanceReopened, Sequence: 9}
+	for name, entry := range map[string]AuditEntry{"other_stage": naReopenedEntry(uuid.NewString()), "unscoped": unscoped} {
+		t.Run(name, func(t *testing.T) {
+			r, stages, _, na := build("pending")
+			before := na.Actions[0].Reason
+			foldAcceptanceRedispatchAdvisory(r, stages, []AuditEntry{entry}, na)
+			if na.State != stateConcernsOpenAcceptanceUnsettled || na.Actions[0].Reason != before {
+				t.Errorf("state %q reason %q, want unsettled with the generic reason", na.State, na.Actions[0].Reason)
+			}
+		})
+	}
+
+	// C4(d): selection is by name + provenance, never by index — a drive-folded
+	// poll AHEAD of the arm's own in-flight poll is never rewritten.
+	t.Run("drive_poll_not_rewritten", func(t *testing.T) {
+		r, stages, acc, na := build("running")
+		drivePoll := pollAction(r, 30, "drive-folded poll")
+		na.Actions = append([]SuggestedAction{drivePoll}, na.Actions...)
+		foldAcceptanceRedispatchAdvisory(r, stages, []AuditEntry{naReopenedEntry(acc.ID)}, na)
+		if na.Actions[0].Reason != "drive-folded poll" {
+			t.Errorf("drive-folded poll reason rewritten to %q", na.Actions[0].Reason)
+		}
+		if !strings.Contains(na.Actions[1].Reason, "re-opened by a fix-up push") {
+			t.Errorf("arm poll reason = %q, want the re-open wording", na.Actions[1].Reason)
+		}
+	})
+}
+
+// naOrphanRun is a running run whose LIVE merge-queue entry carries the
+// dispatch_claim_orphan label (ADR-109 A1, #4711).
+func naOrphanRun(label string, approvalWaiting bool) *Run {
+	r := naRun("running")
+	pr := "https://github.com/x/y/pull/7"
+	r.PullRequestURL = &pr
+	r.MergeCandidateQueue = &runMergeCandidateQueue{
+		State: "live", Phase: "passed", Repo: "x/y", BaseRef: "main", AnchoredHeadSHA: "h1",
+		DispatchClaimOrphan: label,
+	}
+	if approvalWaiting {
+		at := time.Date(2026, 10, 30, 10, 0, 0, 0, time.UTC)
+		r.MergeCandidateQueue.ApprovalWaitStartedAt = &at
+	}
+	return r
+}
+
+// TestFoldMergeQueueOrphanedClaim pins the fold (ADR-109 A1, #4711):
+// orphaned_by_restart INSERTS operator_rearm {run_id} before
+// fishhawk_merge_run (consumes none; the reason names the DELETE re-arm and
+// that no fishhawk_merge_run re-invoke is needed), else appends it; orphaned
+// APPENDS fishhawk_get_merge_queue {repo, base_ref} with a CONDITIONAL reason
+// (approval condition 1): with the approval-wait anchor set it names the
+// needed approval and the claim holding the head, and no row ever says
+// "nothing to do". Absent, unknown, terminal, no block and nil are no-ops; a
+// second fold adds nothing. Counterfactuals: an early return at the top →
+// every positive row RED; an unconditional orphaned reason → the
+// approval-wait row RED.
+func TestFoldMergeQueueOrphanedClaim(t *testing.T) {
+	t.Run("orphaned_by_restart inserted before the merge", func(t *testing.T) {
+		run := naOrphanRun("orphaned_by_restart", false)
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}, mergeRunAction(run)}}
+		foldMergeQueueOrphanedClaim(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
+		if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_await_review", "operator_rearm", "fishhawk_merge_run"}) {
+			t.Fatalf("actions = %v, want operator_rearm inserted once before fishhawk_merge_run", got)
+		}
+		a := na.Actions[1]
+		if !reflect.DeepEqual(a.Params, map[string]string{"run_id": run.ID}) || a.Consumes != consumesNone ||
+			!strings.Contains(a.Precondition, "orphaned_by_restart") {
+			t.Errorf("operator_rearm = %+v, want params {run_id}, consumes none, precondition naming the label", a)
+		}
+		for _, s := range []string{"DELETE the run's dispatch_failed claim", "No fishhawk_merge_run re-invoke is needed", "did not merge", "Merge-dispatch ledger"} {
+			if !strings.Contains(a.Reason, s) {
+				t.Errorf("reason = %q, want it to name %q", a.Reason, s)
+			}
+		}
+	})
+	t.Run("orphaned_by_restart appended without a merge", func(t *testing.T) {
+		run := naOrphanRun("orphaned_by_restart", false)
+		na := &NextActions{Actions: []SuggestedAction{{Action: "fishhawk_await_review"}}}
+		foldMergeQueueOrphanedClaim(run, na)
+		if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_await_review", "operator_rearm"}) {
+			t.Fatalf("actions = %v, want operator_rearm appended", got)
+		}
+	})
+	for _, tc := range []struct {
+		name      string
+		waiting   bool
+		wantParts []string
+	}{
+		{"orphaned, approval not known missing", false, []string{"forge-approval fold approves releases it", "If the pull request still needs a qualifying forge approval, the claim holds the head"}},
+		{"orphaned while the fold has not approved", true, []string{"the pull request still needs a qualifying forge approval", "the claim holds the head until that approval arrives", "Approve the pull request"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			run := naOrphanRun("orphaned", tc.waiting)
+			na := &NextActions{Actions: []SuggestedAction{mergeRunAction(run)}}
+			foldMergeQueueOrphanedClaim(run, na)
+			foldMergeQueueOrphanedClaim(run, na)
+			if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_merge_run", "fishhawk_get_merge_queue"}) {
+				t.Fatalf("actions = %v, want fishhawk_get_merge_queue appended once", got)
+			}
+			a := na.Actions[1]
+			if !reflect.DeepEqual(a.Params, map[string]string{"repo": "x/y", "base_ref": "main"}) || a.Consumes != consumesNone {
+				t.Errorf("fishhawk_get_merge_queue = %+v, want params {repo, base_ref} and consumes none", a)
+			}
+			for _, s := range tc.wantParts {
+				if !strings.Contains(a.Reason, s) {
+					t.Errorf("reason = %q, want it to say %q", a.Reason, s)
+				}
+			}
+			if strings.Contains(strings.ToLower(a.Reason), "nothing to do") {
+				t.Errorf("reason = %q, must never say \"nothing to do\"", a.Reason)
+			}
+		})
+	}
+	t.Run("no-ops", func(t *testing.T) {
+		terminal := naOrphanRun("orphaned_by_restart", false)
+		terminal.State = "succeeded"
+		for name, r := range map[string]*Run{
+			"absent": naOrphanRun("", false), "unknown": naOrphanRun("released", false),
+			"terminal": terminal, "no_block": naRun("running"),
+		} {
+			na := &NextActions{}
+			foldMergeQueueOrphanedClaim(r, na)
+			if len(na.Actions) != 0 {
+				t.Errorf("%s: actions = %+v, want none", name, na.Actions)
+			}
+		}
+		foldMergeQueueOrphanedClaim(nil, nil)
+		foldMergeQueueOrphanedClaim(naOrphanRun("orphaned", false), nil)
+	})
+}
+
+// TestNextActions_MergeQueueOrphanedClaimOnEveryPath: every nextActionsFor
+// return path (ci_failed, review_coverage_incomplete and the classify table)
+// carries the operator_rearm for an orphaned_by_restart claim.
+// Counterfactual: deleting one call site → that path's row RED.
+func TestNextActions_MergeQueueOrphanedClaimOnEveryPath(t *testing.T) {
+	stages := []Stage{naStage("plan", "succeeded"), naStage("implement", "awaiting_host_dispatch")}
+	for name, drive := range map[string]*DriveStatus{
+		"ci_failed":                  {Drive: true, DerivedStatus: "ci_failed"},
+		"review_coverage_incomplete": {Drive: true, DerivedStatus: stateReviewCoverageIncomplete},
+		"classify":                   nil,
+	} {
+		t.Run(name, func(t *testing.T) {
+			na := nextActionsFor(naOrphanRun("orphaned_by_restart", false), stages, nil, nil, nil, drive, false, false, false, "", "", releaseSignals{})
+			if !slices.Contains(actionNames(na), "operator_rearm") {
+				t.Fatalf("actions = %v, want operator_rearm", actionNames(na))
+			}
+		})
 	}
 }

@@ -49,6 +49,7 @@ func TestResolveConcerns_PassesThrough(t *testing.T) {
 
 	_, out, err := r.resolveConcerns(context.Background(), nil, ResolveConcernsInput{
 		RunID: runID.String(), ConcernIDs: []string{a, b}, Evidence: "re-ran it",
+		Judgement: "tradeoff", TradeoffCost: "kept the slow path",
 	})
 	if err != nil {
 		t.Fatalf("resolveConcerns: %v", err)
@@ -62,6 +63,10 @@ func TestResolveConcerns_PassesThrough(t *testing.T) {
 	}
 	if sent.Evidence != "re-ran it" || len(sent.ConcernIDs) != 2 || sent.ConcernIDs[0] != a || sent.ConcernIDs[1] != b {
 		t.Errorf("sent body = %+v, want the ids and evidence verbatim", sent)
+	}
+	// The judgement and its cost reach the backend verbatim (ADR-117 D1, #4840).
+	if sent.Judgement != "tradeoff" || sent.TradeoffCost != "kept the slow path" {
+		t.Errorf("sent judgement/tradeoff_cost = %q/%q, want the threaded pair", sent.Judgement, sent.TradeoffCost)
 	}
 	res := out.Result
 	if res.Resolved != 1 || res.Failed != 1 || len(res.Results) != 2 {
@@ -116,5 +121,28 @@ func TestResolveConcerns_BackendRefusal_Surfaced(t *testing.T) {
 	})
 	if err == nil || !strings.Contains(err.Error(), "resolve_requires_human") {
 		t.Errorf("err = %v, want the backend refusal code surfaced", err)
+	}
+}
+
+// TestResolveConcerns_NoLocalJudgementPreCheck: a resolve WITHOUT a judgement
+// is not refused by the tool. It reaches the backend, and the backend's 400
+// validation_failed is what the caller sees (ADR-117 D1, #4840).
+func TestResolveConcerns_NoLocalJudgementPreCheck(t *testing.T) {
+	stub := &resolveConcernsStub{
+		status: http.StatusBadRequest,
+		body:   `{"error":{"code":"validation_failed","message":"judgement is required","details":{"field":"judgement","rule":"judgement_required"}}}`,
+	}
+	r := stub.resolver(t)
+	_, _, err := r.resolveConcerns(context.Background(), nil, ResolveConcernsInput{
+		RunID: uuid.NewString(), ConcernIDs: []string{uuid.NewString()}, Evidence: "e",
+	})
+	if err == nil || !strings.Contains(err.Error(), "validation_failed") {
+		t.Errorf("err = %v, want the backend's validation_failed surfaced", err)
+	}
+	if len(stub.requests) != 1 {
+		t.Fatalf("backend requests = %v, want 1 (no local judgement pre-check)", stub.requests)
+	}
+	if strings.Contains(stub.bodies[0], "judgement") {
+		t.Errorf("sent body = %s, want no judgement key on an omitted judgement", stub.bodies[0])
 	}
 }

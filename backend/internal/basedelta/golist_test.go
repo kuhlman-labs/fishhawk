@@ -11,6 +11,7 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 	"syscall"
 	"testing"
 	"time"
@@ -157,6 +158,7 @@ func TestGoListLoader_MissingWorkspaceImport(t *testing.T) {
 	}
 	got := (&Classifier{Loader: l}).Classify(context.Background(), Input{
 		DeltaPaths: []string{"m1/a/notes.txt"}, PRPaths: []string{"m1/b.txt"}, Workspaces: []string{root},
+		Surface: &Surface{Global: []string{"go.work"}},
 	})
 	if got.Independent || !strings.HasPrefix(got.Reason, "undecidable:load:") {
 		t.Fatalf("Classify = %+v, want undecidable:load:", got)
@@ -385,14 +387,16 @@ func TestBuildGraph_ContextDoneBeforeParse(t *testing.T) {
 	}
 }
 
-// L8: a non-Go repository loads as an empty graph.
+// L8 (ADR-124 D3): a non-Go repository is refused with
+// ErrUnsupportedLanguage and a nil graph, before any go command runs (GoBin
+// would exit 9), so Load never returns an empty graph for one.
 func TestGoListLoader_NonGoRepo(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	writeTree(t, root, map[string]string{"README.md": "hi\n"})
 	g, err := (&GoListLoader{GoBin: fakeGo(t, "exit 9")}).Load(context.Background(), root)
-	if err != nil || g.Len() != 0 {
-		t.Fatalf("Load = %v, %v; want empty graph, nil", g, err)
+	if !errors.Is(err, ErrUnsupportedLanguage) || g != nil {
+		t.Fatalf("Load = %v, %v; want nil graph, ErrUnsupportedLanguage", g, err)
 	}
 	if _, err := (&GoListLoader{}).Load(context.Background(), filepath.Join(root, "absent")); err == nil {
 		t.Fatal("Load of a missing dir succeeded")
@@ -446,12 +450,51 @@ func TestGoListLoader_ToolchainMismatchFailsLocal(t *testing.T) {
 	}
 }
 
+// TestGoListLoader_Supports: the Go adapter applies only to a workspace with
+// a go.work or go.mod AT ITS ROOT (ADR-124 D3); a nested module is not
+// enough, and a resolution failure is not the sentinel.
+func TestGoListLoader_Supports(t *testing.T) {
+	t.Parallel()
+	l := &GoListLoader{}
+	for name, files := range map[string]map[string]string{
+		"root_go_work": {"go.work": "go 1.25.0\n"},
+		"root_go_mod":  {"go.mod": "module example.com/m\n"},
+	} {
+		root := t.TempDir()
+		writeTree(t, root, files)
+		if err := l.Supports(root); err != nil {
+			t.Errorf("%s: Supports = %v, want nil", name, err)
+		}
+	}
+	for name, files := range map[string]map[string]string{
+		"python_only":        {"app/main.py": "print(1)\n", "requirements.txt": "x\n"},
+		"nested_module_only": {"app/main.py": "print(1)\n", "tools/go.mod": "module example.com/t\n", "tools/x.go": "package t\n"},
+	} {
+		root := t.TempDir()
+		writeTree(t, root, files)
+		if err := l.Supports(root); !errors.Is(err, ErrUnsupportedLanguage) {
+			t.Errorf("%s: Supports = %v, want ErrUnsupportedLanguage", name, err)
+		}
+	}
+	err := l.Supports(filepath.Join(t.TempDir(), "absent"))
+	if err == nil || errors.Is(err, ErrUnsupportedLanguage) {
+		t.Errorf("missing dir: Supports = %v, want a non-sentinel resolution error", err)
+	}
+}
+
+// realRepoGraph caches ONE GoListLoader load of the real repository, (graph,
+// err) as a pair, touching no *testing.T, so every test sharing it reports
+// the load failure itself.
+var realRepoGraph = sync.OnceValues(func() (*Graph, error) {
+	return (&GoListLoader{}).Load(context.Background(), repoRoot())
+})
+
 // L10: the real repository loads error-free, with every go.work module
 // present and a known edge.
 func TestGoListLoader_RealRepository(t *testing.T) {
 	t.Parallel()
 	requireGo(t)
-	g, err := (&GoListLoader{}).Load(context.Background(), repoRoot())
+	g, err := realRepoGraph()
 	if err != nil {
 		t.Fatalf("Load(real repo): %v", err)
 	}

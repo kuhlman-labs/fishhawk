@@ -552,8 +552,19 @@ func (s *Server) republishAuditCheckBeforeMerge(ctx context.Context, runID uuid.
 // a stale recorded head and the live head keeps its missing or IN_PROGRESS
 // required check. An empty liveHead is the pre-#4397 findHeadSHA resolution:
 // the ungated ADR-090 D7 posture and a PR the forge already reports merged.
+//
+// #4617 (approval condition (f)): the recompute and publish run under
+// mergeTailRepublishTimeout, so a hung publish cannot hold the merge-intent
+// lock fn past its own bound. This bounds every pre-dispatch republish (the
+// inline merge_run tail, the delegated may_merge tail and the queue's pre-lock
+// one). Still best-effort: a deadline is logged by the publish path and never
+// unwinds the dispatch. republishAuditCheckOnMergeCandidateVerdict and
+// republishAuditCheckOnRunTerminal are not merge-tail calls and stay unbounded
+// here.
 func (s *Server) republishAuditCheckBeforeMergeAtHead(ctx context.Context, runID uuid.UUID, liveHead string) (auditcomplete.Result, bool) {
-	return s.recomputeAndForcePublishAuditCompleteAtHead(ctx, runID, liveHead)
+	cctx, cancel := context.WithTimeout(ctx, mergeTailRepublishTimeout)
+	defer cancel()
+	return s.recomputeAndForcePublishAuditCompleteAtHead(cctx, runID, liveHead)
 }
 
 // republishAuditCheckOnMergeCandidateVerdict force-publishes the

@@ -238,6 +238,30 @@ stage/reason key halves, unusable-key skipping, unknown run, 8-way
 `_ConcurrentExactlyOne` by direct count) and, end to end through the server
 helper, `server/acceptance_retirement_drop_pg_test.go`.
 
+**In-transaction hook: `DedupeSpec.BeforeAppend` (E94.3 / #4694, ADR-117
+A1.2).** An optional `func(sameCategory []*Entry, p *ChainAppendParams)
+error`, invoked INSIDE the transaction, under the run-row lock, AFTER the
+duplicate scan found no duplicate and BEFORE `AppendChainedTx`.
+`sameCategory` is every entry of the appended category, read on the same
+transaction, so a check the hook makes against it is atomic with the append —
+the escape closure (`server/escape.go`) uses it to require that its target is
+an `escape_recorded` row on the same run, still `pending_judgement`, and to
+copy that target's immutable escape fields into the successor by rewriting
+`p.Payload`. A non-nil return aborts before any write (the caller's rollback
+discards nothing) and is propagated UNWRAPPED, so the caller can `errors.As`
+its own typed refusal. A duplicate short-circuits BEFORE the hook runs. `nil`
+— every pre-#4694 caller (`childcancel`, `stalesweep`, `mergeoutcome`, the
+retirement-drop writers) — is byte-identical to the hook-less append.
+
+`CheckDedupeSpec(sameCategory, p, spec)` is the exported scan + hook half,
+shared by `AppendChainedDedupedTx` and a caller's in-memory fallback (list,
+`CheckDedupeSpec`, append — the non-atomic shape ADR-117 A1.2 allows a fake),
+so the two paths cannot disagree on what a duplicate is. Pinned by
+`deduped_test.go`'s `_BeforeAppendRefusesWritesNothing` (the hook's sentinel
+comes back unwrapped and the committed count is unchanged),
+`_BeforeAppendRewritesPayload` (the committed row carries the rewrite; a
+duplicate never reaches the hook) and `TestCheckDedupeSpec_Table`.
+
 ## Grooming capture/apply window (`GroomingWindowAppender`, #2991)
 
 `grooming_window.go` carries the capture/apply CONCURRENCY PROTOCOL that lets the

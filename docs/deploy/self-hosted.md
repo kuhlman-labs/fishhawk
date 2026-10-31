@@ -101,7 +101,11 @@ Also required, as in any deployment: `FISHHAWKD_DATABASE_URL`, the GitHub App
 credentials (`FISHHAWKD_GITHUB_APP_ID` +
 `FISHHAWKD_GITHUB_APP_PRIVATE_KEY_FILE`), and the OAuth trio
 (`FISHHAWKD_OAUTH_CLIENT_ID` / `_SECRET` / `_CALLBACK_URL`) — all three of the
-last must be set together or startup fails.
+last must be set together or startup fails. `FISHHAWKD_OAUTH_CLIENT_SECRET` also
+authenticates the token-login client check (#4627): `POST /v0/tokens/login`
+mints only for a forge token issued to this deployment's own device OAuth
+client, so `fishhawk token login --client-id` must name that client (or be
+omitted, letting the CLI discover it).
 
 ## Install
 

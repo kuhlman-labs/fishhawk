@@ -1394,10 +1394,32 @@ func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
 		t.Errorf("gate-closed message names acceptance when the run has no acceptance stage: %q", closed.Message)
 	}
 
-	// (3) Gate OPEN -> no annotation at all.
-	open := get(t, hintStages("succeeded", "awaiting_approval", "pending"))
-	if strings.Contains(open.Message, "the fix-up gate is not open yet") {
-		t.Errorf("gate-open hint carries the ordering annotation: %q", open.Message)
+	// (3) Gate OPEN with no acceptance stage -> no annotation at all.
+	open := get(t, hintStages("succeeded", "awaiting_approval", ""))
+	if strings.Contains(open.Message, "the fix-up gate is not open yet") || strings.Contains(open.Message, "NOTE:") {
+		t.Errorf("gate-open hint carries an annotation: %q", open.Message)
+	}
+
+	// (3b) #4801: gate OPEN but the acceptance stage is unsettled (a fix-up push
+	// re-opened it) -> the merge-hold NOTE, never the gate-closed wording, and
+	// split dispatchable vs in flight like (1)/(1b).
+	const holdSentence = "NOTE: the merge is held"
+	held := get(t, hintStages("succeeded", "awaiting_approval", "pending"))
+	if !strings.Contains(held.Message, holdSentence) || !strings.Contains(held.Message, acceptanceSentence) {
+		t.Errorf("gate-open + pending acceptance message lacks the dispatch-first hold NOTE: %q", held.Message)
+	}
+	if strings.Contains(held.Message, "the fix-up gate is not open yet") {
+		t.Errorf("gate-open + pending acceptance message claims the gate is closed: %q", held.Message)
+	}
+	if !strings.HasPrefix(held.Message, open.Message) {
+		t.Errorf("hold NOTE is not appended to the base message:\n base = %q\n got  = %q", open.Message, held.Message)
+	}
+	heldInFlight := get(t, hintStages("succeeded", "awaiting_approval", "running"))
+	if !strings.Contains(heldInFlight.Message, holdSentence) || !strings.Contains(heldInFlight.Message, "already in flight, so wait for it to settle") {
+		t.Errorf("gate-open + running acceptance message lacks the wait hold NOTE: %q", heldInFlight.Message)
+	}
+	if strings.Contains(heldInFlight.Message, acceptanceSentence) {
+		t.Errorf("gate-open + running acceptance message tells the operator to dispatch a stage in flight: %q", heldInFlight.Message)
 	}
 
 	// (1b) Acceptance already IN FLIGHT -> the wait wording, and NEVER "dispatch
@@ -1441,7 +1463,7 @@ func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
 	for _, tc := range []struct {
 		name string
 		got  *ReviewActionHint
-	}{{"acceptance_blocking", blocking}, {"gate_closed", closed}, {"nil_stages", degraded}} {
+	}{{"acceptance_blocking", blocking}, {"gate_closed", closed}, {"nil_stages", degraded}, {"gate_open_acceptance_held", held}} {
 		if tc.got.Concerns != open.Concerns {
 			t.Errorf("%s: Concerns = %d, want %d (unchanged by the annotation)", tc.name, tc.got.Concerns, open.Concerns)
 		}
@@ -1461,5 +1483,43 @@ func TestReviewActionHintFor_GateOrderingAnnotation(t *testing.T) {
 	// untouched.
 	if !strings.HasPrefix(blocking.Message, open.Message) {
 		t.Errorf("annotated message is not the base message plus a suffix:\n base = %q\n got  = %q", open.Message, blocking.Message)
+	}
+}
+
+// TestDeferConcernAction_JudgementParam pins, beside its builder, the exact
+// Params map of the shared fishhawk_defer_concern hint: the existing
+// concern_ids / parent_epic / n placeholders plus the `judgement` placeholder
+// the backend now requires (ADR-117 D1, #4840). The placeholder names every
+// allowed human value and that tradeoff needs tradeoff_cost, never the refused
+// unlabelled.
+func TestDeferConcernAction_JudgementParam(t *testing.T) {
+	a := deferConcernAction(2)
+	want := map[string]string{
+		"concern_ids": "run.concerns.items[].id",
+		"parent_epic": "<epic the follow-up rolls up to, e.g. #1196>",
+		"n":           "<child number for the [E<epic>.<n>] title>",
+		"judgement":   concernJudgementPlaceholder,
+	}
+	if len(a.Params) != len(want) {
+		t.Errorf("params = %v, want exactly %v", a.Params, want)
+	}
+	for k, v := range want {
+		if a.Params[k] != v {
+			t.Errorf("params[%q] = %q, want %q", k, a.Params[k], v)
+		}
+	}
+	j := a.Params["judgement"]
+	for _, v := range concernJudgementValues {
+		if !strings.Contains(j, v) {
+			t.Errorf("judgement placeholder %q does not name %q", j, v)
+		}
+	}
+	for _, s := range []string{"REQUIRED", "tradeoff_cost"} {
+		if !strings.Contains(j, s) {
+			t.Errorf("judgement placeholder %q does not say %q", j, s)
+		}
+	}
+	if strings.Contains(j, "unlabelled") {
+		t.Errorf("judgement placeholder %q offers unlabelled, which the backend refuses", j)
 	}
 }

@@ -1339,14 +1339,27 @@ func TestMergeCandidateVerifyState_TransferredSource(t *testing.T) {
 	f.seedVerdict(mcvOtherHead, mergeCandidateResultPassed)
 	f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, mergeCandidateTransferPayload{
 		FromHead: mcvOtherHead, ToHead: mcvHead, RootHead: "9999999999999999999999999999999999999999", ReasonCode: transferReasonIndependent})
+	// #4749: the state carries the winning row's chain sequence, read back
+	// from the chain (never assumed).
+	lastSeq := func(category string) int64 {
+		rows, err := f.au.ListForRunByCategory(context.Background(), f.runID, category)
+		if err != nil || len(rows) != 1 || rows[0].Sequence == 0 {
+			t.Fatalf("%s rows = %d (%v), want one sequenced row", category, len(rows), err)
+		}
+		return rows[0].Sequence
+	}
 	st, err := f.s.mergeCandidateVerifyState(context.Background(), f.runRow(t), mcvHead)
 	want := mergeCandidateState{State: mergeCandidateStatePassed, Cause: mergeCandidateCauseBaseAdvance,
-		Source: mergeCandidateSourceTransferred, TransferredFrom: mcvOtherHead, RootHead: "9999999999999999999999999999999999999999"}
+		Source: mergeCandidateSourceTransferred, TransferredFrom: mcvOtherHead, RootHead: "9999999999999999999999999999999999999999",
+		VerdictSequence: lastSeq(CategoryMergeCandidateVerdictTransferred)}
 	if err != nil || st != want {
 		t.Errorf("state = %+v err=%v\nwant  %+v", st, err, want)
 	}
 	rec, err := f.s.mergeCandidateVerifyState(context.Background(), f.runRow(t), mcvOtherHead)
 	if err != nil || rec.State != mergeCandidateStatePassed || rec.Source != mergeCandidateSourceRecorded || rec.TransferredFrom != "" {
 		t.Errorf("recorded state = %+v err=%v, want passed/recorded", rec, err)
+	}
+	if got, want := rec.VerdictSequence, lastSeq(CategoryMergeCandidateVerified); got != want {
+		t.Errorf("recorded VerdictSequence = %d, want the merge_candidate_verified row's %d", got, want)
 	}
 }

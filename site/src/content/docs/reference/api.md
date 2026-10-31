@@ -106,6 +106,22 @@ attribution existed omit all three fields. A concern routed into a fix-up by id
 keeps `reviewer_role` and `quote_unverified` on the `stage_fixup_triggered`
 audit entry, and the fix-up prompt names the persona that raised it.
 
+Concerns also carry an outcome and a human judgement, which the table does not
+spell out. The open and settled rows of `GET /v0/runs/{run_id}/gate-view` and
+the items of `GET /v0/runs/{run_id}/concerns` report `outcome` — `fixed` when a
+reviewer confirmed the concern, a clean re-review closed it, or its approval
+condition was confirmed delivered; `carried`; `open_at_merge`; `waived`;
+`deferred`; or `duplicate_of:<id>` — and omit it when none is recorded. A
+concern that reopens loses `fixed`. They always report `judgement`, one of
+`defect`, `defect_pre_existing`, `no_defect`, `tradeoff`, `preference`,
+`stale`, `insufficient_evidence` or `unlabelled`. The server's own closes never
+set a judgement, so a concern no person has judged reads `unlabelled`, and a
+judgement a person recorded earlier survives them. A duplicate reports the
+judgement of the concern at the end of its `duplicate_of` chain within the same
+run, naming it in `judgement_inherited_from`; a chain that leaves the run,
+points nowhere or loops reads `unlabelled`. Neither field is shown to a
+reviewer.
+
 A run's `trigger_source` can also be `scheduled`, which the table does not
 spell out either. Only the scheduler inside `fishhawkd` (off unless the daemon
 runs with `--enable-scheduler`) creates such a run, for a workflow that
@@ -147,6 +163,15 @@ keeps its state. It is the same
 rule the server applies when it advances a run on its own: a post-deploy
 acceptance stage runs only once every earlier deploy stage succeeded.
 
+The marker likewise refuses a `pending` or `awaiting_host_dispatch` stage
+sequenced after a stage that failed: 409 `dispatch_not_admissible` with
+`details.reason` `earlier_stage_failed` and the failed stage's id, type and
+failure category, and the stage keeps its state. A category-C
+(infrastructure) failure of an acceptance stage, or of an implement stage on
+its first execution, leaves the run `running` so the failed stage can be
+retried; retry or cancel the failed stage before dispatching anything after
+it. A failed deploy stage ahead answers `deploy_not_succeeded` instead.
+
 The same marker can also hold new dispatches while the host is short of
 memory, which the table does not spell out either. The hold is off by
 default and interim (the planned adaptive concurrency controller replaces
@@ -168,7 +193,7 @@ _Generated from the canonical sources by `scripts/gen-site-reference`; do not ed
 
 ## Operations
 
-The v0 REST API exposes **180 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
+The v0 REST API exposes **184 operations** across the paths below, generated from [`docs/api/v0.openapi.yaml`](https://github.com/kuhlman-labs/fishhawk/blob/main/docs/api/v0.openapi.yaml). That document is the source of truth; this table is its published rendering.
 
 | Method | Path | Summary |
 |---|---|---|
@@ -211,7 +236,7 @@ The v0 REST API exposes **180 operations** across the paths below, generated fro
 | `POST` | `/v0/runs/{run_id}/rebase-branch` | Advance a run branch onto its declared base (operator-gated) |
 | `POST` | `/v0/runs/{run_id}/vouch-commit` | Vouch a foreign commit as run-authored lineage |
 | `POST` | `/v0/runs/{run_id}/retrigger-ci` | Re-run a run PR's failed CI at the current head |
-| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the squash merge (skipped when already merged) |
+| `POST` | `/v0/runs/{run_id}/merge` | Record an operator merge verdict and queue the forge merge with the repository's declared merge method, default squash (skipped when already merged) |
 | `POST` | `/v0/runs/{run_id}/grooming-dispositions` | Record per-entry grooming dispositions (operator-only) |
 | `GET` | `/v0/runs/{run_id}/grooming-dispositions` | Read back the recorded grooming dispositions for a run |
 | `POST` | `/v0/runs/{run_id}/upkeep-dispositions` | Record per-finding upkeep dispositions (captain-only) |
@@ -231,6 +256,7 @@ The v0 REST API exposes **180 operations** across the paths below, generated fro
 | `GET` | `/v0/runs/{run_id}/audit` | List audit entries for a run |
 | `GET` | `/v0/runs/{run_id}/gate-view` | Gate-scoped decision view for a run |
 | `GET` | `/v0/runs/{run_id}/scope-overlap` | Live cross-run scope overlap for a run |
+| `GET` | `/v0/runs/{run_id}/campaign-pending-amendments` | Pending scope amendments on every run of this run's campaign |
 | `GET` | `/v0/runs/{run_id}/budget` | Current periodic-budget status for a run's workflow |
 | `GET` | `/v0/runs/{run_id}/cache-efficiency` | Per-run prompt-cache efficiency metric |
 | `GET` | `/v0/runs/{run_id}/cost` | Per-run estimated cost with per-stage and per-merged-PR rollup |
@@ -317,13 +343,16 @@ The v0 REST API exposes **180 operations** across the paths below, generated fro
 | `POST` | `/v0/stages/{stage_id}/acceptance-admission` | Pre-spawn acceptance short-circuit admission |
 | `POST` | `/v0/stages/{stage_id}/fixup` | Route advisory implement-review concerns back to the agent |
 | `POST` | `/v0/runs/{run_id}/merge-queue/promote` | Promote a held merge-queue entry to the head of its base's line |
+| `POST` | `/v0/runs/{run_id}/merge-queue/withdraw` | Withdraw the merge intent of a yielded merge-queue entry |
 | `POST` | `/v0/stages/{stage_id}/concurrency/promote` | Promote a queued waiter to the front of its concurrency group |
 | `POST` | `/v0/concerns/{concern_id}/waive` | Waive an open review concern with an audited reason |
 | `GET` | `/v0/runs/{run_id}/concerns` | List a run's review concerns, optionally with its decomposition children's |
 | `POST` | `/v0/runs/{run_id}/concerns/waive` | Waive several of one run's open concerns with one audited reason |
 | `POST` | `/v0/runs/{run_id}/concerns/resolve` | Resolve routed concerns as addressed on the operator's evidence (human-only) |
+| `POST` | `/v0/runs/{run_id}/escapes` | Record an escaped defect, or close a pending one with a human attestation |
 | `POST` | `/v0/runs/{run_id}/divergence/{sequence}/answer` | Answer a divergence question — one-off, or a change of doctrine |
 | `POST` | `/v0/concerns/{concern_id}/defer` | Defer an open review concern into a follow-up work item |
+| `POST` | `/v0/concerns/{concern_id}/label` | Relabel a concern's judgement, or mark it a duplicate of an earlier concern |
 | `GET` | `/v0/artifacts/{artifact_id}` | Get an artifact |
 | `POST` | `/v0/runs/{run_id}/signing-key` | Issue a per-run Ed25519 signing key |
 | `POST` | `/v0/runs/{run_id}/trace` | Upload a signed trace bundle |

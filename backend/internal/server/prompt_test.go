@@ -13405,7 +13405,7 @@ func TestScopeProvenanceForReview_SourceChildBaselineUnchangedByMove(t *testing.
 	// in PlanUntouched IF it is still in the reviewer's baseline.
 	diff := provenanceDiff("pkg/unrelated.go")
 	prov := s.scopeProvenanceForReview(context.Background(), srcChild.ID, uuid.New(),
-		parentPlan, prompt.Trigger{}, diff, nil)
+		parentPlan, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("scopeProvenanceForReview = nil, want non-nil (every whole-plan path untouched)")
 	}

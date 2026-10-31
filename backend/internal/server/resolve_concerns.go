@@ -67,6 +67,12 @@ const resolveConcernsReasonPrefix = "operator evidence: "
 type resolveConcernsRequest struct {
 	ConcernIDs []string `json:"concern_ids"`
 	Evidence   string   `json:"evidence"`
+	// Judgement is the ONE human judgement covering the batch (ADR-117 D1
+	// phase 2, E94.7 / #4840), REQUIRED: one of concern.HumanJudgements. The
+	// waive-reason prefixes do not apply here. TradeoffCost is required with
+	// judgement tradeoff and refused with any other.
+	Judgement    string `json:"judgement"`
+	TradeoffCost string `json:"tradeoff_cost"`
 }
 
 // resolveConcernsItemResult is one concern's outcome. State/StateReason carry
@@ -109,14 +115,15 @@ type resolveConcernsResponse struct {
 // Like the bulk waive the batch has two halves:
 //
 //   - PRE-VALIDATION is ALL-OR-NOTHING and mutates NOTHING: blank or
-//     over-cap evidence, empty or over-cap list, non-UUID id, duplicate id
+//     over-cap evidence, a refused judgement (E94.7 / #4840), empty or
+//     over-cap list, non-UUID id, duplicate id
 //     (compared on the PARSED uuid), unwired store (503), unknown id (404), an
 //     id from another run (400 concern_run_mismatch), or an id not in
 //     addressed_pending (409 concern_resolve_conflict naming its state and the
 //     recovery).
 //   - the APPLY loop is PER-ITEM: the concern_resolved_with_evidence intent
 //     entry is appended FIRST (failure → audit_append_failed, no mutation),
-//     then ApplyResolution(addressed). A transition failure appends the
+//     then ApplyHumanDisposition(addressed). A transition failure appends the
 //     corrective concern_resolve_failed entry and fails that ONE item.
 //
 // After the apply loop, when at least one concern was ACTUALLY resolved, it
@@ -175,6 +182,10 @@ func (s *Server) handleResolveConcerns(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			fmt.Sprintf("evidence is %d bytes; the maximum is %d (it is not truncated)", len(reqBody.Evidence), maxOperatorConcernBytes),
 			map[string]any{"field": "evidence", "bytes": len(reqBody.Evidence), "max": maxOperatorConcernBytes})
+		return
+	}
+	judgement, tradeoffCost, ok := s.concernJudgementFromRequest(w, r, reqBody.Judgement, reqBody.TradeoffCost, "")
+	if !ok {
 		return
 	}
 	if len(reqBody.ConcernIDs) == 0 {
@@ -270,6 +281,10 @@ func (s *Server) handleResolveConcerns(w http.ResponseWriter, r *http.Request) {
 		subject = "anonymous"
 	}
 	actorKind := actorKindForSubject(subject)
+	// FO ruling D2 (E94.7 / #4840): judgement_bulk is COUNT-based — true if
+	// and only if this ONE judgement covers more than one concern (parsed is
+	// the validated, de-duplicated, all-or-nothing id list).
+	judgementBulk := len(parsed) > 1
 
 	resp := resolveConcernsResponse{
 		RunID:    runID.String(),
@@ -278,7 +293,7 @@ func (s *Server) handleResolveConcerns(w http.ResponseWriter, r *http.Request) {
 	}
 	for _, row := range rows {
 		item := resolveConcernsItemResult{ConcernID: row.ID.String()}
-		updated, aerr := s.applyConcernResolve(r.Context(), row, reqBody.Evidence, subject, actorKind)
+		updated, aerr := s.applyConcernResolve(r.Context(), row, reqBody.Evidence, subject, actorKind, judgementBulk, judgement, tradeoffCost)
 		if aerr != nil {
 			item.Error = aerr.Error()
 			var appendErr concernResolveAuditAppendError
@@ -335,13 +350,15 @@ func (e concernResolveAuditAppendError) Unwrap() error { return e.err }
 //  1. append the concern_resolved_with_evidence intent entry FIRST. On failure
 //     return concernResolveAuditAppendError with NO mutation and NO corrective
 //     entry;
-//  2. ApplyResolution to `addressed`. On failure append the corrective
+//  2. ApplyHumanDisposition to `addressed`, recording OutcomeFixed and the
+//     human judgement (E94.7 / #4840). On failure append the corrective
 //     concern_resolve_failed entry (warn-only) naming the actual state, then
 //     return the transition error unwrapped.
 //
 // A non-empty row.Provenance is stamped as an additive provenance key, like
-// the waive.
-func (s *Server) applyConcernResolve(ctx context.Context, row *concern.Concern, evidence, subject string, actorKind audit.ActorKind) (*concern.Concern, error) {
+// the waive. The payload carries `judgement`, plus `tradeoff_cost` ONLY when it
+// is non-empty. judgementBulk is the count-based flag (FO ruling D2).
+func (s *Server) applyConcernResolve(ctx context.Context, row *concern.Concern, evidence, subject string, actorKind audit.ActorKind, judgementBulk bool, judgement concern.Judgement, tradeoffCost string) (*concern.Concern, error) {
 	fields := map[string]any{
 		"concern_id":  row.ID.String(),
 		"prior_state": string(row.State),
@@ -349,6 +366,10 @@ func (s *Server) applyConcernResolve(ctx context.Context, row *concern.Concern, 
 		"stage_kind":  row.StageKind,
 		"severity":    row.Severity,
 		"category":    row.Category,
+		"judgement":   string(judgement),
+	}
+	if tradeoffCost != "" {
+		fields["tradeoff_cost"] = tradeoffCost
 	}
 	if row.Provenance != "" {
 		fields["provenance"] = row.Provenance
@@ -366,7 +387,13 @@ func (s *Server) applyConcernResolve(ctx context.Context, row *concern.Concern, 
 		return nil, concernResolveAuditAppendError{err: aerr}
 	}
 
-	updated, err := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateAddressed, resolveConcernsReasonPrefix+evidence)
+	updated, err := s.cfg.ConcernRepo.ApplyHumanDisposition(ctx, row.ID, concern.StateAddressed, resolveConcernsReasonPrefix+evidence, concern.HumanDisposition{
+		Outcome:       concern.OutcomeFixed,
+		Judgement:     judgement,
+		ActorKind:     string(actorKind),
+		JudgementBulk: judgementBulk,
+		TradeoffCost:  tradeoffCost,
+	})
 	if err != nil {
 		s.writeConcernResolveFailedAudit(ctx, row, err)
 		return nil, err

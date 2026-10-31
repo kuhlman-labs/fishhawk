@@ -3,6 +3,9 @@ package server
 import (
 	"bytes"
 	"context"
+	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -75,13 +78,200 @@ func TestYieldReprobeDue_OverrunStridePastTheCapBecomesDue(t *testing.T) {
 	}
 }
 
-// yieldSweptAgo records this process's previous yield sweep as ago in the
-// past (yieldSweepSince's state), so a sweep judges the window it would after
-// a tick of that length.
+// TestYieldReprobeDueAfter_Table pins the A2.1 per-entry window (servicedAge,
+// age] (ADR-112 Amendment A2.1): a never-serviced row (servicedAge 0) judges
+// (0, age]; a serviced row is due only once a schedule point falls past the
+// age it was serviced at; nothing younger than one interval is due; and past
+// the 16-interval cap only multiples of 16 intervals are points.
+func TestYieldReprobeDueAfter_Table(t *testing.T) {
+	const i = time.Minute
+	for _, tc := range []struct {
+		age, serviced time.Duration
+		want          bool
+	}{
+		{3 * i, 0, true}, {i, 0, true}, {59 * time.Second, 0, false},
+		{3 * i, 2*i + 30*time.Second, false}, {4 * i, 2*i + 30*time.Second, true},
+		{30 * time.Second, 0, false},
+		{31 * i, 16 * i, false}, {32 * i, 16 * i, true},
+		{31 * i, 17 * i, false}, // 24 intervals is no point past the cap
+		{47 * i, 32 * i, false}, {48 * i, 32 * i, true}, {48 * i, 48 * i, false},
+	} {
+		if got := yieldReprobeDueAfter(tc.age, tc.serviced, i); got != tc.want {
+			t.Errorf("yieldReprobeDueAfter(%s, serviced %s, 1m) = %v, want %v", tc.age, tc.serviced, got, tc.want)
+		}
+	}
+	if yieldReprobeDueAfter(time.Hour, 0, 0) {
+		t.Error("a non-positive interval is due")
+	}
+}
+
+// TestYieldServicedBefore_Table pins the A2.2 order (ADR-112 Amendment A2.2):
+// a never-serviced row (seq 0) before a serviced one even when its yield is
+// younger; between serviced rows the lower seq first regardless of
+// yielded_at; equal seq by yielded_at, then by id.
+func TestYieldServicedBefore_Table(t *testing.T) {
+	t0 := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	mk := func(id string, ago time.Duration) mergequeue.Entry {
+		at := t0.Add(-ago)
+		return mergequeue.Entry{ID: uuid.MustParse(id), YieldedAt: &at}
+	}
+	older := mk("00000000-0000-0000-0000-000000000002", 2*time.Hour)
+	younger := mk("00000000-0000-0000-0000-000000000001", time.Hour)
+	tieLo := mk("00000000-0000-0000-0000-000000000003", 3*time.Hour)
+	tieHi := mk("00000000-0000-0000-0000-000000000004", 3*time.Hour)
+	for _, tc := range []struct {
+		name       string
+		aSeq, bSeq uint64
+		a, b       mergequeue.Entry
+		want       bool
+	}{
+		{"never serviced before serviced, though younger", 0, 3, younger, older, true},
+		{"serviced after never serviced, though older", 3, 0, older, younger, false},
+		{"lower seq first, though younger", 2, 5, younger, older, true},
+		{"higher seq after, though older", 5, 2, older, younger, false},
+		{"equal seq: older yield first", 4, 4, older, younger, true},
+		{"equal seq: younger yield after", 4, 4, younger, older, false},
+		{"both never serviced: older yield first", 0, 0, older, younger, true},
+		{"equal seq and yield: lower id first", 1, 1, tieLo, tieHi, true},
+		{"equal seq and yield: higher id after", 1, 1, tieHi, tieLo, false},
+	} {
+		if got := yieldServicedBefore(tc.aSeq, tc.a, tc.bSeq, tc.b); got != tc.want {
+			t.Errorf("%s: yieldServicedBefore = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// yieldSweptAgo rewinds every A2.1 service mark's age by ago (floor 0),
+// keeping its seq: a mark a sweep recorded just now then reads as one
+// recorded a tick of length ago earlier, the window the previous-sweep clock
+// it replaced judged.
 func (s *Server) yieldSweptAgo(ago time.Duration) {
 	s.yieldSweepMu.Lock()
 	defer s.yieldSweepMu.Unlock()
-	s.yieldSweepLast = time.Now().Add(-ago)
+	for id, m := range s.yieldServiced {
+		m.age = max(m.age-ago, 0)
+		s.yieldServiced[id] = m
+	}
+}
+
+// yieldMark reads entry id's A2.1 service mark under yieldSweepMu.
+func (s *Server) yieldMark(id uuid.UUID) (yieldServicedMark, bool) {
+	s.yieldSweepMu.Lock()
+	defer s.yieldSweepMu.Unlock()
+	m, ok := s.yieldServiced[id]
+	return m, ok
+}
+
+// yrListFaultQueue overrides the sweep's two listings; a nil func delegates
+// to the embedded store, as does every other method.
+type yrListFaultQueue struct {
+	mergequeue.Store
+	activeBases func(context.Context) ([]mergequeue.Base, error)
+	list        func(context.Context, mergequeue.Base) ([]mergequeue.Entry, error)
+}
+
+func (q yrListFaultQueue) ActiveBases(ctx context.Context) ([]mergequeue.Base, error) {
+	if q.activeBases != nil {
+		return q.activeBases(ctx)
+	}
+	return q.Store.ActiveBases(ctx)
+}
+
+func (q yrListFaultQueue) ListForBase(ctx context.Context, b mergequeue.Base) ([]mergequeue.Entry, error) {
+	if q.list != nil {
+		return q.list(ctx, b)
+	}
+	return q.Store.ListForBase(ctx, b)
+}
+
+// backdateYielded moves every held, yielded row's yielded_at d into the past
+// on the database clock: d of schedule time passes, and the earlier
+// yielded_at keeps each row's episode (and so its service mark).
+func (w *mqmWorld) backdateYielded(d time.Duration) {
+	w.t.Helper()
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - $1::bigint * interval '1 microsecond'
+WHERE state = 'held' AND yielded_at IS NOT NULL`, d.Microseconds())
+}
+
+// TestMergeQueueYieldSweep_ServicedMarks pins the A2.1 mark's lifecycle, one
+// assertion per mode. Each subtest yields A, ages it to 32 intervals (an hour
+// each) and sweeps once, which probes A and records its mark.
+func TestMergeQueueYieldSweep_ServicedMarks(t *testing.T) {
+	const interval = time.Hour
+	ctx := context.Background()
+	serviced := func(t *testing.T) (*mqmWorld, *mcqRun, mergequeue.Entry) {
+		t.Helper()
+		w, a, _ := newYieldWorld(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours 10 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+		if n := w.srv.sweepMergeQueueYields(ctx, interval); n != 1 {
+			t.Fatalf("precondition: the first sweep re-probed %d rows, want 1", n)
+		}
+		e := w.active(a)
+		if m, ok := w.srv.yieldMark(e.ID); !ok || m.seq != 1 || !m.yieldedAt.Equal(*e.YieldedAt) || m.age < 32*interval {
+			t.Fatalf("precondition: A's mark = %+v (present %v), want seq 1 at the listed episode, age >= 32h", m, ok)
+		}
+		return w, a, e
+	}
+
+	// (1) MECHANISM: the stale mark's age (~32 intervals) exceeds the new
+	// episode's latest point (1 interval), so without the episode check the
+	// row is not due and the sweep probes 0 rows.
+	t.Run("a later yielded_at is a new episode", func(t *testing.T) {
+		w, a, _ := serviced(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '1 hour 5 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+		if n := w.srv.sweepMergeQueueYields(ctx, interval); n != 1 {
+			t.Fatalf("sweep after a new episode re-probed %d rows, want 1 (judged over (0, age])", n)
+		}
+		e := w.active(a)
+		if m, ok := w.srv.yieldMark(e.ID); !ok || m.seq != 2 || !m.yieldedAt.Equal(*e.YieldedAt) {
+			t.Fatalf("A's mark = %+v (present %v), want seq 2 at the new episode %v", m, ok, e.YieldedAt)
+		}
+	})
+
+	// (2) A fully listed sweep that no longer lists the entry prunes its mark.
+	t.Run("pruned after a fully listed sweep", func(t *testing.T) {
+		w, _, e := serviced(t)
+		w.srv.cfg.MergeQueue = yrListFaultQueue{Store: w.store, list: func(ctx context.Context, b mergequeue.Base) ([]mergequeue.Entry, error) {
+			entries, err := w.store.ListForBase(ctx, b)
+			var kept []mergequeue.Entry
+			for _, x := range entries {
+				if x.ID != e.ID {
+					kept = append(kept, x)
+				}
+			}
+			return kept, err
+		}}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		if m, ok := w.srv.yieldMark(e.ID); ok {
+			t.Fatalf("A's mark = %+v after a fully listed sweep that no longer lists A, want pruned", m)
+		}
+	})
+
+	// (3) MECHANISM: the failed listing contributes no ids, so an unguarded
+	// prune drops the mark.
+	t.Run("kept when a base listing fails", func(t *testing.T) {
+		w, _, e := serviced(t)
+		w.srv.cfg.MergeQueue = yrListFaultQueue{Store: w.store, list: func(context.Context, mergequeue.Base) ([]mergequeue.Entry, error) {
+			return nil, errors.New("injected ListForBase failure")
+		}}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		if _, ok := w.srv.yieldMark(e.ID); !ok {
+			t.Fatal("A's mark was pruned by a sweep whose base listing failed, want kept")
+		}
+	})
+
+	// (4) A failed ActiveBases lists nothing, so an unguarded prune drops the
+	// mark.
+	t.Run("kept when ActiveBases fails", func(t *testing.T) {
+		w, _, e := serviced(t)
+		w.srv.cfg.MergeQueue = yrListFaultQueue{Store: w.store, activeBases: func(context.Context) ([]mergequeue.Base, error) {
+			return nil, errors.New("injected ActiveBases failure")
+		}}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		if _, ok := w.srv.yieldMark(e.ID); !ok {
+			t.Fatal("A's mark was pruned by a sweep whose ActiveBases failed, want kept")
+		}
+	})
 }
 
 // TestMergeQueueYieldSweep_FirstSweepAfterStartProbesAPastPointRow: a fresh
@@ -223,28 +413,71 @@ func TestMergeQueueYieldReprobe_HeadMovedReanchorsKeepingTheMarker(t *testing.T)
 	}
 }
 
-// TestMergeQueueYieldReprobe_NothingBranches: a stale episode (the CAS
-// conflict), a transport failure, a merged PR, a terminal run and an entry
-// that is not yielded each write nothing and leave the marker in place.
+// yrFailPRRead answers the REST read of pull request number with a 500 and
+// sends every other request (the review snapshot, the check runs) on to the
+// fake forge.
+type yrFailPRRead struct{ number int }
+
+func (f yrFailPRRead) RoundTrip(r *http.Request) (*http.Response, error) {
+	if r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, fmt.Sprintf("/pulls/%d", f.number)) {
+		return &http.Response{StatusCode: http.StatusInternalServerError, Status: "500 Internal Server Error",
+			Header: http.Header{}, Body: io.NopCloser(strings.NewReader("")), Request: r}, nil
+	}
+	return http.DefaultTransport.RoundTrip(r)
+}
+
+// TestMergeQueueYieldReprobe_NothingBranches: a stale revision (the CAS
+// conflict, docs/adr/112 A3.6), a transport failure, a failed pull-request
+// read or no GitHub client (step (1)'s precondition), a merged PR, a terminal
+// run and an entry that is not yielded each write nothing and leave the
+// marker in place.
 func TestMergeQueueYieldReprobe_NothingBranches(t *testing.T) {
 	ctx := context.Background()
-	t.Run("stale episode", func(t *testing.T) {
+	t.Run("stale revision", func(t *testing.T) {
 		w, a, y := newYieldWorld(t)
 		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 		stale := y
-		old := y.YieldedAt.Add(-time.Hour)
-		stale.YieldedAt = &old
+		stale.YieldRevision = y.YieldRevision - 1
 		if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
 			t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
 		}
 		if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
-			t.Fatalf("a stale-episode probe cleared the marker: %+v", e)
+			t.Fatalf("a stale-revision probe cleared the marker: %+v", e)
 		}
 	})
 	t.Run("transport failure", func(t *testing.T) {
 		w, a, _ := newYieldWorld(t)
 		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
 		w.gh.set(func() { w.gh.graphQLFail[a.pr] = 10 })
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing || w.active(a).YieldedAt == nil {
+			t.Fatalf("outcome = %s, want %s with the marker kept", got, reprobeNothing)
+		}
+	})
+	// Concern bd5b2e63: step (1)'s PR read is a hard precondition. The fold is
+	// approved at a1 and every merge-gate leg passes, so only the failed REST
+	// read keeps the marker. Counterfactual: falling through to the fold on a
+	// read error clears it, RED.
+	t.Run("pull request read fails", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+		w.srv.bgMergeQueuePump.Wait()
+		gh := *w.srv.cfg.GitHub
+		gh.HTTP = &http.Client{Transport: yrFailPRRead{number: a.pr}, Timeout: timescale.D(30 * time.Second)}
+		w.srv.cfg.GitHub = &gh
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing {
+			t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		if e := w.active(a); e.YieldedAt == nil || e.YieldReason != mergeCandidateQueueReasonForgeApprovalDismissed ||
+			len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 || len(w.rows(a, CategoryMergeQueueYielded)) != 1 {
+			t.Fatalf("a failed PR read wrote: %+v", e)
+		}
+	})
+	t.Run("no GitHub client", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+		w.srv.bgMergeQueuePump.Wait()
+		w.srv.cfg.GitHub = nil
 		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeNothing || w.active(a).YieldedAt == nil {
 			t.Fatalf("outcome = %s, want %s with the marker kept", got, reprobeNothing)
 		}
@@ -422,11 +655,12 @@ func TestMergeQueueYieldSurface_ConcurrentSweepsPostOnce(t *testing.T) {
 }
 
 // TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase: two yielded rows on
-// one base are both due, and the sweep re-probes only the OLDEST by
-// yielded_at. The fixture makes FIFO order and yield order disagree: A was
-// enqueued first (so it lists first) but carries the YOUNGER yielded_at, so
-// only B, the older yield, clears and A stays marked though it is approved
-// too. Counterfactual: deleting the yieldedBefore comparison takes the first
+// one base are both due and both never serviced, so ADR-112 Amendment A2.2's
+// tie-break by yielded_at decides: the sweep re-probes only the OLDEST yield.
+// The fixture makes FIFO order and yield order disagree: A was enqueued first
+// (so it lists first) but carries the YOUNGER yielded_at, so only B, the
+// older yield, clears and A stays marked though it is approved too.
+// Counterfactual: deleting the yieldedBefore comparison takes the first
 // listed due row (A), RED.
 func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	w := newMQELineWorld(t)
@@ -461,6 +695,135 @@ func TestMergeQueueYieldSweep_ProbesOnlyTheOldestDuePerBase(t *testing.T) {
 	}
 	if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
 		t.Fatalf("A = %+v, want still marked (listed first but the younger yield, not probed this tick)", e)
+	}
+}
+
+// TestMergeQueueYieldSweep_YoungerDueRowIsProbedUnderContention (CF7's
+// vehicle) pins ADR-112 Amendment A2.1: only the PROBED row's service mark
+// advances. A and B are yielded on one base, A enqueued first (it lists
+// first) with the older yield; aged 32 intervals + 10 s (A) and + 5 s (B) at
+// an hour-long interval, A's only review DISMISSED and B's APPROVED. Between
+// sweeps every yielded row ages one interval. Sweep 1 probes A (both never
+// serviced, A the older yield); sweep 2 finds A serviced past its latest
+// point and B never serviced, so B is probed and clears, and the detached
+// pump merges b1 while A stays yielded. MECHANISM: if every due row's mark
+// advances (CF7), sweep 1 marks A and B though only A is probed; both next
+// become due together at the 48-interval point, where A wins again, so B is
+// never probed, RED.
+func TestMergeQueueYieldSweep_YoungerDueRowIsProbedUnderContention(t *testing.T) {
+	const interval = time.Hour
+	ctx := context.Background()
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mqeSpecYAML))
+	b := w.seed("b", "b1", []byte(mqeSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.mqpHeldIntent(b, "b1", false)
+	w.forgeReviews(a, []string{"alice"}, mqmReview(1, "alice", "DISMISSED", "a1"))
+	w.forgeReviews(b, []string{"alice"}, mqmReview(2, "alice", "DISMISSED", "b1"))
+	w.pumpBase(a)
+	w.backdateApprovalWait(a)
+	w.pumpBase(a) // A yields; B is admitted and waits
+	w.backdateApprovalWait(b)
+	w.pumpBase(b) // B yields
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours 10 seconds' WHERE run_id = $1 AND state = 'held'`, a.id)
+	w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours 5 seconds' WHERE run_id = $1 AND state = 'held'`, b.id)
+	ea, eb := w.active(a), w.active(b)
+	if !ea.Yielded() || !eb.Yielded() || !ea.EnqueuedAt.Before(eb.EnqueuedAt) || !ea.YieldedAt.Before(*eb.YieldedAt) {
+		t.Fatalf("precondition: A (enqueued %v, yielded %v) and B (enqueued %v, yielded %v), want both yielded, A enqueued first with the older yield",
+			ea.EnqueuedAt, ea.YieldedAt, eb.EnqueuedAt, eb.YieldedAt)
+	}
+	listed, err := w.store.ListForBase(ctx, ea.Base())
+	if err != nil || len(listed) != 2 || listed[0].ID != ea.ID {
+		t.Fatalf("precondition: ListForBase = %d entries (err %v), want 2 with A first", len(listed), err)
+	}
+	w.forgeReviews(b, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "b1"))
+
+	clearedAt := 0
+	for k := 1; k <= 40 && clearedAt == 0; k++ {
+		if k > 1 {
+			w.backdateYielded(interval)
+		}
+		w.srv.sweepMergeQueueYields(ctx, interval)
+		w.srv.bgMergeQueuePump.Wait()
+		if len(w.rows(b, CategoryMergeQueueYieldCleared)) == 1 {
+			clearedAt = k
+		}
+	}
+	if clearedAt == 0 {
+		t.Fatal("B (approved, the younger due yield) was never re-probed in 40 sweeps: A won every contended sweep")
+	}
+	t.Logf("B cleared at sweep %d", clearedAt)
+	w.requirePuts("b1")
+	w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	if e := w.active(a); e.YieldedAt == nil || len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
+		t.Fatalf("A = %+v, want still yielded (its only review is dismissed)", e)
+	}
+}
+
+// TestMergeQueueYieldSweep_RoundRobinReachesTheEligibleRowBehindSixteenBlocked
+// is ADR-112 Amendment A2's N=17 evidence (CF8's vehicle): 17 runs on ONE
+// base yield in FIFO order (r1 the oldest yield, r17 the youngest), aged on
+// the database clock to 32 intervals + (18 − i) s at an hour-long interval.
+// r1..r16 keep a DISMISSED review (permanently blocked) and r17 is APPROVED.
+// Every yielded row ages one interval between sweeps, and each sweep
+// re-probes exactly one row. Sweeps 1-16 (ages in [32, 48) intervals, latest
+// point 32) probe r1..r16 once each, oldest yield first among the
+// never-serviced; each is then not due until the 48-interval point. At sweep
+// 17 all 17 rows are due and round-robin (A2.2) picks r17, never serviced, so
+// r17 clears and the detached pump merges it while r1..r16 stay yielded.
+// MECHANISM: oldest-by-yielded_at (CF8) picks r1 again at sweep 17, so r17 is
+// not probed within 17 sweeps, RED.
+func TestMergeQueueYieldSweep_RoundRobinReachesTheEligibleRowBehindSixteenBlocked(t *testing.T) {
+	const interval, n = time.Hour, 17
+	ctx := context.Background()
+	w := newMQELineWorld(t)
+	head := func(i int) string { return fmt.Sprintf("r%dh", i+1) }
+	runs := make([]*mcqRun, n)
+	for i := range runs {
+		runs[i] = w.seed(fmt.Sprintf("r%d", i+1), head(i), []byte(mqeSpecYAML))
+	}
+	for i, r := range runs {
+		w.mqpHeldIntent(r, head(i), false)
+		w.forgeReviews(r, []string{"alice"}, mqmReview(int64(i+1), "alice", "DISMISSED", head(i)))
+	}
+	w.pumpBase(runs[0]) // r1 is admitted and waits
+	for _, r := range runs {
+		w.backdateApprovalWait(r)
+		w.pumpBase(r) // r yields; the next run is admitted and waits
+	}
+	for i, r := range runs {
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = clock_timestamp() - interval '32 hours' - $2::int * interval '1 second'
+WHERE run_id = $1 AND state = 'held'`, r.id, n+1-(i+1))
+		if e := w.active(r); !e.Yielded() || e.State != mergequeue.StateHeld {
+			t.Fatalf("precondition: r%d = %s yielded_at %v, want held and yielded", i+1, e.State, e.YieldedAt)
+		}
+	}
+	last := runs[n-1]
+	w.forgeReviews(last, []string{"alice"}, mqmReview(100, "alice", "APPROVED", head(n-1)))
+
+	clearedAt := 0
+	for k := 1; k <= n && clearedAt == 0; k++ {
+		if k > 1 {
+			w.backdateYielded(interval)
+		}
+		if got := w.srv.sweepMergeQueueYields(ctx, interval); got != 1 {
+			t.Fatalf("sweep %d re-probed %d rows, want exactly 1", k, got)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		if len(w.rows(last, CategoryMergeQueueYieldCleared)) == 1 {
+			clearedAt = k
+		}
+	}
+	if clearedAt == 0 {
+		t.Fatalf("r%d (approved, the youngest yield) was not re-probed within %d sweeps: the blocked rows starved it", n, n)
+	}
+	t.Logf("r%d cleared at sweep %d", n, clearedAt)
+	w.requirePuts(head(n - 1))
+	w.requireState(last, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+	for i, r := range runs[:n-1] {
+		if e := w.active(r); e.YieldedAt == nil || len(w.rows(r, CategoryMergeQueueYieldCleared)) != 0 {
+			t.Fatalf("r%d = %+v, want still yielded (its only review is dismissed)", i+1, e)
+		}
 	}
 }
 
@@ -542,16 +905,16 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredClearsOnceTheSnapshotShowsApp
 // TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield:
 // the fixture snapshot reads APPROVED / CLEAN (so a read would clear), but the
 // re-probe's fresh snapshot read fails (the gate-less fold makes no forge
-// read, so the predicate's read is the one that fails): the row stays
-// yielded, fail closed. Counterfactual: treating a read error as the
-// condition gone clears it, RED.
+// read, so the tier-3 read is the one that fails): the row stays yielded and
+// nothing is written, fail closed (mergeQueueYieldTier ok=false).
+// Counterfactual: treating a read error as the condition gone clears it, RED.
 func TestMergeQueueYieldReprobe_ForgeReviewRequiredSnapshotErrorKeepsTheYield(t *testing.T) {
 	w, a, y := newRowFourYieldWorld(t)
 	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{ReviewDecision: "APPROVED", MergeStateStatus: "CLEAN"})
 	w.gh.set(func() { w.gh.graphQLFail[a.pr] = 10 })
 
-	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeUnchanged {
-		t.Fatalf("outcome = %s, want %s", got, reprobeUnchanged)
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeNothing {
+		t.Fatalf("outcome = %s, want %s", got, reprobeNothing)
 	}
 	w.srv.bgMergeQueuePump.Wait()
 	w.requireRowFourKept(a, y)
@@ -580,6 +943,30 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredWebhookWithoutForgeChangeKeep
 	if n := w.gh.snapshotCalls() - reads; n != 1 {
 		t.Fatalf("review-snapshot reads during the webhook = %d, want 1 (the re-probe's fresh snapshot)", n)
 	}
+	w.requireRowFourKept(a, y)
+	w.requirePuts("a1")
+}
+
+// TestMergeQueueYieldReprobe_UpgradedForgeReviewRequiredWithoutFlagKeepsTheYield
+// (concern fd0cf884): a forge_review_required yield written before 0115 (or by
+// a reverted binary) carries no row4_flag. The fold is approved (gate-less),
+// every merge-gate leg passes and the forge would accept the PUT, but the
+// fresh snapshot still reads BLOCKED: the stored reason alone keeps tier 3,
+// so the row stays yielded and nothing is PUT. Counterfactual: keying tier 3
+// on Row4Flag only skips the snapshot and clears it, RED.
+func TestMergeQueueYieldReprobe_UpgradedForgeReviewRequiredWithoutFlagKeepsTheYield(t *testing.T) {
+	w, a, y := newRowFourYieldWorld(t)
+	w.exec(`UPDATE merge_candidate_queue_entries SET row4_flag = false WHERE run_id = $1 AND state = 'held'`, a.id)
+	w.gh.set(func() { delete(w.gh.putStatus, a.pr) })
+	e := w.active(a)
+	if e.Row4Flag || e.YieldReason != mergeQueueYieldForgeReviewRequired {
+		t.Fatalf("seed = flag %v reason %q, want a flagless forge_review_required yield", e.Row4Flag, e.YieldReason)
+	}
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), e, false); got != reprobeUnchanged {
+		t.Fatalf("outcome = %s, want %s (the forge still reports BLOCKED)", got, reprobeUnchanged)
+	}
+	w.srv.bgMergeQueuePump.Wait()
 	w.requireRowFourKept(a, y)
 	w.requirePuts("a1")
 }
@@ -615,4 +1002,301 @@ func TestMergeQueueYieldReprobe_ForgeReviewRequiredReyieldKeepsTheEpisode(t *tes
 	if n := len(w.rows(a, CategoryMergeQueueYieldPosted)); n != 1 {
 		t.Fatalf("merge_queue_yield_posted rows = %d, want 1 (one episode)", n)
 	}
+}
+
+// --- docs/adr/112 Amendment A3 (#4780): the re-probe's head discovery,
+// clear predicate, tiers, row-4 flag, revision CAS and force rule, driven
+// through the existing mcq fake forge (prs, checks, reviewSnapshot).
+
+// yrRequireCI declares "ci" as r's required check (the run's
+// RequiredChecksSnapshot), so a red "ci" is A3.1(a) checks_red.
+func (w *mqmWorld) yrRequireCI(r *mcqRun) {
+	w.t.Helper()
+	w.exec(`UPDATE runs SET required_checks_snapshot = '{"contexts":["ci"]}' WHERE id = $1`, r.id)
+}
+
+// yrChecks serves one completed "ci" check run with conclusion at head.
+func (w *mqmWorld) yrChecks(head, conclusion string) {
+	w.gh.set(func() {
+		w.gh.checks[head] = `[{"id":2,"name":"ci","status":"completed","conclusion":"` + conclusion +
+			`","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
+	})
+}
+
+// yrYieldStored admits r's held intent entry and yields it with reason
+// through the store (no merge-on-pass), returning the yielded entry.
+func (w *mqmWorld) yrYieldStored(r *mcqRun, reason string) mergequeue.Entry {
+	w.t.Helper()
+	ctx := context.Background()
+	e := w.active(r)
+	adm, err := w.store.AdmitNext(ctx, e.Base())
+	if err != nil || !adm.Admitted || adm.Entry.ID != e.ID {
+		w.t.Fatalf("admit %s: %+v %v", r.id, adm, err)
+	}
+	y, err := w.store.Yield(ctx, e.ID, adm.Entry.AdmissionEpoch, newMergeQueueYield(reason, "seeded", mergeQueueYieldRow(reason)).marker())
+	if err != nil {
+		w.t.Fatalf("yield %s: %v", r.id, err)
+	}
+	return y
+}
+
+// newGatelessRedYieldWorld seeds a GATE-LESS run held with intent at a1,
+// "ci" required and red at a1, yielded merge_checks_red through the store.
+func newGatelessRedYieldWorld(t *testing.T) (*mqmWorld, *mcqRun, mergequeue.Entry) {
+	t.Helper()
+	w := newMQELineWorld(t)
+	a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+	w.mqpHeldIntent(a, "a1", false)
+	w.yrRequireCI(a)
+	w.yrChecks("a1", "failure")
+	return w, a, w.yrYieldStored(a, mergeQueueYieldMergeChecksRed)
+}
+
+// TestReprobe_A34_ApprovedFoldWithFailingLegDoesNotClear (T20, CF18
+// vehicle): a GATED run yielded on a dismissal now carries a qualifying
+// approval at the anchored head, but its required check is red there: the
+// clear predicate (A3.4) refuses, the row stays yielded and transitions to
+// merge_checks_red / retrigger_ci, and nothing is cleared. MECHANISM: the
+// fold alone approves, so only the merge-gate legs block.
+func TestReprobe_A34_ApprovedFoldWithFailingLegDoesNotClear(t *testing.T) {
+	w, a, y := newYieldWorld(t)
+	w.yrRequireCI(a)
+	w.yrChecks("a1", "failure")
+	w.forgeReviews(a, []string{"alice"}, mqmReview(2, "alice", "APPROVED", "a1"))
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeTransitioned {
+		t.Fatalf("outcome = %s, want %s", got, reprobeTransitioned)
+	}
+	e := w.active(a)
+	if e.State != mergequeue.StateHeld || e.YieldReason != mergeQueueYieldMergeChecksRed || !e.YieldedAt.Equal(*y.YieldedAt) {
+		t.Fatalf("A = %s %q yielded_at %v, want held merge_checks_red in the episode %v", e.State, e.YieldReason, e.YieldedAt, y.YieldedAt)
+	}
+	rows := w.rows(a, CategoryMergeQueueYielded)
+	if p := w.payload(rows[len(rows)-1]); p["next_step"] != mergeQueueYieldNextRetriggerCI || p["precedence_row"] != float64(mergeQueueYieldRowEligibility) {
+		t.Fatalf("transition payload = %v, want retrigger_ci row 1", p)
+	}
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 0", n)
+	}
+}
+
+// TestReprobe_A35_TierTransitions (T21): one subtest per A3.5 tier
+// transition.
+func TestReprobe_A35_TierTransitions(t *testing.T) {
+	ctx := context.Background()
+	t.Run("veto beats merge-gate", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		w.forgeReviews(a, []string{"bob"}, mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeCandidateQueueReasonForgeApprovalVetoed {
+			t.Fatalf("reason = %q, want forge_approval_vetoed (tier 1 over a red leg)", e.YieldReason)
+		}
+	})
+	t.Run("merge-gate beats row-4", func(t *testing.T) {
+		w, a, _ := newRowFourYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeQueueYieldMergeChecksRed || !e.Row4Flag {
+			t.Fatalf("reason = %q flag=%v, want merge_checks_red with row4_flag kept", e.YieldReason, e.Row4Flag)
+		}
+	})
+	t.Run("row-4 beats a non-approved fold", func(t *testing.T) {
+		w, a, _ := newYieldWorld(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET row4_flag = true WHERE run_id = $1 AND state = 'held'`, a.id)
+		snap := w.gh.reviewSnapshot[a.pr]
+		w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{Reviews: snap.Reviews, Author: snap.Author, MergeStateStatus: "BLOCKED"})
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeQueueYieldForgeReviewRequired {
+			t.Fatalf("reason = %q, want forge_review_required (tier 3 over a dismissed fold)", e.YieldReason)
+		}
+	})
+	t.Run("row-4 then red then green while BLOCKED reads forge_review_required", func(t *testing.T) {
+		w, a, _ := newRowFourYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+		if e := w.active(a); e.YieldReason != mergeQueueYieldMergeChecksRed {
+			t.Fatalf("after red = %q, want merge_checks_red", e.YieldReason)
+		}
+		w.yrChecks("a1", "success")
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeTransitioned {
+			t.Fatalf("after green = %s, want transitioned", got)
+		}
+		if e := w.active(a); e.YieldReason != mergeQueueYieldForgeReviewRequired || !e.Yielded() {
+			t.Fatalf("after green while BLOCKED = %q yielded=%v, want forge_review_required", e.YieldReason, e.Yielded())
+		}
+	})
+}
+
+// TestReprobe_A36_FlagSurvivesBlockedGoneWhileRed (T22, CF19 vehicle): a
+// row-4 yield turns red (merge_checks_red), the snapshot then reads BLOCKED
+// GONE while red, then CI goes green with BLOCKED back: the row stays yielded
+// as forge_review_required and is NOT cleared. MECHANISM: the gone read
+// happens while tier 2 blocks, so only the persisted flag (never cleared by a
+// reason transition or a gone read without a clear) keeps the row-4
+// obligation; with UpdateYield assigning row4_flag = marker.Row4 the red
+// transition drops it and the last probe clears, RED.
+func TestReprobe_A36_FlagSurvivesBlockedGoneWhileRed(t *testing.T) {
+	ctx := context.Background()
+	w, a, _ := newRowFourYieldWorld(t)
+	w.yrRequireCI(a)
+	w.yrChecks("a1", "failure")
+	w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{ReviewDecision: "APPROVED", MergeStateStatus: "CLEAN"})
+	w.srv.reprobeMergeQueueYield(ctx, w.active(a), false)
+	if e := w.active(a); e.YieldReason != mergeQueueYieldMergeChecksRed || !e.Row4Flag {
+		t.Fatalf("gone while red = %q flag=%v, want merge_checks_red with the flag kept", e.YieldReason, e.Row4Flag)
+	}
+	w.yrChecks("a1", "success")
+	w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{MergeStateStatus: "BLOCKED"})
+	if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got == reprobeCleared {
+		t.Fatal("the row cleared while the forge reads BLOCKED again")
+	}
+	if e := w.active(a); e.YieldReason != mergeQueueYieldForgeReviewRequired || !e.Yielded() {
+		t.Fatalf("green with BLOCKED back = %q yielded=%v, want forge_review_required", e.YieldReason, e.Yielded())
+	}
+	if n := len(w.rows(a, CategoryMergeQueueYieldCleared)); n != 0 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 0", n)
+	}
+}
+
+// TestReprobe_A36_DelayedProbeCannotClearOrOverwriteNewer (T23): a probe
+// holding the entry read at revision r runs AFTER a newer probe transitioned
+// the reason (same head and yielded_at): its clear (the forge now approves)
+// and its transition both miss the revision CAS, and a READ shows the newer
+// marker and reason intact.
+func TestReprobe_A36_DelayedProbeCannotClearOrOverwriteNewer(t *testing.T) {
+	ctx := context.Background()
+	w, a, _ := newYieldWorld(t)
+	stale := w.active(a)
+	w.forgeReviews(a, []string{"bob"}, mqmReview(2, "bob", "CHANGES_REQUESTED", "a1"))
+	if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got != reprobeTransitioned {
+		t.Fatalf("newer probe = %s, want transitioned", got)
+	}
+	newer := w.active(a)
+
+	w.forgeReviews(a, []string{"alice"}, mqmReview(3, "alice", "APPROVED", "a1"))
+	if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
+		t.Fatalf("delayed clear = %s, want nothing", got)
+	}
+	w.forgeReviews(a, []string{"alice"}, mqmReview(4, "alice", "DISMISSED", "a1"))
+	stale.YieldReason = mergeCandidateQueueReasonForgeApprovalAbsent // the delayed probe's own stale read differs from the fold
+	if got := w.srv.reprobeMergeQueueYield(ctx, stale, false); got != reprobeNothing {
+		t.Fatalf("delayed transition = %s, want nothing", got)
+	}
+	e := w.active(a)
+	if !e.Yielded() || e.YieldReason != mergeCandidateQueueReasonForgeApprovalVetoed || e.YieldRevision != newer.YieldRevision ||
+		len(w.rows(a, CategoryMergeQueueYieldCleared)) != 0 {
+		t.Fatalf("after the delayed probes = %q rev %d yielded=%v, want the newer vetoed marker at rev %d", e.YieldReason, e.YieldRevision, e.Yielded(), newer.YieldRevision)
+	}
+}
+
+// TestReprobe_A39_ForceSkipsOnlySnapshot (T24, CF20 vehicle): (1) a forced
+// probe with the row-4 flag set and every leg green clears WITHOUT a
+// snapshot read and KEEPS row4_flag (read after the line merges); (2) a
+// forced probe with a red leg does NOT clear: force never skips the
+// merge-gate legs.
+func TestReprobe_A39_ForceSkipsOnlySnapshot(t *testing.T) {
+	ctx := context.Background()
+	t.Run("green legs clear without a snapshot and keep the flag", func(t *testing.T) {
+		w, a, y := newRowFourYieldWorld(t)
+		w.gh.set(func() { delete(w.gh.putStatus, a.pr) })
+		reads := w.gh.snapshotCalls()
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), true); got != reprobeCleared {
+			t.Fatalf("forced probe = %s, want cleared", got)
+		}
+		if n := w.gh.snapshotCalls() - reads; n != 0 {
+			t.Fatalf("snapshot reads during the forced probe = %d, want 0", n)
+		}
+		w.srv.bgMergeQueuePump.Wait()
+		var flag bool
+		if err := w.pool.QueryRow(ctx, `SELECT row4_flag FROM merge_candidate_queue_entries WHERE id = $1`, y.ID).Scan(&flag); err != nil || !flag {
+			t.Fatalf("row4_flag after a forced clear = %v (%v), want kept", flag, err)
+		}
+	})
+	t.Run("a red leg is never forced", func(t *testing.T) {
+		w, a, _ := newRowFourYieldWorld(t)
+		w.yrRequireCI(a)
+		w.yrChecks("a1", "failure")
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), true); got == reprobeCleared {
+			t.Fatal("a forced probe cleared a red leg")
+		}
+		if e := w.active(a); !e.Yielded() || e.YieldReason != mergeQueueYieldMergeChecksRed {
+			t.Fatalf("A = %q yielded=%v, want merge_checks_red", e.YieldReason, e.Yielded())
+		}
+	})
+}
+
+// TestReprobe_A34_GatelessRepairPushReanchorsAndClears (T25, CF21 vehicle):
+// a GATE-LESS run yielded merge_checks_red at a1; the repair push moves the
+// PR head to a2, whose checks are green: ONE probe re-anchors to a2 and
+// clears there, keeping the episode's yielded_at. MECHANISM: a gate-less
+// fold is approved without reading the PR, so only the gate-independent PR
+// read discovers a2; without it the legs are judged red at a1, RED.
+func TestReprobe_A34_GatelessRepairPushReanchorsAndClears(t *testing.T) {
+	w, a, y := newGatelessRedYieldWorld(t)
+	w.gh.set(func() { w.gh.prs[a.pr].head = "a2" })
+
+	if got := w.srv.reprobeMergeQueueYield(context.Background(), w.active(a), false); got != reprobeCleared {
+		t.Fatalf("outcome = %s, want cleared", got)
+	}
+	w.srv.bgMergeQueuePump.Wait()
+	rows := w.rows(a, CategoryMergeQueueYieldCleared)
+	if len(rows) != 1 {
+		t.Fatalf("merge_queue_yield_cleared rows = %d, want 1", len(rows))
+	}
+	_, yieldedAt := mergeQueueYieldEpisode(y)
+	if p := w.payload(rows[0]); p["head_sha"] != "a2" || p["yielded_at"] != yieldedAt || p["yield_reason"] != mergeQueueYieldMergeChecksRed {
+		t.Fatalf("cleared payload = %v, want head a2 in the episode %s", p, yieldedAt)
+	}
+}
+
+// TestReprobe_A37 (T26): docs/adr/112 A3.7's episode. (1) A flap: a
+// merge_checks_red yield clears on green and the line re-yields (the forge
+// refuses the pinned merge while BLOCKED, forge_review_required): the
+// re-yield CONTINUES the cleared episode's yielded_at whatever the reason,
+// so the A2.1 service mark still applies (the backoff keeps growing), and
+// the hold budget is untouched by the clear and the re-yield. (2) A head
+// move keeps the episode (yielded_at and the approval anchor).
+func TestReprobe_A37(t *testing.T) {
+	ctx := context.Background()
+	t.Run("a flap continues the episode, the backoff and the budget", func(t *testing.T) {
+		w, a, y := newGatelessRedYieldWorld(t)
+		w.exec(`UPDATE merge_candidate_queue_entries SET yielded_at = yielded_at - interval '1 hour', gate_hold_tokens = 1 WHERE id = $1`, y.ID)
+		y = w.active(a)
+		w.srv.markYieldReprobeServiced(y)
+		w.yrChecks("a1", "success")
+		w.gh.set(func() { w.gh.putStatus[a.pr] = http.StatusMethodNotAllowed })
+		w.gh.setReviewSnapshot(a.pr, mcqReviewSnapshot{MergeStateStatus: "BLOCKED"})
+
+		if !w.srv.ReprobeMergeQueueYield(ctx, a.id, false) {
+			t.Fatal("green checks did not clear the merge_checks_red yield")
+		}
+		w.srv.bgMergeQueuePump.Wait()
+
+		e := w.active(a)
+		if !e.Yielded() || e.YieldReason != mergeQueueYieldForgeReviewRequired || !e.YieldedAt.Equal(*y.YieldedAt) {
+			t.Fatalf("after the flap = %q yielded_at %v, want forge_review_required continuing %v", e.YieldReason, e.YieldedAt, y.YieldedAt)
+		}
+		if _, seq := w.srv.yieldReprobeDueFor(e, time.Minute); seq == 0 {
+			t.Fatal("the re-yield lost its service mark (a fresh episode), want the backoff continued")
+		}
+		if e.GateHoldTokens != 1 {
+			t.Fatalf("hold tokens after the flap = %d, want 1 (untouched)", e.GateHoldTokens)
+		}
+	})
+	t.Run("a head move keeps the episode", func(t *testing.T) {
+		w, a, y := newYieldWorld(t)
+		w.gh.set(func() { w.gh.prs[a.pr].head = "a3" })
+		if got := w.srv.reprobeMergeQueueYield(ctx, w.active(a), false); got == reprobeCleared || got == reprobeNothing {
+			t.Fatalf("outcome = %s, want the row re-anchored and still yielded", got)
+		}
+		e := w.active(a)
+		if e.AnchoredHeadSHA != "a3" || !e.YieldedAt.Equal(*y.YieldedAt) || !e.ApprovalWaitStartedAt.Equal(*y.ApprovalWaitStartedAt) {
+			t.Fatalf("after the head move = %s %v %v, want a3 with the episode (%v, %v)", e.AnchoredHeadSHA, e.YieldedAt, e.ApprovalWaitStartedAt, y.YieldedAt, y.ApprovalWaitStartedAt)
+		}
+	})
 }

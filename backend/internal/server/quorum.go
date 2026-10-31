@@ -510,6 +510,12 @@ type predicateSnapshot struct {
 	// gate without members leave them unset.
 	MembersPrincipal string `json:"members_principal,omitempty"`
 	MembersListed    *bool  `json:"members_listed,omitempty"`
+	// MembersCredential is the credential kind the members leg evaluated
+	// (an identity.Credential* value, #4633), set only when the principal
+	// IS the presenting credential's own subject. Additive + omitempty: a
+	// gate without members, and a delegated agent-kind submission (whose
+	// principal is the seated captain), leave it unset.
+	MembersCredential string `json:"members_credential,omitempty"`
 }
 
 // submitterClass labels the submitter relative to the quorum: "author" when
@@ -642,6 +648,10 @@ type predicateResolution struct {
 	// MembersListed means the members leg did not run.
 	MembersPrincipal string
 	MembersListed    *bool
+	// MembersCredential is the credential kind the members leg evaluated
+	// (an identity.Credential* value, #4633), set only when the principal
+	// IS the presenting credential's own subject; empty otherwise.
+	MembersCredential string
 }
 
 // approvalPrincipal returns the identity the gate's approvals.members list is

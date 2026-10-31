@@ -187,12 +187,15 @@ func TestRedPass_RouteRefusedNamesFixupStage(t *testing.T) {
 	}
 }
 
-// Exactly once: a redelivered settle of the same entry writes no second row.
-// MECHANISM: writing the row regardless of SettleResult.Settled appends a
-// second row on the redelivery.
+// Exactly once: a redelivered settle of the same entry writes no second row,
+// and a real NON-ejected settle (b dropped) writes none. MECHANISM: writing
+// the row regardless of SettleResult.Settled appends a second row on the
+// redelivery; a writer that appended merge_queue_ejected on every settling
+// call writes a row for b's drop (RED on b's rows). Sibling:
+// TestEjectionRow_DroppedSettleWritesNone pins the drop alone.
 func TestEjectionRow_WrittenOnlyByTheSettlingCall(t *testing.T) {
 	f := newMCQFixture(t)
-	a, _ := f.wave()
+	a, b := f.wave()
 	st, found, err := f.store.ActiveForRun(context.Background(), a.id)
 	if err != nil || !found {
 		t.Fatalf("active entry: %v %v", found, err)
@@ -211,9 +214,21 @@ func TestEjectionRow_WrittenOnlyByTheSettlingCall(t *testing.T) {
 		t.Fatalf("redelivered SettleAt = %v, want admitSettled", out)
 	}
 	f.oneEjection(a, mergeCandidateQueueReasonPassNotStartable, mergeQueueEjectNextGetRunStatus)
-	// A non-ejected settle writes none.
-	if rows := f.rows(a, CategoryMergeQueueEjected); len(rows) != 1 {
-		t.Fatalf("rows = %d", len(rows))
+	// A real non-ejected settle: b's entry (live or held after a's settle
+	// pumped the base, read fresh) dropped writes no row.
+	bst, found, err := f.store.ActiveForRun(context.Background(), b.id)
+	if err != nil || !found {
+		t.Fatalf("b active entry: %v %v", found, err)
+	}
+	if _, ok := f.srv.settleMergeCandidateQueueEntryWith(context.Background(), bst.Entry, mergequeue.StateDropped,
+		mergeCandidateQueueReasonRunTerminal, nil); !ok {
+		t.Fatal("dropping b's entry did not settle it")
+	}
+	if rows := f.ejectedRows(a); len(rows) != 1 {
+		t.Fatalf("a merge_queue_ejected rows = %d, want 1", len(rows))
+	}
+	if rows := f.ejectedRows(b); len(rows) != 0 {
+		t.Fatalf("b merge_queue_ejected rows = %v, want none for a drop", rows)
 	}
 }
 
@@ -370,5 +385,33 @@ func TestMergeQueueEjectNextStep_Total(t *testing.T) {
 		if got := mergeQueueForgeReasonFor(err); got != want {
 			t.Errorf("forge reason(%v) = %q, want %q", err, got, want)
 		}
+	}
+}
+
+// TestMergeQueueForgeReason_MergeMethodRefused (E93.2 / #4658): a
+// *MergeMethodRefusalError riding alongside ErrPullRequestNotMergeable maps to
+// merge_method_refused (decided BEFORE not_mergeable), and its remedy names
+// the settings-or-by-hand remedy and the admission-spec semantics, never forge
+// text. Counterfactual: deleting the merge_method_refused case maps the
+// dual-sentinel refusal to not_mergeable (RED).
+func TestMergeQueueForgeReason_MergeMethodRefused(t *testing.T) {
+	ref := &MergeMethodRefusalError{Method: "merge", Source: MergeMethodSourceDeclared, Reason: MergeMethodRefusalForgeDisallows,
+		Allowed: []string{"squash"}, Cause: fmt.Errorf("%w: %s", forge.ErrPullRequestNotMergeable, fmmSecretText)}
+	if !errors.Is(ref, forge.ErrPullRequestNotMergeable) {
+		t.Fatalf("fixture: the refusal must also carry ErrPullRequestNotMergeable (isolates the case ordering)")
+	}
+	for _, err := range []error{ref, fmt.Errorf("pinned merge: %w", ref)} {
+		if got := mergeQueueForgeReasonFor(err); got != mergeQueueForgeReasonMergeMethodRefused {
+			t.Errorf("mergeQueueForgeReasonFor(%T) = %q, want %q", err, got, mergeQueueForgeReasonMergeMethodRefused)
+		}
+	}
+	r := mergeQueueEjectRemedy(mergeQueueEjectNextMergeRun, mergeQueueForgeReasonMergeMethodRefused)
+	for _, want := range []string{"merge settings", "by hand", "admitted after it merges", "fishhawk_merge_run"} {
+		if !strings.Contains(r, want) {
+			t.Errorf("remedy = %q, want it to contain %q", r, want)
+		}
+	}
+	if strings.Contains(r, "ghs_SENTINEL") {
+		t.Errorf("remedy carries forge text: %q", r)
 	}
 }
