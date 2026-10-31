@@ -1927,9 +1927,10 @@ Notes:
   transition) and `merge_queue_yield_cleared` (the resolution) rows are
   DELIBERATELY not registered.
 
-- The merge-queue ejection and promote audit kinds `merge_queue_ejected`
-  (ADR-093 D4, E87.6 / #4297) and `merge_queue_promoted` (ADR-093 D7, same
-  issue; forward-registered, its writer is the promote verb) are
+- The merge-queue ejection, promote and withdraw-intent audit kinds
+  `merge_queue_ejected` (ADR-093 D4, E87.6 / #4297), `merge_queue_promoted`
+  (ADR-093 D7, same issue; forward-registered, its writer is the promote
+  verb) and `merge_queue_intent_withdrawn` (ADR-112 R3, E87.17 / #4685) are
   **INTERNAL, deliberately-not-a-surface** rows: no Notifier method, NOT in
   `activityCategories`, nothing in `issuecomment` renders or posts them.
   `merge_queue_ejected` (`server/merge_queue_eject.go`) is written ONCE per
@@ -1938,6 +1939,10 @@ Notes:
   `fishhawk_fixup_stage`, `fishhawk_rebase_run_branch`, `fishhawk_merge_run`,
   `fishhawk_get_run_status`), `fixup_routed` (verify_failed only), and for a
   forge refusal `forge_reason` plus a sanitised, UNTRUSTED `forge_detail`.
+  `merge_queue_intent_withdrawn` (`server/merge_queue_withdraw.go`) is
+  appended INSIDE the withdraw-intent transaction when the operator settles a
+  YIELDED entry `dropped` `intent_withdrawn`; its payload carries only this
+  run's ids, intent and yield reason, never the untrusted `yield_detail`.
   Read them through `GET /v0/runs/{id}/audit`.
 
 - The concern-defer audit kinds — `concern_deferred` and its corrective

@@ -110,6 +110,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 
 - Merge-candidate held-pass queue (`merge_candidate_queue.go`, ADR-092 / E83.85 #4200)
 - Merge queue (ADR-093 slice 1, E87.4 / [#4295](https://github.com/kuhlman-labs/fishhawk/issues/4295))
+  - Withdraw intent (`merge_queue_withdraw.go`, ADR-112 R3, E87.17 / [#4685](https://github.com/kuhlman-labs/fishhawk/issues/4685))
 - Merge overlap guard (`merge_overlap_guard.go`, E83.61 / [#4119](https://github.com/kuhlman-labs/fishhawk/issues/4119))
 - Merge-candidate verdict transfer (ADR-096 D1/D2/D5, ADR-098 D3, E87.2 / #4293)
 - Consolidated fan-in verify hold (`fanin_verify.go`, ADR-090 D5 / #4018, #4812)

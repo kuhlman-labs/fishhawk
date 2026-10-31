@@ -383,6 +383,15 @@ import "sort"
 // only THIS run's own entry, claim and head, so it is run-bound-readable
 // under ADR-106 (no ADR-106 registry flag exists yet) — INTERNAL, actor
 // system, not an issue-comment surface.
+// E87.17 / #4685 (ADR-112 R3) added merge_queue_intent_withdrawn, the
+// withdraw-intent verb's row: the operator withdrew a YIELDED entry's merge
+// intent, settling it dropped intent_withdrawn, appended INSIDE the
+// withdrawal transaction (server/merge_queue_withdraw.go; an append failure
+// rolls the withdrawal back). Its payload names only THIS run's own entry,
+// repo, base ref, head, intent and yield reason, and NO yield_detail (the
+// untrusted forge text), so it is run-bound-readable under ADR-106 (no
+// ADR-106 registry flag exists yet) — INTERNAL, actor = the operator, not an
+// issue-comment surface.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -547,6 +556,7 @@ var KnownCategories = map[string]struct{}{
 	"merge_queue_advanced":                    {}, // E87.5 / #4296 (ADR-093 D3): a merge-intent queue entry's admission auto-advanced its branch, naming prior/new head, merge commit, clean and admission epoch (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_authorized":                  {}, // E89.22 / #4619 (ADR-112 R4): the forge-approval fold's evidence row — qualifying approvals (review id, commit, actor, resolved permission), predicate snapshot, policy version, basis and path — appended in-lock BEFORE any merge verdict row or dispatch claim (server/forge_approval.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_ejected":                     {}, // E87.6 / #4297 (ADR-093 D4): ONE row per ejected merge-queue entry, written only by the settling call, naming reason (verify_failed, advance_conflict, forge_merge_refused, pass_not_startable), next_step from the closed vocabulary, fixup_routed (verify_failed), forge_reason and sanitised forge_detail (server/merge_queue_eject.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_intent_withdrawn":            {}, // E87.17 / #4685 (ADR-112 R3): the operator withdrew a YIELDED merge-queue entry's merge intent, settling it dropped intent_withdrawn, appended INSIDE the withdrawal transaction (server/merge_queue_withdraw.go); payload carries only this run's ids and no yield_detail, so it is run-bound-readable under ADR-106 — INTERNAL, not an issue-comment surface
 	"merge_queue_merged":                      {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass merged the head of line through the forge pinned to the verified head, naming verdict_head_sha and approval basis (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_overlap_refused":             {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass was held by the merge overlap guard; counts only, no other run's ids or paths, one row per distinct decision (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_promoted":                    {}, // E87.6 / #4297 (ADR-093 D7): FORWARD registration — the operator promote verb moved an unmarked held entry to the head of its base's line, appended INSIDE the promotion transaction (server/merge_queue_promote.go, a later slice) — INTERNAL, not an issue-comment surface
