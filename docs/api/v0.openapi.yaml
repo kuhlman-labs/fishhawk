@@ -3046,6 +3046,15 @@ components:
             in the same episode gets no fresh window and yields at once. A
             merge-gate hold never sets it. Present on a live entry that waited at
             the head and on a yielded entry; omitted when no wait started.
+        dispatch_claim_orphan:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueDispatchClaimOrphan' }]
+          description: |
+            A LIVE entry's crash-left queue dispatch claim (ADR-109 A1, #4711),
+            the label the merge-queue read's `dispatch_claim.orphan` carries;
+            `note` then adds a constant-shape clause (the conditional release
+            for `orphaned`, the operator re-arm for `orphaned_by_restart`).
+            Omitted for a held entry, with no or an unlabelled claim, and when
+            the claim or clock read fails (the read still answers 200).
 
     MergeQueueYieldReason:
       type: string
@@ -4051,6 +4060,32 @@ components:
         age_seconds: { type: integer, format: int64, description: The claim's age at read time. }
         failed_at: { type: string, format: date-time, description: When the claim became `dispatch_failed`. }
         reason: { type: string, description: "A `dispatch_failed` claim's recorded forge failure." }
+        orphan:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueDispatchClaimOrphan' }]
+          description: Labels a crash-left QUEUE claim (ADR-109 A1, #4711); omitted otherwise.
+
+    MergeQueueDispatchClaimOrphan:
+      type: string
+      enum: [orphaned, orphaned_by_restart]
+      description: |
+        A DERIVED label on a crash-left QUEUE-path merge-dispatch claim (ADR-109
+        Amendment A1, #4711); never stored, and inline or delegated claims are
+        never labelled.
+        `orphaned` — the claim is still `dispatched` and its `claimed_at` is
+        older than the crash-left window (150 s), judged on the DATABASE clock;
+        omitted when that clock cannot be read. The next merge-on-pass decision
+        whose forge-approval fold APPROVES releases it (a
+        `merge_dispatch_settled` row, outcome `released`, reason
+        `released_orphaned_claim`) and merges through the ordinary path. While
+        the fold does not approve, the pull request still needs a qualifying
+        approval and the claim holds the head until it arrives: a claimed
+        entry never yields.
+        `orphaned_by_restart` — the restart resume could not read the pull
+        request and moved the claim to `dispatch_failed`; it holds the line for
+        the operator re-arm (confirm on the forge the pull request did not
+        merge, then DELETE the claim, `backend/internal/mergequeue/README.md` §
+        "Merge-dispatch ledger"). No merge re-invoke is needed: the queue's next
+        pump re-decides.
 
     MergeQueueHeadOfLine:
       type: object

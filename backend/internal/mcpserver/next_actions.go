@@ -110,6 +110,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldProductIssueSuggestion(run, stages, na)
 		foldMergeCandidateStaleness(run, na)
 		foldMergeQueueYield(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -129,6 +130,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldProductIssueSuggestion(run, stages, na)
 		foldMergeCandidateStaleness(run, na)
 		foldMergeQueueYield(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -160,6 +162,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldProductIssueSuggestion(run, stages, na)
 	foldMergeCandidateStaleness(run, na)
 	foldMergeQueueYield(run, na)
+	foldMergeQueueOrphanedClaim(run, na)
 	foldMergeCandidateRerunAlternative(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
@@ -363,6 +366,85 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 		if a.Action == "fishhawk_merge_run" {
 			na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
 			return
+		}
+	}
+	na.Actions = append(na.Actions, action)
+}
+
+// foldMergeQueueOrphanedClaim names the move for a crash-left QUEUE dispatch
+// claim on the run's LIVE merge-queue entry (ADR-109 A1, #4711), keyed on
+// run.merge_candidate_queue.dispatch_claim_orphan:
+//
+//   - orphaned_by_restart (dispatch_failed; the unreadable-PR resume arm):
+//     operator_rearm, an operator step outside the MCP surface — confirm on
+//     the forge the pull request did not merge, then DELETE the run's
+//     dispatch_failed claim. No fishhawk_merge_run re-invoke is needed (the
+//     queue's next pump re-decides), so it is INSERTED before the first
+//     fishhawk_merge_run, else APPENDED.
+//   - orphaned (still dispatched past the crash-left window): APPENDS
+//     fishhawk_get_merge_queue. The release is CONDITIONAL on the
+//     forge-approval fold: merge-on-pass step 8 releases the claim only in a
+//     decision whose fold approved, and a claimed entry never yields
+//     (ADR-109), so with the approval-wait anchor set the reason says the
+//     pull request still needs a qualifying approval and the claim holds the
+//     head until then; without it the reason states both outcomes. It never
+//     says there is nothing to do.
+//
+// Every string is built from constants and the run's own id, repo and base
+// ref. Idempotent (an identical action already present is left alone). A
+// no-op with a nil na or run, on a terminal run, without the block, or with
+// any other label.
+func foldMergeQueueOrphanedClaim(run *Run, na *NextActions) {
+	if na == nil || run == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	q := run.MergeCandidateQueue
+	if q == nil {
+		return
+	}
+	var action SuggestedAction
+	switch q.DispatchClaimOrphan {
+	case "orphaned_by_restart":
+		action = SuggestedAction{
+			Action:       "operator_rearm",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the run's merge_candidate_queue reads dispatch_claim_orphan orphaned_by_restart",
+			Reason: "the run's queue merge-dispatch claim was orphaned by a restart and is dispatch_failed (orphaned_by_restart), so it holds the line (ADR-109). " +
+				"Confirm on the forge that the pull request did not merge, then DELETE the run's dispatch_failed claim per backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\" (an operator step outside the MCP surface). " +
+				"No fishhawk_merge_run re-invoke is needed: the queue's next pump re-decides the merge",
+		}
+	case "orphaned":
+		why := "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A1): the next merge-on-pass decision whose forge-approval fold approves releases it and merges through the ordinary path. " +
+			"If the pull request still needs a qualifying forge approval, the claim holds the head until that approval arrives (a claimed entry never yields); read the line to watch it"
+		if q.ApprovalWaitStartedAt != nil {
+			why = "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A1) and the pull request still needs a qualifying forge approval at its current head: " +
+				"the claim holds the head until that approval arrives (a claimed entry never yields). Approve the pull request under a write-or-higher identity the review gate admits; the next merge-on-pass decision then releases the claim and merges through the ordinary path"
+		}
+		params := map[string]string{"repo": q.Repo}
+		if q.BaseRef != "" {
+			params["base_ref"] = q.BaseRef
+		}
+		action = SuggestedAction{
+			Action:       "fishhawk_get_merge_queue",
+			Params:       params,
+			Precondition: "the run's merge_candidate_queue reads dispatch_claim_orphan orphaned",
+			Reason:       why,
+		}
+	default:
+		return
+	}
+	action.Consumes = consumesNone
+	for _, a := range na.Actions {
+		if a.Action == action.Action && a.Reason == action.Reason {
+			return
+		}
+	}
+	if action.Action == "operator_rearm" {
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_merge_run" {
+				na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
+				return
+			}
 		}
 	}
 	na.Actions = append(na.Actions, action)

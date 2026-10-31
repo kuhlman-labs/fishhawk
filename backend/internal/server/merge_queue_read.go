@@ -128,6 +128,96 @@ type mergeQueueDispatchClaimView struct {
 	FailedAt   *time.Time `json:"failed_at,omitempty"`
 	// Reason is a dispatch_failed claim's recorded forge failure.
 	Reason string `json:"reason,omitempty"`
+	// Orphan labels a crash-left QUEUE claim (ADR-109 A1, #4711):
+	// orphaned or orphaned_by_restart (mergeQueueDispatchClaimOrphan).
+	// Omitted otherwise, and "orphaned" is omitted when the database clock
+	// cannot be read.
+	Orphan string `json:"orphan,omitempty"`
+}
+
+// The dispatch-claim orphan labels (ADR-109 A1, #4711), shared by the
+// merge-queue read's dispatch_claim.orphan and the run read's
+// merge_candidate_queue.dispatch_claim_orphan.
+const (
+	// mergeQueueClaimOrphaned: a queue claim still dispatched past
+	// mergeQueueCrashLeftClaimAge on the database clock. The next
+	// merge-on-pass decision whose forge-approval fold approves releases it
+	// in step 8 and merges through the ordinary path; while the fold does not
+	// approve, the claim holds the head (ADR-109: a claimed dispatch is never
+	// yielded).
+	mergeQueueClaimOrphaned = "orphaned"
+	// mergeQueueClaimOrphanedByRestart: a queue claim the restart resume
+	// moved to dispatch_failed (orphaned_by_restart, the unreadable-PR arm).
+	// It holds for the operator re-arm; nothing releases it automatically.
+	mergeQueueClaimOrphanedByRestart = "orphaned_by_restart"
+)
+
+// mergeQueueDispatchClaimOrphan labels c: orphaned for a queue claim still
+// dispatched whose non-zero claimed_at is older than
+// mergeQueueCrashLeftClaimAge against dbNow (only when clockOK: the same
+// predicate as mergeQueueClaimCrashLeft, so the label never names a claim the
+// decision would not release); orphaned_by_restart for a queue dispatch_failed
+// claim whose cause is orphaned_by_restart; "" otherwise (inline and delegated
+// claims are never labelled). The decision never reads the label.
+func mergeQueueDispatchClaimOrphan(c mergequeue.DispatchClaim, dbNow time.Time, clockOK bool) string {
+	if c.Path != mergeDispatchPathQueue {
+		return ""
+	}
+	switch c.State {
+	case mergequeue.DispatchDispatched:
+		if clockOK && !c.ClaimedAt.IsZero() && c.ClaimedAt.Before(dbNow.Add(-mergeQueueCrashLeftClaimAge)) {
+			return mergeQueueClaimOrphaned
+		}
+	case mergequeue.DispatchFailed:
+		if c.FailureCause == mergeQueueResumeReasonOrphanedByRestart {
+			return mergeQueueClaimOrphanedByRestart
+		}
+	}
+	return ""
+}
+
+// mergeQueueReadClock returns a read-once database clock for the orphan
+// label: the first call reads Resumer.DatabaseNow, later calls reuse it. Only
+// a queue dispatched claim calls it (mergeQueueDispatchClaimOrphanFor), so a
+// read with no such claim never touches the clock. A store without the
+// Resumer capability or a failed read yields (zero, false): the label is
+// omitted and the caller's read never fails on it.
+func (s *Server) mergeQueueReadClock(ctx context.Context) func() (time.Time, bool) {
+	var (
+		read bool
+		now  time.Time
+		ok   bool
+	)
+	return func() (time.Time, bool) {
+		if read {
+			return now, ok
+		}
+		read = true
+		rs, has := s.cfg.MergeQueue.(mergequeue.Resumer)
+		if !has {
+			return now, false
+		}
+		n, err := rs.DatabaseNow(ctx)
+		if err != nil {
+			s.cfg.Logger.Warn("merge queue: database clock read failed; omitting the orphaned dispatch-claim label", "error", err.Error())
+			return now, false
+		}
+		now, ok = n, true
+		return now, ok
+	}
+}
+
+// mergeQueueDispatchClaimOrphanFor labels c, reading clock only for a queue
+// dispatched claim.
+func mergeQueueDispatchClaimOrphanFor(c mergequeue.DispatchClaim, clock func() (time.Time, bool)) string {
+	var (
+		now time.Time
+		ok  bool
+	)
+	if c.Path == mergeDispatchPathQueue && c.State == mergequeue.DispatchDispatched {
+		now, ok = clock()
+	}
+	return mergeQueueDispatchClaimOrphan(c, now, ok)
 }
 
 // mergeQueueHeadOfLine is the base's first entry plus its PR's live head.
@@ -295,6 +385,7 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 		view.ETABasis.MedianSeconds = &median
 	}
 	held := 0
+	clock := s.mergeQueueReadClock(ctx)
 	for _, e := range entries {
 		ev := mergeQueueEntryView{
 			RunID:           e.RunID.String(),
@@ -320,6 +411,7 @@ func (s *Server) mergeQueueBaseViewFor(ctx context.Context, b mergequeue.Base) (
 			ev.DispatchClaim = &mergeQueueDispatchClaimView{
 				State: string(claim.State), Path: claim.Path, HeadSHA: claim.HeadSHA, ClaimedAt: claim.ClaimedAt,
 				AgeSeconds: int64(time.Since(claim.ClaimedAt) / time.Second), FailedAt: claim.FailedAt, Reason: claim.FailureCause,
+				Orphan: mergeQueueDispatchClaimOrphanFor(claim, clock),
 			}
 		}
 		if e.State == mergequeue.StateHeld {
