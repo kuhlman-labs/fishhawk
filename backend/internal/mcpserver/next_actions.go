@@ -110,6 +110,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldProductIssueSuggestion(run, stages, na)
 		foldMergeCandidateStaleness(run, na)
 		foldMergeQueueYield(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -129,6 +130,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		foldProductIssueSuggestion(run, stages, na)
 		foldMergeCandidateStaleness(run, na)
 		foldMergeQueueYield(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
 		foldMergeCandidateRerunAlternative(run, na)
 		foldWorkingDirParams(run, na)
 		foldFailureSignature(run, stages, na)
@@ -137,7 +139,10 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 
 	na := classifyNextActions(run, stages, planReviewStatus, implementReviewStatus, hint, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated, acceptanceVerdict, acceptanceTriageDisposition, release)
 
-	if drive != nil && drive.NextAction != nil {
+	// #4801: a stale checks-green merge_pr stamp must not outrank the
+	// acceptance move on the acceptance-unsettled concerns arm — the merge is
+	// held there. Every other drive action still folds first.
+	if drive != nil && drive.NextAction != nil && (na.State != stateConcernsOpenAcceptanceUnsettled || drive.NextAction.Action != driveNextActionMergePR) {
 		na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 	}
 
@@ -157,6 +162,7 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 	foldProductIssueSuggestion(run, stages, na)
 	foldMergeCandidateStaleness(run, na)
 	foldMergeQueueYield(run, na)
+	foldMergeQueueOrphanedClaim(run, na)
 	foldMergeCandidateRerunAlternative(run, na)
 	foldWorkingDirParams(run, na)
 	foldFailureSignature(run, stages, na)
@@ -224,7 +230,10 @@ func foldMergeCandidateStaleness(run *Run, na *NextActions) {
 // emits (backend/internal/server/merge_queue_yield.go). foldMergeQueueYield
 // names a reason in its prose only when it is in this set; anything else
 // renders as "an unrecognised reason", so no wire text outside the vocabulary
-// reaches next_actions.
+// reaches next_actions. The three merge_* reasons are the docs/adr/112 A3
+// merge-gate yields (#4780). The set is pinned against the server's
+// vocabulary and the OpenAPI MergeQueueYieldReason enum by
+// TestMergeQueueYieldVocabulary_AgreesAcrossServerMCPAndOpenAPI.
 var mergeQueueYieldReasons = map[string]bool{
 	"forge_approval_vetoed":                         true,
 	"forge_approval_review_required":                true,
@@ -235,19 +244,38 @@ var mergeQueueYieldReasons = map[string]bool{
 	"forge_approval_provider_unsupported":           true,
 	"forge_approval_identity_provider_unconfigured": true,
 	"forge_review_required":                         true,
+	"merge_checks_red":                              true,
+	"merge_checks_pending":                          true,
+	"merge_review_pending":                          true,
+}
+
+// mergeQueueYieldIsMergeGate reports whether a CLOSED-vocabulary reason is a
+// docs/adr/112 A3 merge-gate yield (A3.1/A3.2, R3 row 1): it clears only when
+// every merge-gate leg passes at the anchored head (A3.4), never on a forge
+// approval alone.
+func mergeQueueYieldIsMergeGate(reason string) bool {
+	switch reason {
+	case "merge_checks_red", "merge_checks_pending", "merge_review_pending":
+		return true
+	}
+	return false
 }
 
 // foldMergeQueueYield names the operator's remedy when the run's merge-queue
-// entry YIELDED its place (ADR-112 R3/R5): the queue skips a yielded entry
-// until a re-probe finds a qualifying forge approval and clears the marker,
-// so the remedy is what makes that fold qualify. The action is keyed on the
-// closed next_step vocabulary: approve_pr → the approve_pr ritual step;
-// dismiss_review → the dismiss_review step (dismiss the blocking
-// CHANGES_REQUESTED review on the forge); retry_after → fishhawk_merge_run
-// (a re-invoke on the queued entry re-probes at once, no backoff);
-// configure_identity_provider → that named operator step. none (nothing at
-// the forge clears it) and any unknown step add NOTHING; the run payload's
-// merge_candidate_queue.note still states it.
+// entry YIELDED its place (ADR-112 R3/R5, docs/adr/112 A3): the queue skips a
+// yielded entry until a re-probe finds the clear predicate holding (A3.4: the
+// forge-approval fold qualifies AND every merge-gate leg passes at the
+// anchored head) and clears the marker, so the remedy is what makes the
+// blocking leg pass. The action is keyed on the closed next_step vocabulary:
+// approve_pr → the approve_pr ritual step; dismiss_review → the
+// dismiss_review step (dismiss the blocking CHANGES_REQUESTED review on the
+// forge); retrigger_ci → fishhawk_retrigger_ci (merge_checks_red: a required
+// check failed or was cancelled at the anchored head; re-run it); retry_after
+// → fishhawk_merge_run (a re-invoke on the queued entry re-probes at once, no
+// backoff; for merge_checks_pending / merge_review_pending the prose names
+// the leg the re-probe waits on); configure_identity_provider → that named
+// operator step. none (nothing at the forge clears it) and any unknown step
+// add NOTHING; the run payload's merge_candidate_queue.note still states it.
 //
 // Untrusted text (approval condition C8): every string is built ONLY from the
 // closed next_step / yield_reason vocabulary. yield_detail (forge-derived,
@@ -275,7 +303,12 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 		reason = q.YieldReason
 	}
 	const yielded = "the run's merge-queue entry YIELDED its place (ADR-112 R3: "
-	const rejoin = "; admission skips it until a re-probe finds a qualifying forge approval at the anchored head and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	rejoin := "; admission skips it until a re-probe finds a qualifying forge approval at the anchored head and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	if mergeQueueYieldIsMergeGate(reason) {
+		// docs/adr/112 A3.4: a merge-gate yield never clears on an approval
+		// alone.
+		rejoin = "; admission skips it until a re-probe finds every merge-gate leg passing at the anchored head (docs/adr/112 A3.4) and clears the marker, and it then rejoins the line FIFO at its original enqueue time"
+	}
 	precondition := "the run's merge_candidate_queue reads yielded with next_step " + q.NextStep + " (yield_reason " + reason + ")"
 	var action SuggestedAction
 	switch q.NextStep {
@@ -291,8 +324,20 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 			Params: prParams(run),
 			Reason: yielded + reason + ")" + rejoin + ". A write-level CHANGES_REQUESTED review vetoes the merge: dismiss it on the forge (or have its author approve), make sure a qualifying approval stands, then re-invoke fishhawk_merge_run to re-probe at once",
 		}
+	case "retrigger_ci":
+		action = SuggestedAction{
+			Action: "fishhawk_retrigger_ci",
+			Params: map[string]string{"run_id": run.ID},
+			Reason: yielded + reason + ")" + rejoin + ". A required check failed or was cancelled at the anchored head: re-run it with fishhawk_retrigger_ci; the check_run trigger, the periodic re-probe or a fishhawk_merge_run re-invoke then clears the yield once every required check passes",
+		}
 	case "retry_after":
 		why := yielded + reason + ")" + rejoin + ". The forge-approval read was undetermined or truncated; re-invoking fishhawk_merge_run on the queued entry re-probes now instead of waiting for the periodic re-probe's backoff"
+		switch reason {
+		case "merge_checks_pending":
+			why = yielded + reason + ")" + rejoin + ". Required checks are pending, unreported or unreadable at the anchored head: let them finish; the check_run trigger or the periodic re-probe clears the yield once every required check passes, and re-invoking fishhawk_merge_run on the queued entry re-probes now"
+		case "merge_review_pending":
+			why = yielded + reason + ")" + rejoin + ". The implement-review round at the anchored head is still settling: the periodic re-probe clears the yield once its verdicts land and every merge-gate leg passes, and re-invoking fishhawk_merge_run on the queued entry re-probes now"
+		}
 		for i, a := range na.Actions {
 			if a.Action == "fishhawk_merge_run" {
 				na.Actions[i].Reason, na.Actions[i].Precondition = why, precondition
@@ -321,6 +366,85 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 		if a.Action == "fishhawk_merge_run" {
 			na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
 			return
+		}
+	}
+	na.Actions = append(na.Actions, action)
+}
+
+// foldMergeQueueOrphanedClaim names the move for a crash-left QUEUE dispatch
+// claim on the run's LIVE merge-queue entry (ADR-109 A1, #4711), keyed on
+// run.merge_candidate_queue.dispatch_claim_orphan:
+//
+//   - orphaned_by_restart (dispatch_failed; the unreadable-PR resume arm):
+//     operator_rearm, an operator step outside the MCP surface — confirm on
+//     the forge the pull request did not merge, then DELETE the run's
+//     dispatch_failed claim. No fishhawk_merge_run re-invoke is needed (the
+//     queue's next pump re-decides), so it is INSERTED before the first
+//     fishhawk_merge_run, else APPENDED.
+//   - orphaned (still dispatched past the crash-left window): APPENDS
+//     fishhawk_get_merge_queue. The release is CONDITIONAL on the
+//     forge-approval fold: merge-on-pass step 8 releases the claim only in a
+//     decision whose fold approved, and a claimed entry never yields
+//     (ADR-109), so with the approval-wait anchor set the reason says the
+//     pull request still needs a qualifying approval and the claim holds the
+//     head until then; without it the reason states both outcomes. It never
+//     says there is nothing to do.
+//
+// Every string is built from constants and the run's own id, repo and base
+// ref. Idempotent (an identical action already present is left alone). A
+// no-op with a nil na or run, on a terminal run, without the block, or with
+// any other label.
+func foldMergeQueueOrphanedClaim(run *Run, na *NextActions) {
+	if na == nil || run == nil || runStateIsTerminal(run.State) {
+		return
+	}
+	q := run.MergeCandidateQueue
+	if q == nil {
+		return
+	}
+	var action SuggestedAction
+	switch q.DispatchClaimOrphan {
+	case "orphaned_by_restart":
+		action = SuggestedAction{
+			Action:       "operator_rearm",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the run's merge_candidate_queue reads dispatch_claim_orphan orphaned_by_restart",
+			Reason: "the run's queue merge-dispatch claim was orphaned by a restart and is dispatch_failed (orphaned_by_restart), so it holds the line (ADR-109). " +
+				"Confirm on the forge that the pull request did not merge, then DELETE the run's dispatch_failed claim per backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\" (an operator step outside the MCP surface). " +
+				"No fishhawk_merge_run re-invoke is needed: the queue's next pump re-decides the merge",
+		}
+	case "orphaned":
+		why := "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A1): the next merge-on-pass decision whose forge-approval fold approves releases it and merges through the ordinary path. " +
+			"If the pull request still needs a qualifying forge approval, the claim holds the head until that approval arrives (a claimed entry never yields); read the line to watch it"
+		if q.ApprovalWaitStartedAt != nil {
+			why = "the run's queue merge-dispatch claim is orphaned (crash-left past the 150s window, ADR-109 A1) and the pull request still needs a qualifying forge approval at its current head: " +
+				"the claim holds the head until that approval arrives (a claimed entry never yields). Approve the pull request under a write-or-higher identity the review gate admits; the next merge-on-pass decision then releases the claim and merges through the ordinary path"
+		}
+		params := map[string]string{"repo": q.Repo}
+		if q.BaseRef != "" {
+			params["base_ref"] = q.BaseRef
+		}
+		action = SuggestedAction{
+			Action:       "fishhawk_get_merge_queue",
+			Params:       params,
+			Precondition: "the run's merge_candidate_queue reads dispatch_claim_orphan orphaned",
+			Reason:       why,
+		}
+	default:
+		return
+	}
+	action.Consumes = consumesNone
+	for _, a := range na.Actions {
+		if a.Action == action.Action && a.Reason == action.Reason {
+			return
+		}
+	}
+	if action.Action == "operator_rearm" {
+		for i, a := range na.Actions {
+			if a.Action == "fishhawk_merge_run" {
+				na.Actions = append(na.Actions[:i], append([]SuggestedAction{action}, na.Actions[i:]...)...)
+				return
+			}
 		}
 	}
 	na.Actions = append(na.Actions, action)
@@ -1282,6 +1406,16 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 				}
 				return &NextActions{State: "implement_concerns_open_gate_closed", Actions: hint.gateClosedActions(run, nil)}
 			}
+			// #4801: the gate is OPEN (implement succeeded, review parked) but a
+			// fix-up push re-opened (or nothing ran) the acceptance stage, so the
+			// merge cannot fire until it settles. Lead with the acceptance move
+			// and drop merge_and_file_follow_up — a merge offer here names a verb
+			// the endpoint refuses (#3116 class). The commit-yourself flow
+			// (implement awaiting_approval is its own gate, acceptance not yet
+			// reached) keeps today's arm.
+			if impl.State == "succeeded" && acceptanceHoldsMerge(acceptance) {
+				return &NextActions{State: stateConcernsOpenAcceptanceUnsettled, Actions: hint.acceptanceUnsettledActions(run, impl.ID, acceptance)}
+			}
 			// Open concerns: embed the hint's options as actions. The
 			// entries derive FROM the computed ReviewActionHint value
 			// (review_action_hint.go), so the two surfaces agree by
@@ -1310,6 +1444,21 @@ func implementStageNextActions(run *Run, impl, review, acceptance *Stage, implem
 	default:
 		return nil
 	}
+}
+
+// stateConcernsOpenAcceptanceUnsettled is the #4801 concerns-open arm: the
+// fix-up gate is open but the acceptance stage is non-terminal, so the merge is
+// held. stateConcernsOpenAcceptanceReopened is its relabel when a stage-scoped
+// acceptance_reopened audit entry says a fix-up push is why
+// (foldAcceptanceRedispatchAdvisory).
+const stateConcernsOpenAcceptanceUnsettled = "implement_concerns_open_acceptance_unsettled"
+
+const stateConcernsOpenAcceptanceReopened = "implement_concerns_open_acceptance_reopened"
+
+// acceptanceHoldsMerge reports whether the acceptance stage still holds the
+// merge: it exists and has not settled on this head (#4801).
+func acceptanceHoldsMerge(acceptance *Stage) bool {
+	return acceptance != nil && !stageStateIsTerminal(acceptance.State)
 }
 
 // supersededImplementCount reads the run-status concerns block's
@@ -1663,7 +1812,10 @@ func reviveRunAction(run *Run) SuggestedAction {
 // a slice integration conflict, a RESTART too, #4343), A to an in-place retry
 // (citing a known flake trace event when the failure detail carries one),
 // everything else to retry-or-cancel. The category-A and default (retryable)
-// arms also offer fishhawk_revive_run (#1915) — the batch no-dispatch re-park.
+// arms also offer fishhawk_revive_run (#1915) — the batch no-dispatch re-park —
+// except on a category-C failure whose run is still NON-terminal: that is the
+// server's implement infrastructure park (#4426), revive is inapplicable to a
+// running run, and the retry's precondition names the park and its budget.
 func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextActions {
 	category := ""
 	if impl.FailureCategory != nil {
@@ -1797,6 +1949,35 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 			},
 		}
 	default:
+		cancel := SuggestedAction{
+			Action:       "fishhawk_cancel_run",
+			Params:       map[string]string{"run_id": run.ID},
+			Precondition: "the failure is not retryable",
+			Consumes:     consumesNone,
+			Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
+		}
+		// #4426: a category-C implement failure on a NON-terminal run is the
+		// server's infrastructure park — the run stays running and the stage
+		// stays retry-eligible, so fishhawk_revive_run (which needs a
+		// terminal-failed run) is not offered and the retry names the park. A
+		// terminal run, a category-D failure, and the A and B arms keep the
+		// wording below.
+		implementParked := category == "C" && !runStateIsTerminal(run.State)
+		if implementParked {
+			return &NextActions{
+				State: "implement_failed",
+				Actions: []SuggestedAction{
+					{
+						Action:       "fishhawk_retry_stage",
+						Params:       map[string]string{"stage_id": impl.ID},
+						Precondition: fmt.Sprintf("the implement stage FAILED category C while the run stays non-terminal: the server parks a first-execution category-C implement failure instead of failing the run, up to %d parks per stage (#4426)", runpkg.InfraFailureParkRetryBudget),
+						Consumes:     consumesRetryBudget,
+						Reason:       "retry the parked implement stage in place after reading the failure reason: on runner_kind local the retry parks it at awaiting_host_dispatch, and a decomposition child is then re-spawned by fishhawk_run_children (a parent's fishhawk_await_children releases children_dispatchable for it); past the park budget the next category-C failure fails the run",
+					},
+					cancel,
+				},
+			}
+		}
 		return &NextActions{
 			State: "implement_failed",
 			Actions: []SuggestedAction{
@@ -1808,13 +1989,7 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 					Reason:       "retry the failed stage in place after reading the failure reason",
 				},
 				reviveRunAction(run),
-				{
-					Action:       "fishhawk_cancel_run",
-					Params:       map[string]string{"run_id": run.ID},
-					Precondition: "the failure is not retryable",
-					Consumes:     consumesNone,
-					Reason:       "cancel this run, then start a fresh one with fishhawk_start_run (consumes a new run)",
-				},
+				cancel,
 			},
 		}
 	}
@@ -2538,7 +2713,7 @@ func cancelledPRClosedNextActions(run *Run) *NextActions {
 // mergeRitualActions is the ordered operator merge ritual for a run whose
 // PR is open and safe to act on (E48.7 / #1954): approve the PR under your
 // own GitHub identity (an unchanged gh step), then fishhawk_merge_run — the
-// one verb that records the operator merge verdict, queues the squash merge,
+// one verb that records the operator merge verdict, queues the forge merge,
 // awaits the terminal run state, and surfaces the post-merge dev-host step.
 // This replaces the bare merge_pr + post_merge ritual steps; the post-merge
 // walk is folded into fishhawk_merge_run's own surfaced next_action.
@@ -2566,7 +2741,7 @@ func mergeRunAction(run *Run) SuggestedAction {
 		Params:       map[string]string{"run_id": run.ID, "verdict": "<operator merge verdict>"},
 		Precondition: "the PR is approved (gh pr review --approve under your own identity) and the published fishhawk_audit_complete check is green — queueing before approval is also safe (GitHub fires the merge once branch protection is satisfied). Fishhawk publishes that check but does not make it required: whether it gates the merge depends on this repository's branch protection, which fishhawk_doctor's merge_gate rung reports",
 		Consumes:     consumesNone,
-		Reason:       "records your operator merge verdict as a chained audit entry, queues the squash merge through the same seam drive_run's may_merge arm uses, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
+		Reason:       "records your operator merge verdict as a chained audit entry, queues the forge merge (the repository's declared merge method, default squash) through the same seam drive_run's may_merge arm uses, awaits the terminal run state, and surfaces the post-merge dev-host step — one verb replacing the merge_pr + post_merge hand ceremony",
 	}
 }
 
@@ -2690,7 +2865,27 @@ func naOffersMerge(na *NextActions) bool {
 // no NON-TERMINAL acceptance stage (none at all, or every one of them already
 // settled). That last guard is what keeps a HEALTHY merge byte-identical.
 func foldAcceptanceRedispatchAdvisory(run *Run, stages []Stage, recent []AuditEntry, na *NextActions) {
-	if run == nil || na == nil || !naOffersMerge(na) {
+	if run == nil || na == nil {
+		return
+	}
+	// #4801: the concerns-open acceptance-unsettled arm carries no merge to
+	// fold onto, but its lead acceptance action is where the acceptance_reopened
+	// evidence belongs. Relabel and sharpen that lead only; the action is
+	// selected by NAME plus provenance, never by index, so a drive-folded poll
+	// is never rewritten.
+	if na.State == stateConcernsOpenAcceptanceUnsettled {
+		acc := blockingAcceptanceStage(stages)
+		if acc == nil || !acceptanceReopenedIn(recent, acc.ID) {
+			return
+		}
+		state := runpkg.StageState(acc.State)
+		na.State = stateConcernsOpenAcceptanceReopened
+		if i := acceptanceUnsettledLeadIndex(na.Actions, acc); i >= 0 {
+			na.Actions[i].Reason = runpkg.AcceptanceBlockerAdvisory(shortStageID(acc.ID), state, true, mergeAdvisoryTail)
+		}
+		return
+	}
+	if !naOffersMerge(na) {
 		return
 	}
 	// Selected by NON-TERMINALITY (blockingAcceptanceStage), not by

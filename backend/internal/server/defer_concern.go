@@ -64,6 +64,12 @@ type deferConcernRequest struct {
 	// Note is an optional operator addendum folded into the follow-up
 	// body and the concern's state_reason.
 	Note string `json:"note,omitempty"`
+	// Judgement is the human judgement the defer records (ADR-117 D1 phase 2,
+	// E94.7 / #4840), REQUIRED: one of concern.HumanJudgements. The
+	// waive-reason prefixes do not apply here. TradeoffCost is required with
+	// judgement tradeoff and refused with any other.
+	Judgement    string `json:"judgement"`
+	TradeoffCost string `json:"tradeoff_cost"`
 }
 
 // deferredConcern is the updated concern row returned on a successful
@@ -162,6 +168,13 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 				map[string]any{"error": decErr.Error()})
 			return
 		}
+	}
+	// Judgement (E94.7 / #4840): validated before the concern read and,
+	// crucially, before any work item is filed, so a refused judgement can
+	// never leave an orphan issue.
+	judgement, tradeoffCost, ok := s.concernJudgementFromRequest(w, r, reqBody.Judgement, reqBody.TradeoffCost, "")
+	if !ok {
+		return
 	}
 
 	rows, err := s.cfg.ConcernRepo.GetByIDs(r.Context(), []uuid.UUID{concernID})
@@ -293,7 +306,7 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		target.Scope = scope
 	}
 
-	// Snapshot the prior state before any transition: ApplyResolution
+	// Snapshot the prior state before any transition: ApplyHumanDisposition
 	// mutates the concern row, so prior_state must be captured here for
 	// the success audit FACT (#1202 done-means asserts it).
 	priorState := string(row.State)
@@ -306,11 +319,24 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	subject := id.Subject
+	if subject == "" {
+		subject = "anonymous"
+	}
+	actorKind := actorKindForSubject(subject)
+
 	// Transition the concern to deferred, its reason naming the filed
-	// issue. The audit FACT (concern_deferred) is written only AFTER this
-	// succeeds (binding ordering invariant).
+	// issue, recording OutcomeDeferred and the human judgement (E94.7 /
+	// #4840; one concern, so judgement_bulk is false). The audit FACT
+	// (concern_deferred) is written only AFTER this succeeds (binding
+	// ordering invariant).
 	stateReason := fmt.Sprintf("deferred to #%d: %s", created.Number, deferReasonNote(row.Note, reqBody.Note))
-	updated, err := s.cfg.ConcernRepo.ApplyResolution(r.Context(), concernID, concern.StateDeferred, stateReason)
+	updated, err := s.cfg.ConcernRepo.ApplyHumanDisposition(r.Context(), concernID, concern.StateDeferred, stateReason, concern.HumanDisposition{
+		Outcome:      concern.OutcomeDeferred,
+		Judgement:    judgement,
+		ActorKind:    string(actorKind),
+		TradeoffCost: tradeoffCost,
+	})
 	if err != nil {
 		// The issue is already filed (orphaned relative to the un-transitioned
 		// concern). Keep the chain truthful with the corrective entry naming
@@ -340,13 +366,9 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// SUCCESS audit (fact): the transition landed, so record the defer.
-	subject := id.Subject
-	if subject == "" {
-		subject = "anonymous"
-	}
-	actorKind := actorKindForSubject(subject)
-	payload, _ := json.Marshal(map[string]any{
+	// SUCCESS audit (fact): the transition landed, so record the defer. The
+	// payload carries `judgement`, plus `tradeoff_cost` ONLY when non-empty.
+	deferredFields := map[string]any{
 		"concern_id":     row.ID.String(),
 		"prior_state":    priorState,
 		"reason":         stateReason,
@@ -358,7 +380,12 @@ func (s *Server) handleDeferConcern(w http.ResponseWriter, r *http.Request) {
 		"issue_type":     item.Type,
 		"issue_title":    item.Title,
 		"issue_provider": created.Provider,
-	})
+		"judgement":      string(judgement),
+	}
+	if tradeoffCost != "" {
+		deferredFields["tradeoff_cost"] = tradeoffCost
+	}
+	payload, _ := json.Marshal(deferredFields)
 	deferredEntry, aerr := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
 		RunID:        row.RunID,
 		StageID:      &row.StageID,

@@ -728,15 +728,30 @@ func buildParams(state stagecheck.State, missing []auditcomplete.MissingItem, re
 		// publishing nothing would let a stale prior state ride.
 		params.Status = forge.CheckRunStatusInProgress
 		params.OutputSummary = "Audit chain is still being assembled. Fishhawk will update this check when the run terminates."
+		// #4801: a pending check HELD on a named cause leads with it, in the
+		// title and the summary (GitLab's commit-status description reads the
+		// summary). An empty missing list keeps both byte-identical.
+		if len(missing) > 0 {
+			params.OutputSummary = heldTitle(missing) + ". " + params.OutputSummary
+		}
 		// E64.59 / #3190: a pending check used to carry a one-line summary and
 		// a NULL output.text, so a run stranded on the mid-flight branch gave
 		// the operator nothing to read. The one-line summary keeps its shape;
 		// the DETAIL — which stage, in which state, and what to do about it —
 		// rides in output.text.
-		params.OutputTitle = CheckName
+		params.OutputTitle = heldTitle(missing)
 		params.OutputText = renderMissingText(missing)
 	}
 	return params
+}
+
+// heldTitle is the pending check's output.title (#4801): "Held: <cause>" when
+// the missing list names one (auditcomplete.HeldHeadline), else CheckName.
+func heldTitle(missing []auditcomplete.MissingItem) string {
+	if len(missing) == 0 {
+		return CheckName
+	}
+	return "Held: " + auditcomplete.HeldHeadline(missing)
 }
 
 // renderResolutions appends one line per resolution to the PASS summary,

@@ -781,19 +781,108 @@ func TestVouchCommit_HeadEqualityIsCaseInsensitive(t *testing.T) {
 	}
 }
 
-// TestVouchCommit_AbbreviatedShaTakesMismatchArm pins the documented,
-// deliberate consequence of a FULL-string compare: an abbreviated sha is not
-// the live head, so it takes the mismatch arm — recorded, not published, with
-// both spellings named so the operator can re-vouch with the full sha.
-func TestVouchCommit_AbbreviatedShaTakesMismatchArm(t *testing.T) {
+// vouchNonFullShaCases are the sha spellings the vouch endpoint must refuse:
+// anything that is not exactly 40 (SHA-1) or 64 (SHA-256) hex characters.
+func vouchNonFullShaCases() []struct{ name, sha string } {
+	return []struct{ name, sha string }{
+		{"8-char prefix", vouchedSHA[:8]},
+		{"7-char prefix", vouchedSHA[:7]},
+		{"39-char", vouchedSHA[:39]},
+		{"41-char", vouchedSHA + "a"},
+		{"40-char with non-hex g", strings.Repeat("g", 40)},
+		{"63-char", strings.Repeat("a", 63)},
+	}
+}
+
+// TestVouchCommit_NonFullSha_RefusedAtVouchTime pins #4435: an abbreviated (or
+// otherwise non-full) sha is refused 400 validation_failed BEFORE anything is
+// written or published, because rule 5 of fishhawk_audit_complete matches the
+// PR head by full sha and an abbreviated record could never clear
+// foreign_commit. The live head IS vouchedSHA, so with the guard absent the
+// request would proceed to the audit append and return 200; the test reads the
+// committed audit state AFTER the call (not just the status) so the deletion
+// goes RED on both.
+//
+// COUNTERFACTUAL: deleting the `!isDeployCommitSHA(sha)` refusal in
+// handleVouchCommit turns every subtest RED (200 and one recorded vouch).
+func TestVouchCommit_NonFullSha_RefusedAtVouchTime(t *testing.T) {
+	for _, tc := range vouchNonFullShaCases() {
+		t.Run(tc.name, func(t *testing.T) {
+			creator := &vouchCheckCreator{}
+			s, au, runID := newVouchRepublishServerOpts(t, creator, vouchRepublishOpts{
+				pr: vouchPRStub{headSHA: vouchedSHA},
+			})
+
+			w := postVouchCommit(t, s, runID,
+				vouchCommitRequest{SHA: tc.sha, Reason: "non-full paste"}, withVouchOperator)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			var env errorEnvelope
+			if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+				t.Fatalf("unmarshal error envelope: %v", err)
+			}
+			if env.Error.Code != "validation_failed" {
+				t.Errorf("error code = %q, want validation_failed", env.Error.Code)
+			}
+			if got, _ := env.Error.Details["field"].(string); got != "sha" {
+				t.Errorf("details.field = %q, want sha", got)
+			}
+			if got, _ := env.Error.Details["got_length"].(float64); int(got) != len(tc.sha) {
+				t.Errorf("details.got_length = %v, want %d", env.Error.Details["got_length"], len(tc.sha))
+			}
+			for _, want := range []string{"40-character", "64-character", "never by prefix"} {
+				if !strings.Contains(env.Error.Message, want) {
+					t.Errorf("message must name the full-sha requirement (%q): %s", want, env.Error.Message)
+				}
+			}
+			if n := vouchAuditCount(au); n != 0 {
+				t.Errorf("operator_commit_vouched entries = %d, want 0 (a refused sha must write nothing)", n)
+			}
+			if calls := vouchCreatorCalls(creator); len(calls) != 0 {
+				t.Errorf("publisher seam calls = %d, want 0 (a refused sha must publish nothing)", len(calls))
+			}
+		})
+	}
+}
+
+// TestVouchCommit_NonFullSha_DetailEchoIsBounded pins that the refused sha is
+// echoed back truncated to vouchShaEchoLimit bytes while got_length reports the
+// real length.
+func TestVouchCommit_NonFullSha_DetailEchoIsBounded(t *testing.T) {
+	s, au, runID := seedVouchServer(t)
+	long := strings.Repeat("a", 5000)
+
+	w := postVouchCommit(t, s, runID, vouchCommitRequest{SHA: long, Reason: "x"}, withVouchOperator)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("unmarshal error envelope: %v", err)
+	}
+	if got, _ := env.Error.Details["got"].(string); len(got) != vouchShaEchoLimit {
+		t.Errorf("details.got length = %d, want %d", len(got), vouchShaEchoLimit)
+	}
+	if got, _ := env.Error.Details["got_length"].(float64); int(got) != len(long) {
+		t.Errorf("details.got_length = %v, want %d", env.Error.Details["got_length"], len(long))
+	}
+	if vouchAudit(au) != nil {
+		t.Error("audit written despite a non-full sha")
+	}
+}
+
+// TestVouchCommit_FullSha256_Accepted guards against over-tightening: a 64-hex
+// (SHA-256) object name equal to the live head is accepted and recorded.
+func TestVouchCommit_FullSha256_Accepted(t *testing.T) {
+	sha256 := strings.Repeat("ab12", 16)
 	creator := &vouchCheckCreator{}
 	s, au, runID := newVouchRepublishServerOpts(t, creator, vouchRepublishOpts{
-		pr: vouchPRStub{headSHA: vouchedSHA},
+		pr: vouchPRStub{headSHA: sha256},
 	})
-	short := vouchedSHA[:7]
 
 	w := postVouchCommit(t, s, runID,
-		vouchCommitRequest{SHA: short, Reason: "abbreviated paste"}, withVouchOperator)
+		vouchCommitRequest{SHA: sha256, Reason: "sha-256 repository"}, withVouchOperator)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -801,15 +890,51 @@ func TestVouchCommit_AbbreviatedShaTakesMismatchArm(t *testing.T) {
 	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if calls := vouchCreatorCalls(creator); len(calls) != 0 {
-		t.Fatalf("publisher seam calls = %d, want 0 (an abbreviated sha is not the live head)", len(calls))
+	if resp.VouchedSHA != sha256 {
+		t.Errorf("vouched_sha = %q, want %q", resp.VouchedSHA, sha256)
 	}
-	if !strings.Contains(resp.AuditCheckRepublishWarning, vouchedSHA) {
-		t.Errorf("warning must name the live head in full so the operator can re-vouch: %q",
-			resp.AuditCheckRepublishWarning)
+	e := vouchAudit(au)
+	if e == nil {
+		t.Fatal("operator_commit_vouched entry not recorded for a 64-hex sha")
 	}
-	if vouchAudit(au) == nil {
-		t.Error("operator_commit_vouched entry not recorded")
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if got, _ := payload[lineageVouchedSHAField].(string); got != sha256 {
+		t.Errorf("recorded %s = %q, want %q", lineageVouchedSHAField, got, sha256)
+	}
+	if calls := vouchCreatorCalls(creator); len(calls) != 1 {
+		t.Errorf("publisher seam calls = %d, want 1", len(calls))
+	}
+}
+
+// TestVouchCommit_ShaAcceptanceParity runs the SAME inputs as the MCP tool's
+// TestFullObjectName_ShaAcceptanceParity (mcpserver/vouch_test.go) through the
+// backend's authoritative predicate, so the duplicated MCP fast-fail predicate
+// cannot drift from this one (#4435). Keep the two tables identical.
+func TestVouchCommit_ShaAcceptanceParity(t *testing.T) {
+	cases := []struct {
+		name string
+		sha  string
+		want bool
+	}{
+		{"7 hex", strings.Repeat("a", 7), false},
+		{"8 hex", strings.Repeat("a", 8), false},
+		{"39 hex", strings.Repeat("a", 39), false},
+		{"40 hex", strings.Repeat("a", 40), true},
+		{"41 hex", strings.Repeat("a", 41), false},
+		{"63 hex", strings.Repeat("a", 63), false},
+		{"64 hex", strings.Repeat("a", 64), true},
+		{"40 non-hex", strings.Repeat("g", 40), false},
+		{"40 upper-case hex", strings.Repeat("A", 40), true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isDeployCommitSHA(tc.sha); got != tc.want {
+				t.Errorf("isDeployCommitSHA(%q) = %v, want %v", tc.sha, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -906,6 +1031,69 @@ func TestVouchCommit_RepublishedCheckDoesNotFlagVouchedHeadForeign(t *testing.T)
 	} {
 		if strings.Contains(field.text, string(auditcomplete.MissingForeignCommit)) {
 			t.Errorf("re-posted check %s flags the VOUCHED head as foreign_commit (#3415):\n%s", field.name, field.text)
+		}
+	}
+}
+
+// TestVouchCommit_UpperCaseSha_RecordedLowercase_ClearsCheck is the #4435
+// cross-boundary reproduction of the case variant, spanning HTTP handler →
+// audit append → auditcomplete.ComputeResult (rule 5) → auditcheckpublisher →
+// forge CreateCheckRun fake. The forge serves the lowercase head; the operator
+// vouches the UPPER-CASE spelling of it. The EqualFold publish bound lets the
+// re-post run, but rule 5 matches the head by exact string, so the handler must
+// record the canonical lowercase sha or the re-posted check flags the vouched
+// head as foreign_commit.
+//
+// COUNTERFACTUAL: turning the `sha = strings.ToLower(sha)` canonicalization
+// into a no-op turns this RED on the recorded payload, the response and the
+// re-posted check's foreign_commit.
+func TestVouchCommit_UpperCaseSha_RecordedLowercase_ClearsCheck(t *testing.T) {
+	creator := &vouchCheckCreator{}
+	s, au, runID := newVouchRepublishServerOpts(t, creator, vouchRepublishOpts{
+		pr:           vouchPRStub{headSHA: vouchedSHA},
+		agentHeadSHA: agentHeadSHA,
+	})
+	upper := strings.ToUpper(vouchedSHA)
+	if upper == vouchedSHA {
+		t.Fatalf("fixture sha %q has no letters to upper-case; the canonicalization control would be vacuous", vouchedSHA)
+	}
+
+	w := postVouchCommit(t, s, runID,
+		vouchCommitRequest{SHA: upper, Reason: "same commit, pasted upper-case"}, withVouchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp vouchCommitResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if resp.VouchedSHA != vouchedSHA {
+		t.Errorf("response vouched_sha = %q, want the canonical lowercase %q", resp.VouchedSHA, vouchedSHA)
+	}
+	e := vouchAudit(au)
+	if e == nil {
+		t.Fatal("operator_commit_vouched entry not recorded")
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(e.Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	if got, _ := payload[lineageVouchedSHAField].(string); got != vouchedSHA {
+		t.Errorf("recorded %s = %q, want the canonical lowercase %q", lineageVouchedSHAField, got, vouchedSHA)
+	}
+	calls := vouchCreatorCalls(creator)
+	if len(calls) != 1 {
+		t.Fatalf("check run creations = %d, want exactly 1", len(calls))
+	}
+	if got := calls[0].HeadSHA; got != vouchedSHA {
+		t.Errorf("check run head_sha = %q, want %q", got, vouchedSHA)
+	}
+	for _, field := range []struct{ name, text string }{
+		{"OutputSummary", calls[0].OutputSummary},
+		{"OutputText", calls[0].OutputText},
+	} {
+		if strings.Contains(field.text, string(auditcomplete.MissingForeignCommit)) {
+			t.Errorf("re-posted check %s flags the upper-case-vouched head as foreign_commit (#4435):\n%s", field.name, field.text)
 		}
 	}
 }

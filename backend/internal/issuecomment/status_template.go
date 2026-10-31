@@ -157,6 +157,9 @@ var activityCategories = map[string]struct{}{
 	// living-anchor timeline reflects whether the slices integrated cleanly.
 	"slices_integrated":          {},
 	"slice_integration_conflict": {},
+	// Child-slice concerns imported into the decomposed parent's ledger
+	// (E94.1 / #4692, ADR-117 D2): a system-actor, count-only line.
+	"concern_rolled_up": {},
 	// Implement-model resolution at the plan gate (#1013). The operator-gate
 	// slice emits this when a plan-stage approve resolves the implement model;
 	// surfacing it lets the issue thread show which model (and which rung)
@@ -339,6 +342,8 @@ func renderActivityLine(e *audit.Entry, r actorRenderers) string {
 		return "Slices integrated"
 	case "slice_integration_conflict":
 		return "Slice integration conflict"
+	case "concern_rolled_up":
+		return renderConcernRolledUpLine(e.Payload)
 	case "model_resolved":
 		return renderModelResolvedLine(e.Payload)
 	case "deployment_dispatched":
@@ -657,6 +662,22 @@ func renderModelResolvedLine(payload json.RawMessage) string {
 		return fmt.Sprintf("Implement model resolved: `%s`", model)
 	}
 	return fmt.Sprintf("Implement model resolved: `%s` (source: %s)", model, source)
+}
+
+// renderConcernRolledUpLine renders a concern_rolled_up row (E94.1 / #4692)
+// as a count-only line: no actor, no ids and no reviewer prose. A payload
+// that does not decode to a positive count renders the bare phrase.
+func renderConcernRolledUpLine(payload json.RawMessage) string {
+	const phrase = "Child-slice concerns imported into the parent"
+	var p struct {
+		Count  int `json:"count"`
+		High   int `json:"high"`
+		Medium int `json:"medium"`
+	}
+	if len(payload) == 0 || json.Unmarshal(payload, &p) != nil || p.Count <= 0 || p.High < 0 || p.Medium < 0 {
+		return phrase
+	}
+	return fmt.Sprintf("%s: %d (%d high, %d medium)", phrase, p.Count, p.High, p.Medium)
 }
 
 // decodeModelResolved reads the {model, model_source} payload the approval

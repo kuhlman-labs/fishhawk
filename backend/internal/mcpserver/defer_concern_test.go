@@ -38,10 +38,12 @@ func TestDeferConcern_HappyPath(t *testing.T) {
 	}
 
 	_, out, err := r.deferConcern(context.Background(), nil, DeferConcernInput{
-		ConcernID:  concernID.String(),
-		ParentEpic: "#1196",
-		N:          "4",
-		Note:       "split it out",
+		ConcernID:    concernID.String(),
+		ParentEpic:   "#1196",
+		N:            "4",
+		Note:         "split it out",
+		Judgement:    "tradeoff",
+		TradeoffCost: "the split lands a release later",
 	})
 	if err != nil {
 		t.Fatalf("deferConcern: %v", err)
@@ -57,6 +59,10 @@ func TestDeferConcern_HappyPath(t *testing.T) {
 	}
 	if fb.deferBody.ParentEpic != "#1196" || fb.deferBody.N != "4" || fb.deferBody.Note != "split it out" {
 		t.Errorf("body = %+v, want the threaded coordinates", fb.deferBody)
+	}
+	// The judgement and its cost reach the backend verbatim (ADR-117 D1, #4840).
+	if fb.deferBody.Judgement != "tradeoff" || fb.deferBody.TradeoffCost != "the split lands a release later" {
+		t.Errorf("body judgement/tradeoff_cost = %q/%q, want the threaded pair", fb.deferBody.Judgement, fb.deferBody.TradeoffCost)
 	}
 }
 
@@ -189,5 +195,26 @@ func TestDeferConcern_SchemaNOptional(t *testing.T) {
 	}
 	if !sawConcernID || !sawParentEpic {
 		t.Errorf("concern_id and parent_epic must stay required: %v", schema.Required)
+	}
+}
+
+// TestDeferConcern_NoLocalJudgementPreCheck: a defer WITHOUT a judgement is not
+// refused by the tool. It reaches the backend, whose 400 validation_failed is
+// what the caller sees (ADR-117 D1, #4840).
+func TestDeferConcern_NoLocalJudgementPreCheck(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.deferStatus = http.StatusBadRequest
+	fb.deferErrBody = `{"error":{"code":"validation_failed","message":"judgement is required","details":{"field":"judgement","rule":"judgement_required"}}}`
+	r := newResolver(srv, nil)
+	concernID := uuid.New()
+
+	_, _, err := r.deferConcern(context.Background(), nil, DeferConcernInput{
+		ConcernID: concernID.String(), ParentEpic: "#1196",
+	})
+	if err == nil || !strings.Contains(err.Error(), "validation_failed") {
+		t.Fatalf("err = %v, want the backend's validation_failed surfaced", err)
+	}
+	if fb.deferCalledByID[concernID] != 1 {
+		t.Errorf("backend defer called %d times, want 1 (no local judgement pre-check)", fb.deferCalledByID[concernID])
 	}
 }

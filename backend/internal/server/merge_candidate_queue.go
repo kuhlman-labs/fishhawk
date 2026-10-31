@@ -61,7 +61,13 @@ import (
 //     intent-bearing entry and applies its outcome; it continues only after
 //     a settle, a live admission, a bounded merge-on-pass readvance, or an
 //     ADR-112 R3 yield (#4632: a non-approved fold waits at the head for the
-//     approval window, then yields; an admission veto yields at once).
+//     approval window, then yields; an admission veto yields at once; #4748:
+//     an anchored entry's readvance or transient hold yields at expiry).
+//     docs/adr/112 A3 (#4780): merge-on-pass's retryable merge-gate legs
+//     (A3.1) never drop an intent-bearing entry: red yields at once, pending
+//     checks and a settling review hold on the epoch's merge-gate window
+//     (mergeOnPassEnforceGateWait), then yield; intent-bearing admission
+//     follows A3.3's four-row table (admitMergeCandidateEntryReclaimed).
 //
 // Every queue move writes one INTERNAL audit row, best-effort and after the
 // store's own transaction committed. The store is the source of truth; a lost
@@ -137,9 +143,11 @@ const (
 	// admitStale: an admission-epoch CAS conflict (another admission owns
 	// the entry now) or a failed queue write: nothing more is decided here.
 	admitStale
-	// admitYielded: an intent-bearing entry whose ONLY ineligibility is the
-	// R2 forge veto yielded at its admission epoch (ADR-112 R3 row 2): it is
-	// held and marked, AdmitNext skips it, and the pump continues.
+	// admitYielded: an intent-bearing entry yielded at its admission epoch
+	// under docs/adr/112 A3.3's table: the R2 forge veto (ADR-112 R3 row 2,
+	// alone or beside red checks) or a retryable merge-gate leg (red checks
+	// and/or a settling review, no veto): it is held and marked, AdmitNext
+	// skips it, and the pump continues.
 	admitYielded
 	// admitGateHeld (ADR-093 D8 ruling R7): a RE-CLAIMED admission whose run
 	// has a live stage or merge-candidate trigger is left live at its new
@@ -354,7 +362,13 @@ func (s *Server) pumpMergeCandidateQueue(ctx context.Context, base mergequeue.Ba
 // FIRST admission the boot re-claim (mergeQueueBootAdmit, ADR-093 D8).
 //
 // The live-entry branch routes by the entry's last recorded step: passed +
-// intent → merge-on-pass, then the outcome is applied, THEN the decision's
+// intent → merge-on-pass, then the expired-wait enforcement
+// (mergeOnPassEnforceExpiredWait, ADR-112 R3 / #4748: an anchored entry's
+// pre-claim readvance or transient hold yields at expiry, judged under the
+// run's merge-intent lock), then the merge-gate wait enforcement
+// (mergeOnPassEnforceGateWait, docs/adr/112 A3.2: a step-4 await_gate opens
+// or continues the epoch's window, or yields under the lock), then the
+// outcome is applied, THEN the decision's
 // own in-flight mark (if it marked) is cleared (ruling R8c); merging/settling → skipped while
 // THIS process has the run's merge in flight, else the restart resume
 // (mergeQueueResumeMerge); verifying/unverified → the verifying recovery
@@ -400,11 +414,12 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 			case e.Phase == mergequeue.PhasePassed && e.MergeIntentAt != nil:
 				// ADR-093 D3: the live head of line passed and carries the
 				// operator's merge intent, so the queue merges it.
-				o := s.mergeQueueMergeOnPass(mctx, mergeOnPassRequest{
-					Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger(),
-				})
+				req := mergeOnPassRequest{Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger()}
+				decided := s.mergeQueueMergeOnPass(mctx, req)
+				o := s.mergeOnPassEnforceExpiredWait(mctx, req, decided) // ADR-112 R3: an expired wait yields on a pre-claim readvance or transient hold
+				o = s.mergeOnPassEnforceGateWait(mctx, req, o)           // docs/adr/112 A3.2: a merge-gate leg holds on its window or yields
 				cont = s.applyMergeOnPassOutcome(mctx, e, o, &readvances)
-				if o.InFlightMarked {
+				if decided.InFlightMarked {
 					// Ruling R8c: after the outcome is applied, and only this
 					// decision's own mark (#4298 48a65a85).
 					s.mergeInFlight.clear(e.RunID)
@@ -465,10 +480,19 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 //     next held entry. A yield does not count against the readvance bound:
 //     AdmitNext skips a yielded row, so it cannot return in this pump. A CAS
 //     conflict stops.
+//   - await_gate (docs/adr/112 A3.2): mergeOnPassEnforceGateWait left the
+//     epoch's merge-gate window open and unexpired, so the head of line
+//     waits for its merge-gate legs (pending checks or a settling review)
+//     and the pump stops, never a drop; the next pump re-decides.
+//   - expired_yielded (ADR-112 R3, #4748; docs/adr/112 A3.2): the
+//     expired-wait or merge-gate wait enforcement already yielded the entry
+//     under the merge-intent lock; CONTINUE, not counted against the
+//     readvance bound (AdmitNext skips a yielded row).
 //   - held: stop; the next pump re-decides.
 //
-// It runs OUTSIDE the merge-intent lock (the pump's detached context): the
-// wait is a held outcome repeated across pumps, never held inside the lock.
+// It runs OUTSIDE the merge-intent lock (the pump's detached context): an
+// approval or merge-gate wait is an outcome repeated across pumps, never
+// held inside the lock.
 func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry, o mergeOnPassOutcome, readvances *int) bool {
 	log := func(msg string, attrs ...slog.Attr) {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, msg, append([]slog.Attr{
@@ -526,10 +550,20 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 		return s.yieldMergeQueueEntry(ctx, res.Entry, o.Yield, mergeQueueYieldSiteMergeOnPass)
 	case mergeOnPassYield:
 		return s.yieldMergeQueueEntry(ctx, e, o.Yield, mergeQueueYieldSiteMergeOnPass)
+	case mergeOnPassAwaitGate:
+		log("merge queue: the head of line waits for its merge-gate legs",
+			slog.String("yield_reason", o.Yield.Reason), slog.String("next_step", o.Yield.NextStep),
+			slog.Duration("remaining", o.GateRemaining))
+		return false
+	case mergeOnPassExpiredYielded:
+		log("merge queue: an expired approval or merge-gate wait yielded the entry; the pump continues",
+			slog.String("next_step", o.Yield.NextStep))
+		return true
 	case mergeOnPassRedecide:
-		// ADR-093 D8: the resume returned the entry to passed; the pump's
-		// next iteration runs ordinary merge-on-pass from scratch.
-		log("merge queue: the resume returned a merging entry with no dispatch claim to passed; merge-on-pass re-decides")
+		// ADR-093 D8: the resume returned the entry to passed (no dispatch
+		// claim, or ADR-109 A1's orphaned open-PR claim, named by o.Reason);
+		// the pump's next iteration runs ordinary merge-on-pass.
+		log("merge queue: the resume returned a merging entry to passed; merge-on-pass re-decides")
 		return true
 	}
 	log("merge queue: merge-on-pass holds the entry")
@@ -554,18 +588,24 @@ func (s *Server) pumpMergeCandidateQueueDetached(ctx context.Context, base merge
 	}()
 }
 
-// onlyForgeApprovalVetoed reports a result whose every reason is the R2
-// forge veto (ADR-112 R3 row 2 alone: no row-1 reason beside it).
-func onlyForgeApprovalVetoed(r mergeQueueEligibilityResult) bool {
-	if len(r.Reasons) == 0 {
-		return false
+// mergeQueueAdmissionYield is docs/adr/112 A3.3's yield for an
+// intent-bearing entry determined ineligible at admission whose reasons are
+// not undeterminable and carry no non-retryable leg (legs.Other): row 3, the
+// R2 veto (ADR-112 R3 row 2), alone or beside red checks, wins (A3.5 tier 1);
+// row 4, red checks and/or a settling review with no veto, is the merge-gate
+// yield (mergeGateYieldFor). ok=false: no row applies (the entry drops).
+func mergeQueueAdmissionYield(legs mergeGateLegs, r mergeQueueEligibilityResult) (mergeQueueYield, bool) {
+	if legs.Undeterminable || legs.Other {
+		return mergeQueueYield{}, false
 	}
-	for _, x := range r.Reasons {
-		if x.Code != mergeQueueReasonForgeApprovalVetoed {
-			return false
+	if legs.Veto {
+		for _, x := range r.Reasons {
+			if x.Code == mergeQueueReasonForgeApprovalVetoed {
+				return newMergeQueueYield(mergeCandidateQueueReasonForgeApprovalVetoed, x.Detail, mergeQueueYieldRowVeto), true
+			}
 		}
 	}
-	return true
+	return mergeGateYieldFor(legs, r)
 }
 
 // mergeQueueReasonsText renders eligibility reasons as "code: detail; …".
@@ -739,18 +779,22 @@ func (s *Server) admitMergeCandidateEntryReclaimed(ctx context.Context, e mergeq
 	}
 
 	// ADR-093 slice 1 (E87.4 / #4295): re-evaluate eligibility on the PR's
-	// current head BEFORE the behind probe and auto-advance. Determined
-	// ineligible → dropped not_merge_eligible (the pump admits the next);
-	// undeterminable → unadmit (stays held at its place). ADR-112 R3
-	// precedence: a determined non-approval ineligibility (row 1) drops as
-	// before even beside a veto; an intent-bearing entry whose ONLY reason is
-	// the R2 veto (row 2) YIELDS at its admission epoch, never drops.
+	// current head BEFORE the behind probe and auto-advance. docs/adr/112
+	// A3.3's table for an intent-bearing entry, FIRST matching row: (1)
+	// undeterminable → unadmit (stays held at its place, intent kept); (2) a
+	// non-retryable determined reason (legs.Other) → dropped
+	// not_merge_eligible, even beside a veto or a retryable leg; (3) the R2
+	// veto, alone or beside red checks → the veto yield (ADR-112 R3 row 2);
+	// (4) red checks and/or a settling review, no veto → the merge-gate
+	// yield (mergeGateYieldFor). A yield lands at the admission epoch (FIFO
+	// position and episode state kept), never a drop. An entry without
+	// intent keeps the drop.
 	if elig := s.mergeQueueAdmissionEligibilityAt(ctx, runRow, head, mergeQueueAnchorFor(e)); !elig.Eligible {
-		if elig.Undeterminable {
+		legs := mergeGateLegsOf(elig)
+		if legs.Undeterminable {
 			return unadmit("merge-queue eligibility could not be determined: " + mergeQueueReasonsText(elig.Reasons))
 		}
-		if e.MergeIntentAt != nil && onlyForgeApprovalVetoed(elig) {
-			y := newMergeQueueYield(mergeCandidateQueueReasonForgeApprovalVetoed, elig.Reasons[0].Detail, mergeQueueYieldRowVeto)
+		if y, ok := mergeQueueAdmissionYield(legs, elig); ok && e.MergeIntentAt != nil {
 			if !s.yieldMergeQueueEntry(ctx, e, y, mergeQueueYieldSiteAdmission) {
 				return mergeCandidateAdmitResult{outcome: admitStale, refusal: &mergeCandidateVerifyRefusal{
 					Reason: "the merge-candidate queue could not yield this entry (another admission owns it, or the write failed)"}}

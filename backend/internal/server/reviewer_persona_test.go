@@ -835,7 +835,7 @@ func TestPersona_PromptBuildFailure_DegradesWithoutAttribution(t *testing.T) {
 // Counterfactual: delete the persona reason assignment — the grounded case's
 // persona prompt then names the env var: RED.
 func TestPersona_NonGroundingPersonaNamesReviewerCannotGround(t *testing.T) {
-	repo, _ := gitFixtureRepo(t)
+	repo, headSHA := gitFixtureRepo(t)
 	newStd := func() *groundingFakeReviewer {
 		return &groundingFakeReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
 	}
@@ -849,6 +849,8 @@ func TestPersona_NonGroundingPersonaNamesReviewerCannotGround(t *testing.T) {
 		std, persona := newStd(), approvingFake()
 		p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), std, persona)
 		p.rr.getRuns[p.runID].WorkingDir = repo
+		// The plan round grounds on the recorded plan seed (#4436).
+		seedPlanGeneratedSeed(t, p.au, p.runID, p.stageID, headSHA)
 		p.review(t)
 		if !std.reviewGroundedHit {
 			t.Fatal("fixture: the round must be grounded")

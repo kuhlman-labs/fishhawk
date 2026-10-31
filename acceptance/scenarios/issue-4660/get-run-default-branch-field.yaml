@@ -1,0 +1,14 @@
+id: scenario:issue-4660/get-run-default-branch-field
+statement: GET /v0/runs/{run_id} returns 200 with EXACTLY ONE of default_branch (the run repository's forge-reported default branch) or default_branch_unresolved_reason (one of resolver_unconfigured, forge_unsupported, no_installation, repository_invalid, repository_not_visible, forbidden, default_branch_missing, lookup_failed); a deployment with no forge client reports resolver_unconfigured and never a guessed branch name.
+verify_hint: 'On the localhost preview call GET /v0/runs/{run_id} for an existing run: assert the 200 body carries exactly one of the two fields. With no GitHub App or dev stub forge configured the reason is resolver_unconfigured; with the dev stub forge wired and a GitHub run carrying an installation, default_branch equals the stub''s reported default branch.'
+steps: 1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"plan-gate-parked"} and read run_id from the 201 body. 2) GET /v0/runs/{run_id}. 3) Repeated with fresh seeds of acceptance-dispatched, split-parent-linked (both runs), grooming-confirm-gate and trace-upload-target, reading GET /v0/runs/{run_id} each time. 4) To try the resolved arm, POST /v0/dev/forge/deliveries with a GitHub 'issues' labeled payload carrying installation.id 4242 for repo stubco/trunkrepo. It returned 202 but no run was created.
+assertions:
+    expected: 200 with exactly one of default_branch / default_branch_unresolved_reason, and the reason drawn from the closed set. No guessed branch.
+    observed_at_record: 'All 6 runs returned 200 with default_branch_unresolved_reason=''no_installation'' and no default_branch key. That reason is in the closed set, and the body never carries a guessed branch name. The stub forge is wired, so resolver_unconfigured is correctly not the reason here (a GitHub run without an installation). The resolved default_branch arm could not be reached: no seedable run carries an installation.'
+    repro_handle: curl -s -XPOST localhost:8090/v0/dev/fixtures -d '{"scenario":"plan-gate-parked"}' ; curl -s localhost:8090/v0/runs/<run_id>
+origin:
+    issue: 4660
+    pr: 0
+    run_id: f6eecde6-6cf1-43d3-81f4-5f43fc9bbf2e
+    head_sha: 302380a94fd8f9f219a04727a85e622ae6ffbf7d
+    recorded_at: 2026-10-29T10:36:06Z

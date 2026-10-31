@@ -3,6 +3,7 @@ package planreview_test
 import (
 	"encoding/json"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 
@@ -1265,6 +1266,18 @@ func TestReviewStartedPayload_TreeSHAWireShape(t *testing.T) {
 			},
 			want: `{"configured_agents":1,"authority":"advisory","head_sha":"h1","round_origin":"fixup_push","round_base_sha":"b1","redispatch_of":41,"redispatch_depth":2}`,
 		},
+		{
+			// #4436: a plan round that resolved its seed records it.
+			name: "plan path seed sha only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory"), SeedSHA: "s1"},
+			want: `{"configured_agents":2,"authority":"advisory","seed_sha":"s1"}`,
+		},
+		{
+			// #4436: a plan round with no resolved seed records why.
+			name: "plan path seed unresolved only",
+			in:   planreview.ReviewStartedPayload{ConfiguredAgents: 2, Authority: planreview.AuthorityMode("advisory"), SeedUnresolved: "seed_not_recorded"},
+			want: `{"configured_agents":2,"authority":"advisory","seed_unresolved":"seed_not_recorded"}`,
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -2111,5 +2124,71 @@ func TestClampConventionSeveritiesForRound_ConventionsFileModifiedSeam(t *testin
 	planreview.ClampConventionSeveritiesForRound(&capped, planreview.ConventionCaps{"x": planreview.SeverityLow}, false)
 	if capped.Concerns[0].Severity != planreview.SeverityMedium {
 		t.Errorf("capped round: conventions_file_modified = %q, want medium (only the empty-caps rule targets it)", capped.Concerns[0].Severity)
+	}
+}
+
+// TestReviewStartedPayload_ReviewedHeadWireShape pins ADR-117 A1.7's additive
+// reviewed_head (E94.3 / #4694): omitted when nil, so a plan round and every
+// pre-A1.7 implement payload stay byte-identical; when set, exactly the
+// documented keys, with the three path sets always present as arrays.
+func TestReviewStartedPayload_ReviewedHeadWireShape(t *testing.T) {
+	b, err := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := `{"configured_agents":1,"authority":"advisory"}`; string(b) != want {
+		t.Errorf("nil reviewed_head payload = %s, want %s", b, want)
+	}
+
+	cases := []struct {
+		name string
+		rh   planreview.ReviewedHead
+		want []string
+	}{
+		{
+			name: "recorded",
+			rh: planreview.ReviewedHead{
+				Status: planreview.ReviewedHeadRecorded, Kind: planreview.ReviewedHeadKindPushedCommit, Origin: "fixup_push",
+				SHA: "s", TreeSHA: "t", ChangeID: "c", BaseSHA: "b", DiffMode: planreview.ReviewedHeadDiffDelta,
+				PatchRendered: true, Truncated: true, InventoryBestEffort: true, ChangedFileCount: 1,
+				Files: []string{"a.go"}, PartialFiles: []string{}, OmittedFiles: []string{},
+			},
+			want: []string{"base_sha", "change_id", "changed_file_count", "diff_mode", "files", "inventory_best_effort", "kind", "omitted_files", "origin", "partial_files", "patch_rendered", "sha", "status", "tree_sha", "truncated"},
+		},
+		{
+			name: "head_unknown with nil sets",
+			rh:   planreview.ReviewedHead{Status: planreview.ReviewedHeadUnknown, UnknownReason: "no_round_source", DiffMode: planreview.ReviewedHeadDiffFull},
+			want: []string{"changed_file_count", "diff_mode", "files", "omitted_files", "partial_files", "patch_rendered", "status", "truncated", "unknown_reason"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rh := tc.rh
+			b, err := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory, ReviewedHead: &rh})
+			if err != nil {
+				t.Fatal(err)
+			}
+			var top map[string]json.RawMessage
+			if err := json.Unmarshal(b, &top); err != nil {
+				t.Fatal(err)
+			}
+			var inner map[string]json.RawMessage
+			if err := json.Unmarshal(top["reviewed_head"], &inner); err != nil {
+				t.Fatalf("reviewed_head key missing or not an object: %s", b)
+			}
+			got := make([]string, 0, len(inner))
+			for k := range inner {
+				got = append(got, k)
+			}
+			sort.Strings(got)
+			if !reflect.DeepEqual(got, tc.want) {
+				t.Errorf("reviewed_head keys = %v, want %v", got, tc.want)
+			}
+			for _, k := range []string{"files", "partial_files", "omitted_files"} {
+				if s := string(inner[k]); !strings.HasPrefix(s, "[") {
+					t.Errorf("%s = %s, want a JSON array (never null)", k, s)
+				}
+			}
+		})
 	}
 }

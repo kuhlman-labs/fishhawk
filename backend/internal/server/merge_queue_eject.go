@@ -62,19 +62,33 @@ const (
 	mergeQueueForgeReasonNotMergeable     = "not_mergeable"
 	mergeQueueForgeReasonUnprocessable    = "unprocessable"
 	mergeQueueForgeReasonChecksNotSettled = "checks_not_settled"
+	// mergeQueueForgeReasonMergeMethodRefused (E93.2 / #4658): the run's
+	// declared merge method cannot be applied — the repository's merge
+	// settings disallow it (attributed after the dispatch), or the run's forge
+	// family cannot apply it per merge request (refused pre-lock). A new value
+	// inside ADR-093 D4's existing ejection-reason mechanism.
+	mergeQueueForgeReasonMergeMethodRefused = "merge_method_refused"
 )
 
 // mergeQueueChecksNotSettledDetail leads a checks_not_settled refusal's
-// forge_detail. The asymmetry is DELIBERATE (ADR-112 R3 row 5, ADR-093 D4):
-// pending checks HOLD before dispatch (merge-on-pass's onlyChecksNotGreen
-// rule), so slow CI never ejects; only a refusal from the forge's own merge
-// PUT ejects, and it is attempted exactly once.
-const mergeQueueChecksNotSettledDetail = "the checks were not settled at the merge attempt (the forge refused the pinned merge; pending checks hold before dispatch, only the forge's own refusal ejects): "
+// forge_detail. The lead stays short so the forge's own text, sanitised
+// BEFORE the lead is added (mergeQueueYieldDetail), keeps most of the
+// forgeApprovalDetailMaxBytes budget both sinks re-apply (#4705). The
+// remedy (mergeQueueEjectRemedy, closed vocabulary) states the DELIBERATE
+// asymmetry (ADR-112 R3 row 5, ADR-093 D4): pending checks HOLD before
+// dispatch, so slow CI never ejects; only the forge's own refusal of the
+// merge PUT ejects, and it is attempted exactly once.
+const mergeQueueChecksNotSettledDetail = "the checks were not settled at the merge attempt: "
 
 // mergeQueueForgeReasonFor maps a TYPED forge merge refusal to its code, or
-// "" for any other error.
+// "" for any other error. A *MergeMethodRefusalError is decided FIRST: it
+// rides alongside the original sentinel (ErrPullRequestNotMergeable and
+// friends), so a later case would otherwise claim it.
 func mergeQueueForgeReasonFor(err error) string {
+	var mref *MergeMethodRefusalError
 	switch {
+	case errors.As(err, &mref):
+		return mergeQueueForgeReasonMergeMethodRefused
 	case errors.Is(err, forge.ErrPullRequestUnstableStatus):
 		return mergeQueueForgeReasonChecksNotSettled
 	case errors.Is(err, forge.ErrMergeUnprocessable):
@@ -118,6 +132,9 @@ func mergeQueueEjectRemedy(nextStep, forgeReason string) string {
 		return "Advancing the branch onto its base conflicted: fishhawk_rebase_run_branch starts the bounded conflict-resolution pass; then re-invoke fishhawk_merge_run, which re-enters the run at the tail."
 	case mergeQueueEjectNextGetRunStatus:
 		return "The merge-candidate verify pass could not start: read fishhawk_get_run_status for why, resolve it, then re-invoke fishhawk_merge_run, which re-enters the run at the tail."
+	}
+	if forgeReason == mergeQueueForgeReasonMergeMethodRefused {
+		return "The run's declared merge method cannot be applied: for THIS run change the repository's merge settings to allow it, or merge the pull request by hand; a workflow-spec merge_method edit applies to runs admitted after it merges. fishhawk_merge_run re-enters the run at the tail once the settings allow it."
 	}
 	if forgeReason == mergeQueueForgeReasonChecksNotSettled {
 		return "The forge refused the pinned merge because the checks were not settled at the merge attempt; it is attempted exactly once (pending checks hold before dispatch, only the forge's own refusal ejects). Once the checks settle, re-invoke fishhawk_merge_run, which re-enters the run at the tail."

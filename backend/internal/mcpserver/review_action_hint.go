@@ -283,12 +283,22 @@ func implementReviewMergeHint(implementStatus *ReviewStatus) string {
 // budget/ceiling branch conditions live once, in reviewActionHintFor, and
 // this method only reads the result (RemainingFixupBudget /
 // OverrideAvailable carry the branch).
+// concernJudgementPlaceholder is the `judgement` param placeholder every
+// suggested human concern verb carries (fishhawk_waive_concern and
+// fishhawk_defer_concern here and in drive_run.go's driveFixupConcernActions;
+// ADR-117 D1, #4840). It names the closed human set the backend accepts, and
+// that tradeoff also needs tradeoff_cost, so an operator following the hint
+// does not meet a 400 validation_failed. It deliberately omits unlabelled,
+// which the backend refuses.
+const concernJudgementPlaceholder = "<REQUIRED human judgement: defect | defect_pre_existing | no_defect | tradeoff | preference | stale | insufficient_evidence; tradeoff also needs tradeoff_cost>"
+
 // deferConcernAction is the fishhawk_defer_concern entry shared by every arm
 // that surfaces an open concern. Extracted so the gate-closed arms (#3116) and
 // the three budget/ceiling arms carry ONE definition: deferring is always legal
 // while a concern is open and consumes NO fix-up budget (#1202), which is
 // exactly why it survives into the arms where the fix-up verb does not.
-// parent_epic + n are the non-derivable title coordinates the operator supplies.
+// parent_epic + n are the non-derivable title coordinates the operator supplies;
+// judgement is the human judgement the backend requires (ADR-117 D1, #4840).
 func deferConcernAction(concerns int) SuggestedAction {
 	return SuggestedAction{
 		Action: "fishhawk_defer_concern",
@@ -296,6 +306,7 @@ func deferConcernAction(concerns int) SuggestedAction {
 			"concern_ids": "run.concerns.items[].id",
 			"parent_epic": "<epic the follow-up rolls up to, e.g. #1196>",
 			"n":           "<child number for the [E<epic>.<n>] title>",
+			"judgement":   concernJudgementPlaceholder,
 		},
 		Precondition: "the concern is worth a separate change but should not block the merge",
 		Consumes:     consumesNone,
@@ -395,6 +406,66 @@ func (h *ReviewActionHint) gateClosedActions(run *Run, acceptance *Stage) []Sugg
 			fmt.Sprintf("%d open concern(s) from the implement review, but the review gate has not opened yet — fishhawk_fixup_stage refuses with fixup_not_applicable until the review stage reaches awaiting_approval; re-poll until it does, then route the concerns back (the fix-up budget is not consumed by waiting)", h.Concerns)),
 		deferConcernAction(h.Concerns),
 	}
+}
+
+// acceptanceUnsettledActions is the action set for the #4801 arm: open
+// implement concerns, the fix-up gate OPEN, but the acceptance stage
+// non-terminal on this head (a fix-up push re-opened it, or it never ran). The
+// merge is held until acceptance settles, so the lead is the acceptance move —
+// a dispatch carrying stage_id when no spawn attempt exists, else ONE wait-shaped
+// poll and no dispatch (#3222 binding condition 2) — and the tail is the
+// budget arm's set minus merge_and_file_follow_up, which names a verb the merge
+// endpoint refuses while acceptance is unsettled.
+func (h *ReviewActionHint) acceptanceUnsettledActions(run *Run, implementStageID string, acceptance *Stage) []SuggestedAction {
+	var lead []SuggestedAction
+	if acceptanceIsDispatchable(acceptance.State) {
+		for _, a := range dispatchOrPollActions(run, "acceptance", acceptance) {
+			if a.Action == "fishhawk_dispatch_stage" && a.Params["stage"] == "acceptance" {
+				params := make(map[string]string, len(a.Params)+1)
+				for k, v := range a.Params {
+					params[k] = v
+				}
+				params["stage_id"] = acceptance.ID
+				a.Params = params
+				a.Reason = acceptanceUnsettledLeadReason(acceptance)
+			}
+			lead = append(lead, a)
+		}
+	} else {
+		lead = []SuggestedAction{pollAction(run, derivedStageWaitPollInterval(run, acceptance), acceptanceUnsettledLeadReason(acceptance))}
+	}
+	for _, a := range h.suggestedActions(run, implementStageID) {
+		if a.Action == "merge_and_file_follow_up" {
+			continue
+		}
+		lead = append(lead, a)
+	}
+	return lead
+}
+
+// acceptanceUnsettledLeadReason is the lead acceptance action's reason on the
+// #4801 arm, single-sourced with the other acceptance-blocker surfaces.
+func acceptanceUnsettledLeadReason(acceptance *Stage) string {
+	return runpkg.AcceptanceBlockerAdvisory(shortStageID(acceptance.ID), runpkg.StageState(acceptance.State), false, mergeAdvisoryTail)
+}
+
+// acceptanceUnsettledLeadIndex locates the lead acceptance action
+// acceptanceUnsettledActions emitted, by NAME plus provenance, never by index:
+// the first fishhawk_dispatch_stage for stage acceptance when the stage is
+// dispatchable, else the first fishhawk_get_run_status whose reason is the
+// arm's own in-flight reason (so a drive-folded poll is never selected). -1
+// when absent.
+func acceptanceUnsettledLeadIndex(actions []SuggestedAction, acceptance *Stage) int {
+	dispatchable := acceptanceIsDispatchable(acceptance.State)
+	for i, a := range actions {
+		if dispatchable && a.Action == "fishhawk_dispatch_stage" && a.Params["stage"] == "acceptance" {
+			return i
+		}
+		if !dispatchable && a.Action == "fishhawk_get_run_status" && a.Reason == acceptanceUnsettledLeadReason(acceptance) {
+			return i
+		}
+	}
+	return -1
 }
 
 func (h *ReviewActionHint) suggestedActions(run *Run, implementStageID string) []SuggestedAction {
@@ -745,6 +816,15 @@ func (r *runResolver) reviewActionHintFor(ctx context.Context, runID, implementS
 				}
 			} else {
 				hint.Message += " NOTE: the fix-up gate is not open yet — the review stage has not reached awaiting_approval, so fishhawk_fixup_stage refuses until it does."
+			}
+		} else if acc := blockingAcceptanceStage(stages); acc != nil {
+			// #4801 gate-OPEN twin: a fix-up push re-opens a settled acceptance,
+			// so the merge is held even though the route-back is legal. Without
+			// this the budget message reads as a clean merge-now.
+			if acceptanceIsDispatchable(acc.State) {
+				hint.Message += fmt.Sprintf(" NOTE: the merge is held — the acceptance stage (state %q) has not settled on this head (a fix-up push re-opens a settled acceptance), so dispatch acceptance first, before any merge-with-follow-up; the fix-up route-back remains legal.", acc.State)
+			} else {
+				hint.Message += fmt.Sprintf(" NOTE: the merge is held — the acceptance stage (state %q) has not settled on this head (a fix-up push re-opens a settled acceptance) and is already in flight, so wait for it to settle before any merge-with-follow-up; the fix-up route-back remains legal.", acc.State)
 			}
 		}
 	}

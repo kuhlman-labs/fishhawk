@@ -1,0 +1,14 @@
+id: scenario:issue-4660/run-list-omits-default-branch
+statement: GET /v0/runs (the list endpoint) carries neither default_branch nor default_branch_unresolved_reason on any row.
+verify_hint: On the localhost preview call GET /v0/runs and assert no row carries either key.
+steps: After seeding plan-gate-parked, acceptance-dispatched, split-parent-linked, grooming-confirm-gate and trace-upload-target via POST /v0/dev/fixtures, called GET http://localhost:8090/v0/runs?limit=200 and searched every item and the raw body for both keys.
+assertions:
+    expected: No list row carries either key
+    observed_at_record: 200 with 6 items. No row carries default_branch or default_branch_unresolved_reason, and neither string appears anywhere in the body.
+    repro_handle: curl -s 'localhost:8090/v0/runs?limit=200' | grep -c default_branch
+origin:
+    issue: 4660
+    pr: 0
+    run_id: f6eecde6-6cf1-43d3-81f4-5f43fc9bbf2e
+    head_sha: 302380a94fd8f9f219a04727a85e622ae6ffbf7d
+    recorded_at: 2026-10-29T10:36:06Z

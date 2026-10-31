@@ -33,7 +33,12 @@ One row per queue EPISODE of a run.
 | `merge_intent_sequence` | The audit sequence of the `merge_queue_entered` row that recorded the intent (0108, ADR-093 slice 2). Stamped in the SAME statement as `merge_intent_at` (`EnqueueRequest.IntentSequence`, `MergeIntentRequest.IntentSequence`), only on the NULL-to-set transition, never overwritten. NULL (read as `Entry.MergeIntentSequence` 0) = no intent, or an intent recorded before 0108; merge-on-pass then resolves the newest `merge_queue_entered` row naming the base. |
 | `admission_epoch` | `BIGINT NOT NULL DEFAULT 0` (0108). Bumped by every admission: `AdmitNext`'s admit AND its stale re-claim, and `AdmitNextReclaiming`'s boot re-claim. The admission-owned writes are compare-and-swaps on it (§ "Admission-epoch CAS"). |
 | `yield_reason` / `yield_detail` / `yielded_at` | The YIELD MARKER (0109, ADR-112 R3; § "Yield"). NULL = not marked. `yield_reason` is the server's closed vocabulary (`backend/internal/server/merge_queue_yield.go`); `yield_detail` is untrusted forge-derived text every read surface sanitises (`Entry.YieldDetail`, `""` for NULL). DB CHECKs: `yielded_at` is set exactly when a non-empty `yield_reason` is, and a `live` row never carries a marker; a terminal row keeps it as history. `AdmitNext` skips a marked row. |
-| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission, a stale re-claim or the boot re-claim, kept by `Yield`, cleared only by `ClearYield`. |
+| `approval_wait_started_at` | The persisted head-of-line approval-wait anchor (0109): stamped ONCE per yield episode by `ApprovalWait` (COALESCE), never reset by `Unadmit`, a re-admission, a stale re-claim, the boot re-claim or (docs/adr/112 A3.7, 0115) `ClearYield`: RETAINED for the whole episode, so a later approval-fold block in the same episode judges expired at once. |
+| `approval_wait_open` | `BOOLEAN NOT NULL DEFAULT false` (0115, A3.7): an approval wait is open. Set by `ApprovalWait`, cleared by `ClearYield`; 0115 backfills it `true` on every row whose anchor is set (pre-0115 `ClearYield` nulled the anchor, so every set anchor was an open wait). The server's #4748 readvance deadline fires only while it is set (`Entry.ApprovalWaitOpen`). |
+| `yield_revision` | `BIGINT NOT NULL DEFAULT 0` (0115, A3.6): bumped by EVERY marker write (`Yield`, `Enqueue`'s mark, a marked insert = 1, `UpdateYield`, `ClearYield`, `ReanchorYielded`); a marker-less re-anchor does not. The yielded-row compare-and-swap key with `anchored_head_sha` (`Entry.YieldRevision`). |
+| `row4_flag` | `BOOLEAN NOT NULL DEFAULT false` (0115, A3.6): the row-4 obligation. ORed in by a marker write whose `YieldMarker.Row4` is true (no reason transition clears it); cleared only by `ClearYield(clearRow4=true)` (`Entry.Row4Flag`). 0115 backfills it `true` on every row yielded `forge_review_required` (pre-0115 the obligation was that stored reason). |
+| `gate_wait_started_at` / `gate_wait_epoch` | The per-admission-epoch merge-gate window (0115, A3.2): its start and the admission epoch that opened it; both NULL or both set (DB CHECK). Written only by `GateWait`. |
+| `gate_hold_tokens` / `gate_tokens_refilled_at` | The merge-gate hold budget (0115, A3.7): `SMALLINT NOT NULL DEFAULT 3`, CHECK `BETWEEN 0 AND 3` (`GateHoldBudget`), and its refill clock (NULL = never spent). Written only by `GateWait`; kept by every other write, a clear and a head move included. |
 | `updated_at` | `fishhawk_set_updated_at()` trigger; a call that "writes nothing" leaves it unchanged. |
 
 Invariants: at most one ACTIVE row per run (partial `UNIQUE (run_id) WHERE
@@ -203,9 +208,15 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   0 on an active row) is the database-clock age the sweep's backoff keys on,
   so no Go `time.Now()` is compared against `settled_at`.
 
-**Capabilities.** `Promoter`, `EjectionReader`, `ReentryReader` and
-`Resumer` (§ "AdmitNextReclaiming") are SEPARATE interfaces, not part of
-`Store`; `PostgresStore` implements all four. A caller type-asserts the capability on its `Store`, so a fake that
+- **`WithdrawIntent(WithdrawIntentRequest{RunID, Record})`** →
+  `Withdrawal{Entry, LiveRunID}` (`IntentWithdrawer`): settles the run's
+  YIELDED held entry `dropped` with `ReasonIntentWithdrawn` in one
+  transaction, `Record` before COMMIT (§ "Withdraw intent").
+
+**Capabilities.** `Promoter`, `IntentWithdrawer` (§ "Withdraw intent"),
+`EjectionReader`, `ReentryReader` and `Resumer` (§ "AdmitNextReclaiming")
+are SEPARATE interfaces, not part of `Store`; `PostgresStore` implements all
+five. A caller type-asserts the capability on its `Store`, so a fake that
 embeds a (possibly nil) `Store` and does not implement one degrades instead of
 panicking on a nil embedded call (approval condition M1 of #4297).
 
@@ -270,38 +281,64 @@ Go `time.Now()` is compared against a stored instant.
   (`started + window <= now`) and `Remaining` (0 when expired) in the same
   transaction. `window <= 0` is `ErrInvalidRequest`. The anchor survives
   `Unadmit`, the re-admission and a stale re-claim
-  (`TestApprovalWait_AnchorSurvivesUnadmitAndReadmission`). Call it OUTSIDE
-  the merge-intent lock.
-- **`Yield(id, epoch, YieldMarker{Reason, Detail})`**: live at `epoch` only
-  (epoch CAS). ONE statement moves the row to `held` (phase and `admitted_at`
-  cleared, `enqueued_at` kept) and stamps `yield_reason`, `yield_detail` and
-  `yielded_at`; `approval_wait_started_at` is kept. Empty reason →
+  (`TestApprovalWait_AnchorSurvivesUnadmitAndReadmission`) and, docs/adr/112
+  A3.7, a `ClearYield`: a later epoch's call on a retained anchor past the
+  window reports `Expired` at once (`TestApprovalWait_RetainedAnchorAfterClear`).
+  It sets `approval_wait_open`. Call it OUTSIDE the merge-intent lock.
+- **`GateWait(id, epoch, window)`** → `GateWaitResult{Entry, Opened, Expired,
+  NoToken, Remaining}` (docs/adr/112 A3.2/A3.7): live at `epoch` only (epoch
+  CAS; `ErrStateConflict`, nothing written); `window <= 0` is
+  `ErrInvalidRequest`. ONE window per admission epoch: when `gate_wait_epoch
+  = epoch` it CONTINUES (no spend: a (b) hold then a (c) hold in one epoch
+  spends one token) and `Expired` is judged against `gate_wait_started_at`;
+  otherwise it opens a FRESH window in one statement: the previous window's
+  hold, bounded by `window`, is first charged to the refill clock (holding
+  never refills), then `k = floor((now − gate_tokens_refilled_at) /
+  GateHoldRefill)` CLAMPED to `[0, GateHoldBudget]` (a future clock accrues
+  nothing; no negative remainder), one token is spent atomically with the
+  window stamp, and the refill clock moves to now (full, capped, NULL or
+  future) or keeps its remainder, never past now. An empty budget answers
+  `NoToken` and writes nothing. It never reads or writes the approval wait
+  (`TestGateWait_*`). Call it OUTSIDE the merge-intent lock.
+- **`Yield(id, epoch, YieldMarker{Reason, Detail, Row4})`**: live at `epoch`
+  only (epoch CAS). ONE statement moves the row to `held` (phase and
+  `admitted_at` cleared, `enqueued_at` kept), stamps `yield_reason`,
+  `yield_detail` and `yielded_at`, bumps `yield_revision` and ORs `Row4` into
+  `row4_flag`; `approval_wait_started_at` is kept. Empty reason →
   `ErrInvalidRequest` (`TestYield_OneTransactionUnderEpochCAS`).
-  `YieldMarker.Continue` (the entry's last cleared episode for that reason,
-  supplied by the server) makes `yielded_at` that episode's instead of the
-  database clock, ONLY when the row's anchor in the same statement equals the
-  episode's head and base; `Enqueue` marking an unmarked held entry applies
-  it after its re-anchor. An already-marked entry keeps its own `yielded_at`
-  (`TestYield_ContinuesAClearedEpisodeOnlyOnTheSameAnchor`).
-- **`ClearYield(id, head, yieldedAt)`**: the ONLY way back in. Under the base
-  lock, a compare-and-swap on `state = 'held' AND anchored_head_sha = head AND
-  yielded_at = yieldedAt`: clears the marker AND `approval_wait_started_at`
-  (a later non-approval starts a fresh episode). The row rejoins at its
-  original effective key (`enqueued_at`, or a kept promote `order_key`). A row whose head moved, whose episode changed
-  (another `yielded_at`) or that is not held → `ErrStateConflict` and the
-  marker stays (`TestClearYield_CompareAndSwap`, asserted on read-back).
-- **`UpdateYield(id, head, yieldedAt, YieldMarker)`**: the same CAS; rewrites
-  reason and detail only (a yield transition). `TestUpdateYield_RewritesReasonOnly`.
-- **`ReanchorYielded(id, head, yieldedAt, newHead, newBase)`**: the same CAS on
-  the OLD head; moves the anchor to the PR's current head and KEEPS the
-  marker, `yielded_at` and `approval_wait_started_at` (the same episode). A
-  head move never clears a marker, so a push loop cannot buy a fresh wait
-  window per push; the new head is judged by the next probe and cleared at
-  the NEW head (`TestReanchorYielded_KeepsMarkerAndEpisode`).
+  `YieldMarker.Continue` (the entry's last cleared episode on its base ref,
+  supplied by the server, docs/adr/112 A3.7) makes `yielded_at` that
+  episode's instead of the database clock when the row's `base_ref` equals
+  the episode's, WHATEVER the head or reason; `Enqueue` marking an unmarked
+  held entry applies it after its re-anchor. An already-marked entry keeps
+  its own `yielded_at` (`TestYield_ContinuesLastClearedEpisodeOnSameBaseRef`).
+- **`ClearYield(id, head, revision, clearRow4)`**: the ONLY way back in. Under
+  the base lock, a compare-and-swap on `state = 'held' AND yielded_at IS NOT
+  NULL AND anchored_head_sha = head AND yield_revision = revision`: clears
+  the marker and CLOSES the approval wait (`approval_wait_open = false`)
+  while RETAINING `approval_wait_started_at` (A3.7), and clears `row4_flag`
+  only when `clearRow4`. The row rejoins at its original effective key
+  (`enqueued_at`, or a kept promote `order_key`). A row whose head moved,
+  whose marker was rewritten since (another revision) or that is not held →
+  `ErrStateConflict` and the marker stays (`TestClearYield_CompareAndSwap`,
+  `TestClearYield_StaleRevisionRefused`, asserted on read-back).
+- **`UpdateYield(id, head, revision, YieldMarker)`**: the same CAS; rewrites
+  reason and detail and ORs `Row4` into `row4_flag` (a yield transition).
+  `TestUpdateYield_RewritesReasonOnly`,
+  `TestUpdateYield_StaleRevisionCannotOverwriteNewerReason`, `TestRow4Flag_Lifecycle`.
+- **`ReanchorYielded(id, head, revision, newHead, newBase)`**: the same CAS
+  on the OLD head; moves the anchor to the PR's current head and KEEPS the
+  marker, `yielded_at`, `approval_wait_started_at`, `row4_flag` and the hold
+  budget (the same episode). A head move never clears a marker, so a push
+  loop cannot buy a fresh wait window per push; the new head is judged by the
+  same probe and cleared at the NEW head (`TestReanchorYielded_KeepsMarkerAndEpisode`).
 
-`head` and `yieldedAt` are required on the three marker CASes
-(`ErrInvalidRequest`). `yieldedAt` is the value read back from the row
-(`Entry.YieldedAt`), compared at the column's microsecond precision.
+Every marker write bumps `yield_revision` in its own statement
+(`TestYieldRevision_EveryMarkerWriteBumps`), so a delayed probe that read an
+earlier revision misses the CAS even when the episode continued the same
+(head, `yielded_at`). `head` is required and `revision` must be non-negative
+on the three marker CASes (`ErrInvalidRequest`); `revision` is the value read
+back from the row (`Entry.YieldRevision`).
 
 ### Promote
 
@@ -341,6 +378,54 @@ entries in its account.
   KEY SHARE`), `Record` receives the transaction, and Promote only UPDATEs a
   non-key column, so no foreign-key lock on the runs row is taken.
 
+### Withdraw intent
+
+ADR-112 R3's withdraw-intent verb (#4685). A yielded entry still carries the
+operator's merge intent, so the queue owns the run's merge (ADR-109) and the
+inline `merge_run` is refused. `WithdrawIntent(WithdrawIntentRequest{RunID,
+Record})` → `Withdrawal{Entry, LiveRunID}` takes the merge out of the queue by
+SETTLING the entry, never by clearing `merge_intent_at` (0107's "set once,
+never cleared" holds; no migration).
+
+- **Order.** Promote's: the run's account (unknown run → `ErrNotFound`), the
+  per-run lock, an unlocked peek of the active entry, the base lock BLOCKING,
+  the entry re-read `FOR UPDATE`.
+- **Refusals**, classified on the re-read row in this order: no active entry
+  (none, only terminal rows, or settled between the peek and the lock) →
+  `ErrNotQueued`; live → `ErrEntryLive` (never withdrawn mid-pass); no merge
+  intent → `ErrNoIntent`; held but UNMARKED → `ErrEntryNotYielded` (it is
+  progressing to the queue's own head-pinned merge); then any
+  `merge_dispatch_claims` row for the run, `dispatched` or
+  `dispatch_failed`, read inside the transaction → `ErrDispatchClaimed`,
+  naming the claim's state, path and head. Nil `RunID` or nil `Record` →
+  `ErrInvalidRequest` before any SQL. Every refusal writes nothing
+  (`TestWithdrawIntent_RefusalsWriteNothing`, read back, including the
+  claim).
+- **Write.** `settleTx(..., StateDropped, ReasonIntentWithdrawn)`: only
+  `state`, `eject_reason` and `settled_at` change, so `enqueued_at`,
+  `merge_intent_at`, `merge_intent_sequence` and the yield columns are
+  retained as history (`TestWithdrawIntent_SettlesYieldedEntryDropped`).
+  `LiveRunID` is the base's live run, read inside the transaction.
+- **Record.** REQUIRED, called after the settle and before COMMIT; a non-nil
+  error rolls the whole withdrawal back (`TestWithdrawIntent_RecordErrorRollsBack`).
+  The server appends `merge_queue_intent_withdrawn` through it on `tx`; the
+  settle touches no key column, so (the `PromoteRequest.Record` precedent)
+  the append takes no foreign-key lock on the runs row.
+- **Ledger.** The claim is READ, never written: a `dispatch_failed` claim is
+  never silently cleared, and still needs reconciliation or the operator
+  re-arm (§ "Merge-dispatch ledger"). The server calls `WithdrawIntent` under
+  `WithMergeIntentLock`, the lock every `ClaimMergeDispatch` caller holds,
+  so no claim lands between the read and the settle.
+- **Every intent lookup then reads the intent as absent.** The entry is
+  terminal: `ActiveForRun` (the server's queue-ownership check and the
+  delegated arm) and the held arm of the merge-candidate gate find nothing,
+  `AdmitNext` never sees it, and `ReentryCandidates` / `UnresolvedEjections`
+  need an `ejected` newest row, so a later red-pass eject of the dropped row
+  settles nothing and the run never re-enters
+  (`TestWithdrawIntent_SuppressesAutoReentry`). A later `merge_run` that the
+  merge-candidate gate routes back to the queue records intent on a FRESH
+  row.
+
 ### Admission-epoch CAS
 
 A pump's decision is made against the entry as it read it; another pump may
@@ -353,8 +438,8 @@ change nothing (ADR-093 slice 2, rejection item 1):
 | `SetPhase` | live AND epoch | admission (incl. the D8 `advancing` stamp), verdict hook, transfer re-anchor, merge-on-pass's `merging` / `settling` stamps, the D8 resume |
 | `ReanchorAt` | live AND epoch | admission re-anchor |
 | `SettleAt` | live AND epoch (terminal: no-op) | admission settles, merge-on-pass settle outcomes |
-| `ApprovalWait` / `Yield` | live AND epoch | merge-on-pass approval wait and yield, admission veto yield |
-| `ClearYield` / `UpdateYield` / `ReanchorYielded` | held AND `anchored_head_sha` AND `yielded_at` | the yield re-probe |
+| `ApprovalWait` / `GateWait` / `Yield` | live AND epoch | merge-on-pass approval and merge-gate waits and yields, admission yields |
+| `ClearYield` / `UpdateYield` / `ReanchorYielded` | held AND marked AND `anchored_head_sha` AND `yield_revision` | the yield re-probe |
 | `Settle` / `Reanchor` | active (unconditional) | EXTERNAL facts only: PR resolved, cancel / re-open release, run terminal, the rebase transfer re-anchor, the merged settle after the forge accepted a queue merge |
 
 ### Merge-dispatch ledger
@@ -383,18 +468,30 @@ change nothing (ADR-093 slice 2, rejection item 1):
     whose outcome is uncertain. A head-PINNED inline or delegated dispatch
     the forge refuses for a head mismatch
     ([#4641](https://github.com/kuhlman-labs/fishhawk/issues/4641)) carries
-    `forge.ErrMergeConflict` on every arm and releases: the client pre-check
-    (no mutation sent) and the pinned REST PUT's 409 (`sha` mismatch) are
-    forge guarantees, but the pinned auto-merge enable's `graphql_reread`
-    basis (a GraphQL error, then a fresh read showing a different head) is
-    INFERRED, so that enable may in fact have armed auto-merge at the pinned
-    head. That is the one release the forge does not guarantee. It is taken
-    because a re-dispatch re-runs the merge-candidate gate (and, on a
-    declared approval gate, the forge-approval fold) at the new head
-    (`backend/internal/server/README.md` § "ADR-112 forge-approval fold",
-    head-pinned bullets). A pinned GraphQL
+    `forge.ErrMergeConflict` on every arm with a
+    `*githubclient.HeadMismatchError`, and its basis decides the claim
+    ([#4749](https://github.com/kuhlman-labs/fishhawk/issues/4749)): the
+    client pre-check (`precheck`, no mutation sent) and the pinned REST PUT's
+    409 (`rest_sha`: any 409 on that PUT, which GitHub documents as a `sha`
+    mismatch, so the label names the status, not a proven mismatch) are
+    refusals where nothing applied and release. The
+    pinned auto-merge enable's `graphql_reread` basis (a GraphQL error, then
+    a fresh read showing a different head) is INFERRED: a GraphQL execution
+    error can accompany an applied mutation, so that enable may in fact have
+    armed auto-merge at the pinned head. It is UNCERTAIN: the claim moves to
+    `dispatch_failed` and only reconciliation or the operator re-arm clears
+    it; an empty or unrecognised basis is treated the same (fail closed). A
+    bare `forge.ErrMergeConflict` with no `HeadMismatchError` (the REST PUT
+    409 on the queue's leaf, the unpinned ladder, GitLab) still releases.
+    The settle's `merge_dispatch_settled` row records `refusal_basis`,
+    `expected_head_sha` and `observed_head_sha` as separate keys
+    (`backend/internal/server/docs/merge-queue.md` § "ADR-112 forge-approval
+    fold", head-pinned bullets). A pinned GraphQL
     error whose re-read shows the SAME head, or whose re-read fails, stays a
-    bare `forge.ErrValidation`: uncertain. **`ReleaseMergeDispatch(claim)`**
+    bare `forge.ErrValidation`: uncertain. A pre-forge head-pin refusal
+    (`ErrHeadPinnedMergeUnsupported`) is deliberately uncertain too: it is a
+    deterministic capability refusal, and a release would re-dispatch into it
+    (#4683, ADR-093 D4). **`ReleaseMergeDispatch(claim)`**
     DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,
     `state = 'dispatched'`, `path`, `head_sha`, `claimed_at`); a claim that
     no longer matches is `ErrStateConflict` and is never deleted, so a
@@ -413,16 +510,24 @@ change nothing (ADR-093 slice 2, rejection item 1):
     `released` | `dispatch_failed`, `path`, `head_sha`, `reason`); an
     uncertain one also logs at WARN.
 - **Reconciliation before a re-arm.** Every path re-reads the PR before it
-  touches the ledger (the inline and queue paths re-observe a landed merge
-  BEFORE settling a claim after a failed dispatch, so a merge that landed
-  leaves the claim `dispatched`). The next merge-on-pass or `merge_run`
-  touching a run with a claim re-reads the PR: merged → merge-on-pass reads
-  the claim and settles the entry merged (`pr_merged`) only when there is
-  no claim or the claim names the merged head, else it holds
-  `merged_claim_head_mismatch` (WARN); the inline answer is
-  `already_merged`. On both paths a reconciled `dispatch_failed` claim
-  appends `merge_dispatch_settled` `reconciled_merged`. Unmerged → the claim
-  stands: merge-on-pass holds
+  touches the ledger (the inline, DELEGATED and queue paths re-observe a
+  landed merge BEFORE settling a claim after a failed dispatch, so a merge
+  that landed leaves the claim `dispatched`; the delegated path does so with
+  or without a claim, except on its own checks_pending refusal, and reports
+  the acted outcome `mergeDispatchLandedOnReobserve`, #4617). The next
+  merge-on-pass or `merge_run` touching a run with a claim re-reads the PR:
+  merged → merge-on-pass reads the claim and settles the entry merged
+  (`pr_merged`) only when there is no claim or the claim names the merged
+  head, else it holds `merged_claim_head_mismatch` (WARN); the inline answer
+  is `already_merged`. A claim recorded at head `unresolved` (an empty gate
+  head; inline or delegated only, never a queue claim) names ANY merged head,
+  in merge-on-pass and in the ADR-093 D8 resume (#4617). On both paths a
+  reconciled `dispatch_failed` claim appends `merge_dispatch_settled`
+  `reconciled_merged`, at most ONCE per run: deduped on (run, outcome),
+  atomic on Postgres (`AppendChainedDeduped` under the run-row lock), with a
+  non-atomic list-then-append fallback for the in-memory fakes. Unmerged → the claim
+  stands (except a crash-left queue claim still `dispatched`, which
+  merge-on-pass releases: "Crash-left claims" below): merge-on-pass holds
   `merge_already_dispatched` (WARN), the inline answer is
   `409 merge_already_dispatched` naming the claim, and the merge-queue read
   surfaces it on the entry (`dispatch_claim`: state, path, head, age,
@@ -436,43 +541,78 @@ change nothing (ADR-093 slice 2, rejection item 1):
   operator then re-invokes `fishhawk_merge_run`. On the QUEUE path no
   `fishhawk_merge_run` re-invocation is needed: the queue's next pump
   re-decides from scratch (the ADR-112 forge-approval fold and veto run
-  in-lock) and merges at most once. A `dispatched` claim is never re-armed:
-  its merge was handed to the forge.
-- **Crash-left claims (ADR-093 D8, #4298).** A process that dies between
-  `ClaimMergeDispatch` and classifying the forge outcome leaves a
-  `dispatched` claim no live process owns. The server's restart resume
-  (`backend/internal/server/README.md` § "Merge-queue durability (ADR-093
-  D8)") reconciles it with ONE forge re-read under the run's merge-intent
-  lock, and adds NO ledger transition and dispatches NO merge (ADR-109):
-  - Only a `queue`-path claim is ever reconciled. An `inline` or `delegated`
-    claim stays `dispatched` while the forge's auto-merge is armed, which is
-    normal, as is a GitLab claim: the resume never transitions, releases or
-    rewrites one, and any arm meeting one holds with no ledger write.
-  - A queue claim is crash-left only when the resume observes it while
-    HOLDING the merge-intent lock AND its `claimed_at` is older than the
-    database clock (`DatabaseNow`, never Go `time.Now()`) minus
-    `IntentFnTimeout` (the ADR-108 lock fn deadline) + the pinned merge-call
-    timeout + a margin (the server names the constant and its derivation).
-    There is no boot-time cutoff: a younger claim holds with nothing written
-    (`merge_dispatch_in_progress`) and a later tick re-decides.
+  in-lock) and merges at most once. A `dispatched` claim is never re-armed
+  by the operator: its merge was handed to the forge (a crash-left queue
+  one is released by ADR-109 Amendment A1, below).
+- **Crash-left claims (ADR-093 D8, #4298; ADR-109 Amendment A1, #4711).** A
+  process that dies between `ClaimMergeDispatch` and classifying the forge
+  outcome leaves a `dispatched` claim no live process owns. The server's
+  restart resume (`backend/internal/server/README.md` § "Merge-queue
+  durability (ADR-093 D8)") reconciles it with ONE forge re-read under the
+  run's merge-intent lock, and itself adds NO ledger transition and
+  dispatches NO merge (ADR-109); A1's release happens in merge-on-pass:
+  - Only a `queue`-path claim is ever reconciled or released. An `inline` or
+    `delegated` claim stays `dispatched` while the forge's auto-merge is
+    armed, which is normal, as is a GitLab claim: neither the resume nor
+    merge-on-pass ever transitions, releases or rewrites one, and any arm
+    meeting one holds with no ledger write.
+  - A queue claim is crash-left only when it is observed while HOLDING the
+    merge-intent lock AND its `claimed_at` is older than the database clock
+    (`DatabaseNow`, never Go `time.Now()`) minus `IntentFnTimeout` (the
+    ADR-108 lock fn deadline) + the pinned merge-call timeout + a margin (the
+    server names the constant and its derivation); a zero `claimed_at`, an
+    unreadable clock or a store with no database clock is never crash-left
+    (fail closed). There is no boot-time cutoff: a younger claim holds with
+    nothing written (`merge_dispatch_in_progress`) and a later tick
+    re-decides.
   - Merged at the claimed head → the normal merged reconcile and tail.
-    Closed unmerged → the entry settles closed. Not merged (PR open), or an
-    indeterminate read → the EXISTING `MarkMergeDispatchFailed(run,
-    "orphaned_by_restart")` (its `merge_dispatch_settled` row carries reason
-    `orphaned_by_restart`), then the entry HOLDS with a remedy naming the
-    operator re-arm above. The queue-path re-arm needs NO
-    `fishhawk_merge_run` re-invocation: the next pump re-decides. An entry
-    in phase `settling` (the forge accepted) is never orphaned: PR open or
-    an indeterminate read holds `settling_unconfirmed` with no ledger write.
-  - Nothing is retried or released automatically: the retry-once and the
-    moved head/base release wait for ADR-109 Amendment A1, and any later
-    automatic retry must re-run the ADR-112 forge-approval fold and veto
-    in-lock, failing closed, before calling the forge.
+    Closed unmerged → the EXISTING `MarkMergeDispatchFailed(run,
+    "orphaned_by_restart")` and the entry settles closed.
+  - Not merged, PR OPEN (A1) → the resume records `merge_queue_resumed`
+    `{redecide, orphaned_claim_open}` and returns the entry to `passed` with
+    no ledger write. Ordinary merge-on-pass then re-runs steps 1-7 under the
+    lock (entry, PR, head, base, the ADR-112 forge-approval fold, the R4
+    `merge_queue_authorized` row, the verdict) and, in step 8's not-claimed
+    branch ONLY, releases the claim: a strict `merge_dispatch_settled`
+    `{released, released_orphaned_claim}` row FIRST, then
+    `ReleaseMergeDispatch` (the CAS DELETE on `state = 'dispatched'`), then a
+    fresh `ClaimMergeDispatch` and the ordinary pinned merge (at most one
+    extra pinned merge call per restart; no bespoke retry). A failed row or
+    release holds `orphaned_claim_release_failed` with the claim standing.
+    The release is CONDITIONAL on that decision's fold approving: while the
+    fold is not approved the decision waits at step 6b (`await_approval`),
+    the PR still needs a qualifying approval, and the orphaned claim keeps
+    holding the head of the line until it arrives or the operator acts; the
+    ADR-109 pre-yield refusal still never yields a claimed entry.
+  - Not merged, PR read INDETERMINATE (a failed read) → the EXISTING
+    `MarkMergeDispatchFailed(run, "orphaned_by_restart")` (its
+    `merge_dispatch_settled` row carries reason `orphaned_by_restart`), then
+    the entry HOLDS with a remedy naming the operator re-arm above. The
+    queue-path re-arm needs NO `fishhawk_merge_run` re-invocation: the next
+    pump re-decides. An entry in phase `settling` (the forge accepted) is
+    never orphaned: PR open or an indeterminate read holds
+    `settling_unconfirmed` with no ledger write.
+  - What A1 changed and what stays operator-only: the open-PR release above
+    is the ONE automatic release of a `dispatched` claim. A `dispatch_failed`
+    claim (an uncertain outcome, or `orphaned_by_restart`, including those
+    left before A1) is NEVER released automatically: only reconciliation or
+    the operator re-arm clears it. Nothing is retried in a loop; the
+    retry-once and the moved head/base release are not implemented, and any
+    later automatic retry must re-run the ADR-112 forge-approval fold and
+    veto in-lock, failing closed, before calling the forge.
+  - Visibility: the merge-queue read labels a queue claim
+    `dispatch_claim.orphan` (`orphaned`: still `dispatched` and crash-left on
+    the database clock; `orphaned_by_restart`: `dispatch_failed` with that
+    cause, awaiting the re-arm), and the run read's
+    `merge_candidate_queue.dispatch_claim_orphan` carries the same label. A
+    released claim is deleted, so its record is the `released_orphaned_claim`
+    audit row.
 
 ## Reasons
 
-The store writes exactly one reason itself: `base_changed` (`ReasonBaseChanged`).
-Every other reason is the caller's string. It READS one: `ReentryCandidates`
+The store writes two reasons itself: `base_changed` (`ReasonBaseChanged`,
+`Enqueue`'s base change) and `intent_withdrawn` (`ReasonIntentWithdrawn`,
+`WithdrawIntent`, both dropped). Every other reason is the caller's string. It READS one: `ReentryCandidates`
 matches `ReentryReason` (`verify_failed`), the only ejection ADR-093 D4
 re-enters automatically. ADR-092's set (owned by the server
 serializer): dropped `run_terminal`, `run_cancelled`, `pr_merged_externally`,
@@ -496,7 +636,7 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   as absent (fresh row), never re-anchored
   (`TestEnqueue_EntrySettledBetweenPeekAndLockGetsFreshRow`).
 - By-entry mutations (`Unadmit`, `SetPhase`, `Reanchor`, `Settle`,
-  `MarkMergeIntent`, `ApprovalWait`, `Yield`, `ClearYield`, `UpdateYield`,
+  `MarkMergeIntent`, `ApprovalWait`, `GateWait`, `Yield`, `ClearYield`, `UpdateYield`,
   `ReanchorYielded`): read the entry's base → its base lock → the row
   `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
   stays correct.
@@ -504,8 +644,8 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   base lock → the live check (and its re-claim, whose `Record` runs under the
   base lock and the live row's lock, before COMMIT) → the first unmarked held
   row by effective key.
-- `Promote`: per-run lock → peek → the entry's base lock → the row `FOR
-  UPDATE` (Enqueue's order with one base).
+- `Promote` and `WithdrawIntent`: per-run lock → peek → the entry's base
+  lock → the row `FOR UPDATE` (Enqueue's order with one base).
 
 No path takes a row lock before an advisory lock, and multi-key acquisition is
 ascending, so the order is acyclic. The one-live-per-base guarantee is the
@@ -596,6 +736,8 @@ the BYPASSRLS system context.
 | Constant | Value | Why |
 |---|---|---|
 | `AdmissionStaleAfter` | 10 min | Bounds phases `admitted` and `advancing`. Admission work (auto-advance merge + bounded post-merge read + trigger append + re-open) takes seconds; 10 min is far past a slow forge, so a re-claim means a crash, not a slow pump. The re-run is idempotent (advance is a no-op when up to date; the pass start is per-head idempotent). At boot, `AdmitNextReclaiming` re-claims a pre-boot admission at once instead. |
+| `GateHoldBudget` | 3 | docs/adr/112 A3.7's hold budget N: at most three merge-gate windows per refill period; the 0115 CHECK's upper bound. |
+| `GateHoldRefill` | 1 h | A3.7's refill period R: one token per hour the row spends not holding. |
 | `IntentFnTimeout` | 90 s (`intentFnTimeout`) | The merge-intent lock's fn deadline (§ "Merge-intent lock"), exported for the D8 resume's crash-left queue-claim age window (§ "Merge-dispatch ledger"). |
 
 ## Residuals

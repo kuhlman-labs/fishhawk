@@ -18,7 +18,7 @@ it.
 | Page-class ping | `anchor_ping_posted` | _(payload `event`)_ | `Notifier.firePings` from `NotifyStatusUpdateForRun` AND the pings-only immediate `NotifyPageClassForRun` invoked at each batched append site (#1786) | first crossing of a page-class event (plan gate awaiting human approval, advisory reviewer reject, must_page_human, clarification request / awaiting_input park, CI failure, acceptance triage paged, campaign gate hand-off, crew escalation sent, crew escalation round-bound exhausted) | No — a one-line NEW comment per source event (deduped on the source audit `Sequence`) linking back to the anchor, addressed to the repo's captain when `Deps.Captain` is wired (#3766); an already-resolved reviewer-reject page is recorded-and-skipped |
 | CI-failure retry | `issue_commented` | `ci_retry` | `Dispatcher.handleCIFailureRetry` (#279) | retry dispatch | No (per-attempt dedup; new attempts post new comments) |
 | Budget alert (advisory) | `issue_commented` | `budget_alert` | `Server.checkBudgetAlerts` → `NotifyBudgetAlert` (#688, #1371) | crossing of an advisory periodic-budget ladder rung — `warn` / `over` / `ack_required` (≥2x) / `page` (≥3x) | No (per-`(period_start, tier)` dedup; each tier posts once per calendar period) |
-| Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command | No (every command gets its own reply) |
+| Slash-command reply | _(none — no dedup row)_ | _(none)_ | `Server.HandleApprovalCommand` via `replyApproval` | each `/fishhawk approve` or `/fishhawk reject` command — including the ADR-123 D4 refusal reply (#4755) on a workflow-v2 gate or an unverifiable gate, which names the supported channels (MCP, CLI, web UI) and records nothing | No (every command gets its own reply) |
 | Split parent acceptance-carrier (#2057) | _(none at the comment; the sibling `split_children_filed` completion marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` (plan-gate approve of a `split_proposal`-bearing plan) | on completion of split-child filing (all N children durably filed) | No (best-effort; the completion marker is persisted BEFORE this comment, so once it is durable a re-approval no-ops at the `priorCompletion` gate and never re-posts — the one residual is a re-post if the completion-marker append itself fails after the comment posts) |
 | Split filing refusal (#2412) | _(none at the comment; the sibling `split_filing_refused` marker is the durable dedup record)_ | _(none)_ | `Server.fileSplitProposalChildren` → `refuseSplitFilingOverCapPhase` (plan-gate approve of a `split_proposal` whose phase is over the implement cap) | on refusal to file any children (a phase declares more files than the resolved `max_files_changed` cap) | No (best-effort; the `split_filing_refused` marker is persisted BEFORE this comment, so once it is durable a re-approval of the still-over-cap proposal no-ops at the prior-refusal gate and never re-posts) |
 | Split parent close (#2062) | _(none at the comment; the parent thread's own stamped `fishhawk-split-parent-close` marker is the dedup record)_ | _(none)_ | `Server.handleContractChildClosed` (`issues.closed` on a filed split's contract child) | when the contract child closes as landed (any `state_reason` except `not_planned` / `duplicate`) | No (best-effort; the comment is posted BEFORE the close and deduped by re-reading the parent thread for the `fishhawk-split-parent-close` marker, so a redelivery finds the marker and posts nothing — the residual is a duplicate under two GENUINELY CONCURRENT deliveries, deliberately accepted over a lock) |
@@ -639,17 +639,24 @@ Notes:
 - The typed-reply approval path (`+1` / `lgtm` per E17.4) does NOT post its
   own slash reply (`silent=true`) — the user's typed reply *is* the
   acknowledgment. The plan-on-issue comment edit covers the broadcast.
-- **The one case where the slash-command reply surface deliberately posts
-  NOTHING at all** (E67.24 / #2621): an over-cap approve comment arriving on
-  the typed-reply (`silent=true`) channel is refused before `Submit` (#2583 —
-  the comment would become a binding approval condition, so it must not be
-  silently truncated), and the refusal posts no reply, because a passer-by
-  `+1` that happens to exceed the cap should not draw an unsolicited bot
-  comment. The standing-in machine record is the `approval_comment_refused`
+- **The two cases where the slash-command reply surface deliberately posts
+  NOTHING at all**, both refusals on the typed-reply (`silent=true`) channel
+  before `Submit`, because a passer-by `+1` should not draw an unsolicited bot
+  comment: (1) an over-cap approve comment (E67.24 / #2621; #2583 — the
+  comment would become a binding approval condition, so it must not be
+  silently truncated), payload `reason:"over_cap_approve_comment"`; (2) the
+  ADR-123 D4 channel refusal (#4755) — comment approve/reject on a
+  workflow-v2 gate, or on a gate whose approval rules cannot be verified —
+  payload `reason:"comment_channel_refused"` with `cause` ∈
+  `workflow_v2_gate` / `spec_unreadable` / `role_resolver_unconfigured` /
+  `role_resolution_failed` (plus `spec_major` except on `spec_unreadable`).
+  The standing-in machine record for both is the `approval_comment_refused`
   audit category (`Server.writeApprovalCommentRefusedAudit`, also written on
-  the non-silent slash variant with `silent:false`) — so the drop is visible
-  in the run record even though no comment exists to point at. A trace, not
-  a response: the suppression is intentional and stays.
+  the non-silent slash variant with `silent:false`, which additionally posts
+  the refusal reply) — so the drop is visible in the run record even though
+  no comment exists to point at. A trace, not a response: the suppression is
+  intentional and stays. A reaction approval forwarded by the
+  `reactionpoller` is not silent, so its channel refusal draws one reply.
 - The review-lifecycle audit categories — `plan_reviewed` /
   `implement_reviewed` (terminal verdicts), `plan_review_skipped` /
   `implement_review_skipped` (degraded gate), `plan_review_started` /
@@ -1478,6 +1485,27 @@ Notes:
   decomposed parent's integration phase (`integrated` /
   `integration_conflict`) and surface `consolidated_branch` /
   `conflicting_child_run_id`.
+- The child-slice concern rollup audit kind — `concern_rolled_up` (E94.1 /
+  #4692, ADR-117 D2) — is a **system-actor audit kind with no dedicated
+  Notifier method** that renders **data-drivenly** on the living anchor and the
+  status comment through `activityCategories` + `renderActivityLine` in
+  `status_template.go`. Its sole writer is `server/concern_rollup.go`: on a
+  decomposed parent's fan-in (every `integrateSlices` pass, immediately before
+  `slices_integrated`) or a child review landing after the child succeeded, it
+  copies the children's OPEN HIGH/MEDIUM concerns into the parent's concern
+  ledger and, when at least one copy was inserted, appends ONE row on the
+  parent and its implement stage, payload `{site, parent_stage_id, count,
+  high, medium, concerns:[{concern_id, rolled_up_from, child_run_id,
+  child_stage_id, slice_index, severity, category, reviewer_model,
+  reviewer_role, origin_review_sequence}]}` (`site` ∈ `fan_in` |
+  `child_review`; no reviewer note prose). The line is count-only, with no
+  actor, no ids and no @-mention: `Child-slice concerns imported into the
+  parent: <count> (<high> high, <medium> medium)`, or the bare phrase on a
+  payload without a positive count. A re-run imports nothing and writes no
+  row; an append failure leaves the durable copies without a row (ERROR
+  `concern_rolled_up_audit_lost`). Contract:
+  `backend/internal/concern/README.md` § "Child-slice rollup + the outcome
+  column".
 - The implement-model resolution audit kind — `model_resolved` (#1013) — is
   **INTRODUCED by the operator-gate slice** as the source-tagged record of the
   implement model the plan gate resolved, and it ALSO appears in the
@@ -1899,9 +1927,10 @@ Notes:
   transition) and `merge_queue_yield_cleared` (the resolution) rows are
   DELIBERATELY not registered.
 
-- The merge-queue ejection and promote audit kinds `merge_queue_ejected`
-  (ADR-093 D4, E87.6 / #4297) and `merge_queue_promoted` (ADR-093 D7, same
-  issue; forward-registered, its writer is the promote verb) are
+- The merge-queue ejection, promote and withdraw-intent audit kinds
+  `merge_queue_ejected` (ADR-093 D4, E87.6 / #4297), `merge_queue_promoted`
+  (ADR-093 D7, same issue; forward-registered, its writer is the promote
+  verb) and `merge_queue_intent_withdrawn` (ADR-112 R3, E87.17 / #4685) are
   **INTERNAL, deliberately-not-a-surface** rows: no Notifier method, NOT in
   `activityCategories`, nothing in `issuecomment` renders or posts them.
   `merge_queue_ejected` (`server/merge_queue_eject.go`) is written ONCE per
@@ -1910,6 +1939,10 @@ Notes:
   `fishhawk_fixup_stage`, `fishhawk_rebase_run_branch`, `fishhawk_merge_run`,
   `fishhawk_get_run_status`), `fixup_routed` (verify_failed only), and for a
   forge refusal `forge_reason` plus a sanitised, UNTRUSTED `forge_detail`.
+  `merge_queue_intent_withdrawn` (`server/merge_queue_withdraw.go`) is
+  appended INSIDE the withdraw-intent transaction when the operator settles a
+  YIELDED entry `dropped` `intent_withdrawn`; its payload carries only this
+  run's ids, intent and yield reason, never the untrusted `yield_detail`.
   Read them through `GET /v0/runs/{id}/audit`.
 
 - The concern-defer audit kinds — `concern_deferred` and its corrective
@@ -2053,6 +2086,17 @@ Notes:
   anchor (#977); delivery to the agent is poll-based (the agent polls the GET
   endpoint), so no comment surface is involved. Listed here only so a future reader
   grepping the audit categories doesn't mistake them for comment surfaces.
+  On a decomposition child the requested and decided entries also carry an
+  optional `slice_ownership` key (#4679: `slice_index`, `ancestor_slices`,
+  `ancestor_owned`, `conflicts`, `checked`, plus `error` on the request-time
+  fail-open `checked: false` record); a non-child run's payload is unchanged
+  (key absent). A fourth kind, `scope_amendment_refused` (#4679), is written by
+  `server/scope_amendment.go` (`server/slice_ownership.go`) when the
+  slice-ownership guard refuses a child's amendment — phase `request` (agent
+  actor, `{phase, paths, reason, slice_ownership}`, no row created) or phase
+  `decide` (user actor, `{phase, amendment_id, paths, slice_ownership}`, the
+  row stays pending). It is internal-only: no Notifier method, NOT in
+  `activityCategories`, and withheld from run-bound audit reads.
 - The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
   `scope_completeness_exempted`, `scope_completeness_amended`, and
   `scope_completeness_failed` (#1231/#2501/#2548/#2591) — are

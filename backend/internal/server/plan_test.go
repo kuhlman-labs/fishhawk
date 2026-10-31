@@ -5881,18 +5881,21 @@ func TestPlanReview_Persona_SharedProviderSettlesAtTwo(t *testing.T) {
 // its prompt then claims a tree it cannot read (no DIFF-ONLY clause) and this
 // goes RED.
 func TestPlanReview_Persona_GroundingIsolation(t *testing.T) {
-	repo, _ := gitFixtureRepo(t)
+	repo, headSHA := gitFixtureRepo(t)
 	newStd := func() *groundingFakeReviewer {
 		return &groundingFakeReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "m"}
 	}
 	baseStd := newStd()
 	base := newPersonaPlanRun(t, personaSpec(personaSpecOpts{}), baseStd, nil)
 	base.rr.getRuns[base.runID].WorkingDir = repo
+	// Both rounds ground on the recorded plan seed (#4436).
+	seedPlanGeneratedSeed(t, base.au, base.runID, base.stageID, headSHA)
 	base.review(t)
 
 	std, persona := newStd(), approvingFake()
 	p := newPersonaPlanRun(t, personaSpec(personaSpecOpts{attachOn: "plan"}), std, persona)
 	p.rr.getRuns[p.runID].WorkingDir = repo
+	seedPlanGeneratedSeed(t, p.au, p.runID, p.stageID, headSHA)
 	p.review(t)
 
 	if !std.reviewGroundedHit || std.treeDir == "" {

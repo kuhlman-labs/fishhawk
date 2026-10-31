@@ -3,6 +3,8 @@ package server
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -11,6 +13,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
+	"regexp"
 	"strings"
 	"sync"
 	"testing"
@@ -18,6 +22,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/basedelta"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
@@ -95,7 +100,59 @@ type mctFixture struct {
 // dir, the inputs seam faked and the classifier answering independent.
 func newMCTFixture(t *testing.T, mode MergeCandidateTransferMode) *mctFixture {
 	t.Helper()
-	f := &mctFixture{mcvFixture: newMCVFixture(t, mcvUndelegatedSpecYAML),
+	return newMCTFixtureSpec(t, mode, mcvUndelegatedSpecYAML)
+}
+
+// mctV2SpecBase is a minimal v2 admission spec with a verify command and NO
+// verdict_transfer block; the declared fixtures append one.
+const mctV2SpecBase = `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          verify:
+            command: "scripts/test verify"
+            timeout: "5m"
+        produces:
+          - artifact: pull_request
+`
+
+// mctDeclaredSpecYAML is a v2 admission spec declaring a verdict_transfer
+// surface with a completeness check; mctDeclaredNoCheckSpecYAML declares
+// the same surface without one (enforce withheld, ADR-124 D4).
+const mctDeclaredNoCheckSpecYAML = mctV2SpecBase + `verdict_transfer:
+  global_surface: ["x/**"]
+  shared_artifact_dirs: ["web/"]
+`
+
+const mctDeclaredSpecYAML = mctDeclaredNoCheckSpecYAML + `  completeness_check: "fixture check"
+`
+
+// mctValidSpecs fails the test unless every fixture spec parses, so a
+// fixture typo cannot pass as an undeclared surface.
+func mctValidSpecs(t *testing.T, specs ...string) {
+	t.Helper()
+	for _, sp := range specs {
+		if _, err := spec.ParseBytes([]byte(sp)); err != nil {
+			t.Fatalf("fixture spec does not parse: %v\n%s", err, sp)
+		}
+	}
+}
+
+// newMCTFixtureSpec is newMCTFixture over the given admission spec.
+func newMCTFixtureSpec(t *testing.T, mode MergeCandidateTransferMode, specYAML string) *mctFixture {
+	t.Helper()
+	f := &mctFixture{mcvFixture: newMCVFixture(t, specYAML),
 		cls: &fakeTransferClassifier{res: basedelta.Result{Independent: true, Reason: basedelta.ReasonIndependent}}}
 	f.s.cfg.MergeCandidateTransfer = MergeCandidateTransferConfig{Mode: mode, Classifier: f.cls}
 	f.s.transferInputs = func(_ context.Context, workingDir, candidate, priorHead, rootHead string) (*mergeCandidateTransferInputs, error) {
@@ -372,9 +429,11 @@ func TestTransferDecision_IndependentTransfersInEnforce(t *testing.T) {
 		FromHead: mcvHead, ToHead: mctNewHead, FromBase: mctFromBase, ToBase: mctToBase, RootHead: mcvHead,
 		Cause: mergeCandidateCauseBaseAdvance, DeltaPathsCount: 1, PRPathsCount: 2,
 		Reason: transferReasonIndependent, ReasonCode: transferReasonIndependent, ReasonUntrusted: true,
-		DurationMS: got.DurationMS, SurfaceVersion: basedelta.SurfaceVersion, Mode: "enforce",
+		DurationMS: got.DurationMS, ClassifierVersion: basedelta.ClassifierVersion, Mode: "enforce",
+		SurfaceProvenance: transferSurfaceProvenance{Source: "admission_spec", WorkflowSHA: "abc",
+			SpecSHA256: mctSHA256(mcvUndelegatedSpecYAML), State: "undeclared"},
 	}
-	if got != want {
+	if !reflect.DeepEqual(got, want) {
 		t.Errorf("payload = %+v\nwant      %+v", got, want)
 	}
 	if n := len(auditEntries(f.au, CategoryMergeCandidateVerdictTransferRefused)); n != 0 {
@@ -502,12 +561,31 @@ func TestTransferReason_SplitClosedCodes(t *testing.T) {
 		{basedelta.Result{Reason: "shared_artifact:x/y"}, transferReasonSharedArtifact, "x/y"},
 		{basedelta.Result{Reason: "reach_overlap:a"}, transferReasonReachOverlap, "a"},
 		{basedelta.Result{Reason: "undecidable:panic"}, transferReasonUndecidable, "panic"},
+		{basedelta.Result{Reason: "doc_check:x"}, transferReasonDocCheck, "x"},
+		{basedelta.Result{Reason: "undecidable:unsupported_languagex"}, transferReasonUndecidable, "unsupported_languagex"},
 		{basedelta.Result{Reason: "independent"}, transferReasonUnknown, "independent"},
 		{basedelta.Result{Reason: "brand_new:z"}, transferReasonUnknown, "brand_new:z"},
 	} {
 		code, detail := splitTransferReason(tc.res)
 		if code != tc.code || detail != tc.detail {
 			t.Errorf("split(%+v) = %q,%q want %q,%q", tc.res, code, detail, tc.code, tc.detail)
+		}
+	}
+	// Each ADR-124 undecidable sub-code is its own closed code, bare and
+	// with an untrusted detail, and fits the one-colon [a-z_] <= 64 shape the
+	// issue-comment renderer accepts.
+	closedShape := regexp.MustCompile(`^[a-z_]+(:[a-z_]+)?$`)
+	for _, c := range transferUndecidableCodes {
+		if code, detail := splitTransferReason(basedelta.Result{Reason: c}); code != c || detail != "" {
+			t.Errorf("split(%s) = %q,%q", c, code, detail)
+		}
+		if code, detail := splitTransferReason(basedelta.Result{Reason: c + ":tools/gen.py"}); code != c || detail != "tools/gen.py" {
+			t.Errorf("split(%s:tools/gen.py) = %q,%q", c, code, detail)
+		}
+	}
+	for _, c := range append(append([]string{}, transferUndecidableCodes...), transferReasonDocCheck) {
+		if !closedShape.MatchString(c) || len(c) > 64 {
+			t.Errorf("closed code %q breaks the closed-code shape", c)
 		}
 	}
 	long := strings.Repeat("é", 300) + "\n\x00tail"
@@ -781,9 +859,10 @@ func TestDefaultTransferInputs_ExportIgnoredDependentNeverIndependent(t *testing
 		}
 	}
 	res := (&basedelta.Classifier{Loader: &basedelta.GoListLoader{}}).Classify(context.Background(), basedelta.Input{
-		DeltaPaths: in.Delta.DeltaPaths, PRPaths: in.Delta.PRPaths, Workspaces: in.Workspaces})
-	if res.Independent {
-		t.Fatalf("classified %+v over an export-ignored common dependent, want NOT independent", res)
+		DeltaPaths: in.Delta.DeltaPaths, PRPaths: in.Delta.PRPaths, Workspaces: in.Workspaces,
+		Surface: &basedelta.Surface{Global: []string{"go.mod"}}})
+	if res.Independent || res.Reason != "reach_overlap:c" {
+		t.Fatalf("classified %+v over an export-ignored common dependent, want reach_overlap:c", res)
 	}
 
 	// A plain git error (an unknown candidate) gets one fetch-on-miss and
@@ -951,10 +1030,13 @@ func TestDefaultTransferInputs_SymlinkAliasNeverIndependent(t *testing.T) {
 	if fmt.Sprint(in.Delta.DeltaPaths) != "[shared/impl.txt p/impl.go]" {
 		t.Errorf("DeltaPaths = %v, want the target and its link [shared/impl.txt p/impl.go]", in.Delta.DeltaPaths)
 	}
+	// shared/** is declared inert: without alias expansion the delta is only
+	// the inert shared/impl.txt and would classify independent.
 	res := (&basedelta.Classifier{Loader: &basedelta.GoListLoader{}}).Classify(context.Background(), basedelta.Input{
-		DeltaPaths: in.Delta.DeltaPaths, PRPaths: in.Delta.PRPaths, Workspaces: in.Workspaces})
-	if res.Independent {
-		t.Fatalf("classified %+v; a delta editing p's symlinked source must NOT be independent of a PR on q", res)
+		DeltaPaths: in.Delta.DeltaPaths, PRPaths: in.Delta.PRPaths, Workspaces: in.Workspaces,
+		Surface: &basedelta.Surface{Global: []string{"go.mod"}, Inert: []string{"shared/**"}}})
+	if res.Independent || res.Reason != "reach_overlap:q" {
+		t.Fatalf("classified %+v; a delta editing p's symlinked source must be reach_overlap:q against a PR on q", res)
 	}
 
 	// A link escaping the repository makes the inputs undecidable.
@@ -976,4 +1058,163 @@ func TestDefaultTransferInputs_SymlinkAliasNeverIndependent(t *testing.T) {
 	f := newMCTFixture(t, MergeCandidateTransferEnforce)
 	f.inputsErr = fmt.Errorf("wrapped: %w", basedelta.ErrSymlinkEscape)
 	assertTransferCode(t, f.decide(t), transferReasonIncompleteExport, f.cls.count(), 0)
+}
+
+// --- ADR-124: the admission-spec surface, enforce-withheld, diagnostics ----
+
+func mctSHA256(s string) string {
+	sum := sha256.Sum256([]byte(s))
+	return hex.EncodeToString(sum[:])
+}
+
+// TestTransferDecision_PassesAdmissionSurface: the classifier receives the
+// surface declared in the run's cached ADMISSION spec, and every row records
+// classifier_version, the declaration's digest and its provenance.
+func TestTransferDecision_PassesAdmissionSurface(t *testing.T) {
+	mctValidSpecs(t, mctDeclaredSpecYAML)
+	f := newMCTFixtureSpec(t, MergeCandidateTransferEnforce, mctDeclaredSpecYAML)
+	want := &basedelta.Surface{Global: []string{"x/**"}, SharedDirs: []string{"web/"}, CompletenessCheck: "fixture check"}
+	if transferred, _ := f.s.mergeCandidateTransferEnforce(context.Background(), f.req(t)); !transferred {
+		t.Fatal("a declared, checked surface did not transfer in enforce")
+	}
+	if got := f.cls.input.Surface; got == nil || !reflect.DeepEqual(*got, *want) {
+		t.Fatalf("classifier Input.Surface = %+v, want %+v", got, want)
+	}
+	rows := transferRows(f.au, CategoryMergeCandidateVerdictTransferred)
+	if len(rows) != 1 {
+		t.Fatalf("transferred rows = %d, want 1", len(rows))
+	}
+	wantProv := transferSurfaceProvenance{Source: "admission_spec", WorkflowSHA: "abc", SpecSHA256: mctSHA256(mctDeclaredSpecYAML), State: "declared"}
+	if r := rows[0]; r.ClassifierVersion != basedelta.ClassifierVersion || r.SurfaceDigest != want.Digest() || r.SurfaceProvenance != wantProv {
+		t.Errorf("row = version %d digest %q provenance %+v; want %d %q %+v",
+			r.ClassifierVersion, r.SurfaceDigest, r.SurfaceProvenance, basedelta.ClassifierVersion, want.Digest(), wantProv)
+	}
+	// A ladder refusal (no classification) records the same identity fields.
+	fr := newMCTFixtureSpec(t, MergeCandidateTransferEnforce, mctDeclaredSpecYAML)
+	r := fr.req(t)
+	r.MergePerformed = false
+	if d := fr.s.decideMergeCandidateTransfer(context.Background(), r); d.ReasonCode != transferReasonNotCleanAdvance ||
+		d.SurfaceDigest != want.Digest() || d.SurfaceProvenance.State != "declared" {
+		t.Errorf("ladder refusal = %+v, want not_clean_advance carrying the digest and provenance", d)
+	}
+	// An undeclared (v0.5) admission spec passes a nil surface.
+	fu := newMCTFixture(t, MergeCandidateTransferEnforce)
+	d := fu.decide(t)
+	if fu.cls.input.Surface != nil || d.SurfaceDigest != "" || d.SurfaceProvenance.State != "undeclared" {
+		t.Errorf("undeclared: Input.Surface = %+v decision = %+v, want nil surface, empty digest, state undeclared", fu.cls.input.Surface, d)
+	}
+}
+
+func TestVerdictTransferSurface_ProvenanceStates(t *testing.T) {
+	mctValidSpecs(t, mctDeclaredSpecYAML)
+	f := newMCTFixture(t, MergeCandidateTransferShadow)
+	for _, tc := range []struct {
+		name     string
+		spec     []byte
+		state    string
+		declared bool
+	}{
+		{"no_spec", nil, "no_spec", false},
+		{"unparseable", []byte("version: ["), "unparseable", false},
+		{"undeclared", []byte(mcvUndelegatedSpecYAML), "undeclared", false},
+		{"declared", []byte(mctDeclaredSpecYAML), "declared", true},
+	} {
+		r := f.runRow(t)
+		r.WorkflowSpec = tc.spec
+		surface, prov := f.s.verdictTransferSurface(context.Background(), r)
+		wantSHA := ""
+		if tc.spec != nil {
+			wantSHA = mctSHA256(string(tc.spec))
+		}
+		if prov.State != tc.state || prov.Source != "admission_spec" || prov.SpecSHA256 != wantSHA || (surface != nil) != tc.declared {
+			t.Errorf("%s: surface=%+v provenance=%+v, want state %s sha %q declared=%v", tc.name, surface, prov, tc.state, wantSHA, tc.declared)
+		}
+	}
+}
+
+// TestTransferEnforce_WithheldWithoutCompletenessCheck (ADR-124 D4): enforce
+// over a declaration naming no completeness check writes NOTHING and the
+// shadow scheduler records the would-be decision instead.
+func TestTransferEnforce_WithheldWithoutCompletenessCheck(t *testing.T) {
+	mctValidSpecs(t, mctDeclaredSpecYAML, mctDeclaredNoCheckSpecYAML)
+	f := newMCTFixtureSpec(t, MergeCandidateTransferEnforce, mctDeclaredNoCheckSpecYAML)
+	if transferred, d := f.s.mergeCandidateTransferEnforce(context.Background(), f.req(t)); transferred || d.Computed {
+		t.Fatalf("withheld enforce: transferred=%v decision=%+v, want false and nothing computed", transferred, d)
+	}
+	for _, c := range []string{CategoryMergeCandidateVerdictTransferred, CategoryMergeCandidateVerdictTransferRefused} {
+		if n := len(auditEntries(f.au, c)); n != 0 {
+			t.Errorf("%s rows = %d, want 0 while enforce is withheld", c, n)
+		}
+	}
+	f.s.scheduleMergeCandidateTransferShadow(f.req(t))
+	f.s.waitMergeCandidateTransferShadows()
+	rows := transferRows(f.au, CategoryMergeCandidateVerdictTransferShadow)
+	if len(rows) != 1 || rows[0].WouldTransfer == nil || !*rows[0].WouldTransfer || rows[0].Mode != "shadow" ||
+		rows[0].EnforceWithheld != "completeness_check_undeclared" {
+		t.Fatalf("shadow rows = %+v, want one would_transfer row, mode shadow, enforce_withheld completeness_check_undeclared", rows)
+	}
+	// Positive control: the same surface WITH a check transfers in enforce,
+	// and the shadow scheduler stays out of enforce.
+	fc := newMCTFixtureSpec(t, MergeCandidateTransferEnforce, mctDeclaredSpecYAML)
+	if transferred, _ := fc.s.mergeCandidateTransferEnforce(context.Background(), fc.req(t)); !transferred {
+		t.Error("a checked declaration did not transfer in enforce")
+	}
+	fc.s.scheduleMergeCandidateTransferShadow(fc.req(t))
+	fc.s.waitMergeCandidateTransferShadows()
+	if n := len(auditEntries(fc.au, CategoryMergeCandidateVerdictTransferShadow)); n != 0 {
+		t.Errorf("checked enforce: shadow rows = %d, want 0", n)
+	}
+	// Plain shadow mode stamps no enforce_withheld.
+	fs := newMCTFixtureSpec(t, MergeCandidateTransferShadow, mctDeclaredNoCheckSpecYAML)
+	fs.s.scheduleMergeCandidateTransferShadow(fs.req(t))
+	fs.s.waitMergeCandidateTransferShadows()
+	if rows := transferRows(fs.au, CategoryMergeCandidateVerdictTransferShadow); len(rows) != 1 || rows[0].EnforceWithheld != "" {
+		t.Errorf("shadow mode rows = %+v, want one row without enforce_withheld", rows)
+	}
+}
+
+// TestTransferDecision_RecordsUnmatchedPatterns: a declared pattern matching
+// no file of either workspace is a DIAGNOSTIC on the row, never a refusal.
+func TestTransferDecision_RecordsUnmatchedPatterns(t *testing.T) {
+	base, cand := t.TempDir(), t.TempDir()
+	for _, dir := range []string{base, cand} {
+		for _, p := range []string{"x/a.go", "web/index.html"} {
+			if err := os.MkdirAll(filepath.Join(dir, filepath.Dir(p)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, p), []byte("x\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	decideWith := func(specYAML string) mergeCandidateTransferDecision {
+		mctValidSpecs(t, specYAML)
+		f := newMCTFixtureSpec(t, MergeCandidateTransferShadow, specYAML)
+		f.s.transferInputs = func(context.Context, string, string, string, string) (*mergeCandidateTransferInputs, error) {
+			return &mergeCandidateTransferInputs{
+				Delta:      basedelta.DeltaInputs{FromBase: mctFromBase, ToBase: mctToBase, DeltaPaths: []string{"b/b.go"}, PRPaths: []string{"a/a.go"}},
+				Workspaces: []string{base, cand},
+			}, nil
+		}
+		return f.decide(t)
+	}
+	one := decideWith(mctDeclaredSpecYAML + "  inert_paths: [\"proto/**\"]\n")
+	if !one.Transfer || one.ReasonCode != transferReasonIndependent || !reflect.DeepEqual(one.SurfaceUnmatched, []string{"proto/**"}) ||
+		one.SurfaceUnmatchedCount != 1 {
+		t.Errorf("one unmatched: decision = %+v, want independent with surface_unmatched [proto/**] count 1", one)
+	}
+	var many []string
+	for i := 0; i < 20; i++ {
+		many = append(many, fmt.Sprintf("\"none%02d/**\"", i))
+	}
+	twenty := decideWith(mctDeclaredSpecYAML + "  inert_paths: [" + strings.Join(many, ", ") + "]\n")
+	if !twenty.Transfer || len(twenty.SurfaceUnmatched) != 16 || twenty.SurfaceUnmatchedCount != 20 || twenty.SurfaceUnmatched[0] != "none00/**" {
+		t.Errorf("twenty unmatched: listed %d count %d transfer %v, want 16 listed, count 20, verdict unchanged",
+			len(twenty.SurfaceUnmatched), twenty.SurfaceUnmatchedCount, twenty.Transfer)
+	}
+	// A listing failure skips the diagnostic and keeps the verdict.
+	f := newMCTFixtureSpec(t, MergeCandidateTransferShadow, mctDeclaredSpecYAML)
+	if d := f.decide(t); !d.Transfer || d.SurfaceUnmatched != nil || d.SurfaceUnmatchedCount != 0 {
+		t.Errorf("unlistable workspaces: decision = %+v, want independent with no diagnostic", d)
+	}
 }

@@ -538,12 +538,17 @@ func (f *Forge) ListPullRequestsForCommit(ctx context.Context, scope forge.Crede
 // not in a mergeable state — mapped to forge.ErrPullRequestNotMergeable.
 // GitLab has no ErrPullRequestCleanStatus analog: a merge-ready MR merges
 // synchronously on the same call, so that sentinel is never produced here.
+// The method maps per refuseRebaseMerge's doc (E93.2 / #4658).
 func (f *Forge) EnableAutoMerge(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, prNumber int, method forge.MergeMethod) error {
+	if err := refuseRebaseMerge(method); err != nil {
+		return err
+	}
 	c, pid, err := f.resolve(ctx, scope)
 	if err != nil {
 		return err
 	}
 	_, err = c.MergeMergeRequest(ctx, pid, prNumber, gitlabclient.MergeMergeRequestParams{
+		SquashSet:                 true,
 		Squash:                    method == forge.MergeMethodSquash,
 		MergeWhenPipelineSucceeds: true,
 	})
@@ -551,16 +556,39 @@ func (f *Forge) EnableAutoMerge(ctx context.Context, scope forge.CredentialScope
 }
 
 // MergePullRequest merges a merge request synchronously. A 405/406 maps to
-// forge.ErrPullRequestNotMergeable.
+// forge.ErrPullRequestNotMergeable. The method maps per refuseRebaseMerge's
+// doc (E93.2 / #4658).
 func (f *Forge) MergePullRequest(ctx context.Context, scope forge.CredentialScope, _ forge.RepoRef, prNumber int, method forge.MergeMethod) error {
+	if err := refuseRebaseMerge(method); err != nil {
+		return err
+	}
 	c, pid, err := f.resolve(ctx, scope)
 	if err != nil {
 		return err
 	}
 	_, err = c.MergeMergeRequest(ctx, pid, prNumber, gitlabclient.MergeMergeRequestParams{
-		Squash: method == forge.MergeMethodSquash,
+		SquashSet: true,
+		Squash:    method == forge.MergeMethodSquash,
 	})
 	return mapMergeError(err)
+}
+
+// refuseRebaseMerge is the adapter's merge-method guard (E93.2 / #4658).
+// GitLab's merge API carries no merge method — only a squash boolean — so a
+// per-request REBASE cannot be expressed: it is refused with
+// forge.ErrMergeMethodUnsupported (and forge.ErrUnsupported) BEFORE any
+// credential resolution or HTTP call. The server refuses a gitlab x rebase
+// declaration before its merge-dispatch claim (forge.MergeMethodsForFamily),
+// so this is defence in depth. Every other method sends an EXPLICIT squash
+// (SquashSet): squash -> "squash": true; merge -> "squash": false, overriding
+// an MR author's squash selection so the project's merge-method setting
+// decides the commit shape.
+func refuseRebaseMerge(method forge.MergeMethod) error {
+	if method == forge.MergeMethodRebase {
+		return fmt.Errorf("%w: %w: forge/gitlab: a merge request merge cannot request a rebase merge; the project's merge method setting governs; declare squash or merge",
+			forge.ErrMergeMethodUnsupported, forge.ErrUnsupported)
+	}
+	return nil
 }
 
 // MergePullRequestAtHead merges a merge request SYNCHRONOUSLY with the source
@@ -574,13 +602,17 @@ func (f *Forge) MergePullRequestAtHead(ctx context.Context, scope forge.Credenti
 	if strings.TrimSpace(expectedHeadSHA) == "" {
 		return errors.New("forge/gitlab: merge pull request at head: expected head sha required")
 	}
+	if err := refuseRebaseMerge(method); err != nil {
+		return err
+	}
 	c, pid, err := f.resolve(ctx, scope)
 	if err != nil {
 		return err
 	}
 	_, err = c.MergeMergeRequest(ctx, pid, prNumber, gitlabclient.MergeMergeRequestParams{
-		Squash: method == forge.MergeMethodSquash,
-		SHA:    expectedHeadSHA,
+		SquashSet: true,
+		Squash:    method == forge.MergeMethodSquash,
+		SHA:       expectedHeadSHA,
 	})
 	// 409 = sha does not match the source branch HEAD (the head moved after
 	// verification). Mapped to forge.ErrMergeConflict, the head-pin contract's

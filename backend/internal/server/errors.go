@@ -164,6 +164,13 @@ var redactableDetailKeys = map[string]struct{}{
 	// error or a third-party response — so it satisfies the membership rule
 	// above on the `state` / `failed_ordinal` precedent.
 	"merge_candidate_state": {},
+	// default_branch_unresolved_reason: the named reason a 502
+	// rollback_dispatch_failed (reason default_branch_unresolved) carries when
+	// the repository's forge default branch could not be resolved (#4660). Its
+	// value is the CLOSED, product-owned defaultbranch.Reason enum (eight
+	// constants) — never error text or third-party content — so it satisfies
+	// the membership rule above.
+	"default_branch_unresolved_reason": {},
 }
 
 // redactErrorDetails returns a NEW map holding only the allow-listed keys of

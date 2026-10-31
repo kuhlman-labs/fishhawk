@@ -1,0 +1,130 @@
+# implement-running — a feature_change run whose plan stage SUCCEEDED and
+# whose implement stage is RUNNING, ahead of a pending acceptance stage and
+# a pending human review (#4426). It makes the implement category-C park
+# drivable on the acceptance preview.
+#
+# The stages follow the real feature_change order (plan, implement,
+# acceptance, review). The scenario carries NO artifacts and NO audit rows,
+# so the run's infrastructure-park history is empty: no plan_decomposed row
+# (not a decomposed parent), no stage-scoped pass-trigger row (not a
+# re-opened pass) and no prior park. A first-execution category-C implement
+# failure therefore PARKS the run instead of failing it.
+#
+# Credential-less drive recipe (the reap-failure and retry routes need write
+# scopes the acceptance agent does not hold, so the drive uses the signed
+# pull-request failure report the runner itself sends):
+#   1. POST /v0/runs/{run_id}/signing-key — returns the run's base64
+#      private_key.
+#   2. POST /v0/dev/sign with header X-Fishhawk-Dev-Private-Key: <that key>
+#      and the raw report body
+#      {"outcome":"failed","category":"C","reason":"runner_lost"} — returns
+#      the hex signature over that exact body.
+#   3. POST /v0/runs/{run_id}/pull-request?stage_id=<implement stage id>
+#      with the SAME body and X-Fishhawk-Signature: <hex> — 200.
+# Then GET /v0/runs/{run_id} reads the run still `running`, GET
+# /v0/runs/{run_id}/stages reads implement `failed` (category C) with
+# acceptance still `pending`, and POST
+# /v0/runs/{run_id}/stages/{acceptance_stage_id}/host-dispatch would answer
+# 409 dispatch_not_admissible / earlier_stage_failed on a non-preview daemon
+# (the preview refuses every host-dispatch caller in dev mode).
+#
+# The workflow_spec's acceptance stage is shaped after
+# .fishhawk/workflows.yaml (agent executor, egress.target_hosts naming the
+# preview host, produces: acceptance) so spec parse accepts it.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: target-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4426"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (implement-running).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+
+stages:
+  - key: plan
+    run: target-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: implement
+    run: target-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: running
+  - key: acceptance
+    run: target-run
+    sequence: 3
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: pending
+  - key: review
+    run: target-run
+    sequence: 4
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: pending

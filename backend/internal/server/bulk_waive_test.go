@@ -1,7 +1,6 @@
 package server
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -13,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -35,10 +35,19 @@ func postBulkWaive(t *testing.T, s *Server, runID string, body bulkWaiveRequest)
 	return postBulkWaiveAs(t, s, runID, body, withAuth)
 }
 
+// postBulkWaiveAs posts a bulk waive. A body with no judgement and no reason
+// prefix is waived as no_defect (defaultTestJudgement).
 func postBulkWaiveAs(t *testing.T, s *Server, runID string, body bulkWaiveRequest, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
 	t.Helper()
+	body.Judgement = defaultTestJudgement(body.Judgement, body.Reason, concern.JudgementNoDefect)
 	raw, _ := json.Marshal(body)
-	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID+"/concerns/waive", bytes.NewReader(raw))
+	return postBulkWaiveRaw(t, s, runID, string(raw), auth)
+}
+
+// postBulkWaiveRaw posts raw bytes to the bulk waive, with no judgement default.
+func postBulkWaiveRaw(t *testing.T, s *Server, runID, raw string, auth func(*http.Request) *http.Request) *httptest.ResponseRecorder {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID+"/concerns/waive", strings.NewReader(raw))
 	req.SetPathValue("run_id", runID)
 	w := httptest.NewRecorder()
 	s.handleBulkWaiveConcerns(w, auth(req))
@@ -637,18 +646,19 @@ func TestBulkWaive_AuditAppendFailure_LeavesConcernOpen(t *testing.T) {
 	})
 }
 
-// midBatchFailConcernRepo fails ApplyResolution for ONE id, simulating a
-// concurrent transition that raced the pre-validation.
+// midBatchFailConcernRepo fails ApplyHumanDisposition (the waive's close
+// path since E94.7 / #4840) for ONE id, simulating a concurrent transition
+// that raced the pre-validation.
 type midBatchFailConcernRepo struct {
 	*fakeConcernRepo
 	failFor uuid.UUID
 }
 
-func (m *midBatchFailConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to concern.State, reason string) (*concern.Concern, error) {
+func (m *midBatchFailConcernRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to concern.State, reason string, d concern.HumanDisposition) (*concern.Concern, error) {
 	if id == m.failFor {
 		return nil, concern.InvalidTransitionError{From: concern.StateWaived, To: to}
 	}
-	return m.fakeConcernRepo.ApplyResolution(ctx, id, to, reason)
+	return m.fakeConcernRepo.ApplyHumanDisposition(ctx, id, to, reason, d)
 }
 
 // TestBulkWaive_MidBatchApplyFailure is the partial-application contract. A
@@ -707,5 +717,210 @@ func TestBulkWaive_MidBatchApplyFailure(t *testing.T) {
 	}
 	if payload["concern_id"] != b.ID.String() {
 		t.Errorf("concern_waive_failed names %v, want the failed id %s", payload["concern_id"], b.ID)
+	}
+}
+
+// --- Human judgement (ADR-117 D1 phase 2, E94.7 / #4840) --------------------
+
+// bulkWaiveBody renders a raw bulk-waive body naming ids, with extra fields
+// (judgement, tradeoff_cost) merged in.
+func bulkWaiveBody(t *testing.T, reason string, extra map[string]any, ids ...uuid.UUID) string {
+	t.Helper()
+	body := map[string]any{"reason": reason}
+	strs := make([]string, len(ids))
+	for i, id := range ids {
+		strs[i] = id.String()
+	}
+	body["concern_ids"] = strs
+	for k, v := range extra {
+		body[k] = v
+	}
+	raw, err := json.Marshal(body)
+	if err != nil {
+		t.Fatalf("marshal bulk waive body: %v", err)
+	}
+	return string(raw)
+}
+
+// TestBulkWaiveConcerns_RefusesMissingJudgement (CF2): a bulk waive with an
+// unprefixed reason and NO judgement refuses the WHOLE batch 400
+// field=judgement before any intent entry. With the guard deleted every item
+// appends its intent row and fails in the store (a 200 with failed items).
+func TestBulkWaiveConcerns_RefusesMissingJudgement(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	runID := uuid.New()
+	a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+	b := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 2, "b")
+
+	w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "nits, not blocking", nil, a.ID, b.ID), withAuth)
+	assertJudgementRefused(t, w, "judgement", concern.JudgementRuleRequired)
+	assertUnjudged(t, cr, concern.StateRaised, a.ID, b.ID)
+	assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+}
+
+// TestBulkWaiveConcerns_RefusesTradeoffWithoutCost (CF5): a tradeoff batch with
+// no tradeoff_cost is refused whole, 400 field=tradeoff_cost.
+func TestBulkWaiveConcerns_RefusesTradeoffWithoutCost(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	runID := uuid.New()
+	a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+	b := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 2, "b")
+
+	w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "accepted", map[string]any{"judgement": "tradeoff"}, a.ID, b.ID), withAuth)
+	assertJudgementRefused(t, w, "tradeoff_cost", concern.JudgementRuleTradeoffCostRequired)
+	assertUnjudged(t, cr, concern.StateRaised, a.ID, b.ID)
+	assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+}
+
+// TestBulkWaiveConcerns_RefusesContradictingReasonPrefix (FO ruling D1 rule
+// (d)): the bulk route refuses an explicit judgement contradicting the shared
+// reason's prefix for the WHOLE batch, naming the prefix.
+func TestBulkWaiveConcerns_RefusesContradictingReasonPrefix(t *testing.T) {
+	s, au, cr := waiveServer(t)
+	runID := uuid.New()
+	a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+	b := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 2, "b")
+
+	w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "preference: naming only", map[string]any{"judgement": "defect"}, a.ID, b.ID), withAuth)
+	details := assertJudgementRefused(t, w, "judgement", concern.JudgementRuleConflictsReasonPrefix)
+	if details != nil && details["reason_prefix"] != "preference:" {
+		t.Errorf("details.reason_prefix = %v, want preference:", details["reason_prefix"])
+	}
+	assertUnjudged(t, cr, concern.StateRaised, a.ID, b.ID)
+	assertNoAuditRows(t, au, CategoryConcernWaived, CategoryConcernWaiveFailed)
+}
+
+// TestBulkWaiveConcerns_RecordsJudgementBulkFlag (CF8, FO ruling D2):
+// judgement_bulk is COUNT-based. A 2-id batch records true on both rows; a
+// 1-id batch records false while its concern_waived payload still carries the
+// VERB marker bulk_waive:true, so the two facts are independent.
+func TestBulkWaiveConcerns_RecordsJudgementBulkFlag(t *testing.T) {
+	t.Run("two ids", func(t *testing.T) {
+		s, au, cr := waiveServer(t)
+		runID := uuid.New()
+		a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+		b := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 2, "b")
+		if w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "nits", map[string]any{"judgement": "preference"}, a.ID, b.ID), withAuth); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		for _, id := range []uuid.UUID{a.ID, b.ID} {
+			assertJudgedRow(t, cr, id, judgedRow{
+				State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: concern.JudgementPreference,
+				ActorKind: string(audit.ActorUser), Bulk: true,
+			})
+		}
+		for _, p := range auditPayloadsByCategory(t, au, CategoryConcernWaived) {
+			if p["bulk_waive"] != true {
+				t.Errorf("payload bulk_waive = %v, want true", p["bulk_waive"])
+			}
+		}
+	})
+	t.Run("one id", func(t *testing.T) {
+		s, au, cr := waiveServer(t)
+		runID := uuid.New()
+		a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+		if w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "nit", map[string]any{"judgement": "preference"}, a.ID), withAuth); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		assertJudgedRow(t, cr, a.ID, judgedRow{
+			State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: concern.JudgementPreference,
+			ActorKind: string(audit.ActorUser), Bulk: false,
+		})
+		payloads := auditPayloadsByCategory(t, au, CategoryConcernWaived)
+		if len(payloads) != 1 || payloads[0]["bulk_waive"] != true {
+			t.Errorf("concern_waived payloads = %v, want one carrying the verb marker bulk_waive:true", payloads)
+		}
+	})
+}
+
+// TestBulkWaiveConcerns_AuditCarriesJudgement: every concern_waived row of a
+// 2-id tradeoff batch carries judgement tradeoff and the tradeoff_cost, as do
+// the committed rows; a non-tradeoff batch's payload has NO tradeoff_cost key.
+func TestBulkWaiveConcerns_AuditCarriesJudgement(t *testing.T) {
+	t.Run("tradeoff", func(t *testing.T) {
+		s, au, cr := waiveServer(t)
+		runID := uuid.New()
+		a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+		b := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 2, "b")
+		body := bulkWaiveBody(t, "both accepted", map[string]any{"judgement": "tradeoff", "tradeoff_cost": "two known gaps ship"}, a.ID, b.ID)
+		if w := postBulkWaiveRaw(t, s, runID.String(), body, withAuth); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		payloads := auditPayloadsByCategory(t, au, CategoryConcernWaived)
+		if len(payloads) != 2 {
+			t.Fatalf("concern_waived entries = %d, want 2", len(payloads))
+		}
+		for _, p := range payloads {
+			assertJudgementPayload(t, p, concern.JudgementTradeoff, "two known gaps ship")
+		}
+		for _, id := range []uuid.UUID{a.ID, b.ID} {
+			assertJudgedRow(t, cr, id, judgedRow{
+				State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff,
+				ActorKind: string(audit.ActorUser), Bulk: true, TradeoffCost: "two known gaps ship",
+			})
+		}
+	})
+	t.Run("stale", func(t *testing.T) {
+		s, au, cr := waiveServer(t)
+		runID := uuid.New()
+		a := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 1, "a")
+		if w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "code moved", map[string]any{"judgement": "stale"}, a.ID), withAuth); w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		payloads := auditPayloadsByCategory(t, au, CategoryConcernWaived)
+		if len(payloads) != 1 {
+			t.Fatalf("concern_waived entries = %d, want 1", len(payloads))
+		}
+		assertJudgementPayload(t, payloads[0], concern.JudgementStale, "")
+		assertJudgedRow(t, cr, a.ID, judgedRow{
+			State: concern.StateWaived, Outcome: concern.OutcomeWaived, Judgement: concern.JudgementStale,
+			ActorKind: string(audit.ActorUser),
+		})
+	})
+}
+
+// TestBulkWaiveConcerns_Delegated_RecordsJudgementDelegated (E94.8 / #4841,
+// the carried Phase-2 read-back; operator acceptance criterion
+// bulk-delegated-judgement-read-back): a bulk delegated:true waive through
+// delegatedWaiveServer commits judgement_delegated=true on EVERY committed row,
+// read back from the store after the call returned. The batch is one concern
+// by construction: may_waive's only condition, solo_low, admits exactly one
+// open concern, so a wider delegated batch is unsatisfiable (see
+// TestBulkWaive_Delegated_SoloLowMet_StampsRuleOnEveryRow). The loop covers
+// every id sent, so a wider batch a future condition admits is covered too.
+func TestBulkWaiveConcerns_Delegated_RecordsJudgementDelegated(t *testing.T) {
+	s, repo, au, cr := delegatedWaiveServer(t)
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedLowConcernRow(t, cr, runID, stageID)
+	repo.seedRun(&run.Run{
+		ID:           runID,
+		Repo:         "acme/widgets",
+		State:        run.StateRunning,
+		WorkflowID:   "feature_change",
+		WorkflowSpec: []byte(delegatedActionSpecYAML),
+	})
+	ids := []uuid.UUID{row.ID}
+
+	w := postBulkWaiveRaw(t, s, runID.String(), bulkWaiveBody(t, "style nit, not blocking",
+		map[string]any{"judgement": "preference", "delegated": true}, ids...), withAuth)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 on a satisfied solo_low delegation:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeBulkWaive(t, w); resp.Waived != len(ids) || resp.Failed != 0 {
+		t.Fatalf("waived/failed = %d/%d, want %d/0: %+v", resp.Waived, resp.Failed, len(ids), resp)
+	}
+	for _, id := range ids {
+		rows, err := cr.GetByIDs(context.Background(), []uuid.UUID{id})
+		if err != nil {
+			t.Fatalf("read back concern %s: %v", id, err)
+		}
+		got := rows[0]
+		if got.State != concern.StateWaived || got.Judgement != concern.JudgementPreference || !got.JudgementDelegated || got.JudgementBulk {
+			t.Errorf("concern %s committed state %s judgement %q delegated %v bulk %v, want waived / preference / delegated / not bulk (one concern)",
+				id, got.State, got.Judgement, got.JudgementDelegated, got.JudgementBulk)
+		}
+	}
+	if n := len(auditEntriesByCategory(au, CategoryConcernWaived)); n != len(ids) {
+		t.Errorf("concern_waived entries = %d, want %d", n, len(ids))
 	}
 }

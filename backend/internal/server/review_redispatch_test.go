@@ -1317,3 +1317,90 @@ func TestReviewRedispatchMarker_SetOnlyByBootRedispatch(t *testing.T) {
 		t.Fatalf("withReviewRedispatch production call sites = %v, want exactly [%s] (the marker is server-internal: approval condition C4 of #4077)", sites, want)
 	}
 }
+
+// --- ADR-117 A1.7 reviewed head on re-dispatched and re-run rounds ---------
+
+// reviewedHeadTwoVerifyBundle is a trace bundle whose FIRST verify head is the
+// #797 dedup key and whose LAST (authoritative) verify event names the head
+// the round actually judged.
+func reviewedHeadTwoVerifyBundle(t *testing.T) []byte {
+	t.Helper()
+	return reviewedHeadSliceBundle(t, []map[string]any{
+		reviewedHeadVerify("dedup-head", "tree-first", "", "failed"),
+		reviewedHeadVerify("judged-head", "tree-judged", "change-judged", "passed"),
+	})
+}
+
+// TestReviewedHead_RedispatchTraceRound: the boot re-dispatch of an orphaned
+// trace round writes its OWN implement_review_started row recording the head
+// the orphaned round judged (the stored bundle's authoritative verify head,
+// not the dedup head) plus the redispatch_of lineage.
+func TestReviewedHead_RedispatchTraceRound(t *testing.T) {
+	f := newRedispatchFixture(t, redispatchFixtureOpts{traceStore: newRedispatchTraceStore()})
+	f.runRow.Repo = "acme/widgets"
+	f.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
+	f.seedRedactedBundle(t, reviewedHeadTwoVerifyBundle(t))
+	seq := f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", advisoryImplementStarted(reviewRoundOriginTrace, "", "dedup-head"))
+
+	bootSweep(t, f.s)
+
+	got := assertRedispatchedRound(t, f.au, f.runRow.ID, orphanedReviewStages[1], seq, 1)
+	rh := got.ReviewedHead
+	if rh == nil {
+		t.Fatal("re-dispatched round carries no reviewed_head")
+	}
+	if rh.Status != planreview.ReviewedHeadRecorded || rh.Kind != planreview.ReviewedHeadKindWipTree || rh.SHA != "judged-head" || rh.TreeSHA != "tree-judged" {
+		t.Errorf("reviewed_head = %+v, want recorded wip_tree judged-head / tree-judged", rh)
+	}
+	if got.HeadSHA != "dedup-head" {
+		t.Errorf("head_sha = %q, want the dedup key dedup-head unchanged", got.HeadSHA)
+	}
+}
+
+// TestReviewedHead_RerunRounds: an operator re-run (the reviewRerun marker over
+// redispatchImplementRound, exactly as handleRerunReview calls it) writes its
+// own round carrying rerun_of and the reviewed head of the re-run source: the
+// stored bundle's authoritative verify head for a trace round, the recorded
+// pinned head for a compare-sourced round.
+func TestReviewedHead_RerunRounds(t *testing.T) {
+	cases := []struct {
+		name, origin, base, head string
+		wantKind, wantSHA        string
+	}{
+		{name: "trace", origin: reviewRoundOriginTrace, head: "dedup-head", wantKind: planreview.ReviewedHeadKindWipTree, wantSHA: "judged-head"},
+		{name: "fixup_push", origin: reviewRoundOriginFixupPush, base: "base-pass", head: "head-pushed", wantKind: planreview.ReviewedHeadKindPushedCommit, wantSHA: "head-pushed"},
+		{name: "consolidated", origin: reviewRoundOriginConsolidated, base: "consolidated-base", head: "headsha1", wantKind: planreview.ReviewedHeadKindCompareHead, wantSHA: "headsha1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			gh, _ := recordingCompareClient(t, cannedCompareOneFile)
+			f := newRedispatchFixture(t, redispatchFixtureOpts{github: gh, traceStore: newRedispatchTraceStore()})
+			f.runRow.Repo = "acme/widgets"
+			f.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
+			if tc.origin == reviewRoundOriginTrace {
+				f.seedRedactedBundle(t, reviewedHeadTwoVerifyBundle(t))
+			}
+			payload := advisoryImplementStarted(tc.origin, tc.base, tc.head)
+			seq := f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", payload)
+
+			ctx := withReviewRerun(context.Background(), reviewRerun{Of: seq, StageID: f.implStage.ID, HeadSHA: tc.head})
+			if slug := f.s.redispatchImplementRound(ctx, f.runRow.ID, seq, payload); slug != "" {
+				t.Fatalf("re-run dispatch slug = %q, want dispatched", slug)
+			}
+			f.s.waitBackgroundReviews()
+
+			started, _ := startedAfter(t, f.au, f.runRow.ID, "implement_review_started", seq)
+			if len(started) != 1 {
+				t.Fatalf("re-run rounds = %d, want 1", len(started))
+			}
+			got := started[0]
+			if got.RerunOf != seq {
+				t.Errorf("rerun_of = %d, want %d", got.RerunOf, seq)
+			}
+			rh := got.ReviewedHead
+			if rh == nil || rh.Status != planreview.ReviewedHeadRecorded || rh.Kind != tc.wantKind || rh.SHA != tc.wantSHA || rh.BaseSHA != tc.base {
+				t.Errorf("reviewed_head = %+v, want recorded %s %s base %q", rh, tc.wantKind, tc.wantSHA, tc.base)
+			}
+		})
+	}
+}

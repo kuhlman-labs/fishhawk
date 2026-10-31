@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -51,6 +52,15 @@ type waiveConcernRequest struct {
 	// `delegated: "<rule>"` on the concern_waived payload when met.
 	// Absent → behavior byte-identical to today.
 	Delegated bool `json:"delegated"`
+	// Judgement is the human judgement the waive records (ADR-117 D1 phase 2,
+	// E94.7 / #4840): one of concern.HumanJudgements. REQUIRED unless Reason
+	// opens with a recognised prefix (false_positive:, accepted_tradeoff:,
+	// preference:), which then supplies it; an explicit judgement that
+	// contradicts the prefix is refused (concernJudgementFromRequest).
+	Judgement string `json:"judgement"`
+	// TradeoffCost is the stated cost of a tradeoff judgement: required with
+	// judgement tradeoff and refused with any other.
+	TradeoffCost string `json:"tradeoff_cost"`
 }
 
 // waiveConcernResponse is the 200 body: the updated concern row.
@@ -130,6 +140,10 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 			map[string]any{"field": "reason"})
 		return
 	}
+	judgement, tradeoffCost, ok := s.concernJudgementFromRequest(w, r, reqBody.Judgement, reqBody.TradeoffCost, reqBody.Reason)
+	if !ok {
+		return
+	}
 
 	rows, err := s.cfg.ConcernRepo.GetByIDs(r.Context(), []uuid.UUID{concernID})
 	if err != nil {
@@ -198,7 +212,7 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 	// state (the concern still open), recorded only after the waive landed.
 	shadow := s.captureDelegationShadow(r.Context(), row.RunID, delegation.ActionWaive, subject, reqBody.Delegated)
 	updated, err := s.applyConcernWaive(r.Context(), row, reqBody.Reason, subject,
-		actorKindForSubject(subject), delegatedRule, false)
+		actorKindForSubject(subject), delegatedRule, false, false, judgement, tradeoffCost)
 	if err != nil {
 		var appendErr concernWaiveAuditAppendError
 		if errors.As(err, &appendErr) {
@@ -237,6 +251,44 @@ func (s *Server) handleWaiveConcern(w http.ResponseWriter, r *http.Request) {
 		State:       string(updated.State),
 		StateReason: updated.StateReason,
 	})
+}
+
+// concernJudgementFromRequest validates a human concern verb's judgement input
+// (ADR-117 D1 phase 2, E94.7 / #4840) through concern.ResolveHumanJudgement,
+// the ONE validator the store's HumanDisposition.Validate shares its rules
+// with. prefixSource is the waive reason for waive and bulk waive (the FO D1
+// reason-prefix rules) and "" for resolve and defer. On a refusal it writes
+// 400 validation_failed with the rule's message and details {field, rule,
+// allowed}, plus reason_prefix on judgement_conflicts_reason_prefix, and
+// returns ok=false. Every verb calls it after its own body checks and BEFORE
+// any concern read, delegation check, audit append or work-item filing, so a
+// refused judgement leaves no intent row and no orphan issue.
+//
+// FIRST it refuses a tradeoff_cost over maxOperatorConcernBytes (E94.8 /
+// #4841): 400 validation_failed, rule tradeoff_cost_too_long, details {field,
+// rule, bytes, max}. The cost is persisted verbatim on the row and in the
+// verb's audit payload, so it is refused rather than truncated; exactly
+// maxOperatorConcernBytes is accepted. This one helper serves every human
+// concern verb, so the cap cannot drift between them.
+func (s *Server) concernJudgementFromRequest(w http.ResponseWriter, r *http.Request, judgement, tradeoffCost, prefixSource string) (concern.Judgement, string, bool) {
+	if len(tradeoffCost) > maxOperatorConcernBytes {
+		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
+			fmt.Sprintf("tradeoff_cost is %d bytes; the maximum is %d (it is not truncated)", len(tradeoffCost), maxOperatorConcernBytes),
+			map[string]any{"field": "tradeoff_cost", "rule": concern.JudgementRuleTradeoffCostTooLong, "bytes": len(tradeoffCost), "max": maxOperatorConcernBytes})
+		return "", "", false
+	}
+	j, err := concern.ResolveHumanJudgement(judgement, tradeoffCost, prefixSource)
+	if err == nil {
+		return j, tradeoffCost, true
+	}
+	je := concern.JudgementError{Field: "judgement", Message: err.Error()}
+	errors.As(err, &je)
+	details := map[string]any{"field": je.Field, "rule": je.Rule, "allowed": concern.HumanJudgements()}
+	if je.Prefix != "" {
+		details["reason_prefix"] = je.Prefix
+	}
+	s.writeError(w, r, http.StatusBadRequest, "validation_failed", je.Message, details)
+	return "", "", false
 }
 
 // writeConcernWaiveFailedAudit appends the corrective concern_waive_failed
@@ -293,17 +345,26 @@ func (e concernWaiveAuditAppendError) Unwrap() error { return e.err }
 //  1. append the concern_waived intent entry FIRST. On failure return
 //     concernWaiveAuditAppendError with NO mutation and NO corrective entry —
 //     there is no intent on the chain to correct;
-//  2. ApplyResolution to the terminal waived state. On failure append the
+//  2. ApplyHumanDisposition to the terminal waived state. On failure append the
 //     corrective concern_waive_failed entry (warn-only) naming the actual state,
 //     then return the transition error unwrapped so the caller can map
 //     InvalidTransitionError -> 422 and ErrNotFound -> 404.
 //
 // bulk stamps an ADDITIVE bulk_waive:true marker on the payload so an operator
 // reading the chain can tell a batched waive from a single one. The single path
-// passes bulk=false and its payload stays byte-identical to pre-#3318. A
-// non-empty row.Provenance is likewise stamped as an additive provenance key
-// (E80.3 / #3760); a reviewer concern's provenance is empty and adds nothing.
-func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, reason, subject string, actorKind audit.ActorKind, delegatedRule string, bulk bool) (*concern.Concern, error) {
+// passes bulk=false. A non-empty row.Provenance is likewise stamped as an
+// additive provenance key (E80.3 / #3760); a reviewer concern's provenance is
+// empty and adds nothing.
+//
+// judgement and tradeoffCost are the validated human judgement (E94.7 /
+// #4840): the payload carries `judgement`, plus `tradeoff_cost` ONLY when it
+// is non-empty, and the transition records them through ApplyHumanDisposition
+// with OutcomeWaived, the actor kind and the delegated flag. judgementBulk is
+// DISTINCT from bulk (FO ruling D2): bulk is the VERB fact (the bulk_waive
+// marker), judgementBulk the COUNT fact (one judgement covered more than one
+// concern), so a bulk verb called with one id stamps bulk_waive:true and
+// records judgement_bulk false.
+func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, reason, subject string, actorKind audit.ActorKind, delegatedRule string, bulk, judgementBulk bool, judgement concern.Judgement, tradeoffCost string) (*concern.Concern, error) {
 	waivedFields := map[string]any{
 		"concern_id":  row.ID.String(),
 		"prior_state": string(row.State),
@@ -311,6 +372,10 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 		"stage_kind":  row.StageKind,
 		"severity":    row.Severity,
 		"category":    row.Category,
+		"judgement":   string(judgement),
+	}
+	if tradeoffCost != "" {
+		waivedFields["tradeoff_cost"] = tradeoffCost
 	}
 	if delegatedRule != "" {
 		waivedFields["delegated"] = delegatedRule
@@ -338,7 +403,14 @@ func (s *Server) applyConcernWaive(ctx context.Context, row *concern.Concern, re
 		return nil, concernWaiveAuditAppendError{err: aerr}
 	}
 
-	updated, err := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateWaived, reason)
+	updated, err := s.cfg.ConcernRepo.ApplyHumanDisposition(ctx, row.ID, concern.StateWaived, reason, concern.HumanDisposition{
+		Outcome:       concern.OutcomeWaived,
+		Judgement:     judgement,
+		ActorKind:     string(actorKind),
+		Delegated:     delegatedRule != "",
+		JudgementBulk: judgementBulk,
+		TradeoffCost:  tradeoffCost,
+	})
 	if err != nil {
 		// The intent entry is already durable; keep the chain truthful with a
 		// corrective entry naming the actual outcome (warn-only).

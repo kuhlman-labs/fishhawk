@@ -51,6 +51,8 @@ Invariants:
 
 Why the check does not clear itself: the acceptance stage genuinely re-opened, so the pending is CORRECT. This change makes the block legible and self-clearing — once acceptance is re-dispatched and settles, the run recomputes to pass through the product's own path. Auto-re-dispatching a re-opened acceptance stage would decide on the operator's behalf that a re-opened validation need not re-run, which changes #1682's semantics; that is tracked separately, not decided here.
 
+
+**Headline (#4801).** Each `stage_not_terminal` item also carries `MissingItem.Headline` (`json:"-"`, never on the REST wire, so `GET /v0/stages/{id}/checks` and the merge refusal's `audit_complete_missing` stay byte-identical): `<type> stage <id8> <state>`, plus for an acceptance stage ` — re-opened by a fix-up push, not re-dispatched` (dispatchable + stage-scoped `acceptance_reopened`), ` (not dispatched)` (dispatchable) or ` (in flight)`. `stageNotTerminalItem` reads the entry ONCE for both Detail and Headline and fails open. `HeldHeadline(missing)` picks the first ACCEPTANCE item's headline (else the first item's, else its Kind) with ` (+N more)`; the publisher's pending title is `Held: <HeldHeadline>`.
 ## Rule 2b (#3092): decomposition trace resolution is NEVER an exemption
 
 A decomposed run's parent implement stage is the fan-out stage — it parks `awaiting_children`, spawns no agent, and by construction can never carry a trace — so rule 2 was unsatisfiable for every decomposed run and the required check could never go green.

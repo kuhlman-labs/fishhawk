@@ -64,6 +64,11 @@ type driveFakeBackend struct {
 	forgeBaseURL            string
 	forgeBaseURLPreLoopOnly bool
 	loopStarted             bool
+	// defaultBranch / defaultBranchUnresolvedReason model the #4660 single-run
+	// base-branch fields (#4758); newDriveFake defaults defaultBranch to
+	// "main" so every legacy fixture keeps resolving an omitted base_branch.
+	defaultBranch                 string
+	defaultBranchUnresolvedReason string
 	// requestLog records every request as "METHOD path" in arrival order, and
 	// getRunCalls counts GET /v0/runs/{id} — the forge-target pins read them.
 	requestLog  []string
@@ -135,7 +140,7 @@ func newDriveFake(runState string, stages []Stage) *driveFakeBackend {
 	// runner_kind defaults to "local" — the drive verb's local-only guard
 	// requires it, so every happy-path fixture is a local run unless a test
 	// overrides runnerKind to exercise the rejection path.
-	return &driveFakeBackend{runID: uuid.New(), runState: runState, runnerKind: "local", stages: stages}
+	return &driveFakeBackend{runID: uuid.New(), runState: runState, runnerKind: "local", stages: stages, defaultBranch: "main"}
 }
 
 // driveFakeGateRule mirrors the backend's action->delegated-condition mapping
@@ -407,7 +412,8 @@ func (f *driveFakeBackend) handler() http.HandlerFunc {
 				DerivedStatus string `json:"derived_status,omitempty"`
 			}{
 				Run: Run{ID: f.runID.String(), Repo: "x/y", WorkflowID: "feature_change", State: f.runState, RunnerKind: f.runnerKind, WorkingDir: f.workingDir, PullRequestURL: &pr,
-					Forge: f.forge, ForgeBaseURL: baseURL},
+					Forge: f.forge, ForgeBaseURL: baseURL,
+					DefaultBranch: f.defaultBranch, DefaultBranchUnresolvedReason: f.defaultBranchUnresolvedReason},
 				DerivedStatus: f.derivedStatus,
 			})
 		}
@@ -4670,6 +4676,9 @@ func gitlabParkedImplementFake(baseURL string) *driveFakeBackend {
 	})
 	f.forge = "gitlab"
 	f.forgeBaseURL = baseURL
+	// A gitlab run reports forge_unsupported, as a post-#4660 fishhawkd does,
+	// so every caller below that reaches the spawn passes base_branch (#4758).
+	f.defaultBranch, f.defaultBranchUnresolvedReason = "", "forge_unsupported"
 	f.setOnSpawn(func(f *driveFakeBackend, typ string) {
 		if typ == "implement" {
 			f.setState("implement", "running")
@@ -4702,7 +4711,7 @@ func TestDriveRun_GitLabRun_ImplementDispatchCarriesForgeFlags(t *testing.T) {
 	defer srv.Close()
 	r.driveMaxWallclock = 5 * time.Second
 
-	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String()})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
@@ -4744,7 +4753,7 @@ func TestDriveRun_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
 	defer srv.Close()
 	r.driveMaxWallclock = 5 * time.Second
 
-	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
@@ -4831,7 +4840,7 @@ func TestDriveRun_RunReadFails_StopsWithoutSpawn(t *testing.T) {
 		},
 	}
 
-	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", WorkingDir: t.TempDir()})
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y", WorkingDir: t.TempDir(), BaseBranch: "main"})
 	if err != nil {
 		t.Fatalf("driveRun: %v", err)
 	}
@@ -5052,6 +5061,52 @@ func TestDriveRun_HandoffPrecedentDegrades(t *testing.T) {
 	}
 }
 
+// TestDriveRun_ImplementStageFailedStops pins the #4426 stop (T-DR-1): a
+// running local run the server PARKED on a category-C implement failure
+// (implement failed, acceptance and review pending) stops with
+// implement_stage_failed and the implement_failed retry decision, marking no
+// host dispatch, spawning nothing and recording no act. Mechanism: without the
+// branch the pending acceptance stage is the earliest non-terminal stage but
+// its implement-succeeded precondition fails, so nothing is dispatchable and
+// the loop falls through to the observe-only gate call and stops stalled.
+func TestDriveRun_ImplementStageFailedStops(t *testing.T) {
+	impl := stg(driveImplID, "implement", "failed", 1)
+	cat := "C"
+	impl.FailureCategory = &cat
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "succeeded", 0),
+		impl,
+		stg(uuid.NewSHA1(uuid.Nil, []byte("acceptance")).String(), "acceptance", "pending", 2),
+		stg(uuid.NewSHA1(uuid.Nil, []byte("review")).String(), "review", "pending", 3),
+	})
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 300 * time.Millisecond
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedImplementStageFailed {
+		t.Fatalf("stopped_reason = %q, want %q", out.StoppedReason, stoppedImplementStageFailed)
+	}
+	if out.NextActions == nil || out.NextActions.State != "implement_failed" || len(out.NextActions.Actions) == 0 ||
+		out.NextActions.Actions[0].Action != "fishhawk_retry_stage" || out.NextActions.Actions[0].Params["stage_id"] != driveImplID {
+		t.Fatalf("next_actions = %+v, want implement_failed leading with fishhawk_retry_stage{stage_id: %s}", out.NextActions, driveImplID)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on a parked run, want nothing", got)
+	}
+	f.mu.Lock()
+	nActs, nMarks := len(f.recordedActs), f.hostDispatchCalledN
+	f.mu.Unlock()
+	if nActs != 0 || nMarks != 0 {
+		t.Fatalf("recorded %d acts and %d host-dispatch marks on a parked run, want 0 and 0", nActs, nMarks)
+	}
+}
+
 // TestDriveRun_AcceptanceStageFailedStops pins the #4356 stop: a running run
 // the server PARKED on a category-C acceptance failure (acceptance failed,
 // review still pending) stops with acceptance_stage_failed and a retry
@@ -5095,5 +5150,130 @@ func TestDriveRun_AcceptanceStageFailedStops(t *testing.T) {
 	f.mu.Unlock()
 	if nActs != 0 {
 		t.Fatalf("recorded %d acts on a parked run, want 0", nActs)
+	}
+}
+
+// --- base branch (#4758) -----------------------------------------------------
+
+// TestDriveRun_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch: base_branch
+// omitted on a github run whose forge default_branch is "trunk" → the implement
+// dispatch argv carries --base-branch trunk and --check-base-ref trunk.
+func TestDriveRun_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch(t *testing.T) {
+	f := gitlabParkedImplementFake("")
+	// Re-point the shared parked-implement fixture at a github run whose
+	// default branch resolves to trunk.
+	f.forge, f.forgeBaseURL = "", ""
+	f.defaultBranch, f.defaultBranchUnresolvedReason = "trunk", ""
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedMerged {
+		t.Fatalf("stopped_reason = %q, want merged; warnings=%v", out.StoppedReason, out.Warnings)
+	}
+	argv := rec.argvFor("implement")
+	if argv == nil {
+		t.Fatalf("no implement spawn recorded; spawned %v", rec.list())
+	}
+	if !argvHasPair(argv, "--base-branch", "trunk") || !argvHasPair(argv, "--check-base-ref", "trunk") {
+		t.Fatalf("implement argv should carry --base-branch trunk and --check-base-ref trunk from the run's default_branch: %v", argv)
+	}
+}
+
+// TestDriveRun_UnresolvedDefaultBranch_StopsWithoutSpawn: base_branch omitted
+// on a run whose default branch is unresolved → stopped_reason
+// base_branch_unresolved pre-loop, with a DISPATCHABLE pending plan stage left
+// unspawned: zero spawns, zero host-dispatch markers, zero record-acts, and a
+// warning naming the reason and the remedy.
+func TestDriveRun_UnresolvedDefaultBranch_StopsWithoutSpawn(t *testing.T) {
+	f := newDriveFake("running", []Stage{
+		stg(drivePlanID, "plan", "pending", 0), // dispatchable — a deleted control would spawn this
+		stg(driveImplID, "implement", "blocked", 1),
+	})
+	f.defaultBranch, f.defaultBranchUnresolvedReason = "", "repository_not_visible"
+	f.setOnGate(func(f *driveFakeBackend) AutoDriveOutcome { return AutoDriveOutcome{Note: "observe-only"} })
+	rec := &spawnRecorder{}
+	r, srv := newDriveResolver(t, f, rec)
+	defer srv.Close()
+	r.driveMaxWallclock = 5 * time.Second
+
+	_, out, err := r.driveRun(context.Background(), nil, DriveRunInput{RunID: f.runID.String(), GitHubRepo: "x/y"})
+	if err != nil {
+		t.Fatalf("driveRun: %v", err)
+	}
+	if out.StoppedReason != stoppedBaseBranchUnresolved {
+		t.Fatalf("stopped_reason = %q, want %q; warnings=%v", out.StoppedReason, stoppedBaseBranchUnresolved, out.Warnings)
+	}
+	if got := rec.list(); len(got) != 0 {
+		t.Fatalf("spawned %v on an unresolved default branch, want nothing", got)
+	}
+	f.mu.Lock()
+	marks, acts := f.hostDispatchCalledN, len(f.recordedActs)
+	f.mu.Unlock()
+	if marks != 0 || acts != 0 {
+		t.Fatalf("host-dispatch markers = %d, record-acts = %d; the stop must commit nothing", marks, acts)
+	}
+	joined := strings.Join(out.Warnings, "\n")
+	for _, want := range []string{"repository_not_visible", "Pass base_branch explicitly"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("warnings should name %q: %v", want, out.Warnings)
+		}
+	}
+}
+
+// TestDriveFixupConcernActions_JudgementParam pins, beside its builder, the
+// `judgement` placeholder the out-of-band concern roster carries (ADR-117 D1,
+// #4840): the backend refuses a waive or a defer without a human judgement, so
+// both entries name every allowed value (and that tradeoff needs
+// tradeoff_cost), never the refused unlabelled. The cancel entry takes no
+// judgement and must not carry one. The base params still flow through.
+func TestDriveFixupConcernActions_JudgementParam(t *testing.T) {
+	base := map[string]string{"run_id": "r-1"}
+	actions := driveFixupConcernActions(base)
+	byName := map[string]SuggestedAction{}
+	for _, a := range actions {
+		byName[a.Action] = a
+	}
+	for _, name := range []string{"fishhawk_waive_concern", "fishhawk_defer_concern"} {
+		a, ok := byName[name]
+		if !ok {
+			t.Fatalf("roster has no %s entry: %+v", name, actions)
+		}
+		j, ok := a.Params["judgement"]
+		if !ok {
+			t.Errorf("%s params = %v, want a judgement placeholder", name, a.Params)
+			continue
+		}
+		for _, v := range concernJudgementValues {
+			if !strings.Contains(j, v) {
+				t.Errorf("%s judgement placeholder %q does not name %q", name, j, v)
+			}
+		}
+		for _, want := range []string{"REQUIRED", "tradeoff_cost"} {
+			if !strings.Contains(j, want) {
+				t.Errorf("%s judgement placeholder %q does not say %q", name, j, want)
+			}
+		}
+		if strings.Contains(j, "unlabelled") {
+			t.Errorf("%s judgement placeholder %q offers unlabelled, which the backend refuses", name, j)
+		}
+		if a.Params["run_id"] != "r-1" {
+			t.Errorf("%s params = %v, want the base run_id folded in", name, a.Params)
+		}
+	}
+	cancel, ok := byName["fishhawk_cancel_run"]
+	if !ok {
+		t.Fatalf("roster has no fishhawk_cancel_run entry: %+v", actions)
+	}
+	if _, present := cancel.Params["judgement"]; present {
+		t.Errorf("fishhawk_cancel_run params = %v, want no judgement", cancel.Params)
+	}
+	if _, present := base["judgement"]; present {
+		t.Errorf("the shared base params map was mutated: %v", base)
 	}
 }

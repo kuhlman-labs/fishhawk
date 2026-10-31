@@ -4167,7 +4167,12 @@ func TestResolveRunForgeTarget(t *testing.T) {
 		if err != nil {
 			t.Fatalf("resolveRunForgeTarget: %v", err)
 		}
-		want := runForgeTarget{Forge: "gitlab", GitLabBaseURL: "https://gitlab.example.com", Repo: "acme/widgets"}
+		// The shared fake stamps forge_unsupported on a gitlab row, as a
+		// post-#4660 fishhawkd does; the target copies it (#4758).
+		want := runForgeTarget{
+			Forge: "gitlab", GitLabBaseURL: "https://gitlab.example.com", Repo: "acme/widgets",
+			DefaultBranchUnresolvedReason: "forge_unsupported",
+		}
 		if got != want {
 			t.Fatalf("target = %+v, want %+v", got, want)
 		}
@@ -4223,6 +4228,59 @@ func TestResolveRunForgeTarget(t *testing.T) {
 			t.Fatalf("target = %+v, want github/x/y", got)
 		}
 	})
+	// #4758: the SAME read carries the run's base branch, copied onto the
+	// target on both forge arms.
+	t.Run("github_copies_default_branch", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", Forge: "github", DefaultBranch: "trunk"}
+		fb.mu.Unlock()
+		got, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("resolveRunForgeTarget: %v", err)
+		}
+		want := runForgeTarget{Forge: "github", Repo: "x/y", DefaultBranch: "trunk"}
+		if got != want {
+			t.Fatalf("target = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("github_copies_unresolved_reason", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{ID: runID.String(), Repo: "x/y", State: "running", DefaultBranchUnresolvedReason: "repository_not_visible"}
+		fb.mu.Unlock()
+		got, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("resolveRunForgeTarget: %v", err)
+		}
+		want := runForgeTarget{Forge: "github", Repo: "x/y", DefaultBranchUnresolvedReason: "repository_not_visible"}
+		if got != want {
+			t.Fatalf("target = %+v, want %+v", got, want)
+		}
+	})
+	t.Run("gitlab_copies_default_branch", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+		runID := uuid.New()
+		fb.mu.Lock()
+		fb.getRunByID[runID] = Run{
+			ID: runID.String(), Repo: "acme/widgets", State: "running",
+			Forge: "gitlab", ForgeBaseURL: "https://gitlab.example.com", DefaultBranch: "trunk",
+		}
+		fb.mu.Unlock()
+		got, err := r.resolveRunForgeTarget(context.Background(), runID)
+		if err != nil {
+			t.Fatalf("resolveRunForgeTarget: %v", err)
+		}
+		want := runForgeTarget{Forge: "gitlab", GitLabBaseURL: "https://gitlab.example.com", Repo: "acme/widgets", DefaultBranch: "trunk"}
+		if got != want {
+			t.Fatalf("target = %+v, want %+v", got, want)
+		}
+	})
 	t.Run("unknown_forge_refuses", func(t *testing.T) {
 		fb, srv := newFakeBackend(t)
 		r := newResolver(srv, nil)
@@ -4254,8 +4312,9 @@ func TestRunStage_GitLabRun_DefaultsRepoFromRunRow_SkipsOriginDetect(t *testing.
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
 	seedGitLabRun(fb, runID, "acme/platform/widgets", "https://gitlab.example.com")
 
+	// A gitlab run reports forge_unsupported, so base_branch is passed (#4758).
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
-		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", BaseBranch: "main",
 	})
 	if err != nil {
 		t.Fatalf("runStage: %v", err)
@@ -4288,6 +4347,7 @@ func TestRunStage_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
 
 	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "acme/widgets",
+		BaseBranch: "main",
 	})
 	if err != nil {
 		t.Fatalf("runStage: %v", err)
@@ -4497,5 +4557,138 @@ func TestRunStage_NextActions_AcceptanceVerdictPending(t *testing.T) {
 	}
 	if nextActionOffered(out.NextActions, "fishhawk_retry_stage") || nextActionOffered(out.NextActions, "fishhawk_merge_run") {
 		t.Errorf("verdict_pending must offer neither retry nor merge; got %+v", out.NextActions.Actions)
+	}
+}
+
+// --- base branch (#4758) -----------------------------------------------------
+
+// seedRunDefaultBranch seeds a github run row whose single-run read carries
+// default_branch or default_branch_unresolved_reason (#4660).
+func seedRunDefaultBranch(fb *fakeBackend, runID uuid.UUID, branch, unresolved string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[runID] = Run{
+		ID: runID.String(), Repo: "x/y", State: "running", RunnerKind: "local",
+		DefaultBranch: branch, DefaultBranchUnresolvedReason: unresolved,
+	}
+}
+
+// TestRunStage_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch: base_branch
+// omitted on a run whose forge default_branch is "trunk" → the implement argv
+// carries --base-branch trunk AND --check-base-ref trunk (#4758). CF: make
+// run_stage's call site return in.BaseBranch and the argv carries "".
+func TestRunStage_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	argv := captureArgv(t)
+
+	runID, stageID := uuid.New(), uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedRunDefaultBranch(fb, runID, "trunk", "")
+
+	if _, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "x/y",
+	}); err != nil {
+		t.Fatalf("runStage: %v", err)
+	}
+	if !argvHasPair(*argv, "--base-branch", "trunk") || !argvHasPair(*argv, "--check-base-ref", "trunk") {
+		t.Fatalf("argv should carry --base-branch trunk and --check-base-ref trunk from the run's default_branch; got %v", *argv)
+	}
+}
+
+// TestRunStage_UnresolvedDefaultBranch_RefusesBeforeMarker: base_branch
+// omitted on a run whose default branch is unresolved → a refusal naming the
+// reason, with ZERO host-dispatch marker POSTs and no runner spawned.
+func TestRunStage_UnresolvedDefaultBranch_RefusesBeforeMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID, stageID := uuid.New(), uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedRunDefaultBranch(fb, runID, "", "repository_not_visible")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "x/y",
+	})
+	if err == nil {
+		t.Fatal("expected a base_branch_unresolved refusal")
+	}
+	for _, want := range []string{"base_branch_unresolved", "repository_not_visible", "Pass base_branch explicitly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal should name %q: %v", want, err)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite the refusal: %v", *calls)
+	}
+	fb.mu.Lock()
+	marker := fb.hostDispatchCalledByID[stageID]
+	fb.mu.Unlock()
+	if marker != 0 {
+		t.Fatalf("host-dispatch marker POSTed %d times; the refusal must land BEFORE any state-committing step", marker)
+	}
+}
+
+// TestRunStage_GitLabRun_NoBaseBranch_RefusesForgeUnsupported (approval
+// condition C3): a gitlab run reports forge_unsupported, so an omitted
+// base_branch refuses naming it — before any marker or spawn.
+func TestRunStage_GitLabRun_NoBaseBranch_RefusesForgeUnsupported(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	calls := captureAllArgv(t)
+
+	runID, stageID := uuid.New(), uuid.New()
+	seedStageOfType(fb, runID, stageID, "implement", "pending")
+	seedGitLabRun(fb, runID, "acme/widgets", "https://gitlab.example.com")
+
+	_, _, err := r.runStage(context.Background(), nil, RunStageInput{
+		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "acme/widgets",
+	})
+	if err == nil {
+		t.Fatal("expected a gitlab run with no base_branch to refuse")
+	}
+	for _, want := range []string{"base_branch_unresolved", "forge_unsupported", "Pass base_branch explicitly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal should name %q: %v", want, err)
+		}
+	}
+	if len(*calls) != 0 {
+		t.Fatalf("runner spawned despite the refusal: %v", *calls)
+	}
+	fb.mu.Lock()
+	marker := fb.hostDispatchCalledByID[stageID]
+	fb.mu.Unlock()
+	if marker != 0 {
+		t.Fatalf("host-dispatch marker POSTed %d times before the refusal", marker)
+	}
+}
+
+// TestRunStage_ExplicitBaseBranch_OverridesRunDefault: an explicit base_branch
+// wins over a resolved default AND over an unresolved one.
+func TestRunStage_ExplicitBaseBranch_OverridesRunDefault(t *testing.T) {
+	for _, tc := range []struct{ name, branch, unresolved string }{
+		{"resolved_trunk", "trunk", ""},
+		{"unresolved", "", "repository_not_visible"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			r := newResolver(srv, nil)
+			argv := captureArgv(t)
+
+			runID, stageID := uuid.New(), uuid.New()
+			seedStageOfType(fb, runID, stageID, "implement", "pending")
+			seedRunDefaultBranch(fb, runID, tc.branch, tc.unresolved)
+
+			if _, _, err := r.runStage(context.Background(), nil, RunStageInput{
+				RunID: runID.String(), Workflow: "feature_change", Stage: "implement", GitHubRepo: "x/y",
+				BaseBranch: "release/x",
+			}); err != nil {
+				t.Fatalf("runStage: %v", err)
+			}
+			if !argvHasPair(*argv, "--base-branch", "release/x") || !argvHasPair(*argv, "--check-base-ref", "release/x") {
+				t.Fatalf("an explicit base_branch must win; got %v", *argv)
+			}
+		})
 	}
 }
