@@ -1788,7 +1788,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep; do
+  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep test-agent-context; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -1803,6 +1803,17 @@ _verify_gate_harnesses() {
     printf '>>> scripts/%s\n' "$h"
     ( unset FISHHAWK_VERIFY_LOCK_PATH FISHHAWK_VERIFY_LOCK_OWNER; "$ROOT/scripts/$h" )
   done
+}
+
+# Instruction budgets, local navigation and skill mirror integrity (#4886).
+# Missing scripts are skipped for the wrapper's minimal temp-root harnesses.
+_verify_agent_context() {
+  if [ ! -x "$ROOT/scripts/check-agent-context" ]; then
+    echo "scripts/test: scripts/check-agent-context missing or not executable — skipping the agent context gate" >&2
+    return 0
+  fi
+  printf '>>> scripts/check-agent-context\n'
+  "$ROOT/scripts/check-agent-context"
 }
 
 # _verify_site_voice: run the banned-vocabulary gate over the COMMITTED site
@@ -2464,6 +2475,7 @@ cmd_verify() {
   _verify_adr_records
   _verify_gate_image_pins
   _verify_pipefail_grep
+  _verify_agent_context
   # --no-tests (E51.17 / #3966): the legs above need no Docker daemon, so they
   # are what the gate image can run. The test loop below needs testcontainers
   # Postgres, which the image path reaches only with full gate isolation.

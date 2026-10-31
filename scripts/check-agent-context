@@ -1,0 +1,158 @@
+#!/usr/bin/env python3
+"""Bound repository instruction entrypoints and validate their local navigation.
+
+Scope: root instruction files, docs/agents/*.md, .agents/skills/*/SKILL.md,
+and the corresponding .claude/skills symlinks. Inline Markdown file links are
+checked, not backtick paths, reference-style links, remote URLs or fragments.
+No model calls, credentials, user-home files, network or third-party packages.
+"""
+
+import argparse
+import re
+from pathlib import Path
+from urllib.parse import unquote, urlsplit
+
+ROOT_LIMIT = 8192
+WRAPPER_LIMIT = 1024
+SKILL_LIMIT = 12288
+GUIDE_LIMIT = 16384
+DESCRIPTION_LIMIT = 256
+CATALOG_LIMIT = 2048
+LINK = re.compile(r"\[[^\]\n]*\]\(([^\s)]+)\)")
+
+
+def prose(text):
+    """Ignore fenced examples, inline code and comments when checking links/imports."""
+    text = re.sub(r"<!--.*?-->", lambda m: "\n" * m[0].count("\n"), text, flags=re.S)
+    result = []
+    fence = None
+    for line in text.splitlines():
+        match = re.match(r"^\s*(`{3,}|~{3,})", line)
+        if match:
+            marker = match[1]
+            if fence is None:
+                fence = marker
+            elif marker[0] == fence[0] and len(marker) >= len(fence):
+                fence = None
+            result.append("")
+        elif fence is None:
+            result.append(re.sub(r"(`+).*?\1", "", line))
+        else:
+            result.append("")
+    return "\n".join(result)
+
+
+def check(root):
+    errors = []
+    sizes = {}
+    texts = {}
+    root = root.resolve()
+
+    def error(path, message):
+        errors.append(f"{path}: {message}")
+
+    def read(path, limit):
+        rel = path.relative_to(root)
+        try:
+            if not path.resolve().is_relative_to(root):
+                raise ValueError("target leaves repository")
+            raw = path.read_bytes()
+            text = raw.decode("utf-8")
+        except (OSError, ValueError, RuntimeError) as exc:
+            error(rel, f"cannot read instruction/reference: {exc}")
+            return None
+        sizes[str(rel)] = len(raw)
+        texts[path] = text
+        if not text.strip():
+            error(rel, "empty instruction/reference")
+        if len(raw) > limit:
+            error(rel, f"{len(raw)} UTF-8 bytes exceeds {limit}; move detail to a task reference")
+        return text
+
+    read(root / "AGENTS.md", ROOT_LIMIT)
+    wrapper = read(root / "CLAUDE.md", WRAPPER_LIMIT)
+    if wrapper is not None:
+        imports = re.findall(r"(?<!\w)@([^\s]+)", prose(wrapper))
+        if imports != ["AGENTS.md"]:
+            error("CLAUDE.md", "must import only @AGENTS.md exactly once; link task guides instead")
+    for name in ("AGENTS.override.md", "CLAUDE.local.md"):
+        path = root / name
+        if path.exists() or path.is_symlink():
+            read(path, ROOT_LIMIT)
+
+    guides = sorted((root / "docs/agents").glob("*.md"))
+    if not guides:
+        error("docs/agents", "missing task guides")
+    for path in guides:
+        read(path, GUIDE_LIMIT)
+
+    skill_root = root / ".agents/skills"
+    mirror_root = root / ".claude/skills"
+    skills = sorted(skill_root.glob("*/SKILL.md"))
+    if not skills:
+        error(".agents/skills", "no skills found")
+    names = set()
+    description_bytes = 0
+    for path in skills:
+        name = path.parent.name
+        names.add(name)
+        text = read(path, SKILL_LIMIT)
+        if text is not None:
+            parts = text.split("---", 2)
+            if len(parts) != 3 or parts[0].strip():
+                error(path.relative_to(root), "missing YAML frontmatter")
+            else:
+                fields = dict(re.findall(r"^(name|description):\s*([^\n]+)$", parts[1], re.M))
+                if fields.get("name") != name:
+                    error(path.relative_to(root), "frontmatter name must equal the skill directory")
+                desc = fields.get("description", "").strip()
+                if not desc or desc in ("|", ">", "|-", ">-"):
+                    error(path.relative_to(root), "description must be a nonempty single-line scalar")
+                count = len(desc.encode("utf-8"))
+                description_bytes += count
+                if count > DESCRIPTION_LIMIT:
+                    error(path.relative_to(root), f"description is {count} bytes; limit {DESCRIPTION_LIMIT}")
+        mirror = mirror_root / name
+        expected = Path("../../.agents/skills") / name
+        if not mirror.is_symlink() or mirror.readlink() != expected or not mirror.is_dir():
+            error(mirror.relative_to(root), f"expected a live per-skill symlink to {expected}")
+    if mirror_root.is_dir():
+        for path in sorted(mirror_root.iterdir()):
+            if path.name not in names:
+                error(path.relative_to(root), "mirror has no canonical SKILL.md")
+    if description_bytes > CATALOG_LIMIT:
+        error(".agents/skills", f"descriptions total {description_bytes} bytes; limit {CATALOG_LIMIT}")
+
+    for path, text in texts.items():
+        for number, line in enumerate(prose(text).splitlines(), 1):
+            for match in LINK.finditer(line):
+                target = urlsplit(match[1])
+                if target.scheme or target.netloc or not target.path:
+                    continue
+                dest = path.parent / unquote(target.path)
+                try:
+                    valid = dest.resolve().is_relative_to(root) and dest.exists()
+                except (OSError, RuntimeError):
+                    valid = False
+                if not valid:
+                    error(f"{path.relative_to(root)}:{number}", f"missing/outside local link {match[1]}")
+    return errors, sizes, description_bytes
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
+    args = parser.parse_args()
+    errors, sizes, descriptions = check(args.root)
+    for path, size in sorted(sizes.items()):
+        print(f"{path}: {size} bytes")
+    print(f"skill descriptions: {descriptions} bytes")
+    for error in errors:
+        print(f"FAIL: {error}")
+    if not errors:
+        print("agent context: PASS (byte budgets, inline local file links, skill mirrors)")
+    return bool(errors)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

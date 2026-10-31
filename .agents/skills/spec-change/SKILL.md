@@ -1,6 +1,6 @@
 ---
 name: spec-change
-description: Change a Fishhawk canonical schema or API contract end to end — `docs/spec/*.schema.json` (workflow, plan, operator overlay), the embedded mirrors, the generated site reference, version advertising, and `docs/api/v0.openapi.yaml`. Use when adding/changing a field in the workflow spec or plan schema, standing up a new workflow major, or changing the REST API surface.
+description: Change a Fishhawk workflow/plan schema or REST API contract, including embedded mirrors, generated references and version advertising.
 ---
 
 # Change a schema or API contract
@@ -28,7 +28,7 @@ State the classification to the user before editing.
      Treat `fishhawk validate` (without the flag) as the authority.
 5. **Version advertising.** For a new version string:
    - add it to the plan validator's recognized set (`backend/internal/plan/`)
-   - add it to the runner `/healthz` schema-versions list **once #466 lands**. That endpoint does not exist yet: check for it first, and don't create it as part of a schema change.
+   - inspect existing schema-advertising surfaces; backend `/healthz` advertises workflow schema hashes (see the new-major steps). Do not introduce a speculative runner endpoint as part of this change.
 
 ### A NEW workflow major (also)
 
@@ -43,7 +43,7 @@ State the classification to the user before editing.
 - **Source of truth:** `docs/api/v0.openapi.yaml`. Update the human companion `docs/api/v0.md` with it.
 - **Lint with the pinned version:** `npx -y @redocly/cli@2.31.5 lint --config docs/api/redocly.yaml docs/api/v0.openapi.yaml`
 - Re-run `scripts/gen-site-reference`; `reference/api.md` is generated from it.
-- A tightened auth check also needs the PR-body Auth change checklist (`fishhawkd token migrate` dry-run inventory). See `AGENTS.md`.
+- A tightened auth check also needs the PR-body Auth change checklist (`fishhawkd token migrate` dry-run inventory). See [change checklists](../../../docs/agents/change-checklists.md).
 
 ## 4. Gate
 

@@ -1,6 +1,6 @@
 ---
 name: sync-main
-description: Safely bring the local Fishhawk checkout and stack up to date after a PR merges — pre-pull safety checks for live runs and decompositions, `scripts/dev post-merge`, and confirming the rebuilt binaries are live. Use when the user says a PR merged, asks to "pull main", "sync", "update local", or "run post-merge".
+description: Update the local Fishhawk checkout and stack after a merge. Use for pull main, sync, update local or post-merge requests.
 disable-model-invocation: true
 ---
 

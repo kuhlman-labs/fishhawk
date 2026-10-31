@@ -276,7 +276,7 @@ the handoff. `site/package.json`'s `pnpm.onlyBuiltDependencies` narrows the
 install-time half further, to `esbuild` and `sharp`.
 
 Action refs stay on **floating major tags** — that is the deliberate carve-out
-in `AGENTS.md`'s executable-tooling pin rule, because
+in `docs/agents/verification.md`'s executable-tooling pin rule, because
 [`.github/dependabot.yml`](../.github/dependabot.yml)'s `github-actions` entry
 bumps them reviewably. The pnpm, Astro and TypeScript versions above are pinned
 exactly, because nothing bumps those for us.

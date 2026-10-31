@@ -503,6 +503,7 @@ Resolution is PER RUN FORGE (#3466): the run row's `InstallationRef` → `observ
 
 | Question | Look here |
 |---|---|
+| Agent context budgets and navigation | `scripts/check-agent-context` — root instruction, skill and task-guide budgets plus local link and mirror checks; contract: `docs/agents/README.md` (#4886). |
 | What does v0 ship? | `docs/MVP_SPEC.md` §9, §13 |
 | 5xx error-cause redaction (E67.15 / #2587) | `backend/internal/server/errors.go` — `writeError` redacts 5xx `details` to a default-deny allow-list, sets `error_ref` (= `X-Request-ID`), and logs the full cause keyed by that ref; 4xx unchanged. Long form: `backend/internal/server/README.md`. |
 | Why a decision was made | `docs/adr/` (`docs/adr/index.json` for machines) for backfilled ADRs; the corresponding closed ADR issue (`gh issue list --label adr --state closed`) for ADRs not yet backfilled |

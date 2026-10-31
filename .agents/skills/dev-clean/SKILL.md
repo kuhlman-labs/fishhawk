@@ -1,6 +1,6 @@
 ---
 name: dev-clean
-description: Reclaim disk and clear accumulated local litter in a Fishhawk checkout without stopping the stack — merged operator worktrees, aged run worktrees and /tmp sidecars, merged branches, leaked testcontainers and dangling volumes, stale MCP shims, Go/lint caches, logs. Use when asked to "clean up", "free disk space", "prune worktrees/branches", or when the machine is accumulating leftovers. To STOP services, use teardown-local instead.
+description: Reclaim Fishhawk disk space and prune local worktrees, branches, containers, caches or logs without stopping the stack.
 disable-model-invocation: true
 ---
 

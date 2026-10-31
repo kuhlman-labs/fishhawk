@@ -1,6 +1,6 @@
 ---
 name: record-adr
-description: Add a ratified Fishhawk ADR to the in-repo decision record — transcribe the tracker issue into docs/adr/NNN-slug.md with correct front matter, infer status and applies_to by the documented rules, wire supersession both ways, update the README table, and regenerate index.json. Use when an ADR is accepted/superseded, or when asked to "record", "backfill" or "add" an ADR.
+description: Record a ratified Fishhawk ADR and update its status, relationships and index. Use for accepted, amended or superseded decisions.
 ---
 
 # Record an ADR

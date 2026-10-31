@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -37,13 +38,19 @@ var adr098SharedSnapshot = []string{
 	"docs/", "frontend/", "infra/", "acceptance/", "auth/", ".github/", ".agents/", ".claude/", ".githooks/", "deploy/",
 }
 
-// The move is verbatim: the declaration's G and shared dirs are exactly the
-// ADR-098 set, in order.
-func TestThisRepoDeclaration_EqualsADR098Set(t *testing.T) {
+// Preserve the ADR-098 migration baseline and append only the registered
+// agent-context gate inputs (#4886). Shared dirs and class semantics stay intact.
+func TestThisRepoDeclaration_ExtendsADR098WithAgentContextInputs(t *testing.T) {
 	t.Parallel()
 	s := thisRepoSurface(t)
-	if !reflect.DeepEqual(s.Global, adr098GlobalSnapshot) {
-		t.Errorf("global_surface = %v\nwant the ADR-098 set %v", s.Global, adr098GlobalSnapshot)
+	wantGlobal := append([]string{}, adr098GlobalSnapshot...)
+	for _, input := range agentContextInputs {
+		if !slices.Contains(wantGlobal, input.glob) {
+			wantGlobal = append(wantGlobal, input.glob)
+		}
+	}
+	if !reflect.DeepEqual(s.Global, wantGlobal) {
+		t.Errorf("global_surface = %v\nwant ADR-098 plus context gate inputs %v", s.Global, wantGlobal)
 	}
 	if !reflect.DeepEqual(s.SharedDirs, adr098SharedSnapshot) {
 		t.Errorf("shared_artifact_dirs = %v, want %v", s.SharedDirs, adr098SharedSnapshot)
