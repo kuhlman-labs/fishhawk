@@ -449,6 +449,7 @@ type runMergeCandidateQueue struct {
 	YieldedAt             *time.Time `json:"yielded_at,omitempty" jsonschema:"when the entry yielded; omitted when not yielded"`
 	NextStep              string     `json:"next_step,omitempty" jsonschema:"the operator remedy derived from yield_reason: approve_pr, dismiss_review, retrigger_ci (merge_checks_red: re-run the failed or cancelled checks with fishhawk_retrigger_ci), retry_after (re-invoke fishhawk_merge_run to re-probe now; for merge_checks_pending / merge_review_pending the check_run trigger or the periodic re-probe clears it once the legs pass), configure_identity_provider or none. Omitted when not yielded"`
 	ApprovalWaitStartedAt *time.Time `json:"approval_wait_started_at,omitempty" jsonschema:"the episode's head-of-line approval-wait anchor (ADR-112 R3): the entry waits at the head for a qualifying forge approval for a bounded window from here, then yields. Omitted when no wait started"`
+	DispatchClaimOrphan   string     `json:"dispatch_claim_orphan,omitempty" jsonschema:"a LIVE entry's crash-left queue dispatch claim (ADR-109 A1): orphaned (released by the next merge-on-pass decision whose forge-approval fold approves; while the pull request still needs a qualifying approval the claim holds the head until it arrives) or orphaned_by_restart (dispatch_failed; holds for the operator re-arm, which DELETEs the claim; no fishhawk_merge_run re-invoke is needed). Omitted otherwise, or when the claim or clock read failed"`
 }
 
 // runMergeCandidateRerun mirrors the backend's runMergeCandidateRerunPayload
@@ -4204,6 +4205,7 @@ type mergeQueueDispatchClaim struct {
 	AgeSeconds int64      `json:"age_seconds" jsonschema:"the claim's age at read time"`
 	FailedAt   *time.Time `json:"failed_at,omitempty"`
 	Reason     string     `json:"reason,omitempty" jsonschema:"a dispatch_failed claim's recorded forge failure"`
+	Orphan     string     `json:"orphan,omitempty" jsonschema:"ADR-109 A1: orphaned (a queue claim still dispatched past the 150s crash-left window on the database clock: the next merge-on-pass decision whose forge-approval fold approves releases it and merges through the ordinary path; while the pull request still needs a qualifying approval the claim holds the head until it arrives, and a claimed entry never yields) or orphaned_by_restart (a queue claim the restart resume moved to dispatch_failed: confirm on the forge the PR did not merge, then the operator re-arm DELETEs the claim; no fishhawk_merge_run re-invoke is needed). Omitted otherwise"`
 }
 
 // mergeQueueHeadOfLine mirrors the server's mergeQueueHeadOfLine.

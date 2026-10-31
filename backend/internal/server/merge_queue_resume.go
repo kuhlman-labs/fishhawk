@@ -10,17 +10,24 @@ package server
 // unless THIS process has its merge in flight (mergeInFlightRegistry).
 //
 // ADR-109 governs the ledger: the resume adds NO ledger transition and
-// dispatches NO merge (rulings R1/R2). It makes ONE forge re-read under the
-// run's merge-intent lock and reconciles:
+// dispatches NO merge (rulings R1/R2); A1's release of an orphaned queue
+// claim happens in merge-on-pass step 8, never here. It makes ONE forge
+// re-read under the run's merge-intent lock and reconciles:
 //
 //   - merged at a QUEUE claim's head → the normal merged tail (Resume=true:
 //     merge_queue_merged written only when no row names the entry);
 //   - merged with no claim, or another path's claim at the merged head →
 //     settled merged pr_merged, the claim untouched;
 //   - merged at a head the claim does not name → hold;
-//   - merging, not merged (or unreadable) with a crash-left QUEUE claim still
-//     dispatched → the EXISTING MarkMergeDispatchFailed(orphaned_by_restart),
-//     then the entry HOLDS naming the operator re-arm (closed: dropped);
+//   - merging, PR open and unmerged, with a crash-left QUEUE claim still
+//     dispatched → redecide (orphaned_claim_open): back to passed with NO
+//     ledger write, and ordinary merge-on-pass RELEASES the orphaned claim in
+//     its step 8 after re-running steps 1-7 under the lock, then merges
+//     through the ordinary path (ADR-109 Amendment A1, #4711);
+//   - merging, PR unreadable (indeterminate) or closed, with a crash-left
+//     QUEUE claim still dispatched → the EXISTING
+//     MarkMergeDispatchFailed(orphaned_by_restart), then the entry HOLDS
+//     naming the operator re-arm (closed: dropped);
 //   - settling (the forge accepted), PR open or unreadable → hold
 //     settling_unconfirmed, no ledger write;
 //   - an inline/delegated claim, or a dispatch_failed one → hold, no ledger
@@ -91,6 +98,11 @@ const (
 	mergeQueueResumeReasonMergedAtClaim = "merged_at_claim_head"
 	// mergeQueueResumeReasonNoClaim: a merging entry with no dispatch claim.
 	mergeQueueResumeReasonNoClaim = "no_dispatch_claim"
+	// mergeQueueResumeReasonOrphanedClaimOpen (ADR-109 A1, #4711): a merging
+	// entry whose crash-left queue claim is still dispatched and whose PR
+	// reads open and unmerged is handed back to merge-on-pass, which
+	// releases the claim in step 8.
+	mergeQueueResumeReasonOrphanedClaimOpen = "orphaned_claim_open"
 	// mergeQueueResumeReasonBootInstant: the boot pump re-claimed a dead admission (the boot instant, or AdmissionStaleAfter).
 	mergeQueueResumeReasonBootInstant = "admission_reclaimed"
 )
@@ -99,7 +111,8 @@ const (
 const mergeQueueResumeNextOperatorRearm = "operator_rearm"
 
 // mergeQueueResumeRearmRemedy names the crash-left hold's operator path
-// (approval condition C8a).
+// (approval condition C8a): the indeterminate-read arm's dispatch_failed
+// claim (ADR-109 A1 releases only an open-PR orphan, in merge-on-pass).
 const mergeQueueResumeRearmRemedy = "the queue claim was orphaned by a restart and is now dispatch_failed (orphaned_by_restart). " +
 	"Confirm on the forge that the pull request did not merge, then apply the operator re-arm in backend/internal/mergequeue/README.md " +
 	"§ \"Merge-dispatch ledger\" (DELETE the run's dispatch_failed claim). The queue-path re-arm needs NO fishhawk_merge_run " +
@@ -349,7 +362,10 @@ func (s *Server) mergeQueueResumeMergeLocked(ctx context.Context, e mergequeue.E
 			r.NextStep, r.Remedy = "reconcile_merge", mergeQueueResumeSettlingRemedy
 			return holdRow(mergeQueueResumeReasonSettlingUnconfirmed, mergeQueueResumeSettlingRemedy, r)
 		}
-		return s.mergeQueueResumeOrphan(ctx, cur, claim, closed, record, unrecorded, held)
+		if closed {
+			return s.mergeQueueResumeOrphan(ctx, cur, claim, closed, record, unrecorded, held)
+		}
+		return s.mergeQueueResumeOrphanedOpen(ctx, cur, claim, record, unrecorded, held)
 	}
 	if closed {
 		if !record(mergeQueueResumed{Action: mergeQueueResumeActionDropPRClosed, Reason: mergeCandidateQueueReasonPRClosed}) {
@@ -382,8 +398,36 @@ func (s *Server) mergeQueueResumeMergeLocked(ctx context.Context, e mergequeue.E
 		Detail: "no dispatch claim exists; ordinary merge-on-pass decides from scratch", HeadSHA: cur.AnchoredHeadSHA}
 }
 
+// mergeQueueResumeOrphanedOpen is the ADR-109 Amendment A1 hand-over
+// (#4711) for a merging entry whose still-dispatched QUEUE claim is
+// crash-left and whose PR reads open and unmerged: ONE merge_queue_resumed
+// {redecide, orphaned_claim_open} row BEFORE acting (fail closed:
+// resume_unrecorded, nothing changed), then the entry back to passed at its
+// admission epoch (a CAS miss holds entry_changed), then redecide. The resume
+// makes NO ledger write: merge-on-pass re-runs steps 1-7 under the lock and
+// releases the claim in its step 8 (mergeOnPassReleaseOrphanedClaim). A
+// younger claim, or an undecidable age, holds with nothing written.
+func (s *Server) mergeQueueResumeOrphanedOpen(ctx context.Context, cur mergequeue.Entry, claim mergequeue.DispatchClaim,
+	record func(mergeQueueResumed) bool, unrecorded func(string) mergeOnPassOutcome,
+	held func(string, string) mergeOnPassOutcome) mergeOnPassOutcome {
+	aged, why := s.mergeQueueClaimCrashLeft(ctx, claim)
+	if !aged {
+		return held(mergeQueueResumeReasonInProgress, why)
+	}
+	if !record(mergeQueueResumed{Action: mergeQueueResumeActionRedecide, Reason: mergeQueueResumeReasonOrphanedClaimOpen,
+		NextStep: string(mergequeue.PhasePassed), ClaimState: string(claim.State), ClaimPath: claim.Path, ClaimHeadSHA: claim.HeadSHA}) {
+		return unrecorded("merge_queue_resumed")
+	}
+	if _, err := s.cfg.MergeQueue.SetPhase(ctx, cur.ID, cur.AdmissionEpoch, mergequeue.PhasePassed); err != nil {
+		return held(mergeOnPassReasonEntryChanged, "the entry could not be returned to passed: "+err.Error())
+	}
+	return mergeOnPassOutcome{Kind: mergeOnPassRedecide, Reason: mergeQueueResumeReasonOrphanedClaimOpen,
+		Detail:  "the crash-left queue claim's pull request is open and unmerged; merge-on-pass releases the orphaned claim in step 8 and decides (ADR-109 A1)",
+		HeadSHA: cur.AnchoredHeadSHA}
+}
+
 // mergeQueueResumeOrphan is the crash-left arm for a still-dispatched QUEUE
-// claim whose PR is not merged (or could not be read): when the claim is
+// claim whose PR is closed (or could not be read): when the claim is
 // older than mergeQueueCrashLeftClaimAge on the database clock, a strict
 // merge_dispatch_settled {dispatch_failed, orphaned_by_restart} row, then
 // the EXISTING MarkMergeDispatchFailed(orphaned_by_restart), then the hold
@@ -422,9 +466,13 @@ func (s *Server) mergeQueueResumeOrphan(ctx context.Context, cur mergequeue.Entr
 
 // mergeQueueClaimCrashLeft judges C2's age predicate on the DATABASE clock:
 // the claim is crash-left when claimed_at < db_now - mergeQueueCrashLeftClaimAge.
-// A store with no Resumer, or an unreadable clock, is not crash-left (fail
-// closed: hold, nothing written).
+// A zero claimed_at, a store with no Resumer, or an unreadable clock is not
+// crash-left (fail closed: the age is undecidable; hold, nothing written).
+// The resume and merge-on-pass step 8's orphan release share it.
 func (s *Server) mergeQueueClaimCrashLeft(ctx context.Context, claim mergequeue.DispatchClaim) (bool, string) {
+	if claim.ClaimedAt.IsZero() {
+		return false, "the queue dispatch claim carries no claimed_at, so its age is undecidable"
+	}
 	rs, ok := s.cfg.MergeQueue.(mergequeue.Resumer)
 	if !ok {
 		return false, "the queue store cannot read the database clock, so the claim's age is undecidable"

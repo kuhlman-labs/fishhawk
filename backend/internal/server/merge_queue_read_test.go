@@ -1077,3 +1077,276 @@ func TestMergeQueueEjectionProjection_MergeMethodRefusedSurvivesClosedSet(t *tes
 		t.Fatalf("projection = %+v, want forge_reason merge_method_refused with its remedy", v)
 	}
 }
+
+// TestMergeQueueDispatchClaimOrphan_Table pins the orphan label (ADR-109 A1,
+// #4711) one condition per row: deleting the path, state, cause, clock,
+// zero-time or age condition flips exactly the row that isolates it.
+func TestMergeQueueDispatchClaimOrphan_Table(t *testing.T) {
+	now := time.Date(2026, 10, 30, 12, 0, 0, 0, time.UTC)
+	aged := now.Add(-mergeQueueCrashLeftClaimAge - 20*time.Second)
+	young := now.Add(-mergeQueueCrashLeftClaimAge + 20*time.Second)
+	claim := func(path string, state mergequeue.DispatchState, at time.Time, cause string) mergequeue.DispatchClaim {
+		return mergequeue.DispatchClaim{Path: path, State: state, ClaimedAt: at, FailureCause: cause}
+	}
+	for _, tc := range []struct {
+		name    string
+		c       mergequeue.DispatchClaim
+		clockOK bool
+		want    string
+	}{
+		{"queue dispatched aged", claim(mergequeue.DispatchPathQueue, mergequeue.DispatchDispatched, aged, ""), true, mergeQueueClaimOrphaned},
+		{"queue dispatched young", claim(mergequeue.DispatchPathQueue, mergequeue.DispatchDispatched, young, ""), true, ""},
+		{"inline dispatched aged", claim("inline", mergequeue.DispatchDispatched, aged, ""), true, ""},
+		{"delegated dispatched aged", claim("delegated", mergequeue.DispatchDispatched, aged, ""), true, ""},
+		{"queue dispatched zero claimed_at", claim(mergequeue.DispatchPathQueue, mergequeue.DispatchDispatched, time.Time{}, ""), true, ""},
+		{"queue dispatched aged, clock unreadable", claim(mergequeue.DispatchPathQueue, mergequeue.DispatchDispatched, aged, ""), false, ""},
+		{"queue dispatch_failed orphaned_by_restart", claim(mergequeue.DispatchPathQueue, mergequeue.DispatchFailed, aged, mergeQueueResumeReasonOrphanedByRestart), false, mergeQueueClaimOrphanedByRestart},
+		{"queue dispatch_failed other cause", claim(mergequeue.DispatchPathQueue, mergequeue.DispatchFailed, aged, "github: 502 bad gateway"), true, ""},
+		{"inline dispatch_failed orphaned_by_restart", claim("inline", mergequeue.DispatchFailed, aged, mergeQueueResumeReasonOrphanedByRestart), true, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := mergeQueueDispatchClaimOrphan(tc.c, now, tc.clockOK); got != tc.want {
+				t.Fatalf("mergeQueueDispatchClaimOrphan = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// mqrClockStore is the REAL store with a counted (and optionally failing)
+// database clock.
+type mqrClockStore struct {
+	*mergequeue.PostgresStore
+	fail  bool
+	calls int
+}
+
+func (s *mqrClockStore) DatabaseNow(ctx context.Context) (time.Time, error) {
+	s.calls++
+	now, err := s.PostgresStore.DatabaseNow(ctx)
+	if s.fail {
+		// A plausible instant WITH the error, so a caller ignoring the error
+		// would label the claim: the control under test is the error check,
+		// not the zero time a failed read usually carries.
+		return now, errMCQStore
+	}
+	return now, err
+}
+
+// mqrOrphanSurfaces reads the orphan label from the RAW bytes of the
+// merge-queue read (A's dispatch_claim.orphan) and of the run read and the
+// gate view (merge_candidate_queue.dispatch_claim_orphan): "" with present
+// false when the key is absent, never a zero-value decode. It also returns
+// the run read's note.
+type mqrOrphanSurfaces struct {
+	queue, run, gate             string
+	queueKey, runKey, gateKey    bool
+	runNote, gateNote, queueBody string
+}
+
+func mqrReadOrphan(t *testing.T, s *Server, runID uuid.UUID) mqrOrphanSurfaces {
+	t.Helper()
+	var out mqrOrphanSurfaces
+	w := getMergeQueue(t, s, "", mqrOperator(""))
+	if w.Code != http.StatusOK {
+		t.Fatalf("merge-queue read = %d:\n%s", w.Code, w.Body.String())
+	}
+	out.queueBody = w.Body.String()
+	var q struct {
+		Bases []struct {
+			Entries []struct {
+				RunID         string                     `json:"run_id"`
+				DispatchClaim map[string]json.RawMessage `json:"dispatch_claim"`
+			} `json:"entries"`
+		} `json:"bases"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &q); err != nil {
+		t.Fatalf("decode merge-queue: %v", err)
+	}
+	for _, b := range q.Bases {
+		for _, e := range b.Entries {
+			if e.RunID != runID.String() || e.DispatchClaim == nil {
+				continue
+			}
+			if raw, ok := e.DispatchClaim["orphan"]; ok {
+				out.queueKey = true
+				_ = json.Unmarshal(raw, &out.queue)
+			}
+		}
+	}
+	block := func(body []byte) (string, bool, string) {
+		var top map[string]json.RawMessage
+		if err := json.Unmarshal(body, &top); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		var mcq map[string]json.RawMessage
+		if err := json.Unmarshal(top["merge_candidate_queue"], &mcq); err != nil || mcq == nil {
+			t.Fatalf("merge_candidate_queue absent or undecodable: %v\n%s", err, body)
+		}
+		var note, label string
+		_ = json.Unmarshal(mcq["note"], &note)
+		raw, ok := mcq["dispatch_claim_orphan"]
+		if ok {
+			_ = json.Unmarshal(raw, &label)
+		}
+		return label, ok, note
+	}
+	out.run, out.runKey, out.runNote = block(getRunRaw(t, s, runID).Body.Bytes())
+	gv := getGateView(t, s, runID, "")
+	if gv.Code != http.StatusOK {
+		t.Fatalf("gate view = %d:\n%s", gv.Code, gv.Body.String())
+	}
+	out.gate, out.gateKey, out.gateNote = block(gv.Body.Bytes())
+	return out
+}
+
+// TestMergeQueueRead_DispatchClaimOrphan is the ADR-109 A1 point 5 visibility
+// on the REAL store and handlers: GET /v0/repos/{owner}/{name}/merge-queue's
+// dispatch_claim.orphan and GET /v0/runs/{id} (and the gate view's)
+// merge_candidate_queue.dispatch_claim_orphan, read from raw bytes. Each
+// claim state is seeded in SQL, claimed_at backdated against
+// clock_timestamp() (one clock domain, #3048). The orphaned note is
+// CONDITIONAL on the approval fold (approval condition 1): with the
+// approval-wait anchor set it names the needed approval and the claim
+// holding the head, never "nothing to do". Counterfactuals: dropping the
+// runs.go helper call → the run-read rows go RED; making the orphaned note
+// clause unconditional → the approval-wait row goes RED.
+func TestMergeQueueRead_DispatchClaimOrphan(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	ctx := context.Background()
+	if _, err := f.store.ClaimMergeDispatch(ctx, a.id, mergequeue.DispatchPathQueue, "a1"); err != nil {
+		t.Fatalf("claim: %v", err)
+	}
+	set := func(sql string) {
+		t.Helper()
+		f.exec(`UPDATE merge_dispatch_claims SET `+sql+` WHERE run_id = $1`, a.id)
+	}
+	want := func(t *testing.T, got mqrOrphanSurfaces, label string) {
+		t.Helper()
+		present := label != ""
+		if got.queueKey != present || got.queue != label {
+			t.Errorf("queue read dispatch_claim.orphan = %q (key %v), want %q (key %v):\n%s", got.queue, got.queueKey, label, present, got.queueBody)
+		}
+		if got.runKey != present || got.run != label {
+			t.Errorf("run read dispatch_claim_orphan = %q (key %v), want %q (key %v)", got.run, got.runKey, label, present)
+		}
+		if got.gateKey != present || got.gate != label {
+			t.Errorf("gate view dispatch_claim_orphan = %q (key %v), want %q (key %v)", got.gate, got.gateKey, label, present)
+		}
+	}
+
+	t.Run("aged queue dispatched is orphaned with the conditional note", func(t *testing.T) {
+		set(`state = 'dispatched', path = 'queue', failed_at = NULL, failure_cause = NULL, claimed_at = ` + mqrAged)
+		got := mqrReadOrphan(t, f.srv, a.id)
+		want(t, got, mergeQueueClaimOrphaned)
+		for _, note := range []string{got.runNote, got.gateNote} {
+			if !strings.HasSuffix(note, mergeQueueNoteOrphaned) || strings.Contains(note, "nothing to do") {
+				t.Errorf("note = %q, want the conditional orphaned clause and never \"nothing to do\"", note)
+			}
+		}
+	})
+	t.Run("orphaned while the approval fold has not approved names the needed approval", func(t *testing.T) {
+		set(`state = 'dispatched', path = 'queue', failed_at = NULL, failure_cause = NULL, claimed_at = ` + mqrAged)
+		f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = clock_timestamp() WHERE id = $1`, f.entry(a).ID)
+		defer f.exec(`UPDATE merge_candidate_queue_entries SET approval_wait_started_at = NULL WHERE id = $1`, f.entry(a).ID)
+		got := mqrReadOrphan(t, f.srv, a.id)
+		want(t, got, mergeQueueClaimOrphaned)
+		for _, note := range []string{got.runNote, got.gateNote} {
+			if !strings.HasSuffix(note, mergeQueueNoteOrphanedAwaitingApproval) ||
+				!strings.Contains(note, "still needs a qualifying forge approval") || !strings.Contains(note, "the claim holds the head until that approval arrives") ||
+				strings.Contains(note, "nothing to do") {
+				t.Errorf("note = %q, want the approval-needed clause and never \"nothing to do\"", note)
+			}
+		}
+	})
+	t.Run("young queue dispatched is unlabelled", func(t *testing.T) {
+		set(`state = 'dispatched', path = 'queue', claimed_at = ` + mqrYoung)
+		got := mqrReadOrphan(t, f.srv, a.id)
+		want(t, got, "")
+		if strings.Contains(got.runNote, "orphan") {
+			t.Errorf("young-claim note = %q, want no orphan clause", got.runNote)
+		}
+	})
+	t.Run("aged inline dispatched is unlabelled", func(t *testing.T) {
+		set(`state = 'dispatched', path = 'inline', claimed_at = ` + mqrAged)
+		want(t, mqrReadOrphan(t, f.srv, a.id), "")
+	})
+	t.Run("queue dispatch_failed orphaned_by_restart names the operator re-arm", func(t *testing.T) {
+		set(`path = 'queue', state = 'dispatch_failed', failed_at = clock_timestamp(), failure_cause = 'orphaned_by_restart', claimed_at = ` + mqrAged)
+		got := mqrReadOrphan(t, f.srv, a.id)
+		want(t, got, mergeQueueClaimOrphanedByRestart)
+		if !strings.HasSuffix(got.runNote, mergeQueueNoteOrphanedByRestart) {
+			t.Errorf("note = %q, want the operator re-arm clause", got.runNote)
+		}
+	})
+	t.Run("queue dispatch_failed with another cause is unlabelled", func(t *testing.T) {
+		set(`path = 'queue', state = 'dispatch_failed', failed_at = clock_timestamp(), failure_cause = 'github: 502 bad gateway'`)
+		want(t, mqrReadOrphan(t, f.srv, a.id), "")
+	})
+	t.Run("a held entry is never labelled on the run read", func(t *testing.T) {
+		if _, err := f.store.ClaimMergeDispatch(ctx, b.id, mergequeue.DispatchPathQueue, "b1"); err != nil {
+			t.Fatalf("claim B: %v", err)
+		}
+		f.exec(`UPDATE merge_dispatch_claims SET claimed_at = `+mqrAged+` WHERE run_id = $1`, b.id)
+		got := mqrReadOrphan(t, f.srv, b.id)
+		if got.runKey || got.gateKey || got.queue != mergeQueueClaimOrphaned {
+			t.Errorf("held B: run key %v gate key %v queue %q, want the run read unlabelled and the queue read labelled", got.runKey, got.gateKey, got.queue)
+		}
+		f.exec(`DELETE FROM merge_dispatch_claims WHERE run_id = $1`, b.id)
+	})
+}
+
+// TestMergeQueueRead_DispatchClaimOrphanDegrades: a failed claim read omits
+// dispatch_claim_orphan while the run read and the gate view still answer
+// 200; an unreadable or absent database clock omits "orphaned" (never a
+// guess) while orphaned_by_restart, which needs no clock, is still labelled;
+// the clock is read at most once per queue read and never without a queue
+// dispatched claim. Counterfactuals: failing the run read on the claim error
+// → getRunRaw's 200 check RED; returning ok on a clock error → "orphaned"
+// labelled (RED).
+func TestMergeQueueRead_DispatchClaimOrphanDegrades(t *testing.T) {
+	f := newMCQFixture(t)
+	a, b := f.wave()
+	ctx := context.Background()
+	for _, r := range []*mcqRun{a, b} {
+		if _, err := f.store.ClaimMergeDispatch(ctx, r.id, mergequeue.DispatchPathQueue, "x1"); err != nil {
+			t.Fatalf("claim: %v", err)
+		}
+	}
+	f.exec(`UPDATE merge_dispatch_claims SET claimed_at = `+mqrAged+` WHERE run_id = ANY($1)`, []uuid.UUID{a.id, b.id})
+
+	f.srv.cfg.MergeQueue = &mqrFaultStore{Store: f.store, failClaim: true}
+	blk, ok := runQueueBlock(t, getRunRaw(t, f.srv, a.id))
+	if !ok || blk.DispatchClaimOrphan != "" || strings.Contains(getRunRaw(t, f.srv, a.id).Body.String(), `"dispatch_claim_orphan"`) {
+		t.Errorf("claim-read failure: block present %v orphan %q, want the block with no dispatch_claim_orphan", ok, blk.DispatchClaimOrphan)
+	}
+	if gv := getGateView(t, f.srv, a.id, ""); gv.Code != http.StatusOK || strings.Contains(gv.Body.String(), `"dispatch_claim_orphan"`) {
+		t.Errorf("gate view on a claim-read failure = %d, want 200 with no dispatch_claim_orphan:\n%s", gv.Code, gv.Body.String())
+	}
+
+	clock := &mqrClockStore{PostgresStore: f.store}
+	f.srv.cfg.MergeQueue = clock
+	if got := mqrReadOrphan(t, f.srv, a.id); got.queue != mergeQueueClaimOrphaned || got.run != mergeQueueClaimOrphaned {
+		t.Fatalf("readable clock: queue %q run %q, want orphaned on both", got.queue, got.run)
+	}
+	clock.calls = 0
+	if w := getMergeQueue(t, f.srv, "", mqrOperator("")); w.Code != http.StatusOK || strings.Count(w.Body.String(), `"orphan":"orphaned"`) != 2 || clock.calls != 1 {
+		t.Errorf("two aged queue claims: %d orphaned labels over %d clock reads, want 2 over 1:\n%s", strings.Count(w.Body.String(), `"orphan":"orphaned"`), clock.calls, w.Body.String())
+	}
+
+	clock.fail = true
+	if got := mqrReadOrphan(t, f.srv, a.id); got.queueKey || got.runKey || got.gateKey {
+		t.Errorf("failed clock: queue key %v run key %v gate key %v, want orphaned omitted everywhere", got.queueKey, got.runKey, got.gateKey)
+	}
+	f.srv.cfg.MergeQueue = &mqrFaultStore{Store: f.store}
+	if got := mqrReadOrphan(t, f.srv, a.id); got.queueKey || got.runKey {
+		t.Errorf("no Resumer: queue key %v run key %v, want orphaned omitted", got.queueKey, got.runKey)
+	}
+
+	f.exec(`UPDATE merge_dispatch_claims SET state = 'dispatch_failed', failed_at = clock_timestamp(), failure_cause = 'orphaned_by_restart' WHERE run_id = ANY($1)`, []uuid.UUID{a.id, b.id})
+	clock.calls = 0
+	f.srv.cfg.MergeQueue = clock
+	if got := mqrReadOrphan(t, f.srv, a.id); got.queue != mergeQueueClaimOrphanedByRestart || got.run != mergeQueueClaimOrphanedByRestart || clock.calls != 0 {
+		t.Errorf("failed clock, dispatch_failed claims: queue %q run %q clock reads %d, want orphaned_by_restart with no clock read", got.queue, got.run, clock.calls)
+	}
+}
