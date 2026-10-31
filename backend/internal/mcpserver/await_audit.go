@@ -314,7 +314,7 @@ func validateKnownCategories(cats []string) error {
 		if !audit.IsKnownCategory(c) {
 			return fmt.Errorf("category %q is not a known audit category. Did you mean one of: %s? "+
 				"Pass allow_unknown=true to await it anyway",
-				c, strings.Join(audit.SuggestCategories(c, 3), ", "))
+				c, strings.Join(audit.SuggestCategories(c, 4), ", "))
 		}
 	}
 	return nil

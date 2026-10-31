@@ -876,6 +876,12 @@ func (c *cancelCheckingAudit) AppendChained(ctx context.Context, p audit.ChainAp
 // approval channel (issue_approval.go), a human path outside approveStageAs:
 // a /fishhawk approve stamps once after approval_submitted, and a duplicate
 // command from the same approver adds no second stamp.
+//
+// Since ADR-123 D4 (#4755) the comment channel is REFUSED on every
+// workflow-v2 gate, so the stamping arms run on a legacy v0 gate
+// (legacyCommentGate, with a RoleResolver wired) and a final arm pins that the
+// same command on a v2 gate records no stamp, no approval_submitted row and no
+// approval row.
 func TestDelegationShadow_SlashCommandApprove(t *testing.T) {
 	rr := newOrchestratorRepo()
 	r := rr.seedRun()
@@ -884,8 +890,7 @@ func TestDelegationShadow_SlashCommandApprove(t *testing.T) {
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
-	r.WorkflowID = "feature_change"
-	r.WorkflowSpec = []byte(shadowSpecYAML("low", ""))
+	legacyCommentGate(r)
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
 
@@ -898,6 +903,7 @@ func TestDelegationShadow_SlashCommandApprove(t *testing.T) {
 		AuditRepo:    au,
 		ConcernRepo:  newFakeConcernRepo(),
 		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+		RoleResolver: legacyCommentResolver(),
 	})
 	gh := newSlashGitHubRecorder()
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{GitHub: gh, Runs: rr, Audit: au})
@@ -909,6 +915,9 @@ func TestDelegationShadow_SlashCommandApprove(t *testing.T) {
 		t.Fatalf("HandleApprovalCommand: %v", err)
 	}
 	st := oneStamp(t, au)
+	// A legacy v0 spec has no autonomy block, yet the shadow still yields an
+	// unmet GATED approve stamp on it (no plan-review round is seeded), so the
+	// pre-#4755 mode/verdict assertion holds on the legacy gate unrelaxed.
 	if st.Action != delegation.ActionApprove || st.HumanDecision != "approve" || st.ActorSubject != "alice" ||
 		st.Mode != string(spec.ModeGated) || st.Verdict != string(delegation.ShadowUnmet) {
 		t.Errorf("stamp = %+v, want an unmet gated approve stamp for alice", st)
@@ -926,8 +935,7 @@ func TestDelegationShadow_SlashCommandApprove(t *testing.T) {
 	r2.TriggerRef = &ref2
 	r2.InstallationID = ptrInt64(99)
 	r2.Repo = "x/y"
-	r2.WorkflowID = "feature_change"
-	r2.WorkflowSpec = []byte(shadowSpecYAML("low", ""))
+	legacyCommentGate(r2)
 	stage2 := rr.seedStage(r2.ID, 0, run.StageStateAwaitingApproval)
 	stage2.Type = run.StageTypePlan
 	if _, err := ar.Submit(context.Background(), approval.SubmitParams{
@@ -951,6 +959,46 @@ func TestDelegationShadow_SlashCommandApprove(t *testing.T) {
 	if n := len(shadowStamps(t, au)); n != 1 {
 		t.Errorf("stamps after a duplicate slash command = %d, want 1", n)
 	}
+
+	// v2 arm (ADR-123 D4 / #4755): the same command on a workflow-v2 gate is
+	// refused BEFORE the shadow capture, so it records no stamp, no
+	// approval_submitted row and no approval row.
+	r3 := rr.seedRun()
+	r3.TriggerSource = run.TriggerGitHubIssue
+	ref3 := "issue:44"
+	r3.TriggerRef = &ref3
+	r3.InstallationID = ptrInt64(99)
+	r3.Repo = "x/y"
+	r3.WorkflowID = "feature_change"
+	r3.WorkflowSpec = []byte(shadowSpecYAML("low", ""))
+	stage3 := rr.seedStage(r3.ID, 0, run.StageStateAwaitingApproval)
+	stage3.Type = run.StageTypePlan
+	submittedBefore := countAppended(au, "approval_submitted")
+	cmd.IssueNumber = 44
+	if err := s.HandleApprovalCommand(context.Background(), cmd); err != nil {
+		t.Fatalf("v2 HandleApprovalCommand: %v", err)
+	}
+	if n := len(shadowStamps(t, au)); n != 1 {
+		t.Errorf("stamps after a refused v2 slash command = %d, want still 1", n)
+	}
+	if n := countAppended(au, "approval_submitted"); n != submittedBefore {
+		t.Errorf("approval_submitted rows = %d after a refused v2 command, want %d (unchanged)", n, submittedBefore)
+	}
+	for _, a := range ar.all {
+		if a.StageID == stage3.ID {
+			t.Errorf("a refused v2 slash command recorded an approval row: %+v", a)
+		}
+	}
+	if stage3.State != run.StageStateAwaitingApproval {
+		t.Errorf("v2 stage state = %q, want awaiting_approval", stage3.State)
+	}
+}
+
+// countAppended counts au's appended entries of category, under its lock.
+func countAppended(au *auditFake, category string) int {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	return countCategory(au.appended, category)
 }
 
 // assertDecisionThenOneStamp asserts the appended chain is exactly the

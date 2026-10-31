@@ -765,6 +765,103 @@ components:
             When the minted key expires (database clock; `AttestationTTL`,
             5 minutes). Only the minting attester's same-nonce heartbeats
             slide it. Present only together with `attestation_key`.
+    EscapeRecordRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        RECORD body for `POST /v0/runs/{run_id}/escapes` (E94.3 / #4694).
+        There is NO `security_finding_id` (ADR-126 D7 deferred to E96 /
+        #4774); strict decoding refuses it 400.
+      required: [source, severity, category]
+      properties:
+        source:
+          type: string
+          enum: [later_reviewer, follow_up_bug, operator_battery, human_finding, ci_red_on_main]
+        severity:
+          type: string
+          enum: [high, medium, low]
+        category:
+          type: string
+          enum: [correctness, security, reliability, concurrency, performance, data_integrity, test_coverage, documentation, other]
+          description: '`security` for ANY vulnerability (A1.5 allow-list applies).'
+        description:
+          type: string
+          maxLength: 4000
+          description: Required unless `category=security`; refused (422) on a security escape, even empty.
+        files:
+          type: array
+          minItems: 1
+          maxItems: 200
+          items: { type: string }
+          description: Clean repo-relative paths. Required unless `category=security`; refused (422) on a security escape.
+        head_sha:
+          type: string
+          pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$'
+          description: Required when the run's PR is not observably merged (422 `escape_subject_unresolved`).
+        introducing_commits:
+          type: array
+          maxItems: 20
+          items: { type: string, pattern: '^(?:[0-9a-f]{40}|[0-9a-f]{64})$' }
+          description: 'Recorded with `introducing_commits_source: operator_supplied`; refused (422) on a security escape.'
+        concern_id:
+          $ref: '#/components/schemas/UUID'
+        idempotency_key:
+          type: string
+          pattern: '^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$'
+          description: |
+            Required for every source except `later_reviewer`, refused on
+            `later_reviewer` (which requires `concern_id` and dedupes on
+            `concern:<concern_uuid>`). On `category=security` it must be a
+            canonical lowercase UUID.
+        security_class:
+          type: string
+          pattern: '^[a-z0-9][a-z0-9_]{0,63}$'
+          description: Required iff `category=security`. Interim vocabulary; closes when #4774 defines the class list (#4783).
+        advisory_id:
+          type: string
+          description: Required iff `category=security`. A GHSA id (`^GHSA(-[0-9a-z]{4}){3}$`) on a GitHub run; an opaque bounded token on any other forge.
+        delegated:
+          type: boolean
+          description: ADR-040 delegated-action marker (caller-asserted); makes the birth `pending_judgement` (`agent_recorded`).
+    EscapeCloseRequest:
+      type: object
+      additionalProperties: false
+      description: CLOSE body for `POST /v0/runs/{run_id}/escapes`; any other key is 400.
+      required: [supersedes_sequence, attestation]
+      properties:
+        supersedes_sequence:
+          type: integer
+          format: int64
+          minimum: 1
+          description: The audit sequence of the `pending_judgement` birth to close.
+        attestation:
+          type: object
+          additionalProperties: false
+          required: [judgement]
+          properties:
+            judgement:
+              type: string
+              enum: [defect, no_defect]
+              description: '`defect` closes `counted`; `no_defect` closes `dismissed`.'
+            note:
+              type: string
+              maxLength: 2000
+              description: Optional; refused (422) when the target is a security escape.
+        delegated:
+          type: boolean
+          description: A delegated close is refused 403 `escape_attestation_requires_human`.
+    EscapeRecordResponse:
+      type: object
+      required: [run_id, audit_sequence, record_kind, state, judgement_basis]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        audit_sequence: { type: integer, format: int64 }
+        record_kind: { type: string, enum: [birth, closure] }
+        state: { type: string, enum: [counted, pending_judgement, dismissed] }
+        judgement_basis: { type: string, enum: [not_required, awaiting_attestation, operator_attestation] }
+        pending_reason: { type: string, enum: [review_finding_source, agent_recorded, credential_not_forge_verified] }
+        source_event_key: { type: string, description: 'A birth''s dedupe key: `concern:<uuid>` or `idempotency_key:<key>`.' }
+        supersedes_sequence: { type: string, description: 'A closure''s target birth sequence (base-10).' }
     Error:
       type: object
       required: [error]
@@ -2136,6 +2233,47 @@ components:
             consumer then refuses rather than targeting gitlab.com by
             accident). Omitted on every `github` run.
           example: https://gitlab.example.com
+        default_branch:
+          type: string
+          description: |
+            The run repository's base branch, resolved from the forge's
+            `default_branch` through the shared, TTL-cached default-branch
+            resolver (#4660): the same branch the consolidated PR, fan-in,
+            consolidated review, first-round review re-run and an unpinned
+            deploy / rollback `workflow_dispatch` use. Present ONLY on
+            `GET /v0/runs/{run_id}`, and mutually exclusive with
+            `default_branch_unresolved_reason`: exactly one of the two is set
+            on that route. The list endpoint NEVER carries either — over N
+            rows it would pay up to N forge reads, each capped by the
+            resolver's lookup timeout. A failed read never fails the GET.
+          example: trunk
+        default_branch_unresolved_reason:
+          type: string
+          enum:
+            - resolver_unconfigured
+            - forge_unsupported
+            - no_installation
+            - repository_invalid
+            - repository_not_visible
+            - forbidden
+            - default_branch_missing
+            - lookup_failed
+          description: |
+            Why `default_branch` could not be resolved (#4660), present ONLY
+            on `GET /v0/runs/{run_id}` and only when `default_branch` is
+            absent. `resolver_unconfigured`: the deployment wires no
+            default-branch resolver (no GitHub client). `forge_unsupported`:
+            a GitLab run (the consumers of this branch are GitHub-only).
+            `no_installation`: the run carries no installation id.
+            `repository_invalid`: the run's `repo` is not `owner/name`.
+            `repository_not_visible`: the forge answered not-found.
+            `forbidden`: the forge rejected the credential.
+            `default_branch_missing`: the forge reported no default branch.
+            `lookup_failed`: any other read failure (transport, timeout, 5xx,
+            decode). A server-side consumer that needs the branch refuses
+            with the same reason on its own failure surface rather than
+            guessing a branch.
+          example: repository_not_visible
         capabilities:
           type: object
           description: |
@@ -2903,24 +3041,46 @@ components:
           description: |
             The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
             set on the first non-approved fold at the head, never reset by a
-            readvance or re-admission, cleared only when a re-probe clears the
-            yield. Present on a live entry waiting at the head and on a yielded
-            entry; omitted when no wait started.
+            readvance, a re-admission or (docs/adr/112 A3.7) a re-probe clear:
+            it is RETAINED for the whole episode, so a later approval-fold block
+            in the same episode gets no fresh window and yields at once. A
+            merge-gate hold never sets it. Present on a live entry that waited at
+            the head and on a yielded entry; omitted when no wait started.
+        dispatch_claim_orphan:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueDispatchClaimOrphan' }]
+          description: |
+            A LIVE entry's crash-left queue dispatch claim (ADR-109 A1, #4711),
+            the label the merge-queue read's `dispatch_claim.orphan` carries;
+            `note` then adds a constant-shape clause (the conditional release
+            for `orphaned`, the operator re-arm for `orphaned_by_restart`).
+            Omitted for a held entry, with no or an unlabelled claim, and when
+            the claim or clock read fails (the read still answers 200).
 
     MergeQueueYieldReason:
       type: string
       description: |
-        ADR-112 R3's closed yield vocabulary. A yielded entry is held with a
-        marker the queue's admission skips; clearing the marker (a re-probe
-        whose forge-approval fold qualifies; for `forge_review_required`, also
-        a fresh forge snapshot that no longer reports review required, changes
-        requested or `BLOCKED`) is the only way back in, and the entry then
-        rejoins FIFO at its original `enqueued_at`. `vetoed`,
-        `provider_unsupported` and `identity_provider_unconfigured` yield at
-        once; the others wait at the head for the approval window first;
-        `forge_review_required` is precedence row 4 (the forge refused the
-        pinned merge and reports the pull request still needs review or is
-        blocked).
+        ADR-112 R3's closed yield vocabulary, extended by docs/adr/112
+        Amendment A3 (#4780). A yielded entry is held with a marker the queue's
+        admission skips; clearing the marker is the only way back in, and the
+        entry then rejoins FIFO at its original `enqueued_at`. Under A3.4 ONE
+        clear predicate applies to every reason: the re-probe clears the marker
+        only when the forge-approval fold qualifies, every merge-gate leg passes
+        at the anchored head, and (while the entry's row-4 flag is set, unless
+        an operator merge re-invoke forces the probe) a fresh forge snapshot no
+        longer reports review required, changes requested or `BLOCKED`.
+        `vetoed`, `provider_unsupported` and `identity_provider_unconfigured`
+        yield at once; the other `forge_approval_*` reasons wait at the head for
+        the approval window first; `forge_review_required` is precedence row 4
+        (the forge refused the pinned merge and reports the pull request still
+        needs review or is blocked). The merge-gate reasons (A3.1/A3.2,
+        precedence row 1) are `merge_checks_red` (a required check's latest
+        attempt failed or was cancelled at the anchored head; yields at once),
+        `merge_checks_pending` (a required check is pending, unreported or
+        unreadable there) and `merge_review_pending` (the implement-review round
+        there is still settling); the last two hold the line for a per-admission
+        merge-gate window first. The `yield_reason` `merge_checks_pending` is
+        DISTINCT from the 409 error code of the same name on
+        `POST /v0/runs/{run_id}/merge`: the two live in separate value spaces.
       enum:
         - forge_approval_vetoed
         - forge_approval_review_required
@@ -2931,6 +3091,9 @@ components:
         - forge_approval_provider_unsupported
         - forge_approval_identity_provider_unconfigured
         - forge_review_required
+        - merge_checks_red
+        - merge_checks_pending
+        - merge_review_pending
 
     MergeQueueNextStep:
       type: string
@@ -2938,10 +3101,16 @@ components:
         The operator remedy for a yield, a TOTAL mapping of `yield_reason`:
         `approve_pr` (review_required, dismissed, absent, forge_review_required),
         `dismiss_review` (vetoed), `retry_after` (undetermined,
-        reviews_truncated; re-invoke `POST /v0/runs/{run_id}/merge` to
-        re-probe now), `configure_identity_provider`
-        (identity_provider_unconfigured), `none` (provider_unsupported).
-      enum: [approve_pr, dismiss_review, retry_after, configure_identity_provider, none]
+        reviews_truncated, merge_checks_pending, merge_review_pending; for the
+        forge reads re-invoke `POST /v0/runs/{run_id}/merge` to re-probe now,
+        for the merge-gate reasons the check_run trigger or the periodic
+        re-probe clears the yield once the legs pass), `retrigger_ci`
+        (merge_checks_red: re-run the failed or cancelled checks, e.g. with
+        `fishhawk_retrigger_ci`; the check_run trigger, the periodic re-probe
+        or a merge re-invoke then clears the yield under docs/adr/112 A3.4),
+        `configure_identity_provider` (identity_provider_unconfigured), `none`
+        (provider_unsupported).
+      enum: [approve_pr, dismiss_review, retry_after, configure_identity_provider, retrigger_ci, none]
 
     RunCompletionBlocked:
       type: object
@@ -3777,10 +3946,16 @@ components:
           description: '`verify_failed` only, with a readable row: whether ADR-090 D6 routed a delegated fix-up for the failed verdict. Omitted otherwise.'
         forge_reason:
           type: string
-          enum: [not_mergeable, unprocessable, checks_not_settled]
+          enum: [not_mergeable, unprocessable, checks_not_settled, merge_method_refused]
           description: |
             `forge_merge_refused` only: the forge's typed refusal code. A
             recorded value outside this closed set is dropped on read.
+            `merge_method_refused` (E93.2 / #4658) means the run's declared
+            merge method cannot be applied: the repository's merge settings
+            disallow it (attributed after the dispatch), or the run's forge
+            family cannot apply it per merge request (ejected pre-lock, before
+            any claim); its `forge_detail` is built from closed-set fields
+            only (method, source, reason, allowed methods), never forge text.
             `checks_not_settled` means the checks were not settled at the
             merge attempt: the asymmetry is deliberate (ADR-112 R3 row 5,
             ADR-093 D4) — pending checks HOLD before dispatch, so slow CI never
@@ -3857,9 +4032,11 @@ components:
           description: |
             The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
             set on the first non-approved fold at the head, never reset by a
-            readvance or re-admission, cleared only when a re-probe clears the
-            yield. Present on a live entry waiting at the head and on a yielded
-            entry; omitted when no wait started.
+            readvance, a re-admission or (docs/adr/112 A3.7) a re-probe clear:
+            it is RETAINED for the whole episode, so a later approval-fold block
+            in the same episode gets no fresh window and yields at once. A
+            merge-gate hold never sets it. Present on a live entry that waited at
+            the head and on a yielded entry; omitted when no wait started.
 
     MergeQueueDispatchClaim:
       type: object
@@ -3883,6 +4060,32 @@ components:
         age_seconds: { type: integer, format: int64, description: The claim's age at read time. }
         failed_at: { type: string, format: date-time, description: When the claim became `dispatch_failed`. }
         reason: { type: string, description: "A `dispatch_failed` claim's recorded forge failure." }
+        orphan:
+          allOf: [{ $ref: '#/components/schemas/MergeQueueDispatchClaimOrphan' }]
+          description: Labels a crash-left QUEUE claim (ADR-109 A1, #4711); omitted otherwise.
+
+    MergeQueueDispatchClaimOrphan:
+      type: string
+      enum: [orphaned, orphaned_by_restart]
+      description: |
+        A DERIVED label on a crash-left QUEUE-path merge-dispatch claim (ADR-109
+        Amendment A1, #4711); never stored, and inline or delegated claims are
+        never labelled.
+        `orphaned` — the claim is still `dispatched` and its `claimed_at` is
+        older than the crash-left window (150 s), judged on the DATABASE clock;
+        omitted when that clock cannot be read. The next merge-on-pass decision
+        whose forge-approval fold APPROVES releases it (a
+        `merge_dispatch_settled` row, outcome `released`, reason
+        `released_orphaned_claim`) and merges through the ordinary path. While
+        the fold does not approve, the pull request still needs a qualifying
+        approval and the claim holds the head until it arrives: a claimed
+        entry never yields.
+        `orphaned_by_restart` — the restart resume could not read the pull
+        request and moved the claim to `dispatch_failed`; it holds the line for
+        the operator re-arm (confirm on the forge the pull request did not
+        merge, then DELETE the claim, `backend/internal/mergequeue/README.md` §
+        "Merge-dispatch ledger"). No merge re-invoke is needed: the queue's next
+        pump re-decides.
 
     MergeQueueHeadOfLine:
       type: object
@@ -3927,9 +4130,11 @@ components:
           description: |
             The episode's persisted head-of-line approval-wait anchor (ADR-112 R3):
             set on the first non-approved fold at the head, never reset by a
-            readvance or re-admission, cleared only when a re-probe clears the
-            yield. Present on a live entry waiting at the head and on a yielded
-            entry; omitted when no wait started.
+            readvance, a re-admission or (docs/adr/112 A3.7) a re-probe clear:
+            it is RETAINED for the whole episode, so a later approval-fold block
+            in the same episode gets no fresh window and yields at once. A
+            merge-gate hold never sets it. Present on a live entry that waited at
+            the head and on a yielded entry; omitted when no wait started.
 
     MergeQueueETABasis:
       type: object
@@ -4501,7 +4706,7 @@ components:
     GateViewConcern:
       type: object
       description: One OPEN concern with its full decision context.
-      required: [id, stage_kind, origin_review_sequence, severity, category, state, note, has_suggested_patch]
+      required: [id, stage_kind, origin_review_sequence, severity, category, state, note, has_suggested_patch, judgement]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         stage_kind:
@@ -4589,6 +4794,64 @@ components:
             source of truth. Can be EMPTY on a disputed concern when the
             best-effort veto record did not land.
           items: { $ref: '#/components/schemas/GateViewDispute' }
+        outcome:
+          type: string
+          description: |
+            The concern's recorded outcome (E94.2 / #4693, ADR-117 D1), orthogonal
+            to `state`: `fixed` (a reviewer confirmed it, a clean round auto-closed
+            it, or its binding approval condition was confirmed delivered),
+            `carried` (a decomposition child's concern copied into its parent),
+            `open_at_merge` (still open or superseded when its run merged),
+            `waived` / `deferred` (the human waive, bulk waive and defer verbs,
+            E94.7 / #4840; a human resolve-with-evidence records `fixed`), or
+            `duplicate_of:<concern id>` for a duplicate. A move back into an open
+            state clears `fixed`. Omitted when none is recorded.
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
+          description: |
+            The HUMAN judgement of the concern (E94.2 / #4693, ADR-117 D1). Always
+            present. Only human verbs write it: waive, bulk waive,
+            resolve-with-evidence and defer (E94.7 / #4840), each of which
+            REQUIRES one, and the relabel verb `POST
+            /v0/concerns/{concern_id}/label` (E94.8 / #4841), which sets or
+            corrects it on a concern in any state; a re-judgement overwrites. A
+            human verb's judgement on a duplicate-linked concern is recorded on
+            the concern row and its audit row, but the duplicate keeps reading
+            its root's judgement until it is relabelled with an explicit one. A
+            concern no human has judged reads
+            `unlabelled` — system writers (a reviewer confirm, the clean-round
+            auto-close, a condition claim) never write it, and a blank or unknown
+            stored value also reads `unlabelled`. A duplicate reads its chain
+            root's judgement, resolved over the owning run's own concerns; a
+            dangling, cross-run or cyclic chain reads `unlabelled`.
+        judgement_inherited_from:
+          $ref: '#/components/schemas/UUID'
+          description: For a duplicate whose chain resolved, the chain-root concern that supplied `judgement`. Omitted otherwise.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: The earlier same-run concern this one duplicates, written only by `POST /v0/concerns/{concern_id}/label` (E94.8 / #4841). Omitted otherwise.
+        judgement_actor_kind:
+          type: string
+          description: Who recorded the judgement — `user` or `agent`, the same actor kind the verb's audit row carries. Omitted when nobody has.
+        judgement_delegated:
+          type: boolean
+          description: The judgement was recorded under a delegation. Omitted when false.
+        judgement_bulk:
+          type: boolean
+          description: |
+            COUNT-based (FO ruling D2, E94.7 / #4840): true if and only if one
+            judgement covered more than one concern in one request (a bulk waive
+            or a resolve naming more than one id). A bulk verb called with one id
+            is an individual judgement and records false; the VERB fact is the
+            `concern_waived` audit row's `bulk_waive: true` marker. Omitted when
+            false.
+        judgement_backfill:
+          type: boolean
+          description: The judgement was recorded after the fact (the relabel verb's `backfill`, E94.8 / #4841). Omitted when false.
+        tradeoff_cost:
+          type: string
+          description: The stated cost of a `tradeoff` judgement. Omitted when empty.
 
     GateViewDispute:
       type: object
@@ -4706,7 +4969,7 @@ components:
         concern whose binding approval condition one implement review confirmed
         delivered; its state_reason names the claiming approval + confirming
         review.
-      required: [id, stage_kind, state, severity, category, note]
+      required: [id, stage_kind, state, severity, category, note, judgement]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         stage_kind:
@@ -4758,6 +5021,24 @@ components:
             later review re-confirmed), every other settled state, and when
             the `concern_resolved_with_evidence` read failed (a `history_gaps`
             entry).
+        outcome:
+          type: string
+          description: Same semantics as `GateViewConcern.outcome`. Omitted when none is recorded.
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
+          description: Same semantics as `GateViewConcern.judgement`; always present, `unlabelled` when no human has judged the concern.
+        judgement_inherited_from:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.judgement_inherited_from`.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.duplicate_of`.
+        judgement_actor_kind: { type: string }
+        judgement_delegated: { type: boolean }
+        judgement_bulk: { type: boolean }
+        judgement_backfill: { type: boolean }
+        tradeoff_cost: { type: string }
 
     GateViewSuppressedRelitigation:
       type: object
@@ -5185,6 +5466,16 @@ components:
             binding — each item run then needs its own `working_dir`, and a
             `local` one with neither is refused `working_dir_required`.
           example: /Users/op/checkouts/fishhawk
+        runner_kind:
+          type: string
+          enum: [github_actions, local, gitlab_ci]
+          description: |
+            OPTIONAL campaign-level runner kind (#4485): the `runner_kind` every
+            item run minted from this campaign inherits when
+            `POST /v0/campaigns/{campaign_id}/runs` passes none. Omitted when
+            the campaign records none — item runs then take `local` when the
+            campaign binds `working_dir`, else `github_actions`.
+          example: local
         grooming_source:
           type: object
           description: |
@@ -5874,6 +6165,76 @@ components:
             system actor with `trigger: status_read`); any other caller only
             reads the hold and never triggers a release. A release failure
             never fails the read: the hold is reported as still active.
+        pending_amendments:
+          $ref: '#/components/schemas/CampaignPendingAmendments'
+          description: |
+            Every pending scope amendment on any run of the campaign (E86.85 /
+            #4486), the same block `GET /v0/runs/{run_id}/campaign-pending-amendments`
+            returns. ABSENT means not computed: the scope-amendment repository
+            is unconfigured, the caller may not read it (a run-bound
+            `mcp:run:<uuid>` token, or a token without `read:audit`), or the
+            read failed (logged; the status read never fails on it). PRESENT
+            with `items: []` means computed, none pending.
+
+    CampaignPendingAmendments:
+      type: object
+      description: |
+        The pending scope amendments on every run of one campaign (E86.85 /
+        #4486): each item's linked run, whatever the item state, plus its
+        `parent_run_id` / `decomposed_from` descendants, bounded at 64 runs.
+        `items` is always an array, oldest `requested_at` first.
+      required: [items, truncated]
+      properties:
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPendingAmendment' }
+        truncated:
+          type: boolean
+          description: True when the 64-run cap stopped the enumeration, so runs past it were not read.
+
+    CampaignPendingAmendment:
+      type: object
+      description: One pending scope amendment on a run of the campaign.
+      required: [issue_ref, item_run_id, stage_state, decision_live, amendment]
+      properties:
+        issue_ref:
+          type: string
+          description: The campaign item the filing run belongs to.
+        item_run_id:
+          type: string
+          format: uuid
+          description: The campaign item's linked run (the filing run itself, or the ancestor a slice or recovery child descends from).
+        stage_state:
+          type: string
+          description: The filing stage's current state.
+        decision_live:
+          type: boolean
+          description: |
+            True while the filing stage has not settled, so an agent may still
+            be waiting on the decision. A settled (for example failed) stage's
+            still-pending row is listed with `false`.
+        amendment:
+          $ref: '#/components/schemas/ScopeAmendment'
+
+    RunCampaignPendingAmendments:
+      type: object
+      description: The `GET /v0/runs/{run_id}/campaign-pending-amendments` body.
+      required: [run_id, campaign_id, items, truncated]
+      properties:
+        run_id:
+          type: string
+          format: uuid
+          description: The anchor run.
+        campaign_id:
+          type: [string, "null"]
+          format: uuid
+          description: The resolved campaign, or null (never omitted) when the run is in no campaign or its ancestry cannot be resolved.
+        items:
+          type: array
+          items: { $ref: '#/components/schemas/CampaignPendingAmendment' }
+        truncated:
+          type: boolean
+          description: True when the 64-run cap stopped the enumeration.
 
     CampaignDependencyRefresh:
       type: object
@@ -6046,7 +6407,19 @@ components:
         runner_kind:
           type: string
           enum: [github_actions, local]
-          description: OPTIONAL execution backend; defaults to `github_actions`. Pass `local` for the local dogfood loop.
+          description: >-
+            OPTIONAL execution backend for this item run, and an OVERRIDE of the
+            campaign's recorded `runner_kind` (#4485). The minted run's runner
+            kind is resolved through a four-rung ladder: (1) this explicit value
+            wins, and is recorded on the run row; (2) otherwise the campaign's
+            recorded `runner_kind` is inherited, re-validated against the known
+            runner kinds so an invalid value written onto the campaign row is
+            refused 400 `validation_failed` (`details.field` = `runner_kind`);
+            (3) otherwise `local` when the campaign binds a `working_dir` (this
+            also covers every campaign created before `runner_kind` was
+            recorded); (4) otherwise `github_actions`. The 201 body's
+            `runner_kind_resolution` states the applied kind and its source.
+            Omit it to inherit.
         working_dir:
           type: string
           description: >-
@@ -6060,7 +6433,8 @@ components:
             logged; (2) otherwise the campaign's `working_dir` is inherited,
             re-validated through the same absolute-path gate so a relative value
             smuggled onto the campaign row is still refused 400
-            `validation_failed`; (3) otherwise a `runner_kind: local` item is
+            `validation_failed`; (3) otherwise an item whose RESOLVED
+            `runner_kind` is `local` (passed, or inherited from the campaign) is
             refused 400 `working_dir_required`. A non-empty non-absolute value
             here is refused with 400 `validation_failed` (`details.field` =
             `working_dir`), the same guard POST /v0/runs applies. Omit it when
@@ -6070,11 +6444,34 @@ components:
       type: object
       description: |
         The 201 body of POST /v0/campaigns/{campaign_id}/runs: the minted run
-        plus the linked campaign item (now `running`, with `run_id` set).
-      required: [run, item]
+        plus the linked campaign item (now `running`, with `run_id` set), and
+        the runner-kind resolution that chose the run's `runner_kind` (#4485).
+      required: [run, item, runner_kind_resolution]
       properties:
         run: { $ref: '#/components/schemas/Run' }
         item: { $ref: '#/components/schemas/CampaignItem' }
+        runner_kind_resolution:
+          type: object
+          description: |
+            The runner kind the minted run was given and the ladder rung that
+            chose it. The same two values are recorded on the
+            `campaign_issue_started` audit entry as `runner_kind` and
+            `runner_kind_source`.
+          required: [runner_kind, source]
+          properties:
+            runner_kind:
+              type: string
+              enum: [github_actions, local, gitlab_ci]
+              description: The runner kind the minted run was given.
+            source:
+              type: string
+              enum: [explicit, campaign, campaign_working_dir, default]
+              description: |
+                Why it applied: `explicit` (the request's `runner_kind`),
+                `campaign` (the campaign's recorded `runner_kind`),
+                `campaign_working_dir` (the campaign records none but binds
+                `working_dir`, so `local`) or `default` (neither, so
+                `github_actions`).
 
     WaivedConcern:
       type: object
@@ -6107,6 +6504,80 @@ components:
         state_reason:
           type: string
           description: The operator's audited waive reason.
+
+    LabelConcernRequest:
+      type: object
+      description: |
+        Body of `POST /v0/concerns/{concern_id}/label` (E94.8 / #4841). Send
+        exactly one of `judgement` and `duplicate_of`.
+      properties:
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+          description: |
+            The HUMAN judgement to record; `unlabelled` and any value outside
+            the enum are refused 400. May be omitted with `backfill: true` on
+            a waived concern whose reason carries an interim prefix.
+            Exclusive with `duplicate_of`.
+        tradeoff_cost:
+          type: string
+          description: |
+            The stated cost of a `tradeoff` judgement: REQUIRED (non-blank)
+            with `tradeoff`, refused with any other judgement and with
+            `duplicate_of`. At most 4000 bytes: a longer cost is refused 400
+            `tradeoff_cost_too_long`, never truncated.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: |
+            An EARLIER concern of the SAME run whose chain root's judgement
+            this concern inherits. Exclusive with `judgement` and
+            `tradeoff_cost`. Refused 400 `duplicate_of_not_found` (missing or
+            another run's, indistinguishably) or `duplicate_of_not_earlier`.
+        backfill:
+          type: boolean
+          default: false
+          description: |
+            Records `judgement_backfill: true`. On a WAIVED concern only, lets
+            the stored waive reason's interim prefix supply the judgement.
+
+    LabelledConcern:
+      type: object
+      description: |
+        The 200 body of `POST /v0/concerns/{concern_id}/label`: the concern's
+        identity and (unchanged) state plus its outcome and judgement keys as
+        `GateViewConcern` renders them, resolved over the run's ledger, so a
+        duplicate shows the judgement it inherits. If that ledger read fails
+        after the write, the row's own judgement is rendered (a duplicate
+        then reads `unlabelled` with no `judgement_inherited_from`).
+      required: [id, run_id, stage_id, stage_kind, state, judgement]
+      properties:
+        id: { $ref: '#/components/schemas/UUID' }
+        run_id: { $ref: '#/components/schemas/UUID' }
+        stage_id: { $ref: '#/components/schemas/UUID' }
+        stage_kind:
+          type: string
+          enum: [plan, implement]
+        state:
+          type: string
+          description: The concern's lifecycle state, untouched by the label.
+        outcome:
+          type: string
+          description: Same semantics as `GateViewConcern.outcome` (`duplicate_of:<concern id>` for a duplicate).
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
+          description: Same semantics as `GateViewConcern.judgement`.
+        judgement_inherited_from:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.judgement_inherited_from`.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.duplicate_of`.
+        judgement_actor_kind: { type: string }
+        judgement_delegated: { type: boolean }
+        judgement_bulk: { type: boolean }
+        judgement_backfill: { type: boolean }
+        tradeoff_cost: { type: string }
 
     DeferredConcernResult:
       type: object
@@ -6679,6 +7150,31 @@ components:
         new_position: { type: integer, minimum: 1, description: 1-based place after the call (1 on a promotion). }
         live_run_id: { $ref: '#/components/schemas/UUID', description: The run holding the base's line; omitted when none is live. }
         audit_sequence: { type: integer, format: int64, description: The `merge_queue_promoted` row's chain sequence; omitted on a no-op. }
+    WithdrawMergeQueueIntentRequest:
+      type: object
+      additionalProperties: false
+      required: [reason]
+      properties:
+        reason:
+          type: string
+          minLength: 1
+          maxLength: 1000
+          description: Why this run's merge should leave the merge queue; trimmed, then 1..1000 bytes. Recorded on the `merge_queue_intent_withdrawn` row.
+    MergeQueueWithdrawResponse:
+      type: object
+      required: [run_id, entry_id, repo, base_ref, withdrawn, settled_state, settle_reason, yield_reason, audit_sequence]
+      properties:
+        run_id: { $ref: '#/components/schemas/UUID' }
+        entry_id: { $ref: '#/components/schemas/UUID', description: The withdrawn entry (now terminal). }
+        repo: { type: string, description: '`owner/name`.' }
+        base_ref: { type: string }
+        withdrawn: { type: boolean, description: Always `true` on a 200. }
+        settled_state: { type: string, enum: [dropped], description: The entry's terminal state. }
+        settle_reason: { type: string, enum: [intent_withdrawn], description: The store-owned drop reason. }
+        intent_sequence: { type: integer, format: int64, description: The withdrawn intent's `merge_queue_entered` sequence; omitted when the intent was recorded before 0108. }
+        yield_reason: { type: string, description: The yield reason the entry carried when it was withdrawn. }
+        live_run_id: { $ref: '#/components/schemas/UUID', description: The run holding the base's line; omitted when none is live. }
+        audit_sequence: { type: integer, format: int64, description: The `merge_queue_intent_withdrawn` row's chain sequence. }
     PromoteQueuedStageRequest:
       type: object
       additionalProperties: false
@@ -7449,8 +7945,10 @@ components:
           type: string
           description: |
             The git ref or sha that was deployed (ADR-038's "ref/sha"). The
-            deploy reconciler records the dispatch `git_ref` here (e.g.
-            `main`), a symbolic name; the resolved commit rides `sha`.
+            deploy reconciler records the dispatch `git_ref` here (the pinned
+            `executor.delegate.git_ref`, else the repository's resolved forge
+            default branch, #4660), a symbolic name; the resolved commit rides
+            `sha`.
           example: "1111111111111111111111111111111111111111"
         sha:
           type: string
@@ -7948,7 +8446,7 @@ components:
           items: { $ref: '#/components/schemas/RunConcernListChild' }
     RunConcernListItem:
       type: object
-      required: [id, run_id, stage_id, stage_kind, severity, category, state, origin_review_sequence, has_suggested_patch]
+      required: [id, run_id, stage_id, stage_kind, severity, category, state, origin_review_sequence, has_suggested_patch, judgement]
       properties:
         id: { $ref: '#/components/schemas/UUID' }
         run_id:
@@ -7980,6 +8478,24 @@ components:
         provenance:
           type: string
           description: '`server_check` for a server-synthesized concern; omitted for a reviewer-raised one.'
+        outcome:
+          type: string
+          description: Same semantics as `GateViewConcern.outcome`. Omitted when none is recorded.
+        judgement:
+          type: string
+          enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence, unlabelled]
+          description: Same semantics as `GateViewConcern.judgement`, resolved against the OWNING run's concerns only; always present, `unlabelled` when no human has judged the concern.
+        judgement_inherited_from:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.judgement_inherited_from`.
+        duplicate_of:
+          $ref: '#/components/schemas/UUID'
+          description: Same semantics as `GateViewConcern.duplicate_of`.
+        judgement_actor_kind: { type: string }
+        judgement_delegated: { type: boolean }
+        judgement_bulk: { type: boolean }
+        judgement_backfill: { type: boolean }
+        tradeoff_cost: { type: string }
     RunConcernListChild:
       type: object
       required: [run_id, state, item_count]
@@ -13114,6 +13630,17 @@ paths:
 
         A verified subject whose provider qualifier disagrees with the
         selected provider is refused `401` rather than minted.
+
+        CLIENT BINDING (#4627). Verification is not owner-only: before the
+        subject is resolved, the token must have been issued to the
+        deployment's OWN device OAuth client — the one discovery advertises.
+        GitHub: the forge's check-a-token introspection, authenticated with
+        the deployment's OAuth client id + secret, must name exactly that
+        client. GitLab: the forge's token-information endpoint must name
+        exactly the configured device application. Fail-closed: another
+        client's token, a personal access token, an App/installation or
+        project/CI token, a missing or null issuer, and any introspection
+        failure are all refused `401`.
       tags: [auth]
       security: []
       requestBody:
@@ -13164,9 +13691,12 @@ paths:
         '400': { $ref: '#/components/responses/BadRequest' }
         '401':
           description: |
-            The presented access token could not be verified, or the verified
+            The presented access token could not be verified, or the token was
+            not issued to the deployment's configured device OAuth client, or
+            its issuing client could not be determined, or the verified
             subject's provider qualifier disagrees with the selected provider
-            (`error: token_verification_failed`).
+            (`error: token_verification_failed`). The response does not say
+            which check failed.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -13178,7 +13708,21 @@ paths:
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
-        '503': { $ref: '#/components/responses/ServiceUnavailable' }
+        '503':
+          description: |
+            Token login is not configured (`error: tokens_unconfigured`): no
+            token repository, a repository that cannot mint OAuth tokens, no
+            operator repo, no configured identity provider, or a selected
+            provider missing the credential its client-binding check needs —
+            then `details.provider` names it and the message names the env
+            var (`FISHHAWKD_OAUTH_CLIENT_SECRET` with
+            `FISHHAWKD_OAUTH_CLIENT_ID` for github,
+            `FISHHAWKD_GITLAB_DEVICE_CLIENT_ID` for gitlab). Also the
+            auth-boundary `service_unavailable` when the database is
+            unreachable.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/tokens/{token_id}:
     delete:
@@ -15039,12 +15583,24 @@ paths:
         vouch KEEPS the operator commit and attributes it. Use vouch when
         the commit is a legitimate remediation to retain.
 
+        **The `sha` must be a FULL commit id (#4435).** Exactly 40 hex
+        characters (SHA-1) or 64 (SHA-256); anything else — an abbreviated
+        sha included — is refused `400 validation_failed` (`details.field` is
+        `sha`) BEFORE anything is recorded or published. The reason is that
+        rule 5 of `fishhawk_audit_complete` matches the PR head against the
+        recorded vouches by exact full sha and never by prefix, so a recorded
+        abbreviation would answer 200 yet never clear `foreign_commit`. An
+        upper-case full sha is accepted and recorded in canonical LOWERCASE so
+        it exact-matches the forge's head. A vouch recorded before this
+        refusal landed keeps its stored spelling and is still never
+        prefix-matched; re-vouch the full sha.
+
         **Fail-closed is preserved.** The handler records the declaration
-        verbatim — it does NOT verify the SHA exists on the branch or in the
-        compare set. Vouching a wrong/non-existent SHA simply adds an
-        unreachable ledger entry and un-wedges nothing; an UN-vouched foreign
-        commit still fails category-B at the report boundary and still blocks
-        merge resolution.
+        as the canonical full sha — it does NOT verify the SHA exists on the
+        branch or in the compare set. Vouching a well-formed but wrong or
+        non-existent full SHA simply adds an unreachable ledger entry and
+        un-wedges nothing; an UN-vouched foreign commit still fails category-B
+        at the report boundary and still blocks merge resolution.
 
         **Re-posts the `fishhawk_audit_complete` check (E64.14 / #3109),
         BOUND to the run's own live pull-request head (E64.26 / #3129).**
@@ -15054,17 +15610,18 @@ paths:
         determinability ladder `rebase-branch` uses (installation → repo → PR
         number from the run's tracked pull request → live head sha) and stamps
         the check only when the vouched sha equals it (a case-insensitive
-        FULL-string compare, so an ABBREVIATED sha takes the mismatch arm).
+        FULL-string compare; an abbreviated sha never reaches it, being
+        refused above).
         Three arms: MATCH publishes; MISMATCH skips the publish and names BOTH
         shas on `audit_check_republish_warning`; an UNRESOLVABLE head fails
         closed the same way, naming the resolution failure. The check is never
         posted at an unverified sha. Without this bound an operator carrying
         `write:stages` could have this run's recomputed check state stamped
         onto any commit in the repository, including the head of an unrelated
-        pull request. WHAT DID NOT CHANGE: the record stays verbatim for any
-        sha — the `operator_commit_vouched` append and the 200 are identical
-        for a matching and a non-matching sha, and there is no new response
-        field, error code or status code. An
+        pull request. WHAT DID NOT CHANGE: the record is unverified for any
+        well-formed full sha — the `operator_commit_vouched` append and the 200
+        are identical for a matching and a non-matching full sha, and there is
+        no new response field, error code or status code. An
         operator-pushed commit appears in no head-report audit category, so the
         publisher's normal head resolution would re-post against a stale sha and
         leave the check absent from the live merge head — the exact base-advance
@@ -15105,9 +15662,15 @@ paths:
               properties:
                 sha:
                   type: string
+                  pattern: '^([0-9a-fA-F]{40}|[0-9a-fA-F]{64})$'
                   description: |
-                    The commit SHA on the run branch to declare as
-                    run-authored lineage.
+                    The FULL commit SHA on the run branch to declare as
+                    run-authored lineage: 40 hex characters (SHA-1) or 64
+                    (SHA-256). An abbreviated or otherwise non-full sha is
+                    refused `400 validation_failed` (#4435), because
+                    `fishhawk_audit_complete` matches the PR head by full sha
+                    and never by prefix. Upper-case hex is accepted and
+                    recorded lowercase.
                 reason:
                   type: string
                   description: |
@@ -15123,7 +15686,7 @@ paths:
                 type: object
                 properties:
                   run_id: { $ref: '#/components/schemas/UUID' }
-                  vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage.' }
+                  vouched_sha: { type: string, description: 'The commit SHA recorded as run-authored lineage, in canonical lowercase.' }
                   reason: { type: string }
                   audit_check_republished:
                     type: boolean
@@ -15151,7 +15714,10 @@ paths:
                       when the re-post succeeded and when no publisher is wired.
         '400':
           description: |
-            Malformed body or an empty `sha`/`reason`. Body's `error` is
+            Malformed body, an empty `sha`/`reason`, or a `sha` that is not a
+            full 40-hex (SHA-1) or 64-hex (SHA-256) commit id (#4435; an
+            abbreviated sha is refused, with `details.field` `sha` and the
+            bounded `details.got` / `details.got_length`). Body's `error` is
             `validation_failed`.
           content:
             application/json:
@@ -15304,23 +15870,25 @@ paths:
   /v0/runs/{run_id}/merge:
     post:
       operationId: mergeRun
-      summary: Record an operator merge verdict and queue the squash merge (skipped when already merged)
+      summary: Record an operator merge verdict and queue the forge merge with the repository's declared merge method, default squash (skipped when already merged)
       description: |
         The one-verb operator merge path (E48.7 / #1954). Records the
         operator's merge verdict as a chained `merge_verdict_recorded` audit
-        entry (modeled on `vouch-commit`) and queues the squash merge through
+        entry (modeled on `vouch-commit`) and queues the forge merge — with
+        the merge method the run's cached admission spec declares
+        (workflow-v2 `merge_method`; absent = squash, E93.2 / #4658) — through
         the SAME merge seam the delegated `may_merge` arm of the auto-driver
         uses — so the human merge and the delegated merge converge on one path.
         The seam is forge-resolved by the run's `installation_ref` family
         (E45.47 / #3464): a GitHub run enables GitHub auto-merge, a GitLab run
-        queues `merge_when_pipeline_succeeds` (squash) on the merge request.
+        queues `merge_when_pipeline_succeeds` (squash for squash, an explicit squash=false for merge) on the merge request.
         The PR-approval review itself stays a `gh pr review --approve` step
         under the operator's own GitHub identity (App-identity approval is
         deferred to E39).
 
         The endpoint does NOT wait for the merge to land: it only
         ENABLES/queues GitHub's merge (a PR already merge-ready falls back to a
-        synchronous REST squash merge), and the `pr_merged` / run-completion
+        synchronous REST merge with the resolved method), and the `pr_merged` / run-completion
         settle is left to the `pull_request`-closed webhook. The
         `fishhawk_merge_run` MCP tool awaits the terminal run state client-side.
 
@@ -15509,8 +16077,10 @@ paths:
         forge-approval fold judged. On GitHub the auto-merge
         enable carries GraphQL `expectedHeadOid` and the clean-status REST
         fallback carries `sha`. This is a behaviour change: gate-less GitHub
-        runs are pinned too. A forge refusal for a head mismatch releases
-        the claim and answers `409 merge_head_moved`. An empty gate head (an
+        runs are pinned too. A forge refusal for a head mismatch answers
+        `409 merge_head_moved`; it releases the claim on refusal_basis
+        `precheck` / `rest_sha` and leaves it `dispatch_failed` on
+        `graphql_reread` (#4749), needing the operator re-arm. An empty gate head (an
         ungated ADR-090 D7 admit, including every GitLab-family run, or a
         merged-PR admit) keeps the unpinned ladder, and an unpinned forge
         conflict stays `502 merge_dispatch_failed`.
@@ -15600,7 +16170,7 @@ paths:
       responses:
         '200':
           description: |
-            Merge verdict recorded (or already recorded) and the squash merge
+            Merge verdict recorded (or already recorded) and the forge merge
             queued through the merge seam.
           content:
             application/json:
@@ -15681,7 +16251,7 @@ paths:
             failed/cancelled run (`run_not_mergeable`). (2) The acceptance gate
             does not admit a merge (`acceptance_gate_not_passed`). (3) The pull
             request's required checks have NOT all passed, so GitHub reports it
-            in unstable status and refuses to queue the squash merge
+            in unstable status and refuses to queue the merge
             (`merge_checks_pending`, E67.56 / #2717). On `merge_checks_pending`
             the verdict row is recorded and durable and `details` carry
             `{verdict_sequence, pr_url, reason:"checks_pending"}`; an immediate
@@ -15887,21 +16457,27 @@ paths:
             D1), so the forge was not called again; `details` carry
             `{run_id, pr_url, verdict_sequence, claim_state, claim_path,
             claim_head_sha, claimed_at, failure_cause}`; a `dispatch_failed`
-            claim (an uncertain forge outcome) needs the operator re-arm
+            claim (an uncertain forge outcome, a `graphql_reread`
+            head-moved refusal included, #4749) needs the operator re-arm
             before a re-invoke. (15) `merge_head_moved` (#4641, ADR-112
             residual H3): the dispatch was PINNED to the head the
             merge-candidate gate admitted (GitHub auto-merge
             `expectedHeadOid`; clean-status REST fallback `sha`) and the forge
             refused it because the pull request head moved after it. The
             verdict row is recorded and durable, and the dispatch claim, when
-            one was held, is released (a release that does not land is
-            recorded `dispatch_failed` and the message names the re-arm).
+            one was held, is released on refusal_basis `precheck` /
+            `rest_sha` (a release that does not land is recorded
+            `dispatch_failed` and the message names the re-arm) and left
+            `dispatch_failed` on `graphql_reread` or an unrecognised basis
+            (#4749): a re-invoke then answers `merge_already_dispatched` until
+            the operator re-arm.
             `details` carry `{run_id, pr_url, verdict_sequence,
             head_sha, refusal_basis, next_step: "fishhawk_merge_run"}`, where
             `head_sha` is the pinned head. `refusal_basis` `precheck` (the
             client read a different head and sent no mutation) and `rest_sha`
-            (GitHub's documented 409 for a `sha` mismatch) guarantee nothing
-            merged; `graphql_reread` (the auto-merge enable answered a GraphQL
+            (any 409 on the pinned PUT, which GitHub documents as a `sha`
+            mismatch, so the label names the status, not a proven mismatch)
+            are refusals where nothing merged; `graphql_reread` (the auto-merge enable answered a GraphQL
             error and a fresh read showed a different head) and `unknown` are
             INFERRED, so if that enable had in fact applied, auto-merge may be
             armed at the pinned head: inspect the pull request. The message
@@ -15910,7 +16486,27 @@ paths:
             approval gate. Re-invoke once the head settles (and is
             re-approved, on a declared gate): the re-invoke re-runs the
             merge-candidate gate (and, on a declared gate, the forge-approval
-            fold) at the new head.
+            fold) at the new head. (16) `merge_method_refused` (E93.2 /
+            #4658): the run's declared merge method cannot carry this merge.
+            PRE-CLAIM (right after the merge-seam check, before any write):
+            the run's forge family cannot apply the method per merge request
+            (GitLab x `rebase`), or the run's admission spec does not parse
+            (reason `merge_method_undeterminable`); NOTHING is recorded and
+            `details` carry exactly `{run_id, pr_url, merge_method,
+            merge_method_source, merge_method_citation, reason,
+            allowed_merge_methods, next_step: "merge_by_hand"}` (no
+            `verdict_sequence`). POST-DISPATCH: the forge refused the merge
+            and a re-read of the repository's merge settings shows the
+            declared method disallowed (reason `forge_disallows`); the verdict
+            row is durable, the claim settles through the unchanged
+            classifier (a REST 405/422 releases it; a GraphQL validation
+            envelope leaves it `dispatch_failed` and the message names the
+            operator re-arm), and `details` carry the same keys plus
+            `verdict_sequence` with `next_step:
+            "allow_merge_method_or_merge_by_hand"`. Every value is a closed-set
+            name; no forge response text is carried. The declaration is fixed
+            by the run's admission spec: an edit applies to runs admitted
+            after it merges.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -15945,7 +16541,7 @@ paths:
             true}` where `reason` is `forge_read` or `audit_read`; the raw
             cause stays in the operator log.
 
-            `merge_dispatch_failed`: the verdict row is recorded and durable, but queuing the squash
+            `merge_dispatch_failed`: the verdict row is recorded and durable, but queuing the forge
             merge failed for a reason OTHER than the checks-pending precondition
             above (`merge_dispatch_failed`); the merge is retryable — a re-POST
             re-queues without duplicating the verdict. A checks-not-all-passed
@@ -17317,6 +17913,25 @@ paths:
         re-dispatch. Advisory reviewers then run detached; a recorded verdict
         clears the review-coverage hold.
 
+        **`reviewed_head` on `implement_review_started` (ADR-117 A1.7,
+        #4694).** Beside `round_origin` and `head_sha`, every implement-review
+        round — trace (first and slice), consolidated, fix-up / delta
+        re-review, boot re-dispatch and this operator re-run — records an
+        additive `reviewed_head` object naming what the round actually judged:
+        `status` (`recorded` | `head_unknown` with `unknown_reason`), `kind`
+        (`wip_tree` | `pushed_commit` | `compare_head`), `origin`, `sha`,
+        `tree_sha`, `change_id`, `base_sha`, `diff_mode` (`full` | `delta`),
+        `patch_rendered`, `truncated`, `inventory_best_effort`,
+        `changed_file_count`, and three pairwise-disjoint plain-path sets
+        `files` / `partial_files` / `omitted_files` whose union is the
+        reviewed diff's changed files (partial and omitted files count as NOT
+        seen). A re-run round writes its OWN row with its own
+        `reviewed_head`. `head_sha` keeps its #797 dedup-key meaning; the
+        review prompt does not change; a row written before #4694 has no
+        `reviewed_head` and reads as head unknown. A `later_reviewer` escape
+        (`POST /v0/runs/{run_id}/escapes`) copies its concern round's
+        `reviewed_head`.
+
         **First consolidated round (#4282).** A DECOMPOSED PARENT
         (`decomposed_from` null, at least one decomposed child) with NO
         `implement_review_started` — its consolidated dispatch never started
@@ -17332,12 +17947,15 @@ paths:
         `consolidated_review_not_due` (the consolidated PR is not open yet,
         or the parent has no implement stage — the orchestrator dispatches
         the round when the PR opens); `implement_stage_terminal` /
-        `advanced_past_review`; `forge_compare_unavailable`. An eligible
+        `advanced_past_review`; `forge_compare_unavailable`;
+        `default_branch_unresolved` (the forge default-branch read that
+        supplies the compare base failed; `details.default_branch_unresolved_reason`
+        names why, #4660). An eligible
         parent gets `review_round_rerun_requested` with
         `rerun_of_sequence: 0` and `first_round: true` (no `head_sha`), then
         the same round body the orchestrator's consolidated dispatch runs —
-        permission-drift check, forge compare of the default ref (`main`
-        unless configured) against the consolidated branch, the ADR-090 D5
+        permission-drift check, forge compare of the repository's resolved
+        forge default branch (#4660) against the consolidated branch, the ADR-090 D5
         fan-in verify hold, the truncation signal, the reviewers — runs
         SYNCHRONOUSLY. The new round carries `round_origin: consolidated`
         and NO `rerun_of`; it carries no re-run marker, so a concurrent
@@ -17432,7 +18050,9 @@ paths:
             `review_rerun_ineligible` carries `details.reason`
             `reviewer_unwired`, `no_agent_reviewers`, `gating_authority`,
             `consolidated_review_not_due`, `implement_stage_terminal`,
-            `advanced_past_review` or `forge_compare_unavailable`, plus
+            `advanced_past_review`, `forge_compare_unavailable` or
+            `default_branch_unresolved` (with
+            `details.default_branch_unresolved_reason`, #4660), plus
             `stage_id` once the parent implement stage resolved. Nothing was
             written.
           content:
@@ -17826,6 +18446,20 @@ paths:
         advance that fails the run. The refusal fires BEFORE the state CAS,
         so the stage keeps its state.
 
+        **Failed stage ahead (#4426).** A `pending` or
+        `awaiting_host_dispatch` stage sequenced after a stage that `failed`
+        returns 409 `dispatch_not_admissible` with `details.reason`
+        `earlier_stage_failed` (plus `details.failed_stage_id`,
+        `details.failed_stage_type` and `details.failure_category`), the same
+        rule the orchestrator applies when it walks a run: it never dispatches
+        past a failed stage. A category-C infrastructure failure of an
+        acceptance (#4356) or first-execution implement (#4426) stage parks the
+        run `running` instead of failing it, so the terminal-run refusal does
+        not cover the stages after it; retry or cancel the failed stage first.
+        A failed `deploy` ahead answers `deploy_not_succeeded` instead. The
+        refusal fires BEFORE the state CAS, so the stage keeps its state, and
+        the idempotent already-`dispatched` arm is not checked.
+
         **Decomposed-parent acceptance (#4080).** An `acceptance` stage of a
         run that has decomposed children is refused 409
         `acceptance_integration_incomplete` — on every state arm, the
@@ -18000,7 +18634,13 @@ paths:
               `details.deploy_stage_id` and `details.deploy_state`. It fires
               BEFORE the state CAS, so the stage keeps its state; retry once
               the deploy succeeded (a failed or cancelled deploy never clears
-              it).
+              it). Also the failed-stage-ahead refusal (#4426): a `pending` or
+              `awaiting_host_dispatch` stage sequenced after a `failed` stage
+              (a parked category-C acceptance or implement failure keeps the
+              run `running`) is refused with `details.reason`
+              `earlier_stage_failed`, `details.failed_stage_id`,
+              `details.failed_stage_type` and `details.failure_category`,
+              BEFORE the state CAS; retry or cancel the failed stage first.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not
@@ -18250,10 +18890,12 @@ paths:
         export stay complete. This is not access control: any caller holding
         `read:audit` may request the category explicitly.
 
-        **Run-bound withhold (E83.60 / #4118).** For a run-bound
-        `mcp:run:<uuid>` caller, entries of category `plan_scope_overlap`
-        (which name OTHER runs) are omitted from every non-chain read, a read
-        that names the category included, BEFORE pagination; such a caller's
+        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #4694).** For
+        a run-bound `mcp:run:<uuid>` caller, entries of category
+        `plan_scope_overlap` and `merge_overlap_overridden` (which name OTHER
+        runs) and `escape_recorded` (ADR-117 A1.6: the escape record the run's
+        reviews are measured against) are omitted from every non-chain read,
+        a read that names the category included, BEFORE pagination; such a caller's
         `chain=true` read is refused `403 run_token_forbidden`. Operators are
         unchanged.
       tags: [audit]
@@ -18420,6 +19062,53 @@ paths:
           description: '`internal_error` — the run read or the live-run listing failed.'
         '503':
           description: '`run_repo_unconfigured` — the run repository is not configured.'
+
+  /v0/runs/{run_id}/campaign-pending-amendments:
+    get:
+      operationId: getRunCampaignPendingAmendments
+      summary: Pending scope amendments on every run of this run's campaign
+      description: |
+        E86.85 / #4486. Every PENDING mid-stage scope amendment on any run of
+        the campaign this run belongs to, so a driver blocked waiting on one
+        run sees an amendment filed by a different run of the same campaign.
+        The campaign is resolved through the run's ancestry (the run itself,
+        a decomposition slice, or a recovery child of a campaign item's run).
+        The run set is every campaign item's linked run, whatever the item
+        state, plus its `parent_run_id` / `decomposed_from` descendants,
+        bounded at 64 runs (`truncated: true` when the cap stopped the
+        enumeration). Items are ordered oldest `requested_at` first.
+        `decision_live` is true while the filing stage has not settled, so an
+        agent may still be waiting on the decision; a settled stage's
+        still-pending row is listed with `decision_live: false`. Read-only.
+
+        A run in no campaign (or whose ancestry cannot be resolved) answers
+        200 with `campaign_id: null` and `items: []`. Any read failure is a
+        500; there is no partial result.
+
+        Auth: the payload names other runs' amendment paths and reasons, so a
+        run-bound `mcp:run:<uuid>` token is refused `403 run_token_forbidden`
+        even for its own run. Every other token caller must hold `read:audit`;
+        a cookie-session operator passes.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      responses:
+        '200':
+          description: The campaign's pending amendments.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/RunCampaignPendingAmendments' }
+        '400':
+          description: '`validation_failed` — `run_id` not a UUID.'
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` — a run-bound `mcp:run:<uuid>` token (own run included); or `insufficient_scope` — a token missing the `read:audit` scope.'
+        '404':
+          description: '`run_not_found` — no run with that id.'
+        '500':
+          description: '`internal_error` — the run read, the campaign-membership walk, the campaign item listing, a descendant run listing, an amendment listing or a stage read failed.'
+        '503':
+          description: '`run_repo_unconfigured`, `campaign_repo_unconfigured` or `scope_amendment_unconfigured` — the run, campaign or scope-amendment repository is not configured.'
 
   /v0/runs/{run_id}/budget:
     get:
@@ -18786,10 +19475,12 @@ paths:
         recent-activity read) still returns up to N visible entries. This is
         not access control.
 
-        **Run-bound withhold (E83.60 / #4118).** For a run-bound
-        `mcp:run:<uuid>` caller, entries of category `plan_scope_overlap`
-        (which name OTHER runs) are omitted even when the request names the
-        category, BEFORE pagination. This one IS access control by subject;
+        **Run-bound withhold (E83.60 / #4118, E83.61 / #4119, #4694).** For
+        a run-bound `mcp:run:<uuid>` caller, entries of category
+        `plan_scope_overlap` and `merge_overlap_overridden` (which name OTHER
+        runs) and `escape_recorded` (ADR-117 A1.6) are omitted even when the
+        request names the category, BEFORE pagination. This one IS access
+        control by subject;
         operators are unchanged.
       tags: [audit]
       parameters:
@@ -21654,6 +22345,20 @@ paths:
                     run in the batch. Omit it for no binding (the unchanged
                     default).
                   example: /Users/op/checkouts/fishhawk
+                runner_kind:
+                  type: string
+                  enum: [github_actions, local, gitlab_ci]
+                  description: >-
+                    OPTIONAL campaign-level runner kind (#4485): recorded ONCE
+                    here and inherited by every item run minted from this
+                    campaign when `POST /v0/campaigns/{campaign_id}/runs` passes
+                    no per-item `runner_kind`. Bind `local` together with
+                    `working_dir` for a local campaign. An unknown value is
+                    refused 400 `validation_failed` (`details.field` =
+                    `runner_kind`) BEFORE any forge round-trip. Omit it to
+                    record none: item runs then take `local` when the campaign
+                    binds `working_dir`, else `github_actions`.
+                  example: local
                 provider:
                   type: string
                   description: |
@@ -21711,7 +22416,8 @@ paths:
             `grooming_source.limit` negative, `pause_policy` not a recognized
             value, `operator_agent` not a valid operator-agent block (malformed
             or an unknown knob), `working_dir` non-empty but not absolute
-            (E48.87 / #2527), `provider` non-empty but naming an id this
+            (E48.87 / #2527), `runner_kind` non-empty but not a known runner
+            kind (#4485 — `details.field` = `runner_kind`), `provider` non-empty but naming an id this
             deployment has not registered (#3645 — `details.field` =
             `provider`, `details.got` the offending value,
             `details.registered` the exact accepted set), body malformed /
@@ -22386,10 +23092,13 @@ paths:
             absolute, or the campaign's own `working_dir` binding is not
             absolute and so cannot be inherited (E48.87 / #2527 — the inherited
             value is re-validated through the same gate an explicit one passes,
-            so a binding written straight to the campaign row cannot bypass it);
-            `working_dir_required` — a `runner_kind: local` item whose campaign
-            carries NO `working_dir` binding and whose body passed none, so the
-            run has no checkout to execute in. Bind `working_dir` once at
+            so a binding written straight to the campaign row cannot bypass it),
+            or the campaign's recorded `runner_kind` is not a known runner kind
+            and so cannot be inherited (#4485 — `details.field` =
+            `runner_kind`); `working_dir_required` — an item whose RESOLVED
+            `runner_kind` is `local` (passed in the body, or recorded on the
+            campaign, #4485) whose campaign carries NO `working_dir` binding and
+            whose body passed none, so the run has no checkout to execute in. Bind `working_dir` once at
             campaign create (every item run inherits it) or pass it for this
             item. Nothing is written on either refusal.
         '401': { $ref: '#/components/responses/Unauthorized' }
@@ -24424,8 +25133,16 @@ paths:
                       (`pull_request_opened` / `child_pushed` /
                       `fixup_pushed`), the same audit source the ADR-035
                       branch-lineage verifier treats as the run's legitimate
-                      tips. Present only when `fixup` is true and resolution
-                      succeeded. Before invoking the agent the runner fetches
+                      tips — advanced through the clean Fishhawk-recorded base
+                      merges (`branch_rebased`: a merge Fishhawk performed
+                      whose new head is the merge commit and whose parents
+                      were verified as [prior head, base tip]) recorded after
+                      it, so a fix-up after `fishhawk_rebase_run_branch`
+                      expects the merge commit (E89.6 / #4574). A concurrent
+                      push, an unverified advance or a reset off that chain
+                      leaves the recorded head. Present only when `fixup` is
+                      true and resolution succeeded. Before invoking the agent
+                      the runner fetches
                       + checks out `fixup_branch` and fails fast when the
                       fetched tip differs from this value (#967). Absent
                       (older backend, or backend-side resolution failure)
@@ -25081,7 +25798,7 @@ paths:
                     description: Existing PR branch a fix-up pass commits onto; present only when `fixup` is true. Matches the runner's branch formula — non-decomposed `fishhawk/run-<shortID(run_id)>/stage-<shortID(stage_id)>`, decomposed `fishhawk/run-<shortID(decomposed_from_run_id)>` (#784).
                   fixup_expected_head_sha:
                     type: string
-                    description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
+                    description: The run's recorded head SHA — the newest `head_sha` across the run's reported-head ledger entries (`pull_request_opened` / `child_pushed` / `fixup_pushed`), the ADR-035 lineage source — advanced through the clean Fishhawk-recorded base merges (`branch_rebased` rows recording a performed merge whose new head is the merge commit and whose parents were verified as [prior head, base tip]) recorded after it, so a fix-up after `fishhawk_rebase_run_branch` expects the merge commit (E89.6 / #4574); a concurrent push, an unverified advance or a reset off that chain leaves the recorded head. Present only when `fixup` is true and resolution succeeded; the runner verifies the fetched `fixup_branch` tip against it before invoking the agent (#967).
                   fixup_policy_increment:
                     type: boolean
                     description: True ONLY on a decomposed PARENT's fix-up (#4391) — the parent analogue of #765's per-child increment base. The runner measures both `git_diff` emitters against the fetched consolidated tip (no-fetch merge-base, falling back to the cumulative diff on failure), so the in-band constraint check and the backend's `reEvaluatePolicy` see only the fix-up's own increment. Absent on an ordinary run's fix-up, a decomposed child's fix-up, a non-fix-up dispatch and a verify-only merge-candidate pass.
@@ -26053,7 +26770,15 @@ paths:
               `channel: delegated`) and NEVER counts toward the quorum.
               Every `approval_submitted` audit row on such a gate carries
               a `predicate_snapshot` (the evaluation inputs + outcome);
-              gates with no `approvals` block omit it.
+              gates with no `approvals` block omit it. On a gate whose
+              `approvals.members` credential leg evaluated the submission
+              (#4633, ADR-123), the snapshot also carries
+              `members_credential`: the credential kind the members leg
+              evaluated (`session`, `oauth`, `oauth_as`, `static`,
+              `unrecorded`, `mcp_run` or `unknown`). It is a separate
+              field from the row's `auth_method` (ADR-055), which records
+              an api token's minting path and is absent for a session or
+              an authorization-server token.
             - **Duplicate submission** — the same authenticated subject
               already submitted a decision for this stage. The prior
               decision stands, the stage state is unchanged, NO gates
@@ -26175,8 +26900,8 @@ paths:
               `approvals.members` list is non-empty and the approval's
               principal is not on it (an exact-match allow-list; plain
               members are qualified with the run's forge, the principal
-              never is, so a static-token or agent subject matches
-              nothing). This members check runs FIRST, before any forge
+              never is, so a non-forge subject such as an agent subject is
+              never listed). This members check runs FIRST, before any forge
               call, and applies to delegated and agent-kind submissions
               too: a delegated submission is members-checked against its
               `on_behalf_of` (the real operator, or the seated captain for
@@ -26186,6 +26911,25 @@ paths:
               list), `members_principal`, `subject`, `escalated` and
               `result`. No approval row is recorded; an
               `approval_predicate_rejected` audit entry is.
+              #4633 (ADR-123, #4750, RATIFIED 2026-10-27): the SAME
+              code also fires when the principal IS listed and is the
+              presenting credential's own subject (a direct or a delegated
+              human-kind submission), but the credential that authenticated
+              the request is not forge-verified. The forge-verified kinds
+              are `session` (a browser session from the forge sign-in),
+              `oauth` (a device-flow token) and `oauth_as` (an OAuth
+              authorization-server token); a static API token (`fishhawkd
+              token issue`, or a child token minted through `POST
+              /v0/tokens`), a token with no recorded auth method, any other
+              auth method, and an identity with no credential marker are
+              refused even when the subject is listed. `details` then also
+              carries `reason` (`credential_not_forge_verified`),
+              `credential_kind` (`static`, `unrecorded`, `mcp_run` or
+              `unknown`) and `forge_verified_kinds`; no approval row is
+              recorded, and the `approval_predicate_rejected` audit entry's
+              `predicate_snapshot` records `members_credential`. A
+              delegated agent-kind submission (principal = the seated
+              captain) is not credential-evaluated.
             - `self_decision` — E54.53 / #3041: a run-bound `mcp:run:`
               agent token targeting an ADMITTED human-executor review gate,
               even for its OWN run. Such a gate declares `executor: human`
@@ -27739,6 +28483,109 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
 
+  /v0/runs/{run_id}/merge-queue/withdraw:
+    post:
+      operationId: withdrawMergeQueueIntent
+      summary: Withdraw the merge intent of a yielded merge-queue entry
+      description: |
+        The ADR-112 R3 withdraw-intent verb (E87.17 / #4685). A run whose
+        merge-queue entry has YIELDED (`yield_reason` on the queue read) still
+        carries the operator's merge intent, so the queue owns its merge and
+        an inline merge is refused. This verb takes the merge out of the
+        queue: it settles the run's yielded held entry `dropped` with the
+        store-owned reason `intent_withdrawn`. The entry is terminal, so every
+        intent lookup treats the intent as absent, and a later
+        `POST /v0/runs/{run_id}/merge` runs the inline path with every one of
+        its own gates (the forge-approval fold, the merge-candidate gate, the
+        dispatch claim). `merge_intent_at` is never cleared: a merge the
+        merge-candidate gate routes back to the queue records intent on a
+        FRESH entry. Nothing is merged and no pump is triggered.
+
+        **Eligibility.** Only a YIELDED entry. A held entry that has not
+        yielded is progressing to the queue's own head-pinned merge (ADR-109:
+        the queue owns the merge) and is refused; cancelling the run stops it.
+        A live entry is never withdrawn mid-pass. Any merge-dispatch claim on
+        the run, `dispatched` or `dispatch_failed`, refuses the withdrawal:
+        the verb never writes the ledger, so a `dispatch_failed` claim still
+        needs reconciliation or the operator re-arm.
+
+        **Refusals, each decided before anything is written.**
+        `401 authentication_required`; `403 run_token_forbidden` (a run-bound
+        agent token, even for its own run); `403 insufficient_scope` (no
+        `write:runs`); `403 account_forbidden` (the run belongs to another
+        workspace account); `400 validation_failed` (a non-UUID `run_id`, or a
+        body that is not exactly one `{"reason": string}` object, or a reason
+        empty after trimming or over 1000 bytes); `503
+        merge_queue_unconfigured` (no merge queue, a store without the
+        capability, or no run repository; decided after the auth rungs); `503
+        merge_lock_unavailable` (the run's merge-intent lock could not be
+        taken within the bounded wait). Then, inside the store's transaction,
+        under the run's merge-intent lock: `404 run_not_found`; `409
+        merge_queue_not_queued` (no active entry: never queued, settled, or
+        already withdrawn); `409 merge_queue_entry_live`; `409
+        merge_queue_no_intent` (the entry carries no merge intent); `409
+        merge_queue_entry_not_yielded`; `409 merge_dispatch_claimed`
+        (`details.claim_state`, `claim_path`, `claim_head_sha` when readable,
+        and `next_step`: `operator_rearm` for `dispatch_failed`, else
+        `fishhawk_get_merge_queue`); `500 merge_queue_withdraw_failed` (rolled
+        back, nothing changed).
+
+        **Audit.** A withdrawal appends a chained `merge_queue_intent_withdrawn`
+        row `{entry_id, run_id, repo, base_ref, anchored_head_sha,
+        merge_intent_at, intent_sequence, yield_reason, yielded_at, reason,
+        actor}` INSIDE the withdrawal transaction, so a failed append rolls
+        the withdrawal back. The payload carries only this run's ids and no
+        `yield_detail` (untrusted forge text).
+
+        **Authorization.** An authenticated identity with `write:runs` in the
+        run's workspace account. A delegated operator-agent token is admitted:
+        the verb only exits the queue, and the inline merge keeps every gate.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/WithdrawMergeQueueIntentRequest' }
+      responses:
+        '200':
+          description: The yielded entry was settled `dropped` `intent_withdrawn` and the row appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/MergeQueueWithdrawResponse' }
+        '400':
+          description: '`validation_failed` — a non-UUID `run_id`, a body that is not exactly `{"reason": string}`, or a reason empty after trimming or over 1000 bytes (`details.field`).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: '`run_token_forbidden` (a run-bound agent token), `insufficient_scope` (no `write:runs`), or `account_forbidden` (the run belongs to another workspace account).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found` — no run with that id.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: '`merge_queue_not_queued`, `merge_queue_entry_live`, `merge_queue_no_intent`, `merge_queue_entry_not_yielded` or `merge_dispatch_claimed` (see the refusal ladder above; `details.run_id` names the run). Nothing was written.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`merge_queue_withdraw_failed` — the withdrawal (or its audit append) failed and was rolled back; the entry and its intent are unchanged.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`merge_queue_unconfigured` (no merge queue, a store without the capability, or no run repository) or `merge_lock_unavailable` (the merge-intent lock was not taken; nothing written, retryable).'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
   /v0/stages/{stage_id}/concurrency/promote:
     post:
       operationId: promoteQueuedStage
@@ -27869,6 +28716,22 @@ paths:
         (`concern_waive_conflict`), keeping the chain truthful in every
         interleaving.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** A waive
+        REQUIRES a human `judgement` (or a recognised `reason` prefix
+        that supplies one; see the property). It is validated after
+        the scope check and `reason`, and BEFORE the concern read, the
+        `cross_run_waive` / `concern_requires_human` 403s, the
+        delegation check and the intent entry, so a refusal appends and
+        mutates nothing. The `concern_waived` payload gains `judgement`, plus
+        `tradeoff_cost` ONLY when set (the key is absent otherwise). The
+        transition records, in the same from-state-guarded update:
+        `outcome` `waived`, the `judgement`, `tradeoff_cost`,
+        `judgement_actor_kind` (the `user` | `agent` kind on the audit
+        row), `judgement_delegated` (true on the `delegated: true` path),
+        `judgement_bulk` false and `judgement_backfill` false; a
+        re-judgement overwrites. Read them back through the gate view
+        (`GateViewConcern`). A judgement never enters a reviewer prompt.
+
         Effects of a successful waive: the concern stops appearing in
         `GET /v0/runs/{run_id}`'s open-states-only `concerns` block, can
         no longer be selected by the fix-up endpoint's `concern_ids`,
@@ -27901,6 +28764,35 @@ paths:
                     `state_reason`, and shown verbatim to later
                     re-reviews as the waive context — make it
                     self-contained.
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    The HUMAN judgement the waive records (ADR-117 D1 phase 2,
+                    E94.7 / #4840). REQUIRED unless `reason` opens with a
+                    recognised prefix; `unlabelled` (the read of an unjudged
+                    concern) and any value outside the enum are refused 400.
+                    Interim reason prefixes (FO ruling D1), matched exactly and
+                    lowercase after leading whitespace: `false_positive:` ->
+                    `no_defect`, `accepted_tradeoff:` -> `tradeoff`,
+                    `preference:` -> `preference`. (a) A judgement with a
+                    MATCHING prefix is accepted; (b) a judgement with no prefix
+                    is accepted; (c) a prefix alone supplies the judgement;
+                    (d) a judgement that CONTRADICTS the prefix is refused 400
+                    `judgement_conflicts_reason_prefix`. Recorded on the
+                    concern row and on the `concern_waived` payload.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, including a prefix-derived
+                    one (no cost is inferred from the reason), and refused
+                    with any other judgement (`tradeoff_cost_without_tradeoff`,
+                    so a stray cost is never silently dropped). Recorded on the
+                    concern row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
                 delegated:
                   type: boolean
                   default: false
@@ -27926,8 +28818,19 @@ paths:
               schema: { $ref: '#/components/schemas/WaivedConcern' }
         '400':
           description: |
-            Malformed body, missing/empty `reason`, or a non-UUID
-            `concern_id`. Body's `error` is `validation_failed`.
+            Malformed body, missing/empty `reason`, a non-UUID
+            `concern_id`, or a refused judgement (E94.7 / #4840):
+            `details` carry `field` (`judgement` or `tradeoff_cost`), `rule`
+            and `allowed` (the seven human judgements), with `rule` one of
+            `judgement_required` (no judgement and no recognised reason
+            prefix), `judgement_unknown`, `judgement_unlabelled`,
+            `judgement_conflicts_reason_prefix` (rule (d): the message names
+            both the judgement and the prefix, and `details.reason_prefix`
+            carries the prefix), `tradeoff_cost_required`,
+            `tradeoff_cost_without_tradeoff` or
+            `tradeoff_cost_too_long` (a cost over 4000 bytes, never
+            truncated; `details` carry `bytes` and `max`). Body's `error` is
+            `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28086,6 +28989,18 @@ paths:
         for that concern; a transition failure after the append appends the
         corrective `concern_waive_failed` entry.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** ONE `judgement`
+        (and `tradeoff_cost`) covers the batch, under the same rules and
+        reason-prefix rules (a)-(d) as the single waive; it is validated before
+        any concern read, so a refusal refuses the WHOLE batch with nothing
+        appended. Every `concern_waived` row carries `judgement`, plus
+        `tradeoff_cost` only when set. Each concern records `outcome`
+        `waived` and the judgement fields as the single waive does, with
+        `judgement_bulk` COUNT-based (FO ruling D2): true if and only if the
+        batch names more than one concern. A one-id batch records
+        `judgement_bulk` false while its `concern_waived` row still carries
+        `bulk_waive: true` (the verb record), so both facts survive.
+
         Auth mirrors the single waive: `write:stages` OR `write:fixups`; an mcp
         run-bound token (subject `mcp:run:<uuid>`) may only bulk-waive its own
         run, compared against the PATH run id (403 `cross_run_waive`).
@@ -28118,6 +29033,35 @@ paths:
                     `concern_waived` entry in the batch and stored as each
                     concern's `state_reason`. One reason covers the batch — make
                     it self-contained, since later re-reviews read it verbatim.
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    The HUMAN judgement the batch records (ADR-117 D1 phase 2,
+                    E94.7 / #4840). REQUIRED unless `reason` opens with a
+                    recognised prefix; `unlabelled` (the read of an unjudged
+                    concern) and any value outside the enum are refused 400.
+                    Interim reason prefixes (FO ruling D1), matched exactly and
+                    lowercase after leading whitespace: `false_positive:` ->
+                    `no_defect`, `accepted_tradeoff:` -> `tradeoff`,
+                    `preference:` -> `preference`. (a) A judgement with a
+                    MATCHING prefix is accepted; (b) a judgement with no prefix
+                    is accepted; (c) a prefix alone supplies the judgement;
+                    (d) a judgement that CONTRADICTS the prefix is refused 400
+                    `judgement_conflicts_reason_prefix`. Recorded on the
+                    concern row and on every `concern_waived` row in the batch.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, including a prefix-derived
+                    one (no cost is inferred from the reason), and refused
+                    with any other judgement (`tradeoff_cost_without_tradeoff`,
+                    so a stray cost is never silently dropped). Recorded on the
+                    concern row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
                 delegated:
                   type: boolean
                   default: false
@@ -28174,8 +29118,14 @@ paths:
             raw spelling sent), `canonical_concern_id` and `first_spelling`; or
             an id belonging to ANOTHER run — the last carrying
             `details.rule` `concern_run_mismatch` alongside `concern_id`,
-            `concern_run_id` and `path_run_id`. Every one refuses the whole batch
-            with NOTHING waived.
+            `concern_run_id` and `path_run_id`; or a refused judgement
+            (E94.7 / #4840): `details` carry `field` (`judgement` or
+            `tradeoff_cost`), `rule` and `allowed` (the seven human
+            judgements), with `rule` one of `judgement_required`,
+            `judgement_unknown`, `judgement_unlabelled`,
+            `judgement_conflicts_reason_prefix` (with `details.reason_prefix`),
+            `tradeoff_cost_required`, `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long` (a cost over 4000 bytes, never truncated; `details` carry `bytes` and `max`).
+            Every one refuses the whole batch with NOTHING waived.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28258,6 +29208,16 @@ paths:
         status comment, whose activity section renders
         `Concern <id8> resolved with operator evidence: <evidence>`.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** The batch REQUIRES
+        ONE `judgement` (no reason prefix applies), validated after `evidence`
+        and before any concern read, so a refusal refuses the whole batch with
+        nothing appended. Every `concern_resolved_with_evidence` entry carries
+        `judgement`, plus `tradeoff_cost` only when set. Each concern records
+        `outcome` `fixed`, the `judgement`, `tradeoff_cost`,
+        `judgement_actor_kind`, `judgement_delegated` false, `judgement_bulk`
+        (COUNT-based, FO ruling D2: true if and only if the batch names more
+        than one concern) and `judgement_backfill` false.
+
         Auth: authenticated; `write:stages` OR `write:fixups`; the run's
         account (403 `account_forbidden` for another workspace's bearer); and
         HUMAN-ONLY — ANY agent subject (an `operator-agent/…` token or a
@@ -28273,7 +29233,7 @@ paths:
           application/json:
             schema:
               type: object
-              required: [concern_ids, evidence]
+              required: [concern_ids, evidence, judgement]
               properties:
                 concern_ids:
                   type: array
@@ -28294,6 +29254,27 @@ paths:
                     on every `concern_resolved_with_evidence` entry and stored
                     as each concern's `state_reason` behind the
                     `operator evidence: ` prefix.
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    REQUIRED HUMAN judgement the resolve records (ADR-117 D1
+                    phase 2, E94.7 / #4840). `unlabelled` (the read of an
+                    unjudged concern) and any value outside the enum are
+                    refused 400. No reason prefix applies here — the prefixes
+                    are a waive-reason convention. Recorded on the concern row
+                    and on every `concern_resolved_with_evidence` entry.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, and refused with any other
+                    judgement (`tradeoff_cost_without_tradeoff`, so a stray
+                    cost is never silently dropped). Recorded on the concern
+                    row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
       responses:
         '200':
           description: |
@@ -28335,9 +29316,14 @@ paths:
             over 4000 bytes (`details` carries `bytes` and `max`); an empty
             `concern_ids`; more than 50 ids; a non-UUID id; a duplicate id
             compared on the PARSED uuid (`details` carries `concern_id`,
-            `canonical_concern_id` and `first_spelling`); or an id belonging to
-            ANOTHER run (`details.rule` `concern_run_mismatch`). Every one
-            refuses the whole batch with nothing resolved.
+            `canonical_concern_id` and `first_spelling`); an id belonging to
+            ANOTHER run (`details.rule` `concern_run_mismatch`); or a refused
+            judgement (E94.7 / #4840): `details` carry `field` (`judgement`
+            or `tradeoff_cost`), `rule` and `allowed` (the seven human
+            judgements), with `rule` one of `judgement_required`,
+            `judgement_unknown`, `judgement_unlabelled`,
+            `tradeoff_cost_required`, `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long` (a cost over 4000 bytes, never truncated; `details` carry `bytes` and `max`).
+            Every one refuses the whole batch with nothing resolved.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28381,6 +29367,152 @@ paths:
           description: |
             `concern_store_unconfigured`: the concern or audit repository is
             not wired.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+  /v0/runs/{run_id}/escapes:
+    post:
+      operationId: recordEscape
+      summary: Record an escaped defect, or close a pending one with a human attestation
+      description: |
+        E94.3 / #4694; ADR-117 D3 + Amendment A1 (RATIFIED, with A1.2 as
+        amended by erratum E1). An **escape** is a defect that got past the
+        live reviews. It is stored as append-only `escape_recorded` audit rows
+        on THIS run's chain, one row per state change: a **birth** and at
+        most ONE **closure** successor. A body carrying `supersedes_sequence`
+        is a CLOSE; any other body is a RECORD. Both decode strictly (an
+        unknown key is `400 validation_failed` naming it in `details.field`).
+
+        **Birth rule (A1.2 / A1.4), arms in order.** A `later_reviewer`
+        source is born `pending_judgement` (`pending_reason:
+        review_finding_source`); an agent-recorded escape (an agent-kind
+        subject, or `delegated: true`) is `pending_judgement`
+        (`agent_recorded`); a recorder whose credential is not forge-verified
+        (`session` | `oauth` | `oauth_as`; a static api token is not) is
+        `pending_judgement` (`credential_not_forge_verified`); otherwise the
+        birth is `counted` with `judgement_basis: not_required`.
+
+        **Keys.** A `later_reviewer` birth dedupes on
+        `concern:<concern_uuid>` (#4690 ADR-117 A1.2 as amended by erratum E1
+        (re-transcription PR #4784)) and carries the `reviewed_head` of the
+        review round that raised the concern, resolved over the concern's run
+        chain and copied JSON-equal (absent when that round recorded none; on
+        a `category=security` escape only the scalar identity fields `status`,
+        `kind`, `sha`, `tree_sha`, `change_id`, `origin` are kept). Every other
+        source dedupes on `idempotency_key:<key>`; a security escape on those
+        sources needs a canonical lowercase UUID key. Dedupe is per run chain.
+
+        **Security (A1.5).** `category=security` is for ANY vulnerability. A
+        security escape carries ONLY `source`, `severity`, `category`,
+        `security {class, advisory_id}`, `subject`, its source reference and
+        (for `later_reviewer`) the projected `reviewed_head`. `description`,
+        `files` and `introducing_commits` are refused 422, and so is a closure
+        `attestation.note`. There is no `security_finding_id` field (ADR-126
+        D7 deferred to E96 / #4774).
+
+        **Closure (A1.2 / A1.3).** Attestation is HUMAN-ONLY and needs a
+        forge-verified credential: an agent subject or `delegated: true` is
+        `403 escape_attestation_requires_human`; any other non-forge-verified
+        credential is `403 escape_attestation_requires_forge_credential`.
+        Under the run-row lock, in one transaction: a prior successor of the
+        same target is `409 escape_already_closed`; an absent target is `422
+        escape_target_not_found`; a target that is not `pending_judgement` is
+        `422 escape_target_not_pending`. The successor copies the target's
+        `escape` object JSON-equal; `defect` closes `counted`, `no_defect`
+        closes `dismissed`, `judgement_basis: operator_attestation`.
+
+        **Reader contract.** A birth with no successor is in its birth state;
+        a birth with a successor takes the single closure row's `state`.
+
+        **Visibility.** `escape_recorded` is INTERNAL (no issue-comment
+        activity line) and is withheld from run-bound tokens on `GET
+        /v0/runs/{run_id}/audit` and `GET /v0/audit`, including a
+        category-named read.
+
+        Auth: authenticated (`401 authentication_required` precedes the
+        account check); the run's account; any run-bound `mcp:run:` subject
+        is refused `403 run_token_forbidden`; then `write:runs`. Run state never gates a
+        record or a close. Every refusal appends nothing.
+      tags: [runs]
+      parameters:
+        - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: '#/components/schemas/EscapeRecordRequest'
+                - $ref: '#/components/schemas/EscapeCloseRequest'
+      responses:
+        '201':
+          description: The birth or closure row was appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/EscapeRecordResponse' }
+        '400':
+          description: |
+            `validation_failed` (`details.field`): a non-UUID `run_id`; an
+            empty, oversized or trailing-content body; an unknown key
+            (including `security_finding_id`); or any field rule — an unknown
+            `source` / `severity` / `category`; a missing `description` or
+            `files` on a non-security escape; a bad repo path, `head_sha` or
+            `introducing_commits` entry; `concern_id` missing on
+            `later_reviewer` or present elsewhere; `idempotency_key` present
+            on `later_reviewer`, missing or malformed elsewhere, or not a
+            canonical UUID on a security escape; `security_class` /
+            `advisory_id` missing or invalid on a security escape or present
+            on another category; a non-positive `supersedes_sequence`; a
+            missing `attestation` or bad `attestation.judgement`; an
+            over-long `attestation.note`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401': { $ref: '#/components/responses/Unauthorized' }
+        '403':
+          description: |
+            `account_forbidden` (another account's bearer),
+            `run_token_forbidden` (a run-bound subject),
+            `insufficient_scope` (no `write:runs`),
+            `escape_attestation_requires_human` (`details.refused_actor`
+            `agent_token` | `delegated`), or
+            `escape_attestation_requires_forge_credential`
+            (`details.credential_kind`, `details.forge_verified_kinds`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: '`run_not_found`.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `escape_already_recorded` (`details.source_event_key`,
+            `details.existing_sequence`) or `escape_already_closed`
+            (`details.successor_sequence`). Nothing is appended.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '422':
+          description: |
+            `escape_security_free_text_refused` (`details.field`:
+            `description` | `files` | `introducing_commits` |
+            `attestation.note`); `escape_subject_unresolved` (no `head_sha`
+            and the run's PR is not observably merged);
+            `escape_concern_not_found` (the concern, its run, or a concern in
+            another account — answered identically); `escape_target_not_found`;
+            `escape_target_not_pending`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: '`internal_error`: a read, lookup or append failed. Nothing is appended.'
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: '`escape_unconfigured`: no run or audit repository, or (for `later_reviewer`) no concern repository.'
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28579,6 +29711,16 @@ paths:
         no longer be selected by the fix-up endpoint's `concern_ids`, and
         its `state_reason` names the filed issue. The defer is terminal.
 
+        **Judgement (ADR-117 D1 phase 2, E94.7 / #4840).** A defer
+        REQUIRES a human `judgement` (no reason prefix applies). It is
+        validated after the scope check and BEFORE the concern read, the
+        `cross_run_defer` / `concern_requires_human` 403s and any filing,
+        so a refusal never leaves an orphan issue. The `concern_deferred`
+        payload gains `judgement`, plus `tradeoff_cost` only when set. The
+        transition records `outcome` `deferred`, the `judgement`,
+        `tradeoff_cost`, `judgement_actor_kind`, `judgement_delegated`
+        false, `judgement_bulk` false and `judgement_backfill` false.
+
         Auth mirrors the waive endpoint: `write:stages` or `write:fixups`
         scope; an mcp run-bound token (subject `mcp:run:<uuid>`) may
         defer only its own run's concerns (403 `cross_run_defer`
@@ -28587,13 +29729,35 @@ paths:
       parameters:
         - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
               type: object
               additionalProperties: false
+              required: [judgement]
               properties:
+                judgement:
+                  type: string
+                  enum: [defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence]
+                  description: |
+                    REQUIRED HUMAN judgement the defer records (ADR-117 D1
+                    phase 2, E94.7 / #4840). `unlabelled` (the read of an
+                    unjudged concern) and any value outside the enum are
+                    refused 400. No reason prefix applies here — the prefixes
+                    are a waive-reason convention. Recorded on the concern row
+                    and on the `concern_deferred` payload.
+                tradeoff_cost:
+                  type: string
+                  description: |
+                    The stated cost of a `tradeoff` judgement: REQUIRED
+                    (non-blank) with `tradeoff`, and refused with any other
+                    judgement (`tradeoff_cost_without_tradeoff`, so a stray
+                    cost is never silently dropped). Recorded on the concern
+                    row and on the audit payload.
+                    At most 4000 bytes: a longer cost is refused 400
+                    `tradeoff_cost_too_long` (`details` carry `bytes` and
+                    `max`), never truncated (E94.8 / #4841).
                 parent_epic:
                   type: string
                   description: |
@@ -28641,8 +29805,13 @@ paths:
               schema: { $ref: '#/components/schemas/DeferredConcernResult' }
         '400':
           description: |
-            Malformed body or a non-UUID `concern_id`. Body's `error` is
-            `validation_failed`.
+            Malformed or absent body, a non-UUID `concern_id`, or a refused
+            judgement (E94.7 / #4840): `details` carry `field` (`judgement`
+            or `tradeoff_cost`), `rule` and `allowed` (the seven human
+            judgements), with `rule` one of `judgement_required`,
+            `judgement_unknown`, `judgement_unlabelled`,
+            `tradeoff_cost_required`, `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long` (a cost over 4000 bytes, never truncated; `details` carry `bytes` and `max`).
+            Nothing is filed. Body's `error` is `validation_failed`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28700,6 +29869,161 @@ paths:
           description: |
             Concern, audit, or run store not configured on this
             deployment. Body's `error` is `concern_store_unconfigured`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+
+  /v0/concerns/{concern_id}/label:
+    post:
+      operationId: labelConcern
+      summary: Relabel a concern's judgement, or mark it a duplicate of an earlier concern
+      description: |
+        The relabel verb (ADR-117 D1 phase 3, E94.8 / #4841). A HUMAN operator
+        sets or corrects the `judgement` on ANY concern, in any state, or marks
+        it `duplicate_of` an EARLIER concern of the SAME run, which then
+        inherits its chain root's judgement at read time (the gate view and
+        `GET /v0/runs/{run_id}/concerns`). Exactly one of `judgement` and
+        `duplicate_of` is sent. A label NEVER touches `state`,
+        `state_reason`, `outcome` or `updated_at`: it is not a lifecycle event.
+
+        **Human-only.** ADR-117 D1: a judgement is written only by a
+        human-initiated verb. ANY agent subject — an `operator-agent/` token,
+        a run-bound `mcp:run:<uuid>` token (even on its own run) or a
+        first-officer seat (`first_officer/…`) — is refused 403
+        `label_requires_human` before the body is read. There is no
+        delegated path. Scopes: `write:stages` or `write:fixups` (the waive
+        pair); no new scope.
+
+        **duplicate_of guards** (one pure function,
+        `concern.CheckDuplicateTarget`, applied by the handler before any
+        audit append and again by the store before the write):
+        - the target must be a concern of the labelled concern's run. A
+          MISSING target and a target of ANOTHER run (therefore possibly
+          another account) are refused with the IDENTICAL 400
+          `duplicate_of_not_found`, whose message and `details` name only the
+          labelled concern's own run, never the target's run, account or
+          existence;
+        - the target must sort strictly before the labelled concern in the
+          run ledger (`origin_review_sequence`, then `created_at`, then id):
+          400 `duplicate_of_not_earlier` otherwise, which also refuses a
+          self-link. Because the order is strict and total, a chain of
+          admitted links can never form a cycle.
+
+        A duplicate label stores `judgement` `unlabelled` and an empty
+        `tradeoff_cost` on the row (the inherited one is resolved at read
+        time); a later judgement label clears `duplicate_of`. A human waive,
+        resolve or defer of a duplicate-linked concern records its judgement
+        on the row and its audit row, but the EFFECTIVE judgement stays
+        inherited until the concern is relabelled with an explicit one.
+
+        **backfill.** `backfill: true` records `judgement_backfill: true`. On
+        a WAIVED concern only, it also lets the stored waive reason's interim
+        prefix (`false_positive:`, `accepted_tradeoff:`, `preference:`)
+        supply the judgement, under the waive's prefix rules (a contradicting
+        explicit judgement is refused `judgement_conflicts_reason_prefix`; an
+        `accepted_tradeoff:` import still needs an explicit `tradeoff_cost`).
+        A raised, resolved or deferred concern's reason is never read.
+
+        **Audit-before-write ordering.** Every refusal above writes nothing.
+        The handler then appends a `concern_labelled` entry FIRST (payload:
+        `concern_id`, `stage_kind`, `severity`, `category`, `state`,
+        `prior_judgement`, `prior_duplicate_of` when set, `judgement` or
+        `duplicate_of`, `tradeoff_cost` only when set, `backfill`,
+        `provenance` only when set), so a relabel is a new versioned
+        judgement on the chain, never a silent rewrite; append failure is 500
+        `audit_append_failed` with no write. The write is guarded on the
+        prior `judgement` and `duplicate_of` the handler read: a concurrent
+        relabel in between is 409 `concern_label_conflict`. Any write failure
+        after the intent appends a corrective `concern_label_failed` entry.
+        Both categories are internal (no issue-comment activity line). The
+        `tradeoff_cost` is stored verbatim, up to 4000 bytes, on the row, the
+        audit payload and the hash chain, with no secret scrubbing — the same
+        posture as a waive reason.
+      tags: [stages]
+      parameters:
+        - { name: concern_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema: { $ref: '#/components/schemas/LabelConcernRequest' }
+      responses:
+        '200':
+          description: The label was applied; the concern's judgement as the read surfaces render it.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/LabelledConcern' }
+        '400':
+          description: |
+            Body's `error` is `validation_failed`, nothing written, for: a
+            malformed body, a non-UUID `concern_id` or a non-UUID
+            `duplicate_of` (`details.field`); or a refused label, with
+            `details` carrying `field` and `rule`:
+            - `duplicate_of_excludes_judgement`: `duplicate_of` sent with a
+              `judgement` (`field` `duplicate_of`) or a `tradeoff_cost`
+              (`field` `tradeoff_cost`);
+            - `duplicate_of_not_found`: the target is missing or belongs to
+              another run, indistinguishably (`details.run_id` is the labelled
+              concern's own run). A target that vanishes between the
+              handler's check and the write maps here too (the store's
+              distinct sentinel), never to the labelled concern's 404;
+            - `duplicate_of_not_earlier`: the target does not sort strictly
+              before the labelled concern (including itself);
+            - the judgement rules of the waive (`details.allowed` lists the
+              seven human judgements): `judgement_required` (neither field,
+              or `backfill` with no usable prefix), `judgement_unknown`,
+              `judgement_unlabelled`, `judgement_conflicts_reason_prefix`
+              (with `details.reason_prefix`), `tradeoff_cost_required`,
+              `tradeoff_cost_without_tradeoff` or `tradeoff_cost_too_long`
+              (over 4000 bytes, never truncated; `details` carry `bytes` and
+              `max`).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '401':
+          description: |
+            `authentication_required`: the caller is anonymous.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '403':
+          description: |
+            `insufficient_scope` (neither `write:stages` nor `write:fixups`),
+            `label_requires_human` (an agent subject: `operator-agent/`,
+            `mcp:run:<uuid>` or a first-officer seat; `details.subject`), or
+            `account_forbidden` (the concern's run belongs to another
+            account).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '404':
+          description: |
+            `concern_not_found`: no concern with that id.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '409':
+          description: |
+            `concern_label_conflict`: the concern's `judgement` or
+            `duplicate_of` changed between the handler's read and the write (a
+            concurrent relabel). Nothing was written; a `concern_label_failed`
+            entry follows the intent. Re-read the concern and label it again.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `audit_append_failed` (the `concern_labelled` intent could not be
+            appended; nothing written, no corrective entry) or
+            `internal_error` (a concern read failed, or the write failed after
+            the intent, followed by a `concern_label_failed` entry).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            Concern or audit store not configured on this deployment.
+            Body's `error` is `concern_store_unconfigured`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -28919,6 +30243,20 @@ paths:
             description: |
               Hex-encoded 64-byte Ed25519 signature over
               sha256(plan_bytes).
+        - name: X-Fishhawk-Plan-Seed-SHA
+          in: header
+          required: false
+          description: |
+            Runner-asserted plan seed (#4436): the commit the plan agent's
+            working tree sat at, as a full lowercase hex object name (40 or
+            64 characters). Recorded as `seed_sha` on the `plan_generated`
+            audit entry; a malformed value records `seed_sha_malformed: true`
+            instead and never fails the upload. NOT covered by
+            `X-Fishhawk-Signature`. The plan review exports its read-only
+            tree at this commit; without a valid value it runs diff-only.
+          schema:
+            type: string
+            pattern: '^[0-9a-f]{40}([0-9a-f]{24})?$'
       requestBody:
         required: true
         content:
@@ -29649,7 +30987,14 @@ paths:
           description: |
             The external rollback trigger failed (`rollback_dispatch_failed`):
             the `workflow_dispatch` returned non-204, or the webhook POST
-            errored / returned a non-2xx status.
+            errored / returned a non-2xx status. A github_actions delegate
+            with no pinned `git_ref` dispatches on the repository's forge
+            default branch (#4660); when that read fails the rollback is
+            refused BEFORE any dispatch with `details.reason`
+            `default_branch_unresolved` and
+            `details.default_branch_unresolved_reason` naming why (pin
+            `executor.delegate.git_ref`, or restore the forge read), and no
+            `deployment_rollback_initiated` row is written.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -29906,6 +31251,23 @@ paths:
         remaining_budget}`) — the operator's `fishhawk_await_audit`
         anchor. Delivery is poll-based: the agent polls the GET
         until the status leaves `pending` (bounded ~5 minutes).
+
+        **Slice-ownership guard (#4679).** On a decomposition child,
+        a requested path that overlaps (identical, or directory
+        containment) a path ANOTHER slice of the parent's approved
+        decomposition declares is refused 409
+        `amendment_path_owned_by_sibling_slice` unless that slice is a
+        transitive `depends_on` ancestor of the requester. The check
+        runs BEFORE the row is created, so a refusal creates no row
+        and spends no budget; it is recorded as an internal
+        `scope_amendment_refused` audit entry (phase `request`). An
+        admitted child request carries `slice_ownership` on its
+        `scope_amendment_requested` payload. A run or plan read error
+        here fails OPEN (`slice_ownership.checked: false`) — the
+        decision route re-checks fail-closed. The guard covers only
+        this route and the decision route; `fishhawk_resume_run`
+        `add_scope_files` and the scope-completeness `amend` decision
+        are not covered (#4798).
       tags: [runner]
       security: []
       parameters:
@@ -29964,6 +31326,14 @@ paths:
             `stage_not_implement` — the run's resolved active stage
             (dispatched/running, else first non-terminal) is not an
             implement stage.
+            `amendment_path_owned_by_sibling_slice` — a decomposition
+            child named a path a sibling slice that is not its
+            `depends_on` ancestor declares (#4679). No row is created
+            and no budget is spent. `details` carries `reason`
+            (`path_owned_by_non_ancestor_slice`), `requested_slice`,
+            `ancestor_slices`, `conflicts[]` (`path`, `owning_slice`,
+            `owning_title`, `owning_path`, `owning_child_run_id` when
+            resolvable, `overlap_kind`) and `remedy`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -30088,6 +31458,24 @@ paths:
         cancelled or superseded, or its run succeeded or was cancelled;
         #4127) returns 409
         (`amendment_lapsed`) and is never approvable.
+
+        **Slice-ownership guard (#4679).** An APPROVE of a pending
+        amendment on a decomposition child re-runs the request route's
+        slice-ownership check: a path a sibling slice that is not its
+        `depends_on` ancestor declares returns 409
+        `amendment_path_owned_by_sibling_slice` (the row stays
+        `pending`; a `scope_amendment_refused` audit entry with phase
+        `decide` is recorded). There is no override — deny the
+        amendment with the remedy as the reason. A run or plan read
+        error fails CLOSED: 500 `slice_ownership_check_failed`, the
+        row untouched, retryable. Deny is never checked, and a
+        non-pending row keeps its `amendment_already_decided` /
+        `amendment_lapsed` answer. A row still reading `pending` that
+        has already lapsed can get the ownership 409 instead of
+        `amendment_lapsed` (message fidelity only; the row is
+        untouched). The guard covers only the request and decision
+        routes; `fishhawk_resume_run` `add_scope_files` and the
+        scope-completeness `amend` decision are not covered (#4798).
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -30145,6 +31533,19 @@ paths:
             `amendment_already_decided` — decisions are immutable.
             `amendment_lapsed` — the request lapsed undecided (#4127);
             `details` carries `status`, `decision_reason` and `stage_id`.
+            `amendment_path_owned_by_sibling_slice` — an approve names a
+            path a non-ancestor sibling slice declares (#4679); the row
+            stays `pending` and there is no override (deny it).
+            `details` as on the request route.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `slice_ownership_check_failed` — the approve's
+            slice-ownership check could not read the run or the parent's
+            approved plan (#4679); fail-closed, the row is untouched and
+            the call is retryable.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

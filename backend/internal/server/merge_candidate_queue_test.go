@@ -2111,10 +2111,14 @@ func TestShutdown_DrainsMergeCandidateQueuePump(t *testing.T) {
 	case <-time.After(timescale.D(10 * time.Second)):
 		t.Fatal("Shutdown did not return after the pump admission finished")
 	}
+	// Bounded, not non-blocking: the loop's deferred bgMergeQueuePump.Done()
+	// runs inside RunMergeCandidateQueuePump, but the fixture closes done only
+	// after that call returns, so Shutdown's Wait can return a moment before
+	// done closes. The drain itself is pinned by the first select above.
 	select {
 	case <-done:
-	default:
-		t.Fatal("Shutdown returned before the pump loop exited")
+	case <-time.After(timescale.D(5 * time.Second)):
+		t.Fatal("the pump loop did not exit after Shutdown drained it")
 	}
 	if e := f.requireState(b, mergequeue.StateLive, ""); e.AnchoredHeadSHA != "b2" || e.Phase != mergequeue.PhaseVerifying {
 		t.Fatalf("B after the drained admission = head %q phase %q, want b2 verifying", e.AnchoredHeadSHA, e.Phase)
@@ -3284,5 +3288,118 @@ func TestAdmission_PassNotStartableRecordsEjection(t *testing.T) {
 	p := f.oneEjection(b, mergeCandidateQueueReasonPassNotStartable, mergeQueueEjectNextGetRunStatus)
 	if _, ok := p["fixup_routed"]; ok {
 		t.Fatalf("a non-verify ejection carries fixup_routed: %v", p)
+	}
+}
+
+// TestAdmission_A33Table pins docs/adr/112 A3.3's intent-bearing admission
+// table (#4780), FIRST matching row, one subtest per row: (1) undeterminable
+// unadmits with intent kept; (2) a blocking concern beside red drops
+// not_merge_eligible; (3) the veto alone, or beside red, yields the veto;
+// (4) red alone, review_pending alone, or red beside review_pending yields the
+// merge-gate yield (merge_checks_red wins, A3.5 tier 2) at site admission and
+// the pump continues to the next entry; an entry WITHOUT intent and a red
+// check still drops. A yielded row keeps enqueued_at (its FIFO place). CF26:
+// deleting row 4 drops the red-alone row, RED. CF27: evaluating row 4 before
+// row 3 yields merge_checks_red for veto-beside-red, RED.
+func TestAdmission_A33Table(t *testing.T) {
+	red := func(w *mqmWorld, r *mcqRun, head string) {
+		w.exec(`UPDATE runs SET required_checks_snapshot = '{"contexts":["ci"]}' WHERE id = $1`, r.id)
+		w.gh.set(func() {
+			w.gh.checks[head] = `[{"id":1,"name":"ci","status":"completed","conclusion":"failure","started_at":"2026-01-01T00:00:00Z","completed_at":"2026-01-01T00:01:00Z","check_suite":{"id":1},"app":{"slug":"github-actions"}}]`
+		})
+	}
+	veto := func(w *mqmWorld, r *mcqRun, head string) {
+		w.forgeReviews(r, []string{"alice", "bob"}, mqmReview(1, "alice", "APPROVED", head), mqmReview(2, "bob", "CHANGES_REQUESTED", head))
+	}
+	reviewPending := func(w *mqmWorld, r *mcqRun) {
+		w.mqeAppend(r, "implement_review_started", map[string]any{"configured_agents": 1})
+	}
+	yieldCases := []struct {
+		name   string
+		spec   string
+		plant  func(w *mqmWorld, a *mcqRun)
+		reason string
+		next   string
+	}{
+		{"veto alone yields the veto", mqeSpecYAML, func(w *mqmWorld, a *mcqRun) { veto(w, a, "a1") },
+			mergeCandidateQueueReasonForgeApprovalVetoed, forgeApprovalNextDismissReview},
+		{"veto beside red yields the veto", mqeSpecYAML, func(w *mqmWorld, a *mcqRun) { veto(w, a, "a1"); red(w, a, "a1") },
+			mergeCandidateQueueReasonForgeApprovalVetoed, forgeApprovalNextDismissReview},
+		{"red alone yields merge_checks_red", mcvUndelegatedSpecYAML, func(w *mqmWorld, a *mcqRun) { red(w, a, "a1") },
+			mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI},
+		{"review pending alone yields merge_review_pending", mqeGatedReviewersSpec, func(w *mqmWorld, a *mcqRun) { reviewPending(w, a) },
+			mergeQueueYieldMergeReviewPending, forgeApprovalNextRetryAfter},
+		{"red beside review pending yields merge_checks_red", mqeGatedReviewersSpec, func(w *mqmWorld, a *mcqRun) { reviewPending(w, a); red(w, a, "a1") },
+			mergeQueueYieldMergeChecksRed, mergeQueueYieldNextRetriggerCI},
+	}
+	for _, tc := range yieldCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQELineWorld(t)
+			a := w.seed("a", "a1", []byte(tc.spec))
+			b := w.seed("b", "b1", []byte(mcvUndelegatedSpecYAML))
+			before := w.mqpHeldIntent(a, "a1", false)
+			w.mqpHeldIntent(b, "b1", false)
+			tc.plant(w, a)
+
+			w.pumpBase(a)
+
+			e := w.requireYielded(a, tc.reason, tc.next, mergeQueueYieldSiteAdmission)
+			if e.MergeIntentAt == nil || !e.EnqueuedAt.Equal(before.EnqueuedAt) {
+				t.Fatalf("yielded A intent=%v enqueued_at=%v (was %v), want intent kept at its FIFO place", e.MergeIntentAt, e.EnqueuedAt, before.EnqueuedAt)
+			}
+			if n := len(w.rows(a, CategoryMergeCandidateQueueSettled)); n != 0 {
+				t.Fatalf("A merge_candidate_queue_settled rows = %d, want 0 (a yield, never a drop)", n)
+			}
+			w.requirePuts("b1")
+			w.requireState(b, mergequeue.StateMerged, mergeCandidateQueueReasonMergedByQueue)
+		})
+	}
+	t.Run("undeterminable unadmits with intent kept", func(t *testing.T) {
+		w := newMQELineWorld(t)
+		a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+		w.mqpHeldIntent(a, "a1", false)
+		red(w, a, "a1")
+		w.srv.cfg.ConcernRepo = nil
+
+		w.pumpBase(a)
+
+		e := w.active(a)
+		if e.State != mergequeue.StateHeld || e.YieldedAt != nil || e.MergeIntentAt == nil {
+			t.Fatalf("A = %s yielded_at=%v intent=%v, want held unmarked with intent kept", e.State, e.YieldedAt, e.MergeIntentAt)
+		}
+		if n := len(w.rows(a, CategoryMergeQueueYielded)) + len(w.rows(a, CategoryMergeCandidateQueueSettled)); n != 0 {
+			t.Fatalf("yield/settle rows = %d, want 0", n)
+		}
+		w.requirePuts()
+	})
+	dropCases := []struct {
+		name   string
+		intent bool
+		plant  func(w *mqmWorld, a *mcqRun)
+	}{
+		{"blocking concern beside red drops", true, func(w *mqmWorld, a *mcqRun) { red(w, a, "a1"); w.raiseConcern(a, "high", "") }},
+		{"no intent and red drops", false, func(w *mqmWorld, a *mcqRun) { red(w, a, "a1") }},
+	}
+	for _, tc := range dropCases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQELineWorld(t)
+			a := w.seed("a", "a1", []byte(mcvUndelegatedSpecYAML))
+			if tc.intent {
+				w.mqpHeldIntent(a, "a1", false)
+			} else {
+				w.mqeRebased(a, "pre-a1", "a1", "a1", false)
+				w.mqePassed(a, "a1")
+				w.enqueueDirect(a, "a1")
+			}
+			tc.plant(w, a)
+
+			w.pumpBase(a)
+
+			w.requireState(a, mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible)
+			if n := len(w.rows(a, CategoryMergeQueueYielded)); n != 0 {
+				t.Fatalf("merge_queue_yielded rows = %d, want 0 (a drop)", n)
+			}
+			w.requirePuts()
+		})
 	}
 }

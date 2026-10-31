@@ -1,6 +1,7 @@
 package devfixtures_test
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"slices"
@@ -231,6 +232,64 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 		}
 		if len(s.Approvals) != 1 || s.Approvals[0].Decision != "approve" || s.Approvals[0].Stage != "plan" {
 			t.Fatalf("want exactly one approve approval on the plan stage, got %+v", s.Approvals)
+		}
+	})
+	// implement-running (#4426): the implement category-C park target. The
+	// stages follow the real feature_change order; the implement stage is
+	// running (a signed pull-request failure report can fail it); and the
+	// scenario carries NO artifacts and NO audit rows, so the park history is
+	// empty (no plan_decomposed row, no pass-trigger row, no prior park) and
+	// a first-execution category-C failure parks rather than fails the run.
+	t.Run("implement-running", func(t *testing.T) {
+		s := mustLoad(t, "implement-running")
+		if len(s.Runs) != 1 || s.Runs[0].WorkflowID != "feature_change" || s.Runs[0].State != "running" {
+			t.Fatalf("want one running feature_change run, got %+v", s.Runs)
+		}
+		type shape struct {
+			typ, executor, state string
+			requiresApproval     bool
+		}
+		want := []shape{
+			{"plan", "agent", "succeeded", true},
+			{"implement", "agent", "running", false},
+			{"acceptance", "agent", "pending", false},
+			{"review", "human", "pending", true},
+		}
+		if len(s.Stages) != len(want) {
+			t.Fatalf("want %d stages, got %+v", len(want), s.Stages)
+		}
+		for i, st := range s.Stages {
+			got := shape{st.Type, st.ExecutorKind, st.State, st.RequiresApproval}
+			if got != want[i] || st.Sequence != i+1 {
+				t.Fatalf("stage %d = %+v (sequence %d), want %+v at sequence %d", i, got, st.Sequence, want[i], i+1)
+			}
+		}
+		if len(s.Artifacts) != 0 || len(s.Approvals) != 0 || len(s.Audit) != 0 {
+			t.Fatalf("want no artifacts, approvals or audit rows (empty park history), got %d / %d / %d",
+				len(s.Artifacts), len(s.Approvals), len(s.Audit))
+		}
+		// Materialize it through the fake stores: the implement stage walks
+		// to running, acceptance and review stay pending (no transition), and
+		// nothing reaches the artifact or audit stores.
+		f, deps := newFakes(time.Now())
+		res, err := devfixtures.NewApplier(deps).Apply(context.Background(), "implement-running")
+		if err != nil {
+			t.Fatalf("Apply(implement-running): %v", err)
+		}
+		stages := res.Runs["target-run"].Stages
+		if len(stages) != 4 {
+			t.Fatalf("applied stages = %v, want 4", stages)
+		}
+		if trs := f.runs.transitionsFor(stages["implement"]); len(trs) == 0 || string(trs[len(trs)-1].To) != "running" {
+			t.Fatalf("implement transitions = %+v, want a walk ending at running", trs)
+		}
+		for _, k := range []string{"acceptance", "review"} {
+			if trs := f.runs.transitionsFor(stages[k]); len(trs) != 0 {
+				t.Fatalf("%s transitions = %+v, want none (pending)", k, trs)
+			}
+		}
+		if len(f.artifacts.created) != 0 || f.arm.counts["AppendChained"] != 0 {
+			t.Fatalf("want no artifact or audit writes, got artifacts=%d audit=%d", len(f.artifacts.created), f.arm.counts["AppendChained"])
 		}
 	})
 	t.Run("trace-upload-target", func(t *testing.T) {

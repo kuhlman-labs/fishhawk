@@ -280,3 +280,153 @@ func TestDedupedErrorMessages(t *testing.T) {
 		t.Errorf("with Existing: %q, want %q", got, want)
 	}
 }
+
+// appendDedupedSpec is appendDeduped with a caller-supplied spec, so a test
+// can attach a BeforeAppend hook (#4694).
+func appendDedupedSpec(pool *pgxpool.Pool, runID uuid.UUID, payload json.RawMessage, spec audit.DedupeSpec) (*audit.Entry, error) {
+	appender := audit.NewPostgresRepository(pool).(audit.DedupedChainAppender)
+	return appender.AppendChainedDeduped(context.Background(), audit.ChainAppendParams{
+		RunID: runID, Timestamp: time.Now().UTC(), Category: dedupedCat, Payload: payload,
+	}, spec)
+}
+
+var errHookRefused = errors.New("hook refused")
+
+// (g) a BeforeAppend refusal rolls the transaction back: the sentinel comes
+// back UNWRAPPED and the committed count is unchanged. The hook sees the
+// same-category rows already on the chain. Counterfactual (CF-B10): `if
+// spec.BeforeAppend != nil {` -> `if false {` — the hook never runs, the row
+// commits, and the count assertion fails.
+func TestPostgres_AppendChainedDeduped_BeforeAppendRefusesWritesNothing(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	runID := makeRun(t, pool)
+	if _, err := appendDeduped(pool, runID, nil, "seed", dedupedPayload("seed")); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	var seen int
+	entry, err := appendDedupedSpec(pool, runID, dedupedPayload("other"), audit.DedupeSpec{
+		PayloadKey: dedupedKey, PayloadValue: "other",
+		BeforeAppend: func(same []*audit.Entry, _ *audit.ChainAppendParams) error {
+			seen = len(same)
+			return errHookRefused
+		},
+	})
+	if !errors.Is(err, errHookRefused) || err != errHookRefused { //nolint:errorlint // pins the UNWRAPPED propagation
+		t.Fatalf("err = %v, want the hook's sentinel unwrapped", err)
+	}
+	if entry != nil {
+		t.Errorf("entry = %+v, want nil on a hook refusal", entry)
+	}
+	if seen != 1 {
+		t.Errorf("hook saw %d same-category rows, want 1 (the seed)", seen)
+	}
+	if n := countDedupedRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want 1 (the hook refusal must write nothing)", dedupedCat, n)
+	}
+}
+
+// (h) a BeforeAppend hook may rewrite the payload: the committed row carries
+// the rewritten bytes. A duplicate short-circuits BEFORE the hook runs.
+func TestPostgres_AppendChainedDeduped_BeforeAppendRewritesPayload(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	runID := makeRun(t, pool)
+	rewritten := json.RawMessage(`{"reason":"rewritten","by":"hook"}`)
+	hookCalls := 0
+	spec := audit.DedupeSpec{
+		PayloadKey: dedupedKey, PayloadValue: "rewritten",
+		BeforeAppend: func(_ []*audit.Entry, p *audit.ChainAppendParams) error {
+			hookCalls++
+			p.Payload = rewritten
+			return nil
+		},
+	}
+	entry, err := appendDedupedSpec(pool, runID, dedupedPayload("original"), spec)
+	if err != nil {
+		t.Fatalf("append: %v", err)
+	}
+	var got map[string]string
+	if err := json.Unmarshal(entry.Payload, &got); err != nil {
+		t.Fatalf("decode payload %s: %v", entry.Payload, err)
+	}
+	if got["reason"] != "rewritten" || got["by"] != "hook" {
+		t.Errorf("committed payload = %s, want the hook's rewrite", entry.Payload)
+	}
+	// The rewritten row now holds reason=rewritten, so a second append with
+	// the same spec is a duplicate and the hook is NOT invoked again.
+	_, err = appendDedupedSpec(pool, runID, dedupedPayload("original"), spec)
+	var dup *audit.DedupedDuplicateError
+	if !errors.As(err, &dup) || dup.Existing == nil || dup.Existing.ID != entry.ID {
+		t.Fatalf("second append err = %v, want *DedupedDuplicateError naming %s", err, entry.ID)
+	}
+	if hookCalls != 1 {
+		t.Errorf("hook calls = %d, want 1 (a duplicate refuses before the hook)", hookCalls)
+	}
+	if n := countDedupedRows(t, pool, runID); n != 1 {
+		t.Errorf("committed %s rows = %d, want 1", dedupedCat, n)
+	}
+}
+
+// TestCheckDedupeSpec_Table drives the shared scan + hook helper the server's
+// in-memory fallback uses, without a database.
+func TestCheckDedupeSpec_Table(t *testing.T) {
+	stageA, stageB := uuid.New(), uuid.New()
+	entry := func(stage *uuid.UUID, payload string) *audit.Entry {
+		return &audit.Entry{ID: uuid.New(), StageID: stage, Payload: json.RawMessage(payload)}
+	}
+	match := entry(&stageA, `{"k":"v"}`)
+	cases := []struct {
+		name     string
+		entries  []*audit.Entry
+		stage    *uuid.UUID
+		hookErr  error
+		wantDup  *audit.Entry
+		wantErr  error
+		wantHook bool
+	}{
+		{name: "empty_runs_hook", wantHook: true},
+		{name: "nil_entry_skipped", entries: []*audit.Entry{nil}, wantHook: true},
+		{name: "run_scoped_match", entries: []*audit.Entry{match}, wantDup: match},
+		{name: "stage_scoped_match", entries: []*audit.Entry{match}, stage: &stageA, wantDup: match},
+		{name: "other_stage_skipped", entries: []*audit.Entry{match}, stage: &stageB, wantHook: true},
+		{name: "nil_stage_row_vs_stage_spec", entries: []*audit.Entry{entry(nil, `{"k":"v"}`)}, stage: &stageA, wantHook: true},
+		{name: "other_value_skipped", entries: []*audit.Entry{entry(nil, `{"k":"w"}`)}, wantHook: true},
+		{name: "number_value_skipped", entries: []*audit.Entry{entry(nil, `{"k":7}`)}, wantHook: true},
+		{name: "malformed_skipped", entries: []*audit.Entry{entry(nil, `[1]`)}, wantHook: true},
+		{name: "hook_error_propagates", hookErr: errHookRefused, wantErr: errHookRefused, wantHook: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			hooked := false
+			p := &audit.ChainAppendParams{Payload: json.RawMessage(`{}`)}
+			err := audit.CheckDedupeSpec(tc.entries, p, audit.DedupeSpec{
+				StageID: tc.stage, PayloadKey: "k", PayloadValue: "v",
+				BeforeAppend: func(_ []*audit.Entry, _ *audit.ChainAppendParams) error {
+					hooked = true
+					return tc.hookErr
+				},
+			})
+			if hooked != tc.wantHook {
+				t.Errorf("hook invoked = %v, want %v", hooked, tc.wantHook)
+			}
+			switch {
+			case tc.wantDup != nil:
+				var dup *audit.DedupedDuplicateError
+				if !errors.As(err, &dup) || dup.Existing != tc.wantDup {
+					t.Errorf("err = %v, want a duplicate naming the matching entry", err)
+				}
+			case tc.wantErr != nil:
+				if err != tc.wantErr { //nolint:errorlint // pins the UNWRAPPED propagation
+					t.Errorf("err = %v, want %v unwrapped", err, tc.wantErr)
+				}
+			default:
+				if err != nil {
+					t.Errorf("err = %v, want nil", err)
+				}
+			}
+		})
+	}
+	// A nil hook with no duplicate is nil (every pre-#4694 caller).
+	if err := audit.CheckDedupeSpec(nil, &audit.ChainAppendParams{}, audit.DedupeSpec{PayloadKey: "k", PayloadValue: "v"}); err != nil {
+		t.Errorf("nil hook: err = %v, want nil", err)
+	}
+}

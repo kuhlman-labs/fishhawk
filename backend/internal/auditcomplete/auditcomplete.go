@@ -142,6 +142,43 @@ var TerminalImplementReviewCategories = []string{
 type MissingItem struct {
 	Kind   MissingKind `json:"kind"`
 	Detail string      `json:"detail"`
+	// Headline is a short check-run rendering hint (#4801), set on
+	// stage_not_terminal items: the published pending Check Run's title reads
+	// "Held: <headline>" (HeldHeadline). It is NEVER on the REST wire, so
+	// GET /v0/stages/{id}/checks and the merge refusal's audit_complete_missing
+	// details stay byte-identical.
+	Headline string `json:"-"`
+}
+
+// reopenedHeadlineClause is the stage_not_terminal headline suffix for an
+// acceptance stage a fix-up push re-opened and nobody has re-dispatched.
+const reopenedHeadlineClause = " — re-opened by a fix-up push, not re-dispatched"
+
+// HeldHeadline renders the cause a pending audit-complete check is held on
+// (#4801): the Headline of the first stage_not_terminal item for an
+// ACCEPTANCE stage (the stage a fix-up push re-opens), else the first item's
+// Headline, falling back to its Kind when empty, with " (+N more)" when there
+// is more than one item. "" for an empty list.
+func HeldHeadline(missing []MissingItem) string {
+	if len(missing) == 0 {
+		return ""
+	}
+	pick := missing[0]
+	for _, m := range missing {
+		if m.Kind == MissingStageNotTerminal &&
+			(strings.HasPrefix(m.Headline, string(run.StageTypeAcceptance)+" stage ") || strings.Contains(m.Headline, reopenedHeadlineClause)) {
+			pick = m
+			break
+		}
+	}
+	headline := pick.Headline
+	if headline == "" {
+		headline = string(pick.Kind)
+	}
+	if len(missing) > 1 {
+		headline += fmt.Sprintf(" (+%d more)", len(missing)-1)
+	}
+	return headline
 }
 
 // ResolutionKind names a category of RESOLVED evidence — a requirement that
@@ -545,10 +582,7 @@ func ComputeResult(ctx context.Context, runID uuid.UUID, deps Deps) (Result, err
 	var notTerminal []MissingItem
 	for _, s := range nonReview {
 		if !s.State.IsTerminal() {
-			notTerminal = append(notTerminal, MissingItem{
-				Kind:   MissingStageNotTerminal,
-				Detail: stageNotTerminalDetail(ctx, deps, runID, s),
-			})
+			notTerminal = append(notTerminal, stageNotTerminalItem(ctx, deps, runID, s))
 		}
 	}
 	if len(notTerminal) > 0 {
@@ -970,17 +1004,44 @@ func rule5(ctx context.Context, deps Deps, runID uuid.UUID, out *[]MissingItem) 
 		return
 	}
 
+	// Render every SHA in FULL and sorted: truncating to 7 characters made an
+	// abbreviated vouch of the head read as both foreign and known (#4435).
 	known := make([]string, 0, len(gather.knownSHAs))
 	for sha := range gather.knownSHAs {
-		known = append(known, shortSHA(sha))
+		known = append(known, sha)
+	}
+	sort.Strings(known)
+	detail := fmt.Sprintf(
+		"PR HEAD %s is not a Fishhawk-recorded commit (known: %s)",
+		liveSHA,
+		strings.Join(known, ", "))
+	// Matching above is exact by design, so a recorded ABBREVIATION of the head
+	// (a vouch recorded before the vouch endpoint refused them) never clears the
+	// check. Name it so the operator knows to re-vouch with the full sha.
+	if abbrev := abbreviatedPrefixesOf(liveSHA, gather.knownSHAs); len(abbrev) > 0 {
+		detail += fmt.Sprintf(
+			"; known entry %s is an ABBREVIATED sha that prefixes the PR HEAD but is never matched by prefix — re-vouch the full sha %s with fishhawk_vouch_commit",
+			strings.Join(abbrev, ", "), liveSHA)
 	}
 	*out = append(*out, MissingItem{
-		Kind: MissingForeignCommit,
-		Detail: fmt.Sprintf(
-			"PR HEAD %s is not a Fishhawk-recorded commit (known: %s)",
-			shortSHA(liveSHA),
-			strings.Join(known, ", ")),
+		Kind:   MissingForeignCommit,
+		Detail: detail,
 	})
+}
+
+// abbreviatedPrefixesOf returns, sorted, every known entry that is strictly
+// shorter than liveSHA and a case-insensitive prefix of it: the recorded
+// abbreviations of the PR head that exact-match rule 5 can never clear. It
+// only NAMES them for the detail; it never feeds the match.
+func abbreviatedPrefixesOf(liveSHA string, known map[string]struct{}) []string {
+	var out []string
+	for sha := range known {
+		if sha != "" && len(sha) < len(liveSHA) && strings.EqualFold(liveSHA[:len(sha)], sha) {
+			out = append(out, sha)
+		}
+	}
+	sort.Strings(out)
+	return out
 }
 
 // foreignCommitInputs bundles the values rule5 needs to make the
@@ -1333,15 +1394,6 @@ func parseRepo(s string) (forge.RepoRef, error) {
 	return forge.RepoRef{Owner: s[:i], Name: s[i+1:]}, nil
 }
 
-// shortSHA renders the leading 7 of a SHA for human-readable
-// missing-item details. Leaves shorter SHAs untouched.
-func shortSHA(sha string) string {
-	if len(sha) > 7 {
-		return sha[:7]
-	}
-	return sha
-}
-
 // childPageSize is the ListRuns page size the decomposition resolution walks
 // the child set with, and childPageCeiling the hard cap on how many pages it
 // will read.
@@ -1607,40 +1659,71 @@ func resolveImplementTracesFromChildren(ctx context.Context, deps Deps, runID uu
 // wait. Keying on the entry alone would keep recommending a re-dispatch the
 // operator has already performed.
 //
-// The acceptance_reopened lookup FAILS OPEN: a read error degrades to the
-// generic detail and is never returned as a Compute error. This lookup exists
+// The acceptance_reopened lookup (stageNotTerminalItem, #4801) FAILS OPEN: a
+// read error degrades to the generic detail and is never returned as a Compute
+// error. This lookup exists
 // only to sharpen wording — turning a legible pending into a 500 would be the
 // opposite of what #3190 is for.
-func stageNotTerminalDetail(ctx context.Context, deps Deps, runID uuid.UUID, s *run.Stage) string {
-	generic := fmt.Sprintf("%s stage %s is in state %s; the run is not terminal, so the audit chain cannot be assembled yet",
+func stageNotTerminalDetail(s *run.Stage, reopened bool) string {
+	if s.Type == run.StageTypeAcceptance && reopened {
+		// The dispatchable/in-flight split and both sentences come from
+		// run.AcceptanceBlockerAdvisory (E64.63 / #3222), the single owner of
+		// this wording across the fix-up refusal, this check, the merge
+		// checkpoints and next_actions. The rendered strings are BYTE-IDENTICAL
+		// to what #3190/#3224 shipped — the three pre-existing tests in
+		// auditcomplete_test.go are that proof, and
+		// TestStageNotTerminalDetail_SingleSourcedFromRunRenderer pins the
+		// equality so the copy cannot drift back.
+		//
+		// reopened is correlated with THIS stage's id (stageNotTerminalItem),
+		// never matched by category alone: a run can carry more than one
+		// acceptance stage in its history and a stale entry from an earlier one
+		// must not draw the stronger "a fix-up re-opened this" claim.
+		return run.AcceptanceBlockerAdvisory(shortID(s.ID), s.State, true,
+			checkClearsTail)
+	}
+	return fmt.Sprintf("%s stage %s is in state %s; the run is not terminal, so the audit chain cannot be assembled yet",
 		s.Type, shortID(s.ID), s.State)
-	if s.Type != run.StageTypeAcceptance || deps.Audit == nil {
-		return generic
-	}
-	entries, err := deps.Audit.ListForRunByCategory(ctx, runID, categoryAcceptanceReopened)
-	if err != nil {
-		return generic
-	}
-	for _, e := range entries {
-		if e.StageID != nil && *e.StageID == s.ID {
-			// The dispatchable/in-flight split and both sentences come from
-			// run.AcceptanceBlockerAdvisory (E64.63 / #3222), the single owner
-			// of this wording across the fix-up refusal, this check, the merge
-			// checkpoints and next_actions. The rendered strings are BYTE-
-			// IDENTICAL to what #3190/#3224 shipped — the three pre-existing
-			// tests in auditcomplete_test.go are that proof, and
-			// TestStageNotTerminalDetail_SingleSourcedFromRunRenderer pins the
-			// equality so the copy cannot drift back.
-			//
-			// The entry is correlated with THIS stage's id above, never matched
-			// by category alone: a run can carry more than one acceptance stage
-			// in its history and a stale entry from an earlier one must not draw
-			// the stronger "a fix-up re-opened this" claim.
-			return run.AcceptanceBlockerAdvisory(shortID(s.ID), s.State, true,
-				checkClearsTail)
+}
+
+// stageNotTerminalItem builds one mid-flight stage_not_terminal item. It reads
+// the stage-scoped acceptance_reopened entry ONCE (acceptance stages only) and
+// derives both the Detail (stageNotTerminalDetail) and the check-run Headline
+// (#4801) from it. The read FAILS OPEN to the generic detail and headline.
+func stageNotTerminalItem(ctx context.Context, deps Deps, runID uuid.UUID, s *run.Stage) MissingItem {
+	reopened := false
+	if s.Type == run.StageTypeAcceptance && deps.Audit != nil {
+		if entries, err := deps.Audit.ListForRunByCategory(ctx, runID, categoryAcceptanceReopened); err == nil {
+			for _, e := range entries {
+				if e.StageID != nil && *e.StageID == s.ID {
+					reopened = true
+					break
+				}
+			}
 		}
 	}
-	return generic
+	return MissingItem{
+		Kind:     MissingStageNotTerminal,
+		Detail:   stageNotTerminalDetail(s, reopened),
+		Headline: stageNotTerminalHeadline(s, reopened),
+	}
+}
+
+// stageNotTerminalHeadline is the short cause a held pending check names in its
+// title (#4801), split on the same dispatchable/in-flight owner as the detail.
+func stageNotTerminalHeadline(s *run.Stage, reopened bool) string {
+	base := fmt.Sprintf("%s stage %s %s", s.Type, shortID(s.ID), s.State)
+	if s.Type != run.StageTypeAcceptance {
+		return base
+	}
+	switch {
+	case run.AcceptanceIsDispatchable(s.State) && reopened:
+		return base + reopenedHeadlineClause
+	case run.AcceptanceIsDispatchable(s.State):
+		return base + " (not dispatched)"
+	default:
+		return base + " (in flight)"
+	}
 }
 
 // checkClearsTail is stageNotTerminalDetail's surface-specific tail clause,

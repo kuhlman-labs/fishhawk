@@ -1195,6 +1195,7 @@ func campaignItemFloorFixture(runID string, dependsOn int) StartCampaignItemRunO
 			CreatedAt: time.Date(2026, 8, 7, 12, 0, 0, 0, time.UTC),
 			UpdatedAt: time.Date(2026, 8, 7, 12, 5, 0, 0, time.UTC),
 		},
+		RunnerKindResolution: &campaignRunnerKindResolution{RunnerKind: "local", Source: "campaign_working_dir"},
 	}
 }
 

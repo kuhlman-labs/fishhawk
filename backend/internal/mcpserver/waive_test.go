@@ -6,6 +6,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/jsonschema-go/jsonschema"
 	"github.com/google/uuid"
 )
 
@@ -31,8 +32,10 @@ func TestWaiveConcern_HappyPath(t *testing.T) {
 	}
 
 	_, out, err := r.waiveConcern(context.Background(), nil, WaiveConcernInput{
-		ConcernID: concernID.String(),
-		Reason:    "accepted trade-off: the doc companion is intentional",
+		ConcernID:    concernID.String(),
+		Reason:       "accepted trade-off: the doc companion is intentional",
+		Judgement:    "tradeoff",
+		TradeoffCost: "one more file in the diff",
 	})
 	if err != nil {
 		t.Fatalf("waiveConcern: %v", err)
@@ -51,6 +54,10 @@ func TestWaiveConcern_HappyPath(t *testing.T) {
 	}
 	if fb.waiveBody.Reason != "accepted trade-off: the doc companion is intentional" {
 		t.Errorf("body reason = %q, want the threaded reason", fb.waiveBody.Reason)
+	}
+	// The judgement and its cost reach the backend verbatim (ADR-117 D1, #4840).
+	if fb.waiveBody.Judgement != "tradeoff" || fb.waiveBody.TradeoffCost != "one more file in the diff" {
+		t.Errorf("body judgement/tradeoff_cost = %q/%q, want the threaded pair", fb.waiveBody.Judgement, fb.waiveBody.TradeoffCost)
 	}
 }
 
@@ -163,9 +170,11 @@ func TestWaiveConcerns_HappyPath(t *testing.T) {
 	const reason = "answered by the approval condition; not blocking the merge"
 
 	_, out, err := r.waiveConcerns(context.Background(), nil, WaiveConcernsInput{
-		RunID:      runID.String(),
-		ConcernIDs: ids,
-		Reason:     reason,
+		RunID:        runID.String(),
+		ConcernIDs:   ids,
+		Reason:       reason,
+		Judgement:    "tradeoff",
+		TradeoffCost: "two known gaps ship",
 	})
 	if err != nil {
 		t.Fatalf("waiveConcerns: %v", err)
@@ -188,6 +197,9 @@ func TestWaiveConcerns_HappyPath(t *testing.T) {
 	}
 	if fb.bulkWaiveBody.Reason != reason {
 		t.Errorf("body reason = %q, want the threaded reason", fb.bulkWaiveBody.Reason)
+	}
+	if fb.bulkWaiveBody.Judgement != "tradeoff" || fb.bulkWaiveBody.TradeoffCost != "two known gaps ship" {
+		t.Errorf("body judgement/tradeoff_cost = %q/%q, want the threaded pair", fb.bulkWaiveBody.Judgement, fb.bulkWaiveBody.TradeoffCost)
 	}
 	if want := "/v0/runs/" + runID.String() + "/concerns/waive"; fb.bulkWaivePath != want {
 		t.Errorf("path = %q, want %q (run-scoped)", fb.bulkWaivePath, want)
@@ -297,5 +309,118 @@ func TestWaiveConcerns_BackendRefusal_Surfaced(t *testing.T) {
 	}
 	if !strings.Contains(err.Error(), "validation_failed") {
 		t.Errorf("error = %v, want it to carry the backend error code", err)
+	}
+}
+
+// --- ADR-117 D1 (#4840): the judgement is the BACKEND's to require ---
+
+// TestWaiveConcern_NoLocalJudgementPreCheck: a waive WITHOUT a judgement is not
+// refused by the tool — it reaches the backend, whose 400 validation_failed is
+// the refusal the caller sees. A tool-side pre-check would answer first and
+// mask the REST control in every MCP-level test, so the backend being called
+// exactly once is the assertion, not merely an error being returned.
+func TestWaiveConcern_NoLocalJudgementPreCheck(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.waiveStatus = http.StatusBadRequest
+	fb.waiveErrBody = `{"error":{"code":"validation_failed","message":"judgement is required","details":{"field":"judgement","rule":"judgement_required"}}}`
+	r := newResolver(srv, nil)
+	concernID := uuid.New()
+
+	_, _, err := r.waiveConcern(context.Background(), nil, WaiveConcernInput{
+		ConcernID: concernID.String(),
+		Reason:    "not blocking",
+	})
+	if err == nil || !strings.Contains(err.Error(), "validation_failed") {
+		t.Fatalf("err = %v, want the backend's validation_failed surfaced", err)
+	}
+	if fb.waiveCalledByID[concernID] != 1 {
+		t.Errorf("backend waive called %d times, want 1 (no local judgement pre-check)", fb.waiveCalledByID[concernID])
+	}
+	if fb.waiveBody.Judgement != "" || fb.waiveBody.TradeoffCost != "" {
+		t.Errorf("body judgement/tradeoff_cost = %q/%q, want both empty", fb.waiveBody.Judgement, fb.waiveBody.TradeoffCost)
+	}
+}
+
+// TestWaiveConcerns_NoLocalJudgementPreCheck is the bulk sibling: a
+// contradicting reason prefix is forwarded and the backend's refusal surfaces.
+func TestWaiveConcerns_NoLocalJudgementPreCheck(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.bulkWaiveStatus = http.StatusBadRequest
+	fb.bulkWaiveErrBody = `{"error":{"code":"validation_failed","message":"judgement \"defect\" contradicts reason prefix \"false_positive:\"","details":{"field":"judgement","rule":"judgement_conflicts_reason_prefix","reason_prefix":"false_positive:"}}}`
+	r := newResolver(srv, nil)
+	runID := uuid.New()
+
+	_, _, err := r.waiveConcerns(context.Background(), nil, WaiveConcernsInput{
+		RunID: runID.String(), ConcernIDs: []string{uuid.NewString()},
+		Reason: "false_positive: the reviewer misread the guard", Judgement: "defect",
+	})
+	if err == nil || !strings.Contains(err.Error(), "validation_failed") {
+		t.Fatalf("err = %v, want the backend's validation_failed surfaced", err)
+	}
+	if fb.bulkWaivePath == "" {
+		t.Fatal("backend never called: the tool refused the judgement locally")
+	}
+	if fb.bulkWaiveBody.Judgement != "defect" || fb.bulkWaiveBody.Reason != "false_positive: the reviewer misread the guard" {
+		t.Errorf("body = %+v, want the judgement and prefixed reason forwarded verbatim", fb.bulkWaiveBody)
+	}
+}
+
+// concernJudgementValues is the closed human judgement set the backend accepts
+// (ADR-117 D1). Plain strings: this package does not import the concern store.
+var concernJudgementValues = []string{"defect", "defect_pre_existing", "no_defect", "tradeoff", "preference", "stale", "insufficient_evidence"}
+
+// TestConcernJudgementInputs_NotSchemaRequired pins the single-authority
+// design on all four human concern tools: judgement and tradeoff_cost are NOT
+// in the advertised schema's required list (the go-sdk would refuse a
+// schema-required field before the handler and mask the backend's control),
+// yet the judgement description still says REQUIRED and names every allowed
+// value, so a caller reading the schema sends one. The pre-existing required
+// fields stay required, guarding against an over-broad omitempty demotion.
+func TestConcernJudgementInputs_NotSchemaRequired(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		schemaFor    func() (*jsonschema.Schema, error)
+		wantRequired []string
+	}{
+		{"fishhawk_waive_concern", func() (*jsonschema.Schema, error) { return jsonschema.For[WaiveConcernInput](nil) }, []string{"concern_id", "reason"}},
+		{"fishhawk_waive_concerns", func() (*jsonschema.Schema, error) { return jsonschema.For[WaiveConcernsInput](nil) }, []string{"run_id", "concern_ids", "reason"}},
+		{"fishhawk_resolve_concerns", func() (*jsonschema.Schema, error) { return jsonschema.For[ResolveConcernsInput](nil) }, []string{"run_id", "concern_ids", "evidence"}},
+		{"fishhawk_defer_concern", func() (*jsonschema.Schema, error) { return jsonschema.For[DeferConcernInput](nil) }, []string{"concern_id", "parent_epic"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			schema, err := tc.schemaFor()
+			if err != nil {
+				t.Fatalf("infer schema: %v", err)
+			}
+			required := map[string]bool{}
+			for _, r := range schema.Required {
+				required[r] = true
+			}
+			for _, k := range []string{"judgement", "tradeoff_cost"} {
+				if required[k] {
+					t.Errorf("%q is schema-required (%v); it must stay omitempty so the backend is the single refusal authority", k, schema.Required)
+				}
+				if schema.Properties[k] == nil {
+					t.Errorf("schema has no %q property", k)
+				}
+			}
+			for _, k := range tc.wantRequired {
+				if !required[k] {
+					t.Errorf("%q dropped from the required list %v", k, schema.Required)
+				}
+			}
+			prop := schema.Properties["judgement"]
+			if prop == nil {
+				return
+			}
+			if !strings.Contains(prop.Description, "REQUIRED") {
+				t.Errorf("judgement description = %q, want it to say REQUIRED", prop.Description)
+			}
+			for _, v := range concernJudgementValues {
+				if !strings.Contains(prop.Description, v) {
+					t.Errorf("judgement description does not name %q: %q", v, prop.Description)
+				}
+			}
+		})
 	}
 }

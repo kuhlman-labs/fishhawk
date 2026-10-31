@@ -71,6 +71,8 @@ This table covers the attach, retire and seat-use paths. Other seat refusals (`f
 
 **Disposing a blocking finding.** Use the existing concern surface; there is no separate mechanism: `fishhawk_waive_concern` (reason required), `fishhawk_defer_concern` (to an issue), or route a fix-up with `fishhawk_fixup_stage`. The seat cannot disposition its own finding: it is classified as an agent, and the clearing routes that need a human refuse it. Concern semantics: `backend/internal/concern/README.md`.
 
+A waive, bulk waive (`fishhawk_waive_concerns`), resolve (`fishhawk_resolve_concerns`) or defer REQUIRES a `judgement` (ADR-117 D1 phase 2, #4840): one of `defect`, `defect_pre_existing`, `no_defect`, `tradeoff`, `preference`, `stale`, `insufficient_evidence`; `unlabelled` is refused. A `tradeoff` also requires `tradeoff_cost` (the stated cost), and a cost sent with any other judgement is refused. On a waive or bulk waive the interim reason prefixes still work: `false_positive:` means `no_defect`, `accepted_tradeoff:` means `tradeoff` (send the cost too) and `preference:` means `preference`. The four rules: (a) a judgement plus a MATCHING prefix is accepted; (b) a judgement with no prefix is accepted; (c) a prefix alone supplies the judgement; (d) a judgement that CONTRADICTS the prefix is refused 400 `judgement_conflicts_reason_prefix`. Every refusal is 400 `validation_failed` naming the field and rule, and nothing is recorded. The judgement is stored on the concern and read back through `fishhawk_get_gate_view`; it never enters a reviewer prompt.
+
 **Residuals to know.**
 
 - Retirement is lazy: it happens on the seat's next request after the anchor ends, so a quiet seat keeps a live token until then. Retire by hand when a campaign is abandoned.

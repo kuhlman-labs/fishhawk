@@ -657,7 +657,26 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			// The round source (#4077): a trace round's diff is THIS stage's
 			// uploaded bundle, so a restart-orphaned round is re-dispatched from
 			// the stored bundle. Only the review call carries it.
-			reviewCtx := withReviewRoundSource(r.Context(), reviewRoundSource{Origin: reviewRoundOriginTrace})
+			//
+			// The round's reviewed head (ADR-117 A1.7) is the AUTHORITATIVE
+			// verify_run's head_sha — the same event the identity above came
+			// from — never the #797 dedup head_sha (the FIRST verify head).
+			// Fail-open like the identity: ErrNoVerifyTreeSHA stays silent, any
+			// other error WARN-logs, and both degrade to "", which records the
+			// round's reviewed_head as head_unknown rather than blocking it.
+			verifyHead, vherr := bundle.ExtractVerifyHead(bundleBytes)
+			if vherr != nil {
+				if !errors.Is(vherr, bundle.ErrNoVerifyTreeSHA) {
+					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+						"trace upload: extract verify head failed — proceeding with an unknown reviewed head",
+						slog.String("run_id", runID.String()),
+						slog.String("stage_id", stageID.String()),
+						slog.String("error", vherr.Error()),
+					)
+				}
+				verifyHead = ""
+			}
+			reviewCtx := withReviewRoundSource(r.Context(), reviewRoundSource{Origin: reviewRoundOriginTrace, HeadSHA: verifyHead})
 			// The returned reason is the gating failure (#3913): a reject
 			// verdict, a document-injection failure, or an escalation-attached
 			// persona that could not run — each under the
@@ -3771,7 +3790,18 @@ func (s *Server) runConsolidatedReviewRound(ctx context.Context, runRow *run.Run
 	//
 	// The round source (#4077) records the compare base so a
 	// restart-orphaned round is re-dispatched as ComparePatch(base, head).
-	srcCtx := withReviewRoundSource(ctx, reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base})
+	//
+	// The reviewed head (ADR-117 A1.7) is cmp.HeadSHA, unless the compare named
+	// no head or capped its commit listing (then the last LISTED commit is not
+	// the tip): the round then records head_unknown with that reason.
+	src := reviewRoundSource{Origin: reviewRoundOriginConsolidated, BaseSHA: base}
+	switch {
+	case cmp.HeadSHA == "":
+		src.HeadUnresolvedReason = reviewedHeadReasonCompareNoCommits
+	case cmp.CommitsTruncated:
+		src.HeadUnresolvedReason = reviewedHeadReasonCompareCommitsTruncated
+	}
+	srcCtx := withReviewRoundSource(ctx, src)
 	s.runImplementReviews(srcCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
 	return "", cmp.HeadSHA
 }
@@ -4285,6 +4315,20 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		return ""
 	}
 
+	// Paths the operator authorized at approval time via the #730
+	// approval-condition prose fold or the #824 add_scope_files structured
+	// fold that are NOT already in the raw plan scope.files (#829). The
+	// implement-stage prompt folds these into its effective scope, but this
+	// review prompt is built directly from approvedPlan, so we recompute the
+	// folds here (reusing the same resolvers handleGetStagePrompt uses) and
+	// thread the remainder through (trig.AmendedScopeFiles below) so the
+	// reviewer treats them as in-scope rather than flagging them as scope drift.
+	approvalScopeAdds := s.amendedScopeFilesForReview(ctx, runRow, approvedPlan)
+	// A decomposed parent's fan-out scope (#4425): every sub_plan-only path and
+	// every slice's add_scope_files_to_slice grant, from the SAME resolver the
+	// parent fix-up serve reads (decomposedParentScopeChannels). Nil for every
+	// run that is not a decomposed parent.
+	parentFanOut := s.parentFanOutScopeForReview(ctx, runRow, approvedPlan)
 	trig := prompt.Trigger{
 		Repo:         runRow.Repo,
 		ApprovedPlan: approvedPlan,
@@ -4298,15 +4342,6 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		// reviewer distinguish an operator-stageable drift path from a
 		// genuinely missing file. Empty/nil when there was no drift.
 		ScopeDrift: scopeDrift,
-		// Paths the operator authorized at approval time via the #730
-		// approval-condition prose fold or the #824 add_scope_files structured
-		// fold that are NOT already in the raw plan scope.files (#829). The
-		// implement-stage prompt folds these into its effective scope, but this
-		// review prompt is built directly from approvedPlan, so we recompute the
-		// folds here (reusing the same resolvers handleGetStagePrompt uses) and
-		// thread the remainder through so the reviewer treats them as in-scope
-		// rather than flagging them as scope drift.
-		AmendedScopeFiles: s.amendedScopeFilesForReview(ctx, runRow, approvedPlan),
 		// The operator's binding approve-with-conditions text (#1021), via
 		// the same resolver the implement-stage prompt uses (decomposed-
 		// child/retry-parent fallback included). The conditions AMEND the
@@ -4334,6 +4369,12 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		// no gate ran, extraction error) keeps the prompt byte-identical.
 		GateEvidence: gateEvidence,
 	}
+	// #4425: a decomposed parent's consolidated branch carries every slice's
+	// commit, so its sub_plan-only paths and slice grants must be in the
+	// reviewer's approval-amended list or criterion 4 flags an edit to one of
+	// them as scope drift (a parent fix-up admitted by the #4338 serve, or the
+	// first consolidated round). Approval adds first, fan-out paths after.
+	trig.AmendedScopeFiles = appendFanOutPaths(approvalScopeAdds, parentFanOut)
 	// Decomposed-parent rollup (#2820): a fan-out CHILD's APPROVED mid-stage scope
 	// amendment lives under the CHILD run id, so a path an operator authorized on a
 	// slice reaches this parent's consolidated diff with no provenance on the
@@ -4469,6 +4510,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			)
 		}
 	}
+	// The round's reviewed-head record (ADR-117 A1.7), built from the diff the
+	// round ACTUALLY reviews and the round source the dispatcher set. It rides
+	// the implement_review_started entry only; the prompt is unchanged.
+	roundSrc, roundSrcOK := reviewRoundSourceFrom(ctx)
+	reviewedHead := buildReviewedHead(roundSrc, roundSrcOK, headSHA, treeSHA, changeID, reviewedDiff, trig.DeltaReReview)
 
 	// Diff-truncation notice + operator-facing audit (#2875). The reviewer sees a
 	// PREFIX of the change when the runner cut the patch at 256 KiB or the forge
@@ -4496,7 +4542,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 
 	// Operator-scope-undelivered pre-review signal (#1407): the operator may
 	// have DELIBERATELY added a scope path — either an add_scope_files path
-	// folded at plan approval (already computed as trig.AmendedScopeFiles) or
+	// folded at plan approval (already computed as approvalScopeAdds) or
 	// an approved mid-stage scope amendment — that the implement commit left
 	// UNTOUCHED. Today that is conflated with benign plan-scope under-staging
 	// and surfaces only at the implement-review reject → fixup round-trip
@@ -4512,7 +4558,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// signal would surface as an operator-scope-undelivered MISS on the parent,
 	// trading the #2820 false drift signal for a false miss signal. It is folded
 	// only into the review-facing provenance (scopeProvenanceForReview), never the
-	// operator-scope-undelivered union.
+	// operator-scope-undelivered union. The #4425 parent fan-out channels
+	// (parentFanOut: sub_plan-only paths and slice grants) are likewise a
+	// slice's permission, not a work-order on the parent, so they stay out of
+	// this signal too: the union reads the UNWIDENED approvalScopeAdds, not
+	// trig.AmendedScopeFiles (which now also carries the fan-out paths).
 	//
 	// #3029: the DELIVERY question is "has this implement STAGE committed the
 	// path", not "did THIS PASS touch it" — a fix-up re-review's diff is the
@@ -4526,7 +4576,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// untouched: this moves the evaluation set only, never what the reviewer reads.
 	eval := s.resolveStageCumulativeEval(ctx, runRow, runID, stageID, headSHA, diff)
 	evalDiff := eval.Diff
-	operatorAdded := append([]string(nil), trig.AmendedScopeFiles...)
+	operatorAdded := append([]string(nil), approvalScopeAdds...)
 	operatorAdded = append(operatorAdded, s.approvedAmendmentScopePaths(ctx, runID)...)
 	if undelivered, undeliveredIndeterminate := operatorScopeUndelivered(operatorAdded, evalDiff); len(undelivered) > 0 {
 		// Populate the prompt signal so the reviewer sees the miss as a
@@ -4885,7 +4935,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	// operator-scope-undelivered signal used, so the two surfaces can never
 	// contradict each other, and carry the set label onto the block so the
 	// reviewer is told which set the labels were derived from.
-	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, evalDiff, gateEvidence); prov != nil {
+	if prov := s.scopeProvenanceForReview(ctx, runID, stageID, approvedPlan, trig, parentFanOut, evalDiff, gateEvidence); prov != nil {
 		if gateEvidence == nil {
 			gateEvidence = &prompt.GateEvidence{}
 			trig.GateEvidence = gateEvidence
@@ -5094,7 +5144,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 	//
 	// configured_agents counts every persona invocation too (#3753): each one
 	// produces exactly one terminal entry, so the round settles at this count.
-	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), headSHA, treeSHA, changeID)
+	roundSeq, _ := s.emitReviewStarted(ctx, runID, stageID, "implement_review_started", authority, reviewersCfg.AgentCount()+len(personaInvs), personaNames(personaInvs), headSHA, treeSHA, changeID, reviewedHead)
 	reviewDispatchMu.Unlock()
 
 	// invocations were resolved above (before the prompt build) so the grounding
@@ -5173,6 +5223,11 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 // no scope.files the reviewer has no baseline to drift against, so there is
 // nothing to amend and it returns nil. Returns nil (not an empty slice) when
 // there is no amendment, keeping the review prompt byte-identical to today.
+//
+// It stays the APPROVAL-ONLY list (it also feeds the #1407
+// operator-scope-undelivered union). A decomposed parent's fan-out union
+// (parentFanOutScopeForReview, #4425) is appended to Trigger.AmendedScopeFiles
+// at the runImplementReviewsForTree call site, never here.
 func (s *Server) amendedScopeFilesForReview(ctx context.Context, runRow *run.Run, approvedPlan *plan.Plan) []string {
 	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
 		return nil
@@ -5318,14 +5373,26 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 // honestly as UnexplainedCount rather than being hidden.
 //
 // The effective set is rebuilt in the SAME fold order handleGetStagePrompt
-// applies (server/prompt.go): plan scope.files, then trig.AmendedScopeFiles
-// (approval-add-scope-files), approvedAmendmentScopePaths (scope-amendment),
-// the decomposed parent's children's approved amendments (child-scope-amendment,
-// #2820 — carrying a per-path Detail naming the authorizing amendment),
-// and — on a fix-up pass only — resolveFixupAllowCreate (fixup-allow-create)
-// and the coupled *_test.go stem siblings over the accumulated set
-// (fixup-coupled-test-sibling), deduped by path with first-source-wins
-// (plan wins over any fold), matching foldScopePaths semantics.
+// applies (server/prompt.go): plan scope.files, then the flat approval
+// add_scope_files (approval-add-scope-files: trig.AmendedScopeFiles minus the
+// fan-out paths appended to it), approvedAmendmentScopePaths
+// (scope-amendment), then a decomposed parent's fan-out union (#4425, fanOut
+// from parentFanOutScopeForReview: parent-sub-plan-scope and
+// parent-slice-add-scope-files, each with a per-path Detail and its DECLARED
+// operation), the decomposed parent's children's approved amendments
+// (child-scope-amendment, #2820 — carrying a per-path Detail naming the
+// authorizing amendment), and — on a fix-up pass only —
+// resolveFixupAllowCreate (fixup-allow-create) and the coupled *_test.go stem
+// siblings over the accumulated set (fixup-coupled-test-sibling), deduped by
+// path with first-source-wins (plan wins over any fold), matching
+// foldScopePaths semantics. The fan-out folds after the flat approval adds,
+// exactly as decomposedParentFixupScope runs after the serve's add_scope_files
+// fold, so a path in both keeps the flat channel's label and modify operation
+// and the coupled-test fold over accum reproduces the served set (a sub_plan
+// delete yields no sibling only when nothing earlier declared the path). The
+// reconstruction is a set and UnexplainedCount compares sizes, so the fold
+// order decides only the label of a path present in two channels — and, through
+// the operation it records, its coupled sibling.
 //
 // Each plan/fold path is marked touched by membership in the committed diff
 // using the same set walk + trailing-slash / non-repo-relative skips as
@@ -5339,7 +5406,7 @@ func (s *Server) approvedAmendmentScopePaths(ctx context.Context, runID uuid.UUI
 // nil when there is nothing to report (no folds, no untouched plan path, no
 // unexplained residual, and not a fix-up pass), keeping the prompt
 // byte-identical for the common plain-plan-scope case.
-func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uuid.UUID, approvedPlan *plan.Plan, trig prompt.Trigger, diff policy.Diff, ev *prompt.GateEvidence) *prompt.GateScopeProvenance {
+func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uuid.UUID, approvedPlan *plan.Plan, trig prompt.Trigger, fanOut []parentFanOutScopePath, diff policy.Diff, ev *prompt.GateEvidence) *prompt.GateScopeProvenance {
 	if approvedPlan == nil || len(approvedPlan.Scope.Files) == 0 {
 		return nil
 	}
@@ -5415,8 +5482,43 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 			})
 		}
 	}
-	addFold(trig.AmendedScopeFiles, "approval-add-scope-files")
+	// trig.AmendedScopeFiles also carries the #4425 fan-out paths (appended at
+	// the call site), and parentFanOutScopeForReview excludes every flat
+	// approval add, so the flat channel is exactly the entries that are not
+	// fan-out paths. The fan-out paths fold below under their own labels.
+	fanOutPaths := make(map[string]struct{}, len(fanOut))
+	for _, entry := range fanOut {
+		fanOutPaths[entry.Path] = struct{}{}
+	}
+	var approvalAdds []string
+	for _, p := range trig.AmendedScopeFiles {
+		if _, ok := fanOutPaths[p]; !ok {
+			approvalAdds = append(approvalAdds, p)
+		}
+	}
+	addFold(approvalAdds, "approval-add-scope-files")
 	addFold(s.approvedAmendmentScopePaths(ctx, runID), "scope-amendment")
+	// Decomposed-parent fan-out union (#4425): every sub_plan-only path and
+	// every slice's add_scope_files_to_slice grant, so an edit to one on the
+	// consolidated branch does not read as an unexplained residual. Same
+	// first-source-wins dedup and touched marking as addFold; the DECLARED
+	// operation rides into accum so the fix-up coupled-test fold reproduces the
+	// served set. Nil for every run that is not a decomposed parent.
+	for _, fp := range fanOut {
+		if _, ok := inScope[fp.Path]; ok {
+			continue
+		}
+		inScope[fp.Path] = struct{}{}
+		foldSource[fp.Path] = fp.Source
+		op := fp.Operation
+		if op == "" {
+			op = "modify"
+		}
+		accum = append(accum, scopeFile{Path: fp.Path, Operation: op})
+		folds = append(folds, prompt.GateScopeFold{
+			Path: fp.Path, Source: fp.Source, Touched: touched(fp.Path), Detail: fp.Detail,
+		})
+	}
 	// Decomposed-parent children's approved amendments (#2820): a slice's
 	// operator-approved amendment path folds in as in-scope so it does not read as
 	// an unexplained residual on the parent. Resolved once in runImplementReviews
@@ -6023,6 +6125,16 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 				slog.Int64("verdict_sequence", entry.Sequence),
 			)
 		}
+		// Late child-slice import (E94.1 / #4692, ADR-117 D2): a decomposition
+		// child's advisory review runs detached and routinely lands AFTER the
+		// child succeeded and the parent's fan-in ran, so its new concerns are
+		// copied into the parent's ledger here. It runs only AFTER both
+		// retry-supersession reads, and never for a verdict superseded at
+		// either (approval condition C1(a)): a discarded attempt's concerns
+		// must not reach the parent.
+		if !superseded && len(freshRows) > 0 {
+			s.importLateSliceConcerns(ctx, runID)
+		}
 		// Buffer the delta-verification resolutions (#984) instead of
 		// applying them here (E48.103 / #2551): they are applied once
 		// after the loop, through the veto pass that can see what the
@@ -6158,6 +6270,7 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 		)
 		return
 	}
+	var superseded []*concern.Concern
 	for _, c := range rows {
 		if c.StageID != stageID || c.StageKind != concern.StageKindImplement || !c.State.IsOpen() {
 			continue
@@ -6172,8 +6285,14 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 				"concern_id", c.ID,
 				"error", err.Error(),
 			)
+			continue
 		}
+		superseded = append(superseded, c)
 	}
+	// A decomposition child's superseded concern may already have a parent
+	// copy (E94.1 / #4692): supersede it in the same pass, so no parent copy
+	// outlives its source (approval condition C1(b)).
+	s.supersedeRolledUpCopies(ctx, runID, superseded, reason)
 }
 
 // runSupplementalReinvokeReview dispatches the bounded, ADDITIVE supplemental
@@ -7265,8 +7384,9 @@ func (s *Server) autoCloseUnjudgedRoutedConcerns(ctx context.Context, runID, sta
 		// concern.validTransitions, so no new state and no migration. Per-row
 		// failures (including an InvalidTransitionError from a row that changed
 		// state under us) WARN-log and continue, mirroring
-		// applyConcernResolutions' best-effort posture.
-		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, row.ID, concern.StateAddressed, reason); aerr != nil {
+		// applyConcernResolutions' best-effort posture. A system writer's close:
+		// outcome fixed, no judgement column touched (E94.2 / #4693).
+		if _, aerr := s.cfg.ConcernRepo.ApplyDisposition(ctx, row.ID, concern.StateAddressed, reason, concern.Disposition{Outcome: concern.OutcomeFixed}); aerr != nil {
 			warn("apply resolution failed",
 				slog.String("concern_id", row.ID.String()),
 				slog.String("error", aerr.Error()),
@@ -7668,7 +7788,16 @@ func (s *Server) applyConcernResolutions(ctx context.Context, runID, stageID uui
 		if to == concern.StateAddressed && reviewedHeadSHA != "" {
 			note += " [verified at " + reviewedHeadSHA + "]"
 		}
-		if _, aerr := s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, note); aerr != nil {
+		// A confirm is a SYSTEM writer's close (E94.2 / #4693, ADR-117 D1): it
+		// records outcome fixed through ApplyDisposition, which never touches a
+		// judgement column. reopened / superseded record no outcome.
+		var aerr error
+		if to == concern.StateAddressed {
+			_, aerr = s.cfg.ConcernRepo.ApplyDisposition(ctx, cid, to, note, concern.Disposition{Outcome: concern.OutcomeFixed})
+		} else {
+			_, aerr = s.cfg.ConcernRepo.ApplyResolution(ctx, cid, to, note)
+		}
+		if aerr != nil {
 			// InvalidTransitionError lands here — including the
 			// confirm-after-reopen case across heterogeneous reviewers,
 			// satisfying concern.go's never-silently-swallow contract.
@@ -8090,6 +8219,42 @@ func truncatedPatchOmittedFiles(diff policy.Diff) []string {
 	if !diff.PatchTruncated || len(diff.ChangedFiles) == 0 {
 		return nil
 	}
+	// Rendered FROM the plain-path classifier (ADR-117 A1.7) so the decorated
+	// audit/prompt list and the reviewed_head path sets can never disagree. A
+	// path's class depends only on the path, so membership lookup in
+	// ChangedFiles order reproduces the pre-A1.7 output byte for byte.
+	_, partial, omitted := classifyTruncatedPatchFiles(diff)
+	partialSet := make(map[string]bool, len(partial))
+	for _, p := range partial {
+		partialSet[p] = true
+	}
+	omittedSet := make(map[string]bool, len(omitted))
+	for _, p := range omitted {
+		omittedSet[p] = true
+	}
+	var out []string
+	for _, f := range diff.ChangedFiles {
+		switch {
+		case omittedSet[f.Path]:
+			out = append(out, f.Path+" (no hunks shown)")
+		case partialSet[f.Path]:
+			out = append(out, f.Path+" (may be cut — its tail may be missing)")
+		default:
+			// Header present and not the last one — fully visible; not reported.
+		}
+	}
+	return out
+}
+
+// classifyTruncatedPatchFiles is truncatedPatchOmittedFiles' classification as
+// PLAIN repo-relative paths (ADR-117 A1.7, E94.3 / #4694), in ChangedFiles
+// order: full has a `diff --git` header that is not the last surviving one,
+// partial IS the last surviving header (its tail may be cut), omitted has no
+// header at all. It applies the SAME gitDiffHeaderIndex + last-surviving-header
+// rule, fail-closed and over-reporting exactly as documented above; the
+// reviewed_head record (buildReviewedHead) reads these sets and the decorated
+// truncation list is rendered from them.
+func classifyTruncatedPatchFiles(diff policy.Diff) (full, partial, omitted []string) {
 	patch := diff.Patch
 	idxByFile := make([]int, len(diff.ChangedFiles))
 	lastIdx := -1
@@ -8100,18 +8265,17 @@ func truncatedPatchOmittedFiles(diff policy.Diff) []string {
 			lastIdx = idx
 		}
 	}
-	var out []string
 	for i, f := range diff.ChangedFiles {
 		switch {
 		case idxByFile[i] < 0:
-			out = append(out, f.Path+" (no hunks shown)")
+			omitted = append(omitted, f.Path)
 		case idxByFile[i] == lastIdx:
-			out = append(out, f.Path+" (may be cut — its tail may be missing)")
+			partial = append(partial, f.Path)
 		default:
-			// Header present and not the last one — fully visible; not reported.
+			full = append(full, f.Path)
 		}
 	}
-	return out
+	return full, partial, omitted
 }
 
 // gitDiffHeaderIndex returns the byte offset of the `diff --git ` header line

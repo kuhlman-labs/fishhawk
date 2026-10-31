@@ -276,12 +276,29 @@ func TestFirstOfficerSeat_EndToEndPostgres(t *testing.T) {
 		t.Fatalf("gate view does not list concern %s", sent.BlockingConcernID)
 	}
 
-	// (g) waive needs a reason; once waived the hold clears.
-	if w := f.do(http.MethodPost, "/v0/concerns/"+sent.BlockingConcernID+"/waive", human, `{"reason":""}`); w.Code != http.StatusBadRequest {
+	// (g) waive needs a reason and a judgement (E94.7 / #4840); once waived
+	// the hold clears and the committed row carries the judgement record.
+	if w := f.do(http.MethodPost, "/v0/concerns/"+sent.BlockingConcernID+"/waive", human, `{"reason":"","judgement":"tradeoff","tradeoff_cost":"two runs touch one file"}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("empty-reason waive = %d, want 400:\n%s", w.Code, w.Body.String())
 	}
-	if w := f.do(http.MethodPost, "/v0/concerns/"+sent.BlockingConcernID+"/waive", human, `{"reason":"overlap is intended"}`); w.Code != http.StatusOK {
+	if w := f.do(http.MethodPost, "/v0/concerns/"+sent.BlockingConcernID+"/waive", human, `{"reason":"overlap is intended"}`); w.Code != http.StatusBadRequest ||
+		!strings.Contains(w.Body.String(), `"field":"judgement"`) {
+		t.Fatalf("judgement-less waive = %d, want 400 validation_failed field=judgement:\n%s", w.Code, w.Body.String())
+	}
+	if w := f.do(http.MethodPost, "/v0/concerns/"+sent.BlockingConcernID+"/waive", human, `{"reason":"overlap is intended","judgement":"tradeoff","tradeoff_cost":"two runs touch one file"}`); w.Code != http.StatusOK {
 		t.Fatalf("waive = %d:\n%s", w.Code, w.Body.String())
+	}
+	var (
+		judgement, actorKind, outcome, tradeoffCost string
+		delegated, bulk, backfill                   bool
+	)
+	if err := f.pool.QueryRow(ctx, `SELECT judgement, judgement_actor_kind, judgement_delegated, judgement_bulk, judgement_backfill, outcome, tradeoff_cost
+		FROM review_concerns WHERE id = $1`, sent.BlockingConcernID).Scan(&judgement, &actorKind, &delegated, &bulk, &backfill, &outcome, &tradeoffCost); err != nil {
+		t.Fatalf("read the waived concern row: %v", err)
+	}
+	if judgement != "tradeoff" || actorKind != "user" || delegated || bulk || backfill || outcome != "waived" || tradeoffCost != "two runs touch one file" {
+		t.Fatalf("committed row: judgement %q actor %q delegated %v bulk %v backfill %v outcome %q cost %q; want tradeoff/user/false/false/false/waived/the cost",
+			judgement, actorKind, delegated, bulk, backfill, outcome, tradeoffCost)
 	}
 	if w := f.do(http.MethodPost, "/v0/runs/"+runID.String()+"/merge", human, `{"verdict":"lgtm"}`); strings.Contains(w.Body.String(), codeFirstOfficerFindingOpen) {
 		t.Fatalf("merge still held after waive:\n%s", w.Body.String())

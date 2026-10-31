@@ -76,6 +76,12 @@ function bodyOf(call: unknown[]): Record<string, unknown> {
   return JSON.parse(String((call[1] as RequestInit)?.body));
 }
 
+// chooseJudgement picks a judgement in the concern panel's select (E94.7 /
+// #4840): Waive and Defer both require one.
+function chooseJudgement(value: string) {
+  fireEvent.change(screen.getByLabelText('Judgement'), { target: { value } });
+}
+
 describe('DecisionPanel — happy paths (one per kind)', () => {
   beforeEach(() => vi.unstubAllGlobals());
   afterEach(() => vi.unstubAllGlobals());
@@ -113,6 +119,7 @@ describe('DecisionPanel — happy paths (one per kind)', () => {
     const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
     const { onResolved } = renderPanel(item);
 
+    chooseJudgement('no_defect');
     fireEvent.change(screen.getByLabelText('Waive reason'), {
       target: { value: 'false positive' },
     });
@@ -121,21 +128,22 @@ describe('DecisionPanel — happy paths (one per kind)', () => {
     await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
     const calls = postCalls(fetchMock);
     expect(String(calls[0][0])).toBe(`/v0/concerns/${item.concern_id}/waive`);
-    expect(bodyOf(calls[0])).toEqual({ reason: 'false positive' });
+    expect(bodyOf(calls[0])).toEqual({ reason: 'false positive', judgement: 'no_defect' });
   });
 
-  it('split_verdict: Defer POSTs the parent_epic to the defer URL', async () => {
+  it('split_verdict: Defer POSTs the parent_epic and judgement to the defer URL', async () => {
     const item = itemOf('split_verdict');
     const fetchMock = stubFetch(() => ({ status: 200, body: { concern: {}, issue: {} } }));
     renderPanel(item);
 
+    chooseJudgement('defect_pre_existing');
     fireEvent.change(screen.getByLabelText(/defer: parent epic/i), { target: { value: '#1196' } });
     fireEvent.click(screen.getByRole('button', { name: 'Defer' }));
 
     await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
     const call = postCalls(fetchMock)[0];
     expect(String(call[0])).toBe(`/v0/concerns/${item.concern_id}/defer`);
-    expect(bodyOf(call)).toEqual({ parent_epic: '#1196' });
+    expect(bodyOf(call)).toEqual({ judgement: 'defect_pre_existing', parent_epic: '#1196' });
   });
 
   it('paged_concern: Waive POSTs the reason to the waive URL (same panel, other kind)', async () => {
@@ -143,11 +151,16 @@ describe('DecisionPanel — happy paths (one per kind)', () => {
     const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
     renderPanel(item);
 
+    chooseJudgement('preference');
     fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'accepted' } });
     fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
 
     await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
     expect(String(postCalls(fetchMock)[0][0])).toBe(`/v0/concerns/${item.concern_id}/waive`);
+    expect(bodyOf(postCalls(fetchMock)[0])).toEqual({
+      reason: 'accepted',
+      judgement: 'preference',
+    });
   });
 
   it('acceptance_disposition: ticking ack POSTs acknowledge_failed_criteria: true', async () => {
@@ -216,6 +229,7 @@ describe('DecisionPanel — blank-required-field guard (C2)', () => {
   it('Waive with an empty reason issues ZERO fetches (button disabled)', () => {
     const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
     renderPanel(itemOf('split_verdict'));
+    chooseJudgement('no_defect');
     // reason deliberately left empty
     fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
     expect(fetchMock).not.toHaveBeenCalled();
@@ -224,8 +238,144 @@ describe('DecisionPanel — blank-required-field guard (C2)', () => {
   it('Defer with an empty parent_epic issues ZERO fetches (button disabled)', () => {
     const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
     renderPanel(itemOf('split_verdict'));
+    chooseJudgement('defect');
     fireEvent.click(screen.getByRole('button', { name: 'Defer' }));
     expect(fetchMock).not.toHaveBeenCalled();
+  });
+});
+
+describe('DecisionPanel — judgement gate (E94.7 / #4840)', () => {
+  beforeEach(() => vi.unstubAllGlobals());
+  afterEach(() => vi.unstubAllGlobals());
+
+  it('offers exactly the seven human judgements behind an empty placeholder, never unlabelled', () => {
+    stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(itemOf('split_verdict'));
+    const select = screen.getByLabelText('Judgement') as HTMLSelectElement;
+    expect(select.value).toBe('');
+    expect(Array.from(select.options).map((o) => o.value)).toEqual([
+      '',
+      'defect',
+      'defect_pre_existing',
+      'no_defect',
+      'tradeoff',
+      'preference',
+      'stale',
+      'insufficient_evidence',
+    ]);
+  });
+
+  it('Waive with a reason but NO judgement issues ZERO fetches (button disabled)', () => {
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(itemOf('split_verdict'));
+    fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'fine' } });
+    // judgement deliberately left on the placeholder
+    expect(screen.getByRole('button', { name: 'Waive' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('Defer with a parent_epic but NO judgement issues ZERO fetches (button disabled)', () => {
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(itemOf('split_verdict'));
+    fireEvent.change(screen.getByLabelText(/defer: parent epic/i), { target: { value: '#1196' } });
+    expect(screen.getByRole('button', { name: 'Defer' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Defer' }));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('the tradeoff cost field appears only for a tradeoff judgement', () => {
+    stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(itemOf('split_verdict'));
+    expect(screen.queryByLabelText('Tradeoff cost')).not.toBeInTheDocument();
+    chooseJudgement('tradeoff');
+    expect(screen.getByLabelText('Tradeoff cost')).toBeInTheDocument();
+    chooseJudgement('defect');
+    expect(screen.queryByLabelText('Tradeoff cost')).not.toBeInTheDocument();
+  });
+
+  it('a tradeoff with a blank cost keeps Waive and Defer disabled (ZERO fetches)', () => {
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(itemOf('split_verdict'));
+    chooseJudgement('tradeoff');
+    fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'accepted' } });
+    fireEvent.change(screen.getByLabelText(/defer: parent epic/i), { target: { value: '#1196' } });
+    fireEvent.change(screen.getByLabelText('Tradeoff cost'), { target: { value: '   ' } });
+    expect(screen.getByRole('button', { name: 'Waive' })).toBeDisabled();
+    expect(screen.getByRole('button', { name: 'Defer' })).toBeDisabled();
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Defer' }));
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it('Waive with a tradeoff and its cost POSTs both', async () => {
+    const item = itemOf('split_verdict');
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    const { onResolved } = renderPanel(item);
+    chooseJudgement('tradeoff');
+    fireEvent.change(screen.getByLabelText('Tradeoff cost'), {
+      target: { value: ' one extra query per page ' },
+    });
+    fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'accepted' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+
+    await waitFor(() => expect(onResolved).toHaveBeenCalledTimes(1));
+    expect(bodyOf(postCalls(fetchMock)[0])).toEqual({
+      reason: 'accepted',
+      judgement: 'tradeoff',
+      tradeoff_cost: 'one extra query per page',
+    });
+  });
+
+  it('Defer with a tradeoff and its cost POSTs both', async () => {
+    const fetchMock = stubFetch(() => ({ status: 200, body: { concern: {}, issue: {} } }));
+    renderPanel(itemOf('paged_concern'));
+    chooseJudgement('tradeoff');
+    fireEvent.change(screen.getByLabelText('Tradeoff cost'), { target: { value: 'slower CI' } });
+    fireEvent.change(screen.getByLabelText(/defer: parent epic/i), { target: { value: '#1196' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Defer' }));
+
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
+    expect(bodyOf(postCalls(fetchMock)[0])).toEqual({
+      judgement: 'tradeoff',
+      tradeoff_cost: 'slower CI',
+      parent_epic: '#1196',
+    });
+  });
+
+  it('a cost typed under tradeoff is NOT sent after switching to another judgement', async () => {
+    const fetchMock = stubFetch(() => ({ status: 200, body: {} }));
+    renderPanel(itemOf('split_verdict'));
+    chooseJudgement('tradeoff');
+    fireEvent.change(screen.getByLabelText('Tradeoff cost'), { target: { value: 'stray' } });
+    chooseJudgement('stale');
+    fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'gone' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+
+    await waitFor(() => expect(postCalls(fetchMock)).toHaveLength(1));
+    const body = bodyOf(postCalls(fetchMock)[0]);
+    expect(body).toEqual({ reason: 'gone', judgement: 'stale' });
+    expect('tradeoff_cost' in body).toBe(false);
+  });
+
+  it('a 400 judgement refusal (e.g. a contradicting reason prefix) surfaces, no resolve', async () => {
+    stubFetch(() => ({
+      status: 400,
+      body: {
+        error: 'validation_failed',
+        message: 'judgement "defect" contradicts reason prefix "false_positive:"',
+        details: { field: 'judgement', rule: 'judgement_conflicts_reason_prefix' },
+      },
+    }));
+    const { onResolved } = renderPanel(itemOf('split_verdict'));
+    chooseJudgement('defect');
+    fireEvent.change(screen.getByLabelText('Waive reason'), {
+      target: { value: 'false_positive: not reachable' },
+    });
+    fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
+    await screen.findByRole('alert');
+    expect(screen.getByRole('alert')).toHaveTextContent(/400 · validation_failed/);
+    expect(onResolved).not.toHaveBeenCalled();
   });
 });
 
@@ -259,6 +409,7 @@ describe('DecisionPanel — failure modes leave the item (onResolved not called)
   it('F2: concern waive 422 concern_waive_conflict surfaces the error, no resolve', async () => {
     stubFetch(() => ({ status: 422, body: { error: 'concern_waive_conflict' } }));
     const { onResolved } = renderPanel(itemOf('split_verdict'));
+    chooseJudgement('no_defect');
     fireEvent.change(screen.getByLabelText('Waive reason'), { target: { value: 'x' } });
     fireEvent.click(screen.getByRole('button', { name: 'Waive' }));
     await screen.findByRole('alert');
@@ -269,6 +420,7 @@ describe('DecisionPanel — failure modes leave the item (onResolved not called)
   it('F3: concern defer 502 work_item_filing_failed surfaces the error, no resolve', async () => {
     stubFetch(() => ({ status: 502, body: { error: 'work_item_filing_failed' } }));
     const { onResolved } = renderPanel(itemOf('split_verdict'));
+    chooseJudgement('defect');
     fireEvent.change(screen.getByLabelText(/defer: parent epic/i), { target: { value: '#1196' } });
     fireEvent.click(screen.getByRole('button', { name: 'Defer' }));
     await screen.findByRole('alert');

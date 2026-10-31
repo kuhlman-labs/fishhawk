@@ -93,6 +93,7 @@ type Campaign struct {
 	AccountID      *uuid.UUID         `json:"account_id"`
 	WorkingDir     string             `json:"working_dir"`
 	GroomingSource []byte             `json:"grooming_source"`
+	RunnerKind     string             `json:"runner_kind"`
 }
 
 type CampaignItem struct {

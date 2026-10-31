@@ -1959,6 +1959,69 @@ func TestExtractVerifyIdentity_BadInput(t *testing.T) {
 	}
 }
 
+// TestExtractVerifyHead_AuthoritativeLastEvent pins ADR-117 A1.7's reviewed
+// head (E94.3 / #4694): ExtractVerifyHead returns the head_sha of the SAME last
+// event with a non-empty tree_sha that ExtractVerifyIdentity reads — never the
+// first non-empty head (ExtractHeadSHA's #797 dedup key) and never a later
+// tree-less event's head.
+func TestExtractVerifyHead_AuthoritativeLastEvent(t *testing.T) {
+	b := packLines(t, []Line{
+		{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		makeVerifyRunIdentityLine(t, 2, "head-a", "tree-a", "change-a", "failed"),
+		makeVerifyRunIdentityLine(t, 3, "head-b", "tree-b", "change-b", "passed"),
+		makeVerifyRunIdentityLine(t, 4, "head-c", "", "", "skipped"),
+	})
+	head, err := ExtractVerifyHead(b)
+	if err != nil {
+		t.Fatalf("ExtractVerifyHead: %v", err)
+	}
+	if head != "head-b" {
+		t.Errorf("verify head = %q, want head-b (the authoritative event's head)", head)
+	}
+	if first, _ := ExtractHeadSHA(b); first != "head-a" {
+		t.Errorf("ExtractHeadSHA = %q, want head-a — the two readers must differ on this fixture", first)
+	}
+
+	// The authoritative event carrying no head_sha yields "" with a nil error;
+	// an earlier iteration's head never fills it in.
+	b = packLines(t, []Line{
+		makeVerifyRunIdentityLine(t, 1, "head-a", "tree-a", "", "failed"),
+		makeVerifyRunIdentityLine(t, 2, "", "tree-b", "", "passed"),
+	})
+	head, err = ExtractVerifyHead(b)
+	if err != nil || head != "" {
+		t.Errorf("ExtractVerifyHead = (%q, %v), want (\"\", nil)", head, err)
+	}
+}
+
+// TestExtractVerifyHead_NoVerifyTree pins the sentinel and the hard errors:
+// with no authoritative tree there is no event to read a head from.
+func TestExtractVerifyHead_NoVerifyTree(t *testing.T) {
+	cases := map[string][]Line{
+		"no verify_run": {
+			{Seq: 1, Kind: "manifest", Data: json.RawMessage(`{"bundle_schema":"v1"}`)},
+		},
+		"head but no tree_sha": {
+			makeVerifyRunIdentityLine(t, 1, "head-a", "", "", "skipped"),
+		},
+	}
+	for name, lines := range cases {
+		t.Run(name, func(t *testing.T) {
+			head, err := ExtractVerifyHead(packLines(t, lines))
+			if !errors.Is(err, ErrNoVerifyTreeSHA) || head != "" {
+				t.Errorf("ExtractVerifyHead = (%q, %v), want (\"\", ErrNoVerifyTreeSHA)", head, err)
+			}
+		})
+	}
+	if _, err := ExtractVerifyHead([]byte("not gzipped")); !errors.Is(err, ErrBadGzip) {
+		t.Errorf("err = %v, want ErrBadGzip", err)
+	}
+	bad := []Line{{Seq: 1, Kind: EventKindVerifyRun, Data: json.RawMessage(`[1,2,3]`)}}
+	if _, err := ExtractVerifyHead(packLines(t, bad)); err == nil || !strings.Contains(err.Error(), "parse verify_run payload") {
+		t.Errorf("err = %v, want parse-payload error", err)
+	}
+}
+
 // B3 (#3655): ExtractHeadSHA's first-non-empty rule is UNCHANGED on the same
 // multi-iteration fixture — the two extractors deliberately differ.
 func TestExtractHeadSHA_FirstNonEmptyUnchangedOnMultiIterationBundle(t *testing.T) {

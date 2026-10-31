@@ -16,15 +16,18 @@ import (
 // This file pins ADR-096 D3 to the real verify gate: every leg `scripts/test
 // verify` runs, and every `_verify_gate_harnesses` entry, must be registered
 // below with its inputs, and every input a leg reads as a whole-tree input
-// must be covered by GlobalSurface. A new leg or harness without a row, a
+// must be covered by this repository's verdict_transfer declaration's
+// verdict-wide (global_surface) or doc-check class — never by an inert one
+// (thisRepoSurface: the live block once the operator lands it, the committed
+// example until then). A new leg or harness without a row, a
 // line of cmd_verify / _verify_gate_harnesses this file cannot classify, or a
 // `_verify_*` leg invoking an undeclared script, fails the test by name.
 
 type coverage int
 
 const (
-	// global: the input must match GlobalSurface (a change to it on either
-	// side forces a verify pass).
+	// global: the input must be covered by the declaration's verdict-wide or
+	// doc-check class (a change to it on either side forces a verify pass).
 	global coverage = iota
 	// goReach: the leg consumes the input only by compiling, linting or
 	// testing Go packages, which rule (c)'s import graph already tracks.
@@ -216,10 +219,14 @@ func toSet(xs []string) map[string]bool {
 }
 
 // checkVerifyLegs is the pure checker behind the pin. files are repo-relative
-// slash paths of the tree the inputs are matched against.
-func checkVerifyLegs(script string, tbl legTable, files []string) []error {
+// slash paths of the tree the inputs are matched against; s is the
+// declaration whose verdict-wide or doc-check class must cover every global
+// input (an inert class never does; a nil s covers nothing but the workflow
+// spec).
+func checkVerifyLegs(script string, tbl legTable, files []string, s *Surface) []error {
 	var errs []error
 	fail := func(format string, a ...any) { errs = append(errs, fmt.Errorf(format, a...)) }
+	covered := func(f string) bool { return s.matchVerdictWide(f) || s.matchDocCheck(f) }
 
 	// cmd_verify: every code line is exact plumbing or a registered-leg line.
 	body, ok := funcBody(script, "cmd_verify")
@@ -296,8 +303,8 @@ func checkVerifyLegs(script string, tbl legTable, files []string) []error {
 		if _, ok := tbl.harnesses[h]; !ok {
 			fail("harness %s runs in _verify_gate_harnesses but is not registered (register it and cover its inputs)", h)
 		}
-		if _, ok := MatchGlobal("scripts/" + h); !ok {
-			fail("harness scripts/%s is not global", h)
+		if !covered("scripts/" + h) {
+			fail("harness scripts/%s is not covered by the declaration", h)
 		}
 	}
 	for _, h := range sortedKeys(tbl.harnesses) {
@@ -335,8 +342,8 @@ func checkVerifyLegs(script string, tbl legTable, files []string) []error {
 			if !got[s] {
 				fail("leg %s declares scripts/%s but its body never invokes it", leg, s)
 			}
-			if _, ok := MatchGlobal("scripts/" + s); !ok {
-				fail("leg %s's scripts/%s is not global", leg, s)
+			if !covered("scripts/" + s) {
+				fail("leg %s's scripts/%s is not covered by the declaration", leg, s)
 			}
 		}
 	}
@@ -357,8 +364,8 @@ func checkVerifyLegs(script string, tbl legTable, files []string) []error {
 				n++
 				switch in.cov {
 				case global:
-					if _, ok := MatchGlobal(f); !ok {
-						fail("%s reads %s (input %q) but it is not covered by GlobalSurface", owner, f, in.glob)
+					if !covered(f) {
+						fail("%s reads %s (input %q) but it is not covered by the declaration's verdict-wide (global_surface) or doc-check class", owner, f, in.glob)
 					}
 				case goReach:
 					if !strings.HasSuffix(f, ".go") {
@@ -412,21 +419,22 @@ func repoFiles(t *testing.T) []string {
 	return out
 }
 
-func TestVerifyLegsCoveredByGlobalSurface(t *testing.T) {
+func TestVerifyLegsCoveredByDeclaration(t *testing.T) {
 	t.Parallel()
 	raw, err := os.ReadFile(filepath.Join(repoRoot(), "scripts", "test"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, e := range checkVerifyLegs(string(raw), realLegTable, repoFiles(t)) {
+	for _, e := range checkVerifyLegs(string(raw), realLegTable, repoFiles(t), thisRepoSurface(t)) {
 		t.Error(e)
 	}
 }
 
 var syncDest = regexp.MustCompile(`"\$REPO_ROOT/([^"]+)"`)
 
-func TestSchemaSyncDestinationsAreGlobal(t *testing.T) {
+func TestSchemaSyncDestinationsCoveredByDeclaration(t *testing.T) {
 	t.Parallel()
+	surface := thisRepoSurface(t)
 	raw, err := os.ReadFile(filepath.Join(repoRoot(), "scripts", "sync-schemas"))
 	if err != nil {
 		t.Fatal(err)
@@ -452,8 +460,8 @@ func TestSchemaSyncDestinationsAreGlobal(t *testing.T) {
 		for _, f := range files {
 			if (exact && f == prefix) || (!exact && strings.HasPrefix(f, prefix)) {
 				n++
-				if _, ok := MatchGlobal(f); !ok {
-					t.Errorf("sync-schemas mirror %s (destination %s) is not covered by GlobalSurface", f, d)
+				if !surface.matchVerdictWide(f) && !surface.matchDocCheck(f) {
+					t.Errorf("sync-schemas mirror %s (destination %s) is not covered by the declaration's verdict-wide or doc-check class", f, d)
 				}
 			}
 		}
@@ -505,6 +513,10 @@ func synthScript(extraVerify, extraHarness string, dropLeg string) string {
 
 var synthFiles = []string{"docs/ARCHITECTURE.md", "backend/a.go", "scripts/check-x", "README.md", "frontend/x.json"}
 
+// synthSurface covers the synthetic legs' inputs verdict-wide and declares
+// frontend/ inert only (H9).
+var synthSurface = &Surface{Global: []string{"scripts/**", "docs/ARCHITECTURE.md"}, Inert: []string{"frontend/**"}}
+
 func wantErr(t *testing.T, errs []error, needle string) {
 	t.Helper()
 	for _, e := range errs {
@@ -517,46 +529,60 @@ func wantErr(t *testing.T, errs []error, needle string) {
 
 func TestCheckVerifyLegs_Synthetic(t *testing.T) {
 	t.Parallel()
-	if errs := checkVerifyLegs(synthScript("", "", ""), synthTable(), synthFiles); len(errs) != 0 {
+	if errs := checkVerifyLegs(synthScript("", "", ""), synthTable(), synthFiles, synthSurface); len(errs) != 0 {
 		t.Fatalf("clean synthetic script: %v", errs)
 	}
 	// H1: a new cmd_verify leg.
-	wantErr(t, checkVerifyLegs(synthScript("  _verify_new_leg\n", "", ""), synthTable(), synthFiles), "unregistered leg _verify_new_leg")
+	wantErr(t, checkVerifyLegs(synthScript("  _verify_new_leg\n", "", ""), synthTable(), synthFiles, synthSurface), "unregistered leg _verify_new_leg")
 	// H2: a new harness.
-	wantErr(t, checkVerifyLegs(synthScript("", " test-new", ""), synthTable(), synthFiles), "harness test-new runs")
+	wantErr(t, checkVerifyLegs(synthScript("", " test-new", ""), synthTable(), synthFiles, synthSurface), "harness test-new runs")
 	// H3: a global input matching a non-global file.
 	h3 := synthTable()
 	h3.verify["_verify_leg_a"] = legSpec{scripts: []string{"check-x"}, inputs: []legInput{g("README.md")}}
-	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h3, synthFiles), "reads README.md")
+	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h3, synthFiles, synthSurface), "reads README.md")
 	// H4: a go_reach glob matching a non-Go file.
 	h4 := synthTable()
 	h4.verify["cmd_lint"] = legSpec{inputs: []legInput{r("frontend/*")}}
-	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h4, synthFiles), "matches non-Go file frontend/x.json")
+	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h4, synthFiles, synthSurface), "matches non-Go file frontend/x.json")
 	// H5: a stale table entry.
-	wantErr(t, checkVerifyLegs(synthScript("", "", "_verify_leg_a"), synthTable(), synthFiles), "_verify_leg_a no longer appears")
+	wantErr(t, checkVerifyLegs(synthScript("", "", "_verify_leg_a"), synthTable(), synthFiles, synthSurface), "_verify_leg_a no longer appears")
 	// H6: an input glob matching zero files.
 	h6 := synthTable()
 	h6.verify["_verify_leg_b"] = legSpec{scripts: []string{"check-x"}, inputs: []legInput{g("docs/nothing/**")}}
-	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h6, synthFiles), `"docs/nothing/**" matches no file`)
+	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h6, synthFiles, synthSurface), `"docs/nothing/**" matches no file`)
 	// H7: parser collapse (fewer legs than the floor).
 	h7 := synthTable()
 	delete(h7.verify, "_verify_leg_a")
 	delete(h7.verify, "_verify_leg_b")
 	collapsed := strings.Replace(synthScript("", "", ""), "  _verify_leg_b\n", "", 1)
 	collapsed = strings.Replace(collapsed, "  _verify_leg_a\n", "", 1)
-	wantErr(t, checkVerifyLegs(collapsed, h7, synthFiles), "parser collapse")
+	wantErr(t, checkVerifyLegs(collapsed, h7, synthFiles, synthSurface), "parser collapse")
 	// H8: an inline script invocation, and an unregistered helper call.
-	wantErr(t, checkVerifyLegs(synthScript("  \"$ROOT/scripts/check-new\"\n", "", ""), synthTable(), synthFiles),
+	wantErr(t, checkVerifyLegs(synthScript("  \"$ROOT/scripts/check-new\"\n", "", ""), synthTable(), synthFiles, synthSurface),
 		`neither a registered leg nor allow-listed plumbing: "\"$ROOT/scripts/check-new\""`)
-	wantErr(t, checkVerifyLegs(synthScript("  _check_new\n", "", ""), synthTable(), synthFiles), "unregistered leg _check_new")
+	wantErr(t, checkVerifyLegs(synthScript("  _check_new\n", "", ""), synthTable(), synthFiles, synthSurface), "unregistered leg _check_new")
 	// A leg line that also runs a script inline.
-	wantErr(t, checkVerifyLegs(synthScript("  _verify_leg_a; \"$ROOT/scripts/check-new\"\n", "", ""), synthTable(), synthFiles), "invokes a script inline")
+	wantErr(t, checkVerifyLegs(synthScript("  _verify_leg_a; \"$ROOT/scripts/check-new\"\n", "", ""), synthTable(), synthFiles, synthSurface), "invokes a script inline")
 	// A _verify_* leg body invoking an undeclared script.
 	undeclared := strings.Replace(synthScript("", "", ""), "_verify_leg_c() {\n", "_verify_leg_c() {\n  \"$ROOT/scripts/check-y\"\n", 1)
-	wantErr(t, checkVerifyLegs(undeclared, synthTable(), synthFiles), "leg _verify_leg_c invokes scripts/check-y")
+	wantErr(t, checkVerifyLegs(undeclared, synthTable(), synthFiles, synthSurface), "leg _verify_leg_c invokes scripts/check-y")
 	// An unclassified harness-body line.
-	wantErr(t, checkVerifyLegs(strings.Replace(synthScript("", "", ""), "  local h\n", "  local h\n  rm -rf x\n", 1), synthTable(), synthFiles),
+	wantErr(t, checkVerifyLegs(strings.Replace(synthScript("", "", ""), "  local h\n", "  local h\n  rm -rf x\n", 1), synthTable(), synthFiles, synthSurface),
 		`_verify_gate_harnesses line is neither the harness list nor allow-listed plumbing: "rm -rf x"`)
+	// H9: an input covered only by an inert class is not covered.
+	h9 := synthTable()
+	h9.verify["_verify_leg_a"] = legSpec{scripts: []string{"check-x"}, inputs: []legInput{g("frontend/x.json")}}
+	wantErr(t, checkVerifyLegs(synthScript("", "", ""), h9, synthFiles, synthSurface),
+		"reads frontend/x.json (input \"frontend/x.json\") but it is not covered by the declaration's verdict-wide (global_surface) or doc-check class")
+	// The doc-check class does cover an input.
+	docCheck := &Surface{Global: []string{"scripts/**"}, DocCheck: []string{"docs/ARCHITECTURE.md"}}
+	if errs := checkVerifyLegs(synthScript("", "", ""), synthTable(), synthFiles, docCheck); len(errs) != 0 {
+		t.Fatalf("doc-check-covered input: %v", errs)
+	}
+	// H10: an undeclared (nil) surface covers no global input.
+	h10 := checkVerifyLegs(synthScript("", "", ""), synthTable(), synthFiles, nil)
+	wantErr(t, h10, "reads docs/ARCHITECTURE.md")
+	wantErr(t, h10, "harness scripts/test-h00 is not covered by the declaration")
 }
 
 func TestLegTokenWordAnchored(t *testing.T) {

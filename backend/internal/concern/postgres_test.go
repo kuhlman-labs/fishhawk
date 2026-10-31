@@ -3,12 +3,16 @@ package concern_test
 import (
 	"context"
 	"errors"
+	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	concerndb "github.com/kuhlman-labs/fishhawk/backend/internal/concern/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/postgres"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -691,5 +695,996 @@ func TestNormalizedReviewerRole(t *testing.T) {
 	}
 	if concern.ReviewerRoleStandard != "standard" {
 		t.Errorf("ReviewerRoleStandard = %q, want %q (persisted on every standard-reviewer row)", concern.ReviewerRoleStandard, "standard")
+	}
+}
+
+// rollupHarness is a parent run with an implement stage and a decomposition
+// child with its own implement stage, on a non-Fishhawk repository (E94.1 /
+// #4692). The pool is exposed so a test can read updated_at back raw.
+type rollupHarness struct {
+	repo                  concern.Repository
+	pool                  *pgxpool.Pool
+	parentRun, childRun   uuid.UUID
+	parentStage, childStg uuid.UUID
+}
+
+func newRollupHarness(t *testing.T) rollupHarness {
+	t.Helper()
+	url := pgtest.NewURL(t)
+	if err := postgres.MigrateUp(url); err != nil {
+		t.Fatalf("MigrateUp: %v", err)
+	}
+	pool, err := pgxpool.New(context.Background(), url)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	runRepo := run.NewPostgresRepository(pool)
+	mk := func() (uuid.UUID, uuid.UUID) {
+		r, err := runRepo.CreateRun(context.Background(), run.CreateRunParams{
+			Repo: "acme-widgets/storefront", WorkflowID: "feature_change", WorkflowSHA: "cafef00d", TriggerSource: run.TriggerCLI,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		st, err := runRepo.CreateStage(context.Background(), run.CreateStageParams{
+			RunID: r.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+		})
+		if err != nil {
+			t.Fatalf("create stage: %v", err)
+		}
+		return r.ID, st.ID
+	}
+	h := rollupHarness{repo: concern.NewPostgresRepository(pool), pool: pool}
+	h.parentRun, h.parentStage = mk()
+	h.childRun, h.childStg = mk()
+	return h
+}
+
+func (h rollupHarness) insertOn(t *testing.T, runID, stageID uuid.UUID, p concern.InsertRaisedParams, cs ...concern.RaisedConcern) []*concern.Concern {
+	t.Helper()
+	p.RunID, p.StageID, p.StageKind, p.Concerns = runID, stageID, concern.StageKindImplement, cs
+	if p.ReviewerModel == "" {
+		p.ReviewerModel = "gpt-6-astra"
+	}
+	rows, err := h.repo.InsertRaised(context.Background(), p)
+	if err != nil {
+		t.Fatalf("InsertRaised: %v", err)
+	}
+	return rows
+}
+
+func (h rollupHarness) byRun(t *testing.T, runID uuid.UUID) []*concern.Concern {
+	t.Helper()
+	rows, err := h.repo.ListByRun(context.Background(), runID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	return rows
+}
+
+func (h rollupHarness) get(t *testing.T, id uuid.UUID) *concern.Concern {
+	t.Helper()
+	rows, err := h.repo.GetByIDs(context.Background(), []uuid.UUID{id})
+	if err != nil {
+		t.Fatalf("GetByIDs: %v", err)
+	}
+	return rows[0]
+}
+
+func (h rollupHarness) importSources(t *testing.T, srcs ...*concern.Concern) []*concern.Concern {
+	t.Helper()
+	out, err := h.repo.ImportRolledUp(context.Background(), concern.ImportRolledUpParams{
+		ParentRunID: h.parentRun, ParentStageID: h.parentStage, Sources: srcs,
+	})
+	if err != nil {
+		t.Fatalf("ImportRolledUp: %v", err)
+	}
+	return out
+}
+
+// TestImportRolledUp_CopiesFields: the copy lands on the parent run and
+// implement stage as raised, links back through rolled_up_from and keeps the
+// source's origin round, reviewer, severity, category, note, evidence,
+// provenance and check_key verbatim.
+func TestImportRolledUp_CopiesFields(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{
+		OriginReviewSequence: 4711, ReviewerRole: "architect", Provenance: concern.ProvenanceServerCheck,
+	}, concern.RaisedConcern{Severity: "high", Category: "correctness", Note: "cart total drops tax", SuggestedPatch: "--- a\n+++ b\n",
+		NewEvidence: "repro", SettledRef: "c-9", QuoteUnverified: true, SeverityClampedFrom: "critical", CheckKey: "permission_drift:k1"})[0]
+
+	copies := h.importSources(t, src)
+	if len(copies) != 1 {
+		t.Fatalf("copies = %d, want 1", len(copies))
+	}
+	cp := copies[0]
+	if cp.ID == src.ID || cp.RunID != h.parentRun || cp.StageID != h.parentStage || cp.StageKind != concern.StageKindImplement {
+		t.Errorf("copy placement = id %s run %s stage %s kind %s, want a new id on parent %s / %s implement", cp.ID, cp.RunID, cp.StageID, cp.StageKind, h.parentRun, h.parentStage)
+	}
+	if cp.State != concern.StateRaised || cp.RolledUpFrom == nil || *cp.RolledUpFrom != src.ID {
+		t.Errorf("copy state = %s rolled_up_from = %v, want raised / %s", cp.State, cp.RolledUpFrom, src.ID)
+	}
+	if cp.StateReason != concern.RolledUpStateReason(src) {
+		t.Errorf("copy state_reason = %q, want %q", cp.StateReason, concern.RolledUpStateReason(src))
+	}
+	if cp.OriginReviewSequence != 4711 || cp.ReviewerModel == nil || *cp.ReviewerModel != "gpt-6-astra" || cp.ReviewerRole != "architect" ||
+		cp.Severity != "high" || cp.Category != "correctness" || cp.Note != "cart total drops tax" || cp.SuggestedPatch != src.SuggestedPatch ||
+		cp.NewEvidence != "repro" || cp.SettledRef != "c-9" || !cp.QuoteUnverified || cp.SeverityClampedFrom != "critical" ||
+		cp.Provenance != concern.ProvenanceServerCheck || cp.CheckKey != "permission_drift:k1" {
+		t.Errorf("copy fields not verbatim: %+v", cp)
+	}
+	if cp.Outcome != "" {
+		t.Errorf("copy outcome = %q, want empty", cp.Outcome)
+	}
+}
+
+// TestImportRolledUp_MarksSourceCarried: the source's outcome reads carried;
+// its state, state_reason and updated_at are unchanged.
+func TestImportRolledUp_MarksSourceCarried(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "medium", Category: "tests", Note: "no coupon test"})[0]
+	var before time.Time
+	if err := h.pool.QueryRow(context.Background(), `SELECT updated_at FROM review_concerns WHERE id = $1`, src.ID).Scan(&before); err != nil {
+		t.Fatal(err)
+	}
+	h.importSources(t, src)
+	got := h.get(t, src.ID)
+	if got.Outcome != concern.OutcomeCarried {
+		t.Errorf("source outcome = %q, want carried", got.Outcome)
+	}
+	if got.State != src.State || got.StateReason != src.StateReason {
+		t.Errorf("source state/reason = %s/%q, want unchanged %s/%q", got.State, got.StateReason, src.State, src.StateReason)
+	}
+	var after time.Time
+	if err := h.pool.QueryRow(context.Background(), `SELECT updated_at FROM review_concerns WHERE id = $1`, src.ID).Scan(&after); err != nil {
+		t.Fatal(err)
+	}
+	if !after.Equal(before) {
+		t.Errorf("source updated_at moved %v -> %v; an outcome write must not touch it", before, after)
+	}
+}
+
+// TestImportRolledUp_Idempotent: a second import of the same sources returns
+// no error and no copies; the parent keeps exactly one row per source.
+func TestImportRolledUp_Idempotent(t *testing.T) {
+	h := newRollupHarness(t)
+	srcs := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 5},
+		concern.RaisedConcern{Severity: "high", Note: "a"}, concern.RaisedConcern{Severity: "medium", Note: "b"})
+	if n := len(h.importSources(t, srcs...)); n != 2 {
+		t.Fatalf("first import copies = %d, want 2", n)
+	}
+	again, err := h.repo.ImportRolledUp(context.Background(), concern.ImportRolledUpParams{
+		ParentRunID: h.parentRun, ParentStageID: h.parentStage, Sources: srcs,
+	})
+	if err != nil {
+		t.Fatalf("second ImportRolledUp: %v (the ON CONFLICT clause must absorb the duplicate)", err)
+	}
+	if len(again) != 0 {
+		t.Errorf("second import copies = %d, want 0", len(again))
+	}
+	if n := len(h.byRun(t, h.parentRun)); n != 2 {
+		t.Errorf("parent rows = %d, want 2 (one per source)", n)
+	}
+}
+
+// TestImportRolledUp_Concurrent: two goroutines import the same source;
+// exactly one copy exists.
+func TestImportRolledUp_Concurrent(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 6},
+		concern.RaisedConcern{Severity: "high", Note: "race"})[0]
+	var wg sync.WaitGroup
+	errs := make([]error, 2)
+	for i := range errs {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, errs[i] = h.repo.ImportRolledUp(context.Background(), concern.ImportRolledUpParams{
+				ParentRunID: h.parentRun, ParentStageID: h.parentStage, Sources: []*concern.Concern{src},
+			})
+		}(i)
+	}
+	wg.Wait()
+	for i, err := range errs {
+		if err != nil {
+			t.Errorf("import %d: %v", i, err)
+		}
+	}
+	if n := len(h.byRun(t, h.parentRun)); n != 1 {
+		t.Errorf("parent rows after two concurrent imports = %d, want 1", n)
+	}
+}
+
+// TestImportRolledUp_SkipsSourceNoLongerOpen (concern 92d4e9da, C1): a source
+// read open by the caller and superseded before the copy is written — a retry
+// sweep landing between the fan-in's read and its import — gets no copy and
+// keeps an empty outcome. The caller's snapshot still says raised, so only the
+// copy statement's own state re-check can refuse it.
+func TestImportRolledUp_SkipsSourceNoLongerOpen(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 7},
+		concern.RaisedConcern{Severity: "high", Note: "swept before the copy"})[0]
+	if _, err := h.repo.ApplyResolution(context.Background(), src.ID, concern.StateSuperseded, "superseded by stage retry (retry seq 9)"); err != nil {
+		t.Fatalf("supersede source: %v", err)
+	}
+	if src.State != concern.StateRaised {
+		t.Fatalf("precondition: the caller's snapshot reads %s, want the stale raised", src.State)
+	}
+	if copies := h.importSources(t, src); len(copies) != 0 {
+		t.Errorf("copies of a superseded source = %d, want 0: the copy statement must re-check the source is still open", len(copies))
+	}
+	if n := len(h.byRun(t, h.parentRun)); n != 0 {
+		t.Errorf("parent rows = %d, want 0", n)
+	}
+	if got := h.get(t, src.ID); got.Outcome != "" {
+		t.Errorf("superseded source outcome = %q, want empty: a source with no copy is not carried", got.Outcome)
+	}
+}
+
+// TestImportRolledUp_LocksSourceAgainstConcurrentSupersession (concern
+// 92d4e9da, C1): while an import transaction holds its uncommitted copy, a
+// concurrent supersession of the source WAITS for that transaction, so the
+// sweep's later parent-ledger scan sees the committed copy. Deterministic: the
+// test waits until Postgres reports the supersession blocked on a lock (or
+// fails if it completes first), then commits.
+func TestImportRolledUp_LocksSourceAgainstConcurrentSupersession(t *testing.T) {
+	h := newRollupHarness(t)
+	ctx := context.Background()
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 8},
+		concern.RaisedConcern{Severity: "high", Note: "swept during the copy"})[0]
+	tx, err := h.pool.Begin(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if _, err := concerndb.New(tx).ImportRolledUpReviewConcern(ctx, concerndb.ImportRolledUpReviewConcernParams{
+		ID: uuid.New(), ParentRunID: h.parentRun, ParentStageID: h.parentStage,
+		StateReason: concern.RolledUpStateReason(src), SourceID: src.ID,
+	}); err != nil {
+		t.Fatalf("copy inside the open import transaction: %v", err)
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := h.repo.ApplyResolution(ctx, src.ID, concern.StateSuperseded, "superseded by stage retry (retry seq 9)")
+		done <- err
+	}()
+	deadline := time.Now().Add(30 * time.Second)
+	for blocked := false; !blocked; {
+		select {
+		case err := <-done:
+			t.Fatalf("the source's supersession completed (err %v) while the import transaction held an uncommitted copy: the copy statement does not lock its source, so a retry sweep's parent scan can run before the copy exists and strand it raised", err)
+		default:
+		}
+		var waiting int
+		if err := h.pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&waiting); err != nil {
+			t.Fatal(err)
+		}
+		blocked = waiting > 0
+		if !blocked && time.Now().After(deadline) {
+			t.Fatal("the source's supersession neither blocked nor completed within 30s")
+		}
+		if !blocked {
+			time.Sleep(10 * time.Millisecond)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		t.Fatalf("commit import: %v", err)
+	}
+	if err := <-done; err != nil {
+		t.Fatalf("supersession after the import committed: %v", err)
+	}
+	var copies int
+	for _, r := range h.byRun(t, h.parentRun) {
+		if r.RolledUpFrom != nil && *r.RolledUpFrom == src.ID {
+			copies++
+		}
+	}
+	if copies != 1 {
+		t.Errorf("parent copies visible once the supersession returned = %d, want 1 (the sweep's parent scan must see it)", copies)
+	}
+	if got := h.get(t, src.ID); got.State != concern.StateSuperseded {
+		t.Errorf("source state = %s, want superseded", got.State)
+	}
+}
+
+// TestImportRolledUp_RequiresParent: a nil parent run or stage is refused
+// before any write; an empty source list is a no-op.
+func TestImportRolledUp_RequiresParent(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 1},
+		concern.RaisedConcern{Severity: "high", Note: "x"})[0]
+	for name, p := range map[string]concern.ImportRolledUpParams{
+		"nil run":   {ParentStageID: h.parentStage, Sources: []*concern.Concern{src}},
+		"nil stage": {ParentRunID: h.parentRun, Sources: []*concern.Concern{src}},
+	} {
+		if _, err := h.repo.ImportRolledUp(context.Background(), p); err == nil || !strings.Contains(err.Error(), "required") {
+			t.Errorf("%s: err = %v, want the Go-side refusal naming the required parent id (before any statement)", name, err)
+		}
+	}
+	if out, err := h.repo.ImportRolledUp(context.Background(), concern.ImportRolledUpParams{ParentRunID: h.parentRun, ParentStageID: h.parentStage}); err != nil || out != nil {
+		t.Errorf("empty sources = %v, %v; want nil, nil", out, err)
+	}
+	if got := h.get(t, src.ID); got.Outcome != "" {
+		t.Errorf("source outcome after refused imports = %q, want empty", got.Outcome)
+	}
+}
+
+// TestStampOpenAtMerge_StampsOpenAndSuperseded: raised, addressed_pending,
+// reopened and superseded rows across two runs get open_at_merge; waived,
+// deferred, addressed and addressed_by_condition keep an empty outcome; state, state_reason
+// and updated_at are unchanged; a re-stamp affects 0 rows.
+func TestStampOpenAtMerge_StampsOpenAndSuperseded(t *testing.T) {
+	h := newRollupHarness(t)
+	ctx := context.Background()
+	mk := func(runID, stageID uuid.UUID) *concern.Concern {
+		return h.insertOn(t, runID, stageID, concern.InsertRaisedParams{OriginReviewSequence: 9}, concern.RaisedConcern{Severity: "low", Note: "n"})[0]
+	}
+	walk := func(c *concern.Concern, states ...concern.State) {
+		for _, st := range states {
+			var err error
+			if st == concern.StateAddressedPending {
+				err = h.repo.MarkAddressedPending(ctx, []uuid.UUID{c.ID}, "routed")
+			} else {
+				_, err = h.repo.ApplyResolution(ctx, c.ID, st, "walk "+string(st))
+			}
+			if err != nil {
+				t.Fatalf("walk %s -> %s: %v", c.ID, st, err)
+			}
+		}
+	}
+	raised := mk(h.parentRun, h.parentStage)
+	pending := mk(h.childRun, h.childStg)
+	walk(pending, concern.StateAddressedPending)
+	reopened := mk(h.parentRun, h.parentStage)
+	walk(reopened, concern.StateAddressedPending, concern.StateAddressed, concern.StateReopened)
+	superseded := mk(h.childRun, h.childStg)
+	walk(superseded, concern.StateSuperseded)
+	waived := mk(h.parentRun, h.parentStage)
+	walk(waived, concern.StateWaived)
+	deferred := mk(h.parentRun, h.parentStage)
+	walk(deferred, concern.StateDeferred)
+	addressed := mk(h.childRun, h.childStg)
+	walk(addressed, concern.StateAddressedPending, concern.StateAddressed)
+	byCond := mk(h.parentRun, h.parentStage)
+	walk(byCond, concern.StateAddressedByCondition)
+
+	type snap struct {
+		state, reason string
+		updated       time.Time
+	}
+	read := func(id uuid.UUID) snap {
+		var s snap
+		if err := h.pool.QueryRow(ctx, `SELECT state, state_reason, updated_at FROM review_concerns WHERE id = $1`, id).Scan(&s.state, &s.reason, &s.updated); err != nil {
+			t.Fatal(err)
+		}
+		return s
+	}
+	all := []*concern.Concern{raised, pending, reopened, superseded, waived, deferred, addressed, byCond}
+	before := map[uuid.UUID]snap{}
+	for _, c := range all {
+		before[c.ID] = read(c.ID)
+	}
+	n, err := h.repo.StampOpenAtMerge(ctx, []uuid.UUID{h.parentRun, h.childRun})
+	if err != nil {
+		t.Fatalf("StampOpenAtMerge: %v", err)
+	}
+	if n != 4 {
+		t.Errorf("stamped rows = %d, want 4", n)
+	}
+	for _, c := range []*concern.Concern{raised, pending, reopened, superseded} {
+		if got := h.get(t, c.ID).Outcome; got != concern.OutcomeOpenAtMerge {
+			t.Errorf("%s (%s) outcome = %q, want open_at_merge", c.ID, before[c.ID].state, got)
+		}
+	}
+	for _, c := range []*concern.Concern{waived, deferred, addressed, byCond} {
+		if got := h.get(t, c.ID).Outcome; got != "" {
+			t.Errorf("%s (%s) outcome = %q, want empty", c.ID, before[c.ID].state, got)
+		}
+	}
+	for _, c := range all {
+		if after := read(c.ID); after.state != before[c.ID].state || after.reason != before[c.ID].reason || !after.updated.Equal(before[c.ID].updated) {
+			t.Errorf("%s changed beyond outcome: %+v -> %+v", c.ID, before[c.ID], after)
+		}
+	}
+	if n, err := h.repo.StampOpenAtMerge(ctx, []uuid.UUID{h.parentRun, h.childRun}); err != nil || n != 0 {
+		t.Errorf("re-stamp = %d, %v; want 0, nil", n, err)
+	}
+	if n, err := h.repo.StampOpenAtMerge(ctx, nil); err != nil || n != 0 {
+		t.Errorf("empty run ids = %d, %v; want 0, nil", n, err)
+	}
+}
+
+// TestStampOpenAtMerge_KeepsRecordedOutcome: an OPEN row already carried
+// keeps carried.
+func TestStampOpenAtMerge_KeepsRecordedOutcome(t *testing.T) {
+	h := newRollupHarness(t)
+	src := h.insertOn(t, h.childRun, h.childStg, concern.InsertRaisedParams{OriginReviewSequence: 2},
+		concern.RaisedConcern{Severity: "high", Note: "carried then merged"})[0]
+	h.importSources(t, src)
+	if _, err := h.repo.StampOpenAtMerge(context.Background(), []uuid.UUID{h.childRun}); err != nil {
+		t.Fatalf("StampOpenAtMerge: %v", err)
+	}
+	got := h.get(t, src.ID)
+	if !got.State.IsOpen() {
+		t.Fatalf("precondition: source state = %s, want open", got.State)
+	}
+	if got.Outcome != concern.OutcomeCarried {
+		t.Errorf("open carried source outcome after the merge stamp = %q, want carried (a recorded outcome is never overwritten)", got.Outcome)
+	}
+}
+
+// routedOn inserts one raised concern on the parent run and routes it to
+// addressed_pending, the only state a confirm (addressed) is reachable from.
+func (h rollupHarness) routedOn(t *testing.T, note string) *concern.Concern {
+	t.Helper()
+	row := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: note})[0]
+	if err := h.repo.MarkAddressedPending(context.Background(), []uuid.UUID{row.ID}, "routed"); err != nil {
+		t.Fatalf("MarkAddressedPending: %v", err)
+	}
+	return row
+}
+
+// rawSet writes columns no Phase-1 store method writes (judgement,
+// tradeoff_cost, duplicate_of, a non-fixed outcome) straight through the pool,
+// seeding the state BY CONSTRUCTION rather than through the control under
+// test.
+func (h rollupHarness) rawSet(t *testing.T, id uuid.UUID, set string, args ...any) {
+	t.Helper()
+	tag, err := h.pool.Exec(context.Background(), "UPDATE review_concerns SET "+set+" WHERE id = $1", append([]any{id}, args...)...)
+	if err != nil {
+		t.Fatalf("raw UPDATE %s: %v", set, err)
+	}
+	if tag.RowsAffected() != 1 {
+		t.Fatalf("raw UPDATE %s matched %d rows, want 1", set, tag.RowsAffected())
+	}
+}
+
+// TestApplyDisposition_PreservesJudgement pins the system-writer rule (E94.2 /
+// #4693, ADR-117 D1): ApplyDisposition records the outcome and the transition
+// but leaves every judgement column UNTOUCHED, so a judgement recorded earlier
+// survives an automated close. The row is pre-labelled defect so an overwrite
+// is observable — a fresh row would read unlabelled either way.
+func TestApplyDisposition_PreservesJudgement(t *testing.T) {
+	h := newRollupHarness(t)
+	row := h.routedOn(t, "pre-labelled")
+	h.rawSet(t, row.ID, "judgement = 'defect', judgement_actor_kind = 'user', tradeoff_cost = 'c'")
+
+	ret, err := h.repo.ApplyDisposition(context.Background(), row.ID, concern.StateAddressed, "confirmed by review",
+		concern.Disposition{Outcome: concern.OutcomeFixed})
+	if err != nil {
+		t.Fatalf("ApplyDisposition: %v", err)
+	}
+	for name, got := range map[string]*concern.Concern{"returned": ret, "re-read": h.get(t, row.ID)} {
+		if got.State != concern.StateAddressed || got.StateReason != "confirmed by review" {
+			t.Errorf("%s state = %s (%q), want addressed (confirmed by review)", name, got.State, got.StateReason)
+		}
+		if got.Outcome != concern.OutcomeFixed {
+			t.Errorf("%s outcome = %q, want fixed", name, got.Outcome)
+		}
+		if got.Judgement != concern.JudgementDefect || got.JudgementActorKind != "user" || got.TradeoffCost != "c" {
+			t.Errorf("%s judgement = %q actor = %q cost = %q, want defect / user / c — a system writer never touches a judgement column",
+				name, got.Judgement, got.JudgementActorKind, got.TradeoffCost)
+		}
+	}
+}
+
+// TestApplyDisposition_FreshRowReadsUnlabelled: a never-judged row a system
+// writer closes keeps the column default, so it reads unlabelled.
+func TestApplyDisposition_FreshRowReadsUnlabelled(t *testing.T) {
+	h := newRollupHarness(t)
+	row := h.routedOn(t, "never judged")
+	got, err := h.repo.ApplyDisposition(context.Background(), row.ID, concern.StateAddressed, "confirmed",
+		concern.Disposition{Outcome: concern.OutcomeFixed})
+	if err != nil {
+		t.Fatalf("ApplyDisposition: %v", err)
+	}
+	if got.Judgement != concern.JudgementUnlabelled || got.JudgementActorKind != "" {
+		t.Errorf("judgement = %q actor = %q, want unlabelled / empty", got.Judgement, got.JudgementActorKind)
+	}
+}
+
+// TestApplyDisposition_EmptyOutcomeRefused: an empty outcome is refused before
+// any write. addressed_pending -> addressed is a VALID edge, so without the
+// guard the transition would commit — the assertion reads COMMITTED state, not
+// the error's identity.
+func TestApplyDisposition_EmptyOutcomeRefused(t *testing.T) {
+	h := newRollupHarness(t)
+	row := h.routedOn(t, "no outcome")
+	if _, err := h.repo.ApplyDisposition(context.Background(), row.ID, concern.StateAddressed, "confirmed", concern.Disposition{}); err == nil {
+		t.Error("ApplyDisposition with an empty outcome returned nil error, want a refusal")
+	}
+	got := h.get(t, row.ID)
+	if got.State != concern.StateAddressedPending || got.Outcome != "" {
+		t.Errorf("after a refused disposition: state = %s outcome = %q, want addressed_pending / empty (nothing written)", got.State, got.Outcome)
+	}
+}
+
+// TestApplyDisposition_RefusesInvalidTransition: the state machine still
+// guards the edge; a refused edge records no outcome either.
+func TestApplyDisposition_RefusesInvalidTransition(t *testing.T) {
+	h := newRollupHarness(t)
+	row := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "raised, never routed"})[0]
+	_, err := h.repo.ApplyDisposition(context.Background(), row.ID, concern.StateAddressed, "confirmed",
+		concern.Disposition{Outcome: concern.OutcomeFixed})
+	var ite concern.InvalidTransitionError
+	if !errors.As(err, &ite) {
+		t.Fatalf("raised -> addressed err = %v, want InvalidTransitionError", err)
+	}
+	if got := h.get(t, row.ID); got.State != concern.StateRaised || got.Outcome != "" {
+		t.Errorf("after a refused edge: state = %s outcome = %q, want raised / empty", got.State, got.Outcome)
+	}
+}
+
+// TestUpdateState_ReopenClearsFixedOutcome pins the reopen rule: a move back
+// into an open state clears an outcome of exactly 'fixed', so a reopened
+// concern is stamped open_at_merge like any open one (arm 1); a non-fixed
+// outcome survives the reopen (arm 2).
+func TestUpdateState_ReopenClearsFixedOutcome(t *testing.T) {
+	ctx := context.Background()
+	t.Run("fixed is cleared and the merge stamp sees the row", func(t *testing.T) {
+		h := newRollupHarness(t)
+		row := h.routedOn(t, "confirmed then reopened")
+		if _, err := h.repo.ApplyDisposition(ctx, row.ID, concern.StateAddressed, "confirmed", concern.Disposition{Outcome: concern.OutcomeFixed}); err != nil {
+			t.Fatalf("confirm: %v", err)
+		}
+		if got := h.get(t, row.ID); got.Outcome != concern.OutcomeFixed {
+			t.Fatalf("precondition: outcome after confirm = %q, want fixed", got.Outcome)
+		}
+		if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateReopened, "reopened by the next round"); err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		if got := h.get(t, row.ID); got.Outcome != "" {
+			t.Errorf("outcome after reopen = %q, want empty — a reopened concern is not fixed", got.Outcome)
+		}
+		n, err := h.repo.StampOpenAtMerge(ctx, []uuid.UUID{h.parentRun})
+		if err != nil {
+			t.Fatalf("StampOpenAtMerge: %v", err)
+		}
+		if n != 1 {
+			t.Errorf("rows stamped = %d, want 1 (the reopened row)", n)
+		}
+		if got := h.get(t, row.ID); got.Outcome != concern.OutcomeOpenAtMerge {
+			t.Errorf("reopened row outcome after merge = %q, want open_at_merge", got.Outcome)
+		}
+	})
+	t.Run("a non-fixed outcome survives a reopen", func(t *testing.T) {
+		h := newRollupHarness(t)
+		row := h.routedOn(t, "carried then reopened")
+		if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateAddressed, "confirmed"); err != nil {
+			t.Fatalf("confirm: %v", err)
+		}
+		h.rawSet(t, row.ID, "outcome = 'carried'")
+		if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateReopened, "reopened"); err != nil {
+			t.Fatalf("reopen: %v", err)
+		}
+		if got := h.get(t, row.ID); got.Outcome != concern.OutcomeCarried {
+			t.Errorf("outcome after reopen = %q, want carried (only fixed is cleared)", got.Outcome)
+		}
+	})
+}
+
+// TestReviewConcern_JudgementColumnsRoundTrip reads all seven 0114 columns
+// through every hand-edited Scan list a test can reach without a second run
+// (GetByIDs, ListByRun, ListOpenByRun) and the ApplyDisposition RETURNING row.
+func TestReviewConcern_JudgementColumnsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.routedOn(t, "root")
+	row := h.routedOn(t, "duplicate")
+	h.rawSet(t, row.ID, `judgement = 'tradeoff', judgement_actor_kind = 'first_officer', judgement_delegated = true,
+judgement_bulk = true, judgement_backfill = true, tradeoff_cost = 'slower cold start', duplicate_of = $2`, root.ID)
+
+	check := func(name string, got *concern.Concern) {
+		t.Helper()
+		if got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "first_officer" ||
+			!got.JudgementDelegated || !got.JudgementBulk || !got.JudgementBackfill || got.TradeoffCost != "slower cold start" {
+			t.Errorf("%s: judgement columns = %q %q %v %v %v %q, want tradeoff first_officer true true true %q", name,
+				got.Judgement, got.JudgementActorKind, got.JudgementDelegated, got.JudgementBulk, got.JudgementBackfill, got.TradeoffCost, "slower cold start")
+		}
+		if got.DuplicateOf == nil || *got.DuplicateOf != root.ID {
+			t.Errorf("%s: duplicate_of = %v, want %s", name, got.DuplicateOf, root.ID)
+		}
+	}
+	find := func(rows []*concern.Concern) *concern.Concern {
+		for _, r := range rows {
+			if r.ID == row.ID {
+				return r
+			}
+		}
+		t.Fatalf("row %s not listed", row.ID)
+		return nil
+	}
+	check("GetByIDs", h.get(t, row.ID))
+	check("ListByRun", find(h.byRun(t, h.parentRun)))
+	open, err := h.repo.ListOpenByRun(ctx, h.parentRun)
+	if err != nil {
+		t.Fatalf("ListOpenByRun: %v", err)
+	}
+	check("ListOpenByRun", find(open))
+	ret, err := h.repo.ApplyDisposition(ctx, row.ID, concern.StateAddressed, "confirmed", concern.Disposition{Outcome: concern.OutcomeFixed})
+	if err != nil {
+		t.Fatalf("ApplyDisposition: %v", err)
+	}
+	check("ApplyDisposition RETURNING", ret)
+	if ret.EffectiveOutcome() != concern.DuplicateOutcomePrefix+root.ID.String() {
+		t.Errorf("EffectiveOutcome = %q, want duplicate_of:%s", ret.EffectiveOutcome(), root.ID)
+	}
+}
+
+// TestApplyHumanDisposition_RecordsJudgementColumns pins the human writer
+// (E94.7 / #4840, ADR-117 D1 phase 2): ONE judged UPDATE records the
+// transition, the outcome and every judgement column, writes
+// judgement_backfill false and leaves duplicate_of untouched. The row is
+// pre-seeded with backfill true and a duplicate_of BY CONSTRUCTION so both
+// behaviours are observable, and the re-read through GetByIDs exercises the
+// hand-synced UpdateReviewConcernStateJudged scan list end to end.
+func TestApplyHumanDisposition_RecordsJudgementColumns(t *testing.T) {
+	h := newRollupHarness(t)
+	rows := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "judged"}, concern.RaisedConcern{Severity: "low", Note: "earlier"})
+	row, earlier := rows[0], rows[1]
+	h.rawSet(t, row.ID, "judgement_backfill = true, duplicate_of = $2", earlier.ID)
+
+	ret, err := h.repo.ApplyHumanDisposition(context.Background(), row.ID, concern.StateWaived, "accepted_tradeoff: slower cold start",
+		concern.HumanDisposition{
+			Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "agent",
+			Delegated: true, JudgementBulk: true, TradeoffCost: "slower cold start",
+		})
+	if err != nil {
+		t.Fatalf("ApplyHumanDisposition: %v", err)
+	}
+	for name, got := range map[string]*concern.Concern{"returned": ret, "re-read": h.get(t, row.ID)} {
+		if got.State != concern.StateWaived || got.StateReason != "accepted_tradeoff: slower cold start" || got.Outcome != concern.OutcomeWaived {
+			t.Errorf("%s: state %s (%q) outcome %q, want waived / the reason / waived", name, got.State, got.StateReason, got.Outcome)
+		}
+		if got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "agent" || got.TradeoffCost != "slower cold start" {
+			t.Errorf("%s: judgement %q actor %q cost %q, want tradeoff / agent / slower cold start", name, got.Judgement, got.JudgementActorKind, got.TradeoffCost)
+		}
+		if !got.JudgementDelegated || !got.JudgementBulk || got.JudgementBackfill {
+			t.Errorf("%s: delegated %v bulk %v backfill %v, want true / true / false", name, got.JudgementDelegated, got.JudgementBulk, got.JudgementBackfill)
+		}
+		if got.DuplicateOf == nil || *got.DuplicateOf != earlier.ID {
+			t.Errorf("%s: duplicate_of = %v, want %s untouched", name, got.DuplicateOf, earlier.ID)
+		}
+		if got.Severity != "high" || got.Note != "judged" || got.RunID != h.parentRun {
+			t.Errorf("%s: severity %q note %q run %s — the scan list misaligned", name, got.Severity, got.Note, got.RunID)
+		}
+	}
+}
+
+// TestApplyHumanDisposition_ReJudgementOverwrites: a later human verb
+// overwrites the stored judgement (the latest human decision wins), and its
+// flags are its own — a resolve's bulk/delegated do not survive an individual
+// waive after a reopen.
+func TestApplyHumanDisposition_ReJudgementOverwrites(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	row := h.routedOn(t, "resolved, reopened, waived")
+	if _, err := h.repo.ApplyHumanDisposition(ctx, row.ID, concern.StateAddressed, "evidence: commit abc", concern.HumanDisposition{
+		Outcome: concern.OutcomeFixed, Judgement: concern.JudgementDefect, ActorKind: "user", Delegated: true, JudgementBulk: true,
+	}); err != nil {
+		t.Fatalf("resolve: %v", err)
+	}
+	if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateReopened, "reopened"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if _, err := h.repo.ApplyHumanDisposition(ctx, row.ID, concern.StateWaived, "w", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "agent",
+	}); err != nil {
+		t.Fatalf("waive: %v", err)
+	}
+	got := h.get(t, row.ID)
+	if got.Judgement != concern.JudgementNoDefect || got.JudgementActorKind != "agent" || got.JudgementDelegated || got.JudgementBulk || got.Outcome != concern.OutcomeWaived {
+		t.Errorf("after re-judgement: judgement %q actor %q delegated %v bulk %v outcome %q, want no_defect / agent / false / false / waived",
+			got.Judgement, got.JudgementActorKind, got.JudgementDelegated, got.JudgementBulk, got.Outcome)
+	}
+}
+
+// TestApplyHumanDisposition_RefusesInvalid: every invalid disposition is
+// refused BEFORE any write (CF7). raised -> waived is a VALID edge, so without
+// the Validate guard each call would commit — the assertion reads COMMITTED
+// state, not the error's identity.
+func TestApplyHumanDisposition_RefusesInvalid(t *testing.T) {
+	h := newRollupHarness(t)
+	row := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "never judged"})[0]
+	for _, tc := range []struct {
+		name string
+		d    concern.HumanDisposition
+	}{
+		{"blank judgement", concern.HumanDisposition{Outcome: concern.OutcomeWaived, ActorKind: "user"}},
+		{"unlabelled", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementUnlabelled, ActorKind: "user"}},
+		{"tradeoff without cost", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "user"}},
+		{"blank actor kind", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect}},
+		{"cost without tradeoff", concern.HumanDisposition{Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "user", TradeoffCost: "c"}},
+		{"non-human outcome", concern.HumanDisposition{Outcome: concern.OutcomeCarried, Judgement: concern.JudgementNoDefect, ActorKind: "user"}},
+	} {
+		if _, err := h.repo.ApplyHumanDisposition(context.Background(), row.ID, concern.StateWaived, "w", tc.d); err == nil {
+			t.Errorf("%s: ApplyHumanDisposition returned nil error, want a refusal", tc.name)
+		}
+		got := h.get(t, row.ID)
+		if got.State != concern.StateRaised || got.Judgement != concern.JudgementUnlabelled || got.JudgementActorKind != "" || got.Outcome != "" || got.TradeoffCost != "" {
+			t.Fatalf("%s: after a refused disposition: state %s judgement %q actor %q outcome %q cost %q, want raised / unlabelled / empty (nothing written)",
+				tc.name, got.State, got.Judgement, got.JudgementActorKind, got.Outcome, got.TradeoffCost)
+		}
+	}
+}
+
+// TestApplyHumanDisposition_RefusesInvalidTransition: the state machine still
+// guards the edge; a refused edge records no outcome and no judgement.
+func TestApplyHumanDisposition_RefusesInvalidTransition(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	row := h.insertOn(t, h.parentRun, h.parentStage, concern.InsertRaisedParams{OriginReviewSequence: 3},
+		concern.RaisedConcern{Severity: "high", Note: "waived without a judgement"})[0]
+	if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateWaived, "waived"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	_, err := h.repo.ApplyHumanDisposition(ctx, row.ID, concern.StateDeferred, "deferred", concern.HumanDisposition{
+		Outcome: concern.OutcomeDeferred, Judgement: concern.JudgementDefect, ActorKind: "user",
+	})
+	var ite concern.InvalidTransitionError
+	if !errors.As(err, &ite) {
+		t.Fatalf("waived -> deferred err = %v, want InvalidTransitionError", err)
+	}
+	if got := h.get(t, row.ID); got.State != concern.StateWaived || got.Outcome != "" || got.Judgement != concern.JudgementUnlabelled {
+		t.Errorf("after a refused edge: state %s outcome %q judgement %q, want waived / empty / unlabelled", got.State, got.Outcome, got.Judgement)
+	}
+	if _, err := h.repo.ApplyHumanDisposition(ctx, uuid.New(), concern.StateWaived, "w", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementDefect, ActorKind: "user",
+	}); !errors.Is(err, concern.ErrNotFound) {
+		t.Errorf("unknown id err = %v, want ErrNotFound", err)
+	}
+}
+
+// lifecycleCols reads the columns a label must never touch straight from the
+// pool, updated_at as text, so a test compares them byte for byte (E94.8 /
+// #4841).
+func (h rollupHarness) lifecycleCols(t *testing.T, id uuid.UUID) string {
+	t.Helper()
+	var state, reason, outcome, updated string
+	if err := h.pool.QueryRow(context.Background(),
+		"SELECT state, state_reason, outcome, updated_at::text FROM review_concerns WHERE id = $1", id).
+		Scan(&state, &reason, &outcome, &updated); err != nil {
+		t.Fatalf("read lifecycle columns: %v", err)
+	}
+	return strings.Join([]string{state, reason, outcome, updated}, "|")
+}
+
+// labelAt inserts one concern on runID at origin sequence seq, in its own
+// InsertRaised call so the ledger order is deterministic.
+func (h rollupHarness) labelAt(t *testing.T, runID, stageID uuid.UUID, seq int64, note string) *concern.Concern {
+	t.Helper()
+	return h.insertOn(t, runID, stageID, concern.InsertRaisedParams{OriginReviewSequence: seq},
+		concern.RaisedConcern{Severity: "high", Note: note})[0]
+}
+
+// TestApplyLabel_RecordsJudgement: a judgement label records the judgement,
+// actor kind, backfill and cost, writes delegated and bulk false, and leaves
+// state, state_reason, outcome and updated_at BYTE-EQUAL (C3). The row is
+// waived with an outcome and a stale delegated/bulk pair first, so an
+// overwrite of any of them is observable.
+func TestApplyLabel_RecordsJudgement(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	row := h.labelAt(t, h.parentRun, h.parentStage, 3, "relabelled")
+	if _, err := h.repo.ApplyResolution(ctx, row.ID, concern.StateWaived, "waived long ago"); err != nil {
+		t.Fatalf("seed waived: %v", err)
+	}
+	h.rawSet(t, row.ID, "outcome = 'waived', judgement = 'defect', judgement_delegated = true, judgement_bulk = true")
+	before := h.lifecycleCols(t, row.ID)
+
+	ret, err := h.repo.ApplyLabel(ctx, row.ID, concern.Label{
+		Judgement: concern.JudgementTradeoff, TradeoffCost: "slower cold start", ActorKind: "user", Backfill: true,
+		PriorJudgement: concern.JudgementDefect,
+	})
+	if err != nil {
+		t.Fatalf("ApplyLabel: %v", err)
+	}
+	for name, got := range map[string]*concern.Concern{"returned": ret, "re-read": h.get(t, row.ID)} {
+		if got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "user" || got.TradeoffCost != "slower cold start" || !got.JudgementBackfill {
+			t.Errorf("%s: judgement %q actor %q cost %q backfill %v, want tradeoff / user / slower cold start / true",
+				name, got.Judgement, got.JudgementActorKind, got.TradeoffCost, got.JudgementBackfill)
+		}
+		if got.JudgementDelegated || got.JudgementBulk || got.DuplicateOf != nil {
+			t.Errorf("%s: delegated %v bulk %v duplicate_of %v, want false / false / nil", name, got.JudgementDelegated, got.JudgementBulk, got.DuplicateOf)
+		}
+	}
+	if after := h.lifecycleCols(t, row.ID); after != before {
+		t.Errorf("state|state_reason|outcome|updated_at changed by a label:\n before %s\n after  %s", before, after)
+	}
+}
+
+// TestApplyLabel_DuplicateLinksAndClears: a duplicate label sets duplicate_of
+// and stores judgement unlabelled with no cost (the row's own stale judgement
+// is cleared), so ResolveJudgements reads the root's judgement; a later
+// judgement label clears duplicate_of.
+func TestApplyLabel_DuplicateLinksAndClears(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	dup := h.labelAt(t, h.parentRun, h.parentStage, 3, "duplicate")
+	h.rawSet(t, root.ID, "judgement = 'defect'")
+	h.rawSet(t, dup.ID, "judgement = 'tradeoff', tradeoff_cost = 'stale cost'")
+
+	got, err := h.repo.ApplyLabel(ctx, dup.ID, concern.Label{DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementTradeoff})
+	if err != nil {
+		t.Fatalf("duplicate label: %v", err)
+	}
+	if got.DuplicateOf == nil || *got.DuplicateOf != root.ID || got.Judgement != concern.JudgementUnlabelled || got.TradeoffCost != "" {
+		t.Errorf("after duplicate label: duplicate_of %v judgement %q cost %q, want %s / unlabelled / empty", got.DuplicateOf, got.Judgement, got.TradeoffCost, root.ID)
+	}
+	eff := concern.ResolveJudgements(h.byRun(t, h.parentRun))[dup.ID]
+	if eff.Judgement != concern.JudgementDefect || eff.InheritedFrom == nil || *eff.InheritedFrom != root.ID {
+		t.Errorf("effective judgement of the duplicate = %+v, want defect inherited from %s", eff, root.ID)
+	}
+
+	got, err = h.repo.ApplyLabel(ctx, dup.ID, concern.Label{
+		Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled, PriorDuplicateOf: &root.ID,
+	})
+	if err != nil {
+		t.Fatalf("judgement relabel: %v", err)
+	}
+	if reread := h.get(t, dup.ID); got.DuplicateOf != nil || reread.DuplicateOf != nil || reread.Judgement != concern.JudgementNoDefect {
+		t.Errorf("after a judgement relabel: duplicate_of %v (re-read %v) judgement %q, want nil / nil / no_defect", got.DuplicateOf, reread.DuplicateOf, reread.Judgement)
+	}
+}
+
+// TestApplyLabel_DuplicateKeepsInheritingAfterHumanWaive pins approval
+// condition M2 (option a, ADR-117 D1): a human verb's judgement on a
+// duplicate-linked concern is RECORDED on the row, but the EFFECTIVE judgement
+// stays the chain root's until the concern is relabelled with an explicit
+// judgement.
+func TestApplyLabel_DuplicateKeepsInheritingAfterHumanWaive(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	dup := h.labelAt(t, h.parentRun, h.parentStage, 3, "duplicate")
+	h.rawSet(t, root.ID, "judgement = 'defect'")
+	if _, err := h.repo.ApplyLabel(ctx, dup.ID, concern.Label{DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled}); err != nil {
+		t.Fatalf("duplicate label: %v", err)
+	}
+	if _, err := h.repo.ApplyHumanDisposition(ctx, dup.ID, concern.StateWaived, "false_positive: dup", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "user",
+	}); err != nil {
+		t.Fatalf("human waive: %v", err)
+	}
+	stored := h.get(t, dup.ID)
+	if stored.Judgement != concern.JudgementNoDefect || stored.DuplicateOf == nil || *stored.DuplicateOf != root.ID {
+		t.Fatalf("after the waive: stored judgement %q duplicate_of %v, want no_defect recorded and the link kept", stored.Judgement, stored.DuplicateOf)
+	}
+	eff := concern.ResolveJudgements(h.byRun(t, h.parentRun))[dup.ID]
+	if eff.Judgement != concern.JudgementDefect || eff.InheritedFrom == nil || *eff.InheritedFrom != root.ID {
+		t.Errorf("effective judgement after a human waive on a duplicate = %+v, want the root's defect inherited from %s", eff, root.ID)
+	}
+}
+
+// TestApplyLabel_RefusesCrossRunTarget calls the STORE directly, so no
+// handler pre-check masks the guard (C4). The target is in another run at a
+// LOWER sequence, so the ordering rule would admit it. M1: the refusal is the
+// same as for a missing target and never names the target's run.
+func TestApplyLabel_RefusesCrossRunTarget(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	foreign := h.labelAt(t, h.childRun, h.childStg, 1, "another run's concern")
+	row := h.labelAt(t, h.parentRun, h.parentStage, 5, "labelled")
+	before := h.lifecycleCols(t, row.ID)
+
+	crossErr := func() error {
+		_, err := h.repo.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &foreign.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+		return err
+	}()
+	var je concern.JudgementError
+	if !errors.As(crossErr, &je) || je.Rule != concern.JudgementRuleDuplicateOfNotFound || !errors.Is(crossErr, concern.ErrDuplicateTargetNotInRun) || errors.Is(crossErr, concern.ErrNotFound) {
+		t.Fatalf("cross-run err = %v, want a %s refusal (ErrDuplicateTargetNotInRun, not ErrNotFound)", crossErr, concern.JudgementRuleDuplicateOfNotFound)
+	}
+	if strings.Contains(crossErr.Error(), h.childRun.String()) {
+		t.Errorf("cross-run refusal %q names the foreign run %s", crossErr, h.childRun)
+	}
+	got := h.get(t, row.ID)
+	if got.DuplicateOf != nil || got.Judgement != concern.JudgementUnlabelled {
+		t.Errorf("after a refused cross-run label: duplicate_of %v judgement %q, want nil / unlabelled", got.DuplicateOf, got.Judgement)
+	}
+	if after := h.lifecycleCols(t, row.ID); after != before {
+		t.Errorf("a refused label changed the row: %s -> %s", before, after)
+	}
+
+	missing := uuid.New()
+	_, missingErr := h.repo.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &missing, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+	if missingErr == nil || missingErr.Error() != crossErr.Error() {
+		t.Errorf("missing-target refusal %q differs from the cross-run refusal %q; M1 requires them identical", missingErr, crossErr)
+	}
+	if errors.Is(missingErr, concern.ErrNotFound) || !errors.Is(missingErr, concern.ErrDuplicateTargetNotInRun) {
+		t.Errorf("missing-target err = %v, want ErrDuplicateTargetNotInRun and never ErrNotFound (LOW 2)", missingErr)
+	}
+}
+
+// TestApplyLabel_RefusesNotEarlier: a self-link and a link to a LATER
+// same-run concern are refused with nothing written.
+func TestApplyLabel_RefusesNotEarlier(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	earlier := h.labelAt(t, h.parentRun, h.parentStage, 1, "earlier")
+	later := h.labelAt(t, h.parentRun, h.parentStage, 3, "later")
+	for name, tc := range map[string]struct{ labelled, target uuid.UUID }{
+		"self":    {earlier.ID, earlier.ID},
+		"reverse": {earlier.ID, later.ID},
+	} {
+		target := tc.target
+		_, err := h.repo.ApplyLabel(ctx, tc.labelled, concern.Label{DuplicateOf: &target, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+		var je concern.JudgementError
+		if !errors.As(err, &je) || je.Rule != concern.JudgementRuleDuplicateOfNotEarlier {
+			t.Errorf("%s: err = %v, want a %s refusal", name, err, concern.JudgementRuleDuplicateOfNotEarlier)
+		}
+		if got := h.get(t, tc.labelled); got.DuplicateOf != nil {
+			t.Errorf("%s: duplicate_of = %v after a refusal, want nil", name, got.DuplicateOf)
+		}
+	}
+}
+
+// TestApplyLabel_StalePriorConflicts: a label whose prior judgement or prior
+// duplicate_of no longer matches the row is ErrLabelConflict with nothing
+// written (C5). The row is changed DIRECTLY after the caller's read, as a
+// concurrent relabel would.
+func TestApplyLabel_StalePriorConflicts(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	row := h.labelAt(t, h.parentRun, h.parentStage, 3, "raced")
+	read := h.get(t, row.ID)
+
+	h.rawSet(t, row.ID, "judgement = 'defect'")
+	_, err := h.repo.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: read.Judgement})
+	if !errors.Is(err, concern.ErrLabelConflict) {
+		t.Fatalf("stale prior judgement: err = %v, want ErrLabelConflict", err)
+	}
+	if got := h.get(t, row.ID); got.Judgement != concern.JudgementDefect {
+		t.Errorf("after a stale-judgement conflict: judgement %q, want the intervening defect kept", got.Judgement)
+	}
+
+	h.rawSet(t, row.ID, "judgement = 'unlabelled', duplicate_of = $2", root.ID)
+	_, err = h.repo.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled})
+	if !errors.Is(err, concern.ErrLabelConflict) {
+		t.Fatalf("stale prior duplicate_of: err = %v, want ErrLabelConflict", err)
+	}
+	if got := h.get(t, row.ID); got.DuplicateOf == nil || *got.DuplicateOf != root.ID || got.Judgement != concern.JudgementUnlabelled {
+		t.Errorf("after a stale-link conflict: duplicate_of %v judgement %q, want the intervening link kept", got.DuplicateOf, got.Judgement)
+	}
+}
+
+// TestApplyLabel_RefusesInvalid: every invalid label is refused before any
+// read or write, and an unknown labelled id is ErrNotFound.
+func TestApplyLabel_RefusesInvalid(t *testing.T) {
+	ctx := context.Background()
+	h := newRollupHarness(t)
+	root := h.labelAt(t, h.parentRun, h.parentStage, 1, "root")
+	row := h.labelAt(t, h.parentRun, h.parentStage, 3, "never labelled")
+	before := h.lifecycleCols(t, row.ID)
+	for name, l := range map[string]concern.Label{
+		"judgement and duplicate_of": {Judgement: concern.JudgementDefect, DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"cost with duplicate_of":     {TradeoffCost: "c", DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"neither":                    {ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"unlabelled":                 {Judgement: concern.JudgementUnlabelled, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"tradeoff without cost":      {Judgement: concern.JudgementTradeoff, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled},
+		"blank actor kind":           {Judgement: concern.JudgementDefect, PriorJudgement: concern.JudgementUnlabelled},
+	} {
+		if _, err := h.repo.ApplyLabel(ctx, row.ID, l); err == nil {
+			t.Errorf("%s: ApplyLabel = nil error, want a refusal", name)
+		}
+		got := h.get(t, row.ID)
+		if got.Judgement != concern.JudgementUnlabelled || got.DuplicateOf != nil || got.JudgementActorKind != "" || got.TradeoffCost != "" {
+			t.Fatalf("%s: after a refused label: judgement %q duplicate_of %v actor %q cost %q, want nothing written",
+				name, got.Judgement, got.DuplicateOf, got.JudgementActorKind, got.TradeoffCost)
+		}
+	}
+	if after := h.lifecycleCols(t, row.ID); after != before {
+		t.Errorf("refused labels changed the row: %s -> %s", before, after)
+	}
+	if _, err := h.repo.ApplyLabel(ctx, uuid.New(), concern.Label{Judgement: concern.JudgementDefect, ActorKind: "user"}); !errors.Is(err, concern.ErrNotFound) {
+		t.Errorf("unknown labelled id: err = %v, want ErrNotFound", err)
 	}
 }
