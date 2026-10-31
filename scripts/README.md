@@ -794,8 +794,11 @@ before checksum signing and the final immutable-release publication.
 
 Fishhawk fan-out uses `queue: max`: up to 100 pending siblings are retained,
 with one running at a time. The backend fan-out cap must remain below that
-queue capacity; GitHub cancels arrivals above capacity. Ordinary CI and image
-promotion keep latest-pending behavior because obsolete pushes need not publish.
+queue capacity; GitHub cancels arrivals above capacity. PR updates cancel older
+checks for that PR. Main pushes use independent run groups so GitHub cannot
+replace a pending code push with a docs-only push and lose its image trigger.
+Only image promotion keeps latest-pending behavior; the newer applicable
+publisher supersedes the older one.
 
 ## CI test legs ([#3882](https://github.com/kuhlman-labs/fishhawk/issues/3882))
 

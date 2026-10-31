@@ -10,7 +10,10 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # PR updates supersede older checks. Main pushes must each be evaluated:
+  # a shared latest-pending slot can discard a code push before a docs push.
+  # Publishers have their own serialization below.
+  group: ${{ github.workflow }}-${{ github.event_name == 'pull_request' && github.ref || github.run_id }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 jobs:

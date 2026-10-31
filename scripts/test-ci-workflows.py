@@ -34,6 +34,8 @@ SPEC.loader.exec_module(GUARD)
 
 class WorkflowContracts(unittest.TestCase):
     def test_validation_is_required_and_publication_is_downstream(self):
+        self.assertIn("github.run_id", CI["concurrency"]["group"])
+        self.assertIn("pull_request", CI["concurrency"]["group"])
         jobs = CI["jobs"]
         validators = set(jobs) - {"ci-pass", "publish-backend", "publish-gate"}
         self.assertEqual(set(jobs["ci-pass"]["needs"]), validators)
