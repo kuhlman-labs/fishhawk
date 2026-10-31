@@ -119,6 +119,65 @@ func (w *mqmWorld) admqDrive(r *mcqRun, m GitHubMerger) AutoDriveOutcome {
 	return out
 }
 
+// admqDriveErr is admqDrive returning AutoDriveRunGate's error instead of
+// failing the test (#4617), so a test can assert the error outcome and then
+// its committed state. A GetRun failure is fixture setup and stays fatal.
+func (w *mqmWorld) admqDriveErr(r *mcqRun, m GitHubMerger) (AutoDriveOutcome, error) {
+	w.t.Helper()
+	runRow, err := w.repo.GetRun(context.Background(), r.id)
+	if err != nil {
+		w.t.Fatalf("GetRun: %v", err)
+	}
+	return w.srv.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), m, nil)
+}
+
+// admqPRReader is a mutex-guarded PullRequestStateReader (#3226): it answers
+// an open, unmerged pull request until set flips it, counts every read, and
+// with block set waits on its context (blockOnCtx) and records what it saw.
+type admqPRReader struct {
+	mu    sync.Mutex
+	pr    *forge.PullRequest
+	reads int
+	block bool
+	seen  []blockOutcome
+}
+
+func (f *admqPRReader) GetPullRequest(ctx context.Context, _ forge.CredentialScope, _ forge.RepoRef, _ int) (*forge.PullRequest, error) {
+	f.mu.Lock()
+	f.reads++
+	pr, block := f.pr, f.block
+	f.mu.Unlock()
+	if block {
+		got := blockOnCtx(ctx)
+		f.mu.Lock()
+		f.seen = append(f.seen, got)
+		f.mu.Unlock()
+		return nil, got.err
+	}
+	if pr == nil {
+		return &forge.PullRequest{State: "open"}, nil
+	}
+	return pr, nil
+}
+
+func (f *admqPRReader) set(pr *forge.PullRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pr = pr
+}
+
+func (f *admqPRReader) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+func (f *admqPRReader) outcomes() []blockOutcome {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]blockOutcome(nil), f.seen...)
+}
+
 func requireObserveOnly(t *testing.T, out AutoDriveOutcome, note string) {
 	t.Helper()
 	if out.Acted || out.Paged || out.DecisionRequired || out.Note != note {
@@ -418,6 +477,11 @@ func TestAutoDrive_MayMergeDispatchFailureMarksClaimFailed(t *testing.T) {
 	if st, path := w.claimRow(r, &head); st != string(mergequeue.DispatchFailed) || path != mergequeue.DispatchPathDelegated {
 		t.Fatalf("claim = %s/%s, want dispatch_failed/delegated", st, path)
 	}
+	// #4617: the PR stays unmerged, so the observe-before-settle reads no
+	// merge and the settle still records exactly one dispatch_failed row.
+	if got := w.mdsOutcomes(r); len(got) != 1 || got[string(mergeDispatchUncertain)] != 1 {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want exactly one dispatch_failed", got)
+	}
 	m.err = nil
 	requireObserveOnly(t, w.admqDrive(r, m), autoDriveNoteAlreadyClaimed)
 	if m.calls() != 1 {
@@ -559,5 +623,84 @@ func TestAutoDrive_MayMergeHeldIntentEntryOwnsMerge(t *testing.T) {
 	var head string
 	if st, _ := w.claimRow(r, &head); st != "" {
 		t.Fatalf("claim state = %q, want none", st)
+	}
+}
+
+// TestAutoDrive_MayMergeUncertainErrorButMergedKeepsClaim pins the delegated
+// observe-before-settle (#4617): a dispatch error whose merge landed leaves
+// the claim dispatched, writes no merge_dispatch_settled row and reports the
+// acted mergeDispatchLandedOnReobserve outcome. The PR reads merged only AFTER
+// the merger returns its uncertain error (the forge reader flips, or a
+// pr_merged chain row lands, inside the dispatch), so without the guard the
+// settle runs unconditionally. Counterfactual: the guard made `if false`
+// leaves the claim dispatch_failed with one dispatch_failed row, RED;
+// delegatedMergeLanded skipping its chain tier reddens chain_evidence,
+// skipping its forge tier reddens forge_confirms.
+func TestAutoDrive_MayMergeUncertainErrorButMergedKeepsClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		land func(w *mqmWorld, r *mcqRun, reader *admqPRReader)
+	}{
+		{"forge_confirms", func(_ *mqmWorld, _ *mcqRun, reader *admqPRReader) { reader.set(mergedPR()) }},
+		{"chain_evidence", func(w *mqmWorld, r *mcqRun, _ *admqPRReader) {
+			w.mqeAppend(r, CategoryPRMerged, map[string]any{"merge_commit_sha": "m1"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			reader := &admqPRReader{}
+			w.srv.cfg.PRStateReader = reader
+			r := w.admqReady("landed", "h1")
+			m := &admqMerger{hook: func(context.Context, *run.Run, string) error {
+				tc.land(w, r, reader)
+				return errors.New("forge 502")
+			}}
+			out, err := w.admqDriveErr(r, m)
+			if err != nil || !out.Acted || out.Action != delegation.ActionMerge || out.Note != autoDriveNoteMergeLandedOnReobserve {
+				t.Fatalf("outcome = %+v err %v, want acted %q with no error", out, err, autoDriveNoteMergeLandedOnReobserve)
+			}
+			var head string
+			if st, path := w.claimRow(r, &head); st != string(mergequeue.DispatchDispatched) || path != mergequeue.DispatchPathDelegated || head != "h1" {
+				t.Fatalf("claim = %s/%s@%s, want dispatched/delegated@h1", st, path, head)
+			}
+			if got := w.mdsOutcomes(r); len(got) != 0 {
+				t.Fatalf("merge_dispatch_settled outcomes = %v, want none", got)
+			}
+			if m.calls() != 1 {
+				t.Fatalf("merger calls = %d, want 1", m.calls())
+			}
+		})
+	}
+}
+
+// TestAutoDrive_MayMergeChecksPendingSkipsLandedRead pins approval condition
+// 2's carve-out (#4617): our own checks_pending refusal
+// (forge.ErrPullRequestUnstableStatus) dispatched nothing, so the delegated
+// arm makes NO landed read (mirroring the inline tail's `if !checksPending`)
+// and settles as today: the claim is released with one released row and the
+// error surfaces. The reader flips to merged inside the dispatch, so a read
+// would report landed. Counterfactual: dropping the carve-out adds one read
+// and reports landed, RED.
+func TestAutoDrive_MayMergeChecksPendingSkipsLandedRead(t *testing.T) {
+	w := newMQMWorld(t)
+	reader := &admqPRReader{}
+	w.srv.cfg.PRStateReader = reader
+	r := w.admqReady("pending", "h1")
+	readsAtDispatch := -1
+	m := &admqMerger{hook: func(context.Context, *run.Run, string) error {
+		readsAtDispatch = reader.count()
+		reader.set(mergedPR())
+		return fmt.Errorf("enable auto-merge: %w", forge.ErrPullRequestUnstableStatus)
+	}}
+	out, err := w.admqDriveErr(r, m)
+	if err == nil || out.Acted || out.Note != "merge dispatch failed" {
+		t.Fatalf("outcome = %+v err %v, want the checks_pending refusal surfaced", out, err)
+	}
+	if got := reader.count(); got != readsAtDispatch {
+		t.Fatalf("forge reads after the dispatch = %d, want 0 (no landed read on checks_pending)", got-readsAtDispatch)
+	}
+	w.requireClaim(r, "")
+	if got := w.mdsOutcomes(r); len(got) != 1 || got[string(mergeDispatchRelease)] != 1 {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want exactly one released", got)
 	}
 }
