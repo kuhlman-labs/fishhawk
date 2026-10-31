@@ -1424,7 +1424,10 @@ func (c *Client) EnableAutoMerge(ctx context.Context, scope forge.CredentialScop
 //     different head, so NO mutation was sent. Nothing was applied.
 //   - HeadMismatchRESTSha: the pinned REST PUT .../merge answered 409, which
 //     GitHub documents as "sha was provided and pull request head did not
-//     match". The forge refused the merge; nothing was applied.
+//     match" (https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request).
+//     The label means ANY 409 on that PUT, so the basis names the status, not
+//     a proven sha mismatch. The PUT was refused either way and nothing was
+//     applied.
 //   - HeadMismatchGraphQLReread: the pinned enablePullRequestAutoMerge mutation
 //     answered a GraphQL error and a FRESH GET then showed a different head.
 //     The mismatch is INFERRED: GitHub does not document the error wording for
@@ -1516,6 +1519,11 @@ func (c *Client) enableAutoMerge(ctx context.Context, scope forge.CredentialScop
 	pinned := expectedHeadSHA != ""
 	// Pre-check (#4641): the head GitHub reports now is not the head the
 	// caller evaluated, so refuse before sending anything. Nothing applied.
+	// An EMPTY GET head is not the expected head either, so it is refused as a
+	// precheck mismatch with ObservedHeadSHA empty (fail closed). That is safe
+	// to release because no mutation was sent; the re-read arm below treats an
+	// empty head as uncertain instead, because by then the mutation was sent
+	// (#4683).
 	if pinned && pr.HeadSHA != expectedHeadSHA {
 		return fmt.Errorf("%w: enable auto-merge pr #%d: mutation not sent: %w", ErrMergeConflict, prNumber,
 			&HeadMismatchError{Basis: HeadMismatchPrecheck, ExpectedHeadSHA: expectedHeadSHA, ObservedHeadSHA: pr.HeadSHA})
@@ -1680,6 +1688,10 @@ func (c *Client) QueueMerge(ctx context.Context, scope forge.CredentialScope,
 	// (https://docs.github.com/en/rest/pulls/pulls#merge-a-pull-request).
 	merr := c.MergePullRequestAtHead(ctx, scope, repo, prNumber, method, expectedHeadSHA)
 	if errors.Is(merr, ErrMergeConflict) {
+		// rest_sha labels ANY 409 on the pinned PUT: GitHub documents it as a
+		// sha mismatch, so the basis names the status, not a proven mismatch.
+		// The PUT was refused either way and nothing merged, so it releases
+		// (#4683).
 		return fmt.Errorf("%w: %w", merr, &HeadMismatchError{Basis: HeadMismatchRESTSha, ExpectedHeadSHA: expectedHeadSHA})
 	}
 	return merr

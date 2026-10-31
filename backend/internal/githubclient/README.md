@@ -105,8 +105,10 @@ A whitespace-only head is NOT read as empty. It reaches `EnableAutoMergeAtHead` 
 | `Basis` | established by | nothing applied? |
 |---|---|---|
 | `precheck` (`HeadMismatchPrecheck`) | the pre-mutation GET; no mutation sent | yes, guaranteed |
-| `rest_sha` (`HeadMismatchRESTSha`) | the pinned PUT's 409 | yes, forge-documented |
+| `rest_sha` (`HeadMismatchRESTSha`) | ANY 409 on the pinned PUT (GitHub documents it as a sha mismatch, so the label names the status, not a proven mismatch) | yes: the PUT was refused, nothing merged |
 | `graphql_reread` (`HeadMismatchGraphQLReread`) | a GraphQL error plus a fresh GET showing a moved head | INFERRED, not guaranteed: if the mutation had in fact applied, auto-merge may be armed at the pinned head |
+
+An EMPTY head on the pre-check GET is not the expected head, so it is refused as a `precheck` mismatch with `ObservedHeadSHA` empty (fail closed; no mutation was sent, so it is safe to release). The re-read arm treats an empty head as uncertain instead, because the mutation was sent by then (#4683).
 
 The server's D1 merge-dispatch ledger RELEASES the run's claim only on `precheck` and `rest_sha`; `graphql_reread` (and an empty or unrecognised basis) leaves it `dispatch_failed` for reconciliation or the operator re-arm (#4749, `../mergequeue/README.md` § "Merge-dispatch ledger").
 

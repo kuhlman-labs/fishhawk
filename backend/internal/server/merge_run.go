@@ -232,7 +232,9 @@ type mergeRunResponse struct {
 // forge refuses for a head mismatch (forge.ErrMergeConflict) returns 409
 // merge_head_moved naming the pinned head and its refusal_basis (precheck,
 // rest_sha, graphql_reread; only the first two are forge guarantees that
-// nothing applied): on precheck / rest_sha (and a bare REST 409 naming no
+// nothing applied, rest_sha because the pinned PUT answered 409, which GitHub
+// documents as a sha mismatch, so the basis names the status, not a proven
+// sha mismatch): on precheck / rest_sha (and a bare REST 409 naming no
 // basis) the claim is released and a re-invoke re-gates at the new head; on
 // graphql_reread, or a head mismatch with an empty or unrecognised basis, the
 // claim is left dispatch_failed (#4749) and a re-invoke answers
@@ -1058,12 +1060,14 @@ func mergeHeadMovedBasis(err error) string {
 
 // mergeHeadMovedNothingApplied reports whether basis is one the forge
 // GUARANTEES applied nothing (ruling C3): the client pre-check sent no
-// mutation, and a REST 409 is GitHub's documented sha-mismatch refusal. The
-// graphql_reread basis is INFERRED from a fresh read after a GraphQL error, so
-// an auto-merge may in fact be armed at the pinned head; an unknown basis is
-// treated the same way. Only these two bases RELEASE the D1 claim on a head
-// mismatch: graphql_reread and an empty or unrecognised basis leave it
-// dispatch_failed (mergeDispatchHeadMismatchUncertain, #4749).
+// mutation, and a REST 409 on the pinned PUT is refused either way (GitHub
+// documents it as a sha mismatch; the rest_sha basis names the status, not a
+// proven mismatch, and nothing merged). The graphql_reread basis is INFERRED
+// from a fresh read after a GraphQL error, so an auto-merge may in fact be
+// armed at the pinned head; an unknown basis is treated the same way. Only
+// these two bases RELEASE the D1 claim on a head mismatch: graphql_reread and
+// an empty or unrecognised basis leave it dispatch_failed
+// (mergeDispatchHeadMismatchUncertain, #4749).
 func mergeHeadMovedNothingApplied(basis string) bool {
 	return basis == githubclient.HeadMismatchPrecheck || basis == githubclient.HeadMismatchRESTSha
 }

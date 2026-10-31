@@ -477,8 +477,13 @@ deadline): `backend/internal/mergequeue/README.md`.
   `dispatch_failed`) and surfaces the error, except a head-PINNED dispatch
   the forge refused for a head mismatch, which settles the claim by its
   refusal basis (released on precheck / rest_sha, `dispatch_failed` on
-  graphql_reread, #4749) and is observe-only (`autoDriveNoteHeadMoved`,
-  #4641). The inline AND delegated paths re-observe a landed merge after a
+  graphql_reread, #4749) and is observe-only (#4641). The note follows the
+  SETTLE outcome (`autoDriveHeadMovedNote`, #4683): `autoDriveNoteHeadMoved`
+  (released), `autoDriveNoteHeadMovedBasisHeld` (`dispatch_failed`, the basis
+  does not prove nothing applied), `autoDriveNoteHeadMovedReleaseFailed`
+  (`dispatch_failed`, the release did not land) or
+  `autoDriveNoteHeadMovedUnclaimed` (no ledger wired); the two
+  `dispatch_failed` notes name the operator re-arm. The inline AND delegated paths re-observe a landed merge after a
   dispatch error and BEFORE settling the claim (as merge-on-pass does), so a
   merge that landed leaves the claim `dispatched` with no
   `merge_dispatch_settled` row: inline answers `already_merged`; delegated
@@ -733,20 +738,26 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   `merge_head_moved` with details `{run_id, pr_url, verdict_sequence,
   head_sha (the pin), refusal_basis, next_step: "fishhawk_merge_run"}`; the
   re-observe still runs first, so a PR that landed answers `already_merged`.
-  Delegated returns `mergeDispatchHeadMoved`, which is observe-only
-  `autoDriveNoteHeadMoved` with an INFO log (`pinned_to`, `refusal_basis`,
-  `forge_guarantees_nothing_applied`, `claim_outcome` = the settle outcome),
-  never "merge dispatch failed"; on a released claim the next tick re-gates
-  at the new head, on a `dispatch_failed` one every later tick is
-  observe-only already-claimed. The message and the log name "the head
+  Delegated returns `mergeDispatchHeadMoved`, which is observe-only with the
+  note that follows the settle outcome (`autoDriveHeadMovedNote`, #4683: the
+  released, basis-held, release-failed or unclaimed note) and an INFO log
+  (`pinned_to`, `refusal_basis`, `forge_guarantees_nothing_applied`,
+  `claim_outcome` = the settle outcome), never "merge dispatch failed"; on a
+  released claim the next tick re-gates at the new head, on a
+  `dispatch_failed` one every later tick is observe-only already-claimed
+  until reconciliation or the operator re-arm. #4617's observe-before-settle
+  runs first, so a landed merge never reaches this arm. The message and the log name "the head
   the merge-candidate gate admitted". They add "the head the approval was
   evaluated at" (and the fold, for the re-invoke) ONLY when the review stage
   declares an approval gate (`forgeApprovalFolded`): a gate-less run has no
   evaluated approval.
 - **What `refusal_basis` guarantees.** `precheck` (the client's GET showed a
-  different head; no mutation was sent) and `rest_sha` (GitHub's documented
-  sha-mismatch 409) are forge guarantees that nothing applied, and only
-  these say "Nothing merged". `graphql_reread` is INFERRED: the pinned enable
+  different head; no mutation was sent) and `rest_sha` (ANY 409 on the pinned
+  REST PUT, which GitHub documents as a sha mismatch, so the label names the
+  status, not a proven mismatch) are refusals where nothing applied, and only
+  these say "Nothing merged". An EMPTY pre-check head is not the expected
+  head, so it is refused as a `precheck` mismatch (fail closed, released: no
+  mutation was sent), while an empty re-read head stays uncertain (#4683). `graphql_reread` is INFERRED: the pinned enable
   answered a GraphQL error and a fresh GET then showed a different head.
   GitHub documents no wording for an `expectedHeadOid` mismatch, so if that
   mutation had in fact applied, auto-merge may be armed at the pinned head.
@@ -773,8 +784,16 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   `merge_head_moved` instead of merging a head the gate never verified.
 - **GitLab (R6).** `ForgeMerger`'s non-github arm refuses a non-empty pin with
   `ErrHeadPinnedMergeUnsupported` before resolving or calling any forge, so a
-  pin is never silently dropped. It is unreachable today: GitLab runs carry
-  no gate head.
+  pin is never silently dropped. It is unreachable on the inline and
+  delegated paths: GitLab runs carry no gate head
+  (`TestHeadPinnedMergeUnsupported_UnreachableWithoutGitHubInstallation`).
+  The refusal is UNCERTAIN BY DESIGN (#4683): `classifyMergeDispatchOutcome`
+  answers `dispatch_failed`, never released, because it is a deterministic
+  capability refusal and a release would re-dispatch into it (ADR-093 D4):
+  merge-on-pass step 9 would match no typed-refusal case, fall to the final
+  transient hold and re-claim at step 8 on every pump. Left uncertain, the
+  claim strands once, loudly
+  (`TestClassifyMergeDispatchOutcome_HeadPinRefusalStaysUncertain`).
 - **Residuals.** (Auto-merge persistence) The pre-dispatch window is closed
   (pre-check plus forge pin), but GitHub does not document whether a QUEUED
   auto-merge re-checks `expectedHeadOid` when it later fires. Its docs say

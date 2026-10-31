@@ -384,7 +384,8 @@ var _ HeadPinnedMerger = ForgeMerger{}
 // ErrHeadPinnedMergeUnsupported is returned by ForgeMerger.MergePullRequestAtHead
 // when the run's resolved merge leaf (the github leaf, or the resolved forge)
 // has no head-pinned merge. It is a refusal, never a fallback to an unpinned
-// merge.
+// merge. It is deliberately UNCERTAIN on the merge-dispatch ledger
+// (dispatch_failed), not released: see classifyMergeDispatchOutcome (#4683).
 var ErrHeadPinnedMergeUnsupported = errors.New("forge merge: head-pinned merge not supported by this forge")
 
 // headPinnedMergeCallTimeout bounds ONE pinned merge forge call. Merge-on-pass

@@ -418,7 +418,9 @@ change nothing (ADR-093 slice 2, rejection item 1):
     `*githubclient.HeadMismatchError`, and its basis decides the claim
     ([#4749](https://github.com/kuhlman-labs/fishhawk/issues/4749)): the
     client pre-check (`precheck`, no mutation sent) and the pinned REST PUT's
-    409 (`rest_sha`, `sha` mismatch) are forge guarantees and release. The
+    409 (`rest_sha`: any 409 on that PUT, which GitHub documents as a `sha`
+    mismatch, so the label names the status, not a proven mismatch) are
+    refusals where nothing applied and release. The
     pinned auto-merge enable's `graphql_reread` basis (a GraphQL error, then
     a fresh read showing a different head) is INFERRED: a GraphQL execution
     error can accompany an applied mutation, so that enable may in fact have
@@ -432,7 +434,10 @@ change nothing (ADR-093 slice 2, rejection item 1):
     (`backend/internal/server/docs/merge-queue.md` § "ADR-112 forge-approval
     fold", head-pinned bullets). A pinned GraphQL
     error whose re-read shows the SAME head, or whose re-read fails, stays a
-    bare `forge.ErrValidation`: uncertain. **`ReleaseMergeDispatch(claim)`**
+    bare `forge.ErrValidation`: uncertain. A pre-forge head-pin refusal
+    (`ErrHeadPinnedMergeUnsupported`) is deliberately uncertain too: it is a
+    deterministic capability refusal, and a release would re-dispatch into it
+    (#4683, ADR-093 D4). **`ReleaseMergeDispatch(claim)`**
     DELETEs the claim as a compare-and-swap on the EXACT claim (`run_id`,
     `state = 'dispatched'`, `path`, `head_sha`, `claimed_at`); a claim that
     no longer matches is `ErrStateConflict` and is never deleted, so a

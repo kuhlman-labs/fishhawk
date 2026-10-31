@@ -16450,8 +16450,9 @@ paths:
             head_sha, refusal_basis, next_step: "fishhawk_merge_run"}`, where
             `head_sha` is the pinned head. `refusal_basis` `precheck` (the
             client read a different head and sent no mutation) and `rest_sha`
-            (GitHub's documented 409 for a `sha` mismatch) guarantee nothing
-            merged; `graphql_reread` (the auto-merge enable answered a GraphQL
+            (any 409 on the pinned PUT, which GitHub documents as a `sha`
+            mismatch, so the label names the status, not a proven mismatch)
+            are refusals where nothing merged; `graphql_reread` (the auto-merge enable answered a GraphQL
             error and a fresh read showed a different head) and `unknown` are
             INFERRED, so if that enable had in fact applied, auto-merge may be
             armed at the pinned head: inspect the pull request. The message

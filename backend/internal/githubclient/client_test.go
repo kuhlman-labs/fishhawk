@@ -2806,6 +2806,28 @@ func TestEnableAutoMergeAtHead_ReReadEmptyHeadStaysGeneric(t *testing.T) {
 	assertGenericPinnedGraphQLError(t, err)
 }
 
+// TestEnableAutoMergeAtHead_PreCheckEmptyHeadFailsClosed: a pre-check GET that
+// reports NO head is not the expected head, so it is refused as a precheck
+// mismatch with an empty observed head and NO mutation is sent (#4683). The
+// fake answers the mutation with SUCCESS, so without the fail-closed pre-check
+// this returns nil after one mutation. The re-read arm's empty head stays
+// uncertain (TestEnableAutoMergeAtHead_ReReadEmptyHeadStaysGeneric) because
+// the mutation was sent by then.
+func TestEnableAutoMergeAtHead_PreCheckEmptyHeadFailsClosed(t *testing.T) {
+	pf, c := newPinFake(t, "")
+	err := c.EnableAutoMergeAtHead(context.Background(), pinScope, pinRepo, 42, MergeMethodSquash, pinH1)
+	if !errors.Is(err, ErrMergeConflict) {
+		t.Fatalf("err = %v, want ErrMergeConflict", err)
+	}
+	var hm *HeadMismatchError
+	if !errors.As(err, &hm) || hm.Basis != HeadMismatchPrecheck || hm.ExpectedHeadSHA != pinH1 || hm.ObservedHeadSHA != "" {
+		t.Errorf("HeadMismatchError = %+v, want basis precheck expected h1 observed empty", hm)
+	}
+	if _, graphqls, puts := pf.counts(); graphqls != 0 || puts != 0 {
+		t.Errorf("graphql requests = %d, PUTs = %d, want 0 and 0 (no mutation after a failed pre-check)", graphqls, puts)
+	}
+}
+
 func assertGenericPinnedGraphQLError(t *testing.T, err error) {
 	t.Helper()
 	if !errors.Is(err, ErrValidation) {

@@ -72,9 +72,16 @@ type mhpProxy struct {
 	mode string
 
 	mu sync.Mutex
-	// afterSnapshot runs once, after the first review-snapshot response is
-	// written and before the caller reads it.
+	// afterSnapshot is the hook an arm plants to fire right after the fold's
+	// review snapshot. It is not run directly: the snapshot request moves it
+	// into beforeNext BEFORE the snapshot is forwarded (#4683).
 	afterSnapshot func()
+	// beforeNext runs once, at the very top of the next request the proxy
+	// serves. It is published before the snapshot response is forwarded, so
+	// the caller (which sends its requests serially) cannot have sent its next
+	// request yet and always finds it set: the head move lands before that
+	// request is served, deterministic by construction.
+	beforeNext func()
 	// onEnable runs once, on receipt of the enable mutation, before it is
 	// judged.
 	onEnable func()
@@ -84,6 +91,15 @@ type mhpProxy struct {
 }
 
 func (p *mhpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
+	// A hook published by the previous request fires before anything else, so
+	// the snapshot request, which publishes it below, cannot consume its own.
+	p.mu.Lock()
+	next := p.beforeNext
+	p.beforeNext = nil
+	p.mu.Unlock()
+	if next != nil {
+		next()
+	}
 	if req.Method != http.MethodPost || req.URL.Path != "/graphql" {
 		p.rp.ServeHTTP(rw, req)
 		return
@@ -96,16 +112,12 @@ func (p *mhpProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	}
 	req.Body = io.NopCloser(bytes.NewReader(body))
 	req.ContentLength = int64(len(body))
-	p.rp.ServeHTTP(rw, req)
 	if bytes.Contains(body, []byte("latestOpinionatedReviews")) {
 		p.mu.Lock()
-		hook := p.afterSnapshot
-		p.afterSnapshot = nil
+		p.beforeNext, p.afterSnapshot = p.afterSnapshot, nil
 		p.mu.Unlock()
-		if hook != nil {
-			hook()
-		}
 	}
+	p.rp.ServeHTTP(rw, req)
 }
 
 func (p *mhpProxy) serveEnable(rw http.ResponseWriter, body []byte) {
@@ -194,32 +206,34 @@ func newMHPProxy(t *testing.T, w *mqmWorld, r *mcqRun, mode string) (*mhpProxy, 
 
 // mhpArm is one head-moving dispatch arm: where the head moves, which proxy
 // mode answers the enable, the refusal basis the forge reports, and the claim
-// outcome the D1 ledger must be left in (#4749). claim is HARD-CODED per arm,
-// never derived from the production predicate.
+// outcome the D1 ledger must be left in (#4749). claim and note are
+// HARD-CODED per arm, never derived from the production predicate: note is the
+// delegated arm's observe-only note for a claim left in arm.claim (#4683).
 type mhpArm struct {
 	name  string
 	mode  string
 	basis string
 	claim mergeDispatchLedgerOutcome
+	note  string
 	plant func(p *mhpProxy)
 }
 
 var mhpArms = []mhpArm{
-	// The head moves after the fold's snapshot: the client pre-check sees h2
-	// and sends no mutation.
-	{"precheck", mhpRefuseOnMismatch, githubclient.HeadMismatchPrecheck, mergeDispatchRelease, func(p *mhpProxy) {
+	// The head moves at the top of the first request after the fold's
+	// snapshot request: the client pre-check sees h2 and sends no mutation.
+	{"precheck", mhpRefuseOnMismatch, githubclient.HeadMismatchPrecheck, mergeDispatchRelease, autoDriveNoteHeadMoved, func(p *mhpProxy) {
 		p.afterSnapshot = p.moveHead
 	}},
 	// The head moves on receipt of the pinned enable: the forge refuses it
 	// (expectedHeadOid h1 vs head h2) and the client's re-read sees h2. The
 	// basis is inferred, so the claim is held dispatch_failed (#4749).
-	{"graphql", mhpRefuseOnMismatch, githubclient.HeadMismatchGraphQLReread, mergeDispatchUncertain, func(p *mhpProxy) {
+	{"graphql", mhpRefuseOnMismatch, githubclient.HeadMismatchGraphQLReread, mergeDispatchUncertain, autoDriveNoteHeadMovedBasisHeld, func(p *mhpProxy) {
 		p.onEnable = p.moveHead
 	}},
 	// The enable answers clean status, so the ladder takes the pinned REST
 	// fallback; the head moves before the PUT is judged, so its sha h1 is
 	// refused 409.
-	{"rest", mhpCleanStatus, githubclient.HeadMismatchRESTSha, mergeDispatchRelease, func(p *mhpProxy) {
+	{"rest", mhpCleanStatus, githubclient.HeadMismatchRESTSha, mergeDispatchRelease, autoDriveNoteHeadMoved, func(p *mhpProxy) {
 		p.w.gh.set(func() { p.w.gh.onPut = func(int) { p.moveHead() } })
 	}},
 }
@@ -375,11 +389,14 @@ func TestMergeHeadPinE2E_InlineGateLessHappyPathPinned(t *testing.T) {
 }
 
 // TestMergeHeadPinE2E_Delegated: the same three arms on the delegated
-// may_merge arm are observe-only autoDriveNoteHeadMoved with nothing merged
-// and the claim in the arm's outcome (released: the next tick re-gates at the
-// new head; dispatch_failed on graphql: held until reconciliation or the
-// operator re-arm), and the head-moved log's claim_outcome names that SETTLE
-// outcome (approval condition C1). Counterfactual: liveHead -> "" in
+// may_merge arm are observe-only with nothing merged and the claim in the
+// arm's outcome (released: autoDriveNoteHeadMoved, the next tick re-gates at
+// the new head; dispatch_failed on graphql: autoDriveNoteHeadMovedBasisHeld,
+// held until reconciliation or the operator re-arm), and the head-moved log's
+// claim_outcome names that SETTLE outcome (approval condition C1). The mcq
+// fake reads the PR unmerged, so #4617's observe-before-settle falls through
+// to the head-moved arm. The run declares an approval gate, so the log's
+// pinned_to also names the evaluated approval (#4683). Counterfactual: liveHead -> "" in
 // dispatchAcceptanceGatedMerge flips the outcome to Acted (auto-merge enabled
 // at h2, or h2 merged), RED.
 func TestMergeHeadPinE2E_Delegated(t *testing.T) {
@@ -391,10 +408,14 @@ func TestMergeHeadPinE2E_Delegated(t *testing.T) {
 			w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 			p, merger := newMHPProxy(t, w, r, arm.mode)
 			arm.plant(p)
-			requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMoved)
+			requireObserveOnly(t, w.admqDrive(r, merger), arm.note)
 			requireHeadPinRefused(t, w, r, p, arm, mergequeue.DispatchPathDelegated)
-			if got := mhpHeadMovedClaimOutcome(t, logs); got != string(arm.claim) {
-				t.Fatalf("head-moved log claim_outcome = %q, want %s", got, arm.claim)
+			rec := mhpHeadMovedRecord(t, logs)
+			if got := rec["claim_outcome"]; got != string(arm.claim) {
+				t.Fatalf("head-moved log claim_outcome = %v, want %s", got, arm.claim)
+			}
+			if got, _ := rec["pinned_to"].(string); !strings.Contains(got, "the approval was evaluated at") {
+				t.Fatalf("head-moved log pinned_to = %q, want the evaluated-approval clause (declared gate)", got)
 			}
 		})
 	}
@@ -403,8 +424,9 @@ func TestMergeHeadPinE2E_Delegated(t *testing.T) {
 // TestMergeHeadPinE2E_ReleaseFailureReportsSettledClaim is approval condition
 // C1: a precheck refusal (releasable) whose ReleaseMergeDispatch fails leaves
 // the claim dispatch_failed, and BOTH dispatch paths report that settle
-// outcome: the inline 409 names a release that did not land and never the
-// uncertain-basis clause, and the delegated head-moved log's claim_outcome
+// outcome: the inline 409 names a release that did not land (with the operator
+// re-arm) and never the uncertain-basis clause, and the delegated arm answers
+// autoDriveNoteHeadMovedReleaseFailed while its head-moved log's claim_outcome
 // reads dispatch_failed (a re-derived classification would say released).
 func TestMergeHeadPinE2E_ReleaseFailureReportsSettledClaim(t *testing.T) {
 	arm := mhpArms[0] // precheck
@@ -429,6 +451,13 @@ func TestMergeHeadPinE2E_ReleaseFailureReportsSettledClaim(t *testing.T) {
 			!strings.Contains(msg, "claim release did not land, so it is dispatch_failed") {
 			t.Fatalf("message = %q, want the release that did not land named and no uncertain-basis clause", msg)
 		}
+		// handleMergeRun appends mergeDispatchRearmNote only when the settle
+		// left the claim dispatch_failed, so these come through the handler.
+		for _, want := range []string{"Once the operator re-arms the claim", "until the operator re-arms the claim"} {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("message = %q, want the operator re-arm named (%q)", msg, want)
+			}
+		}
 		requireHeadPinRefused(t, w, r, p, arm, mergequeue.DispatchPathInline)
 	})
 	t.Run("delegated", func(t *testing.T) {
@@ -439,7 +468,7 @@ func TestMergeHeadPinE2E_ReleaseFailureReportsSettledClaim(t *testing.T) {
 		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 		p, merger := newMHPProxy(t, w, r, arm.mode)
 		arm.plant(p)
-		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMoved)
+		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMovedReleaseFailed)
 		requireHeadPinRefused(t, w, r, p, arm, mergequeue.DispatchPathDelegated)
 		if got := mhpHeadMovedClaimOutcome(t, logs); got != string(mergeDispatchUncertain) {
 			t.Fatalf("head-moved log claim_outcome = %q, want dispatch_failed (the settle outcome)", got)
@@ -499,7 +528,7 @@ func TestMergeHeadPinE2E_AppliedEnableErrorKeepsClaim(t *testing.T) {
 		r := w.faeDelegated("dapplerr")
 		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"))
 		p, merger := newMHPProxy(t, w, r, mhpApplyThenError)
-		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMoved)
+		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteHeadMovedBasisHeld)
 		requireApplied(t, w, r, p, mergequeue.DispatchPathDelegated)
 		w.forgeReviews(r, []string{"carol"}, mqmReview(1, "carol", "APPROVED", "h1"), mqmReview(2, "carol", "APPROVED", "h2"))
 		requireObserveOnly(t, w.admqDrive(r, merger), autoDriveNoteAlreadyClaimed)
@@ -515,23 +544,30 @@ func mhpCaptureLogs(w *mqmWorld) *syncBuffer {
 	return buf
 }
 
-// mhpHeadMovedClaimOutcome returns the claim_outcome of the ONE delegated
-// head-moved log line.
-func mhpHeadMovedClaimOutcome(t *testing.T, logs *syncBuffer) string {
+// mhpHeadMovedRecord returns the ONE delegated head-moved log record, so
+// pinned_to and claim_outcome are read from the same line.
+func mhpHeadMovedRecord(t *testing.T, logs *syncBuffer) map[string]any {
 	t.Helper()
-	var outcomes []string
+	var recs []map[string]any
 	for _, line := range strings.Split(logs.String(), "\n") {
 		var rec map[string]any
 		if json.Unmarshal([]byte(line), &rec) != nil {
 			continue
 		}
 		if m, _ := rec["msg"].(string); strings.HasPrefix(m, "auto-drive: the forge refused the head-pinned merge") {
-			o, _ := rec["claim_outcome"].(string)
-			outcomes = append(outcomes, o)
+			recs = append(recs, rec)
 		}
 	}
-	if len(outcomes) != 1 {
-		t.Fatalf("head-moved log lines = %d (%q), want 1", len(outcomes), outcomes)
+	if len(recs) != 1 {
+		t.Fatalf("head-moved log lines = %d (%v), want 1", len(recs), recs)
 	}
-	return outcomes[0]
+	return recs[0]
+}
+
+// mhpHeadMovedClaimOutcome returns the claim_outcome of the ONE delegated
+// head-moved log line.
+func mhpHeadMovedClaimOutcome(t *testing.T, logs *syncBuffer) string {
+	t.Helper()
+	o, _ := mhpHeadMovedRecord(t, logs)["claim_outcome"].(string)
+	return o
 }
