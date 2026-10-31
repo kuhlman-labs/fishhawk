@@ -1788,7 +1788,7 @@ _verify_patch_coverage() {
 # still aborts the loop (a3).
 _verify_gate_harnesses() {
   local h
-  for h in test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep; do
+  for h in test-verify-change test-check-coverage test-patch-coverage test-container-lease test-dev test-site-voice test-site-ia test-helm-render test-site-reference test-verify-scope test-adr test-is-run-agent test-check-gate-image test-in-gate-image test-review-prompt-eval test-release-ldflags test-check-pipefail-grep; do
     if [ ! -x "$ROOT/scripts/$h" ]; then
       echo "scripts/test: scripts/$h missing or not executable — skipping that harness" >&2
       continue
@@ -2627,7 +2627,7 @@ EOF
     cat >&2 <<EOF
 scripts/test: cannot resolve gate image $image to an image ID (docker image inspect and docker pull both failed) — fail closed.
 Build one locally and point the helper at it:
-  docker buildx build --load -t fishhawk-gate:local deploy/gate-image
+  docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image
   FISHHAWK_TEST_GATE_IMAGE=fishhawk-gate:local scripts/test $mode --in-gate-image
 EOF
     exit 1

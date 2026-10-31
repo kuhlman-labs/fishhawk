@@ -5,7 +5,7 @@ description: Run Fishhawk's `scripts/test verify` gate (lint, schema-sync, gate 
 
 # Run the verify gate
 
-`scripts/test verify` is the same gate the runner applies to a committed tree. In order, it runs:
+The repository runner applies `scripts/verify-change` to the committed tree: path-aware frontend checks followed by `scripts/test verify`. See `scripts/README.md` § "Workflow verification" for offline dependencies and exit 75. The Go/schema gate runs:
 
 1. `golangci-lint` (including gofmt/goimports)
 2. the `docs/ARCHITECTURE.md` doc-line budget
@@ -39,7 +39,7 @@ git status --short
 
 | Situation | Command |
 |---|---|
-| Before a PR / final check | `scripts/test verify` |
+| Before a PR / final check | `scripts/verify-change` |
 | Iterating on known packages | `scripts/test verify --packages backend/internal/foo,runner/internal/bar` (repo-relative). It skips patch coverage, so finish with a full run |
 | One test | `scripts/test single -run TestName ./backend/internal/foo/` |
 | Lint only | `scripts/test lint` |

@@ -7,10 +7,12 @@ description: Run the Fishhawk Web UI (frontend/) checks that CI enforces — pre
 
 CI runs `pnpm format:check` as its own gate. `lint` and `typecheck` do **not** catch formatting, so a change that passes those can still fail CI on prettier.
 
+The repository helper `scripts/check-frontend` runs the installation and all five checks below. `scripts/verify-change` selects it for frontend inputs before the Go gate. Container prerequisites and exit 75 are documented in `scripts/README.md` § "Workflow verification".
+
 ## 1. Use the locked dependencies
 
 ```sh
-cd frontend && pnpm install --frozen-lockfile
+cd frontend && pnpm install --frozen-lockfile --ignore-scripts
 ```
 
 A stale local `node_modules` can carry a different prettier/eslint version than the lockfile. For example, local prettier 3.8 vs locked 3.9 produces opposite formatting verdicts. Reinstall before trusting, or overruling, a format result.

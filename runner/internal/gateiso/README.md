@@ -1161,8 +1161,8 @@ SKIP, in 9m35s. This repository's runners now carry
 on the env path. Set both in the spawning process's environment: the fishhawk
 MCP server env, and `.env` for fishhawkd host-dispatch. A local tag works there
 because `docker run` pulls only a missing image. Rebuild it by hand after any
-change under `deploy/gate-image/` or a pin bump:
-`docker buildx build --load -t fishhawk-gate:local deploy/gate-image`. Operator
+change under `deploy/gate-image/`, a pin bump, or frontend dependency changes:
+`docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local deploy/gate-image`. Operator
 fallback, with no spec change: `FISHHAWK_GATE_ISOLATION=clone`.
 
 The repository deliberately does NOT declare an in-repo `gate_container`
@@ -1174,7 +1174,7 @@ works only off a warm layer cache (#4060).
 repository (approval conditions 5 and 6).** In-loop the implement gate proves
 the pieces, not the full in-container verify. Before enabling:
 
-1. Build the gate image (`docker buildx build --load -t fishhawk-gate:local
+1. Build the gate image (`docker buildx build --load --build-context frontend=./frontend -t fishhawk-gate:local
    deploy/gate-image`) and run fixture (n):
    `FISHHAWK_GATE_SELFHOST_IMAGE=fishhawk-gate:local scripts/test single -run
    TestGateContainer_SelfHostPgtestSuite ./runner/cmd/fishhawk-runner/`. It

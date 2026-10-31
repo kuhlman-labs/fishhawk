@@ -129,6 +129,14 @@ var featureChangeEscalationPaths = []string{
 	"backend/internal/auth/**",
 	"backend/internal/githubapp/**",
 	"verifier/**",
+	"backend/internal/server/**",
+	"runner/internal/gateiso/**",
+	"runner/cmd/fishhawk-runner/acceptance*.go",
+	"scripts/dev",
+	"scripts/test",
+	"scripts/verify-change",
+	"scripts/check-frontend",
+	"deploy/gate-image/**",
 }
 
 // TestDelegationTool_CarriesTheCommittedSpecsDelegation is the CONTENT half of
@@ -198,7 +206,7 @@ func TestDelegationTool_CarriesTheCommittedSpecsDelegation(t *testing.T) {
 	}
 	e := fc.Escalations[0]
 	if !reflect.DeepEqual(e.Match.Paths, featureChangeEscalationPaths) {
-		t.Errorf("escalations[0].match.paths =\n %v\nwant the committed spec's seven globs:\n %v",
+		t.Errorf("escalations[0].match.paths =\n %v\nwant the committed spec's security-control globs:\n %v",
 			e.Match.Paths, featureChangeEscalationPaths)
 	}
 	if e.MaxAutonomy != "medium" {
@@ -670,7 +678,7 @@ func TestDelegationTool_SerializedOutputCarriesTheDeclaredWireFieldNames(t *test
 		paths = append(paths, s)
 	}
 	if !reflect.DeepEqual(paths, featureChangeEscalationPaths) {
-		t.Errorf(`"paths" =%v, want the committed spec's seven globs %v`, paths, featureChangeEscalationPaths)
+		t.Errorf(`"paths" =%v, want the committed spec's security-control globs %v`, paths, featureChangeEscalationPaths)
 	}
 	ceiling := wireMatrix(t, e, "ceiling_matrix", "feature_change.escalations[0]")
 	for _, class := range []string{"waive", "merge"} {

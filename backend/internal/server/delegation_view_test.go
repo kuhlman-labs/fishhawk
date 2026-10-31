@@ -229,7 +229,7 @@ func TestDelegationView_MatchesRunDelegationBlockForEveryWorkflow(t *testing.T) 
 
 // featureChangeEscalationPaths is the escalation glob set the committed spec
 // declares on feature_change. Stated here so the assertion is on the SHIPPED
-// seven globs and not on "whatever the projection produced".
+// security-control globs and not on "whatever the projection produced".
 var featureChangeEscalationPaths = []string{
 	"backend/internal/spec/**",
 	"cli/internal/spec/**",
@@ -238,6 +238,14 @@ var featureChangeEscalationPaths = []string{
 	"backend/internal/auth/**",
 	"backend/internal/githubapp/**",
 	"verifier/**",
+	"backend/internal/server/**",
+	"runner/internal/gateiso/**",
+	"runner/cmd/fishhawk-runner/acceptance*.go",
+	"scripts/dev",
+	"scripts/test",
+	"scripts/verify-change",
+	"scripts/check-frontend",
+	"deploy/gate-image/**",
 }
 
 // TestDelegationView_FeatureChangeEscalationIsSurfaced is the CROSS-BOUNDARY
@@ -256,7 +264,7 @@ var featureChangeEscalationPaths = []string{
 // this surface too.
 //
 // The escalation half is config-shaped and not compiler-enforced, so the
-// assertions are on the shipped output: the seven globs, max_autonomy medium,
+// assertions are on the shipped output: the security-control globs, max_autonomy medium,
 // and ceiling_matrix reporting waive and merge at gated with source=escalation.
 func TestDelegationView_FeatureChangeEscalationIsSurfaced(t *testing.T) {
 	f := newDelegationFixture(string(committedWorkflowSpec(t)))
@@ -316,7 +324,7 @@ func TestDelegationView_FeatureChangeEscalationIsSurfaced(t *testing.T) {
 	}
 	e := fc.Escalations[0]
 	if !reflect.DeepEqual(e.Match.Paths, featureChangeEscalationPaths) {
-		t.Errorf("escalations[0].match.paths =\n %v\nwant the committed spec's seven globs:\n %v",
+		t.Errorf("escalations[0].match.paths =\n %v\nwant the committed spec's security-control globs:\n %v",
 			e.Match.Paths, featureChangeEscalationPaths)
 	}
 	if e.MaxAutonomy != "medium" {

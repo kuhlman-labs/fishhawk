@@ -5,7 +5,11 @@ on:
     branches: [main]
     paths:
       - 'deploy/gate-image/**'
+      - 'frontend/package.json'
+      - 'frontend/pnpm-lock.yaml'
       - 'scripts/check-gate-image'
+      - 'scripts/check-frontend'
+      - 'scripts/verify-change'
       - 'scripts/test'
       - 'go.work'
       - '*/go.mod'
@@ -13,7 +17,11 @@ on:
   pull_request:
     paths:
       - 'deploy/gate-image/**'
+      - 'frontend/package.json'
+      - 'frontend/pnpm-lock.yaml'
       - 'scripts/check-gate-image'
+      - 'scripts/check-frontend'
+      - 'scripts/verify-change'
       - 'scripts/test'
       - 'go.work'
       - '*/go.mod'
@@ -61,12 +69,19 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: deploy/gate-image
+          build-contexts: frontend=./frontend
           platforms: ${{ matrix.platform }}
           load: true
           provenance: false
           tags: fishhawk-gate:ci
       - name: Dynamic pin check
         run: scripts/check-gate-image --image fishhawk-gate:ci --platform ${{ matrix.platform }}
+      - name: Offline frontend gate
+        run: |
+          docker run --rm --network=none --entrypoint '' \
+            --user "$(id -u):$(id -g)" \
+            -e FISHHAWK_GATE_CONTAINER=1 -e HOME=/tmp \
+            -v "$PWD:/work" -w /work fishhawk-gate:ci scripts/check-frontend
       - name: Lint parity (scripts/test lint inside the image)
         if: matrix.platform == 'linux/amd64'
         env:
@@ -94,6 +109,7 @@ jobs:
         uses: docker/build-push-action@v7
         with:
           context: deploy/gate-image
+          build-contexts: frontend=./frontend
           platforms: linux/amd64,linux/arm64
           push: true
           tags: |

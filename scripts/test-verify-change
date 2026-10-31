@@ -1,0 +1,59 @@
+#!/usr/bin/env python3
+"""Exercise the real workflow wrapper against throwaway git histories."""
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import tempfile
+
+ROOT = Path(__file__).resolve().parent.parent
+
+def run(args, cwd, **kw):
+    return subprocess.run(args, cwd=cwd, text=True, capture_output=True, **kw)
+
+cases = ["clean", "backend", "frontend", "staged", "untracked", "deleted", "renamed_out", "newline", "unknown_base", "frontend_failure", "verify_refused", "gate_script"]
+for case in cases:
+    with tempfile.TemporaryDirectory(prefix="fishhawk-verify-change-test-") as tmp:
+        root = Path(tmp)
+        (root / "scripts").mkdir()
+        (root / "frontend").mkdir()
+        shutil.copy2(ROOT / "scripts/verify-change", root / "scripts/verify-change")
+        for script, status in [("test", 73 if case == "verify_refused" else 0), ("check-frontend", 9 if case == "frontend_failure" else 0)]:
+            p = root / "scripts" / script
+            p.write_text(f'#!/bin/sh\nprintf "%s\\n" "{script} $*" >>"$LOG"\nexit {status}\n')
+            p.chmod(0o755)
+        (root / "frontend/a.ts").write_text("old")
+        env = dict(os.environ, GIT_CONFIG_GLOBAL="/dev/null", GIT_CONFIG_SYSTEM="/dev/null", GIT_AUTHOR_NAME="Fixture", GIT_AUTHOR_EMAIL="fixture@example.com", GIT_COMMITTER_NAME="Fixture", GIT_COMMITTER_EMAIL="fixture@example.com", LOG=str(root / "calls"))
+        env.pop("FISHHAWK_DIFF_BASE", None)
+        for args in [["git", "init", "-q"], ["git", "add", "."], ["git", "-c", "commit.gpgsign=false", "commit", "-qm", "base"], ["git", "update-ref", "refs/remotes/origin/main", "HEAD"]]:
+            proc = run(args, root, env=env)
+            assert proc.returncode == 0, proc.stderr
+        if case in ["frontend", "staged", "frontend_failure"]:
+            (root / "frontend/a.ts").write_text("changed")
+        if case == "staged":
+            assert run(["git", "add", "."], root, env=env).returncode == 0
+        if case == "backend":
+            (root / "backend.go").write_text("change")
+        if case == "untracked":
+            (root / "frontend/new.ts").write_text("change")
+        if case == "deleted":
+            (root / "frontend/a.ts").unlink()
+        if case == "renamed_out":
+            (root / "frontend/a.ts").rename(root / "moved.ts")
+        if case == "newline":
+            (root / "frontend/a\nb.ts").write_text("change")
+        if case == "unknown_base":
+            env["FISHHAWK_DIFF_BASE"] = "missing"
+        if case == "gate_script":
+            with (root / "scripts/verify-change").open("a") as stream:
+                stream.write("\n# changed\n")
+        proc = run([str(root / "scripts/verify-change"), "--packages", "backend/internal/auth"], root, env=env)
+        expected = 9 if case == "frontend_failure" else 73 if case == "verify_refused" else 0
+        assert proc.returncode == expected, (case, proc.returncode, proc.stderr)
+        calls = (root / "calls").read_text().splitlines()
+        frontend = case not in ["clean", "backend", "verify_refused"]
+        expected_calls = ["check-frontend "] if frontend else []
+        if case != "frontend_failure":
+            expected_calls.append("test verify --packages backend/internal/auth")
+        assert calls == expected_calls, (case, calls, expected_calls)
+print(f"test-verify-change: {len(cases)} cases passed")

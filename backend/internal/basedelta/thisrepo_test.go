@@ -37,13 +37,22 @@ var adr098SharedSnapshot = []string{
 	"docs/", "frontend/", "infra/", "acceptance/", "auth/", ".github/", ".agents/", ".claude/", ".githooks/", "deploy/",
 }
 
-// The move is verbatim: the declaration's G and shared dirs are exactly the
-// ADR-098 set, in order.
-func TestThisRepoDeclaration_EqualsADR098Set(t *testing.T) {
+// Keep the original ADR-098 snapshot intact; workflow verification adds
+// exactly frontend/** to G. All original patterns retain their order.
+func TestThisRepoDeclaration_ADR098PlusFrontend(t *testing.T) {
 	t.Parallel()
 	s := thisRepoSurface(t)
-	if !reflect.DeepEqual(s.Global, adr098GlobalSnapshot) {
-		t.Errorf("global_surface = %v\nwant the ADR-098 set %v", s.Global, adr098GlobalSnapshot)
+	var original []string
+	frontend := 0
+	for _, pattern := range s.Global {
+		if pattern == "frontend/**" {
+			frontend++
+			continue
+		}
+		original = append(original, pattern)
+	}
+	if frontend != 1 || !reflect.DeepEqual(original, adr098GlobalSnapshot) {
+		t.Errorf("global_surface = %v; want ADR-098 plus exactly frontend/**", s.Global)
 	}
 	if !reflect.DeepEqual(s.SharedDirs, adr098SharedSnapshot) {
 		t.Errorf("shared_artifact_dirs = %v, want %v", s.SharedDirs, adr098SharedSnapshot)

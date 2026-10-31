@@ -41,21 +41,14 @@ check-jsonschema --schemafile docs/spec/workflow-v0.schema.json \
 check-jsonschema --schemafile docs/spec/workflow-v1.schema.json \
     docs/spec/examples/workflow-v1-acceptance.yaml
 
-# a v2 spec declares version: "2" — the dotted minor form is rejected.
-# .fishhawk/workflows.yaml belongs here ONLY because it declares no `defaults`
-# and no `extends`: a bare check-jsonschema run resolves no same-document
-# reuse (#2340, and see the reuse note below). Add a reuse block to it and
-# this invocation must become `fishhawk validate`. Which command it is listed
-# under is machine-pinned by TestSpecReadmeListsShippedSpecUnderDeclaredMajor in
-# backend/internal/spec, so reshaping this block will trip a test (#3013).
+# Plain v2 examples need no reuse resolution. The live spec extends stages.
 check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
     docs/spec/examples/workflow-v2-backlog-grooming.yaml \
     docs/spec/examples/workflow-v2-milestone-scoping.yaml \
     docs/spec/examples/workflow-v2-upkeep-scan.yaml \
     docs/spec/examples/workflow-v2-user-report-scan.yaml \
     docs/spec/examples/workflow-v2-release-acceptance.yaml \
-    docs/spec/examples/workflow-v2-hotfix-change.yaml \
-    .fishhawk/workflows.yaml
+    docs/spec/examples/workflow-v2-hotfix-change.yaml
 
 # NOT examples/workflow-v2-reuse.yaml: v2 `defaults` / `extends` are resolved
 # BEFORE schema validation, so the schema only ever sees the RESOLVED document
@@ -70,8 +63,9 @@ check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
 # left half means 'resolvable', not 'valid' — the schema verdict is the right
 # half's. The emitted form drops comments, key order and anchors: never write
 # it back over the source.
-fishhawk validate --emit-resolved docs/spec/examples/workflow-v2-reuse.yaml \
-    | check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
+fishhawk validate .fishhawk/workflows.yaml
+fishhawk validate docs/spec/examples/workflow-v2-reuse.yaml
+fishhawk validate --emit-resolved .fishhawk/workflows.yaml | check-jsonschema --schemafile docs/spec/workflow-v2.schema.json \
         --default-filetype yaml -
 
 check-jsonschema --schemafile docs/spec/plan-standard-v1.schema.json \

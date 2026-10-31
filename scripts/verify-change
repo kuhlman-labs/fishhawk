@@ -1,0 +1,29 @@
+#!/usr/bin/env bash
+# Repository workflow gate. Preserve scripts/test verify's scoped environment,
+# lock and exit-code contracts; check frontend changes on every fix iteration.
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT"
+changed="$(mktemp "${TMPDIR:-/tmp}/fishhawk-verify-paths.XXXXXX")"
+trap 'rm -f "$changed"' EXIT
+frontend=0
+base="${FISHHAWK_DIFF_BASE:-origin/main}"
+if merge_base="$(git merge-base "$base" HEAD 2>/dev/null)" &&
+   git diff --no-ext-diff --no-textconv --no-renames --name-only -z "$merge_base" -- >"$changed" &&
+   git ls-files --others --exclude-standard -z >>"$changed"; then
+  while IFS= read -r -d '' path; do
+    case "$path" in
+      frontend/*|scripts/verify-change|scripts/check-frontend|deploy/gate-image/*|.github/workflows/ci.yml)
+        frontend=1 ;;
+    esac
+  done <"$changed"
+else
+  echo "verify-change: cannot establish changed paths; checking frontend conservatively" >&2
+  frontend=1
+fi
+if [ "$frontend" = 1 ]; then
+  "$ROOT/scripts/check-frontend"
+else
+  echo "verify-change: no frontend inputs changed"
+fi
+"$ROOT/scripts/test" verify "$@"

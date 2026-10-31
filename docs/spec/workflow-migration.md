@@ -171,3 +171,5 @@ Fishhawk's own `.fishhawk/workflows.yaml` now declares `version: "2"` — the wa
 - [`workflow-v2.md`](workflow-v2.md) — the complete standalone reference for the target grammar.
 - [`workflow-v1.md`](workflow-v1.md) — the source grammar.
 - `cli/README.md` — the CLI surface.
+
+The live repository spec now uses `hotfix_change.extends: feature_change`. Validate it with `fishhawk validate .fishhawk/workflows.yaml`; for an additional JSON Schema check, use the resolved pipeline in `docs/spec/README.md`. Bare check-jsonschema on this source no longer resolves the inherited stages.

@@ -1,0 +1,39 @@
+#!/usr/bin/env bash
+# Match the five frontend CI gates. Gate containers install only from the
+# image's offline store; missing tools/cache are infrastructure (exit 75).
+set -euo pipefail
+ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+cd "$ROOT/frontend"
+unavailable() {
+  echo "check-frontend: $*; rebuild the gate image with this candidate's frontend context (deploy/gate-image/README.md)" >&2
+  exit 75
+}
+command -v node >/dev/null 2>&1 || unavailable 'node is missing'
+command -v pnpm >/dev/null 2>&1 || unavailable 'pnpm is missing'
+node -e 'if (Number(process.versions.node.split(".")[0]) < 22) process.exit(1)' || unavailable 'Node 22 or newer is required'
+expected="$(node -p "require('./package.json').packageManager.replace(/^pnpm@/, '')")"
+actual="$(pnpm --version)" || unavailable 'cannot read pnpm version'
+[ "$actual" = "$expected" ] || unavailable "pnpm $actual does not match packageManager $expected"
+if [ "${FISHHAWK_GATE_CONTAINER:-}" = 1 ]; then
+  [ -d /opt/fishhawk-pnpm-store ] || unavailable 'offline pnpm store is missing'
+  store="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-pnpm.XXXXXX")"
+  trap 'rm -rf "$store"' EXIT
+  cp -R /opt/fishhawk-pnpm-store/. "$store/"
+  # No project/ dependency lifecycle scripts at installation. Vite/esbuild use
+  # their pinned platform packages directly. Test/build run explicitly below.
+  rc=0
+  pnpm install --offline --frozen-lockfile --ignore-scripts --store-dir "$store" >"$store/install.log" 2>&1 || rc=$?
+  cat "$store/install.log"
+  if [ "$rc" != 0 ]; then
+    if grep -Eq 'ERR_PNPM_NO_OFFLINE_(TARBALL|META)' "$store/install.log"; then
+      unavailable 'offline dependency cache is incomplete'
+    fi
+    # An inconsistent/invalid lockfile is a candidate defect, not a cache miss.
+    exit "$rc"
+  fi
+else
+  pnpm install --frozen-lockfile --ignore-scripts
+fi
+for check in format:check lint typecheck test build; do
+  pnpm "$check"
+done

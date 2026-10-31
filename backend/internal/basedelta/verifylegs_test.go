@@ -106,6 +106,7 @@ var realLegTable = legTable{
 	},
 	harnesses: map[string]legSpec{
 		"test-check-coverage":      hermetic,
+		"test-verify-change":       hermetic,
 		"test-patch-coverage":      hermetic,
 		"test-container-lease":     hermetic,
 		"test-verify-scope":        hermetic,
