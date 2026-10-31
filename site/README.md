@@ -149,6 +149,14 @@ two fail-open branches, the enumeration-failure fail-CLOSED branch and the
 verify wiring's own skip). Long-form contract:
 [`scripts/README.md`](../scripts/README.md).
 
+## PR validation
+
+Changes under `site/` run a production Astro build in `ci.yml`; that job is
+required by `CI Pass`. Repository validation also runs the site voice, sidebar
+and generated-reference checks. The separate Pages workflow below deploys only
+main pushes or manual dispatches and keeps Pages/OIDC permissions out of the
+build job.
+
 ## Deploy — operator-installed workflow
 
 `.github/workflows/**` is in the implement stage's `forbidden_paths` in
@@ -195,7 +203,8 @@ concurrency:
 jobs:
   build:
     name: Build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # Deliberately contents-only: this job runs dependency code.
     permissions:
       contents: read
@@ -238,7 +247,8 @@ jobs:
   deploy:
     name: Deploy
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     # The only job holding these, and it runs no dependency code.
     permissions:
       pages: write # actions/deploy-pages publishes the artifact

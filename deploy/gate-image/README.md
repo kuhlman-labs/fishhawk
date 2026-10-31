@@ -210,7 +210,7 @@ isolation" (Runtime CLI credentials).
 
 ## One-time operator steps
 
-1. Install the workflow below as `.github/workflows/gate-image.yml`
+1. Maintain the installed `gate-image.yml`, `gate-image-publish.yml` and `ci.yml` workflows
    (`.github/workflows/**` is forbidden to Fishhawk implement stages, so a run
    cannot install it).
 2. After its first successful publish on `main`, make the GHCR package public:
@@ -218,147 +218,28 @@ isolation" (Runtime CLI credentials).
    Change visibility → Public. GHCR creates a new container package PRIVATE by
    default, and anonymous `docker pull` of the default image fails until then.
 
-## CI workflow (operator-installed)
+## CI workflows (operator-installed)
 
-Jobs: `pins` (static check), `build` (per-platform buildx `--load` under QEMU,
-the dynamic check for both arches, and `scripts/test lint --in-gate-image`
-against the amd64 build — lint parity with `ci.yml`'s lint job on the same
-commit), `publish` (main only: multi-arch push of `:<sha>` + `:main`, then the
-dynamic check against the pushed `:<sha>` for both arches), and
-`published-drift` (weekly: the dynamic check against the published `:main`,
-which goes red when the pins moved without a republish). `permissions: {}` at
-the top; `packages: write` only on `publish`. Action refs follow the AGENTS.md
-rule (floating majors, Dependabot-bumped; `docker/login-action` matches the
-exact pin the other workflows use); every ref was verified to exist on
-2026-10-04. Building arm64 under QEMU is slow (apt and pip run emulated); a
-native arm64 runner (`ubuntu-24.04-arm`) is the faster alternative for that
-matrix leg.
+The installed sources are `.github/workflows/gate-image.yml` (reusable
+validation plus weekly published-image drift) and `gate-image-publish.yml`
+(reusable publisher); `ci.yml` owns their dependency order. The old copy-paste
+workflow is replaced by these tracked sources to prevent documentation drift.
 
-```yaml
-name: gate-image
+Static pins are checked on every CI run. Changes to image files, its validation
+scripts or its build/publish workflows trigger the expensive build. Both
+architectures build natively with per-architecture BuildKit caches, export Docker
+archives, load those same archives for dynamic pin checks, and (amd64) run lint
+parity. Main pushes retain the tested archives for one day; PRs upload none.
 
-on:
-  push:
-    branches: [main]
-    paths:
-      - 'deploy/gate-image/**'
-      - 'scripts/check-gate-image'
-      - 'scripts/test'
-      - 'go.work'
-      - '*/go.mod'
-      - '.github/workflows/**'
-  pull_request:
-    paths:
-      - 'deploy/gate-image/**'
-      - 'scripts/check-gate-image'
-      - 'scripts/test'
-      - 'go.work'
-      - '*/go.mod'
-      - '.github/workflows/**'
-  schedule:
-    - cron: '17 6 * * 1'
-  workflow_dispatch:
-
-permissions: {}
-
-concurrency:
-  group: gate-image-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
-
-env:
-  IMAGE: ghcr.io/kuhlman-labs/fishhawk-gate
-
-jobs:
-  pins:
-    name: Gate image pins (static)
-    if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    steps:
-      - uses: actions/checkout@v7
-      - run: scripts/check-gate-image
-
-  build:
-    name: Gate image build (${{ matrix.platform }})
-    if: github.event_name != 'schedule'
-    needs: pins
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - name: Build and load
-        uses: docker/build-push-action@v7
-        with:
-          context: deploy/gate-image
-          platforms: ${{ matrix.platform }}
-          load: true
-          provenance: false
-          tags: fishhawk-gate:ci
-      - name: Dynamic pin check
-        run: scripts/check-gate-image --image fishhawk-gate:ci --platform ${{ matrix.platform }}
-      - name: Lint parity (scripts/test lint inside the image)
-        if: matrix.platform == 'linux/amd64'
-        env:
-          FISHHAWK_TEST_GATE_IMAGE: fishhawk-gate:ci
-        run: scripts/test lint --in-gate-image
-
-  publish:
-    name: Gate image publish
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4.6.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push (amd64 + arm64)
-        uses: docker/build-push-action@v7
-        with:
-          context: deploy/gate-image
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:main
-      - name: Dynamic pin check of the pushed image
-        run: |
-          for p in linux/amd64 linux/arm64; do
-            docker pull --platform "$p" "$IMAGE:$GITHUB_SHA"
-            scripts/check-gate-image --image "$IMAGE:$GITHUB_SHA" --platform "$p"
-          done
-
-  published-drift:
-    name: Published :main drift (${{ matrix.platform }})
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-    strategy:
-      fail-fast: false
-      matrix:
-        platform: [linux/amd64, linux/arm64]
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - run: docker pull --platform ${{ matrix.platform }} "$IMAGE:main"
-      - run: scripts/check-gate-image --image "$IMAGE:main" --platform ${{ matrix.platform }}
-```
+Only after the same CI run's `CI Pass` succeeds does the publisher receive
+`packages: write`. It downloads both named artifacts, loads/pushes the images,
+assembles a multi-architecture manifest from their registry digests, rechecks
+pins, and promotes `:main` only if its image inputs still match main. Later unrelated
+commits do not strand an otherwise-current image.
+Publication is serialized and never rebuilds the validated image. The weekly
+schedule still checks both architectures of the published `:main`. Manual
+`gate-image.yml` dispatch validates only; to publish, rerun the main CI run
+(all jobs if its artifacts have expired).
 
 ## Testing
 

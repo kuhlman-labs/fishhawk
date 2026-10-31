@@ -21,7 +21,7 @@
 #   scripts/ci-test-leg <leg> <profile-dir>  run the leg; one profile per part
 #
 # The partition is COMPLETE BY CONSTRUCTION, not by a hand-maintained list:
-#   backend-heavy   a fixed list of the slowest backend packages
+#   backend-mcp / backend-server / backend-storage: slow packages separately
 #   backend-rest    every OTHER backend package (computed from `go list`)
 #   runner-main-a   runner/cmd/fishhawk-runner, tests matching ^TestRun
 #   runner-main-b   runner/cmd/fishhawk-runner, tests NOT matching ^TestRun
@@ -49,7 +49,7 @@ HEAVY_BACKEND="./internal/mcpserver ./internal/server ./internal/postgres ./inte
 RUNNER_MAIN="./cmd/fishhawk-runner"
 # ^TestRun splits fishhawk-runner's test time ~52/48.
 RUNNER_SPLIT='^TestRun'
-LEGS="backend-heavy backend-rest runner-main-a runner-main-b rest"
+LEGS="backend-mcp backend-server backend-storage backend-rest runner-main-a runner-main-b rest"
 
 # _module_pkgs <module-dir>: every package of a module, module-relative
 # ("." for the module root, "./x/y" otherwise), one per line. Fails closed on an
@@ -109,8 +109,14 @@ _other_modules() {
 _leg_parts() {
   local pkgs m others
   case "$1" in
-    backend-heavy)
-      echo "backend||$HEAVY_BACKEND"
+    backend-mcp)
+      echo "backend||./internal/mcpserver"
+      ;;
+    backend-server)
+      echo "backend||./internal/server"
+      ;;
+    backend-storage)
+      echo "backend||./internal/postgres ./internal/integration/mcp"
       ;;
     backend-rest)
       pkgs="$(_module_pkgs backend | _except "$HEAVY_BACKEND" | tr '\n' ' ')" || return 1

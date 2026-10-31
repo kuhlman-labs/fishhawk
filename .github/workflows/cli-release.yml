@@ -32,13 +32,20 @@ on:
       - 'cli/v*'
 
 permissions:
-  contents: write   # create release + upload assets
-  id-token: write   # cosign keyless signing via GitHub OIDC
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  queue: max
+  cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build, sign, and publish CLI release
-    runs-on: ubuntu-latest
+  build:
+    name: Validate and build cli release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.build.outputs.version }}
     steps:
       - name: Validate release tag (final or -rc.N only)
         env:
@@ -81,7 +88,7 @@ jobs:
             cd cli
             "$GOLANGCI_LINT" run ./...
             go build ./...
-            go test -race ./...
+            ../scripts/test single -p 4 -timeout 20m ./cli/...
           )
 
       - name: Compute version and build binaries
@@ -133,6 +140,7 @@ jobs:
         with:
           path: ./cli
           format: spdx-json
+          upload-release-assets: false
           output-file: ./dist/cli-${{ steps.build.outputs.version }}.sbom.spdx.json
 
       - name: Compute checksums
@@ -144,6 +152,29 @@ jobs:
           sha256sum ./* > SHA256SUMS
           cat SHA256SUMS
 
+      - uses: actions/upload-artifact@v7
+        with:
+          name: cli-release-files
+          path: dist/
+          if-no-files-found: error
+          retention-days: 7
+
+  release:
+    name: Sign and publish cli release
+    needs: build
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    permissions:
+      contents: write
+      id-token: write
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@v8
+        with:
+          name: cli-release-files
+          path: dist
       - name: Install cosign
         uses: sigstore/cosign-installer@v3
 
@@ -168,17 +199,18 @@ jobs:
         uses: softprops/action-gh-release@v3
         with:
           tag_name: ${{ github.ref_name }}
-          name: CLI ${{ steps.build.outputs.version }}
+          name: CLI ${{ needs.build.outputs.version }}
           generate_release_notes: true
           body_path: .github/release-notes/cli.md
           prerelease: ${{ contains(github.ref_name, '-') }}
           make_latest: ${{ !contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true
           files: |
-            dist/fishhawk-${{ steps.build.outputs.version }}-darwin-arm64
-            dist/fishhawk-${{ steps.build.outputs.version }}-darwin-amd64
-            dist/fishhawk-${{ steps.build.outputs.version }}-linux-amd64
-            dist/fishhawk-${{ steps.build.outputs.version }}-linux-arm64
-            dist/cli-${{ steps.build.outputs.version }}.sbom.spdx.json
+            dist/fishhawk-${{ needs.build.outputs.version }}-darwin-arm64
+            dist/fishhawk-${{ needs.build.outputs.version }}-darwin-amd64
+            dist/fishhawk-${{ needs.build.outputs.version }}-linux-amd64
+            dist/fishhawk-${{ needs.build.outputs.version }}-linux-arm64
+            dist/cli-${{ needs.build.outputs.version }}.sbom.spdx.json
             dist/SHA256SUMS
             dist/SHA256SUMS.sig
             dist/SHA256SUMS.pem
