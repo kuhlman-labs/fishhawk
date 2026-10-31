@@ -11,6 +11,7 @@ import fnmatch
 import importlib.util
 import subprocess
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -110,7 +111,9 @@ class WorkflowContracts(unittest.TestCase):
             publish = data["jobs"][job]
             self.assertEqual(publish["concurrency"]["cancel-in-progress"], "false")
             promote = publish["steps"][-1]["run"]
-            self.assertIn('if [ "$current" != "$GITHUB_SHA" ]', promote)
+            self.assertIn('scripts/ci-image-current', promote)
+            self.assertIn('git fetch --no-tags origin main', promote)
+            self.assertIn('*) exit "$rc"', promote)
             self.assertIn("imagetools create", promote)
         backend = workflow("backend-build.yml")["jobs"]["build-and-push"]
         build = next(s for s in backend["steps"] if s.get("id") == "build")
@@ -137,6 +140,40 @@ class WorkflowContracts(unittest.TestCase):
         self.assertEqual(set(jobs["apply"]["needs"]), {"protections", "validate"})
         self.assertNotIn("id-token", jobs["protections"]["permissions"])
         self.assertIn("scripts/check-deploy-environment.py", jobs["protections"]["steps"][-1]["run"])
+
+
+class ImageFreshness(unittest.TestCase):
+    def test_unrelated_commits_can_promote_but_changed_inputs_and_unknown_refs_cannot(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            def git(*args):
+                return subprocess.check_output(["git", "-c", "user.name=CI test", "-c",
+                    "user.email=ci@example.invalid", "-c", "commit.gpgsign=false", *args], cwd=root, text=True).strip()
+            git("init", "--quiet")
+            (root / "pricing").mkdir()
+            (root / "pricing/pricing.go").write_text("original")
+            (root / "README.md").write_text("original")
+            git("add", ".")
+            git("commit", "--quiet", "-m", "base")
+            base = git("rev-parse", "HEAD")
+            (root / "README.md").write_text("documentation only")
+            git("commit", "--quiet", "-am", "docs")
+            def check(kind, revision="HEAD"):
+                return subprocess.run([str(ROOT / "scripts/ci-image-current"), kind, base, revision],
+                    cwd=root, capture_output=True, text=True).returncode
+            self.assertEqual(check("backend"), 0)
+            self.assertEqual(check("gate"), 0)
+            (root / "pricing/pricing.go").write_text("changed pricing")
+            git("commit", "--quiet", "-am", "code")
+            self.assertEqual(check("backend"), 1)
+            self.assertEqual(check("gate"), 0)
+            (root / "deploy/gate-image").mkdir(parents=True)
+            (root / "deploy/gate-image/Dockerfile").write_text("changed image")
+            git("add", ".")
+            git("commit", "--quiet", "-m", "image")
+            self.assertEqual(check("gate"), 1)
+            self.assertEqual(check("backend", "missing-ref"), 2)
+            self.assertEqual(check("gate", "--help"), 2)
 
 
 class DeploymentProtections(unittest.TestCase):

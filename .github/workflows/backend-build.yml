@@ -56,6 +56,7 @@ jobs:
           images: ghcr.io/kuhlman-labs/fishhawkd
           tags: |
             type=sha,prefix=sha-,format=long
+            type=sha,prefix=sha-
           labels: |
             org.opencontainers.image.title=fishhawkd
             org.opencontainers.image.description=Fishhawk backend control plane.
@@ -92,16 +93,19 @@ jobs:
           # exact image bytes — re-tagging doesn't break verify.
           cosign sign --yes "ghcr.io/kuhlman-labs/fishhawkd@${DIGEST}"
 
-      - name: Promote signed image only while this commit is main
+      - name: Promote signed image only while its inputs match main
         env:
-          GH_TOKEN: ${{ github.token }}
           DIGEST: ${{ steps.build.outputs.digest }}
         run: |
-          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
-          if [ "$current" != "$GITHUB_SHA" ]; then
-            echo "::notice::A newer main exists; keeping only the immutable image tag."
-            exit 0
-          fi
+          git fetch --no-tags origin main
+          current="$(git rev-parse FETCH_HEAD)"
+          rc=0
+          scripts/ci-image-current backend "$GITHUB_SHA" "$current" || rc=$?
+          case "$rc" in
+            0) ;;
+            1) exit 0 ;;
+            *) exit "$rc" ;;
+          esac
           docker buildx imagetools create --prefer-index=false \
             --tag ghcr.io/kuhlman-labs/fishhawkd:main \
             "ghcr.io/kuhlman-labs/fishhawkd@$DIGEST"

@@ -234,7 +234,8 @@ parity. Main pushes retain the tested archives for one day; PRs upload none.
 Only after the same CI run's `CI Pass` succeeds does the publisher receive
 `packages: write`. It downloads both named artifacts, loads/pushes the images,
 assembles a multi-architecture manifest from their registry digests, rechecks
-pins, and promotes `:main` only if that SHA is still the main branch tip.
+pins, and promotes `:main` only if its image inputs still match main. Later unrelated
+commits do not strand an otherwise-current image.
 Publication is serialized and never rebuilds the validated image. The weekly
 schedule still checks both architectures of the published `:main`. Manual
 `gate-image.yml` dispatch validates only; to publish, rerun the main CI run

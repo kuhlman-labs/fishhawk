@@ -776,12 +776,12 @@ yet: CI suppresses only that exact diagnostic and the contract test validates
 
 Main image publishers are reusable workflows called after successful `CI Pass`
 on the same push. Each publisher serializes mutable-tag promotion and checks
-that its SHA is still main. Backend images get the full commit in both binary
-metadata and their `sha-<full>` tag; `:main` is promoted after signing. Gate
+that its image inputs still match main (a later docs-only commit is harmless). Backend images get the full commit in both binary
+metadata and their `sha-<full>` tag (the short alias remains compatible); `:main` is promoted after signing. Gate
 images are built and validated once per architecture on native runners, passed
 as immutable workflow artifacts, then pushed and assembled without rebuilding.
 An obsolete run may retain its commit tag, but cannot overwrite `:main` after
-a newer main has arrived. Rerun all jobs of a main CI run to regenerate expired
+newer image inputs have arrived. Rerun all jobs of a main CI run to regenerate expired
 one-day image artifacts before retrying publication. A failed publication is a
 failed CI workflow run even though the validation-only `CI Pass` is green.
 

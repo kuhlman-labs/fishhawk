@@ -54,13 +54,15 @@ jobs:
             docker pull --platform "linux/$arch" "$IMAGE:$GITHUB_SHA"
             scripts/check-gate-image --image "$IMAGE:$GITHUB_SHA" --platform "linux/$arch"
           done
-      - name: Promote only while this commit is main
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Promote only while image inputs match main
         run: |
-          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
-          if [ "$current" != "$GITHUB_SHA" ]; then
-            echo "::notice::A newer main exists; keeping only the immutable image tag."
-            exit 0
-          fi
+          git fetch --no-tags origin main
+          current="$(git rev-parse FETCH_HEAD)"
+          rc=0
+          scripts/ci-image-current gate "$GITHUB_SHA" "$current" || rc=$?
+          case "$rc" in
+            0) ;;
+            1) exit 0 ;;
+            *) exit "$rc" ;;
+          esac
           docker buildx imagetools create --tag "$IMAGE:main" "$IMAGE:$GITHUB_SHA"

@@ -83,6 +83,7 @@ jobs:
               - '.dockerignore'
               - '.github/workflows/ci.yml'
               - '.github/workflows/backend-build.yml'
+              - 'scripts/ci-image-current'
             site:
               - 'site/**'
               - '.github/workflows/ci.yml'
@@ -100,6 +101,7 @@ jobs:
               # Static pin validation runs on EVERY change in repository-checks.
               # Rebuild only when the image, its validation or its publisher changes.
               - 'deploy/gate-image/**'
+              - 'scripts/ci-image-current'
               - 'scripts/check-gate-image'
               - 'scripts/test'
               - '.github/workflows/ci.yml'
