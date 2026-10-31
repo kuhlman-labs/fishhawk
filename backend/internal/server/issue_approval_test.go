@@ -40,6 +40,7 @@ func TestHandleApprovalCommand_PlanApprove_PostsSlashReplyAndStatus(t *testing.T
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
@@ -50,6 +51,7 @@ func TestHandleApprovalCommand_PlanApprove_PostsSlashReplyAndStatus(t *testing.T
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
+		RoleResolver: legacyCommentResolver(),
 		Addr:         "127.0.0.1:0",
 		RunRepo:      rr,
 		ApprovalRepo: ar,
@@ -128,6 +130,7 @@ func TestHandleApprovalCommand_Reject_FailsStageAndReplies(t *testing.T) {
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	// Plan stage — review-stage rejects are refused on the slash path
@@ -141,6 +144,7 @@ func TestHandleApprovalCommand_Reject_FailsStageAndReplies(t *testing.T) {
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
+		RoleResolver: legacyCommentResolver(),
 		Addr:         "127.0.0.1:0",
 		RunRepo:      rr,
 		ApprovalRepo: ar,
@@ -190,6 +194,7 @@ func TestHandleApprovalCommand_PlanReject_StillPostsSlashReply(t *testing.T) {
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
@@ -200,7 +205,8 @@ func TestHandleApprovalCommand_PlanReject_StillPostsSlashReply(t *testing.T) {
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
-		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		RoleResolver: legacyCommentResolver(),
+		Addr:         "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
 		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
 	})
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
@@ -392,6 +398,7 @@ func TestHandleApprovalCommand_ApproveSucceedsRegardlessOfCheckState(t *testing.
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	// Plan stage — review-stage slash approvals are refused per
@@ -413,7 +420,8 @@ func TestHandleApprovalCommand_ApproveSucceedsRegardlessOfCheckState(t *testing.
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
-		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		RoleResolver: legacyCommentResolver(),
+		Addr:         "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
 		StageCheckRepo: scs, Orchestrator: o,
 		ExternalURL: "https://app.fishhawk.example.com",
 	})
@@ -452,6 +460,7 @@ func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *test
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 
@@ -461,7 +470,8 @@ func TestHandleApprovalCommand_RepeatAfterAdvance_RepliesNoAwaitingStage(t *test
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
-		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		RoleResolver: legacyCommentResolver(),
+		Addr:         "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
 		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
 	})
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
@@ -710,6 +720,7 @@ func TestHandleApprovalCommand_ReplyComment_HappyPath(t *testing.T) {
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
@@ -720,6 +731,7 @@ func TestHandleApprovalCommand_ReplyComment_HappyPath(t *testing.T) {
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
+		RoleResolver: legacyCommentResolver(),
 		Addr:         "127.0.0.1:0",
 		RunRepo:      rr,
 		ApprovalRepo: ar,
@@ -855,6 +867,11 @@ workflows:
 		t.Errorf("non-approver reply should not produce any GitHub comment; got %d: %v",
 			len(calls), commentBodies(calls))
 	}
+	// The legacy v0/v1 approvers deny stays UNAUDITED (ADR-123 D4 / #4755
+	// audits only a channel refusal): no approval_comment_refused entry.
+	if n := len(refusalEntries(t, au)); n != 0 {
+		t.Errorf("approval_comment_refused entries = %d, want 0 — the legacy deny is not a channel refusal", n)
+	}
 }
 
 // TestHandleApprovalCommand_ReplyComment_DuplicateIdempotent locks in
@@ -869,6 +886,7 @@ func TestHandleApprovalCommand_ReplyComment_DuplicateIdempotent(t *testing.T) {
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 
@@ -878,7 +896,8 @@ func TestHandleApprovalCommand_ReplyComment_DuplicateIdempotent(t *testing.T) {
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
-		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		RoleResolver: legacyCommentResolver(),
+		Addr:         "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
 		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
 	})
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
@@ -1057,6 +1076,7 @@ func TestHandleApprovalCommand_GitHubPreservation(t *testing.T) {
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
@@ -1067,7 +1087,8 @@ func TestHandleApprovalCommand_GitHubPreservation(t *testing.T) {
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
-		Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+		RoleResolver: legacyCommentResolver(),
+		Addr:         "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
 		Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
 	})
 	s.issueNotifier = issuecomment.New(issuecomment.Deps{
@@ -1125,6 +1146,40 @@ func TestHandleApprovalCommand_GitHubPreservation(t *testing.T) {
 }
 
 // --- helpers ---
+
+// legacyCommentGateSpec is a PARSEABLE workflow-v0 spec whose plan stage
+// declares NO approval gate, so fetchGateForStage returns the legacy
+// no-approvers context and a comment approval from any sender is admitted
+// (ADR-123 D4 / #4755 keeps that v0/v1 outcome). A v0 approval gate must carry
+// `approvers`, so "no approvers" is modelled by omitting the gate.
+const legacyCommentGateSpec = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+`
+
+// legacyCommentGate puts r on the legacy v0 no-approvers gate above. Since
+// ADR-123 D4 (#4755) the comment channel refuses a run with no readable cached
+// spec, so every comment-approval test that must reach Submit seeds one.
+func legacyCommentGate(r *run.Run) {
+	r.WorkflowID = "feature_change"
+	r.WorkflowSpec = []byte(legacyCommentGateSpec)
+}
+
+// legacyCommentResolver is the RoleResolver a legacy-gate comment-approval test
+// wires: the channel refuses a v0/v1 gate when none is configured (ADR-123 D4 /
+// #4755). Its team lister lists nobody, which the no-approvers gate never asks.
+func legacyCommentResolver() *role.Resolver {
+	return role.NewResolver(&stubTeamLister{})
+}
 
 // splitBroadcastAndStatus picks the plan-approved broadcast (the
 // "Plan approved by" comment) and the sticky-status comment (the
@@ -1229,6 +1284,7 @@ func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHu
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 
 	stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
@@ -1239,6 +1295,7 @@ func slashApprovalFixture(t *testing.T) (*Server, *fakeApprovalRepo, *slashGitHu
 	o := &orchestrator.Orchestrator{Runs: rr}
 
 	s := New(Config{
+		RoleResolver: legacyCommentResolver(),
 		Addr:         "127.0.0.1:0",
 		RunRepo:      rr,
 		ApprovalRepo: ar,
@@ -1613,6 +1670,7 @@ func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceEr
 	r.TriggerRef = &triggerRef
 	r.InstallationID = ptrInt64(99)
 	r.Repo = "x/y"
+	legacyCommentGate(r)
 	stage := base.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 	stage.Type = run.StageTypePlan
 
@@ -1622,6 +1680,7 @@ func slashApprovalReplies(t *testing.T, source webhook.ApprovalSource, advanceEr
 	gh := newSlashGitHubRecorder()
 
 	s := New(Config{
+		RoleResolver: legacyCommentResolver(),
 		Addr:         "127.0.0.1:0",
 		RunRepo:      rr,
 		ApprovalRepo: ar,
@@ -1810,6 +1869,7 @@ func TestForgeMatchesRun_TwoSignalFailClosed(t *testing.T) {
 			r.InstallationRef = tc.runRef
 			r.RunnerKind = tc.runnerKind
 			r.Repo = "gitlab-org/gitlab-test"
+			legacyCommentGate(r)
 
 			stage := rr.seedStage(r.ID, 0, run.StageStateAwaitingApproval)
 			stage.Type = run.StageTypePlan
@@ -1820,7 +1880,8 @@ func TestForgeMatchesRun_TwoSignalFailClosed(t *testing.T) {
 			o := &orchestrator.Orchestrator{Runs: rr}
 
 			s := New(Config{
-				Addr: "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
+				RoleResolver: legacyCommentResolver(),
+				Addr:         "127.0.0.1:0", RunRepo: rr, ApprovalRepo: ar, AuditRepo: au,
 				Orchestrator: o, ExternalURL: "https://app.fishhawk.example.com",
 			})
 			s.issueNotifier = issuecomment.New(issuecomment.Deps{

@@ -1925,8 +1925,9 @@ func TestRunChildren_GitLabParent_ChildArgvCarriesForgeFlags(t *testing.T) {
 	children := seedGitLabDecomposition(fb, parent, "https://gitlab.example.com")
 	spawn := withFakeDetachedSpawn(t)
 
+	// A gitlab parent reports forge_unsupported, so base_branch is passed (#4758).
 	_, out, err := r.runChildren(context.Background(), nil, RunChildrenInput{
-		RunID: parent.String(), Workflow: "wf", RunnerBinary: "/fake/fishhawk-runner",
+		RunID: parent.String(), Workflow: "wf", RunnerBinary: "/fake/fishhawk-runner", BaseBranch: "main",
 	})
 	if err != nil {
 		t.Fatalf("runChildren: %v", err)
@@ -1969,7 +1970,10 @@ func TestRunChildren_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
 	fb.mu.Unlock()
 	spawn := withFakeDetachedSpawn(t)
 
-	if _, _, err := r.runChildren(context.Background(), nil, runChildrenIn(parent)); err != nil {
+	// A gitlab parent reports forge_unsupported, so base_branch is passed (#4758).
+	in := runChildrenIn(parent)
+	in.BaseBranch = "main"
+	if _, _, err := r.runChildren(context.Background(), nil, in); err != nil {
 		t.Fatalf("runChildren: %v", err)
 	}
 	calls := spawn.snapshot()
@@ -2043,5 +2047,97 @@ func TestRunChildren_GitHubParent_ArgvUnchanged(t *testing.T) {
 	}
 	if !strings.Contains(strings.Join(calls[0].argv, " "), "--github-repo x/y --base-branch main") {
 		t.Fatalf("github child argv shape changed: %v", calls[0].argv)
+	}
+}
+
+// --- base branch (#4758) -----------------------------------------------------
+
+// seedParentDefaultBranch seeds the PARENT's single-run read with the #4660
+// base-branch fields.
+func seedParentDefaultBranch(fb *fakeBackend, parent uuid.UUID, branch, unresolved string) {
+	fb.mu.Lock()
+	defer fb.mu.Unlock()
+	fb.getRunByID[parent] = Run{
+		ID: parent.String(), Repo: "x/y", State: "running", RunnerKind: "local",
+		DefaultBranch: branch, DefaultBranchUnresolvedReason: unresolved,
+	}
+}
+
+// TestRunChildren_OmittedBaseBranch_FallsBackToRunDefaultBranch: base_branch
+// omitted and the parent reports default_branch "trunk" → a wave-0 child whose
+// marker returns NO base gets --base-branch trunk, while a child whose marker
+// returns a consolidated base keeps THAT base (server authority, #2363).
+func TestRunChildren_OmittedBaseBranch_FallsBackToRunDefaultBranch(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, plain, dependent := uuid.New(), uuid.New(), uuid.New()
+	seedParentDefaultBranch(fb, parent, "trunk", "")
+	seedChildRun(fb, plain, "pending")
+	seedChildRun(fb, dependent, "pending")
+	seedPlanDecomposed(fb, parent, []string{plain.String(), dependent.String()}, 0)
+	fb.mu.Lock()
+	fb.hostDispatchBaseBranchByStage = map[string]string{fb.stagesByRun[dependent][0].ID: "fishhawk/consolidated-x"}
+	fb.mu.Unlock()
+	spawn := withFakeDetachedSpawn(t)
+
+	in := runChildrenIn(parent) // no base_branch
+	if _, _, err := r.runChildren(context.Background(), nil, in); err != nil {
+		t.Fatalf("runChildren: %v", err)
+	}
+	byRun := map[string][]string{}
+	for _, c := range spawn.snapshot() {
+		byRun[c.runID] = c.argv
+	}
+	for _, tc := range []struct {
+		child uuid.UUID
+		want  string
+	}{
+		{plain, "trunk"},
+		{dependent, "fishhawk/consolidated-x"},
+	} {
+		argv, ok := byRun[tc.child.String()]
+		if !ok {
+			t.Fatalf("child %s was not spawned; spawns=%v", tc.child, byRun)
+		}
+		for _, flag := range []string{"--base-branch", "--check-base-ref"} {
+			if got := argvFlag(argv, flag); got != tc.want {
+				t.Errorf("child %s %s = %q, want %q", tc.child, flag, got, tc.want)
+			}
+		}
+	}
+}
+
+// TestRunChildren_UnresolvedDefaultBranch_RefusesBeforeAnyMarker: base_branch
+// omitted and the parent's default branch is unresolved → a refusal naming the
+// reason, with a dispatchable wave-0 child left unmarked and unspawned.
+func TestRunChildren_UnresolvedDefaultBranch_RefusesBeforeAnyMarker(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	r := newResolver(srv, nil)
+	parent, child := uuid.New(), uuid.New()
+	seedParentDefaultBranch(fb, parent, "", "repository_not_visible")
+	seedChildRun(fb, child, "pending") // dispatchable — a deleted control would mark and spawn it
+	seedPlanDecomposed(fb, parent, []string{child.String()}, 0)
+	spawn := withFakeDetachedSpawn(t)
+
+	_, _, err := r.runChildren(context.Background(), nil, runChildrenIn(parent))
+	if err == nil {
+		t.Fatal("expected a base_branch_unresolved refusal")
+	}
+	for _, want := range []string{"base_branch_unresolved", "repository_not_visible", "Pass base_branch explicitly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal should name %q: %v", want, err)
+		}
+	}
+	fb.mu.Lock()
+	markers := 0
+	for _, n := range fb.hostDispatchCalledByID {
+		markers += n
+	}
+	fb.mu.Unlock()
+	if markers != 0 {
+		t.Fatalf("host-dispatch markers = %d; the refusal must land before any marker", markers)
+	}
+	if calls := spawn.snapshot(); len(calls) != 0 {
+		t.Fatalf("spawned %d children despite the refusal", len(calls))
 	}
 }

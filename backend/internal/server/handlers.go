@@ -89,6 +89,9 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/retrigger-ci", s.requireRunAccount(memberWrite, s.handleRetriggerCI))
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge", s.requireRunAccount(memberWrite, s.handleMergeRun))
 	mux.HandleFunc("POST /v0/runs/{run_id}/acceptance-arbitration", s.requireRunAccount(memberWrite, s.handleAcceptanceArbitration))
+	// Escape record + close (E94.3 / #4694, ADR-117 D3 + A1). The outer
+	// wrapper answers an anonymous caller 401 BEFORE the ownership check.
+	mux.HandleFunc("POST /v0/runs/{run_id}/escapes", s.escapeRequireAuthenticated(s.requireRunAccount(memberWrite, s.handleRecordEscape)))
 	// Per-entry grooming disposition capture + read-back (E54.30 / #2843).
 	// CAPTURE is operator-only (the handler refuses a run-bound agent token AND
 	// a delegated operator-agent token); the READ-BACK needs read access only.
@@ -120,6 +123,7 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("GET /v0/runs/{run_id}/audit", s.requireRunAccount(readAccess, s.handleListRunAudit))
 	mux.HandleFunc("GET /v0/runs/{run_id}/gate-view", s.requireRunAccount(readAccess, s.handleGetRunGateView))
 	mux.HandleFunc("GET /v0/runs/{run_id}/scope-overlap", s.requireRunAccount(readAccess, s.handleGetRunScopeOverlap))
+	mux.HandleFunc("GET /v0/runs/{run_id}/campaign-pending-amendments", s.requireRunAccount(readAccess, s.handleGetRunCampaignPendingAmendments))
 	mux.HandleFunc("GET /v0/runs/{run_id}/budget", s.requireRunAccount(readAccess, s.handleGetRunBudget))
 	mux.HandleFunc("GET /v0/runs/{run_id}/cache-efficiency", s.requireRunAccount(readAccess, s.handleGetRunCacheEfficiency))
 	mux.HandleFunc("GET /v0/runs/{run_id}/cost", s.requireRunAccount(readAccess, s.handleGetRunCost))
@@ -322,6 +326,10 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	// #4297): moves the run's unmarked held entry to the head of its base's
 	// line (merge_queue_promote.go).
 	mux.HandleFunc("POST /v0/runs/{run_id}/merge-queue/promote", s.requireRunAccount(memberWrite, s.handleMergeQueuePromote))
+	// ADR-112 R3 withdraw-intent verb (E87.17 / #4685): settles a YIELDED
+	// entry dropped intent_withdrawn so the queue no longer owns the merge
+	// (merge_queue_withdraw.go). Same tier and ladder as the promote.
+	mux.HandleFunc("POST /v0/runs/{run_id}/merge-queue/withdraw", s.requireRunAccount(memberWrite, s.handleMergeQueueWithdraw))
 	// #4101: list a run's (and optionally its decomposition children's) concerns.
 	mux.HandleFunc("GET /v0/runs/{run_id}/concerns", s.requireRunAccount(readAccess, s.handleListRunConcerns))
 	mux.HandleFunc("POST /v0/runs/{run_id}/concerns/waive", s.requireRunAccount(memberWrite, s.handleBulkWaiveConcerns))
@@ -333,6 +341,9 @@ func (s *Server) registerRoutes(mux routeRegistrar) {
 	mux.HandleFunc("POST /v0/runs/{run_id}/divergence/{sequence}/answer", s.requireRunAccount(memberWrite, s.handleAnswerDivergence))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/waive", s.requireConcernAccount(memberWrite, s.handleWaiveConcern))
 	mux.HandleFunc("POST /v0/concerns/{concern_id}/defer", s.requireConcernAccount(memberWrite, s.handleDeferConcern))
+	// E94.8 / #4841 (ADR-117 D1 phase 3): a HUMAN relabels a concern's judgement
+	// or marks it duplicate_of an earlier concern of its run (label_concern.go).
+	mux.HandleFunc("POST /v0/concerns/{concern_id}/label", s.requireConcernAccount(memberWrite, s.handleLabelConcern))
 	mux.HandleFunc("GET /v0/artifacts/{artifact_id}", s.handleGetArtifact)
 	mux.HandleFunc("GET /v0/tokens", s.handleListTokens)
 	mux.HandleFunc("POST /v0/tokens", s.handleCreateToken)

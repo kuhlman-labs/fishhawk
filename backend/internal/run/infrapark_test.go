@@ -63,11 +63,20 @@ func TestClassifyInfraFailurePark(t *testing.T) {
 			t.Fatalf("got %v, want Retryable (self_retry_count must not count against the park budget)", got)
 		}
 	})
-	t.Run("type guard: implement C -> NotApplicable", func(t *testing.T) {
+	// The allow-list stays closed: only acceptance and implement park.
+	for _, typ := range []run.StageType{run.StageTypePlan, run.StageTypeReview, run.StageTypeDeploy} {
+		t.Run("type guard: "+string(typ)+" C -> NotApplicable", func(t *testing.T) {
+			stages, acc := infraFixture(c, run.StageStatePending)
+			acc.Type = typ
+			if got := run.ClassifyInfraFailurePark(stages, acc, run.InfraParkHistory{}); got != run.InfraParkNotApplicable {
+				t.Fatalf("got %v, want NotApplicable", got)
+			}
+		})
+	}
+	t.Run("exclusions are implement-only: acceptance C with DecomposedParent and ReopenedPass -> Retryable", func(t *testing.T) {
 		stages, acc := infraFixture(c, run.StageStatePending)
-		acc.Type = run.StageTypeImplement
-		if got := run.ClassifyInfraFailurePark(stages, acc, run.InfraParkHistory{}); got != run.InfraParkNotApplicable {
-			t.Fatalf("got %v, want NotApplicable", got)
+		if got := run.ClassifyInfraFailurePark(stages, acc, run.InfraParkHistory{DecomposedParent: true, ReopenedPass: true, StagePushed: true}); got != run.InfraParkRetryable {
+			t.Fatalf("got %v, want Retryable (#4356 acceptance behaviour unchanged)", got)
 		}
 	})
 	for _, cat := range []run.FailureCategory{run.FailureA, run.FailureB, run.FailureD} {
@@ -128,6 +137,52 @@ func TestClassifyInfraFailurePark(t *testing.T) {
 			t.Fatalf("nil: got %v, want NotApplicable", got)
 		}
 	})
+}
+
+// implFixture is the feature_change shape with the IMPLEMENT stage failed
+// (sequence 2, the given category) and acceptance + review pending.
+func implFixture(implCat *run.FailureCategory) ([]*run.Stage, *run.Stage) {
+	impl := infraStage(run.StageTypeImplement, 2, run.StageStateFailed, implCat)
+	stages := []*run.Stage{
+		infraStage(run.StageTypePlan, 1, run.StageStateSucceeded, nil),
+		impl,
+		infraStage(run.StageTypeAcceptance, 3, run.StageStatePending, nil),
+		infraStage(run.StageTypeReview, 4, run.StageStatePending, nil),
+	}
+	return stages, impl
+}
+
+// TestClassifyInfraFailurePark_Implement pins the #4426 implement arm. Each
+// non-Retryable row differs from the first row in exactly the one field its
+// guard reads.
+func TestClassifyInfraFailurePark_Implement(t *testing.T) {
+	t.Parallel()
+
+	c := catPtr(run.FailureC)
+	cases := []struct {
+		name string
+		cat  *run.FailureCategory
+		h    run.InfraParkHistory
+		want run.InfraParkDecision
+	}{
+		{"implement C -> Retryable", c, run.InfraParkHistory{}, run.InfraParkRetryable},
+		{"implement C, two prior parks -> Retryable", c, run.InfraParkHistory{PriorParks: 2}, run.InfraParkRetryable},
+		{"implement C, DecomposedParent -> NotApplicable", c, run.InfraParkHistory{DecomposedParent: true}, run.InfraParkNotApplicable},
+		{"implement C, ReopenedPass -> NotApplicable", c, run.InfraParkHistory{ReopenedPass: true}, run.InfraParkNotApplicable},
+		{"implement A -> NotApplicable", catPtr(run.FailureA), run.InfraParkHistory{}, run.InfraParkNotApplicable},
+		{"implement B -> NotApplicable", catPtr(run.FailureB), run.InfraParkHistory{}, run.InfraParkNotApplicable},
+		{"implement D -> NotApplicable", catPtr(run.FailureD), run.InfraParkHistory{}, run.InfraParkNotApplicable},
+		{"implement C, MergeObserved (C2) -> NotApplicable", c, run.InfraParkHistory{MergeObserved: true}, run.InfraParkNotApplicable},
+		{"implement C, three prior parks -> BudgetExhausted", c, run.InfraParkHistory{PriorParks: run.InfraFailureParkRetryBudget}, run.InfraParkBudgetExhausted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stages, impl := implFixture(tc.cat)
+			if got := run.ClassifyInfraFailurePark(stages, impl, tc.h); got != tc.want {
+				t.Fatalf("got %v, want %v", got, tc.want)
+			}
+		})
+	}
 }
 
 func parkEntry(t *testing.T, seq int64, stageID uuid.UUID, failedAt string, ordinal int) *audit.Entry {
@@ -194,4 +249,137 @@ func TestReadInfraParkHistory(t *testing.T) {
 			t.Fatalf("episode = (%q, %d)", at, ord)
 		}
 	})
+}
+
+func stageEntry(seq int64, stageID *uuid.UUID, category string) *audit.Entry {
+	return &audit.Entry{Sequence: seq, StageID: stageID, Category: category}
+}
+
+// TestReadInfraParkHistory_Exclusions pins the #4426 implement-only
+// exclusions as ReadInfraParkHistory derives them, end to end through
+// ClassifyInfraFailurePark: every row that sets an exclusion answers
+// NotApplicable, and every row that must NOT set one still parks.
+func TestReadInfraParkHistory_Exclusions(t *testing.T) {
+	t.Parallel()
+
+	stages, impl := implFixture(catPtr(run.FailureC))
+	implID := impl.ID
+	otherID := stages[2].ID
+
+	t.Run("plan_decomposed sets DecomposedParent", func(t *testing.T) {
+		h := run.ReadInfraParkHistory([]*audit.Entry{stageEntry(1, &otherID, "plan_decomposed")}, impl)
+		if !h.DecomposedParent || h.ReopenedPass {
+			t.Fatalf("history = %+v, want DecomposedParent only", h)
+		}
+		if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkNotApplicable {
+			t.Fatalf("got %v, want NotApplicable", got)
+		}
+	})
+	t.Run("no exclusion rows -> neither flag, parks", func(t *testing.T) {
+		h := run.ReadInfraParkHistory([]*audit.Entry{stageEntry(1, &implID, "implement_dispatched")}, impl)
+		if h.DecomposedParent || h.ReopenedPass || h.StagePushed {
+			t.Fatalf("history = %+v, want no exclusion", h)
+		}
+		if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkRetryable {
+			t.Fatalf("got %v, want Retryable", got)
+		}
+	})
+	for _, cat := range run.InfraParkReopenedPassCategories() {
+		t.Run(cat+" scoped to the failed stage sets ReopenedPass", func(t *testing.T) {
+			h := run.ReadInfraParkHistory([]*audit.Entry{stageEntry(1, &implID, cat)}, impl)
+			if !h.ReopenedPass || h.StagePushed {
+				t.Fatalf("history = %+v, want ReopenedPass from the trigger row", h)
+			}
+			if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkNotApplicable {
+				t.Fatalf("got %v, want NotApplicable", got)
+			}
+		})
+		t.Run(cat+" scoped to another stage or unscoped leaves ReopenedPass false", func(t *testing.T) {
+			h := run.ReadInfraParkHistory([]*audit.Entry{stageEntry(1, &otherID, cat), stageEntry(2, nil, cat)}, impl)
+			if h.ReopenedPass {
+				t.Fatalf("history = %+v, want no ReopenedPass", h)
+			}
+			if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkRetryable {
+				t.Fatalf("got %v, want Retryable", got)
+			}
+		})
+	}
+	// #4426 approval condition C1: a head-producing row scoped to the stage
+	// is a re-opened pass with NO trigger row.
+	for _, cat := range []string{"pull_request_opened", "fixup_pushed", "child_pushed"} {
+		t.Run("C1 durable signal: "+cat+" with no trigger row -> NotApplicable", func(t *testing.T) {
+			h := run.ReadInfraParkHistory([]*audit.Entry{stageEntry(1, &implID, cat)}, impl)
+			if !h.StagePushed || !h.ReopenedPass {
+				t.Fatalf("history = %+v, want StagePushed and ReopenedPass", h)
+			}
+			if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkNotApplicable {
+				t.Fatalf("got %v, want NotApplicable", got)
+			}
+		})
+		t.Run("C1 durable signal: "+cat+" on another stage -> Retryable", func(t *testing.T) {
+			h := run.ReadInfraParkHistory([]*audit.Entry{stageEntry(1, &otherID, cat), stageEntry(2, nil, cat)}, impl)
+			if h.StagePushed || h.ReopenedPass {
+				t.Fatalf("history = %+v, want no exclusion", h)
+			}
+			if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkRetryable {
+				t.Fatalf("got %v, want Retryable", got)
+			}
+		})
+	}
+	t.Run("implement budget counts parks over the stage lifetime", func(t *testing.T) {
+		// An acceptance outcome scoped to a DIFFERENT stage never resets
+		// the implement stage's count.
+		h := run.ReadInfraParkHistory([]*audit.Entry{
+			parkEntry(t, 1, implID, "2026-10-15T09:00:00Z", 0),
+			parkEntry(t, 2, implID, "2026-10-15T10:00:00Z", 1),
+			stageEntry(3, &otherID, "acceptance_outcome_recorded"),
+			parkEntry(t, 4, implID, "2026-10-15T11:00:00Z", 2),
+		}, impl)
+		if h.PriorParks != 3 {
+			t.Fatalf("PriorParks = %d, want 3", h.PriorParks)
+		}
+		if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkBudgetExhausted {
+			t.Fatalf("got %v, want BudgetExhausted", got)
+		}
+	})
+}
+
+// TestInfraParkHistoryOnReadError pins #4426 approval condition C1's
+// read-error arm: an implement failure whose audit read failed classifies as
+// a re-opened pass (NotApplicable: the run fails as today), while an
+// acceptance failure answers ok=false so the caller keeps #4356's
+// error-with-no-transition contract.
+func TestInfraParkHistoryOnReadError(t *testing.T) {
+	t.Parallel()
+
+	t.Run("implement C read error -> ok, NotApplicable", func(t *testing.T) {
+		stages, impl := implFixture(catPtr(run.FailureC))
+		h, ok := run.InfraParkHistoryOnReadError(stages, impl)
+		if !ok {
+			t.Fatalf("ok = false, want true (the read error must fail the run, not error)")
+		}
+		if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkNotApplicable {
+			t.Fatalf("got %v, want NotApplicable", got)
+		}
+	})
+	t.Run("acceptance C read error -> not ok", func(t *testing.T) {
+		stages, acc := infraFixture(catPtr(run.FailureC), run.StageStatePending)
+		if _, ok := run.InfraParkHistoryOnReadError(stages, acc); ok {
+			t.Fatalf("ok = true, want false (an acceptance park cannot be bounded without its history)")
+		}
+	})
+}
+
+// TestInfraParkReopenedPassCategories_ReturnsCopy pins that a caller cannot
+// mutate the predicate's category list through the returned slice.
+func TestInfraParkReopenedPassCategories_ReturnsCopy(t *testing.T) {
+	t.Parallel()
+	got := run.InfraParkReopenedPassCategories()
+	if len(got) != 3 {
+		t.Fatalf("categories = %v, want 3", got)
+	}
+	got[0] = "mutated"
+	if run.InfraParkReopenedPassCategories()[0] == "mutated" {
+		t.Fatal("InfraParkReopenedPassCategories returned the backing slice")
+	}
 }

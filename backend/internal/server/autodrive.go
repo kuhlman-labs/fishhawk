@@ -516,6 +516,17 @@ const (
 	// gate's admitted head because the PR head moved after it; the claim was
 	// released and the next tick re-gates at the new head.
 	autoDriveNoteHeadMoved = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the merge-dispatch claim was released and the next auto-drive tick re-gates at the new head; observe-only"
+	// #4683: the other three head-moved states, chosen by the SETTLE outcome
+	// (autoDriveHeadMovedNote). Each opens with the same lead clause as
+	// autoDriveNoteHeadMoved, which is the RELEASED note. The two
+	// dispatch_failed notes name the operator re-arm, as the inline 409 does.
+	autoDriveNoteHeadMovedBasisHeld     = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the refusal_basis does not prove the forge applied nothing, so the merge-dispatch claim was NOT released and is dispatch_failed: every later tick is observe-only (already claimed) until reconciliation (the pull request reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); inspect the pull request; observe-only"
+	autoDriveNoteHeadMovedReleaseFailed = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the merge-dispatch claim release did not land, so the claim is dispatch_failed: every later tick is observe-only (already claimed) until reconciliation (the pull request reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); observe-only"
+	autoDriveNoteHeadMovedUnclaimed     = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); no merge-dispatch claim was held (no merge-dispatch ledger is wired), so the next auto-drive tick re-gates at the new head; observe-only"
+	// #4617: the merge dispatch errored but the pull request reads merged on
+	// the re-observe before the settle; any merge-dispatch claim stays
+	// dispatched and no dispatch_failed row is written.
+	autoDriveNoteMergeLandedOnReobserve = "the merge dispatch errored but the pull request reads merged on the re-observe (#4617); any merge-dispatch claim stays dispatched; the webhook settles the run"
 )
 
 // delegatedMergeUnderLock runs the delegated may_merge dispatch tail under the
@@ -557,6 +568,25 @@ func (s *Server) delegatedMergeUnderLock(ctx context.Context, runRow *run.Run, s
 	return out, oerr
 }
 
+// autoDriveHeadMovedNote picks the delegated head-moved observe-only note from
+// the claim's SETTLE outcome (#4683), in the same branch order as
+// writeMergeHeadMoved's claim switch: released -> autoDriveNoteHeadMoved; a
+// dispatch_failed claim whose classification is itself uncertain (the
+// refusal_basis does not prove nothing applied) -> BasisHeld; any other
+// dispatch_failed claim (a releasable refusal whose release did not land) ->
+// ReleaseFailed; no claim (settled empty) -> Unclaimed.
+func autoDriveHeadMovedNote(settled mergeDispatchLedgerOutcome, merr error) string {
+	switch {
+	case settled == mergeDispatchRelease:
+		return autoDriveNoteHeadMoved
+	case settled == mergeDispatchUncertain && classifyMergeDispatchOutcome(merr) == mergeDispatchUncertain:
+		return autoDriveNoteHeadMovedBasisHeld
+	case settled == mergeDispatchUncertain:
+		return autoDriveNoteHeadMovedReleaseFailed
+	}
+	return autoDriveNoteHeadMovedUnclaimed
+}
+
 // delegatedMergeLocked is delegatedMergeUnderLock's fn: the ownership check,
 // then the shared acceptance-gated dispatch tail, translated to the delegated
 // arm's outcome. ctx is the lock fn's context.
@@ -574,7 +604,7 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 	}
 	// #4397: the gate's admitted live head rides into the pre-merge
 	// republish so the required check lands where the merge will.
-	outcome, gateState, derr := s.dispatchAcceptanceGatedMerge(ctx, runRow, stages, merger, gate.HeadSHA)
+	outcome, gateState, settled, derr := s.dispatchAcceptanceGatedMergeSettled(ctx, runRow, stages, merger, gate.HeadSHA)
 	switch outcome {
 	case mergeDispatchAcceptanceNotReady:
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "auto-drive: may_merge met but acceptance gate not passed; observe-only",
@@ -601,17 +631,50 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 			slog.String("run_id", runRow.ID.String()), slog.String("error", derr.Error()))
 		return observeOnly(autoDriveNoteAuthorizationUnrecorded), nil
 	case mergeDispatchHeadMoved:
-		// derr is the forge's head-mismatch refusal, carried for this log only.
+		// derr is the forge's head-mismatch refusal, carried for this log and
+		// for the note's basis-versus-release split. claim_outcome is the
+		// SETTLE outcome (the ledger state the claim was left in, #4749),
+		// never a re-derived classification: a released claim lets the next
+		// tick re-gate at the new head, a dispatch_failed one keeps every
+		// later tick observe-only (already claimed) until reconciliation or
+		// the operator re-arm. The returned note follows that same settle
+		// outcome (#4683, autoDriveHeadMovedNote).
 		basis := mergeHeadMovedBasis(derr)
+		claimOutcome := string(settled)
+		if claimOutcome == "" {
+			claimOutcome = "not_claimed"
+		}
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"auto-drive: the forge refused the head-pinned merge because the pull request head moved; observe-only, the next tick re-gates at the new head",
+			"auto-drive: the forge refused the head-pinned merge because the pull request head moved; observe-only (a released claim re-gates at the new head next tick; a dispatch_failed claim holds until reconciliation or the operator re-arm)",
 			slog.String("run_id", runRow.ID.String()), slog.String("head_sha", gate.HeadSHA),
 			slog.String("pinned_to", mergeHeadMovedSubject(gate.HeadSHA, forgeApprovalFolded(runRow))),
 			slog.String("refusal_basis", basis), slog.Bool("forge_guarantees_nothing_applied", mergeHeadMovedNothingApplied(basis)),
+			slog.String("claim_outcome", claimOutcome),
 			slog.String("error", derr.Error()))
-		return observeOnly(autoDriveNoteHeadMoved), nil
+		return observeOnly(autoDriveHeadMovedNote(settled, derr)), nil
+	case mergeDispatchLandedOnReobserve:
+		// #4617: the dispatch errored but the merge landed; acted, no error.
+		return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: autoDriveNoteMergeLandedOnReobserve}, nil
+	case mergeDispatchMethodUnsupported:
+		// E93.2 / #4658: refused BEFORE the fold and the claim; derr is the
+		// *MergeMethodRefusalError, rendered from its closed-set fields only.
+		var ref *MergeMethodRefusalError
+		errors.As(derr, &ref)
+		s.logMergeMethodRefusal(ctx, runRow, ref,
+			"auto-drive: may_merge met but the run's merge method is refused before the claim; observe-only")
+		return observeOnly("merge_method_refused (" + ref.Reason + "): " + ref.FieldDetail() +
+			"; nothing was claimed and the merger was not called; observe-only"), nil
 	}
 	if derr != nil {
+		// E93.2 / #4658: a dispatch refusal ForgeMerger attributed to the
+		// run's merge method names it, built from the refusal's fields only;
+		// the log line carries the method attributes and no error text.
+		var ref *MergeMethodRefusalError
+		if errors.As(derr, &ref) {
+			s.logMergeMethodRefusal(ctx, runRow, ref,
+				"auto-drive: the forge refused the delegated merge for the run's merge method")
+			return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge_method_refused: " + ref.FieldDetail()}, derr
+		}
 		return AutoDriveOutcome{Action: delegation.ActionMerge, Note: "merge dispatch failed"}, derr
 	}
 	// may_merge ENABLES/queues GitHub auto-merge; it does NOT prove
@@ -656,11 +719,37 @@ const (
 	mergeDispatchAuthorizationUnrecorded
 	// mergeDispatchHeadMoved (#4641): the dispatch was PINNED to a non-empty
 	// liveHead and the forge refused it for a head mismatch
-	// (forge.ErrMergeConflict). The claim was settled (released) and the
-	// returned error is that refusal, for logging only: the caller is
-	// observe-only, never "merge dispatch failed".
+	// (forge.ErrMergeConflict). The claim was settled and the returned settle
+	// outcome, which the caller's note follows (autoDriveHeadMovedNote), names
+	// the ledger state (released, dispatch_failed, or empty when unclaimed).
+	// The returned error is that refusal: the caller is observe-only, never
+	// "merge dispatch failed".
 	mergeDispatchHeadMoved
+	// mergeDispatchMethodUnsupported (E93.2 / #4658): staticMergeMethodRefusal
+	// refused the run's merge method (its forge family cannot apply it per
+	// merge request, or its admission spec does not parse) AFTER the
+	// acceptance and nil-merger checks and BEFORE the forge-approval fold, the
+	// republish and the claim: no row, no claim, the merger is never called.
+	// The returned error is the *MergeMethodRefusalError.
+	mergeDispatchMethodUnsupported
+	// mergeDispatchLandedOnReobserve (#4617): the merge dispatch errored, but
+	// the observe-before-settle (delegatedMergeLanded) reads the pull request
+	// merged. Any claim stays dispatched (the merge landed), no
+	// merge_dispatch_settled row is written and the returned error is nil:
+	// the caller reports acted, never "merge dispatch failed".
+	mergeDispatchLandedOnReobserve
 )
+
+// logMergeMethodRefusal logs a merge-method refusal with its closed-set fields
+// only — never the refusal's Cause or any error text (E93.2 / #4658).
+func (s *Server) logMergeMethodRefusal(ctx context.Context, runRow *run.Run, ref *MergeMethodRefusalError, msg string) {
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, msg,
+		slog.String("run_id", runRow.ID.String()),
+		slog.String("merge_method", ref.Method),
+		slog.String("merge_method_source", ref.Source),
+		slog.String("reason", ref.Reason),
+		slog.Any("allowed_merge_methods", ref.Allowed))
+}
 
 // dispatchAcceptanceGatedMerge is the shared merge-dispatch tail extracted from
 // AutoDriveRunGate's may_merge arm (E48.7 / #1954): it confirms the acceptance
@@ -672,7 +761,10 @@ const (
 //
 // Returns the classified outcome, the acceptance gate state (for logging /
 // error detail), and — only on mergeDispatchMerged and mergeDispatchHeadMoved
-// — the seam's dispatch error.
+// — the seam's dispatch error; on mergeDispatchMethodUnsupported the error is
+// the pre-claim *MergeMethodRefusalError (E93.2 / #4658: the run's forge
+// family cannot apply its declared merge method, or its admission spec does
+// not parse — refused before the fold, the republish and the claim).
 // On mergeDispatchAcceptanceNotReady the returned error is the acceptance-audit
 // read error (nil when the gate is simply not-passed rather than unreadable),
 // so the caller can distinguish an evidence hole from a read failure.
@@ -693,10 +785,33 @@ const (
 // dispatch_failed) is mergeDispatchAlreadyClaimed and a claim error is
 // mergeDispatchUnclaimed: the merger is never called on either. A dispatch
 // that fails after the claim is classified once (classifyMergeDispatchOutcome):
-// a refusal that applied nothing releases the claim, anything else moves it to
-// dispatch_failed, which only reconciliation or the operator re-arm clears.
+// a refusal the forge guarantees applied nothing releases the claim (a typed
+// refusal; for a head mismatch only the precheck and rest_sha bases, never
+// graphql_reread or an empty or unrecognised basis, #4749), anything else
+// moves it to dispatch_failed, which only reconciliation or the operator
+// re-arm clears.
 // Without a wired queue there is no
 // ledger and no queue dispatcher to race, so the dispatch proceeds unclaimed.
+//
+// Observe-before-settle (#4617): on EVERY dispatch error except our own
+// checks_pending refusal (forge.ErrPullRequestUnstableStatus, which dispatched
+// nothing — the same carve-out as the inline tail's `if !checksPending`), and
+// BEFORE the claim is settled, delegatedMergeLanded re-observes whether the
+// merge landed. It runs whether or not a D1 claim exists, mirroring the inline
+// tail's unconditional re-observe: a pull request that reads merged is a fact
+// either way, and the read is paid only on an error path. A landed merge is
+// mergeDispatchLandedOnReobserve (acted, nil error): any claim stays
+// dispatched and no dispatch_failed row is written; without a wired ledger
+// (s.mergeDispatchLedger() == nil) a landed merge still reports acted rather
+// than "merge dispatch failed". It is checked before the head-moved mapping,
+// so a merge that landed is never reported as head-moved.
+//
+// Per-call timeouts (#4617, approval condition (f)): the dispatch runs under
+// mergeTailMergeCallTimeout (dispatchMergeBounded), the landed read under
+// mergeTailForgeReadTimeout and the pre-dispatch republish under
+// mergeTailRepublishTimeout. A hung dispatch fails the merge
+// ("merge dispatch failed", a claim dispatch_failed); a hung read or republish
+// proceeds.
 //
 // liveHead is the head mergeCandidateGate admitted (mergeCandidateGateResult.
 // HeadSHA, E86.57 / #4397): the pre-dispatch republish publishes AT it, the
@@ -704,9 +819,18 @@ const (
 // PINNED to it, so the head the fold judged is the only head that can merge. A
 // pinned dispatch the forge refuses for a head mismatch is
 // mergeDispatchHeadMoved. Empty (an ungated D7 admit, a merged PR) keeps the
-// findHeadSHA resolution, claims at "unresolved" (the claim is run-scoped) and
-// dispatches unpinned.
+// findHeadSHA resolution, claims at mergeDispatchClaimHeadUnresolved (the
+// claim is run-scoped) and dispatches unpinned.
 func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, liveHead string) (mergeDispatchOutcome, string, error) {
+	outcome, gateState, _, err := s.dispatchAcceptanceGatedMergeSettled(ctx, runRow, stages, merger, liveHead)
+	return outcome, gateState, err
+}
+
+// dispatchAcceptanceGatedMergeSettled is dispatchAcceptanceGatedMerge also
+// returning settleMergeDispatchClaim's outcome for a claimed dispatch that
+// failed ("" when no claim was settled), so the delegated arm reports the
+// claim state the ledger was LEFT in (#4749) rather than re-deriving it.
+func (s *Server) dispatchAcceptanceGatedMergeSettled(ctx context.Context, runRow *run.Run, stages []*run.Stage, merger GitHubMerger, liveHead string) (mergeDispatchOutcome, string, mergeDispatchLedgerOutcome, error) {
 	gateState, gerr := s.acceptanceGateState(ctx, runRow, stages)
 	// The admitted set is the SHARED acceptanceGateAdmitsMerge predicate (E66.37
 	// / #2474), so the delegated merge and the operator merge endpoint cannot
@@ -723,17 +847,23 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	// clear. A read error (gerr != nil) admits nothing — fail-closed.
 	acceptanceMergeOK := gerr == nil && acceptanceGateAdmitsMerge(gateState)
 	if !acceptanceMergeOK {
-		return mergeDispatchAcceptanceNotReady, gateState, gerr
+		return mergeDispatchAcceptanceNotReady, gateState, "", gerr
 	}
 	if merger == nil {
-		return mergeDispatchNoMerger, gateState, nil
+		return mergeDispatchNoMerger, gateState, "", nil
+	}
+	// E93.2 / #4658: the pre-claim merge-method refusal, AFTER the acceptance
+	// and nil-merger checks and BEFORE the forge-approval fold (so no
+	// merge_queue_authorized row), the republish and the claim.
+	if ref := staticMergeMethodRefusal(runRow); ref != nil {
+		return mergeDispatchMethodUnsupported, gateState, "", ref
 	}
 	// ADR-112 (#4619): the ONE forge-approval fold at the gate's verified
 	// head, AFTER the acceptance and nil-merger checks and BEFORE the
 	// republish and the claim. An empty liveHead folds undetermined
 	// (head_unknown, H1). A gate-less run makes no fold read.
 	if outcome, aerr := s.delegatedForgeApproval(ctx, runRow, liveHead); outcome != mergeDispatchMerged {
-		return outcome, gateState, aerr
+		return outcome, gateState, "", aerr
 	}
 	// E64.42 / #3159: recompute and republish fishhawk_audit_complete
 	// immediately BEFORE the dispatch, the same control handleMergeRun
@@ -760,12 +890,12 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 	if ledger != nil {
 		claimHead := liveHead
 		if claimHead == "" {
-			claimHead = "unresolved"
+			claimHead = mergeDispatchClaimHeadUnresolved
 		}
 		var cerr error
 		claim, claimed, cerr = ledger.ClaimMergeDispatch(ctx, runRow.ID, mergequeue.DispatchPathDelegated, claimHead)
 		if cerr != nil {
-			return mergeDispatchUnclaimed, gateState, cerr
+			return mergeDispatchUnclaimed, gateState, "", cerr
 		}
 		if !claimed { // ADR-093 D1: a merge dispatch is already claimed; never call the forge
 			if claim.State == mergequeue.DispatchFailed {
@@ -774,19 +904,47 @@ func (s *Server) dispatchAcceptanceGatedMerge(ctx context.Context, runRow *run.R
 					slog.String("run_id", runRow.ID.String()), slog.String("claim_path", claim.Path),
 					slog.String("failure_cause", claim.FailureCause))
 			}
-			return mergeDispatchAlreadyClaimed, gateState, nil
+			return mergeDispatchAlreadyClaimed, gateState, "", nil
 		}
 	}
-	merr := merger.MergePullRequest(ctx, runRow, liveHead)
+	merr := dispatchMergeBounded(ctx, merger, runRow, liveHead)
+	// #4617 observe-before-settle: every dispatch error but our own
+	// checks_pending refusal re-observes BEFORE the settle, claim or no claim.
+	if merr != nil && !errors.Is(merr, forge.ErrPullRequestUnstableStatus) && s.delegatedMergeLanded(ctx, runRow) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+			"auto-drive: the delegated merge dispatch errored but the pull request reads merged; any merge-dispatch claim stays dispatched",
+			slog.String("run_id", runRow.ID.String()), slog.Bool("claimed", claimed), slog.String("error", merr.Error()))
+		return mergeDispatchLandedOnReobserve, gateState, "", nil
+	}
+	var settled mergeDispatchLedgerOutcome
 	if merr != nil && claimed {
 		// Ruling R1: release when the forge applied nothing, else
 		// dispatch_failed; recorded on a non-cancellable bounded context.
-		s.settleMergeDispatchClaim(ctx, ledger, claim, merr)
+		settled = s.settleMergeDispatchClaim(ctx, ledger, claim, merr)
 	}
 	if liveHead != "" && errors.Is(merr, forge.ErrMergeConflict) {
-		return mergeDispatchHeadMoved, gateState, merr
+		return mergeDispatchHeadMoved, gateState, settled, merr
 	}
-	return mergeDispatchMerged, gateState, merr
+	return mergeDispatchMerged, gateState, settled, merr
+}
+
+// delegatedMergeLanded reports whether the run's pull request reads merged,
+// for the delegated observe-before-settle (#4617). SIDE-EFFECT-FREE: it
+// appends no merge_observation_recorded row (the queue path's observedMerged
+// posture, unlike the inline observe rung). The cheap chain read
+// (runPRObservablyMerged, skipped with no audit repository) goes first, where
+// a read error is no evidence; then one bounded forge read
+// (observeForgeMergeBounded), true only on obsForgeOK (merged with a merge
+// commit SHA and merged_at). Every uncertainty is false, so the caller falls
+// through to its fail-closed settle.
+func (s *Server) delegatedMergeLanded(ctx context.Context, runRow *run.Run) bool {
+	if s.cfg.AuditRepo != nil {
+		if merged, err := s.runPRObservablyMerged(ctx, runRow.ID); err == nil && merged {
+			return true
+		}
+	}
+	_, reason, _ := s.observeForgeMergeBounded(ctx, runRow)
+	return reason == obsForgeOK
 }
 
 // delegatedForgeApproval runs the delegated arm's ADR-112 fold and evidence

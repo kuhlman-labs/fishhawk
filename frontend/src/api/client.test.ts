@@ -299,22 +299,38 @@ describe('api decision write surfaces (E40.2 / #1717)', () => {
     expect(fetchMock.mock.calls[0][0]).toBe('/v0/runs/run%2F1/scope-amendments/amend%209/decision');
   });
 
-  it('waiveConcern POSTs the reason to the concern waive URL', async () => {
+  it('waiveConcern POSTs the reason and judgement to the concern waive URL', async () => {
     const fetchMock = okFetch();
-    await api.waiveConcern('concern-3', { reason: 'accepted trade-off' });
+    await api.waiveConcern('concern-3', {
+      reason: 'accepted trade-off',
+      judgement: 'tradeoff',
+      tradeoff_cost: 'one extra round trip',
+    });
     expect(fetchMock.mock.calls[0][0]).toBe('/v0/concerns/concern-3/waive');
     const init = lastInit(fetchMock);
     expect(init.method).toBe('POST');
-    expect(JSON.parse(String(init.body))).toEqual({ reason: 'accepted trade-off' });
+    expect(JSON.parse(String(init.body))).toEqual({
+      reason: 'accepted trade-off',
+      judgement: 'tradeoff',
+      tradeoff_cost: 'one extra round trip',
+    });
   });
 
-  it('deferConcern POSTs parent_epic to the concern defer URL', async () => {
+  it('deferConcern POSTs parent_epic and judgement to the concern defer URL', async () => {
     const fetchMock = okFetch();
-    await api.deferConcern('concern-4', { parent_epic: '#1196', note: 'later' });
+    await api.deferConcern('concern-4', {
+      judgement: 'defect_pre_existing',
+      parent_epic: '#1196',
+      note: 'later',
+    });
     expect(fetchMock.mock.calls[0][0]).toBe('/v0/concerns/concern-4/defer');
     const init = lastInit(fetchMock);
     expect(init.method).toBe('POST');
-    expect(JSON.parse(String(init.body))).toEqual({ parent_epic: '#1196', note: 'later' });
+    expect(JSON.parse(String(init.body))).toEqual({
+      judgement: 'defect_pre_existing',
+      parent_epic: '#1196',
+      note: 'later',
+    });
   });
 
   it('arbitrateAcceptance POSTs reason + acknowledge to the run URL', async () => {

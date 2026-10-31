@@ -112,6 +112,73 @@ func TestStartCampaign_ThreadsWorkingDirThroughRealClient(t *testing.T) {
 	})
 }
 
+// TestStartCampaign_ThreadsRunnerKindThroughRealClient drives the REAL
+// startCampaign handler through the REAL apiClient (#4485): runner_kind reaches
+// the POST body trimmed, the response's campaign.runner_kind decodes onto the
+// tool output, and an omitted value sends no runner_kind (never defaulted
+// client-side).
+func TestStartCampaign_ThreadsRunnerKindThroughRealClient(t *testing.T) {
+	t.Run("recorded", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		fb.createCampaignResp = Campaign{
+			ID: uuid.NewString(), Repo: "acme/widgets", EpicRef: "#25", State: "pending",
+			PausePolicy: "pause_campaign", RunnerKind: "local",
+		}
+		r := newResolver(srv, nil)
+
+		_, out, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo: "acme/widgets", EpicRef: "#25", RunnerKind: " local ",
+		})
+		if err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if got := fb.createCampaignBody.RunnerKind; got != "local" {
+			t.Errorf("POST body runner_kind = %q, want the trimmed \"local\"", got)
+		}
+		if out.Campaign.RunnerKind != "local" {
+			t.Errorf("tool output campaign.runner_kind = %q, want local", out.Campaign.RunnerKind)
+		}
+	})
+
+	t.Run("omitted_sends_none", func(t *testing.T) {
+		fb, srv := newFakeBackend(t)
+		r := newResolver(srv, nil)
+
+		if _, _, err := r.startCampaign(context.Background(), nil, StartCampaignInput{
+			Repo: "acme/widgets", EpicRef: "#25", WorkingDir: t.TempDir(),
+		}); err != nil {
+			t.Fatalf("startCampaign: %v", err)
+		}
+		if got := fb.createCampaignBody.RunnerKind; got != "" {
+			t.Errorf("POST body runner_kind = %q, want empty (never defaulted client-side)", got)
+		}
+	})
+}
+
+// TestStartCampaignItemRun_SurfacesRunnerKindResolution: the backend's
+// runner_kind_resolution reaches the tool output through the real client.
+func TestStartCampaignItemRun_SurfacesRunnerKindResolution(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+		RunnerKindResolution: &campaignRunnerKindResolution{RunnerKind: "local", Source: "campaign_working_dir"},
+	}
+	r := newResolver(srv, nil)
+
+	_, out, err := r.startCampaignItemRun(context.Background(), nil, StartCampaignItemRunInput{
+		CampaignID: uuid.NewString(), IssueRef: "issue:1", WorkflowID: "feature_change",
+	})
+	if err != nil {
+		t.Fatalf("startCampaignItemRun: %v", err)
+	}
+	if out.RunnerKindResolution == nil ||
+		*out.RunnerKindResolution != (campaignRunnerKindResolution{RunnerKind: "local", Source: "campaign_working_dir"}) {
+		t.Errorf("tool output runner_kind_resolution = %+v, want {local campaign_working_dir}", out.RunnerKindResolution)
+	}
+	if fb.startCampaignItemRunBody.RunnerKind != "" {
+		t.Errorf("POST body runner_kind = %q, want empty (never defaulted client-side)", fb.startCampaignItemRunBody.RunnerKind)
+	}
+}
+
 // TestStartCampaign_RelativeWorkingDir_Refused is counterfactual C5: the MCP
 // start_campaign syntactic guard (E48.87 / #2527). A relative binding would be
 // inherited by every item run in the batch, so it is refused BEFORE the backend
@@ -2311,6 +2378,83 @@ func TestGetCampaignStatus_Closed_E2E_ThroughRealServer(t *testing.T) {
 	}
 }
 
+// TestStartCampaignItemRun_FloorTier_CarriesRunnerKindResolution (#4485,
+// approval condition C1): the runner_kind_resolution survives the ADR-077 FLOOR
+// tier, where the response is rebuilt from a zero value and only non-omitempty
+// fields are re-installed (carryNonOmitemptyFields). The fixture forces the
+// floor through the real tool handler and asserts BOTH values in the actual
+// tool response, read from the raw structured content rather than a decode
+// that could mask an absent key.
+//
+// Counterfactual: give StartCampaignItemRunOutput.RunnerKindResolution
+// omitempty → the floor drops it → RED.
+func TestStartCampaignItemRun_FloorTier_CarriesRunnerKindResolution(t *testing.T) {
+	ctx := context.Background()
+	fb, srv := newFakeBackend(t)
+	campaignID := uuid.New()
+	runID := uuid.NewString()
+	fb.startCampaignItemRunResp = StartCampaignItemRunResult{
+		Run: floorForcingRun(runID),
+		Item: CampaignItem{
+			ID: uuid.NewString(), IssueRef: "acme/widgets#7", RunID: runID, State: "running",
+		},
+		RunnerKindResolution: &campaignRunnerKindResolution{RunnerKind: "local", Source: "campaign_working_dir"},
+	}
+
+	cfg := config{backendURL: srv.URL, apiToken: "tok-test"}
+	srvMCP := buildServer(cfg)
+	registerTools(srvMCP, &runResolver{api: newAPIClient(cfg), getenv: envFuncFromMap(map[string]string{runStatusBudgetEnvVar: "1"})})
+
+	client := mcp.NewClient(&mcp.Implementation{Name: "test-client", Version: "0"}, nil)
+	serverTransport, clientTransport := mcp.NewInMemoryTransports()
+	serverSession, err := srvMCP.Connect(ctx, serverTransport, nil)
+	if err != nil {
+		t.Fatalf("server connect: %v", err)
+	}
+	defer serverSession.Close()
+	clientSession, err := client.Connect(ctx, clientTransport, nil)
+	if err != nil {
+		t.Fatalf("client connect: %v", err)
+	}
+	defer clientSession.Close()
+
+	res, err := clientSession.CallTool(ctx, &mcp.CallToolParams{
+		Name: "fishhawk_start_campaign_item_run",
+		Arguments: map[string]any{
+			"campaign_id": campaignID.String(),
+			"issue_ref":   "acme/widgets#7",
+			"workflow_id": "feature_change",
+		},
+	})
+	if err != nil {
+		t.Fatalf("CallTool: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("CallTool returned IsError; content: %+v", res.Content)
+	}
+	structured, err := json.Marshal(res.StructuredContent)
+	if err != nil {
+		t.Fatalf("marshal structured content: %v", err)
+	}
+	var raw struct {
+		Elisions             *Elisions       `json:"elisions"`
+		RunnerKindResolution json.RawMessage `json:"runner_kind_resolution"`
+	}
+	if err := json.Unmarshal(structured, &raw); err != nil {
+		t.Fatalf("decode tool output %s: %v", structured, err)
+	}
+	if raw.Elisions == nil || raw.Elisions.Tier != floorTierName {
+		t.Fatalf("fixture did not reach the floor tier through the handler: %s", structured)
+	}
+	var got map[string]any
+	if err := json.Unmarshal(raw.RunnerKindResolution, &got); err != nil || got == nil {
+		t.Fatalf("floor-tier response carries no runner_kind_resolution (raw %q): %s", raw.RunnerKindResolution, structured)
+	}
+	if got["runner_kind"] != "local" || got["source"] != "campaign_working_dir" {
+		t.Errorf("floor-tier runner_kind_resolution = %v, want {runner_kind: local, source: campaign_working_dir}", got)
+	}
+}
+
 // TestStartCampaignItemRun_FloorTier_BoundedThroughHandler is the cross-boundary
 // test (#2576 step 9): it drives fishhawk_start_campaign_item_run through the
 // fakeBackend seam AND the MCP SDK in-memory transport at a floor-clamped
@@ -3996,5 +4140,66 @@ func TestCampaignHotfixTool_ThroughRealServer(t *testing.T) {
 	}
 	if err := call("operator-agent/v1"); err == nil || !strings.Contains(err.Error(), "operator_agent_forbidden") || !strings.Contains(err.Error(), "human operator") {
 		t.Errorf("operator-agent call err = %v, want operator_agent_forbidden with its remedy", err)
+	}
+}
+
+// TestGetCampaignStatus_PassesThroughPendingAmendments (E86.85 / #4486): a
+// present pending_amendments block passes through intact, a present EMPTY block
+// stays present, and an absent block stays ABSENT on the tool output's wire
+// bytes — absent (not computed) is not the same claim as items [].
+func TestGetCampaignStatus_PassesThroughPendingAmendments(t *testing.T) {
+	base := func(id uuid.UUID) CampaignStatus {
+		return CampaignStatus{
+			Campaign:   Campaign{ID: id.String(), Repo: "acme/widgets", EpicRef: "#25", State: "running", PausePolicy: "pause_campaign"},
+			Items:      []CampaignItem{},
+			Rollup:     CampaignRollup{Eligible: []string{}, Blocked: []string{}, Running: []string{}, Done: []string{}, Failed: []string{}, Cancelled: []string{}, Paused: []string{}},
+			NextAction: CampaignNextAction{Action: "wait"},
+		}
+	}
+	entry := campaignAmendmentEntry(uuid.New(), uuid.New(), "acme/widgets#2", true)
+	for _, tc := range []struct {
+		name    string
+		block   *campaignPendingAmendments
+		wantRaw string // substring of the output JSON; "" asserts the key absent
+	}{
+		{"present", &campaignPendingAmendments{Items: []campaignPendingAmendment{entry}, Truncated: true}, `"pending_amendments":{"items":[{"issue_ref":"acme/widgets#2"`},
+		{"present_empty", &campaignPendingAmendments{Items: []campaignPendingAmendment{}}, `"pending_amendments":{"items":[],"truncated":false}`},
+		{"absent", nil, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			id := uuid.New()
+			st := base(id)
+			st.PendingAmendments = tc.block
+			fb.campaignStatusByID[id] = st
+			r := newResolver(srv, nil)
+
+			_, out, err := r.getCampaignStatus(context.Background(), nil, GetCampaignStatusInput{CampaignID: id.String()})
+			if err != nil {
+				t.Fatalf("getCampaignStatus: %v", err)
+			}
+			raw, err := json.Marshal(out)
+			if err != nil {
+				t.Fatalf("marshal: %v", err)
+			}
+			if tc.wantRaw == "" {
+				if strings.Contains(string(raw), `"pending_amendments"`) || out.PendingAmendments != nil {
+					t.Fatalf("absent block surfaced: %s", raw)
+				}
+				return
+			}
+			if !strings.Contains(string(raw), tc.wantRaw) {
+				t.Fatalf("output JSON = %s, want it to carry %s", raw, tc.wantRaw)
+			}
+			if tc.block.Truncated && !out.PendingAmendments.Truncated {
+				t.Error("truncated flag dropped in pass-through")
+			}
+			if len(tc.block.Items) == 1 {
+				got := out.PendingAmendments.Items[0]
+				if got.Amendment.ID != entry.Amendment.ID || got.Amendment.RunID != entry.Amendment.RunID || !got.DecisionLive || got.StageState != "running" {
+					t.Errorf("passed-through entry = %+v, want %+v", got, entry)
+				}
+			}
+		})
 	}
 }

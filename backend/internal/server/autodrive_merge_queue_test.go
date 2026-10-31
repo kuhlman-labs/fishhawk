@@ -119,6 +119,65 @@ func (w *mqmWorld) admqDrive(r *mcqRun, m GitHubMerger) AutoDriveOutcome {
 	return out
 }
 
+// admqDriveErr is admqDrive returning AutoDriveRunGate's error instead of
+// failing the test (#4617), so a test can assert the error outcome and then
+// its committed state. A GetRun failure is fixture setup and stays fatal.
+func (w *mqmWorld) admqDriveErr(r *mcqRun, m GitHubMerger) (AutoDriveOutcome, error) {
+	w.t.Helper()
+	runRow, err := w.repo.GetRun(context.Background(), r.id)
+	if err != nil {
+		w.t.Fatalf("GetRun: %v", err)
+	}
+	return w.srv.AutoDriveRunGate(context.Background(), runRow, campaignOperatorIdentity(), m, nil)
+}
+
+// admqPRReader is a mutex-guarded PullRequestStateReader (#3226): it answers
+// an open, unmerged pull request until set flips it, counts every read, and
+// with block set waits on its context (blockOnCtx) and records what it saw.
+type admqPRReader struct {
+	mu    sync.Mutex
+	pr    *forge.PullRequest
+	reads int
+	block bool
+	seen  []blockOutcome
+}
+
+func (f *admqPRReader) GetPullRequest(ctx context.Context, _ forge.CredentialScope, _ forge.RepoRef, _ int) (*forge.PullRequest, error) {
+	f.mu.Lock()
+	f.reads++
+	pr, block := f.pr, f.block
+	f.mu.Unlock()
+	if block {
+		got := blockOnCtx(ctx)
+		f.mu.Lock()
+		f.seen = append(f.seen, got)
+		f.mu.Unlock()
+		return nil, got.err
+	}
+	if pr == nil {
+		return &forge.PullRequest{State: "open"}, nil
+	}
+	return pr, nil
+}
+
+func (f *admqPRReader) set(pr *forge.PullRequest) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.pr = pr
+}
+
+func (f *admqPRReader) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return f.reads
+}
+
+func (f *admqPRReader) outcomes() []blockOutcome {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return append([]blockOutcome(nil), f.seen...)
+}
+
 func requireObserveOnly(t *testing.T, out AutoDriveOutcome, note string) {
 	t.Helper()
 	if out.Acted || out.Paged || out.DecisionRequired || out.Note != note {
@@ -170,10 +229,14 @@ func TestAutoDriveMergeQueue_DelegatedDispatchPinsGateHead(t *testing.T) {
 // mismatch (forge.ErrMergeConflict) is observe-only autoDriveNoteHeadMoved,
 // never the "merge dispatch failed" error outcome, and the claim is RELEASED
 // (no claim row, a merge_dispatch_settled row outcome released at h1), so the
-// next tick re-gates at the new head. Counterfactual: deleting the
-// mergeDispatchHeadMoved branch returns the error outcome, RED.
+// next tick re-gates at the new head. The spec declares no approval gate, so
+// the head-moved log's pinned_to names only the gate-admitted head, with no
+// approval clause (#4683). Counterfactual: deleting the mergeDispatchHeadMoved
+// branch returns the error outcome, RED; passing a hard-coded folded flag to
+// mergeHeadMovedSubject adds the approval clause, RED.
 func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
 	w := newMQMWorld(t)
+	logs := mhpCaptureLogs(w)
 	r := w.admqReady("hmv", "h1")
 	m := &admqMerger{err: fmt.Errorf("%w: %w", forge.ErrMergeConflict,
 		&githubclient.HeadMismatchError{Basis: githubclient.HeadMismatchPrecheck, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})}
@@ -186,6 +249,9 @@ func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
 		t.Fatalf("AutoDriveRunGate error = %v, want nil (head moved is observe-only)", derr)
 	}
 	requireObserveOnly(t, out, autoDriveNoteHeadMoved)
+	if got, _ := mhpHeadMovedRecord(t, logs)["pinned_to"].(string); got != "the head the merge-candidate gate admitted (h1)" {
+		t.Fatalf("head-moved log pinned_to = %q, want the gate-admitted head only (no approval gate declared)", got)
+	}
 	var head string
 	if st, _ := w.claimRow(r, &head); st != "" {
 		t.Fatalf("claim = %q@%s, want released (no row)", st, head)
@@ -196,6 +262,35 @@ func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
 	}
 	if p := w.payload(settled[0]); p["outcome"] != string(mergeDispatchRelease) || p["head_sha"] != "h1" || p["path"] != mergequeue.DispatchPathDelegated {
 		t.Fatalf("settled payload = %v, want released/delegated@h1", p)
+	}
+}
+
+// TestAutoDriveMergeQueue_DelegatedHeadMovedUnclaimed pins (#4683) the
+// delegated head-moved arm when no merge-dispatch ledger is wired: with no
+// merge queue there is no claim to settle, so the note is
+// autoDriveNoteHeadMovedUnclaimed (the next tick re-gates at the new head) and
+// the head-moved log's claim_outcome is not_claimed. The PR reader answers
+// open and unmerged, so #4617's observe-before-settle falls through to the
+// head-moved arm. Counterfactual: returning autoDriveNoteHeadMoved for every
+// settle outcome gives the released note here, RED.
+func TestAutoDriveMergeQueue_DelegatedHeadMovedUnclaimed(t *testing.T) {
+	w := newMQMWorld(t)
+	logs := mhpCaptureLogs(w)
+	r := w.admqReady("hmvu", "h1")
+	w.srv.cfg.MergeQueue = nil
+	w.srv.cfg.PRStateReader = &admqPRReader{}
+	m := &admqMerger{err: fmt.Errorf("%w: %w", forge.ErrMergeConflict,
+		&githubclient.HeadMismatchError{Basis: githubclient.HeadMismatchPrecheck, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})}
+	out, derr := w.admqDriveErr(r, m)
+	if derr != nil {
+		t.Fatalf("AutoDriveRunGate error = %v, want nil (head moved is observe-only)", derr)
+	}
+	requireObserveOnly(t, out, autoDriveNoteHeadMovedUnclaimed)
+	if got := m.pins(); len(got) != 1 || got[0] != "h1" {
+		t.Fatalf("merger pins = %q, want one dispatch pinned to h1", got)
+	}
+	if got := mhpHeadMovedClaimOutcome(t, logs); got != "not_claimed" {
+		t.Fatalf("head-moved log claim_outcome = %q, want not_claimed", got)
 	}
 }
 
@@ -418,6 +513,11 @@ func TestAutoDrive_MayMergeDispatchFailureMarksClaimFailed(t *testing.T) {
 	if st, path := w.claimRow(r, &head); st != string(mergequeue.DispatchFailed) || path != mergequeue.DispatchPathDelegated {
 		t.Fatalf("claim = %s/%s, want dispatch_failed/delegated", st, path)
 	}
+	// #4617: the PR stays unmerged, so the observe-before-settle reads no
+	// merge and the settle still records exactly one dispatch_failed row.
+	if got := w.mdsOutcomes(r); len(got) != 1 || got[string(mergeDispatchUncertain)] != 1 {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want exactly one dispatch_failed", got)
+	}
 	m.err = nil
 	requireObserveOnly(t, w.admqDrive(r, m), autoDriveNoteAlreadyClaimed)
 	if m.calls() != 1 {
@@ -559,5 +659,84 @@ func TestAutoDrive_MayMergeHeldIntentEntryOwnsMerge(t *testing.T) {
 	var head string
 	if st, _ := w.claimRow(r, &head); st != "" {
 		t.Fatalf("claim state = %q, want none", st)
+	}
+}
+
+// TestAutoDrive_MayMergeUncertainErrorButMergedKeepsClaim pins the delegated
+// observe-before-settle (#4617): a dispatch error whose merge landed leaves
+// the claim dispatched, writes no merge_dispatch_settled row and reports the
+// acted mergeDispatchLandedOnReobserve outcome. The PR reads merged only AFTER
+// the merger returns its uncertain error (the forge reader flips, or a
+// pr_merged chain row lands, inside the dispatch), so without the guard the
+// settle runs unconditionally. Counterfactual: the guard made `if false`
+// leaves the claim dispatch_failed with one dispatch_failed row, RED;
+// delegatedMergeLanded skipping its chain tier reddens chain_evidence,
+// skipping its forge tier reddens forge_confirms.
+func TestAutoDrive_MayMergeUncertainErrorButMergedKeepsClaim(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		land func(w *mqmWorld, r *mcqRun, reader *admqPRReader)
+	}{
+		{"forge_confirms", func(_ *mqmWorld, _ *mcqRun, reader *admqPRReader) { reader.set(mergedPR()) }},
+		{"chain_evidence", func(w *mqmWorld, r *mcqRun, _ *admqPRReader) {
+			w.mqeAppend(r, CategoryPRMerged, map[string]any{"merge_commit_sha": "m1"})
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			reader := &admqPRReader{}
+			w.srv.cfg.PRStateReader = reader
+			r := w.admqReady("landed", "h1")
+			m := &admqMerger{hook: func(context.Context, *run.Run, string) error {
+				tc.land(w, r, reader)
+				return errors.New("forge 502")
+			}}
+			out, err := w.admqDriveErr(r, m)
+			if err != nil || !out.Acted || out.Action != delegation.ActionMerge || out.Note != autoDriveNoteMergeLandedOnReobserve {
+				t.Fatalf("outcome = %+v err %v, want acted %q with no error", out, err, autoDriveNoteMergeLandedOnReobserve)
+			}
+			var head string
+			if st, path := w.claimRow(r, &head); st != string(mergequeue.DispatchDispatched) || path != mergequeue.DispatchPathDelegated || head != "h1" {
+				t.Fatalf("claim = %s/%s@%s, want dispatched/delegated@h1", st, path, head)
+			}
+			if got := w.mdsOutcomes(r); len(got) != 0 {
+				t.Fatalf("merge_dispatch_settled outcomes = %v, want none", got)
+			}
+			if m.calls() != 1 {
+				t.Fatalf("merger calls = %d, want 1", m.calls())
+			}
+		})
+	}
+}
+
+// TestAutoDrive_MayMergeChecksPendingSkipsLandedRead pins approval condition
+// 2's carve-out (#4617): our own checks_pending refusal
+// (forge.ErrPullRequestUnstableStatus) dispatched nothing, so the delegated
+// arm makes NO landed read (mirroring the inline tail's `if !checksPending`)
+// and settles as today: the claim is released with one released row and the
+// error surfaces. The reader flips to merged inside the dispatch, so a read
+// would report landed. Counterfactual: dropping the carve-out adds one read
+// and reports landed, RED.
+func TestAutoDrive_MayMergeChecksPendingSkipsLandedRead(t *testing.T) {
+	w := newMQMWorld(t)
+	reader := &admqPRReader{}
+	w.srv.cfg.PRStateReader = reader
+	r := w.admqReady("pending", "h1")
+	readsAtDispatch := -1
+	m := &admqMerger{hook: func(context.Context, *run.Run, string) error {
+		readsAtDispatch = reader.count()
+		reader.set(mergedPR())
+		return fmt.Errorf("enable auto-merge: %w", forge.ErrPullRequestUnstableStatus)
+	}}
+	out, err := w.admqDriveErr(r, m)
+	if err == nil || out.Acted || out.Note != "merge dispatch failed" {
+		t.Fatalf("outcome = %+v err %v, want the checks_pending refusal surfaced", out, err)
+	}
+	if got := reader.count(); got != readsAtDispatch {
+		t.Fatalf("forge reads after the dispatch = %d, want 0 (no landed read on checks_pending)", got-readsAtDispatch)
+	}
+	w.requireClaim(r, "")
+	if got := w.mdsOutcomes(r); len(got) != 1 || got[string(mergeDispatchRelease)] != 1 {
+		t.Fatalf("merge_dispatch_settled outcomes = %v, want exactly one released", got)
 	}
 }

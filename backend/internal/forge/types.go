@@ -2,6 +2,8 @@ package forge
 
 import (
 	"errors"
+	"fmt"
+	"strings"
 	"time"
 )
 
@@ -66,9 +68,10 @@ var (
 	// right now (E48.7 / #1954). This is the common operator flow: the
 	// operator's `gh pr review --approve` plus green required checks settle the
 	// PR clean before the merge verb enables auto-merge, so the enable errors.
-	// The githubAutoMerger falls back to a synchronous REST squash merge on
-	// this sentinel (serve.go). Wrapped ALONGSIDE ErrValidation (both are
-	// reported via errors.Is) so existing ErrValidation callers are unaffected.
+	// The githubAutoMerger falls back to a synchronous REST merge (with the
+	// run's merge method, E93.2 / #4658) on this sentinel (serve.go). Wrapped
+	// ALONGSIDE ErrValidation (both are reported via errors.Is) so existing
+	// ErrValidation callers are unaffected.
 	ErrPullRequestCleanStatus = errors.New("githubclient: pull request already in clean status")
 	// ErrPullRequestUnstableStatus means EnableAutoMerge was rejected because
 	// the PR is in GitHub's UNSTABLE mergeStateStatus — enablePullRequestAutoMerge
@@ -80,7 +83,7 @@ var (
 	// This is a NOT-YET (or never, on a failed check) precondition, not a dispatch
 	// failure: the operator merge path turns it into a bounded wait rather than an
 	// error whose remedy is guaranteed to fail. Deliberately NOT eligible for the
-	// ErrPullRequestCleanStatus synchronous-REST fallback: a REST squash merge on
+	// ErrPullRequestCleanStatus synchronous-REST fallback: a REST merge on
 	// an UNSTABLE PR would SUCCEED and land the change before its pending checks
 	// report. Wrapped ALONGSIDE ErrValidation (both via errors.Is) so existing
 	// ErrValidation callers are unaffected. Keeps the "githubclient:" prefix to
@@ -107,6 +110,20 @@ var (
 	// forge-neutral "forge:" prefix rather than the "githubclient:" prefix
 	// the moved sentinels preserve.
 	ErrUnsupported = errors.New("forge: operation not supported by this forge")
+	// ErrMergeMethodNotAllowed means the forge refused a merge because the
+	// repository's merge settings disallow the requested merge method (E93.2 /
+	// #4658). It is never decided from forge error wording: the server
+	// attributes a typed merge refusal to it only after re-reading the
+	// repository's documented settings (GitHub GraphQL mergeCommitAllowed /
+	// squashMergeAllowed / rebaseMergeAllowed) and finding the declared method
+	// disallowed. Carried ALONGSIDE the original refusal sentinel, so every
+	// existing classification of that sentinel still holds.
+	ErrMergeMethodNotAllowed = errors.New("forge: merge method not allowed by the repository's merge settings")
+	// ErrMergeMethodUnsupported means the forge has no per-request surface for
+	// the requested merge method (E93.2 / #4658): GitLab's merge API takes no
+	// merge method, so a REBASE request is refused before any HTTP call. Wrapped
+	// with ErrUnsupported by its producer.
+	ErrMergeMethodUnsupported = errors.New("forge: merge method not supported by this forge")
 )
 
 // RepoRef identifies a repository by owner + name.
@@ -267,6 +284,112 @@ const (
 	MergeMethodMerge  MergeMethod = "MERGE"
 	MergeMethodRebase MergeMethod = "REBASE"
 )
+
+// MergeMethodFromDeclaration maps a workflow-v2 `merge_method` declaration (the
+// spec package's closed lowercase set squash | merge | rebase, E93.2 / #4658)
+// onto the forge MergeMethod. Any other value is an error, never a guessed
+// method: the caller fails closed.
+func MergeMethodFromDeclaration(declared string) (MergeMethod, error) {
+	switch declared {
+	case "squash":
+		return MergeMethodSquash, nil
+	case "merge":
+		return MergeMethodMerge, nil
+	case "rebase":
+		return MergeMethodRebase, nil
+	}
+	return "", fmt.Errorf("forge: unknown merge method declaration %q (want squash, merge or rebase)", declared)
+}
+
+// MergeMethodName is the lowercase closed-set name of a MergeMethod (squash,
+// merge, rebase) — the declaration vocabulary every operator-facing refusal
+// renders. An unknown method renders "" so a caller can never echo an
+// unvalidated value.
+func MergeMethodName(m MergeMethod) string {
+	switch m {
+	case MergeMethodSquash:
+		return "squash"
+	case MergeMethodMerge:
+		return "merge"
+	case MergeMethodRebase:
+		return "rebase"
+	}
+	return ""
+}
+
+// AllowedMergeMethods is which merge methods a repository (or a forge family)
+// can apply (E93.2 / #4658): the GitHub repository settings read, or the
+// static per-family table MergeMethodsForFamily.
+type AllowedMergeMethods struct {
+	Squash bool
+	Merge  bool
+	Rebase bool
+}
+
+// Allows reports whether m is allowed. An unknown method is NOT allowed.
+func (a AllowedMergeMethods) Allows(m MergeMethod) bool {
+	switch m {
+	case MergeMethodSquash:
+		return a.Squash
+	case MergeMethodMerge:
+		return a.Merge
+	case MergeMethodRebase:
+		return a.Rebase
+	}
+	return false
+}
+
+// Names lists the allowed members of the closed set {squash, merge, rebase} in
+// that fixed order — the only allowed-method rendering a refusal surface may
+// carry (never forge text). Never nil, so a refusal renders [] rather than
+// null when nothing is allowed.
+func (a AllowedMergeMethods) Names() []string {
+	out := []string{}
+	if a.Squash {
+		out = append(out, "squash")
+	}
+	if a.Merge {
+		out = append(out, "merge")
+	}
+	if a.Rebase {
+		out = append(out, "rebase")
+	}
+	return out
+}
+
+// MergeMethodsForFamily is the STATIC per-forge-family merge-method table
+// (E93.2 / #4658): which methods a family can apply per merge request,
+// independent of any repository setting. github: all three (each a
+// per-request GraphQL/REST merge method). gitlab: squash and merge only — the
+// merge API carries no merge method, so a per-request rebase is impossible
+// (the project's merge-method setting governs). Any other family has no static
+// knowledge and allows all three; such a run is refused by the server's forge
+// resolver before any forge call anyway. Every merge path consults this table
+// BEFORE its merge-dispatch claim (or merge call), so a statically impossible
+// declaration is refused with nothing claimed.
+func MergeMethodsForFamily(family string) AllowedMergeMethods {
+	if family == "gitlab" {
+		return AllowedMergeMethods{Squash: true, Merge: true}
+	}
+	return AllowedMergeMethods{Squash: true, Merge: true, Rebase: true}
+}
+
+// FamilyOfInstallationRef derives a run's forge family from its persisted
+// credential ref (run.InstallationRef) with the same ladder the server's
+// observationForgeID uses (pinned by a parity test there): nil, empty, or a
+// value with no ':' (the pre-0076 bare-decimal GitHub shape) is "github";
+// "<forge>:<id>" names that forge. Here so a package that cannot import the
+// server (the orchestrator) applies MergeMethodsForFamily to the same family
+// ForgeMerger routes on.
+func FamilyOfInstallationRef(ref *string) string {
+	if ref == nil || *ref == "" {
+		return "github"
+	}
+	if i := strings.Index(*ref, ":"); i >= 0 {
+		return (*ref)[:i]
+	}
+	return "github"
+}
 
 // BranchProtection is the classic branch-protection slice the dispatcher
 // needs.

@@ -13,6 +13,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -32,7 +33,15 @@ import (
 // with the head PINNED to the verified SHA.
 //
 // A non-approved fold never drops or ejects an entry carrying intent: it
-// waits at the head, then yields (ADR-112 R3, merge_queue_yield.go).
+// waits at the head, then yields (ADR-112 R3, merge_queue_yield.go). Nor
+// does a retryable merge-gate leg at step 4 (docs/adr/112 A3.2, #4780): a red
+// or cancelled required check (A3.1(a)) yields merge_checks_red /
+// retrigger_ci at once; pending, unreported or unreadable checks (A3.1(b))
+// and a settling implement-review round (A3.1(c)) hold the line on a
+// per-admission-epoch merge-gate window (mergeOnPassEnforceGateWait,
+// Store.GateWait), then yield merge_checks_pending / merge_review_pending.
+// These A3 paths all run BEFORE any dispatch claim; after a claim, ADR-112
+// R3 rows 4 and 5 (a forge refusal) are unchanged.
 //
 // It returns an OUTCOME the pump applies with the admission-epoch CAS; the one
 // queue write it makes itself is the merged settle after the forge accepted
@@ -72,10 +81,17 @@ const mergeDispatchPathQueue = "queue"
 // dispatch_failed; the returned claim is that existing one), and the forge
 // must then never be called. Any error is a failed claim: nothing is
 // dispatched. After a claim the forge outcome is classified ONCE
-// (classifyMergeDispatchOutcome): a RELEASE outcome (the forge applied
-// nothing) deletes the exact claim via ReleaseMergeDispatch, a compare-and-
-// swap; an UNCERTAIN one moves it to dispatch_failed (MarkMergeDispatchFailed),
+// (classifyMergeDispatchOutcome): a RELEASE outcome (the forge guarantees it
+// applied nothing: a typed refusal, and for a head mismatch only the precheck
+// and rest_sha bases) deletes the exact claim via ReleaseMergeDispatch, a
+// compare-and-swap; an UNCERTAIN one (a graphql_reread head mismatch
+// included, #4749) moves it to dispatch_failed (MarkMergeDispatchFailed),
 // never deleted, so only reconciliation or the operator re-arm clears it.
+// ADR-109 Amendment A1 (#4711) adds ONE automatic release: merge-on-pass step
+// 8 releases a crash-left QUEUE claim still 'dispatched' (the same CAS
+// DELETE) when the PR reads open and unmerged under the lock
+// (mergeOnPassReleaseOrphanedClaim); a dispatch_failed claim is never
+// released there.
 type mergeDispatchLedger interface {
 	ClaimMergeDispatch(ctx context.Context, runID uuid.UUID, path, headSHA string) (claim mergequeue.DispatchClaim, claimed bool, err error)
 	MarkMergeDispatchFailed(ctx context.Context, runID uuid.UUID, cause string) error
@@ -87,11 +103,16 @@ type mergeDispatchLedger interface {
 
 // mergeOnPassReconcileMerged reconciles a pull request the forge reports
 // merged against the run's D1 claim (ruling R1 reconciliation): settle merged
-// only when there is no claim, or the claim names the merged head; a
+// only when there is no claim, or the claim names the merged head
+// (mergeDispatchClaimNamesHead: the exact head, or the unresolved head an
+// inline/delegated claim records when the gate head is empty, #4617); a
 // dispatch_failed claim that reconciles appends merge_dispatch_settled
-// reconciled_merged. ok=false holds with reason: the claim could not be read,
-// or it names a different head than the one that merged. A nil ledger has no
-// claim to read.
+// reconciled_merged, at most once per run (appendReconciledMergedOnce).
+// ok=false holds with reason: the claim could not be read
+// (merged_claim_unread, #4748 M1: never transient, so the hold carries no
+// approval-wait ExpiryYield and an already-merged entry is never yielded), or
+// it names a different concrete head than the one that merged. A nil ledger
+// has no claim to read.
 func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string) {
 	ok, reason, detail, err := s.mergeOnPassReconcileMergedStrict(ctx, ledger, runID, mergedHead)
 	if err != nil {
@@ -103,19 +124,22 @@ func (s *Server) mergeOnPassReconcileMerged(ctx context.Context, ledger mergeDis
 
 // mergeOnPassReconcileMergedStrict is mergeOnPassReconcileMerged returning the
 // reconciled_merged row's append error (ok stays true: the reconcile decision
-// stands); the ADR-093 D8 resume holds on it (fail closed, ruling R8d).
+// stands); the ADR-093 D8 resume holds on it (fail closed, ruling R8d). A
+// reconciled_merged row already on the run's chain is not an error: the deduped
+// writer reports it as success, so a re-decide after a SettleAt CAS conflict
+// records the reconciliation once (#4617).
 func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger mergeDispatchLedger, runID uuid.UUID, mergedHead string) (ok bool, reason, detail string, appendErr error) {
 	if ledger == nil {
 		return true, "", "", nil
 	}
 	claim, found, err := ledger.MergeDispatch(ctx, runID)
 	if err != nil {
-		return false, mergeOnPassReasonTransient, "the pull request merged but the run's dispatch claim could not be read: " + err.Error(), nil
+		return false, mergeOnPassReasonMergedClaimUnread, "the pull request merged but the run's dispatch claim could not be read: " + err.Error(), nil
 	}
 	if !found {
 		return true, "", "", nil
 	}
-	if claim.HeadSHA != mergedHead {
+	if !mergeDispatchClaimNamesHead(claim, mergedHead) {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: the pull request merged at a head the run's dispatch claim does not name; holding",
 			slog.String("run_id", runID.String()), slog.String("claim_head_sha", claim.HeadSHA),
@@ -124,9 +148,27 @@ func (s *Server) mergeOnPassReconcileMergedStrict(ctx context.Context, ledger me
 			"the pull request merged at " + mergedHead + " but the run's dispatch claim (" + string(claim.State) + ", " + claim.Path + ") names " + claim.HeadSHA, nil
 	}
 	if claim.State == mergequeue.DispatchFailed {
-		appendErr = s.appendMergeDispatchSettledStrict(ctx, claim, mergeDispatchReconciledMerged, "the forge reports the pull request merged at the claim's head")
+		reason := "the forge reports the pull request merged at the claim's head"
+		if claim.HeadSHA == mergeDispatchClaimHeadUnresolved {
+			reason = "the forge reports the pull request merged at " + mergedHead + "; the claim recorded no head"
+		}
+		appendErr = s.appendReconciledMergedOnce(ctx, claim, reason)
 	}
 	return true, "", "", appendErr
+}
+
+// mergeDispatchClaimNamesHead reports whether a D1 claim names head, the head
+// the pull request merged at: the claim's recorded head equals it, or the
+// claim recorded mergeDispatchClaimHeadUnresolved. An unresolved claim
+// matches ANY merged head: no head was pinned or recorded and its dispatch was
+// unpinned, so the merged head cannot contradict the claim, and holding would
+// only delay the entry's pr_merged settle until the PR-resolution webhook
+// (#4617). A concrete claim head that differs still does not match. The ONE
+// predicate merge-on-pass reconciliation (mergeOnPassReconcileMergedStrict)
+// and the ADR-093 D8 resume's merged switch (mergeQueueResumeMergeLocked)
+// share.
+func mergeDispatchClaimNamesHead(claim mergequeue.DispatchClaim, head string) bool {
+	return claim.HeadSHA == head || claim.HeadSHA == mergeDispatchClaimHeadUnresolved
 }
 
 // mergeDispatchLedgerOutcome classifies a failed forge dispatch made after a D1
@@ -136,23 +178,71 @@ type mergeDispatchLedgerOutcome string
 const (
 	// mergeDispatchRelease: the forge guarantees nothing was applied (our own
 	// pre-call checks_pending refusal, a REST merge PUT 405 / 409 / 422, each a
-	// typed sentinel), so the claim is released and a later dispatch may claim
-	// again.
+	// typed sentinel, and a head mismatch only on the precheck or rest_sha
+	// basis), so the claim is released and a later dispatch may claim again.
+	// rest_sha labels ANY 409 on the pinned REST merge PUT, which GitHub
+	// documents as a sha mismatch; the PUT was refused either way and nothing
+	// merged (#4683).
 	mergeDispatchRelease mergeDispatchLedgerOutcome = "released"
 	// mergeDispatchUncertain: the merge may have been applied (5xx, timeout,
 	// transport error, ctx cancel, 403 that may be a rate limit, a generic
-	// GraphQL error envelope, anything else), so the claim moves to
-	// dispatch_failed.
+	// GraphQL error envelope, a head mismatch on the graphql_reread or an
+	// empty or unrecognised basis (#4749), anything else), so the claim moves
+	// to dispatch_failed. A pre-forge head-pin refusal
+	// (ErrHeadPinnedMergeUnsupported) is deliberately uncertain too, to stop a
+	// release re-dispatching into a deterministic refusal (#4683, see
+	// classifyMergeDispatchOutcome).
 	mergeDispatchUncertain mergeDispatchLedgerOutcome = "dispatch_failed"
 )
 
+// mergeDispatchHeadMismatchUncertain reports whether err carries a
+// *githubclient.HeadMismatchError whose basis is not a forge guarantee that
+// nothing applied (graphql_reread, an empty or unrecognised basis): such a
+// head mismatch is UNCERTAIN (#4749). A GraphQL execution error can
+// accompany an applied mutation, and a moved head proves only that the head
+// moved, not that the enable was refused. A bare forge.ErrMergeConflict with
+// no HeadMismatchError (the REST merge PUT 409, which GitHub documents as a
+// sha mismatch) is not a head-mismatch detail and is decided by the
+// typed-refusal case.
+func mergeDispatchHeadMismatchUncertain(err error) bool {
+	var hm *githubclient.HeadMismatchError
+	if !errors.As(err, &hm) {
+		return false
+	}
+	return !mergeHeadMovedNothingApplied(hm.Basis)
+}
+
 // classifyMergeDispatchOutcome is the ONE classification of a failed forge
 // dispatch after a claim, shared by the inline, delegated and queue paths.
+//
+// A pre-forge head-pin refusal (ErrHeadPinnedMergeUnsupported) sends no merge
+// but deliberately stays outside the release set (#4683): it is a
+// deterministic capability refusal, and a release would re-dispatch into it.
+// Inline and delegated reach it through dispatchMergeBounded ->
+// ForgeMerger.MergePullRequest's non-GitHub arm, on a non-empty pin; released,
+// inline would answer a 502 merge_dispatch_failed whose retry reproduces the
+// refusal, and delegated would report "merge dispatch failed" and re-claim
+// every tick. Merge-on-pass reaches it in step 9 through
+// ForgeMerger.MergePullRequestAtHead, for a leaf lacking the head-pinned
+// capability; released, the typed-refusal switch after the settle matches
+// none of its cases, so the run falls to the final transient hold and the
+// next pump claims at step 8 and dispatches again, breaking
+// mergeQueueMergeOnPass's own "never retries a forge refusal in a loop"
+// contract and ADR-093 D4. Kept uncertain, the settle answers dispatch_failed,
+// step 9 holds once, and every later pump meets step 8's already-dispatched
+// hold: the claim strands once, loudly. It is unreachable on the inline and
+// delegated paths because mergeCandidateGate's warnUngated arm gives a run
+// with no GitHub installation (every GitLab-family run) an empty gate head, so
+// its dispatch is unpinned.
 func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 	switch {
 	case err == nil:
 		return mergeDispatchUncertain
 	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return mergeDispatchUncertain
+	case mergeDispatchHeadMismatchUncertain(err):
+		// Before the typed-refusal case: the head mismatch rides on
+		// ErrMergeConflict, which would otherwise release.
 		return mergeDispatchUncertain
 	case errors.Is(err, forge.ErrPullRequestUnstableStatus),
 		errors.Is(err, forge.ErrPullRequestNotMergeable),
@@ -167,12 +257,28 @@ func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 
 // categoryMergeDispatchSettled records what became of a D1 dispatch claim
 // after a failed forge dispatch, or on reconciliation: outcome released,
-// dispatch_failed or reconciled_merged, with the path, head and reason.
+// dispatch_failed or reconciled_merged, with the path, head and reason. A
+// settle whose cause carries a *githubclient.HeadMismatchError also records
+// refusal_basis, expected_head_sha and observed_head_sha (#4749).
 const categoryMergeDispatchSettled = "merge_dispatch_settled"
 
 // Reconciliation outcome on merge_dispatch_settled: a dispatch_failed claim
-// whose PR the forge reports merged.
+// whose PR the forge reports merged. Recorded at most once per run
+// (appendReconciledMergedOnce).
 const mergeDispatchReconciledMerged = "reconciled_merged"
+
+// mergeDispatchClaimHeadUnresolved is the head an inline or delegated D1 claim
+// records when the gate head is empty (an ungated D7 admit, or a merged PR):
+// the claim is run-scoped and its dispatch is unpinned. Queue claims never
+// record it: merge-on-pass step 8 and ADR-109 Amendment A1's re-claim (#4711)
+// both claim at the entry's non-empty head. mergeDispatchClaimNamesHead lets
+// such a claim reconcile against whatever head the PR merged at (#4617).
+const mergeDispatchClaimHeadUnresolved = "unresolved"
+
+// mergeDispatchReasonReleasedOrphanedClaim is the merge_dispatch_settled
+// reason (outcome released) for ADR-109 Amendment A1's release of an orphaned
+// queue claim in merge-on-pass step 8 (#4711).
+const mergeDispatchReasonReleasedOrphanedClaim = "released_orphaned_claim"
 
 // mergeDispatchRecordTimeout bounds the post-dispatch ledger write, which
 // runs on context.WithoutCancel so a cancelled request or an expired parent
@@ -184,7 +290,9 @@ const mergeDispatchRecordTimeout = 10 * time.Second
 // claim) or dispatch_failed. The write runs on context.WithoutCancel(ctx) with
 // mergeDispatchRecordTimeout, then an audit row (categoryMergeDispatchSettled)
 // is appended best-effort; an uncertain outcome logs at WARN. A release that
-// did not land is reported as uncertain: the claim was not deleted.
+// did not land is reported as uncertain: the claim was not deleted. The
+// returned outcome is the ledger state the claim was LEFT in, so a caller
+// reporting the claim reads it, never a re-derived classification.
 func (s *Server) settleMergeDispatchClaim(ctx context.Context, ledger mergeDispatchLedger, claim mergequeue.DispatchClaim, cause error) mergeDispatchLedgerOutcome {
 	outcome := classifyMergeDispatchOutcome(cause)
 	wctx, cancel := context.WithTimeout(context.WithoutCancel(ctx), mergeDispatchRecordTimeout)
@@ -208,17 +316,39 @@ func (s *Server) settleMergeDispatchClaim(ctx context.Context, ledger mergeDispa
 			slog.String("run_id", claim.RunID.String()), slog.String("path", claim.Path),
 			slog.String("head_sha", claim.HeadSHA), slog.String("error", cause.Error()))
 	}
-	s.appendMergeDispatchSettled(wctx, claim, string(outcome), cause.Error())
+	s.appendMergeDispatchSettledRow(wctx, claim, string(outcome), cause.Error(), mergeDispatchHeadMismatchDetail(cause))
 	return outcome
+}
+
+// mergeDispatchHeadMismatchDetail is the head-movement detail a settle
+// records as separate merge_dispatch_settled keys (#4749) when cause carries
+// a *githubclient.HeadMismatchError: refusal_basis, expected_head_sha and
+// observed_head_sha (empty when the forge did not report it). nil otherwise.
+func mergeDispatchHeadMismatchDetail(cause error) map[string]any {
+	var hm *githubclient.HeadMismatchError
+	if !errors.As(cause, &hm) {
+		return nil
+	}
+	return map[string]any{
+		"refusal_basis":     hm.Basis,
+		"expected_head_sha": hm.ExpectedHeadSHA,
+		"observed_head_sha": hm.ObservedHeadSHA,
+	}
 }
 
 // appendMergeDispatchSettled appends the categoryMergeDispatchSettled row,
 // best-effort (the ledger write is the authority).
 func (s *Server) appendMergeDispatchSettled(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string) {
+	s.appendMergeDispatchSettledRow(ctx, claim, outcome, reason, nil)
+}
+
+// appendMergeDispatchSettledRow is appendMergeDispatchSettled with optional
+// extra payload keys; the base keys (outcome, path, head_sha, reason) win.
+func (s *Server) appendMergeDispatchSettledRow(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) {
 	if s.cfg.AuditRepo == nil {
 		return
 	}
-	if err := s.appendMergeDispatchSettledStrict(ctx, claim, outcome, reason); err != nil {
+	if err := s.appendMergeDispatchSettledPayload(ctx, claim, outcome, reason, extra); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge dispatch: the merge_dispatch_settled row did not land",
 			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
 	}
@@ -228,21 +358,93 @@ func (s *Server) appendMergeDispatchSettled(ctx context.Context, claim mergequeu
 // row and returns the append error: the ADR-093 D8 resume writes it BEFORE
 // its ledger transition and holds on a failure (fail closed, ruling R8d).
 func (s *Server) appendMergeDispatchSettledStrict(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string) error {
+	return s.appendMergeDispatchSettledPayload(ctx, claim, outcome, reason, nil)
+}
+
+// appendMergeDispatchSettledPayload appends one merge_dispatch_settled row
+// built by mergeDispatchSettledParams, returning the append error.
+func (s *Server) appendMergeDispatchSettledPayload(ctx context.Context, claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) error {
 	if s.cfg.AuditRepo == nil {
 		return errors.New("merge_dispatch_settled: no audit repository is wired")
 	}
-	payload, _ := json.Marshal(map[string]any{
-		"outcome": outcome, "path": claim.Path, "head_sha": claim.HeadSHA, "reason": reason,
-	})
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, mergeDispatchSettledParams(claim, outcome, reason, extra))
+	return err
+}
+
+// mergeDispatchSettledParams is the one merge_dispatch_settled row builder:
+// any extra keys first, then the base keys (outcome, path, head_sha, reason)
+// win, under the system actor mergeCandidateSystemSubject.
+func mergeDispatchSettledParams(claim mergequeue.DispatchClaim, outcome, reason string, extra map[string]any) audit.ChainAppendParams {
+	fields := make(map[string]any, len(extra)+4)
+	for k, v := range extra {
+		fields[k] = v
+	}
+	fields["outcome"], fields["path"], fields["head_sha"], fields["reason"] = outcome, claim.Path, claim.HeadSHA, reason
+	payload, _ := json.Marshal(fields)
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
-	_, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
+	return audit.ChainAppendParams{
 		RunID:        claim.RunID,
 		Timestamp:    time.Now().UTC(),
 		Category:     categoryMergeDispatchSettled,
 		ActorKind:    &kind,
 		ActorSubject: &subject,
 		Payload:      payload,
-	})
+	}
+}
+
+// appendReconciledMergedOnce is the ONE writer of merge_dispatch_settled
+// outcome reconciled_merged (#4617): merge-on-pass reconciliation
+// (mergeOnPassReconcileMergedStrict), the ADR-093 D8 resume's merged tail
+// (mergeQueueResumeMergedTail) and the inline claim's reconciliation
+// (claimInlineMergeDispatch) all route through it. The dedupe key is (run,
+// outcome): a PR merges once, so every reconciled_merged row on a run
+// describes the same merge. A row already recorded is success (nil), so a
+// re-decide after a SettleAt CAS conflict, or a resume after an earlier
+// reconcile, never appends a second row nor holds.
+//
+// Capability path: a repository implementing audit.DedupedChainAppender (the
+// production Postgres repository) scans and appends in ONE transaction under
+// the run-row lock; a *audit.DedupedDuplicateError is the already-recorded
+// branch (nil, with a DEBUG line naming the surviving sequence). Fallback (the
+// in-memory fakes): list the category, audit.CheckDedupeSpec, then append. It
+// is NOT atomic, and a list error logs WARN and proceeds: a duplicate row is
+// the lesser harm than a lost one (the appendRetirementDropOnce posture). The
+// residual is stated plainly: only the Postgres path is atomic.
+func (s *Server) appendReconciledMergedOnce(ctx context.Context, claim mergequeue.DispatchClaim, reason string) error {
+	if s.cfg.AuditRepo == nil {
+		return errors.New("merge_dispatch_settled: no audit repository is wired")
+	}
+	spec := audit.DedupeSpec{PayloadKey: "outcome", PayloadValue: mergeDispatchReconciledMerged}
+	p := mergeDispatchSettledParams(claim, mergeDispatchReconciledMerged, reason, nil)
+	alreadyRecorded := func(err error) bool {
+		var dup *audit.DedupedDuplicateError
+		if !errors.As(err, &dup) {
+			return false
+		}
+		var existing int64
+		if dup.Existing != nil {
+			existing = dup.Existing.Sequence
+		}
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+			"merge dispatch: reconciled_merged is already recorded for this run; no second row is appended",
+			slog.String("run_id", claim.RunID.String()), slog.Int64("existing_sequence", existing))
+		return true
+	}
+	if d, ok := s.cfg.AuditRepo.(audit.DedupedChainAppender); ok {
+		_, err := d.AppendChainedDeduped(ctx, p, spec)
+		if alreadyRecorded(err) {
+			return nil
+		}
+		return err
+	}
+	if entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, claim.RunID, categoryMergeDispatchSettled); err != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge dispatch: listing merge_dispatch_settled failed; appending reconciled_merged without the idempotency guard",
+			slog.String("run_id", claim.RunID.String()), slog.String("error", err.Error()))
+	} else if err := audit.CheckDedupeSpec(entries, &p, spec); alreadyRecorded(err) {
+		return nil
+	}
+	_, err := s.cfg.AuditRepo.AppendChained(ctx, p)
 	return err
 }
 
@@ -281,19 +483,42 @@ const (
 	// outside the lock); the pump continues to the next held entry.
 	mergeOnPassYield mergeOnPassKind = "yield"
 	// mergeOnPassRedecide (ADR-093 D8): the restart resume returned a merging
-	// entry with NO dispatch claim to phase passed; the pump continues, and
-	// ordinary merge-on-pass decides from scratch (fold and veto in-lock).
+	// entry with NO dispatch claim, or with an orphaned queue claim whose PR
+	// reads open (ADR-109 A1, released in step 8), to phase passed; the pump
+	// continues, and ordinary merge-on-pass decides (fold and veto in-lock).
 	mergeOnPassRedecide mergeOnPassKind = "redecide"
+	// mergeOnPassExpiredYielded (ADR-112 R3, #4748): the expired-wait
+	// enforcement (mergeOnPassEnforceExpiredWait) or the merge-gate wait
+	// enforcement (mergeOnPassEnforceGateWait, docs/adr/112 A3.2) yielded the
+	// entry under the run's merge-intent lock instead of applying a
+	// readvance, a hold or a merge-gate wait; the pump continues to the next
+	// held entry.
+	mergeOnPassExpiredYielded mergeOnPassKind = "expired_yielded"
+	// mergeOnPassAwaitGate (docs/adr/112 A3.2, #4780): step 4 read a
+	// retryable merge-gate leg (A3.1) and nothing non-retryable. An AWAIT
+	// kind, never mergeOnPassHeld: Yield is the step-4 yield
+	// (mergeGateYieldFor). Immediate (A3.1(a) red) yields at once;
+	// otherwise ((b) pending, (c) review) the entry holds the line on the
+	// epoch's merge-gate window (Store.GateWait) and yields at its expiry
+	// or with no hold token left. mergeOnPassEnforceGateWait applies it.
+	mergeOnPassAwaitGate mergeOnPassKind = "await_gate"
 )
 
 // mergeOnPassOutcome is mergeQueueMergeOnPass's answer. State is set only on
 // mergeOnPassSettle (and mergeOnPassMerged: StateMerged); Yield only on
-// mergeOnPassAwaitApproval and mergeOnPassYield (Reason is then Yield.Reason).
+// mergeOnPassAwaitApproval, mergeOnPassAwaitGate and mergeOnPassYield (Reason
+// is then Yield.Reason).
 // ForgeReason and ForgeDetail are set only on a forge_merge_refused ejection
 // (ADR-093 D4): the typed refusal code and the forge's untrusted refusal text,
 // which the merge_queue_ejected writer sanitises. InFlightMarked reports that
 // THIS decision marked the run in s.mergeInFlight (ADR-093 D8), so the pump
-// clears only its own mark.
+// clears only its own mark. ExpiryYield (ADR-112 R3, #4748) is the yield the
+// expired-wait enforcement applies INSTEAD of this outcome when the entry's
+// ESTABLISHED approval wait has expired: it is set only on readvance and
+// transient-hold outcomes (every head_moved and base_moved readvance, and
+// every mergeOnPassReasonTransient hold), never by the ADR-093 D8 resume
+// (merge_queue_resume.go keeps its own closures). A post-claim outcome may
+// carry it too; InFlightMarked makes the enforcement skip it.
 type mergeOnPassOutcome struct {
 	Kind          mergeOnPassKind
 	State         mergequeue.State
@@ -307,20 +532,32 @@ type mergeOnPassOutcome struct {
 	ForgeDetail   string
 	// InFlightMarked: this decision marked s.mergeInFlight for the run.
 	InFlightMarked bool
+	// ExpiryYield: the yield an expired approval wait applies (nil: none).
+	ExpiryYield *mergeQueueYield
+	// GateRemaining (mergeOnPassAwaitGate only): the open merge-gate
+	// window's remaining time, for the pump's wait log.
+	GateRemaining time.Duration
+	// Immediate (mergeOnPassAwaitGate only, docs/adr/112 A3.2): the
+	// merge-gate yield is (a) red and yields at once, with no window.
+	Immediate bool
 }
 
 // Merge-on-pass reasons. Hold reasons leave the entry; eject/drop reasons are
 // the queue's (mergequeue README § "Reasons").
 const (
-	mergeOnPassReasonNoIntent              = "no_merge_intent"
-	mergeOnPassReasonNotLive               = "not_live"
-	mergeOnPassReasonNotPassed             = "not_passed"
-	mergeOnPassReasonNoPinnedMerge         = "no_pinned_merge"
-	mergeOnPassReasonTransient             = "transient"
-	mergeOnPassReasonVerifyNotPassed       = "verify_not_passed"
-	mergeOnPassReasonNotMergeable          = "not_mergeable_yet"
-	mergeOnPassReasonEntryChanged          = "entry_changed"
-	mergeOnPassReasonMergedClaimMismatch   = "merged_claim_head_mismatch"
+	mergeOnPassReasonNoIntent            = "no_merge_intent"
+	mergeOnPassReasonNotLive             = "not_live"
+	mergeOnPassReasonNotPassed           = "not_passed"
+	mergeOnPassReasonNoPinnedMerge       = "no_pinned_merge"
+	mergeOnPassReasonTransient           = "transient"
+	mergeOnPassReasonVerifyNotPassed     = "verify_not_passed"
+	mergeOnPassReasonNotMergeable        = "not_mergeable_yet"
+	mergeOnPassReasonEntryChanged        = "entry_changed"
+	mergeOnPassReasonMergedClaimMismatch = "merged_claim_head_mismatch"
+	// mergeOnPassReasonMergedClaimUnread (#4748 M1): the pull request merged
+	// and the run's dispatch claim could not be read. Not transient: the
+	// hold carries no ExpiryYield, so an expired wait never yields a merged PR.
+	mergeOnPassReasonMergedClaimUnread     = "merged_claim_unread"
 	mergeOnPassReasonInlineMergeDispatched = "inline_merge_dispatched"
 	mergeOnPassReasonOverlapRefused        = "overlap_refused"
 	mergeOnPassReasonIntentRowMissing      = "intent_row_missing"
@@ -331,6 +568,10 @@ const (
 	mergeOnPassReasonBaseMoved             = "base_moved"
 	mergeOnPassReasonHeadMoved             = "head_moved"
 	mergeOnPassReasonForgeHeadMismatch     = "forge_head_mismatch"
+	// mergeOnPassReasonOrphanReleaseFailed (ADR-109 A1, #4711): step 8 judged
+	// the run's queue claim orphaned but its merge_dispatch_settled row or
+	// its release did not land. Not transient: no approval-wait ExpiryYield.
+	mergeOnPassReasonOrphanReleaseFailed = "orphaned_claim_release_failed"
 	// mergeOnPassReasonAuthorizationUnrecorded: the fold approved but the
 	// merge_queue_authorized append failed (ADR-112 R4): no verdict row, no
 	// claim; the next pump re-decides.
@@ -414,13 +655,18 @@ func (s *Server) mergeOnPassReadPR(ctx context.Context, t mergeOnPassTarget) (*f
 func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassRequest) mergeOnPassOutcome {
 	e := req.Entry
 	held := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+		out := mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+		if reason == mergeOnPassReasonTransient { // ADR-112 R3 (#4748): an approval-uncertain hold carries its expiry yield
+			out.ExpiryYield = mergeOnPassUndeterminedExpiryYield(reason, detail)
+		}
+		return out
 	}
 	settle := func(state mergequeue.State, reason, detail string) mergeOnPassOutcome {
 		return mergeOnPassOutcome{Kind: mergeOnPassSettle, State: state, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
 	}
 	readvance := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA}
+		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: e.AnchoredHeadSHA,
+			ExpiryYield: mergeOnPassUndeterminedExpiryYield(reason, detail)} // ADR-112 R3 (#4748)
 	}
 
 	if e.MergeIntentAt == nil { // ADR-093: merge-on-pass needs the operator's merge intent
@@ -450,6 +696,18 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 	}
 	if runRow.State.IsTerminal() {
 		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonRunTerminal, "the run is "+string(runRow.State))
+	}
+	// E93.2 / #4658: the pre-lock merge-method refusal, right after the run
+	// read and BEFORE the installation guard, the PR read, eligibility, the
+	// republish and the merge-intent lock (so before the fold, the verdict,
+	// SetPhase(merging) and the claim). An EJECT, not a hold: the run's
+	// admission declaration never changes, so a hold would block the head of
+	// the line forever (the verify_failed eject below is the pre-lock
+	// precedent). Detail and ForgeDetail are field-built, never forge text.
+	if ref := staticMergeMethodRefusal(runRow); ref != nil {
+		out := settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused, ref.FieldDetail())
+		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonMergeMethodRefused, ref.FieldDetail()
+		return out
 	}
 	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
 		return held(mergeOnPassReasonTransient, "the run has no installation to read its pull request")
@@ -496,12 +754,23 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 		return held(mergeOnPassReasonVerifyNotPassed, "the head's merge-candidate verify state is "+st.State)
 	}
 
-	// 4. Eligibility, merge variant, with the intent anchor (D6 transfer).
+	// 4. Eligibility, merge variant, with the intent anchor (D6 transfer),
+	// classified onto docs/adr/112 A3.1's legs (A3.2): an undeterminable
+	// non-check leg holds (the merge variant answers every checks-read
+	// failure as checks_not_green, so this is never a check read; A3
+	// residual); any non-retryable determined reason drops, even beside a
+	// retryable one; otherwise the retryable legs await the merge gate:
+	// (a) red yields at once, (b) pending and (c) review hold on the epoch's
+	// window (mergeOnPassEnforceGateWait). Never a drop for a retryable leg.
 	anchor := mergeQueueIntentAnchor{Sequence: req.IntentSequence, BaseRef: e.BaseRef}
 	elig := s.mergeQueueMergeEligibility(ctx, runRow, head, anchor)
 	if !elig.Eligible {
-		if elig.Undeterminable || onlyChecksNotGreen(elig) {
+		legs := mergeGateLegsOf(elig)
+		if legs.Undeterminable {
 			return held(mergeOnPassReasonNotMergeable, mergeQueueReasonsText(elig.Reasons))
+		}
+		if y, ok := mergeGateYieldFor(legs, elig); ok && !legs.Other {
+			return mergeOnPassOutcome{Kind: mergeOnPassAwaitGate, Reason: y.Reason, Detail: y.Detail, HeadSHA: head, Yield: y, Immediate: legs.Red}
 		}
 		return settle(mergequeue.StateDropped, mergeCandidateQueueReasonNotMergeEligible,
 			"the run is no longer merge-queue eligible ("+mergeQueueReasonsText(elig.Reasons)+"); fishhawk_merge_run re-enqueues it at the tail once it is")
@@ -535,18 +804,85 @@ func (s *Server) mergeQueueMergeOnPass(ctx context.Context, req mergeOnPassReque
 	return out
 }
 
-// onlyChecksNotGreen reports a result whose every reason is checks_not_green
-// (a pending check: hold, never drop).
-func onlyChecksNotGreen(r mergeQueueEligibilityResult) bool {
-	if len(r.Reasons) == 0 {
-		return false
+// mergeQueueGateWait is the configured merge-gate window (docs/adr/112
+// A3.2): Config.MergeQueueGateWait when positive, else the approval wait.
+func (s *Server) mergeQueueGateWait() time.Duration {
+	if s.cfg.MergeQueueGateWait > 0 {
+		return s.cfg.MergeQueueGateWait
 	}
-	for _, x := range r.Reasons {
-		if x.Code != mergeQueueReasonChecksNotGreen {
-			return false
+	return s.mergeQueueApprovalWait()
+}
+
+// mergeOnPassEnforceGateWait applies a step-4 await_gate outcome (docs/adr/112
+// A3.2, #4780); any other kind is returned unchanged. Immediate ((a) red) goes
+// straight to the protected yield. Otherwise ((b) pending, (c) review)
+// Store.GateWait opens or continues the epoch's merge-gate window OUTSIDE the
+// merge-intent lock: a write error holds (the pump stops, the next pump
+// re-decides); an open, unexpired window returns o (the entry holds the line,
+// the base frozen); Expired or NoToken (the hold budget is empty) yields.
+//
+// The protected yield takes the run's merge-intent lock, runs the pre-yield
+// refusal (mergeOnPassPreYieldRefusal: entry re-read, in-flight registry, D1
+// claim; a refusal holds with no yield), re-judges GateWait for a window
+// (idempotent within the epoch: it continues, never spends) and yields o.Yield
+// through yieldMergeQueueEntry, answering mergeOnPassExpiredYielded. It never
+// calls ApprovalWait: a merge-gate hold never touches approval_wait_started_at.
+func (s *Server) mergeOnPassEnforceGateWait(ctx context.Context, req mergeOnPassRequest, o mergeOnPassOutcome) mergeOnPassOutcome {
+	if o.Kind != mergeOnPassAwaitGate {
+		return o
+	}
+	e := req.Entry
+	if !o.Immediate {
+		res, err := s.cfg.MergeQueue.GateWait(ctx, e.ID, e.AdmissionEpoch, s.mergeQueueGateWait())
+		if err != nil {
+			return mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonEntryChanged, "the merge-gate wait could not be recorded: "+err.Error())
+		}
+		if !res.Expired && !res.NoToken {
+			o.GateRemaining = res.Remaining
+			return o
 		}
 	}
-	return true
+	out, ran := o, false
+	lockErr := s.withRunMergeLock(ctx, e.RunID, func(lctx context.Context) error {
+		ran = true
+		if h := s.mergeOnPassPreYieldRefusal(lctx, req); h != nil {
+			out = *h
+			return nil
+		}
+		cur := e
+		if !o.Immediate {
+			res, err := s.cfg.MergeQueue.GateWait(lctx, e.ID, e.AdmissionEpoch, s.mergeQueueGateWait())
+			if err != nil {
+				out = mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonEntryChanged, "the merge-gate wait could not be judged: "+err.Error())
+				return nil
+			}
+			if !res.Expired && !res.NoToken {
+				out.GateRemaining = res.Remaining
+				return nil
+			}
+			cur = res.Entry
+		}
+		if !s.yieldMergeQueueEntry(lctx, cur, o.Yield, mergeQueueYieldSiteMergeOnPass) {
+			out = mergeOnPassExpiredWaitHeld(cur, mergeOnPassReasonEntryChanged, "the merge-gate yield did not land")
+			return nil
+		}
+		out = mergeOnPassOutcome{Kind: mergeOnPassExpiredYielded, Reason: o.Yield.Reason, Detail: o.Yield.Detail, HeadSHA: cur.AnchoredHeadSHA, Yield: o.Yield}
+		return nil
+	})
+	if !ran {
+		detail := "the run's merge-intent lock could not be taken to yield the merge-gate wait"
+		if lockErr != nil {
+			detail += ": " + lockErr.Error()
+		}
+		return mergeOnPassExpiredWaitHeld(e, mergeOnPassReasonLockUnavailable, detail)
+	}
+	if lockErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge queue: the merge-gate wait enforcement's lock lapsed after its judgement ran; its writes stand",
+			slog.String("run_id", e.RunID.String()), slog.String("outcome", string(out.Kind)),
+			slog.String("error", lockErr.Error()))
+	}
+	return out
 }
 
 // mergeOnPassLocked is the locked half of mergeQueueMergeOnPass. ctx carries
@@ -562,10 +898,15 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	// basis is the fold's (step 6b); "" until the fold ran.
 	basis := ""
 	held := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+		out := mergeOnPassOutcome{Kind: mergeOnPassHeld, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+		if reason == mergeOnPassReasonTransient { // ADR-112 R3 (#4748): an approval-uncertain hold carries its expiry yield
+			out.ExpiryYield = mergeOnPassUndeterminedExpiryYield(reason, detail)
+		}
+		return out
 	}
 	readvance := func(reason, detail string) mergeOnPassOutcome {
-		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
+		return mergeOnPassOutcome{Kind: mergeOnPassReadvance, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis,
+			ExpiryYield: mergeOnPassUndeterminedExpiryYield(reason, detail)} // ADR-112 R3 (#4748)
 	}
 	settle := func(state mergequeue.State, reason, detail string) mergeOnPassOutcome {
 		return mergeOnPassOutcome{Kind: mergeOnPassSettle, State: state, Reason: reason, Detail: detail, HeadSHA: head, ApprovalBasis: basis}
@@ -655,21 +996,53 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	}
 	baseMoved := len(behind) > 0 // ADR-093 D3 base re-probe
 	if baseMoved {
-		return readvance(mergeOnPassReasonBaseMoved, e.BaseRef+" moved past the verified head "+head)
+		// ADR-112 R3 (#4748): an entry with NO established approval wait
+		// re-advances with the generic ExpiryYield and no fold read. An
+		// anchored entry first runs the fold at head, writing nothing, so an
+		// expiry yield names the real reason. R4: this path yields ONLY on
+		// expiry, a qualified veto included; a veto's immediate yield stays
+		// at step 6b on the entry's next pass.
+		out := readvance(mergeOnPassReasonBaseMoved, e.BaseRef+" moved past the verified head "+head)
+		if cur.Entry.ApprovalWaitStartedAt == nil {
+			return out
+		}
+		// ADR-112 R3: an established wait judges the fold before re-advancing.
+		fold, ferr := s.forgeApprovalFold(ctx, runRow, head)
+		switch {
+		case ferr != nil:
+			y := mergeOnPassSnapshotUndeterminedYield(ferr)
+			out.ExpiryYield = &y
+		case fold.Merged:
+			if ok, reason, detail := s.mergeOnPassReconcileMerged(ctx, req.Ledger, e.RunID, fold.ObservedHead); !ok {
+				return held(reason, detail)
+			}
+			return settle(mergequeue.StateMerged, mergeCandidateQueueReasonPRMerged, "the pull request is already merged")
+		case fold.Reason == forgeApprovalReasonHeadMoved:
+			return readvance(mergeOnPassReasonHeadMoved, fold.Detail)
+		case fold.approved():
+			out.ExpiryYield = nil // the fold approved: no wait to enforce
+		default:
+			y, _ := mergeOnPassFoldYield(fold) // #4748 R4: the base-move path yields only on expiry; a veto's immediate yield stays at step 6b
+			out.ExpiryYield = &y
+		}
+		return out
 	}
 
 	// 6b. ADR-112 (#4619): the ONE forge-approval fold at the verified head,
 	// AFTER the base re-probe and BEFORE the verdict, the single source of
-	// approvals and vetoes on this path. A snapshot transport failure holds
-	// (a read failure, not a decision: nothing is written); a head the
-	// snapshot reports moved re-advances (H1); every other non-approved
-	// result WAITS at the head or YIELDS (ADR-112 R3, mergeOnPassFoldYield;
-	// the pump applies either outside this lock) with no verdict row, no
-	// authorization row and no claim. An approved fold on a declared gate
-	// writes merge_queue_authorized BEFORE the verdict; a failed append holds.
+	// approvals and vetoes on this path. A snapshot transport failure is an
+	// UNDETERMINED approval result (#4748): it WAITS at the head through the
+	// ordinary await_approval path (the pump stamps or continues the anchor
+	// with Store.ApprovalWait), then yields forge_approval_undetermined at
+	// expiry; a head the snapshot reports moved re-advances (H1); every other
+	// non-approved result WAITS at the head or YIELDS (ADR-112 R3,
+	// mergeOnPassFoldYield; the pump applies either outside this lock). None
+	// of these writes a verdict row, an authorization row or a claim. An
+	// approved fold on a declared gate writes merge_queue_authorized BEFORE
+	// the verdict; a failed append holds.
 	fold, ferr := s.forgeApprovalFold(ctx, runRow, head)
 	if ferr != nil {
-		return held(mergeOnPassReasonTransient, sanitizeForgeReadDetail("review_snapshot", ferr.Error()))
+		return yield(mergeOnPassAwaitApproval, mergeOnPassSnapshotUndeterminedYield(ferr))
 	}
 	basis = fold.Basis
 	switch {
@@ -702,7 +1075,8 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return held(mergeOnPassReasonVerdictUnrecorded, "the merge verdict could not be recorded (record before commit): "+err.Error())
 	}
 
-	// 8. Approval condition D1: claim the run's ONE merge dispatch.
+	// 8. Approval condition D1: claim the run's ONE merge dispatch (an
+	// orphaned queue claim is released first: ADR-109 A1, below).
 	if req.Ledger == nil {
 		return held(mergeOnPassReasonLedgerUnavailable, "no merge-dispatch ledger is wired, so no dispatch can be claimed")
 	}
@@ -733,6 +1107,23 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	claim, claimed, err := req.Ledger.ClaimMergeDispatch(ctx, e.RunID, mergeDispatchPathQueue, head)
 	if err != nil {
 		return held(mergeOnPassReasonTransient, "the merge dispatch could not be claimed: "+err.Error())
+	}
+	if !claimed {
+		// ADR-109 Amendment A1 (#4711): steps 1-7 of THIS decision re-read the
+		// entry and an open, unmerged PR, and re-ran the head, base, fold, R4
+		// authorization and verdict under the lock, so a crash-left queue
+		// claim still 'dispatched' is released here and claimed afresh; the
+		// merge below is the ordinary one (no bespoke retry).
+		released, reason, detail := s.mergeOnPassReleaseOrphanedClaim(ctx, req.Ledger, claim)
+		if reason != "" {
+			return held(reason, detail)
+		}
+		if released {
+			claim, claimed, err = req.Ledger.ClaimMergeDispatch(ctx, e.RunID, mergeDispatchPathQueue, head)
+			if err != nil {
+				return held(mergeOnPassReasonTransient, "the merge dispatch could not be claimed after the orphaned claim's release: "+err.Error())
+			}
+		}
 	}
 	if !claimed {
 		// Reconciliation (ruling R1) is the pre-lock and in-lock PR reads
@@ -779,18 +1170,65 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		// ADR-093 D4 (a forge merge refusal ejects naming the forge's reason
 		// and never retries in a loop): the unstable-status refusal ejects
 		// checks_not_settled like the 405/422 arms instead of holding as
-		// transient, which let the next pump claim and dispatch again. Pending
-		// checks still HOLD before dispatch (onlyChecksNotGreen above): slow
-		// CI never ejects; only the forge's own refusal of the merge PUT does.
+		// transient, which let the next pump claim and dispatch again. Before
+		// dispatch, step 4 never drops or ejects on a retryable merge-gate leg
+		// (docs/adr/112 A3.2): pending checks hold on the merge-gate window and
+		// then yield merge_checks_pending, red checks yield merge_checks_red,
+		// so slow CI never ejects; only the forge's own refusal of the merge
+		// PUT does.
+		// E93.2 / #4658: a refusal ForgeMerger attributed to the run's merge
+		// method renders from its closed-set fields only (FieldDetail), never
+		// mergeErr.Error() or its Cause.
+		refusalText := mergeErr.Error()
+		var mref *MergeMethodRefusalError
+		if errors.As(mergeErr, &mref) {
+			refusalText = mref.FieldDetail()
+		}
 		out := settle(mergequeue.StateEjected, mergeCandidateQueueReasonForgeMergeRefused,
-			"the forge refused the pinned merge ("+mergeErr.Error()+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
-		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonFor(mergeErr), mergeErr.Error()
+			"the forge refused the pinned merge ("+refusalText+"); the dispatch claim was released; resolve it, then re-invoke fishhawk_merge_run")
+		out.ForgeReason, out.ForgeDetail = mergeQueueForgeReasonFor(mergeErr), refusalText
 		if out.ForgeReason == mergeQueueForgeReasonChecksNotSettled {
-			out.ForgeDetail = mergeQueueChecksNotSettledDetail + mergeErr.Error()
+			out.ForgeDetail = mergeQueueChecksNotSettledDetail + mergeQueueYieldDetail(mergeErr.Error())
 		}
 		return out
 	}
 	return held(mergeOnPassReasonTransient, "the pinned merge failed: "+mergeErr.Error())
+}
+
+// mergeOnPassReleaseOrphanedClaim is ADR-109 Amendment A1's release arm
+// (#4711), called from merge-on-pass step 8 when the run's claim already
+// exists. It acts ONLY on a QUEUE-path claim still 'dispatched' and
+// crash-left on the database clock (mergeQueueClaimCrashLeft: older than
+// mergeQueueCrashLeftClaimAge; a zero claimed_at fails closed); an inline,
+// delegated or dispatch_failed claim, or a young one, returns
+// (false, "", ""): the caller's merge_already_dispatched hold. For an orphan
+// the strict merge_dispatch_settled {released, released_orphaned_claim} row
+// is appended FIRST (record before action), then ReleaseMergeDispatch, the
+// exact-claim CAS DELETE on state 'dispatched'. Either failure returns
+// orphaned_claim_release_failed with the claim standing (an append failure
+// changes nothing; a release failure leaves the row before a claim the next
+// decision re-judges). released=true: the claim is gone and the caller
+// claims afresh.
+func (s *Server) mergeOnPassReleaseOrphanedClaim(ctx context.Context, ledger mergeDispatchLedger, claim mergequeue.DispatchClaim) (released bool, holdReason, detail string) {
+	if claim.Path != mergeDispatchPathQueue || claim.State != mergequeue.DispatchDispatched {
+		return false, "", ""
+	}
+	if aged, _ := s.mergeQueueClaimCrashLeft(ctx, claim); !aged {
+		return false, "", ""
+	}
+	if err := s.appendMergeDispatchSettledStrict(ctx, claim, string(mergeDispatchRelease), mergeDispatchReasonReleasedOrphanedClaim); err != nil {
+		return false, mergeOnPassReasonOrphanReleaseFailed,
+			"the orphaned queue claim's merge_dispatch_settled row could not be recorded, so the claim was not released: " + err.Error()
+	}
+	if err := ledger.ReleaseMergeDispatch(ctx, claim); err != nil {
+		return false, mergeOnPassReasonOrphanReleaseFailed,
+			"the orphaned queue claim could not be released and still stands: " + err.Error()
+	}
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+		"merge queue: released an orphaned queue dispatch claim whose pull request reads open and unmerged (ADR-109 A1); claiming afresh",
+		slog.String("run_id", claim.RunID.String()), slog.String("path", claim.Path),
+		slog.String("head_sha", claim.HeadSHA), slog.Time("claimed_at", claim.ClaimedAt))
+	return true, "", ""
 }
 
 // mergeOnPassRefusalNeedsReview is ADR-112 R3 rows 4/5 after a TYPED forge

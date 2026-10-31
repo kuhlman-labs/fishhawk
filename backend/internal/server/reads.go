@@ -482,12 +482,16 @@ func (s *Server) handleListRunAudit(w http.ResponseWriter, r *http.Request) {
 	// the check for a legitimately-unlisted category. Parsed before the
 	// category-filter branch below; the no-category path is unaffected.
 	if category != "" && q.Get("allow_unknown") != "true" && !audit.IsKnownCategory(category) {
+		// Four suggestions, not three (#4679): registering
+		// scope_amendment_refused pushed scope_amendment_requested to
+		// fourth-nearest for the canonical wrong-surface string
+		// scope_amendment_pending.
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"category is not a known audit category; pass allow_unknown=true to bypass this check",
 			map[string]any{
 				"field":       "category",
 				"got":         category,
-				"suggestions": audit.SuggestCategories(category, 3),
+				"suggestions": audit.SuggestCategories(category, 4),
 			})
 		return
 	}
@@ -747,15 +751,32 @@ func withholdDelegationShadow(entries []*audit.Entry, requestedCategory string) 
 }
 
 // withholdScopeOverlapFromRunBound drops `plan_scope_overlap` entries
-// (E83.60 / #4118) and `merge_overlap_overridden` entries (E83.61 / #4119)
-// when subject is a run-bound agent token (the isRunBoundSubject prefix
-// match, so a malformed `mcp:run:` suffix is withheld too). Each row names
-// OTHER runs' ids, issue refs and file paths, so a run-bound
-// agent must not read it (approval condition 1 of run 3fa73698, the same rule
-// the scope-overlap endpoint and the gate view enforce). Unlike
-// withholdDelegationShadow this IS access control by subject, so it ignores
-// the requested category: naming the category does not bypass it. Operators
-// get the input unchanged.
+// (E83.60 / #4118), `merge_overlap_overridden` entries (E83.61 / #4119) and
+// `escape_recorded` entries (E94.3 / #4694, ADR-117 A1.6) when subject is a
+// run-bound agent token (the isRunBoundSubject prefix match, so a malformed
+// `mcp:run:` suffix is withheld too). The overlap rows name OTHER runs' ids,
+// issue refs and file paths, so a run-bound agent must not read them
+// (approval condition 1 of run 3fa73698, the same rule the scope-overlap
+// endpoint and the gate view enforce); an escape row records a defect the
+// live reviews missed, and the agent inside a run must not read the escape
+// record its reviews are measured against. Unlike withholdDelegationShadow
+// this IS access control by subject, so it ignores the requested category:
+// naming the category does not bypass it. Operators get the input unchanged.
+//
+// The escape_recorded entry is a DELIBERATE INTERIM DEVIATION from ADR-106,
+// which places per-category read policy in a category registry flag: it MUST
+// migrate into that flag when the registry lands (owned by E89 #4537), and
+// TestWithholdScopeOverlapFromRunBound_EscapeRecordedWithheld guards it until
+// then. A rollback of #4694 keeps this entry and the category registration
+// (server/README.md § "Escape records"): reverting it would expose every
+// already-written escape row to run-bound reads.
+//
+// `scope_amendment_refused` entries (#4679) are withheld on the same interim
+// footing: the row's slice_ownership names sibling slices' titles, declared
+// paths and child run ids. It is the same deliberate deviation from ADR-106,
+// MUST migrate into the per-category registry flag with escape_recorded (owned
+// by E89 #4537), and is guarded until then by
+// TestWithholdScopeOverlapFromRunBound_ScopeAmendmentRefusedWithheld.
 //
 // It returns a NEW slice and never filters in place: the input may be a
 // repository's shared backing array.
@@ -765,7 +786,8 @@ func withholdScopeOverlapFromRunBound(entries []*audit.Entry, subject string) []
 	}
 	out := make([]*audit.Entry, 0, len(entries))
 	for _, e := range entries {
-		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden) {
+		if e != nil && (e.Category == planScopeOverlapCategory || e.Category == CategoryMergeOverlapOverridden || e.Category == CategoryEscapeRecorded ||
+			e.Category == CategoryScopeAmendmentRefused) {
 			continue
 		}
 		out = append(out, e)

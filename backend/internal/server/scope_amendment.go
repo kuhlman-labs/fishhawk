@@ -369,6 +369,36 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	// Slice-ownership guard (#4679): a decomposition child may not widen its
+	// scope onto a path another slice declares unless that slice is a
+	// transitive depends_on ancestor. Checked BEFORE Create, so a refusal
+	// creates no row, spends no budget and fires no page-class ping. A read
+	// error FAILS OPEN here (recorded as slice_ownership.checked=false): the
+	// decide route re-checks fail-closed, so an unchecked path cannot be
+	// approved.
+	var sliceOwnership any
+	ownership, oerr := s.amendmentSliceOwnership(r.Context(), runID, paths)
+	if oerr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"scope amendment: slice-ownership check failed; admitting the request (the decide route re-checks fail-closed)",
+			slog.String("run_id", runID.String()),
+			slog.String("error", oerr.Error()))
+		sliceOwnership = sliceOwnershipFailOpen(oerr)
+	} else if ownership != nil {
+		sliceOwnership = ownership
+	}
+	if ownership.refused() { // #4679 request-time refusal
+		s.writeScopeAmendmentRefusedAudit(r, runID, stage.ID, audit.ActorAgent, id.Subject, map[string]any{
+			"phase":           "request",
+			"paths":           paths,
+			"reason":          strings.TrimSpace(reqBody.Reason),
+			"slice_ownership": ownership,
+		})
+		s.writeError(w, r, http.StatusConflict, errCodeAmendmentPathOwnedBySibling,
+			sliceOwnershipRefusalMessage(ownership, "request"), sliceOwnershipRefusalDetails(ownership))
+		return
+	}
+
 	amendment, err := s.cfg.ScopeAmendmentRepo.Create(r.Context(), scopeamendment.CreateParams{
 		RunID:   runID,
 		StageID: stage.ID,
@@ -405,7 +435,7 @@ func (s *Server) handleRequestScopeAmendment(w http.ResponseWriter, r *http.Requ
 	}
 
 	s.writeScopeAmendmentRequestedAudit(r, amendment, id.Subject,
-		maxScopeAmendmentsPerStage-used-1, effective, maxFiles, deadline)
+		maxScopeAmendmentsPerStage-used-1, effective, maxFiles, deadline, sliceOwnership)
 
 	// Fire the page-class ping immediately (#1786): a scope-amendment request
 	// is a must_page_human event that always parks for an operator decision
@@ -661,6 +691,41 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Slice-ownership guard at APPROVE time (#4679), fail-CLOSED: an approve
+	// of a pending amendment naming a path a non-ancestor sibling slice owns
+	// is refused (the row stays pending), and there is no override — the
+	// operator denies it. Deny is never checked; a non-pending row skips the
+	// check so amendment_already_decided / amendment_lapsed keep their
+	// precedence. A nil RunRepo skips it: that is an unconfigured deployment
+	// only — fishhawkd's serve.go wires RunRepo and ScopeAmendmentRepo in the
+	// same Postgres block, and the request route 503s without a RunRepo, so
+	// such a deployment can file no pending amendment. A nil ArtifactRepo is
+	// NOT a skip: for a decomposition child amendmentSliceOwnership returns an
+	// error (the parent's plan is unreadable), so the approve answers 500
+	// slice_ownership_check_failed.
+	var sliceOwnership *sliceOwnershipCheck
+	if status == scopeamendment.StatusApproved && existing.Status == scopeamendment.StatusPending && s.cfg.RunRepo != nil {
+		ownership, oerr := s.amendmentSliceOwnership(r.Context(), existing.RunID, existing.Paths)
+		if oerr != nil {
+			s.writeError(w, r, http.StatusInternalServerError, errCodeSliceOwnershipCheckFailed,
+				"the slice-ownership check could not read the run or its parent's approved plan; the amendment is still pending — retry the decision",
+				map[string]any{"error": oerr.Error(), "retryable": true})
+			return
+		}
+		if ownership.refused() { // #4679 decide-time refusal
+			s.writeScopeAmendmentRefusedAudit(r, existing.RunID, existing.StageID, audit.ActorUser, id.Subject, map[string]any{
+				"phase":           "decide",
+				"amendment_id":    existing.ID.String(),
+				"paths":           existing.Paths,
+				"slice_ownership": ownership,
+			})
+			s.writeError(w, r, http.StatusConflict, errCodeAmendmentPathOwnedBySibling,
+				sliceOwnershipRefusalMessage(ownership, "decide"), sliceOwnershipRefusalDetails(ownership))
+			return
+		}
+		sliceOwnership = ownership
+	}
+
 	decided, err := s.cfg.ScopeAmendmentRepo.Decide(r.Context(), scopeamendment.DecideParams{
 		ID:        amendmentID,
 		Status:    status,
@@ -706,7 +771,7 @@ func (s *Server) handleDecideScopeAmendment(w http.ResponseWriter, r *http.Reque
 	}
 
 	effective, maxFiles := s.amendmentHeadroom(r.Context(), decided)
-	s.writeScopeAmendmentDecidedAudit(r, decided, reqBody.Decision, effective, maxFiles)
+	s.writeScopeAmendmentDecidedAudit(r, decided, reqBody.Decision, effective, maxFiles, sliceOwnership)
 
 	resp := amendmentToResponse(decided)
 	resp.EffectiveScopeFilesAfterApproval = effective
@@ -749,7 +814,12 @@ func (s *Server) resolveExecutingImplementStage(r *http.Request, runID uuid.UUID
 // chain entry. Best-effort: a failure logs but doesn't unwind the
 // request — the row is the durable record; the audit entry is the
 // operator's await anchor (fishhawk_await_audit, #977).
-func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int, deadline *amendmentDeadline) {
+//
+// sliceOwnership (#4679) is the decomposition child's slice-ownership record —
+// a *sliceOwnershipCheck, or the checked=false fail-open map — carried under
+// slice_ownership; nil (a non-child run) leaves the key absent, so a non-child
+// payload stays byte-identical.
+func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamendment.Amendment, subject string, remainingBudget int, effectiveAfterApproval, maxFiles *int, deadline *amendmentDeadline, sliceOwnership any) {
 	actorKind := audit.ActorAgent
 	payloadMap := map[string]any{
 		"amendment_id":     a.ID.String(),
@@ -769,6 +839,9 @@ func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamen
 	if deadline != nil {
 		payloadMap["stage_deadline_seconds_remaining"] = deadline.remaining
 		payloadMap["amendment_poll_window_seconds"] = deadline.window
+	}
+	if sliceOwnership != nil {
+		payloadMap["slice_ownership"] = sliceOwnership
 	}
 	payload, _ := json.Marshal(payloadMap)
 	stageID := a.StageID
@@ -790,8 +863,10 @@ func (s *Server) writeScopeAmendmentRequestedAudit(r *http.Request, a *scopeamen
 }
 
 // writeScopeAmendmentDecidedAudit appends the scope_amendment_decided
-// chain entry. Best-effort, same posture as the requested entry.
-func (s *Server) writeScopeAmendmentDecidedAudit(r *http.Request, a *scopeamendment.Amendment, decision string, effectiveAfterApproval, maxFiles *int) {
+// chain entry. Best-effort, same posture as the requested entry. A non-nil
+// sliceOwnership (an approved decomposition child's #4679 check) is carried
+// under slice_ownership; nil leaves the key absent (byte-identical).
+func (s *Server) writeScopeAmendmentDecidedAudit(r *http.Request, a *scopeamendment.Amendment, decision string, effectiveAfterApproval, maxFiles *int, sliceOwnership *sliceOwnershipCheck) {
 	actorKind := audit.ActorUser
 	subject := ""
 	if a.DecidedBy != nil {
@@ -806,6 +881,9 @@ func (s *Server) writeScopeAmendmentDecidedAudit(r *http.Request, a *scopeamendm
 	if effectiveAfterApproval != nil && maxFiles != nil {
 		payloadMap["effective_scope_files_after_approval"] = *effectiveAfterApproval
 		payloadMap["max_files_changed"] = *maxFiles
+	}
+	if sliceOwnership != nil {
+		payloadMap["slice_ownership"] = sliceOwnership
 	}
 	payload, _ := json.Marshal(payloadMap)
 	stageID := a.StageID
@@ -822,6 +900,29 @@ func (s *Server) writeScopeAmendmentDecidedAudit(r *http.Request, a *scopeamendm
 			"scope_amendment_decided audit append failed",
 			slog.String("run_id", a.RunID.String()),
 			slog.String("amendment_id", a.ID.String()),
+			slog.String("error", err.Error()))
+	}
+}
+
+// writeScopeAmendmentRefusedAudit appends the scope_amendment_refused chain
+// entry (#4679). Best-effort: an append failure WARN-logs and never changes
+// the outcome — the caller still answers the 409, no row was created at
+// request time and the row stays pending at decide time, so a lost audit row
+// can never turn a refusal into a success.
+func (s *Server) writeScopeAmendmentRefusedAudit(r *http.Request, runID, stageID uuid.UUID, actorKind audit.ActorKind, subject string, payloadMap map[string]any) {
+	payload, _ := json.Marshal(payloadMap)
+	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+		RunID:        runID,
+		StageID:      &stageID,
+		Timestamp:    time.Now().UTC(),
+		Category:     CategoryScopeAmendmentRefused,
+		ActorKind:    &actorKind,
+		ActorSubject: &subject,
+		Payload:      payload,
+	}); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"scope_amendment_refused audit append failed",
+			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()))
 	}
 }

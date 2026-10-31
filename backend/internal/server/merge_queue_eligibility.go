@@ -45,19 +45,31 @@ import (
 //	    UNDETERMINABLE (fail closed).
 //	(b) acceptance merge-eligible and not stale — acceptanceGateState +
 //	    acceptanceGateAdmitsMerge, and acceptanceStaleRefusal == nil.
-//	(c) required checks at the head — the check-runs listing classified by
-//	    mergeoutcome.ClassifyMergeCI against the run's required-checks
-//	    snapshot (a nil snapshot judges the observed set). ZERO observed
-//	    check runs is NOT green: it is undeterminable. The entry and merge
-//	    variants require GREEN. The admission variant refuses only an
-//	    observed RED required check (a freshly advanced head is
-//	    legitimately pending, and the verify pass is the gate there), so it
-//	    neither requires green nor treats an empty listing as a refusal.
-//	    With a NIL snapshot an observed red may be an optional check, so it
-//	    is NOT GREEN rather than red for the variants that act on a queued
-//	    entry: the admission variant passes (never dropped), the merge
-//	    variant answers checks_not_green (a hold); the entry variant keeps
-//	    checks_red.
+//	(c) required checks at the head, the PR-head MERGE-GATE leg
+//	    (docs/adr/112 A3.1, #4780) — the check-runs listing classified by
+//	    mergeoutcome.ClassifyMergeGateCI against the run's required-checks
+//	    snapshot (a nil snapshot judges the observed set): per check suite
+//	    the LATEST attempt decides, completed or not; a completed latest
+//	    attempt in the fail set or CANCELLED is red (checks_red, A3.1(a));
+//	    any failing suite fails the name (no superseded- or cancelled-run
+//	    tolerance); anything else that is not a pass is not green
+//	    (checks_not_green, A3.1(b)). ZERO observed check runs is never green
+//	    (approval condition C5). The entry and merge variants require GREEN.
+//	    The MERGE variant answers EVERY checks-read failure (no GitHub client,
+//	    no head, an unparseable repo, a listing error, a truncated listing)
+//	    and zero runs as the determined checks_not_green, with a detail
+//	    naming the cause, never undeterminable: A3.2 bounds them with the
+//	    merge-gate window. The ENTRY variant keeps read failures and zero
+//	    runs undeterminable (merge_run refuses them, A3.3 "Unchanged"). The
+//	    admission variant refuses only an observed RED required check (a
+//	    freshly advanced head is legitimately pending, and the verify pass
+//	    is the gate there), so it neither requires green nor treats an empty
+//	    listing as a refusal; its read failures stay undeterminable (an A3
+//	    residual). With a NIL snapshot an observed red may be an optional
+//	    check, so it is NOT GREEN rather than red for the variants that act
+//	    on a queued entry: the admission variant passes (never dropped), the
+//	    merge variant answers checks_not_green (A3.1(b)); the entry variant
+//	    keeps checks_red.
 //	(d) no open blocking concern — an open concern whose Provenance is
 //	    concern.ProvenanceFirstOfficer ("first_officer") or whose Severity is
 //	    planreview.SeverityHigh ("high"). Medium/low concerns stay advisory
@@ -88,7 +100,14 @@ import (
 //     the merge path takes the basis from the fold.
 //
 // The predicate NEVER writes. Every read error is undeterminable, which is
-// NOT eligible: uncertainty never enqueues, admits or merges.
+// NOT eligible: uncertainty never enqueues, admits or merges. The one
+// exception is leg (c) on the merge variant, whose checks-read failures are
+// the determined checks_not_green (still not eligible), so merge-on-pass
+// never reports that leg undeterminable (docs/adr/112 A3.2).
+//
+// mergeGateLegsOf is the ONE mapping of a result's reason codes onto A3.1's
+// retryable merge-gate legs; merge-on-pass, admission and the yield re-probe
+// read it.
 
 // Merge-queue ineligibility reason codes.
 const (
@@ -126,8 +145,10 @@ const (
 	// mergeQueueVariantAdmission is the pump's admission: only a red
 	// required check refuses.
 	mergeQueueVariantAdmission
-	// mergeQueueVariantMerge is merge-on-pass: checks GREEN, and no forge
-	// review read (the in-lock forge-approval fold judges approvals, ADR-112).
+	// mergeQueueVariantMerge is merge-on-pass: checks GREEN (a checks-read
+	// failure or zero runs is checks_not_green, docs/adr/112 A3.2), and no
+	// forge review read (the in-lock forge-approval fold judges approvals,
+	// ADR-112).
 	mergeQueueVariantMerge
 )
 
@@ -168,6 +189,46 @@ func (r mergeQueueEligibilityResult) codes() []string {
 		out = append(out, x.Code)
 	}
 	return out
+}
+
+// mergeGateLegs is a result's reason codes mapped onto docs/adr/112 A3.1's
+// merge-gate legs. Red is checks_red (A3.1(a)); Pending is checks_not_green
+// (A3.1(b)); Review is review_pending or review_coverage_incomplete
+// (A3.1(c)); Veto is forge_approval_vetoed (ADR-112 R2); Other is any other
+// determined reason code (never retryable: a blocking concern, a stale or
+// ineligible acceptance, not_approved, changes_requested); Undeterminable is
+// the result's (a leg's read failed).
+type mergeGateLegs struct {
+	Red            bool
+	Pending        bool
+	Review         bool
+	Veto           bool
+	Other          bool
+	Undeterminable bool
+}
+
+// mergeGateLegsOf is the ONE place that maps reason codes onto A3.1's
+// retryable set (docs/adr/112 A3.1); merge-on-pass, admission and the yield
+// re-probe all read it.
+func mergeGateLegsOf(r mergeQueueEligibilityResult) mergeGateLegs {
+	l := mergeGateLegs{Undeterminable: r.Undeterminable}
+	for _, x := range r.Reasons {
+		switch x.Code {
+		case mergeQueueReasonChecksRed:
+			l.Red = true
+		case mergeQueueReasonChecksNotGreen:
+			l.Pending = true
+		case mergeQueueReasonReviewPending, mergeQueueReasonReviewCoverageIncomplete:
+			l.Review = true
+		case mergeQueueReasonForgeApprovalVetoed:
+			l.Veto = true
+		case mergeQueueReasonUndeterminable:
+			l.Undeterminable = true
+		default:
+			l.Other = true
+		}
+	}
+	return l
 }
 
 // mergeQueueEligibility is the queue-ENTRY predicate (merge_run's enqueue
@@ -492,24 +553,18 @@ func (s *Server) mergeQueueAcceptanceLeg(ctx context.Context, runRow *run.Run) (
 	return "", "", nil
 }
 
-// mergeQueueChecksLeg is leg (c).
+// mergeQueueChecksLeg is leg (c), the PR-head merge-gate leg (docs/adr/112
+// A3.1): ClassifyMergeGateCI for every variant. On the MERGE variant every
+// checks-read failure and zero runs answer the determined checks_not_green
+// (A3.2's bound), never an error; the entry and admission variants keep them
+// undeterminable (an error), and admission passes zero runs.
 func (s *Server) mergeQueueChecksLeg(ctx context.Context, runRow *run.Run, headSHA string, variant mergeQueueEligibilityVariant) (string, string, error) {
-	if s.cfg.GitHub == nil {
-		return "", "", errors.New("no GitHub client is wired")
-	}
-	if headSHA == "" {
-		return "", "", errors.New("no head sha to read checks at")
-	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
+	checks, err := s.listMergeGateChecks(ctx, runRow, headSHA)
 	if err != nil {
+		if variant == mergeQueueVariantMerge {
+			return mergeQueueReasonChecksNotGreen, "required checks could not be read at " + headSHA + ": " + err.Error(), nil
+		}
 		return "", "", err
-	}
-	checks, truncated, err := s.cfg.GitHub.ListCheckRunsForRef(ctx, mergeObservationScope(runRow), repo, headSHA)
-	if err != nil {
-		return "", "", err
-	}
-	if truncated {
-		return "", "", errors.New("the check-runs listing was truncated")
 	}
 	snapshot := runRow.RequiredChecksSnapshot
 	nilSnapshot := snapshot == nil
@@ -517,10 +572,10 @@ func (s *Server) mergeQueueChecksLeg(ctx context.Context, runRow *run.Run, headS
 		// Judge the observed set (an authoritatively-empty required set).
 		snapshot = &run.RequiredChecksSnapshot{}
 	}
-	v := mergeoutcome.ClassifyMergeCI(snapshot, checks, false, time.Now().UTC())
+	v := mergeoutcome.ClassifyMergeGateCI(snapshot, checks, false, time.Now().UTC())
 	if v.Conclusion == mergeoutcome.CIConclusionRed {
 		if !nilSnapshot || variant == mergeQueueVariantEntry {
-			return mergeQueueReasonChecksRed, "required check(s) failed at " + headSHA + ": " + strings.Join(v.FailedChecks, ", "), nil
+			return mergeQueueReasonChecksRed, "required check(s) failed or were cancelled at " + headSHA + ": " + strings.Join(v.FailedChecks, ", "), nil
 		}
 		// No required-checks snapshot (carried concern 1208e0e2): the red run
 		// may be an optional check, so a queued entry is NOT GREEN, never red
@@ -529,14 +584,19 @@ func (s *Server) mergeQueueChecksLeg(ctx context.Context, runRow *run.Run, headS
 			return "", "", nil
 		}
 		return mergeQueueReasonChecksNotGreen,
-			"check(s) failed at " + headSHA + " with no required-checks snapshot to say whether they are required: " +
+			"check(s) failed or were cancelled at " + headSHA + " with no required-checks snapshot to say whether they are required: " +
 				strings.Join(v.FailedChecks, ", "), nil
 	}
 	if variant == mergeQueueVariantAdmission {
 		return "", "", nil
 	}
 	if len(checks) == 0 {
-		// Approval condition C5: zero observed check runs is never green.
+		// Approval condition C5: zero observed check runs is never green. The
+		// merge variant holds it as pending (A3.1(b)); the entry variant
+		// refuses it as undeterminable.
+		if variant == mergeQueueVariantMerge {
+			return mergeQueueReasonChecksNotGreen, "no check runs are reported at " + headSHA + " yet", nil
+		}
 		return "", "", errors.New("no check runs are reported at " + headSHA)
 	}
 	if v.Conclusion != mergeoutcome.CIConclusionGreen {
@@ -544,6 +604,30 @@ func (s *Server) mergeQueueChecksLeg(ctx context.Context, runRow *run.Run, headS
 			"required check(s) not green at " + headSHA + " (" + v.MissingReason + "): " + strings.Join(v.MissingChecks, ", "), nil
 	}
 	return "", "", nil
+}
+
+// listMergeGateChecks reads the check-runs listing at headSHA. A missing
+// client, head or parseable repo, a listing error and a truncated listing are
+// each an error naming the cause.
+func (s *Server) listMergeGateChecks(ctx context.Context, runRow *run.Run, headSHA string) ([]githubclient.CheckRunSummary, error) {
+	if s.cfg.GitHub == nil {
+		return nil, errors.New("no GitHub client is wired")
+	}
+	if headSHA == "" {
+		return nil, errors.New("no head sha to read checks at")
+	}
+	repo, err := parseRepoOwnerName(runRow.Repo)
+	if err != nil {
+		return nil, err
+	}
+	checks, truncated, err := s.cfg.GitHub.ListCheckRunsForRef(ctx, mergeObservationScope(runRow), repo, headSHA)
+	if err != nil {
+		return nil, err
+	}
+	if truncated {
+		return nil, errors.New("the check-runs listing was truncated")
+	}
+	return checks, nil
 }
 
 // mergeQueueConcernLeg is leg (d).

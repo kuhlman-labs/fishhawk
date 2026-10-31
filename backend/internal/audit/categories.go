@@ -340,6 +340,25 @@ import "sort"
 // scope_amendment_requested / scope_amendment_decided siblings — NOT an
 // issue-comment activity category (the startup backfill would otherwise
 // re-render activity lines onto every stale run's anchor).
+// E89.40 / #4679 added scope_amendment_refused, written by the slice-ownership
+// guard (server/slice_ownership.go, server/scope_amendment.go) when a
+// decomposition child's mid-stage scope amendment names a path a non-ancestor
+// sibling slice declares: at request time (actor agent, no row created, no
+// budget spent) or at an operator's approve (actor user, the row stays
+// pending). INTERNAL like its scope_amendment_* siblings — NOT an
+// issue-comment activity category. It is WITHHELD from run-bound audit reads
+// by an interim deny-list entry in server/reads.go's
+// withholdScopeOverlapFromRunBound, the same deliberate interim deviation from
+// ADR-106 as escape_recorded, owned by E89 #4537, that MUST migrate to
+// ADR-106's per-category registry flag when that lands.
+// E94.3 / #4694 (ADR-117 D3 + Amendment A1, ratified) added escape_recorded,
+// written by POST /v0/runs/{run_id}/escapes (server/escape.go): a birth row
+// or the single closure row that supersedes it, one row per state change
+// (A1.1). INTERNAL — no issue-comment activity line. It is WITHHELD from
+// run-bound audit reads (A1.6) by an interim deny-list entry in
+// server/reads.go's withholdScopeOverlapFromRunBound — a deliberate interim
+// deviation from ADR-106, owned by E89 #4537, that MUST migrate to ADR-106's
+// per-category registry flag when that lands.
 // E83.61 / #4119 added merge_overlap_overridden, the operator's audited
 // override of the merge overlap guard (server/merge_overlap_guard.go),
 // appended record-before-commit — INTERNAL, not an issue-comment surface.
@@ -364,6 +383,15 @@ import "sort"
 // only THIS run's own entry, claim and head, so it is run-bound-readable
 // under ADR-106 (no ADR-106 registry flag exists yet) — INTERNAL, actor
 // system, not an issue-comment surface.
+// E87.17 / #4685 (ADR-112 R3) added merge_queue_intent_withdrawn, the
+// withdraw-intent verb's row: the operator withdrew a YIELDED entry's merge
+// intent, settling it dropped intent_withdrawn, appended INSIDE the
+// withdrawal transaction (server/merge_queue_withdraw.go; an append failure
+// rolls the withdrawal back). Its payload names only THIS run's own entry,
+// repo, base ref, head, intent and yield reason, and NO yield_detail (the
+// untrusted forge text), so it is run-bound-readable under ADR-106 (no
+// ADR-106 registry flag exists yet) — INTERNAL, actor = the operator, not an
+// issue-comment surface.
 var KnownCategories = map[string]struct{}{
 	"acceptance_dispatched":                   {},
 	"acceptance_outcome_recorded":             {},
@@ -438,7 +466,10 @@ var KnownCategories = map[string]struct{}{
 	"concern_auto_closed":                     {},
 	"concern_defer_failed":                    {},
 	"concern_deferred":                        {},
+	"concern_label_failed":                    {}, // E94.8 / #4841: corrective after a failed relabel write that followed the concern_labelled intent (server/label_concern.go) — INTERNAL
+	"concern_labelled":                        {}, // E94.8 / #4841 (ADR-117 D1 phase 3): a human relabelled a concern's judgement or duplicate_of, recorded before the write (server/label_concern.go) — INTERNAL, not issue-comment activity
 	"concern_note_backfilled":                 {},
+	"concern_rolled_up":                       {}, // E94.1 / ADR-117 D2 (#4692): child-slice HIGH/MEDIUM concerns copied into the parent ledger; written by server/concern_rollup.go; operator-visible through issuecomment's activityCategories
 	"concern_relitigation_suppressed":         {},
 	"concern_resolution_vetoed":               {},
 	"concern_resolve_failed":                  {}, // E83.53 / #4086: corrective after a failed resolve transition (server/resolve_concerns.go)
@@ -478,6 +509,7 @@ var KnownCategories = map[string]struct{}{
 	"document_truncated":                      {},
 	"dispatch_watchdog_elapsed":               {},
 	"escalation_fired":                        {},
+	"escape_recorded":                         {}, // E94.3 / #4694 (ADR-117 D3 + A1): one append-only row per escape state change — a birth or its single-successor closure (server/escape.go) — INTERNAL, not an issue-comment surface; WITHHELD from run-bound audit reads (A1.6) by an interim deny-list entry that MUST migrate to ADR-106's per-category registry flag when that lands
 	"escalation_persona_attached":             {}, // E55.9 / #3754: fired escalations attached reviewer personas to a review round (server/escalation_persona.go)
 	"first_officer_action_refused":            {}, // E85.6 / #4148 (ADR-089 D2): a 403 served to a first-officer seat identity, written from writeError on the global chain (server/first_officer_identity.go) — INTERNAL, not an issue-comment surface
 	"first_officer_seat_attached":             {}, // E85.6 / #4148 (ADR-089 D1): the captain attached a first-officer seat (token id, scopes; never the plaintext) — INTERNAL, not an issue-comment surface
@@ -524,6 +556,7 @@ var KnownCategories = map[string]struct{}{
 	"merge_queue_advanced":                    {}, // E87.5 / #4296 (ADR-093 D3): a merge-intent queue entry's admission auto-advanced its branch, naming prior/new head, merge commit, clean and admission epoch (server/merge_candidate_queue.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_authorized":                  {}, // E89.22 / #4619 (ADR-112 R4): the forge-approval fold's evidence row — qualifying approvals (review id, commit, actor, resolved permission), predicate snapshot, policy version, basis and path — appended in-lock BEFORE any merge verdict row or dispatch claim (server/forge_approval.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_ejected":                     {}, // E87.6 / #4297 (ADR-093 D4): ONE row per ejected merge-queue entry, written only by the settling call, naming reason (verify_failed, advance_conflict, forge_merge_refused, pass_not_startable), next_step from the closed vocabulary, fixup_routed (verify_failed), forge_reason and sanitised forge_detail (server/merge_queue_eject.go) — INTERNAL, not an issue-comment surface
+	"merge_queue_intent_withdrawn":            {}, // E87.17 / #4685 (ADR-112 R3): the operator withdrew a YIELDED merge-queue entry's merge intent, settling it dropped intent_withdrawn, appended INSIDE the withdrawal transaction (server/merge_queue_withdraw.go); payload carries only this run's ids and no yield_detail, so it is run-bound-readable under ADR-106 — INTERNAL, not an issue-comment surface
 	"merge_queue_merged":                      {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass merged the head of line through the forge pinned to the verified head, naming verdict_head_sha and approval basis (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_overlap_refused":             {}, // E87.5 / #4296 (ADR-093 D3): merge-on-pass was held by the merge overlap guard; counts only, no other run's ids or paths, one row per distinct decision (server/merge_queue_merge.go) — INTERNAL, not an issue-comment surface
 	"merge_queue_promoted":                    {}, // E87.6 / #4297 (ADR-093 D7): FORWARD registration — the operator promote verb moved an unmarked held entry to the head of its base's line, appended INSIDE the promotion transaction (server/merge_queue_promote.go, a later slice) — INTERNAL, not an issue-comment surface
@@ -630,6 +663,7 @@ var KnownCategories = map[string]struct{}{
 	"scheduled_run_started":                   {}, // E79.1 / #3725: a due schedule window started a new run
 	"scope_amendment_decided":                 {},
 	"scope_amendment_lapsed":                  {},
+	"scope_amendment_refused":                 {}, // #4679: the slice-ownership guard refused a decomposition child's scope amendment (request time: no row; decide time: row stays pending) (server/slice_ownership.go) — INTERNAL, not an issue-comment surface; WITHHELD from run-bound audit reads by an interim deny-list entry that MUST migrate to ADR-106's per-category registry flag (owned by E89 #4537)
 	"scope_amendment_requested":               {},
 	"scope_completeness_amended":              {},
 	"scope_completeness_exempted":             {},
@@ -728,8 +762,9 @@ func KnownCategoryList() []string {
 // SuggestCategories returns up to max known categories nearest to input by
 // Levenshtein edit distance, closest first, ties broken lexicographically
 // (deterministic). It is the "did you mean" suggester the fail-loud
-// validation surfaces: SuggestCategories("scope_amendment_pending", 3)
-// ranks "scope_amendment_requested" first. max <= 0 or an empty registry
+// validation surfaces: SuggestCategories("scope_amendment_pending", 4)
+// names "scope_amendment_requested" among its siblings (both callers ask
+// for four since #4679 added scope_amendment_refused). max <= 0 or an empty registry
 // returns nil.
 func SuggestCategories(input string, max int) []string {
 	if max <= 0 {

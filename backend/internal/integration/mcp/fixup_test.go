@@ -794,8 +794,10 @@ func TestE2E_Fixup_WaivedConcernsSuppressHintAndAgreeWithGateView(t *testing.T) 
 		res, werr := session.CallTool(ctx, &mcp.CallToolParams{
 			Name: "fishhawk_waive_concern",
 			Arguments: map[string]any{
-				"concern_id": row.ID.String(),
-				"reason":     "accepted trade-off; not blocking the merge",
+				"concern_id":    row.ID.String(),
+				"reason":        "accepted trade-off; not blocking the merge",
+				"judgement":     "tradeoff",
+				"tradeoff_cost": "the concern ships unaddressed",
 			},
 		})
 		if werr != nil {
@@ -1976,6 +1978,124 @@ func TestE2E_Fixup_ExpectedHeadAdvertisedAndNoChangeRefund(t *testing.T) {
 	}
 	if body := toolContentString(t, ceil); !strings.Contains(body, "fixup_ceiling_reached") {
 		t.Errorf("ceiling fix-up error missing fixup_ceiling_reached code: %s", body)
+	}
+}
+
+// TestE2E_Fixup_ExpectedHeadAdvancesThroughRecordedRebase pins the E89.6 /
+// #4574 seam end to end: the real fishhawk-mcp binary triggers the fix-up, the
+// real fixup handler re-opens the stage, and the prompt-render wire reads the
+// Postgres audit chain's own sequence order. A CLEAN branch_rebased row
+// recorded after the run's recorded head advances fixup_expected_head_sha to
+// the merge commit (the run 3fa73698 incident, where the runner refused every
+// fix-up after fishhawk_rebase_run_branch with fixup_base_mismatch); a later
+// row recording a concurrent push (new head != merge commit) leaves it at the
+// merge commit, so a foreign head is never laundered into the fix-up base.
+func TestE2E_Fixup_ExpectedHeadAdvancesThroughRecordedRebase(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	signingRepo := signing.NewPostgresRepository(fx.pool)
+	srv := server.New(server.Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      fx.runRepo,
+		AuditRepo:    auditRepo,
+		SigningRepo:  signingRepo,
+		APITokenRepo: fx.apitokenRepo,
+		GitHub:       githubclient.New(nil),
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	stage, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID:            fx.runID,
+		Sequence:         1,
+		Type:             runpkg.StageTypeImplement,
+		ExecutorKind:     runpkg.ExecutorAgent,
+		ExecutorRef:      "fishhawk/runner@v1",
+		RequiresApproval: true,
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+	parkAtGate(t, ctx, fx.runRepo, stage.ID)
+	seedImplementReview(t, ctx, auditRepo, fx.runID, stage.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "address the drift"})
+
+	const (
+		recordedHead = "3333333333333333333333333333333333333333"
+		mergeCommit  = "4444444444444444444444444444444444444444"
+		baseTip      = "5555555555555555555555555555555555555555"
+		mergeCommit2 = "6666666666666666666666666666666666666666"
+		foreignHead  = "7777777777777777777777777777777777777777"
+	)
+	seedReportedHead(t, ctx, auditRepo, fx.runID, stage.ID, "fixup_pushed", recordedHead, time.Now().Add(-1*time.Hour).UTC())
+	appendBranchRebased(t, ctx, auditRepo, fx.runID, recordedHead, mergeCommit, mergeCommit, baseTip)
+
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, httpSrv.URL)
+	res, err := session.CallTool(ctx, &mcp.CallToolParams{Name: "fishhawk_fixup_stage", Arguments: map[string]any{
+		"stage_id": stage.ID.String(),
+		"concerns": []int{0},
+	}})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_fixup_stage: %v", err)
+	}
+	if res.IsError {
+		t.Fatalf("fix-up returned error: %s", toolContentString(t, res))
+	}
+
+	var promptOut struct {
+		Fixup                bool   `json:"fixup"`
+		FixupExpectedHeadSHA string `json:"fixup_expected_head_sha"`
+	}
+	getPromptRenderJSON(t, ctx, httpSrv.URL, stage.ID, &promptOut)
+	if !promptOut.Fixup {
+		t.Fatal("precondition: prompt fixup = false, want true after the fix-up trigger")
+	}
+	if promptOut.FixupExpectedHeadSHA != mergeCommit {
+		t.Errorf("prompt fixup_expected_head_sha = %q, want the clean recorded merge commit %q (not the pre-rebase head %q)",
+			promptOut.FixupExpectedHeadSHA, mergeCommit, recordedHead)
+	}
+
+	// A later advance whose post-merge head is a FOREIGN push, not its merge
+	// commit: the walk must not follow it.
+	appendBranchRebased(t, ctx, auditRepo, fx.runID, mergeCommit, mergeCommit2, foreignHead, baseTip)
+	promptOut.FixupExpectedHeadSHA = ""
+	getPromptRenderJSON(t, ctx, httpSrv.URL, stage.ID, &promptOut)
+	if promptOut.FixupExpectedHeadSHA != mergeCommit {
+		t.Errorf("prompt fixup_expected_head_sha = %q after a concurrent-push advance, want it to stay %q (never the foreign %q or its merge %q)",
+			promptOut.FixupExpectedHeadSHA, mergeCommit, foreignHead, mergeCommit2)
+	}
+}
+
+// appendBranchRebased appends a branch_rebased row with the payload keys the
+// rebase handler writes, recorded as a merge this advance performed with its
+// parents verified (clean_verified true); newHead != merge records a
+// concurrent push after the merge.
+func appendBranchRebased(t *testing.T, ctx context.Context, repo audit.Repository, runID uuid.UUID, prior, merge, newHead, baseTip string) {
+	t.Helper()
+	payload, err := json.Marshal(map[string]any{
+		"prior_head_sha":     prior,
+		"merge_commit_sha":   merge,
+		"new_head_sha":       newHead,
+		"already_up_to_date": false,
+		"clean_verified":     true,
+		"base_tip_sha":       baseTip,
+	})
+	if err != nil {
+		t.Fatalf("marshal branch_rebased payload: %v", err)
+	}
+	kind := audit.ActorSystem
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		Timestamp: time.Now().UTC(),
+		Category:  server.CategoryBranchRebased,
+		ActorKind: &kind,
+		Payload:   payload,
+	}); err != nil {
+		t.Fatalf("AppendChained branch_rebased: %v", err)
 	}
 }
 
@@ -3368,7 +3488,7 @@ func seedFixupRecoveredCategory(t *testing.T, ctx context.Context, repo audit.Re
 	if err != nil {
 		t.Fatalf("marshal stage_fixup_recovered payload: %v", err)
 	}
-	kind := audit.ActorKind("system")
+	kind := audit.ActorSystem
 	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,
@@ -3395,7 +3515,7 @@ func seedFixupPushedEntry(t *testing.T, ctx context.Context, repo audit.Reposito
 	if err != nil {
 		t.Fatalf("marshal fixup_pushed payload: %v", err)
 	}
-	kind := audit.ActorKind("system")
+	kind := audit.ActorSystem
 	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
 		RunID:     runID,
 		StageID:   &stageID,

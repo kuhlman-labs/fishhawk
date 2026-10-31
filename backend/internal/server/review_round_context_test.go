@@ -151,7 +151,7 @@ func TestEmitReviewStarted_StampsRoundSourceAndRedispatchLineage(t *testing.T) {
 			au := newAuditFake()
 			s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
 			runID, stageID := uuid.New(), uuid.New()
-			if _, ok := s.emitReviewStarted(tc.ctx, runID, stageID, tc.category, planreview.AuthorityAdvisory, tc.agents, nil, tc.head, "", ""); !ok {
+			if _, ok := s.emitReviewStarted(tc.ctx, runID, stageID, tc.category, planreview.AuthorityAdvisory, tc.agents, nil, tc.head, "", "", nil); !ok {
 				t.Fatal("emitReviewStarted ok = false, want true")
 			}
 			got := startedPayloadsRaw(t, au, runID, tc.category)
@@ -424,7 +424,7 @@ func TestEmitReviewStarted_StampsRerunOf(t *testing.T) {
 			au := newAuditFake()
 			s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
 			runID := uuid.New()
-			if _, ok := s.emitReviewStarted(tc.ctx, runID, rr.StageID, tc.category, planreview.AuthorityAdvisory, 1, nil, "h1", "", ""); !ok {
+			if _, ok := s.emitReviewStarted(tc.ctx, runID, rr.StageID, tc.category, planreview.AuthorityAdvisory, 1, nil, "h1", "", "", nil); !ok {
 				t.Fatal("emitReviewStarted ok = false")
 			}
 			if got := startedPayloadsRaw(t, au, runID, tc.category); len(got) != 1 || got[0] != tc.want {

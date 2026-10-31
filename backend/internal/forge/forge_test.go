@@ -2,6 +2,8 @@ package forge_test
 
 import (
 	"errors"
+	"fmt"
+	"reflect"
 	"testing"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -166,4 +168,125 @@ func TestMovedTypesAreIdenticalAcrossSpellings(t *testing.T) {
 func assignIdentical[T any](t *testing.T, v T) T {
 	t.Helper()
 	return v
+}
+
+// TestMergeMethodSentinelsDistinct pins the two E93.2 / #4658 merge-method
+// sentinels: distinct from each other, from ErrUnsupported and from every
+// moved sentinel, and matchable through a wrap.
+func TestMergeMethodSentinelsDistinct(t *testing.T) {
+	for _, s := range []error{forge.ErrMergeMethodNotAllowed, forge.ErrMergeMethodUnsupported} {
+		if !errors.Is(fmt.Errorf("ctx: %w", s), s) {
+			t.Errorf("wrap(%v) not matchable", s)
+		}
+		for _, other := range []error{
+			forge.ErrNotFound, forge.ErrForbidden, forge.ErrValidation, forge.ErrNotInstalled,
+			forge.ErrPullRequestExists, forge.ErrMergeConflict, forge.ErrPullRequestCleanStatus,
+			forge.ErrPullRequestUnstableStatus, forge.ErrPullRequestNotMergeable, forge.ErrUnsupported,
+		} {
+			if errors.Is(s, other) || errors.Is(other, s) {
+				t.Errorf("%v collides with %v", s, other)
+			}
+		}
+	}
+	if errors.Is(forge.ErrMergeMethodNotAllowed, forge.ErrMergeMethodUnsupported) {
+		t.Error("ErrMergeMethodNotAllowed collides with ErrMergeMethodUnsupported")
+	}
+}
+
+func TestMergeMethodFromDeclaration(t *testing.T) {
+	for decl, want := range map[string]forge.MergeMethod{
+		"squash": forge.MergeMethodSquash,
+		"merge":  forge.MergeMethodMerge,
+		"rebase": forge.MergeMethodRebase,
+	} {
+		got, err := forge.MergeMethodFromDeclaration(decl)
+		if err != nil || got != want {
+			t.Errorf("MergeMethodFromDeclaration(%q) = %q, %v; want %q", decl, got, err, want)
+		}
+		if name := forge.MergeMethodName(got); name != decl {
+			t.Errorf("MergeMethodName(%q) = %q, want %q", got, name, decl)
+		}
+	}
+	for _, bad := range []string{"", "SQUASH", "fast_forward", "squash "} {
+		if got, err := forge.MergeMethodFromDeclaration(bad); err == nil {
+			t.Errorf("MergeMethodFromDeclaration(%q) = %q, nil; want an error", bad, got)
+		}
+	}
+	if name := forge.MergeMethodName("FAST_FORWARD"); name != "" {
+		t.Errorf("MergeMethodName(unknown) = %q, want empty", name)
+	}
+}
+
+func TestAllowedMergeMethods_AllowsAndNames(t *testing.T) {
+	all := forge.AllowedMergeMethods{Squash: true, Merge: true, Rebase: true}
+	for _, m := range []forge.MergeMethod{forge.MergeMethodSquash, forge.MergeMethodMerge, forge.MergeMethodRebase} {
+		if !all.Allows(m) {
+			t.Errorf("all.Allows(%s) = false", m)
+		}
+		if (forge.AllowedMergeMethods{}).Allows(m) {
+			t.Errorf("none.Allows(%s) = true", m)
+		}
+	}
+	if all.Allows("FAST_FORWARD") {
+		t.Error("an unknown method must not be allowed")
+	}
+	cases := []struct {
+		a    forge.AllowedMergeMethods
+		want []string
+	}{
+		{forge.AllowedMergeMethods{}, []string{}},
+		{all, []string{"squash", "merge", "rebase"}},
+		{forge.AllowedMergeMethods{Rebase: true, Squash: true}, []string{"squash", "rebase"}},
+		{forge.AllowedMergeMethods{Merge: true}, []string{"merge"}},
+	}
+	for _, tc := range cases {
+		got := tc.a.Names()
+		if got == nil || !reflect.DeepEqual(got, tc.want) {
+			t.Errorf("%+v.Names() = %#v, want %#v", tc.a, got, tc.want)
+		}
+	}
+}
+
+// TestMergeMethodsForFamily pins every row of the static per-family table:
+// GitLab has no per-request rebase; GitHub and an unknown family allow all
+// three.
+func TestMergeMethodsForFamily(t *testing.T) {
+	cases := []struct {
+		family string
+		want   forge.AllowedMergeMethods
+	}{
+		{"github", forge.AllowedMergeMethods{Squash: true, Merge: true, Rebase: true}},
+		{"gitlab", forge.AllowedMergeMethods{Squash: true, Merge: true}},
+		{"bitbucket", forge.AllowedMergeMethods{Squash: true, Merge: true, Rebase: true}},
+		{"", forge.AllowedMergeMethods{Squash: true, Merge: true, Rebase: true}},
+	}
+	for _, tc := range cases {
+		if got := forge.MergeMethodsForFamily(tc.family); got != tc.want {
+			t.Errorf("MergeMethodsForFamily(%q) = %+v, want %+v", tc.family, got, tc.want)
+		}
+	}
+	if forge.MergeMethodsForFamily("gitlab").Allows(forge.MergeMethodRebase) {
+		t.Error("gitlab must not allow a per-request rebase")
+	}
+}
+
+func TestFamilyOfInstallationRef(t *testing.T) {
+	ref := func(s string) *string { return &s }
+	cases := []struct {
+		name string
+		ref  *string
+		want string
+	}{
+		{"nil", nil, "github"},
+		{"empty", ref(""), "github"},
+		{"bare decimal", ref("12345"), "github"},
+		{"github scheme", ref("github:9"), "github"},
+		{"gitlab scheme", ref("gitlab:7"), "gitlab"},
+		{"empty scheme", ref(":7"), ""},
+	}
+	for _, tc := range cases {
+		if got := forge.FamilyOfInstallationRef(tc.ref); got != tc.want {
+			t.Errorf("%s: FamilyOfInstallationRef = %q, want %q", tc.name, got, tc.want)
+		}
+	}
 }

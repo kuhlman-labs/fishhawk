@@ -11,6 +11,8 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/google/uuid"
+
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/identity"
@@ -84,8 +86,28 @@ func seedMembersStage(t *testing.T, rr *approvalRunRepo, au *approvalAuditFake, 
 
 func newMembersRecorder() *httptest.ResponseRecorder { return httptest.NewRecorder() }
 
+// membersRequest carries a forge-verified credential for github:alice, so a
+// direct checkApprovalPredicates call for that listed principal clears the
+// credential leg (#4633).
 func membersRequest() *http.Request {
-	return httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	req := httptest.NewRequest(http.MethodPost, "/v0/stages/x/approvals", nil)
+	return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, forgeVerifiedIdentity("github:alice")))
+}
+
+// forgeVerifiedIdentity is a device-flow api-token identity (auth_method
+// oauth) for subject: the credential a listed principal must present to clear
+// the members credential leg (#4633). Scopes carry write:approvals because
+// requireWriteScope enforces scopes on a TokenID identity.
+func forgeVerifiedIdentity(subject string) Identity {
+	return Identity{Subject: subject, TokenID: "tok-" + subject, Scopes: []string{"write:approvals"}, AuthMethod: "oauth"}
+}
+
+// submitApprovalForgeVerified is submitApprovalAs over forgeVerifiedIdentity,
+// through the existing submitApprovalWithIdentity helper.
+func submitApprovalForgeVerified(t *testing.T, s *Server, stageID uuid.UUID, subject, body string) *httptest.ResponseRecorder {
+	t.Helper()
+	id := forgeVerifiedIdentity(subject)
+	return submitApprovalWithIdentity(t, s, stageID, &id, body)
 }
 
 func approvalRowCount(t *testing.T, ar *fakeApprovalRepo, stage *run.Stage) int {
@@ -179,14 +201,14 @@ func TestSubmitApproval_Members_ListedCounted(t *testing.T) {
 	members := []string{"github:alice", "github:bob"}
 	stage := seedMembersStage(t, rr, au, 2, members, "")
 
-	w := submitApprovalAs(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
+	w := submitApprovalForgeVerified(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("alice status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
 	if got := membersStageState(rr, stage); got != run.StageStateAwaitingApproval {
 		t.Fatalf("after alice: state = %q, want awaiting_approval (count 2)", got)
 	}
-	w = submitApprovalAs(t, s, stage.ID, "github:bob", `{"decision":"approve"}`)
+	w = submitApprovalForgeVerified(t, s, stage.ID, "github:bob", `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("bob status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -279,7 +301,7 @@ func TestSubmitApproval_Members_PlainMemberQualifiedByRunForge(t *testing.T) {
 	t.Run("github run admits github:alice", func(t *testing.T) {
 		s, ar, rr, au, _ := newApprovalServerWithIdentity(t, &fakeIdentityProvider{})
 		stage := seedMembersStage(t, rr, au, 1, []string{"alice"}, "")
-		w := submitApprovalAs(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
+		w := submitApprovalForgeVerified(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 		}
@@ -304,7 +326,7 @@ func TestSubmitApproval_Members_PlainMemberQualifiedByRunForge(t *testing.T) {
 	t.Run("gitlab run admits gitlab:alice", func(t *testing.T) {
 		s, ar, rr, au, _ := newApprovalServerWithIdentity(t, &fakeIdentityProvider{})
 		stage := seedMembersStage(t, rr, au, 1, []string{"alice"}, "gitlab:42")
-		w := submitApprovalAs(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
+		w := submitApprovalForgeVerified(t, s, stage.ID, "gitlab:alice", `{"decision":"approve"}`)
 		if w.Code != http.StatusOK {
 			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 		}
@@ -314,10 +336,13 @@ func TestSubmitApproval_Members_PlainMemberQualifiedByRunForge(t *testing.T) {
 	})
 }
 
-// T4: a plain (static-token) subject is never qualified, so it matches no
+// T4: a plain (non-forge) subject is never qualified, so it matches no
 // member — even one spelled identically. CF4 vehicle: qualifying the subject
-// too would canonicalise both sides of the first case to github:alice.
-func TestSubmitApproval_Members_StaticSubjectNeverMatches(t *testing.T) {
+// too would canonicalise both sides of the first case to github:alice. This
+// pins the SUBJECT-SHAPE refusal (identity.SubjectListed rule 3), not the
+// credential leg: a static token whose subject IS forge-shaped is refused by
+// the credential leg instead (TestSubmitApproval_Members_StaticCredentialRefused).
+func TestSubmitApproval_Members_NonForgeSubjectUnlisted(t *testing.T) {
 	for _, tc := range []struct {
 		name    string
 		members []string
@@ -402,7 +427,7 @@ func TestSubmitApproval_Members_DelegatedListedAdmitted(t *testing.T) {
 	s, repo, au, _, ar := newDelegatedApprovalServer(t)
 	planStage := startDelegatedMembersRun(t, s, repo, au, `["github:alice"]`)
 
-	w := submitApprovalAs(t, s, planStage.ID, "github:alice", `{"decision":"approve","delegated":true}`)
+	w := submitApprovalForgeVerified(t, s, planStage.ID, "github:alice", `{"decision":"approve","delegated":true}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -480,7 +505,7 @@ func TestSubmitApproval_Members_EscalationCannotWiden(t *testing.T) {
 	}
 
 	// The listed approver is admitted and the escalated count (2) still holds.
-	w = submitApprovalAs(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
+	w = submitApprovalForgeVerified(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
 	if w.Code != http.StatusOK {
 		t.Fatalf("alice status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
@@ -669,5 +694,225 @@ func TestSubmitApproval_Members_NonDelegatedAgentKindRefused(t *testing.T) {
 	snap := predicateRejectionSnapshot(t, au, agent)
 	if !reflect.DeepEqual(snap["members"], []any{"github:alice"}) || snap["members_principal"] != agent {
 		t.Errorf("rejection snapshot members=%v members_principal=%v, want [github:alice] / %s", snap["members"], snap["members_principal"], agent)
+	}
+}
+
+// --- the members credential leg (#4633) ---
+
+// credentialIdentity is an api-token identity for subject with the given
+// auth_method: the credential kinds the members credential leg refuses.
+func credentialIdentity(subject, authMethod string) Identity {
+	return Identity{Subject: subject, TokenID: "tok-" + subject, Scopes: []string{"write:approvals"}, AuthMethod: authMethod}
+}
+
+// assertCredentialRefusal asserts the credential leg's 403 shape, that
+// nothing was recorded or advanced, and returns its details.
+func assertCredentialRefusal(t *testing.T, w *httptest.ResponseRecorder, wantKind string) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusForbidden {
+		t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+	}
+	code, details := decodeApprovalError(t, w)
+	assertMembersRefusal(t, code, details, "github:alice", []string{"github:alice"})
+	if details["reason"] != "credential_not_forge_verified" {
+		t.Errorf("details.reason = %v, want credential_not_forge_verified", details["reason"])
+	}
+	if details["credential_kind"] != wantKind {
+		t.Errorf("details.credential_kind = %v, want %q", details["credential_kind"], wantKind)
+	}
+	if !reflect.DeepEqual(details["forge_verified_kinds"], []any{"session", "oauth", "oauth_as"}) {
+		t.Errorf("details.forge_verified_kinds = %v, want [session oauth oauth_as]", details["forge_verified_kinds"])
+	}
+	return details
+}
+
+// T14-T17: a LISTED principal (members ["github:alice"], subject
+// github:alice) on a count-1 members-only gate is refused when the presenting
+// credential is not forge-verified. With the credential leg absent, the
+// listed path admits it: 200, one row, the stage succeeded — so the RED lands
+// on the status / row / state assertions. CF1 vehicle.
+func TestSubmitApproval_Members_StaticCredentialRefused(t *testing.T) {
+	runCredentialRefusal(t, credentialIdentity("github:alice", "static"), identity.CredentialStatic)
+}
+
+func TestSubmitApproval_Members_UnrecordedCredentialRefused(t *testing.T) {
+	runCredentialRefusal(t, credentialIdentity("github:alice", ""), identity.CredentialUnrecorded)
+}
+
+func TestSubmitApproval_Members_UnknownAuthMethodRefused(t *testing.T) {
+	runCredentialRefusal(t, credentialIdentity("github:alice", "ldap"), identity.CredentialUnknown)
+}
+
+// A bare Identity{Subject} carries no credential marker at all.
+func TestSubmitApproval_Members_NoCredentialRefused(t *testing.T) {
+	runCredentialRefusal(t, Identity{Subject: "github:alice"}, identity.CredentialUnknown)
+}
+
+func runCredentialRefusal(t *testing.T, id Identity, wantKind string) {
+	t.Helper()
+	s, ar, rr, au, _ := newApprovalServerWithIdentity(t, &fakeIdentityProvider{})
+	stage := seedMembersStage(t, rr, au, 1, []string{"github:alice"}, "")
+
+	w := submitApprovalWithIdentity(t, s, stage.ID, &id, `{"decision":"approve"}`)
+	assertCredentialRefusal(t, w, wantKind)
+	if n := approvalRowCount(t, ar, stage); n != 0 {
+		t.Errorf("approval rows = %d, want 0 (refused pre-Submit)", n)
+	}
+	if got := membersStageState(rr, stage); got != run.StageStateAwaitingApproval {
+		t.Errorf("stage state = %q, want awaiting_approval", got)
+	}
+	snap := predicateRejectionSnapshot(t, au, "github:alice")
+	if snap["members_listed"] != true {
+		t.Errorf("rejection snapshot members_listed = %v, want true (listed, refused on the credential)", snap["members_listed"])
+	}
+	if snap["members_credential"] != wantKind {
+		t.Errorf("rejection snapshot members_credential = %v, want %q", snap["members_credential"], wantKind)
+	}
+}
+
+// T18: a delegated human-kind submission is credential-bound (its principal
+// is the subject itself), so a static credential is refused there too. T5
+// admits the same delegated submission on a forge-verified credential, so
+// excluding delegated submissions from the leg admits this one (200 plus a
+// row under the synthetic subject). CF6 vehicle.
+func TestSubmitApproval_Members_DelegatedHumanStaticRefused(t *testing.T) {
+	s, repo, au, _, ar := newDelegatedApprovalServer(t)
+	planStage := startDelegatedMembersRun(t, s, repo, au, `["github:alice"]`)
+
+	id := credentialIdentity("github:alice", "static")
+	w := submitApprovalWithIdentity(t, s, planStage.ID, &id, `{"decision":"approve","delegated":true}`)
+	assertCredentialRefusal(t, w, identity.CredentialStatic)
+	rows, _ := ar.ListForStage(context.Background(), planStage.ID)
+	if len(rows) != 0 {
+		t.Errorf("rows = %+v, want none", rows)
+	}
+	snap := rejectionSnapshotFromAuditFake(t, au, "github:alice")
+	if snap["members_listed"] != true || snap["members_credential"] != identity.CredentialStatic {
+		t.Errorf("rejection snapshot members_listed=%v members_credential=%v, want true / static", snap["members_listed"], snap["members_credential"])
+	}
+}
+
+// T19: every forge-verified kind is admitted and its kind is recorded on the
+// approval_submitted predicate_snapshot.
+func TestSubmitApproval_Members_ForgeVerifiedCredentialsAdmitted(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		id   Identity
+		want string
+	}{
+		{"device flow", forgeVerifiedIdentity("github:alice"), identity.CredentialDeviceFlow},
+		{"session", Identity{Subject: "github:alice", UserID: "u1", SessionID: "s1"}, identity.CredentialSession},
+		{"oauth_as", Identity{Subject: "github:alice", TokenID: "fho-1", Scopes: []string{"write:approvals"}, OAuthAudience: "https://fh.example/mcp"}, identity.CredentialOAuthAS},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			s, ar, rr, au, _ := newApprovalServerWithIdentity(t, &fakeIdentityProvider{})
+			stage := seedMembersStage(t, rr, au, 1, []string{"github:alice"}, "")
+			w := submitApprovalWithIdentity(t, s, stage.ID, &tc.id, `{"decision":"approve"}`)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+			}
+			if n := approvalRowCount(t, ar, stage); n != 1 {
+				t.Errorf("approval rows = %d, want 1", n)
+			}
+			if got := membersStageState(rr, stage); got != run.StageStateSucceeded {
+				t.Errorf("state = %q, want succeeded", got)
+			}
+			snap, _ := approvalPayloadFor(t, au, "github:alice")["predicate_snapshot"].(map[string]any)
+			if snap["members_credential"] != tc.want || snap["members_listed"] != true {
+				t.Errorf("snapshot members_credential=%v members_listed=%v, want %q / true", snap["members_credential"], snap["members_listed"], tc.want)
+			}
+		})
+	}
+}
+
+// T20 (C2 / #4633): on a gate declaring members AND a forge predicate, the
+// credential kind is handed from the members leg to the forge resolution, so
+// both the satisfied approval_submitted snapshot and a forge-predicate
+// refusal's approval_predicate_rejected snapshot carry members_credential.
+// CF vehicle: dropping the MembersCredential copy in that handoff leaves both
+// snapshots without the key.
+func TestSubmitApproval_Members_WithForgePredicateRecordsCredential(t *testing.T) {
+	specBytes := []byte(strings.Replace(string(quorumPredicateSpec(1, "", "acme/reviewers")),
+		"              member_of: acme/reviewers\n",
+		"              member_of: acme/reviewers\n              members: [\"github:alice\"]\n", 1))
+
+	t.Run("satisfied", func(t *testing.T) {
+		s, ar, rr, au, _ := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: true})
+		stage := seedQuorumStageSpec(rr, au, specBytes)
+		w := submitApprovalForgeVerified(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if n := approvalRowCount(t, ar, stage); n != 1 {
+			t.Errorf("approval rows = %d, want 1", n)
+		}
+		snap, _ := approvalPayloadFor(t, au, "github:alice")["predicate_snapshot"].(map[string]any)
+		if snap["member_resolved"] != true {
+			t.Errorf("snapshot member_resolved = %v, want true (the forge leg ran)", snap["member_resolved"])
+		}
+		if snap["members_credential"] != identity.CredentialDeviceFlow {
+			t.Errorf("approval_submitted snapshot members_credential = %v, want oauth", snap["members_credential"])
+		}
+	})
+	t.Run("forge predicate refused", func(t *testing.T) {
+		s, ar, rr, au, idp := newApprovalServerWithIdentity(t,
+			&fakeIdentityProvider{perm: identity.PermissionAdmin, member: false})
+		stage := seedQuorumStageSpec(rr, au, specBytes)
+		w := submitApprovalForgeVerified(t, s, stage.ID, "github:alice", `{"decision":"approve"}`)
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("status = %d, want 403:\n%s", w.Code, w.Body.String())
+		}
+		if idp.memberCalls != 1 {
+			t.Errorf("memberCalls = %d, want 1 (refused by the forge leg, not the members leg)", idp.memberCalls)
+		}
+		if n := approvalRowCount(t, ar, stage); n != 0 {
+			t.Errorf("approval rows = %d, want 0", n)
+		}
+		snap := predicateRejectionSnapshot(t, au, "github:alice")
+		if snap["member_resolved"] != false || snap["members_listed"] != true {
+			t.Errorf("rejection snapshot member_resolved=%v members_listed=%v, want false / true", snap["member_resolved"], snap["members_listed"])
+		}
+		if snap["members_credential"] != identity.CredentialDeviceFlow {
+			t.Errorf("approval_predicate_rejected snapshot members_credential = %v, want oauth", snap["members_credential"])
+		}
+	})
+}
+
+// T21: both members refusals' shipped next_actions state the enforced rule —
+// a forge-verified credential, and that a static API token cannot satisfy the
+// leg — and neither carries the old "never matches" claim.
+func TestSubmitApproval_Members_RefusalHintsStateRule(t *testing.T) {
+	s, _, rr, au, _ := newApprovalServerWithIdentity(t, &fakeIdentityProvider{})
+	stage := seedMembersStage(t, rr, au, 1, []string{"github:alice"}, "")
+
+	unlisted := submitApprovalForgeVerified(t, s, stage.ID, "github:mallory", `{"decision":"approve"}`)
+	staticID := credentialIdentity("github:alice", "static")
+	static := submitApprovalWithIdentity(t, s, stage.ID, &staticID, `{"decision":"approve"}`)
+	for name, w := range map[string]*httptest.ResponseRecorder{"unlisted": unlisted, "credential": static} {
+		if w.Code != http.StatusForbidden {
+			t.Fatalf("%s: status = %d, want 403:\n%s", name, w.Code, w.Body.String())
+		}
+		_, details := decodeApprovalError(t, w)
+		raw, _ := details["next_actions"].([]any)
+		var hints []string
+		for _, h := range raw {
+			hs, _ := h.(string)
+			hints = append(hints, hs)
+		}
+		joined := strings.Join(hints, "\n")
+		if !strings.Contains(joined, "forge-verified credential") {
+			t.Errorf("%s next_actions do not name a forge-verified credential:\n%s", name, joined)
+		}
+		if !strings.Contains(joined, "static API token") {
+			t.Errorf("%s next_actions do not name a static API token:\n%s", name, joined)
+		}
+		if strings.Contains(joined, "never matches") {
+			t.Errorf("%s next_actions still claim a static token \"never matches\":\n%s", name, joined)
+		}
+	}
+	_, unlistedDetails := decodeApprovalError(t, unlisted)
+	if _, present := unlistedDetails["reason"]; present {
+		t.Errorf("unlisted refusal carries details.reason=%v, want none (only the credential leg sets it)", unlistedDetails["reason"])
 	}
 }

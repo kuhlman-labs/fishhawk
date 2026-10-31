@@ -346,6 +346,12 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// E83.53 / #4086: the human-only resolve-with-evidence counterpart to the
 	// operator_evidence_routed veto, adjacent to the waive it is NOT.
 	registerResolveConcerns(srv, resolver)
+	// E94.8 / #4841 (ADR-117 D1 phase 3): the human-only relabel and
+	// duplicate_of verb, adjacent to the judgement-recording verbs it corrects.
+	registerLabelConcern(srv, resolver)
+	// E94.3 / #4694 (ADR-117 D3 + A1): record an escaped defect on its run,
+	// or close a pending one with a human, forge-verified attestation.
+	registerRecordEscape(srv, resolver)
 	registerDeferConcern(srv, resolver)
 	registerAnswerDivergence(srv, resolver)
 	registerRecordGroomingDispositions(srv, resolver)
@@ -381,6 +387,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// merge-queue entry, beside the read that shows the line it reorders.
 	// Distinct from fishhawk_promote_queued_stage (a concurrency waiter).
 	registerPromoteMergeQueueEntry(srv, resolver)
+	// E87.17 / #4685 (ADR-112 R3): the operator withdrawal of a YIELDED
+	// merge-queue entry's merge intent, beside the promote and the read that
+	// shows the yield; it unblocks an inline fishhawk_merge_run.
+	registerWithdrawMergeIntent(srv, resolver)
 	registerArbitrateAcceptance(srv, resolver)
 	registerReportProductIssue(srv, resolver)
 	registerReleaseNotes(srv, resolver)

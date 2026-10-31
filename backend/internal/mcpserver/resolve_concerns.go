@@ -13,11 +13,15 @@ import (
 
 // ResolveConcernsInput is the fishhawk_resolve_concerns tool's input schema
 // (E83.53 / #4086). Mirrors `POST /v0/runs/{run_id}/concerns/resolve`: a list
-// of the run's routed (addressed_pending) concern ids and ONE evidence note.
+// of the run's routed (addressed_pending) concern ids, ONE evidence note and
+// ONE human judgement. Judgement and TradeoffCost (ADR-117 D1, #4840) are
+// omitempty and not pre-checked: the backend is the single refusal authority.
 type ResolveConcernsInput struct {
-	RunID      string   `json:"run_id" jsonschema:"the run whose concerns to resolve; every id must belong to THIS run"`
-	ConcernIDs []string `json:"concern_ids" jsonschema:"the stable concern UUIDs to resolve (from fishhawk_get_gate_view or fishhawk_get_run_status's run.concerns.items[].id). Every id must be addressed_pending. At most 50 per batch; duplicates are rejected"`
-	Evidence   string   `json:"evidence" jsonschema:"REQUIRED operator evidence note (at most 4000 bytes): what you executed or observed that shows the routed concern is fixed. Recorded on EVERY concern_resolved_with_evidence audit entry and stored as each concern's state_reason (prefixed 'operator evidence: ')"`
+	RunID        string   `json:"run_id" jsonschema:"the run whose concerns to resolve; every id must belong to THIS run"`
+	ConcernIDs   []string `json:"concern_ids" jsonschema:"the stable concern UUIDs to resolve (from fishhawk_get_gate_view or fishhawk_get_run_status's run.concerns.items[].id). Every id must be addressed_pending. At most 50 per batch; duplicates are rejected"`
+	Evidence     string   `json:"evidence" jsonschema:"REQUIRED operator evidence note (at most 4000 bytes): what you executed or observed that shows the routed concern is fixed. Recorded on EVERY concern_resolved_with_evidence audit entry and stored as each concern's state_reason (prefixed 'operator evidence: ')"`
+	Judgement    string   `json:"judgement,omitempty" jsonschema:"REQUIRED human judgement covering the WHOLE batch (enforced by the backend): one of defect, defect_pre_existing, no_defect, tradeoff, preference, stale, insufficient_evidence; unlabelled is refused. A fixed concern is usually defect or defect_pre_existing. No reason-prefix derivation applies to a resolve. Missing or invalid: 400 validation_failed"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty" jsonschema:"the stated cost of a tradeoff judgement (at most 4000 bytes; refused with rule tradeoff_cost_too_long, never truncated): REQUIRED when the judgement is tradeoff and refused with any other judgement (400 validation_failed)"`
 }
 
 // ResolveConcernsOutput surfaces the per-item outcome list plus the counts.
@@ -49,20 +53,27 @@ type ResolveConcernsResult struct {
 
 // resolveConcernsRequestBody mirrors the backend's resolveConcernsRequest
 // (`backend/internal/server/resolve_concerns.go::resolveConcernsRequest`).
+// Judgement and TradeoffCost are omitempty: the backend requires the
+// judgement, and the client never refuses one locally.
 type resolveConcernsRequestBody struct {
-	ConcernIDs []string `json:"concern_ids"`
-	Evidence   string   `json:"evidence"`
+	ConcernIDs   []string `json:"concern_ids"`
+	Evidence     string   `json:"evidence"`
+	Judgement    string   `json:"judgement,omitempty"`
+	TradeoffCost string   `json:"tradeoff_cost,omitempty"`
 }
 
 // ResolveConcerns resolves a LIST of one run's addressed_pending concerns as
-// addressed with ONE evidence note via
-// `POST /v0/runs/{run_id}/concerns/resolve` (E83.53 / #4086). It lives here
+// addressed with ONE evidence note and ONE human judgement via
+// `POST /v0/runs/{run_id}/concerns/resolve` (E83.53 / #4086; judgement
+// ADR-117 D1, #4840). It lives here
 // rather than in client.go, like crew_message.go's methods. The
 // PRE-VALIDATION half is all-or-nothing; the APPLY half is per-item. 4xx/5xx
 // surfaces as *apiError:
 //   - 400 validation_failed (blank or over-cap evidence, empty concern_ids,
 //     over the 50-id cap, a duplicate id, a non-UUID id, or an id belonging to
-//     another run — details.rule "concern_run_mismatch")
+//     another run — details.rule "concern_run_mismatch"; or a missing, unknown
+//     or unlabelled judgement, a tradeoff/tradeoff_cost mismatch, or a
+//     tradeoff_cost over 4000 bytes — details.rule "tradeoff_cost_too_long")
 //   - 401 authentication_required
 //   - 403 resolve_requires_human (any agent token), insufficient_scope, or
 //     account_forbidden
@@ -70,8 +81,10 @@ type resolveConcernsRequestBody struct {
 //   - 409 concern_resolve_conflict (an id not in addressed_pending — the WHOLE
 //     batch is refused and nothing is resolved)
 //   - 503 concern_store_unconfigured
-func (c *apiClient) ResolveConcerns(ctx context.Context, runID uuid.UUID, concernIDs []string, evidence string) (*ResolveConcernsResult, error) {
-	body, err := json.Marshal(resolveConcernsRequestBody{ConcernIDs: concernIDs, Evidence: evidence})
+func (c *apiClient) ResolveConcerns(ctx context.Context, runID uuid.UUID, concernIDs []string, evidence, judgement, tradeoffCost string) (*ResolveConcernsResult, error) {
+	body, err := json.Marshal(resolveConcernsRequestBody{
+		ConcernIDs: concernIDs, Evidence: evidence, Judgement: judgement, TradeoffCost: tradeoffCost,
+	})
 	if err != nil {
 		return nil, fmt.Errorf("marshal resolve concerns: %w", err)
 	}
@@ -113,6 +126,15 @@ reviewer confirmation produces), not waived, and a later review can still
 reopen it. Use fishhawk_waive_concerns instead when a concern does not
 warrant a change at all.
 
+JUDGEMENT: ONE REQUIRED human judgement covers the batch — one of
+defect, defect_pre_existing, no_defect, tradeoff, preference, stale,
+insufficient_evidence (unlabelled is refused); a fixed concern is
+usually defect or defect_pre_existing. tradeoff_cost is required with a
+tradeoff and refused with any other judgement, and is at most 4000
+bytes (refused, not truncated). Each concern records
+outcome fixed, and judgement_bulk true only when the batch names more
+than one concern.
+
 Each concern gets a concern_resolved_with_evidence audit entry FIRST
 (durable before the state change), carrying your evidence; its
 state_reason becomes "operator evidence: <evidence>".
@@ -135,7 +157,10 @@ Returns a tool error on:
     evidence (caught before the HTTP hop)
   - validation_failed (400: over the 50-id cap, evidence over 4000
     bytes, a duplicate id, or an id from another run — details.rule
-    concern_run_mismatch)
+    concern_run_mismatch; or a missing, unknown or unlabelled judgement,
+    a tradeoff/tradeoff_cost mismatch, or a tradeoff_cost over 4000
+    bytes — details.rule tradeoff_cost_too_long — checked by the backend
+    only)
   - resolve_requires_human (403: an agent token)
   - concern_not_found (404)
   - concern_resolve_conflict (409: an id not in addressed_pending — the
@@ -165,7 +190,7 @@ func (r *runResolver) resolveConcerns(ctx context.Context, _ *mcp.CallToolReques
 	if strings.TrimSpace(in.Evidence) == "" {
 		return nil, ResolveConcernsOutput{}, fmt.Errorf("evidence is required: the operator evidence note is audited on every concern in the batch and stored as its state_reason")
 	}
-	res, err := r.api.ResolveConcerns(ctx, runID, in.ConcernIDs, in.Evidence)
+	res, err := r.api.ResolveConcerns(ctx, runID, in.ConcernIDs, in.Evidence, in.Judgement, in.TradeoffCost)
 	if err != nil {
 		return nil, ResolveConcernsOutput{}, fmt.Errorf("resolve concerns: %w", err)
 	}
