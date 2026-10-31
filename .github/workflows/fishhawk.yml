@@ -59,7 +59,8 @@ on:
 # customer's concurrent-job capacity. Sibling children of one fan-out share
 # parent_run_id, so this group queues them — cancel-in-progress: false NEVER
 # cancels a running stage — serializing the fan-out to one runner at a time as a
-# capacity guard. A normal run has an empty parent_run_id, so the group falls
+# capacity guard. queue:max retains up to 100 pending siblings; without it,
+# GitHub replaces the previous pending sibling. A normal run has an empty parent_run_id, so the group falls
 # back to the unique Actions run id and is NEVER serialized.
 #
 # Tradeoff: a fan-out runs sequentially at the Actions layer regardless of how
@@ -68,6 +69,7 @@ on:
 # it is a conservative safe default for capacity-constrained pools.
 concurrency:
   group: fishhawk-run-${{ inputs.parent_run_id || github.run_id }}
+  queue: max
   cancel-in-progress: false
 
 permissions:
@@ -85,6 +87,7 @@ jobs:
   run:
     name: Run Fishhawk stage
     runs-on: ubuntu-latest
+    timeout-minutes: 120
     steps:
       # Mint the Fishhawk App installation token via OIDC before
       # any git operation runs. The same token then flows into

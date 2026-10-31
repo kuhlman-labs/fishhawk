@@ -28,6 +28,7 @@ jobs:
   build:
     name: Build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # Deliberately contents-only: this job runs dependency code.
     permissions:
       contents: read
@@ -71,6 +72,7 @@ jobs:
     name: Deploy
     needs: build
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     # The only job holding these, and it runs no dependency code.
     permissions:
       pages: write # actions/deploy-pages publishes the artifact

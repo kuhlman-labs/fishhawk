@@ -1,9 +1,8 @@
 # fishhawkd container build (E13.3 / #60).
 #
-# Triggered by push to main when backend code (or this workflow
-# itself) changes. Publishes:
+# Called by CI only after CI Pass succeeds for a main push. Publishes:
 #   ghcr.io/kuhlman-labs/fishhawkd:main
-#   ghcr.io/kuhlman-labs/fishhawkd:sha-<short>
+#   ghcr.io/kuhlman-labs/fishhawkd:sha-<full>
 #
 # Tagged releases use a separate workflow (backend-release.yml)
 # that mirrors the runner-release pattern: re-runs lint+tests at
@@ -20,20 +19,7 @@
 name: Backend Build
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'backend/**'
-      - 'go.work'
-      - 'go.work.sum'
-      - 'runner/go.mod'
-      - 'runner/go.sum'
-      - 'cli/go.mod'
-      - 'cli/go.sum'
-      - 'verifier/go.mod'
-      - 'verifier/go.sum'
-      - '.github/workflows/backend-build.yml'
-      - '.dockerignore'
+  workflow_call:
 
 permissions:
   contents: read
@@ -43,7 +29,12 @@ permissions:
 jobs:
   build-and-push:
     name: Build, sign, and push fishhawkd image
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    concurrency:
+      group: publish-backend-main
+      cancel-in-progress: false
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - name: Checkout
         uses: actions/checkout@v7
@@ -64,8 +55,7 @@ jobs:
         with:
           images: ghcr.io/kuhlman-labs/fishhawkd
           tags: |
-            type=ref,event=branch
-            type=sha,prefix=sha-
+            type=sha,prefix=sha-,format=long
           labels: |
             org.opencontainers.image.title=fishhawkd
             org.opencontainers.image.description=Fishhawk backend control plane.
@@ -84,6 +74,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             VERSION=sha-${{ github.sha }}
+            GIT_SHA=${{ github.sha }}
           cache-from: type=gha,scope=backend-build
           cache-to: type=gha,mode=max,scope=backend-build
           provenance: true
@@ -100,3 +91,17 @@ jobs:
           # Sign by digest so the signature stays attached to the
           # exact image bytes — re-tagging doesn't break verify.
           cosign sign --yes "ghcr.io/kuhlman-labs/fishhawkd@${DIGEST}"
+
+      - name: Promote signed image only while this commit is main
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          current="$(gh api "repos/$GITHUB_REPOSITORY/git/ref/heads/main" --jq .object.sha)"
+          if [ "$current" != "$GITHUB_SHA" ]; then
+            echo "::notice::A newer main exists; keeping only the immutable image tag."
+            exit 0
+          fi
+          docker buildx imagetools create --prefer-index=false \
+            --tag ghcr.io/kuhlman-labs/fishhawkd:main \
+            "ghcr.io/kuhlman-labs/fishhawkd@$DIGEST"

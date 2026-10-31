@@ -35,19 +35,51 @@ on:
 
 permissions:
   contents: read
-  id-token: write # OIDC for AWS role assumption
 
 defaults:
   run:
     working-directory: infra/terraform
 
 jobs:
-  apply:
+  protections:
+    name: Check deployment protections before requesting AWS credentials
     runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      actions: read
+    defaults:
+      run:
+        working-directory: .
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+      - name: Verify main-only dispatch and live environment protections
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          gh api "repos/$GITHUB_REPOSITORY/environments/$DEPLOY_ENV" > "$RUNNER_TEMP/environment.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/environments/$DEPLOY_ENV/deployment-branch-policies" > "$RUNNER_TEMP/branch-policies.json"
+          python3 scripts/check-deploy-environment.py "$DEPLOY_ENV" "$RUNNER_TEMP/environment.json" "$RUNNER_TEMP/branch-policies.json"
+
+  validate:
+    uses: ./.github/workflows/infra-check.yml
+
+  apply:
+    needs: [protections, validate]
+    permissions:
+      contents: read
+      id-token: write
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
     # Push-to-main always targets dev; workflow_dispatch picks the
     # env explicitly. The `environment` reference here gates the
     # job on the GitHub environment's protection rules (prod has
-    # required reviewers; dev is wide-open).
+    # required reviewers; both environments allow only main).
     environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
     concurrency:
       group: infra-apply-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
@@ -68,13 +100,16 @@ jobs:
       - name: terraform init
         env:
           ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
+          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
+          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
+          REGION: ${{ vars.AWS_REGION }}
         run: |
           set -eu
           terraform init \
-            -backend-config="bucket=${{ vars.TF_STATE_BUCKET }}" \
+            -backend-config="bucket=${STATE_BUCKET}" \
             -backend-config="key=${ENV}/terraform.tfstate" \
-            -backend-config="dynamodb_table=${{ vars.TF_LOCK_TABLE }}" \
-            -backend-config="region=${{ vars.AWS_REGION }}" \
+            -backend-config="dynamodb_table=${LOCK_TABLE}" \
+            -backend-config="region=${REGION}" \
             -backend-config="encrypt=true"
 
       - name: terraform plan

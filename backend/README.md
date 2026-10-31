@@ -154,7 +154,7 @@ A token for an operator-agent role instance (ADR-040 D4) uses the subject conven
 `fishhawkd` ships as a distroless static-binary image at
 `ghcr.io/kuhlman-labs/fishhawkd`. Two tag streams:
 
-- `:main` and `:sha-<commit>` — pushed by `.github/workflows/backend-build.yml` on every merge to `main`.
+- `:main` and `:sha-<full-commit>` — published by the reusable `.github/workflows/backend-build.yml` after the same main push passes CI and changes image inputs (including shared workspace modules). The signed digest is promoted to `:main` only while its commit remains the branch tip.
 - `:v<version>` and `:latest` — pushed by `.github/workflows/backend-release.yml` on `backend/v*` tags. Tagged releases also attach an SPDX-JSON SBOM to the GitHub Release.
 
 Both streams are signed keylessly with [cosign](https://docs.sigstore.dev/cosign/overview/) via GitHub Actions OIDC. To verify before pulling:
