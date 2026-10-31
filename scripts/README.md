@@ -802,8 +802,9 @@ with one running at a time. The backend fan-out cap must remain below that
 queue capacity; GitHub cancels arrivals above capacity. PR updates cancel older
 checks for that PR. Main pushes use independent run groups so GitHub cannot
 replace a pending code push with a docs-only push and lose its image trigger.
-Only image promotion keeps latest-pending behavior; the newer applicable
-publisher supersedes the older one.
+Image publishers also use `queue: max`: CI completion order need not match
+commit order, so an older run must not replace a newer pending publisher.
+The freshness check rejects obsolete inputs when each publisher runs.
 
 ## CI test legs ([#3882](https://github.com/kuhlman-labs/fishhawk/issues/3882))
 

@@ -114,6 +114,7 @@ class WorkflowContracts(unittest.TestCase):
             self.assertEqual(set(data["on"]), {"workflow_call"})
             publish = data["jobs"][job]
             self.assertEqual(publish["concurrency"]["cancel-in-progress"], "false")
+            self.assertEqual(publish["concurrency"]["queue"], "max")
             promote = publish["steps"][-1]["run"]
             self.assertIn('scripts/ci-image-current', promote)
             self.assertIn('git fetch --no-tags origin main', promote)
