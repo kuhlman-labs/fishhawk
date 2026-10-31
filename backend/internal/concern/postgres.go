@@ -122,7 +122,7 @@ func (r *postgresRepo) MarkAddressedPending(ctx context.Context, ids []uuid.UUID
 			// already in the target state.
 			continue
 		}
-		if _, err := r.transition(ctx, c, StateAddressedPending, reason); err != nil {
+		if _, err := r.transition(ctx, c, StateAddressedPending, reason, nil); err != nil {
 			return err
 		}
 	}
@@ -134,15 +134,114 @@ func (r *postgresRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to Sta
 	if err != nil {
 		return nil, err
 	}
-	return r.transition(ctx, current[0], to, reason)
+	return r.transition(ctx, current[0], to, reason, nil)
+}
+
+func (r *postgresRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d Disposition) (*Concern, error) {
+	if d.Outcome == "" {
+		return nil, fmt.Errorf("concern: apply disposition %s: outcome required (use ApplyResolution to record none)", id)
+	}
+	current, err := r.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	outcome := string(d.Outcome)
+	return r.transition(ctx, current[0], to, reason, &outcome)
+}
+
+func (r *postgresRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to State, reason string, d HumanDisposition) (*Concern, error) {
+	if err := d.Validate(); err != nil {
+		return nil, fmt.Errorf("concern: apply human disposition %s: %w", id, err)
+	}
+	current, err := r.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	c := current[0]
+	if err := Transition(c.State, to); err != nil {
+		return nil, err
+	}
+	q := concerndb.New(r.pool)
+	row, err := q.UpdateReviewConcernStateJudged(ctx, concerndb.UpdateReviewConcernStateJudgedParams{
+		ID:                 c.ID,
+		State:              string(to),
+		StateReason:        reason,
+		Outcome:            string(d.Outcome),
+		Judgement:          string(d.Judgement),
+		JudgementActorKind: d.ActorKind,
+		JudgementDelegated: d.Delegated,
+		JudgementBulk:      d.JudgementBulk,
+		TradeoffCost:       d.TradeoffCost,
+		FromState:          string(c.State),
+	})
+	return transitionResult(c, row, err)
+}
+
+func (r *postgresRepo) ApplyLabel(ctx context.Context, id uuid.UUID, l Label) (*Concern, error) {
+	if err := l.Validate(); err != nil {
+		return nil, fmt.Errorf("concern: apply label %s: %w", id, err)
+	}
+	current, err := r.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	c := current[0]
+	judgement, tradeoffCost := string(l.Judgement), l.TradeoffCost
+	if l.DuplicateOf != nil {
+		var target *Concern
+		targets, err := r.GetByIDs(ctx, []uuid.UUID{*l.DuplicateOf})
+		switch {
+		case errors.Is(err, ErrNotFound):
+			// A target with no row is refused exactly like a foreign one
+			// (M1): CheckDuplicateTarget(c, nil), never ErrNotFound.
+		case err != nil:
+			return nil, fmt.Errorf("concern: apply label %s: read duplicate_of target: %w", id, err)
+		default:
+			target = targets[0]
+		}
+		if err := CheckDuplicateTarget(c, target); err != nil {
+			return nil, fmt.Errorf("concern: apply label %s: %w", id, err)
+		}
+		judgement, tradeoffCost = string(JudgementUnlabelled), ""
+	}
+	q := concerndb.New(r.pool)
+	row, err := q.SetReviewConcernLabel(ctx, concerndb.SetReviewConcernLabelParams{
+		Judgement:          judgement,
+		JudgementActorKind: l.ActorKind,
+		JudgementBackfill:  l.Backfill,
+		TradeoffCost:       tradeoffCost,
+		DuplicateOf:        l.DuplicateOf,
+		ID:                 c.ID,
+		PriorJudgement:     string(l.PriorJudgement),
+		PriorDuplicateOf:   l.PriorDuplicateOf,
+	})
+	if errors.Is(err, pgx.ErrNoRows) {
+		return nil, fmt.Errorf("%w: concern %s no longer holds judgement %q and duplicate_of %s", ErrLabelConflict, c.ID, l.PriorJudgement, uuidOrNone(l.PriorDuplicateOf))
+	}
+	if err != nil {
+		return nil, fmt.Errorf("concern: apply label %s: %w", id, err)
+	}
+	return rowToConcern(row), nil
+}
+
+// uuidOrNone renders an optional id for an error message.
+func uuidOrNone(id *uuid.UUID) string {
+	if id == nil {
+		return "none"
+	}
+	return id.String()
 }
 
 // transition validates the lifecycle edge against the Go state machine
 // and applies it with a from-state guard so a concurrent writer cannot
 // race past the validation (the guarded UPDATE matching zero rows means
 // the state moved underneath us — surfaced as an error, never silently
-// applied).
-func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, reason string) (*Concern, error) {
+// applied). A non-nil outcome is recorded in the same UPDATE; a nil one
+// leaves the outcome alone except that a move back into an open state clears
+// a stale OutcomeFixed (UpdateReviewConcernState). No judgement column is
+// ever written here: the human verbs' judged transition is
+// ApplyHumanDisposition (UpdateReviewConcernStateJudged).
+func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, reason string, outcome *string) (*Concern, error) {
 	if err := Transition(c.State, to); err != nil {
 		return nil, err
 	}
@@ -151,8 +250,16 @@ func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, rea
 		ID:          c.ID,
 		State:       string(to),
 		StateReason: reason,
+		Outcome:     outcome,
 		FromState:   string(c.State),
 	})
+	return transitionResult(c, row, err)
+}
+
+// transitionResult maps a from-state-guarded UPDATE's result: zero rows means
+// the state moved underneath the caller (surfaced as an error, never silently
+// applied).
+func transitionResult(c *Concern, row concerndb.ReviewConcern, err error) (*Concern, error) {
 	if errors.Is(err, pgx.ErrNoRows) {
 		return nil, fmt.Errorf("concern: %s state changed concurrently (was %s)", c.ID, c.State)
 	}
@@ -160,6 +267,67 @@ func (r *postgresRepo) transition(ctx context.Context, c *Concern, to State, rea
 		return nil, fmt.Errorf("concern: update state: %w", err)
 	}
 	return rowToConcern(row), nil
+}
+
+func (r *postgresRepo) ImportRolledUp(ctx context.Context, p ImportRolledUpParams) ([]*Concern, error) {
+	if p.ParentRunID == uuid.Nil {
+		return nil, errors.New("concern: parent run_id required")
+	}
+	if p.ParentStageID == uuid.Nil {
+		return nil, errors.New("concern: parent stage_id required")
+	}
+	if len(p.Sources) == 0 {
+		return nil, nil
+	}
+	tx, err := r.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("concern: import rolled up: begin: %w", err)
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := concerndb.New(tx)
+	var out []*Concern
+	for _, src := range p.Sources {
+		if src == nil {
+			continue
+		}
+		row, err := q.ImportRolledUpReviewConcern(ctx, concerndb.ImportRolledUpReviewConcernParams{
+			ID:            uuid.New(),
+			ParentRunID:   p.ParentRunID,
+			ParentStageID: p.ParentStageID,
+			StateReason:   RolledUpStateReason(src),
+			SourceID:      src.ID,
+		})
+		switch {
+		case errors.Is(err, pgx.ErrNoRows):
+			// Already imported into this parent (the unique index's
+			// ON CONFLICT DO NOTHING): no second copy. Or the source is no
+			// longer open — a concurrent sweep closed it after the caller
+			// read it — so no copy, and the carried mark below skips it.
+		case err != nil:
+			return nil, fmt.Errorf("concern: import rolled up %s: %w", src.ID, err)
+		default:
+			out = append(out, rowToConcern(row))
+		}
+		if err := q.MarkReviewConcernCarried(ctx, src.ID); err != nil {
+			return nil, fmt.Errorf("concern: mark %s carried: %w", src.ID, err)
+		}
+	}
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("concern: import rolled up: commit: %w", err)
+	}
+	return out, nil
+}
+
+func (r *postgresRepo) StampOpenAtMerge(ctx context.Context, runIDs []uuid.UUID) (int64, error) {
+	if len(runIDs) == 0 {
+		return 0, nil
+	}
+	q := concerndb.New(r.pool)
+	n, err := q.StampReviewConcernsOpenAtMerge(ctx, runIDs)
+	if err != nil {
+		return 0, fmt.Errorf("concern: stamp open_at_merge: %w", err)
+	}
+	return n, nil
 }
 
 func rowsToConcerns(rows []concerndb.ReviewConcern) []*Concern {
@@ -191,6 +359,15 @@ func rowToConcern(r concerndb.ReviewConcern) *Concern {
 		SeverityClampedFrom:  r.SeverityClampedFrom,
 		Provenance:           r.Provenance,
 		CheckKey:             r.CheckKey,
+		Outcome:              Outcome(r.Outcome),
+		RolledUpFrom:         r.RolledUpFrom,
+		Judgement:            Judgement(r.Judgement),
+		JudgementActorKind:   r.JudgementActorKind,
+		JudgementDelegated:   r.JudgementDelegated,
+		JudgementBulk:        r.JudgementBulk,
+		JudgementBackfill:    r.JudgementBackfill,
+		TradeoffCost:         r.TradeoffCost,
+		DuplicateOf:          r.DuplicateOf,
 	}
 	if r.CreatedAt.Valid {
 		out.CreatedAt = r.CreatedAt.Time

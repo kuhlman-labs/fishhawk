@@ -10,35 +10,49 @@ package server
 //     merge_queue_yielded row re-appended, approval condition C7, and one
 //     operator-visible merge_queue_yield_posted row per yield episode, both
 //     under the run's merge-intent lock, approval condition C6), and AT MOST
-//     ONE row per base, the oldest due one, is RE-PROBED on an exponential
-//     schedule over its yielded_at age (yieldReprobeDue), judged over the
-//     time since this process's previous sweep.
+//     ONE due row per base is RE-PROBED on an exponential schedule over its
+//     yielded_at age. Due is judged against the row's OWN service mark
+//     (ADR-112 Amendment A2.1, yieldReprobeDueFor: the age at which this
+//     process last probed it), and the probed row is the due one with the
+//     oldest mark, never-serviced first, ties by yielded_at (A2.2,
+//     yieldServicedBefore), so N due rows on a base are each probed within N
+//     sweeps.
 //   - The same tick then runs the ADR-093 D4 automatic re-entry sweep
 //     (sweepMergeQueueReentries, merge_queue_reentry.go), which re-enters an
 //     ejected red pass at the tail once its delegated fix-up has pushed and
-//     the run is eligible again, on the same yieldReprobeDue schedule.
+//     the run is eligible again, on the same schedule (yieldReprobeDue) over
+//     its own previous-sweep window.
 //   - ReprobeMergeQueueYield is the targeted, no-backoff re-probe by run id
 //     (the merge_run re-invoke, which FORCES one re-attempt, and the approval
 //     webhook, which does not, slice 4).
 //
-// A re-probe runs the ONE forge-approval fold at the row's anchored head with
-// no store transaction open: the clear predicate holds (mergeQueueYieldClears:
-// the fold approved and, for a forge_review_required row, a fresh snapshot
-// showing the row-4 condition gone) → ClearYield (CAS on anchored head and
-// yielded_at) → merge_queue_yield_cleared → a detached pump of the base (the
-// row rejoins FIFO at its enqueued_at); an approved fold the predicate refuses
-// → nothing; the same non-approved reason → nothing;
-// a changed reason → UpdateYield (same CAS) and a merge_queue_yielded
-// transition row; the PR head moved → ReanchorYielded to the current head,
-// KEEPING the marker and the episode (approval condition C2: a head move never
-// clears a marker), then the new head is judged on the same probe; merged, a
-// transport error or a CAS conflict → nothing. Contract:
+// A re-probe judges the row with no store transaction open, in the order of
+// docs/adr/112 Amendment A3.4 (#4780): (1) GATE-INDEPENDENT PR-head
+// discovery: the PR is read (merged, closed, a read error, or no GitHub
+// client, installation or tracked PR to read it → nothing; a hard
+// precondition, so such a yield never clears automatically) and a
+// moved head re-anchors the row with ReanchorYielded (CAS on head and
+// yield_revision), KEEPING the marker, yielded_at, the approval anchor, the
+// row-4 flag and the budget (approval condition C2, A3.7: a head move never
+// clears a marker), and the probe judges the new head; (2) the forge-approval
+// fold at the anchored head (its head_moved branch stays as the race
+// fallback); (3) the merge-gate legs (mergeQueueMergeEligibility at the
+// anchored head; an undeterminable result → nothing, fail closed); (4) the
+// tier (mergeQueueYieldTier, A3.5: veto > merge-gate > row-4 > fold). Not
+// blocked → ClearYield (CAS on anchored head and yield_revision, A3.6) →
+// merge_queue_yield_cleared → a detached pump of the base (the row rejoins
+// FIFO at its enqueued_at); blocked with the stored reason → nothing; blocked
+// with another reason → UpdateYield (same CAS) and a merge_queue_yielded
+// transition row; a CAS conflict → nothing. force (the operator's merge_run,
+// A3.9) skips ONLY the row-4 fresh snapshot. Contract:
 // backend/internal/server/README.md and backend/internal/mergequeue/README.md
 // § "Yield".
 
 import (
 	"context"
 	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -75,10 +89,9 @@ const (
 	reprobeReanchored   mergeQueueYieldReprobeOutcome = "reanchored"
 )
 
-// yieldReprobeDue reports whether a yielded row of age is due a scheduled
-// re-probe on the sweep that observes it: the schedule points are
-// interval·2^k (k = 0..log2 of the cap) and then every cap·interval, and a
-// row is due when a point fell since this process's previous sweep, inside
+// yieldReprobeDue reports whether a row of age is due a scheduled probe on
+// the sweep that observes it, judged over the time since the caller's
+// previous sweep: a schedule point (yieldReprobeLastPoint) fell inside
 // (age − since, age]. since <= 0 (no previous sweep: a restart) widens the
 // window to (0, age], so every row past its first point is due once. The
 // window is the ACTUAL time since the previous sweep, not one interval: a
@@ -86,39 +99,100 @@ const (
 // busy) never skips a point, so no row past the cap starves on a tick-parity
 // stride. The schedule is the row's own database-clock age and since is a
 // duration on this process's clock (no instants cross the two clocks); only
-// since is process state. A row younger than one interval is never due (the
-// first point is one interval): the decision that yielded it just ran.
+// since is process state. The ADR-093 D4 re-entry sweep judges its rows with
+// it; the yield re-probe judges against per-entry service marks instead
+// (yieldReprobeDueAfter, ADR-112 Amendment A2.1).
 func yieldReprobeDue(age, since, interval time.Duration) bool {
 	if interval <= 0 || age < interval {
 		return false
-	}
-	capSpan := interval * mergeQueueYieldReprobeMaxBackoffTicks
-	last := interval // the latest schedule point <= age
-	if age > capSpan {
-		last = age / capSpan * capSpan
-	} else {
-		for last*2 <= age && last*2 <= capSpan {
-			last *= 2
-		}
 	}
 	lo := time.Duration(0)
 	if since > 0 && age-since > 0 {
 		lo = age - since
 	}
-	return last > lo
+	return yieldReprobeLastPoint(age, interval) > lo
 }
 
-// yieldSweepSince records now as this process's latest yield sweep and
-// returns the time since the previous one (0 before the first).
-func (s *Server) yieldSweepSince(now time.Time) time.Duration {
+// yieldReprobeLastPoint is the latest schedule point <= age (age >= interval
+// > 0): the points are interval·2^k (k = 0..log2 of the cap) and then every
+// cap·interval. A row younger than one interval has no point (the first is
+// one interval): the decision that yielded it just ran.
+func yieldReprobeLastPoint(age, interval time.Duration) time.Duration {
+	capSpan := interval * mergeQueueYieldReprobeMaxBackoffTicks
+	last := interval
+	if age > capSpan {
+		return age / capSpan * capSpan
+	}
+	for last*2 <= age && last*2 <= capSpan {
+		last *= 2
+	}
+	return last
+}
+
+// yieldReprobeDueAfter reports whether a yielded row of age is due a
+// scheduled re-probe given the age at which this process last serviced it
+// (ADR-112 Amendment A2.1): a schedule point fell inside (servicedAge, age].
+// servicedAge 0 (never serviced, or a new episode) judges (0, age], so a row
+// past its first point is due once. A row younger than one interval is never
+// due.
+func yieldReprobeDueAfter(age, servicedAge, interval time.Duration) bool {
+	if interval <= 0 || age < interval {
+		return false
+	}
+	return yieldReprobeLastPoint(age, interval) > servicedAge
+}
+
+// yieldServicedMark is one entry's ADR-112 Amendment A2.1 service mark: the
+// yield episode (yieldedAt) and database-clock age at which this process's
+// sweep last re-probed it, and seq, its place in the process-local service
+// order (strictly increasing from 1; 0 is never serviced).
+type yieldServicedMark struct {
+	yieldedAt time.Time
+	age       time.Duration
+	seq       uint64
+}
+
+// yieldReprobeDueFor judges e (yielded) against its own service mark and
+// returns whether it is due and its service seq (0: never serviced). The mark
+// applies only while e.YieldedAt is NOT after the mark's: a later yielded_at
+// is a new episode, judged as never serviced over (0, age].
+func (s *Server) yieldReprobeDueFor(e mergequeue.Entry, interval time.Duration) (due bool, seq uint64) {
+	var servicedAge time.Duration
+	s.yieldSweepMu.Lock()
+	if m, ok := s.yieldServiced[e.ID]; ok && e.YieldedAt != nil && !e.YieldedAt.After(m.yieldedAt) {
+		servicedAge, seq = m.age, m.seq
+	}
+	s.yieldSweepMu.Unlock()
+	return yieldReprobeDueAfter(e.YieldAge, servicedAge, interval), seq
+}
+
+// markYieldReprobeServiced advances e's service mark to its current episode
+// and age, at the next service seq. Only the probed row's mark advances, even
+// when its probe did nothing (ADR-112 Amendment A2.1).
+func (s *Server) markYieldReprobeServiced(e mergequeue.Entry) {
+	if e.YieldedAt == nil {
+		return
+	}
 	s.yieldSweepMu.Lock()
 	defer s.yieldSweepMu.Unlock()
-	var since time.Duration
-	if !s.yieldSweepLast.IsZero() {
-		since = now.Sub(s.yieldSweepLast)
+	if s.yieldServiced == nil {
+		s.yieldServiced = make(map[uuid.UUID]yieldServicedMark)
 	}
-	s.yieldSweepLast = now
-	return since
+	s.yieldServiceSeq++
+	s.yieldServiced[e.ID] = yieldServicedMark{yieldedAt: *e.YieldedAt, age: e.YieldAge, seq: s.yieldServiceSeq}
+}
+
+// pruneYieldReprobeServiced drops the mark of every entry not in seen. The
+// sweep calls it only after a FULLY listed sweep, so a failed listing never
+// drops a live row's mark.
+func (s *Server) pruneYieldReprobeServiced(seen map[uuid.UUID]struct{}) {
+	s.yieldSweepMu.Lock()
+	defer s.yieldSweepMu.Unlock()
+	for id := range s.yieldServiced {
+		if _, ok := seen[id]; !ok {
+			delete(s.yieldServiced, id)
+		}
+	}
 }
 
 // RunMergeQueueYieldReprobe sweeps every active base on every interval tick
@@ -146,50 +220,70 @@ func (s *Server) RunMergeQueueYieldReprobe(ctx context.Context, interval time.Du
 }
 
 // sweepMergeQueueYields surfaces every yielded row older than one tick and
-// re-probes at most one due row per base, the oldest by (yielded_at, id),
-// judging due over the time since this process's previous sweep
-// (yieldReprobeDue). It returns how many rows it re-probed. A list error
+// re-probes at most one due row per base: due against the row's own service
+// mark (yieldReprobeDueFor, ADR-112 Amendment A2.1), and among due rows the
+// oldest mark first, never-serviced first, ties by (yielded_at, id)
+// (yieldServicedBefore, A2.2). Only the probed row's mark advances. Marks of
+// entries no longer listed are pruned, but only when ActiveBases and every
+// ListForBase succeeded. It returns how many rows it re-probed. A list error
 // skips the base (or the sweep); the next tick retries.
 func (s *Server) sweepMergeQueueYields(ctx context.Context, interval time.Duration) int {
 	if s.cfg.MergeQueue == nil {
 		return 0
 	}
-	since := s.yieldSweepSince(time.Now())
 	bases, err := s.cfg.MergeQueue.ActiveBases(ctx)
+	listed := err == nil // every listing succeeded: only then may marks be pruned
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: listing active bases for the yield re-probe failed; the next tick retries",
 			slog.String("error", err.Error()))
-		return 0
 	}
+	seen := make(map[uuid.UUID]struct{})
 	probed := 0
 	for _, b := range bases {
 		entries, err := s.cfg.MergeQueue.ListForBase(ctx, b)
 		if err != nil {
+			listed = false
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 				"merge queue: listing a base for the yield re-probe failed; the next tick retries",
 				slog.String("repo", b.Repo), slog.String("base_ref", b.BaseRef), slog.String("error", err.Error()))
 			continue
 		}
 		var due *mergequeue.Entry
+		var dueSeq uint64
 		for i := range entries {
 			e := entries[i]
+			seen[e.ID] = struct{}{}
 			if e.State != mergequeue.StateHeld || !e.Yielded() {
 				continue
 			}
 			if e.YieldAge >= interval { // posted-once age check: a fresh yield is not surfaced yet
 				s.surfaceMergeQueueYield(ctx, e)
 			}
-			if yieldReprobeDue(e.YieldAge, since, interval) && (due == nil || yieldedBefore(e, *due)) {
-				due = &e
+			if ok, seq := s.yieldReprobeDueFor(e, interval); ok && (due == nil || yieldServicedBefore(seq, e, dueSeq, *due)) {
+				due, dueSeq = &e, seq
 			}
 		}
 		if due != nil {
 			s.reprobeMergeQueueYield(ctx, *due, false)
+			s.markYieldReprobeServiced(*due)
 			probed++
 		}
 	}
+	if listed {
+		s.pruneYieldReprobeServiced(seen)
+	}
 	return probed
+}
+
+// yieldServicedBefore is ADR-112 Amendment A2.2's re-probe order: a (service
+// seq aSeq) before b (bSeq) when its service mark is older, a never-serviced
+// row (seq 0) first, and between equal marks by (yielded_at, id).
+func yieldServicedBefore(aSeq uint64, a mergequeue.Entry, bSeq uint64, b mergequeue.Entry) bool {
+	if aSeq != bSeq { // ADR-112 A2.2: the oldest service mark first; never serviced (0) first
+		return aSeq < bSeq
+	}
+	return yieldedBefore(a, b)
 }
 
 // yieldedBefore orders yielded entries by (yielded_at, id).
@@ -209,9 +303,12 @@ func mergeQueueYieldEpisode(e mergequeue.Entry) (entryID, yieldedAt string) {
 	return e.ID.String(), e.YieldedAt.UTC().Format(time.RFC3339Nano)
 }
 
-// mergeQueueYieldRow is the ADR-112 R3 precedence row a stored reason names.
+// mergeQueueYieldRow is the ADR-112 R3 precedence row a stored reason names
+// (the three merge-gate reasons are row 1, docs/adr/112 A3.2).
 func mergeQueueYieldRow(reason string) int {
 	switch reason {
+	case mergeQueueYieldMergeChecksRed, mergeQueueYieldMergeChecksPending, mergeQueueYieldMergeReviewPending:
+		return mergeQueueYieldRowEligibility
 	case mergeCandidateQueueReasonForgeApprovalVetoed:
 		return mergeQueueYieldRowVeto
 	case mergeQueueYieldForgeReviewRequired:
@@ -310,10 +407,11 @@ func (s *Server) writeMergeQueueYieldPosted(ctx context.Context, e mergequeue.En
 }
 
 // ReprobeMergeQueueYield re-probes runID's yielded entry NOW, with no
-// backoff: the merge_run re-invoke and the approval webhook's trigger (the
-// fold re-reads the forge and is the sole decision). force is the operator's
-// explicit merge_run, which may re-attempt a forge_review_required yield once
-// (mergeQueueYieldClears); every automatic trigger passes false. It reports
+// backoff: the merge_run re-invoke and the approval and check_run webhook
+// triggers (the probe re-reads the forge and is the sole decision). force is
+// the operator's explicit merge_run, which skips ONLY the row-4 fresh
+// snapshot (mergeQueueYieldTier, docs/adr/112 A3.9); every automatic trigger
+// passes false. It reports
 // whether the marker was cleared (the base is then pumped, detached). A run
 // with no active entry, or one not yielded, does nothing.
 func (s *Server) ReprobeMergeQueueYield(ctx context.Context, runID uuid.UUID, force bool) bool {
@@ -327,11 +425,11 @@ func (s *Server) ReprobeMergeQueueYield(ctx context.Context, runID uuid.UUID, fo
 	return s.reprobeMergeQueueYield(ctx, st.Entry, force) == reprobeCleared
 }
 
-// reprobeMergeQueueYield re-judges the yielded entry e at its anchored head
-// (see the file comment; force as ReprobeMergeQueueYield). No store
-// transaction is open across the fold.
+// reprobeMergeQueueYield re-judges the yielded entry e (see the file
+// comment; force as ReprobeMergeQueueYield). No store transaction is open
+// across a forge read.
 func (s *Server) reprobeMergeQueueYield(ctx context.Context, e mergequeue.Entry, force bool) mergeQueueYieldReprobeOutcome {
-	if e.State != mergequeue.StateHeld || !e.Yielded() || s.cfg.RunRepo == nil {
+	if e.State != mergequeue.StateHeld || !e.Yielded() || s.cfg.RunRepo == nil || s.cfg.GitHub == nil {
 		return reprobeNothing
 	}
 	log := func(msg string, err error) {
@@ -348,93 +446,163 @@ func (s *Server) reprobeMergeQueueYield(ctx context.Context, e mergequeue.Entry,
 	if runRow.State.IsTerminal() {
 		return reprobeNothing
 	}
+	nothing := reprobeNothing // reprobeReanchored once this probe moved the anchor
+	reanchor := func(head string) bool {
+		moved, err := s.cfg.MergeQueue.ReanchorYielded(ctx, e.ID, e.AnchoredHeadSHA, e.YieldRevision, head, "")
+		if err != nil {
+			log("merge queue: the yield re-probe could not re-anchor the moved head; another write owns the entry", err)
+			return false
+		}
+		e, nothing = moved, reprobeReanchored
+		return true
+	}
+
+	// (1) A3.4: gate-independent PR-head discovery. A gate-less fold is
+	// approved without reading the PR, so the head is read here. The read is
+	// a HARD precondition: no GitHub client, no installation, no tracked PR
+	// or a read error → nothing, so such a yield clears only once the read
+	// succeeds. Clearing it unread would only re-admit an entry merge-on-pass
+	// itself holds transient on the same missing installation
+	// (mergeQueueMergeOnPass), and the fold and the checks leg read the same
+	// forge.
+	pr, err := s.mergeQueueReentryReadPR(ctx, runRow)
+	if err != nil {
+		log("merge queue: the yield re-probe could not read the pull request; the next tick retries", err)
+		return reprobeNothing
+	}
+	if pr.Merged || pr.State == "closed" {
+		return reprobeNothing
+	}
+	if pr.HeadSHA != "" && pr.HeadSHA != e.AnchoredHeadSHA && !reanchor(pr.HeadSHA) { // A3.4 head discovery
+		return reprobeNothing
+	}
+
+	// (2) The forge-approval fold at the anchored head.
 	fold, err := s.forgeApprovalFold(ctx, runRow, e.AnchoredHeadSHA)
 	if err != nil {
 		log("merge queue: the yield re-probe's review snapshot failed; the next tick retries", err)
-		return reprobeNothing
+		return nothing
 	}
 	if fold.Merged {
-		return reprobeNothing
+		return nothing
 	}
-	if fold.Reason == forgeApprovalReasonHeadMoved { // C2(a): re-anchor the yielded row, keep the marker
-		if fold.ObservedHead == "" {
-			return reprobeNothing
+	if fold.Reason == forgeApprovalReasonHeadMoved { // the race fallback: re-anchor the yielded row, keep the marker
+		if fold.ObservedHead == "" || fold.ObservedHead == e.AnchoredHeadSHA || !reanchor(fold.ObservedHead) {
+			return nothing
 		}
-		moved, err := s.cfg.MergeQueue.ReanchorYielded(ctx, e.ID, e.AnchoredHeadSHA, *e.YieldedAt, fold.ObservedHead, "")
-		if err != nil {
-			log("merge queue: the yield re-probe could not re-anchor the moved head; another write owns the entry", err)
-			return reprobeNothing
-		}
-		e = moved
 		fold, err = s.forgeApprovalFold(ctx, runRow, e.AnchoredHeadSHA)
 		if err != nil || fold.Merged || fold.Reason == forgeApprovalReasonHeadMoved {
 			return reprobeReanchored
 		}
 	}
-	if fold.approved() {
-		if !s.mergeQueueYieldClears(ctx, runRow, e, force) {
-			return reprobeUnchanged
-		}
-		cleared, err := s.cfg.MergeQueue.ClearYield(ctx, e.ID, e.AnchoredHeadSHA, *e.YieldedAt)
+
+	// (3) The merge-gate legs at the anchored head (merge variant).
+	elig := s.mergeQueueMergeEligibility(ctx, runRow, e.AnchoredHeadSHA,
+		mergeQueueIntentAnchor{Sequence: e.MergeIntentSequence, BaseRef: e.BaseRef})
+	if elig.Undeterminable { // fail closed: an unreadable leg never clears
+		log("merge queue: the yield re-probe could not determine every merge-gate leg; the entry stays yielded",
+			errors.New(mergeQueueReasonsText(elig.Reasons)))
+		return nothing
+	}
+
+	// (4) The tier.
+	y, blocked, row4Gone, ok := s.mergeQueueYieldTier(ctx, runRow, e, fold, elig, force)
+	if !ok {
+		return nothing
+	}
+	if !blocked {
+		cleared, err := s.cfg.MergeQueue.ClearYield(ctx, e.ID, e.AnchoredHeadSHA, e.YieldRevision, row4Gone)
 		if err != nil {
-			log("merge queue: the yield re-probe found a qualifying approval but the clear did not land", err)
-			return reprobeNothing
+			log("merge queue: the yield re-probe found every leg passing but the clear did not land", err)
+			return nothing
 		}
 		s.writeMergeQueueYieldCleared(ctx, e, cleared, fold)
 		s.pumpMergeCandidateQueueDetached(ctx, e.Base())
 		return reprobeCleared
 	}
-	y, _ := mergeOnPassFoldYield(fold)
 	if y.Reason == e.YieldReason { // same reason: dedup, nothing written
+		if nothing == reprobeReanchored {
+			return reprobeReanchored
+		}
 		return reprobeUnchanged
 	}
-	updated, err := s.cfg.MergeQueue.UpdateYield(ctx, e.ID, e.AnchoredHeadSHA, *e.YieldedAt, y.marker())
+	updated, err := s.cfg.MergeQueue.UpdateYield(ctx, e.ID, e.AnchoredHeadSHA, e.YieldRevision, y.marker())
 	if err != nil {
 		log("merge queue: the yield re-probe's reason transition did not land", err)
-		return reprobeNothing
+		return nothing
 	}
 	_ = s.writeMergeQueueYielded(ctx, updated, y, mergeQueueYieldSiteReprobe, e.YieldReason)
 	return reprobeTransitioned
 }
 
-// mergeQueueYieldClears is THE clear predicate for a yielded entry e whose
-// fold at the anchored head APPROVED; every clear through the re-probe (the
-// sweep, the targeted re-probe, the webhook trigger, the merge_run re-invoke)
-// judges it here. Every reason but forge_review_required clears on the
-// approved fold. A forge_review_required yield (ADR-112 R3 row 4) exists
-// BECAUSE the fold approved and the forge still refused, so the fold alone is
-// no evidence (a gate-less run's fold is always approved): it clears only when
-// a FRESH review snapshot, read even on a gate-less run, shows the row-4
-// condition gone (forgeReviewRequiredSnapshot). An unreadable or undetermined
-// snapshot keeps the row yielded (fail closed). force (the operator's explicit
-// merge_run) skips the snapshot: one re-attempt per invocation, and a refusal
-// re-yields in the same episode (mergeQueueYieldContinuation).
-func (s *Server) mergeQueueYieldClears(ctx context.Context, runRow *run.Run, e mergequeue.Entry, force bool) bool {
-	if e.YieldReason != mergeQueueYieldForgeReviewRequired || force {
-		return true
+// mergeQueueYieldTier is THE clear predicate and reason tiering for a yielded
+// entry e (docs/adr/112 A3.4/A3.5); every clear through the re-probe (the
+// sweep, the targeted re-probe, the approval and check_run triggers, the
+// merge_run re-invoke) judges it here. fold is the forge-approval fold and
+// elig the merge-variant eligibility, both at e's anchored head. The FIRST
+// matching tier blocks:
+//
+//  1. veto: the fold vetoed (forge_approval_vetoed);
+//  2. merge-gate: a retryable merge-gate leg (mergeGateYieldFor over
+//     mergeGateLegsOf(elig): merge_checks_red > merge_checks_pending >
+//     merge_review_pending);
+//  3. row-4: e.Row4Flag is set (or the stored reason is
+//     forge_review_required: a marker a pre-0115 or reverted binary wrote
+//     without the flag) and force is false, and a FRESH review
+//     snapshot (forgeReviewRequiredSnapshot, read even on a gate-less run)
+//     shows REVIEW_REQUIRED, CHANGES_REQUESTED or BLOCKED
+//     (forge_review_required); a snapshot read error is ok=false (the row
+//     stays yielded, fail closed);
+//  4. fold: any other non-approved fold (mergeOnPassFoldYield).
+//
+// Otherwise blocked is false: the row clears. row4Gone reports the snapshot
+// read on THIS probe showed the row-4 condition gone, the only evidence that
+// clears row4_flag (A3.6): a forced clear never reads it, so it keeps the
+// flag. force (A3.9, the operator's merge_run) skips ONLY the tier-3
+// snapshot: never the fold, the veto, the merge-gate legs or the CAS.
+func (s *Server) mergeQueueYieldTier(ctx context.Context, runRow *run.Run, e mergequeue.Entry, fold forgeApprovalDecision, elig mergeQueueEligibilityResult, force bool) (y mergeQueueYield, blocked bool, row4Gone bool, ok bool) {
+	if fold.Result == forgeApprovalVetoed { // A3.5 tier 1: the veto
+		vy, _ := mergeOnPassFoldYield(fold)
+		return vy, true, false, true
 	}
-	decision, status, present, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
-	if err != nil {
-		entryID, yieldedAt := mergeQueueYieldEpisode(e)
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
-			"merge queue: the forge_review_required re-probe could not read a fresh review snapshot; the entry stays yielded",
-			slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
-			slog.String("detail", sanitizeForgeReadDetail("review_snapshot", err.Error())))
-		return false
+	if gy, gated := mergeGateYieldFor(mergeGateLegsOf(elig), elig); gated { // A3.5 tier 2: the merge-gate legs
+		return gy, true, false, true
 	}
-	if present {
-		entryID, yieldedAt := mergeQueueYieldEpisode(e)
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
-			"merge queue: the forge still reports the pull request needs review or is blocked; the forge_review_required entry stays yielded",
-			slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
-			slog.String("review_decision", decision), slog.String("merge_state_status", status))
+	// A3.5 tier 3: the row-4 fresh snapshot; force skips only this. The stored
+	// reason also carries the obligation: a forge_review_required marker a
+	// pre-0115 (or reverted) binary wrote never set row4_flag.
+	if (e.Row4Flag || e.YieldReason == mergeQueueYieldForgeReviewRequired) && !force {
+		decision, status, present, err := s.forgeReviewRequiredSnapshot(ctx, runRow)
+		if err != nil {
+			entryID, yieldedAt := mergeQueueYieldEpisode(e)
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo,
+				"merge queue: the forge_review_required re-probe could not read a fresh review snapshot; the entry stays yielded",
+				slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
+				slog.String("detail", sanitizeForgeReadDetail("review_snapshot", err.Error())))
+			return mergeQueueYield{}, false, false, false
+		}
+		if present {
+			entryID, yieldedAt := mergeQueueYieldEpisode(e)
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug,
+				"merge queue: the forge still reports the pull request needs review or is blocked; the forge_review_required entry stays yielded",
+				slog.String("run_id", e.RunID.String()), slog.String("entry_id", entryID), slog.String("yielded_at", yieldedAt),
+				slog.String("review_decision", decision), slog.String("merge_state_status", status))
+			return newMergeQueueYield(mergeQueueYieldForgeReviewRequired,
+				fmt.Sprintf(mergeQueueYieldForgeRefusalDetail, decision, status), mergeQueueYieldRowForgeRefusal), true, false, true
+		}
+		row4Gone = true
 	}
-	return !present
+	if !fold.approved() { // A3.5 tier 4: the fold
+		fy, _ := mergeOnPassFoldYield(fold)
+		return fy, true, row4Gone, true
+	}
+	return mergeQueueYield{}, false, row4Gone, true
 }
 
 // writeMergeQueueYieldCleared appends the INTERNAL merge_queue_yield_cleared
 // row (the episode's resolution) for prior, the entry as it was yielded, now
-// cleared. The ClearYield CAS has committed, so a failed append is logged at
+// cleared. Its (entry_id, base_ref, yielded_at) is the key a later re-yield
+// continues (mergeQueueYieldContinuation, docs/adr/112 A3.7). The ClearYield CAS has committed, so a failed append is logged at
 // ERROR naming entry_id and yielded_at and the row is never rolled back
 // (approval condition C7).
 func (s *Server) writeMergeQueueYieldCleared(ctx context.Context, prior, cleared mergequeue.Entry, fold forgeApprovalDecision) {
@@ -443,13 +611,14 @@ func (s *Server) writeMergeQueueYieldCleared(ctx context.Context, prior, cleared
 	}
 	entryID, yieldedAt := mergeQueueYieldEpisode(prior)
 	payload, _ := json.Marshal(map[string]any{
-		"entry_id":     entryID,
-		"base_ref":     cleared.BaseRef,
-		"head_sha":     cleared.AnchoredHeadSHA,
-		"base_sha":     cleared.AnchoredBaseSHA,
-		"yield_reason": prior.YieldReason,
-		"yielded_at":   yieldedAt,
-		"basis":        fold.Basis,
+		"entry_id":       entryID,
+		"base_ref":       cleared.BaseRef,
+		"head_sha":       cleared.AnchoredHeadSHA,
+		"base_sha":       cleared.AnchoredBaseSHA,
+		"yield_reason":   prior.YieldReason,
+		"yielded_at":     yieldedAt,
+		"yield_revision": cleared.YieldRevision,
+		"basis":          fold.Basis,
 	})
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
 	if _, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{

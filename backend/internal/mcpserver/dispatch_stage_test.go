@@ -863,7 +863,7 @@ func TestDispatchStage_ReaperReportsSpawnFailure(t *testing.T) {
 			})
 		default:
 			// guardHostDispatch's GET /v0/runs/{id}: an unlocked run so the guard passes.
-			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
+			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running", DefaultBranch: "main"})
 		}
 	}))
 	defer srv.Close()
@@ -1008,7 +1008,7 @@ func TestDispatchStage_ThreadsNonNilProbeToSpawn(t *testing.T) {
 		default:
 			// guardHostDispatch's GET /v0/runs/{id} (unlocked so the guard passes)
 			// and the best-effort POST /auto-drive record-act both tolerate this.
-			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
+			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running", DefaultBranch: "main"})
 		}
 	}))
 	defer srv.Close()
@@ -1098,6 +1098,10 @@ type dispatchAutoDriveFake struct {
 	// pre-existing test using this fake expects.
 	runnerKind         string
 	runnerKindResolved bool
+	// defaultBranch / defaultBranchUnresolvedReason are the #4660 single-run
+	// base-branch fields (#4758); both empty serves default_branch "main".
+	defaultBranch                 string
+	defaultBranchUnresolvedReason string
 }
 
 func (f *dispatchAutoDriveFake) stageTypeOrDefault() string {
@@ -1190,10 +1194,15 @@ func (f *dispatchAutoDriveFake) handler() http.HandlerFunc {
 			// guard passes; the runnerKind* fixtures lock it when set.
 			f.mu.Lock()
 			kind, resolved := f.runnerKind, f.runnerKindResolved
+			branch, unresolved := f.defaultBranch, f.defaultBranchUnresolvedReason
 			f.mu.Unlock()
+			if branch == "" && unresolved == "" {
+				branch = "main"
+			}
 			_ = json.NewEncoder(w).Encode(Run{
 				ID: f.runID.String(), Repo: "x/y", State: "running",
 				RunnerKind: kind, RunnerKindResolved: resolved,
+				DefaultBranch: branch, DefaultBranchUnresolvedReason: unresolved,
 			})
 		}
 	}
@@ -2041,6 +2050,7 @@ func noPRGuardBackend(t *testing.T, runID, stageID uuid.UUID, decomposedFrom *st
 			// resolver and guardNoPRImplement.
 			_ = json.NewEncoder(w).Encode(Run{
 				ID: runID.String(), Repo: "x/y", State: "running", DecomposedFrom: decomposedFrom,
+				DefaultBranch: "main",
 			})
 		}
 	}))
@@ -2164,7 +2174,7 @@ func TestDispatchStage_NoPRRunnerRefusal_SettlesCategoryC(t *testing.T) {
 		default:
 			// A STANDALONE run: the L2 guard admits, exactly as it does for the
 			// fix-up dispatch this models (fix-up status is invisible pre-spawn).
-			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running"})
+			_ = json.NewEncoder(w).Encode(Run{ID: runID.String(), Repo: "x/y", State: "running", DefaultBranch: "main"})
 		}
 	}))
 	defer srv.Close()
@@ -2727,8 +2737,10 @@ func TestDispatchStage_GitLab_ArgvMatchesRunStage(t *testing.T) {
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
 	seedGitLabRun(fb, runID, "acme/platform/widgets", "https://gitlab.example.com")
 
+	// A gitlab run reports forge_unsupported, so base_branch is passed (#4758).
 	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
 		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", WorkingDir: "/tmp/checkout",
+		BaseBranch: "main",
 	}); err != nil {
 		t.Fatalf("dispatchStage: %v", err)
 	}
@@ -2737,6 +2749,7 @@ func TestDispatchStage_GitLab_ArgvMatchesRunStage(t *testing.T) {
 	seedStageOfType(fb, runID, stageID, "implement", "pending")
 	if _, _, err := r.runStage(context.Background(), nil, RunStageInput{
 		RunID: runID.String(), Workflow: "feature_change", Stage: "implement", WorkingDir: "/tmp/checkout",
+		BaseBranch: "main",
 	}); err != nil {
 		t.Fatalf("runStage: %v", err)
 	}
@@ -2774,7 +2787,7 @@ func TestDispatchStage_ForgeTarget_ReadViaSingleRunGet(t *testing.T) {
 
 	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
 		RunID: runID.String(), Workflow: "feature_change", Stage: "implement",
-		WorkingDir: "/tmp/checkout", GitHubRepo: "acme/widgets",
+		WorkingDir: "/tmp/checkout", GitHubRepo: "acme/widgets", BaseBranch: "main",
 	}); err != nil {
 		t.Fatalf("dispatchStage: %v", err)
 	}
@@ -2865,7 +2878,7 @@ func newSlotDispatchFake(t *testing.T, markerStatus int, markerBody string) (*sl
 				"items": []Stage{{ID: f.stageID.String(), RunID: f.runID.String(), Type: "implement", State: f.stageState}},
 			})
 		default:
-			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", State: "running"})
+			_ = json.NewEncoder(w).Encode(Run{ID: f.runID.String(), Repo: "x/y", State: "running", DefaultBranch: "main"})
 		}
 	}))
 	t.Cleanup(srv.Close)
@@ -3018,5 +3031,80 @@ func TestDispatchStage_ImmediateAdmissionReleaseFailureNamed(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "spawn boom") || !strings.Contains(err.Error(), "releasing its slot failed") ||
 		!strings.Contains(err.Error(), "fishhawk_reap_stage") {
 		t.Fatalf("err = %v, want the spawn error, the failed release and the recovery verbs", err)
+	}
+}
+
+// --- base branch (#4758) -----------------------------------------------------
+
+// newBaseBranchDispatchFake is a dispatchAutoDriveFake whose single-run read
+// carries the given #4660 base-branch fields, with a resolver against it.
+func newBaseBranchDispatchFake(t *testing.T, branch, unresolved string) (*dispatchAutoDriveFake, *runResolver) {
+	t.Helper()
+	f := &dispatchAutoDriveFake{
+		runID: uuid.New(), stageID: uuid.New(),
+		defaultBranch: branch, defaultBranchUnresolvedReason: unresolved,
+	}
+	srv := httptest.NewServer(f.handler())
+	t.Cleanup(srv.Close)
+	return f, &runResolver{
+		api:    newAPIClient(config{backendURL: srv.URL, apiToken: "tok"}),
+		getenv: func(string) string { return "" },
+	}
+}
+
+// TestDispatchStage_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch: base_branch
+// omitted on a run whose forge default_branch is "trunk" → the detached spawn
+// argv carries --base-branch trunk AND --check-base-ref trunk (#4758).
+func TestDispatchStage_OmittedBaseBranch_SpawnsAgainstRunDefaultBranch(t *testing.T) {
+	f, r := newBaseBranchDispatchFake(t, "trunk", "")
+	calls := captureAllArgv(t)
+
+	if _, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	}); err != nil {
+		t.Fatalf("dispatchStage: %v", err)
+	}
+	if len(*calls) != 1 {
+		t.Fatalf("expected exactly one spawn, got %d", len(*calls))
+	}
+	argv := (*calls)[0]
+	if !argvHasPair(argv, "--base-branch", "trunk") || !argvHasPair(argv, "--check-base-ref", "trunk") {
+		t.Fatalf("argv should carry --base-branch trunk and --check-base-ref trunk from the run's default_branch; got %v", argv)
+	}
+}
+
+// TestDispatchStage_UnresolvedDefaultBranch_RefusesBeforeMarker: base_branch
+// omitted on a run whose default branch is unresolved → a refusal naming the
+// reason, with NO run_auto_driven record-act POST, NO host-dispatch marker and
+// NO dispatchSpawnDetached call: the refusal commits no state.
+func TestDispatchStage_UnresolvedDefaultBranch_RefusesBeforeMarker(t *testing.T) {
+	f, r := newBaseBranchDispatchFake(t, "", "repository_not_visible")
+	spawns := 0
+	savedSpawn, savedLook := dispatchSpawnDetached, runStageLookPath
+	dispatchSpawnDetached = func(string, []string, []string, string, string, detachedFailureReporter, detachedStageStateProbe) (string, error) {
+		spawns++
+		return "/dev/null", nil
+	}
+	runStageLookPath = func(string) (string, error) { return "/fake/fishhawk-runner", nil }
+	t.Cleanup(func() { dispatchSpawnDetached, runStageLookPath = savedSpawn, savedLook })
+
+	_, _, err := r.dispatchStage(context.Background(), nil, DispatchStageInput{
+		RunID: f.runID.String(), Workflow: "feature_change", Stage: "implement",
+		GitHubRepo: "x/y", PushAndOpenPR: boolPtr(false),
+	})
+	if err == nil {
+		t.Fatal("expected a base_branch_unresolved refusal")
+	}
+	for _, want := range []string{"base_branch_unresolved", "repository_not_visible", "Pass base_branch explicitly"} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("refusal should name %q: %v", want, err)
+		}
+	}
+	f.mu.Lock()
+	acts, marks := f.actCalledN, f.hostDispatchCalledN
+	f.mu.Unlock()
+	if acts != 0 || marks != 0 || spawns != 0 {
+		t.Fatalf("record-act POSTs = %d, host-dispatch markers = %d, spawns = %d; the refusal must commit nothing", acts, marks, spawns)
 	}
 }

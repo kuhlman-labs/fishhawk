@@ -293,6 +293,18 @@ func TestOpenPRAndShipArtifact_ChildBaseFetchFailure_ArmsAndNamesRefs(t *testing
 	if got, ok := refTarget(repo, stRef); !ok || got != bfe.StashSHA {
 		t.Errorf("stash ref %s = %q (exists %t), want %s", stRef, got, ok, bfe.StashSHA)
 	}
+	// ADR-115 D2 (#4648): the snapshot is stash-shaped and holds the edit; the
+	// stage-end sweep removed the stage's own refs/fishhawk/stash/<stage> AFTER
+	// the #4079 arm pinned its commit, and the shared stash stack was never used.
+	if got := cprGit(t, repo, "show", bfe.StashSHA+":a.txt"); got != "agent change" {
+		t.Errorf("snapshot %s:a.txt = %q, want the agent edit", bfe.StashSHA, got)
+	}
+	if _, ok := refTarget(repo, gitops.SnapshotRef(cfg.stageID)); ok {
+		t.Errorf("stage snapshot ref %s survived the stage-end sweep", gitops.SnapshotRef(cfg.stageID))
+	}
+	if _, ok := refTarget(repo, "refs/stash"); ok {
+		t.Errorf("the shared refs/stash was written by the commit path")
+	}
 	for _, ref := range []string{ckRef, stRef} {
 		if !strings.Contains(err.Error(), ref) {
 			t.Errorf("returned reason does not name %s: %v", ref, err)
@@ -602,5 +614,173 @@ func TestHeldCommitFilesChanged_Unavailable(t *testing.T) {
 	}
 	if !strings.Contains(logSink.String(), "child_push_files_changed_unavailable") {
 		t.Errorf("missing child_push_files_changed_unavailable:\n%s", logSink.String())
+	}
+}
+
+// holdRefLock creates ref's loose-ref lockfile in repo's common dir — the
+// file a sibling worktree's in-flight `git update-ref` holds — and removes it
+// after releaseAfter (0 = never). The returned channel closes once the lock is
+// gone.
+func holdRefLock(t *testing.T, repo, ref string, releaseAfter time.Duration) <-chan struct{} {
+	t.Helper()
+	common := cprGit(t, repo, "rev-parse", "--path-format=absolute", "--git-common-dir")
+	lock := filepath.Join(common, filepath.FromSlash(ref)+".lock")
+	if err := os.MkdirAll(filepath.Dir(lock), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lock, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	if releaseAfter == 0 {
+		t.Cleanup(func() { _ = os.Remove(lock) })
+		return done
+	}
+	go func() {
+		defer close(done)
+		time.Sleep(releaseAfter)
+		_ = os.Remove(lock)
+	}()
+	t.Cleanup(func() { <-done })
+	return done
+}
+
+// countCheckpointGitRuns wraps checkpointGitRun for t, counting the attempts
+// whose argv starts with sub.
+func countCheckpointGitRuns(t *testing.T, sub string) *int {
+	t.Helper()
+	orig := checkpointGitRun
+	n := new(int)
+	checkpointGitRun = func(ctx context.Context, repoDir string, args ...string) ([]byte, error) {
+		if len(args) > 0 && args[0] == sub {
+			*n++
+		}
+		return orig(ctx, repoDir, args...)
+	}
+	t.Cleanup(func() { checkpointGitRun = orig })
+	return n
+}
+
+// TestPinCheckpointRef_RetriesLockContention (ADR-115 D2, #4648): a sibling
+// worktree's git holding the checkpoint ref's lockfile makes git's own
+// update-ref fail ("Unable to create '...lock': File exists"); pinCheckpointRef
+// waits it out within the gitops bound and pins. Every attempt ran under
+// LC_ALL=C/LANG=C, read from the child's real env (C1). Mechanism: without the
+// RetryLockContention wrapper the first update-ref error is returned.
+func TestPinCheckpointRef_RetriesLockContention(t *testing.T) {
+	repo, _, _, headSHA, _ := pushResumeRepo(t)
+	pinHostLocale(t)
+	calls := recordGitChildren(t)
+	attempts := countCheckpointGitRuns(t, "update-ref")
+	ref := checkpointRef("run-lock", "stage-lock")
+	holdRefLock(t, repo, ref, 300*time.Millisecond)
+
+	if err := pinCheckpointRef(context.Background(), repo, ref, headSHA); err != nil {
+		t.Fatalf("pinCheckpointRef under a briefly-held ref lock: %v", err)
+	}
+	if got, ok := refTarget(repo, ref); !ok || got != headSHA {
+		t.Errorf("checkpoint ref = %q (exists %t), want %s", got, ok, headSHA)
+	}
+	if *attempts < 2 {
+		t.Errorf("update-ref attempts = %d, want > 1 (the first must have met the held lock)", *attempts)
+	}
+	if n := assertLockRetryLocale(t, calls(), "update-ref "+ref); n != *attempts {
+		t.Errorf("recorded update-ref children = %d, want one per attempt (%d)", n, *attempts)
+	}
+}
+
+// TestReleaseCheckpointRefs_RetriesLockContention: the release path's
+// `update-ref -d` rides the same checkpointGit retry, so a briefly-held lock
+// still releases the ref (and names it on checkpoint_refs_released).
+func TestReleaseCheckpointRefs_RetriesLockContention(t *testing.T) {
+	repo, _, _, headSHA, _ := pushResumeRepo(t)
+	ref := checkpointRef("run-rel", "stage-rel")
+	cprGit(t, repo, "update-ref", ref, headSHA)
+	attempts := countCheckpointGitRuns(t, "update-ref")
+	holdRefLock(t, repo, ref, 300*time.Millisecond)
+
+	var logSink strings.Builder
+	releaseCheckpointRefs(context.Background(), repo, "run-rel", "stage-rel", &logSink)
+	if _, ok := refTarget(repo, ref); ok {
+		t.Errorf("checkpoint ref %s survived a release under a briefly-held lock:\n%s", ref, logSink.String())
+	}
+	if !strings.Contains(logSink.String(), `"event":"checkpoint_refs_released"`) || strings.Contains(logSink.String(), "checkpoint_ref_release_failed") {
+		t.Errorf("log = %q, want checkpoint_refs_released and no release failure", logSink.String())
+	}
+	if *attempts < 2 {
+		t.Errorf("update-ref -d attempts = %d, want > 1", *attempts)
+	}
+}
+
+// TestCheckpointGit_DoesNotRetryNonLockError: a compare-and-swap mismatch is a
+// real outcome, not contention — exactly one attempt, git's error returned.
+func TestCheckpointGit_DoesNotRetryNonLockError(t *testing.T) {
+	repo, _, _, headSHA, _ := pushResumeRepo(t)
+	ref := checkpointRef("run-cas", "stage-cas")
+	cprGit(t, repo, "update-ref", ref, headSHA)
+	attempts := countCheckpointGitRuns(t, "update-ref")
+	wrongOld := strings.Repeat("1", len(headSHA))
+	out, err := checkpointGit(context.Background(), repo, "update-ref", ref, headSHA, wrongOld)
+	if err == nil {
+		t.Fatal("a CAS mismatch succeeded")
+	}
+	if *attempts != 1 {
+		t.Errorf("attempts = %d, want exactly 1 for a non-lock error", *attempts)
+	}
+	if !strings.Contains(string(out), "but expected") {
+		t.Errorf("output = %q, want git's CAS mismatch", out)
+	}
+}
+
+// TestDropStageSnapshot_SweepsStageRef: the stage-end sweep deletes THIS
+// stage's refs/fishhawk/stash/<stage> (a real stash-shaped snapshot) and logs
+// stage_snapshot_dropped; a sibling stage's snapshot ref and the shared
+// refs/stash are untouched; an absent ref (or no stage id) logs nothing; a
+// delete failure logs stage_snapshot_drop_failed and never panics or errors.
+func TestDropStageSnapshot_SweepsStageRef(t *testing.T) {
+	repo, _, _, headSHA, _ := pushResumeRepo(t)
+	ctx := context.Background()
+	const stage, sibling = "stage-sweep", "stage-sibling"
+	mustWrite(t, filepath.Join(repo, "a.txt"), "retained by a conflict\n")
+	snap, saved, err := (&gitops.Pusher{}).SnapshotWorkTree(ctx, repo, stage, nil)
+	if err != nil || !saved {
+		t.Fatalf("SnapshotWorkTree = (%+v, %t, %v), want a saved snapshot", snap, saved, err)
+	}
+	cprGit(t, repo, "update-ref", gitops.SnapshotRef(sibling), headSHA)
+	cprGit(t, repo, "update-ref", "refs/stash", headSHA)
+
+	var logSink strings.Builder
+	dropStageSnapshot(ctx, repo, "run-sweep", stage, &logSink)
+	if _, ok := refTarget(repo, gitops.SnapshotRef(stage)); ok {
+		t.Errorf("stage snapshot ref survived the sweep")
+	}
+	if !strings.Contains(logSink.String(), `"event":"stage_snapshot_dropped"`) || !strings.Contains(logSink.String(), gitops.SnapshotRef(stage)) {
+		t.Errorf("log = %q, want stage_snapshot_dropped naming the ref", logSink.String())
+	}
+	if got, ok := refTarget(repo, gitops.SnapshotRef(sibling)); !ok || got != headSHA {
+		t.Errorf("sibling stage's snapshot ref = %q (exists %t), want it untouched at %s", got, ok, headSHA)
+	}
+	if got, ok := refTarget(repo, "refs/stash"); !ok || got != headSHA {
+		t.Errorf("refs/stash = %q (exists %t), want it untouched", got, ok)
+	}
+
+	for _, key := range []string{stage, ""} {
+		logSink.Reset()
+		dropStageSnapshot(ctx, repo, "run-sweep", key, &logSink)
+		if logSink.String() != "" {
+			t.Errorf("sweep of key %q with no ref logged %q, want nothing", key, logSink.String())
+		}
+	}
+	if _, ok := refTarget(repo, gitops.SnapshotRef(sibling)); !ok {
+		t.Errorf("an empty stage id swept a sibling's snapshot")
+	}
+
+	orig := dropSnapshotRef
+	dropSnapshotRef = func(context.Context, string, string) error { return errors.New("injected delete failure") }
+	t.Cleanup(func() { dropSnapshotRef = orig })
+	logSink.Reset()
+	dropStageSnapshot(ctx, repo, "run-sweep", sibling, &logSink)
+	if !strings.Contains(logSink.String(), `"event":"stage_snapshot_drop_failed"`) || !strings.Contains(logSink.String(), "injected delete failure") {
+		t.Errorf("log = %q, want stage_snapshot_drop_failed carrying the cause", logSink.String())
 	}
 }

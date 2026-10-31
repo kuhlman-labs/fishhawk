@@ -8,6 +8,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -497,6 +498,93 @@ func TestOpenAPI_RunConcernsRouteDocumented(t *testing.T) {
 		if !strings.Contains(doc, want) {
 			t.Errorf("docs/api/v0.openapi.yaml is missing schema %q", strings.TrimSpace(want))
 		}
+	}
+	// E94.2 / #4693: RunConcernListItem documents the outcome + judgement keys.
+	schemaStart := strings.Index(doc, "\n    RunConcernListItem:\n")
+	if schemaStart >= 0 {
+		// Bound the search to this schema: it ends at the next 4-space-indented
+		// component key.
+		schema := doc[schemaStart+1:]
+		if next := regexp.MustCompile(`\n    [A-Za-z0-9]+:\n`).FindStringIndex(schema); next != nil {
+			schema = schema[:next[0]+1]
+		}
+		for _, want := range []string{"\n        outcome:\n", "\n        judgement:\n", "\n        judgement_inherited_from:\n", "\n        duplicate_of:\n"} {
+			if !strings.Contains(schema, want) {
+				t.Errorf("RunConcernListItem schema is missing property %q", strings.TrimSpace(want))
+			}
+		}
+	}
+}
+
+// TestListRunConcerns_OutcomeAndJudgement (E94.2 / #4693): the listing carries
+// the gate view's outcome + judgement keys — a never-judged row reads
+// unlabelled with no outcome key, a confirmed row reads fixed, and a duplicate
+// reads its root's judgement with outcome duplicate_of:<root>.
+func TestListRunConcerns_OutcomeAndJudgement(t *testing.T) {
+	s, repo, cr := runConcernsServer(t)
+	runID := seedGateRun(t, repo)
+	bare := seedRCConcern(t, cr, runID, "never judged")
+	fixed := seedRCConcern(t, cr, runID, "confirmed")
+	fixed.State, fixed.Outcome = concern.StateAddressed, concern.OutcomeFixed
+	root := seedRCConcern(t, cr, runID, "root")
+	root.Judgement, root.JudgementActorKind = concern.JudgementDefect, "user"
+	dup := seedRCConcern(t, cr, runID, "duplicate")
+	dup.Judgement, dup.DuplicateOf = concern.JudgementNoDefect, &root.ID
+
+	w := callRunConcerns(s, runID.String(), "state=all", gateViewReadIdentity())
+	got := decodeRunConcerns(t, w)
+	items := map[string]runConcernListItem{}
+	for _, it := range got.Items {
+		items[it.ID] = it
+	}
+	if it := items[bare.ID.String()]; it.Judgement != "unlabelled" || it.Outcome != "" {
+		t.Errorf("never-judged row = judgement %q outcome %q, want unlabelled / ''", it.Judgement, it.Outcome)
+	}
+	if it := items[fixed.ID.String()]; it.Outcome != "fixed" {
+		t.Errorf("confirmed row outcome = %q, want fixed", it.Outcome)
+	}
+	if it := items[root.ID.String()]; it.Judgement != "defect" || it.JudgementActorKind != "user" {
+		t.Errorf("root row = judgement %q actor %q, want defect / user", it.Judgement, it.JudgementActorKind)
+	}
+	it := items[dup.ID.String()]
+	if it.Judgement != "defect" || it.Outcome != "duplicate_of:"+root.ID.String() ||
+		it.JudgementInheritedFrom == nil || *it.JudgementInheritedFrom != root.ID {
+		t.Errorf("duplicate row = judgement %q outcome %q inherited %v, want defect / duplicate_of:%s / %s",
+			it.Judgement, it.Outcome, it.JudgementInheritedFrom, root.ID, root.ID)
+	}
+	body := w.Body.String()
+	for _, want := range []string{`"judgement":"unlabelled"`, `"outcome":"fixed"`, `"judgement_inherited_from":"` + root.ID.String() + `"`} {
+		if !strings.Contains(body, want) {
+			t.Errorf("body missing %s\nbody: %s", want, body)
+		}
+	}
+}
+
+// TestListRunConcerns_JudgementResolvedPerRun: each run's items resolve against
+// THAT run's own rows. A parent row whose duplicate_of names a CHILD concern
+// judged defect reads unlabelled (the cross-run target is only reachable in a
+// merged set), while a child duplicate of a child root inherits.
+func TestListRunConcerns_JudgementResolvedPerRun(t *testing.T) {
+	s, repo, cr := runConcernsServer(t)
+	parent := seedGateRun(t, repo)
+	child := seedRCDecompChild(t, repo, parent, 0, time.Now().UTC())
+	childRoot := seedRCConcern(t, cr, child, "child root")
+	childRoot.Judgement = concern.JudgementDefect
+	childDup := seedRCConcern(t, cr, child, "child duplicate")
+	childDup.Judgement, childDup.DuplicateOf = concern.JudgementNoDefect, &childRoot.ID
+	parentDup := seedRCConcern(t, cr, parent, "parent row pointing into the child")
+	parentDup.Judgement, parentDup.DuplicateOf = concern.JudgementNoDefect, &childRoot.ID
+
+	got := decodeRunConcerns(t, callRunConcerns(s, parent.String(), "include_children=true", gateViewReadIdentity()))
+	items := map[string]runConcernListItem{}
+	for _, it := range got.Items {
+		items[it.ID] = it
+	}
+	if it := items[parentDup.ID.String()]; it.Judgement != "unlabelled" || it.JudgementInheritedFrom != nil {
+		t.Errorf("parent cross-run duplicate = judgement %q inherited %v, want unlabelled / nil", it.Judgement, it.JudgementInheritedFrom)
+	}
+	if it := items[childDup.ID.String()]; it.Judgement != "defect" || it.JudgementInheritedFrom == nil || *it.JudgementInheritedFrom != childRoot.ID {
+		t.Errorf("child duplicate = judgement %q inherited %v, want defect from %s", it.Judgement, it.JudgementInheritedFrom, childRoot.ID)
 	}
 }
 

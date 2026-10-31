@@ -15,6 +15,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
@@ -923,7 +924,7 @@ func TestAdvance_FanoutLocalLockedParent_ChildrenParkAwaitingHostDispatch(t *tes
 	au := &recordingAudit{}
 	o := &Orchestrator{
 		Runs: rs, GitHub: gh, Logger: slog.Default(), Artifacts: arts, Audit: au,
-		DefaultRef: "main", MaxParallelChildren: 0, Drive: &drive.Engine{Audit: au},
+		DefaultBranch: defaultbranch.Static("main"), MaxParallelChildren: 0, Drive: &drive.Engine{Audit: au},
 	}
 
 	out, err := o.Advance(context.Background(), parent.ID)
@@ -1406,7 +1407,7 @@ func setChildInstallation(children []*run.Run, installationID int64) {
 // workflow_dispatch per child — each carrying that child's own run_id and
 // implement stage_id (pairwise distinct across calls, proving each child
 // checks out its own slice branch and pushes a distinct branch with no
-// collision) against the base ref (o.DefaultRef).
+// collision) against the runnerbackend.GitHubActions workflow_dispatch ref.
 func TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch(t *testing.T) {
 	rs := newFanoutRunsRepo()
 	parent := seedAwaitingChildrenParent(t, rs)
@@ -1420,7 +1421,7 @@ func TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch(t *testi
 		GitHub:              gh,
 		Logger:              slog.Default(),
 		Audit:               au,
-		DefaultRef:          "main",
+		DefaultBranch:       defaultbranch.Static("main"),
 		MaxParallelChildren: 0, // unlimited
 		Drive:               &drive.Engine{Audit: au},
 	}
@@ -1449,8 +1450,12 @@ func TestDispatchDecomposedChildren_GitHubActions_FiresPerChildDispatch(t *testi
 	seenRun := map[string]bool{}
 	seenStage := map[string]bool{}
 	for i, call := range calls {
-		if call.Ref != o.DefaultRef {
-			t.Errorf("call %d Ref = %q, want %q (the base each slice cuts from)", i, call.Ref, o.DefaultRef)
+		// The workflow_dispatch ref is runnerbackend.GitHubActions' own
+		// default ("main"), NOT the resolved default branch: the Actions
+		// stage-dispatch ref is out of scope for #4660 and still needs
+		// resolving (follow-up).
+		if call.Ref != "main" {
+			t.Errorf("call %d Ref = %q, want %q (the GitHubActions backend default ref)", i, call.Ref, "main")
 		}
 		if call.Scope != forge.FromGitHubInstallationID(42) {
 			t.Errorf("call %d Scope = %v, want scope for installation 42", i, call.Scope)
@@ -1502,7 +1507,7 @@ func TestDispatchDecomposedChildren_GitHubActions_CapThrottlesDispatch(t *testin
 		GitHub:              gh,
 		Logger:              slog.Default(),
 		Audit:               au,
-		DefaultRef:          "main",
+		DefaultBranch:       defaultbranch.Static("main"),
 		MaxParallelChildren: 2,
 		Drive:               &drive.Engine{Audit: au},
 	}
@@ -1558,7 +1563,7 @@ func TestDispatchDecomposedChildren_GitHubActions_NilInstallationSkipsDispatch(t
 		GitHub:              gh,
 		Logger:              slog.Default(),
 		Audit:               au,
-		DefaultRef:          "main",
+		DefaultBranch:       defaultbranch.Static("main"),
 		MaxParallelChildren: 0,
 		Drive:               &drive.Engine{Audit: au},
 	}
@@ -1656,7 +1661,7 @@ func newWaveFixture(t *testing.T, specs []subPlanSpec, childStates []run.State) 
 	}}
 	au := &recordingAudit{}
 	gh := &stubGitHub{branchSHAs: map[string]string{"main": "basesha"}}
-	o := &Orchestrator{Runs: rs, GitHub: gh, Logger: slog.Default(), Artifacts: arts, Audit: au, DefaultRef: "main"}
+	o := &Orchestrator{Runs: rs, GitHub: gh, Logger: slog.Default(), Artifacts: arts, Audit: au, DefaultBranch: defaultbranch.Static("main")}
 
 	children := make([]*run.Run, 0, len(childStates))
 	for i, st := range childStates {

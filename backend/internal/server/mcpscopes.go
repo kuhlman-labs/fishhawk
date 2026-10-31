@@ -247,9 +247,18 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// refuses a run-bound token, which carries only mcp:read/write:retries.
 	"fishhawk_promote_queued_stage": {anyOf: []string{"write:runs"}},
 
+	// escape.go handleRecordEscape (E94.3 / #4694, ADR-117 D3 + A1): the
+	// handler refuses ANY run-bound subject 403 run_token_forbidden before its
+	// requireWriteScope("write:runs"), so no runBoundSubjectOK.
+	"fishhawk_record_escape": {anyOf: []string{"write:runs"}},
+
 	// merge_queue_promote.go handleMergeQueuePromote (ADR-093 D2, E87.6 /
 	// #4297). It also refuses a run-bound token.
 	"fishhawk_promote_merge_queue_entry": {anyOf: []string{"write:runs"}},
+
+	// merge_queue_withdraw.go handleMergeQueueWithdraw (ADR-112 R3, E87.17 /
+	// #4685). It also refuses a run-bound token.
+	"fishhawk_withdraw_merge_intent": {anyOf: []string{"write:runs"}},
 
 	// --- write:stages.
 	"fishhawk_rebase_run_branch":         {anyOf: []string{"write:stages"}}, // rebase_branch.go handleRebaseRunBranch
@@ -290,6 +299,9 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// resolve_concerns.go handleResolveConcerns (E83.53 / #4086) — the waive
 	// predicate; the handler additionally refuses every agent subject.
 	"fishhawk_resolve_concerns": {anyOf: []string{"write:stages", scopeFixupAlternate}},
+	// label_concern.go handleLabelConcern (E94.8 / #4841) — the waive
+	// predicate; the handler additionally refuses every agent subject.
+	"fishhawk_label_concern": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 	// divergence_answer.go handleAnswerDivergence (E75.5 / #3733) — the waive/defer posture.
 	"fishhawk_answer_divergence": {anyOf: []string{"write:stages", scopeFixupAlternate}},
 

@@ -1018,6 +1018,100 @@ func TestCompute_Rule5_VouchOtherSha_StillForeign(t *testing.T) {
 	}
 }
 
+// TestCompute_Rule5_LegacyAbbreviatedVouch_NotPrefixMatched_Named pins the two
+// halves of the #4435 read side. A legacy operator_commit_vouched row whose
+// vouched_sha is an 8-character PREFIX of the live head (recorded before the
+// vouch endpoint refused abbreviations) is never matched by prefix, so the head
+// stays foreign_commit; and the detail names the FULL live sha plus the
+// abbreviated entry, with the re-vouch instruction. The row is seeded directly
+// in the fake audit repo by construction, never through the (now refusing)
+// vouch handler. Counterfactual: disabling the abbreviatedPrefixesOf
+// annotation branch in rule5 turns the substring assertion RED.
+func TestCompute_Rule5_LegacyAbbreviatedVouch_NotPrefixMatched_Named(t *testing.T) {
+	runID, runs, arts, ar, _ := foreignCommitSetup(t)
+	const live = "0a9e170000000000000000000000000000000000"
+	short := live[:8]
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(short))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, live, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail (an abbreviated vouch is never prefix-matched); missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, "PR HEAD "+live+" ") {
+		t.Errorf("detail should render the live head in FULL: %s", detail)
+	}
+	if want := "known entry " + short + " is an ABBREVIATED sha"; !strings.Contains(detail, want) {
+		t.Errorf("detail should name the abbreviated entry (%q): %s", want, detail)
+	}
+	if !strings.Contains(detail, "fishhawk_vouch_commit") {
+		t.Errorf("detail should carry the full-sha re-vouch instruction: %s", detail)
+	}
+}
+
+// TestCompute_Rule5_ForeignCommit_DetailRendersFullShas pins the rendering of
+// the foreign_commit detail: every known sha appears in FULL (no 7-character
+// truncation) in sorted order, and a known entry that is NOT a shorter prefix of
+// the live head (a short non-prefix one, a longer 64-hex one) draws no
+// abbreviated-prefix annotation.
+func TestCompute_Rule5_ForeignCommit_DetailRendersFullShas(t *testing.T) {
+	runID, runs, arts, ar, recordedSHA := foreignCommitSetup(t)
+	const (
+		live       = "deadbeef1111deadbeef1111deadbeef11111111"
+		vouched    = "0a9e170000000000000000000000000000000000"
+		shortOther = "ffffff"
+	)
+	// A 64-hex entry is LONGER than the 40-hex head: it can never be an
+	// abbreviation of it, and must not draw an annotation (or a slice panic).
+	longOther := strings.Repeat("ee", 32)
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(vouched))
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(longOther))
+	ar.appendChained(t, runID, nil, "operator_commit_vouched", vouchPayload(shortOther))
+	d := auditcomplete.Deps{
+		Runs: runs, Artifacts: arts, Audit: ar,
+		PRHead: stubPRHead(t, live, nil),
+	}
+	state, missing, err := auditcomplete.Compute(context.Background(), runID, d)
+	if err != nil {
+		t.Fatalf("Compute: %v", err)
+	}
+	if state != stagecheck.StateFail {
+		t.Fatalf("state = %s want fail; missing=%+v", state, missing)
+	}
+	detail := foreignCommitDetail(missing)
+	if detail == "" {
+		t.Fatalf("expected foreign_commit; got %+v", missing)
+	}
+	if !strings.Contains(detail, "PR HEAD "+live+" ") {
+		t.Errorf("detail should render the live head in FULL: %s", detail)
+	}
+	// Sorted: the "0a…" vouch, the "abc…" artifact head, the "ee…" 64-hex, then "ffffff".
+	ordered := []string{vouched, recordedSHA, longOther, shortOther}
+	last := -1
+	for _, sha := range ordered {
+		i := strings.Index(detail, sha)
+		if i < 0 {
+			t.Fatalf("detail should list known sha %q in full: %s", sha, detail)
+		}
+		if i <= last {
+			t.Errorf("known shas are not in sorted order (%q out of place): %s", sha, detail)
+		}
+		last = i
+	}
+	if strings.Contains(detail, "ABBREVIATED") {
+		t.Errorf("a short known entry that is not a prefix of the head must draw no annotation: %s", detail)
+	}
+}
+
 // TestCompute_Rule5_VouchReadError_Pending: a transient read failure on the
 // operator_commit_vouched category aborts the gather as head_fetch_failed
 // (pending), never a silent under-population that false-flags a vouched head
@@ -3330,5 +3424,101 @@ func TestConflictResolutionSeamConstant_MatchesStoredRowLiteral(t *testing.T) {
 			t.Errorf("conflict_resolution_pushed must stay OUT of HeadReportCategoriesByPrecedence "+
 				"(it is a ledger-only membership category; a precedence position would shadow a newer fixup head): %v", got)
 		}
+	}
+}
+
+// TestCompute_StageNotTerminalHeadline pins the #4801 check-run headline shapes
+// for a mid-flight stage: re-opened + dispatchable names the re-open, a plain
+// dispatchable acceptance reads "(not dispatched)", an in-flight one reads
+// "(in flight)", and a non-acceptance stage carries no suffix.
+func TestCompute_StageNotTerminalHeadline(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		typ      run.StageType
+		state    run.StageState
+		reopened bool
+		suffix   string
+	}{
+		{"reopened_pending", run.StageTypeAcceptance, run.StageStatePending, true, " — re-opened by a fix-up push, not re-dispatched"},
+		{"pending", run.StageTypeAcceptance, run.StageStatePending, false, " (not dispatched)"},
+		{"running", run.StageTypeAcceptance, run.StageStateRunning, false, " (in flight)"},
+		{"reopened_running", run.StageTypeAcceptance, run.StageStateRunning, true, " (in flight)"},
+		{"implement_running", run.StageTypeImplement, run.StageStateRunning, false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID, runs, arts, ar := happyPath(t)
+			st := mkStage(runID, 4, tc.typ, tc.state)
+			runs.stages = append(runs.stages, st)
+			if tc.reopened {
+				ar.appendChained(t, runID, &st.ID, "acceptance_reopened", json.RawMessage(`{"prior_state":"succeeded"}`))
+			}
+			_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+			if err != nil {
+				t.Fatalf("Compute: %v", err)
+			}
+			if len(missing) != 1 {
+				t.Fatalf("missing = %+v, want one item", missing)
+			}
+			want := string(tc.typ) + " stage " + st.ID.String()[:8] + " " + string(tc.state) + tc.suffix
+			if missing[0].Headline != want {
+				t.Errorf("headline = %q, want %q", missing[0].Headline, want)
+			}
+		})
+	}
+}
+
+// TestCompute_ReopenedLookupReadError_HeadlineFailsOpen: the acceptance_reopened
+// read failing degrades the headline to the un-reopened shape, never an error.
+func TestCompute_ReopenedLookupReadError_HeadlineFailsOpen(t *testing.T) {
+	runID, runs, arts, ar := happyPath(t)
+	acc := mkStage(runID, 4, run.StageTypeAcceptance, run.StageStatePending)
+	runs.stages = append(runs.stages, acc)
+	ar.appendChained(t, runID, &acc.ID, "acceptance_reopened", nil)
+	ar.catErr = map[string]error{"acceptance_reopened": errors.New("boom")}
+	_, missing, err := auditcomplete.Compute(context.Background(), runID, deps(runs, arts, ar))
+	if err != nil {
+		t.Fatalf("Compute must not error: %v", err)
+	}
+	if len(missing) != 1 || !strings.HasSuffix(missing[0].Headline, " (not dispatched)") {
+		t.Errorf("missing = %+v, want the generic (not dispatched) headline", missing)
+	}
+}
+
+// TestHeldHeadline pins the title cause: the Kind fallback, the +N suffix, and
+// (C4a) the preference for an ACCEPTANCE stage_not_terminal item over a
+// positionally-first one.
+func TestHeldHeadline(t *testing.T) {
+	if got := auditcomplete.HeldHeadline(nil); got != "" {
+		t.Errorf("empty = %q, want empty", got)
+	}
+	one := []auditcomplete.MissingItem{{Kind: auditcomplete.MissingReviewPending, Detail: "d"}}
+	if got := auditcomplete.HeldHeadline(one); got != string(auditcomplete.MissingReviewPending) {
+		t.Errorf("kind fallback = %q", got)
+	}
+	two := []auditcomplete.MissingItem{
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "implement stage aaaaaaaa running"},
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "acceptance stage bbbbbbbb pending (not dispatched)"},
+	}
+	if got, want := auditcomplete.HeldHeadline(two), "acceptance stage bbbbbbbb pending (not dispatched) (+1 more)"; got != want {
+		t.Errorf("acceptance-preferred = %q, want %q", got, want)
+	}
+	noAcc := []auditcomplete.MissingItem{
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "implement stage aaaaaaaa running"},
+		{Kind: auditcomplete.MissingStageNotTerminal, Headline: "plan stage cccccccc running"},
+	}
+	if got, want := auditcomplete.HeldHeadline(noAcc), "implement stage aaaaaaaa running (+1 more)"; got != want {
+		t.Errorf("first-item fallback = %q, want %q", got, want)
+	}
+}
+
+// TestMissingItem_HeadlineNeverOnTheWire pins the REST surface: Headline is a
+// check-run rendering hint and must not marshal.
+func TestMissingItem_HeadlineNeverOnTheWire(t *testing.T) {
+	b, err := json.Marshal(auditcomplete.MissingItem{Kind: auditcomplete.MissingStageNotTerminal, Detail: "d", Headline: "h"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(strings.ToLower(string(b)), "headline") {
+		t.Errorf("marshalled MissingItem = %s, want no headline key", b)
 	}
 }

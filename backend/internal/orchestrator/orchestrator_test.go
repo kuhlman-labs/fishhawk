@@ -21,6 +21,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	forgegitlab "github.com/kuhlman-labs/fishhawk/backend/internal/forge/gitlab"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
@@ -359,8 +360,11 @@ type stubGitHub struct {
 	// test can fail ONE probe (the #4079 slice-head probe) while the base
 	// and consolidated reads still resolve.
 	branchSHAErrByBranch map[string]error
-	createRefErr         error
-	createRefCalls       []createRefCall
+	// getBranchSHACalls records every branch GetBranchSHA was asked about,
+	// so a test can assert the fan-in base it read (#4660).
+	getBranchSHACalls []string
+	createRefErr      error
+	createRefCalls    []createRefCall
 	// mergeErrByHead programs a per-head-branch MergeBranch error (e.g.
 	// forge.ErrMergeConflict on a specific slice branch).
 	mergeErrByHead map[string]error
@@ -472,6 +476,7 @@ func (g *stubGitHub) GetBranchSHA(_ context.Context, _ forge.CredentialScope,
 	_ forge.RepoRef, branch string) (string, bool, error) {
 	g.mu.Lock()
 	defer g.mu.Unlock()
+	g.getBranchSHACalls = append(g.getBranchSHACalls, branch)
 	if g.getBranchSHAErr != nil {
 		return "", false, g.getBranchSHAErr
 	}
@@ -908,6 +913,123 @@ func TestAdvance_AutoMergeStage_FailureLeavesStageDispatched(t *testing.T) {
 	}
 	if stages[1].State != run.StageStateDispatched {
 		t.Errorf("stage state = %q, want dispatched (not transitioned past)", stages[1].State)
+	}
+}
+
+// mmSpecDoc is a minimal non-Fishhawk workflow-v2 admission spec; a non-empty
+// decl is appended as the top-level merge_method declaration (E93.2 / #4658).
+func mmSpecDoc(decl string) []byte {
+	doc := `version: "2"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: pull_request
+`
+	if decl != "" {
+		doc += "merge_method: " + decl + "\n"
+	}
+	return []byte(doc)
+}
+
+// seedAutoMergeRun seeds an implement-succeeded run whose review stage carries
+// the check-only gate that routes Advance to the auto-merge path.
+func seedAutoMergeRun(t *testing.T, rs *stubRuns, specBytes []byte, installationRef *string) (*run.Run, []*run.Stage) {
+	t.Helper()
+	r, stages := rs.seed(t, "acme/widgets", int64Ptr(99), []stageSeed{
+		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStateSucceeded},
+		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code", State: run.StageStatePending},
+	})
+	stages[1].Gate = &run.Gate{Kind: run.GateKindCheck}
+	prURL := "https://github.com/acme/widgets/pull/42"
+	r.PullRequestURL = &prURL
+	r.WorkflowSpec = specBytes
+	r.InstallationRef = installationRef
+	return r, stages
+}
+
+// TestAdvance_AutoMergeStage_MergeMethod pins the orchestrator's auto-merge
+// method (E93.2 / #4658): the run's cached admission spec decides it, absent =
+// squash.
+func TestAdvance_AutoMergeStage_MergeMethod(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		want forge.MergeMethod
+	}{
+		{"declared merge", mmSpecDoc("merge"), forge.MergeMethodMerge},
+		{"declared rebase on github", mmSpecDoc("rebase"), forge.MergeMethodRebase},
+		{"no declaration", mmSpecDoc(""), forge.MergeMethodSquash},
+		{"no cached spec", nil, forge.MergeMethodSquash},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh := newOrchestrator(t)
+			r, _ := seedAutoMergeRun(t, rs, tc.spec, nil)
+			if _, err := o.Advance(context.Background(), r.ID); err != nil {
+				t.Fatalf("Advance: %v", err)
+			}
+			if len(gh.autoMergeCalls) != 1 || gh.autoMergeCalls[0].Method != tc.want {
+				t.Fatalf("auto-merge calls = %+v, want one with Method %s", gh.autoMergeCalls, tc.want)
+			}
+		})
+	}
+}
+
+// TestAdvance_AutoMergeStage_MergeMethodRefusedBeforeCall pins the two
+// pre-call refusals: an unparseable admission spec, and the STATIC forge-family
+// refusal (gitlab x rebase). Both error with ZERO auto-merge calls and leave
+// the stage dispatched. The gitlab case carries a GitHub InstallationID AND
+// InstallationRef gitlab:7 — an artificial shape that isolates the control: a
+// production GitLab run carries no GitHub installation and is skipped before
+// the call, which would mask the static check.
+func TestAdvance_AutoMergeStage_MergeMethodRefusedBeforeCall(t *testing.T) {
+	gitlabRef := "gitlab:7"
+	for _, tc := range []struct {
+		name   string
+		spec   []byte
+		ref    *string
+		wantIs error
+	}{
+		{"unparseable spec", []byte("version: [\n"), nil, nil},
+		{"gitlab x rebase", mmSpecDoc("rebase"), &gitlabRef, forge.ErrMergeMethodUnsupported},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			o, rs, gh := newOrchestrator(t)
+			r, stages := seedAutoMergeRun(t, rs, tc.spec, tc.ref)
+			_, err := o.Advance(context.Background(), r.ID)
+			if err == nil {
+				t.Fatal("Advance err = nil, want a pre-call refusal")
+			}
+			if tc.wantIs != nil && !errors.Is(err, tc.wantIs) {
+				t.Errorf("err = %v, want errors.Is %v", err, tc.wantIs)
+			}
+			if len(gh.autoMergeCalls) != 0 {
+				t.Errorf("auto-merge calls = %+v, want none (refused before the call)", gh.autoMergeCalls)
+			}
+			if stages[1].State != run.StageStateDispatched {
+				t.Errorf("stage state = %q, want dispatched", stages[1].State)
+			}
+		})
+	}
+	// Positive control for the static row: gitlab x merge reaches the call.
+	o, rs, gh := newOrchestrator(t)
+	r, _ := seedAutoMergeRun(t, rs, mmSpecDoc("merge"), &gitlabRef)
+	if _, err := o.Advance(context.Background(), r.ID); err != nil {
+		t.Fatalf("gitlab x merge: Advance: %v", err)
+	}
+	if len(gh.autoMergeCalls) != 1 || gh.autoMergeCalls[0].Method != forge.MergeMethodMerge {
+		t.Errorf("gitlab x merge: auto-merge calls = %+v, want one MERGE", gh.autoMergeCalls)
 	}
 }
 
@@ -1589,7 +1711,7 @@ func auditRunIDForCategory(a *recordingAudit, category string, want uuid.UUID) b
 }
 
 func TestCompleteRun_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
-	// #698: when a child fails with a retryable category (C), the
+	// #698: when a child fails with a retryable category, the
 	// event-driven parent-resolution path must NOT resolve the parent
 	// to failed-C; it parks the awaiting_children stage and emits a
 	// one-time parent_awaiting_redrive audit so an operator can
@@ -1603,9 +1725,13 @@ func TestCompleteRun_AllFailedChildrenRetryable_ParksParent(t *testing.T) {
 		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
 	})
 
-	// Child fails now with a retryable infra (C) implement failure.
-	cat := run.FailureC
-	reason := "runner OOM"
+	// Child fails now with a retryable category-A implement failure. A
+	// first-execution category-C child failure no longer terminates the
+	// child — it parks the child itself (#4426,
+	// TestAdvance_DecomposedChildImplementInfraFailure_ParentWaitsThenResumes)
+	// — so category A is the retryable class that reaches this path.
+	cat := run.FailureA
+	reason := "agent crashed"
 	child, childStages := rs.seed(t, "x/y", nil, []stageSeed{
 		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateRunning},
 	})
@@ -1674,13 +1800,17 @@ func TestCompleteRun_FailedChildNonRecoverable_ResolvesFailed(t *testing.T) {
 	// A D-rejection child (approver said no) stays non-recoverable and
 	// still resolves the parent to failed-C with no parking.
 	o, rs, _ := newOrchestrator(t)
-	au := &recordingAudit{}
-	o.Audit = au
+	pa := &parkAudit{recordingAudit: &recordingAudit{}}
+	au := pa.recordingAudit
+	o.Audit = pa
 
 	parentRun, parentStages := rs.seed(t, "x/y", nil, []stageSeed{
 		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateAwaitingChildren},
 		{Type: run.StageTypeReview, ExecutorKind: run.ExecutorHuman, State: run.StageStatePending},
 	})
+	// The parent's plan_decomposed row marks it a decomposed parent, so its
+	// fan-in category-C failure is not an infrastructure park (#4426).
+	pa.seeded = []*audit.Entry{{Sequence: 1, RunID: &parentRun.ID, StageID: &parentStages[0].ID, Category: "plan_decomposed"}}
 
 	cat := run.FailureD
 	reason := "gate rejected by approver"
@@ -1995,7 +2125,7 @@ func TestConsolidatedPRTitleBody(t *testing.T) {
 
 func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 
@@ -2020,7 +2150,7 @@ func TestAdvance_DecomposedParent_OpensConsolidatedPR(t *testing.T) {
 		t.Errorf("head = %q, want %q", call.Head, wantHead)
 	}
 	if call.Base != "main" {
-		t.Errorf("base = %q, want main (DefaultRef, not TriggerRef)", call.Base)
+		t.Errorf("base = %q, want main (the resolved default branch, not TriggerRef)", call.Base)
 	}
 	if call.Scope != forge.FromGitHubInstallationID(55) {
 		t.Errorf("installation_id scope = %v, want scope for 55", call.Scope)
@@ -2060,7 +2190,7 @@ func TestAdvance_DecomposedParent_Idempotent(t *testing.T) {
 	// CreatePullRequest. After the URL is stamped, a second Advance over
 	// the same review gate opens no second PR.
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 
 	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
 
@@ -2090,7 +2220,7 @@ func TestAdvance_DecomposedParent_LostRace_RecoversURL(t *testing.T) {
 	// so the create is still reached and the ErrPullRequestExists backstop
 	// does the recovery on the second list call.
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	gh.createPRErr = forge.ErrPullRequestExists
 	gh.listByHeadSeq = [][]forge.PullRequest{
 		nil, // pre-create list: lagging, nothing open yet
@@ -2121,7 +2251,7 @@ func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T
 	// fail with a (retryable) error rather than stamp an empty/nil URL —
 	// the next Advance re-enters and recovers once the list catches up.
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	gh.createPRErr = forge.ErrPullRequestExists
 	gh.listByHeadResult = nil // consistency gap: 422 says exists, list empty (both the pre-create and the recovery list)
 
@@ -2152,7 +2282,7 @@ func TestAdvance_DecomposedParent_LostRace_EmptyList_RetryableError(t *testing.T
 // URL and returns no error.
 func TestAdvance_DecomposedParent_RecordsPullRequestArtifact(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
 	o.Artifacts = arts
 
@@ -2232,7 +2362,7 @@ func TestAdvance_DecomposedParent_RecordsPullRequestArtifact(t *testing.T) {
 // skipped, mirroring the GitHub/installation nil-skip posture.
 func TestAdvance_DecomposedParent_NilArtifacts_GracefulSkip(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	o.Artifacts = nil // no artifact repo wired
 	gh.branchSHAs = map[string]string{}
 
@@ -2263,7 +2393,7 @@ func TestAdvance_DecomposedParent_NilArtifacts_GracefulSkip(t *testing.T) {
 // artifact-record seam (not just the IntegrateSlices seam).
 func TestAdvance_DecomposedParent_ArtifactRecordError_LeavesURLUnstamped(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	arts := &fakeArtifacts{byStage: map[uuid.UUID][]*artifact.Artifact{}}
 	o.Artifacts = arts
 
@@ -2305,7 +2435,7 @@ func TestAdvance_NonDecomposedParent_NoConsolidatedPR(t *testing.T) {
 	// A plain run (no decomposed children) reaching its review gate must
 	// NOT open a PR — only decomposed parents do.
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 
 	r, stages := rs.seed(t, "kuhlman-labs/fishhawk", int64Ptr(55), []stageSeed{
 		{Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, State: run.StageStateSucceeded},
@@ -2329,7 +2459,7 @@ func TestAdvance_DecomposedParent_NoGitHub_GracefulSkip(t *testing.T) {
 	// review (the parent stays PR-less, same posture as the github_actions
 	// backend's TriggerStage skip on a nil client).
 	rs := newStubRuns()
-	o := &Orchestrator{Runs: rs, DefaultRef: "main"} // GitHub nil
+	o := &Orchestrator{Runs: rs, DefaultBranch: defaultbranch.Static("main")} // GitHub nil
 
 	parent, stages := seedDecomposedParent(t, rs, int64Ptr(55), run.ExecutorHuman)
 
@@ -2445,7 +2575,7 @@ func TestAdvance_DecomposedParent_DispatchesConsolidatedReview(t *testing.T) {
 	// consolidated PR present, the orchestrator fires the consolidated
 	// implement review against base...consolidatedBranch (#1060).
 	o, rs, _ := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	rec := &recordingConsolidatedReview{}
 	o.ConsolidatedReview = rec
 
@@ -2462,7 +2592,7 @@ func TestAdvance_DecomposedParent_DispatchesConsolidatedReview(t *testing.T) {
 		t.Errorf("run id = %s, want parent %s", call.runID, parent.ID)
 	}
 	if call.base != "main" {
-		t.Errorf("base = %q, want main (DefaultRef)", call.base)
+		t.Errorf("base = %q, want main (the resolved default branch)", call.base)
 	}
 	if want := consolidatedBranch(parent.ID); call.head != want {
 		t.Errorf("head = %q, want %q (consolidated branch)", call.head, want)
@@ -2475,7 +2605,7 @@ func TestAdvance_NoConsolidatedReview_WhenNoPR(t *testing.T) {
 	// the CLI/dev posture) must NOT fire the consolidated review — there is
 	// no PR diff to review.
 	o, rs, _ := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	rec := &recordingConsolidatedReview{}
 	o.ConsolidatedReview = rec
 
@@ -2603,7 +2733,7 @@ func auditPayload(t *testing.T, a *recordingAudit, category string) map[string]a
 
 func TestIntegrateSlices_Success_MergesInSliceOrder(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"} // consolidated branch absent
@@ -2693,7 +2823,7 @@ func integrationSHAsFromPayload(p map[string]any) []string {
 // never under a name that nests within (or contains) the slice path.
 func TestIntegrateSlices_CreatesConsolidatedRef_WithPrefixSharingSlices(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 
@@ -2761,7 +2891,7 @@ func TestIntegrateSlices_CreatesConsolidatedRef_WithPrefixSharingSlices(t *testi
 
 func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -2816,7 +2946,7 @@ func TestIntegrateSlices_Conflict_FailsParentRecoverable(t *testing.T) {
 // consolidated branch in ascending order.
 func TestIntegrateSlices_DisjointSlices_ConsolidateWithoutConflict(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"} // consolidated absent
@@ -2863,7 +2993,7 @@ func TestIntegrateSlices_DisjointSlices_ConsolidateWithoutConflict(t *testing.T)
 // wrapper is covered by TestIntegrateSlices_Conflict_FailsParentRecoverable).
 func TestIntegrateSlices_OverlappingSlice_ReturnsConflict(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -2919,7 +3049,7 @@ func integrationCommitRecords(t *testing.T, a *recordingAudit) []map[string]any 
 // incrementally via integration_commit_recorded at merge time.
 func TestIntegrateSlices_PartialMergeThenConflict_RecordsCreatedMergeSHAs(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -2986,7 +3116,7 @@ func TestIntegrateSlices_PartialMergeThenConflict_RecordsCreatedMergeSHAs(t *tes
 // still be recorded (#1806 — BOTH early-return paths lose the SHA).
 func TestIntegrateSlices_PartialMergeThenAPIError_RecordsCreatedMergeSHAs(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -3037,7 +3167,7 @@ func TestIntegrateSlices_PartialMergeThenAPIError_RecordsCreatedMergeSHAs(t *tes
 // sweeper parks on instead of burning its bounded retry into category B.
 func TestIntegrateSlices_MissingSliceHead_ReturnsSliceHeadMissing(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	gh.branchSHAs = map[string]string{"main": "basesha"} // slice-1 head absent
 
 	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
@@ -3072,7 +3202,7 @@ func TestIntegrateSlices_MissingSliceHead_ReturnsSliceHeadMissing(t *testing.T) 
 // real failure is unrelated.
 func TestIntegrateSlices_NotFoundWithExistingHead_StaysGeneric(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
 	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
 	head0 := sliceBranch(parent.ID, 0)
@@ -3094,7 +3224,7 @@ func TestIntegrateSlices_NotFoundWithExistingHead_StaysGeneric(t *testing.T) {
 // so the 404 stays the generic wrapped error.
 func TestIntegrateSlices_NotFoundWithProbeError_StaysGeneric(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	gh.branchSHAs = map[string]string{"main": "basesha"}
 	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
 	_ = seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
@@ -3135,7 +3265,7 @@ func TestIntegrateSlices_SliceHeadMissingIsAsThroughWrap(t *testing.T) {
 // SHAs were recorded on the original 201 pass.
 func TestIntegrateSlices_RecordsOneMergePerSuccessfulMerge(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -3180,7 +3310,7 @@ func TestIntegrateSlices_RecordsOneMergePerSuccessfulMerge(t *testing.T) {
 
 func TestIntegrateSlices_Idempotent_ExistingBranchAndMergedSlices(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 
@@ -3217,7 +3347,7 @@ func TestIntegrateSlices_PaginatesToCompletion(t *testing.T) {
 	t.Cleanup(func() { integrateSlicesPageSize = saved })
 
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -3271,7 +3401,7 @@ func TestIntegrateSlices_PaginatesToCompletion(t *testing.T) {
 // COUNTERFACTUAL: restoring the `continue` body reddens all three.
 func TestIntegrateSlices_SucceededChildMissingSliceIndex_FailsClosed(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.branchSHAs = map[string]string{"main": "basesha"}
@@ -3376,7 +3506,7 @@ func TestIntegrateSlices_BaseRefMissing_Errors(t *testing.T) {
 	// A non-conflict error (the base ref does not resolve) must NOT mark
 	// the parent succeeded — it surfaces so the next settle retries.
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	gh.branchSHAs = map[string]string{} // base "main" absent
 
 	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
@@ -5852,17 +5982,22 @@ func TestAdvance_AcceptanceInfraFailure_BudgetExhaustedFailsRunWithAudit(t *test
 
 // TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun: every shape the
 // predicate does not park keeps today's completeRun -> failed, with no park or
-// budget row: an implement C failure, an acceptance A or B failure, and the C2
-// post-merge shape (review resolved succeeded by the merge, or pr_merged).
+// budget row: a plan, review or deploy C failure (the allow-list is acceptance
+// + implement; implement C's park is pinned by
+// TestAdvance_ImplementInfraFailure_ParksRun, #4426), an acceptance A or B
+// failure, and the C2 post-merge shape (review resolved succeeded by the
+// merge, or pr_merged).
 func TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun(t *testing.T) {
 	cases := []struct {
 		name        string
 		cat         run.FailureCategory
 		reviewState run.StageState
-		implement   bool
+		failedType  run.StageType
 		prMerged    bool
 	}{
-		{name: "implement C", cat: run.FailureC, reviewState: run.StageStatePending, implement: true},
+		{name: "plan C", cat: run.FailureC, reviewState: run.StageStatePending, failedType: run.StageTypePlan},
+		{name: "review C", cat: run.FailureC, reviewState: run.StageStatePending, failedType: run.StageTypeReview},
+		{name: "deploy C", cat: run.FailureC, reviewState: run.StageStatePending, failedType: run.StageTypeDeploy},
 		{name: "acceptance A", cat: run.FailureA, reviewState: run.StageStatePending},
 		{name: "acceptance B", cat: run.FailureB, reviewState: run.StageStatePending},
 		{name: "acceptance C, review resolved by merge", cat: run.FailureC, reviewState: run.StageStateSucceeded},
@@ -5872,8 +6007,8 @@ func TestAdvance_AcceptanceInfraFailure_NonParkableStillFailsRun(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			o, rs, au := newParkOrchestrator(t)
 			r, acc := seedAcceptanceInfraFailure(t, rs, tc.cat, tc.reviewState)
-			if tc.implement {
-				acc.Type = run.StageTypeImplement
+			if tc.failedType != "" {
+				acc.Type = tc.failedType
 			}
 			if tc.prMerged {
 				au.seeded = append(au.seeded, &audit.Entry{Sequence: 1, Category: "pr_merged"})
@@ -5940,4 +6075,110 @@ func TestAdvance_AcceptanceInfraFailure_AuditFailurePaths(t *testing.T) {
 			t.Fatalf("Outcome = %q, run state = %q; want run_completed + failed", out, rs.runs[r.ID].State)
 		}
 	})
+}
+
+// recordingSliceConcernImporter is a SliceConcernImporter that records each
+// call and, at call time, how many slices_integrated rows the audit fake had
+// already received — so a test can pin the import as running BEFORE the
+// slices_integrated append (E94.1 / #4692).
+type recordingSliceConcernImporter struct {
+	mu    sync.Mutex
+	audit *recordingAudit
+	err   error
+	calls []sliceConcernImportCall
+}
+
+type sliceConcernImportCall struct {
+	parent                   uuid.UUID
+	children                 []uuid.UUID
+	slicesIntegratedPriorCnt int
+}
+
+func (r *recordingSliceConcernImporter) ImportSliceConcerns(_ context.Context, parentRunID uuid.UUID, childRunIDs []uuid.UUID) error {
+	prior := 0
+	if r.audit != nil {
+		r.audit.mu.Lock()
+		for _, e := range r.audit.appended {
+			if e.Category == "slices_integrated" {
+				prior++
+			}
+		}
+		r.audit.mu.Unlock()
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.calls = append(r.calls, sliceConcernImportCall{parent: parentRunID, children: append([]uuid.UUID(nil), childRunIDs...), slicesIntegratedPriorCnt: prior})
+	return r.err
+}
+
+// newSliceConcernFanIn seeds a parent with two succeeded slices, ready for a
+// clean IntegrateSlices pass, and returns the orchestrator, audit fake and ids.
+func newSliceConcernFanIn(t *testing.T) (*Orchestrator, *recordingAudit, *run.Run, []uuid.UUID) {
+	t.Helper()
+	o, rs, gh := newOrchestrator(t)
+	o.DefaultBranch = defaultbranch.Static("main")
+	au := &recordingAudit{}
+	o.Audit = au
+	gh.branchSHAs = map[string]string{"main": "basesha"}
+	parent, _ := seedFanInParent(t, rs, int64Ptr(55))
+	c0 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 0)
+	c1 := seedSucceededSlice(t, rs, parent.ID, int64Ptr(55), 1)
+	return o, au, parent, []uuid.UUID{c0.ID, c1.ID}
+}
+
+// TestIntegrateSlices_ImportsSliceConcernsBeforeSlicesIntegrated pins the
+// E94.1 / #4692 fan-in hook: the importer is called once with the parent id
+// and every succeeded child id, before the slices_integrated append.
+func TestIntegrateSlices_ImportsSliceConcernsBeforeSlicesIntegrated(t *testing.T) {
+	o, au, parent, children := newSliceConcernFanIn(t)
+	imp := &recordingSliceConcernImporter{audit: au}
+	o.SliceConcerns = imp
+
+	if _, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if len(imp.calls) != 1 {
+		t.Fatalf("ImportSliceConcerns calls = %d, want 1", len(imp.calls))
+	}
+	call := imp.calls[0]
+	if call.parent != parent.ID {
+		t.Errorf("import parent = %s, want %s", call.parent, parent.ID)
+	}
+	if !reflect.DeepEqual(call.children, children) {
+		t.Errorf("import children = %v, want %v (every succeeded child, slice order)", call.children, children)
+	}
+	if call.slicesIntegratedPriorCnt != 0 {
+		t.Errorf("slices_integrated rows already written at import time = %d, want 0 (import runs BEFORE the append)", call.slicesIntegratedPriorCnt)
+	}
+	if n := countAuditCategory(au, "slices_integrated"); n != 1 {
+		t.Errorf("slices_integrated rows = %d, want 1", n)
+	}
+}
+
+// TestIntegrateSlices_ImportErrorWritesNoSlicesIntegrated pins the fail-closed
+// posture (E94.1 / #4692): an import error is returned and no
+// slices_integrated row is written, so the parent stays parked.
+func TestIntegrateSlices_ImportErrorWritesNoSlicesIntegrated(t *testing.T) {
+	o, au, parent, _ := newSliceConcernFanIn(t)
+	o.SliceConcerns = &recordingSliceConcernImporter{audit: au, err: errors.New("concern store down")}
+
+	_, err := o.IntegrateSlices(context.Background(), parent.ID)
+	if err == nil || !strings.Contains(err.Error(), "import slice concerns") {
+		t.Fatalf("IntegrateSlices err = %v, want an import slice concerns error", err)
+	}
+	if n := countAuditCategory(au, "slices_integrated"); n != 0 {
+		t.Errorf("slices_integrated rows after an import error = %d, want 0 (fail closed)", n)
+	}
+}
+
+// TestIntegrateSlices_NilImporterUnchanged pins the nil (CLI/dev) posture: no
+// importer, the fan-in integrates exactly as before.
+func TestIntegrateSlices_NilImporterUnchanged(t *testing.T) {
+	o, au, parent, _ := newSliceConcernFanIn(t)
+	if _, err := o.IntegrateSlices(context.Background(), parent.ID); err != nil {
+		t.Fatalf("IntegrateSlices: %v", err)
+	}
+	if n := countAuditCategory(au, "slices_integrated"); n != 1 {
+		t.Errorf("slices_integrated rows = %d, want 1", n)
+	}
 }

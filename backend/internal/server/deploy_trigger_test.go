@@ -21,6 +21,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
@@ -151,6 +152,7 @@ func TestTriggerDeploy_GitHubActions_DispatchResolvesAndParks(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, _ := seedDispatchedDeploy(rr, deploySpecNoConstraints, instID(99))
 	// The resolver finds the just-dispatched run by its correlation inputs.
 	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":424242,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/424242","status":"queued","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q}}]}`,
@@ -190,6 +192,7 @@ func TestTriggerDeploy_GitHubActions_UnresolvedStillParks(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stub.listBody = `{"workflow_runs":[]}` // resolver finds nothing yet
 	stage, _ := seedDispatchedDeploy(rr, deploySpecNoConstraints, instID(99))
 
@@ -494,6 +497,7 @@ func TestTriggerDeploy_AuditAppendFailure_FailsStage(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	au.appendErr = fmt.Errorf("audit store down")
 	stage, _ := seedDispatchedDeploy(rr, deploySpecNoConstraints, instID(99))
 
@@ -517,6 +521,7 @@ func TestSubmitApproval_Deploy_EndToEnd_TriggersAndParks(t *testing.T) {
 	s, _, rr, au := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, runRow := seedDeployRun(rr, "release", deploySpecNoConstraints)
 	runRow.InstallationID = instID(99)
 	stub.listBody = fmt.Sprintf(`{"workflow_runs":[{"id":777001,"html_url":"https://github.com/kuhlman-labs/example/actions/runs/777001","status":"in_progress","event":"workflow_dispatch","head_branch":"main","inputs":{"fishhawk_run_id":%q,"fishhawk_stage_id":%q}}]}`,

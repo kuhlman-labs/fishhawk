@@ -4,6 +4,8 @@ import (
 	"context"
 	"crypto/ed25519"
 	"encoding/json"
+	"errors"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -14,6 +16,8 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
@@ -568,7 +572,7 @@ func TestFanInHold_EndToEndRelease_ApprovalGatedImplement(t *testing.T) {
 	f.rr.mu.Lock()
 	f.parent.PullRequestURL = &prURL
 	f.rr.mu.Unlock()
-	f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s}
+	f.s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, DefaultBranch: defaultbranch.Static("main")}
 	sf := newSigningFake()
 	f.s.cfg.SigningRepo = sf
 	priv, _ := sf.issue(t, f.parent.ID)
@@ -621,4 +625,650 @@ func TestFanInHold_EndToEndRelease_ApprovalGatedImplement(t *testing.T) {
 func shipFanInReport(t *testing.T, f *fanInFixture, priv ed25519.PrivateKey, body []byte) *httptest.ResponseRecorder {
 	t.Helper()
 	return shipPRRequest(t, f.s, f.parent.ID, f.impl.ID, priv, body, "")
+}
+
+// --- #4785: acceptance ordered ahead of review ----------------------------------
+
+// newFanInAcceptanceAheadFixture is the feature_change shape (#4785): the
+// parent's implement stage succeeded, acceptance pending at seq 2 and review
+// pending at seq 3, on the local runner. The base fixture's seq-2 stage becomes
+// the acceptance stage; f.review is the new seq-3 review stage. acc returns the
+// acceptance stage.
+func newFanInAcceptanceAheadFixture(t *testing.T, spec []byte) (f *fanInFixture, acc *run.Stage) {
+	t.Helper()
+	f = newFanInFixture(t, spec)
+	f.rr.mu.Lock()
+	acc = f.review
+	acc.Type = run.StageTypeAcceptance
+	acc.ExecutorKind = run.ExecutorAgent
+	acc.State = run.StageStatePending
+	f.rr.runs[f.parent.ID].RunnerKind = run.RunnerKindLocal
+	f.rr.runs[f.parent.ID].RunnerKindResolved = true
+	f.rr.mu.Unlock()
+	review := f.rr.seedStage(f.parent.ID, 3, run.StageStatePending)
+	review.Type = run.StageTypeReview
+	review.ExecutorKind = run.ExecutorHuman
+	f.review = review
+	return f, acc
+}
+
+func TestFanInVerifySettled_Arms(t *testing.T) {
+	ctx := context.Background()
+	cases := []struct {
+		name    string
+		spec    []byte
+		setup   func(f *fanInFixture)
+		want    bool
+		wantErr bool
+	}{
+		{name: "passed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultPassed) }, want: true},
+		{name: "not_required", spec: specImplementGatingReviewers, want: true},
+		{name: "failed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultFailed) }, want: true},
+		{name: "unverified", spec: fanInVerifySpec, want: false},
+		{name: "not_executed", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedVerdict(fanInHead, mergeCandidateResultNotExecuted) }, want: false},
+		{name: "in_flight", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.seedTrigger(fanInHead) }, want: false},
+		{name: "state_read_error", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.au.listByCategoryErrCategory = CategoryMergeCandidateVerified
+		}, wantErr: true},
+		{name: "non_parent_child_run", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.rr.mu.Lock()
+			other := uuid.New()
+			f.rr.runs[f.parent.ID].DecomposedFrom = &other
+			f.rr.mu.Unlock()
+		}, want: true},
+		{name: "non_parent_no_children", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.rr.mu.Lock()
+			for _, r := range f.rr.runs {
+				if r.DecomposedFrom != nil && *r.DecomposedFrom == f.parent.ID {
+					r.DecomposedFrom = nil
+				}
+			}
+			f.rr.mu.Unlock()
+		}, want: true},
+		{name: "list_children_error", spec: fanInVerifySpec, setup: func(f *fanInFixture) {
+			f.rr.listRunsErr = errors.New("db unavailable")
+		}, wantErr: true},
+		{name: "forge_not_wired", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.s.cfg.GitHub = nil }, want: true},
+		{name: "compare_error", spec: fanInVerifySpec, setup: func(f *fanInFixture) { f.s.cfg.GitHub = erroringComparePatchClient(t) }, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f, _ := newFanInAcceptanceAheadFixture(t, tc.spec)
+			if tc.setup != nil {
+				tc.setup(f)
+			}
+			got, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch)
+			if tc.wantErr {
+				if err == nil {
+					t.Fatalf("FanInVerifySettled = %v, nil; want an error", got)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("FanInVerifySettled: %v", err)
+			}
+			if got != tc.want {
+				t.Errorf("FanInVerifySettled = %v, want %v", got, tc.want)
+			}
+			// The hook is READ-ONLY: it never starts a pass.
+			if n := len(mcvTriggerRows(f.au)); tc.name == "unverified" && n != 0 {
+				t.Errorf("trigger rows = %d, want 0 (the hook starts nothing)", n)
+			}
+		})
+	}
+
+	t.Run("get_run_error", func(t *testing.T) {
+		f, _ := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+		if _, err := f.s.FanInVerifySettled(ctx, uuid.New(), "main", f.branch); err == nil {
+			t.Fatal("FanInVerifySettled on an unknown run = nil error, want the read error")
+		}
+	})
+	t.Run("no_run_repo", func(t *testing.T) {
+		s := &Server{}
+		if got, err := s.FanInVerifySettled(ctx, uuid.New(), "main", "b"); err != nil || !got {
+			t.Errorf("FanInVerifySettled with no run repo = %v, %v; want true, nil", got, err)
+		}
+	})
+}
+
+// A fan_in pass start re-opens the parent implement stage past the
+// never-dispatched acceptance stage ahead of review (TolerateUndispatchedAcceptance),
+// re-parking no review; an acceptance already parked at awaiting_host_dispatch
+// keeps the #3116 refusal and the trigger settles not_executed.
+func TestBeginMergeCandidateVerifyPass_PendingAcceptanceAhead_ReopensImplement(t *testing.T) {
+	params := func(f *fanInFixture) mergeCandidateVerifyParams {
+		return mergeCandidateVerifyParams{Branch: f.branch, BaseRef: "main", HeadSHA: fanInHead, Cause: mergeCandidateCauseFanIn}
+	}
+	t.Run("pending_acceptance", func(t *testing.T) {
+		f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+		start, refusal := f.s.beginMergeCandidateVerifyPass(context.Background(), f.parent.ID, params(f), mergeCandidateSystemActor())
+		if refusal != nil {
+			t.Fatalf("refusal = %q, want a started pass", refusal.Reason)
+		}
+		if start.State != mergeCandidateStateInFlight || !start.Triggered {
+			t.Errorf("start = %+v, want in_flight + triggered", start)
+		}
+		rows := mcvTriggerRows(f.au)
+		if len(rows) != 1 {
+			t.Fatalf("trigger rows = %d, want 1", len(rows))
+		}
+		var trig mergeCandidateVerifyTrigger
+		if err := json.Unmarshal(rows[0].Payload, &trig); err != nil {
+			t.Fatal(err)
+		}
+		if trig.ReparkedReviewStageID != "" {
+			t.Errorf("reparked_review_stage_id = %q, want empty (the review is still pending)", trig.ReparkedReviewStageID)
+		}
+		if got := f.state(f.impl.ID); got != run.StageStatePending {
+			t.Errorf("implement state = %q, want pending (re-opened)", got)
+		}
+		if got := f.state(acc.ID); got != run.StageStatePending {
+			t.Errorf("acceptance state = %q, want pending", got)
+		}
+		if got := f.state(f.review.ID); got != run.StageStatePending {
+			t.Errorf("review state = %q, want pending", got)
+		}
+		if n := f.count(CategoryMergeCandidateVerified); n != 0 {
+			t.Errorf("merge_candidate_verified rows = %d, want 0 (nothing settled)", n)
+		}
+	})
+	t.Run("awaiting_host_dispatch_acceptance_refused", func(t *testing.T) {
+		f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+		f.rr.mu.Lock()
+		acc.State = run.StageStateAwaitingHostDispatch
+		f.rr.mu.Unlock()
+		_, refusal := f.s.beginMergeCandidateVerifyPass(context.Background(), f.parent.ID, params(f), mergeCandidateSystemActor())
+		if refusal == nil {
+			t.Fatal("refusal = nil, want the re-open refused")
+		}
+		if got := f.state(f.impl.ID); got != run.StageStateSucceeded {
+			t.Errorf("implement state = %q, want succeeded (not re-opened)", got)
+		}
+		verdicts := auditEntries(f.au, CategoryMergeCandidateVerified)
+		if len(verdicts) != 1 {
+			t.Fatalf("merge_candidate_verified rows = %d, want 1 (the un-reopened trigger settled)", len(verdicts))
+		}
+		var v mergeCandidateVerifiedPayload
+		_ = json.Unmarshal(verdicts[0].Payload, &v)
+		if v.Result != mergeCandidateResultNotExecuted {
+			t.Errorf("verdict = %q, want not_executed", v.Result)
+		}
+	})
+}
+
+func TestServerNew_WiresFanInVerifyHook(t *testing.T) {
+	o := &orchestrator.Orchestrator{}
+	s := New(Config{Addr: "127.0.0.1:0", Orchestrator: o})
+	if o.FanInVerify != s {
+		t.Errorf("Orchestrator.FanInVerify = %v, want the *Server", o.FanInVerify)
+	}
+}
+
+// Cross-layer (#4785): the real orchestrator.Advance → FanInVerifySettled hook →
+// DispatchConsolidatedReview D5 hold → beginMergeCandidateVerifyPass →
+// run.FixupStage(tolerant) → signed merge_candidate_verified report →
+// settleMergeCandidateVerifyStage → Advance release → consolidated
+// runImplementReviews, then the review-gate Advance with no duplicate round or
+// trigger. Every step reads persisted stage states and audit rows.
+func TestFanInAcceptanceHold_EndToEnd(t *testing.T) {
+	f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+	evidence := f.captureReviewEvidence()
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
+	f.rr.mu.Unlock()
+	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
+	f.s.cfg.Orchestrator = o
+	sf := newSigningFake()
+	f.s.cfg.SigningRepo = sf
+	priv, _ := sf.issue(t, f.parent.ID)
+	ctx := context.Background()
+
+	// 1. Advance reaches the pending acceptance: held; the verify-only pass is
+	// started and re-opens implement; no review round runs.
+	if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+		t.Fatalf("Advance #1: %v", err)
+	}
+	f.s.waitBackgroundReviews()
+	if n := len(mcvTriggerRows(f.au)); n != 1 {
+		t.Fatalf("trigger rows = %d, want 1", n)
+	}
+	if got := f.state(f.impl.ID); got != run.StageStatePending {
+		t.Fatalf("implement state = %q, want pending (re-opened for the pass)", got)
+	}
+	if got := f.state(acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance state = %q, want pending (held)", got)
+	}
+	f.assertHeld()
+
+	// 2. The runner runs the pass and reports passed for the consolidated head:
+	// the release dispatches acceptance and the consolidated round runs.
+	f.rr.mu.Lock()
+	f.impl.State = run.StageStateRunning
+	f.rr.mu.Unlock()
+	body, _ := json.Marshal(map[string]any{
+		"outcome": outcomeMergeCandidateVerified, "branch": f.branch, "head_sha": fanInHead,
+		"merge_candidate_result": "passed", "merge_candidate_reason": "",
+		"merge_candidate_output_tail": fanInTailSentinel,
+	})
+	w := shipFanInReport(t, f, priv, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+	if got := f.state(f.impl.ID); got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded", got)
+	}
+	if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("acceptance state = %q, want awaiting_host_dispatch (released)", got)
+	}
+	if n := f.count("implement_review_started"); n != 1 {
+		t.Fatalf("implement_review_started = %d, want 1 after the release", n)
+	}
+	f.assertParentLevelVerify(evidence())
+	if got := f.state(f.review.ID); got != run.StageStatePending {
+		t.Errorf("review state = %q, want pending (acceptance runs first)", got)
+	}
+
+	// 3. Acceptance settles; the review gate opens with no duplicate round or
+	// trigger.
+	f.rr.mu.Lock()
+	acc.State = run.StageStateSucceeded
+	f.rr.mu.Unlock()
+	if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+		t.Fatalf("Advance #3: %v", err)
+	}
+	f.s.waitBackgroundReviews()
+	if got := f.state(f.review.ID); got != run.StageStateAwaitingApproval {
+		t.Errorf("review state = %q, want awaiting_approval", got)
+	}
+	if n := f.count("implement_review_started"); n != 1 {
+		t.Errorf("implement_review_started = %d, want still 1 (the review-gate re-fire dedups)", n)
+	}
+	if n := len(mcvTriggerRows(f.au)); n != 1 {
+		t.Errorf("trigger rows = %d, want still 1", n)
+	}
+}
+
+// --- #4812: a base-advanced consolidated head ------------------------------------
+
+// seedBaseAdvanceHead records a branch_rebased row whose new head (and merge
+// commit) is fanInHead, so the consolidated head classifies base_advance —
+// classifier rule 1, ahead of the fixture's fan-in integration row (rule 5).
+func (f *fanInFixture) seedBaseAdvanceHead() {
+	f.appendRow(nil, CategoryBranchRebased, map[string]any{
+		"new_head_sha": fanInHead, "merge_commit_sha": fanInHead,
+	})
+}
+
+// wireQueue wires a pure mcqFaultStore whose ActiveForRun answers active.
+// Every other store call answers errMCQNilStore, so an unexpected write is a
+// recorded call AND an error, never a silent success.
+func (f *fanInFixture) wireQueue(active func(uuid.UUID) (mergequeue.Status, bool, error)) *mcqFaultStore {
+	q := &mcqFaultStore{activeForRun: active}
+	f.s.cfg.MergeQueue = q
+	return q
+}
+
+// wireNotEligibleQueue wires a queue with NO active entry for the run: a
+// serialized start then consults admission eligibility, which the parent (its
+// review and acceptance not settled) fails.
+func (f *fanInFixture) wireNotEligibleQueue() *mcqFaultStore {
+	return f.wireQueue(func(uuid.UUID) (mergequeue.Status, bool, error) { return mergequeue.Status{}, false, nil })
+}
+
+// assertBaseAdvanceHead pins the PRECONDITIONS a #4812 test stands on, so a
+// fixture that silently classifies fan_in (or never routes through the queue)
+// cannot pass vacuously: the head classifies base_advance with merge-candidate
+// state wantState, and a base_advance start for it routes through the queue.
+func (f *fanInFixture) assertBaseAdvanceHead(wantState string) {
+	f.t.Helper()
+	ctx := context.Background()
+	cause, err := f.s.classifyMergeCandidateHead(ctx, f.runRow(), fanInHead)
+	if err != nil || cause != mergeCandidateCauseBaseAdvance {
+		f.t.Fatalf("precondition: head classifies %q (err %v), want %s", cause, err, mergeCandidateCauseBaseAdvance)
+	}
+	state, err := f.s.mergeCandidateVerifyState(ctx, f.runRow(), fanInHead)
+	if err != nil || state.State != wantState {
+		f.t.Fatalf("precondition: merge-candidate state = %+v (err %v), want %s", state, err, wantState)
+	}
+	if wantState == mergeCandidateStateUnverified && state.Cause != mergeCandidateCauseBaseAdvance {
+		f.t.Fatalf("precondition: unverified state cause = %q, want %s", state.Cause, mergeCandidateCauseBaseAdvance)
+	}
+	if !f.s.mergeCandidateQueueRoutes(mergeCandidateVerifyParams{Branch: f.branch, BaseRef: "main", HeadSHA: fanInHead,
+		Cause: mergeCandidateCauseBaseAdvance}, mergeCandidateSystemActor()) {
+		f.t.Fatal("precondition: a base_advance start does not route through the merge-candidate queue")
+	}
+}
+
+// fanInLogRecord is one decoded JSON slog record.
+type fanInLogRecord struct {
+	level string
+	msg   string
+	attrs map[string]any
+}
+
+// captureLogs points the server's logger at a mutex-guarded JSON buffer
+// (#3226: review goroutines write it while the test reads) and returns a
+// decoder over the records written so far.
+func (f *fanInFixture) captureLogs() func() []fanInLogRecord {
+	f.t.Helper()
+	buf := &syncBuffer{}
+	f.s.cfg.Logger = slog.New(slog.NewJSONHandler(buf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	return func() []fanInLogRecord {
+		f.t.Helper()
+		var out []fanInLogRecord
+		for _, line := range strings.Split(buf.String(), "\n") {
+			if strings.TrimSpace(line) == "" {
+				continue
+			}
+			var m map[string]any
+			if err := json.Unmarshal([]byte(line), &m); err != nil {
+				f.t.Fatalf("log line is not JSON: %v\n%s", err, line)
+			}
+			lvl, _ := m["level"].(string)
+			msg, _ := m["msg"].(string)
+			out = append(out, fanInLogRecord{level: lvl, msg: msg, attrs: m})
+		}
+		return out
+	}
+}
+
+// fanInStartedRecords returns the records reporting a started pass.
+func fanInStartedRecords(recs []fanInLogRecord) []fanInLogRecord {
+	var out []fanInLogRecord
+	for _, r := range recs {
+		if strings.Contains(r.msg, "pass started") {
+			out = append(out, r)
+		}
+	}
+	return out
+}
+
+// assertOneFanInTrigger pins exactly one trigger row on the parent implement
+// stage, written by the system actor, with cause fan_in for fanInHead.
+func (f *fanInFixture) assertOneFanInTrigger() {
+	f.t.Helper()
+	rows := mcvTriggerRows(f.au)
+	if len(rows) != 1 {
+		f.t.Fatalf("stage_merge_candidate_verify_triggered = %d, want 1", len(rows))
+	}
+	row := rows[0]
+	if row.ActorKind == nil || *row.ActorKind != audit.ActorSystem {
+		f.t.Errorf("trigger actor = %v, want system", row.ActorKind)
+	}
+	if row.StageID == nil || *row.StageID != f.impl.ID {
+		f.t.Errorf("trigger stage = %v, want the parent implement stage %s", row.StageID, f.impl.ID)
+	}
+	var trig mergeCandidateVerifyTrigger
+	if err := json.Unmarshal(row.Payload, &trig); err != nil {
+		f.t.Fatal(err)
+	}
+	if trig.Cause != mergeCandidateCauseFanIn || trig.ExpectedHeadSHA != fanInHead {
+		f.t.Errorf("trigger cause/head = %q/%q, want %s/%s", trig.Cause, trig.ExpectedHeadSHA, mergeCandidateCauseFanIn, fanInHead)
+	}
+}
+
+// The D5 hold on a base-advanced consolidated head (no queue entry, a run not
+// yet merge-queue eligible) STARTS a fan_in pass: one trigger, the implement
+// stage re-opened, nothing enqueued, and the "started" record names a real
+// stage id. A forwarded base_advance cause answers not_queued and starts
+// nothing (#4812).
+func TestFanInHold_BaseAdvanceHead_StartsFanInPass(t *testing.T) {
+	f := newFanInFixture(t, fanInVerifySpec)
+	f.seedBaseAdvanceHead()
+	q := f.wireNotEligibleQueue()
+	f.assertBaseAdvanceHead(mergeCandidateStateUnverified)
+	logs := f.captureLogs()
+	f.dispatch()
+
+	f.assertHeld()
+	f.assertOneFanInTrigger()
+	if got := f.state(f.impl.ID); got != run.StageStatePending {
+		t.Errorf("implement state = %q, want pending (re-opened for the pass)", got)
+	}
+	if n := q.called("Enqueue"); n != 0 {
+		t.Errorf("queue Enqueue calls = %d, want 0 (fan_in takes the direct start); calls %v", n, q.names())
+	}
+	started := fanInStartedRecords(logs())
+	if len(started) != 1 {
+		t.Fatalf("'pass started' records = %d, want 1: %+v", len(started), logs())
+	}
+	r := started[0]
+	if r.level != "INFO" || r.attrs["triggered"] != true || r.attrs["cause"] != mergeCandidateCauseFanIn ||
+		r.attrs["head_cause"] != mergeCandidateCauseBaseAdvance {
+		t.Errorf("started record = %+v, want INFO triggered=true cause=fan_in head_cause=base_advance", r)
+	}
+	if id, _ := r.attrs["stage_id"].(string); id == "" || id == uuid.Nil.String() {
+		t.Errorf("started record stage_id = %q, want the re-opened stage", id)
+	}
+}
+
+// C4 residual: a parent holding an ACTIVE HELD queue entry still gets a DIRECT
+// fan_in pass from the hold — the queue is not consulted for the start and no
+// queue state is written. Per-head idempotence makes a later admission read the
+// pass as in_flight/passed for the same head.
+func TestFanInHold_BaseAdvanceHead_ActiveHeldEntry_StartsDirectPass(t *testing.T) {
+	f := newFanInFixture(t, fanInVerifySpec)
+	f.seedBaseAdvanceHead()
+	liveRun := uuid.New()
+	q := f.wireQueue(func(runID uuid.UUID) (mergequeue.Status, bool, error) {
+		return mergequeue.Status{
+			Entry: mergequeue.Entry{ID: uuid.New(), RunID: runID, BaseRef: "main", State: mergequeue.StateHeld,
+				AnchoredHeadSHA: "olderhead"},
+			Position: 2, LiveRunID: &liveRun,
+		}, true, nil
+	})
+	f.assertBaseAdvanceHead(mergeCandidateStateUnverified)
+	f.dispatch()
+
+	f.assertHeld()
+	f.assertOneFanInTrigger()
+	if n := q.called("Enqueue"); n != 0 {
+		t.Errorf("queue Enqueue calls = %d, want 0; calls %v", n, q.names())
+	}
+	readOnly := map[string]bool{"ActiveForRun": true, "ActiveBases": true, "ListForBase": true, "MergeDispatch": true, "RecentLineTurns": true}
+	for _, name := range q.names() {
+		if !readOnly[name] {
+			t.Errorf("queue store call %q writes queue state; want none (calls %v)", name, q.names())
+		}
+	}
+}
+
+// Cross-layer (#4812 on the #4785 shape): a base-advanced consolidated head on
+// a parent with acceptance ahead of review. Advance holds acceptance and the D5
+// hold starts a fan_in pass; the passed report settles the head, so
+// FanInVerifySettled flips true, acceptance is released and the consolidated
+// round runs once with the parent-level evidence.
+func TestFanInAcceptanceHold_BaseAdvanceHead_EndToEnd(t *testing.T) {
+	f, acc := newFanInAcceptanceAheadFixture(t, fanInVerifySpec)
+	f.seedBaseAdvanceHead()
+	f.wireNotEligibleQueue()
+	f.assertBaseAdvanceHead(mergeCandidateStateUnverified)
+	evidence := f.captureReviewEvidence()
+	prURL := "https://github.com/kuhlman-labs/example/pull/9"
+	f.rr.mu.Lock()
+	f.rr.runs[f.parent.ID].PullRequestURL = &prURL
+	f.rr.mu.Unlock()
+	o := &orchestrator.Orchestrator{Runs: f.rr, ConsolidatedReview: f.s, FanInVerify: f.s, DefaultBranch: defaultbranch.Static("main")}
+	f.s.cfg.Orchestrator = o
+	sf := newSigningFake()
+	f.s.cfg.SigningRepo = sf
+	priv, _ := sf.issue(t, f.parent.ID)
+	ctx := context.Background()
+
+	if _, err := o.Advance(ctx, f.parent.ID); err != nil {
+		t.Fatalf("Advance #1: %v", err)
+	}
+	f.s.waitBackgroundReviews()
+	f.assertOneFanInTrigger()
+	if got := f.state(acc.ID); got != run.StageStatePending {
+		t.Fatalf("acceptance state = %q, want pending (held)", got)
+	}
+	f.assertHeld()
+	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || settled {
+		t.Fatalf("FanInVerifySettled before the pass = %v, %v; want false", settled, err)
+	}
+
+	f.rr.mu.Lock()
+	f.impl.State = run.StageStateRunning
+	f.rr.mu.Unlock()
+	body, _ := json.Marshal(map[string]any{
+		"outcome": outcomeMergeCandidateVerified, "branch": f.branch, "head_sha": fanInHead,
+		"merge_candidate_result": "passed", "merge_candidate_reason": "",
+		"merge_candidate_output_tail": fanInTailSentinel,
+	})
+	w := shipFanInReport(t, f, priv, body)
+	if w.Code != http.StatusOK {
+		t.Fatalf("report status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.s.waitBackgroundReviews()
+
+	if settled, err := f.s.FanInVerifySettled(ctx, f.parent.ID, "main", f.branch); err != nil || !settled {
+		t.Errorf("FanInVerifySettled after the pass = %v, %v; want true", settled, err)
+	}
+	verdicts := auditEntries(f.au, CategoryMergeCandidateVerified)
+	if len(verdicts) != 1 {
+		t.Fatalf("merge_candidate_verified rows = %d, want 1", len(verdicts))
+	}
+	var v mergeCandidateVerifiedPayload
+	if err := json.Unmarshal(verdicts[0].Payload, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.HeadSHA != fanInHead || v.Cause != mergeCandidateCauseFanIn || v.Result != mergeCandidateResultPassed {
+		t.Errorf("verdict = %+v, want passed fan_in for %s", v, fanInHead)
+	}
+	if got := f.state(f.impl.ID); got != run.StageStateSucceeded {
+		t.Errorf("implement state = %q, want succeeded", got)
+	}
+	if got := f.state(acc.ID); got != run.StageStateAwaitingHostDispatch {
+		t.Fatalf("acceptance state = %q, want awaiting_host_dispatch (released)", got)
+	}
+	f.assertReviewed()
+	f.assertParentLevelVerify(evidence())
+}
+
+// A passed verdict recorded under cause fan_in satisfies the hold on a head the
+// classifier calls base_advance: verdicts bind by head, not cause.
+func TestFanInHold_BaseAdvanceHead_PassedVerdictReleases(t *testing.T) {
+	f := newFanInFixture(t, fanInVerifySpec)
+	f.seedBaseAdvanceHead()
+	f.wireNotEligibleQueue()
+	f.seedVerdict(fanInHead, mergeCandidateResultPassed)
+	f.assertBaseAdvanceHead(mergeCandidateStatePassed)
+	evidence := f.captureReviewEvidence()
+	f.dispatch()
+
+	f.assertReviewed()
+	f.assertParentLevelVerify(evidence())
+	if n := len(mcvTriggerRows(f.au)); n != 1 {
+		t.Errorf("trigger rows = %d, want 1 (the seeded one; a passed head starts nothing)", n)
+	}
+}
+
+// fanInHoldOnStart reads every start answer explicitly (#4812): only a
+// triggered in_flight answer is logged as a started pass.
+func TestFanInHoldOnStart_Answers(t *testing.T) {
+	stageID := uuid.New()
+	liveRun := uuid.New()
+	cases := []struct {
+		name string
+		// answer builds the start answer on the row's fixture.
+		answer      func(t *testing.T, f *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal)
+		wantHold    bool
+		wantLevel   string
+		wantMsg     string
+		wantAttrs   map[string]any
+		wantStarted bool
+	}{
+		{name: "refusal", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return nil, &mergeCandidateVerifyRefusal{Reason: "append failed"}
+		}, wantHold: true, wantLevel: "WARN", wantMsg: "could not be started", wantAttrs: map[string]any{"refusal": "append failed"}},
+		{name: "nil_start", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return nil, nil
+		}, wantHold: true, wantLevel: "WARN", wantMsg: "returned no answer"},
+		{name: "not_required", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStateNotRequired}, nil
+		}},
+		{name: "passed", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStatePassed}, nil
+		}},
+		{name: "in_flight_triggered", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStateInFlight, StageID: stageID, Triggered: true}, nil
+		}, wantHold: true, wantLevel: "INFO", wantMsg: "pass started", wantStarted: true,
+			wantAttrs: map[string]any{"triggered": true, "stage_id": stageID.String(), "cause": mergeCandidateCauseFanIn}},
+		{name: "in_flight_untriggered", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStateInFlight, StageID: stageID}, nil
+		}, wantHold: true, wantLevel: "INFO", wantMsg: "already in flight",
+			wantAttrs: map[string]any{"start_state": mergeCandidateStateInFlight, "stage_id": stageID.String()}},
+		{name: "failed", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStateFailed}, nil
+		}, wantHold: true, wantLevel: "WARN", wantMsg: "FAILED", wantAttrs: map[string]any{"start_state": mergeCandidateStateFailed}},
+		{name: "not_queued_real_start", answer: func(t *testing.T, f *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			// The REAL answer the pre-#4812 forwarded cause produced: a
+			// base_advance start on a base-advanced head with no queue entry
+			// and an ineligible run.
+			f.seedBaseAdvanceHead()
+			q := f.wireNotEligibleQueue()
+			f.assertBaseAdvanceHead(mergeCandidateStateUnverified)
+			start, refusal := f.s.startMergeCandidateVerifyPass(context.Background(), f.parent.ID, mergeCandidateVerifyParams{
+				Branch: f.branch, BaseRef: "main", HeadSHA: fanInHead, Cause: mergeCandidateCauseBaseAdvance,
+			}, mergeCandidateSystemActor())
+			if refusal != nil || start == nil || start.State != mergeCandidateStateNotQueued {
+				t.Fatalf("precondition: forced base_advance start = %+v / %+v, want not_queued", start, refusal)
+			}
+			if n := q.called("Enqueue"); n != 0 {
+				t.Fatalf("precondition: Enqueue calls = %d, want 0", n)
+			}
+			if n := len(mcvTriggerRows(f.au)); n != 0 {
+				t.Fatalf("precondition: trigger rows = %d, want 0 (not_queued starts nothing)", n)
+			}
+			return start, refusal
+		}, wantHold: true, wantLevel: "WARN", wantMsg: "answered not_queued", wantAttrs: map[string]any{"start_state": mergeCandidateStateNotQueued}},
+		{name: "held", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: mergeCandidateStateHeld, Position: 2, LiveRunID: &liveRun}, nil
+		}, wantHold: true, wantLevel: "WARN", wantMsg: "answered held",
+			wantAttrs: map[string]any{"start_state": mergeCandidateStateHeld, "position": float64(2), "live_run_id": liveRun.String()}},
+		{name: "unknown", answer: func(*testing.T, *fanInFixture) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
+			return &mergeCandidateVerifyStart{State: "bogus"}, nil
+		}, wantHold: true, wantLevel: "WARN", wantMsg: "unknown merge-candidate verify start answer", wantAttrs: map[string]any{"start_state": "bogus"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFanInFixture(t, fanInVerifySpec)
+			start, refusal := tc.answer(t, f)
+			logs := f.captureLogs()
+			attrs := []slog.Attr{slog.String("run_id", f.parent.ID.String()), slog.String("head_sha", fanInHead)}
+			got := f.s.fanInHoldOnStart(context.Background(), attrs, mergeCandidateCauseFanIn, start, refusal)
+			if got != tc.wantHold {
+				t.Fatalf("hold = %v, want %v", got, tc.wantHold)
+			}
+			recs := logs()
+			started := fanInStartedRecords(recs)
+			if tc.wantStarted != (len(started) == 1) || len(started) > 1 {
+				t.Errorf("'pass started' records = %+v, want started=%v", started, tc.wantStarted)
+			}
+			if !tc.wantHold {
+				if len(recs) != 0 {
+					t.Errorf("a release logged %+v, want nothing", recs)
+				}
+				return
+			}
+			if len(recs) != 1 {
+				t.Fatalf("records = %+v, want exactly 1", recs)
+			}
+			r := recs[0]
+			if r.level != tc.wantLevel || !strings.Contains(r.msg, tc.wantMsg) {
+				t.Errorf("record = %s %q, want %s containing %q", r.level, r.msg, tc.wantLevel, tc.wantMsg)
+			}
+			if r.attrs["run_id"] != f.parent.ID.String() || r.attrs["head_sha"] != fanInHead {
+				t.Errorf("record lost the hold's attrs: %+v", r.attrs)
+			}
+			for k, want := range tc.wantAttrs {
+				if r.attrs[k] != want {
+					t.Errorf("record attr %s = %#v, want %#v", k, r.attrs[k], want)
+				}
+			}
+		})
+	}
 }

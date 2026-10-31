@@ -19,9 +19,10 @@ import (
 // to count as a duplicate.
 //
 // It is authored generically (stage + payload key=value) rather than hard-coded
-// to the acceptance_scenario_retirement_dropped writers that drove it (#3439);
-// the three of them share one key shape, (stage_id, reason), and are today the
-// only consumers.
+// to the acceptance_scenario_retirement_dropped writers that drove it (#3439).
+// Its consumers are those writers ((stage_id, reason)), childcancel,
+// stalesweep, mergeoutcome, and the escape verb (server/escape.go, #4694),
+// which alone sets BeforeAppend.
 type DedupeSpec struct {
 	// StageID, when non-nil, restricts the duplicate scan to entries carrying
 	// EXACTLY this stage_id — an entry with a nil or different stage_id is
@@ -33,6 +34,45 @@ type DedupeSpec struct {
 	// PayloadValue is the JSON STRING that key must hold for an existing entry
 	// to be a duplicate of this append.
 	PayloadValue string
+	// BeforeAppend, when non-nil, is invoked INSIDE the transaction, under the
+	// run-row lock, AFTER the duplicate scan found no duplicate and BEFORE the
+	// chained append (ADR-117 A1.2 / #4694). sameCategory is every entry of the
+	// appended category on the run's chain, read on the SAME transaction, so a
+	// check the hook makes against it (the escape closure's "target is still
+	// pending" read) is atomic with the append. The hook may rewrite p.Payload
+	// (the closure copies its target's fields into the successor). A non-nil
+	// return rolls the transaction back, writes nothing, and is propagated
+	// UNWRAPPED so the caller can errors.As its own typed refusal. nil — every
+	// pre-#4694 caller — is byte-identical to the hook-less append.
+	BeforeAppend func(sameCategory []*Entry, p *ChainAppendParams) error
+}
+
+// CheckDedupeSpec is the scan + hook half of a deduped append, shared by
+// AppendChainedDedupedTx (in-transaction, under the run-row lock) and a
+// caller's non-atomic in-memory fallback (list, CheckDedupeSpec, append — the
+// fake shape ADR-117 A1.2 allows). sameCategory is every entry of the appended
+// category on the run's chain. An entry is a duplicate when it carries
+// spec.StageID (when set) AND its payload holds spec.PayloadKey as a JSON
+// STRING equal to spec.PayloadValue → *DedupedDuplicateError naming it. A
+// malformed payload, an absent key, or a non-string value is SKIPPED. With no
+// duplicate, spec.BeforeAppend (when set) runs and its error is returned
+// unwrapped; it may rewrite p.Payload.
+func CheckDedupeSpec(sameCategory []*Entry, p *ChainAppendParams, spec DedupeSpec) error {
+	for _, e := range sameCategory {
+		if e == nil {
+			continue
+		}
+		if spec.StageID != nil && (e.StageID == nil || *e.StageID != *spec.StageID) {
+			continue
+		}
+		if v, ok := payloadString(e.Payload, spec.PayloadKey); ok && v == spec.PayloadValue {
+			return &DedupedDuplicateError{Existing: e}
+		}
+	}
+	if spec.BeforeAppend != nil {
+		return spec.BeforeAppend(sameCategory, p)
+	}
+	return nil
 }
 
 // DedupedDuplicateError is returned when an entry carrying the same
@@ -101,6 +141,8 @@ type DedupedChainAppender interface {
 //     STRING equal to spec.PayloadValue → *DedupedDuplicateError, nothing
 //     written. A malformed payload, an absent key, or a non-string value is
 //     SKIPPED (payloadString — the string-typed mirror of payloadInt64).
+//     With no duplicate, spec.BeforeAppend (when set) runs on the same view;
+//     its error aborts the append (CheckDedupeSpec).
 //  3. Delegate to AppendChainedTx so the hashing/chaining path is byte-identical
 //     to every other chained append (its re-entrant LockRunForUpdate inside the
 //     same tx is a harmless no-op).
@@ -139,14 +181,15 @@ func AppendChainedDedupedTx(ctx context.Context, tx pgx.Tx, p ChainAppendParams,
 	if err != nil {
 		return nil, fmt.Errorf("audit: scan deduped duplicates: %w", err)
 	}
+	entries := make([]*Entry, 0, len(existing))
 	for i := range existing {
-		row := existing[i]
-		if spec.StageID != nil && (row.StageID == nil || *row.StageID != *spec.StageID) {
-			continue
-		}
-		if v, ok := payloadString(row.Payload, spec.PayloadKey); ok && v == spec.PayloadValue {
-			return nil, &DedupedDuplicateError{Existing: rowToEntry(row)}
-		}
+		entries = append(entries, rowToEntry(existing[i]))
+	}
+	// The scan, then spec.BeforeAppend (when set) on the same locked view; a
+	// hook refusal returns before AppendChainedTx, so the caller's rollback
+	// discards nothing written.
+	if err := CheckDedupeSpec(entries, &p, spec); err != nil {
+		return nil, err
 	}
 
 	// Step 3: delegate to the shared chained-append path.

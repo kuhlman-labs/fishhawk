@@ -2004,6 +2004,208 @@ func TestHostDispatch_DeployHold_DispatchedArmStaysIdempotent(t *testing.T) {
 	}
 }
 
+// ---- Failed-stage-ahead refusal (#4426) ----
+
+// failedAheadFixture seeds the parked-implement shape (#4426): a RUNNING run
+// (so the terminal-run refusal cannot mask the new guard) locked to the local
+// runner (the runner_kind guard admits) carrying plan (seq 1) succeeded,
+// implement (seq 2) in implState, acceptance (agent, seq 3) in accState, and a
+// human review (seq 4) pending. No deploy stage (the deploy hold is silent), no
+// decomposition linkage (wave-order and decomposed-acceptance guards silent),
+// and nil Concurrency / HostAdmissionHold — so failedStageAhead is the only
+// refusal between the request and the CAS. implCategory is stamped on the
+// implement stage only when it is failed.
+func failedAheadFixture(t *testing.T, implState run.StageState, implCategory run.FailureCategory, accState run.StageState) (*orchestratorRepo, *auditFake, *run.Run, *run.Stage, *run.Stage) {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	au := newAuditFake()
+	runRow := rr.seedRun()
+	lockRunRunnerKind(rr, runRow.ID, run.RunnerKindLocal)
+	rr.seedStage(runRow.ID, 1, run.StageStateSucceeded)
+	impl := rr.seedStage(runRow.ID, 2, implState)
+	impl.Type = run.StageTypeImplement
+	if implState == run.StageStateFailed {
+		cat := implCategory
+		impl.FailureCategory = &cat
+	}
+	acceptance := rr.seedStage(runRow.ID, 3, accState)
+	acceptance.Type = run.StageTypeAcceptance
+	review := rr.seedStage(runRow.ID, 4, run.StageStatePending)
+	review.Type = run.StageTypeReview
+	review.ExecutorKind = run.ExecutorHuman
+	return rr, au, runRow, impl, acceptance
+}
+
+// assertEarlierStageFailedRefusal asserts the 409 earlier_stage_failed body
+// naming failed, and that target reads back in wantState with no acceptance
+// spawn anchor and the run still running (committed state, not error
+// identity: under a deleted guard the CAS would have committed dispatched).
+func assertEarlierStageFailedRefusal(t *testing.T, w *httptest.ResponseRecorder, rr *orchestratorRepo, au *auditFake,
+	runID uuid.UUID, target, failed *run.Stage, wantCategory string, wantState run.StageState) {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("unmarshal: %v (body %s)", err, w.Body.String())
+	}
+	if body.Error.Code != "dispatch_not_admissible" {
+		t.Errorf("error code = %q, want dispatch_not_admissible (body %s)", body.Error.Code, w.Body.String())
+	}
+	for k, want := range map[string]string{
+		"stage_id":          target.ID.String(),
+		"reason":            hostDispatchReasonEarlierStageFailed,
+		"failed_stage_id":   failed.ID.String(),
+		"failed_stage_type": string(failed.Type),
+		"failure_category":  wantCategory,
+	} {
+		if got, _ := body.Error.Details[k].(string); got != want {
+			t.Errorf("details[%q] = %q, want %q (body %s)", k, got, want, w.Body.String())
+		}
+	}
+	cur, err := rr.GetStage(context.Background(), target.ID)
+	if err != nil {
+		t.Fatalf("read back: %v", err)
+	}
+	if cur.State != wantState || cur.DispatchedAt != nil {
+		t.Errorf("target stage = {state:%s dispatched_at:%v}, want %s untouched", cur.State, cur.DispatchedAt, wantState)
+	}
+	if got := acceptanceDispatchEntries(au, target.ID); len(got) != 0 {
+		t.Errorf("acceptance_dispatched entries = %d, want 0 (nothing spawned)", len(got))
+	}
+	if r, _ := rr.GetRun(context.Background(), runID); r.State != run.StateRunning {
+		t.Errorf("run state = %q, want running (the failed-stage guard, not the terminal-run guard, refused)", r.State)
+	}
+}
+
+// TestHostDispatch_FailedStageAhead_RefusesAndLeavesStageUnchanged (T-HD-1,
+// #4426) pins the host-dispatch half of the implement park: a parked
+// category-C implement failure leaves the run RUNNING, so the terminal-run
+// refusal no longer protects the stages after it, and the marker must refuse
+// a pending or awaiting_host_dispatch stage sequenced after a FAILED stage —
+// 409 dispatch_not_admissible / earlier_stage_failed naming the failed stage —
+// with the target read back unchanged. The idempotent dispatched arm stays
+// unguarded (row 3), a succeeded implement admits (row 4), and a failed stage
+// sequenced AFTER the target does not refuse (row 5).
+//
+// Counterfactual (CF-7): replacing `s.State == run.StageStateFailed` in
+// failedStageAhead with a never-matching state turns rows 1 and 2 into 200
+// transitioned:true with the target read back dispatched — the fixture
+// isolates the guard as the only refusal in the path (see failedAheadFixture).
+func TestHostDispatch_FailedStageAhead_RefusesAndLeavesStageUnchanged(t *testing.T) {
+	for _, accState := range []run.StageState{run.StageStatePending, run.StageStateAwaitingHostDispatch} {
+		t.Run("refuses/"+string(accState), func(t *testing.T) {
+			rr, au, runRow, impl, acceptance := failedAheadFixture(t, run.StageStateFailed, run.FailureC, accState)
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+			w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+			assertEarlierStageFailedRefusal(t, w, rr, au, runRow.ID, acceptance, impl, string(run.FailureC), accState)
+		})
+	}
+
+	t.Run("dispatched arm stays idempotent", func(t *testing.T) {
+		rr, au, runRow, _, acceptance := failedAheadFixture(t, run.StageStateFailed, run.FailureC, run.StageStateDispatched)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+		w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want the idempotent 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp := decodeHostDispatch(t, w); resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+			t.Errorf("resp = %+v, want transitioned:false dispatched", resp)
+		}
+	})
+
+	t.Run("implement succeeded admits", func(t *testing.T) {
+		rr, au, runRow, _, acceptance := failedAheadFixture(t, run.StageStateSucceeded, "", run.StageStatePending)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+		w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+			t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+		}
+		cur, _ := rr.GetStage(context.Background(), acceptance.ID)
+		if cur.State != run.StageStateDispatched {
+			t.Errorf("acceptance stage state = %q, want dispatched", cur.State)
+		}
+	})
+
+	t.Run("failed stage after the target does not refuse", func(t *testing.T) {
+		// The implement (seq 2) is the target, pending; the acceptance (seq 3)
+		// AFTER it is failed. Only a stage sequenced BEFORE the target refuses.
+		rr, au, runRow, impl, acceptance := failedAheadFixture(t, run.StageStatePending, "", run.StageStateFailed)
+		cat := run.FailureC
+		acceptance.FailureCategory = &cat
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+		w := postHostDispatch(t, s, runRow.ID, impl.ID, withHostDispatchOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200 (a later failed stage is not ahead):\n%s", w.Code, w.Body.String())
+		}
+		if resp := decodeHostDispatch(t, w); !resp.Transitioned {
+			t.Errorf("resp = %+v, want transitioned:true", resp)
+		}
+	})
+}
+
+// TestHostDispatch_FailedStageAhead_CategoryAgnostic pins approval condition
+// C4: the refusal does not key on the failure category or the failed stage's
+// type. The #4356 shape — a parked category-C ACCEPTANCE failure on a running
+// run — refuses an agent stage sequenced after it the same way, and a
+// non-C (category A) implement failure on a live run (a transient window
+// before the run's advance) refuses too. A later non-terminal failed-stage
+// shape must revisit failedStageAhead deliberately (its doc says so).
+func TestHostDispatch_FailedStageAhead_CategoryAgnostic(t *testing.T) {
+	t.Run("4356 acceptance park", func(t *testing.T) {
+		rr, au, runRow, _, acceptance := failedAheadFixture(t, run.StageStateSucceeded, "", run.StageStateFailed)
+		cat := run.FailureC
+		acceptance.FailureCategory = &cat
+		// An agent-executed stage after the parked acceptance (a feature_change
+		// review is human and refused earlier by the executor guard, so the row
+		// seeds an agent target to reach the failed-stage guard).
+		target := rr.seedStage(runRow.ID, 5, run.StageStatePending)
+		target.Type = run.StageTypeDeploy
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+		w := postHostDispatch(t, s, runRow.ID, target.ID, withHostDispatchOperator)
+		assertEarlierStageFailedRefusal(t, w, rr, au, runRow.ID, target, acceptance, string(run.FailureC), run.StageStatePending)
+	})
+
+	t.Run("implement category A", func(t *testing.T) {
+		rr, au, runRow, impl, acceptance := failedAheadFixture(t, run.StageStateFailed, run.FailureA, run.StageStatePending)
+		s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+		w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+		assertEarlierStageFailedRefusal(t, w, rr, au, runRow.ID, acceptance, impl, string(run.FailureA), run.StageStatePending)
+	})
+}
+
+// TestHostDispatch_FailedStageAhead_FailedDeployKeepsDeployReason pins the
+// precedence between the two refusals sharing one stage-list read: a FAILED
+// deploy ahead answers the post-deploy hold's deploy_not_succeeded, not
+// earlier_stage_failed, so the existing deploy-hold contract is unchanged.
+func TestHostDispatch_FailedStageAhead_FailedDeployKeepsDeployReason(t *testing.T) {
+	rr, au, runRow, _, acceptance := deployHoldHostDispatchFixture(t, run.StageStateFailed, run.StageStatePending)
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+	w := postHostDispatch(t, s, runRow.ID, acceptance.ID, withHostDispatchOperator)
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	if !strings.Contains(w.Body.String(), `"reason":"`+hostDispatchReasonDeployNotSucceeded+`"`) {
+		t.Errorf("body = %s, want reason %s (the deploy hold answers first)", w.Body.String(), hostDispatchReasonDeployNotSucceeded)
+	}
+}
+
 // --- Decomposed-parent acceptance integration gate (#4080) ---
 
 // accDispatchFixture is a decomposed PARENT (with a GitHub installation id and

@@ -28,6 +28,13 @@ const hostDispatchAnchorSource = "host_dispatch"
 // sits behind an earlier deploy stage that has not succeeded.
 const hostDispatchReasonDeployNotSucceeded = "deploy_not_succeeded"
 
+// hostDispatchReasonEarlierStageFailed is the `reason` detail on the
+// failed-stage-ahead 409 dispatch_not_admissible (#4426): the stage is
+// sequenced after a stage that FAILED while the run stayed non-terminal (the
+// category-C infrastructure park), so retrying or cancelling the failed stage
+// comes first.
+const hostDispatchReasonEarlierStageFailed = "earlier_stage_failed"
+
 // HostAdmissionHold is the interim host-dispatch admission hold (E85.11 /
 // #4330; Config.HostAdmissionHold). Held reports whether NEW admissions are
 // held at now and a human-readable reason. Production is
@@ -111,6 +118,18 @@ type hostDispatchResponse struct {
 // predicate Orchestrator.Advance enforces. The idempotent `dispatched` arm is
 // deliberately NOT checked (a dead-runner re-spawn of an already-marked stage).
 // A stage-list read error there answers 500 dependency_check_failed.
+//
+// Failed-stage-ahead refusal (#4426): on the same two admissible arms, and
+// reusing the post-deploy hold's one stage-list read, a stage sequenced after
+// a FAILED stage returns 409 dispatch_not_admissible with reason
+// earlier_stage_failed (details failed_stage_id, failed_stage_type,
+// failure_category), leaving the stage state unchanged. It mirrors
+// Orchestrator.Advance, which never dispatches past a failed stage. Before
+// #4426 a failed stage made its run terminal, so the terminal-run refusal
+// covered it; a parked category-C failure (#4356 acceptance, #4426 implement)
+// leaves the run running, so this refusal is what keeps a downstream stage
+// from being host-spawned while the failed stage awaits a retry. The
+// idempotent `dispatched` arm is unchanged, exactly like the deploy hold.
 //
 // Campaign dispatch hold (E83.100 / #4234): with Config.CampaignRepo wired,
 // an IMPLEMENT stage in either admissible arm whose run (or nearest
@@ -413,7 +432,7 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		runStages, lerr := s.cfg.RunRepo.ListStagesForRun(r.Context(), runID)
 		if lerr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
-				"could not list the run's stages to check for an unsucceeded deploy stage ahead of this one",
+				"could not list the run's stages to check for an unsucceeded deploy stage or a failed stage ahead of this one",
 				map[string]any{"run_id": runID.String(), "stage_id": stageID.String(), "error": lerr.Error()})
 			return
 		}
@@ -422,6 +441,25 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 				"stage is held behind an earlier deploy stage that has not succeeded; it is dispatchable only once every earlier deploy stage succeeded",
 				map[string]any{"stage_id": stageID.String(), "reason": hostDispatchReasonDeployNotSucceeded,
 					"deploy_stage_id": deploy.ID.String(), "deploy_state": string(deploy.State)})
+			return
+		}
+		// Failed-stage-ahead refusal (#4426): a parked category-C failure keeps
+		// the run non-terminal, so the terminal-run guard above no longer
+		// protects the stages sequenced after it. Same scope as the deploy hold
+		// (both admissible arms, never the idempotent dispatched arm) and the
+		// same posture as Orchestrator.Advance's walk, which never dispatches
+		// past a failed stage. A failed deploy ahead answers deploy_not_succeeded
+		// above; every other failed stage answers here.
+		if failed := failedStageAhead(runStages, stage); failed != nil {
+			category := ""
+			if failed.FailureCategory != nil {
+				category = string(*failed.FailureCategory)
+			}
+			s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+				"stage is sequenced after a failed stage; retry or cancel the failed stage first",
+				map[string]any{"stage_id": stageID.String(), "reason": hostDispatchReasonEarlierStageFailed,
+					"failed_stage_id": failed.ID.String(), "failed_stage_type": string(failed.Type),
+					"failure_category": category})
 			return
 		}
 	}
@@ -678,6 +716,26 @@ func (s *Server) writeTerminalRunRefusal(w http.ResponseWriter, r *http.Request,
 	s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
 		"run is "+string(state)+"; a terminal run's stage is never host-spawned",
 		map[string]any{"run_id": runID.String(), "run_state": string(state)})
+}
+
+// failedStageAhead returns the lowest-sequence stage of stages that is
+// sequenced before target and FAILED, or nil when none is (#4426). Stages
+// arrive sequence-ordered from ListStagesForRun, so the first match is the
+// earliest failure.
+//
+// The refusal is CATEGORY-AGNOSTIC by design: any failed stage ahead refuses,
+// whatever its failure category or type. Today the only non-terminal run
+// carrying a failed stage is a category-C infrastructure park (#4356
+// acceptance, #4426 implement); a later shape that leaves a failed stage on a
+// live run for a different reason must revisit this predicate rather than
+// inherit the refusal unexamined.
+func failedStageAhead(stages []*run.Stage, target *run.Stage) *run.Stage {
+	for _, s := range stages {
+		if s != nil && s.ID != target.ID && s.Sequence < target.Sequence && s.State == run.StageStateFailed {
+			return s
+		}
+	}
+	return nil
 }
 
 // isAutoMergeReviewStage mirrors orchestrator.isAutoMergeStage (unexported in

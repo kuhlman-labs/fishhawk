@@ -27,6 +27,7 @@
     },
     "cost_usd_total": 0,
     "created_at": "2026-01-01T00:00:00Z",
+    "default_branch_unresolved_reason": "resolver_unconfigured",
     "drive": true,
     "forge": "github",
     "id": "00000000-0000-0000-0000-000000000001",

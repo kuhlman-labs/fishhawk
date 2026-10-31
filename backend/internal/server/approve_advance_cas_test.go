@@ -15,6 +15,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/approval"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/operatorrole"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -930,6 +931,7 @@ func TestApproveAdvanceCAS_DeployLeg_DispatchesOnceThenRefusesRacedSecondAdvance
 	s, _, rr, _ := newApprovalServer(t)
 	stub, gh := newDeployTriggerGitHub(t)
 	s.cfg.GitHub = gh
+	s.cfg.DefaultBranch = defaultbranch.Static("main")
 	stage, runRow := seedDeployRun(rr, "release", deploySpecNoConstraints)
 	runRow.InstallationID = instID(99)
 	// The snapshot the racing second approver loaded while the gate was still

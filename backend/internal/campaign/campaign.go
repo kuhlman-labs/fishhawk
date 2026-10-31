@@ -257,8 +257,17 @@ type Campaign struct {
 	// bytes here — the campaign package stays server-shape-free, mirroring
 	// OperatorAgent.
 	GroomingSource []byte
-	CreatedAt      time.Time
-	UpdatedAt      time.Time
+	// RunnerKind is the campaign-level runner kind (#4485): the runner_kind
+	// every item run minted from this campaign inherits when the per-item call
+	// passes none. Empty means NOT RECORDED — exactly one no-value state, like
+	// WorkingDir, and the value every pre-#4485 row reads back — and the item-run
+	// handler then falls back to 'local' for a campaign with a WorkingDir binding
+	// and to the github_actions default otherwise. Validation against the known
+	// runner kinds lives above this package (the REST handler); the column
+	// carries the value verbatim.
+	RunnerKind string
+	CreatedAt  time.Time
+	UpdatedAt  time.Time
 }
 
 // Item is one issue within a campaign.

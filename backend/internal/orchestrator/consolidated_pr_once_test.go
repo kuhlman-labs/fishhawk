@@ -12,6 +12,7 @@ import (
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -290,7 +291,7 @@ func TestConsolidatedPROpen_ConcurrentAdvance_OpensOnce(t *testing.T) {
 	rs := newCopyRuns()
 	gh := newGatedCreateGitHub()
 	au := &recordingAudit{}
-	o := &Orchestrator{Runs: rs, GitHub: gh, Audit: au, DefaultRef: "main"}
+	o := &Orchestrator{Runs: rs, GitHub: gh, Audit: au, DefaultBranch: defaultbranch.Static("main")}
 	parentID, _ := rs.seedDecomposedParent()
 
 	errs := raceTwoOpens(t, gh, func() error {
@@ -355,8 +356,8 @@ func TestConsolidatedPROpen_TwoOrchestratorsSharedPostgres_OpensOnce(t *testing.
 	gh := newGatedCreateGitHub()
 	au := &recordingAudit{}
 	replicas := [2]*Orchestrator{
-		{Runs: runs, GitHub: gh, Audit: au, DefaultRef: "main"},
-		{Runs: runs, GitHub: gh, Audit: au, DefaultRef: "main"},
+		{Runs: runs, GitHub: gh, Audit: au, DefaultBranch: defaultbranch.Static("main")},
+		{Runs: runs, GitHub: gh, Audit: au, DefaultBranch: defaultbranch.Static("main")},
 	}
 	var next atomic.Int32
 	errs := raceTwoOpens(t, gh, func() error {
@@ -392,7 +393,7 @@ func TestConsolidatedPROpen_TwoOrchestratorsSharedPostgres_OpensOnce(t *testing.
 // the created #777, not #4108.
 func TestConsolidatedPROpen_AdoptsExistingOpenPR(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.listByHeadResult = []forge.PullRequest{
@@ -422,7 +423,7 @@ func TestConsolidatedPROpen_AdoptsExistingOpenPR(t *testing.T) {
 // (count 1) and stamp its URL.
 func TestConsolidatedPROpen_PreCreateListError_FailsClosed(t *testing.T) {
 	o, rs, gh := newOrchestrator(t)
-	o.DefaultRef = "main"
+	o.DefaultBranch = defaultbranch.Static("main")
 	au := &recordingAudit{}
 	o.Audit = au
 	gh.listByHeadErr = errors.New("github list pulls: 502")
@@ -458,7 +459,7 @@ func TestConsolidatedPROpen_LockError_FailsClosed(t *testing.T) {
 	rs := &lockErrRuns{copyRuns: inner, err: lockErr}
 	gh := newGatedCreateGitHub()
 	gh.releaseAll() // a create, if one wrongly happens, must not park
-	o := &Orchestrator{Runs: rs, GitHub: gh, DefaultRef: "main"}
+	o := &Orchestrator{Runs: rs, GitHub: gh, DefaultBranch: defaultbranch.Static("main")}
 
 	_, err := o.Advance(context.Background(), parentID)
 	if !errors.Is(err, lockErr) {
