@@ -1195,3 +1195,88 @@ func TestMergeCandidateQueue_AdvancingStepUnrecorded(t *testing.T) {
 		}
 	})
 }
+
+// #4617 item 2: an inline or delegated claim recorded at head `unresolved`
+// counts as "another path's claim at the merged head" in the D8 resume's merged
+// switch: the resume settles pr_merged with one settle_pr_merged row and leaves
+// the claim unchanged. Unlike merge-on-pass, the resume writes NO
+// reconciled_merged row, so an unresolved dispatch_failed claim stays
+// dispatch_failed (it heals on the next inline merge_run's
+// claimInlineMergeDispatch).
+func TestMergeQueueResume_UnresolvedNonQueueClaimSettlesMerged(t *testing.T) {
+	for _, path := range []string{mergequeue.DispatchPathInline, mergequeue.DispatchPathDelegated} {
+		for _, state := range []mergequeue.DispatchState{mergequeue.DispatchDispatched, mergequeue.DispatchFailed} {
+			t.Run(path+"/"+string(state), func(t *testing.T) {
+				w := newMQMWorld(t)
+				a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
+				w.mqeRebased(a, "pre-h1", "h1", "h1", false)
+				w.mqePassed(a, "h1")
+				w.mqrCrashLeft(a, mqrAged)
+				w.exec(`UPDATE merge_dispatch_claims SET path = $2, head_sha = $3 WHERE run_id = $1`, a.id, path, mergeDispatchClaimHeadUnresolved)
+				if state == mergequeue.DispatchFailed {
+					w.exec(`UPDATE merge_dispatch_claims SET state = 'dispatch_failed', failed_at = clock_timestamp(), failure_cause = 'x' WHERE run_id = $1`, a.id)
+				}
+				w.mqrPR(a, true, "closed")
+				want := w.mqrClaim(a)
+				settledBefore := len(w.rows(a, categoryMergeDispatchSettled))
+				before := w.mqrCount("h1")
+				w.mqrRestart()
+				out := w.srv.mergeQueueResumeMerge(context.Background(), w.active(a))
+				requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
+				if out.State != mergequeue.StateMerged {
+					t.Fatalf("settle state = %s, want merged", out.State)
+				}
+				if got := w.mqrCount("h1"); got != before {
+					t.Fatalf("pinned merges = %d, want %d", got, before)
+				}
+				if got := w.mqrClaim(a); got.State != want.State || got.Path != want.Path || got.HeadSHA != want.HeadSHA ||
+					got.FailureCause != want.FailureCause || !got.ClaimedAt.Equal(want.ClaimedAt) {
+					t.Fatalf("claim = %+v, want unchanged %+v", got, want)
+				}
+				if n := len(w.rows(a, categoryMergeDispatchSettled)); n != settledBefore {
+					t.Fatalf("merge_dispatch_settled rows = %d, want %d (the resume writes no reconciled_merged)", n, settledBefore)
+				}
+				res := w.mqrResumed(a)
+				if len(res) != 1 || res[0]["action"] != mergeQueueResumeActionSettlePRMerged || res[0]["claim_path"] != path ||
+					res[0]["claim_head_sha"] != mergeDispatchClaimHeadUnresolved {
+					t.Fatalf("merge_queue_resumed = %v, want one settle_pr_merged naming the %s claim at %q", res, path, mergeDispatchClaimHeadUnresolved)
+				}
+			})
+		}
+	}
+}
+
+// #4617 item 3: a reconciled_merged row already on the chain (an earlier
+// merge-on-pass reconcile) is success for the D8 resume's merged tail: it
+// settles merged instead of holding resume_unrecorded, and the run still
+// carries exactly one reconciled_merged row, on the atomic Postgres path and
+// the non-atomic fallback alike.
+func TestMergeQueueResume_ReconciledMergedAlreadyRecordedSettles(t *testing.T) {
+	for _, capable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("capable=%v", capable), func(t *testing.T) {
+			w := newMQMWorld(t)
+			if capable {
+				w.srv.cfg.AuditRepo = w.mcqFixture.audit
+			}
+			a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
+			w.mqeRebased(a, "pre-h1", "h1", "h1", false)
+			w.mqePassed(a, "h1")
+			w.mqrCrashLeft(a, mqrAged)
+			w.exec(`UPDATE merge_dispatch_claims SET state = 'dispatch_failed', failed_at = clock_timestamp(), failure_cause = 'x' WHERE run_id = $1`, a.id)
+			w.mqrPR(a, true, "closed")
+			claim := w.mqrClaim(a)
+			if err := w.srv.appendMergeDispatchSettledStrict(context.Background(), claim, mergeDispatchReconciledMerged, "an earlier reconcile"); err != nil {
+				t.Fatalf("seed reconciled_merged: %v", err)
+			}
+			w.mqrRestart()
+			out := w.srv.mergeQueueResumeMerge(context.Background(), w.active(a))
+			requireOutcome(t, out, mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
+			if got := w.mdsOutcomes(a); got[mergeDispatchReconciledMerged] != 1 {
+				t.Fatalf("merge_dispatch_settled outcomes = %v, want the one reconciled_merged row", got)
+			}
+			if n := len(w.rows(a, CategoryMergeQueueMerged)); n != 1 {
+				t.Fatalf("merge_queue_merged rows = %d, want 1", n)
+			}
+		})
+	}
+}

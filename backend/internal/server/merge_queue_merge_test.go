@@ -2055,3 +2055,97 @@ func TestMergeQueueMergeOnPass_OrphanReleaseFailsClosed(t *testing.T) {
 		}
 	})
 }
+
+// #4617 item 2: an inline or delegated claim recorded at head `unresolved`
+// (an empty gate head) reconciles against whatever head the PR merged at, so
+// merge-on-pass settles the entry merged pr_merged instead of holding
+// merged_claim_head_mismatch on every pump. An exact head comparison alone can
+// never match here: the claim's head is the literal `unresolved` and the PR
+// merged at h1. A dispatch_failed claim lands exactly one reconciled_merged row
+// naming head `unresolved`; a dispatched one lands none. The claim row is never
+// transitioned.
+func TestMergeQueueMergeOnPass_UnresolvedClaimReconcilesMerged(t *testing.T) {
+	ctx := context.Background()
+	for _, path := range []string{mergequeue.DispatchPathInline, mergequeue.DispatchPathDelegated} {
+		for _, state := range []mergequeue.DispatchState{mergequeue.DispatchDispatched, mergequeue.DispatchFailed} {
+			t.Run(path+"/"+string(state), func(t *testing.T) {
+				w := newMQMWorld(t)
+				r, req := w.ready("unres", "h1", mcvUndelegatedSpecYAML)
+				req = w.realLedger(req)
+				if _, err := w.store.ClaimMergeDispatch(ctx, r.id, path, mergeDispatchClaimHeadUnresolved); err != nil {
+					t.Fatalf("seed claim: %v", err)
+				}
+				if state == mergequeue.DispatchFailed {
+					if err := w.store.MarkMergeDispatchFailed(ctx, r.id, "github: 502 bad gateway"); err != nil {
+						t.Fatalf("seed dispatch_failed: %v", err)
+					}
+				}
+				want := w.mqrClaim(r)
+				w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+				out := w.decide(req)
+				requireOutcome(t, out, mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
+				if out.State != mergequeue.StateMerged {
+					t.Fatalf("settle state = %s, want merged", out.State)
+				}
+				w.requireMerges(0)
+				var reconciled []map[string]any
+				for _, row := range w.rows(r, categoryMergeDispatchSettled) {
+					if p := w.payload(row); p["outcome"] == mergeDispatchReconciledMerged {
+						reconciled = append(reconciled, p)
+					}
+				}
+				wantRows := 0
+				if state == mergequeue.DispatchFailed {
+					wantRows = 1
+				}
+				if len(reconciled) != wantRows {
+					t.Fatalf("reconciled_merged rows = %v, want %d", reconciled, wantRows)
+				}
+				if wantRows == 1 && (reconciled[0]["head_sha"] != mergeDispatchClaimHeadUnresolved || reconciled[0]["path"] != path ||
+					!strings.Contains(reconciled[0]["reason"].(string), "recorded no head")) {
+					t.Fatalf("reconciled_merged = %v, want head %q, path %s, a reason naming the unrecorded head", reconciled[0], mergeDispatchClaimHeadUnresolved, path)
+				}
+				if got := w.mqrClaim(r); got.State != want.State || got.Path != want.Path || got.HeadSHA != want.HeadSHA ||
+					got.FailureCause != want.FailureCause || !got.ClaimedAt.Equal(want.ClaimedAt) {
+					t.Fatalf("claim = %+v, want unchanged %+v", got, want)
+				}
+			})
+		}
+	}
+}
+
+// #4617 item 3: a SettleAt CAS conflict re-decides with no settle applied in
+// between, so the merged reconcile runs again for the same dispatch_failed
+// queue claim. Exactly ONE reconciled_merged row lands, on the atomic Postgres
+// capability path and on the non-atomic fallback (mqmAudit).
+func TestMergeQueueMergeOnPass_ReconciledMergedRecordedOnceAcrossRedecides(t *testing.T) {
+	ctx := context.Background()
+	for _, capable := range []bool{true, false} {
+		t.Run(fmt.Sprintf("capable=%v", capable), func(t *testing.T) {
+			w := newMQMWorld(t)
+			if capable {
+				w.srv.cfg.AuditRepo = w.mcqFixture.audit
+			}
+			r, req := w.ready("once", "h1", mcvUndelegatedSpecYAML)
+			req = w.realLedger(req)
+			if _, err := w.store.ClaimMergeDispatch(ctx, r.id, mergeDispatchPathQueue, "h1"); err != nil {
+				t.Fatalf("seed claim: %v", err)
+			}
+			if err := w.store.MarkMergeDispatchFailed(ctx, r.id, "github: 502 bad gateway"); err != nil {
+				t.Fatalf("seed dispatch_failed: %v", err)
+			}
+			w.gh.set(func() { w.gh.prs[r.pr].merged, w.gh.prs[r.pr].state = true, "closed" })
+			for i := range 2 {
+				ok, reason, detail, err := w.srv.mergeOnPassReconcileMergedStrict(ctx, req.Ledger, r.id, "h1")
+				if !ok || err != nil {
+					t.Fatalf("reconcile %d = ok %v %s (%s) err %v, want ok with no error", i+1, ok, reason, detail, err)
+				}
+			}
+			requireOutcome(t, w.decide(req), mergeOnPassSettle, mergeCandidateQueueReasonPRMerged)
+			if got := w.mdsOutcomes(r); got[mergeDispatchReconciledMerged] != 1 {
+				t.Fatalf("merge_dispatch_settled outcomes = %v, want exactly one reconciled_merged across three reconciles", got)
+			}
+			w.requireClaim(r, mergequeue.DispatchFailed)
+		})
+	}
+}
