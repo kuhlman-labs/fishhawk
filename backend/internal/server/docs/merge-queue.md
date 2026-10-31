@@ -1403,17 +1403,51 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   `merge_queue_ejected` row says `fixup_routed: true`; a `fixup_pushed` row's
   chain sequence follows that row's; the `merge_queue_entered` row AT the
   entry's `MergeIntentSequence` exists (never the newest such row); the PR
-  is open on the base with a moved head; and the ENTRY-variant eligibility
-  passes at the new head with a LIVE forge approval read there (an approval
-  the fix-up push dismissed means no re-entry, and an approval-only failure is
-  SKIPPED, never enqueued yielded; unifying it with the A1.3 clear predicate
-  is #4686). Under the run's merge-intent lock `LatestForRun` must still be
-  that ejected row; then a `merge_queue_entered` row is appended BEFORE the
-  write (actor SYSTEM, `reentry: true`, `reentry_basis
+  is open on the base with a moved head that is in the QUALIFYING-HEAD SET
+  (below); and the ENTRY-variant eligibility passes at the new head with a
+  LIVE forge approval read there (an approval the fix-up push dismissed means
+  no re-entry, and an approval-only failure is SKIPPED, never enqueued
+  yielded; unifying it with the A1.3 clear predicate is #4686). Under the
+  run's merge-intent lock `LatestForRun` must still be that ejected row; the
+  PR is re-read there (`mergeOnPassForgeCallTimeout`, inside the store's 90s
+  intent fn deadline, as merge-on-pass's forge calls under the same lock) and
+  must still be open on the base at the SAME head the sweep evaluated
+  (`errReentryHeadMoved`), and the set is re-derived: the newest post-ejection
+  `fixup_pushed` row must still be the sweep's and the head must still
+  qualify against it (`errReentryHeadUnqualified`). A PR or chain read that
+  fails or times out there is no re-entry; the ejected row stays and the next
+  due tick re-evaluates it. Then a `merge_queue_entered` row is appended
+  BEFORE the write (actor SYSTEM, `reentry: true`, `reentry_basis
   delegated_fixup_passed`, `reentry_of_entry_id`, `original_intent_sequence`,
-  the original verdict prose — merge-on-pass still binds to the verified
-  head, never a SHA in that prose) and `Enqueue` inserts a FRESH row at the
-  TAIL carrying that row's sequence. A failed append writes no entry.
+  `ejected_sequence`, `fixup_pushed_sequence`, the additive
+  `reentry_head_chain` — the ordered head SHAs from the fix-up's pushed head
+  to the re-entry head, nothing else; no reader requires it — and the
+  original verdict prose: merge-on-pass still binds to the verified head,
+  never a SHA in that prose) and `Enqueue` inserts a FRESH row at the TAIL
+  carrying that row's sequence. A failed append writes no entry.
+  - **Qualifying-head set (#4703).** The SEED is the `head_sha` of the newest
+    `fixup_pushed` row after the ejection (gate 3's row; an older, superseded
+    fix-up push does not qualify, and a row naming no head seeds nothing).
+    Then every product push the chain records AFTER that row, walked in
+    chain-SEQUENCE order (never forge time), adds its head when its parent is
+    already in the set: `acceptance_scenarios_pushed` and
+    `conflict_resolution_pushed` (`base_sha` → `head_sha`; both runners report
+    `base_sha` as the prior branch head they committed on), and a
+    `branch_rebased` row passing the shared ADR-112 `isCleanAdvance`
+    (`prior_head_sha` → `merge_commit_sha`). Membership is read from audit
+    rows only, written from authenticated runner reports or the rebase writer,
+    never from a commit author string. A head outside the set is SKIPPED
+    (never dropped) and falls back to the operator's `fishhawk_merge_run`: a
+    foreign push, an `operator_commit_vouched` commit, a `child_pushed` head,
+    a `branch_reset` to a non-member, an unverified or legacy base merge
+    (`clean_verified` false or absent, or a new head that is not the merge
+    commit), or a product push whose base is itself foreign.
+  - **Why a conflict-resolution head qualifies here.** `cleanChainReaches`
+    CLEARS approval carriers on a `conflict_resolution_pushed` row; this set
+    does not. The questions differ: here it is whether the PRODUCT authored
+    the head; whether an approval covers it is still gate 6's LIVE forge
+    approval read at the new head, so agent-resolved conflict content on a
+    gated run needs a fresh approval before it re-enters.
 - **Promote (`merge_queue_promote.go`).** `POST
   /v0/runs/{run_id}/merge-queue/promote` (`write:runs`,
   `requireRunAccount(memberWrite)`): 401 anonymous, 403
@@ -1454,8 +1488,16 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
 - **Tests.** Ejection: `merge_queue_eject_test.go`, `merge_queue_merge_test.go`
   (`TestMergeOnPass_ForgeRefusalEjectsExactlyOnce`, rows 4 and 5 per arm),
   `merge_candidate_queue_test.go`. Re-entry: `merge_queue_reentry_test.go`
-  (one test per gate, the schedule and the live-stage skip) and the
-  cross-layer `merge_queue_e2e_test.go`. Promote: `merge_queue_promote_test.go`
+  (one test per gate, the schedule and the live-stage skip;
+  `TestReentry_ProductDescendantOfFixupReenters`,
+  `TestReentry_HeadNotQualifyingNoReentry` and
+  `TestReentry_ProductPushRowsUnreadableSkips` for the qualifying-head set,
+  each refusal asserting no merge-intent lock was taken;
+  `TestReentry_UnderLockRecheckNoReentry` for the in-lock re-read and
+  re-derivation; `TestReentryQualifyingChain_Pure` for the walk) and the
+  cross-layer `merge_queue_e2e_test.go`
+  (`TestMergeQueueE2E_AcceptanceScenarioCommitAfterFixupReenters` drives the
+  real acceptance scenario push recorder through to the HTTP queue read). Promote: `merge_queue_promote_test.go`
   (one per rung), `backend/internal/integration/mcp/merge_queue_promote_test.go`.
   Visibility: `merge_queue_read_test.go` (`TestMergeQueueRead_EjectionsUnresolvedNewestFirstSanitised`,
   `TestMergeQueueEjection_*`, `TestRunReadAndGateView_MergeQueueEjectionOnlyWhileNewestRowEjected`,
