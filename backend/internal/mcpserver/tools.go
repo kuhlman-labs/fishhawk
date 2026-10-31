@@ -387,6 +387,10 @@ func registerTools(srv *mcp.Server, resolver *runResolver) {
 	// merge-queue entry, beside the read that shows the line it reorders.
 	// Distinct from fishhawk_promote_queued_stage (a concurrency waiter).
 	registerPromoteMergeQueueEntry(srv, resolver)
+	// E87.17 / #4685 (ADR-112 R3): the operator withdrawal of a YIELDED
+	// merge-queue entry's merge intent, beside the promote and the read that
+	// shows the yield; it unblocks an inline fishhawk_merge_run.
+	registerWithdrawMergeIntent(srv, resolver)
 	registerArbitrateAcceptance(srv, resolver)
 	registerReportProductIssue(srv, resolver)
 	registerReleaseNotes(srv, resolver)

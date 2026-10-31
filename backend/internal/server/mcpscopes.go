@@ -256,6 +256,10 @@ var mcpToolScopes = map[string]mcpToolScopeRule{
 	// #4297). It also refuses a run-bound token.
 	"fishhawk_promote_merge_queue_entry": {anyOf: []string{"write:runs"}},
 
+	// merge_queue_withdraw.go handleMergeQueueWithdraw (ADR-112 R3, E87.17 /
+	// #4685). It also refuses a run-bound token.
+	"fishhawk_withdraw_merge_intent": {anyOf: []string{"write:runs"}},
+
 	// --- write:stages.
 	"fishhawk_rebase_run_branch":         {anyOf: []string{"write:stages"}}, // rebase_branch.go handleRebaseRunBranch
 	"fishhawk_vouch_commit":              {anyOf: []string{"write:stages"}}, // vouch.go handleVouchCommit
