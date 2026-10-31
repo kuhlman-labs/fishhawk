@@ -86,7 +86,7 @@ permissions:
 jobs:
   run:
     name: Run Fishhawk stage
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
     steps:
       # Mint the Fishhawk App installation token via OIDC before

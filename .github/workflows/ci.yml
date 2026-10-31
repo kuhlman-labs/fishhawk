@@ -19,7 +19,7 @@ concurrency:
 jobs:
   detect:
     name: Detect changed paths
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     permissions:
       contents: read
@@ -114,7 +114,8 @@ jobs:
   # test matrix remains path-filtered; verify --no-tests never reruns it.
   repository-checks:
     name: Repository validation
-    runs-on: ubuntu-latest
+    # Pin the distro alongside the apt package version below.
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -162,14 +163,19 @@ jobs:
         uses: actions/cache@v6
         with:
           path: ~/.cache/golangci-lint
-          key: golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-${{ github.sha }}
+          key: golangci-ubuntu24.04-${{ runner.arch }}-${{ hashFiles('.golangci.yml') }}-${{ github.sha }}
           restore-keys: |
-            golangci-${{ runner.os }}-${{ hashFiles('.golangci.yml') }}-
-            golangci-${{ runner.os }}-
+            golangci-ubuntu24.04-${{ runner.arch }}-${{ hashFiles('.golangci.yml') }}-
+            golangci-ubuntu24.04-${{ runner.arch }}-
 
       - uses: azure/setup-helm@v5
         with:
           version: v4.2.4
+      - name: Install the dev-harness shell
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y zsh=5.9-6ubuntu2
+          command -v zsh
       - name: Verify repository contracts and gate harnesses
         run: scripts/test verify --no-tests
       - name: Check recorded review-prompt evidence
@@ -207,7 +213,7 @@ jobs:
     name: Go (test ${{ matrix.leg }})
     needs: detect
     if: ${{ needs.detect.outputs.go == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -233,9 +239,9 @@ jobs:
           path: |
             ~/go/pkg/mod
             ~/.cache/go-build
-          key: go-test-${{ runner.os }}-1.26-${{ matrix.leg }}-${{ hashFiles('**/go.sum') }}
+          key: go-test-ubuntu24.04-${{ runner.arch }}-1.26-${{ matrix.leg }}-${{ hashFiles('**/go.sum') }}
           restore-keys: |
-            go-test-${{ runner.os }}-1.26-${{ matrix.leg }}-
+            go-test-ubuntu24.04-${{ runner.arch }}-1.26-${{ matrix.leg }}-
 
       # Download EVERY go.work module's dependencies, not just the ones this
       # leg compiles. basedelta's TestGoListLoader_RealRepository runs `go list`
@@ -266,7 +272,7 @@ jobs:
     name: Go (coverage gate)
     needs: [detect, go-test]
     if: ${{ needs.detect.outputs.go == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -307,7 +313,7 @@ jobs:
     name: TypeScript (lint + build + test)
     needs: detect
     if: ${{ needs.detect.outputs.ts == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -351,7 +357,7 @@ jobs:
     name: OpenAPI (lint)
     needs: detect
     if: ${{ needs.detect.outputs.openapi == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -371,7 +377,7 @@ jobs:
     name: Docker build (fishhawkd image, no push)
     needs: detect
     if: ${{ needs.detect.outputs.docker == 'true' }}
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -405,7 +411,7 @@ jobs:
     name: Documentation site
     needs: detect
     if: needs.detect.outputs.site == 'true'
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     defaults:
       run:
@@ -446,7 +452,7 @@ jobs:
     name: CI Pass
     needs: [detect, repository-checks, go-test, go-coverage, ts, openapi, docker-build, site, helm, infra, gate-image]
     if: always()
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - name: Verify required jobs

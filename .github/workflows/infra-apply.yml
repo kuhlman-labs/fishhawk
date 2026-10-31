@@ -43,7 +43,7 @@ defaults:
 jobs:
   protections:
     name: Check deployment protections before requesting AWS credentials
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
@@ -74,7 +74,7 @@ jobs:
     permissions:
       contents: read
       id-token: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     # Push-to-main always targets dev; workflow_dispatch picks the
     # env explicitly. The `environment` reference here gates the

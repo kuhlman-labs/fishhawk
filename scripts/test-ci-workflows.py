@@ -42,6 +42,7 @@ class WorkflowContracts(unittest.TestCase):
         self.assertNotIn("if", jobs["repository-checks"])
         commands = "\n".join(step.get("run", "") for step in jobs["repository-checks"]["steps"])
         self.assertIn("scripts/test verify --no-tests", commands)
+        self.assertIn("command -v zsh", commands)
         self.assertIn('scripts/check-review-prompt-eval --base "$BASE_SHA"', commands)
         for job in ["publish-backend", "publish-gate"]:
             self.assertIn("ci-pass", jobs[job]["needs"])
@@ -80,6 +81,7 @@ class WorkflowContracts(unittest.TestCase):
 
     def test_queue_configuration_and_job_timeouts(self):
         for path in (ROOT / ".github/workflows").glob("*.yml"):
+            self.assertNotIn("ubuntu-latest", path.read_text(), path.name)
             data = workflow(path.name)
             scopes = [data, *data.get("jobs", {}).values()]
             for scope in scopes:

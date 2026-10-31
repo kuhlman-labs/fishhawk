@@ -42,7 +42,7 @@ concurrency:
 jobs:
   build:
     name: Validate and build cli release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     outputs:
       version: ${{ steps.build.outputs.version }}
@@ -162,7 +162,7 @@ jobs:
   release:
     name: Sign and publish cli release
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     permissions:
       contents: write

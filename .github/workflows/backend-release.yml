@@ -48,7 +48,7 @@ concurrency:
 jobs:
   verify:
     name: Validate backend release
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Validate release tag (final or -rc.N only)
@@ -98,7 +98,7 @@ jobs:
   binaries:
     needs: verify
     name: Build fishhawkd binaries
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - name: Validate release tag (final or -rc.N only)
@@ -179,7 +179,7 @@ jobs:
       contents: write
       packages: write
       id-token: write
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7

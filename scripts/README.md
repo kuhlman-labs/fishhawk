@@ -758,6 +758,11 @@ fi
 `ci.yml` owns the required `CI Pass` rollup. Its always-on
 `repository-checks` job runs `scripts/test verify --no-tests`, the recorded
 review-prompt evidence check, actionlint, and `test-ci-workflows.py`.
+All hosted workflows pin Ubuntu 24.04 (`ubuntu-24.04-arm` for native ARM).
+The `ubuntu-latest` migration to 26.04 (actions/runner-images#14748) must not
+change the OS implicitly; a runner upgrade is a separate validated change.
+The repository job installs zsh 5.9-6ubuntu2 explicitly
+so `test-dev` cannot silently skip on a hosted runner without zsh.
 The prompt check uses the PR base SHA or the push's BEFORE SHA, with full
 history; comparing a main push to `origin/main` would compare the commit to
 itself and incorrectly skip evidence validation. No model key is needed.
