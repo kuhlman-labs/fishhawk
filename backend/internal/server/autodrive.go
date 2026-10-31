@@ -516,6 +516,13 @@ const (
 	// gate's admitted head because the PR head moved after it; the claim was
 	// released and the next tick re-gates at the new head.
 	autoDriveNoteHeadMoved = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the merge-dispatch claim was released and the next auto-drive tick re-gates at the new head; observe-only"
+	// #4683: the other three head-moved states, chosen by the SETTLE outcome
+	// (autoDriveHeadMovedNote). Each opens with the same lead clause as
+	// autoDriveNoteHeadMoved, which is the RELEASED note. The two
+	// dispatch_failed notes name the operator re-arm, as the inline 409 does.
+	autoDriveNoteHeadMovedBasisHeld     = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the refusal_basis does not prove the forge applied nothing, so the merge-dispatch claim was NOT released and is dispatch_failed: every later tick is observe-only (already claimed) until reconciliation (the pull request reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); inspect the pull request; observe-only"
+	autoDriveNoteHeadMovedReleaseFailed = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); the merge-dispatch claim release did not land, so the claim is dispatch_failed: every later tick is observe-only (already claimed) until reconciliation (the pull request reads merged) or the operator re-arm (backend/internal/mergequeue/README.md § \"Merge-dispatch ledger\"); observe-only"
+	autoDriveNoteHeadMovedUnclaimed     = "the forge refused the merge pinned to the head the merge-candidate gate admitted because the pull request head moved after it (#4641); no merge-dispatch claim was held (no merge-dispatch ledger is wired), so the next auto-drive tick re-gates at the new head; observe-only"
 	// #4617: the merge dispatch errored but the pull request reads merged on
 	// the re-observe before the settle; any merge-dispatch claim stays
 	// dispatched and no dispatch_failed row is written.
@@ -559,6 +566,25 @@ func (s *Server) delegatedMergeUnderLock(ctx context.Context, runRow *run.Run, s
 			slog.String("run_id", runRow.ID.String()), slog.String("error", lockErr.Error()))
 	}
 	return out, oerr
+}
+
+// autoDriveHeadMovedNote picks the delegated head-moved observe-only note from
+// the claim's SETTLE outcome (#4683), in the same branch order as
+// writeMergeHeadMoved's claim switch: released -> autoDriveNoteHeadMoved; a
+// dispatch_failed claim whose classification is itself uncertain (the
+// refusal_basis does not prove nothing applied) -> BasisHeld; any other
+// dispatch_failed claim (a releasable refusal whose release did not land) ->
+// ReleaseFailed; no claim (settled empty) -> Unclaimed.
+func autoDriveHeadMovedNote(settled mergeDispatchLedgerOutcome, merr error) string {
+	switch {
+	case settled == mergeDispatchRelease:
+		return autoDriveNoteHeadMoved
+	case settled == mergeDispatchUncertain && classifyMergeDispatchOutcome(merr) == mergeDispatchUncertain:
+		return autoDriveNoteHeadMovedBasisHeld
+	case settled == mergeDispatchUncertain:
+		return autoDriveNoteHeadMovedReleaseFailed
+	}
+	return autoDriveNoteHeadMovedUnclaimed
 }
 
 // delegatedMergeLocked is delegatedMergeUnderLock's fn: the ownership check,
@@ -605,12 +631,14 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 			slog.String("run_id", runRow.ID.String()), slog.String("error", derr.Error()))
 		return observeOnly(autoDriveNoteAuthorizationUnrecorded), nil
 	case mergeDispatchHeadMoved:
-		// derr is the forge's head-mismatch refusal, carried for this log only.
-		// claim_outcome is the SETTLE outcome (the ledger state the claim was
-		// left in, #4749), never a re-derived classification: a released
-		// claim lets the next tick re-gate at the new head, a dispatch_failed
-		// one keeps every later tick observe-only (already claimed) until
-		// reconciliation or the operator re-arm.
+		// derr is the forge's head-mismatch refusal, carried for this log and
+		// for the note's basis-versus-release split. claim_outcome is the
+		// SETTLE outcome (the ledger state the claim was left in, #4749),
+		// never a re-derived classification: a released claim lets the next
+		// tick re-gate at the new head, a dispatch_failed one keeps every
+		// later tick observe-only (already claimed) until reconciliation or
+		// the operator re-arm. The returned note follows that same settle
+		// outcome (#4683, autoDriveHeadMovedNote).
 		basis := mergeHeadMovedBasis(derr)
 		claimOutcome := string(settled)
 		if claimOutcome == "" {
@@ -623,7 +651,7 @@ func (s *Server) delegatedMergeLocked(ctx context.Context, runRow *run.Run, stag
 			slog.String("refusal_basis", basis), slog.Bool("forge_guarantees_nothing_applied", mergeHeadMovedNothingApplied(basis)),
 			slog.String("claim_outcome", claimOutcome),
 			slog.String("error", derr.Error()))
-		return observeOnly(autoDriveNoteHeadMoved), nil
+		return observeOnly(autoDriveHeadMovedNote(settled, derr)), nil
 	case mergeDispatchLandedOnReobserve:
 		// #4617: the dispatch errored but the merge landed; acted, no error.
 		return AutoDriveOutcome{Acted: true, Action: delegation.ActionMerge, Note: autoDriveNoteMergeLandedOnReobserve}, nil
@@ -691,9 +719,11 @@ const (
 	mergeDispatchAuthorizationUnrecorded
 	// mergeDispatchHeadMoved (#4641): the dispatch was PINNED to a non-empty
 	// liveHead and the forge refused it for a head mismatch
-	// (forge.ErrMergeConflict). The claim was settled (released) and the
-	// returned error is that refusal, for logging only: the caller is
-	// observe-only, never "merge dispatch failed".
+	// (forge.ErrMergeConflict). The claim was settled and the returned settle
+	// outcome, which the caller's note follows (autoDriveHeadMovedNote), names
+	// the ledger state (released, dispatch_failed, or empty when unclaimed).
+	// The returned error is that refusal: the caller is observe-only, never
+	// "merge dispatch failed".
 	mergeDispatchHeadMoved
 	// mergeDispatchMethodUnsupported (E93.2 / #4658): staticMergeMethodRefusal
 	// refused the run's merge method (its forge family cannot apply it per

@@ -229,10 +229,14 @@ func TestAutoDriveMergeQueue_DelegatedDispatchPinsGateHead(t *testing.T) {
 // mismatch (forge.ErrMergeConflict) is observe-only autoDriveNoteHeadMoved,
 // never the "merge dispatch failed" error outcome, and the claim is RELEASED
 // (no claim row, a merge_dispatch_settled row outcome released at h1), so the
-// next tick re-gates at the new head. Counterfactual: deleting the
-// mergeDispatchHeadMoved branch returns the error outcome, RED.
+// next tick re-gates at the new head. The spec declares no approval gate, so
+// the head-moved log's pinned_to names only the gate-admitted head, with no
+// approval clause (#4683). Counterfactual: deleting the mergeDispatchHeadMoved
+// branch returns the error outcome, RED; passing a hard-coded folded flag to
+// mergeHeadMovedSubject adds the approval clause, RED.
 func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
 	w := newMQMWorld(t)
+	logs := mhpCaptureLogs(w)
 	r := w.admqReady("hmv", "h1")
 	m := &admqMerger{err: fmt.Errorf("%w: %w", forge.ErrMergeConflict,
 		&githubclient.HeadMismatchError{Basis: githubclient.HeadMismatchPrecheck, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})}
@@ -245,6 +249,9 @@ func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
 		t.Fatalf("AutoDriveRunGate error = %v, want nil (head moved is observe-only)", derr)
 	}
 	requireObserveOnly(t, out, autoDriveNoteHeadMoved)
+	if got, _ := mhpHeadMovedRecord(t, logs)["pinned_to"].(string); got != "the head the merge-candidate gate admitted (h1)" {
+		t.Fatalf("head-moved log pinned_to = %q, want the gate-admitted head only (no approval gate declared)", got)
+	}
 	var head string
 	if st, _ := w.claimRow(r, &head); st != "" {
 		t.Fatalf("claim = %q@%s, want released (no row)", st, head)
@@ -255,6 +262,35 @@ func TestAutoDriveMergeQueue_DelegatedHeadMovedObserveOnly(t *testing.T) {
 	}
 	if p := w.payload(settled[0]); p["outcome"] != string(mergeDispatchRelease) || p["head_sha"] != "h1" || p["path"] != mergequeue.DispatchPathDelegated {
 		t.Fatalf("settled payload = %v, want released/delegated@h1", p)
+	}
+}
+
+// TestAutoDriveMergeQueue_DelegatedHeadMovedUnclaimed pins (#4683) the
+// delegated head-moved arm when no merge-dispatch ledger is wired: with no
+// merge queue there is no claim to settle, so the note is
+// autoDriveNoteHeadMovedUnclaimed (the next tick re-gates at the new head) and
+// the head-moved log's claim_outcome is not_claimed. The PR reader answers
+// open and unmerged, so #4617's observe-before-settle falls through to the
+// head-moved arm. Counterfactual: returning autoDriveNoteHeadMoved for every
+// settle outcome gives the released note here, RED.
+func TestAutoDriveMergeQueue_DelegatedHeadMovedUnclaimed(t *testing.T) {
+	w := newMQMWorld(t)
+	logs := mhpCaptureLogs(w)
+	r := w.admqReady("hmvu", "h1")
+	w.srv.cfg.MergeQueue = nil
+	w.srv.cfg.PRStateReader = &admqPRReader{}
+	m := &admqMerger{err: fmt.Errorf("%w: %w", forge.ErrMergeConflict,
+		&githubclient.HeadMismatchError{Basis: githubclient.HeadMismatchPrecheck, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})}
+	out, derr := w.admqDriveErr(r, m)
+	if derr != nil {
+		t.Fatalf("AutoDriveRunGate error = %v, want nil (head moved is observe-only)", derr)
+	}
+	requireObserveOnly(t, out, autoDriveNoteHeadMovedUnclaimed)
+	if got := m.pins(); len(got) != 1 || got[0] != "h1" {
+		t.Fatalf("merger pins = %q, want one dispatch pinned to h1", got)
+	}
+	if got := mhpHeadMovedClaimOutcome(t, logs); got != "not_claimed" {
+		t.Fatalf("head-moved log claim_outcome = %q, want not_claimed", got)
 	}
 }
 

@@ -181,6 +181,89 @@ func TestForgeMerger_NonGitHubPinnedHeadRefused(t *testing.T) {
 	}
 }
 
+// TestClassifyMergeDispatchOutcome_HeadPinRefusalStaysUncertain (#4683) pins
+// that a pre-forge head-pin refusal stays UNCERTAIN (dispatch_failed) on the
+// merge-dispatch ledger. It is a deterministic capability refusal: releasing
+// it would re-dispatch into the same refusal (a 502 retry loop inline, a
+// re-claim every tick delegated, a step-8 re-claim every pump on merge-on-pass,
+// ADR-093 D4). The second row is the exact error ForgeMerger returns for a
+// pinned GitLab run, which wraps none of the four release sentinels. The
+// expected outcome is hard-coded. Counterfactual: adding
+// errors.Is(err, ErrHeadPinnedMergeUnsupported) to the release case of
+// classifyMergeDispatchOutcome flips both rows to released, RED.
+func TestClassifyMergeDispatchOutcome_HeadPinRefusalStaysUncertain(t *testing.T) {
+	m := ForgeMerger{Resolver: func(string) (forge.Forge, error) { return &fakeMergeForge{name: "gitlab"}, nil }}
+	refusal := m.MergePullRequest(context.Background(), gitlabMergeRun(canonicalGitLabMRURL), "2222222222222222222222222222222222222222")
+	if !errors.Is(refusal, ErrHeadPinnedMergeUnsupported) {
+		t.Fatalf("ForgeMerger pinned GitLab error = %v, want it to wrap ErrHeadPinnedMergeUnsupported", refusal)
+	}
+	for name, err := range map[string]error{
+		"bare sentinel":              ErrHeadPinnedMergeUnsupported,
+		"ForgeMerger pinned refusal": refusal,
+	} {
+		if got := classifyMergeDispatchOutcome(err); got != mergeDispatchUncertain {
+			t.Errorf("%s: classifyMergeDispatchOutcome = %q, want %q (a deterministic refusal must not release)", name, got, mergeDispatchUncertain)
+		}
+	}
+}
+
+// TestHeadPinnedMergeUnsupported_UnreachableWithoutGitHubInstallation (#4683)
+// pins why the inline and delegated paths never meet the head-pin refusal: a
+// run with no GitHub installation (every GitLab-family run) gets an EMPTY gate
+// head from mergeCandidateGate, so its dispatch is unpinned. The fixture is the
+// production GitLab shape with a CONSISTENT repository and merge request
+// (acme/widgets), so the observation target resolves; the isolation
+// precondition shows the SAME run pinned to a non-empty head IS refused with
+// zero enables, which proves only the empty gate head avoids the refusal.
+// Counterfactual: returning a non-empty HeadSHA from mergeCandidateGate's
+// no-installation arm reddens the gate-head assertion.
+func TestHeadPinnedMergeUnsupported_UnreachableWithoutGitHubInstallation(t *testing.T) {
+	g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+	g.repo.mu.Lock()
+	r := g.repo.runs[g.runID]
+	r.InstallationID = nil
+	r.InstallationRef = ptrString("gitlab:5")
+	r.PullRequestURL = ptrString(canonicalGitLabMRURL)
+	r.Repo = "acme/widgets"
+	g.repo.mu.Unlock()
+	ctx := context.Background()
+	runRow, err := g.repo.GetRun(ctx, g.runID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+
+	gate := g.s.mergeCandidateGate(ctx, runRow)
+	if gate.HeadSHA != "" {
+		t.Fatalf("gate HeadSHA = %q, want empty (no GitHub installation: the gate cannot probe, so the dispatch is unpinned)", gate.HeadSHA)
+	}
+	g.gh.mu.Lock()
+	compares := g.gh.compareCalls
+	g.gh.mu.Unlock()
+	if compares != 0 {
+		t.Fatalf("GitHub compare calls = %d, want 0 (warnUngated returns before any GitHub read)", compares)
+	}
+
+	// Isolation precondition: the same run pinned to a non-empty head IS refused
+	// before any forge call.
+	probe := &fakeMergeForge{name: "gitlab"}
+	if err := (ForgeMerger{Resolver: func(string) (forge.Forge, error) { return probe, nil }}).MergePullRequest(ctx, runRow, "h1"); !errors.Is(err, ErrHeadPinnedMergeUnsupported) {
+		t.Fatalf("pinned dispatch error = %v, want ErrHeadPinnedMergeUnsupported (the fixture must reach the refusal branch)", err)
+	}
+	if probe.enableCalls != 0 {
+		t.Fatalf("pinned dispatch enable calls = %d, want 0", probe.enableCalls)
+	}
+
+	// The gate's (empty) head dispatches unpinned and reaches the forge.
+	fake := &fakeMergeForge{name: "gitlab"}
+	merr := (ForgeMerger{Resolver: func(string) (forge.Forge, error) { return fake, nil }}).MergePullRequest(ctx, runRow, gate.HeadSHA)
+	if merr != nil || errors.Is(merr, ErrHeadPinnedMergeUnsupported) {
+		t.Fatalf("unpinned dispatch error = %v, want nil", merr)
+	}
+	if fake.enableCalls != 1 || fake.repo != (forge.RepoRef{Owner: "acme", Name: "widgets"}) || fake.number != 7 {
+		t.Fatalf("forge enable calls = %d repo = %+v number = %d, want 1 acme/widgets #7", fake.enableCalls, fake.repo, fake.number)
+	}
+}
+
 func TestForgeMerger_GitHubFamily_NilGitHub_FailsClosed(t *testing.T) {
 	m := ForgeMerger{} // GitHub is a nil interface, Resolver nil.
 	err := m.MergePullRequest(context.Background(), &run.Run{ID: uuid.New()}, "")

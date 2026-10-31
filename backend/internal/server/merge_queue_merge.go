@@ -180,12 +180,18 @@ const (
 	// pre-call checks_pending refusal, a REST merge PUT 405 / 409 / 422, each a
 	// typed sentinel, and a head mismatch only on the precheck or rest_sha
 	// basis), so the claim is released and a later dispatch may claim again.
+	// rest_sha labels ANY 409 on the pinned REST merge PUT, which GitHub
+	// documents as a sha mismatch; the PUT was refused either way and nothing
+	// merged (#4683).
 	mergeDispatchRelease mergeDispatchLedgerOutcome = "released"
 	// mergeDispatchUncertain: the merge may have been applied (5xx, timeout,
 	// transport error, ctx cancel, 403 that may be a rate limit, a generic
 	// GraphQL error envelope, a head mismatch on the graphql_reread or an
 	// empty or unrecognised basis (#4749), anything else), so the claim moves
-	// to dispatch_failed.
+	// to dispatch_failed. A pre-forge head-pin refusal
+	// (ErrHeadPinnedMergeUnsupported) is deliberately uncertain too, to stop a
+	// release re-dispatching into a deterministic refusal (#4683, see
+	// classifyMergeDispatchOutcome).
 	mergeDispatchUncertain mergeDispatchLedgerOutcome = "dispatch_failed"
 )
 
@@ -195,9 +201,9 @@ const (
 // head mismatch is UNCERTAIN (#4749). A GraphQL execution error can
 // accompany an applied mutation, and a moved head proves only that the head
 // moved, not that the enable was refused. A bare forge.ErrMergeConflict with
-// no HeadMismatchError (the REST merge PUT 409, GitHub's documented sha
-// refusal) is not a head-mismatch detail and is decided by the typed-refusal
-// case.
+// no HeadMismatchError (the REST merge PUT 409, which GitHub documents as a
+// sha mismatch) is not a head-mismatch detail and is decided by the
+// typed-refusal case.
 func mergeDispatchHeadMismatchUncertain(err error) bool {
 	var hm *githubclient.HeadMismatchError
 	if !errors.As(err, &hm) {
@@ -208,6 +214,26 @@ func mergeDispatchHeadMismatchUncertain(err error) bool {
 
 // classifyMergeDispatchOutcome is the ONE classification of a failed forge
 // dispatch after a claim, shared by the inline, delegated and queue paths.
+//
+// A pre-forge head-pin refusal (ErrHeadPinnedMergeUnsupported) sends no merge
+// but deliberately stays outside the release set (#4683): it is a
+// deterministic capability refusal, and a release would re-dispatch into it.
+// Inline and delegated reach it through dispatchMergeBounded ->
+// ForgeMerger.MergePullRequest's non-GitHub arm, on a non-empty pin; released,
+// inline would answer a 502 merge_dispatch_failed whose retry reproduces the
+// refusal, and delegated would report "merge dispatch failed" and re-claim
+// every tick. Merge-on-pass reaches it in step 9 through
+// ForgeMerger.MergePullRequestAtHead, for a leaf lacking the head-pinned
+// capability; released, the typed-refusal switch after the settle matches
+// none of its cases, so the run falls to the final transient hold and the
+// next pump claims at step 8 and dispatches again, breaking
+// mergeQueueMergeOnPass's own "never retries a forge refusal in a loop"
+// contract and ADR-093 D4. Kept uncertain, the settle answers dispatch_failed,
+// step 9 holds once, and every later pump meets step 8's already-dispatched
+// hold: the claim strands once, loudly. It is unreachable on the inline and
+// delegated paths because mergeCandidateGate's warnUngated arm gives a run
+// with no GitHub installation (every GitLab-family run) an empty gate head, so
+// its dispatch is unpinned.
 func classifyMergeDispatchOutcome(err error) mergeDispatchLedgerOutcome {
 	switch {
 	case err == nil:
