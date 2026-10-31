@@ -2,10 +2,14 @@ package identity
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 )
@@ -17,14 +21,85 @@ import (
 type fakeGitHub struct {
 	*httptest.Server
 	mux *http.ServeMux
+
+	// requests counts every request the fake received, routed or not, so
+	// a test can assert a gate refused BEFORE any HTTP call.
+	requests atomic.Int64
 }
 
 func newFakeGitHub(t *testing.T) *fakeGitHub {
 	t.Helper()
-	mux := http.NewServeMux()
-	srv := httptest.NewServer(mux)
-	t.Cleanup(srv.Close)
-	return &fakeGitHub{Server: srv, mux: mux}
+	f := &fakeGitHub{mux: http.NewServeMux()}
+	f.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		f.requests.Add(1)
+		f.mux.ServeHTTP(w, r)
+	}))
+	t.Cleanup(f.Close)
+	return f
+}
+
+// testClientSecret is the client secret newTestProvider configures; the
+// fake check-a-token route requires it as the Basic password.
+const testClientSecret = "test-secret"
+
+// checkTokenPath is the check-a-token route for newTestProvider's client.
+const checkTokenPath = "/applications/test-client/token"
+
+// allowCheckToken registers a check-a-token route that binds EVERY token to
+// the configured client, for tests whose subject is the /user exchange.
+func (f *fakeGitHub) allowCheckToken() {
+	f.mux.HandleFunc("POST "+checkTokenPath, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"}}`))
+	})
+}
+
+// ghIssued records which OAuth client issued a token in the fake forge's
+// token table ("" = not an OAuth-app token at all: a PAT) and whose login
+// it resolves to.
+type ghIssued struct {
+	client string
+	login  string
+}
+
+// serveTokenTable registers a fake forge over table: the check-a-token
+// route requires Basic (test-client, testClientSecret) and answers 200
+// naming the issuing client ONLY for tokens issued to test-client (404, the
+// documented invalid-token answer, otherwise), while GET /user resolves
+// EVERY token in the table — so subject resolution alone would accept all
+// of them and only the client binding refuses.
+func (f *fakeGitHub) serveTokenTable(t *testing.T, table map[string]ghIssued) {
+	t.Helper()
+	f.mux.HandleFunc("POST "+checkTokenPath, func(w http.ResponseWriter, r *http.Request) {
+		id, secret, ok := r.BasicAuth()
+		if !ok || id != "test-client" || secret != testClientSecret {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		var body struct {
+			AccessToken string `json:"access_token"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			return
+		}
+		iss, known := table[body.AccessToken]
+		if !known || iss.client != "test-client" {
+			w.WriteHeader(http.StatusNotFound)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"app":{"client_id":%q},"user":{"login":%q}}`, iss.client, iss.login)
+	})
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
+		iss, known := table[strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer ")]
+		if !known {
+			w.WriteHeader(http.StatusUnauthorized)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = fmt.Fprintf(w, `{"login":%q}`, iss.login)
+	})
 }
 
 // newTestProvider returns a GitHubIdentityProvider pointed at the fake,
@@ -32,6 +107,7 @@ func newFakeGitHub(t *testing.T) *fakeGitHub {
 func newTestProvider(f *fakeGitHub) *GitHubIdentityProvider {
 	return &GitHubIdentityProvider{
 		clientID:     "test-client",
+		clientSecret: testClientSecret,
 		apiBaseURL:   f.URL,
 		oauthBaseURL: f.URL,
 		httpClient:   f.Client(),
@@ -81,6 +157,7 @@ func TestVerifyUser_Success(t *testing.T) {
 // with the token forwarded as the bearer credential.
 func TestVerifyAccessToken_Success(t *testing.T) {
 	f := newFakeGitHub(t)
+	f.allowCheckToken()
 	f.mux.HandleFunc("/user", func(w http.ResponseWriter, r *http.Request) {
 		if got := r.Header.Get("Authorization"); got != "Bearer gho_cli" {
 			t.Errorf("GET /user Authorization = %q, want Bearer gho_cli", got)
@@ -106,6 +183,7 @@ func TestVerifyAccessToken_Success(t *testing.T) {
 // two EMU users on different enterprises stay distinct subjects.
 func TestVerifyAccessToken_EMULogin(t *testing.T) {
 	f := newFakeGitHub(t)
+	f.allowCheckToken()
 	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		_, _ = w.Write([]byte(`{"login":"alice_acme"}`))
@@ -157,12 +235,268 @@ func TestVerifyAccessToken_EmptyToken(t *testing.T) {
 // never a mint.
 func TestVerifyAccessToken_Unauthorized(t *testing.T) {
 	f := newFakeGitHub(t)
+	f.allowCheckToken()
 	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusUnauthorized)
 	})
 	p := newTestProvider(f)
 	if _, err := p.VerifyAccessToken(context.Background(), "gho_bad"); err == nil {
 		t.Fatal("VerifyAccessToken with a 401 /user: want error, got nil")
+	}
+}
+
+// TestVerifyAccessToken_ConfiguredClientAccepted pins the client-binding
+// request shape (#4627): POST /applications/{client_id}/token with Basic
+// (client_id, client_secret), a JSON {"access_token"} body and NO Bearer
+// header (GitHub documents that a Bearer header replaces the Basic
+// credential), and a 200 naming the configured client resolves the subject.
+func TestVerifyAccessToken_ConfiguredClientAccepted(t *testing.T) {
+	f := newFakeGitHub(t)
+	var gotMethod, gotUser, gotPass, gotAuth, gotToken string
+	var gotBasic bool
+	f.mux.HandleFunc(checkTokenPath, func(w http.ResponseWriter, r *http.Request) {
+		gotMethod = r.Method
+		gotUser, gotPass, gotBasic = r.BasicAuth()
+		gotAuth = r.Header.Get("Authorization")
+		var body struct {
+			AccessToken string `json:"access_token"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&body)
+		gotToken = body.AccessToken
+		_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"},"user":{"login":"octocat"}}`))
+	})
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"octocat"}`))
+	})
+
+	subject, err := newTestProvider(f).VerifyAccessToken(context.Background(), "gho_ours")
+	if err != nil {
+		t.Fatalf("VerifyAccessToken: %v", err)
+	}
+	if subject != "github:octocat" {
+		t.Errorf("subject = %q, want github:octocat", subject)
+	}
+	if gotMethod != http.MethodPost {
+		t.Errorf("check-a-token method = %q, want POST", gotMethod)
+	}
+	if !gotBasic || gotUser != "test-client" || gotPass != testClientSecret {
+		t.Errorf("check-a-token Basic = (%q, %q, ok=%v), want (test-client, %s)", gotUser, gotPass, gotBasic, testClientSecret)
+	}
+	if strings.HasPrefix(gotAuth, "Bearer") {
+		t.Errorf("check-a-token Authorization = %q: a Bearer header replaces the Basic credential", gotAuth)
+	}
+	if gotToken != "gho_ours" {
+		t.Errorf("check-a-token body access_token = %q, want gho_ours", gotToken)
+	}
+}
+
+// TestVerifyAccessToken_RefusesTokenNotIssuedToClient: a token another OAuth
+// client issued, a personal access token and an App/installation token all
+// resolve a subject at GET /user in this fake, so only the client binding
+// refuses them (counterfactual vehicle: skipping the verifyTokenClient call
+// turns every subtest RED with a resolved subject).
+func TestVerifyAccessToken_RefusesTokenNotIssuedToClient(t *testing.T) {
+	table := map[string]ghIssued{
+		"gho_ours":    {client: "test-client", login: "alice"},
+		"gho_other":   {client: "Iv1.other-oauth-app", login: "alice"},
+		"ghp_pat":     {client: "", login: "alice"},
+		"ghs_install": {client: "Iv1.some-github-app", login: "alice"},
+	}
+	for _, tc := range []struct{ name, token string }{
+		{"other-oauth-client", "gho_other"},
+		{"personal-access-token", "ghp_pat"},
+		{"app-installation-token", "ghs_install"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitHub(t)
+			f.serveTokenTable(t, table)
+			subject, err := newTestProvider(f).VerifyAccessToken(context.Background(), tc.token)
+			if err == nil {
+				t.Fatalf("VerifyAccessToken(%s) = %q, want a refusal: the token was not issued to the configured client", tc.name, subject)
+			}
+			if subject != "" {
+				t.Errorf("subject = %q on refusal, want empty", subject)
+			}
+			if !errors.Is(err, ErrIntrospectionRefused) {
+				t.Errorf("err = %v, want ErrIntrospectionRefused", err)
+			}
+		})
+	}
+	t.Run("control: the configured client's token is accepted by the same fake", func(t *testing.T) {
+		f := newFakeGitHub(t)
+		f.serveTokenTable(t, table)
+		if subject, err := newTestProvider(f).VerifyAccessToken(context.Background(), "gho_ours"); err != nil || subject != "github:alice" {
+			t.Fatalf("VerifyAccessToken(gho_ours) = %q, %v; want github:alice", subject, err)
+		}
+	})
+}
+
+// TestVerifyAccessToken_RefusesForeignOrMissingIssuer: the check endpoint
+// answers 200 but names another client, no app object, or an empty or
+// case-variant client_id. Only the exact app.client_id equality refuses
+// these (counterfactual vehicle for that comparison).
+func TestVerifyAccessToken_RefusesForeignOrMissingIssuer(t *testing.T) {
+	for _, tc := range []struct{ name, body string }{
+		{"foreign client", `{"app":{"client_id":"Iv1.other-oauth-app"},"user":{"login":"alice"}}`},
+		{"no app object", `{"user":{"login":"alice"}}`},
+		{"null app object", `{"app":null,"user":{"login":"alice"}}`},
+		{"empty client_id", `{"app":{"client_id":""},"user":{"login":"alice"}}`},
+		{"case-variant client_id", `{"app":{"client_id":"TEST-CLIENT"},"user":{"login":"alice"}}`},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitHub(t)
+			f.mux.HandleFunc("POST "+checkTokenPath, func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(tc.body))
+			})
+			f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"login":"alice"}`))
+			})
+			subject, err := newTestProvider(f).VerifyAccessToken(context.Background(), "gho_x")
+			if err == nil {
+				t.Fatalf("VerifyAccessToken = %q, want a refusal for a 200 naming %s", subject, tc.name)
+			}
+			if !errors.Is(err, ErrTokenClientMismatch) {
+				t.Errorf("err = %v, want ErrTokenClientMismatch", err)
+			}
+		})
+	}
+}
+
+// TestVerifyAccessToken_IntrospectionFailureRefuses: every introspection
+// outcome other than a 200 naming the configured client refuses, with the
+// sentinel a caller classifies on; GET /user would accept each token.
+func TestVerifyAccessToken_IntrospectionFailureRefuses(t *testing.T) {
+	cases := []struct {
+		name    string
+		handler http.HandlerFunc
+		want    error
+	}{
+		// Non-200 bodies name the configured client, so only the status
+		// check (not a decode or client mismatch) refuses them.
+		{"server error", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusInternalServerError)
+			_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"}}`))
+		}, ErrIntrospectionRefused},
+		{"unprocessable", func(w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusUnprocessableEntity)
+			_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"}}`))
+		}, ErrIntrospectionRefused},
+		{"rate limited", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("X-RateLimit-Remaining", "0")
+			w.WriteHeader(http.StatusForbidden)
+			_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"}}`))
+		}, ErrRateLimited},
+		{"undecodable 200 body", func(w http.ResponseWriter, _ *http.Request) {
+			_, _ = w.Write([]byte(`not json`))
+		}, ErrIntrospectionFailed},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitHub(t)
+			f.mux.HandleFunc("POST "+checkTokenPath, tc.handler)
+			f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"login":"alice"}`))
+			})
+			subject, err := newTestProvider(f).VerifyAccessToken(context.Background(), "gho_x")
+			if err == nil {
+				t.Fatalf("VerifyAccessToken = %q, want a refusal", subject)
+			}
+			if !errors.Is(err, tc.want) {
+				t.Errorf("err = %v, want %v", err, tc.want)
+			}
+		})
+	}
+	t.Run("unreachable forge", func(t *testing.T) {
+		f := newFakeGitHub(t)
+		p := newTestProvider(f)
+		f.Close() // the listener is gone: every request is a transport error
+		subject, err := p.VerifyAccessToken(context.Background(), "gho_x")
+		if err == nil {
+			t.Fatalf("VerifyAccessToken = %q, want a refusal", subject)
+		}
+		if !errors.Is(err, ErrIntrospectionFailed) {
+			t.Errorf("err = %v, want ErrIntrospectionFailed", err)
+		}
+	})
+}
+
+// TestVerifyAccessToken_UnconfiguredClientCredential: without the client
+// secret (or id) the binding cannot be checked, so VerifyAccessToken
+// returns ErrClientCredentialUnconfigured BEFORE any HTTP call. The fake's
+// check route WOULD bind any token to the configured client and /user
+// would resolve it, so only the credential gate refuses.
+func TestVerifyAccessToken_UnconfiguredClientCredential(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mut  func(*GitHubIdentityProvider)
+	}{
+		{"empty client secret", func(p *GitHubIdentityProvider) { p.clientSecret = "" }},
+		{"empty client id", func(p *GitHubIdentityProvider) { p.clientID = "" }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeGitHub(t)
+			f.mux.HandleFunc("/applications/", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"}}`))
+			})
+			f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+				_, _ = w.Write([]byte(`{"login":"alice"}`))
+			})
+			p := newTestProvider(f)
+			tc.mut(p)
+			subject, err := p.VerifyAccessToken(context.Background(), "gho_x")
+			if !errors.Is(err, ErrClientCredentialUnconfigured) {
+				t.Fatalf("VerifyAccessToken = %q, %v; want ErrClientCredentialUnconfigured", subject, err)
+			}
+			if n := f.requests.Load(); n != 0 {
+				t.Errorf("made %d request(s); the credential gate must refuse before any HTTP call", n)
+			}
+		})
+	}
+}
+
+// TestVerifyAccessToken_IntrospectionRedirectRefused: the check-a-token
+// call refuses ANY redirect. The fake 307-redirects to a second server
+// that would bind the token to the configured client; Go's client would
+// follow a 307 with the method, body and (same hostname) Authorization
+// preserved, so without the refusal the token is accepted and the second
+// server records a request.
+func TestVerifyAccessToken_IntrospectionRedirectRefused(t *testing.T) {
+	var redirected atomic.Int64
+	target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirected.Add(1)
+		_, _ = io.Copy(io.Discard, r.Body)
+		_, _ = w.Write([]byte(`{"app":{"client_id":"test-client"}}`))
+	}))
+	t.Cleanup(target.Close)
+
+	f := newFakeGitHub(t)
+	f.mux.HandleFunc("POST "+checkTokenPath, func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, target.URL+checkTokenPath, http.StatusTemporaryRedirect)
+	})
+	f.mux.HandleFunc("/user", func(w http.ResponseWriter, _ *http.Request) {
+		_, _ = w.Write([]byte(`{"login":"alice"}`))
+	})
+
+	subject, err := newTestProvider(f).VerifyAccessToken(context.Background(), "gho_x")
+	if err == nil {
+		t.Fatalf("VerifyAccessToken = %q, want a refusal: the check-a-token call must not follow a redirect", subject)
+	}
+	if !errors.Is(err, ErrIntrospectionRefused) {
+		t.Errorf("err = %v, want ErrIntrospectionRefused (the 3xx refused as a non-200)", err)
+	}
+	if n := redirected.Load(); n != 0 {
+		t.Errorf("redirect target received %d request(s), want 0", n)
+	}
+}
+
+// TestWithClientSecret pins the option's effect on the provider.
+func TestWithClientSecret(t *testing.T) {
+	p, ok := NewGitHubIdentityProvider("cid", nil, WithClientSecret("s3cret")).(*GitHubIdentityProvider)
+	if !ok {
+		t.Fatal("NewGitHubIdentityProvider did not return *GitHubIdentityProvider")
+	}
+	if p.clientSecret != "s3cret" {
+		t.Errorf("clientSecret = %q, want s3cret", p.clientSecret)
 	}
 }
 

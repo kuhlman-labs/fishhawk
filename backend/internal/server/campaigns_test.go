@@ -172,8 +172,12 @@ func (f *fakeCampaignRepo) CreateCampaign(_ context.Context, p campaign.CreateCa
 		// handler that never threaded it onto the assembly pass, which is exactly
 		// the unprovenanced-campaign hole binding condition K3 forbids.
 		GroomingSource: p.GroomingSource,
-		CreatedAt:      now,
-		UpdatedAt:      now,
+		// The campaign-level runner kind (#4485) is carried verbatim for the
+		// same reason: a fake that dropped it would mask a handler that never
+		// threaded it onto the assembly.
+		RunnerKind: p.RunnerKind,
+		CreatedAt:  now,
+		UpdatedAt:  now,
 	}
 	f.campaigns[c.ID] = c
 	return c, nil
@@ -4123,8 +4127,9 @@ func postStartItemRun(t *testing.T, s *Server, campaignID uuid.UUID, body string
 }
 
 type startItemRunBody struct {
-	Run  runResponse          `json:"run"`
-	Item campaignItemResponse `json:"item"`
+	Run                  runResponse                   `json:"run"`
+	Item                 campaignItemResponse          `json:"item"`
+	RunnerKindResolution *campaignRunnerKindResolution `json:"runner_kind_resolution"`
 }
 
 type campaignStatusBody struct {
@@ -4633,6 +4638,406 @@ func TestStartCampaignItemRun_RelativeWorkingDir_Rejected(t *testing.T) {
 		}
 		if it.RunID != nil {
 			t.Errorf("item run_id = %v, want nil (no run linked) after the refusal", it.RunID)
+		}
+	}
+}
+
+// --- campaign runner_kind ladder (#4485) ---
+
+// startedAuditPayload returns the decoded payload of the single
+// campaign_issue_started entry the recorder holds.
+func startedAuditPayload(t *testing.T, aud *campaignAuditRecorder) map[string]any {
+	t.Helper()
+	aud.mu.Lock()
+	defer aud.mu.Unlock()
+	var found []map[string]any
+	for _, e := range aud.entries {
+		if e.Category != categoryCampaignIssueStarted {
+			continue
+		}
+		var m map[string]any
+		if err := json.Unmarshal(e.Payload, &m); err != nil {
+			t.Fatalf("decode campaign_issue_started payload: %v", err)
+		}
+		found = append(found, m)
+	}
+	if len(found) != 1 {
+		t.Fatalf("campaign_issue_started entries = %d, want 1", len(found))
+	}
+	return found[0]
+}
+
+// decodeStartItemRun asserts a 201 and decodes the item-run body.
+func decodeStartItemRun(t *testing.T, w *httptest.ResponseRecorder) startItemRunBody {
+	t.Helper()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var body startItemRunBody
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body: %v (body=%s)", err, w.Body.String())
+	}
+	return body
+}
+
+// assertRunnerKindResolution checks the 201 body's runner_kind_resolution.
+func assertRunnerKindResolution(t *testing.T, body startItemRunBody, wantKind, wantSource string) {
+	t.Helper()
+	if body.RunnerKindResolution == nil {
+		t.Fatalf("201 body carries no runner_kind_resolution, want {%s, %s}", wantKind, wantSource)
+	}
+	if got := *body.RunnerKindResolution; got.RunnerKind != wantKind || got.Source != wantSource {
+		t.Errorf("runner_kind_resolution = %+v, want {runner_kind:%s source:%s}", got, wantKind, wantSource)
+	}
+}
+
+// TestCreateCampaign_PersistsAndEchoesRunnerKind pins the create half: a POST
+// with runner_kind local persists it on the campaign row and echoes it in the
+// 201 body, and a campaign created WITHOUT one carries no runner_kind key.
+func TestCreateCampaign_PersistsAndEchoesRunnerKind(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	registerEpicProvider(t, &fakeEpicProvider{result: smallDAG()})
+	gh := recordingInstallGitHubClient(t, 7788, &installRecorder{})
+	s := New(Config{CampaignRepo: crepo, GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"acme/widgets","epic_ref":"issue:99","runner_kind":"local"}`)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+	}
+	var created campaignResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+		t.Fatalf("decode created campaign: %v", err)
+	}
+	if created.RunnerKind != "local" {
+		t.Errorf("201 body runner_kind = %q, want local", created.RunnerKind)
+	}
+	if got := crepo.campaigns[created.ID].RunnerKind; got != "local" {
+		t.Errorf("persisted campaign runner_kind = %q, want local", got)
+	}
+
+	w2 := postCampaign(t, s, `{"repo":"acme/widgets","epic_ref":"issue:99"}`)
+	if w2.Code != http.StatusCreated {
+		t.Fatalf("unrecorded create status = %d, want 201 (body=%s)", w2.Code, w2.Body.String())
+	}
+	var raw map[string]any
+	if err := json.Unmarshal(w2.Body.Bytes(), &raw); err != nil {
+		t.Fatalf("decode unrecorded campaign: %v", err)
+	}
+	if _, present := raw["runner_kind"]; present {
+		t.Errorf("unrecorded campaign body carries a runner_kind key: %s", w2.Body.String())
+	}
+}
+
+// TestCreateCampaign_InvalidRunnerKind_Rejected: the create-time runner_kind
+// guard refuses an unknown kind 400 validation_failed naming the field, before
+// any forge round-trip, and persists no campaign (committed state is read).
+//
+// Counterfactual: delete the guard → the otherwise-valid create persists the
+// bogus kind and answers 201 → RED on the status and the zero-campaigns read.
+func TestCreateCampaign_InvalidRunnerKind_Rejected(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	fp := &fakeEpicProvider{result: smallDAG()}
+	registerEpicProvider(t, fp)
+	gh := recordingInstallGitHubClient(t, 7788, &installRecorder{})
+	s := New(Config{CampaignRepo: crepo, GitHub: gh})
+
+	w := postCampaign(t, s, `{"repo":"acme/widgets","epic_ref":"issue:99","runner_kind":"kubernetes"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if details["field"] != "runner_kind" || details["got"] != "kubernetes" {
+		t.Errorf("details = %v, want field runner_kind, got kubernetes", details)
+	}
+	if !strings.Contains(w.Body.String(), validRunnerKindsMessage) {
+		t.Errorf("message does not render validRunnerKindsMessage %q: %s", validRunnerKindsMessage, w.Body.String())
+	}
+	if n := len(crepo.campaigns); n != 0 {
+		t.Errorf("campaigns created = %d, want 0 (the guard must refuse before persisting)", n)
+	}
+	if fp.called {
+		t.Error("the epic-children query ran; the guard must refuse before any forge round-trip")
+	}
+}
+
+// TestStartCampaignItemRun_LocalBoundCampaign_OmittedRunnerKind_MintsLocal is
+// the #4485 done-means: a campaign bound to a working_dir but with NO recorded
+// runner_kind (every pre-#4485 campaign), item started with runner_kind
+// omitted, mints a LOCAL run — asserted on the PERSISTED run row — and states
+// why in the 201 body and the campaign_issue_started audit payload.
+//
+// Counterfactual: make the working_dir fallback rung return github_actions →
+// the persisted run is github_actions → RED.
+func TestStartCampaignItemRun_LocalBoundCampaign_OmittedRunnerKind_MintsLocal(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = ""
+	c.WorkingDir = t.TempDir()
+
+	body := decodeStartItemRun(t, postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change"}`))
+	persisted, ok := rrepo.runs[body.Run.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", body.Run.ID)
+	}
+	if persisted.RunnerKind != run.RunnerKindLocal {
+		t.Errorf("persisted run runner_kind = %q, want local (the campaign binds a working_dir)", persisted.RunnerKind)
+	}
+	if persisted.WorkingDir != c.WorkingDir {
+		t.Errorf("persisted run working_dir = %q, want the campaign binding %q", persisted.WorkingDir, c.WorkingDir)
+	}
+	assertRunnerKindResolution(t, body, run.RunnerKindLocal, runnerKindSourceCampaignWorkingDir)
+	payload := startedAuditPayload(t, aud)
+	if payload["runner_kind"] != run.RunnerKindLocal || payload["runner_kind_source"] != runnerKindSourceCampaignWorkingDir {
+		t.Errorf("campaign_issue_started payload runner_kind/source = %v/%v, want local/campaign_working_dir",
+			payload["runner_kind"], payload["runner_kind_source"])
+	}
+}
+
+// TestStartCampaignItemRun_InheritsCampaignRunnerKind_NoBinding isolates the
+// recorded-kind inherit rung: the campaign records local with NO working_dir
+// binding (so the fallback rung cannot mask it) and the item passes a per-item
+// working_dir with runner_kind omitted.
+//
+// Counterfactual: make the inherit rung return github_actions → RED.
+func TestStartCampaignItemRun_InheritsCampaignRunnerKind_NoBinding(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = run.RunnerKindLocal
+	c.WorkingDir = ""
+
+	wd := t.TempDir()
+	body := decodeStartItemRun(t, postStartItemRun(t, s, c.ID,
+		`{"issue_ref":"issue:100","workflow_id":"feature_change","working_dir":`+strconv.Quote(wd)+`}`))
+	persisted, ok := rrepo.runs[body.Run.ID]
+	if !ok {
+		t.Fatalf("run %s was not persisted", body.Run.ID)
+	}
+	if persisted.RunnerKind != run.RunnerKindLocal {
+		t.Errorf("persisted run runner_kind = %q, want local (inherited from the campaign)", persisted.RunnerKind)
+	}
+	assertRunnerKindResolution(t, body, run.RunnerKindLocal, runnerKindSourceCampaign)
+}
+
+// TestStartCampaignItemRun_CampaignRecordedGitHubActions_BeatsWorkingDirFallback
+// pins rung ORDER: a recorded github_actions beats the working_dir fallback.
+func TestStartCampaignItemRun_CampaignRecordedGitHubActions_BeatsWorkingDirFallback(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = run.RunnerKindGitHubActions
+	c.WorkingDir = t.TempDir()
+
+	body := decodeStartItemRun(t, postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change"}`))
+	if got := rrepo.runs[body.Run.ID].RunnerKind; got != run.RunnerKindGitHubActions {
+		t.Errorf("persisted run runner_kind = %q, want github_actions (recorded on the campaign)", got)
+	}
+	assertRunnerKindResolution(t, body, run.RunnerKindGitHubActions, runnerKindSourceCampaign)
+}
+
+// TestStartCampaignItemRun_ExplicitRunnerKindOverridesCampaign: an explicit
+// per-item value wins over the campaign's recorded kind and is what the run row
+// records.
+func TestStartCampaignItemRun_ExplicitRunnerKindOverridesCampaign(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = run.RunnerKindLocal
+	c.WorkingDir = t.TempDir()
+
+	body := decodeStartItemRun(t, postStartItemRun(t, s, c.ID,
+		`{"issue_ref":"issue:100","workflow_id":"feature_change","runner_kind":"github_actions"}`))
+	if got := rrepo.runs[body.Run.ID].RunnerKind; got != run.RunnerKindGitHubActions {
+		t.Errorf("persisted run runner_kind = %q, want github_actions (the per-item override)", got)
+	}
+	assertRunnerKindResolution(t, body, run.RunnerKindGitHubActions, runnerKindSourceExplicit)
+}
+
+// TestStartCampaignItemRun_UnboundLegacyCampaign_DefaultsGitHubActions: with
+// neither a recorded kind nor a binding, the unchanged github_actions default
+// applies and is named as such.
+func TestStartCampaignItemRun_UnboundLegacyCampaign_DefaultsGitHubActions(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, aud := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = ""
+	c.WorkingDir = ""
+
+	body := decodeStartItemRun(t, postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change"}`))
+	if got := rrepo.runs[body.Run.ID].RunnerKind; got != run.RunnerKindGitHubActions {
+		t.Errorf("persisted run runner_kind = %q, want github_actions (the default)", got)
+	}
+	assertRunnerKindResolution(t, body, run.RunnerKindGitHubActions, runnerKindSourceDefault)
+	if p := startedAuditPayload(t, aud); p["runner_kind_source"] != runnerKindSourceDefault {
+		t.Errorf("campaign_issue_started runner_kind_source = %v, want default", p["runner_kind_source"])
+	}
+}
+
+// TestStartCampaignItemRun_InvalidCampaignRunnerKind_Refused: an INHERITED
+// runner kind is re-validated. The bogus value is seeded on the campaign row BY
+// CONSTRUCTION (bypassing the create-time guard), and the refusal leaves no
+// committed state.
+//
+// Counterfactual: delete the re-validation → the bogus kind reaches the run
+// mint (201 or a downstream 502), never the asserted 400 with zero runs → RED.
+func TestStartCampaignItemRun_InvalidCampaignRunnerKind_Refused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = "bogus"
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "validation_failed" {
+		t.Errorf("code = %q, want validation_failed", code)
+	}
+	if details["field"] != "runner_kind" || details["got"] != "bogus" || details["campaign_id"] != c.ID.String() {
+		t.Errorf("details = %v, want field runner_kind, got bogus, campaign_id %s", details, c.ID)
+	}
+	if !strings.Contains(w.Body.String(), validRunnerKindsMessage) {
+		t.Errorf("message does not render validRunnerKindsMessage: %s", w.Body.String())
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	items := crepo.itemsByCmp[c.ID]
+	if len(items) != 1 || items[0].State != campaign.ItemStatePending || items[0].RunID != nil {
+		t.Errorf("item = %+v, want still pending with a nil run_id", items[0])
+	}
+}
+
+// TestStartCampaignItemRun_CampaignRecordedLocal_NoCheckout_Refused: the
+// working_dir_required rung keys on the RESOLVED runner kind. The campaign
+// records local with no binding, and the item passes neither runner_kind nor
+// working_dir.
+//
+// Counterfactual: key the rung on req.RunnerKind instead → it does not fire,
+// a checkout-less local run is minted (201) → RED.
+func TestStartCampaignItemRun_CampaignRecordedLocal_NoCheckout_Refused(t *testing.T) {
+	crepo := newFakeCampaignRepo()
+	s, rrepo, _ := newCampaignStartServer(t, crepo)
+	c := crepo.seedCampaignWithItems("acme/widgets", "issue:99", []*campaign.Item{
+		cItem("issue:100", nil, campaign.ItemStatePending),
+	})
+	c.State = campaign.StatePending
+	c.RunnerKind = run.RunnerKindLocal
+	c.WorkingDir = ""
+
+	w := postStartItemRun(t, s, c.ID, `{"issue_ref":"issue:100","workflow_id":"feature_change"}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400 (body=%s)", w.Code, w.Body.String())
+	}
+	code, details := decodeCampaignErrorDetails(t, w)
+	if code != "working_dir_required" {
+		t.Errorf("code = %q, want working_dir_required", code)
+	}
+	if details["field"] != "working_dir" {
+		t.Errorf("details.field = %v, want working_dir", details["field"])
+	}
+	if n := len(rrepo.runs); n != 0 {
+		t.Errorf("runs minted = %d, want 0", n)
+	}
+	items := crepo.itemsByCmp[c.ID]
+	if len(items) != 1 || items[0].State != campaign.ItemStatePending || items[0].RunID != nil {
+		t.Errorf("item = %+v, want still pending with a nil run_id", items[0])
+	}
+}
+
+// TestStartCampaignItemRun_RunnerKind_CrossBoundary_E2E crosses the REST
+// create, campaign persistence in REAL Postgres (the hand-edited sqlc column
+// lists), the item-run ladder, the run mint and the run row in REAL Postgres.
+// Campaign A records runner_kind local with no binding; campaign B binds only a
+// working_dir. Item runs passing no runner_kind are local on both, for the two
+// different reasons the 201 bodies name.
+func TestStartCampaignItemRun_RunnerKind_CrossBoundary_E2E(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	crepo := campaign.NewPostgresRepository(pool)
+	registerEpicProvider(t, &fakeEpicProvider{result: twoIndependentDAG()})
+	rrepo := run.NewPostgresRepository(pool)
+	fake := newFakeGitHubForRuns(gatedSpecYAML)
+	ghSrv := fake.server(t)
+	gh := &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt", nil },
+	}
+	s := New(Config{CampaignRepo: crepo, RunRepo: rrepo, AuditRepo: &campaignAuditRecorder{}, GitHub: gh})
+	ctx := context.Background()
+
+	create := func(body string) campaignResponse {
+		t.Helper()
+		w := postCampaign(t, s, body)
+		if w.Code != http.StatusCreated {
+			t.Fatalf("create campaign status = %d, want 201 (body=%s)", w.Code, w.Body.String())
+		}
+		var created campaignResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &created); err != nil {
+			t.Fatalf("decode created campaign: %v", err)
+		}
+		return created
+	}
+
+	// Campaign A: runner_kind recorded, no checkout binding.
+	a := create(`{"repo":"acme/widgets","epic_ref":"issue:99","runner_kind":"local"}`)
+	// Campaign B: checkout binding only.
+	bound := t.TempDir()
+	b := create(`{"repo":"acme/widgets","epic_ref":"issue:99","working_dir":` + strconv.Quote(bound) + `}`)
+
+	persistedA, err := crepo.GetCampaign(ctx, a.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign A: %v", err)
+	}
+	if persistedA.RunnerKind != run.RunnerKindLocal {
+		t.Errorf("persisted campaign A runner_kind = %q, want local", persistedA.RunnerKind)
+	}
+	persistedB, err := crepo.GetCampaign(ctx, b.ID)
+	if err != nil {
+		t.Fatalf("re-read campaign B: %v", err)
+	}
+	if persistedB.RunnerKind != "" {
+		t.Errorf("persisted campaign B runner_kind = %q, want \"\" (not recorded)", persistedB.RunnerKind)
+	}
+
+	wd := t.TempDir()
+	bodyA := decodeStartItemRun(t, postStartItemRun(t, s, a.ID,
+		`{"issue_ref":"issue:100","workflow_id":"feature_change","working_dir":`+strconv.Quote(wd)+`}`))
+	assertRunnerKindResolution(t, bodyA, run.RunnerKindLocal, runnerKindSourceCampaign)
+	bodyB := decodeStartItemRun(t, postStartItemRun(t, s, b.ID, `{"issue_ref":"issue:101","workflow_id":"feature_change"}`))
+	assertRunnerKindResolution(t, bodyB, run.RunnerKindLocal, runnerKindSourceCampaignWorkingDir)
+
+	for name, rid := range map[string]uuid.UUID{"A": bodyA.Run.ID, "B": bodyB.Run.ID} {
+		persisted, err := rrepo.GetRun(ctx, rid)
+		if err != nil {
+			t.Fatalf("re-read run %s (%s): %v", name, rid, err)
+		}
+		if persisted.RunnerKind != run.RunnerKindLocal {
+			t.Errorf("persisted run %s runner_kind = %q, want local", name, persisted.RunnerKind)
 		}
 	}
 }

@@ -1,16 +1,18 @@
 // Package basedelta decides whether a PR head that was verified green against
 // base B is still independent of the base delta B..B' after main advanced to
 // B' (ADR-096 D1(b)-(d) and D3). The decision is a pure function of path
-// lists plus the workspaces' Go import graphs: Classify returns Independent
-// only when no rule finds an interaction, and every error, empty input or
-// unmappable path returns an `undecidable:` reason. Fail closed means verify.
+// lists, the repository's DECLARED verdict-transfer surface (ADR-124) and the
+// workspaces' import graphs: Classify returns Independent only when no rule
+// finds an interaction, and every error, empty input, undeclared or malformed
+// surface, unsupported workspace or unclassified path returns an
+// `undecidable:` reason. Fail closed means verify.
 //
-// Nothing consumes the package yet (slice 1 of E87); the contract, rule order
-// and global-surface rationale live in README.md.
+// The contract and rule order live in README.md.
 package basedelta
 
 import (
 	"context"
+	"errors"
 	"path"
 	"sort"
 	"strings"
@@ -25,8 +27,25 @@ const (
 	PrefixGlobalSurface  = "global_surface:"
 	PrefixSharedArtifact = "shared_artifact:"
 	PrefixReachOverlap   = "reach_overlap:"
+	PrefixDocCheck       = "doc_check:"
 	PrefixUndecidable    = "undecidable:"
 )
+
+// Undecidable sub-reasons the declared surface and the workspace adapter add
+// (ADR-124 D2, D3).
+const (
+	reasonSurfaceUndeclared   = "surface_undeclared"
+	reasonSurfaceIncomplete   = "surface_incomplete"
+	reasonInvalidSurface      = "invalid_surface"
+	reasonUnsupportedLanguage = "unsupported_language"
+	reasonUnclassifiedPath    = "unclassified_path"
+	reasonOpaquePath          = "opaque_path"
+)
+
+// ClassifierVersion versions the rule set and its refusal codes. It is
+// recorded beside the declaration's Digest on every decision, replacing the
+// built-in surface's SurfaceVersion (ADR-124 D1).
+const ClassifierVersion = 2
 
 // MaxReasonLen bounds Result.Reason in bytes.
 const MaxReasonLen = 256
@@ -55,6 +74,10 @@ type Input struct {
 	// Callers pass both sides of a rename (git diff --no-renames): the
 	// classifier sees only path lists.
 	Workspaces []string
+	// Surface is the repository's declared verdict-transfer surface,
+	// resolved from the run's ADMISSION spec (ResolveSurface). nil is
+	// undeclared and refused as surface_undeclared.
+	Surface *Surface
 }
 
 // Classifier applies the ADR-096 independence rules.
@@ -66,10 +89,16 @@ type Classifier struct {
 	Deadline time.Duration
 }
 
-// Classify applies, in order: input validation, rule (b) global surface (both
-// sides), rule (d) shared artifact, rule (c) reverse-dependency reach. The
-// first rule that fires decides; with none firing the verdict is independent.
-// A panic anywhere below is recovered into `undecidable:panic`.
+// Classify applies, in order: the surface guards (undeclared, invalid,
+// incomplete), input validation, the WORKSPACE adapter check
+// (unsupported_language, decided before any path rule), rule (b) verdict-wide
+// G on both sides (the workflow spec always included), doc-check on both
+// sides, opaque on both sides, rule (d) shared artifact (inert never exempts
+// it), then the graph load and per-path classification of both sides (adapter
+// graph, else declared inert, else unclassified_path), then rule (c)
+// reverse-dependency reach. The first rule that fires decides; with none
+// firing the verdict is independent. A panic anywhere below is recovered into
+// `undecidable:panic`.
 func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -81,6 +110,15 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 	}
 	if c.Loader == nil {
 		return undecidable("no_loader")
+	}
+	if in.Surface == nil {
+		return undecidable(reasonSurfaceUndeclared)
+	}
+	if bad, ok := in.Surface.firstInvalid(); ok {
+		return undecidable(reasonInvalidSurface + ":" + bad)
+	}
+	if in.Surface.incomplete() {
+		return undecidable(reasonSurfaceIncomplete)
 	}
 	if len(in.DeltaPaths) == 0 {
 		return undecidable("empty_delta")
@@ -103,14 +141,38 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 			}
 		}
 	}
+	// The workspace adapter: an unsupported workspace refuses whatever
+	// changed, before any path rule.
+	for _, w := range in.Workspaces {
+		if err := c.Loader.Supports(w); err != nil {
+			return workspaceRefusal(err)
+		}
+	}
 	delta := sortedUnique(in.DeltaPaths)
 	pr := sortedUnique(in.PRPaths)
+	both := [][]string{delta, pr}
 
-	// Rule (b): a global-surface path on either side.
-	for _, list := range [][]string{delta, pr} {
+	// Rule (b): a verdict-wide path on either side.
+	for _, list := range both {
 		for _, p := range list {
-			if _, ok := MatchGlobal(p); ok {
+			if in.Surface.matchVerdictWide(p) {
 				return dependent(PrefixGlobalSurface + p)
+			}
+		}
+	}
+	// Doc-check inputs force a pass on either side until the D-i/D-ii
+	// relaxation lands (#4317): a conservative superset (ADR-098 D5.1).
+	for _, list := range both {
+		for _, p := range list {
+			if in.Surface.matchDocCheck(p) {
+				return dependent(PrefixDocCheck + p)
+			}
+		}
+	}
+	for _, list := range both {
+		for _, p := range list {
+			if in.Surface.matchOpaque(p) {
+				return undecidable(reasonOpaquePath + ":" + p)
 			}
 		}
 	}
@@ -127,12 +189,8 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 		}
 	}
 	for _, d := range delta {
-		entry, ok := sharedDir(d)
-		if !ok {
-			continue
-		}
 		for _, p := range pr {
-			if strings.HasPrefix(p, entry) {
+			if entry, ok := in.Surface.sharedDir(d, p); ok {
 				return dependent(PrefixSharedArtifact + commonDir(d, p, entry))
 			}
 		}
@@ -153,7 +211,7 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 			return undecidable("deadline_exceeded")
 		}
 		if err != nil {
-			return undecidable("load:" + err.Error())
+			return loadFailure(err)
 		}
 		if g == nil {
 			return undecidable("load:nil_graph")
@@ -161,13 +219,13 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 		graphs = append(graphs, g)
 	}
 	g := Union(graphs...)
-	deltaSeeds, err := mapPaths(g, delta)
-	if err != nil {
-		return undecidable(err.Error())
+	deltaSeeds, res, ok := classifyPaths(g, in.Surface, delta)
+	if !ok {
+		return res
 	}
-	prSeeds, err := mapPaths(g, pr)
-	if err != nil {
-		return undecidable(err.Error())
+	prSeeds, res, ok := classifyPaths(g, in.Surface, pr)
+	if !ok {
+		return res
 	}
 	reachD := g.reverseClosure(deltaSeeds)
 	reachP := g.reverseClosure(prSeeds)
@@ -185,16 +243,41 @@ func (c *Classifier) Classify(ctx context.Context, in Input) (res Result) {
 	return Result{Independent: true, Reason: ReasonIndependent}
 }
 
-func mapPaths(g *Graph, paths []string) ([]string, error) {
+// classifyPaths maps every path to its reach seeds with fixed precedence
+// (ADR-124 D3): adapter graph coverage first (a non-Go path under a package
+// directory included), then declared inert, else refused. An unmapped .go or
+// go.mod path not declared inert keeps its specific unmapped_go_* reason;
+// anything else is unclassified_path. Inert therefore never removes a path
+// from graph reach.
+func classifyPaths(g *Graph, s *Surface, paths []string) ([]string, Result, bool) {
 	var out []string
 	for _, p := range paths {
 		ips, err := g.packagesFor(p)
-		if err != nil {
-			return nil, err
+		if err == nil && len(ips) > 0 {
+			out = append(out, ips...)
+			continue
 		}
-		out = append(out, ips...)
+		if s.inert(p) {
+			continue
+		}
+		if err != nil {
+			return nil, undecidable(err.Error()), false
+		}
+		return nil, undecidable(reasonUnclassifiedPath + ":" + p), false
 	}
-	return out, nil
+	return out, Result{}, true
+}
+
+// workspaceRefusal maps a Loader.Supports error onto its reason.
+func workspaceRefusal(err error) Result { return loadFailure(err) }
+
+// loadFailure maps a Loader.Load error onto its reason; the loader's own
+// unsupported-workspace refusal (defence in depth) keeps its code.
+func loadFailure(err error) Result {
+	if errors.Is(err, ErrUnsupportedLanguage) {
+		return undecidable(reasonUnsupportedLanguage)
+	}
+	return undecidable("load:" + err.Error())
 }
 
 // validPath accepts a non-empty, relative, slash-separated, canonical path

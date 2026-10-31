@@ -68,6 +68,11 @@ type CrossSliceClaim struct {
 // same file; here distinct slices each own different members of a pattern
 // that must move in lockstep. The fix is consolidation (one slice owns the
 // whole seam), not dual declaration. Slices is sorted by SliceTitle.
+//
+// It ALSO carries the #4679 shared-path pattern (surfacePatternSliceSharedPath,
+// sliceSharedPathFindings): two distinct slices DECLARE overlapping paths by
+// directory containment, which the raw-equal #1062 gate does not refuse. Each
+// claim then names the one path that slice declares.
 type CrossSliceCouplingFinding struct {
 	Pattern string            `json:"pattern"`
 	Slices  []CrossSliceClaim `json:"slices"`
@@ -701,6 +706,10 @@ func (s *Server) runSurfaceSweep(ctx context.Context, runID, stageID uuid.UUID, 
 	// can time out (#1035). Pure evaluator, guarded on a decomposition;
 	// normalize nil to an empty slice so the payload marshals an array.
 	crossSlice := evaluateCrossSliceCoupling(parsedPlan, surfacePatterns)
+	// Shared-path pass (#4679): a path two distinct slices both declare by
+	// directory containment rides the same CROSS-SLICE COUPLING reviewer line
+	// under surfacePatternSliceSharedPath.
+	crossSlice = append(crossSlice, sliceSharedPathFindings(parsedPlan)...)
 	if crossSlice == nil {
 		crossSlice = []CrossSliceCouplingFinding{}
 	}

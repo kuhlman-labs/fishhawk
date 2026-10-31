@@ -12,7 +12,9 @@ import (
 	"os/exec"
 	"path/filepath"
 	"reflect"
+	"regexp"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -125,6 +127,45 @@ func TestProfile_DeterministicAcrossOrderings(t *testing.T) {
 	}
 }
 
+// signalGolden is the signal section WithSignalConfinement renders, spelled
+// out literally so the golden pins the exact grammar (#4855): a blanket deny
+// and exactly one allow, `(target same-sandbox)`, with no pid, process-name
+// or path exception.
+const signalGolden = "(deny signal)\n(allow signal (target same-sandbox))\n"
+
+// TestProfile_SignalConfinement_Golden pins the signal render: alone it sits
+// between `(allow default)` and the unchanged IP rules; composed with
+// WithCredentialDeny it precedes the credential section; and the output is
+// identical whichever order the options are passed in.
+func TestProfile_SignalConfinement_Golden(t *testing.T) {
+	const pre = "(version 1)\n(allow default)\n"
+	netRules := strings.TrimPrefix(header, pre) + allow("3000") + allow("8090")
+	got, err := Profile("127.0.0.1:8090", []string{"localhost:3000", "api.github.com"}, WithSignalConfinement())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := pre + signalGolden + netRules; got != want {
+		t.Fatalf("signal-only profile =\n%s\nwant\n%s", got, want)
+	}
+	if n := strings.Count(got, "(allow signal"); n != 1 {
+		t.Fatalf("profile carries %d signal allows, want exactly 1:\n%s", n, got)
+	}
+	cred := WithCredentialDeny(CredentialDeny{
+		Homes: []string{"/Users/a", "/home/b"}, Files: true, Keychain: true, SSHAgent: true,
+		AgentSockets: []string{"/private/tmp/agent.sock", "/var/run/b.sock"}, EvalSymlinks: fakeResolver(credGoldenResolver),
+	})
+	want := pre + signalGolden + credGoldenSection + netRules
+	for i, opts := range [][]ProfileOption{{WithSignalConfinement(), cred}, {cred, WithSignalConfinement()}} {
+		got, err := Profile("127.0.0.1:8090", []string{"localhost:3000"}, opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if got != want {
+			t.Fatalf("composed profile (option order %d) =\n%s\nwant\n%s", i, got, want)
+		}
+	}
+}
+
 func TestProbe_Rows(t *testing.T) {
 	okLook := func(string) (string, error) { return "/usr/bin/sandbox-exec", nil }
 	okRun := func(context.Context, string, ...string) error { return nil }
@@ -145,6 +186,16 @@ func TestProbe_Rows(t *testing.T) {
 			return errors.New("exit status 71: sandbox_apply: Operation not permitted")
 		}, false, "deny-all probe failed (exit status 71: sandbox_apply: Operation not permitted)"},
 		{"darwin with a working probe", "darwin", okLook, okRun, true, ""},
+		// #4855: a host whose Seatbelt accepts the network deny but rejects
+		// the signal grammar reports unavailable at the probe, so the runner
+		// degrades loudly pre-spawn instead of failing sandbox-exec at agent
+		// spawn.
+		{"darwin rejecting the signal grammar", "darwin", okLook, func(_ context.Context, _ string, args ...string) error {
+			if len(args) > 1 && strings.Contains(args[1], "(target same-sandbox)") {
+				return errors.New("exit status 65: sandbox-exec: unbound variable: same-sandbox")
+			}
+			return nil
+		}, false, "deny-all probe failed (exit status 65: sandbox-exec: unbound variable: same-sandbox)"},
 	}
 	for _, row := range rows {
 		t.Run(row.name, func(t *testing.T) {
@@ -169,6 +220,11 @@ func TestProbe_Rows(t *testing.T) {
 				}
 				if !strings.Contains(seen[2], denyClause) {
 					t.Fatalf("probe profile lacks the deny clause: %q", seen[2])
+				}
+				// The probe proves the host accepts the SAME signal grammar
+				// the runner applies (#4855).
+				if !strings.Contains(seen[2], signalClause) {
+					t.Fatalf("probe profile lacks the signal clause: %q", seen[2])
 				}
 			}
 			if row.goos != "darwin" && seen != nil {
@@ -764,5 +820,292 @@ func TestSeatbelt_DeniesCredentialSurfaces_ProxyPathSurvives(t *testing.T) {
 		deniedRead(t, filepath.Join(elsewhere, "config", "gh", "hosts.yml"), "H2-GH")
 		// (iii) through an alias symlink the profile never names.
 		deniedRead(t, filepath.Join(base, "alias-ssh", "id_test"), "H2-SSH")
+	})
+}
+
+// sigVictim is a throwaway process the TEST started — never a real daemon —
+// that a signal case tries to kill from inside the sandbox.
+type sigVictim struct {
+	pid  int
+	done chan struct{}
+}
+
+// alive reports whether the victim has not exited.
+func (v *sigVictim) alive() bool {
+	select {
+	case <-v.done:
+		return false
+	default:
+		return true
+	}
+}
+
+// TestSeatbelt_SignalConfinement_RefusesOutsideProcesses (#4855) is the
+// darwin-only end-to-end for WithSignalConfinement under the COMPOSED
+// acceptance profile (signal + credential deny + network rules): a REAL
+// sandbox-exec, a REAL egressproxy and httptest servers. Every victim is a
+// throwaway the test started — `/bin/sleep 3600.<unique>` for kill and pkill,
+// and a uniquely named symlink to /bin/sleep for killall, which matches by
+// process name only — and every by-name pattern is anchored to that unique
+// throwaway, so no case (the counterfactual arm included) can match any
+// other process on the host. Order: the by-pid kill first, then the by-name
+// pkill and killall against the throwaway pattern only. Every case asserts
+// its victim alive BEFORE the kill, and the counterfactual arm proves the
+// same kills land without the signal section.
+func TestSeatbelt_SignalConfinement_RefusesOutsideProcesses(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Seatbelt e2e is darwin-only (Linux has no signal confinement: stated residual)")
+	}
+	if _, err := exec.LookPath("sandbox-exec"); err != nil {
+		t.Skip("sandbox-exec not on PATH")
+	}
+	for _, bin := range []string{"/bin/sleep", "/bin/kill", "/usr/bin/pkill", "/usr/bin/killall", "/usr/bin/perl", "/usr/bin/curl", "/bin/sh", "/bin/ps"} {
+		if _, err := os.Stat(bin); err != nil {
+			t.Skipf("%s absent", bin)
+		}
+	}
+	if avail, reason := Probe(context.Background()); !avail {
+		t.Skipf("net sandbox unavailable on this host: %s", reason)
+	}
+
+	var forgeHits atomic.Int32
+	forge := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		forgeHits.Add(1)
+		w.WriteHeader(200)
+	}))
+	defer forge.Close()
+	preview := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { w.WriteHeader(200) }))
+	defer preview.Close()
+	proxy, err := egressproxy.Start(egressproxy.Config{AllowHosts: []string{strings.TrimPrefix(forge.URL, "http://")}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = proxy.Close() }()
+	home, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	render := func(t *testing.T, signals bool) string {
+		t.Helper()
+		opts := []ProfileOption{WithCredentialDeny(CredentialDeny{Homes: []string{home}, Files: true, SSHAgent: true})}
+		if signals {
+			opts = append(opts, WithSignalConfinement())
+		}
+		p, err := Profile(strings.TrimPrefix(proxy.URL(), "http://"), []string{strings.TrimPrefix(preview.URL, "http://")}, opts...)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	profile := render(t, true)
+	plain := []string{"PATH=/usr/bin:/bin"}
+
+	// unique keeps every victim's argv and name distinct from any other
+	// process on the host (and from every other victim in this test).
+	var seq atomic.Int32
+	unique := func() string {
+		return fmt.Sprintf("%d%d", os.Getpid()%100000, 1000+seq.Add(1))
+	}
+	// start launches argv unsandboxed (or, with sandboxed, under its own
+	// separate sandbox-exec instance of profile), waits until the process
+	// has exec'd into comm, and registers a cleanup kill.
+	start := func(t *testing.T, sandboxed bool, comm string, argv ...string) *sigVictim {
+		t.Helper()
+		if sandboxed {
+			argv = Wrap(argv, profile)
+		}
+		cmd := exec.Command(argv[0], argv[1:]...)
+		cmd.Env = plain
+		if err := cmd.Start(); err != nil {
+			t.Fatal(err)
+		}
+		v := &sigVictim{pid: cmd.Process.Pid, done: make(chan struct{})}
+		go func() { _ = cmd.Wait(); close(v.done) }()
+		t.Cleanup(func() { _ = cmd.Process.Kill(); <-v.done })
+		for deadline := time.Now().Add(10 * time.Second); ; {
+			out, _ := exec.Command("/bin/ps", "-o", "comm=", "-p", strconv.Itoa(v.pid)).Output()
+			if filepath.Base(strings.TrimSpace(string(out))) == comm {
+				break
+			}
+			if time.Now().After(deadline) || !v.alive() {
+				t.Fatalf("victim %v never became %q (precondition)", argv, comm)
+			}
+			time.Sleep(20 * time.Millisecond)
+		}
+		if !v.alive() {
+			t.Fatalf("victim %v not alive before the kill (precondition)", argv)
+		}
+		return v
+	}
+	sleepVictim := func(t *testing.T, sandboxed bool) (*sigVictim, string) {
+		t.Helper()
+		arg := "3600." + unique()
+		return start(t, sandboxed, "sleep", "/bin/sleep", arg), arg
+	}
+	// namedVictim is a /bin/sleep reached through a uniquely named symlink,
+	// so its process name — what killall matches — is unique.
+	namedVictim := func(t *testing.T) (*sigVictim, string) {
+		t.Helper()
+		name := "fhsig" + unique()
+		link := filepath.Join(t.TempDir(), name)
+		if err := os.Symlink("/bin/sleep", link); err != nil {
+			t.Fatal(err)
+		}
+		return start(t, false, name, link, "3600"), name
+	}
+	run := func(t *testing.T, p string, argv ...string) (int, string) {
+		t.Helper()
+		argv = Wrap(argv, p)
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		cmd := exec.CommandContext(ctx, argv[0], argv[1:]...)
+		cmd.Env = plain
+		// A descendant left holding the output pipe must not hang the test.
+		cmd.WaitDelay = 5 * time.Second
+		out, err := cmd.CombinedOutput()
+		var ee *exec.ExitError
+		if errors.As(err, &ee) {
+			return ee.ExitCode(), string(out)
+		} else if err != nil {
+			t.Fatalf("spawn %v: %v", argv, err)
+		}
+		return 0, string(out)
+	}
+	survives := func(t *testing.T, v *sigVictim) {
+		t.Helper()
+		select {
+		case <-v.done:
+			t.Fatalf("victim %d died — the sandbox delivered a signal outside its own instance", v.pid)
+		case <-time.After(300 * time.Millisecond):
+		}
+	}
+	dies := func(t *testing.T, v *sigVictim) {
+		t.Helper()
+		select {
+		case <-v.done:
+		case <-time.After(10 * time.Second):
+			t.Fatalf("victim %d survived the kill — the counterfactual fixture does not discriminate", v.pid)
+		}
+	}
+	pkillPattern := func(arg string) string { return "^/bin/sleep " + regexp.QuoteMeta(arg) + "$" }
+	const eperm = "Operation not permitted"
+
+	t.Run("a_kill_by_pid_refused", func(t *testing.T) {
+		v, _ := sleepVictim(t, false)
+		code, out := run(t, profile, "/bin/kill", "-TERM", strconv.Itoa(v.pid))
+		if code == 0 || !strings.Contains(out, eperm) {
+			t.Errorf("sandboxed kill: exit %d out %q, want non-zero naming %q", code, out, eperm)
+		}
+		survives(t, v)
+	})
+	t.Run("b_kill0_refused", func(t *testing.T) {
+		v, _ := sleepVictim(t, false)
+		if code, out := run(t, profile, "/bin/kill", "-0", strconv.Itoa(v.pid)); code == 0 || !strings.Contains(out, eperm) {
+			t.Errorf("sandboxed kill -0: exit %d out %q, want non-zero naming %q", code, out, eperm)
+		}
+		survives(t, v)
+	})
+	t.Run("c_pkill_by_throwaway_pattern_refused", func(t *testing.T) {
+		v, arg := sleepVictim(t, false)
+		// The EPERM names the victim's pid, proving pkill MATCHED it and the
+		// kernel refused the signal — not a pattern that matched nothing.
+		code, out := run(t, profile, "/usr/bin/pkill", "-TERM", "-f", pkillPattern(arg))
+		if code == 0 || !strings.Contains(out, strconv.Itoa(v.pid)) || !strings.Contains(out, eperm) {
+			t.Errorf("sandboxed pkill: exit %d out %q, want non-zero naming pid %d and %q", code, out, v.pid, eperm)
+		}
+		survives(t, v)
+	})
+	t.Run("d_killall_by_throwaway_name_refused", func(t *testing.T) {
+		v, name := namedVictim(t)
+		if code, out := run(t, profile, "/usr/bin/killall", "-TERM", name); code == 0 {
+			t.Errorf("sandboxed killall: exit %d out %q, want non-zero", code, out)
+		}
+		survives(t, v)
+	})
+	t.Run("e_separate_sandbox_instance_refused", func(t *testing.T) {
+		v, arg := sleepVictim(t, true)
+		if code, out := run(t, profile, "/bin/kill", "-TERM", strconv.Itoa(v.pid)); code == 0 || !strings.Contains(out, eperm) {
+			t.Errorf("kill across sandbox instances: exit %d out %q, want non-zero naming %q", code, out, eperm)
+		}
+		if code, out := run(t, profile, "/usr/bin/pkill", "-TERM", "-f", pkillPattern(arg)); code == 0 {
+			t.Errorf("pkill across sandbox instances: exit %d out %q, want non-zero", code, out)
+		}
+		survives(t, v)
+	})
+	t.Run("f_own_descendants_killable", func(t *testing.T) {
+		// Child, double-forked grandchild (re-parented to launchd once its
+		// subshell exits) and a process group the sandboxed shell created
+		// via setpgrp: all inside the sandbox instance, all killable.
+		// Each wait runs only after a successful kill, so a regression
+		// fails fast instead of blocking on a 3600 s sleep; the script
+		// prints every pid it started and the test reaps exactly those.
+		u := unique()
+		script := strings.Join([]string{
+			`/bin/sleep 3600.` + u + `1 >/dev/null 2>&1 & c=$!; echo pid=$c`,
+			`/bin/kill -TERM $c && { wait $c; echo child=$?; }`,
+			`g=$( (/bin/sleep 3600.` + u + `2 >/dev/null 2>&1 & echo $!) ); echo pid=$g; /bin/kill -0 $g && echo grandchild_alive`,
+			`/bin/kill -TERM $g && echo grandchild_signalled`,
+			// pgrep, not kill -0 (an EPERM also fails it) and not the setuid
+			// /bin/ps (sandbox-exec refuses a setuid exec under any profile).
+			`i=0; while /usr/bin/pgrep -f '^/bin/sleep 3600\.` + u + `2$' >/dev/null && [ $i -lt 100 ]; do /bin/sleep 0.05; i=$((i+1)); done`,
+			`/usr/bin/pgrep -f '^/bin/sleep 3600\.` + u + `2$' >/dev/null || echo grandchild_gone`,
+			`/usr/bin/perl -e 'setpgrp(0,0); exec "/bin/sleep", "3600.` + u + `3"' >/dev/null 2>&1 & p=$!; echo pid=$p; /bin/sleep 0.2`,
+			`/bin/kill -TERM -- -$p && { wait $p; echo pgroup=$?; }`,
+		}, "\n")
+		code, out := run(t, profile, "/bin/sh", "-c", script)
+		for _, line := range strings.Split(out, "\n") {
+			pid, err := strconv.Atoi(strings.TrimPrefix(line, "pid="))
+			if err != nil || !strings.HasPrefix(line, "pid=") || pid <= 1 {
+				continue
+			}
+			// Reap only a pid still running THIS case's unique sleep, so a
+			// recycled pid is never signalled.
+			cmdline, _ := exec.Command("/bin/ps", "-o", "command=", "-p", strconv.Itoa(pid)).Output()
+			if strings.HasPrefix(strings.TrimSpace(string(cmdline)), "/bin/sleep 3600."+u) {
+				_ = syscall.Kill(pid, syscall.SIGKILL)
+			}
+		}
+		for _, want := range []string{"child=143", "grandchild_alive", "grandchild_signalled", "grandchild_gone", "pgroup=143"} {
+			if !strings.Contains(out, want) {
+				t.Errorf("own-descendant kills: exit %d out %q, missing %q", code, out, want)
+			}
+		}
+	})
+	t.Run("g_admitted_port_and_proxy_survive", func(t *testing.T) {
+		curl := []string{"/usr/bin/curl", "-s", "-o", "/dev/null", "-w", "%{http_code}", "-m", "5"}
+		if code, out := run(t, profile, append(curl, preview.URL+"/")...); code != 0 || out != "200" {
+			t.Errorf("admitted preview port: exit %d out %q, want 0/200", code, out)
+		}
+		cmd := exec.Command("sandbox-exec", append([]string{"-p", profile}, append(curl, forge.URL+"/")...)...)
+		cmd.Env = []string{"http_proxy=" + proxy.URL(), "PATH=/usr/bin"}
+		if out, err := cmd.CombinedOutput(); err != nil || string(out) != "200" {
+			t.Errorf("forge via proxy: err %v out %q, want 200", err, out)
+		}
+		if n := forgeHits.Load(); n != 1 {
+			t.Errorf("forge hits = %d, want 1 (through the proxy)", n)
+		}
+	})
+	t.Run("h_counterfactual_without_signal_section_kills", func(t *testing.T) {
+		// The SAME kills under the composed profile rendered WITHOUT
+		// WithSignalConfinement land: the fixture discriminates.
+		cf := render(t, false)
+		if strings.Contains(cf, "signal") {
+			t.Fatalf("counterfactual profile carries a signal rule:\n%s", cf)
+		}
+		v, _ := sleepVictim(t, false)
+		if code, out := run(t, cf, "/bin/kill", "-TERM", strconv.Itoa(v.pid)); code != 0 {
+			t.Errorf("counterfactual kill: exit %d out %q, want 0", code, out)
+		}
+		dies(t, v)
+		v, arg := sleepVictim(t, false)
+		if code, out := run(t, cf, "/usr/bin/pkill", "-TERM", "-f", pkillPattern(arg)); code != 0 {
+			t.Errorf("counterfactual pkill: exit %d out %q, want 0", code, out)
+		}
+		dies(t, v)
+		v, name := namedVictim(t)
+		if code, out := run(t, cf, "/usr/bin/killall", "-TERM", name); code != 0 {
+			t.Errorf("counterfactual killall: exit %d out %q, want 0", code, out)
+		}
+		dies(t, v)
 	})
 }

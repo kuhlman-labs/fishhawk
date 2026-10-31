@@ -9,8 +9,8 @@
 -- INSERT so a campaign can never exist unprovenanced — campaign.Persist is not
 -- transactional and the audit emit is best-effort after it. NULL for every
 -- epic_ref / explicit-items campaign.
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
-VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind)
+VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10)
 RETURNING *;
 
 -- name: CreateCampaignGuardedByGroomingCurrency :one
@@ -36,10 +36,10 @@ RETURNING *;
 -- must change together. A zero-row result means the guard refused (the INSERT is
 -- otherwise unconditional, so no other outcome yields no row); the adapter maps
 -- it to campaign.ErrGroomingOrderSuperseded.
-INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source)
+INSERT INTO campaigns (id, repo, epic_ref, state, pause_policy, operator_agent, idempotency_key, working_dir, grooming_source, runner_kind)
 SELECT
     sqlc.arg(id), sqlc.arg(repo), sqlc.arg(epic_ref), sqlc.arg(state), sqlc.arg(pause_policy),
-    sqlc.arg(operator_agent), sqlc.narg(idempotency_key), sqlc.arg(working_dir), sqlc.arg(grooming_source)
+    sqlc.arg(operator_agent), sqlc.narg(idempotency_key), sqlc.arg(working_dir), sqlc.arg(grooming_source), sqlc.arg(runner_kind)
 WHERE NOT EXISTS (
     SELECT 1
       FROM runs newer

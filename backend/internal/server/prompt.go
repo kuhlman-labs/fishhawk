@@ -200,7 +200,9 @@ type promptResponse struct {
 	// FixupExpectedHeadSHA is the run's recorded head — the newest head_sha
 	// across the run's reported-head ledger (pull_request_opened /
 	// child_pushed / fixup_pushed audit entries, the same source the ADR-035
-	// branch-lineage verifier treats as the run's legitimate tips). Set only
+	// branch-lineage verifier treats as the run's legitimate tips), advanced
+	// through the clean branch_rebased base merges recorded after it (E89.6 /
+	// #4574, resolveFixupExpectedHeadSHA). Set only
 	// when Fixup is true so the runner can verify the fetched PR-branch tip
 	// IS the stage's recorded head before invoking the agent (#967). Empty
 	// when resolution fails (WARN-and-proceed) — the runner then skips the
@@ -5052,8 +5054,22 @@ func (s *Server) resolveStageGateEvidence(ctx context.Context, runID, stageID uu
 // head_sha, or on any read error — best-effort WARN-and-proceed, same
 // posture as the other prompt resolvers. The runner then skips the SHA
 // comparison (checkout only) rather than blocking the pass.
+//
+// E89.6 / #4574: a Fishhawk-recorded base merge counts as fix-up lineage.
+// fishhawk_rebase_run_branch (and the ADR-092 queue's auto-advance) records
+// its merge commit as a branch_rebased row, which is not a reported-head
+// category, so the seed alone would make every fix-up after a rebase fail the
+// runner's ADR-035 tip check (fixup_base_mismatch, run 3fa73698). The seed is
+// therefore advanced through the CLEAN branch_rebased / branch_reset rows
+// recorded AFTER it (advanceFixupHeadThroughBaseMerges). A rebase alone never
+// invents a head: with no seed the field stays "". The acceptance resolvers
+// keep the un-advanced seed.
 func (s *Server) resolveFixupExpectedHeadSHA(ctx context.Context, runID, stageID uuid.UUID) string {
-	return s.resolveNewestReportedHeadSHA(ctx, runID, stageID, "fixup_expected_head_sha")
+	seed, seedSHA := s.newestReportedHead(ctx, runID, stageID, "fixup_expected_head_sha")
+	if seed == nil {
+		return ""
+	}
+	return s.advanceFixupHeadThroughBaseMerges(ctx, runID, stageID, seed.Sequence, seedSHA)
 }
 
 // resolveConsolidatedFanInHeadSHA resolves a DECOMPOSED PARENT's
@@ -6138,8 +6154,17 @@ func (s *Server) resolveAcceptanceRunBranchAndPR(ctx context.Context, runID, sta
 // as the omitted wire field) when the AuditRepo is unconfigured, no entry
 // carries a head_sha, or on any read error.
 func (s *Server) resolveNewestReportedHeadSHA(ctx context.Context, runID, stageID uuid.UUID, forField string) string {
+	_, sha := s.newestReportedHead(ctx, runID, stageID, forField)
+	return sha
+}
+
+// newestReportedHead is resolveNewestReportedHeadSHA's walk returning the
+// winning entry as well as its head_sha, so the fix-up resolver can order
+// later rows against the seed's chain sequence (E89.6 / #4574). It returns
+// (nil, "") on every case resolveNewestReportedHeadSHA resolves "".
+func (s *Server) newestReportedHead(ctx context.Context, runID, stageID uuid.UUID, forField string) (*audit.Entry, string) {
 	if s.cfg.AuditRepo == nil {
-		return ""
+		return nil, ""
 	}
 	var newest *audit.Entry
 	var newestSHA string
@@ -6154,7 +6179,7 @@ func (s *Server) resolveNewestReportedHeadSHA(ctx context.Context, runID, stageI
 				slog.String("category", cat),
 				slog.String("error", err.Error()),
 			)
-			return ""
+			return nil, ""
 		}
 		for _, e := range entries {
 			var payload struct {
@@ -6177,9 +6202,9 @@ func (s *Server) resolveNewestReportedHeadSHA(ctx context.Context, runID, stageI
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 		)
-		return ""
+		return nil, ""
 	}
-	return newestSHA
+	return newest, newestSHA
 }
 
 // resolveFixupAllowCreate returns the net-new file paths the operator

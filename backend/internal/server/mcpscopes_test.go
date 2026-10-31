@@ -659,3 +659,37 @@ func TestMCPToolScopeTable_GetMergeQueueMirrorsHandler(t *testing.T) {
 		t.Error("row admits a run-bound token the handler refuses")
 	}
 }
+
+// TestMCPToolScopeTable_RecordEscapeRequiresWriteRuns pins the
+// fishhawk_record_escape row (E94.3 / #4694) to {anyOf: [write:runs]} with no
+// runBoundSubjectOK, mirroring escape.go handleRecordEscape: it refuses every
+// run-bound subject (run_token_forbidden) and then requires write:runs. A
+// read-scoped operator bearer and a run-bound token at its full minted
+// vocabulary are REFUSED; a write:runs operator bearer is ADMITTED.
+func TestMCPToolScopeTable_RecordEscapeRequiresWriteRuns(t *testing.T) {
+	rule, ok := mcpToolScopeFor("fishhawk_record_escape")
+	if !ok {
+		t.Fatal("fishhawk_record_escape: no mcpToolScopes entry; it would be refused mcp_tool_not_authorized at runtime")
+	}
+	if len(rule.anyOf) != 1 || rule.anyOf[0] != "write:runs" {
+		t.Fatalf("rule.anyOf = %v, want exactly [write:runs] (escape.go requireWriteScope)", rule.anyOf)
+	}
+	if rule.runBoundSubjectOK {
+		t.Fatal("runBoundSubjectOK is set, but handleRecordEscape refuses every run-bound subject 403 run_token_forbidden")
+	}
+	readOnlyOperator := Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"read:runs"}}
+	if rule.satisfiedBy(readOnlyOperator) {
+		t.Errorf("a read:runs-only operator bearer is ADMITTED, but the REST endpoint refuses it 403 insufficient_scope")
+	}
+	runBound := Identity{
+		Subject: "mcp:run:33333333-3333-3333-3333-333333333333",
+		TokenID: "tok",
+		Scopes:  []string{scopeRunBoundRead, scopeRunBoundRetry, scopeRunBoundScopeAmendments, scopeRunBoundMessages},
+	}
+	if rule.satisfiedBy(runBound) {
+		t.Errorf("a run-bound fhm_ token (%s) is ADMITTED, but the REST endpoint refuses it", strings.Join(runBound.Scopes, " "))
+	}
+	if !rule.satisfiedBy(Identity{Subject: "svc:operator", TokenID: "tok", Scopes: []string{"write:runs"}}) {
+		t.Error("an operator bearer holding write:runs is REFUSED by the gate, but the REST endpoint admits it")
+	}
+}

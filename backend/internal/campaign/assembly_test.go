@@ -507,6 +507,30 @@ func TestPersist_ThreadsWorkingDir(t *testing.T) {
 	}
 }
 
+// TestPersist_ThreadsRunnerKind pins the campaign-level runner kind (#4485)
+// crossing Assembly → CreateCampaignParams: an unset kind stays "" (not
+// recorded, so every existing call site persists the default), and a set value
+// passes through verbatim — validation is the REST handler's.
+func TestPersist_ThreadsRunnerKind(t *testing.T) {
+	fEmpty := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), fEmpty, "acme/widgets",
+		&campaign.Assembly{EpicRef: "issue:7"}); err != nil {
+		t.Fatalf("Persist (no runner kind): %v", err)
+	}
+	if fEmpty.got.RunnerKind != "" {
+		t.Errorf("unrecorded campaign persisted RunnerKind %q, want \"\"", fEmpty.got.RunnerKind)
+	}
+
+	f := &capturingFake{}
+	if _, err := campaign.Persist(context.Background(), f, "acme/widgets",
+		&campaign.Assembly{EpicRef: "issue:7", RunnerKind: "local"}); err != nil {
+		t.Fatalf("Persist (runner kind): %v", err)
+	}
+	if f.got.RunnerKind != "local" {
+		t.Errorf("RunnerKind persisted as %q, want %q", f.got.RunnerKind, "local")
+	}
+}
+
 // persistItemErrFake creates a campaign successfully but fails every item
 // insert, so Persist reaches the create-item error branch.
 type persistItemErrFake struct{ campaign.BaseFake }

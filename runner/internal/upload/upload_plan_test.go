@@ -11,6 +11,8 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -37,7 +39,9 @@ type planFakeBackend struct {
 	receivedBody []byte
 	receivedSig  string
 	receivedPath string
-	calls        int
+	// receivedHeader is the last request's full header set.
+	receivedHeader http.Header
+	calls          int
 }
 
 func newPlanFakeBackend(t *testing.T) (*planFakeBackend, *httptest.Server) {
@@ -60,6 +64,7 @@ func newPlanFakeBackend(t *testing.T) (*planFakeBackend, *httptest.Server) {
 		pf.receivedBody = raw
 		pf.receivedSig = r.Header.Get("X-Fishhawk-Signature")
 		pf.receivedPath = r.URL.Path
+		pf.receivedHeader = r.Header.Clone()
 		pf.mu.Unlock()
 
 		w.Header().Set("Content-Type", "application/json")
@@ -138,6 +143,60 @@ func TestShipPlan_HappyPath_Created(t *testing.T) {
 	wantSig := hex.EncodeToString(ed25519.Sign(priv, digest[:]))
 	if pf.receivedSig != wantSig {
 		t.Errorf("signature mismatch")
+	}
+}
+
+// TestShipPlan_SendsSeedHeader (#4436): a non-empty SeedSHA rides in the
+// header named by the shared wire fixture testdata/wire/plan_seed_header.json
+// (the backend's planSeedHeader is pinned to the same fixture); an empty one
+// sends no such header. Deleting the Header.Set leaves it absent → RED.
+func TestShipPlan_SendsSeedHeader(t *testing.T) {
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "plan_seed_header.json"))
+	if err != nil {
+		t.Fatalf("read shared fixture: %v", err)
+	}
+	var fx struct {
+		Header  string `json:"header"`
+		SeedSHA string `json:"seed_sha"`
+	}
+	if err := json.Unmarshal(raw, &fx); err != nil {
+		t.Fatalf("decode shared fixture: %v", err)
+	}
+	if fx.Header == "" || fx.SeedSHA == "" {
+		t.Fatalf("fixture precondition: header and seed_sha must be set: %+v", fx)
+	}
+	if PlanSeedHeader != fx.Header {
+		t.Errorf("PlanSeedHeader = %q, fixture header = %q", PlanSeedHeader, fx.Header)
+	}
+	for _, tc := range []struct {
+		name string
+		seed string
+	}{
+		{"seed set", fx.SeedSHA},
+		{"seed empty", ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			pf, srv := newPlanFakeBackend(t)
+			priv, _ := makePlanKey(t)
+			if _, err := quickPlanClient(srv).ShipPlan(context.Background(), ShipPlanArgs{
+				RunID: "run-abc", StageID: "stage-xyz", Plan: []byte(`{"plan_version":"standard_v1"}`),
+				PrivateKey: priv, SeedSHA: tc.seed,
+			}); err != nil {
+				t.Fatalf("ShipPlan: %v", err)
+			}
+			pf.mu.Lock()
+			vals, present := pf.receivedHeader[http.CanonicalHeaderKey(fx.Header)]
+			pf.mu.Unlock()
+			if tc.seed == "" {
+				if present {
+					t.Errorf("empty SeedSHA must send no %s header, got %v", fx.Header, vals)
+				}
+				return
+			}
+			if len(vals) != 1 || vals[0] != tc.seed {
+				t.Errorf("%s = %v, want [%s]", fx.Header, vals, tc.seed)
+			}
+		})
 	}
 }
 

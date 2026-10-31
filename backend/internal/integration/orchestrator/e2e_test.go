@@ -37,6 +37,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/childcompletion"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -888,12 +889,12 @@ func TestDecomposition_E2E_ConsolidatedPR(t *testing.T) {
 	gh := &recordingGitHub{}
 
 	o := &orchestrator.Orchestrator{
-		Runs:       runRepo,
-		Artifacts:  artifactRepo,
-		Audit:      auditRepo,
-		GitHub:     gh,
-		DefaultRef: "main",
-		Logger:     slog.Default(),
+		Runs:          runRepo,
+		Artifacts:     artifactRepo,
+		Audit:         auditRepo,
+		GitHub:        gh,
+		DefaultBranch: defaultbranch.Static("main"),
+		Logger:        slog.Default(),
 	}
 	sw := &childcompletion.Sweeper{
 		Runs:    runRepo,
@@ -1008,12 +1009,12 @@ func TestDecomposition_E2E_FanInHappyPath(t *testing.T) {
 	gh := &recordingGitHub{branchSHAs: map[string]string{"main": "basesha"}}
 
 	o := &orchestrator.Orchestrator{
-		Runs:       runRepo,
-		Artifacts:  artifactRepo,
-		Audit:      auditRepo,
-		GitHub:     gh,
-		DefaultRef: "main",
-		Logger:     slog.Default(),
+		Runs:          runRepo,
+		Artifacts:     artifactRepo,
+		Audit:         auditRepo,
+		GitHub:        gh,
+		DefaultBranch: defaultbranch.Static("main"),
+		Logger:        slog.Default(),
 	}
 	sw := &childcompletion.Sweeper{
 		Runs:      runRepo,
@@ -1102,12 +1103,12 @@ func TestDecomposition_E2E_FanInConflict(t *testing.T) {
 	gh := &recordingGitHub{branchSHAs: map[string]string{"main": "basesha"}}
 
 	o := &orchestrator.Orchestrator{
-		Runs:       runRepo,
-		Artifacts:  artifactRepo,
-		Audit:      auditRepo,
-		GitHub:     gh,
-		DefaultRef: "main",
-		Logger:     slog.Default(),
+		Runs:          runRepo,
+		Artifacts:     artifactRepo,
+		Audit:         auditRepo,
+		GitHub:        gh,
+		DefaultBranch: defaultbranch.Static("main"),
+		Logger:        slog.Default(),
 	}
 	sw := &childcompletion.Sweeper{
 		Runs:      runRepo,
@@ -1246,11 +1247,11 @@ func TestDecomposition_E2E_ConsolidatedReviewGatesParentMerge(t *testing.T) {
 	apiRepo := apitoken.NewPostgresRepository(pool)
 
 	o := &orchestrator.Orchestrator{
-		Runs:       runRepo,
-		Artifacts:  artifactRepo,
-		Audit:      auditRepo,
-		DefaultRef: "main",
-		Logger:     slog.Default(),
+		Runs:          runRepo,
+		Artifacts:     artifactRepo,
+		Audit:         auditRepo,
+		DefaultBranch: defaultbranch.Static("main"),
+		Logger:        slog.Default(),
 	}
 
 	// Compare-endpoint stub: the consolidated base...head diff GitHub
@@ -1533,11 +1534,11 @@ func TestDecomposition_E2E_CategoryBChildRecoverInPlace(t *testing.T) {
 	apiRepo := apitoken.NewPostgresRepository(pool)
 
 	o := &orchestrator.Orchestrator{
-		Runs:       runRepo,
-		Artifacts:  artifactRepo,
-		Audit:      auditRepo,
-		DefaultRef: "main",
-		Logger:     slog.Default(),
+		Runs:          runRepo,
+		Artifacts:     artifactRepo,
+		Audit:         auditRepo,
+		DefaultBranch: defaultbranch.Static("main"),
+		Logger:        slog.Default(),
 	}
 	srv := server.New(server.Config{
 		Addr:               "127.0.0.1:0",

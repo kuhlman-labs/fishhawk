@@ -22,8 +22,17 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/procgroup"
 )
 
-// Loader loads the Go import graph of one workspace checkout.
+// ErrUnsupportedLanguage marks a workspace no import-graph adapter applies
+// to. Classify refuses it as `undecidable:unsupported_language` (ADR-124 D3)
+// before any path rule, so a repository without a supported adapter never
+// reaches independent.
+var ErrUnsupportedLanguage = errors.New("basedelta: no supported import-graph adapter for the workspace")
+
+// Loader loads the import graph of one workspace checkout.
 type Loader interface {
+	// Supports reports whether an adapter applies to the WORKSPACE: nil, or
+	// an error wrapping ErrUnsupportedLanguage (or a resolution error).
+	Supports(workspaceDir string) error
 	Load(ctx context.Context, workspaceDir string) (*Graph, error)
 }
 
@@ -37,7 +46,11 @@ const killGrace = 2 * time.Second
 // stderrTail bounds how much of a failed go command's stderr an error carries.
 const stderrTail = 512
 
-// GoListLoader loads a workspace graph with the go toolchain.
+// GoListLoader loads a workspace graph with the go toolchain. It is the Go
+// adapter: it applies only to a workspace with a go.work or go.mod AT ITS
+// ROOT (a Go module elsewhere in the tree is not enough, ADR-124 D3), and
+// Load refuses any other workspace with ErrUnsupportedLanguage before any go
+// command runs, so it never returns an empty graph for one.
 //
 // It runs `go list -e -json` once, in the HOST build context, over every
 // go.work module (or the root module), and then parses the import clauses of
@@ -80,15 +93,44 @@ type workEdit struct {
 	Use []struct{ DiskPath string }
 }
 
-// Load implements Loader.
-func (l *GoListLoader) Load(ctx context.Context, workspaceDir string) (*Graph, error) {
+// resolveWorkspace is the absolute, symlink-free workspace root.
+func resolveWorkspace(workspaceDir string) (string, error) {
 	abs, err := filepath.Abs(workspaceDir)
 	if err != nil {
-		return nil, fmt.Errorf("workspace %q: %w", workspaceDir, err)
+		return "", fmt.Errorf("workspace %q: %w", workspaceDir, err)
 	}
 	root, err := filepath.EvalSymlinks(abs)
 	if err != nil {
-		return nil, fmt.Errorf("workspace %q: %w", workspaceDir, err)
+		return "", fmt.Errorf("workspace %q: %w", workspaceDir, err)
+	}
+	return root, nil
+}
+
+// goAdapter reports whether the Go adapter applies to the workspace root.
+func goAdapter(root string) error {
+	if fileExists(filepath.Join(root, "go.work")) || fileExists(filepath.Join(root, "go.mod")) {
+		return nil
+	}
+	return fmt.Errorf("%w: no go.work or go.mod at the workspace root", ErrUnsupportedLanguage)
+}
+
+// Supports implements Loader.
+func (*GoListLoader) Supports(workspaceDir string) error {
+	root, err := resolveWorkspace(workspaceDir)
+	if err != nil {
+		return err
+	}
+	return goAdapter(root)
+}
+
+// Load implements Loader.
+func (l *GoListLoader) Load(ctx context.Context, workspaceDir string) (*Graph, error) {
+	root, err := resolveWorkspace(workspaceDir)
+	if err != nil {
+		return nil, err
+	}
+	if err := goAdapter(root); err != nil {
+		return nil, err
 	}
 	goBin := l.GoBin
 	if goBin == "" {
@@ -127,10 +169,8 @@ func (l *GoListLoader) Load(ctx context.Context, workspaceDir string) (*Graph, e
 		if len(uses) == 0 {
 			return nil, errors.New("go.work lists no modules")
 		}
-	case fileExists(filepath.Join(root, "go.mod")):
-		uses = []string{"."}
 	default:
-		return NewGraph(nil), nil
+		uses = []string{"."}
 	}
 
 	args := []string{"list", "-e", "-json=ImportPath,Dir,Module,Imports,TestImports,XTestImports,Error,DepsErrors,Incomplete"}

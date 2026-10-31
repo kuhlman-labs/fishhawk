@@ -12,6 +12,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -2523,6 +2524,19 @@ type fakeConcernRepo struct {
 	// applyResolutionErr, when set, makes ApplyResolution fail without
 	// transitioning — the #3395 recovery's per-row best-effort branch.
 	applyResolutionErr error
+	// applyDispositionErr, when set, makes ApplyDisposition fail without
+	// transitioning — the system writers' per-row best-effort branch.
+	applyDispositionErr error
+	// applyHumanDispositionErr, when set, makes ApplyHumanDisposition fail
+	// without transitioning — the human verbs' store-failure branch.
+	applyHumanDispositionErr error
+	// applyLabelErr, when set, makes ApplyLabel fail without writing — the
+	// relabel verb's store-failure branch (E94.8 / #4841).
+	applyLabelErr error
+	// importErr / stampErr, when set, make ImportRolledUp / StampOpenAtMerge
+	// fail without writing (E94.1 / #4692 failure-mode tests).
+	importErr error
+	stampErr  error
 }
 
 func newFakeConcernRepo() *fakeConcernRepo { return &fakeConcernRepo{} }
@@ -2633,10 +2647,20 @@ func (f *fakeConcernRepo) MarkAddressedPending(ctx context.Context, ids []uuid.U
 		if err := concern.Transition(row.State, concern.StateAddressedPending); err != nil {
 			return err
 		}
+		clearStaleFixedOnReopen(row, concern.StateAddressedPending)
 		row.State = concern.StateAddressedPending
 		row.StateReason = reason
 	}
 	return nil
+}
+
+// clearStaleFixedOnReopen mirrors UpdateReviewConcernState's NULL-outcome arm
+// (E94.2 / #4693): a move back into an open state clears an outcome of exactly
+// fixed; every other outcome is kept.
+func clearStaleFixedOnReopen(row *concern.Concern, to concern.State) {
+	if to.IsOpen() && row.Outcome == concern.OutcomeFixed {
+		row.Outcome = ""
+	}
 }
 
 func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to concern.State, reason string) (*concern.Concern, error) {
@@ -2653,9 +2677,227 @@ func (f *fakeConcernRepo) ApplyResolution(ctx context.Context, id uuid.UUID, to 
 	if err := concern.Transition(row.State, to); err != nil {
 		return nil, err
 	}
+	clearStaleFixedOnReopen(row, to)
 	row.State = to
 	row.StateReason = reason
 	return row, nil
+}
+
+// ApplyDisposition mirrors the store (E94.2 / #4693): an empty outcome is
+// refused before any write; otherwise the same transition as ApplyResolution
+// plus the outcome. It writes state, state_reason and outcome ONLY — never a
+// judgement field — so the fake stays honest to the store.
+func (f *fakeConcernRepo) ApplyDisposition(ctx context.Context, id uuid.UUID, to concern.State, reason string, d concern.Disposition) (*concern.Concern, error) {
+	if f.applyDispositionErr != nil {
+		return nil, f.applyDispositionErr
+	}
+	if d.Outcome == "" {
+		return nil, errors.New("fake concern: apply disposition: outcome required")
+	}
+	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := rows[0]
+	if err := concern.Transition(row.State, to); err != nil {
+		return nil, err
+	}
+	row.State = to
+	row.StateReason = reason
+	row.Outcome = d.Outcome
+	return row, nil
+}
+
+// ApplyHumanDisposition mirrors the store (E94.7 / #4840): d.Validate() runs
+// before any read or write, the edge is validated by the real machine, and the
+// outcome plus every judgement field is recorded in one step, with backfill
+// written false and DuplicateOf untouched.
+func (f *fakeConcernRepo) ApplyHumanDisposition(ctx context.Context, id uuid.UUID, to concern.State, reason string, d concern.HumanDisposition) (*concern.Concern, error) {
+	if f.applyHumanDispositionErr != nil {
+		return nil, f.applyHumanDispositionErr
+	}
+	if err := d.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	row := rows[0]
+	if err := concern.Transition(row.State, to); err != nil {
+		return nil, err
+	}
+	row.State = to
+	row.StateReason = reason
+	row.Outcome = d.Outcome
+	row.Judgement = d.Judgement
+	row.JudgementActorKind = d.ActorKind
+	row.JudgementDelegated = d.Delegated
+	row.JudgementBulk = d.JudgementBulk
+	row.JudgementBackfill = false
+	row.TradeoffCost = d.TradeoffCost
+	return row, nil
+}
+
+// ApplyLabel mirrors the store (E94.8 / #4841): l.Validate() before any read,
+// the labelled row read (ErrNotFound when absent), a duplicate's target read
+// and concern.CheckDuplicateTarget applied (a missing target refused exactly
+// like a foreign one, never ErrNotFound), the RAW prior judgement and
+// duplicate_of compared (concern.ErrLabelConflict on a mismatch, nothing
+// written), then the same column writes as SetReviewConcernLabel. It never
+// touches State, StateReason, Outcome or UpdatedAt.
+func (f *fakeConcernRepo) ApplyLabel(ctx context.Context, id uuid.UUID, l concern.Label) (*concern.Concern, error) {
+	if f.applyLabelErr != nil {
+		return nil, f.applyLabelErr
+	}
+	if err := l.Validate(); err != nil {
+		return nil, err
+	}
+	rows, err := f.GetByIDs(ctx, []uuid.UUID{id})
+	if err != nil {
+		return nil, err
+	}
+	row := rows[0]
+	judgement, cost := l.Judgement, l.TradeoffCost
+	if l.DuplicateOf != nil {
+		var target *concern.Concern
+		targets, err := f.GetByIDs(ctx, []uuid.UUID{*l.DuplicateOf})
+		switch {
+		case errors.Is(err, concern.ErrNotFound):
+		case err != nil:
+			return nil, err
+		default:
+			target = targets[0]
+		}
+		if err := concern.CheckDuplicateTarget(row, target); err != nil {
+			return nil, err
+		}
+		judgement, cost = concern.JudgementUnlabelled, ""
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if row.Judgement != l.PriorJudgement || !sameOptionalUUID(row.DuplicateOf, l.PriorDuplicateOf) {
+		return nil, fmt.Errorf("%w: fake concern %s", concern.ErrLabelConflict, row.ID)
+	}
+	row.Judgement = judgement
+	row.JudgementActorKind = l.ActorKind
+	row.JudgementDelegated = false
+	row.JudgementBulk = false
+	row.JudgementBackfill = l.Backfill
+	row.TradeoffCost = cost
+	if l.DuplicateOf != nil {
+		dup := *l.DuplicateOf
+		row.DuplicateOf = &dup
+	} else {
+		row.DuplicateOf = nil
+	}
+	return row, nil
+}
+
+// sameOptionalUUID is SQL's IS NOT DISTINCT FROM over two optional ids.
+func sameOptionalUUID(a, b *uuid.UUID) bool {
+	if a == nil || b == nil {
+		return a == nil && b == nil
+	}
+	return *a == *b
+}
+
+// ImportRolledUp mirrors the store's semantics (E94.1 / #4692): a copy per
+// source on the parent run and stage, deduped on (run_id, rolled_up_from), a
+// source whose STORED row is no longer open skipped, and the outcome of every
+// source with a copy set to carried (also when its copy already existed).
+func (f *fakeConcernRepo) ImportRolledUp(_ context.Context, p concern.ImportRolledUpParams) ([]*concern.Concern, error) {
+	if f.importErr != nil {
+		return nil, f.importErr
+	}
+	if p.ParentRunID == uuid.Nil || p.ParentStageID == uuid.Nil {
+		return nil, errors.New("fake concern: parent run and stage required")
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var out []*concern.Concern
+	for _, src := range p.Sources {
+		if src == nil {
+			continue
+		}
+		exists, srcOpen := false, false
+		for _, row := range f.rows {
+			if row.RunID == p.ParentRunID && row.RolledUpFrom != nil && *row.RolledUpFrom == src.ID {
+				exists = true
+			}
+			if row.ID == src.ID && row.State.IsOpen() {
+				srcOpen = true
+			}
+		}
+		if !exists && !srcOpen {
+			continue
+		}
+		if !exists {
+			from := src.ID
+			cp := &concern.Concern{
+				ID:                   uuid.New(),
+				RunID:                p.ParentRunID,
+				StageID:              p.ParentStageID,
+				StageKind:            concern.StageKindImplement,
+				OriginReviewSequence: src.OriginReviewSequence,
+				ReviewerModel:        src.ReviewerModel,
+				Severity:             src.Severity,
+				Category:             src.Category,
+				Note:                 src.Note,
+				State:                concern.StateRaised,
+				StateReason:          concern.RolledUpStateReason(src),
+				SuggestedPatch:       src.SuggestedPatch,
+				NewEvidence:          src.NewEvidence,
+				SettledRef:           src.SettledRef,
+				ReviewerRole:         src.ReviewerRole,
+				QuoteUnverified:      src.QuoteUnverified,
+				SeverityClampedFrom:  src.SeverityClampedFrom,
+				Provenance:           src.Provenance,
+				CheckKey:             src.CheckKey,
+				RolledUpFrom:         &from,
+			}
+			f.rows = append(f.rows, cp)
+			out = append(out, cp)
+		}
+		for _, row := range f.rows {
+			if row.ID == src.ID && (row.Outcome == "" || row.Outcome == concern.OutcomeCarried) {
+				row.Outcome = concern.OutcomeCarried
+			}
+		}
+	}
+	return out, nil
+}
+
+// StampOpenAtMerge mirrors the store's state and outcome filter (E94.1 /
+// #4692): open or superseded rows of the given runs with no outcome recorded.
+func (f *fakeConcernRepo) StampOpenAtMerge(_ context.Context, runIDs []uuid.UUID) (int64, error) {
+	if f.stampErr != nil {
+		return 0, f.stampErr
+	}
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	var n int64
+	for _, row := range f.rows {
+		in := false
+		for _, id := range runIDs {
+			if row.RunID == id {
+				in = true
+				break
+			}
+		}
+		if !in || row.Outcome != "" {
+			continue
+		}
+		if row.State.IsOpen() || row.State == concern.StateSuperseded {
+			row.Outcome = concern.OutcomeOpenAtMerge
+			n++
+		}
+	}
+	return n, nil
 }
 
 // seedConcernRow inserts one concern row directly, returning it.
@@ -2673,6 +2915,161 @@ func seedConcernRow(t *testing.T, cr *fakeConcernRepo, runID, stageID uuid.UUID,
 		t.Fatalf("seed concern: %v", err)
 	}
 	return rows[0]
+}
+
+// TestFakeConcernRepo_MirrorsDispositionStore keeps the fake honest to the
+// store's E94.2 / #4693 semantics so server tests cannot diverge from it: an
+// empty-outcome disposition is refused with nothing written, a confirm records
+// fixed and leaves the judgement alone, and a reopen clears exactly fixed
+// (concern/postgres_test.go TestUpdateState_ReopenClearsFixedOutcome pins the
+// store side).
+func TestFakeConcernRepo_MirrorsDispositionStore(t *testing.T) {
+	ctx := context.Background()
+	cr := newFakeConcernRepo()
+	runID, stageID := uuid.New(), uuid.New()
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 1, "n")
+	if err := cr.MarkAddressedPending(ctx, []uuid.UUID{row.ID}, "routed"); err != nil {
+		t.Fatalf("route: %v", err)
+	}
+	row.Judgement = concern.JudgementDefect
+	if _, err := cr.ApplyDisposition(ctx, row.ID, concern.StateAddressed, "confirmed", concern.Disposition{}); err == nil {
+		t.Error("empty-outcome ApplyDisposition returned nil error, want a refusal")
+	}
+	if row.State != concern.StateAddressedPending || row.Outcome != "" {
+		t.Fatalf("after a refused disposition: state = %s outcome = %q, want addressed_pending / empty", row.State, row.Outcome)
+	}
+	if _, err := cr.ApplyDisposition(ctx, row.ID, concern.StateAddressed, "confirmed", concern.Disposition{Outcome: concern.OutcomeFixed}); err != nil {
+		t.Fatalf("confirm: %v", err)
+	}
+	if row.Outcome != concern.OutcomeFixed || row.Judgement != concern.JudgementDefect {
+		t.Errorf("after confirm: outcome = %q judgement = %q, want fixed / defect", row.Outcome, row.Judgement)
+	}
+	if _, err := cr.ApplyResolution(ctx, row.ID, concern.StateReopened, "reopened"); err != nil {
+		t.Fatalf("reopen: %v", err)
+	}
+	if row.Outcome != "" {
+		t.Errorf("after reopen: outcome = %q, want empty — a reopen clears a stale fixed", row.Outcome)
+	}
+	if n, _ := cr.StampOpenAtMerge(ctx, []uuid.UUID{runID}); n != 1 || row.Outcome != concern.OutcomeOpenAtMerge {
+		t.Errorf("merge stamp = %d, outcome %q; want 1 and open_at_merge", n, row.Outcome)
+	}
+
+	// The human arm (E94.7 / #4840, concern/postgres_test.go
+	// TestApplyHumanDisposition_* pin the store side): an invalid disposition
+	// is refused with nothing written; a valid one records the outcome and
+	// every judgement field, writes backfill false and leaves DuplicateOf alone.
+	human := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 2, "h")
+	dup := uuid.New()
+	human.DuplicateOf = &dup
+	human.JudgementBackfill = true
+	for name, d := range map[string]concern.HumanDisposition{
+		"blank judgement":     {Outcome: concern.OutcomeWaived, ActorKind: "user"},
+		"unlabelled":          {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementUnlabelled, ActorKind: "user"},
+		"tradeoff no cost":    {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "user"},
+		"blank actor kind":    {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect},
+		"non-human outcome":   {Outcome: concern.OutcomeCarried, Judgement: concern.JudgementNoDefect, ActorKind: "user"},
+		"cost with no_defect": {Outcome: concern.OutcomeWaived, Judgement: concern.JudgementNoDefect, ActorKind: "user", TradeoffCost: "c"},
+	} {
+		if _, err := cr.ApplyHumanDisposition(ctx, human.ID, concern.StateWaived, "w", d); err == nil {
+			t.Errorf("%s: ApplyHumanDisposition returned nil error, want a refusal", name)
+		}
+		if human.State != concern.StateRaised || human.Judgement != "" || human.Outcome != "" {
+			t.Fatalf("%s: after a refused human disposition: state %s judgement %q outcome %q, want raised / unwritten", name, human.State, human.Judgement, human.Outcome)
+		}
+	}
+	got, err := cr.ApplyHumanDisposition(ctx, human.ID, concern.StateWaived, "accepted", concern.HumanDisposition{
+		Outcome: concern.OutcomeWaived, Judgement: concern.JudgementTradeoff, ActorKind: "agent",
+		Delegated: true, JudgementBulk: true, TradeoffCost: "slower cold start",
+	})
+	if err != nil {
+		t.Fatalf("human disposition: %v", err)
+	}
+	if got.State != concern.StateWaived || got.StateReason != "accepted" || got.Outcome != concern.OutcomeWaived ||
+		got.Judgement != concern.JudgementTradeoff || got.JudgementActorKind != "agent" || !got.JudgementDelegated ||
+		!got.JudgementBulk || got.JudgementBackfill || got.TradeoffCost != "slower cold start" ||
+		got.DuplicateOf == nil || *got.DuplicateOf != dup {
+		t.Errorf("after human disposition: %+v, want waived / tradeoff / agent / delegated / bulk / no backfill / cost / duplicate_of kept", got)
+	}
+	if _, err := cr.ApplyHumanDisposition(ctx, human.ID, concern.StateDeferred, "d", concern.HumanDisposition{
+		Outcome: concern.OutcomeDeferred, Judgement: concern.JudgementDefect, ActorKind: "user",
+	}); err == nil {
+		t.Error("waived -> deferred human disposition returned nil error, want InvalidTransitionError")
+	}
+}
+
+// TestFakeConcernRepo_MirrorsLabelStore keeps the fake's ApplyLabel honest to
+// the store (concern/postgres_test.go TestApplyLabel_* pin the store side): a
+// judgement label records its columns and leaves State, StateReason, Outcome
+// and UpdatedAt alone; a duplicate label links, writes unlabelled with no cost
+// and is cleared by a later judgement label; a cross-run or missing target is
+// refused identically; a stale prior is ErrLabelConflict with nothing written.
+func TestFakeConcernRepo_MirrorsLabelStore(t *testing.T) {
+	ctx := context.Background()
+	cr := newFakeConcernRepo()
+	runID, stageID := uuid.New(), uuid.New()
+	root := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 1, "root")
+	row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 3, "labelled")
+	foreign := seedConcernRow(t, cr, uuid.New(), uuid.New(), concern.StageKindImplement, 1, "foreign")
+	stamp := time.Date(2026, 10, 30, 9, 0, 0, 0, time.UTC)
+	row.State, row.StateReason, row.Outcome, row.UpdatedAt = concern.StateWaived, "w", concern.OutcomeWaived, stamp
+	row.JudgementDelegated, row.JudgementBulk = true, true
+
+	got, err := cr.ApplyLabel(ctx, row.ID, concern.Label{
+		Judgement: concern.JudgementTradeoff, TradeoffCost: "slower", ActorKind: "user", Backfill: true, PriorJudgement: "",
+	})
+	if err != nil {
+		t.Fatalf("judgement label: %v", err)
+	}
+	if got.Judgement != concern.JudgementTradeoff || got.TradeoffCost != "slower" || got.JudgementActorKind != "user" || !got.JudgementBackfill ||
+		got.JudgementDelegated || got.JudgementBulk || got.DuplicateOf != nil {
+		t.Errorf("after a judgement label: %+v, want tradeoff / slower / user / backfill / not delegated / not bulk / no link", got)
+	}
+	if got.State != concern.StateWaived || got.StateReason != "w" || got.Outcome != concern.OutcomeWaived || !got.UpdatedAt.Equal(stamp) {
+		t.Errorf("a label touched the lifecycle: state %s reason %q outcome %q updated_at %v", got.State, got.StateReason, got.Outcome, got.UpdatedAt)
+	}
+
+	if _, err := cr.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementDefect, ActorKind: "user", PriorJudgement: ""}); !errors.Is(err, concern.ErrLabelConflict) {
+		t.Errorf("stale prior: err = %v, want ErrLabelConflict", err)
+	}
+	if row.Judgement != concern.JudgementTradeoff {
+		t.Errorf("after a stale-prior conflict: judgement %q, want tradeoff kept", row.Judgement)
+	}
+
+	missing := uuid.New()
+	_, crossErr := cr.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &foreign.ID, ActorKind: "user", PriorJudgement: concern.JudgementTradeoff})
+	_, missingErr := cr.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &missing, ActorKind: "user", PriorJudgement: concern.JudgementTradeoff})
+	if !errors.Is(crossErr, concern.ErrDuplicateTargetNotInRun) || crossErr == nil || missingErr == nil || crossErr.Error() != missingErr.Error() || errors.Is(missingErr, concern.ErrNotFound) {
+		t.Errorf("cross-run err %v / missing err %v, want the identical duplicate_of_not_found refusal, never ErrNotFound", crossErr, missingErr)
+	}
+	if _, err := cr.ApplyLabel(ctx, root.ID, concern.Label{DuplicateOf: &row.ID, ActorKind: "user", PriorJudgement: ""}); err == nil {
+		t.Error("a link to a LATER concern: err = nil, want duplicate_of_not_earlier")
+	}
+	if row.DuplicateOf != nil || root.DuplicateOf != nil {
+		t.Fatalf("a refused duplicate label wrote a link: row %v root %v", row.DuplicateOf, root.DuplicateOf)
+	}
+
+	got, err = cr.ApplyLabel(ctx, row.ID, concern.Label{DuplicateOf: &root.ID, ActorKind: "user", PriorJudgement: concern.JudgementTradeoff})
+	if err != nil {
+		t.Fatalf("duplicate label: %v", err)
+	}
+	if got.DuplicateOf == nil || *got.DuplicateOf != root.ID || got.Judgement != concern.JudgementUnlabelled || got.TradeoffCost != "" {
+		t.Errorf("after a duplicate label: link %v judgement %q cost %q, want %s / unlabelled / empty", got.DuplicateOf, got.Judgement, got.TradeoffCost, root.ID)
+	}
+	if _, err := cr.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled}); !errors.Is(err, concern.ErrLabelConflict) {
+		t.Errorf("stale prior duplicate_of (nil, row links root): err = %v, want ErrLabelConflict", err)
+	}
+	if _, err := cr.ApplyLabel(ctx, row.ID, concern.Label{
+		Judgement: concern.JudgementNoDefect, ActorKind: "user", PriorJudgement: concern.JudgementUnlabelled, PriorDuplicateOf: &root.ID,
+	}); err != nil || row.DuplicateOf != nil || row.Judgement != concern.JudgementNoDefect {
+		t.Errorf("judgement relabel: err %v link %v judgement %q, want nil / cleared / no_defect", err, row.DuplicateOf, row.Judgement)
+	}
+	if _, err := cr.ApplyLabel(ctx, row.ID, concern.Label{ActorKind: "user"}); err == nil {
+		t.Error("an invalid label (neither field): err = nil, want a Validate refusal")
+	}
+	cr.applyLabelErr = errors.New("store down")
+	if _, err := cr.ApplyLabel(ctx, row.ID, concern.Label{Judgement: concern.JudgementDefect, ActorKind: "user", PriorJudgement: concern.JudgementNoDefect}); err == nil || row.Judgement != concern.JudgementNoDefect {
+		t.Errorf("applyLabelErr: err %v judgement %q, want the injected error and nothing written", err, row.Judgement)
+	}
 }
 
 // fixupServerWithConcerns is fixupServer plus a wired concern store, for

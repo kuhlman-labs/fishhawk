@@ -30,8 +30,17 @@ package server
 //     cross-clock timestamp comparison);
 //  4. the merge_queue_entered row AT the entry's stored MergeIntentSequence
 //     exists (the intent is bound to that sequence, never to the newest row);
-//  5. the PR is open, on the entry's base, and its head moved off the ejected
-//     anchored head;
+//  5. the PR is open, on the entry's base, its head moved off the ejected
+//     anchored head, and that head QUALIFIES (#4703): it is the head_sha of
+//     the newest fixup_pushed row after the ejection, or a recorded product
+//     descendant of it — an acceptance_scenarios_pushed or
+//     conflict_resolution_pushed row whose base_sha is already qualifying adds
+//     its head_sha, and a CLEAN branch_rebased row (the shared ADR-112
+//     isCleanAdvance) whose prior_head_sha is qualifying adds its
+//     merge_commit_sha, walked in chain-sequence order after the push and
+//     read from audit rows only (never a commit author). A foreign push, a
+//     vouched commit or an unverified base merge is not a member, so that run
+//     falls back to the operator's fishhawk_merge_run;
 //  6. the ENTRY-variant eligibility (mergeQueueEligibility) passes at the NEW
 //     head, with a LIVE forge approval read there when the review stage
 //     declares an approval gate: an approval the fix-up push dismissed means
@@ -39,14 +48,20 @@ package server
 //
 // Then, under the run's merge-intent lock, LatestForRun must still be that
 // ejected row, which also proves the run has no active entry (an operator
-// fishhawk_merge_run that re-entered first wins). The merge_queue_entered row
-// is appended BEFORE the queue write (record before commit, as merge_run):
-// actor SYSTEM (never the operator), reentry true, the original intent row's
-// verdict prose copied so merge-on-pass records a verdict; the merge still
-// binds to the verified head, never to a SHA in that prose. Enqueue then
-// inserts a FRESH row (no order_key) at the tail carrying the new row's
-// sequence, merge_candidate_queue_held is written, and the base is pumped
-// detached. A failed append writes no entry; a failed Enqueue after the append
+// fishhawk_merge_run that re-entered first wins). Still under the lock the PR
+// is re-read (bounded by mergeOnPassForgeCallTimeout) and must be open on the
+// base at the SAME head gate 5 evaluated, and the qualifying set is
+// re-derived there: the newest post-ejection fix-up push must still be gate
+// 3's row and the head must still qualify against it. An unreadable PR or
+// chain is no re-entry, never a drop. The merge_queue_entered row is appended
+// BEFORE the queue write (record before commit, as merge_run): actor SYSTEM
+// (never the operator), reentry true, the original intent row's verdict prose
+// copied so merge-on-pass records a verdict, and reentry_head_chain (the
+// ordered head SHAs from the fix-up's pushed head to the re-entry head); the
+// merge still binds to the verified head, never to a SHA in that prose.
+// Enqueue then inserts a FRESH row (no order_key) at the tail carrying the new
+// row's sequence, merge_candidate_queue_held is written, and the base is
+// pumped detached. A failed append writes no entry; a failed Enqueue after the append
 // leaves an orphan row no queue entry names, and a later sweep re-enters with
 // a new row. Contract: backend/internal/server/README.md.
 
@@ -55,6 +70,8 @@ import (
 	"encoding/json"
 	"errors"
 	"log/slog"
+	"slices"
+	"sort"
 	"strings"
 	"time"
 
@@ -226,7 +243,7 @@ func (s *Server) reenterMergeQueueEntry(ctx context.Context, e mergequeue.Entry)
 		return skip("no delegated fix-up was routed for the ejection", nil)
 	}
 	// Gate 3: that fix-up pushed AFTER the ejection, by chain sequence.
-	pushSeq, err := s.mergeQueueFixupPushedAfter(ctx, e, ejSeq)
+	pushSeq, fixupHead, err := s.mergeQueueFixupPushedAfter(ctx, e, ejSeq)
 	if err != nil {
 		return skip("fixup_pushed unreadable", err)
 	}
@@ -251,6 +268,13 @@ func (s *Server) reenterMergeQueueEntry(ctx context.Context, e mergequeue.Entry)
 	}
 	if pr.Merged || pr.State != "open" || pr.BaseRef != e.BaseRef || pr.HeadSHA == "" || pr.HeadSHA == e.AnchoredHeadSHA {
 		return skip("the pull request is not open on the base with a moved head", nil)
+	}
+	// ... and that head is the fix-up's pushed head or a recorded product
+	// descendant of it (#4703).
+	if _, qualifies, err := s.mergeQueueReentryHeadChain(ctx, e, pushSeq, fixupHead, pr.HeadSHA); err != nil {
+		return skip("product push rows unreadable", err)
+	} else if !qualifies {
+		return skip("the pull request head is neither the fix-up's pushed head nor a recorded product descendant of it", nil)
 	}
 	// Gate 6: entry-variant eligibility at the NEW head (live approval).
 	if elig := s.mergeQueueEligibility(ctx, runRow, pr.HeadSHA); !elig.Eligible {
@@ -279,6 +303,14 @@ func (s *Server) reenterMergeQueueEntry(ctx context.Context, e mergequeue.Entry)
 // longer the run's newest ejected row.
 var errReentryStale = errors.New("the re-entry candidate is stale under the merge-intent lock")
 
+// errReentryHeadMoved is the in-lock PR re-read's refusal: the PR is no longer
+// open on the entry's base at the head gate 5 evaluated.
+var errReentryHeadMoved = errors.New("the pull request moved off the evaluated re-entry head under the merge-intent lock")
+
+// errReentryHeadUnqualified is the in-lock re-derivation's refusal: a newer
+// fix-up push landed, or the evaluated head no longer qualifies against it.
+var errReentryHeadUnqualified = errors.New("the re-entry head no longer qualifies against the newest fix-up push under the merge-intent lock")
+
 // reenterMergeQueueLocked is the locked half of reenterMergeQueueEntry: the
 // in-lock recheck, the record-before-commit merge_queue_entered append, then
 // the Enqueue at the tail. It returns the new entry, or nil with the reason.
@@ -299,6 +331,27 @@ func (s *Server) reenterMergeQueueLocked(ctx context.Context, e mergequeue.Entry
 	if !found || latest.ID != e.ID || latest.State != mergequeue.StateEjected {
 		return nil, errReentryStale
 	}
+	// #4703: re-read the PR (mergeOnPassForgeCallTimeout-bounded, like every
+	// merge-on-pass forge call under this lock) and re-derive the qualifying
+	// set, so a push or a fix-up landing after gate 5 is not re-entered.
+	repr, err := s.mergeQueueReentryReadPR(ctx, runRow)
+	if err != nil {
+		return nil, err // undeterminable: no re-entry, the ejected row stays
+	}
+	if repr.Merged || repr.State != "open" || repr.BaseRef != e.BaseRef || repr.HeadSHA != head {
+		return nil, errReentryHeadMoved
+	}
+	reSeq, reSeed, err := s.mergeQueueFixupPushedAfter(ctx, e, ejSeq)
+	if err != nil {
+		return nil, err
+	}
+	chain, qualifies, err := s.mergeQueueReentryHeadChain(ctx, e, reSeq, reSeed, head)
+	if err != nil {
+		return nil, err
+	}
+	if !qualifies || reSeq != pushSeq {
+		return nil, errReentryHeadUnqualified
+	}
 	prURL := ""
 	if runRow.PullRequestURL != nil {
 		prURL = *runRow.PullRequestURL
@@ -316,6 +369,7 @@ func (s *Server) reenterMergeQueueLocked(ctx context.Context, e mergequeue.Entry
 		"original_intent_sequence": e.MergeIntentSequence,
 		"ejected_sequence":         ejSeq,
 		"fixup_pushed_sequence":    pushSeq,
+		"reentry_head_chain":       chain,
 	})
 	kind, subject := audit.ActorSystem, mergeCandidateSystemSubject
 	row, err := s.cfg.AuditRepo.AppendChained(ctx, audit.ChainAppendParams{
@@ -356,19 +410,116 @@ func (s *Server) mergeQueueEjectionRouted(ctx context.Context, e mergequeue.Entr
 }
 
 // mergeQueueFixupPushedAfter returns the newest fixup_pushed row's chain
-// sequence when it follows after (0 when none does).
-func (s *Server) mergeQueueFixupPushedAfter(ctx context.Context, e mergequeue.Entry, after int64) (int64, error) {
+// sequence when it follows after (0 when none does) and that row's head_sha,
+// the qualifying-head walk's seed ("" when the row is undecodable or names no
+// head: an empty seed qualifies nothing).
+func (s *Server) mergeQueueFixupPushedAfter(ctx context.Context, e mergequeue.Entry, after int64) (int64, string, error) {
 	rows, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, e.RunID, mergeQueueFixupPushedCategory)
 	if err != nil {
-		return 0, err
+		return 0, "", err
 	}
-	var best int64
+	var best *audit.Entry
 	for _, r := range rows {
-		if r.Sequence > after && r.Sequence > best {
-			best = r.Sequence
+		if r != nil && r.Sequence > after && (best == nil || r.Sequence > best.Sequence) {
+			best = r
 		}
 	}
-	return best, nil
+	if best == nil {
+		return 0, "", nil
+	}
+	var p struct {
+		HeadSHA string `json:"head_sha"`
+	}
+	if json.Unmarshal(best.Payload, &p) != nil {
+		return best.Sequence, "", nil
+	}
+	return best.Sequence, p.HeadSHA, nil
+}
+
+// mergeQueueReentryDescendantCategories are the product-push audit rows the
+// qualifying-head walk reads (#4703): each records a commit Fishhawk itself
+// put on the run branch on top of a recorded prior head.
+var mergeQueueReentryDescendantCategories = []string{CategoryAcceptanceScenariosPushed, CategoryConflictResolutionPushed, CategoryBranchRebased}
+
+// reentryDescendantEdge decodes one product-push row into its (parent, child)
+// head edge: an acceptance scenario commit or a conflict-resolution merge
+// (base_sha, the prior branch head the runner committed on, -> head_sha), or a
+// CLEAN base merge (prior_head_sha -> merge_commit_sha, ADR-112
+// isCleanAdvance). Any other category, an undecodable row or an unverified
+// base merge is no edge ("", "").
+func reentryDescendantEdge(e *audit.Entry) (parent, child string) {
+	switch e.Category {
+	case CategoryAcceptanceScenariosPushed, CategoryConflictResolutionPushed:
+		var p struct {
+			BaseSHA string `json:"base_sha"`
+			HeadSHA string `json:"head_sha"`
+		}
+		if json.Unmarshal(e.Payload, &p) != nil {
+			return "", ""
+		}
+		return p.BaseSHA, p.HeadSHA
+	case CategoryBranchRebased:
+		var p branchRebasedAdvance
+		if json.Unmarshal(e.Payload, &p) != nil || !isCleanAdvance(p) {
+			return "", ""
+		}
+		return p.PriorHeadSHA, p.MergeCommitSHA
+	}
+	return "", ""
+}
+
+// reentryQualifyingChain is the pure qualifying-head walk (#4703): seeded at
+// the fix-up's pushed head, it takes every product-push edge recorded AFTER
+// the push (chain sequence pushSeq), in chain-sequence order, whose parent is
+// already qualifying. It returns the ordered heads from seed to head and
+// whether head qualifies. Each qualifying head maps to its own chain, so the
+// walk holds no predecessor loop.
+func reentryQualifyingChain(rows []*audit.Entry, pushSeq int64, seed, head string) ([]string, bool) {
+	ordered := make([]*audit.Entry, 0, len(rows))
+	for _, e := range rows {
+		if e == nil || e.Sequence <= pushSeq {
+			continue
+		}
+		ordered = append(ordered, e)
+	}
+	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
+	chains := map[string][]string{}
+	if seed != "" {
+		chains[seed] = []string{seed}
+	}
+	for _, e := range ordered {
+		parent, child := reentryDescendantEdge(e)
+		if parent == "" || child == "" {
+			continue
+		}
+		if _, seen := chains[child]; seen {
+			continue
+		}
+		if pc, ok := chains[parent]; ok {
+			chains[child] = append(slices.Clone(pc), child)
+		}
+	}
+	chain, ok := chains[head]
+	if !ok {
+		return nil, false // not a qualifying head
+	}
+	return chain, true
+}
+
+// mergeQueueReentryHeadChain reads e's run's product-push rows and answers
+// reentryQualifyingChain over them; a read error is returned (the caller
+// skips: undeterminable is never a re-entry).
+func (s *Server) mergeQueueReentryHeadChain(ctx context.Context, e mergequeue.Entry, pushSeq int64, seed, head string) ([]string, bool, error) {
+	var rows []*audit.Entry
+	for _, cat := range mergeQueueReentryDescendantCategories {
+		got, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, e.RunID, cat)
+		if err != nil {
+			return nil, false, err
+		}
+		rows = append(rows, got...)
+	}
+	chain, ok := reentryQualifyingChain(rows, pushSeq, seed, head)
+	return chain, ok, nil
 }
 
 // mergeQueueReentryReadPR reads the run's tracked PR, as merge-on-pass does.

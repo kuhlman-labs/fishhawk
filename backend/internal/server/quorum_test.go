@@ -864,7 +864,7 @@ func TestPredicateSnapshotMarshaling(t *testing.T) {
 	}
 	// The additive approvals.members fields (#4116) drop when unset, so a
 	// gate without members serialises byte-identically.
-	for _, k := range []string{"members", "members_principal", "members_listed"} {
+	for _, k := range []string{"members", "members_principal", "members_listed", "members_credential"} {
 		if _, ok := mb[k]; ok {
 			t.Errorf("%s must be omitted when unset: %s", k, rawBelow)
 		}
@@ -875,6 +875,7 @@ func TestPredicateSnapshotMarshaling(t *testing.T) {
 		CountRequired: 1, CountEligible: 1, Identity: snapshotIdentityFor("github:alice"),
 		SubmitterClass: "eligible", Channel: "api", QuorumReached: true,
 		Members: []string{"github:alice", "bob"}, MembersPrincipal: "github:alice", MembersListed: &listed,
+		MembersCredential: "oauth",
 	}
 	rawMembers, _ := json.Marshal(withMembers)
 	var mm map[string]any
@@ -886,6 +887,9 @@ func TestPredicateSnapshotMarshaling(t *testing.T) {
 	}
 	if mm["members_principal"] != "github:alice" || mm["members_listed"] != true {
 		t.Errorf("members_principal=%v members_listed=%v, want github:alice / true", mm["members_principal"], mm["members_listed"])
+	}
+	if mm["members_credential"] != "oauth" {
+		t.Errorf("members_credential = %v, want oauth when recorded (#4633): %s", mm["members_credential"], rawMembers)
 	}
 
 	// A resolved snapshot carries resolved_permission, member_resolved, and

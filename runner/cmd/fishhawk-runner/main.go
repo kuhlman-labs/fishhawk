@@ -335,6 +335,11 @@ var runSliceIndex int
 // the cleanup. The remaining trace bundle (whatever events were
 // captured up to the cancellation point) still packs + ships best-
 // effort if the body gets that far.
+// installProcessGitConfig is the seam run() installs the process-wide git
+// maintenance pins through (ADR-115 D2, #4648), so a test can observe the call
+// (and inject a failure) without depending on the test process's own env.
+var installProcessGitConfig = gitops.InstallProcessGitConfig
+
 func run(args []string, logSink io.Writer) (exitCode int) {
 	// version subcommand: emit JSON {version, plan_schema_hash} to stdout
 	// and exit. Stdout (not logSink) because this is the command's primary
@@ -349,6 +354,20 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		})
 		_, _ = fmt.Fprintf(os.Stdout, "%s\n", out)
 		return exitOK
+	}
+	// Concurrency-safe git (ADR-115 D2, #4648): pin git auto-maintenance off
+	// in the runner PROCESS env (maintenance.auto=false, gc.auto=0 as
+	// command-scope GIT_CONFIG_* entries appended after any inherited set), so
+	// every later git child built from os.Environ() — the ~50 inherited-env
+	// execs in this package, not only gitops' choke points — inherits them and
+	// none starts a repository-wide maintenance pass under a sibling worktree's
+	// feet. Installed before the specialist-job dispatch so that subcommand's
+	// git children carry the pins too. A malformed inherited GIT_CONFIG_COUNT
+	// is a config error: git itself would refuse every command under it.
+	if err := installProcessGitConfig(); err != nil {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"runner_failed","reason":"config","detail":%q}`+"\n", err.Error())
+		return exitUsage
 	}
 	// specialist-job subcommand (ADR-097 D2/D6, E85.9 / #4300): executes one
 	// requested specialist job in a scratch clone and ships its typed
@@ -2219,6 +2238,16 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		}
 	}
 
+	// Plan seed (#4436): the commit the plan agent's tree sits at as it starts
+	// — after the lineage-worktree relocation of cfg.workingDir and every
+	// pre-agent HEAD move (none of which apply to a plan stage). Gated on the
+	// predicate the post-invoke plan upload uses, which ships it so the plan
+	// review grounds there. Captured BEFORE the watcher goroutine below starts:
+	// that closure reads cfg, so a later write would race it.
+	if cfg.planOut != "" && stageType != "implement" && stageType != "review" {
+		cfg.planSeedSHA = capturePlanSeed(ctx, cfg.workingDir, logSink)
+	}
+
 	// Mid-stage scope-amendment watcher (#1035): for implement stages,
 	// emit an in-band scope_amendment_pending event the moment the agent
 	// files a request, so the fishhawk_run_stage relay surfaces the
@@ -3630,7 +3659,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 				renumberExemptions, renumberSubs = maybeParkForMigrationRenumber(ctx, client, &cfg, mcpBearerToken, nil, logSink)
 			}
 			prErr := openPRAndShipArtifact(ctx, cfg, logSink, client, issuedKey, preAgentRef, preAgentDetached, preAgentCaptured, preAgentDirty, preAgentDirtyCaptured, verifiedTreeSHA, applyPath, bindingAssertions, mergeExemptions(mergeExemptions(validatedExemptions, operatorExemptions), renumberExemptions), renumberExemptions, &prCheckpoint)
-			// Bounded base-rebase-conflict re-invoke (#989): a stash-reapply
+			// Bounded base-rebase-conflict re-invoke (#989): a snapshot-reapply
 			// conflict means the base moved under the agent (a sibling's
 			// shared-branch commit, or an advanced origin/<base>) — often a
 			// trivially-resolvable overlap that previously killed the stage
@@ -3939,6 +3968,7 @@ func uploadPlan(ctx context.Context, cfg config, logSink io.Writer, client uploa
 		Plan:         planBytes,
 		PrivateKey:   issued.PrivateKey,
 		Reachability: analyzePlanReachability(cfg, planBytes, logSink),
+		SeedSHA:      cfg.planSeedSHA,
 	})
 	if err != nil {
 		return fmt.Errorf("ship plan: %w", err)
@@ -7335,8 +7365,9 @@ func renderAmendmentPaths(paths []upload.ScopeAmendmentPath) []string {
 // baseRebaseConflictPrompt builds the re-invoke prompt fed to the agent when
 // its working-tree edits could not be reapplied onto the freshly-fetched base
 // (#989): a sibling's shared-branch commit (or an advanced origin/<base>)
-// landed lines the agent also touched, so the stash pop conflicted and was
-// cleanly aborted. The agent is re-invoked ONCE on the updated base — which
+// landed lines the agent also touched, so the snapshot re-apply (`git stash
+// apply <sha>` of the stage's refs/fishhawk/stash/<stage> commit, ADR-115 D2)
+// conflicted and was cleanly aborted. The agent is re-invoked ONCE on the updated base — which
 // already contains the newer commits — with the captured conflict context.
 // detail may be nil (a plain ErrBaseRebaseConflict with no typed context, or
 // a capture-degraded error); the prompt then omits the context sections.
@@ -7397,10 +7428,11 @@ were CONSUMED by the attempt that failed, so they no longer exist on disk:
 }
 
 // reinvokeOnBaseRebaseConflict is the bounded single agent re-invoke on a
-// stash-reapply base conflict (#989, proposal 1). The first
+// snapshot-reapply base conflict (#989, proposal 1). The first
 // openPRAndShipArtifact attempt failed with ErrBaseRebaseConflict: the agent's
-// edits were stashed (preserved on the stash stack), the half-applied pop was
-// cleanly aborted, and the local run-branch ref points at the freshly-fetched
+// edits were saved as a stash-shaped snapshot commit (named in the error's
+// SnapshotSHA, never on the shared stash stack — ADR-115 D2, #4648), the
+// half-applied restore was cleanly aborted, and the local run-branch ref points at the freshly-fetched
 // base. This handler re-checks-out that branch and re-invokes the agent with
 // the captured conflict context so it re-lands its slice on top of the moved
 // base; the caller then retries openPRAndShipArtifact exactly once. The
@@ -7436,7 +7468,7 @@ func reinvokeOnBaseRebaseConflict(ctx context.Context, cfg config, invoker agent
 		conflictPaths = detail.ConflictPaths
 	}
 
-	const stashNote = "attempt 1's stashed edits remain on the stash stack (git stash list) for forensics; the re-invoke re-lands the slice as fresh working-tree edits"
+	const stashNote = "attempt 1's edits are the snapshot commit named in the conflict error (recoverable with `git stash apply <sha>` until git prunes it), not a stash-stack entry; the re-invoke re-lands the slice as fresh working-tree edits"
 	pathsJSON, _ := json.Marshal(conflictPaths)
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"base_rebase_conflict_reinvoke","run_id":%q,"stage_id":%q,"branch":%q,"conflict_paths":%s,"note":%q}`+"\n",
@@ -8635,12 +8667,13 @@ var (
 	// dirtyPaths / cleanDriftPaths / restoreHeadPreserving are the #943
 	// drift-cleanup seam. dirtyPaths snapshots the pre-agent dirty set in
 	// run(); after a successful implement push, cleanDriftPaths reverts the
-	// agent-introduced subset of the scope drift (pathspec-limited stash
-	// push + drop) and restoreHeadPreserving carries the operator's
+	// agent-introduced subset of the scope drift (a pathspec-limited private
+	// snapshot + drop, never the shared stash stack — ADR-115 D2, #4648) and
+	// restoreHeadPreserving carries the operator's
 	// pre-existing edits across the forced HEAD restore that previously
 	// discarded them. Package-level vars for the same reason as captureHead
 	// / restoreHead: the fake-pusher run() tests default repoDir to "." and
-	// must never stash/checkout the runner's own source repo. The real
+	// must never snapshot/checkout the runner's own source repo. The real
 	// helpers are exercised by the gitops unit tests against throwaway repos.
 	dirtyPaths            = gitops.DirtyPaths
 	cleanDriftPaths       = gitops.CleanDriftPaths
@@ -8711,10 +8744,10 @@ var (
 	// checkoutRunBranch re-checks-out the run branch for the base-rebase-
 	// conflict re-invoke (#989). The local branch ref already points at the
 	// freshly-fetched base — CommitAndPush ran `checkout -B <branch>
-	// FETCH_HEAD` before the conflicted pop, and the restore defer only moved
-	// HEAD off the ref, never deleted it — so production reuses
-	// gitops.RestoreHead (`git checkout --force <ref>`); the tree is clean
-	// after popStash's reset --hard abort. A package-level var for the same
+	// FETCH_HEAD` before the conflicted snapshot restore, and the restore
+	// defer only moved HEAD off the ref, never deleted it — so production
+	// reuses gitops.RestoreHead (`git checkout --force <ref>`); the tree is
+	// clean after RestoreSnapshot's reset --hard abort. A package-level var for the same
 	// reason as restoreHead: the fake-pusher run() tests default repoDir to
 	// "." and must never force-checkout the runner's own source repo.
 	checkoutRunBranch = gitops.RestoreHead
@@ -10413,8 +10446,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 	//
 	// preservedDrift names the operator's pre-existing edits the post-push
 	// drift partition below identifies (#943); the defer closes over it so
-	// restoreHeadPreserving carries them across the forced checkout (stash /
-	// checkout / pop) instead of discarding them. It stays nil on every
+	// restoreHeadPreserving carries them across the forced checkout (private
+	// snapshot / checkout / restore) instead of discarding them. It stays nil on every
 	// failure path and whenever the pre-agent dirty snapshot failed, where
 	// restoreHeadPreserving delegates to the plain RestoreHead semantics.
 	var preservedDrift []string
@@ -11075,11 +11108,25 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		return fmt.Errorf("upload: resolve push remote: %w", err)
 	}
 
+	// Stage-end sweep of this stage's pre-commit snapshot ref
+	// (refs/fishhawk/stash/<stage>, ADR-115 D2, #4648). CommitAndPush drops the
+	// snapshot itself on success; a restore CONFLICT retains it so the typed
+	// error can name it, and this deferred sweep removes the ref when the
+	// attempt returns. It runs AFTER the #4079 base-fetch arm below has pinned
+	// the snapshot commit at checkpointStashRef, so a base-fetch failure's
+	// edits stay durable; a conflict's stay recoverable by the SHA the error
+	// names until git prunes the unreachable commit. Best-effort and log-only.
+	defer dropStageSnapshot(ctx, repoDir, cfg.runID, cfg.stageID, logSink)
 	cap, err := newPusher().CommitAndPush(ctx, gitops.CommitAndPushArgs{
 		RepoDir:       repoDir,
 		Branch:        branch,
 		CommitMessage: commitMessage,
 		RemoteURL:     remoteURL,
+		// The stage id keys the pre-commit snapshot ref
+		// (refs/fishhawk/stash/<stage>) instead of the SHARED refs/stash stack,
+		// so concurrent stages in sibling worktrees never pop each other's
+		// edits (ADR-115 D2, #4648).
+		SnapshotKey: cfg.stageID,
 		// App bot commit identity (#722): the backend resolves the App's
 		// `<slug>[bot]` name + `<id>+<slug>[bot]@users.noreply.github.com`
 		// email and echoes them on the prompt response. Empty values flow
@@ -11121,8 +11168,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// the agent ran (the standalone #3454 advance tip, the child's wave
 		// base, or its own pre-existing slice branch tip). On the
 		// FreshFetchBase arm CommitAndPush cuts the branch from it with no
-		// commit-time fetch, so a base that moved mid-stage cannot stash-pop
-		// conflict the commit and the recorded base_sha equals the pin. Empty
+		// commit-time fetch, so a base that moved mid-stage cannot
+		// snapshot-restore conflict the commit and the recorded base_sha equals the pin. Empty
 		// (fix-ups, skip/degrade paths) keeps the fetch path unchanged; the
 		// pinned arm returns the same ErrPushFailed / *BaseFetchError shapes,
 		// so the #4079 failure-site handling below is unchanged.
@@ -11181,8 +11228,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// #4079: pin every recovery point under refs/fishhawk/checkpoints/ and
 		// NAME it in the reason, so the pull_request_failed audit row says where
 		// the work is. The ErrPushFailed arm's held commit is pinned here; the
-		// base-fetch arm (CommitAndPush stashed the edits, then the base fetch or
-		// checkout failed) pins the stash commit and, for a decomposition child
+		// base-fetch arm (CommitAndPush snapshotted the edits as a stash-shaped
+		// commit, then the base fetch or checkout failed) pins that snapshot
+		// commit and, for a decomposition child
 		// with a verified tree, arms a push-kind checkpoint from a commit of that
 		// tree. Both are silent on every other error, so those reasons are
 		// byte-identical.

@@ -520,8 +520,10 @@ func TestE2E_BulkConcernSettlement_ShorthandMarkerAndBulkWaive(t *testing.T) {
 	const waiveReason = "both are accepted trade-offs; recorded and not blocking the merge"
 	status, body = bcsPost(t, ctx, httpSrv.URL+"/v0/runs/"+r.ID.String()+"/concerns/waive", fx.operatorTok,
 		map[string]any{
-			"concern_ids": []string{implA.ID.String(), implB.ID.String()},
-			"reason":      waiveReason,
+			"concern_ids":   []string{implA.ID.String(), implB.ID.String()},
+			"reason":        waiveReason,
+			"judgement":     "tradeoff",
+			"tradeoff_cost": "two known gaps ship with this merge",
 		})
 	if status != http.StatusOK {
 		t.Fatalf("bulk waive status %d: %s", status, body)

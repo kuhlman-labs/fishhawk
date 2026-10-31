@@ -3,15 +3,21 @@ package mcpe2e_test
 import (
 	"context"
 	"encoding/json"
+	"io"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/stagecheck"
 )
 
 // TestE2E_NextActions_AcceptanceReopenedBlocksMerge is the cross-boundary half
@@ -190,6 +196,185 @@ func TestE2E_NextActions_AcceptanceReopenedBlocksMerge(t *testing.T) {
 	// whether it fires.
 	if !sawMerge {
 		t.Errorf("next_actions.actions = %+v, want the merge ritual retained", na.Actions)
+	}
+}
+
+// TestE2E_NextActions_FixupReopenedAcceptanceConcernsOpenHoldsMerge is the
+// cross-boundary half of #4801: the live shape where succeedFixupPushStage
+// advanced implement (review parked at awaiting_approval, so the fix-up gate is
+// OPEN) before the fix-up push re-opened the settled acceptance stage, with an
+// implement concern still open. It crosses persistence
+// (run.ReopenAcceptanceStage), the audit chain (a stage-scoped
+// acceptance_reopened), the server stage/audit/checks HTTP surface and the real
+// fishhawk-mcp render.
+//
+// (1) next_actions leads with the acceptance dispatch carrying stage_id and
+// offers NO merge (the concerns arm used to lead with merge_and_file_follow_up).
+// (2) fishhawk_audit_complete on the review stage is pending on the re-opened
+// acceptance stage, naming it — the merge the dropped action named is refused.
+func TestE2E_NextActions_FixupReopenedAcceptanceConcernsOpenHoldsMerge(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	auditRepo := audit.NewPostgresRepository(fx.pool)
+	kind := audit.ActorKind("system")
+
+	// A local run: the operator host dispatches acceptance (a github_actions
+	// run would auto-dispatch and lead with a poll instead).
+	run, err := fx.runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	if _, err := fx.runRepo.TransitionRun(ctx, run.ID, runpkg.StateRunning); err != nil {
+		t.Fatalf("TransitionRun → running: %v", err)
+	}
+	mkStage := func(seq int, typ runpkg.StageType, approval bool) *runpkg.Stage {
+		t.Helper()
+		st, err := fx.runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+			RunID: run.ID, Sequence: seq, Type: typ,
+			ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "fishhawk/runner@v1",
+			RequiresApproval: approval,
+		})
+		if err != nil {
+			t.Fatalf("CreateStage(%s): %v", typ, err)
+		}
+		return st
+	}
+	planStage := mkStage(0, runpkg.StageTypePlan, false)
+	driveStageToSucceeded(t, ctx, fx.runRepo, planStage.ID)
+	impl := mkStage(1, runpkg.StageTypeImplement, false)
+	driveStageToSucceeded(t, ctx, fx.runRepo, impl.ID)
+	acc := mkStage(2, runpkg.StageTypeAcceptance, false)
+	driveStageToSucceeded(t, ctx, fx.runRepo, acc.ID)
+	review := mkStage(3, runpkg.StageTypeReview, true)
+
+	// One OPEN implement concern from an approve_with_concerns verdict.
+	seedImplementReview(t, ctx, auditRepo, run.ID, impl.ID,
+		planreview.Concern{Severity: planreview.SeverityMedium, Category: "scope", Note: "guard the nil stage"})
+
+	outcomePayload, _ := json.Marshal(map[string]any{"verdict": "passed", "stage_id": acc.ID.String()})
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: run.ID, StageID: &acc.ID, Timestamp: time.Now(),
+		Category: "acceptance_outcome_recorded", ActorKind: &kind, Payload: outcomePayload,
+	}); err != nil {
+		t.Fatalf("AppendChained acceptance_outcome_recorded: %v", err)
+	}
+
+	// The live ordering: review parks at awaiting_approval FIRST (the advance
+	// inside succeedFixupPushStage), THEN the fix-up push re-opens acceptance.
+	parkAtGate(t, ctx, fx.runRepo, review.ID)
+	if _, err := runpkg.ReopenAcceptanceStage(ctx, fx.runRepo, acc.ID); err != nil {
+		t.Fatalf("ReopenAcceptanceStage: %v", err)
+	}
+	reopenPayload, _ := json.Marshal(map[string]any{"prior_state": "succeeded", "head_sha": "f1xuphead"})
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: run.ID, StageID: &acc.ID, Timestamp: time.Now(),
+		Category: server.CategoryAcceptanceReopened, ActorKind: &kind, Payload: reopenPayload,
+	}); err != nil {
+		t.Fatalf("AppendChained acceptance_reopened: %v", err)
+	}
+	if _, err := fx.runRepo.SetRunPullRequestURL(ctx, run.ID, "https://github.com/kuhlman-labs/fishhawk/pull/4801"); err != nil {
+		t.Fatalf("SetRunPullRequestURL: %v", err)
+	}
+
+	// (1) next_actions through the real fishhawk-mcp binary.
+	session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, fx.url)
+	na := getNextActions(t, ctx, session, run.ID)
+	if na == nil {
+		t.Fatal("next_actions absent")
+	}
+	if na.State != "implement_concerns_open_acceptance_reopened" {
+		t.Fatalf("next_actions.state = %q, want implement_concerns_open_acceptance_reopened (actions %+v)", na.State, na.Actions)
+	}
+	lead := -1
+	for i, a := range na.Actions {
+		if a.Action == "merge_and_file_follow_up" || a.Action == "fishhawk_merge_run" {
+			t.Errorf("next_actions offers %s while acceptance is re-opened: %+v", a.Action, na.Actions)
+		}
+		if lead < 0 && strings.HasPrefix(a.Action, "fishhawk_") {
+			lead = i
+		}
+	}
+	// #3321: at most the single run_preview ritual step may precede the lead.
+	if lead < 0 || lead > 1 {
+		t.Fatalf("first fishhawk_* action at index %d, want 0 or 1 (actions %+v)", lead, na.Actions)
+	}
+	if lead == 1 && na.Actions[0].Action != "run_preview" {
+		t.Errorf("action ahead of the lead = %q, want only the run_preview ritual", na.Actions[0].Action)
+	}
+	d := na.Actions[lead]
+	if d.Action != "fishhawk_dispatch_stage" || d.Params["stage"] != "acceptance" || d.Params["stage_id"] != acc.ID.String() {
+		t.Fatalf("lead = %s %v, want fishhawk_dispatch_stage(stage=acceptance, stage_id=%s)", d.Action, d.Params, acc.ID)
+	}
+	if !strings.Contains(d.Reason, "re-opened by a fix-up push") {
+		t.Errorf("lead reason = %q, want the re-open wording", d.Reason)
+	}
+
+	// (2) the checks surface: a second backend over the SAME pool with the
+	// stage-check + artifact repos the checks endpoint needs.
+	srv := server.New(server.Config{
+		Addr: "127.0.0.1:0", RunRepo: fx.runRepo, AuditRepo: auditRepo,
+		ArtifactRepo:   artifact.NewPostgresRepository(fx.pool),
+		StageCheckRepo: stagecheck.NewPostgresRepository(fx.pool),
+		APITokenRepo:   fx.apitokenRepo,
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, httpSrv.URL+"/v0/stages/"+review.ID.String()+"/checks", nil)
+	if err != nil {
+		t.Fatalf("new request: %v", err)
+	}
+	req.Header.Set("Authorization", "Bearer "+fx.operatorTok)
+	resp, err := http.DefaultClient.Do(req)
+	if err != nil {
+		t.Fatalf("GET checks: %v", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	raw, _ := io.ReadAll(resp.Body)
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("GET checks status %d: %s", resp.StatusCode, raw)
+	}
+	var checks struct {
+		Items []struct {
+			Name    string `json:"name"`
+			State   string `json:"state"`
+			Missing []struct {
+				Kind   string `json:"kind"`
+				Detail string `json:"detail"`
+			} `json:"missing"`
+		} `json:"items"`
+	}
+	if err := json.Unmarshal(raw, &checks); err != nil {
+		t.Fatalf("decode checks: %v", err)
+	}
+	found := false
+	for _, it := range checks.Items {
+		if it.Name != server.AuditCompleteCheckName {
+			continue
+		}
+		found = true
+		if it.State != "pending" || len(it.Missing) == 0 || it.Missing[0].Kind != "stage_not_terminal" {
+			t.Fatalf("audit_complete = %+v, want pending with missing[0] stage_not_terminal", it)
+		}
+		for _, want := range []string{acc.ID.String()[:8], "re-opened by a fix-up push"} {
+			if !strings.Contains(it.Missing[0].Detail, want) {
+				t.Errorf("missing[0].detail = %q, want it to contain %q", it.Missing[0].Detail, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatalf("checks = %s, want a %s row", raw, server.AuditCompleteCheckName)
+	}
+	if strings.Contains(string(raw), "headline") {
+		t.Errorf("checks wire carries a headline key: %s", raw)
 	}
 }
 
