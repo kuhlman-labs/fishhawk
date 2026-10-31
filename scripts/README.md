@@ -12,7 +12,8 @@ verify lock" below), then runs, in order: `cmd_lint`, the ARCHITECTURE.md
 doc-line budget, `_verify_schema_sync`, `_verify_gate_harnesses`, the site voice
 gate, the site IA gate, the ADR record gate, the gate-image pin check
 (`_verify_gate_image_pins`, E51.17), the pipefail grep guard
-(`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), and finally
+(`_verify_pipefail_grep`, #4233; see "Pipefail grep guard" below), the agent-context
+gate (`_verify_agent_context`, #4886), and finally
 the test loop (scoped, or full with the patch-scoped coverage gate folded in). It omits the AGGREGATE
 coverage gate to bound runtime (the PATCH-scoped gate rides inside that same
 loop). `verify --no-tests` stops before the test loop; see "Gate image" below.
@@ -753,16 +754,71 @@ fi
 # then: print one summary line per entry of "${failed[@]}" and exit 1 if any
 ```
 
+## Required GitHub Actions validation (#4885)
+
+`ci.yml` owns the required `CI Pass` rollup. Its always-on
+`repository-checks` job runs `scripts/test verify --no-tests`, the recorded
+review-prompt evidence check, actionlint, and `test-ci-workflows.py`.
+All hosted workflows pin Ubuntu 24.04 (`ubuntu-24.04-arm` for native ARM).
+The `ubuntu-latest` migration to 26.04 (actions/runner-images#14748) must not
+change the OS implicitly; a runner upgrade is a separate validated change.
+The repository job installs zsh 5.9-6ubuntu2 explicitly
+so `test-dev` cannot silently skip on a hosted runner without zsh.
+The prompt check uses the PR base SHA or the push's BEFORE SHA, with full
+history; comparing a main push to `origin/main` would compare the commit to
+itself and incorrectly skip evidence validation. No model key is needed.
+
+Path-filtered Go tests include module assets (embedded JSON, migrations and
+fixtures), canonical schemas/API/ADR inputs, scripts, and workflow changes.
+Site builds, Helm render, Terraform fmt/validate and gate-image builds feed
+`CI Pass` through job dependencies; reusable workflows have no independent PR
+triggers. Static image pin checks run for every change; image rebuilds run
+only for image/validation/publisher inputs. `test-ci-workflows.py` pins the
+cross-workflow dependencies, representative routing inputs, release authority,
+queue limits and deployment protection checks. It requires PyYAML 6.0.3 in a
+disposable venv. actionlint 1.7.12 does not recognize GitHub's `concurrency.queue`
+yet: CI suppresses only that exact diagnostic and the contract test validates
+`queue` values and their cancellation pairing. All concrete jobs have timeouts.
+
+Main image publishers are reusable workflows called after successful `CI Pass`
+on the same push. Each publisher serializes mutable-tag promotion and checks
+that its image inputs still match main (a later docs-only commit is harmless). Backend images get the full commit in both binary
+metadata and their `sha-<full>` tag (the short alias remains compatible); `:main` is promoted after signing. Gate
+images are built and validated once per architecture on native runners, passed
+as immutable workflow artifacts, then pushed and assembled without rebuilding.
+An obsolete run may retain its commit tag, but cannot overwrite `:main` after
+newer image inputs have arrived. Rerun all jobs of a main CI run to regenerate expired
+one-day image artifacts before retrying publication. A failed publication is a
+failed CI workflow run even though the validation-only `CI Pass` is green.
+
+Release lint/tests and binary compilation run with contents-read permission.
+Signing and GitHub Release publication run in separate jobs, using artifact
+handoff and strict missing-asset checks. Backend image build/push remains in
+the publisher to preserve BuildKit provenance/SBOM attestations; no test code
+runs with publication credentials. SBOM generation cannot auto-upload assets
+before checksum signing and the final immutable-release publication.
+
+Fishhawk fan-out uses `queue: max`: up to 100 pending siblings are retained,
+with one running at a time. The backend fan-out cap must remain below that
+queue capacity; GitHub cancels arrivals above capacity. PR updates cancel older
+checks for that PR. Main pushes use independent run groups so GitHub cannot
+replace a pending code push with a docs-only push and lose its image trigger.
+Image publishers also use `queue: max`: CI completion order need not match
+commit order, so an older run must not replace a newer pending publisher.
+The freshness check rejects obsolete inputs when each publisher runs.
+
 ## CI test legs ([#3882](https://github.com/kuhlman-labs/fishhawk/issues/3882))
 
 `scripts/ci-test-leg` is the partition behind CI's `go-test` matrix. CI used
 to run `scripts/test coverage` (every module, serially, on one 4-vCPU runner,
-~15-20 min); it now runs five legs in parallel and a `go-coverage` job merges
+~15-20 min); it now runs seven legs in parallel and a `go-coverage` job merges
 their profiles and applies the same `--threshold 80 --exclude '/db/'` gate.
 
 | Leg | Tests |
 |---|---|
-| `backend-heavy` | `backend/internal/{mcpserver,server,postgres,integration/mcp}` |
+| `backend-mcp` | `backend/internal/mcpserver` |
+| `backend-server` | `backend/internal/server` |
+| `backend-storage` | `backend/internal/{postgres,integration/mcp}` |
 | `backend-rest` | every other `backend` package |
 | `runner-main-a` | `runner/cmd/fishhawk-runner`, `-run '^TestRun'` |
 | `runner-main-b` | `runner/cmd/fishhawk-runner`, `-skip '^TestRun'` |
@@ -1471,12 +1527,34 @@ unarmed; plus the #3122 generation-sweep cases above).
 
 ## `scripts/dev` lifecycle: `up` / `reload` / `post-merge` / `sweep` / `gocache`
 
-Long-form contract for the `scripts/dev` behaviours `AGENTS.md` § "Rebuild
-matrix" states as rules. The rebuild table and the activation table themselves
-stay in `AGENTS.md`. All of this is pinned by `scripts/test-dev`, which
+Long-form contract and rebuild/activation tables for `scripts/dev`.
+All of this is pinned by `scripts/test-dev`, which
 `scripts/test verify` runs via `_verify_gate_harnesses` since #2455 (skipped
 in-loop when zsh is absent from PATH), so a `scripts/dev` regression fails
 in-loop rather than only when a human runs the harness.
+
+### Rebuild matrix and activation
+
+| If PR touches | Rebuild |
+|---|---|
+| `backend/cmd/fishhawkd/` or `backend/internal/{server,prompt,plan,spec,runner,webhook,notifier,github,storage,db,...}` | `fishhawkd` |
+| `backend/cmd/fishhawk-mcp/` | `fishhawk-mcp` |
+| `backend/internal/mcpserver/` (extracted MCP tool library, E66.7 / #2408) | `fishhawk-mcp`, `fishhawkd` |
+| `backend/cmd/fishhawk-mcp-shim/` | `fishhawk-mcp-shim` |
+| `runner/cmd/fishhawk-runner/` or `runner/internal/...` | `fishhawk-runner` |
+| `cli/cmd/fishhawk/` or `cli/internal/...` | `fishhawk` CLI |
+| `backend/internal/plan/` or `backend/internal/spec/` (shared libs) | `fishhawkd`, `fishhawk-mcp`, `fishhawk-runner`, `fishhawk` (NOT the shim — it carries its own trigger glob, so it rebuilds rarely) |
+
+**Only a `README.md` basename is carved out of the matrix (#2403).** A README-only diff rebuilds nothing beyond the `fishhawkd` baseline and fires no MCP banner. Every other doc-shaped file (a `CHANGELOG.md`, a nested `docs/*.md`) and every embedded asset still triggers, deliberately: the predicate `_path_affects_build` is a deny-list that fails toward over-notifying. Long-form: `scripts/README.md` § "Rebuild detection and the `README.md` carve-out".
+
+**Rebuilt-on-disk is not the same as live.** What it takes for a rebuilt binary to actually take effect differs per binary:
+
+| Binary | Activation after a rebuild |
+|---|---|
+| `fishhawkd` | rebuilt **and restarted** by `scripts/dev up`/`reload` |
+| `fishhawk-runner` | picked up automatically — spawned fresh from `bin/` on each `fishhawk_run_stage` |
+| `fishhawk-mcp` | **auto-swapped** by the registered [`fishhawk-mcp-shim`](../backend/cmd/fishhawk-mcp-shim/README.md) (ADR-060 / #1922) — the shim SHOULD hot-swap the rebuilt child, and `up`/`reload` print a one-line auto-swap note saying so. **That is an expectation, not an observation** (#2831): `scripts/dev` cannot probe the harness-owned shim, so CONFIRM with a version-returning tool call reflecting the new GitSHA. If it still reports the old SHA the swap did not happen — run `bin/fishhawk-mcp-shim --status` for the recorded reason (`deferred_in_flight` names the request holding it off; `deferred_no_initialize_recorded` means the session cannot be replayed at all), then `/mcp`. A manual `/mcp` reconnect is also the fallback when the shim is **not** registered (the Claude Code harness owns the MCP server process, so `scripts/dev` cannot restart it) |
+| `fishhawk-mcp-shim` | rebuilt on disk but a **shim-binary** change needs a manual `/mcp` reconnect — the shim swaps its *child*, not itself, so the harness-owned shim process stays on the old code until you reconnect |
 
 ### The local `serve` flags
 
@@ -1577,7 +1655,7 @@ STRIPS its own `--force` / `--when-quiet` from the argv it forwards to
 
 `scripts/dev up` auto-detects which binaries need rebuilding by diffing
 `origin/main...HEAD` (falling back to `main...HEAD` with a warning if origin is
-unreachable) against the rebuild matrix in `AGENTS.md`. `fishhawkd` always
+unreachable) against the rebuild matrix above. `fishhawkd` always
 rebuilds as the baseline; the others rebuild only when their source changed.
 `scripts/dev up --all` forces all five. Each rebuild prints a line naming the
 trigger (`baseline`, `--all`, or the path that matched).
@@ -3994,7 +4072,7 @@ runs (`bash`, `git`, `mktemp`, `rm`) plus, where a case wants one, a stub
 `go` that records its cwd and argv and exits as told. No network, no
 Docker, no model, never the real `go`; `origin/main` is seeded with
 `git update-ref`, not a push into a bare repo, so no detached
-`git maintenance` child outlives a fixture (AGENTS.md Traps, #3503). 52
+`git maintenance` child outlives a fixture (docs/agents/testing.md, #3503). 52
 assertions: c1 no trigger → 0, gate not run; c2 committed trigger change +
 passing gate → 0, gate run from `backend/` as
 `run ./internal/agenteval/catchrategate`; c3 failing gate → 1 naming the
@@ -4044,3 +4122,21 @@ The wrapper then invokes `scripts/test verify`, forwarding arguments and the run
 `scripts/check-frontend` matches CI: frozen dependency installation, then `format:check`, `lint`, `typecheck`, `test`, `build`. The pnpm version must equal `frontend/package.json`'s `packageManager`. Install scripts are disabled; the explicitly invoked checks execute the candidate scripts. On a host, installation may use the registry. With `FISHHAWK_GATE_CONTAINER=1`, it uses only a writable temporary copy of `/opt/fishhawk-pnpm-store`, installed at image build time from the frontend lockfile. A candidate requiring uncached dependencies needs a gate-image rebuild from that candidate before the gate can judge it; there is no network fallback in the container. See `deploy/gate-image/README.md`.
 
 `scripts/test-verify-change` drives the real wrapper through disposable git histories, including deletion/rename/untracked paths, unknown bases, failure ordering and exit-code propagation. It runs in `_verify_gate_harnesses`. `frontend/**` is now a verdict-wide input in the live declaration and its committed example, because a frontend base change can invalidate the broader workflow verification result (ADR-124).
+
+## Agent context gate (#4886)
+
+`scripts/check-agent-context` validates repository-owned prompt entrypoints,
+task-guide inline local file links and the canonical/mirror skill directories.
+It uses Python 3.9+ standard library only. `scripts/test-agent-context` exercises
+isolated clean/over-budget/missing-file/broken-link/invalid-import/skill-mirror
+fixtures. Verify runs both the harness and the real checkout check before the
+no-tests return. A missing/nonexecutable checker skips with a diagnostic for
+minimal wrapper fixture trees; a normal checkout must ship both executables.
+
+Budgets, navigation syntax/limitations, source ownership and migration/scenario
+coverage live in [docs/agents/README.md](../docs/agents/README.md). Changing a link
+target's existence can change the result; the basedelta table and matching live/
+example declarations therefore enumerate the checked guides, linked targets
+and skill surfaces as global inputs. These changes require re-verification;
+unlinked documentation retains its existing classification. Add new route
+targets to the leg inputs and both declarations together.

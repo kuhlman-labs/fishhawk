@@ -1,0 +1,135 @@
+#!/usr/bin/env python3
+"""Exercise the real context checker against isolated positive/negative trees."""
+
+import importlib.machinery
+import importlib.util
+import shutil
+import subprocess
+import sys
+import tempfile
+import unittest
+from pathlib import Path
+
+sys.dont_write_bytecode = True
+
+source = Path(__file__).resolve().with_name("check-agent-context")
+loader = importlib.machinery.SourceFileLoader("agent_context", str(source))
+spec = importlib.util.spec_from_loader(loader.name, loader)
+checker = importlib.util.module_from_spec(spec)
+loader.exec_module(checker)
+
+
+class ContextCheck(unittest.TestCase):
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temp.cleanup)
+        self.root = Path(self.temp.name)
+        self.write("AGENTS.md", "# Instructions\nRead [guide](docs/agents/README.md).\n")
+        self.write("CLAUDE.md", "# CLAUDE.md\n\n@AGENTS.md\n")
+        self.write("docs/agents/README.md", "# Guide\n")
+        self.skill("verify")
+
+    def write(self, name, text):
+        path = self.root / name
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(text)
+        return path
+
+    def skill(self, name, description="Run the verification gate."):
+        self.write(f".agents/skills/{name}/SKILL.md", f"---\nname: {name}\ndescription: {description}\n---\n# Gate\n")
+        mirror = self.root / ".claude/skills" / name
+        mirror.parent.mkdir(parents=True, exist_ok=True)
+        mirror.symlink_to(f"../../.agents/skills/{name}")
+
+    def errors(self):
+        return checker.check(self.root)[0]
+
+    def fails(self, expected):
+        self.assertTrue(any(expected in error for error in self.errors()), self.errors())
+
+    def test_verify_leg_propagates_real_checker_failure(self):
+        target = self.root / "scripts/check-agent-context"
+        target.parent.mkdir()
+        shutil.copy2(source, target)
+        command = ["bash", "-c",
+                   'export FISHHAWK_TEST_LIB_ONLY=1; source "$1"; ROOT="$2"; _verify_agent_context',
+                   "context-test", str(source.with_name("test")), str(self.root)]
+        green = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertEqual(0, green.returncode, green.stdout + green.stderr)
+        self.write("AGENTS.md", "x" * (checker.ROOT_LIMIT + 1))
+        red = subprocess.run(command, capture_output=True, text=True, timeout=30)
+        self.assertNotEqual(0, red.returncode, red.stdout + red.stderr)
+        self.assertIn("8193 UTF-8 bytes exceeds", red.stdout + red.stderr)
+
+    def test_clean_and_exact_byte_boundary(self):
+        self.assertEqual([], self.errors())
+        self.write("AGENTS.md", "x" * checker.ROOT_LIMIT)
+        self.assertEqual([], self.errors())
+
+    def test_multibyte_budget(self):
+        self.write("AGENTS.md", "é" * (checker.ROOT_LIMIT // 2) + "x")
+        self.fails("8193 UTF-8 bytes exceeds 8192")
+
+    def test_missing_required_file(self):
+        (self.root / "AGENTS.md").unlink()
+        self.fails("cannot read")
+
+    def test_empty_file_and_override_budget(self):
+        self.write("AGENTS.md", "")
+        self.write("AGENTS.override.md", "x" * (checker.ROOT_LIMIT + 1))
+        self.fails("empty instruction")
+        self.fails("AGENTS.override.md: 8193")
+
+    def test_missing_local_link_and_escape(self):
+        self.write("docs/agents/README.md", "[missing](gone.md)\n[outside](../../../outside.md)\n")
+        self.fails("gone.md")
+        self.fails("outside.md")
+
+    def test_remote_fragment_and_code_examples_are_not_file_links(self):
+        self.write("docs/agents/README.md", "# Guide\n[web](https://example.invalid/x)\n[self](#guide)\n`[code](absent)`\n~~~md\n[example](absent)\n~~~\n<!-- [comment](absent) -->\n")
+        self.assertEqual([], self.errors())
+
+    def test_link_checks_follow_file_not_only_spelling(self):
+        self.write("docs/agents/README.md", "[topic](topic%20one.md#heading)\n")
+        self.write("docs/agents/topic one.md", "# Heading\n")
+        self.assertEqual([], self.errors())
+        (self.root / "docs/agents/topic one.md").unlink()
+        self.fails("topic%20one.md")
+
+    def test_extra_import_and_missing_import(self):
+        self.write("CLAUDE.md", "@AGENTS.md\n@docs/agents/README.md\n")
+        self.fails("must import only")
+        self.write("CLAUDE.md", "# Instructions\n")
+        self.fails("must import only")
+
+    def test_broken_replaced_and_extra_mirrors(self):
+        mirror = self.root / ".claude/skills/verify"
+        mirror.unlink()
+        mirror.mkdir()
+        self.fails("live per-skill symlink")
+        (self.root / ".claude/skills/extra").symlink_to("../../.agents/skills/missing")
+        self.fails("no canonical")
+
+    def test_invalid_frontmatter_and_name(self):
+        self.write(".agents/skills/verify/SKILL.md", "no frontmatter")
+        self.fails("missing YAML")
+        self.write(".agents/skills/verify/SKILL.md", "---\nname: other\ndescription: >\n---\n")
+        self.fails("name must equal")
+        self.fails("single-line")
+
+    def test_individual_and_total_description_budgets(self):
+        self.skill("large", "x" * 257)
+        self.fails("limit 256")
+        for i in range(9):
+            self.skill(f"skill-{i}", "x" * 240)
+        self.fails("limit 2048")
+
+    def test_skill_and_guide_budgets(self):
+        self.write("docs/agents/README.md", "x" * (checker.GUIDE_LIMIT + 1))
+        self.fails("exceeds 16384")
+        self.write(".agents/skills/verify/SKILL.md", "x" * (checker.SKILL_LIMIT + 1))
+        self.fails("exceeds 12288")
+
+
+if __name__ == "__main__":
+    unittest.main(verbosity=2)

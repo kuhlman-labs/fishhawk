@@ -1,40 +1,13 @@
 name: gate-image
 
 on:
-  push:
-    branches: [main]
-    paths:
-      - 'deploy/gate-image/**'
-      - 'frontend/package.json'
-      - 'frontend/pnpm-lock.yaml'
-      - 'scripts/check-gate-image'
-      - 'scripts/check-frontend'
-      - 'scripts/verify-change'
-      - 'scripts/test'
-      - 'go.work'
-      - '*/go.mod'
-      - '.github/workflows/**'
-  pull_request:
-    paths:
-      - 'deploy/gate-image/**'
-      - 'frontend/package.json'
-      - 'frontend/pnpm-lock.yaml'
-      - 'scripts/check-gate-image'
-      - 'scripts/check-frontend'
-      - 'scripts/verify-change'
-      - 'scripts/test'
-      - 'go.work'
-      - '*/go.mod'
-      - '.github/workflows/**'
+  workflow_call:
+  workflow_dispatch:
   schedule:
     - cron: '17 6 * * 1'
-  workflow_dispatch:
 
-permissions: {}
-
-concurrency:
-  group: gate-image-${{ github.ref }}
-  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+permissions:
+  contents: read
 
 env:
   IMAGE: ghcr.io/kuhlman-labs/fishhawk-gate
@@ -43,91 +16,73 @@ jobs:
   pins:
     name: Gate image pins (static)
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v7
       - run: scripts/check-gate-image
 
   build:
-    name: Gate image build (${{ matrix.platform }})
-    if: github.event_name != 'schedule'
+    name: Gate image build (${{ matrix.arch }})
     needs: pins
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:
-        platform: [linux/amd64, linux/arm64]
+        include:
+          - arch: amd64
+            runner: ubuntu-24.04
+          - arch: arm64
+            runner: ubuntu-24.04-arm
     steps:
       - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
       - uses: docker/setup-buildx-action@v4
-      - name: Build and load
+      - name: Build once and export the image to validate
         uses: docker/build-push-action@v7
         with:
           context: deploy/gate-image
           build-contexts: frontend=./frontend
-          platforms: ${{ matrix.platform }}
-          load: true
+          platforms: linux/${{ matrix.arch }}
+          outputs: type=docker,dest=${{ runner.temp }}/gate-${{ matrix.arch }}.tar
           provenance: false
-          tags: fishhawk-gate:ci
+          tags: fishhawk-gate:ci-${{ matrix.arch }}
+          cache-from: type=gha,scope=gate-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=gate-${{ matrix.arch }}
+      - name: Load the exported image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: docker load --input "$RUNNER_TEMP/gate-$ARCH.tar"
       - name: Dynamic pin check
-        run: scripts/check-gate-image --image fishhawk-gate:ci --platform ${{ matrix.platform }}
+        run: scripts/check-gate-image --image fishhawk-gate:ci-${{ matrix.arch }} --platform linux/${{ matrix.arch }}
       - name: Offline frontend gate
         run: |
           docker run --rm --network=none --entrypoint '' \
             --user "$(id -u):$(id -g)" \
             -e FISHHAWK_GATE_CONTAINER=1 -e HOME=/tmp \
-            -v "$PWD:/work" -w /work fishhawk-gate:ci scripts/check-frontend
-      - name: Lint parity (scripts/test lint inside the image)
-        if: matrix.platform == 'linux/amd64'
+            -v "$PWD:/work" -w /work fishhawk-gate:ci-${{ matrix.arch }} scripts/check-frontend
+      - name: Lint parity
+        if: matrix.arch == 'amd64'
         env:
-          FISHHAWK_TEST_GATE_IMAGE: fishhawk-gate:ci
+          FISHHAWK_TEST_GATE_IMAGE: fishhawk-gate:ci-amd64
         run: scripts/test lint --in-gate-image
-
-  publish:
-    name: Gate image publish
-    if: (github.event_name == 'push' || github.event_name == 'workflow_dispatch') && github.ref == 'refs/heads/main'
-    needs: build
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      packages: write
-    steps:
-      - uses: actions/checkout@v7
-      - uses: docker/setup-qemu-action@v4
-      - uses: docker/setup-buildx-action@v4
-      - uses: docker/login-action@v4.7.0
+      # PRs never publish images or hand artifacts to a privileged workflow.
+      # The publisher is a downstream job of this SAME main-push CI run.
+      - name: Retain the tested image for publication
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+        uses: actions/upload-artifact@v7
         with:
-          registry: ghcr.io
-          username: ${{ github.actor }}
-          password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Build and push (amd64 + arm64)
-        uses: docker/build-push-action@v7
-        with:
-          context: deploy/gate-image
-          build-contexts: frontend=./frontend
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ${{ env.IMAGE }}:${{ github.sha }}
-            ${{ env.IMAGE }}:main
-      - name: Dynamic pin check of the pushed image
-        run: |
-          for p in linux/amd64 linux/arm64; do
-            docker pull --platform "$p" "$IMAGE:$GITHUB_SHA"
-            scripts/check-gate-image --image "$IMAGE:$GITHUB_SHA" --platform "$p"
-          done
+          name: gate-image-${{ matrix.arch }}
+          path: ${{ runner.temp }}/gate-${{ matrix.arch }}.tar
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 1
 
   published-drift:
-    name: Published :main drift (${{ matrix.platform }})
+    name: Published main drift (${{ matrix.platform }})
     if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: read
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     strategy:
       fail-fast: false
       matrix:

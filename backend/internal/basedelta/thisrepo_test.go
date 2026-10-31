@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"os/exec"
 	"reflect"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -37,22 +38,29 @@ var adr098SharedSnapshot = []string{
 	"docs/", "frontend/", "infra/", "acceptance/", "auth/", ".github/", ".agents/", ".claude/", ".githooks/", "deploy/",
 }
 
-// Keep the original ADR-098 snapshot intact; workflow verification adds
-// exactly frontend/** to G. All original patterns retain their order.
-func TestThisRepoDeclaration_ADR098PlusFrontend(t *testing.T) {
+// Preserve the ADR-098 migration baseline and append only the registered
+// agent-context gate inputs (#4886), plus frontend verification. Shared dirs
+// and class semantics stay intact.
+func TestThisRepoDeclaration_ExtendsADR098WithContextAndFrontend(t *testing.T) {
 	t.Parallel()
 	s := thisRepoSurface(t)
-	var original []string
+	wantGlobal := append([]string{}, adr098GlobalSnapshot...)
+	for _, input := range agentContextInputs {
+		if !slices.Contains(wantGlobal, input.glob) {
+			wantGlobal = append(wantGlobal, input.glob)
+		}
+	}
+	var withoutFrontend []string
 	frontend := 0
 	for _, pattern := range s.Global {
 		if pattern == "frontend/**" {
 			frontend++
 			continue
 		}
-		original = append(original, pattern)
+		withoutFrontend = append(withoutFrontend, pattern)
 	}
-	if frontend != 1 || !reflect.DeepEqual(original, adr098GlobalSnapshot) {
-		t.Errorf("global_surface = %v; want ADR-098 plus exactly frontend/**", s.Global)
+	if frontend != 1 || !reflect.DeepEqual(withoutFrontend, wantGlobal) {
+		t.Errorf("global_surface = %v\nwant ADR-098 plus context gate inputs %v and exactly frontend/**", s.Global, wantGlobal)
 	}
 	if !reflect.DeepEqual(s.SharedDirs, adr098SharedSnapshot) {
 		t.Errorf("shared_artifact_dirs = %v, want %v", s.SharedDirs, adr098SharedSnapshot)

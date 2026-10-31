@@ -1,6 +1,6 @@
 ---
 name: frontend-check
-description: Run the Fishhawk Web UI (frontend/) checks that CI enforces — prettier format check, eslint, TypeScript typecheck, vitest, and the production build — with the locked toolchain. Use before pushing any change under frontend/, or when asked to lint/test/format the UI.
+description: Run the Fishhawk frontend CI checks. Use before pushing frontend changes, or when asked to format, lint, test or build the UI.
 ---
 
 # Check the Web UI before pushing

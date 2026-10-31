@@ -128,4 +128,4 @@ terminate to `TestMain`, so the container is not leaked.
 It is also wired into both COPY phases of `backend/Dockerfile`: every module
 listed in `go.work` must have its `go.mod` present in the image before
 `go mod download`, or the build fails with `cannot load module ../directory`
-(AGENTS.md "Adding a Go module"; #733 / #672).
+(docs/agents/change-checklists.md "Adding a Go module"; #733 / #672).

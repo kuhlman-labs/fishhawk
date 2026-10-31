@@ -1,6 +1,6 @@
 ---
 name: new-go-module
-description: Add a new Go module to the Fishhawk multi-module workspace — go.mod, go.work, the backend Dockerfile COPY lines, Dependabot, and the docs pointer — so builds, CI and the container image all see it. Use when creating a new top-level Go module (not a new package inside an existing module).
+description: Add a top-level Go module to the Fishhawk workspace and build/CI wiring. Not needed for a package inside an existing module.
 ---
 
 # Add a Go module

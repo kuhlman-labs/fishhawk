@@ -1,11 +1,11 @@
 ---
 name: diagnose-red
-description: Triage a Fishhawk verify/test failure that looks unrelated to the change — red on clean main, flaky under -race, or failing only on this host. Walks the known environmental causes (host load and orphaned agent processes, Go toolchain drift, golangci-lint version/cache, Docker/testcontainers state, iCloud eviction, timing flakes, vanished images) before anyone edits code. Use when verify fails on tests the diff didn't touch or the user asks "why is main red locally".
+description: Diagnose Fishhawk verify/test failures unrelated to the diff, flaky under race detection, or failing only on this host.
 ---
 
 # Diagnose an unexplained red
 
-Rule: **prove it's the code before changing the code.** First establish whether `origin/main` itself is red on this host. If it is, the cause is environmental. Work through the list in order; cheap checks come first.
+Rule: **prove it's the code before changing the code.** First establish whether `origin/main` itself is red on this host. A failure there establishes that the diff did not introduce it; it can still be a real baseline defect. Work through the list in order; cheap checks come first.
 
 ## 1. Host load and orphaned processes (check this first)
 
@@ -20,16 +20,17 @@ ps -axo pid=,ppid=,pcpu=,etime=,comm= | sort -k3 -nr | head -15
 
 ## 2. Go toolchain drift
 
-`go env GOVERSION` newer than the `go 1.26.0` pin can turn clean main red. For example, Go 1.27's jsonv2 breaks `TestJSONEncodedLen_MatchesEncoder_Differential`.
-
-- **Signal:** green in CI, and green with `GOTOOLCHAIN=go1.26.9 scripts/test single -run <Test> ./<pkg>/`.
-- **Fix:** propose `go env -w GOTOOLCHAIN=go1.26.9`; it's a global write, so ask first.
+Compare `go env GOVERSION` with the checked-in `deploy/gate-image/Dockerfile`
+pin. A newer toolchain can change semantics (for example jsonv2). Reproduce the
+failing test under the pinned toolchain before attributing the difference to
+code. Prefer a per-command override; a persistent `go env -w` change requires
+authorization. Host Go settings do not repair the baked-in container toolchain.
 
 ## 3. golangci-lint
 
-- **Version:** local must be v2.x. CI pins v2.12.2, and a newer local binary formats differently. Check with `go run github.com/golangci/golangci-lint/v2/cmd/golangci-lint@v2.12.2 fmt --diff`.
-- **Cross-worktree cache pollution:** a finding naming a path in a *different* worktree means a stale cache. Fix with `golangci-lint cache clean`, then re-run.
-- **Concurrency:** two concurrent lint/verify runs contend on golangci-lint's global lock. Check for another `scripts/test` process.
+- Run `scripts/check-gate-image --host`. The lint version, its build Go and standalone gofmt must match the checker's pins. Use pinned tools on PATH or the gate image; see [verification](../../../docs/agents/verification.md).
+- A finding naming another worktree can be stale lint cache evidence. Check active lint users before clearing the shared cache, then reproduce.
+- Lint invocations serialize on golangci-lint's global lock. A verify-lock refusal remains terminal: use a focused test, not a retry loop.
 
 ## 4. Docker / testcontainers
 
@@ -47,7 +48,7 @@ pgrep -fl '[s]cripts/test' || echo no-scripts-test
 
 ## 5. iCloud-synced repo
 
-The repo lives under `~/Documents`, which iCloud syncs.
+Check the actual checkout path first. This section applies only when the checkout is in an iCloud-synced directory such as `~/Documents`.
 
 - **`Operation timed out` reading a `.git/objects/pack/*` file:** the file is evicted (dataless). Rehydrate it with `brctl download <path>` (or read it once), then retry.
 - **Stray `* 2.*` / `* 2` duplicates** (files or dirs) appearing as untracked or out-of-scope are iCloud conflict copies. List them with `git status --short | grep ' 2'` and show the user; don't bulk-delete.
@@ -55,8 +56,8 @@ The repo lives under `~/Documents`, which iCloud syncs.
 ## 6. Timing / ordering flakes
 
 - **Reproduce:** `scripts/test single -run '^TestX$' -count=10 ./pkg/` (add `-race`).
-- **Load sensitivity:** a pass when idle and a failure under load means a tight deadline. The repo's rule is `backend/internal/timescale` `D(base)` for every deadline-competing duration. `FISHHAWK_TEST_TIME_SCALE=5` simulates CI's factor.
-- **Known flake shapes** (see `AGENTS.md` Traps):
+- **Load sensitivity:** a pass when idle and failure under load suggests a timing or resource dependency; inspect the failed assertion. The repo's rule is `backend/internal/timescale` `D(base)` for every deadline-competing duration. `FISHHAWK_TEST_TIME_SCALE=5` simulates CI's factor.
+- **Known flake shapes** (see [testing rules](../../../docs/agents/testing.md)):
   - a Go `time.Now()` compared against a DB `now()` (cross-clock)
   - waiting on one sink but asserting on another
   - a must-complete invocation racing a tight timeout

@@ -39,15 +39,20 @@ permissions:
 jobs:
   deploy:
     name: Deploy (stub)
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
     steps:
       - name: Echo deploy correlation and outcome
+        env:
+          RUN_ID: ${{ inputs.fishhawk_run_id }}
+          STAGE_ID: ${{ inputs.fishhawk_stage_id }}
+          ROLLBACK: ${{ inputs.fishhawk_rollback }}
         run: |
           echo "::notice::Fishhawk dogfood deploy stub — no-op (echo-now-real-later, #1418)"
-          echo "fishhawk_run_id:   ${{ inputs.fishhawk_run_id }}"
-          echo "fishhawk_stage_id: ${{ inputs.fishhawk_stage_id }}"
-          echo "fishhawk_rollback: ${{ inputs.fishhawk_rollback }}"
-          if [ "${{ inputs.fishhawk_rollback }}" = "true" ]; then
+          echo "fishhawk_run_id:   $RUN_ID"
+          echo "fishhawk_stage_id: $STAGE_ID"
+          echo "fishhawk_rollback: $ROLLBACK"
+          if [ "$ROLLBACK" = "true" ]; then
             echo "rollback path (stub) — succeeding"
           else
             echo "forward deploy path (stub) — succeeding"
