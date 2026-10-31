@@ -1,0 +1,12 @@
+id: scenario:issue-4627/docs-state-binding
+statement: 'The rendered docs state the client binding and the inventory: the POST /v0/tokens/login description in docs/api/v0.openapi.yaml and the matching block in docs/api/v0.md name the per-provider binding and the fail-closed refusal; backend/internal/identity/README.md has a ''Client binding (#4627)'' section; backend/internal/server/README.md''s token-login mint section names the binding and the 503 mapping; backend/internal/apitoken/README.md carries a read-only inventory of active auth_method=''oauth'' tokens with the revocation path; cli/README.md''s --client-id / FISHHAWK_OAUTH_CLIENT_ID entry says only the deployment''s own device client can mint.'
+steps: 'Read the sanctioned checkout (HEAD 2900aa85 = target git_sha): docs/api/v0.openapi.yaml (POST /v0/tokens/login description around line 13118); docs/api/v0.md around line 419; backend/internal/identity/README.md § ''Client binding (#4627)'' at line 122; backend/internal/server/README.md token-login section around line 8253; backend/internal/apitoken/README.md § ''Inventory: OAuth-login tokens minted before the client binding (#4627)''; cli/README.md line 510.'
+assertions:
+    expected: Every listed doc surface states the binding, the fail-closed refusal, the 503 mapping, the inventory and the CLI clause
+    observed_at_record: The OpenAPI file has a CLIENT BINDING (#4627) paragraph with the GitHub check-a-token and GitLab token-info binding and a fail-closed 401 for other clients, PATs, App/installation/project/CI tokens, null issuers and introspection failures. v0.md states the per-provider binding, the 401 refusal and the 503 naming FISHHAWKD_OAUTH_CLIENT_SECRET / FISHHAWKD_GITLAB_DEVICE_CLIENT_ID. The identity README has the 'Client binding (#4627)' section, including the redirect contract. The server README names the binding, the 503 tokens_unconfigured mapping and the closed-set reason table. The apitoken README has a read-only SQL inventory of active auth_method='oauth' rows plus the owner and operator revocation paths. The cli/README --client-id / FISHHAWK_OAUTH_CLIENT_ID entry says it must name the deployment's own device client because the backend mints only for that client's tokens.
+origin:
+    issue: 4627
+    pr: 4759
+    run_id: bfc03183-041f-4249-a257-7331ec070615
+    head_sha: 2900aa85fe545aca7084416432a7dff6ca7d5dd4
+    recorded_at: 2026-10-27T23:38:00Z

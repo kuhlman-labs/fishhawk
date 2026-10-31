@@ -116,9 +116,18 @@ func (s *Server) handleWebhook(w http.ResponseWriter, r *http.Request) {
 	// surface as a 5xx, since the audit log keeps the canonical
 	// trail and a missed delivery just leaves the SPA showing
 	// stale state until the next event.
+	//
+	// A third consumer, triggerMergeQueueYieldOnCheckRun (docs/adr/112
+	// A3.8, #4780), re-probes a yielded, intent-bearing merge-queue
+	// entry when a completed required check lands at its anchored head,
+	// through a coalesced, deduped, single-flight per-run trigger (one
+	// follow-up per process). The probe runs detached, so the 202 never
+	// waits on its forge read; a missed trigger leaves the yield sweep's
+	// schedule as the fallback.
 	if ev.Type == "check_run" {
 		s.ingestCheckRun(r.Context(), ev.RawBody)
 		s.reevaluateCIPolicy(r.Context(), ev.RawBody)
+		s.triggerMergeQueueYieldOnCheckRun(r.Context(), ev.RawBody)
 	}
 
 	// `pull_request.synchronize` fires whenever the PR's head_sha

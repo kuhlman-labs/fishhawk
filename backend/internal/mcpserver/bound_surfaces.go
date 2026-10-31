@@ -682,6 +682,12 @@ var floorCarryTable = map[reflect.Type][]floorCarryRow{
 	},
 	reflect.TypeOf(StartCampaignItemRunOutput{}): {
 		{Path: "item", Class: classStored, Build: nil},
+		// The runner-kind resolution (#4485) is computed by the backend at mint
+		// and carried at the floor because it is non-omitempty; a capped value
+		// has no retrieval surface that returns the pair, so it is computed.
+		{Path: "runner_kind_resolution", Class: classComputed, Build: func(c floorCarryBuildCtx) elidedField {
+			return newComputedElision(c.field, c.reason, c.omitted)
+		}},
 	},
 }
 

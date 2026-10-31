@@ -333,6 +333,12 @@ func (s *Server) resolveReviewStageOnMerge(ctx context.Context, target *run.Run,
 		// Audit row first — if the transition fails (state-machine
 		// reject) we still want the merge recorded.
 		s.writePRMergedAudit(ctx, target.ID, stageID, meta)
+		// ADR-117 D1 (E94.1 / #4692): record open_at_merge on every concern
+		// of the run and its decomposition children still open (or
+		// superseded) with no outcome. Beside pr_merged, so the holds above
+		// defer it exactly as they defer that row; best-effort, never unwinds
+		// the merge, idempotent across redeliveries.
+		s.stampConcernsOpenAtMerge(ctx, target.ID)
 		if reviewStage == nil {
 			// No review stage on this run shape (routine_change-style
 			// workflows are implement-only). The merge still happened.

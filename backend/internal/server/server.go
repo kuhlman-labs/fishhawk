@@ -34,6 +34,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concurrency"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/defaultbranch"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/digest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/drive"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -379,6 +380,16 @@ type Config struct {
 	// workflow_dispatch). Built on top of GitHubTokens. Nil when
 	// GitHubTokens is nil.
 	GitHub *githubclient.Client
+
+	// DefaultBranch resolves a run repository's base branch from the forge
+	// default_branch (#4660) — the first-round review re-run's compare base
+	// and the other server-side base reads resolve through
+	// resolveRunDefaultBranch over it. fishhawkd wires the GitHub client's
+	// shared resolver (githubclient.Client.DefaultBranches), the SAME
+	// instance the orchestrator holds. Nil stays nil — server.New derives
+	// nothing — so every read refuses with resolver_unconfigured rather than
+	// guessing a branch.
+	DefaultBranch defaultbranch.Source
 
 	// DeploySecretLookup resolves a webhook deploy delegate's
 	// executor.delegate.secret_env at deploy dispatch (E45.57 / #3497):
@@ -968,6 +979,18 @@ type Config struct {
 	// and refuses a non-positive value at startup. See merge_queue_yield.go.
 	MergeQueueApprovalWait time.Duration
 
+	// MergeQueueGateWait is docs/adr/112 A3.2's per-admission-epoch
+	// merge-gate window (#4780): a head of line whose required checks are
+	// pending, unreported or unreadable (A3.1(b)) or whose implement-review
+	// round is settling (A3.1(c)) holds the line for this window, opened at
+	// its first such hold in the epoch from a persisted 3-hold budget
+	// (mergequeue.Store.GateWait, database clock), then yields
+	// merge_checks_pending / merge_review_pending. Zero (or non-positive) is
+	// the approval wait (mergeQueueApprovalWait). fishhawkd sets it from
+	// --merge-queue-gate-wait / FISHHAWKD_MERGE_QUEUE_GATE_WAIT. See
+	// merge_queue_merge.go (mergeOnPassEnforceGateWait).
+	MergeQueueGateWait time.Duration
+
 	// MergeCandidateTransfer is the ADR-096 verdict-transfer switch (E87.2 /
 	// #4293): off | shadow | enforce plus the classifier. The ZERO VALUE is
 	// off, so an in-process server is unchanged; fishhawkd defaults shadow
@@ -1281,6 +1304,13 @@ type Server struct {
 	// the loop claimed before SIGTERM finishes inside the drain window rather
 	// than being cut at process exit.
 	bgMergeQueuePump sync.WaitGroup
+	// yieldProbeSpawnMu guards yieldProbeSpawnClosed, which Shutdown sets
+	// before it drains bgMergeQueuePump: spawnMergeQueueYieldProbe adds to
+	// the group only under the lock and only while it is unset, so a check_run
+	// follow-up timer firing during or after the drain starts nothing the
+	// drain would not wait for (docs/adr/112 A3.8, concern 548f1a65).
+	yieldProbeSpawnMu     sync.Mutex
+	yieldProbeSpawnClosed bool
 	// mergeQueueBootAt mirrors Config.MergeQueueBootAt (ADR-093 D8).
 	mergeQueueBootAt time.Time
 	// mergeInFlight is the per-Server, process-local registry of runs whose
@@ -1291,12 +1321,17 @@ type Server struct {
 	// stage-live gate is holding (entry id → admission epoch), so the
 	// periodic pump re-checks the gate for them (approval condition C5).
 	mergeQueueGateHolds *mergeQueueGateHoldRegistry
-	// yieldSweepLast is when THIS process's previous yield sweep started
-	// (sweepMergeQueueYields; zero before the first, ADR-112 R3, #4632): a
-	// row is due when a schedule point fell since then. Process-local, under
-	// yieldSweepMu.
-	yieldSweepMu   sync.Mutex
-	yieldSweepLast time.Time
+	// yieldServiced is THIS process's per-entry yield re-probe service mark
+	// (sweepMergeQueueYields, ADR-112 Amendment A2.1, #4622/#4748): the
+	// yield episode and age at which the sweep last probed the entry, and its
+	// place in yieldServiceSeq's service order. Only the probed row's mark
+	// advances; a row with no mark (or a later yielded_at) is never serviced.
+	// The sweep probes the due row with the OLDEST mark first (A2.2), and
+	// prunes marks only after a fully listed sweep. Lazily initialised;
+	// process-local (a restart resets every mark), under yieldSweepMu.
+	yieldSweepMu    sync.Mutex
+	yieldServiced   map[uuid.UUID]yieldServicedMark
+	yieldServiceSeq uint64
 
 	// refinementFiling is the detached filing arm's in-process per-draft
 	// single-flight guard and status store (#4153), read by the session
@@ -1525,6 +1560,9 @@ func New(cfg Config) *Server {
 	// and slice-1's drive gate parks every fan-out parent forever.
 	if cfg.Orchestrator != nil {
 		cfg.Orchestrator.ConsolidatedReview = s
+		// #4785: the read-only fan-in verify readiness hook that holds a
+		// decomposed parent's acceptance until the consolidated head settles.
+		cfg.Orchestrator.FanInVerify = s
 		// #3389: completeRun's cancelled resolution (a PR closed without
 		// merge cancels the review stage, then the run) reaches the same
 		// dropped-retirement recorder the REST and budget cancel sinks call.
@@ -1533,6 +1571,10 @@ func New(cfg Config) *Server {
 		// EFFECTIVE verification (operator adds/retirements applied), so an
 		// operator-added drivable criterion is actually driven.
 		cfg.Orchestrator.EffectiveAcceptance = s
+		// E94.1 / #4692 (ADR-117 D2): every fan-in pass imports the
+		// succeeded children's open HIGH/MEDIUM concerns into the parent's
+		// ledger before slices_integrated is written.
+		cfg.Orchestrator.SliceConcerns = s
 	}
 	// Channels behind the Router seam (ADR-015 #79), built as a list so a
 	// channel that needs no GitHub client (push, #2292) is still reachable.
@@ -1686,11 +1728,17 @@ func (s *Server) Start() error {
 // merge-candidate queue pump with any admission it is running
 // (bgMergeQueuePump, #4303) to finish, bounded by the same shutdown context
 // so a hung reviewer or a wedged forge can't block shutdown past the
-// deadline.
+// deadline. Before the drain it closes the check_run yield re-probe spawn
+// (yieldProbeSpawnClosed), so a follow-up timer that fires during or after
+// the drain starts no probe.
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
 	err := s.http.Shutdown(shutdownCtx)
+
+	s.yieldProbeSpawnMu.Lock()
+	s.yieldProbeSpawnClosed = true
+	s.yieldProbeSpawnMu.Unlock()
 
 	// Drain in-flight detached reviews and grooming applies, bounded by
 	// the shutdown context. A WaitGroup can't be select-ed on directly,

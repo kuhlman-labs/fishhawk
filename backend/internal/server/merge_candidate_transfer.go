@@ -2,6 +2,8 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -39,6 +41,14 @@ import (
 //   - detectMergeCandidateFalseTransfers appends the ADVISORY
 //     merge_candidate_verdict_false_transfer row when a shadow would_transfer
 //     head's pass went red, in either arrival order.
+//
+// The surface the classifier decides against is the repository's workflow-v2
+// verdict_transfer declaration (ADR-124), read ONLY from the run's cached
+// ADMISSION spec (run.WorkflowSpec), never from a checkout, so a PR cannot
+// change the surface its own decision uses. Every computed row records
+// classifier_version, surface_digest and surface_provenance; enforce acts only
+// for a declaration naming completeness_check (otherwise the decision runs in
+// shadow, enforce_withheld).
 //
 // The classifier's Reason is UNTRUSTED (it names repository paths): it is
 // stored split into a closed reason_code and a bounded, control-stripped
@@ -122,6 +132,7 @@ const (
 	transferReasonGlobalSurface      = "global_surface"
 	transferReasonSharedArtifact     = "shared_artifact"
 	transferReasonReachOverlap       = "reach_overlap"
+	transferReasonDocCheck           = "doc_check"
 	transferReasonUndecidable        = "undecidable"
 	transferReasonDeadlineExceeded   = "undecidable:deadline_exceeded"
 	transferReasonIncompleteExport   = "undecidable:incomplete_export"
@@ -135,6 +146,41 @@ const (
 	transferReasonInputs             = "inputs:"
 	transferReasonUnknown            = "unknown"
 )
+
+// transferUndecidableCodes are the classifier's closed undecidable sub-codes
+// (ADR-124 D2, D3), matched before the generic undecidable row: each keeps
+// its own reason_code, its remainder (after one ':') the UNTRUSTED detail.
+var transferUndecidableCodes = []string{
+	"undecidable:surface_undeclared",
+	"undecidable:surface_incomplete",
+	"undecidable:invalid_surface",
+	"undecidable:unsupported_language",
+	"undecidable:unclassified_path",
+	"undecidable:opaque_path",
+}
+
+// Surface provenance states and the enforce-withheld marker.
+const (
+	transferSurfaceSourceAdmission  = "admission_spec"
+	transferSurfaceStateNoSpec      = "no_spec"
+	transferSurfaceStateUnparseable = "unparseable"
+	transferSurfaceStateUndeclared  = "undeclared"
+	transferSurfaceStateDeclared    = "declared"
+	transferEnforceWithheldNoCheck  = "completeness_check_undeclared"
+)
+
+// transferSurfaceUnmatchedMax bounds the surface_unmatched diagnostic list.
+const transferSurfaceUnmatchedMax = 16
+
+// transferSurfaceProvenance names where a decision's surface came from: the
+// run's admission spec, its recorded blob SHA (may be empty on some trigger
+// paths), the sha256 of the cached bytes (always available) and its state.
+type transferSurfaceProvenance struct {
+	Source      string `json:"source"`
+	WorkflowSHA string `json:"workflow_sha,omitempty"`
+	SpecSHA256  string `json:"spec_sha256,omitempty"`
+	State       string `json:"state"`
+}
 
 // errTransferWorkspace marks a workspace that could not be created.
 var errTransferWorkspace = errors.New("merge-candidate transfer: workspace")
@@ -177,6 +223,15 @@ type mergeCandidateTransferDecision struct {
 	DeltaPathsCount int
 	PRPathsCount    int
 	Duration        time.Duration
+	// SurfaceDigest and SurfaceProvenance identify the declaration decided
+	// against; SurfaceUnmatched(Count) is the prospective-coverage
+	// diagnostic (UNTRUSTED pattern text); EnforceWithheld is set when an
+	// enforce-mode decision ran in shadow for want of a completeness check.
+	SurfaceDigest         string
+	SurfaceProvenance     transferSurfaceProvenance
+	SurfaceUnmatched      []string
+	SurfaceUnmatchedCount int
+	EnforceWithheld       string
 }
 
 // mergeCandidateTransferPayload is the shared payload of the transferred,
@@ -196,8 +251,15 @@ type mergeCandidateTransferPayload struct {
 	ReasonUntrusted bool   `json:"reason_untrusted"`
 	WouldTransfer   *bool  `json:"would_transfer,omitempty"`
 	DurationMS      int64  `json:"duration_ms"`
-	SurfaceVersion  int    `json:"surface_version"`
-	Mode            string `json:"mode"`
+	// ClassifierVersion versions the rule set (basedelta.ClassifierVersion);
+	// SurfaceDigest the admission declaration (empty when undeclared).
+	ClassifierVersion     int                       `json:"classifier_version"`
+	SurfaceDigest         string                    `json:"surface_digest,omitempty"`
+	SurfaceProvenance     transferSurfaceProvenance `json:"surface_provenance"`
+	SurfaceUnmatched      []string                  `json:"surface_unmatched,omitempty"`
+	SurfaceUnmatchedCount int                       `json:"surface_unmatched_count,omitempty"`
+	EnforceWithheld       string                    `json:"enforce_withheld,omitempty"`
+	Mode                  string                    `json:"mode"`
 }
 
 // mergeCandidateFalseTransferPayload is the ADVISORY false-transfer row.
@@ -316,6 +378,8 @@ func (s *Server) decideMergeCandidateTransfer(ctx context.Context, req mergeCand
 	if s.mergeCandidateTransferMode() == MergeCandidateTransferOff {
 		return d
 	}
+	surface, prov := s.verdictTransferSurface(ctx, req.Run)
+	d.SurfaceDigest, d.SurfaceProvenance = surface.Digest(), prov
 	if req.Cause == mergeCandidateCauseConflictResolution {
 		return finish(transferReasonConflictResolution, "")
 	}
@@ -375,12 +439,91 @@ func (s *Server) decideMergeCandidateTransfer(ctx context.Context, req mergeCand
 		DeltaPaths: in.Delta.DeltaPaths,
 		PRPaths:    in.Delta.PRPaths,
 		Workspaces: in.Workspaces,
+		Surface:    surface,
 	})
 	if cctx.Err() != nil {
 		return finish(transferReasonDeadlineExceeded, "")
 	}
+	d.SurfaceUnmatched, d.SurfaceUnmatchedCount = s.transferSurfaceUnmatched(cctx, req.Run, surface, in.Workspaces)
 	code, detail := splitTransferReason(res)
 	return finish(code, detail)
+}
+
+// verdictTransferSurface resolves the run's declared surface from its cached
+// ADMISSION spec (run.WorkflowSpec) ONLY — never the checkout. A spec that
+// does not parse logs a WARN and yields nil (refused surface_undeclared).
+func (s *Server) verdictTransferSurface(ctx context.Context, r *run.Run) (*basedelta.Surface, transferSurfaceProvenance) {
+	prov := transferSurfaceProvenance{Source: transferSurfaceSourceAdmission, WorkflowSHA: r.WorkflowSHA}
+	if r.WorkflowSpec == nil {
+		prov.State = transferSurfaceStateNoSpec
+		return nil, prov
+	}
+	sum := sha256.Sum256(r.WorkflowSpec)
+	prov.SpecSHA256 = hex.EncodeToString(sum[:])
+	surface, err := basedelta.ResolveSurface(r.WorkflowSpec)
+	switch {
+	case err != nil:
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "merge-candidate verdict transfer: the admission spec does not parse; the surface reads as undeclared",
+			slog.String("run_id", r.ID.String()), slog.String("error", err.Error()))
+		prov.State = transferSurfaceStateUnparseable
+	case surface == nil:
+		prov.State = transferSurfaceStateUndeclared
+	default:
+		prov.State = transferSurfaceStateDeclared
+	}
+	return surface, prov
+}
+
+// transferSurfaceUnmatched is the prospective-coverage DIAGNOSTIC (ADR-124
+// D3): the declared patterns matching no file of either workspace, at most
+// transferSurfaceUnmatchedMax listed (each bounded, UNTRUSTED) plus the full
+// count. A listing error or a done context skips it; it never changes the
+// verdict.
+func (s *Server) transferSurfaceUnmatched(ctx context.Context, r *run.Run, surface *basedelta.Surface, workspaces []string) ([]string, int) {
+	if surface == nil {
+		return nil, 0
+	}
+	seen := map[string]bool{}
+	var files []string
+	for _, w := range workspaces {
+		if ctx.Err() != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug, "merge-candidate verdict transfer: unmatched-pattern diagnostic skipped (budget spent)",
+				slog.String("run_id", r.ID.String()))
+			return nil, 0
+		}
+		list, err := basedelta.ListTree(w)
+		if err != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelDebug, "merge-candidate verdict transfer: unmatched-pattern diagnostic skipped",
+				slog.String("run_id", r.ID.String()), slog.String("error", err.Error()))
+			return nil, 0
+		}
+		for _, f := range list {
+			if !seen[f] {
+				seen[f] = true
+				files = append(files, f)
+			}
+		}
+	}
+	unmatched := surface.Unmatched(files)
+	out := make([]string, 0, min(len(unmatched), transferSurfaceUnmatchedMax))
+	for _, u := range unmatched[:min(len(unmatched), transferSurfaceUnmatchedMax)] {
+		out = append(out, boundTransferDetail(u))
+	}
+	if len(out) == 0 {
+		return nil, 0
+	}
+	return out, len(unmatched)
+}
+
+// transferEnforceWithheld reports a run whose admission declaration names no
+// completeness check: enforce runs as shadow for it (ADR-124 D4). An absent
+// declaration is not withheld — the classifier refuses it.
+func transferEnforceWithheld(r *run.Run) bool {
+	surface, err := basedelta.ResolveSurface(r.WorkflowSpec)
+	if err != nil {
+		return false
+	}
+	return surface.EnforceWithheld()
 }
 
 // closedMergeCandidateState maps a verify state onto its closed set.
@@ -404,8 +547,14 @@ func splitTransferReason(res basedelta.Result) (code, detail string) {
 		}
 		return transferReasonUnknown, r
 	}
+	for _, c := range transferUndecidableCodes {
+		if rest, ok := strings.CutPrefix(r, c); ok && (rest == "" || rest[0] == ':') {
+			return c, strings.TrimPrefix(rest, ":")
+		}
+	}
 	for _, p := range []struct{ prefix, code string }{
 		{basedelta.PrefixGlobalSurface, transferReasonGlobalSurface},
+		{basedelta.PrefixDocCheck, transferReasonDocCheck},
 		{basedelta.PrefixSharedArtifact, transferReasonSharedArtifact},
 		{basedelta.PrefixReachOverlap, transferReasonReachOverlap},
 		{basedelta.PrefixUndecidable, transferReasonUndecidable},
@@ -490,10 +639,15 @@ func (d mergeCandidateTransferDecision) transferPayload(mode MergeCandidateTrans
 		RootHead: d.RootHead, Cause: d.Cause,
 		DeltaPathsCount: d.DeltaPathsCount, PRPathsCount: d.PRPathsCount,
 		Reason: d.ReasonCode, ReasonCode: d.ReasonCode, ReasonDetail: d.ReasonDetail,
-		ReasonUntrusted: true,
-		DurationMS:      d.Duration.Milliseconds(),
-		SurfaceVersion:  basedelta.SurfaceVersion,
-		Mode:            string(mode),
+		ReasonUntrusted:       true,
+		DurationMS:            d.Duration.Milliseconds(),
+		ClassifierVersion:     basedelta.ClassifierVersion,
+		SurfaceDigest:         d.SurfaceDigest,
+		SurfaceProvenance:     d.SurfaceProvenance,
+		SurfaceUnmatched:      d.SurfaceUnmatched,
+		SurfaceUnmatchedCount: d.SurfaceUnmatchedCount,
+		EnforceWithheld:       d.EnforceWithheld,
+		Mode:                  string(mode),
 	}
 }
 
@@ -557,9 +711,14 @@ func (s *Server) appendMergeCandidateTransferShadow(ctx context.Context, runID u
 // mergeCandidateTransferEnforce decides and writes in ENFORCE mode. It returns
 // true only when the transferred row is DURABLE, so the caller may skip the
 // pass; on a refusal (or any append failure) it returns false and the caller
-// runs the pass. Outside enforce it writes nothing and returns false.
+// runs the pass. Outside enforce, or when enforce is withheld for a
+// declaration naming no completeness check (the shadow scheduler then records
+// it), it writes nothing and returns false.
 func (s *Server) mergeCandidateTransferEnforce(ctx context.Context, req mergeCandidateTransferRequest) (bool, mergeCandidateTransferDecision) {
 	if s.mergeCandidateTransferMode() != MergeCandidateTransferEnforce || req.Run == nil {
+		return false, mergeCandidateTransferDecision{}
+	}
+	if transferEnforceWithheld(req.Run) {
 		return false, mergeCandidateTransferDecision{}
 	}
 	d := s.decideMergeCandidateTransfer(ctx, req)
@@ -595,9 +754,22 @@ func (s *Server) mergeCandidateTransferEnforce(ctx context.Context, req mergeCan
 // scheduleMergeCandidateTransferShadow runs the decision ASYNC in shadow mode
 // on a detached context bounded by the sub-budget, behind the one-slot
 // classification semaphore, and appends the shadow row. It never touches the
-// pass path; outside shadow it does nothing.
+// pass path. It runs in shadow mode, and in enforce mode when enforce is
+// withheld (ADR-124 D4), stamping enforce_withheld on the shadow row;
+// otherwise it does nothing.
 func (s *Server) scheduleMergeCandidateTransferShadow(req mergeCandidateTransferRequest) {
-	if s.mergeCandidateTransferMode() != MergeCandidateTransferShadow || req.Run == nil {
+	if req.Run == nil {
+		return
+	}
+	withheld := ""
+	switch s.mergeCandidateTransferMode() {
+	case MergeCandidateTransferShadow:
+	case MergeCandidateTransferEnforce:
+		if !transferEnforceWithheld(req.Run) {
+			return
+		}
+		withheld = transferEnforceWithheldNoCheck
+	default:
 		return
 	}
 	req.Reserve = 0
@@ -618,10 +790,13 @@ func (s *Server) scheduleMergeCandidateTransferShadow(req mergeCandidateTransfer
 		case <-wait.C:
 			d = mergeCandidateTransferDecision{Computed: true, ReasonCode: transferReasonBusy,
 				FromHead: req.PriorHead, ToHead: req.NewHead, Cause: req.Cause}
+			surface, prov := s.verdictTransferSurface(ctx, req.Run)
+			d.SurfaceDigest, d.SurfaceProvenance = surface.Digest(), prov
 		}
 		if !d.Computed {
 			return
 		}
+		d.EnforceWithheld = withheld
 		actx, cancel := context.WithTimeout(ctx, rebasePostMergeTailBudget)
 		defer cancel()
 		if err := s.appendMergeCandidateTransferShadow(actx, req.Run.ID, d); err != nil {

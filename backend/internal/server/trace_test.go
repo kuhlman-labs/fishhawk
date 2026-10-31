@@ -6451,6 +6451,69 @@ func addressedPendingConcern() prompt.PriorConcern {
 	return prompt.PriorConcern{ID: uuid.NewString(), State: string(concern.StateAddressedPending), Severity: "high", Category: "scope"}
 }
 
+// TestScopeProvenanceForReview_ParentFanOutFold pins the #4425 fan-out fold on
+// a fix-up pass: each fan-out entry folds under its own source with its
+// Detail and touched mark, a flat approval add keeps approval-add-scope-files
+// (it folds BEFORE the parent union, as on the serve side), the DECLARED
+// operation decides the coupled-test fold (a sub_plan delete yields no
+// sibling, a modify or empty operation does), and the residual is 0 with the
+// fan-out and positive without it for the same DeclaredFiles.
+func TestScopeProvenanceForReview_ParentFanOutFold(t *testing.T) {
+	s := New(Config{Addr: "127.0.0.1:0"})
+	fanOut := []parentFanOutScopePath{
+		{Path: "pkg/a/a.go", Operation: "modify", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 0 scope.files"},
+		{Path: "pkg/d/d.go", Operation: "delete", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 1 scope.files"},
+		{Path: "pkg/e/e.go", Source: "parent-sub-plan-scope", Detail: "declared in decomposition sub_plan 1 scope.files"},
+		{Path: "pkg/g/grant.go", Operation: "modify", Source: "parent-slice-add-scope-files", Detail: "granted to slice 2 at plan approval via add_scope_files_to_slice"},
+	}
+	flat := []string{"pkg/flat/flat.go"}
+	trig := prompt.Trigger{
+		AmendedScopeFiles: appendFanOutPaths(flat, fanOut),
+		PriorConcerns:     []prompt.PriorConcern{addressedPendingConcern()},
+	}
+	// plan.go, flat.go, the four fan-out paths, and the coupled siblings of
+	// every create/modify .go path: plan_test, flat_test, a_test, e_test,
+	// grant_test — never d_test.
+	const declared = 11
+	ev := &prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: declared}}
+	diff := provenanceDiff("pkg/plan.go", "pkg/a/a.go")
+
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), trig, fanOut, diff, ev)
+	if prov == nil || !prov.FixupPass {
+		t.Fatalf("prov = %+v, want a fix-up pass", prov)
+	}
+	for _, want := range []prompt.GateScopeFold{
+		{Path: "pkg/flat/flat.go", Source: "approval-add-scope-files"},
+		{Path: "pkg/a/a.go", Source: "parent-sub-plan-scope", Touched: true, Detail: fanOut[0].Detail},
+		{Path: "pkg/d/d.go", Source: "parent-sub-plan-scope", Detail: fanOut[1].Detail},
+		{Path: "pkg/e/e.go", Source: "parent-sub-plan-scope", Detail: fanOut[2].Detail},
+		{Path: "pkg/g/grant.go", Source: "parent-slice-add-scope-files", Detail: fanOut[3].Detail},
+		{Path: "pkg/a/a_test.go", Source: "fixup-coupled-test-sibling"},
+		{Path: "pkg/e/e_test.go", Source: "fixup-coupled-test-sibling"},
+		{Path: "pkg/g/grant_test.go", Source: "fixup-coupled-test-sibling"},
+	} {
+		got, ok := foldByPath(prov.Folds, want.Path)
+		if !ok || got != want {
+			t.Errorf("fold %s = %+v (present %v), want %+v", want.Path, got, ok, want)
+		}
+	}
+	if f, ok := foldByPath(prov.Folds, "pkg/d/d_test.go"); ok {
+		t.Errorf("a sub_plan DELETE folded a coupled test sibling %+v; the serve grants none", f)
+	}
+	if prov.UnexplainedCount != 0 {
+		t.Errorf("UnexplainedCount = %d with the fan-out, want 0 (folds %+v)", prov.UnexplainedCount, prov.Folds)
+	}
+
+	// The same DeclaredFiles with the fan-out absent (what the review computed
+	// before #4425): the trigger carries only the flat adds.
+	without := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
+		provenancePlan("pkg/plan.go"), prompt.Trigger{AmendedScopeFiles: flat, PriorConcerns: trig.PriorConcerns}, nil, diff, ev)
+	if without == nil || without.UnexplainedCount <= 0 {
+		t.Errorf("without the fan-out: prov = %+v, want a positive residual", without)
+	}
+}
+
 // TestScopeProvenanceForReview_ChannelSourceLabels pins that each fold channel
 // contributes an entry with the correct source label (#1914): approval
 // add_scope_files, approved mid-stage amendment, fix-up allow_create, and the
@@ -6463,7 +6526,7 @@ func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0"})
 		trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
 		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-			provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+			provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 		if prov == nil {
 			t.Fatal("prov = nil, want folds")
 		}
@@ -6478,7 +6541,7 @@ func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
 		seedApprovedAmendment(t, sa, runID, stageID, "pkg/amend.go")
 		s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
 		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-			provenancePlan("pkg/plan.go"), prompt.Trigger{}, provenanceDiff("pkg/plan.go"), nil)
+			provenancePlan("pkg/plan.go"), prompt.Trigger{}, nil, provenanceDiff("pkg/plan.go"), nil)
 		if prov == nil {
 			t.Fatal("prov = nil, want folds")
 		}
@@ -6495,7 +6558,7 @@ func TestScopeProvenanceForReview_ChannelSourceLabels(t *testing.T) {
 		s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au})
 		trig := prompt.Trigger{PriorConcerns: []prompt.PriorConcern{addressedPendingConcern()}}
 		prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-			provenancePlan("backend/internal/foo/main.go"), trig, provenanceDiff("backend/internal/foo/main.go"), nil)
+			provenancePlan("backend/internal/foo/main.go"), trig, nil, provenanceDiff("backend/internal/foo/main.go"), nil)
 		if prov == nil {
 			t.Fatal("prov = nil, want folds")
 		}
@@ -6525,6 +6588,7 @@ func TestScopeProvenanceForReview_TouchedMarking(t *testing.T) {
 	// Plan has two files; only one is touched → the other is an untouched plan path.
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
 		provenancePlan("pkg/plan_touched.go", "pkg/plan_untouched.go"), trig,
+		nil,
 		provenanceDiff("pkg/plan_touched.go", "pkg/touched.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
@@ -6553,7 +6617,7 @@ func TestScopeProvenanceForReview_PlanPathDedup(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/dup.go", "pkg/extra.go"}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/dup.go"), trig, provenanceDiff("pkg/dup.go"), nil)
+		provenancePlan("pkg/dup.go"), trig, nil, provenanceDiff("pkg/dup.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
 	}
@@ -6578,7 +6642,7 @@ func TestScopeProvenanceForReview_UnexplainedArithmetic(t *testing.T) {
 
 	// Reconstructed size = 2 (plan + add). DeclaredFiles 5 → residual 3.
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		base(), trig, provenanceDiff("pkg/plan.go"),
+		base(), trig, nil, provenanceDiff("pkg/plan.go"),
 		&prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 5}})
 	if prov == nil || prov.UnexplainedCount != 3 {
 		t.Fatalf("UnexplainedCount = %v, want 3", prov)
@@ -6586,7 +6650,7 @@ func TestScopeProvenanceForReview_UnexplainedArithmetic(t *testing.T) {
 
 	// DeclaredFiles 1 < reconstructed 2 → clamp to 0.
 	provClamp := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		base(), trig, provenanceDiff("pkg/plan.go"),
+		base(), trig, nil, provenanceDiff("pkg/plan.go"),
 		&prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 1}})
 	if provClamp == nil || provClamp.UnexplainedCount != 0 {
 		t.Fatalf("UnexplainedCount = %v, want 0 (clamp)", provClamp)
@@ -6602,13 +6666,13 @@ func TestScopeProvenanceForReview_NilScopeFacts(t *testing.T) {
 
 	// ev nil.
 	if prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil); prov == nil ||
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil); prov == nil ||
 		len(prov.Folds) != 1 || prov.UnexplainedCount != 0 {
 		t.Fatalf("nil ev: prov = %+v, want 1 fold and UnexplainedCount 0", prov)
 	}
 	// ev non-nil but ScopeFacts nil.
 	if prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"),
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"),
 		&prompt.GateEvidence{}); prov == nil || len(prov.Folds) != 1 || prov.UnexplainedCount != 0 {
 		t.Fatalf("nil ScopeFacts: prov = %+v, want 1 fold and UnexplainedCount 0", prov)
 	}
@@ -6623,7 +6687,7 @@ func TestScopeProvenanceForReview_AmendmentListError_BestEffort(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0", ScopeAmendmentRepo: sa})
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil, want the add fold despite the amendment list error")
 	}
@@ -6647,7 +6711,7 @@ func TestScopeProvenanceForReview_SkippedPathsMarkedTouched(t *testing.T) {
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/", "/abs.go", "../esc.go", "pkg/real.go"}}
 	// Diff touches nothing but the plan file.
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
 	}
@@ -6690,6 +6754,7 @@ func TestScopeProvenanceForReview_ReconstructionParity(t *testing.T) {
 	trig := prompt.Trigger{PriorConcerns: []prompt.PriorConcern{addressedPendingConcern()}}
 	prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
 		provenancePlan("backend/internal/foo/main.go"), trig,
+		nil,
 		provenanceDiff("backend/internal/foo/main.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
@@ -6734,6 +6799,7 @@ func TestScopeProvenanceForReview_ChildScopeAmendmentFold(t *testing.T) {
 	ev := &prompt.GateEvidence{ScopeFacts: &prompt.GateScopeFacts{DeclaredFiles: 2}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
 		provenancePlan("backend/internal/foo/main.go"), trig,
+		nil,
 		provenanceDiff("backend/internal/foo/main.go", "backend/internal/foo/childonly.go"), ev)
 	if prov == nil {
 		t.Fatal("prov = nil, want the child-scope-amendment fold")
@@ -6763,6 +6829,7 @@ func TestScopeProvenanceForReview_ChildScopeAmendmentFold(t *testing.T) {
 	// shrinks the residual.
 	provNoFold := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
 		provenancePlan("backend/internal/foo/main.go"), prompt.Trigger{},
+		nil,
 		provenanceDiff("backend/internal/foo/main.go", "backend/internal/foo/childonly.go"), ev)
 	if provNoFold == nil || provNoFold.UnexplainedCount != 1 {
 		t.Fatalf("without the child fold: UnexplainedCount = %v, want 1", provNoFold)
@@ -6776,7 +6843,7 @@ func TestScopeProvenanceForReview_NonDecomposed_NoChildFold(t *testing.T) {
 	s := New(Config{Addr: "127.0.0.1:0"})
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"pkg/add.go"}}
 	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(),
-		provenancePlan("pkg/plan.go"), trig, provenanceDiff("pkg/plan.go"), nil)
+		provenancePlan("pkg/plan.go"), trig, nil, provenanceDiff("pkg/plan.go"), nil)
 	if prov == nil {
 		t.Fatal("prov = nil")
 	}
@@ -6826,7 +6893,7 @@ func TestScopeProvenance_RenameSourceIsTouched_2398(t *testing.T) {
 	}}
 
 	prov := s.scopeProvenanceForReview(context.Background(), runID, stageID,
-		credstoreMovePlan(), prompt.Trigger{}, diff, nil)
+		credstoreMovePlan(), prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want a provenance naming the renames")
 	}
@@ -6907,7 +6974,7 @@ func TestScopeProvenance_CopySourceStaysUntouched(t *testing.T) {
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "pkg/copy.go", OldPath: "pkg/old.go", Status: policy.StatusCopied},
 	}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want an untouched plan path")
 	}
@@ -6944,7 +7011,7 @@ func TestScopeProvenance_RenameOldPathAbsent_Indeterminate(t *testing.T) {
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "pkg/moved.go", Status: policy.StatusRenamed}, // empty OldPath
 	}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want an indeterminate provenance")
 	}
@@ -6991,7 +7058,7 @@ func TestScopeProvenance_CopyOldPathAbsent_NotIndeterminate(t *testing.T) {
 	diff := policy.Diff{ChangedFiles: []policy.ChangedFile{
 		{Path: "x.go", Status: policy.StatusCopied}, // empty OldPath
 	}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, prompt.Trigger{}, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want an untouched plan path")
 	}
@@ -7035,7 +7102,7 @@ func TestScopeProvenance_FoldedRenameSource_PreservesProvenance(t *testing.T) {
 		renameRow("frontend/added.tsx", "frontend/moved.tsx"),
 	}}
 	trig := prompt.Trigger{AmendedScopeFiles: []string{"frontend/added.tsx"}}
-	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, trig, diff, nil)
+	prov := s.scopeProvenanceForReview(context.Background(), uuid.New(), uuid.New(), pl, trig, nil, diff, nil)
 	if prov == nil {
 		t.Fatal("prov = nil; want a provenance naming the folded rename")
 	}
@@ -14092,13 +14159,13 @@ func TestAutoCloseUnjudgedRoutedConcerns_ApplyResolutionError_NoAuditEntry(t *te
 	s, au, cr, runID, stageID := vetoRoundServer()
 	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "note", "routed")
 	seedPushedFixupPass(t, au, runID, stageID, row.ID)
-	cr.applyResolutionErr = errors.New("concern store write failed")
+	cr.applyDispositionErr = errors.New("concern store write failed")
 
 	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
 		autoCloseRound("fable-5", 200, planreview.VerdictApprove),
 	}, 1, "")
 
-	cr.applyResolutionErr = nil
+	cr.applyDispositionErr = nil
 	if got := concernRowAfterRound(t, cr, row.ID); got.State != concern.StateAddressedPending {
 		t.Errorf("state = %q, want addressed_pending — the write failed", got.State)
 	}
@@ -15784,5 +15851,289 @@ func TestTraceToReviewPrompt_FixupCommitClaims(t *testing.T) {
 		if !strings.Contains(got, w) {
 			t.Errorf("reviewer prompt missing %q:\n%s", w, got)
 		}
+	}
+}
+
+// --- ADR-117 A1.7 reviewed head on implement_review_started (E94.3 / #4694) ---
+
+// reviewedHeadSliceBundle builds a decomposition-child (PushToSharedBranch)
+// trace bundle for fixture repository acme/widgets carrying a rendered,
+// untruncated patch over two files and the given verify_run events, in order.
+func reviewedHeadSliceBundle(t *testing.T, verifies []map[string]any) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	writeLine := func(seq int, kind string, data any) {
+		payload, err := json.Marshal(data)
+		if err != nil {
+			t.Fatal(err)
+		}
+		line, _ := json.Marshal(map[string]any{"seq": seq, "kind": kind, "data": json.RawMessage(payload)})
+		raw.Write(line)
+		raw.WriteByte('\n')
+	}
+	writeLine(1, "manifest", bundle.Manifest{BundleSchema: "v1", PushToSharedBranch: true})
+	writeLine(2, "git_diff", map[string]any{
+		"kind": "name_status", "base_ref": "origin/main", "num_files": 2,
+		"files": []map[string]string{{"path": "widgets/a.go", "status": "modified"}, {"path": "widgets/b.go", "status": "modified"}},
+		"patch": gitHeader("widgets/a.go") + "@@ -1 +1 @@\n-x\n+y\n" + gitHeader("widgets/b.go") + "@@ -1 +1 @@\n-x\n+y\n",
+	})
+	for i, v := range verifies {
+		writeLine(3+i, "verify_run", v)
+	}
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// reviewedHeadVerify is one verify_run event payload.
+func reviewedHeadVerify(head, tree, change, outcome string) map[string]any {
+	return map[string]any{"command": "scripts/test verify", "head_sha": head, "tree_sha": tree, "change_id": change, "exit_code": 0, "output": "", "outcome": outcome}
+}
+
+// reviewedHeadOf decodes the reviewed_head of every implement_review_started
+// row for the run, failing when a row omits the key.
+func reviewedHeadOf(t *testing.T, au *auditFake, runID uuid.UUID) []planreview.ReviewedHead {
+	t.Helper()
+	var out []planreview.ReviewedHead
+	for _, raw := range startedPayloadsRaw(t, au, runID, "implement_review_started") {
+		var p struct {
+			ReviewedHead *planreview.ReviewedHead `json:"reviewed_head"`
+		}
+		if err := json.Unmarshal([]byte(raw), &p); err != nil {
+			t.Fatalf("decode %s: %v", raw, err)
+		}
+		if p.ReviewedHead == nil {
+			t.Fatalf("implement_review_started carries no reviewed_head: %s", raw)
+		}
+		out = append(out, *p.ReviewedHead)
+	}
+	return out
+}
+
+// TestReviewedHead_TraceHookSliceRound_RecordsWipTree drives a REAL
+// decomposition-child (slice) trace upload whose bundle carries TWO verify_run
+// events: the round's reviewed_head.sha is the LAST (authoritative) event's
+// head, with that event's tree and change id, while the top-level head_sha
+// stays the FIRST head (the #797 dedup key).
+//
+// COUNTERFACTUAL CF-A1: delete `started.ReviewedHead = reviewedHead` in plan.go
+// → no reviewed_head key on the row → RED.
+func TestReviewedHead_TraceHookSliceRound_RecordsWipTree(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.Repo = "acme/widgets"
+	priv, _ := sf.issue(t, runRow.ID)
+	b := reviewedHeadSliceBundle(t, []map[string]any{
+		reviewedHeadVerify("head-first", "tree-first", "change-first", "failed"),
+		reviewedHeadVerify("head-last", "tree-last", "change-last", "passed"),
+	})
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, b, ""); w.Code != http.StatusAccepted {
+		t.Fatalf("upload status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	started := startedPayloads(t, au, runRow.ID)
+	if len(started) != 1 || started[0].HeadSHA != "head-first" {
+		t.Fatalf("started = %+v, want one round keyed on the FIRST head (the #797 dedup key)", started)
+	}
+	rh := reviewedHeadOf(t, au, runRow.ID)[0]
+	if rh.Status != planreview.ReviewedHeadRecorded || rh.Kind != planreview.ReviewedHeadKindWipTree || rh.Origin != reviewRoundOriginTrace {
+		t.Errorf("reviewed_head = %+v, want recorded wip_tree / trace", rh)
+	}
+	if rh.SHA != "head-last" || rh.TreeSHA != "tree-last" || rh.ChangeID != "change-last" {
+		t.Errorf("reviewed identity = sha %q tree %q change %q, want the LAST event's head-last / tree-last / change-last", rh.SHA, rh.TreeSHA, rh.ChangeID)
+	}
+	if !reflect.DeepEqual(rh.Files, []string{"widgets/a.go", "widgets/b.go"}) || len(rh.PartialFiles) != 0 || len(rh.OmittedFiles) != 0 || !rh.PatchRendered {
+		t.Errorf("rendered sets = %+v, want both files fully shown", rh)
+	}
+}
+
+// TestReviewedHead_TraceHookNoVerify_HeadUnknown: a trace bundle whose
+// verify_run carries no tree_sha has no authoritative verify head, so the round
+// records head_unknown (no_verify_head) and still dispatches.
+func TestReviewedHead_TraceHookNoVerify_HeadUnknown(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, sf, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementAdvisoryReviewers)
+	runRow.Repo = "acme/widgets"
+	priv, _ := sf.issue(t, runRow.ID)
+	if w := shipRequest(t, s, runRow.ID, implStage.ID, "raw", priv, implementPushGatedBundleWithHeadSHA(t, 2, "dedup-only"), ""); w.Code != http.StatusAccepted {
+		t.Fatalf("upload status = %d, want 202:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	heads := reviewedHeadOf(t, au, runRow.ID)
+	if len(heads) != 1 {
+		t.Fatalf("rounds = %d, want 1", len(heads))
+	}
+	rh := heads[0]
+	if rh.Status != planreview.ReviewedHeadUnknown || rh.UnknownReason != reviewedHeadReasonNoVerifyHead || rh.SHA != "" {
+		t.Errorf("reviewed_head = %+v, want head_unknown / no_verify_head with no sha (never the dedup head)", rh)
+	}
+	if rh.PatchRendered || !reflect.DeepEqual(rh.OmittedFiles, []string{"file0.go", "file1.go"}) {
+		t.Errorf("a patch-less bundle must record every path omitted: %+v", rh)
+	}
+}
+
+// reviewedHeadConsolidatedRound dispatches a consolidated round for fixture
+// repository acme/widgets against the canned compare body and returns its
+// reviewed_head.
+func reviewedHeadConsolidatedRound(t *testing.T, compareBody string) planreview.ReviewedHead {
+	t.Helper()
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	parent, _ := seedConsolidatedParent(t, rr, art, specImplementAdvisoryReviewers)
+	parent.Repo = "acme/widgets"
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, ArtifactRepo: art, AuditRepo: au,
+		PlanReviewers: singleReviewerSet{reviewer},
+		GitHub:        cannedComparePatchClient(t, compareBody),
+	})
+	s.DispatchConsolidatedReview(context.Background(), parent.ID, "consolidated-base", "fishhawk/run-"+parent.ID.String()[:8])
+	s.waitBackgroundReviews()
+	heads := reviewedHeadOf(t, au, parent.ID)
+	if len(heads) != 1 {
+		t.Fatalf("consolidated rounds = %d, want 1", len(heads))
+	}
+	return heads[0]
+}
+
+// TestReviewedHead_ConsolidatedRound_RecordsCompareHead: a consolidated round
+// records the compare head (cmp.HeadSHA) and its compare base.
+func TestReviewedHead_ConsolidatedRound_RecordsCompareHead(t *testing.T) {
+	rh := reviewedHeadConsolidatedRound(t, cannedCompareOneFile)
+	if rh.Status != planreview.ReviewedHeadRecorded || rh.Kind != planreview.ReviewedHeadKindCompareHead || rh.Origin != reviewRoundOriginConsolidated {
+		t.Errorf("reviewed_head = %+v, want recorded compare_head / consolidated", rh)
+	}
+	if rh.SHA != "headsha1" || rh.BaseSHA != "consolidated-base" || rh.TreeSHA != "" {
+		t.Errorf("head = sha %q base %q tree %q, want headsha1 / consolidated-base / none", rh.SHA, rh.BaseSHA, rh.TreeSHA)
+	}
+	if !reflect.DeepEqual(rh.Files, []string{"x.go"}) || !rh.PatchRendered {
+		t.Errorf("sets = %+v, want x.go fully shown", rh)
+	}
+}
+
+// TestReviewedHead_ConsolidatedRound_HeadUnknown: a compare that names no head,
+// and a compare whose commit listing was capped (a NON-empty HeadSHA that is
+// not the tip), each record head_unknown with their reason.
+//
+// COUNTERFACTUAL CF-A3: reviewed_head.go `rh.Status =
+// planreview.ReviewedHeadUnknown` → `...ReviewedHeadRecorded`; the
+// commits_truncated case has a NON-empty head, so no empty-sha guard masks it
+// → status recorded → RED.
+func TestReviewedHead_ConsolidatedRound_HeadUnknown(t *testing.T) {
+	cases := []struct {
+		name, body, reason string
+	}{
+		{name: "no commits", reason: reviewedHeadReasonCompareNoCommits, body: `{
+	"total_commits": 0, "commits": [],
+	"files": [{"filename":"x.go","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+b"}]
+}`},
+		{name: "commits truncated", reason: reviewedHeadReasonCompareCommitsTruncated, body: `{
+	"total_commits": 300, "commits": [{"sha":"listed-not-tip"}],
+	"files": [{"filename":"x.go","status":"modified","changes":2,"patch":"@@ -1 +1 @@\n-a\n+b"}]
+}`},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			rh := reviewedHeadConsolidatedRound(t, tc.body)
+			if rh.Status != planreview.ReviewedHeadUnknown || rh.UnknownReason != tc.reason {
+				t.Errorf("status/reason = %q/%q, want head_unknown/%s", rh.Status, rh.UnknownReason, tc.reason)
+			}
+			if rh.SHA != "" || rh.Kind != planreview.ReviewedHeadKindCompareHead || rh.BaseSHA != "consolidated-base" {
+				t.Errorf("reviewed_head = %+v, want no sha, compare_head kind, base kept", rh)
+			}
+			if !reflect.DeepEqual(rh.Files, []string{"x.go"}) {
+				t.Errorf("head_unknown round must still record its sets: %+v", rh)
+			}
+		})
+	}
+}
+
+// TestReviewedHead_FixupReReview_RecordsPushedCommit: the post-fix-up
+// re-review records the pushed head and the pass's compare base.
+func TestReviewedHead_FixupReReview_RecordsPushedCommit(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
+	runRow.Repo = "acme/widgets"
+
+	s.maybeBackstopFixupReReview(context.Background(), runRow.ID, implStage, "head-pushed", "base-pass")
+	s.waitBackgroundReviews()
+
+	heads := reviewedHeadOf(t, au, runRow.ID)
+	if len(heads) != 1 {
+		t.Fatalf("rounds = %d, want 1", len(heads))
+	}
+	rh := heads[0]
+	if rh.Status != planreview.ReviewedHeadRecorded || rh.Kind != planreview.ReviewedHeadKindPushedCommit || rh.Origin != reviewRoundOriginFixupPush {
+		t.Errorf("reviewed_head = %+v, want recorded pushed_commit / fixup_push", rh)
+	}
+	if rh.SHA != "head-pushed" || rh.BaseSHA != "base-pass" || rh.DiffMode != planreview.ReviewedHeadDiffFull {
+		t.Errorf("head = sha %q base %q mode %q, want head-pushed / base-pass / full", rh.SHA, rh.BaseSHA, rh.DiffMode)
+	}
+}
+
+// TestReviewedHead_DeltaReReview_ScopesDeltaFiles: on a #1725 delta re-review
+// the path sets describe the DELTA the round reviewed, never the full diff, and
+// diff_mode is delta.
+func TestReviewedHead_DeltaReReview_ScopesDeltaFiles(t *testing.T) {
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s, _, au, _, runRow, implStage := newImplementReviewServer(t, reviewer, specImplementGatingReviewers)
+	runRow.Repo = "acme/widgets"
+	seedReReview(t, s, au, runRow, implStage.ID, "priorhead")
+	s.cfg.GitHub = cannedComparePatchClient(t, deltaCompareBody)
+
+	ctx := withReviewRoundSource(t.Context(), reviewRoundSource{Origin: reviewRoundOriginFixupPush, BaseSHA: "base-pass"})
+	if s.runImplementReviews(ctx, runRow.ID, implStage.ID, fullReReviewBundleDiff(), nil, "currenthead", nil) {
+		t.Fatal("gating approve must not gate")
+	}
+	heads := reviewedHeadOf(t, au, runRow.ID)
+	if len(heads) != 1 {
+		t.Fatalf("rounds = %d, want 1", len(heads))
+	}
+	rh := heads[0]
+	if rh.DiffMode != planreview.ReviewedHeadDiffDelta {
+		t.Errorf("diff_mode = %q, want delta", rh.DiffMode)
+	}
+	if !reflect.DeepEqual(rh.Files, []string{"delta/only.go"}) || len(rh.PartialFiles) != 0 || len(rh.OmittedFiles) != 0 || rh.ChangedFileCount != 1 {
+		t.Errorf("sets = %+v, want the delta's delta/only.go only (never full/only.go)", rh)
+	}
+	if rh.SHA != "currenthead" || rh.Kind != planreview.ReviewedHeadKindPushedCommit {
+		t.Errorf("head = %q kind %q, want currenthead / pushed_commit", rh.SHA, rh.Kind)
+	}
+}
+
+// TestReviewedHead_PlanRoundUnchanged: a REAL plan upload's plan_review_started
+// row never carries reviewed_head, so its payload is byte-identical to before
+// A1.7 apart from the #4436 seed_unresolved key: this upload sends no plan seed
+// header, so the round records seed_not_recorded.
+func TestReviewedHead_PlanRoundUnchanged(t *testing.T) {
+	rr := newOrchestratorRepo()
+	art := newFakeArtifactRepo()
+	au := newAuditFake()
+	sf := newSigningFake()
+	runRow := rr.seedRun()
+	runRow.WorkflowID = "feature_change"
+	runRow.WorkflowSpec = specRedispatchAdvisory
+	runRow.Repo = "acme/widgets"
+	planStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
+	planStage.RequiresApproval = true
+	reviewer := &fakePlanReviewer{verdict: &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, model: "claude-opus-4-8"}
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, AuditRepo: au, RunRepo: rr, ArtifactRepo: art, PlanReviewers: singleReviewerSet{reviewer}})
+	priv, _ := sf.issue(t, runRow.ID)
+	if w := shipPlanRequest(t, s, runRow.ID, planStage.ID, priv, validPlanBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("plan upload status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+
+	raws := startedPayloadsRaw(t, au, runRow.ID, "plan_review_started")
+	if len(raws) != 1 {
+		t.Fatalf("plan_review_started = %d, want 1", len(raws))
+	}
+	if want := `{"configured_agents":2,"authority":"advisory","seed_unresolved":"seed_not_recorded"}`; raws[0] != want {
+		t.Errorf("plan_review_started payload = %s, want byte-identical %s (no reviewed_head)", raws[0], want)
 	}
 }

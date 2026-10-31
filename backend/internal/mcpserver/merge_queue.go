@@ -83,7 +83,9 @@ base_ref (optional) narrows the read to one base. Admission is automatic; a
 held entry needs no verb. Do NOT re-invoke fishhawk_merge_run: your merge
 intent persists until the entry settles, and the queue merges the run itself
 on its green pass, pinned to the verified head (while the entry exists an
-inline merge answers merge_queue_owns_merge). fishhawk_get_run_status's
+inline merge answers merge_queue_owns_merge). To take a YIELDED entry's
+merge out of the queue and merge it inline instead, withdraw its intent with
+fishhawk_withdraw_merge_intent (#4685). fishhawk_get_run_status's
 merge_candidate_queue block shows one run's entry; this read shows the whole
 line; its merge_queue_ejection block shows one run's unresolved ejection.
 

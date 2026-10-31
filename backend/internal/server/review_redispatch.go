@@ -679,6 +679,9 @@ func (s *Server) redispatchImplementRound(ctx context.Context, runID uuid.UUID, 
 		if !ok {
 			return redispatchSlugTraceBundleUnavail
 		}
+		// The re-dispatched round records the head the orphaned round judged
+		// (ADR-117 A1.7): the bundle's authoritative verify head.
+		ctx = withReviewRoundSource(ctx, reviewRoundSource{Origin: payload.RoundOrigin, BaseSHA: payload.RoundBaseSHA, HeadSHA: in.verifyHead})
 		s.runImplementReviewsForTree(ctx, runID, stageID, in.diff, in.scopeDrift, in.headSHA, in.treeSHA, in.changeID, in.gateEvidence)
 		return ""
 	}
@@ -779,13 +782,15 @@ type implementReviewInputs struct {
 	headSHA      string
 	treeSHA      string
 	changeID     string
+	verifyHead   string
 	gateEvidence *prompt.GateEvidence
 }
 
 // implementReviewInputsFromBundle re-extracts the trace hook's review inputs
 // from a stored bundle, with the hook's own degrade contract
 // (advanceStageAfterTrace): only the diff is required; scope drift (minus the
-// folded paths), head, verify identity and gate evidence each degrade to empty.
+// folded paths), head, verify identity, the authoritative verify head (ADR-117
+// A1.7's reviewed head) and gate evidence each degrade to empty.
 func implementReviewInputsFromBundle(b []byte) (implementReviewInputs, bool) {
 	var in implementReviewInputs
 	diff, err := bundle.ExtractDiff(b)
@@ -801,6 +806,9 @@ func implementReviewInputsFromBundle(b []byte) (implementReviewInputs, bool) {
 	}
 	if tree, change, terr := bundle.ExtractVerifyIdentity(b); terr == nil {
 		in.treeSHA, in.changeID = tree, change
+	}
+	if vh, verr := bundle.ExtractVerifyHead(b); verr == nil {
+		in.verifyHead = vh
 	}
 	if ev, gerr := bundle.ExtractGateEvidence(b); gerr == nil {
 		in.gateEvidence = gateEvidenceForReview(ev, folded)

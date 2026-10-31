@@ -569,6 +569,13 @@ func TestClassifyMergeDispatchOutcome(t *testing.T) {
 		{"checks pending (our pre-call refusal)", fmt.Errorf("x: %w", forge.ErrPullRequestUnstableStatus), mergeDispatchRelease},
 		{"405 not mergeable", fmt.Errorf("x: %w", forge.ErrPullRequestNotMergeable), mergeDispatchRelease},
 		{"409 head mismatch", fmt.Errorf("x: %w", forge.ErrMergeConflict), mergeDispatchRelease},
+		// #4749: a head mismatch releases ONLY on a basis the forge
+		// guarantees applied nothing.
+		{"head mismatch basis precheck", headMismatchCause(githubclient.HeadMismatchPrecheck), mergeDispatchRelease},
+		{"head mismatch basis rest_sha", headMismatchCause(githubclient.HeadMismatchRESTSha), mergeDispatchRelease},
+		{"head mismatch basis graphql_reread", headMismatchCause(githubclient.HeadMismatchGraphQLReread), mergeDispatchUncertain},
+		{"head mismatch empty basis", headMismatchCause(""), mergeDispatchUncertain},
+		{"head mismatch unrecognised basis", headMismatchCause("forge_said_so"), mergeDispatchUncertain},
 		{"422 merge PUT (typed)", fmt.Errorf("x: %w: %w", forge.ErrValidation, forge.ErrMergeUnprocessable), mergeDispatchRelease},
 		{"bare validation / generic GraphQL envelope", fmt.Errorf("x: %w", forge.ErrValidation), mergeDispatchUncertain},
 		{"403 may be a rate limit", fmt.Errorf("x: %w", forge.ErrForbidden), mergeDispatchUncertain},
@@ -583,4 +590,11 @@ func TestClassifyMergeDispatchOutcome(t *testing.T) {
 			t.Errorf("%s: classify = %s, want %s", tc.name, got, tc.want)
 		}
 	}
+}
+
+// headMismatchCause is a pinned-merge head-mismatch refusal as githubclient
+// returns it: ErrMergeConflict carrying a *HeadMismatchError with basis.
+func headMismatchCause(basis string) error {
+	return fmt.Errorf("%w: %w", forge.ErrMergeConflict,
+		&githubclient.HeadMismatchError{Basis: basis, ExpectedHeadSHA: "h1", ObservedHeadSHA: "h2"})
 }

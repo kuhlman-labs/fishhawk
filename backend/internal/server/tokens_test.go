@@ -875,7 +875,9 @@ func TestBearerAuth_NilRepo_Anonymous(t *testing.T) {
 
 // fakeIdentityProvider stubs identity.IdentityProvider for the
 // token-login handler tests. VerifyAccessToken maps any token to a fixed
-// subject (or returns verifyErr); PermissionLevel returns a fixed tier
+// subject (or returns verifyErr) — it performs no client binding, so the
+// #4627 binding is exercised against the REAL providers in
+// tokens_clientbinding_test.go; PermissionLevel returns a fixed tier
 // (or permErr). ResolveMembership/VerifyUser are unused here.
 type fakeIdentityProvider struct {
 	subject   string
@@ -1163,7 +1165,12 @@ func TestTokenLoginMint_EmptyAccessToken_400(t *testing.T) {
 }
 
 func TestTokenLoginMint_VerificationFails_401(t *testing.T) {
-	s := newFakeLoginServer(t, &fakeIdentityProvider{verifyErr: errors.New("bad token")}, nil)
+	// The server log gets the provider + a closed-set reason class, never
+	// the provider's error text (#4627 C1).
+	var logs bytes.Buffer
+	s := newFakeLoginServer(t, &fakeIdentityProvider{verifyErr: errors.New("bad token")}, func(cfg *Config) {
+		cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+	})
 	w := tokenRequest(t, s, http.MethodPost, "/v0/tokens/login", "",
 		map[string]any{"access_token": "gho_bad"})
 	if w.Code != http.StatusUnauthorized {
@@ -1171,6 +1178,10 @@ func TestTokenLoginMint_VerificationFails_401(t *testing.T) {
 	}
 	if !strings.Contains(w.Body.String(), "token_verification_failed") {
 		t.Errorf("body missing token_verification_failed:\n%s", w.Body.String())
+	}
+	if got := logs.String(); !strings.Contains(got, "reason="+tokenLoginReasonSubjectResolutionFailed) ||
+		strings.Contains(got, "bad token") {
+		t.Errorf("server log must carry the reason class and not the provider error text; got:\n%s", got)
 	}
 }
 

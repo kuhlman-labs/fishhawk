@@ -808,17 +808,43 @@ export interface ConcernRow {
 }
 export type WaivedConcern = ConcernRow;
 
-/** Body of POST /v0/concerns/{id}/waive — the REQUIRED audited reason. */
+/**
+ * The closed set of HUMAN concern judgements (ADR-117 D1 phase 2, E94.7 /
+ * #4840) — the server's concern.HumanJudgements. `unlabelled` is the read of
+ * an unjudged concern, never a judgement a human sends, so it is absent here.
+ */
+export type ConcernJudgement =
+  | 'defect'
+  | 'defect_pre_existing'
+  | 'no_defect'
+  | 'tradeoff'
+  | 'preference'
+  | 'stale'
+  | 'insufficient_evidence';
+
+/**
+ * Body of POST /v0/concerns/{id}/waive — the REQUIRED audited reason and the
+ * REQUIRED judgement (E94.7 / #4840). `tradeoff_cost` is required with a
+ * `tradeoff` judgement and refused with any other. The server also accepts a
+ * judgement-less waive whose reason opens with a recognised prefix
+ * (`false_positive:`, `accepted_tradeoff:`, `preference:`); the panel always
+ * sends an explicit judgement, so the type requires it.
+ */
 export interface ConcernWaiveRequest {
   reason: string;
+  judgement: ConcernJudgement;
+  tradeoff_cost?: string;
 }
 
 /**
- * Body of POST /v0/concerns/{id}/defer. `parent_epic` is the only
- * operator-supplied field the server cannot derive; the rest override
- * server defaults.
+ * Body of POST /v0/concerns/{id}/defer. `judgement` is REQUIRED (E94.7 /
+ * #4840), with `tradeoff_cost` required for a `tradeoff` judgement and
+ * refused otherwise. `parent_epic` is the only other operator-supplied field
+ * the server cannot derive; the rest override server defaults.
  */
 export interface ConcernDeferRequest {
+  judgement: ConcernJudgement;
+  tradeoff_cost?: string;
   parent_epic?: string;
   n?: string;
   type?: string;

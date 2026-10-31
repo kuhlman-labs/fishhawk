@@ -91,7 +91,8 @@ func TestConfigureAcceptanceNetSandbox_Rows(t *testing.T) {
 		wantClauses   []string
 		wantNoClauses []string
 		// wantNoOptionProfile asserts the profile is byte-identical to a
-		// zero-option netsandbox.Profile render.
+		// netsandbox.Profile render carrying ONLY the signal-confinement
+		// option (no credential section).
 		wantNoOptionProfile bool
 	}{
 		{name: "invalid mode fails config", mode: "strict", proxyURL: proxyURL, iso: isoAutoNoCred, probe: avail,
@@ -130,7 +131,7 @@ func TestConfigureAcceptanceNetSandbox_Rows(t *testing.T) {
 			wantLog:       []string{fieldsNoCredApplied},
 			wantClauses:   []string{credFileClause, sshHomeClause, sshSocketClause},
 			wantNoClauses: []string{machLookupClause}},
-		{name: "credential isolation off: profile byte-identical to the no-option render", mode: "auto", proxyURL: proxyURL,
+		{name: "credential isolation off: profile byte-identical to the signal-only render", mode: "auto", proxyURL: proxyURL,
 			iso: isoOff, probe: avail, wantEvent: "acceptance_net_sandbox_applied", wantWrapper: true,
 			wantLog:             []string{fieldsOff},
 			wantNoClauses:       []string{machLookupClause, credFileClause, sshHomeClause, "unix-socket"},
@@ -207,13 +208,81 @@ func TestConfigureAcceptanceNetSandbox_Rows(t *testing.T) {
 				}
 			}
 			if r.wantNoOptionProfile {
-				plain, err := netsandbox.Profile("127.0.0.1:8090", hosts)
+				plain, err := netsandbox.Profile("127.0.0.1:8090", hosts, netsandbox.WithSignalConfinement())
 				if err != nil {
-					t.Fatalf("no-option render: %v", err)
+					t.Fatalf("signal-only render: %v", err)
 				}
 				if profile != plain {
-					t.Errorf("profile is not byte-identical to the no-option render:\n got: %s\nwant: %s", profile, plain)
+					t.Errorf("profile is not byte-identical to the signal-only render:\n got: %s\nwant: %s", profile, plain)
 				}
+			}
+		})
+	}
+}
+
+// signalClauseLines is the signal section netsandbox.WithSignalConfinement
+// renders (#4855), spelled out so this test pins what the runner applies.
+const signalClauseLines = "(deny signal)\n(allow signal (target same-sandbox))\n"
+
+// TestConfigureAcceptanceNetSandbox_SignalConfinement (#4855): every applied
+// profile carries the signal section whether credential isolation is active
+// or off, the applied event says signals_confined:true, and the disabled and
+// unavailable events — including a host whose Seatbelt rejects the signal
+// grammar, which the probe reports as unavailable — say false, carry the
+// printed degradation reason, and produce no wrapper.
+func TestConfigureAcceptanceNetSandbox_SignalConfinement(t *testing.T) {
+	avail := func(context.Context) (bool, string) { return true, "" }
+	// The reason netsandbox.Probe reports when sandbox-exec rejects the
+	// signal grammar its probe profile carries.
+	const grammarReason = "net-sandbox unavailable: sandbox-exec deny-all probe failed (exit status 65: sandbox-exec: unbound variable: same-sandbox)"
+	unsupported := func(context.Context) (bool, string) { return false, grammarReason }
+	hosts := []string{"localhost:3000"}
+	rows := []struct {
+		name        string
+		mode        string
+		iso         acceptanceCredentialIsolation
+		probe       func(context.Context) (bool, string)
+		wantEvent   string
+		wantWrapper bool
+		wantLog     []string
+	}{
+		{"applied, credential isolation active", "auto", isoAutoCred, avail, "acceptance_net_sandbox_applied", true,
+			[]string{`"signals_confined":true`}},
+		{"applied, credential isolation off", "auto", isoOff, avail, "acceptance_net_sandbox_applied", true,
+			[]string{`"signals_confined":true`}},
+		{"disabled claims no signal denial", "off", isoAutoCred, avail, "acceptance_net_sandbox_disabled", false,
+			[]string{`"signals_confined":false`}},
+		{"host rejecting the signal grammar degrades loudly", "auto", isoAutoCred, unsupported, "acceptance_net_sandbox_unavailable", false,
+			[]string{`"signals_confined":false`, `"enforcement":"env-only"`, `"reason":"` + grammarReason + `"`}},
+	}
+	for _, r := range rows {
+		t.Run(r.name, func(t *testing.T) {
+			var log strings.Builder
+			wrapper, failReason, _ := configureAcceptanceNetSandbox(context.Background(),
+				fakeEnv(map[string]string{acceptanceNetSandboxEnvVar: r.mode}), "http://127.0.0.1:8090", hosts, r.iso, r.probe, &log)
+			out := log.String()
+			if failReason != "" {
+				t.Fatalf("failReason = %q, want none: %s", failReason, out)
+			}
+			if strings.Count(out, `"event":"`) != 1 || !strings.Contains(out, `"event":"`+r.wantEvent+`"`) {
+				t.Fatalf("want exactly one %s event, got: %s", r.wantEvent, out)
+			}
+			for _, want := range r.wantLog {
+				if !strings.Contains(out, want) {
+					t.Errorf("log missing %s: %s", want, out)
+				}
+			}
+			if !r.wantWrapper {
+				if wrapper != nil {
+					t.Fatalf("wrapper = %q, want none", wrapper)
+				}
+				return
+			}
+			if len(wrapper) != 3 || wrapper[0] != "sandbox-exec" || wrapper[1] != "-p" {
+				t.Fatalf("wrapper = %q, want sandbox-exec -p <profile>", wrapper)
+			}
+			if !strings.Contains(wrapper[2], signalClauseLines) {
+				t.Errorf("applied profile lacks the signal section %q:\n%s", signalClauseLines, wrapper[2])
 			}
 		})
 	}

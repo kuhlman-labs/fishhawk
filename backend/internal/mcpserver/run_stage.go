@@ -96,7 +96,7 @@ type RunStageInput struct {
 	Stage         string `json:"stage" jsonschema:"stage type: plan | implement | review | acceptance. The acceptance stage (E31.9) validates the merged change against a running preview/target instance; prefer fishhawk_dispatch_stage for it (it runs long, non-blocking) and it takes neither --plan-out nor --check-base-ref"`
 	WorkingDir    string `json:"working_dir,omitempty" jsonschema:"checkout the agent runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path) Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots. The INHERITED binding is confined identically, so a bound checkout stays usable exactly when it is itself inside a root."`
 	GitHubRepo    string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
-	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the implement stage; defaults to main. It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
+	BaseBranch    string `json:"base_branch,omitempty" jsonschema:"base branch for the stage; when omitted, the run's forge default_branch (GET /v0/runs/{run_id}); an omitted base_branch on a run whose default branch is unresolved is REFUSED naming default_branch_unresolved_reason (a gitlab run always reports forge_unsupported, so pass it). It applies even when push_and_open_pr is false — the runner passes --base-branch (and --check-base-ref for every implement stage) unconditionally and provisions the run worktree from it"`
 	PushAndOpenPR *bool  `json:"push_and_open_pr,omitempty" jsonschema:"when true, the implement stage pushes and opens a PR. Defaults to TRUE for the MCP-driven local loop (ADR-031 Phase 1) so every run carries a pull_request_url for the review gate + merge reconciler. A bare omitted value resolves to true. On a STANDALONE implement stage false is supported and unchanged (the E22.8/#406 commit-yourself flow): the agent's work is left in the working tree for the operator to commit, and the stage settles on its trace upload. On a DECOMPOSITION CHILD or a FIX-UP pass false is REFUSED (#2691), because those stages settle on a push this flag suppresses — use fishhawk_run_children for a decomposition child, and re-dispatch without push_and_open_pr=false for a fix-up"`
 	RunnerBinary  string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, fishhawk-runner sibling to this binary (os.Executable dir), then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	Verbose       bool   `json:"verbose,omitempty" jsonschema:"when true, return the full runner event list including every stage_progress heartbeat; default false returns a compact result that omits routine heartbeats"`
@@ -653,9 +653,9 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 
 	// (4) Build the runner argv via the shared composer so this path and
 	// the detached fishhawk_dispatch_stage verb (#1232) cannot drift.
-	baseBranch := in.BaseBranch
-	if baseBranch == "" {
-		baseBranch = "main"
+	baseBranch, err := forgeTarget.resolveSpawnBaseBranch(runUUID, in.BaseBranch)
+	if err != nil {
+		return nil, RunStageOutput{}, err
 	}
 	argv := r.composeRunnerArgv(in, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
 
@@ -1191,11 +1191,16 @@ func (r *runResolver) resolveRunnerBinary(input string) (string, error) {
 
 // runForgeTarget is a run's resolved forge target (E45.46 / #3463): the forge
 // id, the GitLab instance root (gitlab only), and the run row's repo slug (the
-// gitlab default for an omitted github_repo).
+// gitlab default for an omitted github_repo). DefaultBranch and
+// DefaultBranchUnresolvedReason (#4758) are copied from the SAME single-run
+// read: the run's forge default branch, or the reason it could not be
+// resolved; resolveSpawnBaseBranch derives an omitted base_branch from them.
 type runForgeTarget struct {
-	Forge         string
-	GitLabBaseURL string
-	Repo          string
+	Forge                         string
+	GitLabBaseURL                 string
+	Repo                          string
+	DefaultBranch                 string
+	DefaultBranchUnresolvedReason string
 }
 
 // argv renders the target's runner flags: `--forge gitlab --gitlab-base-url
@@ -1209,6 +1214,29 @@ func (t runForgeTarget) argv() []string {
 	return []string{"--forge", startRunForgeGitLab, "--gitlab-base-url", t.GitLabBaseURL}
 }
 
+// baseBranchNotReported is the refusal reason when the single-run read carried
+// NEITHER default_branch NOR default_branch_unresolved_reason (a pre-#4660
+// fishhawkd). MCP-local; outside defaultbranch's closed set.
+const baseBranchNotReported = "not_reported"
+
+// resolveSpawnBaseBranch is the ONE base-branch derivation for every
+// runner-spawn producer (#4758): an explicit base_branch wins; otherwise the
+// run's forge default_branch from the SAME single-run read; otherwise a
+// refusal naming the reason. It never guesses a branch.
+func (t runForgeTarget) resolveSpawnBaseBranch(runID uuid.UUID, explicit string) (string, error) {
+	if explicit != "" {
+		return explicit, nil
+	}
+	if t.DefaultBranch != "" {
+		return t.DefaultBranch, nil
+	}
+	reason := t.DefaultBranchUnresolvedReason
+	if reason == "" {
+		reason = baseBranchNotReported
+	}
+	return "", fmt.Errorf("base_branch_unresolved: run %s has no resolvable default branch (default_branch_unresolved_reason: %s) and base_branch was omitted; NOT spawning. Pass base_branch explicitly, or fix the cause the reason names", runID, reason)
+}
+
 // resolveRunForgeTarget is the ONLY forge-target derivation for every
 // runner-spawn producer — run_stage, dispatch_stage, drive_run and
 // run_children all call it and nothing else derives a forge (E45.46 / #3463).
@@ -1219,7 +1247,10 @@ func (t runForgeTarget) argv() []string {
 // list read would make a correctly configured gitlab run hit the empty-base-URL
 // refusal below spuriously. drive_run calls it once per invocation BEFORE its
 // loop rather than reading view.Run inside the loop, even though that view is
-// the same route: one derivation path, one helper.
+// the same route: one derivation path, one helper. The same read now also
+// carries the run's base branch (#4758): default_branch and
+// default_branch_unresolved_reason are copied onto the target on both forge
+// arms, with no extra round-trip, for resolveSpawnBaseBranch.
 //
 // Rules, each fail-closed (a gitlab run spawned as github would push to
 // api.github.com, so no guess is safe):
@@ -1240,13 +1271,19 @@ func (r *runResolver) resolveRunForgeTarget(ctx context.Context, runUUID uuid.UU
 	}
 	switch got.Forge {
 	case "", startRunForgeGitHub:
-		return runForgeTarget{Forge: startRunForgeGitHub, Repo: got.Repo}, nil
+		return runForgeTarget{
+			Forge: startRunForgeGitHub, Repo: got.Repo,
+			DefaultBranch: got.DefaultBranch, DefaultBranchUnresolvedReason: got.DefaultBranchUnresolvedReason,
+		}, nil
 	case startRunForgeGitLab:
 		if got.ForgeBaseURL == "" {
 			return runForgeTarget{}, fmt.Errorf(
 				"run %s is a gitlab run but carries no forge_base_url; not spawning (the runner needs the GitLab instance root to push and open the merge request). Set FISHHAWKD_GITLAB_BASE_URL on fishhawkd, or re-register the installation with `fishhawkd installation register --provider gitlab ... --forge-base-url <instance root>`", runUUID)
 		}
-		return runForgeTarget{Forge: startRunForgeGitLab, GitLabBaseURL: got.ForgeBaseURL, Repo: got.Repo}, nil
+		return runForgeTarget{
+			Forge: startRunForgeGitLab, GitLabBaseURL: got.ForgeBaseURL, Repo: got.Repo,
+			DefaultBranch: got.DefaultBranch, DefaultBranchUnresolvedReason: got.DefaultBranchUnresolvedReason,
+		}, nil
 	default:
 		return runForgeTarget{}, fmt.Errorf(
 			"run %s carries unknown forge %q; not spawning (this fishhawk-mcp knows github and gitlab — rebuild it against the backend that minted the run)", runUUID, got.Forge)
@@ -1261,8 +1298,9 @@ func (r *runResolver) resolveRunForgeTarget(ctx context.Context, runUUID uuid.UU
 // never the runner arguments. Mirrors cli/cmd/fishhawk/runner.go::runRunnerStart
 // — keep in sync.
 //
-// baseBranch and repo are passed already-resolved (the caller defaults
-// baseBranch to "main" and resolves repo from input/origin); pushAndOpenPR is
+// baseBranch and repo are passed already-resolved (the caller derives
+// baseBranch via runForgeTarget.resolveSpawnBaseBranch, #4758, and resolves
+// repo from input/origin); pushAndOpenPR is
 // the caller's resolved *bool default. workingDir is NOT defaulted here: both
 // callers resolve it transport-conditionally via resolveWorkingDir (#2479) and
 // set in.WorkingDir to the resulting ABSOLUTE path before calling this, so the

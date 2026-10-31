@@ -459,6 +459,92 @@ func TestMergeSquashParam(t *testing.T) {
 	}
 }
 
+// gitlabMergeCall drives one of the adapter's three merge methods.
+type gitlabMergeCall struct {
+	name string
+	call func(f *forgegitlab.Forge, m forge.MergeMethod) error
+}
+
+func gitlabMergeCalls() []gitlabMergeCall {
+	ctx := context.Background()
+	scope := gitlabScope("5")
+	return []gitlabMergeCall{
+		{"EnableAutoMerge", func(f *forgegitlab.Forge, m forge.MergeMethod) error {
+			return f.EnableAutoMerge(ctx, scope, forge.RepoRef{}, 7, m)
+		}},
+		{"MergePullRequest", func(f *forgegitlab.Forge, m forge.MergeMethod) error {
+			return f.MergePullRequest(ctx, scope, forge.RepoRef{}, 7, m)
+		}},
+		{"MergePullRequestAtHead", func(f *forgegitlab.Forge, m forge.MergeMethod) error {
+			return f.MergePullRequestAtHead(ctx, scope, forge.RepoRef{}, 7, m, "headsha1")
+		}},
+	}
+}
+
+// TestMergeMethod_ExplicitSquashOnEveryMergeCall pins the E93.2 / #4658
+// mapping on all three merge methods: squash sends "squash": true; merge sends
+// an EXPLICIT "squash": false (the key PRESENT), so an MR author's squash
+// selection is overridden rather than inherited through an omitted key.
+func TestMergeMethod_ExplicitSquashOnEveryMergeCall(t *testing.T) {
+	for _, mc := range gitlabMergeCalls() {
+		for _, tc := range []struct {
+			method forge.MergeMethod
+			want   bool
+		}{
+			{forge.MergeMethodSquash, true},
+			{forge.MergeMethodMerge, false},
+		} {
+			t.Run(mc.name+"/"+string(tc.method), func(t *testing.T) {
+				var body map[string]any
+				mux := http.NewServeMux()
+				mux.HandleFunc("PUT /api/v4/projects/5/merge_requests/7/merge", func(w http.ResponseWriter, r *http.Request) {
+					_ = json.NewDecoder(r.Body).Decode(&body)
+					writeJSON(w, http.StatusOK, `{"iid":7,"state":"merged"}`)
+				})
+				f, _ := newForge(t, mux)
+				if err := mc.call(f, tc.method); err != nil {
+					t.Fatalf("%s: %v", mc.name, err)
+				}
+				v, present := body["squash"]
+				if !present {
+					t.Fatalf("squash key absent from %v; want an explicit %v", body, tc.want)
+				}
+				if v != tc.want {
+					t.Errorf("squash = %v, want %v", v, tc.want)
+				}
+			})
+		}
+	}
+}
+
+// TestMergeMethod_RebaseRefusedBeforeHTTP pins the adapter's defence-in-depth
+// rebase guard: GitLab's merge API has no per-request merge method, so a
+// REBASE is refused with ErrMergeMethodUnsupported (and ErrUnsupported) with
+// ZERO HTTP requests, on each of the three merge methods.
+func TestMergeMethod_RebaseRefusedBeforeHTTP(t *testing.T) {
+	for _, mc := range gitlabMergeCalls() {
+		t.Run(mc.name, func(t *testing.T) {
+			var hits atomic.Int32
+			mux := http.NewServeMux()
+			mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+				hits.Add(1)
+				writeJSON(w, http.StatusOK, `{"iid":7,"state":"merged"}`)
+			})
+			f, _ := newForge(t, mux)
+			err := mc.call(f, forge.MergeMethodRebase)
+			if !errors.Is(err, forge.ErrMergeMethodUnsupported) {
+				t.Errorf("err = %v, want errors.Is ErrMergeMethodUnsupported", err)
+			}
+			if !errors.Is(err, forge.ErrUnsupported) {
+				t.Errorf("err = %v, want errors.Is ErrUnsupported", err)
+			}
+			if n := hits.Load(); n != 0 {
+				t.Errorf("%d HTTP requests, want 0 (refused before any call)", n)
+			}
+		})
+	}
+}
+
 // TestMergePullRequestAtHead_PinsSHA_NoAutoMerge pins the head-pinned merge
 // (forge.HeadPinnedMerger, ADR-093 D3 / E87.5): the PUT carries sha == the
 // expected head and squash, and NEVER merge_when_pipeline_succeeds (a queued

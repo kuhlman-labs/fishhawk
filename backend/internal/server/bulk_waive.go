@@ -32,6 +32,12 @@ type bulkWaiveRequest struct {
 	// intent entry is appended — every concern in the batch shares the run, so a
 	// per-item re-evaluation would read the same state N times.
 	Delegated bool `json:"delegated"`
+	// Judgement and TradeoffCost are the ONE human judgement covering the
+	// whole batch (E94.7 / #4840), with the single waive's rules: REQUIRED
+	// unless Reason opens with a recognised prefix, and a tradeoff needs a
+	// cost (concernJudgementFromRequest).
+	Judgement    string `json:"judgement"`
+	TradeoffCost string `json:"tradeoff_cost"`
 }
 
 // bulkWaiveItemResult is one concern's outcome. State/StateReason carry the
@@ -73,10 +79,10 @@ type bulkWaiveResponse struct {
 // The batch splits into two halves with deliberately different atomicity:
 //
 //   - PRE-VALIDATION is ALL-OR-NOTHING and mutates NOTHING. The first violation
-//     wins and names the offending id: blank reason, empty list, over-cap,
-//     non-UUID id, duplicate id (compared on the PARSED uuid, so two spellings
-//     of one id collide), unwired store, unknown id, an id belonging to ANOTHER
-//     run, a server_check concern named by an agent token or a delegated
+//     wins and names the offending id: blank reason, a refused judgement
+//     (E94.7 / #4840), empty list, over-cap, non-UUID id, duplicate id
+//     (compared on the PARSED uuid, so two spellings of one id collide),
+//     unwired store, unknown id, an id belonging to ANOTHER run, a server_check concern named by an agent token or a delegated
 //     request (403 concern_requires_human, E80.3 / #3760), or an id not in an
 //     OPEN state.
 //   - the APPLY loop is PER-ITEM. The batch is deliberately NOT a database
@@ -143,6 +149,10 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 		s.writeError(w, r, http.StatusBadRequest, "validation_failed",
 			"reason is required: the waive rationale is recorded on every concern_waived audit entry in the batch and shown to later re-reviews",
 			map[string]any{"field": "reason"})
+		return
+	}
+	judgement, tradeoffCost, ok := s.concernJudgementFromRequest(w, r, reqBody.Judgement, reqBody.TradeoffCost, reqBody.Reason)
+	if !ok {
 		return
 	}
 	if len(reqBody.ConcernIDs) == 0 {
@@ -262,6 +272,12 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 		subject = "anonymous"
 	}
 	actorKind := actorKindForSubject(subject)
+	// FO ruling D2 (E94.7 / #4840): judgement_bulk is COUNT-based — true if
+	// and only if this ONE judgement covers more than one concern. parsed is
+	// the validated, de-duplicated id list, and the batch is all-or-nothing, so
+	// its length is the number of concerns the judgement covers. A one-id call
+	// records false while its payload still stamps the verb's bulk_waive:true.
+	judgementBulk := len(parsed) > 1
 
 	// Delegation shadow stamp (E82.1 / #3778): ONE capture per request (one
 	// run), on the PRE-decision state, recorded only when a waive landed.
@@ -275,7 +291,7 @@ func (s *Server) handleBulkWaiveConcerns(w http.ResponseWriter, r *http.Request)
 	}
 	for _, row := range rows {
 		item := bulkWaiveItemResult{ConcernID: row.ID.String()}
-		updated, aerr := s.applyConcernWaive(r.Context(), row, reqBody.Reason, subject, actorKind, delegatedRule, true)
+		updated, aerr := s.applyConcernWaive(r.Context(), row, reqBody.Reason, subject, actorKind, delegatedRule, true, judgementBulk, judgement, tradeoffCost)
 		if aerr != nil {
 			item.Error = aerr.Error()
 			var appendErr concernWaiveAuditAppendError

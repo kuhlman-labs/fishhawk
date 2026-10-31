@@ -190,6 +190,15 @@ const (
 	// forge_base_url. NO runner is spawned — a gitlab run spawned as github
 	// would push to api.github.com — and the warning names the remedy.
 	stoppedForgeUnresolved = "forge_unresolved"
+	// stoppedBaseBranchUnresolved is the fail-CLOSED pre-loop stop for an
+	// omitted base_branch on a run whose default branch is unresolved
+	// (resolveSpawnBaseBranch, #4758): the single-run read carried a
+	// default_branch_unresolved_reason (or neither field, not_reported). NO
+	// act, host-dispatch marker or spawn — the drive never guesses a base —
+	// and the warning names the reason and the remedy (pass base_branch). It
+	// is checked after the working_dir, runner-binary and forge-target reads,
+	// so those failures take precedence over it.
+	stoppedBaseBranchUnresolved = "base_branch_unresolved"
 	// stoppedContextCancelled is the stop when the drive context is cancelled
 	// (distinct from the run-state-derived 'cancelled', which reports a run the
 	// backend moved to the cancelled terminal state).
@@ -213,6 +222,14 @@ const (
 	// in-flight walk would otherwise poll to the deadline. Nothing is recorded
 	// or spawned; next_actions lead with fishhawk_retry_stage for the stage.
 	stoppedAcceptanceStageFailed = "acceptance_stage_failed"
+	// stoppedImplementStageFailed is the stop for a non-terminal run whose
+	// implement stage FAILED — the server's category-C implement park (#4426):
+	// the run stays running with a failed implement stage below a pending
+	// acceptance/review, which the loop would otherwise walk past (dispatching
+	// downstream) or poll to the deadline. Nothing is recorded or spawned;
+	// next_actions are implementFailedNextActions, leading with
+	// fishhawk_retry_stage for the stage.
+	stoppedImplementStageFailed = "implement_stage_failed"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -255,7 +272,7 @@ type DriveRunInput struct {
 	RunID        string `json:"run_id" jsonschema:"Fishhawk run UUID; the local runner_kind:local run to drive between human gates"`
 	WorkingDir   string `json:"working_dir,omitempty" jsonschema:"checkout the runner runs in. OPTIONAL when the run carries a start_run binding (E66.42 / #2482): omit it to INHERIT the bound checkout. An explicit value is an override and must match the binding after path cleaning — a conflicting value is refused. Over the HTTP MCP transport (fishhawkd's /mcp route, or fishhawk-mcp --transport http) an omitted-and-unbound or relative value is refused — the server's cwd is the daemon's own checkout. On the stdio transport an omitted-and-unbound value defaults to the client-spawned process's own directory (resolved to an absolute path) Over the HTTP MCP transport the path must resolve inside an operator-configured allowed checkout root (fishhawkd --mcp-allowed-roots / FISHHAWKD_MCP_ALLOWED_ROOTS, fishhawk-mcp --allowed-roots / FISHHAWK_MCP_ALLOWED_ROOTS); a path outside every root — or any path at all when no root is configured — is refused path_outside_allowed_roots. The INHERITED binding is confined identically, so a bound checkout stays usable exactly when it is itself inside a root."`
 	GitHubRepo   string `json:"github_repo,omitempty" jsonschema:"repo slug (owner/name, or the GitLab path_with_namespace); defaults to the run row's repo for a gitlab run, else auto-detected from working_dir's origin remote when empty"`
-	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; defaults to main"`
+	BaseBranch   string `json:"base_branch,omitempty" jsonschema:"base branch for the implement-stage PR; when omitted, the run's forge default_branch (GET /v0/runs/{run_id}) is used, and the call is refused (stopped_reason base_branch_unresolved, naming default_branch_unresolved_reason) when it is unresolved (a gitlab run always reports forge_unsupported, so pass it)"`
 	RunnerBinary string `json:"runner_binary,omitempty" jsonschema:"path to fishhawk-runner; on stdio resolved in order: this input, FISHHAWK_RUNNER_BIN env, sibling to this binary, then PATH. Over the HTTP MCP transport a supplied value is refused runner_binary_not_allowed_over_http and the daemon resolves only from its own FISHHAWK_RUNNER_BIN, sibling, then PATH"`
 	MaxMinutes   int    `json:"max_minutes,omitempty" jsonschema:"wall-clock budget in minutes for this drive; clamped to [1,240], default 60. Every return is resumable by re-invoking with the same run_id"`
 }
@@ -275,7 +292,7 @@ type DriveStep struct {
 type DriveRunOutput struct {
 	RunID              string       `json:"run_id"`
 	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
-	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | context_cancelled"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | base_branch_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | implement_stage_failed | context_cancelled"`
 	RunState           string       `json:"run_state"`
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -437,11 +454,6 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		return nil, DriveRunOutput{}, rerr
 	}
 
-	baseBranch := in.BaseBranch
-	if baseBranch == "" {
-		baseBranch = "main"
-	}
-
 	// Resolve working_dir transport-conditionally BEFORE the spawn-seam/binary
 	// resolution and before the drive loop takes its first act (#2479). An
 	// omitted/relative working_dir over HTTP fails here with a clean error, so no
@@ -495,6 +507,14 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 			RunID: runUUID.String(), ResolvedWorkingDir: workingDir,
 			StoppedReason: stoppedForgeUnresolved,
 			Warnings:      []string{ferr.Error()},
+		}, nil
+	}
+	baseBranch, berr := forgeTarget.resolveSpawnBaseBranch(runUUID, in.BaseBranch)
+	if berr != nil {
+		return nil, DriveRunOutput{
+			RunID: runUUID.String(), ResolvedWorkingDir: workingDir,
+			StoppedReason: stoppedBaseBranchUnresolved,
+			Warnings:      []string{berr.Error()},
 		}, nil
 	}
 
@@ -689,6 +709,17 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 		if acc := stageByType(stages, "acceptance"); acc != nil && acc.State == "failed" {
 			out.StoppedReason = stoppedAcceptanceStageFailed
 			out.NextActions = acceptanceStageFailedNextActions(runRow, acc)
+			return nil, out, nil
+		}
+
+		// A failed implement stage on a non-terminal run is the server's
+		// category-C implement park (#4426): stop with the retry decision rather
+		// than walking on to the pending acceptance/review stages below it (the
+		// server never dispatches past a failed stage, and host-dispatch refuses
+		// it 409 earlier_stage_failed). Nothing is recorded or spawned.
+		if impl := stageByType(stages, "implement"); impl != nil && impl.State == "failed" {
+			out.StoppedReason = stoppedImplementStageFailed
+			out.NextActions = implementFailedNextActions(runRow, stageByType(stages, "plan"), stageByType(stages, "review"), impl)
 			return nil, out, nil
 		}
 
@@ -1690,19 +1721,21 @@ func withParams(base, extra map[string]string) map[string]string {
 // waive the concern (no follow-up), defer it into a pre-drafted follow-up, or
 // cancel the run. fishhawk_merge_run is deliberately absent — it only becomes a
 // legal move once the open concerns are resolved (waived/deferred), so naming it
-// here would surface an action that is not yet actionable at this gate.
+// here would surface an action that is not yet actionable at this gate. The
+// waive and defer entries carry the `judgement` placeholder (ADR-117 D1, #4840)
+// because the backend refuses either verb without one.
 func driveFixupConcernActions(params map[string]string) []SuggestedAction {
 	return []SuggestedAction{
 		{
 			Action:       "fishhawk_waive_concern",
-			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id"}),
+			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "judgement": concernJudgementPlaceholder}),
 			Precondition: "an open concern is a false positive or does not block the merge",
 			Consumes:     consumesNone,
 			Reason:       "resolve the concern with NO follow-up and NO fix-up budget; the waive rationale is shown verbatim to later re-reviews, then re-invoke fishhawk_drive_run",
 		},
 		{
 			Action:       "fishhawk_defer_concern",
-			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "parent_epic": "<epic the follow-up rolls up to, e.g. #2091>"}),
+			Params:       withParams(params, map[string]string{"concern_id": "run.concerns.items[].id", "parent_epic": "<epic the follow-up rolls up to, e.g. #2091>", "judgement": concernJudgementPlaceholder}),
 			Precondition: "an open concern is worth a separate change but should not block the merge",
 			Consumes:     consumesNone,
 			Reason:       "file a pre-drafted follow-up work item and resolve the concern in one call (no fix-up budget spent), then re-invoke fishhawk_drive_run",

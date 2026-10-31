@@ -30,38 +30,71 @@ type mcteWorld struct {
 	merged   string // H', the merge commit the forge created
 }
 
-// newMCTEWorld builds the repository and the run, advances main by advance
-// (path → content), and wires mode with the real classifier.
+// mcteDeclaredSpecYAML is the e2e admission spec: workflow-v2 with a
+// verdict_transfer declaration whose G covers go.mod (and an unmatched
+// proto/**) and which names a completeness check, so enforce acts.
+const mcteDeclaredSpecYAML = mctV2SpecBase + `verdict_transfer:
+  global_surface: ["go.mod", "proto/**"]
+  completeness_check: "e2e fixture check"
+`
+
+// mcteOpts shapes one e2e world: the transfer mode, the run's ADMISSION
+// spec, and the files of the base commit, the PR commit and main's advance
+// (path → content; each step is `git add -A` plus one commit).
+type mcteOpts struct {
+	Mode              MergeCandidateTransferMode
+	Spec              string
+	Base, PR, Advance map[string]string
+}
+
+// newMCTEWorld is the Go a/b world: the PR edits a/a.go, main advances by
+// advance, and the admission spec is mcteDeclaredSpecYAML.
 func newMCTEWorld(t *testing.T, mode MergeCandidateTransferMode, advance map[string]string) *mcteWorld {
+	t.Helper()
+	return newMCTEWorldWith(t, mcteOpts{
+		Mode: mode,
+		Spec: mcteDeclaredSpecYAML,
+		Base: map[string]string{
+			"go.mod": "module example.com/m\n\ngo 1.21\n",
+			"a/a.go": "package a\n\nconst A = 1\n",
+			"b/b.go": "package b\n\nconst B = 1\n",
+		},
+		PR:      map[string]string{"a/a.go": "package a\n\nconst A = 2\n"},
+		Advance: advance,
+	})
+}
+
+// newMCTEWorldWith builds the repository and the run from o and wires the
+// mode with the real classifier. o.Spec must parse (checked here, so a
+// fixture typo cannot pass as an undeclared surface).
+func newMCTEWorldWith(t *testing.T, o mcteOpts) *mcteWorld {
 	t.Helper()
 	for _, bin := range []string{"git", "go"} {
 		if _, err := exec.LookPath(bin); err != nil {
 			t.Skipf("%s not on PATH", bin)
 		}
 	}
+	mctValidSpecs(t, o.Spec)
 	w := &mcteWorld{f: newMCQFixture(t), repo: t.TempDir()}
 	mctGit(t, w.repo, "init", "-q")
-	mctWrite(t, w.repo, map[string]string{
-		"go.mod": "module example.com/m\n\ngo 1.21\n",
-		"a/a.go": "package a\n\nconst A = 1\n",
-		"b/b.go": "package b\n\nconst B = 1\n",
-	})
+	mctWrite(t, w.repo, o.Base)
 	mctGit(t, w.repo, "add", "-A")
 	mctGit(t, w.repo, "commit", "-q", "-m", "base")
 	w.fromBase = mctGit(t, w.repo, "rev-parse", "HEAD")
 	mctGit(t, w.repo, "checkout", "-q", "-b", "pr")
-	mctWrite(t, w.repo, map[string]string{"a/a.go": "package a\n\nconst A = 2\n"})
-	mctGit(t, w.repo, "commit", "-q", "-am", "pr")
+	mctWrite(t, w.repo, o.PR)
+	mctGit(t, w.repo, "add", "-A")
+	mctGit(t, w.repo, "commit", "-q", "-m", "pr")
 	w.head = mctGit(t, w.repo, "rev-parse", "HEAD")
 	mctGit(t, w.repo, "checkout", "-q", "main")
-	mctWrite(t, w.repo, advance)
+	mctWrite(t, w.repo, o.Advance)
 	mctGit(t, w.repo, "add", "-A")
 	mctGit(t, w.repo, "commit", "-q", "-m", "advance")
 	w.toBase = mctGit(t, w.repo, "rev-parse", "HEAD")
 	mctGit(t, w.repo, "checkout", "-q", "pr")
 
 	f := w.f
-	w.r = f.seed("e2e", w.head, []byte(mcvUndelegatedSpecYAML))
+	w.r = f.seed("e2e", w.head, []byte(o.Spec))
 	f.appendSystemRow(w.r, CategoryBranchRebased, map[string]any{
 		"new_head_sha": w.head, "merge_commit_sha": w.head, "already_up_to_date": false})
 	f.passedAt(w.r, w.head)
@@ -89,7 +122,7 @@ func newMCTEWorld(t *testing.T, mode MergeCandidateTransferMode, advance map[str
 		}
 	})
 	f.srv.cfg.MergeCandidateTransfer = MergeCandidateTransferConfig{
-		Mode: mode, Classifier: &basedelta.Classifier{Loader: &basedelta.GoListLoader{}}}
+		Mode: o.Mode, Classifier: &basedelta.Classifier{Loader: &basedelta.GoListLoader{}}}
 	return w
 }
 

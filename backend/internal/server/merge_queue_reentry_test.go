@@ -4,13 +4,18 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
 )
 
 // ADR-093 slice 3 (D4, E87.6 / #4297): the automatic re-entry sweep. Each
@@ -383,6 +388,128 @@ func TestReentry_Gate5PRStateAndTerminalRunNoReentry(t *testing.T) {
 	}
 }
 
+// Gate 5's PR-read refusals (#4705): a run with no installation (NULL or 0),
+// a repo that is not owner/name, or no tracked pull request (no URL, or a URL
+// naming no /pull/N) is skipped WITHOUT reading the forge. Each arm starts
+// from the fully eligible fixture, so the refusal is the only one; gates 1-4
+// make no forge call, so any proxied forge response during the sweep means
+// the PR read was attempted. The "control" arm proves the counter observes a
+// PR read. MECHANISMS: narrowing the installation guard to `== nil` lets the
+// zero-installation arm read the PR (counter RED, and the direct call no
+// longer refuses); a PR-number guard of `< 0` makes both URL arms GET
+// /pulls/0 (counter RED, error text RED); ignoring the parseRepoOwnerName
+// error sends an empty RepoRef, so the direct-call error no longer names
+// "is not owner/name" (RED); deleting the nil-installation guard
+// dereferences nil (panic, RED).
+func TestReentry_ReadPRRefusalsSkipWithoutAForgeRead(t *testing.T) {
+	cases := []struct {
+		name string
+		sql  string
+		args func(r *mcqRun) []any
+		want string
+	}{
+		{name: "nil installation", sql: `UPDATE runs SET installation_id = NULL WHERE id = $1`, want: "no installation"},
+		{name: "zero installation", sql: `UPDATE runs SET installation_id = 0 WHERE id = $1`, want: "no installation"},
+		{name: "unparsable repo", sql: `UPDATE runs SET repo = 'x-y' WHERE id = $1`, want: "is not owner/name"},
+		{name: "no pull request url", sql: `UPDATE runs SET pull_request_url = NULL WHERE id = $1`, want: "no tracked pull request"},
+		{name: "non-pull-request url", sql: `UPDATE runs SET pull_request_url = $2 WHERE id = $1`,
+			args: func(r *mcqRun) []any { return []any{fmt.Sprintf("https://github.com/x/y/issues/%d", r.pr)} },
+			want: "no tracked pull request"},
+	}
+	countForgeReads := func(w *mqmWorld) *atomic.Int64 {
+		var n atomic.Int64
+		w.mu.Lock()
+		w.onResponse = func(string) { n.Add(1) }
+		w.mu.Unlock()
+		return &n
+	}
+	t.Run("control: an unrefused read reaches the forge", func(t *testing.T) {
+		w := newMQMWorld(t)
+		r, _ := w.rentReady("a", mcvDelegatedV0SpecYAML)
+		reads := countForgeReads(w)
+		runRow, err := w.srv.cfg.RunRepo.GetRun(context.Background(), r.id)
+		if err != nil {
+			t.Fatalf("get run: %v", err)
+		}
+		if _, err := w.srv.mergeQueueReentryReadPR(context.Background(), runRow); err != nil {
+			t.Fatalf("read PR on the eligible fixture: %v", err)
+		}
+		if reads.Load() == 0 {
+			t.Fatal("forge reads = 0 after a PR read: the counter observes nothing")
+		}
+	})
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, _ := w.rentReady("a", mcvDelegatedV0SpecYAML)
+			args := []any{r.id}
+			if tc.args != nil {
+				args = append(args, tc.args(r)...)
+			}
+			w.exec(tc.sql, args...)
+			reads := countForgeReads(w)
+			runRow, err := w.srv.cfg.RunRepo.GetRun(context.Background(), r.id)
+			if err != nil {
+				t.Fatalf("get run: %v", err)
+			}
+			if _, err := w.srv.mergeQueueReentryReadPR(context.Background(), runRow); err == nil || !strings.Contains(err.Error(), tc.want) {
+				t.Fatalf("mergeQueueReentryReadPR err = %v, want one naming %q", err, tc.want)
+			}
+			if n := w.sweep(0); n != 0 {
+				t.Fatalf("re-entered = %d, want 0", n)
+			}
+			if n := reads.Load(); n != 0 {
+				t.Fatalf("forge reads = %d, want 0 (the refusal precedes any forge request)", n)
+			}
+			w.requireNotReentered(r)
+		})
+	}
+}
+
+// reentryCommitted reports whether r has at least one re-entry row AND a
+// committed active queue entry other than the ejected ej: the re-entry
+// appends its merge_queue_entered row BEFORE the Enqueue, so the row alone
+// does not prove the entry landed.
+func (w *mqmWorld) reentryCommitted(r *mcqRun, ej mergequeue.Entry) bool {
+	w.t.Helper()
+	if len(w.reentryRows(r)) == 0 {
+		return false
+	}
+	st, found, err := w.store.ActiveForRun(context.Background(), r.id)
+	if err != nil {
+		w.t.Fatalf("active entry: %v", err)
+	}
+	return found && st.Entry.ID != ej.ID
+}
+
+// TestRunMergeQueueYieldReprobe_ReentersThroughTheTicker drives the
+// production loop end to end: its ticker, its process-local clock (the first
+// tick's since is 0, the restart window) and its keyset pager re-enter the
+// fully eligible candidate with no hand-driven sweep, and it re-enters
+// EXACTLY once although the ticker keeps ticking. The poll waits until the
+// re-entered entry is COMMITTED (not just its row), because cancelling the
+// loop between the row append and the Enqueue would orphan the row.
+// MECHANISM: removing the sweepMergeQueueReentries call from the loop leaves
+// no re-entry: RED at the scaled deadline.
+func TestRunMergeQueueYieldReprobe_ReentersThroughTheTicker(t *testing.T) {
+	w := newMQMWorld(t)
+	r, ej := w.rentReady("a", mcvDelegatedV0SpecYAML)
+	ctx, cancel := context.WithCancel(context.Background())
+	go w.srv.RunMergeQueueYieldReprobe(ctx, 5*time.Millisecond)
+	deadline := time.Now().Add(timescale.D(10 * time.Second))
+	for !w.reentryCommitted(r, ej) {
+		if time.Now().After(deadline) {
+			cancel()
+			w.srv.bgMergeQueuePump.Wait()
+			t.Fatal("the reprobe loop re-entered nothing before the deadline")
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	cancel()
+	w.srv.bgMergeQueuePump.Wait()
+	w.requireReentered(r, ej, "h1")
+}
+
 // Starvation (#4297): mergeQueueReentryLimit+1 OLDER candidates that never
 // pass a gate (no routed fix-up) sit ahead of one routed, pushed, eligible
 // candidate. The keyset pager reads past the first full page, so the eligible
@@ -638,5 +765,329 @@ func TestReentry_IntentRowBoundToStoredSequence(t *testing.T) {
 			}
 			w.requireNotReentered(r)
 		})
+	}
+}
+
+// rentProductPush records a product-push row of category on top of base (the
+// production base_sha/head_sha field names) and moves the PR head to head, as
+// the acceptance scenario push and the conflict-resolution push report do.
+func (w *mqmWorld) rentProductPush(r *mcqRun, category, base, head string) *audit.Entry {
+	w.t.Helper()
+	e := w.mqeAppend(r, category, map[string]any{"base_sha": base, "head_sha": head})
+	w.gh.set(func() { w.gh.prs[r.pr].head = head })
+	return e
+}
+
+// rentBaseMerge records a base merge prior -> merge through the REAL
+// branch_rebased writer (the resolved new head IS the merge commit) with
+// clean_verified = clean, and moves the PR head to merge.
+func (w *mqmWorld) rentBaseMerge(r *mcqRun, prior, merge string, clean bool) {
+	w.t.Helper()
+	w.srv.writeBranchRebasedAudit(context.Background(), mergeCandidateSystemActor(), r.id, r.pr, r.branch, mcqBase,
+		prior, merge, merge, false, "base advanced", "", nil, "base-tip", clean)
+	w.gh.set(func() { w.gh.prs[r.pr].head = merge })
+}
+
+// requireReentryChain asserts the re-entry row's reentry_head_chain is want
+// and its fixup_pushed_sequence names push.
+func requireReentryChain(t *testing.T, p map[string]any, push *audit.Entry, want []string) {
+	t.Helper()
+	raw, _ := p["reentry_head_chain"].([]any)
+	got := make([]string, 0, len(raw))
+	for _, v := range raw {
+		s, _ := v.(string)
+		got = append(got, s)
+	}
+	if strings.Join(got, ",") != strings.Join(want, ",") || len(raw) != len(want) {
+		t.Fatalf("reentry_head_chain = %v, want %v", p["reentry_head_chain"], want)
+	}
+	if p["fixup_pushed_sequence"] != float64(push.Sequence) {
+		t.Fatalf("fixup_pushed_sequence = %v, want %d", p["fixup_pushed_sequence"], push.Sequence)
+	}
+}
+
+// rentReadyPushed is rentReady returning the fix-up's fixup_pushed row too.
+func (w *mqmWorld) rentReadyPushed(name string) (*mcqRun, mergequeue.Entry, *audit.Entry) {
+	w.t.Helper()
+	r := w.seed(name, "h0", []byte(mcvDelegatedV0SpecYAML))
+	e := w.rentSeed(r, true, 10*time.Minute)
+	push := w.rentPush(r, "h1")
+	w.rentBlock()
+	return r, e, push
+}
+
+// #4703: a commit the PRODUCT authored on top of the fix-up's pushed head h1
+// re-enters at that descendant, its re-entry row naming the qualifying chain.
+// MECHANISMS: dropping CategoryConflictResolutionPushed from the walk's edge
+// decode leaves "conflict-resolution merge" unre-entered (RED); the other
+// edges and the chain are pinned the same way by their own case.
+func TestReentry_ProductDescendantOfFixupReenters(t *testing.T) {
+	cases := []struct {
+		name  string
+		push  func(w *mqmWorld, r *mcqRun)
+		head  string
+		chain []string
+	}{
+		{"acceptance scenario commit", func(w *mqmWorld, r *mcqRun) {
+			w.rentProductPush(r, CategoryAcceptanceScenariosPushed, "h1", "a1")
+		}, "a1", []string{"h1", "a1"}},
+		{"conflict-resolution merge", func(w *mqmWorld, r *mcqRun) {
+			w.rentProductPush(r, CategoryConflictResolutionPushed, "h1", "c1")
+		}, "c1", []string{"h1", "c1"}},
+		{"clean base merge", func(w *mqmWorld, r *mcqRun) {
+			w.rentBaseMerge(r, "h1", "m1", true)
+		}, "m1", []string{"h1", "m1"}},
+		{"acceptance then clean base merge", func(w *mqmWorld, r *mcqRun) {
+			w.rentProductPush(r, CategoryAcceptanceScenariosPushed, "h1", "a1")
+			w.rentBaseMerge(r, "a1", "m2", true)
+		}, "m2", []string{"h1", "a1", "m2"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, ej, push := w.rentReadyPushed("a")
+			tc.push(w, r)
+			if n := w.sweep(0); n != 1 {
+				t.Fatalf("re-entered = %d, want 1 at the product descendant %s", n, tc.head)
+			}
+			_, p := w.requireReentered(r, ej, tc.head)
+			requireReentryChain(t, p, push, tc.chain)
+		})
+	}
+}
+
+// requireEjectedNewest asserts ej is still r's newest queue row (skipped,
+// never dropped).
+func (w *mqmWorld) requireEjectedNewest(r *mcqRun, ej mergequeue.Entry) {
+	w.t.Helper()
+	latest, found, err := w.store.LatestForRun(context.Background(), r.id)
+	if err != nil || !found || latest.ID != ej.ID || latest.State != mergequeue.StateEjected {
+		w.t.Fatalf("latest = %+v found=%v err=%v, want the ejected row %s untouched", latest, found, err, ej.ID)
+	}
+}
+
+// #4703: a PR head that is neither the fix-up's pushed head nor a recorded
+// product descendant of it is SKIPPED (left to the operator's
+// fishhawk_merge_run), on an otherwise fully eligible candidate, and gate 5
+// refuses it BEFORE any merge-intent lock (the in-lock re-check would refuse
+// the same head, so the lock count isolates gate 5). MECHANISMS: deleting
+// gate 5's `!qualifies` skip takes the lock (count RED, though the in-lock
+// re-check still refuses);
+// returning a chain for an absent head re-enters "foreign push" (RED);
+// accepting an edge whose parent is not qualifying re-enters "product push on
+// a foreign base" (RED); dropping isCleanAdvance from the base-merge edge
+// re-enters "unverified base merge" (RED, the merge commit IS the new head so
+// only clean_verified refuses it); dropping the after-the-push sequence filter
+// re-enters "product push before the fix-up push" (RED).
+func TestReentry_HeadNotQualifyingNoReentry(t *testing.T) {
+	cases := []struct {
+		name  string
+		setup func(w *mqmWorld, r *mcqRun)
+	}{
+		{"foreign push", func(w *mqmWorld, r *mcqRun) {
+			w.rentPush(r, "h1")
+			w.gh.set(func() { w.gh.prs[r.pr].head = "f1" })
+		}},
+		{"product push on a foreign base", func(w *mqmWorld, r *mcqRun) {
+			w.rentPush(r, "h1")
+			w.gh.set(func() { w.gh.prs[r.pr].head = "f1" })
+			w.rentProductPush(r, CategoryAcceptanceScenariosPushed, "f1", "a1")
+		}},
+		{"unverified base merge", func(w *mqmWorld, r *mcqRun) {
+			w.rentPush(r, "h1")
+			w.rentBaseMerge(r, "h1", "m1", false)
+		}},
+		{"product push before the fix-up push", func(w *mqmWorld, r *mcqRun) {
+			w.mqeAppend(r, CategoryAcceptanceScenariosPushed, map[string]any{"base_sha": "h1", "head_sha": "a1"})
+			w.rentPush(r, "h1")
+			w.gh.set(func() { w.gh.prs[r.pr].head = "a1" })
+		}},
+		{"operator-vouched commit", func(w *mqmWorld, r *mcqRun) {
+			w.rentPush(r, "h1")
+			w.mqeAppend(r, CategoryOperatorCommitVouched, map[string]any{lineageVouchedSHAField: "v1"})
+			w.gh.set(func() { w.gh.prs[r.pr].head = "v1" })
+		}},
+		{"fix-up push naming no head", func(w *mqmWorld, r *mcqRun) {
+			w.mqeAppend(r, mergeQueueFixupPushedCategory, map[string]any{})
+			w.gh.set(func() { w.gh.prs[r.pr].head = "h1" })
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r := w.seed("a", "h0", []byte(mcvDelegatedV0SpecYAML))
+			ej := w.rentSeed(r, true, 10*time.Minute)
+			tc.setup(w, r)
+			w.rentBlock()
+			locks := w.countLocks()
+			if n := w.sweep(0); n != 0 {
+				t.Fatalf("re-entered = %d, want 0", n)
+			}
+			w.requireNotReentered(r)
+			w.requireEjectedNewest(r, ej)
+			if n := locks.Load(); n != 0 {
+				t.Fatalf("merge-intent locks = %d, want 0 (gate 5 refuses before the locked half)", n)
+			}
+		})
+	}
+}
+
+// rentListFailAudit fails ListForRunByCategory for one category.
+type rentListFailAudit struct {
+	*mqmAudit
+	fail string
+}
+
+func (a *rentListFailAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.fail {
+		return nil, errors.New("injected list failure")
+	}
+	return a.mqmAudit.ListForRunByCategory(ctx, runID, category)
+}
+
+// #4703: an unreadable product-push category is no re-entry (undeterminable),
+// gate 5 skips it before any merge-intent lock, and the next sweep with the
+// read restored re-enters, so the skip was the read and never a drop.
+func TestReentry_ProductPushRowsUnreadableSkips(t *testing.T) {
+	for _, cat := range mergeQueueReentryDescendantCategories {
+		t.Run(cat, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, ej, _ := w.rentReadyPushed("a")
+			w.rentProductPush(r, CategoryAcceptanceScenariosPushed, "h1", "a1")
+			w.srv.cfg.AuditRepo = &rentListFailAudit{mqmAudit: w.audit, fail: cat}
+			locks := w.countLocks()
+			if n := w.sweep(0); n != 0 {
+				t.Fatalf("re-entered = %d with %s unreadable, want 0", n, cat)
+			}
+			w.requireNotReentered(r)
+			w.requireEjectedNewest(r, ej)
+			if n := locks.Load(); n != 0 {
+				t.Fatalf("merge-intent locks = %d, want 0 (gate 5 skips the unreadable read)", n)
+			}
+			w.srv.cfg.MergeQueue = w.store
+			w.srv.cfg.AuditRepo = w.audit
+			if n := w.sweep(0); n != 1 {
+				t.Fatalf("re-entered = %d once the read recovers, want 1", n)
+			}
+			w.requireReentered(r, ej, "a1")
+		})
+	}
+}
+
+// rentLockHookStore is the real store whose WithMergeIntentLock counts each
+// acquisition and runs hook (when set) INSIDE the lock, once, before fn: a
+// push landing between gate 5 and the locked half.
+type rentLockHookStore struct {
+	*mergequeue.PostgresStore
+	hook  func()
+	once  *sync.Once
+	locks *atomic.Int64
+}
+
+func (s rentLockHookStore) WithMergeIntentLock(ctx context.Context, runID uuid.UUID, fn func(context.Context) error) error {
+	s.locks.Add(1)
+	return s.PostgresStore.WithMergeIntentLock(ctx, runID, func(fctx context.Context) error {
+		if s.hook != nil {
+			s.once.Do(s.hook)
+		}
+		return fn(fctx)
+	})
+}
+
+// countLocks binds a counting lock store (no hook) and returns its counter:
+// a gate-5 refusal takes NO merge-intent lock, which isolates gate 5 from the
+// in-lock re-check that would otherwise refuse the same head.
+func (w *mqmWorld) countLocks() *atomic.Int64 {
+	w.t.Helper()
+	locks := &atomic.Int64{}
+	w.srv.cfg.MergeQueue = rentLockHookStore{PostgresStore: w.store, once: &sync.Once{}, locks: locks}
+	return locks
+}
+
+// #4703: the locked half re-reads the PR and re-derives the qualifying set.
+// Each case changes state INSIDE the lock after gate 5 judged h1 qualifying;
+// none writes a re-entry row or an entry, and the ejected row stays. "head
+// moved to a qualifying descendant" isolates the head-equality check (a2 IS
+// in the re-derived set); "newer fix-up push" isolates the re-derived set
+// (the PR head is unchanged); "PR read fails" is undeterminable. The first
+// and last re-enter on a follow-up sweep without the hook (skip, not drop).
+// MECHANISMS: replacing `repr.HeadSHA != head` with `false` re-enters the
+// first at the stale h1 (RED); replacing the re-derived-set condition with
+// false re-enters the second (RED); treating the read error as an open PR at
+// head re-enters the third (RED).
+func TestReentry_UnderLockRecheckNoReentry(t *testing.T) {
+	cases := []struct {
+		name  string
+		hook  func(w *mqmWorld, r *mcqRun)
+		after string // the follow-up sweep's re-entry head ("" = none run)
+	}{
+		{"head moved to a qualifying descendant", func(w *mqmWorld, r *mcqRun) {
+			w.rentProductPush(r, CategoryAcceptanceScenariosPushed, "h1", "a2")
+		}, "a2"},
+		{"newer fix-up push", func(w *mqmWorld, r *mcqRun) {
+			w.mqeAppend(r, mergeQueueFixupPushedCategory, map[string]any{"head_sha": "h9"})
+		}, ""},
+		{"PR read fails", func(w *mqmWorld, r *mcqRun) {
+			w.mu.Lock()
+			w.prReadFail = true
+			w.mu.Unlock()
+		}, "h1"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, ej, _ := w.rentReadyPushed("a")
+			locks := &atomic.Int64{}
+			w.srv.cfg.MergeQueue = rentLockHookStore{PostgresStore: w.store, hook: func() { tc.hook(w, r) }, once: &sync.Once{}, locks: locks}
+			if n := w.sweep(0); n != 0 {
+				t.Fatalf("re-entered = %d, want 0", n)
+			}
+			if n := locks.Load(); n != 1 {
+				t.Fatalf("merge-intent locks = %d, want 1 (gate 5 passed, so the locked half refused)", n)
+			}
+			w.requireNotReentered(r)
+			w.requireEjectedNewest(r, ej)
+			if tc.after == "" {
+				return
+			}
+			w.srv.cfg.MergeQueue = w.store
+			w.mu.Lock()
+			w.prReadFail = false
+			w.mu.Unlock()
+			if n := w.sweep(0); n != 1 {
+				t.Fatalf("follow-up re-entered = %d, want 1 at %s", n, tc.after)
+			}
+			w.requireReentered(r, ej, tc.after)
+		})
+	}
+}
+
+// reentryQualifyingChain is pure: nil rows and rows of other categories are
+// no edge, an undecodable row is no edge, and a child already qualifying is
+// not re-parented (its first chain stands).
+func TestReentryQualifyingChain_Pure(t *testing.T) {
+	row := func(seq int64, cat, payload string) *audit.Entry {
+		return &audit.Entry{Sequence: seq, Category: cat, Payload: []byte(payload)}
+	}
+	rows := []*audit.Entry{
+		nil,
+		row(9, CategoryAcceptanceScenariosPushed, `{"base_sha":"x1","head_sha":"h1"}`), // re-parenting the seed: ignored
+		row(4, CategoryAcceptanceScenariosPushed, `{"base_sha":"h1","head_sha":"a1"}`),
+		row(5, CategoryConflictResolutionPushed, `not json`),
+		row(6, CategoryBranchRebased, `not json`),
+		row(7, "fixup_pushed", `{"base_sha":"a1","head_sha":"z1"}`),
+		row(8, CategoryAcceptanceScenariosPushed, `{"base_sha":"h1","head_sha":"a1"}`), // already qualifying
+	}
+	if chain, ok := reentryQualifyingChain(rows, 3, "h1", "a1"); !ok || strings.Join(chain, ",") != "h1,a1" {
+		t.Fatalf("chain = %v %v, want [h1 a1]", chain, ok)
+	}
+	if chain, ok := reentryQualifyingChain(rows, 3, "h1", "h1"); !ok || strings.Join(chain, ",") != "h1" {
+		t.Fatalf("seed chain = %v %v, want [h1]", chain, ok)
+	}
+	if _, ok := reentryQualifyingChain(rows, 3, "h1", "z1"); ok {
+		t.Fatal("a non-product category qualified z1")
+	}
+	if _, ok := reentryQualifyingChain(rows, 3, "", ""); ok {
+		t.Fatal("an empty seed qualified the empty head")
 	}
 }

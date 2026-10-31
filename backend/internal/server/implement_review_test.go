@@ -5272,3 +5272,130 @@ func TestImplementReviewRound_CleanFirstReviewAutoClosesNothing(t *testing.T) {
 		t.Errorf("open_implement = %d, want 1 — a raised concern is untouched", n)
 	}
 }
+
+// TestImplementReviewRound_ConfirmRecordsOutcomeFixed (E94.2 / #4693, ADR-117
+// D1): a reviewer's `confirmed` resolution is a system writer's close, so the
+// row lands addressed with outcome fixed and its judgement UNTOUCHED — a
+// never-judged row still reads unlabelled, a pre-labelled one keeps its label.
+// A `reopened` resolution in the same round records no outcome. The fixture
+// rows start with an empty outcome and nothing else in the round writes one, so
+// only the confirm's ApplyDisposition can produce fixed.
+func TestImplementReviewRound_ConfirmRecordsOutcomeFixed(t *testing.T) {
+	au := newSeqAuditFake()
+	cr := newFakeConcernRepo()
+	s := New(Config{Addr: "127.0.0.1:0", AuditRepo: au, ConcernRepo: cr})
+	runID, stageID := uuid.New(), uuid.New()
+	route := func(note string) *concern.Concern {
+		row := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, note)
+		if err := cr.MarkAddressedPending(context.Background(), []uuid.UUID{row.ID}, "routed"); err != nil {
+			t.Fatalf("route: %v", err)
+		}
+		return row
+	}
+	fresh := route("unhandled error path")
+	labelled := route("missing bounds check")
+	labelled.Judgement = concern.JudgementDefect
+	reopened := route("race on the cache map")
+
+	rev := &fakePlanReviewer{
+		verdict: &planreview.ReviewVerdict{
+			Verdict: planreview.VerdictApprove,
+			ConcernResolutions: []planreview.ConcernResolution{
+				{ID: fresh.ID.String(), Resolution: "confirmed", Note: "the fixup handles the error"},
+				{ID: labelled.ID.String(), Resolution: "confirmed", Note: "bounds check added"},
+				{ID: reopened.ID.String(), Resolution: "reopened", Note: "the map is still written without the lock"},
+			},
+		},
+		model: "claude-opus-4-8",
+	}
+	s.runImplementReviewInvocations(context.Background(), runID, stageID,
+		[]reviewerInvocation{{reviewer: rev}}, planreview.AuthorityAdvisory, "prompt", "author", "", "", planreview.DefaultReviewBudget, "", 0)
+
+	for _, c := range []struct {
+		row  *concern.Concern
+		want concern.Judgement
+	}{{fresh, concern.JudgementUnlabelled}, {labelled, concern.JudgementDefect}} {
+		got := concernRowAfterRound(t, cr, c.row.ID)
+		if got.State != concern.StateAddressed {
+			t.Errorf("%s state = %q, want addressed", c.row.Note, got.State)
+		}
+		if got.Outcome != concern.OutcomeFixed {
+			t.Errorf("%s outcome = %q, want fixed — a reviewer confirm records fixed", c.row.Note, got.Outcome)
+		}
+		if j := concern.NormalizeJudgement(string(got.Judgement)); j != c.want {
+			t.Errorf("%s judgement = %q, want %q — a system writer never touches the judgement", c.row.Note, j, c.want)
+		}
+	}
+	got := concernRowAfterRound(t, cr, reopened.ID)
+	if got.State != concern.StateReopened || got.Outcome != "" {
+		t.Errorf("reopened row = state %q outcome %q, want reopened / '' — only a confirm records fixed", got.State, got.Outcome)
+	}
+}
+
+// TestAutoCloseUnjudgedRoutedConcerns_RecordsOutcomeFixed: the clean-round
+// auto-close is a system writer's close — outcome fixed, judgement untouched.
+func TestAutoCloseUnjudgedRoutedConcerns_RecordsOutcomeFixed(t *testing.T) {
+	ctx := context.Background()
+	s, au, cr, runID, stageID := vetoRoundServer()
+	row := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "the handler still trusts the caller subject", "routed")
+	seedPushedFixupPass(t, au, runID, stageID, row.ID)
+
+	s.autoCloseUnjudgedRoutedConcerns(ctx, runID, stageID, []roundReviewVerdict{
+		autoCloseRound("gpt-5.6-sol", 200, planreview.VerdictApprove),
+	}, 1, "deadbeef")
+
+	got := concernRowAfterRound(t, cr, row.ID)
+	if got.State != concern.StateAddressed {
+		t.Fatalf("state = %q, want addressed", got.State)
+	}
+	if got.Outcome != concern.OutcomeFixed {
+		t.Errorf("outcome = %q, want fixed — the auto-close records fixed", got.Outcome)
+	}
+	if j := concern.NormalizeJudgement(string(got.Judgement)); j != concern.JudgementUnlabelled {
+		t.Errorf("judgement = %q, want unlabelled", j)
+	}
+}
+
+// TestReviewConcernThreads_ExcludeOutcomeAndJudgement pins the review-prompt
+// freeze (E94.2 / #4693): the prior-concern and settled-ledger threads carry
+// the state_reason a reviewer needs (the waive reason) and NOTHING of the
+// outcome, judgement, tradeoff cost or duplicate link. The sentinels live only
+// on those fields, so any copy of them into a prompt.PriorConcern surfaces.
+func TestReviewConcernThreads_ExcludeOutcomeAndJudgement(t *testing.T) {
+	ctx := context.Background()
+	s, _, cr, runID, stageID := vetoRoundServer()
+	const waiveReason = "operator waived: accepted for this release"
+	const costSentinel = "SENTINEL-COST-4693"
+	// The duplicate's root sits on ANOTHER stage, so its id can reach this
+	// stage's threads only by a leaked duplicate link.
+	root := seedConcernRow(t, cr, runID, uuid.New(), concern.StageKindImplement, 90, "root concern")
+	waived := seedConcernRow(t, cr, runID, stageID, concern.StageKindImplement, 100, "waived concern")
+	waived.State, waived.StateReason = concern.StateWaived, waiveReason
+	waived.Judgement, waived.TradeoffCost, waived.Outcome = concern.JudgementDefectPreExisting, costSentinel, concern.OutcomeWaived
+	waived.JudgementActorKind, waived.DuplicateOf = "user", &root.ID
+	open := seedRoutedConcern(t, cr, runID, stageID, "gpt-5.6-sol", "routed concern", "routed")
+	open.Judgement, open.TradeoffCost = concern.JudgementTradeoff, costSentinel
+
+	prior, err := json.Marshal(s.priorConcernsForReview(ctx, runID, stageID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	settled, err := json.Marshal(s.settledConcernsForReview(ctx, runID, stageID))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(settled), waiveReason) {
+		t.Fatalf("settled ledger %s is missing the waive reason — the fixture does not reach the ledger", settled)
+	}
+	if !strings.Contains(string(prior), open.ID.String()) {
+		t.Fatalf("prior concerns %s are missing the routed row — the fixture does not reach the thread", prior)
+	}
+	for name, body := range map[string]string{"prior": string(prior), "settled": string(settled)} {
+		for _, leak := range []string{costSentinel, string(concern.JudgementDefectPreExisting), string(concern.JudgementTradeoff),
+			"duplicate_of", root.ID.String(), "judgement", "outcome"} {
+			if strings.Contains(body, leak) {
+				t.Errorf("%s thread carries %q — outcome and judgement never reach a review prompt\n%s", name, leak, body)
+			}
+		}
+	}
+}
