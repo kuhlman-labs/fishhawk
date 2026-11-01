@@ -1,0 +1,147 @@
+{
+  "draft_packet": "sdlc-lifecycle-v1",
+  "prepared_on": "2026-10-31",
+  "status": "proposed; not ratified",
+  "checkout_commit": "195b3dd133575cc61bdf4b57dff67b99875c3bc9",
+  "local_sources": [
+    {
+      "path": "docs/adr/038-deploy-stage-type-post-merge-release-governance.md",
+      "sha256": "6f35dd6a762c88715c0f1ac230ccac095d949294f50134d8a813a89aea185bf7"
+    },
+    {
+      "path": "docs/adr/046-workflow-schema-major-version-coexistence.md",
+      "sha256": "916553f89ca4430f37a60247f0c4b99c99b9023a32cb55b8c408d26a95b68ce9"
+    },
+    {
+      "path": "docs/adr/048-repository-onboarding-init-doctor.md",
+      "sha256": "0a77f0cb21bc98e77f6e9e50877dff1ef918a06c3428eeaa5a41594d0c07cec6"
+    },
+    {
+      "path": "docs/adr/049-acceptance-validation-stage.md",
+      "sha256": "1089235558aa3be71fb3c4b18af02bb51f554e14ce85f7ec75f5355f33d1456f"
+    },
+    {
+      "path": "docs/adr/050-acceptance-agent-egress-credential-posture.md",
+      "sha256": "094edba26f78e36b71ae69680573041eebf5f61b5750a0d34911bb87ce0dcccc"
+    },
+    {
+      "path": "docs/adr/051-release-governance-release-notes-delegating-publish.md",
+      "sha256": "759f3fb53ceb8aacfe591c8545a6f2cfc268a17c402b7da5a156c0dcf0348fa8"
+    },
+    {
+      "path": "docs/adr/052-intake-and-refinement-brief-to-drafts.md",
+      "sha256": "89d05435b361cd977e7ba4df7f76985d96f940867d10fc5d28ba98a24b00e027"
+    },
+    {
+      "path": "docs/adr/053-post-deploy-verification-incident-intake.md",
+      "sha256": "43466c9d1b4c2b6add683ab6ffed89f6f565a93a8877efc67f6632cce9430df5"
+    },
+    {
+      "path": "docs/adr/073-kubernetes-helm-single-deployment-substrate.md",
+      "sha256": "c40d28d2aeab99c5bc0e73a04672b5897e013738ce2c2f3df6c70a5b0da203cf"
+    },
+    {
+      "path": "docs/adr/079-product-and-program-management-agent.md",
+      "sha256": "0c52cbb5a9ff971eb854c0c076271dc1544771b484cc6756fdd68d3cf5b22021"
+    },
+    {
+      "path": "docs/adr/080-solo-captain-alpha.md",
+      "sha256": "a1c8b82b5757b2ab36f02be02e0e12c05f77f49fcaf85c3396826d28242a813c"
+    },
+    {
+      "path": "docs/adr/084-reviewer-personas.md",
+      "sha256": "777320d4ccb9dedfcb7db746e82c68a8e2506ec3c03665f6cdaf3be139259711"
+    },
+    {
+      "path": "docs/adr/110-repository-agnostic-product-features.md",
+      "sha256": "af477e24b7c7c2ffae4f027342edbc893b885c24a7de6407758ad4af671baab3"
+    },
+    {
+      "path": "docs/adr/113-forge-verified-adr-ratification.md",
+      "sha256": "9d9edc472cf8c85900d60def3de44e5519472afa574699b004b5e27f9cd9cf49"
+    },
+    {
+      "path": "docs/adr/121-protected-judge.md",
+      "sha256": "49875db20c747662b5837dbec6fd2fa68f6f1598017fce2a302089a04ad3669e"
+    },
+    {
+      "path": "docs/adr/123-forge-verified-stage-approvals.md",
+      "sha256": "e533ba0dded81654db07a9b4d20a4b397ce4ee1a3a6d152dbf314e9461e08c25"
+    },
+    {
+      "path": "docs/adr/125-captains-log.md",
+      "sha256": "d4041bb318ef5d623b77de31d748f46e42a1f52564f190593b64f4604d1a1ad7"
+    },
+    {
+      "path": "docs/adr/126-security-finding-record.md",
+      "sha256": "7a042d2d44ba0915121cbb0e8d0b985f13e5b7cf9e90cad3a7662c24e3c9503b"
+    },
+    {
+      "path": "docs/adr/README.md",
+      "sha256": "3e59a8e16ce76985bf288bea85ca7e03146ea87f14f00d15c735081c0d324329"
+    },
+    {
+      "path": "docs/spec/workflow-v2.md",
+      "sha256": "0f3fe92de62d77d052ce81babacaa05b1f6b77a832c5567411ae2fd617a257ee"
+    },
+    {
+      "path": "backend/internal/deployreconciler/README.md",
+      "sha256": "bc544dfd15696ae8994dcc6982a2d1c848e0989332c2b8f672a71a99229b4236"
+    },
+    {
+      "path": ".fishhawk/workflows.yaml",
+      "sha256": "058f812bf9c8a72b5852366497b6217eaa937d0632ae5ae3f290774c138c0024"
+    },
+    {
+      "path": ".github/workflows/deploy.yml",
+      "sha256": "32208e6795076602821a93da237c0e565dbd1af6f590234301f844898c69a139"
+    },
+    {
+      "path": ".fishhawk/charter.md",
+      "sha256": "628b168a703a5d7c05b697c06673999c49d15652300da1c2229bbc85a8de4460"
+    }
+  ],
+  "tracker_sources": [
+    {
+      "issue": 3791,
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/3791",
+      "adr": "ADR-086",
+      "status_observed": "accepted",
+      "reviewed_on": "2026-10-31"
+    },
+    {
+      "issue": 3240,
+      "url": "https://github.com/kuhlman-labs/fishhawk/issues/3240",
+      "status_observed": "open",
+      "purpose": "Existing E71 delivery owner; not a new decision"
+    },
+    {
+      "issues": [
+        4880,
+        4881,
+        4882,
+        4883
+      ],
+      "adrs": [
+        "ADR-127",
+        "ADR-128",
+        "ADR-129",
+        "ADR-130"
+      ],
+      "status_observed": "proposed, not adopted as authority",
+      "reviewed_on": "2026-10-31"
+    }
+  ],
+  "pr_review_base_commit": "00334fc56158b127921c9be8d433c579e51f21e1",
+  "pr_review_base_note": "Drafts were prepared on the recorded original checkout. PRs are based on current main; accepted ADR source files are unchanged. Workflow and deploy-stub changes at main were reviewed and do not alter the proposed status or lifecycle scope.",
+  "pr_review_base_changed_sources": [
+    {
+      "path": ".fishhawk/workflows.yaml",
+      "sha256": "0a8d6cadf7ae0047500dfe97e15bdb000d30f4cc5f9acf67a95f15a143a1ca9b"
+    },
+    {
+      "path": ".github/workflows/deploy.yml",
+      "sha256": "85bcdd1952c77507eee5984657bb57a48385f985afd66d605d7d39d89d96daef"
+    }
+  ]
+}
