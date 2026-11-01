@@ -155,8 +155,11 @@ class DeploymentFailurePaths(unittest.TestCase):
             (bundle / 'manifest.json').write_text(json.dumps(manifest))
             calls = []
 
-            def fake_run(*args, check=True):
+            def fake_run(*args, check=True, input=None):
                 calls.append(args)
+                if args[:2] == ('helm', 'upgrade'):
+                    self.assertIn(('-f', '-'), list(zip(args, args[1:])))
+                    self.assertEqual(json.loads(input)['config'], {'githubAppId': '123', 'oauthClientId': 'client'})
                 if args[:2] == ('helm', 'history'):
                     return subprocess.CompletedProcess(args, 0 if installed else 1,
                         json.dumps([{'revision': 3, 'status': 'deployed'}]) if installed else '',
@@ -185,6 +188,7 @@ class DeploymentFailurePaths(unittest.TestCase):
                         self.assertFalse((root / 'receipt.json').exists())
             finally:
                 os.chdir(previous)
+            self.assertFalse((root / 'release-values.json').exists())
             return calls
 
     def test_smoke_failure_rolls_back_to_previous_deployment(self):

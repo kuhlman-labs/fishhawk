@@ -33,8 +33,8 @@ def validate_promotion(receipt, digest, run_id):
         raise ValueError("prod requires a successful staging receipt for this exact release bundle")
 
 
-def run(*args, check=True):
-    return subprocess.run(args, check=check, capture_output=True, text=True)
+def run(*args, check=True, input=None):
+    return subprocess.run(args, check=check, input=input, capture_output=True, text=True)
 
 
 def main():
@@ -63,7 +63,6 @@ def main():
               "frontend": {"image": manifest["frontend"]}, "ingress": {"host": host},
               "config": {"githubAppId": os.environ["FISHHAWK_APP_ID"],
                          "oauthClientId": os.environ["OAUTH_CLIENT_ID"]}}
-    Path("release-values.json").write_text(json.dumps(values))
     history = run("helm", "history", "fishhawk", "-n", namespace, "-o", "json", check=False)
     previous = None
     if history.returncode == 0:
@@ -75,8 +74,9 @@ def main():
     rollback_options = ("--rollback-on-failure",) if previous else ()
     try:
         run("helm", "upgrade", "--install", "fishhawk", str(bundle / "fishhawk.tgz"), "-n", namespace,
-            "-f", str(bundle / "values.yaml"), "-f", "release-values.json", *rollback_options,
-            "--wait", "--wait-for-jobs", "--timeout", "10m", "--history-max", "10")
+            "-f", str(bundle / "values.yaml"), "-f", "-", *rollback_options,
+            "--wait", "--wait-for-jobs", "--timeout", "10m", "--history-max", "10",
+            input=json.dumps(values))
         # curl retries accommodate first certificate issuance; TLS verification
         # stays on, and the body must identify the exact built commit.
         health = run("curl", "--fail", "--silent", "--show-error", "--retry", "12", "--retry-all-errors",

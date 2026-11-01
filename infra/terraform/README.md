@@ -105,7 +105,7 @@ Tokens are Kubernetes service-account credentials, scoped to one namespace; they
 
 ## GitHub environments and variables
 
-Create `infra`, `dev`, `staging`, `prod` environments. ALL must use custom branch policies allowing exactly the `main` branch (no tags/wildcards). `infra` and `prod` require reviewers with self-review disabled. Protection settings are checked live BEFORE requesting OIDC; absent or weaker settings fail closed. Keep admin bypass disabled operationally.
+Create `infra`, `dev`, `staging`, `prod` environments. ALL must use custom branch policies allowing exactly the `main` branch (no tags/wildcards). `infra` and `prod` require reviewers with self-review disabled. Protection settings are checked live BEFORE requesting OIDC; absent or weaker settings fail closed. The operator permits GitHub admin bypass for `infra` and `prod`; an administrator may explicitly bypass the environment approval gate, including for a self-initiated run. This does not disable the workflow's main-only and protection-configuration checks.
 
 | Location | Variables |
 |---|---|
@@ -137,5 +137,7 @@ Application frontend and API use one HTTPS host: `/` serves SPA, `/v0`, `/webhoo
 - Growth: sustained load or customer uptime requires larger non-burstable DBs and an increased budget; move prod to its own AKS cluster when isolation/HA is needed. The application chart and external data services carry forward.
 
 ## Checks
+
+When changing provider versions, run `terraform providers lock -platform=darwin_arm64 -platform=linux_amd64 -platform=linux_arm64` in BOTH Terraform roots and commit both lockfiles. CI initializes with `-lockfile=readonly`; provider package hashes must cover its Linux platform as well as the operator's platform. Reproduce Linux validation with Terraform 1.17.1 against a source-only copy, without state or Azure credentials.
 
 `terraform fmt -check -recursive infra/terraform`; initialize/validate both roots without a backend; `python deploy/azure/test_hosting.py` with PyYAML 6.0.3 and Helm 4.2.4. The reusable infra-check job owns these checks and is included in CI Pass. Azure Blob SDK tests live in `backend/internal/tracestore/azure_test.go`. Full repository verification remains `scripts/verify-change`. Static validation does not prove subscription permissions, cloud-init, Azure provisioning, ACME issuance, or live restore behavior; those are first-deploy acceptance checks.
