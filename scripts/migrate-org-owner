@@ -1,0 +1,342 @@
+#!/usr/bin/env python3
+r"""Rewrite the repository owner after the org transfer (kuhlman-labs -> pandion-labs).
+
+One-shot migration tool for the move of kuhlman-labs/fishhawk to the
+pandion-labs org. DRY-RUN BY DEFAULT: it reports what would change and writes
+a unified diff; --apply writes the files and re-sorts Go imports with
+`golangci-lint fmt`.
+
+Rule classes, applied in order to every tracked text file:
+
+  module  github.com/OLD/REPO/<module> and a quoted bare prefix -> NEW
+          Go module paths. Every file outside FROZEN, fixtures included.
+  url     any other github.com[:/]OLD/REPO -> NEW   repo URLs, with or without scheme.
+  ghcr    ghcr.io/OLD/ -> NEW                        image refs.
+  pages   OLD.github.io -> NEW                       the docs site.
+  slug    bare OLD/REPO (or OLD\/REPO) -> NEW        repo full name.
+  project github-project:OLD/<n> -> NEW/<N>          only with --project-number.
+
+url and slug match case-insensitively and keep the matched case
+(Kuhlman-Labs/Fishhawk -> Pandion-Labs/Fishhawk). In fixture files (tests,
+testdata, dev fixtures, spec examples) they apply only when no fixture in the
+same group (a package dir plus its testdata tree) names OLD on its own: such a
+group pairs slugs with a separate owner field ("kuhlman-labs"), so rewriting
+half of it breaks it, and any repo name works there. A coupled test that
+asserts on a product string the rewrite DID change (a hard-coded homepage URL,
+productRepo) fails and is fixed by hand; the PR lists them.
+
+After --apply, scripts/gen-site-reference regenerates the generated site
+reference regions from their canonical sources.
+
+Sibling-module pins. A go.mod that requires another module of this repo at a
+pseudo-version names a commit whose go.mod declares the OLD path, and even a
+workspace build verifies that version's go.mod hash, so the rename alone does
+not build. Each such require becomes `v0.0.0` plus `replace => ../<mod>` (the
+shape directory/credstore already use), and this repo's own go.sum lines are
+dropped (their h1 hashes cover the old path). cli/go.mod must not keep its
+replace (TestCLIModuleIsGoInstallable: `go install .../cli/cmd/fishhawk@<v>`
+refuses one), so the rewrite PR restores a pseudo-version in a second commit,
+after the transfer, against a tagged anchor commit that keeps the first
+commit reachable through the squash merge:
+  git tag migration/org-rewrite-anchor <first-commit> && git push origin migration/org-rewrite-anchor
+  (cd cli && GOWORK=off go get github.com/NEW/REPO/credstore@<first-commit> \
+     && go mod edit -dropreplace github.com/NEW/REPO/credstore && GOWORK=off go mod tidy)
+
+Deliberately NOT rewritten (reported as kept):
+
+  * identities: github:OLD (approver/member), @OLD (mentions), bare OLD as a
+    user login, user(login:"OLD") GraphQL — OLD stays the operator's account;
+  * owner-coupled fixtures (see above), except the module/ghcr/pages classes;
+  * FROZEN paths: hash-pinned files (plan-standard-v1.schema.json and its
+    mirrors, pinned by TestPlanSchemaFrozen), docs/adr (verbatim tracker
+    transcriptions), docs/compliance
+    and acceptance/ (evidence and recorded verifications of past runs),
+    backend/internal/agenteval testdata and eval inputs
+    (module paths only, so the catch-rate evidence record is not staled).
+
+The "kept, needs review" section lists non-test, non-identity occurrences no
+rule covered; read it before applying.
+"""
+
+from __future__ import annotations
+
+import argparse
+import collections
+import difflib
+import pathlib
+import re
+import subprocess
+import sys
+
+SELF = "scripts/migrate-org-owner"
+
+
+MODULES = ("backend", "cli", "credstore", "directory", "pricing", "redaction", "runner", "verifier")
+
+# Paths left entirely untouched.
+FROZEN = ("docs/adr/", "docs/compliance/", "acceptance/", "backend/internal/agenteval/testdata/")
+FROZEN_FILES = {
+    "docs/spec/plan-standard-v1.schema.json",
+    "backend/internal/plan/schemas/plan-standard-v1.schema.json",
+    "runner/internal/plan/schemas/plan-standard-v1.schema.json",
+}
+# Paths where only the module class applies (they must still compile).
+MODULE_ONLY = ("backend/internal/agenteval/",)
+
+TEST_PATTERNS = (
+    re.compile(r"_test\.go$"),
+    re.compile(r"\.test\.[cm]?[jt]sx?$"),
+    re.compile(r"(^|/)testdata/"),
+    re.compile(r"(^|/)__tests__/"),
+    re.compile(r"\.golden$"),
+    re.compile(r"^backend/internal/devfixtures/"),
+    re.compile(r"^docs/spec/examples/"),
+)
+
+
+def is_test(path: str) -> bool:
+    return any(p.search(path) for p in TEST_PATTERNS)
+
+
+def build_rules(old: str, new: str, repo: str, project_number: int | None):
+    o, r = re.escape(old), re.escape(repo)
+    tail = r"(?![A-Za-z0-9_-])"
+    mods = "|".join(MODULES)
+    rules = [
+        # (name, regex, replacement, applies_to_owner_coupled_fixtures)
+        # Module paths proper: a module dir follows, or the bare prefix is quoted.
+        ("module", re.compile(rf"(?<![/:\w.@\\])github\.com/{o}/{r}(?=/(?:{mods})\b|/?[\"'`])"),
+         f"github.com/{new}/{repo}", True),
+        ("url", re.compile(rf"github(\\?)\.com([:/])({o})/({r}){tail}", re.I),
+         lambda m: f"github{m[1]}.com{m[2]}{match_case(m[3], new)}/{m[4]}", False),
+        ("ghcr", re.compile(rf"ghcr(\\?)\.io/{o}/"), rf"ghcr\1.io/{new}/", True),
+        ("pages", re.compile(rf"(?<![\w-]){o}\.github\.io"), f"{new}.github.io", True),
+        # The separator may be regex-escaped (kuhlman-labs\/fishhawk in a JS test regex),
+        # and the slug may follow a string escape ("...*\nkuhlman-labs/fishhawk#1").
+        ("slug", re.compile(rf"(?:(?<=\\[nrt])|(?<![\w.@])(?<!\w-)(?<!github:))({o})(\\?/)({r}){tail}", re.I),
+         lambda m: f"{match_case(m[1], new)}{m[2]}{m[3]}", False),
+    ]
+    if project_number is not None:
+        rules.append(("project", re.compile(rf"github-project:{o}/\d+\b"),
+                      f"github-project:{new}/{project_number}", False))
+    return rules
+
+
+def match_case(found: str, new: str) -> str:
+    """Spell NEW in the case pattern of the matched owner (lower, UPPER, Title-Case)."""
+    if found.isupper():
+        return new.upper()
+    if found.islower():
+        return new
+    return "-".join(w.capitalize() for w in new.split("-"))
+
+
+def owner_coupled(text: str, old: str) -> bool:
+    """True when the file names OLD on its own (a login/owner field), not only inside a slug."""
+    return re.search(rf"(?<![\w.@:/-]){re.escape(old)}(?![\w/.-])", text) is not None
+
+
+def fixture_group(path: str) -> str:
+    """Fixtures that feed each other share a group: a package dir plus its testdata tree."""
+    head, sep, _ = path.partition("/testdata/")
+    return head if sep else path.rsplit("/", 1)[0] if "/" in path else ""
+
+
+# Fixture groups read by tests in OTHER groups (the ticket guard loads the
+# grooming-report examples), so they keep the old owner like their readers.
+ALWAYS_COUPLED = ("docs/spec/examples",)
+
+
+def coupled_groups(root: pathlib.Path, paths: list[str], old: str) -> set[str]:
+    groups = set(ALWAYS_COUPLED)
+    for path in paths:
+        if not is_test(path) or path.startswith(FROZEN) or path in FROZEN_FILES:
+            continue
+        try:
+            text = (root / path).read_text("utf-8")
+        except (UnicodeDecodeError, OSError):
+            continue
+        if owner_coupled(text, old):
+            groups.add(fixture_group(path))
+    return groups
+
+
+def kept_class(line: str, old: str, path: str) -> str:
+    o = re.escape(old)
+    if path.startswith(FROZEN) or path.startswith(MODULE_ONLY) or path in FROZEN_FILES:
+        return "frozen path"
+    if re.search(rf"github:{o}\b", line):
+        return "identity github:OLD"
+    if re.search(rf"@{o}\b", line):
+        return "mention @OLD"
+    if re.search(rf"github-project:{o}/", line):
+        return "project ref (pass --project-number)"
+    if re.search(rf"login:\s*\\?\"{o}", line):
+        return "graphql user(login:) — code change"
+    if is_test(path):
+        return "owner-coupled fixture"
+    return "NEEDS REVIEW"
+
+
+def tracked_files(root: pathlib.Path) -> list[str]:
+    out = subprocess.run(["git", "ls-files", "-z"], cwd=root, check=True, capture_output=True).stdout
+    return [p for p in out.decode().split("\0") if p]
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--from-owner", default="kuhlman-labs")
+    ap.add_argument("--to-owner", default="pandion-labs")
+    ap.add_argument("--repo", default="fishhawk")
+    ap.add_argument("--project-number", type=int, help="new org Project number; rewrites github-project: refs")
+    ap.add_argument("--diff", default="org-migration.diff", help="where to write the unified diff (dry run)")
+    ap.add_argument("--apply", action="store_true", help="write the changes (default: dry run)")
+    ap.add_argument("--show-kept", type=int, default=15, help="sample lines shown per kept class")
+    args = ap.parse_args()
+
+    root = pathlib.Path(subprocess.run(["git", "rev-parse", "--show-toplevel"], check=True,
+                                       capture_output=True, text=True).stdout.strip())
+    old, new = args.from_owner, args.to_owner
+    rules = build_rules(old, new, args.repo, args.project_number)
+
+    rule_hits: collections.Counter[str] = collections.Counter()
+    dir_hits: collections.Counter[str] = collections.Counter()
+    kept: dict[str, list[str]] = collections.defaultdict(list)
+    changed: dict[str, str] = {}
+    diff_chunks: list[str] = []
+
+    paths = tracked_files(root)
+    coupled_dirs = coupled_groups(root, paths, old)
+    for path in paths:
+        if path == SELF or path.startswith(FROZEN) or path in FROZEN_FILES:
+            if path != SELF:
+                _collect_kept(root, path, old, kept)
+            continue
+        fp = root / path
+        if fp.is_symlink() or not fp.is_file():
+            continue
+        raw = fp.read_bytes()
+        if b"\0" in raw or old.encode() not in raw.lower():
+            continue
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError:
+            continue
+
+        if path.endswith("go.sum"):
+            own = f"github.com/{old}/{args.repo}/"
+            lines = text.splitlines(keepends=True)
+            updated = "".join(ln for ln in lines if not ln.startswith(own))
+            dropped = len(lines) - len(updated.splitlines(keepends=True))
+            if dropped:
+                rule_hits["go.sum-drop"] += dropped
+                changed[path] = updated
+                diff_chunks.extend(difflib.unified_diff(
+                    lines, updated.splitlines(keepends=True), fromfile=f"a/{path}", tofile=f"b/{path}"))
+            continue
+
+        if path.endswith("go.mod"):
+            text_pinned = pin_siblings(text, old, args.repo)
+            if text_pinned != text:
+                rule_hits["go.mod-pin"] += 1
+                text, raw_original = text_pinned, text
+            else:
+                raw_original = text
+        else:
+            raw_original = text
+
+        # A fixture is safe to rename only when no fixture in its group names the owner alone.
+        coupled = is_test(path) and fixture_group(path) in coupled_dirs
+        module_only = path.startswith(MODULE_ONLY)
+        updated = text
+        for name, rx, repl, in_coupled in rules:
+            if module_only and name != "module":
+                continue
+            if coupled and not in_coupled:
+                continue
+            updated, n = rx.subn(repl, updated)
+            if n:
+                rule_hits[name] += n
+                dir_hits[path.split("/", 1)[0] if "/" in path else "(root)"] += n
+
+        for i, line in enumerate(updated.splitlines(), 1):
+            if old in line:
+                kept[kept_class(line, old, path)].append(f"{path}:{i}: {line.strip()[:160]}")
+
+        if updated != raw_original:
+            changed[path] = updated
+            diff_chunks.extend(difflib.unified_diff(
+                raw_original.splitlines(keepends=True), updated.splitlines(keepends=True),
+                fromfile=f"a/{path}", tofile=f"b/{path}"))
+
+    total = sum(rule_hits.values())
+    print(f"{'APPLY' if args.apply else 'DRY RUN'}: {old} -> {new} ({args.repo})")
+    print(f"  files changed: {len(changed)}   replacements: {total}")
+    print("  by rule:   " + ", ".join(f"{k}={v}" for k, v in rule_hits.most_common()))
+    print("  by dir:    " + ", ".join(f"{k}={v}" for k, v in dir_hits.most_common(12)))
+    print(f"\nKept occurrences of '{old}' by class:")
+    for cls in sorted(kept, key=lambda c: (c != "NEEDS REVIEW", c)):
+        print(f"  {cls}: {len(kept[cls])}")
+    for cls in ("NEEDS REVIEW", "graphql user(login:) — code change", "project ref (pass --project-number)"):
+        if kept.get(cls):
+            print(f"\n[{cls}] (first {args.show_kept})")
+            for s in kept[cls][: args.show_kept]:
+                print(f"  {s}")
+
+    if not args.apply:
+        pathlib.Path(args.diff).write_text("".join(diff_chunks))
+        print(f"\nDiff written to {args.diff}. Re-run with --apply to write the files.")
+        return 0
+
+    for path, updated in changed.items():
+        (root / path).write_text(updated)
+    gofiles = [p for p in changed if p.endswith(".go")]
+    if gofiles:
+        # The module rename moves local imports in sort order. Re-sort with the
+        # lint formatter (golangci-lint fmt: gofmt + goimports with the configured
+        # local-prefixes), NOT the host gofmt: a host Go newer than the linter's
+        # build aligns some files differently, and the lint gate then fails them.
+        subprocess.run(["golangci-lint", "fmt", *gofiles], cwd=root, check=True)
+    # Generated site reference regions render from canonical sources, some of
+    # them frozen with the old owner (the plan schema), so regenerate rather
+    # than trust the rewrite of the rendered copy.
+    subprocess.run(["scripts/gen-site-reference"], cwd=root, check=True)
+    print(f"\nApplied to {len(changed)} files; golangci-lint fmt re-sorted {len(gofiles)} Go files; "
+          "site reference regenerated.")
+    return 0
+
+
+def pin_siblings(text: str, old: str, repo: str) -> str:
+    """Rewrite pseudo-version requires of this repo's own modules to v0.0.0 + replace => ../<mod>.
+
+    Runs on the pre-rename text (OLD path); the module rule renames the result.
+    """
+    prefix = f"github.com/{old}/{repo}/"
+    rx = re.compile(rf"^(\s*(?:require\s+)?){re.escape(prefix)}([a-z]+) (v\S+)", re.M)
+    pinned = []
+
+    def repl(m: re.Match) -> str:
+        if m.group(3) != "v0.0.0":
+            pinned.append(m.group(2))
+        return f"{m.group(1)}{prefix}{m.group(2)} v0.0.0"
+
+    out = rx.sub(repl, text)
+    have = set(re.findall(rf"^replace {re.escape(prefix)}([a-z]+) =>", out, re.M))
+    missing = [mod for mod in pinned if mod not in have]
+    if missing:
+        out = out.rstrip("\n") + "\n" + "".join(f"\nreplace {prefix}{mod} => ../{mod}\n" for mod in missing)
+    return out
+
+
+def _collect_kept(root: pathlib.Path, path: str, old: str, kept: dict[str, list[str]]) -> None:
+    try:
+        text = (root / path).read_text("utf-8")
+    except (UnicodeDecodeError, OSError):
+        return
+    for i, line in enumerate(text.splitlines(), 1):
+        if old in line:
+            kept["frozen path"].append(f"{path}:{i}: {line.strip()[:160]}")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
