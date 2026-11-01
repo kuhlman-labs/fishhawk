@@ -9,7 +9,7 @@ import sys
 
 
 def validate(name, environment, policy_pages):
-    if name not in {"dev", "prod"} or environment.get("name") != name:
+    if name not in {"dev", "staging", "prod", "infra"} or environment.get("name") != name:
         raise ValueError("unexpected deployment environment")
     policy = environment.get("deployment_branch_policy") or {}
     if policy.get("custom_branch_policies") is not True or policy.get("protected_branches") is not False:
@@ -17,10 +17,10 @@ def validate(name, environment, policy_pages):
     policies = [p for page in policy_pages for p in page["branch_policies"]]
     if len(policies) != 1 or policies[0].get("name") != "main" or policies[0].get("type") != "branch":
         raise ValueError("environment must allow only the main branch (no tag or wildcard policies)")
-    if name == "prod":
+    if name in {"prod", "infra"}:
         reviews = [r for r in environment.get("protection_rules", []) if r.get("type") == "required_reviewers"]
         if not reviews or not reviews[0].get("reviewers") or reviews[0].get("prevent_self_review") is not True:
-            raise ValueError("prod requires reviewers with self-review disabled")
+            raise ValueError(f"{name} requires reviewers with self-review disabled")
 
 
 def main():

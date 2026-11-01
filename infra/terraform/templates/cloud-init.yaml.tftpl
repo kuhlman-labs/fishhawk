@@ -1,0 +1,47 @@
+#cloud-config
+package_update: true
+packages: [curl, ca-certificates, jq, postgresql-client]
+write_files:
+  - path: /etc/systemd/journald.conf.d/fishhawk.conf
+    permissions: '0644'
+    content: |
+      [Journal]
+      SystemMaxUse=256M
+      RuntimeMaxUse=64M
+  - path: /etc/rancher/k3s/config.yaml
+    permissions: '0600'
+    content: |
+      tls-san:
+        - ${public_ip}
+      secrets-encryption: true
+      write-kubeconfig-mode: "0600"
+      # Avoid overlap with the Azure VNet (10.42.0.0/16).
+      cluster-cidr: 10.52.0.0/16
+      service-cidr: 10.53.0.0/16
+      disable:
+        - servicelb
+      kubelet-arg:
+        - "system-reserved=cpu=200m,memory=512Mi"
+        - "kube-reserved=cpu=200m,memory=512Mi"
+        - "eviction-hard=memory.available<250Mi,nodefs.available<10%"
+  - path: /var/lib/rancher/k3s/server/manifests/traefik-config.yaml
+    permissions: '0600'
+    content: |
+      apiVersion: helm.cattle.io/v1
+      kind: HelmChartConfig
+      metadata:
+        name: traefik
+        namespace: kube-system
+      spec:
+        valuesContent: |-
+          service:
+            type: ClusterIP
+          ports:
+            web:
+              hostPort: 80
+            websecure:
+              hostPort: 443
+runcmd:
+  - [systemctl, restart, systemd-journald]
+  # Fetch installer from the SAME immutable release tag as the installed binary.
+  - [sh, -c, 'curl --fail --silent --show-error --location --retry 5 "https://raw.githubusercontent.com/k3s-io/k3s/${k3s_version}/install.sh" -o /root/install-k3s.sh && INSTALL_K3S_VERSION="${k3s_version}" sh /root/install-k3s.sh']

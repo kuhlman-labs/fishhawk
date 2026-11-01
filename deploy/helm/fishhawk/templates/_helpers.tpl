@@ -302,9 +302,11 @@ tier runs no background workers); roles "all" and "worker" honor .Values.workers
 {{- define "fishhawk.fishhawkdPodSpec" -}}
 {{- $root := .root -}}
 {{- $role := .role -}}
+{{ include "fishhawk.podSecurity" $root }}
 containers:
   - name: fishhawkd
-    image: "{{ $root.Values.image.repository }}:{{ $root.Values.image.tag | default $root.Chart.AppVersion }}"
+    image: {{ include "fishhawk.image" $root | quote }}
+    {{- include "fishhawk.containerSecurity" $root | nindent 4 }}
     imagePullPolicy: {{ $root.Values.image.pullPolicy }}
     ports:
       - name: http
@@ -364,8 +366,13 @@ containers:
       failureThreshold: {{ $root.Values.probes.readiness.failureThreshold }}
     resources:
       {{- toYaml $root.Values.resources | nindent 6 }}
-    {{- if $root.Values.secrets.githubApp.privateKeyFile.enabled }}
+    {{- if or $root.Values.hardened $root.Values.secrets.githubApp.privateKeyFile.enabled }}
     volumeMounts:
+      {{- if $root.Values.hardened }}
+      - name: scratch
+        mountPath: /tmp
+      {{- end }}
+      {{- if $root.Values.secrets.githubApp.privateKeyFile.enabled }}
       # GitHub App private key, projected read-only as a single file from
       # the Secret (fishhawk.secretName). subPath mounts just the file, so
       # the rest of the directory is untouched.
@@ -373,9 +380,16 @@ containers:
         mountPath: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | quote }}
         subPath: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
         readOnly: true
+      {{- end }}
     {{- end }}
-{{- if $root.Values.secrets.githubApp.privateKeyFile.enabled }}
+{{- if or $root.Values.hardened $root.Values.secrets.githubApp.privateKeyFile.enabled }}
 volumes:
+  {{- if $root.Values.hardened }}
+  - name: scratch
+    emptyDir:
+      sizeLimit: 512Mi
+  {{- end }}
+  {{- if $root.Values.secrets.githubApp.privateKeyFile.enabled }}
   - name: github-app-private-key
     secret:
       secretName: {{ include "fishhawk.secretName" $root }}
@@ -384,6 +398,7 @@ volumes:
         # secretKey is skipped by envFrom but surfaced here as a file.
         - key: {{ $root.Values.secrets.githubApp.privateKeyFile.secretKey | quote }}
           path: {{ $root.Values.secrets.githubApp.privateKeyFile.mountPath | base | quote }}
+  {{- end }}
 {{- end }}
 {{- end -}}
 
@@ -415,6 +430,15 @@ fishhawk.validateSecretContract (validates against it), NOTES.txt (prints it).
 {{- define "fishhawk.secretKeySpec" -}}
 {{- $v := .Values -}}
 {{- $records := list -}}
+{{- if and $v.config.azureBlobContainer $v.config.s3Bucket -}}
+{{- fail "Azure Blob and S3 trace storage are mutually exclusive" -}}
+{{- end -}}
+{{- $records = append $records (dict
+      "secretKey" "FISHHAWKD_AZURE_STORAGE_CONNECTION_STRING"
+      "valuesField" "azureStorageConnectionString"
+      "envDelivered" true
+      "required" (ne ($v.config.azureBlobContainer | default "") "")) -}}
+
 {{- $records = append $records (dict
       "secretKey" "FISHHAWKD_DATABASE_URL"
       "valuesField" "databaseUrl"
@@ -813,6 +837,7 @@ fishhawk.validateExtraEnv.
       "FISHHAWKD_S3_REGION"
       "FISHHAWKD_S3_ENDPOINT"
       "FISHHAWKD_S3_BUCKET"
+      "FISHHAWKD_AZURE_BLOB_CONTAINER"
       "FISHHAWKD_EXTERNAL_URL"
       "FISHHAWKD_OAUTH_CLIENT_ID"
       "FISHHAWKD_OAUTH_CALLBACK_URL"
@@ -894,4 +919,39 @@ message names the offending key and the way out.
 {{- end -}}
 {{- end -}}
 {{- end -}}
+{{- end -}}
+
+{{/* Immutable image identity shared by every server and migration pod. */}}
+{{- define "fishhawk.image" -}}
+{{- if .Values.image.digest -}}
+{{- if not (regexMatch "^sha256:[a-f0-9]{64}$" .Values.image.digest) -}}
+{{- fail "image.digest must be sha256 followed by 64 lowercase hex characters" -}}
+{{- end -}}
+{{- printf "%s@%s" .Values.image.repository .Values.image.digest -}}
+{{- else -}}
+{{- printf "%s:%s" .Values.image.repository (.Values.image.tag | default .Chart.AppVersion) -}}
+{{- end -}}
+{{- end -}}
+
+{{- define "fishhawk.podSecurity" -}}
+{{- if .Values.hardened }}
+automountServiceAccountToken: false
+securityContext:
+  runAsNonRoot: true
+  runAsUser: 65532
+  runAsGroup: 65532
+  fsGroup: 65532
+  seccompProfile:
+    type: RuntimeDefault
+{{- end }}
+{{- end -}}
+
+{{- define "fishhawk.containerSecurity" -}}
+{{- if .Values.hardened }}
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop: ["ALL"]
+{{- end }}
 {{- end -}}

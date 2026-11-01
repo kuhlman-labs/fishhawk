@@ -1,0 +1,68 @@
+{{- if .Values.frontend.enabled }}
+{{- if not (regexMatch "^ghcr.io/[a-z0-9_./-]+@sha256:[a-f0-9]{64}$" .Values.frontend.image) }}
+{{- fail "frontend.image requires an immutable GHCR image digest" }}
+{{- end }}
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-web
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: fishhawk-web
+  template:
+    metadata:
+      labels:
+        app: fishhawk-web
+    spec:
+      automountServiceAccountToken: false
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 101
+        runAsGroup: 101
+        fsGroup: 101
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: web
+          image: {{ .Values.frontend.image | quote }}
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          ports:
+            - name: http
+              containerPort: 8080
+          readinessProbe:
+            httpGet:
+              path: /index.html
+              port: http
+          resources:
+            requests:
+              cpu: 25m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir:
+            sizeLimit: 32Mi
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: {{ include "fishhawk.fullname" . }}-web
+spec:
+  selector:
+    app: fishhawk-web
+  ports:
+    - name: http
+      port: 8080
+      targetPort: http
+{{- end }}

@@ -8,6 +8,9 @@ metadata:
   labels:
     {{- include "fishhawk.labels" (dict "root" . "role" "server") | nindent 4 }}
 spec:
+  # Stop the old process before starting its singleton workers again.
+  strategy:
+    type: Recreate
   replicas: {{ .Values.replicaCount }}
   # The allInOne fishhawkd workload carries an app.kubernetes.io/component: server
   # discriminator so its Service + Deployment select ONLY the fishhawkd pod. The

@@ -71,6 +71,9 @@ jobs:
               - 'docs/api/**'
               - '.github/workflows/ci.yml'
             docker:
+              - 'frontend/**'
+              - 'deploy/azure/**'
+              - 'deploy/helm/**'
               # All workspace source copied by backend/Dockerfile.
               - 'backend/**'
               - 'runner/**'
@@ -97,6 +100,8 @@ jobs:
               - '.github/workflows/ci.yml'
               - '.github/workflows/helm-render.yml'
             infra:
+              - 'deploy/azure/**'
+              - '.github/workflows/hosted-deploy.yml'
               - 'infra/terraform/**'
               - '.github/workflows/ci.yml'
               - '.github/workflows/infra-*.yml'
@@ -410,6 +415,14 @@ jobs:
           cache-to: type=gha,mode=max,scope=ci-docker-build
           provenance: false
           sbom: false
+
+      - name: Build hosted frontend image
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/azure/frontend.Dockerfile
+          build-contexts: frontend=./frontend
+          push: false
 
   site:
     name: Documentation site

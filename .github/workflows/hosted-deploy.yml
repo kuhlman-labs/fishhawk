@@ -1,0 +1,144 @@
+name: Hosted Deploy
+on:
+  workflow_run:
+    workflows: [CI]
+    types: [completed]
+    branches: [main]
+  workflow_dispatch:
+    inputs:
+      environment:
+        type: choice
+        options: [dev, staging, prod]
+        required: true
+      build_run_id:
+        description: Successful main CI run containing hosted-release
+        type: string
+        required: true
+      staging_run_id:
+        description: For prod, successful Hosted Deploy run with staging-receipt
+        type: string
+permissions:
+  contents: read
+jobs:
+  protections:
+    if: >-
+      vars.AZURE_HOSTING_ENABLED == 'true' &&
+      (github.event_name == 'workflow_dispatch' ||
+       (github.event.workflow_run.conclusion == 'success' && github.event.workflow_run.event == 'push'))
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      actions: read
+    outputs:
+      environment: ${{ steps.guard.outputs.environment }}
+      build_run_id: ${{ steps.guard.outputs.build_run_id }}
+      source_sha: ${{ steps.guard.outputs.source_sha }}
+      available: ${{ steps.guard.outputs.available }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+      - name: Validate source run and live environment protections
+        id: guard
+        env:
+          GH_TOKEN: ${{ github.token }}
+          DEPLOY_ENV: ${{ inputs.environment || 'dev' }}
+          BUILD_RUN_ID: ${{ inputs.build_run_id || github.event.workflow_run.id }}
+        run: |
+          set -euo pipefail
+          test "$GITHUB_REF" = refs/heads/main
+          [[ "$BUILD_RUN_ID" =~ ^[0-9]+$ ]]
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID" > "$RUNNER_TEMP/source.json"
+          jq -e '.conclusion == "success" and .event == "push" and .head_branch == "main" and .path == ".github/workflows/ci.yml"' "$RUNNER_TEMP/source.json"
+          gh api "repos/$GITHUB_REPOSITORY/actions/runs/$BUILD_RUN_ID/artifacts" > "$RUNNER_TEMP/artifacts.json"
+          if ! jq -e '.artifacts | any(.name == "hosted-release" and .expired == false)' "$RUNNER_TEMP/artifacts.json"; then
+            test "$GITHUB_EVENT_NAME" = workflow_run
+            echo 'available=false' >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          gh api "repos/$GITHUB_REPOSITORY/environments/$DEPLOY_ENV" > "$RUNNER_TEMP/environment.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/environments/$DEPLOY_ENV/deployment-branch-policies" > "$RUNNER_TEMP/branch-policies.json"
+          python3 scripts/check-deploy-environment.py "$DEPLOY_ENV" "$RUNNER_TEMP/environment.json" "$RUNNER_TEMP/branch-policies.json"
+          {
+            echo "environment=$DEPLOY_ENV"
+            echo "build_run_id=$BUILD_RUN_ID"
+            echo "source_sha=$(jq -r .head_sha "$RUNNER_TEMP/source.json")"
+            echo 'available=true'
+          } >> "$GITHUB_OUTPUT"
+  deploy:
+    needs: protections
+    if: needs.protections.outputs.available == 'true'
+    runs-on: ubuntu-24.04
+    timeout-minutes: 40
+    environment: ${{ needs.protections.outputs.environment }}
+    concurrency:
+      group: hosted-${{ needs.protections.outputs.environment }}
+      cancel-in-progress: false
+    permissions:
+      contents: read
+      actions: read
+      id-token: write
+    env:
+      GH_TOKEN: ${{ github.token }}
+      DEPLOY_ENV: ${{ needs.protections.outputs.environment }}
+      BUILD_RUN_ID: ${{ needs.protections.outputs.build_run_id }}
+      SOURCE_SHA: ${{ needs.protections.outputs.source_sha }}
+      APP_HOST: ${{ vars.APP_HOST }}
+      FISHHAWK_APP_ID: ${{ vars.FISHHAWK_GITHUB_APP_ID }}
+      OAUTH_CLIENT_ID: ${{ vars.OAUTH_CLIENT_ID }}
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          ref: main
+          persist-credentials: false
+          fetch-depth: 0
+      - name: Download release and verify promotion provenance
+        env:
+          STAGING_RUN_ID: ${{ inputs.staging_run_id }}
+        run: |
+          set -euo pipefail
+          # A queued automatic dev deployment must never replace a newer tree.
+          if [ "$GITHUB_EVENT_NAME" = workflow_run ]; then
+            test "$SOURCE_SHA" = "$(git rev-parse HEAD)"
+          fi
+          gh run download "$BUILD_RUN_ID" --name hosted-release --dir release-bundle
+          if [ "$DEPLOY_ENV" = prod ]; then
+            [[ "$STAGING_RUN_ID" =~ ^[0-9]+$ ]]
+            gh api "repos/$GITHUB_REPOSITORY/actions/runs/$STAGING_RUN_ID" > "$RUNNER_TEMP/staging.json"
+            jq -e '.conclusion == "success" and .head_branch == "main" and .event == "workflow_dispatch" and .path == ".github/workflows/hosted-deploy.yml"' "$RUNNER_TEMP/staging.json"
+            gh run download "$STAGING_RUN_ID" --name staging-receipt --dir staging-receipt
+          fi
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.2.4
+      - uses: azure/setup-kubectl@v4
+        with:
+          version: v1.37.1
+      - uses: sigstore/cosign-installer@v3
+      - uses: azure/login@v3
+        with:
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Read namespace-scoped deployment credential
+        env:
+          VAULT: ${{ vars.AZURE_KEY_VAULT }}
+        run: |
+          set -euo pipefail
+          umask 077
+          az keyvault secret show --vault-name "$VAULT" --name deploy-kubeconfig --query value -o tsv > "$RUNNER_TEMP/kubeconfig"
+          echo "KUBECONFIG=$RUNNER_TEMP/kubeconfig" >> "$GITHUB_ENV"
+      - name: Migrate, deploy, check and record release
+        run: python3 deploy/azure/deploy.py
+      - uses: actions/upload-artifact@v6
+        if: success() && env.DEPLOY_ENV == 'staging'
+        with:
+          name: staging-receipt
+          path: receipt.json
+          if-no-files-found: error
+          retention-days: 90
+      - name: Remove deployment credential
+        if: always()
+        run: rm -f "$RUNNER_TEMP/kubeconfig"

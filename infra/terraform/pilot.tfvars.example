@@ -1,0 +1,15 @@
+subscription_id  = "00000000-0000-0000-0000-000000000000"
+name             = "fhunique"
+location         = "eastus"
+ssh_public_key   = "ssh-ed25519 REPLACE_WITH_OPERATOR_PUBLIC_KEY"
+admin_cidrs      = ["203.0.113.10/32"]
+# Use a fixed-egress runner where possible. Broadening 6443 for GitHub-hosted
+# runners exposes an authenticated TLS API, never anonymous cluster access.
+deployment_cidrs = ["203.0.113.10/32"]
+budget_email     = "operator@example.com"
+budget_start     = "2026-11-01T00:00:00Z"
+sas_start        = "2026-11-01T00:00:00Z"
+sas_expiry       = "2027-01-01T00:00:00Z"
+# Discover with az vm image list --publisher Canonical --offer ubuntu-24_04-lts
+# --sku server --location eastus --all; select an exact version before apply.
+image_version    = "0.0.0"

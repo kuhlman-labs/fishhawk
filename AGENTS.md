@@ -71,6 +71,7 @@ ADRs before choosing boundaries.
 | Tests, fixtures, cross-module wire types | [testing rules](docs/agents/testing.md) |
 | GitHub Actions, CI or publishing | [verification guide](docs/agents/verification.md) § Required GitHub Actions validation; [scripts contract](scripts/README.md) |
 | Verify / unexplained red | `verify-gate` / `diagnose-red`; [verification guide](docs/agents/verification.md) |
+| Hosted Azure pilot | [Azure bootstrap, costs, promotion and recovery](infra/terraform/README.md); operator commissioning #4903 |
 | Deploy, sync, stop, clean | `deploy-local`, `sync-main`, `teardown-local`, `dev-clean`; [operations](docs/agents/operations.md) |
 | Ratified ADR | `record-adr`; update record, README table, index and supersession/amendment links |
 | Review prompt, persona, repodoc or eval change | [change checklists](docs/agents/change-checklists.md): catch-rate evidence and injection/quality evaluation obligations |

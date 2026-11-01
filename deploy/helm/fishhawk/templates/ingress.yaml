@@ -34,6 +34,24 @@ spec:
     - host: {{ .Values.ingress.host | quote }}
       http:
         paths:
+          {{- if .Values.frontend.enabled }}
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "fishhawk.fullname" . }}-web
+                port:
+                  name: http
+          {{- range $path := list "/v0" "/webhooks" "/healthz" "/mcp" "/.well-known" "/oauth" }}
+          - path: {{ $path }}
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "fishhawk.fullname" $ }}
+                port:
+                  name: http
+          {{- end }}
+          {{- else }}
           - path: {{ .Values.ingress.path | default "/" }}
             pathType: {{ .Values.ingress.pathType | default "Prefix" }}
             backend:
@@ -41,4 +59,5 @@ spec:
                 name: {{ include "fishhawk.fullname" . }}
                 port:
                   name: http
+          {{- end }}
 {{- end }}

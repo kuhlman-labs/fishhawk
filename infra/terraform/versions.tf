@@ -1,12 +1,14 @@
-# Pinned per ADR-016 (#165). Floor matches what current macOS
-# Homebrew ships; bump deliberately when newer features land.
 terraform {
-  required_version = "~> 1.5"
-
+  required_version = ">= 1.5.7, < 2.0"
+  backend "azurerm" {}
   required_providers {
-    aws = {
-      source  = "hashicorp/aws"
-      version = "~> 5.50"
-    }
+    azurerm = { source = "hashicorp/azurerm", version = "= 5.12.0" }
+    random  = { source = "hashicorp/random", version = "= 3.7.2" }
   }
 }
+provider "azurerm" {
+  features {}
+  subscription_id                 = var.subscription_id
+  resource_provider_registrations = "none"
+}
+data "azurerm_client_config" "current" {}

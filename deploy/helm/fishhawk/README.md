@@ -1074,3 +1074,33 @@ helm template fishhawk deploy/helm/fishhawk \
   --set singleTenant.accountKey=acme-corp \
   --set config.githubApiUrl=https://ghes.acme.example/api/v3 | grep -E 'SINGLE_TENANT|GITHUB_API_URL'
 ```
+
+## Azure hosted pilot and chart 0.6.0 (#4902)
+
+`deploy/azure/values.yaml` is the hosted layer, with environment inputs supplied
+by the deployment workflow. `config.azureBlobContainer` selects Azure and makes
+`FISHHAWKD_AZURE_STORAGE_CONNECTION_STRING` required in the existing Secret;
+S3 and Azure together fail render. `image.digest` overrides the image tag in
+EVERY backend/migration workload and must be a sha256 digest. `hardened: true`
+disables pod service-account token mounts and enables Restricted-compatible
+non-root/read-only/capability-drop/seccomp security contexts. Backend pods retain
+a writable, size-limited 512 MiB `/tmp` emptyDir for temporary work.
+
+The allInOne and split-worker Deployments now use Recreate, preventing rolling
+surge from running two copies of singleton workers. This deliberately introduces
+brief downtime for allInOne upgrades. Split API deployments retain rolling
+updates. Migration hooks still run before external-DB deployments and must be
+compatible with the prior application version; Helm rollback does not undo SQL.
+The migration's ConfigMap reference is optional because pre-install runs before
+ordinary resources exist; the pre-provisioned database Secret remains required.
+
+`frontend.enabled` optionally deploys the separately built SPA image, supplied
+as a GHCR digest in `frontend.image`. The chart never builds it. In this mode
+Ingress routes `/` to the SPA and backend path prefixes to fishhawkd on the same
+origin; OAuth cookies and CSRF therefore remain same-origin. Default false keeps
+existing external-SPA installations unchanged. The hosted decision #4902 revises
+the earlier #853 exclusion of an optional in-cluster frontend.
+
+Namespace isolation, quotas, TLS controller, deployment RBAC and app Secrets are
+operator-owned and intentionally outside the application release's permissions.
+Full bootstrap, costs, promotion and recovery: `infra/terraform/README.md`.

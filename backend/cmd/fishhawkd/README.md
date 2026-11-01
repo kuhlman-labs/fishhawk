@@ -1004,3 +1004,14 @@ fishhawkd ops-probe [--deployment auto|local|kubernetes|remote] [--db <url>] [--
 One dry-run sweep with the same probes and flags as the serve ticker; it writes NOTHING (no audit row, no notification). `--deployment` is an alias of `--ops-monitor-deployment`. `--db` falls back to `FISHHAWKD_DATABASE_URL`; without it postgres, runners and both amendment probes read `unknown`, under every deployment. With `--db` the amendment probes run the real scan, so `ops-probe --db` previews which pending amendments the serve ticker would report. A single sweep cannot confirm an orphaned runner (confirmation needs 2 consecutive sweeps), so `ops-probe` never reports `orphaned_runner`; a runner seen terminal once is counted in the runners result's `detail.pending_confirmation` (`--json`), and the serve ticker is what confirms and reports it. Output: one line per result, `<status> <probe> [condition="…"] [subject="…"] [observed="…"] [threshold="…"] [contributors="…"] [remedy="…"] [reason="…"]` (empty fields omitted, values quoted; `contributors` is `name[pid] 8.0 GiB, …` from the result's bounded, sanitized contributors), or a JSON array of results with `--json` (each carrying `contributors`). It never updates a dispatch hold and writes no `ops_monitor_alert` row. Exit codes: `0` nothing failing, `1` any result failing or a `--db` connect failure, `2` a usage error (including an invalid flag value).
 
 Tests: `ops_monitor_test.go` (config table, ticker wiring with every seam failing, the serve wiring through the `newServer`/`serveContext` seams, `ops-probe` end to end through `run`, including a real-Postgres `--db` case where both amendment probes read `ok` over the real scan; the amendment-window default pin; the nil-pool reader; E85.11: the host-health flag table and env fallbacks, `TestHostThresholdOverrides_Thresholds`, `TestNewOpsProbes_HostHealthWiring` over a fake Linux host, `TestOpsAdmissionHold`, `TestServe_OpsMonitorDispatchHoldWiring` and `TestOpsProbe_MemoryContributors`).
+
+## Azure hosted trace storage (#4902)
+
+`--azure-blob-container` / `FISHHAWKD_AZURE_BLOB_CONTAINER` selects the private
+Azure Blob container. `FISHHAWKD_AZURE_STORAGE_CONNECTION_STRING` is a required
+secret, normally an expiring container SAS from Key Vault. Never pass it on the
+command line. A partial Azure configuration, invalid connection string, or
+simultaneous S3 bucket refuses startup. Local RustFS/S3 and dev-memory behavior
+are otherwise unchanged. Provider/error/retention contract:
+`backend/internal/tracestore/README.md`. Hosted provisioning and rollout:
+`infra/terraform/README.md`.

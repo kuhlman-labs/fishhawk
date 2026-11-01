@@ -16,6 +16,9 @@ data:
   {{- with .Values.config.s3Endpoint }}
   FISHHAWKD_S3_ENDPOINT: {{ . | quote }}
   {{- end }}
+  {{- with .Values.config.azureBlobContainer }}
+  FISHHAWKD_AZURE_BLOB_CONTAINER: {{ . | quote }}
+  {{- end }}
   {{- with .Values.config.s3Bucket }}
   FISHHAWKD_S3_BUCKET: {{ . | quote }}
   {{- end }}

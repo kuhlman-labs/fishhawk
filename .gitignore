@@ -87,3 +87,12 @@ verifier/fishhawk-verify
 # tracked .fishhawk/workflows.yaml is unaffected (not a .pid file).
 .fishhawk/*.pid
 .fishhawk/dev.nonce
+
+# Hosted Azure providers are locked across local validation and CI.
+!infra/terraform/.terraform.lock.hcl
+!infra/terraform/bootstrap/.terraform.lock.hcl
+# Operator-only deployment files and Python bytecode are never source.
+infra/terraform/pilot.tfvars
+infra/terraform/*.tfplan
+infra/terraform/bootstrap/*.tfplan
+**/__pycache__/
