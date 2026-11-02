@@ -4140,3 +4140,13 @@ example declarations therefore enumerate the checked guides, linked targets
 and skill surfaces as global inputs. These changes require re-verification;
 unlinked documentation retains its existing classification. Add new route
 targets to the leg inputs and both declarations together.
+
+### Azure hosted delivery (#4902)
+
+`deploy/azure/test_hosting.py` is run by the required reusable infra-check CI job,
+covering namespace boundaries, hosted Helm rendering and artifact promotion.
+`infra-apply.yml` is manual and protected as `infra` because the VM/network
+serve all three environments. `hosted-deploy.yml` uses per-namespace credentials
+and an immutable main-CI release bundle, with a successful staging receipt
+required for prod. Bootstrap, variable/protection requirements, budget and
+recovery are owned by `infra/terraform/README.md`.

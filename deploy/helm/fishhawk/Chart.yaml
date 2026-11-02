@@ -15,7 +15,7 @@ type: application
 # spec.template is mutable, so a plain `helm upgrade` from 0.4.x succeeds and
 # simply performs one rolling restart. 0.4.0 renamed the `minio.*` values block
 # to `rustfs.*` (BREAKING for out-of-tree values files; #3386).
-version: 0.5.0
+version: 0.6.0
 # appVersion tracks the fishhawkd image tag shipped by backend-release.yml.
 # Defaults to the `main` rolling tag (matches infra/terraform image_tag default);
 # override per-release via image.tag in values.yaml.

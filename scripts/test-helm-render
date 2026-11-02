@@ -1390,6 +1390,16 @@ YAML
 render -f "$tmproot/r12-allkeys.yaml" --show-only templates/configmap.yaml
 assert_render_ok "r12 all-config-keys fixture renders"
 emitted_keys=$(printf '%s' "$out" | grep -oE '^[[:space:]]*FISHHAWKD_[A-Z0-9_]+:' | sed 's/[[:space:]:]//g' | sort -u)
+# Azure and S3 are mutually exclusive selectors. Cover BOTH valid configurations
+# and union their emitted key sets; enabling both would test only refusal.
+render -f "$tmproot/r12-allkeys.yaml" --set config.s3Bucket= \
+  --set config.azureBlobContainer=traces \
+  --set secrets.values.azureStorageConnectionString=fixture \
+  --show-only templates/configmap.yaml
+assert_render_ok "r12 Azure all-config-keys fixture renders"
+azure_keys=$(printf '%s' "$out" | grep -oE '^[[:space:]]*FISHHAWKD_[A-Z0-9_]+:' | sed 's/[[:space:]:]//g' | sort -u)
+assert_contains "r12 Azure fixture emits its provider selector" "$azure_keys" "FISHHAWKD_AZURE_BLOB_CONTAINER"
+emitted_keys=$(printf '%s\n%s\n' "$emitted_keys" "$azure_keys" | sort -u)
 # Sanity (binding condition 4): the derived keys this change adds MUST be in the
 # emitted set, or the loop below silently under-covers them.
 assert_contains "r12 anti-drift fixture emits the derived FISHHAWKD_OAUTH_CLIENT_ID" "$emitted_keys" "FISHHAWKD_OAUTH_CLIENT_ID"

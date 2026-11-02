@@ -1,0 +1,36 @@
+# Public hosted environments always use the prod security profile, including dev.
+profile: prod
+hardened: true
+replicaCount: 1
+deployment:
+  mode: allInOne
+config:
+  s3Region: ""
+  azureBlobContainer: traces
+  oauthRedirectAfterLogin: /
+workers:
+  slaTimer: true
+  dispatchWatchdog: true
+  reactionPoller: true
+  mergeReconciler: true
+  childCompletionSweeper: true
+  invariantMonitor: true
+secrets:
+  mode: existing
+  githubApp:
+    privateKeyFile:
+      enabled: true
+existingSecret: fishhawk-secrets
+migrate:
+  enabled: true
+ingress:
+  enabled: true
+  className: traefik
+  annotations:
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+  tls:
+    enabled: true
+    clusterIssuer: letsencrypt
+frontend:
+  enabled: true

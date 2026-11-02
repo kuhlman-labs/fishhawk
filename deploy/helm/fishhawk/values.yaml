@@ -18,6 +18,8 @@ image:
   # Pin to an immutable `sha-<short>` or `vX.Y.Z` tag for real deploys.
   tag: ""
   pullPolicy: IfNotPresent
+  # Immutable digest takes precedence over tag when supplied.
+  digest: ""
 
 # Topology mode — how the fishhawkd workload is split across Deployments.
 #   allInOne (default) — one Deployment, replicaCount pods, with the background
@@ -149,6 +151,7 @@ config:
   s3Region: "us-east-1"
   s3Endpoint: ""
   s3Bucket: ""
+  azureBlobContainer: ""
   # SPA root used for GitHub Check Run back-links (#231). Empty disables the
   # publish-to-GitHub path cleanly. When ingress.enabled, an empty value is
   # DERIVED from ingress.host (https when ingress.tls.enabled, else http); an
@@ -574,3 +577,11 @@ secrets:
     #   remoteRef:
     #     key: fishhawk/db
     #     property: url
+
+# Hosted namespaces enforce Restricted Pod Security; local defaults stay compatible.
+hardened: false
+
+# Optional hosted SPA; built/published by CI, never built by Helm.
+frontend:
+  enabled: false
+  image: ""

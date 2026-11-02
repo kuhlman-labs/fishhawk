@@ -94,6 +94,47 @@ jobs:
           # exact image bytes — re-tagging doesn't break verify.
           cosign sign --yes "ghcr.io/kuhlman-labs/fishhawkd@${DIGEST}"
 
+      - name: Build hosted frontend from the same commit
+        id: frontend
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          file: deploy/azure/frontend.Dockerfile
+          build-contexts: frontend=./frontend
+          push: true
+          tags: ghcr.io/kuhlman-labs/fishhawk-web:sha-${{ github.sha }}
+          provenance: true
+          sbom: true
+
+      - name: Sign frontend and assemble immutable release bundle
+        env:
+          BACKEND_DIGEST: ${{ steps.build.outputs.digest }}
+          FRONTEND_DIGEST: ${{ steps.frontend.outputs.digest }}
+        run: |
+          set -euo pipefail
+          cosign sign --yes "ghcr.io/kuhlman-labs/fishhawk-web@$FRONTEND_DIGEST"
+          mkdir release-bundle
+          tar -czf release-bundle/fishhawk.tgz -C deploy/helm fishhawk
+          cp deploy/azure/values.yaml release-bundle/values.yaml
+          python3 - <<'PYCODE'
+          import hashlib, json, os
+          from pathlib import Path
+          bundle = Path('release-bundle')
+          manifest = {'source_sha': os.environ['GITHUB_SHA'], 'build_run_id': os.environ['GITHUB_RUN_ID'],
+                      'backend': 'ghcr.io/kuhlman-labs/fishhawkd@' + os.environ['BACKEND_DIGEST'],
+                      'frontend': 'ghcr.io/kuhlman-labs/fishhawk-web@' + os.environ['FRONTEND_DIGEST'],
+                      'files': {name: hashlib.sha256((bundle / name).read_bytes()).hexdigest()
+                                for name in ('fishhawk.tgz', 'values.yaml')}}
+          (bundle / 'manifest.json').write_text(json.dumps(manifest, sort_keys=True) + '\n')
+          PYCODE
+
+      - uses: actions/upload-artifact@v6
+        with:
+          name: hosted-release
+          path: release-bundle/
+          retention-days: 90
+          if-no-files-found: error
+
       - name: Promote signed image only while its inputs match main
         env:
           DIGEST: ${{ steps.build.outputs.digest }}

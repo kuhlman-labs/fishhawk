@@ -1,56 +1,16 @@
-# Applies infra/terraform/ to a chosen environment. Two triggers:
-#
-#  - push to main with infra changes → auto-applies dev
-#    (a quick guard against drift on the dev stack);
-#  - workflow_dispatch with environment input → applies that env
-#    explicitly. Prod is gated by the `prod` GitHub environment's
-#    required-reviewers protection rule.
-#
-# OIDC: each environment carries its own AWS_DEPLOY_ROLE_ARN
-# variable (output from `terraform output -raw github_actions_deploy_role_arn`
-# after the first manual apply per env). Operator sets the
-# environment vars via the repo Settings → Environments UI, or
-# via gh api as documented in infra/terraform/README.md.
-#
-# Concurrency: one apply per environment in flight at a time.
-# cancel-in-progress=false because killing terraform apply
-# mid-flight leaves the state lock held until the dynamodb-table
-# entry expires (~20 minutes).
+# Shared resources affect prod: always explicit, protected, serialized.
 name: infra-apply
-
 on:
-  push:
-    branches: [main]
-    paths:
-      - "infra/terraform/**"
-      - ".github/workflows/infra-apply.yml"
   workflow_dispatch:
-    inputs:
-      environment:
-        description: "Environment to apply (dev or prod)"
-        required: true
-        default: "dev"
-        type: choice
-        options: [dev, prod]
-
 permissions:
   contents: read
-
-defaults:
-  run:
-    working-directory: infra/terraform
-
 jobs:
   protections:
-    name: Check deployment protections before requesting AWS credentials
     runs-on: ubuntu-24.04
     timeout-minutes: 5
     permissions:
       contents: read
       actions: read
-    defaults:
-      run:
-        working-directory: .
     steps:
       - uses: actions/checkout@v7
         with:
@@ -58,68 +18,60 @@ jobs:
       - name: Verify main-only dispatch and live environment protections
         env:
           GH_TOKEN: ${{ github.token }}
-          DEPLOY_ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
         run: |
           set -euo pipefail
           test "$GITHUB_REF" = refs/heads/main
-          gh api "repos/$GITHUB_REPOSITORY/environments/$DEPLOY_ENV" > "$RUNNER_TEMP/environment.json"
-          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/environments/$DEPLOY_ENV/deployment-branch-policies" > "$RUNNER_TEMP/branch-policies.json"
-          python3 scripts/check-deploy-environment.py "$DEPLOY_ENV" "$RUNNER_TEMP/environment.json" "$RUNNER_TEMP/branch-policies.json"
-
+          gh api "repos/$GITHUB_REPOSITORY/environments/infra" > "$RUNNER_TEMP/environment.json"
+          gh api --paginate --slurp "repos/$GITHUB_REPOSITORY/environments/infra/deployment-branch-policies" > "$RUNNER_TEMP/branch-policies.json"
+          python3 scripts/check-deploy-environment.py infra "$RUNNER_TEMP/environment.json" "$RUNNER_TEMP/branch-policies.json"
   validate:
     uses: ./.github/workflows/infra-check.yml
-
   apply:
     needs: [protections, validate]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
+    environment: infra
+    concurrency:
+      group: azure-infra-shared
+      cancel-in-progress: false
     permissions:
       contents: read
       id-token: write
-    runs-on: ubuntu-24.04
-    timeout-minutes: 60
-    # Push-to-main always targets dev; workflow_dispatch picks the
-    # env explicitly. The `environment` reference here gates the
-    # job on the GitHub environment's protection rules (prod has
-    # required reviewers; both environments allow only main).
-    environment: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
-    concurrency:
-      group: infra-apply-${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
-      cancel-in-progress: false
-
+    defaults:
+      run:
+        working-directory: infra/terraform
+    env:
+      ARM_USE_OIDC: 'true'
+      ARM_USE_AZUREAD: 'true'
+      ARM_CLIENT_ID: ${{ vars.AZURE_CLIENT_ID }}
+      ARM_TENANT_ID: ${{ vars.AZURE_TENANT_ID }}
+      ARM_SUBSCRIPTION_ID: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      TF_IN_AUTOMATION: 'true'
     steps:
       - uses: actions/checkout@v7
-
+        with:
+          persist-credentials: false
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: 1.5.7
-
-      - uses: aws-actions/configure-aws-credentials@v6
+          terraform_version: 1.17.1
+      - uses: azure/login@v3
         with:
-          role-to-assume: ${{ vars.AWS_DEPLOY_ROLE_ARN }}
-          aws-region: ${{ vars.AWS_REGION }}
-
-      - name: terraform init
+          client-id: ${{ vars.AZURE_CLIENT_ID }}
+          tenant-id: ${{ vars.AZURE_TENANT_ID }}
+          subscription-id: ${{ vars.AZURE_SUBSCRIPTION_ID }}
+      - name: Initialize shared state and apply reviewed configuration
         env:
-          ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
-          STATE_BUCKET: ${{ vars.TF_STATE_BUCKET }}
-          LOCK_TABLE: ${{ vars.TF_LOCK_TABLE }}
-          REGION: ${{ vars.AWS_REGION }}
+          STATE_ACCOUNT: ${{ vars.TF_STATE_ACCOUNT }}
+          TF_VARS_JSON: ${{ vars.TF_VARS_JSON }}
         run: |
-          set -eu
-          terraform init \
-            -backend-config="bucket=${STATE_BUCKET}" \
-            -backend-config="key=${ENV}/terraform.tfstate" \
-            -backend-config="dynamodb_table=${LOCK_TABLE}" \
-            -backend-config="region=${REGION}" \
-            -backend-config="encrypt=true"
-
-      - name: terraform plan
-        env:
-          ENV: ${{ github.event_name == 'workflow_dispatch' && inputs.environment || 'dev' }}
-        run: |
-          terraform plan \
-            -var-file="${ENV}.tfvars" \
-            -out=plan.tfplan \
-            -input=false
-
-      - name: terraform apply
-        run: terraform apply -input=false -auto-approve plan.tfplan
+          set -euo pipefail
+          umask 077
+          trap 'rm -f pilot.auto.tfvars.json plan.tfplan' EXIT
+          printf '%s' "$TF_VARS_JSON" > pilot.auto.tfvars.json
+          terraform init -input=false -lockfile=readonly \
+            -backend-config="storage_account_name=$STATE_ACCOUNT" \
+            -backend-config=container_name=tfstate \
+            -backend-config=key=pilot.tfstate \
+            -backend-config=use_azuread_auth=true -backend-config=use_oidc=true
+          terraform plan -input=false -out=plan.tfplan
+          terraform apply -input=false plan.tfplan

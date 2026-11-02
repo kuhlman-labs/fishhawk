@@ -346,10 +346,10 @@ kubectl -n fishhawk get pods \
 
 ## Frontend (SPA)
 
-The SPA frontend is hosted statically out-of-cluster (GitHub Pages, a CDN, or
-object storage); the Helm chart serves the fishhawkd API only. There is no
-in-cluster nginx Deployment/Service and no second built image — the chart stays
-image-build-free, depending solely on the published `fishhawkd` image (#846).
+By default the SPA frontend is hosted statically out-of-cluster (GitHub Pages, a CDN, or
+object storage); the default Helm configuration serves the fishhawkd API only.
+The hosted Azure layer enables the optional separately built SPA image (#4902);
+the chart itself stays image-build-free.
 
 Point the static SPA's API base URL at the chart's `config.externalUrl`:
 
@@ -408,8 +408,10 @@ For any `FISHHAWKD_*` env var the chart has no dedicated field for, use
 ConfigMap (a collision with a chart-managed key or an invalid env identifier
 fails the render; secrets belong in the Secret, not here).
 
-Serving the SPA from an in-cluster nginx Deployment is intentionally out of
-scope (decided against on #853), keeping the chart image-build-free per #846.
+The Azure hosted pilot (#4902) adds opt-in `frontend.enabled` with a separately
+built immutable SPA image and same-origin ingress routing. This revises #853
+for hosted deployments; Helm still builds no images. See
+`infra/terraform/README.md` for the complete hosted setup.
 
 ## Tracing (Jaeger)
 

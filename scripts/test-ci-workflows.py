@@ -149,7 +149,7 @@ class WorkflowContracts(unittest.TestCase):
                 if "action-gh-release" in step.get("uses", ""):
                     self.assertEqual(step["with"]["fail_on_unmatched_files"], "true")
 
-    def test_aws_credentials_depend_on_protection_and_validation_jobs(self):
+    def test_azure_credentials_depend_on_protection_and_validation_jobs(self):
         jobs = workflow("infra-apply.yml")["jobs"]
         self.assertEqual(set(jobs["apply"]["needs"]), {"protections", "validate"})
         self.assertNotIn("id-token", jobs["protections"]["permissions"])

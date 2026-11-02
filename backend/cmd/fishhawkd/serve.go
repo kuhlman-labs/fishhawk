@@ -1851,6 +1851,8 @@ func runServe(args []string, logSink io.Writer) int {
 	gitlabWebhookSecret := fs.String("gitlab-webhook-secret",
 		envOr("FISHHAWKD_GITLAB_WEBHOOK_SECRET", ""),
 		"secret token GitLab sends VERBATIM in X-Gitlab-Token (no HMAC); when empty, /webhooks/gitlab responds 503")
+	azureContainer := fs.String("azure-blob-container", envOr("FISHHAWKD_AZURE_BLOB_CONTAINER", ""),
+		"Azure Blob trace container; requires FISHHAWKD_AZURE_STORAGE_CONNECTION_STRING and excludes --s3-bucket")
 	s3Bucket := fs.String("s3-bucket", envOr("FISHHAWKD_S3_BUCKET", ""),
 		"S3 bucket for trace bundle storage; when empty, /v0/runs/{id}/trace responds 503 "+
 			"(unless --dev-fixtures or --dev-trace-store selects the in-memory dev store)")
@@ -2823,7 +2825,20 @@ func runServe(args []string, logSink io.Writer) int {
 	// Trace storage wiring. The S3 client uses path-style requests
 	// so the same code works against AWS S3 and RustFS. An empty
 	// bucket leaves /v0/runs/{id}/trace at 503.
-	if *s3Bucket != "" {
+	azureConnection := os.Getenv("FISHHAWKD_AZURE_STORAGE_CONNECTION_STRING")
+	if *azureContainer != "" || azureConnection != "" {
+		if *s3Bucket != "" {
+			logger.Error("Azure Blob and S3 trace storage cannot both be configured")
+			return exitFailure
+		}
+		store, err := tracestore.NewAzureStorage(azureConnection, *azureContainer)
+		if err != nil {
+			logger.Error("Azure trace store configuration failed", slog.String("error", err.Error()))
+			return exitFailure
+		}
+		cfg.TraceStore = store
+		logger.Info("Azure trace store configured", slog.String("container", *azureContainer))
+	} else if *s3Bucket != "" {
 		awsCfg, err := awsconfig.LoadDefaultConfig(context.Background(),
 			awsconfig.WithRegion(*s3Region))
 		if err != nil {
@@ -2863,7 +2878,7 @@ func runServe(args []string, logSink io.Writer) int {
 			"— set FISHHAWKD_S3_BUCKET (`make s3-init`) for a durable store",
 			slog.String("selected_by", source))
 	} else {
-		logger.Warn("FISHHAWKD_S3_BUCKET not set; /v0/runs/{id}/trace will respond 503")
+		logger.Warn("No S3 bucket or Azure Blob container configured; /v0/runs/{id}/trace will respond 503")
 	}
 	if *devFixtures && cfg.DevFixtures == nil {
 		logger.Warn("dev fixtures requested but no database configured; surface stays off")

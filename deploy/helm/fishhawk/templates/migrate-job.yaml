@@ -1,17 +1,16 @@
 {{- if .Values.migrate.enabled }}
 {{- include "fishhawk.validateMigrateTiming" . -}}
 # DB-migration hook Job: runs `fishhawkd migrate up` before serve handles traffic
-# against an unmigrated DB — the k8s analog of the ECS one-shot migrate Fargate
-# task (infra/terraform/migrations.tf). Reuses the published fishhawkd image;
+# against an unmigrated DB. Reuses the published fishhawkd image;
 # ENTRYPOINT is ["/fishhawkd"] with CMD ["serve"] (backend/Dockerfile), so
 # args:[migrate, up] overrides only the CMD and runs `/fishhawkd migrate up`,
-# matching the ECS task's command=[migrate, up]. serve does NOT auto-migrate, so
+# serve does NOT auto-migrate, so
 # this Job is the sole migration path (no double-migration). The distroless image
 # has no shell, so DB-warm-up retry is handled by Job backoffLimit (a fresh pod
 # per attempt), not an inline wait loop like rustfs-bucket-job's bootstrap image allows.
 #
 # Hook phase is conditional on postgres.enabled: pre-install,pre-upgrade for the
-# external-DB baseline (the prod/ECS analog — serve never starts against an
+# external-DB baseline (serve never starts against an
 # unmigrated DB), post-install,post-upgrade for the in-cluster local stack
 # (Helm runs all pre-install hooks before any normal resource, so a pre-install
 # hook depending on the in-cluster Postgres would deadlock).
@@ -68,16 +67,21 @@ spec:
       #   * Under OnFailure retries are governed by kubelet CrashLoopBackOff
       #     (10s..300s), not the Job-controller schedule the values.yaml timing
       #     derivation assumes — so that derivation would not hold.
+      {{- include "fishhawk.podSecurity" . | nindent 6 }}
       restartPolicy: Never
       containers:
         - name: migrate
-          image: "{{ .Values.image.repository }}:{{ .Values.image.tag | default .Chart.AppVersion }}"
+          image: {{ include "fishhawk.image" . | quote }}
+          {{- include "fishhawk.containerSecurity" . | nindent 10 }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args: ["migrate", "up"]
           envFrom:
             # Non-secret FISHHAWKD_* env (same ConfigMap as the serve Deployment).
             - configMapRef:
                 name: {{ include "fishhawk.fullname" . }}-config
+                # Pre-install hooks precede ordinary resources. Migrate needs
+                # DATABASE_URL from the pre-provisioned Secret, not this map.
+                optional: true
             # Sensitive FISHHAWKD_* env incl. FISHHAWKD_DATABASE_URL. Name
             # resolved by fishhawk.secretName so the migrate Job and serve
             # resolve the IDENTICAL Secret across all three modes (#849). The

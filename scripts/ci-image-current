@@ -13,7 +13,7 @@ validated="$2"
 current="$3"
 case "$kind" in
   backend)
-    paths=(backend runner cli verifier directory pricing redaction credstore
+    paths=(backend runner cli verifier directory pricing redaction credstore frontend deploy/azure deploy/helm
       ':(glob)**/go.mod' ':(glob)**/go.sum' ':(glob)go.work*' .dockerignore
       .github/workflows/ci.yml .github/workflows/backend-build.yml)
     ;;

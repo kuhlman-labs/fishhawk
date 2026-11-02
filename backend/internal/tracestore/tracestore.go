@@ -1,8 +1,5 @@
-// Package tracestore persists agent trace bundles to an S3-compatible
-// object store (E2.2 / #23). Per ADR-003 (#67) production runs against
-// AWS S3; local dev and tests run against RustFS (an S3-compatible
-// store) with the same code path — the SDK is identical, only the
-// endpoint and credentials differ.
+// Package tracestore persists agent trace bundles to Azure Blob or an
+// S3-compatible object store. See README.md for provider configuration.
 //
 // Bundles are content-addressed: the key embeds the sha256 of the
 // (already gzipped) payload bytes, which gives free dedup on

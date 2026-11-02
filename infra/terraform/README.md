@@ -1,271 +1,143 @@
-# Fishhawk infra (Terraform)
+# Azure hosted pilot
 
-Per [ADR-016](https://github.com/kuhlman-labs/fishhawk/issues/165) — Terraform manages all hosted infrastructure for `fishhawkd`. Terraform 1.5+ with the AWS provider 5.x. This directory has, as of E13.7.4:
+Authority: operator-approved [#4902](https://github.com/kuhlman-labs/fishhawk/issues/4902), 2026-11-01. Azure replaces the never-deployed AWS resources. Preserve ADR-073's Kubernetes/Helm convergence; revise its EKS and two-environment choices. Historical ADR records remain the original decisions; this implementation issue records the approved pilot amendment. Terraform remains the IaC tool (ADR-016).
 
-- **Foundation** ([#148](https://github.com/kuhlman-labs/fishhawk/issues/148)) — VPC + 2-AZ subnets + IGW + single NAT, security groups (ALB → app → RDS chain), IAM (ECS task / execution roles + GitHub Actions OIDC role), Secrets Manager skeletons, CloudWatch log group.
-- **ECS service + ALB** (E13.7.2 / [#166](https://github.com/kuhlman-labs/fishhawk/issues/166)) — Fargate cluster + task definition pointing at `ghcr.io/kuhlman-labs/fishhawkd:<image_tag>`, ECS service across both private subnets with rolling-deploy + circuit-breaker rollback, ALB + target group with `/healthz` health checks, HTTP listener (forward-only when no domain set, redirect-to-HTTPS otherwise), optional ACM cert + Route 53 alias + HTTPS listener gated on `var.domain_name`.
-- **RDS Postgres + migration task** (E13.7.3 / [#167](https://github.com/kuhlman-labs/fishhawk/issues/167)) — `db.t4g.micro` Postgres 16 in the private subnets with `rds.force_ssl=1` and the master password RDS-managed; Terraform reads it via `aws_db_instance.master_user_secret` and assembles the libpq URL into the existing `database_url` Secrets Manager entry. Dedicated `<project>-<env>-migrate` task definition for `fishhawkd migrate up`.
-- **CI deploy workflow** ([#168](https://github.com/kuhlman-labs/fishhawk/issues/168)) — **removed** under [ADR-073](https://github.com/kuhlman-labs/fishhawk/issues/2298). `.github/workflows/backend-deploy.yml` never ran (its `workflow_run` trigger named `backend-build`/`backend-release`, not the real `Backend Build`/`Backend Release` workflow names) and was deleted rather than fixed: fixing the names would have deployed a release candidate to prod. Kubernetes + Helm (`deploy/helm/fishhawk/`) is the single deployment substrate; the ECS-specific resources below await retirement under the same ADR.
+## Topology and ownership
 
-There is no CI deploy path into this stack any more; an ECS deploy is a manual `terraform apply` with an explicit `image_tag`.
+- `bootstrap/`: operator-owned local state; creates state storage, pilot resource group, protected `infra` GitHub OIDC identity and role assignments. Back up this state securely. Do not recreate it on every apply.
+- Root: ONE shared `pilot.tfstate`, not a workspace per namespace. Owns VM/K3s, networking, two PostgreSQL servers, per-environment vaults/storage/SAS/deploy identities, budget alerts. All shared infrastructure changes affect prod and require the protected `infra` environment; no automatic infrastructure apply on main.
+- Application releases: Helm in `fishhawk-dev`, `fishhawk-staging`, `fishhawk-prod`. Namespace boundaries are installed by the operator, never writable by deployment identities. Namespace credentials and application data are distinct. Dev/staging share a DB server with distinct databases/roles; prod has its own server/subnet.
+- Kubernetes, TLS, namespace policy, secret/DB bootstrap: `deploy/azure/configure.py`, executed by the operator on the VM. No application DB or trace data is stored on the VM.
+- Application release configuration/state: independently owned Helm releases and namespace credentials; neither one environment's deploy identity nor Helm can alter shared infrastructure. Terraform state contains generated credentials: use Azure AD authentication, Blob leases, versioning, limited readers, and private handling of plan files.
+
+No resources have been provisioned by this PR. The bootstrap is deliberately explicit: domain/DNS ownership, SKU capacity, existing GitHub Apps, and live secrets cannot be inferred from a subscription login.
+
+## Budget and operating limits
+
+East US retail PAYG estimate, USD, 730 hours, checked 2026-11-01 using Azure Retail Prices API:
+
+| Resource | Monthly estimate |
+|---|---:|
+| One B2ms Linux VM, 2 vCPU / 8 GiB, $0.0832/hour | $60.74 |
+| Two B1ms PostgreSQL servers, $0.017/hour each | $24.82 |
+| 32 GiB DB storage each, $0.115/GiB-month | $7.36 |
+| VM Standard SSD + public IP | $7–10 |
+| Low-volume Blob, Key Vault, DNS, state storage, diagnostics, egress | $5–10 |
+| Total before tax | $105–113 |
+
+This is a low-traffic pilot estimate, not a quota or an Azure quote. Model tokens, paid GitHub Actions, domain registration and support plans are outside it. Budget emails at 50/80/100% do NOT stop spending; the resource-group budget also excludes the separate small state-storage group. No NAT Gateway, Azure Load Balancer, Bastion, paid managed monitoring workspace, ACR, or AKS management charge is provisioned. Ingress binds the VM's ports 80/443; the instance public IP provides explicit outbound connectivity. Logs remain bounded node/container logs; collect incident evidence before recycling the node.
+
+Single VM = shared failure domain and planned downtime for updates. No HA claim. PostgreSQL burstable instances have CPU-credit and connection limits and are not Microsoft's recommended production tier; this is an explicit pilot compromise. Alert on CPU credits, VM memory/disk, PostgreSQL CPU/credits/connections/storage and certificate/SAS expiration before customer onboarding. Expand the budget before sustained CPU, database headroom, availability or stronger isolation requires it. Agent runners, repository builds and CI remain off this VM. Avoid reservation commitments until utilization is measured.
+
+Live commissioning and operational alert/restore evidence are tracked in [#4903](https://github.com/kuhlman-labs/fishhawk/issues/4903); complete that checklist before customer onboarding.
 
 ## Prerequisites
 
-- Terraform `~> 1.5` (Homebrew: `brew install terraform`)
-- An AWS account with admin access for the bootstrap (the deploy workflow uses a narrowly-scoped OIDC role created here, but the *bootstrap* needs IAM + S3 + DynamoDB write access)
-- AWS CLI configured (`aws configure`) for the bootstrap commands below
+- Azure CLI logged into the intended subscription; Terraform 1.17.1 (CI pin; minimum 1.5.7), SSH and an operator public key. Bootstrap requires role-assignment privileges. Use the checked-in provider lock files.
+- Both GHCR packages (`fishhawkd` and the newly published `fishhawk-web`) must be publicly pullable before deployment; set package visibility explicitly after first publication. This pilot does not provision private-registry credentials.
+- Choose globally unique `name` (4–12 lowercase alphanumeric characters), region, an owned base domain, an ACME contact and budget email. Verify regional B2ms/B1ms availability, quota and current prices before apply.
+- Register resource providers once: `Microsoft.Compute`, `Microsoft.Network`, `Microsoft.Storage`, `Microsoft.KeyVault`, `Microsoft.ManagedIdentity`, `Microsoft.DBforPostgreSQL`, `Microsoft.Consumption` (`az provider register --namespace <name> --wait`). Provider auto-registration is disabled so CI needs no subscription-wide registration privileges.
+- Discover an exact Ubuntu image using `az vm image list --publisher Canonical --offer ubuntu-24_04-lts --sku server --location eastus --all`; set `image_version`. Never deploy the example `0.0.0` placeholder.
+- `admin_cidrs` restrict SSH. `deployment_cidrs` must include the actual Kubernetes client source IPs. Prefer fixed-egress runners. Standard GitHub-hosted runners have changing egress: either maintain their published CIDRs or explicitly accept a publicly reachable, authenticated TLS port 6443 by setting `0.0.0.0/0`. There is no anonymous API access. The server certificate includes the static public IP; kubeconfigs embed the CA, never skip verification.
 
-## Bootstrap (one-time per account)
+## Bootstrap and plan
 
-Terraform's S3 backend can't store its own state — the chicken-and-egg of "the state store stores its own state." Create the state bucket and lock table once, by hand:
-
-```sh
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-REGION=us-east-1
-
-# Versioned state bucket
-aws s3api create-bucket \
-  --bucket fishhawk-tfstate-${ACCOUNT_ID} \
-  --region ${REGION} \
-  $([ "${REGION}" != "us-east-1" ] && echo "--create-bucket-configuration LocationConstraint=${REGION}")
-aws s3api put-bucket-versioning \
-  --bucket fishhawk-tfstate-${ACCOUNT_ID} \
-  --versioning-configuration Status=Enabled
-aws s3api put-bucket-encryption \
-  --bucket fishhawk-tfstate-${ACCOUNT_ID} \
-  --server-side-encryption-configuration '{"Rules":[{"ApplyServerSideEncryptionByDefault":{"SSEAlgorithm":"AES256"}}]}'
-aws s3api put-public-access-block \
-  --bucket fishhawk-tfstate-${ACCOUNT_ID} \
-  --public-access-block-configuration "BlockPublicAcls=true,IgnorePublicAcls=true,BlockPublicPolicy=true,RestrictPublicBuckets=true"
-
-# Lock table
-aws dynamodb create-table \
-  --region ${REGION} \
-  --table-name fishhawk-tfstate-lock \
-  --attribute-definitions AttributeName=LockID,AttributeType=S \
-  --key-schema AttributeName=LockID,KeyType=HASH \
-  --billing-mode PAY_PER_REQUEST
-```
-
-## Environments
-
-Two environments share this directory:
-
-| Env | Profile | Cost | Purpose |
-|---|---|---|---|
-| `dev` | bare-minimum: no NAT, no ALB, single replica, public-IP tasks | ~$15/mo | follow-main, integration testing |
-| `prod` | full HA-eligible profile | ~$85/mo (single-AZ NAT/RDS), $135+/mo (multi-AZ) | release tags |
-
-`backend.tf` is committed as a partial-config stub — `terraform { backend "s3" {} }`. Per-env bucket / key / lock-table are passed at `init` time, so the same root module deploys both environments without file edits.
-
-## Per-environment vars
+Use a new directory/state; do not try migrating an AWS state file into these resources. If old AWS state exists, inventory and archive it first.
 
 ```sh
-cp dev.tfvars.example  dev.tfvars
-cp prod.tfvars.example prod.tfvars
-# Edit each to taste (region, AZs, github_repo).
+terraform -chdir=infra/terraform/bootstrap init
+terraform -chdir=infra/terraform/bootstrap plan \
+  -var='subscription_id=<subscription>' -var='name=<unique-prefix>' -out=bootstrap.tfplan
+terraform -chdir=infra/terraform/bootstrap apply bootstrap.tfplan
+# Securely back up bootstrap/terraform.tfstate and remove the sensitive plan.
+
+cp infra/terraform/pilot.tfvars.example infra/terraform/pilot.tfvars
+# Fill every operator value; set budget_start to this month's first day.
+# SAS start should be slightly in the past; expiry at most 90 days later.
+terraform -chdir=infra/terraform init \
+  -backend-config='storage_account_name=<prefix>tfstate' \
+  -backend-config=container_name=tfstate -backend-config=key=pilot.tfstate \
+  -backend-config=use_azuread_auth=true
+terraform -chdir=infra/terraform plan -var-file=pilot.tfvars -out=pilot.tfplan
+# Review resource types, region, SKUs, identity scopes and costs before applying.
+terraform -chdir=infra/terraform apply pilot.tfplan
+terraform -chdir=infra/terraform output -json
 ```
 
-`dev.tfvars` ships with the cost-cutting toggles set:
+Azure RBAC propagation can delay the first Key Vault/state operation. Wait for role propagation and retry the failed apply; do not widen permissions. The protected infrastructure identity has Contributor, RBAC Administrator and Secrets Officer only on the pilot group, plus state-container access in the state group. It is an administrative identity; application jobs never receive it.
 
-```hcl
-enable_nat_gateway    = false
-enable_alb            = false
-task_assign_public_ip = true
-```
+Bootstrap PostgreSQL defaults are PG16, 32 GiB, 7-day nonprod and 14-day prod PITR retention, private networking, no HA. Destruction of DBs and trace accounts is blocked in Terraform. Resizing is a reviewed shared-infra change. No hard-coded provider credentials or app secrets are committed.
 
-A `precondition` in `network.tf` rejects an apply where `enable_nat_gateway=false` and `task_assign_public_ip=false` (tasks would have no path to the internet). Don't set the public-IP toggle in prod.
+## Secrets, namespace bootstrap, DNS and TLS
 
-## Local apply (dev or prod)
+Use separate GitHub App registrations/installations, webhook secrets and OAuth clients for each environment. For a dev-first rollout, prepare only dev's application credentials and select `--environment dev` below; staging/prod can follow later. Configure each callback as `https://<environment-host>/v0/auth/github/callback` and webhook as `https://<environment-host>/webhooks/github`. Never install the dev/staging App into production repositories.
+
+In each SELECTED `<prefix>-<env>` vault, populate the following secret names from secure local files using `az keyvault secret set --vault-name ... --name ... --file ... --output none`:
+
+- `github-app-private-key`: PEM from that environment's GitHub App.
+- `github-webhook-secret`, `oauth-client-secret`, `anthropic-api-key`.
+
+Terraform already writes `database-url`, `database-password`, `database-admin-url`, and `azure-storage-connection-string`. The last is a container SAS granting read/create/write/list, WITHOUT delete; storage accounts are distinct by environment. Versioning + soft delete preserve overwritten/deleted objects, but this is not compliance-mode immutable retention. Account keys remain inside Terraform/provider state, not application pods. SAS rotation is mandatory before `sas_expiry`.
+
+Point the selected environment's DNS A record at `public_ip` (eventually dev/staging/app). Copy the trusted checked-out configuration script to the VM, wait for cloud-init, then run it as root. It reads vaults using the VM identity; no Azure CLI or long-lived cloud credential is installed on the node. Dev-first example:
 
 ```sh
-ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
-ENV=dev   # or prod
-
-terraform init \
-  -backend-config="bucket=fishhawk-tfstate-${ACCOUNT_ID}" \
-  -backend-config="key=${ENV}/terraform.tfstate" \
-  -backend-config="dynamodb_table=fishhawk-tfstate-lock" \
-  -backend-config="region=us-east-1" \
-  -backend-config="encrypt=true"
-
-terraform plan  -var-file=${ENV}.tfvars -out=plan.tfplan
-terraform apply plan.tfplan
+scp deploy/azure/configure.py fishhawk@<public-ip>:/home/fishhawk/configure.py
+ssh fishhawk@<public-ip> 'sudo cloud-init status --wait'
+umask 077
+ssh fishhawk@<public-ip> 'sudo python3 /home/fishhawk/configure.py <prefix> <public-ip> <acme-email> --environment dev' > kubeconfigs.json
+# This file contains credentials. Never print it or upload it as a CI artifact.
 ```
 
-To avoid retyping the backend args, save them to `backend.dev.hcl` (gitignored) and run `terraform init -backend-config=backend.dev.hcl`.
+The script installs shared pinned cert-manager and the ACME issuer, then the selected environment's restricted namespace, quotas, deploy RBAC, default-deny policy, DB owner role, application Secret and scoped deployment token. `--environment` accepts `dev`, `staging`, `prod`, or `all`; omitting it preserves the original all-environment behavior. A dev-only invocation never reads staging/prod secrets or rotates their deployment tokens. This selects application bootstrap only: Terraform still provisions shared infrastructure and data services for all three environments. Re-running syncs secret rotations and rotates SELECTED deploy tokens (invalidating old tokens); serialize with their deployments and complete the vault update below before permitting deploys again. The node identity can read all environment vaults, so node/root compromise crosses environments; network policy blocks pod access to IMDS and other environment DB subnets. Namespace isolation is not host isolation.
 
-## CI apply
+Write each JSON kubeconfig to its matching vault immediately:
 
-Two GitHub Actions workflows cover validation and apply:
+```sh
+jq -r 'keys[]' kubeconfigs.json | while IFS= read -r env; do
+  jq --arg env "$env" '.[$env]' kubeconfigs.json > kubeconfig.json
+  az keyvault secret set --vault-name "<prefix>-$env" --name deploy-kubeconfig --file kubeconfig.json --output none
+done
+rm -f kubeconfig.json kubeconfigs.json
+```
 
-- **`.github/workflows/infra-check.yml`** — a reusable check required by `CI Pass` for PRs touching `infra/terraform/**`; runs `terraform fmt -check` + `terraform validate`. No AWS credentials required; PR authors don't need access to the AWS account.
-- **`.github/workflows/infra-apply.yml`** — push to main with infra changes auto-applies **dev**. `workflow_dispatch` with an environment input applies **dev** or **prod** explicitly.
+Tokens are Kubernetes service-account credentials, scoped to one namespace; they are NOT cluster-admin. Azure OIDC deploy identities can read only their `deploy-kubeconfig` secret, not arbitrary vault secrets. Anyone able to deploy code into an environment can access that environment's app secrets through that code. Rotate Kubernetes tokens at least quarterly and on personnel/runner compromise. No role permits editing namespaces, RBAC, network policy, quota, or privileged pods.
 
-Both apply paths assume the per-environment OIDC role (`vars.AWS_DEPLOY_ROLE_ARN` from the active GitHub environment), so:
+## GitHub environments and variables
 
-1. The first apply per env happens **locally** with admin AWS creds — that's what creates the `<project>-<env>-gha-deploy` role.
-2. After that first apply, copy `terraform output -raw github_actions_deploy_role_arn` into the GitHub environment's `AWS_DEPLOY_ROLE_ARN` variable; CI takes over.
+Create `infra`, `dev`, `staging`, `prod` environments. ALL must use custom branch policies allowing exactly the `main` branch (no tags/wildcards). `infra` and `prod` require reviewers with self-review disabled. Protection settings are checked live BEFORE requesting OIDC; absent or weaker settings fail closed. The operator permits GitHub admin bypass for `infra` and `prod`; an administrator may explicitly bypass the environment approval gate, including for a self-initiated run. This does not disable the workflow's main-only and protection-configuration checks.
 
-Each GitHub environment carries four variables (set via repo Settings → Environments → New variable):
-
-| Variable | Value |
+| Location | Variables |
 |---|---|
-| `AWS_DEPLOY_ROLE_ARN` | from `terraform output -raw github_actions_deploy_role_arn` |
-| `AWS_REGION` | e.g. `us-east-1` |
-| `TF_STATE_BUCKET` | `fishhawk-tfstate-<account-id>` |
-| `TF_LOCK_TABLE` | `fishhawk-tfstate-lock` |
+| Every environment | `AZURE_SUBSCRIPTION_ID`, `AZURE_TENANT_ID`, `AZURE_CLIENT_ID` (matching environment identity output) |
+| `infra` | `TF_STATE_ACCOUNT`; `TF_VARS_JSON` containing the reviewed non-secret root inputs as JSON |
+| Each app environment | `AZURE_KEY_VAULT`, `APP_HOST`, `FISHHAWK_GITHUB_APP_ID`, `OAUTH_CLIENT_ID` |
+| Repository | Set `AZURE_HOSTING_ENABLED=true` ONLY after all bootstrap steps and permissions are verified |
 
-Both environments MUST use custom deployment branch policies with exactly one
-entry: branch `main` (not a tag or wildcard). `prod` additionally requires at
-least one reviewer and `prevent_self_review: true`. Disable administrator bypass
-in the environment UI as well (the public REST environment response does not
-expose that setting, so the preflight cannot attest it).
-`infra-apply.yml` reads those live settings in a job without OIDC permission and
-fails closed before AWS authentication if they are missing, malformed or
-unreadable. Its apply job also depends on the reusable fmt/validate check.
-Manual dispatch from a non-main ref is refused. The environment's own rules
-remain the enforcement boundary between the preflight and credential issuance.
+Only public values belong in GitHub variables. SSH public keys are public; DB passwords, PEMs, model keys and kubeconfigs are not. Keep the opt-in flag unset during merge and bootstrap. Once dev is configured and a successful main release bundle exists, enable it immediately before manually dispatching the first dev deployment; that workflow performs the initial smoke checks. Subsequent successful main builds auto-deploy to dev while the flag remains enabled.
 
-Operator rollout tracked in #4887 for #4885 (repository changes alone do not configure GitHub
-or AWS):
+## Release and rollback
 
-1. Set the branch policies above for `dev` and `prod` in Settings → Environments.
-2. Select the actual production reviewer(s), prevent self-review, and disable
-   administrator bypass. Do this BEFORE applying the changed IAM trust policy.
-3. With existing operator AWS credentials, review and apply the trust-policy
-   change for each environment. It matches
-   `repo:kuhlman-labs/fishhawk:environment:<env>` because environment jobs do not
-   receive branch/tag OIDC subjects. If immutable/custom subject claims are
-   enabled for the repository, adjust the exact subject before applying.
-4. Verify role permissions and supply the environment's non-committed tfvars
-   before attempting an apply. The historical role grants ECS deployment
-   operations, not unrestricted Terraform infrastructure administration; this
-   PR deliberately adds no AWS privileges. This legacy ECS stack is awaiting
-   retirement under ADR-073; do not enable or deploy it merely to test CI.
+1. A successful main CI gate builds and cosign-signs backend and frontend images. The `hosted-release` artifact binds their digests, source commit, CI run ID, Helm chart and values hashes. Frontend uses same-origin paths; no environment API URL is baked into its image.
+2. `Hosted Deploy` auto-deploys eligible main bundles to dev after CI completes. A stale queued auto-deploy refuses to replace a newer main checkout. Commits that did not build a release skip deployment.
+3. Dispatch `Hosted Deploy` on main, environment `staging`, with that successful CI `build_run_id`. It verifies source provenance, signatures, hashes, migration hooks, readiness, HTTPS, health SHA and both running image digests. Success uploads a `staging-receipt` artifact.
+4. Dispatch the SAME workflow on main, environment `prod`, with the SAME `build_run_id` and the successful staging deployment's `staging_run_id`. Protected approval precedes OIDC. A receipt from another release/environment/run fails. No rebuild occurs during promotion. Artifacts expire after 90 days; promote within that window.
 
-Until these operator steps are completed, apply is expected to refuse. A
-successful `terraform validate` is not evidence that live IAM/protections or
-tfvars are configured.
+Helm 4.2.4 uses `--rollback-on-failure --wait` (the successor to Helm 3's `--atomic`). Server/worker Deployments use Recreate to avoid duplicate singleton workers; a brief outage is intentional. Migration hooks run before application upgrade and must remain backward-compatible with the previous version. Readiness failure triggers Helm rollback; a failed post-deploy smoke check explicitly rolls back to the prior deployed revision. First install has no previous revision and is retained for diagnosis. Database migrations are NEVER automatically reversed. Do not deploy a destructive migration under the assumption that application rollback restores the schema.
 
-Expected resources through slice 3 (~50):
+Application frontend and API use one HTTPS host: `/` serves SPA, `/v0`, `/webhooks`, `/healthz`, `/mcp`, `/.well-known`, `/oauth` route to fishhawkd. cert-manager owns the TLS Secret; HTTP port 80 is for ACME validation. Cloud build/main image publishing remains gated by the existing full CI rules; the dogfood `deploy.yml` stub is not silently repurposed.
 
-Foundation (~25):
-- 1 VPC + 1 IGW + 1 NAT gateway + 1 EIP
-- 4 subnets (2 public, 2 private)
-- 3 route tables + 4 associations
-- 3 security groups (ALB, app, RDS)
-- 4 Secrets Manager entries
-- 3 IAM roles (task execution, task, GHA OIDC) + their policies
-- 1 OIDC provider (token.actions.githubusercontent.com)
-- 1 CloudWatch Log group
+## Recovery and maintenance
 
-Slice 2 (~15 more):
-- 1 ECS cluster + capacity-provider config
-- 1 ECS task definition + 1 ECS service
-- 1 ALB + 1 target group
-- 1 HTTP listener (forward when no domain; redirect-to-HTTPS otherwise)
-- When `domain_name` set: 1 ACM cert + 2 Route 53 records (validation + alias) + 1 ACM validation + 1 HTTPS listener
+- Node failure: preserve evidence if possible; rebuild VM from pinned image/K3s, restore namespace boundaries and secrets with configure.py, rotate kubeconfigs, redeploy the last successful immutable release. Application state is in PostgreSQL/Blob. Terraform owns static IP/DNS inputs; verify IP and TLS after replacement. A fresh cluster does not recover Helm history; use recorded release artifacts.
+- DB incident: use Azure PostgreSQL PITR to a NEW server (never overwrite the only recovery source), verify it privately, update Terraform/import and vault URLs, sync secrets, redeploy. Restore nonprod first as a drill; measure RPO/RTO before customer onboarding. DB owner roles must stay isolated; a shared nonprod restore affects dev and staging together.
+- Trace incident: restore blob version/soft-deleted object using a separate operator identity. Application SAS has no delete permission. Keep DB references and trace objects consistent; a DB backup alone is not complete recovery.
+- Rotate SAS: update explicit start/expiry in the reviewed infra inputs, apply, run configure.py, store the rotated kubeconfigs, then redeploy environments. Restart pods after secret updates: an existing Secret's contents are not reflected in Helm's values checksum. Alert ahead of expiry; do not leave this to an expired-auth incident.
+- Patch: schedule downtime, check active runs/review workers, update pinned K3s/OS/cert-manager versions through PRs. VM platform patching may also require reboot. Verify TLS, network policies, secrets and application health afterward. Do not run untrusted CI jobs on this VM.
+- Growth: sustained load or customer uptime requires larger non-burstable DBs and an increased budget; move prod to its own AKS cluster when isolation/HA is needed. The application chart and external data services carry forward.
 
-Slice 3 (~5 more):
-- 1 RDS subnet group + 1 parameter group + 1 RDS instance (Postgres 16, single-AZ db.t4g.micro by default)
-- 1 dedicated migration task definition (`fishhawkd migrate up`)
-- 1 Secrets Manager *version* — Terraform reads the RDS-managed master password and writes the libpq URL into the existing `database_url` secret
+## Checks
 
-Slice 4 has zero net-new AWS resources; it's purely the GitHub Actions workflow plus a tightening of the OIDC role's trust policy (`sub` now matches the protected deployment environment; the environment restricts deployment to `main`).
+When changing provider versions, run `terraform providers lock -platform=darwin_arm64 -platform=linux_amd64 -platform=linux_arm64` in BOTH Terraform roots and commit both lockfiles. CI initializes with `-lockfile=readonly`; provider package hashes must cover its Linux platform as well as the operator's platform. Reproduce Linux validation with Terraform 1.17.1 against a source-only copy, without state or Azure credentials.
 
-## Post-apply manual steps
-
-The Secrets Manager entries are created **empty**. Populate them with real values before slice 2 brings up the ECS service:
-
-```sh
-aws secretsmanager put-secret-value \
-  --secret-id fishhawk/prod/database_url \
-  --secret-string 'postgres://USER:PASS@HOST:5432/fishhawk?sslmode=require'
-
-aws secretsmanager put-secret-value \
-  --secret-id fishhawk/prod/github_app_private_key \
-  --secret-string "$(cat path/to/app-private-key.pem)"
-
-aws secretsmanager put-secret-value \
-  --secret-id fishhawk/prod/github_webhook_secret \
-  --secret-string "$(openssl rand -hex 32)"
-
-aws secretsmanager put-secret-value \
-  --secret-id fishhawk/prod/oauth_client_secret \
-  --secret-string '<github-oauth-app-client-secret>'
-```
-
-Configure the GitHub App's webhook URL + secret to match (the URL points at the ALB after slice 2 lands).
-
-## Smoke testing the deploy
-
-Without a domain, the ALB serves on its AWS-default hostname over plain HTTP — fine for confirming the task is running:
-
-```sh
-URL=$(terraform output -raw fishhawkd_url)
-curl -sf "$URL/healthz"
-# {"status":"ok","version":"…"}
-```
-
-Cold-start time is ~30s — Fargate task placement, image pull from GHCR, binary boot. The ECS service's circuit breaker auto-rolls-back if a new task definition fails health checks too many times in a row.
-
-To follow logs:
-
-```sh
-aws logs tail /aws/ecs/fishhawk-prod --follow
-```
-
-## Releasing
-
-A `backend/v*` tag runs `backend-release.yml`, which builds, signs and publishes `ghcr.io/kuhlman-labs/fishhawkd:vX.Y.Z` (plus `:latest` for a final release only). Nothing deploys it here: the ECS deploy workflow was removed under ADR-073. To move this stack to a new image, set `image_tag` in the environment's tfvars and apply (see "Local apply" / "CI apply" above); the ECS service's circuit breaker still rolls back on health-check failures.
-
-## Running migrations manually
-
-Slice 4's deploy workflow runs migrations on every release. Operators only need this runbook for ad-hoc cases — bringing up a fresh stack the first time, or recovering from a botched release that's wedged the workflow.
-
-```sh
-CLUSTER=$(terraform output -raw ecs_cluster_name)
-TASKDEF=$(terraform output -raw migrate_task_definition_family)
-SUBNETS=$(terraform output -json private_subnet_ids | jq -r '.|join(",")')
-APP_SG=$(terraform output -raw app_security_group_id)
-
-TASK_ARN=$(aws ecs run-task \
-  --cluster "$CLUSTER" \
-  --task-definition "$TASKDEF" \
-  --launch-type FARGATE \
-  --network-configuration "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$APP_SG],assignPublicIp=DISABLED}" \
-  --query 'tasks[0].taskArn' --output text)
-
-aws ecs wait tasks-stopped --cluster "$CLUSTER" --tasks "$TASK_ARN"
-
-# Read exit code:
-aws ecs describe-tasks --cluster "$CLUSTER" --tasks "$TASK_ARN" \
-  --query 'tasks[0].containers[0].exitCode' --output text
-```
-
-A non-zero exit means the migration failed; check `awslogs-stream-prefix=migrate` in the CloudWatch group for the error.
-
-## Cost notes (us-east-1, on-demand, v0 traffic)
-
-| Resource | Approx /mo |
-|---|---|
-| NAT gateway (single AZ, ~10 GB egress) | ~$35 |
-| EIP (attached) | $0 |
-| Subnets, route tables, IGW | $0 |
-| Secrets Manager (4 secrets + 1 RDS-managed) | ~$2 |
-| CloudWatch Logs (30d retention, ~5 GB ingest) | ~$3 |
-| ECS Fargate (1 × 256 CPU / 512 MB / 24×7) | ~$9 |
-| ALB (always-on + ~5 GB) | ~$18 |
-| ACM cert + Route 53 (when configured) | ~$1 |
-| RDS db.t4g.micro single-AZ + 20 GB gp3 + 7d backups | ~$17 |
-| **Total through slice 3** | **~$85** |
-
-Multi-AZ doubles RDS cost (~$32/mo). The deploy workflow (slice 4) adds zero infrastructure cost.
-
-## See also
-
-- [ADR-009 (#73)](https://github.com/kuhlman-labs/fishhawk/issues/73) — hosted deploy target choice (ECS Fargate)
-- [ADR-016 (#165)](https://github.com/kuhlman-labs/fishhawk/issues/165) — IaC tool choice (Terraform)
-- [E13.4 (#61)](https://github.com/kuhlman-labs/fishhawk/issues/61) — secrets management strategy
-- `docs/ARCHITECTURE.md` — "Where to look" entries for the deployed components
+`terraform fmt -check -recursive infra/terraform`; initialize/validate both roots without a backend; `python deploy/azure/test_hosting.py` with PyYAML 6.0.3 and Helm 4.2.4. The reusable infra-check job owns these checks and is included in CI Pass. Azure Blob SDK tests live in `backend/internal/tracestore/azure_test.go`. Full repository verification remains `scripts/verify-change`. Static validation does not prove subscription permissions, cloud-init, Azure provisioning, ACME issuance, or live restore behavior; those are first-deploy acceptance checks.

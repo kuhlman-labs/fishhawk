@@ -1,44 +1,29 @@
-# PR-time check on infra/terraform/**. fmt + validate only — no
-# AWS credentials required. The apply path lives in
-# infra-apply.yml, gated by GitHub environments.
-#
-# We deliberately don't run `terraform plan` here:
-#  - plan needs AWS read access; the GHA OIDC role is currently
-#    locked to protected deployment environments, and loosening it for
-#    PR contexts would widen the blast radius;
-#  - plan also needs the per-env state, and loading that from a
-#    fork-PR context is unsafe.
-# Operators preview changes locally with `terraform plan` against
-# their own credentials.
 name: infra-check
-
 on:
   workflow_call:
   workflow_dispatch:
-
 permissions:
   contents: read
-
-defaults:
-  run:
-    working-directory: infra/terraform
-
 jobs:
   fmt-validate:
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
-
       - uses: hashicorp/setup-terraform@v4
         with:
-          terraform_version: 1.5.7
-
-      - name: terraform fmt
-        run: terraform fmt -check -recursive
-
-      - name: terraform init (no backend)
-        run: terraform init -backend=false
-
-      - name: terraform validate
-        run: terraform validate
+          terraform_version: 1.17.1
+      - uses: azure/setup-helm@v5
+        with:
+          version: v4.2.4
+      - name: Terraform syntax, provider schemas, and hosted contracts
+        run: |
+          set -euo pipefail
+          terraform fmt -check -recursive infra/terraform
+          for root in infra/terraform infra/terraform/bootstrap; do
+            terraform -chdir="$root" init -backend=false -input=false -lockfile=readonly
+            terraform -chdir="$root" validate
+          done
+          python3 -m venv "$RUNNER_TEMP/hosting-tools"
+          "$RUNNER_TEMP/hosting-tools/bin/pip" install PyYAML==6.0.3
+          "$RUNNER_TEMP/hosting-tools/bin/python" deploy/azure/test_hosting.py
