@@ -13,8 +13,8 @@ github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c h1:udKWzYgxTojEK
 github.com/Azure/go-ansiterm v0.0.0-20250102033503-faa5f7b0171c/go.mod h1:xomTg63KZ2rFqZQzSB4Vz2SUXa1BpHTVz9L5PTmPC4E=
 github.com/Microsoft/go-winio v0.6.2 h1:F2VQgta7ecxGYO8k3ZZz3RS8fVIXVxONVUPlNERoyfY=
 github.com/Microsoft/go-winio v0.6.2/go.mod h1:yd8OoFMLzJbo9gZq8j5qaps8bJ9aShtEA8Ipt1oGCvU=
-github.com/anthropics/anthropic-sdk-go v1.82.0 h1:A82J+yHEMbQ3+7ObCagOX4tVm1uyBhELCHd2dDYZYuo=
-github.com/anthropics/anthropic-sdk-go v1.82.0/go.mod h1:GThfYqPJoaQ/6pmibCI98Cr4y5su2FXMUHn3NrSSnIc=
+github.com/anthropics/anthropic-sdk-go v1.84.0 h1:mnAhggc5H5A98JYmhQELT+j4J89PYBFKnnSvUTNwNd8=
+github.com/anthropics/anthropic-sdk-go v1.84.0/go.mod h1:GThfYqPJoaQ/6pmibCI98Cr4y5su2FXMUHn3NrSSnIc=
 github.com/aws/aws-sdk-go-v2 v1.47.5 h1:5yA+A+BiXbDq1ZLbYwPViwhEGDMdR0MEhL8Jh2LnLS4=
 github.com/aws/aws-sdk-go-v2 v1.47.5/go.mod h1:iNIkogrRvFwm+1OQIUOP2lPBtlXZboOIUWiCa+pHEMw=
 github.com/aws/aws-sdk-go-v2/aws/protocol/eventstream v1.7.24 h1:t7FxqJ5KHDeKceyD4HtGaG6z7hMSeVGjs5/4c+L5ArM=
