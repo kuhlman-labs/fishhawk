@@ -99,10 +99,10 @@ Exact versions, no floating majors, per the executable-tooling pin rule in
 
 | Package | Pin | Why this version |
 |---|---|---|
-| `astro` | `7.2.6` | Declares `engines.node >= 22.12.0`, which is why this package's `engines.node` is `>=22.12.0` — **tighter than `frontend/`'s `>=22`**, and honest about what the toolchain needs. |
-| `@astrojs/starlight` | `0.41.8` | Peers `astro: ^7.0.2`, satisfied by the pin above. |
-| `@astrojs/check` | `0.9.10` | Backs the `check` script. `astro check` is a thin front for this **separate** package; without it the script fails at runtime. |
-| `typescript` | `6.0.3` | **Not the latest.** `@astrojs/check@0.9.10` peers `typescript: ^5.0.0 \|\| ^6.0.0`, so a 7.x pin is an unmet peer and a failing `check`. `6.0.3` is the latest 6.x and the version `frontend/` already floats on (`^6.0.3`), so the two pnpm projects agree without being coupled. |
+| `astro` | `7.4.4` | Declares `engines.node >= 22.23.4`, which is why this package's `engines.node` is `>=22.23.4` — **tighter than `frontend/`'s `>=22`**, and honest about what the toolchain needs. |
+| `@astrojs/starlight` | `0.42.8` | Peers `astro: ^7.2.10`, satisfied by the pin above. |
+| `@astrojs/check` | `0.9.12` | Backs the `check` script. `astro check` is a thin front for this **separate** package; without it the script fails at runtime. |
+| `typescript` | `6.0.3` | **Not the latest.** `@astrojs/check@0.9.12` peers `typescript: ^5.0.0 \|\| ^6.0.0`, so a 7.x pin is an unmet peer and a failing `check`. `6.0.3` is the latest 6.x and the version `frontend/` already floats on (`^6.0.3`), so the two pnpm projects agree without being coupled. |
 
 **Read this before bumping.** Bumping `typescript` past 6.x requires bumping
 `@astrojs/check` to a version whose peer range admits it. Bumping one without
