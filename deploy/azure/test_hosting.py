@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Offline deployment contracts; no Azure credentials or resource mutations."""
+import base64
+import contextlib
 import hashlib
 import importlib.util
+import io
 import json
 from pathlib import Path
 import subprocess
@@ -47,6 +50,54 @@ class NamespaceBoundaries(unittest.TestCase):
             self.assertEqual(postgres, '10.42.3.0/24' if env == 'prod' else '10.42.2.0/24')
             self.assertIn('169.254.0.0/16', policy['egress'][2]['to'][0]['ipBlock']['except'])
             self.assertEqual(by_kind['RoleBinding']['subjects'][0]['namespace'], 'fishhawk-' + env)
+
+
+class BootstrapSelection(unittest.TestCase):
+    def test_dev_bootstrap_never_reads_or_rotates_other_environments(self):
+        urls = []
+        documents = []
+
+        def urlopen(request, timeout):
+            url = request.full_url
+            urls.append(url)
+            if url.startswith('http://169.254.169.254/'):
+                return io.BytesIO(json.dumps({'access_token': 'test-only-identity'}).encode())
+            self.assertTrue(url.startswith('https://fishhawkpl-dev.vault.azure.net/secrets/'), url)
+            name = url.split('/secrets/')[1].split('?')[0]
+            value = {'database-password': 'x' * 32,
+                     'database-admin-url': 'postgres://fishhawkadmin:test-only@nonprod.example/postgres'}.get(name, 'test-only')
+            return io.BytesIO(json.dumps({'value': value}).encode())
+
+        def kubectl(*args, data=None):
+            if args == ('apply', '-f', '-'):
+                documents.append(json.loads(data))
+            if args == ('-n', 'fishhawk-dev', 'get', 'secret', 'deploy-token', '-o', 'json'):
+                return json.dumps({'data': {'ca.crt': 'test-only-ca',
+                    'token': base64.b64encode(b'test-only-token').decode()}}).encode()
+            return b''
+
+        output = io.StringIO()
+        with mock.patch.object(CONFIGURE.urllib.request, 'urlopen', side_effect=urlopen), \
+                mock.patch.object(CONFIGURE, 'kubectl', side_effect=kubectl) as kube, \
+                mock.patch.object(CONFIGURE.subprocess, 'run') as postgres, contextlib.redirect_stdout(output):
+            CONFIGURE.main(['fishhawkpl', '192.0.2.1', 'operator@example.com', '--environment', 'dev'])
+        self.assertEqual(set(json.loads(output.getvalue())), {'dev'})
+        self.assertEqual({d['metadata']['namespace'] for d in documents if 'namespace' in d['metadata']}, {'fishhawk-dev'})
+        self.assertEqual([d['metadata']['name'] for d in documents if d['kind'] == 'Namespace'], ['fishhawk-dev'])
+        deletes = [call.args for call in kube.call_args_list if 'delete' in call.args]
+        self.assertEqual(deletes, [('-n', 'fishhawk-dev', 'delete', 'secret', 'deploy-token', '--ignore-not-found')])
+        postgres.assert_called_once()
+        self.assertEqual(postgres.call_args.kwargs['env']['PGHOST'], 'nonprod.example')
+        self.assertTrue(any('/secrets/github-app-private-key?' in url for url in urls))
+
+    def test_unknown_environment_fails_before_any_azure_or_cluster_access(self):
+        with mock.patch.object(CONFIGURE.urllib.request, 'urlopen') as azure, \
+                mock.patch.object(CONFIGURE, 'kubectl') as kube, contextlib.redirect_stderr(io.StringIO()):
+            with self.assertRaises(SystemExit) as failure:
+                CONFIGURE.main(['fishhawkpl', '192.0.2.1', 'operator@example.com', '--environment', 'production'])
+        self.assertEqual(failure.exception.code, 2)
+        azure.assert_not_called()
+        kube.assert_not_called()
 
 
 class Chart(unittest.TestCase):

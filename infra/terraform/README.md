@@ -70,31 +70,31 @@ Bootstrap PostgreSQL defaults are PG16, 32 GiB, 7-day nonprod and 14-day prod PI
 
 ## Secrets, namespace bootstrap, DNS and TLS
 
-Create three separate GitHub App registrations/installations, webhook secrets and OAuth clients. Configure each callback as `https://<environment-host>/v0/auth/github/callback` and webhook as `https://<environment-host>/webhooks/github`. Never install the dev/staging App into production repositories.
+Use separate GitHub App registrations/installations, webhook secrets and OAuth clients for each environment. For a dev-first rollout, prepare only dev's application credentials and select `--environment dev` below; staging/prod can follow later. Configure each callback as `https://<environment-host>/v0/auth/github/callback` and webhook as `https://<environment-host>/webhooks/github`. Never install the dev/staging App into production repositories.
 
-In EACH `<prefix>-<env>` vault, populate the following secret names from secure local files using `az keyvault secret set --vault-name ... --name ... --file ... --output none`:
+In each SELECTED `<prefix>-<env>` vault, populate the following secret names from secure local files using `az keyvault secret set --vault-name ... --name ... --file ... --output none`:
 
 - `github-app-private-key`: PEM from that environment's GitHub App.
 - `github-webhook-secret`, `oauth-client-secret`, `anthropic-api-key`.
 
 Terraform already writes `database-url`, `database-password`, `database-admin-url`, and `azure-storage-connection-string`. The last is a container SAS granting read/create/write/list, WITHOUT delete; storage accounts are distinct by environment. Versioning + soft delete preserve overwritten/deleted objects, but this is not compliance-mode immutable retention. Account keys remain inside Terraform/provider state, not application pods. SAS rotation is mandatory before `sas_expiry`.
 
-Point three DNS A records (e.g. dev/staging/app) at `public_ip`. Copy the trusted checked-out configuration script to the VM, wait for cloud-init, then run it as root. It reads vaults using the VM identity; no Azure CLI or long-lived cloud credential is installed on the node. Example:
+Point the selected environment's DNS A record at `public_ip` (eventually dev/staging/app). Copy the trusted checked-out configuration script to the VM, wait for cloud-init, then run it as root. It reads vaults using the VM identity; no Azure CLI or long-lived cloud credential is installed on the node. Dev-first example:
 
 ```sh
 scp deploy/azure/configure.py fishhawk@<public-ip>:/home/fishhawk/configure.py
 ssh fishhawk@<public-ip> 'sudo cloud-init status --wait'
 umask 077
-ssh fishhawk@<public-ip> 'sudo python3 /home/fishhawk/configure.py <prefix> <public-ip> <acme-email>' > kubeconfigs.json
+ssh fishhawk@<public-ip> 'sudo python3 /home/fishhawk/configure.py <prefix> <public-ip> <acme-email> --environment dev' > kubeconfigs.json
 # This file contains credentials. Never print it or upload it as a CI artifact.
 ```
 
-The script installs pinned cert-manager, the ACME issuer, restricted namespaces, quotas, deploy RBAC, default-deny policies, DB owner roles, application Secrets and scoped deployment tokens. Re-running syncs secret rotations and rotates deploy tokens (invalidating old tokens); serialize with deployments and complete the vault update below before permitting deploys again. The node identity can read all environment vaults, so node/root compromise crosses environments; network policy blocks pod access to IMDS and other environment DB subnets. Namespace isolation is not host isolation.
+The script installs shared pinned cert-manager and the ACME issuer, then the selected environment's restricted namespace, quotas, deploy RBAC, default-deny policy, DB owner role, application Secret and scoped deployment token. `--environment` accepts `dev`, `staging`, `prod`, or `all`; omitting it preserves the original all-environment behavior. A dev-only invocation never reads staging/prod secrets or rotates their deployment tokens. This selects application bootstrap only: Terraform still provisions shared infrastructure and data services for all three environments. Re-running syncs secret rotations and rotates SELECTED deploy tokens (invalidating old tokens); serialize with their deployments and complete the vault update below before permitting deploys again. The node identity can read all environment vaults, so node/root compromise crosses environments; network policy blocks pod access to IMDS and other environment DB subnets. Namespace isolation is not host isolation.
 
 Write each JSON kubeconfig to its matching vault immediately:
 
 ```sh
-for env in dev staging prod; do
+jq -r 'keys[]' kubeconfigs.json | while IFS= read -r env; do
   jq --arg env "$env" '.[$env]' kubeconfigs.json > kubeconfig.json
   az keyvault secret set --vault-name "<prefix>-$env" --name deploy-kubeconfig --file kubeconfig.json --output none
 done
@@ -114,7 +114,7 @@ Create `infra`, `dev`, `staging`, `prod` environments. ALL must use custom branc
 | Each app environment | `AZURE_KEY_VAULT`, `APP_HOST`, `FISHHAWK_GITHUB_APP_ID`, `OAUTH_CLIENT_ID` |
 | Repository | Set `AZURE_HOSTING_ENABLED=true` ONLY after all bootstrap steps and permissions are verified |
 
-Only public values belong in GitHub variables. SSH public keys are public; DB passwords, PEMs, model keys and kubeconfigs are not. Enable the opt-in flag only after smoke-testing the initial deployment path.
+Only public values belong in GitHub variables. SSH public keys are public; DB passwords, PEMs, model keys and kubeconfigs are not. Keep the opt-in flag unset during merge and bootstrap. Once dev is configured and a successful main release bundle exists, enable it immediately before manually dispatching the first dev deployment; that workflow performs the initial smoke checks. Subsequent successful main builds auto-deploy to dev while the flag remains enabled.
 
 ## Release and rollback
 

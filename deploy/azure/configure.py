@@ -5,6 +5,7 @@ Reads app secrets via the VM managed identity, provisions namespace boundaries,
 DB owners, TLS, and secrets. Prints ONLY kubeconfigs as JSON to stdout: redirect
 into a mode-0600 file, then store each in its matching Key Vault. Never run in CI.
 """
+import argparse
 import base64
 import json
 import os
@@ -71,8 +72,16 @@ def namespace_documents(env):
            "roleRef": {"apiGroup": "rbac.authorization.k8s.io", "kind": "Role", "name": "deploy"}}
 
 
-def main():
-    prefix, public_ip, email = sys.argv[1:]
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument('prefix')
+    parser.add_argument('public_ip')
+    parser.add_argument('email')
+    parser.add_argument('--environment', choices=(*ENVIRONMENTS, 'all'), default='all',
+                        help='Environment to configure and rotate credentials for (default: all).')
+    args = parser.parse_args(argv)
+    prefix, public_ip, email = args.prefix, args.public_ip, args.email
+    environments = ENVIRONMENTS if args.environment == 'all' else (args.environment,)
     if not re.fullmatch(r"[a-z][a-z0-9]{3,11}", prefix):
         raise ValueError("invalid prefix")
     token_request = urllib.request.Request(
@@ -96,7 +105,7 @@ def main():
                              "privateKeySecretRef": {"name": "letsencrypt-account"},
                              "solvers": [{"http01": {"ingress": {"ingressClassName": "traefik"}}}]}}})
     kubeconfigs = {}
-    for env in ENVIRONMENTS:
+    for env in environments:
         ns = "fishhawk-" + env
         for document in namespace_documents(env):
             apply(document)
