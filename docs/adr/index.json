@@ -5,9 +5,11 @@
       "id": "ADR-001",
       "title": "Cloud target (AWS / GCP / Other)",
       "path": "docs/adr/001-cloud-target-aws-gcp-other.md",
-      "status": "accepted",
+      "status": "superseded",
       "supersedes": [],
-      "superseded_by": [],
+      "superseded_by": [
+        "ADR-138"
+      ],
       "applies_to": []
     },
     {
@@ -30,6 +32,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-138"
+      ],
       "applies_to": [
         "docker-compose.yml"
       ]
@@ -90,6 +95,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-138"
+      ],
       "applies_to": [
         "backend/Dockerfile"
       ]
@@ -170,6 +178,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-138"
+      ],
       "applies_to": [
         "infra/terraform/**"
       ]
@@ -388,6 +399,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-132"
+      ],
       "applies_to": []
     },
     {
@@ -408,7 +422,8 @@
       "superseded_by": [],
       "amended_by": [
         "ADR-097",
-        "ADR-101"
+        "ADR-101",
+        "ADR-132"
       ],
       "applies_to": [
         "docs/spec/operator-role.schema.json",
@@ -513,6 +528,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-132"
+      ],
       "applies_to": []
     },
     {
@@ -534,6 +552,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-132"
+      ],
       "applies_to": []
     },
     {
@@ -552,6 +573,10 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-132",
+        "ADR-133"
+      ],
       "applies_to": []
     },
     {
@@ -571,7 +596,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-113"
+        "ADR-113",
+        "ADR-132"
       ],
       "applies_to": []
     },
@@ -684,6 +710,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-135"
+      ],
       "applies_to": []
     },
     {
@@ -761,6 +790,11 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-131",
+        "ADR-137",
+        "ADR-138"
+      ],
       "applies_to": [
         "infra/terraform/**"
       ]
@@ -819,6 +853,10 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-132",
+        "ADR-136"
+      ],
       "applies_to": []
     },
     {
@@ -829,6 +867,9 @@
       "supersedes": [],
       "superseded_by": [
         "ADR-099"
+      ],
+      "amended_by": [
+        "ADR-130"
       ],
       "applies_to": []
     },
@@ -853,7 +894,8 @@
       "superseded_by": [],
       "amended_by": [
         "ADR-118",
-        "ADR-120"
+        "ADR-120",
+        "ADR-139"
       ],
       "applies_to": []
     },
@@ -1223,7 +1265,8 @@
       ],
       "amended_by": [
         "ADR-120",
-        "ADR-123"
+        "ADR-123",
+        "ADR-139"
       ],
       "applies_to": []
     },
@@ -1295,7 +1338,8 @@
       ],
       "amended_by": [
         "ADR-121",
-        "ADR-122"
+        "ADR-122",
+        "ADR-129"
       ],
       "applies_to": [
         "backend/internal/agenteval/**",
@@ -1374,6 +1418,9 @@
       "amends": [
         "ADR-113"
       ],
+      "amended_by": [
+        "ADR-132"
+      ],
       "applies_to": []
     },
     {
@@ -1398,6 +1445,9 @@
       "amends": [
         "ADR-082"
       ],
+      "amended_by": [
+        "ADR-128"
+      ],
       "applies_to": []
     },
     {
@@ -1410,6 +1460,182 @@
       "amends": [
         "ADR-103",
         "ADR-117"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-127",
+      "title": "Measure captain interventions by cause, with evidence and honest effort limits",
+      "path": "docs/adr/127-captain-interventions-by-cause.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-128",
+      "title": "Surface evidence-bound process improvement proposals through existing governance",
+      "path": "docs/adr/128-process-improvement-proposals.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-125"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-129",
+      "title": "Recommend crew configurations from comparable evidence, with human-approved experiments",
+      "path": "docs/adr/129-crew-configuration-suggestions.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-118"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-130",
+      "title": "Coordinate projects across repositories while preserving repository-local authority",
+      "path": "docs/adr/130-cross-repository-project-coordination.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-080"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-131",
+      "title": "Distinct dev, stage, and production delivery environments",
+      "path": "docs/adr/131-dev-stage-production-environments.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-073"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-132",
+      "title": "Immutable release candidates and environment promotion",
+      "path": "docs/adr/132-release-candidates-and-promotion.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-038",
+        "ADR-040",
+        "ADR-049",
+        "ADR-051",
+        "ADR-053",
+        "ADR-055",
+        "ADR-079",
+        "ADR-123"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-133",
+      "title": "Deterministic production smoke verification",
+      "path": "docs/adr/133-production-smoke-verification.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-053"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-134",
+      "title": "Retirement governance and separate data disposition authority",
+      "path": "docs/adr/134-retirement-governance.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-135",
+      "title": "A Captain-approved public roadmap, published first to the site",
+      "path": "docs/adr/135-public-roadmap.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-065"
+      ],
+      "applies_to": [
+        "backend/internal/roadmap/**",
+        "backend/internal/workmgmt/**",
+        "backend/internal/server/*roadmap*",
+        "docs/spec/*roadmap*"
+      ]
+    },
+    {
+      "id": "ADR-136",
+      "title": "Experiments and lifecycle evidence in product planning (amends ADR-079)",
+      "path": "docs/adr/136-planning-experiments-and-lifecycle-evidence.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-079"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-137",
+      "title": "One build produces the release candidate (amends ADR-073)",
+      "path": "docs/adr/137-one-build-release-candidate.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-073"
+      ],
+      "applies_to": [
+        ".github/workflows/backend-build.yml",
+        ".github/workflows/backend-release.yml",
+        "backend/internal/version/version.go"
+      ]
+    },
+    {
+      "id": "ADR-138",
+      "title": "Azure with single-node K3s as the hosting substrate (supersedes ADR-001)",
+      "path": "docs/adr/138-azure-k3s-hosting-substrate.md",
+      "status": "accepted",
+      "supersedes": [
+        "ADR-001"
+      ],
+      "superseded_by": [],
+      "amends": [
+        "ADR-003",
+        "ADR-009",
+        "ADR-016",
+        "ADR-073"
+      ],
+      "applies_to": [
+        "infra/terraform/**",
+        ".github/workflows/infra-apply.yml",
+        "deploy/helm/fishhawk/**"
+      ]
+    },
+    {
+      "id": "ADR-139",
+      "title": "Direction C adopted: the adr_change workflow (amends ADR-113)",
+      "path": "docs/adr/139-adr-change-workflow.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-084",
+        "ADR-113"
       ],
       "applies_to": []
     }

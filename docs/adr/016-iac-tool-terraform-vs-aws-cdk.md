@@ -6,6 +6,7 @@ date: 2026-05-05
 issue: https://github.com/kuhlman-labs/fishhawk/issues/165
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-138"]
 applies_to: ["infra/terraform/**"]
 ---
 

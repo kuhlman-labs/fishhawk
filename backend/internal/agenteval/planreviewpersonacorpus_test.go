@@ -822,7 +822,7 @@ func TestPersonaCatchCorpus_NotLeakedIntoPersonaPrompt(t *testing.T) {
 // and ADR-101 amend ADR-040 and ADR-089, ADR-101 also amends ADR-097, and none
 // of the four supersedes another. A record not listed keeps its shipped links.
 var adr040AmendmentEdges = map[string]struct{ amends, amendedBy []string }{
-	"ADR-040": {nil, []string{"ADR-097", "ADR-101"}},
+	"ADR-040": {nil, []string{"ADR-097", "ADR-101", "ADR-132"}},
 	"ADR-089": {nil, []string{"ADR-097", "ADR-101"}},
 	"ADR-097": {[]string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
 	"ADR-101": {[]string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}, []string{"ADR-121", "ADR-122"}},
@@ -953,7 +953,7 @@ func TestPersonaPrompt_AmendmentFramingCrossesTheBoundary(t *testing.T) {
 		"an amendment ranks with the records it amends, after them",
 	}
 	if included["ADR-040"] {
-		wants = append(wants, "Amended by ADR-097, ADR-101: it still governs, except where an amendment decides otherwise.")
+		wants = append(wants, "Amended by ADR-097, ADR-101, ADR-132: it still governs, except where an amendment decides otherwise.")
 	}
 	for _, w := range []struct{ id, path, amends string }{
 		{"ADR-097", "docs/adr/097-operator-as-orchestrator.md", "ADR-040"},

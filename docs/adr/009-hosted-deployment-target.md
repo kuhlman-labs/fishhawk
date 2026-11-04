@@ -6,6 +6,7 @@ date: 2026-04-30
 issue: https://github.com/kuhlman-labs/fishhawk/issues/73
 supersedes: []
 superseded_by: []
+amended_by: ["ADR-138"]
 applies_to: ["backend/Dockerfile"]
 ---
 

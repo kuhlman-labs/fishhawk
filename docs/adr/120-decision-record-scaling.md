@@ -151,3 +151,11 @@ Findings from grounded reads are `low` and unquotable (`docs/review/architect-re
   - ADR-084: D4 and rule 4's whole-index injection become partitioned.
   - ADR-113: D4's live index-size checks and frozen-tree contents gain the topic map.
 - **Related:** ADR-042, ADR-068, ADR-084, ADR-110, ADR-113, ADR-117, ADR-118, ADR-119, #4699, #4700, #4707.
+
+
+
+## Amendment A1 (2026-11-04)
+
+**Ratified by the Captain 2026-11-04** (manual ratification path), from the #5031 plan gate (run 8bec6061).
+
+Among the amendments of a record shown whole, D2's "then matched paths, then newer" order yields to fit: after the whole-then-excerpt walk, leftover record budget promotes excerpted amendments to whole in rank order, within a run of same-status amendments whose amended records are all whole, and the ranking is renumbered so whole records still precede excerpts. Match kind and status still order first, and an amendment still ranks after the records it amends.
