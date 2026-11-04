@@ -19,9 +19,9 @@ dependency.
 |---|---|
 | `ParseIndex(raw)` | Strict `adr-index-v1` decode (below). Every refusal wraps `ErrInvalidIndex` and names the record. |
 | `Select(index, changePaths)` | The records whose `applies_to` matches a change path, plus the records that supersede or amend them (transitively), ranked. |
-| `RenderIndex(index)` | The compact index rendering (`IndexRendering` = `adr-index-lines-v2`, below) the persona is shown. |
+| `RenderIndex(index)` | The compact index rendering (`IndexRendering` = `adr-index-lines-v3`, below) the persona is shown. |
 | `RenderedTitle(title)` | A title as `RenderIndex` renders it: unchanged up to `MaxRenderedTitleChars` = 100 code points, else its first 99 plus `…` (#4699, below). |
-| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index's compact rendering under its own cap, and fit whole records, then Decision-section excerpts, into a separate record budget. Returns a `*Selection`. |
+| `Assemble(ctx, resolver, Request)` | Fetch the index at the admission commit, parse, select, shape the index's compact rendering under its own cap, and fit whole records, then Decision-section excerpts, into a separate record budget, then promote excerpted amendments from what is left (ADR-120 Amendment A1, below). Returns a `*Selection`. |
 | `DecisionExcerpt(content)` | A record's Decision section(s), verbatim, and whether it has any (the excerpt `Assemble` falls back to, #4489, below). |
 | `Selection.PromptDocuments(grounded)` | The index, then each included record, then each excerpt, as `prompt.InjectedDocument`s. |
 | `Selection.Attribution()` | The `repodoc.InjectionSet` for the selection: its documents plus, when anything was dropped, one selection-level truncation. A caller injecting other documents in the same prompt (the persona remit) merges this into ONE `repodoc.AttributeSet` call. |
@@ -120,24 +120,39 @@ scope union diff at implement review.
 
 The persona is shown a COMPACT rendering of the index, not the committed file:
 `RenderIndex` writes one compact JSON object per record, `\n`-terminated, in
-the index's order, with no `schema_version` wrapper. `Record`'s slice tags all
-carry `omitempty`, so every empty list (`supersedes`, `superseded_by`,
-`amends`, `amended_by`, `applies_to`) is left out of its line; `omitempty`
-changes encoding only, so `ParseIndex`'s strict decode still requires the
-three non-optional lists. Because `Record` is marshalled directly, a field
-added to it renders with no further code; `TestRenderIndex_RendersEveryRecordField`
-reflects over `Record`'s json tags and fails when a field is missing from the
-rendering or a slice tag lacks `omitempty`. `TestRenderIndex_EmptyListsOmitted`
-pins the exact lines, an amended record's `amends` / `amended_by` included.
+the index's order, with no `schema_version` wrapper and no `path` (below).
+`Record`'s slice tags all carry `omitempty`, so every empty list (`supersedes`,
+`superseded_by`, `amends`, `amended_by`, `applies_to`) is left out of its line;
+`omitempty` changes encoding only, so `ParseIndex`'s strict decode still
+requires the three non-optional lists. Because `Record` is marshalled directly,
+a field added to it renders with no further code;
+`TestRenderIndex_RendersEveryRecordField` reflects over `Record`'s json tags and
+fails when a field other than `path` is missing from the rendering or a slice
+tag lacks `omitempty`. `TestRenderIndex_EmptyListsOmitted` pins the exact lines,
+an amended record's `amends` / `amended_by` included.
 
 The encoder runs with `SetEscapeHTML(false)` (a `<` stays raw).
 `encoding/json` escapes every byte below 0x20, U+2028 and U+2029, but NOT
 U+0085 NEL, which repodoc honours as a line break; `RenderIndex` rewrites every
 raw NEL (only ever inside a JSON string) as `\u0085`, so the rendering holds
 exactly one repodoc line break per record and each line decodes back to its
-record (`TestRenderIndex_OneLinePerRecordRoundTrips`).
+record, less its path (`TestRenderIndex_OneLinePerRecordRoundTrips`).
 
-**Title cap (`adr-index-lines-v2`, #4699).** Each title is rendered through
+**Path omitted (`adr-index-lines-v3`, #5031).** The path half of ADR-120 D1:
+`RenderIndex` clears each record's path on its range copy, and `Record.Path`'s
+`omitempty` leaves the key out of the line (`TestRenderIndex_OmitsPath`). Only
+the rendering changes. `ParseIndex` still validates and requires every path, the
+caller's `Index` keeps it, and `Assemble` still fetches each record by it. The
+excerpt framing, the dropped notice and the Source lines still name paths. The
+index framing accounts for the omission: it says `That file lists each record's
+path`, and when every path shares one directory and is named with its own id's
+number, a non-empty slug and `.md` (`recordPathConvention`), it adds `, and every
+path follows the convention <dir>/<NNN>-<slug>.md`, which on this repository is
+`docs/adr/<NNN>-<slug>.md`. A repository that does not follow that shape gets no
+convention, so the sentence stays true for it (ADR-110). D1's other half, the
+60-character cap on the titles of records not selected, is not implemented.
+
+**Title cap (`adr-index-lines-v2`, #4699; kept by v3).** Each title is rendered through
 `RenderedTitle`: a title over `MaxRenderedTitleChars` = 100 characters (Unicode
 code points, `utf8.RuneCountInString`) is cut to its first 99 code points plus
 U+2026 `…`, so a rendered title is never over 100 characters. The cut is on a
@@ -146,8 +161,8 @@ split), and the `…` is written raw (`encoding/json` does not escape it). A lin
 therefore decodes to its record with `Title == RenderedTitle(Title)`; the
 caller's `Index` is not modified, and the stored title in `docs/adr/index.json`
 and the record file is unchanged. Measured on the 113-record index
-(2026-10-23), 53 titles are over the cap and the rendering drops from 27,143 to
-24,200 bytes (2,943 saved). New records cannot add a cut title:
+(2026-10-23, before v3 omitted the path), 53 titles are over the cap and the
+rendering drops from 27,143 to 24,200 bytes (2,943 saved). New records cannot add a cut title:
 `scripts/check-adr`'s `C-title-length` refuses a title over 100 characters from
 ADR-119 on (`TITLE_MAX_CHARS`, `TITLE_RULE_FROM`; ADR-001 to ADR-118 are
 grandfathered), and `TestTitleCapMatchesCheckADR` pins the two constants
@@ -158,10 +173,10 @@ index document's `content_hash` and `original_bytes` stay the committed file's,
 while `Content`, `rendered_bytes`, the cut and the marker are the rendering's,
 and its audit entries carry `rendering` / `rendering_bytes` (repodoc README §
 "Derived renderings"). The framing says the index is a compact rendering and
-how to read it, including that a title over 100 characters is shown as its
-first 99 followed by `…` and that the record file carries the full title, and
-the Source line says `shown as its adr-index-lines-v2 rendering, not
-verbatim`.
+how to read it, including that a record's path and any empty list field are
+left out of its line, that a title over 100 characters is shown as its first 99
+followed by `…`, and that the record file carries the full title, and the Source
+line says `shown as its adr-index-lines-v3 rendering, not verbatim`.
 
 ## Byte budget (`Assemble`)
 
@@ -227,15 +242,18 @@ records <= cap), in the persona prompt only.
    index draws nothing from it (`TestAssemble_IndexNearCapDoesNotStarveRecords`).
    The first match that does not fit whole, and every lower-ranked match, is
    offered only as its Decision-section excerpt, likewise measured untruncated
-   and shown when it fits what remains (below).
-3. **Strict prefix, at two fidelities.** The records SHOWN (whole or excerpt)
-   are a strict prefix of the ranking: the first match with no Decision
-   section, or whose excerpt does not fit, and EVERY lower-ranked match, is
-   dropped, even if a smaller lower-ranked record would fit, and records below
-   the first drop are never fetched. The records shown WHOLE are a strict
-   prefix of those shown: once a record is excerpted, no lower-ranked record is
-   shown whole, even one that would fit. So a lower-ranked record is never
-   shown more fully than a higher-ranked one.
+   and shown when it fits what remains (below). Budget still left then promotes
+   excerpted amendments to whole (ADR-120 Amendment A1, below).
+3. **Strict prefix, at two fidelities, on the final ranking.** The records SHOWN
+   (whole or excerpt) are a strict prefix of the ranking: the first match with
+   no Decision section, or whose excerpt does not fit, and EVERY lower-ranked
+   match, is dropped, even if a smaller lower-ranked record would fit, and
+   records below the first drop are never fetched. The records shown WHOLE are a
+   strict prefix of those shown: once a record is excerpted, no lower-ranked
+   record is shown whole, even one that would fit. So a lower-ranked record is
+   never shown more fully than a higher-ranked one. `Match.Rank` after `Assemble`
+   is this final ranking; `Select`'s own order differs only where a promotion
+   moved an amendment up.
 4. **A record is never shown truncated.** It is shown whole, or as its
    complete Decision section(s), or not at all; one whose untruncated size
    exceeds the remaining record budget and that has no fitting excerpt —
@@ -258,6 +276,43 @@ budget and that the index is capped separately) and in one
 `included_bytes` — the record budget and the shown records' bytes, whole and
 excerpts — `dropped: [{id, path, status, rank}]`, `dropped_count`),
 written before any `document_injected` of the set (repodoc `AttributeSet`).
+
+## ADR-120 Amendment A1: promoting excerpted amendments (#5031)
+
+The walk above leaves bytes unspent when a large amendment ranks first among a
+record's amendments: it is excerpted, so every record below it is excerpted too,
+even one that would fit. ADR-120 Amendment A1, ratified by the Captain on
+2026-11-04, lets fit decide there.
+
+- **The rule.** After the whole-then-excerpt walk, `promoteExcerptedAmendments`
+  spends the record budget left over, promoting excerpted amendments to whole in
+  rank order, within the run of same-status amendments at the start of
+  `Selection.Excerpted`, and only those whose amended records are all shown
+  whole. A promoted record joins that whole set before the next excerpt is
+  examined, so an amendment of it qualifies in the same pass. Included then
+  Excerpted is renumbered, so whole records still precede excerpts.
+- **What it overrides.** Among same-status amendments of a whole record, fit
+  overrides D2's `then matched paths` and `then newer`. `Select`'s own ranking
+  does not change.
+- **What still orders first.** Match kind and status still order first: the run
+  ends at the first excerpt that is not an amendment or whose status class
+  (accepted or not) differs from the first excerpt's, and it stays ended. An
+  amendment still ranks after the records it amends.
+- **What it cannot do.** A promotion costs only its whole body's bytes over its
+  excerpt's, so it never removes a shown record, leaves `Selection.Dropped` and
+  its ranks unchanged, and fetches nothing new. It is greedy in rank order, not a
+  best fit: at a 48,000-byte budget ADR-040's family shows ADR-132 whole and
+  ADR-097 as an excerpt, because ADR-132 fit in the walk.
+- **What the reviewer is told.** `Selection.PromotedAmendments` counts the
+  promotions; when it is above zero the index framing's order clause adds `an
+  amendment that fits the record budget whole ranks ahead of one that does not`,
+  so `in rank order` stays true.
+
+On ADR-040's scope with ADR-127 to ADR-139 applied, at the production cap, the
+walk would show one body whole; with promotion ADR-040 and ADR-097 are whole and
+ADR-132, ADR-101, ADR-122 and ADR-121 are Decision excerpts, 21,386 of 32,768
+bytes used, nothing dropped (`TestAssemble_ADR040ShapedSelectionAtEveryBudget`
+pins this shape independently of the records).
 
 ## Decision-section excerpt (`DecisionExcerpt`, #4489)
 
@@ -290,8 +345,8 @@ ADR-040's scope — still reaches the reviewer as its decision.
   excerpt the reviewer saw, recording the file's hash.
 - **Two-fidelity strict prefix.** Byte budget items 2-4 above:
   `Selection.Included` (whole) then `Selection.Excerpted` (excerpts) is a
-  strict prefix of the ranking, and whole bodies are a strict prefix of the
-  shown set. With the amended-first placement (#4471), an amendment is never
+  strict prefix of the final ranking, and whole bodies are a strict prefix of
+  the shown set. With the amended-first placement (#4471), an amendment is never
   shown more fully than the record it amends.
 - **Fallthrough.** A record with no Decision section, or whose excerpt does not
   fit what remains, is dropped with everything below it, as before, and named
@@ -315,9 +370,10 @@ All framing is system-authored. Every interpolated value is a count, an id
 
 - **Index** — heading `Decision record index`; after its opening sentence the
   preamble says the index is shown as a compact rendering, one JSON object per
-  record per line in the file's order, with an empty list field left out
-  (#4478; the byte-identical claims below hold apart from that sentence); it
-  then states M of N
+  record per line in the file's order, with a record's path and any empty list
+  field left out, then says that file lists each record's path and, when every
+  path follows one, states the path convention (#4478, #5031; the byte-identical
+  claims below hold apart from those sentences); it then states M of N
   records matched (and, when any successor was followed, how many more were
   selected because they supersede a selected record — with nothing followed
   the preamble is byte-identical to the pre-#4398 text), which ids are shown
@@ -333,8 +389,10 @@ All framing is system-authored. Every interpolated value is a count, an id
   how many of the selected records amend a selected record and that an amended
   record still governs except where an amendment decides otherwise, and its
   order clause adds that an amendment ranks with the records it amends, after
-  them; with successors but no amendment it is byte-identical to the
-  pre-#4471 text. When any record is shown as an excerpt
+  them, and, when an amendment was promoted (`Selection.PromotedAmendments > 0`,
+  ADR-120 Amendment A1), that an amendment that fits the record budget whole
+  ranks ahead of one that does not; with successors but no amendment it is
+  byte-identical to the pre-#4471 text. When any record is shown as an excerpt
   (`len(Selection.Excerpted) > 0`), the preamble adds, after the shown-in-full
   sentence (or `none of them is shown in full in this prompt.`), `<n> of them
   did not fit the record budget whole and are shown below as excerpts, their
@@ -427,22 +485,38 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
 | record over the budget whole, excerpt fits | shown as its excerpt (`adr-decision-section-v1`, the file's hash and size, never truncated) | `TestAssemble_DecisionExcerptFallback` (excerpt fits) |
 | record over the budget whole with no Decision section | dropped with every lower-ranked record, which is never fetched | `TestAssemble_DecisionExcerptFallback` (no Decision section) |
 | excerpt over the remaining record budget | dropped with every lower-ranked record; `IncludedBytes` stays `<= CapBytes` | `TestAssemble_DecisionExcerptFallback` (excerpt over the remaining budget) |
-| lower-ranked record that would fit whole after an excerpt | shown only as its excerpt (fidelity never increases) | `TestAssemble_DecisionExcerptFallback` (fidelity), `TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments` |
+| lower-ranked record that would fit whole after an excerpt | shown only as its excerpt (fidelity never increases), unless ADR-120 Amendment A1 promotes it, which renumbers it ahead of that excerpt | `TestAssemble_DecisionExcerptFallback` (fidelity), `TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments` |
 | excerpt framing (index sentence, widened not-shown clause, dropped header, heading, note naming the record path with its grounded / ungrounded tail, Source line, a forged delimiter in the Decision section) | framed as an excerpt; delimiter neutralized | `TestPromptDocuments_ExcerptFraming`; on the shipped ADR-101 excerpt, `TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt` |
 | shipped ADR-040 scope at the production cap | ADR-040 and ADR-097 whole, ADR-101 as its Decision excerpt | `TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt`, `TestPersonaPrompt_AmendmentFramingCrossesTheBoundary` (agenteval), `TestDecisionRecordPersona_OverCap_ShowsDecisionExcerpt` (server) |
+| record with a path rendered, or a line with an empty `path` key | exact line carries no path key; the caller's `Index` keeps it | `TestRenderIndex_OmitsPath`; on the shipped lines, `TestShippedIndex_TitleCapShrinksRendering` |
+| missing or empty `path` in the index | `ErrInvalidIndex` naming the record, though the rendering leaves it out | `TestParseIndex_FailsClosed` (missing path, empty path) |
+| record paths that do not all follow one convention (mixed directories, no or empty slug, number not its id's, not `.md`), or no records | no convention returned, none stated | `TestRecordPathConvention`, `TestIndexFraming_RecordPathNote` |
+| control character in a stated convention | sanitized, cannot start a line | `TestIndexFraming_RecordPathNote` |
+| large amendment ranked first, smaller ones fit what is left | the smaller ones shown whole, the large one still shown as its excerpt, nothing dropped | `TestAssemble_LargeAmendmentYieldsToSmallerAmendments` |
+| ADR-040-shaped family at every budget from 4,096 to 64,000 | complete ranking in whole, excerpt, dropped order; amendment after and never fuller than the record it amends; `IncludedBytes <= CapBytes` | `TestAssemble_ADR040ShapedSelectionAtEveryBudget` |
+| excerpt below the amendment run: a record that amends nothing, or anything ranked below it | stays an excerpt, even when it would fit | `TestAssemble_PromotionStopsAtNonAmendment` |
+| amendment of another status class after an excerpted amendment | stays an excerpt, even when it would fit | `TestAssemble_PromotionStopsAtStatusChange` |
+| amendment of a record still excerpted; amendment of a record just promoted | stays an excerpt; promoted in the same pass | `TestAssemble_PromotionKeepsDependentExcerpted` |
+| promotion exactly filling the budget; one byte over | promoted; stays an excerpt, `IncludedBytes` stays `<= CapBytes` | `TestAssemble_PromotionBudgetBoundary` |
+| promoted amendment passes a higher-ranked excerpt | `Rank` runs 1..n in final order | `TestAssemble_PromotionRenumbersRanks` |
+| records dropped below a promotion | same ids and ranks, excerpt still shown, nothing new fetched, nothing below the first drop fetched | `TestAssemble_PromotionKeepsDropped` |
+| order clause with and without a promotion | stated only when an amendment was promoted | `TestIndexFraming_StatesPromotedOrder` |
 
 ## Residuals
 
 - **Index size.** The persona is shown the index's compact rendering
-  (`RenderIndex`, #4478), not the committed file. Measured 2026-10-23 on 113
-  records with the #4699 title cap (`adr-index-lines-v2`):
-  `docs/adr/index.json` is 41,625 raw bytes and its rendering 24,200 bytes
-  (27,143 uncapped), leaving 8,568 bytes under the 32 KiB cap — 21 more lines
-  at the largest current line (405 bytes).
+  (`RenderIndex`, #4478), not the committed file. Measured 2026-11-04 with the
+  #4699 title cap and no path (`adr-index-lines-v3`): on 123 records
+  `docs/adr/index.json` is 46,289 raw bytes and its rendering 19,708 bytes (22,755
+  uncapped), leaving 13,060 bytes under the 32 KiB cap, 38 more lines at the
+  largest current line (338 bytes). With ADR-127 to ADR-139 applied (136 records,
+  numbered to 139), 22,372 bytes render, leaving 10,396 bytes, 30 lines at the
+  same 338-byte largest line.
   `TestAssemble_ShippedIndex_HeadroomFloor` fails the ADR landing that leaves
   fewer than 10 such lines (#4699 AC4): the early warning to tier the index
   (collapse superseded or older records), which #4699 deferred until about 150
-  ADRs, or to raise the cap — an operator decision, not a flake.
+  ADRs and ADR-120 D3 designs, or to raise the cap — an operator decision, not a
+  flake.
   `TestAssemble_ShippedIndex_RenderingFitsCap` still fails the change whose
   record makes the rendering overflow the cap (and keeps its 2026-10-16
   record-count floor: 25 more records at 428 bytes beyond the 95 measured then),
@@ -450,6 +524,11 @@ Any failure fails the WHOLE assembly: no partial `Selection` is returned.
   overflow on main between their verifies, as with any shared-file budget. The
   raw file's size no longer reaches the prompt; how the writer emits the
   optional amendment keys is `docs/adr/README.md`'s.
+- **ADR-120 is partly implemented.** Only D1's path half and Amendment A1 are
+  here. D1's title cap on records not selected and the rest of ADR-120 are not.
+  ADR-120 D5 couples each step to an architect corpus case and a catch-rate
+  recording; the case that fails when `path` is rendered, one for A1's promotion
+  and the re-measurement of the changed prompt are owed to the next re-pin.
 - **Grounding reads the head.** Records not injected are reachable only through
   read-only grounding, which reads the REVIEW TREE (the change's head), not the
   admission commit; injection is base-pinned, grounding is not. The index

@@ -13,7 +13,9 @@
 // compact rendering (RenderIndex, one JSON object per record per line) under
 // its own per-document cap and fits the FULL text of as many ranked matches as
 // a separate record budget allows, then the Decision section(s) of the next
-// ones (DecisionExcerpt, #4489), so the index cannot starve the records.
+// ones (DecisionExcerpt, #4489), so the index cannot starve the records. Budget
+// still left then promotes excerpted amendments to whole (ADR-120 Amendment A1,
+// #5031).
 //
 // The package reads through repodoc and renders through repodoc's framing, so
 // base-ref pinning, content hashing, delimiter neutralization and attribution
@@ -27,6 +29,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"path"
 	"regexp"
 	"slices"
 	"sort"
@@ -85,11 +88,13 @@ var idPattern = regexp.MustCompile(`^ADR-[0-9]{3,}$`)
 // Every slice tag carries omitempty, which affects ENCODING only: RenderIndex
 // marshals Record directly, so an empty list costs the rendering no bytes,
 // while ParseIndex's strict decode still requires supersedes, superseded_by
-// and applies_to (TestRenderIndex_RendersEveryRecordField pins the tags).
+// and applies_to (TestRenderIndex_RendersEveryRecordField pins the tags). Path's
+// omitempty is what lets RenderIndex leave it out of a line; ParseIndex still
+// validates, and so requires, every record's path, and Assemble fetches by it.
 type Record struct {
 	ID           string   `json:"id"`
 	Title        string   `json:"title"`
-	Path         string   `json:"path"`
+	Path         string   `json:"path,omitempty"`
 	Status       Status   `json:"status"`
 	Supersedes   []string `json:"supersedes,omitempty"`
 	SupersededBy []string `json:"superseded_by,omitempty"`
@@ -117,10 +122,11 @@ type Index struct {
 }
 
 // IndexRendering names the compact index rendering RenderIndex produces; it is
-// the repodoc rendering name Assemble derives the index document under. v2
-// (#4699) caps each rendered title at MaxRenderedTitleChars; v1 rendered every
-// title in full.
-const IndexRendering = "adr-index-lines-v2"
+// the repodoc rendering name Assemble derives the index document under. v3
+// (#5031, the path half of ADR-120 D1) leaves each record's path out of its
+// line; v2 (#4699) capped each rendered title at MaxRenderedTitleChars, which
+// v3 keeps; v1 rendered every title in full.
+const IndexRendering = "adr-index-lines-v3"
 
 // MaxRenderedTitleChars is the most characters — Unicode code points, the
 // unit of utf8.RuneCountInString and of Python's len(str) — a title is
@@ -144,17 +150,19 @@ func RenderedTitle(title string) string {
 
 // RenderIndex renders idx compactly for a reviewer prompt (#4478): one compact
 // JSON object per record, one record per line ("\n"-terminated), in index
-// order, with every empty list field left out (Record's omitempty tags) and
-// every title capped by RenderedTitle (#4699). The schema_version wrapper is
-// not rendered. Because Record is marshalled directly, every field it declares
-// — the amends / amended_by relations included — renders with no further
-// code. idx is not modified: the cap applies to each record's range copy.
+// order, with every empty list field left out (Record's omitempty tags), every
+// title capped by RenderedTitle (#4699) and the path left out (#5031: the index
+// framing states the path convention, and the file lists every path). The
+// schema_version wrapper is not rendered. Because Record is marshalled directly,
+// every other field it declares — the amends / amended_by relations included —
+// renders with no further code. idx is not modified: the cap and the omission
+// apply to each record's range copy.
 //
 // Each line decodes back to a Record equal to its record except that Title is
-// RenderedTitle(Title). encoding/json escapes every byte below 0x20, U+2028
-// and U+2029 (SetEscapeHTML(false) only stops it escaping '<', '>' and '&'),
-// but NOT U+2026, so a cut title's '…' is written raw, and NOT U+0085 NEL,
-// which repodoc honours as a line break; so every raw NEL in the output —
+// RenderedTitle(Title) and Path is empty. encoding/json escapes every byte below
+// 0x20, U+2028 and U+2029 (SetEscapeHTML(false) only stops it escaping '<', '>'
+// and '&'), but NOT U+2026, so a cut title's '…' is written raw, and NOT U+0085
+// NEL, which repodoc honours as a line break; so every raw NEL in the output —
 // which can only sit inside a JSON string — is rewritten as the escape
 // \u0085, and the output holds exactly one repodoc line break per record.
 func RenderIndex(idx *Index) ([]byte, error) {
@@ -163,11 +171,33 @@ func RenderIndex(idx *Index) ([]byte, error) {
 	enc.SetEscapeHTML(false)
 	for _, r := range idx.Records {
 		r.Title = RenderedTitle(r.Title)
+		r.Path = ""
 		if err := enc.Encode(r); err != nil {
 			return nil, fmt.Errorf("decisionrecord: render index record %q: %w", r.ID, err)
 		}
 	}
 	return bytes.ReplaceAll(b.Bytes(), []byte("\u0085"), []byte(`\u0085`)), nil
+}
+
+// recordPathConvention names the convention every record path in idx follows,
+// `<dir>/<NNN>-<slug>.md`, when each one sits in the same directory and is named
+// with its own id's number, a non-empty slug and .md. It returns "" for an index
+// with no records or with any path outside that shape, so the framing never
+// states a convention a repository does not follow (ADR-110).
+func recordPathConvention(idx *Index) string {
+	if len(idx.Records) == 0 {
+		return ""
+	}
+	shared, _ := path.Split(idx.Records[0].Path)
+	for _, r := range idx.Records {
+		dir, file := path.Split(r.Path)
+		stem, isMarkdown := strings.CutSuffix(file, ".md")
+		slug, numbered := strings.CutPrefix(stem, strings.TrimPrefix(r.ID, "ADR-")+"-")
+		if dir != shared || !isMarkdown || !numbered || slug == "" {
+			return ""
+		}
+	}
+	return shared + "<NNN>-<slug>.md"
 }
 
 // ParseIndex decodes raw as a STRICT adr-index-v1 index. It refuses: malformed
@@ -280,7 +310,9 @@ func checkLinks(idx *Index) error {
 // Match is one selected record and where it ranked.
 type Match struct {
 	Record Record
-	// Rank is the 1-based position in the selection's ranking.
+	// Rank is the 1-based position in the selection's ranking: Select's order,
+	// and once Assemble has run, the FINAL ranking, which an excerpted amendment
+	// promoted to whole moves up (ADR-120 Amendment A1, #5031).
 	Rank int
 	// MatchedPaths is how many DISTINCT change paths the record's OWN
 	// applies_to matched; 0 for a record selected only as a successor or an

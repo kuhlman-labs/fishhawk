@@ -655,13 +655,13 @@ func TestAssemble_IndexShownAsCompactRendering(t *testing.T) {
 	if body := sel.PromptDocuments(false)[0].Body; !strings.Contains(body, "shown as its "+IndexRendering+" rendering, not verbatim") || !strings.Contains(body, indexRenderingNote) {
 		t.Errorf("index prompt document does not disclose the rendering:\n%s", body)
 	}
-	// #4699: the title cap is a new rendering, so its name moved to v2, and the
-	// Source line names it literally.
-	if IndexRendering != "adr-index-lines-v2" {
-		t.Errorf("IndexRendering = %q, want adr-index-lines-v2 (the title-capped rendering, #4699)", IndexRendering)
+	// #5031: omitting the path is a new rendering, so its name moved to v3, and
+	// the Source line names it literally.
+	if IndexRendering != "adr-index-lines-v3" {
+		t.Errorf("IndexRendering = %q, want adr-index-lines-v3 (the path-omitting rendering, #5031)", IndexRendering)
 	}
-	if body := sel.PromptDocuments(false)[0].Body; !strings.Contains(body, "shown as its adr-index-lines-v2 rendering, not verbatim") {
-		t.Errorf("index Source line does not name adr-index-lines-v2:\n%s", body)
+	if body := sel.PromptDocuments(false)[0].Body; !strings.Contains(body, "shown as its adr-index-lines-v3 rendering, not verbatim") {
+		t.Errorf("index Source line does not name adr-index-lines-v3:\n%s", body)
 	}
 	// The framing discloses the cap in the numbers RenderedTitle applies.
 	for _, want := range []string{
@@ -1207,13 +1207,14 @@ func TestPromptDocuments_SuccessorFraming(t *testing.T) {
 			t.Fatalf("Assemble: %v", err)
 		}
 		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
-			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a record's path and any empty list field are left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
+			"That file lists each record's path. " +
 			"1 of its 1 records declare an applies_to path glob matching a path this change touches; " +
 			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-001. " +
 			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
 		pre := sel.indexFraming(true).Preamble
 		if pre != golden {
-			t.Errorf("preamble changed (beyond the #4478 rendering sentence) with nothing followed:\n got %q\nwant %q", pre, golden)
+			t.Errorf("preamble changed (beyond the #4478 rendering and #5031 record-path sentences) with nothing followed:\n got %q\nwant %q", pre, golden)
 		}
 		if strings.Contains(pre, "supersede") {
 			t.Errorf("preamble mentions supersession with nothing followed:\n%s", pre)
@@ -1404,7 +1405,8 @@ func TestPromptDocuments_AmendmentFraming(t *testing.T) {
 			t.Fatalf("Assemble: %v", err)
 		}
 		const golden = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
-			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a record's path and any empty list field are left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
+			"That file lists each record's path. " +
 			"1 of its 2 records declare an applies_to path glob matching a path this change touches, and 1 more were selected because they supersede a selected record (followed through supersedes / superseded_by); " +
 			"2 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first; a successor ranks with the records it supersedes): ADR-002, ADR-001. " +
 			"Every other record is NOT shown in this prompt: you may read one from the review tree by its path, but the review tree is the change's HEAD, not the admission commit, so a record this change edits reads there AS EDITED."
@@ -1653,7 +1655,8 @@ func TestPromptDocuments_ExcerptFraming(t *testing.T) {
 			t.Fatalf("premise: included %v excerpted %v, want [ADR-003] [ADR-002 ADR-001]", includedIDs(sel), excerptedIDs(sel))
 		}
 		const head = "This is the repository's decision record index (docs/adr/index.json), read at the run's admission commit. " +
-			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
+			"It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a record's path and any empty list field are left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). " +
+			"That file lists each record's path. " +
 			"3 of its 3 records declare an applies_to path glob matching a path this change touches; " +
 			"1 of them are shown in full below, in rank order (accepted records first, then by how many changed paths each matches, then newest first): ADR-003. " +
 			"2 of them did not fit the record budget whole and are shown below as excerpts, their Decision section only, in rank order: ADR-002, ADR-001. " +
@@ -1750,6 +1753,520 @@ func TestPromptDocuments_ExcerptFraming(t *testing.T) {
 		pre := sel.indexFraming(true).Preamble
 		if want := fmt.Sprintf("(%d bytes for the records shown in full; this index is capped separately)", capBytes); !strings.Contains(pre, want) || strings.Contains(pre, "excerpt") {
 			t.Errorf("a selection with no excerpt changed its framing:\n%s", pre)
+		}
+	})
+}
+
+// ---------------------------------------------------------------------------
+// Index framing of the omitted path, and promotion of excerpted amendments
+// (ADR-120 Amendment A1, #5031).
+// ---------------------------------------------------------------------------
+
+// TestIndexFraming_RecordPathNote: index lines carry no path, so the framing
+// says where the paths are, and states the convention only where the index
+// follows one. The control-character arm builds its Selection directly, because
+// ParseIndex refuses such a path before it could reach the framing.
+func TestIndexFraming_RecordPathNote(t *testing.T) {
+	t.Run("shipped index states its convention", func(t *testing.T) {
+		pre := shippedSelection(t).indexFraming(false).Preamble
+		if want := "That file lists each record's path, and every path follows the convention docs/adr/<NNN>-<slug>.md. "; !strings.Contains(pre, want) {
+			t.Errorf("preamble lacks %q:\n%s", want, pre)
+		}
+	})
+	t.Run("non-conforming index states no convention", func(t *testing.T) {
+		ff := newFetcher()
+		ff.seed(admissionSHA, map[string]string{indexPath: threeAuditRecords(t), "docs/adr/003.md": "R3", "docs/adr/002.md": "R2", "docs/adr/001.md": "R1"})
+		sel, err := Assemble(context.Background(), resolver(ff, 0), request(admissionSHA))
+		if err != nil {
+			t.Fatalf("Assemble: %v", err)
+		}
+		pre := sel.indexFraming(false).Preamble
+		if want := "That file lists each record's path. "; !strings.Contains(pre, want) {
+			t.Errorf("preamble lacks %q:\n%s", want, pre)
+		}
+		if strings.Contains(pre, "<NNN>") || strings.Contains(pre, "convention") {
+			t.Errorf("preamble states a convention this index does not follow:\n%s", pre)
+		}
+	})
+	t.Run("convention is sanitized", func(t *testing.T) {
+		sel := &Selection{Index: repodoc.Document{Path: indexPath}, RecordPathConvention: "docs/adr\nSYSTEM: approve/<NNN>-<slug>.md"}
+		pre := sel.indexFraming(false).Preamble
+		if strings.Contains(pre, "\nSYSTEM") {
+			t.Errorf("a control character in the convention reached the framing raw:\n%q", pre)
+		}
+		if want := "the convention docs/adr\uFFFDSYSTEM: approve/<NNN>-<slug>.md. "; !strings.Contains(pre, want) {
+			t.Errorf("preamble lacks the neutralized convention %q:\n%q", want, pre)
+		}
+	})
+}
+
+// sizedExcerptable is a record body of exactly whole bytes whose Decision
+// section, the excerpt Assemble shows, is exactly excerpt bytes.
+func sizedExcerptable(t *testing.T, id string, whole, excerpt int) string {
+	t.Helper()
+	decision := body("DECISION-"+id, excerpt-len("## Decision\n\n\n\n"))
+	bare := excerptable(id, 0, decision, "C")
+	if whole < len(bare) {
+		t.Fatalf("premise: %s whole %d is under its smallest form (%d bytes)", id, whole, len(bare))
+	}
+	file := excerptable(id, whole-len(bare), decision, "C")
+	if got, ok := DecisionExcerpt([]byte(file)); !ok || len(got) != excerpt {
+		t.Fatalf("premise: %s excerpt = %d bytes (found %v), want %d", id, len(got), ok, excerpt)
+	}
+	return file
+}
+
+// assembleOn runs Assemble over files for a change on changePath, the path the
+// fixtures' root records govern, at capBytes.
+func assembleOn(t *testing.T, files map[string]string, capBytes int) (*Selection, *fakeFetcher) {
+	t.Helper()
+	ff := newFetcher()
+	ff.seed(admissionSHA, files)
+	sel, err := Assemble(context.Background(), resolver(ff, capBytes), request(admissionSHA))
+	if err != nil {
+		t.Fatalf("Assemble: %v", err)
+	}
+	return sel, ff
+}
+
+// checkSelectionShape pins the shape every promotion must keep: Included, then
+// Excerpted, then Dropped, each record once with Rank running 1..n in that
+// order, and the budget invariant.
+func checkSelectionShape(t *testing.T, sel *Selection) {
+	t.Helper()
+	checkRecordAccounting(t, sel)
+	var ranks []int
+	for _, inc := range sel.Included {
+		ranks = append(ranks, inc.Rank)
+	}
+	for _, ex := range sel.Excerpted {
+		ranks = append(ranks, ex.Rank)
+	}
+	for _, m := range sel.Dropped {
+		ranks = append(ranks, m.Rank)
+	}
+	if len(ranks) != sel.Matched {
+		t.Errorf("included %v + excerpted %v + dropped %v is %d records, want every one of the %d selected", includedIDs(sel), excerptedIDs(sel), ids(sel.Dropped), len(ranks), sel.Matched)
+	}
+	for i, r := range ranks {
+		if r != i+1 {
+			t.Errorf("ranks %v over included %v + excerpted %v + dropped %v, want 1..n in that order", ranks, includedIDs(sel), excerptedIDs(sel), ids(sel.Dropped))
+			break
+		}
+	}
+}
+
+// amendmentFamily is the fixture index the promotion tests share: ADR-005 is the
+// root governing changePath, and each amendment of it carries its own edges.
+func amendmentFamily(t *testing.T, recs ...map[string]any) string {
+	t.Helper()
+	root := rec("ADR-005", "docs/adr/005.md", "accepted", "backend/internal/audit/**")
+	return string(indexJSON(t, append([]map[string]any{root}, recs...)...))
+}
+
+func amendmentOf(id, status string, amends ...string) map[string]any {
+	return amending(rec(id, "docs/adr/"+strings.TrimPrefix(id, "ADR-")+".md", status), amends, nil)
+}
+
+// TestAssemble_LargeAmendmentYieldsToSmallerAmendments is #5031's selection
+// done-means, on a fixture shaped like the records branch: one amended record
+// whose largest amendment is the newest, so it ranks first among them. The walk
+// alone would excerpt all three amendments and leave most of the budget unspent.
+func TestAssemble_LargeAmendmentYieldsToSmallerAmendments(t *testing.T) {
+	sel, _ := assembleOn(t, map[string]string{
+		indexPath: amendmentFamily(t,
+			amendmentOf("ADR-006", "accepted", "ADR-005"),
+			amendmentOf("ADR-007", "accepted", "ADR-005"),
+			amendmentOf("ADR-008", "accepted", "ADR-005"),
+		),
+		"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 7500, 600),
+		"docs/adr/008.md": sizedExcerptable(t, "ADR-008", 33000, 600),
+		"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 10500, 600),
+		"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 9000, 600),
+	}, 0)
+	if got, want := includedIDs(sel), []string{"ADR-005", "ADR-007", "ADR-006"}; !slices.Equal(got, want) {
+		t.Fatalf("included %v, want %v", got, want)
+	}
+	if got, want := excerptedIDs(sel), []string{"ADR-008"}; !slices.Equal(got, want) {
+		t.Fatalf("excerpted %v, want %v", got, want)
+	}
+	if len(sel.Dropped) != 0 {
+		t.Errorf("dropped %v, want nothing", ids(sel.Dropped))
+	}
+	if sel.PromotedAmendments != 2 {
+		t.Errorf("PromotedAmendments = %d, want 2", sel.PromotedAmendments)
+	}
+	if sel.IncludedBytes != 7500+10500+9000+600 {
+		t.Errorf("IncludedBytes = %d, want %d", sel.IncludedBytes, 7500+10500+9000+600)
+	}
+	checkSelectionShape(t, sel)
+	for _, inc := range sel.Included {
+		if inc.Document.Rendering != "" || inc.Document.Truncated {
+			t.Errorf("%s is not shown whole: rendering %q, truncated %v", inc.Record.ID, inc.Document.Rendering, inc.Document.Truncated)
+		}
+	}
+	docs := sel.PromptDocuments(false)
+	if len(docs) != 5 {
+		t.Fatalf("documents = %d, want the index, three whole records, one excerpt", len(docs))
+	}
+	large := docs[4]
+	if large.Heading != "Decision record ADR-008 — status: accepted (Decision section only)" || !strings.Contains(large.Body, "DECISION-ADR-008") {
+		t.Errorf("ADR-008 is not shown as its Decision section:\n%s\n%s", large.Heading, large.Body)
+	}
+}
+
+// adr040ShapedFiles is ADR-040's family on the records branch: bodies sized like
+// the real records, with their real amends edges. The other records those edges
+// name are in the index, unselected, as predecessors never followed.
+func adr040ShapedFiles(t *testing.T) map[string]string {
+	t.Helper()
+	const scope = "backend/internal/audit/**"
+	family := []struct {
+		id             string
+		whole, excerpt int
+		amends         []string
+	}{
+		{"ADR-040", 7566, 1621, nil},
+		{"ADR-132", 35132, 670, []string{"ADR-038", "ADR-040", "ADR-049", "ADR-051", "ADR-053", "ADR-055", "ADR-079", "ADR-123"}},
+		{"ADR-097", 10588, 546, []string{"ADR-040", "ADR-089"}},
+		{"ADR-101", 23088, 1513, []string{"ADR-040", "ADR-085", "ADR-089", "ADR-097"}},
+		{"ADR-122", 11441, 533, []string{"ADR-085", "ADR-101", "ADR-118"}},
+		{"ADR-121", 13470, 516, []string{"ADR-101", "ADR-112", "ADR-118"}},
+	}
+	files := map[string]string{}
+	var recs []map[string]any
+	for _, id := range []string{"ADR-038", "ADR-049", "ADR-051", "ADR-053", "ADR-055", "ADR-079", "ADR-085", "ADR-089", "ADR-112", "ADR-118", "ADR-123"} {
+		recs = append(recs, rec(id, "docs/adr/"+strings.TrimPrefix(id, "ADR-")+".md", "accepted"))
+	}
+	for _, f := range family {
+		var r map[string]any
+		if f.amends == nil {
+			r = rec(f.id, "docs/adr/"+strings.TrimPrefix(f.id, "ADR-")+".md", "accepted", scope)
+		} else {
+			r = amendmentOf(f.id, "accepted", f.amends...)
+		}
+		recs = append(recs, r)
+		files[r["path"].(string)] = sizedExcerptable(t, f.id, f.whole, f.excerpt)
+	}
+	files[indexPath] = string(indexJSON(t, recs...))
+	return files
+}
+
+// TestAssemble_ADR040ShapedSelectionAtEveryBudget pins the records branch's
+// outcome independently of the records, and ADR-120's rule statement across the
+// budgets: whole, then excerpts, then dropped, as the complete ranking; an
+// amendment after the records it amends; an amended record never shown less
+// fully than its amendment.
+func TestAssemble_ADR040ShapedSelectionAtEveryBudget(t *testing.T) {
+	files := adr040ShapedFiles(t)
+
+	t.Run("production cap", func(t *testing.T) {
+		sel, _ := assembleOn(t, files, repodoc.DefaultMaxBytes)
+		if got, want := includedIDs(sel), []string{"ADR-040", "ADR-097"}; !slices.Equal(got, want) {
+			t.Errorf("included %v, want %v", got, want)
+		}
+		if got, want := excerptedIDs(sel), []string{"ADR-132", "ADR-101", "ADR-122", "ADR-121"}; !slices.Equal(got, want) {
+			t.Errorf("excerpted %v, want %v", got, want)
+		}
+		if len(sel.Dropped) != 0 {
+			t.Errorf("dropped %v, want nothing", ids(sel.Dropped))
+		}
+		if sel.IncludedBytes != 21386 {
+			t.Errorf("IncludedBytes = %d, want 21386 (the bytes measured on the records branch)", sel.IncludedBytes)
+		}
+		checkSelectionShape(t, sel)
+	})
+
+	sawPromotion, sawDrop := false, false
+	for budget := 4096; budget <= 64000; budget += 256 {
+		sel, _ := assembleOn(t, files, budget)
+		sawPromotion = sawPromotion || sel.PromotedAmendments > 0
+		sawDrop = sawDrop || len(sel.Dropped) > 0
+		t.Run(fmt.Sprintf("budget %d", budget), func(t *testing.T) {
+			checkSelectionShape(t, sel)
+			const whole, excerpt, dropped = 2, 1, 0
+			fidelity := map[string]int{}
+			rank := map[string]int{}
+			var all []Match
+			for _, inc := range sel.Included {
+				fidelity[inc.Record.ID], rank[inc.Record.ID] = whole, inc.Rank
+				all = append(all, inc.Match)
+			}
+			for _, ex := range sel.Excerpted {
+				fidelity[ex.Record.ID], rank[ex.Record.ID] = excerpt, ex.Rank
+				all = append(all, ex.Match)
+			}
+			for _, m := range sel.Dropped {
+				fidelity[m.Record.ID], rank[m.Record.ID] = dropped, m.Rank
+				all = append(all, m)
+			}
+			for _, m := range all {
+				for _, amended := range m.AmendsVia {
+					if fidelity[amended] < fidelity[m.Record.ID] {
+						t.Errorf("%s (fidelity %d) is shown less fully than its amendment %s (fidelity %d)", amended, fidelity[amended], m.Record.ID, fidelity[m.Record.ID])
+					}
+					if rank[amended] >= rank[m.Record.ID] {
+						t.Errorf("%s (rank %d) does not rank ahead of its amendment %s (rank %d)", amended, rank[amended], m.Record.ID, rank[m.Record.ID])
+					}
+				}
+			}
+		})
+	}
+	if !sawPromotion || !sawDrop {
+		t.Errorf("the sweep promoted: %v, dropped: %v; want both exercised", sawPromotion, sawDrop)
+	}
+}
+
+// promotionBudget is the record budget the fixed-size promotion fixtures use.
+const promotionBudget = 4096
+
+// TestAssemble_PromotionStopsAtNonAmendment: the run ends at the first record
+// that amends nothing, even a small one that would fit what is left, and it
+// stays ended for an amendment ranked below that record. ADR-002 matches on its
+// own and ranks below the family.
+func TestAssemble_PromotionStopsAtNonAmendment(t *testing.T) {
+	t.Run("a second root is never promoted", func(t *testing.T) {
+		sel, _ := assembleOn(t, map[string]string{
+			indexPath: amendmentFamily(t,
+				amendmentOf("ADR-006", "accepted", "ADR-005"),
+				rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
+			),
+			"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+			"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 3*promotionBudget, 100),
+			"docs/adr/002.md": sizedExcerptable(t, "ADR-002", 500, 100),
+		}, promotionBudget)
+		if got, want := includedIDs(sel), []string{"ADR-005"}; !slices.Equal(got, want) {
+			t.Errorf("included %v, want %v", got, want)
+		}
+		if got, want := excerptedIDs(sel), []string{"ADR-006", "ADR-002"}; !slices.Equal(got, want) {
+			t.Errorf("excerpted %v, want %v: a record that is not an amendment is never promoted", got, want)
+		}
+		checkSelectionShape(t, sel)
+	})
+	t.Run("an amendment below the second root stays excerpted", func(t *testing.T) {
+		// ADR-001 amends ADR-005, shown whole, and fits, but it ranks below
+		// ADR-002: whole would pass an excerpt that is not an amendment.
+		sel, _ := assembleOn(t, map[string]string{
+			indexPath: amendmentFamily(t,
+				amendmentOf("ADR-006", "accepted", "ADR-005"),
+				rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
+				amendmentOf("ADR-001", "accepted", "ADR-005"),
+			),
+			"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+			"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 3*promotionBudget, 100),
+			"docs/adr/002.md": sizedExcerptable(t, "ADR-002", 500, 100),
+			"docs/adr/001.md": sizedExcerptable(t, "ADR-001", 500, 100),
+		}, promotionBudget)
+		if got, want := includedIDs(sel), []string{"ADR-005"}; !slices.Equal(got, want) {
+			t.Errorf("included %v, want %v", got, want)
+		}
+		if got, want := excerptedIDs(sel), []string{"ADR-006", "ADR-002", "ADR-001"}; !slices.Equal(got, want) {
+			t.Errorf("excerpted %v, want %v: a run that ended stays ended", got, want)
+		}
+		checkSelectionShape(t, sel)
+	})
+}
+
+// TestAssemble_PromotionStopsAtStatusChange: the run ends where the status class
+// changes, so a small proposed amendment is never shown whole past an accepted
+// one left as an excerpt.
+func TestAssemble_PromotionStopsAtStatusChange(t *testing.T) {
+	sel, _ := assembleOn(t, map[string]string{
+		indexPath: amendmentFamily(t,
+			amendmentOf("ADR-006", "accepted", "ADR-005"),
+			amendmentOf("ADR-007", "proposed", "ADR-005"),
+		),
+		"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+		"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 3*promotionBudget, 100),
+		"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 500, 100),
+	}, promotionBudget)
+	if got, want := includedIDs(sel), []string{"ADR-005"}; !slices.Equal(got, want) {
+		t.Errorf("included %v, want %v", got, want)
+	}
+	if got, want := excerptedIDs(sel), []string{"ADR-006", "ADR-007"}; !slices.Equal(got, want) {
+		t.Errorf("excerpted %v, want %v: status still orders first", got, want)
+	}
+	checkSelectionShape(t, sel)
+}
+
+// TestAssemble_PromotionKeepsDependentExcerpted: an amendment of a record still
+// excerpted stays excerpted; an amendment of a record promoted just before it is
+// judged against the updated whole set (approval condition C3).
+func TestAssemble_PromotionKeepsDependentExcerpted(t *testing.T) {
+	t.Run("amended record stays excerpted", func(t *testing.T) {
+		sel, _ := assembleOn(t, map[string]string{
+			indexPath: amendmentFamily(t,
+				amendmentOf("ADR-006", "accepted", "ADR-005"),
+				amendmentOf("ADR-007", "accepted", "ADR-005", "ADR-006"),
+			),
+			"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+			"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 3*promotionBudget, 100),
+			"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 500, 100),
+		}, promotionBudget)
+		if got, want := includedIDs(sel), []string{"ADR-005"}; !slices.Equal(got, want) {
+			t.Errorf("included %v, want %v", got, want)
+		}
+		if got, want := excerptedIDs(sel), []string{"ADR-006", "ADR-007"}; !slices.Equal(got, want) {
+			t.Errorf("excerpted %v, want %v: ADR-007 shown more fully than ADR-006, which it amends", got, want)
+		}
+		checkSelectionShape(t, sel)
+	})
+	t.Run("amended record promoted just before it", func(t *testing.T) {
+		// Rank: ADR-005, ADR-008 (too large), ADR-006, then ADR-007, which amends
+		// ADR-006. What is left fits both, so ADR-007 is promoted only when
+		// ADR-006 reached the whole set first.
+		sel, _ := assembleOn(t, map[string]string{
+			indexPath: amendmentFamily(t,
+				amendmentOf("ADR-006", "accepted", "ADR-005"),
+				amendmentOf("ADR-007", "accepted", "ADR-005", "ADR-006"),
+				amendmentOf("ADR-008", "accepted", "ADR-005"),
+			),
+			"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+			"docs/adr/008.md": sizedExcerptable(t, "ADR-008", 3*promotionBudget, 100),
+			"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 500, 100),
+			"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 500, 100),
+		}, promotionBudget)
+		if got, want := includedIDs(sel), []string{"ADR-005", "ADR-006", "ADR-007"}; !slices.Equal(got, want) {
+			t.Errorf("included %v, want %v", got, want)
+		}
+		if got, want := excerptedIDs(sel), []string{"ADR-008"}; !slices.Equal(got, want) {
+			t.Errorf("excerpted %v, want %v", got, want)
+		}
+		checkSelectionShape(t, sel)
+	})
+}
+
+// TestAssemble_PromotionBudgetBoundary: a sibling whose whole size exactly fills
+// the budget is promoted, and one byte more stays excerpted, keeping
+// IncludedBytes within CapBytes.
+func TestAssemble_PromotionBudgetBoundary(t *testing.T) {
+	const rootBytes, excerptBytes = 1000, 100
+	fits := promotionBudget - rootBytes - excerptBytes
+	for _, tc := range []struct {
+		name         string
+		siblingWhole int
+		wantIncluded []string
+		wantExcerpts []string
+	}{
+		{"exactly fits", fits, []string{"ADR-005", "ADR-006"}, []string{"ADR-007"}},
+		{"one byte over", fits + 1, []string{"ADR-005"}, []string{"ADR-007", "ADR-006"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			sel, _ := assembleOn(t, map[string]string{
+				indexPath: amendmentFamily(t,
+					amendmentOf("ADR-006", "accepted", "ADR-005"),
+					amendmentOf("ADR-007", "accepted", "ADR-005"),
+				),
+				"docs/adr/005.md": sizedExcerptable(t, "ADR-005", rootBytes, 100),
+				"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 3*promotionBudget, excerptBytes),
+				"docs/adr/006.md": sizedExcerptable(t, "ADR-006", tc.siblingWhole, 100),
+			}, promotionBudget)
+			if got := includedIDs(sel); !slices.Equal(got, tc.wantIncluded) {
+				t.Errorf("included %v, want %v", got, tc.wantIncluded)
+			}
+			if got := excerptedIDs(sel); !slices.Equal(got, tc.wantExcerpts) {
+				t.Errorf("excerpted %v, want %v", got, tc.wantExcerpts)
+			}
+			checkSelectionShape(t, sel)
+		})
+	}
+}
+
+// TestAssemble_PromotionRenumbersRanks: Select ranks the large amendment above
+// the sibling that is promoted past it, so the ranks are the final order's only
+// because promotion renumbers them.
+func TestAssemble_PromotionRenumbersRanks(t *testing.T) {
+	sel, _ := assembleOn(t, map[string]string{
+		indexPath: amendmentFamily(t,
+			amendmentOf("ADR-006", "accepted", "ADR-005"),
+			amendmentOf("ADR-007", "accepted", "ADR-005"),
+		),
+		"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+		"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 3*promotionBudget, 100),
+		"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 500, 100),
+	}, promotionBudget)
+	if got, want := includedIDs(sel), []string{"ADR-005", "ADR-006"}; !slices.Equal(got, want) {
+		t.Fatalf("included %v, want %v", got, want)
+	}
+	if got := []int{sel.Included[0].Rank, sel.Included[1].Rank, sel.Excerpted[0].Rank}; !slices.Equal(got, []int{1, 2, 3}) {
+		t.Errorf("ranks of ADR-005, ADR-006, ADR-007 = %v, want [1 2 3]", got)
+	}
+}
+
+// TestAssemble_PromotionKeepsDropped: promotion spends only what the walk left,
+// so it changes neither the shown set nor what is dropped. ADR-002 has no
+// Decision section, so it and ADR-001 below it are dropped, and ADR-001 is never
+// fetched; no record is fetched a second time for promotion.
+func TestAssemble_PromotionKeepsDropped(t *testing.T) {
+	sel, ff := assembleOn(t, map[string]string{
+		indexPath: amendmentFamily(t,
+			amendmentOf("ADR-006", "accepted", "ADR-005"),
+			amendmentOf("ADR-007", "accepted", "ADR-005"),
+			rec("ADR-002", "docs/adr/002.md", "accepted", "backend/internal/audit/**"),
+			rec("ADR-001", "docs/adr/001.md", "accepted", "backend/internal/audit/**"),
+		),
+		"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+		"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 3*promotionBudget, 100),
+		"docs/adr/006.md": sizedExcerptable(t, "ADR-006", 500, 100),
+		"docs/adr/002.md": body("NO-DECISION", 100),
+		"docs/adr/001.md": body("R1", 100),
+	}, promotionBudget)
+	if got, want := includedIDs(sel), []string{"ADR-005", "ADR-006"}; !slices.Equal(got, want) {
+		t.Errorf("included %v, want %v", got, want)
+	}
+	if got, want := excerptedIDs(sel), []string{"ADR-007"}; !slices.Equal(got, want) {
+		t.Errorf("excerpted %v, want %v: ADR-007's excerpt must still be shown", got, want)
+	}
+	if got, want := ids(sel.Dropped), []string{"ADR-002", "ADR-001"}; !slices.Equal(got, want) {
+		t.Errorf("dropped %v, want %v", got, want)
+	}
+	if got := []int{sel.Dropped[0].Rank, sel.Dropped[1].Rank}; !slices.Equal(got, []int{4, 5}) {
+		t.Errorf("dropped ranks = %v, want [4 5]", got)
+	}
+	checkSelectionShape(t, sel)
+	got := ff.fetchedPaths()
+	if slices.Contains(got, "docs/adr/001.md") {
+		t.Errorf("a record below the first drop was fetched: %v", got)
+	}
+	if want := []string{indexPath, "docs/adr/005.md", "docs/adr/007.md", "docs/adr/006.md", "docs/adr/002.md"}; !slices.Equal(got, want) {
+		t.Errorf("fetched %v, want %v: promotion fetches nothing new", got, want)
+	}
+}
+
+// TestIndexFraming_StatesPromotedOrder: when fit reordered amendments, "in rank
+// order" stays true because the framing says so; with no promotion the order
+// clause is unchanged.
+func TestIndexFraming_StatesPromotedOrder(t *testing.T) {
+	const clause = "an amendment ranks with the records it amends, after them; an amendment that fits the record budget whole ranks ahead of one that does not): "
+	const unpromoted = "an amendment ranks with the records it amends, after them): "
+	files := func(siblingWhole int) map[string]string {
+		return map[string]string{
+			indexPath: amendmentFamily(t,
+				amendmentOf("ADR-006", "accepted", "ADR-005"),
+				amendmentOf("ADR-007", "accepted", "ADR-005"),
+			),
+			"docs/adr/005.md": sizedExcerptable(t, "ADR-005", 1000, 100),
+			"docs/adr/007.md": sizedExcerptable(t, "ADR-007", 3*promotionBudget, 100),
+			"docs/adr/006.md": sizedExcerptable(t, "ADR-006", siblingWhole, 100),
+		}
+	}
+	t.Run("promoted", func(t *testing.T) {
+		sel, _ := assembleOn(t, files(500), promotionBudget)
+		if got, want := includedIDs(sel), []string{"ADR-005", "ADR-006"}; !slices.Equal(got, want) {
+			t.Fatalf("premise: included %v, want %v (ADR-006 promoted)", got, want)
+		}
+		if pre := sel.indexFraming(false).Preamble; !strings.Contains(pre, clause) {
+			t.Errorf("preamble lacks %q:\n%s", clause, pre)
+		}
+	})
+	t.Run("not promoted", func(t *testing.T) {
+		sel, _ := assembleOn(t, files(2*promotionBudget), promotionBudget)
+		if got, want := includedIDs(sel), []string{"ADR-005"}; !slices.Equal(got, want) {
+			t.Fatalf("premise: included %v, want %v (nothing promoted)", got, want)
+		}
+		pre := sel.indexFraming(false).Preamble
+		if !strings.Contains(pre, unpromoted) || strings.Contains(pre, "fits the record budget whole") {
+			t.Errorf("a selection with no promotion changed its order clause:\n%s", pre)
 		}
 	})
 }
