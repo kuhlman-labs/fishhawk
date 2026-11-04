@@ -160,6 +160,9 @@ func TestParseIndex_FailsClosed(t *testing.T) {
 		{"unknown record field", withRecord("extra", "x"), "extra"},
 		{"bad id", withRecord("id", "ADR-02"), "records[1]"},
 		{"lowercase id", withRecord("id", "adr-002"), "records[1]"},
+		// RenderIndex leaves path out (#5031); the parser still requires it.
+		{"missing path", withRecords(func(recs []map[string]any) { delete(recs[1], "path") }), "records[1]"},
+		{"empty path", withRecord("path", ""), "records[1]"},
 		{"absolute path", withRecord("path", "/docs/adr/002-b.md"), "records[1]"},
 		{"dot-dot path", withRecord("path", "docs/../adr/002-b.md"), "records[1]"},
 		{"control-character path", withRecord("path", "docs/adr/002\n-b.md"), "records[1]"},
@@ -797,9 +800,10 @@ func fullRecord() Record {
 }
 
 // TestRenderIndex_RendersEveryRecordField (#4478): a fully populated record's
-// line names every json key Record declares, and every slice field's tag
-// carries omitempty — so a field added to Record renders, and an empty list
-// renders compactly (left out of its line).
+// line names every json key Record declares except path, which RenderIndex
+// leaves out (#5031), and every slice field's tag carries omitempty — so a field
+// added to Record renders, and an empty list renders compactly (left out of its
+// line).
 func TestRenderIndex_RendersEveryRecordField(t *testing.T) {
 	r := fullRecord()
 	out, err := RenderIndex(&Index{SchemaVersion: IndexSchemaVersion, Records: []Record{r}})
@@ -815,7 +819,11 @@ func TestRenderIndex_RendersEveryRecordField(t *testing.T) {
 		if v.IsZero() {
 			t.Fatalf("fixture leaves Record.%s zero; populate every field", f.Name)
 		}
-		if !strings.Contains(string(out), `"`+name+`":`) {
+		if name == "path" {
+			if strings.Contains(string(out), `"path":`) {
+				t.Errorf("rendering carries Record.Path:\n%s", out)
+			}
+		} else if !strings.Contains(string(out), `"`+name+`":`) {
 			t.Errorf("rendering lacks Record.%s (json %q):\n%s", f.Name, name, out)
 		}
 		if f.Type.Kind() == reflect.Slice && !slices.Contains(strings.Split(opts, ","), "omitempty") {
@@ -825,8 +833,59 @@ func TestRenderIndex_RendersEveryRecordField(t *testing.T) {
 	var back Record
 	dec := json.NewDecoder(strings.NewReader(string(out)))
 	dec.DisallowUnknownFields()
-	if err := dec.Decode(&back); err != nil || !reflect.DeepEqual(back, r) {
-		t.Errorf("line decodes to %+v (%v), want %+v", back, err, r)
+	want := r
+	want.Path = ""
+	if err := dec.Decode(&back); err != nil || !reflect.DeepEqual(back, want) {
+		t.Errorf("line decodes to %+v (%v), want %+v", back, err, want)
+	}
+}
+
+// TestRenderIndex_OmitsPath is the path half of ADR-120 D1 (#5031): a record
+// with a non-empty path renders with no path key at all, and the caller's Index
+// keeps its path, because Assemble fetches each record by it.
+func TestRenderIndex_OmitsPath(t *testing.T) {
+	idx := &Index{SchemaVersion: IndexSchemaVersion, Records: []Record{
+		{ID: "ADR-001", Title: "Plain", Path: "docs/adr/001-a.md", Status: StatusAccepted},
+	}}
+	out, err := RenderIndex(idx)
+	if err != nil {
+		t.Fatalf("RenderIndex: %v", err)
+	}
+	if want := `{"id":"ADR-001","title":"Plain","status":"accepted"}` + "\n"; string(out) != want {
+		t.Errorf("RenderIndex = %q, want %q", out, want)
+	}
+	if idx.Records[0].Path != "docs/adr/001-a.md" {
+		t.Errorf("RenderIndex modified the caller's index: path now %q", idx.Records[0].Path)
+	}
+}
+
+// TestRecordPathConvention: a convention is stated only when every record path
+// follows it. Each non-conforming arm breaks exactly one rule, on one record
+// past the first, so a body that ignored that rule returns a value.
+func TestRecordPathConvention(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		paths []string
+		want  string
+	}{
+		{"all conforming", []string{"docs/adr/001-a.md", "docs/adr/002-b-c.md"}, "docs/adr/<NNN>-<slug>.md"},
+		{"conforming at the repository root", []string{"001-a.md", "002-b.md"}, "<NNN>-<slug>.md"},
+		{"no records", nil, ""},
+		{"mixed directories", []string{"docs/adr/001-a.md", "docs/other/002-b.md"}, ""},
+		{"no slug", []string{"docs/adr/001-a.md", "docs/adr/002.md"}, ""},
+		{"empty slug", []string{"docs/adr/001-a.md", "docs/adr/002-.md"}, ""},
+		{"number not matching the id", []string{"docs/adr/001-a.md", "docs/adr/003-b.md"}, ""},
+		{"not a .md name", []string{"docs/adr/001-a.md", "docs/adr/002-b.txt"}, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			idx := &Index{SchemaVersion: IndexSchemaVersion}
+			for i, p := range tc.paths {
+				idx.Records = append(idx.Records, Record{ID: fmt.Sprintf("ADR-%03d", i+1), Path: p, Status: StatusAccepted})
+			}
+			if got := recordPathConvention(idx); got != tc.want {
+				t.Errorf("recordPathConvention(%v) = %q, want %q", tc.paths, got, tc.want)
+			}
+		})
 	}
 }
 
@@ -841,9 +900,9 @@ func TestRenderIndex_EmptyListsOmitted(t *testing.T) {
 	if err != nil {
 		t.Fatalf("RenderIndex: %v", err)
 	}
-	want := `{"id":"ADR-001","title":"Plain","path":"docs/adr/001-a.md","status":"unknown"}` + "\n" +
-		`{"id":"ADR-004","title":"Successor","path":"docs/adr/004-d.md","status":"accepted","supersedes":["ADR-002"]}` + "\n" +
-		`{"id":"ADR-003","title":"Amended","path":"docs/adr/003-c.md","status":"accepted","amends":["ADR-001"],"amended_by":["ADR-005","ADR-006"],"applies_to":[".fishhawk/operator.yaml"]}` + "\n"
+	want := `{"id":"ADR-001","title":"Plain","status":"unknown"}` + "\n" +
+		`{"id":"ADR-004","title":"Successor","status":"accepted","supersedes":["ADR-002"]}` + "\n" +
+		`{"id":"ADR-003","title":"Amended","status":"accepted","amends":["ADR-001"],"amended_by":["ADR-005","ADR-006"],"applies_to":[".fishhawk/operator.yaml"]}` + "\n"
 	if string(out) != want {
 		t.Errorf("RenderIndex =\n%s\nwant\n%s", out, want)
 	}
@@ -872,7 +931,7 @@ func countRepodocLineBreaks(s string) int {
 // separator repodoc honours, a double quote and '<'. The rendering has exactly
 // one repodoc line break per record, no raw NEL, the RAW '<' (SetEscapeHTML
 // false) and no < escape, and every line decodes strictly back to its
-// record.
+// record, less its path.
 func TestRenderIndex_OneLinePerRecordRoundTrips(t *testing.T) {
 	titles := []string{"lf\nbreak", "cr\rbreak", "crlf\r\nbreak", "vt\vbreak", "ff\fbreak", "nel\u0085break", "ls\u2028break", "ps\u2029break", `a "quoted" <tag> & more`}
 	recs := make([]Record, 0, len(titles))
@@ -915,6 +974,7 @@ func TestRenderIndex_OneLinePerRecordRoundTrips(t *testing.T) {
 			t.Fatalf("line %d does not decode: %v\n%s", i, err, line)
 		}
 		want := recs[i]
+		want.Path = ""
 		for _, p := range []*[]string{&got.Supersedes, &got.SupersededBy, &got.Amends, &got.AmendedBy, &got.AppliesTo, &want.Supersedes, &want.SupersededBy, &want.Amends, &want.AmendedBy, &want.AppliesTo} {
 			*p = norm(*p)
 		}
@@ -954,8 +1014,9 @@ func TestRenderedTitle(t *testing.T) {
 // than bytes; 101, 249 and 120-'é' titles render as their first 99 code
 // points plus a RAW '…'; a cut through a title carrying '\n' and U+0085 just
 // before the cut point still leaves one repodoc line break per record. Every
-// line decodes strictly to the record with Title == RenderedTitle(original)
-// and every other field unchanged, and the caller's Index is not modified.
+// line decodes strictly to the record with Title == RenderedTitle(original), an
+// empty Path and every other field unchanged, and the caller's Index is not
+// modified.
 func TestRenderIndex_CapsLongTitles(t *testing.T) {
 	ascii := func(n int) string { return strings.Repeat("a", n) }
 	breaks := ascii(96) + "\n\u0085" + ascii(3) // 101 runes; '\n' and NEL at runes 97 and 98
@@ -978,7 +1039,7 @@ func TestRenderIndex_CapsLongTitles(t *testing.T) {
 			if err != nil {
 				t.Fatalf("RenderIndex: %v", err)
 			}
-			want := `{"id":"ADR-007","title":"` + tc.wantTitle + `","path":"docs/adr/007-g.md","status":"accepted","supersedes":["ADR-002"],"amended_by":["ADR-009"],"applies_to":["docs/**"]}` + "\n"
+			want := `{"id":"ADR-007","title":"` + tc.wantTitle + `","status":"accepted","supersedes":["ADR-002"],"amended_by":["ADR-009"],"applies_to":["docs/**"]}` + "\n"
 			if string(out) != want {
 				t.Errorf("RenderIndex =\n%q\nwant\n%q", out, want)
 			}
@@ -1002,6 +1063,7 @@ func TestRenderIndex_CapsLongTitles(t *testing.T) {
 			}
 			wantBack := r
 			wantBack.Title = RenderedTitle(tc.title)
+			wantBack.Path = ""
 			if !reflect.DeepEqual(back, wantBack) {
 				t.Errorf("line decodes to %+v, want %+v", back, wantBack)
 			}

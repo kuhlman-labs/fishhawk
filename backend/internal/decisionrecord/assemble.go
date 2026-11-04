@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"slices"
 	"strings"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/forge"
@@ -73,12 +74,20 @@ type Selection struct {
 	// AmendsVia), whether or not their own applies_to also matched. It is what
 	// tells the index framing that an amendment was followed.
 	Amendments int
+	// PromotedAmendments is how many of Included were excerpted by the walk and
+	// promoted to whole from the budget it left (ADR-120 Amendment A1, #5031).
+	// It is what tells the index framing that fit reordered amendments.
+	PromotedAmendments int
+	// RecordPathConvention is the convention every record path in the index
+	// follows (recordPathConvention), empty when they do not share one. Index
+	// lines carry no path, so the index framing states it.
+	RecordPathConvention string
 	// Included are the matches shown in full, in rank order — a strict prefix
-	// of the ranking.
+	// of the FINAL ranking, which promotion renumbers.
 	Included []Included
 	// Excerpted are the matches shown as Decision-section excerpts (#4489), in
 	// rank order, all ranked below every Included record: Included then
-	// Excerpted is itself a strict prefix of the ranking.
+	// Excerpted is itself a strict prefix of the FINAL ranking.
 	Excerpted []Included
 	// Dropped are the matches left out because they did not fit the record
 	// budget, whole or as an excerpt, in rank order. Never fetched past the
@@ -116,10 +125,14 @@ type Selection struct {
 //     lower-ranked record is never shown whole, even one that would fit;
 //   - the first match with no Decision section, or whose excerpt does not
 //     fit, and EVERY lower-ranked match, is dropped, and the lower-ranked ones
-//     are never fetched.
+//     are never fetched;
+//   - budget still left then promotes excerpted amendments to whole, in rank
+//     order (promoteExcerptedAmendments, ADR-120 Amendment A1, #5031), and the
+//     shown records are renumbered. Fit decides here, over D2's "then matched
+//     paths, then newer" among same-status amendments of a whole record.
 //
-// So the records shown (whole or excerpt) are a strict prefix of the ranking,
-// and the records shown whole are a strict prefix of those shown: a
+// So, on that FINAL ranking, the records shown (whole or excerpt) are a strict
+// prefix, and the records shown whole are a strict prefix of those shown: a
 // lower-ranked record is never shown more fully than a higher-ranked one, and
 // no record is ever shown cut.
 //
@@ -169,10 +182,11 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 	// and does not draw on this one.
 	recordBudget := r.CapBytes()
 	sel := &Selection{
-		Index:        idxDoc,
-		TotalRecords: len(idx.Records),
-		Matched:      len(matches),
-		CapBytes:     recordBudget,
+		Index:                idxDoc,
+		TotalRecords:         len(idx.Records),
+		Matched:              len(matches),
+		CapBytes:             recordBudget,
+		RecordPathConvention: recordPathConvention(idx),
 	}
 	for _, m := range matches {
 		if m.MatchedPaths == 0 {
@@ -184,6 +198,7 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 	}
 	remaining := recordBudget
 	excerpting := false
+	var excerptFetched []*repodoc.Fetched
 	for i, m := range matches {
 		f, err := r.Fetch(ctx, repodoc.Request{
 			Repo:    req.Repo,
@@ -220,10 +235,67 @@ func Assemble(ctx context.Context, r *repodoc.Resolver, req Request) (*Selection
 			break
 		}
 		sel.Excerpted = append(sel.Excerpted, Included{Match: m, Document: excerpt})
+		excerptFetched = append(excerptFetched, f)
 		sel.IncludedBytes += excerpt.RenderedBytes
 		remaining -= excerpt.RenderedBytes
 	}
+	promoteExcerptedAmendments(sel, excerptFetched, remaining, recordBudget)
 	return sel, nil
+}
+
+// promoteExcerptedAmendments implements ADR-120 Amendment A1 (#5031). It spends
+// remaining, the record budget the walk left, moving excerpted amendments to
+// whole in rank order, within the run of same-status amendments at the start of
+// sel.Excerpted, and only those whose amended records are all shown whole. A
+// promoted record joins whole before the next one is examined, so an amendment
+// of it is judged against the updated set. A promotion costs only the bytes its
+// whole body adds over its excerpt, so it never removes a shown record, and
+// fetched (parallel to sel.Excerpted) means it fetches nothing new. Included
+// then Excerpted is renumbered as the final ranking; Dropped keeps its ranks,
+// because the shown count does not change.
+func promoteExcerptedAmendments(sel *Selection, fetched []*repodoc.Fetched, remaining, recordBudget int) {
+	whole := make(map[string]bool, len(sel.Included)+len(sel.Excerpted))
+	for _, inc := range sel.Included {
+		whole[inc.Record.ID] = true
+	}
+	kept := make([]Included, 0, len(sel.Excerpted))
+	inRun := true
+	for i, ex := range sel.Excerpted {
+		inRun = inRun && inAmendmentRun(ex.Match, sel.Excerpted[0].Match)
+		if inRun && amendsOnlyWhole(ex.Match, whole) {
+			doc := fetched[i].Document(max(recordBudget, len(fetched[i].Content)))
+			if extra := doc.RenderedBytes - ex.Document.RenderedBytes; extra <= remaining {
+				sel.Included = append(sel.Included, Included{Match: ex.Match, Document: doc})
+				sel.IncludedBytes += extra
+				remaining -= extra
+				sel.PromotedAmendments++
+				whole[ex.Record.ID] = true
+				continue
+			}
+		}
+		kept = append(kept, ex)
+	}
+	sel.Excerpted = kept
+	for i := range sel.Included {
+		sel.Included[i].Rank = i + 1
+	}
+	for i := range sel.Excerpted {
+		sel.Excerpted[i].Rank = len(sel.Included) + i + 1
+	}
+}
+
+// inAmendmentRun reports whether m continues the run of promotable records that
+// starts at first, the highest-ranked excerpt: it amends a selected record and
+// shares first's accepted-or-not status class, so a promotion stays inside the
+// status order and never passes a record that is not an amendment.
+func inAmendmentRun(m, first Match) bool {
+	return len(m.AmendsVia) > 0 && (m.Record.Status == StatusAccepted) == (first.Record.Status == StatusAccepted)
+}
+
+// amendsOnlyWhole reports whether every selected record m amends is in whole,
+// so a promoted amendment is never shown more fully than a record it amends.
+func amendsOnlyWhole(m Match, whole map[string]bool) bool {
+	return !slices.ContainsFunc(m.AmendsVia, func(id string) bool { return !whole[id] })
 }
 
 // excerptDocument shapes f's Decision-section excerpt under a cap at least its
@@ -352,19 +424,27 @@ func (s *Selection) PromptDocuments(grounded bool) []prompt.InjectedDocument {
 
 // indexRenderingNote is the sentence the index framing adds after its opening
 // sentence, describing the RenderIndex format the persona is shown (#4478),
-// including the title cap (RenderedTitle, MaxRenderedTitleChars, #4699).
-const indexRenderingNote = "It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a list field that is empty is left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). "
+// including the title cap (RenderedTitle, MaxRenderedTitleChars, #4699) and the
+// omitted path (#5031), which indexFraming's next sentence accounts for.
+const indexRenderingNote = "It is shown below as a compact rendering of that file, not verbatim: one JSON object per record, one record per line, in the file's order; a record's path and any empty list field are left out of its line, and a title longer than 100 characters is shown as its first 99 characters followed by '…' (the record file carries the full title). "
 
 // indexFraming is the system-authored framing of the index document. Apart
-// from the indexRenderingNote sentence (#4478): with no followed successor
-// (Followed == 0) the preamble is exactly the pre-#4398 text; with successors
-// but no amendment (Amendments == 0) it is exactly the pre-#4471 text; with no
-// excerpt (len(Excerpted) == 0) it is exactly the pre-#4489 text.
+// from the indexRenderingNote sentence (#4478) and the record-path sentence
+// after it (#5031): with no followed successor (Followed == 0) the preamble is
+// exactly the pre-#4398 text; with successors but no amendment (Amendments == 0)
+// it is exactly the pre-#4471 text; with no excerpt (len(Excerpted) == 0) it is
+// exactly the pre-#4489 text; with no promotion (PromotedAmendments == 0) its
+// order clause is exactly the pre-#5031 text.
 func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 	var b strings.Builder
 	fmt.Fprintf(&b, "This is the repository's decision record index (%s), read at the run's admission commit. ",
 		repodoc.SanitizeMetadata(s.Index.Path))
 	b.WriteString(indexRenderingNote)
+	b.WriteString("That file lists each record's path")
+	if s.RecordPathConvention != "" {
+		fmt.Fprintf(&b, ", and every path follows the convention %s", repodoc.SanitizeMetadata(s.RecordPathConvention))
+	}
+	b.WriteString(". ")
 	switch {
 	case s.Amendments > 0:
 		fmt.Fprintf(&b, "%d of its %d records declare an applies_to path glob matching a path this change touches, "+
@@ -390,6 +470,9 @@ func (s *Selection) indexFraming(grounded bool) repodoc.Framing {
 		switch {
 		case s.Amendments > 0:
 			order += "; a successor ranks with the records it supersedes; an amendment ranks with the records it amends, after them"
+			if s.PromotedAmendments > 0 {
+				order += "; an amendment that fits the record budget whole ranks ahead of one that does not"
+			}
 		case s.Followed > 0:
 			order += "; a successor ranks with the records it supersedes"
 		}

@@ -215,10 +215,10 @@ func jsonString(t *testing.T, s string) []byte {
 // TestShippedIndex_TitleCapShrinksRendering is #4699's shipped done-means
 // (AC1, AC2): every line of the committed index's RenderIndex rendering
 // decodes strictly to its record with Title == RenderedTitle(stored title), at
-// most MaxRenderedTitleChars code points, and the cap saves at least
-// minTitleCapSavings bytes. The saving is summed per title from RenderIndex's
-// OWN output (approval condition 3), never through a re-render: each line's
-// title value bytes are read raw and compared with the stored title's JSON
+// most MaxRenderedTitleChars code points, and no path (#5031), and the cap saves
+// at least minTitleCapSavings bytes. The saving is summed per title from
+// RenderIndex's OWN output (approval condition 3), never through a re-render:
+// each line's title value bytes are read raw and compared with the stored title's JSON
 // encoding; an under-cap title must render byte-equal to that encoding, which
 // pins jsonString to RenderIndex's encoder on the real titles.
 func TestShippedIndex_TitleCapShrinksRendering(t *testing.T) {
@@ -245,6 +245,7 @@ func TestShippedIndex_TitleCapShrinksRendering(t *testing.T) {
 		}
 		want := r
 		want.Title = RenderedTitle(r.Title)
+		want.Path = ""
 		// An empty list is left out of its line (omitempty), so it decodes nil.
 		for _, p := range []*[]string{&back.Supersedes, &back.SupersededBy, &back.Amends, &back.AmendedBy, &back.AppliesTo, &want.Supersedes, &want.SupersededBy, &want.Amends, &want.AmendedBy, &want.AppliesTo} {
 			if len(*p) == 0 {
@@ -260,6 +261,9 @@ func TestShippedIndex_TitleCapShrinksRendering(t *testing.T) {
 		var raw map[string]json.RawMessage
 		if err := json.Unmarshal([]byte(line), &raw); err != nil {
 			t.Fatalf("line %d (%s): %v", i, r.ID, err)
+		}
+		if _, carried := raw["path"]; carried {
+			t.Errorf("%s: rendered line carries a path key: %s", r.ID, line)
 		}
 		full := jsonString(t, r.Title)
 		if utf8.RuneCountInString(r.Title) <= MaxRenderedTitleChars {
