@@ -1,11 +1,11 @@
 ---
 id: ADR-001
 title: "Cloud target (AWS / GCP / Other)"
-status: accepted
+status: superseded
 date: 2026-04-30
 issue: https://github.com/kuhlman-labs/fishhawk/issues/65
 supersedes: []
-superseded_by: []
+superseded_by: ["ADR-138"]
 applies_to: []
 ---
 

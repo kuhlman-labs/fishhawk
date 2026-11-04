@@ -52,7 +52,7 @@ func shippedIndex(t *testing.T) (*Index, []byte) {
 // shippedLinks is the E78.13 / #4471 encoding docs/adr/README.md § "Amendment
 // relation" records. A record not listed here is not pinned.
 var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedBy []string }{
-	"ADR-040": {nil, nil, nil, []string{"ADR-097", "ADR-101"}},
+	"ADR-040": {nil, nil, nil, []string{"ADR-097", "ADR-101", "ADR-132"}},
 	"ADR-082": {nil, nil, nil, []string{"ADR-125"}},
 	"ADR-087": {nil, []string{"ADR-094"}, nil, []string{"ADR-100"}},
 	"ADR-089": {nil, nil, nil, []string{"ADR-097", "ADR-101"}},
@@ -78,26 +78,39 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-107": {nil, nil, []string{"ADR-025"}, nil},
 	"ADR-109": {nil, nil, []string{"ADR-093"}, nil},
 	"ADR-041": {nil, nil, []string{"ADR-032"}, []string{"ADR-116"}},
-	"ADR-055": {nil, nil, nil, []string{"ADR-113"}},
+	"ADR-055": {nil, nil, nil, []string{"ADR-113", "ADR-132"}},
 	"ADR-063": {nil, nil, nil, []string{"ADR-115"}},
 	"ADR-068": {nil, nil, nil, []string{"ADR-118"}},
-	"ADR-084": {nil, nil, nil, []string{"ADR-118", "ADR-120"}},
+	"ADR-084": {nil, nil, nil, []string{"ADR-118", "ADR-120", "ADR-139"}},
 	"ADR-092": {[]string{"ADR-090"}, []string{"ADR-093"}, nil, []string{"ADR-115"}},
 	"ADR-112": {nil, nil, []string{"ADR-093"}, []string{"ADR-115", "ADR-121"}},
-	"ADR-113": {nil, nil, []string{"ADR-055"}, []string{"ADR-120", "ADR-123"}},
+	"ADR-113": {nil, nil, []string{"ADR-055"}, []string{"ADR-120", "ADR-123", "ADR-139"}},
 	"ADR-115": {nil, nil, []string{"ADR-063", "ADR-092", "ADR-093", "ADR-094", "ADR-112"}, []string{"ADR-116"}},
 	"ADR-116": {nil, nil, []string{"ADR-041", "ADR-115"}, nil},
 	"ADR-117": {nil, nil, nil, []string{"ADR-118", "ADR-126"}},
-	"ADR-118": {nil, nil, []string{"ADR-068", "ADR-084", "ADR-117"}, []string{"ADR-121", "ADR-122"}},
+	"ADR-118": {nil, nil, []string{"ADR-068", "ADR-084", "ADR-117"}, []string{"ADR-121", "ADR-122", "ADR-129"}},
 	"ADR-121": {nil, nil, []string{"ADR-101", "ADR-112", "ADR-118"}, nil},
 	"ADR-122": {nil, nil, []string{"ADR-085", "ADR-101", "ADR-118"}, nil},
-	"ADR-123": {nil, nil, []string{"ADR-113"}, nil},
+	"ADR-123": {nil, nil, []string{"ADR-113"}, []string{"ADR-132"}},
 	"ADR-124": {nil, nil, []string{"ADR-098"}, nil},
-	"ADR-125": {nil, nil, []string{"ADR-082"}, nil},
+	"ADR-125": {nil, nil, []string{"ADR-082"}, []string{"ADR-128"}},
 	"ADR-126": {nil, nil, []string{"ADR-103", "ADR-117"}, nil},
 	"ADR-042": {nil, nil, nil, []string{"ADR-119"}},
 	"ADR-119": {nil, nil, []string{"ADR-042"}, nil},
 	"ADR-120": {nil, nil, []string{"ADR-084", "ADR-113"}, nil},
+	// ADR-127 to ADR-139, ratified 2026-11-03/04 (relations from their record-metadata lines, ADR-113 D3).
+	"ADR-128": {nil, nil, []string{"ADR-125"}, nil},
+	"ADR-129": {nil, nil, []string{"ADR-118"}, nil},
+	"ADR-130": {nil, nil, []string{"ADR-080"}, nil},
+	"ADR-131": {nil, nil, []string{"ADR-073"}, nil},
+	"ADR-132": {nil, nil, []string{"ADR-038", "ADR-040", "ADR-049", "ADR-051", "ADR-053", "ADR-055", "ADR-079", "ADR-123"}, nil},
+	"ADR-133": {nil, nil, []string{"ADR-053"}, nil},
+	"ADR-135": {nil, nil, []string{"ADR-065"}, nil},
+	"ADR-136": {nil, nil, []string{"ADR-079"}, nil},
+	"ADR-137": {nil, nil, []string{"ADR-073"}, nil},
+	"ADR-138": {[]string{"ADR-001"}, nil, []string{"ADR-003", "ADR-009", "ADR-016", "ADR-073"}, nil},
+	"ADR-139": {nil, nil, []string{"ADR-084", "ADR-113"}, nil},
+	"ADR-001": {nil, []string{"ADR-138"}, nil, nil},
 	// The Captain's 2026-10-23 status rulings (ADR-041 amends ADR-032).
 	"ADR-032": {nil, nil, nil, []string{"ADR-041"}},
 }
@@ -426,8 +439,8 @@ func TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments(t *testing.T) 
 	if sel.Index.Truncated {
 		t.Errorf("the shipped index was injected truncated at the production cap (%d bytes cut)", sel.Index.DroppedBytes)
 	}
-	if sel.Amendments != 4 {
-		t.Fatalf("Amendments = %d, want 4 (ADR-097, ADR-101, and ADR-101's amendments ADR-121, ADR-122)", sel.Amendments)
+	if sel.Amendments != 5 {
+		t.Fatalf("Amendments = %d, want 5 (ADR-097, ADR-101, ADR-132, and ADR-101's amendments ADR-121, ADR-122)", sel.Amendments)
 	}
 	inc := includedIDs(sel)
 	if !slices.Equal(inc[:2], []string{"ADR-040", "ADR-097"}) {
@@ -441,7 +454,7 @@ func TestShippedIndex_AssembleKeepsAmendedBodyAndFramesAmendments(t *testing.T) 
 	wants := []string{
 		fmt.Sprintf("%d of the selected records amend a selected record, and an amended record still governs, except where an amendment decides otherwise; ", sel.Amendments),
 		"an amendment ranks with the records it amends, after them",
-		"Amended by ADR-097, ADR-101: it still governs, except where an amendment decides otherwise.",
+		"Amended by ADR-097, ADR-101, ADR-132: it still governs, except where an amendment decides otherwise.",
 		"This record was selected because it amends ADR-040; the amended record still governs except where this record decides otherwise.",
 	}
 	// ADR-101, whole or as its excerpt, carries its amendment sentence (#4489).
@@ -472,11 +485,11 @@ func TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt(t *testing.T) {
 	if got := includedIDs(sel); !slices.Equal(got, []string{"ADR-040", "ADR-097"}) {
 		t.Fatalf("included %v, want [ADR-040 ADR-097]", got)
 	}
-	if got := excerptedIDs(sel); !slices.Equal(got, []string{"ADR-101", "ADR-122", "ADR-121"}) {
-		t.Fatalf("excerpted %v, want [ADR-101 ADR-122 ADR-121] (ADR-101, then its amendments; dropped %v)", got, ids(sel.Dropped))
+	if got := excerptedIDs(sel); !slices.Equal(got, []string{"ADR-132", "ADR-101", "ADR-122", "ADR-121"}) {
+		t.Fatalf("excerpted %v, want [ADR-132 ADR-101 ADR-122 ADR-121] (ADR-101, then its amendments; dropped %v)", got, ids(sel.Dropped))
 	}
-	if !slices.Equal(sel.Excerpted[0].AmendsVia, []string{"ADR-040", "ADR-097"}) {
-		t.Errorf("ADR-101 AmendsVia = %v, want [ADR-040 ADR-097]", sel.Excerpted[0].AmendsVia)
+	if !slices.Equal(sel.Excerpted[1].AmendsVia, []string{"ADR-040", "ADR-097"}) {
+		t.Errorf("ADR-101 AmendsVia = %v, want [ADR-040 ADR-097]", sel.Excerpted[1].AmendsVia)
 	}
 	if slices.Contains(ids(sel.Dropped), "ADR-101") {
 		t.Errorf("ADR-101 is both excerpted and dropped")
@@ -542,7 +555,7 @@ func TestShippedIndex_ADR040ScopeShowsADR101DecisionExcerpt(t *testing.T) {
 		t.Errorf("ADR-101's rendered document carries the Recommendation-only %q: the excerpt leaked Recommendation text", recommendationOnlyProbe)
 	}
 	all := rendered.String()
-	if want := "3 of them did not fit the record budget whole and are shown below as excerpts, their Decision section only, in rank order: ADR-101, ADR-122, ADR-121. "; !strings.Contains(all, want) {
+	if want := "4 of them did not fit the record budget whole and are shown below as excerpts, their Decision section only, in rank order: ADR-132, ADR-101, ADR-122, ADR-121. "; !strings.Contains(all, want) {
 		t.Errorf("the index framing lacks %q", want)
 	}
 	if strings.Contains(all, "- ADR-101 (docs/adr/101-charter-authorization-mode.md") {

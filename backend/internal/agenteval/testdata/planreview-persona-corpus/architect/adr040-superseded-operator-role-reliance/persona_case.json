@@ -91,7 +91,8 @@
       "superseded_by": [],
       "amended_by": [
         "ADR-097",
-        "ADR-101"
+        "ADR-101",
+        "ADR-132"
       ]
     }
   ],

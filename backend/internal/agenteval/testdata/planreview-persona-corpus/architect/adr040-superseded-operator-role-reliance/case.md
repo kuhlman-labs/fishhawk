@@ -62,7 +62,9 @@ amendment's text is not available.
 
 ## Governing records
 
-- ADR-040 — accepted, `superseded_by: []`, `amended_by: [ADR-097, ADR-101]`,
+- ADR-040 — accepted, `superseded_by: []`, `amended_by: [ADR-097, ADR-101, ADR-132]`
+  (ADR-132, recorded 2026-11-04, amends ADR-040 on release promotion; it does
+  not bear on this catch),
   `applies_to: [docs/spec/operator-role.schema.json, .fishhawk/operator.yaml]`.
 
 ADR-101 (accepted, `amends: [ADR-040, ADR-089, ADR-097]`, empty `applies_to`)
