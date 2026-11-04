@@ -30,6 +30,36 @@ Drafted by the first officer at the Captain's direction (2026-10-23); it is the 
 
 **Titles** are at most 100 characters from ADR-119 onward (`C-title-length`).
 
+## Drafting and review
+
+Operator rules for drafting and reviewing an ADR before ratification. The Captain adopted them on 2026-11-04, from the ADR review board experiment that mimicked ADR-113 Direction C over ADR-127 to ADR-137. Until the product carries an `adr_change` workflow, the operator applies them by hand.
+
+1. **Start in final record form.** A draft is filed and reviewed in the shape it will be ratified in. That means:
+   - one `## Decision` heading;
+   - exactly one well-formed record-metadata line (ADR-113 D3);
+   - no H1, since the record writer supplies it;
+   - no draft-status prose ("not ratified", "Decision pending") outside the Decision section;
+   - no `### Intake signals (advisory)` block or hidden intake marker in the body.
+
+   Run these checks before round 1. A draft that starts this way and has one subject converged within the revise ceiling; none of the nine pre-filed drafts did.
+2. **Decide less, early.** If a draft grows by more than half in a round, or two rounds' mediums concern the same surface, the operator rules on scope before the next revision. The ruling either decides less, or turns the contested part into a direction that requires an amendment. Reviewers reward completeness, so they do not propose this themselves.
+3. **Check the operator's rulings.**
+   - A ruling that states what a decided record says, or how code behaves, cites the `path:line` it read.
+   - A ruling that accepts a finding lists each element the finding asks for: the replacement text, plus any fixture, actor or exclusion it names. Each element must appear in the next draft before the round runs.
+
+   Folds that dropped an element caused about a third of the mediums still open at the ceiling.
+4. **Treat a family as one unit.**
+   - Several ADRs drafted together are reviewed with each other's drafts as context.
+   - Their numbers are allocated before the last round.
+   - A hashed body never states a sibling's ratification status. It names the record (`ADR-NNN (#N)`) and leaves the status to the record and the index. Otherwise ratifying a later sibling makes the earlier bodies false.
+5. **Revise ceiling, then a ruling, then a scoped round.** A draft gets at most 3 revisions. At the ceiling the operator takes the open findings to the Captain, with scope options and an estimate of what another round buys. Any revision the Captain grants is followed by one confirming round with every reviewer, scoped to the diff, at about two-thirds the cost of a full round. The ceiling is not raised.
+6. **Govern errata.** A change after the last review round is an erratum. It is allowed only when:
+   - a reviewer supplied the text, or the Captain approved it;
+   - the Captain accepts it;
+   - the ratification comment says no reviewer saw the final text.
+
+   An erratum that adds a decision is a revision instead, and needs a round.
+
 ## Record layout
 
 ```
