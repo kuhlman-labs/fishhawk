@@ -44,10 +44,11 @@ operator.
 - Kind: `superseded_reliance`, expect `catch`, anchored at approach step 2.
 - The defect: reliance on the pre-ADR-095 merge path, carried by a content
   reference to the amended decision (ADR-091's restart-recovery rule for
-  advisory review rounds), never by its id. ADR-091 is amended by ADR-095,
-  whose D1 says a decomposed parent is merge-eligible only when
-  every slice's code is covered by a successful agent review, and a round
-  that settled `failed` or `skipped` covers nothing.
+  advisory review rounds), never by its id. ADR-091 is amended by ADR-095
+  and ADR-140 (ADR-140 does not alter this catch). ADR-095's D1 says a
+  decomposed parent is merge-eligible only when every slice's code is covered
+  by a successful agent review, and a round that settled `failed` or
+  `skipped` covers nothing.
 
 ## Remit item
 
@@ -57,8 +58,10 @@ the amendment's text is not available.
 
 ## Governing records
 
-- ADR-091 — accepted, `superseded_by: []`, `amended_by: [ADR-095]`, empty
-  `applies_to`.
+- ADR-091 — accepted, `superseded_by: []`, `amended_by: [ADR-095, ADR-140]`,
+  empty `applies_to`. ADR-140, recorded 2026-11-05, amends ADR-091 on
+  terminal-run review recovery and leaves ADR-095's review-coverage hold
+  unchanged, so it does not bear on this catch.
 - ADR-095 — accepted, `superseded_by: []`, `amends: [ADR-091]`, empty
   `applies_to`.
 
@@ -74,10 +77,11 @@ through amendment following (re-observed 2026-10-16: matched nothing). Since
 #4399 the index and the records have SEPARATE 32,768-byte budgets, so the
 9,244-byte ADR-095 record would fit the record budget if it were selected;
 it is not selected. The index renders whole (32,744 bytes). The persona sees
-no record's Decision text. It has the two index entries: ADR-091 with
-`amended_by: [ADR-095]`, and ADR-095 with `amends: [ADR-091]` and its title,
-"Review-coverage hold for decomposed parents ... (amends ADR-091)". The
-remit tells it to say the amendment's text is not shown.
+no record's Decision text. It has the two governing index entries (the
+rendered index also lists ADR-140, which is not governing here): ADR-091 with
+`amended_by: [ADR-095, ADR-140]`, and ADR-095 with `amends: [ADR-091]` and
+its title, "Review-coverage hold for decomposed parents ... (amends
+ADR-091)". The remit tells it to say the amendment's text is not shown.
 `TestPersonaCatchCorpus_RenderContainsRemitAndSelectionInEnvelopes` logs the
 selection per case and asserts each governing record's index entry survives
 in the rendered index (approval condition C1).
