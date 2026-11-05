@@ -56,7 +56,7 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-082": {nil, nil, nil, []string{"ADR-125"}},
 	"ADR-087": {nil, []string{"ADR-094"}, nil, []string{"ADR-100"}},
 	"ADR-089": {nil, nil, nil, []string{"ADR-097", "ADR-101"}},
-	"ADR-091": {nil, nil, nil, []string{"ADR-095"}},
+	"ADR-091": {nil, nil, nil, []string{"ADR-095", "ADR-140"}},
 	"ADR-094": {[]string{"ADR-087"}, nil, nil, []string{"ADR-100", "ADR-115"}},
 	"ADR-095": {nil, nil, []string{"ADR-091"}, nil},
 	"ADR-097": {nil, nil, []string{"ADR-040", "ADR-089"}, []string{"ADR-101"}},
@@ -111,6 +111,8 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	"ADR-138": {[]string{"ADR-001"}, nil, []string{"ADR-003", "ADR-009", "ADR-016", "ADR-073"}, nil},
 	"ADR-139": {nil, nil, []string{"ADR-084", "ADR-113"}, nil},
 	"ADR-001": {nil, []string{"ADR-138"}, nil, nil},
+	// ADR-140, ratified 2026-11-05 (relations from its record-metadata line, ADR-113 D3).
+	"ADR-140": {nil, nil, []string{"ADR-091"}, nil},
 	// ADR-141, ratified 2026-11-04 (relations from its record-metadata line, ADR-113 D3).
 	"ADR-141": {nil, nil, []string{"ADR-035"}, nil},
 	"ADR-035": {nil, nil, nil, []string{"ADR-141"}},

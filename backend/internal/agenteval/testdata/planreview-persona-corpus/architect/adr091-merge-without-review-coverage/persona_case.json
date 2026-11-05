@@ -74,7 +74,8 @@
       "status": "accepted",
       "superseded_by": [],
       "amended_by": [
-        "ADR-095"
+        "ADR-095",
+        "ADR-140"
       ]
     },
     {
