@@ -1,8 +1,11 @@
 # Codex-only workflow contingency
 
 Issue #5094 prepares the repository workflow for Anthropic quota exhaustion.
-The change takes effect for newly admitted runs after its approved merge; an
-unmerged preparation branch does not change the shared deployment.
+Activation is blocked by #5095: the original local MCP runner composer omits
+the executor's provider and the runner defaults to Claude Code. The routing
+hotfix must be active on the dispatch path before these pins can select Codex.
+After that prerequisite and this configuration's approved merge, newly admitted
+runs use the new assignments. An unmerged preparation branch changes no live run.
 
 ## Workload mapping
 
