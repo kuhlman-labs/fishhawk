@@ -1,0 +1,14 @@
+id: scenario:issue-4875/schema-major-stays-stern-when-undetermined
+statement: A workflow schema-major change with undetermined registration keeps the stern `schema_major` banner, and a shim-binary rebuild keeps `shim_rebuilt`.
+verify_hint: 'CLI stdout: in library mode, `_select_mcp_banner 1 0 0 undetermined` prints `schema_major`, `_signal_mcp_activation schema_major` contains ACTION REQUIRED, and `_select_mcp_banner 0 1 0 undetermined` prints `shim_rebuilt`.'
+steps: 'Library mode: _select_mcp_banner 1 0 0 undetermined; _signal_mcp_activation schema_major | grep -c ''ACTION REQUIRED''; _select_mcp_banner 0 1 0 undetermined.'
+assertions:
+    expected: schema_major with ACTION REQUIRED, and shim_rebuilt.
+    observed_at_record: schema_major, count 1, shim_rebuilt.
+    repro_handle: _select_mcp_banner 1 0 0 undetermined
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

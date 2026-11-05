@@ -1,0 +1,14 @@
+id: scenario:issue-4875/absent-registration-still-reports-not-registered
+statement: A `claude` lookup that runs and exits non-zero by itself, or an absent CLI, still reports not registered and still selects the manual reconnect banner.
+verify_hint: 'CLI stdout: in library mode with a `claude` stub that exits 1 with no output, `$(_detect_shim_registered)` prints 0, and `_select_mcp_banner 0 0 1 0` prints `reconnect`.'
+steps: 'Library mode: `claude` stub that exits 1 with no output, then a stub that prints shim text and exits 2, then a PATH with no claude. Each run calls _detect_shim_registered and _select_mcp_banner 0 0 1 <state>; also call _select_mcp_banner 0 0 1 0 directly.'
+assertions:
+    expected: 0 and reconnect.
+    observed_at_record: All three print 0 and select reconnect. The reconnect banner still says ACTION REQUIRED and Run /mcp.
+    repro_handle: /tmp/acc4875/ct.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z
