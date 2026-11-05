@@ -4597,7 +4597,8 @@ type ScopeCompletenessDecisionResult struct {
 	// landed on. Stable across a retry — the row is reused, never duplicated.
 	AmendmentID string `json:"amendment_id,omitempty"`
 	// OwnerAttributionUnresolved is true when the backend's owner-slice guard
-	// could not establish ownership for at least one amended path. It can only
+	// could not establish ownership for at least one amended path the parent's
+	// plan does not declare. It can only
 	// be true alongside AcknowledgedOwnerUnresolved: unacknowledged, that arm
 	// is REFUSED 409 amend_owner_attribution_unresolved.
 	OwnerAttributionUnresolved bool `json:"owner_attribution_unresolved,omitempty"`
@@ -4647,8 +4648,9 @@ type scopeCompletenessDecisionRequest struct {
 	// non-empty on amend; the backend 400s a non-amend decision that carries it.
 	Paths []ScopeAmendmentPathEntry `json:"paths,omitempty"`
 	// AcknowledgeOwnerUnresolved re-admits an amend whose owner-slice guard
-	// could not resolve ownership for a submitted path. The guard fails CLOSED
-	// without it (409 amend_owner_attribution_unresolved).
+	// could not resolve ownership for a submitted path the plan does not
+	// declare. The guard fails CLOSED without it (409
+	// amend_owner_attribution_unresolved). It relaxes no other refusal.
 	AcknowledgeOwnerUnresolved bool `json:"acknowledge_owner_unresolved,omitempty"`
 }
 
@@ -4659,8 +4661,8 @@ type scopeCompletenessDecisionRequest struct {
 // (widen the parked stage's effective scope with `paths` and RESUME it so the
 // agent re-runs, #2591), or "fail" (fall through to category-B); reason is
 // required. paths is required on amend and rejected otherwise;
-// acknowledgeOwnerUnresolved re-admits an amend the owner-slice guard could not
-// prove safe. Operator-token-only (write:stages); the backend rejects run-bound
+// acknowledgeOwnerUnresolved re-admits an amend on a plan-undeclared path whose
+// ownership the guard could not resolve. Operator-token-only (write:stages); the backend rejects run-bound
 // agent tokens (run_token_forbidden). 4xx surfaces:
 //   - 400 validation_failed (decision not exempt/amend/fail, empty reason,
 //     paths absent on amend or present on a non-amend, invalid path entry)
@@ -4670,13 +4672,18 @@ type scopeCompletenessDecisionRequest struct {
 //   - 409 scope_completeness_not_parked (the stage is not parked in
 //     awaiting_scope_decision)
 //   - 409 amend_incomplete_coverage (the amend omits a build_required_path)
-//   - 409 amend_refused_owner_slice_active (a path's owning sibling slice has
-//     already started its implement pass)
-//   - 409 amend_owner_attribution_unresolved (ownership unprovable and not
-//     acknowledged)
+//   - 409 amendment_path_owned_by_sibling_slice (#4798: a non-ancestor slice
+//     declares the path, whatever its state)
+//   - 409 amend_refused_owner_slice_active (an ancestor's delivery is not proven,
+//     details.reason and details.retryable; or a plan-undeclared path's
+//     attributed non-ancestor already started)
+//   - 409 amend_owner_attribution_unresolved (a plan-undeclared path's ownership
+//     is unprovable and not acknowledged)
 //   - 409 amend_budget_exhausted (the stage's amend-and-resume budget is spent)
 //   - 500 amend_unrecorded / amend_resume_failed (the stage is left parked;
 //     re-POST — the amendment row is reused, not duplicated)
+//   - 500 slice_ownership_check_failed (#4798: the plan or an ancestor proof read
+//     failed, or the decomposition is absent; details.retryable)
 func (c *apiClient) DecideScopeCompleteness(ctx context.Context, runID uuid.UUID, decision, reason string,
 	paths []ScopeAmendmentPathEntry, acknowledgeOwnerUnresolved bool) (*ScopeCompletenessDecisionResult, error) {
 	body, err := json.Marshal(scopeCompletenessDecisionRequest{
@@ -4802,6 +4809,11 @@ type RecoverRunParams struct {
 //     decomposed parent — its parent-walked approved plan carries
 //     decomposition.sub_plans or it has decomposition children — so a flat
 //     recovery run is refused and nothing is minted)
+//   - 409 amendment_path_owned_by_sibling_slice (#4798: a decomposition-child
+//     target's add_scope_files names a non-ancestor slice's path; the child
+//     stays failed)
+//   - 500 slice_ownership_check_failed (#4798: only with add_scope_files on a
+//     decomposition child; details.retryable)
 func (c *apiClient) RecoverRun(ctx context.Context, p RecoverRunParams) (*Run, bool, error) {
 	body, err := json.Marshal(recoverRunRequest{
 		AddScopeFiles:    p.AddScopeFiles,

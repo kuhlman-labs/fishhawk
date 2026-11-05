@@ -14596,6 +14596,23 @@ paths:
         `git add -A` guard) — category-B failures presuppose a
         declared scope, so this is a documented edge, not a refusal.
 
+        **Slice ownership on a decomposition child (#4798).** Because
+        the row is born approved, no later decision re-checks it, so
+        `add_scope_files` on a decomposition-child target passes the
+        #4679 rule BEFORE the child is re-opened: a path owned by a slice
+        that is not a transitive `depends_on` ancestor is refused 409
+        `amendment_path_owned_by_sibling_slice`, whatever that sibling's
+        state, with an internal `scope_amendment_refused` audit entry
+        (phase `resume`, withheld from run-bound reads). There is no
+        override. Resume applies this STRUCTURAL rule only and does NOT
+        check delivery: an ancestor's path is admitted whatever that
+        ancestor's state. On a local runner a category-B-failed child has
+        already passed the wave gate; on Actions or GitLab a resume naming
+        an undelivered ancestor's path can still conflict at fan-in. A
+        recovery with no `add_scope_files` never reaches the check. The
+        top-level mint needs no check, because a recovery child carries
+        neither `decomposed_from` nor `slice_index`.
+
         **Scope exemptions.** Optional `exempt_scope_files` is the
         inverse of `add_scope_files` (#1229): each `{path, reason}` marks
         a DECLARED `scope.files` path operator-justified-unchanged so the
@@ -14745,9 +14762,33 @@ paths:
             stage is not `succeeded` and/or whose implement stage is not
             `failed` category-B, or a decomposition-child target whose
             own implement stage is not `failed` category-B and/or whose
-            plan does not resolve via the `parent_run_id` walk.
+            plan does not resolve via the `parent_run_id` walk, which
+            includes a deployment with no artifact repository.
             `details` carries `{plan_state, implement_state,
             failure_category, plan_resolved}`.
+
+            `amendment_path_owned_by_sibling_slice` (#4798) — a
+            decomposition-child target's `add_scope_files` names a path a
+            non-ancestor slice declares. The child stays failed and no
+            amendment row is written. `details` carries `reason`,
+            `requested_slice`, `ancestor_slices`, `conflicts[]`, `remedy` and
+            `retryable: false`.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` — a read failed before the guard: listing the
+            stages, or the eligibility block's plan read. Nothing was written.
+
+            `slice_ownership_check_failed` (#4798) — only with
+            `add_scope_files` on a decomposition-child target: the guard's own
+            plan read failed (`details.reason` `parent_plan_unreadable`,
+            `retryable: true`, re-POST), or the parent's plan resolves but
+            declares no decomposition for this slice (`decomposition_absent`,
+            `retryable: false`, fail and restart). The child stays failed and
+            no amendment row is written. The cause reaches only the log record
+            keyed by `error_ref`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -31311,10 +31352,11 @@ paths:
         admitted child request carries `slice_ownership` on its
         `scope_amendment_requested` payload. A run or plan read error
         here fails OPEN (`slice_ownership.checked: false`) — the
-        decision route re-checks fail-closed. The guard covers only
-        this route and the decision route; `fishhawk_resume_run`
-        `add_scope_files` and the scope-completeness `amend` decision
-        are not covered (#4798).
+        decision route re-checks fail-closed. The two channels that mint
+        an already-approved row carry the same rule and fail closed
+        (#4798): `add_scope_files` on `POST /v0/runs/{run_id}/recover`, and
+        the `amend` decision on
+        `POST /v0/runs/{run_id}/scope-completeness/decision`.
       tags: [runner]
       security: []
       parameters:
@@ -31520,9 +31562,10 @@ paths:
         `amendment_lapsed` answer. A row still reading `pending` that
         has already lapsed can get the ownership 409 instead of
         `amendment_lapsed` (message fidelity only; the row is
-        untouched). The guard covers only the request and decision
-        routes; `fishhawk_resume_run` `add_scope_files` and the
-        scope-completeness `amend` decision are not covered (#4798).
+        untouched). The two channels that mint an already-approved row
+        carry the same rule and fail closed (#4798): `add_scope_files` on
+        `POST /v0/runs/{run_id}/recover`, and the `amend` decision on
+        `POST /v0/runs/{run_id}/scope-completeness/decision`.
       tags: [runs]
       parameters:
         - { name: run_id, in: path, required: true, schema: { $ref: '#/components/schemas/UUID' } }
@@ -31641,12 +31684,26 @@ paths:
         (ADR-035). `amend` is the only non-fail resolution for a
         BUILD-REQUIRED-class park, whose `exempt` is refused outright. The
         amend must cover every `build_required_path` the park recorded
-        (else 409 `amend_incomplete_coverage`), is refused when a path's
-        OWNING sibling slice has already started its implement pass (409
-        `amend_refused_owner_slice_active`), is refused when ownership
-        cannot be RESOLVED unless `acknowledge_owner_unresolved` is true
-        (409 `amend_owner_attribution_unresolved`), and is capped per stage
-        (409 `amend_budget_exhausted`). The row, the audit entry and the
+        (else 409 `amend_incomplete_coverage`) and is capped per stage
+        (409 `amend_budget_exhausted`). On a decomposition child it then
+        follows the parent's approved plan (#4798), failing closed when the
+        plan is unreadable, absent or unconfigured (500
+        `slice_ownership_check_failed`). A path a slice that is not a
+        transitive `depends_on` ancestor declares is refused 409
+        `amendment_path_owned_by_sibling_slice`, whatever that sibling's
+        state. A path an ancestor declares is allowed only on PROVEN delivery
+        into this child's base: the child's dispatch goes through the host
+        wave gate, the ancestor's run and implement stage succeeded, and the
+        parent's newest `slices_integrated` names a branch and covers the
+        ancestor. No per-child base is persisted, so this is what stands in
+        for reading one. Anything less is refused 409
+        `amend_refused_owner_slice_active`, or 500
+        `slice_ownership_check_failed` when a proof read fails. A path the
+        plan does not declare is decided by the park's attribution: refused
+        when a non-ancestor attributed there has started (409
+        `amend_refused_owner_slice_active`), and when ownership cannot be
+        RESOLVED unless `acknowledge_owner_unresolved` is true (409
+        `amend_owner_attribution_unresolved`). The row, the audit entry and the
         resume are three writes with no shared transaction, so the amend is
         IDEMPOTENT: a re-POST of the same decision REUSES the row rather
         than minting a second, which would silently spend one of the
@@ -31694,13 +31751,16 @@ paths:
                   type: boolean
                   description: |
                     `amend` ONLY — re-admits an amend whose owner-slice guard
-                    could not RESOLVE ownership for a submitted path. The
-                    guard fails CLOSED by default (409
-                    `amend_owner_attribution_unresolved`); setting this true
-                    proceeds AND records the acknowledgement on the response
-                    and the `scope_completeness_amended` audit entry, so the
-                    relaxation is an audited operator decision. It never
-                    relaxes `amend_refused_owner_slice_active`. Supplying it
+                    could not RESOLVE ownership for a submitted path the
+                    parent's plan does NOT declare. The guard fails CLOSED by
+                    default (409 `amend_owner_attribution_unresolved`);
+                    setting this true proceeds AND records the acknowledgement
+                    on the response and the `scope_completeness_amended` audit
+                    entry, so the relaxation is an audited operator decision.
+                    It never relaxes `amend_refused_owner_slice_active`,
+                    `amendment_path_owned_by_sibling_slice` or
+                    `slice_ownership_check_failed`, so it can never stand in
+                    for an ancestor's proven delivery (#4798). Supplying it
                     with any other decision is 400 `validation_failed`: only
                     the amend arm runs an owner-slice guard, so on
                     `exempt`/`fail` it would be silently ignored and the
@@ -31881,25 +31941,56 @@ paths:
             would re-park identically and burn a full agent pass. `details`
             carries `uncovered_paths` and `build_required_paths`.
 
-            `amend_refused_owner_slice_active` (#2591) — a submitted path is
-            owned by a sibling slice whose implement pass has already STARTED,
-            the window in which two branches can carry divergent edits to one
-            file. `details` carries `path`, `slice_index`, `slice_title`,
-            `sibling_run_id` and `sibling_implement_state`.
+            `amendment_path_owned_by_sibling_slice` (#4798) — the parent's
+            approved plan declares a submitted path in a slice that is not a
+            transitive `depends_on` ancestor of this child, whatever that
+            sibling's state. There is no override, and it wins over every other
+            owner refusal. `details` carries `reason`, `requested_slice`,
+            `ancestor_slices`, `conflicts[]`, `remedy` and `retryable: false`.
+
+            `amend_refused_owner_slice_active` (#2591, #4798) — two cases,
+            told apart by `details.reason`. With no `reason`, a path the plan
+            does not declare is attributed by the park to a non-ancestor slice
+            whose implement pass has already STARTED, the window in which two
+            branches can carry divergent edits to one file. With a `reason`, a
+            depends_on ancestor's delivery into this child's base is not proven;
+            `details.retryable` true means a later re-POST of the same decision
+            can succeed without changing the plan or the runner kind. Reasons
+            with `retryable: false` (fail and restart with a corrected
+            decomposition): `ancestor_no_wave_gate` (this child's dispatch does
+            not go through the host wave gate, so a remote ancestor's later
+            success proves nothing about its base), `ancestor_run_not_found`
+            (`sibling_run_state` `not_minted`) and
+            `ancestor_implement_stage_absent`. Reasons with `retryable: true`
+            (retry once the ancestor succeeds and is integrated):
+            `ancestor_not_delivered` (its run or implement stage has not
+            succeeded, started or not) and `ancestor_not_integrated` (the
+            parent's newest `slices_integrated` is absent, undecodable,
+            branch-less or stale; `consolidated_branch_present` says which side
+            is missing). `details` carries `path`, `slice_index`, `slice_title`,
+            `sibling_run_id`, `sibling_implement_state`, `sibling_run_state`,
+            and on the ancestor cases `reason`, `retryable` and `remedy`.
+            `acknowledge_owner_unresolved` does not relax either case.
 
             `amend_owner_attribution_unresolved` (#2591) — the OWNING slice of
-            at least one submitted path could not be resolved, so the amend
-            cannot be shown to preserve the single-owner-file invariant. The
-            guard fails CLOSED: `details` names each unresolved path with its
-            reason, and the operator re-admits it with
-            `acknowledge_owner_unresolved: true`.
+            at least one submitted path the plan does not declare could not be
+            resolved, so the amend cannot be shown to preserve the
+            single-owner-file invariant. The guard fails CLOSED: `details` names
+            each unresolved path with its reason (`no_owning_slice_entry`,
+            `owning_slice_index_absent`, `sibling_lookup_failed`,
+            `owning_slice_run_not_found`, `owning_slice_stages_unreadable`,
+            `owning_slice_implement_stage_absent`), and the operator re-admits
+            it with `acknowledge_owner_unresolved: true`.
 
             `amend_budget_exhausted` (#2591) — this stage has already been
             amended-and-resumed the maximum number of times; the remaining
             resolution is `fail` plus a corrected decomposition.
 
-            Every 409 leaves the stage parked with NO amendment row and NO
-            audit entry.
+            Every 409 leaves the stage parked with NO amendment row and no
+            cap slot spent. None writes an audit entry except
+            `amendment_path_owned_by_sibling_slice`, which appends a
+            `scope_amendment_refused` entry (phase `scope_completeness_amend`,
+            withheld from run-bound reads).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -31925,6 +32016,19 @@ paths:
 
             `amend_resume_failed` (#2591) — the widening was recorded but the
             parked stage could not be resumed. Same retry-safe shape.
+
+            `slice_ownership_check_failed` (#4798) — the amend's slice-ownership
+            check or ancestor-delivery proof could not complete. Fail-closed:
+            the stage is left parked, no amendment row or audit entry is written
+            and `acknowledge_owner_unresolved` has no effect. `details.reason`
+            with `retryable: true` (re-POST once the read recovers):
+            `parent_plan_unreadable`, `child_dispatch_channel_unreadable`,
+            `ancestor_sibling_lookup_failed`, `ancestor_stages_unreadable`,
+            `ancestor_integration_unreadable`. With `retryable: false`:
+            `decomposition_absent` (fail and restart) and
+            `plan_store_unconfigured` (configure the artifact repository and
+            restart the deployment, or decide `fail`). `details.remedy` says
+            which; the cause reaches only the log record keyed by `error_ref`.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
