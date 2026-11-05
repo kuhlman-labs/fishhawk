@@ -626,15 +626,17 @@ Residual: the FIRST agent invocation's `FISHHAWK_API_TOKEN` is still the stage-s
 
 ## Terminal-egress retry budget ([E68.7 / #2897](https://github.com/kuhlman-labs/fishhawk/issues/2897))
 
-`runner/internal/upload` has **two** retry budgets, not one.
+`runner/internal/upload` has **three** retry budgets, not one: the blip budget,
+the terminal-egress budget and the
+[request-local push-report budget](#the-request-local-push-report-budget-adr-141--4870).
 
 **The blip budget** (`DefaultMaxRetries = 3`, `DefaultBackoff = 500ms`, uncapped
 doubling) is ~3.5s of sleep across 4 attempts. It is what every non-settling
-call uses — `FetchPrompt`, `ShipAcceptanceTranscript`, `ShipPullRequest`,
-`FetchMCPToken`, `FetchScopeAmendments`, and the single-attempt
-`ReportStageProgress`. A lost progress tick is cosmetic: the next tick
-supersedes it. `ShipAcceptanceTranscript` stays here deliberately: it is
-best-effort, and on failure the verdict ships without the transcript ref.
+call uses — `FetchPrompt`, `ShipAcceptanceTranscript`, `ShipPullRequest` for every
+outcome except the three push reports, `FetchMCPToken`, `FetchScopeAmendments`,
+and the single-attempt `ReportStageProgress`. A lost progress tick is cosmetic:
+the next tick supersedes it. `ShipAcceptanceTranscript` stays here deliberately:
+it is best-effort, and on failure the verdict ships without the transcript ref.
 
 **The terminal-egress budget** (`DefaultTerminalMaxRetries = 8`,
 `DefaultTerminalBackoff = 1s`, `DefaultTerminalBackoffCap = 15s`) is the capped
@@ -754,6 +756,58 @@ because the outage outlasts `DefaultMaxRetries+1` attempts.
 
 The operator-side half of #2897 — `scripts/dev reload` / `post-merge` refusing
 to tear the stack down while a runner is live — is in `scripts/README.md`.
+
+### The request-local push-report budget ([ADR-141](https://github.com/kuhlman-labs/fishhawk/issues/5053) / [#4870](https://github.com/kuhlman-labs/fishhawk/issues/4870))
+
+`ShipPullRequest` gives exactly three outcomes a third budget:
+`fixup_pushed`, `conflict_resolution_pushed` and `acceptance_scenarios_pushed`.
+Each writes a qualifying push row, and the backend checks the reported head
+against the forge first, answering a retryable 503 with no row when it cannot
+confirm it. A forge outage therefore needs more than the blip budget's ~3.5s.
+
+`DefaultPushReportMaxRetries = 5`, `DefaultPushReportBackoff = 1s` and
+`DefaultPushReportBackoffCap = 15s` give the series 1,2,4,8,15: **30s of sleep
+across 6 attempts**, inside a **45s** `DefaultPushReportBudget` context. The
+overrides `PushReportMaxRetries`, `PushReportBackoff`, `PushReportBackoffCap` and
+`PushReportBudget` mean "the default" when zero. Every other outcome, including
+`failed`, `pushed`, `fixup_no_changes` and the retirement-drop report, keeps the
+blip budget.
+
+**It never joins the terminal-egress phase.** `pushReportEgressContext` is a
+timeout over the caller's context, so the caller's earlier deadline or
+cancellation wins. It never reads, arms, spends or resets
+`terminalEgressDeadline`. The phase bounds one outage across the calls that settle
+a stage; a push report does not settle one, and sharing the deadline would let a
+report spend the budget of a later terminal call on the same `Client`, which would
+then be born expired. An exhausted or rejected report leaves that call its full
+budget.
+
+**What did NOT change.** Status classes: network errors and 5xx retry; 400, 401,
+404 and every other 4xx, including a 409 `reported_head_mismatch`, stop after one
+attempt. Re-posting the same signed bytes after a 503 is safe because a 503 writes
+nothing. Upload order is also unchanged:
+
+| Pass | Order today | When the report fails |
+|---|---|---|
+| Acceptance | trace (raw, redacted), verdict, then the scenario push and its report | the verdict stands, the run exits OK, and the retirement-drop report names `push_report_failed`; no trace follows |
+| Fix-up | trace (raw, redacted), then the push and its report | a `failed` category-C report follows and the run exits failed |
+| Conflict resolution | the push and its report; this pass ships no trace | no failed report and no trace: the run exits failed and the stage stays `running` until the watchdog or `fishhawk_reap_stage` recovers it ([#5052](https://github.com/kuhlman-labs/fishhawk/issues/5052)) |
+
+**The cost.** The commit is already on the branch when a report exhausts its
+retries or is refused, so it has no qualifying audit row until an operator acts.
+Nothing vouches for it automatically. The operator-facing recovery costs are in
+`backend/internal/server/docs/merge-queue.md`.
+
+**Tests** (`runner/internal/upload/upload_pullrequest_test.go`,
+`runner/cmd/fishhawk-runner/pushreport_callpath_test.go`):
+`TestShipPullRequest_ExhaustedPushReportThenShipTraceSucceeds` and
+`TestShipPullRequest_PermanentFailedPushReportThenShipTraceSucceeds` are the
+client-level isolation probes, and `TestPersistAndReport_PushReportFailedThenUploadTrace`
+composes the real call sites the same way. They prove isolation, not `run()`'s
+order. `TestRun_AcceptanceStage_PushReportFailed_ActualOrder`,
+`TestRun_Fixup_PushReportExhausted_SendsFailedC` and
+`TestRunConflictResolution_PushReportExhausted_NoTraceNoFailedReport` pin the table
+above.
 
 ## Self-hosting bootstrap deadlock ([E64.5 / #3086](https://github.com/kuhlman-labs/fishhawk/issues/3086))
 
@@ -1060,7 +1114,10 @@ recovery verdict; a push failure reports category C. An establishment refusal
 `_base_fetch_failed` / `_tree_provision_failed`, B for
 `conflict_resolution_unexpected_head` (the remote branch moved past the anchor)
 and `conflict_resolution_base_ref_unfetchable`. Neither arm may leave the stage
-in `running` — that strand is the failure this whole change removes.
+in `running` — that strand is the failure this whole change removes. A report that
+never lands is the residual: it exits failed with the stage still `running`
+([#5052](https://github.com/kuhlman-labs/fishhawk/issues/5052), see
+[the push-report budget](#the-request-local-push-report-budget-adr-141--4870)).
 
 **Push-failure residual after teardown.** The merge commit is created in the
 throwaway tree, which shares the dispatch checkout's object store, and pushed

@@ -107,6 +107,11 @@ func TestPersistAcceptanceScenarios_PushesScenarioOnlyCommit(t *testing.T) {
 	if got := tgit(t, origin, "rev-parse", "refs/heads/fishhawk/run-r1"); got != res.headSHA {
 		t.Errorf("origin run branch = %s, want %s", got, res.headSHA)
 	}
+	// The runner half of the server's first-parent contract (ADR-141 D1): the
+	// report names as its base the pushed head's first parent.
+	if got := tgit(t, origin, "rev-parse", res.headSHA+"^1"); got != res.baseSHA {
+		t.Errorf("assert: pushed head's first parent = %s, want the reported base %s", got, res.baseSHA)
+	}
 	files := strings.Split(tgit(t, origin, "diff-tree", "--no-commit-id", "--name-only", "-r", res.headSHA), "\n")
 	if len(files) != 2 {
 		t.Fatalf("commit files = %v, want the scenario + retired.yaml only", files)
