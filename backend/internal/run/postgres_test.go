@@ -14,6 +14,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
@@ -3417,12 +3418,272 @@ func TestPostgres_ScopeParkDecision_MissingStage(t *testing.T) {
 	repo := run.NewPostgresRepository(pool)
 	ctx := context.Background()
 
+	// The empty and non-empty attempts reach the not-found through different locks.
+	for _, attempt := range []struct{ name, token string }{
+		{"legacy_identity", ""},
+		{"attempt_token", "2026-11-04T00:00:00Z"},
+	} {
+		for _, verb := range scopeParkVerbs {
+			t.Run(verb.name+"/"+attempt.name, func(t *testing.T) {
+				stage, won, err := verb.decide(ctx, repo.(run.ScopeParkDecider), uuid.New(), attempt.token,
+					scopeDecisionParams(uuid.New(), uuid.New(), verb.category, []byte(`{}`)))
+				if !errors.Is(err, run.ErrNotFound) {
+					t.Fatalf("err = %v, want run.ErrNotFound", err)
+				}
+				if won || stage != nil {
+					t.Errorf("won=%v stage=%+v, want false and nil", won, stage)
+				}
+			})
+		}
+	}
+}
+
+// seedLegacyAttempt gives a parked stage the legacy attempt identity: no
+// dispatched_at, as on a row that predates the column (migration 0072).
+func seedLegacyAttempt(t *testing.T, pool *pgxpool.Pool, repo run.Repository, stageID uuid.UUID) *run.Stage {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `UPDATE stages SET dispatched_at = NULL WHERE id = $1`, stageID); err != nil {
+		t.Fatalf("clear dispatched_at: %v", err)
+	}
+	legacy, err := repo.GetStage(ctx, stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if legacy.DispatchedAt != nil {
+		t.Fatalf("fixture: dispatched_at = %v, want nil", legacy.DispatchedAt)
+	}
+	return legacy
+}
+
+// assertScopeParkUntouched reads the COMMITTED row and compares it with before. An
+// unchanged updated_at shows nothing wrote the row at all.
+func assertScopeParkUntouched(t *testing.T, repo run.Repository, before *run.Stage) {
+	t.Helper()
+	got, err := repo.GetStage(context.Background(), before.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != before.State {
+		t.Errorf("stage state = %q, want %q", got.State, before.State)
+	}
+	if gotToken, wantToken := run.StageAttemptToken(got.DispatchedAt), run.StageAttemptToken(before.DispatchedAt); gotToken != wantToken {
+		t.Errorf("attempt = %q, want %q", gotToken, wantToken)
+	}
+	if !got.UpdatedAt.Equal(before.UpdatedAt) {
+		t.Errorf("updated_at = %v, want %v: the row was written", got.UpdatedAt, before.UpdatedAt)
+	}
+	if got.FailureCategory != nil || got.EndedAt != nil {
+		t.Errorf("category=%v ended_at=%v, want neither", got.FailureCategory, got.EndedAt)
+	}
+}
+
+// TestPostgres_ScopeParkDecision_LegacyIdentityAdmitted: a stage with no
+// dispatched_at is decided with the token the handler derives from that row, and
+// both writes commit.
+func TestPostgres_ScopeParkDecision_LegacyIdentityAdmitted(t *testing.T) {
 	for _, verb := range scopeParkVerbs {
 		t.Run(verb.name, func(t *testing.T) {
-			stage, won, err := verb.decide(ctx, repo.(run.ScopeParkDecider), uuid.New(), "",
-				scopeDecisionParams(uuid.New(), uuid.New(), verb.category, []byte(`{}`)))
-			if !errors.Is(err, run.ErrNotFound) {
-				t.Fatalf("err = %v, want run.ErrNotFound", err)
+			pool := pgtest.NewPool(t)
+			repo := run.NewPostgresRepository(pool)
+			auditRepo := audit.NewPostgresRepository(pool)
+			ctx := context.Background()
+
+			r, parked := seedParkedImplementStage(t, repo, "abc")
+			legacy := seedLegacyAttempt(t, pool, repo, parked.ID)
+
+			stage, won, err := verb.decide(ctx, repo.(run.ScopeParkDecider), legacy.ID, run.StageAttemptToken(legacy.DispatchedAt),
+				scopeDecisionParams(r.ID, legacy.ID, verb.category, []byte(`{}`)))
+			if err != nil || !won {
+				t.Fatalf("won=%v err=%v, want won=true nil", won, err)
+			}
+			if stage == nil || stage.State != verb.target {
+				t.Errorf("returned stage = %+v, want %q", stage, verb.target)
+			}
+			if got := stageStateOf(t, repo, legacy.ID); got != verb.target {
+				t.Errorf("committed state = %q, want %q", got, verb.target)
+			}
+			if n := scopeEntryCount(t, auditRepo, r.ID, verb.category); n != 1 {
+				t.Errorf("%s entries = %d, want 1", verb.category, n)
+			}
+		})
+	}
+}
+
+// TestPostgres_ScopeParkDecision_AttemptIdentityDriftLoses: the expected identity
+// must equal the row's exactly, in both directions, and a decision that does not
+// match writes nothing.
+func TestPostgres_ScopeParkDecision_AttemptIdentityDriftLoses(t *testing.T) {
+	cases := []struct {
+		name string
+		// arrange returns the row to compare against and the identity to decide with.
+		arrange func(t *testing.T, pool *pgxpool.Pool, repo run.Repository, r *run.Run, parked *run.Stage) (*run.Stage, string)
+	}{
+		{"empty_identity_on_dispatched_attempt", func(_ *testing.T, _ *pgxpool.Pool, _ run.Repository, _ *run.Run, parked *run.Stage) (*run.Stage, string) {
+			return parked, ""
+		}},
+		{"attempt_token_on_legacy_row", func(t *testing.T, pool *pgxpool.Pool, repo run.Repository, _ *run.Run, parked *run.Stage) (*run.Stage, string) {
+			token := run.StageAttemptToken(parked.DispatchedAt)
+			return seedLegacyAttempt(t, pool, repo, parked.ID), token
+		}},
+		{"empty_identity_after_legacy_row_re_dispatched", func(t *testing.T, pool *pgxpool.Pool, repo run.Repository, r *run.Run, parked *run.Stage) (*run.Stage, string) {
+			ctx := context.Background()
+			legacy := seedLegacyAttempt(t, pool, repo, parked.ID)
+			if _, won, err := repo.(run.ScopeParkDecider).ExemptScopeParkAndAppend(ctx, legacy.ID, "",
+				scopeDecisionParams(r.ID, legacy.ID, scopeExemptedCategory, []byte(`{}`))); err != nil || !won {
+				t.Fatalf("legacy exempt: won=%v err=%v, want won=true nil", won, err)
+			}
+			for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+				if _, err := repo.TransitionStage(ctx, legacy.ID, to, nil); err != nil {
+					t.Fatalf("transition to %s: %v", to, err)
+				}
+			}
+			reparked := parkRunningStage(t, repo, r.ID, legacy.ID, "newer-held-commit")
+			if reparked.DispatchedAt == nil {
+				t.Fatal("fixture: re-dispatch left dispatched_at nil")
+			}
+			return reparked, ""
+		}},
+	}
+	for _, tc := range cases {
+		for _, verb := range scopeParkVerbs {
+			t.Run(tc.name+"/"+verb.name, func(t *testing.T) {
+				pool := pgtest.NewPool(t)
+				repo := run.NewPostgresRepository(pool)
+				auditRepo := audit.NewPostgresRepository(pool)
+				ctx := context.Background()
+
+				r, parked := seedParkedImplementStage(t, repo, "abc")
+				before, identity := tc.arrange(t, pool, repo, r, parked)
+				entries := scopeEntryCount(t, auditRepo, r.ID, verb.category)
+				var terminal atomic.Int32
+				repo.(run.StageTerminalObservable).SetStageTerminalObserver(func(context.Context, *run.Stage) { terminal.Add(1) })
+
+				stage, won, err := verb.decide(ctx, repo.(run.ScopeParkDecider), before.ID, identity,
+					scopeDecisionParams(r.ID, before.ID, verb.category, []byte(`{}`)))
+
+				assertScopeParkUntouched(t, repo, before)
+				if n := scopeEntryCount(t, auditRepo, r.ID, verb.category); n != entries {
+					t.Errorf("%s entries = %d, want %d: the lost decision must append nothing", verb.category, n, entries)
+				}
+				if n := terminal.Load(); n != 0 {
+					t.Errorf("terminal observer calls = %d, want 0 on a lost decision", n)
+				}
+				if err != nil {
+					t.Errorf("err = %v, want nil", err)
+				}
+				if won || stage != nil {
+					t.Errorf("won=%v stage=%+v, want false and nil", won, stage)
+				}
+			})
+		}
+	}
+}
+
+// TestPostgres_ScopeParkDecision_LegacyIdentityLockFailureRefuses: another
+// transaction holds the stage row, and the decision's context is cancelled once it
+// is waiting on that lock. That is an error, not a lost decision, and nothing is
+// written. The error text is the observable: a transaction whose lock failed cannot
+// commit, so swallowing the failure would still return some error, just not this one.
+func TestPostgres_ScopeParkDecision_LegacyIdentityLockFailureRefuses(t *testing.T) {
+	for _, verb := range scopeParkVerbs {
+		t.Run(verb.name, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			repo := run.NewPostgresRepository(pool)
+			auditRepo := audit.NewPostgresRepository(pool)
+			ctx := context.Background()
+
+			r, parked := seedParkedImplementStage(t, repo, "abc")
+			legacy := seedLegacyAttempt(t, pool, repo, parked.ID)
+			holder, err := pool.Begin(ctx)
+			if err != nil {
+				t.Fatalf("begin: %v", err)
+			}
+			defer func() { _ = holder.Rollback(ctx) }()
+			if _, err := holder.Exec(ctx, `SELECT id FROM stages WHERE id = $1 FOR UPDATE`, legacy.ID); err != nil {
+				t.Fatalf("hold row lock: %v", err)
+			}
+
+			waiting, cancel := context.WithCancel(ctx)
+			defer cancel()
+			go func() {
+				for waiting.Err() == nil {
+					var blocked int
+					err := pool.QueryRow(ctx, `SELECT count(*) FROM pg_stat_activity
+						WHERE datname = current_database() AND wait_event_type = 'Lock'`).Scan(&blocked)
+					if err == nil && blocked > 0 {
+						cancel()
+						return
+					}
+					time.Sleep(5 * time.Millisecond)
+				}
+			}()
+			stage, won, decideErr := verb.decide(waiting, repo.(run.ScopeParkDecider), legacy.ID, "",
+				scopeDecisionParams(r.ID, legacy.ID, verb.category, []byte(`{}`)))
+			if err := holder.Rollback(ctx); err != nil {
+				t.Fatalf("release row lock: %v", err)
+			}
+
+			assertScopeParkUntouched(t, repo, legacy)
+			if n := scopeEntryCount(t, auditRepo, r.ID, verb.category); n != 0 {
+				t.Errorf("%s entries = %d, want 0", verb.category, n)
+			}
+			if decideErr == nil || !strings.Contains(decideErr.Error(), "lock stage") {
+				t.Errorf("err = %v, want the lock failure", decideErr)
+			}
+			if won || stage != nil {
+				t.Errorf("won=%v stage=%+v, want false and nil", won, stage)
+			}
+		})
+	}
+}
+
+// TestPostgres_ScopeParkDecision_HelperRefusesMismatchedCompletion calls the helper
+// directly, because neither verb can pass an invalid completion. It pins the
+// defense-in-depth guard a future verb would rely on.
+func TestPostgres_ScopeParkDecision_HelperRefusesMismatchedCompletion(t *testing.T) {
+	category := run.FailureB
+	cases := []struct {
+		name       string
+		to         run.StageState
+		completion *run.StageCompletion
+	}{
+		{"failed_without_completion", run.StageStateFailed, nil},
+		{"failed_without_category", run.StageStateFailed, &run.StageCompletion{}},
+		{"pending_with_category", run.StageStatePending, &run.StageCompletion{FailureCategory: &category}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			pool := pgtest.NewPool(t)
+			repo := run.NewPostgresRepository(pool)
+			auditRepo := audit.NewPostgresRepository(pool)
+			ctx := context.Background()
+
+			var terminal atomic.Int32
+			repo.(run.StageTerminalObservable).SetStageTerminalObserver(func(context.Context, *run.Stage) { terminal.Add(1) })
+			r, parked := seedParkedImplementStage(t, repo, "abc")
+			attempt := run.StageAttemptToken(parked.DispatchedAt)
+			params := scopeDecisionParams(r.ID, parked.ID, scopeExemptedCategory, []byte(`{}`))
+
+			// A cancelled context fails any database call, so only a check made ahead
+			// of the database can return the validation error here.
+			cancelled, cancel := context.WithCancel(ctx)
+			cancel()
+			if _, _, err := run.DecideScopeParkForTest(cancelled, repo, parked.ID, attempt, tc.to, tc.completion, params); err == nil || !strings.Contains(err.Error(), "FailureCategory") {
+				t.Errorf("err on a cancelled context = %v, want the validation error ahead of the database", err)
+			}
+
+			stage, won, err := run.DecideScopeParkForTest(ctx, repo, parked.ID, attempt, tc.to, tc.completion, params)
+
+			assertScopeParkUntouched(t, repo, parked)
+			if n := scopeEntryCount(t, auditRepo, r.ID, scopeExemptedCategory); n != 0 {
+				t.Errorf("%s entries = %d, want 0", scopeExemptedCategory, n)
+			}
+			if n := terminal.Load(); n != 0 {
+				t.Errorf("terminal observer calls = %d, want 0", n)
+			}
+			if err == nil || !strings.Contains(err.Error(), "FailureCategory") {
+				t.Errorf("err = %v, want the validation error", err)
 			}
 			if won || stage != nil {
 				t.Errorf("won=%v stage=%+v, want false and nil", won, stage)

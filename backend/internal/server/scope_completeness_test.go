@@ -85,7 +85,7 @@ func (r *scopeParkDeciderRepo) decide(ctx context.Context, stageID uuid.UUID, ex
 	if st.State != run.StageStateAwaitingScopeDecision {
 		return nil, false, nil
 	}
-	if expectedAttempt != "" && run.StageAttemptToken(st.DispatchedAt) != expectedAttempt {
+	if run.StageAttemptToken(st.DispatchedAt) != expectedAttempt {
 		return nil, false, nil
 	}
 	if _, err := r.au.AppendChained(ctx, p); err != nil {

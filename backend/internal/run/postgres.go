@@ -1277,6 +1277,23 @@ func (r *postgresRepo) decideScopePark(ctx context.Context, stageID uuid.UUID, e
 	}
 	var result *Stage
 	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		// An empty expectedAttempt is the legacy identity, a stage with no
+		// dispatched_at, not a wildcard. transitionStageTx skips its comparison on
+		// empty for its other callers, so compare it here. This takes the row lock
+		// transitionStageTx then re-takes in the same transaction, so the identity
+		// cannot change before the state comparison and the audit append.
+		if expectedAttempt == "" {
+			current, err := rundb.New(tx).LockStageForUpdate(ctx, stageID)
+			if errors.Is(err, pgx.ErrNoRows) {
+				return ErrNotFound
+			}
+			if err != nil {
+				return fmt.Errorf("lock stage: %w", err)
+			}
+			if StageAttemptToken(rowToStage(current).DispatchedAt) != expectedAttempt {
+				return nil
+			}
+		}
 		parked := StageStateAwaitingScopeDecision
 		updated, err := transitionStageTx(ctx, tx, stageID, to, completion, &parked, expectedAttempt)
 		if err != nil {

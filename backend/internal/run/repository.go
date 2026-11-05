@@ -379,8 +379,9 @@ type StageCASTransitioner interface {
 // awaiting_scope_decision and StageAttemptToken of its dispatched_at must equal
 // expectedAttempt. The attempt pin stops a decision stalled through an exempt, a
 // re-dispatch and a re-park from authorizing the newer held commit, which a
-// state-only comparison would admit. An empty expectedAttempt disables the attempt
-// comparison, for a legacy row with no dispatched_at.
+// state-only comparison would admit. An empty expectedAttempt is the identity of a
+// legacy row with no dispatched_at and matches only such a row: unlike
+// TransitionStageFromAttempt's empty value, it is never a wildcard here.
 //
 // Results:
 //
