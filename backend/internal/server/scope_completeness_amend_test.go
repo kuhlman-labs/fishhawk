@@ -78,7 +78,7 @@ func newAmendFixture(t *testing.T) *amendFixture {
 
 	au := newAuditFake()
 	sa := newFakeScopeAmendmentRepo()
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, ScopeAmendmentRepo: sa})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au, ScopeAmendmentRepo: sa})
 
 	return &amendFixture{s: s, rr: rr, au: au, sa: sa,
 		child: child, stage: stage, sibling: sibling, sibImpl: sibImpl}

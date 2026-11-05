@@ -1241,6 +1241,68 @@ func (r *postgresRepo) ParkScopeCompletenessAndAppend(ctx context.Context, stage
 	return result, won, nil
 }
 
+// Compile-time assertion that the concrete postgres repo carries the
+// ScopeParkDecider capability (#2559): the scope-completeness decision handler
+// hard-requires it, so removing a verb fails the BUILD rather than refusing every
+// exempt and fail decision at runtime.
+var _ ScopeParkDecider = (*postgresRepo)(nil)
+
+// ExemptScopeParkAndAppend is ScopeParkDecider's exempt verb: it resumes the
+// parked stage to pending and appends the decision's audit entry in one
+// transaction.
+func (r *postgresRepo) ExemptScopeParkAndAppend(ctx context.Context, stageID uuid.UUID, expectedAttempt string, p audit.ChainAppendParams) (*Stage, bool, error) {
+	return r.decideScopePark(ctx, stageID, expectedAttempt, StageStatePending, nil, p)
+}
+
+// FailScopeParkAndAppend is ScopeParkDecider's fail verb: it fails the parked
+// stage category B with reason and appends the decision's audit entry in one
+// transaction.
+func (r *postgresRepo) FailScopeParkAndAppend(ctx context.Context, stageID uuid.UUID, expectedAttempt, reason string, p audit.ChainAppendParams) (*Stage, bool, error) {
+	category := FailureB
+	return r.decideScopePark(ctx, stageID, expectedAttempt, StageStateFailed,
+		&StageCompletion{FailureCategory: &category, FailureReason: &reason}, p)
+}
+
+// decideScopePark is the shared body of both ScopeParkDecider verbs. A lost
+// decision commits a no-op: the compare-and-swap refused before any write, and no
+// entry is appended. Any other error, including a failed append or a failed
+// commit, rolls back both writes and leaves the stage parked.
+//
+// Lock order is stage row then run row (audit.AppendChainedTx locks the run), as
+// in ResumeAwaitingInputAndAppend. The observer fires only after a winning commit,
+// so the fail verb keeps the behavior run.FailStage had through transitionStage.
+func (r *postgresRepo) decideScopePark(ctx context.Context, stageID uuid.UUID, expectedAttempt string, to StageState, completion *StageCompletion, p audit.ChainAppendParams) (*Stage, bool, error) {
+	if err := validateStageCompletion(to, completion); err != nil {
+		return nil, false, err
+	}
+	var result *Stage
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		parked := StageStateAwaitingScopeDecision
+		updated, err := transitionStageTx(ctx, tx, stageID, to, completion, &parked, expectedAttempt)
+		if err != nil {
+			var stateChanged StageStateChangedError
+			var attemptChanged StageAttemptChangedError
+			if errors.As(err, &stateChanged) || errors.As(err, &attemptChanged) {
+				return nil
+			}
+			return fmt.Errorf("decide scope park from %s: %w", parked, err)
+		}
+		if _, err := audit.AppendChainedTx(ctx, tx, p); err != nil {
+			return err
+		}
+		result = updated
+		return nil
+	})
+	if err != nil {
+		return nil, false, err
+	}
+	if result == nil {
+		return nil, false, nil
+	}
+	r.notifyStageTerminal(ctx, result)
+	return result, true, nil
+}
+
 // RetryStage is the explicit override out of a terminal state. The
 // failure_category, failure_reason, and ended_at fields are
 // cleared; the updated_at trigger fires on the row update so any

@@ -10765,6 +10765,50 @@ func TestPromptExemptFields_EmissionGate(t *testing.T) {
 		assertGoldenExemptProjection(t, keys, "/prompt")
 	})
 
+	// #2559: the gate refuses a stage still in awaiting_scope_decision itself. The
+	// fixture is a complete park whose newest entry is exempted, so every other arm
+	// passes and the prompt handlers serve a parked stage: only the state guard
+	// withholds the fields. An entry like this could outlive a failed transition
+	// before #2559 made the two commit together.
+	exemptInState := func(t *testing.T, state run.StageState) (*Server, uuid.UUID, uuid.UUID, ed25519.PrivateKey) {
+		t.Helper()
+		s, runID, sid, priv := exemptPromptFixture(t, exemptPark(), func(sid uuid.UUID) audit.Repository {
+			return &exemptAuditFake{entries: []*audit.Entry{
+				scopeDecisionEntry(sid, CategoryScopeCompletenessParked, 1),
+				scopeDecisionEntry(sid, CategoryScopeCompletenessExempted, 2),
+			}}
+		})
+		s.cfg.RunRepo.(*promptRunRepo).stage.State = state
+		return s, runID, sid, priv
+	}
+
+	t.Run("parked_with_newest_exempted_never_emits_on_prompt", func(t *testing.T) {
+		s, runID, sid, priv := exemptInState(t, run.StageStateAwaitingScopeDecision)
+		keys := exemptBodyKeys(t, promptRequest(t, s, runID, sid, priv, ""), "/prompt")
+		assertNoExemptKeys(t, keys, "/prompt on a stage still parked")
+	})
+
+	t.Run("parked_with_newest_exempted_never_emits_on_prompt_render", func(t *testing.T) {
+		s, _, sid, _ := exemptInState(t, run.StageStateAwaitingScopeDecision)
+		keys := exemptBodyKeys(t, promptRenderRequest(t, s, sid), "/prompt-render")
+		assertNoExemptKeys(t, keys, "/prompt-render on a stage still parked")
+	})
+
+	// The guard names the parked state alone: every state a resumed stage passes
+	// through on its way to opening the held commit's PR must still emit.
+	for _, state := range []run.StageState{
+		run.StageStatePending, run.StageStateAwaitingHostDispatch,
+		run.StageStateDispatched, run.StageStateRunning,
+	} {
+		t.Run("exempt_decided_emits_in_"+string(state), func(t *testing.T) {
+			s, runID, sid, priv := exemptInState(t, state)
+			assertGoldenExemptProjection(t,
+				exemptBodyKeys(t, promptRequest(t, s, runID, sid, priv, ""), "/prompt"), "/prompt in "+string(state))
+			assertGoldenExemptProjection(t,
+				exemptBodyKeys(t, promptRenderRequest(t, s, sid), "/prompt-render"), "/prompt-render in "+string(state))
+		})
+	}
+
 	t.Run("re_parked_after_exempt", func(t *testing.T) {
 		// The parked entry is NEWER than the exempted one → newest-wins refuses.
 		keys := exemptPromptKeys(t, exemptPark(), []*audit.Entry{
