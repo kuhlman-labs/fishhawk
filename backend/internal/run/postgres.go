@@ -16,6 +16,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	auditdb "github.com/kuhlman-labs/fishhawk/backend/internal/audit/db"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pglock"
 	rundb "github.com/kuhlman-labs/fishhawk/backend/internal/run/db"
 )
@@ -744,6 +745,117 @@ var _ StageAttemptCASTransitioner = (*postgresRepo)(nil)
 // mutates nothing. An empty expectedAttempt degrades to TransitionStageFrom.
 func (r *postgresRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to StageState, expectedAttempt string, completion *StageCompletion) (*Stage, error) {
 	return r.transitionStage(ctx, id, to, completion, &from, expectedAttempt)
+}
+
+// StageEdgeGuardRow is one audit row a StageEdgeGuard's Decide reads.
+type StageEdgeGuardRow struct {
+	Category string
+	Sequence int64
+	StageID  *uuid.UUID
+	Payload  []byte
+}
+
+// StageEdgeGuard is the evidence check TransitionStageFromAttemptGuarded runs
+// inside the edge's transaction. Decide reads every row of Categories on the
+// stage's run, after both row locks; a non-nil return refuses the edge and comes
+// back unwrapped. Decide is pure: it does no I/O and takes no lock.
+//
+// LegacyIdentity is how an unstamped stage takes the edge: an empty expected
+// attempt then matches only a row whose dispatched_at is still nil, so it is that
+// legacy row's exact identity and never a wildcard.
+type StageEdgeGuard struct {
+	Categories     []string
+	Decide         func([]StageEdgeGuardRow) error
+	LegacyIdentity bool
+}
+
+// ErrStageEdgeGuardInvalid refuses a guarded edge before any SQL: an empty
+// expected attempt without LegacyIdentity, no categories, or a nil Decide.
+var ErrStageEdgeGuardInvalid = errors.New("run: invalid stage edge guard")
+
+// GuardedStageTransitioner is an OPTIONAL capability on the concrete postgres
+// repo (ADR-140 (#5047) D8, D9): the attempt-pinned compare-and-swap with a
+// StageEdgeGuard decided in the same transaction. Kept OFF the Repository
+// interface for the same reason StageAttemptCASTransitioner is.
+type GuardedStageTransitioner interface {
+	TransitionStageFromAttemptGuarded(ctx context.Context, id uuid.UUID, from, to StageState, expectedAttempt string, completion *StageCompletion, guard StageEdgeGuard) (*Stage, error)
+}
+
+// Compile-time assertion that the concrete postgres repo carries the guarded
+// edge, so production can never fall into a consumer's capability-absent refusal.
+var _ GuardedStageTransitioner = (*postgresRepo)(nil)
+
+// lockStageForGuardedEdge is the guarded edge's first lock. See its step 1.
+const lockStageForGuardedEdge = `SELECT run_id, dispatched_at FROM stages WHERE id = $1 FOR NO KEY UPDATE`
+
+// TransitionStageFromAttemptGuarded is the atomic evidence-checked edge
+// (ADR-140 (#5047) D8, D9). Ordering is LOAD-BEARING and runs in ONE transaction
+// at the server-default READ COMMITTED:
+//
+//  1. Lock the stage row, then the run row (the documented stage -> run order).
+//     Every chained audit append takes the run row lock, so an append either
+//     committed before this lock was granted or commits after this transaction.
+//     The first stage lock is FOR NO KEY UPDATE, not LockStageForUpdate's FOR
+//     UPDATE: an append holding the run lock then takes FOR KEY SHARE on this row
+//     through audit_entries.stage_id's foreign key, so FOR UPDATE here would close
+//     a stage -> run -> stage cycle against an ordinary verdict write (40P01).
+//  2. Read each guard category on the same transaction. READ COMMITTED takes a
+//     fresh snapshot per statement, so these reads see every append committed
+//     before the lock was granted; a read above the lock would not.
+//  3. Run Decide; its error rolls back and returns unwrapped.
+//  4. Compare identity and state in transitionStageTx (its re-lock is a no-op).
+//
+// A reject committed after this commit stays outside the guarantee. The generic
+// TransitionStageFromAttempt's empty-token contract is untouched. The terminal
+// observer fires only after commit.
+func (r *postgresRepo) TransitionStageFromAttemptGuarded(ctx context.Context, id uuid.UUID, from, to StageState, expectedAttempt string, completion *StageCompletion, guard StageEdgeGuard) (*Stage, error) {
+	if (expectedAttempt == "" && !guard.LegacyIdentity) || len(guard.Categories) == 0 || guard.Decide == nil {
+		return nil, ErrStageEdgeGuardInvalid
+	}
+	if err := validateStageCompletion(to, completion); err != nil {
+		return nil, err
+	}
+	var result *Stage
+	err := pgx.BeginFunc(ctx, r.pool, func(tx pgx.Tx) error {
+		q := rundb.New(tx)
+		var current struct {
+			RunID        uuid.UUID
+			DispatchedAt *time.Time
+		}
+		err := tx.QueryRow(ctx, lockStageForGuardedEdge, id).Scan(&current.RunID, &current.DispatchedAt)
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrNotFound
+		}
+		if err != nil {
+			return fmt.Errorf("lock stage: %w", err)
+		}
+		if _, err := q.LockRunForUpdate(ctx, current.RunID); err != nil {
+			return fmt.Errorf("lock run: %w", err)
+		}
+		var guardRows []StageEdgeGuardRow
+		for _, category := range guard.Categories {
+			rows, err := auditdb.New(tx).ListAuditEntriesByCategory(ctx, auditdb.ListAuditEntriesByCategoryParams{RunID: &current.RunID, Category: category})
+			if err != nil {
+				return fmt.Errorf("read %s: %w", category, err)
+			}
+			for _, row := range rows {
+				guardRows = append(guardRows, StageEdgeGuardRow{Category: row.Category, Sequence: row.Sequence, StageID: row.StageID, Payload: row.Payload})
+			}
+		}
+		if err := guard.Decide(guardRows); err != nil {
+			return err
+		}
+		if expectedAttempt == "" && StageAttemptToken(current.DispatchedAt) != "" {
+			return StageAttemptChangedError{StageID: id, Expected: expectedAttempt, Actual: StageAttemptToken(current.DispatchedAt)}
+		}
+		result, err = transitionStageTx(ctx, tx, id, to, completion, &from, expectedAttempt)
+		return err
+	})
+	if err != nil {
+		return nil, err
+	}
+	r.notifyStageTerminal(ctx, result)
+	return result, nil
 }
 
 // transitionStage is the shared body of TransitionStage (expectedFrom

@@ -185,6 +185,28 @@ The operator's `exempt` and `fail` decisions on a scope-completeness park. Each 
 - **Terminal observer.** The fail verb fires `StageTerminalObserver` after its winning commit, keeping the behavior `FailStage` had through `transitionStage`. A lost or rolled-back decision does not fire it, and neither does the exempt verb, because `pending` is not terminal.
 - **Required capability, off `Repository`** (the `StageCASTransitioner` precedent). `var _ ScopeParkDecider = (*postgresRepo)(nil)` pins it at build time. The consumer, `server/scope_completeness.go::commitScopeParkDecision`, refuses 503 `scope_completeness_unconfigured` when a repo lacks it rather than falling back to two separate writes, which would reopen the split. The `amend` decision does not use it: `amended` is itself an invalidator at the gate, so a stale entry can only make the gate withhold.
 
+## Guarded terminal edge (`GuardedStageTransitioner`, ADR-140 / #5047)
+
+`TransitionStageFromAttemptGuarded` is the attempt-pinned compare-and-swap with an
+evidence check decided in the same transaction. It exists because a state + attempt
+CAS cannot see a recorded reject committed after the caller's last read. Declared in
+`postgres.go` and kept off `Repository`, like `StageAttemptCASTransitioner`.
+
+- **Order, in one READ COMMITTED transaction:** lock the stage row, lock the run row,
+  read every `StageEdgeGuard.Categories` row, run `Decide`, compare identity, then
+  `transitionStageTx`. Every chained audit append takes the run row lock, so an append
+  committed before the lock is seen and one still waiting commits after this edge. A
+  verdict committed after the edge's commit stays outside the guarantee.
+- **Lock mode:** the first stage lock is `FOR NO KEY UPDATE`. An append holding the run
+  lock takes `FOR KEY SHARE` on the stage through `audit_entries.stage_id`'s foreign key,
+  so `FOR UPDATE` here deadlocks against an ordinary verdict write (40P01).
+- **`Decide`** is pure (no I/O, no lock); its error rolls back and returns unwrapped.
+- **Identity:** an empty expected attempt without `LegacyIdentity`, no categories or a
+  nil `Decide` return `ErrStageEdgeGuardInvalid` before any SQL. With `LegacyIdentity`,
+  an empty attempt matches only a row whose `dispatched_at` is still nil, never as a
+  wildcard. Generic `TransitionStageFromAttempt`'s empty-token contract is unchanged.
+- **Consumer:** the server's pull-request upload edges (`backend/internal/server/docs/review.md`).
+
 ## Consolidated-PR open lock (`ConsolidatedPROpenLocker`, #4110)
 
 The cross-process half of the decomposed parent's once-only consolidated-PR open. `orchestrator.maybeOpenConsolidatedPR` runs its read-URL → create → record-artifact → stamp-URL → audit critical section inside `WithConsolidatedPROpenLock(ctx, parentRunID, fn)`, because Helm split mode puts the child-completion sweeper (worker pod) and the event-driven settle (api pods) in different processes, where the orchestrator's in-process mutex cannot serialize them. Orchestrator side: `backend/internal/orchestrator/README.md` § "Consolidated PR on settle".
@@ -502,6 +524,6 @@ Before #4186, cancelling a decomposed parent transitioned only the parent, so ev
 
 `StageTerminalObserver` / `TerminalRunObserver` are optional post-commit hooks on the postgres repo, installed through the `StageTerminalObservable` / `TerminalRunObservable` capabilities (kept off `Repository`; nil clears). fishhawkd installs `scopeamendment.InstallLapseHooks` there; the hooks fire on EVERY terminal state, and the lapse predicate (`scopeamendment.StageStateLapses` / `RunStateLapses`) then skips `failed` — a failed stage or failed run stays recoverable on `fishhawk_retry_stage`.
 
-- **Fired by:** `transitionStage` (`TransitionStage`, `TransitionStageFrom`, `TransitionStageFromAttempt` — every `FailStage`, cancel, trace-upload and fix-up recovery path), `FailScopeParkAndAppend` and `SupersedeStrandedStageOnMerge`, whenever the committed stage state is terminal; `TransitionRun` whenever the committed run state is terminal. A same-state re-application fires again, so an observer must be idempotent.
+- **Fired by:** `transitionStage` (`TransitionStage`, `TransitionStageFrom`, `TransitionStageFromAttempt` — every `FailStage`, cancel, trace-upload and fix-up recovery path), `TransitionStageFromAttemptGuarded`, `FailScopeParkAndAppend` and `SupersedeStrandedStageOnMerge`, whenever the committed stage state is terminal; `TransitionRun` whenever the committed run state is terminal. A same-state re-application fires again, so an observer must be idempotent.
 - **Not fired by:** the transaction-scoped `TransitionStageFromTx` / `TransitionStageFromLiveRunTx` (their only caller, `concurrency.Admit`, moves to dispatched), `RetryStage`, `RetryRun`, `ReviveRunOnReopen` (they leave a terminal state), or a refused transition.
 - **Contract:** runs AFTER the transaction commits, synchronously on the caller's goroutine, best-effort — it returns nothing, so it can never fail or roll back the transition. It takes its own locks in its own transaction, so a caller must not invoke a transition while holding a run-row lock in an open transaction on another connection.
