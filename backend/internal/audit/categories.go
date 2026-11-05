@@ -634,6 +634,7 @@ var KnownCategories = map[string]struct{}{
 	"refinement_filing_completed":             {},
 	"release_cut":                             {},
 	"release_published":                       {},
+	"review_obligation_checkpoint":            {}, // ADR-140 (#5047) D9: a known-required held-commit report, stored apart from its checkpoint-less pull_request_failed sibling so a reverted backend re-runs the agent (server/review_recovery.go) — INTERNAL resolver hint, not an issue-comment surface; intended run-bound READABLE with a same-run-only payload, and takes the mandatory flag when #4599 lands. This comment and its allow-list test (TestRecoveryCategories_RegisteredAndRunBoundReadable) are INTERIM, not ADR-106 registry option B
 	"review_head_mismatch":                    {}, // #3655: reviewed tree != pushed tree on a success ship (server/pullrequest.go)
 	"review_round_redispatched":               {}, // #4077: boot re-dispatch of a restart-orphaned advisory review round (server/review_redispatch.go)
 	"review_round_rerun_requested":            {}, // #4219: operator re-run of a verdict-less implement-review round (server/review_rerun.go)
@@ -674,6 +675,7 @@ var KnownCategories = map[string]struct{}{
 	"slice_integration_conflict":              {},
 	"slice_integration_failed":                {},
 	"slices_integrated":                       {},
+	"supplemental_review_started":             {}, // ADR-140 (#5047) D9: a gating supplemental pass's atomic start, written before any reviewer runs (server/review_recovery.go) — INTERNAL resolver hint, not an issue-comment surface; intended run-bound READABLE with a same-run-only payload, and takes the mandatory flag when #4599 lands. This comment and its allow-list test (TestRecoveryCategories_RegisteredAndRunBoundReadable) are INTERIM, not ADR-106 registry option B
 	"split_children_filed":                    {},
 	"split_filing_refused":                    {},
 	"split_parent_closed":                     {},
