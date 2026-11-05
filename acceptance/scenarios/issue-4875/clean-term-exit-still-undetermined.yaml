@@ -1,0 +1,14 @@
+id: scenario:issue-4875/clean-term-exit-still-undetermined
+statement: A `claude` that prints the shim name, catches TERM and exits 0 after the bound expires still reports `undetermined`, never registered.
+verify_hint: 'CLI stdout: in library mode with that stub first on PATH and the bound constants set to 1, `$(_detect_shim_registered)` prints `undetermined`.'
+steps: Library mode with the ps stand-in and a `claude` stub that prints fishhawk-mcp-shim, traps TERM to log and exit 0, and waits on a background sleep. Set _MCP_REGISTRATION_PROBE_TIMEOUT=1 and _MCP_REGISTRATION_PROBE_GRACE=1, then run x="$(_detect_shim_registered 2>&1)".
+assertions:
+    expected: undetermined, never registered.
+    observed_at_record: state=undetermined in 2.08s; the stub log shows got-term, so TERM was delivered, and the stub is dead.
+    repro_handle: /tmp/acc4875/ct.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

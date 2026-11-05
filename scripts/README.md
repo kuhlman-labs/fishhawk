@@ -1809,15 +1809,15 @@ non-tty/self-protection/confirmed-sweep `cmd_sweep` paths.
 Because `--all` always rebuilds `fishhawk-mcp`, the closing MCP banner is
 **decoupled from the rebuild action** and selected by `_select_mcp_banner` from
 four inputs — the schema-major signal, the shim-rebuild signal, the mcp-source
-signal, and whether the shim is registered — into exactly one kind, in fixed
-precedence:
+signal, and the shim registration state (`0`, `1` or `undetermined`, #4875) —
+into exactly one kind, in fixed precedence:
 
 1. **schema-major** — unconditional (#1422). Its BODY TEXT is registration-aware
-   since #2349: with the shim NOT registered, or registered but itself rebuilt
-   this run, it keeps the stern `ACTION REQUIRED` reconnect wording; with the
-   shim registered and not itself rebuilt it selects the sibling
-   `schema_major_shim` kind, same precedence slot (see "Schema-major banner"
-   below).
+   since #2349: with the shim NOT registered, with its registration undetermined,
+   or registered but itself rebuilt this run, it keeps the stern `ACTION REQUIRED`
+   reconnect wording; with the shim registered and not itself rebuilt it selects
+   the sibling `schema_major_shim` kind, same precedence slot (see "Schema-major
+   banner" below).
 2. **shim-rebuilt** — a distinct banner: a change to `fishhawk-mcp-shim` itself
    still needs one manual `/mcp`, since the shim swaps its child not itself.
 3. **reconnect** — the mcp source changed and the shim is NOT registered: the
@@ -1826,7 +1826,13 @@ precedence:
    note that the registered `fishhawk-mcp-shim` hot-swaps the rebuilt child
    automatically, verifiable via a version-returning tool call reflecting the
    new GitSHA.
-5. **none**.
+5. **undetermined** — the mcp source changed and registration could not be read:
+   a `VERIFY` banner that says so, names the GitSHA check that confirms a swap,
+   and names `bin/fishhawk-mcp-shim --status` then `/mcp` as the refutation path.
+6. **none**.
+
+Only MCP-only uncertainty gets the `undetermined` kind: a schema-major bump stays
+stern and a rebuilt shim stays `shim-rebuilt`, whatever the registration state.
 
 The mcp-source and shim signals are each keyed to whether the pull's merge-aware
 diff (`HEAD@{1}..HEAD`) touched that binary's matrix globs (mcp:
@@ -1836,11 +1842,100 @@ diff (`HEAD@{1}..HEAD`) touched that binary's matrix globs (mcp:
 binary, so it selects `none` rather than a spurious ACTION REQUIRED (#2403). So
 `reload` never false-nags when the merge missed both; fresh-clone / no-reflog /
 detached-HEAD (unresolvable `HEAD@{1}`) fires conservatively — never a
-false-negative silent-stale binary. Registration is detected via the
-`FISHHAWK_MCP_SHIM_REGISTERED` `.env` override winning over a best-effort
-`claude mcp get fishhawk` probe, degrading to not-registered (manual banner
-survives) when the `claude` CLI is absent or errors. Plain `up` (branch-diff,
-not `--all`) keys each signal off whether that binary was rebuilt.
+false-negative silent-stale binary. Plain `up` (branch-diff, not `--all`) keys
+each signal off whether that binary was rebuilt.
+
+Registration is detected via the `FISHHAWK_MCP_SHIM_REGISTERED` `.env` override
+winning over a bounded `claude mcp get fishhawk` probe:
+
+| Input | State |
+|---|---|
+| override `1` / `true` | `1`, no probe |
+| override `0` / `false` | `0`, no probe |
+| any other non-empty override | `0`, no probe |
+| `claude` not on `PATH` | `0` (manual banner survives) |
+| probe exit 0, text contains `fishhawk-mcp-shim` | `1` |
+| probe exit 0, other text | `0` |
+| probe exit 0, empty text | `undetermined` |
+| probe exit 1-123 (the CLI ran and answered no) | `0` |
+| probe exit >= 124 (expired, could not start, launch failure, killed) | `undetermined`, the text is ignored |
+
+#### Bounded registration probe (#4875)
+
+An unbounded `claude mcp get fishhawk` used to run after `cmd_down`, so a hung CLI
+left `reload` waiting forever with the backend already down. `cmd_reload` now probes
+before its guards and its teardown, and hands a normalized state to `cmd_up` through
+the unexported `_SHIM_REGISTERED_PRECOMPUTED` carrier, so a reload never probes after
+the teardown. `cmd_up` reads and clears the carrier before its own `.env` load, and
+uses only `0`, `1` or `undetermined`; anything else re-probes, so plain `up` still
+probes, now bounded. `cmd_post_merge` inherits this through `cmd_reload`.
+
+**Runner contract.** `_run_bounded_capture <secs> <grace> <cmd> [args...]`, always
+inside `$( )`, prints the command's stdout only if it finished in time and returns:
+
+| Return | Meaning |
+|---|---|
+| the command's status | a `rc=<digits>` line arrived on the status pipe in time |
+| 124 | expired, or the status pipe gave EOF or an unexpected line; no output |
+| 125 | the output file could not be created; the command never ran |
+| 143 / 130 / 129 | TERM / INT / HUP reached the capture shell, after the same sweep |
+
+The capture shell is the timer: it blocks in `read -t` on a coprocess pipe that a
+small wrapper uses to report the command's status. No sleeper exists, so the normal
+path sends no signal and its latency is the command's own. Expiry is authoritative,
+because the status line is the only way to finish: a CLI that prints shim text and
+exits 0 on TERM is still expired. On expiry the shell sends TERM, sleeps the grace,
+sends KILL, and returns without waiting on the wrapper or the command. Worst case is
+`secs + grace` (5s + 2s, constants set at file scope so the environment cannot change
+them) plus two `ps` reads, and that holds even for a process that cannot be killed.
+The command's stdin is `/dev/null`, its stderr is discarded and its stdout goes to a
+private 0600 file removed in an `always` block; probe text is never printed or logged.
+
+It is separate from `_run_with_timeout`, which only sends TERM and then waits on the
+command, so a TERM-ignoring or unkillable `claude` would still hang the reload.
+
+**Dependencies and fallbacks.** Identity comes from one `ps -A -o pid= -o ppid= -o
+lstart=` table per signal round, and `$sysparams[pid]` from `zsh/system`. `pgrep` is
+not used. A recorded pid must still have its recorded start time, a root must be this
+shell's direct child, and a new pid must be a child of a verified survivor. A failed
+or empty table read, or a missing `zsh/system`, signals nothing: the call stays
+bounded and undetermined, and a hung CLI stays running with no caller fd. `lstart` is
+not POSIX but is in macOS ps(1) and procps-ng ps(1); BusyBox `ps` lacks it (not
+measured), which lands in that same fallback.
+
+**Evidence, macOS (Darwin 27.0.0, zsh 5.9) and the Linux gate image (zsh 5.9,
+procps-ng 4.0.2).** `setopt monitor` fails with no tty, so a background child keeps
+the script's process group, and `kill -0 -- -<child>` fails: no isolated group exists,
+and signalling the inherited one would hit the reload itself. The runner therefore
+signals pids only, never a group. `read -t` on the coprocess pipe returned at once on
+a status line, at the bound on a timeout, and at wrapper EOF, and a deferred trap
+interrupted it promptly for TERM, INT and HUP.
+
+**Residuals, stated not hidden.**
+
+- Milliseconds pass between the table read and `kill`. `lstart` has 1s resolution, so
+  a recycle within the same second would match, which needs a full PID wrap inside
+  that second.
+- A descendant that re-parents before the first table read, such as a double-forked
+  daemon, escapes the sweep. It holds only the unlinked output file, no caller fd,
+  and is deliberately not chased.
+- A signal landing in the instant before `read` starts can delay handling up to the
+  bound, which is still bounded and still cleans up.
+- The production caller's `if` switches errexit off inside its substitution. Every
+  fallible runner statement is still tested, so an untested caller gets the same
+  statuses, but there a shell error mid-sweep is an errexit `exit`, which skips the
+  `always` block and leaves the 0600 temp file.
+- SIGKILL to the capture shell cannot be handled, and leaves the 0600 temp file and
+  the wrapper tree. SIGTERM to the top-level reload alone kills only that shell,
+  before the teardown; the capture subshell finishes on its own bound and cleans up.
+- A refused reload now spends up to about 7s (normally about 1.6s) on the read-only
+  probe. That is the cost of a slow probe never widening the window between the final
+  guard scan and the teardown.
+- A future CLI using another 1-123 status for a transient failure would read as not
+  registered: the same fail-safe manual banner as before.
+- `cmd_up`'s own unguarded `source .env` still aborts on a malformed `.env`, after the
+  teardown, which is separate from the probe (#5046). `FISHHAWK_MCP_SHIM_REGISTERED=1`
+  in `.env` skips the probe.
 
 This supersedes the older "MCP server stale after rebuild" gotcha: once the shim
 is registered (a one-time re-registration — re-point the harness's `fishhawk`
@@ -2024,7 +2119,11 @@ id could not be read reads `pid <pid> (run id unreadable)`.
 - `cmd_reload` parses its own args for `--force` and **STRIPS** that token from
   what it forwards to `cmd_up` (which scans only for `--all` / `--start-deps` and
   has no meaning for `--force`), then calls the guard **before `cmd_down`** — so
-  the refusal is structurally ahead of the stop.
+  the refusal is structurally ahead of the stop. Its full order is the
+  `--when-quiet` wait when requested, the bounded registration probe (#4875), a
+  fresh live-run guard, a fresh restart-blocker guard, then the teardown. The probe
+  runs first so a slow one cannot widen the window between the final scan and the
+  teardown.
 - `cmd_post_merge` calls the guard at its **very top**, before `git checkout main`
   / `git pull --ff-only` / `scripts/cleanup-merged`, so a refusal never leaves
   local git state half-advanced. It does NOT strip `--force`: it forwards it to
@@ -2038,8 +2137,10 @@ id could not be read reads `pid <pid> (run id unreadable)`.
 ### Residuals, stated not hidden
 
 - **TOCTOU.** A runner that starts between the scan and the teardown is not
-  caught. `cmd_post_merge`'s second check via `cmd_reload` narrows the window to
-  roughly the git pull, but does not eliminate it. Eliminating it needs a lock the
+  caught. `cmd_reload` scans after its bounded registration probe, so the probe adds
+  nothing to that window (#4875). `cmd_post_merge`'s second check via `cmd_reload`
+  narrows the window to roughly the git pull, but does not eliminate it. Eliminating
+  it needs a lock the
   runner participates in, out of proportion to the hazard: the guard turns a
   silent collision into a rare one.
 - **Fail-OPEN on a scan degrade.** No `ps`, or a non-zero `ps`, prints a one-line
@@ -2136,7 +2237,8 @@ the already-loaded old `scripts/dev`.
 ### Wiring, scope and residuals
 
 - Called as `if ! _refuse_on_restart_blockers …` (a TESTED context, #631) in
-  `cmd_reload` right after the live-run guard and **before `cmd_down`**, and in
+  `cmd_reload` right after the live-run guard, which itself follows the bounded
+  registration probe (#4875), and **before `cmd_down`**, and in
   `cmd_post_merge` right after the live-run guard and **before `git checkout
   main`**. `post-merge` forwards `--force` to `cmd_reload`, which re-asks after
   the pull.
@@ -2148,8 +2250,8 @@ the already-loaded old `scripts/dev`.
 - **TOCTOU.** A blocker that appears between the check and the teardown is not
   caught — the same class as #2897. `post-merge`'s second check inside
   `cmd_reload` runs AFTER the pull, so a refusal there leaves main pulled.
-  `--when-quiet` narrows the window (the guards re-check right after the wait)
-  but does not close it.
+  `--when-quiet` narrows the window (the order is the wait, the bounded registration
+  probe, then both guards fresh, then the teardown) but does not close it.
 
 ### `reload --when-quiet` (#4077)
 
@@ -2166,8 +2268,9 @@ live poll; a quiet first poll prints nothing.
 | `FISHHAWK_RELOAD_QUIET_INTERVAL` | `15` | seconds between polls (the last sleep is clipped to the remaining budget) |
 | `FISHHAWK_RELOAD_QUIET_TIMEOUT` | `3600` | seconds of waiting before giving up |
 
-- **Quiet** → falls through to the normal live-run and restart-blocker guards
-  (a cheap re-check), then the teardown.
+- **Quiet** → falls through to the bounded registration probe (#4875), then the
+  normal live-run and restart-blocker guards (a cheap fresh re-check, after the
+  probe so the probe cannot widen the window), then the teardown.
 - **Timeout** → `error: reload --when-quiet gave up after <N>s … still live:
   <what>`, exit 1, no teardown.
 - **Degrades count as quiet**: `ps` or curl unavailable, daemon unreachable, a
@@ -2208,6 +2311,19 @@ quiet, WQ-e/f are the exit-2 usage errors with no scan and no teardown, and
 WQ-g shows a plain reload never reads the knobs. The existing LR and GC
 harnesses stub `_refuse_on_restart_blockers` so they never query the host
 daemon.
+
+The delimited #4875 section holds the bounded-probe rows, with PATH fully replaced so
+the real `claude` can never run, and only synthetic `.env` files under a temp
+`REPO_ROOT`. The `PURE-*` rows pin the classifier, all 24 `_select_mcp_banner`
+combinations, the banner bodies, `_normalize_shim_state` and the file-scope bounds.
+The `SRP-*` rows drive the real runner in a real `$( )`, one per failure mode:
+TERM-ignoring trees, exit 0 on TERM, launch failures, unusable `ps` tables, recycled
+identities, signals, and the real `TRAPZERR` under errexit (SRP-z). The `RLP-*` rows
+drive the real `cmd_reload`: the order against a shared marker file, `.env` handling,
+refusals with no teardown (RLP-g, RLP-h) and, through real `cmd_up`, the banner and a
+probe count of exactly one (RLP-i to RLP-l). HERM-a records that the LR, RB and WQ
+harnesses reach `cmd_reload` at their temp `REPO_ROOT` and never call a logging
+`claude` on PATH.
 
 ## Go build-cache bound (E83.20 / [#3901](https://github.com/kuhlman-labs/fishhawk/issues/3901))
 

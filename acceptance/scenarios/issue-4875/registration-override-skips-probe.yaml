@@ -1,0 +1,14 @@
+id: scenario:issue-4875/registration-override-skips-probe
+statement: A `FISHHAWK_MCP_SHIM_REGISTERED` value set in the environment or only in `.env` is honoured during reload without running `claude`, so the existing workaround keeps working.
+verify_hint: 'CLI stdout: in library mode with a logging hanging `claude` stub and FISHHAWK_MCP_SHIM_REGISTERED=1 set, `$(_detect_shim_registered)` prints 1 at once and the stub''s log stays empty; repeat through `_detect_shim_registered_with_env` with the value only in a synthetic `.env` under a temp REPO_ROOT.'
+steps: Library mode with a logging hanging `claude` stub. Run $(_detect_shim_registered) with FISHHAWK_MCP_SHIM_REGISTERED=1 in the environment. Then with the variable unset and only a synthetic .env under a temp REPO_ROOT (values 1, 0, true, false), run $(_detect_shim_registered_with_env). Then run cmd_reload with stubbed guards, down and up against the .env-only value 1.
+assertions:
+    expected: Override honoured with no claude run.
+    observed_at_record: env gives 1; .env gives 1, 0, 1, 0, each in about 0.02s with no leak into the parent shell. cmd_reload's up sees precomputed=1. The stub log stayed 0 bytes throughout.
+    repro_handle: /tmp/acc4875/a.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

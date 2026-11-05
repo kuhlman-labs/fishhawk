@@ -1,0 +1,14 @@
+id: scenario:issue-4875/hanging-probe-reports-undetermined
+statement: With a never-returning, TERM-ignoring `claude` first on PATH and no registration override, the registration detection in scripts/dev prints `undetermined` on stdout and returns within 10 seconds.
+verify_hint: 'CLI stdout and elapsed time: in a scratch zsh, source scripts/dev with DEV_LIB_ONLY=1, unset FISHHAWK_MCP_SHIM_REGISTERED, put a stub `claude` that ignores TERM and sleeps first on a PATH of `<stubdir>:/usr/bin:/bin`, run `_detect_shim_registered` inside a command substitution and read its stdout.'
+steps: Scratch zsh with env -i and PATH=<stubdir>:<ps stand-in dir>:/usr/bin:/bin; a TERM/INT/HUP-ignoring looping `claude` stub first on PATH. DEV_LIB_ONLY=1, source the sanctioned checkout's scripts/dev, unset FISHHAWK_MCP_SHIM_REGISTERED, run x="$(_detect_shim_registered)" and time it at the default constants. Also run once without the ps stand-in.
+assertions:
+    expected: undetermined within 10s.
+    observed_at_record: state=undetermined at 7.11s with the stand-in (stub dead, TMPDIR empty). At 7.04s without it, with state undetermined but the stub surviving because the sandbox denies /bin/ps.
+    repro_handle: /tmp/acc4875/a.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

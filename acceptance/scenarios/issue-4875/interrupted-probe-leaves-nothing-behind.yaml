@@ -1,0 +1,14 @@
+id: scenario:issue-4875/interrupted-probe-leaves-nothing-behind
+statement: TERM or INT delivered to the bounded capture during a hanging probe ends it with the signal's exit code, leaves the stub dead, and leaves no probe temp file.
+verify_hint: 'CLI exit code and a directory listing: in library mode with a private TMPDIR and a hanging stub that records its parent, read the capture shell''s pid with `ps -o ppid=` on that parent, signal it, then check the exit code, `kill -0` on the stub, and that TMPDIR is empty.'
+steps: Library mode with a private TMPDIR, the ps stand-in, and a hanging stub recording its pid and parent. Run if x="$(_run_bounded_capture 30 1 claude mcp get fishhawk)" in the background. Read the capture shell with ps -o ppid= on the stub's parent (via the stand-in), send it TERM, INT or HUP, then check rc, kill -0 and TMPDIR. One fresh run per signal.
+assertions:
+    expected: Signal exit code, stub dead, no temp file.
+    observed_at_record: TERM rc=143, INT rc=130, HUP rc=129, each in about 1.1s. Stub, wrapper and capture shell are dead. TMPDIR held 1 file before and 0 after.
+    repro_handle: /tmp/acc4875/a.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

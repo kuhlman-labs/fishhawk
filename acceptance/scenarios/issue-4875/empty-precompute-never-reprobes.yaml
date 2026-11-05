@@ -1,0 +1,14 @@
+id: scenario:issue-4875/empty-precompute-never-reprobes
+statement: A registration precompute that fails or comes back empty is carried as `undetermined`, so the up step does not run the probe again after teardown.
+verify_hint: 'CLI stdout and a log file: in library mode with a temp REPO_ROOT whose synthetic `.env` contains `exit 3`, a logging `claude` stub and stubbed teardown, run `cmd_reload`; the stubbed `cmd_up` sees `undetermined` and the stub log stays empty.'
+steps: Library mode with a temp REPO_ROOT whose .env contains 'exit 3', a logging `claude` stub, and stubbed guards, cmd_down and cmd_up. Run cmd_reload. Read the up entry and the stub log.
+assertions:
+    expected: up sees undetermined; stub log empty.
+    observed_at_record: exit 0, up[--all] precomputed=undetermined, and stub log 0 bytes.
+    repro_handle: /tmp/acc4875/crit2.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z
