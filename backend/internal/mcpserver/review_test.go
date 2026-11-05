@@ -3252,6 +3252,586 @@ func appendE2EAudit(t *testing.T, repo audit.Repository, runID uuid.UUID, stageI
 	}
 }
 
+// --- #4865: re-open floor above the latest started row ---
+
+// seedReviewStartedAuditAtForStage is seedReviewStartedAuditAt with the entry's
+// stage_id STAMPED too: the strand probe compares the round's dispatch TIMESTAMP
+// to the daemon's boot, while the #3690 retry floor is scoped to its stage_id,
+// so the fixtures below need both on one row.
+func seedReviewStartedAuditAtForStage(fb *fakeBackend, runID uuid.UUID, category string, configuredAgents int, authority string, ts time.Time, stageID string) {
+	payload, _ := json.Marshal(map[string]any{
+		"configured_agents": configuredAgents,
+		"authority":         authority,
+	})
+	var decoded any
+	_ = json.Unmarshal(payload, &decoded)
+	var sid *string
+	if stageID != "" {
+		sid = &stageID
+	}
+	fb.mu.Lock()
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:        uuid.New().String(),
+		Sequence:  int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:     runID.String(),
+		StageID:   sid,
+		Timestamp: ts,
+		Category:  category,
+		Payload:   decoded,
+	})
+	fb.mu.Unlock()
+}
+
+// appendAuditEntryLocked appends one entry from INSIDE the fake's reviewFlip
+// hook, which already holds fb.mu: the seed* helpers take the same lock, so
+// calling one from the hook would deadlock. The caller must hold fb.mu.
+func appendAuditEntryLocked(fb *fakeBackend, runID uuid.UUID, category string, payload any, ts time.Time) {
+	raw, _ := json.Marshal(payload)
+	var decoded any
+	_ = json.Unmarshal(raw, &decoded)
+	fb.perRunAuditByRun[runID] = append(fb.perRunAuditByRun[runID], AuditEntry{
+		ID:        uuid.New().String(),
+		Sequence:  int64(len(fb.perRunAuditByRun[runID]) + 1),
+		RunID:     runID.String(),
+		Timestamp: ts,
+		Category:  category,
+		Payload:   decoded,
+	})
+}
+
+// awaitReviewUntilNthStartedQuery drives awaitReview into its poll loop and
+// cancels the wait on the nth *_review_started read, so the call ends through
+// the pending-timeout path (the cancelled poll context) without burning a real
+// wall-clock timeout. The boundary is re-probed on every tick.
+func awaitReviewUntilNthStartedQuery(t *testing.T, r *runResolver, fb *fakeBackend, runID uuid.UUID, stage, startedCategory string, n int64) AwaitReviewOutput {
+	t.Helper()
+	r.reviewPollInterval = 100 * time.Microsecond
+	r.strandProbeTTL = time.Nanosecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category == startedCategory && startedQueries.Add(1) >= n {
+			cancel()
+		}
+	}
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{RunID: runID.String(), Stage: stage, TimeoutSeconds: 600})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	return out
+}
+
+// TestAwaitReview_FloorAboveLatestStarted_PendingNotStranded is the #4865
+// done-means at the await surface: a stage re-opened by a plan revise, a live
+// fix-up, or a counting retry — with the dispatching daemon since restarted and
+// NO new *_review_started row yet — reads PENDING with a "no new round" message,
+// never 'stranded' and never an Undecidable verdict that advises reconcile.
+//
+// Every arm seeds the superseded round pre-boot with ALL of its verdicts below
+// the floor, so absent the floor branch the strand derivation pairs a pre-boot
+// started row with zero floored terminals below the configured count — exactly
+// the strand condition — and the await resolves 'stranded'. The 503 arm is the
+// ordering control: with /healthz unreadable that same missing branch (or one
+// placed after the boundary check) returns Undecidable with the reconcile advice.
+func TestAwaitReview_FloorAboveLatestStarted_PendingNotStranded(t *testing.T) {
+	implStageID := uuid.New().String()
+	planStageID := uuid.New().String()
+	cases := []struct {
+		name         string
+		stage        string
+		startedCat   string
+		healthz503   bool
+		seedOldRound func(fb *fakeBackend, runID uuid.UUID)
+		seedFloor    func(fb *fakeBackend, runID uuid.UUID)
+	}{
+		{
+			name: "plan_revised", stage: "plan", startedCat: "plan_review_started",
+			seedOldRound: func(fb *fakeBackend, runID uuid.UUID) { seedOldPlanRound(fb, runID, "") },
+			seedFloor:    func(fb *fakeBackend, runID uuid.UUID) { seedRunPlanRevisedAudit(fb, runID) },
+		},
+		{
+			name: "stage_fixup_triggered", stage: "implement", startedCat: "implement_review_started",
+			seedOldRound: func(fb *fakeBackend, runID uuid.UUID) { seedOldImplementRound(fb, runID, "") },
+			seedFloor:    func(fb *fakeBackend, runID uuid.UUID) { seedRunFixupTriggeredAudit(fb, runID) },
+		},
+		{
+			name: "implement stage_retried", stage: "implement", startedCat: "implement_review_started",
+			seedOldRound: func(fb *fakeBackend, runID uuid.UUID) { seedOldImplementRound(fb, runID, implStageID) },
+			seedFloor: func(fb *fakeBackend, runID uuid.UUID) {
+				seedStageRetriedAudit(fb, runID, categoryStageRetried, implStageID, "A")
+			},
+		},
+		{
+			name: "plan stage_retried", stage: "plan", startedCat: "plan_review_started",
+			seedOldRound: func(fb *fakeBackend, runID uuid.UUID) { seedOldPlanRound(fb, runID, planStageID) },
+			seedFloor: func(fb *fakeBackend, runID uuid.UUID) {
+				seedStageRetriedAudit(fb, runID, categoryStageRetried, planStageID, "A")
+			},
+		},
+		{
+			name: "plan_revised with unreadable healthz", stage: "plan", startedCat: "plan_review_started",
+			healthz503:   true,
+			seedOldRound: func(fb *fakeBackend, runID uuid.UUID) { seedOldPlanRound(fb, runID, "") },
+			seedFloor:    func(fb *fakeBackend, runID uuid.UUID) { seedRunPlanRevisedAudit(fb, runID) },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			if tc.healthz503 {
+				fb.healthzStatus = http.StatusServiceUnavailable
+			} else {
+				// The daemon serving now booted AFTER the old round was dispatched:
+				// the restart that makes the superseded round look orphaned.
+				fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+			}
+			tc.seedOldRound(fb, runID)
+			tc.seedFloor(fb, runID) // the re-open row; NO new *_review_started follows it
+			r := newResolver(srv, nil)
+
+			out := awaitReviewUntilNthStartedQuery(t, r, fb, runID, tc.stage, tc.startedCat, 4)
+			if out.Status != "pending" {
+				t.Fatalf("Status = %q, want pending (message %q)", out.Status, out.Message)
+			}
+			if out.Stranded {
+				t.Error("Stranded = true for a re-opened stage with no new round")
+			}
+			if out.Undecidable {
+				t.Errorf("Undecidable = true; a re-open window is a positive verdict, not an unreadable one: %q", out.Message)
+			}
+			if out.ConfiguredAgents != 0 || out.LandedTerminal != 0 {
+				t.Errorf("landed/configured = %d/%d, want 0/0 (the superseded round must not be reported)",
+					out.LandedTerminal, out.ConfiguredAgents)
+			}
+			if !strings.Contains(out.Message, "no new round") {
+				t.Errorf("message does not say no new round has started: %q", out.Message)
+			}
+			if strings.Contains(out.Message, "fishhawk_reconcile_reviews") {
+				t.Errorf("message prescribes reconcile for a round that does not exist: %q", out.Message)
+			}
+		})
+	}
+}
+
+// seedOldPlanRound / seedOldImplementRound seed a SUPERSEDED, fully landed
+// 3-reviewer round dispatched before the simulated restart (strandBootB).
+func seedOldPlanRound(fb *fakeBackend, runID uuid.UUID, stageID string) {
+	seedReviewStartedAuditAtForStage(fb, runID, "plan_review_started", 3, "advisory", strandDispatch, stageID)
+	for i := 0; i < 3; i++ {
+		seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	}
+}
+
+func seedOldImplementRound(fb *fakeBackend, runID uuid.UUID, stageID string) {
+	seedReviewStartedAuditAtForStage(fb, runID, "implement_review_started", 3, "advisory", strandDispatch, stageID)
+	for i := 0; i < 3; i++ {
+		seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	}
+}
+
+// TestAwaitReview_ReviseAcrossRestart_PendingThenComplete is the issue's named
+// scenario on the fake backend: a fully landed pre-boot round, a plan_revised,
+// then (on later polls) the new round's started row and its three verdicts. One
+// call must poll through BOTH pending phases and end 'complete' carrying only
+// the new round's verdicts. Without the floor branch the first round-trip
+// resolves 'stranded' and the call never reaches complete.
+func TestAwaitReview_ReviseAcrossRestart_PendingThenComplete(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+	seedOldPlanRound(fb, runID, "")
+	seedRunPlanRevisedAudit(fb, runID)
+
+	var startedQueries atomic.Int64
+	fb.reviewFlip = func(category string) {
+		if category != "plan_review_started" {
+			return
+		}
+		// The hook runs under fb.mu: append directly, never via seed*.
+		switch startedQueries.Add(1) {
+		case 3: // phase 2: the new round is dispatched AFTER the restart
+			appendAuditEntryLocked(fb, runID, "plan_review_started",
+				map[string]any{"configured_agents": 3, "authority": "advisory"}, strandBootB.Add(time.Minute))
+		case 5: // phase 3: the new round's three verdicts land
+			for _, v := range []string{"approve", "approve_with_concerns", "approve"} {
+				appendAuditEntryLocked(fb, runID, "plan_reviewed",
+					PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: v}, strandBootB.Add(2*time.Minute))
+			}
+		}
+	}
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 100 * time.Microsecond
+	r.strandProbeTTL = time.Nanosecond
+
+	// Bounded, so a regression fails fast rather than waiting out 600s.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID: runID.String(), Stage: "plan", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "complete" {
+		t.Fatalf("Status = %q, want complete (message %q)", out.Status, out.Message)
+	}
+	if len(out.Reviews) != 3 {
+		t.Fatalf("Reviews = %+v, want exactly the 3 new-round verdicts", out.Reviews)
+	}
+	got := map[string]int{}
+	for _, rv := range out.Reviews {
+		got[rv.Verdict]++
+	}
+	if got["approve"] != 2 || got["approve_with_concerns"] != 1 || got["reject"] != 0 {
+		t.Errorf("verdict counts = %v, want approve x2 + approve_with_concerns x1 and none of the superseded rejects", got)
+	}
+	if n := startedQueries.Load(); n < 5 {
+		t.Errorf("started queries = %d, want >= 5: the wait must poll through both pending phases in ONE call", n)
+	}
+}
+
+// TestAwaitReview_ReviseAcrossRestart_EndToEnd is the cross-boundary control for
+// #4865: the REAL MCP api client over HTTP to the REAL server.Handler(), over
+// REAL persisted Postgres audit rows, so real chained sequences and the real
+// category filter decide the floor comparison. It would fail if real audit
+// sequencing put a new round's started row at or below its plan_revised.
+func TestAwaitReview_ReviseAcrossRestart_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+
+	r0, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+		Repo:          "kuhlman-labs/fishhawk",
+		WorkflowID:    "feature_change",
+		WorkflowSHA:   "deadbeef",
+		TriggerSource: runpkg.TriggerCLI,
+		RunnerKind:    runpkg.RunnerKindLocal,
+	})
+	if err != nil {
+		t.Fatalf("CreateRun: %v", err)
+	}
+	planStage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{
+		RunID: r0.ID, Sequence: 0, Type: runpkg.StageTypePlan,
+		ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("CreateStage: %v", err)
+	}
+
+	// The daemon serving these requests booted AFTER the first round was
+	// dispatched and landed.
+	boot := time.Now().UTC()
+	dispatched := boot.Add(-15 * time.Minute)
+	appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, dispatched, "plan_review_started",
+		map[string]any{"configured_agents": 2, "authority": "advisory"})
+	for _, m := range []string{"claude-fable-5", "gpt-5.6-sol"} {
+		appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, dispatched.Add(time.Minute), "plan_reviewed",
+			map[string]any{"reviewer_kind": "agent", "reviewer_model": m, "authority": "advisory", "verdict": "reject"})
+	}
+	// The operator revises the plan: the superseded round is floored out and no
+	// new round has started.
+	appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, dispatched.Add(10*time.Minute), "plan_revised",
+		map[string]any{})
+
+	const bearer = "fhk_revise_e2e"
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"write:runs", "read:runs"}, PlainText: bearer,
+	}}
+	srv := server.New(server.Config{
+		RunRepo: runRepo, AuditRepo: auditRepo, APITokenRepo: tokRepo, ProcessStart: boot,
+	})
+	httpSrv := httptest.NewServer(srv.Handler())
+	t.Cleanup(httpSrv.Close)
+
+	r := &runResolver{api: newAPIClient(config{backendURL: httpSrv.URL, apiToken: bearer})}
+	r.reviewPollInterval = 10 * time.Millisecond
+
+	// (a) Revised, no new round: pending with the no-new-round message.
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{RunID: r0.ID.String(), Stage: "plan", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitReview (before the new round): %v", err)
+	}
+	if out.Status != "pending" || out.Stranded || out.Undecidable {
+		t.Fatalf("before the new round: status %q stranded=%v undecidable=%v (message %q), want a plain pending",
+			out.Status, out.Stranded, out.Undecidable, out.Message)
+	}
+	if !strings.Contains(out.Message, "no new round") || strings.Contains(out.Message, "fishhawk_reconcile_reviews") {
+		t.Errorf("before the new round the message must say no new round started and not prescribe reconcile: %q", out.Message)
+	}
+
+	// (b) The new round is dispatched after the restart: still pending, now with
+	// the boundary-verified timestamp-ordering wording.
+	appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, boot.Add(time.Minute), "plan_review_started",
+		map[string]any{"configured_agents": 2, "authority": "advisory"})
+	_, out, err = r.awaitReview(ctx, nil, AwaitReviewInput{RunID: r0.ID.String(), Stage: "plan", TimeoutSeconds: 1})
+	if err != nil {
+		t.Fatalf("awaitReview (new round dispatched): %v", err)
+	}
+	if out.Status != "pending" || out.Stranded {
+		t.Fatalf("new round dispatched: status %q stranded=%v (message %q), want pending", out.Status, out.Stranded, out.Message)
+	}
+	if !strings.Contains(out.Message, "verified only") || !strings.Contains(out.Message, "timestamp ordering") {
+		t.Errorf("a dispatched, post-boot round should carry the verified timestamp-ordering wording: %q", out.Message)
+	}
+
+	// (c) The new round's verdicts land: complete, carrying ONLY those rows.
+	for _, v := range []string{"approve", "approve_with_concerns"} {
+		appendE2EAudit(t, auditRepo, r0.ID, &planStage.ID, boot.Add(2*time.Minute), "plan_reviewed",
+			map[string]any{"reviewer_kind": "agent", "reviewer_model": "claude-fable-5", "authority": "advisory", "verdict": v})
+	}
+	_, out, err = r.awaitReview(ctx, nil, AwaitReviewInput{RunID: r0.ID.String(), Stage: "plan", TimeoutSeconds: 30})
+	if err != nil {
+		t.Fatalf("awaitReview (verdicts landed): %v", err)
+	}
+	if out.Status != "complete" {
+		t.Fatalf("Status = %q, want complete (message %q)", out.Status, out.Message)
+	}
+	if len(out.Reviews) != 2 {
+		t.Fatalf("Reviews = %+v, want exactly the 2 new-round rows", out.Reviews)
+	}
+	for _, rv := range out.Reviews {
+		if rv.Verdict == "reject" {
+			t.Errorf("a superseded round-1 reject leaked into the new round: %+v", out.Reviews)
+		}
+	}
+}
+
+// TestReviewRoundStrand_OrphanedLatestRoundStillStrands pins that the floor
+// branch does not blunt the #2712 classification. The first three arms are the
+// floor-present orphans: a NEW round dispatched above each re-open row, pre-boot,
+// partially landed — a floor AND a higher started row, so the comparison falls
+// through and the round is judged. The last three keep a floor from suppressing
+// the strand where the existing rules void or scope it out (a category-D retry,
+// a delivered-nothing recovered fix-up, a retry of a DIFFERENT stage); those
+// have SinceSeq 0 and pin the floor-derivation rules the branch relies on.
+func TestReviewRoundStrand_OrphanedLatestRoundStillStrands(t *testing.T) {
+	implStageID := uuid.New().String()
+	otherStageID := uuid.New().String()
+	cases := []struct {
+		name           string
+		stage          string
+		seed           func(fb *fakeBackend, runID uuid.UUID)
+		wantLanded     int
+		wantConfigured int
+	}{
+		{
+			name: "new round above plan_revised", stage: "plan",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedOldPlanRound(fb, runID, "")
+				seedRunPlanRevisedAudit(fb, runID)
+				seedReviewStartedAuditAtForStage(fb, runID, "plan_review_started", 2, "advisory", strandDispatch, "")
+				seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+			},
+			wantLanded: 1, wantConfigured: 2,
+		},
+		{
+			name: "new round above a fix-up trigger", stage: "implement",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedOldImplementRound(fb, runID, "")
+				seedRunFixupTriggeredAudit(fb, runID)
+				seedReviewStartedAuditAtForStage(fb, runID, "implement_review_started", 2, "advisory", strandDispatch, "")
+				seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+			},
+			wantLanded: 1, wantConfigured: 2,
+		},
+		{
+			name: "new round above a retry", stage: "implement",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedOldImplementRound(fb, runID, implStageID)
+				seedStageRetriedAudit(fb, runID, categoryStageRetried, implStageID, "A")
+				seedReviewStartedAuditAtForStage(fb, runID, "implement_review_started", 2, "advisory", strandDispatch, implStageID)
+				seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+			},
+			wantLanded: 1, wantConfigured: 2,
+		},
+		{
+			name: "category-D retry does not floor", stage: "implement",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAtForStage(fb, runID, "implement_review_started", 2, "advisory", strandDispatch, implStageID)
+				seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+				seedStageRetriedAudit(fb, runID, categoryStageRetried, implStageID, "D")
+			},
+			wantLanded: 1, wantConfigured: 2,
+		},
+		{
+			name: "delivered-nothing recovered fix-up does not floor", stage: "implement",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAtForStage(fb, runID, "implement_review_started", 2, "advisory", strandDispatch, "")
+				seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+				seedRunFixupTriggeredAudit(fb, runID)
+				dn := true
+				seedRunFixupRecoveredAudit(fb, runID, "", &dn)
+			},
+			wantLanded: 1, wantConfigured: 2,
+		},
+		{
+			name: "retry of a different stage does not floor", stage: "implement",
+			seed: func(fb *fakeBackend, runID uuid.UUID) {
+				seedReviewStartedAuditAtForStage(fb, runID, "implement_review_started", 2, "advisory", strandDispatch, implStageID)
+				seedImplementReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "approve"})
+				seedStageRetriedAudit(fb, runID, categoryStageRetried, otherStageID, "A")
+			},
+			wantLanded: 1, wantConfigured: 2,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fb, srv := newFakeBackend(t)
+			runID := uuid.New()
+			fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+			tc.seed(fb, runID)
+
+			r := newResolver(srv, nil)
+			got, err := r.reviewRoundStrand(context.Background(), runID, tc.stage,
+				r.probeHealthBoundary(context.Background(), time.Now()))
+			if err != nil {
+				t.Fatalf("reviewRoundStrand: %v", err)
+			}
+			if !got.Stranded || got.AwaitingRedispatch {
+				t.Fatalf("Stranded = %v / AwaitingRedispatch = %v, want a genuine strand (reason %q)",
+					got.Stranded, got.AwaitingRedispatch, got.Reason)
+			}
+			if got.LandedTerminal != tc.wantLanded || got.ConfiguredAgents != tc.wantConfigured {
+				t.Errorf("landed/configured = %d/%d, want %d/%d (the round being judged)",
+					got.LandedTerminal, got.ConfiguredAgents, tc.wantLanded, tc.wantConfigured)
+			}
+		})
+	}
+}
+
+// TestAwaitReview_RevisedRoundOrphaned_ResolvesStranded is the original
+// report's "judge the LATEST round" expectation at the await surface: a revised
+// plan whose NEW round was itself orphaned by a restart resolves 'stranded', and
+// the message cites the NEW round's dispatch time, not the superseded one's.
+func TestAwaitReview_RevisedRoundOrphaned_ResolvesStranded(t *testing.T) {
+	fb, srv := newFakeBackend(t)
+	runID := uuid.New()
+	fb.healthzProcessStart = strandBootB.Format(time.RFC3339Nano)
+	oldDispatch := strandBootA.Add(2 * time.Minute)
+	newDispatch := strandDispatch
+	seedReviewStartedAuditAtForStage(fb, runID, "plan_review_started", 2, "advisory", oldDispatch, "")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", Authority: "advisory", Verdict: "reject"})
+	seedRunPlanRevisedAudit(fb, runID)
+	seedReviewStartedAuditAtForStage(fb, runID, "plan_review_started", 2, "advisory", newDispatch, "")
+	seedPlanReviewAudit(fb, runID, PlanReview{ReviewerKind: "agent", ReviewerModel: "claude-fable-5", Authority: "advisory", Verdict: "approve"})
+
+	r := newResolver(srv, nil)
+	r.reviewPollInterval = 10 * time.Millisecond
+	// A bounded context, so a regression that stops this resolving 'stranded'
+	// fails in seconds instead of waiting out the 600s request timeout.
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, out, err := r.awaitReview(ctx, nil, AwaitReviewInput{
+		RunID: runID.String(), Stage: "plan", TimeoutSeconds: 600,
+	})
+	if err != nil {
+		t.Fatalf("awaitReview: %v", err)
+	}
+	if out.Status != "stranded" || !out.Stranded {
+		t.Fatalf("Status = %q / Stranded = %v, want stranded (message %q)", out.Status, out.Stranded, out.Message)
+	}
+	if out.LandedTerminal != 1 || out.ConfiguredAgents != 2 {
+		t.Errorf("landed/configured = %d/%d, want the NEW round's 1/2", out.LandedTerminal, out.ConfiguredAgents)
+	}
+	if want := newDispatch.UTC().Format(time.RFC3339); !strings.Contains(out.Message, want) {
+		t.Errorf("stranded message does not cite the new round's dispatch %s: %q", want, out.Message)
+	}
+	if stale := oldDispatch.UTC().Format(time.RFC3339); strings.Contains(out.Message, stale) {
+		t.Errorf("stranded message cites the SUPERSEDED round's dispatch %s: %q", stale, out.Message)
+	}
+}
+
+// TestReviewRoundStrandFrom_FloorBoundary is the pure table over the floor
+// comparison: a started row AT or BELOW the floor is awaiting-redispatch, one
+// row above it is judged normally, and a zero floor never suppresses a verdict
+// (the SinceSeq > 0 guard — a zero-sequence, zero-floor row would otherwise
+// satisfy 0 <= 0).
+func TestReviewRoundStrandFrom_FloorBoundary(t *testing.T) {
+	boot := strandBootB
+	preBoot := strandDispatch
+	postBoot := boot.Add(time.Minute)
+	cases := []struct {
+		name         string
+		sinceSeq     int64
+		sequence     int64
+		ts           time.Time
+		wantAwaiting bool
+		wantStranded bool
+		wantReason   string
+	}{
+		{name: "sequence equals the floor", sinceSeq: 10, sequence: 10, ts: preBoot, wantAwaiting: true},
+		{name: "sequence below the floor", sinceSeq: 10, sequence: 7, ts: preBoot, wantAwaiting: true},
+		{name: "sequence one above the floor, pre-boot", sinceSeq: 10, sequence: 11, ts: preBoot, wantStranded: true},
+		{name: "sequence one above the floor, post-boot", sinceSeq: 10, sequence: 11, ts: postBoot, wantReason: "postdates"},
+		{name: "zero floor, zero sequence", sinceSeq: 0, sequence: 0, ts: postBoot, wantReason: "postdates"},
+		{name: "zero floor, zero sequence, pre-boot", sinceSeq: 0, sequence: 0, ts: preBoot, wantStranded: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := reviewRoundStrandFrom(reviewRound{
+				SinceSeq: tc.sinceSeq,
+				Started: startedRound{
+					Exists: true, ConfiguredAgents: 3, Timestamp: tc.ts, Sequence: tc.sequence,
+				},
+			}, healthBoundary{OK: true, ProcessStart: boot})
+			if got.AwaitingRedispatch != tc.wantAwaiting {
+				t.Errorf("AwaitingRedispatch = %v, want %v (reason %q)", got.AwaitingRedispatch, tc.wantAwaiting, got.Reason)
+			}
+			if got.Stranded != tc.wantStranded {
+				t.Errorf("Stranded = %v, want %v (reason %q)", got.Stranded, tc.wantStranded, got.Reason)
+			}
+			if got.Undecidable {
+				t.Errorf("Undecidable = true: %q", got.Reason)
+			}
+			if tc.wantAwaiting {
+				if got.ConfiguredAgents != 0 || got.LandedTerminal != 0 || !got.StartedAt.IsZero() || !got.DaemonProcessStart.IsZero() {
+					t.Errorf("an awaiting-redispatch verdict must not carry the superseded round's fields: %+v", got)
+				}
+			}
+			if tc.wantReason != "" && !strings.Contains(got.Reason, tc.wantReason) {
+				t.Errorf("reason = %q, want it to contain %q", got.Reason, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestAwaitPendingTimeoutOutput_AwaitingRedispatchWording pins the COMPLETE
+// message the awaiting-redispatch branch emits. It claims no liveness and does
+// not name fishhawk_reconcile_reviews: there is no round to wait on and no
+// orphaned round for reconcile to settle. Acceptance cannot drive this wording
+// (it needs a re-opened stage across a restart), so this exact-string pin is the
+// control.
+func TestAwaitPendingTimeoutOutput_AwaitingRedispatchWording(t *testing.T) {
+	r := &runResolver{}
+	out := r.awaitPendingTimeoutOutput("plan", 360, time.Now(), "", false, 600, &reviewStrand{
+		AwaitingRedispatch: true,
+		Reason:             "the stage was re-opened after its latest review dispatch and no new round has started yet",
+	})
+	for _, forbidden := range []string{"still running", "is running", "are running", "genuinely", "fishhawk_reconcile_reviews"} {
+		if strings.Contains(out.Message, forbidden) {
+			t.Errorf("awaiting-redispatch message contains %q: %q", forbidden, out.Message)
+		}
+	}
+	const wantExact = "plan review still pending after 360s — the stage was re-opened (a plan revise, fix-up or retry) after " +
+		"its latest review dispatch and no new round has started yet, so no reviewer exists to wait on. The next round " +
+		"starts when the re-opened stage produces its new plan or diff; check that stage in fishhawk_get_run_status if " +
+		"this persists. The wait holds nothing: re-call fishhawk_await_review to resume it, or poll " +
+		"fishhawk_get_run_status every 15s (the authoritative path)."
+	if out.Message != wantExact {
+		t.Errorf("awaiting-redispatch message is not the exact pinned message\nwant: %q\ngot:  %q", wantExact, out.Message)
+	}
+	if out.Status != "pending" || out.Undecidable || out.Stranded {
+		t.Errorf("status %q undecidable=%v stranded=%v, want a plain pending", out.Status, out.Undecidable, out.Stranded)
+	}
+	if out.ConfiguredAgents != 0 || out.LandedTerminal != 0 {
+		t.Errorf("landed/configured = %d/%d, want 0/0", out.LandedTerminal, out.ConfiguredAgents)
+	}
+}
+
 // --- #4391 supersession arm of the live fix-up floor ---
 
 // seedRunAuditRow appends one run audit entry of category on stageID (empty =
