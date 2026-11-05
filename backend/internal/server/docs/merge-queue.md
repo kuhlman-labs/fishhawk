@@ -1439,7 +1439,13 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
     `branch_rebased` row passing the shared ADR-112 `isCleanAdvance`
     (`prior_head_sha` → `merge_commit_sha`). Membership is read from audit
     rows only, written from authenticated runner reports or the rebase writer,
-    never from a commit author string. A head outside the set is SKIPPED
+    never from a commit author string. On an installation-bearing run the
+    `fixup_pushed`, acceptance and conflict rows were forge-checked when
+    written (an exact head, plus a first-parent base on the two edge kinds; §
+    "Forge-confirmed push reports"), so the walk reads no forge edge itself
+    and gate 5 still pins the terminal head to the live PR. A skipped run's
+    rows, and rows older than that check, were not checked, and no check says
+    who authored a commit. A head outside the set is SKIPPED
     (never dropped) and falls back to the operator's `fishhawk_merge_run`: a
     foreign push, an `operator_commit_vouched` commit, a `child_pushed` head,
     a `branch_reset` to a non-member, an unverified or legacy base merge
@@ -1506,6 +1512,86 @@ ADR-093 D4 plus the D2 promote verb (E87.6 / [#4297](https://github.com/kuhlman-
   `TestMergeQueueEjection_*`, `TestRunReadAndGateView_MergeQueueEjectionOnlyWhileNewestRowEjected`,
   `TestOpenAPIDocumentsMergeQueuePromote` / `...Ejection`) and
   `mcpserver`'s `TestMergeQueueEjection_WireShape` (real backend and store).
+
+### Forge-confirmed push reports ([ADR-141](https://github.com/kuhlman-labs/fishhawk/issues/5053), [#4870](https://github.com/kuhlman-labs/fishhawk/issues/4870))
+
+`refuseUnverifiedReportedHead` (`reported_head.go`) admits a `fixup_pushed`,
+`conflict_resolution_pushed` or `acceptance_scenarios_pushed` report only when
+the forge confirms it. It runs after the handler's replay dedup, so a replay
+stays a 200 with one row, and before the row and every later effect. The
+lineage ledger, merge-candidate verify, the approval-dismissal cause, the gate
+view and the qualifying-head walk read those rows with no logic of their own
+for a refused report: it has no row (`TestReportedHead_RefusedHeadReachesNoConsumer`,
+`TestMergeQueueReentry_ForgedEdge_*`).
+
+- **The check.** The reported head must EXACTLY equal the forge PR head or the
+  tip of a branch the server derived. A merely reachable commit is refused, and
+  `CompareCommits` is never read. The reported branch is not authority: the PR's
+  ref or the run's derived branch is used, and an admitted row records it. The
+  conflict and acceptance kinds also require the reported base to equal the
+  head's FIRST parent (`GetCommit`). A fix-up's base stays outside the check. All
+  forge reads share one 15s deadline.
+- **Explicit residuals, never universal verification.** A server with no forge
+  client and a run with a nil or zero installation, which includes every GitLab
+  run, admit the report unchecked. Initial PR and child reports and fix-up base
+  provenance are deferred ([#5050](https://github.com/kuhlman-labs/fishhawk/issues/5050),
+  [#5051](https://github.com/kuhlman-labs/fishhawk/issues/5051)). The check hardens
+  against commits the forge does not show at the PR head or branch tip and parents
+  the head does not have. Forge state cannot show who wrote a commit, so gate 6
+  eligibility still applies.
+- **`503 reported_head_unverifiable` means confirmation is unknown.** A forge or
+  required repository read failed, a dedup read failed (or a row became visible)
+  on a putative mismatch, or the trigger state a refusal needs was unreadable.
+  Nothing is recorded and nothing transitions, so the runner re-posts the same
+  signed bytes inside its request-local 45s budget
+  ([runner README](../../../../runner/README.md#the-request-local-push-report-budget-adr-141--4870)).
+  The operator cause is in the log line joined to the response's `error_ref`.
+- **`reported_head_mismatch` means the report disagreed with forge state.** It can
+  be a benign head-movement race and is not proof of misconduct: a clean base merge
+  (`advanceRunBranch` reads no stage state) can land between a runner's push and its
+  report, and a stale successful read looks the same. It is not retried as an unknown
+  read error. A running implement stage's fix-up or conflict report answers 200
+  `outcome: failed`; an acceptance report, a non-implement stage or a settled stage
+  answers 409 with no transition.
+- **Category B and C.** An ACTIVE fix-up trigger (the newest
+  `stage_fixup_triggered` row, with no `fixup_pushed`, `fixup_no_changes` or
+  `stage_fixup_recovered` row after it and no confirmed supersession) selects B: the
+  existing recovery restores the pre-pass gate and the pass stays consumed. No active
+  trigger selects C: the stage stays failed unless another recovery fires, and `POST
+  /v0/stages/{id}/retry` admits it (a failed category-B stage answers 422).
+  `dispatch_reaper_failed` and an inert supersession marker spend nothing. Recovery
+  order is unchanged: merge-candidate verify, then conflict resolution, then fix-up,
+  so a live conflict trigger is consumed and restores from its own anchors whichever
+  category was selected. These trigger reads precede every write. Recovery re-reads
+  its trigger after the failure has committed, so a read failure in that small window
+  leaves the stage failed in the selected category with no restoration; that is the
+  posture of every failed report, and no 503 is possible by then.
+- **Evidence is best-effort.** A confirmed mismatch logs one WARN and appends one
+  `invariant_violation` row of kind `reported_head_mismatch` (see
+  [comment surfaces](../../../../docs/issue-comment-surfaces.md)), then refreshes the
+  status comment. The refusal never depends on them. A failed append logs a WARN
+  naming the run, stage and both heads; the other fallbacks are the 409 details and
+  the stage's failure reason. Reported and forge values reach these sinks only as
+  bounded ids and branch names, with a fixed placeholder for anything else.
+
+**Operator recovery costs (D5).** Availability is deliberately traded for provenance:
+a commit can already be on the branch when its report is refused or exhausted.
+
+| Report | Forge unavailable past the 45s budget | Confirmed mismatch |
+|---|---|---|
+| Fix-up | No row. The runner reports `failed` category C; recovery restores the review gate, reopens routed concerns and stamps `delivered_nothing`, which refunds the pass. | Active trigger: category B, same restoration, the pass stays consumed. None: category C, and a retry re-runs the agent on a branch still holding the unrecorded commit. |
+| Conflict resolution | No row, no trace and no failed report. The stage stays `running` until the watchdog or `fishhawk_reap_stage` ([#5052](https://github.com/kuhlman-labs/fishhawk/issues/5052)). | 200 `failed`; a live conflict trigger is consumed and the pre-pass gate restored, as for any failed pass. |
+| Acceptance scenarios | No row. The verdict stands and the retirement-drop report names `push_report_failed`. | 409, no transition. The verdict stands and the runner records the same drop. |
+
+In every case the PR head can carry a commit no row attributes. A later fix-up's
+lineage guard can flag it foreign (`TestReportedHead_RefusedPush_NoAutoVouch_ReadsForeignLater`),
+merge-candidate and gate-view heads can disagree with the PR, and re-entry will not
+qualify it. `fishhawk_vouch_commit` and `fishhawk_reset_run_branch` remain the operator's
+choices and nothing runs them automatically: a vouched commit is still outside the
+qualifying-head set, so that run falls back to `fishhawk_merge_run`. On a 200 refusal
+the runner's logs still read as delivered, so read server state: the stage, its
+`pull_request_failed` row and the evidence row. A forge outage therefore costs operator
+time that a fail-open check would not; that is the trade ADR-141 selected.
 
 ### Withdraw intent (ADR-112 R3, [#4685](https://github.com/kuhlman-labs/fishhawk/issues/4685))
 
