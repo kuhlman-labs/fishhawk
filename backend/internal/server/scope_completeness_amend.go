@@ -11,7 +11,9 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/runnerbackend"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/wavecoverage"
 )
 
 // maxScopeCompletenessAmendsPerStage bounds how many times ONE parked implement
@@ -98,6 +100,22 @@ const (
 	amendOwnerUnresolvedNoImplement    = "owning_slice_implement_stage_absent"
 )
 
+// The reasons a plan-declared ancestor's delivery into this child's base could
+// not be proven (Captain's ruling on #4798). Each is a HARD refusal:
+// acknowledge_owner_unresolved cannot admit any of them.
+const (
+	amendAncestorNoWaveGate    = "ancestor_no_wave_gate"
+	amendAncestorRunNotFound   = "ancestor_run_not_found"
+	amendAncestorNoImplement   = "ancestor_implement_stage_absent"
+	amendAncestorNotDelivered  = "ancestor_not_delivered"
+	amendAncestorNotIntegrated = "ancestor_not_integrated"
+
+	amendAncestorChannelUnreadable     = "child_dispatch_channel_unreadable"
+	amendAncestorSiblingsUnreadable    = "ancestor_sibling_lookup_failed"
+	amendAncestorStagesUnreadable      = "ancestor_stages_unreadable"
+	amendAncestorIntegrationUnreadable = "ancestor_integration_unreadable"
+)
+
 // amendOwnerGuardResult is the owner-slice guard's verdict for the whole
 // submitted path set: the RESOLVED attributions (echoed so the operator knows
 // which sibling will see the same file on another branch) and the UNRESOLVED
@@ -107,15 +125,106 @@ type amendOwnerGuardResult struct {
 	unresolved []amendUnresolvedOwner
 }
 
-// amendOwnerActiveRefusal is the guard's hard refusal: a submitted path whose
-// owning sibling slice has already STARTED its implement pass, i.e. the window
-// in which two branches can carry divergent edits to one file.
+// amendOwnerActiveRefusal is the guard's hard refusal, of two kinds. Legacy: a
+// submitted path the plan does not declare, whose park-attributed non-ancestor
+// sibling has already STARTED its implement pass, i.e. the window in which two
+// branches can carry divergent edits to one file. Ancestor: a plan-declared
+// ancestor whose delivery into this child's base could not be proven.
+//
+// Neither ever enters amendOwnerGuardResult.unresolved, the only input to
+// acknowledge_owner_unresolved, so the flag cannot admit either.
 type amendOwnerActiveRefusal struct {
-	Path        string `json:"path"`
-	SliceIndex  int    `json:"slice_index"`
-	SliceTitle  string `json:"slice_title,omitempty"`
-	SiblingRun  string `json:"sibling_run_id"`
-	SiblingStat string `json:"sibling_implement_state"`
+	Path           string `json:"path"`
+	SliceIndex     int    `json:"slice_index"`
+	SliceTitle     string `json:"slice_title,omitempty"`
+	SiblingRun     string `json:"sibling_run_id"`
+	SiblingStat    string `json:"sibling_implement_state"`
+	SiblingRunStat string `json:"sibling_run_state"`
+	// Ancestor marks a refused ancestor proof, with its Reason and whether a
+	// later re-POST of the same decision can succeed (Retryable).
+	Ancestor  bool   `json:"-"`
+	Reason    string `json:"-"`
+	Retryable bool   `json:"-"`
+	// ReadFailed marks a proof read that errored, answered 500 rather than 409.
+	// cause reaches only the log record, through internalCauseKey.
+	ReadFailed bool `json:"-"`
+	cause      string
+	// branchPresent is set only for ancestor_not_integrated.
+	branchPresent *bool
+}
+
+// writeAmendOwnerRefusal maps a guard refusal to its response. See the contract
+// in docs/review.md: no refusal writes an amendment row, moves the stage, spends
+// a cap slot or carries a raw cause, and none of them writes an audit row, because
+// a failed read is not a decision and the ancestor 409s stay in the #2591 family.
+func (s *Server) writeAmendOwnerRefusal(w http.ResponseWriter, r *http.Request, refusal *amendOwnerActiveRefusal) {
+	if refusal.ReadFailed {
+		s.writeError(w, r, http.StatusInternalServerError, errCodeSliceOwnershipCheckFailed,
+			"the delivery of an ancestor slice could not be read, so this amend cannot be shown to edit a file already in this child's base; nothing was written. "+
+				"acknowledge_owner_unresolved does not relax this",
+			map[string]any{
+				"retryable":      refusal.Retryable,
+				"reason":         refusal.Reason,
+				"remedy":         "re-POST the same decision once the read recovers; nothing was written",
+				"path":           refusal.Path,
+				"slice_index":    refusal.SliceIndex,
+				internalCauseKey: refusal.cause,
+			})
+		return
+	}
+	if !refusal.Ancestor {
+		s.writeError(w, r, http.StatusConflict, "amend_refused_owner_slice_active",
+			"a submitted path is owned by a sibling slice whose implement pass has already STARTED: from that moment two branches can carry divergent edits to one file and consolidation would conflict. Drop the file from that slice, or merge the slices, and re-run",
+			map[string]any{
+				"path":                    refusal.Path,
+				"slice_index":             refusal.SliceIndex,
+				"slice_title":             refusal.SliceTitle,
+				"sibling_run_id":          refusal.SiblingRun,
+				"sibling_implement_state": refusal.SiblingStat,
+				"sibling_run_state":       refusal.SiblingRunStat,
+			})
+		return
+	}
+	details := map[string]any{
+		"path":                    refusal.Path,
+		"slice_index":             refusal.SliceIndex,
+		"slice_title":             refusal.SliceTitle,
+		"sibling_run_id":          refusal.SiblingRun,
+		"sibling_implement_state": refusal.SiblingStat,
+		"sibling_run_state":       refusal.SiblingRunStat,
+		"reason":                  refusal.Reason,
+		"retryable":               refusal.Retryable,
+		"remedy":                  amendAncestorRemedy(refusal.Retryable),
+	}
+	if refusal.branchPresent != nil {
+		details["consolidated_branch_present"] = *refusal.branchPresent
+	}
+	s.writeError(w, r, http.StatusConflict, "amend_refused_owner_slice_active", amendAncestorMessage(refusal.Reason), details)
+}
+
+// amendAncestorRemedy is the remedy of an ancestor 409. A retryable reason clears
+// without changing the plan or the runner kind.
+func amendAncestorRemedy(retryable bool) string {
+	if retryable {
+		return "retry this decision once the ancestor slice has succeeded and the parent's newest slices_integrated covers it; or decide fail"
+	}
+	return "decide fail and restart with a corrected decomposition: retrying cannot succeed under this plan and runner kind"
+}
+
+// amendAncestorMessage is the static message for each ancestor 409 reason.
+func amendAncestorMessage(reason string) string {
+	const suffix = " acknowledge_owner_unresolved does not relax this."
+	switch reason {
+	case amendAncestorNoWaveGate:
+		return "a submitted path is owned by a depends_on ancestor slice, but this child's dispatch does not pass through the host wave gate, so nothing proves that ancestor's work is in this child's base." + suffix
+	case amendAncestorRunNotFound:
+		return "a submitted path is owned by a depends_on ancestor slice that has no identifiable child run, so its delivery into this child's base cannot be proven." + suffix
+	case amendAncestorNoImplement:
+		return "a submitted path is owned by a depends_on ancestor slice whose run has no implement stage, so its delivery into this child's base cannot be proven." + suffix
+	case amendAncestorNotIntegrated:
+		return "a submitted path is owned by a depends_on ancestor slice that the parent's newest slices_integrated record does not prove merged onto a consolidated branch, so it is not proven in this child's base." + suffix
+	}
+	return "a submitted path is owned by a depends_on ancestor slice that has not delivered: its run and implement stage have not both succeeded, so its work is not in this child's base." + suffix
 }
 
 // amendScopeCompleteness resolves an `amend` decision (#2591): it WIDENS the
@@ -142,17 +251,22 @@ type amendOwnerActiveRefusal struct {
 //	(b) coverage check         — 409, nothing touched
 //	(c) in-flight row lookup   — 500 amend_unrecorded, READ-ONLY, nothing touched
 //	(d) per-stage amend cap    — 409, nothing touched
-//	(e) owner-slice guard      — 409, nothing touched
-//	(f) pre-approved row       — 500 amend_unrecorded, stage left PARKED
-//	(g) amended audit entry    — 500 amend_unrecorded, stage left PARKED
-//	(h) resume to pending      — 500 amend_resume_failed, stage left PARKED
-//	(i) orchestrator advance    — best-effort WARN (mirrors both existing arms)
+//	(e) slice-ownership guard  — 409 with a refused row, or 500, nothing else touched
+//	(f) owner + ancestor proof — 409 or 500, nothing touched
+//	(g) pre-approved row       — 500 amend_unrecorded, stage left PARKED
+//	(h) amended audit entry    — 500 amend_unrecorded, stage left PARKED
+//	(i) resume to pending      — 500 amend_resume_failed, stage left PARKED
+//	(j) orchestrator advance    — best-effort WARN (mirrors both existing arms)
 //
-// Steps (a)-(e) are the no-side-effect refusals; a stage whose widening the
-// chain never recorded is never dispatched. Every step from (f) on is RETRY-SAFE:
-// re-POSTing the same amend reuses this episode's row (f), re-appends an entry
-// keyed to the same amendment_id so the cap is unmoved (g), and re-attempts the
-// resume (h).
+// Steps (a)-(f) are the refusals that touch neither row, stage nor park; a stage
+// whose widening the chain never recorded is never dispatched. Every step from
+// (g) on is RETRY-SAFE: re-POSTing the same amend reuses this episode's row (g),
+// re-appends an entry keyed to the same amendment_id so the cap is unmoved (h),
+// and re-attempts the resume (i).
+//
+// (e) runs BEFORE (f) so a non-ancestor owner hits the ownership 409 and its
+// audit row whatever that sibling's state, and never reaches
+// amend_refused_owner_slice_active. acknowledge_owner_unresolved relaxes neither.
 //
 // (c) runs BEFORE the cap deliberately. A resume failure on the LAST permitted
 // amend has already recorded that amendment against the cap, so a cap check that
@@ -237,20 +351,19 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// (e) OWNER-SLICE GUARD. The run row comes from resolveParkedScopeStage,
-	// which already refused a GetRun failure — re-fetching it here would add a
-	// round-trip whose error branch no request could reach.
-	guard, refusal := s.resolveAmendOwnerGuard(ctx, runRow, park, paths)
+	// (e) SLICE-OWNERSHIP GUARD (#4798). The run row comes from
+	// resolveParkedScopeStage, which already refused a GetRun failure —
+	// re-fetching it here would add a round-trip whose error branch no request
+	// could reach.
+	ownership, refused := s.refuseSliceOwnedPreApproval(w, r, runRow, stage.ID, paths, sliceOwnershipPhaseAmend, reqBody.Reason, decidedBy)
+	if refused {
+		return
+	}
+
+	// (f) OWNER-SLICE GUARD AND ANCESTOR-DELIVERY PROOF.
+	guard, refusal := s.resolveAmendOwnerGuard(ctx, runRow, park, paths, ownership)
 	if refusal != nil {
-		s.writeError(w, r, http.StatusConflict, "amend_refused_owner_slice_active",
-			"a submitted path is owned by a sibling slice whose implement pass has already STARTED: from that moment two branches can carry divergent edits to one file and consolidation would conflict. Drop the file from that slice, or merge the slices, and re-run",
-			map[string]any{
-				"path":                    refusal.Path,
-				"slice_index":             refusal.SliceIndex,
-				"slice_title":             refusal.SliceTitle,
-				"sibling_run_id":          refusal.SiblingRun,
-				"sibling_implement_state": refusal.SiblingStat,
-			})
+		s.writeAmendOwnerRefusal(w, r, refusal)
 		return
 	}
 	// FAIL CLOSED on unresolved ownership (binding condition 1). Unknown
@@ -270,7 +383,7 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 	}
 	acknowledged := len(guard.unresolved) > 0 && reqBody.AcknowledgeOwnerUnresolved
 
-	// (f) The pre-approved #961 row — the SAME create+auto-approve mechanism
+	// (g) The pre-approved #961 row — the SAME create+auto-approve mechanism
 	// recover.go uses, so no prompt.go fold change is needed: the row is already
 	// APPROVED, and resolveApprovedScopeAmendmentEntries filters on status alone
 	// with no origin discriminator.
@@ -283,7 +396,7 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// (f) The amended audit entry. REFUSED on failure for the same reason the
+	// (h) The amended audit entry. REFUSED on failure for the same reason the
 	// exempt arm refuses: a stage whose widening the chain never recorded must
 	// never become dispatchable, because that entry is also what DEMOTES a stale
 	// `exempted` decision in prompt.go's newest-wins walk.
@@ -307,7 +420,7 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// (g) Pending, NOT Running — the #2501 reason: host_dispatch.go's admission
+	// (i) Pending, NOT Running — the #2501 reason: host_dispatch.go's admission
 	// switch accepts only {pending, awaiting_host_dispatch}.
 	if _, err := s.cfg.RunRepo.TransitionStage(ctx, stage.ID, run.StageStatePending, nil); err != nil {
 		s.writeError(w, r, http.StatusInternalServerError, "amend_resume_failed",
@@ -316,7 +429,7 @@ func (s *Server) amendScopeCompleteness(w http.ResponseWriter, r *http.Request, 
 		return
 	}
 
-	// (h) Best-effort advance, mirroring both existing arms.
+	// (j) Best-effort advance, mirroring both existing arms.
 	if s.cfg.Orchestrator != nil {
 		if _, err := s.cfg.Orchestrator.Advance(ctx, runID); err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
@@ -446,10 +559,25 @@ func (s *Server) agentAmendmentBudgetRemaining(ctx context.Context, stageID uuid
 }
 
 // resolveAmendOwnerGuard evaluates the SINGLE-OWNER-FILE invariant for the
-// submitted paths.
+// submitted paths, on a path set refuseSliceOwnedPreApproval has already cleared
+// of plan-declared non-ancestor owners.
 //
-// The invariant this narrowly relaxes is that exactly one decomposition slice
-// edits a given file. An amend hands a second slice permission to edit a file a
+// The contract is plan-first (#4798):
+//
+//   - A path the plan declares takes its owners from ownership.attributedOwners
+//     and ignores the park, so a missing or nil park attribution cannot create an
+//     acknowledgeable state. Every owner is evaluated, because directory
+//     containment can give one path two ancestors.
+//   - The own slice resolves with no read: a slice cannot conflict with itself.
+//   - An ancestor, whether the plan or the park attributed it, must have PROVEN
+//     delivery into this child's base (proveAncestorDelivered). A failed proof
+//     returns at once, so it wins over any unresolved path in the set regardless
+//     of order, and never enters `unresolved`.
+//   - Only a path the plan does NOT declare can reach `unresolved`, the sole input
+//     to acknowledge_owner_unresolved: no park entry, a nil park index, or the
+//     legacy branch below for a park-attributed non-ancestor.
+//
+// THE LEGACY BRANCH. An amend hands a second slice permission to edit a file a
 // sibling owns, which is safe ONLY while that sibling has not yet begun its
 // implement pass: from Stage.StartedAt onwards two branches can carry divergent
 // edits to one file and consolidation would conflict. StartedAt is the sound
@@ -457,16 +585,14 @@ func (s *Server) agentAmendmentBudgetRemaining(ctx context.Context, stageID uuid
 // never overwritten (see scope_amendment.go::amendmentDeadlineRemaining), so
 // non-nil means an agent pass began. Its documented caveat — a re-spawned
 // stage's started_at is CUMULATIVE — can only make this guard MORE conservative.
+// This branch needs a plan revised under an in-flight fan-out, the anomaly
+// guardDecompositionWaveOrder's comment documents, because park attribution comes
+// from the same plan as the ownership check.
 //
-// FAIL-CLOSED (binding condition 1). Every branch that cannot establish
-// ownership lands in `unresolved`, and the caller refuses the amend unless the
-// operator explicitly acknowledges the risk. The ONE case treated as resolved
-// by construction is a run that is not a decomposition child at all
-// (DecomposedFrom == nil): no sibling slice exists, so no sibling can hold a
-// divergent edit — there is nothing uncertain to fail closed on. A path owned by
-// THIS run's own slice is likewise resolved: a slice cannot conflict with itself.
+// A run that is not a decomposition child (DecomposedFrom == nil) has no sibling
+// slice, so nothing is uncertain and nothing is read.
 func (s *Server) resolveAmendOwnerGuard(ctx context.Context, runRow *run.Run,
-	park *run.ScopeCompletenessPark, paths []scopeamendment.PathEntry) (amendOwnerGuardResult, *amendOwnerActiveRefusal) {
+	park *run.ScopeCompletenessPark, paths []scopeamendment.PathEntry, ownership *sliceOwnershipCheck) (amendOwnerGuardResult, *amendOwnerActiveRefusal) {
 	var out amendOwnerGuardResult
 	if runRow == nil || runRow.DecomposedFrom == nil {
 		return out, nil
@@ -479,61 +605,211 @@ func (s *Server) resolveAmendOwnerGuard(ctx context.Context, runRow *run.Run,
 		}
 	}
 
-	siblings, err := s.cfg.RunRepo.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: runRow.DecomposedFrom})
-	if err != nil {
+	// A list failure is decided per path: it refuses an ancestor's proof and is
+	// merely unresolved for a legacy attribution, and a request naming only the
+	// run's own slice is unaffected.
+	siblings, listErr := s.listDecomposedSiblings(ctx, *runRow.DecomposedFrom)
+	if listErr != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
-			"scope-completeness amend: sibling slice lookup failed; every path's ownership is unresolved",
+			"scope-completeness amend: sibling slice lookup failed",
 			slog.String("run_id", runRow.ID.String()),
-			slog.String("error", err.Error()))
-		for _, p := range paths {
-			out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedSiblingLookup})
-		}
-		return out, nil
+			slog.String("error", listErr.Error()))
 	}
+	proof := &amendAncestorProof{siblings: siblings, listErr: listErr, proven: map[int]bool{}}
 
 	for _, p := range paths {
-		owner, ok := byPath[p.Path]
-		if !ok {
-			out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedNoEntry})
-			continue
-		}
-		if owner.SliceIndex == nil {
-			out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedNoSliceIndex})
-			continue
-		}
-		// Self-owned: this child's own slice declares the path, so no sibling can
-		// hold a divergent edit to it.
-		if runRow.SliceIndex != nil && *runRow.SliceIndex == *owner.SliceIndex {
-			out.resolved = append(out.resolved, owner)
-			continue
-		}
-		sibling := siblingForSlice(siblings, runRow.ID, *owner.SliceIndex)
-		if sibling == nil {
-			out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedSiblingMissing})
-			continue
-		}
-		stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, sibling.ID)
-		if err != nil {
-			out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedStagesUnread})
-			continue
-		}
-		implement := implementStageOf(stages)
-		if implement == nil {
-			out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedNoImplement})
-			continue
-		}
-		if implement.StartedAt != nil || implement.State == run.StageStateSucceeded {
-			return out, &amendOwnerActiveRefusal{
-				Path:        p.Path,
-				SliceIndex:  *owner.SliceIndex,
-				SliceTitle:  owner.SliceTitle,
-				SiblingRun:  sibling.ID.String(),
-				SiblingStat: string(implement.State),
+		owners, planned := ownership.attributedOwners(p.Path)
+		if !planned {
+			owner, ok := byPath[p.Path]
+			if !ok {
+				out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedNoEntry})
+				continue
 			}
+			if owner.SliceIndex == nil {
+				out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedNoSliceIndex})
+				continue
+			}
+			owners = []run.BuildRequiredOwner{owner}
 		}
-		out.resolved = append(out.resolved, owner)
+		for _, owner := range owners {
+			idx := *owner.SliceIndex
+			if runRow.SliceIndex != nil && *runRow.SliceIndex == idx {
+				out.resolved = append(out.resolved, owner)
+				continue
+			}
+			if ownership.isAncestorSlice(idx) {
+				if refusal := s.proveAncestorDelivered(ctx, runRow, p.Path, owner, proof); refusal != nil {
+					return out, refusal
+				}
+				out.resolved = append(out.resolved, owner)
+				continue
+			}
+			if listErr != nil {
+				out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedSiblingLookup})
+				continue
+			}
+			sibling := siblingForSlice(siblings, runRow.ID, idx)
+			if sibling == nil {
+				out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedSiblingMissing})
+				continue
+			}
+			stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, sibling.ID)
+			if err != nil {
+				out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedStagesUnread})
+				continue
+			}
+			implement := implementStageOf(stages)
+			if implement == nil {
+				out.unresolved = append(out.unresolved, amendUnresolvedOwner{Path: p.Path, Reason: amendOwnerUnresolvedNoImplement})
+				continue
+			}
+			if implement.StartedAt != nil || implement.State == run.StageStateSucceeded {
+				return out, &amendOwnerActiveRefusal{
+					Path:           p.Path,
+					SliceIndex:     idx,
+					SliceTitle:     owner.SliceTitle,
+					SiblingRun:     sibling.ID.String(),
+					SiblingStat:    string(implement.State),
+					SiblingRunStat: string(sibling.State),
+				}
+			}
+			out.resolved = append(out.resolved, owner)
+		}
 	}
 	return out, nil
+}
+
+// amendAncestorProof holds the reads one amend decision shares, so each is made
+// at most once however many ancestor paths it names. A failed proof ends the
+// decision, so only successes need remembering.
+type amendAncestorProof struct {
+	siblings []*run.Run
+	listErr  error
+
+	waveGateApplies bool
+	integrationRead bool
+	branch          string
+	integrated      []string
+	proven          map[int]bool
+}
+
+// childWaveGateApplies reports whether this child's dispatch goes through
+// handleHostDispatchStage, the only caller of guardDecompositionWaveOrder and
+// resolveDependentChildBase. It mirrors runnerbackend.Resolver's routing: a
+// non-host kind fires remotely; a locked host child is host-dispatched; an
+// un-resolved host hint defers to the parent's lock, because a child is minted
+// un-resolved with RunnerKind COPIED (#1980) and a parent locked remote supersedes
+// the hint. A parent that is itself un-resolved parks the child at
+// awaiting_host_dispatch, which is host dispatch too. A parked child may not be
+// locked, because the lock comes from the signed trace manifest, so this cannot
+// require the lock.
+func (s *Server) childWaveGateApplies(ctx context.Context, child *run.Run) (bool, error) {
+	hostDispatched, known := runnerbackend.KindHostDispatched(child.RunnerKind)
+	if !known || !hostDispatched {
+		return false, nil
+	}
+	if child.RunnerKindResolved {
+		return true, nil
+	}
+	parent, err := s.cfg.RunRepo.GetRun(ctx, *child.DecomposedFrom)
+	if err != nil {
+		return false, err
+	}
+	if parent.RunnerKindResolved {
+		return parent.RunnerKind == run.RunnerKindLocal, nil
+	}
+	return true, nil
+}
+
+// proveAncestorDelivered is the Captain's ruling on #4798, "Require proven ancestor
+// delivery": a plan-declared ancestor's path is allowed only when that ancestor's
+// work is proven in this child's base, and every failure of the proof refuses.
+//
+// No per-child base is persisted, so the proof is built from three facts. ROUTING:
+// this child's dispatch goes through handleHostDispatchStage, which admits a
+// dependent child only after guardDecompositionWaveOrder and
+// resolveDependentChildBase, and the amend's own re-dispatch passes both gates
+// again. STATE: the ancestor's run and implement stage succeeded, and succeeded is
+// absorbing (run.TestRunSucceededIsAbsorbing). INTEGRATION: the parent's newest
+// slices_integrated names a branch and covers the ancestor, the same reader and
+// predicate the wave gate uses; IntegrateSlices merges every succeeded slice on
+// each pass, so the transitive closure is covered too.
+//
+// It returns nil when proven. AuditRepo cannot be nil here because
+// handleDecideScopeCompleteness answers 503 first.
+func (s *Server) proveAncestorDelivered(ctx context.Context, child *run.Run, path string, owner run.BuildRequiredOwner, proof *amendAncestorProof) *amendOwnerActiveRefusal {
+	idx := *owner.SliceIndex
+	if proof.proven[idx] {
+		return nil
+	}
+	refuse := func(reason string, retryable bool) *amendOwnerActiveRefusal {
+		return &amendOwnerActiveRefusal{
+			Path: path, SliceIndex: idx, SliceTitle: owner.SliceTitle,
+			Ancestor: true, Reason: reason, Retryable: retryable,
+		}
+	}
+	readFailed := func(reason string, err error) *amendOwnerActiveRefusal {
+		r := refuse(reason, true)
+		r.ReadFailed = true
+		r.cause = err.Error()
+		return r
+	}
+
+	if !proof.waveGateApplies {
+		applies, err := s.childWaveGateApplies(ctx, child)
+		if err != nil {
+			return readFailed(amendAncestorChannelUnreadable, err)
+		}
+		if !applies {
+			return refuse(amendAncestorNoWaveGate, false)
+		}
+		proof.waveGateApplies = true
+	}
+
+	if proof.listErr != nil {
+		return readFailed(amendAncestorSiblingsUnreadable, proof.listErr)
+	}
+	sibling := siblingForSlice(proof.siblings, child.ID, idx)
+	if sibling == nil {
+		r := refuse(amendAncestorRunNotFound, false)
+		r.SiblingRunStat = notMintedState
+		return r
+	}
+	stages, err := s.cfg.RunRepo.ListStagesForRun(ctx, sibling.ID)
+	if err != nil {
+		return readFailed(amendAncestorStagesUnreadable, err)
+	}
+	withSibling := func(r *amendOwnerActiveRefusal, implementState string) *amendOwnerActiveRefusal {
+		r.SiblingRun = sibling.ID.String()
+		r.SiblingRunStat = string(sibling.State)
+		r.SiblingStat = implementState
+		return r
+	}
+	implement := implementStageOf(stages)
+	if implement == nil {
+		return withSibling(refuse(amendAncestorNoImplement, false), "")
+	}
+	if sibling.State != run.StateSucceeded || implement.State != run.StageStateSucceeded {
+		return withSibling(refuse(amendAncestorNotDelivered, true), string(implement.State))
+	}
+
+	if !proof.integrationRead {
+		branch, integrated, err := s.latestSlicesIntegrated(ctx, *child.DecomposedFrom)
+		if err != nil {
+			return readFailed(amendAncestorIntegrationUnreadable, err)
+		}
+		proof.branch, proof.integrated, proof.integrationRead = branch, integrated, true
+	}
+	branch, integrated := proof.branch, proof.integrated
+	covered, _ := wavecoverage.Covered([]int{idx}, map[int]string{idx: sibling.ID.String()}, integrated)
+	if !covered || branch == "" {
+		r := withSibling(refuse(amendAncestorNotIntegrated, true), string(implement.State))
+		present := branch != ""
+		r.branchPresent = &present
+		return r
+	}
+	proof.proven[idx] = true
+	return nil
 }
 
 // siblingForSlice finds the fan-out child occupying the given sub-plan index,

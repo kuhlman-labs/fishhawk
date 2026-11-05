@@ -104,16 +104,19 @@ type scopeCompletenessDecisionRequest struct {
 	// amendment, because an amend IS one — a pre-approved row on this stage.
 	Paths []scopeamendment.PathEntry `json:"paths,omitempty"`
 	// AcknowledgeOwnerUnresolved re-admits an `amend` whose owner-slice guard
-	// could not RESOLVE ownership for one or more submitted paths (#2591
-	// binding condition 1). The guard fails CLOSED by default — unknown
-	// ownership is exactly the case in which a sibling slice might already hold
-	// divergent edits to the file — so an unresolved path refuses the amend 409
+	// could not RESOLVE ownership for one or more submitted paths the parent's
+	// plan does NOT declare (#2591 binding condition 1, narrowed by #4798). The
+	// guard fails CLOSED by default — unknown ownership is exactly the case in
+	// which a sibling slice might already hold divergent edits to the file — so
+	// an unresolved path refuses the amend 409
 	// amend_owner_attribution_unresolved. Setting this to true makes the
 	// operator take that risk KNOWINGLY: the amend proceeds and the
 	// acknowledgement is recorded on both the response and the
 	// scope_completeness_amended audit entry, so it is an audited decision
 	// rather than a silent default. It never relaxes the RESOLVED-and-started
-	// refusal (amend_refused_owner_slice_active).
+	// refusal (amend_refused_owner_slice_active), the slice-ownership refusal
+	// (amendment_path_owned_by_sibling_slice, slice_ownership_check_failed) or
+	// the ancestor-delivery proof.
 	AcknowledgeOwnerUnresolved bool `json:"acknowledge_owner_unresolved,omitempty"`
 }
 
@@ -151,9 +154,11 @@ type scopeCompletenessDecisionResponse struct {
 	// never duplicated) so the budget below cannot silently drain.
 	AmendmentID string `json:"amendment_id,omitempty"`
 	// OwnerAttributionUnresolved is true when the owner-slice guard could not
-	// establish ownership for at least one submitted path. It can only be true
-	// alongside AcknowledgedOwnerUnresolved — the unresolved arm otherwise
-	// refuses the amend outright (409 amend_owner_attribution_unresolved).
+	// establish ownership for at least one submitted path the parent's plan does
+	// not declare. It can only be true alongside AcknowledgedOwnerUnresolved —
+	// the unresolved arm otherwise refuses the amend outright (409
+	// amend_owner_attribution_unresolved). The acknowledgement never relaxes the
+	// slice-ownership refusal or the ancestor-delivery proof.
 	OwnerAttributionUnresolved bool `json:"owner_attribution_unresolved,omitempty"`
 	// OwnerUnresolvedPaths names each path whose ownership could not be
 	// resolved, with the reason, so the acknowledgement is auditable in detail.
