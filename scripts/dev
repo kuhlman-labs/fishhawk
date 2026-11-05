@@ -1483,22 +1483,49 @@ _decide_shim_signal() {
   print 1
 }
 
-# Pure: decide whether the fishhawk-mcp-shim is the registered MCP server.
-# Args: <override_value> <registration_text>
-#   - override '1'/'true'  -> 1 (explicit operator assertion, wins)
+# Pure: decide whether the fishhawk-mcp-shim is the registered MCP server. Prints
+# exactly one of 1 (registered), 0 (not registered) or undetermined (#4875).
+# Args: <override_value> <registration_text> [probe_rc], in this precedence:
+#   - override '1'/'true'  -> 1 (explicit operator assertion, wins over everything)
 #   - override '0'/'false' -> 0
-#   - empty override       -> 1 iff registration_text contains 'fishhawk-mcp-shim',
-#                             else 0 (absent/errored `claude mcp get` yields empty
-#                             text -> 0, which keeps the manual reconnect banner —
-#                             the fail-safe direction).
+#   - empty probe_rc       -> no probe ran: 1 iff registration_text contains
+#                             'fishhawk-mcp-shim', else 0 (an absent CLI or an
+#                             unrecognized override keeps the manual banner)
+#   - non-numeric probe_rc -> undetermined
+#   - probe_rc >= 124      -> undetermined, the text never consulted: 124 expired,
+#                             125 could not start, 126/127 launch failure,
+#                             >= 128 killed. An expired probe that printed shim
+#                             text is still no answer.
+#   - probe_rc 1-123       -> 0 (the CLI ran and answered no)
+#   - probe_rc 0           -> undetermined on empty text, else 1 iff the text
+#                             contains 'fishhawk-mcp-shim', else 0
 # Git/CLI-free so scripts/test-dev can drive every branch with crafted input.
 _shim_registered_from() {
   local override="$1"
   local reg_text="$2"
+  local probe_rc="${3:-}"
   case "$override" in
     1|true)  print 1; return ;;
     0|false) print 0; return ;;
   esac
+  if [[ -n "$probe_rc" ]]; then
+    if [[ "$probe_rc" != <-> ]]; then
+      print undetermined
+      return
+    fi
+    if (( probe_rc >= 124 )); then
+      print undetermined
+      return
+    fi
+    if (( probe_rc != 0 )); then
+      print 0
+      return
+    fi
+    if [[ -z "$reg_text" ]]; then
+      print undetermined
+      return
+    fi
+  fi
   if [[ "$reg_text" == *fishhawk-mcp-shim* ]]; then
     print 1
   else
@@ -1506,28 +1533,60 @@ _shim_registered_from() {
   fi
 }
 
+# Pure: map a precomputed registration answer to a value the banner can use. 0, 1
+# and undetermined pass through; anything else (an empty or failed precompute) is
+# undetermined, never a truthy or falsy guess.
+_normalize_shim_state() {
+  case "${1:-}" in
+    0|1|undetermined) print -r -- "$1" ;;
+    *) print -r -- undetermined ;;
+  esac
+}
+
 # Impure: is the shim registered as the MCP server this session? An explicit
 # FISHHAWK_MCP_SHIM_REGISTERED override (sourced from .env before the banner
-# decision) wins; otherwise, when the `claude` CLI is present, best-effort match
-# `claude mcp get fishhawk` output for the shim binary. The lookup is guarded
-# (command -v + if-condition capture, set -e safe); an absent CLI or a non-zero
-# lookup degrades to empty text -> not-registered, preserving the manual banner.
+# decision) wins and runs no probe; otherwise, when the `claude` CLI is present,
+# ask it through the bounded runner, which also bounds a CLI that ignores TERM
+# (#4875). An absent CLI prints 0, and a probe that gave no usable answer prints
+# undetermined. The probe text stays in reg_text and is never printed or logged.
 _detect_shim_registered() {
   local override="${FISHHAWK_MCP_SHIM_REGISTERED:-}"
-  local reg_text=""
+  local reg_text="" probe_rc=""
   if [[ -z "$override" ]] && command -v claude &>/dev/null; then
-    if ! reg_text="$(claude mcp get fishhawk 2>/dev/null)"; then reg_text=""; fi
+    if reg_text="$(_run_bounded_capture "$_MCP_REGISTRATION_PROBE_TIMEOUT" "$_MCP_REGISTRATION_PROBE_GRACE" claude mcp get fishhawk)"; then
+      probe_rc=0
+    else
+      probe_rc=$?
+      reg_text=""
+    fi
   fi
-  _shim_registered_from "$override" "$reg_text"
+  _shim_registered_from "$override" "$reg_text" "$probe_rc"
+}
+
+# Impure, and only ever called inside $( ): cmd_reload's precompute. It runs before
+# cmd_up's own .env load, so it loads .env first for the override, in the
+# substitution's subshell so nothing leaks into the reload. .env output and a
+# non-fatal .env failure must not become the state: the group is silenced and
+# tested. A .env that calls `exit` still ends this subshell with empty output,
+# which cmd_reload normalizes to undetermined.
+_detect_shim_registered_with_env() {
+  if [[ -f "${REPO_ROOT}/.env" ]]; then
+    { set -a; source "${REPO_ROOT}/.env"; set +a; } >/dev/null 2>&1 || true
+  fi
+  _detect_shim_registered
 }
 
 # Pure: map the four MCP-activation inputs to exactly one banner kind, in fixed
 # precedence order. Args:
-#   <schema_major 0|1> <shim_signal 0|1> <mcp_signal 0|1> <shim_registered 0|1>
+#   <schema_major 0|1> <shim_signal 0|1> <mcp_signal 0|1>
+#   <shim_registered 0|1|undetermined>
+# shim_registered is classified by string before any arithmetic, so a word never
+# reaches (( )): 1 is registered, 0 is not, and anything else is undetermined.
 #   1. schema_major — a workflow-spec MAJOR bump (#1422) breaks every start_run
 #      against the live server's stale embedded schema, UNLESS a registered
 #      ADR-060 shim has already hot-swapped the child (kind 1b); unconditional
-#      and first.
+#      and first. Undetermined registration keeps this stern kind (#4875): the
+#      only proof of a swap would be the registration we could not read.
 #   1b. schema_major_shim — the same bump, but the shim IS registered and the
 #      shim binary itself was NOT rebuilt this run, so the swapped child is
 #      expected to carry the new major (#2349). Same precedence slot; only the
@@ -1541,15 +1600,21 @@ _detect_shim_registered() {
 #      manual-reconnect banner.
 #   4. auto_swap — mcp changed and the shim IS registered: the registered shim
 #      hot-swaps the rebuilt child automatically; a one-line verifiable note.
+#   4b. undetermined — mcp changed and registration could not be read (#4875):
+#      a VERIFY banner, because neither reconnect nor auto_swap would be true.
 #   5. none — nothing MCP-relevant changed.
 _select_mcp_banner() {
   local schema_major="$1"
   local shim_signal="$2"
   local mcp_signal="$3"
-  local shim_registered="$4"
+  local registration=undetermined
+  case "$4" in
+    1) registration=registered ;;
+    0) registration=unregistered ;;
+  esac
 
   if (( schema_major )); then
-    if (( shim_registered )) && (( ! shim_signal )); then
+    if [[ "$registration" == registered ]] && (( ! shim_signal )); then
       print "schema_major_shim"
     else
       print "schema_major"
@@ -1558,11 +1623,11 @@ _select_mcp_banner() {
   fi
   if (( shim_signal )); then print "shim_rebuilt"; return; fi
   if (( mcp_signal )); then
-    if (( shim_registered )); then
-      print "auto_swap"
-    else
-      print "reconnect"
-    fi
+    case "$registration" in
+      registered)   print "auto_swap" ;;
+      unregistered) print "reconnect" ;;
+      *)            print "undetermined" ;;
+    esac
     return
   fi
   print "none"
@@ -1571,12 +1636,13 @@ _select_mcp_banner() {
 # Emits the MCP-activation signal — must be the LAST thing printed by up/reload
 # so it is unmissable. Arg 1: the banner KIND from _select_mcp_banner
 # (schema_major | schema_major_shim | shim_rebuilt | reconnect | auto_swap |
-# none). scripts/dev cannot restart the MCP server (the Claude Code harness owns
-# that process), so on a change that leaves the live server stale the only lever
-# is to tell the operator, unmissably, what manual action is required — EXCEPT
-# the auto_swap and schema_major_shim cases, where a registered
-# fishhawk-mcp-shim is EXPECTED to have refreshed the child, so the banner names
-# the verification and the refutation path instead of demanding a reconnect.
+# undetermined | none). scripts/dev cannot restart the MCP server (the Claude Code
+# harness owns that process), so on a change that leaves the live server stale the
+# only lever is to tell the operator, unmissably, what manual action is required —
+# EXCEPT the auto_swap and schema_major_shim cases, where a registered
+# fishhawk-mcp-shim is EXPECTED to have refreshed the child, and the undetermined
+# case, where it might have: those banners name the verification and the refutation
+# path instead of demanding a reconnect.
 _signal_mcp_activation() {
   local kind="${1:-none}"
   case "$kind" in
@@ -1638,6 +1704,21 @@ _signal_mcp_activation() {
       ;;
     auto_swap)
       print "bin/fishhawk-mcp rebuilt; the registered fishhawk-mcp-shim SHOULD hot-swap it within ~2 poll intervals. Confirm with a version-returning tool call reflecting the new GitSHA (#1007) — if it still reports the old SHA the swap did not happen (#2831): run 'bin/fishhawk-mcp-shim --status' for the reason, then /mcp."
+      ;;
+    undetermined)
+      print ""
+      print "================================================================"
+      print "  VERIFY: bin/fishhawk-mcp was rebuilt this run, and"
+      print "  'claude mcp get fishhawk' gave no usable answer, so the"
+      print "  fishhawk-mcp-shim registration is undetermined (#4875)."
+      print ""
+      print "  A registered shim SHOULD hot-swap the rebuilt child. CONFIRM"
+      print "  it: a version-returning tool call reflecting the new GitSHA"
+      print "  (#1007)."
+      print ""
+      print "  If it still reports the old SHA the swap did not happen: run"
+      print "  'bin/fishhawk-mcp-shim --status' for the reason, then /mcp."
+      print "================================================================"
       ;;
     none|*)
       print "no MCP reconnect needed (bin/fishhawk-mcp unchanged)"
@@ -1797,6 +1878,139 @@ _run_with_timeout() {
   if (( watch_rc == 0 && rc != 0 )); then
     return 124
   fi
+  return "$rc"
+}
+
+# Bounds for the `claude mcp get fishhawk` registration probe (#4875). Assigned at
+# file scope, so the environment cannot change them. The issue's limit is 10s for
+# the whole probe: 5 + 2 plus two `ps` reads stays inside it.
+_MCP_REGISTRATION_PROBE_TIMEOUT=5
+_MCP_REGISTRATION_PROBE_GRACE=2
+
+# Refresh the caller's `typeset -A _probe_tree_ids` (pid -> start time) from ONE
+# `ps` table, so a signal round acts only on identities verified just before it.
+# A failed or empty read clears the map and returns 1: no identity, no signal.
+# Otherwise, using that one table:
+#   - a recorded pid whose start time no longer matches is dropped (recycled);
+#   - <root_pid> is admitted only if its parent in this table is this shell, read
+#     from $sysparams[pid] because $$ is the top-level shell inside $( ); without
+#     zsh/system no root is admitted;
+#   - descendants of admitted and surviving entries are added.
+# Everything fallible is tested, for an untested caller's errexit and TRAPZERR. Rows
+# are split with ${=row}, not a here-string, which zsh backs with a temp file.
+# Arg: [root_pid]
+_probe_tree_refresh() {
+  local root_pid="${1:-}"
+  local IFS=$' \t\n'
+  local table="" row="" pid="" self="" start="" added=1
+  local -a fields
+  local -A table_ppid table_start
+  if ! table="$(ps -A -o pid= -o ppid= -o lstart= </dev/null 2>/dev/null)" || [[ -z "$table" ]]; then
+    _probe_tree_ids=()
+    return 1
+  fi
+  for row in "${(@f)table}"; do
+    fields=(${=row})
+    if (( ${#fields} >= 3 )) && [[ "${fields[1]}" == <-> && "${fields[2]}" == <-> ]]; then
+      table_ppid[${fields[1]}]="${fields[2]}"
+      table_start[${fields[1]}]="${(j: :)fields[3,-1]}"
+    fi
+  done
+  for pid start in "${(@kv)_probe_tree_ids}"; do
+    if [[ "${table_start[$pid]:-}" != "$start" ]]; then
+      unset "_probe_tree_ids[$pid]"
+    fi
+  done
+  if [[ -n "$root_pid" ]]; then
+    zmodload zsh/system 2>/dev/null || true
+    self="${sysparams[pid]:-}"
+    if [[ -n "$self" && "${table_ppid[$root_pid]:-}" == "$self" ]]; then
+      _probe_tree_ids[$root_pid]="${table_start[$root_pid]}"
+    fi
+  fi
+  while (( added )); do
+    added=0
+    for pid in "${(@k)table_ppid}"; do
+      if [[ -z "${_probe_tree_ids[$pid]:-}" && -n "${_probe_tree_ids[${table_ppid[$pid]}]:-}" ]]; then
+        _probe_tree_ids[$pid]="${table_start[$pid]}"
+        added=1
+      fi
+    done
+  done
+  return 0
+}
+
+# Send <TERM|KILL> to each positive pid in the caller's _probe_tree_ids. Never a
+# process group: this shell has no isolated group, so a group signal could reach
+# the reload itself (scripts/README.md, "Bounded registration probe").
+_probe_tree_signal() {
+  local sig="$1" pid=""
+  for pid in "${(@k)_probe_tree_ids}"; do
+    if [[ "$pid" == <1-> ]]; then
+      kill "-${sig}" "$pid" 2>/dev/null || true
+    fi
+  done
+}
+
+# Run a command with a hard wall-clock bound, ALWAYS inside $( ): the command's
+# stdout is printed only if it finished in time. Returns the command's own status,
+# 124 on expiry or an unusable status report, 125 if the output file could not be
+# created; a TERM, INT or HUP exits 143, 130 or 129 after the same sweep.
+#
+# This is separate from _run_with_timeout, which only sends TERM and then waits on
+# the command, so a TERM-ignoring or unkillable command still hangs its caller.
+# Here the capture shell itself is the timer, blocked in `read -t` on a coprocess
+# pipe that a small wrapper uses to report the command's status. No sleeper exists,
+# so the normal path sends no signal and nothing can hold the caller's pipe. A line
+# matching rc=<digits> is the only way to finish. Expiry is therefore
+# authoritative: a command that prints text and exits 0 on TERM is still expired.
+#
+# The expiry path sweeps and returns without waiting on the wrapper or the command,
+# so the bound holds even if a process cannot be killed: worst case is
+# secs + grace plus two `ps` reads. A descendant that re-parented before the first
+# table read escapes the sweep, but holds only the unlinked output file.
+#
+# Everything fallible is tested, including the command in the wrapper. The production
+# caller's `if` switches errexit off inside its substitution, but under an untested
+# caller errexit and TRAPZERR are live here, and a failure would abort mid-sweep and
+# skip the always-list (zshmisc(1)). Traps only record, so no work runs in trap
+# context. Args: <secs> <grace> <cmd> [args...]
+_run_bounded_capture() {
+  setopt localoptions localtraps
+  local secs="$1" grace="$2"
+  shift 2
+  local pending=0 rc=0 command_rc=0 outfile="" wrapper="" line=""
+  local -A _probe_tree_ids
+  trap 'pending=143' TERM
+  trap 'pending=130' INT
+  trap 'pending=129' HUP
+  if ! outfile="$(mktemp "${TMPDIR:-/tmp}/fishhawk-mcp-probe.XXXXXX" 2>/dev/null)"; then
+    if (( pending )); then exit "$pending"; fi
+    return 125
+  fi
+  {
+    coproc {
+      if "$@" >"$outfile" 2>/dev/null </dev/null; then
+        command_rc=0
+      else
+        command_rc=$?
+      fi
+      print -r -- "rc=${command_rc}"
+    } 2>/dev/null
+    wrapper=$!
+    if (( ! pending )) && read -t "$secs" -p line && [[ "$line" == rc=<-> ]]; then
+      rc="${line#rc=}"
+      cat -- "$outfile" 2>/dev/null || true
+    else
+      rc=124
+      if _probe_tree_refresh "$wrapper"; then _probe_tree_signal TERM; fi
+      sleep "$grace" </dev/null >/dev/null 2>&1 || true
+      if _probe_tree_refresh; then _probe_tree_signal KILL; fi
+    fi
+  } always {
+    rm -f -- "$outfile" 2>/dev/null || true
+  }
+  if (( pending )); then exit "$pending"; fi
   return "$rc"
 }
 
@@ -2690,7 +2904,15 @@ _wire_trace_store() {
   return 0
 }
 
+# cmd_reload's registration answer for the cmd_up it is about to call (#4875), so
+# nothing probes after the teardown. Declared here, unexported, so an ambient value
+# cannot inject a state.
+typeset -g +x _SHIM_REGISTERED_PRECOMPUTED=""
+
 cmd_up() {
+  # Before the .env load below, which could otherwise set the carrier.
+  local shim_precomputed="$_SHIM_REGISTERED_PRECOMPUTED"
+  _SHIM_REGISTERED_PRECOMPUTED=""
   print "up: starting"
   _warn_stale_worktrees || true
   _warn_stale_shim "${REPO_ROOT}/bin/fishhawk-mcp-shim" || true
@@ -2878,14 +3100,23 @@ cmd_up() {
   local shim_signal
   shim_signal="$(_decide_shim_signal "$shim_rebuilt" "$force_all" "$reflog_ok" "$merge_diff")"
 
-  # Is the shim the registered MCP server? An .env override (sourced above at the
-  # top of cmd_up) wins over a best-effort `claude mcp get fishhawk` probe; an
-  # absent/errored CLI degrades to not-registered, keeping the manual banner.
-  local shim_registered
-  shim_registered="$(_detect_shim_registered)"
+  # Is the shim the registered MCP server? cmd_reload's precomputed answer is used
+  # as-is, so a reload never probes after its teardown. Otherwise an .env override
+  # (sourced above at the top of cmd_up) wins over a bounded `claude mcp get
+  # fishhawk` probe; a probe with no usable answer reports undetermined (#4875).
+  local shim_registered=""
+  case "$shim_precomputed" in
+    0|1|undetermined)
+      shim_registered="$shim_precomputed"
+      ;;
+    *)
+      if ! shim_registered="$(_detect_shim_registered)"; then shim_registered=undetermined; fi
+      shim_registered="$(_normalize_shim_state "$shim_registered")"
+      ;;
+  esac
 
-  # Exactly one banner kind (schema_major | shim_rebuilt | reconnect | auto_swap
-  # | none), in fixed precedence.
+  # Exactly one banner kind (schema_major | schema_major_shim | shim_rebuilt |
+  # reconnect | auto_swap | undetermined | none), in fixed precedence.
   local mcp_banner_kind
   mcp_banner_kind="$(_select_mcp_banner "$workflow_major_changed" "$shim_signal" "$mcp_signal" "$shim_registered")"
 
@@ -3032,8 +3263,8 @@ cmd_up() {
   # requires. The kind selects among the schema-major banner (#1422), its
   # registered-shim sibling that asks you to VERIFY rather than reconnect
   # (#2349), the distinct shim-rebuilt banner, the plain mcp reconnect banner,
-  # the one-line auto-swap note (registered shim, ADR-060 / #1922), or the
-  # no-op line.
+  # the one-line auto-swap note (registered shim, ADR-060 / #1922), the VERIFY
+  # banner for an undetermined registration (#4875), or the no-op line.
   _signal_mcp_activation "$mcp_banner_kind"
 }
 
@@ -3588,8 +3819,9 @@ cmd_reload() {
   done
 
   # --when-quiet: usage checks BEFORE any check or teardown (exit 2), then the
-  # bounded wait. Once quiet it falls through to the normal guards below — a
-  # cheap re-check that narrows (never closes) the scan-to-teardown window.
+  # bounded wait. Once quiet it falls through to the probe and the normal guards
+  # below — a cheap re-check that narrows (never closes) the scan-to-teardown
+  # window.
   if (( when_quiet )); then
     if (( force )); then
       print -u2 "usage: scripts/dev reload: --when-quiet and --force are mutually exclusive (--when-quiet waits for the guards to clear; --force overrides them)"
@@ -3604,6 +3836,14 @@ cmd_reload() {
       exit 1
     fi
   fi
+
+  # Registration probe (#4875): BEFORE the guards, so a slow probe cannot widen the
+  # window between the final guard scan and the teardown, and before any teardown,
+  # so a hung `claude` cannot leave the backend down. A failed or empty precompute
+  # becomes undetermined, and cmd_up uses this answer instead of probing again.
+  local shim_state=""
+  if ! shim_state="$(_detect_shim_registered_with_env)"; then shim_state=""; fi
+  _SHIM_REGISTERED_PRECOMPUTED="$(_normalize_shim_state "$shim_state")"
 
   # Live-run guard (#2897) BEFORE any teardown, so the refusal is structurally
   # ahead of the stop. Tested context: a deliberate refusal must not fire the
