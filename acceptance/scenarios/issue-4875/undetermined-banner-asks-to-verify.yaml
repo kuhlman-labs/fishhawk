@@ -1,0 +1,14 @@
+id: scenario:issue-4875/undetermined-banner-asks-to-verify
+statement: An undetermined registration with only the MCP binary changed selects the `undetermined` banner kind, and that banner says registration is undetermined and names a version-returning tool call, without saying ACTION REQUIRED, not registered, or no reconnect needed.
+verify_hint: 'CLI stdout: in library mode, `_select_mcp_banner 0 0 1 undetermined` prints `undetermined`, and `_signal_mcp_activation undetermined` prints the banner text to check.'
+steps: 'Library mode: print _select_mcp_banner 0 0 1 undetermined, then _signal_mcp_activation undetermined, and read the text.'
+assertions:
+    expected: Verify wording with none of the forbidden phrases.
+    observed_at_record: Kind undetermined. The banner starts VERIFY, says 'the fishhawk-mcp-shim registration is undetermined (#4875)' and asks for 'a version-returning tool call reflecting the new GitSHA (#1007)'. It contains no ACTION REQUIRED, not registered, or no reconnect needed.
+    repro_handle: _signal_mcp_activation undetermined
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

@@ -38,6 +38,11 @@ orig_pwd="$PWD"
 # auto-trim) never resolve or touch the HOST cache while the older cmd_up /
 # sweep / post-merge fixtures run. The GC cases override it per subshell.
 export FISHHAWK_GOCACHE_MAX_GB=0
+# Hermeticity for the registration probe (#4875): no row reaches the host `claude`.
+# The probe rows in the #4875 section unset this inside their own subshells, with
+# PATH fully replaced. Same reasoning for the .env precompute: every row driving the
+# real cmd_reload points REPO_ROOT at a temp dir.
+export FISHHAWK_MCP_SHIM_REGISTERED=0
 
 # A high port with no LISTEN socket, for the port-preflight fixtures (#965,
 # E69.6 / #2917). Prints nothing when it cannot find one in five tries, so
@@ -691,12 +696,13 @@ if [[ "$(_shim_registered_from '' 'command: /path/to/bin/fishhawk-mcp')" == 0 ]]
 else
   fail "_shim_registered_from: empty override + non-matching text should be 0"
 fi
-# Empty override + empty text (absent/errored `claude mcp get`) degrades to 0 —
-# the fail-safe direction that keeps the manual reconnect banner.
+# Two arguments means no probe ran (an absent `claude` CLI): empty text is 0, the
+# fail-safe direction that keeps the manual reconnect banner. The probe-status
+# rows are in the #4875 section.
 if [[ "$(_shim_registered_from '' '')" == 0 ]]; then
-  pass "_shim_registered_from: empty override + empty text degrades to 0 (fail-safe)"
+  pass "_shim_registered_from: no probe ran + empty text -> 0 (fail-safe)"
 else
-  fail "_shim_registered_from: empty override + empty text should degrade to 0"
+  fail "_shim_registered_from: no probe ran + empty text should be 0"
 fi
 
 # 5g. _select_mcp_banner precedence (ADR-060 / #1922). Args:
@@ -6844,6 +6850,7 @@ _lr_run_reload() {
   lr_upargs="${lr_dir}/upargs"
   lr_out="$(
     setopt errexit
+    REPO_ROOT="$lr_dir"
     PID_FILE="${lr_dir}/dev.pid"
     : > "$PID_FILE"
     case "$mode" in
@@ -6855,7 +6862,7 @@ _lr_run_reload() {
     # GET the HOST daemon on :8080. The RB cases below drive it for real.
     _refuse_on_restart_blockers() { return 0 }
     cmd_down() { print -r -- "down" >> "$lr_marker" }
-    cmd_up()   { print -r -- "$*" > "$lr_upargs"; print -r -- "up" >> "$lr_marker" }
+    cmd_up()   { print -r -- "$REPO_ROOT" > "${lr_dir}/repo_root"; print -r -- "$*" > "$lr_upargs"; print -r -- "up" >> "$lr_marker" }
     cmd_reload "$@" 2>"${lr_dir}/err"
   )"
   lr_rc=$?
@@ -7815,7 +7822,7 @@ _rb_run_reload() {
     # host this suite runs on during a campaign.
     _scan_live_runs() { return 0 }
     cmd_down() { print -r -- "down" >> "$rb_marker" }
-    cmd_up()   { print -r -- "up" >> "$rb_marker" }
+    cmd_up()   { print -r -- "$REPO_ROOT" > "${rb_dir}/repo_root"; print -r -- "up" >> "$rb_marker" }
     cmd_reload "$@" 2>"${rb_dir}/err"
   )"
   rb_rc=$?
@@ -8120,7 +8127,8 @@ if print -r -- "$rb_reload_body" | grep_q '_refuse_on_restart_blockers "$force" 
 else
   fail "RB-m the guard's context arg should be 'reload' in cmd_reload and 'post-merge' in cmd_post_merge"
 fi
-# RB-m the --when-quiet wait sits BEFORE both guards (it falls through to them).
+# RB-m the --when-quiet wait sits BEFORE both guards (it falls through to the
+# #4875 probe, then to them).
 rb_wait_at="$(print -r -- "$rb_reload_body" | grep -n '_reload_wait_until_quiet' | head -n 1 | cut -d: -f1)"
 rb_lr_at="$(print -r -- "$rb_reload_body" | grep -n '_refuse_on_live_runs' | head -n 1 | cut -d: -f1)"
 if [[ -n "$rb_wait_at" && -n "$rb_lr_at" ]] && (( rb_wait_at < rb_lr_at )); then
@@ -8177,7 +8185,7 @@ _wq_run() {
     }
     _reload_quiet_sleep() { print -r -- "$1" >> "$wq_sleeps" }
     cmd_down() { print -r -- "down" >> "$wq_marker" }
-    cmd_up()   { print -r -- "up" >> "$wq_marker" }
+    cmd_up()   { print -r -- "$REPO_ROOT" > "${wq_dir}/repo_root"; print -r -- "up" >> "$wq_marker" }
     cmd_reload "$@" 2>"${wq_dir}/err"
   )"
   wq_rc=$?
@@ -8289,6 +8297,1410 @@ else
 fi
 rm -rf "$wq_dir"
 wq_interval=""
+
+# ---------------------------------------------------------------------------
+# Bounded registration probe (#4875)
+# BEGIN #4875 SECTION
+# ---------------------------------------------------------------------------
+# Probe rows run in a real $( ) with PATH fully replaced by <stubdir>:/usr/bin:/bin,
+# so the real `claude` can never run; .env files are synthetic, under a temp
+# REPO_ROOT. Only pids the fixtures recorded are ever signalled here, by pid, never
+# a process group. Elapsed bounds are margins, not measurements: expiry rows run
+# 1s + 1s against 20s stubs and fast rows run against a bound of 8s or 20s, so
+# SRP_SLOW separates them on a loaded host. The one exception is the issue's own
+# limit, which SRP-d asserts at the default constants.
+# BEGIN #4875 HELPERS
+zmodload zsh/datetime
+zmodload zsh/system
+SRP_SLOW=10
+srp_t_lines=()
+
+_srp_new() {
+  srp_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-srp.XXXXXX")"
+  srp_bin="${srp_dir}/bin"
+  srp_tmp="${srp_dir}/tmp"
+  srp_klog="${srp_dir}/kill.log"
+  srp_timeout=1
+  srp_grace=1
+  srp_merge=0
+  srp_rc=0
+  srp_out=""
+  unset srp_override
+  mkdir -p "$srp_bin" "$srp_tmp"
+}
+# Remove only what this row recorded, and never this shell or pid 1.
+_srp_end() {
+  local f="" pid=""
+  for f in "$srp_dir"/*.pid(N); do
+    pid="$(<"$f")"
+    if [[ "$pid" == <2-> && "$pid" != "$$" ]]; then builtin kill -KILL "$pid" 2>/dev/null; fi
+  done
+  rm -rf "$srp_dir"
+}
+# Write a /bin/sh stub from stdin. Stubs read SRP_D, exported by _srp_base_env.
+_srp_stub() {
+  { print -r -- '#!/bin/sh'; cat } > "${srp_bin}/$1"
+  chmod +x "${srp_bin}/$1"
+}
+_srp_stub_hang() {
+  _srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+echo $PPID > "$SRP_D/wrapper.pid"
+echo probe >> "$SRP_D/order"
+echo "command: fishhawk-mcp-shim"
+exec sleep 20
+STUB
+}
+_srp_stub_hang_ignoring() {
+  _srp_stub claude <<'STUB'
+trap '' TERM
+echo $$ > "$SRP_D/stub.pid"
+echo $PPID > "$SRP_D/wrapper.pid"
+echo probe >> "$SRP_D/order"
+sleep 20 &
+echo $! > "$SRP_D/grandchild.pid"
+wait $!
+STUB
+}
+_srp_base_env() {
+  unset FISHHAWK_MCP_SHIM_REGISTERED
+  if [[ -n "${srp_override+x}" ]]; then export FISHHAWK_MCP_SHIM_REGISTERED="$srp_override"; fi
+  export SRP_D="$srp_dir" SRP_PS="${commands[ps]:-/bin/ps}" SRP_SLEEP="${commands[sleep]:-/bin/sleep}" TMPDIR="$srp_tmp"
+  PATH="${srp_bin}:/usr/bin:/bin"
+  _MCP_REGISTRATION_PROBE_TIMEOUT="$srp_timeout"
+  _MCP_REGISTRATION_PROBE_GRACE="$srp_grace"
+}
+_srp_env() {
+  _srp_base_env
+  kill() {
+    builtin print -r -- "${sysparams[pid]:-} $*" >> "$srp_klog"
+    builtin kill "$@"
+  }
+}
+# Run "$@" in a real $( ) under errexit; srp_merge=1 points its stderr at the
+# substitution pipe, so anything inheriting stderr holds this call open. The
+# assignment stays untested in these harnesses: `x="$( )" || rc=$?` would switch
+# errexit off inside the substitution too, and hide every errexit failure.
+_srp_call() {
+  local t0=$EPOCHREALTIME
+  srp_out="$(
+    setopt errexit
+    _srp_env
+    if (( srp_merge )); then
+      "$@" 2>&1
+    else
+      "$@" 2>"${srp_dir}/err"
+    fi
+  )"
+  srp_rc=$?
+  srp_elapsed=$(( EPOCHREALTIME - t0 ))
+}
+_srp_pid() { if [[ -f "${srp_dir}/$1.pid" ]]; then print -r -- "$(<"${srp_dir}/$1.pid")"; fi }
+_srp_gone() {
+  local pid="$1" st="" i=0
+  if [[ -z "$pid" ]]; then return 1; fi
+  while (( i < 50 )); do
+    st="$(ps -o stat= -p "$pid" 2>/dev/null)"
+    if [[ -z "$st" || "$st" == Z* ]]; then return 0; fi
+    sleep 0.1
+    (( ++i ))
+  done
+  return 1
+}
+_srp_alive() {
+  local st=""
+  if [[ -z "${1:-}" ]]; then return 1; fi
+  st="$(ps -o stat= -p "$1" 2>/dev/null)"
+  [[ -n "$st" && "$st" != Z* ]]
+}
+_srp_await_file() {
+  local i=0
+  while (( i < 100 )); do
+    if [[ -s "$1" ]]; then return 0; fi
+    sleep 0.05
+    (( ++i ))
+  done
+  return 1
+}
+_srp_tmp_empty() {
+  local -a left
+  left=("$srp_tmp"/*(ND))
+  (( ${#left} == 0 ))
+}
+_srp_klog() { if [[ -f "$srp_klog" ]]; then cat "$srp_klog"; fi }
+_srp_err() { if [[ -f "${srp_dir}/err" ]]; then cat "${srp_dir}/err"; fi }
+_srp_state() {
+  print -r -- "rc=${srp_rc} out=[${srp_out}] elapsed=${srp_elapsed:-?} tmp=[$(ls -A "$srp_tmp" 2>/dev/null)] kills=[$(_srp_klog)] err=[$(_srp_err)]"
+}
+_srp_collect_kills() { if [[ -f "$srp_klog" ]]; then srp_t_lines+=("${(@f)$(<"$srp_klog")}"); fi }
+# Start _run_bounded_capture as a signalable shell, reporting into private files.
+# A `( ) &` keeps the capture shell's own pid in $!.
+_srp_bg_capture() {
+  (
+    setopt errexit
+    _srp_env
+    _run_bounded_capture "$srp_timeout" "$srp_grace" claude mcp get fishhawk
+  ) >"${srp_dir}/out" 2>"${srp_dir}/err" &
+  srp_bg_pid=$!
+}
+_srp_has_kill() { [[ -f "$srp_klog" ]] && grep -q -- "$1" "$srp_klog"; }
+# A fresh zsh under the REAL #631 TRAPZERR and errexit, running <statements> after
+# sourcing the library, so a failure anywhere aborts and prints `command failed`.
+_srp_zerr_statements() {
+  local fixture="${srp_dir}/zerr-fixture.zsh"
+  local zsh_bin="${commands[zsh]:-/bin/zsh}" ps_bin="${commands[ps]:-/bin/ps}" sleep_bin="${commands[sleep]:-/bin/sleep}"
+  {
+    print -r -- 'set -euo pipefail'
+    print -r -- "DEV_LIB_ONLY=1 source \"${REPO_ROOT}/scripts/dev\""
+    print -r -- "$1"
+  } > "$fixture"
+  srp_z_out="$(SRP_D="$srp_dir" SRP_PS="$ps_bin" SRP_SLEEP="$sleep_bin" TMPDIR="$srp_tmp" PATH="${srp_bin}:/usr/bin:/bin" "$zsh_bin" "$fixture" 2>"${srp_dir}/err")"
+  srp_z_rc=$?
+}
+# The state assigned in an UNTESTED statement, as cmd_up used to do.
+_srp_zerr_run() {
+  _srp_zerr_statements "unset FISHHAWK_MCP_SHIM_REGISTERED
+_MCP_REGISTRATION_PROBE_TIMEOUT=${srp_timeout}
+_MCP_REGISTRATION_PROBE_GRACE=${srp_grace}
+state=\"\$(_detect_shim_registered)\"
+print -r -- \"state=\${state}\""
+}
+_srp_zerr_ok() {
+  [[ "$srp_z_out" == "state=$1" ]] && (( srp_z_rc == 0 )) && [[ "$(_srp_err)" != *"command failed"* ]]
+}
+# The same real trap and errexit with the RUNNER as the untested statement.
+# _detect_shim_registered's own `if` switches errexit off inside its substitution,
+# so only this form reaches the runner with errexit live. The runner's own non-zero
+# return is reported by the trap at its `return` and at the fixture's line. Any other
+# status or stderr line means a statement inside the runner failed.
+_srp_zerr_capture_run() {
+  _srp_zerr_statements "out=\"\$(_run_bounded_capture ${srp_timeout} ${srp_grace} claude mcp get fishhawk)\"
+print -r -- \"out=\${out}\""
+}
+_srp_zerr_capture_ok() {
+  local want="$1" line=""
+  if (( srp_z_rc != want )); then return 1; fi
+  for line in "${(@f)$(_srp_err)}"; do
+    if [[ -n "$line" && "$line" != *"command failed (exit ${want})"* ]]; then return 1; fi
+  done
+  return 0
+}
+
+_rlp_new() {
+  _srp_new
+  rlp_root="${srp_dir}/root"
+  rlp_order="${srp_dir}/order"
+  rlp_carrier="${srp_dir}/carrier"
+  rlp_live=0
+  rlp_major=0
+  mkdir -p "${rlp_root}/.fishhawk"
+  touch "${rlp_root}/README.md"
+}
+_rlp_end() {
+  if [[ -f "${rlp_root}/.fishhawk/dev.pid" ]]; then
+    builtin kill -KILL "$(<"${rlp_root}/.fishhawk/dev.pid")" 2>/dev/null
+  fi
+  _srp_end
+}
+_rlp_seq() { if [[ -f "$rlp_order" ]]; then print -r -- "${(j: :)${(@f)$(<"$rlp_order")}}"; fi }
+_rlp_count() { if [[ -f "$rlp_order" ]]; then grep -c "^$1\$" "$rlp_order"; else print 0; fi }
+_rlp_state() { print -r -- "rc=${rlp_rc} order=[$(_rlp_seq)] carrier=[$(cat "$rlp_carrier" 2>/dev/null)] elapsed=${rlp_elapsed:-?} err=[$(_srp_err)] out=[${rlp_out}]" }
+_rlp_env() {
+  _srp_base_env
+  REPO_ROOT="$rlp_root"
+  PID_FILE="${rlp_root}/.fishhawk/dev.pid"
+  NONCE_FILE="${rlp_root}/.fishhawk/dev.nonce"
+  LOG_DIR="${rlp_root}/logs"
+  LOG_FILE="${rlp_root}/logs/fishhawkd.log"
+  BIN="${srp_dir}/fishhawkd"
+  _scan_live_runs() {
+    print -r -- live-guard >> "$rlp_order"
+    if (( rlp_live )); then print -r -- "4242"$'\t'"rlp-run-1"; fi
+    return 0
+  }
+  _fetch_restart_blockers() {
+    print -r -- restart-guard >> "$rlp_order"
+    print -r -- '{"items":[],"scanned_runs":0,"truncated":false}'
+    return 0
+  }
+  cmd_down() {
+    print -r -- down >> "$rlp_order"
+    rm -f "$PID_FILE"
+  }
+}
+_rlp_stub_up() {
+  cmd_up() {
+    print -r -- "$_SHIM_REGISTERED_PRECOMPUTED" > "$rlp_carrier"
+    print -r -- up >> "$rlp_order"
+  }
+}
+# The _ts_run_up stub set, keeping the real _detect_shim_registered and the real
+# banner functions, with the mcp signal on and the shim signal off.
+_rlp_real_up_stubs() {
+  print -r -- '#!/bin/sh
+case "$1" in
+  serve) exec sleep 20 ;;
+esac
+exit 0' > "$BIN"
+  chmod +x "$BIN"
+  docker() {
+    case "$1" in
+      ps) if [[ "$*" == *postgres* ]]; then print fishhawk-postgres; else print fishhawk-rustfs; fi ;;
+    esac
+    return 0
+  }
+  git() { return 1 }
+  _warn_stale_worktrees() { return 0 }
+  _warn_stale_shim() { return 0 }
+  _preflight_port_free() { return 0 }
+  _detect_rebuild_set() { : }
+  _build_binary() { return 0 }
+  _await_healthz() { return 0 }
+  _verify_healthz_nonce() { return 0 }
+  _tls_enabled() { return 1 }
+  _relay_enabled() { return 1 }
+  _decide_mcp_signal() { print 1 }
+  _decide_shim_signal() { print 0 }
+  _workflow_major_changed() { print "$rlp_major" }
+  disown() { : }
+}
+# <stub|real> [cmd_reload args...]: the real cmd_reload with a stubbed teardown.
+_rlp_reload() {
+  local up_kind="$1" t0=$EPOCHREALTIME
+  shift
+  rlp_out="$(
+    setopt errexit
+    _rlp_env
+    : > "$PID_FILE"
+    if [[ "$up_kind" == stub ]]; then _rlp_stub_up; else _rlp_real_up_stubs; fi
+    cmd_reload "$@" 2>"${srp_dir}/err"
+  )"
+  rlp_rc=$?
+  rlp_elapsed=$(( EPOCHREALTIME - t0 ))
+}
+# Plain cmd_up, with no reload in front of it. Arg: [carrier value to seed].
+_rlp_plain_up() {
+  local seed="${1:-}"
+  rlp_out="$(
+    setopt errexit
+    _rlp_env
+    _rlp_real_up_stubs
+    _SHIM_REGISTERED_PRECOMPUTED="$seed"
+    cmd_up 2>"${srp_dir}/err"
+  )"
+  rlp_rc=$?
+}
+# END #4875 HELPERS
+
+# BEGIN ROW PURE-classifier
+srp_bad=""
+for srp_row in \
+  '1||124|1' '1||127|1' '1|fishhawk-mcp-shim|0|1' \
+  'true||124|1' 'true||127|1' 'true|fishhawk-mcp-shim|0|1' \
+  '0||124|0' '0||127|0' '0|fishhawk-mcp-shim|0|0' \
+  'false||124|0' 'false||127|0' 'false|fishhawk-mcp-shim|0|0' \
+  '||124|undetermined' '|fishhawk-mcp-shim|124|undetermined' '||125|undetermined' \
+  '||126|undetermined' '|fishhawk-mcp-shim|127|undetermined' '||137|undetermined' \
+  '||143|undetermined' '||0|undetermined' '||x|undetermined' \
+  '||1|0' '|fishhawk-mcp-shim|2|0' '||123|0' \
+  '|command: fishhawk-mcp-shim|0|1' '|command: fishhawk-mcp|0|0' \
+  '|command: fishhawk-mcp-shim||1' '|command: fishhawk-mcp||0' '|||0' 'garbage|||0' 'garbage|fishhawk-mcp-shim|0|1'; do
+  srp_f=("${(@s:|:)srp_row}")
+  srp_got="$(_shim_registered_from "${srp_f[1]}" "${srp_f[2]}" "${srp_f[3]}")"
+  if [[ "$srp_got" != "${srp_f[4]}" ]]; then srp_bad+=" [${srp_row}: got ${srp_got}]"; fi
+done
+if [[ -z "$srp_bad" ]]; then
+  pass "_shim_registered_from (#4875): override, probe status and text classify in precedence order"
+else
+  fail "_shim_registered_from (#4875) table:${srp_bad}"
+fi
+if [[ "$(_shim_registered_from '' 'fishhawk-mcp-shim')" == 1 && "$(_shim_registered_from '' '')" == 0 ]]; then
+  pass "_shim_registered_from (#4875): the two-argument form means no probe ran and keeps the text match"
+else
+  fail "_shim_registered_from (#4875): the two-argument form changed"
+fi
+# END ROW PURE-classifier
+
+# BEGIN ROW PURE-selector
+srp_bad=""
+for srp_row in \
+  '0 0 0 0 none' '0 0 0 1 none' '0 0 0 undetermined none' \
+  '0 0 1 0 reconnect' '0 0 1 1 auto_swap' '0 0 1 undetermined undetermined' \
+  '0 1 0 0 shim_rebuilt' '0 1 0 1 shim_rebuilt' '0 1 0 undetermined shim_rebuilt' \
+  '0 1 1 0 shim_rebuilt' '0 1 1 1 shim_rebuilt' '0 1 1 undetermined shim_rebuilt' \
+  '1 0 0 0 schema_major' '1 0 0 1 schema_major_shim' '1 0 0 undetermined schema_major' \
+  '1 0 1 0 schema_major' '1 0 1 1 schema_major_shim' '1 0 1 undetermined schema_major' \
+  '1 1 0 0 schema_major' '1 1 0 1 schema_major' '1 1 0 undetermined schema_major' \
+  '1 1 1 0 schema_major' '1 1 1 1 schema_major' '1 1 1 undetermined schema_major' \
+  '0 0 1 garbage undetermined' '1 0 0 garbage schema_major'; do
+  srp_f=(${=srp_row})
+  srp_got="$(_select_mcp_banner "${srp_f[1]}" "${srp_f[2]}" "${srp_f[3]}" "${srp_f[4]}" 2>&1)"
+  if [[ "$srp_got" != "${srp_f[5]}" ]]; then srp_bad+=" [${srp_row}: got ${srp_got}]"; fi
+done
+if [[ -z "$srp_bad" ]]; then
+  pass "_select_mcp_banner (#4875): all 24 combinations and a garbage state select the fixed-precedence kind"
+else
+  fail "_select_mcp_banner (#4875) table:${srp_bad}"
+fi
+# END ROW PURE-selector
+
+# BEGIN ROW PURE-banner
+srp_got="$(_signal_mcp_activation undetermined)"
+if [[ "$srp_got" == *undetermined* && "$srp_got" == *GitSHA* && "$srp_got" == *--status* && "$srp_got" == */mcp* && "$srp_got" == *VERIFY* \
+   && "$srp_got" != *"ACTION REQUIRED"* && "$srp_got" != *"not registered"* && "$srp_got" != *"no MCP reconnect needed"* ]]; then
+  pass "_signal_mcp_activation undetermined (#4875): VERIFY body with the confirmation and refutation paths, no reconnect demand"
+else
+  fail "_signal_mcp_activation undetermined (#4875): ${srp_got}"
+fi
+if [[ "$(_signal_mcp_activation schema_major)" == *"ACTION REQUIRED"* ]]; then
+  pass "_signal_mcp_activation schema_major (#4875): the stern body is unchanged"
+else
+  fail "_signal_mcp_activation schema_major (#4875) lost ACTION REQUIRED"
+fi
+# END ROW PURE-banner
+
+# BEGIN ROW PURE-normalize
+if [[ "$(_normalize_shim_state 0)" == 0 && "$(_normalize_shim_state 1)" == 1 && "$(_normalize_shim_state undetermined)" == undetermined \
+   && "$(_normalize_shim_state '')" == undetermined && "$(_normalize_shim_state garbage)" == undetermined && "$(_normalize_shim_state)" == undetermined ]]; then
+  pass "_normalize_shim_state (#4875): keeps 0, 1 and undetermined; empty and garbage become undetermined"
+else
+  fail "_normalize_shim_state (#4875) table"
+fi
+# END ROW PURE-normalize
+
+# BEGIN ROW PURE-constants
+srp_got="$(env _MCP_REGISTRATION_PROBE_TIMEOUT=30 _MCP_REGISTRATION_PROBE_GRACE=30 zsh -c 'DEV_LIB_ONLY=1 source "$1/scripts/dev"; print -r -- "${_MCP_REGISTRATION_PROBE_TIMEOUT} ${_MCP_REGISTRATION_PROBE_GRACE}"' zsh "$REPO_ROOT" 2>&1)"
+if [[ "$srp_got" == "5 2" ]]; then
+  pass "probe bounds (#4875): assigned at file scope, so the environment cannot change them"
+else
+  fail "probe bounds (#4875): got ${srp_got}, want 5 2"
+fi
+# END ROW PURE-constants
+
+# BEGIN ROW SRP-a
+_srp_new
+_srp_stub_hang
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined ]] && (( srp_elapsed < SRP_SLOW )) && _srp_gone "$(_srp_pid stub)" && _srp_tmp_empty; then
+  pass "SRP-a hanging claude stub printing shim text: undetermined in time, stub dead, no temp left"
+else
+  fail "SRP-a hanging claude stub: $(_srp_state)"
+fi
+_srp_collect_kills
+_srp_end
+# END ROW SRP-a
+
+# BEGIN ROW SRP-b
+_srp_new
+_srp_stub_hang_ignoring
+srp_merge=1
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined ]] && (( srp_elapsed < SRP_SLOW )) && _srp_gone "$(_srp_pid stub)" && _srp_gone "$(_srp_pid grandchild)" && _srp_tmp_empty; then
+  pass "SRP-b hanging claude stub ignoring TERM with a TERM-ignoring grandchild, stderr on the pipe: undetermined in time, both dead"
+else
+  fail "SRP-b hanging claude stub: $(_srp_state) stub=$(_srp_pid stub) grandchild=$(_srp_pid grandchild)"
+fi
+_srp_collect_kills
+_srp_end
+# END ROW SRP-b
+
+# BEGIN ROW SRP-b2
+# The stub stays alive after forking, so only the second table walk can find the
+# late child. The grace is longer here so the fork lands before that walk.
+_srp_new
+_srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+trap '(trap "" TERM; exec sleep 20) & echo $! > "$SRP_D/late.pid"' TERM
+(trap "" TERM; exec sleep 20) &
+holder=$!
+while kill -0 "$holder" 2>/dev/null; do wait "$holder"; done
+STUB
+srp_grace=2
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined ]] && [[ -n "$(_srp_pid late)" ]] && _srp_gone "$(_srp_pid late)" && _srp_gone "$(_srp_pid stub)"; then
+  pass "SRP-b2 hanging claude stub whose TERM trap forks a late TERM-ignoring child: the second walk kills the late child"
+else
+  fail "SRP-b2 hanging claude stub: $(_srp_state) late=$(_srp_pid late)"
+fi
+_srp_end
+# END ROW SRP-b2
+
+# BEGIN ROW SRP-c
+_srp_new
+_srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+trap 'echo term > "$SRP_D/term.marker"; exit 0' TERM
+echo "command: fishhawk-mcp-shim"
+sleep 20 &
+wait $!
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined && -f "${srp_dir}/term.marker" ]] && _srp_tmp_empty; then
+  pass "SRP-c hanging claude stub printing shim text and exiting 0 on TERM: expiry wins, undetermined, never 1"
+else
+  fail "SRP-c hanging claude stub: $(_srp_state) marker=$([[ -f ${srp_dir}/term.marker ]] && print present || print absent)"
+fi
+_srp_collect_kills
+_srp_end
+# END ROW SRP-c
+
+# BEGIN ROW SRP-d
+_srp_new
+_srp_stub_hang_ignoring
+srp_timeout="$_MCP_REGISTRATION_PROBE_TIMEOUT"
+srp_grace="$_MCP_REGISTRATION_PROBE_GRACE"
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined ]] && (( srp_elapsed < 10 )) && _srp_gone "$(_srp_pid stub)"; then
+  pass "SRP-d hanging claude stub ignoring TERM at the default bounds: undetermined within the issue's 10 seconds"
+else
+  fail "SRP-d hanging claude stub: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-d
+
+# BEGIN ROW SRP-e
+for srp_sig in TERM KILL; do
+  _srp_new
+  srp_timeout=8
+  print -r -- "kill -${srp_sig} \$\$" | _srp_stub claude
+  _srp_call _detect_shim_registered
+  if [[ "$srp_out" == undetermined ]] && (( srp_elapsed < SRP_SLOW )); then
+    pass "SRP-e a stub killed by ${srp_sig}: undetermined"
+  else
+    fail "SRP-e stub killed by ${srp_sig}: $(_srp_state)"
+  fi
+  _srp_end
+done
+# END ROW SRP-e
+
+# BEGIN ROW SRP-f
+_srp_new
+srp_timeout=8
+print -r -- '#!/nonexistent/fishhawk-4875-interpreter' > "${srp_bin}/claude"
+chmod +x "${srp_bin}/claude"
+_srp_call _run_bounded_capture 8 1 claude mcp get fishhawk
+srp_f_status="$srp_rc"
+_srp_call _detect_shim_registered
+if [[ "$srp_f_status" == 12[67] && "$srp_out" == undetermined ]]; then
+  pass "SRP-f a stub with a missing interpreter (status ${srp_f_status}): undetermined"
+else
+  fail "SRP-f missing interpreter: status=${srp_f_status} $(_srp_state)"
+fi
+_srp_end
+for srp_code in 126 127; do
+  _srp_new
+  srp_timeout=8
+  print -r -- "exit ${srp_code}" | _srp_stub claude
+  _srp_call _detect_shim_registered
+  if [[ "$srp_out" == undetermined ]]; then
+    pass "SRP-f a stub exiting ${srp_code}: undetermined"
+  else
+    fail "SRP-f stub exiting ${srp_code}: $(_srp_state)"
+  fi
+  _srp_end
+done
+_srp_new
+srp_override=1
+_srp_stub claude <<'STUB'
+echo ran > "$SRP_D/ran.marker"
+exit 127
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 1 && ! -f "${srp_dir}/ran.marker" ]]; then
+  pass "SRP-f override 1 beats a failing CLI: 1, and the stub never ran"
+else
+  fail "SRP-f override: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-f
+
+# BEGIN ROW SRP-g
+_srp_new
+srp_timeout=8
+print -r -- 'exit 1' | _srp_stub claude
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 0 && "$(_select_mcp_banner 0 0 1 "$srp_out")" == reconnect ]]; then
+  pass "SRP-g an executed CLI exiting 1 with no output: 0, and the reconnect banner"
+else
+  fail "SRP-g exit 1: $(_srp_state)"
+fi
+_srp_end
+_srp_new
+srp_timeout=8
+_srp_stub claude <<'STUB'
+echo "command: fishhawk-mcp-shim"
+exit 2
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 0 ]]; then
+  pass "SRP-g an executed CLI exiting 2 with shim text: 0"
+else
+  fail "SRP-g exit 2: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-g
+
+# BEGIN ROW SRP-h
+_srp_new
+srp_timeout=8
+print -r -- 'exit 0' | _srp_stub claude
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined ]]; then
+  pass "SRP-h exit 0 with empty stdout: undetermined"
+else
+  fail "SRP-h empty success: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-h
+
+# BEGIN ROW SRP-i
+_srp_new
+srp_timeout=8
+print -r -- 'echo "command: /x/bin/fishhawk-mcp-shim"' | _srp_stub claude
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 1 ]]; then
+  pass "SRP-i exit 0 with shim text: 1"
+else
+  fail "SRP-i shim text: $(_srp_state)"
+fi
+_srp_end
+_srp_new
+srp_timeout=8
+print -r -- 'echo "command: /x/bin/fishhawk-mcp"' | _srp_stub claude
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 0 ]]; then
+  pass "SRP-i exit 0 with other text: 0"
+else
+  fail "SRP-i other text: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-i
+
+# BEGIN ROW SRP-j
+_srp_absent_probe() {
+  if command -v claude >/dev/null 2>&1; then
+    print -r -- claude-on-path
+    return 0
+  fi
+  _detect_shim_registered
+}
+_srp_new
+_srp_call _srp_absent_probe
+if [[ "$srp_out" == claude-on-path ]]; then
+  print "skip: SRP-j, a claude binary exists under /usr/bin or /bin on this host"
+elif [[ "$srp_out" == 0 ]]; then
+  pass "SRP-j claude absent from a PATH verified not to contain it: 0"
+else
+  fail "SRP-j absent CLI: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-j
+
+# BEGIN ROW SRP-k
+_srp_new
+srp_tmp="${srp_dir}/missing"
+print -r -- 'echo ran > "$SRP_D/ran.marker"' | _srp_stub claude
+_srp_call _detect_shim_registered
+srp_k_state="$srp_out"
+_srp_call _run_bounded_capture 1 1 claude mcp get fishhawk
+if [[ "$srp_k_state" == undetermined && ! -f "${srp_dir}/ran.marker" ]] && (( srp_rc == 125 )); then
+  pass "SRP-k TMPDIR names a missing directory: undetermined, the stub never ran, the runner returns 125"
+else
+  fail "SRP-k mktemp failure: state=${srp_k_state} $(_srp_state)"
+fi
+_srp_end
+_srp_new
+print -r -- 'echo ran > "$SRP_D/ran.marker"' | _srp_stub claude
+_srp_stub mktemp <<'STUB'
+kill -TERM "$PPID"
+exit 1
+STUB
+_srp_call _run_bounded_capture 1 1 claude mcp get fishhawk
+if (( srp_rc == 143 )) && [[ ! -f "${srp_dir}/ran.marker" ]]; then
+  pass "SRP-k a signal landing while mktemp fails: exits with the signal's code, the stub never ran"
+else
+  fail "SRP-k signal during mktemp: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-k
+
+# BEGIN ROW SRP-l
+for srp_row in '1 1' 'true 1' '0 0' 'false 0' 'garbage 0'; do
+  srp_f=(${=srp_row})
+  _srp_new
+  srp_override="${srp_f[1]}"
+  _srp_stub_hang
+  _srp_call _detect_shim_registered
+  if [[ "$srp_out" == "${srp_f[2]}" && ! -f "${srp_dir}/stub.pid" ]] && (( srp_elapsed < SRP_SLOW )); then
+    pass "SRP-l override ${srp_f[1]} with a hanging claude stub: ${srp_f[2]} at once, the stub never ran"
+  else
+    fail "SRP-l override ${srp_f[1]} with a hanging claude stub: $(_srp_state)"
+  fi
+  _srp_end
+done
+# END ROW SRP-l
+
+# BEGIN ROW SRP-m
+_srp_new
+srp_timeout=20
+print -r -- 'echo "command: fishhawk-mcp-shim"' | _srp_stub claude
+_srp_stub sleep <<'STUB'
+echo "$*" >> "$SRP_D/sleep.log"
+exec "$SRP_SLEEP" "$@"
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 1 && ! -f "$srp_klog" && ! -f "${srp_dir}/sleep.log" ]] && (( srp_elapsed < SRP_SLOW )) && _srp_tmp_empty; then
+  pass "SRP-m fast stub: its own latency, no signal, no sleeper, no temp left"
+else
+  fail "SRP-m fast stub: $(_srp_state) sleeps=[$(cat "${srp_dir}/sleep.log" 2>/dev/null)]"
+fi
+_srp_end
+# END ROW SRP-m
+
+# BEGIN ROW SRP-n
+_srp_new
+srp_timeout=20
+srp_merge=1
+_srp_stub claude <<'STUB'
+sleep 20 &
+echo $! > "$SRP_D/descendant.pid"
+echo "command: fishhawk-mcp-shim"
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 1 ]] && (( srp_elapsed < SRP_SLOW )); then
+  pass "SRP-n fast stub leaving a background descendant, stderr on the pipe: the descendant holds no caller fd"
+else
+  fail "SRP-n background descendant: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-n
+
+# BEGIN ROW SRP-o
+_srp_new
+srp_timeout=8
+_srp_stub claude <<'STUB'
+cat >/dev/null
+echo "command: fishhawk-mcp-shim"
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == 1 ]] && (( srp_elapsed < SRP_SLOW )); then
+  pass "SRP-o stub reading stdin to EOF: stdin is /dev/null, so it answers 1 in time"
+else
+  fail "SRP-o stdin: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-o
+
+# BEGIN ROW SRP-p
+_srp_new
+_srp_stub_hang
+print -r -- 'exit 127' | _srp_stub ps
+srp_merge=1
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined && ! -f "$srp_klog" ]] && (( srp_elapsed < SRP_SLOW )) && _srp_alive "$(_srp_pid stub)"; then
+  pass "SRP-p hanging claude stub with no usable ps: undetermined in time, nothing signalled, the stub stays running"
+else
+  fail "SRP-p hanging claude stub: $(_srp_state) stub=$(_srp_pid stub)"
+fi
+_srp_end
+for srp_row in 'exit 0' 'echo "abc def not a row"'; do
+  _srp_new
+  _srp_stub_hang
+  print -r -- "$srp_row" | _srp_stub ps
+  _srp_call _detect_shim_registered
+  if [[ "$srp_out" == undetermined && ! -f "$srp_klog" ]] && (( srp_elapsed < SRP_SLOW )); then
+    pass "SRP-p hanging claude stub with an unusable ps table (${srp_row}): undetermined in time, nothing signalled"
+  else
+    fail "SRP-p unusable table (${srp_row}) with a hanging claude stub: $(_srp_state)"
+  fi
+  _srp_end
+done
+# END ROW SRP-p
+
+# BEGIN ROW SRP-q
+_srp_new
+_srp_stub_hang_ignoring
+_srp_stub ps <<'STUB'
+n=0
+if [ -f "$SRP_D/ps.count" ]; then n=$(cat "$SRP_D/ps.count"); fi
+n=$((n + 1))
+echo "$n" > "$SRP_D/ps.count"
+if [ "$n" -ge 2 ]; then exit 1; fi
+exec "$SRP_PS" "$@"
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined ]] && _srp_has_kill ' -TERM ' && ! _srp_has_kill ' -KILL '; then
+  pass "SRP-q hanging claude stub ignoring TERM with ps failing on its second read: TERM sent, no identity so no KILL"
+else
+  fail "SRP-q hanging claude stub: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-q
+
+# BEGIN ROW SRP-r
+_srp_new
+_srp_stub_hang_ignoring
+_srp_stub ps <<'STUB'
+n=0
+if [ -f "$SRP_D/ps.count" ]; then n=$(cat "$SRP_D/ps.count"); fi
+n=$((n + 1))
+echo "$n" > "$SRP_D/ps.count"
+if [ "$n" -lt 2 ]; then exec "$SRP_PS" "$@"; fi
+gc=$(cat "$SRP_D/grandchild.pid")
+"$SRP_PS" "$@" | awk -v gc="$gc" '$1 == gc { print $1, 1, "Mon Jan  1 00:00:00 2001"; next } { print }'
+STUB
+_srp_call _detect_shim_registered
+srp_gc="$(_srp_pid grandchild)"
+if [[ "$srp_out" == undetermined && -n "$srp_gc" ]] && _srp_has_kill " -TERM ${srp_gc}\$" && ! _srp_has_kill " -KILL ${srp_gc}\$" \
+   && _srp_gone "$(_srp_pid stub)" && _srp_alive "$srp_gc"; then
+  pass "SRP-r hanging claude stub with a recycled grandchild identity: that pid gets no KILL and lives, the rest die"
+else
+  fail "SRP-r hanging claude stub: $(_srp_state) grandchild=${srp_gc}"
+fi
+_srp_end
+# END ROW SRP-r
+
+# BEGIN ROW SRP-s
+_srp_new
+_srp_stub_hang
+_srp_stub ps <<'STUB'
+w=$(cat "$SRP_D/wrapper.pid")
+"$SRP_PS" "$@" | awk -v w="$w" '$1 == w { $2 = 1 } { print }'
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined && ! -f "$srp_klog" && -n "$(_srp_pid wrapper)" ]] && _srp_alive "$(_srp_pid stub)"; then
+  pass "SRP-s hanging claude stub whose wrapper is not this shell's child: no signals at all"
+else
+  fail "SRP-s hanging claude stub: $(_srp_state)"
+fi
+_srp_end
+_srp_no_system_module() {
+  zmodload -u zsh/system 2>/dev/null || true
+  zmodload() { return 1 }
+  _detect_shim_registered
+}
+_srp_new
+_srp_stub_hang
+_srp_call _srp_no_system_module
+if [[ "$srp_out" == undetermined && ! -f "$srp_klog" ]] && _srp_alive "$(_srp_pid stub)"; then
+  pass "SRP-s hanging claude stub without zsh/system: no parent to verify, so no root and no signals"
+else
+  fail "SRP-s no zsh/system with a hanging claude stub: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-s
+
+# BEGIN ROW SRP-t
+srp_bad=""
+for srp_line in "${srp_t_lines[@]}"; do
+  srp_f=(${=srp_line})
+  if (( ${#srp_f} != 3 )) || [[ "${srp_f[2]}" != -TERM && "${srp_f[2]}" != -KILL ]] || [[ "${srp_f[3]}" != <2-> ]] \
+     || [[ "${srp_f[3]}" == "${srp_f[1]}" || "${srp_f[3]}" == "$$" ]]; then
+    srp_bad+=" [${srp_line}]"
+  fi
+done
+if (( ${#srp_t_lines} > 0 )) && [[ -z "$srp_bad" ]]; then
+  pass "SRP-t the kill log across SRP-a, b and c holds only positive pids, never the capture shell, this harness or pid 1"
+else
+  fail "SRP-t kill log (${#srp_t_lines} lines):${srp_bad}"
+fi
+_srp_signal_table() {
+  kill() { builtin print -r -- "$*" >> "$srp_klog"; return 1 }
+  local -A _probe_tree_ids
+  _probe_tree_ids=(0 zero abc word -5 negative 4875 fixture 4876 fixture)
+  _probe_tree_signal TERM
+}
+_srp_new
+_srp_call _srp_signal_table
+if (( srp_rc == 0 )) && [[ "$(sort "$srp_klog" 2>/dev/null | tr '\n' ' ')" == "-TERM 4875 -TERM 4876 " ]]; then
+  pass "SRP-t _probe_tree_signal sends only to positive pids, and a failed kill does not stop the round (a logging kill, nothing is signalled)"
+else
+  fail "SRP-t positive pid filter: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-t
+
+# BEGIN ROW SRP-u
+for srp_row in 'TERM 143' 'INT 130' 'HUP 129'; do
+  srp_f=(${=srp_row})
+  _srp_new
+  srp_timeout=20
+  _srp_stub_hang
+  _srp_bg_capture
+  _srp_await_file "${srp_dir}/stub.pid"
+  srp_t0=$EPOCHREALTIME
+  builtin kill "-${srp_f[1]}" "$srp_bg_pid"
+  wait "$srp_bg_pid"
+  srp_rc=$?
+  srp_elapsed=$(( EPOCHREALTIME - srp_t0 ))
+  if (( srp_rc == ${srp_f[2]} && srp_elapsed < SRP_SLOW )) && _srp_gone "$(_srp_pid stub)" && _srp_gone "$(_srp_pid wrapper)" && _srp_tmp_empty; then
+    pass "SRP-u ${srp_f[1]} during a hanging claude stub: exit ${srp_f[2]} in time, stub and wrapper dead, no temp left"
+  else
+    fail "SRP-u ${srp_f[1]} during a hanging claude stub: $(_srp_state)"
+  fi
+  _srp_end
+done
+# END ROW SRP-u
+
+# BEGIN ROW SRP-v
+# Through the production caller, whose `if` keeps errexit off: under an untested
+# caller the error is an errexit `exit`, which skips the always-list (README residual).
+_srp_v_inner() {
+  setopt nounset
+  _probe_tree_signal() { print -r -- "$srp_v_never_set" }
+  _detect_shim_registered
+}
+_srp_new
+_srp_stub_hang
+unset srp_v_never_set
+_srp_call _srp_v_inner
+if [[ "$(_srp_err)" == *srp_v_never_set* ]] && _srp_tmp_empty; then
+  pass "SRP-v a shell error raised mid-sweep with a hanging claude stub: the always-list still removes the temp file"
+else
+  fail "SRP-v hanging claude stub: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-v
+
+# BEGIN ROW SRP-w
+_srp_new
+srp_timeout=20
+_srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+kill -KILL "$PPID"
+exec sleep 20
+STUB
+_srp_call _detect_shim_registered
+if [[ "$srp_out" == undetermined && -n "$(_srp_pid stub)" ]] && (( srp_elapsed < SRP_SLOW )); then
+  pass "SRP-w wrapper killed out of band: EOF ends the wait, undetermined well before the bound"
+else
+  fail "SRP-w killed wrapper: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-w
+
+# BEGIN ROW SRP-x
+_srp_new
+srp_timeout=8
+_srp_stub claude <<'STUB'
+ls -l "$TMPDIR" | grep -v '^total' > "$SRP_D/listing"
+echo "SRPUNIQUE4875 command: fishhawk-mcp-shim"
+STUB
+_srp_call _detect_shim_registered
+srp_listing=("${(@f)$(cat "${srp_dir}/listing")}")
+if [[ "$srp_out" == 1 && "$(_srp_err)" != *SRPUNIQUE4875* ]] && (( ${#srp_listing} == 1 )) && [[ "${srp_listing[1]}" == -rw-------* ]]; then
+  pass "SRP-x one private 0600 output file, and probe text reaches neither stdout nor stderr"
+else
+  fail "SRP-x secrecy: $(_srp_state) listing=[${srp_listing[*]}]"
+fi
+_srp_end
+# END ROW SRP-x
+
+# BEGIN ROW SRP-y
+_srp_new
+srp_timeout=8
+print -r -- 'echo out-zero' | _srp_stub claude
+_srp_call _run_bounded_capture 8 1 claude
+if (( srp_rc == 0 )) && [[ "$srp_out" == out-zero ]]; then
+  pass "SRP-y runner returns 0 and prints the output of a command that succeeded"
+else
+  fail "SRP-y status 0: $(_srp_state)"
+fi
+_srp_end
+_srp_new
+print -r -- 'exit 3' | _srp_stub claude
+_srp_call _run_bounded_capture 8 1 claude
+if (( srp_rc == 3 )); then pass "SRP-y runner returns the command's own status 3"; else fail "SRP-y status 3: $(_srp_state)"; fi
+_srp_end
+_srp_new
+_srp_stub_hang
+_srp_call _run_bounded_capture 1 1 claude
+if (( srp_rc == 124 )) && [[ -z "$srp_out" ]]; then
+  pass "SRP-y runner returns 124 and no output on a hanging claude stub"
+else
+  fail "SRP-y status 124 with a hanging claude stub: $(_srp_state)"
+fi
+_srp_end
+_srp_new
+srp_tmp="${srp_dir}/missing"
+print -r -- 'exit 0' | _srp_stub claude
+_srp_call _run_bounded_capture 1 1 claude
+if (( srp_rc == 125 )); then pass "SRP-y runner returns 125 when the output file cannot be created"; else fail "SRP-y status 125: $(_srp_state)"; fi
+_srp_end
+_srp_bad_status_line() {
+  print() { builtin print -r -- not-a-status }
+  _run_bounded_capture 8 1 claude
+}
+_srp_new
+print -r -- 'echo out-zero' | _srp_stub claude
+_srp_call _srp_bad_status_line
+if (( srp_rc == 124 )) && [[ -z "$srp_out" ]] && _srp_tmp_empty; then
+  pass "SRP-y an unexpected line on the status pipe takes the expiry path: 124, no output"
+else
+  fail "SRP-y unexpected status line: $(_srp_state)"
+fi
+_srp_end
+# END ROW SRP-y
+
+# BEGIN ROW SRP-z
+_srp_new
+_srp_stub_hang
+_srp_zerr_run
+if _srp_zerr_ok undetermined && _srp_gone "$(_srp_pid stub)"; then
+  pass "SRP-z hanging claude stub under real errexit and TRAPZERR: undetermined, no command failed line"
+else
+  fail "SRP-z hanging claude stub: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+srp_timeout=8
+print -r -- 'echo "command: fishhawk-mcp-shim"' | _srp_stub claude
+_srp_zerr_run
+if _srp_zerr_ok 1; then
+  pass "SRP-z fast stub under real errexit and TRAPZERR: 1, no command failed line"
+else
+  fail "SRP-z fast: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+_srp_stub_hang
+print -r -- 'exit 127' | _srp_stub ps
+_srp_zerr_run
+if _srp_zerr_ok undetermined; then
+  pass "SRP-z hanging claude stub with ps absent under real errexit and TRAPZERR: undetermined, no command failed line"
+else
+  fail "SRP-z ps absent with a hanging claude stub: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+srp_timeout=8
+print -r -- 'exit 1' | _srp_stub claude
+_srp_zerr_run
+if _srp_zerr_ok 0; then
+  pass "SRP-z executed CLI exiting 1 with no output under real errexit and TRAPZERR: 0, no command failed line"
+else
+  fail "SRP-z exit 1: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+srp_timeout=8
+_srp_stub claude <<'STUB'
+echo "command: fishhawk-mcp-shim"
+exit 2
+STUB
+_srp_zerr_run
+if _srp_zerr_ok 0; then
+  pass "SRP-z executed CLI exiting 2 with shim text under real errexit and TRAPZERR: 0, no command failed line"
+else
+  fail "SRP-z exit 2: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+_srp_stub_hang
+_srp_zerr_capture_run
+if _srp_zerr_capture_ok 124 && _srp_gone "$(_srp_pid stub)" && _srp_tmp_empty; then
+  pass "SRP-z untested runner caller, hanging claude stub: 124, stub dead, no temp left, no diagnostic from scripts/dev"
+else
+  fail "SRP-z untested caller, hanging claude stub: rc=${srp_z_rc} tmp=[$(ls -A "$srp_tmp")] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+_srp_stub_hang
+print -r -- 'exit 127' | _srp_stub ps
+_srp_zerr_capture_run
+if _srp_zerr_capture_ok 124 && _srp_tmp_empty; then
+  pass "SRP-z untested runner caller, hanging claude stub with ps absent: 124, no temp left, no diagnostic from scripts/dev"
+else
+  fail "SRP-z untested caller, ps absent with a hanging claude stub: rc=${srp_z_rc} tmp=[$(ls -A "$srp_tmp")] err=[$(_srp_err)]"
+fi
+_srp_end
+_srp_new
+srp_timeout=8
+print -r -- 'echo out-zero' | _srp_stub claude
+_srp_zerr_capture_run
+if _srp_zerr_capture_ok 0 && [[ "$srp_z_out" == out=out-zero && -z "$(_srp_err)" ]]; then
+  pass "SRP-z untested runner caller, fast stub: the output, and nothing on stderr"
+else
+  fail "SRP-z untested caller, fast: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+for srp_code in 1 2; do
+  _srp_new
+  srp_timeout=8
+  print -r -- "exit ${srp_code}" | _srp_stub claude
+  _srp_zerr_capture_run
+  if _srp_zerr_capture_ok "$srp_code" && _srp_tmp_empty; then
+    pass "SRP-z untested runner caller, stub exiting ${srp_code}: the wrapper still reports status ${srp_code}, not an expiry"
+  else
+    fail "SRP-z untested caller, exit ${srp_code}: rc=${srp_z_rc} err=[$(_srp_err)]"
+  fi
+  _srp_end
+done
+# Each `|| true` in the runner, with its tool failing under the untested caller.
+for srp_tool in cat rm; do
+  _srp_new
+  srp_timeout=8
+  print -r -- 'echo out-zero' | _srp_stub claude
+  print -r -- 'exit 1' | _srp_stub "$srp_tool"
+  _srp_zerr_capture_run
+  if _srp_zerr_capture_ok 0; then
+    pass "SRP-z untested runner caller, ${srp_tool} failing: still status 0, no abort"
+  else
+    fail "SRP-z untested caller, ${srp_tool} failing: rc=${srp_z_rc} err=[$(_srp_err)]"
+  fi
+  _srp_end
+done
+_srp_new
+_srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+exec "$SRP_SLEEP" 20
+STUB
+print -r -- 'exit 1' | _srp_stub sleep
+_srp_zerr_capture_run
+if _srp_zerr_capture_ok 124 && _srp_gone "$(_srp_pid stub)"; then
+  pass "SRP-z untested runner caller, hanging claude stub with the grace sleep failing: still 124, no abort"
+else
+  fail "SRP-z untested caller, hanging claude stub with sleep failing: rc=${srp_z_rc} err=[$(_srp_err)]"
+fi
+_srp_end
+# The runner calls the helper from an `if`, which keeps errexit off inside it, so
+# only an untested call reaches the table read with errexit live.
+_srp_new
+print -r -- 'exit 127' | _srp_stub ps
+_srp_zerr_statements 'typeset -A _probe_tree_ids
+_probe_tree_ids=(4875 stale)
+_probe_tree_refresh
+print -r -- survived'
+if _srp_zerr_capture_ok 1 && [[ "$srp_z_out" != *survived* ]]; then
+  pass "SRP-z untested _probe_tree_refresh with ps absent: its own return 1, the read itself does not abort"
+else
+  fail "SRP-z untested _probe_tree_refresh: rc=${srp_z_rc} out=[${srp_z_out}] err=[$(_srp_err)]"
+fi
+_srp_end
+# END ROW SRP-z
+
+# BEGIN ROW RLP-a
+_rlp_new
+_srp_stub_hang
+_rlp_reload stub
+if [[ "$(_rlp_seq)" == probe*down* && "$(cat "$rlp_carrier" 2>/dev/null)" == undetermined ]] && (( rlp_rc == 0 && rlp_elapsed < SRP_SLOW )); then
+  pass "RLP-a hanging claude stub: the probe precedes down, cmd_up gets carrier undetermined, total in time"
+else
+  fail "RLP-a hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-a
+
+# BEGIN ROW RLP-b
+_rlp_new
+_srp_stub_hang
+_rlp_reload stub
+if [[ "$(_rlp_seq)" == "probe live-guard restart-guard down up" ]]; then
+  pass "RLP-b hanging claude stub: order is probe, live-run guard, restart-blocker guard, down"
+else
+  fail "RLP-b hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-b
+
+# BEGIN ROW RLP-c
+_rlp_wait_run() {
+  rlp_out="$(
+    setopt errexit
+    _rlp_env
+    : > "$PID_FILE"
+    _rlp_stub_up
+    rlp_in_wait=0
+    functions[_rlp_real_wait]="${functions[_reload_wait_until_quiet]}"
+    _reload_wait_until_quiet() {
+      local wait_rc=0
+      rlp_in_wait=1
+      _rlp_real_wait "$@" || wait_rc=$?
+      rlp_in_wait=0
+      print -r -- wait >> "$rlp_order"
+      return "$wait_rc"
+    }
+    functions[_rlp_guard_scan]="${functions[_scan_live_runs]}"
+    _scan_live_runs() {
+      if (( rlp_in_wait )); then
+        print -r -- poll >> "${srp_dir}/polls"
+        if (( $(wc -l < "${srp_dir}/polls") <= 1 )); then print -r -- "4242"$'\t'"rlp-wait-run"; fi
+        return 0
+      fi
+      _rlp_guard_scan
+    }
+    functions[_rlp_guard_fetch]="${functions[_fetch_restart_blockers]}"
+    _fetch_restart_blockers() {
+      if (( rlp_in_wait )); then
+        print -r -- '{"items":[],"scanned_runs":0,"truncated":false}'
+        return 0
+      fi
+      _rlp_guard_fetch
+    }
+    _reload_quiet_sleep() { print -r -- "$1" >> "${srp_dir}/sleeps" }
+    cmd_reload --when-quiet 2>"${srp_dir}/err"
+  )"
+  rlp_rc=$?
+}
+_rlp_new
+_srp_stub_hang
+_rlp_wait_run
+if [[ "$(_rlp_seq)" == "wait probe live-guard restart-guard down up" && -s "${srp_dir}/sleeps" ]]; then
+  pass "RLP-c hanging claude stub with --when-quiet: order is wait, probe, live-run guard, restart-blocker guard, down"
+else
+  fail "RLP-c hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-c
+
+# BEGIN ROW RLP-d
+_rlp_new
+_srp_stub_hang
+print -r -- $'echo noise\nFISHHAWK_MCP_SHIM_REGISTERED=1' > "${rlp_root}/.env"
+_rlp_reload stub
+if [[ "$(_rlp_count probe)" == 0 && "$(cat "$rlp_carrier" 2>/dev/null)" == 1 ]]; then
+  pass "RLP-d a fixture .env with noise and the override: no probe, and the carrier is exactly 1"
+else
+  fail "RLP-d .env override: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-d
+
+# BEGIN ROW RLP-e
+_rlp_new
+srp_timeout=8
+print -r -- 'echo "command: fishhawk-mcp-shim"' | _srp_stub claude
+print -r -- 'if then' > "${rlp_root}/.env"
+_rlp_reload stub
+if (( rlp_rc == 0 )) && [[ "$(cat "$rlp_carrier" 2>/dev/null)" == 1 && "$(_rlp_seq)" == *down* && -z "$(_srp_err)" ]]; then
+  pass "RLP-e a malformed fixture .env: reload continues, the stub's answer is used, stderr clean"
+else
+  fail "RLP-e malformed .env: $(_rlp_state)"
+fi
+# cmd_reload's `if` switches errexit off; an untested caller keeps it live.
+_rlp_with_env_untested() {
+  REPO_ROOT="$rlp_root"
+  _detect_shim_registered_with_env
+}
+_srp_call _rlp_with_env_untested
+if (( srp_rc == 0 )) && [[ "$srp_out" == 1 && -z "$(_srp_err)" ]]; then
+  pass "RLP-e a malformed fixture .env under an untested caller: errexit does not end the precompute"
+else
+  fail "RLP-e malformed .env, untested caller: $(_srp_state)"
+fi
+_rlp_end
+# END ROW RLP-e
+
+# BEGIN ROW RLP-f
+# A plain `exit 3` also ends real cmd_up's own unguarded source (the pre-existing
+# #5046 hazard), which would hide a re-probe, so the last arm exits on the first
+# source only.
+_rlp_new
+_srp_stub_hang
+print -r -- 'exit 3' > "${rlp_root}/.env"
+_rlp_reload stub
+if [[ "$(cat "$rlp_carrier" 2>/dev/null)" == undetermined && "$(_rlp_count probe)" == 0 ]]; then
+  pass "RLP-f a fixture .env calling exit: the empty precompute becomes carrier undetermined"
+else
+  fail "RLP-f exit 3, stubbed cmd_up: $(_rlp_state)"
+fi
+_rlp_end
+_rlp_new
+_srp_stub_hang
+print -r -- 'exit 3' > "${rlp_root}/.env"
+_rlp_reload real
+if (( rlp_rc == 3 )) && [[ "$(_rlp_count probe)" == 0 && "$(_rlp_seq)" == "live-guard restart-guard down" ]]; then
+  pass "RLP-f a fixture .env calling exit, real cmd_up: the hanging claude stub never runs after down"
+else
+  fail "RLP-f exit 3, real cmd_up: $(_rlp_state)"
+fi
+_rlp_end
+_rlp_new
+_srp_stub_hang
+print -r -- 'if [ ! -f "$SRP_D/env-once" ]; then : > "$SRP_D/env-once"; exit 3; fi' > "${rlp_root}/.env"
+_rlp_reload real
+if (( rlp_rc == 0 )) && [[ "$(_rlp_count probe)" == 0 && "$(_rlp_seq)" == "live-guard restart-guard down" && "$rlp_out" == *"undetermined (#4875)"* ]]; then
+  pass "RLP-f a fixture .env exiting on the precompute only, real cmd_up: no probe after down, undetermined banner"
+else
+  fail "RLP-f exit 3 once, real cmd_up: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-f
+
+# BEGIN ROW RLP-g
+_rlp_new
+_srp_stub_hang
+rlp_live=1
+_rlp_reload stub
+if (( rlp_rc != 0 )) && [[ "$(_rlp_count down)" == 0 && "$(_rlp_count up)" == 0 && "$(_srp_err)" == *rlp-run-1* ]]; then
+  pass "RLP-g hanging claude stub plus a live runner: non-zero exit, no down, no up"
+else
+  fail "RLP-g hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-g
+
+# BEGIN ROW RLP-h
+_rlp_new
+_srp_stub_hang
+(
+  setopt errexit
+  _rlp_env
+  : > "$PID_FILE"
+  _rlp_stub_up
+  cmd_reload
+) >"${srp_dir}/out" 2>"${srp_dir}/err" &
+srp_bg_pid=$!
+_srp_await_file "${srp_dir}/stub.pid"
+builtin kill -TERM "$srp_bg_pid"
+wait "$srp_bg_pid"
+srp_rc=$?
+srp_i=0
+while (( srp_i < 100 )) && ! _srp_tmp_empty; do
+  sleep 0.1
+  (( ++srp_i ))
+done
+if (( srp_rc == 143 )) && [[ "$(_rlp_count down)" == 0 && "$(_rlp_count up)" == 0 ]] && _srp_tmp_empty && _srp_gone "$(_srp_pid stub)"; then
+  pass "RLP-h TERM to the reload during a hanging claude stub: no down, and no temp left once the bound has passed"
+else
+  fail "RLP-h hanging claude stub: rc=${srp_rc} order=[$(_rlp_seq)] tmp=[$(ls -A "$srp_tmp")]"
+fi
+_rlp_end
+# END ROW RLP-h
+
+# BEGIN ROW RLP-i
+_rlp_new
+_srp_stub_hang
+_rlp_reload real
+if (( rlp_rc == 0 )) && [[ "$rlp_out" == *"VERIFY: bin/fishhawk-mcp was rebuilt"* && "$rlp_out" == *undetermined* && "$rlp_out" != *"ACTION REQUIRED"* ]] \
+   && [[ "$(_rlp_count probe)" == 1 && "$(_rlp_seq)" == "probe live-guard restart-guard down" ]]; then
+  pass "RLP-i end to end, hanging claude stub: the VERIFY banner, and the stub ran exactly once, before down"
+else
+  fail "RLP-i end to end, hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-i
+
+# BEGIN ROW RLP-j
+_rlp_new
+_srp_stub_hang
+rlp_major=1
+_rlp_reload real
+if (( rlp_rc == 0 )) && [[ "$rlp_out" == *"ACTION REQUIRED"* && "$rlp_out" == *"schema MAJOR"* && "$rlp_out" != *"VERIFY"* ]] && [[ "$(_rlp_count probe)" == 1 ]]; then
+  pass "RLP-j end to end, hanging claude stub and a schema-major bump: the stern banner"
+else
+  fail "RLP-j end to end, hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-j
+
+# BEGIN ROW RLP-k
+_rlp_new
+_srp_stub_hang
+_rlp_plain_up
+if (( rlp_rc == 0 )) && [[ "$rlp_out" == *"VERIFY: bin/fishhawk-mcp was rebuilt"* && "$(_rlp_count probe)" == 1 ]]; then
+  pass "RLP-k plain cmd_up with no carrier and a hanging claude stub: still probes, bounded, once, undetermined banner"
+else
+  fail "RLP-k plain cmd_up, hanging claude stub: $(_rlp_state)"
+fi
+_rlp_end
+_rlp_failing_detect() {
+  rlp_out="$(
+    setopt errexit
+    _rlp_env
+    _rlp_real_up_stubs
+    functions[_detect_shim_registered]="print -r -- ${1}; return ${2}"
+    cmd_up 2>"${srp_dir}/err"
+  )"
+  rlp_rc=$?
+}
+for srp_row in 'nonsense 0' 'nonsense 1'; do
+  srp_f=(${=srp_row})
+  _rlp_new
+  _rlp_failing_detect "${srp_f[1]}" "${srp_f[2]}"
+  if (( rlp_rc == 0 )) && [[ "$rlp_out" == *"VERIFY: bin/fishhawk-mcp was rebuilt"* ]]; then
+    pass "RLP-k cmd_up with detection printing garbage and returning ${srp_f[2]}: survives errexit, undetermined banner"
+  else
+    fail "RLP-k detection (${srp_row}): $(_rlp_state)"
+  fi
+  _rlp_end
+done
+# END ROW RLP-k
+
+# BEGIN ROW RLP-l
+srp_got="$(env _SHIM_REGISTERED_PRECOMPUTED=1 zsh -c 'DEV_LIB_ONLY=1 source "$1/scripts/dev"; print -r -- "[${_SHIM_REGISTERED_PRECOMPUTED}][$(env | grep -c "^_SHIM_REGISTERED_PRECOMPUTED=" || true)]"' zsh "$REPO_ROOT" 2>&1)"
+if [[ "$srp_got" == "[][0]" ]]; then
+  pass "RLP-l an ambient carrier value cannot inject a state: the library clears and unexports it"
+else
+  fail "RLP-l ambient carrier: ${srp_got}"
+fi
+_rlp_new
+srp_timeout=8
+_srp_stub claude <<'STUB'
+echo probe >> "$SRP_D/order"
+echo "command: fishhawk-mcp-shim"
+STUB
+print -r -- '_SHIM_REGISTERED_PRECOMPUTED=1' > "${rlp_root}/.env"
+_rlp_plain_up
+if (( rlp_rc == 0 )) && [[ "$(_rlp_count probe)" == 1 ]]; then
+  pass "RLP-l a fixture .env setting the carrier under plain cmd_up: it still probes"
+else
+  fail "RLP-l .env carrier: $(_rlp_state)"
+fi
+_rlp_end
+_rlp_new
+srp_timeout=8
+_srp_stub claude <<'STUB'
+echo probe >> "$SRP_D/order"
+echo "command: fishhawk-mcp-shim"
+STUB
+_rlp_plain_up garbage
+if (( rlp_rc == 0 )) && [[ "$(_rlp_count probe)" == 1 && "$rlp_out" == *"SHOULD hot-swap"* ]]; then
+  pass "RLP-l a garbage carrier is not a state: cmd_up re-probes and uses that answer"
+else
+  fail "RLP-l garbage carrier: $(_rlp_state)"
+fi
+_rlp_end
+# END ROW RLP-l
+
+# BEGIN ROW HERM-a
+herm_dir="$(mktemp -d "${TMPDIR:-/tmp}/fishhawk-herm.XXXXXX")"
+print -r -- "#!/bin/sh
+echo ran >> \"${herm_dir}/claude.log\"
+echo 'command: fishhawk-mcp-shim'" > "${herm_dir}/claude"
+chmod +x "${herm_dir}/claude"
+herm_path="$PATH"
+PATH="${herm_dir}:${PATH}"
+_lr_run_reload clean
+if [[ "$(cat "${lr_dir}/repo_root" 2>/dev/null)" == "$lr_dir" && ! -f "${herm_dir}/claude.log" ]]; then
+  pass "HERM-a LR drives cmd_reload at its temp REPO_ROOT, and a logging claude on PATH stays uncalled"
+else
+  fail "HERM-a LR: root=[$(cat "${lr_dir}/repo_root" 2>/dev/null)] want [${lr_dir}] claude=$([[ -f ${herm_dir}/claude.log ]] && print ran)"
+fi
+rm -rf "$lr_dir"
+wq_interval="" wq_timeout=""
+_wq_run 0 0 ""
+if [[ "$(cat "${wq_dir}/repo_root" 2>/dev/null)" == "$wq_dir" && ! -f "${herm_dir}/claude.log" ]]; then
+  pass "HERM-a WQ drives cmd_reload at its temp REPO_ROOT, and a logging claude on PATH stays uncalled"
+else
+  fail "HERM-a WQ: root=[$(cat "${wq_dir}/repo_root" 2>/dev/null)] want [${wq_dir}] claude=$([[ -f ${herm_dir}/claude.log ]] && print ran)"
+fi
+rm -rf "$wq_dir"
+if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null || ! command -v curl &>/dev/null; then
+  print "skip: nc, lsof or curl not found — skipping the HERM-a RB arm"
+else
+  _rb_run_reload "200 OK" "$RB_EMPTY"
+  if [[ "$(cat "${rb_dir}/repo_root" 2>/dev/null)" == "$rb_dir" && ! -f "${herm_dir}/claude.log" ]]; then
+    pass "HERM-a RB drives cmd_reload at its temp REPO_ROOT, and a logging claude on PATH stays uncalled"
+  else
+    fail "HERM-a RB: root=[$(cat "${rb_dir}/repo_root" 2>/dev/null)] want [${rb_dir}] claude=$([[ -f ${herm_dir}/claude.log ]] && print ran)"
+  fi
+  rm -rf "$rb_dir"
+fi
+PATH="$herm_path"
+rm -rf "$herm_dir"
+# END ROW HERM-a
+# END #4875 SECTION
 
 # 6. Parse check: scripts/dev is valid zsh.
 if zsh -n "${REPO_ROOT}/scripts/dev"; then

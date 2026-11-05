@@ -1,0 +1,14 @@
+id: scenario:issue-4875/launch-failure-is-undetermined
+statement: A located `claude` that cannot execute, such as one with a missing shebang interpreter, reports `undetermined`, and an explicit registration override still wins over it.
+verify_hint: 'CLI stdout: in library mode with a stub whose first line names a missing interpreter, `$(_detect_shim_registered)` prints `undetermined`; with FISHHAWK_MCP_SHIM_REGISTERED=1 it prints `1`.'
+steps: 'Library mode with an executable `claude` stub whose first line is #!/nonexistent/interpreter/xyz. Run x="$(_detect_shim_registered)", then again with FISHHAWK_MCP_SHIM_REGISTERED=1.'
+assertions:
+    expected: undetermined; override prints 1.
+    observed_at_record: undetermined, then 1.
+    repro_handle: /tmp/acc4875/ct.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z

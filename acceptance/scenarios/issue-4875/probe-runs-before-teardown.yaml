@@ -1,0 +1,14 @@
+id: scenario:issue-4875/probe-runs-before-teardown
+statement: During a reload, the order is any `--when-quiet` wait, the bounded registration probe, the live-run and restart-blocker guards, then teardown, and the result reaches the up step, so a hanging probe leaves the backend running for the whole bound.
+verify_hint: 'CLI stdout and a log file: in library mode with REPO_ROOT at an empty temp dir, replace `cmd_down`, `cmd_up` and the two reload guards with functions that append to one log, put a hanging logging `claude` stub on PATH, run `cmd_reload`. The log shows the probe before the guards and down, and the up entry sees `undetermined`. Do not run a real reload of the shared stack.'
+steps: Library mode with REPO_ROOT at an empty temp dir and a scratch PID_FILE. Replace _reload_wait_until_quiet, _refuse_on_live_runs, _refuse_on_restart_blockers, cmd_down and cmd_up with functions appending timestamps to one log; a hanging `claude` stub logs into the same file. Run cmd_reload --when-quiet. Also run a variant whose live-run guard refuses. No real reload ran.
+assertions:
+    expected: wait, probe, guards, teardown, and up sees undetermined.
+    observed_at_record: 'Log order: wait, probe, guard_live (+7.08s), guard_blockers, down, then up[--all] precomputed=undetermined. The stub was dead by the end. The refusing guard exits 1 with no down or up entry.'
+    repro_handle: /tmp/acc4875/crit2.zsh <checkout>
+origin:
+    issue: 4875
+    pr: 5074
+    run_id: 7ec5e7b5-c54d-4394-a1f1-dd8544245958
+    head_sha: 1afdb067f701d48548b7be03e86e3c035de0759c
+    recorded_at: 2026-11-05T12:36:27Z
