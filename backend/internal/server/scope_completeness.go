@@ -326,29 +326,20 @@ func (s *Server) resolveParkedScopeStage(r *http.Request, runID uuid.UUID) (*run
 // either — so the pre-#2501 Running transition was a dead end on BOTH runner
 // kinds and no runner ever spawned to open the held commit's PR.
 //
-// ORDERING IS LOAD-BEARING (#2501): the scope_completeness_exempted audit entry
-// is appended FIRST, and a failed append REFUSES the decision (500) instead of
-// logging on. That entry is not a record of the decision — since #2501 it IS the
-// functional authorization proof the prompt emission gate reads
-// (prompt.go::resolveHeldCommitExemption), so:
-//
-//   - Appending it before the stage leaves awaiting_scope_decision closes the
-//     window in which the transition + Advance below could spawn a runner whose
-//     prompt fetch raced the append, read the older `parked` entry, emitted no
-//     held-commit fields, and re-invoked the agent — the ~$23/~50-minute re-run
-//     #2501 exists to eliminate.
-//   - Refusing on an append failure keeps the same property when the chain write
-//     fails outright: a stage the gate can never prove exempt is left parked (the
-//     operator can simply re-decide) rather than dispatched into a guaranteed
-//     agent re-run with no exemption recorded in the audit chain.
-//
-// failScopeCompleteness keeps its best-effort append: nothing downstream reads
-// the `failed` entry as authorization, and its stage transition is terminal.
+// ATOMIC WITH ITS AUDIT ENTRY (#2559): the scope_completeness_exempted entry and
+// the stage's move out of awaiting_scope_decision commit in ONE transaction. That
+// entry is not only a record of the decision: since #2501 it IS the functional
+// authorization proof the prompt emission gate reads
+// (prompt.go::resolveHeldCommitExemption). So the entry exists only if the
+// transition committed, and it is visible to a runner's prompt fetch no later than
+// the stage becomes dispatchable. A failed commit refuses the decision and leaves
+// the stage parked for the operator to re-decide; a decision that lost to a
+// concurrent one records nothing. See commitScopeParkDecision.
 func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, reason, decidedBy string) {
 	// #2548 EXEMPT REFUSAL for the build-required class. This runs FIRST — before
-	// the load-bearing scope_completeness_exempted append, before the stage
-	// leaves awaiting_scope_decision, before any Advance — because exempt resumes
+	// the transaction that appends scope_completeness_exempted and moves the stage
+	// out of awaiting_scope_decision, before any Advance — because exempt resumes
 	// the stage and drives a PR-open from the held commit, whose committed tree
 	// is RED BY CONSTRUCTION for this class (that redness IS the shortfall the
 	// park records). Opening a PR from it is the one outcome this design says
@@ -368,17 +359,13 @@ func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request,
 			})
 		return
 	}
-	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
-		CategoryScopeCompletenessExempted, reason, decidedBy, nil); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "exemption_unrecorded",
-			"the exemption could not be recorded in the audit chain; the stage is left parked — re-POST the decision",
-			map[string]any{"error": err.Error()})
-		return
-	}
-
-	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, run.StageStatePending, nil); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"resume parked stage failed", map[string]any{"error": err.Error()})
+	params := scopeCompletenessDecisionAuditParams(runID, stage,
+		CategoryScopeCompletenessExempted, reason, decidedBy, nil)
+	if !s.commitScopeParkDecision(w, r, "exemption_unrecorded",
+		"the exemption and its audit entry could not be committed; the stage is left parked — re-POST the decision",
+		func(decider run.ScopeParkDecider) (*run.Stage, bool, error) {
+			return decider.ExemptScopeParkAndAppend(r.Context(), stage.ID, run.StageAttemptToken(stage.DispatchedAt), params)
+		}) {
 		return
 	}
 
@@ -408,15 +395,24 @@ func (s *Server) exemptScopeCompleteness(w http.ResponseWriter, r *http.Request,
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
-// failScopeCompleteness resolves a `fail` decision: it fails the parked
-// implement stage category-B (today's restore path) and appends a
+// failScopeCompleteness resolves a `fail` decision: in one transaction it fails
+// the parked implement stage category-B (today's restore path) and appends a
 // scope_completeness_failed audit entry, then advances the run so the
 // orchestrator walks it forward — mirroring failPullRequestStage.
+//
+// The entry is load-bearing (#2559): it is what demotes an earlier `exempted`
+// entry in the emission gate's newest-wins walk, and an override retry keeps the
+// park row. So a failed commit refuses the decision and leaves the stage parked,
+// exactly as on the exempt arm.
 func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, reason, decidedBy string) {
-	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stage.ID, run.FailureB, reason); err != nil {
-		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
-			"fail parked stage failed", map[string]any{"error": err.Error()})
+	params := scopeCompletenessDecisionAuditParams(runID, stage,
+		CategoryScopeCompletenessFailed, reason, decidedBy, nil)
+	if !s.commitScopeParkDecision(w, r, "fail_unrecorded",
+		"the failure and its audit entry could not be committed; the stage is left parked — re-POST the decision",
+		func(decider run.ScopeParkDecider) (*run.Stage, bool, error) {
+			return decider.FailScopeParkAndAppend(r.Context(), stage.ID, run.StageAttemptToken(stage.DispatchedAt), reason, params)
+		}) {
 		return
 	}
 
@@ -430,16 +426,6 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 		}
 	}
 
-	// Best-effort, deliberately (see exemptScopeCompleteness): the `failed` entry
-	// authorizes nothing downstream and the stage is already terminally failed.
-	if err := s.writeScopeCompletenessDecisionAudit(r, runID, stage,
-		CategoryScopeCompletenessFailed, reason, decidedBy, nil); err != nil {
-		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-			CategoryScopeCompletenessFailed+" audit append failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stage.ID.String()),
-			slog.String("error", err.Error()))
-	}
 	s.notifyStatusUpdate(r.Context(), runID, "scope_failed")
 
 	resp := scopeCompletenessDecisionResponse{
@@ -459,21 +445,64 @@ func (s *Server) failScopeCompleteness(w http.ResponseWriter, r *http.Request, r
 	s.writeJSON(w, r, http.StatusOK, resp)
 }
 
-// writeScopeCompletenessDecisionAudit appends the exempted/failed/amended
-// decision audit entry, pinning the operator's reason and the parked
-// held-commit coordinates into the chain. It RETURNS the append error rather
-// than swallowing it (#2501): each caller decides how load-bearing its entry is
-// — exemptScopeCompleteness refuses the decision (the entry is the emission
-// gate's authorization proof), amendScopeCompleteness refuses it too (a stage
-// whose widening the chain never recorded must never be dispatched),
-// failScopeCompleteness logs and continues.
+// commitScopeParkDecision runs one exempt or fail decision through the
+// run.ScopeParkDecider capability and writes the refusal when it does not win. It
+// reports whether the decision committed; the caller runs Advance and
+// notifyStatusUpdate only then.
+//
+// The capability is hard-required, following the reap path rather than the
+// parker's fallback: two separate writes are exactly the split this removes, so a
+// repo without it refuses 503. Production wires the postgres repo directly, and a
+// compile-time assertion there pins the capability.
+//
+// A decision that lost to a concurrent one reaches the same 409 as the handler's
+// earlier stage_not_parked read, because it is the same fact observed under the
+// row lock instead of ahead of it.
+func (s *Server) commitScopeParkDecision(w http.ResponseWriter, r *http.Request, unrecordedCode, unrecordedMessage string,
+	decide func(run.ScopeParkDecider) (*run.Stage, bool, error)) bool {
+	decider, ok := s.cfg.RunRepo.(run.ScopeParkDecider)
+	if !ok {
+		s.writeError(w, r, http.StatusServiceUnavailable, "scope_completeness_unconfigured",
+			"the run repository cannot commit a scope-completeness decision atomically with its audit entry", nil)
+		return false
+	}
+	_, won, err := decide(decider)
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, unrecordedCode, unrecordedMessage,
+			map[string]any{"error": err.Error()})
+		return false
+	}
+	if !won {
+		s.writeError(w, r, http.StatusConflict, "stage_not_parked",
+			"the implement stage is no longer parked awaiting this scope-completeness decision: a concurrent decision or a newer attempt came first",
+			nil)
+		return false
+	}
+	return true
+}
+
+// writeScopeCompletenessDecisionAudit appends a decision audit entry on its own,
+// outside any stage transition, and RETURNS the append error. Only the `amend` arm
+// uses it: amendScopeCompleteness refuses on that error (a stage whose widening the
+// chain never recorded must never be dispatched). The exempt and fail arms commit
+// their entry with the transition instead (commitScopeParkDecision).
+func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid.UUID,
+	stage *run.Stage, category, reason, decidedBy string, extra map[string]any) error {
+	_, err := s.cfg.AuditRepo.AppendChained(r.Context(),
+		scopeCompletenessDecisionAuditParams(runID, stage, category, reason, decidedBy, extra))
+	return err
+}
+
+// scopeCompletenessDecisionAuditParams builds the exempted/failed/amended decision
+// audit entry, pinning the operator's reason and the parked held-commit coordinates
+// into the chain.
 //
 // extra carries the caller-specific payload keys and MUST be nil for the
 // exempted/failed categories: those two payload key sets are a wire contract
 // #2548 already promised not to touch, and #2591 keeps that promise the same
 // way — by ADDING keys only on the new category's entry.
-func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid.UUID,
-	stage *run.Stage, category, reason, decidedBy string, extra map[string]any) error {
+func scopeCompletenessDecisionAuditParams(runID uuid.UUID, stage *run.Stage,
+	category, reason, decidedBy string, extra map[string]any) audit.ChainAppendParams {
 	actorKind := actorKindForSubject(decidedBy)
 	stageID := stage.ID
 	payloadMap := map[string]any{
@@ -515,7 +544,7 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 		payloadMap[k] = v
 	}
 	payload, _ := json.Marshal(payloadMap)
-	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
+	return audit.ChainAppendParams{
 		RunID:        runID,
 		StageID:      &stageID,
 		Timestamp:    time.Now().UTC(),
@@ -523,8 +552,5 @@ func (s *Server) writeScopeCompletenessDecisionAudit(r *http.Request, runID uuid
 		ActorKind:    &actorKind,
 		ActorSubject: &decidedBy,
 		Payload:      payload,
-	}); err != nil {
-		return err
 	}
-	return nil
 }

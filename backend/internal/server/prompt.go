@@ -5288,6 +5288,7 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 // following hold:
 //
 //   - the stage is an implement stage carrying a ScopeCompletenessPark, and
+//   - the stage has left awaiting_scope_decision (see FAIL-CLOSED below), and
 //   - the dispatch is NOT a fix-up (see the fix-up refusal below), and
 //   - the NEWEST audit entry for THIS stage across
 //     scopeCompletenessDecisionInvalidatorCategories is `exempted`, and
@@ -5328,8 +5329,18 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 // unproven or unshippable exemption. A missing base SHA fails closed here
 // because the runner would otherwise open the PR and then fail category-B
 // shipping an artifact the backend rejects (#2563), orphaning the PR.
+//
+// The `exempted` entry it reads is committed in one transaction with the stage's
+// move out of the park (#2559, run.ScopeParkDecider), so a new entry cannot exist
+// without its transition. The gate still refuses a stage in
+// awaiting_scope_decision itself rather than relying on dispatch admission: the
+// prompt handlers serve a parked stage to the SPA preview, and an entry written
+// before #2559 may have outlived a failed transition.
 func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run, stage *run.Stage, fixup bool) (heldCommitResume, bool) {
 	if stage == nil || stage.Type != run.StageTypeImplement || stage.ScopeCompletenessPark == nil {
+		return heldCommitResume{}, false
+	}
+	if stage.State == run.StageStateAwaitingScopeDecision {
 		return heldCommitResume{}, false
 	}
 	// FIX-UP REFUSAL (#2630): a fix-up dispatch carries a fix-up prompt the
