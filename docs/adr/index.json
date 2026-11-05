@@ -974,7 +974,8 @@
       "supersedes": [],
       "superseded_by": [],
       "amended_by": [
-        "ADR-095"
+        "ADR-095",
+        "ADR-140"
       ],
       "applies_to": []
     },
@@ -1639,6 +1640,18 @@
       "amends": [
         "ADR-084",
         "ADR-113"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-140",
+      "title": "Bound terminal-run review recovery by consumer lifetime (amends ADR-091)",
+      "path": "docs/adr/140-terminal-run-review-consumer-lifetime.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-091"
       ],
       "applies_to": []
     },
