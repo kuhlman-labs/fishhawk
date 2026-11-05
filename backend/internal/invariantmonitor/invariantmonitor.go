@@ -74,6 +74,15 @@ const KindReviewAwaitingApprovalNullPR = "review_awaiting_approval_null_pr"
 // docs/issue-comment-surfaces.md).
 const KindForeignCommitOnBranch = "foreign_commit_on_branch"
 
+// KindReportedHeadMismatch is the push-report refusal kind (ADR-141, #4870)
+// recorded in the audit payload's `kind` field: a fix-up, conflict-resolution or
+// acceptance-scenario report disagreed with forge state, so no row was admitted.
+// It can be a benign head-movement race and is not proof of misconduct. It is
+// written by server/reported_head.go under the existing
+// CategoryInvariantViolation by the system actor: an internal audit kind, NOT an
+// issue-comment surface (see docs/issue-comment-surfaces.md).
+const KindReportedHeadMismatch = "reported_head_mismatch"
+
 // listRunsPageSize bounds each ListRuns page the sweep walks. Matches
 // the constant ReconcileStuckRuns uses — at v0 scale the running-run
 // set is tiny; this only bounds memory if it ever grows.

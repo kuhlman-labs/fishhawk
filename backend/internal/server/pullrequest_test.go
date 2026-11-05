@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2322,6 +2324,27 @@ func TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError(
 	}
 }
 
+// serveReportedBranchTip fronts a canned compare client with the branch ref a
+// fix-up report implies, as a real push leaves it (ADR-141). Every other route
+// still reaches the canned client. BaseURL is swapped on the shared client
+// because the server holds that pointer.
+func serveReportedBranchTip(t *testing.T, s *Server, tip string) {
+	t.Helper()
+	upstream, err := url.Parse(s.cfg.GitHub.BaseURL)
+	if err != nil {
+		t.Fatalf("setup: parse canned client URL: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"object":{"sha":%q}}`, tip)
+	})
+	mux.Handle("/", httputil.NewSingleHostReverseProxy(upstream))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s.cfg.GitHub.BaseURL = srv.URL
+}
+
 // TestShipPullRequest_FixupPush_BackstopReReview_WedgeRepro is the #1932
 // cross-boundary seam test: it reproduces the run 98020210 wedge and proves the
 // fix-up re-review backstop resolves it. A fixup_pushed report for a NEW head
@@ -2357,6 +2380,7 @@ func TestShipPullRequest_FixupPush_BackstopReReview_WedgeRepro(t *testing.T) {
 		newHead = "head-new-5d33d25f"
 		base    = "base-def"
 	)
+	serveReportedBranchTip(t, s, newHead)
 	// The wedge shape: a prior-head round's started entry ONLY (no terminal
 	// verdict for the round under the fix-up floor), recent so the review-gate
 	// backstop bound has not elapsed.
@@ -2437,6 +2461,7 @@ func TestShipPullRequest_FixupPush_BackstopReReview_DuplicateReport_NoDoubleDisp
 	s, sf, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
 
 	const newHead = "head-new-dup"
+	serveReportedBranchTip(t, s, newHead)
 	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
 
 	priv, _ := sf.issue(t, runRow.ID)
@@ -3036,6 +3061,7 @@ func newFixupSeamServer(t *testing.T, pushedHead, baseSHA string) (
 
 	stub := &lineageGitHub{
 		baseRef:       "main",
+		headSHA:       pushedHead, // the forge shows the head the report names (ADR-141)
 		commitsByBase: map[string][]string{"main": {pushedHead}, baseSHA: {pushedHead}},
 	}
 	gh := newLineageGitHubClient(t, stub)
