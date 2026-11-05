@@ -482,6 +482,13 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// expected-success case shouldn't fail with a unique-constraint
 	// 500.
 	if existing, err := s.cfg.ArtifactRepo.GetByHash(r.Context(), stageID, contentHash); err == nil {
+		// A byte-identical retry must not read a lost gating round as "no
+		// rejection" (ADR-140 (#5047) D8): 503 while this process is closing, 409
+		// on the next one. Nothing here re-runs the round.
+		if stage.State == run.StageStateRunning && s.planRoundLost(r.Context(), runID, stageID) {
+			s.writeReviewRoundInterrupted(w, r, runID, stageID, "plan")
+			return
+		}
 		// Plan-ready comment-back retry hook (#245). The notify
 		// path may have run from the trace handler before this
 		// plan artifact existed, in which case it skipped silently;
@@ -824,7 +831,14 @@ func (s *Server) handleShipPlan(w http.ResponseWriter, r *http.Request) {
 	// blocked. Skipped when the over-cap split reject above already failed
 	// the stage — the reviewers have nothing to add to a server-rejected plan.
 	if !gatingRejected {
-		gatingRejected = s.runPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression, acceptance)
+		planOutcome := s.dispatchPlanReviews(r.Context(), runID, stageID, body, precheck, sweep, testSweep, regression, acceptance)
+		// A gating round shutdown stopped decides nothing: no advance, no
+		// plan-ready comment and no fabricated verdict.
+		if planOutcome.interrupted {
+			s.writeReviewRoundInterrupted(w, r, runID, stageID, "plan")
+			return
+		}
+		gatingRejected = planOutcome.blocked()
 	}
 
 	// Plan-stage terminal advancement (#603). With a valid plan artifact
@@ -1537,7 +1551,9 @@ func deref(s *string) string {
 //
 // All per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't fail the upload response — the plan artifact
-// is already durably stored.
+// is already durably stored. A round shutdown stopped is not such an error:
+// the wrapper reports it as not blocked, while dispatchPlanReviews reports it
+// as interrupted for the upload handler that owns the stage edge.
 //
 // precheck, sweep, testSweep, regression, and acceptance are the plan-gate
 // results handleShipPlan's synchronous checks computed (nil when a gate
@@ -1545,10 +1561,18 @@ func deref(s *string) string {
 // prompt's gate-evidence section (#963, #1257, #1533) and never alter
 // dispatch, authority, or verdict handling.
 func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload, acceptance *AcceptancePrecheckPayload) bool {
+	return s.dispatchPlanReviews(ctx, runID, stageID, planBody, precheck, sweep, testSweep, regression, acceptance).blocked()
+}
+
+// dispatchPlanReviews is runPlanReviews' body, returning the typed outcome the
+// caller that owns the stage edge reads (ADR-140 (#5047) D8). A gating round
+// shutdown stopped returns interrupted, with no stage transition and no block
+// reason, even when an earlier reviewer in the round had already rejected.
+func (s *Server) dispatchPlanReviews(ctx context.Context, runID, stageID uuid.UUID, planBody []byte, precheck *ScopePrecheckPayload, sweep *SurfaceSweepPayload, testSweep *TestSweepPayload, regression *ScopeRegressionPayload, acceptance *AcceptancePrecheckPayload) reviewDispatchOutcome {
 	// RunRepo is required to resolve the workflow spec; without it we
 	// can't tell whether agent review was even requested.
 	if s.cfg.RunRepo == nil {
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
@@ -1557,12 +1581,12 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypePlan)
 	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	authority := planreview.ResolveAuthority(*reviewersCfg)
@@ -1597,7 +1621,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 				)
 			}
 		}
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	// Parse plan for the self-review guard (GeneratedBy.Model) and for the
@@ -1639,7 +1663,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 				)
 			}
 		}
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	// Build the plan_review prompt using the same trigger-context
@@ -1735,7 +1759,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		)
 		s.emitPreRoundReviewFailed(ctx, runID, stageID, "plan_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
 		if authority != planreview.AuthorityGating {
-			return false
+			return reviewDispatchOutcome{}
 		}
 		cat := run.FailureB
 		reason := "plan_review_document_injection_failed: the declared repository documents could not be resolved or attributed for the gating plan review (see the plan_review_failed audit entry)"
@@ -1753,7 +1777,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 				slog.String("error", terr.Error()),
 			)
 		}
-		return true
+		return reviewDispatchOutcome{blockReason: reason}
 	}
 	injected := docs.Injected
 	trig.InjectedDocuments = injected
@@ -1767,7 +1791,7 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return reviewDispatchOutcome{}
 	}
 	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "plan_review", crewDeliveries.Sequences)
 
@@ -1844,9 +1868,11 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 		go func() {
 			defer s.bgReviews.Done()
 			defer treeCleanup()
-			s.runPlanReviewLoopWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
+			// The outcome is discarded: an advisory round has no stage edge, and
+			// one shutdown stopped writes no terminal row, so the next boot owns it.
+			_ = s.runPlanReviewLoopOutcome(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
 		}()
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	// Gating: run synchronously so the failed-B transition lands before
@@ -1854,11 +1880,16 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 	// (deferred) because the loop runs to completion before runPlanReviews
 	// returns, so the export is live for every reviewer and removed right after.
 	defer treeCleanup()
-	hasRejection := s.runPlanReviewLoopWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
+	gatingLoop := s.runPlanReviewLoopOutcome(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, stageBudget, treeDir, round)
+	// A round shutdown stopped decides nothing, ahead of any reject or persona
+	// block it had already gathered (ADR-140 (#5047) D8).
+	if gatingLoop.interrupted {
+		return reviewDispatchOutcome{interrupted: true}
+	}
 	// An escalation-attached persona that could not run blocks the gating
-	// round (#3913), decided HERE rather than in the loop so hasRejection keeps
+	// round (#3913), decided HERE rather than in the loop so rejected keeps
 	// its verdict-only meaning.
-	if reason := planReviewGatingFailureReason(hasRejection, escalationPersonaGateBlock(personaInvs)); reason != "" {
+	if reason := planReviewGatingFailureReason(gatingLoop.rejected, escalationPersonaGateBlock(personaInvs)); reason != "" {
 		cat := run.FailureB
 		if _, terr := s.cfg.RunRepo.TransitionStage(reviewCtx, stageID,
 			run.StageStateFailed, &run.StageCompletion{
@@ -1872,9 +1903,9 @@ func (s *Server) runPlanReviews(ctx context.Context, runID, stageID uuid.UUID, p
 				slog.String("error", terr.Error()),
 			)
 		}
-		return true
+		return reviewDispatchOutcome{blockReason: reason}
 	}
-	return false
+	return reviewDispatchOutcome{}
 }
 
 // planReviewGatingRejectReason is the plan stage's category-B failure reason
@@ -2458,7 +2489,9 @@ func reviewerAgentVersionMismatch(inv reviewerInvocation, probedVersion string) 
 //
 // ctx is the detached review context: per-invocation errors (including a
 // reviewer whose provider failed to resolve) are WARN-logged and skipped
-// so a transient reviewer failure doesn't strand the loop.
+// so a transient reviewer failure doesn't strand the loop. A reviewer stopped by
+// shutdown is the exception: it ends the loop with no terminal row
+// (runPlanReviewLoopOutcome).
 //
 // It is the no-conventions round of runPlanReviewLoopWithConventions: the zero
 // reviewConventionRound still clamps a review-convention-category concern a
@@ -2482,6 +2515,14 @@ func (s *Server) runPlanReviewLoop(ctx context.Context, runID, stageID uuid.UUID
 // lowered concern is WARN-logged with the run id and its category. Plan review
 // has no diff, so round.ModifiedFiles is unused here (no synthesis).
 func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget, treeDir string, round reviewConventionRound) bool {
+	return s.runPlanReviewLoopOutcome(ctx, runID, stageID, invocations, authority, promptText, authorModel, reviewBudget, treeDir, round).rejected
+}
+
+// runPlanReviewLoopOutcome is the loop's body, reporting interruption as well as
+// the verdict-only rejected flag (ADR-140 (#5047) D8). A reviewer stopped by
+// shutdown returns at once, before the failed-row emit and the post-loop page:
+// the round writes no fabricated terminal and the next boot owns it.
+func (s *Server) runPlanReviewLoopOutcome(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel string, reviewBudget planreview.ReviewBudget, treeDir string, round reviewConventionRound) reviewLoopOutcome {
 	systemKind := audit.ActorKind("system")
 	hasRejection := false
 	// pagedRejectAppended tracks whether THIS loop appended a page-class
@@ -2571,6 +2612,14 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 		verdict, model, err := s.invokeReview(invocationCtx, inv, invPrompt, invTree)
 		timedOut := errors.Is(invocationCtx.Err(), context.DeadlineExceeded)
 		cancel()
+		if errors.Is(err, errReviewerStoppedForShutdown) {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "plan review: reviewer stopped for shutdown; the round is left to the next boot",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.Int("reviewer_index", i),
+			)
+			return reviewLoopOutcome{rejected: hasRejection, interrupted: true}
+		}
 		if err != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "plan review: reviewer invocation failed",
 				slog.String("run_id", runID.String()),
@@ -2682,7 +2731,7 @@ func (s *Server) runPlanReviewLoopWithConventions(ctx context.Context, runID, st
 	if pagedRejectAppended {
 		s.notifyPageClass(ctx, runID, "plan_review")
 	}
-	return hasRejection
+	return reviewLoopOutcome{rejected: hasRejection}
 }
 
 // logConventionClamps WARN-logs every concern the ingest-time review-convention
