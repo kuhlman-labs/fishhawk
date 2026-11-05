@@ -777,6 +777,17 @@ func TestGitLabCIRetry_NonCorrelatingPipelinesSkipWithNamedReasons(t *testing.T)
 			gitLabRetrySkipNoRunForRef,
 			false,
 		},
+		// A consolidated ref of a run NO candidate owns is still no-owner: the
+		// consolidated-ref arm (#4813) attributes only when a candidate's own
+		// consolidated branch matches, so this stays global-chained.
+		{
+			"consolidated_ref_of_no_candidate",
+			func(*run.Run) Event {
+				return gitlabPipelineEvent("failed", "fishhawk/run-99999999-consolidated", "deadbeef", 9001, 0)
+			},
+			gitLabRetrySkipNoRunForRef,
+			false,
+		},
 		{
 			"right_branch_wrong_sha",
 			func(p *run.Run) Event {
@@ -1071,6 +1082,182 @@ func TestGitLabRunBranch_MatchesOrchestratorDerivation(t *testing.T) {
 				t.Errorf("branch = %q, want %q", got, tc.wantName)
 			}
 		})
+	}
+}
+
+// TestGitLabConsolidatedBranch_MatchesOrchestratorDerivation pins the
+// cross-package equivalence for the consolidated branch (#4813), exactly as
+// TestGitLabRunBranch_MatchesOrchestratorDerivation does for the run branch. It
+// runs the OTHER derivation rather than restating its output, and keeps the
+// exact string beside it because the name is a wire contract with the
+// orchestrator's fan-in and the consolidated PR head. A drift would silently
+// degrade the consolidated-ref reason back to no_candidate_run_owns_pipeline_ref.
+func TestGitLabConsolidatedBranch_MatchesOrchestratorDerivation(t *testing.T) {
+	id := uuid.MustParse("bff9a242-9c4a-48a3-ad84-5feb66de9da2")
+	got := gitLabConsolidatedBranch(&run.Run{ID: id})
+	if want := orchestrator.ConsolidatedBranch(id); got != want {
+		t.Errorf("gitLabConsolidatedBranch = %q, but orchestrator derives %q — the consolidated-ref arm would miss every fan-in pipeline",
+			got, want)
+	}
+	if want := "fishhawk/run-bff9a242-consolidated"; got != want {
+		t.Errorf("consolidated branch = %q, want %q", got, want)
+	}
+}
+
+// TestGitLabConsolidatedRefOwner pins the owner lookup's three outcomes: the
+// owning candidate, a consolidated ref no candidate owns, and a plain run
+// branch — which is a DIFFERENT shape that correlateGitLabPipeline owns.
+func TestGitLabConsolidatedRefOwner(t *testing.T) {
+	a := &run.Run{ID: uuid.MustParse("1dd0f40b-ea08-41cc-a79c-cc4a6a931648")}
+	b := &run.Run{ID: uuid.MustParse("bff9a242-9c4a-48a3-ad84-5feb66de9da2")}
+	cands := []*run.Run{a, b}
+	cases := []struct {
+		name string
+		ref  string
+		want *run.Run
+	}{
+		{"first_candidate_owns", "fishhawk/run-1dd0f40b-consolidated", a},
+		{"second_candidate_owns", "fishhawk/run-bff9a242-consolidated", b},
+		{"no_candidate_owns", "fishhawk/run-99999999-consolidated", nil},
+		{"plain_run_branch_is_not_a_consolidated_ref", "fishhawk/run-1dd0f40b", nil},
+		{"slice_branch_is_not_a_consolidated_ref", "fishhawk/run-1dd0f40b/slice-0", nil},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := gitLabConsolidatedRefOwner(cands, tc.ref)
+			if got != tc.want {
+				t.Errorf("gitLabConsolidatedRefOwner(%q) = %s, want %s", tc.ref, ownerLabel(got), ownerLabel(tc.want))
+			}
+		})
+	}
+	if got := gitLabConsolidatedRefOwner(nil, "fishhawk/run-1dd0f40b-consolidated"); got != nil {
+		t.Errorf("owner over no candidates = %s, want nil", ownerLabel(got))
+	}
+}
+
+// ownerLabel renders a candidate run for a failure message: its id, or "nil".
+func ownerLabel(r *run.Run) string {
+	if r == nil {
+		return "nil"
+	}
+	return r.ID.String()
+}
+
+// TestGitLabCIRetry_ConsolidatedPipelineRef_RefusedNamingLineage is the done-
+// means test for the GitLab consolidated-ref arm (#4813). A pipeline on a
+// decomposed parent's CONSOLIDATED branch matches no gitLabRunBranch, so before
+// this arm it fell to correlateGitLabPipeline and drew the untrue, global-
+// chained no_candidate_run_owns_pipeline_ref. It must now be refused with the
+// lineage reason, chained to the PARENT, with no child and no pipeline trigger.
+//
+// Counterfactual: replacing the owner condition with
+// `if owner := (*run.Run)(nil); owner != nil {` leaves no child either way, so
+// this RED lands on the reason and chain assertions, not the child count.
+func TestGitLabCIRetry_ConsolidatedPipelineRef_RefusedNamingLineage(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	trigger := retryTrigger(t, d)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+
+	ev := gitlabPipelineEvent("failed", gitLabConsolidatedBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0", len(got))
+	}
+	trigger.mu.Lock()
+	calls := len(trigger.calls)
+	trigger.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("pipeline trigger calls = %d, want 0", calls)
+	}
+	p, chainedToRun := skipPayload(t, au)
+	if got, _ := p["reason"].(string); got != "decomposed_parent_consolidated_lineage" {
+		t.Errorf("reason = %q, want %q", got, "decomposed_parent_consolidated_lineage")
+	}
+	if !chainedToRun {
+		t.Error("skip row is global-chained; a consolidated ref names its parent, so it must chain to that run")
+	}
+	if got, _ := p["run_id"].(string); got != parent.ID.String() {
+		t.Errorf("payload run_id = %q, want the parent %s", got, parent.ID)
+	}
+}
+
+// TestGitLabCIRetry_DecomposedParent_OwnBranchRefused covers the other way a
+// decomposed parent reaches the retry: its pipeline correlates on the parent's
+// OWN run branch and recorded head SHA, so the consolidated-ref arm never sees
+// it. The ref and SHA correlate perfectly — absent the probe the parent reaches
+// the mint — so a slice row seeded against it is the only thing refusing.
+//
+// Counterfactual: replacing the probe call site's condition with
+// `if reason := ""; reason != "" {` mints a retry child and this goes red.
+func TestGitLabCIRetry_DecomposedParent_OwnBranchRefused(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	trigger := retryTrigger(t, d)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	seedSliceChildOf(t, runs, parent.Repo, parent.ID, run.RunnerKindGitLabCI)
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if got := retryChildren(runs, 2); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0 (a decomposed parent must not mint a retry child)", len(got))
+	}
+	trigger.mu.Lock()
+	calls := len(trigger.calls)
+	trigger.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("pipeline trigger calls = %d, want 0", calls)
+	}
+	p, chainedToRun := skipPayload(t, au)
+	if got, _ := p["reason"].(string); got != "decomposed_parent_consolidated_lineage" {
+		t.Errorf("reason = %q, want %q", got, "decomposed_parent_consolidated_lineage")
+	}
+	if !chainedToRun {
+		t.Error("skip row is global-chained, want chained to the parent")
+	}
+	if got, _ := p["run_id"].(string); got != parent.ID.String() {
+		t.Errorf("payload run_id = %q, want the parent %s", got, parent.ID)
+	}
+}
+
+// TestGitLabCIRetry_ChildrenLookupFailure_RefusesRetry pins the FAIL CLOSED
+// half on the GitLab path. decomposedProbeErr fails only the
+// DecomposedFrom-filtered probe, so the candidate lookup and correlation
+// succeed and nothing downstream masks a fail-open: the parent is under its cap
+// with a wired trigger and credential scope.
+//
+// Counterfactual: replacing `return ciRetrySkipChildrenLookupFailed` with
+// `return ""` mints a child here.
+func TestGitLabCIRetry_ChildrenLookupFailure_RefusesRetry(t *testing.T) {
+	d, runs, au, arts := newGitLabRetryDispatcher(t)
+	trigger := retryTrigger(t, d)
+	parent := seedGitLabRun(t, runs, arts, "acme/widgets", "deadbeef", 0, 0)
+	runs.decomposedProbeErr = errors.New("children lookup: connection reset")
+
+	ev := gitlabPipelineEvent("failed", gitLabRunBranch(parent), "deadbeef", 9001, 0)
+	if err := d.Handle(context.Background(), ev); err != nil {
+		t.Fatalf("Handle: %v (a probe failure must refuse quietly, not 5xx)", err)
+	}
+
+	if got := retryChildren(runs, 1); len(got) != 0 {
+		t.Fatalf("retry children = %d, want 0 (fail closed)", len(got))
+	}
+	trigger.mu.Lock()
+	calls := len(trigger.calls)
+	trigger.mu.Unlock()
+	if calls != 0 {
+		t.Errorf("pipeline trigger calls = %d, want 0", calls)
+	}
+	p, chainedToRun := skipPayload(t, au)
+	if got, _ := p["reason"].(string); got != "decomposition_children_lookup_failed" {
+		t.Errorf("reason = %q, want %q", got, "decomposition_children_lookup_failed")
+	}
+	if !chainedToRun {
+		t.Error("skip row is global-chained, want chained to the parent")
 	}
 }
 
