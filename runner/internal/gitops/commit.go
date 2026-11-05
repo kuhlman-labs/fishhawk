@@ -1560,17 +1560,19 @@ var ErrBranchCheckedOutElsewhere = errors.New("gitops: run branch already checke
 // needs no such preflight: a detached HEAD claims no branch name and never
 // collides (#1361).
 //
-// The fetch uses an explicit refspec `+refs/heads/<branch>:<trackingRef>`
-// where trackingRef is refs/remotes/<remote>/<branch> derived from the SAME
-// remote the fetch targets — fetch source and compared/checked-out ref stay
-// in lockstep by construction, never a hard-coded "origin" against a
-// different remote. Per git-fetch(1), a refspec given on the command line
-// overrides the configured fetch refspecs and an explicit destination ref
-// is updated directly (the leading + forces a non-fast-forward update), so
-// the tracking ref deterministically holds the fetched tip regardless of
-// the repo's fetch config. The checkout is `checkout -B <branch>
-// <trackingRef>`, resetting any stale local branch of the same name to the
-// fetched tip.
+// The fetch (fetchRemoteBranchTip) pulls `+refs/heads/<branch>` into a
+// transient per-call private ref (the leading + forces a non-fast-forward
+// update) and then publishes the fetched tip to trackingRef, which is
+// refs/remotes/<remote>/<branch> derived from the SAME remote the fetch
+// targets — fetch source and compared/checked-out ref stay in lockstep by
+// construction, never a hard-coded "origin" against a different remote. The
+// fetch never names the shared tracking ref (--refmap= switches off git's
+// opportunistic tracking-ref update), so a concurrent fetch of the same ref
+// cannot fail it with a compare-and-swap error (#4835); the publish is an
+// update-ref with no old value, so trackingRef deterministically holds the
+// fetched tip on return regardless of the repo's fetch config. The checkout is
+// `checkout -B <branch> <trackingRef>`, resetting any stale local branch of the
+// same name to the fetched tip.
 //
 // Auth: when pushToken is non-empty and the remote resolves to an http(s)
 // URL, the fetch authenticates per-invocation with a freshly-minted token via
@@ -1747,38 +1749,94 @@ func canonWorktreePath(pth string) string {
 	return filepath.Clean(pth)
 }
 
+// privateFetchRefPrefix is the namespace of the per-call private ref
+// fetchRemoteBranchTip fetches into. A ref here is transient: the fetch that
+// creates it deletes it before returning.
+const privateFetchRefPrefix = "refs/fishhawk/fetch/"
+
+// privateFetchRefDropTimeout bounds the cancellation-independent delete of a
+// private fetch ref (see dropPrivateFetchRef).
+const privateFetchRefDropTimeout = 30 * time.Second
+
 // fetchRemoteBranchTip is the shared fetch+rev-parse prologue of
-// CheckoutRemoteBranch and CheckoutRemoteBranchDetached. It fetches
-// refs/heads/<branch> from the named remote into the remote-tracking ref
-// refs/remotes/<remote>/<branch> via the explicit refspec (see
-// CheckoutRemoteBranch's doc for the lockstep / non-fast-forward rationale)
-// and returns that trackingRef plus the fetched tip SHA. The two checkout
-// variants diverge only in HOW they move the working tree onto that tip:
-// on-branch `checkout -B` (fix-up) vs. detached `checkout --detach` (the
-// decomposed-child base, #1361).
+// CheckoutRemoteBranch, CheckoutRemoteBranchDetached and FetchBaseTip. It
+// fetches refs/heads/<branch> from the named remote and returns the
+// remote-tracking ref refs/remotes/<remote>/<branch> (derived from the SAME
+// remote the fetch targets — see CheckoutRemoteBranch's doc for the lockstep
+// rationale) plus the fetched tip SHA. The two checkout variants diverge only
+// in HOW they move the working tree onto that tip: on-branch `checkout -B`
+// (fix-up) vs. detached `checkout --detach` (the decomposed-child base, #1361).
+//
+// The fetch NEVER names a shared ref, so it cannot lose a compare-and-swap on
+// one (#4835). A fetch whose destination is the shared tracking ref reads that
+// ref's old value and stores the new one only if it is still unchanged; any
+// other fetch of the same remote branch (an operator's, a sibling run's) that
+// lands in between fails this one with `cannot lock ref ... is at X but
+// expected Y`. Instead the fetch writes a per-call PRIVATE ref
+// (refs/fishhawk/fetch/tip-<hex>, unique per call via perCallSnapshotKey so
+// sibling worktrees never share it), the tip is read from that ref, and it is
+// then PUBLISHED to the tracking ref by an `update-ref` that carries no old
+// value — a write with no compare step cannot lose a race. The private ref is
+// dropped on return. Two fetch flags are load-bearing:
+//
+//   - --refmap= (empty): a fetch of a named remote that has a configured
+//     fetch refspec also updates the matching tracking ref opportunistically,
+//     WITH a compare against the value it read (git-fetch(1), CONFIGURED
+//     REMOTE-TRACKING BRANCHES). A private destination alone therefore does not
+//     remove the race; an empty refmap switches the opportunistic update off.
+//   - --no-tags: an explicit-destination refspec auto-follows tags that point
+//     into the fetched history, which would be another shared write.
+//
+// On return the tracking ref holds the fetched tip, so by-name readers of
+// refs/remotes/<remote>/<branch> see what they always saw. This is a
+// compatibility contract, not a pin: the returned SHA is bound to the private
+// ref's value, but the tracking ref is last-writer-wins, so a concurrent fetch
+// can move it between this publish and a later by-name read (a pre-existing
+// window; the pinned-consumer design is #5039). IsLockContention still refuses
+// to retry a CAS mismatch; that rule stands because this path no longer has one.
 //
 // authEnv carries the run token's process-scoped auth (authConfigEnv's
 // GIT_CONFIG_* entries, resolved by AuthEnvForRemote) so the fetch
 // authenticates per-invocation with a fresh credential and neutralizes any
 // stale persisted extraheader on the shared config (#1951) — a nil authEnv
 // falls back to ambient auth (byte-identical to before this seam existed).
+// authEnv rides the fetch ALONE: the rev-parse, the publish and the delete are
+// local and need no credential.
 func fetchRemoteBranchTip(ctx context.Context, p *Pusher, repoDir, remote, branch string, authEnv []string) (trackingRef, tipSHA string, err error) {
 	remote = orDefault(remote, DefaultRemote)
 	trackingRef = fmt.Sprintf("refs/remotes/%s/%s", remote, branch)
-	if err := p.runEnvLockRetry(ctx, repoDir, authEnv, "fetch", remote,
-		fmt.Sprintf("+refs/heads/%s:%s", branch, trackingRef)); err != nil {
+	privateRef := privateFetchRefPrefix + perCallSnapshotKey("tip")
+	defer dropPrivateFetchRef(ctx, p, repoDir, privateRef)
+	if err := p.runEnvLockRetry(ctx, repoDir, authEnv, "fetch", "--no-tags", "--refmap=", remote,
+		fmt.Sprintf("+refs/heads/%s:%s", branch, privateRef)); err != nil {
 		return "", "", fmt.Errorf("gitops: fetch %s from %s: %w", branch, remote, err)
 	}
-	tip, err := p.runOut(ctx, repoDir, "rev-parse", trackingRef)
+	tip, err := p.runOut(ctx, repoDir, "rev-parse", privateRef)
 	if err != nil {
-		return "", "", fmt.Errorf("gitops: rev-parse %s: %w", trackingRef, err)
+		return "", "", fmt.Errorf("gitops: rev-parse %s: %w", privateRef, err)
 	}
-	return trackingRef, strings.TrimSpace(tip), nil
+	tip = strings.TrimSpace(tip)
+	if err := p.runEnvLockRetry(ctx, repoDir, nil, "update-ref", trackingRef, tip); err != nil {
+		return "", "", fmt.Errorf("gitops: update-ref %s: %w", trackingRef, err)
+	}
+	return trackingRef, tip, nil
+}
+
+// dropPrivateFetchRef deletes a private fetch ref. It runs under a context
+// detached from ctx's cancellation and bounded by privateFetchRefDropTimeout,
+// so a cancelled stage still cleans up without being able to hang. The error is
+// discarded: a failed delete leaves one inert ref and must not fail a fetch that
+// succeeded. Because the drop is deferred it always runs after the publish, so
+// the tip stays referenced throughout.
+func dropPrivateFetchRef(ctx context.Context, p *Pusher, repoDir, ref string) {
+	dropCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), privateFetchRefDropTimeout)
+	defer cancel()
+	_ = p.runEnvLockRetry(dropCtx, repoDir, nil, "update-ref", "-d", ref)
 }
 
 // CheckoutRemoteBranchDetached is the decomposed-child base-establishment
 // path (#1361). Like CheckoutRemoteBranch it fetches the base branch tip
-// from the named remote (sharing the same explicit-refspec fetch prologue),
+// from the named remote (sharing the same private-ref fetch prologue),
 // but it then moves the working tree onto that tip with `git checkout
 // --detach <tipSHA>` — a DETACHED HEAD that claims NO branch name.
 //
@@ -1817,16 +1875,18 @@ func CheckoutRemoteBranchDetached(ctx context.Context, repoDir, remote, branch, 
 	return tip, nil
 }
 
-// FetchBaseTip fetches refs/heads/<branch> from the named remote into the
-// remote-tracking ref refs/remotes/<remote>/<branch> and returns the fetched
-// tip SHA, WITHOUT moving the working tree. It is the checkout-less sibling of
-// CheckoutRemoteBranch / CheckoutRemoteBranchDetached, sharing the same
-// explicit-refspec fetch prologue (fetchRemoteBranchTip): the runner uses it
-// to re-anchor the policy-gate/review diff to the CURRENT base-branch tip
-// (matching what GitHub renders on the PR) before merge-basing, so a long-lived
-// run whose local base ref lags the advanced remote no longer folds the base's
-// unrelated advance into the staged diff (#1975). Because it only fetches (no
-// checkout), it never touches the working tree the fix-up agent's edits live on.
+// FetchBaseTip fetches refs/heads/<branch> from the named remote, publishes the
+// tip to the remote-tracking ref refs/remotes/<remote>/<branch> and returns the
+// fetched tip SHA, WITHOUT moving the working tree. It is the checkout-less
+// sibling of CheckoutRemoteBranch / CheckoutRemoteBranchDetached, sharing the
+// same private-ref fetch prologue (fetchRemoteBranchTip, which never names the
+// shared tracking ref and so cannot lose a compare-and-swap, #4835): the runner
+// uses it to re-anchor the policy-gate/review diff to the CURRENT base-branch
+// tip (matching what GitHub renders on the PR) before merge-basing, so a
+// long-lived run whose local base ref lags the advanced remote no longer folds
+// the base's unrelated advance into the staged diff (#1975). Because it only
+// fetches (no checkout), it never touches the working tree the fix-up agent's
+// edits live on.
 //
 // Auth mirrors the checkout variants: when pushToken is supplied and the remote
 // is http(s), the fetch authenticates per-invocation via AuthEnvForRemote's

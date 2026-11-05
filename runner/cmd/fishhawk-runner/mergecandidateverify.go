@@ -91,11 +91,13 @@ const mergeCandidateDefaultVerifyTimeout = 10 * time.Minute
 // `running`.
 var mergeCandidateReportTimeout = 2 * time.Minute
 
-// fetchMergeCandidateTip fetches the run branch's live tip into
-// refs/remotes/<remote>/<branch> WITHOUT moving any working tree or checkout.
-// A package var for the same reason fetchConflictBranchTip is: tests must
-// never fetch against the runner's own source repository, and they wrap it to
-// record what was fetched.
+// fetchMergeCandidateTip fetches the run branch's live tip WITHOUT moving any
+// working tree or checkout. It fetches through a transient private ref
+// (refs/fishhawk/fetch/*, dropped before it returns) and publishes the tip to
+// refs/remotes/<remote>/<branch>, so a concurrent fetch of that shared ref
+// cannot fail the pass with a compare-and-swap error (#4835). A package var for
+// the same reason fetchConflictBranchTip is: tests must never fetch against the
+// runner's own source repository, and they wrap it to record what was fetched.
 var fetchMergeCandidateTip = gitops.FetchBaseTip
 
 // mergeCandidateVerifyFn is the committed-tree verify seam. Production is
@@ -154,8 +156,9 @@ func runMergeCandidateVerifyStage(ctx context.Context, cfg config, req mergeCand
 }
 
 // mergeCandidateVerify performs the pass and returns its outcome. It never
-// writes to any working tree, branch or remote: the only side effect is the
-// remote-tracking-ref refresh of the run-branch fetch.
+// writes to any working tree, branch or remote: the only side effects are the
+// remote-tracking-ref refresh of the run-branch fetch and the transient private
+// ref that fetch creates and drops before returning.
 func mergeCandidateVerify(ctx context.Context, cfg config, req mergeCandidateVerifyRequest,
 	client uploadClient, issued *upload.IssuedKey, logSink io.Writer) mergeCandidateOutcome {
 	notExecuted := func(reason string) mergeCandidateOutcome {
