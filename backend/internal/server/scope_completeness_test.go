@@ -2,6 +2,7 @@ package server
 
 import (
 	"context"
+	"crypto/ed25519"
 	"encoding/json"
 	"errors"
 	"net/http"
@@ -10,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
@@ -34,8 +36,67 @@ func scopeCompletenessServer(t *testing.T) (*Server, *orchestratorRepo, *auditCa
 		MissingPaths:    []string{"backend/internal/foo/foo_test.go"},
 	}
 	au := &auditCapture{}
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au})
 	return s, rr, au, runRow, stage
+}
+
+// scopeParkDeciderRepo gives the orchestratorRepo fake the run.ScopeParkDecider
+// capability the exempt and fail arms hard-require. It is all-or-nothing like the
+// postgres verbs: state and attempt are compared and the entry appended before the
+// stage moves, all under the fake's lock, so an append error leaves the stage
+// parked. Embedding keeps every other method and optional capability of the fake.
+type scopeParkDeciderRepo struct {
+	*orchestratorRepo
+	au audit.Repository
+	// deciderErr, when set, makes both verbs fail without touching anything.
+	deciderErr error
+	// loseDecision, when set, makes both verbs report a lost decision without
+	// touching anything, whatever the stage's state.
+	loseDecision bool
+}
+
+func newScopeParkDeciderRepo(rr *orchestratorRepo, au audit.Repository) *scopeParkDeciderRepo {
+	return &scopeParkDeciderRepo{orchestratorRepo: rr, au: au}
+}
+
+func (r *scopeParkDeciderRepo) ExemptScopeParkAndAppend(ctx context.Context, stageID uuid.UUID, expectedAttempt string, p audit.ChainAppendParams) (*run.Stage, bool, error) {
+	return r.decide(ctx, stageID, expectedAttempt, run.StageStatePending, nil, p)
+}
+
+func (r *scopeParkDeciderRepo) FailScopeParkAndAppend(ctx context.Context, stageID uuid.UUID, expectedAttempt, reason string, p audit.ChainAppendParams) (*run.Stage, bool, error) {
+	category := run.FailureB
+	return r.decide(ctx, stageID, expectedAttempt, run.StageStateFailed,
+		&run.StageCompletion{FailureCategory: &category, FailureReason: &reason}, p)
+}
+
+func (r *scopeParkDeciderRepo) decide(ctx context.Context, stageID uuid.UUID, expectedAttempt string, to run.StageState, c *run.StageCompletion, p audit.ChainAppendParams) (*run.Stage, bool, error) {
+	if r.deciderErr != nil {
+		return nil, false, r.deciderErr
+	}
+	if r.loseDecision {
+		return nil, false, nil
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.stagesByID[stageID]
+	if !ok {
+		return nil, false, run.ErrNotFound
+	}
+	if st.State != run.StageStateAwaitingScopeDecision {
+		return nil, false, nil
+	}
+	if run.StageAttemptToken(st.DispatchedAt) != expectedAttempt {
+		return nil, false, nil
+	}
+	if _, err := r.au.AppendChained(ctx, p); err != nil {
+		return nil, false, err
+	}
+	st.State = to
+	if c != nil {
+		st.FailureCategory = c.FailureCategory
+		st.FailureReason = c.FailureReason
+	}
+	return st, true, nil
 }
 
 func postScopeCompletenessDecision(t *testing.T, s *Server, pathRunID uuid.UUID, body string, decorate func(*http.Request) *http.Request) *httptest.ResponseRecorder {
@@ -306,81 +367,10 @@ func TestDecideScopeCompleteness_UnknownRun404(t *testing.T) {
 	}
 }
 
-// orchestratorRepoOrderProbe records, at the moment the exempt decision
-// transitions the parked stage out of awaiting_scope_decision, how many audit
-// entries the decision had already appended. It is the observation seam for the
-// ORDERING invariant: the exemption must be provable from the audit chain
-// BEFORE the stage becomes dispatchable, because the transition (and the
-// Advance that follows it) is what can spawn a runner whose prompt fetch reads
-// that chain.
-type orchestratorRepoOrderProbe struct {
-	*orchestratorRepo
-	au                     *auditCapture
-	auditCountAtTransition int
-	transitioned           bool
-}
-
-func (r *orchestratorRepoOrderProbe) TransitionStage(ctx context.Context, id uuid.UUID,
-	to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
-	r.au.mu.Lock()
-	r.auditCountAtTransition = len(r.au.appended)
-	r.au.mu.Unlock()
-	r.transitioned = true
-	return r.orchestratorRepo.TransitionStage(ctx, id, to, c)
-}
-
-// TestDecideScopeCompleteness_ExemptAuditPrecedesDispatchability pins the
-// happens-before the zero-re-run path rests on (#2501): the
-// scope_completeness_exempted entry — the emission gate's authorization proof
-// (prompt.go::resolveHeldCommitExemption) — is in the chain BEFORE the stage
-// leaves awaiting_scope_decision.
-//
-// Without that ordering, the transition + Orchestrator.Advance can start a
-// runner whose prompt fetch races the append, sees only the older `parked`
-// entry, omits the held-commit fields, and re-invokes the agent — the exact
-// full re-run the park exists to avoid. Advance runs strictly after the
-// transition, so pinning the transition pins Advance transitively.
-func TestDecideScopeCompleteness_ExemptAuditPrecedesDispatchability(t *testing.T) {
-	base := newOrchestratorRepo()
-	runRow := base.seedRun()
-	stage := base.seedStage(runRow.ID, 1, run.StageStateAwaitingScopeDecision)
-	stage.Type = run.StageTypeImplement
-	stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
-		HeldCommitSHA:   "1111111111111111111111111111111111111111",
-		RunBranch:       "fishhawk/run-aaa/slice-0",
-		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
-		MissingPaths:    []string{"backend/internal/foo/foo_test.go"},
-	}
-	au := &auditCapture{}
-	rr := &orchestratorRepoOrderProbe{orchestratorRepo: base, au: au}
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
-
-	w := postScopeCompletenessDecision(t, s, runRow.ID,
-		`{"decision":"exempt","reason":"the assertion literal was operator-authored and wrong"}`,
-		operatorWriteStages)
-	if w.Code != http.StatusOK {
-		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
-	}
-	if !rr.transitioned {
-		t.Fatal("the exempt decision never transitioned the stage; the ordering probe observed nothing")
-	}
-	if rr.auditCountAtTransition != 1 {
-		t.Fatalf("audit entries present when the stage became dispatchable = %d, want 1: "+
-			"the scope_completeness_exempted entry MUST be in the chain before the stage leaves "+
-			"awaiting_scope_decision, or a runner started by the follow-on Advance can fetch its "+
-			"prompt, read the older `parked` entry, and re-invoke the agent", rr.auditCountAtTransition)
-	}
-	au.mu.Lock()
-	defer au.mu.Unlock()
-	if len(au.appended) != 1 || au.appended[0].Category != CategoryScopeCompletenessExempted {
-		t.Fatalf("audit = %+v, want one scope_completeness_exempted entry", au.appended)
-	}
-}
-
 // TestDecideScopeCompleteness_ExemptAuditAppendFailure_RefusesAndLeavesParked
-// pins the fail-closed half of the same invariant (#2501): when the exempted
-// entry cannot be written, the decision is REFUSED (500) and the stage stays
-// parked — never moved to a dispatch-admissible state.
+// pins the fail-closed exempt arm (#2501, #2559): when the exempted entry cannot
+// be written, the decision is REFUSED (500) and the stage stays parked — never
+// moved to a dispatch-admissible state.
 //
 // A best-effort append here would return 200 and dispatch a stage the emission
 // gate can never prove exempt: the runner would re-invoke the agent (the loss
@@ -400,7 +390,7 @@ func TestDecideScopeCompleteness_ExemptAuditAppendFailure_RefusesAndLeavesParked
 	}
 	au := newAuditFake()
 	au.appendErr = errors.New("audit chain write failed")
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au})
 
 	w := postScopeCompletenessDecision(t, s, runRow.ID,
 		`{"decision":"exempt","reason":"the coupled test file is genuinely already covered"}`,
@@ -426,25 +416,21 @@ func TestDecideScopeCompleteness_ExemptAuditAppendFailure_RefusesAndLeavesParked
 	}
 }
 
-// TestScopeCompleteness_ParkToPromptEmission_EndToEnd is the BACKEND half of the
-// #2501 cross-module seam, covered in ONE test (operator binding condition 1(b))
-// rather than piecewise per layer: it posts the runner's exact scope_park bytes,
-// persists the park through REAL Postgres (pgtest), decides `exempt` through the
-// real decision handler, then fetches the prompt through the real signed
-// /prompt endpoint and asserts BOTH that the emitted held-commit projection
-// equals the cross-module golden fixture AND that the resolved stage state is
-// dispatch-admissible (an inadmissible state emits fields no runner ever reads).
-//
-// The one hop this test cannot make is the runner's DECODE — the runner and the
-// backend are separate Go modules and neither may import the other. That hop is
-// pinned by the SINGLE shared fixture testdata/wire/exempt_prompt_fields.json,
-// read here via goldenExemptPromptJSON(t) and read verbatim by
-// runner/cmd/fishhawk-runner/main_test.go, which decodes it into
-// upload.FetchedPrompt. One source of truth (#2558): any drift in what the
-// backend emits forces a fixture edit, which then breaks the RUNNER decode test,
-// not merely a backend assertion. The struct-level tag parity is additionally
-// pinned by backend/internal/wirecontract's TestCrossModuleWireParity.
-func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
+// scopeParkE2E is an implement stage parked in awaiting_scope_decision through
+// the runner's real scope_park report: real Postgres (pgtest), the real ship
+// handler, and a run signing key so the test can fetch the real signed /prompt.
+type scopeParkE2E struct {
+	pool      *pgxpool.Pool
+	s         *Server
+	runRepo   run.Repository
+	auditRepo audit.Repository
+	runID     uuid.UUID
+	stageID   uuid.UUID
+	priv      ed25519.PrivateKey
+}
+
+func newScopeParkE2E(t *testing.T) *scopeParkE2E {
+	t.Helper()
 	pool := pgtest.NewPool(t)
 	ctx := context.Background()
 
@@ -492,23 +478,115 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 	})
 	s.promptIssueGetterOverride = &stubIssueGetter{}
 
-	// (1) The runner's exact scope_park bytes for an ASSERTION-class park: the
-	// field order and tags of upload.pullRequestScopeParkBody, with missing_paths
-	// omitted (omitempty) exactly as the runner ships it. The held commit and
-	// branch are the golden fixture's, so the projection asserted in (4) is
-	// byte-comparable against the shared cross-module literal.
-	parkBytes := []byte(`{"outcome":"scope_park","branch":"fishhawk/run-11112222/stage-99990000",` +
-		`"head_sha":"1111111111111111111111111111111111111111",` +
-		`"base_sha":"3333333333333333333333333333333333333333",` +
-		`"verified_tree_sha":"2222222222222222222222222222222222222222",` +
-		`"unsatisfied_assertions":[{"type":"file_contains","path":"backend/internal/run/run.go","literal":"UnsatisfiedAssertion"}]}`)
-	w := shipPRRequest(t, s, realRun.ID, implStage.ID, key.PrivateKey, parkBytes, "")
+	w := shipPRRequest(t, s, realRun.ID, implStage.ID, key.PrivateKey,
+		scopeParkReport("1111111111111111111111111111111111111111"), "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("scope_park report status = %d, want 200:\n%s", w.Code, w.Body.String())
 	}
+	return &scopeParkE2E{
+		pool: pool, s: s, runRepo: runRepo, auditRepo: auditRepo,
+		runID: realRun.ID, stageID: implStage.ID, priv: key.PrivateKey,
+	}
+}
+
+// scopeParkReport is the runner's exact scope_park bytes for an ASSERTION-class
+// park: the field order and tags of upload.pullRequestScopeParkBody, with
+// missing_paths omitted (omitempty) exactly as the runner ships it. With the golden
+// fixture's held commit, an emitted projection is byte-comparable against the
+// shared cross-module literal.
+func scopeParkReport(heldCommitSHA string) []byte {
+	return []byte(`{"outcome":"scope_park","branch":"fishhawk/run-11112222/stage-99990000",` +
+		`"head_sha":"` + heldCommitSHA + `",` +
+		`"base_sha":"3333333333333333333333333333333333333333",` +
+		`"verified_tree_sha":"2222222222222222222222222222222222222222",` +
+		`"unsatisfied_assertions":[{"type":"file_contains","path":"backend/internal/run/run.go","literal":"UnsatisfiedAssertion"}]}`)
+}
+
+func (e *scopeParkE2E) stage(t *testing.T) *run.Stage {
+	t.Helper()
+	st, err := e.runRepo.GetStage(context.Background(), e.stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	return st
+}
+
+func (e *scopeParkE2E) entries(t *testing.T, category string) []*audit.Entry {
+	t.Helper()
+	all, err := e.auditRepo.ListForRunByCategory(context.Background(), e.runID, category)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory(%s): %v", category, err)
+	}
+	return all
+}
+
+func (e *scopeParkE2E) promptKeys(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	return exemptBodyKeys(t, promptRequest(t, e.s, e.runID, e.stageID, e.priv, ""), "/prompt")
+}
+
+// staleDecisionRequest is the request a decision arm receives directly, with a
+// stage row loaded before another decision committed: the deterministic form of
+// two in-flight decisions that both passed resolveParkedScopeStage's read.
+func staleDecisionRequest(e *scopeParkE2E) *http.Request {
+	req := httptest.NewRequest(http.MethodPost,
+		"/v0/runs/"+e.runID.String()+"/scope-completeness/decision", nil)
+	return operatorWriteStages(req)
+}
+
+// refuseCommitOfPendingStages installs a test-only DEFERRED constraint trigger:
+// any transaction moving a stage to `pending` fails at COMMIT, after every
+// statement in it succeeded. pgtest gives each test its own database, so the
+// trigger is isolated to this test. The returned func drops it.
+func refuseCommitOfPendingStages(t *testing.T, pool *pgxpool.Pool) (drop func()) {
+	t.Helper()
+	ctx := context.Background()
+	if _, err := pool.Exec(ctx, `
+CREATE FUNCTION fishhawk_test_refuse_pending() RETURNS trigger LANGUAGE plpgsql AS $$
+BEGIN
+	IF NEW.state = 'pending' THEN
+		RAISE EXCEPTION 'test-only: refusing to commit a stage moved to pending';
+	END IF;
+	RETURN NULL;
+END $$;
+CREATE CONSTRAINT TRIGGER fishhawk_test_refuse_pending AFTER UPDATE ON stages
+	DEFERRABLE INITIALLY DEFERRED FOR EACH ROW
+	EXECUTE FUNCTION fishhawk_test_refuse_pending();`); err != nil {
+		t.Fatalf("install deferred trigger: %v", err)
+	}
+	return func() {
+		t.Helper()
+		if _, err := pool.Exec(ctx, `DROP TRIGGER fishhawk_test_refuse_pending ON stages`); err != nil {
+			t.Fatalf("drop deferred trigger: %v", err)
+		}
+	}
+}
+
+// TestScopeCompleteness_ParkToPromptEmission_EndToEnd is the BACKEND half of the
+// #2501 cross-module seam, covered in ONE test (operator binding condition 1(b))
+// rather than piecewise per layer: it posts the runner's exact scope_park bytes,
+// persists the park through REAL Postgres (pgtest), decides `exempt` through the
+// real decision handler, then fetches the prompt through the real signed
+// /prompt endpoint and asserts BOTH that the emitted held-commit projection
+// equals the cross-module golden fixture AND that the resolved stage state is
+// dispatch-admissible (an inadmissible state emits fields no runner ever reads).
+//
+// The one hop this test cannot make is the runner's DECODE — the runner and the
+// backend are separate Go modules and neither may import the other. That hop is
+// pinned by the SINGLE shared fixture testdata/wire/exempt_prompt_fields.json,
+// read here via goldenExemptPromptJSON(t) and read verbatim by
+// runner/cmd/fishhawk-runner/main_test.go, which decodes it into
+// upload.FetchedPrompt. One source of truth (#2558): any drift in what the
+// backend emits forces a fixture edit, which then breaks the RUNNER decode test,
+// not merely a backend assertion. The struct-level tag parity is additionally
+// pinned by backend/internal/wirecontract's TestCrossModuleWireParity.
+func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
+	e := newScopeParkE2E(t)
+	ctx := context.Background()
+	s, runRepo := e.s, e.runRepo
 
 	// (2) The park persisted through real Postgres, shortfall intact.
-	parked, err := runRepo.GetStage(ctx, implStage.ID)
+	parked, err := runRepo.GetStage(ctx, e.stageID)
 	if err != nil {
 		t.Fatalf("GetStage after park: %v", err)
 	}
@@ -530,13 +608,13 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 	}
 
 	// (3) The operator exempts it through the real decision handler.
-	dw := postScopeCompletenessDecision(t, s, realRun.ID,
+	dw := postScopeCompletenessDecision(t, s, e.runID,
 		`{"decision":"exempt","reason":"the operator-authored assertion literal was wrong, not the implement output"}`,
 		operatorWriteStages)
 	if dw.Code != http.StatusOK {
 		t.Fatalf("decision status = %d, want 200; body = %s", dw.Code, dw.Body.String())
 	}
-	resolved, err := runRepo.GetStage(ctx, implStage.ID)
+	resolved, err := runRepo.GetStage(ctx, e.stageID)
 	if err != nil {
 		t.Fatalf("GetStage after decision: %v", err)
 	}
@@ -547,7 +625,7 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 
 	// (4) The prompt the re-dispatched runner fetches carries exactly the golden
 	// three-key projection.
-	pw := promptRequest(t, s, realRun.ID, implStage.ID, key.PrivateKey, "")
+	pw := promptRequest(t, s, e.runID, e.stageID, e.priv, "")
 	if pw.Code != http.StatusOK {
 		t.Fatalf("prompt status = %d, want 200:\n%s", pw.Code, pw.Body.String())
 	}
@@ -573,6 +651,320 @@ func TestScopeCompleteness_ParkToPromptEmission_EndToEnd(t *testing.T) {
 	if string(got) != golden {
 		t.Errorf("prompt emitted after a REAL park→exempt walk drifted from the cross-module golden fixture:\n got: %s\nwant: %s",
 			got, golden)
+	}
+}
+
+// TestScopeCompleteness_StaleExemptAfterFail_NeverEmits reproduces the
+// fail-then-exempt interleaving #2559's note called unreachable: the 409 guard
+// is a read ahead of the arms, so two in-flight decisions can both pass it. The
+// exempt that loses must leave no `exempted` entry, because an override retry
+// keeps the park row and a newest `exempted` would then open a PR from a commit
+// the operator rejected. Committed state and emission are asserted BEFORE the
+// status code: the status alone cannot show what the chain now authorizes.
+func TestScopeCompleteness_StaleExemptAfterFail_NeverEmits(t *testing.T) {
+	e := newScopeParkE2E(t)
+	ctx := context.Background()
+
+	stale := e.stage(t) // the row both in-flight decisions resolved
+
+	fw := postScopeCompletenessDecision(t, e.s, e.runID,
+		`{"decision":"fail","reason":"the shortfall is load-bearing"}`, operatorWriteStages)
+	if fw.Code != http.StatusOK {
+		t.Fatalf("fail status = %d, want 200; body = %s", fw.Code, fw.Body.String())
+	}
+
+	w := httptest.NewRecorder()
+	e.s.exemptScopeCompleteness(w, staleDecisionRequest(e), e.runID, stale, "a stale exempt", "operator")
+
+	if got := e.stage(t).State; got != run.StageStateFailed {
+		t.Errorf("stage state = %q, want it still failed", got)
+	}
+	if rows := e.entries(t, CategoryScopeCompletenessExempted); len(rows) != 0 {
+		t.Errorf("%d scope_completeness_exempted rows, want 0: the losing decision must record nothing", len(rows))
+	}
+
+	if _, err := run.RetryStage(ctx, e.runRepo, e.stageID, run.RetryOptions{OverrideB: true}); err != nil {
+		t.Fatalf("override retry: %v", err)
+	}
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := e.runRepo.TransitionStage(ctx, e.stageID, to, nil); err != nil {
+			t.Fatalf("transition to %s: %v", to, err)
+		}
+	}
+	assertNoExemptKeys(t, e.promptKeys(t), "an override retry of a FAIL-decided park")
+
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "stage_not_parked") {
+		t.Errorf("stale exempt response = %d %s, want 409 stage_not_parked", w.Code, w.Body.String())
+	}
+}
+
+// TestScopeCompleteness_StaleFailAfterExempt_Refused is the mirror interleaving:
+// a fail that loses to a committed exempt must not fail the resumed stage nor
+// demote the exemption with a `failed` entry.
+func TestScopeCompleteness_StaleFailAfterExempt_Refused(t *testing.T) {
+	e := newScopeParkE2E(t)
+
+	stale := e.stage(t)
+
+	ew := postScopeCompletenessDecision(t, e.s, e.runID,
+		`{"decision":"exempt","reason":"the assertion literal was wrong"}`, operatorWriteStages)
+	if ew.Code != http.StatusOK {
+		t.Fatalf("exempt status = %d, want 200; body = %s", ew.Code, ew.Body.String())
+	}
+
+	w := httptest.NewRecorder()
+	e.s.failScopeCompleteness(w, staleDecisionRequest(e), e.runID, stale, "a stale fail", "operator")
+
+	if got := e.stage(t).State; got != run.StageStatePending {
+		t.Errorf("stage state = %q, want it still pending", got)
+	}
+	if rows := e.entries(t, CategoryScopeCompletenessFailed); len(rows) != 0 {
+		t.Errorf("%d scope_completeness_failed rows, want 0: the losing decision must record nothing", len(rows))
+	}
+	assertGoldenExemptProjection(t, e.promptKeys(t), "/prompt after a losing fail")
+
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "stage_not_parked") {
+		t.Errorf("stale fail response = %d %s, want 409 stage_not_parked", w.Code, w.Body.String())
+	}
+}
+
+// TestScopeCompleteness_TransitionFailureAfterAppend_LeavesNoExemption is the
+// issue's first scenario: the stage move cannot commit after the entry was
+// written. The fixture's trigger raises at COMMIT, so every statement of the
+// decision succeeds first; an exempted entry in a separate transaction would
+// survive it and stand as authorization for a stage that never left the park.
+func TestScopeCompleteness_TransitionFailureAfterAppend_LeavesNoExemption(t *testing.T) {
+	e := newScopeParkE2E(t)
+	drop := refuseCommitOfPendingStages(t, e.pool)
+
+	const body = `{"decision":"exempt","reason":"the assertion literal was wrong"}`
+	w := postScopeCompletenessDecision(t, e.s, e.runID, body, operatorWriteStages)
+
+	if got := e.stage(t).State; got != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want it left parked", got)
+	}
+	if rows := e.entries(t, CategoryScopeCompletenessExempted); len(rows) != 0 {
+		t.Errorf("%d scope_completeness_exempted rows, want 0: the entry must not outlive its failed transition", len(rows))
+	}
+	assertNoExemptKeys(t, e.promptKeys(t), "a parked stage whose exemption failed to commit")
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "exemption_unrecorded") {
+		t.Errorf("exempt response = %d %s, want 500 exemption_unrecorded", w.Code, w.Body.String())
+	}
+
+	// Recovery: the operator re-POSTs after the fault clears.
+	drop()
+	rw := postScopeCompletenessDecision(t, e.s, e.runID, body, operatorWriteStages)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("re-POST status = %d, want 200; body = %s", rw.Code, rw.Body.String())
+	}
+	if got := e.stage(t).State; got != run.StageStatePending {
+		t.Errorf("stage state after re-POST = %q, want pending", got)
+	}
+	if rows := e.entries(t, CategoryScopeCompletenessExempted); len(rows) != 1 {
+		t.Errorf("%d scope_completeness_exempted rows after re-POST, want exactly 1", len(rows))
+	}
+	assertGoldenExemptProjection(t, e.promptKeys(t), "/prompt after the re-POST")
+}
+
+// TestScopeCompleteness_StaleDecisionAcrossReDispatch_Refused pins the attempt
+// token the handler hands the store. A decision resolved against the first park,
+// stalled through an exempt, a re-dispatch and a re-park, sees the same parked
+// state on the row; only the attempt tells them apart. The stale row's token must
+// reach the compare-and-swap, or the decision would authorize the NEWER held commit
+// no operator looked at.
+func TestScopeCompleteness_StaleDecisionAcrossReDispatch_Refused(t *testing.T) {
+	const newerHeldCommit = "4444444444444444444444444444444444444444"
+	for _, tc := range []struct {
+		name     string
+		decide   func(*Server, http.ResponseWriter, *http.Request, uuid.UUID, *run.Stage, string, string)
+		category string
+		wantRows int
+	}{
+		{"exempt", (*Server).exemptScopeCompleteness, CategoryScopeCompletenessExempted, 1},
+		{"fail", (*Server).failScopeCompleteness, CategoryScopeCompletenessFailed, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := newScopeParkE2E(t)
+			ctx := context.Background()
+
+			stale := e.stage(t)
+
+			ew := postScopeCompletenessDecision(t, e.s, e.runID,
+				`{"decision":"exempt","reason":"the assertion literal was wrong"}`, operatorWriteStages)
+			if ew.Code != http.StatusOK {
+				t.Fatalf("exempt status = %d, want 200; body = %s", ew.Code, ew.Body.String())
+			}
+			for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+				if _, err := e.runRepo.TransitionStage(ctx, e.stageID, to, nil); err != nil {
+					t.Fatalf("transition to %s: %v", to, err)
+				}
+			}
+			if pw := shipPRRequest(t, e.s, e.runID, e.stageID, e.priv, scopeParkReport(newerHeldCommit), ""); pw.Code != http.StatusOK {
+				t.Fatalf("re-park status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+			}
+			reparked := e.stage(t)
+			if reparked.State != run.StageStateAwaitingScopeDecision || reparked.ScopeCompletenessPark.HeldCommitSHA != newerHeldCommit {
+				t.Fatalf("fixture: stage = %q holding %q, want re-parked on the newer commit",
+					reparked.State, reparked.ScopeCompletenessPark.HeldCommitSHA)
+			}
+
+			w := httptest.NewRecorder()
+			tc.decide(e.s, w, staleDecisionRequest(e), e.runID, stale, "a stale decision", "operator")
+
+			if got := e.stage(t).State; got != run.StageStateAwaitingScopeDecision {
+				t.Errorf("stage state = %q, want the newer park left undecided", got)
+			}
+			if rows := e.entries(t, tc.category); len(rows) != tc.wantRows {
+				t.Errorf("%d %s rows, want %d: the stale decision must record nothing", len(rows), tc.category, tc.wantRows)
+			}
+			assertNoExemptKeys(t, e.promptKeys(t), "a re-parked stage a stale decision tried to decide")
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "stage_not_parked") {
+				t.Errorf("stale decision response = %d %s, want 409 stage_not_parked", w.Code, w.Body.String())
+			}
+		})
+	}
+}
+
+// exemptAndFailDecisions is the two arms that go through run.ScopeParkDecider.
+var exemptAndFailDecisions = []struct{ name, body, unrecordedCode string }{
+	{"exempt", `{"decision":"exempt","reason":"the coupled test file is genuinely already covered"}`, "exemption_unrecorded"},
+	{"fail", `{"decision":"fail","reason":"the shortfall is load-bearing"}`, "fail_unrecorded"},
+}
+
+// assertRefusalOnly pins that a refused decision stops at its refusal. The status
+// alone cannot show this, because the first WriteHeader wins: an arm that fell
+// through would run Advance and append the success body, whose `decision` key
+// no refusal carries.
+func assertRefusalOnly(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if strings.Contains(w.Body.String(), `"decision"`) {
+		t.Errorf("response body = %s, want the refusal alone", w.Body.String())
+	}
+}
+
+// TestDecideScopeCompleteness_LostRace pins the handler's refusal of a lost
+// decision. The decider reports won=false WITHOUT moving the stage, so the handler
+// is the only thing between that result and a 200 claiming a decision landed.
+func TestDecideScopeCompleteness_LostRace(t *testing.T) {
+	for _, tc := range exemptAndFailDecisions {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, runRow, stage := scopeCompletenessServer(t)
+			s.cfg.RunRepo.(*scopeParkDeciderRepo).loseDecision = true
+
+			w := postScopeCompletenessDecision(t, s, runRow.ID, tc.body, operatorWriteStages)
+
+			if got, _ := rr.GetStage(context.Background(), stage.ID); got.State != run.StageStateAwaitingScopeDecision {
+				t.Errorf("stage state = %q, want it untouched", got.State)
+			}
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			if len(au.appended) != 0 {
+				t.Errorf("audit = %+v, want no row from a lost decision", au.appended)
+			}
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), "stage_not_parked") {
+				t.Errorf("response = %d %s, want 409 stage_not_parked", w.Code, w.Body.String())
+			}
+			assertRefusalOnly(t, w)
+		})
+	}
+}
+
+// TestDecideScopeCompleteness_DeciderError_Refuses pins the refusal of a decision
+// that could not commit: a 500 naming the arm's code, with the stage left parked so
+// the operator can re-POST.
+func TestDecideScopeCompleteness_DeciderError_Refuses(t *testing.T) {
+	for _, tc := range exemptAndFailDecisions {
+		t.Run(tc.name, func(t *testing.T) {
+			s, rr, au, runRow, stage := scopeCompletenessServer(t)
+			s.cfg.RunRepo.(*scopeParkDeciderRepo).deciderErr = errors.New("commit failed")
+
+			w := postScopeCompletenessDecision(t, s, runRow.ID, tc.body, operatorWriteStages)
+
+			if got, _ := rr.GetStage(context.Background(), stage.ID); got.State != run.StageStateAwaitingScopeDecision {
+				t.Errorf("stage state = %q, want it left parked", got.State)
+			}
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			if len(au.appended) != 0 {
+				t.Errorf("audit = %+v, want no row from a failed commit", au.appended)
+			}
+			if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), tc.unrecordedCode) {
+				t.Errorf("response = %d %s, want 500 %s", w.Code, w.Body.String(), tc.unrecordedCode)
+			}
+			assertRefusalOnly(t, w)
+		})
+	}
+}
+
+// TestDecideScopeCompleteness_FailAuditAppendFailure_RefusesAndLeavesParked pins
+// the #2559 behavior change on the fail arm: its entry used to be best-effort, but
+// it is what demotes an earlier `exempted` in the gate's newest-wins walk, so a
+// fail the chain cannot record no longer fails the stage.
+func TestDecideScopeCompleteness_FailAuditAppendFailure_RefusesAndLeavesParked(t *testing.T) {
+	rr := newOrchestratorRepo()
+	runRow := rr.seedRun()
+	stage := rr.seedStage(runRow.ID, 1, run.StageStateAwaitingScopeDecision)
+	stage.Type = run.StageTypeImplement
+	stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
+		HeldCommitSHA:   "1111111111111111111111111111111111111111",
+		RunBranch:       "fishhawk/run-aaa/slice-0",
+		VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+		MissingPaths:    []string{"backend/internal/foo/foo_test.go"},
+	}
+	au := newAuditFake()
+	au.appendErr = errors.New("audit chain write failed")
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au})
+
+	w := postScopeCompletenessDecision(t, s, runRow.ID,
+		`{"decision":"fail","reason":"the shortfall is load-bearing"}`, operatorWriteStages)
+
+	got, _ := rr.GetStage(context.Background(), stage.ID)
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want it left parked", got.State)
+	}
+	if got.FailureCategory != nil {
+		t.Errorf("failure category = %v, want nil on a refused decision", *got.FailureCategory)
+	}
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "fail_unrecorded") {
+		t.Errorf("response = %d %s, want 500 fail_unrecorded", w.Code, w.Body.String())
+	}
+}
+
+// TestDecideScopeCompleteness_DeciderCapabilityAbsent_Refuses pins the hard
+// requirement. A repo without the capability (a future decorator around RunRepo,
+// say) must refuse rather than fall back to two separate writes. This fixture is
+// deliberately the BARE orchestratorRepo, not scopeCompletenessServer's wrapper.
+func TestDecideScopeCompleteness_DeciderCapabilityAbsent_Refuses(t *testing.T) {
+	for _, tc := range exemptAndFailDecisions {
+		t.Run(tc.name, func(t *testing.T) {
+			rr := newOrchestratorRepo()
+			runRow := rr.seedRun()
+			stage := rr.seedStage(runRow.ID, 1, run.StageStateAwaitingScopeDecision)
+			stage.Type = run.StageTypeImplement
+			stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
+				HeldCommitSHA:   "1111111111111111111111111111111111111111",
+				RunBranch:       "fishhawk/run-aaa/slice-0",
+				VerifiedTreeSHA: "2222222222222222222222222222222222222222",
+				MissingPaths:    []string{"backend/internal/foo/foo_test.go"},
+			}
+			au := &auditCapture{}
+			s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au})
+
+			w := postScopeCompletenessDecision(t, s, runRow.ID, tc.body, operatorWriteStages)
+
+			if got, _ := rr.GetStage(context.Background(), stage.ID); got.State != run.StageStateAwaitingScopeDecision {
+				t.Errorf("stage state = %q, want it left parked", got.State)
+			}
+			au.mu.Lock()
+			defer au.mu.Unlock()
+			if len(au.appended) != 0 {
+				t.Errorf("audit = %+v, want no row without the capability", au.appended)
+			}
+			if w.Code != http.StatusServiceUnavailable || !strings.Contains(w.Body.String(), "scope_completeness_unconfigured") {
+				t.Errorf("response = %d %s, want 503 scope_completeness_unconfigured", w.Code, w.Body.String())
+			}
+			assertRefusalOnly(t, w)
+		})
 	}
 }
 
@@ -748,7 +1140,7 @@ func TestDecideScopeCompleteness_FailBuildRequiredParkDrivesParentResolution(t *
 	sibling.State = run.StateSucceeded
 
 	o := &orchestrator.Orchestrator{Runs: rr, Audit: au}
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: rr, AuditRepo: au, Orchestrator: o})
+	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au, Orchestrator: o})
 
 	w := postScopeCompletenessDecision(t, s, child.ID,
 		`{"decision":"fail","reason":"the decomposition boundary cut a coupling; re-plan the slices"}`,

@@ -48,9 +48,9 @@ var ErrStageParked = errors.New("stage is parked awaiting children")
 //     refuses with StageStateChangedError, and failStageCAS RE-ANCHORS its
 //     walk at the observed Actual state and retries (bounded). This ABSORBS
 //     the advance and lands failed, exactly as the pre-CAS TransitionStage
-//     walk did — so the 18 FailStage call sites (SLA, approvals, dispatch
-//     watchdog, webhook dispatcher, trace, plan, pullrequest,
-//     scope_completeness, lineage, deploy_trigger, reap) need NO per-site
+//     walk did — so the 25 FailStage call sites (SLA, approvals, dispatch
+//     watchdog, webhook dispatcher, trace, plan, pullrequest, lineage,
+//     deploy_trigger, and the report and gate handlers) need NO per-site
 //     CAS handling: their error branches fire only for the two typed
 //     refusals below, retry exhaustion, and genuine repo errors — the same
 //     benign-or-real classes their pre-CAS handling was written for.

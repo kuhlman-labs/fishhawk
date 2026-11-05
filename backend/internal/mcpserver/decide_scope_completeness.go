@@ -120,8 +120,9 @@ Returns the decided park record. Tool errors:
   - run_token_forbidden (a run-bound agent token attempted the decision, 403)
   - insufficient_scope (token lacks write:stages, 403)
   - run_not_found (404)
-  - scope_completeness_not_parked (the stage is not parked in
-    awaiting_scope_decision, 409)
+  - stage_not_parked (the stage is not parked in awaiting_scope_decision, or
+    this exempt or fail lost to a concurrent decision or a newer attempt of the
+    stage and recorded nothing; re-read the run before deciding again, 409)
   - exempt_refused_build_required (exempt on a build-required park; use
     amend or fail, 409)
   - amend_incomplete_coverage (the amend omits a build_required_path, 409)
@@ -133,6 +134,12 @@ Returns the decided park record. Tool errors:
   - amend_unrecorded / amend_resume_failed (the widening or the resume could
     not be persisted; the stage is left parked — re-POST, the amendment row is
     reused rather than duplicated, 500)
+  - exemption_unrecorded / fail_unrecorded (the exempt or fail decision and its
+    audit entry could not be committed together; the stage is left parked —
+    re-POST, 500)
+  - scope_completeness_unconfigured (the backend's run or audit repository is
+    not wired, or its run repository cannot commit an exempt or fail decision
+    with its audit entry, 503)
 `),
 	}, resolver.decideScopeCompleteness)
 }

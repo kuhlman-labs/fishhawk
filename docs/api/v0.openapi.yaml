@@ -31571,18 +31571,21 @@ paths:
         (403 `self_decision`): the implement agent that produced the
         parked commit must never decide its own exemption.
 
-        On `exempt` the `scope_completeness_exempted` audit entry is
-        appended FIRST and the stage then resumes to `pending` (#2501),
-        so the orchestrator re-dispatches it and the runner opens the
-        held commit's PR with NO agent re-run. That entry is the prompt
-        emission gate's authorization proof for the held commit, so the
-        ordering is load-bearing (a runner started by the follow-on
-        advance must not race the append) and an append failure refuses
-        the decision with 500 `exemption_unrecorded`, leaving the stage
-        parked. On `fail` the stage fails category-B (today's restore
-        path) and a `scope_completeness_failed` entry is appended
-        best-effort. A stage not currently parked returns 409
-        (`stage_not_parked`).
+        On `exempt` the stage resumes to `pending` (#2501) and the
+        `scope_completeness_exempted` audit entry is recorded in ONE
+        transaction (#2559), so the orchestrator re-dispatches the stage and
+        the runner opens the held commit's PR with NO agent re-run. That
+        entry is the prompt emission gate's authorization proof for the held
+        commit, so it exists only if the transition committed: a failed
+        commit refuses the decision with 500 `exemption_unrecorded`, leaving
+        the stage parked. On `fail` the stage fails category-B (today's
+        restore path) and a `scope_completeness_failed` entry is recorded in
+        one transaction the same way, because that entry is what demotes an
+        earlier `exempted` entry at the gate: a failed commit refuses with
+        500 `fail_unrecorded`, leaving the stage parked. A stage not currently
+        parked returns 409 (`stage_not_parked`), and so does an `exempt` or
+        `fail` that loses to a concurrent decision or to a newer attempt of
+        the stage; a losing decision records nothing.
 
         On `amend` (#2591) the `paths` are folded into THIS stage's
         effective scope as a pre-approved #961 scope-amendment row and the
@@ -31812,7 +31815,9 @@ paths:
         '409':
           description: |
             `stage_not_parked` — the implement stage is not parked
-            awaiting a scope-completeness decision.
+            awaiting a scope-completeness decision, or this `exempt` or `fail`
+            lost to a concurrent decision or to a newer attempt of the stage
+            (#2559). A losing decision records nothing.
 
             `exempt_refused_build_required` (#2548) — `decision: exempt` was
             requested for a build-required scope-drift park. The held commit's
@@ -31853,11 +31858,17 @@ paths:
               schema: { $ref: '#/components/schemas/Error' }
         '500':
           description: |
-            `exemption_unrecorded` — the `scope_completeness_exempted`
-            audit entry could not be appended, so the exemption the
-            prompt emission gate reads as authorization does not exist
-            (#2501). The decision is refused and the stage is left
-            parked in `awaiting_scope_decision`; re-POST it.
+            `exemption_unrecorded` — the stage's resume and its
+            `scope_completeness_exempted` audit entry could not be committed
+            together, so the exemption the prompt emission gate reads as
+            authorization does not exist (#2501, #2559). The decision is
+            refused and the stage is left parked in `awaiting_scope_decision`;
+            re-POST it.
+
+            `fail_unrecorded` (#2559) — the stage's failure and its
+            `scope_completeness_failed` audit entry could not be committed
+            together. The decision is refused and the stage is left parked in
+            `awaiting_scope_decision`; re-POST it.
 
             `amend_unrecorded` (#2591) — the scope-amendment row or the
             `scope_completeness_amended` audit entry could not be written, so
@@ -31871,7 +31882,10 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '503':
-          description: Run/audit repositories not wired.
+          description: |
+            `scope_completeness_unconfigured` — the run or audit repository is
+            not wired, or the run repository cannot commit an `exempt` or `fail`
+            decision atomically with its audit entry (#2559).
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
