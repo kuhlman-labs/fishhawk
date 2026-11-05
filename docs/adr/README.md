@@ -400,6 +400,7 @@ Amendments recorded under the upkeep rule since:
 - ADR-137: `amends: [ADR-073]`; each gains `amended_by: [ADR-137]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
 - ADR-138: `amends: [ADR-003, ADR-009, ADR-016, ADR-073]`; each gains `amended_by: [ADR-138]` and keeps `status: accepted`; `supersedes: [ADR-001]`; each gains `superseded_by: [ADR-138]` and becomes `status: superseded` (from its record-metadata line, ADR-113 D3).
 - ADR-139: `amends: [ADR-084, ADR-113]`; each gains `amended_by: [ADR-139]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
+- ADR-141: `amends: [ADR-035]`; ADR-035 gains `amended_by: [ADR-141]` and keeps `status: accepted` (from its record-metadata line, ADR-113 D3).
 - ADR-051: its tracker body gained "## Amendment (2026-10-16)", an in-place amendment of its own text, so the body is re-transcribed and no `amends`/`amended_by` edge is added.
 - ADR-041: `amends: [ADR-032]`. Its Consequences state "Revises **ADR-032**
   (#714)", and the Captain confirmed on 2026-10-23 that this is an amendment,
@@ -469,7 +470,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 
 | ID | Title | Status | Issue |
 |---|---|---|---|
-| [ADR-001](001-cloud-target-aws-gcp-other.md) | Cloud target (AWS / GCP / Other) | `accepted` | [#65](https://github.com/kuhlman-labs/fishhawk/issues/65) |
+| [ADR-001](001-cloud-target-aws-gcp-other.md) | Cloud target (AWS / GCP / Other) | `superseded` | [#65](https://github.com/kuhlman-labs/fishhawk/issues/65) |
 | [ADR-002](002-postgres-access-layer-sqlc-pgx-vs-orm.md) | Postgres access layer (sqlc + pgx vs. ORM) | `accepted` | [#66](https://github.com/kuhlman-labs/fishhawk/issues/66) |
 | [ADR-003](003-object-storage-choice-dev-loop-strategy.md) | Object storage choice + dev-loop strategy | `accepted` | [#67](https://github.com/kuhlman-labs/fishhawk/issues/67) |
 | [ADR-004](004-frontend-styling-system.md) | Frontend styling system | `accepted` | [#68](https://github.com/kuhlman-labs/fishhawk/issues/68) |
@@ -605,6 +606,7 @@ ADR-079, ADR-080, ADR-088, ADR-089, ADR-090, ADR-091 → no edge.
 | [ADR-137](137-one-build-release-candidate.md) | One build produces the release candidate (amends ADR-073) | `accepted` | [#4926](https://github.com/kuhlman-labs/fishhawk/issues/4926) |
 | [ADR-138](138-azure-k3s-hosting-substrate.md) | Azure with single-node K3s as the hosting substrate (supersedes ADR-001) | `accepted` | [#5006](https://github.com/kuhlman-labs/fishhawk/issues/5006) |
 | [ADR-139](139-adr-change-workflow.md) | Direction C adopted: the adr_change workflow (amends ADR-113) | `accepted` | [#5007](https://github.com/kuhlman-labs/fishhawk/issues/5007) |
+| [ADR-141](141-forge-confirmed-push-reports.md) | Require forge-confirmed push reports and isolate their retries (amends ADR-035) | `accepted` | [#5053](https://github.com/kuhlman-labs/fishhawk/issues/5053) |
 
 ## Status unknown — needs captain confirmation
 
