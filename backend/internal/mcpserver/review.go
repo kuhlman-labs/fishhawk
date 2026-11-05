@@ -973,14 +973,24 @@ func (r *runResolver) probeHealthBoundary(ctx context.Context, now time.Time) he
 // verdict can ever land and waiting is futile.
 //
 // Undecidable means the boundary could not be read at all; the caller must keep
-// waiting exactly as it would today. Both flags false means positively NOT
-// stranded — the reviewers belong to the serving process.
+// waiting exactly as it would today. AwaitingRedispatch means the stage was
+// re-opened after its latest dispatch and no new round has started, so there is
+// no round whose reviewers could have been orphaned. All three flags false
+// means positively NOT stranded — the reviewers belong to the serving process.
 type reviewStrand struct {
-	Stranded         bool
-	Undecidable      bool
-	Reason           string
-	LandedTerminal   int
-	ConfiguredAgents int
+	Stranded    bool
+	Undecidable bool
+	// AwaitingRedispatch is set when the latest *_review_started row sits at or
+	// below the stage's re-open floor (a plan revise, a live fix-up, or a counting
+	// retry): that row describes a SUPERSEDED round and the replacement has not
+	// been dispatched yet. There are no reviewers to orphan, so the verdict is
+	// positively not stranded and not undecidable. ConfiguredAgents,
+	// LandedTerminal and StartedAt are left zero because they would describe the
+	// superseded round.
+	AwaitingRedispatch bool
+	Reason             string
+	LandedTerminal     int
+	ConfiguredAgents   int
 	// LandedReviewers names the reviewers that DID report, so the surface can
 	// state the shortfall concretely ("1 of 2 configured reviewers landed;
 	// claude-fable-5 reported, 1 never did") rather than only that the round
@@ -1022,12 +1032,15 @@ func reviewerLabel(p PlanReview) string {
 // Stranded requires ALL of:
 //
 //	(1) a *_review_started entry exists for the stage;
-//	(2) its ConfiguredAgents > 0 (else the #1127 fallback governs, not this);
-//	(3) landed terminals for THIS round < ConfiguredAgents;
-//	(4) /healthz resolved a parseable process_start;
-//	(5) the started entry's timestamp is BEFORE that boot instant.
+//	(2) that entry is ABOVE the stage's re-open floor — at or below it the
+//	    stage was re-opened and the replacement round has not started
+//	    (AwaitingRedispatch), so there is nothing to orphan;
+//	(3) its ConfiguredAgents > 0 (else the #1127 fallback governs, not this);
+//	(4) landed terminals for THIS round < ConfiguredAgents;
+//	(5) /healthz resolved a parseable process_start;
+//	(6) the started entry's timestamp is BEFORE that boot instant.
 //
-// (4) failing is UNDECIDABLE — the wait continues unchanged. (5) failing is a
+// (5) failing is UNDECIDABLE — the wait continues unchanged. (6) failing is a
 // positive NOT-stranded: the round's dispatch postdates the serving daemon's
 // boot, so a restart did not orphan it — a timestamp ordering, not observed
 // reviewer liveness (#3395).
@@ -1048,6 +1061,19 @@ func reviewRoundStrandFrom(round reviewRound, boundary healthBoundary) *reviewSt
 	if !started.Exists {
 		out.Reason = "no review has been dispatched for this stage"
 		return out
+	}
+	// The terminal reads were floored at the re-open row but the started read is
+	// deliberately not (so the status stays 'pending', not 'none', across the
+	// window). A latest started row at or below that floor is the SUPERSEDED
+	// round: judging it would pair its stale dispatch time with floored counts
+	// and read a round nobody dispatched as orphaned. This precedes the /healthz
+	// check so an unreadable boundary in the window cannot yield an Undecidable
+	// verdict that advises reconcile.
+	if round.SinceSeq > 0 && started.Sequence <= round.SinceSeq {
+		return &reviewStrand{
+			AwaitingRedispatch: true,
+			Reason:             "the stage was re-opened after its latest review dispatch and no new round has started yet",
+		}
 	}
 	if started.ConfiguredAgents <= 0 {
 		out.Reason = "the review round records no configured agent count"
@@ -1284,10 +1310,11 @@ whether your client supplied a progressToken (a per-tick keep-alive was
 emitted); timeout_cap_seconds is the cap actually applied. A "failed" status is a definite terminal state: the
 reviewer errored or timed out (e.g. it hit FISHHAWKD_PLAN_REVIEW_TIMEOUT)
 and a terminal *_review_failed audit entry was written — reviews[] carries
-the failure reason. A "pending" status after the timeout means the review is
-genuinely STILL RUNNING (no terminal entry yet); re-call to resume, switch
-to fishhawk_get_run_status polling on poll_interval_seconds, or check the
-fishhawkd logs. If the message reports the run has gone terminal while the
+the failure reason. A "pending" status after the timeout means no terminal
+verdict has landed yet: the round's reviewers may still be working, or a
+re-opened stage (plan revise, fix-up, retry) has not yet started its new round;
+re-call to resume, switch to fishhawk_get_run_status polling on
+poll_interval_seconds, or check the fishhawkd logs. If the message reports the run has gone terminal while the
 review is in flight, the verdict will still land; what to do next depends on
 the terminal state the message names (#4101). A FAILED run must be
 re-admitted with fishhawk_revive_run to progress past the gate. A SUCCEEDED
@@ -1595,7 +1622,11 @@ func (*runResolver) awaitStrandedOutput(stage string, s *reviewStrand, start tim
 // an undecidable verdict says so and names fishhawk_reconcile_reviews as the
 // recovery if a restart did happen; and a verdict from one of the early returns
 // that never reached the boundary check falls back to the neutral pre-#2712
-// wording rather than claiming a verification that never ran.
+// wording rather than claiming a verification that never ran. An
+// AwaitingRedispatch verdict (the stage was re-opened and no new round has
+// started) says exactly that: no round exists to wait on, no liveness is
+// claimed, and fishhawk_reconcile_reviews is not named because there is no
+// orphaned round for it to settle.
 func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start time.Time, terminalState string, heartbeat bool, timeoutCap int, strand *reviewStrand) AwaitReviewOutput {
 	out := AwaitReviewOutput{
 		Stage:               stage,
@@ -1635,6 +1666,15 @@ func (*runResolver) awaitPendingTimeoutOutput(stage string, timeout int, start t
 			"the run must be re-admitted to progress past the gate. Call fishhawk_revive_run to re-park the failed "+
 			"stage(s) and flip the run back to running, then re-call fishhawk_await_review or poll fishhawk_get_run_status "+
 			"every %ds (the authoritative path).",
+			stage, timeout, suggestedReviewPollIntervalSeconds)
+		return out
+	}
+	if strand != nil && strand.AwaitingRedispatch {
+		out.Message = fmt.Sprintf("%s review still pending after %ds — the stage was re-opened (a plan revise, fix-up or "+
+			"retry) after its latest review dispatch and no new round has started yet, so no reviewer exists to wait on. "+
+			"The next round starts when the re-opened stage produces its new plan or diff; check that stage in "+
+			"fishhawk_get_run_status if this persists. The wait holds nothing: re-call fishhawk_await_review to resume it, "+
+			"or poll fishhawk_get_run_status every %ds (the authoritative path).",
 			stage, timeout, suggestedReviewPollIntervalSeconds)
 		return out
 	}

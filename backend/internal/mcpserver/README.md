@@ -2153,10 +2153,11 @@ the gate silently DEGRADES from N reviewers to the M that landed, and `fishhawk_
 window and then assert the dead reviewer was "genuinely still running". Two surfaces close it.
 
 **The strand probe (`review.go`).** `reviewRoundStrandFrom` reports `Stranded` only when ALL of: a `*_review_started`
-entry exists; its `configured_agents > 0`; landed terminals for THIS round (same re-open floor and floored decoders
-`reviewStatusFor` uses) `< configured_agents`; `/healthz` resolved a PARSEABLE `process_start`; and the started entry's
-timestamp is BEFORE that boot instant. Every other outcome is not-stranded, and an unreadable boundary is a distinct
-`Undecidable` verdict carrying a reason.
+entry exists; that entry is ABOVE the stage's re-open floor (the latest started row's sequence is greater than the
+effective `SinceSeq`, which is 0 when nothing re-opened the stage); its `configured_agents > 0`; landed terminals for THIS
+round (same re-open floor and floored decoders `reviewStatusFor` uses) `< configured_agents`; `/healthz` resolved a
+PARSEABLE `process_start`; and the started entry's timestamp is BEFORE that boot instant. Every other outcome is
+not-stranded, and an unreadable boundary is a distinct `Undecidable` verdict carrying a reason.
 
 - **Fail-open is uniform.** `/healthz` unreachable, non-200, non-JSON, absent `process_start`, or an unparseable one all
   degrade to `Undecidable` — the wait then behaves exactly as it did before this diagnostic existed. A zero `time.Time`
@@ -2174,6 +2175,28 @@ timestamp is BEFORE that boot instant. Every other outcome is not-stranded, and 
   reported, and how many never will — because the silent two-reviewers-to-one degradation is half of what makes this
   failure dangerous. `ReviewStatus.Status` is deliberately UNCHANGED at `pending` (it feeds the approval/merge gates,
   `drive_run` and `await_audit`); `stranded` is an await-surface diagnostic, not a new gate state.
+- **A re-opened stage with no new round is `AwaitingRedispatch`, not stranded (#4865).** A plan revise
+  (`plan_revised`), a live fix-up (`stage_fixup_triggered`) or a counting retry (`stage_retried` /
+  `stage_override_retried`) floors the terminal-verdict reads at its own sequence, but the latest `*_review_started` row
+  is deliberately NOT floored (that keeps the status `pending` rather than `none` across the window, and feeds the
+  gates, `drive_run` and `await_audit`). Across a `fishhawkd` restart that left the strand derivation pairing the
+  SUPERSEDED round's pre-boot dispatch time with the floored counts — `0 of N` — and reporting a round nobody had
+  dispatched as orphaned. The comparison therefore lives in `reviewRoundStrandFrom`, not in the started read: a latest
+  started row at or below `SinceSeq` returns `AwaitingRedispatch` (not stranded, not undecidable, with
+  `configured_agents` / `landed_terminal` left zero), ahead of the `/healthz` check so an unreadable boundary in the
+  window cannot produce an `Undecidable` verdict that advises reconcile. `SinceSeq` already carries the effective
+  floor, `max(fix-up or revise, retry)`, so one comparison covers all three; floors the existing rules void
+  (a delivered-nothing or superseded fix-up, a category-D retry, a retry of a different stage) never raise it, and those
+  rounds stay subject to the normal strand check, as does a new round dispatched ABOVE the floor. The timeout message
+  for this verdict says no new round has started and names neither liveness nor `fishhawk_reconcile_reviews`. A latest
+  started row at or below a live fix-up floor resolves through `AwaitingRedispatch`; the verified-timeout clause below
+  ("verified only that the round's dispatch postdates …") can apply only once a replacement round ABOVE the trigger
+  exists, so a superseded pre-trigger round never reaches the verified branch. Accepted narrowing: where the floor is
+  broader than the round (the run-scoped fix-up floor on a multi-implement run, or a retry whose `stage_id` is empty)
+  a truly orphaned started row below it reads `pending` for a bounded wait instead of `stranded`. Pinned by
+  `TestAwaitReview_FloorAboveLatestStarted_PendingNotStranded`, `TestReviewRoundStrandFrom_FloorBoundary`,
+  `TestReviewRoundStrand_OrphanedLatestRoundStillStrands`, `TestAwaitPendingTimeoutOutput_AwaitingRedispatchWording`
+  and, across real Postgres sequences, `TestAwaitReview_ReviseAcrossRestart_EndToEnd`.
 - The pending-after-timeout message no longer asserts liveness AT ALL (#3395 narrowed #2712's wording) — its outer clause reads "no terminal verdict has landed (…)", not the earlier "the review is still running (…)", which asserted exactly what the parenthetical disclaims: on a
   not-stranded verdict THAT ACTUALLY COMPARED THE BOUNDARY it says it "verified only that the round's dispatch postdates
   the serving fishhawkd's boot … a timestamp ordering, not observed reviewer liveness" and points at the
