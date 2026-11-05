@@ -251,6 +251,76 @@ func TestMergeCandidateVerify_WritesNothing(t *testing.T) {
 	}
 }
 
+// TestMergeCandidateVerify_SurvivesTrackingRefRace is the #4835 cross-layer
+// regression: the pass is anchored to a run-branch tip the dispatch checkout
+// does not have yet, and a concurrent writer moves the shared remote-tracking
+// ref between the fetch's read of its old value and its store. The pre-fix
+// fetch named that ref and the pass reported not_executed(branch_fetch_failed)
+// on `cannot lock ref ... but expected`; the private-ref fetch crosses the
+// gitops fetch, this pass and the gateiso clone gate to a real verdict from a
+// real `sh check.sh`, bound to the new tip.
+func TestMergeCandidateVerify_SurvivesTrackingRefRace(t *testing.T) {
+	dispatch, _, tipB, _ := mcvRepo(t)
+	bare := crGitOut(t, dispatch, "remote", "get-url", "origin")
+
+	// A second clone pushes a new, passing commit to branch `a`, which the
+	// dispatch checkout has not fetched.
+	scratch := filepath.Join(t.TempDir(), "scratch")
+	crGit(t, filepath.Dir(scratch), "clone", "-q", bare, scratch)
+	crGit(t, scratch, "config", "user.name", "test")
+	crGit(t, scratch, "config", "user.email", "test@example.com")
+	crGit(t, scratch, "config", "commit.gpgsign", "false")
+	crGit(t, scratch, "checkout", "-q", "a")
+	crWrite(t, scratch, "migrations/0097_a2.sql", "-- a2\n")
+	crGit(t, scratch, "add", "-A")
+	crGit(t, scratch, "commit", "-q", "-m", "a2")
+	crGit(t, scratch, "push", "-q", "origin", "a")
+	newTip := crGitOut(t, scratch, "rev-parse", "HEAD")
+	if got := crGitOut(t, dispatch, "rev-parse", "refs/remotes/origin/a"); got == newTip {
+		t.Fatalf("fixture: dispatch already has the new tip %s", newTip)
+	}
+
+	// Inject the race with uploadpack.packObjectsHook, which git honours from
+	// GIT_CONFIG_GLOBAL on any version: it runs after the client read the
+	// tracking ref's old value and before the client stores refs. The override
+	// keeps maintenance.auto=false (the runTestMain pin it replaces, #3503) and
+	// carries no signing keys; it is installed after every fixture clone and
+	// push, so none of those runs under a hook-only config.
+	cfgDir := t.TempDir()
+	marker := filepath.Join(cfgDir, "hook-fired")
+	hook := filepath.Join(cfgDir, "race-hook.sh")
+	crWrite(t, cfgDir, "race-hook.sh", fmt.Sprintf("#!/bin/sh\necho fired >> '%s'\nGIT_DIR='%s' git update-ref refs/remotes/origin/a '%s'\nexec \"$@\"\n",
+		marker, filepath.Join(dispatch, ".git"), tipB))
+	if err := os.Chmod(hook, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	crWrite(t, cfgDir, "gitconfig", fmt.Sprintf("[maintenance]\n\tauto = false\n[uploadpack]\n\tpackObjectsHook = %s\n", hook))
+	t.Setenv("GIT_CONFIG_GLOBAL", filepath.Join(cfgDir, "gitconfig"))
+
+	counter := withMCVVerifyCounter(t)
+	code, ship := runMCV(t, mcvCfg(dispatch, mcvVerifyCmd),
+		mergeCandidateVerifyRequest{Branch: "a", ExpectedHeadSHA: newTip, Cause: "base_advance"})
+	if code != exitOK {
+		t.Errorf("exit = %d, want exitOK", code)
+	}
+	if b, err := os.ReadFile(marker); err != nil || strings.TrimSpace(string(b)) == "" {
+		t.Fatalf("race hook never fired (%v): the fixture did not exercise the race", err)
+	}
+	if ship.MergeCandidateResult != mergeCandidatePassed || ship.MergeCandidateReason != "" {
+		t.Fatalf("result/reason = %q/%q, want passed with no reason; tail:\n%s",
+			ship.MergeCandidateResult, ship.MergeCandidateReason, ship.MergeCandidateOutputTail)
+	}
+	if ship.HeadSHA != newTip {
+		t.Errorf("shipped head = %s, want the new tip %s", ship.HeadSHA, newTip)
+	}
+	if counter.calls != 1 {
+		t.Errorf("verify invocations = %d, want 1", counter.calls)
+	}
+	if got := crGitOut(t, dispatch, "rev-parse", "refs/remotes/origin/a"); got != newTip {
+		t.Errorf("tracking ref = %s, want the fetched tip %s (not the racer %s)", got, newTip, tipB)
+	}
+}
+
 // TestMergeCandidateVerify_RedactsAndBoundsTail: a token-shaped secret in the
 // verify output never ships, and the tail is bounded to its LAST bytes.
 func TestMergeCandidateVerify_RedactsAndBoundsTail(t *testing.T) {
