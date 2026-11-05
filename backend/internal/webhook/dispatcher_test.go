@@ -988,6 +988,12 @@ type stubRuns struct {
 	createErrQueue []error
 	createStageErr error
 	transitionErr  error
+	// decomposedProbeErr, when set, fails ONLY a ListRuns call that carries a
+	// DecomposedFrom filter — the decomposition-children probe
+	// (decomposedParentSkipReason). listErr cannot serve: it fails the PR and
+	// candidate lookups first, so a probe-failure fixture would never reach the
+	// probe.
+	decomposedProbeErr error
 }
 
 type stubStageTransition struct {
@@ -1102,6 +1108,9 @@ func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.listCalls++
+	if s.decomposedProbeErr != nil && f.DecomposedFrom != nil {
+		return nil, s.decomposedProbeErr
+	}
 	if s.listErr != nil {
 		return nil, s.listErr
 	}
@@ -1129,6 +1138,14 @@ func (s *stubRuns) ListRuns(_ context.Context, f run.ListRunsFilter) ([]*run.Run
 		// gitlab_ci runs (E45.22 / #2043); the GitHub paths pass nil.
 		if f.RunnerKind != nil && r.RunnerKind != *f.RunnerKind {
 			continue
+		}
+		// DecomposedFrom narrows to the slice children of one parent — the
+		// decomposition probe. Mirrors the SQL: a row with no parent never
+		// matches, and a row decomposed from a DIFFERENT parent does not match.
+		if f.DecomposedFrom != nil {
+			if r.DecomposedFrom == nil || *r.DecomposedFrom != *f.DecomposedFrom {
+				continue
+			}
 		}
 		out = append(out, r)
 	}
@@ -3724,6 +3741,312 @@ func TestHandle_CIFailureRetry_CheckNotRequired_Skips(t *testing.T) {
 	}
 	if len(au.appended) != 0 {
 		t.Errorf("audit rows = %d, want 0 (non-required check skipped silently)", len(au.appended))
+	}
+}
+
+// --- #4813: decomposed-parent refusal ------------------------------------
+
+// seedSliceChildOf inserts a slice child row decomposed from parentID — the
+// shape the decomposition probe (decomposedParentSkipReason) reads. It carries
+// no PullRequestURL, like a real slice child before consolidation, so it is
+// invisible to the PR-URL lookup and only the DecomposedFrom filter finds it.
+func seedSliceChildOf(t *testing.T, runs *stubRuns, repo string, parentID uuid.UUID, kind string) *run.Run {
+	t.Helper()
+	idx := 0
+	r := &run.Run{
+		ID:             uuid.New(),
+		Repo:           repo,
+		WorkflowID:     "feature_change",
+		WorkflowSHA:    "feedf00d",
+		TriggerSource:  run.TriggerGitHubIssue,
+		DecomposedFrom: &parentID,
+		SliceIndex:     &idx,
+		RunnerKind:     kind,
+		State:          run.StateSucceeded,
+		CreatedAt:      time.Now().Add(-time.Minute).UTC(),
+		UpdatedAt:      time.Now().Add(-time.Minute).UTC(),
+	}
+	runs.mu.Lock()
+	runs.created = append(runs.created, r)
+	runs.mu.Unlock()
+	return r
+}
+
+// ciRetrySkippedRows returns the ci_retry_skipped rows chained to a run, each
+// with its decoded payload, in append order.
+func ciRetrySkippedRows(t *testing.T, au *stubAudit) ([]audit.ChainAppendParams, []map[string]any) {
+	t.Helper()
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	var rows []audit.ChainAppendParams
+	var payloads []map[string]any
+	for _, a := range au.appended {
+		if a.Category != "ci_retry_skipped" {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(a.Payload, &p); err != nil {
+			t.Fatalf("unmarshal ci_retry_skipped payload: %v", err)
+		}
+		rows = append(rows, a)
+		payloads = append(payloads, p)
+	}
+	return rows, payloads
+}
+
+// TestHandle_CIFailureRetry_DecomposedParent_RefusesRetryNamingLineage is the
+// done-means test for #4813. The failing required check is on a decomposed
+// parent's consolidated PR; a retry child minted there would re-run a lineage
+// the decomposition already replaced. The handler must mint nothing, dispatch
+// nothing, notify nothing, and leave exactly one ci_retry_skipped row chained to
+// the parent naming WHY. Reason strings are compared as LITERALS, not constants,
+// so a rename or a no-op touch cannot pass.
+//
+// Counterfactual: replacing `return ciRetrySkipDecomposedParent` in
+// decomposedParentSkipReason with `return ""` lets the parent pass the dedup and
+// cap and this test observes a minted child.
+func TestHandle_CIFailureRetry_DecomposedParent_RefusesRetryNamingLineage(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSliceChildOf(t, runs, parent.Repo, parent.ID, run.RunnerKindGitHubActions)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+
+	if len(runs.created) != 2 {
+		t.Errorf("runs.created = %d, want 2 (parent + slice child; no retry child)", len(runs.created))
+	}
+	if len(runs.createdStages) != 0 {
+		t.Errorf("stages created = %d, want 0 (no retry child, no stage)", len(runs.createdStages))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(notifier.retryCalls) != 0 {
+		t.Errorf("NotifyCIRetry calls = %d, want 0", len(notifier.retryCalls))
+	}
+	for _, a := range au.appended {
+		if a.Category == "ci_failure_retry_dispatched" {
+			t.Errorf("a ci_failure_retry_dispatched row was written for a refused retry (chained to %s)", a.RunID)
+		}
+	}
+	rows, payloads := ciRetrySkippedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1; audit categories: %v", len(rows), auditCategories(au))
+	}
+	if rows[0].RunID != parent.ID {
+		t.Errorf("row chained to %s, want the parent %s", rows[0].RunID, parent.ID)
+	}
+	p := payloads[0]
+	if got, _ := p["reason"].(string); got != "decomposed_parent_consolidated_lineage" {
+		t.Errorf("reason = %q, want %q", got, "decomposed_parent_consolidated_lineage")
+	}
+	if got, _ := p["run_id"].(string); got != parent.ID.String() {
+		t.Errorf("payload run_id = %q, want %s", got, parent.ID)
+	}
+	if got, _ := p["check_name"].(string); got != "ci/build" {
+		t.Errorf("payload check_name = %q, want ci/build", got)
+	}
+	if got, _ := p["head_sha"].(string); got != "abc123" {
+		t.Errorf("payload head_sha = %q, want abc123", got)
+	}
+	if got, _ := p["pr_number"].(float64); int(got) != 42 {
+		t.Errorf("payload pr_number = %v, want 42", p["pr_number"])
+	}
+}
+
+// TestHandle_CIFailureRetry_ChildrenLookupFailure_RefusesRetry pins the FAIL
+// CLOSED half. decomposedProbeErr fails ONLY the DecomposedFrom-filtered probe —
+// listErr cannot serve, it would fail the PR lookup first — and NO slice row is
+// seeded, so the only thing standing between this delivery and a minted child is
+// the probe-error branch. The fixture records no head and is under the cap, so
+// nothing downstream masks a fail-open.
+//
+// Counterfactual: replacing `return ciRetrySkipChildrenLookupFailed` with
+// `return ""` fails open and this test observes a minted child.
+func TestHandle_CIFailureRetry_ChildrenLookupFailure_RefusesRetry(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	notifier := &stubIssueNotifier{}
+	d.IssueNotifier = notifier
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	runs.decomposedProbeErr = errors.New("children lookup: connection reset")
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v (a probe failure must refuse quietly, not 5xx)", err)
+	}
+
+	if len(runs.created) != 1 {
+		t.Errorf("runs.created = %d, want 1 (no child minted on a failed probe)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(notifier.retryCalls) != 0 {
+		t.Errorf("NotifyCIRetry calls = %d, want 0", len(notifier.retryCalls))
+	}
+	rows, payloads := ciRetrySkippedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1; audit categories: %v", len(rows), auditCategories(au))
+	}
+	if rows[0].RunID != parent.ID {
+		t.Errorf("row chained to %s, want the parent %s", rows[0].RunID, parent.ID)
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "decomposition_children_lookup_failed" {
+		t.Errorf("reason = %q, want %q", got, "decomposition_children_lookup_failed")
+	}
+}
+
+// TestHandle_CIFailureRetry_DecomposedParent_AuditAppendFailure_StillRefuses
+// pins that a failed audit append never unwinds the refusal: the retry was
+// already declined, and an error return would 5xx the delivery so the forge
+// redelivers it into the same refusal.
+func TestHandle_CIFailureRetry_DecomposedParent_AuditAppendFailure_StillRefuses(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSliceChildOf(t, runs, parent.Repo, parent.ID, run.RunnerKindGitHubActions)
+	au.appendErr = errors.New("audit table down")
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v (an audit append failure must not turn a refusal into a 5xx)", err)
+	}
+	if len(runs.created) != 2 {
+		t.Errorf("runs.created = %d, want 2 (a failed audit append must not let a child through)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+}
+
+// TestHandle_CIFailureRetry_DecomposedParent_RefusesBeforeHeadSHADedup is the
+// placement pin against the head_sha dedup. The parent's consolidated
+// pull_request artifact records the consolidated head SHA, so a failure AT that
+// SHA is exactly the failing SHA here. runOnHeadSHAExists then reports a
+// duplicate and returns silently — it is a MASKING downstream guard for the
+// no-child assertion, which would stay green with the control moved after it.
+// Only the ROW assertion isolates the placement: the refusal must be recorded.
+//
+// Counterfactual: replacing the call site's condition with
+// `if reason := ""; reason != "" {` leaves no child either way (the dedup
+// swallows it) but writes no row, so the row assertion goes red.
+func TestHandle_CIFailureRetry_DecomposedParent_RefusesBeforeHeadSHADedup(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	arts := &stubArtifacts{}
+	d.Artifacts = arts
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSliceChildOf(t, runs, parent.Repo, parent.ID, run.RunnerKindGitHubActions)
+	recordHeadSHA(t, runs, arts, parent.ID, "abc123") // the failing SHA IS the recorded head
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 2 {
+		t.Errorf("runs.created = %d, want 2 (no retry child)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	rows, payloads := ciRetrySkippedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1 — the head_sha dedup must not swallow the refusal with no record; audit categories: %v",
+			len(rows), auditCategories(au))
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "decomposed_parent_consolidated_lineage" {
+		t.Errorf("reason = %q, want %q", got, "decomposed_parent_consolidated_lineage")
+	}
+}
+
+// TestHandle_CIFailureRetry_DecomposedParent_RefusedAheadOfRetryCap is the
+// placement pin against the retry cap: a decomposed parent already at its cap
+// must report the REAL reason, not ci_retry_exhausted.
+func TestHandle_CIFailureRetry_DecomposedParent_RefusedAheadOfRetryCap(t *testing.T) {
+	d, _, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	// retry_attempt=1 with ciRetrySpec's max_retries of 1: the cap is hit.
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 1)
+	seedSliceChildOf(t, runs, parent.Repo, parent.ID, run.RunnerKindGitHubActions)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	for _, a := range au.appended {
+		if a.Category == "ci_retry_exhausted" {
+			t.Fatalf("a capped decomposed parent reported ci_retry_exhausted; want the real reason (chained to %s)", a.RunID)
+		}
+	}
+	rows, payloads := ciRetrySkippedRows(t, au)
+	if len(rows) != 1 {
+		t.Fatalf("ci_retry_skipped rows = %d, want exactly 1; audit categories: %v", len(rows), auditCategories(au))
+	}
+	if rows[0].RunID != parent.ID {
+		t.Errorf("row chained to %s, want the parent %s", rows[0].RunID, parent.ID)
+	}
+	if got, _ := payloads[0]["reason"].(string); got != "decomposed_parent_consolidated_lineage" {
+		t.Errorf("reason = %q, want %q", got, "decomposed_parent_consolidated_lineage")
+	}
+}
+
+// TestHandle_CIFailureRetry_DecomposedParent_NonRequiredCheckWritesNoRow is the
+// placement pin against the required-check filter: a non-required check failing
+// on a fan-in PR stays SILENT, exactly as it does on any other PR. A guard moved
+// above the filter would write a row here.
+func TestHandle_CIFailureRetry_DecomposedParent_NonRequiredCheckWritesNoRow(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	parent.RequiredChecksSnapshot = &run.RequiredChecksSnapshot{
+		Contexts: []string{"lint"}, // the event names ci/build
+		Sources:  []string{"branch_protection"},
+	}
+	seedSliceChildOf(t, runs, parent.Repo, parent.ID, run.RunnerKindGitHubActions)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 2 {
+		t.Errorf("runs.created = %d, want 2 (no child)", len(runs.created))
+	}
+	if gh.dispatchCalls != 0 {
+		t.Errorf("DispatchWorkflow calls = %d, want 0", gh.dispatchCalls)
+	}
+	if len(au.appended) != 0 || len(au.globalAppended) != 0 {
+		t.Errorf("audit rows = %d chained + %d global, want 0 (non-required check stays silent): categories %v",
+			len(au.appended), len(au.globalAppended), auditCategories(au))
+	}
+}
+
+// TestHandle_CIFailureRetry_NotDecomposed_StillMintsChild is the positive
+// control: the probe is not vacuously refusing everything. A slice row exists in
+// the repo but is decomposed from a DIFFERENT parent, so this run is an
+// ordinary one and the retry child is minted. Deleting the DecomposedFrom
+// filter from the probe returns the parent itself and turns this red.
+func TestHandle_CIFailureRetry_NotDecomposed_StillMintsChild(t *testing.T) {
+	d, gh, runs, au := newDispatcherWithStubs(t)
+	d.Artifacts = &stubArtifacts{}
+	d.IssueNotifier = &stubIssueNotifier{}
+	parent := seedParentRunForRetry(t, runs, "kuhlman-labs/fishhawk", ciRetrySpec, 0)
+	seedSliceChildOf(t, runs, parent.Repo, uuid.New(), run.RunnerKindGitHubActions)
+
+	if err := d.Handle(context.Background(), checkRunFailedEvent(t)); err != nil {
+		t.Fatalf("Handle: %v", err)
+	}
+	if len(runs.created) != 3 {
+		t.Fatalf("runs.created = %d, want 3 (parent + unrelated slice + retry child)", len(runs.created))
+	}
+	child := runs.created[2]
+	if child.ParentRunID == nil || *child.ParentRunID != parent.ID {
+		t.Errorf("child.ParentRunID = %v, want %s", child.ParentRunID, parent.ID)
+	}
+	if gh.dispatchCalls != 1 {
+		t.Errorf("DispatchWorkflow calls = %d, want 1", gh.dispatchCalls)
+	}
+	if rows, _ := ciRetrySkippedRows(t, au); len(rows) != 0 {
+		t.Errorf("ci_retry_skipped rows = %d, want 0 for an ordinary PR", len(rows))
 	}
 }
 
