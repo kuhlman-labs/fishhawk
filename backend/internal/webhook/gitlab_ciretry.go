@@ -74,6 +74,13 @@ import (
 // a worse artifact than no row at all, on a path whose entire subject is the
 // record telling the truth.
 //
+// DECOMPOSED PARENTS (#4813). A pipeline on a decomposed parent's consolidated
+// branch, or on the parent's own run branch, is refused with a
+// `ci_retry_skipped` row chained to the PARENT (reason
+// decomposed_parent_consolidated_lineage; decomposition_children_lookup_failed
+// when the children probe errors — fail closed). See decomposedParentSkipReason
+// and backend/internal/webhook/README.md ("Decomposed-parent refusal").
+//
 // AUTHORIZATION. This path runs the SAME GitLabProjectAuthorizer gate the
 // create path runs, before candidate lookup, child creation or any pipeline
 // trigger. A Pipeline Hook is authenticated only by the deployment-shared
@@ -252,6 +259,30 @@ func shortRunID(id uuid.UUID) string {
 	return s[:8]
 }
 
+// gitLabConsolidatedBranch derives the branch a decomposed parent's fan-in
+// consolidates onto and the consolidated PR / MR is opened from (#4813). It MUST
+// stay byte-identical to orchestrator.ConsolidatedBranch. Duplicated for the
+// same reason as gitLabRunBranch — the orchestrator imports this direction, not
+// the reverse — and pinned by TestGitLabConsolidatedBranch_MatchesOrchestratorDerivation:
+// a drift would silently degrade the consolidated-ref reason back to
+// no_candidate_run_owns_pipeline_ref.
+func gitLabConsolidatedBranch(r *run.Run) string {
+	return gitLabRunBranchNamespace + shortRunID(r.ID) + "-consolidated"
+}
+
+// gitLabConsolidatedRefOwner returns the candidate decomposed parent whose
+// consolidated branch is ref, or nil when none is. Only the orchestrator's
+// fan-in creates that branch, so the ref ALONE names the lineage: no children
+// probe is needed on this arm.
+func gitLabConsolidatedRefOwner(candidates []*run.Run, ref string) *run.Run {
+	for _, r := range candidates {
+		if gitLabConsolidatedBranch(r) == ref {
+			return r
+		}
+	}
+	return nil
+}
+
 // handleGitLabCIRetry creates a follow-up implement run when a GitLab pipeline
 // fails on a Fishhawk-managed run branch. See the package-level contract above
 // for the correlation and deferral rules.
@@ -312,6 +343,18 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 		return nil
 	}
 
+	// A pipeline on a decomposed parent's CONSOLIDATED branch (#4813). The ref
+	// matches no gitLabRunBranch, so without this arm it would fall to
+	// correlateGitLabPipeline and draw no_candidate_run_owns_pipeline_ref,
+	// global-chained — untrue, since a candidate run DOES own the ref. Refused
+	// and attributed to the parent. No children probe is needed: only the
+	// orchestrator's fan-in creates this branch, so the ref itself names the
+	// lineage.
+	if owner := gitLabConsolidatedRefOwner(candidates, pr.Ref); owner != nil {
+		d.writeGitLabRetrySkippedAudit(ctx, ev, owner, pr, ciRetrySkipDecomposedParent, now)
+		return nil
+	}
+
 	// anchor is the run the pipeline's ref belongs to, or nil when none does.
 	// It is the ONLY run a skip entry may be chained to.
 	parent, anchor, reason := d.correlateGitLabPipeline(ctx, candidates, pr)
@@ -321,6 +364,15 @@ func (d *Dispatcher) handleGitLabCIRetry(ctx context.Context, ev Event, m Match)
 	}
 	if parent.State == run.StateCancelled {
 		d.writeGitLabRetrySkippedAudit(ctx, ev, parent, pr, gitLabRetrySkipCancelledLineage, now)
+		return nil
+	}
+
+	// A decomposed parent that correlates on its OWN run branch and recorded head
+	// SHA (#4813): the consolidated-ref arm above does not see it, but a retry
+	// child minted against it would still re-run a lineage the decomposition
+	// replaced. FAIL CLOSED on a probe error — see decomposedParentSkipReason.
+	if reason := d.decomposedParentSkipReason(ctx, parent); reason != "" {
+		d.writeGitLabRetrySkippedAudit(ctx, ev, parent, pr, reason, now)
 		return nil
 	}
 

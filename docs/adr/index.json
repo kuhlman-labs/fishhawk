@@ -372,6 +372,9 @@
       "status": "accepted",
       "supersedes": [],
       "superseded_by": [],
+      "amended_by": [
+        "ADR-141"
+      ],
       "applies_to": []
     },
     {
@@ -1636,6 +1639,18 @@
       "amends": [
         "ADR-084",
         "ADR-113"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-141",
+      "title": "Require forge-confirmed push reports and isolate their retries (amends ADR-035)",
+      "path": "docs/adr/141-forge-confirmed-push-reports.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-035"
       ],
       "applies_to": []
     }

@@ -248,6 +248,8 @@ on_ci_failure:
 
 When a **required** CI check fails on the implement stage's PR, the dispatcher fires a fresh implement dispatch up to `max_retries` times. A chain of length N means the agent is dispatched N+1 times total. `0` disables auto-retry — useful for a low-autonomy workflow where a human prefers to re-trigger after inspecting the failure.
 
+**Exception: a decomposed parent's consolidated PR is never auto-retried.** When the run the failing check correlates to is a decomposed parent (it has decomposition children), its PR is the consolidated fan-in of the slices, and a retry child would re-run a single-implement lineage the decomposition already replaced. The dispatcher refuses instead, writing a `ci_retry_skipped` audit row chained to the parent with reason `decomposed_parent_consolidated_lineage`; the same refusal, with reason `decomposition_children_lookup_failed`, applies when the children lookup itself fails (the check fails closed). The refusal consumes no retry budget. Recovery stays with the parent's own fix-up (`fishhawk_fixup_stage` on the parent's implement stage, which lands on the consolidated branch) or the merge-candidate route where fix-up routing is delegated.
+
 Only the closed set of failing conclusions (`failure`, `timed_out`, `cancelled`, `action_required`, `stale`, `startup_failure`) fires a retry; `success` / `neutral` / `skipped` are no-ops. `fishhawk_audit_complete` failures are **excluded** — retrying does not fill Fishhawk's own audit gaps. Only failures of checks in the run's branch-protection snapshot count, so a failing third-party non-required check triggers nothing.
 
 ### `auto_advance`

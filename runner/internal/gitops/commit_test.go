@@ -1641,7 +1641,7 @@ func TestCheckoutRemoteBranchDetached_DetachesAndReturnsTip(t *testing.T) {
 	if got := mustGitOut(t, repo, "rev-parse", "HEAD"); got != remoteTip {
 		t.Errorf("detached HEAD sha = %q, want fetched tip %q", got, remoteTip)
 	}
-	// The explicit refspec updated the remote-tracking ref.
+	// The publish step wrote the (deleted) remote-tracking ref.
 	if got := mustGitOut(t, repo, "rev-parse", "refs/remotes/origin/main"); got != remoteTip {
 		t.Errorf("tracking ref = %q, want %q", got, remoteTip)
 	}
@@ -1664,10 +1664,11 @@ func TestCheckoutRemoteBranchDetached_RejectsEmptyBranch(t *testing.T) {
 
 // TestFetchBaseTip_ReturnsTipAndUpdatesTrackingRef is the #1975 re-anchor
 // primitive against a real repo pair: the remote advances its base branch to a
-// tip the local clone never fetched, and FetchBaseTip must fetch that tip into
-// the remote-tracking ref via the explicit refspec, return its SHA, and — the
-// distinguishing property vs. the checkout variants — leave the working tree /
-// HEAD untouched.
+// tip the local clone never fetched, and FetchBaseTip must fetch that tip
+// through its private ref, publish it to the remote-tracking ref, return its
+// SHA, and — the distinguishing property vs. the checkout variants — leave the
+// working tree / HEAD untouched. The tracking ref is deleted before the call so
+// the assertion below proves the publish step created it (#4835).
 func TestFetchBaseTip_ReturnsTipAndUpdatesTrackingRef(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git not available")
@@ -1713,7 +1714,7 @@ func TestFetchBaseTip_ReturnsTipAndUpdatesTrackingRef(t *testing.T) {
 	if tip != remoteTip {
 		t.Errorf("returned tip = %q, want fetched remote tip %q", tip, remoteTip)
 	}
-	// The explicit refspec updated the remote-tracking ref.
+	// The publish step wrote the (deleted) remote-tracking ref.
 	if got := mustGitOut(t, repo, "rev-parse", "refs/remotes/origin/main"); got != remoteTip {
 		t.Errorf("tracking ref = %q, want %q", got, remoteTip)
 	}

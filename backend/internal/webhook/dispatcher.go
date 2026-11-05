@@ -2035,6 +2035,54 @@ var errCIRetryGitHubUnconfigured = errors.New("dispatcher: github client unconfi
 // the client and propagated a dispatchErr (E45.7 fix-up).
 var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-retry workflow_dispatch skipped")
 
+// ci_retry_skipped reasons shared by BOTH forge CI-retry paths (#4813). They are
+// payload values on the existing ci_retry_skipped category, not categories.
+const (
+	// ciRetrySkipDecomposedParent refuses a CI-failure retry whose correlated
+	// run is a DECOMPOSED PARENT. The failing check is on the parent's
+	// consolidated PR (the fan-in of its slices), and a retry child minted
+	// against it would re-run the parent's single-implement lineage from the
+	// parent's approved plan — a lineage the decomposition already replaced.
+	// Recovery stays with the parent's own fix-up (fishhawk_fixup_stage on its
+	// implement stage, which lands on the consolidated branch) and the ADR-090 D6
+	// merge-candidate route.
+	ciRetrySkipDecomposedParent = "decomposed_parent_consolidated_lineage"
+	// ciRetrySkipChildrenLookupFailed is the FAIL-CLOSED sibling: the
+	// decomposition-children probe itself errored, so Fishhawk could not learn
+	// whether the run is a decomposed parent. Distinct from
+	// ciRetrySkipDecomposedParent so an operator reading the audit can tell "this
+	// is a fan-in PR" from "the repository could not say" — the second is worth
+	// re-driving.
+	ciRetrySkipChildrenLookupFailed = "decomposition_children_lookup_failed"
+)
+
+// decomposedParentSkipReason reports why a CI-failure retry must NOT mint a
+// child against r, or "" when r is not a decomposed parent and the retry may
+// proceed. A non-empty result is one of the two ciRetrySkip* reasons above.
+//
+// FAIL CLOSED, DELIBERATELY. A probe error returns
+// ciRetrySkipChildrenLookupFailed, not "". This is the deliberate INVERSE of
+// server.isDecomposedParentRun, which reads a probe error as "not a decomposed
+// parent" because its callers only decide how to LABEL a run. Here the question
+// gates a mint: failing open on a transient repository fault would start
+// automated work against a fan-in PR, the exact failure this control exists to
+// stop, whereas failing closed costs one audited refusal the operator can
+// re-drive.
+func (d *Dispatcher) decomposedParentSkipReason(ctx context.Context, r *run.Run) string {
+	children, err := d.Runs.ListRuns(ctx, run.ListRunsFilter{DecomposedFrom: &r.ID, Limit: 1})
+	if err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelWarn,
+			"ci_failure_retry: decomposition children lookup failed; refusing retry",
+			slog.String("run_id", r.ID.String()),
+			slog.String("error", err.Error()))
+		return ciRetrySkipChildrenLookupFailed
+	}
+	if len(children) > 0 {
+		return ciRetrySkipDecomposedParent
+	}
+	return ""
+}
+
 // handleCIFailureRetry creates a follow-up implement run when a
 // required CI check fails on a Fishhawk-managed PR (#279 / E16).
 // Best-effort throughout — every skip path emits a structured log
@@ -2048,6 +2096,17 @@ var errCIRetryNoInstallation = errors.New("dispatcher: no installation_id; ci-re
 //  2. Skip if the failing check isn't in the parent's
 //     required_checks_snapshot (#251). A non-required check failing
 //     isn't a merge blocker, so it isn't a retry trigger.
+//
+//     Step 2a (#4813): refuse, with an audited ci_retry_skipped row, when the
+//     correlated run is a DECOMPOSED PARENT: its PR is the consolidated fan-in, and a
+//     retry child would re-run a single-implement lineage the decomposition
+//     already replaced. FAIL CLOSED — a failed children probe refuses too.
+//     Placed AFTER step 2 so a non-required check on a fan-in PR stays silent,
+//     and BEFORE step 3 and step 5 so the refusal is recorded even when the
+//     failing SHA is the parent's recorded head (step 3 would swallow it with
+//     no row) or the parent is at its cap (step 5 would report ci_retry_exhausted
+//     instead of the real reason). See decomposedParentSkipReason and
+//     backend/internal/webhook/README.md ("Decomposed-parent refusal").
 //
 //  3. Skip if a Fishhawk run already has this head_sha (defence in depth).
 //     The runner's fresh commit produces a new head_sha each retry, so an
@@ -2122,6 +2181,18 @@ func (d *Dispatcher) handleCIFailureRetry(ctx context.Context, ev Event, m Match
 			slog.String("delivery_id", ev.DeliveryID),
 			slog.String("run_id", parent.ID.String()),
 			slog.String("check_name", ref.CheckName))
+		return nil
+	}
+
+	// Step 2a: refuse a decomposed parent's consolidated PR (#4813). Placement
+	// is load-bearing in both directions: AFTER the required-check filter so a
+	// non-required check on a fan-in PR stays silent, and BEFORE the head_sha
+	// dedup and the retry cap — the parent's consolidated pull_request artifact
+	// records the consolidated head SHA, so a failure at that SHA would otherwise
+	// be swallowed by the dedup with no record, and a capped parent would report
+	// ci_retry_exhausted instead of the real reason.
+	if reason := d.decomposedParentSkipReason(ctx, parent); reason != "" {
+		d.writeCIRetrySkippedAudit(ctx, ev, parent, ref, reason, now)
 		return nil
 	}
 
@@ -2591,6 +2662,50 @@ func (d *Dispatcher) writeCIRetryDispatchedAudit(ctx context.Context, ev Event, 
 			slog.String("delivery_id", ev.DeliveryID),
 			slog.String("error", err.Error()))
 	}
+}
+
+// writeCIRetrySkippedAudit records a DELIBERATE GitHub-path refusal with its
+// named reason (#4813), chained to r — the run the failing check correlated to
+// and therefore the only run the record honestly belongs to. The GitLab path
+// writes the sibling via writeGitLabRetrySkippedAudit; both use the one
+// ci_retry_skipped category so the stream stays awaitable.
+//
+// An append failure is logged and NEVER unwinds the refusal: the retry was
+// already declined, and returning an error would 5xx the delivery so the forge
+// redelivers it into the same refusal.
+func (d *Dispatcher) writeCIRetrySkippedAudit(ctx context.Context, ev Event, r *run.Run,
+	ref *CheckRunRef, reason string, now time.Time) {
+	systemKind := audit.ActorKind("system")
+	payload, _ := json.Marshal(map[string]any{
+		"event":       ev.Type,
+		"delivery_id": ev.DeliveryID,
+		"repo":        ev.Repo,
+		"run_id":      r.ID.String(),
+		"reason":      reason,
+		"check_name":  ref.CheckName,
+		"conclusion":  ref.Conclusion,
+		"head_sha":    ref.HeadSHA,
+		"pr_number":   ref.PRNumber,
+	})
+	if _, err := d.Audit.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:        r.ID,
+		Timestamp:    now,
+		Category:     "ci_retry_skipped",
+		ActorKind:    &systemKind,
+		ActorSubject: stringPtr("github-webhook"),
+		Payload:      payload,
+	}); err != nil {
+		d.logger().LogAttrs(ctx, slog.LevelError, "ci_failure_retry: skip audit append failed",
+			slog.String("delivery_id", ev.DeliveryID),
+			slog.String("error", err.Error()))
+	}
+	d.logger().LogAttrs(ctx, slog.LevelInfo, "ci_failure_retry: not retrying",
+		slog.String("delivery_id", ev.DeliveryID),
+		slog.String("run_id", r.ID.String()),
+		slog.String("reason", reason),
+		slog.String("check_name", ref.CheckName),
+		slog.Int("pr_number", ref.PRNumber),
+	)
 }
 
 // writeCIRetryExhaustedAudit records the cap-hit case so an

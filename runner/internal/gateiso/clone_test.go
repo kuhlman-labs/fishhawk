@@ -82,6 +82,51 @@ func newCloneFixture(t *testing.T) cloneFixture {
 	return cloneFixture{primary: primary, linked: linked, mainSHA: mainSHA, originMain: originMain, headSHA: headSHA}
 }
 
+// TestMaterializeClone_ResolvesHeadWithNoClonableRef pins the git semantics the
+// verify gate relies on once the runner's fetch holds a tip only through a
+// transient private ref (refs/fishhawk/fetch/*, #4835): a local clone copies
+// the source's whole object directory, so a head commit that no branch, tag or
+// remote-tracking ref reaches still resolves, including from a linked worktree.
+// It is a pin on git, not a new control; swapping --no-hardlinks for --no-local
+// in MaterializeClone turns the clone into a transport clone that transfers
+// only reachable objects and reddens both arms.
+func TestMaterializeClone_ResolvesHeadWithNoClonableRef(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		hold bool // keep a private ref at the head until MaterializeClone runs
+	}{
+		{"held_only_by_private_ref", true},
+		{"unreferenced", false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fx := newCloneFixture(t)
+			const priv = "refs/fishhawk/fetch/x"
+			gitT(t, fx.primary, "update-ref", priv, fx.headSHA)
+			// Detach the linked worktree off the head so only the private ref
+			// (and the worktree's reflog, which a clone does not copy) names it.
+			gitT(t, fx.linked, "checkout", "--quiet", "--detach", fx.mainSHA)
+			if !tc.hold {
+				gitT(t, fx.primary, "update-ref", "-d", priv)
+			}
+
+			dest := filepath.Join(t.TempDir(), "clone")
+			rep, err := MaterializeClone(context.Background(), "", fx.linked, fx.headSHA, dest)
+			if err != nil {
+				t.Fatalf("MaterializeClone with no clonable ref to %s: %v", fx.headSHA, err)
+			}
+			if rep.HeadSHA != fx.headSHA {
+				t.Fatalf("report HeadSHA = %s, want %s", rep.HeadSHA, fx.headSHA)
+			}
+			if got := gitT(t, dest, "rev-parse", "HEAD"); got != fx.headSHA {
+				t.Fatalf("clone HEAD = %s, want %s", got, fx.headSHA)
+			}
+			if refs := gitT(t, dest, "for-each-ref", "--format=%(refname)", "refs/fishhawk/"); refs != "" {
+				t.Fatalf("clone carries private refs: %q", refs)
+			}
+		})
+	}
+}
+
 func TestMaterializeClone_FromLinkedWorktree(t *testing.T) {
 	fx := newCloneFixture(t)
 	dest := filepath.Join(t.TempDir(), "clone")
