@@ -6,6 +6,8 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 )
 
 // ErrNotFound signals a missing run or stage. The Postgres adapter
@@ -360,6 +362,44 @@ type StageCASTransitioner interface {
 	TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to StageState, completion *StageCompletion) (*Stage, error)
 }
 
+// ScopeParkDecider is an OPTIONAL capability on the concrete postgres repo: the
+// operator's exempt and fail decisions on a scope-completeness park (#2559). Each
+// verb commits the stage's move out of awaiting_scope_decision AND the decision's
+// audit entry in ONE transaction, so the chain can never say `exempted` for a
+// stage whose exemption did not apply. The prompt emission gate reads that entry
+// as authorization to open a PR from the held commit.
+//
+// Two named verbs rather than a target-state parameter, so a caller cannot write
+// an arbitrary transition through this capability:
+//
+//   - ExemptScopeParkAndAppend moves the stage to pending.
+//   - FailScopeParkAndAppend moves the stage to failed, category B, with reason.
+//
+// Both compare state AND attempt under the stage row lock: the row must still be
+// awaiting_scope_decision and StageAttemptToken of its dispatched_at must equal
+// expectedAttempt. The attempt pin stops a decision stalled through an exempt, a
+// re-dispatch and a re-park from authorizing the newer held commit, which a
+// state-only comparison would admit. An empty expectedAttempt is the identity of a
+// legacy row with no dispatched_at and matches only such a row: unlike
+// TransitionStageFromAttempt's empty value, it is never a wildcard here.
+//
+// Results:
+//
+//   - won=true with the updated stage: both writes committed.
+//   - won=false with a nil stage and nil error: the decision lost to a concurrent
+//     one or a newer attempt. It wrote nothing.
+//   - a non-nil error (ErrNotFound for a missing stage): nothing committed, and a
+//     still-parked stage can be decided again.
+//
+// Kept OFF the Repository interface for the same reason StageCASTransitioner is.
+// Its consumer, the server's scope-completeness decision handler, REFUSES a repo
+// without it rather than falling back to two separate writes, because that
+// fallback is the split this capability removes.
+type ScopeParkDecider interface {
+	ExemptScopeParkAndAppend(ctx context.Context, stageID uuid.UUID, expectedAttempt string, p audit.ChainAppendParams) (*Stage, bool, error)
+	FailScopeParkAndAppend(ctx context.Context, stageID uuid.UUID, expectedAttempt, reason string, p audit.ChainAppendParams) (*Stage, bool, error)
+}
+
 // RunReopenReviver is an OPTIONAL capability on the concrete postgres repo —
 // the repository half of the PR-reopen revive (#4082). ReviveRunOnReopen
 // re-parks a run's cancelled REVIEW stage at awaiting_approval AND reopens
@@ -484,10 +524,10 @@ type TerminalRunObserver func(ctx context.Context, r *Run)
 // StageTerminalObservable is an OPTIONAL capability on the concrete postgres
 // repo (#4127): install (or, with nil, clear) the stage-terminal observer.
 // transitionStage (TransitionStage, TransitionStageFrom,
-// TransitionStageFromAttempt) and SupersedeStrandedStageOnMerge fire it. The
-// transaction-scoped package functions TransitionStageFromTx and
-// TransitionStageFromLiveRunTx do NOT: they commit in the caller's
-// transaction, and their only caller (concurrency.Admit) moves a stage to
+// TransitionStageFromAttempt), FailScopeParkAndAppend and
+// SupersedeStrandedStageOnMerge fire it. The transaction-scoped package functions
+// TransitionStageFromTx and TransitionStageFromLiveRunTx do NOT: they commit in the
+// caller's transaction, and their only caller (concurrency.Admit) moves a stage to
 // dispatched. A terminal write outside these paths is repaired by
 // scopeamendment's startup backfill, not instantly.
 //
