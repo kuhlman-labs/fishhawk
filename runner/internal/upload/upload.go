@@ -94,6 +94,26 @@ var (
 	DefaultTerminalEgressReserve = 15 * time.Second
 )
 
+// PUSH-REPORT retry budget (ADR-141 D4 / #4870). The third budget, for exactly
+// the three reports that write a qualifying push row: fixup_pushed,
+// conflict_resolution_pushed and acceptance_scenarios_pushed. Their commit is
+// already on the branch, and the backend now answers a retryable 503 with no
+// row when it cannot confirm the head against the forge, so the blip budget's
+// ~3.5s would lose the report to any short forge outage.
+//
+// The capped doubling series is 1,2,4,8,15 = 30s of sleep across 6 attempts,
+// all inside DefaultPushReportBudget. The budget is REQUEST-LOCAL: it never
+// reads, arms, spends or resets the shared terminal-egress phase, so an exhausted
+// or rejected report leaves any later terminal call on the same Client its full
+// budget. Re-posting after a 503 is safe: a 503 writes nothing, and a report the
+// backend already admitted answers its replay idempotently.
+var (
+	DefaultPushReportMaxRetries = 5
+	DefaultPushReportBackoff    = 1 * time.Second
+	DefaultPushReportBackoffCap = 15 * time.Second
+	DefaultPushReportBudget     = 45 * time.Second
+)
+
 // Errors callers may want to switch on. ErrSignatureRejected is
 // the runner's signal to STOP retrying — the backend rejected the
 // signature, retrying with the same bytes won't help.
@@ -182,7 +202,8 @@ type Client struct {
 	HTTP    *http.Client
 
 	// MaxRetries caps retry attempts on retryable failures for every
-	// non-terminal call. Zero means DefaultMaxRetries.
+	// non-terminal call except the three push reports, which ride the
+	// PushReport* budget below. Zero means DefaultMaxRetries.
 	MaxRetries int
 	// Backoff is the initial delay before the first retry; each
 	// subsequent retry doubles. Zero means DefaultBackoff.
@@ -202,6 +223,14 @@ type Client struct {
 	// means the corresponding default.
 	TerminalEgressBudget  time.Duration
 	TerminalEgressReserve time.Duration
+
+	// PushReportMaxRetries / PushReportBackoff / PushReportBackoffCap /
+	// PushReportBudget override the request-local PUSH-REPORT budget (see
+	// DefaultPushReportMaxRetries). Zero means the corresponding default.
+	PushReportMaxRetries int
+	PushReportBackoff    time.Duration
+	PushReportBackoffCap time.Duration
+	PushReportBudget     time.Duration
 
 	// terminalEgressDeadline is the shared terminal-egress deadline as Unix
 	// nanoseconds, armed by whichever terminal call OPENS the phase and
@@ -238,8 +267,8 @@ func New(baseURL string) *Client {
 }
 
 // retryPolicy resolves the SHORT (blip) retry budget every non-terminal call
-// uses: a doubling backoff with no cap. Resolution lives here rather than being
-// re-derived at each call site.
+// other than a push report uses: a doubling backoff with no cap. Resolution
+// lives here rather than being re-derived at each call site.
 func (c *Client) retryPolicy() (maxRetries int, backoff time.Duration) {
 	maxRetries = c.MaxRetries
 	if maxRetries == 0 {
@@ -269,6 +298,46 @@ func (c *Client) terminalRetryPolicy() (maxRetries int, backoff, backoffCap time
 		backoffCap = DefaultTerminalBackoffCap
 	}
 	return maxRetries, backoff, backoffCap
+}
+
+// pushReportRetryPolicy resolves the request-local PUSH-REPORT retry budget. See
+// DefaultPushReportMaxRetries for why the three push reports need it.
+func (c *Client) pushReportRetryPolicy() (maxRetries int, backoff, backoffCap time.Duration) {
+	maxRetries = c.PushReportMaxRetries
+	if maxRetries == 0 {
+		maxRetries = DefaultPushReportMaxRetries
+	}
+	backoff = c.PushReportBackoff
+	if backoff == 0 {
+		backoff = DefaultPushReportBackoff
+	}
+	backoffCap = c.PushReportBackoffCap
+	if backoffCap == 0 {
+		backoffCap = DefaultPushReportBackoffCap
+	}
+	return maxRetries, backoff, backoffCap
+}
+
+// pushReportEgressContext bounds one push report's whole retry loop. It derives
+// from the caller's ctx, so the caller's earlier deadline or cancellation wins,
+// and it touches no terminal-egress state, so it cannot arm, spend or reset the
+// shared phase for unrelated work. The caller MUST defer the returned cancel.
+func (c *Client) pushReportEgressContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	budget := c.PushReportBudget
+	if budget <= 0 {
+		budget = DefaultPushReportBudget
+	}
+	return context.WithTimeout(ctx, budget)
+}
+
+// isPushReportOutcome reports whether outcome is one of the three reports that
+// write a qualifying push row and so ride the push-report budget.
+func isPushReportOutcome(outcome string) bool {
+	switch outcome {
+	case "fixup_pushed", "conflict_resolution_pushed", OutcomeAcceptanceScenariosPushed:
+		return true
+	}
+	return false
 }
 
 // capBackoff doubles d and clamps it to backoffCap. A non-positive cap means
@@ -3396,8 +3465,10 @@ type ShipPullRequestResult struct {
 // /v0/runs/{run_id}/pull-request?stage_id=…. The body is the success PR
 // artifact (Args.Body) when Args.Outcome is empty, a failure report when
 // Outcome=="failed" (#742), or a decomposed-child push-success report when
-// Outcome=="pushed" (#771). Retries 5xx with exponential backoff. Permanent
-// failures bubble up:
+// Outcome=="pushed" (#771). Retries network errors and 5xx with exponential
+// backoff: the three push reports (see isPushReportOutcome) ride the
+// request-local push-report budget, every other outcome the short blip budget.
+// Permanent failures bubble up:
 //
 //   - 400 pull_request_invalid → ErrPullRequestInvalid (runner shipped wrong shape)
 //   - 401 signature_*          → ErrSignatureRejected
@@ -3579,16 +3650,24 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 	aggressiveRetried := false
 
 	maxRetries, backoff := c.retryPolicy()
+	// Zero keeps capBackoff's uncapped doubling for every other outcome.
+	var backoffCap time.Duration
+	cancel := context.CancelFunc(func() {})
+	if isPushReportOutcome(args.Outcome) {
+		maxRetries, backoff, backoffCap = c.pushReportRetryPolicy()
+		ctx, cancel = c.pushReportEgressContext(ctx)
+	}
+	defer cancel()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			select {
 			case <-ctx.Done():
-				return nil, ctx.Err()
+				return nil, fmt.Errorf("upload: ship pull-request: %w: last error: %w", ctx.Err(), lastErr)
 			case <-time.After(backoff):
 			}
-			backoff *= 2
+			backoff = capBackoff(backoff, backoffCap)
 		}
 
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
