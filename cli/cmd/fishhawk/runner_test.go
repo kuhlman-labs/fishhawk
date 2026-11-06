@@ -1170,6 +1170,9 @@ func TestRunnerStart_RoutesStageExecutorAgent(t *testing.T) {
 		{name: "claudecode alias", kind: "agent", ref: "claudecode", wantAgent: "claude-code"},
 		{name: "surrounding whitespace", kind: "agent", ref: "  codex ", wantAgent: "codex"},
 		{name: "uppercase stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: strings.ToUpper(lettersStageID), wantAgent: "codex"},
+		{name: "compact stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: strings.ReplaceAll(lettersStageID, "-", ""), wantAgent: "codex"},
+		{name: "braced stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: "{" + lettersStageID + "}", wantAgent: "codex"},
+		{name: "urn stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: "urn:uuid:" + lettersStageID, wantAgent: "codex"},
 		{name: "empty ref keeps the runner default", kind: "agent", ref: ""},
 		{name: "human kind has no provider", kind: "human", ref: "human"},
 	} {
@@ -1194,6 +1197,9 @@ func TestRunnerStart_RoutesStageExecutorAgent(t *testing.T) {
 			}
 			if n := fb.stageCalls.Load(); n != 1 {
 				t.Errorf("GET /v0/runs/{id}/stages called %d times, want exactly 1", n)
+			}
+			if s := indexOf(cap.args, "--stage-id"); s < 0 || s+1 >= len(cap.args) || cap.args[s+1] != stageArg {
+				t.Errorf("argv must forward --stage-id %s as passed: %v", stageArg, cap.args)
 			}
 			i := indexOf(cap.args, "--agent")
 			if tc.wantAgent == "" {
@@ -1277,15 +1283,28 @@ func TestRunnerStart_StageReadFails_RefusesSpawn(t *testing.T) {
 
 // TestRunnerStart_StageNotInRun_RefusesSpawn: a --stage-id the run's list does
 // not carry has no provider to read, including one that is not a UUID at all.
+// The nil-UUID row isolates the parse guard: without it the zero value of a
+// failed parse would match that row and spawn.
 func TestRunnerStart_StageNotInRun_RefusesSpawn(t *testing.T) {
-	for _, tc := range []struct{ name, stageArg string }{
-		{"another uuid", "99999999-3333-4444-5555-666666666666"},
-		{"not a uuid", "not-a-stage-uuid"},
+	for _, tc := range []struct {
+		name, stageArg string
+		stages         []httpclient.Stage
+	}{
+		{name: "another uuid", stageArg: "99999999-3333-4444-5555-666666666666"},
+		{name: "not a uuid", stageArg: "not-a-stage-uuid"},
+		{
+			name:     "not a uuid beside a nil-uuid row",
+			stageArg: "not-a-stage-uuid",
+			stages:   []httpclient.Stage{fixtureStage(uuid.Nil.String(), "agent", "codex")},
+		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			cap := withFakeRunnerSpawn(t)
 			withFakeGitRemoteNeverCalled(t)
 			fb := newRunRowBackend(t, gitlabRunRow())
+			if tc.stages != nil {
+				fb.stages = tc.stages
+			}
 			withFakeHTTPClient(t, fb.srv)
 
 			var stdout, stderr strings.Builder

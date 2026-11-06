@@ -466,9 +466,15 @@ func resolveStageRunnerAgent(cf commonFlags, runID, stageID string) (string, err
 			"could not read the stages of run %s to resolve the provider of stage %s (%v); not spawning. Fix backend reachability (--backend-url / FISHHAWK_BACKEND_URL), or invoke fishhawk-runner directly with --agent",
 			runID, stageID, err)
 	}
-	for _, stage := range stages.Items {
-		if stage.ID.String() == strings.ToLower(stageID) {
-			return stageRunnerAgent(runID, stageID, stage.Executor)
+	// Compare by parsed identity: uuid.Parse accepts uppercase, compact, braced
+	// and urn:uuid spellings of one ID, and the runner receives the spelling the
+	// caller passed. A --stage-id that does not parse matches no row, so it takes
+	// the not-in-run refusal below; its zero value must not match a nil-UUID row.
+	if parsedStageID, parseErr := uuid.Parse(stageID); parseErr == nil {
+		for _, stage := range stages.Items {
+			if stage.ID == parsedStageID {
+				return stageRunnerAgent(runID, stageID, stage.Executor)
+			}
 		}
 	}
 	return "", fmt.Errorf(
