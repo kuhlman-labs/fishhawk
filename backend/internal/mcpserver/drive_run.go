@@ -230,6 +230,11 @@ const (
 	// next_actions are implementFailedNextActions, leading with
 	// fishhawk_retry_stage for the stage.
 	stoppedImplementStageFailed = "implement_stage_failed"
+	// stoppedExecutorAgentUnsupported is the fail-CLOSED stop when the
+	// dispatchable stage's row declares an executor agent outside the closed
+	// provider set (stageRunnerAgent, #5095). NO act, host-dispatch marker or
+	// spawn, and the warning carries the refusal naming the run, stage and value.
+	stoppedExecutorAgentUnsupported = "executor_agent_unsupported"
 	// "paged:<event>" and "decision_required:<state>" are composed inline.
 )
 
@@ -292,7 +297,7 @@ type DriveStep struct {
 type DriveRunOutput struct {
 	RunID              string       `json:"run_id"`
 	ResolvedWorkingDir string       `json:"resolved_working_dir,omitempty" jsonschema:"the absolute checkout directory the driver spawned runners against, after transport-conditional working_dir resolution (#2479)"`
-	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | base_branch_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | implement_stage_failed | context_cancelled"`
+	StoppedReason      string       `json:"stopped_reason" jsonschema:"why the drive stopped: merged | paged:<event> | decision_required:<state> | timeout | stalled | stage_failed | unrecorded_act | host_dispatch_failed | forge_unresolved | base_branch_unresolved | run_failed | cancelled | gate_error | amendment_check_failed | dispatch_check_failed | dispatched_stale | acceptance_needs_target | acceptance_stage_failed | implement_stage_failed | executor_agent_unsupported | context_cancelled"`
 	RunState           string       `json:"run_state"`
 	StepsTaken         []DriveStep  `json:"steps_taken,omitempty" jsonschema:"the ordered acts the driver performed; each dispatch and gate act also landed a run_auto_driven audit row"`
 	PageEvent          string       `json:"page_event,omitempty" jsonschema:"the must_page_human event, set only on a paged stop"`
@@ -944,6 +949,24 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 				}
 			}
 
+			// Compose the argv BEFORE the record-act (#5095): it reads no state the
+			// act or marker changes, and composing here is what makes an unsupported
+			// executor agent refuse with no act, marker or spawn.
+			argv, aerr := r.composeStageRunnerArgv(RunStageInput{
+				RunID:      in.RunID,
+				Workflow:   runRow.WorkflowID,
+				Stage:      disp.Type,
+				WorkingDir: in.WorkingDir,
+				GitHubRepo: repo,
+				BaseBranch: baseBranch,
+			}, *disp, repo, baseBranch, true, forgeTarget)
+			if aerr != nil {
+				out.StoppedReason = stoppedExecutorAgentUnsupported
+				out.Warnings = append(out.Warnings, aerr.Error())
+				out.NextActions = driveDecisionActions(stoppedExecutorAgentUnsupported, runUUID, in.WorkingDir)
+				return nil, out, nil
+			}
+
 			if _, rerr := r.api.RecordAutoDriveAct(ctx, runUUID, RecordAutoDriveAct{
 				Action: autoDriveDispatchActionName,
 				Stage:  recordName,
@@ -976,14 +999,6 @@ func (r *runResolver) driveRunLoop(ctx context.Context, req *mcp.CallToolRequest
 					"host-dispatch marker for %s failed; NOT spawning (fail-closed): %v", recordName, hderr))
 				return nil, out, nil
 			}
-			argv := r.composeRunnerArgv(RunStageInput{
-				RunID:      in.RunID,
-				Workflow:   runRow.WorkflowID,
-				Stage:      disp.Type,
-				WorkingDir: in.WorkingDir,
-				GitHubRepo: repo,
-				BaseBranch: baseBranch,
-			}, disp.ID, repo, baseBranch, true, forgeTarget)
 			env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 			report := func(ctx context.Context, category, reason, detail string, exitCode int) error {
 				_, e := r.api.ReportStageFailure(ctx, runUUID, stageUUID, category, reason, detail, exitCode)
@@ -1605,6 +1620,17 @@ func driveDecisionActions(state string, runID uuid.UUID, workingDir string) *Nex
 			Precondition: "the acceptance target is unreachable or stale for the merge candidate; no runner was spawned and the stage stays awaiting_host_dispatch",
 			Consumes:     consumesNone,
 			Reason:       "bring up the acceptance target at the expected head SHA (e.g. scripts/dev preview), then re-dispatch the acceptance stage and re-invoke fishhawk_drive_run",
+		}}}
+	case state == stoppedExecutorAgentUnsupported:
+		// A run keeps the workflow it was admitted with, so re-driving would refuse
+		// identically and no remedy here can touch the stored copy. The recovery is
+		// a new run from corrected source, or the direct runner override.
+		return &NextActions{State: state, Actions: []SuggestedAction{{
+			Action:       "fishhawk_cancel_run",
+			Params:       params,
+			Precondition: "the dispatchable stage declares an executor agent outside the supported providers (claude-code, codex); no act was recorded and no runner was spawned, so the stage stays parked",
+			Consumes:     consumesNone,
+			Reason:       "correct executor.agent in the workflow source, cancel this run, then start a new one with fishhawk_start_run (consumes a new run); or leave it parked and invoke fishhawk-runner directly with --agent to run this stage under a supported provider",
 		}}}
 	case state == "fixup_budget_exhausted":
 		// The delegated route_fixup gate met but the NORMAL fix-up budget is
