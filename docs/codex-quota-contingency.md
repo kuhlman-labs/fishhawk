@@ -20,7 +20,10 @@ runs use the new assignments. An unmerged preparation branch changes no live run
 | Existing Astra standard reviewer | `gpt-6-astra` | Existing `high` |
 
 Every agent executor uses `agent: codex`; every standard reviewer and persona
-uses `provider: codex`. Hotfix inherits the feature workflow assignments.
+uses `provider: codex`. Hotfix pins the same agent and model as the feature
+workflow explicitly and inherits the remaining stage settings. These explicit
+pins also work with backend model readers predating #5095's inheritance fix;
+update both workflows when changing their model assignments.
 Human gates and delegated deploy execution retain their existing executors.
 
 This is a mapping by workload role, not a claim of measured behavioral or
@@ -44,7 +47,11 @@ verification commands, delegation and budgets retain their existing values.
    stripping only provider/model changes and the explicit upkeep effort leaves
    the previous workflow configuration unchanged. Run the repository verify gate
    when its shared line is free; do not start a competing verify.
-2. Confirm the deployment enables the Codex reviewer and allows the selected
+2. Confirm the host dispatch path uses the routing fix from #5095. The explicit
+   pins above avoid depending on its backend inheritance repair to select these
+   repository models, but do not claim that repair is deployed until the backend
+   version proves it. Follow the live-run guards for any backend rollout.
+   Confirm the deployment enables the Codex reviewer and allows the selected
    models. Verify both models through bounded authenticated CLI probes using the
    deployment's normal credential mechanism; never print or change credentials.
    A CLI version probe alone does not prove account access or quota.

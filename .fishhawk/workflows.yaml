@@ -989,10 +989,16 @@ workflows:
       max_retries: 1
     # No periodic `budgets`: advisory would change nothing for the run, and
     # blocking would refuse an incident fix at admission.
-    # Only stage differences are repeated. Workflow-level policy, routing,
-    # actions and escalations above do NOT inherit through extends.
+    # Stage differences and explicit provider/model pins are repeated. The pins
+    # keep this contingency compatible with backend model readers predating
+    # #5095's inheritance fix; the effective assignments match feature_change.
+    # Workflow-level policy, routing, actions and escalations above do NOT
+    # inherit through extends.
     stages:
       - id: plan
+        executor:
+          agent: codex
+          model: gpt-6-astra
         budget:
           max_tokens: 150000
           max_runtime: 10m
@@ -1001,6 +1007,9 @@ workflows:
       - id: implement
         # Keep type explicit for the runner-side instruction-path fixture.
         type: implement
+        executor:
+          agent: codex
+          model: gpt-6-astra
         constraints:
           max_files_changed: 15
           # The inherited AGENTS.md built-in exemption cannot override these
@@ -1032,6 +1041,9 @@ workflows:
           limit_usd: 8
           enforcement: advisory
       - id: acceptance
+        executor:
+          agent: codex
+          model: gpt-6-astra
         budget:
           max_tokens: 150000
           max_runtime: 10m
