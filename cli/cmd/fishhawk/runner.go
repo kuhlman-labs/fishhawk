@@ -113,6 +113,13 @@ func planArtifactPath(runID, stageID string) string {
 // defaulting to github with a warning, because a gitlab run spawned as
 // github is the silent wrong-forge class this exists to close.
 // Explicit flags always win over the row.
+//
+// Stage provider (#5095). The verb always reads the run's stage list before the
+// spawn and passes the stage row's executor as --agent, resolved by
+// resolveStageRunnerAgent, so it runs a stage under the same provider the local
+// MCP spawn verbs do. The read is fail-closed: nothing spawns if the stage's
+// provider cannot be established or is outside the closed set. The direct
+// override is `fishhawk-runner --agent`, which this verb does not expose.
 func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	fs := flag.NewFlagSet("fishhawk runner start", flag.ContinueOnError)
 	fs.SetOutput(stderr)
@@ -165,8 +172,8 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	// (the row's path_with_namespace is the only sane default for a
 	// gitlab run — origin auto-detect is github.com-only), or the
 	// gitlab base URL. Runs BEFORE the origin auto-detect and BEFORE
-	// the argv build; all flags explicit → zero network calls, as
-	// before.
+	// the argv build; all forge flags explicit → no run-row read, as
+	// before. The stage read below happens either way.
 	forge := *forgeFlag
 	baseURL := *gitlabBaseURL
 	repo := *githubRepo
@@ -276,6 +283,15 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 
+	// Resolve the stage's provider from its row (#5095). Runs after the forge
+	// and repo refusals and before the argv build, so a refusal here spawns
+	// nothing.
+	agent, err := resolveStageRunnerAgent(cf, *runID, *stageID)
+	if err != nil {
+		_, _ = fmt.Fprintf(stderr, "fishhawk runner start: %v\n", err)
+		return exitFailure
+	}
+
 	// Build the runner argv. Mirrors the GHA action.yml's inputs
 	// closely; the only differences are the local-mode flags
 	// landed in E22.8 / #406.
@@ -323,6 +339,11 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 	}
 	if *noPR {
 		argv = append(argv, "--no-pr")
+	}
+	// An empty agent (a non-agent executor or an empty ref) emits no flag, so
+	// the runner keeps its default and the argv is byte-identical to before.
+	if agent != "" {
+		argv = append(argv, "--agent", agent)
 	}
 
 	cmd := runnerStartCommand(binary, argv...)
@@ -412,6 +433,72 @@ func runRunnerStart(args []string, stdout, stderr io.Writer) int {
 		}
 	}
 	return exitOK
+}
+
+// The executor values resolveStageRunnerAgent maps. This is a hand mirror of
+// stageRunnerAgent in backend/internal/mcpserver/run_stage.go and the runner's
+// selectInvoker, because the CLI, backend and runner modules share no code. A
+// provider added to the runner but missed here refuses loudly rather than
+// choosing the wrong provider.
+const (
+	runnerAgentClaudeCode      = "claude-code"
+	runnerAgentCodex           = "codex"
+	runnerAgentClaudeCodeAlias = "claudecode"
+	stageExecutorKindAgent     = "agent"
+)
+
+// resolveStageRunnerAgent reads the run's stage list through runnerNewClient and
+// returns the --agent value for stageID, or "" for no flag. Every failure is a
+// refusal naming the run, the stage and a remedy: a stage whose provider cannot
+// be established must not silently run under the runner default.
+func resolveStageRunnerAgent(cf commonFlags, runID, stageID string) (string, error) {
+	parsedRunID, err := uuid.Parse(runID)
+	if err != nil {
+		return "", fmt.Errorf(
+			"--run-id %q is not a UUID, so the provider of stage %s cannot be read: %v; not spawning. Pass the run's UUID, or invoke fishhawk-runner directly with --agent",
+			runID, stageID, err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), *cf.timeout)
+	defer cancel()
+	stages, err := runnerNewClient(cf).ListRunStages(ctx, parsedRunID)
+	if err != nil {
+		return "", fmt.Errorf(
+			"could not read the stages of run %s to resolve the provider of stage %s (%v); not spawning. Fix backend reachability (--backend-url / FISHHAWK_BACKEND_URL), or invoke fishhawk-runner directly with --agent",
+			runID, stageID, err)
+	}
+	for _, stage := range stages.Items {
+		if stage.ID.String() == strings.ToLower(stageID) {
+			return stageRunnerAgent(runID, stageID, stage.Executor)
+		}
+	}
+	return "", fmt.Errorf(
+		"stage %s is not in run %s, so its provider cannot be read; not spawning. Pass the --stage-id of a stage in this run, or invoke fishhawk-runner directly with --agent",
+		stageID, runID)
+}
+
+// stageRunnerAgent maps a stage row's executor to a --agent value. A non-agent
+// kind or an empty ref returns "": no flag, so the runner keeps its default.
+// An empty ref on an agent stage is the legacy default-spawn residual, a row
+// that never declared a provider. claude-code and codex return themselves and
+// the claudecode alias returns claude-code. Anything else refuses. A run keeps
+// the workflow it was admitted with, so the remedy is the workflow source for a
+// new run, or the direct runner override for this stage.
+func stageRunnerAgent(runID, stageID string, ex httpclient.StageExecutor) (string, error) {
+	if ex.Kind != stageExecutorKindAgent {
+		return "", nil
+	}
+	switch ref := strings.TrimSpace(ex.Ref); ref {
+	case "":
+		return "", nil
+	case runnerAgentClaudeCode, runnerAgentCodex:
+		return ref, nil
+	case runnerAgentClaudeCodeAlias:
+		return runnerAgentClaudeCode, nil
+	default:
+		return "", fmt.Errorf(
+			"unsupported_executor_agent: run %s stage %s declares executor agent %q; supported providers are %s and %s; not spawning. Correct executor.agent in the workflow source and start a new run (a run keeps the workflow it was admitted with), or invoke fishhawk-runner directly with --agent to run this stage under a supported provider",
+			runID, stageID, ref, runnerAgentClaudeCode, runnerAgentCodex)
+	}
 }
 
 // detectGitHubRepo runs `git remote get-url origin` in workingDir
