@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -46,7 +47,116 @@ const (
 	reconcileSkipNoStageID      = "started_entry_has_no_stage_id"
 	reconcileSkipInFlight       = "review_dispatched_by_this_process"
 	reconcileSkipAlreadySettled = "round_already_settled"
+	// reconcileSkipNotAdmitted is reached only at boot: terminal-run discovery
+	// did not admit this round. It is not part of the on-demand skip_reason enum.
+	reconcileSkipNotAdmitted = "round_not_admitted"
 )
+
+// Terminal-run discovery bounds (ADR-140 D3, D4, #5047). terminalRoundScanLimit
+// caps the newest audit rows read per review kind per scan, and
+// terminalRoundDiscoveryBound is the lookback. Older rounds are a stated residual.
+const (
+	terminalRoundScanLimit      = 500
+	terminalRoundDiscoveryBound = 24 * time.Hour
+)
+
+// reviewRoundAdmission decides whether a stage-level pass may act on the round
+// it just loaded. A nil admission means every stage, the state scan's behaviour.
+type reviewRoundAdmission func(stage orphanedReviewStageKind, latest *audit.Entry, payload planreview.ReviewStartedPayload) bool
+
+// terminalRoundCandidate is one discovered round with its identity kept through
+// evaluation. configured is the started row's reviewer count, 0 when its payload
+// does not decode.
+type terminalRoundCandidate struct {
+	runID      uuid.UUID
+	stage      orphanedReviewStageKind
+	sequence   int64
+	configured int
+}
+
+// terminalRoundScan is one discovery pass. truncated reports that a review kind
+// returned its full limit while its oldest row was still inside the lookback, so
+// rounds may lie past the cap.
+type terminalRoundScan struct {
+	candidates []terminalRoundCandidate
+	truncated  bool
+}
+
+// discoverTerminalRunRounds reads the newest started rows per review kind and
+// keeps each (run, stage)'s highest-sequence row while window admits it (ADR-140
+// D3, D4). It reads no run: this is candidate discovery only, and a caller
+// establishes each run's state and visibility before naming it. A row with no
+// run is skipped. A list error is returned.
+func (s *Server) discoverTerminalRunRounds(ctx context.Context, accountID string, window func(configured int) time.Duration) (terminalRoundScan, error) {
+	return s.discoverTerminalRunRoundsCapped(ctx, accountID, terminalRoundScanLimit, window)
+}
+
+// discoverTerminalRunRoundsCapped is discoverTerminalRunRounds with its per-kind
+// row limit named, so real store ordering can be pinned at a small cap.
+func (s *Server) discoverTerminalRunRoundsCapped(ctx context.Context, accountID string, limit int, window func(configured int) time.Duration) (terminalRoundScan, error) {
+	var scan terminalRoundScan
+	now := time.Now()
+	for _, stage := range orphanedReviewStages {
+		category := stage.started
+		rows, err := s.cfg.AuditRepo.ListAll(ctx, audit.ListAllParams{Category: &category, AccountID: accountID, Limit: limit})
+		if err != nil {
+			return terminalRoundScan{}, fmt.Errorf("list %s: %w", category, err)
+		}
+		if terminalRoundPageTruncated(now, rows, limit) {
+			scan.truncated = true
+		}
+		newest := make(map[uuid.UUID]*audit.Entry, len(rows))
+		order := make([]uuid.UUID, 0, len(rows))
+		for _, row := range rows {
+			if row.RunID == nil {
+				continue
+			}
+			held, seen := newest[*row.RunID]
+			if !seen {
+				order = append(order, *row.RunID)
+			}
+			if !seen || row.Sequence > held.Sequence {
+				newest[*row.RunID] = row
+			}
+		}
+		for _, runID := range order {
+			row := newest[runID]
+			candidate := terminalRoundCandidate{runID: *row.RunID, stage: stage, sequence: row.Sequence}
+			var started planreview.ReviewStartedPayload
+			if json.Unmarshal(row.Payload, &started) == nil {
+				candidate.configured = started.ConfiguredAgents
+			}
+			if !reviewRoundInWindow(now, *row.RunID, stage, row.Sequence, row.Timestamp, window(candidate.configured)) {
+				continue
+			}
+			scan.candidates = append(scan.candidates, candidate)
+		}
+	}
+	return scan, nil
+}
+
+// terminalRoundPageTruncated is true when a page reached limit and its oldest
+// row is still inside the lookback. Rows past the bound could not have qualified,
+// so reaching the cap there drops nothing. The store orders by timestamp
+// descending; the page is scanned so this does not lean on a reader's order.
+func terminalRoundPageTruncated(now time.Time, rows []*audit.Entry, limit int) bool {
+	if limit <= 0 || len(rows) < limit {
+		return false
+	}
+	oldest := rows[0].Timestamp
+	for _, row := range rows[1:] {
+		if row.Timestamp.Before(oldest) {
+			oldest = row.Timestamp
+		}
+	}
+	return now.Sub(oldest) < terminalRoundDiscoveryBound
+}
+
+// reviewRoundInWindow reports whether a round is still inside window, or is
+// mid-handoff to a boot re-dispatch, which stays visible whatever its age.
+func reviewRoundInWindow(now time.Time, runID uuid.UUID, stage orphanedReviewStageKind, seq int64, started time.Time, window time.Duration) bool {
+	return now.Sub(started) < window || reviewRedispatchPending(runID, stage.label, seq)
+}
 
 // reconciledStage is the per-stage outcome of one reconcile pass. It carries
 // the counts the on-demand endpoint reports and the skip reason when the pass
@@ -147,6 +257,15 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 // The on-demand POST /v0/runs/{run_id}/reviews/reconcile stays
 // terminate-only.
 //
+// Terminal-run discovery (ADR-140 D3, #5047). After the state scan, the sweep
+// reads started rows from the bounded lookback, because a round started while its
+// run was reporting a terminal state is on no state page. A run that is terminal
+// reaches the same stage-level pass, admitted only for its discovered stages and
+// re-checked against the stage's ACTUAL latest round, so a settled sibling cannot
+// admit an expired round. A missing or unreadable run closes nothing: unknown is
+// never proof of no consumer. A terminal-round list error is systemic and is
+// returned, keeping the state scan's effects.
+//
 // Lost review terminals (E72.64 / #4106). Before the pending-redispatch and
 // boot-marker gates, each stage first flushes the named verdict_write_failed
 // entries THIS process registered for reviewers whose terminal write never
@@ -167,9 +286,9 @@ const orphanedReviewRestartReason = "reviewer orphaned by daemon restart; no ter
 //
 // Best-effort PER RUN: a per-run error is logged and skipped so a single
 // unresolvable run never wedges the boot sweep. Only a systemic ListRuns
-// paging failure aborts (and is returned). Returns the count of runs whose
-// reviews were terminated (synthesized failed); re-dispatched rounds are
-// logged, not counted.
+// paging or terminal-round list failure aborts (and is returned). Returns the
+// count of runs whose reviews were terminated (synthesized failed);
+// re-dispatched rounds are logged, not counted.
 func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 	if s.cfg.RunRepo == nil {
 		return 0, fmt.Errorf("server: reconcile orphaned reviews: RunRepo is nil")
@@ -237,12 +356,84 @@ func (s *Server) ReconcileOrphanedReviews(ctx context.Context) (int, error) {
 		}
 	}
 
+	scan, err := s.discoverTerminalRunRounds(ctx, "", func(int) time.Duration { return terminalRoundDiscoveryBound })
+	if err != nil {
+		return terminated, fmt.Errorf("server: reconcile orphaned reviews: discover terminal-run rounds: %w", err)
+	}
+	if scan.truncated {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: terminal-run discovery reached its row cap — older rounds were not checked",
+			slog.Int("limit", terminalRoundScanLimit),
+		)
+	}
+	discovered := make(map[uuid.UUID]map[string]struct{}, len(scan.candidates))
+	order := make([]uuid.UUID, 0, len(scan.candidates))
+	for _, candidate := range scan.candidates {
+		if _, seen := discovered[candidate.runID]; !seen {
+			discovered[candidate.runID] = map[string]struct{}{}
+			order = append(order, candidate.runID)
+		}
+		discovered[candidate.runID][candidate.stage.label] = struct{}{}
+	}
+	for _, runID := range order {
+		ru, err := s.cfg.RunRepo.GetRun(ctx, runID)
+		if err != nil {
+			failed++
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: skipped terminal-run candidate on read error — nothing closed",
+				slog.String("run_id", runID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		if !ru.State.IsTerminal() {
+			// The state scan owns a non-terminal run.
+			continue
+		}
+		stages, err := s.reconcileAdmittedRoundsForBoot(ctx, runID, admitDiscoveredRounds(runID, discovered[runID]))
+		if err != nil {
+			failed++
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "review reconcile: skipped run on error",
+				slog.String("run_id", runID.String()),
+				slog.String("error", err.Error()),
+			)
+			continue
+		}
+		for _, st := range stages {
+			if st.Redispatched {
+				redispatched++
+				s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: re-dispatched orphaned review round",
+					slog.String("run_id", runID.String()),
+					slog.String("stage", st.Stage),
+				)
+			}
+		}
+		if _, seen := healed[runID]; !seen && reconcileSynthesizedAny(stages) {
+			healed[runID] = struct{}{}
+			terminated++
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: terminated orphaned review(s)",
+				slog.String("run_id", runID.String()),
+				slog.String("run_state", string(ru.State)),
+			)
+		}
+	}
+
 	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "review reconcile: orphaned-review reconciliation complete",
 		slog.Int("terminated", terminated),
 		slog.Int("redispatched", redispatched),
 		slog.Int("failed", failed),
 	)
 	return terminated, nil
+}
+
+// admitDiscoveredRounds admits only a run's discovered review stages and
+// re-checks the window against the stage's actual latest round.
+func admitDiscoveredRounds(runID uuid.UUID, stages map[string]struct{}) reviewRoundAdmission {
+	now := time.Now()
+	return func(stage orphanedReviewStageKind, latest *audit.Entry, _ planreview.ReviewStartedPayload) bool {
+		if _, ok := stages[stage.label]; !ok {
+			return false
+		}
+		return reviewRoundInWindow(now, runID, stage, latest.Sequence, latest.Timestamp, terminalRoundDiscoveryBound)
+	}
 }
 
 // reconcileSynthesizedAny reports whether any stage in the pass emitted a
@@ -301,20 +492,26 @@ func reconcileEmitLockFor(runID uuid.UUID) *sync.Mutex {
 // C1 of #4077): it never re-dispatches. The boot sweep calls
 // reconcileRunOrphanedReviewsForBoot.
 func (s *Server) reconcileRunOrphanedReviews(ctx context.Context, runID uuid.UUID) ([]reconciledStage, error) {
-	return s.reconcileRunOrphanedReviewsMode(ctx, runID, false)
+	return s.reconcileRunOrphanedReviewsMode(ctx, runID, nil, false)
 }
 
 // reconcileRunOrphanedReviewsForBoot is the boot-mode sibling of
 // reconcileRunOrphanedReviews (#4077): identical, except that an orphaned round
 // redispatchEligibility accepts is re-dispatched instead of failed.
 func (s *Server) reconcileRunOrphanedReviewsForBoot(ctx context.Context, runID uuid.UUID) ([]reconciledStage, error) {
-	return s.reconcileRunOrphanedReviewsMode(ctx, runID, true)
+	return s.reconcileRunOrphanedReviewsMode(ctx, runID, nil, true)
+}
+
+// reconcileAdmittedRoundsForBoot is the boot-mode pass over a terminal run's
+// discovered rounds (ADR-140 D3, #5047): boot mode, limited by admit.
+func (s *Server) reconcileAdmittedRoundsForBoot(ctx context.Context, runID uuid.UUID, admit reviewRoundAdmission) ([]reconciledStage, error) {
+	return s.reconcileRunOrphanedReviewsMode(ctx, runID, admit, true)
 }
 
 // reconcileRunOrphanedReviewsMode is the shared body; allowRedispatch is true
-// only on the boot sweep's path.
-func (s *Server) reconcileRunOrphanedReviewsMode(ctx context.Context, runID uuid.UUID, allowRedispatch bool) ([]reconciledStage, error) {
-	out, emittedImplement, err := s.reconcileRunOrphanedReviewsLockedMode(ctx, runID, allowRedispatch)
+// only on the boot sweep's path, and a nil admit means every stage.
+func (s *Server) reconcileRunOrphanedReviewsMode(ctx context.Context, runID uuid.UUID, admit reviewRoundAdmission, allowRedispatch bool) ([]reconciledStage, error) {
+	out, emittedImplement, err := s.reconcileRunOrphanedReviewsLockedMode(ctx, runID, admit, allowRedispatch)
 	if err != nil {
 		return out, err
 	}
@@ -350,12 +547,12 @@ func (s *Server) reconcileRunOrphanedReviewsMode(ctx context.Context, runID uuid
 //
 // Terminate-only, like reconcileRunOrphanedReviews (C1 of #4077).
 func (s *Server) reconcileRunOrphanedReviewsLocked(ctx context.Context, runID uuid.UUID) ([]reconciledStage, bool, error) {
-	return s.reconcileRunOrphanedReviewsLockedMode(ctx, runID, false)
+	return s.reconcileRunOrphanedReviewsLockedMode(ctx, runID, nil, false)
 }
 
 // reconcileRunOrphanedReviewsLockedMode is reconcileRunOrphanedReviewsLocked
-// with the boot-mode flag threaded to the stage-level reconcile.
-func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runID uuid.UUID, allowRedispatch bool) ([]reconciledStage, bool, error) {
+// with the admission and boot-mode flag threaded to the stage-level reconcile.
+func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runID uuid.UUID, admit reviewRoundAdmission, allowRedispatch bool) ([]reconciledStage, bool, error) {
 	lock := reconcileEmitLockFor(runID)
 	lock.Lock()
 	defer lock.Unlock()
@@ -363,7 +560,7 @@ func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runI
 	out := make([]reconciledStage, 0, len(orphanedReviewStages))
 	emittedImplement := false
 	for _, stage := range orphanedReviewStages {
-		res, err := s.reconcileStageOrphanedReviewsMode(ctx, runID, stage, allowRedispatch)
+		res, err := s.reconcileStageOrphanedReviewsMode(ctx, runID, stage, admit, allowRedispatch)
 		if err != nil {
 			return out, emittedImplement, err
 		}
@@ -392,7 +589,7 @@ func (s *Server) reconcileRunOrphanedReviewsLockedMode(ctx context.Context, runI
 // Terminate-only (C1 of #4077); the boot sweep reaches
 // reconcileStageOrphanedReviewsMode with allowRedispatch=true.
 func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind) (reconciledStage, error) {
-	return s.reconcileStageOrphanedReviewsMode(ctx, runID, stage, false)
+	return s.reconcileStageOrphanedReviewsMode(ctx, runID, stage, nil, false)
 }
 
 // reconcileStageOrphanedReviewsMode is the stage-level body. With
@@ -400,8 +597,9 @@ func (s *Server) reconcileStageOrphanedReviews(ctx context.Context, runID uuid.U
 // accepts is handed to redispatchOrphanedRound instead of synthesized, and an
 // ineligible one is synthesized with a reason naming the refusing slug.
 // Without it the behaviour is the #1781 synthesis, byte-identical reasons
-// included.
-func (s *Server) reconcileStageOrphanedReviewsMode(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, allowRedispatch bool) (reconciledStage, error) {
+// included. A non-nil admit that refuses the round's actual latest row leaves it
+// untouched.
+func (s *Server) reconcileStageOrphanedReviewsMode(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, admit reviewRoundAdmission, allowRedispatch bool) (reconciledStage, error) {
 	out := reconciledStage{Stage: stage.label}
 	skip := func(reason string) reconciledStage {
 		out.Skipped = true
@@ -426,6 +624,9 @@ func (s *Server) reconcileStageOrphanedReviewsMode(ctx context.Context, runID uu
 		// A started entry always carries its stage id; defend anyway rather
 		// than emit a terminal entry with no stage anchor.
 		return skip(reconcileSkipNoStageID), nil
+	}
+	if admit != nil && !admit(stage, latest, payload) {
+		return skip(reconcileSkipNotAdmitted), nil
 	}
 
 	// Count landed terminals for THIS round only (see

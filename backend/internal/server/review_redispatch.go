@@ -3,6 +3,7 @@ package server
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"log/slog"
@@ -53,13 +54,14 @@ const maxReviewRoundRedispatches = 3
 
 // Re-dispatch reason slugs. The INELIGIBILITY slugs are returned by
 // redispatchEligibility and stamped on the synthesized *_review_failed as
-// "...; not re-dispatched: <slug>" (gating_authority through
+// "...; not re-dispatched: <slug>" (run_terminal, gating_authority through
 // advanced_past_review, plus eligibility_check_failed and
 // redispatch_audit_failed, which the boot sweep stamps itself). The FAILURE
 // slugs name why a re-dispatch that was audited as review_round_redispatched
 // started no new round; the fallback stamps them as "...; re-dispatch did not
 // start a round: <slug>".
 const (
+	redispatchSlugRunTerminal            = "run_terminal"
 	redispatchSlugGatingAuthority        = "gating_authority"
 	redispatchSlugReviewerUnwired        = "reviewer_unwired"
 	redispatchSlugAlreadyRedispatched    = "already_redispatched"
@@ -161,6 +163,12 @@ func reviewRedispatchPending(runID uuid.UUID, stage string, orphanedSeq int64) b
 // (false, slug, nil) naming the first failed condition. err is non-nil only
 // when a read needed to decide failed; the caller decides how to degrade.
 //
+// The shared consumer predicate runs first (ADR-140 D2, #5047), before the
+// authority, backend and depth refusals can obscure a proven no-consumer round,
+// so a nil RunRepo answers eligibility_check_failed ahead of gating_authority,
+// reviewer_unwired and depth_cap_reached. No production path has a nil RunRepo:
+// the boot sweep refuses to start without one.
+//
 // Check order per round kind, after the shared authority / wiring / depth /
 // already-redispatched checks: superseded, then stage state, then input-source
 // wiring. A plan round: superseded_by_new_plan, plan_stage_not_awaiting_approval,
@@ -173,6 +181,9 @@ func reviewRedispatchPending(runID uuid.UUID, stage string, orphanedSeq int64) b
 // loading: a round eligible here can still fail to rebuild its inputs at
 // dispatch time, which the fallback closes.
 func (s *Server) redispatchEligibility(ctx context.Context, runID uuid.UUID, stage orphanedReviewStageKind, latest *audit.Entry, payload planreview.ReviewStartedPayload) (bool, string, error) {
+	if slug, err := s.roundConsumerGoneSlug(ctx, runID); err != nil || slug != "" {
+		return false, slug, err
+	}
 	// Gating rounds are synchronous: a gating plan round's reject transitions
 	// the stage, so re-running one on boot would act on a stage the operator
 	// has not seen. Only an advisory round, whose human gate stands behind it,
@@ -226,6 +237,42 @@ func (s *Server) redispatchEligibility(ctx context.Context, runID uuid.UUID, sta
 		return false, slug, err
 	}
 	return true, "", nil
+}
+
+// roundConsumerGoneSlug is the one consumer predicate (ADR-140 D1, D2, #5047).
+// Boot recovery and GET /v0/restart-blockers both reach it through
+// redispatchEligibility, so they cannot disagree. It returns run_terminal when
+// no consumer can use the round's verdict: a cancelled run, or a succeeded
+// decomposition child whose parent is terminal. A failed run keeps the existing
+// eligibility checks because it can be revived, so it is never classified
+// no-consumer for being failed and it reads no parent. Any other readable state,
+// including a succeeded child with a live parent, returns "".
+//
+// A missing or unreadable run or required parent, run.ErrNotFound included, is
+// returned as an error: unknown is never proof that no consumer exists. A nil
+// RunRepo returns eligibility_check_failed.
+func (s *Server) roundConsumerGoneSlug(ctx context.Context, runID uuid.UUID) (string, error) {
+	if s.cfg.RunRepo == nil {
+		return redispatchSlugEligibilityCheckFailed, nil
+	}
+	ru, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		return "", fmt.Errorf("get run %s: %w", runID, err)
+	}
+	if ru.State == run.StateCancelled {
+		return redispatchSlugRunTerminal, nil
+	}
+	if ru.State != run.StateSucceeded || ru.DecomposedFrom == nil {
+		return "", nil
+	}
+	parent, err := s.cfg.RunRepo.GetRun(ctx, *ru.DecomposedFrom)
+	if err != nil {
+		return "", fmt.Errorf("get parent run %s: %w", *ru.DecomposedFrom, err)
+	}
+	if parent.State.IsTerminal() {
+		return redispatchSlugRunTerminal, nil
+	}
+	return "", nil
 }
 
 // implementRoundRebuildSlug is the implement-round half of redispatchEligibility,
@@ -592,6 +639,7 @@ func (s *Server) redispatchPlanRound(ctx context.Context, runID uuid.UUID, orpha
 	loadPlanGatePayload(ctx, s, runID, categoryPlanScopeRegression, stageID, gen.Sequence, orphanedSeq, &regression)
 	loadPlanGatePayload(ctx, s, runID, categoryPlanAcceptancePrecheck, stageID, gen.Sequence, orphanedSeq, &acceptance)
 
+	// A re-dispatched round owns no stage edge; its outcome is not read.
 	s.runPlanReviews(ctx, runID, stageID, []byte(art.Content), precheck, sweep, testSweep, regression, acceptance)
 	return ""
 }
@@ -682,6 +730,7 @@ func (s *Server) redispatchImplementRound(ctx context.Context, runID uuid.UUID, 
 		// The re-dispatched round records the head the orphaned round judged
 		// (ADR-117 A1.7): the bundle's authoritative verify head.
 		ctx = withReviewRoundSource(ctx, reviewRoundSource{Origin: payload.RoundOrigin, BaseSHA: payload.RoundBaseSHA, HeadSHA: in.verifyHead})
+		// A re-dispatched round owns no stage edge; its outcome is not read.
 		s.runImplementReviewsForTree(ctx, runID, stageID, in.diff, in.scopeDrift, in.headSHA, in.treeSHA, in.changeID, in.gateEvidence)
 		return ""
 	}
@@ -717,6 +766,7 @@ func (s *Server) redispatchImplementRound(ctx context.Context, runID uuid.UUID, 
 	// The recorded head: for a fixup_push round the pushed head the backstop
 	// keyed on, for a consolidated round the compare result's head SHA the
 	// dispatcher stamped.
+	// A re-dispatched round owns no stage edge; its outcome is not read.
 	s.runImplementReviews(ctx, runID, stageID, diff, nil, payload.HeadSHA, gateEvidence)
 	return ""
 }
@@ -733,15 +783,27 @@ func (s *Server) redispatchImplementRound(ctx context.Context, runID uuid.UUID, 
 // so the redacted bundle of the round's own pack is sequenced AFTER its
 // started entry. head_sha is what ties a bundle to the round.
 func (s *Server) redactedBundleForHead(ctx context.Context, runID, stageID uuid.UUID, head string) ([]byte, bool) {
+	body, ok, _ := s.loadRedactedBundleForHead(ctx, runID, stageID, head)
+	return body, ok
+}
+
+// loadRedactedBundleForHead is redactedBundleForHead with its read failures
+// kept. The error is non-nil only when no usable bundle was found AND the
+// trace_uploaded list failed, or a TraceStore read failed with anything but
+// tracestore.ErrNotFound. A missing object, an unparseable bundle and a wrong
+// head are definitive misses, so they carry no error; a usable bundle wins over
+// a read failure on a newer one.
+func (s *Server) loadRedactedBundleForHead(ctx context.Context, runID, stageID uuid.UUID, head string) ([]byte, bool, error) {
 	if s.cfg.TraceStore == nil {
-		return nil, false
+		return nil, false, nil
 	}
 	entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "trace_uploaded")
 	if err != nil {
-		return nil, false
+		return nil, false, fmt.Errorf("list trace_uploaded for run %s: %w", runID, err)
 	}
 	ordered := append([]*audit.Entry(nil), entries...)
 	sort.SliceStable(ordered, func(i, j int) bool { return ordered[i].Sequence < ordered[j].Sequence })
+	var readErr error
 	for i := len(ordered) - 1; i >= 0; i-- {
 		e := ordered[i]
 		if e.StageID == nil || *e.StageID != stageID {
@@ -754,13 +816,11 @@ func (s *Server) redactedBundleForHead(ctx context.Context, runID, stageID uuid.
 		if json.Unmarshal(e.Payload, &p) != nil || p.Variant != string(tracestore.VariantRedacted) || len(p.ContentHash) != 64 {
 			continue
 		}
-		body, err := s.cfg.TraceStore.Get(ctx, tracestore.BundleRef{RunID: runID, Variant: tracestore.VariantRedacted, ContentHash: p.ContentHash})
+		b, err := s.readRedactedBundle(ctx, runID, p.ContentHash)
 		if err != nil {
-			continue
-		}
-		b, err := io.ReadAll(body)
-		_ = body.Close()
-		if err != nil {
+			if !errors.Is(err, tracestore.ErrNotFound) {
+				readErr = err
+			}
 			continue
 		}
 		if head != "" {
@@ -769,9 +829,19 @@ func (s *Server) redactedBundleForHead(ctx context.Context, runID, stageID uuid.
 				continue
 			}
 		}
-		return b, true
+		return b, true, nil
 	}
-	return nil, false
+	return nil, false, readErr
+}
+
+// readRedactedBundle reads one stored redacted bundle whole.
+func (s *Server) readRedactedBundle(ctx context.Context, runID uuid.UUID, contentHash string) ([]byte, error) {
+	body, err := s.cfg.TraceStore.Get(ctx, tracestore.BundleRef{RunID: runID, Variant: tracestore.VariantRedacted, ContentHash: contentHash})
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = body.Close() }()
+	return io.ReadAll(body)
 }
 
 // implementReviewInputs is what the trace-time review hook extracts from a
