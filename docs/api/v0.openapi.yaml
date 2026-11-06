@@ -30568,9 +30568,10 @@ paths:
         '503':
           description: |
             `reported_head_unverifiable` (ADR-141, #5053): a forge, required
-            repository, dedup or required trigger-state read failed, so
-            confirmation of a push report is unknown. No row is written and the
-            stage does not transition; re-post the same report.
+            repository or required trigger-state read failed, or a dedup read
+            failed on a putative mismatch, so confirmation of a push report is
+            unknown. No row is written and the stage does not transition;
+            re-post the same report.
 
             `pull_request_upload_unconfigured`: the server has no signing,
             artifact, audit or run repository wired.

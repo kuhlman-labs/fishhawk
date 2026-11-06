@@ -447,8 +447,10 @@ func (s *Server) mergeQueueFixupPushedAfter(ctx context.Context, e mergequeue.En
 // put on the run branch on top of a recorded prior head. The walk reads these
 // rows only. The acceptance and conflict-resolution edges were forge-checked
 // when written (ADR-141: exact head and first-parent base) on an
-// installation-bearing run, and the rebase writer verified a clean base merge's
-// parents (ADR-112), so an edge the forge did not confirm has no row to walk.
+// installation-bearing run, so there an acceptance or conflict edge the forge
+// did not confirm has no row. The rebase writer verifies a clean base merge's
+// parents (ADR-112), but an unverified base merge still has a branch_rebased
+// row with clean_verified=false, and isCleanAdvance filters it from the walk.
 var mergeQueueReentryDescendantCategories = []string{CategoryAcceptanceScenariosPushed, CategoryConflictResolutionPushed, CategoryBranchRebased}
 
 // reentryDescendantEdge decodes one product-push row into its (parent, child)
