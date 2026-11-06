@@ -1,11 +1,12 @@
 # Codex-only workflow contingency
 
 Issue #5094 prepares the repository workflow for Anthropic quota exhaustion.
-Activation is blocked by #5095: the original local MCP runner composer omits
-the executor's provider and the runner defaults to Claude Code. The routing
-hotfix must be active on the dispatch path before these pins can select Codex.
-After that prerequisite and this configuration's approved merge, newly admitted
-runs use the new assignments. An unmerged preparation branch changes no live run.
+Activation is blocked by #5095 and #5096. The original local MCP runner composer
+omits the executor's provider and the runner defaults to Claude Code (#5095).
+Acceptance and standalone review executor model pins also lack runner transport
+(#5096); provider selection alone does not make those pins effective. Both
+prerequisites must be active before claiming the full mapping below for newly
+admitted runs. An unmerged preparation branch changes no live run.
 
 ## Workload mapping
 
@@ -51,6 +52,10 @@ verification commands, delegation and budgets retain their existing values.
    pins above avoid depending on its backend inheritance repair to select these
    repository models, but do not claim that repair is deployed until the backend
    version proves it. Follow the live-run guards for any backend rollout.
+   Confirm #5096's model transport is active for acceptance and standalone review;
+   schema resolution alone is not proof that a declared model reaches a binary.
+   Preserve the existing review-agent override behavior separately: #1416's
+   review model channel controls reviewer invocations, not standalone execution.
    Confirm the deployment enables the Codex reviewer and allows the selected
    models. Verify both models through bounded authenticated CLI probes using the
    deployment's normal credential mechanism; never print or change credentials.

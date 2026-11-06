@@ -830,7 +830,8 @@ workflows:
           # An acceptance stage must run under an agent or human executor.
           agent: codex
           # Acceptance drives scripted HTTP checks against the criteria, not
-          # open-ended reasoning, so it retains `medium` effort on Astra.
+          # open-ended reasoning, so it declares Astra with `medium` effort.
+          # #5096 must route this model pin before contingency activation.
           model: gpt-6-astra
           reasoning_effort: medium
         inputs:
@@ -1189,6 +1190,8 @@ workflows:
           agent: codex
           model: gpt-6.1-sol
           # This executor does not replace implement.reviewers above.
+          # Its model transport is blocked by #5096; declaration alone does
+          # not establish the model of this standalone review invocation.
           reasoning_effort: high
         gates:
           # A `check` gate carries no approval predicate: it lets the run
