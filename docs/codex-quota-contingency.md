@@ -1,12 +1,16 @@
 # Codex-only workflow contingency
 
 Issue #5094 prepares the repository workflow for Anthropic quota exhaustion.
-Activation is blocked by #5095 and #5096. The original local MCP runner composer
-omits the executor's provider and the runner defaults to Claude Code (#5095).
-Acceptance and standalone review executor model pins also lack runner transport
-(#5096); provider selection alone does not make those pins effective. Both
-prerequisites must be active before claiming the full mapping below for newly
-admitted runs. An unmerged preparation branch changes no live run.
+Activation requires the routing fix from #5095 and acceptance model transport
+from #5096 to be deployed. #5095 merged in PR #5098; its binaries still need a
+guarded rollout. Acceptance currently lacks model transport, so provider
+selection alone does not make that pin effective. A check-gated review stage
+spawns no provider invocation; its declared model is not an active invocation
+pin. An unmerged preparation branch changes no live run.
+
+The Captain authorized activation after the hotfix merge and campaign
+resumption if Anthropic quota is exhausted. Keep this branch unmerged until
+that condition, the rollout prerequisites and the human approval gate are met.
 
 ## Workload mapping
 
@@ -16,7 +20,8 @@ admitted runs. An unmerged preparation branch changes no live run.
 | Opus acceptance and routine implementation | `gpt-6-astra` | Existing `medium` |
 | Fable standard reviewer | `gpt-6.1-sol` | Existing `high` |
 | Sonnet architect and security personas | `gpt-6.1-sol` | Existing `high` |
-| Implicit grooming and routine-review executor | `gpt-6.1-sol` | Existing `high` |
+| Implicit grooming executor | `gpt-6.1-sol` | Existing `high` |
+| Routine review declaration (no provider invocation) | `gpt-6.1-sol` | Unused for this gate |
 | Implicit upkeep executor | `gpt-6.1-sol` | Explicit `high` |
 | Existing Astra standard reviewer | `gpt-6-astra` | Existing `high` |
 
@@ -26,6 +31,11 @@ workflow explicitly and inherits the remaining stage settings. These explicit
 pins also work with backend model readers predating #5095's inheritance fix;
 update both workflows when changing their model assignments.
 Human gates and delegated deploy execution retain their existing executors.
+The routine review declaration describes a check-gated auto-merge stage. The
+prompt builder has no `review` template, and that gate takes the orchestrator's
+auto-merge path before agent dispatch. Its configured agent/model must not be
+counted as an observed provider spawn. The existing #1416 review-model ladder
+and persisted resolutions for implement reviewers remain unchanged.
 
 This is a mapping by workload role, not a claim of measured behavioral or
 runtime equivalence. [OpenAI's model guidance](https://learn.chatgpt.com/docs/models)
@@ -52,7 +62,7 @@ verification commands, delegation and budgets retain their existing values.
    pins above avoid depending on its backend inheritance repair to select these
    repository models, but do not claim that repair is deployed until the backend
    version proves it. Follow the live-run guards for any backend rollout.
-   Confirm #5096's model transport is active for acceptance and standalone review;
+   Confirm #5096's model transport is active for acceptance;
    schema resolution alone is not proof that a declared model reaches a binary.
    Preserve the existing review-agent override behavior separately: #1416's
    review model channel controls reviewer invocations, not standalone execution.
