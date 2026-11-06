@@ -272,6 +272,18 @@ type pullRequestBody struct {
 	// scopeExemptionEvidence marshal — the cross-boundary seam.
 	SupplementalScopeExemptions []scopeExemption `json:"supplemental_scope_exemptions,omitempty"`
 
+	// ReviewObligation is a required supplemental review's recovery state
+	// (ADR-140 (#5047) D9), present on a failure or scope_park report from a runner
+	// the backend advertised the capability to. Absent, null and empty are three
+	// states (reviewObligationKnowledge). Declared here so the
+	// DisallowUnknownFields decoder accepts the body; an absent key keeps every
+	// older report byte-identical.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to the
+	// runner's upload.pullRequestFailureBody and upload.pullRequestScopeParkBody
+	// ReviewObligation fields.
+	ReviewObligation *reviewObligation `json:"review_obligation,omitempty"`
+
 	// ScenarioIDs and RetiredScenarios form the acceptance-stage scenario-corpus
 	// report variants (E72.4 / #3328). Outcome=="acceptance_scenarios_pushed":
 	// the acceptance runner committed + pushed its scenario-corpus commit
@@ -740,6 +752,56 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 
 	contentHash := sha256Hex(body)
 
+	// Admission on a running implement stage (ADR-140 (#5047) D8, D9), before
+	// anything is persisted. The terminal edge cannot be taken without its guarded
+	// capability, and an upload missing a recorded required path is refused unless
+	// recorded rows prove the pass completed. A discharged omission still takes the
+	// pass's ownership below, so it cannot apply a second edge while the owner lives.
+	forceClaim := false
+	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
+		if !s.guardedEdgeAvailable() {
+			s.writeSupplementalEdgeError(w, r, errSupplementalAttemptCASAbsent)
+			return
+		}
+		obligationCheck, merr := s.requiredReviewObligationMissing(r.Context(), runID, stage, pr.HeadSHA, pr.SupplementalScopeExemptions)
+		if merr != nil {
+			s.writeSupplementalEdgeError(w, r, merr)
+			return
+		}
+		if len(obligationCheck.missing) > 0 && !obligationCheck.discharged {
+			s.writeReviewObligationMissing(w, r, runID, stageID, "", len(obligationCheck.missing))
+			return
+		}
+		forceClaim = len(obligationCheck.missing) > 0 && obligationCheck.discharged
+	}
+
+	// Current-attempt, process-local ownership of a required gating pass (D8). It
+	// covers the artifact-visibility-to-pass-completion interval, releases on every
+	// exit and tells a live pass from a lost one without counting partial verdicts.
+	passClaim := s.claimSupplementalGatingPass(r.Context(), runID, stage, &pr, forceClaim)
+	defer passClaim.release()
+	if passClaim.unknown {
+		s.writeSupplementalEdgeError(w, r, errors.New("supplemental pass requirement or capability unavailable"))
+		return
+	}
+	if passClaim.busy {
+		s.writeSupplementalPassBusy(w, r, runID, stageID, passClaim.holderDeadline)
+		return
+	}
+	if passClaim.claimed {
+		// A caller disconnect does not revoke the pass; its deadline and shutdown do.
+		passCtx, releasePass := s.boundSupplementalPassContext(r.Context(), passClaim.deadline)
+		defer releasePass()
+		r = r.WithContext(passCtx)
+		// The first read may predate the previous owner's edge.
+		freshStage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
+		if err != nil {
+			s.writeSupplementalEdgeError(w, r, err)
+			return
+		}
+		stage = freshStage
+	}
+
 	// Idempotency: dedup on (stage_id, content_hash). The runner
 	// computes content_hash over the canonical bytes it shipped, so
 	// re-running an identical job returns the same artifact rather
@@ -787,6 +849,34 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 				"heal governance audit entry failed", map[string]any{"error": herr.Error()})
 			return
 		}
+		respondIdempotent := func() {
+			s.writeJSON(w, r, http.StatusOK, pullRequestResponse{
+				ID:          existing.ID,
+				StageID:     existing.StageID,
+				ContentHash: existing.ContentHash,
+				PRNumber:    pr.PRNumber,
+				PRURL:       pr.PRURL,
+				HeadSHA:     pr.HeadSHA,
+				Idempotent:  true,
+			})
+		}
+		// Re-entry (D8): a stage retry's resumed upload can hit an earlier attempt's
+		// artifact. Recorded rows decide: a reject blocks, a complete set on this
+		// attempt skips, no start on this attempt is the one allowed pass, and a start
+		// with an incomplete set is lost. A same-attempt artifact never takes this arm,
+		// so no same-attempt replay ever dispatches a reviewer.
+		if passClaim.claimed && supplementalArtifactPrecedesAttempt(stage, existing) {
+			if s.settleClaimedUpload(w, r, runID, stage, &pr, passClaim, existing.ID, respondIdempotent) {
+				respondIdempotent()
+			}
+			return
+		}
+		// A retried gating upload must not read a lost pass as no rejection. A closing
+		// process answers 503, an open one 409; nothing advances either way.
+		if s.supplementalPassLost(r.Context(), runID, stage, &pr) {
+			s.writeReviewRoundInterrupted(w, r, runID, stageID, "implement")
+			return
+		}
 		// Terminalise on the idempotent replay (#2630). #1396 self-healed the
 		// governance audit entry on this short-circuit but never drove the stage
 		// transition, so a re-ship of an already-persisted artifact left a still-
@@ -794,27 +884,27 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		// the #2630 sticky re-entry into a permanently stranded stage: the terminal
 		// transition rode ONLY on the create-path PR-open event, so an idempotent-
 		// suppressed upload settled nothing. Drive it here under EXACTLY the create
-		// path's guard (line ~697): implement && running. That guard is what keeps
-		// this safe without re-running the create path's gating-reject and lineage
-		// checks — both of those leave the stage terminally `failed`, never
-		// `running`, so a stage that failed either can never reach this advance. A
-		// replay against an already-terminal stage (a prior ship having advanced it)
-		// fails the running guard and is an unchanged no-op — no double transition,
-		// no second orchestrator advance. Best-effort like the create path: a
-		// transition error is WARN-logged inside the helper and never unwinds the
-		// 200. The response body stays byte-unchanged (still idempotent:true).
+		// path's guard: implement && running. A replay against an already-terminal
+		// stage (a prior ship having advanced it) fails the running guard and is an
+		// unchanged no-op — no double transition, no second orchestrator advance. The
+		// heal shares the create path's guarded edge, so recorded evidence decides here
+		// too and a store fault answers 500 for a further replay to decide. The response
+		// body stays byte-unchanged (still idempotent:true).
 		if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
-			s.advanceImplementStageAfterPR(r, runID, stage)
+			if passClaim.claimed {
+				// The guard above proved this pass; a same-attempt replay never dispatches.
+				if !s.applySupplementalOutcome(w, r, runID, stage, &pr, passClaim, reviewDispatchOutcome{}, existing.ID, respondIdempotent) {
+					return
+				}
+			} else {
+				edgeKey := supplementalPassKey{stageID: stage.ID, attempt: run.StageAttemptToken(stage.DispatchedAt), headSHA: pr.HeadSHA}
+				healErr := s.advanceImplementStageAfterPRAtAttempt(r, runID, stage, edgeKey, pr.SupplementalScopeExemptions)
+				if !s.applyEdgeResult(w, r, runID, stage, &pr, edgeKey, healErr, existing.ID, respondIdempotent) {
+					return
+				}
+			}
 		}
-		s.writeJSON(w, r, http.StatusOK, pullRequestResponse{
-			ID:          existing.ID,
-			StageID:     existing.StageID,
-			ContentHash: existing.ContentHash,
-			PRNumber:    pr.PRNumber,
-			PRURL:       pr.PRURL,
-			HeadSHA:     pr.HeadSHA,
-			Idempotent:  true,
-		})
+		respondIdempotent()
 		return
 	} else if !errors.Is(err, artifact.ErrNotFound) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
@@ -834,6 +924,18 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 			"create pull-request artifact failed", map[string]any{"error": err.Error()})
 		return
+	}
+
+	respondCreated := func() {
+		s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
+			ID:          created.ID,
+			StageID:     created.StageID,
+			ContentHash: created.ContentHash,
+			PRNumber:    pr.PRNumber,
+			PRURL:       pr.PRURL,
+			HeadSHA:     pr.HeadSHA,
+			Idempotent:  false,
+		})
 	}
 
 	auditFields := map[string]any{
@@ -964,7 +1066,7 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// category-B BEFORE the runner — which has no view of that verdict —
 	// opens its PR and POSTs here. By now the stage is terminally failed, so
 	// the PR artifact + pull_request_opened audit + URL backfill above stay
-	// honestly recorded but advanceImplementStageAfterPR below is a no-op
+	// honestly recorded but the terminal drive below is skipped
 	// (the stage is not running), leaving the rejected change with an open
 	// PR that will never merge. Detect that exact already-failed state
 	// (implement + failed + category-B + the gating-reject reason prefix,
@@ -977,15 +1079,7 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 		stage.FailureCategory != nil && *stage.FailureCategory == run.FailureB &&
 		stage.FailureReason != nil && strings.HasPrefix(*stage.FailureReason, implementReviewGatingRejectPrefix) {
 		s.closePRAfterGatingReject(r, runID, stage, &pr, created.ID)
-		s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
-			ID:          created.ID,
-			StageID:     created.StageID,
-			ContentHash: created.ContentHash,
-			PRNumber:    pr.PRNumber,
-			PRURL:       pr.PRURL,
-			HeadSHA:     pr.HeadSHA,
-			Idempotent:  false,
-		})
+		respondCreated()
 		return
 	}
 
@@ -998,15 +1092,7 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// stage + emitted the audit + notified; respond and RETURN without
 	// advancing to the review gate.
 	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, pr.PRNumber) {
-		s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
-			ID:          created.ID,
-			StageID:     created.StageID,
-			ContentHash: created.ContentHash,
-			PRNumber:    pr.PRNumber,
-			PRURL:       pr.PRURL,
-			HeadSHA:     pr.HeadSHA,
-			Idempotent:  false,
-		})
+		respondCreated()
 		return
 	}
 
@@ -1029,52 +1115,41 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// stage's terminal transition — the PR is now durably recorded, so open
 	// the review gate. When the stage already advanced (the non-gated flow
 	// where the trace handler transitioned it), it isn't in `running` and
-	// the helper is a no-op — byte-identical to the prior behavior.
+	// this block is skipped — byte-identical to the prior behavior.
 	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
-		// Supplemental base-rebase re-invoke review (#1250, option (b) / ADR-042).
-		// When this success ship carries the re-invoke exemption delta, dispatch
-		// a bounded, additive supplemental implement-review against the PUSHED
-		// re-landed tree BEFORE advancing — this is the durable-tree anchor point
-		// (#742) and the only place the honored delta is known. A gating reject
-		// fails the stage category-B (reusing trace.go's exact path) and closes
-		// the dangling PR (reusing the #877 helper), then responds 201 WITHOUT
-		// advancing — mirroring the already-failed gating-reject block above.
-		// An empty delta (every non-re-invoke ship) skips this entirely and the
-		// response is byte-identical.
-		if len(pr.SupplementalScopeExemptions) > 0 {
-			exemptions := make([]prompt.GateScopeExemption, 0, len(pr.SupplementalScopeExemptions))
-			for _, ex := range pr.SupplementalScopeExemptions {
-				exemptions = append(exemptions, prompt.GateScopeExemption{Path: ex.Path, Reason: ex.Reason})
+		if passClaim.claimed {
+			// A required gating pass (#1250, option (b) / ADR-042; ADR-140 (#5047) D8):
+			// the pushed re-landed tree is the durable anchor, and the pass's recorded
+			// outcome decides the attempt-pinned edge.
+			if !s.settleClaimedUpload(w, r, runID, stage, &pr, passClaim, created.ID, respondCreated) {
+				return
 			}
-			if s.runSupplementalReinvokeReview(r.Context(), runID, stageID, pr.HeadSHA, exemptions) {
-				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, run.FailureB, implementReviewGatingRejectReason); ferr != nil {
-					s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-						"pull-request upload: transition to failed-B after supplemental reinvoke review gating reject failed",
-						slog.String("run_id", runID.String()),
-						slog.String("stage_id", stageID.String()),
-						slog.String("error", ferr.Error()),
-					)
-				} else {
-					// Reload so the failure-state fields the close helper reads
-					// reflect the transition just applied.
-					if failed, gerr := s.cfg.RunRepo.GetStage(r.Context(), stageID); gerr == nil {
-						stage = failed
-					}
-					s.closePRAfterGatingReject(r, runID, stage, &pr, created.ID)
-				}
-				s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
-					ID:          created.ID,
-					StageID:     created.StageID,
-					ContentHash: created.ContentHash,
-					PRNumber:    pr.PRNumber,
-					PRURL:       pr.PRURL,
-					HeadSHA:     pr.HeadSHA,
-					Idempotent:  false,
-				})
+		} else {
+			// An advisory pass runs detached and decides nothing; a non-re-invoke ship
+			// has an empty delta and dispatches nothing. Any other outcome means the
+			// requirement changed since the claim, so nothing moves and a replay decides.
+			advisoryOutcome := s.dispatchSupplementalReinvokeReview(r.Context(), runID, stageID, pr.HeadSHA, "", gateScopeExemptions(pr.SupplementalScopeExemptions))
+			if advisoryOutcome != (reviewDispatchOutcome{}) {
+				s.writeSupplementalEdgeError(w, r, errors.New("supplemental pass requirement changed after the claim"))
+				return
+			}
+			// The ordinary edge (D8, D9): one stage-then-run-locked transaction re-reads
+			// recorded evidence, so a reject or a start committed after every read above
+			// still binds. The empty token of a nil-dispatched legacy stage matches only
+			// that exact identity; it is never a wildcard.
+			edgeKey := supplementalPassKey{stageID: stage.ID, attempt: run.StageAttemptToken(stage.DispatchedAt), headSHA: pr.HeadSHA}
+			ordinaryErr := s.advanceImplementStageAfterPRAtAttempt(r, runID, stage, edgeKey, pr.SupplementalScopeExemptions)
+			if !s.applyEdgeResult(w, r, runID, stage, &pr, edgeKey, ordinaryErr, created.ID, respondCreated) {
 				return
 			}
 		}
-		s.advanceImplementStageAfterPR(r, runID, stage)
+	}
+
+	// A settled stage whose head holds a recorded binding reject must not announce
+	// an opened PR. A read error stays silent too; the artifact and its row stand.
+	if stage.Type == run.StageTypeImplement && s.headRejectBlocksNotify(r.Context(), runID, stageID, pr.HeadSHA) {
+		respondCreated()
+		return
 	}
 
 	// Sticky status comment (E20.4 / #330). The PR-opened transition
@@ -1087,15 +1162,233 @@ func (s *Server) handleShipPullRequest(w http.ResponseWriter, r *http.Request) {
 	// the in_review canonical state. Best-effort; never unwinds the response.
 	s.notifyBoardTransition(r.Context(), runID, lifecyclePROpened)
 
-	s.writeJSON(w, r, http.StatusCreated, pullRequestResponse{
-		ID:          created.ID,
-		StageID:     created.StageID,
-		ContentHash: created.ContentHash,
-		PRNumber:    pr.PRNumber,
-		PRURL:       pr.PRURL,
-		HeadSHA:     pr.HeadSHA,
-		Idempotent:  false,
+	respondCreated()
+}
+
+// gateScopeExemptions converts an upload's exemption delta to the review prompt's
+// shape. An empty delta dispatches nothing.
+func gateScopeExemptions(exemptions []scopeExemption) []prompt.GateScopeExemption {
+	out := make([]prompt.GateScopeExemption, 0, len(exemptions))
+	for _, ex := range exemptions {
+		out = append(out, prompt.GateScopeExemption{Path: ex.Path, Reason: ex.Reason})
+	}
+	return out
+}
+
+// guardedEdgeAvailable reports whether the guarded terminal edge exists. Without
+// it an implement stage's success edge cannot be taken, so an upload is refused
+// before any artifact is written.
+func (s *Server) guardedEdgeAvailable() bool {
+	_, ok := supplementalGuardedEdge(s)
+	return ok
+}
+
+// writeSupplementalEdgeError answers a fault deciding an upload's stage edge: a
+// static 500 with the cause kept off the client, nothing moved, and a replay decides.
+func (s *Server) writeSupplementalEdgeError(w http.ResponseWriter, r *http.Request, cause error) {
+	s.writeError(w, r, http.StatusInternalServerError, "internal_error",
+		"the pull-request upload could not be decided; nothing advanced, and a retry of the same upload decides",
+		map[string]any{internalCauseKey: cause.Error()})
+}
+
+// writeReviewObligationMissing refuses an upload or report that would skip a
+// recorded required review: nothing is created, moved, closed or notified.
+func (s *Server) writeReviewObligationMissing(w http.ResponseWriter, r *http.Request, runID, stageID uuid.UUID, outcome string, missingCount int) {
+	details := map[string]any{
+		"run_id":        runID.String(),
+		"stage_id":      stageID.String(),
+		"missing_count": missingCount,
+	}
+	if outcome != "" {
+		details["outcome"] = outcome
+	}
+	s.writeError(w, r, http.StatusConflict, "review_obligation_missing",
+		"this head has a recorded required supplemental review with no completed pass; re-upload with the recorded paths or retry the stage with fishhawk_retry_stage",
+		details)
+}
+
+// supplementalArtifactPrecedesAttempt reports whether an artifact predates the
+// running stage's current attempt: the one case a replayed upload may start a pass.
+// A nil DispatchedAt has no attempt to precede.
+func supplementalArtifactPrecedesAttempt(stage *run.Stage, existing *artifact.Artifact) bool {
+	return stage.State == run.StageStateRunning && stage.DispatchedAt != nil && existing.CreatedAt.Before(*stage.DispatchedAt)
+}
+
+// supplementalEdgeRefused reports the compare-and-swap's own refusal: the stage
+// left running or moved to another attempt, so this request owns no edge.
+func supplementalEdgeRefused(err error) bool {
+	var stateChanged run.StageStateChangedError
+	var attemptChanged run.StageAttemptChangedError
+	return errors.As(err, &stateChanged) || errors.As(err, &attemptChanged)
+}
+
+// headRejectBlocksNotify reports a recorded binding reject at this head, failing
+// closed to silence on a read or decode fault.
+func (s *Server) headRejectBlocksNotify(ctx context.Context, runID, stageID uuid.UUID, headSHA string) bool {
+	rows, err := s.listGuardRows(ctx, runID, []string{implementReviewedCategory})
+	if err == nil {
+		err = recordedRejectAtHead(rows, stageID, headSHA)
+	}
+	if err == nil {
+		return false
+	}
+	var headRejected *supplementalHeadRejectedError
+	if !errors.As(err, &headRejected) {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "pull-request upload: recorded verdicts unreadable; skipping the pr_opened notification",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", err.Error()))
+	}
+	return true
+}
+
+// settleClaimedUpload runs a claimed upload's required pass and applies its edge.
+// Create and re-entry share it. true means the success edge was
+// applied and the caller answers normally; false means a response is written. The
+// checks run in the dispatcher's documented order and none of the no-decision
+// outcomes moves the stage. The context check comes before the write failure, so a
+// deadline or shutdown stays interrupted.
+func (s *Server) settleClaimedUpload(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, passClaim supplementalPassClaim, artifactID uuid.UUID, respond func()) bool {
+	stageID := stage.ID
+	exemptions := gateScopeExemptions(pr.SupplementalScopeExemptions)
+	supplementalOutcome := s.dispatchSupplementalReinvokeReview(r.Context(), runID, stageID, pr.HeadSHA, passClaim.key.attempt, exemptions)
+	if supplementalOutcome.interrupted {
+		s.writeReviewRoundInterrupted(w, r, runID, stageID, "implement")
+		return false
+	}
+	if supplementalOutcome.undecided {
+		s.writeSupplementalEdgeError(w, r, errors.New("the supplemental pass could not be proved or built"))
+		return false
+	}
+	if supplementalCtxErr := r.Context().Err(); supplementalCtxErr != nil {
+		s.writeReviewRoundInterrupted(w, r, runID, stageID, "implement")
+		return false
+	}
+	if supplementalOutcome.evidenceWriteFailed {
+		s.writeSupplementalEdgeError(w, r, errors.New("a supplemental verdict's terminal write was lost"))
+		return false
+	}
+	return s.applySupplementalOutcome(w, r, runID, stage, pr, passClaim, supplementalOutcome, artifactID, respond)
+}
+
+// applySupplementalOutcome is the edge for every claimed path: create, re-entry,
+// healed replay and discharged omission. A recorded block or a reject found under
+// the lock fails the claim's attempt category B and closes the PR only after that
+// edge wins. Only a nil edge error reports true, which is what notifies.
+func (s *Server) applySupplementalOutcome(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, passClaim supplementalPassClaim, outcome reviewDispatchOutcome, artifactID uuid.UUID, respond func()) bool {
+	if outcome.blocked() {
+		s.failClaimedStage(r, runID, stage, pr, passClaim, outcome.blockReason, artifactID)
+		respond()
+		return false
+	}
+	advanceErr := s.advanceImplementStageAfterPRAtAttempt(r, runID, stage, passClaim.key, pr.SupplementalScopeExemptions)
+	var passIncomplete *supplementalPassIncompleteError
+	if errors.As(advanceErr, &passIncomplete) {
+		s.writeReviewRoundInterrupted(w, r, runID, stage.ID, "implement")
+		return false
+	}
+	var headRejected *supplementalHeadRejectedError
+	if errors.As(advanceErr, &headRejected) {
+		s.failClaimedStage(r, runID, stage, pr, passClaim, implementReviewGatingRejectReason, artifactID)
+		respond()
+		return false
+	}
+	if supplementalEdgeRefused(advanceErr) {
+		respond()
+		return false
+	}
+	if advanceErr != nil {
+		s.writeSupplementalEdgeError(w, r, advanceErr)
+		return false
+	}
+	return true
+}
+
+// failClaimedStage takes the attempt-pinned failed edge. A refused edge means a
+// newer attempt or a settled stage owns the row, so no PR closes after it.
+func (s *Server) failClaimedStage(r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, passClaim supplementalPassClaim, reason string, artifactID uuid.UUID) {
+	stageID := stage.ID
+	rejectCompletion := gatingRejectCompletion(reason)
+	failed, ferr := s.transitionStageAtAttempt(r.Context(), stageID, passClaim.key.attempt, run.StageStateFailed, &rejectCompletion)
+	if ferr != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"pull-request upload: transition to failed-B after supplemental reinvoke review gating reject failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", ferr.Error()),
+		)
+		return
+	}
+	stage = failed
+	s.closePRAfterGatingReject(r, runID, stage, pr, artifactID)
+}
+
+// gatingRejectCompletion is a gating reject's category-B completion.
+func gatingRejectCompletion(reason string) run.StageCompletion {
+	category := run.FailureB
+	return run.StageCompletion{FailureCategory: &category, FailureReason: &reason}
+}
+
+// transitionStageAtIdentity is the unclaimed path's failed edge, pinned to the
+// handler's read identity. A token takes the attempt-pinned edge. An empty token
+// takes the guarded capability's exact legacy comparison, because
+// TransitionStageFromAttempt treats an empty token as no comparison at all.
+func (s *Server) transitionStageAtIdentity(ctx context.Context, stageID uuid.UUID, attempt string, to run.StageState, completion *run.StageCompletion) (*run.Stage, error) {
+	if attempt != "" {
+		return s.transitionStageAtAttempt(ctx, stageID, attempt, to, completion)
+	}
+	g, ok := supplementalGuardedEdge(s)
+	if !ok {
+		return nil, errSupplementalAttemptCASAbsent
+	}
+	return g.TransitionStageFromAttemptGuarded(ctx, stageID, run.StageStateRunning, to, "", completion, run.StageEdgeGuard{
+		Categories:     []string{implementReviewedCategory},
+		Decide:         func([]run.StageEdgeGuardRow) error { return nil },
+		LegacyIdentity: true,
 	})
+}
+
+// applyEdgeResult maps an unclaimed upload's terminal edge error to its response.
+// true means the edge was applied. A recorded reject takes the existing category-B
+// treatment on this request's identity; an unmet obligation and a lost pass move
+// nothing; drift means this request owns no edge; any other fault answers 500 and
+// a replay decides.
+func (s *Server) applyEdgeResult(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, edgeKey supplementalPassKey, ordinaryErr error, artifactID uuid.UUID, respond func()) bool {
+	var passIncomplete *supplementalPassIncompleteError
+	if errors.As(ordinaryErr, &passIncomplete) {
+		s.writeReviewRoundInterrupted(w, r, runID, stage.ID, "implement")
+		return false
+	}
+	var headRejected *supplementalHeadRejectedError
+	if errors.As(ordinaryErr, &headRejected) {
+		rejectCompletion := gatingRejectCompletion(implementReviewGatingRejectReason)
+		failed, ierr := s.transitionStageAtIdentity(r.Context(), stage.ID, edgeKey.attempt, run.StageStateFailed, &rejectCompletion)
+		if ierr != nil {
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"pull-request upload: transition to failed-B over a recorded gating reject failed",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", ierr.Error()))
+		} else {
+			s.closePRAfterGatingReject(r, runID, failed, pr, artifactID)
+		}
+		respond()
+		return false
+	}
+	var obligationUnmet *reviewObligationUnmetError
+	if errors.As(ordinaryErr, &obligationUnmet) {
+		s.writeReviewObligationMissing(w, r, runID, stage.ID, "", len(obligationUnmet.missing))
+		return false
+	}
+	if supplementalEdgeRefused(ordinaryErr) {
+		respond()
+		return false
+	}
+	if ordinaryErr != nil {
+		s.writeSupplementalEdgeError(w, r, ordinaryErr)
+		return false
+	}
+	return true
 }
 
 // pullRequestResponse echoes the persisted artifact's identity back
@@ -1132,48 +1425,176 @@ type pullRequestChildPushResponse struct {
 	HeadSHA string    `json:"head_sha"`
 }
 
-// advanceImplementStageAfterPR drives the implement stage's terminal
-// transition once the PR artifact has landed (#742). The trace handler's
-// push-and-open-pr gate leaves the stage in `running` until the
-// /pull-request upload arrives, so this handler owns the running →
-// awaiting_approval (gated) or running → succeeded (gateless) transition,
-// mirroring advancePlanStageTerminal (#603).
-//
-// Best-effort: transition / advance errors are WARN-logged and never
-// unwind the upload response — the PR artifact + URL backfill are already
-// in place, and a stuck stage is recoverable via GET /v0/runs/{id}/stages.
-func (s *Server) advanceImplementStageAfterPR(r *http.Request, runID uuid.UUID, stage *run.Stage) {
-	terminal := run.StageStateAwaitingApproval
-	if !stage.RequiresApproval {
-		terminal = run.StageStateSucceeded
+// implementStageTerminalState is the terminal state an implement stage's success
+// edge takes: its approval gate, or succeeded on a gateless stage.
+func implementStageTerminalState(stage *run.Stage) run.StageState {
+	if stage.RequiresApproval {
+		return run.StageStateAwaitingApproval
 	}
-	if _, err := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, terminal, nil); err != nil {
+	return run.StageStateSucceeded
+}
+
+// advanceImplementStageAfterPR is the unguarded generic edge (#742). No upload
+// route takes it since ADR-140 (#5047): each takes a guarded edge below, so
+// recorded evidence decides. It shares driveImplementStageTerminal with them and
+// keeps the original contract: an error is WARN-logged and never returned.
+func (s *Server) advanceImplementStageAfterPR(r *http.Request, runID uuid.UUID, stage *run.Stage) {
+	err := s.driveImplementStageTerminal(r, runID, stage, func(terminal run.StageState) error {
+		_, terr := s.cfg.RunRepo.TransitionStage(r.Context(), stage.ID, terminal, nil)
+		return terr
+	})
+	if err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"pull-request upload: transition implement stage to terminal failed",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stage.ID.String()),
-			slog.String("target", string(terminal)),
+			slog.String("target", string(implementStageTerminalState(stage))),
 			slog.String("error", err.Error()))
+	}
+}
+
+// advanceImplementStageAfterPRAtAttempt is every plain upload's success edge
+// (ADR-140 (#5047) D8, D9). supplementalEdgeGuard re-reads recorded evidence after
+// the run lock and commits before release, so evidence committed after this
+// request's last read still binds. key.attempt is read once from the handler's
+// stage; empty serves only an unclaimed legacy stage's exact identity.
+func (s *Server) advanceImplementStageAfterPRAtAttempt(r *http.Request, runID uuid.UUID, stage *run.Stage, key supplementalPassKey, bodyExemptions []scopeExemption) error {
+	guard := supplementalEdgeGuard(stage.ID, key.headSHA, key.attempt, bodyExemptions)
+	guard.LegacyIdentity = key.attempt == ""
+	return s.driveImplementStageTerminal(r, runID, stage, func(terminal run.StageState) error {
+		return s.transitionStageAtAttemptGuarded(r.Context(), stage.ID, key.attempt, terminal, guard)
+	})
+}
+
+// driveImplementStageTerminal applies transition to the stage's terminal state,
+// mirroring advancePlanStageTerminal (#603). The trace handler's push-and-open-pr
+// gate leaves the stage in `running` until the /pull-request upload arrives. Only
+// after the write wins does a gateless stage, which gets no approval submission to
+// drive the next dispatch, fire the orchestrator; that is best-effort.
+func (s *Server) driveImplementStageTerminal(r *http.Request, runID uuid.UUID, stage *run.Stage, transition func(run.StageState) error) error {
+	terminal := implementStageTerminalState(stage)
+	if err := transition(terminal); err != nil {
+		return err
+	}
+	s.advanceOrchestratorAfterImplementTerminal(r, runID, stage, terminal)
+	return nil
+}
+
+// advanceOrchestratorAfterImplementTerminal fires the orchestrator for a gateless
+// stage whose terminal edge was just won.
+func (s *Server) advanceOrchestratorAfterImplementTerminal(r *http.Request, runID uuid.UUID, stage *run.Stage, terminal run.StageState) {
+	if terminal != run.StageStateSucceeded || s.cfg.Orchestrator == nil {
 		return
 	}
-
-	// Gateless stages get no approval submission to drive the next dispatch
-	// — fire the orchestrator ourselves. Best-effort, like the plan handler.
-	if terminal == run.StageStateSucceeded && s.cfg.Orchestrator != nil {
-		if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
-			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
-				"pull-request upload: orchestrator advance after gateless implement stage failed",
-				slog.String("run_id", runID.String()),
-				slog.String("stage_id", stage.ID.String()),
-				slog.String("error", err.Error()))
-		}
+	if _, err := s.cfg.Orchestrator.Advance(r.Context(), runID); err != nil {
+		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+			"pull-request upload: orchestrator advance after gateless implement stage failed",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("error", err.Error()))
 	}
+}
+
+// variantRefused reports recorded binding evidence refusing an alternative outcome.
+func variantRefused(err error) bool {
+	var headRejected *supplementalHeadRejectedError
+	var obligationUnmet *reviewObligationUnmetError
+	return errors.As(err, &headRejected) || errors.As(err, &obligationUnmet)
+}
+
+// variantMissingCount is the refusal's missing_count: a reject has no missing path.
+func variantMissingCount(err error) int {
+	var obligationUnmet *reviewObligationUnmetError
+	if errors.As(err, &obligationUnmet) {
+		return len(obligationUnmet.missing)
+	}
+	return 0
+}
+
+// advanceVariantStageAfterReport is the terminal edge for the four alternative
+// success outcomes (ADR-140 (#5047) D8, D9). The handler selects its variant from a
+// runner-supplied spelling, so server evidence decides: variantEdgeGuard reads mode
+// rows, rejects and starts after the run lock, and the attempt or legacy identity is
+// compared before commit. true means the caller writes its normal row, notifications
+// and response. false means a response is written with no row: a row would consume a
+// newer attempt's trigger, or record a refused claim as landed. Called after a
+// handler's dedup and lineage checks, so replays stay byte-identical.
+func (s *Server) advanceVariantStageAfterReport(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, respond func()) bool {
+	if stage.Type != run.StageTypeImplement {
+		return true
+	}
+	if stage.State != run.StageStateRunning {
+		settledRefused, missingCount, settledErr := s.variantRefusedOnSettledStage(r.Context(), runID, stage, pr)
+		if settledErr != nil {
+			s.writeSupplementalEdgeError(w, r, settledErr)
+			return false
+		}
+		if settledRefused {
+			s.writeReviewObligationMissing(w, r, runID, stage.ID, pr.Outcome, missingCount)
+			return false
+		}
+		return true
+	}
+	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
+	if err != nil {
+		s.writeSupplementalEdgeError(w, r, err)
+		return false
+	}
+	isChild := runRow.DecomposedFrom != nil
+	if !s.guardedEdgeAvailable() {
+		s.writeSupplementalEdgeError(w, r, errSupplementalAttemptCASAbsent)
+		return false
+	}
+	attempt := run.StageAttemptToken(stage.DispatchedAt)
+	terminal := implementStageTerminalState(stage)
+	variantErr := s.transitionStageAtAttemptGuarded(r.Context(), stage.ID, attempt, terminal, variantEdgeGuard(pr.Outcome, stage.ID, pr.HeadSHA, attempt, isChild))
+	var passIncomplete *supplementalPassIncompleteError
+	if errors.As(variantErr, &passIncomplete) {
+		s.writeReviewRoundInterrupted(w, r, runID, stage.ID, "implement")
+		return false
+	}
+	if variantRefused(variantErr) {
+		s.writeReviewObligationMissing(w, r, runID, stage.ID, pr.Outcome, variantMissingCount(variantErr))
+		return false
+	}
+	if supplementalEdgeRefused(variantErr) {
+		respond()
+		return false
+	}
+	if variantErr != nil {
+		s.writeSupplementalEdgeError(w, r, variantErr)
+		return false
+	}
+	s.advanceOrchestratorAfterImplementTerminal(r, runID, stage, terminal)
+	return true
+}
+
+// variantRefusedOnSettledStage applies the variant guard's reducer over an outside
+// read when the stage already left running and so takes no edge. A wrong claim
+// writes no row, reopens no acceptance, republishes nothing and notifies nothing. A
+// read or decode fault is returned, never read as no evidence.
+func (s *Server) variantRefusedOnSettledStage(ctx context.Context, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody) (refused bool, missingCount int, err error) {
+	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
+	if err != nil {
+		return false, 0, err
+	}
+	guard := variantEdgeGuard(pr.Outcome, stage.ID, pr.HeadSHA, run.StageAttemptToken(stage.DispatchedAt), runRow.DecomposedFrom != nil)
+	rows, err := s.listGuardRows(ctx, runID, guard.Categories)
+	if err != nil {
+		return false, 0, err
+	}
+	decided := guard.Decide(rows)
+	var passIncomplete *supplementalPassIncompleteError
+	if variantRefused(decided) || errors.As(decided, &passIncomplete) {
+		return true, variantMissingCount(decided), nil
+	}
+	return false, 0, decided
 }
 
 // succeedChildPushStage handles the child-push success variant (#771): a
 // decomposed child committed + pushed onto the shared parent branch (no PR)
 // after the trace gate left the child implement stage in `running`. It drives
-// the running → terminal transition via advanceImplementStageAfterPR (a no-op
+// the running → terminal transition via advanceVariantStageAfterReport (a no-op
 // if the stage already advanced — e.g. an older runner that never gated),
 // writes a child_pushed audit entry pinning the shared-branch commit into the
 // chain, fires the sticky status comment, and responds 200. No PR artifact,
@@ -1211,18 +1632,21 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 	// parent run opens the consolidated PR later — so the anchor resolves
 	// from the run's tracked pull_request_url (0 = unknown → fail open). A
 	// foreign commit on the shared branch fails the stage category-B here.
-	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, 0) {
+	respondPushed := func() {
 		s.writeJSON(w, r, http.StatusOK, pullRequestChildPushResponse{
 			StageID: stageID,
 			Outcome: "pushed",
 			Branch:  pr.Branch,
 			HeadSHA: pr.HeadSHA,
 		})
+	}
+	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, 0) {
+		respondPushed()
 		return
 	}
 
-	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
-		s.advanceImplementStageAfterPR(r, runID, stage)
+	if !s.advanceVariantStageAfterReport(w, r, runID, stage, pr, respondPushed) {
+		return
 	}
 
 	auditPayload, _ := json.Marshal(map[string]any{
@@ -1252,12 +1676,7 @@ func (s *Server) succeedChildPushStage(w http.ResponseWriter, r *http.Request, r
 
 	s.notifyStatusUpdate(r.Context(), runID, "child_pushed")
 
-	s.writeJSON(w, r, http.StatusOK, pullRequestChildPushResponse{
-		StageID: stageID,
-		Outcome: "pushed",
-		Branch:  pr.Branch,
-		HeadSHA: pr.HeadSHA,
-	})
+	respondPushed()
 }
 
 // pullRequestFixupPushResponse is the 200 body for the fix-up push success
@@ -1273,7 +1692,7 @@ type pullRequestFixupPushResponse struct {
 // succeedFixupPushStage handles the fix-up push success variant (#794): a
 // fix-up re-dispatch committed + pushed onto the EXISTING PR branch (no new PR)
 // after the trace gate left the fix-up implement stage in `running`. It drives
-// the running → terminal transition via advanceImplementStageAfterPR (a no-op
+// the running → terminal transition via advanceVariantStageAfterReport (a no-op
 // if the stage already advanced — e.g. an older runner that never gated), writes
 // a fixup_pushed audit entry pinning the pushed commit into the chain, fires the
 // sticky status comment, and responds 200. No PR artifact, no pull_request_url
@@ -1324,18 +1743,21 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 	// base ref (0 = no body PR number → resolved from the run). A foreign
 	// commit on the PR branch fails the stage category-B here instead of
 	// advancing the fix-up review gate.
-	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, 0) {
+	respondFixupPushed := func() {
 		s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
 			StageID: stageID,
 			Outcome: "fixup_pushed",
 			Branch:  pr.Branch,
 			HeadSHA: pr.HeadSHA,
 		})
+	}
+	if !s.verifyBranchLineage(r.Context(), runID, stage, pr.HeadSHA, 0) {
+		respondFixupPushed()
 		return
 	}
 
-	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
-		s.advanceImplementStageAfterPR(r, runID, stage)
+	if !s.advanceVariantStageAfterReport(w, r, runID, stage, pr, respondFixupPushed) {
+		return
 	}
 
 	auditFields := map[string]any{
@@ -1404,12 +1826,7 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 
 	s.notifyOperatorVisible(r.Context(), runID, CategoryFixupPushed)
 
-	s.writeJSON(w, r, http.StatusOK, pullRequestFixupPushResponse{
-		StageID: stageID,
-		Outcome: "fixup_pushed",
-		Branch:  pr.Branch,
-		HeadSHA: pr.HeadSHA,
-	})
+	respondFixupPushed()
 }
 
 // pullRequestFixupNoChangesResponse is the 200 body for the fix-up no-changes
@@ -1424,7 +1841,7 @@ type pullRequestFixupNoChangesResponse struct {
 // succeedFixupNoChangesStage handles the fix-up no-changes variant (#856): a
 // fix-up re-dispatch produced no changes (the fix-up pass committed nothing)
 // after the trace gate left the fix-up implement stage in `running`. It drives
-// the running → terminal transition via advanceImplementStageAfterPR (which
+// the running → terminal transition via advanceVariantStageAfterReport (which
 // re-parks the review gate pending → awaiting_approval), writes a
 // fixup_no_changes audit entry, fires the sticky status comment, and responds
 // 200. No PR artifact, no pull_request_url backfill — the PR already exists and
@@ -1465,8 +1882,14 @@ func (s *Server) succeedFixupNoChangesStage(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
-	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
-		s.advanceImplementStageAfterPR(r, runID, stage)
+	if !s.advanceVariantStageAfterReport(w, r, runID, stage, pr, func() {
+		s.writeJSON(w, r, http.StatusOK, pullRequestFixupNoChangesResponse{
+			StageID: stageID,
+			Outcome: "fixup_no_changes",
+			Branch:  pr.Branch,
+		})
+	}) {
+		return
 	}
 
 	auditPayload, _ := json.Marshal(map[string]any{
@@ -1618,6 +2041,24 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 	if pr.Body != "" {
 		payloadMap["pr_body"] = pr.Body
 	}
+	// A required review known at park time survives the exempt resume (ADR-140
+	// (#5047) D9). A park reporting a non-empty obligation withholds base_sha from
+	// the two places an older resolver reads, so its exempt retry takes its existing
+	// no-base refusal and re-runs the agent rather than dropping the review; only the
+	// current resolver reads the true value, under its own key. No field holds a false
+	// value. An invalid report is left out, but still withholds the base.
+	parkObligationValid := false
+	if pr.ReviewObligation != nil && validateReviewObligationReport(pr.ReviewObligation, resumeKindPROpen, pr.HeadSHA, stage) == nil {
+		parkObligationValid = true
+		payloadMap["review_obligation"] = pr.ReviewObligation
+	}
+	if parkObligationWithholdsBase(pr.ReviewObligation) {
+		park.BaseSHA = ""
+		delete(payloadMap, "base_sha")
+		if parkObligationValid {
+			payloadMap["required_review_base_sha"] = pr.BaseSHA
+		}
+	}
 	auditPayload, _ := json.Marshal(payloadMap)
 	appendParams := audit.ChainAppendParams{
 		RunID:        runID,
@@ -1681,6 +2122,12 @@ func (s *Server) parkScopeCompletenessStage(w http.ResponseWriter, r *http.Reque
 		Branch:  pr.Branch,
 		HeadSHA: pr.HeadSHA,
 	})
+}
+
+// parkObligationWithholdsBase reports a park whose base_sha an older resolver must
+// not read. Validity does not matter: a non-empty set is never resumed unreviewed.
+func parkObligationWithholdsBase(o *reviewObligation) bool {
+	return o != nil && len(o.SupplementalScopeExemptions) > 0
 }
 
 // auditEntryForStage reports whether any of the entries belongs to the given
@@ -1748,6 +2195,23 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// update the same *Stage in place.
 	wasFailed := stage.State == run.StageStateFailed
 	newlyFailedC := false
+	// A required review reported with the held commit (ADR-140 (#5047) D9) is read
+	// here, before FailStage may update the same *Stage. An invalid report cannot bind
+	// this stage and is never laundered onto any carrier.
+	obligationInvalid := false
+	if pr.ReviewObligation != nil && pr.Branch != "" && pr.HeadSHA != "" {
+		if verr := validateReviewObligationReport(pr.ReviewObligation, pr.ResumeKind, pr.HeadSHA, stage); verr != nil {
+			obligationInvalid = true
+			s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+				"pull-request failure report: review obligation refused; recording no checkpoint",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stage.ID.String()),
+				slog.String("error", verr.Error()))
+		}
+	}
+	obligatedCheckpoint := !obligationInvalid && pr.Branch != "" && pr.HeadSHA != "" &&
+		reviewObligationKnowledge(pr.ReviewObligation) == obligationKnownRequired &&
+		(pr.ResumeKind == "" || pr.ResumeKind == resumeKindPush)
 	if _, err := run.FailStage(r.Context(), s.cfg.RunRepo, stage.ID, cat, pr.Reason); err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"pull-request failure report: fail stage failed",
@@ -1848,8 +2312,12 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	// unrecognized kind records NOTHING here and no checkpoint anywhere, so the
 	// retry fails SAFE to a full agent re-run rather than opening a PR on a
 	// branch whose push this backend cannot vouch for.
+	//
+	// A known-required report skips this payload too and is stored under its own
+	// category below (the rollback property of ADR-140 (#5047) D9), and an invalid
+	// obligation records no checkpoint of any kind.
 	if pr.Outcome == "failed" && pr.Branch != "" && pr.HeadSHA != "" &&
-		pr.ResumeKind == "" {
+		pr.ResumeKind == "" && !obligationInvalid && !obligatedCheckpoint {
 		checkpoint := map[string]any{
 			"branch":            pr.Branch,
 			"head_sha":          pr.HeadSHA,
@@ -1868,6 +2336,7 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 		if pr.Body != "" {
 			checkpoint["pr_body"] = pr.Body
 		}
+		stampReviewObligation(checkpoint, pr)
 		payloadFields["push_checkpoint"] = checkpoint
 	}
 	auditPayload, _ := json.Marshal(payloadFields)
@@ -1887,9 +2356,39 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 			slog.String("error", err.Error()))
 	}
 
+	// ADR-140 (#5047) D9, AFTER the pull_request_failed entry so the carrier is
+	// strictly NEWER. A reverify kind cannot reach it: its report validates only with
+	// an empty set.
+	if obligatedCheckpoint {
+		kind := resumeKindPROpen
+		if pr.ResumeKind == resumeKindPush {
+			kind = resumeKindPush
+		}
+		s.recordReviewObligationCheckpoint(r.Context(), runID, stageID, kind, pushCheckpointPayload{
+			Branch:          pr.Branch,
+			HeadSHA:         pr.HeadSHA,
+			BaseSHA:         pr.BaseSHA,
+			VerifiedTreeSHA: pr.VerifiedTreeSHA,
+			PRTitle:         pr.Title,
+			PRBody:          pr.Body,
+		}, pr.ReviewObligation, actorKind, actorSubject)
+	}
+	if obligationInvalid {
+		s.appendVerifiedTreeDiscarded(r.Context(), runID, stageID, pushCheckpointPayload{
+			Branch:          pr.Branch,
+			HeadSHA:         pr.HeadSHA,
+			BaseSHA:         pr.BaseSHA,
+			VerifiedTreeSHA: pr.VerifiedTreeSHA,
+		}, "review_obligation_invalid")
+	}
+
 	// E45.86 / #3621, AFTER the pull_request_failed entry so the checkpoint row
 	// is strictly NEWER and wins the resolver's newest-wins comparison.
-	switch pr.ResumeKind {
+	resumeKind := pr.ResumeKind
+	if obligationInvalid || obligatedCheckpoint {
+		resumeKind = ""
+	}
+	switch resumeKind {
 	case resumeKindPush:
 		s.recordPushResumeCheckpoint(r.Context(), runID, stageID, CategoryPushResumeCheckpoint, resumeKindPush, pr, actorKind, actorSubject)
 	case resumeKindReverify:
@@ -1964,6 +2463,7 @@ func (s *Server) recordPushResumeCheckpoint(ctx context.Context, runID, stageID 
 	if pr.Body != "" {
 		checkpoint["pr_body"] = pr.Body
 	}
+	stampReviewObligation(checkpoint, pr)
 	payload, err := json.Marshal(map[string]any{
 		"run_id":          runID.String(),
 		"stage_id":        stageID.String(),
@@ -1990,6 +2490,16 @@ func (s *Server) recordPushResumeCheckpoint(ctx context.Context, runID, stageID 
 			slog.String("category", category),
 			slog.String("error", err.Error()))
 	}
+}
+
+// stampReviewObligation adds the known-none marker to an existing carrier. Only
+// that state reaches a carrier: known-required has its own category, and an absent
+// or null list stays absent, keeping every older checkpoint byte-identical.
+func stampReviewObligation(checkpoint map[string]any, pr *pullRequestBody) {
+	if reviewObligationKnowledge(pr.ReviewObligation) != obligationKnownNone {
+		return
+	}
+	checkpoint["review_obligation"] = pr.ReviewObligation
 }
 
 // closePRAfterGatingReject closes the dangling PR the runner just opened
@@ -2118,7 +2628,7 @@ type pullRequestConflictResolutionResponse struct {
 // commit and pushed it to the EXISTING PR branch after the trace gate left the
 // stage in `running`.
 //
-// It drives the running → terminal transition via advanceImplementStageAfterPR
+// It drives the running → terminal transition via advanceVariantStageAfterReport
 // (which re-parks the review gate pending → awaiting_approval — the merge
 // commit is new code and a mechanical resolution is not a substitute for
 // review), writes a conflict_resolution_pushed audit entry, fires the sticky
@@ -2158,8 +2668,15 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 		return
 	}
 
-	if stage.Type == run.StageTypeImplement && stage.State == run.StageStateRunning {
-		s.advanceImplementStageAfterPR(r, runID, stage)
+	if !s.advanceVariantStageAfterReport(w, r, runID, stage, pr, func() {
+		s.writeJSON(w, r, http.StatusOK, pullRequestConflictResolutionResponse{
+			StageID: stageID,
+			Outcome: "conflict_resolution_pushed",
+			Branch:  pr.Branch,
+			HeadSHA: pr.HeadSHA,
+		})
+	}) {
+		return
 	}
 
 	auditPayload, _ := json.Marshal(map[string]any{
