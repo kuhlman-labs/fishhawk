@@ -1,0 +1,14 @@
+id: scenario:issue-5107/adr-142-body-exact
+statement: The bytes after the H1 and its following blank line in docs/adr/142-merge-verification-after-scenario-commits.md hash to normalized SHA-256 13a6b0f204e08a947b3e7c4976d1941808d6ab82d8b365584187d70b2ac4bac2, and without the single trailing LF they are 10,324 bytes hashing to 001778a11169a249fb3e492c7ff879a990dd875d2efafb36eff7e18957bf7e8f.
+verify_hint: 'CLI: extract the body from the committed file with tail and head, and compare wc -c and shasum -a 256 stdout with the two stated values.'
+steps: 'Posture B: in the sanctioned checkout, the H1 of docs/adr/142-merge-verification-after-scenario-commits.md is on line 13. Run tail -n +15 on the file into a scratch file, then wc -c and shasum -a 256; run head -c 10324 on it through shasum -a 256; check the final byte with xxd. Repeat independently with a Python byte parse of front matter, H1 and blank line, and count CR bytes.'
+assertions:
+    expected: Normalized sha256 13a6b0f2...4bac2; without the trailing LF, 10,324 bytes hashing to 001778a1...f7e8f.
+    observed_at_record: Normalized 10325 bytes, sha256 13a6b0f204e08a947b3e7c4976d1941808d6ab82d8b365584187d70b2ac4bac2, one trailing LF. Raw 10324 bytes, sha256 001778a11169a249fb3e492c7ff879a990dd875d2efafb36eff7e18957bf7e8f. 0 CR bytes. Both methods agree.
+    repro_handle: tail -n +15 docs/adr/142-merge-verification-after-scenario-commits.md | shasum -a 256
+origin:
+    issue: 5107
+    pr: 5110
+    run_id: 740bbdb1-46f7-4eca-948a-ad5357e121be
+    head_sha: b70b2856cf19ac3e62c3327e3a268af19a28b21e
+    recorded_at: 2026-11-06T18:33:30Z

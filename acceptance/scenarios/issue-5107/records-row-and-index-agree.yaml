@@ -1,0 +1,14 @@
+id: scenario:issue-5107/records-row-and-index-agree
+statement: docs/adr/README.md carries exactly one ADR-142 Records row whose record link, title and status agree with ADR-142's docs/adr/index.json entry, and whose issue URL equals ADR-142 record front-matter issue https://github.com/kuhlman-labs/fishhawk/issues/5088. ADR-090's index entry names ADR-142 in amended_by with its other links unchanged; ADR-140 and ADR-141 rows and entries are unchanged. The generated index contains no issue field.
+verify_hint: 'CLI: grep the ADR-142 row from the README, print the ADR-090, ADR-140, ADR-141 and ADR-142 entries from the index, and compare against the merge-base on stdout.'
+steps: 'Posture B: in the sanctioned checkout, a Python comparator (/tmp/fh5107/cmp.py) reads docs/adr/README.md rows beginning ''| [ADR-142]'', parses link, title, status and issue URL, and compares them with the ADR-142 index.json entry and ADR-142 front matter. A second script diffs every index entry against git show <merge-base>:docs/adr/index.json, and greps the ADR-140 and ADR-141 rows at both revisions. Control on a copy of docs/adr under /tmp: change the README URL to issues/5089, then rerun the comparator and scripts/check-adr <copy>.'
+assertions:
+    expected: One row agreeing with index and front matter; ADR-090 gains ADR-142 with other links unchanged; ADR-140/141 unchanged; no issue field.
+    observed_at_record: 'Exactly 1 row. Path, title, status and issue URL (.../issues/5088) all agree. Index diff: ADR-142 added, only ADR-090 changed, gaining amended_by [ADR-142] with supersedes and superseded_by unchanged. ADR-140 and ADR-141 entries and rows are unchanged. No issue field or key anywhere in index.json. Mutation control: comparator rc 1 on the issue check while check-adr stayed rc 0. Unmutated comparator rc 0. check-adr --write-index on a copy reproduced the committed index bytes (sha256 7e96dc44...).'
+    repro_handle: python3 -I /tmp/fh5107/cmp.py docs/adr
+origin:
+    issue: 5107
+    pr: 5110
+    run_id: 740bbdb1-46f7-4eca-948a-ad5357e121be
+    head_sha: b70b2856cf19ac3e62c3327e3a268af19a28b21e
+    recorded_at: 2026-11-06T18:33:30Z
