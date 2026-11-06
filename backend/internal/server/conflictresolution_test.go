@@ -584,6 +584,18 @@ func seedConflictResolutionE2E(t *testing.T) *crSeed {
 	return &crSeed{s: s, stub: stub, au: au, rr: rr, creator: creator, sf: sf, runID: runID, impl: impl}
 }
 
+// serveMergeFirstParent makes the forge answer the merge commit's first parent
+// the conflict-resolution report implies: the pass pins its parents to [pre-merge
+// tip, merge head], and the report's base_sha names the pre-merge tip (ADR-141).
+func (sd *crSeed) serveMergeFirstParent() {
+	sd.stub.mu.Lock()
+	defer sd.stub.mu.Unlock()
+	if sd.stub.mergeParents == nil {
+		sd.stub.mergeParents = map[string][]string{}
+	}
+	sd.stub.mergeParents[crMergeSHA] = []string{crAgentHeadSHA, rebaseBaseTipSHA}
+}
+
 // TestConflictResolutionPushed_RepublishedCheckDoesNotFlagMergeForeign is the
 // #3673 Done-means, cross-boundary test: the entry is WRITTEN in
 // backend/internal/server and READ in backend/internal/auditcomplete, and both
@@ -603,6 +615,7 @@ func seedConflictResolutionE2E(t *testing.T) *crSeed {
 // turns this RED on the foreign_commit assertion.
 func TestConflictResolutionPushed_RepublishedCheckDoesNotFlagMergeForeign(t *testing.T) {
 	sd := seedConflictResolutionE2E(t)
+	sd.serveMergeFirstParent()
 
 	// --- pass 1: the runner reports the pushed merge commit ---
 	priv, _ := sd.sf.issue(t, sd.runID)
@@ -679,6 +692,7 @@ func TestConflictResolutionPushed_RepublishedCheckDoesNotFlagMergeForeign(t *tes
 func TestConflictResolutionPushed_RepublishedCheckStillFlagsUnrecordedHead(t *testing.T) {
 	const unrecorded = "dddd444444444444444444444444444444444444"
 	sd := seedConflictResolutionE2E(t)
+	sd.serveMergeFirstParent()
 
 	priv, _ := sd.sf.issue(t, sd.runID)
 	report := []byte(`{"outcome":"conflict_resolution_pushed","branch":"` + rebaseBranchName +

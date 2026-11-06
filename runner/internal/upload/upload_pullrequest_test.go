@@ -686,3 +686,424 @@ func TestShipPullRequest_AggressiveRetryPreservesCheckpoint(t *testing.T) {
 		t.Errorf("aggressive retry dropped base/tree: base_sha=%q verified_tree_sha=%q", sent.BaseSHA, sent.VerifiedTreeSHA)
 	}
 }
+
+// pushReportOutcomes is exactly the set that rides the request-local budget.
+var pushReportOutcomes = []string{"fixup_pushed", "conflict_resolution_pushed", OutcomeAcceptanceScenariosPushed}
+
+// pushReportStub answers the pull-request route from a status script (the last
+// entry repeats) and the trace route with a 202, counting both. A hanging stub
+// holds each pull-request answer until the request's context ends or the test
+// cleans up.
+type pushReportStub struct {
+	mu         sync.Mutex
+	statuses   []int
+	prCalls    int
+	traceCalls int
+	hang       bool
+	dropConn   int           // the first dropConn pull-request attempts drop the connection
+	onPR       func(int)     // called with the attempt number, before the answer
+	release    chan struct{} // closed at cleanup so a hanging handler returns
+}
+
+func newPushReportStub(t *testing.T, statuses ...int) (*pushReportStub, *Client) {
+	t.Helper()
+	st := &pushReportStub{statuses: statuses, release: make(chan struct{})}
+	mux := http.NewServeMux()
+	mux.HandleFunc("POST /v0/runs/{run_id}/pull-request", func(w http.ResponseWriter, r *http.Request) {
+		// Reading the body to EOF is what lets net/http notice the client's
+		// disconnect and end r.Context() while the handler is still holding.
+		_, _ = io.Copy(io.Discard, r.Body)
+		st.mu.Lock()
+		st.prCalls++
+		attempt := st.prCalls
+		status := http.StatusOK
+		if len(st.statuses) > 0 {
+			i := attempt - 1
+			if i >= len(st.statuses) {
+				i = len(st.statuses) - 1
+			}
+			status = st.statuses[i]
+		}
+		hang, drop, onPR := st.hang, attempt <= st.dropConn, st.onPR
+		st.mu.Unlock()
+		if onPR != nil {
+			onPR(attempt)
+		}
+		if drop {
+			conn, _, err := w.(http.Hijacker).Hijack()
+			if err == nil {
+				_ = conn.Close()
+			}
+			return
+		}
+		if hang {
+			select {
+			case <-r.Context().Done():
+			case <-st.release:
+			}
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(status)
+		if status == http.StatusOK {
+			_ = json.NewEncoder(w).Encode(ShipPullRequestResult{StageID: "s"})
+		}
+	})
+	mux.HandleFunc("POST /v0/runs/{run_id}/trace", func(w http.ResponseWriter, _ *http.Request) {
+		st.mu.Lock()
+		st.traceCalls++
+		st.mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_ = json.NewEncoder(w).Encode(ShipResult{RunID: "r", StageID: "s", Variant: "raw", ContentHash: "h"})
+	})
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(st.release) }) // runs first, so srv.Close cannot wait on a holder
+	c := New(srv.URL)
+	// The blip budget is four attempts here, deliberately fewer than the
+	// push-report budget's six, so a report on the wrong budget is visible.
+	c.MaxRetries = 3
+	c.Backoff = time.Millisecond
+	c.PushReportBackoff = time.Millisecond
+	c.PushReportBackoffCap = time.Millisecond
+	return st, c
+}
+
+func (s *pushReportStub) attempts() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.prCalls
+}
+
+func (s *pushReportStub) traces() int {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.traceCalls
+}
+
+func pushReportArgs(t *testing.T, outcome string) ShipPullRequestArgs {
+	t.Helper()
+	return ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: makePRKey(t), Outcome: outcome,
+		Branch: "fishhawk/run-r", HeadSHA: strings.Repeat("a", 40), BaseSHA: strings.Repeat("b", 40),
+	}
+}
+
+func shipTraceArgs(t *testing.T) ShipArgs {
+	t.Helper()
+	return ShipArgs{RunID: "r", StageID: "s", Variant: "raw", Bundle: []byte("b"), PrivateKey: makePRKey(t)}
+}
+
+// isolationBudgets are the probe's values: a report runs at least 1.2s, longer
+// than the 500ms settling window of the 1s terminal phase, so a report that
+// armed that phase would leave a later ShipTrace born expired.
+func isolationBudgets(c *Client) {
+	c.TerminalEgressBudget = time.Second
+	c.PushReportBackoff = 600 * time.Millisecond
+	c.PushReportBackoffCap = 600 * time.Millisecond
+	c.PushReportMaxRetries = 2
+}
+
+// TestShipPullRequest_ExhaustedPushReportThenShipTraceSucceeds is the
+// client-level isolation probe for any later terminal-egress call (ADR-141 D4).
+// It proves isolation and says nothing about run()'s order. Swapping the
+// request-local context for the settling one arms the 1s phase, the report
+// spends its 500ms settling window, and ShipTrace joins an expired phase and
+// makes no request.
+func TestShipPullRequest_ExhaustedPushReportThenShipTraceSucceeds(t *testing.T) {
+	st, c := newPushReportStub(t, http.StatusServiceUnavailable)
+	isolationBudgets(c)
+
+	_, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, "fixup_pushed"))
+	if err == nil {
+		t.Errorf("assert: report against a persistent 503 returned no error")
+	}
+	if got := st.attempts(); got != 3 {
+		t.Errorf("assert: report attempts = %d, want 3", got)
+	}
+	if got := c.terminalEgressDeadline.Load(); got != 0 {
+		t.Errorf("assert: terminal-egress deadline = %d after the report, want 0 (never armed)", got)
+	}
+	res, err := c.ShipTrace(context.Background(), shipTraceArgs(t))
+	if err != nil {
+		t.Errorf("assert: ShipTrace after an exhausted report: %v", err)
+	} else if res.RunID != "r" {
+		t.Errorf("assert: ShipTrace result = %+v, want the stub's", res)
+	}
+	if got := st.traces(); got != 1 {
+		t.Errorf("assert: trace requests = %d, want 1", got)
+	}
+}
+
+// TestShipPullRequest_PermanentFailedPushReportThenShipTraceSucceeds is the
+// failed arm of the probe. A rejected report takes no time, so the pause runs
+// the clock past the settling window a wrongly armed phase would have opened:
+// without it the later ShipTrace would succeed either way.
+func TestShipPullRequest_PermanentFailedPushReportThenShipTraceSucceeds(t *testing.T) {
+	st, c := newPushReportStub(t, http.StatusConflict)
+	isolationBudgets(c)
+
+	if _, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, "conflict_resolution_pushed")); err == nil {
+		t.Errorf("assert: report answered 409 returned no error")
+	}
+	if got := st.attempts(); got != 1 {
+		t.Errorf("assert: report attempts = %d, want 1", got)
+	}
+	if got := c.terminalEgressDeadline.Load(); got != 0 {
+		t.Errorf("assert: terminal-egress deadline = %d after the report, want 0 (never armed)", got)
+	}
+	time.Sleep(600 * time.Millisecond)
+	if _, err := c.ShipTrace(context.Background(), shipTraceArgs(t)); err != nil {
+		t.Errorf("assert: ShipTrace after a rejected report: %v", err)
+	}
+	if got := st.traces(); got != 1 {
+		t.Errorf("assert: trace requests = %d, want 1", got)
+	}
+}
+
+// TestShipPullRequest_PushReports_RideLocalRetryBudget rides out more failures
+// than the blip budget's four attempts, on the default six.
+func TestShipPullRequest_PushReports_RideLocalRetryBudget(t *testing.T) {
+	for _, outcome := range pushReportOutcomes {
+		t.Run(outcome, func(t *testing.T) {
+			u := http.StatusServiceUnavailable
+			st, c := newPushReportStub(t, u, u, u, u, u, http.StatusOK)
+			if _, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, outcome)); err != nil {
+				t.Errorf("assert: report after five 503s: %v", err)
+			}
+			if got := st.attempts(); got != 6 {
+				t.Errorf("assert: attempts = %d, want 6", got)
+			}
+		})
+	}
+	t.Run("network_errors_retry", func(t *testing.T) {
+		st, c := newPushReportStub(t, http.StatusOK)
+		st.dropConn = 5
+		if _, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, "fixup_pushed")); err != nil {
+			t.Errorf("assert: report after five dropped connections: %v", err)
+		}
+		if got := st.attempts(); got != 6 {
+			t.Errorf("assert: attempts = %d, want 6", got)
+		}
+	})
+}
+
+func TestShipPullRequest_PushReports_SuccessOneAttempt(t *testing.T) {
+	for _, outcome := range pushReportOutcomes {
+		t.Run(outcome, func(t *testing.T) {
+			st, c := newPushReportStub(t, http.StatusOK)
+			res, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, outcome))
+			if err != nil {
+				t.Fatalf("assert: ShipPullRequest: %v", err)
+			}
+			if res.StageID != "s" {
+				t.Errorf("assert: result = %+v, want the stub's", res)
+			}
+			if got := st.attempts(); got != 1 {
+				t.Errorf("assert: attempts = %d, want 1", got)
+			}
+		})
+	}
+}
+
+// TestShipPullRequest_PushReports_PermanentFailureNoRetry: the new budget changes
+// no status class. 409 is a mismatch refusal, so a retry could not change it.
+func TestShipPullRequest_PushReports_PermanentFailureNoRetry(t *testing.T) {
+	for _, tc := range []struct {
+		status int
+		want   error
+	}{
+		{status: http.StatusConflict},
+		{status: http.StatusBadRequest},
+		{status: http.StatusUnauthorized, want: ErrSignatureRejected},
+		{status: http.StatusNotFound, want: ErrNotFound},
+	} {
+		for _, outcome := range pushReportOutcomes {
+			t.Run(http.StatusText(tc.status)+"/"+outcome, func(t *testing.T) {
+				st, c := newPushReportStub(t, tc.status)
+				_, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, outcome))
+				if err == nil {
+					t.Fatalf("assert: status %d returned no error", tc.status)
+				}
+				if tc.want != nil && !errors.Is(err, tc.want) {
+					t.Errorf("assert: err = %v, want %v", err, tc.want)
+				}
+				if got := st.attempts(); got != 1 {
+					t.Errorf("assert: attempts = %d, want 1", got)
+				}
+			})
+		}
+	}
+}
+
+// TestShipPullRequest_PushReports_ExhaustionIsBounded pins N+1 attempts, the
+// wrapped last error and the backoff cap: the uncapped series would sleep 3s
+// where the capped one sleeps 800ms.
+func TestShipPullRequest_PushReports_ExhaustionIsBounded(t *testing.T) {
+	st, c := newPushReportStub(t, http.StatusServiceUnavailable)
+	c.PushReportMaxRetries = 4
+	c.PushReportBackoff = 200 * time.Millisecond
+	c.PushReportBackoffCap = 200 * time.Millisecond
+
+	start := time.Now()
+	_, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, "fixup_pushed"))
+	elapsed := time.Since(start)
+	if err == nil {
+		t.Fatalf("assert: a persistent 503 returned no error")
+	}
+	if got := st.attempts(); got != 5 {
+		t.Errorf("assert: attempts = %d, want 5", got)
+	}
+	if !strings.Contains(err.Error(), "exhausted retries") || !strings.Contains(err.Error(), "503") {
+		t.Errorf("assert: err = %v, want exhausted retries wrapping the 503", err)
+	}
+	if elapsed > 2500*time.Millisecond {
+		t.Errorf("assert: elapsed = %v, want the capped 800ms of sleep", elapsed)
+	}
+}
+
+// TestShipPullRequest_PushReports_ContextCancelled cancels the caller during a
+// backoff far longer than the test. Detaching the local context from the caller
+// would hold that backoff until the 2s budget and answer DeadlineExceeded.
+func TestShipPullRequest_PushReports_ContextCancelled(t *testing.T) {
+	st, c := newPushReportStub(t, http.StatusServiceUnavailable)
+	c.PushReportBackoff = time.Minute
+	c.PushReportBackoffCap = time.Minute
+	c.PushReportBudget = 2 * time.Second
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	st.onPR = func(int) { time.AfterFunc(50*time.Millisecond, cancel) }
+
+	_, err := c.ShipPullRequest(ctx, pushReportArgs(t, "fixup_pushed"))
+	if !errors.Is(err, context.Canceled) {
+		t.Errorf("assert: err = %v, want context.Canceled", err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "503") {
+		t.Errorf("assert: err = %v, want the last 503 kept beside the cancellation", err)
+	}
+	if got := st.attempts(); got != 1 {
+		t.Errorf("assert: attempts = %d, want 1", got)
+	}
+}
+
+// TestShipPullRequest_PushReports_LocalDeadlineBounds: the budget itself stops a
+// hanging request while the caller's context stays live.
+func TestShipPullRequest_PushReports_LocalDeadlineBounds(t *testing.T) {
+	st, c := newPushReportStub(t, http.StatusOK)
+	st.hang = true
+	c.PushReportBudget = 50 * time.Millisecond
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	args := pushReportArgs(t, "acceptance_scenarios_pushed")
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.ShipPullRequest(ctx, args)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("assert: err = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("assert: a 50ms budget did not bound a hanging report within 3s")
+	}
+	if err := ctx.Err(); err != nil {
+		t.Errorf("assert: caller context = %v, want it still live", err)
+	}
+}
+
+// TestShipPullRequest_PushReports_CallerEarlierDeadlineWins: a 100ms caller
+// deadline beats the 45s budget, on this test's own 3s bound.
+func TestShipPullRequest_PushReports_CallerEarlierDeadlineWins(t *testing.T) {
+	st, c := newPushReportStub(t, http.StatusOK)
+	st.hang = true
+	c.PushReportBudget = 45 * time.Second
+	c.PushReportMaxRetries = 1
+	ctx, cancel := context.WithTimeout(context.Background(), 100*time.Millisecond)
+	defer cancel()
+
+	args := pushReportArgs(t, "conflict_resolution_pushed")
+	done := make(chan error, 1)
+	go func() {
+		_, err := c.ShipPullRequest(ctx, args)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Errorf("assert: err = %v, want context.DeadlineExceeded", err)
+		}
+	case <-time.After(3 * time.Second):
+		t.Errorf("assert: the caller's 100ms deadline did not bound the report within 3s")
+	}
+}
+
+// TestShipPullRequest_PushReport_LeavesArmedPhaseUntouched: a landed push report
+// neither closes nor moves a phase another terminal call opened.
+func TestShipPullRequest_PushReport_LeavesArmedPhaseUntouched(t *testing.T) {
+	_, c := newPushReportStub(t, http.StatusOK)
+	armed := c.terminalEgressPhaseDeadline().UnixNano()
+	if _, err := c.ShipPullRequest(context.Background(), pushReportArgs(t, "fixup_pushed")); err != nil {
+		t.Fatalf("setup: report: %v", err)
+	}
+	if got := c.terminalEgressDeadline.Load(); got != armed {
+		t.Errorf("assert: terminal-egress deadline = %d, want %d unchanged", got, armed)
+	}
+}
+
+// TestShipPullRequest_OtherOutcomes_KeepShortBudget is the narrowness control.
+// The push-report values are set so a widened budget changes both the attempt
+// count (seven) and the sleep (a 10ms cap would give 30ms, not the blip's 70ms).
+func TestShipPullRequest_OtherOutcomes_KeepShortBudget(t *testing.T) {
+	for _, outcome := range []string{"", "pushed", "failed", "fixup_no_changes", OutcomeAcceptanceScenarioRetirementDropped} {
+		t.Run("outcome="+outcome, func(t *testing.T) {
+			st, c := newPushReportStub(t, http.StatusServiceUnavailable)
+			c.Backoff = 10 * time.Millisecond
+			c.PushReportMaxRetries = 6
+			c.PushReportBackoff = 10 * time.Millisecond
+			c.PushReportBackoffCap = 10 * time.Millisecond
+			args := pushReportArgs(t, outcome)
+			args.Body = []byte(`{"pr_number":1}`)
+
+			start := time.Now()
+			_, err := c.ShipPullRequest(context.Background(), args)
+			elapsed := time.Since(start)
+			if err == nil {
+				t.Errorf("assert: a persistent 503 returned no error")
+			}
+			if got := st.attempts(); got != 4 {
+				t.Errorf("assert: attempts = %d, want the blip budget's 4", got)
+			}
+			if elapsed < 70*time.Millisecond {
+				t.Errorf("assert: elapsed = %v, want at least the doubling series' 70ms", elapsed)
+			}
+		})
+	}
+}
+
+// TestPushReportBudget_DefaultSeriesFitsBudget is a sleep-free check on the
+// shipped constants: 1,2,4,8,15 is 30s of sleep across 6 attempts, inside 45s,
+// so a quiet change to any of them goes red here.
+func TestPushReportBudget_DefaultSeriesFitsBudget(t *testing.T) {
+	maxRetries, backoff, backoffCap := New("http://unused").pushReportRetryPolicy()
+	if maxRetries != 5 || backoff != time.Second || backoffCap != 15*time.Second {
+		t.Fatalf("assert: policy = %d/%v/%v, want 5/1s/15s", maxRetries, backoff, backoffCap)
+	}
+	var sleep time.Duration
+	for i := 0; i < maxRetries; i++ {
+		sleep += backoff
+		backoff = capBackoff(backoff, backoffCap)
+	}
+	if sleep != 30*time.Second {
+		t.Errorf("assert: total sleep = %v, want 30s", sleep)
+	}
+	if DefaultPushReportBudget != 45*time.Second {
+		t.Errorf("assert: budget = %v, want 45s", DefaultPushReportBudget)
+	}
+	if sleep >= DefaultPushReportBudget {
+		t.Errorf("assert: sleep %v leaves the attempts no time inside %v", sleep, DefaultPushReportBudget)
+	}
+}

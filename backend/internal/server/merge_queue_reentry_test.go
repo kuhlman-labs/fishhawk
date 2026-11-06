@@ -2,8 +2,11 @@ package server
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -13,6 +16,8 @@ import (
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/timescale"
@@ -1089,5 +1094,409 @@ func TestReentryQualifyingChain_Pure(t *testing.T) {
 	}
 	if _, ok := reentryQualifyingChain(rows, 3, "", ""); ok {
 		t.Fatal("an empty seed qualified the empty head")
+	}
+}
+
+// rentAcceptanceStage adds the settled acceptance stage a scenario report comes
+// from, with the verdict the runner recorded before its push.
+func (w *mqmWorld) rentAcceptanceStage(r *mcqRun) *run.Stage {
+	w.t.Helper()
+	ctx := context.Background()
+	st, err := w.repo.CreateStage(ctx, run.CreateStageParams{
+		RunID: r.id, Sequence: 4, Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		w.t.Fatalf("setup: create acceptance stage: %v", err)
+	}
+	w.setStage(st.ID, run.StageStateSucceeded)
+	w.rentStageRow(r, st.ID, CategoryAcceptanceOutcomeRecorded, map[string]any{"outcome": "passed"})
+	return st
+}
+
+// rentStageRow appends one chained row on a stage BY CONSTRUCTION.
+func (w *mqmWorld) rentStageRow(r *mcqRun, stageID uuid.UUID, category string, payload any) {
+	w.t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		w.t.Fatalf("setup: marshal %s: %v", category, err)
+	}
+	kind, subj := audit.ActorSystem, "test"
+	if _, err := w.audit.AppendChained(context.Background(), audit.ChainAppendParams{RunID: r.id, StageID: &stageID,
+		Timestamp: time.Now().UTC(), Category: category, ActorKind: &kind, ActorSubject: &subj, Payload: raw}); err != nil {
+		w.t.Fatalf("setup: seed %s: %v", category, err)
+	}
+}
+
+// rentConflictPass reopens the implement stage on a live conflict-resolution
+// trigger. The trigger names no re-parked review stage, so the review gate stays
+// parked and the recovery has only the implement stage to restore. The recorded
+// base commit lets an admitted report's permission-drift check read its surfaces,
+// so it raises no unevaluable concern that eligibility would then refuse.
+func (w *mqmWorld) rentConflictPass(r *mcqRun, expectedHead string) {
+	w.t.Helper()
+	w.exec(`UPDATE runs SET document_base_commit = $1 WHERE id = $2`, rhBaseSHA, r.id)
+	w.rentStageRow(r, r.impl.ID, CategoryStageConflictResolutionTriggered, conflictResolutionTrigger{
+		Branch: r.branch, BaseRef: mcqBase, ExpectedHeadSHA: expectedHead, Pass: 1, PriorState: string(run.StageStateSucceeded),
+	})
+	w.setStage(r.impl.ID, run.StageStateRunning)
+}
+
+// rentReport signs one push report and sends it through the real route.
+func (w *mqmWorld) rentReport(r *mcqRun, stageID uuid.UUID, outcome, head, base string) *httptest.ResponseRecorder {
+	w.t.Helper()
+	body, err := json.Marshal(map[string]any{
+		"outcome": outcome, "branch": r.branch, "head_sha": head, "base_sha": base, "files_changed_count": 1,
+	})
+	if err != nil {
+		w.t.Fatalf("setup: marshal report: %v", err)
+	}
+	sf := newSigningFake()
+	priv, _ := sf.issue(w.t, r.id)
+	w.srv.cfg.SigningRepo = sf
+	w.srv.cfg.ArtifactRepo = newFakeArtifactRepo()
+	resp := shipPRRequest(w.t, w.srv, r.id, stageID, priv, body, "")
+	w.srv.waitBackgroundReviews()
+	return resp
+}
+
+// rentMismatchRows counts r's reported_head_mismatch evidence rows.
+func (w *mqmWorld) rentMismatchRows(r *mcqRun) int {
+	w.t.Helper()
+	n := 0
+	for _, e := range w.rows(r, invariantmonitor.CategoryInvariantViolation) {
+		if w.payload(e)["kind"] == invariantmonitor.KindReportedHeadMismatch {
+			n++
+		}
+	}
+	return n
+}
+
+// TestMergeQueueReentry_ForgedEdge_HeadNotOnBranch_NeverQualifies: an acceptance
+// report names a qualifying base and a head that is neither the PR head nor the
+// branch tip. It is refused with no row, so when that head later reaches the PR the
+// walk has no edge to it and the sweep re-enters nothing. The control then lets the
+// forge confirm the same head and edge, and the same world re-enters.
+//
+// COUNTERFACTUAL (M41, the acceptance hook call replaced with false): the edge row
+// exists, the moved head qualifies and the sweep re-enters one → RED.
+func TestMergeQueueReentry_ForgedEdge_HeadNotOnBranch_NeverQualifies(t *testing.T) {
+	w := newMQMWorld(t)
+	r, ej, push := w.rentReadyPushed("a")
+	accept := w.rentAcceptanceStage(r)
+
+	resp := w.rentReport(r, accept.ID, outcomeAcceptanceScenariosPushed, rhH2, "h1")
+	if resp.Code != http.StatusConflict || !strings.Contains(resp.Body.String(), `"reported_head_mismatch"`) {
+		t.Errorf("assert: status = %d, want 409 reported_head_mismatch:\n%s", resp.Code, resp.Body.String())
+	}
+	if rows := w.rows(r, CategoryAcceptanceScenariosPushed); len(rows) != 0 {
+		t.Errorf("assert: acceptance_scenarios_pushed rows = %d, want 0", len(rows))
+	}
+	if n := w.rentMismatchRows(r); n != 1 {
+		t.Errorf("assert: reported_head_mismatch rows = %d, want 1", n)
+	}
+
+	w.gh.set(func() { w.gh.prs[r.pr].head = rhH2 })
+	if n := w.sweep(0); n != 0 {
+		t.Errorf("assert: re-entered = %d at the refused head, want 0", n)
+	}
+	if rows := w.reentryRows(r); len(rows) != 0 {
+		t.Errorf("assert: re-entry rows = %d, want 0", len(rows))
+	}
+	if latest, found, err := w.store.LatestForRun(context.Background(), r.id); err != nil || !found || latest.ID != ej.ID {
+		t.Fatalf("assert: latest = %+v found=%v err=%v, want the ejected row %s", latest, found, err, ej.ID)
+	}
+
+	// Control: only the refusal held it back. The forge now confirms this edge.
+	w.gh.set(func() { w.gh.commitParents[rhH2] = []string{"h1"} })
+	if resp := w.rentReport(r, accept.ID, outcomeAcceptanceScenariosPushed, rhH2, "h1"); resp.Code != http.StatusOK {
+		t.Fatalf("assert: confirmed report = %d, want 200:\n%s", resp.Code, resp.Body.String())
+	}
+	if n := w.sweep(0); n != 1 {
+		t.Fatalf("assert: re-entered = %d once the forge confirmed the edge, want 1", n)
+	}
+	_, p := w.requireReentered(r, ej, rhH2)
+	requireReentryChain(t, p, push, []string{"h1", rhH2})
+}
+
+// TestMergeQueueReentry_ForgedEdge_BaseNotFirstParent_NeverQualifies: the reported
+// head IS the PR head by construction and the qualifying base is only its second
+// parent, so the first-parent check alone refuses the edge. The conflict pass runs
+// on a live trigger, whose recovery restores the stage, so a live stage is not what
+// holds the sweep back. The control lets the forge show the base as first parent.
+//
+// COUNTERFACTUAL (M42, the first-parent check neutered): the edge row is written and
+// the sweep re-enters at the head → RED on zero-rows and on the sweep.
+func TestMergeQueueReentry_ForgedEdge_BaseNotFirstParent_NeverQualifies(t *testing.T) {
+	cases := []struct {
+		name     string
+		outcome  string
+		category string
+		stage    func(w *mqmWorld, r *mcqRun) uuid.UUID
+		refused  func(t *testing.T, w *mqmWorld, r *mcqRun, resp *httptest.ResponseRecorder)
+		confirm  func(w *mqmWorld, r *mcqRun)
+	}{
+		{
+			name: "acceptance", outcome: outcomeAcceptanceScenariosPushed, category: CategoryAcceptanceScenariosPushed,
+			stage: func(w *mqmWorld, r *mcqRun) uuid.UUID { return w.rentAcceptanceStage(r).ID },
+			refused: func(t *testing.T, _ *mqmWorld, _ *mcqRun, resp *httptest.ResponseRecorder) {
+				if resp.Code != http.StatusConflict {
+					t.Errorf("assert: status = %d, want 409:\n%s", resp.Code, resp.Body.String())
+				}
+			},
+			confirm: func(*mqmWorld, *mcqRun) {},
+		},
+		{
+			name: "conflict_resolution", outcome: "conflict_resolution_pushed", category: CategoryConflictResolutionPushed,
+			stage: func(w *mqmWorld, r *mcqRun) uuid.UUID {
+				w.rentConflictPass(r, "h1")
+				return r.impl.ID
+			},
+			refused: func(t *testing.T, w *mqmWorld, r *mcqRun, resp *httptest.ResponseRecorder) {
+				var body pullRequestFailureResponse
+				_ = json.Unmarshal(resp.Body.Bytes(), &body)
+				if resp.Code != http.StatusOK || body.Outcome != "failed" {
+					t.Errorf("assert: status = %d outcome = %q, want 200 failed:\n%s", resp.Code, body.Outcome, resp.Body.String())
+				}
+				if rows := w.rows(r, CategoryStageConflictResolutionFailed); len(rows) != 1 {
+					t.Errorf("assert: stage_conflict_resolution_failed rows = %d, want 1 (the trigger is consumed)", len(rows))
+				}
+				st, err := w.repo.GetStage(context.Background(), r.impl.ID)
+				if err != nil {
+					t.Fatalf("setup: get stage: %v", err)
+				}
+				if st.State != run.StageStateSucceeded {
+					t.Errorf("assert: implement = %s, want succeeded (restored, so gate 1 is not what holds the sweep)", st.State)
+				}
+			},
+			confirm: func(w *mqmWorld, r *mcqRun) { w.rentConflictPass(r, "h1") },
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			w := newMQMWorld(t)
+			r, ej, push := w.rentReadyPushed("a")
+			stageID := tc.stage(w, r)
+			w.gh.set(func() {
+				w.gh.prs[r.pr].head = rhH2
+				w.gh.commitParents[rhH2] = []string{rhOther, "h1"}
+			})
+
+			resp := w.rentReport(r, stageID, tc.outcome, rhH2, "h1")
+			tc.refused(t, w, r, resp)
+			if rows := w.rows(r, tc.category); len(rows) != 0 {
+				t.Errorf("assert: %s rows = %d, want 0", tc.category, len(rows))
+			}
+			if n := w.rentMismatchRows(r); n != 1 {
+				t.Errorf("assert: reported_head_mismatch rows = %d, want 1", n)
+			}
+			if n := w.sweep(0); n != 0 {
+				t.Errorf("assert: re-entered = %d on the refused edge, want 0", n)
+			}
+			if rows := w.reentryRows(r); len(rows) != 0 {
+				t.Errorf("assert: re-entry rows = %d, want 0", len(rows))
+			}
+			if latest, found, err := w.store.LatestForRun(context.Background(), r.id); err != nil || !found || latest.ID != ej.ID {
+				t.Fatalf("assert: latest = %+v found=%v err=%v, want the ejected row %s", latest, found, err, ej.ID)
+			}
+
+			// Control: the same edge with the base as first parent re-enters.
+			tc.confirm(w, r)
+			w.gh.set(func() { w.gh.commitParents[rhH2] = []string{"h1", rhOther} })
+			if resp := w.rentReport(r, stageID, tc.outcome, rhH2, "h1"); resp.Code != http.StatusOK {
+				t.Fatalf("assert: confirmed report = %d, want 200:\n%s", resp.Code, resp.Body.String())
+			}
+			if n := w.sweep(0); n != 1 {
+				t.Fatalf("assert: re-entered = %d once the forge confirmed the edge, want 1", n)
+			}
+			_, p := w.requireReentered(r, ej, rhH2)
+			requireReentryChain(t, p, push, []string{"h1", rhH2})
+		})
+	}
+}
+
+// rhConsumerView is what each reader of the audit chain answers about a reported
+// head after its report settled.
+type rhConsumerView struct {
+	InLedger         bool
+	ChainReports     bool
+	DismissingCause  string
+	MergeCause       string
+	LatestRunHead    string
+	GateViewHead     string
+	PriorApprovalOK  bool
+	CarriedToHead    bool
+	QualifiesReentry bool
+	ReentrySeed      string
+}
+
+// rhReadConsumers reads the head through every consumer, using the fix-up row at
+// pushSeq as the qualifying walk's seed. Each read is the production one.
+func (w *mqmWorld) rhReadConsumers(r *mcqRun, kc rhKindCase, pushSeq int64, prior, head string) rhConsumerView {
+	w.t.Helper()
+	ctx := context.Background()
+	runRow := w.runRow(r)
+	var v rhConsumerView
+
+	ledger, complete := w.srv.buildReportedHeadLedger(ctx, runRow, "")
+	if !complete {
+		w.t.Fatalf("setup: the ledger read was incomplete")
+	}
+	if _, ok := ledger[prior]; !ok {
+		w.t.Fatalf("setup: the ledger misses the recorded prior head %s", prior)
+	}
+	_, v.InLedger = ledger[head]
+
+	var err error
+	if v.ChainReports, err = w.srv.chainReportsHead(ctx, r.id, kc.category, "head_sha", head); err != nil {
+		w.t.Fatalf("setup: chainReportsHead: %v", err)
+	}
+	v.DismissingCause = w.srv.dismissingCause(ctx, runRow, head)
+	if v.MergeCause, err = w.srv.classifyMergeCandidateHead(ctx, runRow, head); err != nil {
+		w.t.Fatalf("setup: classifyMergeCandidateHead: %v", err)
+	}
+	if v.LatestRunHead, _, err = w.srv.latestRunHeadSHA(ctx, r.id); err != nil {
+		w.t.Fatalf("setup: latestRunHeadSHA: %v", err)
+	}
+	if v.GateViewHead, err = w.srv.gateViewCurrentHead(ctx, r.id); err != nil {
+		w.t.Fatalf("setup: gateViewCurrentHead: %v", err)
+	}
+
+	rows := append(w.rows(r, CategoryBranchRebased), w.rows(r, CategoryConflictResolutionPushed)...)
+	v.PriorApprovalOK, _ = cleanChainReaches(rows, prior, prior)
+	v.CarriedToHead, _ = cleanChainReaches(rows, prior, head)
+
+	entry := mergequeue.Entry{RunID: r.id}
+	if _, v.QualifiesReentry, err = w.srv.mergeQueueReentryHeadChain(ctx, entry, pushSeq, prior, head); err != nil {
+		w.t.Fatalf("setup: mergeQueueReentryHeadChain: %v", err)
+	}
+	if _, v.ReentrySeed, err = w.srv.mergeQueueFixupPushedAfter(ctx, entry, pushSeq-1); err != nil {
+		w.t.Fatalf("setup: mergeQueueFixupPushedAfter: %v", err)
+	}
+	return v
+}
+
+// TestReportedHead_RefusedHeadReachesNoConsumer refuses through the real route for
+// each kind, then reads the lineage ledger, the merge-candidate classifier, the
+// approval-dismissal cause, the run-head and gate-view heads, the approval carrier
+// walk and the re-entry walk. None sees the refused head or edge, so a refusal needs
+// no consumer change. The admitted subtests are the positive controls: the same
+// reads do see a head the forge confirmed.
+//
+// The fixture records one integration commit, so a head no report names classifies
+// as fan_in rather than as "needs no verify", which the fix-up and conflict rows
+// would otherwise share with it.
+//
+// COUNTERFACTUAL (M43a/b/c, each hook call replaced with false): the row lands, so
+// the zero-rows assertion and the view comparison go RED for that kind.
+func TestReportedHead_RefusedHeadReachesNoConsumer(t *testing.T) {
+	refusedView := rhConsumerView{
+		DismissingCause: dismissingCausePush, MergeCause: mergeCandidateCauseFanIn,
+		LatestRunHead: rhH1, GateViewHead: rhH1, PriorApprovalOK: true, ReentrySeed: rhH1,
+	}
+	arrange := func(t *testing.T) (*mqmWorld, *mcqRun, *audit.Entry) {
+		t.Helper()
+		w := newMQMWorld(t)
+		r := w.seed("a", rhH1, []byte(mcvDelegatedV0SpecYAML))
+		push := w.rentPush(r, rhH1)
+		w.mqeAppend(r, auditcomplete.CategoryIntegrationCommitRecorded, map[string]any{"merge_sha": rhOther})
+		w.gh.set(func() { w.gh.baseTip[r.branch] = rhH1 })
+		return w, r, push
+	}
+	// reportingStage puts the stage in the state the kind reports from.
+	reportingStage := func(w *mqmWorld, r *mcqRun, kc rhKindCase) uuid.UUID {
+		if kc == rhAcceptanceKind {
+			return w.rentAcceptanceStage(r).ID
+		}
+		w.setStage(r.impl.ID, run.StageStateRunning)
+		return r.impl.ID
+	}
+
+	refusals := []struct {
+		name    string
+		kinds   []rhKindCase
+		prepare func(g *mcqGitHub, r *mcqRun)
+		reason  string
+	}{
+		{"refused_head", rhAllKinds, func(g *mcqGitHub, _ *mcqRun) {
+			g.commitParents[rhH2] = []string{rhH1}
+		}, reportedHeadReasonHead},
+		{"refused_base_edge", rhEdgeKinds, func(g *mcqGitHub, r *mcqRun) {
+			g.prs[r.pr].head = rhH2
+			g.commitParents[rhH2] = []string{rhOther, rhH1}
+		}, reportedHeadReasonBaseEdge},
+	}
+	for _, rf := range refusals {
+		for _, kc := range rf.kinds {
+			t.Run(rf.name+"/"+kc.name, func(t *testing.T) {
+				w, r, push := arrange(t)
+				stageID := reportingStage(w, r, kc)
+				w.gh.set(func() { rf.prepare(w.gh, r) })
+
+				resp := w.rentReport(r, stageID, kc.outcome, rhH2, rhH1)
+
+				if kc == rhAcceptanceKind {
+					if resp.Code != http.StatusConflict {
+						t.Errorf("assert: status = %d, want 409:\n%s", resp.Code, resp.Body.String())
+					}
+				} else {
+					var body pullRequestFailureResponse
+					_ = json.Unmarshal(resp.Body.Bytes(), &body)
+					if resp.Code != http.StatusOK || body.Outcome != "failed" || body.Category != "C" {
+						t.Errorf("assert: status = %d outcome = %q category = %q, want 200 failed C:\n%s",
+							resp.Code, body.Outcome, body.Category, resp.Body.String())
+					}
+				}
+				wantRows := 0
+				if kc == rhFixupKind {
+					wantRows = 1 // the prior push the fixture recorded
+				}
+				if rows := w.rows(r, kc.category); len(rows) != wantRows {
+					t.Errorf("assert: %s rows = %d, want %d", kc.category, len(rows), wantRows)
+				}
+				evidence := 0
+				for _, e := range w.rows(r, invariantmonitor.CategoryInvariantViolation) {
+					if p := w.payload(e); p["kind"] == invariantmonitor.KindReportedHeadMismatch && p["reason"] == rf.reason {
+						evidence++
+					}
+				}
+				if evidence != 1 {
+					t.Errorf("assert: reported_head_mismatch rows with reason %s = %d, want 1", rf.reason, evidence)
+				}
+				if got := w.rhReadConsumers(r, kc, push.Sequence, rhH1, rhH2); got != refusedView {
+					t.Errorf("assert: consumers read the refused report:\n got %+v\nwant %+v", got, refusedView)
+				}
+			})
+		}
+	}
+
+	admitted := []struct {
+		kc   rhKindCase
+		want rhConsumerView
+	}{
+		{rhFixupKind, rhConsumerView{InLedger: true, ChainReports: true, DismissingCause: dismissingCauseFixupPush,
+			LatestRunHead: rhH2, GateViewHead: rhH2, PriorApprovalOK: true, ReentrySeed: rhH2}},
+		{rhConflictKind, rhConsumerView{InLedger: true, ChainReports: true, DismissingCause: dismissingCausePush,
+			MergeCause: mergeCandidateCauseConflictResolution, LatestRunHead: rhH1, GateViewHead: rhH2,
+			QualifiesReentry: true, ReentrySeed: rhH1}},
+		{rhAcceptanceKind, rhConsumerView{InLedger: true, ChainReports: true, DismissingCause: dismissingCausePush,
+			MergeCause: mergeCandidateCauseFanIn, LatestRunHead: rhH2, GateViewHead: rhH2, PriorApprovalOK: true,
+			QualifiesReentry: true, ReentrySeed: rhH1}},
+	}
+	for _, tc := range admitted {
+		t.Run("admitted_control/"+tc.kc.name, func(t *testing.T) {
+			w, r, push := arrange(t)
+			stageID := reportingStage(w, r, tc.kc)
+			w.gh.set(func() {
+				w.gh.prs[r.pr].head = rhH2
+				w.gh.commitParents[rhH2] = []string{rhH1}
+			})
+
+			if resp := w.rentReport(r, stageID, tc.kc.outcome, rhH2, rhH1); resp.Code != http.StatusOK {
+				t.Fatalf("assert: status = %d, want 200:\n%s", resp.Code, resp.Body.String())
+			}
+			if got := w.rhReadConsumers(r, tc.kc, push.Sequence, rhH1, rhH2); got != tc.want {
+				t.Errorf("assert: consumers read the admitted report:\n got %+v\nwant %+v", got, tc.want)
+			}
+		})
 	}
 }

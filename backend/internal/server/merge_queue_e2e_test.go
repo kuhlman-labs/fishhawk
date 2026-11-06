@@ -1431,7 +1431,13 @@ func TestMergeQueueE2E_AcceptanceScenarioCommitAfterFixupReenters(t *testing.T) 
 	}
 	w.requireNotReentered(a)
 
-	// Phase 2: the acceptance runner pushes its scenario commit on a2.
+	// Phase 2: the acceptance runner pushes its scenario commit on a2. The
+	// forge shows that head and its first parent before the report, as a real
+	// push does (ADR-141).
+	w.gh.set(func() {
+		w.gh.prs[a.pr].head = "a3"
+		w.gh.commitParents["a3"] = []string{"a2"}
+	})
 	rec := httptest.NewRecorder()
 	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+a.id.String()+"/stages/"+a.impl.ID.String()+"/pull-request", nil)
 	subj := "runner"
@@ -1444,7 +1450,6 @@ func TestMergeQueueE2E_AcceptanceScenarioCommitAfterFixupReenters(t *testing.T) 
 	if rows := w.rows(a, CategoryAcceptanceScenariosPushed); len(rows) != 1 {
 		t.Fatalf("acceptance_scenarios_pushed rows = %d, want 1", len(rows))
 	}
-	w.gh.set(func() { w.gh.prs[a.pr].head = "a3" })
 	if n := w.sweep(0); n != 1 {
 		t.Fatalf("re-entered = %d after the scenario commit, want 1", n)
 	}
