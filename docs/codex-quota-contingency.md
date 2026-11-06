@@ -21,7 +21,7 @@ that condition, the rollout prerequisites and the human approval gate are met.
 | Fable standard reviewer | `gpt-6.1-sol` | Existing `high` |
 | Sonnet architect and security personas | `gpt-6.1-sol` | Existing `high` |
 | Implicit grooming executor | `gpt-6.1-sol` | Existing `high` |
-| Routine review declaration (no provider invocation) | `gpt-6.1-sol` | Unused for this gate |
+| Routine review declaration (no provider invocation) | Model remains unset | Existing `high` declaration |
 | Implicit upkeep executor | `gpt-6.1-sol` | Explicit `high` |
 | Existing Astra standard reviewer | `gpt-6-astra` | Existing `high` |
 
@@ -35,7 +35,10 @@ The routine review declaration describes a check-gated auto-merge stage. The
 prompt builder has no `review` template, and that gate takes the orchestrator's
 auto-merge path before agent dispatch. Its configured agent/model must not be
 counted as an observed provider spawn. The existing #1416 review-model ladder
-and persisted resolutions for implement reviewers remain unchanged.
+and persisted resolutions for implement reviewers remain unchanged. Leave the
+review-stage model unset: when the existing #1416 gate resolution runs, that
+field is also a reviewer-model override. Adding a pin here would add an override
+rung rather than preserve the two configured reviewer models.
 
 This is a mapping by workload role, not a claim of measured behavioral or
 runtime equivalence. [OpenAI's model guidance](https://learn.chatgpt.com/docs/models)

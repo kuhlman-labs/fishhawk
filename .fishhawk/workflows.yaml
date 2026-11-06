@@ -1188,10 +1188,9 @@ workflows:
         type: review
         executor:
           agent: codex
-          model: gpt-6.1-sol
-          # This executor does not replace implement.reviewers above.
-          # Its model transport is blocked by #5096; declaration alone does
-          # not establish the model of this standalone review invocation.
+          # This check-gated review spawns no provider invocation. Leave its
+          # model unset: #1416 also reads it as a reviewer-model override;
+          # setting it would add a rung instead of preserving the mapping.
           reasoning_effort: high
         gates:
           # A `check` gate carries no approval predicate: it lets the run
