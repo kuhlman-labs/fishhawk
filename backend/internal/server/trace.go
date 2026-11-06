@@ -406,7 +406,12 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo != nil {
 		switch {
 		case len(violations) == 0:
-			s.advanceStageAfterTrace(r, runID, stageID, variant, body)
+			// A gating review round shutdown stopped, or a prior process lost,
+			// decides nothing: answer that instead of the ordinary 202.
+			if s.advanceStageAfterTrace(r, runID, stageID, variant, body) {
+				s.writeReviewRoundInterrupted(w, r, runID, stageID, "implement")
+				return
+			}
 		case s.noDiffCaptured(r.Context(), stageID, body, violations):
 			// #691/#692: an implement stage whose bundle carries a
 			// present-but-empty diff is a staging/capture miss, not a
@@ -444,7 +449,11 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 //
 // bundleBytes is passed through for runtime calibration emit after
 // the terminal transition.
-func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID, variant tracestore.Variant, bundleBytes []byte) {
+//
+// It returns true only when a gating implement-review round was interrupted: the
+// stage has not moved and the caller answers review_round_interrupted (ADR-140
+// (#5047) D8). Every other return is false.
+func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUID, variant tracestore.Variant, bundleBytes []byte) bool {
 	stage, err := s.cfg.RunRepo.GetStage(r.Context(), stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
@@ -453,7 +462,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
-		return
+		return false
 	}
 
 	// Local-runner runs skip the GHA dispatcher's
@@ -470,7 +479,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 				slog.String("stage_id", stageID.String()),
 				slog.String("error", err.Error()),
 			)
-			return
+			return false
 		}
 	}
 
@@ -482,7 +491,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()),
 		)
-		return
+		return false
 	}
 
 	// Implement-review hook (ADR-027 impl 2/2). After the diff has
@@ -681,7 +690,13 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			// verdict, a document-injection failure, or an escalation-attached
 			// persona that could not run — each under the
 			// implement_review_rejected prefix #877's PR close keys on.
-			if reason := s.runImplementReviewsForTree(reviewCtx, runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence); reason != "" {
+			reviewOutcome := s.runImplementReviewsForTree(reviewCtx, runID, stageID, diff, scopeDrift, headSHA, treeSHA, changeID, gateEvidence)
+			// A stopped or lost gating round decides nothing: no FailStage, no
+			// runtime calibration and no terminal transition.
+			if reviewOutcome.interrupted {
+				return true
+			}
+			if reason := reviewOutcome.blockReason; reason != "" {
 				cat := run.FailureB
 				if _, ferr := run.FailStage(r.Context(), s.cfg.RunRepo, stageID, cat, reason); ferr != nil {
 					// #968: a failure report FailStage rejected (duplicate /
@@ -692,11 +707,11 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 						slog.String("stage_id", stageID.String()),
 						slog.String("error", ferr.Error()),
 					)
-					return
+					return false
 				}
 				s.advanceAfterFailure(r, runID, stageID)
 				s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "failed")
-				return
+				return false
 			}
 		}
 	}
@@ -717,7 +732,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// true so this gate is a no-op and the prior trace-driven behavior is
 	// preserved.
 	if stage.Type == run.StageTypePlan && !s.planArtifactExists(r.Context(), stageID) {
-		return
+		return false
 	}
 
 	// Push-and-open-pr implement gate (#742). When the implement stage will
@@ -775,7 +790,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	if stage.Type == run.StageTypeImplement &&
 		(s.pushAndOpenPRGated(bundleBytes) || s.childPushGated(bundleBytes) || s.fixupPushGated(bundleBytes)) {
 		s.emitRuntimeObserved(r.Context(), runID, stageID, bundleBytes, "succeeded")
-		return
+		return false
 	}
 
 	terminal := run.StageStateAwaitingApproval
@@ -791,7 +806,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 			slog.String("target", string(terminal)),
 			slog.String("error", err.Error()),
 		)
-		return
+		return false
 	}
 
 	// Best-effort: emit runtime calibration data for implement stages.
@@ -829,6 +844,7 @@ func (s *Server) advanceStageAfterTrace(r *http.Request, runID, stageID uuid.UUI
 	// short-circuits for non-issue triggers; for issue triggers it
 	// edits the seeded comment in place.
 	s.notifyStatusUpdate(r.Context(), runID, "trace_handler")
+	return false
 }
 
 // planArtifactExists reports whether a valid standard_v1 plan artifact
@@ -3802,6 +3818,7 @@ func (s *Server) runConsolidatedReviewRound(ctx context.Context, runRow *run.Run
 		src.HeadUnresolvedReason = reviewedHeadReasonCompareCommitsTruncated
 	}
 	srcCtx := withReviewRoundSource(ctx, src)
+	// No stage edge here: the result is discarded, and an interrupted round is the boot sweep's.
 	s.runImplementReviews(srcCtx, parentRunID, stageID, diff, nil, cmp.HeadSHA, nil)
 	return "", cmp.HeadSHA
 }
@@ -4006,6 +4023,7 @@ func (s *Server) maybeBackstopFixupReReview(ctx context.Context, runID uuid.UUID
 		// The round source (#4077) records the compare base so a
 		// restart-orphaned round is re-dispatched as ComparePatch(baseSHA, headSHA).
 		srcCtx := withReviewRoundSource(reviewCtx, reviewRoundSource{Origin: reviewRoundOriginFixupPush, BaseSHA: baseSHA})
+		// No stage edge here: the result is discarded, and an interrupted round is the boot sweep's.
 		s.runImplementReviews(srcCtx, runID, stageID, diff, nil, headSHA, gateEvidence)
 	}()
 }
@@ -4181,7 +4199,7 @@ var buildImplementReviewPrompt = prompt.Build
 // Per-invocation errors are WARN-logged and skipped so a transient
 // reviewer failure doesn't block the stage — the diff is already stored.
 func (s *Server) runImplementReviews(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA string, gateEvidence *prompt.GateEvidence) bool {
-	return s.runImplementReviewsForTree(ctx, runID, stageID, diff, scopeDrift, headSHA, "", "", gateEvidence) != ""
+	return s.runImplementReviewsForTree(ctx, runID, stageID, diff, scopeDrift, headSHA, "", "", gateEvidence).blocked()
 }
 
 // implementReviewGatingFailureReason returns the category-B failure reason a
@@ -4211,22 +4229,26 @@ func implementReviewGatingFailureReason(rejected bool, block string) string {
 // runImplementReviews and records neither, which the ship-side check treats as
 // undecidable (fail-closed to silence).
 //
-// It returns the GATING failure reason, "" meaning not blocked (#3913): the
-// reject literal implementReviewGatingRejectReason for a reject verdict or a
+// Its blockReason is the GATING failure reason, "" meaning not blocked (#3913):
+// the reject literal implementReviewGatingRejectReason for a reject verdict or a
 // gating document-injection / required-convention failure, or
 // implementReviewGatingFailureReason's escalation_persona_unavailable reason
 // when an escalation-attached persona could not run. The caller fails the
 // stage with it verbatim; every reason carries
 // implementReviewGatingRejectPrefix. The post-success rounds (fix-up push
 // re-review, consolidated review) ignore it, exactly as for a reject.
-func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA, treeSHA, changeID string, gateEvidence *prompt.GateEvidence) string {
+//
+// interrupted means shutdown stopped this gating round, or a retried upload at
+// this head found its gating round lost (ADR-140 (#5047) D8). No stage decision
+// exists and the caller moves nothing.
+func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID uuid.UUID, diff policy.Diff, scopeDrift []string, headSHA, treeSHA, changeID string, gateEvidence *prompt.GateEvidence) reviewDispatchOutcome {
 	// #3400: decide whether this round's gate evidence came from an uploaded
 	// bundle at ENTRY, before any of the allocate-if-nil blocks below
 	// (operator-scope-undelivered, per-slice verify, obligations) can conjure a
 	// non-nil GateEvidence that no bundle produced.
 	bundleDerivedGateEvidence := isBundleDerivedGateEvidence(gateEvidence)
 	if s.cfg.RunRepo == nil {
-		return ""
+		return reviewDispatchOutcome{}
 	}
 
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
@@ -4235,7 +4257,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return ""
+		return reviewDispatchOutcome{}
 	}
 
 	// Diff secrets check (E80.3 / #3760): deterministic, no model call, run
@@ -4266,7 +4288,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 
 	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
 	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
-		return ""
+		return reviewDispatchOutcome{}
 	}
 
 	authority := planreview.ResolveAuthority(*reviewersCfg)
@@ -4297,7 +4319,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 				)
 			}
 		}
-		return ""
+		return reviewDispatchOutcome{}
 	}
 
 	// Load the approved plan for the self-review guard (GeneratedBy.Model)
@@ -4309,10 +4331,10 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return ""
+		return reviewDispatchOutcome{}
 	}
 	if approvedPlan == nil {
-		return ""
+		return reviewDispatchOutcome{}
 	}
 
 	// Paths the operator authorized at approval time via the #730
@@ -5029,7 +5051,14 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			// A duplicate dispatch: remove the export we just created (#2486) —
 			// no reviewer will run against it on this path.
 			treeCleanup()
-			return ""
+			// A started row at this head is not a settled round (ADR-140 (#5047)
+			// D8): a retried upload must not read a lost gating round as no
+			// rejection. Read after the unlock and the cleanup, as it touches the
+			// audit store and decides no new dispatch.
+			if s.sameHeadGatingRoundLost(ctx, runID, stageID, headSHA) {
+				return reviewDispatchOutcome{interrupted: true}
+			}
+			return reviewDispatchOutcome{}
 		}
 	}
 
@@ -5067,9 +5096,9 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		)
 		s.emitPreRoundReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
 		if authority == planreview.AuthorityGating {
-			return implementReviewGatingRejectReason
+			return reviewDispatchOutcome{blockReason: implementReviewGatingRejectReason}
 		}
-		return ""
+		return reviewDispatchOutcome{}
 	}
 	injected := reviewDocs.Injected
 	trig.InjectedDocuments = injected
@@ -5096,7 +5125,7 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return ""
+		return reviewDispatchOutcome{}
 	}
 	s.recordCrewMessagesDelivered(ctx, runID, stageID, run.StageTypeReview, "implement_review", crewDeliveries.Sequences)
 
@@ -5178,20 +5207,26 @@ func (s *Server) runImplementReviewsForTree(ctx context.Context, runID, stageID 
 		go func() {
 			defer s.bgReviews.Done()
 			defer treeCleanup()
-			s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
+			// Advisory: nothing reads this outcome. An interrupted round is the boot sweep's.
+			_ = s.runImplementReviewLoopOutcome(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", "", stageBudget, treeDir, roundSeq, conventionRound)
 		}()
-		return ""
+		return reviewDispatchOutcome{}
 	}
 
 	// Gating: run synchronously so the caller can fail the stage as
 	// category-B before the terminal transition. Cleanup is owned by THIS scope
 	// because the loop runs to completion before runImplementReviews returns.
 	defer treeCleanup()
-	rejected := s.runImplementReviewInvocationsWithConventions(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", stageBudget, treeDir, roundSeq, conventionRound)
+	gatingLoop := s.runImplementReviewLoopOutcome(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, "", "", "", stageBudget, treeDir, roundSeq, conventionRound)
+	// A round shutdown stopped decides nothing, whatever a landed verdict said
+	// and whatever persona could not run.
+	if gatingLoop.interrupted {
+		return reviewDispatchOutcome{interrupted: true}
+	}
 	// An escalation-attached persona that could not run blocks the gating
 	// round (#3913), decided HERE so the loop's verdict accumulator is
 	// unchanged.
-	return implementReviewGatingFailureReason(rejected, escalationPersonaGateBlock(personaInvs))
+	return reviewDispatchOutcome{blockReason: implementReviewGatingFailureReason(gatingLoop.rejected, escalationPersonaGateBlock(personaInvs))}
 }
 
 // amendedScopeFilesForReview computes the approval-time scope folds that the
@@ -5629,7 +5664,7 @@ func (s *Server) scopeProvenanceForReview(ctx context.Context, runID, stageID uu
 // round key and supersedes nothing, and the PR relay uses its legacy
 // below-the-verdict derivation for those rows.
 func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget, treeDir string, roundSeq int64) bool {
-	return s.runImplementReviewInvocationsWithConventions(ctx, runID, stageID, invocations, authority, promptText, authorModel, origin, headSHA, reviewBudget, treeDir, roundSeq, reviewConventionRound{})
+	return s.runImplementReviewLoopOutcome(ctx, runID, stageID, invocations, authority, promptText, authorModel, origin, headSHA, "", reviewBudget, treeDir, roundSeq, reviewConventionRound{}).rejected
 }
 
 // runImplementReviewInvocationsWithConventions is runImplementReviewInvocations
@@ -5673,15 +5708,37 @@ func (s *Server) runImplementReviewInvocations(ctx context.Context, runID, stage
 // becomes visible, never the audit row order. A round in which every reviewer
 // failed synthesizes nothing; the next round re-evaluates.
 func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA string, reviewBudget planreview.ReviewBudget, treeDir string, roundSeq int64, conv reviewConventionRound) bool {
+	return s.runImplementReviewLoopOutcome(ctx, runID, stageID, invocations, authority, promptText, authorModel, origin, headSHA, "", reviewBudget, treeDir, roundSeq, conv).rejected
+}
+
+// runImplementReviewLoopOutcome is the loop's body, reporting interruption and a
+// known evidence-write failure as well as the verdict-only rejected flag.
+//
+// A reviewer stopped by daemon shutdown writes no terminal row and ends the
+// round before any later reviewer runs: both arms return before every post-loop
+// pass, leaving the round to the next process's boot sweep (ADR-140 (#5047) D8).
+//
+// stageAttempt is the attempt the caller captured before invoking anyone, stamped
+// on each verdict; only the gating supplemental pass passes one. Under the
+// bounded-terminal-write mark a lost terminal lets the remaining reviewers run, so
+// a later reject still records, then returns before every post-loop pass, as the
+// round is incomplete. A marked pass never releases a deferred acceptance fix-up:
+// that route's queue release carries no deadline, so the deferral waits for the
+// next settled round or boot.
+func (s *Server) runImplementReviewLoopOutcome(ctx context.Context, runID, stageID uuid.UUID, invocations []reviewerInvocation, authority planreview.AuthorityMode, promptText, authorModel, origin, headSHA, stageAttempt string, reviewBudget planreview.ReviewBudget, treeDir string, roundSeq int64, conv reviewConventionRound) reviewLoopOutcome {
 	st := &implementReviewLoopState{
 		runID: runID, stageID: stageID, authority: authority, authorModel: authorModel,
-		origin: origin, headSHA: headSHA, roundSeq: roundSeq, invocations: len(invocations),
+		origin: origin, headSHA: headSHA, stageAttempt: stageAttempt, roundSeq: roundSeq, invocations: len(invocations),
 	}
 	if len(conv.ModifiedFiles) == 0 {
 		// Streaming: each invocation is ingested before the next is invoked,
 		// exactly as before E55.3.
 		for i, inv := range invocations {
 			res := s.invokeImplementReviewer(ctx, i, inv, promptText, treeDir, reviewBudget)
+			if res.interrupted() {
+				s.logReviewerInterrupted(ctx, runID, stageID, i)
+				return reviewLoopOutcome{rejected: st.hasRejection, interrupted: true}
+			}
 			s.clampImplementReviewVerdict(ctx, runID, stageID, &res, conv)
 			s.ingestImplementReview(ctx, st, res)
 		}
@@ -5691,6 +5748,10 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 		results := make([]implementReviewInvocationResult, len(invocations))
 		for i, inv := range invocations {
 			results[i] = s.invokeImplementReviewer(ctx, i, inv, promptText, treeDir, reviewBudget)
+			if results[i].interrupted() {
+				s.logReviewerInterrupted(ctx, runID, stageID, i)
+				return reviewLoopOutcome{rejected: st.hasRejection, interrupted: true}
+			}
 		}
 		for i := range results {
 			s.clampImplementReviewVerdict(ctx, runID, stageID, &results[i], conv)
@@ -5699,6 +5760,10 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 		for _, res := range results {
 			s.ingestImplementReview(ctx, st, res)
 		}
+	}
+	terminalWrites := reviewTerminalWritesBound(ctx)
+	if terminalWrites != nil && terminalWrites.evidenceWriteFailed() {
+		return reviewLoopOutcome{rejected: st.hasRejection, evidenceWriteFailed: true}
 	}
 	round := st.round
 	hasRejection := st.hasRejection
@@ -5725,7 +5790,9 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 	// routable concerns too. Placed BEFORE recomputeAndPublishAuditComplete so
 	// the republished check reflects the re-opened stages of a routed pass.
 	// One audit list on a run with no deferral.
-	s.releaseDeferredAcceptanceFixup(ctx, runID)
+	if terminalWrites == nil {
+		s.releaseDeferredAcceptanceFixup(ctx, runID)
+	}
 
 	// The implement review has now written its terminal entries
 	// (implement_reviewed / implement_review_failed). Re-derive and
@@ -5749,19 +5816,31 @@ func (s *Server) runImplementReviewInvocationsWithConventions(ctx context.Contex
 		s.notifyPageClass(ctx, runID, "implement_review")
 	}
 
-	return hasRejection
+	return reviewLoopOutcome{rejected: hasRejection}
+}
+
+// logReviewerInterrupted is the loop's one INFO line for a reviewer shutdown stopped.
+func (s *Server) logReviewerInterrupted(ctx context.Context, runID, stageID uuid.UUID, reviewerIndex int) {
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "implement review: reviewer stopped for shutdown; the round is left to the next boot",
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stageID.String()),
+		slog.Int("reviewer_index", reviewerIndex),
+	)
 }
 
 // implementReviewLoopState is the state one implement-review round's ingests
-// share (runImplementReviewInvocationsWithConventions): the round's fixed
-// identity plus the accumulators the post-loop passes read.
+// share (runImplementReviewLoopOutcome): the round's fixed identity plus the
+// accumulators the post-loop passes read.
 type implementReviewLoopState struct {
 	runID, stageID  uuid.UUID
 	authority       planreview.AuthorityMode
 	authorModel     string
 	origin, headSHA string
-	roundSeq        int64
-	invocations     int
+	// stageAttempt is stamped on each verdict: the attempt the caller captured
+	// before any reviewer ran. Empty on every path but the gating supplemental pass.
+	stageAttempt string
+	roundSeq     int64
+	invocations  int
 	// hasRejection is true when at least one ingested verdict (after the
 	// ingest clamp) is reject.
 	hasRejection bool
@@ -5813,6 +5892,12 @@ type implementReviewInvocationResult struct {
 // succeeded reports whether the invocation produced a verdict to ingest.
 func (r implementReviewInvocationResult) succeeded() bool {
 	return r.ran && r.err == nil && r.verdict != nil
+}
+
+// interrupted reports whether daemon shutdown stopped this reviewer: its
+// invocation has no terminal row of any kind.
+func (r implementReviewInvocationResult) interrupted() bool {
+	return errors.Is(r.err, errReviewerStoppedForShutdown)
 }
 
 // invokeImplementReviewer is the INVOKE half of one implement-review
@@ -6069,7 +6154,11 @@ func (s *Server) ingestImplementReview(ctx context.Context, st *implementReviewL
 		VerdictRaisedFrom:                  res.verdictRaisedFrom,
 		ConventionsFileModifiedSynthesized: res.conventionsFileModifiedSynthesized,
 	}
-	payloadBytes, _ := json.Marshal(payload)
+	// The attempt that invoked this reviewer, captured before invocation (ADR-140
+	// (#5047) D8). Empty keeps today's bytes.
+	evidence := implementReviewedEvidence{ImplementReviewedPayload: payload}
+	evidence.StageAttempt = st.stageAttempt
+	payloadBytes, _ := json.Marshal(evidence)
 	systemKind := audit.ActorKind("system")
 	// Durable terminal write (E72.64 / #4106): retried, then a named
 	// verdict_write_failed or the lost-terminal registry.
@@ -6308,7 +6397,7 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 // + ResolveAuthority (skip when no agent reviewers), the wired-reviewer check
 // (skip when none), loadApprovedPlanForRun (skip on nil — nothing to judge
 // soundness against), resolveReviewerInvocations, groundReview, and
-// runImplementReviewInvocations, stamping Origin=base_rebase_reinvoke +
+// runImplementReviewLoopOutcome, stamping Origin=base_rebase_reinvoke +
 // headSHA so the verdict is labelable and the dispatch idempotent.
 //
 // Grounding (#4160): the pass goes through the shared groundReview decision.
@@ -6325,65 +6414,100 @@ func (s *Server) supersedeOpenImplementConcerns(ctx context.Context, runID, stag
 // (anchor_template.go), so emitting a fresh started would advance the floor
 // and BURY the first review's verdict. Skipping it keeps the floor at the
 // first review and lets this implement_reviewed entry count ADDITIVELY above
-// it.
+// it. A gating pass records its own start under supplemental_review_started,
+// which the anchor does not read.
 //
-// Returns true ONLY on a gating-authority reject (the caller fails the stage
-// category-B), or — with no reviewer run — on a gating-authority failure to
-// resolve or attribute the implement stage's declared documents (#2797).
-// Advisory dispatch is detached and returns false. A skipped
-// dispatch (no reviewers, no backend, no plan, or an idempotent duplicate)
-// returns false.
+// The bool wrapper returns true ONLY on a recorded gating block: a reject (the
+// caller fails the stage category-B), or — with no reviewer run — a gating-authority
+// failure to resolve or attribute the implement stage's declared documents (#2797).
+// It reads the stage for the attempt the dispatcher pins. The no-decision outcomes
+// are not blocks; the handler that owns the edge reads the typed dispatcher.
 func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stageID uuid.UUID, headSHA string, exemptions []prompt.GateScopeExemption) bool {
 	if s.cfg.RunRepo == nil || len(exemptions) == 0 {
 		return false
 	}
+	attempt := ""
+	if stage, err := s.cfg.RunRepo.GetStage(ctx, stageID); err == nil {
+		attempt = run.StageAttemptToken(stage.DispatchedAt)
+	}
+	return s.dispatchSupplementalReinvokeReview(ctx, runID, stageID, headSHA, attempt, exemptions).blocked()
+}
 
-	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: get run failed",
+// dispatchSupplementalReinvokeReview is the supplemental pass's body, returning
+// the typed outcome the caller that owns the stage edge reads. attempt is the
+// stage attempt the caller captured before any reviewer runs, stamped on each
+// gating verdict.
+//
+// A required gating pass (ADR-140 (#5047) D8, D9) is decided from recorded rows,
+// never from any verdict at this head: unreadable evidence is undecided and runs
+// no reviewer; a reject from any attempt blocks; a complete current-attempt set
+// skips; a recorded start with an incomplete set is a lost pass, interrupted, and
+// is never dispatched again on this attempt. Otherwise the atomic start allocation
+// runs after every early exit and before the first invocation, and only its winner
+// invokes every configured reviewer fresh. The pass runs under the caller's context
+// and its terminal writes keep that bound.
+//
+// Advisory dispatch keeps today's additive path: detached, any-verdict dedup, no
+// start row and no attempt. A skipped dispatch (no reviewers, no backend, no plan,
+// or an idempotent duplicate) returns the empty outcome.
+func (s *Server) dispatchSupplementalReinvokeReview(ctx context.Context, runID, stageID uuid.UUID, headSHA, attempt string, exemptions []prompt.GateScopeExemption) reviewDispatchOutcome {
+	if s.cfg.RunRepo == nil || len(exemptions) == 0 {
+		return reviewDispatchOutcome{}
+	}
+
+	// The ONE requirement decision: no reviewers, no backend (the first-review
+	// path already emitted implement_review_skipped for this stage) and no plan
+	// (nothing to measure the exemptions against) are not required, while a read
+	// fault is unknown rather than proof that no pass is due.
+	req := s.resolveSupplementalPassRequirement(ctx, runID)
+	if req.state == passRequirementUnknown {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: requirement unreadable — no reviewer dispatched",
 			slog.String("run_id", runID.String()),
-			slog.String("error", err.Error()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", req.err.Error()),
 		)
-		return false
+		return reviewDispatchOutcome{undecided: true}
 	}
+	if req.state != passRequiredGating && req.state != passRequiredAdvisory {
+		return reviewDispatchOutcome{}
+	}
+	runRow, reviewersCfg, authority, approvedPlan := req.runRow, req.reviewers, req.authority, req.plan
 
-	reviewersCfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
-	if reviewersCfg == nil || reviewersCfg.AgentCount() == 0 {
-		return false
-	}
-	authority := planreview.ResolveAuthority(*reviewersCfg)
+	var terminalWrites *reviewTerminalWriteBound
+	if req.state == passRequiredGating {
+		// The pass is proved only from recorded rows, so no audit store proves nothing.
+		if s.cfg.AuditRepo == nil {
+			return reviewDispatchOutcome{undecided: true}
+		}
+		// Every terminal write from here keeps this request's bound. A failure to
+		// prove the recorded evidence refuses the edge (ADR-140 (#5047) D8).
+		ctx, terminalWrites = withBoundedReviewTerminalWrites(ctx)
 
-	// No reviewer backend wired: nothing can run. The first-review path
-	// already emitted implement_review_skipped for this stage, so re-emitting
-	// here would only double-record the same degradation; skip quietly.
-	if s.defaultPlanReviewer() == nil {
-		return false
-	}
-
-	// Load the approved plan: the supplemental prompt judges exemption
-	// soundness against the plan's scope/approach (and the self-review guard
-	// needs GeneratedBy.Model). No plan → nothing to measure against → skip.
-	approvedPlan, err := s.loadApprovedPlanForRun(ctx, runID)
-	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: load plan failed",
-			slog.String("run_id", runID.String()),
-			slog.String("error", err.Error()),
-		)
-		return false
-	}
-	if approvedPlan == nil {
-		return false
-	}
-
-	// Idempotency (#1250): a retried PR-upload with the SAME re-landed head SHA
-	// must not dispatch a second supplemental review. Dedup on
-	// (stage_id, Origin=base_rebase_reinvoke, head_sha). Best-effort and
-	// non-atomic — acceptable because the runner drives a stage's PR-uploads
-	// serially, so there is no concurrent second dispatch to race; a list
-	// error WARN-logs and falls through to dispatch (fail-open, never suppress
-	// a review on a read failure). An empty headSHA cannot be deduped, but the
-	// caller only invokes this on a success ship that carries pr.HeadSHA.
-	if headSHA != "" && s.cfg.AuditRepo != nil {
+		state, stateErr := s.supplementalRoundState(ctx, runID, stageID, headSHA, attempt)
+		if stateErr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: round evidence unreadable — no reviewer dispatched",
+				slog.String("run_id", runID.String()),
+				slog.String("stage_id", stageID.String()),
+				slog.String("error", stateErr.Error()),
+			)
+			return reviewDispatchOutcome{undecided: true}
+		}
+		if state.rejected {
+			return reviewDispatchOutcome{blockReason: implementReviewGatingRejectReason}
+		}
+		if supplementalPassDischarged(state) {
+			return reviewDispatchOutcome{}
+		}
+		if state.startedThisAttempt {
+			return reviewDispatchOutcome{interrupted: true}
+		}
+	} else if headSHA != "" && s.cfg.AuditRepo != nil {
+		// Idempotency (#1250): a retried advisory PR-upload with the SAME re-landed
+		// head SHA must not dispatch a second supplemental review. Dedup on
+		// (stage_id, Origin=base_rebase_reinvoke, head_sha). A list error WARN-logs
+		// and falls through to dispatch (fail-open, never suppress a review on a
+		// read failure). An empty headSHA cannot be deduped, but the caller only
+		// invokes this on a success ship that carries pr.HeadSHA.
 		reviewed, lerr := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, "implement_reviewed")
 		if lerr != nil {
 			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: list implement_reviewed failed — proceeding with dispatch",
@@ -6392,7 +6516,7 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 				slog.String("error", lerr.Error()),
 			)
 		} else if supplementalReinvokeReviewAlreadyRecorded(reviewed, stageID, headSHA) {
-			return false
+			return reviewDispatchOutcome{}
 		}
 	}
 
@@ -6430,8 +6554,9 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 	// (#2797), through the same seam and with the same fail-closed contract as
 	// runImplementReviewsForTree: no reviewer runs on a document-less prompt,
 	// implement_review_failed (reason document_injection_failed: …) records the
-	// cause, and under gating authority this returns true so the caller fails
-	// the stage category-B and closes the PR.
+	// cause, and under gating authority this returns the block so the caller fails
+	// the stage category-B and closes the PR. If that row itself is lost the failure
+	// has no recorded cause, so the known write failure answers instead (§45).
 	injected, err := s.resolveReviewInjectedDocuments(ctx, runRow, stageID)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: document injection failed — no reviewer dispatched",
@@ -6440,7 +6565,13 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 			slog.String("error", err.Error()),
 		)
 		s.emitReviewFailed(ctx, runID, stageID, "implement_review_failed", authority, "", reviewDocumentInjectionFailedReason(err), false)
-		return authority == planreview.AuthorityGating
+		if authority != planreview.AuthorityGating {
+			return reviewDispatchOutcome{}
+		}
+		if terminalWrites.evidenceWriteFailed() {
+			return reviewDispatchOutcome{evidenceWriteFailed: true}
+		}
+		return reviewDispatchOutcome{blockReason: implementReviewGatingRejectReason}
 	}
 	trig.InjectedDocuments = injected
 
@@ -6473,11 +6604,10 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 			slog.String("run_id", runID.String()),
 			slog.String("error", err.Error()),
 		)
-		return false
+		return reviewDispatchOutcome{undecided: authority == planreview.AuthorityGating}
 	}
 
 	authorModel := approvedPlan.GeneratedBy.Model
-	reviewCtx := context.WithoutCancel(ctx)
 
 	// Per-stage review-budget floor (#1494): same resolution as the first
 	// implement review — the stage's reviewers.review_timeout overrides the
@@ -6497,6 +6627,7 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 	// (immediately, on the advisory path) while the detached reviewers still
 	// hold it as their working directory.
 	if authority != planreview.AuthorityGating {
+		advisoryCtx := context.WithoutCancel(ctx)
 		s.bgReviews.Add(1)
 		go func() {
 			defer s.bgReviews.Done()
@@ -6504,17 +6635,59 @@ func (s *Server) runSupplementalReinvokeReview(ctx context.Context, runID, stage
 			// roundSeq 0 (#3593): the supplemental pass emits no
 			// implement_review_started row, so it records no round key and marks
 			// nothing; the relay's legacy fallback applies to its verdicts.
-			s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, treeDir, 0)
+			// Advisory: nothing reads this outcome, and a stopped pass writes no row.
+			_ = s.runImplementReviewLoopOutcome(advisoryCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, "", stageBudget, treeDir, 0, reviewConventionRound{})
 		}()
-		return false
+		return reviewDispatchOutcome{}
 	}
 
 	// Gating: run synchronously so the caller can fail the stage category-B
-	// before responding. Same no-started-emission discipline. Cleanup is owned
-	// by THIS scope because the loop runs to completion before this returns.
-	// roundSeq 0 (#3593): no started row, so no round key is recorded.
+	// before responding. Same no-implement_review_started discipline. Cleanup is
+	// owned by THIS scope because the loop runs to completion before this returns.
 	defer treeCleanup()
-	return s.runImplementReviewInvocations(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, stageBudget, treeDir, 0)
+
+	// The atomic start (ADR-140 (#5047) D8, D9), after every early exit and before
+	// the first invocation. Two processes that both read no start cannot both run
+	// reviewers: a loser re-reads what the survivor's rows prove and runs nothing.
+	allocation, allocErr := s.allocateSupplementalPass(ctx, runID, stageID, headSHA, attempt, req.agentCount, exemptionPaths(exemptions))
+	if allocErr != nil {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "supplemental reinvoke review: start allocation failed — no reviewer dispatched",
+			slog.String("run_id", runID.String()),
+			slog.String("stage_id", stageID.String()),
+			slog.String("error", allocErr.Error()),
+		)
+		return reviewDispatchOutcome{undecided: true}
+	}
+	if !allocation.won {
+		survivor, survivorErr := s.supplementalRoundState(ctx, runID, stageID, headSHA, attempt)
+		switch {
+		case survivorErr != nil:
+			return reviewDispatchOutcome{undecided: true}
+		case survivor.rejected:
+			return reviewDispatchOutcome{blockReason: implementReviewGatingRejectReason}
+		case supplementalPassDischarged(survivor):
+			return reviewDispatchOutcome{}
+		}
+		return reviewDispatchOutcome{interrupted: true}
+	}
+
+	// The gating pass runs under the caller's context: its deadline and shutdown
+	// reach reviewers and writes alike. roundSeq 0 (#3593): no
+	// implement_review_started row, so no round key is recorded.
+	reviewCtx := ctx
+	loop := s.runImplementReviewLoopOutcome(reviewCtx, runID, stageID, invocations, authority, promptText, authorModel, planreview.OriginBaseRebaseReinvoke, headSHA, attempt, stageBudget, treeDir, 0, reviewConventionRound{})
+	if loop.interrupted {
+		return reviewDispatchOutcome{interrupted: true}
+	}
+	// A known write failure wins over the local reject flag: an unrecorded verdict
+	// drives no edge, whichever reviewer's row was lost.
+	if loop.evidenceWriteFailed {
+		return reviewDispatchOutcome{evidenceWriteFailed: true}
+	}
+	if loop.rejected {
+		return reviewDispatchOutcome{blockReason: implementReviewGatingRejectReason}
+	}
+	return reviewDispatchOutcome{}
 }
 
 // supplementalReinvokeReviewAlreadyRecorded reports whether a base-rebase
