@@ -7844,7 +7844,9 @@ components:
         Echoed by `POST /v0/runs/{run_id}/pull-request` for the failure
         variant (`outcome: failed`, #742): the runner-reported
         commit/push/PR-open failure was recorded and the implement stage
-        transitioned to `failed`.
+        transitioned to `failed`. It also answers a fix-up or
+        conflict-resolution push report refused on a running implement stage
+        (ADR-141), whose existing recovery may then restore the stage.
       required: [stage_id, outcome, category]
       properties:
         stage_id: { $ref: '#/components/schemas/UUID' }
@@ -28108,7 +28110,10 @@ paths:
         **Delivered-nothing refund (#967 / #1957 / #3085).** A fix-up pass
         that landed NOTHING on the PR branch is refunded against the NORMAL
         budget, so the next trigger is admitted WITHOUT
-        `force_additional_pass`. The server computes the stage's
+        `force_additional_pass`. Landing is read from the `fixup_pushed` row:
+        a pass whose push report exhausted its retries (ADR-141, #5053) has
+        none, so it refunds even though its commit can be on the branch. The
+        server computes the stage's
         `stage_fixup_triggered` windows once and asks ONE question per window
         — does it hold at least one delivered-nothing signal and NO
         `fixup_pushed` entry? A window refunds AT MOST ONCE however many
@@ -30459,6 +30464,18 @@ paths:
         job that pushed the same commits returns the existing
         artifact unchanged rather than inserting a duplicate.
 
+        **Forge-confirmed push reports (ADR-141, #5053).** A new
+        `fixup_pushed`, `conflict_resolution_pushed` or
+        `acceptance_scenarios_pushed` report writes its audit row only when
+        its `head_sha` exactly equals the forge PR head or the tip of a
+        server-derived branch; reachability alone is refused. The conflict
+        and acceptance reports also need `base_sha` to be that head's first
+        parent. An admitted row records the forge-resolved branch, not the
+        reported one. A replay of a recorded report stays an idempotent 200.
+        A server with no forge client and a run with no installation (every
+        GitLab run) skip this check as explicit residuals, so it is not
+        universal forge verification.
+
         v0 has no formal JSON Schema for the body — required-field
         checks happen in the handler. v1+ may graduate this to a
         versioned `pull_request_v1` schema.
@@ -30509,7 +30526,16 @@ paths:
               (`outcome: merge_candidate_verified`, ADR-090 / #4018) was
               accepted: the head-bound result was recorded (or an idempotent
               replay found it already recorded) and the implement stage was
-              returned to its pre-pass gate.
+              returned to its pre-pass gate, or
+            - a `fixup_pushed` or `conflict_resolution_pushed` report on a
+              running implement stage disagreed with forge state (ADR-141,
+              #5053) and was refused: the body is a
+              `PullRequestFailureResponse` and no push row was written.
+              `category` is `B` with an active fix-up trigger, whose recovery
+              keeps its pass consumed, or `C` with none, which is retryable. A
+              live merge-candidate or conflict trigger still recovers first.
+              The refusal can be a benign head-movement race and is not proof
+              of misconduct.
           content:
             application/json:
               schema:
@@ -30527,6 +30553,28 @@ paths:
             report arrived for a stage with no live (unconsumed, fully
             populated) merge-candidate verify trigger, so it cannot be bound to
             a head. Nothing is recorded.
+
+            `reported_head_mismatch` (ADR-141, #5053): an
+            `acceptance_scenarios_pushed` report, or a `fixup_pushed` or
+            `conflict_resolution_pushed` report on a non-implement or settled
+            stage, disagreed with forge state. No push row is written and the
+            stage does not transition. `details` names the run, stage, `reason`
+            (`head` or `base_edge`) and the bounded reported and forge values.
+            This can be a benign head-movement race and is not proof of
+            misconduct.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `reported_head_unverifiable` (ADR-141, #5053): a forge, required
+            repository or required trigger-state read failed, or a dedup read
+            failed on a putative mismatch, so confirmation of a push report is
+            unknown. No row is written and the stage does not transition;
+            re-post the same report.
+
+            `pull_request_upload_unconfigured`: the server has no signing,
+            artifact, audit or run repository wired.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

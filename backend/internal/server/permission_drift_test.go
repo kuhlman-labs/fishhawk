@@ -103,6 +103,11 @@ type driftGH struct {
 	contentStatus map[string]int // "ref|path" → status
 	calls         int
 	fetched       []string // every contents read, "ref|path", in order (an injected-status read included)
+	// The forge state a push report's admission check reads (ADR-141). Unset
+	// routes answer 404, as they always have for every other test.
+	prHead  string              // GET /pulls/{n} head.sha ("" → 404)
+	tip     string              // GET /git/ref/heads/{branch} object.sha ("" → 404, the branch is absent)
+	parents map[string][]string // GET /git/commits/{sha} parents (unlisted → 404)
 }
 
 func newDriftGH() *driftGH {
@@ -143,6 +148,31 @@ func (g *driftGH) serve(w http.ResponseWriter, r *http.Request) {
 	g.calls++
 	w.Header().Set("Content-Type", "application/json")
 	p := r.URL.Path
+	if strings.Contains(p, "/pulls/") && g.prHead != "" {
+		// No base ref, so the lineage guard stays on the fail-open arm it has
+		// always taken on this fixture.
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"node_id": "PR_x", "state": "open", "head": map[string]string{"sha": g.prHead, "ref": "fishhawk/run-x"},
+		})
+		return
+	}
+	if strings.Contains(p, "/git/ref/heads/") && g.tip != "" {
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": g.tip}})
+		return
+	}
+	if i := strings.Index(p, "/git/commits/"); i >= 0 {
+		sha := p[i+len("/git/commits/"):]
+		if parents, ok := g.parents[sha]; ok {
+			rows := make([]map[string]string, 0, len(parents))
+			for _, parent := range parents {
+				rows = append(rows, map[string]string{"sha": parent})
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"sha": sha, "tree": map[string]string{"sha": "tree-" + sha}, "parents": rows,
+			})
+			return
+		}
+	}
 	if i := strings.Index(p, "/compare/"); i >= 0 {
 		if g.compareStatus != 0 {
 			w.WriteHeader(g.compareStatus)
@@ -457,6 +487,7 @@ func TestPermissionDrift_PullRequestReportToHumanWaive(t *testing.T) {
 func TestPermissionDrift_FixupPushedRaises(t *testing.T) {
 	f := newDriftFixture(t)
 	f.workflowChange(wfBase, wfWidened)
+	f.gh.tip = driftHead
 	body, _ := json.Marshal(map[string]any{
 		"outcome": "fixup_pushed", "branch": "fishhawk/run-x", "head_sha": driftHead, "base_sha": driftBase, "files_changed_count": 1,
 	})
@@ -580,6 +611,8 @@ func TestPermissionDrift_ConflictResolutionIntersects(t *testing.T) {
 		f.workflowChange(wfBase, wfWidened)
 		f.gh.put(mainRef, driftWFPath, wfBase)
 		f.seedConflictTrigger(t, mainRef)
+		f.gh.tip = driftHead
+		f.gh.parents = map[string][]string{driftHead: {driftBase, "base-branch-tip"}}
 		body, _ := json.Marshal(map[string]any{
 			"outcome": "conflict_resolution_pushed", "branch": "fishhawk/run-x", "head_sha": driftHead, "base_sha": driftBase,
 		})
@@ -1700,6 +1733,11 @@ func TestPermissionDrift_FixupHandlerReadsExtensionAtRunBase(t *testing.T) {
 		t.Fatalf("rows after PR open = %d, want 0 (infra/app.json is unchanged base → head)", n)
 	}
 
+	// The PR-opened report tracks the pull request, so the fix-up's admission
+	// check reads the PR head from the forge.
+	f.gh.mu.Lock()
+	f.gh.prHead = driftHead2
+	f.gh.mu.Unlock()
 	fixup, _ := json.Marshal(map[string]any{
 		"outcome": "fixup_pushed", "branch": "fishhawk/run-x", "head_sha": driftHead2, "base_sha": driftHead, "files_changed_count": 1,
 	})

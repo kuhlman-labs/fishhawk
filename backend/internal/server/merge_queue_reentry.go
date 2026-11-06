@@ -40,7 +40,13 @@ package server
 //     merge_commit_sha, walked in chain-sequence order after the push and
 //     read from audit rows only (never a commit author). A foreign push, a
 //     vouched commit or an unverified base merge is not a member, so that run
-//     falls back to the operator's fishhawk_merge_run;
+//     falls back to the operator's fishhawk_merge_run. On an
+//     installation-bearing run those push rows were forge-checked when written
+//     (ADR-141, #5053: an exact head, plus a first-parent base on the two edge
+//     kinds; refuseUnverifiedReportedHead), so this walk re-reads no forge edge
+//     and this gate still pins the terminal head to the live PR. A run with no
+//     installation or forge client admits its rows unchecked, and a check does
+//     not establish who authored a commit;
 //  6. the ENTRY-variant eligibility (mergeQueueEligibility) passes at the NEW
 //     head, with a LIVE forge approval read there when the review stage
 //     declares an approval gate: an approval the fix-up push dismissed means
@@ -438,7 +444,13 @@ func (s *Server) mergeQueueFixupPushedAfter(ctx context.Context, e mergequeue.En
 
 // mergeQueueReentryDescendantCategories are the product-push audit rows the
 // qualifying-head walk reads (#4703): each records a commit Fishhawk itself
-// put on the run branch on top of a recorded prior head.
+// put on the run branch on top of a recorded prior head. The walk reads these
+// rows only. The acceptance and conflict-resolution edges were forge-checked
+// when written (ADR-141: exact head and first-parent base) on an
+// installation-bearing run, so there an acceptance or conflict edge the forge
+// did not confirm has no row. The rebase writer verifies a clean base merge's
+// parents (ADR-112), but an unverified base merge still has a branch_rebased
+// row with clean_verified=false, and isCleanAdvance filters it from the walk.
 var mergeQueueReentryDescendantCategories = []string{CategoryAcceptanceScenariosPushed, CategoryConflictResolutionPushed, CategoryBranchRebased}
 
 // reentryDescendantEdge decodes one product-push row into its (parent, child)
