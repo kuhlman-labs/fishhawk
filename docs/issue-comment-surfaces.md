@@ -2093,9 +2093,11 @@ Notes:
   (key absent). A fourth kind, `scope_amendment_refused` (#4679), is written by
   `server/scope_amendment.go` (`server/slice_ownership.go`) when the
   slice-ownership guard refuses a child's amendment — phase `request` (agent
-  actor, `{phase, paths, reason, slice_ownership}`, no row created) or phase
+  actor, `{phase, paths, reason, slice_ownership}`, no row created), phase
   `decide` (user actor, `{phase, amendment_id, paths, slice_ownership}`, the
-  row stays pending). It is internal-only: no Notifier method, NOT in
+  row stays pending), or, since #4798, phase `resume` or
+  `scope_completeness_amend` (user actor, `{phase, paths, reason,
+  slice_ownership}`, no row created). It is internal-only: no Notifier method, NOT in
   `activityCategories`, and withheld from run-bound audit reads.
 - The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
   `scope_completeness_exempted`, `scope_completeness_amended`, and

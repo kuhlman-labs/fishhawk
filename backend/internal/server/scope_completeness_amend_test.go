@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"sort"
@@ -29,34 +30,87 @@ const (
 	amendHeldSHA      = "1111111111111111111111111111111111111111"
 	amendRunBranch    = "fishhawk/run-parent/slice-0"
 	amendVerifiedTree = "2222222222222222222222222222222222222222"
+	amendConsolidated = "fishhawk/run-parent"
 )
 
 // amendFixture is the state an `amend` decision acts on: a DECOMPOSED CHILD
-// (slice 0) whose implement stage is parked on a #2548 BUILD-REQUIRED shortfall
-// — the class whose `exempt` is refused outright, so before #2591 its only
-// resolution was `fail`. The coupled path is attributed to sibling slice 1,
-// whose own implement stage exists and has NOT started.
+// whose implement stage is parked on a #2548 BUILD-REQUIRED shortfall — the
+// class whose `exempt` is refused outright, so before #2591 its only resolution
+// was `fail` — under a REAL approved decomposition on its parent (#4798). The
+// child is locked local, and every other slice has a minted sibling run.
 type amendFixture struct {
-	s       *Server
-	rr      *orchestratorRepo
-	au      *auditFake
-	sa      *fakeScopeAmendmentRepo
-	child   *run.Run
-	stage   *run.Stage
-	sibling *run.Run
-	sibImpl *run.Stage
+	s         *Server
+	rr        *orchestratorRepo
+	au        *auditFake
+	sa        *fakeScopeAmendmentRepo
+	art       *fakeArtifactRepo
+	parent    *run.Run
+	planStage *run.Stage
+	child     *run.Run
+	stage     *run.Stage
+	// sibling and sibImpl are slice 1's run and implement stage.
+	sibling  *run.Run
+	sibImpl  *run.Stage
+	siblings map[int]*run.Run
+	sibImpls map[int]*run.Stage
 }
 
+// newAmendFixture is the amend mechanics shape: slice 0 depends_on [1], slice 1
+// declares the coupled path and is a DELIVERED ancestor (run and implement
+// succeeded, named by the parent's newest slices_integrated), so the mechanics
+// tests keep their 200 on production shape.
 func newAmendFixture(t *testing.T) *amendFixture {
 	t.Helper()
+	f := newAmendFixtureWithPlan(t, 0, ownershipSlices(
+		ownSpec{files: []string{"backend/internal/server/own.go"}, deps: []int{1}},
+		ownSpec{files: []string{amendCoupledPath}},
+	))
+	f.deliver(1)
+	f.integrate(amendConsolidated, 1)
+	return f
+}
+
+// newLegacyAmendFixture is the only shape left to the #2591 not-started and
+// acknowledgement branch: a plan with no depends_on edge whose slice 1 does NOT
+// declare the coupled path, while the park still attributes it there.
+func newLegacyAmendFixture(t *testing.T) *amendFixture {
+	t.Helper()
+	return newAmendFixtureWithPlan(t, 0, ownershipSlices(
+		ownSpec{files: []string{"backend/internal/server/own.go"}},
+		ownSpec{files: []string{"backend/internal/server/other.go"}},
+	))
+}
+
+// newAmendFixtureWithPlan seeds subPlans as the parent's approved decomposition
+// and parks the child at childSlice. No sibling has started.
+func newAmendFixtureWithPlan(t *testing.T, childSlice int, subPlans []plan.SubPlanSummary) *amendFixture {
+	t.Helper()
 	rr := newOrchestratorRepo()
-	parentID := uuid.New()
+	au := newAuditFake()
+	sa := newFakeScopeAmendmentRepo()
+	art := newFakeArtifactRepo()
 
+	parent := rr.seedRun()
+	planStage := rr.seedStage(parent.ID, 0, run.StageStateSucceeded)
+	f := &amendFixture{rr: rr, au: au, sa: sa, art: art, parent: parent, planStage: planStage,
+		siblings: map[int]*run.Run{}, sibImpls: map[int]*run.Stage{}}
+	f.seedParentPlan(t, &plan.Plan{
+		PlanVersion:   "standard_v1",
+		Summary:       "decomposed plan",
+		Verification:  plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: &plan.Decomposition{Rationale: "split", SubPlans: subPlans},
+	})
+
+	parentID := parent.ID
 	child := rr.seedRun()
-	slice0, slice1 := 0, 1
+	idx := childSlice
 	child.DecomposedFrom = &parentID
-	child.SliceIndex = &slice0
+	child.ParentRunID = &parentID
+	child.SliceIndex = &idx
+	child.RunnerKind = run.RunnerKindLocal
+	child.RunnerKindResolved = true
 
+	slice1 := 1
 	stage := rr.seedStage(child.ID, 1, run.StageStateAwaitingScopeDecision)
 	stage.Type = run.StageTypeImplement
 	stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{
@@ -69,19 +123,80 @@ func newAmendFixture(t *testing.T) *amendFixture {
 			{Path: amendCoupledPath, SliceIndex: &slice1, SliceTitle: "prompt plumbing"},
 		},
 	}
+	f.child, f.stage = child, stage
 
-	sibling := rr.seedRun()
-	sibling.DecomposedFrom = &parentID
-	sibling.SliceIndex = &slice1
-	sibImpl := rr.seedStage(sibling.ID, 1, run.StageStatePending)
-	sibImpl.Type = run.StageTypeImplement // StartedAt nil: the sibling has not begun
+	for i := range subPlans {
+		if i == childSlice {
+			continue
+		}
+		sib := rr.seedRun()
+		sliceIdx := i
+		sib.DecomposedFrom = &parentID
+		sib.ParentRunID = &parentID
+		sib.SliceIndex = &sliceIdx
+		impl := rr.seedStage(sib.ID, 1, run.StageStatePending)
+		impl.Type = run.StageTypeImplement // StartedAt nil: the sibling has not begun
+		f.siblings[i], f.sibImpls[i] = sib, impl
+	}
+	f.sibling, f.sibImpl = f.siblings[1], f.sibImpls[1]
 
-	au := newAuditFake()
-	sa := newFakeScopeAmendmentRepo()
-	s := New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au, ScopeAmendmentRepo: sa})
+	f.s = New(Config{Addr: "127.0.0.1:0", RunRepo: newScopeParkDeciderRepo(rr, au), AuditRepo: au,
+		ScopeAmendmentRepo: sa, ArtifactRepo: art})
+	return f
+}
 
-	return &amendFixture{s: s, rr: rr, au: au, sa: sa,
-		child: child, stage: stage, sibling: sibling, sibImpl: sibImpl}
+// seedParentPlan replaces the parent's approved plan artifact.
+func (f *amendFixture) seedParentPlan(t *testing.T, p *plan.Plan) {
+	t.Helper()
+	f.art.all = nil
+	body, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := "standard_v1"
+	if _, err := f.art.Create(context.Background(), artifact.CreateParams{
+		StageID: f.planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: body,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+}
+
+// deliver marks a sibling's run and implement stage succeeded with a start stamp.
+func (f *amendFixture) deliver(idx int) {
+	started := time.Now().UTC().Add(-time.Hour)
+	f.siblings[idx].State = run.StateSucceeded
+	f.sibImpls[idx].State = run.StageStateSucceeded
+	f.sibImpls[idx].StartedAt = &started
+}
+
+// setRunning marks a sibling's run and implement stage in flight.
+func (f *amendFixture) setRunning(idx int) {
+	started := time.Now().UTC().Add(-time.Minute)
+	f.siblings[idx].State = run.StateRunning
+	f.sibImpls[idx].State = run.StageStateRunning
+	f.sibImpls[idx].StartedAt = &started
+}
+
+// integrate makes the parent's newest slices_integrated name branch and these
+// slices' runs.
+func (f *amendFixture) integrate(branch string, slices ...int) {
+	ids := make([]string, 0, len(slices))
+	for _, i := range slices {
+		ids = append(ids, f.siblings[i].ID.String())
+	}
+	f.integrateIDs(branch, ids...)
+}
+
+// integrateIDs is integrate with literal child run ids.
+func (f *amendFixture) integrateIDs(branch string, ids ...string) {
+	payload, _ := json.Marshal(map[string]any{"consolidated_branch": branch, "child_run_ids": ids})
+	f.seedIntegrationPayload(payload)
+}
+
+// seedIntegrationPayload seeds the raw newest slices_integrated payload.
+func (f *amendFixture) seedIntegrationPayload(payload json.RawMessage) {
+	rid := f.parent.ID
+	f.au.seeded = []*audit.Entry{{RunID: &rid, Category: "slices_integrated", Payload: payload}}
 }
 
 // scopeAmendBody renders a decision body naming the coupled path.
@@ -151,6 +266,60 @@ func (f *amendFixture) repark(t *testing.T, heldSHA string) {
 	next.HeldCommitSHA = heldSHA
 	f.stage.ScopeCompletenessPark = &next
 	f.stage.State = run.StageStateAwaitingScopeDecision
+}
+
+// refusedRows returns the scope_amendment_refused entries on the child.
+func (f *amendFixture) refusedRows() []audit.ChainAppendParams {
+	f.au.mu.Lock()
+	defer f.au.mu.Unlock()
+	var out []audit.ChainAppendParams
+	for _, e := range f.au.appended {
+		if e.Category == CategoryScopeAmendmentRefused {
+			out = append(out, e)
+		}
+	}
+	return out
+}
+
+// parkSnapshot captures the persisted park so assertAmendUntouched can compare it.
+func (f *amendFixture) parkSnapshot(t *testing.T) string {
+	t.Helper()
+	got, err := f.rr.GetStage(context.Background(), f.stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	raw, err := json.Marshal(got.ScopeCompletenessPark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// assertAmendUntouched is what every #4798 refusal must leave: no amendment row
+// of ANY status, the stage still parked, the park byte-equal to its pre-call
+// snapshot and no scope_completeness_amended entry, so no cap slot was spent.
+func (f *amendFixture) assertAmendUntouched(t *testing.T, parkBefore string) {
+	t.Helper()
+	got, err := f.rr.GetStage(context.Background(), f.stage.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if got.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want it left parked", got.State)
+	}
+	all, err := f.sa.ListByRun(context.Background(), f.child.ID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(all) != 0 {
+		t.Errorf("%d amendment row(s) of any status, want 0", len(all))
+	}
+	if after := f.parkSnapshot(t); after != parkBefore {
+		t.Errorf("park changed:\n got: %s\nwant: %s", after, parkBefore)
+	}
+	if entries := f.amendedEntries(); len(entries) != 0 {
+		t.Errorf("%d scope_completeness_amended entr(ies), want 0", len(entries))
+	}
 }
 
 // assertNoSideEffects is the shape every amend REFUSAL must present: the stage
@@ -487,8 +656,9 @@ func TestAmend_IncompleteCoverage409(t *testing.T) {
 }
 
 // TestAmend_OwnerSliceActive409 (counterfactual: the owner-slice guard). The
-// sibling that OWNS the coupled path has already begun its implement pass, so
-// from that moment two branches can carry divergent edits to one file.
+// sibling the PARK attributes the coupled path to, on a path the plan does not
+// declare, has already begun its implement pass, so from that moment two
+// branches can carry divergent edits to one file.
 //
 // One arm per DISJUNCT of the refusal predicate — `StartedAt != nil ||
 // State == succeeded` — each seeded BY CONSTRUCTION at fixture time. The
@@ -520,7 +690,7 @@ func TestAmend_OwnerSliceActive409(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newAmendFixture(t)
+			f := newLegacyAmendFixture(t)
 			tc.setup(f)
 
 			w := postAmend(t, f, scopeAmendBody("widen despite the active sibling"))
@@ -541,11 +711,13 @@ func TestAmend_OwnerSliceActive409(t *testing.T) {
 	}
 }
 
-// TestAmend_OwnerSliceNotStartedAllowed is the OTHER side of the StartedAt
-// predicate: an owner that has not begun cannot hold a divergent edit, so the
-// amend proceeds with NO acknowledgement and the owning slice is named.
-func TestAmend_OwnerSliceNotStartedAllowed(t *testing.T) {
-	f := newAmendFixture(t) // sibling implement stage: StartedAt nil, state pending
+// TestAmend_UndeclaredParkAttributionNotStartedResolved is the OTHER side of the
+// StartedAt predicate, on the only path left to it (#4798): a path the plan does
+// not declare whose park-attributed owner has not begun cannot hold a divergent
+// edit, so the amend proceeds with NO acknowledgement and the owning slice is
+// named. A plan-declared non-ancestor never gets here: TestAmend_SliceOwnership.
+func TestAmend_UndeclaredParkAttributionNotStartedResolved(t *testing.T) {
+	f := newLegacyAmendFixture(t) // sibling implement stage: StartedAt nil, state pending
 
 	w := postAmend(t, f, scopeAmendBody("the owning slice has not started"))
 	if w.Code != http.StatusOK {
@@ -627,7 +799,7 @@ func TestAmend_OwnerAttributionUnresolvedFailsClosed(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newAmendFixture(t)
+			f := newLegacyAmendFixture(t)
 			tc.setup(f)
 
 			w := postAmend(t, f, scopeAmendBody("widen with unresolvable ownership"))
@@ -681,7 +853,7 @@ func (r *listStagesErrRepo) ListStagesForRun(ctx context.Context, runID uuid.UUI
 // TestAmend_OwnerListRunsErrorFailsClosed: an unreadable sibling list is not
 // evidence that no sibling is active, so it takes the same fail-CLOSED path.
 func TestAmend_OwnerListRunsErrorFailsClosed(t *testing.T) {
-	f := newAmendFixture(t)
+	f := newLegacyAmendFixture(t)
 	f.s.cfg.RunRepo = &listRunsErrRepo{f.rr}
 
 	w := postAmend(t, f, scopeAmendBody("widen with an unreadable sibling list"))
@@ -720,7 +892,7 @@ func TestAmend_UnresolvedAcknowledgementReadmitsAndIsRecorded(t *testing.T) {
 			amendOwnerUnresolvedStagesUnread},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newAmendFixture(t)
+			f := newLegacyAmendFixture(t)
 			tc.setup(f)
 
 			w := postAmend(t, f, `{"decision":"amend","reason":"accepting the sibling-conflict risk knowingly",`+
@@ -762,12 +934,11 @@ func TestAmend_UnresolvedAcknowledgementReadmitsAndIsRecorded(t *testing.T) {
 }
 
 // TestAmend_AcknowledgementDoesNotRelaxTheActiveOwnerRefusal: the escape hatch
-// covers UNRESOLVED ownership only. A RESOLVED-and-started owner is a known
+// covers UNRESOLVED ownership only. An ancestor still running is a known
 // conflict and stays refused however loudly the operator acknowledges.
 func TestAmend_AcknowledgementDoesNotRelaxTheActiveOwnerRefusal(t *testing.T) {
 	f := newAmendFixture(t)
-	started := time.Now().UTC().Add(-time.Minute)
-	f.sibImpl.StartedAt = &started
+	f.setRunning(1)
 
 	w := postAmend(t, f, `{"decision":"amend","reason":"try to acknowledge past a live sibling",`+
 		`"acknowledge_owner_unresolved":true,"paths":[{"path":"`+amendCoupledPath+`","operation":"modify"}]}`)
@@ -1601,4 +1772,1092 @@ func TestAmend_ExemptedPayloadUnchanged(t *testing.T) {
 			}
 		})
 	}
+}
+
+// --- #4798: the slice-ownership guard and the ancestor-delivery proof -------
+
+// amendDecisionBody renders an amend decision naming paths, with the operation modify.
+func amendDecisionBody(reason string, acknowledge bool, paths ...string) string {
+	entries := make([]string, 0, len(paths))
+	for _, p := range paths {
+		entries = append(entries, fmt.Sprintf(`{"path":%q,"operation":"modify"}`, p))
+	}
+	ack := ""
+	if acknowledge {
+		ack = `"acknowledge_owner_unresolved":true,`
+	}
+	return fmt.Sprintf(`{"decision":"amend","reason":%q,%s"paths":[%s]}`, reason, ack, strings.Join(entries, ","))
+}
+
+const (
+	amendAncestorPath   = "docs/ancestor.md"
+	amendTransitivePath = "docs/transitive.md"
+	amendUndeclaredPath = "docs/nobody.md"
+)
+
+// newAmendOwnershipFixture is the contract's fixture: the child at slice 0
+// depends_on [2] and owns own/; slice 1 declares the coupled path with no edge;
+// slice 2 depends_on [3]; slices 2 and 3 are delivered and named by the parent's
+// newest slices_integrated; the park attributes the coupled path to slice 1, as
+// the real park does. Each mode changes ONE element, so that element is the only
+// thing refusing or admitting. Coverage does not constrain the paths.
+func newAmendOwnershipFixture(t *testing.T) *amendFixture {
+	t.Helper()
+	f := newAmendFixtureWithPlan(t, 0, ownershipSlices(
+		ownSpec{files: []string{"own/"}, deps: []int{2}},
+		ownSpec{files: []string{amendCoupledPath}},
+		ownSpec{files: []string{amendAncestorPath}, deps: []int{3}},
+		ownSpec{files: []string{amendTransitivePath}},
+	))
+	f.stage.ScopeCompletenessPark.BuildRequiredPaths = nil
+	f.stage.ScopeCompletenessPark.MissingPaths = []string{amendCoupledPath}
+	f.deliver(2)
+	f.deliver(3)
+	f.integrate(amendConsolidated, 2, 3)
+	return f
+}
+
+// newAmendOverlapFixture is the M5 shape: the child depends_on [1, 2], slice 1
+// declares shared/ and is delivered and covered, slice 2 declares shared/file.go.
+// A single path therefore has two ancestors, the first of which is delivered.
+func newAmendOverlapFixture(t *testing.T) *amendFixture {
+	t.Helper()
+	f := newAmendFixtureWithPlan(t, 0, ownershipSlices(
+		ownSpec{files: []string{"own/"}, deps: []int{1, 2}},
+		ownSpec{files: []string{"shared/"}},
+		ownSpec{files: []string{"shared/file.go"}},
+	))
+	f.stage.ScopeCompletenessPark.BuildRequiredPaths = nil
+	f.stage.ScopeCompletenessPark.OwningSlices = nil
+	f.stage.ScopeCompletenessPark.MissingPaths = []string{"shared/file.go"}
+	f.deliver(1)
+	return f
+}
+
+// amendRefusal decodes the error body and pins status and code.
+func amendRefusal(t *testing.T, w *httptest.ResponseRecorder, wantStatus int, wantCode string) errorBody {
+	t.Helper()
+	if w.Code != wantStatus {
+		t.Fatalf("status = %d, want %d; body = %s", w.Code, wantStatus, w.Body.String())
+	}
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	if env.Error.Code != wantCode {
+		t.Fatalf("code = %q, want %q; body = %s", env.Error.Code, wantCode, w.Body.String())
+	}
+	return env.Error
+}
+
+// assertOwnershipRefusal is the plan-declared non-ancestor contract: 409 naming
+// owner and remedy, retryable false, exactly one scope_amendment_refused row with
+// phase scope_completeness_amend and actor user, and nothing else touched.
+func assertOwnershipRefusal(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+	t.Helper()
+	body := amendRefusal(t, w, http.StatusConflict, errCodeAmendmentPathOwnedBySibling)
+	conflicts, _ := body.Details["conflicts"].([]any)
+	if len(conflicts) == 0 {
+		t.Fatalf("details.conflicts empty: %v", body.Details)
+	}
+	first, _ := conflicts[0].(map[string]any)
+	if first["owning_slice"] != float64(1) || first["owning_child_run_id"] != f.sibling.ID.String() {
+		t.Errorf("conflicts[0] = %v, want slice 1 and its child run %s", first, f.sibling.ID)
+	}
+	remedy, _ := body.Details["remedy"].(string)
+	if !strings.Contains(remedy, "decide fail") || !strings.Contains(remedy, "corrected decomposition") {
+		t.Errorf("remedy = %q, want it to name fail and a corrected decomposition", remedy)
+	}
+	if body.Details["retryable"] != false {
+		t.Errorf("details.retryable = %v, want false", body.Details["retryable"])
+	}
+	rows := f.refusedRows()
+	if len(rows) != 1 {
+		t.Fatalf("%d scope_amendment_refused rows, want exactly 1", len(rows))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(rows[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["phase"] != sliceOwnershipPhaseAmend {
+		t.Errorf("refused row phase = %v, want %s", payload["phase"], sliceOwnershipPhaseAmend)
+	}
+	if rows[0].ActorKind == nil || *rows[0].ActorKind != audit.ActorUser {
+		t.Errorf("refused row actor = %v, want user", rows[0].ActorKind)
+	}
+	if rows[0].RunID != f.child.ID {
+		t.Errorf("refused row run = %s, want the child %s", rows[0].RunID, f.child.ID)
+	}
+	f.assertAmendUntouched(t, parkBefore)
+}
+
+// assertAmendAdmitted is the proven contract: 200, stage pending, an approved row,
+// owning_slices naming exactly wantOwners, and no acknowledgement.
+func assertAmendAdmitted(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, wantOwners ...int) {
+	t.Helper()
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+	}
+	got, _ := f.rr.GetStage(context.Background(), f.stage.ID)
+	if got.State != run.StageStatePending {
+		t.Errorf("stage state = %q, want pending", got.State)
+	}
+	if rows := f.approvedRows(t); len(rows) != 1 {
+		t.Errorf("%d approved rows, want 1", len(rows))
+	}
+	var resp scopeCompletenessDecisionResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatal(err)
+	}
+	if resp.OwnerAttributionUnresolved || resp.AcknowledgedOwnerUnresolved {
+		t.Errorf("a proven amend must need no acknowledgement: %+v", resp)
+	}
+	owners := make([]int, 0, len(resp.OwningSlices))
+	for _, o := range resp.OwningSlices {
+		if o.SliceIndex != nil {
+			owners = append(owners, *o.SliceIndex)
+		}
+	}
+	if fmt.Sprint(owners) != fmt.Sprint(wantOwners) {
+		t.Errorf("owning_slices = %v, want %v", owners, wantOwners)
+	}
+	if rows := f.refusedRows(); len(rows) != 0 {
+		t.Errorf("%d scope_amendment_refused rows on an admitted amend", len(rows))
+	}
+}
+
+// assertProofRefusal pins an ancestor or plan refusal that writes NO audit row.
+func assertProofRefusal(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string, status int, code, reason string, retryable bool, causes ...string) errorBody {
+	t.Helper()
+	body := amendRefusal(t, w, status, code)
+	if body.Details["reason"] != reason {
+		t.Errorf("details.reason = %v, want %s; body = %s", body.Details["reason"], reason, w.Body.String())
+	}
+	if body.Details["retryable"] != retryable {
+		t.Errorf("details.retryable = %v, want %v", body.Details["retryable"], retryable)
+	}
+	if remedy, _ := body.Details["remedy"].(string); remedy == "" {
+		t.Errorf("details.remedy is empty: %v", body.Details)
+	}
+	for _, cause := range causes {
+		if strings.Contains(w.Body.String(), cause) {
+			t.Errorf("raw cause %q in the body: %s", cause, w.Body.String())
+		}
+	}
+	if strings.Contains(w.Body.String(), internalCauseKey) {
+		t.Errorf("internal cause key in the body: %s", w.Body.String())
+	}
+	if rows := f.refusedRows(); len(rows) != 0 {
+		t.Errorf("%d scope_amendment_refused rows, want 0", len(rows))
+	}
+	f.assertAmendUntouched(t, parkBefore)
+	return body
+}
+
+// TestAmend_SliceOwnership is the amend half of the #4798 contract, one subtest
+// per mode. A plan-declared non-ancestor is refused in every sibling state; own
+// slice and a proven ancestor are allowed; a broken proof is refused by reason; a
+// missing or unreadable plan fails closed with nothing written.
+func TestAmend_SliceOwnership(t *testing.T) {
+	const cause = "plan artifact store offline sentinel"
+	for _, tc := range []struct {
+		name    string
+		fixture func(*testing.T) *amendFixture
+		setup   func(*testing.T, *amendFixture)
+		paths   []string
+		ack     bool
+		check   func(*testing.T, *amendFixture, *httptest.ResponseRecorder, string)
+	}{
+		{
+			name:  "non_ancestor_not_started_refused",
+			paths: []string{amendCoupledPath},
+			check: assertOwnershipRefusal,
+		},
+		{
+			name: "non_ancestor_started_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.setRunning(1)
+			},
+			paths: []string{amendCoupledPath},
+			check: assertOwnershipRefusal,
+		},
+		{
+			name: "non_ancestor_succeeded_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.deliver(1)
+			},
+			paths: []string{amendCoupledPath},
+			check: assertOwnershipRefusal,
+		},
+		{
+			name:  "non_ancestor_acknowledged_still_refused",
+			paths: []string{amendCoupledPath},
+			ack:   true,
+			check: assertOwnershipRefusal,
+		},
+		{
+			name: "non_ancestor_no_park_entry_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.stage.ScopeCompletenessPark.OwningSlices = nil
+			},
+			paths: []string{amendCoupledPath},
+			check: assertOwnershipRefusal,
+		},
+		{
+			name:  "mixed_set_refused_whole",
+			paths: []string{amendAncestorPath, amendCoupledPath},
+			check: assertOwnershipRefusal,
+		},
+		{
+			name:  "ancestor_succeeded_allowed",
+			paths: []string{amendAncestorPath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 2)
+			},
+		},
+		{
+			name:  "transitive_ancestor_succeeded_allowed",
+			paths: []string{amendTransitivePath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 3)
+			},
+		},
+		{
+			name: "ancestor_no_park_entry_allowed",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.stage.ScopeCompletenessPark.OwningSlices = nil
+			},
+			paths: []string{amendAncestorPath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 2)
+			},
+		},
+		{
+			name: "own_slice_no_park_entry_allowed",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.stage.ScopeCompletenessPark.OwningSlices = nil
+			},
+			paths: []string{"own/extra.go"},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 0)
+			},
+		},
+		{
+			name: "unresolved_child_local_parent_allowed",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.child.RunnerKindResolved = false
+				f.parent.RunnerKind = run.RunnerKindLocal
+				f.parent.RunnerKindResolved = true
+			},
+			paths: []string{amendAncestorPath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 2)
+			},
+		},
+		{
+			name: "unresolved_child_unresolved_parent_allowed",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.child.RunnerKindResolved = false
+			},
+			paths: []string{amendAncestorPath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 2)
+			},
+		},
+		{
+			name: "ancestor_running_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.setRunning(2)
+			},
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNotDelivered(string(run.StageStateRunning), string(run.StateRunning)),
+		},
+		{
+			name: "ancestor_not_started_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.siblings[2].State = run.StatePending
+				f.sibImpls[2].State = run.StageStatePending
+				f.sibImpls[2].StartedAt = nil
+			},
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNotDelivered(string(run.StageStatePending), string(run.StatePending)),
+		},
+		{
+			name: "ancestor_run_not_succeeded_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.siblings[2].State = run.StateRunning
+			},
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNotDelivered(string(run.StageStateSucceeded), string(run.StateRunning)),
+		},
+		{
+			name: "ancestor_implement_not_succeeded_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.sibImpls[2].State = run.StageStateRunning
+			},
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNotDelivered(string(run.StageStateRunning), string(run.StateSucceeded)),
+		},
+		{
+			name:  "ancestor_without_wave_gate_refused_github_actions",
+			setup: setLockedRunnerKind(run.RunnerKindGitHubActions),
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNoWaveGate,
+		},
+		{
+			name:  "ancestor_without_wave_gate_refused_gitlab_ci",
+			setup: setLockedRunnerKind(run.RunnerKindGitLabCI),
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNoWaveGate,
+		},
+		{
+			name:  "ancestor_without_wave_gate_refused_unknown_kind",
+			setup: setLockedRunnerKind("banana"),
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNoWaveGate,
+		},
+		{
+			name:  "ancestor_without_wave_gate_refused_empty_kind",
+			setup: setLockedRunnerKind(""),
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNoWaveGate,
+		},
+		{
+			// The Captain's rule: a remote ancestor's later success infers nothing.
+			name: "ancestor_parent_locked_remote_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.child.RunnerKindResolved = false
+				f.parent.RunnerKind = run.RunnerKindGitHubActions
+				f.parent.RunnerKindResolved = true
+			},
+			paths: []string{amendAncestorPath},
+			check: assertAncestorNoWaveGate,
+		},
+		{
+			name:    "any_undelivered_ancestor_refused",
+			fixture: newAmendOverlapFixture,
+			setup: func(t *testing.T, f *amendFixture) {
+				t.Helper()
+				f.setRunning(2)
+				f.integrate(amendConsolidated, 1)
+				pinOverlapOwners(t)
+			},
+			paths: []string{"shared/file.go"},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+				body := assertProofRefusal(t, f, w, parkBefore, http.StatusConflict, "amend_refused_owner_slice_active", amendAncestorNotDelivered, true)
+				if body.Details["slice_index"] != float64(2) {
+					t.Errorf("slice_index = %v, want the LATER, undelivered owner 2", body.Details["slice_index"])
+				}
+			},
+		},
+		{
+			name:    "all_overlapping_ancestors_delivered_allowed",
+			fixture: newAmendOverlapFixture,
+			setup: func(t *testing.T, f *amendFixture) {
+				t.Helper()
+				f.deliver(2)
+				f.integrate(amendConsolidated, 1, 2)
+				pinOverlapOwners(t)
+			},
+			paths: []string{"shared/file.go"},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, _ string) {
+				assertAmendAdmitted(t, f, w, 1, 2)
+			},
+		},
+		{
+			name:  "undeclared_path_unresolved",
+			paths: []string{amendUndeclaredPath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+				amendRefusal(t, w, http.StatusConflict, "amend_owner_attribution_unresolved")
+				if !strings.Contains(w.Body.String(), amendOwnerUnresolvedNoEntry) {
+					t.Errorf("body must name %s: %s", amendOwnerUnresolvedNoEntry, w.Body.String())
+				}
+				f.assertAmendUntouched(t, parkBefore)
+			},
+		},
+		{
+			name: "plan_read_error_fails_closed",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.art.listErr = errors.New(cause)
+			},
+			paths: []string{amendCoupledPath},
+			check: assertPlanUnreadable(cause),
+		},
+		{
+			name: "plan_read_error_acknowledged_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.art.listErr = errors.New(cause)
+			},
+			paths: []string{amendCoupledPath},
+			ack:   true,
+			check: assertPlanUnreadable(cause),
+		},
+		{
+			name: "nil_artifact_repo_not_retryable",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.s.cfg.ArtifactRepo = nil
+			},
+			paths: []string{amendCoupledPath},
+			check: assertPlanStoreUnconfigured,
+		},
+		{
+			name: "nil_artifact_repo_acknowledged_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.s.cfg.ArtifactRepo = nil
+			},
+			paths: []string{amendCoupledPath},
+			ack:   true,
+			check: assertPlanStoreUnconfigured,
+		},
+		{
+			name: "plan_absent_fails_closed_no_artifact",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.art.all = nil
+			},
+			paths: []string{amendCoupledPath},
+			check: assertDecompositionAbsent,
+		},
+		{
+			name: "plan_absent_fails_closed_no_decomposition",
+			setup: func(t *testing.T, f *amendFixture) {
+				f.seedParentPlan(t, &plan.Plan{PlanVersion: "standard_v1", Summary: "flat",
+					Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"}})
+			},
+			paths: []string{amendCoupledPath},
+			check: assertDecompositionAbsent,
+		},
+		{
+			name: "plan_absent_fails_closed_slice_out_of_range",
+			setup: func(_ *testing.T, f *amendFixture) {
+				idx := 99
+				f.child.SliceIndex = &idx
+			},
+			paths: []string{amendCoupledPath},
+			check: assertDecompositionAbsent,
+		},
+		{
+			name: "plan_absent_fails_closed_nil_slice_index",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.child.SliceIndex = nil
+			},
+			paths: []string{amendCoupledPath},
+			check: assertDecompositionAbsent,
+		},
+		{
+			name: "refusal_audit_append_failure_still_refused",
+			setup: func(_ *testing.T, f *amendFixture) {
+				f.au.appendErrCategory = CategoryScopeAmendmentRefused
+			},
+			paths: []string{amendCoupledPath},
+			check: func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+				amendRefusal(t, w, http.StatusConflict, errCodeAmendmentPathOwnedBySibling)
+				if rows := f.refusedRows(); len(rows) != 0 {
+					t.Errorf("%d refused rows despite the failed append", len(rows))
+				}
+				f.assertAmendUntouched(t, parkBefore)
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fixture := tc.fixture
+			if fixture == nil {
+				fixture = newAmendOwnershipFixture
+			}
+			f := fixture(t)
+			if tc.setup != nil {
+				tc.setup(t, f)
+			}
+			parkBefore := f.parkSnapshot(t)
+			w := postAmend(t, f, amendDecisionBody("widen for the slice-ownership contract", tc.ack, tc.paths...))
+			tc.check(t, f, w, parkBefore)
+		})
+	}
+}
+
+// setLockedRunnerKind locks the child to kind, with a fully delivered ancestor, so
+// the dispatch channel alone decides.
+func setLockedRunnerKind(kind string) func(*testing.T, *amendFixture) {
+	return func(_ *testing.T, f *amendFixture) {
+		f.child.RunnerKind = kind
+		f.child.RunnerKindResolved = true
+	}
+}
+
+// pinOverlapOwners pins, as a precondition, that the first actual owner of
+// shared/file.go is slice 1 and the later is slice 2: stopping after the first is
+// what M5 mutates, so the order is what makes that fixture discriminating.
+func pinOverlapOwners(t *testing.T) {
+	t.Helper()
+	subs := ownershipSlices(
+		ownSpec{files: []string{"own/"}, deps: []int{1, 2}},
+		ownSpec{files: []string{"shared/"}},
+		ownSpec{files: []string{"shared/file.go"}},
+	)
+	c := classifySliceOwnership(subs, 0, []string{"shared/file.go"})
+	got := []int{}
+	for _, o := range c.AncestorOwned {
+		got = append(got, o.OwningSlice)
+	}
+	if fmt.Sprint(got) != "[1 2]" {
+		t.Fatalf("declared ancestor owners = %v, want [1 2]", got)
+	}
+}
+
+func assertAncestorNotDelivered(wantImplement, wantRun string) func(*testing.T, *amendFixture, *httptest.ResponseRecorder, string) {
+	return func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+		t.Helper()
+		body := assertProofRefusal(t, f, w, parkBefore, http.StatusConflict, "amend_refused_owner_slice_active", amendAncestorNotDelivered, true)
+		if body.Details["sibling_implement_state"] != wantImplement {
+			t.Errorf("sibling_implement_state = %v, want %s", body.Details["sibling_implement_state"], wantImplement)
+		}
+		if body.Details["sibling_run_state"] != wantRun {
+			t.Errorf("sibling_run_state = %v, want %s", body.Details["sibling_run_state"], wantRun)
+		}
+		if body.Details["sibling_run_id"] != f.siblings[2].ID.String() {
+			t.Errorf("sibling_run_id = %v, want the ancestor %s", body.Details["sibling_run_id"], f.siblings[2].ID)
+		}
+	}
+}
+
+func assertAncestorNoWaveGate(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+	t.Helper()
+	assertProofRefusal(t, f, w, parkBefore, http.StatusConflict, "amend_refused_owner_slice_active", amendAncestorNoWaveGate, false)
+}
+
+func assertPlanUnreadable(cause string) func(*testing.T, *amendFixture, *httptest.ResponseRecorder, string) {
+	return func(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+		t.Helper()
+		assertProofRefusal(t, f, w, parkBefore, http.StatusInternalServerError, errCodeSliceOwnershipCheckFailed, "parent_plan_unreadable", true, cause)
+	}
+}
+
+func assertPlanStoreUnconfigured(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+	t.Helper()
+	body := assertProofRefusal(t, f, w, parkBefore, http.StatusInternalServerError, errCodeSliceOwnershipCheckFailed, "plan_store_unconfigured", false)
+	if remedy, _ := body.Details["remedy"].(string); !strings.Contains(remedy, "configure the artifact repository") {
+		t.Errorf("remedy = %q, want it to name the configuration", remedy)
+	}
+}
+
+func assertDecompositionAbsent(t *testing.T, f *amendFixture, w *httptest.ResponseRecorder, parkBefore string) {
+	t.Helper()
+	assertProofRefusal(t, f, w, parkBefore, http.StatusInternalServerError, errCodeSliceOwnershipCheckFailed, "decomposition_absent", false)
+}
+
+// getRunErrForRepo fails GetRun only for failFor: the parent lock read.
+type getRunErrForRepo struct {
+	*orchestratorRepo
+	failFor uuid.UUID
+	err     error
+}
+
+func (r *getRunErrForRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	if id == r.failFor {
+		return nil, r.err
+	}
+	return r.orchestratorRepo.GetRun(ctx, id)
+}
+
+// TestAmend_AncestorProof_AcknowledgeNeverAdmits resolves HIGH defect 53c9cd95:
+// every failure of the proof is a hard refusal that acknowledge_owner_unresolved
+// cannot admit. Each mode is seeded by construction against a transitive-ancestor
+// path with every other proof element satisfied, under local and github_actions
+// and with the flag true and false. On github_actions every mode answers
+// ancestor_no_wave_gate, decided before any read's result is consulted.
+func TestAmend_AncestorProof_AcknowledgeNeverAdmits(t *testing.T) {
+	const (
+		codeActive = "amend_refused_owner_slice_active"
+		codeFailed = errCodeSliceOwnershipCheckFailed
+	)
+	for _, mode := range []struct {
+		name      string
+		setup     func(*amendFixture)
+		paths     []string
+		status    int
+		code      string
+		reason    string
+		retryable bool
+		cause     string
+	}{
+		{
+			name:   "sibling_list_error",
+			setup:  func(f *amendFixture) { f.s.cfg.RunRepo = &listRunsErrRepo{f.rr} },
+			status: http.StatusInternalServerError, code: codeFailed, reason: amendAncestorSiblingsUnreadable, retryable: true,
+			cause: "sibling listing unavailable",
+		},
+		{
+			name: "sibling_run_missing",
+			setup: func(f *amendFixture) {
+				f.rr.mu.Lock()
+				defer f.rr.mu.Unlock()
+				delete(f.rr.runs, f.siblings[3].ID)
+			},
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorRunNotFound,
+		},
+		{
+			name:   "sibling_slice_index_nil",
+			setup:  func(f *amendFixture) { f.siblings[3].SliceIndex = nil },
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorRunNotFound,
+		},
+		{
+			name: "stages_unreadable",
+			setup: func(f *amendFixture) {
+				f.s.cfg.RunRepo = &listStagesErrRepo{orchestratorRepo: f.rr, failFor: f.siblings[3].ID}
+			},
+			status: http.StatusInternalServerError, code: codeFailed, reason: amendAncestorStagesUnreadable, retryable: true,
+			cause: "stage listing unavailable",
+		},
+		{
+			name:   "implement_absent",
+			setup:  func(f *amendFixture) { f.sibImpls[3].Type = run.StageTypeReview },
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNoImplement,
+		},
+		{
+			name:   "integration_read_error",
+			setup:  func(f *amendFixture) { f.au.listByCategoryErrCategory = "slices_integrated" },
+			status: http.StatusInternalServerError, code: codeFailed, reason: amendAncestorIntegrationUnreadable, retryable: true,
+			cause: "auditFake: injected ListForRunByCategory error",
+		},
+		{
+			name:   "integration_absent",
+			setup:  func(f *amendFixture) { f.au.seeded = nil },
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotIntegrated, retryable: true,
+		},
+		{
+			name:   "integration_undecodable",
+			setup:  func(f *amendFixture) { f.seedIntegrationPayload(json.RawMessage(`not json`)) },
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotIntegrated, retryable: true,
+		},
+		{
+			name:   "integration_empty_branch",
+			setup:  func(f *amendFixture) { f.integrate("", 2, 3) },
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotIntegrated, retryable: true,
+		},
+		{
+			name:   "integration_stale",
+			setup:  func(f *amendFixture) { f.integrateIDs(amendConsolidated, uuid.NewString()) },
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotIntegrated, retryable: true,
+		},
+		{
+			name: "park_no_entry_undelivered",
+			setup: func(f *amendFixture) {
+				f.stage.ScopeCompletenessPark.OwningSlices = nil
+				f.setRunning(3)
+			},
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotDelivered, retryable: true,
+		},
+		{
+			name: "park_nil_index_undelivered",
+			setup: func(f *amendFixture) {
+				f.stage.ScopeCompletenessPark.OwningSlices = []run.BuildRequiredOwner{{Path: amendTransitivePath}}
+				f.setRunning(3)
+			},
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotDelivered, retryable: true,
+		},
+		{
+			// The unresolved path comes FIRST, so a refusal that merely joined the
+			// unresolved set would be acknowledgeable.
+			name: "mixed_legacy_and_undelivered",
+			setup: func(f *amendFixture) {
+				f.stage.ScopeCompletenessPark.OwningSlices = nil
+				f.setRunning(3)
+			},
+			paths:  []string{amendUndeclaredPath, amendTransitivePath},
+			status: http.StatusConflict, code: codeActive, reason: amendAncestorNotDelivered, retryable: true,
+		},
+	} {
+		for _, kind := range []string{run.RunnerKindLocal, run.RunnerKindGitHubActions} {
+			for _, ack := range []bool{true, false} {
+				t.Run(fmt.Sprintf("%s/%s/ack_%v", mode.name, kind, ack), func(t *testing.T) {
+					f := newAmendOwnershipFixture(t)
+					f.child.RunnerKind = kind
+					mode.setup(f)
+					paths := mode.paths
+					if paths == nil {
+						paths = []string{amendTransitivePath}
+					}
+					parkBefore := f.parkSnapshot(t)
+					w := postAmend(t, f, amendDecisionBody("widen against an unproven ancestor", ack, paths...))
+					causes := []string{}
+					if mode.cause != "" {
+						causes = append(causes, mode.cause)
+					}
+					if kind == run.RunnerKindLocal {
+						assertProofRefusal(t, f, w, parkBefore, mode.status, mode.code, mode.reason, mode.retryable, causes...)
+						return
+					}
+					assertProofRefusal(t, f, w, parkBefore, http.StatusConflict, codeActive, amendAncestorNoWaveGate, false, causes...)
+				})
+			}
+		}
+	}
+
+	for _, ack := range []bool{true, false} {
+		t.Run(fmt.Sprintf("parent_lock_read_error/ack_%v", ack), func(t *testing.T) {
+			f := newAmendOwnershipFixture(t)
+			const cause = "parent lock read offline"
+			f.child.RunnerKindResolved = false
+			f.s.cfg.RunRepo = &getRunErrForRepo{orchestratorRepo: f.rr, failFor: f.parent.ID, err: errors.New(cause)}
+			parkBefore := f.parkSnapshot(t)
+			w := postAmend(t, f, amendDecisionBody("widen with an unreadable parent lock", ack, amendTransitivePath))
+			assertProofRefusal(t, f, w, parkBefore, http.StatusInternalServerError, codeFailed, amendAncestorChannelUnreadable, true, cause)
+		})
+	}
+}
+
+// proofReadCounts counts the reads the ancestor proof makes.
+type proofReadCounts struct {
+	*orchestratorRepo
+	stages map[uuid.UUID]int
+	getRun map[uuid.UUID]int
+}
+
+func (r *proofReadCounts) ListStagesForRun(ctx context.Context, id uuid.UUID) ([]*run.Stage, error) {
+	r.stages[id]++
+	return r.orchestratorRepo.ListStagesForRun(ctx, id)
+}
+
+func (r *proofReadCounts) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	r.getRun[id]++
+	return r.orchestratorRepo.GetRun(ctx, id)
+}
+
+// integrationReadCounts counts the slices_integrated reads.
+type integrationReadCounts struct {
+	*auditFake
+	reads int
+}
+
+func (a *integrationReadCounts) ListForRunByCategory(ctx context.Context, id uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == "slices_integrated" {
+		a.reads++
+	}
+	return a.auditFake.ListForRunByCategory(ctx, id, category)
+}
+
+// TestAmend_AncestorProof_ReadsOncePerDecision pins the proof's memo: however many
+// paths a decision names, each ancestor's stages, the parent's lock and the
+// parent's integration record are read once.
+func TestAmend_AncestorProof_ReadsOncePerDecision(t *testing.T) {
+	f := newAmendFixtureWithPlan(t, 0, ownershipSlices(
+		ownSpec{files: []string{"own/"}, deps: []int{1, 2}},
+		ownSpec{files: []string{"docs/one/"}},
+		ownSpec{files: []string{"docs/two/"}},
+	))
+	f.stage.ScopeCompletenessPark.BuildRequiredPaths = nil
+	f.stage.ScopeCompletenessPark.OwningSlices = nil
+	f.stage.ScopeCompletenessPark.MissingPaths = []string{"docs/one/a.md"}
+	f.deliver(1)
+	f.deliver(2)
+	f.integrate(amendConsolidated, 1, 2)
+	f.child.RunnerKindResolved = false // so the channel check reads the parent lock
+
+	runs := &proofReadCounts{orchestratorRepo: f.rr, stages: map[uuid.UUID]int{}, getRun: map[uuid.UUID]int{}}
+	au := &integrationReadCounts{auditFake: f.au}
+	f.s.cfg.RunRepo = runs
+	f.s.cfg.AuditRepo = au
+
+	w := postAmend(t, f, amendDecisionBody("three paths, two ancestors", false, "docs/one/a.md", "docs/one/b.md", "docs/two/c.md"))
+	assertAmendAdmitted(t, f, w, 1, 1, 2)
+	if got := runs.stages[f.siblings[1].ID]; got != 1 {
+		t.Errorf("ancestor 1 stages read %d times for two paths, want 1", got)
+	}
+	if got := runs.stages[f.siblings[2].ID]; got != 1 {
+		t.Errorf("ancestor 2 stages read %d times, want 1", got)
+	}
+	if got := runs.getRun[f.parent.ID]; got != 1 {
+		t.Errorf("parent lock read %d times, want 1", got)
+	}
+	if au.reads != 1 {
+		t.Errorf("slices_integrated read %d times for two ancestors, want 1", au.reads)
+	}
+}
+
+// amendE2E is one fresh real-Postgres decomposition for the end-to-end arms.
+type amendE2E struct {
+	ctx       context.Context
+	runRepo   run.Repository
+	auditRepo audit.Repository
+	amendRepo scopeamendment.Repository
+	s         *Server
+	parent    *run.Run
+	child     *run.Run
+	stageID   uuid.UUID
+	key       *signing.IssuedKey
+	siblings  map[int]*run.Run
+	impls     map[int]*run.Stage
+}
+
+// seedAmendE2E mints the real shape over real repositories: a parent locked local
+// through ResolveRunnerKind, an approved decomposition, one child per slice minted
+// un-resolved with the kind copied, and the requesting child parked through the
+// REAL signed runner report carrying missing_paths only, so coverage does not
+// constrain the amend.
+func seedAmendE2E(t *testing.T, ctx context.Context, runRepo run.Repository, auditRepo audit.Repository, signingRepo signing.Repository, amendRepo scopeamendment.Repository, art *fakeArtifactRepo, childKind string, childSlice int, subPlans []plan.SubPlanSummary) *amendE2E {
+	t.Helper()
+	mint := func(kind string, parent *uuid.UUID, idx *int) *run.Run {
+		t.Helper()
+		r, err := runRepo.CreateRun(ctx, run.CreateRunParams{
+			Repo: "kuhlman-labs/fishhawk", WorkflowID: "feature_change", WorkflowSHA: "deadbeef",
+			TriggerSource: run.TriggerCLI, RunnerKind: kind, ParentRunID: parent, DecomposedFrom: parent, SliceIndex: idx,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return r
+	}
+	parent := mint(run.RunnerKindLocal, nil, nil)
+	locker, ok := any(runRepo).(interface {
+		ResolveRunnerKind(context.Context, uuid.UUID, string) (run.RunnerKindResolution, error)
+	})
+	if !ok {
+		t.Fatal("run repository cannot lock runner_kind")
+	}
+	if _, err := locker.ResolveRunnerKind(ctx, parent.ID, run.RunnerKindLocal); err != nil {
+		t.Fatalf("lock parent runner_kind: %v", err)
+	}
+	planStage, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+		RunID: parent.ID, Sequence: 0, Type: run.StageTypePlan, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create plan stage: %v", err)
+	}
+	planBytes, err := json.Marshal(&plan.Plan{
+		PlanVersion: "standard_v1", Summary: "decomposed",
+		Verification:  plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: &plan.Decomposition{Rationale: "split", SubPlans: subPlans},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := "standard_v1"
+	if _, err := art.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: planBytes,
+	}); err != nil {
+		t.Fatalf("seed plan artifact: %v", err)
+	}
+
+	e := &amendE2E{ctx: ctx, runRepo: runRepo, auditRepo: auditRepo, amendRepo: amendRepo, parent: parent,
+		siblings: map[int]*run.Run{}, impls: map[int]*run.Stage{}}
+	e.s = New(Config{Addr: "127.0.0.1:0", RunRepo: runRepo, AuditRepo: auditRepo, SigningRepo: signingRepo,
+		ArtifactRepo: art, ScopeAmendmentRepo: amendRepo})
+	e.s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	for i := range subPlans {
+		idx := i
+		pid := parent.ID
+		sib := mint(childKind, &pid, &idx)
+		impl, err := runRepo.CreateStage(ctx, run.CreateStageParams{
+			RunID: sib.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create implement stage: %v", err)
+		}
+		if i == childSlice {
+			e.child, e.stageID = sib, impl.ID
+			continue
+		}
+		e.siblings[i], e.impls[i] = sib, impl
+	}
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := runRepo.TransitionStage(ctx, e.stageID, to, nil); err != nil {
+			t.Fatalf("transition requester stage to %s: %v", to, err)
+		}
+	}
+	e.key, err = signingRepo.Issue(ctx, e.child.ID, signing.DefaultTTL)
+	if err != nil {
+		t.Fatalf("issue signing key: %v", err)
+	}
+	parkBytes := []byte(`{"outcome":"scope_park","branch":"` + amendRunBranch + `",` +
+		`"head_sha":"` + amendHeldSHA + `","base_sha":"3333333333333333333333333333333333333333",` +
+		`"verified_tree_sha":"` + amendVerifiedTree + `",` +
+		`"missing_paths":["docs/never-edited.md"]}`)
+	if pw := shipPRRequest(t, e.s, e.child.ID, e.stageID, e.key.PrivateKey, parkBytes, ""); pw.Code != http.StatusOK {
+		t.Fatalf("scope_park report status = %d, want 200:\n%s", pw.Code, pw.Body.String())
+	}
+	return e
+}
+
+// deliver walks a sibling's run and implement stage to succeeded.
+func (e *amendE2E) deliver(t *testing.T, idx int) {
+	t.Helper()
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning, run.StageStateSucceeded} {
+		if _, err := e.runRepo.TransitionStage(e.ctx, e.impls[idx].ID, to, nil); err != nil {
+			t.Fatalf("transition implement to %s: %v", to, err)
+		}
+	}
+	for _, to := range []run.State{run.StateRunning, run.StateSucceeded} {
+		if _, err := e.runRepo.TransitionRun(e.ctx, e.siblings[idx].ID, to); err != nil {
+			t.Fatalf("transition run to %s: %v", to, err)
+		}
+	}
+}
+
+// integrate appends a slices_integrated entry to the parent's REAL chain.
+func (e *amendE2E) integrate(t *testing.T, slices ...int) {
+	t.Helper()
+	ids := make([]string, 0, len(slices))
+	for _, i := range slices {
+		ids = append(ids, e.siblings[i].ID.String())
+	}
+	payload, _ := json.Marshal(map[string]any{"consolidated_branch": amendConsolidated, "child_run_ids": ids})
+	actor := audit.ActorSystem
+	subject := "test"
+	if _, err := e.auditRepo.AppendChained(e.ctx, audit.ChainAppendParams{
+		RunID: e.parent.ID, Timestamp: time.Now().UTC(), Category: "slices_integrated",
+		ActorKind: &actor, ActorSubject: &subject, Payload: payload,
+	}); err != nil {
+		t.Fatalf("append slices_integrated: %v", err)
+	}
+}
+
+// assertUntouched pins the persisted refusal shape on real repositories.
+func (e *amendE2E) assertUntouched(t *testing.T, parkBefore string) {
+	t.Helper()
+	rows, err := e.amendRepo.ListByRun(e.ctx, e.child.ID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("%d amendment row(s), want 0", len(rows))
+	}
+	if got := e.parkSnapshot(t); got != parkBefore {
+		t.Errorf("persisted park changed:\n got: %s\nwant: %s", got, parkBefore)
+	}
+	stage, err := e.runRepo.GetStage(e.ctx, e.stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if stage.State != run.StageStateAwaitingScopeDecision {
+		t.Errorf("stage state = %q, want parked", stage.State)
+	}
+}
+
+func (e *amendE2E) parkSnapshot(t *testing.T) string {
+	t.Helper()
+	stage, err := e.runRepo.GetStage(e.ctx, e.stageID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	raw, err := json.Marshal(stage.ScopeCompletenessPark)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return string(raw)
+}
+
+// assertScopeFile fetches the REAL signed /prompt and pins the amended entry.
+func (e *amendE2E) assertScopeFile(t *testing.T, path, operation string) {
+	t.Helper()
+	prw := promptRequest(t, e.s, e.child.ID, e.stageID, e.key.PrivateKey, "")
+	if prw.Code != http.StatusOK {
+		t.Fatalf("prompt status = %d, want 200:\n%s", prw.Code, prw.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(prw.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode prompt: %v", err)
+	}
+	for _, f := range resp.ScopeFiles {
+		if f.Path == path {
+			if f.Operation != operation {
+				t.Errorf("scope file %s operation = %q, want %q", path, f.Operation, operation)
+			}
+			return
+		}
+	}
+	t.Errorf("%s missing from the re-dispatched prompt's scope_files: %+v", path, resp.ScopeFiles)
+}
+
+// TestAmend_SliceOwnership_EndToEnd crosses HTTP handler, plan read, sibling
+// paging, audit chain, amendment store and the signed prompt on REAL Postgres.
+// delivered_transitive_ancestor_path_folds also proves the paged sibling read,
+// because postgresRepo.ListRuns rejects Limit <= 0 and the in-memory fake does not.
+func TestAmend_SliceOwnership_EndToEnd(t *testing.T) {
+	pool := pgtest.NewPool(t)
+	ctx := context.Background()
+	runRepo := run.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	signingRepo := signing.NewPostgresRepository(pool)
+	amendRepo := scopeamendment.NewPostgresRepository(pool)
+
+	const transitive = "docs/slice3-only.md"
+	base := func() []plan.SubPlanSummary {
+		return ownershipSlices(
+			ownSpec{files: []string{"internal/own/"}, deps: []int{2}},
+			ownSpec{files: []string{"docs/slice1.md"}},
+			ownSpec{files: []string{"docs/slice2.md"}, deps: []int{3}},
+			ownSpec{files: []string{transitive}},
+		)
+	}
+	seed := func(t *testing.T, kind string) *amendE2E {
+		t.Helper()
+		return seedAmendE2E(t, ctx, runRepo, auditRepo, signingRepo, amendRepo, newFakeArtifactRepo(), kind, 0, base())
+	}
+	decide := func(t *testing.T, e *amendE2E, body string) *httptest.ResponseRecorder {
+		t.Helper()
+		return postScopeCompletenessDecision(t, e.s, e.child.ID, body, operatorWriteStages)
+	}
+
+	t.Run("delivered_transitive_ancestor_path_folds", func(t *testing.T) {
+		e := seed(t, run.RunnerKindLocal)
+		e.deliver(t, 2)
+		e.deliver(t, 3)
+		e.integrate(t, 2, 3)
+		w := decide(t, e, `{"decision":"amend","reason":"needs the ancestor's file","paths":[{"path":"`+transitive+`","operation":"modify"}]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+		e.assertScopeFile(t, transitive, string(plan.FileOpModify))
+	})
+
+	t.Run("own_slice_directory_path_folds", func(t *testing.T) {
+		e := seed(t, run.RunnerKindLocal)
+		w := decide(t, e, `{"decision":"amend","reason":"a new file in my own directory","paths":[{"path":"internal/own/extra.go","operation":"create"}]}`)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200; body = %s", w.Code, w.Body.String())
+		}
+		e.assertScopeFile(t, "internal/own/extra.go", string(plan.FileOpCreate))
+	})
+
+	t.Run("non_ancestor_refused_with_chain_row", func(t *testing.T) {
+		e := seed(t, run.RunnerKindLocal)
+		before := e.parkSnapshot(t)
+		w := decide(t, e, `{"decision":"amend","reason":"a sibling's file","paths":[{"path":"docs/slice1.md","operation":"modify"}]}`)
+		amendRefusal(t, w, http.StatusConflict, errCodeAmendmentPathOwnedBySibling)
+		entries, err := auditRepo.ListForRunByCategory(ctx, e.child.ID, CategoryScopeAmendmentRefused)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(entries) != 1 {
+			t.Fatalf("%d scope_amendment_refused chain rows, want 1", len(entries))
+		}
+		e.assertUntouched(t, before)
+	})
+
+	t.Run("not_integrated_ancestor_acknowledged_refused", func(t *testing.T) {
+		e := seed(t, run.RunnerKindLocal)
+		e.deliver(t, 2)
+		e.deliver(t, 3)
+		before := e.parkSnapshot(t)
+		w := decide(t, e, `{"decision":"amend","reason":"no integration yet","acknowledge_owner_unresolved":true,"paths":[{"path":"`+transitive+`","operation":"modify"}]}`)
+		body := amendRefusal(t, w, http.StatusConflict, "amend_refused_owner_slice_active")
+		if body.Details["reason"] != amendAncestorNotIntegrated || body.Details["retryable"] != true {
+			t.Errorf("details = %v, want %s retryable", body.Details, amendAncestorNotIntegrated)
+		}
+		e.assertUntouched(t, before)
+	})
+
+	t.Run("no_wave_gate_acknowledged_refused", func(t *testing.T) {
+		e := seed(t, run.RunnerKindGitHubActions)
+		e.deliver(t, 2)
+		e.deliver(t, 3)
+		e.integrate(t, 2, 3)
+		before := e.parkSnapshot(t)
+		w := decide(t, e, `{"decision":"amend","reason":"remote child","acknowledge_owner_unresolved":true,"paths":[{"path":"`+transitive+`","operation":"modify"}]}`)
+		body := amendRefusal(t, w, http.StatusConflict, "amend_refused_owner_slice_active")
+		if body.Details["reason"] != amendAncestorNoWaveGate || body.Details["retryable"] != false {
+			t.Errorf("details = %v, want %s not retryable", body.Details, amendAncestorNoWaveGate)
+		}
+		e.assertUntouched(t, before)
+	})
 }

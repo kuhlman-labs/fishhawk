@@ -5,35 +5,63 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"sort"
 	"strconv"
 	"strings"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
 )
 
 // CategoryScopeAmendmentRefused is the audit-log category for the entry the
-// slice-ownership guard writes when it refuses a decomposition child's
-// mid-stage scope amendment (#4679): at REQUEST time (phase "request", actor
-// agent, no amendment row created) or at an operator's APPROVE (phase
-// "decide", actor user, the row stays pending). Payload carries {phase, paths,
-// slice_ownership} plus reason (request) or amendment_id (decide). Internal
-// audit kind — NOT an issue-comment surface — and WITHHELD from run-bound
-// audit reads (withholdScopeOverlapFromRunBound), because its slice_ownership
-// names sibling slices' titles, paths and child run ids.
+// slice-ownership guard writes when it refuses a decomposition child's scope
+// amendment: at REQUEST time (phase "request", actor agent, no amendment row
+// created), at an operator's APPROVE (phase "decide", actor user, the row stays
+// pending) (#4679), or on one of the two channels that mint an already-approved
+// row (#4798): phase "resume" (POST /v0/runs/{id}/recover add_scope_files on a
+// decomposition child) and phase "scope_completeness_amend" (the amend decision),
+// both actor user with no row created. Payload carries {phase, paths,
+// slice_ownership} plus reason (request, resume, scope_completeness_amend) or
+// amendment_id (decide). Internal audit kind — NOT an issue-comment surface —
+// and WITHHELD from run-bound audit reads (withholdScopeOverlapFromRunBound),
+// because its slice_ownership names sibling slices' titles, paths and child run
+// ids.
 const CategoryScopeAmendmentRefused = "scope_amendment_refused"
 
-// errCodeAmendmentPathOwnedBySibling is the 409 code both scope-amendment
-// routes answer when a requested path is owned by a non-ancestor sibling
-// slice (#4679).
+// errCodeAmendmentPathOwnedBySibling is the 409 code all four amendment routes
+// (request, decide, resume add_scope_files, scope-completeness amend) answer
+// when a path is owned by a non-ancestor sibling slice (#4679, #4798).
 const errCodeAmendmentPathOwnedBySibling = "amendment_path_owned_by_sibling_slice"
 
-// errCodeSliceOwnershipCheckFailed is the decide route's fail-CLOSED 500 when
-// the slice-ownership check could not read the run or the parent's plan.
+// errCodeSliceOwnershipCheckFailed is the fail-CLOSED 500 for a slice-ownership
+// read that could not complete: the decide route's run or plan read (#4679), the
+// resume and scope-completeness amend channels' plan read, including a parent
+// plan that is absent or a plan store that is unconfigured (#4798), and the
+// amend's ancestor-delivery proof reads (#4798). details.retryable says whether
+// re-POSTing can succeed.
 const errCodeSliceOwnershipCheckFailed = "slice_ownership_check_failed"
+
+// The phase values of a scope_amendment_refused row on the two channels that
+// mint an already-approved amendment (#4798).
+const (
+	sliceOwnershipPhaseResume = "resume"
+	sliceOwnershipPhaseAmend  = "scope_completeness_amend"
+)
+
+// Why sliceOwnershipForRun could not produce a verdict without any read having
+// failed. amendmentSliceOwnership maps errSliceOwnershipPlanAbsent to "nothing to
+// check", the ABSENT partition the request and decide routes admit;
+// refuseSliceOwnedPreApproval fails closed on both, because no later decide
+// re-checks a row that is born approved.
+var (
+	errSliceOwnershipPlanAbsent       = errors.New("the parent's approved plan declares no decomposition for this slice")
+	errSliceOwnershipPlanUnconfigured = errors.New("artifact repository unconfigured: the parent's approved plan cannot be read")
+)
 
 // sliceOwnershipRefusalReason is the details.reason of the 409.
 const sliceOwnershipRefusalReason = "path_owned_by_non_ancestor_slice"
@@ -43,6 +71,18 @@ const sliceOwnershipRefusalReason = "path_owned_by_non_ancestor_slice"
 // or a follow-up.
 const sliceOwnershipRemedy = "leave this edit to the owning slice (it is in that slice's scope.files) or defer it to a follow-up issue; " +
 	"do NOT edit the path — re-file the amendment without it if other paths are still needed"
+
+// sliceOwnershipResumeRemedy is the resume channel's remedy: the refusal runs
+// before the child is re-opened, so it stays failed and the operator can act.
+const sliceOwnershipResumeRemedy = "re-submit without the path; the child is still failed and nothing was re-opened. " +
+	"Leave the edit to the owning slice or defer it to a follow-up issue; if this slice cannot pass without the path, " +
+	"fail and restart with a corrected decomposition"
+
+// sliceOwnershipAmendRemedy is the amend channel's remedy. A build_required_path
+// cannot be dropped, because the coverage check refuses an amend that omits one.
+const sliceOwnershipAmendRemedy = "re-submit without the path; when it is a build_required_path the amend must cover, " +
+	"it cannot be removed, so decide fail and restart with a corrected decomposition " +
+	"(a single owner for the file, or a depends_on edge on the owning slice)"
 
 // sliceOwnershipOverlap is one requested path overlapping a path another slice
 // DECLARES in the parent's approved decomposition.
@@ -67,12 +107,63 @@ type sliceOwnershipCheck struct {
 	AncestorOwned  []sliceOwnershipOverlap `json:"ancestor_owned"`
 	Checked        bool                    `json:"checked"`
 	Error          string                  `json:"error,omitempty"`
+	// ownSlice holds overlaps with the requester's OWN slice. Unexported, so it
+	// never serializes: the scope_amendment_requested, _decided and _refused
+	// payloads keep their exact wire shape. Read through attributedOwners.
+	ownSlice []sliceOwnershipOverlap
 }
 
 // refused reports whether the check found a non-ancestor owner. Nil-safe: a
 // nil check (the run is not a decomposition child, or the plan is absent)
 // never refuses.
 func (c *sliceOwnershipCheck) refused() bool { return c != nil && len(c.Conflicts) > 0 }
+
+// isAncestorSlice reports whether idx is a transitive depends_on ancestor of the
+// checked slice. Nil-safe: a nil check has no ancestors.
+func (c *sliceOwnershipCheck) isAncestorSlice(idx int) bool {
+	if c == nil {
+		return false
+	}
+	for _, a := range c.AncestorSlices {
+		if a == idx {
+			return true
+		}
+	}
+	return false
+}
+
+// attributedOwners returns every owner of path the plan declares among the
+// requester's own slice and its ancestors, one entry per slice: the own slice
+// first, then every overlapping ancestor by ascending slice index, the order
+// classifySliceOwnership produces. A path can overlap two ancestors by directory
+// containment, which the validator only warns about, so a caller must see them
+// all. The bool is false when the plan declares no such owner. Nil-safe.
+func (c *sliceOwnershipCheck) attributedOwners(path string) ([]run.BuildRequiredOwner, bool) {
+	if c == nil {
+		return nil, false
+	}
+	var owners []run.BuildRequiredOwner
+	seen := make(map[int]bool)
+	for _, o := range c.ownSlice {
+		if o.Path == path && !seen[o.OwningSlice] {
+			seen[o.OwningSlice] = true
+			owners = append(owners, o.owner())
+		}
+	}
+	for _, o := range c.AncestorOwned {
+		if o.Path == path && !seen[o.OwningSlice] {
+			seen[o.OwningSlice] = true
+			owners = append(owners, o.owner())
+		}
+	}
+	return owners, len(owners) > 0
+}
+
+// owner renders the overlap as a park-shaped owner attribution.
+func (o sliceOwnershipOverlap) owner() run.BuildRequiredOwner {
+	idx := o.OwningSlice
+	return run.BuildRequiredOwner{Path: o.Path, SliceIndex: &idx, SliceTitle: o.OwningTitle}
+}
 
 // sliceAncestors returns the TRANSITIVE depends_on closure of slice idx: every
 // slice idx depends on directly or through another dependency. idx itself is
@@ -112,9 +203,10 @@ func sortedSliceSet(set map[int]bool) []int {
 // containment on segment boundaries). An overlap with a transitive depends_on
 // ancestor is allowed (AncestorOwned): the ancestor's commits are in the
 // requester's base. Any other owner — a same-wave sibling, an earlier-wave
-// non-dependency, a descendant — is a Conflict. Same-slice overlaps are never
-// recorded. Order: requested-path order, then slice index ascending, then the
-// owner's declared order. Pure.
+// non-dependency, a descendant — is a Conflict. Same-slice overlaps are recorded
+// only in the unexported ownSlice, so they never reach a payload. Order:
+// requested-path order, then slice index ascending, then the owner's declared
+// order. Pure.
 func classifySliceOwnership(subPlans []plan.SubPlanSummary, sliceIdx int, paths []string) *sliceOwnershipCheck {
 	ancestors := sliceAncestors(subPlans, sliceIdx)
 	c := &sliceOwnershipCheck{
@@ -126,7 +218,7 @@ func classifySliceOwnership(subPlans []plan.SubPlanSummary, sliceIdx int, paths 
 	}
 	for _, p := range paths {
 		for j, sp := range subPlans {
-			if j == sliceIdx || sp.Scope == nil {
+			if sp.Scope == nil {
 				continue
 			}
 			for _, f := range sp.Scope.Files {
@@ -140,9 +232,12 @@ func classifySliceOwnership(subPlans []plan.SubPlanSummary, sliceIdx int, paths 
 					OwningPath:  f.Path,
 					OverlapKind: overlapKind(p, f.Path),
 				}
-				if ancestors[j] {
+				switch {
+				case j == sliceIdx:
+					c.ownSlice = append(c.ownSlice, o)
+				case ancestors[j]:
 					c.AncestorOwned = append(c.AncestorOwned, o)
-				} else {
+				default:
 					c.Conflicts = append(c.Conflicts, o)
 				}
 			}
@@ -152,17 +247,14 @@ func classifySliceOwnership(subPlans []plan.SubPlanSummary, sliceIdx int, paths 
 }
 
 // amendmentSliceOwnership runs the slice-ownership check for an amendment on
-// runID (#4679). It returns (nil, nil) — nothing to check — when the RunRepo is
-// unconfigured, when the run is not a decomposition child (DecomposedFrom or
-// SliceIndex nil), or when the parent's approved plan is ABSENT (nil, no
-// decomposition, or SliceIndex out of range): the same ABSENT partition
-// resolveSliceDependencies documents. A run or plan read ERROR returns a
-// non-nil error; the request route fails open on it, the decide route fails
-// closed. So does a decomposition child with no ArtifactRepo: the parent's
-// plan is unreadable, not absent, and loadApprovedPlanForRun's own nil-repo
-// (nil, nil) would otherwise read as ABSENT and admit the approve. OwningChildRunID is filled best-effort from the parent's minted
-// children: a sibling-list error WARN-logs and leaves the ids empty, because
-// the decision depends only on the plan.
+// runID (#4679), for the request and decide routes. It returns (nil, nil) —
+// nothing to check — when the RunRepo is unconfigured, when the run is not a
+// decomposition child (DecomposedFrom or SliceIndex nil), or when the parent's
+// approved plan is ABSENT (nil, no decomposition, or SliceIndex out of range):
+// the same ABSENT partition resolveSliceDependencies documents. A run or plan
+// read ERROR returns a non-nil error; the request route fails open on it, the
+// decide route fails closed. So does a decomposition child with no ArtifactRepo:
+// the parent's plan is unreadable, not absent.
 func (s *Server) amendmentSliceOwnership(ctx context.Context, runID uuid.UUID, paths []scopeamendment.PathEntry) (*sliceOwnershipCheck, error) {
 	if s.cfg.RunRepo == nil {
 		return nil, nil
@@ -171,12 +263,34 @@ func (s *Server) amendmentSliceOwnership(ctx context.Context, runID uuid.UUID, p
 	if err != nil {
 		return nil, fmt.Errorf("get run: %w", err)
 	}
-	if runRow.DecomposedFrom == nil || runRow.SliceIndex == nil {
+	check, err := s.sliceOwnershipForRun(ctx, runRow, paths)
+	if errors.Is(err, errSliceOwnershipPlanAbsent) {
 		return nil, nil
 	}
+	return check, err
+}
+
+// sliceOwnershipForRun classifies paths against the parent's approved
+// decomposition for a run row the caller already holds. It returns (nil, nil)
+// when the run is not a decomposition child, errSliceOwnershipPlanAbsent when the
+// run has no slice index or the parent's plan is nil, has no decomposition or
+// does not reach that index, errSliceOwnershipPlanUnconfigured with no
+// ArtifactRepo (loadApprovedPlanForRun's own nil-repo (nil, nil) would otherwise
+// read as ABSENT), and an ordinary error when a read fails. OwningChildRunID is
+// filled best-effort from the parent's minted children: a sibling-list error
+// WARN-logs and leaves the ids empty, because the decision depends only on the
+// plan.
+func (s *Server) sliceOwnershipForRun(ctx context.Context, runRow *run.Run, paths []scopeamendment.PathEntry) (*sliceOwnershipCheck, error) {
+	if runRow.DecomposedFrom == nil {
+		return nil, nil
+	}
+	if runRow.SliceIndex == nil {
+		return nil, errSliceOwnershipPlanAbsent
+	}
+	runID := runRow.ID
 	parentID := *runRow.DecomposedFrom
 	if s.cfg.ArtifactRepo == nil {
-		return nil, errors.New("artifact repository unconfigured: the parent's approved plan cannot be read")
+		return nil, errSliceOwnershipPlanUnconfigured
 	}
 	p, err := s.loadApprovedPlanForRun(ctx, parentID)
 	if err != nil {
@@ -184,7 +298,7 @@ func (s *Server) amendmentSliceOwnership(ctx context.Context, runID uuid.UUID, p
 	}
 	idx := *runRow.SliceIndex
 	if p == nil || p.Decomposition == nil || idx < 0 || idx >= len(p.Decomposition.SubPlans) {
-		return nil, nil
+		return nil, errSliceOwnershipPlanAbsent
 	}
 	reqPaths := make([]string, 0, len(paths))
 	for _, pe := range paths {
@@ -221,6 +335,73 @@ func (s *Server) amendmentSliceOwnership(ctx context.Context, runID uuid.UUID, p
 	return check, nil
 }
 
+// refuseSliceOwnedPreApproval is the fail-CLOSED slice-ownership guard for the two
+// channels that mint an ALREADY-APPROVED amendment on a decomposition child
+// (#4798): resume add_scope_files and the scope-completeness amend. It writes the
+// response and returns (nil, true) when it refused, and returns (check, false)
+// with nothing written when the caller may proceed. The check is nil for a run
+// that is not a decomposition child.
+//
+// A non-ancestor owner answers 409 amendment_path_owned_by_sibling_slice with a
+// scope_amendment_refused row, whatever state that sibling is in, and there is no
+// override. The row is best-effort: a lost row never turns a refusal into a
+// success. A failed read, an absent decomposition and an unconfigured plan store
+// answer 500 slice_ownership_check_failed with details.retryable, because no later
+// decide re-checks a row that is born approved; the request route can fail open
+// only because decide does re-check. The message is static and the cause travels
+// only through internalCauseKey.
+func (s *Server) refuseSliceOwnedPreApproval(w http.ResponseWriter, r *http.Request, runRow *run.Run, stageID uuid.UUID, paths []scopeamendment.PathEntry, phase, reason, subject string) (*sliceOwnershipCheck, bool) {
+	ownership, oerr := s.sliceOwnershipForRun(r.Context(), runRow, paths)
+	if oerr != nil {
+		details := map[string]any{
+			"retryable":      true,
+			"reason":         "parent_plan_unreadable",
+			"remedy":         "re-POST the same request once the plan store is readable; nothing was written",
+			internalCauseKey: oerr.Error(),
+		}
+		switch {
+		case errors.Is(oerr, errSliceOwnershipPlanAbsent):
+			details["retryable"] = false
+			details["reason"] = "decomposition_absent"
+			details["remedy"] = "fail and restart the run: the parent's approved plan declares no decomposition for this slice, so retrying cannot succeed"
+		case errors.Is(oerr, errSliceOwnershipPlanUnconfigured):
+			details["retryable"] = false
+			details["reason"] = "plan_store_unconfigured"
+			details["remedy"] = "configure the artifact repository and restart the deployment, retrying cannot succeed until then; or decide fail to end the park"
+		}
+		s.writeError(w, r, http.StatusInternalServerError, errCodeSliceOwnershipCheckFailed,
+			"the slice-ownership check could not establish this run's approved decomposition, so no scope widening was applied; nothing was written",
+			details)
+		return nil, true
+	}
+	if ownership.refused() {
+		s.writeScopeAmendmentRefusedAudit(r, runRow.ID, stageID, audit.ActorUser, subject, map[string]any{
+			"phase":           phase,
+			"paths":           paths,
+			"reason":          strings.TrimSpace(reason),
+			"slice_ownership": ownership,
+		})
+		details := sliceOwnershipRefusalDetails(ownership)
+		details["remedy"] = sliceOwnershipPhaseRemedy(phase)
+		details["retryable"] = false
+		s.writeError(w, r, http.StatusConflict, errCodeAmendmentPathOwnedBySibling,
+			sliceOwnershipRefusalMessage(ownership, phase), details)
+		return nil, true
+	}
+	return ownership, false
+}
+
+// sliceOwnershipPhaseRemedy is the remedy text for a refusal in the given phase.
+func sliceOwnershipPhaseRemedy(phase string) string {
+	switch phase {
+	case sliceOwnershipPhaseResume:
+		return sliceOwnershipResumeRemedy
+	case sliceOwnershipPhaseAmend:
+		return sliceOwnershipAmendRemedy
+	}
+	return sliceOwnershipRemedy
+}
+
 // sliceOwnershipFailOpen is the slice_ownership payload the request route
 // records when the check could not run: checked=false plus the read error.
 func sliceOwnershipFailOpen(err error) map[string]any {
@@ -230,7 +411,8 @@ func sliceOwnershipFailOpen(err error) map[string]any {
 // sliceOwnershipRefusalMessage renders the 409 message: each conflicting path,
 // its owning slice (index, title, child run id), the requesting slice and its
 // ancestor set, and the remedy. phase "decide" addresses the operator: there is
-// no override, so the message tells them to deny.
+// no override, so the message tells them to deny. The resume and amend phases
+// carry that channel's remedy, because their operator has no row to deny.
 func sliceOwnershipRefusalMessage(c *sliceOwnershipCheck, phase string) string {
 	parts := make([]string, 0, len(c.Conflicts))
 	for _, o := range c.Conflicts {
@@ -259,7 +441,7 @@ func sliceOwnershipRefusalMessage(c *sliceOwnershipCheck, phase string) string {
 	if phase == "decide" {
 		return msg + "There is no override: DENY this amendment with the remedy as the reason — " + sliceOwnershipRemedy
 	}
-	return msg + "Remedy: " + sliceOwnershipRemedy
+	return msg + "Remedy: " + sliceOwnershipPhaseRemedy(phase)
 }
 
 // sliceOwnershipRefusalDetails is the 409 details object.

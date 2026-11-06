@@ -187,6 +187,9 @@ type childDispatch struct {
 	// at discovery — i.e. awaiting a host spawn, so this call dispatches it.
 	pending    bool
 	stateKnown bool
+	// executor is the child implement stage's executor from the same discovery
+	// read; dispatchOneChild derives the child's --agent from it (#5095).
+	executor StageExecutor
 }
 
 // implementStageDispatchable reports whether an implement stage in the given
@@ -349,6 +352,7 @@ func (r *runResolver) runChildren(ctx context.Context, _ *mcp.CallToolRequest, i
 		d.stageID = stage.ID
 		d.state = stage.State
 		d.stateKnown = true
+		d.executor = stage.Executor
 		d.pending = implementStageDispatchable(stage.State)
 		if implementStageInFlight(stage.State) {
 			inFlight++
@@ -490,6 +494,15 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 		return res
 	}
 
+	// An unsupported executor agent refuses per child, before the marker (#5095):
+	// this child's stage stays parked, and the loop continues so its siblings
+	// still dispatch.
+	agent, aerr := stageRunnerAgent(d.runID, d.stageID, d.executor)
+	if aerr != nil {
+		res.Warnings = append(res.Warnings, aerr.Error())
+		return res
+	}
+
 	// (#1912) Mark the host spawn BEFORE spawning, exactly as
 	// fishhawk_run_stage / fishhawk_dispatch_stage do: the endpoint CAS-flips
 	// {pending, awaiting_host_dispatch} → dispatched so 'dispatched'
@@ -551,6 +564,7 @@ func (r *runResolver) dispatchOneChild(ctx context.Context, p dispatchChildParam
 	// at the same position (right after --github-repo) so the two producers
 	// cannot drift (E45.46 / #3463).
 	argv = append(argv, p.forgeTarget.argv()...)
+	argv = append(argv, runnerAgentArgv(agent)...)
 	argv = append(argv,
 		// --base-branch / --check-base-ref drives BOTH halves of a dependent
 		// wave's basing on its predecessors' merged tree: (a) the runner's

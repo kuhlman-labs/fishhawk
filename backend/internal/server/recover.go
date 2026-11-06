@@ -501,6 +501,8 @@ func (s *Server) refuseDecomposedRecovery(w http.ResponseWriter, r *http.Request
 // freshly created implement stage; the in-place decomposition re-drive
 // attaches it to the child's EXISTING implement stage. amendPaths must
 // be non-empty. defaultReason is used when the operator gave no reason.
+// A decomposition-child caller must have passed refuseSliceOwnedPreApproval
+// first (#4798): this row is born approved, so no later decide re-checks it.
 func (s *Server) createApprovedScopeAmendment(ctx context.Context, runID, stageID uuid.UUID, amendPaths []scopeamendment.PathEntry, reason, defaultReason, decidedBy string) error {
 	rsn := strings.TrimSpace(reason)
 	if rsn == "" {
@@ -579,19 +581,27 @@ func (s *Server) resolveInheritedApprovedAmendments(ctx context.Context, parentR
 //     FailureCategory==B AND its approved plan must resolve via the
 //     ParentRunID parent-walk (loadApprovedPlanForRun); otherwise
 //     recovery_not_eligible names which leg failed.
-//  2. Re-open the child via run.RedriveChild (failed implement →
+//  2. Slice ownership, only with add_scope_files (#4798): a path owned by
+//     a slice that is not a transitive depends_on ancestor is refused 409
+//     amendment_path_owned_by_sibling_slice, and an unreadable or absent
+//     decomposition 500 slice_ownership_check_failed, before anything is
+//     written, so the child stays failed. This is the STRUCTURAL #4679 rule
+//     and it does NOT check delivery: an ancestor's path is admitted whatever
+//     that ancestor's state. On a local runner a category-B-failed child has
+//     already passed the wave gate; on Actions or GitLab, a resume naming an
+//     undelivered ancestor's path can still conflict at fan-in.
+//  3. Re-open the child via run.RedriveChild (failed implement →
 //     pending, failed run → running) on the shared parent branch. This
-//     runs FIRST and acts as the duplicate guard: it un-terminals the
-//     run, so a concurrent/replayed recover fails here and never folds an
-//     amendment.
-//  3. Fold the operator's add_scope_files as a pre-approved amendment on
+//     acts as the duplicate guard: it un-terminals the run, so a
+//     concurrent/replayed recover fails here and never folds an amendment.
+//  4. Fold the operator's add_scope_files as a pre-approved amendment on
 //     the EXISTING implement stage — only after a successful re-drive (so
 //     a failed attempt never orphans an approved amendment) and BEFORE
 //     the orchestrator handoff, so the implement prompt's
 //     mergeApprovedScopeAmendments fold (keyed by run + stage id) sees it.
-//  4. Append a plan_reused_from provenance entry
+//  5. Append a plan_reused_from provenance entry
 //     (source=decomposition_child_recovery).
-//  5. Hand off to Orchestrator.Advance to walk pending → dispatched,
+//  6. Hand off to Orchestrator.Advance to walk pending → dispatched,
 //     then return the re-opened child (same id).
 //
 // run.RedriveChild accepts any failure category — gating on category-B
@@ -657,7 +667,16 @@ func (s *Server) handleRecoverDecompositionChild(w http.ResponseWriter, r *http.
 		return
 	}
 
-	// Re-open the child in place against the shared parent branch FIRST.
+	// The refusal runs BEFORE the re-drive so a refused recovery leaves the
+	// child failed with nothing written. An amendment-less recovery never
+	// reaches it, because it widens nothing.
+	if len(amendPaths) > 0 {
+		if _, refused := s.refuseSliceOwnedPreApproval(w, r, child, implementStage.ID, amendPaths, sliceOwnershipPhaseResume, reason, id.Subject); refused {
+			return
+		}
+	}
+
+	// Re-open the child in place against the shared parent branch.
 	// RedriveChild transitions the run failed → running, so it is the
 	// duplicate guard: a concurrent duplicate recover (or any replay after
 	// the child has already re-opened) fails here with

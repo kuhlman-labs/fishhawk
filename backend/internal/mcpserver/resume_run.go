@@ -88,6 +88,16 @@ fishhawk_start_run, re-stating the prior plan approval's conditions —
 or re-drive ONE failed slice in place by pointing parent_run_id at that
 decomposition child's own id.
 
+On a decomposition child, add_scope_files passes the slice-ownership rule
+BEFORE the child is re-opened, so a refusal leaves it failed with no amendment
+row. A path a slice that is not a depends_on ancestor declares is refused 409
+amendment_path_owned_by_sibling_slice, with no override; details name the owner
+and the remedy. A plan the guard cannot read answers 500
+slice_ownership_check_failed with details.retryable true, and a plan declaring
+no decomposition for this slice the same code with retryable false. This is the
+structural rule only: resume does NOT check delivery, so on Actions or GitLab a
+path of an undelivered ancestor can still conflict at fan-in.
+
 Either way an ineligible target returns a recovery_not_eligible error
 naming which leg failed the gate, and a plan_reused_from audit entry
 records the recovery. Parents without a cached workflow spec (legacy
