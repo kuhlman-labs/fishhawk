@@ -4517,8 +4517,9 @@ func TestFetchPrompt_SendsRunnerCapabilities(t *testing.T) {
 // literal backend/internal/server's TestResumeKindWireValues pins, and the
 // FULL combined header value is pinned in list order (append-only — #3621's
 // push-resume, then #4183's merge-candidate-verify, then E55.16 / #3916's
-// child-push-resume, then #4190's reverify-resume), matching the
-// capableRunnerCapabilities row of the backend's TestResumeKindWireValues.
+// child-push-resume, then #4190's reverify-resume, then ADR-140 (#5047) D9's
+// review-obligation-resume), matching the reviewObligationRunnerCapabilities row
+// of the backend's TestResumeKindWireValues.
 func TestRunnerCapabilityWireValues(t *testing.T) {
 	if CapabilityChildPushResume != "child-push-resume" {
 		t.Errorf("CapabilityChildPushResume = %q, want %q", CapabilityChildPushResume, "child-push-resume")
@@ -4526,7 +4527,10 @@ func TestRunnerCapabilityWireValues(t *testing.T) {
 	if CapabilityReverifyResume != "reverify-resume" {
 		t.Errorf("CapabilityReverifyResume = %q, want %q", CapabilityReverifyResume, "reverify-resume")
 	}
-	const want = "push-resume,merge-candidate-verify,child-push-resume,reverify-resume"
+	if CapabilityReviewObligationResume != "review-obligation-resume" {
+		t.Errorf("CapabilityReviewObligationResume = %q, want %q", CapabilityReviewObligationResume, "review-obligation-resume")
+	}
+	const want = "push-resume,merge-candidate-verify,child-push-resume,reverify-resume,review-obligation-resume"
 	if got := RunnerCapabilitiesValue(); got != want {
 		t.Errorf("RunnerCapabilitiesValue() = %q, want %q", got, want)
 	}
@@ -6092,6 +6096,1084 @@ func TestSpecialistJob_DecodesProvenance(t *testing.T) {
 		}
 		if j.Provenance != tc.provenance || j.BlockingEligible != tc.eligible {
 			t.Fatalf("%s decoded provenance=%q blocking_eligible=%v", tc.body, j.Provenance, j.BlockingEligible)
+		}
+	}
+}
+
+// reviewObligationWireSection reads one compact section of the shared golden
+// testdata/wire/review_obligation_wire.json, the same bytes the backend's route
+// and prompt tests post and compare.
+func reviewObligationWireSection(t *testing.T, section string) []byte {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "review_obligation_wire.json"))
+	if err != nil {
+		t.Fatalf("setup: read shared review-obligation golden: %v", err)
+	}
+	var sections map[string]json.RawMessage
+	if err := json.Unmarshal(b, &sections); err != nil {
+		t.Fatalf("setup: decode shared review-obligation golden: %v", err)
+	}
+	raw, ok := sections[section]
+	if !ok {
+		t.Fatalf("setup: golden has no %q section", section)
+	}
+	return raw
+}
+
+// shipArgsFromGoldenFailureReport maps the golden failure report onto the args
+// the real caller passes.
+func shipArgsFromGoldenFailureReport(t *testing.T, priv ed25519.PrivateKey) ShipPullRequestArgs {
+	t.Helper()
+	var report struct {
+		Outcome          string            `json:"outcome"`
+		Category         string            `json:"category"`
+		Reason           string            `json:"reason"`
+		Branch           string            `json:"branch"`
+		HeadSHA          string            `json:"head_sha"`
+		BaseSHA          string            `json:"base_sha"`
+		VerifiedTreeSHA  string            `json:"verified_tree_sha"`
+		Title            string            `json:"title"`
+		Body             string            `json:"body"`
+		ReviewObligation *ReviewObligation `json:"review_obligation"`
+	}
+	if err := json.Unmarshal(reviewObligationWireSection(t, "failure_report"), &report); err != nil {
+		t.Fatalf("setup: decode failure_report section: %v", err)
+	}
+	return ShipPullRequestArgs{
+		RunID: "r", StageID: "s", PrivateKey: priv,
+		Outcome: report.Outcome, Category: report.Category, Reason: report.Reason,
+		Branch: report.Branch, HeadSHA: report.HeadSHA, BaseSHA: report.BaseSHA,
+		TreeSHA: report.VerifiedTreeSHA, PRTitle: report.Title, PRBody: report.Body,
+		ReviewObligation: report.ReviewObligation,
+	}
+}
+
+// TestShipPullRequest_FailureReport_ObligationWire pins the marshalled report to
+// the golden byte for byte, with review_obligation last after the held-commit text.
+func TestShipPullRequest_FailureReport_ObligationWire(t *testing.T) {
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := shipAndCapture(t, shipArgsFromGoldenFailureReport(t, priv))
+	if want := string(reviewObligationWireSection(t, "failure_report")); got != want {
+		t.Errorf("failure report bytes differ from the golden:\n got  %s\n want %s", got, want)
+	}
+
+	t.Run("no_obligation_keeps_legacy_bytes", func(t *testing.T) {
+		args := shipArgsFromGoldenFailureReport(t, priv)
+		args.ReviewObligation = nil
+		if got := shipAndCapture(t, args); strings.Contains(got, "review_obligation") {
+			t.Errorf("a report with no obligation must not carry the key: %s", got)
+		}
+	})
+	t.Run("known_none_keeps_empty_list", func(t *testing.T) {
+		args := shipArgsFromGoldenFailureReport(t, priv)
+		args.ReviewObligation = &ReviewObligation{HeadSHA: args.HeadSHA, StageAttempt: "a", SupplementalScopeExemptions: []ScopeExemption{}}
+		if got := shipAndCapture(t, args); !strings.Contains(got, `"supplemental_scope_exemptions":[]`) {
+			t.Errorf("known none must marshal an empty list, not omit it: %s", got)
+		}
+	})
+}
+
+// TestShipPullRequest_FailureReport_ObligationNeverShrunk: the ladder yields the
+// reason and PR text; the obligation has no rung and survives whole.
+func TestShipPullRequest_FailureReport_ObligationNeverShrunk(t *testing.T) {
+	obligation := &ReviewObligation{HeadSHA: "deadbeef", StageAttempt: "attempt-1"}
+	for i := range 40 {
+		obligation.SupplementalScopeExemptions = append(obligation.SupplementalScopeExemptions,
+			ScopeExemption{Path: fmt.Sprintf("backend/internal/foo/file_%03d.go", i), Reason: strings.Repeat("r", 200)})
+	}
+	expanding := strings.Repeat("<>&\\\x01", 20*1024)
+	got := shipAndCapture(t, ShipPullRequestArgs{
+		RunID: "r", StageID: "s",
+		Outcome: "failed", Category: "C", Reason: strings.Repeat("<&", 40*1024),
+		Branch: "b", HeadSHA: "deadbeef", BaseSHA: "feedface", TreeSHA: "tree",
+		PRTitle: expanding, PRBody: expanding,
+		ReviewObligation: obligation,
+	})
+	if len(got) > MaxPullRequestReportBytes {
+		t.Fatalf("report = %d bytes, want <= %d", len(got), MaxPullRequestReportBytes)
+	}
+	var decoded struct {
+		HeadSHA          string            `json:"head_sha"`
+		ReviewObligation *ReviewObligation `json:"review_obligation"`
+	}
+	if err := json.Unmarshal([]byte(got), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.HeadSHA != "deadbeef" {
+		t.Errorf("head = %q, the checkpoint must survive the ladder", decoded.HeadSHA)
+	}
+	if !reflect.DeepEqual(decoded.ReviewObligation, obligation) {
+		t.Errorf("obligation was altered by the ladder: got %d paths, want %d",
+			len(decoded.ReviewObligation.SupplementalScopeExemptions), len(obligation.SupplementalScopeExemptions))
+	}
+}
+
+// oversizedObligation cannot fit the report cap, so the ladder reports false.
+func oversizedObligation() *ReviewObligation {
+	obligation := &ReviewObligation{HeadSHA: "deadbeef", StageAttempt: "attempt-1"}
+	for i := range 400 {
+		obligation.SupplementalScopeExemptions = append(obligation.SupplementalScopeExemptions,
+			ScopeExemption{Path: fmt.Sprintf("backend/internal/foo/file_%03d.go", i), Reason: strings.Repeat("r", 200)})
+	}
+	return obligation
+}
+
+// assertNoFailureCheckpoint fails on any checkpoint coordinate, kind, PR text or
+// obligation in a report's bytes.
+func assertNoFailureCheckpoint(t *testing.T, body string) {
+	t.Helper()
+	for _, key := range []string{"branch", "head_sha", "base_sha", "verified_tree_sha", "resume_kind", "title", "body", "review_obligation"} {
+		if strings.Contains(body, `"`+key+`"`) {
+			t.Errorf("report still carries %q: %.200s", key, body)
+		}
+	}
+}
+
+// TestShipPullRequest_FailureReport_TooLarge_DropsWholeCheckpoint: a required set
+// that cannot fit gives up every coordinate with it, so the report never reads as a
+// resumable carrier owing nothing, and the diagnosis survives.
+func TestShipPullRequest_FailureReport_TooLarge_DropsWholeCheckpoint(t *testing.T) {
+	args := ShipPullRequestArgs{
+		RunID: "r", StageID: "s",
+		Outcome: "failed", Category: "C", Reason: "open pull request: forge returned 502",
+		Branch: "b", HeadSHA: "deadbeef", BaseSHA: "feedface", TreeSHA: "tree", ResumeKind: "push",
+		PRTitle: "title", PRBody: "body",
+		ReviewObligation: oversizedObligation(),
+	}
+	t.Run("first_post", func(t *testing.T) {
+		got := shipAndCapture(t, args)
+		assertNoFailureCheckpoint(t, got)
+		if len(got) > MaxPullRequestReportBytes {
+			t.Errorf("report = %d bytes, want <= %d", len(got), MaxPullRequestReportBytes)
+		}
+		if !strings.Contains(got, "forge returned 502") {
+			t.Errorf("the cleared report must keep its diagnosis: %.200s", got)
+		}
+	})
+	t.Run("no_required_set_keeps_coordinates", func(t *testing.T) {
+		// A report the ladder cannot fit for any other reason keeps today's shape:
+		// only a non-empty required set costs the checkpoint.
+		for name, obligation := range map[string]*ReviewObligation{
+			"no_obligation": nil,
+			"known_none":    {HeadSHA: "deadbeef", StageAttempt: "attempt-1", SupplementalScopeExemptions: []ScopeExemption{}},
+		} {
+			legacy := args
+			legacy.Branch = strings.Repeat("b", MaxPullRequestReportBytes+1)
+			legacy.ReviewObligation = obligation
+			if got := shipAndCapture(t, legacy); !strings.Contains(got, `"head_sha":"deadbeef"`) {
+				t.Errorf("%s: report lost its coordinates: %.200s", name, got)
+			}
+		}
+	})
+	t.Run("413_rung_does_not_restore_it", func(t *testing.T) {
+		var bodies []string
+		srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			b, _ := io.ReadAll(r.Body)
+			bodies = append(bodies, string(b))
+			if len(bodies) == 1 {
+				w.WriteHeader(http.StatusRequestEntityTooLarge)
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{}`)
+		}))
+		defer srv.Close()
+		_, priv, _ := ed25519.GenerateKey(rand.Reader)
+		withKey := args
+		withKey.PrivateKey = priv
+		if _, err := quickClient(srv).ShipPullRequest(context.Background(), withKey); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		if len(bodies) != 2 {
+			t.Fatalf("POSTs = %d, want 2", len(bodies))
+		}
+		assertNoFailureCheckpoint(t, bodies[1])
+	})
+}
+
+// TestShipPullRequest_FailureReport_Aggressive413Rung_CarriesObligation: the
+// aggressive rung may drop PR text but never the obligation beside its coordinates.
+func TestShipPullRequest_FailureReport_Aggressive413Rung_CarriesObligation(t *testing.T) {
+	var bodies []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		bodies = append(bodies, string(b))
+		if len(bodies) == 1 {
+			w.WriteHeader(http.StatusRequestEntityTooLarge)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}))
+	defer srv.Close()
+	_, priv, _ := ed25519.GenerateKey(rand.Reader)
+	args := shipArgsFromGoldenFailureReport(t, priv)
+	if _, err := quickClient(srv).ShipPullRequest(context.Background(), args); err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if len(bodies) != 2 {
+		t.Fatalf("POSTs = %d, want 2", len(bodies))
+	}
+	var decoded struct {
+		HeadSHA          string            `json:"head_sha"`
+		Title            string            `json:"title"`
+		ReviewObligation *ReviewObligation `json:"review_obligation"`
+	}
+	if err := json.Unmarshal([]byte(bodies[1]), &decoded); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if decoded.HeadSHA != args.HeadSHA || decoded.Title != "" {
+		t.Errorf("the rung keeps coordinates and drops PR text: %+v", decoded)
+	}
+	if !reflect.DeepEqual(decoded.ReviewObligation, args.ReviewObligation) {
+		t.Errorf("the 413 rung must carry the obligation: got %+v", decoded.ReviewObligation)
+	}
+}
+
+// TestShipPullRequest_ParkBody_CarriesObligation pins the park report's key, last
+// in the body, and its absence with no obligation.
+func TestShipPullRequest_ParkBody_CarriesObligation(t *testing.T) {
+	obligation := &ReviewObligation{
+		HeadSHA: "deadbeef", StageAttempt: "attempt-1",
+		SupplementalScopeExemptions: []ScopeExemption{{Path: "a.go", Reason: "r"}},
+	}
+	args := ShipPullRequestArgs{
+		RunID: "r", StageID: "s", Outcome: "scope_park",
+		Branch: "b", HeadSHA: "deadbeef", BaseSHA: "feedface", TreeSHA: "tree",
+		MissingPaths: []string{"b.go"}, PRTitle: "t", PRBody: "p",
+		ReviewObligation: obligation,
+	}
+	got := shipAndCapture(t, args)
+	wantKey, err := json.Marshal(obligation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasSuffix(got, `,"review_obligation":`+string(wantKey)+`}`) {
+		t.Errorf("park body must end with its obligation: %s", got)
+	}
+	args.ReviewObligation = nil
+	if got := shipAndCapture(t, args); strings.Contains(got, "review_obligation") {
+		t.Errorf("a park with no obligation must not carry the key: %s", got)
+	}
+}
+
+// TestFetchPrompt_DecodesReviewObligation reads the golden's prompt fields, and
+// keeps absent, null and empty lists apart.
+func TestFetchPrompt_DecodesReviewObligation(t *testing.T) {
+	envelope := func(fields string) string {
+		return `{"stage_id":"s","stage_type":"implement","prompt":"hi"` + fields + `}`
+	}
+	golden := strings.TrimPrefix(string(reviewObligationWireSection(t, "prompt_fields")), "{")
+	golden = "," + strings.TrimSuffix(golden, "}")
+	for _, tc := range []struct {
+		name       string
+		body       string
+		wantNil    bool
+		wantListed bool
+		wantLen    int
+		wantFlag   bool
+	}{
+		{name: "golden", body: envelope(golden), wantListed: true, wantLen: 1, wantFlag: true},
+		{name: "absent", body: envelope(""), wantNil: true},
+		{name: "null_list", body: envelope(`,"held_commit_review_obligation":{"head_sha":"h","stage_attempt":"a","supplemental_scope_exemptions":null}`)},
+		{name: "empty_list", body: envelope(`,"held_commit_review_obligation":{"head_sha":"h","stage_attempt":"a","supplemental_scope_exemptions":[]}`), wantListed: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = io.WriteString(w, tc.body)
+			}))
+			defer srv.Close()
+			_, priv, _ := ed25519.GenerateKey(rand.Reader)
+			got, err := quickClient(srv).FetchPrompt(context.Background(), FetchPromptArgs{StageID: "s", PrivateKey: priv})
+			if err != nil {
+				t.Fatalf("FetchPrompt: %v", err)
+			}
+			if got.SupportsReviewObligationResume != tc.wantFlag {
+				t.Errorf("flag = %t, want %t", got.SupportsReviewObligationResume, tc.wantFlag)
+			}
+			if got.HeldCommitReviewObligation == nil {
+				if !tc.wantNil {
+					t.Fatal("obligation decoded nil")
+				}
+				return
+			}
+			if tc.wantNil {
+				t.Fatalf("obligation = %+v, want nil", got.HeldCommitReviewObligation)
+			}
+			list := got.HeldCommitReviewObligation.SupplementalScopeExemptions
+			if (list != nil) != tc.wantListed || len(list) != tc.wantLen {
+				t.Errorf("list = %#v, want listed=%t len=%d", list, tc.wantListed, tc.wantLen)
+			}
+		})
+	}
+}
+
+// liveScriptServer answers each POST through a per-test script. A held handler
+// waits on release or its request context, so a client that stops ends the hold
+// and t.Cleanup frees everything.
+type liveScriptServer struct {
+	mu      sync.Mutex
+	bodies  [][]byte
+	sigs    []string
+	release chan struct{}
+}
+
+func (l *liveScriptServer) count() int {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	return len(l.bodies)
+}
+
+func (l *liveScriptServer) hold(r *http.Request) {
+	select {
+	case <-l.release:
+	case <-r.Context().Done():
+	}
+}
+
+func newLiveScriptClient(t *testing.T, script func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request)) (*Client, *liveScriptServer) {
+	t.Helper()
+	l := &liveScriptServer{release: make(chan struct{})}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		b, _ := io.ReadAll(r.Body)
+		l.mu.Lock()
+		l.bodies = append(l.bodies, b)
+		l.sigs = append(l.sigs, r.Header.Get("X-Fishhawk-Signature"))
+		n := len(l.bodies)
+		l.mu.Unlock()
+		script(l, n, w, r)
+	}))
+	t.Cleanup(srv.Close)
+	t.Cleanup(func() { close(l.release) })
+	c := New(srv.URL)
+	c.HTTP = &http.Client{Timeout: 30 * time.Second}
+	c.MaxRetries = 3
+	c.Backoff = 10 * time.Millisecond
+	c.LivePassSettleAllowance = 200 * time.Millisecond
+	return c, l
+}
+
+// writeInFlight answers review_round_in_flight with the given header values; an
+// empty value omits its header.
+func writeInFlight(w http.ResponseWriter, remaining, retryAfter string) {
+	writeLiveEnvelope(w, http.StatusServiceUnavailable, codeReviewRoundInFlight, remaining, retryAfter)
+}
+
+func writeLiveEnvelope(w http.ResponseWriter, status int, code, remaining, retryAfter string) {
+	if remaining != "" {
+		w.Header().Set(ReviewPassRemainingHeader, remaining)
+	}
+	if retryAfter != "" {
+		w.Header().Set("Retry-After", retryAfter)
+	}
+	w.WriteHeader(status)
+	_, _ = fmt.Fprintf(w, `{"error":{"code":%q,"message":"m"}}`, code)
+}
+
+func hijackClose(t *testing.T, w http.ResponseWriter) {
+	t.Helper()
+	conn, _, err := w.(http.Hijacker).Hijack()
+	if err != nil {
+		t.Errorf("setup: hijack: %v", err)
+		return
+	}
+	_ = conn.Close()
+}
+
+func livePassArgs(t *testing.T) ShipPullRequestArgs {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return ShipPullRequestArgs{RunID: "r", StageID: "s", Body: []byte(`{"pr_number":1}`), PrivateKey: priv}
+}
+
+// shipBounded fails on the per-test clock rather than a global timeout: a mutant
+// that loses a bound fails here with a named message.
+func shipBounded(t *testing.T, c *Client, ctx context.Context, args ShipPullRequestArgs, within time.Duration) (*ShipPullRequestResult, error) {
+	t.Helper()
+	type result struct {
+		out *ShipPullRequestResult
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		out, err := c.ShipPullRequest(ctx, args)
+		done <- result{out, err}
+	}()
+	select {
+	case got := <-done:
+		return got.out, got.err
+	case <-time.After(within):
+		t.Fatalf("ShipPullRequest still running after %s: the bound did not govern this path", within)
+		return nil, nil
+	}
+}
+
+// liveBoundTolerance is the slack on a test's stated bound.
+const liveBoundTolerance = 2 * time.Second
+
+// TestShipPullRequest_LivePass_ExceedsBlipWindow_CompletesOnce: a pass outliving the
+// client timeout and more answers than the blip budget still completes, re-posting
+// identical signed bytes.
+func TestShipPullRequest_LivePass_ExceedsBlipWindow_CompletesOnce(t *testing.T) {
+	inFlightAnswers := DefaultMaxRetries + 2
+	c, l := newLiveScriptClient(t, func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request) {
+		switch {
+		case n == 1:
+			select {
+			case <-time.After(600 * time.Millisecond):
+			case <-l.release:
+			}
+		case n <= 1+inFlightAnswers:
+			writeInFlight(w, "120", "1")
+		default:
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"a","idempotent":true}`)
+		}
+	})
+	c.HTTP = &http.Client{Timeout: 300 * time.Millisecond}
+	c.MaxRetries = 0 // DefaultMaxRetries: the real blip budget
+	out, err := shipBounded(t, c, context.Background(), livePassArgs(t), time.Duration(inFlightAnswers)*time.Second+10*time.Second)
+	if err != nil {
+		t.Fatalf("ShipPullRequest: %v", err)
+	}
+	if !out.Idempotent {
+		t.Errorf("result = %+v, want the idempotent answer", out)
+	}
+	if got, want := l.count(), inFlightAnswers+2; got != want {
+		t.Errorf("POSTs = %d, want %d", got, want)
+	}
+	for i := range l.bodies {
+		if !bytes.Equal(l.bodies[i], l.bodies[0]) || l.sigs[i] != l.sigs[0] {
+			t.Errorf("POST %d differs from the first: every continuation re-posts the same signed bytes", i)
+		}
+	}
+}
+
+func TestShipPullRequest_LivePass_Outcomes(t *testing.T) {
+	t.Run("reject_settled_200", func(t *testing.T) {
+		t.Parallel()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			if n == 1 {
+				writeInFlight(w, "30", "1")
+				return
+			}
+			w.WriteHeader(http.StatusOK)
+			_, _ = io.WriteString(w, `{"id":"a","idempotent":true}`)
+		})
+		out, err := shipBounded(t, c, context.Background(), livePassArgs(t), 10*time.Second)
+		if err != nil || !out.Idempotent {
+			t.Fatalf("result = %+v, %v; a settled answer decides", out, err)
+		}
+		if l.count() != 2 {
+			t.Errorf("POSTs = %d, want 2", l.count())
+		}
+	})
+	t.Run("lost_409", func(t *testing.T) {
+		t.Parallel()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			if n == 1 {
+				writeInFlight(w, "30", "1")
+				return
+			}
+			writeLiveEnvelope(w, http.StatusConflict, "review_round_interrupted", "", "")
+		})
+		_, err := shipBounded(t, c, context.Background(), livePassArgs(t), 10*time.Second)
+		if err == nil || errors.Is(err, ErrLivePassBudgetExhausted) || !strings.Contains(err.Error(), "409") {
+			t.Fatalf("err = %v, want the 409 itself", err)
+		}
+		if l.count() != 2 {
+			t.Errorf("POSTs = %d, want 2: a lost pass stops at once", l.count())
+		}
+	})
+	t.Run("deadline", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, "1", "1")
+		})
+		_, err := shipBounded(t, c, context.Background(), livePassArgs(t), 1200*time.Millisecond+liveBoundTolerance)
+		if !errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want ErrLivePassBudgetExhausted", err)
+		}
+	})
+	t.Run("not_extended", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, fmt.Sprint(1+(n-1)*100), "1")
+		})
+		_, err := shipBounded(t, c, context.Background(), livePassArgs(t), 1200*time.Millisecond+liveBoundTolerance)
+		if !errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want the first answer's bound to hold", err)
+		}
+	})
+	t.Run("caller_cancel", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, "120", "60")
+			time.AfterFunc(100*time.Millisecond, cancel)
+		})
+		_, err := shipBounded(t, c, ctx, livePassArgs(t), liveBoundTolerance)
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("err = %v, want the caller's cancellation", err)
+		}
+	})
+	t.Run("never_latched_keeps_caller_error", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			w.WriteHeader(http.StatusServiceUnavailable)
+			time.AfterFunc(50*time.Millisecond, cancel)
+		})
+		c.Backoff = time.Minute
+		_, err := shipBounded(t, c, ctx, livePassArgs(t), liveBoundTolerance)
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want the plain cancellation with no bound latched", err)
+		}
+	})
+	t.Run("caller_deadline", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+		defer cancel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, "120", "60")
+		})
+		_, err := shipBounded(t, c, ctx, livePassArgs(t), liveBoundTolerance)
+		if !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("err = %v, want the caller's deadline", err)
+		}
+	})
+}
+
+// TestShipPullRequest_LivePass_OtherFiveHundreds_StayBlip: every answer short of the
+// exact live one spends the ordinary budget, however close it looks.
+func TestShipPullRequest_LivePass_OtherFiveHundreds_StayBlip(t *testing.T) {
+	for name, answer := range map[string]func(http.ResponseWriter){
+		"plain_503": func(w http.ResponseWriter) {
+			w.Header().Set(ReviewPassRemainingHeader, "30")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, "service unavailable")
+		},
+		"interrupted_with_live_headers": func(w http.ResponseWriter) {
+			writeLiveEnvelope(w, http.StatusServiceUnavailable, "review_round_interrupted", "30", "1")
+		},
+		"no_remaining_header": func(w http.ResponseWriter) { writeInFlight(w, "", "1") },
+		"zero":                func(w http.ResponseWriter) { writeInFlight(w, "0", "1") },
+		"negative":            func(w http.ResponseWriter) { writeInFlight(w, "-5", "1") },
+		"over_24h":            func(w http.ResponseWriter) { writeInFlight(w, "86401", "1") },
+		"non_numeric":         func(w http.ResponseWriter) { writeInFlight(w, "soon", "1") },
+		"no_envelope": func(w http.ResponseWriter) {
+			w.Header().Set(ReviewPassRemainingHeader, "30")
+			w.Header().Set("Retry-After", "1")
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, codeReviewRoundInFlight)
+		},
+		"in_flight_code_on_500": func(w http.ResponseWriter) {
+			writeLiveEnvelope(w, http.StatusInternalServerError, codeReviewRoundInFlight, "30", "1")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			c, l := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+				answer(w)
+			})
+			c.LivePassSettleAllowance = 1500 * time.Millisecond
+			_, err := shipBounded(t, c, context.Background(), livePassArgs(t), 30*time.Second)
+			if err == nil || errors.Is(err, ErrLivePassBudgetExhausted) || !strings.Contains(err.Error(), "exhausted retries") {
+				t.Fatalf("err = %v, want the ordinary exhausted-retries error", err)
+			}
+			if got, want := l.count(), c.MaxRetries+1; got != want {
+				t.Errorf("POSTs = %d, want %d: this answer proves no live pass", got, want)
+			}
+		})
+	}
+}
+
+func TestShipPullRequest_LivePass_BlipDuringContinuation(t *testing.T) {
+	t.Run("network_error_does_not_end_it", func(t *testing.T) {
+		t.Parallel()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			switch n {
+			case 1, 3:
+				writeInFlight(w, "30", "1")
+			case 2, 4:
+				hijackClose(t, w)
+			default:
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, `{"id":"a"}`)
+			}
+		})
+		c.MaxRetries = 1
+		out, err := shipBounded(t, c, context.Background(), livePassArgs(t), 15*time.Second)
+		if err != nil || out.ID != "a" {
+			t.Fatalf("result = %+v, %v: each live answer refills the blip budget", out, err)
+		}
+		if l.count() != 5 {
+			t.Errorf("POSTs = %d, want 5", l.count())
+		}
+	})
+	t.Run("live_resets_custom_backoff", func(t *testing.T) {
+		t.Parallel()
+		// Four ordinary 503s double a custom Backoff of 100ms to 1600ms. The live
+		// answer then fixes a 2s bound and must restore 100ms; a kept 1600ms sleep
+		// after the next ordinary 503 would outlast that bound.
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			switch {
+			case n <= 4 || n == 6:
+				w.WriteHeader(http.StatusServiceUnavailable)
+			case n == 5:
+				writeInFlight(w, "1", "1")
+			default:
+				w.WriteHeader(http.StatusCreated)
+				_, _ = io.WriteString(w, `{"id":"a"}`)
+			}
+		})
+		c.MaxRetries = 5
+		c.Backoff = 100 * time.Millisecond
+		c.LivePassSettleAllowance = time.Second
+		out, err := shipBounded(t, c, context.Background(), livePassArgs(t), 15*time.Second)
+		if err != nil || out.ID != "a" {
+			t.Fatalf("result = %+v, %v: the next POST must land inside the bound", out, err)
+		}
+		if l.count() != 7 {
+			t.Errorf("POSTs = %d, want 7", l.count())
+		}
+	})
+}
+
+// TestShipPullRequest_LivePass_FailureReportNeverWaits: a runner's failure report
+// must land while a pass is live, so it spends only the blip budget.
+func TestShipPullRequest_LivePass_FailureReportNeverWaits(t *testing.T) {
+	c, l := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+		writeInFlight(w, "120", "60")
+	})
+	args := livePassArgs(t)
+	args.Outcome, args.Category, args.Reason = "failed", "C", "boom"
+	_, err := shipBounded(t, c, context.Background(), args, liveBoundTolerance)
+	if err == nil || errors.Is(err, ErrLivePassBudgetExhausted) {
+		t.Fatalf("err = %v, want the ordinary exhausted-retries error", err)
+	}
+	if got, want := l.count(), c.MaxRetries+1; got != want {
+		t.Errorf("POSTs = %d, want %d", got, want)
+	}
+}
+
+// TestShipPullRequest_LivePass_TerminalEgressUntouched: the continuation never
+// reads, arms, spends or resets the shared terminal-egress phase.
+func TestShipPullRequest_LivePass_TerminalEgressUntouched(t *testing.T) {
+	settles := func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+		if n == 1 {
+			writeInFlight(w, "30", "1")
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		_, _ = io.WriteString(w, `{}`)
+	}
+	exhausts := func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+		writeInFlight(w, "1", "1")
+	}
+	t.Run("not_armed_stays_zero", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newLiveScriptClient(t, settles)
+		if _, err := shipBounded(t, c, context.Background(), livePassArgs(t), 10*time.Second); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		if got := c.terminalEgressDeadline.Load(); got != 0 {
+			t.Errorf("phase armed to %d by a pull-request upload", got)
+		}
+	})
+	const armed = int64(4242424242)
+	t.Run("armed_unchanged_after_success", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newLiveScriptClient(t, settles)
+		c.terminalEgressDeadline.Store(armed)
+		if _, err := shipBounded(t, c, context.Background(), livePassArgs(t), 10*time.Second); err != nil {
+			t.Fatalf("ShipPullRequest: %v", err)
+		}
+		if got := c.terminalEgressDeadline.Load(); got != armed {
+			t.Errorf("phase = %d, want it unchanged at %d", got, armed)
+		}
+	})
+	t.Run("armed_unchanged_after_exhaustion", func(t *testing.T) {
+		t.Parallel()
+		c, _ := newLiveScriptClient(t, exhausts)
+		c.terminalEgressDeadline.Store(armed)
+		if _, err := shipBounded(t, c, context.Background(), livePassArgs(t), 1200*time.Millisecond+liveBoundTolerance); !errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want ErrLivePassBudgetExhausted", err)
+		}
+		if got := c.terminalEgressDeadline.Load(); got != armed {
+			t.Errorf("phase = %d, want it unchanged at %d", got, armed)
+		}
+	})
+	t.Run("later_ship_trace_full_budget", func(t *testing.T) {
+		t.Parallel()
+		var traceCalls int
+		var mu sync.Mutex
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, r *http.Request) {
+			if strings.Contains(r.URL.Path, "pull-request") {
+				writeInFlight(w, "1", "1")
+				return
+			}
+			mu.Lock()
+			traceCalls++
+			mu.Unlock()
+			w.WriteHeader(http.StatusInternalServerError)
+		})
+		c.TerminalMaxRetries = 3
+		c.TerminalBackoff = time.Millisecond
+		c.TerminalBackoffCap = time.Millisecond
+		args := livePassArgs(t)
+		if _, err := shipBounded(t, c, context.Background(), args, 1200*time.Millisecond+liveBoundTolerance); !errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want ErrLivePassBudgetExhausted", err)
+		}
+		if _, err := c.ShipTrace(context.Background(), ShipArgs{RunID: "r", StageID: "s", Variant: "raw", Bundle: []byte("b"), PrivateKey: args.PrivateKey}); err == nil {
+			t.Fatal("ShipTrace against a failing server must fail")
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if want := c.TerminalMaxRetries + 1; traceCalls != want {
+			t.Errorf("ShipTrace attempts = %d, want its full budget %d", traceCalls, want)
+		}
+	})
+}
+
+// TestShipPullRequest_LivePass_GoldenSection reads the backend's live answer from
+// the shared golden, truncated exactly as the 5xx arm reads it.
+func TestShipPullRequest_LivePass_GoldenSection(t *testing.T) {
+	var section struct {
+		Status   int               `json:"status"`
+		Headers  map[string]string `json:"headers"`
+		Envelope json.RawMessage   `json:"envelope"`
+	}
+	if err := json.Unmarshal(reviewObligationWireSection(t, "review_round_in_flight"), &section); err != nil {
+		t.Fatalf("setup: decode section: %v", err)
+	}
+	resp := &http.Response{StatusCode: section.Status, Header: http.Header{}, Body: io.NopCloser(bytes.NewReader(section.Envelope))}
+	for k, v := range section.Headers {
+		resp.Header.Set(k, v)
+	}
+	if resp.Header.Get(ReviewPassRemainingHeader) == "" {
+		t.Fatalf("golden has no %s header: the wire name drifted", ReviewPassRemainingHeader)
+	}
+	now := time.Now()
+	live := livePassContinuation{allowance: DefaultLivePassSettleAllowance}
+	wait, isLive, latched, err := live.next(resp, readBriefBody(resp), "", now)
+	if err != nil || !isLive || !latched {
+		t.Fatalf("next = %s, %t, %t, %v; the golden answer is a live pass", wait, isLive, latched, err)
+	}
+	if wait != 15*time.Second {
+		t.Errorf("wait = %s, want the golden's Retry-After", wait)
+	}
+	if want := now.Add(90*time.Second + DefaultLivePassSettleAllowance); !live.deadline.Equal(want) {
+		t.Errorf("deadline = %s, want remaining plus allowance %s", live.deadline, want)
+	}
+}
+
+// TestShipPullRequest_LivePass_BoundsWholeCall: the first live answer's bound
+// governs every sleep, request, body read and retry of the remaining call. The kill
+// is shipBounded's per-test clock, never a global timeout.
+func TestShipPullRequest_LivePass_BoundsWholeCall(t *testing.T) {
+	const within = 1200*time.Millisecond + liveBoundTolerance
+	inFlightOnce := func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request, then func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request)) {
+		if n == 1 {
+			writeInFlight(w, "1", "1")
+			return
+		}
+		then(l, n, w, r)
+	}
+	hang := func(l *liveScriptServer, _ int, _ http.ResponseWriter, r *http.Request) { l.hold(r) }
+	stall := func(status int, partial string) func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request) {
+		return func(l *liveScriptServer, _ int, w http.ResponseWriter, r *http.Request) {
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, partial)
+			w.(http.Flusher).Flush()
+			l.hold(r)
+		}
+	}
+	ordinary503 := func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}
+	for _, tc := range []struct {
+		name      string
+		then      func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request)
+		first     func(w http.ResponseWriter)
+		backoff   time.Duration
+		retries   int
+		wantPosts int
+	}{
+		{
+			name:      "retry_after_past_remainder",
+			first:     func(w http.ResponseWriter) { writeInFlight(w, "1", "60") },
+			then:      hang,
+			wantPosts: 1,
+		},
+		{name: "next_request_hangs", then: hang},
+		{name: "body_stall_200", then: stall(http.StatusOK, `{"id":"par`)},
+		{name: "body_stall_503", then: stall(http.StatusServiceUnavailable, `{"error":{"code":"par`)},
+		{name: "ordinary_503_after_live", then: ordinary503, backoff: 300 * time.Millisecond},
+		{
+			name: "transport_failure_after_live",
+			then: func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+				hijackClose(t, w)
+			},
+			backoff: 300 * time.Millisecond,
+		},
+		{name: "retry_backoff_past_bound", then: ordinary503, backoff: 30 * time.Second, wantPosts: 2},
+		{
+			name: "final_attempt_hang_typed",
+			then: func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request) {
+				if n == 2 {
+					w.WriteHeader(http.StatusServiceUnavailable)
+					return
+				}
+				l.hold(r)
+			},
+			retries:   1,
+			wantPosts: 3,
+		},
+		{name: "already_expired_before_next_iteration", then: hang, wantPosts: 2},
+		{
+			name: "repeated_live_no_extension",
+			then: func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+				writeInFlight(w, fmt.Sprint(n*100), "1")
+			},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			c, l := newLiveScriptClient(t, func(l *liveScriptServer, n int, w http.ResponseWriter, r *http.Request) {
+				if n == 1 && tc.first != nil {
+					tc.first(w)
+					return
+				}
+				inFlightOnce(l, n, w, r, tc.then)
+			})
+			if tc.backoff != 0 {
+				c.Backoff = tc.backoff
+			}
+			if tc.retries != 0 {
+				c.MaxRetries = tc.retries
+			}
+			_, err := shipBounded(t, c, context.Background(), livePassArgs(t), within)
+			if !errors.Is(err, ErrLivePassBudgetExhausted) {
+				t.Fatalf("err = %v, want ErrLivePassBudgetExhausted", err)
+			}
+			if tc.wantPosts != 0 && l.count() != tc.wantPosts {
+				t.Errorf("POSTs = %d, want %d", l.count(), tc.wantPosts)
+			}
+		})
+	}
+
+	t.Run("earlier_caller_deadline", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithTimeout(context.Background(), 300*time.Millisecond)
+		defer cancel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, "120", "60")
+		})
+		_, err := shipBounded(t, c, ctx, livePassArgs(t), within)
+		if !errors.Is(err, context.DeadlineExceeded) || errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want the caller's own deadline", err)
+		}
+	})
+	t.Run("caller_cancel_during_wait", func(t *testing.T) {
+		t.Parallel()
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		c, _ := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, "120", "60")
+			time.AfterFunc(100*time.Millisecond, cancel)
+		})
+		_, err := shipBounded(t, c, ctx, livePassArgs(t), within)
+		if !errors.Is(err, context.Canceled) || errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want the caller's own cancellation", err)
+		}
+	})
+	// A long pass whose answer arrives inside the bound decides, on a wider bound so
+	// the green path cannot race the fixture's one-second poll.
+	longPass := func(t *testing.T, status int, body string) (*ShipPullRequestResult, *liveScriptServer, error) {
+		t.Helper()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			if n == 1 {
+				writeInFlight(w, "30", "1")
+				return
+			}
+			w.WriteHeader(status)
+			_, _ = io.WriteString(w, body)
+		})
+		out, err := shipBounded(t, c, context.Background(), livePassArgs(t), 10*time.Second)
+		return out, l, err
+	}
+	t.Run("long_pass_approve", func(t *testing.T) {
+		t.Parallel()
+		out, _, err := longPass(t, http.StatusCreated, `{"id":"a"}`)
+		if err != nil || out.ID != "a" {
+			t.Fatalf("result = %+v, %v", out, err)
+		}
+	})
+	t.Run("long_pass_reject", func(t *testing.T) {
+		t.Parallel()
+		out, _, err := longPass(t, http.StatusOK, `{"id":"a","idempotent":true}`)
+		if err != nil || !out.Idempotent {
+			t.Fatalf("result = %+v, %v", out, err)
+		}
+	})
+	t.Run("long_pass_lost", func(t *testing.T) {
+		t.Parallel()
+		_, l, err := longPass(t, http.StatusConflict, `{"error":{"code":"review_round_interrupted"}}`)
+		if err == nil || !strings.Contains(err.Error(), "409") || errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want the 409", err)
+		}
+		if l.count() != 2 {
+			t.Errorf("POSTs = %d, want 2", l.count())
+		}
+	})
+	t.Run("ordinary_retries_no_reset", func(t *testing.T) {
+		t.Parallel()
+		// Only a live answer refills the budget, so ordinary 503s under a wide bound
+		// exhaust it with the ordinary error: the bound has not passed.
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			if n == 1 {
+				writeInFlight(w, "30", "1")
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+		})
+		c.MaxRetries = 2
+		_, err := shipBounded(t, c, context.Background(), livePassArgs(t), 10*time.Second)
+		if err == nil || errors.Is(err, ErrLivePassBudgetExhausted) || !strings.Contains(err.Error(), "exhausted retries") {
+			t.Fatalf("err = %v, want the ordinary exhausted-retries error", err)
+		}
+		if got, want := l.count(), 1+c.MaxRetries+1; got != want {
+			t.Errorf("POSTs = %d, want %d: an ordinary 503 must not reset the budget", got, want)
+		}
+	})
+	t.Run("failed_report_after_exhaustion_posts", func(t *testing.T) {
+		t.Parallel()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, r *http.Request) {
+			writeInFlight(w, "1", "1")
+		})
+		args := livePassArgs(t)
+		if _, err := shipBounded(t, c, context.Background(), args, within); !errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want ErrLivePassBudgetExhausted", err)
+		}
+		before := l.count()
+		report := args
+		report.Body, report.Outcome, report.Category, report.Reason = nil, "failed", "C", "budget exhausted"
+		_, err := shipBounded(t, c, context.Background(), report, within)
+		if err == nil {
+			t.Fatal("the scripted server keeps answering 503; want an error")
+		}
+		if got := l.count() - before; got != c.MaxRetries+1 {
+			t.Errorf("later report POSTs = %d, want %d: exhaustion must leave the Client usable", got, c.MaxRetries+1)
+		}
+	})
+	t.Run("failed_report_never_arms", func(t *testing.T) {
+		t.Parallel()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, _ int, w http.ResponseWriter, _ *http.Request) {
+			writeInFlight(w, "1", "60")
+		})
+		args := livePassArgs(t)
+		args.Body, args.Outcome, args.Category, args.Reason = nil, "failed", "C", "boom"
+		_, err := shipBounded(t, c, context.Background(), args, liveBoundTolerance)
+		if err == nil || errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Fatalf("err = %v, want the ordinary exhausted-retries error", err)
+		}
+		if got, want := l.count(), c.MaxRetries+1; got != want {
+			t.Errorf("POSTs = %d, want %d", got, want)
+		}
+	})
+}
+
+// TestLivePassContinuation_Next is unit-boundary evidence with an injected clock:
+// over HTTP opCtx ends first and masks the response-after-deadline line.
+func TestLivePassContinuation_Next(t *testing.T) {
+	envelope := `{"error":{"code":"review_round_in_flight","message":"m"}}`
+	answer := func(remaining string) *http.Response {
+		h := http.Header{}
+		h.Set(ReviewPassRemainingHeader, remaining)
+		h.Set("Retry-After", "5")
+		return &http.Response{StatusCode: http.StatusServiceUnavailable, Header: h}
+	}
+	now := time.Unix(1_000, 0)
+	t.Run("first_latches", func(t *testing.T) {
+		l := livePassContinuation{allowance: time.Second}
+		wait, isLive, latched, err := l.next(answer("10"), envelope, "", now)
+		if err != nil || !isLive || !latched || wait != 5*time.Second {
+			t.Fatalf("next = %s, %t, %t, %v", wait, isLive, latched, err)
+		}
+		if want := now.Add(11 * time.Second); !l.deadline.Equal(want) {
+			t.Errorf("deadline = %s, want %s", l.deadline, want)
+		}
+	})
+	t.Run("later_keeps_deadline", func(t *testing.T) {
+		l := livePassContinuation{allowance: time.Second}
+		_, _, _, _ = l.next(answer("10"), envelope, "", now)
+		first := l.deadline
+		_, isLive, latched, err := l.next(answer("1000"), envelope, "", now.Add(time.Second))
+		if err != nil || !isLive || latched {
+			t.Fatalf("isLive=%t latched=%t err=%v", isLive, latched, err)
+		}
+		if !l.deadline.Equal(first) {
+			t.Errorf("deadline moved to %s from %s", l.deadline, first)
+		}
+	})
+	t.Run("response_after_deadline", func(t *testing.T) {
+		l := livePassContinuation{allowance: time.Second}
+		_, _, _, _ = l.next(answer("10"), envelope, "", now)
+		_, isLive, _, err := l.next(answer("10"), envelope, "", now.Add(time.Hour))
+		if !errors.Is(err, ErrLivePassBudgetExhausted) || isLive {
+			t.Fatalf("isLive=%t err=%v, want ErrLivePassBudgetExhausted", isLive, err)
+		}
+	})
+	t.Run("outcome_not_live", func(t *testing.T) {
+		l := livePassContinuation{allowance: time.Second}
+		_, isLive, latched, err := l.next(answer("10"), envelope, "failed", now)
+		if err != nil || isLive || latched || !l.deadline.IsZero() {
+			t.Fatalf("isLive=%t latched=%t err=%v deadline=%s", isLive, latched, err, l.deadline)
+		}
+	})
+}
+
+func TestParseLivePassSeconds_Range(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"1":     time.Second,
+		"90":    90 * time.Second,
+		"86400": 24 * time.Hour,
+	} {
+		if got, ok := parseLivePassSeconds(raw, maxLivePassRemaining); !ok || got != want {
+			t.Errorf("parse(%q) = %s, %t; want %s", raw, got, ok, want)
+		}
+	}
+	for _, raw := range []string{"", "0", "-1", "+5", "86401", "soon", "1.5", "99999999999999999999"} {
+		if got, ok := parseLivePassSeconds(raw, maxLivePassRemaining); ok {
+			t.Errorf("parse(%q) = %s, want not ok", raw, got)
+		}
+	}
+}
+
+func TestLivePassWait_Clamp(t *testing.T) {
+	for raw, want := range map[string]time.Duration{
+		"":     defaultLivePassWait,
+		"soon": defaultLivePassWait,
+		"-3":   defaultLivePassWait,
+		"0":    minLivePassWait,
+		"1":    time.Second,
+		"30":   30 * time.Second,
+		"60":   maxLivePassWait,
+		"3600": maxLivePassWait,
+	} {
+		if got := livePassWait(raw); got != want {
+			t.Errorf("livePassWait(%q) = %s, want %s", raw, got, want)
 		}
 	}
 }
