@@ -445,10 +445,11 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	// explicit stage_id when supplied (back-compat) and erroring when
 	// it disagrees. This replaces the hand-copied-UUID error class
 	// (#602) and folds in #583's belongs-to-run validation.
-	resolvedStageID, err := r.resolveStageID(ctx, runUUID, in.Stage, in.StageID)
+	resolvedStage, err := r.resolveStage(ctx, runUUID, in.Stage, in.StageID)
 	if err != nil {
 		return nil, RunStageOutput{}, err
 	}
+	resolvedStageID := resolvedStage.ID
 	stageUUID, err := uuid.Parse(resolvedStageID)
 	if err != nil {
 		return nil, RunStageOutput{}, fmt.Errorf("resolved stage_id %q is not a valid UUID: %w", resolvedStageID, err)
@@ -652,12 +653,18 @@ func (r *runResolver) runStage(ctx context.Context, req *mcp.CallToolRequest, in
 	}
 
 	// (4) Build the runner argv via the shared composer so this path and
-	// the detached fishhawk_dispatch_stage verb (#1232) cannot drift.
+	// the detached fishhawk_dispatch_stage verb (#1232) cannot drift. An
+	// unsupported executor agent refuses here (#5095), after the acceptance
+	// short-circuit and needs-target paths and before the host-dispatch marker,
+	// so the refusal commits no state and spawns nothing.
 	baseBranch, err := forgeTarget.resolveSpawnBaseBranch(runUUID, in.BaseBranch)
 	if err != nil {
 		return nil, RunStageOutput{}, err
 	}
-	argv := r.composeRunnerArgv(in, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
+	argv, err := r.composeStageRunnerArgv(in, resolvedStage, repo, baseBranch, pushAndOpenPR, forgeTarget)
+	if err != nil {
+		return nil, RunStageOutput{}, err
+	}
 
 	env := append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
@@ -1355,6 +1362,75 @@ func (r *runResolver) composeRunnerArgv(in RunStageInput, resolvedStageID, repo,
 	return argv
 }
 
+// The closed set of coding-agent providers a local host spawn may name. The
+// values mirror fishhawk-runner's selectInvoker (runner/cmd/fishhawk-runner/
+// agentselect.go) and `fishhawk runner start`'s hand mirror (cli/cmd/fishhawk/
+// runner.go): the backend, runner and CLI modules share no dependency, so adding
+// a provider means updating all three, and a missed mirror refuses loudly here
+// rather than picking the wrong provider.
+const (
+	runnerAgentClaudeCode = "claude-code"
+	runnerAgentCodex      = "codex"
+	// runnerAgentClaudeCodeAlias is the id adapterForImplementAgent already
+	// treats as the Claude adapter, so it spawns as claude-code and the
+	// allow-list key and the spawned adapter agree.
+	runnerAgentClaudeCodeAlias = "claudecode"
+	// stageExecutorKindAgent is the StageExecutor.Kind of an agent-run stage.
+	stageExecutorKindAgent = "agent"
+)
+
+// stageRunnerAgent derives a stage's `--agent` value from its row's executor,
+// which CreateStagesFromSpec snapshots from the reuse-resolved cached workflow
+// (#5095). A non-agent kind or an empty ref returns "": no flag, so the runner
+// keeps its default. An empty ref on an agent stage is the legacy default-spawn
+// residual, a row that never declared a provider. claude-code and codex return
+// themselves and the claudecode alias returns claude-code. Anything else is an
+// unsupported_executor_agent refusal, because the runner would otherwise fail the
+// stage only after a marker and a spawn had already been committed.
+//
+// The refusal's remedy deliberately does not ask anyone to edit the run's stored
+// workflow, which is immutable: correct the source for future runs, or use the
+// direct runner override this verb leaves untouched.
+func stageRunnerAgent(runID, stageID string, ex StageExecutor) (string, error) {
+	if ex.Kind != stageExecutorKindAgent {
+		return "", nil
+	}
+	switch ref := strings.TrimSpace(ex.Ref); ref {
+	case "":
+		return "", nil
+	case runnerAgentClaudeCode, runnerAgentCodex:
+		return ref, nil
+	case runnerAgentClaudeCodeAlias:
+		return runnerAgentClaudeCode, nil
+	default:
+		return "", fmt.Errorf(
+			"unsupported_executor_agent: run %s stage %s declares executor agent %q; supported providers are %s and %s; NOT spawning. Correct executor.agent in the workflow source and start a new run (a run keeps the workflow it was admitted with), or invoke fishhawk-runner directly with --agent to run this stage under a supported provider",
+			runID, stageID, ref, runnerAgentClaudeCode, runnerAgentCodex)
+	}
+}
+
+// runnerAgentArgv renders a resolved agent as runner flags: `--agent <agent>`,
+// or nothing for the empty value (the runner default). Shaped like
+// runForgeTarget.argv so composeStageRunnerArgv and the inline child argv in
+// run_children.go render it identically.
+func runnerAgentArgv(agent string) []string {
+	if agent == "" {
+		return nil
+	}
+	return []string{"--agent", agent}
+}
+
+// composeStageRunnerArgv is composeRunnerArgv plus the stage's executor agent:
+// it refuses an unsupported agent or appends `--agent`, so one call cannot return
+// argv without the check. composeRunnerArgv itself stays unchanged.
+func (r *runResolver) composeStageRunnerArgv(in RunStageInput, stage Stage, repo, baseBranch string, pushAndOpenPR bool, target runForgeTarget) ([]string, error) {
+	agent, err := stageRunnerAgent(in.RunID, stage.ID, stage.Executor)
+	if err != nil {
+		return nil, err
+	}
+	return append(r.composeRunnerArgv(in, stage.ID, repo, baseBranch, pushAndOpenPR, target), runnerAgentArgv(agent)...), nil
+}
+
 // spawnRunnerStageDetached spawns fishhawk-runner DETACHED for the non-blocking
 // fishhawk_dispatch_stage verb (#1232): it starts the subprocess and returns
 // immediately rather than blocking to terminal like spawnRunnerStage. The
@@ -1770,9 +1846,9 @@ func spawnRunnerStage(ctx context.Context, binary string, argv []string, env []s
 	}
 }
 
-// resolveStageID resolves the stage UUID to spawn the runner against
-// from (run_id, stage type). It lists the run's stages (ListRunStages)
-// and matches on Stage.Type:
+// resolveStage resolves the stage to spawn the runner against from (run_id,
+// stage type). It lists the run's stages (ListRunStages) and matches on
+// Stage.Type:
 //
 //   - explicitStageID != "": back-compat path. The explicit id must be
 //     one of the run's stages of stageType; otherwise it errors. This
@@ -1783,21 +1859,10 @@ func spawnRunnerStage(ctx context.Context, binary string, argv []string, env []s
 //     types; more than one errors (ambiguous) naming the duplicate ids
 //     rather than silently picking one.
 //
-// Uses a bounded context mirroring the post-run stage fetch.
-func (r *runResolver) resolveStageID(ctx context.Context, runUUID uuid.UUID, stageType, explicitStageID string) (string, error) {
-	stage, err := r.resolveStage(ctx, runUUID, stageType, explicitStageID)
-	if err != nil {
-		return "", err
-	}
-	return stage.ID, nil
-}
-
-// resolveStage is resolveStageID's underlying matcher: it returns the FULL
-// matched Stage (id + state + type) so callers that need the stage's state —
-// e.g. fishhawk_run_children's pending-vs-in-flight partition (#1237) — can
-// read it without a second round-trip. resolveStageID delegates here and
-// projects out the ID, so every error path (zero / ambiguous / explicit
-// disagree) is byte-identical between the two.
+// It returns the FULL matched Stage so callers that need more than the id can
+// read it without a second round-trip: the spawn verbs read its executor
+// (#5095) and fishhawk_run_children's pending-vs-in-flight partition reads its
+// state (#1237). Uses a bounded context mirroring the post-run stage fetch.
 func (r *runResolver) resolveStage(ctx context.Context, runUUID uuid.UUID, stageType, explicitStageID string) (Stage, error) {
 	fetchCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()

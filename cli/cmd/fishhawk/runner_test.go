@@ -112,19 +112,40 @@ const (
 )
 
 // runRowBackend is an httptest backend serving ONE run row on the
-// single-run route only. getCalls counts GET /v0/runs/{id} hits; the
-// list route deliberately 404s so a producer that read the list
-// instead of the single-run GET (which omits forge_base_url on the
-// real backend) cannot resolve a gitlab target from it.
+// single-run route, plus that run's stage list. getCalls counts GET
+// /v0/runs/{id} hits; the list route deliberately 404s so a producer
+// that read the list instead of the single-run GET (which omits
+// forge_base_url on the real backend) cannot resolve a gitlab target
+// from it. stageCalls counts GET /v0/runs/{id}/stages hits. The default
+// stage list is fixtureStageID with an empty executor ref, so a case
+// that is not about the provider keeps its flagless argv.
 type runRowBackend struct {
-	srv      *httptest.Server
-	getCalls atomic.Int64
-	status   int
+	srv          *httptest.Server
+	getCalls     atomic.Int64
+	stageCalls   atomic.Int64
+	status       int
+	stagesStatus int
+	stages       []httpclient.Stage
+}
+
+// fixtureStage returns a stage row with the given id and executor.
+func fixtureStage(id, kind, ref string) httpclient.Stage {
+	return httpclient.Stage{
+		ID:       uuid.MustParse(id),
+		RunID:    uuid.MustParse(fixtureRunID),
+		Type:     "plan",
+		Executor: httpclient.StageExecutor{Kind: kind, Ref: ref},
+		State:    "pending",
+	}
 }
 
 func newRunRowBackend(t *testing.T, row httpclient.Run) *runRowBackend {
 	t.Helper()
-	fb := &runRowBackend{status: http.StatusOK}
+	fb := &runRowBackend{
+		status:       http.StatusOK,
+		stagesStatus: http.StatusOK,
+		stages:       []httpclient.Stage{fixtureStage(fixtureStageID, "agent", "")},
+	}
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /v0/runs/{run_id}", func(w http.ResponseWriter, _ *http.Request) {
 		fb.getCalls.Add(1)
@@ -135,6 +156,16 @@ func newRunRowBackend(t *testing.T, row httpclient.Run) *runRowBackend {
 			return
 		}
 		_ = json.NewEncoder(w).Encode(row)
+	})
+	mux.HandleFunc("GET /v0/runs/{run_id}/stages", func(w http.ResponseWriter, _ *http.Request) {
+		fb.stageCalls.Add(1)
+		w.Header().Set("Content-Type", "application/json")
+		if fb.stagesStatus != http.StatusOK {
+			w.WriteHeader(fb.stagesStatus)
+			_, _ = w.Write([]byte(`{"error":{"code":"internal_error","message":"boom"}}`))
+			return
+		}
+		_ = json.NewEncoder(w).Encode(httpclient.ListStagesResult{Items: fb.stages})
 	})
 	fb.srv = httptest.NewServer(mux)
 	t.Cleanup(fb.srv.Close)
@@ -568,8 +599,14 @@ func TestRunnerStart_StageCompleteComment(t *testing.T) {
 		CreatedAt: time.Now().UTC(),
 		UpdatedAt: time.Now().UTC(),
 	}
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
+		if strings.HasSuffix(r.URL.Path, "/stages") {
+			_ = json.NewEncoder(w).Encode(httpclient.ListStagesResult{Items: []httpclient.Stage{
+				{ID: stageID, RunID: runID, Type: "plan", Executor: httpclient.StageExecutor{Kind: "agent", Ref: "claude-code"}},
+			}})
+			return
+		}
 		_ = json.NewEncoder(w).Encode(runRow)
 	}))
 	t.Cleanup(srv.Close)
@@ -999,8 +1036,10 @@ func TestRunnerStart_UnknownForgeFromRunRow_RefusesBeforeSpawn(t *testing.T) {
 }
 
 // TestRunnerStart_AllFlagsExplicit_NoRunRead: --forge github +
-// --github-repo explicit → zero network calls before the spawn, as
-// before #3463 (the seam points at a backend that counts).
+// --github-repo explicit → no run-row read before the spawn, as before
+// #3463 (the seam points at a backend that counts). The stage read
+// still happens, because the stage's provider has no flag on this verb
+// (#5095).
 func TestRunnerStart_AllFlagsExplicit_NoRunRead(t *testing.T) {
 	cap := withFakeRunnerSpawn(t)
 	withFakeGitRemoteNeverCalled(t)
@@ -1029,6 +1068,9 @@ func TestRunnerStart_AllFlagsExplicit_NoRunRead(t *testing.T) {
 	}
 	if getsAtSpawn != 0 {
 		t.Errorf("GET /v0/runs/{id} called %d times before the spawn, want 0 with every forge input explicit", getsAtSpawn)
+	}
+	if n := fb.stageCalls.Load(); n != 1 {
+		t.Errorf("GET /v0/runs/{id}/stages called %d times, want exactly 1", n)
 	}
 	if !contains(cap.args, "x/y") {
 		t.Errorf("argv missing explicit x/y: %v", cap.args)
@@ -1087,4 +1129,210 @@ func TestRunnerStart_GitLabRun_SkipsGitHubStatusComment(t *testing.T) {
 	if len(*calls) != 0 {
 		t.Errorf("postOrEditStatusComment called %d times on a gitlab run, want 0: %+v", len(*calls), *calls)
 	}
+}
+
+// --- Stage provider (#5095) ---------------------------------------------------
+//
+// Every case passes --forge and --github-repo explicitly so the stage read is
+// the only thing that can refuse or supply --agent. The state assertions are
+// what spawned and what was read, not only the stderr text.
+
+// explicitForgeRunnerArgs is a `runner start` argv with every forge input
+// explicit, so no run-row read happens and nothing else can block the spawn.
+func explicitForgeRunnerArgs(runID, stageID string) []string {
+	return []string{
+		"runner", "start",
+		"--run-id", runID, "--stage-id", stageID,
+		"--workflow", "w", "--stage", "plan",
+		"--forge", "github", "--github-repo", "x/y",
+	}
+}
+
+// TestRunnerStart_RoutesStageExecutorAgent pins the mapping end to end from the
+// stage row to the runner argv. A sibling stage declaring an unsupported value
+// proves the verb reads --stage-id's row, not the first one.
+func TestRunnerStart_RoutesStageExecutorAgent(t *testing.T) {
+	const (
+		siblingStageID = "33333333-4444-5555-6666-777777777777"
+		// The backend serves a UUID in lowercase; this one has hex letters, so an
+		// uppercase --stage-id really differs from the row's id.
+		lettersStageID = "abcdef00-3333-4444-5555-666666666666"
+	)
+	for _, tc := range []struct {
+		name      string
+		kind, ref string
+		rowID     string
+		stageArg  string
+		wantAgent string
+	}{
+		{name: "codex", kind: "agent", ref: "codex", wantAgent: "codex"},
+		{name: "claude-code", kind: "agent", ref: "claude-code", wantAgent: "claude-code"},
+		{name: "claudecode alias", kind: "agent", ref: "claudecode", wantAgent: "claude-code"},
+		{name: "surrounding whitespace", kind: "agent", ref: "  codex ", wantAgent: "codex"},
+		{name: "uppercase stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: strings.ToUpper(lettersStageID), wantAgent: "codex"},
+		{name: "compact stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: strings.ReplaceAll(lettersStageID, "-", ""), wantAgent: "codex"},
+		{name: "braced stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: "{" + lettersStageID + "}", wantAgent: "codex"},
+		{name: "urn stage id", kind: "agent", ref: "codex", rowID: lettersStageID, stageArg: "urn:uuid:" + lettersStageID, wantAgent: "codex"},
+		{name: "empty ref keeps the runner default", kind: "agent", ref: ""},
+		{name: "human kind has no provider", kind: "human", ref: "human"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cap := withFakeRunnerSpawn(t)
+			withFakeGitRemoteNeverCalled(t)
+			fb := newRunRowBackend(t, gitlabRunRow())
+			rowID, stageArg := fixtureStageID, fixtureStageID
+			if tc.rowID != "" {
+				rowID, stageArg = tc.rowID, tc.stageArg
+			}
+			fb.stages = []httpclient.Stage{
+				fixtureStage(siblingStageID, "agent", "not-a-provider"),
+				fixtureStage(rowID, tc.kind, tc.ref),
+			}
+			withFakeHTTPClient(t, fb.srv)
+
+			var stdout, stderr strings.Builder
+			got := run(explicitForgeRunnerArgs(fixtureRunID, stageArg), &stdout, &stderr)
+			if got != exitOK {
+				t.Fatalf("run = %d, want exitOK:\n%s", got, stderr.String())
+			}
+			if n := fb.stageCalls.Load(); n != 1 {
+				t.Errorf("GET /v0/runs/{id}/stages called %d times, want exactly 1", n)
+			}
+			if s := indexOf(cap.args, "--stage-id"); s < 0 || s+1 >= len(cap.args) || cap.args[s+1] != stageArg {
+				t.Errorf("argv must forward --stage-id %s as passed: %v", stageArg, cap.args)
+			}
+			i := indexOf(cap.args, "--agent")
+			if tc.wantAgent == "" {
+				if i >= 0 {
+					t.Errorf("argv must omit --agent so the runner keeps its default: %v", cap.args)
+				}
+				return
+			}
+			if i < 0 || i+1 >= len(cap.args) || cap.args[i+1] != tc.wantAgent {
+				t.Errorf("argv missing --agent %s: %v", tc.wantAgent, cap.args)
+			}
+		})
+	}
+}
+
+// assertRefusedBeforeSpawn asserts exitFailure, no spawn, and that stderr carries
+// every fragment.
+func assertRefusedBeforeSpawn(t *testing.T, got int, cap *spawnCapture, stderr string, wants ...string) {
+	t.Helper()
+	if got != exitFailure {
+		t.Errorf("run = %d, want exitFailure:\n%s", got, stderr)
+	}
+	if cap.binary != "" || cap.args != nil {
+		t.Errorf("runner must NOT be spawned; spawned %q %v", cap.binary, cap.args)
+	}
+	for _, want := range wants {
+		if !strings.Contains(stderr, want) {
+			t.Errorf("stderr should contain %q: %s", want, stderr)
+		}
+	}
+}
+
+// TestRunnerStart_UnsupportedExecutorAgent_RefusesBeforeSpawn: a value outside
+// the closed set refuses, naming it and a remedy that does not ask anyone to
+// edit the run's stored workflow.
+func TestRunnerStart_UnsupportedExecutorAgent_RefusesBeforeSpawn(t *testing.T) {
+	cap := withFakeRunnerSpawn(t)
+	withFakeGitRemoteNeverCalled(t)
+	fb := newRunRowBackend(t, gitlabRunRow())
+	fb.stages = []httpclient.Stage{fixtureStage(fixtureStageID, "agent", "not-a-provider")}
+	withFakeHTTPClient(t, fb.srv)
+
+	var stdout, stderr strings.Builder
+	got := run(explicitForgeRunnerArgs(fixtureRunID, fixtureStageID), &stdout, &stderr)
+	assertRefusedBeforeSpawn(t, got, cap, stderr.String(),
+		"unsupported_executor_agent", fixtureRunID, fixtureStageID, `"not-a-provider"`,
+		"claude-code", "codex", "workflow source", "start a new run", "fishhawk-runner directly with --agent")
+}
+
+// TestRunnerStart_StageReadFails_RefusesSpawn: an unreadable stage list never
+// degrades to a flagless spawn under the runner default.
+func TestRunnerStart_StageReadFails_RefusesSpawn(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		wire func(t *testing.T)
+	}{
+		{"http 500", func(t *testing.T) {
+			fb := newRunRowBackend(t, gitlabRunRow())
+			fb.stagesStatus = http.StatusInternalServerError
+			withFakeHTTPClient(t, fb.srv)
+		}},
+		{"connection refused", func(t *testing.T) {
+			dead := httptest.NewServer(http.NotFoundHandler())
+			dead.Close()
+			withFakeHTTPClient(t, dead)
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cap := withFakeRunnerSpawn(t)
+			withFakeGitRemoteNeverCalled(t)
+			tc.wire(t)
+
+			var stdout, stderr strings.Builder
+			got := run(explicitForgeRunnerArgs(fixtureRunID, fixtureStageID), &stdout, &stderr)
+			assertRefusedBeforeSpawn(t, got, cap, stderr.String(),
+				"could not read the stages of run "+fixtureRunID, fixtureStageID,
+				"--backend-url", "FISHHAWK_BACKEND_URL", "fishhawk-runner directly with --agent", "not spawning")
+		})
+	}
+}
+
+// TestRunnerStart_StageNotInRun_RefusesSpawn: a --stage-id the run's list does
+// not carry has no provider to read, including one that is not a UUID at all.
+// The nil-UUID row isolates the parse guard: without it the zero value of a
+// failed parse would match that row and spawn.
+func TestRunnerStart_StageNotInRun_RefusesSpawn(t *testing.T) {
+	for _, tc := range []struct {
+		name, stageArg string
+		stages         []httpclient.Stage
+	}{
+		{name: "another uuid", stageArg: "99999999-3333-4444-5555-666666666666"},
+		{name: "not a uuid", stageArg: "not-a-stage-uuid"},
+		{
+			name:     "not a uuid beside a nil-uuid row",
+			stageArg: "not-a-stage-uuid",
+			stages:   []httpclient.Stage{fixtureStage(uuid.Nil.String(), "agent", "codex")},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cap := withFakeRunnerSpawn(t)
+			withFakeGitRemoteNeverCalled(t)
+			fb := newRunRowBackend(t, gitlabRunRow())
+			if tc.stages != nil {
+				fb.stages = tc.stages
+			}
+			withFakeHTTPClient(t, fb.srv)
+
+			var stdout, stderr strings.Builder
+			got := run(explicitForgeRunnerArgs(fixtureRunID, tc.stageArg), &stdout, &stderr)
+			assertRefusedBeforeSpawn(t, got, cap, stderr.String(),
+				tc.stageArg, "is not in run "+fixtureRunID, "--stage-id", "fishhawk-runner directly with --agent")
+			if n := fb.stageCalls.Load(); n != 1 {
+				t.Errorf("GET /v0/runs/{id}/stages called %d times, want exactly 1", n)
+			}
+		})
+	}
+}
+
+// TestRunnerStart_NonUUIDRunID_RefusesSpawn: a non-UUID --run-id refuses before
+// any stage read. The backend here serves the stage for every run id, so with
+// the guard removed the zero-UUID read succeeds and a spawn is captured; the
+// zero-read and no-spawn assertions are what catch that, not another refusal.
+func TestRunnerStart_NonUUIDRunID_RefusesSpawn(t *testing.T) {
+	cap := withFakeRunnerSpawn(t)
+	withFakeGitRemoteNeverCalled(t)
+	fb := newRunRowBackend(t, gitlabRunRow())
+	withFakeHTTPClient(t, fb.srv)
+
+	var stdout, stderr strings.Builder
+	got := run(explicitForgeRunnerArgs("not-a-uuid", fixtureStageID), &stdout, &stderr)
+	if n := fb.stageCalls.Load(); n != 0 {
+		t.Errorf("GET /v0/runs/{id}/stages called %d times, want 0: a non-UUID run id must refuse before the read", n)
+	}
+	assertRefusedBeforeSpawn(t, got, cap, stderr.String(),
+		`--run-id "not-a-uuid" is not a UUID`, fixtureStageID, "fishhawk-runner directly with --agent", "not spawning")
 }
