@@ -51,6 +51,14 @@ persona remits, conventions and medium severity caps remain intact. All gates,
 reviewer counts, timeouts, scope constraints, concurrency limits, retry limits,
 verification commands, delegation and budgets retain their existing values.
 
+Reviewer-configuration evaluation remains pending under ADR-118 in
+[#4667](https://github.com/kuhlman-labs/fishhawk/issues/4667) and
+[#4697](https://github.com/kuhlman-labs/fishhawk/issues/4697). The current
+`check-review-prompt-eval` reports no changed review-prompt path for this
+two-file preparation; that result supplies no measurement of Sol or the new
+reviewer configuration. The historical evidence is not evidence for these
+replacement models.
+
 ## Rollout and existing runs
 
 1. Validate the workflow with the product validator, including resolved hotfix
