@@ -8362,6 +8362,33 @@ echo $! > "$SRP_D/grandchild.pid"
 wait $!
 STUB
 }
+# The clean-TERM fixture (SRP-c): prints registered-looking text, then exits 0 from
+# its own TERM trap. The holder ignores TERM (an ignored signal stays ignored across
+# exec), so the wait ends only through the stub's own trap, whatever order the
+# descendants are signalled in. The holder pid is recorded so _srp_end can reap it.
+_srp_stub_clean_term() {
+  _srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+trap 'echo term > "$SRP_D/term.marker"; exit 0' TERM
+echo "command: fishhawk-mcp-shim"
+(trap "" TERM; exec sleep 20) &
+holder=$!
+echo "$holder" > "$SRP_D/holder.pid"
+while kill -0 "$holder" 2>/dev/null; do wait "$holder"; done
+STUB
+}
+# The ORIGINAL SRP-c stub, byte for byte. Its sleeper dies on TERM, so the stub's
+# `wait` can return and the script end before the stub's own TERM arrives. Kept only
+# as SRP-c2's negative control: it shows the row can still detect that defect.
+_srp_stub_clean_term_unrepaired() {
+  _srp_stub claude <<'STUB'
+echo $$ > "$SRP_D/stub.pid"
+trap 'echo term > "$SRP_D/term.marker"; exit 0' TERM
+echo "command: fishhawk-mcp-shim"
+sleep 20 &
+wait $!
+STUB
+}
 _srp_base_env() {
   unset FISHHAWK_MCP_SHIM_REGISTERED
   if [[ -n "${srp_override+x}" ]]; then export FISHHAWK_MCP_SHIM_REGISTERED="$srp_override"; fi
@@ -8433,6 +8460,70 @@ _srp_state() {
   print -r -- "rc=${srp_rc} out=[${srp_out}] elapsed=${srp_elapsed:-?} tmp=[$(ls -A "$srp_tmp" 2>/dev/null)] kills=[$(_srp_klog)] err=[$(_srp_err)]"
 }
 _srp_collect_kills() { if [[ -f "$srp_klog" ]]; then srp_t_lines+=("${(@f)$(<"$srp_klog")}"); fi }
+# TERM the pids in "$@" through the REAL _probe_tree_signal (saved by
+# _srp_detect_forced as _srp_real_tree_signal), by shadowing the walker's map with
+# exactly those ids.
+_srp_term_group() {
+  local -A _probe_tree_ids
+  local pid=""
+  for pid in "$@"; do _probe_tree_ids[$pid]=1; done
+  _srp_real_tree_signal TERM
+}
+# <sleep_first|stub_first>: the real _detect_shim_registered with its TERM sweep
+# forced into one order. Run it under _srp_call: the override dies with that $( ).
+# The override signals only ids the production walker tracked, through the real
+# helper, and any signal but TERM goes straight to the real helper, so the KILL walk
+# is unchanged. Tracked pids are classified by name: `sleep` or `*/sleep` is the
+# sleeper, the pid in stub.pid is the stub, all else is rest. Unless there is exactly
+# one of each, nothing is forced and nothing is recorded: the real helper sweeps, and
+# the row fails on missing evidence. Otherwise sleeper.pid records the sleeper, the
+# groups are signalled in the requested order, then rest, and sleep_first records in
+# stub_at_term whether the stub was gone before its own TERM (it can only be gone if
+# it fell through, so alive means it survived the sleeper's TERM for the whole bound).
+# Every fallible call is tested, so no row outcome rests on an errexit abort.
+_srp_detect_forced() {
+  local order="$1"
+  functions[_srp_real_tree_signal]="${functions[_probe_tree_signal]}"
+  _probe_tree_signal() {
+    local sig="$1" pid="" comm="" stub_pid=""
+    local -a sleepers stubs rest
+    if [[ "$sig" != TERM ]]; then
+      _srp_real_tree_signal "$@"
+      return
+    fi
+    stub_pid="$(_srp_pid stub)"
+    for pid in "${(@k)_probe_tree_ids}"; do
+      if ! comm="$(ps -o comm= -p "$pid" 2>/dev/null)"; then comm=""; fi
+      comm="${comm//[[:space:]]/}"
+      if [[ "$comm" == sleep || "$comm" == */sleep ]]; then
+        sleepers+=("$pid")
+      elif [[ -n "$stub_pid" && "$pid" == "$stub_pid" ]]; then
+        stubs+=("$pid")
+      else
+        rest+=("$pid")
+      fi
+    done
+    if (( ${#sleepers} != 1 || ${#stubs} != 1 )); then
+      _srp_real_tree_signal "$@"
+      return
+    fi
+    print -r -- "${sleepers[1]}" >| "${srp_dir}/sleeper.pid" || true
+    if [[ "$order" == sleep_first ]]; then
+      _srp_term_group "${sleepers[@]}"
+      if _srp_gone "${stubs[1]}"; then
+        print -r -- gone >| "${srp_dir}/stub_at_term" || true
+      else
+        print -r -- alive >| "${srp_dir}/stub_at_term" || true
+      fi
+      _srp_term_group "${stubs[@]}"
+    else
+      _srp_term_group "${stubs[@]}"
+      _srp_term_group "${sleepers[@]}"
+    fi
+    if (( ${#rest} )); then _srp_term_group "${rest[@]}"; fi
+  }
+  _detect_shim_registered
+}
 # Start _run_bounded_capture as a signalable shell, reporting into private files.
 # A `( ) &` keeps the capture shell's own pid in $!.
 _srp_bg_capture() {
@@ -8726,23 +8817,63 @@ _srp_end
 # END ROW SRP-b2
 
 # BEGIN ROW SRP-c
+# The holder ignores TERM, so only the stub's own TERM can end its wait and the
+# marker cannot depend on the order the sweep reaches the stub and its descendant.
+# Only the KILL walk can end the holder, so the stub and holder both end gone.
 _srp_new
-_srp_stub claude <<'STUB'
-echo $$ > "$SRP_D/stub.pid"
-trap 'echo term > "$SRP_D/term.marker"; exit 0' TERM
-echo "command: fishhawk-mcp-shim"
-sleep 20 &
-wait $!
-STUB
+_srp_stub_clean_term
 _srp_call _detect_shim_registered
-if [[ "$srp_out" == undetermined && -f "${srp_dir}/term.marker" ]] && _srp_tmp_empty; then
+if [[ "$srp_out" == undetermined && -f "${srp_dir}/term.marker" ]] && _srp_tmp_empty && _srp_gone "$(_srp_pid stub)" && _srp_gone "$(_srp_pid holder)"; then
   pass "SRP-c hanging claude stub printing shim text and exiting 0 on TERM: expiry wins, undetermined, never 1"
 else
-  fail "SRP-c hanging claude stub: $(_srp_state) marker=$([[ -f ${srp_dir}/term.marker ]] && print present || print absent)"
+  fail "SRP-c hanging claude stub: $(_srp_state) marker=$([[ -f ${srp_dir}/term.marker ]] && print present || print absent) stub=$(_srp_pid stub) holder=$(_srp_pid holder)"
 fi
 _srp_collect_kills
 _srp_end
 # END ROW SRP-c
+
+# BEGIN ROW SRP-c2
+# SRP-c's outcome must not depend on descendant signal order. Both orders are forced
+# through _srp_detect_forced (a test-only wrapper around the real _probe_tree_signal)
+# against the repaired fixture and the original, kept as a negative control: under
+# sleep_first the original's stub falls through before its own TERM, so its marker is
+# absent and stub_at_term is gone, and everything else writes the marker.
+for srp_c2_fx in unrepaired repaired; do
+  for srp_c2_order in sleep_first stub_first; do
+    _srp_new
+    if [[ "$srp_c2_fx" == repaired ]]; then _srp_stub_clean_term; else _srp_stub_clean_term_unrepaired; fi
+    _srp_call _srp_detect_forced "$srp_c2_order"
+    srp_c2_stub="$(_srp_pid stub)"
+    srp_c2_sleeper="$(_srp_pid sleeper)"
+    srp_c2_marker=absent
+    if [[ -f "${srp_dir}/term.marker" ]]; then srp_c2_marker=present; fi
+    srp_c2_want=present
+    if [[ "$srp_c2_fx/$srp_c2_order" == unrepaired/sleep_first ]]; then srp_c2_want=absent; fi
+    srp_c2_at=""
+    if [[ -f "${srp_dir}/stub_at_term" ]]; then srp_c2_at="$(<"${srp_dir}/stub_at_term")"; fi
+    srp_c2_at_want=""
+    if [[ "$srp_c2_order" == sleep_first ]]; then
+      srp_c2_at_want=alive
+      if [[ "$srp_c2_fx" == unrepaired ]]; then srp_c2_at_want=gone; fi
+    fi
+    srp_c2_first="$srp_c2_sleeper"
+    srp_c2_second="$srp_c2_stub"
+    if [[ "$srp_c2_order" == stub_first ]]; then
+      srp_c2_first="$srp_c2_stub"
+      srp_c2_second="$srp_c2_sleeper"
+    fi
+    srp_c2_k=("${(@f)$(_srp_klog)}")
+    if [[ "$srp_out" == undetermined && "$srp_c2_marker" == "$srp_c2_want" && "$srp_c2_at" == "$srp_c2_at_want" && -n "$srp_c2_sleeper" && -n "$srp_c2_stub" ]] \
+       && [[ "${srp_c2_k[1]:-}" == *" -TERM ${srp_c2_first}" && "${srp_c2_k[2]:-}" == *" -TERM ${srp_c2_second}" ]] \
+       && _srp_tmp_empty && _srp_gone "$srp_c2_stub" && _srp_gone "$srp_c2_sleeper"; then
+      pass "SRP-c2 ${srp_c2_fx} clean-TERM stub, ${srp_c2_order}: marker ${srp_c2_marker}, undetermined, both processes dead, no temp left"
+    else
+      fail "SRP-c2 ${srp_c2_fx} clean-TERM stub, ${srp_c2_order}: $(_srp_state) marker=${srp_c2_marker} (want ${srp_c2_want}) stub_at_term=${srp_c2_at:-none} (want ${srp_c2_at_want:-none}) stub=${srp_c2_stub} sleeper=${srp_c2_sleeper}"
+    fi
+    _srp_end
+  done
+done
+# END ROW SRP-c2
 
 # BEGIN ROW SRP-d
 _srp_new
