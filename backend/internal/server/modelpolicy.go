@@ -14,6 +14,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // ModelSource names which rung of the implement-model resolution ladder
@@ -339,7 +340,8 @@ func ParseAllowedModels(raw string) AllowedModels {
 //
 //   - default:  the deployment-configured default implement model (cfg).
 //   - spec:     executor.model on the run's workflow spec implement stage,
-//     read from the raw spec bytes (specImplementExecutorModel).
+//     read from the reuse-resolved spec with a raw-probe fallback
+//     (specImplementExecutorModel).
 //   - plan:     model_recommendation.implement_model on the run's approved
 //     standard_v1 plan artifact, read from the raw artifact bytes
 //     (planImplementModelRecommendation).
@@ -363,8 +365,8 @@ func (s *Server) resolveImplementModelForRun(ctx context.Context, runRow *run.Ru
 
 // resolvePlanModelForRun resolves the plan-model ladder for a run through the
 // pure resolvePlanModel chokepoint. It reads executor.model on the run's
-// workflow plan stage (specPlanExecutorModel) from the raw spec bytes, keeping
-// this slice free of a static dependency on the spec.Executor.Model field. The
+// workflow plan stage (specPlanExecutorModel) from the reuse-resolved spec, with
+// a raw-probe fallback for a document that does not parse. The
 // deployment-default rung is left empty here: a PlanModelDefault config field is
 // owned by the allow-list/config slice, not this one, so the plan default is ""
 // and the ladder is effectively spec-only until that slice folds in a default
@@ -568,16 +570,38 @@ func adapterForImplementAgent(agent string) string {
 	}
 }
 
+// specStageExecutor returns the reuse-resolved executor of the run's stage of
+// the given type: spec.ParseBytes applies file/workflow `defaults` and `extends`,
+// so a value a stage only INHERITS is visible here, where a raw YAML read sees
+// an empty executor (#5095). It uses resolveSpecStageForRun's lookup (stage id
+// first, then the first stage of that type).
+//
+// ok == false means the document could not be resolved (it fails ParseBytes, or
+// the parsed spec has no such workflow): each spec rung then falls back to its
+// raw YAML probe, so stored specs and minimal fixtures that do not parse read
+// exactly as they did before this helper existed. Each read parses the full spec;
+// that cost is accepted for this bounded repair (no cross-request cache).
+func specStageExecutor(specBytes []byte, workflowID string, stageType run.StageType) (spec.Executor, bool) {
+	_, stage, _, err := resolveSpecStageForRun(&run.Run{WorkflowSpec: specBytes, WorkflowID: workflowID}, stageType)
+	if err != nil {
+		return spec.Executor{}, false
+	}
+	return stage.Executor, true
+}
+
 // specImplementExecutorAgent reads executor.agent on the implement stage of the
-// given workflow from raw workflow-spec bytes via a local YAML probe, returning
-// "" when the spec is empty, malformed, or declares no executor.agent. Mirrors
+// given workflow from the reuse-resolved spec (specStageExecutor), falling back
+// to a local raw YAML probe when the document does not parse. It returns "" when
+// the spec is empty, malformed, or declares no executor.agent. The probe mirrors
 // specImplementExecutorModel's stage-lookup (prefer id=="implement", else the
-// first stage whose type=="implement") and stays free of a static dependency on
-// the spec.Executor.Agent field. The gate maps the returned id to the
+// first stage whose type=="implement"). The gate maps the returned id to the
 // allow-list adapter key via adapterForImplementAgent.
 func specImplementExecutorAgent(specBytes []byte, workflowID string) string {
 	if len(specBytes) == 0 {
 		return ""
+	}
+	if ex, ok := specStageExecutor(specBytes, workflowID, run.StageTypeImplement); ok {
+		return strings.TrimSpace(ex.Agent)
 	}
 	var probe struct {
 		Workflows map[string]struct {
@@ -785,15 +809,18 @@ func planModelRecommendationFromBytes(content []byte) string {
 }
 
 // specImplementExecutorModel reads executor.model on the implement stage of the
-// given workflow from raw workflow-spec bytes via a local YAML probe, returning
-// "" when the spec is empty, malformed, or declares no executor.model. Decoding
-// from bytes (rather than the parsed spec.Stage) keeps this slice free of a
-// static dependency on the spec.Executor.Model field (owned by a sibling schema
-// slice). The probe mirrors resolveVerifyConfig's stage lookup: prefer a stage
-// whose id == "implement", else the first stage whose type == "implement".
+// given workflow from the reuse-resolved spec (specStageExecutor), so a model
+// inherited through `defaults` or `extends` is honored, falling back to a local
+// raw YAML probe when the document does not parse. It returns "" when the spec is
+// empty, malformed, or declares no executor.model. The probe mirrors
+// resolveVerifyConfig's stage lookup: prefer a stage whose id == "implement",
+// else the first stage whose type == "implement".
 func specImplementExecutorModel(specBytes []byte, workflowID string) string {
 	if len(specBytes) == 0 {
 		return ""
+	}
+	if ex, ok := specStageExecutor(specBytes, workflowID, run.StageTypeImplement); ok {
+		return strings.TrimSpace(ex.Model)
 	}
 	var probe struct {
 		Workflows map[string]struct {
@@ -827,16 +854,19 @@ func specImplementExecutorModel(specBytes []byte, workflowID string) string {
 }
 
 // specPlanExecutorModel reads executor.model on the plan stage of the given
-// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
-// when the spec is empty, malformed, or declares no executor.model. It mirrors
+// workflow from the reuse-resolved spec (specStageExecutor), falling back to a
+// local raw YAML probe when the document does not parse. It returns "" when the
+// spec is empty, malformed, or declares no executor.model. It mirrors
 // specImplementExecutorModel exactly but targets the PLAN stage (prefer a stage
-// whose id == "plan", else the first stage whose type == "plan"), staying free
-// of a static dependency on the spec.Executor.Model field (owned by a sibling
-// schema slice). This is the spec rung of the plan-model ladder — the pinned
-// plan executor.model Scenario B honors.
+// whose id == "plan", else the first stage whose type == "plan"). This is the
+// spec rung of the plan-model ladder — the pinned plan executor.model Scenario B
+// honors.
 func specPlanExecutorModel(specBytes []byte, workflowID string) string {
 	if len(specBytes) == 0 {
 		return ""
+	}
+	if ex, ok := specStageExecutor(specBytes, workflowID, run.StageTypePlan); ok {
+		return strings.TrimSpace(ex.Model)
 	}
 	var probe struct {
 		Workflows map[string]struct {
@@ -870,15 +900,18 @@ func specPlanExecutorModel(specBytes []byte, workflowID string) string {
 }
 
 // specReviewExecutorModel reads executor.model on the review stage of the given
-// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
-// when the spec is empty, malformed, or declares no executor.model. It mirrors
+// workflow from the reuse-resolved spec (specStageExecutor), falling back to a
+// local raw YAML probe when the document does not parse. It returns "" when the
+// spec is empty, malformed, or declares no executor.model. It mirrors
 // specPlanExecutorModel exactly but targets the REVIEW stage (prefer a stage
-// whose id == "review", else the first stage whose type == "review"), staying
-// free of a static dependency on the spec.Executor.Model field. This is the spec
-// rung of the review-model ladder (#1416).
+// whose id == "review", else the first stage whose type == "review"). This is
+// the spec rung of the review-model ladder (#1416).
 func specReviewExecutorModel(specBytes []byte, workflowID string) string {
 	if len(specBytes) == 0 {
 		return ""
+	}
+	if ex, ok := specStageExecutor(specBytes, workflowID, run.StageTypeReview); ok {
+		return strings.TrimSpace(ex.Model)
 	}
 	var probe struct {
 		Workflows map[string]struct {

@@ -9,6 +9,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 )
 
 // gateAuditFake returns canned model_resolved entries (or an error) so the
@@ -1141,5 +1142,325 @@ func TestResolveStageReasoningEffort(t *testing.T) {
 	}
 	if got := s.resolveStageReasoningEffort(context.Background(), nil, run.StageTypeImplement); got != none {
 		t.Fatalf("nil run: resolveStageReasoningEffort = %+v, want %+v", got, none)
+	}
+}
+
+// specExecutorReaders names the five spec rungs that read through
+// specStageExecutor; each test below keys its expected values by these names.
+var specExecutorReaders = []struct {
+	name string
+	read func(specBytes []byte, workflowID string) string
+}{
+	{"specPlanExecutorAgent", specPlanExecutorAgent},
+	{"specPlanExecutorModel", specPlanExecutorModel},
+	{"specImplementExecutorAgent", specImplementExecutorAgent},
+	{"specImplementExecutorModel", specImplementExecutorModel},
+	{"specReviewExecutorModel", specReviewExecutorModel},
+}
+
+// TestSpecStageExecutor_ResolvesInheritedExecutor pins #5095's reader gap: a
+// stage that only INHERITS its executor through file defaults, workflow defaults
+// or extends reads as empty through a raw YAML probe, which dropped the model and
+// keyed claudecode. Every fixture declares nothing on wf's own stages (or has no
+// stages at all), so only the resolved read can produce these values.
+func TestSpecStageExecutor_ResolvesInheritedExecutor(t *testing.T) {
+	const stagesNoExecutor = `
+    stages:
+      - id: plan
+        type: plan
+      - id: implement
+        type: implement
+      - id: review
+        type: review
+        reviewers:
+          human: 1
+`
+	tests := []struct {
+		name string
+		doc  string
+		want map[string]string
+	}{
+		{
+			name: "file defaults",
+			doc: `version: "2"
+defaults:
+  executor:
+    agent: codex
+    model: gpt-from-file-defaults
+workflows:
+  wf:` + stagesNoExecutor,
+			want: map[string]string{
+				"specPlanExecutorAgent":      "codex",
+				"specPlanExecutorModel":      "gpt-from-file-defaults",
+				"specImplementExecutorAgent": "codex",
+				"specImplementExecutorModel": "gpt-from-file-defaults",
+				"specReviewExecutorModel":    "gpt-from-file-defaults",
+			},
+		},
+		{
+			name: "workflow defaults",
+			doc: `version: "2"
+workflows:
+  wf:
+    defaults:
+      executor:
+        agent: codex
+        model: gpt-from-workflow-defaults` + stagesNoExecutor,
+			want: map[string]string{
+				"specPlanExecutorAgent":      "codex",
+				"specPlanExecutorModel":      "gpt-from-workflow-defaults",
+				"specImplementExecutorAgent": "codex",
+				"specImplementExecutorModel": "gpt-from-workflow-defaults",
+				"specReviewExecutorModel":    "gpt-from-workflow-defaults",
+			},
+		},
+		{
+			// Each base stage differs, which also pins each reader to its own stage.
+			name: "extends base",
+			doc: `version: "2"
+workflows:
+  base:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: codex
+          model: gpt-base-plan
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          model: claude-base-implement
+      - id: review
+        type: review
+        executor:
+          agent: codex
+          model: gpt-base-review
+  wf:
+    extends: base
+`,
+			want: map[string]string{
+				"specPlanExecutorAgent":      "codex",
+				"specPlanExecutorModel":      "gpt-base-plan",
+				"specImplementExecutorAgent": "claude-code",
+				"specImplementExecutorModel": "claude-base-implement",
+				"specReviewExecutorModel":    "gpt-base-review",
+			},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(tt.doc)); err != nil {
+				t.Fatalf("fixture must parse, or it exercises the fallback instead: %v", err)
+			}
+			for _, r := range specExecutorReaders {
+				if got := r.read([]byte(tt.doc), "wf"); got != tt.want[r.name] {
+					t.Errorf("%s = %q, want %q", r.name, got, tt.want[r.name])
+				}
+			}
+		})
+	}
+}
+
+// TestSpecStageExecutor_ExplicitDeclarationUnchanged: a stage's own declaration
+// resolves to the value it read before, including over a default, and the
+// id-then-type lookup order is preserved.
+func TestSpecStageExecutor_ExplicitDeclarationUnchanged(t *testing.T) {
+	const doc = `version: "2"
+defaults:
+  executor:
+    agent: claude-code
+    model: claude-default
+workflows:
+  wf:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: codex
+          model: gpt-plan
+      - id: implement_first
+        type: implement
+        executor:
+          agent: codex
+          model: gpt-first-by-type
+      - id: implement_second
+        type: implement
+        executor:
+          agent: claude-code
+          model: claude-second-by-type
+      - id: review
+        type: review
+        executor:
+          agent: codex
+          model: gpt-review
+  by_id:
+    stages:
+      - id: not_the_implement_id
+        type: implement
+        executor:
+          agent: claude-code
+          model: claude-by-type
+      - id: implement
+        type: implement
+        executor:
+          agent: codex
+          model: gpt-by-id
+`
+	if _, err := spec.ParseBytes([]byte(doc)); err != nil {
+		t.Fatalf("fixture must parse, or it exercises the fallback instead: %v", err)
+	}
+	wf := map[string]string{
+		"specPlanExecutorAgent":      "codex",
+		"specPlanExecutorModel":      "gpt-plan",
+		"specImplementExecutorAgent": "codex",
+		"specImplementExecutorModel": "gpt-first-by-type",
+		"specReviewExecutorModel":    "gpt-review",
+	}
+	for _, r := range specExecutorReaders {
+		if got := r.read([]byte(doc), "wf"); got != wf[r.name] {
+			t.Errorf("%s(wf) = %q, want %q", r.name, got, wf[r.name])
+		}
+	}
+	if got := specImplementExecutorModel([]byte(doc), "by_id"); got != "gpt-by-id" {
+		t.Errorf("a stage whose id is implement must win over an earlier type match: got %q", got)
+	}
+	if got := specImplementExecutorAgent([]byte(doc), "by_id"); got != "codex" {
+		t.Errorf("a stage whose id is implement must win over an earlier type match: got %q", got)
+	}
+}
+
+// TestSpecStageExecutor_UnparsableSpecFallsBackToRawProbe: a document that fails
+// spec.ParseBytes but is YAML-readable keeps its raw probe result, so stored
+// specs and minimal fixtures read as they did before the resolved read. Malformed,
+// empty and missing-workflow inputs still degrade to "".
+func TestSpecStageExecutor_UnparsableSpecFallsBackToRawProbe(t *testing.T) {
+	const noVersion = `
+workflows:
+  wf:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: codex
+          model: gpt-plan
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+          model: claude-implement
+      - id: review
+        type: review
+        executor:
+          model: gpt-review
+`
+	// A stage with no type fails the schema but is YAML-readable.
+	const schemaInvalid = `version: "2"
+workflows:
+  wf:
+    stages:
+      - id: plan
+        executor:
+          agent: codex
+          model: gpt-plan
+      - id: implement
+        executor:
+          agent: claude-code
+          model: claude-implement
+      - id: review
+        executor:
+          model: gpt-review
+`
+	want := map[string]string{
+		"specPlanExecutorAgent":      "codex",
+		"specPlanExecutorModel":      "gpt-plan",
+		"specImplementExecutorAgent": "claude-code",
+		"specImplementExecutorModel": "claude-implement",
+		"specReviewExecutorModel":    "gpt-review",
+	}
+	for name, doc := range map[string]string{"no version": noVersion, "schema invalid": schemaInvalid} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := spec.ParseBytes([]byte(doc)); err == nil {
+				t.Fatal("fixture must fail ParseBytes, or it does not exercise the fallback")
+			}
+			for _, r := range specExecutorReaders {
+				if got := r.read([]byte(doc), "wf"); got != want[r.name] {
+					t.Errorf("%s = %q, want the raw probe's %q", r.name, got, want[r.name])
+				}
+			}
+		})
+	}
+
+	const parsesWithoutWorkflow = `version: "2"
+workflows:
+  other:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: codex
+          model: gpt-plan
+`
+	for name, doc := range map[string]string{
+		"malformed yaml":       "\t\tnot: [valid",
+		"empty":                "",
+		"workflow not in spec": parsesWithoutWorkflow,
+	} {
+		t.Run(name, func(t *testing.T) {
+			for _, r := range specExecutorReaders {
+				if got := r.read([]byte(doc), "wf"); got != "" {
+					t.Errorf("%s = %q, want empty", r.name, got)
+				}
+			}
+		})
+	}
+}
+
+// TestInheritedCodexStage_KeysCodexAllowList composes the resolved agent,
+// adapterForImplementAgent and AllowedModels.IsAllowed: an inherited Codex stage
+// keys the codex allow-list, accepting a Codex model and rejecting a Claude-only
+// one. Read raw, the agent is empty, which keys claudecode and inverts both.
+func TestInheritedCodexStage_KeysCodexAllowList(t *testing.T) {
+	doc := []byte(`version: "2"
+defaults:
+  executor:
+    agent: codex
+    model: gpt-allowed
+workflows:
+  wf:
+    stages:
+      - id: plan
+        type: plan
+      - id: implement
+        type: implement
+`)
+	allowed := AllowedModels{
+		"claudecode": {"claude-only": true},
+		"codex":      {"gpt-allowed": true},
+	}
+	for _, tt := range []struct {
+		name  string
+		agent func([]byte, string) string
+		model func([]byte, string) string
+	}{
+		{"implement", specImplementExecutorAgent, specImplementExecutorModel},
+		{"plan", specPlanExecutorAgent, specPlanExecutorModel},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			adapter := adapterForImplementAgent(tt.agent(doc, "wf"))
+			if adapter != "codex" {
+				t.Fatalf("adapter = %q, want codex", adapter)
+			}
+			model := tt.model(doc, "wf")
+			if model != "gpt-allowed" {
+				t.Fatalf("model = %q, want gpt-allowed", model)
+			}
+			if !allowed.IsAllowed(adapter, model) {
+				t.Errorf("%q must be allowed for the codex adapter", model)
+			}
+			if allowed.IsAllowed(adapter, "claude-only") {
+				t.Error("a Claude-only model must be rejected for the codex adapter")
+			}
+		})
 	}
 }
