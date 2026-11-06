@@ -84,6 +84,10 @@ func runReverifyResume(ctx context.Context, cfg config, h reverifyHeld, heldBran
 				branch: heldBranch, headSHA: h.heldSHA, baseSHA: h.baseSHA, armed: true,
 				resumeKind: resumeKindReverify,
 				prTitle:    servedPRTitle, prBody: servedPRBody,
+				// ADR-140 (#5047) D9: a reverify set is empty by construction and the
+				// backend refuses a non-empty one. openHeldCommitPR re-anchors at the
+				// synthesized head once this path hands it over.
+				reviewObligation: heldReviewObligationFor(cfg, h.heldSHA),
 			}
 		}
 		_ = reportPullRequestFailure(ctx, cfg, logSink, client, issued, v.category, reason, cp)
