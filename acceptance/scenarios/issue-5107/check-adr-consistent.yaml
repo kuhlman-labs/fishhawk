@@ -1,0 +1,14 @@
+id: scenario:issue-5107/check-adr-consistent
+statement: scripts/check-adr with no arguments on the committed tree exits 0, and stdout reports every record consistent with docs/adr/index.json (139 records at base a66db179, more only if the base gains records).
+verify_hint: 'CLI: run scripts/check-adr from the repo root; observe exit code 0 and the consistency line on stdout.'
+steps: 'Posture B: in the sanctioned checkout at b70b2856 (merge-base a66db179), run scripts/check-adr with no arguments from the repo root and read the exit code and stdout.'
+assertions:
+    expected: Exit 0 with every record reported consistent (139 records).
+    observed_at_record: 'Exit 0. stdout: check-adr: 139 record(s) consistent with .../docs/adr/index.json. The base index had 138 records and the head has 139, the count the criterion names.'
+    repro_handle: scripts/check-adr
+origin:
+    issue: 5107
+    pr: 5110
+    run_id: 740bbdb1-46f7-4eca-948a-ad5357e121be
+    head_sha: b70b2856cf19ac3e62c3327e3a268af19a28b21e
+    recorded_at: 2026-11-06T18:33:30Z

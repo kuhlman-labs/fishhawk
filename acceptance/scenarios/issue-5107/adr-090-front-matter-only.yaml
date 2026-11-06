@@ -1,0 +1,14 @@
+id: scenario:issue-5107/adr-090-front-matter-only
+statement: Against the merge-base, the only change to docs/adr/090-verify-the-merge-candidate.md is one added front-matter line naming ADR-142 in amended_by, with status accepted, supersedes, superseded_by and every body byte unchanged.
+verify_hint: 'CLI: git diff of that file against the merge-base with origin/main shows one added line and no deletions on stdout.'
+steps: 'Posture B: in the sanctioned checkout, compute the merge-base with origin/main (a66db179633f810cb7ae01b0c1826a70be0fad88), run git diff and git diff --numstat against it for docs/adr/090-verify-the-merge-candidate.md.'
+assertions:
+    expected: One added front-matter line naming ADR-142 in amended_by and no other change.
+    observed_at_record: 'numstat 1 0. The single added line is amended_by: ["ADR-142"], placed in the front matter between superseded_by and applies_to. status, supersedes [ADR-043], superseded_by [ADR-092, ADR-093, ADR-096] and the whole body are unchanged.'
+    repro_handle: git diff a66db179 b70b2856 -- docs/adr/090-verify-the-merge-candidate.md
+origin:
+    issue: 5107
+    pr: 5110
+    run_id: 740bbdb1-46f7-4eca-948a-ad5357e121be
+    head_sha: b70b2856cf19ac3e62c3327e3a268af19a28b21e
+    recorded_at: 2026-11-06T18:33:30Z
