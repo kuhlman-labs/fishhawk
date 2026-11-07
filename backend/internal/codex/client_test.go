@@ -987,8 +987,9 @@ func TestInference_EmptyAPIKeyNotAnError(t *testing.T) {
 
 // TestInference_ArgvModelAndEffort asserts the config→argv boundary: Model and
 // ReasoningEffort are appended as `--model <m>` / `-c model_reasoning_effort=<e>`
-// only when set, both placed BEFORE the prompt positional (pinned by the exact
-// argv comparison after stripping the non-deterministic --output-schema pair),
+// only when set, both placed BEFORE the trailing `-` stdin positional (#5113 —
+// the prompt rides on stdin, never argv; pinned by the exact argv comparison
+// after stripping the non-deterministic --output-schema pair),
 // and an all-empty config yields exactly the base argv — the inherit-host-default
 // regression guard. The returned model label must equal the configured (argv)
 // model, so label and reality match. The structured-outputs change (#1324)
@@ -1011,7 +1012,7 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 				"exec", "--json", "--skip-git-repo-check",
 				"--model", "gpt-5.5",
 				"-c", "model_reasoning_effort=medium",
-				prompt,
+				"-",
 			},
 		},
 		{
@@ -1020,7 +1021,7 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 			wantArgv: []string{
 				"exec", "--json", "--skip-git-repo-check",
 				"--model", "gpt-5.5",
-				prompt,
+				"-",
 			},
 		},
 		{
@@ -1029,12 +1030,12 @@ func TestInference_ArgvModelAndEffort(t *testing.T) {
 			wantArgv: []string{
 				"exec", "--json", "--skip-git-repo-check",
 				"-c", "model_reasoning_effort=high",
-				prompt,
+				"-",
 			},
 		},
 		{
 			name:     "both empty inherits host default",
-			wantArgv: []string{"exec", "--json", "--skip-git-repo-check", prompt},
+			wantArgv: []string{"exec", "--json", "--skip-git-repo-check", "-"},
 		},
 	}
 	for _, tt := range tests {
@@ -1123,9 +1124,10 @@ func TestParseStream_ClampsNegativeFresh(t *testing.T) {
 // TestInference_ScratchDirWorkspace pins the #995 workspace bound: the codex
 // subprocess runs from a fresh EMPTY scratch directory distinct from the
 // fishhawkd process cwd (verified by the child itself via the echo_cwd probe),
-// the prompt remains the SOLE positional argument (the composed context the
-// reviewer receives is exactly the server-built prompt — nothing rides in via
-// argv), and the scratch dir is removed after the invocation.
+// the sole positional argument is `-` (#5113: the prompt rides on stdin, so the
+// composed context the reviewer receives is exactly the server-built prompt and
+// nothing else rides in via argv), and the scratch dir is removed after the
+// invocation.
 func TestInference_ScratchDirWorkspace(t *testing.T) {
 	const prompt = "review this plan"
 	parentCwd, err := os.Getwd()
@@ -1156,13 +1158,13 @@ func TestInference_ScratchDirWorkspace(t *testing.T) {
 	if !strings.Contains(text, `"verdict":"approve"`) {
 		t.Errorf("child cwd probe rejected the workspace: %s", text)
 	}
-	// The prompt is the sole positional arg, after the pinned flag set (the
-	// non-deterministic --output-schema <path> pair is stripped by
+	// `-` (read the prompt from stdin, #5113) is the sole positional arg, after
+	// the pinned flag set (the non-deterministic --output-schema <path> pair is stripped by
 	// extractOutputSchema, and its file content is asserted separately).
 	wantArgv := []string{
 		"exec", "--json", "--skip-git-repo-check",
 		"--model", "gpt-5-codex",
-		prompt,
+		"-",
 	}
 	if !slices.Equal(capturedArgs, wantArgv) {
 		t.Errorf("argv (--output-schema pair stripped) = %q, want %q", capturedArgs, wantArgv)
