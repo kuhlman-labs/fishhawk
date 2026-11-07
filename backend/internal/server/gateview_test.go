@@ -4078,6 +4078,41 @@ workflows:
 			t.Errorf("entry = %+v gaps = %v, want unknown with the gap", got, resp.HistoryGaps)
 		}
 	})
+	// A concurrent advisory re-run lands a newer round between the coverage read
+	// and the recovery read. The entry stays bound to the covered round and offers
+	// nothing, and the real verb agrees that the newer round is not re-runnable.
+	t.Run("round_replaced_after_coverage", func(t *testing.T) {
+		for _, withVerdict := range []bool{false, true} {
+			name, wantCode := "new_round_in_flight", rerunCodeRoundInFlight
+			if withVerdict {
+				name, wantCode = "new_round_has_verdict", rerunCodeRoundHasVerdict
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newSliceLostFixture(t, compare(t))
+				covered := f.settledRound(t, consolidated)
+				var newer int64
+				f.s.cfg.AuditRepo = &sliceStartedReplacedAudit{auditFake: f.au, failRun: f.runRow.ID, replace: func() {
+					newer = unsettled(t, f, time.Now())
+					if withVerdict {
+						f.appendAt(t, f.implStage.ID, time.Now(), "implement_reviewed", planreview.ImplementReviewedPayload{Verdict: planreview.VerdictApprove, Authority: planreview.AuthorityAdvisory, HeadSHA: sliceLostHead})
+					}
+				}}
+				resp := f.read(t)
+				if newer == 0 {
+					t.Fatal("setup: the newer round did not land between the two reads")
+				}
+				got := f.only(t, resp)
+				if got.RoundSequence != covered || got.Reason != reviewCoverageReasonNoVerdict || got.RerunEligibility != sliceRerunUnknown || got.NextStep != "" || !sliceGapRecorded(resp) {
+					t.Errorf("entry = %+v gaps = %v, want covered round %d unknown with no action and the gap", got, resp.HistoryGaps, covered)
+				}
+				f.s.cfg.AuditRepo = f.au
+				w := f.verb(t)
+				if code, _ := rerunErr(t, w); w.Code != http.StatusConflict || code != wantCode {
+					t.Errorf("verb = %d %s, want 409 %s for round %d", w.Code, code, wantCode, newer)
+				}
+			})
+		}
+	})
 	t.Run("two_unknown_entries_one_gap", func(t *testing.T) {
 		f := newSliceLostFixture(t, compare(t))
 		f.settledRound(t, consolidated)
@@ -4158,6 +4193,22 @@ type sliceStartedEmptyAudit struct {
 func (a *sliceStartedEmptyAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
 	if runID == a.failRun && category == "implement_review_started" && a.reads.Add(1) > 1 {
 		return nil, nil
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// sliceStartedReplacedAudit passes the coverage read of a run's started rows, then
+// runs replace once before the recovery read: a newer round lands between them.
+type sliceStartedReplacedAudit struct {
+	*auditFake
+	failRun uuid.UUID
+	replace func()
+	reads   atomic.Int32
+}
+
+func (a *sliceStartedReplacedAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == a.failRun && category == "implement_review_started" && a.reads.Add(1) == 2 {
+		a.replace()
 	}
 	return a.auditFake.ListForRunByCategory(ctx, runID, category)
 }

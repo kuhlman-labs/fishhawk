@@ -200,6 +200,22 @@ CAS cannot see a recorded reject committed after the caller's last read. Declare
 - **Lock mode:** the first stage lock is `FOR NO KEY UPDATE`. An append holding the run
   lock takes `FOR KEY SHARE` on the stage through `audit_entries.stage_id`'s foreign key,
   so `FOR UPDATE` here deadlocks against an ordinary verdict write (40P01).
+- **Later `FOR UPDATE` upgrade:** `transitionStageTx`'s own `LockStageForUpdate` then
+  upgrades the stage lock to `FOR UPDATE`, but only while this transaction holds the run
+  lock. That is safe because of the chained-writer invariant: every chained audit writer
+  takes the run row lock BEFORE its insert takes `FOR KEY SHARE` on the stage and keeps
+  both until it commits. With the run lock held here, no chained append holds or waits
+  for that share lock, so the upgrade cannot close the stage -> run -> stage cycle. A new
+  chained writer that inserted a stage-referencing row before taking the run lock would
+  break this.
+- **Pinned by** the real-Postgres tests in `server/review_shutdown_test.go`.
+  `TestGuardedStageEdge_ReadFollowsRunLock_PG` holds the run row in another transaction
+  and checks three things: the edge blocks on that holder before `Decide`, the stage row
+  is already locked (`FOR UPDATE NOWAIT` refused), and a reject the holder then commits
+  is read and refuses the edge. `TestGuardedStageEdge_HoldsBothLocksThroughDecide_PG`
+  checks that both rows stay locked through `Decide` and that a chained append waits for
+  the commit. `TestGuardedStageEdge_VerdictWriterNoDeadlock_PG` runs verdict appends
+  against guarded edges on the same run with no 40P01.
 - **`Decide`** is pure (no I/O, no lock); its error rolls back and returns unwrapped.
 - **Identity:** an empty expected attempt without `LegacyIdentity`, no categories or a
   nil `Decide` return `ErrStageEdgeGuardInvalid` before any SQL. With `LegacyIdentity`,

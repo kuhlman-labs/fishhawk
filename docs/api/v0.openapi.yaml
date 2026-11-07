@@ -3695,9 +3695,9 @@ components:
             staleness block adds `merge_candidate_staleness` when the
             decomposition-children list or the chain-head read failed
             (E85.4 / #4147). The slice-reviews block adds `slice_reviews` when
-            a coverage read failed (the block is omitted) or a recovery read
-            failed (that entry reports `rerun_eligibility: unknown`), ADR-140 D6
-            (#5047).
+            a coverage read failed (the block is omitted), or a recovery read
+            failed or the round moved between the two reads (that entry
+            reports `rerun_eligibility: unknown`), ADR-140 D6 (#5047).
         slice_reviews_lost:
           type: array
           items: { $ref: '#/components/schemas/GateViewSliceReviewLost' }
@@ -4196,7 +4196,7 @@ components:
         rerun_eligibility:
           type: string
           enum: [eligible, ineligible, unknown]
-          description: '`unknown` means a read failed: no `next_step`, a `slice_reviews` gap, and no raw cause in the body.'
+          description: '`unknown` means a read failed or the round changed between reads: no `next_step`, a `slice_reviews` gap, and no raw cause in the body.'
         rerun_refusal:
           type: string
           description: The slug `POST /v0/runs/{run_id}/reviews/rerun` answers for this round.

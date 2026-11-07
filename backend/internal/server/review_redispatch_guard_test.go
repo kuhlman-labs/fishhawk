@@ -1324,6 +1324,11 @@ func TestDiscoverTerminalRunRounds_RealStoreOrderingAndCap_PG(t *testing.T) {
 		return out
 	}
 	t.Run("cap_reached_inside_bound", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("discovery-page contract must return normally; recovered %v", recovered)
+			}
+		}()
 		s, ids := seed(t, 3*time.Hour, 2*time.Hour, time.Hour)
 		scan, err := s.discoverTerminalRunRoundsCapped(ctx, "", 2, constantWindow(terminalRoundDiscoveryBound))
 		if err != nil {
@@ -1338,6 +1343,11 @@ func TestDiscoverTerminalRunRounds_RealStoreOrderingAndCap_PG(t *testing.T) {
 		}
 	})
 	t.Run("cap_reached_past_bound", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("discovery-page contract must return normally; recovered %v", recovered)
+			}
+		}()
 		s, ids := seed(t, 30*time.Hour, 26*time.Hour, time.Hour)
 		scan, err := s.discoverTerminalRunRoundsCapped(ctx, "", 2, constantWindow(terminalRoundDiscoveryBound))
 		if err != nil {
@@ -1351,6 +1361,11 @@ func TestDiscoverTerminalRunRounds_RealStoreOrderingAndCap_PG(t *testing.T) {
 		}
 	})
 	t.Run("below_cap", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("discovery-page contract must return normally; recovered %v", recovered)
+			}
+		}()
 		s, ids := seed(t, 3*time.Hour, time.Hour)
 		scan, err := s.discoverTerminalRunRoundsCapped(ctx, "", 5, constantWindow(terminalRoundDiscoveryBound))
 		if err != nil {
@@ -1435,6 +1450,11 @@ func TestDiscoverTerminalRunRounds_Identity(t *testing.T) {
 		}
 	})
 	t.Run("nil_run_id_skipped", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("nil-run-id contract must return normally; recovered %v", recovered)
+			}
+		}()
 		x := build(t)
 		x.f.au.seeded = append(x.f.au.seeded, &audit.Entry{ID: uuid.New(), Category: "plan_review_started", Timestamp: terminalRoundAge(time.Hour)})
 		if got := scan(t, x, constantWindow(terminalRoundDiscoveryBound)); len(got.candidates) != 0 {
@@ -1753,6 +1773,11 @@ func TestReconcileOrphanedReviews_TerminalRun_Truncated(t *testing.T) {
 		}
 	}
 	t.Run("cap_reached_warns_naming_the_limit", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("discovery-page contract must return normally; recovered %v", recovered)
+			}
+		}()
 		var logs syncBuffer
 		f, _ := newTerminalSweepFixture(t, redispatchFixtureOpts{reviewerUnwired: true, logOut: &logs})
 		seedRows(t, f, terminalRoundScanLimit)
@@ -1767,6 +1792,11 @@ func TestReconcileOrphanedReviews_TerminalRun_Truncated(t *testing.T) {
 		}
 	})
 	t.Run("below_cap_does_not_warn", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("discovery-page contract must return normally; recovered %v", recovered)
+			}
+		}()
 		var logs syncBuffer
 		f, _ := newTerminalSweepFixture(t, redispatchFixtureOpts{reviewerUnwired: true, logOut: &logs})
 		seedRows(t, f, terminalRoundScanLimit-1)
@@ -2416,6 +2446,9 @@ func TestShipPullRequest_SupplementalGatingOwnership_Independence(t *testing.T) 
 			assertNotInFlight(t, p.post(t, body))
 			parking.open()
 			assertNotInFlight(t, awaitResponse(t, done, "A"))
+			// The advisory pass is detached; drain it before the seam's var
+			// restores run, or its terminal write races them.
+			p.s.waitBackgroundReviews()
 		})
 	}
 }

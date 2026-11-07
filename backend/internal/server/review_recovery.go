@@ -48,6 +48,9 @@ var (
 	// errSupplementalStartNotAtomic refuses a start on an audit repository without
 	// the atomic deduped append; there is no check-then-append fallback.
 	errSupplementalStartNotAtomic = errors.New("supplemental review: audit repository lacks the atomic start allocation")
+	// errReviewEvidenceUnreadable is listGuardRows' answer with no audit repository:
+	// unreadable evidence is an error, never an empty row set.
+	errReviewEvidenceUnreadable = errors.New("supplemental review: no audit repository is wired, so recorded review evidence cannot be read")
 )
 
 // supplementalEdgeCategories is what the obligation read and the terminal edge's
@@ -129,9 +132,10 @@ func validateReviewObligationReport(report *reviewObligation, kind, headSHA stri
 // recordReviewObligationCheckpoint stores a known-required report under its own
 // category, strictly newer than its checkpoint-less pull_request_failed sibling.
 // Best-effort like recordPushResumeCheckpoint: the stage is already failed, and a
-// missing carrier degrades to a full agent pass rather than losing the report.
+// missing carrier degrades to a full agent pass rather than losing the report. With
+// no audit repository it records nothing, as that sibling does.
 func (s *Server) recordReviewObligationCheckpoint(ctx context.Context, runID, stageID uuid.UUID, kind string, coords pushCheckpointPayload, report *reviewObligation, actorKind audit.ActorKind, actorSubject *string) {
-	if reviewObligationKnowledge(report) != obligationKnownRequired || coords.Branch == "" || coords.HeadSHA == "" {
+	if s.cfg.AuditRepo == nil || reviewObligationKnowledge(report) != obligationKnownRequired || coords.Branch == "" || coords.HeadSHA == "" {
 		return
 	}
 	checkpoint := map[string]any{
@@ -345,9 +349,12 @@ func supplementalRoundFromRows(rows []run.StageEdgeGuardRow, stageID uuid.UUID, 
 }
 
 // listGuardRows reads categories in the row shape a guard's Decide reads, so an
-// outside read and the edge reach the same reducer. A list error is returned,
-// never read as no evidence.
+// outside read and the edge reach the same reducer. A list error, or no audit
+// repository, is returned, never read as no evidence.
 func (s *Server) listGuardRows(ctx context.Context, runID uuid.UUID, categories []string) ([]run.StageEdgeGuardRow, error) {
+	if s.cfg.AuditRepo == nil {
+		return nil, errReviewEvidenceUnreadable
+	}
 	var rows []run.StageEdgeGuardRow
 	for _, category := range categories {
 		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, category)

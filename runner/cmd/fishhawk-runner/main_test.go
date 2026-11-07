@@ -32199,6 +32199,11 @@ func TestBindReviewObligation_Modes(t *testing.T) {
 		}
 	})
 	t.Run("nil_checkpoint", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("nil-checkpoint contract must return normally; recovered %v", recovered)
+			}
+		}()
 		var log strings.Builder
 		bindReviewObligation(old, &log, nil, set)
 		if log.Len() != 0 {

@@ -5971,9 +5971,15 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 	case CategoryVerifyResumeCheckpoint:
 		kind = resumeKindReverify
 	case CategoryReviewObligationCheckpoint:
-		// Only pr_open and push are valid here; any other value reaches the
-		// resolver's unknown_resume_kind decline rather than a guessed kind.
-		kind = env.ResumeKind
+		// Only pr_open and push are valid on this carrier. reverify is a kind
+		// this build serves elsewhere, but never from here: a reverify carrier
+		// is armed before any delta exists, so it cannot hold a required set.
+		// It and any other value are cleared, so they reach the resolver's
+		// unknown_resume_kind decline rather than a served or guessed kind.
+		kind = ""
+		if env.ResumeKind == resumeKindPROpen || env.ResumeKind == resumeKindPush {
+			kind = env.ResumeKind
+		}
 	}
 	out := pushCheckpointPayload{
 		Branch: cp.Branch, HeadSHA: cp.HeadSHA, BaseSHA: cp.BaseSHA,

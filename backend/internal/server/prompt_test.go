@@ -17375,6 +17375,39 @@ func TestNewestPushCheckpoint_ReviewObligationCarrier(t *testing.T) {
 		}
 		assertDiscardReason(t, f, "unknown_resume_kind")
 	})
+	// reverify is a recognized kind, but never on this carrier: every capability
+	// is advertised, so only the carrier's own kind check can refuse it.
+	t.Run("recognized_reverify_kind_disallowed", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.requiredCarrier(t, resumeKindReverify)
+		held, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+		if resume || held.resumeKind != "" {
+			t.Fatalf("resume = %t kind = %q: a reverify obligation carrier must not resume", resume, held.resumeKind)
+		}
+		assertDiscardReason(t, f, "unknown_resume_kind")
+	})
+	t.Run("valid_kinds_resolve", func(t *testing.T) {
+		for _, kind := range []string{resumeKindPROpen, resumeKindPush} {
+			f := newObligationPrompt(t, gating)
+			f.requiredCarrier(t, kind)
+			held, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+			if !resume || held.resumeKind != kind {
+				t.Errorf("%s: resume = %t kind = %q, want served as %s", kind, resume, held.resumeKind, kind)
+			}
+			if got := f.discardReasons(t); len(got) != 0 {
+				t.Errorf("%s: discard reasons = %v, want none", kind, got)
+			}
+		}
+	})
+	// The legacy reverify carrier keeps its own category, which names the kind.
+	t.Run("legacy_reverify_carrier_unchanged", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.plainCarrier(t, resumeKindReverify, nil)
+		held, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+		if !resume || held.resumeKind != resumeKindReverify {
+			t.Errorf("resume = %t kind = %q, want the legacy reverify carrier served", resume, held.resumeKind)
+		}
+	})
 }
 
 // TestAdmitHeldCommitObligation_Modes calls the admission directly, so each row's

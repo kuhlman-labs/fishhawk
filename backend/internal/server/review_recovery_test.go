@@ -287,9 +287,16 @@ func seedGuardRows(au *auditFake, runID uuid.UUID, rows []run.StageEdgeGuardRow,
 // --- obligation state --------------------------------------------------------
 
 func TestReviewObligationKnowledge_ThreeStates(t *testing.T) {
-	if got := reviewObligationKnowledge(nil); got != obligationUnknown {
-		t.Errorf("nil_pointer = %d, want unknown", got)
-	}
+	t.Run("nil_pointer_stays_unknown", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("nil-state contract must return normally; recovered %v", recovered)
+			}
+		}()
+		if got := reviewObligationKnowledge(nil); got != obligationUnknown {
+			t.Errorf("nil_pointer = %d, want unknown", got)
+		}
+	})
 	cases := []struct {
 		name string
 		wire string
@@ -312,6 +319,11 @@ func TestReviewObligationKnowledge_ThreeStates(t *testing.T) {
 		})
 	}
 	t.Run("null_pointer_stays_unknown", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("nil-state contract must return normally; recovered %v", recovered)
+			}
+		}()
 		var carrier struct {
 			ReviewObligation *reviewObligation `json:"review_obligation"`
 		}
@@ -343,6 +355,11 @@ func TestValidateReviewObligationReport_Modes(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
+			defer func() {
+				if recovered := recover(); recovered != nil {
+					t.Fatalf("nil-state contract must return normally; recovered %v", recovered)
+				}
+			}()
 			err := validateReviewObligationReport(tc.report, tc.kind, recoveryHead, stage)
 			if (err != nil) != tc.wantErr {
 				t.Fatalf("err = %v, wantErr %v", err, tc.wantErr)
@@ -433,6 +450,73 @@ func TestRecordReviewObligationCheckpoint_Modes(t *testing.T) {
 		f.carrier(t, recoveryHead, recoveryPath)
 		if got := rows(t, f); len(got) != 0 {
 			t.Fatalf("rows = %d, want none", len(got))
+		}
+	})
+	// Like recordPushResumeCheckpoint, no audit repository records nothing.
+	t.Run("nil_audit_repo_writes_nothing", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("nil audit repository contract must return normally; recovered %v", recovered)
+			}
+		}()
+		f := newRecoverySeam(t)
+		f.s.cfg.AuditRepo = nil
+		f.carrier(t, recoveryHead, recoveryPath)
+		if got := rows(t, f); len(got) != 0 {
+			t.Fatalf("rows = %d, want none", len(got))
+		}
+	})
+}
+
+// TestReviewEvidence_NilAuditRepo_Unreadable: with no audit repository every
+// evidence read is an error, never an empty row set read as proof.
+func TestReviewEvidence_NilAuditRepo_Unreadable(t *testing.T) {
+	ctx := context.Background()
+	noPanic := func(t *testing.T) {
+		if recovered := recover(); recovered != nil {
+			t.Fatalf("nil audit repository contract must return normally; recovered %v", recovered)
+		}
+	}
+	t.Run("guard_rows", func(t *testing.T) {
+		defer noPanic(t)
+		f := newRecoverySeam(t)
+		f.s.cfg.AuditRepo = nil
+		rows, err := f.s.listGuardRows(ctx, f.runRow.ID, supplementalEdgeCategories)
+		if !errors.Is(err, errReviewEvidenceUnreadable) || rows != nil {
+			t.Fatalf("rows = %v, err = %v, want no rows and the unreadable error", rows, err)
+		}
+	})
+	t.Run("round_state", func(t *testing.T) {
+		defer noPanic(t)
+		f := newRecoverySeam(t)
+		f.s.cfg.AuditRepo = nil
+		state, err := f.s.supplementalRoundState(ctx, f.runRow.ID, f.stage.ID, recoveryHead, f.attempt)
+		if !errors.Is(err, errReviewEvidenceUnreadable) || state != (supplementalRoundSnapshot{}) {
+			t.Fatalf("state = %+v, err = %v, want the unreadable error", state, err)
+		}
+	})
+	t.Run("obligation_check", func(t *testing.T) {
+		defer noPanic(t)
+		f := newRecoverySeam(t)
+		f.s.cfg.AuditRepo = nil
+		check, err := f.s.requiredReviewObligationMissing(ctx, f.runRow.ID, f.stage, recoveryHead, nil)
+		if !errors.Is(err, errReviewEvidenceUnreadable) || check.discharged || len(check.missing) != 0 {
+			t.Fatalf("check = %+v, err = %v, want the unreadable error and nothing proved", check, err)
+		}
+	})
+	t.Run("gating_pass_reads_as_lost", func(t *testing.T) {
+		defer noPanic(t)
+		s, _, _, _, runRow, stage := newImplementReviewServer(t, &fakePlanReviewer{}, specImplementGatingReviewers)
+		stage.State = run.StageStateRunning
+		s.cfg.AuditRepo = nil
+		body := &pullRequestBody{HeadSHA: recoveryHead, SupplementalScopeExemptions: []scopeExemption{{Path: recoveryPath, Reason: "r"}}}
+		var logs bytes.Buffer
+		s.cfg.Logger = slog.New(slog.NewTextHandler(&logs, nil))
+		if !s.supplementalPassLost(ctx, runRow.ID, stage, body) {
+			t.Fatal("an unreadable round must read as lost")
+		}
+		if !strings.Contains(logs.String(), errReviewEvidenceUnreadable.Error()) {
+			t.Errorf("lost for another reason, want the round read's unreadable error: %q", logs.String())
 		}
 	})
 }

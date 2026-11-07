@@ -6878,6 +6878,21 @@ func TestShipPullRequest_LivePass_GoldenSection(t *testing.T) {
 	}
 }
 
+type livePassRoundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f livePassRoundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) { return f(r) }
+
+type livePassObservedClose struct {
+	io.ReadCloser
+	afterClose func()
+}
+
+func (b livePassObservedClose) Close() error {
+	err := b.ReadCloser.Close()
+	b.afterClose()
+	return err
+}
+
 // TestShipPullRequest_LivePass_BoundsWholeCall: the first live answer's bound
 // governs every sleep, request, body read and retry of the remaining call. The kill
 // is shipBounded's per-test clock, never a global timeout.
@@ -6940,7 +6955,6 @@ func TestShipPullRequest_LivePass_BoundsWholeCall(t *testing.T) {
 			retries:   1,
 			wantPosts: 3,
 		},
-		{name: "already_expired_before_next_iteration", then: hang, wantPosts: 2},
 		{
 			name: "repeated_live_no_extension",
 			then: func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
@@ -6972,6 +6986,62 @@ func TestShipPullRequest_LivePass_BoundsWholeCall(t *testing.T) {
 			}
 		})
 	}
+
+	t.Run("already_expired_before_next_iteration", func(t *testing.T) {
+		t.Parallel()
+		c, l := newLiveScriptClient(t, func(_ *liveScriptServer, n int, w http.ResponseWriter, _ *http.Request) {
+			if n == 1 {
+				writeInFlight(w, "1", "1")
+				return
+			}
+			w.WriteHeader(http.StatusServiceUnavailable)
+			_, _ = io.WriteString(w, `{"error":{"code":"service_unavailable"}}`)
+		})
+		// Keep enough room to receive the second response. Its exchange and body
+		// read finish normally; Close crosses the REAL latched deadline before
+		// returning, so the next loop iteration must begin already expired.
+		c.LivePassSettleAllowance = time.Second
+		c.HTTP.Timeout = 0 // the live-pass context, not Client.Timeout, owns this bound
+		base := http.DefaultTransport
+		attempts := 0
+		expiredBeforeNext := false
+		c.HTTP.Transport = livePassRoundTripFunc(func(req *http.Request) (*http.Response, error) {
+			attempts++
+			if attempts > 2 {
+				t.Errorf("POST attempted after expiry: attempt=%d, expired boundary reached=%t", attempts, expiredBeforeNext)
+				return &http.Response{StatusCode: http.StatusConflict, Header: make(http.Header), Body: io.NopCloser(strings.NewReader(`{}`)), Request: req}, nil
+			}
+			resp, err := base.RoundTrip(req)
+			if err != nil || attempts != 2 {
+				return resp, err
+			}
+			deadline, ok := req.Context().Deadline()
+			if !ok {
+				t.Error("second request must carry the latched live-pass deadline")
+				resp.StatusCode = http.StatusConflict // end a missing-bound mutant without a harness timeout
+				return resp, nil
+			}
+			resp.Body = livePassObservedClose{ReadCloser: resp.Body, afterClose: func() {
+				<-req.Context().Done()
+				if !errors.Is(req.Context().Err(), context.DeadlineExceeded) || time.Now().Before(deadline) {
+					t.Errorf("body Close must return after its latched deadline, got %v", req.Context().Err())
+				}
+				expiredBeforeNext = true
+			}}
+			return resp, nil
+		})
+		_, err := shipBounded(t, c, context.Background(), livePassArgs(t), 2*time.Second+liveBoundTolerance)
+		if !errors.Is(err, ErrLivePassBudgetExhausted) {
+			t.Errorf("err = %v, want ErrLivePassBudgetExhausted", err)
+		}
+		if !expiredBeforeNext {
+			t.Error("the completed response did not cross the latched deadline before the next iteration")
+		}
+		if attempts != 2 || l.count() != 2 {
+			t.Errorf("HTTP attempts=%d, POSTs=%d, want two with none after the expired boundary", attempts, l.count())
+		}
+		t.Logf("expired boundary observed=%t; HTTP attempts=%d, POSTs=%d", expiredBeforeNext, attempts, l.count())
+	})
 
 	t.Run("earlier_caller_deadline", func(t *testing.T) {
 		t.Parallel()

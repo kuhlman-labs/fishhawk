@@ -226,8 +226,9 @@ type gateViewResponse struct {
 	// the verb's 502. Computed only by handleGetRunGateView. Omitted (nil) when
 	// no slice review is lost or the coverage guards do not apply; omitted with a
 	// slice_reviews history_gaps entry when a coverage read fails, and an entry
-	// whose recovery read fails reports rerun_eligibility unknown with the same
-	// gap. See sliceReviewsLostForRun.
+	// whose recovery read fails, or whose round moved between the two reads,
+	// reports rerun_eligibility unknown with the same gap. See
+	// sliceReviewsLostForRun.
 	SliceReviewsLost []gateViewSliceReviewLost `json:"slice_reviews_lost,omitempty"`
 }
 
@@ -1319,7 +1320,8 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 }
 
 // gateViewGapSliceReviews is the history_gaps entry the slice_reviews_lost block
-// records when a coverage or recovery read fails.
+// records when a coverage or recovery read fails, or the round moved between
+// them.
 const gateViewGapSliceReviews = "slice_reviews"
 
 // reviewCoverageNextReconcile is the next_step of a stale prior-process round:
@@ -1442,10 +1444,11 @@ func (s *Server) sliceReviewsLostForRun(ctx context.Context, runRow *run.Run, re
 }
 
 // sliceRoundRecovery reduces one coverage gap to its entry from the ACTUAL latest
-// round, including its start time. ok is false for a round still in flight inside
-// its budget. A returned error means the entry reports rerun_eligibility unknown
-// with no next_step and the caller records the gap; the raw cause never reaches
-// the body.
+// round, including its start time, which must be the round the coverage read
+// reduced. ok is false for a round still in flight inside its budget. A returned
+// error, including a round that moved between the two reads, means the entry
+// reports rerun_eligibility unknown with no next_step and the caller records the
+// gap; the raw cause never reaches the body.
 //
 // For a settled zero-verdict round it walks the re-run verb's own ladder, then
 // proves the inputs that verb would load. next_step therefore means that at read
@@ -1476,7 +1479,12 @@ func (s *Server) sliceRoundRecovery(ctx context.Context, g sliceCoverageGap) (ga
 	if !ok {
 		return unknown(fmt.Errorf("run %s: the implement round disappeared between reads", ch.ID))
 	}
-	entry.RoundSequence = latest.Sequence
+	// The advice is bound to the round the coverage read reduced. A newer round
+	// (a concurrent re-run) carries completion evidence g.reason never saw, so no
+	// action is proven for it: unknown, never the old round's reason on the new one.
+	if latest.Sequence != g.coverage.Sequence {
+		return unknown(fmt.Errorf("run %s: the implement round moved between reads (covered %d, latest %d)", ch.ID, g.coverage.Sequence, latest.Sequence))
+	}
 	entry.Authority = string(payload.Authority)
 	handingOff := reviewRedispatchPending(ch.ID, stage.label, latest.Sequence)
 

@@ -5361,21 +5361,27 @@ type stageCopyRepo struct {
 	onTransition func(ctx context.Context, to run.StageState) error
 }
 
+// GetStage returns a hook's error WITH a usable stage copy. A caller must not read
+// the value on an error, so this is within its contract; it means a caller that
+// skips its error check reaches the response and effect assertions instead of a
+// nil dereference.
 func (r *stageCopyRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
 	call := r.getStages.Add(1)
+	var hookErr error
 	if r.onGetStage != nil {
-		if err := r.onGetStage(ctx, call); err != nil {
-			return nil, err
-		}
+		hookErr = r.onGetStage(ctx, call)
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	s, ok := r.stagesByID[id]
 	if !ok {
+		if hookErr != nil {
+			return nil, hookErr
+		}
 		return nil, run.ErrNotFound
 	}
 	out := *s
-	return &out, nil
+	return &out, hookErr
 }
 
 func (r *stageCopyRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
@@ -6029,40 +6035,64 @@ func TestShipPullRequest_SupplementalGating_PartialVerdicts_LiveVersusLost(t *te
 }
 
 func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *testing.T) {
+	// Capture the ORIGINAL ownership coordinates before any handler can change
+	// the stage. Inspect that exact key after its first call, before any replay.
+	assertOriginalReleased := func(t *testing.T, p *prSeam) func() {
+		t.Helper()
+		key := supplementalPassKey{stageID: p.stage.ID, attempt: p.attempt(t), headSHA: prSeamHead}
+		return func() {
+			t.Helper()
+			p.s.supplementalPasses.mu.Lock()
+			_, held := p.s.supplementalPasses.live[key]
+			p.s.supplementalPasses.mu.Unlock()
+			if held {
+				t.Errorf("original supplemental ownership key remains held after handler exit: stage=%s attempt=%s head=%s", key.stageID, key.attempt, key.headSHA)
+			}
+		}
+	}
+
 	t.Run("approve", func(t *testing.T) {
 		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		if w := p.post(t, body); w.Code != http.StatusCreated {
 			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 		}
+		assertReleased()
 		assertNotInFlight(t, p.post(t, body))
 	})
 	t.Run("reject", func(t *testing.T) {
 		p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		if w := p.post(t, body); w.Code != http.StatusCreated {
 			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 		}
 		p.assertFailedB(t)
+		assertReleased()
 		assertNotInFlight(t, p.post(t, body))
 	})
 	t.Run("interrupted", func(t *testing.T) {
 		started := make(chan struct{})
 		p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		done := p.postAsync(t.Context(), body)
 		waitFor(t, started, "setup: blocked reviewer")
 		p.s.reviewers.closeAndCancel()
 		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		assertReleased()
 		assertInterrupted(t, p.post(t, body), http.StatusServiceUnavailable)
 	})
 	t.Run("create_error", func(t *testing.T) {
 		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		p.art.createErr = errors.New("forced create fault")
 		if w := p.post(t, body); w.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
 		}
+		assertReleased()
 		p.art.createErr = nil
 		if w := p.post(t, body); w.Code != http.StatusCreated {
 			t.Fatalf("later upload = %d, want it to create and run the pass:\n%s", w.Code, w.Body.String())
@@ -6074,10 +6104,12 @@ func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *test
 	t.Run("governance_append_error", func(t *testing.T) {
 		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		p.audit.setHooks(failVerdicts(func(q audit.ChainAppendParams) bool { return q.Category == "pull_request_opened" }), nil)
 		if w := p.post(t, body); w.Code != http.StatusInternalServerError {
 			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
 		}
+		assertReleased()
 		p.audit.setHooks(nil, nil)
 		assertInterrupted(t, p.post(t, body), http.StatusConflict)
 		p.assertNothingMoved(t)
@@ -6085,6 +6117,7 @@ func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *test
 	t.Run("lineage_violation", func(t *testing.T) {
 		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		stub := &lineageGitHub{baseRef: "main", headSHA: prSeamHead, commitsByBase: map[string][]string{"main": {"0000000000000000000000000000000000000f0f", prSeamHead}}}
 		p.s.cfg.GitHub = newLineageGitHubClient(t, stub)
 		if w := p.post(t, body); w.Code != http.StatusCreated {
@@ -6093,6 +6126,7 @@ func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *test
 		if got := p.state(t); got != run.StageStateFailed {
 			t.Fatalf("setup: stage = %q, want the lineage guard's failure", got)
 		}
+		assertReleased()
 		assertNotInFlight(t, p.post(t, body))
 	})
 	t.Run("handler_panic", func(t *testing.T) {
@@ -6100,6 +6134,7 @@ func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *test
 		panicking := &panicOnceArtifactRepo{Repository: p.art}
 		p.s.cfg.ArtifactRepo = panicking
 		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
 		func() {
 			// The server's recover middleware or this one catches it; either way
 			// the handler's defers ran.
@@ -6109,6 +6144,7 @@ func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *test
 		if !panicking.fired.Load() {
 			t.Fatal("setup: Create did not panic")
 		}
+		assertReleased()
 		assertNotInFlight(t, p.post(t, body))
 	})
 }
@@ -6420,6 +6456,30 @@ func TestShipPullRequest_SupplementalGatingOwnership_BoundedLifetime(t *testing.
 		done := p.postAsync(t.Context(), body)
 		awaitObserved(t, observed, context.DeadlineExceeded)
 		assertStaticEdgeError(t, awaitResponse(t, done, "owner"))
+		p.assertNothingMoved(t)
+		p.repo.onGetStage = nil
+		assertReleased(t, p, body)
+	})
+	// The fresh read's own error on a LIVE context. blocked_get_stage cannot isolate
+	// the read-error guard: its expired pass context refuses the next step anyway.
+	// Here the fake returns a usable stage WITH the error, so only that guard stands
+	// between the fault and an edge.
+	t.Run("fresh_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		fault := errors.New("fresh stage read fault")
+		var faulted atomic.Bool
+		p.repo.onGetStage = func(_ context.Context, call int32) error {
+			if call != 2 {
+				return nil
+			}
+			faulted.Store(true)
+			return fault
+		}
+		body := p.body(t)
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		if !faulted.Load() {
+			t.Fatal("setup: the fresh read was never faulted")
+		}
 		p.assertNothingMoved(t)
 		p.repo.onGetStage = nil
 		assertReleased(t, p, body)
