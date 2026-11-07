@@ -5,8 +5,11 @@
 // (an OPENAI_API_KEY in the environment, or a ChatGPT login on the host), which
 // the subprocess inherits via os.Environ().
 //
-// The adapter shells out to `codex exec --json --skip-git-repo-check <prompt>`
-// for inference-only review and reads one JSON event per line from stdout. The
+// The adapter shells out to `codex exec --json --skip-git-repo-check -` with the
+// prompt written to the child's STDIN (#5113) for inference-only review and reads
+// one JSON event per line from stdout. The prompt is never an argv element, so
+// the spawn's argv size does not depend on prompt size and a large consolidated
+// review prompt cannot fail at fork/exec with E2BIG. The
 // flag shape and JSONL event schema below were pinned against the installed
 // Codex CLI (codex-cli 0.137.0, --sandbox/--ignore-rules pinned against 0.144.1),
 // the same family the runner executor adapter pinned (runner/internal/agent/codex).
@@ -191,12 +194,13 @@ type usageBlock struct {
 	ReasoningOutputTokens int `json:"reasoning_output_tokens"`
 }
 
-// Inference runs `codex exec --json --skip-git-repo-check <prompt>`, scans the
-// JSONL stream for the final agent-message text (the verdict body) and the
-// summed per-turn token usage, and returns the verdict text as responseText,
-// the configured model as the model identifier, and the token usage (#681). The
-// child inherits os.Environ() so the operator's existing OPENAI_API_KEY or
-// ChatGPT-login auth is used with zero new plumbing.
+// Inference runs `codex exec --json --skip-git-repo-check -` with the prompt on
+// stdin (#5113), scans the JSONL stream for the final agent-message text (the
+// verdict body) and the summed per-turn token usage, and returns the verdict
+// text as responseText, the configured model as the model identifier, and the
+// token usage (#681). The child environment is the scrubbed reviewsandbox.Env
+// allow-list (#2486), which keeps the operator's OPENAI_API_KEY or ChatGPT-login
+// auth discovery.
 func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, err error) {
 	return c.InferenceInTree(ctx, prompt, "")
 }
@@ -366,8 +370,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	}
 
 	// Flag rationale (pinned against codex-cli 0.137.0):
-	//   exec                  — the non-interactive subcommand; reads the
-	//                           prompt from the positional argument.
+	//   exec                  — the non-interactive subcommand.
 	//   --json                — emit one JSON event per line to stdout (the
 	//                           stream this adapter parses).
 	//   --skip-git-repo-check — Codex refuses to run outside a git repo by
@@ -400,7 +403,18 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	//                           effort; appended only when cfg.ReasoningEffort is
 	//                           set. A bare value like `medium` that fails to
 	//                           parse as TOML is treated as a string literal.
-	// Both optional flags are placed BEFORE the prompt positional, matching the
+	//   -                     — the trailing positional (#5113): per `codex exec
+	//                           --help` (codex-cli 0.166.0), "If not provided as
+	//                           an argument (or if `-` is used), instructions are
+	//                           read from stdin." The prompt itself is written to
+	//                           cmd.Stdin below and never rides in argv: execve
+	//                           refuses an oversized argument list with E2BIG
+	//                           before the CLI runs (Linux: one string over
+	//                           MAX_ARG_STRLEN, 128 KiB; darwin: argv+env over
+	//                           kern.argmax, 1 MiB). `-` is explicit rather than
+	//                           omitted so the stdin reading never depends on the
+	//                           CLI's no-positional default.
+	// Both optional flags are placed BEFORE the trailing `-`, matching the
 	// existing argv shape.
 	args := []string{
 		"exec", "--json",
@@ -421,7 +435,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	if c.cfg.ReasoningEffort != "" {
 		args = append(args, "-c", "model_reasoning_effort="+c.cfg.ReasoningEffort)
 	}
-	args = append(args, prompt)
+	args = append(args, "-")
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
 	// Harden the subprocess so the review deadline actually terminates a wedged
 	// reviewer (#1805): the child leads its own process group, a deadline-fired
@@ -431,6 +445,13 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	// Must be applied after the cmd is built and before cmd.Output().
 	procgroup.Harden(cmd, killGrace)
 	cmd.Dir = workDir
+	// Prompt transport (#5113): the prompt goes to the child's STDIN (the `-`
+	// positional above), never argv. Per the os/exec Cmd.Stdin contract a
+	// non-*os.File reader is copied to the child through a pipe and the pipe is
+	// closed at EOF; the bytes are delivered unchanged. Wait does not return
+	// until that copy finishes or WaitDelay expires, so the procgroup.Harden
+	// group kill + WaitDelay above still bound a child that never reads stdin.
+	cmd.Stdin = strings.NewReader(prompt)
 	// Seed the child environment from the SCRUBBED allow-list, not a wholesale
 	// os.Environ() (#2486): a tool-enabled reviewer processing untrusted diff/issue
 	// text must never hold FISHHAWKD_DATABASE_URL, GITHUB_TOKEN, or unrelated API
