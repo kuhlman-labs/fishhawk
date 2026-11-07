@@ -23,6 +23,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	runpkg "github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
 )
@@ -1744,4 +1745,173 @@ func TestGetGateView_OutcomeJudgementWireDecode(t *testing.T) {
 		t.Errorf("settled concern = outcome %q judgement %q actor %q delegated %v bulk %v backfill %v cost %q, want fixed tradeoff user true true true %q",
 			st.Outcome, st.Judgement, st.JudgementActorKind, st.JudgementDelegated, st.JudgementBulk, st.JudgementBackfill, st.TradeoffCost, "slower cold start")
 	}
+}
+
+// sliceLostWireReviewer satisfies the backend's reviewer wiring; the read never
+// invokes it.
+type sliceLostWireReviewer struct{}
+
+func (sliceLostWireReviewer) Review(context.Context, string) (*planreview.ReviewVerdict, string, error) {
+	return &planreview.ReviewVerdict{Verdict: planreview.VerdictApprove}, "claude-sonnet-4-6", nil
+}
+
+// sliceLostWireSpecYAML configures one implement reviewer, so the coverage guards
+// the block shares apply.
+const sliceLostWireSpecYAML = `version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          agent: 1
+          human: 1
+`
+
+// TestSliceReviewsLost_WireShape pins the hand-maintained gateViewSliceReviewLost
+// mirror against the REAL backend (ADR-140 D6, #5047; the #371 trap). A real
+// server.New over Postgres carries a decomposed parent whose slice child's round is
+// stale and predates this process, the one row emitting every member: its keys equal
+// the mirror's json tags in BOTH directions, and every member decodes non-zero through
+// GetGateView and the fishhawk_get_gate_view handler. Counterfactual: renaming a mirror
+// tag fails both.
+func TestSliceReviewsLost_WireShape(t *testing.T) {
+	const bearer = "fhk_slice_reviews_lost_e2e"
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runpkg.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	create := func() *runpkg.Run {
+		t.Helper()
+		row, err := runRepo.CreateRun(ctx, runpkg.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runpkg.TriggerCLI,
+			WorkflowSpec: []byte(sliceLostWireSpecYAML),
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return row
+	}
+	parent, child := create(), create()
+	if _, err := pool.Exec(ctx, `UPDATE runs SET decomposed_from = $1, slice_index = 2, state = 'succeeded' WHERE id = $2`, parent.ID, child.ID); err != nil {
+		t.Fatalf("mark child: %v", err)
+	}
+	stage, err := runRepo.CreateStage(ctx, runpkg.CreateStageParams{RunID: child.ID, Sequence: 0, Type: runpkg.StageTypeImplement, ExecutorKind: runpkg.ExecutorAgent, ExecutorRef: "claude-code"})
+	if err != nil {
+		t.Fatalf("create stage: %v", err)
+	}
+	started, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityAdvisory, RoundOrigin: "consolidated", RoundBaseSHA: "base", HeadSHA: "head"})
+	entry, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: child.ID, StageID: &stage.ID, Timestamp: time.Now().UTC().Add(-30 * 24 * time.Hour), Category: "implement_review_started", Payload: started,
+	})
+	if err != nil {
+		t.Fatalf("seed round: %v", err)
+	}
+
+	tokRepo := &stubMCPAPITokens{tok: &apitoken.Token{
+		ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit"}, PlainText: bearer,
+	}}
+	s := server.New(server.Config{
+		RunRepo: runRepo, ConcernRepo: concern.NewPostgresRepository(pool), AuditRepo: auditRepo,
+		APITokenRepo: tokRepo, PlanReviewer: sliceLostWireReviewer{},
+	})
+	ts := httptest.NewServer(s.Handler())
+	t.Cleanup(ts.Close)
+	client := newAPIClient(config{backendURL: ts.URL, apiToken: bearer})
+
+	top := wireRawGET(t, ctx, ts.URL, "/v0/runs/"+parent.ID.String()+"/gate-view", bearer)
+	var blocks []json.RawMessage
+	if err := json.Unmarshal(top["slice_reviews_lost"], &blocks); err != nil || len(blocks) != 1 {
+		t.Fatalf("server emitted no one-entry slice_reviews_lost block (err %v):\n%s", err, top["slice_reviews_lost"])
+	}
+	requireMirrorKeys(t, "slice_reviews_lost", blocks[0], reflect.TypeOf(gateViewSliceReviewLost{}))
+	var emitted map[string]json.RawMessage
+	if err := json.Unmarshal(blocks[0], &emitted); err != nil {
+		t.Fatalf("decode entry: %v", err)
+	}
+	for k := range jsonFieldNames(reflect.TypeOf(gateViewSliceReviewLost{})) {
+		if _, ok := emitted[k]; !ok {
+			t.Errorf("mirror field %q is not emitted by the server's slice_reviews_lost entry (tag drift)", k)
+		}
+	}
+
+	check := func(surface string, got []gateViewSliceReviewLost) {
+		t.Helper()
+		if len(got) != 1 {
+			t.Fatalf("%s: slice_reviews_lost = %+v, want one entry", surface, got)
+		}
+		v := got[0]
+		if v.ChildRunID != child.ID.String() || v.SliceIndex == nil || *v.SliceIndex != 2 || v.RoundSequence != entry.Sequence ||
+			v.Reason != "review_round_stale" || v.Authority != string(planreview.AuthorityAdvisory) ||
+			v.RerunEligibility != "ineligible" || v.RerunRefusal != "round_unsettled" || v.NextStep != "fishhawk_reconcile_reviews" {
+			t.Errorf("%s: entry = %+v, want every member decoded non-zero", surface, v)
+		}
+	}
+	gv, err := client.GetGateView(ctx, parent.ID, "")
+	if err != nil {
+		t.Fatalf("GetGateView: %v", err)
+	}
+	check("client", gv.SliceReviewsLost)
+	resolver := &runResolver{api: client, getenv: envFuncFromMap(nil)}
+	_, out, err := resolver.getGateView(ctx, nil, GetGateViewInput{RunID: parent.ID.String()})
+	if err != nil {
+		t.Fatalf("getGateView: %v", err)
+	}
+	check("fishhawk_get_gate_view", out.GateView.SliceReviewsLost)
+}
+
+// TestNextActions_DecompositionChildWording: a child's slice implement-review round
+// exists whenever the pending arm fires, so neither arm may claim the child has no
+// review of its own: it lacks a plan or review STAGE. next_actions_test.go's table
+// case and TestNextActions_AwaitingParentConsolidationPointsAtParent keep the state,
+// the actions and the parent poll.
+func TestNextActions_DecompositionChildWording(t *testing.T) {
+	const staleClaim = "no plan or review of its own"
+	t.Run("j_1082_succeeded_decomp_child_awaits_parent", func(t *testing.T) {
+		r := naRun("succeeded")
+		parent := uuid.NewString()
+		r.ParentRunID = &parent
+		na := nextActionsFor(r, []Stage{naStage("implement", "succeeded")},
+			nil, naReviewStatus("implement", "pending"), nil, nil, false, false, false, "", "", releaseSignals{})
+		if na.State != "awaiting_parent_consolidation" {
+			t.Fatalf("state = %q", na.State)
+		}
+		poll := findAction(t, na, "fishhawk_get_run_status")
+		if strings.Contains(poll.Precondition, staleClaim) {
+			t.Errorf("precondition still claims %q:\n%s", staleClaim, poll.Precondition)
+		}
+		for _, want := range []string{"no plan or review stage of its own", "slice implement-review round is in flight or orphaned"} {
+			if !strings.Contains(poll.Precondition, want) {
+				t.Errorf("precondition missing %q:\n%s", want, poll.Precondition)
+			}
+		}
+		for _, want := range []string{"late verdict imports into the parent's concern ledger", "fan-in does not wait", "boot sweep re-dispatches or closes"} {
+			if !strings.Contains(poll.Reason, want) {
+				t.Errorf("reason missing %q:\n%s", want, poll.Reason)
+			}
+		}
+	})
+	t.Run("failed_category_b_child", func(t *testing.T) {
+		na := nextActionsFor(naDecompChild(), []Stage{naFailedImplement("B", "scope drift")},
+			nil, nil, nil, nil, false, false, false, "", "", releaseSignals{})
+		if na.State != "implement_failed_category_b_decomposition_child" {
+			t.Fatalf("state = %q", na.State)
+		}
+		resume := findAction(t, na, "fishhawk_resume_run")
+		if strings.Contains(resume.Precondition, staleClaim) {
+			t.Errorf("precondition still claims %q:\n%s", staleClaim, resume.Precondition)
+		}
+		if !strings.Contains(resume.Precondition, "no plan or review stage of its own") {
+			t.Errorf("precondition = %s", resume.Precondition)
+		}
+	})
 }
