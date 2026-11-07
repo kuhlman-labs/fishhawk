@@ -4,6 +4,7 @@ import (
 	"context"
 	"net/http"
 	"sort"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -19,6 +20,18 @@ import (
 // predicate (redispatchEligibility in review_redispatch.go, E72.59 / #4077)
 // rather than re-deriving either. Long-form contract:
 // backend/internal/server/README.md § "Restart blockers".
+//
+// Terminal-run discovery (ADR-140 D2-D5, #5047). A review started while its run
+// was reporting a terminal state is on no state page, so the route also reads the
+// newest started rows per review kind. Per-request read bound: two ListAll calls of
+// at most terminalRoundScanLimit rows each, at most one memoized GetRun per distinct
+// in-window candidate run, and for each visible terminal candidate its discovered
+// stages' round reads; a round that reaches eligibility adds that predicate's own
+// run, parent and stage reads. An expired row costs no GetRun. A row's account column
+// is never evidence of visibility: a run is named only after candidateVisible
+// accepts it, and an unloadable candidate answers one generic 503 carrying no
+// identifier. Rounds whose budget outlives the 24-hour lookback, and rows past the
+// cap, are stated residuals; truncated reports the cap.
 
 // restartBlockersRunScanLimit bounds the non-terminal runs scanned per
 // request (pending + running combined). A bite sets truncated=true.
@@ -39,7 +52,8 @@ const (
 	// sweep would NOT re-dispatch (redispatchEligibility says no), or an
 	// orphaned round this process's boot sweep has handed to a re-dispatch
 	// that has not settled yet (#4077). An eligible current-process round is
-	// not a blocker: the next boot re-dispatches it.
+	// not a blocker: the next boot re-dispatches it. Nor is a proven no-consumer
+	// round (run_terminal, ADR-140 D2): no verdict could be used.
 	restartBlockerReviewInFlight = "review_in_flight"
 	// restartBlockerCheckFailed: a per-run stage, parent-run or audit read
 	// failed, so the daemon could not decide that run's state. scripts/dev treats it as a
@@ -70,7 +84,9 @@ type restartBlockersResponse struct {
 	Items       []restartBlocker `json:"items"`
 	ScannedRuns int              `json:"scanned_runs"`
 	// Truncated is true when the candidate-run scan hit
-	// restartBlockersRunScanLimit, so runs past the cap were not checked.
+	// restartBlockersRunScanLimit, so runs past the cap were not checked, or when
+	// a terminal-run audit page reached its cap inside the discovery lookback, so
+	// rounds past that cap were not checked.
 	Truncated bool `json:"truncated"`
 }
 
@@ -107,7 +123,9 @@ type parentLookup struct {
 // Identity.AccountID bounds the run scan, and the repo-visibility filter drops
 // runs the caller cannot read, failing the whole request CLOSED (503) on a
 // filter fault. The items expose only run ids, enum slugs and counts — a
-// subset of what anonymous GET /v0/runs and /v0/runs/{id}/stages serve.
+// subset of what anonymous GET /v0/runs and /v0/runs/{id}/stages serve. Terminal
+// discovery keeps that posture (ADR-140 D5): an anonymous caller with no account
+// filter sees qualifying terminal rounds across accounts, with no added field.
 func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "run_repo_unconfigured",
@@ -157,7 +175,9 @@ func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Reques
 		return
 	}
 	parents := map[uuid.UUID]parentLookup{}
+	stateScanned := make(map[uuid.UUID]struct{}, len(candidates))
 	for _, ru := range candidates {
+		stateScanned[ru.ID] = struct{}{}
 		allowed, ferr := filter.allows(ctx, ru.Repo)
 		if ferr != nil {
 			s.writeRepoFilterUnavailable(w, r)
@@ -168,6 +188,9 @@ func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Reques
 		}
 		resp.ScannedRuns++
 		resp.Items = append(resp.Items, s.runRestartBlockers(ctx, ru, parents)...)
+	}
+	if !s.appendTerminalRunBlockers(w, r, &resp, filter, accountFilter, stateScanned) {
+		return
 	}
 
 	sort.SliceStable(resp.Items, func(i, j int) bool {
@@ -181,6 +204,98 @@ func (s *Server) handleListRestartBlockers(w http.ResponseWriter, r *http.Reques
 		return a.Stage < b.Stage
 	})
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// appendTerminalRunBlockers adds what terminal-run discovery finds (ADR-140 D3-D5).
+// Audit discovery is candidate discovery only: a run that the state scan already
+// listed is that scan's, a non-terminal run is too, and a terminal run contributes
+// only after candidateVisible accepts it, so no parent is read for an invisible run.
+// Checks (a) and (c) of runRestartBlockers stay non-terminal-only. false means an
+// error was written: a list or candidate read failure is one generic 503 and the
+// partial response is discarded.
+func (s *Server) appendTerminalRunBlockers(w http.ResponseWriter, r *http.Request, resp *restartBlockersResponse, filter *repoFilter, accountFilter string, stateScanned map[uuid.UUID]struct{}) bool {
+	ctx := r.Context()
+	window := func(configured int) time.Duration {
+		return min(s.planReviewBackstop(configured), terminalRoundDiscoveryBound)
+	}
+	scan, err := s.discoverTerminalRunRounds(ctx, accountFilter, window)
+	if err != nil {
+		s.writeRestartBlockersUnavailable(w, r, err)
+		return false
+	}
+	if scan.truncated {
+		resp.Truncated = true
+	}
+	// admitted memoizes one GetRun per distinct run; nil means skipped.
+	admitted := map[uuid.UUID]*run.Run{}
+	for _, candidate := range scan.candidates {
+		if _, owned := stateScanned[candidate.runID]; owned {
+			continue
+		}
+		ru, seen := admitted[candidate.runID]
+		if !seen {
+			loaded, err := s.cfg.RunRepo.GetRun(ctx, candidate.runID)
+			if err != nil {
+				s.writeRestartBlockersUnavailable(w, r, err)
+				return false
+			}
+			if loaded.State.IsTerminal() {
+				visible, verr := candidateVisible(ctx, filter, accountFilter, loaded)
+				if verr != nil {
+					s.writeRepoFilterUnavailable(w, r)
+					return false
+				}
+				if visible {
+					ru = loaded
+					resp.ScannedRuns++
+				}
+			}
+			admitted[candidate.runID] = ru
+		}
+		if ru == nil {
+			continue
+		}
+		if blocker := s.reviewRoundBlocker(ctx, ru, candidate.stage, window); blocker != nil {
+			resp.Items = append(resp.Items, *blocker)
+		}
+	}
+	return true
+}
+
+// writeRestartBlockersUnavailable is the single generic 503 for a scan that could
+// not decide (ADR-140 D5, D7). A candidate's identity and the raw error stay out of
+// the body; the cause reaches only the server log. scripts/dev refuses on it.
+func (s *Server) writeRestartBlockersUnavailable(w http.ResponseWriter, r *http.Request, cause error) {
+	s.writeError(w, r, http.StatusServiceUnavailable, "service_unavailable",
+		"could not complete the restart-blocker scan; retry shortly",
+		map[string]any{internalCauseKey: cause.Error()})
+}
+
+// candidateVisible is the visibility a discovered run must pass before anything may
+// name it (ADR-140 D5): the same account window and repository filter the state scan
+// applies. The audit row's own account is not consulted, because a NULL-account row
+// is never evidence of its run's visibility. An error is a filter fault.
+func candidateVisible(ctx context.Context, filter *repoFilter, accountFilter string, ru *run.Run) (bool, error) {
+	if !accountWindowAdmits(accountFilter, ru.AccountID) {
+		return false, nil
+	}
+	return filter.allows(ctx, ru.Repo)
+}
+
+// accountWindowAdmits mirrors ListRuns' account clause, since a discovered run never
+// passed through that query: an empty or malformed filter is no constraint, an equal
+// account admits and a NULL (untenanted) run account admits. An unparseable run
+// account matches nothing.
+func accountWindowAdmits(accountFilter, runAccount string) bool {
+	want, err := uuid.Parse(accountFilter)
+	if err != nil {
+		return true
+	}
+	if runAccount == "" {
+		return true
+	}
+	got, err := uuid.Parse(runAccount)
+	return err == nil && got == want
 }
 
 // runRestartBlockers derives every blocker one non-terminal run contributes.
@@ -240,59 +355,9 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run, parents ma
 	// own redispatchEligibility, so this surface and the boot sweep cannot
 	// disagree about which rounds survive a restart (#4077).
 	for _, stage := range orphanedReviewStages {
-		latest, payload, found, err := s.latestReviewStarted(ctx, ru.ID, stage)
-		if err != nil {
-			out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerCheckFailed, Stage: stage.label})
-			continue
+		if blocker := s.reviewRoundBlocker(ctx, ru, stage, nil); blocker != nil {
+			out = append(out, *blocker)
 		}
-		if !found {
-			continue
-		}
-		landed, err := s.countLandedReviewTerminals(ctx, ru.ID, stage, latest.Sequence)
-		if err != nil {
-			out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerCheckFailed, Stage: stage.label})
-			continue
-		}
-		// Settled — or never pending: a round with no configured reviewer
-		// (ConfiguredAgents <= 0) is settled at zero verdicts.
-		if landed >= payload.ConfiguredAgents {
-			continue
-		}
-		configured := payload.ConfiguredAgents
-		inFlight := restartBlocker{
-			RunID:            runID,
-			Reason:           restartBlockerReviewInFlight,
-			Stage:            stage.label,
-			ConfiguredAgents: &configured,
-			Landed:           &landed,
-		}
-		// A boot re-dispatch mid-handoff: the orphaned round predates this
-		// process, so it is checked BEFORE the boot-marker skip. A restart
-		// kills the re-dispatch goroutine, and the next boot finds the round
-		// already named by its review_round_redispatched entry, so it closes
-		// the round failed instead of re-dispatching it again.
-		if reviewRedispatchPending(ru.ID, stage.label, latest.Sequence) {
-			out = append(out, inFlight)
-			continue
-		}
-		// A round dispatched BEFORE this process booted is not a blocker: its
-		// goroutine is already dead and this process's boot sweep either
-		// re-dispatched it (the pending check above) or closed it, so a
-		// restart loses nothing more.
-		if latest.Timestamp.Before(s.processStart) {
-			continue
-		}
-		eligible, _, err := s.redispatchEligibility(ctx, ru.ID, stage, latest, payload)
-		if err != nil {
-			out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerCheckFailed, Stage: stage.label})
-			continue
-		}
-		// The next boot sweep re-dispatches an eligible round against the
-		// same plan or head, so a restart loses nothing.
-		if eligible {
-			continue
-		}
-		out = append(out, inFlight)
 	}
 
 	// (c) A head-of-line merge-queue merge THIS process has in flight
@@ -302,6 +367,72 @@ func (s *Server) runRestartBlockers(ctx context.Context, ru *run.Run, parents ma
 		out = append(out, restartBlocker{RunID: runID, Reason: restartBlockerMergeInFlight, Stage: restartBlockerStageMerge})
 	}
 	return out
+}
+
+// reviewRoundBlocker is check (b) for one review stage: the blocker a restart would
+// lose on that stage's ACTUAL latest round, or nil. A nil window is the state scan,
+// which bounds nothing; terminal discovery passes the round's own window, so a settled
+// or younger sibling that made the run a candidate cannot admit an expired round. A
+// proven no-consumer round (run_terminal) is omitted, because no verdict could be used
+// (ADR-140 D1, D2). Every other refusal keeps blocking.
+func (s *Server) reviewRoundBlocker(ctx context.Context, ru *run.Run, stage orphanedReviewStageKind, window func(configured int) time.Duration) *restartBlocker {
+	runID := ru.ID.String()
+	checkFailed := &restartBlocker{RunID: runID, Reason: restartBlockerCheckFailed, Stage: stage.label}
+	latest, payload, found, err := s.latestReviewStarted(ctx, ru.ID, stage)
+	if err != nil {
+		return checkFailed
+	}
+	if !found {
+		return nil
+	}
+	landed, err := s.countLandedReviewTerminals(ctx, ru.ID, stage, latest.Sequence)
+	if err != nil {
+		return checkFailed
+	}
+	// Settled — or never pending: a round with no configured reviewer
+	// (ConfiguredAgents <= 0) is settled at zero verdicts.
+	if landed >= payload.ConfiguredAgents {
+		return nil
+	}
+	configured := payload.ConfiguredAgents
+	inFlight := &restartBlocker{
+		RunID:            runID,
+		Reason:           restartBlockerReviewInFlight,
+		Stage:            stage.label,
+		ConfiguredAgents: &configured,
+		Landed:           &landed,
+	}
+	// A boot re-dispatch mid-handoff: the orphaned round predates this
+	// process, so it is checked BEFORE the boot-marker skip. A restart
+	// kills the re-dispatch goroutine, and the next boot finds the round
+	// already named by its review_round_redispatched entry, so it closes
+	// the round failed instead of re-dispatching it again.
+	if reviewRedispatchPending(ru.ID, stage.label, latest.Sequence) {
+		return inFlight
+	}
+	// A round dispatched BEFORE this process booted is not a blocker: its
+	// goroutine is already dead and this process's boot sweep either
+	// re-dispatched it (the pending check above) or closed it, so a
+	// restart loses nothing more.
+	if latest.Timestamp.Before(s.processStart) {
+		return nil
+	}
+	if window != nil && !reviewRoundInWindow(time.Now(), ru.ID, stage, latest.Sequence, latest.Timestamp, window(payload.ConfiguredAgents)) {
+		return nil
+	}
+	eligible, slug, err := s.redispatchEligibility(ctx, ru.ID, stage, latest, payload)
+	if err != nil {
+		return checkFailed
+	}
+	// The next boot sweep re-dispatches an eligible round against the
+	// same plan or head, so a restart loses nothing.
+	if eligible {
+		return nil
+	}
+	if slug == redispatchSlugRunTerminal {
+		return nil
+	}
+	return inFlight
 }
 
 // restartBlockerParent resolves a decomposition parent's state through the
