@@ -919,6 +919,12 @@ type GateView struct {
 	// gateViewFanInConflict; TestFanInConflict_WireShape pins them against a
 	// REAL server.
 	FanInConflict *gateViewFanInConflict `json:"fan_in_conflict,omitempty" jsonschema:"a decomposed parent's unresolved fan-in conflict: kind base_fold_conflict (the consolidated head is clean but behind base_ref; at merge fishhawk_rebase_run_branch starts the bounded conflict-resolution pass, no manual resolution) or slice_conflict (a slice failed to merge and failed implement category B; restart with fishhawk_start_run or fishhawk_start_campaign_item_run, never fishhawk_resume_run on the succeeded child), with the attributed slice, child and conflicting_base_paths and the remedy; absent when there is none or the read failed (a fan_in history_gaps entry)"`
+	// SliceReviewsLost mirrors the backend's slice_reviews_lost block (ADR-140 D6,
+	// #5047): each succeeded slice child whose latest implement-review round is
+	// lost, with the action only when it was verified at read time. A read failure
+	// is a slice_reviews history_gaps entry. The json tags MUST byte-match the
+	// backend's gateViewSliceReviewLost; TestSliceReviewsLost_WireShape pins them.
+	SliceReviewsLost []gateViewSliceReviewLost `json:"slice_reviews_lost,omitempty" jsonschema:"each succeeded slice child of a decomposed parent whose latest implement-review round is lost: reason review_round_no_verdict, no_review_round or review_round_stale (unsettled past its budget), with rerun_eligibility eligible, ineligible or unknown, rerun_refusal naming the slug the re-run verb answers and next_step only when verified at read time (fishhawk_rerun_review, fishhawk_reconcile_reviews). A later input loss can still draw the verb's 502. Never a merge clearance: the review_coverage_incomplete hold still applies; absent when none is lost or the read failed (a slice_reviews history_gaps entry)"`
 	// MergeCandidateStaleness mirrors the backend's gate-view
 	// merge_candidate_staleness block (E85.4 / #4147) — the same projection
 	// Run.MergeCandidateStaleness carries. Omitted (nil) when the run is not
@@ -958,6 +964,20 @@ type scopeOverlapRun struct {
 	Stage          string   `json:"stage,omitempty" jsonschema:"the overlapping run's current stage: the lowest-sequence non-terminal stage, else its last"`
 	StageState     string   `json:"stage_state,omitempty" jsonschema:"that stage's state"`
 	Paths          []string `json:"paths" jsonschema:"the shared exact paths, sorted"`
+}
+
+// gateViewSliceReviewLost mirrors the backend's gateViewSliceReviewLost
+// (backend/internal/server/gateview.go, ADR-140 D6, #5047). UNEXPORTED, like
+// gateViewFanInConflict, so the package's export baseline is unchanged.
+type gateViewSliceReviewLost struct {
+	ChildRunID       string `json:"child_run_id" jsonschema:"the slice child whose round is lost"`
+	SliceIndex       *int   `json:"slice_index,omitempty" jsonschema:"the slice index; absent on an unindexed child"`
+	RoundSequence    int64  `json:"round_sequence" jsonschema:"audit sequence of the child's latest implement_review_started; 0 when it has none"`
+	Reason           string `json:"reason" jsonschema:"review_round_no_verdict, no_review_round or review_round_stale"`
+	Authority        string `json:"authority,omitempty" jsonschema:"the round's recorded review authority; absent with no round"`
+	RerunEligibility string `json:"rerun_eligibility,omitempty" jsonschema:"eligible, ineligible or unknown (a read failed; never an action)"`
+	RerunRefusal     string `json:"rerun_refusal,omitempty" jsonschema:"the slug fishhawk_rerun_review answers for this round"`
+	NextStep         string `json:"next_step,omitempty" jsonschema:"the verb verified at read time: fishhawk_rerun_review or fishhawk_reconcile_reviews; absent when none is"`
 }
 
 // gateViewFanInConflict mirrors the backend's gateViewFanInConflict

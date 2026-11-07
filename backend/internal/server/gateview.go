@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"net/http"
+	"slices"
 	"sort"
 	"strings"
 	"time"
@@ -17,8 +18,10 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/issuecomment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/prompt"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/spec"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
 )
 
@@ -213,6 +216,19 @@ type gateViewResponse struct {
 	// the chain-head read fails, so an unreadable state is never shown as
 	// fresh. See mergeCandidateStalenessFor.
 	MergeCandidateStaleness *mergeCandidateStalenessPayload `json:"merge_candidate_staleness,omitempty"`
+	// SliceReviewsLost names each SUCCEEDED slice child of a decomposed parent
+	// whose latest implement-review round is lost (ADR-140 D6, #5047): the round
+	// settled with no verdict, the child has no round, or the round is still
+	// unsettled past its review budget. A read-time projection: the coverage hold
+	// (review_coverage_incomplete) is unchanged and independent of it. An action
+	// is advertised only when the verb's own ladder passed and the round's
+	// recorded inputs loaded and parsed at read time; a later loss can still draw
+	// the verb's 502. Computed only by handleGetRunGateView. Omitted (nil) when
+	// no slice review is lost or the coverage guards do not apply; omitted with a
+	// slice_reviews history_gaps entry when a coverage read fails, and an entry
+	// whose recovery read fails reports rerun_eligibility unknown with the same
+	// gap. See sliceReviewsLostForRun.
+	SliceReviewsLost []gateViewSliceReviewLost `json:"slice_reviews_lost,omitempty"`
 }
 
 // gateViewFanInConflict is the gate view's fan_in_conflict block (#4343).
@@ -1295,7 +1311,245 @@ func (s *Server) handleGetRunGateView(w http.ResponseWriter, r *http.Request) {
 	// scan the attention scan must not pay per run. Omitted for a run-bound
 	// caller and on a compute error.
 	resp.ScopeOverlap = s.gateViewScopeOverlapFor(r.Context(), runRow)
+	// HERE and not in buildGateView (ADR-140 D6): per-child audit reads plus a
+	// trace bundle read per zero-verdict round, which the attention scan must
+	// not pay per run.
+	resp.SliceReviewsLost = s.sliceReviewsLostForRun(r.Context(), runRow, &resp)
 	s.writeJSON(w, r, http.StatusOK, resp)
+}
+
+// gateViewGapSliceReviews is the history_gaps entry the slice_reviews_lost block
+// records when a coverage or recovery read fails.
+const gateViewGapSliceReviews = "slice_reviews"
+
+// reviewCoverageNextReconcile is the next_step of a stale prior-process round:
+// fishhawk_reconcile_reviews (POST /v0/runs/{run_id}/reviews/reconcile) closes
+// it, after which the re-run verb can take it.
+const reviewCoverageNextReconcile = "fishhawk_reconcile_reviews"
+
+// sliceReviewReasonStale is the slice_reviews_lost reason of a round still
+// unsettled past planReviewBackstop.
+const sliceReviewReasonStale = "review_round_stale"
+
+// The slice_reviews_lost rerun_eligibility values.
+const (
+	sliceRerunEligible   = "eligible"
+	sliceRerunIneligible = "ineligible"
+	sliceRerunUnknown    = "unknown"
+)
+
+// gateViewSliceReviewLost is one slice_reviews_lost entry. RerunRefusal names
+// the slug POST /v0/runs/{child}/reviews/rerun answers for the round (or
+// no_review_round, or the in-flight reason it carries); NextStep is omitted
+// whenever no verb is proven to act on the round at read time.
+type gateViewSliceReviewLost struct {
+	ChildRunID       string `json:"child_run_id"`
+	SliceIndex       *int   `json:"slice_index,omitempty"`
+	RoundSequence    int64  `json:"round_sequence"`
+	Reason           string `json:"reason"`
+	Authority        string `json:"authority,omitempty"`
+	RerunEligibility string `json:"rerun_eligibility,omitempty"`
+	RerunRefusal     string `json:"rerun_refusal,omitempty"`
+	NextStep         string `json:"next_step,omitempty"`
+}
+
+// sliceCoverageGap is one succeeded child no verdict covers: the reduction
+// reviewCoverageRefusal's uncovered_slices loop makes.
+type sliceCoverageGap struct {
+	child    *run.Run
+	coverage implementRoundCoverage
+	reason   string
+}
+
+// sliceCoverageGaps reads each SUCCEEDED child's latest implement round and
+// returns those carrying no verdict, in slice order, with the same reason
+// constants the coverage refusal uses. Coverage itself stays with
+// reviewCoverageRefusal; TestSliceCoverageGaps_Reasons compares the two on every
+// fixture so this reader cannot drift from it. Any read error is returned.
+func (s *Server) sliceCoverageGaps(ctx context.Context, children []*run.Run) ([]sliceCoverageGap, error) {
+	ordered := append([]*run.Run(nil), children...)
+	sort.SliceStable(ordered, func(i, j int) bool {
+		return sliceOrderKey(ordered[i]) < sliceOrderKey(ordered[j])
+	})
+	var gaps []sliceCoverageGap
+	for _, ch := range ordered {
+		if ch.State != run.StateSucceeded {
+			continue
+		}
+		cov, err := s.latestImplementRoundCoverage(ctx, ch)
+		if err != nil {
+			return nil, err
+		}
+		if cov.Verdicts > 0 {
+			continue
+		}
+		reason := reviewCoverageReasonNoVerdict
+		switch {
+		case !cov.Started:
+			reason = reviewCoverageReasonNoRound
+		case cov.inFlight():
+			reason = reviewCoverageReasonInFlight
+		}
+		gaps = append(gaps, sliceCoverageGap{child: ch, coverage: cov, reason: reason})
+	}
+	return gaps, nil
+}
+
+// sliceReviewsLostForRun builds the slice_reviews_lost block (ADR-140 D6, #5047),
+// under reviewCoverageRefusal's applicability guards. A coverage read failure
+// omits the block and records the gap: a partial read is never shown as "no
+// slice review was lost". A round in flight inside its budget is not lost and is
+// omitted.
+func (s *Server) sliceReviewsLostForRun(ctx context.Context, runRow *run.Run, resp *gateViewResponse) []gateViewSliceReviewLost {
+	if s.cfg.AuditRepo == nil || s.cfg.RunRepo == nil || runRow == nil || runRow.DecomposedFrom != nil {
+		return nil
+	}
+	if s.defaultPlanReviewer() == nil {
+		return nil
+	}
+	cfg := s.resolveStageReviewers(ctx, runRow, spec.StageTypeImplement)
+	if cfg == nil || cfg.AgentCount() == 0 {
+		return nil
+	}
+	gap := func(err error) {
+		s.cfg.Logger.Warn("gate view: slice review read failed", "run_id", runRow.ID.String(), "error", err.Error())
+		resp.HistoryIncomplete = true
+		if !slices.Contains(resp.HistoryGaps, gateViewGapSliceReviews) {
+			resp.HistoryGaps = append(resp.HistoryGaps, gateViewGapSliceReviews)
+		}
+	}
+	children, err := s.listAllDecomposedChildren(ctx, runRow.ID)
+	if err != nil {
+		gap(fmt.Errorf("list decomposed children: %w", err))
+		return nil
+	}
+	gaps, err := s.sliceCoverageGaps(ctx, children)
+	if err != nil {
+		gap(err)
+		return nil
+	}
+	var lost []gateViewSliceReviewLost
+	for _, g := range gaps {
+		entry, ok, rerr := s.sliceRoundRecovery(ctx, g)
+		if rerr != nil {
+			gap(rerr)
+		}
+		if ok {
+			lost = append(lost, entry)
+		}
+	}
+	return lost
+}
+
+// sliceRoundRecovery reduces one coverage gap to its entry from the ACTUAL latest
+// round, including its start time. ok is false for a round still in flight inside
+// its budget. A returned error means the entry reports rerun_eligibility unknown
+// with no next_step and the caller records the gap; the raw cause never reaches
+// the body.
+//
+// For a settled zero-verdict round it walks the re-run verb's own ladder, then
+// proves the inputs that verb would load. next_step therefore means that at read
+// time the ladder passed and the inputs loaded and parsed; a later loss or a
+// failed compare can still draw 502 review_rerun_not_started with no round
+// started. An interrupted gating round is refused gating_authority here, so the
+// advisory-only verb is never offered for it.
+func (s *Server) sliceRoundRecovery(ctx context.Context, g sliceCoverageGap) (gateViewSliceReviewLost, bool, error) {
+	ch := g.child
+	entry := gateViewSliceReviewLost{ChildRunID: ch.ID.String(), SliceIndex: ch.SliceIndex, RoundSequence: g.coverage.Sequence, Reason: g.reason}
+	unknown := func(err error) (gateViewSliceReviewLost, bool, error) {
+		entry.RerunEligibility = sliceRerunUnknown
+		return entry, true, err
+	}
+	refused := func(slug string) (gateViewSliceReviewLost, bool, error) {
+		entry.RerunEligibility = sliceRerunIneligible
+		entry.RerunRefusal = slug
+		return entry, true, nil
+	}
+	if g.reason == reviewCoverageReasonNoRound {
+		return refused(rerunCodeNoReviewRound)
+	}
+	stage := orphanedReviewStages[1]
+	latest, payload, ok, err := s.latestReviewStarted(ctx, ch.ID, stage)
+	if err != nil {
+		return unknown(err)
+	}
+	if !ok {
+		return unknown(fmt.Errorf("run %s: the implement round disappeared between reads", ch.ID))
+	}
+	entry.RoundSequence = latest.Sequence
+	entry.Authority = string(payload.Authority)
+	handingOff := reviewRedispatchPending(ch.ID, stage.label, latest.Sequence)
+
+	if g.reason == reviewCoverageReasonInFlight {
+		if time.Since(latest.Timestamp) < s.planReviewBackstop(g.coverage.Configured) {
+			return entry, false, nil
+		}
+		entry.Reason = sliceReviewReasonStale
+		// The reconcile verb's own gates: it closes only a round with a
+		// configured count and a stage anchor, predating this process's boot
+		// marker and not mid-handoff to a boot re-dispatch.
+		if payload.ConfiguredAgents > 0 && latest.StageID != nil && latest.Timestamp.Before(s.processStart) && !handingOff {
+			entry.NextStep = reviewCoverageNextReconcile
+		}
+		return refused(rerunInFlightUnsettled)
+	}
+
+	if sliceRerunPending(ch.ID) {
+		return refused(rerunInFlightRerunPending)
+	}
+	if handingOff {
+		return refused(rerunInFlightRedispatching)
+	}
+	slug, err := s.rerunIneligibleSlug(ctx, ch.ID, latest, payload)
+	if err != nil {
+		return unknown(err)
+	}
+	if slug != "" {
+		return refused(slug)
+	}
+	proofSlug, proofErr := s.rerunInputsProofSlug(ctx, ch.ID, *latest.StageID, payload)
+	if proofErr != nil {
+		return unknown(proofErr)
+	}
+	if proofSlug != "" {
+		return refused(proofSlug)
+	}
+	entry.RerunEligibility = sliceRerunEligible
+	entry.NextStep = reviewCoverageNextRerun
+	return entry, true, nil
+}
+
+// sliceRerunPending reports a re-run of runID between its refusal checks and its
+// dispatch's return, the verb's first in-flight refusal.
+func sliceRerunPending(runID uuid.UUID) bool {
+	pendingRerunMu.Lock()
+	defer pendingRerunMu.Unlock()
+	_, ok := pendingReruns[runID]
+	return ok
+}
+
+// rerunInputsProofSlug makes the calls redispatchImplementRound makes for a trace
+// round, because a configured trace store alone does not establish that the
+// recorded bundle exists and can be decoded (ADR-140 D6): a miss or a parse
+// failure is trace_bundle_unavailable, and a read failure is returned. A compare
+// round (fixup_push, consolidated) needs no proof here: implementRoundRebuildSlug
+// has already established that its base and head are recorded and that a forge
+// compare is wired, and this read makes no forge call.
+func (s *Server) rerunInputsProofSlug(ctx context.Context, runID, stageID uuid.UUID, payload planreview.ReviewStartedPayload) (string, error) {
+	if payload.RoundOrigin != reviewRoundOriginTrace {
+		return "", nil
+	}
+	body, ok, err := s.loadRedactedBundleForHead(ctx, runID, stageID, payload.HeadSHA)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return redispatchSlugTraceBundleUnavail, nil
+	}
+	if _, parsed := implementReviewInputsFromBundle(body); !parsed {
+		return redispatchSlugTraceBundleUnavail, nil
+	}
+	return "", nil
 }
 
 // gateViewSpecialistJobsFor builds the display-only specialist_jobs block

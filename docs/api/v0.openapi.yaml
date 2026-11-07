@@ -3694,7 +3694,21 @@ components:
             the decode of a row it reads, failed (#4343). The merge-candidate
             staleness block adds `merge_candidate_staleness` when the
             decomposition-children list or the chain-head read failed
-            (E85.4 / #4147).
+            (E85.4 / #4147). The slice-reviews block adds `slice_reviews` when
+            a coverage read failed (the block is omitted) or a recovery read
+            failed (that entry reports `rerun_eligibility: unknown`), ADR-140 D6
+            (#5047).
+        slice_reviews_lost:
+          type: array
+          items: { $ref: '#/components/schemas/GateViewSliceReviewLost' }
+          description: |
+            Each SUCCEEDED slice child of a decomposed parent whose latest
+            implement-review round is lost (ADR-140 D6, #5047). A read-time
+            projection computed on this endpoint only, under the review-coverage
+            refusal's applicability guards. The `review_coverage_incomplete` hold
+            is unchanged and independent of it. A round in flight inside its
+            budget is omitted. Omitted when no slice review is lost; omitted with
+            a `slice_reviews` `history_gaps` entry when a coverage read fails.
         live_validation:
           $ref: '#/components/schemas/LiveValidation'
         review_diff_truncated:
@@ -4154,6 +4168,45 @@ components:
           description: Their median, rounded to the second (the mean of the middle two for an even count); omitted with no samples.
         note: { type: string, description: A constant sentence stating the basis. }
 
+    GateViewSliceReviewLost:
+      type: object
+      description: |
+        One lost slice review (ADR-140 D6, #5047). `next_step` is advertised only
+        when, at read time, the verb's own ladder passed and the round's recorded
+        inputs loaded and parsed. That is point-in-time: a later input loss or a
+        failed compare can still draw `502 review_rerun_not_started` with no
+        round started. An interrupted gating round is never offered the
+        advisory-only re-run verb, and no gating-recovery verb exists here.
+      required: [child_run_id, round_sequence, reason]
+      properties:
+        child_run_id: { type: string, format: uuid }
+        slice_index: { type: integer, description: 'Absent on an unindexed child.' }
+        round_sequence:
+          type: integer
+          format: int64
+          description: Audit sequence of the child's latest `implement_review_started`; 0 when it has none.
+        reason:
+          type: string
+          enum: [review_round_no_verdict, no_review_round, review_round_stale]
+          description: |
+            `review_round_no_verdict`: the round settled with no verdict.
+            `no_review_round`: the child has no round. `review_round_stale`:
+            still unsettled past its review budget.
+        authority: { type: string, description: "The round's recorded review authority; absent with no round." }
+        rerun_eligibility:
+          type: string
+          enum: [eligible, ineligible, unknown]
+          description: '`unknown` means a read failed: no `next_step`, a `slice_reviews` gap, and no raw cause in the body.'
+        rerun_refusal:
+          type: string
+          description: The slug `POST /v0/runs/{run_id}/reviews/rerun` answers for this round.
+        next_step:
+          type: string
+          enum: [fishhawk_rerun_review, fishhawk_reconcile_reviews]
+          description: |
+            `fishhawk_rerun_review` for a settled zero-verdict round the verb can
+            take. `fishhawk_reconcile_reviews` for a stale round that predates
+            this process and is not mid-handoff. Absent when neither is verified.
     GateViewFanInConflict:
       type: object
       required: [kind, sequence, conflicting_base_paths, compare_truncated, remedy]
@@ -7815,6 +7868,54 @@ components:
             `scope_files_exempted` audit entry (origin `base_rebase_reinvoke`)
             so the re-invoke exemptions are queryable via the audit endpoint.
             Omitted on the first ship and every non-re-invoke ship.
+        review_obligation:
+          allOf:
+            - $ref: '#/components/schemas/ReviewObligation'
+          description: |
+            Optional on the `failed` and `scope_park` variants (ADR-140 D9,
+            #5047), sent only to a backend that advertised
+            `supports_review_obligation_resume`. A known-required report stores
+            its coordinates under the `review_obligation_checkpoint` audit
+            category, and its `pull_request_failed` sibling carries no
+            `push_checkpoint`, so a reverted backend re-runs the agent. A
+            known-none report adds only this key to its existing carrier. A
+            report whose head, attempt or paths fail validation records no
+            checkpoint of any kind and appends a `verified_tree_discarded` row
+            with reason `review_obligation_invalid`. A `scope_park` carrying a
+            non-empty list omits `base_sha` from the park row and the parked
+            audit payload, keeping the true value only in the payload key
+            `required_review_base_sha`.
+
+    ReviewObligation:
+      type: object
+      description: |
+        A required supplemental review known when a held-commit checkpoint or
+        park was recorded (ADR-140 D9, #5047), bound to the recorded head. The
+        list has three states: an absent or null `supplemental_scope_exemptions`
+        is unknown, an empty one is known none and a non-empty one is known
+        required. Known-none is runner-attested under the ordinary upload path's
+        trust boundary (#5078).
+      required: [head_sha, stage_attempt]
+      properties:
+        head_sha:
+          type: string
+          description: The head the obligation is bound to.
+        stage_attempt:
+          type: string
+          description: The stage attempt token the obligation was recorded on.
+        supplemental_scope_exemptions:
+          type: [array, 'null']
+          items:
+            type: object
+            required: [path, reason]
+            properties:
+              path:
+                type: string
+                description: A declared `scope.files` path left unchanged.
+              reason:
+                type: string
+                description: Why the path correctly needs no change.
+          description: The paths a required supplemental review must judge. See the three states above.
 
     PullRequestUploadResponse:
       type: object
@@ -8520,10 +8621,18 @@ components:
           items: { $ref: '#/components/schemas/RestartBlocker' }
         scanned_runs:
           type: integer
-          description: Non-terminal runs examined after account and repo narrowing.
+          description: |
+            Runs examined after account and repo narrowing: the non-terminal
+            runs, plus each visible terminal run with a discovered review round
+            inside its window, each counted once. Per request the discovery adds
+            two audit pages of at most 500 rows, at most one read per distinct
+            in-window candidate run, and that run's round reads.
         truncated:
           type: boolean
-          description: The candidate-run scan hit its 500-run cap; runs past it were not checked.
+          description: |
+            A scan cap was reached: the 500-run page, or a 500-row audit page
+            whose oldest row is still inside the 24-hour lookback. Runs and
+            rounds past the cap were not checked.
     RestartBlocker:
       type: object
       required: [run_id, reason, stage]
@@ -17966,7 +18075,9 @@ paths:
         **Refusals, in order, each decided before anything is written.**
         `409 no_review_round` (no `implement_review_started` and not a
         decomposed parent — a parent takes the first-round path above);
-        `409 review_round_in_flight` (`details.reason`: `rerun_pending` — a
+        `409 review_round_in_flight` on this route (`POST
+        /v0/runs/{run_id}/pull-request` has its own `503` under the same code,
+        see that route; `details.reason`: `rerun_pending` — a
         re-run of this run is already in progress in this process;
         `boot_redispatch_pending` — the round is mid-handoff to a boot
         re-dispatch; `round_unsettled` — not every configured reviewer has
@@ -19658,6 +19769,19 @@ paths:
         scanned; a bite sets `truncated: true` and the runs past the cap were
         not checked.
 
+        **Terminal-run discovery (ADR-140 D3-D5, #5047).** A review started
+        while its run was reporting a terminal state is on no state page, so the
+        scan also reads the newest 500 `plan_review_started` and
+        `implement_review_started` rows per request. A candidate's window is its
+        review budget times its own configured reviewers, never more than 24
+        hours, judged on the round's actual latest row; a round whose budget
+        outlives that lookback is a stated residual. A cap reached with its
+        oldest row inside the lookback sets `truncated`. A run with no possible
+        verdict consumer (`run_terminal`: a cancelled run, or a succeeded
+        decomposition child whose parent is terminal, a failed parent included)
+        reports no item. A failed run keeps the existing checks because it can
+        be revived.
+
         **Auth and narrowing.** Mirrors `GET /v0/runs`: anonymous callers are
         accepted (no scope check — `scripts/dev` calls it with no token), the
         caller's workspace account bounds the scan, and for a non-admin
@@ -19665,7 +19789,13 @@ paths:
         read at the forge (ADR-057 Amendment A2 / #2071). It exposes nothing
         beyond what anonymous `GET /v0/runs` and `GET /v0/runs/{run_id}/stages`
         already serve. A repo-visibility fault fails the WHOLE request closed
-        (503).
+        (503). Audit discovery is candidate discovery only: a run is named only
+        after the run visibility checks pass, and a NULL-account audit row is
+        never evidence of visibility. The existing anonymous posture has a
+        stated cost: an anonymous caller with no account filter sees the run ids
+        and stages of other accounts' qualifying terminal rounds inside the
+        lookback, with no added fields. The route is not load-hardened
+        (#5057, #5058).
       tags: [runs]
       responses:
         '200':
@@ -19683,7 +19813,12 @@ paths:
             `run_repo_unconfigured` / `audit_repo_unconfigured` — the run or
             audit repository is not configured on this instance; or
             `service_unavailable` — repo visibility could not be resolved
-            (#2071), so no partially-narrowed page is returned.
+            (#2071), so no partially-narrowed page is returned. The same
+            `service_unavailable` answers a terminal-run discovery read or a
+            candidate run read that failed (ADR-140 D5, #5047). It carries no
+            candidate identifiers or internal error text, so one unloadable
+            candidate, another tenant's included, can temporarily make the whole
+            request unavailable. `scripts/dev` refuses a restart on this 503.
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
@@ -24818,7 +24953,15 @@ paths:
             `runner_capability_absent`; no tree is recorded for this kind, so
             no `verified_tree_discarded` row is written). A current runner
             sends
-            `push-resume,merge-candidate-verify,child-push-resume,reverify-resume`.
+            `push-resume,merge-candidate-verify,child-push-resume,reverify-resume,review-obligation-resume`.
+            `review-obligation-resume` (ADR-140 D9, #5047) — this runner retains
+            a required supplemental review across a held-commit resume. A
+            non-empty `held_commit_review_obligation` served to a request
+            WITHOUT it is totally declined: no held-commit fields, and a
+            `verified_tree_discarded` row with reason
+            `runner_review_obligation_capability_absent`. A known-none
+            obligation is still served. The token is advisory: it is not proof
+            that a reporting client implements the contract honestly.
       responses:
         '200':
           description: Constructed prompt for the stage.
@@ -25400,6 +25543,19 @@ paths:
                       report) ONLY when it saw this, so against an older
                       backend the failure-report body is byte-identical to the
                       pre-#3621 shape.
+                  supports_review_obligation_resume:
+                    type: boolean
+                    description: |
+                      The BACKEND half of the ADR-140 D9 (#5047) capability
+                      handshake, `true` on every implement-stage response from
+                      a build that retains a required supplemental review across
+                      a held-commit resume. The runner sets `review_obligation`
+                      on a report only when it saw this. A runner that sees no
+                      flag, or no recorded list, proves nothing and runs the
+                      ordinary agent pass for a standalone `pr_open`, `push` or
+                      exempt resume; reverify and child kinds proceed.
+                  held_commit_review_obligation:
+                    $ref: '#/components/schemas/ReviewObligation'
                   held_commit_pr_title:
                     type: string
                     description: |
@@ -25864,6 +26020,11 @@ paths:
                   supports_push_resume:
                     type: boolean
                     description: The BACKEND half of the E45.86 / #3621 capability handshake, `true` on every implement-stage response from a build that understands `held_commit_resume_kind: push`. It describes the build, not a per-run decision.
+                  supports_review_obligation_resume:
+                    type: boolean
+                    description: The BACKEND half of the ADR-140 D9 (#5047) capability handshake, `true` on every implement-stage response from a build that retains a required supplemental review across a held-commit resume.
+                  held_commit_review_obligation:
+                    $ref: '#/components/schemas/ReviewObligation'
                   held_commit_pr_title:
                     type: string
                     description: |
@@ -30188,6 +30349,22 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `review_round_interrupted`: a byte-identical retry reached a process
+            after the stage's gating review round was lost (ADR-140 D8, #5047).
+            Nothing advances and no reviewer runs; recovery is a stage retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `review_round_interrupted`: this daemon is shutting down and stopped
+            the stage's gating review round. No terminal verdict is recorded and
+            nothing advances (ADR-140 D8, #5047).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
 
   /v0/runs/{run_id}/plan:
     post:
@@ -30358,6 +30535,23 @@ paths:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }
         '404': { $ref: '#/components/responses/NotFound' }
+        '409':
+          description: |
+            `review_round_interrupted`: a byte-identical retry reached a process
+            after the plan stage's gating review round was lost (ADR-140 D8,
+            #5047). Nothing advances and no reviewer runs; recovery is a stage
+            retry.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `review_round_interrupted`: this daemon is shutting down and stopped
+            the plan stage's gating review round. No terminal verdict is recorded
+            and nothing advances (ADR-140 D8, #5047).
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
         '413':
           description: Body exceeds the per-stage size cap (256 KiB).
           content:
@@ -30486,6 +30680,60 @@ paths:
             report arrived for a stage with no live (unconsumed, fully
             populated) merge-candidate verify trigger, so it cannot be bound to
             a head. Nothing is recorded.
+
+            `review_round_interrupted` (ADR-140 D8, #5047): this upload's
+            required supplemental gating pass was lost on this process or a prior
+            one, was started on this attempt without its full verdict set, or its
+            owner passed its deadline. No stage edge, close, status comment,
+            board change or Advance; an artifact already created stays and proves
+            nothing. No same-attempt pass is re-dispatched; recovery is a stage
+            retry, which runs one pass on the new attempt.
+
+            `review_obligation_missing` (ADR-140 D9, #5047): this head has a
+            recorded required supplemental review with no completed pass and the
+            upload omits a recorded path, or a claimed outcome variant is not
+            proved by recorded server evidence and a binding reject or unmet
+            obligation stands. `details` carry `run_id`, `stage_id`,
+            `missing_count` and, on a variant, `outcome`. Recording or opening a
+            pull request is never evidence that the review completed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '500':
+          description: |
+            `internal_error` with a static message: a required supplemental
+            pass's evidence could not be read or written, or a guarded terminal
+            edge failed (ADR-140 D8, #5047). No reviewer runs when the start
+            cannot be proved, and an exhausted verdict write, approve or reject,
+            takes no successful or failed edge, close, status comment, board
+            change or Advance. A replay decides from the rows that landed.
+          content:
+            application/json:
+              schema: { $ref: '#/components/schemas/Error' }
+        '503':
+          description: |
+            `review_round_interrupted`: this daemon is shutting down and stopped
+            this upload's required supplemental gating pass. Carries no
+            continuation headers; nothing advances (ADR-140 D8, #5047).
+
+            `review_round_in_flight` on `POST /v0/runs/{run_id}/pull-request`
+            (distinct from the existing `409` on `POST
+            /v0/runs/{run_id}/reviews/rerun`): a retry reached this process while
+            the original required pass is proven live, so the duplicate moves
+            nothing. It carries `Retry-After` and
+            `X-Fishhawk-Review-Pass-Remaining-Seconds`. A current runner re-posts
+            the same signed bytes after `Retry-After`, within a bound fixed at
+            the first such response (remaining plus 30 seconds). A runner
+            predating it keeps its ordinary retry budget and can exhaust while the
+            pass is live, which fails closed. This is not an unlimited wait
+            guarantee. `details` carry `run_id`, `stage_id` and `stage`.
+          headers:
+            Retry-After:
+              description: Delay seconds, on `review_round_in_flight` only.
+              schema: { type: integer, minimum: 1 }
+            X-Fishhawk-Review-Pass-Remaining-Seconds:
+              description: Seconds left on the owner's lifetime, on `review_round_in_flight` only.
+              schema: { type: integer, minimum: 1 }
           content:
             application/json:
               schema: { $ref: '#/components/schemas/Error' }

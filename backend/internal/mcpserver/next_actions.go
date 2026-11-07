@@ -943,26 +943,30 @@ func classifyNextActions(run *Run, stages []Stage, planReviewStatus, implementRe
 	if run.State == "succeeded" {
 		if implReviewPending {
 			// A succeeded DECOMPOSITION CHILD (#1082): the run reports
-			// succeeded while its own implement review is still pending
-			// because the PARENT owns review under #1061 — the child pushes
-			// to the shared parent branch and never merges or gets reviewed
-			// individually. This is NOT the #968 wedge (which is a top-level
-			// run that must merge), so the merge_and_file_follow_up framing is
-			// wrong here. Detect the orchestrator's minted-child shape — the
-			// SAME predicate implementFailedNextActions uses for a category-B
-			// child: a parent_run_id plus an implement stage but NO plan or
-			// review stage of its own (a CI-retry child carries a review stage
-			// and is excluded by the review == nil clause). Point the operator
-			// at the parent run instead of a non-existent per-child PR.
+			// succeeded while its slice implement-review round is in flight or
+			// orphaned. implReviewPending means a *_review_started row exists,
+			// so the child does have a review round; what it lacks is a plan or
+			// review STAGE. The child pushes to the shared parent branch and
+			// never merges individually: a late verdict imports into the parent's
+			// concern ledger, fan-in does not wait on it, and the boot sweep
+			// re-dispatches or closes a round a restart orphaned. This is NOT the
+			// #968 wedge (which is a top-level run that must merge), so the
+			// merge_and_file_follow_up framing is wrong here. Detect the
+			// orchestrator's minted-child shape — the SAME predicate
+			// implementFailedNextActions uses for a category-B child: a
+			// parent_run_id plus an implement stage but NO plan or review stage
+			// of its own (a CI-retry child carries a review stage and is excluded
+			// by the review == nil clause). Point the operator at the parent run
+			// instead of a non-existent per-child PR.
 			if run.ParentRunID != nil && plan == nil && review == nil {
 				return &NextActions{
 					State: "awaiting_parent_consolidation",
 					Actions: []SuggestedAction{{
 						Action:       "fishhawk_get_run_status",
 						Params:       map[string]string{"run_id": *run.ParentRunID},
-						Precondition: "this is a succeeded decomposition child (it carries a parent_run_id and has only an implement stage — no plan or review of its own) whose own implement review stays pending because the parent gates the consolidated diff (#1061)",
+						Precondition: "this is a succeeded decomposition child (it carries a parent_run_id and has only an implement stage — no plan or review stage of its own) whose slice implement-review round is in flight or orphaned; the parent gates the consolidated diff (#1061)",
 						Consumes:     consumesNone,
-						Reason:       "the slice pushed to the shared parent branch and succeeded; the parent run consolidates the fan-out and gates review, so there is no per-child PR to merge and no #968 wedge to recover — poll the parent run for the consolidation state",
+						Reason:       "the slice pushed to the shared parent branch and succeeded; a late verdict imports into the parent's concern ledger, fan-in does not wait on the round and the boot sweep re-dispatches or closes a round a restart orphaned, so there is no per-child PR to merge and no #968 wedge to recover — poll the parent run for the consolidation state",
 					}},
 				}
 			}
@@ -1890,7 +1894,7 @@ func implementFailedNextActions(run *Run, plan, review, impl *Stage) *NextAction
 				Actions: []SuggestedAction{{
 					Action:       "fishhawk_resume_run",
 					Params:       map[string]string{"parent_run_id": run.ID},
-					Precondition: "this run is a failed decomposition child (it carries a parent_run_id and has only an implement stage — no plan or review of its own) whose implement stage failed category-B; point resume at THIS child's own id, NOT the parent",
+					Precondition: "this run is a failed decomposition child (it carries a parent_run_id and has only an implement stage — no plan or review stage of its own) whose implement stage failed category-B; point resume at THIS child's own id, NOT the parent",
 					Consumes:     consumesNone,
 					Reason:       "category-B decomposition-child failure: fishhawk_resume_run pointed at the child re-opens the SAME run in place on the shared parent branch (folding add_scope_files), so the parked parent fan-out can still consolidate — pointing resume at the parent would replan from scratch and discard the succeeded sibling slices",
 				}},
