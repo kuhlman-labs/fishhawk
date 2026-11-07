@@ -6,8 +6,11 @@
 // or an ANTHROPIC_API_KEY already in the environment), which the subprocess
 // inherits via os.Environ().
 //
-// The adapter shells out to `claude --print --output-format json --model
-// <model> [--effort <effort>] -p <prompt>` and decodes the single JSON envelope the CLI emits.
+// The adapter shells out to `claude --print --output-format json --input-format
+// text --model <model> [--effort <effort>]` with the prompt written to the child's
+// STDIN (#5113) and decodes the single JSON envelope the CLI emits. The prompt is
+// never an argv element, so the spawn's argv size does not depend on prompt size
+// and a large consolidated review prompt cannot fail at fork/exec with E2BIG.
 // cmd.Output() captures the whole response in one buffer, sidestepping the
 // StdoutPipe read race the streaming adapter must handle.
 //
@@ -178,12 +181,12 @@ func (r *Reviewer) ReasoningEffort() string {
 	return r.client.cfg.ReasoningEffort
 }
 
-// Inference runs `claude --print --output-format json --model <model> -p
-// <prompt>`, decodes the CLI envelope, and returns the envelope's `result`
-// field as responseText, the configured model as the model identifier, and
-// the envelope's token usage (#681). The child inherits os.Environ() so the
-// operator's existing ANTHROPIC_API_KEY or subscription auth is used with
-// zero new plumbing.
+// Inference runs `claude --print --output-format json --input-format text
+// --model <model>` with the prompt on stdin (#5113), decodes the CLI envelope,
+// and returns the envelope's `result` field as responseText, the configured
+// model as the model identifier, and the envelope's token usage (#681). The
+// child environment is the scrubbed reviewsandbox.Env allow-list (#2486), which
+// keeps the operator's ANTHROPIC_API_KEY or subscription auth discovery.
 func (c *Client) Inference(ctx context.Context, prompt string) (responseText, model string, usage planreview.Usage, err error) {
 	return c.InferenceInTree(ctx, prompt, "")
 }
@@ -263,6 +266,7 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	args := []string{
 		"--print",
 		"--output-format", "json",
+		"--input-format", "text",
 		"--model", c.cfg.Model,
 	}
 	// Effort pin (#3896): appended only when declared, so an absent effort
@@ -350,7 +354,6 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 		args = append(args, "--disallowed-tools")
 		args = append(args, denyRules...)
 	}
-	args = append(args, "-p", prompt)
 	cmd := cmdFn(ctx, c.cfg.Binary, args...)
 	// Harden the subprocess so the review deadline actually terminates a wedged
 	// reviewer (#1805): the child leads its own process group, a deadline-fired
@@ -360,6 +363,19 @@ func (c *Client) invokeOnce(ctx context.Context, prompt, treeDir string) (respon
 	// cmd.Output().
 	procgroup.Harden(cmd, killGrace)
 	cmd.Dir = workDir
+	// Prompt transport (#5113): the prompt goes to the child's STDIN, never argv.
+	// It used to ride as the trailing `-p <prompt>` argv string, and execve
+	// refuses an oversized argument list with E2BIG before the CLI runs (Linux:
+	// one string over MAX_ARG_STRLEN, 128 KiB; darwin: argv+env over
+	// kern.argmax, 1 MiB) — a large consolidated review prompt failed before
+	// inference. In --print mode with no positional prompt the CLI reads the
+	// prompt from stdin; --input-format text (above) pins the plain-text reading.
+	// Per the os/exec Cmd.Stdin contract a non-*os.File reader is copied to the
+	// child through a pipe and the pipe is closed at EOF; the bytes are delivered
+	// unchanged. Wait does not return until that copy finishes or WaitDelay
+	// expires, so the procgroup.Harden group kill + WaitDelay above still bound a
+	// child that never reads its stdin.
+	cmd.Stdin = strings.NewReader(prompt)
 	// Seed the child environment from the SCRUBBED allow-list, not a wholesale
 	// os.Environ() (#2486): a tool-enabled reviewer processing untrusted diff/issue
 	// text must never hold FISHHAWKD_DATABASE_URL, GITHUB_TOKEN, or unrelated API
