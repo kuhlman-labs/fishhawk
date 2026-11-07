@@ -7757,6 +7757,7 @@ RB_EMPTY='{"items":[],"scanned_runs":3,"truncated":false}'
 RB_MALFORMED='{"error":{"code":"internal_error"}}'
 RB_UNREADABLE='{"items":[{"surprise":true}],"scanned_runs":1,"truncated":false}'
 RB_TRUNCATED='{"items":[],"scanned_runs":500,"truncated":true}'
+RB_UNDECIDED='{"error":{"code":"service_unavailable","message":"could not complete the restart-blocker scan; retry shortly"}}'
 
 # One-shot fake fishhawkd on <port>: one HTTP response (<status>, <body>), then
 # nc exits. Waits for the bind so curl cannot race the listener. Sets
@@ -7861,7 +7862,7 @@ CLEAN
 _rb_m() { [[ -f "$1" ]] && print present || print absent }
 
 if ! command -v nc &>/dev/null || ! command -v lsof &>/dev/null || ! command -v curl &>/dev/null; then
-  print "skip: nc, lsof or curl not found — skipping the restart-blocker responder cases (RB-a..RB-j, RB-l, RB-n, RB-p)"
+  print "skip: nc, lsof or curl not found — skipping the restart-blocker responder cases (RB-a..RB-j, RB-l, RB-n, RB-p, RB-q)"
 else
   # RB-a DONE-MEANS (negative): an undispatched child makes POST-MERGE refuse
   # (its git pull is what strands the child, #4077), before any git step, and
@@ -8005,10 +8006,11 @@ else
   fi
   rm -rf "$rb_dir"
 
-  # RB-i a truncated scan warns and (with no item) proceeds.
+  # RB-i a truncated scan warns and (with no item) proceeds. Either page's cap can
+  # set truncated (ADR-140 D4), so the warning names both causes.
   _rb_run_reload "200 OK" "$RB_TRUNCATED"
-  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *truncated* ]]; then
-    pass "RB-i truncated scan: proceeds with a warning naming the cap"
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"run page"* && "$rb_err" == *"audit page cap"* ]]; then
+    pass "RB-i truncated scan: proceeds with a warning naming the run page and audit page caps"
   else
     fail "RB-i truncated (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
   fi
@@ -8042,6 +8044,85 @@ else
     fail "RB-l post-merge control (rc=${rb_rc} git=$(_rb_m "$rb_git") cleanup=$(_rb_m "$rb_clean") reload=$(_rb_m "$rb_reload") err=${rb_err})"
   fi
   rm -rf "$rb_dir"
+
+  # RB-q (ADR-140 D7, #5047) an HTTP 503 means a reachable daemon could not decide,
+  # so reload and post-merge refuse before any teardown or git step. Without the
+  # 503 arm each of these is the fail-open arm RB-f shows: the restart proceeds.
+  _rb_run_reload "503 Service Unavailable" "$RB_UNDECIDED"
+  if (( rb_rc == 1 )) && [[ ! -f "$rb_marker" ]] && [[ "$rb_err" == *"refusing to restart fishhawkd"* && "$rb_err" == *"could not decide"* ]] \
+     && [[ "$rb_err" == *"HTTP 503"* && "$rb_err" == *"--force breaks"* && "$rb_err" != *"skipping it"* && "$rb_err" != *"command failed"* ]]; then
+    pass "RB-q HTTP 503: cmd_reload refuses before the teardown, naming the undecided check"
+  else
+    fail "RB-q 503 reload refusal (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+  _rb_run_post_merge "503 Service Unavailable" "$RB_UNDECIDED"
+  if (( rb_rc == 1 )) && [[ ! -f "$rb_git" && ! -f "$rb_clean" && ! -f "$rb_reload" ]] \
+     && [[ "$rb_err" == *"refusing to restart fishhawkd"* && "$rb_err" == *"could not decide"* && "$rb_err" != *"command failed"* ]]; then
+    pass "RB-q HTTP 503: cmd_post_merge refuses before git, cleanup-merged and reload"
+  else
+    fail "RB-q 503 post-merge refusal (rc=${rb_rc} git=$(_rb_m "$rb_git") cleanup=$(_rb_m "$rb_clean") reload=$(_rb_m "$rb_reload") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-q --force: D7's override stays, downgraded to a warning that says what it
+  # risks. A build that refused under --force leaves no marker; one that dropped the
+  # warning proceeds silently past the fail-open text this rejects.
+  _rb_run_reload "503 Service Unavailable" "$RB_UNDECIDED" --force
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"warning: restarting fishhawkd although it could not decide"* ]] \
+     && [[ "$rb_err" == *"no durable record"* && "$rb_err" != *"refusing to restart"* && "$rb_err" != *"skipping it"* ]]; then
+    pass "RB-q HTTP 503 + --force: cmd_reload reaches the teardown with a warning naming the risk"
+  else
+    fail "RB-q 503 reload --force (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+  _rb_run_post_merge "503 Service Unavailable" "$RB_UNDECIDED" --force
+  if (( rb_rc == 0 )) && [[ -f "$rb_git" && -f "$rb_reload" ]] && [[ "$rb_err" == *"warning: restarting fishhawkd although it could not decide"* && "$rb_err" != *"refusing to restart"* ]]; then
+    pass "RB-q HTTP 503 + --force: cmd_post_merge runs its walk with a warning"
+  else
+    fail "RB-q 503 post-merge --force (rc=${rb_rc} git=$(_rb_m "$rb_git") reload=$(_rb_m "$rb_reload") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-q control: only 503 changed (#5054). A 500 keeps the fail-open line RB-f pins
+  # for 404, and its reason carries no predates hint.
+  _rb_run_reload "500 Internal Server Error" '{"error":{"code":"internal_error"}}'
+  if (( rb_rc == 0 )) && [[ -f "$rb_marker" ]] && [[ "$rb_err" == *"answered HTTP 500"*"skipping it (degraded)"* ]] \
+     && [[ "$rb_err" != *predates* && "$rb_err" != *"refusing to restart"* ]]; then
+    pass "RB-q control: HTTP 500 still proceeds with its one-line degrade reason"
+  else
+    fail "RB-q 500 control (rc=${rb_rc} marker=$(_rb_m "$rb_marker") err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+
+  # RB-q _reload_quiet_check over the real fetch: 503 is live; 404, 500 and a
+  # malformed 200 stay quiet, and so does an unreachable daemon.
+  _rb_quiet_check() {
+    local mode="$1" body="$2"
+    _rb_setup "$mode" "$body"
+    rb_out="$(
+      _scan_live_runs() { return 0 }
+      _reload_quiet_check "http://127.0.0.1:${rb_port}/v0/restart-blockers" 2>"${rb_dir}/err" || exit $?
+    )"
+    rb_rc=$?
+    _rb_teardown
+  }
+  _rb_quiet_check "503 Service Unavailable" "$RB_UNDECIDED"
+  if (( rb_rc == 1 )) && [[ "$rb_out" == "undecided restart-blocker check (HTTP 503)" ]]; then
+    pass "RB-q _reload_quiet_check reports an HTTP 503 as live"
+  else
+    fail "RB-q 503 quiet check (rc=${rb_rc} out=${rb_out} err=${rb_err})"
+  fi
+  rm -rf "$rb_dir"
+  for rb_row in '404 Not Found|{"error":{"code":"not_found"}}' '500 Internal Server Error|{"error":{"code":"internal_error"}}' "200 OK|${RB_MALFORMED}" 'none|'; do
+    _rb_quiet_check "${rb_row%%|*}" "${rb_row#*|}"
+    if (( rb_rc == 0 )) && [[ -z "$rb_out" ]]; then
+      pass "RB-q control: _reload_quiet_check stays quiet on '${rb_row%%|*}'"
+    else
+      fail "RB-q quiet control '${rb_row%%|*}' (rc=${rb_rc} out=${rb_out} err=${rb_err})"
+    fi
+    rm -rf "$rb_dir"
+  done
 fi
 
 # RB-k the cross-boundary seam: _parse_restart_blockers reads the SAME wire
@@ -8180,6 +8261,7 @@ _wq_run() {
     _fetch_restart_blockers() {
       if [[ "$wq_b" == degrade ]]; then _wq_tick "$wq_fetches" >/dev/null; return 2; fi
       local n; n="$(_wq_tick "$wq_fetches")"
+      if (( n <= wq_b )) && [[ "$wq_body" == http-503 ]]; then print -r -- 503; return 4; fi
       if (( n <= wq_b )); then print -r -- "$wq_body"; else print -r -- "$RB_EMPTY"; fi
       return 0
     }
@@ -8225,6 +8307,28 @@ else
   fail "WQ-b child-only wait (rc=${wq_rc} marker=$(_rb_m "$wq_marker") waits=${wq_waits} err=${wq_err})"
 fi
 rm -rf "$wq_dir"
+
+# RB-q --when-quiet (ADR-140 D7, #5047): an HTTP 503 is not quiet. The real
+# cmd_reload waits through it, then proceeds through the normal guards once the
+# daemon can decide; one that never can times out with no teardown. <body>
+# http-503 makes the fetch stub answer as _fetch_restart_blockers does on a 503.
+_wq_run 0 2 http-503 --when-quiet
+if (( wq_rc == 0 )) && [[ -f "$wq_marker" ]] && (( wq_waits == 2 && wq_nsleeps == 2 )) \
+   && [[ "$wq_err" == *"waiting on: undecided restart-blocker check (HTTP 503)"* ]]; then
+  pass "RB-q --when-quiet waits through 2 HTTP 503 polls, then tears down"
+else
+  fail "RB-q --when-quiet 503 wait (rc=${wq_rc} marker=$(_rb_m "$wq_marker") waits=${wq_waits} err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+wq_interval=10 wq_timeout=30
+_wq_run 0 1000 http-503 --when-quiet
+if (( wq_rc == 1 )) && [[ ! -f "$wq_marker" ]] && [[ "$wq_err" == *"gave up after 30s"* && "$wq_err" == *"still live: undecided restart-blocker check (HTTP 503)"* ]]; then
+  pass "RB-q --when-quiet gives up on a persistent HTTP 503: exit 1, no teardown"
+else
+  fail "RB-q --when-quiet 503 timeout (rc=${wq_rc} marker=$(_rb_m "$wq_marker") err=${wq_err})"
+fi
+rm -rf "$wq_dir"
+wq_interval="" wq_timeout=""
 
 # WQ-c timeout: a runner that never settles exhausts FISHHAWK_RELOAD_QUIET_TIMEOUT
 # (30 s at a 10 s interval: polls at 0/10/20 wait, the poll at 30 gives up),
