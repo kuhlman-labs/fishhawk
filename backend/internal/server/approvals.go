@@ -2982,8 +2982,9 @@ func (s *Server) reviewProvidersForRun(ctx context.Context, runRow *run.Run) []s
 }
 
 // specPlanExecutorAgent reads executor.agent on the plan stage of the given
-// workflow from raw workflow-spec bytes via a local YAML probe, returning ""
-// when the spec is empty, malformed, or declares no executor.agent. It mirrors
+// workflow from the reuse-resolved spec (specStageExecutor), falling back to a
+// local raw YAML probe when the document does not parse. It returns "" when the
+// spec is empty, malformed, or declares no executor.agent. It mirrors
 // specImplementExecutorAgent exactly but targets the PLAN stage (prefer a stage
 // whose id == "plan", else the first stage whose type == "plan"). The gate maps
 // the returned id to the allow-list adapter key via adapterForImplementAgent,
@@ -2991,6 +2992,9 @@ func (s *Server) reviewProvidersForRun(ctx context.Context, runRow *run.Run) []s
 func specPlanExecutorAgent(specBytes []byte, workflowID string) string {
 	if len(specBytes) == 0 {
 		return ""
+	}
+	if ex, ok := specStageExecutor(specBytes, workflowID, run.StageTypePlan); ok {
+		return strings.TrimSpace(ex.Agent)
 	}
 	var probe struct {
 		Workflows map[string]struct {

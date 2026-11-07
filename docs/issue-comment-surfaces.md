@@ -2093,9 +2093,11 @@ Notes:
   (key absent). A fourth kind, `scope_amendment_refused` (#4679), is written by
   `server/scope_amendment.go` (`server/slice_ownership.go`) when the
   slice-ownership guard refuses a child's amendment — phase `request` (agent
-  actor, `{phase, paths, reason, slice_ownership}`, no row created) or phase
+  actor, `{phase, paths, reason, slice_ownership}`, no row created), phase
   `decide` (user actor, `{phase, amendment_id, paths, slice_ownership}`, the
-  row stays pending). It is internal-only: no Notifier method, NOT in
+  row stays pending), or, since #4798, phase `resume` or
+  `scope_completeness_amend` (user actor, `{phase, paths, reason,
+  slice_ownership}`, no row created). It is internal-only: no Notifier method, NOT in
   `activityCategories`, and withheld from run-bound audit reads.
 - The scope-completeness park/decision audit kinds — `scope_completeness_parked`,
   `scope_completeness_exempted`, `scope_completeness_amended`, and
@@ -2364,6 +2366,20 @@ Notes:
   comment (`notifyStatusUpdate`), but the audit kind itself posts nothing.
   Listed here only so a future reader grepping the audit categories doesn't
   mistake it for a comment surface.
+- The push-report refusal kind — `reported_head_mismatch` (ADR-141, #5053, #4870)
+  — is an **internal, audit-only kind, not an issue-comment surface**, beside
+  `foreign_commit_on_branch`. Nothing in `issuecomment` posts it; it has no Notifier
+  method. It is written best-effort under category `invariant_violation` by a
+  `system` actor: `server/reported_head.go::refuseUnverifiedReportedHead` calls
+  `AuditRepo.AppendChained` when a fix-up, conflict-resolution or acceptance-scenario
+  report disagrees with forge state. The payload is `{kind, run_id, stage_id,
+  outcome, reason, reported_head, reported_base, reported_branch, forge_pr_head,
+  forge_branch, forge_tip, forge_parents}`, with those values bounded for diagnostics.
+  It can be a benign head-movement race and is not proof of misconduct. The refusal
+  also fires the sticky status comment (`notifyStatusUpdate`) under the existing
+  `lineage_violation` source, but the audit kind itself posts nothing. Runs with no
+  forge client or installation skip the check, so its absence does not show a head
+  was verified.
 - The run-branch reset kind — `branch_reset` (ADR-035, #867) — is an
   **internal, audit-only kind, not its own issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method. It is written under its

@@ -11,6 +11,8 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"net/http/httputil"
+	"net/url"
 	"os"
 	"path/filepath"
 	"reflect"
@@ -2334,6 +2336,27 @@ func TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError(
 	}
 }
 
+// serveReportedBranchTip fronts a canned compare client with the branch ref a
+// fix-up report implies, as a real push leaves it (ADR-141). Every other route
+// still reaches the canned client. BaseURL is swapped on the shared client
+// because the server holds that pointer.
+func serveReportedBranchTip(t *testing.T, s *Server, tip string) {
+	t.Helper()
+	upstream, err := url.Parse(s.cfg.GitHub.BaseURL)
+	if err != nil {
+		t.Fatalf("setup: parse canned client URL: %v", err)
+	}
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"object":{"sha":%q}}`, tip)
+	})
+	mux.Handle("/", httputil.NewSingleHostReverseProxy(upstream))
+	srv := httptest.NewServer(mux)
+	t.Cleanup(srv.Close)
+	s.cfg.GitHub.BaseURL = srv.URL
+}
+
 // TestShipPullRequest_FixupPush_BackstopReReview_WedgeRepro is the #1932
 // cross-boundary seam test: it reproduces the run 98020210 wedge and proves the
 // fix-up re-review backstop resolves it. A fixup_pushed report for a NEW head
@@ -2369,6 +2392,7 @@ func TestShipPullRequest_FixupPush_BackstopReReview_WedgeRepro(t *testing.T) {
 		newHead = "head-new-5d33d25f"
 		base    = "base-def"
 	)
+	serveReportedBranchTip(t, s, newHead)
 	// The wedge shape: a prior-head round's started entry ONLY (no terminal
 	// verdict for the round under the fix-up floor), recent so the review-gate
 	// backstop bound has not elapsed.
@@ -2449,6 +2473,7 @@ func TestShipPullRequest_FixupPush_BackstopReReview_DuplicateReport_NoDoubleDisp
 	s, sf, au, _, runRow, implStage := newFixupReReviewBackstopServer(t, reviewer, cannedCompareOneFile, false)
 
 	const newHead = "head-new-dup"
+	serveReportedBranchTip(t, s, newHead)
 	seedImplementReviewStarted(t, au, runRow.ID, implStage.ID, "head-old", time.Now().UTC())
 
 	priv, _ := sf.issue(t, runRow.ID)
@@ -3048,6 +3073,7 @@ func newFixupSeamServer(t *testing.T, pushedHead, baseSHA string) (
 
 	stub := &lineageGitHub{
 		baseRef:       "main",
+		headSHA:       pushedHead, // the forge shows the head the report names (ADR-141)
 		commitsByBase: map[string][]string{"main": {pushedHead}, baseSHA: {pushedHead}},
 	}
 	gh := newLineageGitHubClient(t, stub)
@@ -5503,7 +5529,7 @@ func newPRSeamWithSet(t *testing.T, set ReviewerSet, workflowSpec []byte, rev *s
 	s.cfg.RunRepo = repo
 	s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: orchestratorCountRepo{repo}}
 	closes := &closeRecorder{}
-	ghSrv := closes.server(t)
+	ghSrv := closes.reportedHeadAdmittingServer(t)
 	s.cfg.GitHub = &githubclient.Client{
 		BaseURL: ghSrv.URL,
 		Tokens:  &ghTokensStub{tok: "ghs_test"},
@@ -7651,6 +7677,76 @@ func TestShipPullRequest_OrdinaryEdge_Modes(t *testing.T) {
 	})
 }
 
+// variantReportBaseSHA is the base every variantCase body reports.
+const variantReportBaseSHA = "2222222222222222222222222222222222222222"
+
+// reportedHeadForgeTips holds each admitting forge's branch tip, keyed by its
+// closeRecorder, so an arm can confirm a head other than prSeamHead.
+var reportedHeadForgeTips sync.Map // *closeRecorder -> *atomic.Pointer[string]
+
+// setReportedHeadTip makes c's admitting forge name sha as every branch tip.
+func (c *closeRecorder) setReportedHeadTip(sha string) {
+	v, _ := reportedHeadForgeTips.LoadOrStore(c, &atomic.Pointer[string]{})
+	v.(*atomic.Pointer[string]).Store(&sha)
+}
+
+// reportedHeadAdmittingServer serves c's close and comment routes plus the forge
+// reads ADR-141's reported-head check makes (#5053): the PR head and every branch
+// tip name prSeamHead (setReportedHeadTip moves the tip), and every commit's first
+// parent is variantReportBaseSHA. Each variantCase reports exactly that head and
+// base, so the check admits it and the suites keep exercising the guarded edge
+// behind it (ADR-140 (#5047) D8, D9). The PR read carries no base ref, so the
+// branch-lineage check stays fail-open as before.
+func (c *closeRecorder) reportedHeadAdmittingServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	c.setReportedHeadTip(prSeamHead)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"number": 42, "node_id": "PR_seam", "state": "open",
+			"head": map[string]string{"sha": prSeamHead, "ref": "fishhawk/run/stage"},
+		})
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}", func(w http.ResponseWriter, _ *http.Request) {
+		v, _ := reportedHeadForgeTips.Load(c)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": *v.(*atomic.Pointer[string]).Load()}})
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/commits/{sha}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha": r.PathValue("sha"), "tree": map[string]string{"sha": "tree"},
+			"parents": []map[string]string{{"sha": variantReportBaseSHA}},
+		})
+	})
+	mux.Handle("/", c.server(t).Config.Handler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(func() {
+		srv.Close()
+		reportedHeadForgeTips.Delete(c)
+	})
+	return srv
+}
+
+// reportedHeadChecked reports whether ADR-141's forge check (#5053) gates this
+// outcome before its edge: a run-read fault then answers that check's retryable
+// 503 with nothing recorded, ahead of the guarded edge's static 500.
+func (c variantCase) reportedHeadChecked() bool {
+	return c.outcome == "fixup_pushed" || c.outcome == "conflict_resolution_pushed"
+}
+
+// assertRunReadRefused is the run-read-fault answer for c: the forge check's 503
+// on a checked outcome, otherwise the guarded edge's static 500.
+func (c variantCase) assertRunReadRefused(t *testing.T, w *httptest.ResponseRecorder, fault error) {
+	t.Helper()
+	if c.reportedHeadChecked() {
+		assertCode(t, w, http.StatusServiceUnavailable, "reported_head_unverifiable")
+		return
+	}
+	assertStaticEdgeError(t, w, fault.Error())
+}
+
 // --- the alternative-outcome edges (§43), hermetic arms --------------------------
 
 // variantCase is one runner-spelled alternative outcome.
@@ -7669,7 +7765,7 @@ var prVariantCases = []variantCase{
 
 func (c variantCase) body(t *testing.T) []byte {
 	t.Helper()
-	fields := map[string]any{"outcome": c.outcome, "branch": "fishhawk/run/stage", "base_sha": "2222222222222222222222222222222222222222", "files_changed_count": 1}
+	fields := map[string]any{"outcome": c.outcome, "branch": "fishhawk/run/stage", "base_sha": variantReportBaseSHA, "files_changed_count": 1}
 	if c.head != "" {
 		fields["head_sha"] = c.head
 	}
@@ -7720,7 +7816,13 @@ func TestVariantSuccessEdges_KeepGenericEdge(t *testing.T) {
 					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 				}
 				p.s.waitBackgroundReviews()
-				if !strings.Contains(w.Body.String(), `"outcome":"`+c.outcome+`"`) || !strings.Contains(w.Body.String(), `"branch":"fishhawk/run/stage"`) {
+				// ADR-141 (#5053) replaces a checked outcome's branch with the one
+				// the forge check resolved; every other byte is unchanged.
+				wantBranch := "fishhawk/run/stage"
+				if c.reportedHeadChecked() {
+					wantBranch = fixupBranchFor(p.runRow, p.stage)
+				}
+				if !strings.Contains(w.Body.String(), `"outcome":"`+c.outcome+`"`) || !strings.Contains(w.Body.String(), `"branch":"`+wantBranch+`"`) {
 					t.Errorf("response bytes changed: %s", w.Body.String())
 				}
 				if got := p.state(t); got != run.StageStateAwaitingApproval {
@@ -7813,7 +7915,7 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 			t.Run("run_read_error_500", func(t *testing.T) {
 				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 				p.repo.onGetRun = func(int32) error { return readFault }
-				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
+				c.assertRunReadRefused(t, p.post(t, c.body(t)), readFault)
 				c.assertNoRow(t, p)
 				p.assertNothingMoved(t)
 			})
@@ -7850,7 +7952,7 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 				p.setState(run.StageStateAwaitingApproval)
 				p.repo.onGetRun = func(int32) error { return readFault }
-				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
+				c.assertRunReadRefused(t, p.post(t, c.body(t)), readFault)
 				c.assertNoRow(t, p)
 			})
 			t.Run("settled_undecodable_500", func(t *testing.T) {
@@ -7949,6 +8051,10 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 				p.rr.mu.Lock()
 				p.rr.stagesByID[p.stage.ID].Type = run.StageTypeReview
+				// A tracked PR lets ADR-141's check confirm the head on a stage
+				// with no implement sibling to derive a branch from (#5053).
+				prURL := "https://github.com/acme/widgets/pull/42"
+				p.rr.runs[p.runRow.ID].PullRequestURL = &prURL
 				p.rr.mu.Unlock()
 				seedBinding(t, p)
 				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {

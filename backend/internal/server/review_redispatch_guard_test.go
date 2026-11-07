@@ -2750,7 +2750,7 @@ func newPGRouteSeam(t *testing.T, workflowSpec []byte, requiresApproval bool, st
 		}
 	}
 	closes := &closeRecorder{}
-	ghSrv := closes.server(t)
+	ghSrv := closes.reportedHeadAdmittingServer(t)
 	boards := &atomic.Int32{}
 	setVar(t, &conventionsLoader, func(context.Context, string) (workmgmt.Conventions, error) {
 		boards.Add(1)

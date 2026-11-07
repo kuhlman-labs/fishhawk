@@ -353,6 +353,7 @@ func TestVerifyBranchLineage_CaseB_FixupVariant(t *testing.T) {
 
 	stub := &lineageGitHub{
 		baseRef:       "main",
+		headSHA:       h2, // the forge shows the fix-up head the report names (ADR-141)
 		commitsByBase: map[string][]string{"main": {h1, h2}},
 	}
 	gh := newLineageGitHubClient(t, stub)
@@ -610,6 +611,7 @@ func TestVerifyBranchLineage_MultiPushLedgerReadErrorFailsOpen(t *testing.T) {
 
 	stub := &lineageGitHub{
 		baseRef:       "main",
+		headSHA:       h2,                                    // the forge shows the fix-up head the report names (ADR-141)
 		commitsByBase: map[string][]string{"main": {h1, h2}}, // both legitimate run commits
 	}
 	gh := newLineageGitHubClient(t, stub)
@@ -1801,7 +1803,7 @@ func TestVerifyBranchLineage_AdmitsScenarioCommitParent(t *testing.T) {
 	const h1 = "1111111111111111111111111111111111111111" // PR-open head
 	const hs = "3333333333333333333333333333333333333333" // scenario-corpus commit
 	const h2 = "2222222222222222222222222222222222222222" // fix-up head
-	stub := &lineageGitHub{baseRef: "main", commitsByBase: map[string][]string{"main": {h1, hs, h2}}}
+	stub := &lineageGitHub{baseRef: "main", headSHA: h2, commitsByBase: map[string][]string{"main": {h1, hs, h2}}}
 	gh := newLineageGitHubClient(t, stub)
 	prURL := "https://github.com/x/y/pull/42"
 	runRow := &run.Run{ID: runID, Repo: "x/y", State: run.StateRunning, InstallationID: instID(99), PullRequestURL: &prURL}

@@ -2430,6 +2430,9 @@ func TestShipPullRequest_WrongClaimedOutcome_PG(t *testing.T) {
 					o := newRBRace(t, true, approveStep)
 					fabricated := c
 					fabricated.head = prSeamOther
+					// The forge confirms the fabricated head, so ADR-141's check
+					// (#5053) admits it and the guarded edge alone decides.
+					o.closes.setReportedHeadTip(prSeamOther)
 					claim := o.park(t, fabricated.body(t))
 					o.appendVerdict(t, o.stageID, supplementalVerdict(prSeamHead, o.attempt(t), planreview.VerdictReject))
 					o.edge.open()

@@ -45,9 +45,9 @@ type DecideScopeCompletenessInput struct {
 	Reason   string `json:"reason" jsonschema:"operator rationale; required and non-empty. Recorded on the scope_completeness_exempted / scope_completeness_amended / scope_completeness_failed audit entry"`
 	// Paths is required on decision=amend and rejected on any other decision.
 	Paths []ScopeAmendmentPathEntry `json:"paths,omitempty" jsonschema:"amend ONLY: the repo-relative files to fold into the parked stage's effective scope, each {path, operation} with operation modify or create. Must cover every build_required_path the park recorded"`
-	// AcknowledgeOwnerUnresolved re-admits an amend the owner-slice guard could
-	// not prove safe. It never relaxes the resolved-and-started refusal.
-	AcknowledgeOwnerUnresolved bool `json:"acknowledge_owner_unresolved,omitempty" jsonschema:"amend ONLY: set true to proceed when the backend cannot resolve which slice OWNS an amended path (409 amend_owner_attribution_unresolved). The acknowledgement is recorded on the audit entry — it is an audited risk, not a default"`
+	// AcknowledgeOwnerUnresolved re-admits an amend on a plan-undeclared path
+	// whose ownership the guard could not resolve. It relaxes no other refusal.
+	AcknowledgeOwnerUnresolved bool `json:"acknowledge_owner_unresolved,omitempty" jsonschema:"amend ONLY: set true to proceed when the backend cannot resolve which slice OWNS an amended path the parent's plan does not declare (409 amend_owner_attribution_unresolved). Recorded on the audit entry — an audited risk, not a default. It never relaxes amendment_path_owned_by_sibling_slice, amend_refused_owner_slice_active or slice_ownership_check_failed, so it cannot stand in for an ancestor's proven delivery"`
 }
 
 // DecideScopeCompletenessOutput surfaces the decided park record.
@@ -92,12 +92,20 @@ construction because a sibling slice owns a file the build needs, so its
 exempt is refused 409 exempt_refused_build_required. The amend must cover
 every build_required_path the park recorded.
 
-amend narrowly relaxes the single-owner-file invariant, so it is guarded:
-a path whose owning sibling slice has ALREADY STARTED its implement pass is
-refused (two branches would carry divergent edits to one file), and a path
-whose ownership cannot be RESOLVED is refused too unless you re-admit it with
+amend narrowly relaxes the single-owner-file invariant, so on a decomposition
+child the parent's approved plan decides first (#4798). A path a slice that is
+not a depends_on ancestor declares is refused whatever that sibling's state,
+with no override: when it is a build_required_path, decide fail and restart
+with a corrected decomposition. A path an ancestor declares needs PROVEN
+delivery into this child's base: the child's dispatch goes through the host
+wave gate, the ancestor's run and implement stage succeeded, and the parent's
+newest slices_integrated names a branch and covers it. A failed proof is a hard
+refusal. Only a path the plan does NOT declare falls to the park's attribution:
+refused when its non-ancestor owner already started, and refused when ownership
+cannot be RESOLVED unless you re-admit it with
 acknowledge_owner_unresolved:true — which is recorded on the audit entry as a
-deliberate operator risk. Note the cost: an operator amend consumes one of
+deliberate operator risk and relaxes nothing else. Note the cost: an operator
+amend consumes one of
 the re-run agent's two mid-stage #961 amendment slots
 (agent_amendment_budget_remaining on the response reports what is left).
 
@@ -126,14 +134,23 @@ Returns the decided park record. Tool errors:
   - exempt_refused_build_required (exempt on a build-required park; use
     amend or fail, 409)
   - amend_incomplete_coverage (the amend omits a build_required_path, 409)
-  - amend_refused_owner_slice_active (a path's owning sibling slice has
-    already started its implement pass, 409)
-  - amend_owner_attribution_unresolved (ownership unprovable and not
-    acknowledged — re-submit with acknowledge_owner_unresolved:true, 409)
+  - amendment_path_owned_by_sibling_slice (a non-ancestor slice declares the
+    path, whatever its state; no override; details name the owner and remedy, 409)
+  - amend_refused_owner_slice_active (an ancestor's delivery is not proven:
+    details.reason is ancestor_no_wave_gate, ancestor_run_not_found or
+    ancestor_implement_stage_absent, retryable false, or ancestor_not_delivered
+    or ancestor_not_integrated, retryable true; or a plan-undeclared path's
+    attributed non-ancestor already started its implement pass, 409)
+  - amend_owner_attribution_unresolved (a plan-undeclared path's ownership is
+    unprovable and not acknowledged — re-submit with
+    acknowledge_owner_unresolved:true, 409)
   - amend_budget_exhausted (this stage's amend-and-resume budget is spent, 409)
   - amend_unrecorded / amend_resume_failed (the widening or the resume could
     not be persisted; the stage is left parked — re-POST, the amendment row is
     reused rather than duplicated, 500)
+  - slice_ownership_check_failed (the plan or an ancestor-proof read failed, or
+    the decomposition is absent or the plan store unconfigured; details.retryable
+    says whether a re-POST can succeed, 500)
   - exemption_unrecorded / fail_unrecorded (the exempt or fail decision and its
     audit entry could not be committed together; the stage is left parked —
     re-POST, 500)

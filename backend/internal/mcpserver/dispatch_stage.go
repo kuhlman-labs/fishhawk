@@ -268,10 +268,11 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 
 	// (2) Resolve the stage id from (run_id, stage type) — the same
 	// belongs-to-run-validating resolver fishhawk_run_stage uses.
-	resolvedStageID, err := r.resolveStageID(ctx, runUUID, in.Stage, in.StageID)
+	resolvedStage, err := r.resolveStage(ctx, runUUID, in.Stage, in.StageID)
 	if err != nil {
 		return nil, DispatchStageOutput{}, err
 	}
+	resolvedStageID := resolvedStage.ID
 
 	// (2a) Sibling-in-flight admission guard (#1872). Refuse a host dispatch
 	// while another stage of the run is dispatched/running (or the target
@@ -348,7 +349,10 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 		}
 
 		// (5) Compose the runner argv via the shared composer so the dispatched
-		// argv is byte-identical to fishhawk_run_stage's for the same input.
+		// argv is byte-identical to fishhawk_run_stage's for the same input. An
+		// unsupported executor agent refuses here (#5095): this closure's first
+		// run precedes acceptance admission, the record-act and the marker, so the
+		// refusal commits no state and spawns nothing.
 		baseBranch, err := forgeTarget.resolveSpawnBaseBranch(runUUID, in.BaseBranch)
 		if err != nil {
 			return plan, err
@@ -364,7 +368,10 @@ func (r *runResolver) dispatchStage(ctx context.Context, _ *mcp.CallToolRequest,
 			PushAndOpenPR: in.PushAndOpenPR,
 			RunnerBinary:  in.RunnerBinary,
 		}
-		plan.argv = r.composeRunnerArgv(runStageIn, resolvedStageID, repo, baseBranch, pushAndOpenPR, forgeTarget)
+		plan.argv, err = r.composeStageRunnerArgv(runStageIn, resolvedStage, repo, baseBranch, pushAndOpenPR, forgeTarget)
+		if err != nil {
+			return plan, err
+		}
 		plan.env = append(os.Environ(), "FISHHAWK_API_TOKEN="+r.api.token)
 
 		// (5a') auto_preview (E68.43 / #3321). ONE resolution feeds BOTH the gate's

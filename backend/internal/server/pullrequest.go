@@ -1713,6 +1713,10 @@ type pullRequestFixupPushResponse struct {
 // Idempotency-guarded on (stage_id, head_sha) mirroring succeedChildPushStage
 // (#776): a runner retry after a 5xx — or a duplicate delivery — must not append
 // a second fixup_pushed audit entry or fire a redundant status-comment update.
+//
+// A new report is admitted only when the forge confirms its head (ADR-141, see
+// refuseUnverifiedReportedHead): a refusal writes no fixup_pushed entry and
+// answers 200 outcome failed, 409 or 503 instead of the path described above.
 func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
@@ -1735,6 +1739,12 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 			Branch:  pr.Branch,
 			HeadSHA: pr.HeadSHA,
 		})
+		return
+	}
+
+	// Forge-confirmed report admission (ADR-141): after the dedup so a replay
+	// stays a 200, before the lineage guard and every later effect.
+	if s.refuseUnverifiedReportedHead(w, r, runID, stage, pr, authMethod, actorKind, actorSubject, reportedHeadFixupPush) {
 		return
 	}
 
@@ -2179,6 +2189,28 @@ func childPushAlreadyRecorded(entries []*audit.Entry, stageID uuid.UUID, headSHA
 // reason; this never reaches review:awaiting_approval with a null PR.
 func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
+	s.failPullRequestStageWith(w, r, runID, stage, pr, authMethod, actorKind, actorSubject, failPullRequestOpts{})
+}
+
+// failPullRequestOpts are the two adjustments a reported-head refusal
+// (reported_head.go, ADR-141) makes to the failure path. The zero value is the
+// runner's own failure report, byte-identical to failPullRequestStage.
+type failPullRequestOpts struct {
+	// skipFixupRecovery gates the fix-up recovery arm alone.
+	// maybeRecoverFixupFailure restores from the newest trigger without asking
+	// whether that pass settled, so a category-C refusal on a spent trigger
+	// would otherwise be undone from a stale anchor. The merge-candidate and
+	// conflict arms keep their order and still run.
+	skipFixupRecovery bool
+	// appendFailureAttrs, when set, replaces the run and stage attributes on the
+	// WARN for a pull_request_failed append failure, so that evidence failure
+	// still names the run, the stage and both heads.
+	appendFailureAttrs []slog.Attr
+}
+
+// failPullRequestStageWith is failPullRequestStage's body; see that function.
+func (s *Server) failPullRequestStageWith(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
+	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string, opts failPullRequestOpts) {
 	cat := run.FailureC
 	if pr.Category == "B" {
 		cat = run.FailureB
@@ -2252,7 +2284,7 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 	if !recovered {
 		recovered = s.maybeRecoverConflictResolutionFailure(r.Context(), runID, stage.ID, pr.Reason)
 	}
-	if !recovered {
+	if !recovered && !opts.skipFixupRecovery {
 		recovered = s.maybeRecoverFixupFailure(r.Context(), runID, stage.ID)
 	}
 
@@ -2349,11 +2381,13 @@ func (s *Server) failPullRequestStage(w http.ResponseWriter, r *http.Request, ru
 		ActorSubject: actorSubject,
 		Payload:      auditPayload,
 	}); err != nil {
+		attrs := opts.appendFailureAttrs
+		if len(attrs) == 0 {
+			attrs = []slog.Attr{slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String())}
+		}
 		s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
 			"pull-request failure report: append audit entry failed",
-			slog.String("run_id", runID.String()),
-			slog.String("stage_id", stageID.String()),
-			slog.String("error", err.Error()))
+			append(attrs[:len(attrs):len(attrs)], slog.String("error", err.Error()))...)
 	}
 
 	// ADR-140 (#5047) D9, AFTER the pull_request_failed entry so the carrier is
@@ -2647,7 +2681,9 @@ type pullRequestConflictResolutionResponse struct {
 // pass has a ceiling of one and its report is stage-unique: a runner retry
 // after a 5xx must not append a second entry or re-fire the status comment.
 // Fail-open on a read error — a transient listing failure must never drop the
-// report the stage's terminal transition depends on.
+// report the stage's terminal transition depends on, provided the forge confirms
+// its head and first-parent base. A report it cannot confirm writes no entry
+// (ADR-141, see refuseUnverifiedReportedHead).
 func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
@@ -2665,6 +2701,12 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 			Branch:  pr.Branch,
 			HeadSHA: pr.HeadSHA,
 		})
+		return
+	}
+
+	// Forge-confirmed report admission (ADR-141): after the dedup so a replay
+	// stays a 200, before the stage advance and every later effect.
+	if s.refuseUnverifiedReportedHead(w, r, runID, stage, pr, authMethod, actorKind, actorSubject, reportedHeadConflictResolutionPush) {
 		return
 	}
 
@@ -2929,7 +2971,9 @@ type pullRequestAcceptanceScenarioResponse struct {
 // responds 200. It performs NO stage transition and NO acceptance reopen: the
 // verdict stays bound to the pre-scenario head (acceptanceValidatedHeadSHA is
 // dispatch-anchored) while the commit attributes as run lineage through
-// auditcomplete.HeadReportCategoriesByPrecedence + lineageLedgerCategories.
+// auditcomplete.HeadReportCategoriesByPrecedence + lineageLedgerCategories. A
+// report the forge does not confirm writes no entry and answers 409 or 503
+// instead (ADR-141, see refuseUnverifiedReportedHead).
 func (s *Server) recordAcceptanceScenariosPushed(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
@@ -2946,6 +2990,11 @@ func (s *Server) recordAcceptanceScenariosPushed(w http.ResponseWriter, r *http.
 			slog.String("run_id", runID.String()), slog.String("stage_id", stageID.String()), slog.String("error", err.Error()))
 	} else if childPushAlreadyRecorded(entries, stageID, pr.HeadSHA) {
 		respond()
+		return
+	}
+	// Forge-confirmed report admission (ADR-141): after the dedup so a replay
+	// stays a 200, before the row. A refusal here transitions nothing.
+	if s.refuseUnverifiedReportedHead(w, r, runID, stage, pr, authMethod, actorKind, actorSubject, reportedHeadAcceptanceScenariosPush) {
 		return
 	}
 	scenarioIDs := pr.ScenarioIDs

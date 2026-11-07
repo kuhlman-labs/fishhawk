@@ -1,0 +1,14 @@
+id: scenario:issue-5107/changed-paths-exact
+statement: Against the merge-base with origin/main, the implement change touches exactly the five scoped paths, ignoring only any scenario-corpus commit the acceptance stage itself appended under acceptance/scenarios/.
+verify_hint: 'CLI: git diff --name-only against the merge-base lists the changed paths on stdout.'
+steps: 'Posture B: in the sanctioned checkout, run git diff --name-status against the merge-base with origin/main (a66db179) and git log a66db179..HEAD.'
+assertions:
+    expected: Exactly the five scoped paths.
+    observed_at_record: 'Exactly five paths: M backend/internal/decisionrecord/shippedindex_test.go, M docs/adr/090-verify-the-merge-candidate.md, A docs/adr/142-merge-verification-after-scenario-commits.md, M docs/adr/README.md, M docs/adr/index.json. One commit, b70b2856, and no acceptance/scenarios commit.'
+    repro_handle: git diff --name-status a66db179 b70b2856
+origin:
+    issue: 5107
+    pr: 5110
+    run_id: 740bbdb1-46f7-4eca-948a-ad5357e121be
+    head_sha: b70b2856cf19ac3e62c3327e3a268af19a28b21e
+    recorded_at: 2026-11-06T18:33:30Z

@@ -220,6 +220,12 @@ func (s *Server) handleShipTrace(w http.ResponseWriter, r *http.Request) {
 		auditFields["runner_kind"] = runnerKindRes.Locked
 	}
 
+	// Manifest-reported provider (#5095). Additive: older readers ignore it, and
+	// it is omitted unless the signed manifest names a known provider.
+	if agent := traceManifestAgent(body); agent != "" {
+		auditFields["agent"] = agent
+	}
+
 	// Audit: append a chained entry tying the upload to this run's
 	// prior history. AppendChained holds a row-lock on runs so two
 	// concurrent uploads can't fork the chain.
@@ -1754,6 +1760,31 @@ func (s *Server) emitRuntimeObserved(ctx context.Context, runID, stageID uuid.UU
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
+	}
+}
+
+// traceManifestAgent returns the provider the bundle's signed manifest reports,
+// for the trace_uploaded audit (#5095), or "" when the audit should omit it. It
+// is an exact match on the closed provider set the runner's selectInvoker
+// accepts, so an unreadable bundle and an absent, empty, oversized or
+// unrecognized value all omit the key and leave trace ingest unchanged. Whoever
+// holds a run's signing key writes this value, so nothing else from it reaches
+// the audit chain.
+//
+// This is manifest-reported metadata, not independent proof of which binary ran.
+// Read it with the stage's executor.ref and the runner_started event's
+// agent_kind, agent_binary and agent_version; together they make a direct
+// `fishhawk-runner --agent` override visible.
+func traceManifestAgent(body []byte) string {
+	manifest, err := bundle.ExtractManifest(body)
+	if err != nil {
+		return ""
+	}
+	switch manifest.Agent {
+	case "claude-code", "codex":
+		return manifest.Agent
+	default:
+		return ""
 	}
 }
 

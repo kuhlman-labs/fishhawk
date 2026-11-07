@@ -344,8 +344,10 @@ import "sort"
 // guard (server/slice_ownership.go, server/scope_amendment.go) when a
 // decomposition child's mid-stage scope amendment names a path a non-ancestor
 // sibling slice declares: at request time (actor agent, no row created, no
-// budget spent) or at an operator's approve (actor user, the row stays
-// pending). INTERNAL like its scope_amendment_* siblings — NOT an
+// budget spent), at an operator's approve (actor user, the row stays
+// pending), or (#4798) on the resume and scope-completeness amend channels,
+// phases resume and scope_completeness_amend (actor user, no row created).
+// INTERNAL like its scope_amendment_* siblings — NOT an
 // issue-comment activity category. It is WITHHELD from run-bound audit reads
 // by an interim deny-list entry in server/reads.go's
 // withholdScopeOverlapFromRunBound, the same deliberate interim deviation from
@@ -664,7 +666,7 @@ var KnownCategories = map[string]struct{}{
 	"scheduled_run_started":                   {}, // E79.1 / #3725: a due schedule window started a new run
 	"scope_amendment_decided":                 {},
 	"scope_amendment_lapsed":                  {},
-	"scope_amendment_refused":                 {}, // #4679: the slice-ownership guard refused a decomposition child's scope amendment (request time: no row; decide time: row stays pending) (server/slice_ownership.go) — INTERNAL, not an issue-comment surface; WITHHELD from run-bound audit reads by an interim deny-list entry that MUST migrate to ADR-106's per-category registry flag (owned by E89 #4537)
+	"scope_amendment_refused":                 {}, // #4679, #4798: the slice-ownership guard refused a decomposition child's scope amendment (request time: no row; decide time: row stays pending; resume and scope_completeness_amend phases: no row, nothing re-opened) (server/slice_ownership.go) — INTERNAL, not an issue-comment surface; WITHHELD from run-bound audit reads by an interim deny-list entry that MUST migrate to ADR-106's per-category registry flag (owned by E89 #4537)
 	"scope_amendment_requested":               {},
 	"scope_completeness_amended":              {},
 	"scope_completeness_exempted":             {},

@@ -2340,7 +2340,13 @@ the real `claude` can never run, and only synthetic `.env` files under a temp
 combinations, the banner bodies, `_normalize_shim_state` and the file-scope bounds.
 The `SRP-*` rows drive the real runner in a real `$( )`, one per failure mode:
 TERM-ignoring trees, exit 0 on TERM, launch failures, unusable `ps` tables, recycled
-identities, signals, and the real `TRAPZERR` under errexit (SRP-z). The `RLP-*` rows
+identities, signals, and the real `TRAPZERR` under errexit (SRP-z). SRP-c's clean-TERM
+fixture ignores TERM in its holder process, so its outcome cannot depend on the order
+the sweep signals the stub and that descendant. SRP-c2 forces both orders through a
+test-only wrapper around the real `_probe_tree_signal`, which signals only ids the
+production walker tracked and leaves the KILL walk untouched, against the repaired
+fixture and, as a negative control, the original, which must lose its marker when the
+descendant is signalled first. The `RLP-*` rows
 drive the real `cmd_reload`: the order against a shared marker file, `.env` handling,
 refusals with no teardown (RLP-g, RLP-h) and, through real `cmd_up`, the banner and a
 probe count of exactly one (RLP-i to RLP-l). HERM-a records that the LR, RB and WQ

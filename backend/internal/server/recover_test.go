@@ -9,6 +9,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"reflect"
+	"sort"
 	"strings"
 	"testing"
 	"time"
@@ -1103,13 +1104,17 @@ func seedRecoverableDecompositionChild(t *testing.T, rr *recoverRepo, art *fakeA
 	parent.WorkflowSpec = []byte(gatedSpecYAML)
 	planStage := rr.seedStage(parent.ID, 0, run.StageStateSucceeded)
 
+	// A minimal REAL approved decomposition: docs/extra.md and backend/new.go
+	// stay undeclared, so the fold tests keep their meaning under the #4798 guard.
+	handlers := []plan.ScopeFile{{Path: "backend/internal/server/handlers.go", Operation: plan.FileOpModify}}
 	p := &plan.Plan{
 		PlanVersion:  "standard_v1",
 		Summary:      "decomposition child plan",
 		Verification: plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
-		Scope: plan.Scope{
-			Files: []plan.ScopeFile{{Path: "backend/internal/server/handlers.go", Operation: plan.FileOpModify}},
-		},
+		Scope:        plan.Scope{Files: handlers},
+		Decomposition: &plan.Decomposition{Rationale: "split", SubPlans: []plan.SubPlanSummary{
+			{Title: "handlers", ScopeHint: "server", Scope: &plan.Scope{Files: handlers}},
+		}},
 	}
 	planBytes, err := json.Marshal(p)
 	if err != nil {
@@ -1132,6 +1137,8 @@ func seedRecoverableDecompositionChild(t *testing.T, rr *recoverRepo, art *fakeA
 	pid := parent.ID
 	child.ParentRunID = &pid
 	child.DecomposedFrom = &pid
+	sliceIdx := 0
+	child.SliceIndex = &sliceIdx
 	implStage := rr.seedStage(child.ID, 0, run.StageStateFailed)
 	implStage.Type = run.StageTypeImplement
 	implStage.FailureCategory = cat
@@ -2677,4 +2684,369 @@ func TestRecoverRun_IneligibleDecomposedRunStaysNotEligible(t *testing.T) {
 	}
 	assertErrorCode(t, w, "recovery_not_eligible")
 	assertNoRunMinted(t, rr)
+}
+
+// --- #4798: slice ownership on the in-place decomposition-child recovery ------
+
+// failNthListArtifactRepo fails only the Nth ListForStage call. The eligibility
+// block's plan read comes first, so a global listErr would be masked by its 500.
+type failNthListArtifactRepo struct {
+	*fakeArtifactRepo
+	n     int
+	calls int
+	err   error
+}
+
+func (f *failNthListArtifactRepo) ListForStage(ctx context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	f.calls++
+	if f.calls == f.n {
+		return nil, f.err
+	}
+	return f.fakeArtifactRepo.ListForStage(ctx, stageID)
+}
+
+// failRefusedAuditRepo fails only scope_amendment_refused appends.
+type failRefusedAuditRepo struct {
+	*recoverAuditRepo
+}
+
+func (a *failRefusedAuditRepo) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if p.Category == CategoryScopeAmendmentRefused {
+		return nil, errors.New("refused append offline")
+	}
+	return a.recoverAuditRepo.AppendChained(ctx, p)
+}
+
+// resumeOwnershipFixture is the resume contract's fixture: slice 0 {docs/a.md},
+// slice 1 {docs/b.md}, slice 2 {pkg/c.go} depends_on [0], one minted child per
+// slice, requester child 2 failed category-B, child 0 succeeded.
+type resumeOwnershipFixture struct {
+	s         *Server
+	rr        *recoverRepo
+	sa        *fakeScopeAmendmentRepo
+	au        *recoverAuditRepo
+	art       *fakeArtifactRepo
+	planStage *run.Stage
+	child     *run.Run
+	impl      *run.Stage
+	siblings  map[int]*run.Run
+}
+
+func newResumeOwnershipFixture(t *testing.T) *resumeOwnershipFixture {
+	t.Helper()
+	s, rr, sa, au, art := newDecompositionRecoverServer(t)
+	parent := rr.seedRun()
+	parent.WorkflowID = "feature_change"
+	parent.WorkflowSpec = []byte(gatedSpecYAML)
+	f := &resumeOwnershipFixture{s: s, rr: rr, sa: sa, au: au, art: art, siblings: map[int]*run.Run{}}
+	f.planStage = rr.seedStage(parent.ID, 0, run.StageStateSucceeded)
+	f.seedPlan(t, &plan.Decomposition{Rationale: "split", SubPlans: ownershipSlices(
+		ownSpec{files: []string{"docs/a.md"}},
+		ownSpec{files: []string{"docs/b.md"}},
+		ownSpec{files: []string{"pkg/c.go"}, deps: []int{0}},
+	)})
+	pid := parent.ID
+	for i := 0; i < 3; i++ {
+		idx := i
+		c := rr.seedRun()
+		c.WorkflowID = "feature_change"
+		c.WorkflowSpec = []byte(gatedSpecYAML)
+		c.ParentRunID = &pid
+		c.DecomposedFrom = &pid
+		c.SliceIndex = &idx
+		f.siblings[i] = c
+	}
+	f.siblings[0].State = run.StateSucceeded
+	f.child = f.siblings[2]
+	f.child.State = run.StateFailed
+	f.impl = rr.seedStage(f.child.ID, 0, run.StageStateFailed)
+	f.impl.Type = run.StageTypeImplement
+	f.impl.FailureCategory = failureCat(run.FailureB)
+	return f
+}
+
+// seedPlan replaces the parent's approved plan; a nil decomposition is a flat plan.
+func (f *resumeOwnershipFixture) seedPlan(t *testing.T, d *plan.Decomposition) {
+	t.Helper()
+	f.art.all = nil
+	body, err := json.Marshal(&plan.Plan{
+		PlanVersion: "standard_v1", Summary: "s",
+		Verification:  plan.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: d,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := "standard_v1"
+	if _, err := f.art.Create(context.Background(), artifact.CreateParams{
+		StageID: f.planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: body,
+	}); err != nil {
+		t.Fatalf("seed plan: %v", err)
+	}
+}
+
+func (f *resumeOwnershipFixture) post(t *testing.T, paths ...string) *httptest.ResponseRecorder {
+	t.Helper()
+	entries := make([]string, 0, len(paths))
+	for _, p := range paths {
+		entries = append(entries, `{"path":"`+p+`"}`)
+	}
+	body := `{"reason":"resume the failed slice"}`
+	if len(paths) > 0 {
+		body = `{"reason":"resume the failed slice","add_scope_files":[` + strings.Join(entries, ",") + `]}`
+	}
+	return postRecover(t, f.s, f.child.ID.String(), body, nil)
+}
+
+// assertNothingWritten reads COMMITTED state: the child run and implement stage
+// are STILL failed, so RedriveChild did not take effect even if a status matched;
+// no amendment row of any status; no plan_reused_from.
+func (f *resumeOwnershipFixture) assertNothingWritten(t *testing.T) {
+	t.Helper()
+	gotRun, err := f.rr.GetRun(context.Background(), f.child.ID)
+	if err != nil {
+		t.Fatalf("GetRun: %v", err)
+	}
+	if gotRun.State != run.StateFailed {
+		t.Errorf("child run state = %q, want still failed", gotRun.State)
+	}
+	gotStage, err := f.rr.GetStage(context.Background(), f.impl.ID)
+	if err != nil {
+		t.Fatalf("GetStage: %v", err)
+	}
+	if gotStage.State != run.StageStateFailed {
+		t.Errorf("implement stage state = %q, want still failed", gotStage.State)
+	}
+	rows, err := f.sa.ListByRun(context.Background(), f.child.ID)
+	if err != nil {
+		t.Fatalf("ListByRun: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("%d amendment row(s) of any status, want 0", len(rows))
+	}
+	if n := countPlanReusedFrom(f.au); n != 0 {
+		t.Errorf("%d plan_reused_from entries, want 0", n)
+	}
+}
+
+// assertReopened is the admit contract: 201, the child re-opened and, with paths,
+// one approved row on the existing stage.
+func (f *resumeOwnershipFixture) assertReopened(t *testing.T, w *httptest.ResponseRecorder, wantRows int) {
+	t.Helper()
+	if w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	got, err := f.rr.GetStage(context.Background(), f.impl.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got.State != run.StageStatePending {
+		t.Errorf("implement stage state = %q, want pending", got.State)
+	}
+	rows, err := f.sa.ListByRun(context.Background(), f.child.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(rows) != wantRows {
+		t.Fatalf("%d amendment rows, want %d", len(rows), wantRows)
+	}
+	for _, a := range rows {
+		if a.Status != scopeamendment.StatusApproved {
+			t.Errorf("amendment status = %q, want approved", a.Status)
+		}
+	}
+	for _, e := range f.au.appended {
+		if e.Category == CategoryScopeAmendmentRefused {
+			t.Errorf("a scope_amendment_refused row on an admitted resume: %s", e.Payload)
+		}
+	}
+}
+
+// assertResumeRefused pins the 409: owner, child run id, remedy, retryable false
+// and exactly one refused row with phase resume, actor user and the request
+// phase's payload keys.
+func (f *resumeOwnershipFixture) assertResumeRefused(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, errCodeAmendmentPathOwnedBySibling)
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	d := env.Error.Details
+	conflicts, _ := d["conflicts"].([]any)
+	if len(conflicts) == 0 {
+		t.Fatalf("details.conflicts empty: %v", d)
+	}
+	first, _ := conflicts[0].(map[string]any)
+	if first["owning_slice"] != float64(1) || first["owning_child_run_id"] != f.siblings[1].ID.String() {
+		t.Errorf("conflicts[0] = %v, want slice 1 and child %s", first, f.siblings[1].ID)
+	}
+	if remedy, _ := d["remedy"].(string); !strings.Contains(remedy, "still failed") {
+		t.Errorf("details.remedy = %q, want the resume remedy", remedy)
+	}
+	if d["retryable"] != false {
+		t.Errorf("details.retryable = %v, want false", d["retryable"])
+	}
+	var refused []audit.ChainAppendParams
+	for _, e := range f.au.appended {
+		if e.Category == CategoryScopeAmendmentRefused {
+			refused = append(refused, e)
+		}
+	}
+	if len(refused) != 1 {
+		t.Fatalf("%d scope_amendment_refused rows, want exactly 1", len(refused))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(refused[0].Payload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	if payload["phase"] != sliceOwnershipPhaseResume {
+		t.Errorf("phase = %v, want %s", payload["phase"], sliceOwnershipPhaseResume)
+	}
+	if refused[0].ActorKind == nil || *refused[0].ActorKind != audit.ActorUser {
+		t.Errorf("actor = %v, want user", refused[0].ActorKind)
+	}
+	keys := make([]string, 0, len(payload))
+	for k := range payload {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	if !reflect.DeepEqual(keys, []string{"paths", "phase", "reason", "slice_ownership"}) {
+		t.Errorf("payload keys = %v", keys)
+	}
+	f.assertNothingWritten(t)
+}
+
+// assertCheckFailed pins the fail-closed 500 with its retryability and reason.
+func (f *resumeOwnershipFixture) assertCheckFailed(t *testing.T, w *httptest.ResponseRecorder, reason string, retryable bool) {
+	t.Helper()
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	assertErrorCode(t, w, errCodeSliceOwnershipCheckFailed)
+	var env errorEnvelope
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatal(err)
+	}
+	if env.Error.Details["reason"] != reason || env.Error.Details["retryable"] != retryable {
+		t.Errorf("details = %v, want reason %s retryable %v", env.Error.Details, reason, retryable)
+	}
+	if remedy, _ := env.Error.Details["remedy"].(string); remedy == "" {
+		t.Errorf("details.remedy is empty: %v", env.Error.Details)
+	}
+	f.assertNothingWritten(t)
+}
+
+// TestRecoverRun_DecompositionChild_SliceOwnership is the resume half of the #4798
+// contract. Resume applies the STRUCTURAL #4679 rule and does not check delivery:
+// ancestor_state_not_read_on_resume pins that so the residual stays visible.
+func TestRecoverRun_DecompositionChild_SliceOwnership(t *testing.T) {
+	t.Run("non_ancestor_path_refused", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.assertResumeRefused(t, f.post(t, "docs/b.md"))
+	})
+	t.Run("mixed_set_refused_whole", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.assertResumeRefused(t, f.post(t, "docs/a.md", "docs/b.md"))
+	})
+	t.Run("ancestor_path_allowed", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.assertReopened(t, f.post(t, "docs/a.md"), 1)
+	})
+	t.Run("ancestor_state_not_read_on_resume", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.siblings[0].State = run.StateRunning
+		f.assertReopened(t, f.post(t, "docs/a.md"), 1)
+	})
+	t.Run("own_slice_path_allowed", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.assertReopened(t, f.post(t, "pkg/c.go"), 1)
+	})
+	t.Run("undeclared_path_allowed", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.assertReopened(t, f.post(t, "docs/nobody.md"), 1)
+	})
+	t.Run("initial_plan_read_is_internal_error", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		const cause = "first plan read offline sentinel"
+		f.art.listErr = errors.New(cause)
+		w := f.post(t, "docs/a.md")
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "internal_error")
+		if strings.Contains(w.Body.String(), cause) {
+			t.Errorf("raw cause in the body: %s", w.Body.String())
+		}
+		f.assertNothingWritten(t)
+	})
+	t.Run("later_plan_read_error_fails_closed", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		const cause = "second plan read offline sentinel"
+		var logBuf bytes.Buffer
+		f.s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, &slog.HandlerOptions{Level: slog.LevelDebug}))
+		f.s.cfg.ArtifactRepo = &failNthListArtifactRepo{fakeArtifactRepo: f.art, n: 2, err: errors.New(cause)}
+		w := f.post(t, "docs/a.md")
+		f.assertCheckFailed(t, w, "parent_plan_unreadable", true)
+		if strings.Contains(w.Body.String(), cause) {
+			t.Errorf("raw cause in the body: %s", w.Body.String())
+		}
+		if !strings.Contains(soleLogRecord(t, &logBuf, "http error response")["cause"].(string), cause) {
+			t.Errorf("the log record must carry the cause: %s", logBuf.String())
+		}
+	})
+	t.Run("later_read_error_without_add_scope_files", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.s.cfg.ArtifactRepo = &failNthListArtifactRepo{fakeArtifactRepo: f.art, n: 2, err: errors.New("never reached")}
+		f.assertReopened(t, f.post(t), 0)
+	})
+	t.Run("plan_missing_not_eligible", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.art.all = nil
+		w := f.post(t, "docs/a.md")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_not_eligible")
+		f.assertNothingWritten(t)
+	})
+	t.Run("nil_artifact_repo_not_eligible", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.s.cfg.ArtifactRepo = nil
+		w := f.post(t, "docs/a.md")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, "recovery_not_eligible")
+		f.assertNothingWritten(t)
+	})
+	t.Run("plan_absent_fails_closed_no_decomposition", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.seedPlan(t, nil)
+		f.assertCheckFailed(t, f.post(t, "docs/a.md"), "decomposition_absent", false)
+	})
+	t.Run("plan_absent_fails_closed_nil_slice_index", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.child.SliceIndex = nil
+		f.assertCheckFailed(t, f.post(t, "docs/a.md"), "decomposition_absent", false)
+	})
+	t.Run("plan_absent_fails_closed_slice_out_of_range", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		idx := 99
+		f.child.SliceIndex = &idx
+		f.assertCheckFailed(t, f.post(t, "docs/a.md"), "decomposition_absent", false)
+	})
+	t.Run("refusal_audit_append_failure_still_refused", func(t *testing.T) {
+		f := newResumeOwnershipFixture(t)
+		f.s.cfg.AuditRepo = &failRefusedAuditRepo{recoverAuditRepo: f.au}
+		w := f.post(t, "docs/b.md")
+		if w.Code != http.StatusConflict {
+			t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+		}
+		assertErrorCode(t, w, errCodeAmendmentPathOwnedBySibling)
+		f.assertNothingWritten(t)
+	})
 }

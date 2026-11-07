@@ -3,11 +3,24 @@ package mcpserver
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/apitoken"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/artifact"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	planpkg "github.com/kuhlman-labs/fishhawk/backend/internal/plan"
+	runmodel "github.com/kuhlman-labs/fishhawk/backend/internal/run"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/scopeamendment"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/server"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
 )
 
 // --- fishhawk_decide_scope_completeness (#1231) ---
@@ -439,6 +452,8 @@ func TestDecideScopeCompleteness_AmendBackendRefusalsSurfaced(t *testing.T) {
 		{"amend_budget_exhausted", http.StatusConflict},
 		{"amend_unrecorded", http.StatusInternalServerError},
 		{"amend_resume_failed", http.StatusInternalServerError},
+		{"amendment_path_owned_by_sibling_slice", http.StatusConflict},
+		{"slice_ownership_check_failed", http.StatusInternalServerError},
 	} {
 		code := tc.code
 		t.Run(code, func(t *testing.T) {
@@ -458,4 +473,256 @@ func TestDecideScopeCompleteness_AmendBackendRefusalsSurfaced(t *testing.T) {
 			}
 		})
 	}
+}
+
+// amendOwnershipE2E is a real-Postgres decomposition with the requester parked at
+// slice 0 depends_on [2], and slice 1 owning a path with no edge.
+type amendOwnershipE2E struct {
+	parent  *runmodel.Run
+	child   *runmodel.Run
+	stageID uuid.UUID
+	sibling map[int]*runmodel.Run
+	impl    map[int]*runmodel.Stage
+}
+
+// parkRepo is the optional capability the runner-report handler type-asserts.
+type parkRepo interface {
+	ParkScopeCompletenessAndAppend(ctx context.Context, stageID uuid.UUID, park runmodel.ScopeCompletenessPark, p audit.ChainAppendParams) (*runmodel.Stage, bool, error)
+}
+
+func seedAmendOwnershipE2E(t *testing.T, ctx context.Context, runRepo runmodel.Repository, artRepo artifact.Repository) amendOwnershipE2E {
+	t.Helper()
+	mint := func(parent *uuid.UUID, idx *int) *runmodel.Run {
+		t.Helper()
+		r, err := runRepo.CreateRun(ctx, runmodel.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "abc", TriggerSource: runmodel.TriggerCLI,
+			RunnerKind: runmodel.RunnerKindLocal, ParentRunID: parent, DecomposedFrom: parent, SliceIndex: idx,
+		})
+		if err != nil {
+			t.Fatalf("create run: %v", err)
+		}
+		return r
+	}
+	newStage := func(runID uuid.UUID, seq int, typ runmodel.StageType) *runmodel.Stage {
+		t.Helper()
+		st, err := runRepo.CreateStage(ctx, runmodel.CreateStageParams{
+			RunID: runID, Sequence: seq, Type: typ, ExecutorKind: runmodel.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create stage: %v", err)
+		}
+		return st
+	}
+	parent := mint(nil, nil)
+	locker, ok := any(runRepo).(interface {
+		ResolveRunnerKind(context.Context, uuid.UUID, string) (runmodel.RunnerKindResolution, error)
+	})
+	if !ok {
+		t.Fatal("run repository cannot lock runner_kind")
+	}
+	if _, err := locker.ResolveRunnerKind(ctx, parent.ID, runmodel.RunnerKindLocal); err != nil {
+		t.Fatalf("lock parent: %v", err)
+	}
+	planStage := newStage(parent.ID, 0, runmodel.StageTypePlan)
+	scope := func(path string) *planpkg.Scope {
+		return &planpkg.Scope{Files: []planpkg.ScopeFile{{Path: path, Operation: planpkg.FileOpModify}}}
+	}
+	body, err := json.Marshal(planpkg.Plan{
+		PlanVersion: "standard_v1", Summary: "s",
+		Verification: planpkg.Verification{TestStrategy: "ts", RollbackPlan: "rb"},
+		Decomposition: &planpkg.Decomposition{Rationale: "split", SubPlans: []planpkg.SubPlanSummary{
+			{Title: "own", ScopeHint: "own", Scope: scope("own/"), DependsOn: []int{2}},
+			{Title: "stranger", ScopeHint: "docs", Scope: scope("docs/b.md")},
+			{Title: "ancestor", ScopeHint: "docs", Scope: scope("docs/a.md")},
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	sv := "standard_v1"
+	if _, err := artRepo.Create(ctx, artifact.CreateParams{
+		StageID: planStage.ID, Kind: artifact.KindPlan, SchemaVersion: &sv, Content: body,
+		ContentHash: uuid.NewString() + uuid.NewString(),
+	}); err != nil {
+		t.Fatalf("create plan artifact: %v", err)
+	}
+	out := amendOwnershipE2E{parent: parent, sibling: map[int]*runmodel.Run{}, impl: map[int]*runmodel.Stage{}}
+	pid := parent.ID
+	for i := 0; i < 3; i++ {
+		idx := i
+		c := mint(&pid, &idx)
+		st := newStage(c.ID, 1, runmodel.StageTypeImplement)
+		if i == 0 {
+			out.child, out.stageID = c, st.ID
+			continue
+		}
+		out.sibling[i], out.impl[i] = c, st
+	}
+	for _, to := range []runmodel.StageState{runmodel.StageStateDispatched, runmodel.StageStateRunning} {
+		if _, err := runRepo.TransitionStage(ctx, out.stageID, to, nil); err != nil {
+			t.Fatalf("transition requester: %v", err)
+		}
+	}
+	parker, ok := any(runRepo).(parkRepo)
+	if !ok {
+		t.Fatal("run repository cannot park")
+	}
+	stageID := out.stageID
+	actor := audit.ActorSystem
+	subject := "runner"
+	if _, _, err := parker.ParkScopeCompletenessAndAppend(ctx, out.stageID, runmodel.ScopeCompletenessPark{
+		HeldCommitSHA: strings.Repeat("1", 40), RunBranch: "fishhawk/run-x", VerifiedTreeSHA: strings.Repeat("2", 40),
+		BaseSHA: strings.Repeat("3", 40), MissingPaths: []string{"docs/never-edited.md"},
+	}, audit.ChainAppendParams{
+		RunID: out.child.ID, StageID: &stageID, Timestamp: time.Now().UTC(), Category: "scope_completeness_parked",
+		ActorKind: &actor, ActorSubject: &subject, Payload: json.RawMessage(`{}`),
+	}); err != nil {
+		t.Fatalf("park: %v", err)
+	}
+	return out
+}
+
+// deliver walks the ancestor to succeeded; integrate records it on the parent's
+// real chain.
+func (e amendOwnershipE2E) deliver(t *testing.T, ctx context.Context, runRepo runmodel.Repository, idx int) {
+	t.Helper()
+	for _, to := range []runmodel.StageState{runmodel.StageStateDispatched, runmodel.StageStateRunning, runmodel.StageStateSucceeded} {
+		if _, err := runRepo.TransitionStage(ctx, e.impl[idx].ID, to, nil); err != nil {
+			t.Fatalf("transition implement: %v", err)
+		}
+	}
+	for _, to := range []runmodel.State{runmodel.StateRunning, runmodel.StateSucceeded} {
+		if _, err := runRepo.TransitionRun(ctx, e.sibling[idx].ID, to); err != nil {
+			t.Fatalf("transition run: %v", err)
+		}
+	}
+}
+
+func (e amendOwnershipE2E) integrate(t *testing.T, ctx context.Context, auditRepo audit.Repository, idx int) {
+	t.Helper()
+	payload, _ := json.Marshal(map[string]any{"consolidated_branch": "fishhawk/run-parent", "child_run_ids": []string{e.sibling[idx].ID.String()}})
+	actor := audit.ActorSystem
+	subject := "test"
+	if _, err := auditRepo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID: e.parent.ID, Timestamp: time.Now().UTC(), Category: "slices_integrated",
+		ActorKind: &actor, ActorSubject: &subject, Payload: payload,
+	}); err != nil {
+		t.Fatalf("append slices_integrated: %v", err)
+	}
+}
+
+// TestDecideScopeCompleteness_AmendOwnershipRefusal_EndToEnd crosses the MCP tool,
+// the real API client, the real HTTP handler and real Postgres repositories. The
+// delivered-ancestor control goes through identical wiring, so the refusals cannot
+// be a 401/403 masking them.
+func TestDecideScopeCompleteness_AmendOwnershipRefusal_EndToEnd(t *testing.T) {
+	ctx := context.Background()
+	pool := pgtest.NewPool(t)
+	runRepo := runmodel.NewPostgresRepository(pool)
+	artRepo := artifact.NewPostgresRepository(pool)
+	auditRepo := audit.NewPostgresRepository(pool)
+	amendRepo := scopeamendment.NewPostgresRepository(pool)
+
+	const bearer = "fhk_amend_ownership_e2e"
+	srv := server.New(server.Config{
+		RunRepo: runRepo, ArtifactRepo: artRepo, AuditRepo: auditRepo, ScopeAmendmentRepo: amendRepo,
+		SigningRepo: signing.NewPostgresRepository(pool),
+		APITokenRepo: &stubMCPAPITokens{tok: &apitoken.Token{
+			ID: uuid.New(), Subject: "github:op", Scopes: []string{"read:runs", "read:audit", "write:runs", "write:stages"}, PlainText: bearer,
+		}},
+	})
+	ts := httptest.NewServer(srv.Handler())
+	t.Cleanup(ts.Close)
+	r := &runResolver{api: newAPIClient(config{backendURL: ts.URL, apiToken: bearer}), getenv: envFuncFromMap(nil)}
+
+	amend := func(child uuid.UUID, path string, ack bool) error {
+		_, _, err := r.decideScopeCompleteness(ctx, nil, DecideScopeCompletenessInput{
+			RunID: child.String(), Decision: "amend", Reason: "widen", AcknowledgeOwnerUnresolved: ack,
+			Paths: []ScopeAmendmentPathEntry{{Path: path, Operation: "modify"}},
+		})
+		return err
+	}
+	apiErrOf := func(t *testing.T, err error) *apiError {
+		t.Helper()
+		var ae *apiError
+		if !errors.As(err, &ae) {
+			t.Fatalf("err = %v, want an *apiError through the chain", err)
+		}
+		return ae
+	}
+	assertParked := func(t *testing.T, seeded amendOwnershipE2E) {
+		t.Helper()
+		rows, err := amendRepo.ListByRun(ctx, seeded.child.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(rows) != 0 {
+			t.Errorf("%d amendment rows, want 0", len(rows))
+		}
+		st, err := runRepo.GetStage(ctx, seeded.stageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.State != runmodel.StageStateAwaitingScopeDecision {
+			t.Errorf("stage state = %q, want parked", st.State)
+		}
+	}
+
+	t.Run("non_ancestor", func(t *testing.T) {
+		seeded := seedAmendOwnershipE2E(t, ctx, runRepo, artRepo)
+		ae := apiErrOf(t, amend(seeded.child.ID, "docs/b.md", false))
+		if ae.Code != "amendment_path_owned_by_sibling_slice" || ae.StatusCode != http.StatusConflict {
+			t.Fatalf("got %d %q: %v", ae.StatusCode, ae.Code, ae)
+		}
+		conflicts, _ := ae.Details["conflicts"].([]any)
+		if len(conflicts) == 0 {
+			t.Fatalf("details.conflicts empty: %v", ae.Details)
+		}
+		first, _ := conflicts[0].(map[string]any)
+		if first["owning_slice"] != float64(1) || first["owning_child_run_id"] != seeded.sibling[1].ID.String() {
+			t.Errorf("conflicts[0] = %v, want slice 1 and its child", first)
+		}
+		if remedy, _ := ae.Details["remedy"].(string); !strings.Contains(remedy, "corrected decomposition") {
+			t.Errorf("details.remedy = %q", remedy)
+		}
+		if ae.Details["retryable"] != false {
+			t.Errorf("details.retryable = %v, want false", ae.Details["retryable"])
+		}
+		assertParked(t, seeded)
+	})
+
+	t.Run("unproven_ancestor_acknowledged", func(t *testing.T) {
+		seeded := seedAmendOwnershipE2E(t, ctx, runRepo, artRepo)
+		seeded.deliver(t, ctx, runRepo, 2)
+		ae := apiErrOf(t, amend(seeded.child.ID, "docs/a.md", true))
+		if ae.Code != "amend_refused_owner_slice_active" || ae.StatusCode != http.StatusConflict {
+			t.Fatalf("got %d %q: %v", ae.StatusCode, ae.Code, ae)
+		}
+		if ae.Details["reason"] != "ancestor_not_integrated" || ae.Details["retryable"] != true {
+			t.Errorf("details = %v, want ancestor_not_integrated retryable", ae.Details)
+		}
+		if ae.Details["sibling_run_id"] != seeded.sibling[2].ID.String() {
+			t.Errorf("sibling_run_id = %v, want %s", ae.Details["sibling_run_id"], seeded.sibling[2].ID)
+		}
+		if remedy, _ := ae.Details["remedy"].(string); remedy == "" {
+			t.Errorf("details.remedy empty: %v", ae.Details)
+		}
+		assertParked(t, seeded)
+	})
+
+	t.Run("delivered_ancestor_control", func(t *testing.T) {
+		seeded := seedAmendOwnershipE2E(t, ctx, runRepo, artRepo)
+		seeded.deliver(t, ctx, runRepo, 2)
+		seeded.integrate(t, ctx, auditRepo, 2)
+		if err := amend(seeded.child.ID, "docs/a.md", false); err != nil {
+			t.Fatalf("amend naming a delivered ancestor's path: %v", err)
+		}
+		st, err := runRepo.GetStage(ctx, seeded.stageID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if st.State != runmodel.StageStatePending {
+			t.Errorf("stage state = %q, want pending", st.State)
+		}
+	})
 }

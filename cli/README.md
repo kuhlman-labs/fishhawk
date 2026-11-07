@@ -195,8 +195,8 @@ overwrite, `2` usage or I/O. Full contract, translation table and refusal taxono
 `fishhawk runner start --run-id … --stage-id … --workflow … --stage …` (`cmd/fishhawk/runner.go`) is a thin wrapper
 around the `fishhawk-runner` binary. It composes the runner's argv from the operator's config — backend URL via
 `--backend-url`, token via the `FISHHAWK_API_TOKEN` env — auto-detects `--github-repo` from
-`git remote get-url origin` when not set on a github run, and passes `--no-pr` through only when given (default off:
-the implement stage pushes and opens the change request).
+`git remote get-url origin` when not set on a github run, passes `--no-pr` through only when given (default off:
+the implement stage pushes and opens the change request), and derives `--agent` from the stage row (below).
 
 - **Test seams:** four seams (`runnerStartCommand`, `runnerBinaryLookPath`, `gitRemoteOriginURL`, `runnerNewClient`)
   let unit tests assert on the constructed argv without actually spawning the binary or reaching a backend.
@@ -215,8 +215,8 @@ omitted derives from the run row's `forge_base_url`) — and, symmetric with the
 **When the row is read.** Whenever ANY of `--forge`, `--github-repo`, or (for a gitlab target) `--gitlab-base-url` is
 omitted, the verb performs ONE single-run `GET /v0/runs/{id}` via `runnerNewClient` BEFORE the origin auto-detect and
 BEFORE the argv build — the single-run route is the only one the backend serves `forge_base_url` on (the list route
-deliberately omits it). With `--forge github --github-repo <slug>` both explicit, the verb makes zero network calls
-before the spawn, as before. Explicit flags always win over the row.
+deliberately omits it). With `--forge github --github-repo <slug>` both explicit, the verb skips this run read, as
+before; it still makes the stage read described under "Stage provider". Explicit flags always win over the row.
 
 **Fail-closed rules on an unreadable row** (backend unreachable, non-2xx, or a non-UUID `--run-id`):
 
@@ -237,6 +237,44 @@ intact) — the github.com-only `detectGitHubRepo` is skipped on gitlab. The arg
 `--forge gitlab --gitlab-base-url <url>` right after `--github-repo` (the runner keeps `--github-repo` as the project
 slug on both forges); a github run emits nothing new, so its argv is byte-identical to before. After the runner exits,
 the GitHub sticky status comment (`postOrEditStatusComment`, posted via `gh`) is skipped for a gitlab run.
+
+### Stage provider: `--agent` from the stage row ([#5095](https://github.com/kuhlman-labs/fishhawk/issues/5095))
+
+`runner start` runs a stage under the provider its cached workflow declares, the same way the local MCP spawn verbs do.
+After forge and repo resolution and before the argv build, it makes ONE `GET /v0/runs/{id}/stages` via
+`runnerNewClient`, finds `--stage-id`, and maps that row's `executor`. It always makes this read, so the verb now needs
+a reachable backend before the spawn. The runner it spawns already needs the same backend for `--fetch-prompt` and
+`--upload-trace`.
+
+| Stage row `executor` | Runner argv |
+|---|---|
+| `kind` other than `agent` | no `--agent` (runner default) |
+| empty `ref` | no `--agent` (runner default) |
+| `claude-code`, `codex` | `--agent <ref>` |
+| `claudecode` | `--agent claude-code` |
+| anything else | **REFUSES** with `unsupported_executor_agent` |
+
+Values are trimmed first. **Residual:** an agent stage with an empty `ref` (a legacy row) cannot be told apart from one
+that wants the default, so it keeps the runner default rather than refusing.
+
+**Every failure refuses to spawn** (`exitFailure`), naming the run, the stage and a remedy. A stage whose provider cannot
+be established must not silently run under the default:
+
+| Failure | Remedy named |
+|---|---|
+| non-UUID `--run-id` (refused before the read) | pass the run's UUID |
+| stage read fails (backend unreachable or non-2xx) | fix backend reachability (`--backend-url` / `FISHHAWK_BACKEND_URL`) |
+| `--stage-id` is not in the run's stage list | pass the `--stage-id` of a stage in this run |
+| unsupported provider | correct `executor.agent` in the workflow source and start a new run; a run keeps the workflow it was admitted with |
+
+Each also names the override: this verb adds no `--agent` flag, so to run a stage under a chosen provider, or when the
+backend read is the problem, invoke `fishhawk-runner --agent <provider>` directly.
+
+The mapping is a hand mirror of `stageRunnerAgent` in `backend/internal/mcpserver/run_stage.go` and the runner's
+`selectInvoker`, because the modules share no code. A provider missed here refuses loudly rather than choosing the wrong
+provider. Pinned by `TestRunnerStart_RoutesStageExecutorAgent`, `TestRunnerStart_UnsupportedExecutorAgent_RefusesBeforeSpawn`,
+`TestRunnerStart_StageReadFails_RefusesSpawn`, `TestRunnerStart_StageNotInRun_RefusesSpawn` and
+`TestRunnerStart_NonUUIDRunID_RefusesSpawn`.
 
 **`run start` ladder difference (`--forge` on run-create).** `fishhawk run start --forge github|gitlab` is validated
 locally (anything else is a usage error with no request) and sent as the optional `forge` field on `POST /v0/runs`,
