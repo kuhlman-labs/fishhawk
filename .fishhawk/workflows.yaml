@@ -66,19 +66,20 @@ review_conventions:
 
 # Reviewer personas (ADR-084). Each runs as one extra reviewer invocation with
 # its own remit, in addition to the stage's standard reviewers and under their
-# authority. The model and severity caps match the catch-rate evidence the
-# personas were measured under (docs/compliance/planreview-catchrate-evidence.md,
-# baseline d624cd36): claude-sonnet-5-5, medium cap.
+# authority. The Codex-only quota contingency uses gpt-6.1-sol/high while
+# retaining the medium caps. Historical catch-rate evidence was measured on
+# claude-sonnet-5-5 (baseline d624cd36), not Sol; it is not a Sol measurement.
+# Mapping, evidence limits and rollout: docs/codex-quota-contingency.md (#5094).
 reviewer_personas:
   # The architect (E78.6 #3757): checks a plan against the in-repo decision
   # record, cites ADRs verbatim, and flags undeclared new architectural
-  # direction. Attached statically to feature_change's plan review. Measured
-  # at 118/138 catch with 24/138 false alarms — expect roughly one advisory
-  # decision_record false alarm in six plans; its cap keeps it at medium.
+  # direction. Attached statically to feature_change's plan review. The prior
+  # Sonnet measurement was 118/138 catch with 24/138 false alarms; those rates
+  # do not characterize Sol. Its existing medium cap is retained.
   architect:
     agent:
-      provider: claudecode
-      model: claude-sonnet-5-5
+      provider: codex
+      model: gpt-6.1-sol
       reasoning_effort: high
     remit:
       path: docs/review/architect-remit.md
@@ -87,12 +88,13 @@ reviewer_personas:
       index: docs/adr/index.json
   # The security persona (E80.5 #3762): a threat-model lens attached by
   # feature_change's escalations to a change touching a sensitive path, at
-  # plan and implement review. Measured at 204/204 catch with 1/136 false
-  # alarms (7/136 with no repository convention).
+  # plan and implement review. The prior Sonnet measurement was 204/204 catch
+  # with 1/136 false alarms (7/136 without the repository convention); those
+  # rates do not characterize Sol.
   security:
     agent:
-      provider: claudecode
-      model: claude-sonnet-5-5
+      provider: codex
+      model: gpt-6.1-sol
       reasoning_effort: high
     remit:
       path: docs/review/security-remit.md
@@ -314,7 +316,8 @@ workflows:
       - id: groom
         type: plan
         executor:
-          agent: claude-code
+          agent: codex
+          model: gpt-6.1-sol
           # A long ranking pass over a few hundred items. `high` rather than
           # `xhigh` keeps the pass well inside the 45m cap below.
           reasoning_effort: high
@@ -431,7 +434,9 @@ workflows:
       - id: scan
         type: plan
         executor:
-          agent: claude-code
+          agent: codex
+          model: gpt-6.1-sol
+          reasoning_effort: high
           timeout: 20m
         produces:
           - artifact: upkeep_report
@@ -562,24 +567,24 @@ workflows:
       - id: plan
         type: plan
         executor:
-          agent: claude-code
+          agent: codex
           # The plan stage is the cheapest agent stage and plan quality is
           # the strongest lever on downstream rework, so it pins the current
-          # Opus rather than taking the deployment default. Effort is pinned
+          # Astra rather than taking the deployment default. Effort is pinned
           # at `xhigh` for the same reason: the extra thinking is cheap here
           # and pays back across every later stage.
-          model: claude-opus-5-5
+          model: gpt-6-astra
           reasoning_effort: xhigh
         # Advisory plan review: agent reviewers surface verdicts before the
         # human gate below, which stays authoritative (agent reviewers plus
-        # a human reviewer resolves to advisory authority). Two providers
-        # review concurrently — independent models disagree in useful ways,
-        # and a concern only one of them raises is still surfaced.
+        # a human reviewer resolves to advisory authority). Sol and Astra
+        # review concurrently through Codex. Distinct models retain model
+        # diversity; this contingency does not retain provider diversity.
         reviewers:
           authority: advisory
           agents:
-            - provider: claudecode
-              model: claude-fable-5-1
+            - provider: codex
+              model: gpt-6.1-sol
               reasoning_effort: high
             - provider: codex
               model: gpt-6-astra
@@ -648,17 +653,14 @@ workflows:
         concurrency:
           limit: 2
         executor:
-          agent: claude-code
+          agent: codex
           # Pinned so the implement model is reproducible and priced rather
-          # than whatever the host's claude CLI defaults to. A plan
+          # than whatever the host's Codex CLI defaults to. A plan
           # model_recommendation or an operator override at the gate still
           # takes precedence over this pin.
-          model: claude-opus-5-5
-          # `xhigh` is Anthropic's recommended level for agentic coding and
-          # the claude CLI's documented default, so this pin should make
-          # today's effective effort explicit rather than change it. If
-          # runtime_observed keeps running long against the 60m budget, drop
-          # to `high` before raising the budget.
+          model: gpt-6-astra
+          # Preserve the prior xhigh effort for the quota contingency;
+          # Astra supports it. Runtime equivalence has not been measured.
           reasoning_effort: xhigh
           # Execution-grounded verifier. After the agent exits, run the
           # project's test command against the committed, scope-only tree
@@ -690,15 +692,15 @@ workflows:
             command: "scripts/verify-change"
             timeout: "40m"
             max_iterations: 1
-        # Advisory implement review: the same two providers read the diff
+        # Advisory implement review: the same two Codex models read the diff
         # against the approved plan and surface verdicts, including a
         # scope-drift flag when the diff exceeds what the plan declared.
         # Verdicts land shortly after the stage's trace is uploaded.
         reviewers:
           authority: advisory
           agents:
-            - provider: claudecode
-              model: claude-fable-5-1
+            - provider: codex
+              model: gpt-6.1-sol
               reasoning_effort: high
             - provider: codex
               model: gpt-6-astra
@@ -826,10 +828,11 @@ workflows:
           limit: 1
         executor:
           # An acceptance stage must run under an agent or human executor.
-          agent: claude-code
+          agent: codex
           # Acceptance drives scripted HTTP checks against the criteria, not
-          # open-ended reasoning, so it runs the current Opus at `medium`.
-          model: claude-opus-5-5
+          # open-ended reasoning, so it declares Astra with `medium` effort.
+          # #5096 must route this model pin before contingency activation.
+          model: gpt-6-astra
           reasoning_effort: medium
         inputs:
           - artifact: plan
@@ -987,10 +990,16 @@ workflows:
       max_retries: 1
     # No periodic `budgets`: advisory would change nothing for the run, and
     # blocking would refuse an incident fix at admission.
-    # Only stage differences are repeated. Workflow-level policy, routing,
-    # actions and escalations above do NOT inherit through extends.
+    # Stage differences and explicit provider/model pins are repeated. The pins
+    # keep this contingency compatible with backend model readers predating
+    # #5095's inheritance fix; the effective assignments match feature_change.
+    # Workflow-level policy, routing, actions and escalations above do NOT
+    # inherit through extends.
     stages:
       - id: plan
+        executor:
+          agent: codex
+          model: gpt-6-astra
         budget:
           max_tokens: 150000
           max_runtime: 10m
@@ -999,6 +1008,9 @@ workflows:
       - id: implement
         # Keep type explicit for the runner-side instruction-path fixture.
         type: implement
+        executor:
+          agent: codex
+          model: gpt-6-astra
         constraints:
           max_files_changed: 15
           # The inherited AGENTS.md built-in exemption cannot override these
@@ -1030,6 +1042,9 @@ workflows:
           limit_usd: 8
           enforcement: advisory
       - id: acceptance
+        executor:
+          agent: codex
+          model: gpt-6-astra
         budget:
           max_tokens: 150000
           max_runtime: 10m
@@ -1090,8 +1105,8 @@ workflows:
         concurrency:
           limit: 2
         executor:
-          agent: claude-code
-          model: claude-opus-5-5
+          agent: codex
+          model: gpt-6-astra
           # Narrow routine work uses medium effort.
           reasoning_effort: medium
           verify:
@@ -1101,8 +1116,8 @@ workflows:
         reviewers:
           authority: gating
           agents:
-            - provider: claudecode
-              model: claude-fable-5-1
+            - provider: codex
+              model: gpt-6.1-sol
               reasoning_effort: high
             - provider: codex
               model: gpt-6-astra
@@ -1172,8 +1187,10 @@ workflows:
       - id: review
         type: review
         executor:
-          agent: claude-code
-          # This executor does not replace implement.reviewers above.
+          agent: codex
+          # This check-gated review spawns no provider invocation. Leave its
+          # model unset: #1416 also reads it as a reviewer-model override;
+          # setting it would add a rung instead of preserving the mapping.
           reasoning_effort: high
         gates:
           # A `check` gate carries no approval predicate: it lets the run
