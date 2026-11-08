@@ -58,7 +58,7 @@ Every fraction is in (0,1). A critical latch enters at the `Critical*` values an
 
 ## Remedy
 
-The remedy text is host- and codebase-agnostic: no repository path, no language-specific cache, no operator location, no host name. The only concrete names it carries are the contributors' own process names; a table hint names only its own process and no path.
+The remedy text is host- and codebase-agnostic: no repository path, no language-specific cache, no operator location, no host name (the portability test matches the host's short name as a whole, case-insensitive, punctuation- or dot-delimited token, so a short host such as `mac` inside an ordinary word like `machine` or a permitted process key like `com.apple.Virtualization.VirtualMachine` is not a hit, while `Mac.` or `mac.example.com` is). The only concrete names it carries are the contributors' own process names; a table hint names only its own process and no path.
 
 - **Per-OS table** (`remedyTable`): darwin `fseventsd` (file-events daemon), `mds_stores` / `mds` (Spotlight), `com.apple.Virtualization.VirtualMachine` (the VM hosting a container runtime); linux `dockerd`, `containerd`, `kswapd` (prefix: `kswapd0`…; a symptom of pressure, not its cause). A name matches its key exactly, by prefix for prefix entries, or as the OS's truncated form of the key (16 bytes on macOS `top`, 15 on Linux `comm`).
 - `GenericAction` (always), `GenericRemedy` (when no contributor has a hint), `HoldGuidance` (always last: hold new stage dispatches until the condition clears; treat stage failures in the episode as infrastructure retries, not fix-ups).
