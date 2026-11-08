@@ -23187,6 +23187,13 @@ func TestAssertionShortfall_ParksThenExemptOpensPRWithNoAgentReRun(t *testing.T)
 		HeldCommitBranch:     golden.HeldCommitBranch,
 		HeldCommitSHA:        heldSHA,
 		HeldCommitBaseSHA:    golden.HeldCommitBaseSHA,
+		// A current backend proves this park owes no required review (ADR-140
+		// (#5047) D9); without that the runner runs the agent instead.
+		SupportsReviewObligationResume: true,
+		HeldCommitReviewObligation: &upload.ReviewObligation{
+			HeadSHA:                     heldSHA,
+			SupplementalScopeExemptions: []upload.ScopeExemption{},
+		},
 	}
 	withFakeUploader(t, fu2)
 
@@ -24037,6 +24044,20 @@ type checkpointBackend struct {
 	// unaffected.
 	rejectFirstShip   bool
 	firstShipRejected bool
+
+	// obligation is the newest failure report's review_obligation, served back on
+	// the next prompt (ADR-140 (#5047) D9). A checkpoint recorded with none serves
+	// known none, the shape a current backend serves a report that proved none.
+	obligation *upload.ReviewObligation
+	// failedReports holds every failure report in order, as decoded off the wire.
+	failedReports []upload.ShipPullRequestArgs
+	// promptFetches counts GET /prompt. With numberAttempts set, each dispatch is
+	// served its own stage_attempt ("attempt-<n>"), as a retried stage is.
+	promptFetches  int
+	numberAttempts bool
+	// onSuccessShip, when set, answers a success ship instead of the default arm
+	// when it returns true.
+	onSuccessShip func(w http.ResponseWriter, raw []byte) bool
 }
 
 // retryAdmitted models handleRetryStage's RetryableFailure gate over the
@@ -24097,13 +24118,22 @@ func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
 	// kind — exactly what resolvePushCheckpointResume emits.
 	mux.HandleFunc("GET /v0/stages/{stage_id}/prompt", func(w http.ResponseWriter, r *http.Request) {
 		b.mu.Lock()
-		cp, opened := b.checkpoint, b.prOpened
+		cp, opened, obligation := b.checkpoint, b.prOpened, b.obligation
+		b.promptFetches++
+		attempt := ""
+		if b.numberAttempts {
+			attempt = fmt.Sprintf("attempt-%d", b.promptFetches)
+		}
 		b.mu.Unlock()
 		resp := map[string]any{
-			"stage_id":    r.PathValue("stage_id"),
-			"stage_type":  "implement",
-			"prompt":      "implement the change",
-			"prompt_hash": "h",
+			"stage_id":                          r.PathValue("stage_id"),
+			"stage_type":                        "implement",
+			"prompt":                            "implement the change",
+			"prompt_hash":                       "h",
+			"supports_review_obligation_resume": true,
+		}
+		if attempt != "" {
+			resp["stage_attempt"] = attempt
 		}
 		if cp != nil && !opened {
 			resp["open_pr_from_held_commit"] = true
@@ -24111,6 +24141,10 @@ func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
 			resp["held_commit_branch"] = cp.Branch
 			resp["held_commit_base_sha"] = cp.BaseSHA
 			resp["held_commit_resume_kind"] = "pr_open"
+			if obligation == nil {
+				obligation = &upload.ReviewObligation{HeadSHA: cp.HeadSHA, SupplementalScopeExemptions: []upload.ScopeExemption{}}
+			}
+			resp["held_commit_review_obligation"] = obligation
 		}
 		w.Header().Set("Content-Type", "application/json")
 		_ = json.NewEncoder(w).Encode(resp)
@@ -24127,23 +24161,40 @@ func newCheckpointBackend(t *testing.T) (*checkpointBackend, *httptest.Server) {
 			HeadSHA         string `json:"head_sha"`
 			BaseSHA         string `json:"base_sha"`
 			VerifiedTreeSHA string `json:"verified_tree_sha"`
+
+			ReviewObligation *upload.ReviewObligation `json:"review_obligation"`
 		}
 		if err := json.Unmarshal(raw, &body); err != nil {
 			w.WriteHeader(http.StatusBadRequest)
 			return
 		}
 		b.mu.Lock()
+		if body.Outcome == "failed" {
+			b.failedReports = append(b.failedReports, upload.ShipPullRequestArgs{
+				Outcome: body.Outcome, Category: body.Category, Branch: body.Branch,
+				HeadSHA: body.HeadSHA, BaseSHA: body.BaseSHA, ReviewObligation: body.ReviewObligation,
+			})
+		}
 		switch {
 		case body.Outcome == "failed" && body.Branch != "" && body.HeadSHA != "":
 			b.checkpoint = &upload.ShipPullRequestArgs{
 				Branch: body.Branch, HeadSHA: body.HeadSHA,
 				BaseSHA: body.BaseSHA, TreeSHA: body.VerifiedTreeSHA,
 			}
+			b.obligation = body.ReviewObligation
 			b.lastFailedCategory = body.Category
 		case body.Outcome == "failed":
 			b.checkpoint = nil
+			b.obligation = nil
 			b.lastFailedCategory = body.Category
 		case body.Outcome == "":
+			if hook := b.onSuccessShip; hook != nil {
+				b.mu.Unlock()
+				if hook(w, raw) {
+					return
+				}
+				b.mu.Lock()
+			}
 			// Model the runner wire defect (#2563 shape): reject the FIRST
 			// success-ship, accept the retry. The runner maps this 400 to
 			// upload.ErrPullRequestInvalid.
@@ -32004,4 +32055,1328 @@ func TestRun_ReasoningEffortPinnedToSpawn(t *testing.T) {
 			}
 		})
 	}
+}
+
+// ---------------------------------------------------------------------------
+// Required-review retention and the long-pass callers (ADR-140 (#5047) D8, D9).
+// ---------------------------------------------------------------------------
+
+// reviewObligationGolden is testdata/wire/review_obligation_wire.json: one
+// contract, one fixture, read through json.RawMessage so every section compares
+// byte for byte with what this module produces.
+type reviewObligationGolden struct {
+	FailureReport     json.RawMessage `json:"failure_report"`
+	PromptFields      json.RawMessage `json:"prompt_fields"`
+	ResumedArtifact   json.RawMessage `json:"resumed_artifact"`
+	KnownRequiredPark struct {
+		ParkedPayload struct {
+			ReviewObligation json.RawMessage `json:"review_obligation"`
+		} `json:"parked_payload"`
+	} `json:"known_required_park"`
+	ReviewRoundInFlight struct {
+		Status   int               `json:"status"`
+		Headers  map[string]string `json:"headers"`
+		Envelope json.RawMessage   `json:"envelope"`
+	} `json:"review_round_in_flight"`
+}
+
+func loadReviewObligationGolden(t *testing.T) reviewObligationGolden {
+	t.Helper()
+	raw, err := os.ReadFile(filepath.Join(pkgSrcDir, "..", "..", "..", "testdata", "wire", "review_obligation_wire.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var g reviewObligationGolden
+	if err := json.Unmarshal(raw, &g); err != nil {
+		t.Fatal(err)
+	}
+	return g
+}
+
+// goldenServedPrompt decodes the golden's prompt_fields through the real
+// FetchedPrompt, so the obligation under test is what the wire delivers.
+func goldenServedPrompt(t *testing.T) upload.FetchedPrompt {
+	t.Helper()
+	var got upload.FetchedPrompt
+	if err := json.Unmarshal(loadReviewObligationGolden(t).PromptFields, &got); err != nil {
+		t.Fatal(err)
+	}
+	if got.HeldCommitReviewObligation == nil || len(got.HeldCommitReviewObligation.SupplementalScopeExemptions) != 1 || !got.SupportsReviewObligationResume {
+		t.Fatalf("setup: golden prompt_fields decoded to %+v", got)
+	}
+	return got
+}
+
+// goldenSupplemental is the golden's required set in the runner's internal form.
+func goldenSupplemental(t *testing.T) []scopeExemption {
+	t.Helper()
+	return toScopeExemptions(goldenServedPrompt(t).HeldCommitReviewObligation.SupplementalScopeExemptions)
+}
+
+// assertKnownNone fails unless o states known none at head: a non-nil empty list
+// that reaches the wire as `[]`, never an absent key.
+func assertKnownNone(t *testing.T, o *upload.ReviewObligation, head, attempt string) {
+	t.Helper()
+	if o == nil {
+		t.Fatal("obligation is nil (unknown), want known none")
+	}
+	if o.HeadSHA != head || o.StageAttempt != attempt {
+		t.Errorf("obligation head/attempt = %q/%q, want %q/%q", o.HeadSHA, o.StageAttempt, head, attempt)
+	}
+	raw, err := json.Marshal(o)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(raw, []byte(`"supplemental_scope_exemptions":[]`)) {
+		t.Errorf("known none must marshal an empty list, got %s", raw)
+	}
+}
+
+// assertGoldenSet fails unless o carries the golden's required set at head.
+func assertGoldenSet(t *testing.T, o *upload.ReviewObligation, head, attempt string) {
+	t.Helper()
+	if o == nil {
+		t.Fatal("obligation is nil, want the required set")
+	}
+	if o.HeadSHA != head || o.StageAttempt != attempt {
+		t.Errorf("obligation head/attempt = %q/%q, want %q/%q", o.HeadSHA, o.StageAttempt, head, attempt)
+	}
+	want := goldenServedPrompt(t).HeldCommitReviewObligation.SupplementalScopeExemptions
+	if !reflect.DeepEqual(o.SupplementalScopeExemptions, want) {
+		t.Errorf("obligation set = %+v, want %+v", o.SupplementalScopeExemptions, want)
+	}
+}
+
+// TestBindReviewObligation_Modes drives the one arming control over every state
+// it separates. The not-capable non-empty row is the only one that disarms.
+func TestBindReviewObligation_Modes(t *testing.T) {
+	set := []scopeExemption{{Path: "a.go", Reason: "r"}}
+	armed := func() *pushCheckpoint {
+		return &pushCheckpoint{branch: "b", headSHA: "h", baseSHA: "base", armed: true, resumeKind: resumeKindPROpen, backendSupportsPushResume: true, prTitle: "t"}
+	}
+	capable := config{runID: "r", stageID: "s", backendSupportsReviewObligation: true, stageAttempt: "a1"}
+	old := config{runID: "r", stageID: "s", stageAttempt: "a1"}
+
+	t.Run("capable_empty", func(t *testing.T) {
+		cp := armed()
+		bindReviewObligation(capable, io.Discard, cp, nil)
+		assertKnownNone(t, cp.reviewObligation, "h", "a1")
+		if !cp.armed {
+			t.Error("must stay armed")
+		}
+	})
+	t.Run("capable_nonempty", func(t *testing.T) {
+		cp := armed()
+		bindReviewObligation(capable, io.Discard, cp, set)
+		if cp.reviewObligation == nil || !cp.armed {
+			t.Fatalf("checkpoint = %+v, want armed with the set", cp)
+		}
+		want := []upload.ScopeExemption{{Path: "a.go", Reason: "r"}}
+		if cp.reviewObligation.HeadSHA != "h" || cp.reviewObligation.StageAttempt != "a1" || !reflect.DeepEqual(cp.reviewObligation.SupplementalScopeExemptions, want) {
+			t.Errorf("obligation = %+v", cp.reviewObligation)
+		}
+	})
+	t.Run("not_capable_empty", func(t *testing.T) {
+		cp, before := armed(), armed()
+		var log strings.Builder
+		bindReviewObligation(old, &log, cp, nil)
+		if !reflect.DeepEqual(cp, before) {
+			t.Errorf("checkpoint changed: %+v, want %+v (legacy bytes)", cp, before)
+		}
+		if log.Len() != 0 {
+			t.Errorf("logged %q, want nothing", log.String())
+		}
+	})
+	t.Run("not_capable_nonempty", func(t *testing.T) {
+		cp := armed()
+		var log strings.Builder
+		bindReviewObligation(old, &log, cp, set)
+		if want := (pushCheckpoint{backendSupportsPushResume: true}); !reflect.DeepEqual(*cp, want) {
+			t.Errorf("checkpoint = %+v, want disarmed with only the flag kept", *cp)
+		}
+		if !strings.Contains(log.String(), `"event":"push_checkpoint_not_armed"`) || !strings.Contains(log.String(), notArmedReviewObligationBackendAbsent) {
+			t.Errorf("missing the named not-armed line:\n%s", log.String())
+		}
+	})
+	t.Run("nil_checkpoint", func(t *testing.T) {
+		defer func() {
+			if recovered := recover(); recovered != nil {
+				t.Fatalf("nil-checkpoint contract must return normally; recovered %v", recovered)
+			}
+		}()
+		var log strings.Builder
+		bindReviewObligation(old, &log, nil, set)
+		if log.Len() != 0 {
+			t.Errorf("logged %q, want nothing", log.String())
+		}
+	})
+	t.Run("unarmed_ignored", func(t *testing.T) {
+		cp := &pushCheckpoint{backendSupportsPushResume: true}
+		bindReviewObligation(capable, io.Discard, cp, set)
+		if cp.reviewObligation != nil {
+			t.Errorf("an unarmed checkpoint gained %+v", cp.reviewObligation)
+		}
+	})
+}
+
+// shipPullRequestRecorder is a real upload.Client's peer: it records each POST
+// body and answers 201, so a test reads the bytes the backend would receive.
+func shipPullRequestRecorder(t *testing.T) (uploadClient, *[][]byte) {
+	t.Helper()
+	var mu sync.Mutex
+	bodies := &[][]byte{}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		raw, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		*bodies = append(*bodies, raw)
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusCreated)
+		_, _ = w.Write([]byte(`{"id":"x","content_hash":"h"}`))
+	}))
+	t.Cleanup(srv.Close)
+	return upload.New(srv.URL), bodies
+}
+
+func obligationIssuedKey(t *testing.T) *upload.IssuedKey {
+	t.Helper()
+	_, priv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return &upload.IssuedKey{PrivateKey: priv}
+}
+
+// postPushObligationCall runs openPRAndShipArtifact over the fake commit path,
+// failing where shape says, then reports exactly as run() does.
+func postPushObligationCall(t *testing.T, cfg config, supplemental []scopeExemption, shipFails bool) (*fakeUploader, *pushCheckpoint, string) {
+	t.Helper()
+	withFakePusher(t)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	if shipFails {
+		fu.prErrSeq = []error{errors.New("ship: 502 bad gateway"), nil}
+	} else {
+		fpr.err = errors.New("503 Service Unavailable from the forge")
+	}
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cp := &pushCheckpoint{backendSupportsPushResume: true}
+	var log strings.Builder
+	perr := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", nil, nil, supplemental, cp)
+	if perr == nil {
+		t.Fatalf("setup: the post-push failure did not fire:\n%s", log.String())
+	}
+	if err := reportPullRequestFailure(context.Background(), cfg, &log, fu, issued, "C", perr.Error(), cp); err != nil {
+		t.Fatal(err)
+	}
+	return fu, cp, log.String()
+}
+
+// TestOpenPRAndShipArtifact_PostPushFailure_ReportCarriesObligation pins the
+// post-push arm through the real function and report, on both failures that
+// reach it, and the bytes against the golden's failure_report section.
+func TestOpenPRAndShipArtifact_PostPushFailure_ReportCarriesObligation(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		shipFails bool
+	}{{"open_pr_failed", false}, {"ship_failed", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, _, _, _ := pushResumeRepo(t)
+			cfg := checkpointResumeCfg(repo)
+			cfg.backendSupportsReviewObligation = true
+			cfg.stageAttempt = "attempt-1"
+			fu, _, log := postPushObligationCall(t, cfg, goldenSupplemental(t), tc.shipFails)
+			rep := lastFailureReport(fu)
+			if rep == nil {
+				t.Fatalf("no failure report:\n%s", log)
+			}
+			if rep.HeadSHA != "head-sha-abc" || rep.Branch == "" {
+				t.Errorf("report coordinates = %q on %q, want the pushed head", rep.HeadSHA, rep.Branch)
+			}
+			assertGoldenSet(t, rep.ReviewObligation, "head-sha-abc", "attempt-1")
+		})
+	}
+	t.Run("golden_bytes", func(t *testing.T) {
+		g := loadReviewObligationGolden(t)
+		var want struct {
+			Reason, Branch, Category string
+			HeadSHA                  string `json:"head_sha"`
+			BaseSHA                  string `json:"base_sha"`
+			Tree                     string `json:"verified_tree_sha"`
+			Title                    string `json:"title"`
+			Body                     string `json:"body"`
+			Obligation               struct {
+				StageAttempt string `json:"stage_attempt"`
+			} `json:"review_obligation"`
+		}
+		if err := json.Unmarshal(g.FailureReport, &want); err != nil {
+			t.Fatal(err)
+		}
+		cfg := config{runID: verifiedTreeRunID, stageID: verifiedTreeStageID, backendSupportsReviewObligation: true, stageAttempt: want.Obligation.StageAttempt}
+		cp := &pushCheckpoint{
+			branch: want.Branch, headSHA: want.HeadSHA, baseSHA: want.BaseSHA, verifiedTreeSHA: want.Tree,
+			armed: true, resumeKind: resumeKindPROpen, prTitle: want.Title, prBody: want.Body,
+		}
+		bindReviewObligation(cfg, io.Discard, cp, goldenSupplemental(t))
+		client, bodies := shipPullRequestRecorder(t)
+		if err := reportPullRequestFailure(context.Background(), cfg, io.Discard, client, obligationIssuedKey(t), want.Category, want.Reason, cp); err != nil {
+			t.Fatal(err)
+		}
+		if len(*bodies) != 1 || !bytes.Equal((*bodies)[0], g.FailureReport) {
+			t.Errorf("report bytes drifted from the golden:\n got: %s\nwant: %s", (*bodies)[0], g.FailureReport)
+		}
+	})
+}
+
+// pushFailureObligationCall is the pre-push arm through the real function: the
+// held commit is on HEAD and only the transport fails.
+func pushFailureObligationCall(t *testing.T, capable bool, supplemental []scopeExemption) (cfg config, repo, headSHA string, cp *pushCheckpoint, fu *fakeUploader, log string) {
+	t.Helper()
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	cprGit(t, repo, "checkout", branch)
+	fp := withFakePusher(t)
+	fp.err = fmt.Errorf("gitops: push: %w", gitops.ErrPushFailed)
+	withFakePROpenerOnly(t)
+	fu = newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg = checkpointResumeCfg(repo)
+	cfg.backendSupportsReviewObligation = capable
+	cfg.stageAttempt = "attempt-1"
+	cp = &pushCheckpoint{backendSupportsPushResume: true}
+	var sink strings.Builder
+	perr := openPRAndShipArtifact(context.Background(), cfg, &sink, fu, issued, "", false, false, nil, false, treeSHA, "", nil, nil, supplemental, cp)
+	if !errors.Is(perr, gitops.ErrPushFailed) {
+		t.Fatalf("setup: err = %v, want ErrPushFailed\n%s", perr, sink.String())
+	}
+	if err := reportPullRequestFailure(context.Background(), cfg, &sink, fu, issued, "C", perr.Error(), cp); err != nil {
+		t.Fatal(err)
+	}
+	return cfg, repo, headSHA, cp, fu, sink.String()
+}
+
+// TestOpenPRAndShipArtifact_PrePushFailure_ReportCarriesObligation pins the
+// pre-push arm: push kind, bound to the unpublished head, and pinned.
+func TestOpenPRAndShipArtifact_PrePushFailure_ReportCarriesObligation(t *testing.T) {
+	cfg, repo, headSHA, cp, fu, log := pushFailureObligationCall(t, true, goldenSupplemental(t))
+	if !cp.armed || cp.resumeKind != resumeKindPush {
+		t.Fatalf("checkpoint = %+v, want an armed push kind\n%s", cp, log)
+	}
+	rep := lastFailureReport(fu)
+	if rep == nil || rep.ResumeKind != resumeKindPush || rep.HeadSHA != headSHA {
+		t.Fatalf("report = %+v, want the push kind at %s\n%s", rep, headSHA, log)
+	}
+	assertGoldenSet(t, rep.ReviewObligation, headSHA, "attempt-1")
+	if got, ok := refTarget(repo, checkpointRef(cfg.runID, cfg.stageID)); !ok || got != headSHA {
+		t.Errorf("checkpoint ref = %q (exists %t), want %s", got, ok, headSHA)
+	}
+}
+
+// TestOpenPRAndShipArtifact_NoDelta_ReportUnchanged: an ordinary pass with no
+// supplemental delta states known none to a capable backend, and to an old one
+// keeps today's report bytes with no key at all.
+func TestOpenPRAndShipArtifact_NoDelta_ReportUnchanged(t *testing.T) {
+	t.Run("capable_known_none", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		cfg := checkpointResumeCfg(repo)
+		cfg.backendSupportsReviewObligation = true
+		cfg.stageAttempt = "attempt-1"
+		fu, _, log := postPushObligationCall(t, cfg, nil, false)
+		rep := lastFailureReport(fu)
+		if rep == nil {
+			t.Fatalf("no failure report:\n%s", log)
+		}
+		assertKnownNone(t, rep.ReviewObligation, "head-sha-abc", "attempt-1")
+	})
+	t.Run("old_backend_keeps_bytes", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		fu, cp, log := postPushObligationCall(t, checkpointResumeCfg(repo), nil, false)
+		rep := lastFailureReport(fu)
+		if rep == nil || rep.HeadSHA != "head-sha-abc" {
+			t.Fatalf("report = %+v, want the ordinary checkpoint coordinates\n%s", rep, log)
+		}
+		if rep.ReviewObligation != nil {
+			t.Errorf("an old backend's report carries %+v, want no key", rep.ReviewObligation)
+		}
+		client, bodies := shipPullRequestRecorder(t)
+		if err := reportPullRequestFailure(context.Background(), checkpointResumeCfg(repo), io.Discard, client, obligationIssuedKey(t), "C", "r", cp); err != nil {
+			t.Fatal(err)
+		}
+		if bytes.Contains((*bodies)[0], []byte("review_obligation")) {
+			t.Errorf("report bytes name review_obligation: %s", (*bodies)[0])
+		}
+	})
+}
+
+// TestOpenPRAndShipArtifact_ChildBaseFetchArm_KnownNone pins the third arm over
+// the real commit path: a child's synthesized checkpoint states known none.
+func TestOpenPRAndShipArtifact_ChildBaseFetchArm_KnownNone(t *testing.T) {
+	repo, _, _ := verifiedTreeRepo(t)
+	verifiedTree := treeWithEdit(t, repo, "a.txt", "agent change\n")
+	withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := verifiedTreeCfg(repo, "true")
+	cfg.decomposedFromRunID = childResumeParentRunID
+	cfg.baseBranch = "fishhawk/run-deadbeef-consolidated" // never exists on the remote
+	cfg.backendSupportsReviewObligation = true
+	cfg.stageAttempt = "attempt-1"
+	cp := pushCheckpoint{backendSupportsPushResume: true}
+	var log strings.Builder
+	perr := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, verifiedTree, "", nil, nil, nil, &cp)
+	if !errors.Is(perr, gitops.ErrBaseFetchFailed) || !cp.armed {
+		t.Fatalf("setup: err = %v armed = %t\n%s", perr, cp.armed, log.String())
+	}
+	assertKnownNone(t, cp.reviewObligation, cp.headSHA, "attempt-1")
+}
+
+// runObligationImplement drives run() through an ordinary implement stage with a
+// caller-chosen prompt over the standard fake seams.
+func runObligationImplement(t *testing.T, fu *fakeUploader, fp *fakePusher, fpr *fakePROpener, prompt *upload.FetchedPrompt) (int, string) {
+	t.Helper()
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{canned: agent.Result{OK: true}})
+	fu.promptResp = prompt
+	withFakeUploader(t, fu)
+	withFakeGitOps(t, fp, fpr)
+	var stderr strings.Builder
+	code := run([]string{
+		"--run-id", "11111111-2222-3333-4444-555555555555",
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", "22222222-3333-4444-5555-666666666666",
+		"--fetch-prompt", "--upload-trace",
+	}, &stderr)
+	return code, stderr.String()
+}
+
+// TestRun_ArmedCheckpoint_UsesAdvertisedCapability pins the decode: only what the
+// backend advertised on this prompt, with this prompt's attempt, reaches a report.
+func TestRun_ArmedCheckpoint_UsesAdvertisedCapability(t *testing.T) {
+	prompt := func(advertised bool) *upload.FetchedPrompt {
+		return &upload.FetchedPrompt{
+			StageID: "22222222-3333-4444-5555-666666666666", StageType: "implement", Prompt: "implement", PromptHash: "h",
+			StageAttempt: "attempt-9", SupportsReviewObligationResume: advertised,
+		}
+	}
+	t.Run("advertised", func(t *testing.T) {
+		fu := newFakeUploader(t)
+		code, logs := runObligationImplement(t, fu, &fakePusher{}, &fakePROpener{err: errors.New("forge down")}, prompt(true))
+		rep := lastFailureReport(fu)
+		if code != exitFailure || rep == nil {
+			t.Fatalf("run = %d report = %+v\n%s", code, rep, logs)
+		}
+		assertKnownNone(t, rep.ReviewObligation, "head-sha-abc", "attempt-9")
+	})
+	t.Run("not_advertised", func(t *testing.T) {
+		fu := newFakeUploader(t)
+		code, logs := runObligationImplement(t, fu, &fakePusher{}, &fakePROpener{err: errors.New("forge down")}, prompt(false))
+		rep := lastFailureReport(fu)
+		if code != exitFailure || rep == nil {
+			t.Fatalf("run = %d report = %+v\n%s", code, rep, logs)
+		}
+		if rep.ReviewObligation != nil {
+			t.Errorf("report carries %+v without the capability", rep.ReviewObligation)
+		}
+		if rep.HeadSHA != "head-sha-abc" {
+			t.Errorf("an empty set must keep the ordinary checkpoint, got head %q", rep.HeadSHA)
+		}
+	})
+}
+
+// TestRun_ReverifyReport_KnownNone pins the reverify arm in run(): a pin armed
+// before any delta exists proves none, at the pinned head.
+func TestRun_ReverifyReport_KnownNone(t *testing.T) {
+	repo := gateFailRepo(t)
+	implementEnv(t, "kuhlman-labs/fishhawk", "main")
+	withFakeInvoker(t, &fakeInvoker{mirrorWorkingTreeFrom: repo, canned: agent.Result{OK: true}})
+	cmd, _ := formVerifyCmd(t, noopPassOut, 0, noopOutsideOut, 1)
+	fu := newFakeUploader(t)
+	fu.promptResp = gateFailPrompt(cmd, 2)
+	fu.promptResp.SupportsReviewObligationResume = true
+	fu.promptResp.StageAttempt = "attempt-1"
+	code, log := runGateFail(t, repo, fu, verifyFixRunArgs(repo, filepath.Join(t.TempDir(), "trace.jsonl.gz")))
+	if code != exitFailure {
+		t.Fatalf("run = %d, want exitFailure:\n%s", code, log)
+	}
+	reports := failedReports(fu)
+	if len(reports) != 1 || reports[0].ResumeKind != resumeKindReverify {
+		t.Fatalf("reports = %+v, want one reverify report:\n%s", reports, log)
+	}
+	assertKnownNone(t, reports[0].ReviewObligation, reports[0].HeadSHA, "attempt-1")
+}
+
+// scopeParkObligationCall reaches the park through the real function.
+func scopeParkObligationCall(t *testing.T, cfg config, supplemental []scopeExemption, head string) (*fakeUploader, string, error) {
+	t.Helper()
+	fp := withFakePusher(t)
+	fp.result = &gitops.CommitAndPushResult{HeadSHA: head, BaseSHA: "base", TreeSHA: "tree", ScopeShortfall: []string{"backend/internal/foo/bar.go"}}
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var log strings.Builder
+	perr := openPRAndShipArtifact(context.Background(), cfg, &log, fu, issued, "", false, false, nil, false, "", "", nil, nil, supplemental, &pushCheckpoint{})
+	if fpr.gotArgs != nil {
+		t.Errorf("a park opened a PR: %+v", fpr.gotArgs)
+	}
+	return fu, log.String(), perr
+}
+
+// TestOpenPRAndShipArtifact_Park_CarriesObligation pins the park report across
+// the three states, with the required row against the golden's park obligation.
+func TestOpenPRAndShipArtifact_Park_CarriesObligation(t *testing.T) {
+	gold := goldenServedPrompt(t).HeldCommitReviewObligation
+	t.Run("required", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		cfg := checkpointResumeCfg(repo)
+		cfg.backendSupportsReviewObligation = true
+		cfg.stageAttempt = gold.StageAttempt
+		fu, log, perr := scopeParkObligationCall(t, cfg, goldenSupplemental(t), gold.HeadSHA)
+		if perr != nil || fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+			t.Fatalf("err = %v args = %+v\n%s", perr, fu.gotPRArgs, log)
+		}
+		got, err := json.Marshal(fu.gotPRArgs.ReviewObligation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if want := loadReviewObligationGolden(t).KnownRequiredPark.ParkedPayload.ReviewObligation; !bytes.Equal(got, want) {
+			t.Errorf("park obligation bytes drifted:\n got: %s\nwant: %s", got, want)
+		}
+	})
+	t.Run("known_none", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		cfg := checkpointResumeCfg(repo)
+		cfg.backendSupportsReviewObligation = true
+		cfg.stageAttempt = "attempt-1"
+		fu, log, perr := scopeParkObligationCall(t, cfg, nil, "held")
+		if perr != nil || fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+			t.Fatalf("err = %v args = %+v\n%s", perr, fu.gotPRArgs, log)
+		}
+		assertKnownNone(t, fu.gotPRArgs.ReviewObligation, "held", "attempt-1")
+	})
+	t.Run("old_backend_no_delta_keeps_bytes", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		fu, log, perr := scopeParkObligationCall(t, checkpointResumeCfg(repo), nil, "held")
+		if perr != nil || fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "scope_park" {
+			t.Fatalf("err = %v args = %+v\n%s", perr, fu.gotPRArgs, log)
+		}
+		if fu.gotPRArgs.ReviewObligation != nil {
+			t.Errorf("an old backend's park carries %+v", fu.gotPRArgs.ReviewObligation)
+		}
+	})
+}
+
+// TestRunner_OldBackend_Park_ReportsFailed: an old backend cannot retain a
+// required review behind a park, so the runner fails retryably instead of parking.
+func TestRunner_OldBackend_Park_ReportsFailed(t *testing.T) {
+	repo, _, _, _, _ := pushResumeRepo(t)
+	fu, log, perr := scopeParkObligationCall(t, checkpointResumeCfg(repo), goldenSupplemental(t), "held")
+	if perr == nil {
+		t.Fatalf("a required review against an old backend must not park:\n%s", log)
+	}
+	if !strings.Contains(perr.Error(), notArmedReviewObligationBackendAbsent) {
+		t.Errorf("err = %v, want the named token", perr)
+	}
+	if got := pushFailureCategory(perr); got != "C" {
+		t.Errorf("pushFailureCategory = %q, want C", got)
+	}
+	for _, c := range fu.gotPRCalls {
+		if c.Outcome == "scope_park" {
+			t.Errorf("shipped a park: %+v", c)
+		}
+	}
+}
+
+// TestRunner_OldBackend_NonemptyObligation_NoCheckpoint: against an old backend a
+// required set disarms both reachable arms. Nothing is recorded as resumable and
+// a disarmed pre-push arm pins nothing.
+func TestRunner_OldBackend_NonemptyObligation_NoCheckpoint(t *testing.T) {
+	assertNoCoordinates := func(t *testing.T, rep *upload.ShipPullRequestArgs, log string) {
+		t.Helper()
+		if rep == nil {
+			t.Fatalf("no failure report:\n%s", log)
+		}
+		if rep.Branch != "" || rep.HeadSHA != "" || rep.BaseSHA != "" || rep.TreeSHA != "" || rep.ResumeKind != "" || rep.ReviewObligation != nil {
+			t.Errorf("report carries resumable state: %+v", rep)
+		}
+		if !strings.Contains(log, notArmedReviewObligationBackendAbsent) {
+			t.Errorf("missing the named not-armed line:\n%s", log)
+		}
+	}
+	t.Run("post_push", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		fu, _, log := postPushObligationCall(t, checkpointResumeCfg(repo), goldenSupplemental(t), false)
+		assertNoCoordinates(t, lastFailureReport(fu), log)
+	})
+	t.Run("pre_push", func(t *testing.T) {
+		cfg, repo, _, cp, fu, log := pushFailureObligationCall(t, false, goldenSupplemental(t))
+		assertNoCoordinates(t, lastFailureReport(fu), log)
+		if cp.armed {
+			t.Errorf("checkpoint stayed armed: %+v", cp)
+		}
+		if _, ok := refTarget(repo, checkpointRef(cfg.runID, cfg.stageID)); ok {
+			t.Errorf("a disarmed checkpoint pinned %s", checkpointRef(cfg.runID, cfg.stageID))
+		}
+	})
+}
+
+// TestRun_HeldCommit_PromptObligationReachesArtifact is the whole retained chain
+// through run(): the golden's prompt bytes decode, the exempt resume runs no
+// agent, and the artifact equals the golden's resumed_artifact section.
+func TestRun_HeldCommit_PromptObligationReachesArtifact(t *testing.T) {
+	g := loadReviewObligationGolden(t)
+	keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	fpr := withFakePROpenerOnly(t)
+	fu := newFakeUploader(t)
+	prompt := goldenServedPrompt(t)
+	prompt.StageID, prompt.StageType, prompt.Prompt, prompt.PromptHash = verifiedTreeStageID, "implement", "unused", "h"
+	prompt.OpenPRFromHeldCommit = true
+	prompt.HeldCommitBranch = wireGoldenHeldCommitBranch
+	prompt.HeldCommitSHA = wireGoldenHeldCommitHeadSHA
+	prompt.HeldCommitBaseSHA = wireGoldenHeldCommitBaseSHA
+	fu.promptResp = &prompt
+	withFakeUploader(t, fu)
+	var stderr strings.Builder
+	if code := run([]string{
+		"--run-id", verifiedTreeRunID,
+		"--backend-url", "https://api.fishhawk.test",
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", verifiedTreeStageID,
+		"--github-repo", "test-owner/test-repo",
+		"--base-branch", "main",
+		"--fetch-prompt",
+	}, &stderr); code != exitOK {
+		t.Fatalf("run = %d, want exitOK:\n%s", code, stderr.String())
+	}
+	if invoker.callIdx != 0 {
+		t.Errorf("agent invoked %d time(s), want 0", invoker.callIdx)
+	}
+	if fpr.gotArgs == nil || fu.gotPRArgs == nil || fu.gotPRArgs.Outcome != "" {
+		t.Fatalf("no artifact shipped: %+v / %+v\n%s", fpr.gotArgs, fu.gotPRArgs, stderr.String())
+	}
+	if got := substituteWireHandoffPath(t, fu.gotPRArgs.Body, keyed); !bytes.Equal(got, g.ResumedArtifact) {
+		t.Errorf("artifact drifted from the golden:\n got: %s\nwant: %s", got, g.ResumedArtifact)
+	}
+}
+
+// heldGoldenRepo renames the run branch to the golden's, so every byte of a real
+// resume's artifact except the real head SHA can match the shared fixture.
+func heldGoldenRepo(t *testing.T, published bool) (repo, headSHA, treeSHA string) {
+	t.Helper()
+	repo, _, branch, headSHA, treeSHA := pushResumeRepo(t)
+	cprGit(t, repo, "branch", "-m", branch, wireGoldenHeldCommitBranch)
+	if published {
+		cprGit(t, repo, "push", "origin", wireGoldenHeldCommitBranch)
+	}
+	return repo, headSHA, treeSHA
+}
+
+// TestOpenHeldCommitPR_CarriesServedObligation: all three kinds that ship an
+// artifact reproduce the golden's resumed_artifact for a required set, and an
+// empty or absent set stays byte-identical to the older held-commit golden.
+func TestOpenHeldCommitPR_CarriesServedObligation(t *testing.T) {
+	g := loadReviewObligationGolden(t)
+	plain, err := os.ReadFile(wireGoldenHeldCommitPath(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	gold := goldenServedPrompt(t).HeldCommitReviewObligation
+	none := &upload.ReviewObligation{HeadSHA: gold.HeadSHA, SupplementalScopeExemptions: []upload.ScopeExemption{}}
+	for _, tc := range []struct {
+		name   string
+		kind   string
+		served *upload.ReviewObligation
+		want   []byte
+	}{
+		{"pr_open", resumeKindPROpen, gold, g.ResumedArtifact},
+		{"push", resumeKindPush, gold, g.ResumedArtifact},
+		{"exempt", "", gold, g.ResumedArtifact},
+		{"served_empty", "", none, plain},
+		{"no_obligation", "", nil, plain},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			keyed := withPRDescriptionPath(t, verifiedTreeRunID, verifiedTreeStageID)
+			head, tree := wireGoldenHeldCommitHeadSHA, ""
+			cfg := config{
+				runID: verifiedTreeRunID, stageID: verifiedTreeStageID,
+				githubRepo: "test-owner/test-repo", baseBranch: "main", backendURL: "https://api.fishhawk.test",
+				backendSupportsReviewObligation: true, heldReviewObligation: tc.served,
+			}
+			if tc.kind != "" {
+				repo, realHead, realTree := heldGoldenRepo(t, tc.kind == resumeKindPROpen)
+				cfg.workingDir, head = repo, realHead
+				if tc.kind == resumeKindPush {
+					tree = realTree
+				}
+			}
+			withFakePusher(t)
+			withFakePROpenerOnly(t)
+			fu := newFakeUploader(t)
+			issued, ierr := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+			if ierr != nil {
+				t.Fatal(ierr)
+			}
+			var log strings.Builder
+			if code := openHeldCommitPR(context.Background(), cfg, head, wireGoldenHeldCommitBranch, wireGoldenHeldCommitBaseSHA, tc.kind, tree, "", "", &log, fu, issued); code != exitOK {
+				t.Fatalf("exit = %d, want exitOK\n%s", code, log.String())
+			}
+			got := substituteWireHandoffPath(t, fu.gotPRArgs.Body, keyed)
+			got = bytes.ReplaceAll(got, []byte(head), []byte(wireGoldenHeldCommitHeadSHA))
+			if !bytes.Equal(got, tc.want) {
+				t.Errorf("artifact drifted:\n got: %s\nwant: %s", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestOpenHeldCommitPR_FailedResume_RearmsObligation pins that a failed resume
+// keeps the served set, anchored to the head it holds, on every failure that
+// re-arms, and that a permanent refusal arms nothing.
+func TestOpenHeldCommitPR_FailedResume_RearmsObligation(t *testing.T) {
+	const attempt = "attempt-3"
+	capable := func(cfg config, served *upload.ReviewObligation) config {
+		cfg.backendSupportsReviewObligation = true
+		cfg.heldReviewObligation = served
+		cfg.stageAttempt = attempt
+		return cfg
+	}
+	setup := func(t *testing.T) (*fakePusher, *fakePROpener, *fakeUploader, *upload.IssuedKey) {
+		t.Helper()
+		fp, fpr, fu := withFakePusher(t), withFakePROpenerOnly(t), newFakeUploader(t)
+		issued, err := fu.IssueKey(context.Background(), verifiedTreeRunID, time.Minute)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return fp, fpr, fu, issued
+	}
+	served := goldenServedPrompt(t).HeldCommitReviewObligation
+
+	t.Run("tip_moved", func(t *testing.T) {
+		repo, branch, _ := checkpointResumeRepo(t)
+		_, _, fu, issued := setup(t)
+		const stale = "0123456789abcdef0123456789abcdef01234567"
+		var log strings.Builder
+		if code := openHeldCommitPR(context.Background(), capable(checkpointResumeCfg(repo), served), stale, branch, "base", resumeKindPROpen, "", "", "", &log, fu, issued); code != exitFailure {
+			t.Fatalf("exit = %d\n%s", code, log.String())
+		}
+		rep := lastFailureReport(fu)
+		if rep == nil || rep.HeadSHA != stale {
+			t.Fatalf("report = %+v\n%s", rep, log.String())
+		}
+		assertGoldenSet(t, rep.ReviewObligation, stale, attempt)
+	})
+	t.Run("open_failed", func(t *testing.T) {
+		repo, branch, head := checkpointResumeRepo(t)
+		_, fpr, fu, issued := setup(t)
+		fpr.err = errors.New("forge down")
+		var log strings.Builder
+		if code := openHeldCommitPR(context.Background(), capable(checkpointResumeCfg(repo), served), head, branch, "base", resumeKindPROpen, "", "", "", &log, fu, issued); code != exitFailure {
+			t.Fatalf("exit = %d\n%s", code, log.String())
+		}
+		rep := lastFailureReport(fu)
+		if rep == nil || rep.ResumeKind != "" {
+			t.Fatalf("report = %+v\n%s", rep, log.String())
+		}
+		assertGoldenSet(t, rep.ReviewObligation, head, attempt)
+	})
+	t.Run("ship_failed", func(t *testing.T) {
+		repo, branch, head := checkpointResumeRepo(t)
+		_, _, fu, issued := setup(t)
+		fu.prErrSeq = []error{errors.New("ship: 502"), nil}
+		var log strings.Builder
+		if code := openHeldCommitPR(context.Background(), capable(checkpointResumeCfg(repo), served), head, branch, "base", resumeKindPROpen, "", "", "", &log, fu, issued); code != exitFailure {
+			t.Fatalf("exit = %d\n%s", code, log.String())
+		}
+		rep := lastFailureReport(fu)
+		if rep == nil {
+			t.Fatalf("no report\n%s", log.String())
+		}
+		assertGoldenSet(t, rep.ReviewObligation, head, attempt)
+	})
+	t.Run("push_published_then_open_failed", func(t *testing.T) {
+		repo, _, branch, head, tree := pushResumeRepo(t)
+		fp, fpr, fu, issued := setup(t)
+		fpr.err = errors.New("forge down")
+		var log strings.Builder
+		if code := openHeldCommitPR(context.Background(), capable(checkpointResumeCfg(repo), served), head, branch, "base", resumeKindPush, tree, "", "", &log, fu, issued); code != exitFailure {
+			t.Fatalf("exit = %d\n%s", code, log.String())
+		}
+		if fp.pushCommittedArgs == nil {
+			t.Fatalf("setup: nothing was published\n%s", log.String())
+		}
+		rep := lastFailureReport(fu)
+		if rep == nil || rep.ResumeKind != "" || rep.HeadSHA != head {
+			t.Fatalf("report = %+v, want the pr_open kind (no resume_kind key) at %s\n%s", rep, head, log.String())
+		}
+		assertGoldenSet(t, rep.ReviewObligation, head, attempt)
+	})
+	t.Run("child_push", func(t *testing.T) {
+		repo, _, branch, head, tree := pushResumeRepo(t)
+		fp, _, fu, issued := setup(t)
+		fu.prErrSeq = []error{errors.New("report: 502"), nil}
+		var log strings.Builder
+		if code := openHeldCommitPR(context.Background(), capable(childResumeCfg(repo), nil), head, branch, "main", resumeKindPush, tree, "", "", &log, fu, issued); code != exitFailure {
+			t.Fatalf("exit = %d\n%s", code, log.String())
+		}
+		if fp.pushCommittedArgs == nil {
+			t.Fatalf("setup: nothing was published\n%s", log.String())
+		}
+		rep := lastFailureReport(fu)
+		if rep == nil || rep.ResumeKind != resumeKindPush {
+			t.Fatalf("report = %+v, want the push kind\n%s", rep, log.String())
+		}
+		assertKnownNone(t, rep.ReviewObligation, head, attempt)
+	})
+	t.Run("permanent_refusal_arms_nothing", func(t *testing.T) {
+		repo, _, branch, head, _ := pushResumeRepo(t)
+		_, _, fu, issued := setup(t)
+		var log strings.Builder
+		// No served verified tree: the permanent verified_tree_missing refusal.
+		if code := openHeldCommitPR(context.Background(), capable(checkpointResumeCfg(repo), served), head, branch, "base", resumeKindPush, "", "", "", &log, fu, issued); code != exitFailure {
+			t.Fatalf("exit = %d\n%s", code, log.String())
+		}
+		rep := lastFailureReport(fu)
+		if rep == nil || rep.ResumeKind != resumeKindPushDiscarded {
+			t.Fatalf("report = %+v, want the discard\n%s", rep, log.String())
+		}
+		if rep.ReviewObligation != nil {
+			t.Errorf("a discard armed %+v", rep.ReviewObligation)
+		}
+	})
+}
+
+// TestRunReverifyResume_Rearm_KnownNoneAnchoredToHead pins both reverify re-arms:
+// at the held commit before synthesis and at the synthesized head after it.
+func TestRunReverifyResume_Rearm_KnownNoneAnchoredToHead(t *testing.T) {
+	capablePrompt := func(f reverifyRunFixture, cmd string) *upload.FetchedPrompt {
+		p := reverifyPromptFor(f, cmd)
+		p.SupportsReviewObligationResume = true
+		p.StageAttempt = "attempt-2"
+		return p
+	}
+	t.Run("verify_failed_rearms_at_held", func(t *testing.T) {
+		f := newReverifyRunFixture(t, nil)
+		cmd, _ := reverifyVerifyCmd(t, noopOutsideOut, 1)
+		r := runReverify(t, f, capablePrompt(f, cmd), nil)
+		if r.code != exitFailure {
+			t.Fatalf("run = %d:\n%s", r.code, r.log)
+		}
+		got := reportedFailureBody(t, r.fu)
+		if got.ResumeKind != resumeKindReverify {
+			t.Fatalf("kind = %q:\n%s", got.ResumeKind, r.log)
+		}
+		assertKnownNone(t, got.ReviewObligation, f.held, "attempt-2")
+	})
+	t.Run("push_failed_rearms_at_synthesized", func(t *testing.T) {
+		f := newReverifyRunFixture(t, nil)
+		cmd, _ := reverifyVerifyCmd(t, noopPassOut, 0)
+		r := runReverify(t, f, capablePrompt(f, cmd), &fakePusher{pushCommittedErr: errors.New("push transport down")})
+		if r.code != exitFailure || r.fp.pushCommittedArgs == nil {
+			t.Fatalf("run = %d pushed = %+v:\n%s", r.code, r.fp.pushCommittedArgs, r.log)
+		}
+		got := reportedFailureBody(t, r.fu)
+		synth := r.fp.pushCommittedArgs.HeadSHA
+		if got.ResumeKind != resumeKindPush || got.HeadSHA != synth || synth == f.held {
+			t.Fatalf("re-armed kind %q at %q, want push at the synthesized %q (not %q)", got.ResumeKind, got.HeadSHA, synth, f.held)
+		}
+		assertKnownNone(t, got.ReviewObligation, synth, "attempt-2")
+	})
+	t.Run("old_backend_keeps_bytes", func(t *testing.T) {
+		f := newReverifyRunFixture(t, nil)
+		cmd, _ := reverifyVerifyCmd(t, noopOutsideOut, 1)
+		r := runReverify(t, f, reverifyPromptFor(f, cmd), nil)
+		got := reportedFailureBody(t, r.fu)
+		if got.ResumeKind != resumeKindReverify || got.ReviewObligation != nil {
+			t.Errorf("kind %q obligation %+v, want the reverify kind with no key", got.ResumeKind, got.ReviewObligation)
+		}
+	})
+}
+
+// withObligationClient makes run() use a real upload.Client on the small budgets
+// these tests hold to: one blip retry and a 200ms live-pass settle allowance.
+func withObligationClient(t *testing.T) {
+	t.Helper()
+	orig := newUploadClient
+	newUploadClient = func(baseURL string) uploadClient {
+		c := upload.New(baseURL)
+		c.MaxRetries = 1
+		c.Backoff = time.Millisecond
+		c.LivePassSettleAllowance = 200 * time.Millisecond
+		return c
+	}
+	t.Cleanup(func() { newUploadClient = orig })
+}
+
+// obligationRunArgs are run()'s arguments over the checkpoint backend.
+func obligationRunArgs(url, repo string) []string {
+	return []string{
+		"--run-id", verifiedTreeRunID,
+		"--backend-url", url,
+		"--workflow", "feature_change", "--stage", "implement",
+		"--stage-id", verifiedTreeStageID,
+		"--working-dir", repo,
+		"--github-repo", "test-owner/test-repo",
+		"--base-branch", "main",
+		"--fetch-prompt", "--upload-trace",
+	}
+}
+
+// TestRunner_RepeatedResumeFailures_RetainObligation loops failed resumes through
+// a fake backend that projects each report into the next prompt: head and set
+// stay unchanged while each report binds to its own dispatch's attempt, and the
+// resume that finally lands still names the paths it owes.
+func TestRunner_RepeatedResumeFailures_RetainObligation(t *testing.T) {
+	repo, branch, headSHA := checkpointResumeRepo(t)
+	implementEnv(t, "test-owner/test-repo", "main")
+	invoker := &fakeInvoker{canned: agent.Result{OK: true}}
+	withFakeInvoker(t, invoker)
+	backend, srv := newCheckpointBackend(t)
+	backend.numberAttempts = true
+	backend.checkpoint = &upload.ShipPullRequestArgs{Branch: branch, HeadSHA: headSHA, BaseSHA: "base"}
+	seeded := *goldenServedPrompt(t).HeldCommitReviewObligation
+	seeded.HeadSHA = headSHA
+	backend.obligation = &seeded
+	var artifact []byte
+	backend.onSuccessShip = func(_ http.ResponseWriter, raw []byte) bool {
+		backend.mu.Lock()
+		defer backend.mu.Unlock()
+		artifact = raw
+		return false
+	}
+	withObligationClient(t)
+	fpr := &fakePROpener{err: errors.New("503 Service Unavailable from the forge")}
+	withFakeGitOps(t, &fakePusher{}, fpr)
+	args := obligationRunArgs(srv.URL, repo)
+
+	for i := 1; i <= 3; i++ {
+		var log strings.Builder
+		if code := run(args, &log); code != exitFailure {
+			t.Fatalf("resume %d: run = %d\n%s", i, code, log.String())
+		}
+		if invoker.callIdx != 0 {
+			t.Fatalf("resume %d: agent invoked %d time(s), want 0\n%s", i, invoker.callIdx, log.String())
+		}
+		backend.mu.Lock()
+		reports := append([]upload.ShipPullRequestArgs(nil), backend.failedReports...)
+		backend.mu.Unlock()
+		if len(reports) != i {
+			t.Fatalf("resume %d: %d report(s)\n%s", i, len(reports), log.String())
+		}
+		if reports[i-1].HeadSHA != headSHA {
+			t.Errorf("resume %d: report head %q, want %q", i, reports[i-1].HeadSHA, headSHA)
+		}
+		assertGoldenSet(t, reports[i-1].ReviewObligation, headSHA, fmt.Sprintf("attempt-%d", i))
+	}
+
+	fpr.err = nil
+	var log strings.Builder
+	if code := run(args, &log); code != exitOK {
+		t.Fatalf("final resume: run = %d\n%s", code, log.String())
+	}
+	backend.mu.Lock()
+	defer backend.mu.Unlock()
+	if !bytes.Contains(artifact, []byte(`"supplemental_scope_exemptions":[{"path":"backend/internal/foo/foo.go"`)) {
+		t.Errorf("the landing resume dropped the required set: %s", artifact)
+	}
+}
+
+// TestRun_HeldResume_OldBackendAbsenceIsUnknown pins the consume guard through
+// run() over real JSON decode. Absence is unknown, never proof of none.
+func TestRun_HeldResume_OldBackendAbsenceIsUnknown(t *testing.T) {
+	const required = `{"head_sha":"%s","stage_attempt":"a","supplemental_scope_exemptions":[{"path":"a.go","reason":"r"}]}`
+	const empty = `{"head_sha":"%s","stage_attempt":"a","supplemental_scope_exemptions":[]}`
+	const null = `{"head_sha":"%s","stage_attempt":"a","supplemental_scope_exemptions":null}`
+	for _, tc := range []struct {
+		name         string
+		kind         string
+		advertise    bool
+		obligation   string
+		wantFallback bool
+	}{
+		{name: "pr_open", kind: resumeKindPROpen, wantFallback: true},
+		{name: "push", kind: resumeKindPush, wantFallback: true},
+		{name: "exempt", kind: "", wantFallback: true},
+		{name: "not_advertised_stray_obligation", kind: resumeKindPROpen, obligation: empty, wantFallback: true},
+		{name: "advertising_no_obligation_unknown", kind: resumeKindPROpen, advertise: true, wantFallback: true},
+		{name: "advertising_null_list_unknown", kind: resumeKindPROpen, advertise: true, obligation: null, wantFallback: true},
+		{name: "advertising_known_none_proceeds", kind: resumeKindPROpen, advertise: true, obligation: empty},
+		{name: "advertising_known_required_proceeds", kind: resumeKindPROpen, advertise: true, obligation: required},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var repo, branch, head, tree string
+			if tc.kind == resumeKindPush {
+				repo, _, branch, head, tree = pushResumeRepo(t)
+			} else {
+				repo, branch, head = checkpointResumeRepo(t)
+			}
+			fields := map[string]any{
+				"stage_id": verifiedTreeStageID, "stage_type": "implement", "prompt": "implement", "prompt_hash": "h",
+				"open_pr_from_held_commit": true, "held_commit_sha": head, "held_commit_branch": branch,
+				"held_commit_base_sha": "base", "held_commit_resume_kind": tc.kind, "held_commit_verified_tree_sha": tree,
+			}
+			if tc.advertise {
+				fields["supports_review_obligation_resume"] = true
+			}
+			if tc.obligation != "" {
+				fields["held_commit_review_obligation"] = json.RawMessage(fmt.Sprintf(tc.obligation, head))
+			}
+			raw, err := json.Marshal(fields)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var prompt upload.FetchedPrompt
+			if err := json.Unmarshal(raw, &prompt); err != nil {
+				t.Fatal(err)
+			}
+			implementEnv(t, "test-owner/test-repo", "main")
+			inv := &fakeInvoker{canned: agent.Result{OK: true}}
+			withFakeInvoker(t, inv)
+			fu := newFakeUploader(t)
+			fu.promptResp = &prompt
+			withFakeUploader(t, fu)
+			fp, fpr := &fakePusher{}, &fakePROpener{}
+			withFakeGitOps(t, fp, fpr)
+			var stderr strings.Builder
+			code := run(obligationRunArgs("https://api.fishhawk.test", repo), &stderr)
+			logs := stderr.String()
+			fellBack := strings.Contains(logs, `"path":"fallback_agent_rerun","reason":"review_obligation_unknown_backend"`)
+			if fellBack != tc.wantFallback {
+				t.Fatalf("fell back = %t, want %t:\n%s", fellBack, tc.wantFallback, logs)
+			}
+			if tc.wantFallback {
+				if inv.callIdx != 1 {
+					t.Errorf("agent invoked %d time(s), want 1", inv.callIdx)
+				}
+				if fp.pushCommittedArgs != nil {
+					t.Errorf("published the held commit: %+v", fp.pushCommittedArgs)
+				}
+				for _, ev := range []string{"pr_open_resume_pr_opened", "push_resume_pr_opened", "scope_completeness_pr_opened"} {
+					if strings.Contains(logs, ev) {
+						t.Errorf("opened a PR from the held commit (%s):\n%s", ev, logs)
+					}
+				}
+				return
+			}
+			if code != exitOK || inv.callIdx != 0 {
+				t.Errorf("run = %d, agent invoked %d time(s), want exitOK with no agent:\n%s", code, inv.callIdx, logs)
+			}
+		})
+	}
+	// Reverify and child kinds prove none by construction, so neither needs the
+	// capability an old backend cannot advertise.
+	t.Run("reverify_proceeds", func(t *testing.T) {
+		f := newReverifyRunFixture(t, nil)
+		cmd, _ := reverifyVerifyCmd(t, noopPassOut, 0)
+		r := runReverify(t, f, reverifyPromptFor(f, cmd), nil)
+		if strings.Contains(r.log, "review_obligation_unknown_backend") || r.code != exitOK || r.invoker.callIdx != 0 {
+			t.Errorf("run = %d agent = %d:\n%s", r.code, r.invoker.callIdx, r.log)
+		}
+	})
+	t.Run("child_push_proceeds", func(t *testing.T) {
+		repo, _, branch, head, tree := pushResumeRepo(t)
+		implementEnv(t, "test-owner/test-repo", "main")
+		inv := &fakeInvoker{canned: agent.Result{OK: true}}
+		withFakeInvoker(t, inv)
+		fu := newFakeUploader(t)
+		fu.promptResp = &upload.FetchedPrompt{
+			StageID: verifiedTreeStageID, StageType: "implement", Prompt: "implement", PromptHash: "h",
+			DecomposedFromRunID: childResumeParentRunID, OpenPRFromHeldCommit: true, HeldCommitSHA: head,
+			HeldCommitBranch: branch, HeldCommitBaseSHA: "main", HeldCommitVerifiedTreeSHA: tree, HeldCommitResumeKind: resumeKindPush,
+		}
+		withFakeUploader(t, fu)
+		fp := &fakePusher{}
+		withFakeGitOps(t, fp, &fakePROpener{})
+		var stderr strings.Builder
+		code := run(obligationRunArgs("https://api.fishhawk.test", repo), &stderr)
+		if strings.Contains(stderr.String(), "review_obligation_unknown_backend") || code != exitOK || inv.callIdx != 0 || fp.pushCommittedArgs == nil {
+			t.Errorf("run = %d agent = %d pushed = %+v:\n%s", code, inv.callIdx, fp.pushCommittedArgs, stderr.String())
+		}
+	})
+}
+
+// livePassScript answers success ships from the golden's review_round_in_flight
+// section. Retry-After is shortened to the 1s floor so a poll costs a second;
+// the caller_cancel rows send the section verbatim.
+type livePassScript struct {
+	mu        sync.Mutex
+	g         reviewObligationGolden
+	live      int // in-flight answers before final; -1 answers in flight forever
+	remaining string
+	verbatim  bool
+	final     func(w http.ResponseWriter)
+	bodies    [][]byte
+	firstPost chan struct{}
+	once      sync.Once
+}
+
+func (s *livePassScript) serve(w http.ResponseWriter, raw []byte) bool {
+	s.mu.Lock()
+	s.bodies = append(s.bodies, raw)
+	n := len(s.bodies)
+	s.mu.Unlock()
+	s.once.Do(func() { close(s.firstPost) })
+	if s.live >= 0 && n > s.live {
+		s.final(w)
+		return true
+	}
+	for k, v := range s.g.ReviewRoundInFlight.Headers {
+		switch {
+		case s.verbatim:
+			w.Header().Set(k, v)
+		case k == upload.ReviewPassRemainingHeader:
+			w.Header().Set(k, s.remaining)
+		default:
+			w.Header().Set(k, "1")
+		}
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(s.g.ReviewRoundInFlight.Status)
+	_, _ = w.Write(s.g.ReviewRoundInFlight.Envelope)
+	return true
+}
+
+func (s *livePassScript) posts() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.bodies...)
+}
+
+func writeShipSettled(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_, _ = w.Write([]byte(`{"id":"00000000-0000-0000-0000-000000000bbb","content_hash":"cafebabe","idempotent":true}`))
+}
+
+func writeShipLost(w http.ResponseWriter) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusConflict)
+	_, _ = w.Write([]byte(`{"error":{"code":"review_round_interrupted","message":"the review round was lost"}}`))
+}
+
+func newLivePassScript(t *testing.T, live int, remaining string, final func(http.ResponseWriter)) *livePassScript {
+	t.Helper()
+	g := loadReviewObligationGolden(t)
+	if _, ok := g.ReviewRoundInFlight.Headers[upload.ReviewPassRemainingHeader]; !ok || len(g.ReviewRoundInFlight.Headers) != 2 {
+		t.Fatalf("setup: golden headers = %v", g.ReviewRoundInFlight.Headers)
+	}
+	return &livePassScript{g: g, live: live, remaining: remaining, final: final, firstPost: make(chan struct{})}
+}
+
+// assertLivePassOutcome holds the assertions both callers share. wantFailed means
+// a category-C failure report landed carrying a resumable checkpoint.
+func assertLivePassOutcome(t *testing.T, b *checkpointBackend, s *livePassScript, wantPosts int, wantFailed bool) []upload.ShipPullRequestArgs {
+	t.Helper()
+	posts := s.posts()
+	if wantPosts >= 0 && len(posts) != wantPosts {
+		t.Errorf("success POSTs = %d, want %d", len(posts), wantPosts)
+	}
+	for i, p := range posts {
+		if !bytes.Equal(p, posts[0]) {
+			t.Errorf("POST %d changed the signed bytes:\n%s\nvs\n%s", i, p, posts[0])
+		}
+	}
+	b.mu.Lock()
+	reports := append([]upload.ShipPullRequestArgs(nil), b.failedReports...)
+	b.mu.Unlock()
+	if !wantFailed {
+		if len(reports) != 0 {
+			t.Errorf("failure reports = %+v, want none", reports)
+		}
+		return reports
+	}
+	if len(reports) != 1 || reports[0].Category != "C" || reports[0].HeadSHA == "" {
+		t.Fatalf("failure reports = %+v, want one category C with coordinates", reports)
+	}
+	return reports
+}
+
+// TestOpenPRAndShipArtifact_LongSupplementalPass drives the ordinary ship's real
+// caller with a real client against a backend answering from the golden section.
+func TestOpenPRAndShipArtifact_LongSupplementalPass(t *testing.T) {
+	const blipBudget = 2 // MaxRetries 1: an uncontinued pass exhausts after two POSTs.
+	for _, tc := range []struct {
+		name       string
+		live       int
+		remaining  string
+		final      func(http.ResponseWriter)
+		wantCode   int
+		wantPosts  int
+		wantFailed bool
+	}{
+		{"completes_once", blipBudget + 1, "90", writeShipSettled, exitOK, blipBudget + 2, false},
+		{"reject_settled", 1, "90", writeShipSettled, exitOK, 2, false},
+		{"lost_409_reports_failed_c", 1, "90", writeShipLost, exitFailure, 2, true},
+		{"deadline_reports_failed_c", -1, "1", nil, exitFailure, -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, _, _, _, _ := pushResumeRepo(t)
+			implementEnv(t, "test-owner/test-repo", "main")
+			inv := &fakeInvoker{canned: agent.Result{OK: true}}
+			withFakeInvoker(t, inv)
+			backend, srv := newCheckpointBackend(t)
+			script := newLivePassScript(t, tc.live, tc.remaining, tc.final)
+			backend.onSuccessShip = script.serve
+			withObligationClient(t)
+			withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+			var log strings.Builder
+			if code := run(obligationRunArgs(srv.URL, repo), &log); code != tc.wantCode {
+				t.Fatalf("run = %d, want %d\n%s", code, tc.wantCode, log.String())
+			}
+			if inv.callIdx != 1 {
+				t.Errorf("agent invoked %d time(s), want the one ordinary pass", inv.callIdx)
+			}
+			reports := assertLivePassOutcome(t, backend, script, tc.wantPosts, tc.wantFailed)
+			if tc.wantFailed {
+				assertKnownNone(t, reports[0].ReviewObligation, "head-sha-abc", "")
+			}
+		})
+	}
+	t.Run("caller_cancel", func(t *testing.T) {
+		repo, _, _, _, _ := pushResumeRepo(t)
+		backend, srv := newCheckpointBackend(t)
+		script := newLivePassScript(t, -1, "", nil)
+		script.verbatim = true
+		backend.onSuccessShip = script.serve
+		withFakePusher(t)
+		withFakePROpenerOnly(t)
+		client := upload.New(srv.URL)
+		client.MaxRetries = 1
+		client.Backoff = time.Millisecond
+		cfg := checkpointResumeCfg(repo)
+		issued := obligationIssuedKey(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan error, 1)
+		go func() {
+			done <- openPRAndShipArtifact(ctx, cfg, io.Discard, client, issued, "", false, false, nil, false, "", "", nil, nil, nil, &pushCheckpoint{})
+		}()
+		awaitLivePassThenCancel(t, script, cancel)
+		select {
+		case err := <-done:
+			if !errors.Is(err, context.Canceled) {
+				t.Errorf("err = %v, want the caller's context.Canceled", err)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the caller's cancel did not end the wait")
+		}
+		if got := len(script.posts()); got != 1 {
+			t.Errorf("POSTs = %d, want 1: the golden section must read as live, not an ordinary blip", got)
+		}
+	})
+}
+
+// awaitLivePassThenCancel cancels once the first POST was answered and the
+// client's millisecond blip backoff has long passed, so a second POST at that
+// point would mean the section was not read as live.
+func awaitLivePassThenCancel(t *testing.T, s *livePassScript, cancel context.CancelFunc) {
+	t.Helper()
+	select {
+	case <-s.firstPost:
+	case <-time.After(10 * time.Second):
+		t.Fatal("setup: no success ship reached the backend")
+	}
+	time.Sleep(200 * time.Millisecond)
+	cancel()
+}
+
+// TestOpenHeldCommitPR_LongSupplementalPass drives the resume's real caller: no
+// agent runs on any arm, and a failure that re-arms keeps the required set.
+func TestOpenHeldCommitPR_LongSupplementalPass(t *testing.T) {
+	const blipBudget = 2
+	seed := func(t *testing.T, b *checkpointBackend, branch, head string) {
+		t.Helper()
+		b.checkpoint = &upload.ShipPullRequestArgs{Branch: branch, HeadSHA: head, BaseSHA: "base"}
+		seeded := *goldenServedPrompt(t).HeldCommitReviewObligation
+		seeded.HeadSHA = head
+		b.obligation = &seeded
+	}
+	for _, tc := range []struct {
+		name       string
+		live       int
+		remaining  string
+		final      func(http.ResponseWriter)
+		wantCode   int
+		wantPosts  int
+		wantFailed bool
+	}{
+		{"completes_once", blipBudget + 1, "90", writeShipSettled, exitOK, blipBudget + 2, false},
+		{"reject_settled", 1, "90", writeShipSettled, exitOK, 2, false},
+		{"lost_409_reports_failed_c", 1, "90", writeShipLost, exitFailure, 2, true},
+		{"deadline_reports_failed_c", -1, "1", nil, exitFailure, -1, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			repo, branch, head := checkpointResumeRepo(t)
+			implementEnv(t, "test-owner/test-repo", "main")
+			inv := &fakeInvoker{canned: agent.Result{OK: true}}
+			withFakeInvoker(t, inv)
+			backend, srv := newCheckpointBackend(t)
+			seed(t, backend, branch, head)
+			script := newLivePassScript(t, tc.live, tc.remaining, tc.final)
+			backend.onSuccessShip = script.serve
+			withObligationClient(t)
+			withFakeGitOps(t, &fakePusher{}, &fakePROpener{})
+			var log strings.Builder
+			if code := run(obligationRunArgs(srv.URL, repo), &log); code != tc.wantCode {
+				t.Fatalf("run = %d, want %d\n%s", code, tc.wantCode, log.String())
+			}
+			if inv.callIdx != 0 {
+				t.Errorf("agent invoked %d time(s), want 0", inv.callIdx)
+			}
+			reports := assertLivePassOutcome(t, backend, script, tc.wantPosts, tc.wantFailed)
+			if tc.wantFailed {
+				assertGoldenSet(t, reports[0].ReviewObligation, head, "")
+			}
+			posts := script.posts()
+			if len(posts) == 0 || !bytes.Contains(posts[0], []byte(`"supplemental_scope_exemptions":[{"path":"backend/internal/foo/foo.go"`)) {
+				t.Errorf("the resumed upload must name the paths it owes: %s", posts)
+			}
+		})
+	}
+	t.Run("caller_cancel", func(t *testing.T) {
+		repo, branch, head := checkpointResumeRepo(t)
+		backend, srv := newCheckpointBackend(t)
+		script := newLivePassScript(t, -1, "", nil)
+		script.verbatim = true
+		backend.onSuccessShip = script.serve
+		withFakePusher(t)
+		withFakePROpenerOnly(t)
+		client := upload.New(srv.URL)
+		client.MaxRetries = 1
+		client.Backoff = time.Millisecond
+		cfg := checkpointResumeCfg(repo)
+		cfg.backendSupportsReviewObligation = true
+		cfg.heldReviewObligation = goldenServedPrompt(t).HeldCommitReviewObligation
+		issued := obligationIssuedKey(t)
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+		done := make(chan int, 1)
+		go func() {
+			done <- openHeldCommitPR(ctx, cfg, head, branch, "base", resumeKindPROpen, "", "", "", io.Discard, client, issued)
+		}()
+		awaitLivePassThenCancel(t, script, cancel)
+		select {
+		case code := <-done:
+			if code != exitFailure {
+				t.Errorf("exit = %d, want exitFailure", code)
+			}
+		case <-time.After(10 * time.Second):
+			t.Fatal("the caller's cancel did not end the wait")
+		}
+		if got := len(script.posts()); got != 1 {
+			t.Errorf("POSTs = %d, want 1: the golden section must read as live, not an ordinary blip", got)
+		}
+	})
 }

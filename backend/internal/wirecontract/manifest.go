@@ -63,8 +63,11 @@ const (
 	promptFile    = "backend/internal/server/prompt.go"
 	bindingsFile  = "backend/internal/server/binding_assertions.go"
 	pullRequestGo = "backend/internal/server/pullrequest.go"
-	scopeCompFile = "backend/internal/server/scope_completeness.go"
-	acceptanceGo  = "backend/internal/server/acceptance.go"
+	// reviewRecoveryGo holds the backend twin of the runner's retained required
+	// review (ADR-140 (#5047) D9).
+	reviewRecoveryGo = "backend/internal/server/review_recovery.go"
+	scopeCompFile    = "backend/internal/server/scope_completeness.go"
+	acceptanceGo     = "backend/internal/server/acceptance.go"
 	// acceptanceTranscriptGo holds the backend twins of the runner's
 	// acceptance-transcript wire shapes (E72.5 / #3329).
 	acceptanceTranscriptGo = "backend/internal/server/acceptance_transcript.go"
@@ -202,6 +205,16 @@ func SeedManifest() Manifest {
 				Name: "acceptance_transcript_ref", Anchor: "#3329",
 				Emitter:  Endpoint{File: uploadFile, Type: "AcceptanceTranscriptRef"},
 				Consumer: Endpoint{File: acceptanceTranscriptGo, Type: "acceptanceTranscriptRef"},
+				Mode:     ModeExact,
+			},
+			{
+				// The required supplemental review a held-commit resume owes
+				// (ADR-140 (#5047) D9). ModeExact: absent, null and empty are three
+				// states, so no side may add omitempty. The bytes are ALSO pinned by
+				// the shared golden testdata/wire/review_obligation_wire.json.
+				Name: "held_commit_review_obligation", Anchor: "ADR-140/#5047",
+				Emitter:  Endpoint{File: reviewRecoveryGo, Type: "reviewObligation"},
+				Consumer: Endpoint{File: uploadFile, Type: "ReviewObligation"},
 				Mode:     ModeExact,
 			},
 			// ---- ModeSubset: prompt response -> fetched prompt ----
@@ -413,6 +426,7 @@ func SeedManifest() Manifest {
 			promptFile,
 			bindingsFile,
 			pullRequestGo,
+			reviewRecoveryGo,
 			scopeCompFile,
 			acceptanceGo,
 			acceptanceTranscriptGo,

@@ -51,7 +51,28 @@ func allInvocationsGrounded(invocations []reviewerInvocation) bool {
 // contract already guarantees allInvocationsGrounded held, but the type
 // assertion is repeated here as a defensive belt: a reviewer that somehow lacks
 // the capability degrades to diff-only rather than dropping the review.
-func (*Server) invokeReview(ctx context.Context, inv reviewerInvocation, promptText, treeDir string) (*planreview.ReviewVerdict, string, error) {
+//
+// It is the ONE choke point every reviewer invocation passes (ADR-140 (#5047)
+// D8): the invocation runs under the server's reviewer lifetime, so shutdown can
+// cancel it even though reviewers run under context.WithoutCancel. Once the
+// lifetime is closed no adapter is touched, and an adapter error while it is
+// closed is the interrupted outcome, never a failed-review row. A verdict that
+// arrived despite the close is returned normally.
+func (s *Server) invokeReview(ctx context.Context, inv reviewerInvocation, promptText, treeDir string) (*planreview.ReviewVerdict, string, error) {
+	reviewCtx, release, entered := s.reviewers.enter(ctx)
+	if !entered {
+		return nil, "", errReviewerStoppedForShutdown
+	}
+	defer release()
+	verdict, model, err := invokeReviewAdapter(reviewCtx, inv, promptText, treeDir)
+	if err != nil && s.reviewers.isClosed() {
+		return nil, model, errReviewerStoppedForShutdown
+	}
+	return verdict, model, err
+}
+
+// invokeReviewAdapter is invokeReview's capability routing.
+func invokeReviewAdapter(ctx context.Context, inv reviewerInvocation, promptText, treeDir string) (*planreview.ReviewVerdict, string, error) {
 	if treeDir != "" {
 		if gr, ok := inv.reviewer.(groundedReviewer); ok {
 			return gr.ReviewGrounded(ctx, promptText, treeDir)

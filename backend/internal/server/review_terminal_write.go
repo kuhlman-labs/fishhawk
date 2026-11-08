@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/google/uuid"
@@ -42,6 +43,14 @@ import (
 // Callers holding reconcileEmitLockFor(runID) use appendReviewTerminalSingleWith
 // (one bounded append, one bounded probe, then the registry) so the stripe
 // lock is held across at most two bounded operations per terminal.
+//
+// Bounded mode (ADR-140 (#5047) D8). A required gating pass marks its context
+// with withBoundedReviewTerminalWrites. The terminal path's final probe and named
+// attempt then keep the caller's deadline and shutdown instead of detaching, and
+// a write that stays unrecorded is noted on the mark so the dispatcher can refuse
+// the stage edge. An unmarked caller keeps the detached #4106 path byte for byte.
+// The registered settle still runs detached and may land a named failure or
+// confirm the original later, but it holds no ownership and takes no stage edge.
 
 // reviewVerdictWriteFailedPrefix starts the reason of every named failure the
 // terminal path writes, so an operator (and the tests) can tell a lost-write
@@ -109,6 +118,39 @@ func productionReviewTerminalWriteConfig() reviewTerminalWriteConfig {
 // defaultReviewTerminalWriteConfig is read-only after init. The package's
 // tests replace it ONCE in an init() with millisecond steps.
 var defaultReviewTerminalWriteConfig = productionReviewTerminalWriteConfig()
+
+// reviewTerminalWriteBound marks a context as a required gating pass's: its
+// terminal writes keep the context's bound, and failed records a write that the
+// terminal path could not prove recorded.
+type reviewTerminalWriteBound struct {
+	failed atomic.Bool
+}
+
+// evidenceWriteFailed reports whether a terminal write under this mark was lost.
+func (b *reviewTerminalWriteBound) evidenceWriteFailed() bool {
+	return b.failed.Load()
+}
+
+type reviewTerminalWriteBoundKey struct{}
+
+// withBoundedReviewTerminalWrites marks ctx for bounded mode and returns the mark.
+func withBoundedReviewTerminalWrites(ctx context.Context) (context.Context, *reviewTerminalWriteBound) {
+	bound := &reviewTerminalWriteBound{}
+	return context.WithValue(ctx, reviewTerminalWriteBoundKey{}, bound), bound
+}
+
+// reviewTerminalWritesBound returns ctx's mark, or nil on an unmarked context.
+func reviewTerminalWritesBound(ctx context.Context) *reviewTerminalWriteBound {
+	bound, _ := ctx.Value(reviewTerminalWriteBoundKey{}).(*reviewTerminalWriteBound)
+	return bound
+}
+
+// noteReviewTerminalWriteFailed records a lost terminal on ctx's mark, if any.
+func noteReviewTerminalWriteFailed(ctx context.Context) {
+	if b := reviewTerminalWritesBound(ctx); b != nil {
+		b.failed.Store(true)
+	}
+}
 
 // boundedAppend is one AppendChained under its own per-operation timeout.
 func (s *Server) boundedAppend(parent context.Context, p audit.ChainAppendParams, cfg reviewTerminalWriteConfig) (*audit.Entry, error) {
@@ -200,7 +242,11 @@ phase1:
 			slog.String("error", err.Error()),
 		)
 	}
-	return s.reviewTerminalWriteFailed(ctx, p, cfg, attempts, time.Since(start), lastErr, true)
+	found, ferr := s.reviewTerminalWriteFailed(ctx, p, cfg, attempts, time.Since(start), lastErr, true)
+	if ferr != nil {
+		noteReviewTerminalWriteFailed(ctx)
+	}
+	return found, ferr
 }
 
 // appendReviewTerminalSingleWith is the in-lock variant for callers holding
@@ -222,15 +268,21 @@ func (s *Server) appendReviewTerminalSingleWith(ctx context.Context, p audit.Cha
 
 // reviewTerminalWriteFailed is the terminal path shared by exhaustion and
 // cancellation (and the single in-lock variant, with namedAttempt false). Every
-// operation runs under context.WithoutCancel(ctx), each with its own timeout.
+// operation runs under context.WithoutCancel(ctx), each with its own timeout,
+// unless ctx carries the bounded-mode mark: then the final probe and the named
+// attempt keep ctx, so a gating pass's deadline and shutdown still bind them.
 func (s *Server) reviewTerminalWriteFailed(ctx context.Context, p audit.ChainAppendParams, cfg reviewTerminalWriteConfig, attempts int, elapsed time.Duration, lastErr error, namedAttempt bool) (*audit.Entry, error) {
 	detached := context.WithoutCancel(ctx)
+	opCtx := detached
+	if reviewTerminalWritesBound(ctx) != nil {
+		opCtx = ctx
+	}
 	cancelled := ctx.Err() != nil
 	stageID := reviewTerminalStageID(p)
 
 	// (1) Final probe for the ORIGINAL row: the last attempt (or the one the
 	// cancel interrupted) may have committed despite its error.
-	found, ok, perr := s.probeReviewTerminal(detached, p.RunID, p.Category, stageID, p.Timestamp, cfg)
+	found, ok, perr := s.probeReviewTerminal(opCtx, p.RunID, p.Category, stageID, p.Timestamp, cfg)
 	if perr == nil && ok {
 		return found, nil
 	}
@@ -271,7 +323,7 @@ func (s *Server) reviewTerminalWriteFailed(ctx context.Context, p audit.ChainApp
 	// nothing: a failed probe cannot rule out a committed original, and the
 	// flush re-probes before it appends.
 	if namedAttempt && perr == nil {
-		_, nerr := s.boundedAppend(detached, named, cfg)
+		_, nerr := s.boundedAppend(opCtx, named, cfg)
 		if nerr == nil {
 			return nil, lastErr
 		}

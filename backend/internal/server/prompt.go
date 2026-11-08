@@ -558,6 +558,24 @@ type promptResponse struct {
 	// convention as the four fields above.
 	HeldCommitPRTitle string `json:"held_commit_pr_title,omitempty"`
 	HeldCommitPRBody  string `json:"held_commit_pr_body,omitempty"`
+	// HeldCommitReviewObligation is the required supplemental review a held-commit
+	// resume still owes (ADR-140 (#5047) D9), served only alongside the held-commit
+	// fields above. Its list has three states on the wire; see
+	// reviewObligationKnowledge. A resume admitHeldCommitObligation proved owes
+	// nothing is served an empty list, so the runner can tell it from an old
+	// backend that says nothing.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to the
+	// runner's upload.FetchedPrompt.HeldCommitReviewObligation.
+	HeldCommitReviewObligation *reviewObligation `json:"held_commit_review_obligation,omitempty"`
+	// SupportsReviewObligationResume is the BACKEND half of the
+	// review-obligation-resume handshake (ADR-140 (#5047) D9). Like
+	// SupportsPushResume it advertises the BUILD, so it is set on every
+	// implement-stage response. A runner reads an absent flag as proving nothing.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to the
+	// runner's upload.FetchedPrompt.SupportsReviewObligationResume.
+	SupportsReviewObligationResume bool `json:"supports_review_obligation_resume,omitempty"`
 	// ScopeConstraint is the decomposed child's agent-facing narrowing (#1669,
 	// slice-move gained/lost fold #2596), served ONLY for a fan-out slice child
 	// whose sub-plan resolved (trigger.ScopeConstraint != nil). Its ScopeFiles
@@ -2160,13 +2178,17 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		// the BUILD's capability, not a per-run decision, so it is set
 		// unconditionally on every implement-stage response.
 		resp.SupportsPushResume = true
+		resp.SupportsReviewObligationResume = true
 		// Scope-completeness EXEMPT resolution (#2501): emit the held-commit
 		// fields ONLY for a park whose newest decision entry is `exempted`, so the
 		// re-dispatched runner opens the PR from the held commit with no agent
 		// re-run. Fail-closed — see resolveHeldCommitExemption. A fix-up dispatch
 		// is refused inside the resolver (#2630) so the fetched fix-up prompt runs
 		// instead of the pre-agent held-commit short-circuit.
-		if held, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
+		// ADR-140 (#5047) D9: a resolved resume is still subject to admission, on
+		// both arms. A declined exempt arm falls through to a checkpoint resolver
+		// that finds the newer `exempted` row and declines as well.
+		if held, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt && s.admitHeldCommitObligation(r.Context(), r, runRow, stage, &held, true) {
 			resp.OpenPRFromHeldCommit = true
 			resp.HeldCommitSHA = held.sha
 			resp.HeldCommitBranch = held.branch
@@ -2176,7 +2198,8 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), runnerAdvertises(r, capabilityReverifyResume), true); resume {
+			resp.HeldCommitReviewObligation = held.reviewObligation
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), runnerAdvertises(r, capabilityReverifyResume), true); resume && s.admitHeldCommitObligation(r.Context(), r, runRow, stage, &held, true) {
 			// Held-commit CHECKPOINT resume (#2169 pr_open, E45.86 / #3621 push),
 			// taken ONLY when the exempt resolution above returned false. An
 			// exempt-resolved park always wins: #1231 keeps precedence, and the two
@@ -2193,6 +2216,7 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 			// #2570, same as the exempt arm above.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
+			resp.HeldCommitReviewObligation = held.reviewObligation
 		}
 	}
 	// Plan-stage model routing (#1416): resolve the plan-model ladder and carry
@@ -2964,11 +2988,12 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		// BACKEND half of the E45.86 / #3621 capability handshake, same
 		// unconditional derivation as the dispatch path.
 		resp.SupportsPushResume = true
+		resp.SupportsReviewObligationResume = true
 		// Scope-completeness EXEMPT resolution (#2501), same derivation as the
 		// dispatch path so the rendered (SPA-readable) prompt response stays
 		// byte-consistent with the runner-facing one. A fix-up dispatch is refused
 		// inside the resolver (#2630) identically to the dispatch path.
-		if held, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt {
+		if held, exempt := s.resolveHeldCommitExemption(r.Context(), runRow, stage, fixup); exempt && s.admitHeldCommitObligation(r.Context(), r, runRow, stage, &held, false) {
 			resp.OpenPRFromHeldCommit = true
 			resp.HeldCommitSHA = held.sha
 			resp.HeldCommitBranch = held.branch
@@ -2978,7 +3003,8 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// agent text nor the issue-context fallback was available.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
-		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), runnerAdvertises(r, capabilityReverifyResume), false); resume {
+			resp.HeldCommitReviewObligation = held.reviewObligation
+		} else if held, resume := s.resolvePushCheckpointResume(r.Context(), runRow, stage, fixup, runnerAdvertises(r, capabilityPushResume), runnerAdvertises(r, capabilityChildPushResume), runnerAdvertises(r, capabilityReverifyResume), false); resume && s.admitHeldCommitObligation(r.Context(), r, runRow, stage, &held, false) {
 			// Held-commit CHECKPOINT resume, same derivation + same exempt-wins
 			// precedence as the dispatch path so the rendered (SPA-readable) prompt
 			// response stays byte-consistent with it. recordDrop is FALSE here: a
@@ -2994,6 +3020,7 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 			// #2570, same as the exempt arm above.
 			resp.HeldCommitPRTitle = held.prTitle
 			resp.HeldCommitPRBody = held.prBody
+			resp.HeldCommitReviewObligation = held.reviewObligation
 		}
 	}
 	// Plan-stage model routing (#1416), same derivation as the dispatch path so
@@ -5319,6 +5346,10 @@ var scopeCompletenessDecisionInvalidatorCategories = []string{
 // ALREADY-parked legacy row resumable: a pre-#2563 park (e.g. #2169's) has an
 // empty park.BaseSHA yet its parked audit payload carries base_sha, so it
 // resumes instead of re-failing category-B identically after a retry_stage.
+// (c) ADR-140 (#5047) D9: a park that reported a required review withholds both
+// of those, so an older resolver takes this no-base refusal; only this rung reads
+// the true value (requiredReviewBaseFromParked). The obligation the park recorded
+// rides on the result, and admitHeldCommitObligation decides whether it is served.
 //
 // FAIL-CLOSED, deliberately. This gate is the only thing standing between a
 // parked stage reachable in `pending` through the widened
@@ -5440,6 +5471,12 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 		}
 		base = payload.BaseSHA
 	}
+	// ADR-140 (#5047) D9: a park reporting a required review withholds base_sha from
+	// the two places an older resolver reads, so its retry is one agent pass there.
+	// This build reads the true value from the one key that older build ignores.
+	if base == "" && newestParked != nil {
+		base = requiredReviewBaseFromParked(newestParked, park.HeldCommitSHA)
+	}
 	if base == "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"prompt: exempt-resolved park carries no base SHA (park.base_sha empty, no parked-audit fallback); omitting held-commit exempt fields",
@@ -5487,7 +5524,111 @@ func (s *Server) resolveHeldCommitExemption(ctx context.Context, runRow *run.Run
 	return heldCommitResume{
 		sha: park.HeldCommitSHA, branch: park.RunBranch, baseSHA: base,
 		prTitle: title, prBody: body,
+		reviewObligation: parkedReviewObligation(newestParked),
+		discardTreeSHA:   park.VerifiedTreeSHA,
 	}, true
+}
+
+// parkedReviewObligation reads the obligation a park recorded. A park with no
+// key, or a key that does not decode, proves nothing: it stays unknown and
+// admission decides.
+func parkedReviewObligation(parked *audit.Entry) *reviewObligation {
+	if parked == nil {
+		return nil
+	}
+	var payload struct {
+		ReviewObligation *reviewObligation `json:"review_obligation"`
+	}
+	if err := json.Unmarshal(parked.Payload, &payload); err != nil {
+		return nil
+	}
+	return payload.ReviewObligation
+}
+
+// requiredReviewBaseFromParked reads the base a required-review park withheld. It
+// answers only for a known-required obligation bound to the held commit, so a
+// stray key cannot supply a base for any other park; anything else is empty and
+// takes the resolver's existing no-base refusal.
+func requiredReviewBaseFromParked(parked *audit.Entry, heldSHA string) string {
+	var payload struct {
+		ReviewObligation      *reviewObligation `json:"review_obligation"`
+		RequiredReviewBaseSHA string            `json:"required_review_base_sha"`
+	}
+	if err := json.Unmarshal(parked.Payload, &payload); err != nil {
+		return ""
+	}
+	var obligation reviewObligation
+	if payload.ReviewObligation != nil {
+		obligation = *payload.ReviewObligation
+	}
+	if reviewObligationKnowledge(&obligation) != obligationKnownRequired {
+		return ""
+	}
+	if obligation.HeadSHA != heldSHA {
+		return ""
+	}
+	return payload.RequiredReviewBaseSHA
+}
+
+// admitHeldCommitObligation is the ADR-140 (#5047) D9 admission every resolved
+// held-commit resume passes, at both prompt sites. It reports whether the resume
+// may be served, and on success leaves the obligation to serve on held. A decline
+// is TOTAL: no held-commit field reaches the runner, so the retry is one full
+// agent pass, never a resume that loses the required review.
+//
+//   - A decomposition child or a reverify carrier proves none by construction: a
+//     child's ship body has no such field, and a reverify carrier is armed before
+//     any delta exists.
+//   - A known obligation bound to another head declines. A non-empty set served
+//     to a runner lacking the capability declines. Any other known one is served.
+//   - An unknown one, which a nil pointer, an absent list and a null list all are,
+//     declines where the configured implement review is gating or unreadable, and
+//     otherwise proves none.
+//
+// Knowledge is read before the obligation is dereferenced, so a nil obligation
+// stays unknown. Known-none remains runner-attested and the capability advisory;
+// neither is a defence against a dishonest reporter (#5078). recordDrop keeps a
+// preview render off the audit chain.
+func (s *Server) admitHeldCommitObligation(ctx context.Context, r *http.Request, runRow *run.Run, stage *run.Stage, held *heldCommitResume, recordDrop bool) bool {
+	decline := func(reason string) bool {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"prompt: declining held-commit resume on its review obligation",
+			slog.String("run_id", runRow.ID.String()),
+			slog.String("stage_id", stage.ID.String()),
+			slog.String("reason", reason))
+		if recordDrop {
+			s.appendVerifiedTreeDiscarded(ctx, runRow.ID, stage.ID, pushCheckpointPayload{
+				Branch: held.branch, HeadSHA: held.sha, VerifiedTreeSHA: held.discardTreeSHA,
+			}, reason)
+		}
+		return false
+	}
+	provenNone := func() bool {
+		held.reviewObligation = &reviewObligation{
+			HeadSHA:                     held.sha,
+			StageAttempt:                run.StageAttemptToken(stage.DispatchedAt),
+			SupplementalScopeExemptions: []scopeExemption{},
+		}
+		return true
+	}
+	isChild := runRow.DecomposedFrom != nil
+	if isChild || held.resumeKind == resumeKindReverify {
+		return provenNone()
+	}
+	if reviewObligationKnowledge(held.reviewObligation) != obligationUnknown {
+		if held.reviewObligation.HeadSHA != held.sha {
+			return decline("review_obligation_head_mismatch")
+		}
+		if len(held.reviewObligation.SupplementalScopeExemptions) > 0 && !runnerAdvertises(r, capabilityReviewObligationResume) {
+			return decline("runner_review_obligation_capability_absent")
+		}
+		return true
+	}
+	req := s.resolveSupplementalPassRequirement(ctx, runRow.ID)
+	if req.state == passRequiredGating || req.state == passRequirementUnknown {
+		return decline("review_obligation_unknown")
+	}
+	return provenNone()
 }
 
 // heldCommitResume is what the two held-commit resume gates return: the
@@ -5515,6 +5656,13 @@ type heldCommitResume struct {
 	// side re-proves the unpublished local commit against. Never with
 	// resumeKindReverify, whose held tree failed verify.
 	verifiedTreeSHA string
+	// reviewObligation is the recorded required review this resume still owes, nil
+	// until a carrier supplies one; admitHeldCommitObligation decides what a nil
+	// or absent list means. Served on the prompt only after admission.
+	reviewObligation *reviewObligation
+	// discardTreeSHA names the recorded verified tree a declined admission throws
+	// away, for its verified_tree_discarded row. It is never served.
+	discardTreeSHA string
 }
 
 // resumeKindPROpen is the held_commit_resume_kind wire value for a PR-open
@@ -5605,6 +5753,17 @@ const capabilityChildPushResume = "child-push-resume"
 // declined and the agent re-runs.
 const capabilityReverifyResume = "reverify-resume"
 
+// capabilityReviewObligationResume is the runnerCapabilitiesHeader token for the
+// required-review retention of ADR-140 (#5047) D9: this runner retains a served
+// held_commit_review_obligation across its resume. A runner that does not
+// advertise it is served no held-commit field at all for a non-empty obligation,
+// never a resume that drops it; a known-none carrier is served as before. The
+// token is advisory: it does not prove a client implements the contract (#5078).
+// WIRE VALUE: byte-identical to the runner's
+// upload.CapabilityReviewObligationResume. A drift is fail-SAFE: every required
+// obligation is declined and the agent re-runs.
+const capabilityReviewObligationResume = "review-obligation-resume"
+
 // runnerAdvertises reports whether the request's capability header carries
 // token. Comma-separated, space-trimmed, CASE-SENSITIVE (the tokens are wire
 // values, not user text). A nil request or an absent header is false, so an
@@ -5625,12 +5784,14 @@ func runnerAdvertises(r *http.Request, token string) bool {
 // walks to find THIS stage's newest terminal implement outcome. It must contain
 // every category that can SUPERSEDE a checkpoint, not just the one that carries
 // it — a walk over pull_request_failed alone would happily resume a stage that
-// has since opened its PR, parked, or pushed a fix-up. pull_request_failed is
-// the carrier; the rest are the invalidators.
+// has since opened its PR, parked, or pushed a fix-up. pull_request_failed and
+// the three separate checkpoint categories are the carriers; the rest are the
+// invalidators.
 var pushCheckpointCategories = []string{
 	"pull_request_failed",
 	CategoryPushResumeCheckpoint,
 	CategoryVerifyResumeCheckpoint,
+	CategoryReviewObligationCheckpoint,
 	"pull_request_opened",
 	CategoryScopeCompletenessParked,
 	CategoryScopeCompletenessExempted,
@@ -5700,11 +5861,16 @@ type pushCheckpointPayload struct {
 	PRTitle         string
 	PRBody          string
 	ResumeKind      string
+	// ReviewObligation is the carrier's recorded obligation; absent stays nil.
+	ReviewObligation *reviewObligation
 }
 
 // checkpointEnvelope is the JSON shape EVERY carrier uses. Sharing it is what
-// keeps the three categories' payloads decodable by one path.
+// keeps the carrier categories' payloads decodable by one path.
 type checkpointEnvelope struct {
+	// ResumeKind is read only for CategoryReviewObligationCheckpoint, the one
+	// carrier whose category does not itself name the kind.
+	ResumeKind     string `json:"resume_kind"`
 	PushCheckpoint *struct {
 		Branch          string `json:"branch"`
 		HeadSHA         string `json:"head_sha"`
@@ -5715,6 +5881,8 @@ type checkpointEnvelope struct {
 		// checkpoint, where heldCommitPRTitleBody synthesizes instead.
 		PRTitle string `json:"pr_title"`
 		PRBody  string `json:"pr_body"`
+		// ADR-140 (#5047) D9: absent on every carrier that recorded no obligation.
+		ReviewObligation *reviewObligation `json:"review_obligation"`
 	} `json:"push_checkpoint"`
 }
 
@@ -5770,7 +5938,7 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 				newest = e
 			}
 			if (cat == "pull_request_failed" || cat == CategoryPushResumeCheckpoint ||
-				cat == CategoryVerifyResumeCheckpoint) &&
+				cat == CategoryVerifyResumeCheckpoint || cat == CategoryReviewObligationCheckpoint) &&
 				(newestCarrier == nil || e.Sequence > newestCarrier.Sequence) {
 				newestCarrier = e
 				newestCarrierCat = cat
@@ -5802,12 +5970,23 @@ func (s *Server) newestPushCheckpoint(ctx context.Context, runID, stageID uuid.U
 		kind = resumeKindPush
 	case CategoryVerifyResumeCheckpoint:
 		kind = resumeKindReverify
+	case CategoryReviewObligationCheckpoint:
+		// Only pr_open and push are valid on this carrier. reverify is a kind
+		// this build serves elsewhere, but never from here: a reverify carrier
+		// is armed before any delta exists, so it cannot hold a required set.
+		// It and any other value are cleared, so they reach the resolver's
+		// unknown_resume_kind decline rather than a served or guessed kind.
+		kind = ""
+		if env.ResumeKind == resumeKindPROpen || env.ResumeKind == resumeKindPush {
+			kind = env.ResumeKind
+		}
 	}
 	out := pushCheckpointPayload{
 		Branch: cp.Branch, HeadSHA: cp.HeadSHA, BaseSHA: cp.BaseSHA,
 		VerifiedTreeSHA: cp.VerifiedTreeSHA,
 		PRTitle:         cp.PRTitle, PRBody: cp.PRBody,
-		ResumeKind: kind,
+		ResumeKind:       kind,
+		ReviewObligation: cp.ReviewObligation,
 	}
 	// NEWEST-WINS. A carrier that is no longer this stage's newest terminal
 	// outcome has been superseded — the PR opened, the stage parked or was
@@ -5953,7 +6132,9 @@ func (s *Server) resolvePushCheckpointResume(ctx context.Context, runRow *run.Ru
 	held := heldCommitResume{
 		sha: cp.HeadSHA, branch: cp.Branch, baseSHA: cp.BaseSHA,
 		prTitle: title, prBody: body,
-		resumeKind: cp.ResumeKind,
+		resumeKind:       cp.ResumeKind,
+		reviewObligation: cp.ReviewObligation,
+		discardTreeSHA:   cp.VerifiedTreeSHA,
 	}
 	if cp.ResumeKind == resumeKindPush {
 		held.verifiedTreeSHA = cp.VerifiedTreeSHA

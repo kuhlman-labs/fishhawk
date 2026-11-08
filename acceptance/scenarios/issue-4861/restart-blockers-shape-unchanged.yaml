@@ -1,0 +1,14 @@
+id: scenario:issue-4861/restart-blockers-shape-unchanged
+statement: With no review round in flight on the preview, an anonymous GET /v0/restart-blockers returns 200 with items an array, scanned_runs an integer and truncated a boolean, and a terminal run with no open round adds no item.
+verify_hint: 'HTTP: GET /v0/restart-blockers with no credential; check the status code and the three top-level fields.'
+steps: '1) Anonymous GET http://localhost:8090/v0/restart-blockers on the fresh preview. 2) POST /v0/dev/fixtures {"scenario":"implement-running"} gave run 1ff5f1e0-04f0-438b-b8e6-202dd3536ba9 and implement stage a0e3e7bc-e889-425b-aee5-4ae9b5c3df93. 3) POST /v0/runs/{run}/signing-key {} returned private_key. 4) POST /v0/dev/sign with body {"outcome":"failed","category":"B","reason":"acceptance probe: deliberate category B failure"} and header X-Fishhawk-Dev-Private-Key returned a signature. 5) POST /v0/runs/{run}/pull-request?stage_id={implement} with the same body and X-Fishhawk-Signature returned 200 with outcome failed. 6) GET /v0/runs/{run} shows state failed. 7) Anonymous GET /v0/restart-blockers again.'
+assertions:
+    expected: 200 with items array, integer scanned_runs, boolean truncated; a terminal run with no open round adds no item.
+    observed_at_record: 'Before: 200 {"items":[],"scanned_runs":0,"truncated":false}. After the run turned terminal (failed) with no review round: 200 {"items":[],"scanned_runs":2,"truncated":false}. Two other seeded runs were still running, and the terminal run added no item.'
+    repro_handle: curl -s http://localhost:8090/v0/restart-blockers
+origin:
+    issue: 4861
+    pr: 0
+    run_id: 40a378fb-7fd3-45f9-b74a-293a9b1dbc58
+    head_sha: fac932cfd96ddb61bc8014cb32ce61792b5522e7
+    recorded_at: 2026-11-07T16:20:26Z

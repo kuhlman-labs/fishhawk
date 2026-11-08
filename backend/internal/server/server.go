@@ -1425,6 +1425,12 @@ type Server struct {
 	// is inert for non-drive runs.
 	drive *drive.Engine
 
+	// reviewers cancels every live reviewer and claimed supplemental pass handler
+	// at shutdown; supplementalPasses is the process-local proof that a gating
+	// supplemental pass is live (ADR-140 (#5047) D8). Both zero values are ready.
+	reviewers          reviewerLifetime
+	supplementalPasses supplementalPassOwners
+
 	// processStart is the in-memory boot marker the startup orphaned-review
 	// reconcile (#1781) compares audit timestamps against: every un-terminated
 	// *_review_started with a timestamp before this instant belongs to a dead
@@ -1731,9 +1737,20 @@ func (s *Server) Start() error {
 // deadline. Before the drain it closes the check_run yield re-probe spawn
 // (yieldProbeSpawnClosed), so a follow-up timer that fires during or after
 // the drain starts no probe.
+//
+// Reviewers do not wait for that drain's end: a fixed clock cancels every live
+// reviewer and claimed supplemental pass during it (reviewerShutdownDrain), and a
+// bounded wait after it (reviewerShutdownGrace) lets their group kills land. A
+// stopped reviewer writes no terminal row (ADR-140 (#5047) D8).
 func (s *Server) Shutdown(ctx context.Context) error {
 	shutdownCtx, cancel := context.WithTimeout(ctx, s.cfg.ShutdownTimeout)
 	defer cancel()
+	// http.Server.Shutdown does not cancel request contexts and reviewers run
+	// detached, so a fixed clock cancels live reviewers during HTTP drain, early
+	// enough that their process groups die inside scripts/dev's 5s SIGKILL window
+	// (ADR-140 (#5047) D8). It writes no terminal row: the next boot owns the round.
+	reviewerStop := time.AfterFunc(min(reviewerShutdownDrain, s.cfg.ShutdownTimeout), s.reviewers.closeAndCancel)
+	defer reviewerStop.Stop()
 	err := s.http.Shutdown(shutdownCtx)
 
 	s.yieldProbeSpawnMu.Lock()
@@ -1757,6 +1774,14 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	select {
 	case <-done:
 	case <-shutdownCtx.Done():
+	}
+
+	// Do not exit before cancelled reviewers' group kills land; a reviewer
+	// ignoring its context cannot hold shutdown past the grace.
+	if ended, stillLive := s.reviewers.stop(reviewerShutdownGrace); s.cfg.Logger != nil && ended+stillLive > 0 {
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, "shutdown: stopped live reviewers",
+			slog.Int("ended", ended),
+			slog.Int("still_live", stillLive))
 	}
 	return err
 }

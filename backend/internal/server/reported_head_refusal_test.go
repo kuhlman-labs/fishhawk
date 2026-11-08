@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -451,13 +455,16 @@ func TestReportedHead_DedupReadErrorMismatchIsRetryable(t *testing.T) {
 }
 
 // TestReportedHead_DedupReadErrorVerifiedHeadStillWrites pins the existing fail-open
-// dedup: a verified head proceeds and writes its row despite the failed read.
+// dedup: a verified head proceeds and writes its row despite the failed read. The
+// fault is one-shot: ADR-140 (#5047) D8's guarded variant edge re-reads these rows
+// after the run lock and answers a static 500 on a fault that persists, so only a
+// transient dedup fault isolates the fail-open dedup.
 func TestReportedHead_DedupReadErrorVerifiedHeadStillWrites(t *testing.T) {
 	for _, kc := range rhAllKinds {
 		t.Run(kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
 			f.forgeAt(rhH2, rhH2)
-			f.au.listByCategoryErrCategory = kc.category
+			f.s.cfg.AuditRepo = &rhDedupReadFault{auditFake: f.au, category: kc.category}
 			w := f.post(kc, rhH2, rhBaseSHA, rhPRBranch)
 			f.assertRowAt(kc, w, rhH2, rhPRBranch)
 			if !strings.Contains(f.logs.String(), "proceeding without idempotency guard") {
@@ -872,4 +879,19 @@ func TestReportedHead_RefusalTextIsNeutral(t *testing.T) {
 		}
 		assertNeutral(t, "409 message", env.Error.Message)
 	})
+}
+
+// rhDedupReadFault fails only the first read of category, which is the handler's
+// dedup read; every later read, the guarded edge's included, sees the store.
+type rhDedupReadFault struct {
+	*auditFake
+	category string
+	fired    atomic.Bool
+}
+
+func (a *rhDedupReadFault) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.category && a.fired.CompareAndSwap(false, true) {
+		return nil, errors.New("rhDedupReadFault: injected dedup read error for " + category)
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
 }

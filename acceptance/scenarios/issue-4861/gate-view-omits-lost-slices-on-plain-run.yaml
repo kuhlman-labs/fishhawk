@@ -1,0 +1,14 @@
+id: scenario:issue-4861/gate-view-omits-lost-slices-on-plain-run
+statement: GET /v0/runs/{run_id}/gate-view on a run with no decomposed children carries no slice_reviews_lost key and no slice_reviews entry in history_gaps.
+verify_hint: 'HTTP: GET /v0/runs/{run_id}/gate-view on any plain run and inspect the response body.'
+steps: '1) POST /v0/dev/fixtures {"scenario":"plan-gate-parked"} gave run cdbb1633-eb63-4845-8eb7-70caa9161c72. Also seeded acceptance-dispatched, which gave run 135f341a-93c6-405d-a70f-edd9a0d9ca6a. 2) An unauthenticated GET /v0/runs/{run}/gate-view answers 401. 3) POST /v0/runs/{run}/signing-key {}, then POST /v0/dev/sign with body {} and X-Fishhawk-Dev-Private-Key, then POST /v0/runs/{run}/mcp-token {} with X-Fishhawk-Signature returned an fhm_ bearer. 4) GET /v0/runs/{run}/gate-view with Authorization: Bearer <fhm_>.'
+assertions:
+    expected: No slice_reviews_lost key and no slice_reviews entry in history_gaps on a plain run.
+    observed_at_record: Both runs answer 200 with keys captain, consults, history_incomplete(false), merge_candidate_verdict, open, run_id, settled and suppressed_relitigations. Neither body has a slice_reviews_lost key, a history_gaps key or any slice_reviews string.
+    repro_handle: GET http://localhost:8090/v0/runs/{run_id}/gate-view with a run-scoped fhm_ bearer
+origin:
+    issue: 4861
+    pr: 0
+    run_id: 40a378fb-7fd3-45f9-b74a-293a9b1dbc58
+    head_sha: fac932cfd96ddb61bc8014cb32ce61792b5522e7
+    recorded_at: 2026-11-07T16:20:26Z
