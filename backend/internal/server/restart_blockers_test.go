@@ -2392,9 +2392,81 @@ func (o *rbRace) assertRefusedClaim(t *testing.T, w *httptest.ResponseRecorder, 
 	}
 }
 
+// assertGuardRefusedClaim pins a conflict_resolution_pushed claim with no live
+// trigger: its report guard (#3806) refuses it before the guarded edge, so nothing
+// commits, closes or notifies, and the stage keeps wantState.
+func (o *rbRace) assertGuardRefusedClaim(t *testing.T, w *httptest.ResponseRecorder, c variantCase, wantState run.StageState) {
+	t.Helper()
+	assertCode(t, w, http.StatusConflict, "conflict_resolution_not_live")
+	if got := o.committed(t).State; got != wantState {
+		t.Errorf("committed stage = %q, want %q", got, wantState)
+	}
+	if n := o.edge.advances.Load(); n != 0 {
+		t.Errorf("successful edges = %d, want 0", n)
+	}
+	if wantState == run.StageStateRunning {
+		o.assertNoSuccessEdge(t)
+	}
+	if n := o.rowCount(t, c.row); n != 0 {
+		t.Errorf("%s rows = %d, want 0", c.row, n)
+	}
+	if n := o.closeCalls(); n != 0 {
+		t.Errorf("PR closes = %d, want 0", n)
+	}
+	o.assertNoNotification(t)
+}
+
 func TestShipPullRequest_WrongClaimedOutcome_PG(t *testing.T) {
 	for _, c := range prVariantCases {
 		t.Run(c.outcome, func(t *testing.T) {
+			if c.outcome == "conflict_resolution_pushed" {
+				// An unproven conflict claim never reaches the guarded edge: the report
+				// guard (#3806) refuses it first, so the in-window races cannot apply.
+				// These two cases pin that early refusal ONLY; they prove nothing about
+				// the transactional review guard, which the live_trigger_* cases pin.
+				t.Run("running_refused_before_edge", func(t *testing.T) {
+					o := newRBRace(t, true, approveStep)
+					o.appendVerdict(t, o.stageID, supplementalVerdict(prSeamHead, o.attempt(t), planreview.VerdictReject))
+					o.assertGuardRefusedClaim(t, o.post(t, c.body(t)), c, run.StageStateRunning)
+				})
+				t.Run("settled_refused_before_edge", func(t *testing.T) {
+					o := newRBRace(t, true, approveStep)
+					if _, err := o.realRuns.TransitionStage(context.Background(), o.stageID, run.StageStateAwaitingApproval, nil); err != nil {
+						t.Fatalf("setup: settle: %v", err)
+					}
+					o.appendVerdict(t, o.stageID, supplementalVerdict(prSeamHead, o.attempt(t), planreview.VerdictReject))
+					o.assertGuardRefusedClaim(t, o.post(t, c.body(t)), c, run.StageStateAwaitingApproval)
+				})
+				// A live trigger proves the mode, so the claim reaches the guarded edge,
+				// where a binding reject at the SAME head still refuses it: removing the
+				// typed review guard stays observable after the admission guard.
+				t.Run("live_trigger_same_head_reject_in_window", func(t *testing.T) {
+					o := newRBRace(t, true, approveStep)
+					o.proveMode(t, c)
+					claim := o.park(t, c.body(t))
+					o.appendVerdict(t, o.stageID, supplementalVerdict(prSeamHead, o.attempt(t), planreview.VerdictReject))
+					o.edge.open()
+					o.assertRefusedClaim(t, awaitResponse(t, claim, "claim"), c)
+				})
+				t.Run("live_trigger_settled_same_head_reject", func(t *testing.T) {
+					o := newRBRace(t, true, approveStep)
+					o.proveMode(t, c)
+					if _, err := o.realRuns.TransitionStage(context.Background(), o.stageID, run.StageStateAwaitingApproval, nil); err != nil {
+						t.Fatalf("setup: settle: %v", err)
+					}
+					o.appendVerdict(t, o.stageID, supplementalVerdict(prSeamHead, o.attempt(t), planreview.VerdictReject))
+					w := o.post(t, c.body(t))
+					assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+					if got := o.committed(t).State; got != run.StageStateAwaitingApproval {
+						t.Errorf("committed stage = %q, want it untouched", got)
+					}
+					if n := o.rowCount(t, c.row); n != 0 {
+						t.Errorf("%s rows = %d, want 0", c.row, n)
+					}
+					o.assertNoEffects(t)
+				})
+				return
+			}
 			t.Run("reject_in_window", func(t *testing.T) {
 				o := newRBRace(t, true, rejectStep)
 				claim := o.park(t, c.body(t))
@@ -2583,6 +2655,11 @@ func TestShipPullRequest_GenuineModeEdges_PG(t *testing.T) {
 		for _, c := range prVariantCases {
 			t.Run(c.outcome, func(t *testing.T) {
 				o := newRBRace(t, true, approveStep)
+				if c.outcome == "conflict_resolution_pushed" {
+					// Nothing recorded means no live trigger: refused before any edge (#3806).
+					o.assertGuardRefusedClaim(t, o.post(t, c.body(t)), c, run.StageStateRunning)
+					return
+				}
 				o.wantStatus(t, o.postAsync(c.body(t)), "report", http.StatusOK)
 				o.assertGenuineEdge(t, c, 1)
 			})
@@ -2635,7 +2712,8 @@ func TestShipPullRequest_GenuineModeEdges_PG(t *testing.T) {
 		// consumption this report can still reach is the failure marker.
 		o.appendRow(t, o.stageID, CategoryStageConflictResolutionFailed, consumedAt)
 		oldReject(t, o, prSeamOther)
-		refused(t, o, conflict, 0)
+		// The consumed trigger is refused by the report guard (#3806) before the edge.
+		o.assertGuardRefusedClaim(t, o.post(t, conflict.body(t)), conflict, run.StageStateRunning)
 	})
 	t.Run("conflict_trigger_spelled_fixup", func(t *testing.T) {
 		o := newRBRace(t, true, approveStep)

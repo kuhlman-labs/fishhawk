@@ -2044,9 +2044,12 @@ Notes:
   ResolutionPushStage` writes `conflict_resolution_pushed` once (idempotency-guarded
   **stage-keyed**, since the pass has a ceiling of one) when the runner reports
   `{outcome:"conflict_resolution_pushed"}` after pushing its single merge commit onto
-  the EXISTING PR branch, with payload `{run_id, stage_id, branch, head_sha, base_sha,
-  files_changed_count, auth_method}`. That entry ALSO consumes the trigger, exactly as
-  the failure entry does: either terminal outcome settles the pass, so a later ordinary
+  the EXISTING PR branch, and only after the ADR-141 forge check confirms (or skips)
+  the head AND the stage carries a live trigger (#3806). The recorded row carries
+  payload `{run_id, stage_id, branch, head_sha, base_sha, files_changed_count,
+  auth_method}`; a report with no live trigger answers `409
+  conflict_resolution_not_live` and writes NO audit row (WARN only). The recorded
+  entry ALSO consumes the trigger, exactly as the failure entry does: either terminal outcome settles the pass, so a later ordinary
   fix-up on the stage is served `conflict_resolution=false` whether the pass was refused
   or succeeded. It drives the stage's terminal transition and
   re-parks the review gate — a mechanical resolution is not a substitute for review —

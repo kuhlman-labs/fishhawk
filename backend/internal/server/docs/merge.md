@@ -542,6 +542,21 @@ never has to push to a branch ADR-035 declares runner-owned.
   reached through the happy path. `succeedConflictResolutionPushStage` and the
   resolver share the `CategoryConflictResolutionPushed` constant so the writer
   cannot drift out of the consumption set.
+- **Only a LIVE pass may write `conflict_resolution_pushed`
+  ([#3806](https://github.com/kuhlman-labs/fishhawk/issues/3806)).** The report
+  handler's order is replay dedup, the ADR-141 forge check, then
+  `refuseConflictResolutionWithoutLiveTrigger`, then the stage advance and the row.
+  The guard reads the same consumption rule strictly
+  (`liveConflictResolutionTrigger`; `resolveConflictResolutionTrigger` is its
+  fail-closed wrapper for the prompt and the failure recovery): no unconsumed, fully
+  populated same-stage trigger answers `409 conflict_resolution_not_live` with no row,
+  so a forge-confirmed head the rebase verb never authorized cannot enter the
+  lineage ledger or rule 5's known set below. Both consumption reads run even with no
+  trigger, and any read failure answers the retryable `503
+  reported_head_unverifiable`. A confirmed mismatch settles first through ADR-141
+  D3, and a recorded report replays 200 before the guard. The refusal is WARN-only
+  (no audit category); a live-trigger holder can still report any forge-confirmed
+  head, since the head is not bound to `expected_head_sha`.
 - **A SUCCESSFUL pass's merge commit is ADMITTED to both reported-head readers
   ([#3673](https://github.com/kuhlman-labs/fishhawk/issues/3673)).** The pass is
   the product's own sanctioned recovery path, but neither reader of the ADR-035
