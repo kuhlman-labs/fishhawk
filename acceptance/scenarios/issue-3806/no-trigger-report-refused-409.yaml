@@ -1,0 +1,14 @@
+id: scenario:issue-3806/no-trigger-report-refused-409
+statement: 'When ADR-141 admits the report, because the forge confirms its head and first-parent base or because the documented no-forge-client or no-installation skip applies, a NEW signed conflict_resolution_pushed report for a stage with no unconsumed stage_conflict_resolution_triggered entry makes POST /v0/runs/{run_id}/pull-request?stage_id={stage_id} answer HTTP 409 with error code conflict_resolution_not_live. This is not a claim about every no-trigger report: a confirmed mismatch keeps its ADR-141 outcome.'
+verify_hint: HTTP surface on the NO-INSTALLATION SKIP arm only. The implement-running scenario's run has no installation, so ADR-141 skips the forge check and this walk does NOT exercise forge confirmation; TestConflictResolutionPushed_NoLiveTrigger_Refused decides the forge-confirmed arm. Apply implement-running through POST /v0/dev/fixtures, POST /v0/runs/{run_id}/signing-key, POST /v0/dev/sign with header X-Fishhawk-Dev-Private-Key over the raw body {"outcome":"conflict_resolution_pushed","branch":"b","head_sha":"<40 hex>","base_sha":"<40 hex>","files_changed_count":1}, POST that body to the implement stage with X-Fishhawk-Signature, and read the status and error code.
+steps: 1) POST /v0/dev/fixtures {"scenario":"implement-running"} -> run 908789d3-1a21-405c-b142-04eb6f127ed9, implement stage e54d5682-55d3-4e45-8493-51b845162ed2. 2) POST /v0/runs/{run}/signing-key {} -> private_key. 3) POST /v0/dev/sign with header X-Fishhawk-Dev-Private-Key over the raw body {"outcome":"conflict_resolution_pushed","branch":"b","head_sha":"aaaa...(40)","base_sha":"bbbb...(40)","files_changed_count":1} -> signature. 4) POST /v0/runs/{run}/pull-request?stage_id={implement} with that body and the X-Fishhawk-Signature header.
+assertions:
+    expected: HTTP 409 with error code conflict_resolution_not_live.
+    observed_at_record: HTTP 409 {"error":{"code":"conflict_resolution_not_live","message":"no live conflict-resolution pass is recorded for this stage, so the report cannot be admitted; nothing was recorded",...}}
+    repro_handle: POST /v0/runs/{run}/pull-request?stage_id={implement} with the signed conflict_resolution_pushed body
+origin:
+    issue: 3806
+    pr: 5125
+    run_id: 36f098b7-f503-4ae7-9f2b-e6cf5ee0d9f6
+    head_sha: 76ac67ab5d94c65e763872dde5738e71ddd0f352
+    recorded_at: 2026-11-08T19:53:00Z

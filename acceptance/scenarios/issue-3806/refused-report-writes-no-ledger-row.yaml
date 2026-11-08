@@ -1,0 +1,14 @@
+id: scenario:issue-3806/refused-report-writes-no-ledger-row
+statement: After that refusal, GET /v0/runs/{run_id}/audit carries no entry of category conflict_resolution_pushed and GET /v0/runs/{run_id}/stages still reads the implement stage running, so the reported head never enters the lineage ledger or rule 5's known set.
+verify_hint: 'Audit and stage surfaces: GET /v0/runs/{run_id}/audit filtered to category conflict_resolution_pushed, and GET /v0/runs/{run_id}/stages, on the same run after the refused POST.'
+steps: 'Same run, right after the refused POST: 1) seeded implement-running; 2) signing-key; 3) dev sign over the conflict_resolution_pushed body; 4) POST pull-request -> 409. Then GET /v0/runs/{run}/audit?category=conflict_resolution_pushed, GET /v0/runs/{run}/audit, and GET /v0/runs/{run}/stages.'
+assertions:
+    expected: No conflict_resolution_pushed entry; the implement stage still running.
+    observed_at_record: The audit filtered to conflict_resolution_pushed returned 200 {"items":[]}, and the unfiltered audit was also empty. The implement stage reads state running with ended_at null.
+    repro_handle: GET /v0/runs/{run}/audit?category=conflict_resolution_pushed
+origin:
+    issue: 3806
+    pr: 5125
+    run_id: 36f098b7-f503-4ae7-9f2b-e6cf5ee0d9f6
+    head_sha: 76ac67ab5d94c65e763872dde5738e71ddd0f352
+    recorded_at: 2026-11-08T19:53:00Z
