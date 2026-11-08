@@ -231,3 +231,32 @@ func ConclusionSuperseded(conclusion *string) bool {
 func (c *Check) RedVerdict() bool {
 	return c.State == StateFail && !ConclusionSuperseded(c.Conclusion)
 }
+
+// CancelledAtHead reports whether the check is a supersession conclusion
+// (cancelled/stale) recorded AT currentHead — the run's current recorded head
+// (#4706). That is the one supersession the drive must surface instead of
+// ignore: a newer push did not supersede it, so nothing will re-run it, and the
+// run would otherwise wait forever. A red verdict is RedVerdict's business, not
+// this predicate's: a failure conclusion is false here.
+//
+// currentHead is Fishhawk's audit-ledger head (auditcomplete precedence), not a
+// forge read. An empty currentHead is unknown and never equals anything, so an
+// empty check head cannot match an unknown current head. The drive observer
+// never calls this with an empty head (its headKnown gate skips the call), so
+// the empty-head arm is isolatable only at the predicate itself.
+func (c *Check) CancelledAtHead(currentHead string) bool {
+	return c.State == StateFail && ConclusionSuperseded(c.Conclusion) && currentHead != "" && c.HeadSHA == currentHead
+}
+
+// SupersededByHead reports whether a cancelled/stale conclusion is PROVEN to
+// belong to an older head than currentHead (#4706): both heads are known and
+// they differ. An unknown head (empty string) is never equal or unequal to
+// anything, so it proves nothing and the result is false. Every
+// non-supersession conclusion (failure, timed_out, nil, ...) is false.
+//
+// currentHead is Fishhawk's audit-ledger head, not forge authority; when the
+// ledger lags the forge, a check at an unrecorded newer head reads as
+// superseded. See backend/internal/webhook/README.md for that limit.
+func SupersededByHead(conclusion *string, checkHead, currentHead string) bool {
+	return ConclusionSuperseded(conclusion) && checkHead != "" && currentHead != "" && checkHead != currentHead
+}
