@@ -2,8 +2,8 @@
 
 Issue #5094 prepares the repository workflow for Anthropic quota exhaustion.
 Activation requires the routing fix from #5095 and acceptance model transport
-from #5096 to be deployed. #5095 merged in PR #5098; its binaries still need a
-guarded rollout. Acceptance currently lacks model transport, so provider
+from #5096 to be deployed. #5095 merged in PR #5098 and its routing fix is
+active on the Campaign 5 host. Acceptance currently lacks model transport, so provider
 selection alone does not make that pin effective. A check-gated review stage
 spawns no provider invocation; its declared model is not an active invocation
 pin. An unmerged preparation branch changes no live run.
@@ -11,6 +11,16 @@ pin. An unmerged preparation branch changes no live run.
 The Captain authorized activation after the hotfix merge and campaign
 resumption if Anthropic quota is exhausted. Keep this branch unmerged until
 that condition, the rollout prerequisites and the human approval gate are met.
+
+The condition was observed on 2026-11-08: an authenticated plan trace recorded
+an Anthropic HTTP 429 `usage_limit_reached` for the global `seven_day` window,
+with reset at 2026-11-10T22:00:00Z. This is distinct from the earlier Fable-only
+quota failure. Fresh, bounded, tool-free CLI probes using the normal ChatGPT
+account returned successfully with requested `gpt-6-astra` / `xhigh` and
+`gpt-6.1-sol` / `high`. They establish access, not measured equivalence or
+successful production dispatch. Acceptance transport, the human gate and the
+supported transition for cached runs remain prerequisites; the observed quota
+does not activate them.
 
 ## Workload mapping
 
