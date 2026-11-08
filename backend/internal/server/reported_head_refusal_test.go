@@ -145,6 +145,7 @@ func TestReportedHead_FixupPushed_NoCommitRead(t *testing.T) {
 	// The route log does see a commit read, so zero above is not a dead counter.
 	t.Run("conflict_kind_control_reads_the_commit", func(t *testing.T) {
 		f := newRHFixture(t)
+		f.armConflictReport(rhConflictKind)
 		f.forgeAt(rhH2, rhH2)
 		w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
 		f.assertRowAt(rhConflictKind, w, rhH2, rhPRBranch)
@@ -262,12 +263,14 @@ func TestReportedHead_RowBranchIsForgeResolved(t *testing.T) {
 	for _, kc := range rhAllKinds {
 		t.Run("tracked_pr/"+kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
+			f.armConflictReport(kc)
 			f.forgeAt(rhH2, rhH2)
 			w := f.post(kc, rhH2, rhBaseSHA, rhReportedBranch)
 			assertResolved(t, f, kc, w, rhPRBranch)
 		})
 		t.Run("derived/"+kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
+			f.armConflictReport(kc)
 			f.untrack()
 			derived := fixupBranchFor(f.runRow, f.impl)
 			f.forgeAt("", rhOther)
@@ -459,8 +462,26 @@ func TestReportedHead_DedupReadErrorMismatchIsRetryable(t *testing.T) {
 // fault is one-shot: ADR-140 (#5047) D8's guarded variant edge re-reads these rows
 // after the run lock and answers a static 500 on a fault that persists, so only a
 // transient dedup fault isolates the fail-open dedup.
+//
+// The conflict kind no longer fails open to a write (#3806): its live-trigger
+// guard reads the same pushed category itself, so a fault that persists past the
+// dedup answers the retryable 503 before the edge, with no row and no transition.
+// TestConflictResolutionPushed_DedupFault_PushedConsumption pins the one-shot
+// conflict arms, including the admitted positive.
 func TestReportedHead_DedupReadErrorVerifiedHeadStillWrites(t *testing.T) {
-	for _, kc := range rhAllKinds {
+	t.Run(rhConflictKind.name, func(t *testing.T) {
+		f := newRHFixture(t)
+		f.armConflictReport(rhConflictKind)
+		f.forgeAt(rhH2, rhH2)
+		f.au.listByCategoryErrCategory = CategoryConflictResolutionPushed
+		w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+		f.assertUnverifiable(rhConflictKind, w, f.impl, run.StageStateRunning)
+		f.assertLoggedCause("conflict_trigger_state")
+		if !strings.Contains(f.logs.String(), "proceeding without idempotency guard") {
+			t.Errorf("assert: the failed dedup read was not logged:\n%s", f.logs.String())
+		}
+	})
+	for _, kc := range []rhKindCase{rhFixupKind, rhAcceptanceKind} {
 		t.Run(kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
 			f.forgeAt(rhH2, rhH2)
@@ -487,6 +508,7 @@ func TestReportedHead_ReplayAfterTipMoved_DedupFirst(t *testing.T) {
 	admit := func(t *testing.T, kc rhKindCase) *rhFixture {
 		t.Helper()
 		f := newRHFixture(t)
+		f.armConflictReport(kc)
 		f.forgeAt(rhH2, rhH2)
 		w := f.post(kc, rhH2, rhBaseSHA, rhPRBranch)
 		f.assertRowAt(kc, w, rhH2, rhPRBranch)

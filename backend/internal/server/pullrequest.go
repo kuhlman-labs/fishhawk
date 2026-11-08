@@ -2680,10 +2680,14 @@ type pullRequestConflictResolutionResponse struct {
 // idempotency rather than succeedFixupPushStage's head-keyed dedup, because the
 // pass has a ceiling of one and its report is stage-unique: a runner retry
 // after a 5xx must not append a second entry or re-fire the status comment.
-// Fail-open on a read error — a transient listing failure must never drop the
-// report the stage's terminal transition depends on, provided the forge confirms
-// its head and first-parent base. A report it cannot confirm writes no entry
-// (ADR-141, see refuseUnverifiedReportedHead).
+//
+// The order is replay dedup, forge check (ADR-141 D2 and D3), live-trigger
+// guard (#3806), effects. A failed dedup lookup no longer implies a write: it
+// only skips the replay answer. A report the forge cannot confirm writes no
+// entry (ADR-141, see refuseUnverifiedReportedHead), and a verified head still
+// needs the guard's own strict reads of the trigger and both consumption
+// categories, so a consumed row refuses new admission and an unreadable one
+// answers the retryable 503 (refuseConflictResolutionWithoutLiveTrigger).
 func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *http.Request, runID uuid.UUID,
 	stage *run.Stage, pr *pullRequestBody, authMethod string, actorKind audit.ActorKind, actorSubject *string) {
 	stageID := stage.ID
@@ -2705,8 +2709,13 @@ func (s *Server) succeedConflictResolutionPushStage(w http.ResponseWriter, r *ht
 	}
 
 	// Forge-confirmed report admission (ADR-141): after the dedup so a replay
-	// stays a 200, before the stage advance and every later effect.
+	// stays a 200, before the stage advance and every later effect. The
+	// live-trigger guard (#3806) follows it directly, so a confirmed mismatch
+	// settles through ADR-141 D3 first and only an admitted head is refused.
 	if s.refuseUnverifiedReportedHead(w, r, runID, stage, pr, authMethod, actorKind, actorSubject, reportedHeadConflictResolutionPush) {
+		return
+	}
+	if s.refuseConflictResolutionWithoutLiveTrigger(w, r, runID, stage, pr.HeadSHA) {
 		return
 	}
 

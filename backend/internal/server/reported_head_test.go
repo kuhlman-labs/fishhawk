@@ -370,6 +370,16 @@ func (f *rhFixture) seedConflictTrigger(seq int64) {
 	})
 }
 
+// armConflictReport gives a conflict-kind report the live trigger its
+// live-trigger guard (#3806) requires, so a test about forge admission reaches
+// the row. Other kinds are untouched.
+func (f *rhFixture) armConflictReport(kc rhKindCase) {
+	f.t.Helper()
+	if kc == rhConflictKind {
+		f.seedConflictTrigger(10)
+	}
+}
+
 // seedVerifyTrigger records a live merge-candidate verify trigger, naming a
 // superseded fix-up trigger when supersedes is non-zero.
 func (f *rhFixture) seedVerifyTrigger(seq, supersedes int64) {
@@ -958,6 +968,7 @@ func TestReportedHead_EdgeFirstParent_Accepted(t *testing.T) {
 		for _, arm := range edgeArmsFor(kc) {
 			t.Run(kc.name+"/"+arm.name, func(t *testing.T) {
 				f := newRHFixture(t)
+				f.armConflictReport(kc)
 				if arm.noPR {
 					f.untrack()
 				}
@@ -1174,6 +1185,7 @@ func TestReportedHead_PRHeadMatchAccepted(t *testing.T) {
 	for _, kc := range rhAllKinds {
 		t.Run(kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
+			f.armConflictReport(kc)
 			f.forge.set(func(g *rhForge) {
 				g.prHead = rhH2
 				g.tips[rhPRBranch] = rhOther
@@ -1200,6 +1212,7 @@ func TestReportedHead_PRHeadLag_AcceptedViaBranchRef(t *testing.T) {
 	for _, kc := range rhAllKinds {
 		t.Run(kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
+			f.armConflictReport(kc)
 			f.forge.set(func(g *rhForge) {
 				g.prHead = rhH1
 				g.tips[rhPRBranch] = rhH2
@@ -1238,6 +1251,7 @@ func TestReportedHead_UnwiredOrNoInstallation_Skips(t *testing.T) {
 		for _, kc := range rhAllKinds {
 			t.Run(name+"/"+kc.name, func(t *testing.T) {
 				f := newRHFixture(t)
+				f.armConflictReport(kc)
 				setup(f)
 				w := f.post(kc, rhH2, rhBaseSHA, rhPRBranch)
 				if w.Code != http.StatusOK {

@@ -1486,6 +1486,10 @@ func TestReportedHead_RefusedHeadReachesNoConsumer(t *testing.T) {
 		t.Run("admitted_control/"+tc.kc.name, func(t *testing.T) {
 			w, r, push := arrange(t)
 			stageID := reportingStage(w, r, tc.kc)
+			if tc.kc == rhConflictKind {
+				// The live-trigger guard (#3806) admits only an authorized pass.
+				w.rentConflictPass(r, rhH1)
+			}
 			w.gh.set(func() {
 				w.gh.prs[r.pr].head = rhH2
 				w.gh.commitParents[rhH2] = []string{rhH1}

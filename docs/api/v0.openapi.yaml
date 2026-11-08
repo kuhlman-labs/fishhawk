@@ -30670,6 +30670,17 @@ paths:
         GitLab run) skip this check as explicit residuals, so it is not
         universal forge verification.
 
+        **Live conflict-resolution trigger (#3806).** After that check admits
+        a new `conflict_resolution_pushed` report (or skips it as a
+        residual), the report also needs an unconsumed, fully populated
+        `stage_conflict_resolution_triggered` entry on the same stage: one
+        newer than that stage's newest `stage_conflict_resolution_failed` and
+        `conflict_resolution_pushed` rows. Without one it answers 409
+        `conflict_resolution_not_live` and writes no row. A confirmed
+        mismatch still settles first through the 200 refusal below, a
+        recorded report still replays as 200 before any check, and a failed
+        dedup read no longer implies admission.
+
         v0 has no formal JSON Schema for the body — required-field
         checks happen in the handler. v1+ may graduate this to a
         versioned `pull_request_v1` schema.
@@ -30748,6 +30759,13 @@ paths:
             populated) merge-candidate verify trigger, so it cannot be bound to
             a head. Nothing is recorded.
 
+            `conflict_resolution_not_live` (#3806): a new
+            `conflict_resolution_pushed` report the forge check admitted (or
+            skipped) has no live (unconsumed, fully populated) same-stage
+            conflict-resolution trigger. No row is written, the stage does not
+            transition and no audit row records the refusal. `details` name
+            only `run_id` and `stage_id`.
+
             `review_round_interrupted` (ADR-140 D8, #5047): this upload's
             required supplemental gating pass was lost on this process or a prior
             one, was started on this attempt without its full verdict set, or its
@@ -30807,11 +30825,16 @@ paths:
             `reported_head_unverifiable` (ADR-141, #5053): a forge, required
             repository or required trigger-state read failed, or a dedup read
             failed on a putative mismatch, so confirmation of a push report is
-            unknown. No row is written and the stage does not transition;
+            unknown. For `conflict_resolution_pushed` this includes the
+            live-trigger read and both consumption reads
+            (`stage_conflict_resolution_failed`, `conflict_resolution_pushed`)
+            (#3806). No row is written and the stage does not transition;
             re-post the same report.
 
             `pull_request_upload_unconfigured`: the server has no signing,
-            artifact, audit or run repository wired.
+            artifact, audit or run repository wired. A server with no audit
+            repository answers this before any report check, so it never
+            reaches the conflict-resolution trigger read.
           headers:
             Retry-After:
               description: Delay seconds, on `review_round_in_flight` only.

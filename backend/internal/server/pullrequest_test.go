@@ -3392,6 +3392,7 @@ func TestShipPullRequest_ConflictResolutionPushed_DrivesTerminal(t *testing.T) {
 	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	implStage.Type = run.StageTypeImplement
 	implStage.RequiresApproval = true
+	recordLiveConflictTrigger(t, s, runRow.ID, implStage.ID)
 
 	priv, _ := sf.issue(t, runRow.ID)
 	// The exact key set the runner marshals for this outcome.
@@ -3436,6 +3437,7 @@ func TestShipPullRequest_ConflictResolutionPushed_IsIdempotent(t *testing.T) {
 	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	implStage.Type = run.StageTypeImplement
 	implStage.RequiresApproval = true
+	recordLiveConflictTrigger(t, s, runRow.ID, implStage.ID)
 
 	priv, _ := sf.issue(t, runRow.ID)
 	body := []byte(`{"outcome":"conflict_resolution_pushed","branch":"b","head_sha":"h","base_sha":"p","files_changed_count":1}`)
@@ -7859,6 +7861,33 @@ func (c variantCase) proveMode(t *testing.T, p *prSeam) {
 	}
 }
 
+// assertUnprovenRefused pins the refusal of a claim no server evidence proves. A
+// conflict_resolution_pushed claim with no live trigger is refused by its report
+// guard (#3806) before the variant edge, so it answers conflict_resolution_not_live
+// and carries no variant details; every other outcome answers code with details.
+func (c variantCase) assertUnprovenRefused(t *testing.T, w *httptest.ResponseRecorder, code string, details ...string) {
+	t.Helper()
+	if c.outcome == "conflict_resolution_pushed" {
+		assertCode(t, w, http.StatusConflict, "conflict_resolution_not_live")
+		return
+	}
+	assertCode(t, w, http.StatusConflict, code)
+	for _, d := range details {
+		if !strings.Contains(w.Body.String(), d) {
+			t.Errorf("details %s missing: %s", d, w.Body.String())
+		}
+	}
+}
+
+// armLiveConflictTrigger gives a conflict_resolution_pushed case the live trigger
+// its report guard requires (#3806); other outcomes are untouched.
+func (c variantCase) armLiveConflictTrigger(t *testing.T, p *prSeam) {
+	t.Helper()
+	if c.outcome == "conflict_resolution_pushed" {
+		c.proveMode(t, p)
+	}
+}
+
 func TestVariantSuccessEdges_KeepGenericEdge(t *testing.T) {
 	for _, c := range prVariantCases {
 		for _, mode := range []struct {
@@ -7872,6 +7901,15 @@ func TestVariantSuccessEdges_KeepGenericEdge(t *testing.T) {
 				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
 				mode.setup(t, p, c)
 				w := p.post(t, c.body(t))
+				if c.outcome == "conflict_resolution_pushed" && mode.name == "nothing_recorded" {
+					// No live trigger: the report guard (#3806) refuses before any edge.
+					c.assertUnprovenRefused(t, w, "")
+					c.assertNoRow(t, p)
+					if n := p.repo.advances.Load(); n != 0 {
+						t.Errorf("edges = %d, want 0", n)
+					}
+					return
+				}
 				if w.Code != http.StatusOK {
 					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
 				}
@@ -7901,6 +7939,7 @@ func TestVariantSuccessEdges_KeepGenericEdge(t *testing.T) {
 		}
 		t.Run(c.outcome+"_gateless_fires_orchestrator", func(t *testing.T) {
 			p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+			c.armLiveConflictTrigger(t, p)
 			p.setGateless()
 			if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
 				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
@@ -7929,30 +7968,55 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 		return nil
 	}
 	for _, c := range prVariantCases {
+		// A conflict_resolution_pushed report reaches the variant edge only with a
+		// live trigger (#3806), so its arms run on a live pass.
+		seam := func(t *testing.T) *prSeam {
+			t.Helper()
+			p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+			c.armLiveConflictTrigger(t, p)
+			return p
+		}
 		t.Run(c.outcome, func(t *testing.T) {
 			t.Run("refused_409_no_row", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				seedBinding(t, p)
 				w := p.post(t, c.body(t))
-				assertCode(t, w, http.StatusConflict, "review_obligation_missing")
-				if !strings.Contains(w.Body.String(), `"outcome":"`+c.outcome+`"`) || !strings.Contains(w.Body.String(), `"missing_count"`) {
-					t.Errorf("details: %s", w.Body.String())
-				}
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"outcome":"`+c.outcome+`"`, `"missing_count"`)
 				c.assertNoRow(t, p)
 				p.assertNothingMoved(t)
 			})
+			if c.outcome == "conflict_resolution_pushed" {
+				// The unproven arms above now stop at the admission guard (#3806). A live
+				// trigger proves the mode, and a reject or unmet obligation at the SAME head
+				// still refuses at the typed edge, so removing it stays observable.
+				t.Run("live_trigger_same_head_reject_refused", func(t *testing.T) {
+					p := seam(t)
+					p.seedVerdict(t, prSeamHead, p.attempt(t), planreview.VerdictReject)
+					w := p.post(t, c.body(t))
+					assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+					c.assertNoRow(t, p)
+					p.assertNothingMoved(t)
+				})
+				t.Run("live_trigger_same_head_unmet_refused", func(t *testing.T) {
+					p := seam(t)
+					p.seedStart(t, prSeamHead, p.attempt(t), 1, prSeamPath)
+					w := p.post(t, c.body(t))
+					assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+					if !strings.Contains(w.Body.String(), `"missing_count":1`) {
+						t.Errorf("details: %s", w.Body.String())
+					}
+					c.assertNoRow(t, p)
+				})
+			}
 			t.Run("refused_unmet_counts_missing", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				p.seedStart(t, prSeamOther, p.attempt(t), 1, prSeamPath)
 				w := p.post(t, c.body(t))
-				assertCode(t, w, http.StatusConflict, "review_obligation_missing")
-				if !strings.Contains(w.Body.String(), `"missing_count":1`) {
-					t.Errorf("details: %s", w.Body.String())
-				}
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"missing_count":1`)
 				c.assertNoRow(t, p)
 			})
 			t.Run("drift_200_no_row_no_notify", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.repo.onGetStage = func(_ context.Context, call int32) error {
 					if call == 2 {
 						p.retry()
@@ -7966,42 +8030,42 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				p.assertNothingMoved(t)
 			})
 			t.Run("read_error_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.audit.setHooks(nil, failVerdictReads)
 				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
 				c.assertNoRow(t, p)
 				p.assertNothingMoved(t)
 			})
 			t.Run("run_read_error_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.repo.onGetRun = func(int32) error { return readFault }
 				c.assertRunReadRefused(t, p.post(t, c.body(t)), readFault)
 				c.assertNoRow(t, p)
 				p.assertNothingMoved(t)
 			})
 			t.Run("capability_absent_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.s.cfg.RunRepo = noGuardRepo{p.rr}
 				assertStaticEdgeError(t, p.post(t, c.body(t)))
 				c.assertNoRow(t, p)
 			})
 			t.Run("store_fault_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.repo.onTransition = func(context.Context, run.StageState) error { return readFault }
 				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
 				c.assertNoRow(t, p)
 				p.assertNothingMoved(t)
 			})
 			t.Run("settled_refused_no_row", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				p.setState(run.StageStateAwaitingApproval)
 				seedBinding(t, p)
-				assertCode(t, p.post(t, c.body(t)), http.StatusConflict, "review_obligation_missing")
+				c.assertUnprovenRefused(t, p.post(t, c.body(t)), "review_obligation_missing")
 				c.assertNoRow(t, p)
 				p.assertNoEffects(t)
 			})
 			t.Run("settled_read_error_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.setState(run.StageStateAwaitingApproval)
 				p.audit.setHooks(nil, failVerdictReads)
 				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
@@ -8009,21 +8073,21 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				p.assertNoEffects(t)
 			})
 			t.Run("settled_run_read_error_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.setState(run.StageStateAwaitingApproval)
 				p.repo.onGetRun = func(int32) error { return readFault }
 				c.assertRunReadRefused(t, p.post(t, c.body(t)), readFault)
 				c.assertNoRow(t, p)
 			})
 			t.Run("settled_undecodable_500", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.setState(run.StageStateAwaitingApproval)
 				p.seed(t, implementReviewedCategory, []byte(`{"verdict":7}`))
 				assertStaticEdgeError(t, p.post(t, c.body(t)))
 				c.assertNoRow(t, p)
 			})
 			t.Run("settled_nothing_recorded_unchanged", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.setState(run.StageStateAwaitingApproval)
 				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
 					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
@@ -8037,7 +8101,7 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				}
 			})
 			t.Run("dedup_replay_unchanged", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				seedBinding(t, p) // binding evidence would refuse: dedup stays first.
 				p.seed(t, c.row, recoveryPayload(t, map[string]any{"head_sha": c.head}))
 				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
@@ -8049,38 +8113,36 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				p.assertNothingMoved(t)
 			})
 			t.Run("started_incomplete_409_no_row", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				p.seedStart(t, prSeamOther, p.attempt(t), 1)
-				assertInterrupted(t, p.post(t, c.body(t)), http.StatusConflict)
+				if w := p.post(t, c.body(t)); c.outcome == "conflict_resolution_pushed" {
+					c.assertUnprovenRefused(t, w, "")
+				} else {
+					assertInterrupted(t, w, http.StatusConflict)
+				}
 				c.assertNoRow(t, p)
 				p.assertNothingMoved(t)
 			})
 			t.Run("settled_started_incomplete_refused", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				p.setState(run.StageStateAwaitingApproval)
 				p.seedStart(t, prSeamOther, p.attempt(t), 1)
 				w := p.post(t, c.body(t))
-				assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"missing_count":0`)
 				c.assertNoRow(t, p)
-				if !strings.Contains(w.Body.String(), `"missing_count":0`) {
-					t.Errorf("details: %s", w.Body.String())
-				}
 			})
 			t.Run("settled_unmet_counts_missing", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				p.setState(run.StageStateAwaitingApproval)
 				p.seedStart(t, prSeamOther, p.attempt(t), 1, prSeamPath)
 				w := p.post(t, c.body(t))
-				assertCode(t, w, http.StatusConflict, "review_obligation_missing")
-				if !strings.Contains(w.Body.String(), `"missing_count":1`) {
-					t.Errorf("details: %s", w.Body.String())
-				}
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"missing_count":1`)
 				c.assertNoRow(t, p)
 			})
 			t.Run("failure_report_lands", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
 				seedBinding(t, p)
-				assertCode(t, p.post(t, c.body(t)), http.StatusConflict, "review_obligation_missing")
+				c.assertUnprovenRefused(t, p.post(t, c.body(t)), "review_obligation_missing")
 				failed, _ := json.Marshal(map[string]any{"outcome": "failed", "category": "C", "reason": "gave up"})
 				if w := p.post(t, failed); w.Code != http.StatusOK {
 					t.Fatalf("failed report = %d:\n%s", w.Code, w.Body.String())
@@ -8091,7 +8153,7 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 			})
 			if c.head != "" && c.outcome != "conflict_resolution_pushed" {
 				t.Run("lineage_violation_no_row", func(t *testing.T) {
-					p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+					p := seam(t)
 					prURL := "https://github.com/kuhlman-labs/example/pull/42"
 					p.rr.mu.Lock()
 					p.rr.runs[p.runRow.ID].PullRequestURL = &prURL
@@ -8108,7 +8170,7 @@ func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
 				})
 			}
 			t.Run("non_implement_stage_keeps_row", func(t *testing.T) {
-				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p := seam(t)
 				p.rr.mu.Lock()
 				p.rr.stagesByID[p.stage.ID].Type = run.StageTypeReview
 				// A tracked PR lets ADR-141's check confirm the head on a stage
