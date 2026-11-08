@@ -56,6 +56,16 @@ type config struct {
 	// nil-tolerant), so every un-armed path behaves exactly as before.
 	handoff *agentHandoff
 
+	// stageAttempt, heldReviewObligation and backendSupportsReviewObligation are
+	// set at runtime (not flags), in run() after the prompt fetch (ADR-140 (#5047)
+	// D9): this dispatch's attempt token, the required review a held-commit resume
+	// was served (nil is unknown; see upload.ReviewObligation) and whether the
+	// backend advertised review-obligation resume. Same runtime-set idiom as
+	// agentBinary/agentVersion above. The zero values match an old backend.
+	stageAttempt                    string
+	heldReviewObligation            *upload.ReviewObligation
+	backendSupportsReviewObligation bool
+
 	// mcpTokens lazily re-mints the run-bound fhm_ bearer (and the signing
 	// key that authorizes minting it) when it nears expiry (#3255). Set at
 	// runtime ONLY on the successful FetchMCPToken path in run(); nil for the

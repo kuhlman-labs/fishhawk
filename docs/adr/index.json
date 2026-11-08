@@ -964,6 +964,9 @@
         "ADR-093",
         "ADR-096"
       ],
+      "amended_by": [
+        "ADR-142"
+      ],
       "applies_to": []
     },
     {
@@ -1664,6 +1667,18 @@
       "superseded_by": [],
       "amends": [
         "ADR-035"
+      ],
+      "applies_to": []
+    },
+    {
+      "id": "ADR-142",
+      "title": "Keep merge verification requirements across acceptance scenario commits",
+      "path": "docs/adr/142-merge-verification-after-scenario-commits.md",
+      "status": "accepted",
+      "supersedes": [],
+      "superseded_by": [],
+      "amends": [
+        "ADR-090"
       ],
       "applies_to": []
     }

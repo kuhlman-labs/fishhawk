@@ -2044,9 +2044,12 @@ Notes:
   ResolutionPushStage` writes `conflict_resolution_pushed` once (idempotency-guarded
   **stage-keyed**, since the pass has a ceiling of one) when the runner reports
   `{outcome:"conflict_resolution_pushed"}` after pushing its single merge commit onto
-  the EXISTING PR branch, with payload `{run_id, stage_id, branch, head_sha, base_sha,
-  files_changed_count, auth_method}`. That entry ALSO consumes the trigger, exactly as
-  the failure entry does: either terminal outcome settles the pass, so a later ordinary
+  the EXISTING PR branch, and only after the ADR-141 forge check confirms (or skips)
+  the head AND the stage carries a live trigger (#3806). The recorded row carries
+  payload `{run_id, stage_id, branch, head_sha, base_sha, files_changed_count,
+  auth_method}`; a report with no live trigger answers `409
+  conflict_resolution_not_live` and writes NO audit row (WARN only). The recorded
+  entry ALSO consumes the trigger, exactly as the failure entry does: either terminal outcome settles the pass, so a later ordinary
   fix-up on the stage is served `conflict_resolution=false` whether the pass was refused
   or succeeded. It drives the stage's terminal transition and
   re-parks the review gate — a mechanical resolution is not a substitute for review —
@@ -2274,6 +2277,23 @@ Notes:
   to the pre-#2169 shape. `pull_request_failed` remains an internal audit kind
   either way: the checkpoint adds a payload key, not a comment surface, and
   nothing in `issuecomment` posts it.
+- The required-review recovery kinds — `review_obligation_checkpoint` and
+  `supplemental_review_started` (ADR-140 D8, D9, #5047) — are **internal audit
+  kinds and prompt or resolver hints, not issue-comment surfaces**. They render no
+  comment and have no Notifier methods. `server/review_recovery.go` writes both:
+  `recordReviewObligationCheckpoint` stores a known-required failure report under
+  the first with `{run_id, stage_id, resume_kind, push_checkpoint{..., review_obligation}}`,
+  and `allocateSupplementalPass` records a gating pass's start under the second
+  with `{run_id, stage_id, stage_attempt, head_sha, configured_agents,
+  required_paths, origin, pass_key}`. The producers are the review-recovery
+  helpers, the pull-request route that reports the obligation, and the gating
+  dispatcher in `server/trace.go`. The same work adds keys to rows that remain
+  internal: `review_obligation` on a `scope_completeness_parked` payload and on a
+  `pull_request_failed` or `push_resume_checkpoint` known-none `push_checkpoint`,
+  `required_review_base_sha` on a withheld-base park, and `stage_attempt` on a
+  gating supplemental `implement_reviewed`. That last row is still the
+  Agent-review PR review source above; the added key changes no rendered comment,
+  and every non-gating verdict keeps its bytes.
 - The detached-dispatch reaper failure kind — `dispatch_reaper_failed` (#1747) —
   is an **internal, audit-only kind, not an issue-comment surface**. Nothing in
   `issuecomment` posts it; it has no Notifier method.

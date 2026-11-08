@@ -137,6 +137,10 @@ var (
 	// because that body carries agent-authored text and a retry costs
 	// a full agent pass (#2566).
 	ErrPullRequestInvalid = errors.New("upload: pull-request rejected as invalid")
+	// ErrLivePassBudgetExhausted is a pull-request upload that outlasted the bound
+	// its first review_round_in_flight answer fixed (ADR-140 (#5047) D8). Nothing
+	// moved, so the caller fails the stage retryably.
+	ErrLivePassBudgetExhausted = errors.New("upload: live supplemental review pass outlasted its continuation bound")
 	// ErrAcceptanceInvalid surfaces when the backend rejects the
 	// acceptance verdict body (400 acceptance_invalid) — missing or
 	// malformed fields per the ADR-049 evidence shape. Permanent at
@@ -208,6 +212,10 @@ type Client struct {
 	// Backoff is the initial delay before the first retry; each
 	// subsequent retry doubles. Zero means DefaultBackoff.
 	Backoff time.Duration
+	// LivePassSettleAllowance is added to a live supplemental pass's remaining
+	// lifetime when ShipPullRequest fixes its continuation bound (see
+	// livePassContinuation). Zero means DefaultLivePassSettleAllowance.
+	LivePassSettleAllowance time.Duration
 
 	// TerminalMaxRetries / TerminalBackoff / TerminalBackoffCap override the
 	// TERMINAL-EGRESS budget (see DefaultTerminalMaxRetries) used by
@@ -257,11 +265,12 @@ func New(baseURL string) *Client {
 		// asynchronously, so the review completes to its own
 		// FISHHAWKD_PLAN_REVIEW_TIMEOUT budget regardless of when this
 		// client disconnects. A gating-mode synchronous review can still
-		// exceed any fixed client timeout; if this client gives up first,
-		// the detached server-side review completes anyway and a retried
-		// upload short-circuits at GetByHash. Raising the ceiling just
-		// keeps advisory uploads well under it and reduces spurious
-		// gating retries.
+		// exceed any fixed client timeout. On a pull-request upload the
+		// supplemental pass keeps running with the client gone, and a retry
+		// answers review_round_in_flight until the pass settles (see
+		// livePassContinuation); the ship then decides at GetByHash. Raising
+		// the ceiling just keeps advisory uploads well under it and reduces
+		// spurious gating retries.
 		HTTP: &http.Client{Timeout: 120 * time.Second},
 	}
 }
@@ -1075,6 +1084,22 @@ type FetchedPrompt struct {
 	// (backend/internal/server/prompt.go). A tag drift decodes false, which
 	// DISABLES the resume — the fail-safe direction.
 	SupportsPushResume bool `json:"supports_push_resume,omitempty"`
+	// HeldCommitReviewObligation is the required supplemental review a held-commit
+	// resume still owes (ADR-140 (#5047) D9). Absent, null and empty lists are three
+	// states: see ReviewObligation. An empty list is what proves a resume owes none.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to the
+	// backend's promptResponse.HeldCommitReviewObligation
+	// (backend/internal/server/prompt.go).
+	HeldCommitReviewObligation *ReviewObligation `json:"held_commit_review_obligation,omitempty"`
+	// SupportsReviewObligationResume is the BACKEND half of the
+	// review-obligation-resume handshake (ADR-140 (#5047) D9). An old backend omits
+	// the key and decodes false here, which proves nothing about an obligation.
+	//
+	// CROSS-MODULE WIRE CONTRACT: the json tag MUST stay byte-identical to the
+	// backend's promptResponse.SupportsReviewObligationResume
+	// (backend/internal/server/prompt.go).
+	SupportsReviewObligationResume bool `json:"supports_review_obligation_resume,omitempty"`
 	// EgressTargetHosts is the acceptance stage's full spec-declared
 	// egress.target_hosts list (E31.4 / #1532 grammar), served ONLY on
 	// acceptance-stage prompt responses (E31.7 / #1535). It is the
@@ -1249,6 +1274,21 @@ type CounterfactualSpec struct {
 type ScopeExemption struct {
 	Path   string `json:"path"`
 	Reason string `json:"reason"`
+}
+
+// ReviewObligation is a required supplemental review's recovery state, bound to
+// a recorded head and attempt (ADR-140 (#5047) D9). An absent or null list is
+// unknown, an empty list is known none and a non-empty list is known required.
+// That is why the list has no omitempty: `[]` must reach the wire.
+//
+// CROSS-MODULE WIRE CONTRACT: the json tags (names and the absence of omitempty)
+// MUST stay byte-identical to the backend's reviewObligation
+// (backend/internal/server/review_recovery.go). The shared bytes are the sections
+// of testdata/wire/review_obligation_wire.json.
+type ReviewObligation struct {
+	HeadSHA                     string           `json:"head_sha"`
+	StageAttempt                string           `json:"stage_attempt"`
+	SupplementalScopeExemptions []ScopeExemption `json:"supplemental_scope_exemptions"`
 }
 
 // DiffCoverageConfig is the stage's spec-declared `diff_coverage`
@@ -1891,7 +1931,12 @@ func readBriefBody(resp *http.Response) string {
 // the status text and a short body excerpt. Centralized so every
 // non-success path produces a uniform error message.
 func statusError(op string, resp *http.Response) error {
-	body := readBriefBody(resp)
+	return statusErrorFromBody(op, resp, readBriefBody(resp))
+}
+
+// statusErrorFromBody is statusError for a caller that has already read the
+// excerpt, because a response body can be read only once.
+func statusErrorFromBody(op string, resp *http.Response, body string) error {
 	if body == "" {
 		body = "(no body)"
 	}
@@ -1934,7 +1979,9 @@ const PlanSeedHeader = "X-Fishhawk-Plan-Seed-SHA"
 // live merge-candidate verify pass (409 runner_capability_missing) rather than
 // serve it to a runner that would run a plain agent pass instead, and it
 // declines a decomposition child's push resume to a runner without
-// CapabilityChildPushResume rather than risk a standalone PR for the slice.
+// CapabilityChildPushResume rather than risk a standalone PR for the slice, and
+// it declines a non-empty required review obligation to a runner without
+// CapabilityReviewObligationResume rather than lose that review.
 //
 // WIRE VALUE: byte-identical to the backend's runnerCapabilitiesHeader
 // (backend/internal/server/prompt.go).
@@ -1989,10 +2036,21 @@ const CapabilityChildPushResume = "child-push-resume"
 // checkpoint is declined and the agent re-runs.
 const CapabilityReverifyResume = "reverify-resume"
 
+// CapabilityReviewObligationResume is the RunnerCapabilitiesHeader token for the
+// required-review retention of ADR-140 (#5047) D9: this runner understands
+// held_commit_review_obligation and retains it across a resume. A runner that
+// omits it is served no held-commit field at all for a non-empty obligation, so
+// its retry is one ordinary agent pass.
+//
+// WIRE VALUE: byte-identical to the backend's capabilityReviewObligationResume
+// (backend/internal/server/prompt.go). A drift is fail-SAFE: every required
+// obligation is declined and the agent re-runs.
+const CapabilityReviewObligationResume = "review-obligation-resume"
+
 // runnerCapabilities is the full static token list FetchPrompt advertises.
 // APPEND-ONLY: a new token goes at the end, so the combined header value the
 // tests pin only ever grows.
-var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify, CapabilityChildPushResume, CapabilityReverifyResume}
+var runnerCapabilities = []string{CapabilityPushResume, CapabilityMergeCandidateVerify, CapabilityChildPushResume, CapabilityReverifyResume, CapabilityReviewObligationResume}
 
 // RunnerCapabilitiesValue is the RunnerCapabilitiesHeader value this binary
 // sends. Exported so the backend-facing tests and the runner's own seam tests
@@ -2515,6 +2573,10 @@ type ShipPullRequestArgs struct {
 	PRTitle string
 	PRBody  string
 
+	// ReviewObligation is the required supplemental review this report's
+	// checkpoint or park retains (ADR-140 (#5047) D9). Nil keeps the legacy bytes.
+	ReviewObligation *ReviewObligation
+
 	// ScenarioIDs and RetiredScenarios carry the acceptance scenario-corpus
 	// report payloads (E72.4 / #3328): on OutcomeAcceptanceScenariosPushed the
 	// persisted scenario ids and the FULL served retirements merged into
@@ -2749,6 +2811,24 @@ type pullRequestFailureBody struct {
 	// failure body — and therefore every signature and content hash over it — is
 	// BYTE-IDENTICAL. Populated only alongside a real checkpoint.
 	HeldCommitPRText
+
+	// ReviewObligation is the required review the checkpoint retains (ADR-140
+	// (#5047) D9), declared LAST and omitempty so a report without one keeps its
+	// bytes, signature and content hash. shrinkFailureBodyFields never touches it:
+	// a truncated set would read as a smaller obligation. A report that cannot fit
+	// it gives up the whole checkpoint instead (clearFailureCheckpoint).
+	ReviewObligation *ReviewObligation `json:"review_obligation,omitempty"`
+}
+
+// clearFailureCheckpoint empties every checkpoint coordinate, the resume kind and
+// the obligation TOGETHER. A report that kept coordinates without its obligation
+// would read as a resumable carrier that owes no review, so an unfittable required
+// set costs the checkpoint and the retry is one full agent pass.
+func clearFailureCheckpoint(body *pullRequestFailureBody) {
+	body.Branch, body.HeadSHA, body.BaseSHA, body.VerifiedTreeSHA = "", "", "", ""
+	body.ResumeKind = ""
+	body.HeldCommitPRText = HeldCommitPRText{}
+	body.ReviewObligation = nil
 }
 
 // AcceptanceCriterionEntry is one effective acceptance criterion the backend
@@ -3433,6 +3513,10 @@ type pullRequestScopeParkBody struct {
 	// the exempt resume opens a real pull request (#2570). Appended LAST and
 	// fully omitempty, so every pre-#2570 park body is BYTE-IDENTICAL.
 	HeldCommitPRText
+
+	// ReviewObligation is the required review the park retains (ADR-140 (#5047)
+	// D9), declared LAST and omitempty so a park without one keeps its bytes.
+	ReviewObligation *ReviewObligation `json:"review_obligation,omitempty"`
 }
 
 // BindingAssertionReport is one unsatisfied operator-declared binding assertion
@@ -3476,8 +3560,15 @@ type ShipPullRequestResult struct {
 //
 // On 201 the backend created a fresh artifact; on 200 the upload
 // matched an existing one (Result.Idempotent==true).
+//
+// A success upload answered by a live supplemental pass continues rather than
+// exhausting its blip budget (ADR-140 (#5047) D8): see livePassContinuation. The
+// first such answer fixes one bound over the whole remaining call, and exhausting
+// it returns ErrLivePassBudgetExhausted with nothing moved. This never reads, arms
+// or resets the shared terminal-egress phase.
 func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) (*ShipPullRequestResult, error) {
 	body := args.Body
+	failureCheckpointCleared := false
 	switch args.Outcome {
 	case "failed":
 		// Failure-report POST (#742): build the failure body from the
@@ -3501,14 +3592,22 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			// Held-commit PR text (#2570): empty everywhere the checkpoint is,
 			// so the legacy body stays byte-identical there too.
 			HeldCommitPRText: HeldCommitPRText{Title: args.PRTitle, PRBody: args.PRBody},
+			ReviewObligation: args.ReviewObligation,
 		}
 		// Budget the MARSHALLED bytes, not the raw field lengths (#2570): the
 		// reason's nominal 30 KiB clamp is applied inside, then the ladder yields
 		// fields until the SERIALIZED body fits the backend's cap. A false return
 		// means even the emptied envelope is over — ship it anyway and let the
 		// backend's 413 plus the bounded aggressive retry below decide, rather
-		// than dropping the report the stage's recovery depends on.
-		_ = shrinkFailureBodyFields(&failure, MaxPullRequestReportBytes)
+		// than dropping the report the stage's recovery depends on. A body that
+		// cannot fit a required review gives up its whole checkpoint instead, and
+		// the ladder then re-runs so the report keeps its diagnosis.
+		if !shrinkFailureBodyFields(&failure, MaxPullRequestReportBytes) && failure.ReviewObligation != nil && len(failure.ReviewObligation.SupplementalScopeExemptions) > 0 {
+			clearFailureCheckpoint(&failure)
+			failureCheckpointCleared = true
+			failure.Reason = args.Reason
+			_ = shrinkFailureBodyFields(&failure, MaxPullRequestReportBytes)
+		}
 		marshalled, err := json.Marshal(failure)
 		if err != nil {
 			return nil, fmt.Errorf("upload: marshal pull-request failure body: %w", err)
@@ -3616,6 +3715,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			// Held-commit PR text (#2570) so the exempt resume opens a real PR.
 			// Empty on a pre-#2570 runner, where the body is byte-identical.
 			HeldCommitPRText: HeldCommitPRText{Title: args.PRTitle, PRBody: args.PRBody},
+			ReviewObligation: args.ReviewObligation,
 		}
 		// Same marshalled-bytes budget as the failure body (#2570).
 		_ = shrinkParkBodyFields(&park, MaxPullRequestReportBytes)
@@ -3658,19 +3758,34 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 		ctx, cancel = c.pushReportEgressContext(ctx)
 	}
 	defer cancel()
+	initialBackoff := backoff
+
+	// opCtx is ctx until the first live answer latches the bound; from then on it
+	// governs every sleep, request, body read and retry of the remaining call.
+	// Only a success upload (empty outcome) can latch, so the live bound never
+	// meets the push-report budget above (ADR-140 (#5047) D8).
+	livePass := livePassContinuation{allowance: c.LivePassSettleAllowance}
+	if livePass.allowance == 0 {
+		livePass.allowance = DefaultLivePassSettleAllowance
+	}
+	opCtx, cancelOp := ctx, context.CancelFunc(func() {})
+	defer func() { cancelOp() }()
 
 	var lastErr error
 	for attempt := 0; attempt <= maxRetries; attempt++ {
 		if attempt > 0 {
 			select {
-			case <-ctx.Done():
+			case <-opCtx.Done():
+				if stop := livePass.stopErr(ctx, opCtx); stop != nil {
+					return nil, stop
+				}
 				return nil, fmt.Errorf("upload: ship pull-request: %w: last error: %w", ctx.Err(), lastErr)
 			case <-time.After(backoff):
 			}
 			backoff = capBackoff(backoff, backoffCap)
 		}
 
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(opCtx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return nil, fmt.Errorf("upload: build pull-request request: %w", err)
 		}
@@ -3691,6 +3806,9 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			err := json.NewDecoder(resp.Body).Decode(&out)
 			_ = resp.Body.Close()
 			if err != nil {
+				if stop := livePass.stopErr(ctx, opCtx); stop != nil {
+					return nil, stop
+				}
 				return nil, fmt.Errorf("upload: decode pull-request response: %w", err)
 			}
 			return &out, nil
@@ -3709,8 +3827,30 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			_ = resp.Body.Close()
 			return nil, ErrNotFound
 		case resp.StatusCode >= 500:
-			lastErr = statusError("ship pull-request", resp)
+			detail := readBriefBody(resp)
+			lastErr = statusErrorFromBody("ship pull-request", resp, detail)
 			_ = resp.Body.Close()
+			wait, isLive, latched, liveErr := livePass.next(resp, detail, args.Outcome, time.Now())
+			if liveErr != nil {
+				return nil, liveErr
+			}
+			if latched {
+				opCtx, cancelOp = context.WithDeadline(ctx, livePass.deadline)
+				// Latches once. The opening deferred closure already covers this;
+				// go vet's lostcancel cannot see through it.
+				defer cancelOp()
+			}
+			if isLive {
+				select {
+				case <-opCtx.Done():
+					return nil, livePass.doneErr(ctx, opCtx)
+				case <-time.After(wait):
+				}
+				// A live answer refills the ordinary blip budget; only this
+				// branch does. A custom retry policy's own values come back.
+				attempt = -1
+				backoff = initialBackoff
+			}
 			continue
 		default:
 			lastErr = statusError("ship pull-request", resp)
@@ -3724,7 +3864,7 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			// truncatable reason, so it fails fast as before.
 			if args.Outcome == "failed" && resp.StatusCode >= 400 && resp.StatusCode < 500 && !aggressiveRetried {
 				aggressiveRetried = true
-				marshalled, mErr := json.Marshal(pullRequestFailureBody{
+				aggressive := pullRequestFailureBody{
 					Outcome:  args.Outcome,
 					Category: args.Category,
 					Reason:   TruncateReason(args.Reason, AggressiveFailureReportReasonBytes),
@@ -3747,7 +3887,16 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 					// whole agent) and a 2 KiB reason. The PR text costs only the
 					// placeholder title the backend's issue-context fallback then
 					// covers — the cheapest field to lose.
-				})
+					//
+					// The obligation (ADR-140 (#5047) D9) is NOT droppable here:
+					// coordinates without it would read as owing no review.
+					ReviewObligation: args.ReviewObligation,
+				}
+				// A report that already gave up its checkpoint does not get it back.
+				if failureCheckpointCleared {
+					clearFailureCheckpoint(&aggressive)
+				}
+				marshalled, mErr := json.Marshal(aggressive)
 				if mErr != nil {
 					return nil, fmt.Errorf("upload: marshal aggressive pull-request failure body: %w", mErr)
 				}
@@ -3759,7 +3908,123 @@ func (c *Client) ShipPullRequest(ctx context.Context, args ShipPullRequestArgs) 
 			return nil, lastErr
 		}
 	}
+	if stop := livePass.stopErr(ctx, opCtx); stop != nil {
+		return nil, stop
+	}
 	return nil, fmt.Errorf("upload: ship pull-request exhausted retries: %w", lastErr)
+}
+
+const (
+	// ReviewPassRemainingHeader carries the seconds left on a live supplemental
+	// pass owner's lifetime, on a review_round_in_flight answer.
+	//
+	// WIRE VALUE: byte-identical to the backend's reviewPassRemainingHeader
+	// (backend/internal/server/review_shutdown.go).
+	ReviewPassRemainingHeader = "X-Fishhawk-Review-Pass-Remaining-Seconds"
+
+	// codeReviewRoundInFlight is the backend's error code for a live supplemental
+	// pass on POST /v0/runs/{run_id}/pull-request.
+	codeReviewRoundInFlight = "review_round_in_flight"
+
+	// DefaultLivePassSettleAllowance is the settle time added to a live pass's
+	// remaining lifetime when the continuation bound is fixed.
+	DefaultLivePassSettleAllowance = 30 * time.Second
+
+	// maxLivePassRemaining is the largest remaining value the runner believes. A
+	// larger one stays an ordinary 5xx rather than an enormous bound.
+	maxLivePassRemaining = 24 * time.Hour
+
+	// A live answer's Retry-After is clamped to this window, and an absent or
+	// unreadable one takes the default.
+	minLivePassWait     = time.Second
+	maxLivePassWait     = 60 * time.Second
+	defaultLivePassWait = 15 * time.Second
+)
+
+// livePassContinuation is one ShipPullRequest call's reading of the backend's
+// live-pass answer (ADR-140 (#5047) D8). Only an HTTP 503 whose envelope code is
+// review_round_in_flight and whose remaining header is in range proves a live pass:
+// anything else stays an ordinary 5xx on the blip budget, and any other answer
+// decides. The first such answer fixes deadline at remaining plus the settle
+// allowance; a later one cannot extend it. A failure report never waits, since a
+// runner's report must land while a pass is live. This is not an unlimited wait
+// guarantee: the bound can pass with the pass still running, and that fails the
+// stage retryably with nothing moved.
+type livePassContinuation struct {
+	deadline  time.Time
+	allowance time.Duration
+}
+
+// next classifies one 5xx answer. wait and isLive tell the caller to poll again,
+// latched that this answer fixed the bound.
+func (l *livePassContinuation) next(resp *http.Response, detail, outcome string, now time.Time) (wait time.Duration, isLive, latched bool, err error) {
+	if outcome != "" {
+		return 0, false, false, nil
+	}
+	if resp.StatusCode != http.StatusServiceUnavailable {
+		return 0, false, false, nil
+	}
+	if code, ok := errorEnvelopeCode(detail); !ok || code != codeReviewRoundInFlight {
+		return 0, false, false, nil
+	}
+	remaining, ok := parseLivePassSeconds(resp.Header.Get(ReviewPassRemainingHeader), maxLivePassRemaining)
+	if !ok {
+		return 0, false, false, nil
+	}
+	if l.deadline.IsZero() {
+		l.deadline = now.Add(remaining + l.allowance)
+		latched = true
+	}
+	if !now.Before(l.deadline) {
+		return 0, false, latched, ErrLivePassBudgetExhausted
+	}
+	return livePassWait(resp.Header.Get("Retry-After")), true, latched, nil
+}
+
+// stopErr is why the call must stop now: nil when no bound was ever latched, so
+// every such path keeps its existing error bytes. The caller's own error wins over
+// the bound's.
+func (l *livePassContinuation) stopErr(ctx, opCtx context.Context) error {
+	if l.deadline.IsZero() {
+		return nil
+	}
+	if cerr := ctx.Err(); cerr != nil {
+		return cerr
+	}
+	if opCtx.Err() != nil {
+		return ErrLivePassBudgetExhausted
+	}
+	return nil
+}
+
+// doneErr is stopErr for a wait that observed opCtx end.
+func (l *livePassContinuation) doneErr(ctx, opCtx context.Context) error {
+	if stop := l.stopErr(ctx, opCtx); stop != nil {
+		return stop
+	}
+	return ctx.Err()
+}
+
+// parseLivePassSeconds reads a whole-second count in 1s..maxValue. An absent,
+// zero, signed, non-numeric or larger value is not ok.
+func parseLivePassSeconds(raw string, maxValue time.Duration) (time.Duration, bool) {
+	seconds, err := strconv.ParseUint(raw, 10, 63)
+	if err != nil || seconds < 1 || seconds > uint64(maxValue/time.Second) {
+		return 0, false
+	}
+	return time.Duration(seconds) * time.Second, true
+}
+
+// livePassWait is a live answer's Retry-After delay, clamped to the poll window.
+func livePassWait(raw string) time.Duration {
+	seconds, err := strconv.ParseUint(raw, 10, 63)
+	if err != nil {
+		return defaultLivePassWait
+	}
+	if seconds >= uint64(maxLivePassWait/time.Second) {
+		return maxLivePassWait
+	}
+	return max(time.Duration(seconds)*time.Second, minLivePassWait)
 }
 
 // FetchMCPTokenArgs collects the inputs for FetchMCPToken.

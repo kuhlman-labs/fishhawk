@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -385,12 +386,16 @@ func promptRequestWithCapabilities(t *testing.T, s *Server, stageID uuid.UUID, p
 	return w
 }
 
-// capableRunnerCapabilities is the header value a current runner sends: the
-// full token list in the runner's append-only order (#3621, #4183, E55.16 /
-// #3916, E83.80 / #4190). TestResumeKindWireValues pins it against the same
-// literal the runner's upload.TestRunnerCapabilityWireValues pins
+// capableRunnerCapabilities is the header value a runner predating ADR-140
+// (#5047) D9 sends: the first four tokens in the runner's append-only order
+// (#3621, #4183, E55.16 / #3916, E83.80 / #4190). The fifth token's tests use
+// reviewObligationRunnerCapabilities, which TestResumeKindWireValues pins against
+// the same literal the runner's upload.TestRunnerCapabilityWireValues pins
 // RunnerCapabilitiesValue() against.
 const capableRunnerCapabilities = capabilityPushResume + "," + capabilityMergeCandidateVerify + "," + capabilityChildPushResume + "," + capabilityReverifyResume
+
+// reviewObligationRunnerCapabilities is the header value a current runner sends.
+const reviewObligationRunnerCapabilities = capableRunnerCapabilities + "," + capabilityReviewObligationResume
 
 // promptRenderRequest exercises the unsigned /prompt-render preview endpoint,
 // the sibling surface of promptRequest's signed /prompt dispatch endpoint.
@@ -15098,8 +15103,11 @@ func TestResumeKindWireValues(t *testing.T) {
 		{resumeKindReverify, "reverify", "resumeKindReverify"},
 		{capabilityReverifyResume, "reverify-resume", "capabilityReverifyResume"},
 		{capableRunnerCapabilities, "push-resume,merge-candidate-verify,child-push-resume,reverify-resume", "capableRunnerCapabilities"},
+		{capabilityReviewObligationResume, "review-obligation-resume", "capabilityReviewObligationResume"},
+		{reviewObligationRunnerCapabilities, "push-resume,merge-candidate-verify,child-push-resume,reverify-resume,review-obligation-resume", "reviewObligationRunnerCapabilities"},
 		{CategoryPushResumeCheckpoint, "push_resume_checkpoint", "CategoryPushResumeCheckpoint"},
 		{CategoryVerifyResumeCheckpoint, "verify_resume_checkpoint", "CategoryVerifyResumeCheckpoint"},
+		{CategoryReviewObligationCheckpoint, "review_obligation_checkpoint", "CategoryReviewObligationCheckpoint"},
 	} {
 		if tc.got != tc.want {
 			t.Errorf("%s = %q, want %q", tc.name, tc.got, tc.want)
@@ -17064,5 +17072,868 @@ func TestCounterfactualSpecsForPrompt_NilReplaceReadsAsEmpty(t *testing.T) {
 	}}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("specs = %#v, want %#v", got, want)
+	}
+}
+
+// --- held-commit review obligation (ADR-140 (#5047) D9) -----------------------
+
+// obligationPrompt is a real signed /prompt over a stage whose attempt token and
+// coordinates are the shared golden's, so a served obligation is byte-comparable.
+type obligationPrompt struct {
+	s      *Server
+	au     *auditFake
+	rr     *orchestratorRepo
+	runRow *run.Run
+	stage  *run.Stage
+	priv   ed25519.PrivateKey
+	report goldenFailureBody
+}
+
+func newObligationPrompt(t *testing.T, spec []byte) *obligationPrompt {
+	t.Helper()
+	s, sf, au, rr, runRow, stage := newImplementReviewServer(t, &fakePlanReviewer{}, spec)
+	au.stampSequence = true
+	stage.State = run.StageStateRunning
+	dispatched := time.Date(2026, 11, 5, 12, 0, 0, 0, time.UTC)
+	stage.DispatchedAt = &dispatched
+	s.cfg.RunRepo = obligationParkRepo{newScopeParkDeciderRepo(rr, au)}
+	triggerRef := "issue:42"
+	runRow.TriggerSource = run.TriggerGitHubIssue
+	runRow.TriggerRef = &triggerRef
+	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{Number: 42, Title: "t", Body: "b", State: "open"}}
+	priv, _ := sf.issue(t, runRow.ID)
+	var report goldenFailureBody
+	if err := json.Unmarshal(loadReviewObligationWire(t).FailureReport, &report); err != nil {
+		t.Fatalf("setup: decode golden failure report: %v", err)
+	}
+	return &obligationPrompt{s: s, au: au, rr: rr, runRow: runRow, stage: stage, priv: priv, report: report}
+}
+
+func (f *obligationPrompt) append(t *testing.T, category string, payload []byte) {
+	t.Helper()
+	stageID := f.stage.ID
+	if _, err := f.au.AppendChained(context.Background(), audit.ChainAppendParams{RunID: f.runRow.ID, StageID: &stageID, Category: category, Payload: payload}); err != nil {
+		t.Fatalf("setup: append %s: %v", category, err)
+	}
+}
+
+// coords is the golden report's checkpoint coordinates.
+func (f *obligationPrompt) coords() pushCheckpointPayload {
+	r := f.report
+	return pushCheckpointPayload{Branch: r.Branch, HeadSHA: r.HeadSHA, BaseSHA: r.BaseSHA, VerifiedTreeSHA: r.VerifiedTreeSHA, PRTitle: r.Title, PRBody: r.Body}
+}
+
+// requiredCarrier records a known-required report the way the route does: a
+// checkpoint-less pull_request_failed, then the separate category strictly newer.
+func (f *obligationPrompt) requiredCarrier(t *testing.T, kind string) {
+	t.Helper()
+	f.append(t, "pull_request_failed", []byte(`{"category":"C","reason":"open pull request failed"}`))
+	f.s.recordReviewObligationCheckpoint(context.Background(), f.runRow.ID, f.stage.ID, kind, f.coords(), f.report.ReviewObligation, audit.ActorSystem, nil)
+}
+
+// plainCarrier records a checkpoint under its own kind's category, with extra keys
+// on the checkpoint: a known-none marker, or none at all for a legacy row.
+func (f *obligationPrompt) plainCarrier(t *testing.T, kind string, extra map[string]any) {
+	t.Helper()
+	r := f.report
+	checkpoint := map[string]any{"branch": r.Branch, "head_sha": r.HeadSHA, "base_sha": r.BaseSHA, "verified_tree_sha": r.VerifiedTreeSHA}
+	for k, v := range extra {
+		checkpoint[k] = v
+	}
+	payload := recoveryPayload(t, map[string]any{"resume_kind": kind, "push_checkpoint": checkpoint})
+	switch kind {
+	case resumeKindPROpen:
+		f.append(t, "pull_request_failed", payload)
+	case resumeKindPush:
+		f.append(t, "pull_request_failed", []byte(`{"category":"C","reason":"push failed"}`))
+		f.append(t, CategoryPushResumeCheckpoint, payload)
+	case resumeKindReverify:
+		f.append(t, "pull_request_failed", []byte(`{"category":"C","reason":"verify failed"}`))
+		f.append(t, CategoryVerifyResumeCheckpoint, payload)
+	default:
+		t.Fatalf("setup: unknown carrier kind %q", kind)
+	}
+}
+
+// knownNone is a known-none marker bound to the golden head.
+func (f *obligationPrompt) knownNone() map[string]any {
+	return map[string]any{"review_obligation": reviewObligation{HeadSHA: f.report.HeadSHA, StageAttempt: f.report.ReviewObligation.StageAttempt, SupplementalScopeExemptions: []scopeExemption{}}}
+}
+
+// exemptPark moves the stage out of a resolved park whose row carries the given
+// parked payload, by construction rather than through the route.
+func (f *obligationPrompt) exemptPark(t *testing.T, base string, parkedPayload []byte) {
+	t.Helper()
+	r := f.report
+	f.stage.State = run.StageStatePending
+	f.stage.ScopeCompletenessPark = &run.ScopeCompletenessPark{HeldCommitSHA: r.HeadSHA, RunBranch: r.Branch, BaseSHA: base, VerifiedTreeSHA: r.VerifiedTreeSHA}
+	f.append(t, CategoryScopeCompletenessParked, parkedPayload)
+	f.append(t, CategoryScopeCompletenessExempted, []byte(`{"decision":"exempt"}`))
+}
+
+// goldenParkedPayload is the golden's withheld park payload, the row a current
+// backend writes for a known-required report.
+func goldenParkedPayload(t *testing.T) []byte {
+	t.Helper()
+	var park struct {
+		ParkedPayload json.RawMessage `json:"parked_payload"`
+	}
+	if err := json.Unmarshal(loadReviewObligationWire(t).KnownRequiredPark, &park); err != nil {
+		t.Fatalf("setup: decode known_required_park: %v", err)
+	}
+	return park.ParkedPayload
+}
+
+// legacyParkedPayload is a park with a base and no obligation key.
+func (f *obligationPrompt) legacyParkedPayload(t *testing.T) []byte {
+	t.Helper()
+	return recoveryPayload(t, map[string]any{"base_sha": f.report.BaseSHA, "head_sha": f.report.HeadSHA})
+}
+
+func (f *obligationPrompt) prompt(t *testing.T, caps string) map[string]json.RawMessage {
+	t.Helper()
+	return exemptBodyKeys(t, promptRequestWithCapabilities(t, f.s, f.stage.ID, f.priv, caps), "/prompt")
+}
+
+func (f *obligationPrompt) render(t *testing.T, caps string) map[string]json.RawMessage {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodGet, fmt.Sprintf("/v0/stages/%s/prompt-render", f.stage.ID), nil)
+	req.Header.Set(runnerCapabilitiesHeader, caps)
+	w := httptest.NewRecorder()
+	f.s.Handler().ServeHTTP(w, req)
+	return exemptBodyKeys(t, w, "/prompt-render")
+}
+
+// discardReasons reads the verified_tree_discarded rows' reasons.
+func (f *obligationPrompt) discardReasons(t *testing.T) []string {
+	t.Helper()
+	rows, err := f.au.ListForRunByCategory(context.Background(), f.runRow.ID, "verified_tree_discarded")
+	if err != nil {
+		t.Fatalf("list discard rows: %v", err)
+	}
+	var reasons []string
+	for _, row := range rows {
+		var payload struct {
+			VerifiedTreeSHA string `json:"verified_tree_sha"`
+			Reason          string `json:"reason"`
+		}
+		if err := json.Unmarshal(row.Payload, &payload); err != nil {
+			t.Fatalf("decode discard row: %v", err)
+		}
+		if payload.VerifiedTreeSHA != f.report.VerifiedTreeSHA {
+			t.Errorf("discard row names tree %q, want %q", payload.VerifiedTreeSHA, f.report.VerifiedTreeSHA)
+		}
+		reasons = append(reasons, payload.Reason)
+	}
+	return reasons
+}
+
+func assertDiscardReason(t *testing.T, f *obligationPrompt, want string) {
+	t.Helper()
+	if got := f.discardReasons(t); !slices.Equal(got, []string{want}) {
+		t.Errorf("verified_tree_discarded reasons = %v, want [%s]", got, want)
+	}
+}
+
+// assertObligationDeclined requires a total decline: no held-commit field at all.
+func assertObligationDeclined(t *testing.T, keys map[string]json.RawMessage, why string) {
+	t.Helper()
+	assertNoResumeEmission(t, keys, why)
+	if raw, ok := keys["held_commit_review_obligation"]; ok {
+		t.Errorf("%s: held_commit_review_obligation must be absent, got %s", why, raw)
+	}
+}
+
+// assertProvenNone requires a served resume carrying a known-none obligation.
+func assertProvenNone(t *testing.T, keys map[string]json.RawMessage, wantHead string) {
+	t.Helper()
+	if string(keys["open_pr_from_held_commit"]) != "true" {
+		t.Fatalf("resume not served: open_pr_from_held_commit = %s", keys["open_pr_from_held_commit"])
+	}
+	var obligation reviewObligation
+	if err := json.Unmarshal(keys["held_commit_review_obligation"], &obligation); err != nil {
+		t.Fatalf("decode served obligation %s: %v", keys["held_commit_review_obligation"], err)
+	}
+	if reviewObligationKnowledge(&obligation) != obligationKnownNone || obligation.HeadSHA != wantHead {
+		t.Errorf("served obligation = %s, want known none at %s", keys["held_commit_review_obligation"], wantHead)
+	}
+}
+
+// promptFieldsBytes rebuilds the golden's prompt_fields section from a response's
+// raw values, for a byte comparison.
+func promptFieldsBytes(keys map[string]json.RawMessage) string {
+	return `{"held_commit_review_obligation":` + string(keys["held_commit_review_obligation"]) +
+		`,"supports_review_obligation_resume":` + string(keys["supports_review_obligation_resume"]) + `}`
+}
+
+// armedListArtifactRepo fails artifact lists once its flag is set.
+type armedListArtifactRepo struct {
+	artifact.Repository
+	armed *bool
+}
+
+func (r armedListArtifactRepo) ListForStage(ctx context.Context, stageID uuid.UUID) ([]*artifact.Artifact, error) {
+	if *r.armed {
+		return nil, errors.New("artifact list failed")
+	}
+	return r.Repository.ListForStage(ctx, stageID)
+}
+
+// armOnCategoryAudit sets a flag when one category is first listed.
+type armOnCategoryAudit struct {
+	audit.Repository
+	category string
+	armed    *bool
+}
+
+func (a armOnCategoryAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.category {
+		*a.armed = true
+	}
+	return a.Repository.ListForRunByCategory(ctx, runID, category)
+}
+
+// obligationParkRepo commits a park the way the Postgres verb does, so the real
+// route's row reaches the real decision and prompt.
+type obligationParkRepo struct{ *scopeParkDeciderRepo }
+
+func (r obligationParkRepo) ParkScopeCompletenessAndAppend(ctx context.Context, stageID uuid.UUID, park run.ScopeCompletenessPark, p audit.ChainAppendParams) (*run.Stage, bool, error) {
+	if _, err := r.au.AppendChained(ctx, p); err != nil {
+		return nil, false, err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	st, ok := r.stagesByID[stageID]
+	if !ok {
+		return nil, false, run.ErrNotFound
+	}
+	st.State = run.StageStateAwaitingScopeDecision
+	st.ScopeCompletenessPark = &park
+	return st, true, nil
+}
+
+// TestNewestPushCheckpoint_ReviewObligationCarrier seeds through the real recorder,
+// so the walk reads the payload the route writes.
+func TestNewestPushCheckpoint_ReviewObligationCarrier(t *testing.T) {
+	gating := specImplementGatingReviewers
+	read := func(f *obligationPrompt) (pushCheckpointPayload, string) {
+		return f.s.newestPushCheckpoint(context.Background(), f.runRow.ID, f.stage.ID)
+	}
+	t.Run("obligated_is_newest", func(t *testing.T) {
+		for _, kind := range []string{resumeKindPROpen, resumeKindPush} {
+			f := newObligationPrompt(t, gating)
+			f.requiredCarrier(t, kind)
+			cp, verdict := read(f)
+			if verdict != checkpointResumable {
+				t.Fatalf("%s: verdict = %q, want resumable", kind, verdict)
+			}
+			if cp.ResumeKind != kind {
+				t.Errorf("kind = %q, want %q from the payload", cp.ResumeKind, kind)
+			}
+			if !reflect.DeepEqual(cp.ReviewObligation, f.report.ReviewObligation) {
+				t.Errorf("obligation = %+v, want the recorded set", cp.ReviewObligation)
+			}
+		}
+	})
+	t.Run("newer_pull_request_opened_supersedes", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.requiredCarrier(t, resumeKindPROpen)
+		f.append(t, "pull_request_opened", []byte(`{}`))
+		if _, verdict := read(f); verdict != checkpointSuperseded {
+			t.Errorf("verdict = %q, want superseded", verdict)
+		}
+	})
+	t.Run("newer_checkpointless_failure_retires", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.requiredCarrier(t, resumeKindPROpen)
+		f.append(t, "pull_request_failed", []byte(`{"category":"C","reason":"later"}`))
+		if _, verdict := read(f); verdict != checkpointNone {
+			t.Errorf("verdict = %q, want none: an ordinary failure retires the carrier", verdict)
+		}
+	})
+	t.Run("newer_park_supersedes", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.requiredCarrier(t, resumeKindPROpen)
+		f.append(t, CategoryScopeCompletenessParked, []byte(`{}`))
+		if _, verdict := read(f); verdict != checkpointSuperseded {
+			t.Errorf("verdict = %q, want superseded", verdict)
+		}
+	})
+	t.Run("other_stage_ignored", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.s.recordReviewObligationCheckpoint(context.Background(), f.runRow.ID, uuid.New(), resumeKindPROpen, f.coords(), f.report.ReviewObligation, audit.ActorSystem, nil)
+		if _, verdict := read(f); verdict != checkpointNone {
+			t.Errorf("verdict = %q, want none", verdict)
+		}
+	})
+	t.Run("unknown_resume_kind", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.requiredCarrier(t, "not_a_kind")
+		_, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+		if resume {
+			t.Fatal("an unknown kind must not resume")
+		}
+		assertDiscardReason(t, f, "unknown_resume_kind")
+	})
+	// reverify is a recognized kind, but never on this carrier: every capability
+	// is advertised, so only the carrier's own kind check can refuse it.
+	t.Run("recognized_reverify_kind_disallowed", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.requiredCarrier(t, resumeKindReverify)
+		held, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+		if resume || held.resumeKind != "" {
+			t.Fatalf("resume = %t kind = %q: a reverify obligation carrier must not resume", resume, held.resumeKind)
+		}
+		assertDiscardReason(t, f, "unknown_resume_kind")
+	})
+	t.Run("valid_kinds_resolve", func(t *testing.T) {
+		for _, kind := range []string{resumeKindPROpen, resumeKindPush} {
+			f := newObligationPrompt(t, gating)
+			f.requiredCarrier(t, kind)
+			held, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+			if !resume || held.resumeKind != kind {
+				t.Errorf("%s: resume = %t kind = %q, want served as %s", kind, resume, held.resumeKind, kind)
+			}
+			if got := f.discardReasons(t); len(got) != 0 {
+				t.Errorf("%s: discard reasons = %v, want none", kind, got)
+			}
+		}
+	})
+	// The legacy reverify carrier keeps its own category, which names the kind.
+	t.Run("legacy_reverify_carrier_unchanged", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.plainCarrier(t, resumeKindReverify, nil)
+		held, resume := f.s.resolvePushCheckpointResume(context.Background(), f.runRow, f.stage, false, true, true, true, true)
+		if !resume || held.resumeKind != resumeKindReverify {
+			t.Errorf("resume = %t kind = %q, want the legacy reverify carrier served", resume, held.resumeKind)
+		}
+	})
+}
+
+// TestAdmitHeldCommitObligation_Modes calls the admission directly, so each row's
+// outcome is that arm alone.
+func TestAdmitHeldCommitObligation_Modes(t *testing.T) {
+	const otherHead = "ffffffffffffffffffffffffffffffffffffffff"
+	required := func(f *obligationPrompt) *reviewObligation { return f.report.ReviewObligation }
+	none := func(f *obligationPrompt) *reviewObligation {
+		return &reviewObligation{HeadSHA: f.report.HeadSHA, StageAttempt: "recorded", SupplementalScopeExemptions: []scopeExemption{}}
+	}
+	cases := []struct {
+		name       string
+		spec       []byte
+		caps       string
+		obligation func(f *obligationPrompt) *reviewObligation
+		kind       string
+		edit       func(t *testing.T, f *obligationPrompt)
+		noRecord   bool
+		wantServed bool
+		wantNone   bool
+		wantKept   bool
+		wantReason string
+	}{
+		{name: "known_empty_served", spec: specImplementGatingReviewers, caps: capableRunnerCapabilities, obligation: none, wantServed: true, wantKept: true},
+		{name: "known_required_capable_served", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities, obligation: required, wantServed: true, wantKept: true},
+		{name: "known_required_no_capability_declined", spec: specImplementGatingReviewers, caps: capableRunnerCapabilities, obligation: required, wantReason: "runner_review_obligation_capability_absent"},
+		{
+			name: "head_mismatch_declined", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities,
+			obligation: func(f *obligationPrompt) *reviewObligation {
+				o := *f.report.ReviewObligation
+				o.HeadSHA = otherHead
+				return &o
+			},
+			wantReason: "review_obligation_head_mismatch",
+		},
+		{name: "unknown_gating_declined", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities, wantReason: "review_obligation_unknown"},
+		{
+			name: "null_list_gating_declined", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities,
+			obligation: func(f *obligationPrompt) *reviewObligation {
+				return &reviewObligation{HeadSHA: otherHead, StageAttempt: "recorded"}
+			},
+			wantReason: "review_obligation_unknown",
+		},
+		{
+			name: "unknown_plan_read_error_declined", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities,
+			edit: func(_ *testing.T, f *obligationPrompt) {
+				f.s.cfg.ArtifactRepo = failingListArtifactRepo{f.s.cfg.ArtifactRepo}
+			},
+			wantReason: "review_obligation_unknown",
+		},
+		{name: "unknown_advisory_served_none", spec: specImplementAdvisoryReviewers, caps: reviewObligationRunnerCapabilities, wantServed: true, wantNone: true},
+		{
+			name: "unknown_no_plan_served_none", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities,
+			edit: func(_ *testing.T, f *obligationPrompt) {
+				f.s.cfg.ArtifactRepo = newFakeArtifactRepo()
+			},
+			wantServed: true, wantNone: true,
+		},
+		{name: "reverify_absent_served_none", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities, kind: resumeKindReverify, wantServed: true, wantNone: true},
+		{
+			name: "child_push_absent_served_none", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities, kind: resumeKindPush,
+			edit: func(_ *testing.T, f *obligationPrompt) {
+				parent := uuid.New()
+				f.runRow.DecomposedFrom = &parent
+			},
+			wantServed: true, wantNone: true,
+		},
+		{name: "preview_records_nothing", spec: specImplementGatingReviewers, caps: reviewObligationRunnerCapabilities, noRecord: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newObligationPrompt(t, tc.spec)
+			if tc.edit != nil {
+				tc.edit(t, f)
+			}
+			held := heldCommitResume{sha: f.report.HeadSHA, branch: f.report.Branch, resumeKind: tc.kind, discardTreeSHA: f.report.VerifiedTreeSHA}
+			if tc.obligation != nil {
+				held.reviewObligation = tc.obligation(f)
+			}
+			before := held.reviewObligation
+			req := httptest.NewRequest(http.MethodGet, "/", nil)
+			req.Header.Set(runnerCapabilitiesHeader, tc.caps)
+			served := f.s.admitHeldCommitObligation(context.Background(), req, f.runRow, f.stage, &held, !tc.noRecord)
+			if served != tc.wantServed {
+				t.Fatalf("served = %t, want %t", served, tc.wantServed)
+			}
+			switch {
+			case tc.wantReason != "":
+				assertDiscardReason(t, f, tc.wantReason)
+			default:
+				if got := f.discardReasons(t); len(got) != 0 {
+					t.Errorf("no row may be written here, got %v", got)
+				}
+			}
+			if tc.wantKept && held.reviewObligation != before {
+				t.Errorf("a known obligation is served as recorded, got %+v", held.reviewObligation)
+			}
+			if tc.wantNone {
+				if reviewObligationKnowledge(held.reviewObligation) != obligationKnownNone {
+					t.Fatalf("obligation = %+v, want proven none", held.reviewObligation)
+				}
+				if held.reviewObligation.HeadSHA != f.report.HeadSHA || held.reviewObligation.StageAttempt != run.StageAttemptToken(f.stage.DispatchedAt) {
+					t.Errorf("proven none must bind this head and attempt: %+v", held.reviewObligation)
+				}
+			}
+		})
+	}
+}
+
+// TestStagePrompt_ServesReviewObligation drives each resume arm at each prompt site
+// and compares the served fields to the golden byte for byte.
+func TestStagePrompt_ServesReviewObligation(t *testing.T) {
+	want := string(loadReviewObligationWire(t).PromptFields)
+	checkpoint := func(t *testing.T, f *obligationPrompt) { f.requiredCarrier(t, resumeKindPROpen) }
+	exempt := func(t *testing.T, f *obligationPrompt) { f.exemptPark(t, "", goldenParkedPayload(t)) }
+	dispatch := func(t *testing.T, f *obligationPrompt) map[string]json.RawMessage {
+		return f.prompt(t, reviewObligationRunnerCapabilities)
+	}
+	render := func(t *testing.T, f *obligationPrompt) map[string]json.RawMessage {
+		return f.render(t, reviewObligationRunnerCapabilities)
+	}
+	for _, tc := range []struct {
+		name  string
+		seed  func(*testing.T, *obligationPrompt)
+		fetch func(*testing.T, *obligationPrompt) map[string]json.RawMessage
+	}{
+		{"dispatch_checkpoint", checkpoint, dispatch},
+		{"dispatch_exempt", exempt, dispatch},
+		{"render_checkpoint", checkpoint, render},
+		{"render_exempt", exempt, render},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newObligationPrompt(t, specImplementGatingReviewers)
+			tc.seed(t, f)
+			keys := tc.fetch(t, f)
+			if string(keys["held_commit_sha"]) != `"`+f.report.HeadSHA+`"` {
+				t.Fatalf("held_commit_sha = %s", keys["held_commit_sha"])
+			}
+			if got := promptFieldsBytes(keys); got != want {
+				t.Errorf("prompt fields differ from the golden:\n got  %s\n want %s", got, want)
+			}
+		})
+	}
+	t.Run("flag_on_every_implement_response", func(t *testing.T) {
+		f := newObligationPrompt(t, specImplementGatingReviewers)
+		for name, keys := range map[string]map[string]json.RawMessage{
+			"dispatch": f.prompt(t, capableRunnerCapabilities),
+			"render":   f.render(t, capableRunnerCapabilities),
+		} {
+			if string(keys["supports_review_obligation_resume"]) != "true" {
+				t.Errorf("%s: flag = %s, want true with nothing to resume", name, keys["supports_review_obligation_resume"])
+			}
+			if raw, ok := keys["held_commit_review_obligation"]; ok {
+				t.Errorf("%s: no resume serves no obligation, got %s", name, raw)
+			}
+		}
+	})
+}
+
+// TestStagePrompt_OldRunner_NonemptyObligation_TotalDecline: a runner lacking the
+// capability gets no held-commit field at all, never a resume that drops the set.
+func TestStagePrompt_OldRunner_NonemptyObligation_TotalDecline(t *testing.T) {
+	t.Run("checkpoint", func(t *testing.T) {
+		f := newObligationPrompt(t, specImplementGatingReviewers)
+		f.requiredCarrier(t, resumeKindPROpen)
+		assertObligationDeclined(t, f.prompt(t, capableRunnerCapabilities), "a four-token runner")
+		assertDiscardReason(t, f, "runner_review_obligation_capability_absent")
+	})
+	t.Run("exempt_park", func(t *testing.T) {
+		f := newObligationPrompt(t, specImplementGatingReviewers)
+		f.exemptPark(t, "", goldenParkedPayload(t))
+		assertObligationDeclined(t, f.prompt(t, capableRunnerCapabilities), "a four-token runner")
+		assertDiscardReason(t, f, "runner_review_obligation_capability_absent")
+	})
+	t.Run("render_checkpoint_declines_with_no_row", func(t *testing.T) {
+		f := newObligationPrompt(t, specImplementGatingReviewers)
+		f.requiredCarrier(t, resumeKindPROpen)
+		assertObligationDeclined(t, f.render(t, capableRunnerCapabilities), "a preview without the capability")
+		if got := f.discardReasons(t); len(got) != 0 {
+			t.Errorf("a preview must not write to the chain, got %v", got)
+		}
+	})
+	t.Run("render_exempt_declines_with_no_row", func(t *testing.T) {
+		f := newObligationPrompt(t, specImplementGatingReviewers)
+		f.exemptPark(t, "", goldenParkedPayload(t))
+		assertObligationDeclined(t, f.render(t, capableRunnerCapabilities), "a preview without the capability")
+		if got := f.discardReasons(t); len(got) != 0 {
+			t.Errorf("a preview must not write to the chain, got %v", got)
+		}
+	})
+	t.Run("known_none_still_served", func(t *testing.T) {
+		f := newObligationPrompt(t, specImplementGatingReviewers)
+		f.plainCarrier(t, resumeKindPROpen, f.knownNone())
+		assertProvenNone(t, f.prompt(t, capableRunnerCapabilities), f.report.HeadSHA)
+		if got := f.discardReasons(t); len(got) != 0 {
+			t.Errorf("a served resume discards nothing, got %v", got)
+		}
+	})
+}
+
+// TestStagePrompt_LegacyCarriers_Unchanged keeps today's held-commit fields for
+// rows D9 leaves alone, plus only the marker that proves none.
+func TestStagePrompt_LegacyCarriers_Unchanged(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		kind string
+	}{
+		{"no_workflow_spec", nil, resumeKindPROpen},
+		{"advisory", specImplementAdvisoryReviewers, resumeKindPROpen},
+		{"no_reviewers", specNoReviewers, resumeKindPush},
+		{"reverify_on_gating", specImplementGatingReviewers, resumeKindReverify},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newObligationPrompt(t, tc.spec)
+			f.plainCarrier(t, tc.kind, nil)
+			keys := f.prompt(t, capableRunnerCapabilities)
+			assertProvenNone(t, keys, f.report.HeadSHA)
+			for key, want := range map[string]string{
+				"held_commit_sha":      `"` + f.report.HeadSHA + `"`,
+				"held_commit_branch":   `"` + f.report.Branch + `"`,
+				"held_commit_base_sha": `"` + f.report.BaseSHA + `"`,
+			} {
+				if string(keys[key]) != want {
+					t.Errorf("%s = %s, want %s", key, keys[key], want)
+				}
+			}
+			if got := f.discardReasons(t); len(got) != 0 {
+				t.Errorf("a served resume discards nothing, got %v", got)
+			}
+		})
+	}
+}
+
+// TestStagePrompt_UnknownCarrier_WholeHandler fixes the rule over the real handler,
+// rows and signed header: an unproved carrier on a gating or unreadable review is
+// one full agent pass, and everything D9 proves none still resumes.
+func TestStagePrompt_UnknownCarrier_WholeHandler(t *testing.T) {
+	gating := specImplementGatingReviewers
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		seed func(t *testing.T, f *obligationPrompt)
+	}{
+		{"gating_pr_open", gating, func(t *testing.T, f *obligationPrompt) { f.plainCarrier(t, resumeKindPROpen, nil) }},
+		{"gating_push", gating, func(t *testing.T, f *obligationPrompt) { f.plainCarrier(t, resumeKindPush, nil) }},
+		{"gating_exempt_park", gating, func(t *testing.T, f *obligationPrompt) { f.exemptPark(t, f.report.BaseSHA, f.legacyParkedPayload(t)) }},
+		{"null_list_pr_open", gating, func(t *testing.T, f *obligationPrompt) {
+			f.plainCarrier(t, resumeKindPROpen, map[string]any{"review_obligation": reviewObligation{HeadSHA: f.report.HeadSHA, StageAttempt: "a"}})
+		}},
+		{"spec_unparseable", gating, func(t *testing.T, f *obligationPrompt) {
+			f.plainCarrier(t, resumeKindPROpen, nil)
+			f.runRow.WorkflowSpec = []byte("version: [unterminated")
+		}},
+		{"plan_read_error", gating, func(t *testing.T, f *obligationPrompt) {
+			// The handler refuses a plan fault of its own earlier, so the fault arms
+			// at the resume resolver's first read: admission is what meets it.
+			f.plainCarrier(t, resumeKindPROpen, nil)
+			armed := false
+			f.s.cfg.ArtifactRepo = armedListArtifactRepo{Repository: f.s.cfg.ArtifactRepo, armed: &armed}
+			f.s.cfg.AuditRepo = armOnCategoryAudit{Repository: f.s.cfg.AuditRepo, category: "pull_request_failed", armed: &armed}
+		}},
+	} {
+		t.Run("negative/"+tc.name, func(t *testing.T) {
+			f := newObligationPrompt(t, tc.spec)
+			tc.seed(t, f)
+			assertObligationDeclined(t, f.prompt(t, reviewObligationRunnerCapabilities), tc.name)
+			assertDiscardReason(t, f, "review_obligation_unknown")
+		})
+	}
+	for _, tc := range []struct {
+		name string
+		spec []byte
+		seed func(t *testing.T, f *obligationPrompt)
+		none bool
+	}{
+		{"advisory", specImplementAdvisoryReviewers, func(t *testing.T, f *obligationPrompt) { f.plainCarrier(t, resumeKindPROpen, nil) }, true},
+		{"no_pass", specNoReviewers, func(t *testing.T, f *obligationPrompt) { f.plainCarrier(t, resumeKindPush, nil) }, true},
+		{"reverify", gating, func(t *testing.T, f *obligationPrompt) { f.plainCarrier(t, resumeKindReverify, nil) }, true},
+		{"known_none", gating, func(t *testing.T, f *obligationPrompt) { f.plainCarrier(t, resumeKindPROpen, f.knownNone()) }, true},
+		{"known_required_capable", gating, func(t *testing.T, f *obligationPrompt) { f.requiredCarrier(t, resumeKindPush) }, false},
+	} {
+		t.Run("positive/"+tc.name, func(t *testing.T) {
+			f := newObligationPrompt(t, tc.spec)
+			tc.seed(t, f)
+			keys := f.prompt(t, reviewObligationRunnerCapabilities)
+			if string(keys["held_commit_sha"]) != `"`+f.report.HeadSHA+`"` {
+				t.Fatalf("held_commit_sha = %s, want the resume served", keys["held_commit_sha"])
+			}
+			if tc.none {
+				assertProvenNone(t, keys, f.report.HeadSHA)
+			} else if got, want := promptFieldsBytes(keys), string(loadReviewObligationWire(t).PromptFields); got != want {
+				t.Errorf("prompt fields = %s, want %s", got, want)
+			}
+			if got := f.discardReasons(t); len(got) != 0 {
+				t.Errorf("a served resume discards nothing, got %v", got)
+			}
+		})
+	}
+	t.Run("positive/child_push", func(t *testing.T) {
+		var au *exemptAuditFake
+		s, _, stageID, priv := exemptPromptFixtureRun(t, nil, childPushCheckpointAudit(&au), func(r *run.Run) {
+			parent := uuid.New()
+			r.DecomposedFrom = &parent
+			r.WorkflowSpec = specImplementGatingReviewers
+		})
+		keys := exemptBodyKeys(t, promptRequestWithCapabilities(t, s, stageID, priv, reviewObligationRunnerCapabilities), "/prompt")
+		assertProvenNone(t, keys, checkpointHeadSHA)
+		assertNoDiscardRow(t, au, "a served child resume")
+	})
+}
+
+// TestResolveHeldCommitExemption_ReviewObligation reads the obligation and the third
+// base rung off a resolved park.
+func TestResolveHeldCommitExemption_ReviewObligation(t *testing.T) {
+	gating, advisory := specImplementGatingReviewers, specImplementAdvisoryReviewers
+	resolve := func(f *obligationPrompt) (heldCommitResume, bool) {
+		return f.s.resolveHeldCommitExemption(context.Background(), f.runRow, f.stage, false)
+	}
+	t.Run("parked_required", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.exemptPark(t, "", goldenParkedPayload(t))
+		held, ok := resolve(f)
+		if !ok {
+			t.Fatal("a withheld base resolves through the third rung")
+		}
+		if held.baseSHA != f.report.BaseSHA {
+			t.Errorf("base = %q, want %q", held.baseSHA, f.report.BaseSHA)
+		}
+		if !reflect.DeepEqual(held.reviewObligation, f.report.ReviewObligation) {
+			t.Errorf("obligation = %+v, want the parked set", held.reviewObligation)
+		}
+		if held.discardTreeSHA != f.report.VerifiedTreeSHA {
+			t.Errorf("discard tree = %q, want the park's", held.discardTreeSHA)
+		}
+	})
+	t.Run("parked_empty", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		payload := recoveryPayload(t, map[string]any{"base_sha": f.report.BaseSHA, "review_obligation": f.knownNone()["review_obligation"]})
+		f.exemptPark(t, f.report.BaseSHA, payload)
+		held, ok := resolve(f)
+		if !ok || reviewObligationKnowledge(held.reviewObligation) != obligationKnownNone {
+			t.Fatalf("resolved %t, obligation %+v; a known-none park stays resumable", ok, held.reviewObligation)
+		}
+		assertProvenNone(t, f.prompt(t, capableRunnerCapabilities), f.report.HeadSHA)
+	})
+	t.Run("parked_absent_gating_declined", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		f.exemptPark(t, f.report.BaseSHA, f.legacyParkedPayload(t))
+		held, ok := resolve(f)
+		if !ok || held.reviewObligation != nil {
+			t.Fatalf("resolved %t, obligation %+v; no key is unknown", ok, held.reviewObligation)
+		}
+		assertObligationDeclined(t, f.prompt(t, reviewObligationRunnerCapabilities), "no key on a gating review")
+		assertDiscardReason(t, f, "review_obligation_unknown")
+	})
+	t.Run("parked_absent_advisory_served", func(t *testing.T) {
+		f := newObligationPrompt(t, advisory)
+		f.exemptPark(t, f.report.BaseSHA, f.legacyParkedPayload(t))
+		assertProvenNone(t, f.prompt(t, reviewObligationRunnerCapabilities), f.report.HeadSHA)
+	})
+	t.Run("parked_undecodable", func(t *testing.T) {
+		t.Run("no_base_withheld", func(t *testing.T) {
+			f := newObligationPrompt(t, gating)
+			f.exemptPark(t, "", []byte(`{"review_obligation":"not an object","required_review_base_sha":"abc"}`))
+			if _, ok := resolve(f); ok {
+				t.Fatal("an undecodable obligation supplies no base")
+			}
+		})
+		t.Run("base_present_is_unknown", func(t *testing.T) {
+			f := newObligationPrompt(t, gating)
+			f.exemptPark(t, f.report.BaseSHA, []byte(`{"review_obligation":"not an object"}`))
+			if held, ok := resolve(f); !ok || held.reviewObligation != nil {
+				t.Fatalf("resolved %t, obligation %+v; an undecodable key proves nothing", ok, held.reviewObligation)
+			}
+			assertObligationDeclined(t, f.prompt(t, reviewObligationRunnerCapabilities), "an undecodable key on a gating review")
+			assertDiscardReason(t, f, "review_obligation_unknown")
+		})
+	})
+}
+
+// postPark drives the real scope_park route with the golden's coordinates.
+func (f *obligationPrompt) postPark(t *testing.T, obligation *reviewObligation) {
+	t.Helper()
+	r := f.report
+	body := recoveryPayload(t, map[string]any{
+		"outcome": "scope_park", "branch": r.Branch, "head_sha": r.HeadSHA, "base_sha": r.BaseSHA,
+		"verified_tree_sha": r.VerifiedTreeSHA, "missing_paths": []string{"backend/internal/foo/bar.go"},
+		"title": r.Title, "body": r.Body, "review_obligation": obligation,
+	})
+	if w := shipPRRequest(t, f.s, f.runRow.ID, f.stage.ID, f.priv, body, ""); w.Code != http.StatusOK {
+		t.Fatalf("setup: park status = %d:\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestExemptPark_KnownRequired_ResumesWithObligation drives the real park route,
+// the real exempt decision and the signed prompt: the withheld base comes back only
+// through the required key.
+func TestExemptPark_KnownRequired_ResumesWithObligation(t *testing.T) {
+	gating := specImplementGatingReviewers
+	parkedAndExempted := func(t *testing.T) *obligationPrompt {
+		t.Helper()
+		f := newObligationPrompt(t, gating)
+		f.postPark(t, f.report.ReviewObligation)
+		if f.stage.ScopeCompletenessPark == nil || f.stage.ScopeCompletenessPark.BaseSHA != "" {
+			t.Fatalf("setup: park row = %+v, want its base withheld", f.stage.ScopeCompletenessPark)
+		}
+		if w := postScopeCompletenessDecision(t, f.s, f.runRow.ID, `{"decision":"exempt","reason":"operator accepted"}`, operatorWriteStages); w.Code != http.StatusOK {
+			t.Fatalf("setup: exempt status = %d:\n%s", w.Code, w.Body.String())
+		}
+		return f
+	}
+	t.Run("served", func(t *testing.T) {
+		f := parkedAndExempted(t)
+		keys := f.prompt(t, reviewObligationRunnerCapabilities)
+		if string(keys["held_commit_base_sha"]) != `"`+f.report.BaseSHA+`"` {
+			t.Errorf("held_commit_base_sha = %s, want the value from required_review_base_sha", keys["held_commit_base_sha"])
+		}
+		if string(keys["open_pr_from_held_commit"]) != "true" || string(keys["held_commit_sha"]) != `"`+f.report.HeadSHA+`"` {
+			t.Errorf("held-commit fields not served: %s %s", keys["open_pr_from_held_commit"], keys["held_commit_sha"])
+		}
+		if got, want := promptFieldsBytes(keys), string(loadReviewObligationWire(t).PromptFields); got != want {
+			t.Errorf("prompt fields = %s, want %s", got, want)
+		}
+	})
+	t.Run("old_runner_total_decline", func(t *testing.T) {
+		f := parkedAndExempted(t)
+		assertObligationDeclined(t, f.prompt(t, capableRunnerCapabilities), "a four-token runner")
+		assertDiscardReason(t, f, "runner_review_obligation_capability_absent")
+	})
+	withPayload := func(t *testing.T, payload []byte) *obligationPrompt {
+		t.Helper()
+		f := newObligationPrompt(t, gating)
+		f.exemptPark(t, "", payload)
+		return f
+	}
+	declinedNoBase := func(t *testing.T, f *obligationPrompt) {
+		t.Helper()
+		if held, ok := f.s.resolveHeldCommitExemption(context.Background(), f.runRow, f.stage, false); ok {
+			t.Fatalf("resolved base %q; this park has no usable base", held.baseSHA)
+		}
+		assertObligationDeclined(t, f.prompt(t, reviewObligationRunnerCapabilities), "no usable base")
+	}
+	t.Run("head_mismatch_declined", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		other := *f.report.ReviewObligation
+		other.HeadSHA = "ffffffffffffffffffffffffffffffffffffffff"
+		declinedNoBase(t, withPayload(t, recoveryPayload(t, map[string]any{"required_review_base_sha": f.report.BaseSHA, "review_obligation": other})))
+	})
+	t.Run("missing_key_declined", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		declinedNoBase(t, withPayload(t, recoveryPayload(t, map[string]any{"review_obligation": f.report.ReviewObligation})))
+	})
+	t.Run("known_none_key_ignored", func(t *testing.T) {
+		f := newObligationPrompt(t, gating)
+		declinedNoBase(t, withPayload(t, recoveryPayload(t, map[string]any{"required_review_base_sha": f.report.BaseSHA, "review_obligation": f.knownNone()["review_obligation"]})))
+	})
+	t.Run("fixup_refused", func(t *testing.T) {
+		f := parkedAndExempted(t)
+		if _, ok := f.s.resolveHeldCommitExemption(context.Background(), f.runRow, f.stage, true); ok {
+			t.Fatal("a fix-up dispatch re-invokes the agent")
+		}
+	})
+	t.Run("child_refused", func(t *testing.T) {
+		f := parkedAndExempted(t)
+		parent := uuid.New()
+		f.runRow.DecomposedFrom = &parent
+		if _, ok := f.s.resolveHeldCommitExemption(context.Background(), f.runRow, f.stage, false); ok {
+			t.Fatal("a decomposition child never opens a PR from the held commit")
+		}
+	})
+	t.Run("build_required_refused", func(t *testing.T) {
+		f := parkedAndExempted(t)
+		f.stage.ScopeCompletenessPark.BuildRequiredPaths = []string{"backend/internal/foo/bar.go"}
+		if _, ok := f.s.resolveHeldCommitExemption(context.Background(), f.runRow, f.stage, false); ok {
+			t.Fatal("a build-required park's tree is red")
+		}
+	})
+}
+
+// TestReviewObligation_ReportToPromptSeam_Golden crosses the real report route and
+// the real prompt with only the golden's bytes between them.
+func TestReviewObligation_ReportToPromptSeam_Golden(t *testing.T) {
+	f := newObligationPrompt(t, specImplementGatingReviewers)
+	sections := loadReviewObligationWire(t)
+	if w := shipPRRequest(t, f.s, f.runRow.ID, f.stage.ID, f.priv, sections.FailureReport, ""); w.Code != http.StatusOK {
+		t.Fatalf("failure report status = %d:\n%s", w.Code, w.Body.String())
+	}
+	f.stage.State = run.StageStatePending
+	keys := f.prompt(t, reviewObligationRunnerCapabilities)
+	if got, want := promptFieldsBytes(keys), string(sections.PromptFields); got != want {
+		t.Errorf("prompt fields differ from the golden:\n got  %s\n want %s", got, want)
+	}
+	if string(keys["held_commit_sha"]) != `"`+f.report.HeadSHA+`"` || string(keys["held_commit_base_sha"]) != `"`+f.report.BaseSHA+`"` {
+		t.Errorf("coordinates not served: %s %s", keys["held_commit_sha"], keys["held_commit_base_sha"])
+	}
+}
+
+// TestReviewObligation_RepeatedResumeFailures_RetainThroughBackend repeats report
+// and prompt across three failed resumes, each on its own attempt: the set and head
+// never change, and the retained report stays bound to the attempt it reports from.
+func TestReviewObligation_RepeatedResumeFailures_RetainThroughBackend(t *testing.T) {
+	f := newObligationPrompt(t, specImplementGatingReviewers)
+	served := f.report.ReviewObligation
+	for i := range 3 {
+		token := run.StageAttemptToken(f.stage.DispatchedAt)
+		report := f.report
+		report.ReviewObligation = &reviewObligation{HeadSHA: served.HeadSHA, StageAttempt: token, SupplementalScopeExemptions: served.SupplementalScopeExemptions}
+		f.stage.State = run.StageStateRunning
+		if w := shipPRRequest(t, f.s, f.runRow.ID, f.stage.ID, f.priv, recoveryPayload(t, report), ""); w.Code != http.StatusOK {
+			t.Fatalf("cycle %d: failure report status = %d:\n%s", i, w.Code, w.Body.String())
+		}
+		next := f.stage.DispatchedAt.Add(time.Minute)
+		f.stage.DispatchedAt = &next
+		f.stage.State = run.StageStatePending
+		keys := f.prompt(t, reviewObligationRunnerCapabilities)
+		var got reviewObligation
+		if err := json.Unmarshal(keys["held_commit_review_obligation"], &got); err != nil {
+			t.Fatalf("cycle %d: decode served obligation %s: %v", i, keys["held_commit_review_obligation"], err)
+		}
+		if got.HeadSHA != f.report.HeadSHA || got.StageAttempt != token || !reflect.DeepEqual(got.SupplementalScopeExemptions, f.report.ReviewObligation.SupplementalScopeExemptions) {
+			t.Errorf("cycle %d: served %+v, want the set retained at the recorded head and attempt %s", i, got, token)
+		}
+		served = &got
+	}
+	if got := f.discardReasons(t); len(got) != 0 {
+		t.Errorf("no resume here was declined, got %v", got)
 	}
 }

@@ -696,7 +696,7 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 			return exitFailure
 		}
 		issuedKey = key
-		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
+		path, sType, agentTimeoutSecs, specVerifyCmd, specVerifyTimeoutSecs, specVerifyMaxIterations, decomposedFromRunID, minRunnerVersion, agentVersionRange, agentSelfRetry, maxRetriesSnapshot, retryAttempt, scopeFiles, commitAuthorName, commitAuthorEmail, fixup, fixupBranch, expectedHeadSHA, promptBindingAssertions, applyPatches, sliceIndex, promptScopeExemptions, openPRFromHeldCommit, heldCommitSHA, heldCommitBranch, heldCommitBaseSHA, heldCommitResumeKind, heldCommitVerifiedTreeSHA, promptSupportsPushResume, heldCommitPRTitle, heldCommitPRBody, promptImplementModel, promptPlanModel, promptEgressTargetHosts, promptAcceptanceCriteriaIDs, promptAcceptanceExpectedHeadSHA, promptDiffCoverage, promptConflictResolution, promptAcceptanceReplay, promptForgeWrites, promptStageAttempt, promptReasoningEffort, promptGateContainer, promptMergeCandidateVerify, fetchedCounterfactuals, promptFixupPolicyIncrement, promptHeldCommitReviewObligation, promptSupportsReviewObligationResume, fetchErr := fetchPromptToFile(ctx, client, cfg, key, logSink)
 		stageAttempt = promptStageAttempt
 		// Arm the retirement-drop reporter IMMEDIATELY (E72.4 / #3328, binding
 		// condition 1) — and BEFORE the fetchErr check (#3396): the guarantee
@@ -801,6 +801,12 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 		exemptResumeKind = heldCommitResumeKind
 		exemptHeldVerifiedTreeSHA = heldCommitVerifiedTreeSHA
 		supportsPushResume = promptSupportsPushResume
+		// Required-review retention (ADR-140 (#5047) D9): what the backend served and
+		// whether it advertised the capability, plus this dispatch's attempt token
+		// the reports bind to. Held on cfg so every arming site reads one answer.
+		cfg.heldReviewObligation = promptHeldCommitReviewObligation
+		cfg.backendSupportsReviewObligation = promptSupportsReviewObligationResume
+		cfg.stageAttempt = promptStageAttempt
 		exemptPRTitle = heldCommitPRTitle
 		exemptPRBody = heldCommitPRBody
 		fixupExpectedHeadSHA = expectedHeadSHA
@@ -1092,6 +1098,19 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 	if exemptOpenPR && cfg.fixup {
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"held_commit_fields_ignored_on_fixup","run_id":%q,"stage_id":%q,"held_sha":%q}`+"\n",
+			cfg.runID, cfg.stageID, exemptHeldSHA)
+		exemptOpenPR = false
+	}
+	// REQUIRED-REVIEW GUARD (ADR-140 (#5047) D9, Runner skew). A backend that does
+	// not advertise the capability, or sends no obligation list, proves nothing:
+	// resuming would ship a held commit that may still owe a required review. So
+	// this dispatch runs the ordinary agent pass, the same fallback a reverify
+	// precheck miss takes. The cost is one agent pass per such resume during skew,
+	// non-gating configurations included, because the runner cannot read review
+	// configuration.
+	if exemptOpenPR && !heldResumeObligationProven(cfg, exemptResumeKind) {
+		_, _ = fmt.Fprintf(logSink,
+			`{"event":"held_commit_resume_path","run_id":%q,"stage_id":%q,"path":"fallback_agent_rerun","reason":"review_obligation_unknown_backend","held_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, exemptHeldSHA)
 		exemptOpenPR = false
 	}
@@ -3599,6 +3618,9 @@ func run(args []string, logSink io.Writer) (exitCode int) {
 						resumeKind: resumeKindReverify,
 						prTitle:    title, prBody: body,
 					}
+					// Armed before any delta exists, so it proves none (nil set). A
+					// child or a fix-up reports no reverify.
+					bindReviewObligation(cfg, logSink, cp, nil)
 					_, _ = fmt.Fprintf(logSink,
 						`{"event":"reverify_checkpoint_armed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"ref":%q}`+"\n",
 						cfg.runID, cfg.stageID, routing.branch, verifyPin.headSHA, verifyPin.baseSHA, verifyPin.ref)
@@ -4141,16 +4163,19 @@ type reasoningEffort struct {
 // gate_container as the backend resolved it; nil when none is declared.
 // fixupPolicyIncrement (#4391) is true only on a decomposed parent's fix-up:
 // run() then bounds the policy diff to the fix-up's increment.
+// heldCommitReviewObligation and supportsReviewObligationResume (ADR-140 (#5047)
+// D9) are the required review a held-commit resume retains and the backend half
+// of its capability handshake; nil and false against a backend predating them.
 // The temp file is 0o600 — bundle-style defense in depth, since prompts
 // may include issue bodies that the customer would prefer not to leave on
 // the runner's filesystem world-readable.
-func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, err error) {
+func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key *upload.IssuedKey, logSink io.Writer) (path string, stageType string, agentTimeoutSecs int, verifyCmd string, verifyTimeoutSecs int, verifyMaxIterations int, decomposedFromRunID string, minRunnerVersion string, agentVersionRange string, agentSelfRetry bool, maxRetriesSnapshot int, retryAttempt int, scopeFiles []upload.ScopeFile, commitAuthorName string, commitAuthorEmail string, fixup bool, fixupBranch string, fixupExpectedHeadSHA string, bindingAssertions []upload.BindingAssertion, fixupApplyPatches []upload.FixupApplyPatch, sliceIndex int, scopeExemptions []upload.ScopeExemption, openPRFromHeldCommit bool, heldCommitSHA string, heldCommitBranch string, heldCommitBaseSHA string, heldCommitResumeKind string, heldCommitVerifiedTreeSHA string, supportsPushResume bool, heldCommitPRTitle string, heldCommitPRBody string, implementModel string, planModel string, egressTargetHosts []string, acceptanceCriteriaIDs []string, acceptanceExpectedHeadSHA string, diffCoverage *upload.DiffCoverageConfig, conflictResolution *conflictResolutionRequest, acceptanceReplay acceptanceReplayInputs, forgeWrites string, stageAttempt string, effort reasoningEffort, gateContainer *upload.GateContainerConfig, mergeCandidate *mergeCandidateVerifyRequest, counterfactuals []upload.CounterfactualSpec, fixupPolicyIncrement bool, heldCommitReviewObligation *upload.ReviewObligation, supportsReviewObligationResume bool, err error) {
 	got, fetchErr := client.FetchPrompt(ctx, upload.FetchPromptArgs{
 		StageID:    cfg.stageID,
 		PrivateKey: key.PrivateKey,
 	})
 	if fetchErr != nil {
-		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, fetchErr
+		return "", "", 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplayInputs{}, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fetchErr
 	}
 	_, _ = fmt.Fprintf(logSink,
 		`{"event":"prompt_fetched","stage_id":%q,"stage_type":%q,"prompt_hash":%q,"prompt_bytes":%d}`+"\n",
@@ -4165,20 +4190,20 @@ func fetchPromptToFile(ctx context.Context, client uploadClient, cfg config, key
 	acceptanceReplay = acceptanceReplayInputsFromPrompt(got)
 	tmp, tmpErr := os.CreateTemp("", "fishhawk-prompt-*.txt")
 	if tmpErr != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("create prompt temp file: %w", tmpErr)
 	}
 	if err := os.Chmod(tmp.Name(), 0o600); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("chmod prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("chmod prompt temp file: %w", err)
 	}
 	if _, err := tmp.WriteString(got.Prompt); err != nil {
 		_ = tmp.Close()
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("write prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("write prompt temp file: %w", err)
 	}
 	if err := tmp.Close(); err != nil {
-		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, fmt.Errorf("close prompt temp file: %w", err)
+		return "", stageType, 0, "", 0, 0, "", "", "", false, 0, 0, nil, "", "", false, "", "", nil, nil, 0, nil, false, "", "", "", "", "", false, "", "", "", "", nil, nil, "", nil, nil, acceptanceReplay, "", "", reasoningEffort{}, nil, nil, nil, false, nil, false, fmt.Errorf("close prompt temp file: %w", err)
 	}
-	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, nil
+	return tmp.Name(), got.StageType, got.AgentTimeoutSeconds, got.VerifyCommand, got.VerifyTimeoutSeconds, got.VerifyMaxIterations, got.DecomposedFromRunID, got.MinRunnerVersion, got.AgentVersionRange, got.AgentSelfRetry, got.MaxRetriesSnapshot, got.RetryAttempt, got.ScopeFiles, got.CommitAuthorName, got.CommitAuthorEmail, got.Fixup, got.FixupBranch, got.FixupExpectedHeadSHA, got.BindingAssertions, got.FixupApplyPatches, got.SliceIndex, got.ScopeExemptions, got.OpenPRFromHeldCommit, got.HeldCommitSHA, got.HeldCommitBranch, got.HeldCommitBaseSHA, got.HeldCommitResumeKind, got.HeldCommitVerifiedTreeSHA, got.SupportsPushResume, got.HeldCommitPRTitle, got.HeldCommitPRBody, got.ImplementModel, got.PlanModel, got.EgressTargetHosts, got.AcceptanceCriteriaIDs, got.AcceptanceExpectedHeadSHA, got.DiffCoverage, conflictResolutionFromPrompt(got), acceptanceReplayInputsFromPrompt(got), got.ForgeWrites, got.StageAttempt, reasoningEffort{value: got.ReasoningEffort, source: got.ReasoningEffortSource}, got.GateContainer, mergeCandidateVerifyFromPrompt(got), got.Counterfactuals, got.FixupPolicyIncrement, got.HeldCommitReviewObligation, got.SupportsReviewObligationResume, nil
 }
 
 func logStartup(w io.Writer, cfg config) {
@@ -9666,6 +9691,10 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 				// retry back to the placeholder, the same repeatable-resume property
 				// #2169 established for the coordinates.
 				prTitle: servedPRTitle, prBody: servedPRBody,
+				// ADR-140 (#5047) D9: a failed resume keeps the served required
+				// review, anchored to the head this resume holds, so repeated
+				// failures never lose it.
+				reviewObligation: heldReviewObligationFor(cfg, heldSHA),
 			}
 		}
 		// Best-effort: this closure returns exitFailure, so the detached reaper
@@ -10008,6 +10037,17 @@ func openHeldCommitPR(ctx context.Context, cfg config, heldSHA, heldBranch, held
 	if artifactFallbackReason != prBodyReasonNone {
 		heldArtifactFields["pr_body_fallback_reason"] = string(artifactFallbackReason)
 	}
+	// ADR-140 (#5047) D9: the resumed upload re-enters the backend's required
+	// gating path only when it names the paths it owes. Marshalled as the ordinary
+	// ship marshals them; a served empty set omits the key, so those bytes stay
+	// byte-identical to testdata/wire/held_commit_pr_artifact.json.
+	if cfg.heldReviewObligation != nil && len(cfg.heldReviewObligation.SupplementalScopeExemptions) > 0 {
+		wire := make([]scopeExemptionEvidence, 0, len(cfg.heldReviewObligation.SupplementalScopeExemptions))
+		for _, e := range cfg.heldReviewObligation.SupplementalScopeExemptions {
+			wire = append(wire, scopeExemptionEvidence{Path: e.Path, Reason: e.Reason})
+		}
+		heldArtifactFields["supplemental_scope_exemptions"] = wire
+	}
 	artifactBody, _ := json.Marshal(heldArtifactFields)
 	shipRes, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 		RunID:      cfg.runID,
@@ -10117,6 +10157,9 @@ const (
 	notArmedTreeMismatch            = "tree_mismatch"
 	notArmedBaseUnresolvable        = "base_unresolvable"
 	notArmedNotPushTransport        = "not_push_transport"
+	// notArmedReviewObligationBackendAbsent (ADR-140 (#5047) D9): the report would
+	// hold a required review an old backend cannot retain.
+	notArmedReviewObligationBackendAbsent = "review_obligation_backend_capability_absent"
 )
 
 // pushCheckpoint is the PR-open CHECKPOINT (#2169): the coordinates of a
@@ -10166,6 +10209,89 @@ type pushCheckpoint struct {
 	// once at open time (see prTitleAndBodyParts).
 	prTitle string
 	prBody  string
+
+	// reviewObligation is the required supplemental review this checkpoint's head
+	// still owes (ADR-140 (#5047) D9). nil is unknown and leaves the report's bytes
+	// byte-identical; an empty list is known none. Set only by bindReviewObligation
+	// and the resume re-arm closures.
+	reviewObligation *upload.ReviewObligation
+}
+
+// reviewObligationFor renders a recorded head's obligation. The list is never
+// nil, so a report with nothing required says known none rather than unknown.
+func reviewObligationFor(headSHA, attempt string, set []upload.ScopeExemption) *upload.ReviewObligation {
+	list := make([]upload.ScopeExemption, 0, len(set))
+	list = append(list, set...)
+	return &upload.ReviewObligation{HeadSHA: headSHA, StageAttempt: attempt, SupplementalScopeExemptions: list}
+}
+
+// reviewObligationForReport is what a first-pass report at headSHA states: this
+// pass's supplemental delta at this dispatch's attempt, or nil against a backend
+// that did not advertise the capability.
+func reviewObligationForReport(cfg config, headSHA string, supplemental []scopeExemption) *upload.ReviewObligation {
+	if !cfg.backendSupportsReviewObligation {
+		return nil
+	}
+	set := make([]upload.ScopeExemption, 0, len(supplemental))
+	for _, e := range supplemental {
+		set = append(set, upload.ScopeExemption{Path: e.Path, Reason: e.Reason})
+	}
+	return reviewObligationFor(headSHA, cfg.stageAttempt, set)
+}
+
+// bindReviewObligation is the one control every checkpoint arm passes through
+// (ADR-140 (#5047) D9). On an armed checkpoint it records the head's obligation
+// when the backend advertised the capability. Against a backend that did not, an
+// empty set changes nothing, so the legacy bytes stand, and a non-empty set
+// DISARMS the checkpoint: the old backend would serve the coordinates back with
+// the obligation gone, and the retry would ship past a required review. The cost
+// of a disarm is one ordinary agent pass.
+func bindReviewObligation(cfg config, logSink io.Writer, checkpoint *pushCheckpoint, supplemental []scopeExemption) {
+	if checkpoint == nil || !checkpoint.armed {
+		return
+	}
+	if cfg.backendSupportsReviewObligation {
+		checkpoint.reviewObligation = reviewObligationForReport(cfg, checkpoint.headSHA, supplemental)
+		return
+	}
+	if len(supplemental) == 0 {
+		return
+	}
+	_, _ = fmt.Fprintf(logSink,
+		`{"event":"push_checkpoint_not_armed","run_id":%q,"stage_id":%q,"reason":%q}`+"\n",
+		cfg.runID, cfg.stageID, notArmedReviewObligationBackendAbsent)
+	*checkpoint = pushCheckpoint{backendSupportsPushResume: checkpoint.backendSupportsPushResume}
+}
+
+// heldReviewObligationFor is what a failed resume re-reports: the obligation this
+// dispatch was served, anchored to the head it holds at this dispatch's attempt.
+// A served nil is proven none here, because heldResumeObligationProven only lets
+// reverify and child kinds through without a list. nil against a backend that did
+// not advertise the capability, keeping those report bytes.
+func heldReviewObligationFor(cfg config, heldSHA string) *upload.ReviewObligation {
+	if !cfg.backendSupportsReviewObligation {
+		return nil
+	}
+	var served []upload.ScopeExemption
+	if cfg.heldReviewObligation != nil {
+		served = cfg.heldReviewObligation.SupplementalScopeExemptions
+	}
+	return reviewObligationFor(heldSHA, cfg.stageAttempt, served)
+}
+
+// heldResumeObligationProven reports whether a served held-commit resume may run
+// without an agent pass (ADR-140 (#5047) D9). Reverify and child kinds prove none
+// by construction: a reverify carrier is armed before any delta exists and a
+// child's ship carries no such field. Otherwise only an advertising backend's
+// recorded list proves anything. An absent or null list is unknown.
+func heldResumeObligationProven(cfg config, kind string) bool {
+	if cfg.decomposedFromRunID != "" || kind == resumeKindReverify {
+		return true
+	}
+	if !cfg.backendSupportsReviewObligation {
+		return false
+	}
+	return cfg.heldReviewObligation != nil && cfg.heldReviewObligation.SupplementalScopeExemptions != nil
 }
 
 // gitRevParseIn resolves a single revision inside repoDir, returning the
@@ -11225,6 +11351,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// arm ships a PR from an unintended tree, a wrong omission costs exactly
 		// what happens today.
 		maybeArmPushFailureCheckpoint(ctx, cfg, logSink, checkpoint, supportsPushResume, err, repoDir, branch, verifiedTreeSHA, agentPRTitle, agentPRBody)
+		// Before the pin, so a disarm pins nothing (ADR-140 (#5047) D9).
+		bindReviewObligation(cfg, logSink, checkpoint, supplementalExemptions)
 		// #4079: pin every recovery point under refs/fishhawk/checkpoints/ and
 		// NAME it in the reason, so the pull_request_failed audit row says where
 		// the work is. The ErrPushFailed arm's held commit is pinned here; the
@@ -11236,6 +11364,11 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		// byte-identical.
 		armedRef := pinPushFailureCheckpoint(ctx, cfg, logSink, checkpoint, repoDir)
 		baseFetchArmedRef, stashRef := maybeArmBaseFetchFailureCheckpoint(ctx, cfg, logSink, checkpoint, supportsPushResume, err, repoDir, branch, verifiedTreeSHA, commitMessage, agentPRTitle, agentPRBody)
+		// This arm serves decomposition children only, whose set is always empty, so
+		// it can never disarm the commit it just pinned.
+		if errors.Is(err, gitops.ErrBaseFetchFailed) {
+			bindReviewObligation(cfg, logSink, checkpoint, supplementalExemptions)
+		}
 		if baseFetchArmedRef != "" {
 			armedRef = baseFetchArmedRef
 		}
@@ -11514,6 +11647,14 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"scope_completeness_parked","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q,"tree_sha":%q,"missing_paths":%s,"unsatisfied_assertions":%s,"build_required_paths":%s}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA, cap.TreeSHA, missingJSON, unsatisfiedJSON, buildRequiredJSON)
+		// ADR-140 (#5047) D9: a park can own a required review, and a backend that
+		// cannot retain one would lose it behind an exempt decision. Fail instead, so
+		// the retry is an ordinary agent pass. The push above already landed; nothing
+		// resumes from it because this path arms no checkpoint.
+		if !cfg.backendSupportsReviewObligation && len(supplementalExemptions) > 0 {
+			return fmt.Errorf("report scope-completeness park: %s: backend cannot retain the %d required supplemental review path(s) at %s",
+				notArmedReviewObligationBackendAbsent, len(supplementalExemptions), cap.HeadSHA)
+		}
 		if _, err := client.ShipPullRequest(ctx, upload.ShipPullRequestArgs{
 			RunID:                 cfg.runID,
 			StageID:               cfg.stageID,
@@ -11532,6 +11673,8 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			// documented issue-context synthesis.
 			PRTitle: agentPRTitle,
 			PRBody:  agentPRBody,
+			// nil against a backend without the capability, keeping those bytes.
+			ReviewObligation: reviewObligationForReport(cfg, cap.HeadSHA, supplementalExemptions),
 		}); err != nil {
 			return fmt.Errorf("report scope-completeness park: %w", err)
 		}
@@ -11619,6 +11762,9 @@ func openPRAndShipArtifact(ctx context.Context, cfg config, logSink io.Writer, c
 			prTitle: agentPRTitle,
 			prBody:  agentPRBody,
 		}
+		// ADR-140 (#5047) D9. A disarm against an old backend leaves the report
+		// carrying no coordinates, so the retry is an ordinary agent pass.
+		bindReviewObligation(cfg, logSink, checkpoint, supplementalExemptions)
 		_, _ = fmt.Fprintf(logSink,
 			`{"event":"pr_open_checkpoint_armed","run_id":%q,"stage_id":%q,"branch":%q,"head_sha":%q,"base_sha":%q,"verified_tree_sha":%q}`+"\n",
 			cfg.runID, cfg.stageID, branch, cap.HeadSHA, cap.BaseSHA, verifiedTreeSHA)
@@ -11820,6 +11966,9 @@ func reportPullRequestFailure(ctx context.Context, cfg config, logSink io.Writer
 			checkpoint.resumeKind == resumeKindReverify {
 			args.ResumeKind = checkpoint.resumeKind
 		}
+		// ADR-140 (#5047) D9: nil on every path without the capability and on a
+		// discard, keeping those bodies byte-identical.
+		args.ReviewObligation = checkpoint.reviewObligation
 	}
 	if _, err := client.ShipPullRequest(ctx, args); err != nil {
 		_, _ = fmt.Fprintf(logSink,

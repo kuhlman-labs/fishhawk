@@ -236,17 +236,19 @@ func TestInvokeUngrounded_ClaudeNoDenyRules(t *testing.T) {
 // TestInvoke_ClaudeEffortFlag pins the reviewer effort pin (E28.5 / #3896): a
 // declared Config.ReasoningEffort lands as the `--effort <e>` pair right after
 // `--model`, and an ABSENT effort leaves the argv byte-identical to the
-// pre-#3896 spawn — no `--effort` token at all, not `--effort ""`.
+// no-effort spawn — no `--effort` token at all, not `--effort ""`. It also pins
+// the #5113 stdin prompt transport's argv half: `--input-format text` is present
+// and the prompt ("review") is NOT an argv element — no trailing `-p <prompt>`.
 func TestInvoke_ClaudeEffortFlag(t *testing.T) {
-	// The exact pre-#3896 ungrounded argv; the absent case must equal it.
+	// The exact no-effort ungrounded argv; the absent case must equal it.
 	preChange := []string{
 		"claude",
 		"--print",
 		"--output-format", "json",
+		"--input-format", "text",
 		"--model", "claude-sonnet-4-6",
 		"--strict-mcp-config",
 		"--mcp-config", `{"mcpServers":{}}`,
-		"-p", "review",
 	}
 	run := func(effort string) []string {
 		t.Helper()
@@ -265,7 +267,7 @@ func TestInvoke_ClaudeEffortFlag(t *testing.T) {
 
 	t.Run("set", func(t *testing.T) {
 		argv := run("xhigh")
-		want := slices.Concat(preChange[:6], []string{"--effort", "xhigh"}, preChange[6:])
+		want := slices.Concat(preChange[:8], []string{"--effort", "xhigh"}, preChange[8:])
 		if !slices.Equal(argv, want) {
 			t.Errorf("argv = %q\nwant   %q", argv, want)
 		}
@@ -276,7 +278,7 @@ func TestInvoke_ClaudeEffortFlag(t *testing.T) {
 			t.Errorf("argv %q carries --effort with no declared effort", argv)
 		}
 		if !slices.Equal(argv, preChange) {
-			t.Errorf("argv = %q\nwant byte-identical pre-#3896 argv %q", argv, preChange)
+			t.Errorf("argv = %q\nwant byte-identical no-effort argv %q", argv, preChange)
 		}
 	})
 }

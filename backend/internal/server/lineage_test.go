@@ -536,7 +536,10 @@ func TestVerifyBranchLineage_LedgerDegradesOnReadError(t *testing.T) {
 	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
 		State: run.StageStateRunning, RequiresApproval: true}
 	s, sf, au, rr := newLineageServer(t, gh, runRow, stage)
-	au.listByCategoryErr = errors.New("audit read boom") // ledger category reads fail
+	// Ledger category reads fail. Review and obligation reads stay healthy: a fault
+	// there answers 500 and moves nothing (ADR-140 (#5047) D9), which
+	// TestShipPullRequest_ReviewObligationMissing_Refused/list_read_error pins.
+	s.cfg.AuditRepo = &categoryErrAudit{auditFake: au, errFor: lineageLedgerReadFault(errors.New("audit read boom"))}
 	priv, _ := sf.issue(t, runID)
 
 	w := shipPRRequest(t, s, runID, stageID, priv, mustPRBody(t, head), "")
@@ -549,6 +552,47 @@ func TestVerifyBranchLineage_LedgerDegradesOnReadError(t *testing.T) {
 	if !transitionedTo(rr, run.StageStateAwaitingApproval) {
 		t.Error("ledger degradation path did not advance the happy path")
 	}
+}
+
+// guardReadsItsOwnTxRepo models the store's guarded edge, whose evidence read runs
+// inside the edge's own transaction rather than through the handler's audit reads.
+// fixup_pushed is both a lineage ledger row and a variant mode row, so a fault on the
+// handler's ledger read must not reach the guard here. A fault on the guard's own
+// read answers 500: TestShipPullRequest_VariantEdge_Modes/read_error_500 pins that.
+type guardReadsItsOwnTxRepo struct {
+	*promptRunRepo
+	au *auditFake
+}
+
+func (r guardReadsItsOwnTxRepo) TransitionStageFromAttemptGuarded(ctx context.Context, id uuid.UUID, _, to run.StageState, _ string, completion *run.StageCompletion, guard run.StageEdgeGuard) (*run.Stage, error) {
+	stage, err := r.GetStage(ctx, id)
+	if err != nil {
+		return nil, err
+	}
+	var rows []run.StageEdgeGuardRow
+	for _, category := range guard.Categories {
+		entries, lerr := r.au.ListForRunByCategory(ctx, stage.RunID, category)
+		if lerr != nil {
+			return nil, lerr
+		}
+		for _, entry := range entries {
+			rows = append(rows, run.StageEdgeGuardRow{Category: category, Sequence: entry.Sequence, StageID: entry.StageID, Payload: entry.Payload})
+		}
+	}
+	if derr := guard.Decide(rows); derr != nil {
+		return nil, derr
+	}
+	return r.TransitionStage(ctx, id, to, completion)
+}
+
+// lineageLedgerReadFault fails every own-lineage head, vouch and integration ledger
+// category, leaving every other read healthy.
+func lineageLedgerReadFault(err error) map[string]error {
+	errFor := map[string]error{lineageVouchLedgerCategory: err, "slices_integrated": err, "integration_commit_recorded": err}
+	for _, category := range lineageLedgerCategories {
+		errFor[category] = err
+	}
+	return errFor
 }
 
 // TestVerifyBranchLineage_MultiPushLedgerReadErrorFailsOpen is the regression
@@ -577,24 +621,38 @@ func TestVerifyBranchLineage_MultiPushLedgerReadErrorFailsOpen(t *testing.T) {
 	stage := &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement,
 		State: run.StageStateRunning, RequiresApproval: true}
 	s, sf, au, rr := newLineageServer(t, gh, runRow, stage)
-	// h1's ledger entry exists, but every category read fails — so it cannot be
-	// loaded and the ledger is incomplete. Without fail-open, h1 is mis-flagged.
+	// h1's ledger entry exists, but every ledger category read fails — so it cannot
+	// be loaded and the ledger is incomplete. Without fail-open, h1 is mis-flagged.
+	// Review and obligation reads stay healthy: a fault there answers 500 and moves
+	// nothing (ADR-140 (#5047) D9), which TestShipPullRequest_VariantEdge_Modes pins.
 	au.seeded = append(au.seeded, &audit.Entry{
 		RunID:    &runID,
 		Category: "pull_request_opened",
 		Payload:  json.RawMessage(fmt.Sprintf(`{"head_sha":%q}`, h1)),
+	}, &audit.Entry{
+		RunID:    &runID,
+		StageID:  &stageID,
+		Category: "implement_review_started",
+		Payload:  json.RawMessage(`{"head_sha":""}`),
 	})
-	au.listByCategoryErr = errors.New("audit read boom")
+	s.cfg.AuditRepo = &categoryErrAudit{auditFake: au, errFor: lineageLedgerReadFault(errors.New("audit read boom"))}
+	s.cfg.RunRepo = guardReadsItsOwnTxRepo{promptRunRepo: rr, au: au}
 	priv, _ := sf.issue(t, runID)
 
 	// Although this is a fixup_pushed report, the #1932 re-review backstop is
-	// guarded OFF here: au.listByCategoryErr fails the backstop's
-	// implement_review_started read (guard (a) in maybeBackstopFixupReReview),
-	// so it returns before spawning the s.bgReviews goroutine — no background
-	// compare to race the stub reads below.
+	// guarded OFF here: the seeded implement_review_started row has an empty head,
+	// so guard (c) in maybeBackstopFixupReReview returns before spawning the
+	// s.bgReviews goroutine — no background compare to race the stub reads below.
+	// The compare-base check at the end of this test proves it stayed off.
 	w := shipPRRequest(t, s, runID, stageID, priv, mustFixupBody(t, h2), "")
 	if w.Code != http.StatusOK {
 		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	s.waitBackgroundReviews()
+	for _, call := range stub.compareCalls() {
+		if call.base != "main" {
+			t.Errorf("compare from base %q: the re-review backstop must stay off, leaving only the lineage guard's compare", call.base)
+		}
 	}
 	if v := foreignViolation(au); v != nil {
 		t.Fatalf("incomplete-ledger path false-flagged a legitimate prior head: %+v", v)

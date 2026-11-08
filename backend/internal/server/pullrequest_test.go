@@ -17,6 +17,8 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -31,6 +33,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/signing"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
 // pkgSrcDir is this package's SOURCE directory, captured once at package
@@ -2233,6 +2236,15 @@ func (r *failTransitionToFailedRepo) TransitionStageFrom(ctx context.Context, id
 	return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
 }
 
+// TransitionStageFromAttempt mirrors the forced error onto the attempt-pinned
+// edge a claimed gating pass takes (ADR-140 (#5047) D8).
+func (r *failTransitionToFailedRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to run.StageState, expected string, c *run.StageCompletion) (*run.Stage, error) {
+	if to == run.StageStateFailed {
+		return nil, r.err
+	}
+	return r.orchestratorRepo.TransitionStageFromAttempt(ctx, id, from, to, expected, c)
+}
+
 // TestShipPullRequest_SupplementalReinvokeReview_GatingReject_FailStageError
 // pins the FailStage-ERROR (ferr != nil) degradation sub-branch of the
 // gating-reject path: when the gating supplemental reviewer rejects AND
@@ -3380,6 +3392,7 @@ func TestShipPullRequest_ConflictResolutionPushed_DrivesTerminal(t *testing.T) {
 	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	implStage.Type = run.StageTypeImplement
 	implStage.RequiresApproval = true
+	recordLiveConflictTrigger(t, s, runRow.ID, implStage.ID)
 
 	priv, _ := sf.issue(t, runRow.ID)
 	// The exact key set the runner marshals for this outcome.
@@ -3424,6 +3437,7 @@ func TestShipPullRequest_ConflictResolutionPushed_IsIdempotent(t *testing.T) {
 	implStage := rr.seedStage(runRow.ID, 0, run.StageStateRunning)
 	implStage.Type = run.StageTypeImplement
 	implStage.RequiresApproval = true
+	recordLiveConflictTrigger(t, s, runRow.ID, implStage.ID)
 
 	priv, _ := sf.issue(t, runRow.ID)
 	body := []byte(`{"outcome":"conflict_resolution_pushed","branch":"b","head_sha":"h","base_sha":"p","files_changed_count":1}`)
@@ -5324,4 +5338,3271 @@ func TestShipPullRequest_MergeCandidateVerified_DuplicateRoutesOnce(t *testing.T
 	if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 1 {
 		t.Errorf("stage_fixup_triggered rows = %d, want exactly 1 across both deliveries", n)
 	}
+}
+
+// --- ADR-140 (#5047): upload edges, ownership and recovery hops ---------------
+
+const (
+	prSeamHead  = "abc123abc123abc123abc123abc123abc123abcd"
+	prSeamOther = "fedcba9876fedcba9876fedcba9876fedcba9876"
+	prSeamPath  = "backend/internal/foo/foo.go"
+)
+
+// stageCopyRepo hands out a fresh stage per read, as the postgres repo does, so
+// concurrent handlers race on nothing. It counts every terminal edge that landed
+// and lets a test fail or block each store call.
+type stageCopyRepo struct {
+	*orchestratorRepo
+	advances     atomic.Int32
+	fails        atomic.Int32
+	listStages   atomic.Int32
+	getStages    atomic.Int32
+	getRuns      atomic.Int32
+	onGetStage   func(ctx context.Context, call int32) error
+	onGetRun     func(call int32) error
+	onTransition func(ctx context.Context, to run.StageState) error
+}
+
+// GetStage returns a hook's error WITH a usable stage copy. A caller must not read
+// the value on an error, so this is within its contract; it means a caller that
+// skips its error check reaches the response and effect assertions instead of a
+// nil dereference.
+func (r *stageCopyRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	call := r.getStages.Add(1)
+	var hookErr error
+	if r.onGetStage != nil {
+		hookErr = r.onGetStage(ctx, call)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	s, ok := r.stagesByID[id]
+	if !ok {
+		if hookErr != nil {
+			return nil, hookErr
+		}
+		return nil, run.ErrNotFound
+	}
+	out := *s
+	return &out, hookErr
+}
+
+func (r *stageCopyRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	call := r.getRuns.Add(1)
+	if r.onGetRun != nil {
+		if err := r.onGetRun(call); err != nil {
+			return nil, err
+		}
+	}
+	return r.orchestratorRepo.GetRun(ctx, id)
+}
+
+// orchestratorCountRepo is what the orchestrator reads, so its own walk is counted
+// apart from every handler read.
+type orchestratorCountRepo struct{ *stageCopyRepo }
+
+func (r orchestratorCountRepo) ListStagesForRun(ctx context.Context, id uuid.UUID) ([]*run.Stage, error) {
+	r.listStages.Add(1)
+	return r.orchestratorRepo.ListStagesForRun(ctx, id)
+}
+
+func (r *stageCopyRepo) land(ctx context.Context, to run.StageState, apply func() (*run.Stage, error)) (*run.Stage, error) {
+	if r.onTransition != nil {
+		if err := r.onTransition(ctx, to); err != nil {
+			return nil, err
+		}
+	}
+	got, err := apply()
+	if err != nil {
+		return nil, err
+	}
+	switch to {
+	case run.StageStateAwaitingApproval, run.StageStateSucceeded:
+		r.advances.Add(1)
+	case run.StageStateFailed:
+		r.fails.Add(1)
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := *got
+	return &out, nil
+}
+
+func (r *stageCopyRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	return r.land(ctx, to, func() (*run.Stage, error) { return r.orchestratorRepo.TransitionStage(ctx, id, to, c) })
+}
+
+func (r *stageCopyRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	return r.land(ctx, to, func() (*run.Stage, error) { return r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c) })
+}
+
+func (r *stageCopyRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to run.StageState, expected string, c *run.StageCompletion) (*run.Stage, error) {
+	return r.land(ctx, to, func() (*run.Stage, error) {
+		return r.orchestratorRepo.TransitionStageFromAttempt(ctx, id, from, to, expected, c)
+	})
+}
+
+// prStatusRecorder counts status comments from concurrent handlers.
+type prStatusRecorder struct {
+	pageClassRecorder
+	n atomic.Int32
+}
+
+func (r *prStatusRecorder) NotifyStatusUpdateForRun(context.Context, uuid.UUID) error {
+	r.n.Add(1)
+	return nil
+}
+
+// parkingArtifactRepo parks the first call of one method: "get" at its miss, or
+// "create" just after the row persisted.
+type parkingArtifactRepo struct {
+	artifact.Repository
+	on       string
+	parked   atomic.Bool
+	reached  chan struct{}
+	release  chan struct{}
+	openOnce sync.Once
+	creates  atomic.Int32
+}
+
+func newParkingArtifactRepo(t *testing.T, inner artifact.Repository, on string) *parkingArtifactRepo {
+	t.Helper()
+	p := &parkingArtifactRepo{Repository: inner, on: on, reached: make(chan struct{}), release: make(chan struct{})}
+	t.Cleanup(p.open)
+	return p
+}
+
+// open releases a parked call; it is safe to call more than once.
+func (p *parkingArtifactRepo) open() { p.openOnce.Do(func() { close(p.release) }) }
+
+func (p *parkingArtifactRepo) park(method string) {
+	if p.on != method {
+		return
+	}
+	// Only the first call parks; a later one passes straight through rather than
+	// waiting on the parked call, so a mutant reaches its assertion instead of hanging.
+	if p.parked.CompareAndSwap(false, true) {
+		close(p.reached)
+		<-p.release
+	}
+}
+
+func (p *parkingArtifactRepo) GetByHash(ctx context.Context, stageID uuid.UUID, hash string) (*artifact.Artifact, error) {
+	got, err := p.Repository.GetByHash(ctx, stageID, hash)
+	if errors.Is(err, artifact.ErrNotFound) {
+		p.park("get")
+	}
+	return got, err
+}
+
+func (p *parkingArtifactRepo) Create(ctx context.Context, params artifact.CreateParams) (*artifact.Artifact, error) {
+	p.creates.Add(1)
+	got, err := p.Repository.Create(ctx, params)
+	p.park("create")
+	return got, err
+}
+
+// prSeam is one running gating implement stage behind the registered mux, with
+// every store a test can observe or fault.
+type prSeam struct {
+	s      *Server
+	sf     *signingFake
+	priv   ed25519.PrivateKey
+	au     *auditFake
+	audit  *tgtAudit
+	repo   *stageCopyRepo
+	rr     *orchestratorRepo
+	art    *fakeArtifactRepo
+	runRow *run.Run
+	stage  *run.Stage
+	rev    *scriptedReviewer
+	closes *closeRecorder
+	notes  *prStatusRecorder
+	boards *atomic.Int32
+}
+
+func newPRSeam(t *testing.T, workflowSpec []byte, steps ...reviewStep) *prSeam {
+	t.Helper()
+	rev := &scriptedReviewer{steps: steps}
+	return newPRSeamWithSet(t, singleReviewerSet{rev}, workflowSpec, rev)
+}
+
+func newPRSeamWithSet(t *testing.T, set ReviewerSet, workflowSpec []byte, rev *scriptedReviewer) *prSeam {
+	t.Helper()
+	s, sf, au, rr, runRow, stage := newImplementReviewServerWithSet(t, set, workflowSpec)
+	au.stampSequence = true
+	stage.State = run.StageStateRunning
+	wrapped := newTGTAudit(au)
+	repo := &stageCopyRepo{orchestratorRepo: rr}
+	s.cfg.AuditRepo = wrapped
+	s.cfg.RunRepo = repo
+	s.cfg.Orchestrator = &orchestrator.Orchestrator{Runs: orchestratorCountRepo{repo}}
+	closes := &closeRecorder{}
+	ghSrv := closes.reportedHeadAdmittingServer(t)
+	s.cfg.GitHub = &githubclient.Client{
+		BaseURL: ghSrv.URL,
+		Tokens:  &ghTokensStub{tok: "ghs_test"},
+		HTTP:    &http.Client{Timeout: 5 * time.Second},
+		AppJWT:  func() (string, error) { return "gha_app_jwt_test", nil },
+	}
+	inst := int64(12345)
+	runRow.InstallationID = &inst
+	ref := "issue:7"
+	runRow.TriggerRef = &ref
+	notes := &prStatusRecorder{}
+	s.issueNotifier = notes
+	boards := &atomic.Int32{}
+	setVar(t, &conventionsLoader, func(context.Context, string) (workmgmt.Conventions, error) {
+		boards.Add(1)
+		return workmgmt.Conventions{}, errors.New("no conventions in this fixture")
+	})
+	// A lost write exhausts at once, with no backoff to wait out.
+	setVar(t, &defaultReviewTerminalWriteConfig, reviewTerminalWriteConfig{opTimeout: time.Hour, settle: rtSteps(1, time.Millisecond)})
+	priv, _ := sf.issue(t, runRow.ID)
+	art := s.cfg.ArtifactRepo.(*fakeArtifactRepo)
+	return &prSeam{s: s, sf: sf, priv: priv, au: au, audit: wrapped, repo: repo, rr: rr, art: art, runRow: runRow, stage: stage, rev: rev, closes: closes, notes: notes, boards: boards}
+}
+
+func (p *prSeam) body(t *testing.T) []byte {
+	t.Helper()
+	return runnerShapedSupplementalPRBody(t, prSeamHead, prSeamPath, "unchanged after rebase")
+}
+
+func (p *prSeam) plainBody(t *testing.T) []byte {
+	t.Helper()
+	return mustPRBody(t, prSeamHead)
+}
+
+func (p *prSeam) post(t *testing.T, body []byte) *httptest.ResponseRecorder {
+	t.Helper()
+	return shipPRRequest(t, p.s, p.runRow.ID, p.stage.ID, p.priv, body, "")
+}
+
+// postAsync runs one upload on its own goroutine. ctx may be a cancellable caller.
+func (p *prSeam) postAsync(ctx context.Context, body []byte) <-chan *httptest.ResponseRecorder {
+	done := make(chan *httptest.ResponseRecorder, 1)
+	url := fmt.Sprintf("/v0/runs/%s/pull-request?stage_id=%s", p.runRow.ID, p.stage.ID)
+	sig := hex.EncodeToString(ed25519.Sign(p.priv, signing.ComputeMessage(body)))
+	go func() {
+		req := httptest.NewRequest(http.MethodPost, url, bytes.NewReader(body)).WithContext(ctx)
+		req.Header.Set("X-Fishhawk-Signature", sig)
+		w := httptest.NewRecorder()
+		p.s.Handler().ServeHTTP(w, req)
+		done <- w
+	}()
+	return done
+}
+
+// nextProcess swaps in a fresh Server over the same stores: empty ownership, an
+// open lifetime and the given reviewers.
+func (p *prSeam) nextProcess(steps ...reviewStep) {
+	p.rev = &scriptedReviewer{steps: steps}
+	cfg := p.s.cfg
+	cfg.PlanReviewers = singleReviewerSet{p.rev}
+	notifier := p.s.issueNotifier
+	p.s = New(cfg)
+	p.s.issueNotifier = notifier
+}
+
+// retry moves the stage to a new running attempt whose token is after every
+// artifact and row written so far.
+func (p *prSeam) retry() string {
+	p.rr.mu.Lock()
+	defer p.rr.mu.Unlock()
+	st := p.rr.stagesByID[p.stage.ID]
+	at := time.Now().UTC().Add(time.Second)
+	st.State = run.StageStateRunning
+	st.DispatchedAt = &at
+	st.FailureCategory, st.FailureReason = nil, nil
+	return run.StageAttemptToken(&at)
+}
+
+func (p *prSeam) current(t *testing.T) *run.Stage {
+	t.Helper()
+	p.rr.mu.Lock()
+	defer p.rr.mu.Unlock()
+	out := *p.rr.stagesByID[p.stage.ID]
+	return &out
+}
+
+func (p *prSeam) attempt(t *testing.T) string {
+	t.Helper()
+	return run.StageAttemptToken(p.current(t).DispatchedAt)
+}
+
+func (p *prSeam) state(t *testing.T) run.StageState { return p.current(t).State }
+
+func (p *prSeam) seed(t *testing.T, category string, payload []byte) {
+	t.Helper()
+	stageID := p.stage.ID
+	if _, err := p.au.AppendChained(t.Context(), audit.ChainAppendParams{RunID: p.runRow.ID, StageID: &stageID, Timestamp: time.Now().UTC(), Category: category, Payload: payload}); err != nil {
+		t.Fatalf("setup: seed %s: %v", category, err)
+	}
+}
+
+func (p *prSeam) seedVerdict(t *testing.T, head, attempt string, verdict planreview.Verdict) {
+	t.Helper()
+	p.seed(t, implementReviewedCategory, recoveryPayload(t, supplementalVerdict(head, attempt, verdict)))
+}
+
+func (p *prSeam) seedStart(t *testing.T, head, attempt string, agents int, paths ...string) {
+	t.Helper()
+	row := startRow(t, p.stage.ID, 0, head, attempt, agents, paths...)
+	p.seed(t, row.Category, row.Payload)
+}
+
+// seedArtifact persists body's artifact as an earlier upload did.
+func (p *prSeam) seedArtifact(t *testing.T, body []byte) {
+	t.Helper()
+	if _, err := p.art.Create(t.Context(), artifact.CreateParams{StageID: p.stage.ID, Kind: artifact.KindPullRequest, Content: json.RawMessage(body), ContentHash: sha256Hex(body)}); err != nil {
+		t.Fatalf("setup: seed artifact: %v", err)
+	}
+}
+
+// artifacts counts this stage's pull-request artifacts.
+func (p *prSeam) artifacts() int {
+	p.art.mu.Lock()
+	defer p.art.mu.Unlock()
+	n := 0
+	for _, a := range p.art.all {
+		if a.StageID == p.stage.ID {
+			n++
+		}
+	}
+	return n
+}
+
+func (p *prSeam) closeCalls() int {
+	p.closes.mu.Lock()
+	defer p.closes.mu.Unlock()
+	return p.closes.closeCalls
+}
+
+// assertNothingMoved pins the whole no-decision contract.
+func (p *prSeam) assertNothingMoved(t *testing.T) {
+	t.Helper()
+	if got := p.state(t); got != run.StageStateRunning {
+		t.Errorf("stage = %q, want running", got)
+	}
+	p.assertNoEffects(t)
+}
+
+// assertNoEffects pins zero edges, closes and notifications.
+func (p *prSeam) assertNoEffects(t *testing.T) {
+	t.Helper()
+	if n := p.repo.advances.Load(); n != 0 {
+		t.Errorf("successful edges = %d, want 0", n)
+	}
+	if n := p.repo.fails.Load(); n != 0 {
+		t.Errorf("failed edges = %d, want 0", n)
+	}
+	if n := p.closeCalls(); n != 0 {
+		t.Errorf("PR closes = %d, want 0", n)
+	}
+	if n := p.notes.n.Load(); n != 0 {
+		t.Errorf("status comments = %d, want 0", n)
+	}
+	if n := p.boards.Load(); n != 0 {
+		t.Errorf("board transitions = %d, want 0", n)
+	}
+	if n := p.repo.listStages.Load(); n != 0 {
+		t.Errorf("orchestrator advances = %d, want 0", n)
+	}
+}
+
+func (p *prSeam) assertFailedB(t *testing.T) {
+	t.Helper()
+	got := p.current(t)
+	if got.State != run.StageStateFailed || got.FailureCategory == nil || *got.FailureCategory != run.FailureB ||
+		got.FailureReason == nil || !strings.HasPrefix(*got.FailureReason, implementReviewGatingRejectPrefix) {
+		t.Fatalf("stage = %q %v %v, want failed category B with the gating-reject reason", got.State, got.FailureCategory, got.FailureReason)
+	}
+	if n := p.closeCalls(); n != 1 {
+		t.Errorf("PR closes = %d, want 1", n)
+	}
+	if n := p.repo.advances.Load(); n != 0 {
+		t.Errorf("successful edges = %d, want 0", n)
+	}
+	if n := p.notes.n.Load(); n != 0 {
+		t.Errorf("status comments = %d, want 0", n)
+	}
+}
+
+// assertAdvancedOnce pins one successful edge to the approval gate.
+func (p *prSeam) assertAdvancedOnce(t *testing.T) {
+	t.Helper()
+	if got := p.state(t); got != run.StageStateAwaitingApproval {
+		t.Errorf("stage = %q, want awaiting_approval", got)
+	}
+	if n := p.repo.advances.Load(); n != 1 {
+		t.Errorf("successful edges = %d, want 1", n)
+	}
+	if n := p.closeCalls(); n != 0 {
+		t.Errorf("PR closes = %d, want 0", n)
+	}
+}
+
+// assertCode reads a response's status and error code.
+func assertCode(t *testing.T, w *httptest.ResponseRecorder, status int, code string) {
+	t.Helper()
+	if w.Code != status {
+		t.Fatalf("status = %d, want %d:\n%s", w.Code, status, w.Body.String())
+	}
+	var env struct {
+		Error struct {
+			Code string `json:"code"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &env); err != nil {
+		t.Fatalf("decode envelope: %v", err)
+	}
+	if env.Error.Code != code {
+		t.Fatalf("code = %q, want %q:\n%s", env.Error.Code, code, w.Body.String())
+	}
+}
+
+// assertStaticEdgeError pins the static 500: no raw cause reaches the client.
+func assertStaticEdgeError(t *testing.T, w *httptest.ResponseRecorder, raw ...string) {
+	t.Helper()
+	assertCode(t, w, http.StatusInternalServerError, "internal_error")
+	for _, leak := range raw {
+		if strings.Contains(w.Body.String(), leak) {
+			t.Errorf("raw cause %q reached the client:\n%s", leak, w.Body.String())
+		}
+	}
+}
+
+func assertNotInFlight(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	if strings.Contains(w.Body.String(), "review_round_in_flight") {
+		t.Errorf("response is review_round_in_flight, want ownership released:\n%s", w.Body.String())
+	}
+}
+
+// --- the three signed routes at shutdown, the pull-request arm -----------------
+
+// edgeAttemptRepo counts every guarded edge attempted, landed or not, so a
+// no-decision outcome can be told apart from a later guard refusing the same upload.
+type edgeAttemptRepo struct {
+	*stageCopyRepo
+	s        *Server
+	attempts atomic.Int32
+}
+
+func (r *edgeAttemptRepo) TransitionStageFromAttemptGuarded(ctx context.Context, id uuid.UUID, from, to run.StageState, expected string, completion *run.StageCompletion, guard run.StageEdgeGuard) (*run.Stage, error) {
+	r.attempts.Add(1)
+	return testGuardedEdge{r.s}.TransitionStageFromAttemptGuarded(ctx, id, from, to, expected, completion, guard)
+}
+
+func TestShipPullRequest_SupplementalGatingKilled_StageNotAdvanced(t *testing.T) {
+	t.Run("killed_mid_pass", func(t *testing.T) {
+		started := make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+		done := p.postAsync(t.Context(), p.body(t))
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "killed upload"), http.StatusServiceUnavailable)
+		p.assertNothingMoved(t)
+		if n := countAuditCategory(p.au, implementReviewedCategory) + countAuditCategory(p.au, "implement_review_failed"); n != 0 {
+			t.Errorf("terminal rows = %d, want none for a killed reviewer", n)
+		}
+	})
+	t.Run("closed_before_claim_takes_no_edge", func(t *testing.T) {
+		// The lifetime refused the handler, so its context is alive when the reviewer
+		// refuses: only the interrupted check stands between the outcome and the edge.
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		attempts := &edgeAttemptRepo{stageCopyRepo: p.repo, s: p.s}
+		p.s.cfg.RunRepo = attempts
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, p.post(t, p.body(t)), http.StatusServiceUnavailable)
+		if n := attempts.attempts.Load(); n != 0 {
+			t.Errorf("guarded edges attempted = %d, want 0 on an interrupted outcome", n)
+		}
+		p.assertNothingMoved(t)
+	})
+}
+
+func TestShipPullRequest_SupplementalGatingLost_ReplayRefused(t *testing.T) {
+	kill := func(t *testing.T, workflowSpec []byte, steps ...reviewStep) (*prSeam, []byte) {
+		t.Helper()
+		started := make(chan struct{})
+		p := newPRSeam(t, workflowSpec, append(steps, blockStep(started))...)
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "killed upload"), http.StatusServiceUnavailable)
+		return p, body
+	}
+	t.Run("lost_pass_replay_409", func(t *testing.T) {
+		p, body := kill(t, specImplementGatingReviewers)
+		p.nextProcess(approveStep)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		p.assertNothingMoved(t)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("replay invoked %d reviewers, want 0", n)
+		}
+	})
+	t.Run("partial_pass_replay_409", func(t *testing.T) {
+		p, body := kill(t, specImplementGatingTwo, approveStep)
+		if n := countAuditCategory(p.au, implementReviewedCategory); n != 1 {
+			t.Fatalf("setup: verdict rows = %d, want the first reviewer's one", n)
+		}
+		p.nextProcess(approveStep)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		p.assertNothingMoved(t)
+	})
+	t.Run("complete_pass_replay_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		fault := errors.New("forced store fault")
+		p.repo.onTransition = func(context.Context, run.StageState) error { return fault }
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		p.repo.onTransition = nil
+		w := p.post(t, body)
+		if w.Code != http.StatusOK {
+			t.Fatalf("replay status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want the one pass", n)
+		}
+	})
+	t.Run("replay_without_exemptions_still_heals", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.plainBody(t)
+		fault := errors.New("forced store fault")
+		p.repo.onTransition = func(context.Context, run.StageState) error { return fault }
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		p.repo.onTransition = nil
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("replay status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+}
+
+func TestShipPullRequest_CurrentProcessPassAfterClose_ReplayRefused(t *testing.T) {
+	started := make(chan struct{})
+	p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+	body := p.body(t)
+	done := p.postAsync(t.Context(), body)
+	waitFor(t, started, "setup: blocked reviewer")
+	p.s.reviewers.closeAndCancel()
+	assertInterrupted(t, awaitResponse(t, done, "killed upload"), http.StatusServiceUnavailable)
+	assertInterrupted(t, p.post(t, body), http.StatusServiceUnavailable)
+	p.assertNothingMoved(t)
+	if n := countAuditCategory(p.au, CategorySupplementalReviewStarted); n != 1 {
+		t.Errorf("start rows = %d, want 1", n)
+	}
+}
+
+func TestShipPullRequest_ClosingProcess_CompletePass_ReplayAdvances(t *testing.T) {
+	p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+	body := p.body(t)
+	fault := errors.New("forced store fault")
+	p.repo.onTransition = func(context.Context, run.StageState) error { return fault }
+	assertStaticEdgeError(t, p.post(t, body), fault.Error())
+	p.repo.onTransition = nil
+	p.s.reviewers.closeAndCancel()
+	if w := p.post(t, body); w.Code != http.StatusOK {
+		t.Fatalf("replay in a closing process = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	p.assertAdvancedOnce(t)
+}
+
+// --- live pass ownership ---------------------------------------------------------
+
+func TestShipPullRequest_SupplementalGatingLive_RetryInFlight(t *testing.T) {
+	t.Run("reviewer_blocked", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, approveStep))
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		w := p.post(t, body)
+		assertCode(t, w, http.StatusServiceUnavailable, "review_round_in_flight")
+		if w.Header().Get("Retry-After") == "" || w.Header().Get(reviewPassRemainingHeader) == "" {
+			t.Errorf("live response lacks its delay headers: %v", w.Header())
+		}
+		if got := p.state(t); got != run.StageStateRunning {
+			t.Errorf("stage = %q, want running", got)
+		}
+		if a, opened := p.artifacts(), countAuditCategory(p.au, "pull_request_opened"); a != 1 || opened != 1 {
+			t.Errorf("artifacts = %d, opened rows = %d, want one each", a, opened)
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want 1", n)
+		}
+		if n := countAuditCategory(p.au, implementReviewedCategory) + countAuditCategory(p.au, "implement_review_failed"); n != 0 {
+			t.Errorf("terminal rows while live = %d, want 0", n)
+		}
+		close(release)
+		if w := awaitResponse(t, done, "owner"); w.Code != http.StatusCreated {
+			t.Fatalf("owner status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+	for _, parkOn := range []struct{ name, on string }{{"artifact_visible_before_pass", "create"}, {"before_create", "get"}} {
+		t.Run(parkOn.name, func(t *testing.T) {
+			p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+			parking := newParkingArtifactRepo(t, p.art, parkOn.on)
+			p.s.cfg.ArtifactRepo = parking
+			body := p.body(t)
+			done := p.postAsync(t.Context(), body)
+			waitFor(t, parking.reached, "setup: parked owner")
+			assertCode(t, p.post(t, body), http.StatusServiceUnavailable, "review_round_in_flight")
+			parking.open()
+			if w := awaitResponse(t, done, "owner"); w.Code != http.StatusCreated {
+				t.Fatalf("owner status = %d:\n%s", w.Code, w.Body.String())
+			}
+			if n := parking.creates.Load(); n != 1 {
+				t.Errorf("Create ran %d times, want 1", n)
+			}
+			p.assertAdvancedOnce(t)
+		})
+	}
+}
+
+func TestShipPullRequest_SupplementalGatingLive_Shutdown(t *testing.T) {
+	t.Run("busy_while_closing", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		// This reviewer ignores its cancel, so A still owns the pass while closing.
+		held := func(context.Context) (*planreview.ReviewVerdict, string, error) {
+			close(started)
+			<-release
+			return nil, "m", context.Canceled
+		}
+		p := newPRSeam(t, specImplementGatingReviewers, held)
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		w := p.post(t, body)
+		assertInterrupted(t, w, http.StatusServiceUnavailable)
+		if w.Header().Get(reviewPassRemainingHeader) != "" || w.Header().Get("Retry-After") != "" {
+			t.Errorf("a closing response carries live headers: %v", w.Header())
+		}
+		close(release)
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		p.assertNothingMoved(t)
+	})
+	t.Run("after_release", func(t *testing.T) {
+		started := make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		assertInterrupted(t, p.post(t, body), http.StatusServiceUnavailable)
+		p.assertNothingMoved(t)
+		if n := countAuditCategory(p.au, implementReviewedCategory); n != 0 {
+			t.Errorf("verdict rows = %d, want 0", n)
+		}
+	})
+	t.Run("next_process", func(t *testing.T) {
+		started := make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		p.nextProcess(approveStep)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		p.assertNothingMoved(t)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("next process invoked %d reviewers, want 0", n)
+		}
+	})
+}
+
+func TestShipPullRequest_SupplementalGating_PartialVerdicts_LiveVersusLost(t *testing.T) {
+	started := make(chan struct{})
+	p := newPRSeam(t, specImplementGatingTwo, approveStep, blockStep(started))
+	body := p.body(t)
+	done := p.postAsync(t.Context(), body)
+	waitFor(t, started, "setup: second reviewer blocked")
+	rowsBefore := countAuditCategory(p.au, implementReviewedCategory)
+	assertCode(t, p.post(t, body), http.StatusServiceUnavailable, "review_round_in_flight")
+	owner := p.s
+	p.nextProcess(approveStep)
+	assertInterrupted(t, p.post(t, body), http.StatusConflict)
+	if rowsAfter := countAuditCategory(p.au, implementReviewedCategory); rowsAfter != rowsBefore || rowsBefore != 1 {
+		t.Errorf("verdict rows = %d then %d, want the same one across both answers", rowsBefore, rowsAfter)
+	}
+	owner.reviewers.closeAndCancel()
+	assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+	p.assertNothingMoved(t)
+}
+
+func TestShipPullRequest_SupplementalGatingOwnership_ReleasedOnEveryExit(t *testing.T) {
+	// Capture the ORIGINAL ownership coordinates before any handler can change
+	// the stage. Inspect that exact key after its first call, before any replay.
+	assertOriginalReleased := func(t *testing.T, p *prSeam) func() {
+		t.Helper()
+		key := supplementalPassKey{stageID: p.stage.ID, attempt: p.attempt(t), headSHA: prSeamHead}
+		return func() {
+			t.Helper()
+			p.s.supplementalPasses.mu.Lock()
+			_, held := p.s.supplementalPasses.live[key]
+			p.s.supplementalPasses.mu.Unlock()
+			if held {
+				t.Errorf("original supplemental ownership key remains held after handler exit: stage=%s attempt=%s head=%s", key.stageID, key.attempt, key.headSHA)
+			}
+		}
+	}
+
+	t.Run("approve", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		if w := p.post(t, body); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		assertReleased()
+		assertNotInFlight(t, p.post(t, body))
+	})
+	t.Run("reject", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		if w := p.post(t, body); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+		assertReleased()
+		assertNotInFlight(t, p.post(t, body))
+	})
+	t.Run("interrupted", func(t *testing.T) {
+		started := make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		assertReleased()
+		assertInterrupted(t, p.post(t, body), http.StatusServiceUnavailable)
+	})
+	t.Run("create_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		p.art.createErr = errors.New("forced create fault")
+		if w := p.post(t, body); w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertReleased()
+		p.art.createErr = nil
+		if w := p.post(t, body); w.Code != http.StatusCreated {
+			t.Fatalf("later upload = %d, want it to create and run the pass:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want 1", n)
+		}
+	})
+	t.Run("governance_append_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		p.audit.setHooks(failVerdicts(func(q audit.ChainAppendParams) bool { return q.Category == "pull_request_opened" }), nil)
+		if w := p.post(t, body); w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+		}
+		assertReleased()
+		p.audit.setHooks(nil, nil)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		p.assertNothingMoved(t)
+	})
+	t.Run("lineage_violation", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		stub := &lineageGitHub{baseRef: "main", headSHA: prSeamHead, commitsByBase: map[string][]string{"main": {"0000000000000000000000000000000000000f0f", prSeamHead}}}
+		p.s.cfg.GitHub = newLineageGitHubClient(t, stub)
+		if w := p.post(t, body); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if got := p.state(t); got != run.StageStateFailed {
+			t.Fatalf("setup: stage = %q, want the lineage guard's failure", got)
+		}
+		assertReleased()
+		assertNotInFlight(t, p.post(t, body))
+	})
+	t.Run("handler_panic", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		panicking := &panicOnceArtifactRepo{Repository: p.art}
+		p.s.cfg.ArtifactRepo = panicking
+		body := p.body(t)
+		assertReleased := assertOriginalReleased(t, p)
+		func() {
+			// The server's recover middleware or this one catches it; either way
+			// the handler's defers ran.
+			defer func() { _ = recover() }()
+			p.post(t, body)
+		}()
+		if !panicking.fired.Load() {
+			t.Fatal("setup: Create did not panic")
+		}
+		assertReleased()
+		assertNotInFlight(t, p.post(t, body))
+	})
+}
+
+// panicOnceArtifactRepo panics on its first Create.
+type panicOnceArtifactRepo struct {
+	artifact.Repository
+	once  sync.Once
+	fired atomic.Bool
+}
+
+func (p *panicOnceArtifactRepo) Create(ctx context.Context, params artifact.CreateParams) (*artifact.Artifact, error) {
+	p.once.Do(func() {
+		p.fired.Store(true)
+		panic("forced create panic")
+	})
+	return p.Repository.Create(ctx, params)
+}
+
+func TestShipPullRequest_SupplementalGating_ClientGone_EdgeStillApplies(t *testing.T) {
+	cancelledRepo := func(p *prSeam) {
+		// A cancelled context fails the store, as pgx does.
+		p.repo.onTransition = func(ctx context.Context, _ run.StageState) error { return ctx.Err() }
+	}
+	t.Run("approve", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, approveStep))
+		cancelledRepo(p)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := p.postAsync(ctx, p.body(t))
+		waitFor(t, started, "setup: blocked reviewer")
+		cancel()
+		close(release)
+		if w := awaitResponse(t, done, "owner"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("reject", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, rejectStep))
+		cancelledRepo(p)
+		ctx, cancel := context.WithCancel(t.Context())
+		done := p.postAsync(ctx, p.body(t))
+		waitFor(t, started, "setup: blocked reviewer")
+		cancel()
+		close(release)
+		awaitResponse(t, done, "owner")
+		p.assertFailedB(t)
+	})
+	t.Run("before_pass", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		cancelledRepo(p)
+		parking := newParkingArtifactRepo(t, p.art, "get")
+		p.s.cfg.ArtifactRepo = parking
+		ctx, cancel := context.WithCancel(t.Context())
+		done := p.postAsync(ctx, p.body(t))
+		waitFor(t, parking.reached, "setup: parked owner")
+		cancel()
+		parking.open()
+		awaitResponse(t, done, "owner")
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want the pass to survive the disconnect", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+}
+
+func TestShipPullRequest_SupplementalGating_AttemptSuperseded_NoEdge(t *testing.T) {
+	failedReport := func(t *testing.T, p *prSeam) {
+		t.Helper()
+		body, err := json.Marshal(map[string]any{"outcome": "failed", "category": "C", "reason": "runner gave up"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("setup: failed report = %d:\n%s", w.Code, w.Body.String())
+		}
+	}
+	for _, verdict := range []struct {
+		name string
+		step reviewStep
+	}{{"approve", approveStep}, {"reject", rejectStep}} {
+		t.Run("runner_failed_report_"+verdict.name, func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, verdict.step))
+			done := p.postAsync(t.Context(), p.body(t))
+			waitFor(t, started, "setup: blocked reviewer")
+			failedReport(t, p)
+			if p.state(t) != run.StageStateFailed {
+				t.Fatalf("setup: stage = %q, want the report's failure", p.state(t))
+			}
+			p.repo.fails.Store(0)
+			close(release)
+			if w := awaitResponse(t, done, "owner"); w.Code != http.StatusCreated {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			if n := countAuditCategory(p.au, implementReviewedCategory); n != 1 {
+				t.Errorf("verdict rows = %d, want the late one", n)
+			}
+			if got := p.current(t); got.State != run.StageStateFailed || *got.FailureCategory != run.FailureC {
+				t.Errorf("stage = %q %v, want unchanged failed C", got.State, got.FailureCategory)
+			}
+			if a, f, c := p.repo.advances.Load(), p.repo.fails.Load(), p.closeCalls(); a != 0 || f != 0 || c != 0 {
+				t.Errorf("edges = %d/%d, closes = %d, want none", a, f, c)
+			}
+		})
+		t.Run("retried_attempt_"+verdict.name, func(t *testing.T) {
+			started, release := make(chan struct{}), make(chan struct{})
+			p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, verdict.step))
+			done := p.postAsync(t.Context(), p.body(t))
+			waitFor(t, started, "setup: blocked reviewer")
+			newAttempt := p.retry()
+			close(release)
+			if w := awaitResponse(t, done, "owner"); w.Code != http.StatusCreated {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			if n := countAuditCategory(p.au, implementReviewedCategory); n != 1 {
+				t.Errorf("verdict rows = %d, want the late one", n)
+			}
+			p.assertNothingMoved(t)
+			if got := p.attempt(t); got != newAttempt {
+				t.Errorf("attempt = %q, want the newer %q", got, newAttempt)
+			}
+		})
+	}
+}
+
+func TestShipPullRequest_SupplementalGating_RejectEdgeFailed_ReplayRefused(t *testing.T) {
+	p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
+	body := p.body(t)
+	p.repo.onTransition = func(_ context.Context, to run.StageState) error {
+		if to == run.StageStateFailed {
+			return errors.New("forced failed-edge fault")
+		}
+		return nil
+	}
+	if w := p.post(t, body); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+	}
+	p.assertNothingMoved(t)
+	assertInterrupted(t, p.post(t, body), http.StatusConflict)
+	p.assertNothingMoved(t)
+	if n := p.rev.calls.Load(); n != 1 {
+		t.Errorf("reviewer calls = %d, want 1: a recorded reject runs no more", n)
+	}
+}
+
+func TestShipPullRequest_NoPassConfiguration_ReplayHeals(t *testing.T) {
+	p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+	p.s.cfg.ArtifactRepo = newFakeArtifactRepo() // no approved plan
+	p.art = p.s.cfg.ArtifactRepo.(*fakeArtifactRepo)
+	body := p.body(t)
+	fault := errors.New("forced store fault")
+	p.repo.onTransition = func(context.Context, run.StageState) error { return fault }
+	assertStaticEdgeError(t, p.post(t, body), fault.Error())
+	p.repo.onTransition = nil
+	if w := p.post(t, body); w.Code != http.StatusOK {
+		t.Fatalf("replay = %d, want the #2630 heal:\n%s", w.Code, w.Body.String())
+	}
+	p.assertAdvancedOnce(t)
+	if n := p.rev.calls.Load(); n != 0 {
+		t.Errorf("reviewer calls = %d, want 0: no pass is required", n)
+	}
+}
+
+func TestShipPullRequest_SupplementalRequirementUnknown_NoArtifact(t *testing.T) {
+	p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
+	body := p.body(t)
+	fault := errors.New("forced run read fault")
+	p.repo.onGetRun = func(int32) error { return fault }
+	assertStaticEdgeError(t, p.post(t, body), fault.Error())
+	if n := p.artifacts(); n != 0 {
+		t.Errorf("artifacts = %d, want 0", n)
+	}
+	if n := p.rev.calls.Load(); n != 0 {
+		t.Errorf("reviewer calls = %d, want 0", n)
+	}
+	p.assertNothingMoved(t)
+	p.repo.onGetRun = nil
+	if w := p.post(t, body); w.Code != http.StatusCreated {
+		t.Fatalf("after the fault cleared = %d:\n%s", w.Code, w.Body.String())
+	}
+	p.assertFailedB(t)
+}
+
+// --- the finite lifetime -----------------------------------------------------------
+
+// ctxBlockingAudit blocks chosen operations until their context ends and records
+// what ended them, as a store that honours its context does.
+type ctxBlockingAudit struct {
+	*tgtAudit
+	mu           sync.Mutex
+	blockWrite   string
+	blockRead    string
+	cleanup      chan struct{}
+	entered      chan struct{}
+	enterOnce    sync.Once
+	observed     chan error
+	deadlines    chan time.Time
+	stubbornStop chan struct{}
+}
+
+func newCtxBlockingAudit(t *testing.T, inner *tgtAudit) *ctxBlockingAudit {
+	t.Helper()
+	a := &ctxBlockingAudit{tgtAudit: inner, entered: make(chan struct{}), cleanup: make(chan struct{}), observed: make(chan error, 64), deadlines: make(chan time.Time, 64)}
+	// A registered settle retries on a detached context; release it with the test.
+	t.Cleanup(func() { close(a.cleanup) })
+	return a
+}
+
+// block sets what the next matching operation blocks on.
+func (a *ctxBlockingAudit) setBlocks(write, read string) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.blockWrite, a.blockRead = write, read
+}
+
+func (a *ctxBlockingAudit) block(ctx context.Context) error {
+	a.enterOnce.Do(func() { close(a.entered) })
+	if deadline, ok := ctx.Deadline(); ok {
+		select {
+		case a.deadlines <- deadline:
+		default:
+		}
+	}
+	if a.stubbornStop != nil {
+		<-a.stubbornStop
+		return errors.New("a stubborn dependency finally returned")
+	}
+	select {
+	case <-ctx.Done():
+	case <-a.cleanup:
+		return errors.New("released with the test")
+	}
+	select {
+	case a.observed <- ctx.Err():
+	default:
+	}
+	return ctx.Err()
+}
+
+func (a *ctxBlockingAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	a.mu.Lock()
+	blocked := p.Category == a.blockWrite
+	a.mu.Unlock()
+	if blocked {
+		return nil, a.block(ctx)
+	}
+	return a.tgtAudit.AppendChained(ctx, p)
+}
+
+func (a *ctxBlockingAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	a.mu.Lock()
+	blocked := category == a.blockRead
+	a.mu.Unlock()
+	if blocked {
+		return nil, a.block(ctx)
+	}
+	return a.tgtAudit.ListForRunByCategory(ctx, runID, category)
+}
+
+func (a *ctxBlockingAudit) AppendChainedDeduped(ctx context.Context, p audit.ChainAppendParams, spec audit.DedupeSpec) (*audit.Entry, error) {
+	return testDedupedAppender{a}.AppendChainedDeduped(ctx, p, spec)
+}
+
+// shortLifetime lowers a claimed pass's lifetime to about 300ms.
+func shortLifetime(t *testing.T, p *prSeam) {
+	t.Helper()
+	setVar(t, &supplementalPassOverhead, 250*time.Millisecond)
+	p.s.cfg.ReviewBudget.Cap = 50 * time.Millisecond
+	p.s.cfg.ReviewBudget.Floor = 10 * time.Millisecond
+}
+
+func awaitObserved(t *testing.T, ch <-chan error, want error) {
+	t.Helper()
+	select {
+	case got := <-ch:
+		if !errors.Is(got, want) {
+			t.Errorf("blocked dependency observed %v, want %v", got, want)
+		}
+	case <-time.After(boundedWait):
+		t.Fatalf("no blocked dependency observed %v within %s", want, boundedWait)
+	}
+}
+
+func TestShipPullRequest_SupplementalGatingOwnership_BoundedLifetime(t *testing.T) {
+	// Each arm is a COOPERATIVE fixture: the dependency honours its context, as pgx
+	// does. The handler must return by the deadline, release ownership and move nothing.
+	assertReleased := func(t *testing.T, p *prSeam, body []byte) {
+		t.Helper()
+		// A later identical upload is decided on evidence, never told a pass is live.
+		w := p.post(t, body)
+		assertNotInFlight(t, w)
+	}
+	t.Run("blocked_get_stage", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		observed := make(chan error, 1)
+		p.repo.onGetStage = func(ctx context.Context, call int32) error {
+			if call != 2 {
+				return nil
+			}
+			<-ctx.Done()
+			observed <- ctx.Err()
+			return ctx.Err()
+		}
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, observed, context.DeadlineExceeded)
+		assertStaticEdgeError(t, awaitResponse(t, done, "owner"))
+		p.assertNothingMoved(t)
+		p.repo.onGetStage = nil
+		assertReleased(t, p, body)
+	})
+	// The fresh read's own error on a LIVE context. blocked_get_stage cannot isolate
+	// the read-error guard: its expired pass context refuses the next step anyway.
+	// Here the fake returns a usable stage WITH the error, so only that guard stands
+	// between the fault and an edge.
+	t.Run("fresh_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		fault := errors.New("fresh stage read fault")
+		var faulted atomic.Bool
+		p.repo.onGetStage = func(_ context.Context, call int32) error {
+			if call != 2 {
+				return nil
+			}
+			faulted.Store(true)
+			return fault
+		}
+		body := p.body(t)
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		if !faulted.Load() {
+			t.Fatal("setup: the fresh read was never faulted")
+		}
+		p.assertNothingMoved(t)
+		p.repo.onGetStage = nil
+		assertReleased(t, p, body)
+	})
+	t.Run("blocked_create", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		observed := make(chan error, 1)
+		p.s.cfg.ArtifactRepo = &ctxBlockingArtifactRepo{Repository: p.art, observed: observed}
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, observed, context.DeadlineExceeded)
+		if w := awaitResponse(t, done, "owner"); w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertNothingMoved(t)
+		p.s.cfg.ArtifactRepo = p.art
+		assertReleased(t, p, body)
+	})
+	t.Run("blocked_audit_append", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		blocking := newCtxBlockingAudit(t, p.audit)
+		blocking.setBlocks("pull_request_opened", "")
+		p.s.cfg.AuditRepo = blocking
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, blocking.observed, context.DeadlineExceeded)
+		if w := awaitResponse(t, done, "owner"); w.Code != http.StatusInternalServerError {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertNothingMoved(t)
+		blocking.setBlocks("", "")
+		assertReleased(t, p, body)
+	})
+	t.Run("blocked_lineage_read", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		stub := &lineageGitHub{baseRef: "main", headSHA: prSeamHead, commitsByBase: map[string][]string{"main": {prSeamHead}}}
+		p.s.cfg.GitHub = newLineageGitHubClient(t, stub)
+		blocking := newCtxBlockingAudit(t, p.audit)
+		blocking.setBlocks("", "pull_request_opened")
+		p.s.cfg.AuditRepo = blocking
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, blocking.observed, context.DeadlineExceeded)
+		w := awaitResponse(t, done, "owner")
+		if w.Code == http.StatusCreated {
+			t.Fatalf("status = %d, want no advance past the deadline:\n%s", w.Code, w.Body.String())
+		}
+		p.assertNothingMoved(t)
+		blocking.setBlocks("", "")
+		assertReleased(t, p, body)
+	})
+	t.Run("blocked_reviewer_append", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		blocking := newCtxBlockingAudit(t, p.audit)
+		blocking.setBlocks(implementReviewedCategory, "")
+		p.s.cfg.AuditRepo = blocking
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, blocking.observed, context.DeadlineExceeded)
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusConflict)
+		p.assertNothingMoved(t)
+		blocking.setBlocks("", "")
+		assertReleased(t, p, body)
+	})
+	t.Run("blocked_transition", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		observed := make(chan error, 1)
+		p.repo.onTransition = func(ctx context.Context, _ run.StageState) error {
+			<-ctx.Done()
+			observed <- ctx.Err()
+			return ctx.Err()
+		}
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, observed, context.DeadlineExceeded)
+		assertStaticEdgeError(t, awaitResponse(t, done, "owner"))
+		p.assertNothingMoved(t)
+		p.repo.onTransition = nil
+		assertReleased(t, p, body)
+	})
+	t.Run("shutdown_cancels_blocked_dependency", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		observed := make(chan error, 1)
+		repo := &ctxBlockingArtifactRepo{Repository: p.art, observed: observed, entered: make(chan struct{})}
+		p.s.cfg.ArtifactRepo = repo
+		done := p.postAsync(t.Context(), p.body(t))
+		waitFor(t, repo.entered, "setup: blocked create")
+		p.s.reviewers.closeAndCancel()
+		awaitObserved(t, observed, context.Canceled)
+		awaitResponse(t, done, "owner")
+		p.assertNothingMoved(t)
+	})
+	t.Run("client_disconnect_does_not_revoke", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, approveStep))
+		ctx, cancel := context.WithCancel(t.Context())
+		done := p.postAsync(ctx, p.body(t))
+		waitFor(t, started, "setup: blocked reviewer")
+		cancel()
+		close(release)
+		if w := awaitResponse(t, done, "owner"); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("dependency_ignores_context", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		blocking := newCtxBlockingAudit(t, p.audit)
+		blocking.setBlocks("pull_request_opened", "")
+		blocking.stubbornStop = make(chan struct{})
+		p.s.cfg.AuditRepo = blocking
+		body := p.body(t)
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, blocking.entered, "setup: stubborn dependency")
+		time.Sleep(400 * time.Millisecond) // past the owner's 300ms deadline
+		w := p.post(t, body)
+		assertInterrupted(t, w, http.StatusConflict)
+		if w.Header().Get(reviewPassRemainingHeader) != "" {
+			t.Errorf("an owner past its deadline is not proven live: %v", w.Header())
+		}
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want no second reviewer", n)
+		}
+		close(blocking.stubbornStop)
+		awaitResponse(t, done, "owner")
+		p.assertNothingMoved(t)
+	})
+	t.Run("blocked_verdict_final_probe_keeps_deadline", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		blocking := newCtxBlockingAudit(t, p.audit)
+		p.s.cfg.AuditRepo = blocking
+		body := p.body(t)
+		latest := time.Now().Add(p.s.supplementalPassLifetime(supplementalPassRequirement{agentCount: 1}) + 2*time.Second)
+		// The proof's first read precedes the write; arm the block only once a write failed.
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			if q.Category == implementReviewedCategory {
+				blocking.setBlocks("", implementReviewedCategory)
+				return flakyFail
+			}
+			return flakyOK
+		}, nil)
+		done := p.postAsync(t.Context(), body)
+		awaitObserved(t, blocking.observed, context.DeadlineExceeded)
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusConflict)
+		select {
+		case got := <-blocking.deadlines:
+			if got.After(latest) {
+				t.Errorf("the final probe's deadline %s is past the pass's %s", got, latest)
+			}
+		default:
+			t.Error("the final probe carried no deadline")
+		}
+		p.assertNothingMoved(t)
+		blocking.setBlocks("", "")
+		p.audit.setHooks(nil, nil)
+		assertReleased(t, p, body)
+	})
+	t.Run("shutdown_cancels_final_probe", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		blocking := newCtxBlockingAudit(t, p.audit)
+		p.s.cfg.AuditRepo = blocking
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			if q.Category == implementReviewedCategory {
+				blocking.setBlocks("", implementReviewedCategory)
+				return flakyFail
+			}
+			return flakyOK
+		}, nil)
+		done := p.postAsync(t.Context(), p.body(t))
+		waitFor(t, blocking.entered, "setup: blocked final probe")
+		p.s.reviewers.closeAndCancel()
+		awaitObserved(t, blocking.observed, context.Canceled)
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		p.assertNothingMoved(t)
+	})
+}
+
+// ctxBlockingArtifactRepo blocks Create until its context ends.
+type ctxBlockingArtifactRepo struct {
+	artifact.Repository
+	observed chan error
+	entered  chan struct{}
+}
+
+func (r *ctxBlockingArtifactRepo) Create(ctx context.Context, _ artifact.CreateParams) (*artifact.Artifact, error) {
+	if r.entered != nil {
+		close(r.entered)
+	}
+	<-ctx.Done()
+	r.observed <- ctx.Err()
+	return nil, ctx.Err()
+}
+
+// --- re-entry and the recovery hops --------------------------------------------------
+
+func TestShipPullRequest_ResumedSupplemental_PriorAttemptArtifact(t *testing.T) {
+	resumed := func(t *testing.T, workflowSpec []byte, steps ...reviewStep) (*prSeam, []byte, string, string) {
+		t.Helper()
+		p := newPRSeam(t, workflowSpec, steps...)
+		body := p.body(t)
+		first := p.attempt(t)
+		p.seedArtifact(t, body)
+		return p, body, first, p.retry()
+	}
+	t.Run("approve_advances", func(t *testing.T) {
+		p, body, _, attempt := resumed(t, specImplementGatingReviewers, approveStep)
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+		state, err := p.s.supplementalRoundState(t.Context(), p.runRow.ID, p.stage.ID, prSeamHead, attempt)
+		if err != nil || state.currentVerdicts != 1 {
+			t.Errorf("state = %+v, %v: the verdict must carry this attempt's token", state, err)
+		}
+	})
+	t.Run("reject_fails_b_closes_pr", func(t *testing.T) {
+		p, body, _, _ := resumed(t, specImplementGatingReviewers, rejectStep)
+		p.post(t, body)
+		p.assertFailedB(t)
+	})
+	t.Run("killed_503", func(t *testing.T) {
+		started := make(chan struct{})
+		p, body, _, _ := resumed(t, specImplementGatingReviewers, blockStep(started))
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "owner"), http.StatusServiceUnavailable)
+		p.assertNothingMoved(t)
+	})
+	t.Run("lost_next_process_409", func(t *testing.T) {
+		started := make(chan struct{})
+		p, body, _, _ := resumed(t, specImplementGatingReviewers, blockStep(started))
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		awaitResponse(t, done, "owner")
+		p.nextProcess(approveStep)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("prior_reject_blocks_no_reviewer", func(t *testing.T) {
+		p, body, first, _ := resumed(t, specImplementGatingReviewers, approveStep)
+		p.seedVerdict(t, prSeamHead, first, planreview.VerdictReject)
+		p.post(t, body)
+		p.assertFailedB(t)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+	})
+	t.Run("partial_prior_verdict_reruns_all_reviewers", func(t *testing.T) {
+		p, body, first, _ := resumed(t, specImplementGatingTwo, approveStep)
+		p.seedStart(t, prSeamHead, first, 2, prSeamPath)
+		p.seedVerdict(t, prSeamHead, first, planreview.VerdictApprove)
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 2 {
+			t.Errorf("reviewer calls = %d, want every configured reviewer", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("complete_on_this_attempt_heals_idempotent", func(t *testing.T) {
+		p, body, _, attempt := resumed(t, specImplementGatingReviewers, approveStep)
+		p.seedStart(t, prSeamHead, attempt, 1, prSeamPath)
+		p.seedVerdict(t, prSeamHead, attempt, planreview.VerdictApprove)
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("no_exemptions_heals_no_reviewer", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.plainBody(t)
+		p.seedArtifact(t, body)
+		p.retry()
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("advisory_heals_no_gating_entry", func(t *testing.T) {
+		p, body, _, _ := resumed(t, specImplementAdvisoryReviewers, approveStep)
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.s.waitBackgroundReviews()
+		if n := countAuditCategory(p.au, CategorySupplementalReviewStarted); n != 0 {
+			t.Errorf("start rows = %d, want 0 on an advisory spec", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+}
+
+func TestShipPullRequest_SameAttemptArtifact_NoStart_Refused(t *testing.T) {
+	p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+	body := p.body(t)
+	p.seedArtifact(t, body)
+	p.nextProcess(approveStep)
+	assertInterrupted(t, p.post(t, body), http.StatusConflict)
+	if n := p.rev.calls.Load(); n != 0 {
+		t.Errorf("reviewer calls = %d, want 0: no same-attempt replay dispatches", n)
+	}
+	p.assertNothingMoved(t)
+}
+
+func TestShipPullRequest_SupplementalGating_CompletedCurrentPass_Heals(t *testing.T) {
+	fault := errors.New("forced store fault")
+	failEdge := func(_ context.Context, to run.StageState) error {
+		if to == run.StageStateAwaitingApproval {
+			return fault
+		}
+		return nil
+	}
+	t.Run("same_attempt_failed_advance", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		p.repo.onTransition = failEdge
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		p.repo.onTransition = nil
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("replay = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want no further pass", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("replay_edge_fault_500", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		p.repo.onTransition = failEdge
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		p.assertNothingMoved(t)
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want no further pass", n)
+		}
+	})
+	t.Run("resumed_attempt_failed_advance", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		p.seedArtifact(t, body)
+		p.retry()
+		p.repo.onTransition = failEdge
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		p.repo.onTransition = nil
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("replay = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want no further pass", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+}
+
+func TestShipPullRequest_SupplementalEvidenceFailures_NonAdvancing(t *testing.T) {
+	fault := errors.New("forced read fault")
+	t.Run("claim_requirement_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.repo.onGetRun = func(int32) error { return fault }
+		assertStaticEdgeError(t, p.post(t, p.body(t)), fault.Error())
+		if n := p.artifacts(); n != 0 {
+			t.Errorf("artifacts = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("admission_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.audit.setHooks(nil, func(category string) error {
+			if category == CategoryReviewObligationCheckpoint {
+				return fault
+			}
+			return nil
+		})
+		assertStaticEdgeError(t, p.post(t, p.body(t)), fault.Error())
+		if n := p.artifacts(); n != 0 {
+			t.Errorf("artifacts = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("round_state_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		// Admission reads each category once; the dispatcher's proof read is the second.
+		var reads atomic.Int32
+		p.audit.setHooks(nil, func(category string) error {
+			if category == implementReviewedCategory && reads.Add(1) == 2 {
+				return fault
+			}
+			return nil
+		})
+		assertStaticEdgeError(t, p.post(t, p.body(t)), fault.Error())
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("started_append_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.audit.onDedup = func(audit.ChainAppendParams) (*audit.Entry, error) { return nil, fault }
+		assertStaticEdgeError(t, p.post(t, p.body(t)), fault.Error())
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		if n := countAuditCategory(p.au, implementReviewedCategory); n != 0 {
+			t.Errorf("verdict rows = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("started_row_undecodable", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.seed(t, CategorySupplementalReviewStarted, []byte(`{"pass_key":7}`))
+		assertStaticEdgeError(t, p.post(t, p.body(t)))
+		p.assertNothingMoved(t)
+	})
+	t.Run("idempotent_replay_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		p.seedArtifact(t, body)
+		var reads atomic.Int32
+		p.audit.setHooks(nil, func(category string) error {
+			if category == implementReviewedCategory && reads.Add(1) == 2 {
+				return fault
+			}
+			return nil
+		})
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		p.assertNothingMoved(t)
+	})
+	t.Run("partial_pass_replay", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingTwo, approveStep)
+		body := p.body(t)
+		attempt := p.attempt(t)
+		p.seedArtifact(t, body)
+		p.seedStart(t, prSeamHead, attempt, 2, prSeamPath)
+		p.seedVerdict(t, prSeamHead, attempt, planreview.VerdictApprove)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+}
+
+func TestShipPullRequest_SupplementalCapabilityAbsent_NoReviewer(t *testing.T) {
+	assertRefused := func(t *testing.T, p *prSeam) {
+		t.Helper()
+		assertStaticEdgeError(t, p.post(t, p.body(t)))
+		if n := p.artifacts(); n != 0 {
+			t.Errorf("artifacts = %d, want 0", n)
+		}
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		if got := p.state(t); got != run.StageStateRunning {
+			t.Errorf("stage = %q, want running", got)
+		}
+	}
+	t.Run("start_capability_absent", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.s.cfg.AuditRepo = plainAuditOnly{p.au}
+		assertRefused(t, p)
+	})
+	t.Run("attempt_cas_absent", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.s.cfg.RunRepo = noAttemptCASRepo{p.repo}
+		assertRefused(t, p)
+	})
+	t.Run("nil_dispatched_at", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.rr.mu.Lock()
+		p.stage.DispatchedAt = nil
+		p.rr.mu.Unlock()
+		assertRefused(t, p)
+	})
+	t.Run("guarded_edge_absent", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.s.cfg.RunRepo = noGuardRepo{p.rr}
+		assertRefused(t, p)
+	})
+}
+
+// noAttemptCASRepo hides the attempt-pinned transition behind the plain interface.
+type noAttemptCASRepo struct{ run.Repository }
+
+func TestSupplementalWrapper_NoHandlerReferrer(t *testing.T) {
+	got := productionReferrers(t, "runSupplementalReinvokeReview", "advanceImplementStageAfterPR")
+	if referrers := got["runSupplementalReinvokeReview"]; len(referrers) != 0 {
+		t.Errorf("runSupplementalReinvokeReview production referrers = %v, want none: the handler reads the typed outcome", referrers)
+	}
+	if referrers := got["advanceImplementStageAfterPR"]; len(referrers) != 0 {
+		t.Errorf("advanceImplementStageAfterPR production referrers = %v, want none: every upload takes a guarded edge", referrers)
+	}
+}
+
+// TestAdvanceImplementStageAfterPR_GenericEdge keeps the unguarded body's contract:
+// an error is logged and the edge is simply not taken.
+func TestAdvanceImplementStageAfterPR_GenericEdge(t *testing.T) {
+	p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+	req := httptest.NewRequest(http.MethodPost, "/", nil)
+	p.repo.onTransition = func(context.Context, run.StageState) error { return errors.New("forced") }
+	p.s.advanceImplementStageAfterPR(req, p.runRow.ID, p.current(t))
+	if got := p.state(t); got != run.StageStateRunning {
+		t.Errorf("stage = %q, want running", got)
+	}
+	p.repo.onTransition = nil
+	p.s.advanceImplementStageAfterPR(req, p.runRow.ID, p.current(t))
+	p.assertAdvancedOnce(t)
+}
+
+// obligationBody builds a report carrying a review obligation.
+func obligationReport(t *testing.T, fields map[string]any, obligation any) []byte {
+	t.Helper()
+	body := map[string]any{"branch": "fishhawk/run/held", "head_sha": prSeamHead, "base_sha": "2222222222222222222222222222222222222222", "verified_tree_sha": "aaaabbbb", "title": "A title", "body": "A body"}
+	for k, v := range fields {
+		body[k] = v
+	}
+	if obligation != nil {
+		body["review_obligation"] = obligation
+	}
+	b, err := json.Marshal(body)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func TestShipPullRequest_FailureReport_RecordsReviewObligation(t *testing.T) {
+	failed := map[string]any{"outcome": "failed", "category": "C", "reason": "open pull request failed"}
+	withKind := func(kind string) map[string]any {
+		out := map[string]any{"outcome": "failed", "category": "C", "reason": "failed", "resume_kind": kind}
+		return out
+	}
+	rows := func(p *prSeam, category string) []audit.ChainAppendParams {
+		p.au.mu.Lock()
+		defer p.au.mu.Unlock()
+		return entriesByCategory(p.au.appended, category)
+	}
+	send := func(t *testing.T, p *prSeam, body []byte) {
+		t.Helper()
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+	}
+	assertCarrier := func(t *testing.T, payload []byte, wantKey bool) {
+		t.Helper()
+		var carrier struct {
+			PushCheckpoint map[string]json.RawMessage `json:"push_checkpoint"`
+		}
+		if err := json.Unmarshal(payload, &carrier); err != nil {
+			t.Fatal(err)
+		}
+		_, hasKey := carrier.PushCheckpoint["review_obligation"]
+		if hasKey != wantKey {
+			t.Errorf("checkpoint review_obligation key = %v, want %v: %s", hasKey, wantKey, payload)
+		}
+	}
+	noCheckpoint := func(t *testing.T, p *prSeam) {
+		t.Helper()
+		for _, category := range []string{CategoryPushResumeCheckpoint, CategoryVerifyResumeCheckpoint, CategoryReviewObligationCheckpoint} {
+			if n := len(rows(p, category)); n != 0 {
+				t.Errorf("%s rows = %d, want none", category, n)
+			}
+		}
+		for _, row := range rows(p, "pull_request_failed") {
+			if strings.Contains(string(row.Payload), "push_checkpoint") {
+				t.Errorf("pull_request_failed carries a checkpoint: %s", row.Payload)
+			}
+		}
+	}
+	t.Run("obligated_pr_open", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		send(t, p, obligationReport(t, failed, requiredObligation(prSeamHead, p.attempt(t), prSeamPath)))
+		carriers := rows(p, CategoryReviewObligationCheckpoint)
+		if len(carriers) != 1 {
+			t.Fatalf("obligated carriers = %d, want 1", len(carriers))
+		}
+		if !strings.Contains(string(carriers[0].Payload), `"resume_kind":"pr_open"`) {
+			t.Errorf("carrier kind: %s", carriers[0].Payload)
+		}
+		noCheckpointOnFailed := rows(p, "pull_request_failed")
+		if len(noCheckpointOnFailed) != 1 || strings.Contains(string(noCheckpointOnFailed[0].Payload), "push_checkpoint") {
+			t.Errorf("the sibling must carry no push_checkpoint: %+v", noCheckpointOnFailed)
+		}
+	})
+	t.Run("obligated_push", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		send(t, p, obligationReport(t, withKind(resumeKindPush), requiredObligation(prSeamHead, p.attempt(t), prSeamPath)))
+		carriers := rows(p, CategoryReviewObligationCheckpoint)
+		if len(carriers) != 1 || !strings.Contains(string(carriers[0].Payload), `"resume_kind":"push"`) {
+			t.Fatalf("obligated carriers = %+v, want one push kind", carriers)
+		}
+		if n := len(rows(p, CategoryPushResumeCheckpoint)); n != 0 {
+			t.Errorf("push checkpoint rows = %d, want 0", n)
+		}
+	})
+	t.Run("known_none_pr_open", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		send(t, p, obligationReport(t, failed, requiredObligation(prSeamHead, p.attempt(t))))
+		carriers := rows(p, "pull_request_failed")
+		if len(carriers) != 1 {
+			t.Fatalf("rows = %d", len(carriers))
+		}
+		assertCarrier(t, carriers[0].Payload, true)
+	})
+	t.Run("known_none_push", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		send(t, p, obligationReport(t, withKind(resumeKindPush), requiredObligation(prSeamHead, p.attempt(t))))
+		carriers := rows(p, CategoryPushResumeCheckpoint)
+		if len(carriers) != 1 {
+			t.Fatalf("rows = %d", len(carriers))
+		}
+		assertCarrier(t, carriers[0].Payload, true)
+	})
+	t.Run("absent_legacy_bytes", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		send(t, p, obligationReport(t, failed, nil))
+		carriers := rows(p, "pull_request_failed")
+		if len(carriers) != 1 {
+			t.Fatalf("rows = %d", len(carriers))
+		}
+		assertCarrier(t, carriers[0].Payload, false)
+		want, _ := json.Marshal(map[string]any{"auth_method": "ed25519", "category": "C", "push_checkpoint": map[string]any{"base_sha": "2222222222222222222222222222222222222222", "branch": "fishhawk/run/held", "head_sha": prSeamHead, "pr_body": "A body", "pr_title": "A title", "verified_tree_sha": "aaaabbbb"}, "reason": "open pull request failed", "run_id": p.runRow.ID.String(), "stage_id": p.stage.ID.String()})
+		if !bytes.Equal(carriers[0].Payload, want) {
+			t.Errorf("payload changed:\n got %s\nwant %s", carriers[0].Payload, want)
+		}
+	})
+	t.Run("null_list_stays_unmarked", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		send(t, p, obligationReport(t, failed, map[string]any{"head_sha": prSeamHead, "stage_attempt": p.attempt(t), "supplemental_scope_exemptions": nil}))
+		assertCarrier(t, rows(p, "pull_request_failed")[0].Payload, false)
+	})
+	for _, tc := range []struct {
+		name       string
+		fields     func(attempt string) (map[string]any, *reviewObligation)
+		wantReason bool
+	}{
+		{name: "head_mismatch", fields: func(attempt string) (map[string]any, *reviewObligation) {
+			return failed, requiredObligation(prSeamOther, attempt, prSeamPath)
+		}, wantReason: true},
+		{name: "stale_attempt", fields: func(string) (map[string]any, *reviewObligation) {
+			return failed, requiredObligation(prSeamHead, recoveryOlder, prSeamPath)
+		}, wantReason: true},
+		{name: "reverify_nonempty", fields: func(attempt string) (map[string]any, *reviewObligation) {
+			return withKind(resumeKindReverify), requiredObligation(prSeamHead, attempt, prSeamPath)
+		}, wantReason: true},
+		{name: "invalid_never_laundered", fields: func(attempt string) (map[string]any, *reviewObligation) {
+			return failed, &reviewObligation{HeadSHA: prSeamHead, StageAttempt: attempt, SupplementalScopeExemptions: []scopeExemption{{Path: ""}}}
+		}, wantReason: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+			fields, obligation := tc.fields(p.attempt(t))
+			send(t, p, obligationReport(t, fields, obligation))
+			noCheckpoint(t, p)
+			discarded := rows(p, "verified_tree_discarded")
+			if len(discarded) != 1 || !strings.Contains(string(discarded[0].Payload), `"reason":"review_obligation_invalid"`) {
+				t.Errorf("discard rows = %+v, want one review_obligation_invalid", discarded)
+			}
+		})
+	}
+}
+
+func TestShipPullRequest_ReviewObligationMissing_Refused(t *testing.T) {
+	carrier := func(t *testing.T, p *prSeam, head string) {
+		t.Helper()
+		p.s.recordReviewObligationCheckpoint(t.Context(), p.runRow.ID, p.stage.ID, resumeKindPROpen,
+			pushCheckpointPayload{Branch: "b", HeadSHA: head, BaseSHA: "base", VerifiedTreeSHA: "tree"},
+			requiredObligation(head, p.attempt(t), prSeamPath), audit.ActorKind("system"), nil)
+	}
+	t.Run("missing_path", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		carrier(t, p, prSeamHead)
+		w := p.post(t, p.plainBody(t))
+		assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+		if !strings.Contains(w.Body.String(), `"missing_count":1`) {
+			t.Errorf("details: %s", w.Body.String())
+		}
+		if a, o := p.artifacts(), countAuditCategory(p.au, "pull_request_opened"); a != 0 || o != 0 {
+			t.Errorf("artifacts = %d, opened rows = %d, want none", a, o)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("list_read_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		fault := errors.New("forced list fault")
+		p.audit.setHooks(nil, func(string) error { return fault })
+		assertStaticEdgeError(t, p.post(t, p.plainBody(t)), fault.Error())
+		if n := p.artifacts(); n != 0 {
+			t.Errorf("artifacts = %d, want 0", n)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("discharged_omission_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		attempt := p.attempt(t)
+		carrier(t, p, prSeamHead)
+		p.seedStart(t, prSeamHead, attempt, 1, prSeamPath)
+		p.seedVerdict(t, prSeamHead, attempt, planreview.VerdictApprove)
+		if w := p.post(t, p.plainBody(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("discharged_omission_takes_ownership", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		attempt := p.attempt(t)
+		carrier(t, p, prSeamHead)
+		p.seedStart(t, prSeamHead, attempt, 1, prSeamPath)
+		p.seedVerdict(t, prSeamHead, attempt, planreview.VerdictApprove)
+		release, _, ok := p.s.supplementalPasses.tryAcquire(supplementalPassKey{stageID: p.stage.ID, attempt: attempt, headSHA: prSeamHead}, time.Now().Add(time.Minute))
+		if !ok {
+			t.Fatal("setup: acquire")
+		}
+		defer release()
+		assertCode(t, p.post(t, p.plainBody(t)), http.StatusServiceUnavailable, "review_round_in_flight")
+		p.assertNothingMoved(t)
+	})
+	t.Run("body_covers", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		carrier(t, p, prSeamHead)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want the required pass", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("different_head_unaffected", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		carrier(t, p, prSeamOther)
+		if w := p.post(t, p.plainBody(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("no_carrier_unchanged", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		w := p.post(t, p.plainBody(t))
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+		if n := p.notes.n.Load(); n != 1 {
+			t.Errorf("status comments = %d, want 1", n)
+		}
+	})
+}
+
+// parkSeam posts one park report and returns what the parker received.
+func parkReportBody(t *testing.T, obligation any) []byte {
+	t.Helper()
+	return obligationReport(t, map[string]any{"outcome": "scope_park", "missing_paths": []string{"backend/internal/foo/bar.go"}}, obligation)
+}
+
+func newParkSeam(t *testing.T) (*prSeam, *parkRecordingRepo) {
+	t.Helper()
+	p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+	parker := &parkRecordingRepo{orchestratorRepo: p.rr}
+	p.s.cfg.RunRepo = parker
+	return p, parker
+}
+
+func decodeParked(t *testing.T, payload []byte) map[string]json.RawMessage {
+	t.Helper()
+	var got map[string]json.RawMessage
+	if err := json.Unmarshal(payload, &got); err != nil {
+		t.Fatal(err)
+	}
+	return got
+}
+
+func TestParkScopeCompleteness_RecordsReviewObligation(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		report  func(p *prSeam) any
+		wantKey bool
+	}{
+		{"required", func(p *prSeam) any { return requiredObligation(prSeamHead, p.attempt(t), prSeamPath) }, true},
+		{"known_none", func(p *prSeam) any { return requiredObligation(prSeamHead, p.attempt(t)) }, true},
+		{"absent", func(*prSeam) any { return nil }, false},
+		{"invalid", func(p *prSeam) any { return requiredObligation(prSeamOther, p.attempt(t), prSeamPath) }, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			p, parker := newParkSeam(t)
+			if w := p.post(t, parkReportBody(t, tc.report(p))); w.Code != http.StatusOK {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			if len(parker.parkCalls) != 1 {
+				t.Fatalf("park calls = %d", len(parker.parkCalls))
+			}
+			if _, has := decodeParked(t, parker.parkCalls[0].append.Payload)["review_obligation"]; has != tc.wantKey {
+				t.Errorf("review_obligation key = %v, want %v", has, tc.wantKey)
+			}
+		})
+	}
+}
+
+func TestParkReport_WithholdsOldReadableBase(t *testing.T) {
+	const base = "2222222222222222222222222222222222222222"
+	t.Run("known_required", func(t *testing.T) {
+		var sections struct {
+			ParkRow json.RawMessage `json:"park_row"`
+			Parked  json.RawMessage `json:"parked_payload"`
+		}
+		if err := json.Unmarshal(loadReviewObligationWire(t).KnownRequiredPark, &sections); err != nil {
+			t.Fatal(err)
+		}
+		var goldenPayload map[string]json.RawMessage
+		if err := json.Unmarshal(sections.Parked, &goldenPayload); err != nil {
+			t.Fatal(err)
+		}
+		var report goldenFailureBody
+		if err := json.Unmarshal(loadReviewObligationWire(t).FailureReport, &report); err != nil {
+			t.Fatal(err)
+		}
+		p, parker := newParkSeam(t)
+		runID, stageID := uuid.MustParse("11112222-3333-4444-5555-666677778888"), uuid.MustParse("99990000-aaaa-bbbb-cccc-ddddeeeeffff")
+		token, err := time.Parse(time.RFC3339Nano, "2026-11-05T12:00:00Z")
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.rr.mu.Lock()
+		p.rr.stagesByID[stageID] = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement, State: run.StageStateRunning, DispatchedAt: &token, RequiresApproval: true}
+		p.rr.mu.Unlock()
+		priv, _ := p.sf.issue(t, runID)
+		body, err := json.Marshal(map[string]any{
+			"outcome": "scope_park", "branch": report.Branch, "head_sha": report.HeadSHA, "base_sha": report.BaseSHA,
+			"verified_tree_sha": report.VerifiedTreeSHA, "title": report.Title, "body": report.Body,
+			"missing_paths": []string{"backend/internal/foo/bar.go"}, "review_obligation": report.ReviewObligation,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if w := shipPRRequest(t, p.s, runID, stageID, priv, body, ""); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if len(parker.parkCalls) != 1 {
+			t.Fatalf("park calls = %d", len(parker.parkCalls))
+		}
+		call := parker.parkCalls[0]
+		if call.park.BaseSHA != "" {
+			t.Errorf("park row base = %q, want withheld", call.park.BaseSHA)
+		}
+		row, err := json.Marshal(call.park)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Equal(row, sections.ParkRow) {
+			t.Errorf("park row:\n got %s\nwant %s", row, sections.ParkRow)
+		}
+		if !bytes.Equal(call.append.Payload, sections.Parked) {
+			t.Errorf("parked payload:\n got %s\nwant %s", call.append.Payload, sections.Parked)
+		}
+		got := decodeParked(t, call.append.Payload)
+		if _, has := got["base_sha"]; has {
+			t.Error("parked payload still names base_sha")
+		}
+		if string(got["required_review_base_sha"]) != fmt.Sprintf("%q", report.BaseSHA) {
+			t.Errorf("required_review_base_sha = %s", got["required_review_base_sha"])
+		}
+	})
+	t.Run("invalid_nonempty", func(t *testing.T) {
+		p, parker := newParkSeam(t)
+		bad := &reviewObligation{HeadSHA: "", StageAttempt: p.attempt(t), SupplementalScopeExemptions: []scopeExemption{{Path: prSeamPath}}}
+		if w := p.post(t, parkReportBody(t, bad)); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		call := parker.parkCalls[0]
+		got := decodeParked(t, call.append.Payload)
+		if call.park.BaseSHA != "" {
+			t.Errorf("park row base = %q, want withheld", call.park.BaseSHA)
+		}
+		for _, key := range []string{"base_sha", "review_obligation", "required_review_base_sha"} {
+			if _, has := got[key]; has {
+				t.Errorf("payload stores %s: an invalid report stores neither key", key)
+			}
+		}
+	})
+	t.Run("known_none", func(t *testing.T) {
+		p, parker := newParkSeam(t)
+		if w := p.post(t, parkReportBody(t, requiredObligation(prSeamHead, p.attempt(t)))); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		call := parker.parkCalls[0]
+		got := decodeParked(t, call.append.Payload)
+		if call.park.BaseSHA != base {
+			t.Errorf("park row base = %q, want kept", call.park.BaseSHA)
+		}
+		if _, has := got["base_sha"]; !has {
+			t.Error("payload lost base_sha")
+		}
+		if _, has := got["required_review_base_sha"]; has {
+			t.Error("known-none stored required_review_base_sha")
+		}
+	})
+	t.Run("no_key", func(t *testing.T) {
+		p, parker := newParkSeam(t)
+		if w := p.post(t, parkReportBody(t, nil)); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		call := parker.parkCalls[0]
+		want, _ := json.Marshal(map[string]any{
+			"auth_method": "ed25519", "base_sha": base, "branch": "fishhawk/run/held", "head_sha": prSeamHead,
+			"missing_paths": []string{"backend/internal/foo/bar.go"}, "pr_body": "A body", "pr_title": "A title",
+			"run_id": p.runRow.ID.String(), "stage_id": p.stage.ID.String(), "unsatisfied_assertions": nil, "verified_tree_sha": "aaaabbbb",
+		})
+		if !bytes.Equal(call.append.Payload, want) {
+			t.Errorf("payload changed:\n got %s\nwant %s", call.append.Payload, want)
+		}
+	})
+	t.Run("two_step_fallback", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		if w := p.post(t, parkReportBody(t, requiredObligation(prSeamHead, p.attempt(t), prSeamPath))); w.Code != http.StatusOK {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		parked := findAuditByCategory(t, p.au, CategoryScopeCompletenessParked)
+		if parked == nil {
+			t.Fatal("no parked row")
+		}
+		got := decodeParked(t, parked.Payload)
+		if _, has := got["base_sha"]; has {
+			t.Error("fallback path still names base_sha")
+		}
+		if _, has := got["required_review_base_sha"]; !has {
+			t.Error("fallback path lost required_review_base_sha")
+		}
+		if p.state(t) != run.StageStateAwaitingScopeDecision {
+			t.Errorf("stage = %q", p.state(t))
+		}
+	})
+}
+
+// --- the ordinary terminal edge, hermetic arms (ADR-140 (#5047) D8, D9) ----------
+
+// onCreateArtifactRepo runs hook just after the artifact persisted, which is after
+// every admission read and before the handler's terminal edge.
+type onCreateArtifactRepo struct {
+	artifact.Repository
+	hook func()
+}
+
+func (r *onCreateArtifactRepo) Create(ctx context.Context, params artifact.CreateParams) (*artifact.Artifact, error) {
+	got, err := r.Repository.Create(ctx, params)
+	if err == nil && r.hook != nil {
+		r.hook()
+	}
+	return got, err
+}
+
+// afterAdmission runs hook inside the handler, past its admission reads.
+func (p *prSeam) afterAdmission(hook func()) {
+	p.s.cfg.ArtifactRepo = &onCreateArtifactRepo{Repository: p.art, hook: hook}
+}
+
+func (p *prSeam) setGateless() {
+	p.rr.mu.Lock()
+	defer p.rr.mu.Unlock()
+	p.rr.stagesByID[p.stage.ID].RequiresApproval = false
+}
+
+func (p *prSeam) setState(state run.StageState) {
+	p.rr.mu.Lock()
+	defer p.rr.mu.Unlock()
+	p.rr.stagesByID[p.stage.ID].State = state
+}
+
+func (p *prSeam) clearDispatch() {
+	p.rr.mu.Lock()
+	defer p.rr.mu.Unlock()
+	p.rr.stagesByID[p.stage.ID].DispatchedAt = nil
+}
+
+func (p *prSeam) assertNotified(t *testing.T, status, boards int32) {
+	t.Helper()
+	if n := p.notes.n.Load(); n != status {
+		t.Errorf("status comments = %d, want %d", n, status)
+	}
+	if n := p.boards.Load(); n != boards {
+		t.Errorf("board transitions = %d, want %d", n, boards)
+	}
+}
+
+func TestShipPullRequest_OrdinaryEdge_Modes(t *testing.T) {
+	seedOlderReject := func(t *testing.T, p *prSeam) func() {
+		return func() { p.seedVerdict(t, prSeamHead, recoveryOlder, planreview.VerdictReject) }
+	}
+	created := func(t *testing.T, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != http.StatusCreated {
+			t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+		}
+	}
+	t.Run("hermetic_reject_fails_b", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.afterAdmission(seedOlderReject(t, p))
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertFailedB(t)
+		p.assertNotified(t, 0, 0)
+	})
+	t.Run("identity_drift_no_edge", func(t *testing.T) {
+		// A reject and a retry both land after admission: the failed edge is pinned to
+		// this request's attempt, so the newer attempt keeps running.
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		var newer string
+		p.afterAdmission(func() {
+			p.seedVerdict(t, prSeamHead, recoveryOlder, planreview.VerdictReject)
+			newer = p.retry()
+		})
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertNothingMoved(t)
+		if got := p.attempt(t); got != newer {
+			t.Errorf("attempt = %q, want the newer %q", got, newer)
+		}
+	})
+	t.Run("hermetic_reject_failed_edge_no_close", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.afterAdmission(seedOlderReject(t, p))
+		p.repo.onTransition = func(_ context.Context, to run.StageState) error {
+			if to == run.StageStateFailed {
+				return errors.New("forced failed-edge fault")
+			}
+			return nil
+		}
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertNothingMoved(t)
+	})
+	t.Run("hermetic_claimed_reject", func(t *testing.T) {
+		// A reject another attempt commits after this pass's last read: the claimed
+		// edge finds it under the lock.
+		var p *prSeam
+		step := func(ctx context.Context) (*planreview.ReviewVerdict, string, error) {
+			p.seedVerdict(t, prSeamHead, recoveryOlder, planreview.VerdictReject)
+			return approveStep(ctx)
+		}
+		p = newPRSeam(t, specImplementGatingReviewers, step)
+		created(t, p.post(t, p.body(t)))
+		p.assertFailedB(t)
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want 1", n)
+		}
+	})
+	t.Run("claimed_document_injection_fails_b", func(t *testing.T) {
+		// The block comes from the dispatcher with no reject row for a guard to find.
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		wireReviewInjection(p.s, missingDecl())
+		created(t, p.post(t, p.body(t)))
+		p.assertFailedB(t)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+	})
+	t.Run("hermetic_heal_reject", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.plainBody(t)
+		p.seedArtifact(t, body)
+		p.seedVerdict(t, prSeamHead, recoveryOlder, planreview.VerdictReject)
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("heal status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+	})
+	t.Run("hermetic_obligation_unmet_409", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.afterAdmission(func() { p.seedStart(t, prSeamHead, p.attempt(t), 1, prSeamPath) })
+		w := p.post(t, p.plainBody(t))
+		assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+		p.assertNothingMoved(t)
+		if n := p.artifacts(); n != 1 {
+			t.Errorf("artifacts = %d, want the one created before the race", n)
+		}
+	})
+	t.Run("hermetic_started_incomplete_full_body_refused", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.afterAdmission(func() { p.seedStart(t, prSeamHead, p.attempt(t), 1) })
+		assertInterrupted(t, p.post(t, p.plainBody(t)), http.StatusConflict)
+		p.assertNothingMoved(t)
+	})
+	t.Run("hermetic_read_error_500", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		fault := errors.New("forced guard read fault")
+		p.afterAdmission(func() {
+			p.audit.setHooks(nil, func(category string) error {
+				if category == implementReviewedCategory {
+					return fault
+				}
+				return nil
+			})
+		})
+		assertStaticEdgeError(t, p.post(t, p.plainBody(t)), fault.Error())
+		p.assertNothingMoved(t)
+	})
+	t.Run("capability_absent_no_artifact", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.s.cfg.RunRepo = noGuardRepo{p.rr}
+		assertStaticEdgeError(t, p.post(t, p.plainBody(t)))
+		if n := p.artifacts(); n != 0 {
+			t.Errorf("artifacts = %d, want 0", n)
+		}
+	})
+	t.Run("plain_fixture_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertAdvancedOnce(t)
+		p.assertNotified(t, 1, 1)
+	})
+	t.Run("plain_fixture_advances_gateless", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setGateless()
+		created(t, p.post(t, p.plainBody(t)))
+		if got := p.state(t); got != run.StageStateSucceeded {
+			t.Errorf("stage = %q, want succeeded", got)
+		}
+		if n := p.repo.listStages.Load(); n == 0 {
+			t.Error("a gateless stage must fire the orchestrator after its edge")
+		}
+		p.assertNotified(t, 1, 1)
+	})
+	t.Run("gateless_orchestrator_error_keeps_the_edge", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setGateless()
+		p.repo.onTransition = func(context.Context, run.StageState) error {
+			p.repo.onGetRun = func(int32) error { return errors.New("forced run read fault") }
+			return nil
+		}
+		created(t, p.post(t, p.plainBody(t)))
+		if got := p.state(t); got != run.StageStateSucceeded {
+			t.Errorf("stage = %q, want succeeded: the orchestrator's error is best-effort", got)
+		}
+	})
+	t.Run("drift_no_notify", func(t *testing.T) {
+		for _, drift := range []struct {
+			name  string
+			apply func(p *prSeam)
+		}{
+			{"attempt", func(p *prSeam) { p.retry() }},
+			{"state", func(p *prSeam) { p.setState(run.StageStateFailed) }},
+		} {
+			t.Run(drift.name, func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				p.afterAdmission(func() { drift.apply(p) })
+				created(t, p.post(t, p.plainBody(t)))
+				p.assertNoEffects(t)
+			})
+		}
+	})
+	t.Run("advisory_exemptions_unclaimed_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementAdvisoryReviewers, approveStep)
+		created(t, p.post(t, p.body(t)))
+		p.s.waitBackgroundReviews()
+		if n := countAuditCategory(p.au, CategorySupplementalReviewStarted); n != 0 {
+			t.Errorf("start rows = %d, want 0", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("advisory_reject_excluded", func(t *testing.T) {
+		p := newPRSeam(t, specImplementAdvisoryReviewers, approveStep)
+		evidence := supplementalVerdict(prSeamHead, p.attempt(t), planreview.VerdictReject)
+		evidence.Authority = planreview.AuthorityAdvisory
+		p.seed(t, implementReviewedCategory, recoveryPayload(t, evidence))
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("advisory_requirement_changed_refuses", func(t *testing.T) {
+		p := newPRSeam(t, specImplementAdvisoryReviewers, approveStep)
+		fault := errors.New("forced run read fault")
+		p.afterAdmission(func() { p.repo.onGetRun = func(int32) error { return fault } })
+		assertStaticEdgeError(t, p.post(t, p.body(t)), fault.Error())
+		p.assertNothingMoved(t)
+	})
+	t.Run("no_pass_configuration_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.s.cfg.ArtifactRepo = newFakeArtifactRepo() // no approved plan
+		p.art = p.s.cfg.ArtifactRepo.(*fakeArtifactRepo)
+		created(t, p.post(t, p.body(t)))
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want 0", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("legacy_identity_no_rows_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.clearDispatch()
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("legacy_identity_reject_fails_b", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.clearDispatch()
+		p.afterAdmission(seedOlderReject(t, p))
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertFailedB(t)
+	})
+	t.Run("legacy_identity_row_gained_dispatch_refused", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.clearDispatch()
+		p.afterAdmission(func() { p.retry() })
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertNoEffects(t)
+	})
+	t.Run("settled_stage_reject_no_notify", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setState(run.StageStateAwaitingApproval)
+		p.seedVerdict(t, prSeamHead, p.attempt(t), planreview.VerdictReject)
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertNoEffects(t)
+	})
+	t.Run("settled_stage_no_reject_notifies", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setState(run.StageStateAwaitingApproval)
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertNotified(t, 1, 1)
+		if n := p.repo.advances.Load(); n != 0 {
+			t.Errorf("edges = %d, want 0", n)
+		}
+	})
+	t.Run("settled_stage_read_error_no_notify", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setState(run.StageStateAwaitingApproval)
+		p.audit.setHooks(nil, func(category string) error {
+			if category == implementReviewedCategory {
+				return errors.New("forced read fault")
+			}
+			return nil
+		})
+		created(t, p.post(t, p.plainBody(t)))
+		p.assertNoEffects(t)
+	})
+	t.Run("identity_edge_capability_absent", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.s.cfg.RunRepo = noGuardRepo{p.rr}
+		if _, err := p.s.transitionStageAtIdentity(t.Context(), p.stage.ID, "", run.StageStateFailed, nil); !errors.Is(err, errSupplementalAttemptCASAbsent) {
+			t.Errorf("err = %v, want the absent capability refusal", err)
+		}
+	})
+}
+
+// variantReportBaseSHA is the base every variantCase body reports.
+const variantReportBaseSHA = "2222222222222222222222222222222222222222"
+
+// reportedHeadForgeTips holds each admitting forge's branch tip, keyed by its
+// closeRecorder, so an arm can confirm a head other than prSeamHead.
+var reportedHeadForgeTips sync.Map // *closeRecorder -> *atomic.Pointer[string]
+
+// setReportedHeadTip makes c's admitting forge name sha as every branch tip.
+func (c *closeRecorder) setReportedHeadTip(sha string) {
+	v, _ := reportedHeadForgeTips.LoadOrStore(c, &atomic.Pointer[string]{})
+	v.(*atomic.Pointer[string]).Store(&sha)
+}
+
+// reportedHeadAdmittingServer serves c's close and comment routes plus the forge
+// reads ADR-141's reported-head check makes (#5053): the PR head and every branch
+// tip name prSeamHead (setReportedHeadTip moves the tip), and every commit's first
+// parent is variantReportBaseSHA. Each variantCase reports exactly that head and
+// base, so the check admits it and the suites keep exercising the guarded edge
+// behind it (ADR-140 (#5047) D8, D9). The PR read carries no base ref, so the
+// branch-lineage check stays fail-open as before.
+func (c *closeRecorder) reportedHeadAdmittingServer(t *testing.T) *httptest.Server {
+	t.Helper()
+	c.setReportedHeadTip(prSeamHead)
+	mux := http.NewServeMux()
+	mux.HandleFunc("GET /repos/{owner}/{repo}/pulls/{number}", func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"number": 42, "node_id": "PR_seam", "state": "open",
+			"head": map[string]string{"sha": prSeamHead, "ref": "fishhawk/run/stage"},
+		})
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/ref/heads/{branch...}", func(w http.ResponseWriter, _ *http.Request) {
+		v, _ := reportedHeadForgeTips.Load(c)
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{"object": map[string]string{"sha": *v.(*atomic.Pointer[string]).Load()}})
+	})
+	mux.HandleFunc("GET /repos/{owner}/{repo}/git/commits/{sha}", func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sha": r.PathValue("sha"), "tree": map[string]string{"sha": "tree"},
+			"parents": []map[string]string{{"sha": variantReportBaseSHA}},
+		})
+	})
+	mux.Handle("/", c.server(t).Config.Handler)
+	srv := httptest.NewServer(mux)
+	t.Cleanup(func() {
+		srv.Close()
+		reportedHeadForgeTips.Delete(c)
+	})
+	return srv
+}
+
+// reportedHeadChecked reports whether ADR-141's forge check (#5053) gates this
+// outcome before its edge: a run-read fault then answers that check's retryable
+// 503 with nothing recorded, ahead of the guarded edge's static 500.
+func (c variantCase) reportedHeadChecked() bool {
+	return c.outcome == "fixup_pushed" || c.outcome == "conflict_resolution_pushed"
+}
+
+// assertRunReadRefused is the run-read-fault answer for c: the forge check's 503
+// on a checked outcome, otherwise the guarded edge's static 500.
+func (c variantCase) assertRunReadRefused(t *testing.T, w *httptest.ResponseRecorder, fault error) {
+	t.Helper()
+	if c.reportedHeadChecked() {
+		assertCode(t, w, http.StatusServiceUnavailable, "reported_head_unverifiable")
+		return
+	}
+	assertStaticEdgeError(t, w, fault.Error())
+}
+
+// --- the alternative-outcome edges (§43), hermetic arms --------------------------
+
+// variantCase is one runner-spelled alternative outcome.
+type variantCase struct {
+	outcome string
+	row     string
+	head    string
+}
+
+var prVariantCases = []variantCase{
+	{"pushed", "child_pushed", prSeamHead},
+	{"fixup_pushed", "fixup_pushed", prSeamHead},
+	{"fixup_no_changes", "fixup_no_changes", ""},
+	{"conflict_resolution_pushed", CategoryConflictResolutionPushed, prSeamHead},
+}
+
+func (c variantCase) body(t *testing.T) []byte {
+	t.Helper()
+	fields := map[string]any{"outcome": c.outcome, "branch": "fishhawk/run/stage", "base_sha": variantReportBaseSHA, "files_changed_count": 1}
+	if c.head != "" {
+		fields["head_sha"] = c.head
+	}
+	b, err := json.Marshal(fields)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func (c variantCase) assertNoRow(t *testing.T, p *prSeam) {
+	t.Helper()
+	if n := countAuditCategory(p.au, c.row); n != 0 {
+		t.Errorf("%s rows = %d, want 0", c.row, n)
+	}
+}
+
+// proveMode seeds what server evidence proves this outcome's mode with.
+func (c variantCase) proveMode(t *testing.T, p *prSeam) {
+	t.Helper()
+	switch c.outcome {
+	case "pushed":
+		parent := uuid.New()
+		p.rr.mu.Lock()
+		p.rr.runs[p.runRow.ID].DecomposedFrom = &parent
+		p.rr.mu.Unlock()
+	case "fixup_pushed", "fixup_no_changes":
+		p.seed(t, CategoryStageFixupTriggered, []byte(`{"concerns":[{"severity":"HIGH","category":"c","note":"n"}]}`))
+	case "conflict_resolution_pushed":
+		p.seed(t, CategoryStageConflictResolutionTriggered, []byte(`{"branch":"b","base_ref":"main","expected_head_sha":"h"}`))
+	}
+}
+
+// assertUnprovenRefused pins the refusal of a claim no server evidence proves. A
+// conflict_resolution_pushed claim with no live trigger is refused by its report
+// guard (#3806) before the variant edge, so it answers conflict_resolution_not_live
+// and carries no variant details; every other outcome answers code with details.
+func (c variantCase) assertUnprovenRefused(t *testing.T, w *httptest.ResponseRecorder, code string, details ...string) {
+	t.Helper()
+	if c.outcome == "conflict_resolution_pushed" {
+		assertCode(t, w, http.StatusConflict, "conflict_resolution_not_live")
+		return
+	}
+	assertCode(t, w, http.StatusConflict, code)
+	for _, d := range details {
+		if !strings.Contains(w.Body.String(), d) {
+			t.Errorf("details %s missing: %s", d, w.Body.String())
+		}
+	}
+}
+
+// armLiveConflictTrigger gives a conflict_resolution_pushed case the live trigger
+// its report guard requires (#3806); other outcomes are untouched.
+func (c variantCase) armLiveConflictTrigger(t *testing.T, p *prSeam) {
+	t.Helper()
+	if c.outcome == "conflict_resolution_pushed" {
+		c.proveMode(t, p)
+	}
+}
+
+func TestVariantSuccessEdges_KeepGenericEdge(t *testing.T) {
+	for _, c := range prVariantCases {
+		for _, mode := range []struct {
+			name  string
+			setup func(t *testing.T, p *prSeam, c variantCase)
+		}{
+			{"nothing_recorded", func(*testing.T, *prSeam, variantCase) {}},
+			{"proved", func(t *testing.T, p *prSeam, c variantCase) { c.proveMode(t, p) }},
+		} {
+			t.Run(c.outcome+"_"+mode.name, func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+				mode.setup(t, p, c)
+				w := p.post(t, c.body(t))
+				if c.outcome == "conflict_resolution_pushed" && mode.name == "nothing_recorded" {
+					// No live trigger: the report guard (#3806) refuses before any edge.
+					c.assertUnprovenRefused(t, w, "")
+					c.assertNoRow(t, p)
+					if n := p.repo.advances.Load(); n != 0 {
+						t.Errorf("edges = %d, want 0", n)
+					}
+					return
+				}
+				if w.Code != http.StatusOK {
+					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+				}
+				p.s.waitBackgroundReviews()
+				// ADR-141 (#5053) replaces a checked outcome's branch with the one
+				// the forge check resolved; every other byte is unchanged.
+				wantBranch := "fishhawk/run/stage"
+				if c.reportedHeadChecked() {
+					wantBranch = fixupBranchFor(p.runRow, p.stage)
+				}
+				if !strings.Contains(w.Body.String(), `"outcome":"`+c.outcome+`"`) || !strings.Contains(w.Body.String(), `"branch":"`+wantBranch+`"`) {
+					t.Errorf("response bytes changed: %s", w.Body.String())
+				}
+				if got := p.state(t); got != run.StageStateAwaitingApproval {
+					t.Errorf("stage = %q, want awaiting_approval", got)
+				}
+				if n := p.repo.advances.Load(); n != 1 {
+					t.Errorf("edges = %d, want 1", n)
+				}
+				if n := countAuditCategory(p.au, c.row); n != 1 {
+					t.Errorf("%s rows = %d, want 1", c.row, n)
+				}
+				if n := p.notes.n.Load(); n < 1 {
+					t.Error("no status comment")
+				}
+			})
+		}
+		t.Run(c.outcome+"_gateless_fires_orchestrator", func(t *testing.T) {
+			p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+			c.armLiveConflictTrigger(t, p)
+			p.setGateless()
+			if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
+				t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+			}
+			p.s.waitBackgroundReviews()
+			if got := p.state(t); got != run.StageStateSucceeded {
+				t.Errorf("stage = %q, want succeeded", got)
+			}
+			if p.repo.listStages.Load() == 0 {
+				t.Error("a gateless stage must fire the orchestrator after its edge")
+			}
+		})
+	}
+}
+
+func TestShipPullRequest_VariantEdge_Modes(t *testing.T) {
+	seedBinding := func(t *testing.T, p *prSeam) {
+		t.Helper()
+		p.seedVerdict(t, prSeamOther, p.attempt(t), planreview.VerdictReject)
+	}
+	readFault := errors.New("forced read fault")
+	failVerdictReads := func(category string) error {
+		if category == implementReviewedCategory {
+			return readFault
+		}
+		return nil
+	}
+	for _, c := range prVariantCases {
+		// A conflict_resolution_pushed report reaches the variant edge only with a
+		// live trigger (#3806), so its arms run on a live pass.
+		seam := func(t *testing.T) *prSeam {
+			t.Helper()
+			p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+			c.armLiveConflictTrigger(t, p)
+			return p
+		}
+		t.Run(c.outcome, func(t *testing.T) {
+			t.Run("refused_409_no_row", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				seedBinding(t, p)
+				w := p.post(t, c.body(t))
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"outcome":"`+c.outcome+`"`, `"missing_count"`)
+				c.assertNoRow(t, p)
+				p.assertNothingMoved(t)
+			})
+			if c.outcome == "conflict_resolution_pushed" {
+				// The unproven arms above now stop at the admission guard (#3806). A live
+				// trigger proves the mode, and a reject or unmet obligation at the SAME head
+				// still refuses at the typed edge, so removing it stays observable.
+				t.Run("live_trigger_same_head_reject_refused", func(t *testing.T) {
+					p := seam(t)
+					p.seedVerdict(t, prSeamHead, p.attempt(t), planreview.VerdictReject)
+					w := p.post(t, c.body(t))
+					assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+					c.assertNoRow(t, p)
+					p.assertNothingMoved(t)
+				})
+				t.Run("live_trigger_same_head_unmet_refused", func(t *testing.T) {
+					p := seam(t)
+					p.seedStart(t, prSeamHead, p.attempt(t), 1, prSeamPath)
+					w := p.post(t, c.body(t))
+					assertCode(t, w, http.StatusConflict, "review_obligation_missing")
+					if !strings.Contains(w.Body.String(), `"missing_count":1`) {
+						t.Errorf("details: %s", w.Body.String())
+					}
+					c.assertNoRow(t, p)
+				})
+			}
+			t.Run("refused_unmet_counts_missing", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				p.seedStart(t, prSeamOther, p.attempt(t), 1, prSeamPath)
+				w := p.post(t, c.body(t))
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"missing_count":1`)
+				c.assertNoRow(t, p)
+			})
+			t.Run("drift_200_no_row_no_notify", func(t *testing.T) {
+				p := seam(t)
+				p.repo.onGetStage = func(_ context.Context, call int32) error {
+					if call == 2 {
+						p.retry()
+					}
+					return nil
+				}
+				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
+					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+				}
+				c.assertNoRow(t, p)
+				p.assertNothingMoved(t)
+			})
+			t.Run("read_error_500", func(t *testing.T) {
+				p := seam(t)
+				p.audit.setHooks(nil, failVerdictReads)
+				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
+				c.assertNoRow(t, p)
+				p.assertNothingMoved(t)
+			})
+			t.Run("run_read_error_500", func(t *testing.T) {
+				p := seam(t)
+				p.repo.onGetRun = func(int32) error { return readFault }
+				c.assertRunReadRefused(t, p.post(t, c.body(t)), readFault)
+				c.assertNoRow(t, p)
+				p.assertNothingMoved(t)
+			})
+			t.Run("capability_absent_500", func(t *testing.T) {
+				p := seam(t)
+				p.s.cfg.RunRepo = noGuardRepo{p.rr}
+				assertStaticEdgeError(t, p.post(t, c.body(t)))
+				c.assertNoRow(t, p)
+			})
+			t.Run("store_fault_500", func(t *testing.T) {
+				p := seam(t)
+				p.repo.onTransition = func(context.Context, run.StageState) error { return readFault }
+				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
+				c.assertNoRow(t, p)
+				p.assertNothingMoved(t)
+			})
+			t.Run("settled_refused_no_row", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				p.setState(run.StageStateAwaitingApproval)
+				seedBinding(t, p)
+				c.assertUnprovenRefused(t, p.post(t, c.body(t)), "review_obligation_missing")
+				c.assertNoRow(t, p)
+				p.assertNoEffects(t)
+			})
+			t.Run("settled_read_error_500", func(t *testing.T) {
+				p := seam(t)
+				p.setState(run.StageStateAwaitingApproval)
+				p.audit.setHooks(nil, failVerdictReads)
+				assertStaticEdgeError(t, p.post(t, c.body(t)), readFault.Error())
+				c.assertNoRow(t, p)
+				p.assertNoEffects(t)
+			})
+			t.Run("settled_run_read_error_500", func(t *testing.T) {
+				p := seam(t)
+				p.setState(run.StageStateAwaitingApproval)
+				p.repo.onGetRun = func(int32) error { return readFault }
+				c.assertRunReadRefused(t, p.post(t, c.body(t)), readFault)
+				c.assertNoRow(t, p)
+			})
+			t.Run("settled_undecodable_500", func(t *testing.T) {
+				p := seam(t)
+				p.setState(run.StageStateAwaitingApproval)
+				p.seed(t, implementReviewedCategory, []byte(`{"verdict":7}`))
+				assertStaticEdgeError(t, p.post(t, c.body(t)))
+				c.assertNoRow(t, p)
+			})
+			t.Run("settled_nothing_recorded_unchanged", func(t *testing.T) {
+				p := seam(t)
+				p.setState(run.StageStateAwaitingApproval)
+				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
+					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+				}
+				p.s.waitBackgroundReviews()
+				if n := countAuditCategory(p.au, c.row); n != 1 {
+					t.Errorf("%s rows = %d, want 1", c.row, n)
+				}
+				if n := p.repo.advances.Load(); n != 0 {
+					t.Errorf("edges = %d, want 0", n)
+				}
+			})
+			t.Run("dedup_replay_unchanged", func(t *testing.T) {
+				p := seam(t)
+				seedBinding(t, p) // binding evidence would refuse: dedup stays first.
+				p.seed(t, c.row, recoveryPayload(t, map[string]any{"head_sha": c.head}))
+				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
+					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+				}
+				if n := countAuditCategory(p.au, c.row); n != 1 {
+					t.Errorf("%s rows = %d, want no second row", c.row, n)
+				}
+				p.assertNothingMoved(t)
+			})
+			t.Run("started_incomplete_409_no_row", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				p.seedStart(t, prSeamOther, p.attempt(t), 1)
+				if w := p.post(t, c.body(t)); c.outcome == "conflict_resolution_pushed" {
+					c.assertUnprovenRefused(t, w, "")
+				} else {
+					assertInterrupted(t, w, http.StatusConflict)
+				}
+				c.assertNoRow(t, p)
+				p.assertNothingMoved(t)
+			})
+			t.Run("settled_started_incomplete_refused", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				p.setState(run.StageStateAwaitingApproval)
+				p.seedStart(t, prSeamOther, p.attempt(t), 1)
+				w := p.post(t, c.body(t))
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"missing_count":0`)
+				c.assertNoRow(t, p)
+			})
+			t.Run("settled_unmet_counts_missing", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				p.setState(run.StageStateAwaitingApproval)
+				p.seedStart(t, prSeamOther, p.attempt(t), 1, prSeamPath)
+				w := p.post(t, c.body(t))
+				c.assertUnprovenRefused(t, w, "review_obligation_missing", `"missing_count":1`)
+				c.assertNoRow(t, p)
+			})
+			t.Run("failure_report_lands", func(t *testing.T) {
+				p := newPRSeam(t, specImplementGatingReviewers, approveStep) // unproven: no live trigger
+				seedBinding(t, p)
+				c.assertUnprovenRefused(t, p.post(t, c.body(t)), "review_obligation_missing")
+				failed, _ := json.Marshal(map[string]any{"outcome": "failed", "category": "C", "reason": "gave up"})
+				if w := p.post(t, failed); w.Code != http.StatusOK {
+					t.Fatalf("failed report = %d:\n%s", w.Code, w.Body.String())
+				}
+				if got := p.state(t); got != run.StageStateFailed {
+					t.Errorf("stage = %q, want failed", got)
+				}
+			})
+			if c.head != "" && c.outcome != "conflict_resolution_pushed" {
+				t.Run("lineage_violation_no_row", func(t *testing.T) {
+					p := seam(t)
+					prURL := "https://github.com/kuhlman-labs/example/pull/42"
+					p.rr.mu.Lock()
+					p.rr.runs[p.runRow.ID].PullRequestURL = &prURL
+					p.rr.mu.Unlock()
+					stub := &lineageGitHub{baseRef: "main", headSHA: prSeamHead, commitsByBase: map[string][]string{"main": {"0000000000000000000000000000000000000f0f", prSeamHead}}}
+					p.s.cfg.GitHub = newLineageGitHubClient(t, stub)
+					if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
+						t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+					}
+					if got := p.state(t); got != run.StageStateFailed {
+						t.Errorf("stage = %q, want the lineage guard's failure", got)
+					}
+					c.assertNoRow(t, p)
+				})
+			}
+			t.Run("non_implement_stage_keeps_row", func(t *testing.T) {
+				p := seam(t)
+				p.rr.mu.Lock()
+				p.rr.stagesByID[p.stage.ID].Type = run.StageTypeReview
+				// A tracked PR lets ADR-141's check confirm the head on a stage
+				// with no implement sibling to derive a branch from (#5053).
+				prURL := "https://github.com/acme/widgets/pull/42"
+				p.rr.runs[p.runRow.ID].PullRequestURL = &prURL
+				p.rr.mu.Unlock()
+				seedBinding(t, p)
+				if w := p.post(t, c.body(t)); w.Code != http.StatusOK {
+					t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+				}
+				if n := countAuditCategory(p.au, c.row); n != 1 {
+					t.Errorf("%s rows = %d, want 1", c.row, n)
+				}
+			})
+		})
+	}
+}
+
+// --- evidence-write refusal (§45) ----------------------------------------------------
+
+func verdictWriteFails(q audit.ChainAppendParams) bool {
+	return q.Category == implementReviewedCategory
+}
+
+func TestShipPullRequest_SupplementalEvidenceWriteFailed_NoEdge(t *testing.T) {
+	const raw = "injected write failure"
+	assertRefused := func(t *testing.T, p *prSeam, w *httptest.ResponseRecorder) {
+		t.Helper()
+		assertStaticEdgeError(t, w, raw)
+		if got := p.state(t); got != run.StageStateRunning {
+			t.Errorf("stage = %q, want running", got)
+		}
+		p.assertNoEffects(t)
+		if n := countAuditCategory(p.au, CategorySupplementalReviewStarted); n != 1 {
+			t.Errorf("start rows = %d, want 1", n)
+		}
+		if n := countAuditCategory(p.au, "implement_review_failed"); n == 0 {
+			t.Error("no named verdict_write_failed row")
+		}
+		state, err := p.s.supplementalRoundState(t.Context(), p.runRow.ID, p.stage.ID, prSeamHead, p.attempt(t))
+		if err != nil || supplementalPassDischarged(state) {
+			t.Errorf("state = %+v, %v: a lost verdict never discharges", state, err)
+		}
+	}
+	lost := func(t *testing.T, workflowSpec []byte, steps ...reviewStep) (*prSeam, []byte, *httptest.ResponseRecorder) {
+		t.Helper()
+		p := newPRSeam(t, workflowSpec, steps...)
+		p.audit.setHooks(failVerdicts(verdictWriteFails), nil)
+		body := p.body(t)
+		return p, body, p.post(t, body)
+	}
+	t.Run("create_gated", func(t *testing.T) {
+		p, _, w := lost(t, specImplementGatingReviewers, approveStep)
+		assertRefused(t, p, w)
+	})
+	t.Run("create_gateless", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setGateless()
+		p.audit.setHooks(failVerdicts(verdictWriteFails), nil)
+		assertRefused(t, p, p.post(t, p.body(t)))
+	})
+	t.Run("reentry_prior_attempt_artifact", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		body := p.body(t)
+		p.seedArtifact(t, body)
+		p.retry()
+		p.audit.setHooks(failVerdicts(verdictWriteFails), nil)
+		assertRefused(t, p, p.post(t, body))
+	})
+	t.Run("partial_then_failure", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingTwo, approveStep)
+		var calls atomic.Int32
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			if q.Category == implementReviewedCategory && calls.Add(1) > 1 {
+				return flakyFail
+			}
+			return flakyOK
+		}, nil)
+		assertRefused(t, p, p.post(t, p.body(t)))
+		if n := countAuditCategory(p.au, implementReviewedCategory); n != 1 {
+			t.Errorf("verdict rows = %d, want the first reviewer's, which stays", n)
+		}
+	})
+	t.Run("replay_refused", func(t *testing.T) {
+		p, body, _ := lost(t, specImplementGatingReviewers, approveStep)
+		p.audit.setHooks(nil, nil)
+		calls := p.rev.calls.Load()
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("replay invoked %d more reviewers", n-calls)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("other_body_same_paths_refused", func(t *testing.T) {
+		p, _, _ := lost(t, specImplementGatingReviewers, approveStep)
+		p.audit.setHooks(nil, nil)
+		calls := p.rev.calls.Load()
+		other := runnerShapedSupplementalPRBody(t, prSeamHead, prSeamPath, "a different reason")
+		assertInterrupted(t, p.post(t, other), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("a new body invoked %d more reviewers", n-calls)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("omission_refused", func(t *testing.T) {
+		p, _, _ := lost(t, specImplementGatingReviewers, approveStep)
+		p.audit.setHooks(nil, nil)
+		assertCode(t, p.post(t, p.plainBody(t)), http.StatusConflict, "review_obligation_missing")
+		p.assertNothingMoved(t)
+	})
+	t.Run("retry_attempt_reenters_once", func(t *testing.T) {
+		p, body, _ := lost(t, specImplementGatingReviewers, approveStep)
+		p.audit.setHooks(nil, nil)
+		attempt := p.retry()
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("re-entry = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 2 {
+			t.Errorf("reviewer calls = %d, want one more pass", n)
+		}
+		state, err := p.s.supplementalRoundState(t.Context(), p.runRow.ID, p.stage.ID, prSeamHead, attempt)
+		if err != nil || !state.startedThisAttempt || state.currentVerdicts != 1 {
+			t.Errorf("state = %+v, %v", state, err)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("lost_ack_original_positive", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		var once sync.Once
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			act := flakyOK
+			if verdictWriteFails(q) {
+				once.Do(func() { act = flakyCommitThenFail })
+			}
+			return act
+		}, nil)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("lost_ack_found_on_replay", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		var committed atomic.Bool
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			if verdictWriteFails(q) {
+				if committed.CompareAndSwap(false, true) {
+					return flakyCommitThenFail
+				}
+				return flakyFail
+			}
+			return flakyOK
+		}, func(category string) error {
+			if category == implementReviewedCategory && committed.Load() {
+				return errors.New("forced probe fault")
+			}
+			return nil
+		})
+		body := p.body(t)
+		assertStaticEdgeError(t, p.post(t, body), "forced probe fault")
+		p.assertNoEffects(t)
+		calls := p.rev.calls.Load()
+		p.audit.setHooks(nil, nil)
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("replay = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("replay invoked %d more reviewers", n-calls)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("reject_write_failed_static_500_no_edge", func(t *testing.T) {
+		p, _, w := lost(t, specImplementGatingReviewers, rejectStep)
+		assertRefused(t, p, w)
+	})
+	t.Run("reject_landed_other_failed_500_binds", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingTwo, rejectStep, approveStep)
+		p.audit.setHooks(failVerdicts(func(q audit.ChainAppendParams) bool {
+			return q.Category == implementReviewedCategory && !verdictIs(q, planreview.VerdictReject)
+		}), nil)
+		body := p.body(t)
+		assertRefused(t, p, p.post(t, body))
+		p.audit.setHooks(nil, nil)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		p.assertNothingMoved(t)
+		calls := p.rev.calls.Load()
+		p.retry()
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("re-entry = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("re-entry over a recorded reject invoked %d reviewers", n-calls)
+		}
+	})
+	t.Run("recorded_reject_healthy_write_fails_b_once", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+	})
+	t.Run("reject_lost_ack_recovered_fails_b_once", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
+		var once sync.Once
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			act := flakyOK
+			if verdictWriteFails(q) {
+				once.Do(func() { act = flakyCommitThenFail })
+			}
+			return act
+		}, nil)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+	})
+	t.Run("deadline_is_interrupted_not_500", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		shortLifetime(t, p)
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			if verdictWriteFails(q) {
+				return flakyBlock
+			}
+			return flakyOK
+		}, nil)
+		assertInterrupted(t, p.post(t, p.body(t)), http.StatusConflict)
+		p.assertNothingMoved(t)
+	})
+	t.Run("failure_report_lands", func(t *testing.T) {
+		p, _, _ := lost(t, specImplementGatingReviewers, approveStep)
+		failed, _ := json.Marshal(map[string]any{"outcome": "failed", "category": "C", "reason": "gave up"})
+		if w := p.post(t, failed); w.Code != http.StatusOK {
+			t.Fatalf("failed report = %d:\n%s", w.Code, w.Body.String())
+		}
+		if got := p.state(t); got != run.StageStateFailed {
+			t.Errorf("stage = %q, want failed", got)
+		}
+	})
+}
+
+// --- started-pass completeness (§47) -------------------------------------------------
+
+func errorStep(context.Context) (*planreview.ReviewVerdict, string, error) {
+	return nil, "claude-sonnet-4-6", errors.New("reviewer backend error")
+}
+
+func TestShipPullRequest_SupplementalStartedIncomplete_NoEdge(t *testing.T) {
+	assertLost := func(t *testing.T, p *prSeam, w *httptest.ResponseRecorder, status int) {
+		t.Helper()
+		assertInterrupted(t, w, status)
+		p.assertNothingMoved(t)
+		if n := countAuditCategory(p.au, CategorySupplementalReviewStarted); n == 0 {
+			t.Error("no start row")
+		}
+		state, err := p.s.supplementalRoundState(t.Context(), p.runRow.ID, p.stage.ID, prSeamHead, p.attempt(t))
+		if err != nil || supplementalPassDischarged(state) {
+			t.Errorf("state = %+v, %v: an incomplete pass never discharges", state, err)
+		}
+	}
+	t.Run("reviewer_error_first_call_gated", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, errorStep)
+		assertLost(t, p, p.post(t, p.body(t)), http.StatusConflict)
+		if n := countAuditCategory(p.au, "implement_review_failed"); n != 1 {
+			t.Errorf("failed rows = %d, want the reviewer's", n)
+		}
+	})
+	t.Run("reviewer_error_first_call_gateless", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, errorStep)
+		p.setGateless()
+		assertLost(t, p, p.post(t, p.body(t)), http.StatusConflict)
+	})
+	t.Run("reviewer_error_closing_503", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, errorStep)
+		p.audit.setHooks(func(_ context.Context, q audit.ChainAppendParams, _ int) flakyAction {
+			if q.Category == "implement_review_failed" {
+				p.s.reviewers.closeAndCancel()
+			}
+			return flakyOK
+		}, nil)
+		assertLost(t, p, p.post(t, p.body(t)), http.StatusServiceUnavailable)
+	})
+	t.Run("partial_approve_then_error", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingTwo, approveStep, errorStep)
+		assertLost(t, p, p.post(t, p.body(t)), http.StatusConflict)
+		if n := countAuditCategory(p.au, implementReviewedCategory); n != 1 {
+			t.Errorf("verdict rows = %d, want the first", n)
+		}
+	})
+	heterogeneous := func(t *testing.T, workflowSpec []byte) *prSeam {
+		t.Helper()
+		rev := &scriptedReviewer{steps: []reviewStep{approveStep}}
+		return newPRSeamWithSet(t, fakeReviewerSet{providers: map[string]PlanReviewer{"anthropic": rev}, def: rev}, workflowSpec, rev)
+	}
+	t.Run("skip_row_first_call", func(t *testing.T) {
+		p := heterogeneous(t, specImplementHeterogeneousGating)
+		assertLost(t, p, p.post(t, p.body(t)), http.StatusConflict)
+		if n := countAuditCategory(p.au, "implement_review_skipped"); n == 0 {
+			t.Fatal("setup: no skip row")
+		}
+	})
+	t.Run("optional_skip_refuses", func(t *testing.T) {
+		p := heterogeneous(t, specImplementHeterogeneousGatingV1Optional(true))
+		assertLost(t, p, p.post(t, p.body(t)), http.StatusConflict)
+	})
+	t.Run("named_recovery_row_first_call", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.audit.setHooks(failVerdicts(verdictWriteFails), nil)
+		assertStaticEdgeError(t, p.post(t, p.body(t)))
+		p.assertNothingMoved(t)
+	})
+	replayFixture := func(t *testing.T) (*prSeam, []byte, int32) {
+		t.Helper()
+		p := newPRSeam(t, specImplementGatingReviewers, errorStep)
+		body := p.body(t)
+		assertLost(t, p, p.post(t, body), http.StatusConflict)
+		return p, body, p.rev.calls.Load()
+	}
+	t.Run("byte_identical_replay_refused", func(t *testing.T) {
+		p, body, calls := replayFixture(t)
+		assertLost(t, p, p.post(t, body), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("replay invoked %d more reviewers", n-calls)
+		}
+	})
+	t.Run("other_body_same_paths_refused", func(t *testing.T) {
+		p, _, calls := replayFixture(t)
+		other := runnerShapedSupplementalPRBody(t, prSeamHead, prSeamPath, "another reason")
+		assertLost(t, p, p.post(t, other), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("a new body invoked %d more reviewers", n-calls)
+		}
+	})
+	t.Run("omission_after_error_refused", func(t *testing.T) {
+		p, _, calls := replayFixture(t)
+		assertCode(t, p.post(t, p.plainBody(t)), http.StatusConflict, "review_obligation_missing")
+		if n := p.rev.calls.Load(); n != calls {
+			t.Errorf("an omission invoked %d more reviewers", n-calls)
+		}
+		p.assertNothingMoved(t)
+	})
+	t.Run("prior_complete_new_error_refused", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, errorStep)
+		first := p.attempt(t)
+		p.seedStart(t, prSeamHead, first, 1, prSeamPath)
+		p.seedVerdict(t, prSeamHead, first, planreview.VerdictApprove)
+		body := p.body(t)
+		p.seedArtifact(t, body)
+		p.retry()
+		assertLost(t, p, p.post(t, body), http.StatusConflict)
+	})
+	t.Run("prior_error_new_complete_advances", func(t *testing.T) {
+		p, body, calls := replayFixture(t)
+		p.rev.steps = []reviewStep{approveStep}
+		p.retry()
+		if w := p.post(t, body); w.Code != http.StatusOK {
+			t.Fatalf("re-entry = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != calls+1 {
+			t.Errorf("reviewer calls = %d, want one more", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("late_old_row_not_counted", func(t *testing.T) {
+		p, body, _ := replayFixture(t)
+		old := p.attempt(t)
+		attempt := p.retry()
+		p.seedStart(t, prSeamHead, attempt, 1, prSeamPath)
+		p.seedVerdict(t, prSeamHead, old, planreview.VerdictApprove)
+		assertLost(t, p, p.post(t, body), http.StatusConflict)
+	})
+	t.Run("full_verdict_advances_once", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+		p.assertNotified(t, 1, 1)
+	})
+	t.Run("full_verdict_gateless_advances_once", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		p.setGateless()
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		if got := p.state(t); got != run.StageStateSucceeded {
+			t.Errorf("stage = %q, want succeeded", got)
+		}
+		if n := p.repo.advances.Load(); n != 1 {
+			t.Errorf("edges = %d, want 1", n)
+		}
+		if p.repo.listStages.Load() == 0 {
+			t.Error("orchestrator not fired")
+		}
+		p.assertNotified(t, 1, 1)
+	})
+	t.Run("reject_with_error_fails_b_once", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingTwo, rejectStep, errorStep)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+	})
+	t.Run("edge_read_error_500", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		fault := errors.New("forced guard read fault")
+		var reads atomic.Int32
+		p.audit.setHooks(nil, func(category string) error {
+			if category == implementReviewedCategory && reads.Add(1) == 3 {
+				return fault
+			}
+			return nil
+		})
+		assertStaticEdgeError(t, p.post(t, p.body(t)), fault.Error())
+		p.assertNothingMoved(t)
+	})
+	t.Run("advisory_reviewer_error_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementAdvisoryReviewers, errorStep)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.s.waitBackgroundReviews()
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("no_pass_configuration_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, errorStep)
+		p.s.cfg.ArtifactRepo = newFakeArtifactRepo()
+		p.art = p.s.cfg.ArtifactRepo.(*fakeArtifactRepo)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("status = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
 }

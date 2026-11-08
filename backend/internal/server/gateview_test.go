@@ -1,27 +1,37 @@
 package server
 
 import (
+	"bytes"
+	"compress/gzip"
 	"context"
 	"encoding/json"
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/captain"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/concern"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/crewmessage"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/planreview"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/specialistjob"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/tracestore"
 )
 
 // gateViewLongNote is deliberately longer than the MCP compaction levers'
@@ -3422,4 +3432,1947 @@ func TestGateView_JudgementRoundTripPostgres(t *testing.T) {
 	if !strings.Contains(body, `"duplicate_of":"`+root.ID.String()+`"`) || !strings.Contains(body, `"outcome":"fixed"`) {
 		t.Errorf("body missing the duplicate_of / outcome wire keys\nbody: %s", body)
 	}
+}
+
+// --- slice_reviews_lost (ADR-140 D6, #5047) ---------------------------------------
+
+// sliceLostHead is the head the slice rounds record.
+const sliceLostHead = "slice-lost-head"
+
+// sliceLostFixture is a decomposed parent with ONE succeeded slice child, whose
+// implement stage is the redispatch fixture's, so the real gate-view read on the
+// parent and the real re-run verb on the child share one set of stores.
+type sliceLostFixture struct {
+	*redispatchFixture
+	parent *run.Run
+	store  *bundleModesStore
+}
+
+func newSliceLostFixture(t *testing.T, opts redispatchFixtureOpts) *sliceLostFixture {
+	t.Helper()
+	store := &bundleModesStore{redispatchTraceStore: newRedispatchTraceStore(), getFaults: map[string]error{}, readFaults: map[string]error{}}
+	if opts.traceStore == nil {
+		opts.traceStore = store
+	}
+	f := newRedispatchFixture(t, opts)
+	parent := f.rr.seedRun()
+	parent.WorkflowID, parent.WorkflowSpec, parent.Repo, parent.State = "feature_change", f.runRow.WorkflowSpec, f.runRow.Repo, run.StateRunning
+	idx := 3
+	f.runRow.DecomposedFrom, f.runRow.SliceIndex, f.runRow.State = &parent.ID, &idx, run.StateSucceeded
+	f.s.cfg.ConcernRepo = newFakeConcernRepo()
+	f.seedPlanArtifact(t, validPlanBytes(t), "approved-plan", true)
+	return &sliceLostFixture{redispatchFixture: f, parent: parent, store: store}
+}
+
+// settledRound seeds a round whose only reviewer failed: settled with no verdict.
+func (f *sliceLostFixture) settledRound(t *testing.T, started planreview.ReviewStartedPayload) int64 {
+	t.Helper()
+	seq := f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", started)
+	f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_failed", planreview.ReviewFailedPayload{Reason: "provider quota exhausted", Authority: started.Authority})
+	return seq
+}
+
+func (f *sliceLostFixture) traceRound(t *testing.T) int64 {
+	t.Helper()
+	return f.settledRound(t, advisoryImplementStarted(reviewRoundOriginTrace, "", sliceLostHead))
+}
+
+// recordBundle records a redacted trace_uploaded row, storing the object when stored.
+func (f *sliceLostFixture) recordBundle(t *testing.T, b []byte, stored bool) string {
+	t.Helper()
+	hash := bundleHash(b)
+	if stored {
+		f.store.put(tracestore.VariantRedacted, hash, b)
+	}
+	f.appendAt(t, f.implStage.ID, beforeBoot, "trace_uploaded", map[string]any{"variant": string(tracestore.VariantRedacted), "content_hash": hash})
+	return hash
+}
+
+// read drives the REAL gate-view handler on the parent.
+func (f *sliceLostFixture) read(t *testing.T) gateViewResponse {
+	t.Helper()
+	return decodeGateView(t, getGateView(t, f.s, f.parent.ID, ""))
+}
+
+// only asserts exactly one entry naming this child.
+func (f *sliceLostFixture) only(t *testing.T, resp gateViewResponse) gateViewSliceReviewLost {
+	t.Helper()
+	if len(resp.SliceReviewsLost) != 1 {
+		t.Fatalf("slice_reviews_lost = %+v, want one entry", resp.SliceReviewsLost)
+	}
+	got := resp.SliceReviewsLost[0]
+	if got.ChildRunID != f.runRow.ID.String() || got.SliceIndex == nil || *got.SliceIndex != 3 {
+		t.Errorf("entry names %s slice %v, want child %s slice 3", got.ChildRunID, got.SliceIndex, f.runRow.ID)
+	}
+	return got
+}
+
+func (f *sliceLostFixture) verb(t *testing.T) *httptest.ResponseRecorder {
+	t.Helper()
+	w := postRerun(t, f.s, f.runRow.ID.String(), rerunOperator())
+	f.s.waitBackgroundReviews()
+	return w
+}
+
+// assertVerbRefused pins the verb's status, code and details.reason, and that it
+// started no round.
+func (f *sliceLostFixture) assertVerbRefused(t *testing.T, w *httptest.ResponseRecorder, seq int64, status int, code, reason string) {
+	t.Helper()
+	if w.Code != status {
+		t.Fatalf("verb = %d, want %d:\n%s", w.Code, status, w.Body.String())
+	}
+	gotCode, details := rerunErr(t, w)
+	if gotCode != code || (reason != "" && details["reason"] != reason) {
+		t.Errorf("verb error = %s %v, want %s reason %q", gotCode, details, code, reason)
+	}
+	if n := countAfter(t, f.au, f.runRow.ID, "implement_review_started", seq); n != 0 {
+		t.Errorf("new rounds = %d, want none on a refusal", n)
+	}
+}
+
+// gapRecorded reports the slice_reviews history gap.
+func sliceGapRecorded(resp gateViewResponse) bool {
+	return resp.HistoryIncomplete && slices.Contains(resp.HistoryGaps, gateViewGapSliceReviews)
+}
+
+// noDiffBundle is a parseable bundle whose head matches and which has no git_diff
+// event, the one bundle only the parse arm of the input proof refuses.
+func noDiffBundle(t *testing.T, head string) []byte {
+	t.Helper()
+	var raw bytes.Buffer
+	manifest, _ := json.Marshal(bundle.Manifest{BundleSchema: "v1"})
+	line, _ := json.Marshal(map[string]any{"seq": 1, "kind": "manifest", "data": json.RawMessage(manifest)})
+	raw.Write(line)
+	raw.WriteByte('\n')
+	verify, _ := json.Marshal(map[string]any{"command": "go build ./...", "head_sha": head, "exit_code": 0, "output": "", "outcome": "passed"})
+	line, _ = json.Marshal(map[string]any{"seq": 2, "kind": "verify_run", "data": json.RawMessage(verify)})
+	raw.Write(line)
+	raw.WriteByte('\n')
+	var gz bytes.Buffer
+	w := gzip.NewWriter(&gz)
+	_, _ = w.Write(raw.Bytes())
+	_ = w.Close()
+	return gz.Bytes()
+}
+
+// TestGateView_SliceReviewsLost_AdvertisedActionMatchesVerb drives the REAL read,
+// then the REAL POST /v0/runs/{child}/reviews/rerun, with nothing changing between
+// them: next_step is fishhawk_rerun_review if and only if the verb answers 200, and
+// a refusal names the slug the verb answers. An interrupted gating round is never
+// offered the advisory-only verb.
+func TestGateView_SliceReviewsLost_AdvertisedActionMatchesVerb(t *testing.T) {
+	gh, _ := recordingCompareClient(t, cannedCompareOneFile)
+	good := func(t *testing.T) []byte { return implementPushGatedBundleWithHeadSHA(t, 1, sliceLostHead) }
+	cases := []struct {
+		name       string
+		opts       redispatchFixtureOpts
+		seed       func(t *testing.T, f *sliceLostFixture) int64
+		wantNext   bool
+		refusal    string
+		verbStatus int
+		verbCode   string
+	}{
+		{
+			name: "valid_bundle_advisory_trace", wantNext: true, verbStatus: http.StatusOK,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, good(t), true)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "configured_store_missing_bundle", refusal: redispatchSlugTraceBundleUnavail, verbStatus: http.StatusBadGateway, verbCode: rerunCodeNotStarted,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, good(t), false)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "configured_store_no_uploaded_row", refusal: redispatchSlugTraceBundleUnavail, verbStatus: http.StatusBadGateway, verbCode: rerunCodeNotStarted,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 { return f.traceRound(t) },
+		},
+		{
+			name: "malformed_bundle_corrupt", refusal: redispatchSlugTraceBundleUnavail, verbStatus: http.StatusBadGateway, verbCode: rerunCodeNotStarted,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, []byte("these bytes are no bundle"), true)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "malformed_bundle_no_diff_event", refusal: redispatchSlugTraceBundleUnavail, verbStatus: http.StatusBadGateway, verbCode: rerunCodeNotStarted,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, noDiffBundle(t, sliceLostHead), true)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "wrong_head_bundle", refusal: redispatchSlugTraceBundleUnavail, verbStatus: http.StatusBadGateway, verbCode: rerunCodeNotStarted,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, implementPushGatedBundleWithHeadSHA(t, 1, "another-head"), true)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "gating", refusal: redispatchSlugGatingAuthority, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, good(t), true)
+				started := advisoryImplementStarted(reviewRoundOriginTrace, "", sliceLostHead)
+				started.Authority = planreview.AuthorityGating
+				return f.settledRound(t, started)
+			},
+		},
+		{
+			name: "unknown_round_source", refusal: redispatchSlugUnknownRoundSource, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				return f.settledRound(t, advisoryImplementStarted("", "", sliceLostHead))
+			},
+		},
+		{
+			name: "superseded_by_fixup", refusal: redispatchSlugSupersededByFixup, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, good(t), true)
+				seq := f.traceRound(t)
+				f.appendAt(t, f.implStage.ID, beforeBoot, CategoryStageFixupTriggered, map[string]any{"concerns": []string{"c1"}})
+				return seq
+			},
+		},
+		{
+			name: "implement_stage_terminal", opts: redispatchFixtureOpts{implStageState: run.StageStateFailed},
+			refusal: redispatchSlugImplementStageTerminal, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, good(t), true)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "advanced_past_review", opts: redispatchFixtureOpts{reviewStageState: run.StageStateSucceeded},
+			refusal: redispatchSlugAdvancedPastReview, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				f.recordBundle(t, good(t), true)
+				return f.traceRound(t)
+			},
+		},
+		{
+			name: "forge_compare_unavailable", refusal: redispatchSlugForgeCompareUnavail, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				return f.settledRound(t, advisoryImplementStarted(reviewRoundOriginFixupPush, "base-sha", sliceLostHead))
+			},
+		},
+		{
+			name: "compare_missing_base", opts: redispatchFixtureOpts{github: gh},
+			refusal: redispatchSlugUnknownRoundSource, verbStatus: http.StatusConflict, verbCode: rerunCodeIneligible,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				return f.settledRound(t, advisoryImplementStarted(reviewRoundOriginFixupPush, "", sliceLostHead))
+			},
+		},
+		{
+			name: "compare_wired", opts: redispatchFixtureOpts{github: gh}, wantNext: true, verbStatus: http.StatusOK,
+			seed: func(t *testing.T, f *sliceLostFixture) int64 {
+				return f.settledRound(t, advisoryImplementStarted(reviewRoundOriginConsolidated, "base-sha", sliceLostHead))
+			},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSliceLostFixture(t, tc.opts)
+			seq := tc.seed(t, f)
+			got := f.only(t, f.read(t))
+			if got.Reason != reviewCoverageReasonNoVerdict || got.RoundSequence != seq {
+				t.Errorf("entry = %+v, want reason %s at round %d", got, reviewCoverageReasonNoVerdict, seq)
+			}
+			advertised := got.NextStep == reviewCoverageNextRerun
+			if advertised != tc.wantNext {
+				t.Errorf("next_step = %q, want advertised %v", got.NextStep, tc.wantNext)
+			}
+			w := f.verb(t)
+			if advertised != (w.Code == http.StatusOK) {
+				t.Errorf("advertised %v but the verb answered %d: next_step must match the verb\n%s", advertised, w.Code, w.Body.String())
+			}
+			if tc.wantNext {
+				if got.RerunEligibility != sliceRerunEligible || got.RerunRefusal != "" {
+					t.Errorf("entry = %+v, want eligible with no refusal", got)
+				}
+				if n := countAfter(t, f.au, f.runRow.ID, "implement_review_started", seq); n != 1 {
+					t.Errorf("new rounds = %d, want 1", n)
+				}
+				return
+			}
+			if got.RerunEligibility != sliceRerunIneligible || got.RerunRefusal != tc.refusal || got.NextStep != "" {
+				t.Errorf("entry = %+v, want ineligible %s with no next_step", got, tc.refusal)
+			}
+			f.assertVerbRefused(t, w, seq, tc.verbStatus, tc.verbCode, tc.refusal)
+		})
+	}
+
+	// nil_store is one row and not the proof: a nil store is refused by the rebuild
+	// slug, so the verb answers 409 rather than the 502 of a configured store's miss.
+	t.Run("nil_store", func(t *testing.T) {
+		f := newRedispatchFixture(t, redispatchFixtureOpts{})
+		parent := f.rr.seedRun()
+		parent.WorkflowID, parent.WorkflowSpec, parent.Repo, parent.State = "feature_change", f.runRow.WorkflowSpec, f.runRow.Repo, run.StateRunning
+		f.runRow.DecomposedFrom, f.runRow.State = &parent.ID, run.StateSucceeded
+		f.s.cfg.ConcernRepo = newFakeConcernRepo()
+		lost := &sliceLostFixture{redispatchFixture: f, parent: parent}
+		seq := lost.traceRound(t)
+		resp := lost.read(t)
+		if len(resp.SliceReviewsLost) != 1 {
+			t.Fatalf("entries = %+v", resp.SliceReviewsLost)
+		}
+		got := resp.SliceReviewsLost[0]
+		if got.RerunRefusal != redispatchSlugTraceBundleUnavail || got.NextStep != "" {
+			t.Errorf("entry = %+v", got)
+		}
+		lost.assertVerbRefused(t, lost.verb(t), seq, http.StatusConflict, rerunCodeIneligible, redispatchSlugTraceBundleUnavail)
+	})
+
+	// The rows below pin what the invariant does NOT promise: next_step is a
+	// point-in-time statement, so a later loss still draws the verb's 502.
+	t.Run("toctou_bundle_deleted_after_read", func(t *testing.T) {
+		f := newSliceLostFixture(t, redispatchFixtureOpts{})
+		hash := f.recordBundle(t, good(t), true)
+		seq := f.traceRound(t)
+		if got := f.only(t, f.read(t)); got.NextStep != reviewCoverageNextRerun {
+			t.Fatalf("setup: entry = %+v, want advertised", got)
+		}
+		f.store.mu.Lock()
+		delete(f.store.bodies, string(tracestore.VariantRedacted)+"/"+hash)
+		f.store.mu.Unlock()
+		f.assertVerbRefused(t, f.verb(t), seq, http.StatusBadGateway, rerunCodeNotStarted, redispatchSlugTraceBundleUnavail)
+		if got := f.only(t, f.read(t)); got.NextStep != "" || got.RerunRefusal != redispatchSlugTraceBundleUnavail {
+			t.Errorf("next read = %+v, want no action", got)
+		}
+	})
+	t.Run("compare_fails_after_read", func(t *testing.T) {
+		failing, paths := recordingCompareClient(t, "not json")
+		f := newSliceLostFixture(t, redispatchFixtureOpts{github: failing})
+		seq := f.settledRound(t, advisoryImplementStarted(reviewRoundOriginConsolidated, "base-sha", sliceLostHead))
+		if got := f.only(t, f.read(t)); got.NextStep != reviewCoverageNextRerun {
+			t.Fatalf("setup: entry = %+v, want advertised", got)
+		}
+		if p := paths(); len(p) != 0 {
+			t.Errorf("the read made forge calls: %v", p)
+		}
+		f.assertVerbRefused(t, f.verb(t), seq, http.StatusBadGateway, rerunCodeNotStarted, redispatchSlugCompareFailed)
+		if got := f.only(t, f.read(t)); got.NextStep != reviewCoverageNextRerun {
+			t.Errorf("next read = %+v, want still advertised: the read makes no forge call", got)
+		}
+	})
+	const rawCause = "raw store cause must stay private"
+	assertUnknown := func(t *testing.T, f *sliceLostFixture, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if strings.Contains(w.Body.String(), rawCause) {
+			t.Errorf("raw cause reached the body:\n%s", w.Body.String())
+		}
+		resp := decodeGateView(t, w)
+		got := f.only(t, resp)
+		if got.RerunEligibility != sliceRerunUnknown || got.NextStep != "" || got.RerunRefusal != "" {
+			t.Errorf("entry = %+v, want unknown with no action", got)
+		}
+		if !sliceGapRecorded(resp) {
+			t.Errorf("gaps = %v, want %s", resp.HistoryGaps, gateViewGapSliceReviews)
+		}
+	}
+	t.Run("store_read_error", func(t *testing.T) {
+		f := newSliceLostFixture(t, redispatchFixtureOpts{})
+		hash := f.recordBundle(t, good(t), true)
+		f.traceRound(t)
+		f.store.getFaults[hash] = errors.New(rawCause)
+		assertUnknown(t, f, getGateView(t, f.s, f.parent.ID, ""))
+		delete(f.store.getFaults, hash)
+		if got := f.only(t, f.read(t)); got.NextStep != reviewCoverageNextRerun {
+			t.Errorf("cleared read = %+v, want advertised", got)
+		}
+		if w := f.verb(t); w.Code != http.StatusOK {
+			t.Errorf("verb = %d:\n%s", w.Code, w.Body.String())
+		}
+	})
+	t.Run("trace_uploaded_list_error", func(t *testing.T) {
+		f := newSliceLostFixture(t, redispatchFixtureOpts{})
+		f.recordBundle(t, good(t), true)
+		f.traceRound(t)
+		f.s.cfg.AuditRepo = &sliceRunCategoryErrAudit{auditFake: f.au, failRun: f.runRow.ID, failCategory: "trace_uploaded", cause: errors.New(rawCause)}
+		assertUnknown(t, f, getGateView(t, f.s, f.parent.ID, ""))
+		f.s.cfg.AuditRepo = f.au
+		if got := f.only(t, f.read(t)); got.NextStep != reviewCoverageNextRerun {
+			t.Errorf("cleared read = %+v, want advertised", got)
+		}
+		if w := f.verb(t); w.Code != http.StatusOK {
+			t.Errorf("verb = %d:\n%s", w.Code, w.Body.String())
+		}
+	})
+}
+
+// sliceRunCategoryErrAudit fails one category on one run, so a read this block makes
+// on the child never collides with the parent's history joins.
+type sliceRunCategoryErrAudit struct {
+	*auditFake
+	failRun      uuid.UUID
+	failCategory string
+	cause        error
+}
+
+func (a *sliceRunCategoryErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == a.failRun && category == a.failCategory {
+		return nil, a.cause
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// sliceReconcile drives the REAL on-demand reconcile verb on the child.
+func (f *sliceLostFixture) sliceReconcile(t *testing.T) reconcileRunReviewsResponse {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+f.runRow.ID.String()+"/reviews/reconcile", nil)
+	req.SetPathValue("run_id", f.runRow.ID.String())
+	req = injectIdentity(req, Identity{Subject: "github:op", TokenID: "tok-op", Scopes: []string{"write:runs"}})
+	w := httptest.NewRecorder()
+	f.s.handleReconcileRunReviews(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("reconcile = %d:\n%s", w.Code, w.Body.String())
+	}
+	var out reconcileRunReviewsResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &out); err != nil {
+		t.Fatalf("decode reconcile: %v", err)
+	}
+	return out
+}
+
+func TestGateView_SliceReviewsLost_Modes(t *testing.T) {
+	compare := func(t *testing.T) redispatchFixtureOpts {
+		t.Helper()
+		gh, _ := recordingCompareClient(t, cannedCompareOneFile)
+		return redispatchFixtureOpts{github: gh}
+	}
+	unsettled := func(t *testing.T, f *sliceLostFixture, at time.Time) int64 {
+		t.Helper()
+		return f.appendAt(t, f.implStage.ID, at, "implement_review_started", advisoryImplementStarted(reviewRoundOriginConsolidated, "base-sha", sliceLostHead))
+	}
+	consolidated := advisoryImplementStarted(reviewRoundOriginConsolidated, "base-sha", sliceLostHead)
+
+	t.Run("no_verdict", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		seq := f.settledRound(t, consolidated)
+		got := f.only(t, f.read(t))
+		if got.Reason != reviewCoverageReasonNoVerdict || got.RoundSequence != seq || got.Authority != string(planreview.AuthorityAdvisory) || got.RerunEligibility != sliceRerunEligible || got.NextStep != reviewCoverageNextRerun {
+			t.Errorf("entry = %+v", got)
+		}
+	})
+	t.Run("no_round", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		got := f.only(t, f.read(t))
+		if got.Reason != reviewCoverageReasonNoRound || got.RoundSequence != 0 || got.RerunEligibility != sliceRerunIneligible || got.RerunRefusal != rerunCodeNoReviewRound || got.NextStep != "" {
+			t.Errorf("entry = %+v, want ineligible no_review_round with no action", got)
+		}
+		w := f.verb(t)
+		if code, _ := rerunErr(t, w); w.Code != http.StatusConflict || code != rerunCodeNoReviewRound {
+			t.Errorf("verb = %d %s, want 409 %s", w.Code, code, rerunCodeNoReviewRound)
+		}
+	})
+	t.Run("stale_prior_process", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		seq := unsettled(t, f, beforeBoot)
+		got := f.only(t, f.read(t))
+		if got.Reason != sliceReviewReasonStale || got.RoundSequence != seq || got.NextStep != reviewCoverageNextReconcile || got.RerunRefusal != rerunInFlightUnsettled {
+			t.Fatalf("entry = %+v, want stale with the reconcile verb", got)
+		}
+		out := f.sliceReconcile(t)
+		if !out.Terminated {
+			t.Fatalf("reconcile = %+v, want the verb to close the round next_step named", out)
+		}
+		if after := f.only(t, f.read(t)); after.Reason != reviewCoverageReasonNoVerdict || after.NextStep != reviewCoverageNextRerun {
+			t.Errorf("after reconcile = %+v, want a settled zero-verdict round", after)
+		}
+	})
+	t.Run("stale_current_process", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.s.processStart = time.Now().Add(-48 * time.Hour)
+		unsettled(t, f, time.Now().Add(-24*time.Hour))
+		got := f.only(t, f.read(t))
+		if got.Reason != sliceReviewReasonStale || got.NextStep != "" {
+			t.Fatalf("entry = %+v, want stale with no action on a round this process dispatched", got)
+		}
+		out := f.sliceReconcile(t)
+		if out.Terminated {
+			t.Errorf("reconcile = %+v, want nothing closed", out)
+		}
+		found := false
+		for _, st := range out.Stages {
+			found = found || st.SkipReason == reconcileSkipInFlight
+		}
+		if !found {
+			t.Errorf("reconcile = %+v, want %s", out, reconcileSkipInFlight)
+		}
+	})
+	t.Run("stale_mid_handoff", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		seq := unsettled(t, f, beforeBoot)
+		k := pendingRedispatchKey{runID: f.runRow.ID, stage: "implement", seq: seq}
+		markRedispatchPending(k)
+		t.Cleanup(func() { clearRedispatchPending(k) })
+		if got := f.only(t, f.read(t)); got.Reason != sliceReviewReasonStale || got.NextStep != "" {
+			t.Errorf("entry = %+v, want no action mid-handoff", got)
+		}
+	})
+	t.Run("stale_no_configured_count", func(t *testing.T) {
+		// The spec's fallback count makes the round in flight, while the verb skips a
+		// round with no configured count, so no action is advertised.
+		f := newSliceLostFixture(t, compare(t))
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", planreview.ReviewStartedPayload{Authority: planreview.AuthorityAdvisory})
+		if got := f.only(t, f.read(t)); got.Reason != sliceReviewReasonStale || got.NextStep != "" {
+			t.Errorf("entry = %+v, want no action on a round the verb skips", got)
+		}
+	})
+	t.Run("stale_no_stage_anchor", func(t *testing.T) {
+		// The verb skips a round with no stage anchor, so it gets no action.
+		f := newSliceLostFixture(t, compare(t))
+		raw := recoveryPayload(t, consolidated)
+		rid := f.runRow.ID
+		f.au.mu.Lock()
+		f.au.seeded = append(f.au.seeded, &audit.Entry{RunID: &rid, Sequence: 99, Timestamp: beforeBoot, Category: "implement_review_started", Payload: raw})
+		f.au.mu.Unlock()
+		if got := f.only(t, f.read(t)); got.Reason != sliceReviewReasonStale || got.NextStep != "" {
+			t.Errorf("entry = %+v, want no action on a round with no stage anchor", got)
+		}
+	})
+	t.Run("in_flight_within_budget", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		unsettled(t, f, time.Now())
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 || resp.HistoryIncomplete {
+			t.Errorf("entries = %+v gaps = %v, want omitted", resp.SliceReviewsLost, resp.HistoryGaps)
+		}
+	})
+	t.Run("verdict", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_review_started", consolidated)
+		f.appendAt(t, f.implStage.ID, beforeBoot, "implement_reviewed", planreview.ImplementReviewedPayload{Verdict: planreview.VerdictApprove})
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want omitted", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("failed_child", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.runRow.State = run.StateFailed
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want a failed child omitted: it contributed no code", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("non_decomposed", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.runRow.DecomposedFrom = nil
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want omitted with no children", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("child_reads_no_block", func(t *testing.T) {
+		// A child with children of its own, so the child guard alone omits the block.
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		grandchild := f.rr.seedRun()
+		grandchild.WorkflowID, grandchild.WorkflowSpec, grandchild.State = "feature_change", f.runRow.WorkflowSpec, run.StateSucceeded
+		grandchild.DecomposedFrom = &f.runRow.ID
+		if resp := decodeGateView(t, getGateView(t, f.s, f.runRow.ID, "")); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want a child's own gate view to carry no block", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("zero_reviewers", func(t *testing.T) {
+		opts := compare(t)
+		opts.spec = specRedispatchNoReviewers
+		f := newSliceLostFixture(t, opts)
+		f.settledRound(t, consolidated)
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want omitted with zero reviewers", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("human_only_reviewers", func(t *testing.T) {
+		// A reviewers block with zero agents, so the agent count alone omits the block.
+		opts := compare(t)
+		opts.spec = []byte(`version: "0.3"
+workflows:
+  feature_change:
+    stages:
+      - id: plan
+        type: plan
+        executor:
+          agent: claude-code
+        produces:
+          - artifact: plan
+            schema: standard_v1
+      - id: implement
+        type: implement
+        executor:
+          agent: claude-code
+        reviewers:
+          human: 1
+`)
+		f := newSliceLostFixture(t, opts)
+		f.settledRound(t, consolidated)
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want omitted with zero agent reviewers", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("reviewer_unwired", func(t *testing.T) {
+		opts := compare(t)
+		opts.reviewerUnwired = true
+		f := newSliceLostFixture(t, opts)
+		f.settledRound(t, consolidated)
+		if resp := f.read(t); len(resp.SliceReviewsLost) != 0 {
+			t.Errorf("entries = %+v, want omitted with no reviewer backend", resp.SliceReviewsLost)
+		}
+	})
+	t.Run("rerun_pending", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		if !claimRerun(f.runRow.ID) {
+			t.Fatal("setup: claimRerun = false")
+		}
+		t.Cleanup(func() { releaseRerun(f.runRow.ID) })
+		if got := f.only(t, f.read(t)); got.RerunRefusal != rerunInFlightRerunPending || got.NextStep != "" {
+			t.Errorf("entry = %+v, want no action while a re-run is pending", got)
+		}
+	})
+	t.Run("redispatch_pending", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		seq := f.settledRound(t, consolidated)
+		k := pendingRedispatchKey{runID: f.runRow.ID, stage: "implement", seq: seq}
+		markRedispatchPending(k)
+		t.Cleanup(func() { clearRedispatchPending(k) })
+		if got := f.only(t, f.read(t)); got.RerunRefusal != rerunInFlightRedispatching || got.NextStep != "" {
+			t.Errorf("entry = %+v, want no action mid-handoff", got)
+		}
+	})
+	const rawCause = "raw store cause must stay private"
+	t.Run("eligibility_read_error", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.s.cfg.AuditRepo = &sliceRunCategoryErrAudit{auditFake: f.au, failRun: f.runRow.ID, failCategory: CategoryStageFixupTriggered, cause: errors.New(rawCause)}
+		w := getGateView(t, f.s, f.parent.ID, "")
+		if strings.Contains(w.Body.String(), rawCause) {
+			t.Errorf("raw cause reached the body:\n%s", w.Body.String())
+		}
+		resp := decodeGateView(t, w)
+		got := f.only(t, resp)
+		if got.RerunEligibility != sliceRerunUnknown || got.NextStep != "" {
+			t.Errorf("entry = %+v, want unknown with no action", got)
+		}
+		if !sliceGapRecorded(resp) {
+			t.Errorf("gaps = %v, want %s", resp.HistoryGaps, gateViewGapSliceReviews)
+		}
+	})
+	t.Run("round_read_error_after_coverage", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.s.cfg.AuditRepo = &sliceStartedReadErrAudit{auditFake: f.au, failRun: f.runRow.ID, failAfter: 1}
+		resp := f.read(t)
+		got := f.only(t, resp)
+		if got.RerunEligibility != sliceRerunUnknown || got.NextStep != "" || !sliceGapRecorded(resp) {
+			t.Errorf("entry = %+v gaps = %v, want unknown with the gap", got, resp.HistoryGaps)
+		}
+	})
+	t.Run("round_disappeared_after_coverage", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.s.cfg.AuditRepo = &sliceStartedEmptyAudit{auditFake: f.au, failRun: f.runRow.ID}
+		resp := f.read(t)
+		got := f.only(t, resp)
+		if got.RerunEligibility != sliceRerunUnknown || got.NextStep != "" || !sliceGapRecorded(resp) {
+			t.Errorf("entry = %+v gaps = %v, want unknown with the gap", got, resp.HistoryGaps)
+		}
+	})
+	// A concurrent advisory re-run lands a newer round between the coverage read
+	// and the recovery read. The entry stays bound to the covered round and offers
+	// nothing, and the real verb agrees that the newer round is not re-runnable.
+	t.Run("round_replaced_after_coverage", func(t *testing.T) {
+		for _, withVerdict := range []bool{false, true} {
+			name, wantCode := "new_round_in_flight", rerunCodeRoundInFlight
+			if withVerdict {
+				name, wantCode = "new_round_has_verdict", rerunCodeRoundHasVerdict
+			}
+			t.Run(name, func(t *testing.T) {
+				f := newSliceLostFixture(t, compare(t))
+				covered := f.settledRound(t, consolidated)
+				var newer int64
+				f.s.cfg.AuditRepo = &sliceStartedReplacedAudit{auditFake: f.au, failRun: f.runRow.ID, replace: func() {
+					newer = unsettled(t, f, time.Now())
+					if withVerdict {
+						f.appendAt(t, f.implStage.ID, time.Now(), "implement_reviewed", planreview.ImplementReviewedPayload{Verdict: planreview.VerdictApprove, Authority: planreview.AuthorityAdvisory, HeadSHA: sliceLostHead})
+					}
+				}}
+				resp := f.read(t)
+				if newer == 0 {
+					t.Fatal("setup: the newer round did not land between the two reads")
+				}
+				got := f.only(t, resp)
+				if got.RoundSequence != covered || got.Reason != reviewCoverageReasonNoVerdict || got.RerunEligibility != sliceRerunUnknown || got.NextStep != "" || !sliceGapRecorded(resp) {
+					t.Errorf("entry = %+v gaps = %v, want covered round %d unknown with no action and the gap", got, resp.HistoryGaps, covered)
+				}
+				f.s.cfg.AuditRepo = f.au
+				w := f.verb(t)
+				if code, _ := rerunErr(t, w); w.Code != http.StatusConflict || code != wantCode {
+					t.Errorf("verb = %d %s, want 409 %s for round %d", w.Code, code, wantCode, newer)
+				}
+			})
+		}
+	})
+	t.Run("two_unknown_entries_one_gap", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		second := f.rr.seedRun()
+		second.WorkflowID, second.WorkflowSpec, second.Repo, second.State = "feature_change", f.runRow.WorkflowSpec, f.runRow.Repo, run.StateSucceeded
+		second.DecomposedFrom = &f.parent.ID
+		raw := recoveryPayload(t, consolidated)
+		sid := f.implStage.ID
+		if _, err := f.au.AppendChained(t.Context(), audit.ChainAppendParams{RunID: second.ID, StageID: &sid, Timestamp: beforeBoot, Category: "implement_review_started", Payload: raw}); err != nil {
+			t.Fatalf("setup: second round: %v", err)
+		}
+		if _, err := f.au.AppendChained(t.Context(), audit.ChainAppendParams{RunID: second.ID, StageID: &sid, Timestamp: beforeBoot, Category: "implement_review_failed", Payload: []byte(`{}`)}); err != nil {
+			t.Fatalf("setup: second terminal: %v", err)
+		}
+		f.au.listByCategoryErrCategory = CategoryStageFixupTriggered
+		resp := f.read(t)
+		if len(resp.SliceReviewsLost) != 2 {
+			t.Fatalf("entries = %+v, want both unknown", resp.SliceReviewsLost)
+		}
+		n := 0
+		for _, g := range resp.HistoryGaps {
+			if g == gateViewGapSliceReviews {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("slice_reviews gaps = %d (%v), want exactly 1", n, resp.HistoryGaps)
+		}
+	})
+	t.Run("coverage_read_error", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.s.cfg.AuditRepo = &sliceRunCategoryErrAudit{auditFake: f.au, failRun: f.runRow.ID, failCategory: "implement_review_started", cause: errors.New(rawCause)}
+		w := getGateView(t, f.s, f.parent.ID, "")
+		if strings.Contains(w.Body.String(), rawCause) {
+			t.Errorf("raw cause reached the body:\n%s", w.Body.String())
+		}
+		resp := decodeGateView(t, w)
+		if len(resp.SliceReviewsLost) != 0 || !sliceGapRecorded(resp) {
+			t.Errorf("entries = %+v gaps = %v, want the block omitted with the gap", resp.SliceReviewsLost, resp.HistoryGaps)
+		}
+	})
+	t.Run("children_read_error", func(t *testing.T) {
+		f := newSliceLostFixture(t, compare(t))
+		f.settledRound(t, consolidated)
+		f.s.cfg.RunRepo = &sliceChildrenErrRepo{orchestratorRepo: f.rr}
+		resp := f.read(t)
+		if len(resp.SliceReviewsLost) != 0 || !sliceGapRecorded(resp) {
+			t.Errorf("entries = %+v gaps = %v, want the block omitted with the gap", resp.SliceReviewsLost, resp.HistoryGaps)
+		}
+	})
+}
+
+// sliceStartedReadErrAudit passes the coverage read of a run's started rows, then
+// fails the recovery read that follows it.
+type sliceStartedReadErrAudit struct {
+	*auditFake
+	failRun   uuid.UUID
+	failAfter int32
+	reads     atomic.Int32
+}
+
+func (a *sliceStartedReadErrAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == a.failRun && category == "implement_review_started" && a.reads.Add(1) > a.failAfter {
+		return nil, errors.New("injected recovery read error")
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// sliceStartedEmptyAudit passes the coverage read of a run's started rows, then
+// answers none: the round is gone between the two reads.
+type sliceStartedEmptyAudit struct {
+	*auditFake
+	failRun uuid.UUID
+	reads   atomic.Int32
+}
+
+func (a *sliceStartedEmptyAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == a.failRun && category == "implement_review_started" && a.reads.Add(1) > 1 {
+		return nil, nil
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// sliceStartedReplacedAudit passes the coverage read of a run's started rows, then
+// runs replace once before the recovery read: a newer round lands between them.
+type sliceStartedReplacedAudit struct {
+	*auditFake
+	failRun uuid.UUID
+	replace func()
+	reads   atomic.Int32
+}
+
+func (a *sliceStartedReplacedAudit) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if runID == a.failRun && category == "implement_review_started" && a.reads.Add(1) == 2 {
+		a.replace()
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+// sliceChildrenErrRepo fails only the decomposed-children listing.
+type sliceChildrenErrRepo struct{ *orchestratorRepo }
+
+func (r *sliceChildrenErrRepo) ListRuns(ctx context.Context, filter run.ListRunsFilter) ([]*run.Run, error) {
+	if filter.DecomposedFrom != nil {
+		return nil, errors.New("injected children read error")
+	}
+	return r.orchestratorRepo.ListRuns(ctx, filter)
+}
+
+// TestGateView_SliceReviewsLost_GatingRoundKeepsCoverageHold: describing a lost
+// gating round offers no action and changes no byte of the coverage hold.
+func TestGateView_SliceReviewsLost_GatingRoundKeepsCoverageHold(t *testing.T) {
+	h := newCoverageHarness(t)
+	child := h.addChild(t, 0, run.StateSucceeded)
+	started, _ := json.Marshal(planreview.ReviewStartedPayload{ConfiguredAgents: 1, Authority: planreview.AuthorityGating, RoundOrigin: reviewRoundOriginTrace, HeadSHA: sliceLostHead})
+	rid := child
+	h.au.mu.Lock()
+	h.au.seeded = append(h.au.seeded,
+		&audit.Entry{RunID: &rid, Sequence: 5, Category: "implement_review_started", Payload: started},
+		&audit.Entry{RunID: &rid, Sequence: 6, Category: "implement_review_failed", Payload: []byte(`{}`)})
+	h.au.mu.Unlock()
+
+	resp := decodeGateView(t, getGateView(t, h.s, h.parentID, ""))
+	if len(resp.SliceReviewsLost) != 1 {
+		t.Fatalf("slice_reviews_lost = %+v, want the gating round described", resp.SliceReviewsLost)
+	}
+	got := resp.SliceReviewsLost[0]
+	if got.RerunRefusal != redispatchSlugGatingAuthority || got.NextStep != "" || got.Authority != string(planreview.AuthorityGating) {
+		t.Errorf("entry = %+v, want gating_authority and no action", got)
+	}
+	blocker := mergeBlockerByCode(resp.MergeReadiness, mergeCodeReviewCoverageIncomplete)
+	if blocker == nil {
+		t.Fatalf("merge_readiness = %+v, want the coverage hold", resp.MergeReadiness)
+	}
+	ref, err := h.s.reviewCoverageRefusal(context.Background(), h.parent)
+	if err != nil || ref == nil {
+		t.Fatalf("reviewCoverageRefusal = %+v, %v", ref, err)
+	}
+	gotBytes, err := json.Marshal(blocker)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wantBytes, err := json.Marshal(gateViewMergeBlockerOf(ref))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(gotBytes, wantBytes) {
+		t.Errorf("hold changed:\n got %s\nwant %s", gotBytes, wantBytes)
+	}
+}
+
+// TestRestartLostSliceReview_SurfacesOnParentGateView: slices_integrated lands first
+// and the boot sweep then closes the child's round because its bundle is missing, so
+// an entry written at fan-in would have missed it. The read-time projection names it
+// through the real handler, and the real verb answers what the entry says.
+func TestRestartLostSliceReview_SurfacesOnParentGateView(t *testing.T) {
+	f := newSliceLostFixture(t, redispatchFixtureOpts{})
+	faithful := newFaithfulListAllAudit(f.au)
+	f.s.cfg.AuditRepo = faithful
+	f.s.processStart = time.Now().Add(time.Hour)
+	seq := f.appendAt(t, f.implStage.ID, terminalRoundAge(time.Hour), "implement_review_started", advisoryImplementStarted(reviewRoundOriginTrace, "", sliceLostHead))
+	parentID := f.parent.ID
+	integrated, err := f.au.AppendChained(context.Background(), audit.ChainAppendParams{RunID: parentID, Timestamp: terminalRoundAge(time.Hour), Category: "slices_integrated", Payload: []byte(`{"slice_count":1}`)})
+	if err != nil {
+		t.Fatalf("setup: slices_integrated: %v", err)
+	}
+
+	bootSweep(t, f.s)
+
+	want := orphanedReviewRedispatchFallbackReason(redispatchSlugTraceBundleUnavail)
+	if got := failedReasonsAfter(t, f.au, f.runRow.ID, "implement_review_failed", seq); !slices.Equal(got, []string{want}) {
+		t.Fatalf("closure reasons = %v, want %q", got, want)
+	}
+	closed := redispatchEntries(t, f.au, f.runRow.ID, "implement_review_failed")
+	if len(closed) != 1 || closed[0].Sequence <= integrated.Sequence {
+		t.Fatalf("closure %+v must land after slices_integrated (sequence %d)", closed, integrated.Sequence)
+	}
+	got := f.only(t, f.read(t))
+	if got.Reason != reviewCoverageReasonNoVerdict || got.RerunRefusal != redispatchSlugTraceBundleUnavail || got.NextStep != "" {
+		t.Errorf("entry = %+v, want trace_bundle_unavailable with no action", got)
+	}
+	f.assertVerbRefused(t, f.verb(t), seq, http.StatusBadGateway, rerunCodeNotStarted, redispatchSlugTraceBundleUnavail)
+}
+
+// TestSliceCoverageGaps_Reasons compares each fixture's reasons, slices and order
+// with the real reviewCoverageRefusal's uncovered_slices, so the reader cannot drift.
+func TestSliceCoverageGaps_Reasons(t *testing.T) {
+	cases := []struct {
+		name string
+		seed func(t *testing.T, h *coverageHarness)
+	}{
+		{"no_round", func(t *testing.T, h *coverageHarness) { h.addChild(t, 0, run.StateSucceeded) }},
+		{"no_verdict", func(t *testing.T, h *coverageHarness) {
+			h.round(h.addChild(t, 0, run.StateSucceeded), 5, 1, "implement_review_failed")
+		}},
+		{"in_flight", func(t *testing.T, h *coverageHarness) {
+			h.round(h.addChild(t, 0, run.StateSucceeded), 5, 2, "implement_review_failed")
+		}},
+		{"skipped_covers_nothing", func(t *testing.T, h *coverageHarness) {
+			h.round(h.addChild(t, 0, run.StateSucceeded), 5, 1, "implement_review_skipped")
+		}},
+		{"verdict_covers", func(t *testing.T, h *coverageHarness) {
+			h.round(h.addChild(t, 0, run.StateSucceeded), 5, 1, "implement_reviewed")
+			h.addChild(t, 1, run.StateSucceeded)
+		}},
+		{"older_verdict_superseded", func(t *testing.T, h *coverageHarness) {
+			child := h.addChild(t, 0, run.StateSucceeded)
+			h.round(child, 5, 1, "implement_reviewed")
+			h.round(child, 9, 1, "implement_review_failed")
+		}},
+		{"failed_and_cancelled_excluded", func(t *testing.T, h *coverageHarness) {
+			h.addChild(t, 0, run.StateFailed)
+			h.addChild(t, 1, run.StateCancelled)
+			h.addChild(t, 2, run.StateSucceeded)
+		}},
+		{"order_by_slice_index", func(t *testing.T, h *coverageHarness) {
+			h.addChild(t, 2, run.StateSucceeded)
+			h.round(h.addChild(t, 0, run.StateSucceeded), 5, 1, "implement_review_failed")
+			h.round(h.addChild(t, 1, run.StateSucceeded), 7, 2)
+		}},
+		{"unindexed_last", func(t *testing.T, h *coverageHarness) {
+			id := uuid.New()
+			parent := h.parentID
+			h.repo.mu.Lock()
+			h.repo.runs[id] = &run.Run{ID: id, State: run.StateSucceeded, WorkflowID: "feature_change", WorkflowSpec: fanInVerifySpec, DecomposedFrom: &parent, CreatedAt: time.Now()}
+			h.repo.mu.Unlock()
+			h.addChild(t, 4, run.StateSucceeded)
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newCoverageHarness(t)
+			tc.seed(t, h)
+			children, err := h.s.listAllDecomposedChildren(context.Background(), h.parentID)
+			if err != nil {
+				t.Fatalf("children: %v", err)
+			}
+			gaps, err := h.s.sliceCoverageGaps(context.Background(), children)
+			if err != nil {
+				t.Fatalf("sliceCoverageGaps: %v", err)
+			}
+			got := make([]map[string]any, 0, len(gaps))
+			for _, g := range gaps {
+				entry := map[string]any{"child_run_id": g.child.ID.String(), "round_sequence": g.coverage.Sequence, "reason": g.reason}
+				if g.child.SliceIndex != nil {
+					entry["slice_index"] = *g.child.SliceIndex
+				}
+				got = append(got, entry)
+			}
+			var want []map[string]any
+			if ref := h.refusal(t); ref != nil {
+				want, _ = ref.Details["uncovered_slices"].([]map[string]any)
+			}
+			if len(got) == 0 && len(want) == 0 {
+				return
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("gaps:\n got %v\nwant %v", got, want)
+			}
+		})
+	}
+	t.Run("read_error_returned", func(t *testing.T) {
+		h := newCoverageHarness(t)
+		child := h.addChild(t, 0, run.StateSucceeded)
+		h.s.cfg.AuditRepo = runScopedErrAudit{auditFake: h.au, failRun: child}
+		children, err := h.s.listAllDecomposedChildren(context.Background(), h.parentID)
+		if err != nil {
+			t.Fatalf("children: %v", err)
+		}
+		if gaps, err := h.s.sliceCoverageGaps(context.Background(), children); err == nil {
+			t.Errorf("gaps = %+v, want the read error", gaps)
+		}
+	})
+}
+
+// --- API companions (ADR-140, #5047) ------------------------------------------
+
+func readAPIDoc(t *testing.T, rel string) string {
+	t.Helper()
+	b, err := os.ReadFile(filepath.Join(repoRoot(t), rel))
+	if err != nil {
+		t.Fatalf("read %s: %v", rel, err)
+	}
+	return string(b)
+}
+
+// TestReviewObligationCapability_Documented: both API files carry the five-token
+// runner capability literal and every wire name a client reads.
+func TestReviewObligationCapability_Documented(t *testing.T) {
+	for _, rel := range []string{"docs/api/v0.openapi.yaml", "docs/api/v0.md"} {
+		doc := readAPIDoc(t, rel)
+		for _, want := range []string{
+			reviewObligationRunnerCapabilities,
+			"held_commit_review_obligation",
+			"supports_review_obligation_resume",
+			"review_obligation_missing",
+			"slice_reviews_lost",
+		} {
+			if !strings.Contains(doc, want) {
+				t.Errorf("%s must document %q (ADR-140, #5047)", rel, want)
+			}
+		}
+	}
+}
+
+// openAPIPathBlock returns one path's YAML block.
+func openAPIPathBlock(t *testing.T, doc, path string) string {
+	t.Helper()
+	header := "\n  " + path + ":\n"
+	i := strings.Index(doc, header)
+	if i < 0 {
+		t.Fatalf("no %s path in the OpenAPI document", path)
+	}
+	rest := doc[i+len(header):]
+	if j := strings.Index(rest, "\n  /"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// openAPIResponseBlock returns one status's block inside a path block.
+func openAPIResponseBlock(t *testing.T, block, status string) string {
+	t.Helper()
+	header := "\n        '" + status + "':"
+	i := strings.Index(block, header)
+	if i < 0 {
+		t.Fatalf("no %s response in:\n%s", status, block)
+	}
+	rest := block[i+len(header):]
+	if j := strings.Index(rest, "\n        '"); j >= 0 {
+		rest = rest[:j]
+	}
+	return rest
+}
+
+// TestReviewRoundInFlight_DocumentedPerRoute: review_round_in_flight is one code on
+// two routes with two statuses, so the error table and both OpenAPI responses name
+// route and status together, never a bare second row or a new slug. A client reading
+// only one route's text would otherwise treat the other's answer as its own.
+func TestReviewRoundInFlight_DocumentedPerRoute(t *testing.T) {
+	const (
+		rerunRoute = "POST /v0/runs/{run_id}/reviews/rerun"
+		shipRoute  = "POST /v0/runs/{run_id}/pull-request"
+	)
+	md := readAPIDoc(t, "docs/api/v0.md")
+	var row string
+	for _, line := range strings.Split(md, "\n") {
+		if strings.HasPrefix(line, "| ") && strings.Contains(line, "`review_round_in_flight`") {
+			if row != "" {
+				t.Errorf("v0.md has a second review_round_in_flight row; name the route inside the one row:\n%s", line)
+			}
+			row = line
+		}
+	}
+	for _, want := range []string{
+		rerunRoute,
+		"`review_round_in_flight`, 409 on this route",
+		"503 on `" + shipRoute + "`",
+		"`Retry-After`",
+		"`" + reviewPassRemainingHeader + "`",
+	} {
+		if !strings.Contains(row, want) {
+			t.Errorf("v0.md's review_round_in_flight row must name %q:\n%s", want, row)
+		}
+	}
+
+	doc := readAPIDoc(t, "docs/api/v0.openapi.yaml")
+	ship := openAPIResponseBlock(t, openAPIPathBlock(t, doc, "/v0/runs/{run_id}/pull-request"), "503")
+	for _, want := range []string{"`review_round_in_flight` on `" + shipRoute + "`", "Retry-After:", reviewPassRemainingHeader + ":", rerunRoute} {
+		if !strings.Contains(strings.Join(strings.Fields(ship), " "), strings.Join(strings.Fields(want), " ")) {
+			t.Errorf("the pull-request 503 must name %q:\n%s", want, ship)
+		}
+	}
+	rerun := openAPIPathBlock(t, doc, "/v0/runs/{run_id}/reviews/rerun")
+	if conflict := openAPIResponseBlock(t, rerun, "409"); !strings.Contains(conflict, "`review_round_in_flight`") {
+		t.Errorf("the rerun 409 must name review_round_in_flight:\n%s", conflict)
+	}
+	for _, want := range []string{"`409 review_round_in_flight` on this route", shipRoute} {
+		if !strings.Contains(strings.Join(strings.Fields(rerun), " "), want) {
+			t.Errorf("the rerun description must name %q", want)
+		}
+	}
+}
+
+// --- The resumed-upload seam (ADR-140 D9, #5047), over the bytes the golden pins ---
+
+// TestResumedHeldCommitUpload_GoldenWire_GatingPath posts the golden resumed artifact
+// to the real route: the runner's exact bytes re-enter the required gating path.
+func TestResumedHeldCommitUpload_GoldenWire_GatingPath(t *testing.T) {
+	body := []byte(loadReviewObligationWire(t).ResumedArtifact)
+	t.Run("approve_advances", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, approveStep)
+		if w := p.post(t, body); w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want 1", n)
+		}
+	})
+	t.Run("reject_fails_b_closes_pr", func(t *testing.T) {
+		p := newPRSeam(t, specImplementGatingReviewers, rejectStep)
+		if w := p.post(t, body); w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedB(t)
+	})
+	t.Run("kill_503_then_lost_409", func(t *testing.T) {
+		started := make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+		done := p.postAsync(t.Context(), body)
+		waitFor(t, started, "setup: blocked reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, done, "killed upload"), http.StatusServiceUnavailable)
+		p.assertNothingMoved(t)
+		p.nextProcess(approveStep)
+		assertInterrupted(t, p.post(t, body), http.StatusConflict)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls on the next process = %d, want none: no same-attempt replay dispatches", n)
+		}
+		p.assertNothingMoved(t)
+	})
+}
+
+// TestResumedHeldCommitUpload_OrdinaryWire_Unchanged: the no-delta golden stays the
+// ordinary upload and invokes no reviewer.
+func TestResumedHeldCommitUpload_OrdinaryWire_Unchanged(t *testing.T) {
+	started := make(chan struct{})
+	p := newPRSeam(t, specImplementGatingReviewers, blockStep(started))
+	if w := p.post(t, wireGoldenHeldCommitBytes(t)); w.Code != http.StatusCreated {
+		t.Fatalf("upload = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := p.rev.calls.Load(); n != 0 {
+		t.Errorf("reviewer calls = %d, want none on a no-delta resume", n)
+	}
+	p.assertAdvancedOnce(t)
+}
+
+// --- Reverted-backend readers (ADR-140 D9, #5047) ----------------------------------
+
+// The frozen* declarations are VERBATIM copies of commit d57d24e6's
+// resolveHeldCommitExemption and newestPushCheckpoint, their category lists and decode
+// structs, cut only to their decisions and with no logging. They are the backend this
+// change can be reverted to: every test below writes its rows through the REAL route
+// and decision handlers, then asks the old code what it would serve. This is
+// component-seam evidence, not a whole-stack proof.
+var (
+	frozenScopeCompletenessCategories = []string{
+		CategoryScopeCompletenessParked,
+		CategoryScopeCompletenessExempted,
+		CategoryScopeCompletenessFailed,
+		CategoryScopeCompletenessAmended,
+		"pull_request_opened",
+		"fixup_pushed",
+		"child_pushed",
+	}
+	frozenPushCheckpointCategories = []string{
+		"pull_request_failed",
+		CategoryPushResumeCheckpoint,
+		CategoryVerifyResumeCheckpoint,
+		"pull_request_opened",
+		CategoryScopeCompletenessParked,
+		CategoryScopeCompletenessExempted,
+		CategoryScopeCompletenessFailed,
+		"fixup_pushed",
+		"child_pushed",
+	}
+)
+
+// frozenCheckpointEnvelope is d57d24e6's checkpointEnvelope.
+type frozenCheckpointEnvelope struct {
+	PushCheckpoint *struct {
+		Branch          string `json:"branch"`
+		HeadSHA         string `json:"head_sha"`
+		BaseSHA         string `json:"base_sha"`
+		VerifiedTreeSHA string `json:"verified_tree_sha"`
+		PRTitle         string `json:"pr_title"`
+		PRBody          string `json:"pr_body"`
+	} `json:"push_checkpoint"`
+}
+
+// frozenScopeCompletenessPark is d57d24e6's run.ScopeCompletenessPark row shape.
+type frozenScopeCompletenessPark struct {
+	HeldCommitSHA   string `json:"held_commit_sha"`
+	RunBranch       string `json:"run_branch"`
+	BaseSHA         string `json:"base_sha,omitempty"`
+	VerifiedTreeSHA string `json:"verified_tree_sha"`
+	PRTitle         string `json:"pr_title,omitempty"`
+	PRBody          string `json:"pr_body,omitempty"`
+}
+
+// frozenNewestPushCheckpoint is d57d24e6's newestPushCheckpoint verdict.
+func frozenNewestPushCheckpoint(t *testing.T, s *Server, runID, stageID uuid.UUID) string {
+	t.Helper()
+	ctx := context.Background()
+	var newest, newestCarrier *audit.Entry
+	for _, cat := range frozenPushCheckpointCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runID, cat)
+		if err != nil {
+			return checkpointNone
+		}
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stageID {
+				continue
+			}
+			if newest == nil || e.Sequence > newest.Sequence {
+				newest = e
+			}
+			if (cat == "pull_request_failed" || cat == CategoryPushResumeCheckpoint ||
+				cat == CategoryVerifyResumeCheckpoint) &&
+				(newestCarrier == nil || e.Sequence > newestCarrier.Sequence) {
+				newestCarrier = e
+			}
+		}
+	}
+	if newestCarrier == nil {
+		return checkpointNone
+	}
+	var env frozenCheckpointEnvelope
+	if err := json.Unmarshal(newestCarrier.Payload, &env); err != nil {
+		return checkpointNone
+	}
+	if env.PushCheckpoint == nil {
+		return checkpointNone
+	}
+	cp := env.PushCheckpoint
+	if newest != newestCarrier {
+		return checkpointSuperseded
+	}
+	if cp.HeadSHA == "" || cp.Branch == "" || cp.BaseSHA == "" {
+		return checkpointIncomplete
+	}
+	return checkpointResumable
+}
+
+// frozenResolveHeldCommitExemption is d57d24e6's resolveHeldCommitExemption decision.
+func frozenResolveHeldCommitExemption(t *testing.T, s *Server, runRow *run.Run, stage *run.Stage) bool {
+	t.Helper()
+	ctx := context.Background()
+	if stage == nil || stage.Type != run.StageTypeImplement || stage.ScopeCompletenessPark == nil {
+		return false
+	}
+	if runRow != nil && runRow.DecomposedFrom != nil {
+		return false
+	}
+	var newest, newestParked *audit.Entry
+	var newestCategory string
+	for _, cat := range frozenScopeCompletenessCategories {
+		entries, err := s.cfg.AuditRepo.ListForRunByCategory(ctx, runRow.ID, cat)
+		if err != nil {
+			return false
+		}
+		for _, e := range entries {
+			if e.StageID == nil || *e.StageID != stage.ID {
+				continue
+			}
+			if newest == nil || e.Sequence > newest.Sequence {
+				newest = e
+				newestCategory = cat
+			}
+			if cat == CategoryScopeCompletenessParked && (newestParked == nil || e.Sequence > newestParked.Sequence) {
+				newestParked = e
+			}
+		}
+	}
+	if newest == nil || newestCategory != CategoryScopeCompletenessExempted {
+		return false
+	}
+	park := stage.ScopeCompletenessPark
+	if len(park.BuildRequiredPaths) > 0 {
+		return false
+	}
+	if park.HeldCommitSHA == "" || park.RunBranch == "" {
+		return false
+	}
+	base := park.BaseSHA
+	if base == "" && newestParked != nil {
+		var payload struct {
+			BaseSHA string `json:"base_sha"`
+		}
+		if err := json.Unmarshal(newestParked.Payload, &payload); err != nil {
+			return false
+		}
+		base = payload.BaseSHA
+	}
+	return base != ""
+}
+
+// frozenSeam posts real reports and decisions, then reads them with the old code.
+type frozenSeam struct{ *obligationPrompt }
+
+func newFrozenSeam(t *testing.T) *frozenSeam {
+	t.Helper()
+	return &frozenSeam{newObligationPrompt(t, specImplementGatingReviewers)}
+}
+
+// report posts one real signed failure report over the golden's coordinates.
+func (f *frozenSeam) report(t *testing.T, kind string, obligation *reviewObligation) {
+	t.Helper()
+	r := f.obligationPrompt.report
+	// A post-push report names no kind on the wire; that is what pr_open means.
+	r.ResumeKind = kind
+	if kind == resumeKindPROpen {
+		r.ResumeKind = ""
+	}
+	r.ReviewObligation = obligation
+	if w := shipPRRequest(t, f.s, f.runRow.ID, f.stage.ID, f.priv, recoveryPayload(t, r), ""); w.Code != http.StatusOK {
+		t.Fatalf("setup: failure report = %d:\n%s", w.Code, w.Body.String())
+	}
+}
+
+func (f *frozenSeam) required() *reviewObligation {
+	return f.obligationPrompt.report.ReviewObligation
+}
+
+func (f *frozenSeam) none() *reviewObligation {
+	o := f.required()
+	return &reviewObligation{HeadSHA: o.HeadSHA, StageAttempt: o.StageAttempt, SupplementalScopeExemptions: []scopeExemption{}}
+}
+
+// exemptDecision takes the real exempt decision on a real park.
+func (f *frozenSeam) exemptDecision(t *testing.T, obligation *reviewObligation) {
+	t.Helper()
+	f.postPark(t, obligation)
+	if w := postScopeCompletenessDecision(t, f.s, f.runRow.ID, `{"decision":"exempt","reason":"operator accepted"}`, operatorWriteStages); w.Code != http.StatusOK {
+		t.Fatalf("setup: exempt = %d:\n%s", w.Code, w.Body.String())
+	}
+}
+
+func (f *frozenSeam) checkpoint(t *testing.T) string {
+	t.Helper()
+	return frozenNewestPushCheckpoint(t, f.s, f.runRow.ID, f.stage.ID)
+}
+
+func (f *frozenSeam) exempt(t *testing.T) bool {
+	t.Helper()
+	return frozenResolveHeldCommitExemption(t, f.s, f.runRow, f.stage)
+}
+
+// TestLegacyReaders_KnownRequired_EveryCarrierFailsClosed: a known-required carrier
+// serves no held-commit field at d57d24e6's readers, so a reverted backend re-runs
+// the agent instead of resuming past the required review.
+func TestLegacyReaders_KnownRequired_EveryCarrierFailsClosed(t *testing.T) {
+	for _, tc := range []struct{ name, kind string }{
+		{"pr_open_failure", resumeKindPROpen},
+		{"push_failure", resumeKindPush},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFrozenSeam(t)
+			f.report(t, tc.kind, f.required())
+			if n := countAuditCategory(f.au, CategoryReviewObligationCheckpoint); n != 1 {
+				t.Fatalf("setup: %s rows = %d, want the real route's one", CategoryReviewObligationCheckpoint, n)
+			}
+			if got := f.checkpoint(t); got != checkpointNone {
+				t.Errorf("legacy walk = %q, want no checkpoint", got)
+			}
+		})
+	}
+	t.Run("obligated_checkpoint_category", func(t *testing.T) {
+		f := newFrozenSeam(t)
+		f.report(t, resumeKindPROpen, f.required())
+		if n := countAuditCategory(f.au, CategoryReviewObligationCheckpoint); n != 1 {
+			t.Fatalf("setup: %s rows = %d, want the real route's one", CategoryReviewObligationCheckpoint, n)
+		}
+		if slices.Contains(frozenPushCheckpointCategories, CategoryReviewObligationCheckpoint) {
+			t.Fatal("the frozen walk names the new category; a reverted backend never queries it")
+		}
+		failed, err := f.au.ListForRunByCategory(context.Background(), f.runRow.ID, "pull_request_failed")
+		if err != nil || len(failed) != 1 {
+			t.Fatalf("pull_request_failed rows = %d, %v", len(failed), err)
+		}
+		var env frozenCheckpointEnvelope
+		if err := json.Unmarshal(failed[0].Payload, &env); err != nil || env.PushCheckpoint != nil {
+			t.Errorf("sibling checkpoint = %+v, %v: the sibling must carry none", env.PushCheckpoint, err)
+		}
+	})
+	t.Run("reverify_nonempty_refused", func(t *testing.T) {
+		f := newFrozenSeam(t)
+		f.report(t, resumeKindReverify, f.required())
+		if got := f.checkpoint(t); got != checkpointNone {
+			t.Errorf("legacy walk = %q, want none", got)
+		}
+		if n := countAuditCategory(f.au, CategoryVerifyResumeCheckpoint) + countAuditCategory(f.au, CategoryReviewObligationCheckpoint); n != 0 {
+			t.Errorf("checkpoint rows = %d, want none for a refused report", n)
+		}
+		if got := f.discardReasons(t); !slices.Contains(got, "review_obligation_invalid") {
+			t.Errorf("discard reasons = %v", got)
+		}
+	})
+	t.Run("exempt_park", func(t *testing.T) {
+		f := newFrozenSeam(t)
+		f.exemptDecision(t, f.required())
+		if f.exempt(t) {
+			t.Error("the old resolver resumed a withheld park past its required review")
+		}
+	})
+}
+
+// TestLegacyReaders_ProvenNoneAndOrdinary_StayResumable is the positive control: the
+// frozen readers cannot be vacuously declining. no_key rows are the labelled baseline.
+func TestLegacyReaders_ProvenNoneAndOrdinary_StayResumable(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		kind string
+		none bool
+	}{
+		{"known_none_pr_open", resumeKindPROpen, true},
+		{"known_none_push", resumeKindPush, true},
+		{"known_none_reverify", resumeKindReverify, true},
+		{"no_key_pr_open", resumeKindPROpen, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFrozenSeam(t)
+			var obligation *reviewObligation
+			if tc.none {
+				obligation = f.none()
+			}
+			f.report(t, tc.kind, obligation)
+			if got := f.checkpoint(t); got != checkpointResumable {
+				t.Errorf("legacy walk = %q, want resumable", got)
+			}
+		})
+	}
+	t.Run("known_none_exempt_park", func(t *testing.T) {
+		f := newFrozenSeam(t)
+		f.exemptDecision(t, f.none())
+		if !f.exempt(t) {
+			t.Error("the old resolver refused a known-none park; the positive control failed")
+		}
+	})
+	t.Run("no_key_exempt_park", func(t *testing.T) {
+		f := newFrozenSeam(t)
+		f.exemptDecision(t, nil)
+		if !f.exempt(t) {
+			t.Error("the old resolver refused an ordinary park; the positive control failed")
+		}
+	})
+}
+
+// TestParkRowJSON_OldDecodersAcceptNewRows decodes real new park rows and payloads
+// into the frozen structs. A withheld base reads as absent, never a false value.
+func TestParkRowJSON_OldDecodersAcceptNewRows(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		obligation   func(f *frozenSeam) *reviewObligation
+		wantBase     bool
+		wantRequired bool
+	}{
+		{"known_required", func(f *frozenSeam) *reviewObligation { return f.required() }, false, true},
+		{"known_none", func(f *frozenSeam) *reviewObligation { return f.none() }, true, false},
+		{"no_key", func(*frozenSeam) *reviewObligation { return nil }, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFrozenSeam(t)
+			f.postPark(t, tc.obligation(f))
+			row, err := json.Marshal(f.stage.ScopeCompletenessPark)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var old frozenScopeCompletenessPark
+			if err := json.Unmarshal(row, &old); err != nil {
+				t.Fatalf("old park decoder refused %s: %v", row, err)
+			}
+			r := f.obligationPrompt.report
+			if old.HeldCommitSHA != r.HeadSHA || old.RunBranch != r.Branch || old.VerifiedTreeSHA != r.VerifiedTreeSHA || old.PRTitle != r.Title || old.PRBody != r.Body {
+				t.Errorf("old row = %+v, want the held-commit coordinates and PR text unchanged", old)
+			}
+			if (old.BaseSHA != "") != tc.wantBase {
+				t.Errorf("old row base = %q, want present %v", old.BaseSHA, tc.wantBase)
+			}
+			rows, err := f.au.ListForRunByCategory(context.Background(), f.runRow.ID, CategoryScopeCompletenessParked)
+			if err != nil || len(rows) != 1 {
+				t.Fatalf("parked rows = %d, %v", len(rows), err)
+			}
+			var payload struct {
+				BaseSHA  string `json:"base_sha"`
+				HeadSHA  string `json:"head_sha"`
+				Required string `json:"required_review_base_sha"`
+			}
+			if err := json.Unmarshal(rows[0].Payload, &payload); err != nil {
+				t.Fatalf("old payload decoder refused %s: %v", rows[0].Payload, err)
+			}
+			if payload.HeadSHA != r.HeadSHA || (payload.BaseSHA != "") != tc.wantBase || (payload.Required != "") != tc.wantRequired {
+				t.Errorf("old payload = %+v, want base present %v, required key %v", payload, tc.wantBase, tc.wantRequired)
+			}
+		})
+	}
+}
+
+// TestPushCheckpointCategories_LegacyWalkSeesNoObligatedCarrier: checkpoint-only
+// evidence, never alone. The current walk reads the new carrier and the frozen one
+// cannot, which is the rollback property the separate category exists for.
+func TestPushCheckpointCategories_LegacyWalkSeesNoObligatedCarrier(t *testing.T) {
+	if !slices.Contains(pushCheckpointCategories, CategoryReviewObligationCheckpoint) {
+		t.Errorf("the current walk must read %s", CategoryReviewObligationCheckpoint)
+	}
+	if slices.Contains(frozenPushCheckpointCategories, CategoryReviewObligationCheckpoint) {
+		t.Errorf("the frozen walk must not read %s", CategoryReviewObligationCheckpoint)
+	}
+	f := newFrozenSeam(t)
+	f.report(t, resumeKindPROpen, f.required())
+	if _, verdict := f.s.newestPushCheckpoint(context.Background(), f.runRow.ID, f.stage.ID); verdict != checkpointResumable {
+		t.Errorf("current walk = %q, want the obligated carrier resumable", verdict)
+	}
+	if got := f.checkpoint(t); got != checkpointNone {
+		t.Errorf("frozen walk = %q, want none", got)
+	}
+}
+
+// --- Discharge over the real handler (ADR-140 D9, #5047; rehomed here by plan §33) ---
+
+// requiredPassSeam seeds a known-required carrier through a real signed failure
+// report and retries the stage, so U1 (the obligated upload) writes a PR artifact
+// and a pull_request_opened row NEWER than the carrier. U2 omits the paths.
+type requiredPassSeam struct {
+	*prSeam
+	fails, notified int32
+}
+
+func newRequiredPassSeam(t *testing.T, steps ...reviewStep) *requiredPassSeam {
+	t.Helper()
+	p := newPRSeam(t, specImplementGatingReviewers, steps...)
+	report := obligationReport(t, map[string]any{"outcome": "failed", "category": "C", "reason": "open pull request failed"}, requiredObligation(prSeamHead, p.attempt(t), prSeamPath))
+	if w := p.post(t, report); w.Code != http.StatusOK {
+		t.Fatalf("setup: failure report = %d:\n%s", w.Code, w.Body.String())
+	}
+	if n := countAuditCategory(p.au, CategoryReviewObligationCheckpoint); n != 1 {
+		t.Fatalf("setup: carrier rows = %d, want the report's one", n)
+	}
+	p.retry()
+	// The carrier's own failure report failed the stage and notified once.
+	return &requiredPassSeam{prSeam: p, fails: p.repo.fails.Load(), notified: p.notes.n.Load()}
+}
+
+func (p *requiredPassSeam) u1(t *testing.T) []byte { t.Helper(); return p.body(t) }
+func (p *requiredPassSeam) u2(t *testing.T) []byte { t.Helper(); return p.plainBody(t) }
+
+// assertOmissionRefused posts U2 and pins the same-head refusal: no artifact, no row
+// and nothing moved. Admission must refuse, not the edge after an artifact landed.
+func (p *requiredPassSeam) assertOmissionRefused(t *testing.T) {
+	t.Helper()
+	before, opened := p.artifacts(), countAuditCategory(p.au, "pull_request_opened")
+	assertCode(t, p.post(t, p.u2(t)), http.StatusConflict, "review_obligation_missing")
+	if n := p.artifacts(); n != before {
+		t.Errorf("artifacts = %d, want %d: the omitting upload creates none", n, before)
+	}
+	if n := countAuditCategory(p.au, "pull_request_opened"); n != opened {
+		t.Errorf("pull_request_opened rows = %d, want %d", n, opened)
+	}
+	p.assertHeld(t)
+}
+
+// assertHeld pins a running stage with no effect past the carrier's own report.
+func (p *requiredPassSeam) assertHeld(t *testing.T) {
+	t.Helper()
+	if got := p.state(t); got != run.StageStateRunning {
+		t.Errorf("stage = %q, want running", got)
+	}
+	if n := p.repo.advances.Load(); n != 0 {
+		t.Errorf("successful edges = %d, want 0", n)
+	}
+	if n := p.repo.fails.Load(); n != p.fails {
+		t.Errorf("failed edges = %d, want %d", n, p.fails)
+	}
+	if n := p.closeCalls(); n != 0 {
+		t.Errorf("PR closes = %d, want 0", n)
+	}
+	if n := p.notes.n.Load(); n != p.notified {
+		t.Errorf("status comments = %d, want %d", n, p.notified)
+	}
+}
+
+func (p *requiredPassSeam) startRows() int {
+	return countAuditCategory(p.au, CategorySupplementalReviewStarted)
+}
+
+// requiredPassEdgePark parks the first guarded success edge, after every outside read
+// and with the pass's verdict set written.
+type requiredPassEdgePark struct {
+	*stageCopyRepo
+	s       *Server
+	armed   atomic.Bool
+	reached chan struct{}
+	release chan struct{}
+	once    sync.Once
+}
+
+func newRequiredPassEdgePark(t *testing.T, p *prSeam) *requiredPassEdgePark {
+	t.Helper()
+	r := &requiredPassEdgePark{stageCopyRepo: p.repo, s: p.s, reached: make(chan struct{}), release: make(chan struct{})}
+	r.armed.Store(true)
+	t.Cleanup(r.open)
+	p.s.cfg.RunRepo = r
+	return r
+}
+
+func (r *requiredPassEdgePark) open() { r.once.Do(func() { close(r.release) }) }
+
+func (r *requiredPassEdgePark) TransitionStageFromAttemptGuarded(ctx context.Context, id uuid.UUID, from, to run.StageState, expected string, completion *run.StageCompletion, guard run.StageEdgeGuard) (*run.Stage, error) {
+	if r.armed.CompareAndSwap(true, false) {
+		close(r.reached)
+		select {
+		case <-r.release:
+		case <-ctx.Done():
+		}
+	}
+	return testGuardedEdge{r.s}.TransitionStageFromAttemptGuarded(ctx, id, from, to, expected, completion, guard)
+}
+
+// TestShipPullRequest_RequiredPass_SameHeadOmission: an omitting upload at a recorded
+// head must not bypass a required pass, live or lost. The opened row is newer than the
+// carrier, so the old inference, or a deleted completion guard, would create its
+// artifact and advance over the pass.
+func TestShipPullRequest_RequiredPass_SameHeadOmission(t *testing.T) {
+	t.Run("live_no_bypass", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		p := newRequiredPassSeam(t, heldStep(started, release, approveStep))
+		u1 := p.postAsync(t.Context(), p.u1(t))
+		waitFor(t, started, "setup: U1's reviewer")
+		p.assertOmissionRefused(t)
+		if n := p.artifacts(); n != 1 {
+			t.Errorf("artifacts = %d, want U1's one", n)
+		}
+		if n := p.startRows(); n != 1 {
+			t.Errorf("start rows = %d, want 1", n)
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want 1", n)
+		}
+		close(release)
+		if w := awaitResponse(t, u1, "U1"); w.Code != http.StatusCreated {
+			t.Fatalf("U1 = %d:\n%s", w.Code, w.Body.String())
+		}
+	})
+	kill := func(t *testing.T) *requiredPassSeam {
+		t.Helper()
+		started := make(chan struct{})
+		p := newRequiredPassSeam(t, blockStep(started))
+		u1 := p.postAsync(t.Context(), p.u1(t))
+		waitFor(t, started, "setup: U1's reviewer")
+		p.s.reviewers.closeAndCancel()
+		assertInterrupted(t, awaitResponse(t, u1, "U1"), http.StatusServiceUnavailable)
+		return p
+	}
+	t.Run("lost_no_bypass", func(t *testing.T) {
+		p := kill(t)
+		p.nextProcess(approveStep)
+		p.assertOmissionRefused(t)
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want none", n)
+		}
+	})
+	t.Run("closing_no_bypass", func(t *testing.T) {
+		p := kill(t)
+		p.assertOmissionRefused(t)
+	})
+	t.Run("approve_then_settled", func(t *testing.T) {
+		p := newRequiredPassSeam(t, approveStep)
+		if w := p.post(t, p.u1(t)); w.Code != http.StatusCreated {
+			t.Fatalf("U1 = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.post(t, p.u2(t))
+		if got := p.state(t); got != run.StageStateAwaitingApproval {
+			t.Errorf("stage = %q, want awaiting_approval", got)
+		}
+		if n := p.repo.advances.Load(); n != 1 {
+			t.Errorf("successful edges = %d, want 1", n)
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want 1", n)
+		}
+	})
+	t.Run("reject_then_settled", func(t *testing.T) {
+		p := newRequiredPassSeam(t, rejectStep)
+		if w := p.post(t, p.u1(t)); w.Code != http.StatusCreated {
+			t.Fatalf("U1 = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.closeCalls(); n != 1 {
+			t.Errorf("PR closes = %d, want U1's one", n)
+		}
+		p.post(t, p.u2(t))
+		got := p.current(t)
+		if got.State != run.StageStateFailed || got.FailureCategory == nil || *got.FailureCategory != run.FailureB {
+			t.Errorf("stage = %q %v, want failed category B", got.State, got.FailureCategory)
+		}
+		if n := p.repo.advances.Load(); n != 0 {
+			t.Errorf("successful edges = %d, want 0", n)
+		}
+	})
+	t.Run("reject_edge_failed", func(t *testing.T) {
+		p := newRequiredPassSeam(t, rejectStep)
+		fault := errors.New("forced failed-edge fault")
+		p.repo.onTransition = func(_ context.Context, to run.StageState) error {
+			if to == run.StageStateFailed {
+				return fault
+			}
+			return nil
+		}
+		if w := p.post(t, p.u1(t)); w.Code != http.StatusCreated {
+			t.Fatalf("U1 = %d:\n%s", w.Code, w.Body.String())
+		}
+		if got := p.state(t); got != run.StageStateRunning {
+			t.Fatalf("stage = %q, want running after the failed edge errored", got)
+		}
+		p.assertOmissionRefused(t)
+	})
+	t.Run("retry_reentry", func(t *testing.T) {
+		p := kill(t)
+		p.nextProcess(approveStep)
+		attempt := p.retry()
+		p.assertOmissionRefused(t)
+		if w := p.post(t, p.u1(t)); w.Code != http.StatusOK && w.Code != http.StatusCreated {
+			t.Fatalf("resumed upload = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want the new attempt's one", n)
+		}
+		state, err := p.s.supplementalRoundState(context.Background(), p.runRow.ID, p.stage.ID, prSeamHead, attempt)
+		if err != nil || !supplementalPassDischarged(state) {
+			t.Errorf("round state = %+v, %v: the new attempt's pass must discharge", state, err)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("prior_attempt_complete_not_discharged", func(t *testing.T) {
+		p := newRequiredPassSeam(t, approveStep)
+		fault := errors.New("forced edge fault")
+		p.repo.onTransition = func(_ context.Context, to run.StageState) error {
+			if to == run.StageStateAwaitingApproval {
+				return fault
+			}
+			return nil
+		}
+		assertStaticEdgeError(t, p.post(t, p.u1(t)), fault.Error())
+		p.repo.onTransition = nil
+		p.retry()
+		p.assertOmissionRefused(t)
+	})
+	t.Run("genuine_discharge", func(t *testing.T) {
+		p := newRequiredPassSeam(t, approveStep)
+		fault := errors.New("forced edge fault")
+		p.repo.onTransition = func(_ context.Context, to run.StageState) error {
+			if to == run.StageStateAwaitingApproval {
+				return fault
+			}
+			return nil
+		}
+		assertStaticEdgeError(t, p.post(t, p.u1(t)), fault.Error())
+		p.repo.onTransition = nil
+		before := p.artifacts()
+		if w := p.post(t, p.u2(t)); w.Code != http.StatusCreated {
+			t.Fatalf("U2 = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.artifacts(); n != before+1 {
+			t.Errorf("artifacts = %d, want U2's own added to %d", n, before)
+		}
+		if n := p.rev.calls.Load(); n != 1 {
+			t.Errorf("reviewer calls = %d, want no further pass", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("discharged_races_live_owner", func(t *testing.T) {
+		p := newRequiredPassSeam(t, approveStep)
+		park := newRequiredPassEdgePark(t, p.prSeam)
+		u1 := p.postAsync(t.Context(), p.u1(t))
+		waitFor(t, park.reached, "setup: U1 parked before its edge with its set written")
+		w := p.post(t, p.u2(t))
+		assertCode(t, w, http.StatusServiceUnavailable, "review_round_in_flight")
+		if n := p.repo.advances.Load(); n != 0 {
+			t.Errorf("successful edges = %d, want 0 while the owner is before its edge", n)
+		}
+		park.open()
+		if w := awaitResponse(t, u1, "U1"); w.Code != http.StatusCreated {
+			t.Fatalf("U1 = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t)
+	})
+	t.Run("first_ship_no_carrier", func(t *testing.T) {
+		started, release := make(chan struct{}), make(chan struct{})
+		p := newPRSeam(t, specImplementGatingReviewers, heldStep(started, release, approveStep))
+		u1 := p.postAsync(t.Context(), p.body(t))
+		waitFor(t, started, "setup: U1's reviewer")
+		if n := countAuditCategory(p.au, CategoryReviewObligationCheckpoint); n != 0 {
+			t.Fatalf("setup: carrier rows = %d, want none on a first ship", n)
+		}
+		assertCode(t, p.post(t, p.plainBody(t)), http.StatusConflict, "review_obligation_missing")
+		if n := p.repo.advances.Load(); n != 0 {
+			t.Errorf("successful edges = %d, want 0", n)
+		}
+		close(release)
+		awaitResponse(t, u1, "U1")
+	})
+	t.Run("other_head_unaffected", func(t *testing.T) {
+		p := newRequiredPassSeam(t, approveStep)
+		if w := p.post(t, mustPRBody(t, prSeamOther)); w.Code != http.StatusCreated {
+			t.Fatalf("other head = %d:\n%s", w.Code, w.Body.String())
+		}
+		if n := p.rev.calls.Load(); n != 0 {
+			t.Errorf("reviewer calls = %d, want none at another head", n)
+		}
+		p.assertAdvancedOnce(t)
+	})
+}
+
+// --- Attempt fence at the terminal edge (ADR-140 D8, #5047; rehomed here by §33) -----
+
+// fenceBaseline is what the real failed report itself did: it notified and walked once.
+type fenceBaseline struct {
+	attempt       string
+	notes, walks  int32
+	boards, fails int32
+}
+
+// fenceStaleAttempt lands a real failed report and re-dispatches the stage to running
+// on a new token while the old handler is parked at entry to its terminal store call.
+func fenceStaleAttempt(t *testing.T, p *pgRouteSeam) fenceBaseline {
+	t.Helper()
+	ctx := context.Background()
+	before := p.attempt(t)
+	report := []byte(`{"outcome":"failed","category":"C","reason":"retried while the old pass ran"}`)
+	if w := p.post(t, report); w.Code != http.StatusOK {
+		t.Fatalf("setup: failed report = %d:\n%s", w.Code, w.Body.String())
+	}
+	if _, err := run.RetryStage(ctx, p.realRuns, p.stageID, run.RetryOptions{}); err != nil {
+		t.Fatalf("setup: retry: %v", err)
+	}
+	for _, to := range []run.StageState{run.StageStateDispatched, run.StageStateRunning} {
+		if _, err := p.realRuns.TransitionStage(ctx, p.stageID, to, nil); err != nil {
+			t.Fatalf("setup: transition to %s: %v", to, err)
+		}
+	}
+	after := p.attempt(t)
+	if after == before || after == "" {
+		t.Fatalf("setup: the retry kept attempt %q", after)
+	}
+	return fenceBaseline{attempt: after, notes: p.notes.n.Load(), walks: p.walks.Load(), boards: p.boards.Load(), fails: p.edge.fails.Load()}
+}
+
+// assertFenced pins the newer attempt untouched and every old-attempt effect refused.
+func assertFenced(t *testing.T, p *pgRouteSeam, base fenceBaseline) {
+	t.Helper()
+	got := p.committed(t)
+	if got.State != run.StageStateRunning || run.StageAttemptToken(got.DispatchedAt) != base.attempt {
+		t.Errorf("committed stage = %q on %q, want running on %q", got.State, run.StageAttemptToken(got.DispatchedAt), base.attempt)
+	}
+	if got.FailureCategory != nil || got.FailureReason != nil {
+		t.Errorf("failure fields = %v %v, want none on the newer attempt", got.FailureCategory, got.FailureReason)
+	}
+	if n := p.closeCalls(); n != 0 {
+		t.Errorf("PR closes = %d, want 0", n)
+	}
+	rows, err := p.audits.ListForRunByCategory(context.Background(), p.runID, "pull_request_closed_after_review_reject")
+	if err != nil {
+		t.Fatalf("list close rows: %v", err)
+	}
+	if len(rows) != 0 {
+		t.Errorf("close rows = %d, want 0", len(rows))
+	}
+	if n := p.edge.advances.Load(); n != 0 {
+		t.Errorf("successful edges = %d, want 0", n)
+	}
+	if n := p.edge.fails.Load(); n != base.fails {
+		t.Errorf("failed edges = %d, want %d: the stale edge must not land", n, base.fails)
+	}
+	if n := p.notes.n.Load(); n != base.notes {
+		t.Errorf("status comments = %d, want %d", n, base.notes)
+	}
+	if n := p.boards.Load(); n != base.boards {
+		t.Errorf("board transitions = %d, want %d", n, base.boards)
+	}
+	if n := p.walks.Load(); n != base.walks {
+		t.Errorf("orchestrator advances = %d, want %d", n, base.walks)
+	}
+}
+
+// TestShipPullRequest_SupplementalTerminalFence_PG drives real handlers over real run
+// and audit stores. The old handler parks at entry to its terminal store call, after
+// its last read of the old attempt. At release the row is running, so FailStage or a
+// generic write would land on the new attempt and a preliminary read would already
+// have passed: only the pin inside the write refuses.
+func TestShipPullRequest_SupplementalTerminalFence_PG(t *testing.T) {
+	stale := func(t *testing.T, requiresApproval bool, step reviewStep, want int) {
+		t.Helper()
+		p := newPGRouteSeam(t, specImplementGatingReviewers, requiresApproval, step)
+		p.edge.parkNext()
+		old := p.postAsync(p.body(t))
+		waitFor(t, p.edge.reached, "setup: the old handler parked at its edge")
+		base := fenceStaleAttempt(t, p)
+		p.edge.open()
+		if w := awaitResponse(t, old, "old handler"); w.Code != want {
+			t.Fatalf("old handler = %d, want %d:\n%s", w.Code, want, w.Body.String())
+		}
+		assertFenced(t, p, base)
+	}
+	t.Run("old_reject", func(t *testing.T) { stale(t, true, rejectStep, http.StatusCreated) })
+	t.Run("old_approve", func(t *testing.T) { stale(t, true, approveStep, http.StatusCreated) })
+	t.Run("old_approve_gateless", func(t *testing.T) { stale(t, false, approveStep, http.StatusCreated) })
+	t.Run("replay_heal_old_attempt", func(t *testing.T) {
+		p := newPGRouteSeam(t, specImplementGatingReviewers, true, approveStep)
+		body := p.body(t)
+		fault := errors.New("forced store fault")
+		p.edge.failNext(fault)
+		assertStaticEdgeError(t, p.post(t, body), fault.Error())
+		p.edge.parkNext()
+		replay := p.postAsync(body)
+		waitFor(t, p.edge.reached, "setup: the replay parked at its heal edge")
+		base := fenceStaleAttempt(t, p)
+		p.edge.open()
+		if w := awaitResponse(t, replay, "replay"); w.Code != http.StatusOK {
+			t.Fatalf("replay = %d:\n%s", w.Code, w.Body.String())
+		}
+		assertFenced(t, p, base)
+	})
+	t.Run("current_reject", func(t *testing.T) {
+		p := newPGRouteSeam(t, specImplementGatingReviewers, true, rejectStep)
+		attempt := p.attempt(t)
+		// The forge close is the observable that must follow the failed edge.
+		var stateAtClose atomic.Pointer[run.StageState]
+		closeSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			if r.Method == http.MethodPatch {
+				if st, err := p.realRuns.GetStage(context.Background(), p.stageID); err == nil {
+					stateAtClose.Store(&st.State)
+				}
+				p.closes.mu.Lock()
+				p.closes.closeCalls++
+				p.closes.mu.Unlock()
+			}
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte(`{"number":42,"state":"closed","head":{"sha":"abc"},"id":1}`))
+		}))
+		t.Cleanup(closeSrv.Close)
+		p.s.cfg.GitHub = &githubclient.Client{BaseURL: closeSrv.URL, Tokens: &ghTokensStub{tok: "ghs_test"}, HTTP: &http.Client{Timeout: 5 * time.Second}, AppJWT: func() (string, error) { return "gha_app_jwt_test", nil }}
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertFailedBOn(t, attempt)
+		if got := stateAtClose.Load(); got == nil || *got != run.StageStateFailed {
+			t.Errorf("stage at close = %v, want failed: the close follows the edge", got)
+		}
+		rows, err := p.audits.ListForRunByCategory(context.Background(), p.runID, "pull_request_closed_after_review_reject")
+		if err != nil || len(rows) != 1 {
+			t.Errorf("close rows = %d, %v, want 1", len(rows), err)
+		}
+	})
+	t.Run("current_approve", func(t *testing.T) {
+		p := newPGRouteSeam(t, specImplementGatingReviewers, true, approveStep)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t, run.StageStateAwaitingApproval)
+	})
+	t.Run("current_approve_gateless", func(t *testing.T) {
+		p := newPGRouteSeam(t, specImplementGatingReviewers, false, approveStep)
+		if w := p.post(t, p.body(t)); w.Code != http.StatusCreated {
+			t.Fatalf("upload = %d:\n%s", w.Code, w.Body.String())
+		}
+		p.assertAdvancedOnce(t, run.StageStateSucceeded)
+		if n := p.walks.Load(); n != 1 {
+			t.Errorf("orchestrator advances = %d, want 1", n)
+		}
+	})
 }

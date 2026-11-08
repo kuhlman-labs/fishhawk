@@ -1,16 +1,20 @@
 package server
 
 import (
+	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/invariantmonitor"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -141,6 +145,7 @@ func TestReportedHead_FixupPushed_NoCommitRead(t *testing.T) {
 	// The route log does see a commit read, so zero above is not a dead counter.
 	t.Run("conflict_kind_control_reads_the_commit", func(t *testing.T) {
 		f := newRHFixture(t)
+		f.armConflictReport(rhConflictKind)
 		f.forgeAt(rhH2, rhH2)
 		w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
 		f.assertRowAt(rhConflictKind, w, rhH2, rhPRBranch)
@@ -258,12 +263,14 @@ func TestReportedHead_RowBranchIsForgeResolved(t *testing.T) {
 	for _, kc := range rhAllKinds {
 		t.Run("tracked_pr/"+kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
+			f.armConflictReport(kc)
 			f.forgeAt(rhH2, rhH2)
 			w := f.post(kc, rhH2, rhBaseSHA, rhReportedBranch)
 			assertResolved(t, f, kc, w, rhPRBranch)
 		})
 		t.Run("derived/"+kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
+			f.armConflictReport(kc)
 			f.untrack()
 			derived := fixupBranchFor(f.runRow, f.impl)
 			f.forgeAt("", rhOther)
@@ -451,13 +458,34 @@ func TestReportedHead_DedupReadErrorMismatchIsRetryable(t *testing.T) {
 }
 
 // TestReportedHead_DedupReadErrorVerifiedHeadStillWrites pins the existing fail-open
-// dedup: a verified head proceeds and writes its row despite the failed read.
+// dedup: a verified head proceeds and writes its row despite the failed read. The
+// fault is one-shot: ADR-140 (#5047) D8's guarded variant edge re-reads these rows
+// after the run lock and answers a static 500 on a fault that persists, so only a
+// transient dedup fault isolates the fail-open dedup.
+//
+// The conflict kind no longer fails open to a write (#3806): its live-trigger
+// guard reads the same pushed category itself, so a fault that persists past the
+// dedup answers the retryable 503 before the edge, with no row and no transition.
+// TestConflictResolutionPushed_DedupFault_PushedConsumption pins the one-shot
+// conflict arms, including the admitted positive.
 func TestReportedHead_DedupReadErrorVerifiedHeadStillWrites(t *testing.T) {
-	for _, kc := range rhAllKinds {
+	t.Run(rhConflictKind.name, func(t *testing.T) {
+		f := newRHFixture(t)
+		f.armConflictReport(rhConflictKind)
+		f.forgeAt(rhH2, rhH2)
+		f.au.listByCategoryErrCategory = CategoryConflictResolutionPushed
+		w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+		f.assertUnverifiable(rhConflictKind, w, f.impl, run.StageStateRunning)
+		f.assertLoggedCause("conflict_trigger_state")
+		if !strings.Contains(f.logs.String(), "proceeding without idempotency guard") {
+			t.Errorf("assert: the failed dedup read was not logged:\n%s", f.logs.String())
+		}
+	})
+	for _, kc := range []rhKindCase{rhFixupKind, rhAcceptanceKind} {
 		t.Run(kc.name, func(t *testing.T) {
 			f := newRHFixture(t)
 			f.forgeAt(rhH2, rhH2)
-			f.au.listByCategoryErrCategory = kc.category
+			f.s.cfg.AuditRepo = &rhDedupReadFault{auditFake: f.au, category: kc.category}
 			w := f.post(kc, rhH2, rhBaseSHA, rhPRBranch)
 			f.assertRowAt(kc, w, rhH2, rhPRBranch)
 			if !strings.Contains(f.logs.String(), "proceeding without idempotency guard") {
@@ -480,6 +508,7 @@ func TestReportedHead_ReplayAfterTipMoved_DedupFirst(t *testing.T) {
 	admit := func(t *testing.T, kc rhKindCase) *rhFixture {
 		t.Helper()
 		f := newRHFixture(t)
+		f.armConflictReport(kc)
 		f.forgeAt(rhH2, rhH2)
 		w := f.post(kc, rhH2, rhBaseSHA, rhPRBranch)
 		f.assertRowAt(kc, w, rhH2, rhPRBranch)
@@ -872,4 +901,19 @@ func TestReportedHead_RefusalTextIsNeutral(t *testing.T) {
 		}
 		assertNeutral(t, "409 message", env.Error.Message)
 	})
+}
+
+// rhDedupReadFault fails only the first read of category, which is the handler's
+// dedup read; every later read, the guarded edge's included, sees the store.
+type rhDedupReadFault struct {
+	*auditFake
+	category string
+	fired    atomic.Bool
+}
+
+func (a *rhDedupReadFault) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.category && a.fired.CompareAndSwap(false, true) {
+		return nil, errors.New("rhDedupReadFault: injected dedup read error for " + category)
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
 }

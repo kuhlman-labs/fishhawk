@@ -10,8 +10,8 @@ import (
 // Reviewer implements server.PlanReviewer by shelling out to the `claude` CLI.
 // It is the local-mode sibling of anthropic.Reviewer (#572): the SDK adapter
 // calls the Messages API with a cached system/user split, whereas this adapter
-// sends the full prompt as one `-p` argument to a subprocess — no prompt
-// splitting or caching is available over the CLI.
+// writes the full prompt to a subprocess's stdin as one document (#5113) — no
+// prompt splitting or caching is available over the CLI.
 type Reviewer struct {
 	client *Client
 }

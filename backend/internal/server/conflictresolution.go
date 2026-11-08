@@ -4,7 +4,9 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net/http"
 	"time"
 
 	"github.com/google/uuid"
@@ -96,8 +98,14 @@ func (s *Server) newestStageEntry(ctx context.Context, runID, stageID uuid.UUID,
 	return newest, true
 }
 
-// resolveConflictResolutionTrigger returns the LIVE conflict-resolution trigger
-// for a stage, or nil when there is none to serve.
+// errConflictResolutionAuditUnavailable is liveConflictResolutionTrigger's answer
+// when no audit repository is wired: the trigger state cannot be read at all.
+var errConflictResolutionAuditUnavailable = errors.New("no audit repository is wired")
+
+// liveConflictResolutionTrigger is the STRICT read of a stage's live
+// conflict-resolution trigger. It returns (nil, err) when any required read
+// fails, (nil, nil) when there is no live trigger to serve, and the decoded
+// payload otherwise.
 //
 // The comparison against the newest same-stage CONSUMPTION entry is the
 // load-bearing half (#3202). Consumption is written by BOTH terminal outcomes
@@ -110,46 +118,102 @@ func (s *Server) newestStageEntry(ctx context.Context, runID, stageID uuid.UUID,
 // merge that was aborted and a HEAD that has since moved (the failure case) or
 // at a merge already committed and pushed (the success case).
 //
-// Fails closed on every uncertainty: an unreadable audit chain, a
-// undecodable payload, and a half-populated trigger all return nil (no pass),
-// because serving a pass the backend cannot fully justify is strictly worse
-// than not serving one — the operator's next rebase invocation simply takes
-// the fail-closed 422 it takes today.
-func (s *Server) resolveConflictResolutionTrigger(ctx context.Context, runID, stageID uuid.UUID) *conflictResolutionTrigger {
-	trigger, ok := s.newestStageEntry(ctx, runID, stageID, CategoryStageConflictResolutionTriggered)
-	if !ok || trigger == nil {
-		return nil
+// Both consumption reads run even when the stage has no trigger: the report
+// guard's refusal is permanent (#3806), so it must rest on a fully read state,
+// and an unreadable consumption category is an error, never "no entry". An
+// undecodable or half-populated newest trigger is (nil, nil): serving a pass
+// the backend cannot fully justify is strictly worse than not serving one.
+func (s *Server) liveConflictResolutionTrigger(ctx context.Context, runID, stageID uuid.UUID) (*conflictResolutionTrigger, error) {
+	if s.cfg.AuditRepo == nil {
+		return nil, errConflictResolutionAuditUnavailable
 	}
+	triggers, err := s.stageEntriesStrict(ctx, runID, stageID, CategoryStageConflictResolutionTriggered)
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", CategoryStageConflictResolutionTriggered, err)
+	}
+	consumed := len(triggers) == 0
 	for _, category := range []string{CategoryStageConflictResolutionFailed, CategoryConflictResolutionPushed} {
-		settled, ok := s.newestStageEntry(ctx, runID, stageID, category)
-		if !ok {
-			return nil
+		settled, err := s.stageEntriesStrict(ctx, runID, stageID, category)
+		if err != nil {
+			return nil, fmt.Errorf("read %s: %w", category, err)
 		}
-		if settled != nil && settled.Sequence >= trigger.Sequence {
+		if !consumed && len(settled) > 0 && settled[len(settled)-1].Sequence >= triggers[len(triggers)-1].Sequence {
 			// The trigger was consumed by the pass that settled — refused
 			// (stage_conflict_resolution_failed) or succeeded
 			// (conflict_resolution_pushed). Either way its budget is spent.
-			return nil
+			consumed = true
 		}
+	}
+	if consumed {
+		return nil, nil
 	}
 
 	var payload conflictResolutionTrigger
-	if err := json.Unmarshal(trigger.Payload, &payload); err != nil {
+	if err := json.Unmarshal(triggers[len(triggers)-1].Payload, &payload); err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"conflict resolution: malformed stage_conflict_resolution_triggered payload — serving no pass",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()),
 			slog.String("error", err.Error()))
-		return nil
+		return nil, nil
 	}
 	if !payload.populated() {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"conflict resolution: half-populated trigger payload — serving no pass",
 			slog.String("run_id", runID.String()),
 			slog.String("stage_id", stageID.String()))
+		return nil, nil
+	}
+	return &payload, nil
+}
+
+// resolveConflictResolutionTrigger returns the LIVE conflict-resolution trigger
+// for a stage, or nil when there is none to serve. It is the fail-closed wrapper
+// over liveConflictResolutionTrigger: an unreadable audit chain, an undecodable
+// payload and a half-populated trigger all return nil (no pass), because the
+// prompt and the failure recovery have no retryable answer to give — the
+// operator's next rebase invocation simply takes the fail-closed 422 it takes
+// today.
+func (s *Server) resolveConflictResolutionTrigger(ctx context.Context, runID, stageID uuid.UUID) *conflictResolutionTrigger {
+	trigger, err := s.liveConflictResolutionTrigger(ctx, runID, stageID)
+	if err != nil {
 		return nil
 	}
-	return &payload
+	return trigger
+}
+
+// refuseConflictResolutionWithoutLiveTrigger is the conflict_resolution_pushed
+// report's live-trigger guard (#3806), returning true when it has written the
+// response. It runs AFTER the ADR-141 forge check, so a confirmed mismatch has
+// already settled through the existing failure paths and only a report the
+// forge admits (or a documented skip) reaches it, and BEFORE the stage advance,
+// the row and every later effect.
+//
+// A report with no live same-stage trigger answers 409
+// conflict_resolution_not_live with no audit row, mirroring
+// merge_candidate_verify_not_live: only a pass the rebase verb authorized may
+// write the row that admits its head into the lineage ledger and rule 5's known
+// set. Unreadable trigger state answers the retryable 503
+// reported_head_unverifiable, never the permanent 409. reportedHead is passed
+// explicitly because the request body is already consumed.
+func (s *Server) refuseConflictResolutionWithoutLiveTrigger(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, reportedHead string) bool {
+	trigger, err := s.liveConflictResolutionTrigger(r.Context(), runID, stage.ID)
+	if err != nil {
+		s.writeReportedHeadUnverifiable(w, r, runID, stage.ID, reportedHeadEvidence{}.undeterminable("conflict_trigger_state", err))
+		return true
+	}
+	if trigger != nil {
+		return false
+	}
+	s.cfg.Logger.LogAttrs(r.Context(), slog.LevelWarn,
+		"conflict-resolution push report: no live conflict-resolution trigger for this stage; report refused",
+		slog.String("run_id", runID.String()),
+		slog.String("stage_id", stage.ID.String()),
+		slog.String("reported_head", formatReportedHeadObjectID(reportedHead)))
+	s.writeError(w, r, http.StatusConflict, "conflict_resolution_not_live",
+		"no live conflict-resolution pass is recorded for this stage, so the report cannot be admitted; nothing was recorded",
+		map[string]any{"run_id": runID.String(), "stage_id": stage.ID.String()})
+	return true
 }
 
 // maybeRecoverConflictResolutionFailure handles a REPORTED conflict-resolution

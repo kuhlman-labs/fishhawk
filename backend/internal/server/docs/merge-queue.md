@@ -1533,7 +1533,9 @@ for a refused report: it has no row (`TestReportedHead_RefusedHeadReachesNoConsu
   forge reads share one 15s deadline.
 - **Explicit residuals, never universal verification.** A server with no forge
   client and a run with a nil or zero installation, which includes every GitLab
-  run, admit the report unchecked. Initial PR and child reports and fix-up base
+  run, skip the forge check. Those reports are admitted with no forge read, except
+  that a `conflict_resolution_pushed` report still needs its live trigger (below).
+  Initial PR and child reports and fix-up base
   provenance are deferred ([#5050](https://github.com/kuhlman-labs/fishhawk/issues/5050),
   [#5051](https://github.com/kuhlman-labs/fishhawk/issues/5051)). The check hardens
   against commits the forge does not show at the PR head or branch tip and parents
@@ -1541,11 +1543,25 @@ for a refused report: it has no row (`TestReportedHead_RefusedHeadReachesNoConsu
   eligibility still applies.
 - **`503 reported_head_unverifiable` means confirmation is unknown.** A forge or
   required repository read failed, a dedup read failed (or a row became visible)
-  on a putative mismatch, or the trigger state a refusal needs was unreadable.
+  on a putative mismatch, the trigger state a refusal needs was unreadable, or a
+  `conflict_resolution_pushed` report's live-trigger or consumption read failed
+  (cause `conflict_trigger_state`, #3806).
   Nothing is recorded and nothing transitions, so the runner re-posts the same
   signed bytes inside its request-local 45s budget
   ([runner README](../../../../runner/README.md#the-request-local-push-report-budget-adr-141--4870)).
   The operator cause is in the log line joined to the response's `error_ref`.
+- **`409 conflict_resolution_not_live` means no authorized pass
+  ([#3806](https://github.com/kuhlman-labs/fishhawk/issues/3806)).** After the forge
+  check admits (or skips) a new `conflict_resolution_pushed` report,
+  `refuseConflictResolutionWithoutLiveTrigger` requires an unconsumed, fully populated
+  same-stage `stage_conflict_resolution_triggered` entry, newer than the stage's
+  newest `stage_conflict_resolution_failed` and `conflict_resolution_pushed` rows.
+  Without one: no row, no transition and no audit row, only a WARN naming the run,
+  stage and bounded head. The handler's dedup still fails open on a read error, but
+  that no longer implies admission: the guard reads the pushed category itself, so a
+  consumed row refuses and an unreadable one answers 503. A genuine replay whose
+  first response was lost AND whose dedup read then failed answers this 409; the row
+  and settled stage already exist, and the runner stops after one 409.
 - **`reported_head_mismatch` means the report disagreed with forge state.** It can
   be a benign head-movement race and is not proof of misconduct: a clean base merge
   (`advanceRunBranch` reads no stage state) can land between a runner's push and its

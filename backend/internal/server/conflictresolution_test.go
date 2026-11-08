@@ -4,8 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
+	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/google/uuid"
@@ -616,6 +619,7 @@ func (sd *crSeed) serveMergeFirstParent() {
 func TestConflictResolutionPushed_RepublishedCheckDoesNotFlagMergeForeign(t *testing.T) {
 	sd := seedConflictResolutionE2E(t)
 	sd.serveMergeFirstParent()
+	sd.recordLiveTrigger(t)
 
 	// --- pass 1: the runner reports the pushed merge commit ---
 	priv, _ := sd.sf.issue(t, sd.runID)
@@ -693,6 +697,7 @@ func TestConflictResolutionPushed_RepublishedCheckStillFlagsUnrecordedHead(t *te
 	const unrecorded = "dddd444444444444444444444444444444444444"
 	sd := seedConflictResolutionE2E(t)
 	sd.serveMergeFirstParent()
+	sd.recordLiveTrigger(t)
 
 	priv, _ := sd.sf.issue(t, sd.runID)
 	report := []byte(`{"outcome":"conflict_resolution_pushed","branch":"` + rebaseBranchName +
@@ -725,5 +730,497 @@ func TestConflictResolutionPushed_RepublishedCheckStillFlagsUnrecordedHead(t *te
 	if !strings.Contains(foreign.Detail, crMergeSHA[:7]) {
 		t.Errorf("foreign_commit detail should list the recorded merge sha %s as known: %s",
 			crMergeSHA[:7], foreign.Detail)
+	}
+}
+
+// --- conflict_resolution_pushed live-trigger guard (#3806) ---
+
+// recordLiveConflictTrigger records a live conflict-resolution trigger through
+// the real writer, with the operator identity the rebase verb carries.
+func recordLiveConflictTrigger(t *testing.T, s *Server, runID, stageID uuid.UUID) {
+	t.Helper()
+	req := withRebaseOperator(httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/rebase-branch", nil))
+	if err := s.writeConflictResolutionTriggeredAudit(req, runID, stageID, conflictResolutionTrigger{
+		Branch: rebaseBranchName, BaseRef: rebaseBaseRef, ExpectedHeadSHA: crAgentHeadSHA, Pass: 1,
+		PriorState: string(run.StageStateSucceeded),
+	}); err != nil {
+		t.Fatalf("setup: record conflict-resolution trigger: %v", err)
+	}
+}
+
+// recordLiveTrigger authorizes the e2e world's pass through the real writer.
+func (sd *crSeed) recordLiveTrigger(t *testing.T) {
+	t.Helper()
+	recordLiveConflictTrigger(t, sd.s, sd.runID, sd.impl.ID)
+}
+
+// scriptedReadAuditFake fails only the named 1-based read ordinals of one
+// category and counts that category's reads, so a test can fault the handler's
+// dedup read while the guard's own read of the same category stays observable.
+type scriptedReadAuditFake struct {
+	*auditFake
+	category string
+	failOn   map[int]bool
+	mu       sync.Mutex
+	reads    int
+}
+
+func (a *scriptedReadAuditFake) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.category {
+		a.mu.Lock()
+		a.reads++
+		n := a.reads
+		a.mu.Unlock()
+		if a.failOn[n] {
+			return nil, fmt.Errorf("scriptedReadAuditFake: injected read %d error for %s", n, category)
+		}
+	}
+	return a.auditFake.ListForRunByCategory(ctx, runID, category)
+}
+
+func (a *scriptedReadAuditFake) readCount() int {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.reads
+}
+
+// scriptPushedReads installs a scripted fault on the pushed category.
+func (f *rhFixture) scriptPushedReads(failOn ...int) *scriptedReadAuditFake {
+	f.t.Helper()
+	fail := map[int]bool{}
+	for _, n := range failOn {
+		fail[n] = true
+	}
+	sf := &scriptedReadAuditFake{auditFake: f.au, category: CategoryConflictResolutionPushed, failOn: fail}
+	f.s.cfg.AuditRepo = sf
+	return sf
+}
+
+// confirmConflictReport makes the forge confirm the report every guard test
+// sends: PR head H2 whose first parent is the reported base. ADR-141 admits it,
+// so only the live-trigger guard can refuse it.
+func (f *rhFixture) confirmConflictReport() { f.forgeAt(rhH2, rhH2) }
+
+// assertNotLive pins the guard's refusal: 409 conflict_resolution_not_live naming
+// only run and stage, no row of any kind, no transition, no later effect.
+func (f *rhFixture) assertNotLive(w *httptest.ResponseRecorder, stage *run.Stage, wantState run.StageState) {
+	f.t.Helper()
+	var env errorEnvelope
+	_ = json.Unmarshal(w.Body.Bytes(), &env)
+	if w.Code != http.StatusConflict || env.Error.Code != "conflict_resolution_not_live" {
+		f.t.Errorf("assert: status = %d code = %q, want 409 conflict_resolution_not_live:\n%s", w.Code, env.Error.Code, w.Body.String())
+	}
+	want := map[string]any{"run_id": f.runRow.ID.String(), "stage_id": stage.ID.String()}
+	if len(env.Error.Details) != len(want) || env.Error.Details["run_id"] != want["run_id"] || env.Error.Details["stage_id"] != want["stage_id"] {
+		f.t.Errorf("assert: details = %+v, want only %+v", env.Error.Details, want)
+	}
+	if rows := f.rowPayloads(CategoryConflictResolutionPushed); len(rows) != 0 {
+		f.t.Errorf("assert: conflict_resolution_pushed rows = %d, want 0", len(rows))
+	}
+	if rows := f.mismatchRows(); len(rows) != 0 {
+		f.t.Errorf("assert: reported_head_mismatch rows = %d, want 0", len(rows))
+	}
+	if rows := f.rowPayloads("pull_request_failed"); len(rows) != 0 {
+		f.t.Errorf("assert: pull_request_failed rows = %d, want 0", len(rows))
+	}
+	if got := f.stageState(stage.ID).State; got != wantState {
+		f.t.Errorf("assert: stage state = %s, want %s", got, wantState)
+	}
+	f.assertLaterEffectsAbsent()
+}
+
+// assertAdmitted pins an admitted report: 200, exactly one appended row at the
+// reported head, and the implement stage settled.
+func (f *rhFixture) assertAdmitted(w *httptest.ResponseRecorder) {
+	f.t.Helper()
+	if w.Code != http.StatusOK {
+		f.t.Errorf("assert: status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if rows := f.rowPayloads(CategoryConflictResolutionPushed); len(rows) != 1 || rows[0]["head_sha"] != rhH2 {
+		f.t.Errorf("assert: conflict_resolution_pushed rows = %+v, want one at %s", rows, rhH2)
+	}
+	if got := f.stageState(f.impl.ID).State; got == run.StageStateRunning {
+		f.t.Errorf("assert: implement state = %s, want settled", got)
+	}
+}
+
+// TestConflictResolutionPushed_NoLiveTrigger_Refused: a report the forge confirms
+// (or a documented skip admits) but that has no live same-stage trigger is
+// refused 409 with no row and no later effect.
+//
+// COUNTERFACTUALS: CF1 (call site `if false {`) admits every arm → RED on 409 and
+// zero rows. CF2 (sequence compare forced false) admits consumed_by_failure and
+// equal_sequence_failure. CF3 (populated check forced false) admits
+// half_populated_trigger. CF7 (`>=` weakened to `>`) admits
+// equal_sequence_failure while consumed_by_failure stays GREEN.
+func TestConflictResolutionPushed_NoLiveTrigger_Refused(t *testing.T) {
+	cases := []struct {
+		name    string
+		skip    bool
+		arrange func(f *rhFixture) *run.Stage
+	}{
+		{"no_trigger_row", false, func(f *rhFixture) *run.Stage { return f.impl }},
+		{"consumed_by_failure", false, func(f *rhFixture) *run.Stage {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryStageConflictResolutionFailed, f.impl.ID, 11, map[string]any{"reason": "conflict"})
+			return f.impl
+		}},
+		{"equal_sequence_failure", false, func(f *rhFixture) *run.Stage {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryStageConflictResolutionFailed, f.impl.ID, 10, map[string]any{"reason": "conflict"})
+			return f.impl
+		}},
+		{"trigger_on_other_stage", false, func(f *rhFixture) *run.Stage {
+			f.seed(CategoryStageConflictResolutionTriggered, f.review.ID, 10, conflictResolutionTrigger{
+				Branch: rhPRBranch, BaseRef: rhBaseRef, ExpectedHeadSHA: rhH1, Pass: 1,
+			})
+			return f.impl
+		}},
+		{"half_populated_trigger", false, func(f *rhFixture) *run.Stage {
+			f.seed(CategoryStageConflictResolutionTriggered, f.impl.ID, 10, conflictResolutionTrigger{
+				Branch: rhPRBranch, ExpectedHeadSHA: rhH1, Pass: 1,
+			})
+			return f.impl
+		}},
+		{"malformed_trigger", false, func(f *rhFixture) *run.Stage {
+			f.seed(CategoryStageConflictResolutionTriggered, f.impl.ID, 10, json.RawMessage(`{"branch":`))
+			return f.impl
+		}},
+		{"non_implement_stage", false, func(f *rhFixture) *run.Stage {
+			f.seedConflictTrigger(10) // live on the implement stage, not on the reporting stage
+			f.review.State = run.StageStateRunning
+			return f.review
+		}},
+		{"settled_implement_stage", false, func(f *rhFixture) *run.Stage {
+			f.impl.State = run.StageStateSucceeded
+			return f.impl
+		}},
+		{"no_forge_client", true, func(f *rhFixture) *run.Stage {
+			f.s.cfg.GitHub = nil
+			f.s.auditCheckPublisher = nil
+			return f.impl
+		}},
+		{"no_installation", true, func(f *rhFixture) *run.Stage {
+			f.runRow.InstallationID = nil
+			return f.impl
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRHFixture(t)
+			f.confirmConflictReport()
+			stage := c.arrange(f)
+			wantState := stage.State
+			w := f.postTo(stage, rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+			f.assertNotLive(w, stage, wantState)
+			if c.skip {
+				if calls := f.forge.allCalls(); len(calls) != 0 {
+					t.Errorf("assert: forge calls = %v, want none on a skipped run", calls)
+				}
+			} else if n := f.forge.count("pull"); n != 1 {
+				t.Errorf("assert: pull reads = %d, want 1: the forge check runs before the guard", n)
+			}
+		})
+	}
+}
+
+// TestConflictResolutionPushed_TriggerStateUnreadable_Is503: an unreadable
+// trigger or consumption category answers the retryable 503, never the
+// permanent 409 and never an admission.
+//
+// COUNTERFACTUALS: CF4 (the guard's read-failure branch forced false) turns every
+// arm into a 409. CF6 (a consumption read error skipped with `continue`) admits
+// failed_category and pushed_read_after_clean_dedup and refuses the no-trigger
+// arms 409; trigger_category stays GREEN. M2 (triggers set to nil on a read
+// error) refuses trigger_category 409. M3 (early return with no trigger) refuses
+// the _no_trigger arms 409.
+func TestConflictResolutionPushed_TriggerStateUnreadable_Is503(t *testing.T) {
+	cases := []struct {
+		name    string
+		arrange func(f *rhFixture)
+	}{
+		{"trigger_category", func(f *rhFixture) {
+			f.au.listByCategoryErrCategory = CategoryStageConflictResolutionTriggered
+		}},
+		{"failed_category", func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.au.listByCategoryErrCategory = CategoryStageConflictResolutionFailed
+		}},
+		{"failed_category_no_trigger", func(f *rhFixture) {
+			f.au.listByCategoryErrCategory = CategoryStageConflictResolutionFailed
+		}},
+		{"pushed_read_after_clean_dedup", func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.scriptPushedReads(2)
+		}},
+		{"pushed_read_after_clean_dedup_no_trigger", func(f *rhFixture) {
+			f.scriptPushedReads(2)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRHFixture(t)
+			f.confirmConflictReport()
+			c.arrange(f)
+			w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+			f.assertUnverifiable(rhConflictKind, w, f.impl, run.StageStateRunning)
+			f.assertLoggedCause("conflict_trigger_state")
+			f.assertLaterEffectsAbsent()
+		})
+	}
+}
+
+// TestConflictResolutionPushed_NoAuditRepo_Is503 calls the guard directly: the
+// route answers pull_request_upload_unconfigured before any handler when no audit
+// repository is wired, which the first half pins.
+//
+// COUNTERFACTUAL (M4, the nil-repository return replaced with `return nil, nil`):
+// the guard reads no trigger and answers 409 → RED.
+func TestConflictResolutionPushed_NoAuditRepo_Is503(t *testing.T) {
+	sf := newSigningFake()
+	s := New(Config{Addr: "127.0.0.1:0", SigningRepo: sf, ArtifactRepo: newFakeArtifactRepo(), RunRepo: newOrchestratorRepo()})
+	runID := uuid.New()
+	stage := &run.Stage{ID: uuid.New(), RunID: runID, Type: run.StageTypeImplement, State: run.StageStateRunning}
+
+	priv, _ := sf.issue(t, runID)
+	body := []byte(`{"outcome":"conflict_resolution_pushed","branch":"b","head_sha":"` + rhH2 + `","base_sha":"` + rhBaseSHA + `","files_changed_count":1}`)
+	if w := shipPRRequest(t, s, runID, stage.ID, priv, body, ""); w.Code != http.StatusServiceUnavailable ||
+		!strings.Contains(w.Body.String(), `"pull_request_upload_unconfigured"`) {
+		t.Errorf("setup: route status = %d, want 503 pull_request_upload_unconfigured:\n%s", w.Code, w.Body.String())
+	}
+
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+runID.String()+"/pull-request", nil)
+	refused := s.refuseConflictResolutionWithoutLiveTrigger(rec, req, runID, stage, rhH2)
+	if !refused || rec.Code != http.StatusServiceUnavailable || !strings.Contains(rec.Body.String(), `"reported_head_unverifiable"`) {
+		t.Errorf("assert: refused = %v status = %d, want true and 503 reported_head_unverifiable:\n%s", refused, rec.Code, rec.Body.String())
+	}
+}
+
+// TestConflictResolutionPushed_DedupFault_PushedConsumption: a failed dedup read
+// no longer bypasses eligibility. The guard reads the pushed category itself, so
+// a consumed row refuses new admission, an unreadable one is 503, and a live
+// trigger is still admitted.
+//
+// COUNTERFACTUAL (CF5, the pushed category removed from the consumption loop): the
+// trigger reads as live, so consumed_row_refused, equal_sequence_row_refused and
+// both_reads_unreadable_is_503 are admitted → RED; live_trigger_admitted and
+// new_trigger_after_prior_push_admitted stay GREEN.
+func TestConflictResolutionPushed_DedupFault_PushedConsumption(t *testing.T) {
+	cases := []struct {
+		name    string
+		failOn  []int
+		arrange func(f *rhFixture)
+		check   func(t *testing.T, f *rhFixture, w *httptest.ResponseRecorder, reads int)
+	}{
+		{"consumed_row_refused", []int{1}, func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryConflictResolutionPushed, f.impl.ID, 11, map[string]any{"head_sha": rhH1})
+		}, func(t *testing.T, f *rhFixture, w *httptest.ResponseRecorder, reads int) {
+			f.assertNotLive(w, f.impl, run.StageStateRunning)
+			if reads != 2 {
+				t.Errorf("assert: pushed reads = %d, want 2 (the dedup and the guard)", reads)
+			}
+		}},
+		{"equal_sequence_row_refused", []int{1}, func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryConflictResolutionPushed, f.impl.ID, 10, map[string]any{"head_sha": rhH1})
+		}, func(t *testing.T, f *rhFixture, w *httptest.ResponseRecorder, reads int) {
+			f.assertNotLive(w, f.impl, run.StageStateRunning)
+			if reads != 2 {
+				t.Errorf("assert: pushed reads = %d, want 2 (the dedup and the guard)", reads)
+			}
+		}},
+		{"both_reads_unreadable_is_503", []int{1, 2}, func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+		}, func(t *testing.T, f *rhFixture, w *httptest.ResponseRecorder, reads int) {
+			f.assertUnverifiable(rhConflictKind, w, f.impl, run.StageStateRunning)
+			f.assertLoggedCause("conflict_trigger_state")
+			if reads != 2 {
+				t.Errorf("assert: pushed reads = %d, want 2 (the dedup and the guard)", reads)
+			}
+		}},
+		{"live_trigger_admitted", []int{1}, func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+		}, func(t *testing.T, f *rhFixture, w *httptest.ResponseRecorder, _ int) {
+			f.assertAdmitted(w)
+		}},
+		{"new_trigger_after_prior_push_admitted", []int{1}, func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryConflictResolutionPushed, f.impl.ID, 11, map[string]any{"head_sha": rhH1})
+			f.seedConflictTrigger(12)
+		}, func(t *testing.T, f *rhFixture, w *httptest.ResponseRecorder, _ int) {
+			f.assertAdmitted(w)
+		}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			f := newRHFixture(t)
+			f.confirmConflictReport()
+			c.arrange(f)
+			sf := f.scriptPushedReads(c.failOn...)
+			w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+			if !strings.Contains(f.logs.String(), "proceeding without idempotency guard") {
+				t.Errorf("assert: the dedup fault did not fire:\n%s", f.logs.String())
+			}
+			c.check(t, f, w, sf.readCount())
+		})
+	}
+}
+
+// TestConflictResolutionPushed_LiveTrigger_Admitted is the positive comparison: a
+// live trigger admits a forge-confirmed report, including a newer trigger after a
+// failed pass.
+func TestConflictResolutionPushed_LiveTrigger_Admitted(t *testing.T) {
+	cases := map[string]func(f *rhFixture){
+		"live_trigger": func(f *rhFixture) { f.seedConflictTrigger(10) },
+		"newer_trigger_after_failure": func(f *rhFixture) {
+			f.seedConflictTrigger(9)
+			f.seed(CategoryStageConflictResolutionFailed, f.impl.ID, 10, map[string]any{"reason": "conflict"})
+			f.seedConflictTrigger(11)
+		},
+	}
+	for name, arrange := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRHFixture(t)
+			f.confirmConflictReport()
+			arrange(f)
+			w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+			f.assertAdmitted(w)
+		})
+	}
+}
+
+// TestConflictResolutionPushed_RecordedRowReplays200: a recorded report replays
+// through the FIRST dedup as 200, with no trigger read, no new row and no forge
+// read, whatever the trigger state.
+//
+// COUNTERFACTUAL (M1, the guard moved above the dedup): no_trigger_row_replays has
+// a recorded row and no trigger, so it answers 409 → RED.
+func TestConflictResolutionPushed_RecordedRowReplays200(t *testing.T) {
+	cases := map[string]func(f *rhFixture){
+		"no_trigger_row_replays": func(f *rhFixture) {
+			f.seed(CategoryConflictResolutionPushed, f.impl.ID, 11, map[string]any{"head_sha": rhH2})
+		},
+		"consumed_trigger_replays": func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryConflictResolutionPushed, f.impl.ID, 11, map[string]any{"head_sha": rhH2})
+		},
+		"newer_trigger_replays": func(f *rhFixture) {
+			f.seedConflictTrigger(10)
+			f.seed(CategoryConflictResolutionPushed, f.impl.ID, 11, map[string]any{"head_sha": rhH2})
+			f.seedConflictTrigger(12)
+		},
+	}
+	for name, arrange := range cases {
+		t.Run(name, func(t *testing.T) {
+			f := newRHFixture(t)
+			f.confirmConflictReport()
+			arrange(f)
+			w := f.post(rhConflictKind, rhH2, rhBaseSHA, rhPRBranch)
+			var resp pullRequestConflictResolutionResponse
+			_ = json.Unmarshal(w.Body.Bytes(), &resp)
+			if w.Code != http.StatusOK || resp.Outcome != "conflict_resolution_pushed" {
+				t.Errorf("assert: status = %d outcome = %q, want 200 conflict_resolution_pushed:\n%s", w.Code, resp.Outcome, w.Body.String())
+			}
+			if rows := f.rowPayloads(CategoryConflictResolutionPushed); len(rows) != 0 {
+				t.Errorf("assert: appended conflict_resolution_pushed rows = %d, want 0 on a replay", len(rows))
+			}
+			if calls := f.forge.allCalls(); len(calls) != 0 {
+				t.Errorf("assert: forge calls = %v, want none on a replay", calls)
+			}
+		})
+	}
+}
+
+// TestConflictResolutionPushed_RefusalDiagnosticsAreBounded: an untrusted head the
+// forge matches exactly reaches the guard, and neither the 409 body nor the log
+// echoes it; the WARN carries the fixed placeholder. A valid head is the positive
+// control: the WARN carries it verbatim.
+//
+// COUNTERFACTUAL (M5, the formatter replaced with the raw head): the untrusted
+// head reaches the WARN → RED on the no-echo assertion; the control stays GREEN.
+func TestConflictResolutionPushed_RefusalDiagnosticsAreBounded(t *testing.T) {
+	const warnMsg = "conflict-resolution push report: no live conflict-resolution trigger for this stage; report refused"
+	untrusted := "SYNTHETICMARKER" + rhH2
+	for name, head := range map[string]string{"untrusted_head": untrusted, "valid_head_control": rhH2} {
+		t.Run(name, func(t *testing.T) {
+			f := newRHFixture(t)
+			f.forge.set(func(g *rhForge) {
+				g.prHead = head
+				g.tips[rhPRBranch] = head
+				g.parents[head] = []string{rhBaseSHA}
+			})
+			w := f.post(rhConflictKind, head, rhBaseSHA, rhPRBranch)
+			if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"conflict_resolution_not_live"`) {
+				t.Fatalf("setup: status = %d, want the guard's 409 (the forge must admit this head):\n%s", w.Code, w.Body.String())
+			}
+			rec := f.warnRecord(warnMsg)
+			if rec == nil {
+				t.Fatalf("assert: no refusal WARN:\n%s", f.logs.String())
+			}
+			if head == rhH2 {
+				if rec["reported_head"] != rhH2 {
+					t.Errorf("assert: WARN reported_head = %v, want the valid head %s", rec["reported_head"], rhH2)
+				}
+				return
+			}
+			if strings.Contains(w.Body.String(), "SYNTHETICMARKER") {
+				t.Errorf("assert: the 409 body echoes the untrusted head:\n%s", w.Body.String())
+			}
+			if strings.Contains(f.logs.String(), "SYNTHETICMARKER") {
+				t.Errorf("assert: the log echoes the untrusted head:\n%s", f.logs.String())
+			}
+			if rec["reported_head"] != reportedHeadObjectIDFallback {
+				t.Errorf("assert: WARN reported_head = %v, want the placeholder %q", rec["reported_head"], reportedHeadObjectIDFallback)
+			}
+		})
+	}
+}
+
+// TestConflictResolutionPushed_NoLiveTrigger_HeadStaysForeign is the cross-boundary
+// negative of TestConflictResolutionPushed_RepublishedCheckDoesNotFlagMergeForeign:
+// a forge-confirmed report with no live trigger is refused 409, so its head never
+// enters the chain, and the check republished at that head through
+// fishhawk_rebase_run_branch's already-up-to-date arm still carries
+// foreign_commit from auditcomplete rule 5.
+//
+// COUNTERFACTUAL (CF1, the guard's call site `if false {`): the report lands, the
+// head enters rule 5's known set, and the foreign_commit assertion goes RED.
+func TestConflictResolutionPushed_NoLiveTrigger_HeadStaysForeign(t *testing.T) {
+	sd := seedConflictResolutionE2E(t)
+	sd.serveMergeFirstParent()
+
+	priv, _ := sd.sf.issue(t, sd.runID)
+	report := []byte(`{"outcome":"conflict_resolution_pushed","branch":"` + rebaseBranchName +
+		`","head_sha":"` + crMergeSHA + `","base_sha":"` + crAgentHeadSHA + `","files_changed_count":2}`)
+	w := shipPRRequest(t, sd.s, sd.runID, sd.impl.ID, priv, report, "")
+	if w.Code != http.StatusConflict || !strings.Contains(w.Body.String(), `"conflict_resolution_not_live"`) {
+		t.Errorf("assert: report status = %d, want 409 conflict_resolution_not_live:\n%s", w.Code, w.Body.String())
+	}
+	if got := auditEntries(sd.au, CategoryConflictResolutionPushed); len(got) != 0 {
+		t.Errorf("assert: conflict_resolution_pushed entries = %d, want 0", len(got))
+	}
+
+	// Terminal by construction, as the positive e2e does, so rule 5 runs.
+	sd.impl.State = run.StageStateSucceeded
+	rw := postRebaseBranch(t, sd.s, sd.runID,
+		rebaseBranchRequest{Reason: "recheck after a refused conflict-resolution report", Confirm: true},
+		withRebaseOperator)
+	if rw.Code != http.StatusOK {
+		t.Fatalf("setup: rebase status = %d, want 200:\n%s", rw.Code, rw.Body.String())
+	}
+	sd.creator.mu.Lock()
+	calls := append([]forge.CreateCheckRunParams(nil), sd.creator.calls...)
+	sd.creator.mu.Unlock()
+	if len(calls) != 1 {
+		t.Fatalf("setup: check run creations = %d, want exactly 1", len(calls))
+	}
+	text := calls[0].OutputSummary + "\n" + calls[0].OutputText
+	if strings.Contains(text, string(auditcomplete.MissingStageNotTerminal)) {
+		t.Fatalf("setup: recompute short-circuited at stage_not_terminal, so the foreign_commit assertion is vacuous:\n%s", text)
+	}
+	if !strings.Contains(text, string(auditcomplete.MissingForeignCommit)) {
+		t.Errorf("assert: the republished check at the refused head carries no foreign_commit:\n%s", text)
 	}
 }

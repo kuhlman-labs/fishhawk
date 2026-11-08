@@ -1,0 +1,14 @@
+id: scenario:issue-5107/broken-reciprocity-refused
+statement: On a temporary copy of docs/adr outside the repository, removing ADR-090's amended_by makes scripts/check-adr exit 1 naming C-amend-recip-fwd, and removing ADR-142's amends makes it exit 1 naming C-amend-recip-rev.
+verify_hint: 'CLI: run scripts/check-adr <temp dir> for each mutated copy and read the exit code and the violation class in its output; the unmutated copy exits 0.'
+steps: 'Posture B: copy docs/adr from the sanctioned checkout to /tmp/fh5107/mut/base and run scripts/check-adr on it. In a second copy, delete the amended_by: ["ADR-142"] line from 090-verify-the-merge-candidate.md and run scripts/check-adr <copy>. In a third copy, delete the amends: ["ADR-090"] line from 142-merge-verification-after-scenario-commits.md and run scripts/check-adr <copy>.'
+assertions:
+    expected: Removing ADR-090's amended_by exits 1 naming C-amend-recip-fwd; removing ADR-142's amends exits 1 naming C-amend-recip-rev; unmutated copy exits 0.
+    observed_at_record: 'Unmutated: rc 0, 139 consistent. ADR-090 mutation: rc 1 naming [C-amend-recip-fwd], plus [C-index-stale]. ADR-142 mutation: rc 1 naming [C-amend-recip-rev], plus [C-index-stale].'
+    repro_handle: scripts/check-adr /tmp/fh5107/mut/fwd; scripts/check-adr /tmp/fh5107/mut/rev
+origin:
+    issue: 5107
+    pr: 5110
+    run_id: 740bbdb1-46f7-4eca-948a-ad5357e121be
+    head_sha: b70b2856cf19ac3e62c3327e3a268af19a28b21e
+    recorded_at: 2026-11-06T18:33:30Z

@@ -9,8 +9,9 @@ import (
 
 // Reviewer implements server.PlanReviewer by shelling out to the `codex` CLI.
 // It is the Codex sibling of claudecode.Reviewer (#575): structurally identical,
-// it sends the full prompt as one positional argument to a `codex exec`
-// subprocess and decodes the agent-message verdict body the CLI emits.
+// it writes the full prompt to a `codex exec` subprocess's stdin, with `-` as
+// the positional argument (#5113), and decodes the agent-message verdict body
+// the CLI emits.
 type Reviewer struct {
 	client *Client
 }

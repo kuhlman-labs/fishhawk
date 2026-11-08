@@ -3600,16 +3600,20 @@ _fetch_restart_blockers() {
 #                                 child); any other context is post-merge
 #   blockers + force=0         -> refusal naming each run + reason on stderr, return 1
 #   blockers + force=1         -> the same inventory as a WARNING, return 0
+#   HTTP 503 + force=0         -> refusal saying the daemon could not decide, return 1
+#   HTTP 503 + force=1         -> the same as a WARNING, return 0
 #   unreachable / curl absent  -> one-line reason, return 0 (fail-open)
-#   non-200 (404 = old daemon) -> one-line reason naming the status, return 0
+#   other non-200 (404 = old daemon) -> one-line reason naming the status, return 0
 #   malformed 200 (no items)   -> one-line reason, return 0
 #   truncated scan             -> one warning line, then the verdict above
 #
-# Fail-OPEN on every "could not ask" mode mirrors the #2897 guard: a daemon
-# that is down has nothing in flight to orphan, and the first post-merge after
-# this lands hits the OLD daemon, which answers 404. A check_failed item is the
-# opposite case — a REACHABLE daemon that could not decide a run — and it
-# REFUSES like any other blocker (fail-closed; --force overrides).
+# Fail-OPEN on the "could not ask" modes mirrors the #2897 guard: a daemon that
+# is down has nothing in flight to orphan, and the first post-merge after this
+# lands hits the OLD daemon, which answers 404. A check_failed item and an HTTP
+# 503 are the opposite case — a REACHABLE daemon that could not decide — and
+# they REFUSE (fail-closed; --force overrides). The 503 carries no candidate
+# identifier, so this guard can name no run (ADR-140 D5, D7, #5047). Other
+# degraded statuses keep their fail-open behaviour (#5054).
 #
 # Call sites MUST invoke this in a tested context
 # (`if ! _refuse_on_restart_blockers …`) so the #631 ZERR trap never fires on a
@@ -3621,6 +3625,19 @@ _refuse_on_restart_blockers() {
   local body="" records="" rc=0 prc=0
   body="$(_fetch_restart_blockers "$url")" || rc=$?
   if (( rc == 4 )); then
+    if [[ "$body" == "503" ]]; then
+      print -u2 ""
+      if (( force )); then
+        print -u2 "warning: restarting fishhawkd although it could not decide whether a restart would orphan work — it answered HTTP 503 to the restart-blocker check (--force):"
+        print -u2 "  what --force breaks: any work the daemon could not report may be orphaned, and this override leaves no durable record."
+        print -u2 "  proceeding anyway because --force was given."
+        return 0
+      fi
+      print -u2 "error: refusing to restart fishhawkd — it is reachable but could not decide whether a restart would orphan work (HTTP 503 from the restart-blocker check)."
+      print -u2 "  the answer names no run; the cause is in fishhawkd's log. Retry shortly (reload --when-quiet waits for it), or re-run with --force to restart anyway."
+      print -u2 "  what --force breaks: any work the daemon could not report may be orphaned, and this override leaves no durable record."
+      return 1
+    fi
     local hint=""
     if [[ "$body" == "404" ]]; then hint=" (the running daemon predates GET /v0/restart-blockers)"; fi
     print -u2 "warning: fishhawkd answered HTTP ${body} to the restart-blocker check${hint} — skipping it (degraded)"
@@ -3636,7 +3653,7 @@ _refuse_on_restart_blockers() {
     return 0
   fi
   if [[ "$body" =~ '"truncated"[[:space:]]*:[[:space:]]*true' ]]; then
-    print -u2 "warning: the restart-blocker scan hit its run cap (truncated) — runs past it were not checked"
+    print -u2 "warning: the restart-blocker scan was truncated (run page or audit page cap reached) — runs and rounds past the cap were not checked"
   fi
 
   local -a blockers
@@ -3695,9 +3712,10 @@ _refuse_on_restart_blockers() {
 # (_scan_live_runs) and no RELOAD-relevant restart blocker (the query half of
 # the guard above, with undispatched_child ignored as in the reload context).
 # Every "could not ask" mode counts as quiet — ps or curl unavailable, daemon
-# unreachable, a non-200 (404 = old daemon), a malformed body — because the
-# normal guards run right after the wait and print their own one-line degrade
-# reason. Knobs: FISHHAWK_RELOAD_QUIET_INTERVAL (seconds between polls, default
+# unreachable, a non-200 other than 503 (404 = old daemon), a malformed body —
+# because the normal guards run right after the wait and print their own
+# one-line degrade reason. An HTTP 503 is NOT quiet: the daemon answered and
+# could not decide (ADR-140 D7, #5047), so the wait keeps polling. Knobs: FISHHAWK_RELOAD_QUIET_INTERVAL (seconds between polls, default
 # 15) and FISHHAWK_RELOAD_QUIET_TIMEOUT (seconds before giving up, default
 # 3600), each a positive integer. Long-form: scripts/README.md.
 # ---------------------------------------------------------------------------
@@ -3752,6 +3770,9 @@ _reload_quiet_check() {
         live+=("${b_reason} on run ${b_run} (${b_stage})")
       done <<< "$records"
     fi
+  fi
+  if (( brc == 4 )) && [[ "$body" == "503" ]]; then
+    live+=("undecided restart-blocker check (HTTP 503)")
   fi
   if (( ${#live} == 0 )); then
     return 0
@@ -5770,8 +5791,9 @@ _usage() {
   print -u2 "  (#2897): restarting fishhawkd under a mid-stage runner can strand its"
   print -u2 "  stage in 'running'. They also REFUSE while fishhawkd reports a restart"
   print -u2 "  blocker (#3974): a review round a restart would lose (one the next boot"
-  print -u2 "  would not re-dispatch, #4077) or a run it could not decide; post-merge"
-  print -u2 "  also refuses on an undispatched decomposition child, which its git pull"
+  print -u2 "  would not re-dispatch, #4077) or a run it could not decide, or answers"
+  print -u2 "  that check with HTTP 503 (ADR-140 D7); post-merge also refuses on an"
+  print -u2 "  undispatched decomposition child, which its git pull"
   print -u2 "  would strand. Pass --force to tear down anyway, or reload --when-quiet"
   print -u2 "  to wait until nothing is live (FISHHAWK_RELOAD_QUIET_INTERVAL, default"
   print -u2 "  15 s; FISHHAWK_RELOAD_QUIET_TIMEOUT, default 3600 s; exit 1 on timeout)."

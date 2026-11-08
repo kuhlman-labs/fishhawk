@@ -2,6 +2,7 @@ package hosthealth
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -42,6 +43,47 @@ func nameTokens(s string) []string {
 
 func namesKey(text, key string) bool { return slices.Contains(nameTokens(text), key) }
 
+// hostTokens splits s into lower-cased whole-word tokens for the host check.
+// Every rune that is not a letter, digit, '-' or '_' is a delimiter, so dots,
+// whitespace, commas, parentheses and slashes all separate tokens; leading and
+// trailing '-' and '_' are trimmed and empty tokens dropped. It is deliberately
+// not nameTokens: that keeps '.' inside a token and is case-sensitive, which is
+// right for process names and table keys but would keep "mac.example.com" as
+// one token and miss an FQDN occurrence of the host "mac".
+func hostTokens(s string) []string {
+	f := strings.FieldsFunc(strings.ToLower(s), func(r rune) bool {
+		return !unicode.IsLetter(r) && !unicode.IsDigit(r) && r != '-' && r != '_'
+	})
+	out := f[:0]
+	for _, tok := range f {
+		if tok = strings.Trim(tok, "-_"); tok != "" {
+			out = append(out, tok)
+		}
+	}
+	return out
+}
+
+// namesHost reports whether text names the host. It matches the host's short
+// name (everything before the first '.') as a whole, case-insensitive token
+// sequence delimited by dots and punctuation, so the host "mac" is a hit in
+// "Mac", "(mac)", "mac." and "mac.example.com" but not inside a longer word or
+// identifier such as "machine", "VirtualMachine", "macOS" or "mac-mini". An
+// empty, blank or leading-dot host names nothing.
+func namesHost(text, host string) bool {
+	short, _, _ := strings.Cut(strings.ToLower(strings.TrimSpace(host)), ".")
+	want := hostTokens(short)
+	if len(want) == 0 {
+		return false
+	}
+	got := hostTokens(text)
+	for i := 0; i+len(want) <= len(got); i++ {
+		if slices.Equal(got[i:i+len(want)], want) {
+			return true
+		}
+	}
+	return false
+}
+
 // fixtureProcessNames collects every process name in the darwin and linux
 // fixtures.
 func fixtureProcessNames(t *testing.T) []string {
@@ -66,12 +108,11 @@ func fixtureProcessNames(t *testing.T) []string {
 	return names
 }
 
-// TestNoHostOrRepoSpecifics pins the agnostic contract on the SHIPPED
-// strings: no table hint, GenericAction, GenericRemedy, HoldGuidance or
-// composed remedy names a repository path, a language cache, an operator
-// location or this host; a hint names no table key but its own; the generic
-// texts name no table key and no fixture process.
-func TestNoHostOrRepoSpecifics(t *testing.T) {
+// shippedRemedyTexts is every SHIPPED remedy string, keyed by a name for
+// failure output: the generic texts, every table hint and the composed
+// remedies for each fixture case.
+func shippedRemedyTexts(t *testing.T) map[string]string {
+	t.Helper()
 	texts := map[string]string{
 		"GenericAction": GenericAction,
 		"GenericRemedy": GenericRemedy,
@@ -80,19 +121,20 @@ func TestNoHostOrRepoSpecifics(t *testing.T) {
 	for goos, table := range remedyTable {
 		for _, e := range table.entries {
 			texts[goos+" hint "+e.key] = e.hint
-			if strings.ContainsAny(e.hint, "/~\\") {
-				t.Errorf("%s hint for %s carries a path character: %q", goos, e.key, e.hint)
-			}
-			for _, k := range tableKeys() {
-				if k != e.key && namesKey(e.hint, k) {
-					t.Errorf("%s hint for %s names another table key %q", goos, e.key, k)
-				}
-			}
 		}
 	}
-	darwinProcs, _ := parseDarwinTop(darwinDoneMeansTop)
-	healthyProcs, _ := parseDarwinTop(darwinTopHealthy)
-	linuxProcs, _ := linuxReaderFor(linuxHealthyFS()).Processes(context.Background(), 0)
+	darwinProcs, err := parseDarwinTop(darwinDoneMeansTop)
+	if err != nil {
+		t.Fatal(err)
+	}
+	healthyProcs, err := parseDarwinTop(darwinTopHealthy)
+	if err != nil {
+		t.Fatal(err)
+	}
+	linuxProcs, err := linuxReaderFor(linuxHealthyFS()).Processes(context.Background(), 0)
+	if err != nil {
+		t.Fatal(err)
+	}
 	for name, c := range map[string]struct {
 		goos  string
 		procs []Process
@@ -106,19 +148,52 @@ func TestNoHostOrRepoSpecifics(t *testing.T) {
 	} {
 		texts["ComposeRemedy "+name] = ComposeRemedy(c.goos, TopHolders(c.procs, 1, 3))
 	}
+	return texts
+}
 
-	host, _ := os.Hostname()
-	host = strings.ToLower(strings.TrimSpace(host))
+// remedySpecifics returns one sorted finding per forbidden token a text
+// contains and per text that names host. The forbidden tokens are path
+// fragments and stay a substring match; the host is matched by namesHost.
+func remedySpecifics(texts map[string]string, host string) []string {
+	var found []string
 	for name, text := range texts {
 		lower := strings.ToLower(text)
 		for _, tok := range forbiddenSpecifics {
 			if strings.Contains(lower, tok) {
-				t.Errorf("%s names %q: %q", name, tok, text)
+				found = append(found, fmt.Sprintf("%s names %q: %q", name, tok, text))
 			}
 		}
-		if host != "" && strings.Contains(lower, host) {
-			t.Errorf("%s names this host %q", name, host)
+		if namesHost(text, host) {
+			found = append(found, fmt.Sprintf("%s names this host %q", name, host))
 		}
+	}
+	slices.Sort(found)
+	return found
+}
+
+// TestNoHostOrRepoSpecifics pins the agnostic contract on the SHIPPED
+// strings: no table hint, GenericAction, GenericRemedy, HoldGuidance or
+// composed remedy names a repository path, a language cache, an operator
+// location or this host; a hint names no table key but its own; the generic
+// texts name no table key and no fixture process.
+func TestNoHostOrRepoSpecifics(t *testing.T) {
+	for goos, table := range remedyTable {
+		for _, e := range table.entries {
+			if strings.ContainsAny(e.hint, "/~\\") {
+				t.Errorf("%s hint for %s carries a path character: %q", goos, e.key, e.hint)
+			}
+			for _, k := range tableKeys() {
+				if k != e.key && namesKey(e.hint, k) {
+					t.Errorf("%s hint for %s names another table key %q", goos, e.key, k)
+				}
+			}
+		}
+	}
+
+	texts := shippedRemedyTexts(t)
+	host, _ := os.Hostname()
+	for _, finding := range remedySpecifics(texts, host) {
+		t.Error(finding)
 	}
 
 	procNames := fixtureProcessNames(t)
@@ -128,6 +203,112 @@ func TestNoHostOrRepoSpecifics(t *testing.T) {
 				t.Errorf("%s names %q", name, k)
 			}
 		}
+	}
+}
+
+// TestNamesHost pins namesHost on synthetic hosts, so the whole-token rule is
+// checked deterministically on every machine, not just on a host that happens
+// to collide with shipped text.
+func TestNamesHost(t *testing.T) {
+	cases := []struct {
+		name, host, text string
+		want             bool
+	}{
+		// A short host inside a longer word or identifier is not a hit (#5123).
+		{"mac in machine", "mac", "machine", false},
+		{"mac in virtual machine", "mac", "virtual machine", false},
+		{"mac in dotted process key", "mac", "com.apple.Virtualization.VirtualMachine", false},
+		{"mac in VirtualMachine", "mac", "VirtualMachine", false},
+		{"mac in macOS", "mac", "macOS", false},
+		{"mac in hyphenated name", "mac", "mac-mini", false},
+		{"mac in underscored name", "mac", "mac_pro", false},
+		{"uppercase Mac in machine", "Mac", "machine", false},
+		// The host as a whole token is a hit, whatever the case or punctuation.
+		{"standalone", "mac", "on mac", true},
+		{"capitalised with period", "mac", "Mac.", true},
+		{"upper case in parentheses", "mac", "(MAC)", true},
+		{"followed by comma", "mac", "mac,", true},
+		{"first label of an FQDN", "mac", "see mac.example.com", true},
+		{"uppercase host, lowercase text", "Mac", "ran on mac", true},
+		{"hyphenated host", "build-runner-07", "build-runner-07", true},
+		{"hyphenated host, case and period", "build-runner-07", "Build-Runner-07.", true},
+		{"hyphenated host with FQDN and port", "build-runner-07", "build-runner-07.example.com:22", true},
+		// An FQDN host is matched by its short name.
+		{"FQDN host, short text", "build-runner-07.example.com", "build-runner-07", true},
+		{"FQDN host, FQDN text in upper case", "build-runner-07.example.com", "BUILD-RUNNER-07.EXAMPLE.COM", true},
+		// A longer ordinary hostname is not a hit on a longer token.
+		{"digit suffix", "build-runner-07", "build-runner-070", false},
+		{"word prefix", "build-runner-07", "my-build-runner-07", false},
+		// An absent host names nothing.
+		{"empty host", "", "mac machine anything", false},
+		{"blank host", "   ", "mac machine anything", false},
+		{"leading-dot host", ".local", "local mac", false},
+	}
+	for _, c := range cases {
+		if got := namesHost(c.text, c.host); got != c.want {
+			t.Errorf("%s: namesHost(%q, %q) = %v, want %v", c.name, c.text, c.host, got, c.want)
+		}
+	}
+}
+
+// TestRemedySpecifics_SyntheticHosts runs the portability scan over the SHIPPED
+// strings with synthetic hosts, so the #5123 false positive (host "mac" inside
+// "VirtualMachine"/"machine") and the host-detection wiring are pinned on every
+// machine.
+func TestRemedySpecifics_SyntheticHosts(t *testing.T) {
+	texts := shippedRemedyTexts(t)
+
+	// The zero-findings cases below only mean something if "mac" really does
+	// occur inside shipped text.
+	var withMac []string
+	for name, text := range texts {
+		if strings.Contains(strings.ToLower(text), "mac") {
+			withMac = append(withMac, name)
+		}
+	}
+	if len(withMac) == 0 {
+		t.Fatal("no shipped text contains \"mac\": the false-positive fixture is gone")
+	}
+
+	for _, host := range []string{"mac", "Mac", "MAC.local", "machine-builder", ""} {
+		if got := remedySpecifics(texts, host); len(got) != 0 {
+			t.Errorf("host %q: findings %q, want none", host, got)
+		}
+	}
+
+	var withSpotlight []string
+	for name, text := range texts {
+		if strings.Contains(strings.ToLower(text), "spotlight") {
+			withSpotlight = append(withSpotlight, name)
+		}
+	}
+	for _, name := range []string{"darwin hint mds", "darwin hint mds_stores"} {
+		if !slices.Contains(withSpotlight, name) {
+			t.Fatalf("shipped %q no longer mentions Spotlight; got %q", name, withSpotlight)
+		}
+	}
+	for _, host := range []string{"Spotlight", "spotlight.example.com"} {
+		var want []string
+		for _, name := range withSpotlight {
+			want = append(want, fmt.Sprintf("%s names this host %q", name, host))
+		}
+		slices.Sort(want)
+		if got := remedySpecifics(texts, host); !slices.Equal(got, want) {
+			t.Errorf("host %q: findings %q, want %q", host, got, want)
+		}
+	}
+
+	// A synthetic text pins both branches: the forbidden-specifics scan and the
+	// host scan each contribute exactly one finding.
+	got := remedySpecifics(map[string]string{"t": "run scripts/x on Mac"}, "mac")
+	if len(got) != 2 {
+		t.Fatalf("findings %q, want exactly 2", got)
+	}
+	if !slices.ContainsFunc(got, func(f string) bool { return strings.HasPrefix(f, `t names "scripts/"`) }) {
+		t.Errorf("findings %q lack the forbidden-specifics finding", got)
+	}
+	if !slices.Contains(got, `t names this host "mac"`) {
+		t.Errorf("findings %q lack the host finding", got)
 	}
 }
 

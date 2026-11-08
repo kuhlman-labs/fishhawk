@@ -116,6 +116,9 @@ var shippedLinks = map[string]struct{ supersedes, supersededBy, amends, amendedB
 	// ADR-141, ratified 2026-11-04 (relations from its record-metadata line, ADR-113 D3).
 	"ADR-141": {nil, nil, []string{"ADR-035"}, nil},
 	"ADR-035": {nil, nil, nil, []string{"ADR-141"}},
+	// ADR-142, ratified 2026-11-06 (relations from its record-metadata line, ADR-113 D3).
+	"ADR-142": {nil, nil, []string{"ADR-090"}, nil},
+	"ADR-090": {[]string{"ADR-043"}, []string{"ADR-092", "ADR-093", "ADR-096"}, nil, []string{"ADR-142"}},
 	// The Captain's 2026-10-23 status rulings (ADR-041 amends ADR-032).
 	"ADR-032": {nil, nil, nil, []string{"ADR-041"}},
 }

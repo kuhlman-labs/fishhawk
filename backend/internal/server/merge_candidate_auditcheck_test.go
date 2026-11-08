@@ -51,6 +51,7 @@ func checkRunHeads(c *vouchCheckCreator) []string {
 func shipConflictResolutionPushed(t *testing.T, sd *crSeed) {
 	t.Helper()
 	sd.serveMergeFirstParent()
+	sd.recordLiveTrigger(t)
 	priv, _ := sd.sf.issue(t, sd.runID)
 	report := []byte(`{"outcome":"conflict_resolution_pushed","branch":"` + rebaseBranchName +
 		`","head_sha":"` + crMergeSHA + `","base_sha":"` + crAgentHeadSHA + `","files_changed_count":2}`)
