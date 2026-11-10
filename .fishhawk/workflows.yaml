@@ -579,7 +579,7 @@ workflows:
           authority: advisory
           agents:
             - provider: claudecode
-              model: claude-fable-5-1
+              model: claude-fable-5-2
               reasoning_effort: high
             - provider: codex
               model: gpt-6-astra
@@ -698,7 +698,7 @@ workflows:
           authority: advisory
           agents:
             - provider: claudecode
-              model: claude-fable-5-1
+              model: claude-fable-5-2
               reasoning_effort: high
             - provider: codex
               model: gpt-6-astra
@@ -1102,7 +1102,7 @@ workflows:
           authority: gating
           agents:
             - provider: claudecode
-              model: claude-fable-5-1
+              model: claude-fable-5-2
               reasoning_effort: high
             - provider: codex
               model: gpt-6-astra
