@@ -21,7 +21,7 @@ import "strings"
 // AsOf is the date the price table was last reconciled against
 // published vendor pricing. Surfaced alongside any rolled cost so
 // consumers can label the figure as an estimate of a known vintage.
-const AsOf = "2026-10-01"
+const AsOf = "2026-11-10"
 
 // rate is the per-token price for a single model family, in US
 // dollars. Vendors publish per-million-token prices; we store the
@@ -80,8 +80,10 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 //	Opus 5.5      4   / 20 / 0.2  / 5      (Anthropic, non-fast tier)
 //	Fable         10  / 50 / 1.0  / 12.5   (Anthropic Fable 5, premium tier)
 //	Fable 5.1     10  / 50 / 0.25 / 12.5   (Anthropic, premium tier)
+//	Fable 5.2     8   / 40 / 0.2  / 10     (Anthropic, premium tier)
 //	Mythos 5      10  / 50 / 1.0  / 12.5   (Anthropic, Project Glasswing)
 //	Mythos 5.1    10  / 50 / 0.25 / 12.5   (Anthropic, Project Glasswing)
+//	Mythos 5.2    8   / 40 / 0.2  / 10     (Anthropic, Project Glasswing)
 //	Sonnet        3   / 15 / 0.3  / 3.75   (Anthropic Sonnet 4.x)
 //	Sonnet 5      2   / 10 / 0.2  / 2.5    (Anthropic Sonnet 5 + 5.5)
 //	Haiku         1   / 5  / 0.1  / 1.25   (Anthropic)
@@ -100,8 +102,9 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // pricing (the 1-hour-TTL 2x write tier is intentionally out of scope
 // this slice). Fable follows the same convention at the premium tier
 // ($10/1M input → 1.0 read / 12.5 write). Exceptions to the 0.1x READ
-// rule: Fable 5.1 / Mythos 5.1 read at 0.025x ($0.25/1M) and Opus 5.5 at
-// 0.05x ($0.20/1M); their WRITE stays 1.25x input. The OpenAI cache READ is the
+// rule: Fable 5.1 / Mythos 5.1 read at 0.025x ($0.25/1M), Fable 5.2 /
+// Mythos 5.2 at 0.025x ($0.20/1M) and Opus 5.5 at 0.05x ($0.20/1M); their
+// WRITE stays 1.25x input. The OpenAI cache READ is the
 // published 90%-cached-input discount (0.1x input). gpt-5.5's cache
 // WRITE is set to the input rate because that model charges no separate
 // cache-write premium; the entire gpt-5.6 family (Sol / Terra / Luna)
@@ -120,7 +123,7 @@ func perMillionCache(input, output, cacheRead, cacheWrite float64) rate {
 // Family-key convention: Anthropic keys are the tier stem (claude-opus,
 // claude-fable) so every dated point release inherits the tier price; a
 // release that REPRICES within its tier gets a longer, version-specific
-// key (claude-opus-5-5, claude-fable-5-1, claude-sonnet-5) that wins the
+// key (claude-opus-5-5, claude-fable-5-1, claude-fable-5-2, claude-sonnet-5) that wins the
 // longest-prefix lookup. claude-sonnet-5 deliberately covers both Sonnet 5
 // and Sonnet 5.5 (same price); claude-opus-5 needs no key of its own
 // because it keeps the stem's 5/25 price.
@@ -152,8 +155,10 @@ var familyRates = map[string]rate{
 	"claude-opus-5-5":   perMillionCache(4, 20, 0.2, 5),
 	"claude-fable":      perMillionCache(10, 50, 1, 12.5),
 	"claude-fable-5-1":  perMillionCache(10, 50, 0.25, 12.5),
+	"claude-fable-5-2":  perMillionCache(8, 40, 0.2, 10),
 	"claude-mythos-5":   perMillionCache(10, 50, 1, 12.5),
 	"claude-mythos-5-1": perMillionCache(10, 50, 0.25, 12.5),
+	"claude-mythos-5-2": perMillionCache(8, 40, 0.2, 10),
 	"claude-sonnet":     perMillionCache(3, 15, 0.3, 3.75),
 	"claude-sonnet-5":   perMillionCache(2, 10, 0.2, 2.5),
 	"claude-haiku":      perMillionCache(1, 5, 0.1, 1.25),
