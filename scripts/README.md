@@ -1452,6 +1452,16 @@ the container is removed. Consumers call `pgtest.NewPool(t)`
 Go-side hazards and their classifiers are documented in the `pgtest.go` package
 comment.
 
+A per-test pool open failure (`connect per-test pool: ...`) keeps its original
+error as the unchanged prefix and appends one bounded, credential-free
+`pgtest diagnostics:` suffix (no DSN, user, password, database name, host:port
+or query text). `shape=acquire-wait` means a NEW connection was not built inside
+`postgres.Connect`'s fixed 5 s ping window; the per-test and base probe outcomes
+(`stalled-at-lookup`, `stalled-at-dial`, `stalled-awaiting-server`,
+`stalled-in-startup`, `stalled-at-ping`) say which phase stalled, and `server{}`
+carries slot, wait-event and checkpoint counts. The contract is in the
+`pgtest.go` package comment (#5116).
+
 `backend/internal/postgres/postgres_test.go` is the one exemption: it tests
 MigrateUp/MigrateDown and needs raw, un-migrated throwaway databases — so it
 starts its OWN anonymous containers with a `t.Cleanup` that terminates each on

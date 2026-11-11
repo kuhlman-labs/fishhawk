@@ -483,7 +483,8 @@ deadline): `backend/internal/mergequeue/README.md`.
   run's ONE dispatch on the D1 ledger (path `queue`; an existing claim →
   hold `merge_already_dispatched`, forge never called, except a crash-left
   QUEUE claim still `dispatched`, which ADR-109 A1 releases and claims afresh
-  here: § "Merge-queue durability (ADR-093 D8)"); the pinned merge
+  here as the backstop, since A2's restart resume releases a merging entry's
+  orphan before the fold: § "Merge-queue durability (ADR-093 D8)"); the pinned merge
   `MergePullRequestAtHead(head)`.
 - **Classification.** nil → settle merged `merged_by_queue` INSIDE the lock
   (approval condition D3: a later inline caller reads the PR merged and
@@ -1786,22 +1787,30 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
 | `merging` / `settling`, PR merged at the QUEUE claim's head | `settle_merged` row (`merge_actor_verified:false`, C6b), the deduped `merge_dispatch_settled` `reconciled_merged` (`appendReconciledMergedOnce`) for a `dispatch_failed` claim — a row already on the chain is success, not a hold (#4617) — then the merged tail with `Resume=true` (`merge_queue_merged` only when no row names the entry; a failed dedup read or append holds `resume_unrecorded`). A DECLARED approval gate with no `merge_queue_authorized` row (path `queue`, claim head) holds `authorization_unrecorded` (C6a) |
 | `merging` / `settling`, PR merged, no claim or another path's claim | `settle_pr_merged`, settled merged `pr_merged`, claim untouched. An inline or delegated claim at head `unresolved` counts as another path's claim at the merged head (`mergeDispatchClaimNamesHead`, #4617). Asymmetry: this resume writes NO `reconciled_merged` row and leaves an unresolved `dispatch_failed` non-queue claim unchanged; that claim heals on the next inline `merge_run` (`claimInlineMergeDispatch`'s deduped `reconciled_merged`), whereas merge-on-pass appends the deduped row |
 | PR merged at a head the claim does not name | hold `merged_claim_head_mismatch` |
-| `merging`, PR OPEN and unmerged, QUEUE claim still `dispatched` and crash-left (C2) | ADR-109 Amendment A1 ([#4711](https://github.com/kuhlman-labs/fishhawk/issues/4711)): one `merge_queue_resumed` {`redecide`, `orphaned_claim_open`, next_step `passed`, claim fields} row, then back to `passed` at the epoch (a CAS miss holds `entry_changed`), NO ledger write; ordinary merge-on-pass then releases the claim in step 8 (below) and merges through the ordinary path. A failing release writes ONE `redecide` row per pump tick (each tick's resume hands the re-stamped `merging` entry back; its merge-on-pass holds `orphaned_claim_release_failed` again), plus one `released_orphaned_claim` row per tick when the row landed and the CAS failed |
+| `merging`, PR OPEN and unmerged, QUEUE claim still `dispatched` and crash-left (C2) | ADR-109 Amendment A2 ([#4862](https://github.com/kuhlman-labs/fishhawk/issues/4862)): one `merge_queue_resumed` {`redecide`, `orphaned_claim_open`, next_step `passed`, claim fields} row, then the resume RELEASES the claim through merge-on-pass's own release body (`mergeOnPassReleaseOrphanedClaim`: a strict `merge_dispatch_settled` {`released`, `released_orphaned_claim`} row, then the exact-claim CAS DELETE), then back to `passed` at the epoch, then `redecide`: ordinary merge-on-pass decides with NO claim standing, so the claim never reaches the ADR-112 fold (an unapproved fold waits and yields like any other entry). Failures, each in phase `merging`: the redecide or settled row's append holds `resume_unrecorded` (nothing changed); the DELETE failing holds `orphaned_claim_release_failed` after the row (the claim's state unknown; the next resume re-judges it, releasing again or taking the no-claim arm); the helper's re-judgement unable to re-confirm the age (a clock read failing the second time) holds `merge_dispatch_in_progress` after the redecide row; the phase write failing holds `entry_changed` with the claim already released (the next resume takes the no-claim arm). A failing release writes ONE `redecide` row per pump tick, plus one `released_orphaned_claim` row per tick when the row landed and the DELETE failed |
 | `merging`, PR UNREADABLE (indeterminate), QUEUE claim still `dispatched` and crash-left (C2) | strict `merge_dispatch_settled` {`dispatch_failed`, `orphaned_by_restart`}, then the EXISTING `MarkMergeDispatchFailed(orphaned_by_restart)` (C3), then a hold row {`merge_dispatch_uncertain`, next_step `operator_rearm`, remedy}: confirm on the forge nothing merged, DELETE the `dispatch_failed` claim (mergequeue README operator re-arm); the queue-path re-arm needs NO `fishhawk_merge_run` re-invocation, the next pump re-decides from scratch (C8a). PR closed: the same transition, then `drop_pr_closed` |
 | the same claim younger than the crash-left age | hold `merge_dispatch_in_progress`, nothing written; a later tick re-decides |
 | `settling`, PR open (queue claim `dispatched`) or unreadable | hold `settling_unconfirmed`, no ledger write (an unreadable PR never orphans a settling claim: the step recorded that the forge accepted); depends on the forge converging: once it shows the PR merged, `fishhawk_reconcile_merge` or `fishhawk_record_merge_observation` (or the next pump) settles it; otherwise the forge must converge (C8b) |
 | an inline/delegated claim, a GitLab claim, or a non-orphaned `dispatch_failed` claim | hold `merge_already_dispatched`, no ledger write (C1: only a `queue`-path claim is ever reconciled) |
 | `merging`, no claim | `redecide`: back to `passed` at the epoch, ordinary merge-on-pass decides from scratch with the fold and veto in-lock; no dispatch was ever handed to the forge, so this is not a retry |
 
-- **ADR-109 governs the ledger.** The resume adds NO ledger transition and
-  dispatches NO merge: it makes ONE forge re-read (`merged := pr.Merged //
-  ADR-093 D8: the resume re-read`) under the run's merge-intent lock, and
-  its only claim write is the existing `MarkMergeDispatchFailed` the
-  uncertain classification already uses. Amendment A1's step-8 release
-  (below) is the SOLE added automatic ledger transition, and it is
-  merge-on-pass's, not the resume's.
-- **Step-8 orphan release (ADR-109 A1, #4711,
-  `mergeOnPassReleaseOrphanedClaim`).** In `mergeOnPassLocked` step 8, when
+- **ADR-109 governs the ledger.** The resume dispatches NO merge: it makes
+  ONE forge re-read (`merged := pr.Merged // ADR-093 D8: the resume re-read`)
+  under the run's merge-intent lock. It makes exactly two ledger writes, both
+  on a crash-left QUEUE claim still `dispatched` (Amendment A2 point 4): the
+  existing `MarkMergeDispatchFailed(orphaned_by_restart)` on the closed or
+  indeterminate arm, and the release of an open-PR orphan on the
+  `orphaned_claim_open` arm, through the same body (and the same
+  `released_orphaned_claim` row) as merge-on-pass step 8. No schema change
+  and no new audit category. A resume whose merge-intent lock lapses after
+  its judgement ran logs one WARN and keeps its outcome (its writes stand).
+- **Step-8 orphan release, the backstop (ADR-109 A1, #4711,
+  `mergeOnPassReleaseOrphanedClaim`).** Since A2 the resume releases a
+  merging entry's orphan before the fold, so step 8 acts only on (a) an
+  orphan stranded on a non-merging entry before A2 (a passed, held or
+  yielded entry still carrying an aged `dispatched` queue claim) and (b)
+  step 1's in-lock acceptance of a merging entry after a stale pre-lock
+  read. In `mergeOnPassLocked` step 8, when
   `ClaimMergeDispatch` answers claimed=false, AFTER steps 1-7 of THE SAME
   decision re-read the entry and an open, unmerged PR and re-ran the head,
   base, ADR-112 fold, R4 `merge_queue_authorized` row and verdict under the
@@ -1812,18 +1821,23 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
   age; a zero `claimed_at` fails closed). Order: a strict
   `merge_dispatch_settled` {`released`, `released_orphaned_claim`} row
   FIRST (record before action), then `ReleaseMergeDispatch` (the exact-claim
-  CAS DELETE on `state = 'dispatched'`); either failing holds
+  CAS DELETE on `state = 'dispatched'`); at step 8 either failing holds
   `orphaned_claim_release_failed` (not transient: no approval-wait
-  ExpiryYield) with the claim standing. On a release the decision claims
+  ExpiryYield; the resume holds `resume_unrecorded` for the append instead,
+  through the helper's `unrecordedReason` parameter). On a release the decision claims
   ONCE more (an error holds `transient`; a lost race holds
   `merge_already_dispatched`) and makes the ordinary step-9 pinned merge, so
-  a restart costs at most one extra pinned merge call. The release is
-  CONDITIONAL on that decision's fold approving: an unapproved fold returns
-  `await_approval` at step 6b, before step 8, so the PR still needs a
-  qualifying approval and the orphaned claim holds the head until it
-  arrives or the operator acts; `mergeOnPassPreYieldRefusal` still refuses
-  to yield a claimed entry (ADR-109: a claimed dispatch is held, never
-  yielded). Visibility: `dispatch_claim.orphan` on the merge-queue read and
+  a restart costs at most one extra pinned merge call. This backstop release
+  is CONDITIONAL on that decision's fold approving: an unapproved fold
+  returns `await_approval` at step 6b, before step 8, so for a pre-A2 orphan
+  the PR still needs a qualifying approval and the claim holds the head until
+  it arrives or the operator acts; `mergeOnPassPreYieldRefusal` still
+  refuses to yield a claimed entry (ADR-109: a claimed dispatch is held,
+  never yielded). Transition: an orphan already stranded on a non-merging
+  entry when A2 deploys keeps this conditional path. Residual: a late PUT
+  from the crashed process after the resume's release merges the PR; the
+  next pump settles it merged `pr_merged` with no PUT of its own (the merged
+  reconcile finds no claim). Visibility: `dispatch_claim.orphan` on the merge-queue read and
   `merge_candidate_queue.dispatch_claim_orphan` on the run read label
   `orphaned` / `orphaned_by_restart`; a released claim is deleted, so its
   record is the audit row.
@@ -1836,10 +1850,12 @@ gate). Store half: `backend/internal/mergequeue/README.md` (`Resumer`,
   boot-time cutoff. An unreadable clock holds.
 - **R2 note (binds any follow-up).** Any later automatic retry of a
   crash-left merge MUST re-run the ADR-112 forge-approval fold and veto
-  in-lock, failing closed, before calling the forge. A1's open-PR release
-  does exactly that (it sits after the fold in step 8); the retry-once and
-  the moved head/base release are not implemented, and the resume itself
-  dispatches no merge PUT.
+  in-lock, failing closed, before calling the forge. A2's open-PR release
+  does: the resume only releases the claim and dispatches no merge PUT, and
+  the next merge is ordinary merge-on-pass, whose fold and veto run in-lock
+  before its claim (step 8's backstop release likewise sits after the
+  fold); the retry-once and the moved head/base release are not
+  implemented.
 - **`merge_queue_resumed` (INTERNAL audit category).** Payload `{entry_id,
   base_ref, step, action, reason?, head_sha, admission_epoch, next_step?,
   remedy?, claim_state?, claim_path?, claim_head_sha?}`; every id is the

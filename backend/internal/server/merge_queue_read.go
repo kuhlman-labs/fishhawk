@@ -140,11 +140,13 @@ type mergeQueueDispatchClaimView struct {
 // merge_candidate_queue.dispatch_claim_orphan.
 const (
 	// mergeQueueClaimOrphaned: a queue claim still dispatched past
-	// mergeQueueCrashLeftClaimAge on the database clock. The next
-	// merge-on-pass decision whose forge-approval fold approves releases it
-	// in step 8 and merges through the ordinary path; while the fold does not
-	// approve, the claim holds the head (ADR-109: a claimed dispatch is never
-	// yielded).
+	// mergeQueueCrashLeftClaimAge on the database clock. On a merging entry
+	// the next restart resume releases it when the PR reads open and
+	// unmerged, before the forge-approval fold (ADR-109 A2). On any other
+	// phase (an orphan left before A2) the next merge-on-pass decision whose
+	// fold approves releases it in step 8, the backstop; while that fold does
+	// not approve, the claim holds the head (ADR-109: a claimed dispatch is
+	// never yielded).
 	mergeQueueClaimOrphaned = "orphaned"
 	// mergeQueueClaimOrphanedByRestart: a queue claim the restart resume
 	// moved to dispatch_failed (orphaned_by_restart, the unreadable-PR arm).
@@ -156,7 +158,7 @@ const (
 // dispatched whose non-zero claimed_at is older than
 // mergeQueueCrashLeftClaimAge against dbNow (only when clockOK: the same
 // predicate as mergeQueueClaimCrashLeft, so the label never names a claim the
-// decision would not release); orphaned_by_restart for a queue dispatch_failed
+// resume or step 8 would not judge crash-left); orphaned_by_restart for a queue dispatch_failed
 // claim whose cause is orphaned_by_restart; "" otherwise (inline and delegated
 // claims are never labelled). The decision never reads the label.
 func mergeQueueDispatchClaimOrphan(c mergequeue.DispatchClaim, dbNow time.Time, clockOK bool) string {
