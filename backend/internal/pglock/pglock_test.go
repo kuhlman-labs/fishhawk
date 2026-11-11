@@ -4,7 +4,10 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"net"
+	"os"
 	"sync/atomic"
+	"syscall"
 	"testing"
 	"time"
 	"weak"
@@ -251,6 +254,10 @@ func TestWithSessionLock_WaiterHoldsNoSlot(t *testing.T) {
 	}
 }
 
+// TestWithSessionLock_CanceledWaitNeverRunsFn: the waiter's deadline may fire
+// while the try-lock query is mid-WRITE, which pgx reports as "write failed:
+// ... i/o timeout" rather than the ctx error (#5159); ctxTimeoutErr keeps the
+// strict DeadlineExceeded assertion valid, and it is NOT relaxed.
 func TestWithSessionLock_CanceledWaitNeverRunsFn(t *testing.T) {
 	pool := newPool(t, pgtest.NewURL(t), 6)
 	ctx := callerCtx(t)
@@ -531,5 +538,145 @@ func TestDetach_ChildCanAcquire(t *testing.T) {
 	ran := false
 	if err := WithSessionLock(cctx, pool, b, 92, opts("detached child"), func(context.Context) error { ran = true; return nil }); err != nil || !ran {
 		t.Fatalf("detached child = %v ran=%v, want it to acquire", err, ran)
+	}
+}
+
+// TestCtxTimeoutErr: one case per branch of ctxTimeoutErr's guard plus the
+// wrap. Hermetic (no database).
+func TestCtxTimeoutErr(t *testing.T) {
+	writeTimeout := fmt.Errorf("write failed: %w", &net.OpError{Op: "write", Net: "tcp", Err: os.ErrDeadlineExceeded})
+	expired, cancelExpired := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
+	defer cancelExpired()
+	canceled, cancelNow := context.WithCancel(context.Background())
+	cancelNow()
+	live, cancelLive := context.WithCancel(context.Background())
+	defer cancelLive()
+	reset := &net.OpError{Op: "write", Net: "tcp", Err: syscall.ECONNRESET}
+
+	t.Run("expired deadline wraps DeadlineExceeded and keeps the timeout", func(t *testing.T) {
+		got := ctxTimeoutErr(expired, writeTimeout)
+		if !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, os.ErrDeadlineExceeded) {
+			t.Fatalf("got %v, want it to wrap both context.DeadlineExceeded and os.ErrDeadlineExceeded", got)
+		}
+		var nerr net.Error
+		if !errors.As(got, &nerr) || !nerr.Timeout() {
+			t.Fatalf("got %v, want the original net timeout reachable through errors.As", got)
+		}
+	})
+	t.Run("canceled ctx wraps Canceled and keeps the timeout", func(t *testing.T) {
+		got := ctxTimeoutErr(canceled, writeTimeout)
+		if !errors.Is(got, context.Canceled) || !errors.Is(got, os.ErrDeadlineExceeded) {
+			t.Fatalf("got %v, want it to wrap both context.Canceled and os.ErrDeadlineExceeded", got)
+		}
+	})
+	unchanged := []struct {
+		name string
+		ctx  context.Context
+		in   error
+	}{
+		{"live ctx", live, writeTimeout},
+		{"plain non-net error", expired, errors.New("boom")},
+		{"net error that is not a timeout", expired, reset},
+		{"error already wrapping the ctx error", expired, fmt.Errorf("x: %w", expired.Err())},
+		{"timeout already carrying the ctx error", expired, fmt.Errorf("%w: %w", expired.Err(), writeTimeout)},
+	}
+	for _, tc := range unchanged {
+		t.Run("unchanged/"+tc.name, func(t *testing.T) {
+			if got := ctxTimeoutErr(tc.ctx, tc.in); got != tc.in {
+				t.Fatalf("got %v, want the input returned unchanged (%v)", got, tc.in)
+			}
+		})
+	}
+	if !errors.As(reset, new(net.Error)) || reset.Timeout() {
+		t.Fatal("fixture: ECONNRESET must be a net.Error that is not a timeout")
+	}
+}
+
+// deadlineWriteConn is a net.Conn whose Write, once armed, blocks until the
+// armed ctx ends and then fails the way a net.Conn write deadline does, once:
+// it disarms first, so pgx's asynchronous close (which sends Terminate and
+// drains until the server closes) is not stalled for its 15s bound. The
+// injection is triggered by the wrapper, not by a wall-clock race, so the
+// write-time deadline is deterministic under -race and host load.
+type deadlineWriteConn struct {
+	net.Conn
+	armed atomic.Pointer[context.Context]
+	fired atomic.Bool
+}
+
+func (c *deadlineWriteConn) Write(b []byte) (int, error) {
+	ctxp := c.armed.Load()
+	if ctxp == nil {
+		return c.Conn.Write(b)
+	}
+	<-(*ctxp).Done()
+	c.armed.Store(nil)
+	c.fired.Store(true)
+	return 0, &net.OpError{Op: "write", Net: "tcp", Source: c.LocalAddr(), Addr: c.RemoteAddr(), Err: os.ErrDeadlineExceeded}
+}
+
+// TestWithSessionLock_WriteTimeoutAtDeadline: the waiter's deadline fires
+// while the try-lock statement is being WRITTEN, which pgx v5.11.0 returns as
+// "write failed: ... i/o timeout" without attributing it to ctx (#5159). The
+// pool's connections are wrapped so that write blocks until the deadline and
+// then fails with a net deadline error. Counterfactuals: ctxTimeoutErr
+// returning err, or the call site passing err unwrapped, is RED; running fn
+// before the error return is RED on `ran`.
+func TestWithSessionLock_WriteTimeoutAtDeadline(t *testing.T) {
+	cfg, err := pgxpool.ParseConfig(pgtest.NewURL(t))
+	if err != nil {
+		t.Fatalf("parse url: %v", err)
+	}
+	cfg.MaxConns = MinPoolConns
+	// No acquire-time ping write: the try-lock Prepare must be the first
+	// write on the warmed connection.
+	cfg.ShouldPing = func(context.Context, pgxpool.ShouldPingParams) bool { return false }
+	// Force TLS off on this pool's own config, whatever an external
+	// FISHHAWK_TEST_PG_URL says, so the DialFunc wrapper is always the
+	// connection pgconn writes to.
+	cfg.ConnConfig.TLSConfig = nil
+	cfg.ConnConfig.Fallbacks = nil
+	dial := cfg.ConnConfig.DialFunc
+	cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+		c, err := dial(ctx, network, addr)
+		if err != nil {
+			return nil, err
+		}
+		return &deadlineWriteConn{Conn: c}, nil
+	}
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+	ctx := callerCtx(t)
+
+	// Warm the one connection so the waiter reuses it, already started.
+	warm, err := pool.Acquire(ctx)
+	if err != nil {
+		t.Fatalf("warm acquire: %v", err)
+	}
+	dc, ok := warm.Conn().PgConn().Conn().(*deadlineWriteConn)
+	if !ok {
+		t.Fatalf("pool connection is %T, want *deadlineWriteConn", warm.Conn().PgConn().Conn())
+	}
+	warm.Release()
+
+	wctx, cancel := context.WithTimeout(ctx, timescale.D(500*time.Millisecond))
+	defer cancel()
+	dc.armed.Store(&wctx)
+	ran := false
+	err = WithSessionLock(wctx, pool, BudgetFor(pool), 33, opts("waiter"), func(context.Context) error { ran = true; return nil })
+	if !dc.fired.Load() {
+		t.Fatalf("the waiter never wrote on the armed connection (err=%v): the injection did not land, so this test proves nothing", err)
+	}
+	if !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("waiter whose deadline fired mid-write = %v, want it to wrap context.DeadlineExceeded", err)
+	}
+	if !errors.Is(err, os.ErrDeadlineExceeded) {
+		t.Fatalf("waiter whose deadline fired mid-write = %v, want the original os.ErrDeadlineExceeded kept", err)
+	}
+	if ran {
+		t.Fatal("fn ran although the try-lock write failed")
 	}
 }

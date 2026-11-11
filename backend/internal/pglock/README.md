@@ -63,7 +63,9 @@ nil budget or one built for another pool (`ErrBudgetMismatch`), a pool below
 slot, then a pooled connection, then runs `pg_try_advisory_lock`. A held lock
 releases both and re-tries every `Poll` (25ms), so a waiter holds nothing
 between tries; the wait is bounded only by the caller's ctx, and a canceled
-ctx returns its error with fn never run. A try-lock query error closes the
+ctx returns its error with fn never run. A ctx that ends mid-query returns
+its error even when pgx reports the interrupted write as a net timeout
+(`ctxTimeoutErr` wraps both, #5159). A try-lock query error closes the
 connection before release (the lock may have been granted). Trade-off: no
 FIFO fairness for same-key waiters (same-key contention is one run or one
 draft).
@@ -109,7 +111,11 @@ pool, and admits nothing.
 `_CanceledWaitNeverRunsFn`, `_BoundsFnWithDeadline`,
 `_PanicInFnReleasesLock` (separate non-pooled probe session: advisory locks
 are re-entrant per session), `_LapsedSessionSurfaces`, `_ReservesHeadroom`,
-`_RefusesNestedLock`, `TestDetach_ChildCanAcquire`.
+`_RefusesNestedLock`, `TestDetach_ChildCanAcquire`,
+`TestCtxTimeoutErr` (hermetic, one case per guard branch),
+`_WriteTimeoutAtDeadline` (a wrapping `DialFunc` injects a write-time deadline
+on the try-lock write; asserts the injection fired, `DeadlineExceeded` and
+the original timeout both reachable, fn not run).
 
 `mixed_test.go` (the three production helpers over ONE 6-connection pool,
 `HolderLimit` 2):
