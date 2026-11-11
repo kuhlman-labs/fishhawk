@@ -54,7 +54,7 @@ import (
 //     run's entry so it stops holding the line; the run re-enters at the TAIL
 //     on its next serialized pass (ADR-093 Q2).
 //   - ADR-093 slice 2 (E87.5 / #4296): every admission-owned write carries
-//     the entry's admission epoch (Unadmit, SetPhase, ReanchorAt, SettleAt
+//     the entry's admission epoch (Unadmit, UnadmitPassed, SetPhase, ReanchorAt, SettleAt
 //     are compare-and-swaps), so a decision made against an earlier admission
 //     changes nothing. The pump's live-entry branch runs MERGE-ON-PASS
 //     (mergeQueueMergeOnPass, merge_queue_merge.go) for a live, passed,
@@ -123,7 +123,7 @@ const (
 const mergeCandidateQueueMaxAdmissions = 64
 
 // mergeQueueMaxReadvancesPerPump bounds the merge-on-pass readvances ONE pump
-// performs (Unadmit then re-admit onto a moved base or head). A yield also
+// performs (UnadmitPassed then re-admit onto a moved base or head). A yield also
 // returns the entry to held but is NOT counted: AdmitNext skips a yielded
 // row, so it cannot come back in the same pump. A base that moves on every
 // pass leaves the entry held at its place for the next pump past this bound.
@@ -412,6 +412,13 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 			mctx, cancel := mergeCandidateAdmissionContext(pglock.Detach(ctx))
 			switch {
 			case e.Phase == mergequeue.PhasePassed && e.MergeIntentAt != nil:
+				if s.mergeInFlight.has(e.RunID) {
+					// #4876 (ruling R8c kept): THIS process's decision released
+					// its claim and returned the entry to passed under the lock;
+					// it applies the outcome and clears its mark, so a
+					// concurrent same-process pump neither claims nor merges.
+					break
+				}
 				// ADR-093 D3: the live head of line passed and carries the
 				// operator's merge intent, so the queue merges it.
 				req := mergeOnPassRequest{Entry: e, IntentSequence: e.MergeIntentSequence, Ledger: s.mergeDispatchLedger()}
@@ -467,16 +474,18 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 //     merge is a fact and it is settled merged here. Continue.
 //   - settle: SettleAt with the epoch the decision read. Continue on a
 //     settle; a CAS conflict (another admission owns it) stops.
-//   - readvance: Unadmit at the epoch read, returning it to held at its
-//     place so its next admission re-advances it. Continue, bounded by
-//     mergeQueueMaxReadvancesPerPump; a CAS conflict stops.
+//   - readvance: UnadmitPassed at the epoch read, returning it to held at
+//     its place so its next admission re-advances it. Continue, bounded by
+//     mergeQueueMaxReadvancesPerPump; a CAS conflict (another admission owns
+//     it, or its phase moved past passed: a concurrent pump stamped merging
+//     and may hold the dispatch claim, #4876) stops.
 //   - await_approval (ADR-112 R3 row 3): start or continue the persisted
 //     approval wait (Store.ApprovalWait, expiry judged on the database
 //     clock). Before expiry the entry holds the line and the pump stops (it
 //     admits nothing else; the next pump re-decides); at expiry it yields as
 //     below. A CAS conflict or a failed write stops.
-//   - yield (ADR-112 R3 rows 2 and 4, or an expired wait): Store.Yield at the
-//     epoch read (held, marked), merge_queue_yielded, then CONTINUE to the
+//   - yield (ADR-112 R3 rows 2 and 4, or an expired wait): Store.YieldPassed
+//     at the epoch read (held, marked), merge_queue_yielded, then CONTINUE to the
 //     next held entry. A yield does not count against the readvance bound:
 //     AdmitNext skips a yielded row, so it cannot return in this pump. A CAS
 //     conflict stops.
@@ -492,7 +501,13 @@ func (s *Server) pumpMergeCandidateQueueWith(ctx context.Context, base mergequeu
 //
 // It runs OUTSIDE the merge-intent lock (the pump's detached context): an
 // approval or merge-gate wait is an outcome repeated across pumps, never
-// held inside the lock.
+// held inside the lock. So the readvance and both yields compare-and-swap on
+// phase passed as well as the epoch (UnadmitPassed, YieldPassed; #4876):
+// SetPhase(merging) keeps the epoch, and merging is stamped under the lock
+// before every queue claim, so a stale outcome landing after another pump
+// claimed the dispatch is refused instead of returning a claimed entry to
+// held. A decision that released its own claim returns the entry to passed
+// under the lock first (mergeOnPassReleasedToPassed).
 func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry, o mergeOnPassOutcome, readvances *int) bool {
 	log := func(msg string, attrs ...slog.Attr) {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelInfo, msg, append([]slog.Attr{
@@ -527,8 +542,8 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 			log("merge queue: merge-on-pass readvance bound reached; the next pump re-decides")
 			return false
 		}
-		if _, err := s.cfg.MergeQueue.Unadmit(ctx, e.ID, e.AdmissionEpoch); err != nil {
-			log("merge queue: merge-on-pass readvance did not return the entry to held; another admission owns it",
+		if _, err := s.cfg.MergeQueue.UnadmitPassed(ctx, e.ID, e.AdmissionEpoch); err != nil {
+			log("merge queue: merge-on-pass readvance did not return the entry to held; another admission owns it or its phase moved past passed",
 				slog.String("error", err.Error()))
 			return false
 		}
@@ -547,9 +562,9 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 				slog.String("next_step", o.Yield.NextStep), slog.Duration("remaining", res.Remaining))
 			return false
 		}
-		return s.yieldMergeQueueEntry(ctx, res.Entry, o.Yield, mergeQueueYieldSiteMergeOnPass)
+		return s.yieldMergeQueueEntry(ctx, res.Entry, o.Yield, mergeQueueYieldSiteMergeOnPass, true)
 	case mergeOnPassYield:
-		return s.yieldMergeQueueEntry(ctx, e, o.Yield, mergeQueueYieldSiteMergeOnPass)
+		return s.yieldMergeQueueEntry(ctx, e, o.Yield, mergeQueueYieldSiteMergeOnPass, true)
 	case mergeOnPassAwaitGate:
 		log("merge queue: the head of line waits for its merge-gate legs",
 			slog.String("yield_reason", o.Yield.Reason), slog.String("next_step", o.Yield.NextStep),
@@ -796,7 +811,7 @@ func (s *Server) admitMergeCandidateEntryReclaimed(ctx context.Context, e mergeq
 			return unadmit("merge-queue eligibility could not be determined: " + mergeQueueReasonsText(elig.Reasons))
 		}
 		if y, ok := mergeQueueAdmissionYield(legs, elig); ok && e.MergeIntentAt != nil {
-			if !s.yieldMergeQueueEntry(ctx, e, y, mergeQueueYieldSiteAdmission) {
+			if !s.yieldMergeQueueEntry(ctx, e, y, mergeQueueYieldSiteAdmission, false) { // an admitted/advancing entry: plain Yield
 				return mergeCandidateAdmitResult{outcome: admitStale, refusal: &mergeCandidateVerifyRefusal{
 					Reason: "the merge-candidate queue could not yield this entry (another admission owns it, or the write failed)"}}
 			}

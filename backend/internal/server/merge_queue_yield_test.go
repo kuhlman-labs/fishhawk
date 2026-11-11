@@ -220,7 +220,7 @@ func TestMergeOnPassVetoUndetermined_YieldRowAgreesWithReadSurface(t *testing.T)
 	if out.Yield.NextStep != forgeApprovalNextRetryAfter {
 		t.Errorf("outcome yield = %+v, want next_step %s", out.Yield, forgeApprovalNextRetryAfter)
 	}
-	if !w.srv.yieldMergeQueueEntry(context.Background(), req.Entry, out.Yield, mergeQueueYieldSiteMergeOnPass) {
+	if !w.srv.yieldMergeQueueEntry(context.Background(), req.Entry, out.Yield, mergeQueueYieldSiteMergeOnPass, true) {
 		t.Fatal("the yield did not land")
 	}
 	rows := w.rows(r, CategoryMergeQueueYielded)
@@ -247,8 +247,9 @@ func (l *lockedWriter) Write(p []byte) (int, error) {
 	return l.w.Write(p)
 }
 
-// mqyLockProbe records whether ApprovalWait and Yield ran inside a pglock
-// lock; every other method is the real store.
+// mqyLockProbe records whether ApprovalWait and Yield (or YieldPassed, the
+// pump's out-of-lock yield since #4876, recorded as "yield" too) ran inside a
+// pglock lock; every other method is the real store.
 type mqyLockProbe struct {
 	mergequeue.Store
 	mu     sync.Mutex
@@ -273,6 +274,11 @@ func (p *mqyLockProbe) ApprovalWait(ctx context.Context, id uuid.UUID, epoch int
 func (p *mqyLockProbe) Yield(ctx context.Context, id uuid.UUID, epoch int64, m mergequeue.YieldMarker) (mergequeue.Entry, error) {
 	p.note("yield", ctx)
 	return p.Store.Yield(ctx, id, epoch, m)
+}
+
+func (p *mqyLockProbe) YieldPassed(ctx context.Context, id uuid.UUID, epoch int64, m mergequeue.YieldMarker) (mergequeue.Entry, error) {
+	p.note("yield", ctx)
+	return p.Store.YieldPassed(ctx, id, epoch, m)
 }
 
 // TestMergeQueueYield_WaitAndYieldRunOutsideTheMergeIntentLock pins ADR-112
