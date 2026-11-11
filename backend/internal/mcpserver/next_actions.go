@@ -89,7 +89,9 @@ type NextActions struct {
 // legal next actions (#1024). Pure function over already-fetched data;
 // every input except run and stages may be nil. For drive-enabled runs
 // with a distilled NextAction, that action is folded in FIRST so drive
-// and next_actions never point different ways.
+// and next_actions never point different ways — except on the
+// review_coverage_incomplete and ci_cancelled arms, which translate the
+// stamped verb into their own lead action instead of prepending it.
 func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewStatus *ReviewStatus, hint *ReviewActionHint, drive *DriveStatus, mergeObserved, acceptanceSkippedOutOfScope, acceptanceArbitrated bool, acceptanceVerdict, acceptanceTriageDisposition string, release releaseSignals) *NextActions {
 	if run == nil {
 		return nil
@@ -104,6 +106,28 @@ func nextActionsFor(run *Run, stages []Stage, planReviewStatus, implementReviewS
 		if drive.NextAction != nil {
 			na.Actions = append([]SuggestedAction{driveAction(run, drive.NextAction)}, na.Actions...)
 		}
+		foldReviewHeadMismatchAdvisory(run, na)
+		foldLiveValidationAdvisory(run, na)
+		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
+		foldProductIssueSuggestion(run, stages, na)
+		foldMergeCandidateStaleness(run, na)
+		foldMergeQueueYield(run, na)
+		foldMergeQueueOrphanedClaim(run, na)
+		foldMergeCandidateRerunAlternative(run, na)
+		foldWorkingDirParams(run, na)
+		foldFailureSignature(run, stages, na)
+		return na
+	}
+
+	// ci_cancelled (#4706) is the drive-derived, detection-only park for a
+	// required PR check concluded cancelled/stale AT the run's current recorded
+	// head (a cancellation at a superseded head never parks). Decided ahead of
+	// the table like ci_failed, with the same folds in the same order, but the
+	// drive NextAction is NOT prepended: its raw retrigger_ci verb is not an
+	// MCP tool, so ciCancelledNextActions names fishhawk_retrigger_ci itself.
+	// The arm NEVER offers a merge verb — the table's review arms would.
+	if drive != nil && drive.DerivedStatus == stateCICancelled {
+		na := ciCancelledNextActions(run, drive.NextAction)
 		foldReviewHeadMismatchAdvisory(run, na)
 		foldLiveValidationAdvisory(run, na)
 		foldRejectWithoutConcernAdvisory(implementReviewStatus, na)
@@ -277,6 +301,12 @@ func mergeQueueYieldIsMergeGate(reason string) bool {
 // operator step. none (nothing at the forge clears it) and any unknown step
 // add NOTHING; the run payload's merge_candidate_queue.note still states it.
 //
+// ci_cancelled (#4706): on that state ONLY, retry_after's remedy is
+// fishhawk_get_merge_queue instead of a synthesized fishhawk_merge_run — the
+// merge is withheld while a required check is cancelled at the current
+// recorded head, so the arm must never offer it. Every other next_step, and
+// retry_after on every other state, is unchanged.
+//
 // Untrusted text (approval condition C8): every string is built ONLY from the
 // closed next_step / yield_reason vocabulary. yield_detail (forge-derived,
 // untrusted) is NEVER interpolated, nor is any other wire string; an
@@ -331,6 +361,18 @@ func foldMergeQueueYield(run *Run, na *NextActions) {
 			Reason: yielded + reason + ")" + rejoin + ". A required check failed or was cancelled at the anchored head: re-run it with fishhawk_retrigger_ci; the check_run trigger, the periodic re-probe or a fishhawk_merge_run re-invoke then clears the yield once every required check passes",
 		}
 	case "retry_after":
+		if na.State == stateCICancelled {
+			params := map[string]string{"repo": q.Repo}
+			if q.BaseRef != "" {
+				params["base_ref"] = q.BaseRef
+			}
+			action = SuggestedAction{
+				Action: "fishhawk_get_merge_queue",
+				Params: params,
+				Reason: yielded + reason + ")" + rejoin + ciCancelledYieldWithheldTail,
+			}
+			break
+		}
 		why := yielded + reason + ")" + rejoin + ". The forge-approval read was undetermined or truncated; re-invoking fishhawk_merge_run on the queued entry re-probes now instead of waiting for the periodic re-probe's backoff"
 		switch reason {
 		case "merge_checks_pending":
@@ -2062,6 +2104,61 @@ func ciFailedNextActions(run *Run, stages []Stage, hint *ReviewActionHint) *Next
 				Precondition: "the failure is neither a flake nor operator-remediable",
 				Consumes:     consumesNone,
 				Reason:       "the red required check is unclassifiable or non-remediable here — escalate to a human for a judgment call",
+			},
+		},
+	}
+}
+
+// stateCICancelled is the next_actions.state (and the drive derived_status and
+// drive rule) for a required PR check concluded cancelled/stale at the run's
+// current recorded head (#4706). driveNextActionRetriggerCI is the verb the
+// server stamps on that park. Both are thin local copies, not imports, per the
+// thin local-copy rule; TestCICancelledLiterals pins them against
+// drive.RuleCICancelled and drive.NextActionRetriggerCI.
+const (
+	stateCICancelled           = "ci_cancelled"
+	driveNextActionRetriggerCI = "retrigger_ci"
+)
+
+// ciCancelledDefaultReason is the lead action's reason when the drive stamp
+// carries no Detail.
+const ciCancelledDefaultReason = "a required PR check concluded cancelled or stale at the run's current recorded head and no newer push will re-run it; re-run it with fishhawk_retrigger_ci"
+
+// ciCancelledYieldWithheldTail closes the ci_cancelled retry_after remedy
+// (foldMergeQueueYield). Fixed text: it never names the merge verb, because
+// the arm must not offer one.
+const ciCancelledYieldWithheldTail = ". The merge is withheld while a required check is cancelled at the current recorded head (ci_cancelled): re-run it with fishhawk_retrigger_ci, then read the base's line with fishhawk_get_merge_queue to watch the entry rejoin once a re-probe clears the yield"
+
+// ciCancelledNextActions is the drive-derived ci_cancelled arm (#4706): a
+// required PR check concluded cancelled/stale at the run's current recorded
+// head (the audit-ledger head, not a forge read), so the merge is withheld
+// until it re-runs green. It leads with fishhawk_retrigger_ci — which re-runs
+// every completed, non-successful workflow run at the current head, cancelled
+// ones included — and offers page_human for a cancellation that keeps
+// recurring. It NEVER offers a merge verb and is not a product-issue filing
+// state. The drive Detail (bounded and neutralized at its server source) is the
+// lead action's reason; da == nil or an empty Detail uses a fixed default.
+func ciCancelledNextActions(run *Run, da *RunNextAction) *NextActions {
+	reason := ciCancelledDefaultReason
+	if da != nil && da.Detail != "" {
+		reason = da.Detail
+	}
+	return &NextActions{
+		State: stateCICancelled,
+		Actions: []SuggestedAction{
+			{
+				Action:       "fishhawk_retrigger_ci",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "a required PR check concluded cancelled or stale at the run's current recorded head (drive derived_status ci_cancelled); a green re-run re-asserts awaiting_merge, and a newer recorded head lifts the park (ci_recovered)",
+				Consumes:     consumesNone,
+				Reason:       reason,
+			},
+			{
+				Action:       "page_human",
+				Params:       map[string]string{"run_id": run.ID},
+				Precondition: "the re-run cannot clear the cancellation (it keeps recurring at the current head)",
+				Consumes:     consumesNone,
+				Reason:       "a required check keeps concluding cancelled or stale at the current head — escalate to a human for a judgment call",
 			},
 		},
 	}
@@ -4037,6 +4134,11 @@ func conflictResolutionSignalIn(recent []AuditEntry) conflictResolutionSignal {
 // A no-op leaving na deep-equal to its unfolded value when na is nil, when run
 // is nil, or when the recent slice carries no conflict-resolution entry at all
 // — which is what keeps every ordinary run byte-identical.
+//
+// The relabel goes through relabelConflictResolutionState, which keeps the
+// ci_cancelled state FINAL (#4706): the action is still appended, but the
+// state is not overwritten, so a conflict signal can never hide the
+// cancellation park. Every other state relabels exactly as before.
 func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActions) {
 	if run == nil || na == nil {
 		return
@@ -4046,7 +4148,7 @@ func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActio
 		return
 	}
 	if sig.Triggered {
-		na.State = "conflict_resolution_pass_pending"
+		relabelConflictResolutionState(na, "conflict_resolution_pass_pending")
 		reason := "fishhawk_rebase_run_branch found the run branch CONFLICTS with its advanced base and authorized a bounded conflict-resolution pass (ceiling 1) instead of refusing; NOTHING was written to the branch. Await the re-opened implement stage, then re-invoke fishhawk_rebase_run_branch — on success the behind-probe short-circuits and the fishhawk_audit_complete check is re-posted at the resulting head."
 		params := map[string]string{"run_id": run.ID}
 		if sig.StageID != "" {
@@ -4062,7 +4164,7 @@ func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActio
 		return
 	}
 	if sig.Succeeded {
-		na.State = "conflict_resolution_pass_succeeded"
+		relabelConflictResolutionState(na, "conflict_resolution_pass_succeeded")
 		na.Actions = append(na.Actions, SuggestedAction{
 			Action:       "fishhawk_rebase_run_branch",
 			Params:       map[string]string{"run_id": run.ID, "confirm": "true"},
@@ -4072,7 +4174,7 @@ func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActio
 		})
 		return
 	}
-	na.State = "conflict_resolution_pass_failed"
+	relabelConflictResolutionState(na, "conflict_resolution_pass_failed")
 	reason := "the bounded conflict-resolution pass was REFUSED and the run was restored to its pre-pass review gate; its ceiling-of-one budget is now SPENT, so re-invoking fishhawk_rebase_run_branch on the same conflict fails closed (422 rebase_conflict) naming the refusal and the fallback: resolve in a worktree, push, then fishhawk_vouch_commit."
 	if sig.Reason != "" {
 		reason = "refusal reason: " + sig.Reason + ". " + reason
@@ -4084,4 +4186,14 @@ func foldConflictResolutionAdvisory(run *Run, recent []AuditEntry, na *NextActio
 		Consumes:     consumesNone,
 		Reason:       reason,
 	})
+}
+
+// relabelConflictResolutionState sets the conflict-resolution state label on
+// na unless na is the ci_cancelled arm (#4706), whose state stays FINAL so a
+// conflict signal never hides the cancellation park; the fold's action is
+// appended either way. Every other state relabels exactly as before.
+func relabelConflictResolutionState(na *NextActions, state string) {
+	if na.State != stateCICancelled {
+		na.State = state
+	}
 }
