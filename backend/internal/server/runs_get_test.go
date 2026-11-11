@@ -1559,6 +1559,83 @@ func TestGetRun_Drive_CIRecoveredSupersedesCIFailed_OmitsDerivedStatus(t *testin
 	}
 }
 
+// TestGetRun_DerivedStatusCICancelled is the done-means test for the shipped
+// ci_cancelled derived_status value (#4706). It derives through the REAL
+// applyDriveSurfaces path (seeded run_auto_advanced entries; the field is
+// never hand-set) and pins the same guard as ci_failed:
+//   - latest:    ci_cancelled is the latest stamp on a non-terminal run with
+//     an open PR → derived_status ci_cancelled, next_action retrigger_ci.
+//   - recovered: a LATER ci_recovered (From ci_cancelled) supersedes it →
+//     derived_status absent, next_action await_checks.
+//   - no_pr:     the same latest stamp with no PR on the row → absent.
+//   - terminal:  the same latest stamp on a terminal run → absent.
+func TestGetRun_DerivedStatusCICancelled(t *testing.T) {
+	const pr = "https://github.com/x/y/pull/7"
+	cancelled := drive.Advance{
+		Rule: drive.RuleCICancelled, From: "review:awaiting_approval", To: "ci_cancelled",
+		Event:      "required PR checks cancelled at current head abc123: ci_pass",
+		NextAction: &drive.NextAction{Action: drive.NextActionRetriggerCI, Detail: "call fishhawk_retrigger_ci", PRURL: pr},
+	}
+
+	t.Run("latest", func(t *testing.T) {
+		s, _, au, seeded := newDriveGetServer(t)
+		prURL := pr
+		seeded.PullRequestURL = &prURL
+		seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), cancelled)
+
+		resp, raw := getRunResponse(t, s, seeded.ID)
+		if resp.DerivedStatus != "ci_cancelled" {
+			t.Errorf("derived_status = %q (raw %v), want ci_cancelled", resp.DerivedStatus, raw["derived_status"])
+		}
+		if resp.NextAction == nil || resp.NextAction.Action != drive.NextActionRetriggerCI {
+			t.Errorf("next_action = %+v, want %s", resp.NextAction, drive.NextActionRetriggerCI)
+		}
+	})
+
+	t.Run("recovered", func(t *testing.T) {
+		s, _, au, seeded := newDriveGetServer(t)
+		prURL := pr
+		seeded.PullRequestURL = &prURL
+		t0 := time.Now().UTC().Add(-5 * time.Minute)
+		seedAutoAdvance(t, au, seeded.ID, 5, t0, cancelled)
+		seedAutoAdvance(t, au, seeded.ID, 8, t0.Add(2*time.Minute), drive.Advance{
+			Rule: drive.RuleCIRecovered, From: "ci_cancelled", To: "review:awaiting_approval",
+			NextAction: &drive.NextAction{Action: "await_checks", PRURL: pr},
+		})
+
+		resp, raw := getRunResponse(t, s, seeded.ID)
+		if _, present := raw["derived_status"]; present {
+			t.Errorf("derived_status present (%v), want absent — ci_recovered supersedes ci_cancelled", raw["derived_status"])
+		}
+		if resp.NextAction == nil || resp.NextAction.Action != "await_checks" {
+			t.Errorf("next_action = %+v, want await_checks", resp.NextAction)
+		}
+	})
+
+	t.Run("no_pr", func(t *testing.T) {
+		s, _, au, seeded := newDriveGetServer(t)
+		seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), cancelled)
+
+		_, raw := getRunResponse(t, s, seeded.ID)
+		if _, present := raw["derived_status"]; present {
+			t.Errorf("derived_status present (%v) without a PR on the run row", raw["derived_status"])
+		}
+	})
+
+	t.Run("terminal", func(t *testing.T) {
+		s, _, au, seeded := newDriveGetServer(t)
+		prURL := pr
+		seeded.PullRequestURL = &prURL
+		seeded.State = run.StateSucceeded
+		seedAutoAdvance(t, au, seeded.ID, 9, time.Now().UTC(), cancelled)
+
+		_, raw := getRunResponse(t, s, seeded.ID)
+		if _, present := raw["derived_status"]; present {
+			t.Errorf("derived_status present (%v) on a terminal run", raw["derived_status"])
+		}
+	})
+}
+
 // TestGetRun_Drive_AcceptancePending_NoPR_OmitsDerivedStatus: like
 // awaiting_merge / ci_failed, an acceptance-gate derived_status requires an
 // open PR on the row.
