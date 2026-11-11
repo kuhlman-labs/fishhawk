@@ -18888,10 +18888,15 @@ paths:
               carries `campaign_id`, `hotfix_item_id`, `hotfix_issue_ref`,
               `expires_at`, `stage_id` and `item_id`. An ancestry that cannot be
               resolved (a missing parent, a cycle, or the depth bound) could
-              belong to any campaign, so while ANY campaign holds dispatches
-              (due holds are released first) it is held FAIL-CLOSED with
-              `details.reason: campaign_ancestry_unresolved` and
-              `details.unresolved`; with no hold anywhere it is admitted.
+              belong to any campaign the stage can see, so, on the stage's
+              repository, while a campaign in the stage's own account or a
+              legacy untenanted (NULL-account) campaign holds dispatches (due
+              holds in that scope are released first) it is held FAIL-CLOSED
+              with `details.reason: campaign_ancestry_unresolved` and
+              `details.unresolved`, and admitted when none does. A stage with
+              no account sees only untenanted campaigns' holds; a hold on a
+              campaign stamped with another account, or on another
+              repository, neither holds it nor is released by it (#4586).
               Expedited items and their decomposed
               children, non-implement stages, runs in no campaign and the
               idempotent already-`dispatched` arm are never held. A

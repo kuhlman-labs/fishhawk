@@ -39,8 +39,9 @@ const (
 var (
 	// ErrExpediteInvalid: an expedited append or a hold release is malformed —
 	// not exactly one new item, an addition alongside it, an unknown kind, an
-	// empty workflow, a hold window that is empty or exceeds MaxDispatchHold, or
-	// an unknown release reason. Nothing is written.
+	// empty workflow, a hold window that is empty or exceeds MaxDispatchHold, an
+	// unknown release reason, or an invalid DispatchHoldScope. Nothing is
+	// written.
 	ErrExpediteInvalid = errors.New("campaign: invalid expedite")
 	// ErrDispatchHoldActive: the campaign already holds a dispatch hold, so an
 	// expedited append asking for another is refused and writes nothing (one
@@ -158,6 +159,40 @@ func ValidateReleaseDispatchHold(p ReleaseDispatchHoldParams) error {
 	}
 	if p.Record == nil {
 		return fmt.Errorf("%w: no recorder supplied", ErrHoldReleaseUnrecorded)
+	}
+	return nil
+}
+
+// DispatchHoldScope bounds Repository.ListDispatchHolds to the campaigns a
+// stage with an unresolvable campaign ancestry could belong to (#4586): those
+// on Repo whose account is AccountID, plus every legacy untenanted
+// (NULL-account) campaign on Repo — the #1829 migration window, kept because
+// an unstamped campaign's owner is unknown. An empty AccountID selects the
+// NULL-account campaigns on Repo ONLY; unlike ListCampaignsFilter it is never
+// "no constraint", so a stage with no account never sees a known tenant's
+// hold. Removing the NULL-account window is later governed work (#5048).
+type DispatchHoldScope struct {
+	// AccountID is the stage's run account: "" (untenanted) or an account
+	// UUID string.
+	AccountID string
+	// Repo is the stage's run repository. Required.
+	Repo string
+}
+
+// ValidateDispatchHoldScope refuses a scope that would otherwise fail OPEN:
+// an empty Repo (it would list no hold at all) or a non-empty AccountID that
+// is not a UUID (it would bind as NULL and silently drop the stage's own
+// account, leaving only the NULL-account window). Both wrap
+// ErrExpediteInvalid. It is exported so a test fake enforces exactly the
+// production rules.
+func ValidateDispatchHoldScope(s DispatchHoldScope) error {
+	if s.Repo == "" {
+		return fmt.Errorf("%w: a dispatch hold scope needs a repository", ErrExpediteInvalid)
+	}
+	if s.AccountID != "" {
+		if _, err := uuid.Parse(s.AccountID); err != nil {
+			return fmt.Errorf("%w: dispatch hold scope account %q is not a UUID", ErrExpediteInvalid, s.AccountID)
+		}
 	}
 	return nil
 }
