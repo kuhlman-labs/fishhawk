@@ -1676,14 +1676,42 @@ its reason as `rationale`, `skip_expected: false` (always drivable) and
 (so `acceptance_criteria_ids` — now served from the seam — admits a verdict row
 for it) and to `Added`. The acceptance prompt names it under an
 "Operator-authored at approval" block: it did NOT pass plan review, it must be
-validated, and a failure on it alone does not condemn the change. It is
-ADVISORY by construction, not only by the `blocking` flag (which
-`aggregateAcceptanceResults` never reads): a failed verdict whose failures name
-ONLY operator-added criteria is neutralized at ingest under downgrade basis
-`added_criteria_only`, and the orchestrator's acceptance short-circuit evaluates
-the EFFECTIVE verification (via the nil-safe `EffectiveAcceptance` hook), so an
-add on an all-skip-with-basis plan is actually driven instead of settling
-`not_validated`.
+validated, a failure on it alone does not condemn the change, and a pass on it
+does not validate the change. It is ADVISORY by construction, not only by the
+`blocking` flag (which `aggregateAcceptanceResults` never reads): an added
+criterion can neither escalate nor certify a verdict. The orchestrator's
+acceptance short-circuit evaluates the EFFECTIVE verification (via the nil-safe
+`EffectiveAcceptance` hook), so an add on an all-skip-with-basis plan is still
+driven, but the verdict stays `not_validated`, because the add did not pass plan
+review (`TestShipAcceptance_AddedRowPassed_AllSkipReviewed_RecordsNotValidated`).
+
+An added row never feeds the precedence ladder, so it cannot move a shipped
+`passed` (#3682): an added `undecidable` or `failed` row beside a passing reviewed
+contract records `passed`, and the failure stays visible in `criteria_failed`
+and the additive `added_criteria_failed` key
+(`TestShipAcceptance_AddedRowUndecidable_PassingContract_RecordsPassed`,
+`TestShipAcceptance_AddedRowFailed_ShippedPassed_RecordsPassed`, which also pins
+the merge gate at `acceptance_passed`; the skipped-row sibling
+`TestShipAcceptance_AddedRowSkipped_PassingContract_RecordsPassed` is a
+regression pin — that shape never escalated). The residual shipped-`failed`
+shapes are named, not claimed away:
+
+- A shipped `failed` whose failures name only added criteria is neutralized
+  under downgrade basis `added_criteria_only` when A1-A4 hold.
+- The unchanged conjuncts leave it `failed` when `failure_mode` is `error` (A1),
+  or when a surviving blocking reviewed row was reported `skipped` without a
+  plan-declared basis, or `undecidable` (A4).
+- When only added/retired rows were itemized (A3), the #3682 R1 rule records
+  `not_validated` under basis `added-only-observed`, provided the verdict is
+  `assertion_fail`, at least one row failed, at least one itemized row is
+  added, and EVERY reviewed criterion in force was itemized (approval condition
+  C1). A verdict that omits a live reviewed criterion keeps `failed` and routes
+  triage (`TestShipAcceptance_OnlyAddedRows_ShippedFailed_OmitsLiveReviewed_StaysFailed`).
+  Inside the empty-ladder door the C1 conjunct holds only when every reviewed
+  criterion was retired, a chain the approval gate's R12 refuses beside an add,
+  so on any chain the gate admits this shape records `failed`.
+- A failed live reviewed row always records `failed`
+  (`TestAddedOnlyDowngrade_BlockingConjuncts` case A2).
 
 **2. Contested context in the acceptance prompt.** The acceptance prompt renders
 the binding approval conditions AND the paths the operator dropped via
@@ -1820,7 +1848,7 @@ a single total question: *was there evidence, and what did it say?*
 
 | | decided | evidence | outcome |
 |---|---|---|---|
-| `not_validated` (#2347, #3397) | PRE-SPAWN from the plan (no rows), OR POST-RUN when every non-retired row is `skipped` / no rows were itemized / every itemized row was retired | verified nothing — pre-spawn: no runner/preview (bases `empty-criteria` / `all-skip-with-basis`); post-run: the stage RAN but observed nothing (bases `all-skip-observed` / `no-rows-observed` / `all-retired-observed`) | merge-eligible |
+| `not_validated` (#2347, #3397, #3682) | PRE-SPAWN from the plan (no rows), OR POST-RUN when every laddered row (neither retired nor operator-added) is `skipped` / no rows were itemized / every itemized row was retired / every itemized row was operator-added or retired | verified nothing reviewed — pre-spawn: no runner/preview (bases `empty-criteria` / `all-skip-with-basis`); post-run: the stage RAN but observed no reviewed criterion in force (bases `all-skip-observed` / `no-rows-observed` / `all-retired-observed` / `added-only-observed`) | merge-eligible |
 | `undecidable` (#2512) | POST-RUN, from the agent's own rows | the stage ran and drove the preview; at least one row could not be decided | merge-eligible |
 | `failed` → `acceptance_triage` (#2474) | POST-RUN, from the agent's own rows | a criterion genuinely failed | blocked until arbitrated |
 
@@ -1849,16 +1877,45 @@ all, exactly the case an operator most needs described correctly. A row set
 containing an undecidable row can NEVER be recorded as `passed`, and an all-skip
 set can never be `passed` either: a green light over an unevaluated criterion is
 the dangerous direction, because nobody looks behind it. The seam layers the
-empty-row-set door on top (binding condition 1, #3397): an empty non-retired set
-is laddered against `not_validated` directly, so a shipped `passed` that itemized
-no rows records `not_validated` while a shipped `failed` with no rows stays
-`failed`. The empty non-retired set has TWO distinct origins, recorded under
-distinct bases so they stay tellable apart: `no-rows-observed` (the validator
-itemized nothing) and `all-retired-observed` (rows WERE itemized but the operator
-retired every one). The `all-retired-observed` origin is reachable only from a
-shipped `passed` — the #2581 downgrade's D3 precondition requires a surviving
-non-retired row, so an all-retired shipped `failed` never downgrades and the
-severity ladder leaves it `failed`.
+empty-row-set door on top (binding condition 1, #3397): an empty laddered set
+(no row that is neither retired nor operator-added) is laddered against
+`not_validated` directly, so a shipped `passed` that itemized no rows records
+`not_validated` while a shipped `failed` with no rows stays `failed`. The empty
+laddered set has THREE distinct origins, recorded under distinct bases so they
+stay tellable apart: `no-rows-observed` (the validator itemized nothing),
+`all-retired-observed` (rows WERE itemized but the operator retired every one)
+and `added-only-observed` (#3682: every itemized row was operator-added or
+retired, at least one added). The `all-retired-observed` origin is reachable only
+from a shipped `passed` — the #2581 downgrade's D3 precondition requires a
+surviving non-retired row, so an all-retired shipped `failed` never downgrades
+and the severity ladder leaves it `failed`. The `added-only-observed` origin is
+reachable from a shipped `passed`
+(`TestShipAcceptance_OnlyAddedRows_ShippedPassed_RecordsAddedOnlyBasis`,
+`TestShipAcceptance_OnlyAddedRows_WithRetired_RecordsAddedOnlyBasis`), from a
+#2581-downgraded `failed` whose surviving row was the added one
+(`TestShipAcceptance_RetiredFailedAddedPassed_ShippedFailed_RecordsNotValidated`),
+and from the #3682 R1 advisory-only shipped `failed`.
+
+**The #3682 R1 rule is the ONE deliberate softening of a shipped `failed` at this
+door.** A shipped `failed` whose itemized rows are all added or retired records
+`not_validated` (`added-only-observed`) and routes NO triage when all four
+conjuncts hold: at least one itemized added row, at least one failed row,
+`failure_mode` `assertion_fail`, and every reviewed criterion in force itemized
+(approval condition C1). Pinned by
+`TestShipAcceptance_OnlyAddedRows_ShippedFailed_RecordsNotValidated` and
+`TestShipAcceptance_RetiredFailedAddedFailed_ShippedFailed_RecordsNotValidated`.
+Every other shape keeps `failed`: `failure_mode` `error`
+(`TestShipAcceptance_OnlyAddedRows_ShippedFailedError_StaysFailed`), no failed
+row (`TestShipAcceptance_OnlyAddedRows_ShippedFailedNoFailedRow_StaysFailed`), a
+pure-retired itemization
+(`TestShipAcceptance_OnlyRetiredRows_EveryReviewedRetired_ShippedFailed_StaysFailed`,
+`TestShipAcceptance_AllRowsRetired_ShippedFailed_StaysFailed`), and an omitted
+live reviewed criterion
+(`TestShipAcceptance_OnlyAddedRows_ShippedFailed_OmitsLiveReviewed_StaysFailed`).
+Inside this door no reviewed row is laddered, so C1 holds only when every
+reviewed criterion was retired; the approval gate's R12
+(`acceptance_criteria_all_operator_authored`) refuses that chain beside an add,
+so on any gate-admitted chain R1 does not fire.
 
 The shipped-verdict/derived-verdict mismatch resolves SEVERITY-MONOTONE as a
 lower bound on the total order `passed < not_validated < undecidable < failed`:
@@ -1869,16 +1926,22 @@ recorded `passed` before #2512 and records `failed` now. That is a behaviour
 change on a pre-existing wire shape carrying no undecidable data, and it is
 deliberate — recording a pass over a row the agent itself reported failed was the
 dishonest direction. Pinned by
-`TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed`.
+`TestAcceptanceSeam_ShippedPassed_FailedRow_NowRecordsFailed`. Operator-added
+rows are carved out (#3682): they never feed the ladder, so a shipped `passed`
+whose only failed row is operator-added records `passed`
+(`TestShipAcceptance_AddedRowFailed_ShippedPassed_RecordsPassed`).
 
 `aggregateAcceptanceResults` is TOTAL and answers an EMPTY row set with `passed`.
 That answer is never taken as-is: its single call site guards on `len(rows) > 0`
-and, on an empty non-retired set, ladders the shipped verdict against
+and, on an empty laddered set, ladders the shipped verdict against
 `not_validated` DIRECTLY (#3397, binding condition 1) rather than calling the
 function — so a shipped `passed` with no rows records `not_validated`
 (`no-rows-observed`), a shipped `passed` whose every itemized row was retired
-records `not_validated` (`all-retired-observed`), and a shipped `failed` with no
-rows (or all rows retired) stays `failed`. The
+records `not_validated` (`all-retired-observed`), a shipped `passed` whose
+itemized rows are all operator-added or retired records `not_validated`
+(`added-only-observed`), and a shipped `failed` with no rows (or all rows
+retired) stays `failed`, except for the bounded #3682 R1 advisory-only shape
+above. The
 function's empty-set answer is pinned openly by
 `TestAggregateAcceptanceResults/EMPTY-row-set-answers-passed-the-documented-hazard`;
 the shipped-`failed`-with-no-rows anti-softening property by
@@ -1891,14 +1954,19 @@ all-retired origin (both directions) by
 
 **Ordering at the ingest seam is load-bearing.** The #2581 retired-criterion
 downgrade runs FIRST over the retired-id set; the ladder then runs over the
-NON-RETIRED rows only. If the ladder ran over all rows, a retired criterion's
+rows that are neither RETIRED nor OPERATOR-ADDED (#3682: the added-id set is
+resolved for every verdict, not only when the added-only downgrade fires). If the ladder ran over all rows, a retired criterion's
 undecidable row would pin the run to `undecidable` forever and the operator's
 retirement would have no effect
 (`TestDowngrade_RetiredCriterionUndecidableRow_DoesNotPinTheRun`, with its paired
 positive `TestDowngrade_SurvivingUndecidableOutsideRetirement_RecordsUndecidable`).
 `verdict_reported` is the ONE "what the agent said vs what was recorded" field
 and is present whenever the two differ, for either reason; `downgrade_basis` and
-`retired_criterion_ids` stay gated on an actual retirement.
+`retired_criterion_ids` stay gated on an actual retirement, and
+`added_criterion_ids` on an actual added-only downgrade. `added_criteria_failed`
+(#3682) is an additive, descriptive key naming every operator-added id reported
+`failed`, emitted whatever the recorded verdict and absent when no added row
+failed; nothing reads it to decide a verdict.
 
 ### Head binding: the consolidated fan-in fallback and the unbound-head clamp (#3091)
 

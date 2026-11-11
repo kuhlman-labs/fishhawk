@@ -1654,13 +1654,20 @@ Notes:
   RAN and shipped a verdict the ingest ladder recorded as `not_validated`, keyed
   by `basis` — `all-skip-observed` renders "Acceptance not validated —
   `<passed>`/`<total>` criteria verified (the validator skipped every
-  criterion)"; `no-rows-observed` renders "Acceptance not validated — the
+  reviewed criterion in force)" — scoped to reviewed criteria in force because a
+  passed operator-added or retired row is counted in `<passed>` but never feeds
+  the ladder (#3682); `no-rows-observed` renders "Acceptance not validated — the
   validator recorded no criteria (verified nothing)"; `all-retired-observed`
   (rows WERE itemized but the operator retired every one, so nothing non-retired
   remained) renders "Acceptance not validated — all `<total>` recorded criteria
   were retired (verified nothing)" — a DISTINCT sentence from `no-rows-observed`
   because criteria WERE recorded here, so claiming the validator "recorded no
-  criteria" would be inaccurate. Because the POST-RUN stage
+  criteria" would be inaccurate; `added-only-observed` (#3682: every itemized row
+  named an operator-added or retired criterion, at least one added) renders
+  "Acceptance not validated — no reviewed criterion in force was recorded (all
+  `<total>` recorded were operator-added or retired)", falling back to "Acceptance
+  not validated — no reviewed criterion in force was recorded (only
+  operator-added or retired ones)" when the total is zero. Because the POST-RUN stage
   actually ran, both observed rows ALSO append the transcript clause (below),
   which the pre-spawn row never carries. Neither shape reuses the "Acceptance
   recorded — `<outcome>` (`<passed>`/`<total>` criteria passed)" certification
@@ -1698,7 +1705,7 @@ Notes:
   headline. A PRE-SPAWN `not_validated` branch is untouched by construction
   (that verdict is minted pre-spawn and never carries a transcript); a POST-RUN
   `not_validated` (basis `all-skip-observed` / `no-rows-observed` /
-  `all-retired-observed`, #3397) DID run, so its observed row appends the
+  `all-retired-observed`, #3397; `added-only-observed`, #3682) DID run, so its observed row appends the
   transcript clause too. A payload with
   no transcript, or `transcript: null`, renders byte-identically to before.
   No `@`-mention is added, so `notifier.go` stays uninvolved (same exemption as
