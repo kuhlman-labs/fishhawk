@@ -83,13 +83,18 @@ const (
 )
 
 // mergeCandidateStateHeld is the start answer for a pass HELD behind its
-// base's live pass: no trigger, no re-open, no slot.
+// base's live pass: no trigger, no re-open, no slot. Nothing started also
+// covers #4811: an older UNDISPATCHED trigger the run's head has moved past is
+// settled superseded (not_executed) first, and an unreadable stage list or
+// chain turns the answer into a refusal (answerQueuedWithoutPass).
 const mergeCandidateStateHeld = "held"
 
 // mergeCandidateStateNotQueued is the start answer for a serialized pass whose
 // run is NOT merge-queue eligible (ADR-093 slice 1, E87.4 / #4295): no entry,
 // no trigger, no re-open, no slot. The run takes the line through
-// fishhawk_merge_run once it is eligible.
+// fishhawk_merge_run once it is eligible. As for held (#4811), an older
+// undispatched trigger the head has moved past is settled superseded first,
+// and an unreadable stage list or chain turns the answer into a refusal.
 const mergeCandidateStateNotQueued = "not_queued"
 
 // mergeCandidateNotQueuedNote is the not_queued answer's operator note.
@@ -231,6 +236,14 @@ type mergeCandidateAdmitResult struct {
 // pump's start answer. Live already (the run holds the line, e.g. its
 // operator rebased it again) → the pass is started for the new head directly,
 // which is where a pending pass's trigger is REPLACED (D2).
+//
+// #4811: the held and not_queued answers never reach begin's replacement arm,
+// so both route through answerQueuedWithoutPass (merge_candidate_supersede.go):
+// an older UNDISPATCHED pass whose head the run has since moved past is
+// settled not_executed (superseded) under the implement stage's admission
+// fence, so the slot waiter cannot dispatch it on the new branch. Nothing is
+// started either way; a stage-list or chain read error turns the answer into
+// a refusal (the caller holds and re-invokes fishhawk_rebase_run_branch).
 func (s *Server) serializeMergeCandidateVerifyPass(ctx context.Context, runID uuid.UUID,
 	p mergeCandidateVerifyParams, actor mergeCandidateActor) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
 	runRow, err := s.cfg.RunRepo.GetRun(ctx, runID)
@@ -253,7 +266,7 @@ func (s *Server) serializeMergeCandidateVerifyPass(ctx context.Context, runID uu
 	}
 	if active == nil {
 		if elig := s.mergeQueueAdmissionEligibility(ctx, runRow, p.HeadSHA); !elig.Eligible {
-			return &mergeCandidateVerifyStart{State: mergeCandidateStateNotQueued}, nil
+			return s.answerQueuedWithoutPass(ctx, runID, p.HeadSHA, &mergeCandidateVerifyStart{State: mergeCandidateStateNotQueued})
 		}
 	}
 
@@ -293,7 +306,7 @@ func (s *Server) serializeMergeCandidateVerifyPass(ctx context.Context, runID uu
 		return nil, &mergeCandidateVerifyRefusal{Reason: "the merge-candidate queue entry left the queue before its pass could start; read fishhawk_get_run_status for the reason"}
 	}
 	if st.Entry.State == mergequeue.StateHeld {
-		return &mergeCandidateVerifyStart{State: mergeCandidateStateHeld, Position: st.Position, LiveRunID: st.LiveRunID}, nil
+		return s.answerQueuedWithoutPass(ctx, runID, p.HeadSHA, &mergeCandidateVerifyStart{State: mergeCandidateStateHeld, Position: st.Position, LiveRunID: st.LiveRunID})
 	}
 
 	// The run already holds the line: start (or replace) its pass for this
@@ -928,9 +941,10 @@ func (s *Server) admitMergeCandidateEntryReclaimed(ctx context.Context, e mergeq
 		Branch: branch, BaseRef: e.BaseRef, HeadSHA: head, Cause: st.Cause,
 	}, mergeCandidateSystemActor())
 	if refusal != nil && refusal.Transient {
-		// #4391 (approval condition C1): begin's superseded-fix-up arm could not
-		// take the stage's admission fence within its bound; the next pump
-		// re-admits the entry.
+		// #4391 (approval condition C1): begin's superseded-fix-up arm, or its
+		// fenced PENDING REPLACEMENT arm (#4811), could not take the implement
+		// stage's admission fence within its bound; the next pump re-admits
+		// the entry, which stays held rather than ejected pass_not_startable.
 		return unadmit(refusal.Reason)
 	}
 	if refusal != nil {

@@ -20,7 +20,8 @@ settle carries.
   declared verify command → `not_required`, nothing queued; otherwise Enqueue
   (new → held at the tail; same base → re-anchored in place) and pump the
   base, then answer from the run's entry. HELD → start state `held` with its
-  position and the live run (no trigger, no re-open, no slot). Admitted by
+  position and the live run (no trigger, no re-open, no slot; an older stale
+  undispatched pass is settled first, see the #4811 bullet). Admitted by
   this pump → the admission's answer. Already live → the pass is started for
   the new head directly. `fan_in` is NOT serialized (it gates the
   consolidated review that precedes approval); it still routes through
@@ -32,7 +33,35 @@ settle carries.
   `pending`/`awaiting_host_dispatch` is replaced by appending a trigger for
   the new head carrying the old `prior_state`/`reparked_review_stage_id`;
   no second re-open. A dispatched/running pass keeps the "stage is in state"
-  refusal.
+  refusal. Since #4811 the arm runs under the implement stage's admission
+  fence when an Orchestrator is wired (`tryHoldStageAdmission`, bounded by
+  `stageAdmissionTryWait`, re-entrant on a fence-marked context): a fence it
+  cannot take answers a
+  `Transient` refusal naming the busy fence, so admission `Unadmit`s the entry
+  back to held rather than ejecting it `pass_not_startable`.
+- **Stale pending pass on held/not_queued (#4811).** The `held` and
+  `not_queued` answers return before `beginMergeCandidateVerifyPass`, so the
+  replacement arm above never runs on them. Both now return through
+  `answerQueuedWithoutPass` (`merge_candidate_supersede.go`): under the
+  implement stage's admission fence it settles an UNDISPATCHED pass
+  (`pending`/`awaiting_host_dispatch`) whose trigger names a head the run has
+  moved past — a recorded head write sequenced after the trigger, or the
+  producer's new head — as `merge_candidate_verified{not_executed}` with a
+  `superseded:` reason, restores the stage to the trigger's prior gate and
+  re-parks the review, so the slot waiter cannot dispatch the old pass on the
+  new branch. The settle is pinned to the checked trigger's sequence: a
+  replacement appended since detection stays live (`trigger_replaced`, nothing
+  written). A dispatched or running pass is left to its runner's `head_moved`
+  not_executed (#5164). A busy fence is a WARN with no settle (the
+  host-dispatch marker check is the backstop). Advance runs after the fence
+  is released, and only when the settle step is `settled` or
+  `restore_failed` (so the failure path stays in force), the caller did not
+  already hold the fence, and an Orchestrator is wired. An unreadable stage
+  list or merge-candidate chain turns the `held`/`not_queued` answer into a
+  refusal (nothing started; re-invoke
+  `fishhawk_rebase_run_branch`). Residual: the window between the record's
+  trigger read and its append is closed only by the process-local fence (one
+  fishhawkd per database).
 - **Pump + admission.** `pumpMergeCandidateQueue(base)` loops: a live entry
   whose run is terminal is dropped `run_terminal`; otherwise `AdmitNext`.
   `admitMergeCandidateEntry` re-reads the run and PR: run terminal → dropped
@@ -43,7 +72,8 @@ settle carries.
   (`fishhawk_rebase_run_branch` resolves and re-queues); then re-anchor and
   act on `mergeCandidateVerifyState`: unverified → start (refusal → ejected
   `pass_not_startable`, except a `Transient` refusal — begin's
-  superseded-fix-up arm missing its bounded admission fence, #4391 — which
+  superseded-fix-up arm, #4391, or its fenced pending-replacement arm, #4811,
+  missing its bounded admission fence — which
   `Unadmit`s like the transient failures below), in_flight → phase `verifying`, passed/not_required →
   phase `passed`, failed → ejected `verify_failed`. A TRANSIENT failure (run
   or PR unreadable, behind-probe error, non-conflict advance refusal,
@@ -176,7 +206,14 @@ settle carries.
   `AdmissionBranches` (already failed / in_flight / passed at admission, an
   unresolved post-merge head, a re-anchor error, no installation, and a
   pending-replacement trigger-append failure, which TODAY ejects
-  `pass_not_startable`).
+  `pass_not_startable`). #4811 adds the stale-pass producer arm through the
+  real rebase handler, each asserting the superseded row and the restored
+  stage BEFORE any host-dispatch marker POST:
+  `HeldRebaseSupersedesStalePendingTrigger`,
+  `NotQueuedRebaseSupersedesStalePendingTrigger` and
+  `HeldRebaseLeavesDispatchedPassToRunner` (the fixture wires no Orchestrator,
+  so the fence and Advance are pinned fake-backed in
+  `merge_candidate_supersede_test.go`).
 
 ### Scenario commits: exact-head classification ([ADR-142](../../../../docs/adr/142-merge-verification-after-scenario-commits.md), #4874)
 

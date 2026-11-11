@@ -3418,3 +3418,170 @@ func TestAdmission_A33Table(t *testing.T) {
 		})
 	}
 }
+
+// --- #4811: a held / not_queued answer settles a stale undispatched pass ---
+
+// seedStalePendingPass gives r's implement stage a live merge-candidate pass
+// for head BY CONSTRUCTION (a direct begin, cause fan_in, which the queue does
+// not serialize), then parks the stage at stageState as the slot waiter would.
+// It returns the trigger's chain sequence and asserts the precondition: the
+// trigger names head and is the stage's live trigger.
+func (f *mcqFixture) seedStalePendingPass(r *mcqRun, head string, stageState run.StageState) int64 {
+	f.t.Helper()
+	ctx := context.Background()
+	start, refusal := f.srv.beginMergeCandidateVerifyPass(ctx, r.id, mergeCandidateVerifyParams{
+		Branch: r.branch, BaseRef: mcqBase, HeadSHA: head, Cause: mergeCandidateCauseFanIn,
+	}, mergeCandidateSystemActor())
+	if refusal != nil || start == nil || !start.Triggered {
+		f.t.Fatalf("seed begin at %s = %+v / %+v, want a triggered pass", head, start, refusal)
+	}
+	f.setStage(r.impl.ID, stageState)
+	live, err := f.srv.liveMergeCandidateTrigger(ctx, r.id, r.impl.ID)
+	if err != nil || live == nil || live.payload.ExpectedHeadSHA != head {
+		f.t.Fatalf("precondition: live trigger = %+v / %v, want one for %s", live, err, head)
+	}
+	return live.sequence
+}
+
+// verdicts decodes r's merge_candidate_verified rows.
+func (f *mcqFixture) verdicts(r *mcqRun) []mergeCandidateVerifiedPayload {
+	f.t.Helper()
+	var out []mergeCandidateVerifiedPayload
+	for _, e := range f.rows(r, CategoryMergeCandidateVerified) {
+		var p mergeCandidateVerifiedPayload
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			f.t.Fatalf("decode verdict: %v", err)
+		}
+		out = append(out, p)
+	}
+	return out
+}
+
+// requireStaleSuperseded asserts the producer arm's COMMITTED state, read
+// before any host-dispatch marker POST so the marker guard (slice 2) cannot
+// mask a missing producer arm: one not_executed superseded row for the stale
+// trigger at oldHead, the trigger consumed, the implement stage back at the
+// trigger's prior gate with its review re-parked, and no trigger naming
+// newHead.
+func (f *mcqFixture) requireStaleSuperseded(r *mcqRun, triggerSeq int64, oldHead, newHead string) {
+	f.t.Helper()
+	v := f.verdicts(r)
+	if len(v) != 1 || v[0].Result != mergeCandidateResultNotExecuted ||
+		!strings.HasPrefix(v[0].Reason, mergeCandidateReasonSuperseded+":") ||
+		v[0].TriggerSequence != triggerSeq || v[0].HeadSHA != oldHead {
+		f.t.Fatalf("merge_candidate_verified rows = %+v, want one not_executed %q row for trigger %d at %s",
+			v, mergeCandidateReasonSuperseded, triggerSeq, oldHead)
+	}
+	if !strings.Contains(v[0].Reason, newHead) {
+		f.t.Errorf("superseded reason %q does not name the new head %s", v[0].Reason, newHead)
+	}
+	live, err := f.srv.liveMergeCandidateTrigger(context.Background(), r.id, r.impl.ID)
+	if err != nil || live != nil {
+		f.t.Errorf("live trigger after the answer = %+v / %v, want consumed", live, err)
+	}
+	if st := f.stageState(r.impl.ID); st != run.StageStateSucceeded {
+		f.t.Errorf("implement = %s, want the trigger's prior gate succeeded", st)
+	}
+	if st := f.stageState(r.review.ID); st != run.StageStateAwaitingApproval {
+		f.t.Errorf("review = %s, want re-parked awaiting_approval", st)
+	}
+	for _, tr := range f.triggers(r) {
+		if tr.ExpectedHeadSHA == newHead {
+			f.t.Errorf("a trigger names %s, want none (the answer started nothing)", newHead)
+		}
+	}
+}
+
+// requireMarkerRefusesRestored POSTs the host-dispatch marker for r's
+// implement stage AFTER the producer-arm assertions: the restored stage is in
+// no host-dispatchable state, so the generic 409 dispatch_not_admissible
+// answers and the stage is never dispatched.
+func (f *mcqFixture) requireMarkerRefusesRestored(r *mcqRun) {
+	f.t.Helper()
+	w := postHostDispatch(f.t, f.srv, r.id, r.impl.ID, withHostDispatchOperator)
+	if code, _ := decodeErrorDetails(f.t, w.Body.Bytes()); w.Code != http.StatusConflict || code != "dispatch_not_admissible" {
+		f.t.Fatalf("marker = %d %q:\n%s\nwant 409 dispatch_not_admissible", w.Code, code, w.Body.String())
+	}
+	if st := f.stageState(r.impl.ID); st == run.StageStateDispatched {
+		f.t.Fatalf("implement = %s after the marker, want never dispatched", st)
+	}
+}
+
+// TestMergeCandidateQueue_HeldRebaseSupersedesStalePendingTrigger (#4811): B
+// is held behind A and carries an undispatched pass for b1 (awaiting a host
+// slot). Its rebase moves the head to b2 and the queue answers held, which
+// never reaches begin's replacement arm; the producer arm on the held answer
+// settles the b1 trigger superseded, so the slot waiter cannot dispatch it on
+// the b2 branch. The real rebase handler, queue, audit and stage stores run.
+func TestMergeCandidateQueue_HeldRebaseSupersedesStalePendingTrigger(t *testing.T) {
+	f := newMCQFixture(t)
+	_, b := f.wave()
+	seq := f.seedStalePendingPass(b, "b1", run.StageStateAwaitingHostDispatch)
+	f.requireState(b, mergequeue.StateHeld, "")
+
+	f.behind(b, "b1", "b2")
+	resp := f.rebase(b)
+	if resp.MergeCandidateVerifyState != mergeCandidateStateHeld || resp.MergeCandidateVerifyTriggered ||
+		resp.MergeCandidateVerifyRefusal != "" {
+		t.Fatalf("B rebase = state %q triggered=%v refusal %q, want held, not triggered, no refusal",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyRefusal)
+	}
+	f.requireStaleSuperseded(b, seq, "b1", "b2")
+	if e := f.requireState(b, mergequeue.StateHeld, ""); e.AnchoredHeadSHA != "b2" {
+		t.Fatalf("B entry = %+v, want held at b2", e)
+	}
+	f.requireMarkerRefusesRestored(b)
+}
+
+// TestMergeCandidateQueue_NotQueuedRebaseSupersedesStalePendingTrigger
+// (#4811): the not_queued arm. An unapproved run (no queue entry) carries an
+// undispatched pass for n1; its rebase to n2 answers not_queued, and the
+// producer arm settles the n1 trigger superseded before answering.
+func TestMergeCandidateQueue_NotQueuedRebaseSupersedesStalePendingTrigger(t *testing.T) {
+	f := newMCQFixture(t)
+	r := f.seed("n", "n0", []byte(mqeSpecYAML))
+	f.behind(r, "n0", "n1")
+	if resp := f.rebase(r); resp.MergeCandidateVerifyState != mergeCandidateStateNotQueued {
+		t.Fatalf("precondition: first rebase = state %q, want not_queued (unapproved)", resp.MergeCandidateVerifyState)
+	}
+	seq := f.seedStalePendingPass(r, "n1", run.StageStateAwaitingHostDispatch)
+
+	f.behind(r, "n1", "n2")
+	resp := f.rebase(r)
+	if resp.MergeCandidateVerifyState != mergeCandidateStateNotQueued || resp.MergeCandidateVerifyTriggered ||
+		resp.MergeCandidateVerifyRefusal != "" {
+		t.Fatalf("rebase = state %q triggered=%v refusal %q, want not_queued, not triggered, no refusal",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyRefusal)
+	}
+	f.requireStaleSuperseded(r, seq, "n1", "n2")
+	if es := f.entries(r); len(es) != 0 {
+		t.Fatalf("queue entries = %+v, want none on not_queued", es)
+	}
+	f.requireMarkerRefusesRestored(r)
+}
+
+// TestMergeCandidateQueue_HeldRebaseLeavesDispatchedPassToRunner (#4811): a
+// DISPATCHED pass belongs to its runner (whose head_moved not_executed is the
+// guard there, #5164), so the held answer settles nothing and leaves the
+// stage dispatched with its trigger live.
+func TestMergeCandidateQueue_HeldRebaseLeavesDispatchedPassToRunner(t *testing.T) {
+	f := newMCQFixture(t)
+	_, b := f.wave()
+	seq := f.seedStalePendingPass(b, "b1", run.StageStateDispatched)
+
+	f.behind(b, "b1", "b2")
+	if resp := f.rebase(b); resp.MergeCandidateVerifyState != mergeCandidateStateHeld || resp.MergeCandidateVerifyRefusal != "" {
+		t.Fatalf("B rebase = state %q refusal %q, want held with no refusal",
+			resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyRefusal)
+	}
+	if v := f.verdicts(b); len(v) != 0 {
+		t.Fatalf("merge_candidate_verified rows = %+v, want none for a dispatched pass", v)
+	}
+	if st := f.stageState(b.impl.ID); st != run.StageStateDispatched {
+		t.Fatalf("implement = %s, want still dispatched", st)
+	}
+	live, err := f.srv.liveMergeCandidateTrigger(context.Background(), b.id, b.impl.ID)
+	if err != nil || live == nil || live.sequence != seq {
+		t.Fatalf("live trigger = %+v / %v, want the b1 trigger %d still live", live, err, seq)
+	}
+}
