@@ -99,6 +99,21 @@ The runner applies operator `--verify-cmd`/`--verify-timeout`/`--verify-max-iter
 
 `verify_max_iterations` (additive, optional, default 0, no version-enum bump) is consumed only by the committed-tree verify-fix loop on the implement push path — see `runner/cmd/fishhawk-runner/README.md` ("Committed-tree verify-fix loop") and `docs/ARCHITECTURE.md` §4 step 5.
 
+Both server prompt handlers (signed `GET /v0/stages/{id}/prompt` and unsigned `/prompt-render`) call `resolveVerifyConfig` BEFORE `Build` and set `Trigger.VerifyGateConfigured` from it (#5148): true when the run's own workflow-spec snapshot resolves a non-empty `executor.verify.command`, forced false on a conflict-resolution pass (the runner's `runConflictResolutionStage` returns before every verify gate). The field is server-internal, not on the wire. `false` is the FAIL-CLOSED default: a spec-parse failure, an absent `executor.verify`, or an unthreaded caller all render the run-the-full-verify-yourself arm. A merge-candidate verify pass needs no override: the runner runs the declared verify there (`runner/cmd/fishhawk-runner/mergecandidateverify.go`). **Accepted gap:** a runner-local `--verify-cmd` flag replaces the spec command (flag wins, above), so the prompt's "full verification" wording assumes the spec command is the one the runner runs; the server cannot see the flag.
+
+## Implement-prompt verify rules (#3315, #5148)
+
+`writeConcurrentVerifyRule` is the one shared writer of the `### Concurrent verify` block for both implement paths (`buildImplement` and the slim `buildImplementFixup`). Its first paragraph is the run-context rule, with two arms selected by `Trigger.VerifyGateConfigured`:
+
+- **Configured gate:** the runner's gate is the full verification of the change; inside the run the agent must not run the project's full verify gate itself, runs focused tests and a scoped verify instead, and treats a plan step or repository instruction calling for a full verify before push/PR as satisfied by the runner's gate.
+- **No configured gate (fail-closed):** a NEW instruction, not the pre-#5148 wording: no gate runs after the agent, so it runs the project's full verify itself before it finishes and reports the outcome. On the full implement path the report goes in the PR body's Test plan (there is no self-report sidecar there); on the fix-up path it goes in the self-report sidecar.
+
+The second paragraph (lock-held refusal is a fast failure; do not poll or retry) renders unchanged in both arms. The block stays repository-agnostic (no command, environment-variable or linter names): the repository's own guide names the commands — `docs/agents/verification.md` § Run-context rule in this repository.
+
+`writeFixupSelfReport` (fix-up only) follows the same field: under a configured gate `verify_status` reports the focused or scoped checks the agent actually ran, and the runner's gate remains the full verify (the agent is told not to run it to fill in the report); with no gate it reports the full verify the agent ran. The reviewer-facing `### Fix-up self-report divergence` block keeps its pinned sentences and gains one additive sentence: a `passed` claim against a `failed` gate can now be an honest gap in those checks rather than a misstatement.
+
+Pinned by `TestBuild_Implement_RunContextVerifyRule_*`, `TestBuild_ImplementFixup_RunContextVerifyRule_*`, `TestBuild_ImplementFixup_SelfReport_GateConfigured_ProductionShaped`, `TestBuild_ImplementFixup_SelfReport_GateUnconfigured`, `TestBuild_ConcurrentVerifyRule_StaysRepoAgnostic` and the extended `TestBuild_ImplementReview_GateEvidence_RendersFixupSelfReportDivergence` here, and by the handler tests `TestGetStagePromptRender_RunContextVerifyRule_*`, `TestGetStagePrompt_RunContextVerifyRule_SignedGateConfigured` and `TestGetStagePrompt_RunContextVerifyRule_ConflictResolutionFailsClosed` in `backend/internal/server/prompt_test.go`.
+
 ## Decomposition fan-out prompt resolution (#541/#676/#677)
 
 A decomposed child run (`runs.decomposed_from` set) is implement-only — no plan stage and no human approval gate of its own — so three plan-derived implement-prompt inputs resolve against the parent's approved plan/gate.

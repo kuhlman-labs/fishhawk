@@ -1212,6 +1212,20 @@ type Trigger struct {
 	// Grooming or Upkeep is ErrPlanForkConflict. No other stage renders its
 	// user reports — implement and implement-fixup above all (ADR-029).
 	Comms *CommsScanContext
+
+	// VerifyGateConfigured is true when the server resolved a non-empty
+	// executor.verify.command for this stage from the run's own workflow-spec
+	// snapshot (server resolveVerifyConfig, #5148). The runner then runs that
+	// command as its gate after the agent finishes: the committed-tree gate or
+	// verify-fix loop on a PR-opening implement push, or the single-shot
+	// working-tree gate on a --no-pr run. Both server prompt handlers force it
+	// false on a conflict-resolution pass, whose runner path runs no project
+	// verify. It selects the arm of writeConcurrentVerifyRule and
+	// writeFixupSelfReport. The zero value is the FAIL-CLOSED default: the
+	// prompt then tells the agent to run the full verify itself. It is
+	// server-derived from trusted spec data and never read from issue text or
+	// agent output.
+	VerifyGateConfigured bool
 }
 
 // UpkeepScanContext is the deterministic evidence the server gathered for an
@@ -2544,7 +2558,7 @@ func buildImplement(t Trigger) string {
 	// family as writeScopeAmendments — rendered here so the full implement path
 	// carries it, and identically in buildImplementFixup for the slim path.
 	writeWorkspaceHygiene(&b)
-	writeConcurrentVerifyRule(&b)
+	writeConcurrentVerifyRule(&b, t.VerifyGateConfigured)
 
 	// Scope self-exempt (#1153): the standalone open-PR path's escape hatch for
 	// a declared scope.files path the agent DELIBERATELY leaves unchanged. The
@@ -3810,9 +3824,23 @@ func writeWorkspaceHygiene(b *strings.Builder) {
 // project's verify command, so it names the BEHAVIOUR (a lock-held refusal) and
 // the correct response (narrow to package-scoped tests, report what you have)
 // rather than any particular command.
-func writeConcurrentVerifyRule(b *strings.Builder) {
+//
+// The first paragraph carries the run-context rule (#5148) and has two arms,
+// selected by gateConfigured (Trigger.VerifyGateConfigured, server-derived).
+// With a configured runner gate, the agent is told to keep its own checks
+// focused and scoped, that a plan or repository instruction to run the full
+// verify before push is met by the runner's gate in this run, and not to run
+// a second, concurrent full verify. Without one, the block FAILS CLOSED: the
+// agent is told no gate will run after it and that it must run the project's
+// full verify itself and report the outcome. The second paragraph (the
+// lock-refusal rule) renders in both arms unchanged.
+func writeConcurrentVerifyRule(b *strings.Builder, gateConfigured bool) {
 	b.WriteString("### Concurrent verify\n\n")
-	b.WriteString("After you finish, the runner runs the project's verify gate against the committed tree — you do not need to run the full gate yourself for it to happen. Do NOT start a second concurrent full verify while that one may be running: they contend on the same shared linter and test-container resources, and the loser fails for reasons that have nothing to do with your change.\n\n")
+	if gateConfigured {
+		b.WriteString("Run-context rule: this stage has a runner verify gate configured. After you finish, the runner runs that gate against your change under its own separate budget, and that run is the full verification of your change: a red result fails the stage or is fed back to you for a bounded fix iteration. So inside this run, do NOT run the project's full verify gate yourself. While you work, run focused tests over the code you changed and, where the project offers one, a verify scoped to the packages you touched. A repository instruction or plan step that calls for a full verify before pushing or before opening a pull request is satisfied by the runner's gate inside this run; running it yourself only spends your stage budget repeating the gate's work. Do NOT start a second concurrent full verify while the runner's may be running: they contend on the same shared linter and test-container resources, and the loser fails for reasons that have nothing to do with your change.\n\n")
+	} else {
+		b.WriteString("Run-context rule: this stage has no runner verify gate configured, so do not rely on one running after you finish. Run focused tests while you work, then run the project's full verify yourself before you finish, and report its outcome. If another full verify may already be running, do not start a second concurrent one: they contend on the same shared linter and test-container resources, and the loser fails for reasons that have nothing to do with your change.\n\n")
+	}
 	b.WriteString("If a verify command REFUSES with a message saying the lock is held or another verify is already running, that is a fast failure, NOT a queue: it will not clear by waiting. Do NOT poll it, retry it in a loop, or sleep-and-retry — that burns the stage budget on a refusal. Instead narrow to package-scoped tests over the packages you actually touched, and report the outcome you have along with the fact that the full gate was held by another invocation.\n")
 	b.WriteString("\n")
 }
@@ -3862,14 +3890,27 @@ func writeScopeSelfExempt(b *strings.Builder, t Trigger) {
 // is surfaced to the reviewer as an ADVISORY honesty cross-check. It NEVER fails,
 // re-opens, or re-budgets the pass — stated plainly so the agent is not nudged to
 // game it. Fix-up-only: NOT rendered by the full buildImplement prompt.
+//
+// Since #5148 the claim's meaning follows Trigger.VerifyGateConfigured: with a
+// configured runner gate the agent reports the focused or scoped checks it ran
+// (the runner's gate stays the full verify, and the agent is told not to
+// repeat it to fill in the report); without one, it reports the full verify it
+// ran itself.
 func writeFixupSelfReport(b *strings.Builder, t Trigger) {
 	path := FixupSelfReportPath(t.ImplementRunID, t.ImplementStageID)
 	b.WriteString("### Report your verify outcome\n\n")
-	b.WriteString("After you have made your change, run the project's verify gate and report the outcome you " +
-		"observed by writing a small JSON sidecar. This is an advisory honesty cross-check: the runner compares " +
-		"your claimed outcome against the verify outcome it independently computes on the committed tree, and " +
-		"surfaces any disagreement to the reviewer. It does NOT fail, re-open, or re-budget this pass — report " +
-		"truthfully.\n\n")
+	if t.VerifyGateConfigured {
+		b.WriteString("After you have made your change, report the outcome of " +
+			"the focused or scoped checks you actually ran" +
+			" by writing a small JSON sidecar. The runner's gate remains the full verify of your change; " +
+			"do not run the full gate yourself to fill in this report. ")
+	} else {
+		b.WriteString("After you have made your change, report the outcome of the full verify you ran by writing " +
+			"a small JSON sidecar. ")
+	}
+	b.WriteString("This is an advisory honesty cross-check: the runner compares your claimed outcome against any " +
+		"verify outcome it independently computes on your change, and surfaces any disagreement to the reviewer. " +
+		"It does NOT fail, re-open, or re-budget this pass — report truthfully.\n\n")
 	fmt.Fprintf(b, "Write a JSON sidecar to `%s` with this shape:\n\n", path)
 	b.WriteString("```json\n")
 	fmt.Fprintf(b, "{\"run_id\":%q,\"stage_id\":%q,\"verify_status\":\"passed\",\n"+
@@ -3879,8 +3920,8 @@ func writeFixupSelfReport(b *strings.Builder, t Trigger) {
 	b.WriteString("```\n\n")
 	b.WriteString("Rules:\n\n")
 	b.WriteString("- `run_id` and `stage_id` MUST be exactly the values shown above. A mismatch is ignored.\n")
-	b.WriteString("- `verify_status` MUST be one of exactly `passed` (the verify gate passed on your change) or " +
-		"`failed` (it did not). Any other value, or an absent sidecar, is ignored — no divergence is reported.\n")
+	b.WriteString("- `verify_status` MUST be one of exactly `passed` (the checks you ran passed on your change) or " +
+		"`failed` (one did not). Any other value, or an absent sidecar, is ignored — no divergence is reported.\n")
 	b.WriteString("- `counterfactuals` is OPTIONAL, but you MUST carry ONE entry per control this pass ADDED or " +
 		"TIGHTENED (any guard, validation, check, or refusal). Each entry is " +
 		"`{\"control_path\":\"...\",\"observed\":\"red\",\"restored\":true,\"record\":\"...\"}`. " +
@@ -4285,7 +4326,7 @@ func buildImplementFixup(t Trigger) string {
 	// rendered identically to the full implement path so a fix-up pass that
 	// compiles or downloads while verifying leaves no untracked build output.
 	writeWorkspaceHygiene(&b)
-	writeConcurrentVerifyRule(&b)
+	writeConcurrentVerifyRule(&b, t.VerifyGateConfigured)
 
 	// Advisory verify-outcome self-report (#1210): fix-up-only honesty cross-
 	// check, surfaced to the reviewer via gate_evidence. Placed after the scope
@@ -8228,7 +8269,10 @@ func writeGateEvidence(b *strings.Builder, ev *GateEvidence) {
 		b.WriteString("### Fix-up self-report divergence (advisory honesty flag)\n\n")
 		fmt.Fprintf(b, "On this fix-up pass the agent CLAIMED the verify gate `%s`, but the runner's "+
 			"committed-tree verify gate `%s`. The agent's self-reported outcome disagrees with the machine-"+
-			"verified outcome of the committed tree.\n\n",
+			"verified outcome of the committed tree. Since #5148 the agent is told to report the checks it "+
+			"actually ran, which on a stage with a configured verify gate are focused or scoped checks rather "+
+			"than the full gate, so a `passed` claim against a `failed` gate can be an honest gap in those "+
+			"checks rather than a misstatement.\n\n",
 			ev.FixupSelfReportDivergence.ClaimedVerifyStatus, ev.FixupSelfReportDivergence.ActualVerifyStatus)
 		b.WriteString("This is an ADVISORY signal — it did NOT fail or re-open the pass. Arbitrate it: the " +
 			"committed-tree verify outcome above is authoritative, so weigh whether the agent's change actually " +

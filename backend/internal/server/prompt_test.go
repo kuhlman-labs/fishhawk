@@ -18135,3 +18135,145 @@ func TestResolveAcceptanceRunBranchAndPR_DecomposedParent(t *testing.T) {
 		t.Errorf("ConsolidatedBranch = %q, want the literal %q", got, want)
 	}
 }
+
+// Run-context verify rule sentinels (#5148). The handler tests below pin the
+// cross-boundary seam: workflow spec → resolveVerifyConfig → handler →
+// Trigger.VerifyGateConfigured → rendered implement prompt.
+const (
+	runContextGateSentinel   = "do NOT run the project's full verify gate yourself"
+	runContextNoGateSentinel = "this stage has no runner verify gate configured"
+)
+
+// renderPromptForSpec drives the unsigned /prompt-render handler for an
+// implement stage whose run snapshot carries spec, and returns the prompt.
+func renderPromptForSpec(t *testing.T, spec string) string {
+	t.Helper()
+	s, rr, _, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	rr.runRow = &run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(spec),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+stageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	return resp.Prompt
+}
+
+// TestGetStagePromptRender_RunContextVerifyRule_GateConfigured: a spec
+// declaring executor.verify.command renders the configured-gate arm on the
+// unsigned preview.
+func TestGetStagePromptRender_RunContextVerifyRule_GateConfigured(t *testing.T) {
+	p := renderPromptForSpec(t, specWithVerifyYAML)
+	if !strings.Contains(p, runContextGateSentinel) {
+		t.Errorf("prompt-render with executor.verify lacks %q", runContextGateSentinel)
+	}
+	if strings.Contains(p, runContextNoGateSentinel) {
+		t.Errorf("prompt-render with executor.verify carries the fail-closed arm %q", runContextNoGateSentinel)
+	}
+}
+
+// TestGetStagePromptRender_RunContextVerifyRule_NoGate: a spec with no
+// executor.verify renders the fail-closed arm.
+func TestGetStagePromptRender_RunContextVerifyRule_NoGate(t *testing.T) {
+	p := renderPromptForSpec(t, planStageSpecYAML30m)
+	if !strings.Contains(p, runContextNoGateSentinel) {
+		t.Errorf("prompt-render without executor.verify lacks the fail-closed arm %q", runContextNoGateSentinel)
+	}
+	if strings.Contains(p, runContextGateSentinel) {
+		t.Errorf("prompt-render without executor.verify carries the configured-gate arm %q", runContextGateSentinel)
+	}
+}
+
+// TestGetStagePrompt_RunContextVerifyRule_SignedGateConfigured: the signed
+// /prompt endpoint the runner consumes renders the configured-gate arm.
+func TestGetStagePrompt_RunContextVerifyRule_SignedGateConfigured(t *testing.T) {
+	s, rr, sf, _ := newPromptServer(t)
+	runID := uuid.New()
+	stageID := uuid.New()
+	priv, _ := sf.issue(t, runID)
+	rr.runRow = &run.Run{
+		ID: runID, Repo: "x/y", WorkflowID: "feature_change",
+		TriggerSource: run.TriggerCLI, WorkflowSpec: []byte(specWithVerifyYAML),
+	}
+	rr.stage = &run.Stage{ID: stageID, RunID: runID, Type: run.StageTypeImplement}
+	w := promptRequest(t, s, runID, stageID, priv, "")
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	var resp promptResponse
+	if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	if !strings.Contains(resp.Prompt, runContextGateSentinel) {
+		t.Errorf("signed prompt with executor.verify lacks %q", runContextGateSentinel)
+	}
+}
+
+// TestGetStagePrompt_RunContextVerifyRule_ConflictResolutionFailsClosed (H1):
+// the runner routes an implement stage carrying a conflict-resolution
+// instruction to runConflictResolutionStage, which returns before every
+// verify gate. So even with executor.verify declared, both prompt endpoints
+// must render the fail-closed arm for such a pass. The fixture is identical to
+// the GateConfigured tests except for the live conflict trigger, so the
+// conflict override is the only thing that selects the fail-closed arm.
+func TestGetStagePrompt_RunContextVerifyRule_ConflictResolutionFailsClosed(t *testing.T) {
+	rr := newPromptRunRepo()
+	sf := newSigningFake()
+	art := newFakeArtifactRepo()
+	runID := uuid.New()
+	implStageID := uuid.New()
+	rr.stagesByRunID = map[uuid.UUID][]*run.Stage{
+		runID: {{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}},
+	}
+	rr.getRuns[runID] = &run.Run{
+		ID: runID, Repo: "o/r", WorkflowID: "feature_change",
+		WorkflowSpec: []byte(specWithVerifyYAML),
+	}
+	rr.getStages[implStageID] = &run.Stage{ID: implStageID, RunID: runID, Type: run.StageTypeImplement}
+	priv, _ := sf.issue(t, runID)
+	s := New(Config{
+		Addr: "127.0.0.1:0", RunRepo: rr, SigningRepo: sf, ArtifactRepo: art,
+		AuditRepo: &feedbackAuditRepo{byRunID: map[uuid.UUID][]*audit.Entry{runID: {
+			conflictTriggerEntry(runID, implStageID, 1, "fishhawk/run-1", "main", "head1"),
+		}}},
+	})
+	s.promptIssueGetterOverride = &stubIssueGetter{}
+
+	check := func(name string, w *httptest.ResponseRecorder) {
+		t.Helper()
+		if w.Code != http.StatusOK {
+			t.Fatalf("%s: status = %d, want 200:\n%s", name, w.Code, w.Body.String())
+		}
+		var resp promptResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("%s: decode: %v", name, err)
+		}
+		if !resp.ConflictResolution {
+			t.Fatalf("%s: conflict_resolution = false; fixture must carry a live trigger", name)
+		}
+		if resp.VerifyCommand == "" {
+			t.Fatalf("%s: verify_command empty; fixture must declare executor.verify", name)
+		}
+		if !strings.Contains(resp.Prompt, runContextNoGateSentinel) {
+			t.Errorf("%s: conflict-resolution pass lacks the fail-closed arm %q", name, runContextNoGateSentinel)
+		}
+		if strings.Contains(resp.Prompt, runContextGateSentinel) {
+			t.Errorf("%s: conflict-resolution pass carries the configured-gate arm %q", name, runContextGateSentinel)
+		}
+	}
+	check("signed /prompt", promptRequest(t, s, runID, implStageID, priv, ""))
+	req := httptest.NewRequest(http.MethodGet, "/v0/stages/"+implStageID.String()+"/prompt-render", nil)
+	w := httptest.NewRecorder()
+	s.Handler().ServeHTTP(w, req)
+	check("unsigned /prompt-render", w)
+}
