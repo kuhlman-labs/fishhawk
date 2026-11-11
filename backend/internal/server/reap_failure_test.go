@@ -1781,11 +1781,23 @@ var unconditionalAuditPayloadKeys = []string{
 	"auth_method", "detail", "exit_code", "failure_category", "reason", "reported_at", "run_id", "stage_id",
 }
 
-// (n11) The operator's binding CONDITION 2: an UNCONDITIONAL call's audit
-// payload key set is unchanged, byte-for-byte, by #2699 — no
-// "expected_state":"" key appears. Comparing the SORTED key set (not a
-// substring) is what makes the claim a fact: adding the key unconditionally
-// reddens this immediately.
+// reapOperatorEpisodeKeys are the two keys the OPERATOR arm adds on top of the
+// shared builder's keys (#4816): the failure episode its own CAS produced.
+var reapOperatorEpisodeKeys = []string{"failed_at", "retry_ordinal"}
+
+// (n11) The operator's binding CONDITION 2 of #2699: an UNCONDITIONAL call's
+// audit payload carries no "expected_state":"" key. Comparing the SORTED key
+// set (not a substring) is what makes the claim a fact: adding the key
+// unconditionally reddens this immediately.
+//
+// SUPERSESSION (#4816, ratified by the FO): the earlier "the unconditional key
+// set is unchanged" condition no longer holds for the OPERATOR arm, whose
+// dispatch_reaper_failed row is now unconditionalAuditPayloadKeys plus
+// reapOperatorEpisodeKeys (failed_at + retry_ordinal, read by
+// run.ReadInfraParkHistory). unconditionalAuditPayloadKeys itself is unchanged,
+// and TestReapStageFailure_UnshippedMarkerPayload_SharedWithReaperFailed still
+// pins the marker at exactly those keys, which proves the stamp is
+// handler-only.
 func TestReapStageFailure_UnconditionalAuditPayloadKeySet(t *testing.T) {
 	s, _, au, runID, stageID := reapServer(t, run.StageStateDispatched)
 
@@ -1808,11 +1820,11 @@ func TestReapStageFailure_UnconditionalAuditPayloadKeySet(t *testing.T) {
 		got = append(got, k)
 	}
 	sort.Strings(got)
-	want := append([]string(nil), unconditionalAuditPayloadKeys...)
+	want := append(append([]string(nil), unconditionalAuditPayloadKeys...), reapOperatorEpisodeKeys...)
 	sort.Strings(want)
 	if !reflect.DeepEqual(got, want) {
-		t.Errorf("unconditional dispatch_reaper_failed payload keys = %v, want %v "+
-			"(an unconditional call's payload must be unchanged by the expected_state feature)", got, want)
+		t.Errorf("unconditional operator dispatch_reaper_failed payload keys = %v, want %v "+
+			"(the shared builder's keys plus the #4816 episode keys; no expected_state on an unconditional call)", got, want)
 	}
 }
 
@@ -2946,4 +2958,239 @@ func TestReapStageFailure_RunnerSelfReportEndToEnd(t *testing.T) {
 	if curRun, _ := rr.GetRun(context.Background(), runID); curRun.State != run.StateFailed {
 		t.Errorf("run state = %q, want failed (Advance observed)", curRun.State)
 	}
+}
+
+// --- #4816 operator-only episode stamp ----------------------------------------
+
+// reapEpisodeRepo stamps EndedAt on a terminal TransitionStageFrom /
+// TransitionStageFromAttempt the way Postgres's UpdateStageState does (at
+// microsecond resolution); the shared orchestratorRepo fake leaves EndedAt nil,
+// which would make every stamp an empty string and mask the episode identity.
+type reapEpisodeRepo struct {
+	*orchestratorRepo
+}
+
+func (r *reapEpisodeRepo) stampEnded(st *run.Stage, from run.StageState) {
+	if st == nil || st.State == from || !st.State.IsTerminal() {
+		return
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	now := time.Now().UTC().Truncate(time.Microsecond)
+	st.EndedAt = &now
+}
+
+func (r *reapEpisodeRepo) TransitionStageFrom(ctx context.Context, id uuid.UUID, from, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	st, err := r.orchestratorRepo.TransitionStageFrom(ctx, id, from, to, c)
+	if err == nil {
+		r.stampEnded(st, from)
+	}
+	return st, err
+}
+
+func (r *reapEpisodeRepo) TransitionStageFromAttempt(ctx context.Context, id uuid.UUID, from, to run.StageState, expectedAttempt string, c *run.StageCompletion) (*run.Stage, error) {
+	st, err := r.orchestratorRepo.TransitionStageFromAttempt(ctx, id, from, to, expectedAttempt, c)
+	if err == nil {
+		r.stampEnded(st, from)
+	}
+	return st, err
+}
+
+// reapEpisodeServer is reapServer over reapEpisodeRepo, with the seeded stage at
+// retry ordinal 2 so the stamp's retry_ordinal is distinguishable from zero.
+func reapEpisodeServer(t *testing.T, stageState run.StageState) (*Server, *orchestratorRepo, *auditFake, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	base := newOrchestratorRepo()
+	rr := &reapEpisodeRepo{orchestratorRepo: base}
+	au := newAuditFake()
+	runRow := base.seedRun()
+	stage := base.seedStage(runRow.ID, 0, stageState)
+	base.mu.Lock()
+	stage.Type = run.StageTypeImplement
+	stage.SelfRetryCount = 2
+	base.mu.Unlock()
+	s := New(Config{
+		Addr:         "127.0.0.1:0",
+		RunRepo:      rr,
+		AuditRepo:    au,
+		Orchestrator: &orchestrator.Orchestrator{Runs: rr},
+	})
+	return s, base, au, runRow.ID, stage.ID
+}
+
+// reapPayloadMap decodes the single dispatch_reaper_failed row's payload.
+func reapPayloadMap(t *testing.T, au *auditFake) map[string]any {
+	t.Helper()
+	entries := reapAudit(au)
+	if len(entries) != 1 {
+		t.Fatalf("dispatch_reaper_failed entries = %d, want 1", len(entries))
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return payload
+}
+
+// requireReapStampedWithEpisode asserts the row's top-level failed_at /
+// retry_ordinal equal the failed stage's own episode, READ BACK from the repo
+// after the call (run.InfraParkEpisode over the committed row).
+func requireReapStampedWithEpisode(t *testing.T, rr *orchestratorRepo, stageID uuid.UUID, payload map[string]any) {
+	t.Helper()
+	cur, err := rr.GetStage(context.Background(), stageID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cur.State != run.StageStateFailed || cur.EndedAt == nil {
+		t.Fatalf("PRECONDITION: stage = %s ended_at=%v, want failed with ended_at set", cur.State, cur.EndedAt)
+	}
+	wantAt, wantOrdinal := run.InfraParkEpisode(cur)
+	if wantAt == "" {
+		t.Fatal("PRECONDITION: the failed stage's episode failed_at is empty")
+	}
+	if payload["failed_at"] != wantAt {
+		t.Errorf("payload failed_at = %v, want %q (the stage's own episode from the CAS-returned row)", payload["failed_at"], wantAt)
+	}
+	if got, ok := payload["retry_ordinal"].(float64); !ok || int(got) != wantOrdinal || wantOrdinal != 2 {
+		t.Errorf("payload retry_ordinal = %v, want %d (the stage's self_retry_count)", payload["retry_ordinal"], wantOrdinal)
+	}
+}
+
+// TestReapStageFailure_StampsOperatorFailureEpisode pins the #4816 episode
+// stamp (N1, N4): an OPERATOR reap that performs the failing transition stamps
+// its dispatch_reaper_failed row with the failed stage's episode, taken from
+// the row its own CAS returned; a run-bound runner self-report is never
+// stamped; an already-terminal no-op writes no row at all; and a caller cannot
+// supply the stamp.
+//
+// Arm "run-bound self-report" is the COUNTERFACTUAL VEHICLE for the `!runBound`
+// gate (CF-S1): its attempt pin matches, so the stage transitions and the CAS
+// returns a non-nil row, and the gate alone keeps the keys off. Arm "operator
+// unconditional" is the vehicle for the stamp assignment (CF-S2).
+func TestReapStageFailure_StampsOperatorFailureEpisode(t *testing.T) {
+	t.Run("operator unconditional", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateRunning)
+		w := postReapFailure(t, s, runID, stageID,
+			reapFailureRequest{Category: "C", Reason: run.InfraParkRunnerLostReason}, withReapOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		requireReapStampedWithEpisode(t, rr, stageID, reapPayloadMap(t, au))
+	})
+
+	// C2 pin: the conditional expected_state=dispatched operator reap (the
+	// fishhawk_reap_stage shape) is stamped too, alongside its pin.
+	t.Run("operator conditional expected_state=dispatched", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateDispatched)
+		w := postReapFailure(t, s, runID, stageID,
+			condReq("C", run.InfraParkRunnerLostReason, strptr("dispatched")), withReapOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		payload := reapPayloadMap(t, au)
+		if payload["expected_state"] != "dispatched" {
+			t.Errorf("expected_state = %v, want dispatched", payload["expected_state"])
+		}
+		requireReapStampedWithEpisode(t, rr, stageID, payload)
+	})
+
+	t.Run("operator session cookie", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateRunning)
+		w := postReapFailure(t, s, runID, stageID,
+			reapFailureRequest{Category: "C", Reason: run.InfraParkRunnerLostReason},
+			func(req *http.Request) *http.Request {
+				return req.WithContext(context.WithValue(req.Context(), ctxKeyIdentity, Identity{Subject: "github:ops"}))
+			})
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		requireReapStampedWithEpisode(t, rr, stageID, reapPayloadMap(t, au))
+	})
+
+	t.Run("run-bound self-report", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateRunning)
+		attempt := liveAttempt(t, rr, stageID)
+		if attempt == "" {
+			t.Fatal("PRECONDITION: seeded running stage carries no attempt stamp")
+		}
+		w := postReapFailureRaw(t, s, runID, stageID, selfReportBody(t, "running", attempt), withRunBoundToken(runID))
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp reapFailureResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if !resp.Transitioned {
+			t.Fatal("PRECONDITION: transitioned = false, want true (the CAS must return a row)")
+		}
+		if cur, _ := rr.GetStage(context.Background(), stageID); cur.EndedAt == nil {
+			t.Fatal("PRECONDITION: the failed stage carries no ended_at, so a stamp would be indistinguishable")
+		}
+		payload := reapPayloadMap(t, au)
+		if payload["reported_by"] != "runner" || payload["reported_attempt"] != attempt {
+			t.Errorf("provenance = %v/%v, want runner/%q", payload["reported_by"], payload["reported_attempt"], attempt)
+		}
+		for _, k := range reapOperatorEpisodeKeys {
+			if v, ok := payload[k]; ok {
+				t.Errorf("run-bound self-report payload carries %s = %v; a runner self-report must never produce parking evidence", k, v)
+			}
+		}
+	})
+
+	t.Run("already-terminal no-op", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateFailed)
+		w := postReapFailure(t, s, runID, stageID,
+			reapFailureRequest{Category: "C", Reason: run.InfraParkRunnerLostReason}, withReapOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		var resp reapFailureResponse
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		if resp.Transitioned {
+			t.Error("transitioned = true, want false on an already-terminal stage")
+		}
+		if got := reapAudit(au); len(got) != 0 {
+			t.Errorf("dispatch_reaper_failed entries = %d, want 0 (a stamped row exists only for a transition its own handler performed)", len(got))
+		}
+		if cur, _ := rr.GetStage(context.Background(), stageID); cur.EndedAt != nil {
+			t.Errorf("ended_at = %v, want unchanged nil", cur.EndedAt)
+		}
+	})
+
+	for _, raw := range []string{
+		`{"category":"C","reason":"runner_lost","failed_at":"2001-01-01T00:00:00Z"}`,
+		`{"category":"C","reason":"runner_lost","retry_ordinal":99}`,
+	} {
+		t.Run("caller-supplied stamp refused: "+raw, func(t *testing.T) {
+			s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateRunning)
+			w := postReapFailureRaw(t, s, runID, stageID, []byte(raw), withReapOperator)
+			if w.Code != http.StatusBadRequest {
+				t.Fatalf("status = %d, want 400:\n%s", w.Code, w.Body.String())
+			}
+			if code, _ := decodeReapError(t, w); code != "validation_failed" {
+				t.Errorf("code = %q, want validation_failed", code)
+			}
+			if cur, _ := rr.GetStage(context.Background(), stageID); cur.State != run.StageStateRunning || cur.EndedAt != nil {
+				t.Errorf("stage = %s ended_at=%v, want running/nil (nothing transitioned)", cur.State, cur.EndedAt)
+			}
+			if got := reapAudit(au); len(got) != 0 {
+				t.Errorf("dispatch_reaper_failed entries = %d, want 0", len(got))
+			}
+		})
+	}
+
+	t.Run("stamp smuggled in reason and detail is ignored", func(t *testing.T) {
+		s, rr, au, runID, stageID := reapEpisodeServer(t, run.StageStateRunning)
+		smuggled := "failed_at:2001-01-01T00:00:00Z retry_ordinal:99"
+		w := postReapFailure(t, s, runID, stageID,
+			reapFailureRequest{Category: "C", Reason: smuggled, Detail: `{"failed_at":"2001-01-01T00:00:00Z","retry_ordinal":99}`},
+			withReapOperator)
+		if w.Code != http.StatusOK {
+			t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+		}
+		payload := reapPayloadMap(t, au)
+		if payload["reason"] != smuggled {
+			t.Errorf("reason = %v, want the verbatim smuggled string", payload["reason"])
+		}
+		requireReapStampedWithEpisode(t, rr, stageID, payload)
+	})
 }
