@@ -2128,9 +2128,11 @@ func (s *Server) handleGetCampaignStatus(w http.ResponseWriter, r *http.Request)
 	}
 
 	// Monotone dependency refresh (E86.47 / #4358): re-read the tracker for
-	// unstarted members and ADD newly observed edges. Gated on account
-	// ownership + repo visibility and single-flight per campaign with a 30 s
-	// minimum interval; it never fails the read. A committed change re-reads
+	// unstarted members and ADD newly observed edges. Gated on write:campaigns
+	// (a read-scoped, run-bound or anonymous caller gets skipped_reason
+	// insufficient_scope and the persisted DAG), then on account ownership +
+	// repo visibility, and single-flight per campaign with a 30 s minimum
+	// interval; it never fails the read. A committed change re-reads
 	// the items (and, if that re-read fails, holds the committed edges on the
 	// stale slice, as the start path does); an UNcommitted one (audit or write
 	// failure) is held in every status response until a refresh records it,

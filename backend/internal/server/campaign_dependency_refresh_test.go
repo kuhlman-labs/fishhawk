@@ -16,7 +16,9 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/account"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/campaign"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mcptoken"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/workmgmt"
 )
 
@@ -674,6 +676,251 @@ func TestRefresh_FlagOffNoForgeRead(t *testing.T) {
 	items, _ := h.repo.ListCampaignItemsForCampaign(context.Background(), c.ID)
 	if res, err := h.s.refreshCampaignDependencies(context.Background(), c, items, dependencyRefreshOpts{trigger: refreshTriggerStart}); err != nil || res.Performed || h.res.callCount() != 0 {
 		t.Errorf("flag off core: %+v %v calls %d", res, err, h.res.callCount())
+	}
+	// The scope check sits AFTER the kill switch: a read-only poll with the flag
+	// off gets no block at all, not an insufficient_scope one.
+	code, ro := getRefreshStatus(t, h.s, c.ID, refreshReadOnlyIdentity(""))
+	if code != http.StatusOK || ro.DependencyRefresh != nil || h.res.callCount() != 0 {
+		t.Errorf("flag off, read-only poll: code %d block %+v resolver calls %d, want 200/nil/0", code, ro.DependencyRefresh, h.res.callCount())
+	}
+}
+
+// --- status trigger scope gate (E89.5 / #4571) ---
+
+// refreshReadOnlyIdentity is a bearer-token identity that can read but holds no
+// write:campaigns. acct is the account the token acts in ("" = untenanted).
+func refreshReadOnlyIdentity(acct string) Identity {
+	return Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{"read:runs", "read:audit"}, AccountID: acct}
+}
+
+// refreshWriteIdentity is an ordinary operator token holding write:campaigns.
+func refreshWriteIdentity(acct string) Identity {
+	return Identity{Subject: "github:op", TokenID: "tok", Scopes: []string{"write:campaigns"}, AccountID: acct}
+}
+
+// TestStatus_RefreshRequiresWriteCampaignsScope: the status trigger drives the
+// refresh only for a caller holding write:campaigns (a cookie session carries no
+// scope list and passes, as on the write routes); a read-scoped token, a
+// run-bound token even WITH the scope, and an anonymous caller still get a 200
+// and the persisted DAG, with the skip reason named and zero tracker reads,
+// zero appends and zero campaign_dependencies_refreshed rows. Every row builds
+// a FRESH harness whose tracker reports a new edge, so the identity is the only
+// variable: no min_interval slot, visibility filter or foreign account can mask
+// the scope control. The same-account rows seed the campaign's account
+// explicitly; the anonymous row's campaign is intentionally untenanted.
+func TestStatus_RefreshRequiresWriteCampaignsScope(t *testing.T) {
+	acct := testOperatorAccountID
+	runBound := "mcp:run:" + uuid.NewString()
+	for _, tc := range []struct {
+		name     string
+		ident    Identity
+		tenanted bool
+		allow    bool
+	}{
+		{"read_only_token", refreshReadOnlyIdentity(acct), true, false},
+		{"run_bound_no_scope", Identity{Subject: runBound, TokenID: "tok", Scopes: []string{"mcp:read"}, AccountID: acct}, true, false},
+		{"run_bound_with_write_campaigns", Identity{Subject: runBound, TokenID: "tok", Scopes: []string{"write:campaigns"}, AccountID: acct}, true, false},
+		{"anonymous", Identity{Subject: "anonymous"}, false, false},
+		{"write_campaigns_token", refreshWriteIdentity(acct), true, true},
+		{"cookie_session", testOperatorIdentity(), true, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			h := newRefreshHarness(t, Config{})
+			c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending), cItem("issue:11", nil, campaign.ItemStatePending))
+			if tc.tenanted {
+				h.repo.accounts[c.ID] = acct
+			}
+			h.res.deps[10] = []int{11}
+			code, st := getRefreshStatus(t, h.s, c.ID, tc.ident)
+			if code != http.StatusOK {
+				t.Fatalf("status code = %d, want 200 (the read is never refused)", code)
+			}
+			if st.DependencyRefresh == nil {
+				t.Fatal("dependency_refresh block missing")
+			}
+			rows := h.aud.count(categoryCampaignDependenciesRefreshed)
+			if tc.allow {
+				if !st.DependencyRefresh.Performed || st.DependencyRefresh.SkippedReason != "" || !st.DependencyRefresh.Committed {
+					t.Errorf("dependency_refresh = %+v, want performed and committed with no skip reason", st.DependencyRefresh)
+				}
+				if got := h.itemDeps(c.ID, "issue:10"); !containsRef(got, "issue:11") {
+					t.Errorf("committed depends_on = %v, want issue:11 added", got)
+				}
+				if rows != 1 {
+					t.Errorf("campaign_dependencies_refreshed rows = %d, want 1", rows)
+				}
+				return
+			}
+			if got := st.DependencyRefresh.SkippedReason; got != "insufficient_scope" {
+				t.Errorf("skipped_reason = %q, want %q", got, "insufficient_scope")
+			}
+			if st.DependencyRefresh.Performed || len(st.DependencyRefresh.Added) != 0 || st.DependencyRefresh.Committed {
+				t.Errorf("dependency_refresh = %+v, want not performed, nothing added, not committed", st.DependencyRefresh)
+			}
+			if n := h.res.callCount(); n != 0 {
+				t.Errorf("tracker reads = %d, want 0", n)
+			}
+			if n := h.rr.appendCount(); n != 0 {
+				t.Errorf("AppendCampaignItems calls = %d, want 0", n)
+			}
+			if rows != 0 {
+				t.Errorf("campaign_dependencies_refreshed rows = %d, want 0", rows)
+			}
+			if got := h.itemDeps(c.ID, "issue:10"); len(got) != 0 {
+				t.Errorf("persisted depends_on = %v, want empty (the persisted DAG is served)", got)
+			}
+			if !containsRef(st.Rollup.Eligible, "issue:10") {
+				t.Errorf("rollup eligible = %v, want issue:10 (persisted DAG)", st.Rollup.Eligible)
+			}
+		})
+	}
+}
+
+// TestStatus_RefreshScopeGate_ThroughRealMux is the cross-boundary pin: it
+// drives s.Handler() with a real Authorization header, crossing bearerAuth's
+// identity derivation, the mux, the handler, the gate and the JSON wire. The
+// campaign is untenanted (stubToken carries no AccountID), so only the scope
+// gate can deny. The no-header row also proves the anonymous route answers 200.
+func TestStatus_RefreshScopeGate_ThroughRealMux(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		bearer func(t *testing.T, mcp *fakeMCPTokenRepo, runs *fakeRepo, api *stubAPITokenRepo) string
+		api    *stubAPITokenRepo
+		allow  bool
+	}{
+		{"read_only_bearer", func(_ *testing.T, _ *fakeMCPTokenRepo, _ *fakeRepo, api *stubAPITokenRepo) string {
+			return api.tok.PlainText
+		}, stubToken("read:runs"), false},
+		{"run_bound_bearer_with_write_campaigns", func(t *testing.T, mcp *fakeMCPTokenRepo, runs *fakeRepo, _ *stubAPITokenRepo) string {
+			t.Helper()
+			runID := uuid.New()
+			// bearerAuth's fhm_ arm resolves the run's account: the run must exist.
+			runs.runs[runID] = &run.Run{ID: runID, State: run.StateRunning}
+			tok, err := mcp.Issue(context.Background(), mcptoken.IssueParams{RunID: runID, Scopes: []string{"mcp:read", "write:campaigns"}})
+			if err != nil {
+				t.Fatalf("issue run-bound token: %v", err)
+			}
+			return tok.PlainText
+		}, stubToken("read:runs"), false},
+		{"no_authorization_header", func(*testing.T, *fakeMCPTokenRepo, *fakeRepo, *stubAPITokenRepo) string { return "" }, stubToken("read:runs"), false},
+		{"write_campaigns_bearer", func(_ *testing.T, _ *fakeMCPTokenRepo, _ *fakeRepo, api *stubAPITokenRepo) string {
+			return api.tok.PlainText
+		}, stubToken("write:campaigns"), true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			mcp, runs := newFakeMCPTokenRepo(), newFakeRepo()
+			h := newRefreshHarness(t, Config{APITokenRepo: tc.api, MCPTokenRepo: mcp, RunRepo: runs})
+			c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending), cItem("issue:11", nil, campaign.ItemStatePending))
+			h.res.deps[10] = []int{11}
+			bearer := tc.bearer(t, mcp, runs, tc.api)
+
+			req := httptest.NewRequest(http.MethodGet, "/v0/campaigns/"+c.ID.String()+"/status", nil)
+			if bearer != "" {
+				req.Header.Set("Authorization", "Bearer "+bearer)
+			}
+			w := httptest.NewRecorder()
+			h.s.Handler().ServeHTTP(w, req)
+			if w.Code != http.StatusOK {
+				t.Fatalf("status = %d, want 200: %s", w.Code, w.Body.String())
+			}
+			var st refreshStatusBody
+			if err := json.Unmarshal(w.Body.Bytes(), &st); err != nil {
+				t.Fatalf("decode status: %v (%s)", err, w.Body.String())
+			}
+			if st.DependencyRefresh == nil {
+				t.Fatalf("dependency_refresh block missing: %s", w.Body.String())
+			}
+			if tc.allow {
+				if !st.DependencyRefresh.Performed || st.DependencyRefresh.SkippedReason != "" || !st.DependencyRefresh.Committed {
+					t.Errorf("dependency_refresh = %+v, want a committed refresh", st.DependencyRefresh)
+				}
+				if h.res.callCount() != 1 || h.aud.count(categoryCampaignDependenciesRefreshed) != 1 {
+					t.Errorf("resolver calls %d refresh rows %d, want 1/1", h.res.callCount(), h.aud.count(categoryCampaignDependenciesRefreshed))
+				}
+				return
+			}
+			if got := st.DependencyRefresh.SkippedReason; got != "insufficient_scope" {
+				t.Errorf("skipped_reason = %q, want %q", got, "insufficient_scope")
+			}
+			if h.res.callCount() != 0 || h.rr.appendCount() != 0 || h.aud.count(categoryCampaignDependenciesRefreshed) != 0 {
+				t.Errorf("denied caller drove resolver %d append %d refresh rows %d, want 0/0/0",
+					h.res.callCount(), h.rr.appendCount(), h.aud.count(categoryCampaignDependenciesRefreshed))
+			}
+		})
+	}
+}
+
+// TestStatus_ReadOnlyPollLeavesRefreshGateUntouched: a skipped read-only poll
+// does not stamp the interval slot or claim it. A cookie poll right after it, with
+// NO clock advance, still performs the refresh; a read-only poll inside the
+// interval, or while another refresh holds the slot, reports insufficient_scope
+// rather than min_interval or in_flight. The resolver count stays 1.
+func TestStatus_ReadOnlyPollLeavesRefreshGateUntouched(t *testing.T) {
+	h := newRefreshHarness(t, Config{})
+	c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending))
+	ro := refreshReadOnlyIdentity("")
+
+	_, st := getRefreshStatus(t, h.s, c.ID, ro)
+	if st.DependencyRefresh == nil || st.DependencyRefresh.SkippedReason != "insufficient_scope" {
+		t.Fatalf("first read-only poll: dependency_refresh = %+v, want insufficient_scope", st.DependencyRefresh)
+	}
+	st = mustStatus(t, h.s, c.ID)
+	if st.DependencyRefresh == nil || !st.DependencyRefresh.Performed || st.DependencyRefresh.SkippedReason != "" || h.res.callCount() != 1 {
+		t.Fatalf("cookie poll after a read-only one: dependency_refresh = %+v resolver calls %d, want performed with 1 call (the slot was not stamped)", st.DependencyRefresh, h.res.callCount())
+	}
+
+	// Inside the interval: the scope reason wins over min_interval.
+	_, st = getRefreshStatus(t, h.s, c.ID, ro)
+	if st.DependencyRefresh == nil || st.DependencyRefresh.SkippedReason != "insufficient_scope" {
+		t.Errorf("read-only poll inside the interval: dependency_refresh = %+v, want insufficient_scope", st.DependencyRefresh)
+	}
+
+	// Slot claimed by another refresh: the scope reason wins over in_flight.
+	h.clk.advance(campaignDependencyRefreshMinInterval)
+	if ok, _, _ := h.s.campaignRefreshGate.tryAcquire(c.ID, h.clk.now()); !ok {
+		t.Fatal("could not claim the slot")
+	}
+	_, st = getRefreshStatus(t, h.s, c.ID, ro)
+	if st.DependencyRefresh == nil || st.DependencyRefresh.SkippedReason != "insufficient_scope" {
+		t.Errorf("read-only poll while in flight: dependency_refresh = %+v, want insufficient_scope", st.DependencyRefresh)
+	}
+	h.s.campaignRefreshGate.release(c.ID, h.clk.now(), nil, nil)
+	if n := h.res.callCount(); n != 1 {
+		t.Errorf("resolver calls = %d, want 1 throughout", n)
+	}
+}
+
+// TestStatus_ReadOnlyPollNeitherCarriesNorClearsHold: a cookie poll observes an
+// edge it cannot record (the slot holds it). A read-only poll then reports
+// insufficient_scope with the PERSISTED DAG: no carried addition, no warning,
+// issue:10 eligible. It also does not clear the hold: a cookie poll inside the
+// interval still reports min_interval carrying the hold.
+func TestStatus_ReadOnlyPollNeitherCarriesNorClearsHold(t *testing.T) {
+	h := newRefreshHarness(t, Config{AuditRepo: failingAuditRepo{}})
+	c := h.seed(cItem("issue:10", nil, campaign.ItemStatePending), cItem("issue:11", nil, campaign.ItemStatePending))
+	h.res.deps[10] = []int{11}
+
+	st := mustStatus(t, h.s, c.ID)
+	if st.DependencyRefresh == nil || st.DependencyRefresh.Committed || len(st.DependencyRefresh.Added) != 1 {
+		t.Fatalf("cookie poll: dependency_refresh = %+v, want an uncommitted observation (the hold)", st.DependencyRefresh)
+	}
+
+	_, st = getRefreshStatus(t, h.s, c.ID, refreshReadOnlyIdentity(""))
+	d := st.DependencyRefresh
+	if d == nil || d.SkippedReason != "insufficient_scope" || len(d.Added) != 0 || len(d.Warnings) != 0 {
+		t.Fatalf("read-only poll: dependency_refresh = %+v, want insufficient_scope with no added and no warnings", d)
+	}
+	if !containsRef(st.Rollup.Eligible, "issue:10") {
+		t.Errorf("read-only poll: rollup eligible = %v, want issue:10 (the persisted DAG)", st.Rollup.Eligible)
+	}
+
+	st = mustStatus(t, h.s, c.ID)
+	d = st.DependencyRefresh
+	if d == nil || d.SkippedReason != refreshSkippedMinInterval || len(d.Added) != 1 || len(d.Warnings) == 0 {
+		t.Fatalf("cookie poll after a read-only one: dependency_refresh = %+v, want min_interval carrying the hold", d)
+	}
+	if containsRef(st.Rollup.Eligible, "issue:10") {
+		t.Errorf("cookie poll: rollup eligible = %v, want issue:10 held", st.Rollup.Eligible)
 	}
 }
 
