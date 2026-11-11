@@ -474,16 +474,18 @@ const (
 	mergeOnPassMerged mergeOnPassKind = "merged"
 	// mergeOnPassSettle: settle the entry State/Reason (SettleAt).
 	mergeOnPassSettle mergeOnPassKind = "settle"
-	// mergeOnPassReadvance: return the entry to held at its place (Unadmit)
-	// so its next admission re-advances it onto the moved base or head.
+	// mergeOnPassReadvance: return the entry to held at its place
+	// (UnadmitPassed, #4876) so its next admission re-advances it onto the
+	// moved base or head.
 	mergeOnPassReadvance mergeOnPassKind = "readvance"
 	// mergeOnPassAwaitApproval (ADR-112 R3 row 3): the fold is not approved
 	// and the reason waits at the head. The pump starts or continues the
 	// persisted approval wait (Store.ApprovalWait) outside the lock: before
 	// expiry the entry holds the line; at expiry it yields Yield.
 	mergeOnPassAwaitApproval mergeOnPassKind = "await_approval"
-	// mergeOnPassYield (ADR-112 R3 rows 2-4): yield Yield now (Store.Yield
-	// outside the lock); the pump continues to the next held entry.
+	// mergeOnPassYield (ADR-112 R3 rows 2-4): yield Yield now
+	// (Store.YieldPassed outside the lock, #4876); the pump continues to the
+	// next held entry.
 	mergeOnPassYield mergeOnPassKind = "yield"
 	// mergeOnPassRedecide (ADR-093 D8): the restart resume returned a merging
 	// entry with NO dispatch claim, or with an orphaned queue claim whose PR
@@ -868,7 +870,7 @@ func (s *Server) mergeOnPassEnforceGateWait(ctx context.Context, req mergeOnPass
 			}
 			cur = res.Entry
 		}
-		if !s.yieldMergeQueueEntry(lctx, cur, o.Yield, mergeQueueYieldSiteMergeOnPass) {
+		if !s.yieldMergeQueueEntry(lctx, cur, o.Yield, mergeQueueYieldSiteMergeOnPass, false) { // in-lock: the pre-yield refusal re-read phase passed
 			out = mergeOnPassExpiredWaitHeld(cur, mergeOnPassReasonEntryChanged, "the merge-gate yield did not land")
 			return nil
 		}
@@ -1164,8 +1166,26 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 	if s.settleMergeDispatchClaim(ctx, req.Ledger, claim, mergeErr) == mergeDispatchUncertain {
 		return held(mergeOnPassReasonTransient, "the pinned merge failed with an uncertain outcome; the dispatch claim is dispatch_failed: "+mergeErr.Error())
 	}
+	// The claim was RELEASED. #4876: the pump applies a readvance or a yield
+	// outside this lock with UnadmitPassed / YieldPassed, which move only a
+	// passed entry, so the 409 readvance and the row-4 yield first return the
+	// entry from merging to passed here, under the lock (the rule ADR-109 A2
+	// applies on the resume path: back to passed only once no claim stands).
+	// A missed write holds entry_changed: the entry stays merging with no
+	// claim, and the next pump's D8 resume returns it to passed (no_claim,
+	// redecide). This process's in-flight mark stays until the pump applied
+	// the outcome (ruling R8c), so a concurrent same-process pump skips the
+	// passed entry meanwhile. The ejection settle below needs no reset
+	// (SettleAt is phase-agnostic).
+	releasedToPassedHeld := func(outcome string) mergeOnPassOutcome {
+		return held(mergeOnPassReasonEntryChanged, "the forge refused the pinned merge and its claim was released, but the entry could not be "+
+			"returned to passed before the "+outcome+"; the next pump's resume returns it to passed: "+mergeErr.Error())
+	}
 	switch {
 	case errors.Is(mergeErr, forge.ErrMergeConflict):
+		if !s.mergeOnPassReleasedToPassed(ctx, e) {
+			return releasedToPassedHeld("readvance")
+		}
 		return readvance(mergeOnPassReasonForgeHeadMismatch,
 			"the forge refused the pinned merge because the head no longer matched "+head+": "+mergeErr.Error())
 	case errors.Is(mergeErr, forge.ErrPullRequestNotMergeable), errors.Is(mergeErr, forge.ErrMergeUnprocessable),
@@ -1175,6 +1195,9 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		if decision, status, ok := s.mergeOnPassRefusalNeedsReview(ctx, runRow); ok {
 			// ADR-112 R3 row 4: the claim was released (a typed RELEASE
 			// outcome above), so the entry yields approve_pr, never ejects.
+			if !s.mergeOnPassReleasedToPassed(ctx, e) {
+				return releasedToPassedHeld("forge_review_required yield")
+			}
 			return yield(mergeOnPassYield, newMergeQueueYield(mergeQueueYieldForgeReviewRequired,
 				fmt.Sprintf(mergeQueueYieldForgeRefusalDetail, nonEmpty(decision, "null"), nonEmpty(status, "null")), mergeQueueYieldRowForgeRefusal))
 		}
@@ -1205,6 +1228,23 @@ func (s *Server) mergeOnPassLocked(ctx context.Context, req mergeOnPassRequest, 
 		return out
 	}
 	return held(mergeOnPassReasonTransient, "the pinned merge failed: "+mergeErr.Error())
+}
+
+// mergeOnPassReleasedToPassed returns e from merging to passed at its
+// admission epoch after merge-on-pass RELEASED its own dispatch claim, so the
+// pump's out-of-lock UnadmitPassed / YieldPassed can apply the 409 readvance
+// or the row-4 yield (#4876). Called ONLY under the run's merge-intent lock,
+// the lock that guards SetPhase(merging) and ClaimMergeDispatch. false: the
+// write missed (logged); the caller holds entry_changed.
+func (s *Server) mergeOnPassReleasedToPassed(ctx context.Context, e mergequeue.Entry) bool {
+	if _, err := s.cfg.MergeQueue.SetPhase(ctx, e.ID, e.AdmissionEpoch, mergequeue.PhasePassed); err != nil { // #4876: the released claim returns the entry to passed
+		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+			"merge queue: the released claim's entry could not be returned to passed; merge-on-pass holds entry_changed",
+			slog.String("run_id", e.RunID.String()), slog.String("entry_id", e.ID.String()),
+			slog.Int64("admission_epoch", e.AdmissionEpoch), slog.String("error", err.Error()))
+		return false
+	}
+	return true
 }
 
 // mergeOnPassReleaseOrphanedClaim is ADR-109's one release body for a

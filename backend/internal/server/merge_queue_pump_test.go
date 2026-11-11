@@ -147,10 +147,11 @@ func TestMergeQueuePump_TransientAdmissionFailureDoesNotLoop(t *testing.T) {
 
 // TestMergeQueuePump_StaleReadvanceUnadmitConflicts is rejection item 1: a
 // live, passed, intent-bearing entry at h1, epoch N, whose base moved. Pump
-// B decides first and parks in its readvance Unadmit(N); pump A then runs to
-// completion (Unadmit(N), re-admission at N+1, the advance to h2, the pass
-// start). Released, B's stale Unadmit(N) is a CAS conflict and B stops: the
-// entry stays live, verifying at N+1, with ONE advance and ONE admission.
+// B decides first and parks in its readvance UnadmitPassed(N) (#4876); pump
+// A then runs to completion (UnadmitPassed(N), re-admission at N+1, the
+// advance to h2, the pass start). Released, B's stale UnadmitPassed(N) is a
+// CAS conflict and B stops: the entry stays live, verifying at N+1, with ONE
+// advance and ONE admission.
 func TestMergeQueuePump_StaleReadvanceUnadmitConflicts(t *testing.T) {
 	w := newMQMWorld(t)
 	r, req := w.ready("race", "h1", mcvUndelegatedSpecYAML)
@@ -161,17 +162,17 @@ func TestMergeQueuePump_StaleReadvanceUnadmitConflicts(t *testing.T) {
 	var once sync.Once
 	var bErr error
 	fs := &mcqFaultStore{Store: w.store}
-	fs.unadmitAt = func(ctx context.Context, id uuid.UUID, ep int64) (mergequeue.Entry, error) {
+	fs.unadmitPassedAt = func(ctx context.Context, id uuid.UUID, ep int64) (mergequeue.Entry, error) {
 		first := false
 		once.Do(func() { first = true })
 		if first {
 			close(entered)
 			<-release
-			e, err := w.store.Unadmit(ctx, id, ep)
+			e, err := w.store.UnadmitPassed(ctx, id, ep)
 			bErr = err
 			return e, err
 		}
-		return w.store.Unadmit(ctx, id, ep)
+		return w.store.UnadmitPassed(ctx, id, ep)
 	}
 	w.srv.cfg.MergeQueue = fs
 
@@ -183,7 +184,7 @@ func TestMergeQueuePump_StaleReadvanceUnadmitConflicts(t *testing.T) {
 	select {
 	case <-entered:
 	case <-time.After(timescale.D(30 * time.Second)):
-		t.Fatal("pump B never reached its readvance Unadmit")
+		t.Fatal("pump B never reached its readvance UnadmitPassed")
 	}
 
 	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
@@ -191,11 +192,11 @@ func TestMergeQueuePump_StaleReadvanceUnadmitConflicts(t *testing.T) {
 	select {
 	case <-bDone:
 	case <-time.After(timescale.D(30 * time.Second)):
-		t.Fatal("pump B did not return after its stale Unadmit")
+		t.Fatal("pump B did not return after its stale UnadmitPassed")
 	}
 
 	if !errors.Is(bErr, mergequeue.ErrStateConflict) {
-		t.Fatalf("B's stale Unadmit(%d) err = %v, want ErrStateConflict", epoch, bErr)
+		t.Fatalf("B's stale UnadmitPassed(%d) err = %v, want ErrStateConflict", epoch, bErr)
 	}
 	e := w.storeEntry(r)
 	if e.State != mergequeue.StateLive || e.Phase != mergequeue.PhaseVerifying || e.AdmissionEpoch != epoch+1 || e.AnchoredHeadSHA != "h2" {
@@ -232,8 +233,8 @@ func TestMergeQueuePump_ReadvanceCapped(t *testing.T) {
 
 	w.srv.pumpMergeCandidateQueue(context.Background(), req.Entry.Base())
 
-	if n := fs.called("Unadmit"); n != mergeQueueMaxReadvancesPerPump {
-		t.Fatalf("readvance Unadmits = %d, want %d (the per-pump bound): %v", n, mergeQueueMaxReadvancesPerPump, fs.names())
+	if n := fs.called("UnadmitPassed"); n != mergeQueueMaxReadvancesPerPump {
+		t.Fatalf("readvance UnadmitPassed calls = %d, want %d (the per-pump bound): %v", n, mergeQueueMaxReadvancesPerPump, fs.names())
 	}
 	if n := len(w.gh.mergeCalls()); n != mergeQueueMaxReadvancesPerPump {
 		t.Fatalf("advances = %d, want %d", n, mergeQueueMaxReadvancesPerPump)
@@ -371,6 +372,7 @@ func TestMCQFaultStore_NilEmbeddedReturnsNamedError(t *testing.T) {
 		"Enqueue":         func() error { _, err := fs.Enqueue(ctx, mergequeue.EnqueueRequest{}); return err },
 		"AdmitNext":       func() error { _, err := fs.AdmitNext(ctx, b); return err },
 		"Unadmit":         func() error { _, err := fs.Unadmit(ctx, id, 1); return err },
+		"UnadmitPassed":   func() error { _, err := fs.UnadmitPassed(ctx, id, 1); return err },
 		"SetPhase":        func() error { _, err := fs.SetPhase(ctx, id, 1, mergequeue.PhasePassed); return err },
 		"Reanchor":        func() error { _, err := fs.Reanchor(ctx, id, "h", ""); return err },
 		"ReanchorAt":      func() error { _, err := fs.ReanchorAt(ctx, id, 1, "h", ""); return err },
@@ -476,8 +478,12 @@ func TestMergeQueueMergeOnPass_RealLedger_HeadMismatchThenMerges(t *testing.T) {
 	if got := w.settledOutcomes(r); len(got) != 1 || got[0] != string(mergeDispatchRelease) {
 		t.Fatalf("merge_dispatch_settled outcomes = %v, want [released]", got)
 	}
+	// #4876: the decision itself returned the released entry to passed under
+	// the lock (no fixture phase write), so the next decision merges.
+	if e := w.storeEntry(r); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
+		t.Fatalf("entry after the 409 decision = %s/%s, want live/passed (the released claim returns it to passed)", e.State, e.Phase)
+	}
 	w.merger.err = nil
-	w.exec(`UPDATE merge_candidate_queue_entries SET phase = 'passed' WHERE run_id = $1 AND state = 'live'`, r.id)
 	req.Entry = w.active(r)
 	requireOutcome(t, w.decide(req), mergeOnPassMerged, mergeCandidateQueueReasonMergedByQueue)
 	w.requireMerges(2)

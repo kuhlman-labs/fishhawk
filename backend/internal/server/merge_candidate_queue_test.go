@@ -1411,14 +1411,18 @@ type mcqFaultStore struct {
 	unadmit   func(uuid.UUID) (mergequeue.Entry, error)
 	// unadmitAt, when set, replaces Unadmit with the caller's ctx and epoch
 	// (the barrier seam of merge_queue_pump_test.go); it wins over unadmit.
-	unadmitAt    func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error)
-	setPhase     func(uuid.UUID, mergequeue.Phase) (mergequeue.Entry, error)
-	reanchor     func(uuid.UUID, string, string) (mergequeue.Entry, error)
-	settle       func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
-	activeForRun func(uuid.UUID) (mergequeue.Status, bool, error)
-	activeBases  func() ([]mergequeue.Base, error)
-	markIntent   func(uuid.UUID) (mergequeue.MergeIntentResult, error)
-	intentLock   func(ctx context.Context, fn func(context.Context) error) error
+	unadmitAt func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error)
+	// unadmitPassedAt, when set, replaces UnadmitPassed (the merge-on-pass
+	// readvance's CAS since #4876) with the caller's ctx and epoch: the
+	// barrier seam of the readvance-path tests.
+	unadmitPassedAt func(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error)
+	setPhase        func(uuid.UUID, mergequeue.Phase) (mergequeue.Entry, error)
+	reanchor        func(uuid.UUID, string, string) (mergequeue.Entry, error)
+	settle          func(uuid.UUID, mergequeue.State, string) (mergequeue.SettleResult, error)
+	activeForRun    func(uuid.UUID) (mergequeue.Status, bool, error)
+	activeBases     func() ([]mergequeue.Base, error)
+	markIntent      func(uuid.UUID) (mergequeue.MergeIntentResult, error)
+	intentLock      func(ctx context.Context, fn func(context.Context) error) error
 }
 
 // mcqCall is one recorded store call: the method, the id it named (the entry
@@ -1527,6 +1531,17 @@ func (s *mcqFaultStore) Unadmit(ctx context.Context, id uuid.UUID, epoch int64) 
 		return mergequeue.Entry{}, errMCQNilStore
 	}
 	return s.Store.Unadmit(ctx, id, epoch)
+}
+
+func (s *mcqFaultStore) UnadmitPassed(ctx context.Context, id uuid.UUID, epoch int64) (mergequeue.Entry, error) {
+	s.record(ctx, "UnadmitPassed", id)
+	if s.unadmitPassedAt != nil {
+		return s.unadmitPassedAt(ctx, id, epoch)
+	}
+	if s.Store == nil {
+		return mergequeue.Entry{}, errMCQNilStore
+	}
+	return s.Store.UnadmitPassed(ctx, id, epoch)
 }
 
 func (s *mcqFaultStore) Reanchor(ctx context.Context, id uuid.UUID, headSHA, baseSHA string) (mergequeue.Entry, error) {
