@@ -1,0 +1,14 @@
+id: scenario:issue-5148/implement-prompt-fails-closed-without-gate
+statement: For an implement stage whose workflow spec declares no executor.verify command, the constructed implement prompt's '### Concurrent verify' section keeps the instruction to run the project's full verify before finishing ('this stage has no runner verify gate configured' and 'run the project's full verify yourself before you finish'). It does NOT carry the prohibition "do NOT run the project's full verify gate yourself", the retired clause 'you do not need to run the full gate yourself', or any `scripts/test` token.
+verify_hint: Materialize the `implement-running` seeded scenario (its implement stage declares no executor.verify) via POST /v0/dev/fixtures, then GET /v0/stages/{stage_id}/prompt-render for its implement stage id. The response is 200, and in the prompt text's '### Concurrent verify' section 'this stage has no runner verify gate configured' and 'run the project's full verify yourself before you finish' are present, while "do NOT run the project's full verify gate yourself", 'you do not need to run the full gate yourself' and 'scripts/test' are absent.
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"implement-running"} and take the implement stage id from the 201 body. 2) GET /v0/stages/{implement}/prompt-render. 3) Extract the ''### Concurrent verify'' section and check the five phrases. 4) Cross-check: signing-key, then /v0/dev/sign over ''prompt:<stage>'', then GET /v0/stages/{stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: no-gate wording and the full-verify-yourself instruction present; prohibition, retired clause and scripts/test absent
+    observed_at_record: '200. The section reads: ''Run-context rule: this stage has no runner verify gate configured, so do not rely on one running after you finish. Run focused tests while you work, then run the project''s full verify yourself before you finish, and report its outcome.'' The prohibition "do NOT run the project''s full verify gate yourself" is absent, as are the retired clause ''you do not need to run the full gate yourself'' and any ''scripts/test'' token anywhere in the prompt. The signed /prompt endpoint returns the same fail-closed wording.'
+    repro_handle: curl -s http://localhost:8090/v0/stages/<implement stage id>/prompt-render after seeding implement-running
+origin:
+    issue: 5148
+    pr: 5171
+    run_id: 8a172d58-d570-42ba-b7fa-33268a4758cc
+    head_sha: 7d2170ff21b6b9007a0a065b890c6ac284c0e0ce
+    recorded_at: 2026-11-11T13:33:50Z
