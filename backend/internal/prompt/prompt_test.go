@@ -12045,6 +12045,8 @@ func TestBuild_Acceptance_OperatorAddedCriterion_RendersAdvisoryBlock(t *testing
 		"They did NOT pass plan review",
 		"MUST validate and report each one",
 		"does not condemn the change",
+		"can neither escalate nor certify the verdict",
+		"a pass on one of them does not validate it",
 	} {
 		if !strings.Contains(got, want) {
 			t.Errorf("acceptance prompt missing %q\n---\n%s", want, got)

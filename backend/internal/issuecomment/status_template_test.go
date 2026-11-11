@@ -420,10 +420,22 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 		// shape. The basis value comes from the plan-package constant, so these
 		// double as the byte-identity pin for the package-local mirror.
 		{
-			name:     "all-skip-observed names the validator skipping every criterion",
+			name:     "all-skip-observed names the validator skipping every reviewed criterion in force",
 			category: "acceptance_outcome_recorded",
 			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllSkipObserved, "criteria_passed": 0, "criteria_total": 3},
-			want:     "Acceptance not validated — 0/3 criteria verified (the validator skipped every criterion)",
+			want:     "Acceptance not validated — 0/3 criteria verified (the validator skipped every reviewed criterion in force)",
+		},
+		{
+			// Approval condition C3 (#3682): a PASSED operator-added (or retired)
+			// row beside an all-skipped reviewed contract is counted in N/M but
+			// never feeds the ladder, so the recorded verdict is not_validated with
+			// a non-zero passed count. The parenthetical must scope the skip to the
+			// reviewed criteria in force, or "1/3 verified" beside "skipped every
+			// criterion" contradicts itself.
+			name:     "all-skip-observed with a passed advisory row scopes the skip to reviewed criteria",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllSkipObserved, "criteria_passed": 1, "criteria_total": 3},
+			want:     "Acceptance not validated — 1/3 criteria verified (the validator skipped every reviewed criterion in force)",
 		},
 		{
 			name:     "no-rows-observed names the validator recording no criteria",
@@ -451,12 +463,36 @@ func TestRenderStatusBody_AcceptanceActivity(t *testing.T) {
 			want:     "Acceptance not validated — every recorded criterion was retired (verified nothing)",
 		},
 		{
+			// added-only-observed (#3682): rows WERE recorded, but every one named an
+			// operator-added or retired criterion, so no reviewed criterion in force
+			// was evidenced. Built from the plan-package constant, so these rows
+			// double as the mirror pin.
+			name:     "added-only-observed names the missing reviewed criteria",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAddedOnlyObserved, "criteria_total": 2},
+			want:     "Acceptance not validated — no reviewed criterion in force was recorded (all 2 recorded were operator-added or retired)",
+		},
+		{
+			// The criteria_total == 0 fallback of the same branch (defensive: the
+			// basis implies rows were recorded), pinned like its all-retired peer.
+			name:     "added-only-observed with no tally falls back to the count-free sentence",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAddedOnlyObserved},
+			want:     "Acceptance not validated — no reviewed criterion in force was recorded (only operator-added or retired ones)",
+		},
+		{
+			name:     "added-only-observed appends the transcript clause",
+			category: "acceptance_outcome_recorded",
+			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAddedOnlyObserved, "criteria_total": 1, "transcript": map[string]any{"artifact_id": "abc123"}},
+			want:     "Acceptance not validated — no reviewed criterion in force was recorded (all 1 recorded were operator-added or retired); transcript /v0/artifacts/abc123",
+		},
+		{
 			// A POST-RUN not_validated DID run, so it can carry a transcript — the
 			// pre-spawn variant never does. The clause must append here.
 			name:     "all-skip-observed appends the transcript clause",
 			category: "acceptance_outcome_recorded",
 			payload:  map[string]any{"outcome": plan.AcceptanceOutcomeNotValidated, "basis": plan.AcceptanceBasisAllSkipObserved, "criteria_passed": 0, "criteria_total": 2, "transcript": map[string]any{"artifact_id": "abc123"}},
-			want:     "Acceptance not validated — 0/2 criteria verified (the validator skipped every criterion); transcript /v0/artifacts/abc123",
+			want:     "Acceptance not validated — 0/2 criteria verified (the validator skipped every reviewed criterion in force); transcript /v0/artifacts/abc123",
 		},
 		// #2512: the ladder-derived undecidable outcome renders its OWN row.
 		// Same construction as the not_validated rows above — the outcome value

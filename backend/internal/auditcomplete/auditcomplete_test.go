@@ -264,6 +264,7 @@ func TestCompute_AcceptanceShortCircuit_ExemptsTraceRule(t *testing.T) {
 		{name: "all-skip-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisAllSkipObserved)},
 		{name: "no-rows-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisNoRowsObserved)},
 		{name: "all-retired-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisAllRetiredObserved)},
+		{name: "added-only-observed basis -> trace_missing", payload: shortCircuitPayload(t, plan.AcceptanceBasisAddedOnlyObserved)},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			runID, accID, d := buildWithPayload(t, tc.payload)

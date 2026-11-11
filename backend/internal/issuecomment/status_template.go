@@ -797,7 +797,8 @@ func renderAcceptanceLine(verb string) string {
 // contradicts its own headline. The not_validated branch now has TWO shapes
 // (#3397): a PRE-SPAWN verdict (empty/absent basis) is byte-identical to
 // before and carries no transcript, while a POST-RUN verdict (basis
-// all-skip-observed / no-rows-observed) DID run and so appends the transcript
+// all-skip-observed / no-rows-observed / all-retired-observed /
+// added-only-observed) DID run and so appends the transcript
 // clause on its own honest wording.
 func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 	a := decodeAcceptanceActivity(payload)
@@ -816,7 +817,11 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 		// pre-spawn "the plan declared none" / "all criteria skip-expected".
 		switch a.basis {
 		case acceptanceBasisAllSkipObserved:
-			return fmt.Sprintf("Acceptance not validated — %d/%d criteria verified (the validator skipped every criterion)",
+			// "every reviewed criterion in force" (#3682): a passed operator-added
+			// or retired row beside an all-skipped reviewed contract is counted in
+			// N/M but never feeds the ladder, so the wording must not claim the
+			// validator skipped every row.
+			return fmt.Sprintf("Acceptance not validated — %d/%d criteria verified (the validator skipped every reviewed criterion in force)",
 				a.criteriaPassed, a.criteriaTotal) + acceptanceTranscriptClause(a)
 		case acceptanceBasisNoRowsObserved:
 			return "Acceptance not validated — the validator recorded no criteria (verified nothing)" + acceptanceTranscriptClause(a)
@@ -828,6 +833,15 @@ func renderAcceptanceOutcomeLine(payload json.RawMessage) string {
 					a.criteriaTotal) + acceptanceTranscriptClause(a)
 			}
 			return "Acceptance not validated — every recorded criterion was retired (verified nothing)" + acceptanceTranscriptClause(a)
+		case acceptanceBasisAddedOnlyObserved:
+			// #3682: rows WERE recorded, but every one named an operator-added
+			// (advisory) or retired criterion, so no reviewed criterion in force
+			// was evidenced.
+			if a.criteriaTotal > 0 {
+				return fmt.Sprintf("Acceptance not validated — no reviewed criterion in force was recorded (all %d recorded were operator-added or retired)",
+					a.criteriaTotal) + acceptanceTranscriptClause(a)
+			}
+			return "Acceptance not validated — no reviewed criterion in force was recorded (only operator-added or retired ones)" + acceptanceTranscriptClause(a)
 		}
 		// PRE-SPAWN not_validated: byte-identical to before — no transcript.
 		line := "Acceptance not validated — 0 criteria verified (the plan declared none)"
@@ -904,10 +918,15 @@ const acceptanceOutcomeNotValidated = "not_validated"
 // because rows WERE recorded — the render must not claim "recorded no criteria".
 // Mirrored (not imported) like its peers and pinned against
 // plan.AcceptanceBasisAllRetiredObserved by status_template_test.go.
+// acceptanceBasisAddedOnlyObserved mirrors the #3682 fourth POST-RUN basis:
+// every itemized row named an operator-added or retired criterion, at least one
+// added, so no reviewed criterion in force was recorded. Pinned against
+// plan.AcceptanceBasisAddedOnlyObserved by the render table's added-only rows.
 const (
 	acceptanceBasisAllSkipObserved    = "all-skip-observed"
 	acceptanceBasisNoRowsObserved     = "no-rows-observed"
 	acceptanceBasisAllRetiredObserved = "all-retired-observed"
+	acceptanceBasisAddedOnlyObserved  = "added-only-observed"
 )
 
 // acceptanceOutcomeUndecidable is the `outcome` value the acceptance ingest
