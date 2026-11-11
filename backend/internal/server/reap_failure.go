@@ -261,6 +261,12 @@ type reapFailureResponse struct {
 // stage is the same benign no-op (#1891): that state is a live decomposition
 // park owned by its children, and failing it would destroy the fan-in park a
 // doomed mis-dispatched runner never owned.
+//
+// An OPERATOR-scoped reap (a write:runs token or a session) that performs the
+// failing transition stamps its dispatch_reaper_failed row with the failed
+// stage's episode (failed_at + retry_ordinal, run.InfraParkEpisode over the
+// row the CAS returned). The stamp's only reader is run.ReadInfraParkHistory
+// (#4816); the run-bound self-report arm is never stamped.
 func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) {
 	if s.cfg.RunRepo == nil || s.cfg.AuditRepo == nil {
 		s.writeError(w, r, http.StatusServiceUnavailable, "reap_failure_unconfigured",
@@ -547,7 +553,8 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	// dispatched → running → failed), so the spawn-phase 'dispatched' case is
 	// handled — but, UNLIKE run.FailStage, it refuses to re-anchor into any
 	// protected park that lands mid-transition (GUARD 2, #2630).
-	if _, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason, conditional, expectedAttempt); err != nil {
+	failed, err := failStageForReap(r.Context(), s.cfg.RunRepo, stageID, stage.State, cat, req.Reason, conditional, expectedAttempt)
+	if err != nil {
 		// (d) WIRING FAULT — the run repository does not implement
 		// run.StageCASTransitioner (#2672). This is classified FIRST, ahead of
 		// the re-load below, and is load-bearing: the re-load's terminal-or-park
@@ -681,23 +688,39 @@ func (s *Server) handleReapStageFailure(w http.ResponseWriter, r *http.Request) 
 	stageIDCopy := stageID
 	systemKind := audit.ActorSystem
 	payload := reapFailureAuditPayload(runID, stageID, cat, req)
-	// expected_state is added ONLY for a conditional call, so the UNCONDITIONAL
-	// payload's key set is byte-for-byte what it was before #2699 — "unconditional
-	// callers are unaffected" stays a fact rather than an assertion. An
-	// unconditionally-present "expected_state":"" would silently change an existing
-	// observable payload; TestReapStageFailure_UnconditionalAuditPayloadKeySet pins
-	// the key set against the recorded pre-change list.
+	// expected_state is added ONLY for a conditional call, so an unconditional
+	// call never carries an "expected_state":"" key. The OPERATOR payload's key
+	// set is the shared builder's keys plus the two #4816 episode keys below — a
+	// CONSCIOUS supersession, ratified by the FO for #4816, of the earlier
+	// "unconditional key set is unchanged" condition (#2699).
+	// TestReapStageFailure_UnconditionalAuditPayloadKeySet pins that set against
+	// the recorded pre-change list plus failed_at and retry_ordinal.
 	if conditional {
 		payload["expected_state"] = string(expected)
 	}
-	// Run-bound self-report provenance (#3598) — added on that arm ONLY, so the
-	// operator payload's key set (shared builder, pinned by
-	// _UnconditionalAuditPayloadKeySet) does not grow. Both values derive from
-	// the VERIFIED identity and the VERIFIED attempt precondition, never from a
-	// caller-supplied provenance field.
+	// Run-bound self-report provenance (#3598) — added on that arm ONLY. Both
+	// values derive from the VERIFIED identity and the VERIFIED attempt
+	// precondition, never from a caller-supplied provenance field. The run-bound
+	// arm's key set does not grow under #4816: it gets no episode stamp.
 	if runBound {
 		payload["reported_by"] = "runner"
 		payload["reported_attempt"] = expectedAttempt
+	}
+	// #4816 episode stamp — OPERATOR arm only (N1). failed_at + retry_ordinal
+	// identify the failure episode THIS handler's own CAS produced
+	// (run.InfraParkEpisode over the RETURNING row: ended_at, self_retry_count),
+	// never a request field — the body decoder disallows unknown fields and
+	// reapFailureRequest has none of these. Its only reader is
+	// run.ReadInfraParkHistory, which lets an operator runner_lost reap of a live
+	// merge-candidate verify-only pass park the run instead of failing it. A
+	// run-bound self-report gets no stamp, so a runner never produces parking
+	// evidence; the dispatch watchdog writes none either. Handler-only, NOT in
+	// reapFailureAuditPayload: the acceptance_verdict_unshipped marker shares
+	// that builder, performs no transition and keeps its key set.
+	if !runBound && failed != nil {
+		failedAt, retryOrdinal := run.InfraParkEpisode(failed)
+		payload["failed_at"] = failedAt
+		payload["retry_ordinal"] = retryOrdinal
 	}
 	auditPayload, _ := json.Marshal(payload)
 	if _, err := s.cfg.AuditRepo.AppendChained(r.Context(), audit.ChainAppendParams{
@@ -762,7 +785,7 @@ func (s *Server) writeStageAttemptSuperseded(w http.ResponseWriter, r *http.Requ
 //   - no LIVE marker already exists (idempotence: the reaper's bounded retry
 //     and a watchdog race must not stack markers).
 //
-// The payload is the dispatch_reaper_failed key set (run_id, stage_id,
+// The payload is the shared reap key set (run_id, stage_id,
 // failure_category, reason, detail, exit_code, reported_at, auth_method) so
 // the reaper's failure line is preserved verbatim on the chain — built by the
 // SAME reapFailureAuditPayload builder the dispatch_reaper_failed append uses,
@@ -840,12 +863,14 @@ func (s *Server) recordAcceptanceVerdictUnshipped(ctx context.Context, runID uui
 // only). One const so the two payloads cannot disagree (E72.12 / #3458).
 const reapFailureAuthMethod = "bearer"
 
-// reapFailureAuditPayload builds the UNCONDITIONAL reap-failure audit payload
+// reapFailureAuditPayload builds the SHARED reap-failure audit payload
 // (run_id, stage_id, failure_category, reason, detail, exit_code, reported_at,
-// auth_method) shared by the dispatch_reaper_failed append and the
-// acceptance_verdict_unshipped marker (E72.12 / #3458). The conditional
-// caller adds expected_state on top; the key set here is exactly what
-// TestReapStageFailure_UnconditionalAuditPayloadKeySet pins.
+// auth_method) used by the dispatch_reaper_failed append and the
+// acceptance_verdict_unshipped marker (E72.12 / #3458). The builder's key set
+// is exactly what TestReapStageFailure_UnshippedMarkerPayload_SharedWithReaperFailed
+// pins for the marker. handleReapStageFailure adds on top: expected_state on a
+// conditional call, reported_by + reported_attempt on the run-bound arm, and
+// the #4816 episode keys failed_at + retry_ordinal on the operator arm.
 func reapFailureAuditPayload(runID, stageID uuid.UUID, cat run.FailureCategory, req reapFailureRequest) map[string]any {
 	return map[string]any{
 		"run_id":           runID.String(),
