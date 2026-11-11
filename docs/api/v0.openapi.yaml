@@ -16206,7 +16206,9 @@ paths:
         re-invoke the merge; without the seam, re-invoke once the entry's pass
         is green. An INELIGIBLE or undeterminable run keeps
         the 409 above, byte-for-byte, plus the additive
-        `details.merge_queue_ineligible` reason codes, with nothing written.
+        `details.merge_queue_ineligible` reason codes, with no verdict, intent
+        or queue row written (the eligibility predicate's concern leg may
+        idempotently import child-slice concerns into the parent ledger).
         `merge_candidate_verify_failed` and `merge_candidate_check_failed`
         are never enqueued. Eligibility also refuses `changes_requested` (a
         reviewer's latest non-comment review is CHANGES_REQUESTED), and the
@@ -16579,8 +16581,9 @@ paths:
             `merge_queue_ineligible` array of reason codes — `not_approved`,
             `review_pending`, `review_coverage_incomplete`,
             `acceptance_not_eligible`, `acceptance_stale`, `checks_not_green`,
-            `checks_red`, `blocking_concern_open`, `undeterminable` (a read
-            failed: fail closed) — and nothing is written.
+            `checks_red`, `blocking_concern_open`, `undeterminable` (a read or
+            the concern leg's child-slice reconcile failed: fail closed) — and
+            no verdict, intent or queue row is written.
             (12) The merge overlap guard (#4119) refused, checked after case
             (4) and before case (7a), with NO new verdict row, nothing
             dispatched or enqueued. `overlapping_implement_in_flight`:
