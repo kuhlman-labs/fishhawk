@@ -139,7 +139,30 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
   `acceptance_pull_request_number` from the reported-head ledger
   (`resolveAcceptanceRunBranchAndPR` — the newest `lineageLedgerCategories`
   entry's `branch`, the newest `pull_request_opened` entry's `pr_number`; 0 =
-  unresolvable, NEVER the issue number), `acceptance_criteria` (the EFFECTIVE
+  unresolvable, NEVER the issue number). A DECOMPOSED PARENT writes no
+  ledger branch and no `pull_request_opened` row (#4874): with no ledger
+  branch and any `integration_commit_recorded` row, the branch is the
+  server-derived `orchestrator.ConsolidatedBranch` (`fishhawk/run-<first 8>-consolidated`,
+  never taken from a report), and a known branch with an unresolved number
+  reads the run row's `pull_request_url` through a nil-safe lookup
+  (`acceptanceRunPRNumber`; a read error omits both fields on the derived
+  path and keeps today's `(branch, 0)` for a ledger branch). That makes a
+  parent's scenario persistence and approved retirements reachable instead of
+  `persist_skipped` / `no_run_branch`. The parent's corpus-only push is proved
+  by the RUNNER guards only (`TestPersist_ConsolidatedBranch_PushesCorpusOnlyCommit`,
+  `TestPersist_ConsolidatedBranch_RefusesPlantedPaths`): tree pristine before
+  any write, corpus-root symlink refusal, staged set a subset of the paths
+  written, plain no-force push. No server-side path-set restriction exists
+  ([#5091](https://github.com/kuhlman-labs/fishhawk/issues/5091) assesses one).
+  Consequence: with a declared verify command, on a deployment that can probe
+  the forge, a parent whose acceptance writes a scenario commit C generally
+  owes one merge-candidate pass at exactly C under the EXISTING classification
+  (`fan_in` when the integration write is the newest head write before C; a
+  newer rebase or conflict push keeps its own cause), unless an operator vouch
+  of exact C takes rule 4's answer; with no declared verify command nothing is
+  required (ADR-090 D4), and a deployment that cannot probe proceeds at the
+  merge gate with its WARN (ADR-090 D7). See `merge-queue.md`
+  § "Scenario commits". `acceptance_criteria` (the EFFECTIVE
   set through `resolveEffectiveAcceptanceCriteria`, fail-open to the plan set)
   and `acceptance_retired_scenarios` (FULL `retiredScenarioEntry` rows with
   `pr` filled from the ledger). The element types are wirecontract-pinned

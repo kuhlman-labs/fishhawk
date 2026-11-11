@@ -16,6 +16,7 @@ import (
 	"github.com/kuhlman-labs/fishhawk/backend/internal/bundle"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/devfixtures"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/githubclient"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/pgtest"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/plan"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
@@ -573,6 +574,79 @@ func TestDevFixtures_AcceptanceDispatched_PromptCarriesCriteria_AllSkipRecordsNo
 // 503 trace_upload_unconfigured on a seeded run — the exact state a
 // preview without --dev-fixtures (and without FISHHAWKD_S3_BUCKET) is
 // in. It stays as the visible control for the in-memory store wiring.
+// TestDevFixtures_AcceptanceRebasedHead_ServesAdvancedHead applies the
+// acceptance-rebased-head scenario over real Postgres and reads the signed
+// acceptance prompt for all three runs (#4874): each names the ADVANCED head
+// acceptanceHeadAsOf resolves, not its seed; both parents serve the
+// server-derived consolidated branch and, because devfixtures.Run carries no
+// pull_request_url, no pull request number.
+func TestDevFixtures_AcceptanceRebasedHead_ServesAdvancedHead(t *testing.T) {
+	d := newDevPGServer(t)
+	s := d.s
+	s.promptIssueGetterOverride = &stubIssueGetter{issue: &githubclient.Issue{
+		Number: 4874, Title: "Acceptance rebased head fixture", Body: "seed", State: "open",
+	}}
+	w := devRequest(t, s, http.MethodPost, "/v0/dev/fixtures", []byte(`{"scenario":"acceptance-rebased-head"}`), devLoopbackPeer, nil)
+	if w.Code != http.StatusCreated {
+		t.Fatalf("POST /v0/dev/fixtures: status = %d, want 201\n%s", w.Code, w.Body.String())
+	}
+	var res devfixtures.Result
+	if err := json.Unmarshal(w.Body.Bytes(), &res); err != nil {
+		t.Fatalf("decode: %v", err)
+	}
+	cases := []struct {
+		run, acceptance, wantHead, seed string
+		parent                          bool
+	}{
+		{"rebased-run", "rr-acceptance", "2222222222222222222222222222222222222222", "1111111111111111111111111111111111111111", false},
+		{"rebased-parent", "rp-acceptance", "5555555555555555555555555555555555555555", "4444444444444444444444444444444444444444", true},
+		{"late-integration-parent", "lp-acceptance", "7777777777777777777777777777777777777777", "6666666666666666666666666666666666666666", true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.run, func(t *testing.T) {
+			rr, ok := res.Runs[tc.run]
+			if !ok {
+				t.Fatalf("scenario result has no run %q", tc.run)
+			}
+			acceptanceID := rr.Stages[tc.acceptance]
+			priv := issueDevSigningKey(t, s, rr.ID)
+			sig := devSignBody(t, s, priv, []byte("prompt:"+acceptanceID.String()))
+			pw := devRequest(t, s, http.MethodGet, "/v0/stages/"+acceptanceID.String()+"/prompt", nil, devLoopbackPeer,
+				map[string]string{"X-Fishhawk-Signature": sig})
+			if pw.Code != http.StatusOK {
+				t.Fatalf("GET prompt: status = %d, want 200\n%s", pw.Code, pw.Body.String())
+			}
+			var prompt struct {
+				AcceptanceExpectedHeadSHA   string `json:"acceptance_expected_head_sha"`
+				AcceptanceRunBranch         string `json:"acceptance_run_branch"`
+				AcceptancePullRequestNumber *int   `json:"acceptance_pull_request_number"`
+			}
+			if err := json.Unmarshal(pw.Body.Bytes(), &prompt); err != nil {
+				t.Fatalf("decode prompt: %v", err)
+			}
+			if prompt.AcceptanceExpectedHeadSHA != tc.wantHead {
+				t.Errorf("acceptance_expected_head_sha = %q, want the advanced head %q (seed %q)", prompt.AcceptanceExpectedHeadSHA, tc.wantHead, tc.seed)
+			}
+			if !tc.parent {
+				if prompt.AcceptanceRunBranch != "e97.24-rebased-run" {
+					t.Errorf("acceptance_run_branch = %q, want the ledger branch e97.24-rebased-run", prompt.AcceptanceRunBranch)
+				}
+				if prompt.AcceptancePullRequestNumber == nil || *prompt.AcceptancePullRequestNumber != 4874 {
+					t.Errorf("acceptance_pull_request_number = %v, want 4874 from the ledger", prompt.AcceptancePullRequestNumber)
+				}
+				return
+			}
+			literal := "fishhawk/run-" + rr.ID.String()[:8] + "-consolidated"
+			if prompt.AcceptanceRunBranch != orchestrator.ConsolidatedBranch(rr.ID) || prompt.AcceptanceRunBranch != literal {
+				t.Errorf("acceptance_run_branch = %q, want the consolidated branch %q", prompt.AcceptanceRunBranch, literal)
+			}
+			if prompt.AcceptancePullRequestNumber != nil {
+				t.Errorf("acceptance_pull_request_number = %d, want it absent (the fixture run has no pull_request_url)", *prompt.AcceptancePullRequestNumber)
+			}
+		})
+	}
+}
+
 func TestShipTrace_UnconfiguredWithoutTraceStore_503(t *testing.T) {
 	d := newDevPGServer(t)
 	// Rebuild the server from the same repositories with TraceStore nil.

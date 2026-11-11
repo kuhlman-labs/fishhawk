@@ -1,8 +1,12 @@
 package mcpserver
 
 import (
+	"encoding/json"
 	"fmt"
 	"regexp"
+	"sort"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 )
 
 /*
@@ -174,31 +178,141 @@ func acceptancePreviewAction(cmd, sha, workingDir, targetHost string) SuggestedA
 }
 
 // acceptancePreviewLedgerCategories are the audit categories whose entries
-// carry a head_sha for THIS run's own commits. It mirrors the backend's
-// lineageLedgerCategories (backend/internal/server/lineage.go) — the same set
-// resolveAcceptanceExpectedHeadSHA advertises — so the rendered command names
-// the head the admission would.
-var acceptancePreviewLedgerCategories = map[string]bool{
-	"pull_request_opened": true,
-	"child_pushed":        true,
-	"fixup_pushed":        true,
-}
+// carry a head_sha for THIS run's own commits. It is BUILT FROM
+// auditcomplete.ReportedHeadLedgerCategories, the same list the backend's
+// lineageLedgerCategories (backend/internal/server/lineage.go) aliases, so the
+// mirror cannot drift from the set acceptanceHeadAsOf seeds from (#4874).
+var acceptancePreviewLedgerCategories = func() map[string]bool {
+	m := make(map[string]bool, len(auditcomplete.ReportedHeadLedgerCategories))
+	for _, c := range auditcomplete.ReportedHeadLedgerCategories {
+		m[c] = true
+	}
+	return m
+}()
 
-// latestReportedHeadSHA returns the head_sha on the newest reported-head ledger
-// entry in the recent slice (time-descending, item 0 newest — the
-// latestAcceptanceVerdict idiom). Returns "" on an empty window, a malformed
-// payload, or no matching entry; the SHA is then omitted from the rendered
-// command while the COMMAND itself stays concrete.
+// The categories the mirror reads beside the shared ledger list. The
+// integration row is a SEED source read next to that list, never added to it,
+// exactly as the server's acceptanceHeadSeed reads it (#4874).
+const (
+	acceptancePreviewIntegrationCategory = "integration_commit_recorded"
+	acceptancePreviewBranchRebased       = "branch_rebased"
+	acceptancePreviewBranchReset         = "branch_reset"
+)
+
+// latestReportedHeadSHA mirrors the server's acceptance head resolution
+// (acceptanceHeadAsOf, unbounded) over the recent audit slice, for DISPLAY
+// only: the admission's expected_head_sha stays the authority (#4874).
+//
+// Response order carries NO meaning. The seed is the highest-SEQUENCE ledger
+// row with a non-empty head_sha, or the highest-sequence
+// integration_commit_recorded merge_sha when that row is newer by chain
+// sequence (a reported row wins only an equal-sequence tie). Inside one set
+// an equal sequence keeps the row delivered first, so rows carrying no
+// sequence keep the old first-delivered answer. The rows above the seed's
+// sequence are then walked in sequence order applying the server's
+// walkRecordedBaseMerges rules: a CLEAN branch_rebased row whose prior head is
+// the current head advances to its merge commit, and a branch_reset to a head
+// on the walked chain moves there, while a reset off the chain returns the
+// seed. Returns "" on an empty window, a malformed payload, or no seed in the
+// window (a seed aged out while a rebase row is inside degrades to ""); the
+// SHA is then omitted from the rendered command while the COMMAND itself
+// stays concrete.
 func latestReportedHeadSHA(recent []AuditEntry) string {
+	seed, sha := newestPreviewSeed(recent, func(c string) bool { return acceptancePreviewLedgerCategories[c] }, "head_sha")
+	fan, fanSHA := newestPreviewSeed(recent, func(c string) bool { return c == acceptancePreviewIntegrationCategory }, "merge_sha")
+	if fan != nil && (seed == nil || fan.Sequence > seed.Sequence) {
+		seed, sha = fan, fanSHA
+	}
+	if seed == nil {
+		return ""
+	}
+	var newer []AuditEntry
 	for _, e := range recent {
-		if !acceptancePreviewLedgerCategories[e.Category] {
-			continue
-		}
-		if sha := acceptancePayloadString(e.Payload, "head_sha"); sha != "" {
-			return sha
+		if e.Sequence > seed.Sequence {
+			newer = append(newer, e)
 		}
 	}
-	return ""
+	sort.SliceStable(newer, func(i, j int) bool { return newer[i].Sequence < newer[j].Sequence })
+	return walkPreviewBaseMerges(newer, sha)
+}
+
+// newestPreviewSeed selects the highest-sequence row of a matching category
+// whose field decodes to a non-empty string. An equal sequence keeps the row
+// delivered first. No timestamp is read.
+func newestPreviewSeed(recent []AuditEntry, match func(string) bool, field string) (*AuditEntry, string) {
+	var seed *AuditEntry
+	var seedSHA string
+	for i := range recent {
+		e := &recent[i]
+		if !match(e.Category) {
+			continue
+		}
+		v := acceptancePayloadString(e.Payload, field)
+		if v == "" {
+			continue
+		}
+		if seed == nil || e.Sequence > seed.Sequence {
+			seed = e
+			seedSHA = v
+		}
+	}
+	return seed, seedSHA
+}
+
+// previewBranchRebased is the decoded slice of a branch_rebased payload the
+// mirror's clean-advance check reads; it mirrors the server's
+// branchRebasedAdvance (CleanVerified a pointer, so a legacy row with no key
+// is not clean).
+type previewBranchRebased struct {
+	PriorHeadSHA    string `json:"prior_head_sha"`
+	NewHeadSHA      string `json:"new_head_sha"`
+	MergeCommitSHA  string `json:"merge_commit_sha"`
+	AlreadyUpToDate bool   `json:"already_up_to_date"`
+	CleanVerified   *bool  `json:"clean_verified"`
+}
+
+// decodePreviewPayload re-decodes a wire payload into a typed struct so the
+// mirror's decode failures match the server's json.Unmarshal ones.
+func decodePreviewPayload(payload any, into any) bool {
+	if payload == nil {
+		return false
+	}
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		return false
+	}
+	return json.Unmarshal(raw, into) == nil
+}
+
+// walkPreviewBaseMerges applies the server's walkRecordedBaseMerges rules to
+// rows already filtered above the seed and ordered by sequence.
+func walkPreviewBaseMerges(ordered []AuditEntry, seed string) string {
+	head := seed
+	onChain := map[string]bool{seed: true}
+	for _, e := range ordered {
+		switch e.Category {
+		case acceptancePreviewBranchRebased:
+			var p previewBranchRebased
+			if !decodePreviewPayload(e.Payload, &p) {
+				continue
+			}
+			clean := !p.AlreadyUpToDate && p.MergeCommitSHA != "" && p.NewHeadSHA == p.MergeCommitSHA &&
+				p.CleanVerified != nil && *p.CleanVerified
+			if clean && p.PriorHeadSHA == head {
+				head = p.MergeCommitSHA
+				onChain[head] = true
+			}
+		case acceptancePreviewBranchReset:
+			var p struct {
+				ResetToSHA string `json:"reset_to_sha"`
+			}
+			if !decodePreviewPayload(e.Payload, &p) || !onChain[p.ResetToSHA] {
+				return seed
+			}
+			head = p.ResetToSHA
+		}
+	}
+	return head
 }
 
 // foldAcceptancePreviewAdvisory inserts the run_preview action IMMEDIATELY

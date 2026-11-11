@@ -4,6 +4,9 @@ import (
 	"reflect"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
 )
 
 // TestResolveAcceptancePreviewCmd_EnvWinsOverAutoPreview is the operator-env
@@ -318,6 +321,137 @@ func TestLatestReportedHeadSHA(t *testing.T) {
 			},
 			"abc1234",
 		},
+		// #4874: the shared five-member ledger, the fan-in seed and the
+		// clean-advance walk, each with explicit chain sequences.
+		{"acceptance_scenarios_pushed", []AuditEntry{seqEntry(5, "acceptance_scenarios_pushed", head("ddd4444"))}, "ddd4444"},
+		{"conflict_resolution_pushed", []AuditEntry{seqEntry(5, "conflict_resolution_pushed", head("eee5555"))}, "eee5555"},
+		{
+			"fan-in fallback: integration merge_sha seeds a parent",
+			[]AuditEntry{seqEntry(3, "integration_commit_recorded", map[string]any{"merge_sha": "fff6666"})},
+			"fff6666",
+		},
+		{
+			"clean rebase advances the seed to its merge commit",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"mmm1111",
+		},
+		{
+			"fan-in seed plus clean rebase advances to the merge",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", rebased("fff6666", "ppp1111", "ppp1111", true)),
+				seqEntry(10, "integration_commit_recorded", map[string]any{"merge_sha": "fff6666"}),
+			},
+			"ppp1111",
+		},
+		{
+			"unclean rebase (clean_verified false) keeps the seed",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", false)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"concurrent push (new head != merge) keeps the seed",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "zzz9999", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"rebase from a different prior head keeps the seed",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", rebased("other00", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"rebase older than the seed does not advance it",
+			[]AuditEntry{
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+				seqEntry(9, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+			},
+			"abc1234",
+		},
+		{
+			"reset on the walked chain moves to its target",
+			[]AuditEntry{
+				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "abc1234"}),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"reset off the walked chain returns the seed",
+			[]AuditEntry{
+				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "elsewhere"}),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"legacy rebase row with no clean_verified key keeps the seed",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", map[string]any{"prior_head_sha": "abc1234", "merge_commit_sha": "mmm1111", "new_head_sha": "mmm1111", "already_up_to_date": false}),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"already-up-to-date rebase row keeps the seed",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", map[string]any{"prior_head_sha": "abc1234", "merge_commit_sha": "mmm1111", "new_head_sha": "mmm1111", "already_up_to_date": true, "clean_verified": true}),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"undecodable rebase row is skipped, the seed stays",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", "oops"),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"rebase row with a mistyped field is skipped like the server's decode failure",
+			[]AuditEntry{
+				seqEntry(11, "branch_rebased", map[string]any{"prior_head_sha": "abc1234", "merge_commit_sha": "mmm1111", "new_head_sha": "mmm1111", "already_up_to_date": "no", "clean_verified": true}),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"undecodable reset row returns the seed",
+			[]AuditEntry{
+				seqEntry(12, "branch_reset", "oops"),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"abc1234",
+		},
+		{
+			"walk continues after a reset on the chain",
+			[]AuditEntry{
+				seqEntry(13, "branch_rebased", rebased("abc1234", "mmm2222", "mmm2222", true)),
+				seqEntry(12, "branch_reset", map[string]any{"reset_to_sha": "abc1234"}),
+				seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true)),
+				seqEntry(10, "pull_request_opened", head("abc1234")),
+			},
+			"mmm2222",
+		},
+		{
+			"seed outside the window with a rebase row inside -> empty",
+			[]AuditEntry{seqEntry(11, "branch_rebased", rebased("abc1234", "mmm1111", "mmm1111", true))},
+			"",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -325,6 +459,137 @@ func TestLatestReportedHeadSHA(t *testing.T) {
 				t.Errorf("latestReportedHeadSHA = %q, want %q", got, tc.want)
 			}
 		})
+	}
+}
+
+// seqEntry is a ledger row with an explicit chain sequence (#4874).
+func seqEntry(seq int64, cat string, payload any) AuditEntry {
+	return AuditEntry{Sequence: seq, Category: cat, Payload: payload}
+}
+
+// rebased is a branch_rebased payload; clean sets clean_verified.
+func rebased(prior, merge, newHead string, clean bool) map[string]any {
+	return map[string]any{
+		"prior_head_sha":     prior,
+		"merge_commit_sha":   merge,
+		"new_head_sha":       newHead,
+		"already_up_to_date": false,
+		"clean_verified":     clean,
+	}
+}
+
+// TestLatestReportedHeadSHA_SeedOrderedByChainSequence pins that the mirror
+// treats response order as carrying NO meaning (#4874, e7d3cc01, ecaa8b62):
+// every row delivers the LOWER-sequence candidate first and carries a
+// timestamp that disagrees with the sequence, so first-delivered or
+// timestamp selection gives the opposite answer.
+func TestLatestReportedHeadSHA_SeedOrderedByChainSequence(t *testing.T) {
+	base := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+	at := func(seq int64, ts time.Time, cat string, payload any) AuditEntry {
+		return AuditEntry{Sequence: seq, Timestamp: ts, Category: cat, Payload: payload}
+	}
+	head := func(sha string) map[string]any { return map[string]any{"head_sha": sha} }
+	merge := func(sha string) map[string]any { return map[string]any{"merge_sha": sha} }
+
+	tests := []struct {
+		name   string
+		recent []AuditEntry
+		want   string
+	}{
+		{
+			"(a) across categories the higher sequence wins over a later timestamp",
+			[]AuditEntry{
+				at(10, base.Add(5*time.Second), "pull_request_opened", head("sss0000")),
+				at(12, base, "fixup_pushed", head("fff0000")),
+			},
+			"fff0000",
+		},
+		{
+			"(e) a fix-up newer than the rebase is the seed, the older rebase is not walked",
+			[]AuditEntry{
+				at(10, base.Add(5*time.Second), "pull_request_opened", head("sss0000")),
+				at(11, base.Add(time.Second), "branch_rebased", rebased("sss0000", "mmm0000", "mmm0000", true)),
+				at(12, base, "fixup_pushed", head("fff0000")),
+			},
+			"fff0000",
+		},
+		{
+			"(g) fan-in fallback picks the higher-sequence integration row",
+			[]AuditEntry{
+				at(20, base.Add(5*time.Second), "integration_commit_recorded", merge("ff10000")),
+				at(21, base, "integration_commit_recorded", merge("ff20000")),
+			},
+			"ff20000",
+		},
+		{
+			"chained walk delivered scrambled: S -> M -> M2",
+			[]AuditEntry{
+				at(12, base.Add(2*time.Second), "branch_rebased", rebased("mmm0000", "mm20000", "mm20000", true)),
+				at(10, base, "pull_request_opened", head("sss0000")),
+				at(11, base.Add(time.Second), "branch_rebased", rebased("sss0000", "mmm0000", "mmm0000", true)),
+			},
+			"mm20000",
+		},
+		{
+			"(i) a late integration row beats an older reported head",
+			[]AuditEntry{
+				at(20, base, "fixup_pushed", head("ccc0000")),
+				at(30, base, "integration_commit_recorded", merge("ff20000")),
+			},
+			"ff20000",
+		},
+		{
+			"(j) a newer reported head beats the integration row",
+			[]AuditEntry{
+				at(30, base, "integration_commit_recorded", merge("ff20000")),
+				at(40, base, "fixup_pushed", head("ccc0000")),
+			},
+			"ccc0000",
+		},
+		{
+			"(k) an equal-sequence tie keeps the reported row",
+			[]AuditEntry{
+				at(30, base, "fixup_pushed", head("ccc0000")),
+				at(30, base, "integration_commit_recorded", merge("ff20000")),
+			},
+			"ccc0000",
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := latestReportedHeadSHA(tc.recent); got != tc.want {
+				t.Errorf("latestReportedHeadSHA = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestAcceptancePreviewLedgerCategories_MirrorsShared pins the mirror's
+// ledger set to the shared auditcomplete.ReportedHeadLedgerCategories and to
+// the exact five members, so neither can drift (#4874). The integration
+// category is read beside the list, never inside it.
+func TestAcceptancePreviewLedgerCategories_MirrorsShared(t *testing.T) {
+	want := map[string]bool{
+		"pull_request_opened":         true,
+		"child_pushed":                true,
+		"fixup_pushed":                true,
+		"acceptance_scenarios_pushed": true,
+		"conflict_resolution_pushed":  true,
+	}
+	if !reflect.DeepEqual(acceptancePreviewLedgerCategories, want) {
+		t.Errorf("acceptancePreviewLedgerCategories = %v, want %v", acceptancePreviewLedgerCategories, want)
+	}
+	shared := make(map[string]bool, len(auditcomplete.ReportedHeadLedgerCategories))
+	for _, c := range auditcomplete.ReportedHeadLedgerCategories {
+		shared[c] = true
+	}
+	if !reflect.DeepEqual(acceptancePreviewLedgerCategories, shared) {
+		t.Errorf("mirror %v drifted from auditcomplete.ReportedHeadLedgerCategories %v", acceptancePreviewLedgerCategories, shared)
+	}
+	for _, c := range []string{acceptancePreviewIntegrationCategory, acceptancePreviewBranchRebased, acceptancePreviewBranchReset, "operator_commit_vouched"} {
+		if acceptancePreviewLedgerCategories[c] {
+			t.Errorf("%s must not be a ledger member", c)
+		}
 	}
 }
 
