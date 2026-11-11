@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -558,9 +559,12 @@ func TestCtxTimeoutErr(t *testing.T) {
 		if !errors.Is(got, context.DeadlineExceeded) || !errors.Is(got, os.ErrDeadlineExceeded) {
 			t.Fatalf("got %v, want it to wrap both context.DeadlineExceeded and os.ErrDeadlineExceeded", got)
 		}
-		var nerr net.Error
-		if !errors.As(got, &nerr) || !nerr.Timeout() {
-			t.Fatalf("got %v, want the original net timeout reachable through errors.As", got)
+		// The concrete type: context.DeadlineExceeded is itself a net.Error
+		// and is first in the chain, so a net.Error target would be satisfied
+		// without the original.
+		var oerr *net.OpError
+		if !errors.As(got, &oerr) || !oerr.Timeout() {
+			t.Fatalf("got %v, want the original *net.OpError timeout reachable through errors.As", got)
 		}
 	})
 	t.Run("canceled ctx wraps Canceled and keeps the timeout", func(t *testing.T) {
@@ -592,91 +596,141 @@ func TestCtxTimeoutErr(t *testing.T) {
 	}
 }
 
-// deadlineWriteConn is a net.Conn whose Write, once armed, blocks until the
-// armed ctx ends and then fails the way a net.Conn write deadline does, once:
-// it disarms first, so pgx's asynchronous close (which sends Terminate and
-// drains until the server closes) is not stalled for its 15s bound. The
-// injection is triggered by the wrapper, not by a wall-clock race, so the
-// write-time deadline is deterministic under -race and host load.
+// tripCtx is a context whose deadline the test fires by hand (trip), so the
+// deadline lands at an exact point (the armed write) instead of at a wall-clock
+// instant a stalled host could reach first. Err is context.DeadlineExceeded
+// once tripped, as for a timer-driven deadline.
+type tripCtx struct {
+	context.Context
+	done chan struct{}
+	once sync.Once
+}
+
+func newTripCtx() *tripCtx {
+	return &tripCtx{Context: context.Background(), done: make(chan struct{})}
+}
+
+func (c *tripCtx) Done() <-chan struct{} { return c.done }
+
+func (c *tripCtx) Err() error {
+	select {
+	case <-c.done:
+		return context.DeadlineExceeded
+	default:
+		return nil
+	}
+}
+
+func (c *tripCtx) trip() { c.once.Do(func() { close(c.done) }) }
+
+// deadlineWriteConn is a net.Conn whose Write, once armed, trips the armed
+// ctx and fails the way a net.Conn write deadline does, once: it disarms
+// first, so pgx's asynchronous close (which sends Terminate and drains until
+// the server closes) is not stalled for its 15s bound. The deadline is
+// injected by this wrapper at the write, never by a timer, so it is
+// deterministic under -race and host load however long the call took to reach
+// the write. fired holds the first byte of the failed write: the pgproto3
+// message type, 'P' (Parse) for a Prepare flush, 'B' (Bind) for the flush of
+// an already-prepared statement; 0 until the injection lands.
 type deadlineWriteConn struct {
 	net.Conn
-	armed atomic.Pointer[context.Context]
-	fired atomic.Bool
+	armed atomic.Pointer[tripCtx]
+	fired atomic.Int32
 }
 
 func (c *deadlineWriteConn) Write(b []byte) (int, error) {
-	ctxp := c.armed.Load()
-	if ctxp == nil {
+	ctx := c.armed.Load()
+	if ctx == nil || len(b) == 0 {
 		return c.Conn.Write(b)
 	}
-	<-(*ctxp).Done()
 	c.armed.Store(nil)
-	c.fired.Store(true)
+	c.fired.Store(int32(b[0]))
+	ctx.trip()
 	return 0, &net.OpError{Op: "write", Net: "tcp", Source: c.LocalAddr(), Addr: c.RemoteAddr(), Err: os.ErrDeadlineExceeded}
 }
 
 // TestWithSessionLock_WriteTimeoutAtDeadline: the waiter's deadline fires
 // while the try-lock statement is being WRITTEN, which pgx v5.11.0 returns as
 // "write failed: ... i/o timeout" without attributing it to ctx (#5159). The
-// pool's connections are wrapped so that write blocks until the deadline and
-// then fails with a net deadline error. Counterfactuals: ctxTimeoutErr
-// returning err, or the call site passing err unwrapped, is RED; running fn
-// before the error return is RED on `ran`.
+// pool's connections are wrapped so that write trips the waiter's ctx and
+// fails with a net deadline error. One subtest per un-normalized pgx write
+// path: the first try-lock on a connection flushes Prepare, every later one
+// (a polling waiter's second and subsequent attempts) flushes Bind/Execute of
+// the cached statement. Counterfactuals: ctxTimeoutErr returning err, or the
+// call site passing err unwrapped, is RED; running fn before the error return
+// is RED on `ran`.
 func TestWithSessionLock_WriteTimeoutAtDeadline(t *testing.T) {
-	cfg, err := pgxpool.ParseConfig(pgtest.NewURL(t))
-	if err != nil {
-		t.Fatalf("parse url: %v", err)
-	}
-	cfg.MaxConns = MinPoolConns
-	// No acquire-time ping write: the try-lock Prepare must be the first
-	// write on the warmed connection.
-	cfg.ShouldPing = func(context.Context, pgxpool.ShouldPingParams) bool { return false }
-	// Force TLS off on this pool's own config, whatever an external
-	// FISHHAWK_TEST_PG_URL says, so the DialFunc wrapper is always the
-	// connection pgconn writes to.
-	cfg.ConnConfig.TLSConfig = nil
-	cfg.ConnConfig.Fallbacks = nil
-	dial := cfg.ConnConfig.DialFunc
-	cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
-		c, err := dial(ctx, network, addr)
-		if err != nil {
-			return nil, err
-		}
-		return &deadlineWriteConn{Conn: c}, nil
-	}
-	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
-	if err != nil {
-		t.Fatalf("pool: %v", err)
-	}
-	t.Cleanup(pool.Close)
-	ctx := callerCtx(t)
+	for _, tc := range []struct {
+		name      string
+		warmLock  bool // run one successful try-lock first, caching the statement
+		wantFirst byte
+	}{
+		{"prepare flush", false, 'P'},
+		{"cached statement flush", true, 'B'},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg, err := pgxpool.ParseConfig(pgtest.NewURL(t))
+			if err != nil {
+				t.Fatalf("parse url: %v", err)
+			}
+			cfg.MaxConns = MinPoolConns
+			// No acquire-time ping write: the armed write must be the
+			// try-lock's own flush.
+			cfg.ShouldPing = func(context.Context, pgxpool.ShouldPingParams) bool { return false }
+			// Force TLS off on this pool's own config, whatever an external
+			// FISHHAWK_TEST_PG_URL says, so the DialFunc wrapper is always
+			// the connection pgconn writes to.
+			cfg.ConnConfig.TLSConfig = nil
+			cfg.ConnConfig.Fallbacks = nil
+			dial := cfg.ConnConfig.DialFunc
+			cfg.ConnConfig.DialFunc = func(ctx context.Context, network, addr string) (net.Conn, error) {
+				c, err := dial(ctx, network, addr)
+				if err != nil {
+					return nil, err
+				}
+				return &deadlineWriteConn{Conn: c}, nil
+			}
+			pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+			if err != nil {
+				t.Fatalf("pool: %v", err)
+			}
+			t.Cleanup(pool.Close)
+			ctx := callerCtx(t)
+			b := BudgetFor(pool)
 
-	// Warm the one connection so the waiter reuses it, already started.
-	warm, err := pool.Acquire(ctx)
-	if err != nil {
-		t.Fatalf("warm acquire: %v", err)
-	}
-	dc, ok := warm.Conn().PgConn().Conn().(*deadlineWriteConn)
-	if !ok {
-		t.Fatalf("pool connection is %T, want *deadlineWriteConn", warm.Conn().PgConn().Conn())
-	}
-	warm.Release()
+			if tc.warmLock {
+				if err := WithSessionLock(ctx, pool, b, 33, opts("warm"), func(context.Context) error { return nil }); err != nil {
+					t.Fatalf("warm try-lock: %v", err)
+				}
+			}
+			// The pool has created exactly one connection and reuses it
+			// (LIFO) for the waiter below.
+			warm, err := pool.Acquire(ctx)
+			if err != nil {
+				t.Fatalf("warm acquire: %v", err)
+			}
+			dc, ok := warm.Conn().PgConn().Conn().(*deadlineWriteConn)
+			if !ok {
+				t.Fatalf("pool connection is %T, want *deadlineWriteConn", warm.Conn().PgConn().Conn())
+			}
+			warm.Release()
 
-	wctx, cancel := context.WithTimeout(ctx, timescale.D(500*time.Millisecond))
-	defer cancel()
-	dc.armed.Store(&wctx)
-	ran := false
-	err = WithSessionLock(wctx, pool, BudgetFor(pool), 33, opts("waiter"), func(context.Context) error { ran = true; return nil })
-	if !dc.fired.Load() {
-		t.Fatalf("the waiter never wrote on the armed connection (err=%v): the injection did not land, so this test proves nothing", err)
-	}
-	if !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("waiter whose deadline fired mid-write = %v, want it to wrap context.DeadlineExceeded", err)
-	}
-	if !errors.Is(err, os.ErrDeadlineExceeded) {
-		t.Fatalf("waiter whose deadline fired mid-write = %v, want the original os.ErrDeadlineExceeded kept", err)
-	}
-	if ran {
-		t.Fatal("fn ran although the try-lock write failed")
+			wctx := newTripCtx()
+			dc.armed.Store(wctx)
+			ran := false
+			err = WithSessionLock(wctx, pool, b, 33, opts("waiter"), func(context.Context) error { ran = true; return nil })
+			if got := dc.fired.Load(); got != int32(tc.wantFirst) {
+				t.Fatalf("armed write began with message %q, want %q (err=%v): the injection did not land on the intended write path, so this test proves nothing", rune(got), rune(tc.wantFirst), err)
+			}
+			if !errors.Is(err, context.DeadlineExceeded) {
+				t.Fatalf("waiter whose deadline fired mid-write = %v, want it to wrap context.DeadlineExceeded", err)
+			}
+			if !errors.Is(err, os.ErrDeadlineExceeded) {
+				t.Fatalf("waiter whose deadline fired mid-write = %v, want the original os.ErrDeadlineExceeded kept", err)
+			}
+			if ran {
+				t.Fatal("fn ran although the try-lock write failed")
+			}
+		})
 	}
 }

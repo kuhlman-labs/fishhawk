@@ -113,9 +113,11 @@ pool, and admits nothing.
 are re-entrant per session), `_LapsedSessionSurfaces`, `_ReservesHeadroom`,
 `_RefusesNestedLock`, `TestDetach_ChildCanAcquire`,
 `TestCtxTimeoutErr` (hermetic, one case per guard branch),
-`_WriteTimeoutAtDeadline` (a wrapping `DialFunc` injects a write-time deadline
-on the try-lock write; asserts the injection fired, `DeadlineExceeded` and
-the original timeout both reachable, fn not run).
+`_WriteTimeoutAtDeadline` (a wrapping `DialFunc` trips a hand-fired ctx at the
+try-lock write, once on the Prepare flush and once on the cached-statement
+Bind flush, so no timer decides the injection; asserts the injection landed
+on the intended message, `DeadlineExceeded` and the original timeout both
+reachable, fn not run).
 
 `mixed_test.go` (the three production helpers over ONE 6-connection pool,
 `HolderLimit` 2):

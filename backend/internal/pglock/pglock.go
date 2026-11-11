@@ -260,12 +260,15 @@ func attempt(ctx context.Context, pool *pgxpool.Pool, b *Budget, key int64, opts
 }
 
 // ctxTimeoutErr returns err, or, when ctx has ended and err is a net timeout
-// pgx did not already attribute to ctx, an error wrapping BOTH ctx.Err() and
-// err. pgconn reports a deadline that interrupts a read as the ctx error, but
-// one that interrupts a write (its context watcher sets the net.Conn
+// that does not already carry ctx's error, an error wrapping BOTH ctx.Err()
+// and err. pgconn reports a deadline that interrupts a read as the ctx error,
+// but one that interrupts a write (its context watcher sets the net.Conn
 // deadline) as "write failed: ... i/o timeout" (#5159), which
 // errors.Is(err, context.DeadlineExceeded) would miss. Both stay reachable
-// through errors.Is and errors.As.
+// through errors.Is and errors.As. The guard keys on net.Error, and
+// context.DeadlineExceeded is itself one, so an error carrying a DeadlineExceeded
+// from a different ctx would also be relabelled with a canceled ctx's error;
+// this helper's one caller runs the query on the same ctx it passes here.
 func ctxTimeoutErr(ctx context.Context, err error) error {
 	cerr := ctx.Err()
 	var nerr net.Error
