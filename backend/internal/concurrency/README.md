@@ -257,9 +257,13 @@ stage has a live (unconsumed) trigger. So:
 
 - a fix-up, a conflict-resolution re-open, and a trigger already consumed by a
   later `merge_candidate_verified` row stay in `local-implement:<host>`;
-- an unreadable trigger (read error, malformed or half-populated payload, or no
-  audit repository) serves no pass, so the runner runs an ordinary implement
-  and the stage is routed as one (WARN-logged).
+- an unreadable trigger (malformed or half-populated payload, or no audit
+  repository) serves no pass, so the runner runs an ordinary implement and the
+  stage is routed as one (WARN-logged). A trigger READ ERROR never reaches
+  this routing: the marker's superseded-pass check (#4811) runs first and
+  fails closed with `500 dependency_check_failed`, the stage untouched and no
+  slot or queue row written. Only a read error that first appears between
+  that check and the routing read takes the WARN-logged implement route.
 
 The store itself is group-agnostic: holders and queue-ahead are keyed by
 `group_key`, so the two groups never count each other

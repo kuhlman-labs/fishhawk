@@ -2581,3 +2581,369 @@ func TestHostDispatch_HostMemoryHold_PrecedesSlotAdmission(t *testing.T) {
 		})
 	}
 }
+
+// --- #4811: the superseded merge-candidate pass refusal (the marker arm) ---
+//
+// Fake-backed over slice 0's newSupFixture: the implement stage carries live
+// trigger A for supHeadOld (prior state succeeded, re-parking a review stage).
+
+// decodeHostDispatchError returns a refusal's code and details.
+func decodeHostDispatchError(t *testing.T, w *httptest.ResponseRecorder) (string, map[string]any) {
+	t.Helper()
+	var body struct {
+		Error struct {
+			Code    string         `json:"code"`
+			Details map[string]any `json:"details"`
+		} `json:"error"`
+	}
+	if err := json.Unmarshal(w.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode: %v (%s)", err, w.Body.String())
+	}
+	return body.Error.Code, body.Error.Details
+}
+
+// assertSupersededRefusal checks the 409 merge_candidate_pass_superseded body.
+func assertSupersededRefusal(t *testing.T, f *supFixture, w *httptest.ResponseRecorder, settled bool) map[string]any {
+	t.Helper()
+	if w.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409:\n%s", w.Code, w.Body.String())
+	}
+	code, d := decodeHostDispatchError(t, w)
+	if code != "dispatch_not_admissible" || d["reason"] != hostDispatchReasonMergeCandidatePassSuperseded {
+		t.Fatalf("code=%q details=%v, want dispatch_not_admissible / %s", code, d, hostDispatchReasonMergeCandidatePassSuperseded)
+	}
+	if d["stage_id"] != f.impl.ID.String() || d["trigger_sequence"] != float64(f.seqA) ||
+		d["expected_head_sha"] != supHeadOld || d["superseding_head_sha"] != supHeadNew || d["settled"] != settled {
+		t.Errorf("details = %v, want stage %s, trigger %d, %s -> %s, settled %v",
+			d, f.impl.ID, f.seqA, supHeadOld, supHeadNew, settled)
+	}
+	return d
+}
+
+func TestHostDispatch_SupersededMergeCandidatePass_RefusesAndSettles(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow(CategoryOperatorCommitVouched, "vouched_sha", supHeadNew)
+	swapSupersedeAdvance(t, f.impl.ID)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	if st := f.state(t, f.impl.ID); st == run.StageStateDispatched {
+		t.Errorf("persisted state = %q: a superseded pass must never be marked dispatched", st)
+	}
+	d := assertSupersededRefusal(t, f, w, true)
+	if d["superseding_category"] != CategoryOperatorCommitVouched || d["superseding_sequence"] != float64(chainLen(f.au)-1) {
+		t.Errorf("details = %v, want superseded by the %s row", d, CategoryOperatorCommitVouched)
+	}
+	if _, ok := d["settle_step"]; ok {
+		t.Errorf("details = %v, want no settle_step on a settled pass", d)
+	}
+	// The PERSISTED state: never dispatched, back at the trigger's prior gate.
+	f.assertSettled(t, mergeCandidateSupersession{Superseded: true, Settled: true, Step: mergeCandidateSettled})
+}
+
+func TestHostDispatch_CurrentMergeCandidatePass_Admits(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	seqB := f.seedTriggerFor(supHeadNew)
+	rec := swapSupersedeAdvance(t, f.impl.ID)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	if v := f.verdicts(t); len(v) != 0 {
+		t.Errorf("merge_candidate_verified rows = %+v, want none", v)
+	}
+	if live := f.live(t); live == nil || live.sequence != seqB {
+		t.Errorf("live = %+v, want B (%d)", live, seqB)
+	}
+	if calls, _ := rec.snapshot(); calls != 0 {
+		t.Errorf("advance calls = %d, want 0", calls)
+	}
+}
+
+func TestHostDispatch_SupersededMergeCandidatePass_ReadErrorFailsClosed(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	f.au.listByCategoryErrCategory = "fixup_pushed"
+	before := chainLen(f.au)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	f.au.listByCategoryErrCategory = ""
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeHostDispatchError(t, w); code != "dependency_check_failed" {
+		t.Errorf("code = %q, want dependency_check_failed", code)
+	}
+	if st := f.state(t, f.impl.ID); st != run.StageStateAwaitingHostDispatch {
+		t.Errorf("state = %q, want untouched awaiting_host_dispatch", st)
+	}
+	if n := len(chainDelta(f.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
+	}
+}
+
+// TestHostDispatch_SupersededMergeCandidatePass_StageListErrorFailsClosed is
+// R2: impl.Sequence = 0 skips the post-deploy hold's own stage-list read, so
+// the supersede resolver's read is the only one in the path.
+func TestHostDispatch_SupersededMergeCandidatePass_StageListErrorFailsClosed(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	f.repo.mu.Lock()
+	f.impl.Sequence = 0
+	f.repo.mu.Unlock()
+	wrapper := &mcvStageListErrRepo{mcvRepo: f.repo, err: errors.New("injected stage list failure")}
+	f.s.cfg.RunRepo = wrapper
+	before := chainLen(f.au)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	f.s.cfg.RunRepo = f.repo
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeHostDispatchError(t, w); code != "dependency_check_failed" {
+		t.Errorf("code = %q, want dependency_check_failed", code)
+	}
+	if wrapper.calls != 1 {
+		t.Errorf("stage-list reads = %d, want exactly the resolver's 1", wrapper.calls)
+	}
+	if st := f.state(t, f.impl.ID); st != run.StageStateAwaitingHostDispatch {
+		t.Errorf("state = %q, want untouched awaiting_host_dispatch", st)
+	}
+	if n := len(chainDelta(f.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
+	}
+}
+
+// TestHostDispatch_SupersededMergeCandidatePass_SettleTimeReadErrorFailsClosed
+// is approval condition D3: detection reads the trigger chain fine, then the
+// settle's own trigger resolve fails. The marker answers 500, never 409 or 200.
+func TestHostDispatch_SupersededMergeCandidatePass_SettleTimeReadErrorFailsClosed(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	wrap := &nthListErrAudit{auditFake: f.au, category: CategoryStageMergeCandidateVerifyTriggered, failOn: 2}
+	f.s.cfg.AuditRepo = wrap
+	rec := swapSupersedeAdvance(t, f.impl.ID)
+	before := chainLen(f.au)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	f.s.cfg.AuditRepo = f.au
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	if code, _ := decodeHostDispatchError(t, w); code != "dependency_check_failed" {
+		t.Errorf("code = %q, want dependency_check_failed", code)
+	}
+	if wrap.calls < 2 {
+		t.Errorf("trigger reads = %d, want detection (1) then the failing settle read (2)", wrap.calls)
+	}
+	if st := f.state(t, f.impl.ID); st != run.StageStateAwaitingHostDispatch {
+		t.Errorf("state = %q, want untouched awaiting_host_dispatch", st)
+	}
+	if n := len(chainDelta(f.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
+	}
+	if calls, _ := rec.snapshot(); calls != 0 {
+		t.Errorf("advance calls = %d, want 0", calls)
+	}
+}
+
+func TestHostDispatch_SupersededMergeCandidatePass_SettleRecordFails(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	f.au.appendErr = errors.New("injected append failure")
+	rec := swapSupersedeAdvance(t, f.impl.ID)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	f.au.appendErr = nil
+	d := assertSupersededRefusal(t, f, w, false)
+	if d["settle_step"] != "record_failed" {
+		t.Errorf("settle_step = %v, want record_failed", d["settle_step"])
+	}
+	if st := f.state(t, f.impl.ID); st != run.StageStateAwaitingHostDispatch {
+		t.Errorf("state = %q, want untouched awaiting_host_dispatch", st)
+	}
+	if live := f.live(t); live == nil || live.sequence != f.seqA {
+		t.Errorf("live = %+v, want trigger A still live", live)
+	}
+	if calls, _ := rec.snapshot(); calls != 0 {
+		t.Errorf("advance calls = %d, want 0", calls)
+	}
+}
+
+// TestHostDispatch_SupersededMergeCandidatePass_AdvanceCondition is approval
+// condition D4 on the marker arm: restore_failed advances (the failure path
+// stays in force), before_restore_failed does not and names left_state.
+func TestHostDispatch_SupersededMergeCandidatePass_AdvanceCondition(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		refuseTo run.StageState
+		step     string
+		left     run.StageState
+		calls    int
+	}{
+		{"restore_failed advances", run.StageStateSucceeded, "restore_failed", "", 1},
+		{"before_restore_failed does not", run.StageStateFailed, "before_restore_failed", run.StageStateRunning, 0},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+			f.headRow("fixup_pushed", "head_sha", supHeadNew)
+			rec := swapSupersedeAdvance(t, f.impl.ID)
+			f.repo.refuseTo = tc.refuseTo
+			w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+			f.repo.refuseTo = ""
+			d := assertSupersededRefusal(t, f, w, false)
+			if d["settle_step"] != tc.step {
+				t.Errorf("settle_step = %v, want %s", d["settle_step"], tc.step)
+			}
+			if left, ok := d["left_state"]; (tc.left == "") == ok || (ok && left != string(tc.left)) {
+				t.Errorf("left_state = %v (present %v), want %q", left, ok, tc.left)
+			}
+			if calls, probes := rec.snapshot(); calls != tc.calls || (calls == 1 && !probes[0]) {
+				t.Errorf("advance calls = %d (probes %v), want %d outside the fence", calls, probes, tc.calls)
+			}
+		})
+	}
+}
+
+func TestHostDispatch_MalformedMergeCandidateTrigger_Admits(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	id := f.impl.ID
+	f.appendRow(&id, CategoryStageMergeCandidateVerifyTriggered, mergeCandidateVerifyTrigger{
+		Branch: mcvBranch, BaseRef: mcvBaseRef, ExpectedHeadSHA: supHeadOld,
+		Cause: mergeCandidateCauseBaseAdvance, PriorState: string(run.StageStateSucceeded),
+	})
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	before := chainLen(f.au)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200 (a malformed trigger reads as no pass, R6):\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	if n := len(chainDelta(f.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
+	}
+}
+
+// TestHostDispatch_ConcurrentReplacementStaysDispatchable is R1 at the marker:
+// a settle pinned to A that lost to replacement B writes nothing, and the
+// marker then admits B.
+func TestHostDispatch_ConcurrentReplacementStaysDispatchable(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	ctx := context.Background()
+	stale, err := f.s.detectStaleMergeCandidatePass(ctx, f.runID, f.impl.ID, "")
+	if err != nil || stale == nil || stale.TriggerSequence != f.seqA {
+		t.Fatalf("detect = %+v, %v; want stale pinned to A", stale, err)
+	}
+	start, refusal := f.s.beginMergeCandidateVerifyPass(ctx, f.runID, mergeCandidateVerifyParams{
+		Branch: mcvBranch, BaseRef: mcvBaseRef, HeadSHA: supHeadNew, Cause: mergeCandidateCauseFanIn,
+	}, mergeCandidateSystemActor())
+	if refusal != nil || !start.Triggered {
+		t.Fatalf("begin = %+v, %+v; want replacement B", start, refusal)
+	}
+	seqB := int64(chainLen(f.au))
+	if step, err := f.s.settleStaleMergeCandidatePass(ctx, f.runID, stale); err != nil || step != mergeCandidateSettleTriggerReplaced {
+		t.Fatalf("settle = %s, %v; want trigger_replaced", mergeCandidateSettleStepName(step), err)
+	}
+	swapSupersedeAdvance(t, f.impl.ID)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); !resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:true dispatched", resp)
+	}
+	if v := f.verdicts(t); len(v) != 0 {
+		t.Errorf("merge_candidate_verified rows = %+v, want zero", v)
+	}
+	if live := f.live(t); live == nil || live.sequence != seqB || live.payload.ExpectedHeadSHA != supHeadNew {
+		t.Errorf("live = %+v, want B (%d) for %s", live, seqB, supHeadNew)
+	}
+}
+
+func TestHostDispatch_SupersededMergeCandidatePass_AdvancesAfterUnlock(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	rec := swapSupersedeAdvance(t, f.impl.ID)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	assertSupersededRefusal(t, f, w, true)
+	calls, probes := rec.snapshot()
+	if calls != 1 {
+		t.Fatalf("advance calls = %d, want 1", calls)
+	}
+	if !probes[0] {
+		t.Error("the Advance hook could not take the stage's fence: it ran before the marker released it")
+	}
+}
+
+// TestHostDispatch_SupersededMergeCandidatePass_NoOrchestrator is approval
+// condition D2 on the marker: no Orchestrator, so no fence and no Advance; the
+// pass still settles, the refusal is returned, and nothing panics.
+func TestHostDispatch_SupersededMergeCandidatePass_NoOrchestrator(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	rec := swapSupersedeAdvance(t, f.impl.ID)
+	f.s.cfg.Orchestrator = nil
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	assertSupersededRefusal(t, f, w, true)
+	f.assertSettled(t, mergeCandidateSupersession{Superseded: true, Settled: true, Step: mergeCandidateSettled})
+	if calls, _ := rec.snapshot(); calls != 0 {
+		t.Errorf("advance calls = %d, want 0 with no Orchestrator", calls)
+	}
+}
+
+func TestHostDispatch_SupersededMergeCandidatePass_DispatchedArmUnchanged(t *testing.T) {
+	f := newSupFixture(t, run.StageStateDispatched)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	before := chainLen(f.au)
+
+	w := postHostDispatch(t, f.s, f.runID, f.impl.ID, withHostDispatchOperator)
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want the idempotent 200:\n%s", w.Code, w.Body.String())
+	}
+	if resp := decodeHostDispatch(t, w); resp.Transitioned || resp.StageState != string(run.StageStateDispatched) {
+		t.Errorf("resp = %+v, want transitioned:false dispatched", resp)
+	}
+	if n := len(chainDelta(f.au, before)); n != 0 {
+		t.Errorf("rows appended = %d, want 0", n)
+	}
+}
+
+// TestHostDispatch_SupersededMergeCandidatePass_NonImplementStageInert: the
+// refusal reads nothing for a non-implement stage. The failing stage list is
+// the probe (the plan stage is sequence 0, so the deploy hold skips its read).
+func TestHostDispatch_SupersededMergeCandidatePass_NonImplementStageInert(t *testing.T) {
+	f := newSupFixture(t, run.StageStateAwaitingHostDispatch)
+	f.headRow("fixup_pushed", "head_sha", supHeadNew)
+	planStage := f.repo.stagesFor(f.runID)[0]
+	f.repo.mu.Lock()
+	planStage.State = run.StageStatePending
+	f.repo.mu.Unlock()
+	if planStage.Type == run.StageTypeImplement || planStage.Sequence != 0 {
+		t.Fatalf("precondition: stage 0 = %s seq %d, want a non-implement sequence-0 stage", planStage.Type, planStage.Sequence)
+	}
+	wrapper := &mcvStageListErrRepo{mcvRepo: f.repo, err: errors.New("injected stage list failure")}
+	f.s.cfg.RunRepo = wrapper
+
+	w := postHostDispatch(t, f.s, f.runID, planStage.ID, withHostDispatchOperator)
+	f.s.cfg.RunRepo = f.repo
+	if w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if wrapper.calls != 0 {
+		t.Errorf("stage-list reads = %d, want 0 for a non-implement stage", wrapper.calls)
+	}
+	if live := f.live(t); live == nil || live.sequence != f.seqA {
+		t.Errorf("live = %+v, want the implement stage's trigger A untouched", live)
+	}
+}
