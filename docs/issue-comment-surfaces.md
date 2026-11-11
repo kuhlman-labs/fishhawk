@@ -1719,9 +1719,11 @@ Notes:
   verdict is now bound to a stale commit, so the stage is re-opened to
   re-validate the final commit (payload `{stage_id, prior_state, head_sha,
   reason}`). This kind is REUSED for the #1682 invalidation rather than adding a
-  new issue-comment surface. Both sites have no page-class ping of their own —
-  the status refresh rides the `notifyStatusUpdate` hook (like the PR-upload
-  handler), not a dedicated comment. Listed here so a future reader grepping the
+  new issue-comment surface. Since #4804 the fix-up push handler fires the
+  orchestrator advance only after this re-open, so the re-opened stage is
+  re-armed; that adds no audit kind or comment. Both sites have no page-class
+  ping of their own — the status refresh rides the `notifyStatusUpdate` hook
+  (like the PR-upload handler), not a dedicated comment. Listed here so a future reader grepping the
   acceptance audit categories doesn't mistake it for a comment surface.
 - The bounded-retry give-up audit kind — `slice_integration_failed` (#1243) —
   is a **system-actor audit kind with no dedicated Notifier method and is NOT
