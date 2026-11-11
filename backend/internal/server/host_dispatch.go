@@ -142,6 +142,17 @@ type hostDispatchResponse struct {
 // dependency_check_failed and an unrecordable release 503
 // campaign_audit_unavailable (guardCampaignDispatchHold).
 //
+// Superseded merge-candidate pass (#4811): an IMPLEMENT stage in either
+// admissible arm whose live verify-only pass was triggered for a head that a
+// recorded head write sequenced after the trigger has since moved past is
+// settled not_executed (the ADR-090 settle, pinned to the checked trigger)
+// and answers 409 dispatch_not_admissible with reason
+// merge_candidate_pass_superseded, after the state switch and BEFORE the host
+// memory hold, so it never takes a slot. A malformed newest trigger reads as
+// no pass (admitted); a stage-list or chain read error answers 500
+// dependency_check_failed. The idempotent `dispatched` arm is untouched (a
+// declared residual, #5164). See refuseSupersededMergeCandidatePass.
+//
 // Host memory hold (E85.11 / #4330, INTERIM until ADR-100's adaptive
 // concurrency controller): with Config.HostAdmissionHold wired and held, a
 // stage in either admissible arm — `pending` or `awaiting_host_dispatch` —
@@ -252,6 +263,17 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 	// Full lock order: this admission mutex → the group advisory lock → the
 	// stage row (FOR UPDATE) → the run row (only on paths that already take
 	// stage-then-run; Admit itself never locks a run row).
+	//
+	// postUnlock hooks (#4811) run AFTER the fence below is released: this
+	// defer is registered first, so it runs last (defers are LIFO). The
+	// superseded-pass refusal queues its Orchestrator.Advance here, because
+	// Advance never runs under the admission lock.
+	var postUnlock []func()
+	defer func() {
+		for _, f := range postUnlock {
+			f()
+		}
+	}()
 	if s.cfg.Orchestrator != nil {
 		unlock := s.cfg.Orchestrator.LockStageAdmission(stageID)
 		defer unlock()
@@ -487,6 +509,15 @@ func (s *Server) handleHostDispatchStage(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	// Superseded merge-candidate pass (#4811): an implement stage whose live
+	// verify-only pass was triggered for a head the run has since moved past
+	// is settled not_executed and refused, never spawned. Only the two
+	// admissible arms reach here, and it precedes the host memory hold and the
+	// CAS / slot admission, so a refusal never takes a slot.
+	if s.refuseSupersededMergeCandidatePass(w, r, runRow, stage, &postUnlock) {
+		return
+	}
+
 	// Host memory hold (E85.11 / #4330, INTERIM): only the two admissible
 	// arms reach here (the idempotent dispatched arm returned above), so the
 	// hold refuses every NEW admission and nothing already spawned. Before
@@ -717,6 +748,83 @@ func (s *Server) writeTerminalRunRefusal(w http.ResponseWriter, r *http.Request,
 	s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
 		"run is "+string(state)+"; a terminal run's stage is never host-spawned",
 		map[string]any{"run_id": runID.String(), "run_state": string(state)})
+}
+
+// refuseSupersededMergeCandidatePass is the host-dispatch marker's arm of the
+// #4811 supersede (merge_candidate_supersede.go). It reports whether it wrote
+// a response. It is inert, with no reads, for every non-implement stage; the
+// core is inert without an AuditRepo. The handler's own stage ID is passed to
+// the core, so a stage that is not the run's implement stage short-circuits
+// before any write (approval condition D5).
+//
+// The handler holds the stage's raw admission lock, so with an Orchestrator
+// wired the core runs on a context marked as holding it: nested fence
+// acquisitions on this stage stay re-entrant.
+//
+//   - a detection read error (the stage list, R2, or the audit chain) and a
+//     settle-time read error (approval condition D3) answer 500
+//     dependency_check_failed, the stage untouched;
+//   - a superseded pass answers 409 dispatch_not_admissible with reason
+//     merge_candidate_pass_superseded. A settle that did not finish answers
+//     the same 409 (fail-closed) with settle_step, plus left_state on
+//     before_restore_failed;
+//   - after settled or restore_failed (mergeCandidateSupersedeAdvances, the
+//     producer arm's condition, approval condition D4), Orchestrator.Advance
+//     is queued on *postUnlock, so it runs after the fence is released and
+//     the 409 is written, on a context a client disconnect cannot cancel. It
+//     is skipped when no Orchestrator is wired (approval condition D2);
+//   - no stale pass answers false and the marker proceeds unchanged.
+func (s *Server) refuseSupersededMergeCandidatePass(w http.ResponseWriter, r *http.Request,
+	runRow *run.Run, stage *run.Stage, postUnlock *[]func()) bool {
+	if stage.Type != run.StageTypeImplement {
+		return false
+	}
+	ctx := r.Context()
+	if s.cfg.Orchestrator != nil {
+		ctx = withStageAdmissionHeld(ctx, stage.ID)
+	}
+	sup, err := s.supersedeStaleMergeCandidatePass(ctx, runRow.ID, stage.ID, "")
+	if err != nil {
+		s.writeError(w, r, http.StatusInternalServerError, "dependency_check_failed",
+			"could not read the run's stages or merge-candidate chain to check the stage's verify pass against the run's head",
+			map[string]any{"run_id": runRow.ID.String(), "stage_id": stage.ID.String(), "error": err.Error()})
+		return true
+	}
+	if !sup.Superseded {
+		return false
+	}
+	details := map[string]any{
+		"stage_id":             stage.ID.String(),
+		"reason":               hostDispatchReasonMergeCandidatePassSuperseded,
+		"trigger_sequence":     sup.Stale.TriggerSequence,
+		"expected_head_sha":    sup.Stale.ExpectedHead,
+		"superseding_head_sha": sup.Stale.SupersedingHead,
+		"superseding_category": sup.Stale.Source,
+		"superseding_sequence": sup.Stale.SupersedingSequence,
+		"settled":              sup.Settled,
+	}
+	if !sup.Settled {
+		details["settle_step"] = mergeCandidateSettleStepName(sup.Step)
+	}
+	if sup.Step == mergeCandidateSettleBeforeRestoreFailed {
+		details["left_state"] = string(sup.LeftState)
+	}
+	if mergeCandidateSupersedeAdvances(sup.Step) && s.cfg.Orchestrator != nil {
+		runID := runRow.ID
+		actx := context.WithoutCancel(r.Context())
+		*postUnlock = append(*postUnlock, func() {
+			if aerr := mergeCandidateSupersedeAdvance(actx, s, runID); aerr != nil {
+				s.cfg.Logger.LogAttrs(actx, slog.LevelWarn,
+					"host-dispatch: orchestrator advance after settling a superseded merge-candidate pass failed",
+					slog.String("run_id", runID.String()),
+					slog.String("error", aerr.Error()))
+			}
+		})
+	}
+	s.writeError(w, r, http.StatusConflict, "dispatch_not_admissible",
+		"the stage's merge-candidate verify pass was triggered for a head the run has since moved past; it was settled not_executed instead of spending a slot",
+		details)
+	return true
 }
 
 // failedStageAhead returns the lowest-sequence stage of stages that is
