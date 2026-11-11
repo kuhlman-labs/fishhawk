@@ -1927,24 +1927,64 @@ appended before the pass's slice rows, so the last slice merge stays newest). Or
 not timestamp — the fan-in writes these within one pass, and the dispatch-anchored
 caller compares against a sequence anchor.
 
-Three properties are deliberate:
+Since #4874 the fallback is no longer subordinate: acceptance resolves its head
+through ONE resolver, `acceptanceHeadAsOf` (`acceptance_head.go`), and the
+expected head, the verdict's validated head and Option C's current head all
+read it. Its properties:
 
-- **Strictly SUBORDINATE.** `acceptanceHeadForRun` returns the reported head
-  verbatim whenever one resolves; the fallback fires only on `""`. A
-  non-decomposed run's answer is byte-identical to before
-  (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`).
-- **ACCEPTANCE-ONLY.** `lineageLedgerCategories` and
-  `auditcomplete.HeadReportCategoriesByPrecedence` are NOT widened — they are
-  shared with the branch-lineage guard and the audit-check publisher, and
-  widening them would silently change head resolution for surfaces this has
-  nothing to do with. `resolveFixupExpectedHeadSHA` is unaffected
-  (`TestResolveFixupExpectedHeadSHA_UnaffectedByIntegrationEntry`).
+- **Seed by CHAIN SEQUENCE across both sets.** It ALWAYS reads the five
+  `lineageLedgerCategories` rows and the run's own `integration_commit_recorded`
+  rows, and picks the highest-sequence candidate across them; a reported row
+  wins only an equal-sequence tie, which only a test fake produces. No
+  timestamp is read, so a late integration row newer than a reported head now
+  wins (`TestAcceptanceHeadAsOf_SeedOrderedByChainSequence`,
+  `TestGetStagePrompt_Acceptance_LateIntegrationBeatsOlderReportedHead`). The
+  reverse is pinned too: a NEWER reported head wins
+  (`TestResolveAcceptanceExpectedHeadSHA_ReportedHeadWins`). Correctness rests on
+  the chain's sequence being unique and assigned in serialized append order,
+  not on clocks.
+- **Walked through clean base advances.** The seed then advances through every
+  CLEAN `branch_rebased` row recorded after it, through the same
+  `walkRecordedBaseMerges` and `isCleanAdvance` the fix-up walk uses, so after a
+  Fishhawk rebase acceptance validates the merge commit rather than the
+  pre-rebase head.
+- **Fail-closed reads.** A read error on either seed set or on the base-merge
+  rows returns an error and resolves no head (an empty head makes the dispatch
+  verb and the runner refuse with `acceptance_expected_head_unresolved`), unlike
+  the fix-up path's deliberate seed fallback
+  (`TestAcceptanceHeadAsOf_LedgerReadErrorReturned`,
+  `TestAcceptanceHeadAsOf_BaseMergeReadErrorFailsClosed`).
+- **ACCEPTANCE-ONLY.** `lineageLedgerCategories` (now an alias of
+  `auditcomplete.ReportedHeadLedgerCategories`, membership unchanged) and
+  `auditcomplete.HeadReportCategoriesByPrecedence` are NOT widened: the
+  integration category is read beside the list, never added to it.
+  `resolveFixupExpectedHeadSHA` keeps its timestamp-then-sequence seed, so the
+  two can disagree on a clock-inverted chain
+  (`TestResolveFixupExpectedHeadSHA_SeedKeepsTimestampOrdering`).
 - **DISPATCH-SEQUENCE-BOUNDED on the validated-head path.**
-  `acceptanceValidatedHeadSHA` applies the fallback with `bounded=true` against
-  the same `dispatchSeq` anchor its reported-head walk uses, so a fan-in merge
-  recorded AFTER the acceptance dispatch can never re-bind the verdict to a tree
-  the stage did not validate
-  (`TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`).
+  `acceptanceValidatedHeadSHA` reads `acceptanceHeadAsOf` with `bounded=true`
+  at the `dispatchSeq` anchor: both seed sets and the base-merge rows are cut at
+  the anchor BEFORE selection, so a rebase, scenario commit or fan-in merge
+  recorded AFTER the dispatch can never re-bind the verdict to a tree the stage
+  did not validate (`TestShipAcceptance_PostDispatchRebaseDoesNotBind`,
+  `TestShipAcceptance_PostDispatchIntegrationCommitDoesNotBind`). An error or an
+  empty answer returns `("", false)`, which the clamp below records as
+  `undecidable(head_unresolved)`.
+
+Residuals, none of them fixed here. The `fishhawk_audit_complete` Check Run's
+publisher still resolves `auditcomplete.LatestReportedHeadSHA`'s category
+precedence, so after a clean rebase it can target the pre-rebase ledger head;
+that is a source-read contract gap tracked by
+[#5087](https://github.com/kuhlman-labs/fishhawk/issues/5087), not a reproduced
+incident. The prompt resolves unbounded while the verdict binds at the anchor,
+so a head recorded between dispatch and prompt fetch can be served while the
+verdict names the older head
+([#5082](https://github.com/kuhlman-labs/fishhawk/issues/5082)). A
+plan-stageless recovery child resolves its head from an ancestor while its
+verdict reads only its own chain
+([#5083](https://github.com/kuhlman-labs/fishhawk/issues/5083); reachability
+UNVERIFIED). A vouched or unrecorded commit still does not advance the
+acceptance head (the Captain-held #4856 vouch half).
 
 **Anchor provenance and the retained sequence bound (E64.53 / #3174).** The
 `acceptance_dispatched` anchor is written by `Advance` for a backend-triggered
