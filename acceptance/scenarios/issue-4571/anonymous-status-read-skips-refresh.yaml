@@ -1,0 +1,14 @@
+id: scenario:issue-4571/anonymous-status-read-skips-refresh
+statement: GET /v0/campaigns/{campaign_id}/status with no credential returns the status with dependency_refresh.skipped_reason = insufficient_scope and dependency_refresh.performed = false, for an untenanted campaign.
+verify_hint: 'HTTP: GET /v0/campaigns/{campaign_id}/status with no Authorization header and read dependency_refresh from the body. Decided in-suite by TestStatus_RefreshScopeGate_ThroughRealMux (no-header row) in backend/internal/server/campaign_dependency_refresh_test.go when the preview cannot seed a campaign.'
+steps: 'Posture B in the sanctioned checkout: cd backend && go test ./internal/server/ -count=1 -v -run ''TestStatus_|Refresh''. TestStatus_RefreshScopeGate_ThroughRealMux/no_authorization_header sends GET /v0/campaigns/{id}/status with no Authorization header against an untenanted campaign. Live check: an anonymous GET /v0/campaigns/00000000-0000-4000-8000-000000000001/status -> 404 campaign_not_found. That shows the route is reachable without credentials, but no campaign exists to show the refresh block.'
+assertions:
+    expected: 200 status with skipped_reason=insufficient_scope, performed=false
+    observed_at_record: PASS. The row asserts 200 and skipped_reason=insufficient_scope, with zero resolver, append and refresh-audit counts; performed=false on the denied path. TestStatus_RefreshRequiresWriteCampaignsScope/anonymous also PASS.
+    repro_handle: cd backend && go test ./internal/server/ -count=1 -v -run TestStatus_RefreshScopeGate_ThroughRealMux/no_authorization_header
+origin:
+    issue: 4571
+    pr: 5153
+    run_id: 2dd8bcf1-f514-4276-9deb-2d339fc756d4
+    head_sha: 27c32e505fb5fc1a6e2e3f51105ac12ee49ee281
+    recorded_at: 2026-11-11T03:53:14Z
