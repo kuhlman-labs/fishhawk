@@ -40,7 +40,11 @@ import (
 //   - voidFailedMergeCandidateVerdict voids a failed head's verdict for the
 //     operator's verify-only re-run (#4391), making it re-triggerable; the
 //     in-place conversion of a queued D6 fix-up lives in
-//     merge_candidate_rerun.go.
+//     merge_candidate_rerun.go;
+//   - merge_candidate_supersede.go settles a STALE undispatched pass (its
+//     trigger's head superseded by a later recorded head write) as
+//     not_executed, pinned to the exact trigger it checked (#4811), for the
+//     queue's held / not_queued answers and the host-dispatch marker.
 
 // CategoryStageMergeCandidateVerifyTriggered is the durable trigger that
 // re-opens the implement stage for a verify-only merge-candidate pass (ADR-090
@@ -122,7 +126,19 @@ var (
 	errMergeCandidateInvalidResult  = errors.New("merge_candidate_result must be one of passed, failed, not_executed")
 	errMergeCandidateNoLiveTrigger  = errors.New("no live merge-candidate verify trigger for this stage")
 	errMergeCandidateTriggerPayload = errors.New("the live merge-candidate verify trigger payload is malformed or half-populated")
+	// errMergeCandidateTriggerReplaced is the pinned record's refusal (#4811
+	// R1): the stage's newest trigger is no longer the one the caller checked,
+	// so nothing is written and the replacement stays live.
+	errMergeCandidateTriggerReplaced = errors.New("the stage's newest merge-candidate verify trigger is no longer the one checked; a replacement is live")
 )
+
+// mergeCandidateChainReadError marks a chain READ failure inside a PINNED
+// record (#4811, approval condition D3), so a settle can tell an unreadable
+// chain from a failed append. Error and Unwrap are the underlying error's.
+type mergeCandidateChainReadError struct{ err error }
+
+func (e *mergeCandidateChainReadError) Error() string { return e.err.Error() }
+func (e *mergeCandidateChainReadError) Unwrap() error { return e.err }
 
 // mergeCandidateVerifyTrigger is the stage_merge_candidate_verify_triggered
 // payload: everything the runner needs (branch, base ref, expected head, the
@@ -291,6 +307,14 @@ type mergeCandidateVerifyRefusal struct {
 // queue (serializeMergeCandidateVerifyPass, merge_candidate_queue.go) instead
 // of starting at once; fan_in and an unwired queue take the direct start
 // below unchanged.
+//
+// #4811: a held or not_queued queue answer starts nothing, but it first
+// settles an older UNDISPATCHED pass whose head the run has since moved past
+// (answerQueuedWithoutPass, merge_candidate_supersede.go), so the slot waiter
+// cannot dispatch it stale; an unreadable stage list or chain turns that
+// answer into a refusal. Begin's PENDING REPLACEMENT arm still re-targets a
+// pending pass when the run holds the line, now under the implement stage's
+// admission fence.
 func (s *Server) startMergeCandidateVerifyPass(ctx context.Context, runID uuid.UUID,
 	p mergeCandidateVerifyParams, actor mergeCandidateActor) (*mergeCandidateVerifyStart, *mergeCandidateVerifyRefusal) {
 	if s.mergeCandidateQueueRoutes(p, actor) {
@@ -356,6 +380,25 @@ func (s *Server) beginMergeCandidateVerifyPass(ctx context.Context, runID uuid.U
 	// local-verify group. A dispatched or running pass keeps the refusal
 	// below: its runner already holds the old trigger.
 	if live != nil && (impl.State == run.StageStatePending || impl.State == run.StageStateAwaitingHostDispatch) {
+		// R1 FENCE (#4811). The supersede settle (merge_candidate_supersede.go)
+		// holds this stage's admission fence across detect, record, FailStage
+		// and restore, so the replacement takes the same fence: in-process, no
+		// replacement lands inside the settle record's read-to-append window.
+		// Every read is redone under the fence by re-entering begin on the
+		// marked context (depth 1). LOCK ORDER: as holdStageAdmission's — the
+		// acquisition is bounded by stageAdmissionTryWait, and a miss is a
+		// Transient refusal the queue admission un-admits back to held
+		// (approval condition D1), the beginSupersededFixupPass precedent.
+		if !stageAdmissionHeldBy(ctx, impl.ID) && s.cfg.Orchestrator != nil {
+			fctx, unlock, acquired := s.tryHoldStageAdmission(ctx, impl.ID, stageAdmissionTryWait)
+			if !acquired {
+				return nil, &mergeCandidateVerifyRefusal{Transient: true, Reason: fmt.Sprintf(
+					"the implement stage %s's admission fence is busy (a host dispatch or a stale-pass settle holds it), so the pending pass was not re-targeted and still targets %s; nothing was written; re-invoke fishhawk_rebase_run_branch",
+					impl.ID, live.payload.ExpectedHeadSHA)}
+			}
+			defer unlock()
+			return s.beginMergeCandidateVerifyPass(fctx, runID, p, actor)
+		}
 		replacement := mergeCandidateVerifyTrigger{
 			Branch:                p.Branch,
 			BaseRef:               p.BaseRef,
@@ -565,6 +608,24 @@ func (s *Server) recordMergeCandidateVerified(ctx context.Context, runID, stageI
 // piece of the untrusted evidence is re-bounded before it is stored.
 func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID, stageID uuid.UUID,
 	result, reason string, ev mergeCandidateOutputEvidence, actorKind audit.ActorKind, actorSubject string) (*mergeCandidateVerifiedRecord, error) {
+	return s.recordMergeCandidateVerifiedEvidenceAt(ctx, runID, stageID, 0, result, reason, ev, actorKind, actorSubject)
+}
+
+// recordMergeCandidateVerifiedEvidenceAt is recordMergeCandidateVerifiedEvidence
+// with an optional PIN (#4811 R1): a non-zero pin is the chain sequence of the
+// trigger the caller checked, and the record refuses with
+// errMergeCandidateTriggerReplaced — writing nothing — when the stage's newest
+// trigger is not that one. It is the ONLY pin check. With a pin, a chain read
+// failure is wrapped as mergeCandidateChainReadError. Pin 0 is the unpinned
+// record, byte-identical for every existing caller.
+func (s *Server) recordMergeCandidateVerifiedEvidenceAt(ctx context.Context, runID, stageID uuid.UUID, pin int64,
+	result, reason string, ev mergeCandidateOutputEvidence, actorKind audit.ActorKind, actorSubject string) (*mergeCandidateVerifiedRecord, error) {
+	readErr := func(err error) error {
+		if pin != 0 {
+			return &mergeCandidateChainReadError{err: err}
+		}
+		return err
+	}
 	if !validMergeCandidateResult(result) {
 		return nil, errMergeCandidateInvalidResult
 	}
@@ -573,19 +634,22 @@ func (s *Server) recordMergeCandidateVerifiedEvidence(ctx context.Context, runID
 	}
 	triggers, err := s.stageEntriesStrict(ctx, runID, stageID, CategoryStageMergeCandidateVerifyTriggered)
 	if err != nil {
-		return nil, err
+		return nil, readErr(err)
 	}
 	if len(triggers) == 0 {
 		return nil, errMergeCandidateNoLiveTrigger
 	}
 	newest := triggers[len(triggers)-1]
+	if pin != 0 && newest.Sequence != pin {
+		return nil, errMergeCandidateTriggerReplaced
+	}
 	var trigger mergeCandidateVerifyTrigger
 	if err := json.Unmarshal(newest.Payload, &trigger); err != nil || !trigger.populated() {
 		return nil, errMergeCandidateTriggerPayload
 	}
 	verified, err := s.stageEntriesStrict(ctx, runID, stageID, CategoryMergeCandidateVerified)
 	if err != nil {
-		return nil, err
+		return nil, readErr(err)
 	}
 	if len(verified) > 0 && verified[len(verified)-1].Sequence >= newest.Sequence {
 		var prior mergeCandidateVerifiedPayload
@@ -755,6 +819,14 @@ const (
 	mergeCandidateSettleRestoreFailed
 	// mergeCandidateSettled: the row landed and the pre-pass gate is restored.
 	mergeCandidateSettled
+	// mergeCandidateSettleTriggerReplaced (PINNED settle only, #4811 R1): the
+	// pinned trigger is no longer the stage's newest. Nothing written, no
+	// FailStage, no restore; the replacement stays live.
+	mergeCandidateSettleTriggerReplaced
+	// mergeCandidateSettleReadFailed (PINNED settle only, approval condition
+	// D3): the settle's own chain read failed, so it is told apart from
+	// no_live_trigger. Nothing written.
+	mergeCandidateSettleReadFailed
 )
 
 // settleMergeCandidatePassNotExecuted settles the stage's live merge-candidate
@@ -776,7 +848,31 @@ const (
 // error. It does not log or notify; callers do, so each keeps its own lines.
 func (s *Server) settleMergeCandidatePassNotExecuted(ctx context.Context, runID, stageID uuid.UUID,
 	reason string, beforeRestore func() error) (mergeCandidateSettleStep, error) {
-	trigger := s.resolveMergeCandidateVerifyTrigger(ctx, runID, stageID)
+	return s.settleMergeCandidatePassNotExecutedPinned(ctx, runID, stageID, 0, reason, beforeRestore)
+}
+
+// settleMergeCandidatePassNotExecutedPinned is settleMergeCandidatePassNotExecuted
+// with an optional PIN (#4811 R1): a non-zero pin is the sequence of the
+// trigger the caller checked. With a pin it resolves the live trigger
+// STRICTLY (a read error answers mergeCandidateSettleReadFailed, never
+// no_live_trigger; a malformed newest trigger is no live trigger, R6) and
+// records through recordMergeCandidateVerifiedEvidenceAt, so a replaced
+// trigger answers mergeCandidateSettleTriggerReplaced with NOTHING written and
+// no beforeRestore or restore run. Pin 0 is the unpinned settle, unchanged.
+func (s *Server) settleMergeCandidatePassNotExecutedPinned(ctx context.Context, runID, stageID uuid.UUID, pin int64,
+	reason string, beforeRestore func() error) (mergeCandidateSettleStep, error) {
+	var trigger *mergeCandidateVerifyTrigger
+	if pin == 0 {
+		trigger = s.resolveMergeCandidateVerifyTrigger(ctx, runID, stageID)
+	} else {
+		live, err := s.liveMergeCandidateTrigger(ctx, runID, stageID)
+		if err != nil && !errors.Is(err, errMergeCandidateTriggerPayload) {
+			return mergeCandidateSettleReadFailed, err
+		}
+		if live != nil {
+			trigger = &live.payload
+		}
+	}
 	if trigger == nil {
 		return mergeCandidateSettleNoLiveTrigger, nil
 	}
@@ -788,8 +884,15 @@ func (s *Server) settleMergeCandidatePassNotExecuted(ctx context.Context, runID,
 		}
 		reviewStageID = &rid
 	}
-	if _, err := s.recordMergeCandidateVerified(ctx, runID, stageID, mergeCandidateResultNotExecuted,
-		reason, "", audit.ActorSystem, mergeCandidateSystemSubject); err != nil {
+	if _, err := s.recordMergeCandidateVerifiedEvidenceAt(ctx, runID, stageID, pin, mergeCandidateResultNotExecuted,
+		reason, mergeCandidateOutputEvidence{}, audit.ActorSystem, mergeCandidateSystemSubject); err != nil {
+		var rerr *mergeCandidateChainReadError
+		switch {
+		case errors.Is(err, errMergeCandidateTriggerReplaced):
+			return mergeCandidateSettleTriggerReplaced, nil
+		case errors.As(err, &rerr):
+			return mergeCandidateSettleReadFailed, err
+		}
 		return mergeCandidateSettleRecordFailed, err
 	}
 	if beforeRestore != nil {
