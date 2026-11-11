@@ -1998,25 +1998,87 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 			})
 			return
 		}
+		// No red verdict (#4706). A cancelled/stale conclusion AT the run's
+		// current recorded head was not superseded by a newer push, so
+		// nothing will re-run it: park ci_cancelled with a retrigger next
+		// action instead of ignoring it. The head is resolved lazily (only
+		// past the ci_failed park, so a red verdict always outranks a
+		// cancellation) from the audit-ledger head
+		// (auditcomplete.LatestReportedHeadSHA) — not a forge read. A
+		// cancellation at an OLDER recorded head stays ignored (#3414).
+		head, headOK, herr := s.latestRunHeadSHA(ctx, stage.RunID)
+		if herr != nil {
+			s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
+				"drive: current recorded head unresolvable; ci_cancelled undetermined this tick",
+				slog.String("run_id", stage.RunID.String()), slog.String("error", herr.Error()))
+		}
+		headKnown := herr == nil && headOK
+		if headKnown {
+			if cancelled := s.reviewChecksCancelledAtHead(ctx, runRow, stage, head); len(cancelled) > 0 {
+				// Idempotent on LatestRuleIs, like ci_failed: a persistent
+				// cancellation stamps once, but a new one after a
+				// ci_recovered / awaiting_merge supersession re-parks.
+				if s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCICancelled) {
+					return
+				}
+				names := ciCancelledCheckNamesProse(cancelled)
+				headLabel := truncate(neutralizeUntrustedFixupText(head), 40)
+				s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
+					Rule:  drive.RuleCICancelled,
+					From:  "review:awaiting_approval",
+					To:    "ci_cancelled",
+					Event: "required PR checks cancelled at the current recorded head " + headLabel + ": " + names,
+					NextAction: &drive.NextAction{
+						Action: drive.NextActionRetriggerCI,
+						Detail: "required PR checks (" + names + ") concluded cancelled/stale at the current recorded head " + headLabel + " and no newer push will re-run them; re-run them with fishhawk_retrigger_ci",
+						PRURL:  prURL,
+					},
+				})
+				return
+			}
+		} else if s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCICancelled) {
+			// The head is unresolvable (read error or no recorded head), so
+			// whether the cancellation is still current cannot be decided:
+			// hold the ci_cancelled park rather than lift it on no evidence.
+			return
+		}
 		// No required check carries a red verdict, yet the checks are not
 		// green — they are pending or were superseded by a newer head
 		// (cancelled/stale). If the run's LATEST auto-advance is ci_failed,
 		// the park tripped on a superseded conclusion (the #3414 wedge):
 		// stamp ci_recovered, which supersedes the derived ci_failed status
-		// so next_actions leaves the ci_failed_unroutable dead end. When the
-		// latest is NOT ci_failed there is nothing to recover — return
+		// so next_actions leaves the ci_failed_unroutable dead end. A
+		// ci_cancelled latest whose cancellation is no longer at the current
+		// recorded head (a newer head landed, #4706) is lifted the same way.
+		// When the latest is neither there is nothing to recover — return
 		// silently as before (a merely-pending check never advances).
-		if s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCIFailed) {
+		recoverFrom := drive.Rule("")
+		switch {
+		case s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCIFailed):
+			recoverFrom = drive.RuleCIFailed
+		case s.drive.LatestRuleIs(ctx, stage.RunID, drive.RuleCICancelled):
+			recoverFrom = drive.RuleCICancelled
+		}
+		if recoverFrom != "" {
 			pending := s.reviewChecksPending(ctx, runRow, stage)
-			names := strings.Join(pending, ", ")
+			var event, detail string
+			if recoverFrom == drive.RuleCIFailed {
+				names := strings.Join(pending, ", ")
+				event = "no required PR check carries a red verdict at the latest observed head; awaiting: " + names
+				detail = "the red conclusion that parked this run was superseded by a newer head; wait for the remaining required checks (" + names + ") to conclude"
+			} else {
+				names := ciCancelledCheckNamesProse(pending)
+				event = "no required PR check is cancelled at the current recorded head; awaiting: " + names
+				detail = "the cancellation that parked this run is no longer at the current recorded head; wait for the remaining required checks (" + names + ") to conclude"
+			}
 			s.drive.Record(ctx, stage.RunID, &stage.ID, drive.Advance{
 				Rule:  drive.RuleCIRecovered,
-				From:  "ci_failed",
+				From:  string(recoverFrom),
 				To:    "review:awaiting_approval",
-				Event: "no required PR check carries a red verdict at the latest observed head; awaiting: " + names,
+				Event: event,
 				NextAction: &drive.NextAction{
 					Action: "await_checks",
-					Detail: "the red conclusion that parked this run was superseded by a newer head; wait for the remaining required checks (" + names + ") to conclude",
+					Detail: detail,
 					PRURL:  prURL,
 				},
 			})
@@ -2157,7 +2219,8 @@ func (s *Server) ObserveParkedReviewForDrive(ctx context.Context, stage *run.Sta
 		// acceptance passes, is skipped, or settles not-validated.
 	}
 	// Idempotent on Recorded (per-(run,stage) ever-recorded) EXCEPT when the
-	// run's latest entry is a CI park (ci_failed or ci_recovered) or the
+	// run's latest entry is a CI park (ci_failed, ci_recovered or
+	// ci_cancelled, #4706) or the
 	// review-coverage hold (#4219, see below): a run that
 	// reached awaiting_merge, then parked ci_failed on a superseded head, must
 	// RE-ASSERT awaiting_merge once the checks go green — delegation's
@@ -2524,15 +2587,78 @@ func checksAcceptanceLead(resolved bool) string {
 }
 
 // ciParkIsLatest reports whether the run's latest run_auto_advanced entry
-// is a CI park — ci_failed or ci_recovered (#3414). It is the narrow
-// carve-out on the checks_green_awaiting_merge Recorded guard: a run that
-// went green after a CI park must re-assert awaiting_merge because
-// delegation.evalGatesResolvedCIGreen and derived_status both key on the
-// LATEST entry. Fail-open exactly like LatestRuleIs (a degraded audit read
-// re-stamps rather than suppressing awaiting_merge forever).
+// is a CI park — ci_failed, ci_recovered (#3414) or ci_cancelled (#4706).
+// It is the narrow carve-out on the checks_green_awaiting_merge Recorded
+// guard: a run that went green after a CI park must re-assert
+// awaiting_merge because delegation.evalGatesResolvedCIGreen and
+// derived_status both key on the LATEST entry. Fail-open exactly like
+// LatestRuleIs (a degraded audit read re-stamps rather than suppressing
+// awaiting_merge forever).
 func (s *Server) ciParkIsLatest(ctx context.Context, runID uuid.UUID) bool {
 	return s.drive.LatestRuleIs(ctx, runID, drive.RuleCIFailed) ||
-		s.drive.LatestRuleIs(ctx, runID, drive.RuleCIRecovered)
+		s.drive.LatestRuleIs(ctx, runID, drive.RuleCIRecovered) || s.drive.LatestRuleIs(ctx, runID, drive.RuleCICancelled)
+}
+
+// ciCancelledProseMaxNames and ciCancelledProseMaxNameBytes bound the
+// check-name list the ci_cancelled Event/Detail render (#4706).
+const (
+	ciCancelledProseMaxNames     = 5
+	ciCancelledProseMaxNameBytes = 100
+)
+
+// ciCancelledCheckNamesProse renders required-check context names for the
+// NEW ci_cancelled park and recovery prose (#4706). The names come from the
+// run's RequiredChecksSnapshot (branch protection / rulesets at run
+// creation), and the text flows unbounded through the run_auto_advanced
+// payload into GET /v0/runs next_action.detail and the MCP Reason, so each
+// name is structure-neutralized then bounded with the package's
+// truncate(neutralizeUntrustedFixupText(x), n) idiom (fixupRecoveryReasonLabel),
+// at most ciCancelledProseMaxNames are listed, and the rest are counted as
+// "(+N more)". The pre-existing ci_failed text is deliberately left as-is.
+func ciCancelledCheckNamesProse(names []string) string {
+	shown := names
+	if len(shown) > ciCancelledProseMaxNames {
+		shown = shown[:ciCancelledProseMaxNames]
+	}
+	parts := make([]string, 0, len(shown))
+	for _, name := range shown {
+		parts = append(parts, truncate(neutralizeUntrustedFixupText(name), ciCancelledProseMaxNameBytes))
+	}
+	out := strings.Join(parts, ", ")
+	if omitted := len(names) - len(shown); omitted > 0 {
+		out += fmt.Sprintf(" (+%d more)", omitted)
+	}
+	return out
+}
+
+// reviewChecksCancelledAtHead returns the required-check contexts whose
+// latest row against the review stage concluded cancelled/stale AT head,
+// the run's current recorded head (#4706, stagecheck CancelledAtHead). It
+// iterates ONLY RequiredChecksSnapshot.Contexts — the same source
+// reviewChecksFailed uses, never check_run payload text — and is
+// conservative on the same gaps: a nil OR empty snapshot or an unwired
+// StageCheckRepo returns nil, and an unreadable row is skipped, so
+// ci_cancelled can never be over-claimed. A red verdict is not this
+// helper's business (CancelledAtHead is false for it); the observer parks
+// ci_failed first. The caller resolves head and never passes an unknown one.
+func (s *Server) reviewChecksCancelledAtHead(ctx context.Context, runRow *run.Run, stage *run.Stage, head string) []string {
+	if runRow.RequiredChecksSnapshot == nil || len(runRow.RequiredChecksSnapshot.Contexts) == 0 {
+		return nil
+	}
+	if s.cfg.StageCheckRepo == nil {
+		return nil
+	}
+	var cancelled []string
+	for _, name := range runRow.RequiredChecksSnapshot.Contexts {
+		check, err := s.cfg.StageCheckRepo.LatestForStageAndName(ctx, stage.ID, name)
+		if err != nil {
+			continue
+		}
+		if check.CancelledAtHead(head) {
+			cancelled = append(cancelled, name)
+		}
+	}
+	return cancelled
 }
 
 // reviewChecksFailed returns the required-check contexts whose latest
@@ -2542,7 +2668,10 @@ func (s *Server) ciParkIsLatest(ctx context.Context, runID uuid.UUID) bool {
 // the code and never trips ci_failed (#3414), and a StatePending
 // (in-flight) or StateNotTracked (no row) check is not failed either — so
 // neither a still-running check nor a head superseded by a newer push can
-// over-claim a failure. Conservative on any gap: a nil OR empty snapshot
+// over-claim a failure. A cancelled/stale conclusion AT the current
+// recorded head is reviewChecksCancelledAtHead's (ci_cancelled, #4706),
+// consulted only after this returns nothing, so a red verdict outranks it.
+// Conservative on any gap: a nil OR empty snapshot
 // or an unwired StageCheckRepo returns nil, so ci_failed can never be
 // over-claimed (in particular an unresolved run never mirrors a failure —
 // #2497).
@@ -2570,7 +2699,8 @@ func (s *Server) reviewChecksFailed(ctx context.Context, runRow *run.Run, stage 
 // row against the review stage is neither a pass nor a red verdict —
 // pending (in-flight), superseded (cancelled/stale), or untracked (no
 // row). Used ONLY to name the outstanding contexts in the ci_recovered
-// Event/Detail prose (#3414); it makes no gate decision. Conservative on
+// Event/Detail prose (#3414; the ci_cancelled recovery renders them through
+// ciCancelledCheckNamesProse, #4706); it makes no gate decision. Conservative on
 // any gap exactly like reviewChecksFailed: a nil OR empty snapshot or an
 // unwired StageCheckRepo returns nil.
 func (s *Server) reviewChecksPending(ctx context.Context, runRow *run.Run, stage *run.Stage) []string {
