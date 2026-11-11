@@ -1,0 +1,575 @@
+# acceptance-rebased-head — three feature_change runs whose acceptance stage is
+# DISPATCHED after the head moved past its first reported row, so the
+# acceptance prompt's acceptance_expected_head_sha names the ADVANCED head the
+# server's acceptanceHeadAsOf resolves, not the seed (#4874). Shaped after
+# acceptance-dispatched: every run carries an approved standard_v1 plan with
+# two drivable criteria and a pull_request artifact, so a signed verdict can
+# ship against it.
+#
+# Audit rows are ORDERED per run (the chain sequence is the order below):
+#
+#   rebased-run              pull_request_opened(S), a CLEAN branch_rebased
+#                            S -> M (clean_verified true), then the
+#                            acceptance_dispatched anchor: the head is M.
+#   rebased-parent           integration_commit_recorded(F), a CLEAN
+#                            branch_rebased F -> P, then the anchor: the head
+#                            is P, and the run branch is the server-derived
+#                            fishhawk/run-<first 8>-consolidated.
+#   late-integration-parent  fixup_pushed(H), then a LATER
+#                            integration_commit_recorded(F2), then the anchor:
+#                            the newer integration row seeds by chain
+#                            sequence, so the head is F2 (the seed repair is
+#                            observable on the wire).
+#
+# Neither parent serves an acceptance_pull_request_number: devfixtures.Run has
+# no pull_request_url and this scenario does not extend the fixture schema, so
+# the run-row fallback reads no URL and the field is 0 (omitted). That is the
+# expected shape, not a defect; the real PR-number fallback is decided by
+# TestResolveAcceptanceRunBranchAndPR_DecomposedParent with a real run URL.
+# The parents are ordinary runs carrying integration rows, not decomposed
+# runs with children.
+#
+# Handles (`key`) are scenario-local; every Apply mints fresh ids.
+runs:
+  - key: rebased-run
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-rebased-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+  - key: rebased-parent
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-rebased-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+  - key: late-integration-parent
+    repo: kuhlman-labs/fishhawk
+    workflow_id: feature_change
+    trigger_ref: "issue:4874"
+    state: running
+    workflow_spec: |
+      version: "2"
+      workflows:
+        feature_change:
+          description: Seeded fixture workflow (acceptance-rebased-head).
+          autonomy: low
+          stages:
+            - id: plan
+              type: plan
+              executor:
+                agent: claude-code
+              inputs:
+                - source: github_issue
+                  required: true
+              produces:
+                - artifact: plan
+                  schema: standard_v1
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: implement
+              type: implement
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+              produces:
+                - artifact: pull_request
+            - id: review
+              type: review
+              executor:
+                human: true
+              inputs:
+                - artifact: pull_request
+                  from_stage: implement
+              gates:
+                - type: approval
+                  approvals:
+                    count: 1
+                    not: [author, agent]
+            - id: acceptance
+              type: acceptance
+              executor:
+                agent: claude-code
+              inputs:
+                - artifact: plan
+                  from_stage: plan
+                - artifact: pull_request
+                  from_stage: implement
+              egress:
+                target_hosts:
+                  - localhost:8090
+              produces:
+                - artifact: acceptance
+
+stages:
+  - key: rr-plan
+    run: rebased-run
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: rr-implement
+    run: rebased-run
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: rr-review
+    run: rebased-run
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: rr-acceptance
+    run: rebased-run
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+  - key: rp-plan
+    run: rebased-parent
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: rp-implement
+    run: rebased-parent
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: rp-review
+    run: rebased-parent
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: rp-acceptance
+    run: rebased-parent
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+  - key: lp-plan
+    run: late-integration-parent
+    sequence: 1
+    type: plan
+    executor_kind: agent
+    executor_ref: claude-code
+    requires_approval: true
+    state: succeeded
+  - key: lp-implement
+    run: late-integration-parent
+    sequence: 2
+    type: implement
+    executor_kind: agent
+    executor_ref: claude-code
+    state: succeeded
+  - key: lp-review
+    run: late-integration-parent
+    sequence: 3
+    type: review
+    executor_kind: human
+    executor_ref: human
+    requires_approval: true
+    state: succeeded
+  - key: lp-acceptance
+    run: late-integration-parent
+    sequence: 4
+    type: acceptance
+    executor_kind: agent
+    executor_ref: claude-code
+    state: dispatched
+
+artifacts:
+  - key: rr-plan
+    stage: rr-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-rebased-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: rr-pr
+    stage: rr-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-rebased-run",
+        "head_sha": "1111111111111111111111111111111111111111",
+        "base_sha": "3333333333333333333333333333333333333333",
+        "title": "Seeded fixture pull request (acceptance-rebased-head, rebased-run).",
+        "files_changed_count": 1
+      }
+  - key: rp-plan
+    stage: rp-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-rebased-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: rp-pr
+    stage: rp-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-rebased-parent",
+        "head_sha": "4444444444444444444444444444444444444444",
+        "base_sha": "3333333333333333333333333333333333333333",
+        "title": "Seeded fixture pull request (acceptance-rebased-head, rebased-parent).",
+        "files_changed_count": 1
+      }
+  - key: lp-plan
+    stage: lp-plan
+    kind: plan
+    schema_version: standard_v1
+    content: |
+      {
+        "plan_version": "standard_v1",
+        "ticket_reference": {
+          "type": "github_issue",
+          "url": "https://github.com/kuhlman-labs/fishhawk/issues/4874",
+          "id": "kuhlman-labs/fishhawk#4874"
+        },
+        "generated_by": {
+          "agent": "claude-code",
+          "model": "claude-opus-4-8",
+          "timestamp": "2026-01-01T09:00:00Z"
+        },
+        "summary": "Seeded fixture plan for the acceptance-rebased-head scenario.",
+        "scope": {
+          "files": [
+            {"path": "README.md", "operation": "modify"}
+          ]
+        },
+        "approach": [
+          {"step": 1, "description": "Edit README.md."}
+        ],
+        "verification": {
+          "test_strategy": "None: this is a seeded fixture, never implemented.",
+          "rollback_plan": "Revert the PR.",
+          "acceptance_criteria": [
+            {
+              "id": "run-readable",
+              "statement": "GET /v0/runs/{run_id} returns 200 with the seeded run's fields.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id} -> 200"
+            },
+            {
+              "id": "stages-listed",
+              "statement": "GET /v0/runs/{run_id}/stages lists the run's stages.",
+              "source": "explicit",
+              "source_ref": "kuhlman-labs/fishhawk#4874",
+              "blocking": true,
+              "verify_hint": "GET /v0/runs/{run_id}/stages -> 200"
+            }
+          ]
+        },
+        "predicted_runtime_minutes": 5,
+        "predicted_runtime_confidence": "high"
+      }
+  - key: lp-pr
+    stage: lp-implement
+    kind: pull_request
+    content: |
+      {
+        "pr_number": 4874,
+        "pr_url": "https://github.com/kuhlman-labs/fishhawk/pull/4874",
+        "branch": "e97.24-late-integration-parent",
+        "head_sha": "6666666666666666666666666666666666666666",
+        "base_sha": "3333333333333333333333333333333333333333",
+        "title": "Seeded fixture pull request (acceptance-rebased-head, late-integration-parent).",
+        "files_changed_count": 1
+      }
+
+approvals:
+  - stage: rr-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+  - stage: rp-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+  - stage: lp-plan
+    approver_subject: operator:devfixtures
+    decision: approve
+    surface: api
+
+audit:
+  - run: rebased-run
+    stage: rr-implement
+    category: pull_request_opened
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"1111111111111111111111111111111111111111","branch":"e97.24-rebased-run","pr_number":4874,"pr_url":"https://github.com/kuhlman-labs/fishhawk/pull/4874"}'
+  - run: rebased-run
+    stage: rr-implement
+    category: branch_rebased
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"prior_head_sha":"1111111111111111111111111111111111111111","merge_commit_sha":"2222222222222222222222222222222222222222","new_head_sha":"2222222222222222222222222222222222222222","base_tip_sha":"3333333333333333333333333333333333333333","already_up_to_date":false,"clean_verified":true}'
+  - run: rebased-run
+    stage: rr-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: rebased-parent
+    stage: rp-implement
+    category: integration_commit_recorded
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"merge_sha":"4444444444444444444444444444444444444444"}'
+  - run: rebased-parent
+    stage: rp-implement
+    category: branch_rebased
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"prior_head_sha":"4444444444444444444444444444444444444444","merge_commit_sha":"5555555555555555555555555555555555555555","new_head_sha":"5555555555555555555555555555555555555555","base_tip_sha":"3333333333333333333333333333333333333333","already_up_to_date":false,"clean_verified":true}'
+  - run: rebased-parent
+    stage: rp-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'
+  - run: late-integration-parent
+    stage: lp-implement
+    category: fixup_pushed
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"head_sha":"6666666666666666666666666666666666666666"}'
+  - run: late-integration-parent
+    stage: lp-implement
+    category: integration_commit_recorded
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"merge_sha":"7777777777777777777777777777777777777777"}'
+  - run: late-integration-parent
+    stage: lp-acceptance
+    category: acceptance_dispatched
+    actor_kind: system
+    actor_subject: devfixtures
+    payload: '{"sequence":4,"executor":"agent","source":"host_dispatch"}'

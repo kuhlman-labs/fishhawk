@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/kuhlman-labs/fishhawk/runner/internal/gitops"
+	"github.com/kuhlman-labs/fishhawk/runner/internal/scenario"
 )
 
 // acceptanceTreeRepo builds a dispatch checkout whose main branch carries
@@ -491,5 +492,97 @@ func TestProvisionAcceptanceTree_CredentialChallengeFailsFast(t *testing.T) {
 	// which warns and returns a no-op teardown — never a stage failure.
 	if !strings.Contains(logged, `"event":"acceptance_tree_failed"`) {
 		t.Errorf("want the warn-and-proceed acceptance_tree_failed line in:\n%s", logged)
+	}
+}
+
+// TestProvisionAcceptanceTree_RebasedHead_ExcludesRetiredScenarios is the
+// runner half of #4874 over a real git repository: base commit B retires
+// scenario X in retired.yaml, and M merges the run head S with B (the commit a
+// Fishhawk rebase records). Provisioning the tree at M and loading the replay
+// corpus excludes X (RetiredExcluded 1); provisioning at the un-advanced seed
+// S does not (RetiredExcluded 0, the incident's retired_excluded 0). The pair
+// is discriminating: only the head the server now serves sees the retirement.
+func TestProvisionAcceptanceTree_RebasedHead_ExcludesRetiredScenarios(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not available")
+	}
+	repo := t.TempDir()
+	git := func(args ...string) string {
+		t.Helper()
+		cmd := exec.Command("git", args...)
+		cmd.Dir = repo
+		cmd.Env = append(os.Environ(),
+			"GIT_AUTHOR_NAME=t", "GIT_AUTHOR_EMAIL=t@e",
+			"GIT_COMMITTER_NAME=t", "GIT_COMMITTER_EMAIL=t@e")
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %s: %v\n%s", strings.Join(args, " "), err, out)
+		}
+		return strings.TrimSpace(string(out))
+	}
+	write := func(rel, body string) {
+		t.Helper()
+		p := filepath.Join(repo, filepath.FromSlash(rel))
+		if err := os.MkdirAll(filepath.Dir(p), 0o755); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	const scenarioID = "scenario:issue-7/x"
+	retiredRel := scenario.CorpusDir + "/" + scenario.RetiredFile
+	git("init", "-q", "--initial-branch=main")
+	write("acceptance/scenarios/issue-7/x.yaml", scenarioYAML(scenarioID, 7, 70, "r0", time.Date(2026, 9, 1, 0, 0, 0, 0, time.UTC)))
+	write(retiredRel, "retired: []\n")
+	git("add", "-A")
+	git("commit", "-q", "-m", "root: corpus with scenario X")
+
+	// The run head S, on its own branch.
+	git("checkout", "-q", "-b", "run")
+	write("feature.txt", "run change\n")
+	git("add", "-A")
+	git("commit", "-q", "-m", "S: run change")
+	seedS := git("rev-parse", "HEAD")
+
+	// The base advance B retires X.
+	git("checkout", "-q", "main")
+	write(retiredRel, "retired:\n  - id: "+scenarioID+"\n    reason: behaviour replaced\n    run_id: r0\n    pr: 70\n    retired_at: \"2026-09-02T00:00:00Z\"\n")
+	git("add", "-A")
+	git("commit", "-q", "-m", "B: retire X")
+
+	// M merges S with B, the commit a clean branch_rebased row names.
+	git("checkout", "-q", "run")
+	git("merge", "-q", "--no-ff", "-m", "M: merge main into run", "main")
+	mergeM := git("rev-parse", "HEAD")
+	if got := git("rev-parse", mergeM+"^1"); got != seedS {
+		t.Fatalf("assert: M's first parent = %s, want S %s", got, seedS)
+	}
+	git("checkout", "-q", "main")
+
+	redirectAcceptanceTreeDir(t)
+	excludedAt := func(head, stageID string) int {
+		t.Helper()
+		var log strings.Builder
+		teardown := provisionAcceptanceTree(context.Background(), repo, head, "run1", stageID, nil, &log)
+		defer teardown()
+		target := acceptanceTreePath("run1", stageID)
+		if _, err := os.Stat(target); err != nil {
+			t.Fatalf("provisioned tree missing at %q: %v\nlog:\n%s", target, err, log.String())
+		}
+		set, _, err := loadReplayCorpus(target, nil, replayCorpusConfig{maxScenarios: 10}, "run1", &log)
+		if err != nil {
+			t.Fatalf("loadReplayCorpus at %s: %v\nlog:\n%s", head, err, log.String())
+		}
+		if set.CorpusSize+set.RetiredExcluded == 0 {
+			t.Fatalf("loadReplayCorpus at %s found no scenario at all: %+v", head, set)
+		}
+		return set.RetiredExcluded
+	}
+	if got := excludedAt(mergeM, "stage-m"); got != 1 {
+		t.Errorf("RetiredExcluded at the rebased head M = %d, want 1 (B's retirement is in M's tree)", got)
+	}
+	if got := excludedAt(seedS, "stage-s"); got != 0 {
+		t.Errorf("RetiredExcluded at the seed S = %d, want 0 (the un-advanced tree lacks B's retirement)", got)
 	}
 }

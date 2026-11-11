@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -1362,4 +1363,1187 @@ func TestMergeCandidateVerifyState_TransferredSource(t *testing.T) {
 	if got, want := rec.VerdictSequence, lastSeq(CategoryMergeCandidateVerified); got != want {
 		t.Errorf("recorded VerdictSequence = %d, want the merge_candidate_verified row's %d", got, want)
 	}
+}
+
+// --- ADR-142 (#4874): scenario-corpus commits keep the recorded requirement --
+//
+// Every row reads the REAL mergeCandidateVerifyState. Recorded-obligation rows
+// run on BOTH fixtures: mcvFixture wires no GitHub client (the ADR-090 D7
+// cannot-probe deployment) and mcGateFixture is fully wired, so the
+// uncertain arm (d) and the vouch ladder really probe there. The live head is
+// mcvHead (scC) unless a row says otherwise; sequences are stamped in append
+// order.
+
+const (
+	scS  = "5c00000000000000000000000000000000000001" // a runner-gated root
+	scM  = "5c00000000000000000000000000000000000002" // a recorded producer's head
+	scC1 = "5c00000000000000000000000000000000000003" // an intermediate scenario commit
+	scF  = "5c00000000000000000000000000000000000004" // a gated fix-up / integrated head
+	scF0 = "5c00000000000000000000000000000000000005" // an older integration head
+	scV  = "5c00000000000000000000000000000000000006" // an operator-vouched head
+	scG  = "5c00000000000000000000000000000000000007" // a newer gated head
+	scX  = "5c00000000000000000000000000000000000008" // an unrelated SHA
+	scB  = "5c00000000000000000000000000000000000009" // a base commit
+	scV2 = "5c0000000000000000000000000000000000000a" // a second vouched head
+	scC0 = "5c0000000000000000000000000000000000000b" // an earlier intermediate
+	scC  = mcvHead                                    // the live scenario head
+)
+
+// scScenario appends an acceptance_scenarios_pushed row reporting head on
+// base; a nil base omits the field, and any other non-string is written as is.
+func scScenario(f *mcvFixture, head string, base any) {
+	p := map[string]any{"head_sha": head, "branch": mcvBranch}
+	if base != nil {
+		p["base_sha"] = base
+	}
+	f.appendRow(nil, CategoryAcceptanceScenariosPushed, p)
+}
+
+func scHeadRow(f *mcvFixture, category, head string) {
+	f.appendRow(nil, category, map[string]any{"head_sha": head})
+}
+
+func scVouch(f *mcvFixture, sha string) {
+	f.appendRow(nil, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": sha})
+}
+
+func scRebase(f *mcvFixture, head string) { f.seedRebased(head, head, false) }
+
+func scNoOp(f *mcvFixture) { f.seedRebased("", "", true) }
+
+func scIntegration(f *mcvFixture, sha string) {
+	f.appendRow(nil, auditcomplete.CategoryIntegrationCommitRecorded, map[string]any{"merge_sha": sha})
+}
+
+func scTransfer(f *mcvFixture, to string) {
+	f.appendRow(nil, CategoryMergeCandidateVerdictTransferred, mergeCandidateTransferPayload{
+		FromHead: scM, ToHead: to, ReasonCode: transferReasonIndependent})
+}
+
+// scBaseBringing is the compare pair for a terminal t that brought in base
+// commit scB relative to reference ref: ref...t carries t and scB, main...t
+// carries only t, so scB is a base commit t brought in.
+func scBaseBringing(ref, t string) map[string][]string {
+	return map[string][]string{ref + "..." + t: {t, scB}, mcvBaseRef + "..." + t: {t}}
+}
+
+// scEdit is the D8 operator-edit pair: ref...t carries only t, which main...t
+// also carries, so t brings in no base commit.
+func scEdit(ref, t string) map[string][]string {
+	return map[string][]string{ref + "..." + t: {t}, mcvBaseRef + "..." + t: {ref, t}}
+}
+
+const (
+	scD7WarnText    = "a scenario commit's reported chain is unresolved and the deployment cannot probe"
+	scVouchWarnText = "cannot probe an operator-vouched head for base commits"
+)
+
+type scWant struct{ state, cause string }
+
+var (
+	scNotRequired  = scWant{mergeCandidateStateNotRequired, ""}
+	scUnverBase    = scWant{mergeCandidateStateUnverified, mergeCandidateCauseBaseAdvance}
+	scUnverConfl   = scWant{mergeCandidateStateUnverified, mergeCandidateCauseConflictResolution}
+	scUnverFanIn   = scWant{mergeCandidateStateUnverified, mergeCandidateCauseFanIn}
+	scPassedBase   = scWant{mergeCandidateStatePassed, mergeCandidateCauseBaseAdvance}
+	scFailedBase   = scWant{mergeCandidateStateFailed, mergeCandidateCauseBaseAdvance}
+	scInFlightBase = scWant{mergeCandidateStateInFlight, mergeCandidateCauseBaseAdvance}
+)
+
+// scRow is one classification row. want is the unprobeable (mcvFixture)
+// answer; gate, when set, is the probeable (mcGateFixture) answer, else the
+// same. only restricts a row to one fixture ("mcv" or "gate").
+type scRow struct {
+	name     string
+	spec     string
+	head     string
+	mode     MergeCandidateTransferMode
+	seed     func(f *mcvFixture)
+	compares map[string][]string
+	want     scWant
+	gate     *scWant
+	source   string
+	// warn names a WARN the unprobeable run must log ("" asserts the (d)
+	// residual WARN is absent); zeroCompares asserts the probeable run made
+	// no compare.
+	warn         string
+	zeroCompares bool
+	only         string
+}
+
+func scGate(w scWant) *scWant { return &w }
+
+func runScenarioRows(t *testing.T, rows []scRow) {
+	t.Helper()
+	for _, tc := range rows {
+		for _, fx := range []string{"mcv", "gate"} {
+			if tc.only != "" && tc.only != fx {
+				continue
+			}
+			tc, fx := tc, fx
+			t.Run(tc.name+"/"+fx, func(t *testing.T) {
+				spec := tc.spec
+				if spec == "" {
+					spec = mcvUndelegatedSpecYAML
+				}
+				var f *mcvFixture
+				var g *mcGateFixture
+				if fx == "gate" {
+					g = newMCGateFixture(t, spec)
+					g.gh.compares = tc.compares
+					f = g.mcvFixture
+				} else {
+					f = newMCVFixture(t, spec)
+				}
+				f.s.cfg.MergeCandidateTransfer.Mode = tc.mode
+				buf := captureLogger(f.s)
+				tc.seed(f)
+				head := tc.head
+				if head == "" {
+					head = scC
+				}
+				got, err := f.s.mergeCandidateVerifyState(context.Background(), f.runRow(t), head)
+				if err != nil {
+					t.Fatalf("err = %v, want a state", err)
+				}
+				want := tc.want
+				if fx == "gate" && tc.gate != nil {
+					want = *tc.gate
+				}
+				if got.State != want.state || got.Cause != want.cause {
+					t.Errorf("state = %q cause %q, want state %q cause %q (%+v)", got.State, got.Cause, want.state, want.cause, got)
+				}
+				if tc.source != "" && got.Source != tc.source {
+					t.Errorf("source = %q, want %q", got.Source, tc.source)
+				}
+				logs := buf.String()
+				if fx == "mcv" {
+					if tc.warn != "" && !strings.Contains(logs, "level=WARN") || tc.warn != "" && !strings.Contains(logs, tc.warn) {
+						t.Errorf("logs lack the WARN %q:\n%s", tc.warn, logs)
+					}
+					if tc.warn != scD7WarnText && strings.Contains(logs, scD7WarnText) {
+						t.Errorf("logs carry the scenario D7 WARN on a row that must not reach (d):\n%s", logs)
+					}
+				}
+				if fx == "gate" {
+					if strings.Contains(logs, scD7WarnText) {
+						t.Errorf("a probeable run logged the cannot-probe WARN:\n%s", logs)
+					}
+					if tc.zeroCompares && len(g.gh.compareKeys) != 0 {
+						t.Errorf("compares = %v, want none", g.gh.compareKeys)
+					}
+				}
+			})
+		}
+	}
+}
+
+// TestMergeCandidateVerifyState_ScenarioCommit pins ADR-142 D1, D3, D4 and D5
+// on the real predicate, for every merge-gate, no-op, uncertain-chain and
+// parent row in the plan's test strategy. The rows named "ordinary S + C on
+// S" and "fix-up F after a rebase + C on F" are the positive proof that a
+// genuine runner-gated root keeps today's answer.
+func TestMergeCandidateVerifyState_ScenarioCommit(t *testing.T) {
+	rebasedM := func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scRebase(f, scM) }
+	rows := []scRow{
+		// Merge gate: a recorded rebase M, then C on M.
+		{name: "M unverified, C on M", seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scM) }, want: scUnverBase, zeroCompares: true},
+		{name: "M passed, C on M", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "M failed, C on M", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.seedVerdict(scM, mergeCandidateResultFailed)
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "M in flight, C on M", seed: func(f *mcvFixture) { rebasedM(f); f.seedTrigger(scM); scScenario(f, scC, scM) }, want: scUnverBase},
+		{name: "conflict-resolution M, C on M", seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scHeadRow(f, CategoryConflictResolutionPushed, scM)
+			scScenario(f, scC, scM)
+		}, want: scUnverConfl},
+		{name: "parent F passed, C on F", seed: func(f *mcvFixture) {
+			scIntegration(f, scF)
+			f.seedVerdict(scF, mergeCandidateResultPassed)
+			scScenario(f, scC, scF)
+		}, want: scUnverFanIn},
+		{name: "C1 passed then C2", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC1, scM)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "C1 failed then C2", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC1, scM)
+			f.seedVerdict(scC1, mergeCandidateResultFailed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "C1 in flight then C2", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC1, scM)
+			f.seedTrigger(scC1)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "exact C2 passed, C1 and M failed", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.seedVerdict(scM, mergeCandidateResultFailed)
+			scScenario(f, scC1, scM)
+			f.seedVerdict(scC1, mergeCandidateResultFailed)
+			scScenario(f, scC, scC1)
+			f.seedVerdict(scC, mergeCandidateResultPassed)
+		}, want: scPassedBase},
+		{name: "exact C2 failed, C1 and M passed", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scScenario(f, scC1, scM)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+			f.seedVerdict(scC, mergeCandidateResultFailed)
+		}, want: scFailedBase},
+		{name: "exact C2 live, C1 and M passed", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scScenario(f, scC1, scM)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+			f.seedTrigger(scC)
+		}, want: scInFlightBase},
+		{name: "exact C passed, nothing at M", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC, scM)
+			f.seedVerdict(scC, mergeCandidateResultPassed)
+		}, want: scPassedBase},
+		{name: "not_executed at C", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC, scM)
+			f.seedTrigger(scC)
+			f.seedVerdict(scC, mergeCandidateResultNotExecuted)
+		}, want: scUnverBase},
+		{name: "no declared verify", spec: mcvNoVerifySpecYAML, seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scM) }, want: scNotRequired, zeroCompares: true},
+		{name: "non-scenario ordinary head", head: scX, seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scM) }, want: scNotRequired},
+		{name: "ordinary S + C on S", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scScenario(f, scC, scS) }, want: scNotRequired, zeroCompares: true},
+		{name: "fix-up F after a rebase + C on F", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scHeadRow(f, "fixup_pushed", scF)
+			scScenario(f, scC, scF)
+		}, want: scNotRequired, zeroCompares: true},
+		{name: "undecodable branch_rebased below C", seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			f.appendRow(nil, CategoryBranchRebased, map[string]any{"already_up_to_date": "yes"})
+			scScenario(f, scC, scS)
+		}, want: scUnverBase},
+		{name: "reset after the rebase", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.appendRow(nil, CategoryBranchReset, map[string]any{"target_sha": scS})
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "recorded rebase, malformed base", seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, 42) }, want: scUnverBase, zeroCompares: true},
+		{name: "recorded rebase, missing base", seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, nil) }, want: scUnverBase},
+		{name: "recorded rebase, self-referencing base", seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scC) }, want: scUnverBase},
+		{name: "recorded rebase, cyclic base", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC1, scC)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "recorded rebase, unrelated base", seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scX) }, want: scUnverBase},
+		{name: "recorded rebase, C alleging older gated S", seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scS) }, want: scUnverBase},
+		// Uncertain chains with no recorded obligation (ADR-142 D3).
+		{name: "gated run, malformed base", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scScenario(f, scC, 42) }, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "gated run, missing base", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scScenario(f, scC, nil) }, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "gated run, empty base", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scScenario(f, scC, "") }, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "gated run, self-referencing base", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scScenario(f, scC, scC) }, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "gated run, cyclic base", seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scScenario(f, scC1, scC)
+			scScenario(f, scC, scC1)
+		}, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "gated run, unrelated base", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scScenario(f, scC, scX) }, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		// Transfer modes: a suggested transfer is not evidence.
+		{name: "enforce transfer to C", mode: MergeCandidateTransferEnforce, seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scM); scTransfer(f, scC) }, want: scPassedBase, source: mergeCandidateSourceTransferred},
+		{name: "shadow transfer to C", mode: MergeCandidateTransferShadow, seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scM); scTransfer(f, scC) }, want: scUnverBase},
+		{name: "off transfer to C", mode: MergeCandidateTransferOff, seed: func(f *mcvFixture) { rebasedM(f); scScenario(f, scC, scM); scTransfer(f, scC) }, want: scUnverBase},
+		{name: "enforce transfer to M, live C", mode: MergeCandidateTransferEnforce, seed: func(f *mcvFixture) { rebasedM(f); scTransfer(f, scM); scScenario(f, scC, scM) }, want: scUnverBase},
+		// No-op rows (ADR-142 D1): an already_up_to_date row never masks a write.
+		{name: "M, one no-op, C on M", seed: func(f *mcvFixture) { rebasedM(f); scNoOp(f); scScenario(f, scC, scM) }, want: scUnverBase},
+		{name: "M, two no-ops, C on M", seed: func(f *mcvFixture) { rebasedM(f); scNoOp(f); scNoOp(f); scScenario(f, scC, scM) }, want: scUnverBase},
+		{name: "M, no-op, passed at M, C on M", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scNoOp(f)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "conflict H, no-op, C on H", seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scHeadRow(f, CategoryConflictResolutionPushed, scM)
+			scNoOp(f)
+			scScenario(f, scC, scM)
+		}, want: scUnverConfl},
+		{name: "parent F, no-op, C on F", seed: func(f *mcvFixture) { scIntegration(f, scF); scNoOp(f); scScenario(f, scC, scF) }, want: scUnverFanIn},
+		{name: "undecodable rebase, no-op, C", seed: func(f *mcvFixture) {
+			f.appendRow(nil, CategoryBranchRebased, map[string]any{"already_up_to_date": "yes"})
+			scNoOp(f)
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "undecodable rebase alone, C", seed: func(f *mcvFixture) {
+			f.appendRow(nil, CategoryBranchRebased, map[string]any{"already_up_to_date": "yes"})
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "decodable rebase without the no-op key, C", seed: func(f *mcvFixture) {
+			f.appendRow(nil, CategoryBranchRebased, map[string]any{"new_head_sha": scM})
+			scScenario(f, scC, scM)
+		}, want: scUnverBase},
+		{name: "gated S, no-op, C on S", seed: func(f *mcvFixture) { scHeadRow(f, "pull_request_opened", scS); scNoOp(f); scScenario(f, scC, scS) }, want: scNotRequired},
+		{name: "rebase M, fix-up F, no-op, C on F", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scHeadRow(f, "fixup_pushed", scF)
+			scNoOp(f)
+			scScenario(f, scC, scF)
+		}, want: scNotRequired},
+		{name: "no-op alone, C", seed: func(f *mcvFixture) { scNoOp(f); scScenario(f, scC, scS) }, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "operator vouch of exact C after a recorded rebase", only: "mcv", seed: func(f *mcvFixture) {
+			rebasedM(f)
+			scScenario(f, scC, scM)
+			scVouch(f, scC)
+		}, want: scNotRequired, warn: scVouchWarnText},
+		// Older gated roots and parents.
+		{name: "gated S, gated F, C alleging older S", seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scHeadRow(f, "fixup_pushed", scF)
+			scScenario(f, scC, scS)
+		}, want: scNotRequired, gate: scGate(scUnverBase), warn: scD7WarnText},
+		{name: "parent F0, gated fix-up F, C on F", seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			scHeadRow(f, "fixup_pushed", scF)
+			scScenario(f, scC, scF)
+		}, want: scUnverFanIn},
+		// Parent with no rebase row (criterion parent-scenario-commit-needs-exact-pass).
+		{name: "parent: integration F, C on F", seed: func(f *mcvFixture) { scIntegration(f, scF); scScenario(f, scC, scF) }, want: scUnverFanIn},
+		{name: "parent: passed then failed at F", seed: func(f *mcvFixture) {
+			scIntegration(f, scF)
+			f.seedVerdict(scF, mergeCandidateResultPassed)
+			f.seedVerdict(scF, mergeCandidateResultFailed)
+			scScenario(f, scC, scF)
+		}, want: scUnverFanIn},
+		{name: "parent: exact C passed, F failed", seed: func(f *mcvFixture) {
+			scIntegration(f, scF)
+			f.seedVerdict(scF, mergeCandidateResultFailed)
+			scScenario(f, scC, scF)
+			f.seedVerdict(scC, mergeCandidateResultPassed)
+		}, want: scWant{mergeCandidateStatePassed, mergeCandidateCauseFanIn}},
+		{name: "parent: exact C failed, F passed", seed: func(f *mcvFixture) {
+			scIntegration(f, scF)
+			f.seedVerdict(scF, mergeCandidateResultPassed)
+			scScenario(f, scC, scF)
+			f.seedVerdict(scC, mergeCandidateResultFailed)
+		}, want: scWant{mergeCandidateStateFailed, mergeCandidateCauseFanIn}},
+		{name: "parent: exact C live", seed: func(f *mcvFixture) {
+			scIntegration(f, scF)
+			f.seedVerdict(scF, mergeCandidateResultPassed)
+			scScenario(f, scC, scF)
+			f.seedTrigger(scC)
+		}, want: scWant{mergeCandidateStateInFlight, mergeCandidateCauseFanIn}},
+		{name: "parent: slices_integrated only, C", seed: func(f *mcvFixture) {
+			f.appendRow(nil, auditcomplete.CategorySlicesIntegrated, map[string]any{})
+			scScenario(f, scC, scF)
+		}, want: scUnverFanIn},
+		{name: "parent: no declared verify", spec: mcvNoVerifySpecYAML, seed: func(f *mcvFixture) { scIntegration(f, scF); scScenario(f, scC, scF) }, want: scNotRequired},
+		// Vouched terminals (ADR-142 D2), ladder answers on the probeable fixture.
+		{name: "vouched terminal: parent, F...V edit, C on V", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scUnverFanIn},
+		{name: "vouched terminal: standalone, F...V edit, C on V", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scNotRequired},
+		{name: "vouched terminal: standalone, base-bringing, C on V", only: "gate", compares: scBaseBringing(scF, scV), seed: func(f *mcvFixture) {
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scUnverBase},
+		{name: "vouched terminal: parent, base-bringing, C on V", only: "gate", compares: scBaseBringing(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scUnverBase},
+		{name: "vouched terminal: preempted by a recorded rebase", only: "gate", compares: scEdit(scM, scV), zeroCompares: true, seed: func(f *mcvFixture) {
+			rebasedM(f)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scUnverBase},
+		{name: "vouched terminal: newer gated F, empty ladder (characterization)", only: "gate",
+			compares: map[string][]string{scF + "..." + scV: {}}, seed: func(f *mcvFixture) {
+				scVouch(f, scV)
+				scHeadRow(f, "fixup_pushed", scF)
+				scScenario(f, scC, scV)
+			}, want: scNotRequired},
+		{name: "vouched terminal, unprobeable: standalone", only: "mcv", seed: func(f *mcvFixture) {
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scNotRequired, warn: scVouchWarnText},
+		{name: "vouched terminal, unprobeable: parent", only: "mcv", seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, scV)
+			scScenario(f, scC, scV)
+		}, want: scUnverFanIn, warn: scVouchWarnText},
+	}
+	runScenarioRows(t, rows)
+}
+
+// TestMergeCandidateVerifyState_ScenarioTerminalVouch pins ADR-142 D2's
+// isolated reference and D5 on the real predicate (step 19). Standalone
+// gated F and vouch V unless a row says otherwise; compares follow git's
+// (merge-base, head] semantics, keyed on the reference the ladder must use.
+func TestMergeCandidateVerifyState_ScenarioTerminalVouch(t *testing.T) {
+	gatedVouch := func(f *mcvFixture) { scHeadRow(f, "fixup_pushed", scF); scVouch(f, scV) }
+	withC1 := func(f *mcvFixture, c1 string) {
+		gatedVouch(f)
+		scScenario(f, scC1, scV)
+		if c1 != "" {
+			f.seedVerdict(scC1, c1)
+		}
+		scScenario(f, scC, scC1)
+	}
+	bb := scBaseBringing(scF, scV)
+	rows := []scRow{
+		{name: "no intermediate, C absent", only: "gate", compares: bb, seed: func(f *mcvFixture) { gatedVouch(f); scScenario(f, scC, scV) }, want: scUnverBase},
+		{name: "no intermediate, C passed", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC, scV)
+			f.seedVerdict(scC, mergeCandidateResultPassed)
+		}, want: scPassedBase},
+		{name: "no intermediate, C failed", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC, scV)
+			f.seedVerdict(scC, mergeCandidateResultFailed)
+		}, want: scFailedBase},
+		{name: "no intermediate, C live", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC, scV)
+			f.seedTrigger(scC)
+		}, want: scInFlightBase},
+		{name: "passed C1, C2 absent", only: "gate", compares: bb, seed: func(f *mcvFixture) { withC1(f, mergeCandidateResultPassed) }, want: scUnverBase},
+		{name: "passed C1, C2 passed", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			f.seedVerdict(scC, mergeCandidateResultPassed)
+		}, want: scPassedBase},
+		{name: "passed C1, C2 failed", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			f.seedVerdict(scC, mergeCandidateResultFailed)
+		}, want: scFailedBase},
+		{name: "passed C1, C2 live", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			f.seedTrigger(scC)
+		}, want: scInFlightBase},
+		{name: "any number: passed C0, passed C1, C absent", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC0, scV)
+			f.seedVerdict(scC0, mergeCandidateResultPassed)
+			scScenario(f, scC1, scC0)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "any number: failed C0, passed C1, C absent", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC0, scV)
+			f.seedVerdict(scC0, mergeCandidateResultFailed)
+			scScenario(f, scC1, scC0)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "fork: passed C1 on V, reset to V, C alleging V", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			f.appendRow(nil, CategoryBranchReset, map[string]any{"target_sha": scV})
+			scScenario(f, scC, scV)
+		}, want: scUnverBase},
+		{name: "out-of-order vouch after the scenario row", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			scHeadRow(f, "fixup_pushed", scF)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scVouch(f, scV)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "enforce transfer to C1, C absent", only: "gate", mode: MergeCandidateTransferEnforce, compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, "")
+			scTransfer(f, scC1)
+		}, want: scUnverBase},
+		{name: "enforce transfer to exact C", only: "gate", mode: MergeCandidateTransferEnforce, compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			scTransfer(f, scC)
+		}, want: scPassedBase, source: mergeCandidateSourceTransferred},
+		{name: "shadow transfer to exact C", only: "gate", mode: MergeCandidateTransferShadow, compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			scTransfer(f, scC)
+		}, want: scUnverBase},
+		{name: "off transfer to exact C", only: "gate", mode: MergeCandidateTransferOff, compares: bb, seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			scTransfer(f, scC)
+		}, want: scUnverBase},
+		{name: "parent base-bringing, passed C1, C absent", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			withC1(f, mergeCandidateResultPassed)
+		}, want: scUnverBase},
+		{name: "parent edit, no intermediate, C absent", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			gatedVouch(f)
+			scScenario(f, scC, scV)
+		}, want: scUnverFanIn},
+		{name: "parent edit, passed C1, C absent", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			withC1(f, mergeCandidateResultPassed)
+		}, want: scUnverFanIn},
+		{name: "parent edit, passed C1, C passed", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			withC1(f, mergeCandidateResultPassed)
+			f.seedVerdict(scC, mergeCandidateResultPassed)
+		}, want: scWant{mergeCandidateStatePassed, mergeCandidateCauseFanIn}},
+		{name: "parent edit, passed C1, C failed", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			withC1(f, mergeCandidateResultPassed)
+			f.seedVerdict(scC, mergeCandidateResultFailed)
+		}, want: scWant{mergeCandidateStateFailed, mergeCandidateCauseFanIn}},
+		{name: "parent edit, passed C1, C live", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			withC1(f, mergeCandidateResultPassed)
+			f.seedTrigger(scC)
+		}, want: scWant{mergeCandidateStateInFlight, mergeCandidateCauseFanIn}},
+		{name: "standalone edit, passed C1, C absent", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) { withC1(f, mergeCandidateResultPassed) }, want: scNotRequired},
+		{name: "standalone edit, passed C1, C failed (characterization)", only: "gate", compares: scEdit(scF, scV), seed: func(f *mcvFixture) {
+			withC1(f, mergeCandidateResultPassed)
+			f.seedVerdict(scC, mergeCandidateResultFailed)
+		}, want: scNotRequired},
+		{name: "terminal's own pass", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			f.seedVerdict(scV, mergeCandidateResultPassed)
+			scScenario(f, scC, scV)
+		}, want: scUnverBase},
+		{name: "newest gated G, G...V empty", only: "gate", compares: map[string][]string{scG + "..." + scV: {}}, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scHeadRow(f, "fixup_pushed", scG)
+			scScenario(f, scC, scV)
+		}, want: scNotRequired},
+		{name: "newest gated G, passed C1, G...V empty", only: "gate", compares: map[string][]string{scG + "..." + scV: {}}, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scHeadRow(f, "fixup_pushed", scG)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scNotRequired},
+		{name: "newest gated G, G...V base-bringing", only: "gate", compares: scBaseBringing(scG, scV), seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scHeadRow(f, "fixup_pushed", scG)
+			scScenario(f, scC, scV)
+		}, want: scUnverBase},
+		{name: "recorded priority: rebase M, passed M, vouch V, passed C1", only: "gate", compares: scEdit(scM, scV), zeroCompares: true, seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scRebase(f, scM)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scVouch(f, scV)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "recorded priority: conflict H", only: "gate", compares: scEdit(scM, scV), zeroCompares: true, seed: func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scHeadRow(f, CategoryConflictResolutionPushed, scM)
+			f.seedVerdict(scM, mergeCandidateResultPassed)
+			scVouch(f, scV)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverConfl},
+		{name: "recorded priority: integration F0 newest", only: "gate", compares: scEdit(scF, scV), zeroCompares: true, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scIntegration(f, scF0)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverFanIn},
+		{name: "non-scenario reference: passed V, vouch V2 on V", only: "gate",
+			compares: map[string][]string{
+				scV + "..." + scV2: {scV2}, scF + "..." + scV2: {scV, scV2, scB}, mcvBaseRef + "..." + scV2: {scF, scV, scV2},
+			}, seed: func(f *mcvFixture) {
+				scHeadRow(f, "fixup_pushed", scF)
+				f.seedVerdict(scV, mergeCandidateResultPassed)
+				scVouch(f, scV2)
+				scScenario(f, scC, scV2)
+			}, want: scNotRequired},
+		{name: "only scenario evidence, no gated head", only: "gate", compares: bb, zeroCompares: true, seed: func(f *mcvFixture) {
+			scVouch(f, scV)
+			scScenario(f, scC1, scV)
+			f.seedVerdict(scC1, mergeCandidateResultPassed)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "gated row at a scenario SHA", only: "gate", compares: bb, seed: func(f *mcvFixture) {
+			gatedVouch(f)
+			scScenario(f, scC1, scV)
+			scHeadRow(f, "fixup_pushed", scC1)
+			scScenario(f, scC, scC1)
+		}, want: scUnverBase},
+		{name: "unprobeable: standalone, passed C1", only: "mcv", seed: func(f *mcvFixture) { withC1(f, mergeCandidateResultPassed) }, want: scNotRequired, warn: scVouchWarnText},
+		{name: "unprobeable: parent, passed C1", only: "mcv", seed: func(f *mcvFixture) {
+			scIntegration(f, scF0)
+			withC1(f, mergeCandidateResultPassed)
+		}, want: scUnverFanIn, warn: scVouchWarnText},
+		{name: "no declared verify", spec: mcvNoVerifySpecYAML, compares: bb, zeroCompares: true, seed: func(f *mcvFixture) { withC1(f, mergeCandidateResultPassed) }, want: scNotRequired},
+		{name: "unresolved chain beside a malformed vouch row", only: "gate", compares: bb, zeroCompares: true, seed: func(f *mcvFixture) {
+			scHeadRow(f, "fixup_pushed", scF)
+			scVouch(f, "")
+			scScenario(f, scC, "")
+		}, want: scUnverBase},
+	}
+	runScenarioRows(t, rows)
+
+	t.Run("pinned compares name F, never a scenario head", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = bb
+		withC1(g.mcvFixture, mergeCandidateResultPassed)
+		if _, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC); err != nil {
+			t.Fatalf("err = %v", err)
+		}
+		want := []string{scF + "..." + scV, mcvBaseRef + "..." + scV}
+		if !reflect.DeepEqual(g.gh.compareKeys, want) {
+			t.Errorf("compare keys = %v, want %v (reference F, not C1)", g.gh.compareKeys, want)
+		}
+	})
+	t.Run("a compare read error through the arm is returned", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = bb
+		g.gh.compareStatusByKey = map[string]int{scF + "..." + scV: http.StatusInternalServerError}
+		withC1(g.mcvFixture, mergeCandidateResultPassed)
+		if got, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC); err == nil {
+			t.Fatalf("state = %+v, err = nil; want the compare error returned", got)
+		}
+	})
+}
+
+// scArmedReadErr fails exactly ONE ListForRunByCategory read of category
+// fail: the first one made at or after the first read of category arm. Arming
+// on acceptance_scenarios_pushed (rule 4a's first read, which rules 1 to 4 never
+// make) means an earlier rule's read of the same category is never the one
+// that fails, and failing it only once means a later read (the verdict read
+// after classification) cannot re-surface an error the arm swallowed.
+type scArmedReadErr struct {
+	audit.Repository
+	arm, fail    string
+	armed, fired bool
+}
+
+func (a *scArmedReadErr) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.arm {
+		a.armed = true
+	}
+	if a.armed && !a.fired && category == a.fail {
+		a.fired = true
+		return nil, errors.New(scArmedReadErrText + category)
+	}
+	return a.Repository.ListForRunByCategory(ctx, runID, category)
+}
+
+const scArmedReadErrText = "scArmedReadErr: injected scenario-arm read error for "
+
+// TestMergeCandidateVerifyState_ScenarioReadErrorsAreReturned: ADR-142 D4 —
+// every read the scenario arm adds returns its error, through a vouched
+// terminal chain that reaches each one. Rules 1 to 4 read several of these
+// categories BEFORE rule 4a, and the verdict read re-reads
+// merge_candidate_verified after it, so a category-wide fault would surface
+// from those reads even if the arm swallowed its own; scArmedReadErr fails only
+// the arm's first read of the category, so a swallowed error leaves err nil.
+func TestMergeCandidateVerifyState_ScenarioReadErrorsAreReturned(t *testing.T) {
+	seed := func(t *testing.T) *mcGateFixture {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = scBaseBringing(scF, scV)
+		scHeadRow(g.mcvFixture, "fixup_pushed", scF)
+		scVouch(g.mcvFixture, scV)
+		scScenario(g.mcvFixture, scC, scV)
+		return g
+	}
+	t.Run("baseline: the chain reaches the terminal ladder and answers base_advance", func(t *testing.T) {
+		g := seed(t)
+		got, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC)
+		if err != nil || got.State != mergeCandidateStateUnverified || got.Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("state = %+v err=%v, want unverified base_advance with no fault", got, err)
+		}
+	})
+	for _, cat := range []string{
+		CategoryAcceptanceScenariosPushed, CategoryBranchRebased, CategoryConflictResolutionPushed,
+		auditcomplete.CategoryIntegrationCommitRecorded, auditcomplete.CategorySlicesIntegrated,
+		"pull_request_opened", "fixup_pushed", "child_pushed", CategoryOperatorCommitVouched,
+		CategoryMergeCandidateVerified,
+	} {
+		t.Run(cat, func(t *testing.T) {
+			g := seed(t)
+			fault := &scArmedReadErr{Repository: g.au, arm: CategoryAcceptanceScenariosPushed, fail: cat}
+			g.s.cfg.AuditRepo = fault
+			if g.au.listByCategoryErr != nil || g.au.listByCategoryErrCategory != "" {
+				t.Fatal("the fake's own read errors must stay unset")
+			}
+			got, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC)
+			if !fault.fired {
+				t.Fatalf("the scenario arm never read %s (state %+v, err %v); the row does not reach it", cat, got, err)
+			}
+			if err == nil || !strings.Contains(err.Error(), scArmedReadErrText+cat) {
+				t.Fatalf("state = %+v, err = %v; want the scenario arm's %s read error returned", got, err, cat)
+			}
+		})
+	}
+	t.Run("scenario rows read error on an otherwise not_required head", func(t *testing.T) {
+		f := newMCVFixture(t, mcvUndelegatedSpecYAML)
+		scHeadRow(f, "pull_request_opened", scS)
+		f.au.listByCategoryErrCategory = CategoryAcceptanceScenariosPushed
+		if got, err := f.s.mergeCandidateVerifyState(context.Background(), f.runRow(t), scC); err == nil {
+			t.Fatalf("state = %+v, err = nil; want the scenario read error returned", got)
+		}
+	})
+}
+
+// TestMergeCandidateGate_CannotProbeStaysUngatedWithScenarioObligation is a
+// characterization of ADR-090 D7, not a new control: with no GitHub client
+// the merge gate proceeds with its WARN BEFORE reading state, while the
+// state reader reports the recorded requirement. A state reader can require
+// verification there; this change does not enforce it at merge.
+func TestMergeCandidateGate_CannotProbeStaysUngatedWithScenarioObligation(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		seed func(f *mcvFixture)
+		want scWant
+	}{
+		{"standalone rebase", func(f *mcvFixture) {
+			scHeadRow(f, "pull_request_opened", scS)
+			scRebase(f, scM)
+			scScenario(f, scC, scM)
+		}, scUnverBase},
+		{"parent, no rebase", func(f *mcvFixture) { scIntegration(f, scF); scScenario(f, scC, scF) }, scUnverFanIn},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+			g.s.cfg.GitHub = nil
+			buf := captureLogger(g.s)
+			tc.seed(g.mcvFixture)
+			res := g.s.mergeCandidateGate(context.Background(), g.runRow(t))
+			if res.Code != "" {
+				t.Errorf("gate code = %q, want ungated (ADR-090 D7)", res.Code)
+			}
+			if !strings.Contains(buf.String(), "proceeding ungated (ADR-090 D7)") {
+				t.Errorf("logs lack the D7 gate WARN:\n%s", buf.String())
+			}
+			st, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC)
+			if err != nil || st.State != tc.want.state || st.Cause != tc.want.cause {
+				t.Errorf("state = %+v err=%v, want %+v", st, err, tc.want)
+			}
+		})
+	}
+}
+
+// TestMergeCandidateScenarioTerminalVouch_GateRefusesFinalHeadThenRebaseStartsPass
+// drives the real merge handler at a final scenario head C2 on a vouched,
+// base-bringing terminal with a passed intermediate C1, then the real rebase
+// verb's up-to-date arm. It wires no queue, so it proves the refusal and the
+// exact-head trigger, not admission (TestMergeCandidateScenarioCommit_
+// QueueRecoveryNeedsCurrentApprovalAtC owns admission); a hold is never a
+// started pass.
+func TestMergeCandidateScenarioTerminalVouch_GateRefusesFinalHeadThenRebaseStartsPass(t *testing.T) {
+	seed := func(f *mcvFixture) {
+		scHeadRow(f, "fixup_pushed", scF)
+		scVouch(f, scV)
+		scScenario(f, scC1, scV)
+		f.seedVerdict(scC1, mergeCandidateResultPassed)
+		scScenario(f, scC, scC1)
+	}
+	t.Run("unverified at C2 refuses", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = scBaseBringing(scF, scV)
+		seed(g.mcvFixture)
+		env := g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateUnverified)
+		if d := env.Error.Details; d["cause"] != mergeCandidateCauseBaseAdvance || d["head_sha"] != scC ||
+			d["verify_state"] != mergeCandidateStateUnverified {
+			t.Errorf("details = %v, want cause base_advance, head %s, unverified", d, scC)
+		}
+	})
+	t.Run("failed at C2 refuses verify_failed", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = scBaseBringing(scF, scV)
+		seed(g.mcvFixture)
+		g.seedVerdict(scC, mergeCandidateResultFailed)
+		g.assertRefused(t, g.post(t), http.StatusConflict, mergeCodeCandidateVerifyFailed)
+	})
+	t.Run("passed at C2 admits", func(t *testing.T) {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = scBaseBringing(scF, scV)
+		seed(g.mcvFixture)
+		g.seedVerdict(scC, mergeCandidateResultPassed)
+		g.assertAdmitted(t, g.post(t))
+	})
+	t.Run("rebase up-to-date arm triggers a pass naming C2", func(t *testing.T) {
+		stub := upToDateRebaseStub()
+		stub.headSHA = scC
+		stub.compareByPair = map[string][]string{
+			scF + "..." + scV:           {scV, scB},
+			rebaseBaseRef + "..." + scV: {scV},
+		}
+		sd := seedMCVRebase(t, stub)
+		impl := crImplementStage(t, sd)
+		seedMCVRow(sd, nil, "fixup_pushed", map[string]any{"head_sha": scF})
+		seedMCVRow(sd, nil, CategoryOperatorCommitVouched, map[string]any{"vouched_sha": scV})
+		seedMCVRow(sd, nil, CategoryAcceptanceScenariosPushed, map[string]any{"head_sha": scC1, "base_sha": scV})
+		seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+			HeadSHA: scC1, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand, Result: mergeCandidateResultPassed})
+		seedMCVRow(sd, nil, CategoryAcceptanceScenariosPushed, map[string]any{"head_sha": scC, "base_sha": scC1})
+
+		resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+		if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+			t.Errorf("state/triggered = %q/%v, want in_flight/true", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+		}
+		triggers := mcvTriggerPayloads(t, sd.au)
+		if len(triggers) != 1 || triggers[0].ExpectedHeadSHA != scC || triggers[0].Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("triggers = %+v, want one naming expected_head_sha %s cause base_advance", triggers, scC)
+		}
+	})
+}
+
+// scReportScenarioCommit records C on base through the REAL
+// recordAcceptanceScenariosPushed route, with the forge configured as a real
+// push leaves it (ADR-141): the PR head is C and C's first parent is base.
+func scReportScenarioCommit(t *testing.T, sd *rebaseSeed, stage *run.Stage, c, base string) {
+	t.Helper()
+	sd.stub.mu.Lock()
+	sd.stub.headSHA = c
+	if sd.stub.mergeParents == nil {
+		sd.stub.mergeParents = map[string][]string{}
+	}
+	sd.stub.mergeParents[c] = []string{base}
+	sd.stub.mu.Unlock()
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+sd.runID.String()+"/stages/"+stage.ID.String()+"/pull-request", nil)
+	subj := "runner"
+	sd.s.recordAcceptanceScenariosPushed(rec, req, sd.runID, stage, &pullRequestBody{
+		Outcome: outcomeAcceptanceScenariosPushed, Branch: rebaseBranchName, HeadSHA: c, BaseSHA: base,
+	}, "run_token", audit.ActorSystem, &subj)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scenario push report = %d %s, want 200 (forge head %s, first parent %s)", rec.Code, rec.Body.String(), c, base)
+	}
+	if rows := auditEntries(sd.au, CategoryAcceptanceScenariosPushed); len(rows) != 1 {
+		t.Fatalf("acceptance_scenarios_pushed rows = %d, want 1 written by the real route", len(rows))
+	}
+}
+
+// TestMergeCandidateScenarioCommit_GateRefusesThenRebaseStartsExactHeadPass
+// drives the merge-gate seam end to end: a clean rebase S -> M, C recorded
+// through the REAL scenario report route, the real merge gate refusing at C,
+// the real rebase verb's up-to-date arm starting a pass whose trigger names
+// exactly C with cause base_advance, a passed verdict at M changing nothing
+// and a passed verdict at C admitting. It wires no queue, so it proves the
+// refusal and the exact-head trigger, not admission.
+func TestMergeCandidateScenarioCommit_GateRefusesThenRebaseStartsExactHeadPass(t *testing.T) {
+	ctx := context.Background()
+	stub := upToDateRebaseStub()
+	stub.headSHA = scM
+	sd := seedMCVRebase(t, stub)
+	impl := crImplementStage(t, sd)
+	seedMCVRow(sd, nil, "pull_request_opened", map[string]any{"head_sha": scS})
+	seedMCVRow(sd, nil, CategoryBranchRebased, map[string]any{
+		"prior_head_sha": scS, "new_head_sha": scM, "merge_commit_sha": scM, "clean_verified": true})
+	scReportScenarioCommit(t, sd, impl, scC, scM)
+
+	runRow, err := sd.rr.GetRun(ctx, sd.runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gate := func() mergeCandidateGateResult { return sd.s.mergeCandidateGate(ctx, runRow) }
+	if res := gate(); res.Code != mergeCodeCandidateUnverified || res.Details["cause"] != mergeCandidateCauseBaseAdvance ||
+		res.Details["head_sha"] != scC {
+		t.Fatalf("gate at C = %+v, want merge_candidate_unverified cause base_advance at %s", res, scC)
+	}
+
+	resp := decodeRebase(t, postRebaseBranch(t, sd.s, sd.runID, rebaseBranchRequest{Confirm: true}, withRebaseOperator))
+	if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+		t.Errorf("rebase state/triggered = %q/%v, want in_flight/true", resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+	}
+	triggers := mcvTriggerPayloads(t, sd.au)
+	if len(triggers) != 1 || triggers[0].ExpectedHeadSHA != scC || triggers[0].Cause != mergeCandidateCauseBaseAdvance {
+		t.Fatalf("triggers = %+v, want one naming expected_head_sha %s cause base_advance", triggers, scC)
+	}
+
+	seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+		HeadSHA: scM, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand, Result: mergeCandidateResultPassed})
+	if res := gate(); res.Code != mergeCodeCandidateUnverified {
+		t.Fatalf("gate after a pass at M = %+v, want still merge_candidate_unverified", res)
+	}
+	seedMCVRow(sd, &impl.ID, CategoryMergeCandidateVerified, mergeCandidateVerifiedPayload{
+		HeadSHA: scC, Cause: mergeCandidateCauseBaseAdvance, VerifyCommand: mcvCommand, Result: mergeCandidateResultPassed})
+	if res := gate(); res.Code != "" || res.HeadSHA != scC {
+		t.Fatalf("gate after a pass at C = %+v, want an admit at %s", res, scC)
+	}
+}
+
+// scqSpecYAML is mqeSpecYAML (a declared verify command and a review approval
+// gate listing github:alice) with an acceptance stage added, so the admission
+// predicate's acceptance leg reads the recorded outcome.
+const scqSpecYAML = mqeSpecYAML + `      - id: accept
+        type: acceptance
+        executor:
+          agent: claude-code
+`
+
+// scqRun seeds one queue-recovery run on f's real Postgres stores: an
+// acceptance stage row (succeeded) beside the seeded plan, implement and
+// review, the chain rows seed writes, and C recorded through the REAL
+// recordAcceptanceScenariosPushed route with the forge configured as a real
+// push leaves it (ADR-141): PR head C and C's first parent base.
+func scqRun(t *testing.T, f *mcqFixture, name, base string, seed func(r *mcqRun)) (*mcqRun, *run.Stage) {
+	t.Helper()
+	ctx := context.Background()
+	r := f.seed(name, base, []byte(scqSpecYAML))
+	acc, err := f.repo.CreateStage(ctx, run.CreateStageParams{
+		RunID: r.id, Sequence: 4, Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create acceptance stage: %v", err)
+	}
+	f.setStage(acc.ID, run.StageStateSucceeded)
+	seed(r)
+	f.gh.set(func() {
+		f.gh.prs[r.pr].head = scC
+		f.gh.commitParents[scC] = []string{base}
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+r.id.String()+"/stages/"+acc.ID.String()+"/pull-request", nil)
+	subj := "runner"
+	f.srv.recordAcceptanceScenariosPushed(rec, req, r.id, acc, &pullRequestBody{
+		Outcome: outcomeAcceptanceScenariosPushed, Branch: r.branch, HeadSHA: scC, BaseSHA: base,
+	}, "run_token", audit.ActorSystem, &subj)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scenario push report = %d %s, want 200 (forge head %s, first parent %s)", rec.Code, rec.Body.String(), scC, base)
+	}
+	if rows := f.rows(r, CategoryAcceptanceScenariosPushed); len(rows) != 1 {
+		t.Fatalf("acceptance_scenarios_pushed rows = %d, want 1 written by the real route", len(rows))
+	}
+	return r, acc
+}
+
+// scqStandalone is the incident's standalone shape: pull_request_opened S, a
+// clean branch_rebased S -> M, a passed pass at M and acceptance recorded at
+// M with verdict.
+func scqStandalone(f *mcqFixture, verdict string) func(r *mcqRun) {
+	return func(r *mcqRun) {
+		f.mqeAppend(r, "pull_request_opened", map[string]any{"head_sha": scS})
+		f.mqeAppend(r, CategoryBranchRebased, map[string]any{
+			"prior_head_sha": scS, "new_head_sha": scM, "merge_commit_sha": scM, "clean_verified": true})
+		f.mqeAppend(r, CategoryMergeCandidateVerified, map[string]any{
+			"head_sha": scM, "cause": mergeCandidateCauseBaseAdvance, "verify_command": mcvCommand, "result": mergeCandidateResultPassed})
+		f.mqeAppend(r, CategoryAcceptanceOutcomeRecorded, map[string]any{"head_sha": scM, "verdict": verdict})
+	}
+}
+
+func scqState(t *testing.T, f *mcqFixture, r *mcqRun) mergeCandidateState {
+	t.Helper()
+	st, err := f.srv.mergeCandidateVerifyState(context.Background(), f.runRow(r), scC)
+	if err != nil {
+		t.Fatalf("verify state at C: %v", err)
+	}
+	return st
+}
+
+// scqPassAt records a merge_candidate_verified verdict at head.
+func scqPassAt(f *mcqFixture, r *mcqRun, head, cause, result string) {
+	f.mqeAppend(r, CategoryMergeCandidateVerified, map[string]any{
+		"head_sha": head, "cause": cause, "verify_command": mcvCommand, "result": result})
+}
+
+// TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC
+// decides queue ADMISSION for a scenario commit C (ADR-142, ADR-093 slice 1)
+// on newMCQFixture's real Postgres queue store, the real rebase verb's
+// up-to-date arm and the real scenario report route. It adds no permission,
+// bypass, queue or eligibility change: an unverified C needs a pass, and the
+// pass is queued only when the run is merge-queue eligible at C. A hold is
+// reported as a hold, never as a started pass. Merge-on-pass's need for an
+// approval covering exactly C (forge_approval.go) stays pinned by the existing
+// queue tests and is not re-proved here.
+func TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC(t *testing.T) {
+	const dismissed = `[{"id":1,"user":{"login":"alice"},"state":"APPROVED"},{"id":2,"user":{"login":"alice"},"state":"DISMISSED"}]`
+	requireNotQueued := func(t *testing.T, f *mcqFixture, r *mcqRun, resp rebaseBranchResponse, reasons ...string) {
+		t.Helper()
+		if resp.MergeCandidateVerifyState != mergeCandidateStateNotQueued || resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v note %q, want not_queued, not triggered",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+		}
+		for _, want := range reasons {
+			if !strings.Contains(resp.MergeCandidateVerifyNote, want) {
+				t.Errorf("not_queued note %q lacks %q", resp.MergeCandidateVerifyNote, want)
+			}
+		}
+		if trig := f.triggers(r); len(trig) != 0 {
+			t.Errorf("triggers = %+v, want none at C", trig)
+		}
+		if es := f.entries(r); len(es) != 0 {
+			t.Errorf("queue entries = %+v, want none", es)
+		}
+		if st := f.stageState(r.impl.ID); st != run.StageStateSucceeded {
+			t.Errorf("implement = %s, want succeeded (not_queued re-opens nothing)", st)
+		}
+	}
+
+	t.Run("(1) no live approval at C, the dismissed shape: not_queued not_approved", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q1", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = dismissed })
+		if st := scqState(t, f, r); st.State != mergeCandidateStateUnverified || st.Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("state at C = %+v, want unverified base_advance (the pass at M covers nothing at C)", st)
+		}
+		requireNotQueued(t, f, r, f.rebase(r), mergeQueueReasonNotApproved, "fishhawk_merge_run")
+	})
+
+	t.Run("(2) acceptance parked at triage as well: not_queued not_approved and acceptance_not_eligible", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q2", scM, scqStandalone(f, acceptanceVerdictFailed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = dismissed })
+		requireNotQueued(t, f, r, f.rebase(r),
+			mergeQueueReasonNotApproved, mergeQueueReasonAcceptanceNotEligible, acceptanceGateTriage)
+	})
+
+	t.Run("(3) live approval at C, acceptance passed at M: in_flight, a trigger naming C, entry live at C", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q3", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+		if st := scqState(t, f, r); st.State != mergeCandidateStateUnverified || st.Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("state at C = %+v, want unverified base_advance", st)
+		}
+		resp := f.rebase(r)
+		if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v note %q, want in_flight triggered",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+		}
+		trig := f.triggers(r)
+		if len(trig) != 1 || trig[0].ExpectedHeadSHA != scC || trig[0].Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("triggers = %+v, want one naming expected_head_sha %s cause base_advance", trig, scC)
+		}
+		if e := f.requireState(r, mergequeue.StateLive, ""); e.AnchoredHeadSHA != scC {
+			t.Fatalf("entry anchored at %q, want %s", e.AnchoredHeadSHA, scC)
+		}
+		if st := scqState(t, f, r); st.State != mergeCandidateStateInFlight {
+			t.Fatalf("state at C after the trigger = %+v, want in_flight (the pass at M does not make it passed)", st)
+		}
+		scqPassAt(f, r, scC, mergeCandidateCauseBaseAdvance, mergeCandidateResultPassed)
+		if st := scqState(t, f, r); st.State != mergeCandidateStatePassed {
+			t.Fatalf("state at C after a passed verdict at C = %+v, want passed", st)
+		}
+	})
+
+	t.Run("(4) eligible behind another run's live pass: held, nothing started", func(t *testing.T) {
+		f := newMCQFixture(t)
+		other := f.seed("live", "l0", []byte(mqeSpecYAML))
+		f.gh.set(func() { f.gh.reviews[other.pr] = mqeApprovedBy("alice") })
+		f.behind(other, "l0", "l1")
+		if resp := f.rebase(other); resp.MergeCandidateVerifyState != mergeCandidateStateInFlight {
+			t.Fatalf("fixture: other rebase = %q, want in_flight", resp.MergeCandidateVerifyState)
+		}
+		f.requireState(other, mergequeue.StateLive, "")
+
+		r, _ := scqRun(t, f, "q4", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+		resp := f.rebase(r)
+		if resp.MergeCandidateVerifyState != mergeCandidateStateHeld || resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v, want held, not triggered",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+		}
+		if trig := f.triggers(r); len(trig) != 0 {
+			t.Fatalf("triggers = %+v, want none at C (a hold is not a started pass)", trig)
+		}
+		if e := f.requireState(r, mergequeue.StateHeld, ""); e.AnchoredHeadSHA != scC {
+			t.Fatalf("held entry anchored at %q, want %s", e.AnchoredHeadSHA, scC)
+		}
+		if st := f.stageState(r.impl.ID); st != run.StageStateSucceeded {
+			t.Fatalf("implement = %s, want succeeded (not re-opened while held)", st)
+		}
+	})
+
+	t.Run("(5) parent, fan-in only, no rebase: unverified fan_in, gate refuses, direct route starts the pass", func(t *testing.T) {
+		ctx := context.Background()
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q5", scF, func(r *mcqRun) {
+			f.mqeAppend(r, auditcomplete.CategoryIntegrationCommitRecorded, map[string]any{"merge_sha": scF})
+			scqPassAt(f, r, scF, mergeCandidateCauseFanIn, mergeCandidateResultPassed)
+			f.mqeAppend(r, CategoryAcceptanceOutcomeRecorded, map[string]any{"head_sha": scF, "verdict": acceptanceVerdictPassed})
+		})
+		if n := len(f.rows(r, CategoryBranchRebased)); n != 0 {
+			t.Fatalf("fixture: branch_rebased rows = %d before the verb, want 0 (no rebase producer)", n)
+		}
+		if st := scqState(t, f, r); st.State != mergeCandidateStateUnverified || st.Cause != mergeCandidateCauseFanIn {
+			t.Fatalf("state at C = %+v, want unverified fan_in (the pass at F changes nothing)", st)
+		}
+		if res := f.srv.mergeCandidateGate(ctx, f.runRow(r)); res.Code != mergeCodeCandidateUnverified ||
+			res.Details["cause"] != mergeCandidateCauseFanIn || res.Details["head_sha"] != scC {
+			t.Fatalf("gate at C = %+v, want merge_candidate_unverified cause fan_in at %s", res, scC)
+		}
+
+		resp := f.rebase(r)
+		if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v note %q, want in_flight triggered (fan_in is not serialized, ADR-092 D1)",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+		}
+		rebased := f.rows(r, CategoryBranchRebased)
+		if len(rebased) != 1 {
+			t.Fatalf("branch_rebased rows = %d, want only the verb's no-op row", len(rebased))
+		}
+		var noop map[string]any
+		_ = json.Unmarshal(rebased[0].Payload, &noop)
+		if noop["already_up_to_date"] != true {
+			t.Fatalf("branch_rebased payload = %v, want the up-to-date no-op row", noop)
+		}
+		trig := f.triggers(r)
+		if len(trig) != 1 || trig[0].ExpectedHeadSHA != scC || trig[0].Cause != mergeCandidateCauseFanIn {
+			t.Fatalf("triggers = %+v, want one naming expected_head_sha %s cause fan_in", trig, scC)
+		}
+		if es := f.entries(r); len(es) != 0 {
+			t.Fatalf("queue entries = %+v, want none (the direct route)", es)
+		}
+		scqPassAt(f, r, scC, mergeCandidateCauseFanIn, mergeCandidateResultPassed)
+		if st := scqState(t, f, r); st.State != mergeCandidateStatePassed {
+			t.Fatalf("state at C after a passed verdict at C = %+v, want passed", st)
+		}
+		if res := f.srv.mergeCandidateGate(ctx, f.runRow(r)); res.Code != "" || res.HeadSHA != scC {
+			t.Fatalf("gate after a pass at C = %+v, want an admit at %s", res, scC)
+		}
+	})
+
+	t.Run("(6) fishhawk_merge_run at C on an eligible run: 202 with merge intent, no merge dispatched", func(t *testing.T) {
+		f := newMCQFixture(t)
+		merger := &fakeMerger{}
+		f.srv.cfg.GateMerger = merger
+		r, _ := scqRun(t, f, "q6", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+		w := f.mergeRun(r)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("merge at C = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		var resp mergeRunResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !resp.Queued || resp.MergeQueued || resp.AnchoredHeadSHA != scC || resp.IntentSequence == 0 {
+			t.Fatalf("response = %+v, want queued at %s with an intent sequence", resp, scC)
+		}
+		f.srv.bgMergeQueuePump.Wait()
+		if got := f.intentAt(r); len(got) != 1 || !got[0] {
+			t.Fatalf("entries merge_intent_at set = %v, want one entry with intent", got)
+		}
+		if merger.called != 0 {
+			t.Fatalf("merger called %d times, want 0 (no merge dispatched before a pass at C)", merger.called)
+		}
+		if n := len(f.rows(r, CategoryMergeVerdictRecorded)); n != 0 {
+			t.Fatalf("merge_verdict_recorded rows = %d, want 0 on the queued path", n)
+		}
+	})
 }

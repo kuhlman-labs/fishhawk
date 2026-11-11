@@ -240,6 +240,66 @@ func TestEmbeddedScenarios_DeclaredShapes(t *testing.T) {
 	// scenario carries NO artifacts and NO audit rows, so the park history is
 	// empty (no plan_decomposed row, no pass-trigger row, no prior park) and
 	// a first-execution category-C failure parks rather than fails the run.
+	// acceptance-rebased-head (#4874): three runs, each with an acceptance
+	// stage dispatched and its audit rows in the declared order, the anchor
+	// newest on each run, so the server resolves the ADVANCED head.
+	t.Run("acceptance-rebased-head", func(t *testing.T) {
+		s := mustLoad(t, "acceptance-rebased-head")
+		wantRuns := map[string][]string{
+			"rebased-run":             {"pull_request_opened", "branch_rebased", "acceptance_dispatched"},
+			"rebased-parent":          {"integration_commit_recorded", "branch_rebased", "acceptance_dispatched"},
+			"late-integration-parent": {"fixup_pushed", "integration_commit_recorded", "acceptance_dispatched"},
+		}
+		if len(s.Runs) != len(wantRuns) {
+			t.Fatalf("want %d runs, got %d", len(wantRuns), len(s.Runs))
+		}
+		stageType := map[string]string{}
+		stageRun := map[string]string{}
+		for _, st := range s.Stages {
+			stageType[st.Key] = st.Type
+			stageRun[st.Key] = st.Run
+			if st.Type == "acceptance" && (st.State != "dispatched" || st.ExecutorKind != "agent") {
+				t.Fatalf("acceptance stage %q must be agent/dispatched, got %+v", st.Key, st)
+			}
+		}
+		for _, r := range s.Runs {
+			want, ok := wantRuns[r.Key]
+			if !ok || r.WorkflowID != "feature_change" || r.State != "running" {
+				t.Fatalf("unexpected run %+v", r)
+			}
+			var got []string
+			for _, row := range s.Audit {
+				if row.Run != r.Key {
+					continue
+				}
+				got = append(got, row.Category)
+				if row.Category == "acceptance_dispatched" && stageType[row.Stage] != "acceptance" {
+					t.Fatalf("run %s: acceptance_dispatched must sit on the acceptance stage, got %q", r.Key, row.Stage)
+				}
+				if stageRun[row.Stage] != r.Key {
+					t.Fatalf("run %s: audit row %s names stage %q of another run", r.Key, row.Category, row.Stage)
+				}
+				if row.Category == "branch_rebased" {
+					var p struct {
+						PriorHeadSHA    string `json:"prior_head_sha"`
+						MergeCommitSHA  string `json:"merge_commit_sha"`
+						NewHeadSHA      string `json:"new_head_sha"`
+						AlreadyUpToDate bool   `json:"already_up_to_date"`
+						CleanVerified   *bool  `json:"clean_verified"`
+					}
+					if err := json.Unmarshal([]byte(row.Payload), &p); err != nil {
+						t.Fatalf("run %s: branch_rebased payload: %v", r.Key, err)
+					}
+					if p.AlreadyUpToDate || p.CleanVerified == nil || !*p.CleanVerified || p.MergeCommitSHA == "" || p.NewHeadSHA != p.MergeCommitSHA || len(p.PriorHeadSHA) != 40 {
+						t.Fatalf("run %s: branch_rebased must be a CLEAN advance, got %s", r.Key, row.Payload)
+					}
+				}
+			}
+			if !slices.Equal(got, want) {
+				t.Fatalf("run %s: audit order = %v, want %v (the anchor newest)", r.Key, got, want)
+			}
+		}
+	})
 	t.Run("implement-running", func(t *testing.T) {
 		s := mustLoad(t, "implement-running")
 		if len(s.Runs) != 1 || s.Runs[0].WorkflowID != "feature_change" || s.Runs[0].State != "running" {
