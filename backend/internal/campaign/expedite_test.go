@@ -111,6 +111,32 @@ func TestValidateReleaseDispatchHold(t *testing.T) {
 	}
 }
 
+// TestValidateDispatchHoldScope pins the two scopes that would fail OPEN: an
+// empty repository (nothing would be listed) and a malformed account (it
+// would bind as NULL, dropping the stage's own account). An empty account is
+// valid: it selects the untenanted campaigns only.
+func TestValidateDispatchHoldScope(t *testing.T) {
+	acct := uuid.NewString()
+	for name, s := range map[string]DispatchHoldScope{
+		"valid account":              {AccountID: acct, Repo: "kuhlman-labs/fishhawk"},
+		"empty account (untenanted)": {Repo: "kuhlman-labs/fishhawk"},
+	} {
+		if err := ValidateDispatchHoldScope(s); err != nil {
+			t.Errorf("%s: err = %v, want nil", name, err)
+		}
+	}
+	for name, s := range map[string]DispatchHoldScope{
+		"empty repository":                {AccountID: acct},
+		"empty repository, empty account": {},
+		"malformed account":               {AccountID: "not-a-uuid", Repo: "kuhlman-labs/fishhawk"},
+		"truncated account":               {AccountID: acct[:8], Repo: "kuhlman-labs/fishhawk"},
+	} {
+		if err := ValidateDispatchHoldScope(s); !errors.Is(err, ErrExpediteInvalid) {
+			t.Errorf("%s: err = %v, want ErrExpediteInvalid", name, err)
+		}
+	}
+}
+
 func TestExpeditedHeadPosition(t *testing.T) {
 	items := func(pos ...int) []*Item {
 		out := make([]*Item, 0, len(pos))
