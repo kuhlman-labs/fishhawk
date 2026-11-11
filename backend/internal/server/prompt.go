@@ -2090,6 +2090,12 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
+	// Run-context verify rule (#5148): resolved before Build so the implement
+	// prompt states whether a runner gate runs after the agent. A
+	// conflict-resolution pass is forced to the fail-closed arm because its
+	// runner path runs no project verify.
+	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	trigger.VerifyGateConfigured = verifyGateConfigured(verifyCmd) && conflictResolution == nil
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		s.writePromptBuildError(w, r, string(stage.Type), err)
@@ -2112,7 +2118,6 @@ func (s *Server) handleGetStagePrompt(w http.ResponseWriter, r *http.Request) {
 	s.recordCrewMessagesDelivered(r.Context(), runRow.ID, stage.ID, stage.Type, string(stage.Type), crewDeliveries.Sequences)
 
 	hash := signing.ComputeMessage([]byte(text))
-	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
@@ -2917,6 +2922,10 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 		return
 	}
 
+	// Run-context verify rule (#5148), resolved exactly as
+	// handleGetStagePrompt resolves it so the preview matches the signed serve.
+	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
+	trigger.VerifyGateConfigured = verifyGateConfigured(verifyCmd) && conflictResolution == nil
 	text, err := prompt.Build(string(stage.Type), trigger)
 	if err != nil {
 		s.writePromptBuildError(w, r, string(stage.Type), err)
@@ -2924,7 +2933,6 @@ func (s *Server) handleGetStagePromptRender(w http.ResponseWriter, r *http.Reque
 	}
 
 	hash := signing.ComputeMessage([]byte(text))
-	verifyCmd, verifyTimeoutSecs, verifyMaxIterations := s.resolveVerifyConfig(r.Context(), runRow, stage.Type)
 	commitAuthorName, commitAuthorEmail := s.resolveAppBotIdentity(r.Context())
 	resp := promptResponse{
 		StageID:              stageID.String(),
@@ -3929,6 +3937,16 @@ func (s *Server) resolveImplementTimeout(ctx context.Context, runRow *run.Run, s
 		slog.String("winner", winner),
 	)
 	return candidate
+}
+
+// verifyGateConfigured reports whether a resolved verify command means the
+// runner runs a verify gate after the implement agent finishes (#5148). The
+// command comes from resolveVerifyConfig, which reads the run's own
+// workflow-spec snapshot and yields "" on any parse or lookup failure, so an
+// unresolvable spec selects the prompt's fail-closed arm. Callers also force
+// false on a conflict-resolution pass, which runs no project verify.
+func verifyGateConfigured(verifyCmd string) bool {
+	return verifyCmd != ""
 }
 
 // resolveVerifyConfig returns the verify command, timeout (in seconds),

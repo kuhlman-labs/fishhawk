@@ -75,7 +75,13 @@ import (
 //	    planreview.SeverityHigh ("high"). Medium/low concerns stay advisory
 //	    (ADR-027). No requirement-arbitration concern CATEGORY exists
 //	    (requirement_arbitration is a page event, spec.PageEventRequirementArbitration,
-//	    never a concern category), so leg (d) matches no category.
+//	    never a concern category), so leg (d) matches no category. Before it
+//	    reads the run's ledger it re-runs the idempotent child-slice import
+//	    for the run's succeeded decomposition children (site merge_reconcile),
+//	    so a late child review the best-effort hook lost is blocked on, not
+//	    missed; a failed reconcile is undeterminable. The inline admitted
+//	    merge (merge_run.go) does not evaluate this predicate, so it does not
+//	    run leg (d) at all (#5045).
 //
 // Leg (a)'s FORGE sub-legs differ by variant (ADR-112, #4619 / #4632):
 //
@@ -99,11 +105,17 @@ import (
 //     approvals and vetoes through the in-lock fold. ApprovalBasis is "" and
 //     the merge path takes the basis from the fold.
 //
-// The predicate NEVER writes. Every read error is undeterminable, which is
-// NOT eligible: uncertainty never enqueues, admits or merges. The one
-// exception is leg (c) on the merge variant, whose checks-read failures are
-// the determined checks_not_green (still not eligible), so merge-on-pass
-// never reports that leg undeterminable (docs/adr/112 A3.2).
+// The predicate writes no verdict, intent or queue row. Its one write is leg
+// (d)'s idempotent child-slice concern reconcile (mergeQueueConcernLeg:
+// concern rows and a concern_rolled_up audit row, only on a decomposed parent
+// whose succeeded children hold an uncopied open HIGH/MEDIUM). Every read
+// error, and a failed reconcile, is undeterminable, which is NOT eligible:
+// uncertainty never enqueues, admits or merges. The one exception is leg (c)
+// on the merge variant, whose checks-read failures are the determined
+// checks_not_green (still not eligible), so merge-on-pass never reports that
+// leg undeterminable (docs/adr/112 A3.2). Every caller is a POST or pump path
+// (enqueue, re-entry, admission, merge-on-pass, the yield re-probe, rebase);
+// no GET evaluates it.
 //
 // mergeGateLegsOf is the ONE mapping of a result's reason codes onto A3.1's
 // retryable merge-gate legs; merge-on-pass, admission and the yield re-probe
@@ -630,10 +642,26 @@ func (s *Server) listMergeGateChecks(ctx context.Context, runRow *run.Run, headS
 	return checks, nil
 }
 
-// mergeQueueConcernLeg is leg (d).
+// mergeQueueConcernLeg is leg (d). Before it reads the run's ledger it re-runs
+// the idempotent child-slice import for the run's succeeded decomposition
+// children (reconcileSliceConcerns), so a late child review the best-effort
+// hook lost reaches the ledger this leg then blocks on. That import is the
+// predicate's one write; it is idempotent (a repeat pass inserts nothing),
+// writes only concern rows plus a concern_rolled_up audit row, and a
+// reconcile failure is an error here, which the caller maps to
+// undeterminable: the merge is held, never waved through. A refusal's
+// "nothing written" therefore means no verdict, intent or queue row, not no
+// concern row. On the merge variant the call can run under the merge-intent
+// lock, and ImportRolledUp takes the child-source row locks; the added cost is
+// one indexed child listing per evaluation, plus, for a decomposed parent with
+// succeeded children, one parent stage list, one open-concern read per
+// succeeded child and one import transaction.
 func (s *Server) mergeQueueConcernLeg(ctx context.Context, runRow *run.Run) (string, string, error) {
 	if s.cfg.ConcernRepo == nil {
 		return "", "", errors.New("no concern repository is wired")
+	}
+	if err := s.reconcileSliceConcerns(ctx, runRow); err != nil {
+		return "", "", fmt.Errorf("reconcile child-slice concerns: %w", err)
 	}
 	open, err := s.cfg.ConcernRepo.ListOpenByRun(ctx, runRow.ID)
 	if err != nil {

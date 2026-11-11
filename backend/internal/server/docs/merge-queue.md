@@ -314,8 +314,10 @@ README). Merge-on-pass is slice 2 (§ "Merge-on-pass (ADR-093 D3/D6)"
 below); eject/promote and durability are slices 3-4.
 
 - **Eligibility (`merge_queue_eligibility.go`, D1).** One predicate decides
-  queue ADMISSION, not only the merge. It never writes; every read error is
-  `undeterminable`, which is NOT eligible. Four legs, each on the existing
+  queue ADMISSION, not only the merge. It writes no verdict, intent or queue
+  row; its one write is leg (d)'s idempotent child-slice concern reconcile
+  (below). Every read error, and a failed reconcile, is `undeterminable`,
+  which is NOT eligible. Four legs, each on the existing
   single-source helper: (a) review gate approved — the LATEST implement
   review round (`implementReviewRound`, read-only) has a TERMINAL entry for
   every configured agent reviewer (no started round, fewer terminals than
@@ -355,7 +357,43 @@ below); eject/promote and durability are slices 3-4.
   (`"first_officer"`) or whose severity is `planreview.SeverityHigh`
   (`"high"`); medium/low stay advisory (ADR-027). No requirement-arbitration
   concern CATEGORY exists (`requirement_arbitration` is a page event), so the
-  leg matches none. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
+  leg matches none. **Child-slice reconcile (#4823).** Before the leg reads
+  the run's open concerns it re-runs the idempotent import
+  (`reconcileSliceConcerns`, `concern_rollup.go`) for the run's SUCCEEDED
+  decomposition children, so a late child review whose best-effort import
+  was lost (WARN `concern_late_import_failed`, site `child_review`) reaches
+  the parent ledger and blocks here (`blocking_concern_open`) instead of
+  being missed. The call is skipped for a terminal run (a copy on a merged
+  parent would be a false open row) and returns before any parent stage read
+  when no child has succeeded; a running or failed child is never imported
+  (the fan-in's child set). A copy inserted by the pass is audited as one
+  `concern_rolled_up` row with site `merge_reconcile`. A child-list,
+  stage-list, concern-read or import failure WARN-logs under the same key
+  (site `merge_reconcile`) and fails the leg closed: `undeterminable`, so
+  enqueue, admission, merge-on-pass and the re-probe all hold. This is the
+  predicate's ONE write, and it is idempotent: a closed child source is not
+  imported and the unique index never re-mints a closed copy, so a repeat
+  evaluation inserts nothing and writes no second audit row. Cost and
+  locking: every evaluation adds one indexed child listing
+  (`runs_decomposed_from_idx`); a decomposed parent whose succeeded children
+  hold open HIGH/MEDIUM concerns adds one parent stage list, one
+  open-concern read per succeeded child and one `ImportRolledUp`
+  transaction, which takes the child-source row locks (`FOR NO KEY UPDATE`).
+  The reconcile takes no lock of its own. The lock order is the merge-intent
+  lock first, then the concern store's row locks, never the reverse: a
+  merge-variant evaluation that runs under the merge-intent lock nests the
+  row locks inside it and inherits its `fn` deadline. Today's callers
+  (the enqueue arm, re-entry and merge-on-pass) evaluate BEFORE they take
+  that lock, and admission and the re-probe run on detached pump or tick
+  contexts, so none nests the import today. Every caller is a POST or pump path
+  (the enqueue arm, re-entry, admission, merge-on-pass, the yield re-probe,
+  rebase); no GET evaluates the predicate, so no GET writes. A parent copy
+  and its child source resolve independently except for retry-sweep
+  supersession (the concern README, § "Child-slice rollup"). **Residual
+  (#5045):** the inline admitted merge (`handleMergeRun` when
+  `mergeCandidateGate` admits) never evaluates this predicate, so it runs no
+  leg (d) at all; this reconcile does not make an open HIGH block every
+  merge path. Reason codes: `not_approved`, `changes_requested`, `review_pending`,
   `review_coverage_incomplete`, `acceptance_not_eligible`,
   `acceptance_stale`, `checks_not_green`, `checks_red`,
   `blocking_concern_open`, `undeterminable`. The ADMISSION variant differs
@@ -385,8 +423,9 @@ below); eject/promote and durability are slices 3-4.
   its order; `merge_candidate_verify_failed` / `merge_candidate_check_failed`
   are never enqueued; an up-to-date verified (or ADR-096 transferred) head
   merges inline as before. An ineligible or undeterminable run gets today's
-  refusal plus the additive `details.merge_queue_ineligible` codes, with
-  nothing written.
+  refusal plus the additive `details.merge_queue_ineligible` codes, with no
+  verdict, intent or queue row written (the concern leg's reconcile may still
+  insert child-slice concern copies).
 - **Record before commit.** The chained `merge_queue_entered` row (operator
   actor; payload `run_id`, `repo`, `base_ref`, `anchored_head_sha`,
   `gate_code`, the verdict prose slice 2's merge-on-pass reads, `pr_url`)
@@ -1114,8 +1153,8 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   `yielded`, `yield_reason`) is appended first, then the queue write and
   `merge_queue_yielded` (site `merge_run`); 202 `queued` names the yield and
   the next step. A same-base LIVE entry is never marked; any other
-  ineligibility keeps the 409 with nothing written; the inline path still
-  refuses and writes nothing. A yielded entry's intent blocks the inline
+  ineligibility keeps the 409 with no verdict, intent or queue row written;
+  the inline path still refuses and writes nothing. A yielded entry's intent blocks the inline
   `merge_run` (ADR-109) until a qualifying approval clears the yield, the run
   is cancelled, or the operator withdraws the intent (§ "Withdraw intent
   (ADR-112 R3, #4685)").

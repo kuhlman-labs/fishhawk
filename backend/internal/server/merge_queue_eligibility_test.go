@@ -1018,3 +1018,130 @@ func TestMergeGateLegsOf(t *testing.T) {
 		t.Fatalf("combined: legs = %+v, want %+v", got, want)
 	}
 }
+
+// mqeFailingImport fails ImportRolledUp only, so the reconcile's one write is
+// the failure and every read still answers.
+type mqeFailingImport struct{ concern.Repository }
+
+func (mqeFailingImport) ImportRolledUp(context.Context, concern.ImportRolledUpParams) ([]*concern.Concern, error) {
+	return nil, errors.New("import store down")
+}
+
+// TestMergeQueueEligibility_ReconcilesChildSliceConcerns crosses eligibility
+// predicate -> child-slice reconcile -> concern store -> audit chain on the real
+// Postgres run, concern and audit repositories (#4823). A SUCCEEDED
+// decomposition child holds an open HIGH the parent never copied (a lost late
+// import); leg (d) must import it before reading the parent ledger, on both the
+// entry and the admission variant, exactly once, and fail closed when the
+// import itself fails.
+func TestMergeQueueEligibility_ReconcilesChildSliceConcerns(t *testing.T) {
+	ctx := context.Background()
+	// seedLostImport seeds a decomposition child of r that has SUCCEEDED and
+	// holds an open HIGH with NO copy on the parent, and returns the source.
+	seedLostImport := func(f *mcqFixture, r *mcqRun) *concern.Concern {
+		t.Helper()
+		child, err := f.repo.CreateRun(ctx, run.CreateRunParams{
+			Repo: "x/y", WorkflowID: "feature_change", WorkflowSHA: "deadbeef", TriggerSource: run.TriggerCLI, DecomposedFrom: &r.id,
+		})
+		if err != nil {
+			t.Fatalf("create child run: %v", err)
+		}
+		f.exec(`UPDATE runs SET state = 'succeeded' WHERE id = $1`, child.ID)
+		childImpl, err := f.repo.CreateStage(ctx, run.CreateStageParams{
+			RunID: child.ID, Sequence: 1, Type: run.StageTypeImplement, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+		})
+		if err != nil {
+			t.Fatalf("create child stage: %v", err)
+		}
+		seeded, err := concern.NewPostgresRepository(f.pool).InsertRaised(ctx, concern.InsertRaisedParams{
+			RunID: child.ID, StageID: childImpl.ID, StageKind: concern.StageKindImplement, ReviewerModel: "gpt-6-astra", OriginReviewSequence: 1,
+			Concerns: []concern.RaisedConcern{{Severity: "high", Category: "correctness", Note: "late high"}},
+		})
+		if err != nil {
+			t.Fatalf("seed child concern: %v", err)
+		}
+		open, err := concern.NewPostgresRepository(f.pool).ListOpenByRun(ctx, r.id)
+		if err != nil || len(open) != 0 {
+			t.Fatalf("precondition: parent open concerns = %d / %v, want 0 (the import was lost)", len(open), err)
+		}
+		return seeded[0]
+	}
+	parentCopies := func(f *mcqFixture, r *mcqRun) []*concern.Concern {
+		t.Helper()
+		rows, err := concern.NewPostgresRepository(f.pool).ListByRun(ctx, r.id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return rows
+	}
+	rolledUp := func(f *mcqFixture, r *mcqRun) []*audit.Entry {
+		t.Helper()
+		entries, err := f.audit.ListForRunByCategory(ctx, r.id, CategoryConcernRolledUp)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return entries
+	}
+
+	for _, variant := range []struct {
+		name string
+		eval func(f *mcqFixture, r *mcqRun) mergeQueueEligibilityResult
+	}{
+		{"entry", func(f *mcqFixture, r *mcqRun) mergeQueueEligibilityResult {
+			return f.srv.mergeQueueEligibility(ctx, f.runRow(r), "h0")
+		}},
+		{"admission", func(f *mcqFixture, r *mcqRun) mergeQueueEligibilityResult {
+			return f.srv.mergeQueueAdmissionEligibility(ctx, f.runRow(r), "h0")
+		}},
+	} {
+		t.Run(variant.name+" variant blocks once and adds nothing on a repeat", func(t *testing.T) {
+			f := newMCQFixture(t)
+			r := f.seed("rc-"+variant.name, "h0", []byte(mcvUndelegatedSpecYAML))
+			src := seedLostImport(f, r)
+
+			requireReasons(t, variant.eval(f, r), mergeQueueReasonBlockingConcernOpen)
+			copies := parentCopies(f, r)
+			if len(copies) != 1 || copies[0].RolledUpFrom == nil || *copies[0].RolledUpFrom != src.ID || copies[0].StageID != r.impl.ID {
+				t.Fatalf("parent rows after the first evaluation = %+v, want exactly one copy of %s on the parent implement stage", copies, src.ID)
+			}
+			entries := rolledUp(f, r)
+			if len(entries) != 1 {
+				t.Fatalf("concern_rolled_up rows = %d, want 1", len(entries))
+			}
+			var payload concernRolledUpPayload
+			if err := json.Unmarshal(entries[0].Payload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			if payload.Site != concernRollupSiteMergeReconcile || payload.Count != 1 || payload.High != 1 || payload.ParentStageID != r.impl.ID.String() {
+				t.Errorf("concern_rolled_up payload = %+v, want site merge_reconcile, count 1, high 1 on the parent implement stage", payload)
+			}
+
+			requireReasons(t, variant.eval(f, r), mergeQueueReasonBlockingConcernOpen)
+			if n := len(parentCopies(f, r)); n != 1 {
+				t.Errorf("parent rows after the second evaluation = %d, want 1 (idempotent)", n)
+			}
+			if n := len(rolledUp(f, r)); n != 1 {
+				t.Errorf("concern_rolled_up rows after the second evaluation = %d, want 1", n)
+			}
+		})
+	}
+
+	t.Run("a failing import is undeterminable", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r := f.seed("rc-fail", "h0", []byte(mcvUndelegatedSpecYAML))
+		seedLostImport(f, r)
+		f.srv.cfg.ConcernRepo = mqeFailingImport{concern.NewPostgresRepository(f.pool)}
+
+		got := f.srv.mergeQueueEligibility(ctx, f.runRow(r), "h0")
+		requireReasons(t, got, mergeQueueReasonUndeterminable)
+		if !got.Undeterminable || !strings.Contains(got.Reasons[0].Detail, "concerns: reconcile child-slice concerns") {
+			t.Fatalf("got %+v, want undeterminable naming the concern leg's reconcile", got)
+		}
+		if n := len(parentCopies(f, r)); n != 0 {
+			t.Errorf("parent rows = %d, want 0 after a failed import", n)
+		}
+		if n := len(rolledUp(f, r)); n != 0 {
+			t.Errorf("concern_rolled_up rows = %d, want 0 after a failed import", n)
+		}
+	})
+}
