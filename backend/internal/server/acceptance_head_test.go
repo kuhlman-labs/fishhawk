@@ -25,6 +25,7 @@ const (
 	ahF1 = "1f00000000000000000000000000000000000001" // an integration merge
 	ahF2 = "2f00000000000000000000000000000000000002" // a later integration merge
 	ahX  = "eeee000000000000000000000000000000000000" // a foreign concurrent push
+	ahH  = "4000000000000000000000000000000000000004" // the implement (PR-open) head of the #4673 shape
 )
 
 var ahT0 = time.Date(2026, 11, 1, 12, 0, 0, 0, time.UTC)
@@ -211,6 +212,15 @@ func TestAcceptanceHeadAsOf_SeedOrderedByChainSequence(t *testing.T) {
 			[]*audit.Entry{ahIntegration(run, 30, 0, ahF2), ahHead(run, "acceptance_scenarios_pushed", 30, 0, ahC)}, 0, false, ahC},
 		{"(l) a rebase predating the chosen integration seed does not walk it",
 			[]*audit.Entry{ahHead(run, "acceptance_scenarios_pushed", 20, 0, ahC), ahClean(run, 25, 0, ahC, ahM), ahIntegration(run, 30, 0, ahF2)}, 0, false, ahF2},
+		// (m) the #4673 shape: PR-open H at 10, the first acceptance episode's
+		// corpus commit S at 20 with the LATER timestamp, then a fix-up F at 30
+		// with the EARLIER one. Neither the old category precedence
+		// (acceptance_scenarios_pushed above fixup_pushed) nor a timestamp
+		// order answers F; only the chain sequence does.
+		{"(m) a fix-up after the scenario commit wins over the scenario commit's category precedence and later timestamp",
+			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahH), ahHead(run, "acceptance_scenarios_pushed", 20, 9, ahC), ahHead(run, "fixup_pushed", 30, 3, ahF)}, 0, false, ahF},
+		{"(m) bound 25 excludes the fix-up and answers the scenario head",
+			[]*audit.Entry{ahHead(run, "pull_request_opened", 10, 0, ahH), ahHead(run, "acceptance_scenarios_pushed", 20, 9, ahC), ahHead(run, "fixup_pushed", 30, 3, ahF)}, 25, true, ahC},
 		{"(l) plus a clean rebase of the integration seed walks to it",
 			[]*audit.Entry{ahHead(run, "acceptance_scenarios_pushed", 20, 0, ahC), ahClean(run, 25, 0, ahC, ahM), ahIntegration(run, 30, 0, ahF2), ahClean(run, 31, 0, ahF2, ahM2)}, 0, false, ahM2},
 	}
@@ -439,5 +449,28 @@ func TestAcceptanceValidatedHead_AdvancesThroughRebase(t *testing.T) {
 				t.Errorf("validated head = (%q, %v), want the merge commit (%q, true)", got, ok, ahM)
 			}
 		})
+	}
+}
+
+// TestAcceptanceValidatedHead_FixupAfterScenarioCommit is the #4673 shape at
+// the verdict binder: PR-open H, the first acceptance episode's corpus commit
+// S (category-precedence winner, later timestamp), then a fix-up F recorded
+// after S and before the second dispatch anchor. The verdict binds to F, never
+// to the prior episode's corpus commit S.
+func TestAcceptanceValidatedHead_FixupAfterScenarioCommit(t *testing.T) {
+	ph := uuid.Nil
+	const anchor = 40
+	rows := []*audit.Entry{
+		ahHead(ph, "pull_request_opened", 10, 0, ahH),
+		ahHead(ph, "acceptance_scenarios_pushed", 20, 9, ahC),
+		ahHead(ph, "fixup_pushed", 30, 3, ahF),
+	}
+	if anchor <= rows[2].Sequence {
+		t.Fatalf("precondition: the anchor %d must sit above the fix-up row %d", anchor, rows[2].Sequence)
+	}
+	s, runID, stageID := ahValidatedServer(t, anchor, rows...)
+	got, ok := s.acceptanceValidatedHeadSHA(context.Background(), runID, stageID)
+	if !ok || got != ahF {
+		t.Errorf("validated head = (%q, %v), want (%q, true) — the fix-up head, not the prior episode's corpus commit %q", got, ok, ahF, ahC)
 	}
 }

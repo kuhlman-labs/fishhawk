@@ -320,7 +320,7 @@ new preview head (`runner/internal/scenario`). The backend half is four seams:
 Residual, stated: an operator-invoked `fishhawk_retry_stage` on the settled
 acceptance stage AFTER a scenario push sees recorded-head ≠ current-head
 (`retry.go` Option C) and is admitted as a stale-head reopen — deliberate
-operator action, not an automatic reopen. Terminal-FAILED runs are
+operator action, not an automatic reopen ([#5161](https://github.com/kuhlman-labs/fishhawk/issues/5161)). Terminal-FAILED runs are
 deliberately NOT hooked by the cancel writer: `failed` is not absorbing
 (`runRetryTransitions` failed→running via revive/redrive), so a drop row at
 failure would be a false report once the run is revived and its acceptance
@@ -331,6 +331,83 @@ recorded a `stage_cancelled` row at or after the PR close that cancelled the
 run, which is what keeps the cancel row safe to write. `applies_to.go`'s `abandonUnauditedOverrideRun`
 is not hooked either — it fires at run creation before any approval can carry
 a retirement, and its audit store is the thing that just failed.
+
+## Verdict head binding (#1682, #4874, #4673)
+
+The resolver properties (one `acceptanceHeadAsOf` for the served head, the
+verdict-bound head and Option C's current head; chain-sequence seed; dispatch
+anchor bound) and the #5082 / #5083 / #5087 residual list are in
+[review.md § "Head binding"](review.md#head-binding-the-consolidated-fan-in-fallback-and-the-unbound-head-clamp-3091).
+This section carries only what #4673 added.
+
+**Corpus-commit contract.** A verdict binds to the PRE-corpus head it validated.
+The stage's own `acceptance_scenarios_pushed` commit lands after the verdict, so
+it is a post-verdict descendant: `recordAcceptanceScenariosPushed` writes a
+reported-head ledger row (lineage) and makes no stage transition. It triggers no
+AUTOMATIC re-open. An operator-invoked retry still can re-open it (Option C,
+`retryAcceptanceOutcomeUnknown`, reads the corpus commit as a stale head; see
+Known residuals). After a fix-up the bound head is the fix-up head, never the
+prior episode's corpus commit. Pinned by
+`TestAcceptanceE2E_ScenarioCommitThenFixup_SecondVerdictBindsFixupHead` (served
+head, second verdict head, `acceptance_stale` between the fix-up and the re-run,
+admission after the verdict and its own corpus commit),
+`TestShipAcceptance_HeadSHA_FixupAfterScenarioCommit`,
+`TestAcceptanceValidatedHead_FixupAfterScenarioCommit` and the `(m)` rows of
+`TestAcceptanceHeadAsOf_SeedOrderedByChainSequence`.
+
+**The #4673 determination (an INFERENCE from the pre-#5155 code, not an observed
+fact).** Before #5155 two resolvers answered one question. The SERVED head,
+`acceptance_expected_head_sha` (`prompt.go` `acceptanceHeadForRun` →
+`newestReportedHead`), picked the newest row by TIMESTAMP across
+`lineageLedgerCategories`. The BOUND head (`acceptance.go`
+`acceptanceValidatedHeadSHA`) was `auditcomplete.LatestReportedHeadSHA` over
+`HeadReportCategoriesByPrecedence`, where `acceptance_scenarios_pushed` outranks
+`fixup_pushed` (read both with `git show 5455579c^:backend/internal/server/prompt.go`
+and `...acceptance.go`). The inference assumes that, in runs 50d3144b and
+3f940bf0, the `fixup_pushed` row carried a later timestamp than the first
+episode's scenario row; those chains were not re-read. On that assumption the
+runner was served and checked out the fix-up head F, so the second episode
+VERIFIED F, and the record named the first episode's corpus commit S1: the
+verdict MISSTATED the tree it verified. Were the `fixup_pushed` timestamp
+earlier, the stage would instead have been served S1 and verified stale code;
+#5155's single resolver, which reads chain sequence only, removes both shapes.
+
+**Why merge readiness runs no ancestor-or-equal check on `head_sha`.** The
+defect's wrong head S1 is itself an ancestor of F and of every later PR head, so
+an ancestor-or-equal check on the recorded head could not have caught it. Every
+head-moving write Fishhawk performs without re-opening acceptance is a
+descendant of the verdict head by construction: the scenario commit, a clean
+ADR-090 rebase merge, a conflict-resolution merge commit and an operator vouch
+commit on top. The code those writes add is covered by the ADR-090 / ADR-142
+exact-head merge-candidate verification, not by re-acceptance. The one write that
+changes validated code, a fix-up push, records `acceptance_reopened` through
+`reopenAcceptanceOnFixupPush`, and `acceptanceStaleRefusal` refuses
+`acceptance_stale` on that record. Branch rewrites belong to the ADR-035 lineage
+and reset-branch paths. The refusal keys on the chain's own record, not a head
+compare.
+
+**Known residuals, none fixed here.**
+
+- `reopenAcceptanceOnFixupPush` writes nothing when the acceptance stage is
+  absent or not `succeeded`, or has no recorded verdict (the #1567 operator
+  re-open owns an outcome-less stage). A refused `ReopenAcceptanceStage` (a
+  concurrent or re-delivered re-open, a terminal run) or a failed
+  `acceptance_reopened` append only WARN-logs and never unwinds the fix-up push.
+  In each case no `acceptance_reopened` row exists, so `acceptanceStaleRefusal`
+  has no record to key on and admits. The invalidation guarantee above holds only
+  when that row is written.
+- Option C (`retry.go` `retryAcceptanceOutcomeUnknown`) compares the recorded
+  head with the unbounded current head, so the stage's own post-verdict corpus
+  commit reads as stale and an operator retry is admitted. Predates #5155;
+  [#5161](https://github.com/kuhlman-labs/fishhawk/issues/5161).
+- `auditcheckpublisher.findHeadSHA` and `server.latestRunHeadSHA` still rank by
+  `HeadReportCategoriesByPrecedence`, so a stale `acceptance_scenarios_pushed`
+  head outranks a newer `fixup_pushed` head. The runner skips the corpus commit
+  when the corpus is unchanged, so after acceptance, scenario, fix-up and a
+  re-run with no new scenarios the `fishhawk_audit_complete` Check Run can stay
+  on S1 while the PR head is F. The failure direction is a merge wedge, not a
+  false admit; [#5160](https://github.com/kuhlman-labs/fishhawk/issues/5160).
+- The #5082, #5083 and #5087 residuals are unchanged (see review.md above).
 
 ## Pre-spawn acceptance-dispatch admission (E31.23 / #1928)
 
