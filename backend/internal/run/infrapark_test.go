@@ -174,6 +174,12 @@ func TestClassifyInfraFailurePark_Implement(t *testing.T) {
 		{"implement D -> NotApplicable", catPtr(run.FailureD), run.InfraParkHistory{}, run.InfraParkNotApplicable},
 		{"implement C, MergeObserved (C2) -> NotApplicable", c, run.InfraParkHistory{MergeObserved: true}, run.InfraParkNotApplicable},
 		{"implement C, three prior parks -> BudgetExhausted", c, run.InfraParkHistory{PriorParks: run.InfraFailureParkRetryBudget}, run.InfraParkBudgetExhausted},
+		// #4816: an operator-reaped live merge-candidate verify pass overrides
+		// ReopenedPass and StagePushed, but never DecomposedParent.
+		{"implement C, ReopenedPass + StagePushed + ReapedLiveMergeCandidatePass -> Retryable", c,
+			run.InfraParkHistory{ReopenedPass: true, StagePushed: true, ReapedLiveMergeCandidatePass: true}, run.InfraParkRetryable},
+		{"implement C, DecomposedParent + ReopenedPass + ReapedLiveMergeCandidatePass -> NotApplicable", c,
+			run.InfraParkHistory{DecomposedParent: true, ReopenedPass: true, ReapedLiveMergeCandidatePass: true}, run.InfraParkNotApplicable},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -381,5 +387,304 @@ func TestInfraParkReopenedPassCategories_ReturnsCopy(t *testing.T) {
 	got[0] = "mutated"
 	if run.InfraParkReopenedPassCategories()[0] == "mutated" {
 		t.Fatal("InfraParkReopenedPassCategories returned the backing slice")
+	}
+}
+
+// mcTriggerPayload is a populated server stage_merge_candidate_verify_triggered
+// payload with the given anchor overrides (an override of "" blanks it).
+func mcTriggerPayload(t *testing.T, overrides map[string]any) json.RawMessage {
+	t.Helper()
+	p := map[string]any{
+		"branch":                   "fishhawk/run-4816",
+		"base_ref":                 "main",
+		"expected_head_sha":        "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+		"cause":                    "base_advance",
+		"verify_command":           "scripts/test verify",
+		"prior_state":              "succeeded",
+		"reparked_review_stage_id": uuid.NewString(),
+	}
+	for k, v := range overrides {
+		p[k] = v
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+// reapPayload is an operator dispatch_reaper_failed payload: the shared reap
+// key set plus, when stamp is true, the episode keys the operator arm adds.
+func reapPayload(t *testing.T, reason string, stamp bool, failedAt string, ordinal int, extra map[string]any) json.RawMessage {
+	t.Helper()
+	p := map[string]any{
+		"run_id":           uuid.NewString(),
+		"stage_id":         uuid.NewString(),
+		"failure_category": "C",
+		"reason":           reason,
+		"detail":           "",
+		"exit_code":        0,
+		"reported_at":      "2026-11-11T12:00:00Z",
+		"auth_method":      "bearer",
+	}
+	if stamp {
+		p["failed_at"] = failedAt
+		p["retry_ordinal"] = ordinal
+	}
+	for k, v := range extra {
+		p[k] = v
+	}
+	b, err := json.Marshal(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return b
+}
+
+func payloadEntry(seq int64, stageID *uuid.UUID, category string, payload json.RawMessage) *audit.Entry {
+	return &audit.Entry{Sequence: seq, StageID: stageID, Category: category, Payload: payload}
+}
+
+// TestReadInfraParkHistory_ReapedLiveMergeCandidatePass pins the #4816 arm end
+// to end through ClassifyInfraFailurePark. Unless a row says otherwise, the
+// trigger is populated and the operator reap is a runner_lost reap stamped
+// with the failed stage's own episode. Every NotApplicable row differs from a
+// Retryable row in exactly the one fact its conjunct reads, so that conjunct
+// is the only thing in the path.
+func TestReadInfraParkHistory_ReapedLiveMergeCandidatePass(t *testing.T) {
+	t.Parallel()
+
+	ended := time.Date(2026, 11, 11, 12, 34, 56, 789000, time.UTC)
+	newImpl := func(cat *run.FailureCategory, endedAt *time.Time, ordinal int) ([]*run.Stage, *run.Stage) {
+		stages, impl := implFixture(cat)
+		impl.EndedAt = endedAt
+		impl.SelfRetryCount = ordinal
+		return stages, impl
+	}
+	const (
+		trig     = "stage_merge_candidate_verify_triggered"
+		verified = "merge_candidate_verified"
+		reap     = "dispatch_reaper_failed"
+		watchdog = "dispatch_watchdog_elapsed"
+	)
+
+	type tc struct {
+		name string
+		// cat / endedAt / ordinal shape the failed stage (defaults: C, ended, 2).
+		cat      *run.FailureCategory
+		unended  bool
+		ordinal  *int
+		rows     func(t *testing.T, id, other uuid.UUID, at string, ord int) []*audit.Entry
+		want     run.InfraParkDecision
+		wantFlag bool
+	}
+	intp := func(i int) *int { return &i }
+	stamped := func(t *testing.T, at string, ord int) json.RawMessage {
+		return reapPayload(t, run.InfraParkRunnerLostReason, true, at, ord, nil)
+	}
+	cases := []tc{
+		// --- Retryable ---
+		{name: "trigger + stamped operator reap -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "conditional expected_state=dispatched operator reap -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{
+					payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)),
+					payloadEntry(6, &id, reap, reapPayload(t, run.InfraParkRunnerLostReason, true, at, ord, map[string]any{"expected_state": "dispatched"})),
+				}
+			}},
+		{name: "pull_request_opened before the trigger (StagePushed override) -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{stageEntry(2, &id, "pull_request_opened"), payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "older stage_fixup_triggered then trigger (newestPass) -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{stageEntry(2, &id, "stage_fixup_triggered"), payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "earlier merge_candidate_verified then a newer trigger (live) -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{stageEntry(3, &id, verified), payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "a prior-episode park row counts (PriorParks 1) -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{parkEntry(t, 1, id, "2026-11-10T09:00:00Z", 0), payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "a current-episode park row is not double counted -> Retryable", want: run.InfraParkRetryable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord)), parkEntry(t, 7, id, at, ord)}
+			}},
+		// --- BudgetExhausted ---
+		{name: "three prior-episode parks + a live stamped reap -> BudgetExhausted", want: run.InfraParkBudgetExhausted, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{
+					parkEntry(t, 1, id, "2026-11-10T09:00:00Z", 0), parkEntry(t, 2, id, "2026-11-10T10:00:00Z", 1), parkEntry(t, 3, id, "2026-11-10T11:00:00Z", 1),
+					payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord)),
+				}
+			}},
+		// --- NotApplicable ---
+		{name: "trigger only, no reap -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, _ string, _ int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil))}
+			}},
+		{name: "trigger consumed by a later merge_candidate_verified -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), stageEntry(6, &id, verified), payloadEntry(7, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "trigger then a newer stage_fixup_triggered -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), stageEntry(6, &id, "stage_fixup_triggered"), payloadEntry(7, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "trigger then a newer stage_conflict_resolution_triggered -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), stageEntry(6, &id, "stage_conflict_resolution_triggered"), payloadEntry(7, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "reap stamped with an EARLIER episode (failed_at and ordinal differ) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, _ string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, "2026-11-11T10:00:00Z", ord-1))}
+			}},
+		{name: "matching failed_at but a different retry_ordinal -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord+1))}
+			}},
+		{name: "LEGACY unstamped reap on an unended ordinal-0 stage (the (\"\",0) collision) -> NotApplicable", want: run.InfraParkNotApplicable,
+			unended: true, ordinal: intp(0),
+			rows: func(t *testing.T, id, _ uuid.UUID, _ string, _ int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, reapPayload(t, run.InfraParkRunnerLostReason, false, "", 0, nil))}
+			}},
+		{name: "current-episode stamp carrying reported_by runner (N1 provenance) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{
+					payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)),
+					payloadEntry(6, &id, reap, reapPayload(t, run.InfraParkRunnerLostReason, true, at, ord, map[string]any{"reported_by": "runner", "reported_attempt": "attempt-1"})),
+				}
+			}},
+		{name: "detached reaper non-zero-exit reason (C2) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{
+					payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)),
+					payloadEntry(6, &id, reap, reapPayload(t, "runner exited 1 before reporting a terminal state", true, at, ord, map[string]any{"exit_code": 1})),
+				}
+			}},
+		{name: "zero-exit strand reaper reason (C2) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{
+					payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)),
+					payloadEntry(6, &id, reap, reapPayload(t, "runner exited 0 without settling the stage (state=running)", true, at, ord, nil)),
+				}
+			}},
+		{name: "concurrency-slot spawn-failure compensation (C2, conditional dispatched) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{
+					payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)),
+					payloadEntry(6, &id, reap, reapPayload(t, "slot waiter: spawn failed after admission: fork/exec: no such file", true, at, ord, map[string]any{"expected_state": "dispatched"})),
+				}
+			}},
+		{name: "dispatch_watchdog_elapsed carrying a current-episode stamp (N1: never parks) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, watchdog, stamped(t, at, ord))}
+			}},
+		{name: "half-populated trigger (no verify_command) -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, map[string]any{"verify_command": ""})), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "invalid-cause trigger -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, map[string]any{"cause": "rebase"})), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "malformed trigger payload -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, json.RawMessage(`{"branch":`)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "stamped reap scoped to another stage -> NotApplicable", want: run.InfraParkNotApplicable,
+			rows: func(t *testing.T, id, other uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &other, reap, stamped(t, at, ord))}
+			}},
+		{name: "plan_decomposed (DecomposedParent precedence) -> NotApplicable", want: run.InfraParkNotApplicable, wantFlag: true,
+			rows: func(t *testing.T, id, other uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{stageEntry(1, &other, "plan_decomposed"), payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+		{name: "pr_merged (C2 carve-out) -> NotApplicable", want: run.InfraParkNotApplicable, wantFlag: true,
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord)), stageEntry(7, nil, "pr_merged")}
+			}},
+		{name: "failure category B -> NotApplicable", want: run.InfraParkNotApplicable, wantFlag: true, cat: catPtr(run.FailureB),
+			rows: func(t *testing.T, id, _ uuid.UUID, at string, ord int) []*audit.Entry {
+				return []*audit.Entry{payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)), payloadEntry(6, &id, reap, stamped(t, at, ord))}
+			}},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cat := c.cat
+			if cat == nil {
+				cat = catPtr(run.FailureC)
+			}
+			endedAt := &ended
+			if c.unended {
+				endedAt = nil
+			}
+			ordinal := 2
+			if c.ordinal != nil {
+				ordinal = *c.ordinal
+			}
+			stages, impl := newImpl(cat, endedAt, ordinal)
+			at, ord := run.InfraParkEpisode(impl)
+			if !c.unended && (at == "" || ord != ordinal) {
+				t.Fatalf("precondition: episode = (%q, %d), want a non-empty failed_at and ordinal %d", at, ord, ordinal)
+			}
+			rows := c.rows(t, impl.ID, stages[2].ID, at, ord)
+			h := run.ReadInfraParkHistory(rows, impl)
+			if h.ReapedLiveMergeCandidatePass != c.wantFlag {
+				t.Fatalf("ReapedLiveMergeCandidatePass = %v, want %v (history %+v)", h.ReapedLiveMergeCandidatePass, c.wantFlag, h)
+			}
+			if got := run.ClassifyInfraFailurePark(stages, impl, h); got != c.want {
+				t.Fatalf("got %v, want %v (history %+v)", got, c.want, h)
+			}
+		})
+	}
+
+	t.Run("the reaped pass is still a re-opened pass, and park counts are unchanged", func(t *testing.T) {
+		stages, impl := newImpl(catPtr(run.FailureC), &ended, 2)
+		at, ord := run.InfraParkEpisode(impl)
+		id := impl.ID
+		h := run.ReadInfraParkHistory([]*audit.Entry{
+			parkEntry(t, 1, id, "2026-11-10T09:00:00Z", 0),
+			stageEntry(2, &id, "pull_request_opened"),
+			payloadEntry(5, &id, trig, mcTriggerPayload(t, nil)),
+			payloadEntry(6, &id, reap, stamped(t, at, ord)),
+			parkEntry(t, 7, id, at, ord),
+		}, impl)
+		if !h.ReopenedPass || !h.StagePushed || !h.ReapedLiveMergeCandidatePass || h.PriorParks != 1 || !h.CurrentEpisodeParked {
+			t.Fatalf("history = %+v, want ReopenedPass, StagePushed, ReapedLiveMergeCandidatePass, PriorParks 1, CurrentEpisodeParked", h)
+		}
+		if got := run.ClassifyInfraFailurePark(stages, impl, h); got != run.InfraParkRetryable {
+			t.Fatalf("got %v, want Retryable", got)
+		}
+	})
+	t.Run("read error keeps failing the run", func(t *testing.T) {
+		stages, impl := newImpl(catPtr(run.FailureC), &ended, 2)
+		h, ok := run.InfraParkHistoryOnReadError(stages, impl)
+		if !ok || h.ReapedLiveMergeCandidatePass {
+			t.Fatalf("ok = %v, history = %+v, want ok and no ReapedLiveMergeCandidatePass", ok, h)
+		}
+	})
+}
+
+// TestInfraParkMergeCandidateAccessors pins the mirrored values the server's
+// mirror test binds and the orchestrator's park-row marker writes.
+func TestInfraParkMergeCandidateAccessors(t *testing.T) {
+	t.Parallel()
+	if got := run.InfraParkOperatorReapCategory(); got != "dispatch_reaper_failed" {
+		t.Fatalf("InfraParkOperatorReapCategory = %q", got)
+	}
+	if got := run.InfraParkMergeCandidateVerifiedCategory(); got != "merge_candidate_verified" {
+		t.Fatalf("InfraParkMergeCandidateVerifiedCategory = %q", got)
+	}
+	if run.InfraParkReopenedPassMergeCandidateVerify != "merge_candidate_verify" {
+		t.Fatalf("InfraParkReopenedPassMergeCandidateVerify = %q", run.InfraParkReopenedPassMergeCandidateVerify)
+	}
+	if run.InfraParkRunnerLostReason != "runner_lost" {
+		t.Fatalf("InfraParkRunnerLostReason = %q", run.InfraParkRunnerLostReason)
 	}
 }

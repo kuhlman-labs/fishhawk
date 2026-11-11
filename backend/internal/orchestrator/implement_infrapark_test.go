@@ -184,6 +184,11 @@ func TestAdvance_ImplementInfraFailure_ParksRun(t *testing.T) {
 	if p["stage_type"] != "implement" || p["park_ordinal"] != float64(1) || p["failure_reason"] != implInfraReason {
 		t.Fatalf("park payload = %v", p)
 	}
+	// #4816: only a park of an operator-reaped live merge-candidate verify
+	// pass carries reopened_pass; a first-execution park's key set is unchanged.
+	if _, ok := p["reopened_pass"]; ok {
+		t.Fatalf("first-execution park payload carries reopened_pass: %v", p)
+	}
 }
 
 // TestAdvance_ImplementInfraFailure_BudgetExhaustedFailsRun (T-ORCH-2): three
@@ -401,4 +406,144 @@ func TestAdvance_ImplementInfraFailure_ReopenedPassStillFailsRun(t *testing.T) {
 			}
 		})
 	}
+}
+
+// seedReapedLiveMergeCandidatePass seeds the #4816 shape on a fresh implement
+// park fixture: the implement stage failed C at retry ordinal 1 (EndedAt set),
+// with pull_request_opened (seq 1), a populated merge-candidate trigger (seq 2)
+// and a dispatch_reaper_failed row (seq 3) carrying the given payload, all
+// scoped to the implement stage.
+func seedReapedLiveMergeCandidatePass(t *testing.T, au *perRunParkAudit, r *run.Run, impl *run.Stage, reap map[string]any) {
+	t.Helper()
+	impl.SelfRetryCount = 1
+	trigger, err := json.Marshal(map[string]any{
+		"branch":            "fishhawk/run-4816",
+		"base_ref":          "main",
+		"expected_head_sha": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+		"cause":             "base_advance",
+		"verify_command":    "scripts/test verify",
+		"prior_state":       "succeeded",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reapPayload, err := json.Marshal(reap)
+	if err != nil {
+		t.Fatal(err)
+	}
+	au.seeded = []*audit.Entry{
+		{Sequence: 1, RunID: &r.ID, StageID: &impl.ID, Category: "pull_request_opened"},
+		{Sequence: 2, RunID: &r.ID, StageID: &impl.ID, Category: "stage_merge_candidate_verify_triggered", Payload: trigger},
+		{Sequence: 3, RunID: &r.ID, StageID: &impl.ID, Category: run.InfraParkOperatorReapCategory(), Payload: reapPayload},
+	}
+	// Precondition (M1): the rows read back with distinct, increasing
+	// sequences, and the failed stage carries an episode to stamp.
+	got, err := au.ListForRun(context.Background(), r.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 3 || got[0].Sequence >= got[1].Sequence || got[1].Sequence >= got[2].Sequence {
+		t.Fatalf("precondition: seeded rows = %d with sequences not strictly increasing", len(got))
+	}
+	if impl.EndedAt == nil {
+		t.Fatal("precondition: the failed implement stage has no EndedAt")
+	}
+}
+
+// operatorReap is an operator dispatch_reaper_failed payload for a runner
+// loss, stamped with the given episode.
+func operatorReap(failedAt string, ordinal int) map[string]any {
+	return map[string]any{
+		"failure_category": "C",
+		"reason":           run.InfraParkRunnerLostReason,
+		"auth_method":      "bearer",
+		"failed_at":        failedAt,
+		"retry_ordinal":    ordinal,
+	}
+}
+
+// TestAdvance_ImplementInfraFailure_ReapedLiveMergeCandidatePassParks (#4816):
+// an operator's runner-loss reap of a live merge-candidate verify-only pass,
+// stamped with the failed stage's current episode, parks the run even though
+// the stage is a re-opened pass. The park row names the pass
+// (reopened_pass merge_candidate_verify), a re-entry writes no second row,
+// and the operator retry re-opens the stage.
+func TestAdvance_ImplementInfraFailure_ReapedLiveMergeCandidatePassParks(t *testing.T) {
+	o, rs, au := newImplementParkOrchestrator(t)
+	rr := &retryRuns{stubRuns: rs}
+	o.Runs = rr
+	r, stages := seedImplementInfraFailure(t, rs)
+	impl := stages[1]
+	impl.SelfRetryCount = 1
+	at, ord := run.InfraParkEpisode(impl)
+	seedReapedLiveMergeCandidatePass(t, au, r, impl, operatorReap(at, ord))
+
+	for i := 0; i < 2; i++ {
+		out, err := o.Advance(context.Background(), r.ID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if out != OutcomeNoOp {
+			t.Fatalf("call %d: Outcome = %q, want noop (parked)", i, out)
+		}
+	}
+	if got := rs.runs[r.ID].State; got != run.StateRunning {
+		t.Fatalf("run state = %q, want running (parked)", got)
+	}
+	parks := au.rows(run.CategoryStageInfraParked)
+	if len(parks) != 1 {
+		t.Fatalf("stage_infra_parked rows = %d, want 1", len(parks))
+	}
+	var p map[string]any
+	if err := json.Unmarshal(parks[0].Payload, &p); err != nil {
+		t.Fatal(err)
+	}
+	if p["reopened_pass"] != run.InfraParkReopenedPassMergeCandidateVerify || p["park_ordinal"] != float64(1) {
+		t.Fatalf("park payload = %v, want reopened_pass %q and park_ordinal 1", p, run.InfraParkReopenedPassMergeCandidateVerify)
+	}
+	if p["failed_at"] != at || p["retry_ordinal"] != float64(ord) {
+		t.Fatalf("park payload episode = (%v, %v), want (%q, %d)", p["failed_at"], p["retry_ordinal"], at, ord)
+	}
+
+	dec, err := run.RetryStage(context.Background(), rr, impl.ID, run.RetryOptions{})
+	if err != nil {
+		t.Fatalf("RetryStage: %v", err)
+	}
+	if dec.Stage.State != run.StageStatePending || dec.Stage.SelfRetryCount != 2 {
+		t.Fatalf("after retry: stage = %q (ordinal %d), want pending (ordinal 2)", dec.Stage.State, dec.Stage.SelfRetryCount)
+	}
+}
+
+// TestAdvance_ImplementInfraFailure_StaleRunnerLossEpisodeFailsRun (#4816
+// H2): the same rows as the park test, but the reap is stamped with the
+// PREVIOUS retry ordinal — an earlier episode's reap never parks a later
+// failure, so the run fails as today.
+func TestAdvance_ImplementInfraFailure_StaleRunnerLossEpisodeFailsRun(t *testing.T) {
+	o, rs, au := newImplementParkOrchestrator(t)
+	r, stages := seedImplementInfraFailure(t, rs)
+	impl := stages[1]
+	impl.SelfRetryCount = 1
+	at, ord := run.InfraParkEpisode(impl)
+	seedReapedLiveMergeCandidatePass(t, au, r, impl, operatorReap(at, ord-1))
+
+	out, err := o.Advance(context.Background(), r.ID)
+	assertRunFailedNoRows(t, rs, au, r, out, err)
+}
+
+// TestAdvance_ImplementInfraFailure_RunnerReportedReapFailsRun (#4816 N1): a
+// current-episode stamp on a run-bound runner self-report (reported_by
+// runner) never parks — only an operator reap produces parking evidence.
+func TestAdvance_ImplementInfraFailure_RunnerReportedReapFailsRun(t *testing.T) {
+	o, rs, au := newImplementParkOrchestrator(t)
+	r, stages := seedImplementInfraFailure(t, rs)
+	impl := stages[1]
+	impl.SelfRetryCount = 1
+	at, ord := run.InfraParkEpisode(impl)
+	reap := operatorReap(at, ord)
+	reap["reported_by"] = "runner"
+	reap["reported_attempt"] = "attempt-1"
+	seedReapedLiveMergeCandidatePass(t, au, r, impl, reap)
+
+	out, err := o.Advance(context.Background(), r.ID)
+	assertRunFailedNoRows(t, rs, au, r, out, err)
 }
