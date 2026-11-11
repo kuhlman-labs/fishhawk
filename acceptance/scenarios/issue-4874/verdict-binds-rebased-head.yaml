@@ -1,0 +1,14 @@
+id: scenario:issue-4874/verdict-binds-rebased-head
+statement: A verdict shipped for a stage dispatched after a clean base merge is recorded against the merge commit.
+verify_hint: 'After seeding acceptance-rebased-head, ship a signed transcript and verdict through /acceptance/transcript and /acceptance, then GET /v0/runs/{run_id}/audit: the acceptance_outcome_recorded entry''s head_sha equals the seeded merge SHA.'
+steps: 'On the acceptance-rebased-head seed, for rebased-run 920d19cf-4f41-4a4f-96c6-10655db6dcb1 (stage 2100c9ac-216c-4e92-8627-7d2fcfab2b3c) and also rebased-parent 4d1cfda4-590c-41c7-9f1b-f929e7768e35 (stage c98eb536-6eec-4310-bf90-53fc00393f6b): 1) POST /v0/runs/{run}/signing-key {}. 2) POST /v0/dev/sign over a transcript JSON with rows run-readable and stages-listed. 3) POST /v0/runs/{run}/acceptance/transcript?stage_id={stage} with X-Fishhawk-Signature -> 201 with id and content_hash. 4) Sign the verdict {verdict:passed, criteria:[run-readable passed, stages-listed passed], target_url, transcript:{artifact_id, content_hash}}. 5) POST /v0/runs/{run}/acceptance?stage_id={stage} -> 201. 6) GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded.'
+assertions:
+    expected: head_sha equals the seeded merge SHA.
+    observed_at_record: 'rebased-run: acceptance_outcome_recorded seq 13 head_sha=2222222222222222222222222222222222222222, verdict passed, outcome accepted. rebased-parent: seq 14 head_sha=5555555555555555555555555555555555555555.'
+    repro_handle: POST /v0/runs/<run>/acceptance?stage_id=<stage> (signed), then GET /v0/runs/<run>/audit?category=acceptance_outcome_recorded
+origin:
+    issue: 4874
+    pr: 0
+    run_id: b17a1356-268d-4e98-8bf7-68e413ba7018
+    head_sha: ce361c0905f240c36b7ce26a24cd75d541a232e2
+    recorded_at: 2026-11-11T07:41:24Z

@@ -1,0 +1,14 @@
+id: scenario:issue-4874/rebased-head-is-expected-head
+statement: For a standalone run whose head advanced through a clean recorded base merge, the acceptance prompt names the merge commit as acceptance_expected_head_sha, not the pre-rebase head.
+verify_hint: 'POST /v0/dev/fixtures {"scenario":"acceptance-rebased-head"}, then GET /v0/stages/{stage_id}/prompt for run rebased-run''s acceptance stage: the body''s acceptance_expected_head_sha equals the seeded merge SHA.'
+steps: '1) POST http://localhost:8090/v0/dev/fixtures {"scenario":"acceptance-rebased-head"} -> rebased-run 920d19cf-4f41-4a4f-96c6-10655db6dcb1, acceptance stage 2100c9ac-216c-4e92-8627-7d2fcfab2b3c. 2) GET /v0/runs/{run}/audit: seq1 pull_request_opened head 1111...(40), seq2 branch_rebased prior_head 1111..., new_head/merge_commit 2222...(40), clean_verified true, seq3 acceptance_dispatched. 3) POST /v0/runs/{run}/signing-key {} -> private_key. 4) POST /v0/dev/sign with X-Fishhawk-Dev-Private-Key over the raw bytes ''prompt:<stage_id>'' -> signature. 5) GET /v0/stages/{stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: acceptance_expected_head_sha = the seeded merge SHA (2222...), not the pre-rebase head 1111...
+    observed_at_record: 200; acceptance_expected_head_sha=2222222222222222222222222222222222222222, acceptance_run_branch=e97.24-rebased-run, acceptance_pull_request_number=4874.
+    repro_handle: POST /v0/dev/fixtures {"scenario":"acceptance-rebased-head"}; sign 'prompt:<rr-acceptance id>' via /v0/dev/sign; GET /v0/stages/<rr-acceptance id>/prompt
+origin:
+    issue: 4874
+    pr: 0
+    run_id: b17a1356-268d-4e98-8bf7-68e413ba7018
+    head_sha: ce361c0905f240c36b7ce26a24cd75d541a232e2
+    recorded_at: 2026-11-11T07:41:24Z

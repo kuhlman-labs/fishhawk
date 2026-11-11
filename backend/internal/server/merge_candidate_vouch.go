@@ -66,9 +66,42 @@ func vouchProbeAtCap(n int) bool {
 
 // classifyVouchedHead is classifyMergeCandidateHead's rule 4 as amended (ADR-090
 // D8 Amendment 1, #4368): the cause for an operator-vouched head, or "" when
-// the vouch still exempts it. It performs NO writes.
+// the vouch still exempts it. It performs NO writes. Its reference is
+// newestVerifiedHead, which excludes only the probed head itself; ADR-142 D2
+// leaves this direct live-head reference unchanged.
 func (s *Server) classifyVouchedHead(ctx context.Context, runRow *run.Run, headSHA string) (string, error) {
-	cannotProbe := func(why string) (string, error) {
+	return s.vouchedHeadProbe(ctx, runRow, headSHA, func(ctx context.Context) (string, error) {
+		return s.newestVerifiedHead(ctx, runRow.ID, headSHA)
+	})
+}
+
+// mergeCandidateCannotProbeReason names why the deployment cannot run the
+// vouch probe for runRow (ADR-090 D7's inability-to-probe residual), or ""
+// when every input the probe needs is present.
+func (s *Server) mergeCandidateCannotProbeReason(runRow *run.Run) string {
+	if s.cfg.GitHub == nil {
+		return "no GitHub client is wired"
+	}
+	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
+		return "the run carries no GitHub installation"
+	}
+	if _, err := parseRepoOwnerName(runRow.Repo); err != nil {
+		return "the run repo is unparseable"
+	}
+	if parsePRNumberFromURL(runRow.PullRequestURL) <= 0 {
+		return "the run carries no parseable pull request number"
+	}
+	return ""
+}
+
+// vouchedHeadProbe is the Amendment 1 probe and determinability ladder for
+// headSHA, with the verified reference supplied by the caller. The order is
+// fixed: the cannot-probe check first, then the reference read, then the PR
+// read and the two compares. Rule 4 supplies newestVerifiedHead; ADR-142 D2's
+// scenario-terminal use supplies a reference that also excludes every
+// scenario-reported head. It performs NO writes.
+func (s *Server) vouchedHeadProbe(ctx context.Context, runRow *run.Run, headSHA string, reference func(context.Context) (string, error)) (string, error) {
+	if why := s.mergeCandidateCannotProbeReason(runRow); why != "" {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge-candidate verify: cannot probe an operator-vouched head for base commits; keeping the vouch exemption (ADR-090 D7, D8 Amendment 1)",
 			slog.String("run_id", runRow.ID.String()),
@@ -76,22 +109,11 @@ func (s *Server) classifyVouchedHead(ctx context.Context, runRow *run.Run, headS
 			slog.String("why", why))
 		return "", nil
 	}
-	if s.cfg.GitHub == nil {
-		return cannotProbe("no GitHub client is wired")
-	}
-	if runRow.InstallationID == nil || *runRow.InstallationID == 0 {
-		return cannotProbe("the run carries no GitHub installation")
-	}
-	repo, err := parseRepoOwnerName(runRow.Repo)
-	if err != nil {
-		return cannotProbe("the run repo is unparseable")
-	}
+	// Both parses succeeded inside mergeCandidateCannotProbeReason.
+	repo, _ := parseRepoOwnerName(runRow.Repo)
 	prNumber := parsePRNumberFromURL(runRow.PullRequestURL)
-	if prNumber <= 0 {
-		return cannotProbe("the run carries no parseable pull request number")
-	}
 
-	refHead, err := s.newestVerifiedHead(ctx, runRow.ID, headSHA)
+	refHead, err := reference(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -146,7 +168,20 @@ func bringsInBaseCommits(sinceVerified, branchOnly []string) bool {
 }
 
 // newestVerifiedHead returns the newest (by chain sequence) head on the run's
-// chain whose tree the product gated or verified, never excludeHead itself:
+// chain whose tree the product gated or verified, never excludeHead itself
+// (newestVerifiedHeadExcept lists the sources).
+//
+// Excluding the probed head keeps a passed verdict for that head from becoming
+// its own reference (H...H is empty, which would read not_required instead of
+// passed). "" means nothing on the chain was ever verified. Every audit read
+// error is returned.
+func (s *Server) newestVerifiedHead(ctx context.Context, runID uuid.UUID, excludeHead string) (string, error) {
+	return s.newestVerifiedHeadExcept(ctx, runID, func(sha string) bool { return sha == excludeHead })
+}
+
+// newestVerifiedHeadExcept returns the newest (by chain sequence) head on the
+// run's chain whose tree the product gated or verified, skipping every head
+// for which excluded reports true:
 //
 //   - the head_sha of a runner-gated report (mergeCandidateRunnerGatedCategories);
 //   - the head_sha of a passed merge_candidate_verified row;
@@ -154,15 +189,13 @@ func bringsInBaseCommits(sinceVerified, branchOnly []string) bool {
 //     row — matching newestMergeCandidateVerdict's rollback contract, so
 //     switching enforce → off/shadow revokes a transfer here too.
 //
-// Excluding the probed head keeps a passed verdict for that head from becoming
-// its own reference (H...H is empty, which would read not_required instead of
-// passed). "" means nothing on the chain was ever verified. Every audit read
-// error is returned.
-func (s *Server) newestVerifiedHead(ctx context.Context, runID uuid.UUID, excludeHead string) (string, error) {
+// The exclusion is by SHA, independent of sequence or result. "" means no
+// eligible head exists. Every audit read error is returned.
+func (s *Server) newestVerifiedHeadExcept(ctx context.Context, runID uuid.UUID, excluded func(string) bool) (string, error) {
 	var newest string
 	var newestSeq int64
 	consider := func(sha string, seq int64) {
-		if sha == "" || sha == excludeHead {
+		if sha == "" || excluded(sha) {
 			return
 		}
 		if newest == "" || seq > newestSeq {

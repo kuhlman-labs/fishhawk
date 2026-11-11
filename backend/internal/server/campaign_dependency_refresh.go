@@ -16,6 +16,12 @@ package server
 // and who can see the repo, so a read can never let a foreign caller drive a
 // forge read or a write.
 //
+// The status trigger additionally requires write:campaigns
+// (campaignStatusRefreshScopeHeld): a read-scoped poll, a run-bound token and
+// an anonymous caller still get the 200 and the persisted DAG, but drive no
+// tracker read and no write. The start route already requires write:campaigns
+// (requireWriteScope), so it needs no second check.
+//
 // Monotone means a tracker edit can only HOLD an item, never release one:
 // removing a native link or a Depends-on line changes nothing persisted. An
 // edge onto a non-member is held and marked external; an unparsable target is
@@ -61,6 +67,9 @@ const (
 	refreshSkippedForeign       = "foreign_account"
 	refreshSkippedRepoInvisible = "repo_not_visible"
 	refreshSkippedNoCandidates  = "no_candidates"
+	// refreshSkippedInsufficientScope: the status caller does not hold
+	// write:campaigns, or is a run-bound token or anonymous.
+	refreshSkippedInsufficientScope = "insufficient_scope"
 )
 
 // errDependencyRefreshForge: the tracker read failed, so nothing was observed.
@@ -239,14 +248,33 @@ func (s *Server) campaignRefreshAccess(ctx context.Context, c *campaign.Campaign
 	return true, ""
 }
 
-// refreshCampaignDependenciesForStatus is the GET /status trigger: access
-// gate, then the single-flight + minimum-interval gate, then a lenient
-// refresh. It never fails the read. A poll the gate skips, and one whose
+// campaignStatusRefreshScopeHeld reports whether the caller may drive the
+// GET /status dependency refresh. A run-bound token never does, even if it
+// holds write:campaigns; an anonymous caller is denied; a cookie session
+// passes because it carries no scope list (the same outcome requireWriteScope
+// gives the write routes); a token must hold write:campaigns. It is separate
+// from campaignRefreshAccess, which the start trigger and the dispatch-hold
+// release share and which asserts account + visibility only.
+func campaignStatusRefreshScopeHeld(id Identity) bool {
+	if isRunBoundSubject(id.Subject) {
+		return false
+	}
+	return identityHasGateScope(id, "write:campaigns")
+}
+
+// refreshCampaignDependenciesForStatus is the GET /status trigger: scope gate,
+// then access gate, then the single-flight + minimum-interval gate, then a
+// lenient refresh. It never fails the read. The scope gate runs before the
+// interval gate, so a skipped poll neither stamps the slot nor reads, carries
+// or clears its unrecorded hold. A poll the interval gate skips, and one whose
 // tracker read fails, still carries the last unrecorded hold. Returns nil when
 // the deployment disables the refresh.
 func (s *Server) refreshCampaignDependenciesForStatus(ctx context.Context, c *campaign.Campaign, items []*campaign.Item) (res *dependencyRefreshResult) {
 	if !s.cfg.CampaignDependencyRefresh {
 		return nil
+	}
+	if !campaignStatusRefreshScopeHeld(IdentityFrom(ctx)) {
+		return &dependencyRefreshResult{SkippedReason: refreshSkippedInsufficientScope}
 	}
 	if ok, reason := s.campaignRefreshAccess(ctx, c); !ok {
 		return &dependencyRefreshResult{SkippedReason: reason}

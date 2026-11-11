@@ -6316,21 +6316,29 @@ components:
           description: True when the tracker was read this poll.
         skipped_reason:
           type: string
-          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates]
+          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates, insufficient_scope]
           description: |
             Why no read happened: another refresh of this campaign is in flight;
             one finished (successfully or on a tracker error) under 30 s ago;
             the caller's account does not own the campaign; the caller cannot
-            see the repo; or no item is unstarted.
+            see the repo; no item is unstarted; or the caller lacks
+            `write:campaigns` (`insufficient_scope`: a read-scoped token, any
+            run-bound `mcp:run` token even one holding the scope, or an
+            anonymous caller). An `insufficient_scope` poll makes no tracker
+            read and no write, serves the persisted DAG, and neither stamps the
+            30 s interval nor reads, carries or clears an unrecorded hold.
         committed:
           type: boolean
           description: |
             False when observed additions could NOT be persisted (audit row or
             write failure). The additions are then HELD in `items`/`rollup`/
             `next_action` and listed under `added`, and `warnings` names the
-            cause. Every later status read (one the 30 s interval skips, or one
-            whose tracker read fails) keeps that hold and warning until a
-            refresh records the additions; the hold is process-local.
+            cause. Every later status read by a caller the refresh admits (one
+            the 30 s interval skips, or one whose tracker read fails) keeps that
+            hold and warning until a refresh records the additions; the hold is
+            process-local. A caller the refresh does not admit (for example one
+            without `write:campaigns`) is served the persisted DAG and carries
+            no hold.
         added:
           type: array
           items:
@@ -18880,10 +18888,15 @@ paths:
               carries `campaign_id`, `hotfix_item_id`, `hotfix_issue_ref`,
               `expires_at`, `stage_id` and `item_id`. An ancestry that cannot be
               resolved (a missing parent, a cycle, or the depth bound) could
-              belong to any campaign, so while ANY campaign holds dispatches
-              (due holds are released first) it is held FAIL-CLOSED with
-              `details.reason: campaign_ancestry_unresolved` and
-              `details.unresolved`; with no hold anywhere it is admitted.
+              belong to any campaign the stage can see, so, on the stage's
+              repository, while a campaign in the stage's own account or a
+              legacy untenanted (NULL-account) campaign holds dispatches (due
+              holds in that scope are released first) it is held FAIL-CLOSED
+              with `details.reason: campaign_ancestry_unresolved` and
+              `details.unresolved`, and admitted when none does. A stage with
+              no account sees only untenanted campaigns' holds; a hold on a
+              campaign stamped with another account, or on another
+              repository, neither holds it nor is released by it (#4586).
               Expedited items and their decomposed
               children, non-implement stages, runs in no campaign and the
               idempotent already-`dispatched` arm are never held. A
@@ -23176,16 +23189,22 @@ paths:
         Dependency refresh (E86.47 / #4358): after the reconcile, the read
         re-reads tracker dependencies for unstarted items and ADDS newly
         observed edges (never removes one) — see `CampaignDependencyRefresh`.
-        It runs only for a caller whose account owns the campaign (or it is
-        untenanted) and who can see the repo, at most once per 30 s per
-        campaign (single-flight), and never fails the read: a tracker error or
-        an unrecordable change is reported in `dependency_refresh.warnings`,
-        and an observed blocker that could not be persisted still HOLDS its
-        item in this and every later status read until a refresh records it.
+        It runs only for a caller holding `write:campaigns` (a cookie session
+        passes, as on the write routes; a run-bound `mcp:run` token never does,
+        even one holding the scope; a caller without it gets
+        `dependency_refresh.skipped_reason: insufficient_scope` and the
+        persisted DAG, with no tracker read and no write), whose account owns
+        the campaign (or it is untenanted) and who can see the repo, at most
+        once per 30 s per campaign (single-flight), and never fails the read: a
+        tracker error or an unrecordable change is reported in
+        `dependency_refresh.warnings`, and an observed blocker that could not be
+        persisted still HOLDS its item in this and every later status read by a
+        caller the refresh admits until a refresh records it.
 
         Dispatch hold (E83.100 / #4234): an active hotfix hold is reported as
-        `dispatch_hold`. For a caller passing the same ownership + visibility
-        predicate, a DUE hold (hotfix item or its run terminal, or past
+        `dispatch_hold`. For a caller whose account owns the campaign (or it is
+        untenanted) and who can see the repo (that access predicate alone; the
+        refresh's `write:campaigns` gate does not apply), a DUE hold (hotfix item or its run terminal, or past
         `expires_at`) is released first and recorded as a system-actor
         `campaign_hold_released` row with `trigger: status_read`; any other
         caller never triggers a release. Expedited items carry `expedited`,
@@ -25384,17 +25403,25 @@ paths:
                   acceptance_expected_head_sha:
                     type: string
                     description: |
-                      The run's merge-candidate identity — the newest
-                      `head_sha` across the run's reported-head ledger
-                      entries (`pull_request_opened` / `child_pushed` /
-                      `fixup_pushed` / `acceptance_scenarios_pushed`, the same
-                      ADR-035 lineage source as
-                      `fixup_expected_head_sha`), falling back to the newest
-                      `integration_commit_recorded` `merge_sha` on the run's
-                      own chain when that ledger is empty (#3091), which is
-                      how a DECOMPOSED PARENT — whose children report their
-                      pushes on their own chains — resolves its consolidated
-                      branch tip. Served ONLY on acceptance stages
+                      The run's merge-candidate identity, resolved by
+                      acceptanceHeadAsOf (#4874): the seed is the
+                      highest-chain-sequence row across the run's
+                      reported-head ledger (`pull_request_opened` /
+                      `child_pushed` / `fixup_pushed` /
+                      `acceptance_scenarios_pushed` /
+                      `conflict_resolution_pushed`) and its own
+                      `integration_commit_recorded` `merge_sha` rows, with
+                      no timestamp read (a reported row wins only an
+                      equal-sequence tie), so a DECOMPOSED PARENT, whose
+                      children report their pushes on their own chains,
+                      resolves its consolidated branch tip. The seed then
+                      advances through each CLEAN `branch_rebased` row
+                      recorded after it (a reset to a head on that walked
+                      chain moves there), so after a Fishhawk rebase the
+                      field names the merge commit. A read error on either
+                      seed set or on the base-merge rows fails closed.
+                      `fixup_expected_head_sha` keeps its own timestamp
+                      seed and is unchanged. Served ONLY on acceptance stages
                       (E31.18 / #1569). The runner's pre-spawn
                       target-identity gate compares the declared acceptance
                       target's `/healthz` `git_sha` against it before
@@ -25424,7 +25451,11 @@ paths:
                     description: |
                       The run branch the acceptance runner pushes its
                       scenario-corpus commit to (E72.4 / #3328): the branch of
-                      the run's newest reported-head ledger entry. Served ONLY
+                      the run's newest reported-head ledger entry or, for a
+                      decomposed parent with no ledger branch but an
+                      `integration_commit_recorded` row, the server-derived
+                      `fishhawk/run-<first 8 of the run id>-consolidated`
+                      (#4874), never taken from a report. Served ONLY
                       on acceptance stages; absent when unresolvable, in which
                       case the runner skips persistence
                       (`persist_skipped` / `no_run_branch`) and reports
@@ -26017,14 +26048,14 @@ paths:
                     description: The approved plan's `verification.acceptance_criteria` id list (the E31.1 join keys) in plan order, served ONLY on acceptance stages (E31.7 / #1535) — the runner's verdict join-key validation set. Absent on every other stage type and when the approved plan carries no criteria.
                   acceptance_expected_head_sha:
                     type: string
-                    description: The run's merge-candidate identity — the newest `head_sha` across the run's reported-head ledger entries (the ADR-035 lineage source, same as `fixup_expected_head_sha`), falling back to the newest `integration_commit_recorded` `merge_sha` on the run's own chain for a decomposed parent whose reported-head ledger is empty (#3091); served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
+                    description: The run's merge-candidate identity resolved by acceptanceHeadAsOf (#4874) — the highest-chain-sequence row across the run's reported-head ledger and its own `integration_commit_recorded` `merge_sha` rows (no timestamp read; a reported row wins only an equal-sequence tie), advanced through each later CLEAN `branch_rebased` row, so after a Fishhawk rebase it names the merge commit; a read error fails closed, and `fixup_expected_head_sha` keeps its own timestamp seed; served ONLY on acceptance stages (E31.18 / #1569) — the runner's pre-spawn target-identity gate compares the declared target's `/healthz` `git_sha` against it. Absent on every other stage type and when resolution fails, in which case the runner fails the stage pre-spawn category-C `acceptance_expected_head_unresolved` rather than proceeding unverified (#3091).
                   forge_writes:
                     type: string
                     enum: [deny]
                     description: The backend's forge-write policy for this stage (E72.13 / #3500) — `deny` when this fishhawkd is in dev mode (a dev-only surface is mounted, `scripts/dev preview`); the runner's pre-spawn forge-writes gate refuses the stage on it (`runner_failed` reason `forge_writes_denied`, category C) before any agent spawn, push or pull-request open. Stamped on every stage type; omitted on a production daemon.
                   acceptance_run_branch:
                     type: string
-                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328); acceptance stages only, absent when unresolvable.
+                    description: The run branch the acceptance runner pushes its scenario-corpus commit to (E72.4 / #3328) — the newest reported-head ledger entry's branch or, for a decomposed parent with only `integration_commit_recorded` rows, the server-derived `fishhawk/run-<first 8>-consolidated` (#4874); acceptance stages only, absent when unresolvable.
                   acceptance_pull_request_number:
                     type: integer
                     description: The run's PR number from its newest `pull_request_opened` ledger entry, recorded as each persisted scenario's `origin.pr` (E72.4 / #3328); acceptance stages only, absent (0) when unresolvable — never the issue number.

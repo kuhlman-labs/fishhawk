@@ -1,0 +1,14 @@
+id: scenario:issue-4874/late-integration-seed-names-newest-head
+statement: On a run whose integration_commit_recorded row is newer than its newest reported-head row, the acceptance prompt names that integration head as acceptance_expected_head_sha, and a verdict shipped for that dispatch is recorded against it.
+verify_hint: 'POST /v0/dev/fixtures {"scenario":"acceptance-rebased-head"}, then GET /v0/stages/{stage_id}/prompt for run late-integration-parent''s acceptance stage: acceptance_expected_head_sha is the seeded integration SHA, not the older fixup head. Ship a signed transcript and verdict through /acceptance/transcript and /acceptance, then GET /v0/runs/{run_id}/audit: the acceptance_outcome_recorded entry''s head_sha equals that SHA.'
+steps: '1) POST /v0/dev/fixtures {"scenario":"acceptance-rebased-head"} -> late-integration-parent 3c966b91-5e51-4ff7-a7ec-a471d3a777be, acceptance stage 760abf07-c6b1-4644-8426-a4ae43ff7c99. 2) GET /v0/runs/{run}/audit: seq7 fixup_pushed head 6666...(40), seq8 integration_commit_recorded merge_sha 7777...(40), seq9 acceptance_dispatched. 3) POST /v0/runs/{run}/signing-key {}; POST /v0/dev/sign over ''prompt:<stage_id>''; GET /v0/stages/{stage}/prompt with X-Fishhawk-Signature. 4) Sign and POST a transcript to /v0/runs/{run}/acceptance/transcript?stage_id={stage} (201). Sign and POST a passed verdict referencing it to /v0/runs/{run}/acceptance?stage_id={stage} (201). 5) GET /v0/runs/{run}/audit?category=acceptance_outcome_recorded.'
+assertions:
+    expected: Both equal the integration SHA 7777..., not the fixup head 6666...
+    observed_at_record: Prompt acceptance_expected_head_sha=7777777777777777777777777777777777777777 and acceptance_run_branch=fishhawk/run-3c966b91-consolidated. acceptance_outcome_recorded seq 15 head_sha=7777777777777777777777777777777777777777.
+    repro_handle: GET /v0/stages/<lp-acceptance id>/prompt signed; POST /v0/runs/<run>/acceptance; GET audit?category=acceptance_outcome_recorded
+origin:
+    issue: 4874
+    pr: 0
+    run_id: b17a1356-268d-4e98-8bf7-68e413ba7018
+    head_sha: ce361c0905f240c36b7ce26a24cd75d541a232e2
+    recorded_at: 2026-11-11T07:41:24Z

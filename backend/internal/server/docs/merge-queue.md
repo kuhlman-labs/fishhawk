@@ -178,6 +178,96 @@ settle carries.
   pending-replacement trigger-append failure, which TODAY ejects
   `pass_not_startable`).
 
+### Scenario commits: exact-head classification ([ADR-142](../../../../docs/adr/142-merge-verification-after-scenario-commits.md), #4874)
+
+An acceptance scenario-corpus commit C (an `acceptance_scenarios_pushed` row)
+is classified by rule 4a of `mergeCandidateVerifyState`
+(`scenarioCommitObligation`, `merge_candidate_verify.go`), AFTER rule 4 (an
+operator-vouched live head) and BEFORE rule 5 (the decomposed-parent
+`fan_in`). Applicability: every requirement below holds only with a declared
+verify command (ADR-090 D4: none → `not_required` first, no arm runs), and is
+ENFORCED at merge only where the existing forge probe works. Rule 4 still
+decides an operator vouch of exact live C, with its existing reference.
+
+- **A recorded D2 obligation survives the commit (D1).** When the newest
+  non-no-op recorded head write before C is a performed `branch_rebased`, a
+  `conflict_resolution_pushed` or a fan-in integration, C needs passing
+  evidence at EXACTLY C, with that producer's cause (`base_advance`,
+  `conflict_resolution`, `fan_in`). The scenario commit is not a fourth
+  producer: it PRESERVES an obligation recorded by an ADR-090 D2 producer, and
+  a runner-gated root keeps today's answer. A report's `base_sha` can never
+  clear a recorded obligation. A `branch_rebased` whose `already_up_to_date`
+  decodes true is a no-op and is skipped before selection (the rebase verb's
+  up-to-date arm records one each time); an undecodable row or a missing flag
+  reads as performed. A `branch_reset` does not discharge it (one extra pass,
+  never a wedge).
+- **Runner-gated terminal (D2).** A chain whose reported terminal is the
+  newest runner-gated head, with no later recorded producer, falls through:
+  `not_required` on a standalone run and the existing `fan_in` on a parent.
+- **Vouched terminal (D2), the isolated reference.** When the walk resolves to
+  an operator-vouched terminal and D1 does not already decide, the vouch
+  ladder runs on the terminal with ONE change to its reference: the newest
+  verified head by chain sequence EXCLUDING the terminal and EVERY head an
+  `acceptance_scenarios_pushed` row on the chain reports
+  (`classifyScenarioTerminalVouch`). So no head a scenario row reports, C or
+  any intermediate or forked scenario commit, can remove the cause, whatever
+  its result or its position relative to the vouch. A nonempty cause is
+  returned; an EMPTY cause falls through, so a standalone run reads
+  `not_required` and a parent keeps its `fan_in`. A directly vouched live
+  head (rule 4) keeps its existing reference, which can be a passed scenario
+  commit, and so can read `not_required` where a scenario commit on the same
+  chain reads `unverified`: that difference is deliberate, and this amendment
+  hardens no direct vouch.
+- **Unresolved chain (D3).** A missing, malformed, empty, self-referencing,
+  cyclic or unrelated base with no recorded requirement answers `base_advance`
+  on a probeable run: a CONSERVATIVE requirement, not evidence that a base
+  merge occurred (the 409 wording residual is #5090). A deployment that
+  cannot probe keeps the ADR-090 D7 residual (`not_required` with a WARN),
+  but only when no requirement is already recorded.
+- **Exact-head evidence (D5).** Passed or failed comes only from a verdict at
+  exactly C; a result at M, an intermediate C1 or a predecessor neither clears
+  nor fails C, no verdict is inherited and no transfer row is fabricated
+  (transfer modes unchanged; a shadow or off transfer is not evidence).
+- **D7 gate reach.** `mergeCandidateGate` returns ungated with its WARN
+  BEFORE reading any state on a deployment that cannot probe. There a state
+  reader (the rebase up-to-date arm, the gate view) can report a recorded
+  requirement as `unverified`, but the merge is not refused: `unverified`
+  does not mean blocked on such a deployment.
+- **A parent's pass at C.** With a declared verify command on a probeable
+  deployment, a decomposed parent whose acceptance writes C generally owes
+  one pass at exactly C under the EXISTING classification: `fan_in` by the
+  direct route when the integration write is the newest head write before C
+  (ADR-092 D1, not serialized), and the newer producer's own cause and queue
+  route when a rebase or conflict push is newer.
+- **Recovery** is the existing route and promises no immediate pass. The gate
+  answers 409 `merge_candidate_unverified` naming `fishhawk_rebase_run_branch`
+  (unless `mergeQueueEnqueueArm` takes the run first: `fishhawk_merge_run`
+  then answers 202 with merge intent, and merge-on-pass still needs the pass
+  at C). The rebase verb's already-up-to-date arm reads `unverified` at C and
+  calls `startMergeCandidateVerifyPass` for C. `base_advance` and
+  `conflict_resolution` go through the ADR-092 queue: with no active entry
+  only a merge-queue-eligible run is admitted, otherwise the answer is
+  `not_queued` naming the reasons (for example `not_approved`,
+  `acceptance_not_eligible`), with no entry, no trigger and nothing
+  re-opened. Because C moves the head, a dismiss-stale repository drops the
+  forge approval, so the operator re-approves at C before the verb can queue
+  the pass, and on ANY repository merge-on-pass's fold needs an approval
+  covering exactly C (a scenario commit is not a clean base advance). An
+  eligible run behind another run's live pass answers `held`: a queue hold
+  is NOT a dispatched pass. A failed verdict at C refuses
+  `merge_candidate_verify_failed` with the existing fix-up and re-run routes.
+
+Pinned by `TestMergeCandidateVerifyState_ScenarioCommit`,
+`TestMergeCandidateVerifyState_ScenarioTerminalVouch`,
+`TestMergeCandidateScenarioCommit_GateRefusesThenRebaseStartsExactHeadPass`,
+`TestMergeCandidateScenarioTerminalVouch_GateRefusesFinalHeadThenRebaseStartsPass`,
+`TestMergeCandidateGate_CannotProbeStaysUngatedWithScenarioObligation` and
+`TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC`
+(`merge_candidate_verify_test.go`), with the isolated-reference seam in
+`TestVouchedHeadProbe_ReferenceExclusion` and the unchanged direct path in
+`TestClassifyVouchedHead_DirectKeepsScenarioEvidence`
+(`merge_candidate_vouch_reference_test.go`).
+
 ## Merge queue (ADR-093 slice 1, E87.4 / [#4295](https://github.com/kuhlman-labs/fishhawk/issues/4295))
 
 ADR-093 D1, D2 and D7 on the ADR-092 queue above: the same store rows, FIFO
@@ -656,7 +746,11 @@ surfaces) landed with #4632: § "ADR-112 R3 yield and R5 visibility".
   transferred, merge_candidate_verdict_transferred_sequence,
   transferred_from, root_head}`, and `not_required` appears ONLY on a head
   that predicate determined needs no verify (no verify command, a
-  runner-gated or otherwise unclassified head). Any other state (unverified,
+  runner-gated or otherwise unclassified head, or a scenario commit ADR-142
+  leaves with no cause: a chain resolving to the newest runner-gated head with
+  no later recorded producer, an empty terminal-vouch cause on a standalone
+  run, or the D7 inability-to-probe residual with no recorded requirement;
+  § "Scenario commits"). Any other state (unverified,
   in_flight, failed, a transfer ignored in off/shadow mode) fails closed
   before any append, refused exactly like an evidence-read error.
 - **Unresolvable veto names `dismiss_review` (#4764).** Every

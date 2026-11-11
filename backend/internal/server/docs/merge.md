@@ -474,11 +474,12 @@ walked chain; a reset anywhere else (or an undecodable reset row) resolves the
 seed. A failed read of either category WARNs and resolves the SEED, never ""
 (which would switch the runner to its checkout-only path); with no reported
 head the field stays "" (a rebase alone never invents a head).
-`acceptance_expected_head_sha` is deliberately unchanged
-(`resolveNewestReportedHeadSHA` returns the un-advanced seed). Pinned by
+`acceptance_expected_head_sha` now walks the same clean advances through its
+own resolver, `acceptanceHeadAsOf`, which seeds by chain sequence and fails
+closed on a read error (#4874; `review.md` § "Head binding"). Pinned by
 `TestWalkRecordedBaseMerges` (one row per mode),
 `TestResolveFixupExpectedHeadSHA_AdvancesThroughRecordedRebase` (the REAL
-rebase handler; also asserts the acceptance resolver still returns the seed),
+rebase handler; also asserts the acceptance resolver names the merge commit),
 `..._ConcurrentPushRebaseDoesNotAdvance`, `..._LaterFixupPushSupersedesRebase`,
 `..._BaseMergeReadErrorKeepsRecordedHead`, `..._NoRecordedHeadStaysEmpty`
 (`fixup_expected_head_test.go`) and the Postgres + MCP e2e

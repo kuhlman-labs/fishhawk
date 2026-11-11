@@ -58,16 +58,29 @@ func (r *holdCampaignRepo) ListCampaignItemsForRun(_ context.Context, runID uuid
 	return out, nil
 }
 
-func (r *holdCampaignRepo) ListDispatchHolds(_ context.Context) ([]*campaign.DispatchHold, error) {
+// ListDispatchHolds mirrors the production scope (#4586): the shared
+// validator, then a hold is listed only when its campaign is on s.Repo and is
+// stamped with s.AccountID or untenanted (an absent accounts entry is "").
+// An empty s.AccountID therefore lists the untenanted campaigns only.
+func (r *holdCampaignRepo) ListDispatchHolds(_ context.Context, s campaign.DispatchHoldScope) ([]*campaign.DispatchHold, error) {
+	if err := campaign.ValidateDispatchHoldScope(s); err != nil {
+		return nil, err
+	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
 	if r.listHoldsErr != nil {
 		return nil, r.listHoldsErr
 	}
 	var out []*campaign.DispatchHold
-	for _, h := range r.holds {
-		cp := *h
-		out = append(out, &cp)
+	for campaignID, h := range r.holds {
+		c, ok := r.campaigns[campaignID]
+		if !ok {
+			continue
+		}
+		if (r.accounts[campaignID] == s.AccountID || r.accounts[campaignID] == "") && c.Repo == s.Repo {
+			cp := *h
+			out = append(out, &cp)
+		}
 	}
 	return out, nil
 }
@@ -109,9 +122,10 @@ type holdHarness struct {
 	runS *run.Run
 }
 
-// newHoldHarness seeds a running campaign with an EXPEDITED hotfix item (run
-// runH) holding the campaign's dispatches, and a sibling item (run runS). The
-// hold's expires_at is MaxDispatchHold ahead of the fixed clock and both the
+// newHoldHarness seeds a running UNTENANTED campaign on runS's repository
+// (so an orphan stage, seeded on the same repository, is in its scope) with
+// an EXPEDITED hotfix item (run runH) holding the campaign's dispatches, and a
+// sibling item (run runS). The hold's expires_at is MaxDispatchHold ahead of the fixed clock and both the
 // hotfix item and its run are non-terminal, so the hold is NOT due. aud, when
 // non-nil, replaces the recording audit repo.
 func newHoldHarness(t *testing.T, aud audit.Repository) *holdHarness {
@@ -127,7 +141,7 @@ func newHoldHarness(t *testing.T, aud audit.Repository) *holdHarness {
 	h.hot = cItemWithRun("issue:42", nil, campaign.ItemStateRunning, h.runH.ID)
 	h.hot.Expedite = &campaign.Expedite{Kind: campaign.ExpediteKindHotfix, Workflow: "hotfix_change"}
 	h.sib = cItemWithRun("issue:10", nil, campaign.ItemStateRunning, h.runS.ID)
-	h.c = h.repo.seedCampaignWithItems("kuhlman-labs/fishhawk", "", []*campaign.Item{h.hot, h.sib})
+	h.c = h.repo.seedCampaignWithItems(h.runS.Repo, "", []*campaign.Item{h.hot, h.sib})
 	h.repo.mu.Lock()
 	h.repo.holds[h.c.ID] = &campaign.DispatchHold{CampaignID: h.c.ID, HotfixItemID: h.hot.ID, HeldAt: h.now, ExpiresAt: h.now.Add(campaign.MaxDispatchHold)}
 	h.repo.mu.Unlock()
@@ -340,7 +354,10 @@ func TestCampaignDispatchHold_UnresolvableAncestorHeld(t *testing.T) {
 }
 
 // Fix-up concerns c705d0e3 / 47ec2a19: an unresolvable ancestry is held ONLY
-// while some campaign still holds dispatches. Each shape is a run in NO
+// while a campaign in the stage's scope still holds dispatches; here every
+// run and the harness's campaign are untenanted on one repository, so the
+// harness's hold is in scope (#4586 scoping is pinned by
+// TestCampaignDispatchHold_UnresolvedAncestryScope). Each shape is a run in NO
 // campaign: with the harness's hold removed it is admitted (a deep follow-up
 // lineage is the motivating case), and with the hold back it is held again.
 // A due hold is released on the way (trigger host_dispatch) and admits.
@@ -420,6 +437,294 @@ func TestCampaignDispatchHold_UnresolvedAncestryNoHoldAdmitted(t *testing.T) {
 		h.refused(t, h.impl(h.childOf(uuid.New()).ID), http.StatusServiceUnavailable, "campaign_audit_unavailable")
 		if h.hold() == nil {
 			t.Fatalf("hold row released under an unrecordable release")
+		}
+	})
+}
+
+// scopeHold is a campaign seeded by seedScopedHold: its EXPEDITED hotfix item
+// holds the campaign's dispatches.
+type scopeHold struct {
+	c   *campaign.Campaign
+	hot *campaign.Item
+}
+
+// seedScopedHold seeds a campaign on repo stamped with account ("" =
+// untenanted) whose expedited hotfix item (issue ref ref) holds its
+// dispatches. due puts the hold AT its expires_at on the harness clock, so a
+// release on the way is a timeout; otherwise it is MaxDispatchHold ahead.
+func (h *holdHarness) seedScopedHold(account, repo, ref string, due bool) scopeHold {
+	hot := cItem(ref, nil, campaign.ItemStateRunning)
+	hot.Expedite = &campaign.Expedite{Kind: campaign.ExpediteKindHotfix, Workflow: "hotfix_change"}
+	c := h.repo.seedCampaignWithItems(repo, "", []*campaign.Item{hot})
+	held := h.now
+	if due {
+		held = h.now.Add(-campaign.MaxDispatchHold)
+	}
+	h.repo.mu.Lock()
+	if account != "" {
+		h.repo.accounts[c.ID] = account
+	}
+	h.repo.holds[c.ID] = &campaign.DispatchHold{CampaignID: c.ID, HotfixItemID: hot.ID, HeldAt: held, ExpiresAt: held.Add(campaign.MaxDispatchHold)}
+	h.repo.mu.Unlock()
+	return scopeHold{c: c, hot: hot}
+}
+
+func (h *holdHarness) holdOf(c *campaign.Campaign) *campaign.DispatchHold {
+	h.repo.mu.Lock()
+	defer h.repo.mu.Unlock()
+	return h.repo.holds[c.ID]
+}
+
+// orphanStage seeds an implement stage on a run with a MISSING parent (an
+// unresolvable ancestry) on runS's repository, stamped with account.
+func (h *holdHarness) orphanStage(account string) *run.Stage {
+	r := h.childOf(uuid.New())
+	h.rr.mu.Lock()
+	r.AccountID = account
+	h.rr.mu.Unlock()
+	return h.impl(r.ID)
+}
+
+// assertNamesNothingOf fails when body carries any identifier of sh.
+func assertNamesNothingOf(t *testing.T, body string, sh scopeHold) {
+	t.Helper()
+	for _, s := range []string{sh.c.ID.String(), sh.hot.ID.String(), sh.hot.IssueRef} {
+		if strings.Contains(body, s) {
+			t.Errorf("body names %q of an out-of-scope campaign: %s", s, body)
+		}
+	}
+}
+
+// releasedCampaigns lists the campaign_id of every campaign_hold_released row
+// the harness's recording audit repo holds, checking each trigger.
+func (h *holdHarness) releasedCampaigns(t *testing.T) []string {
+	t.Helper()
+	h.aud.mu.Lock()
+	defer h.aud.mu.Unlock()
+	var out []string
+	for _, e := range h.aud.entries {
+		if e.Category != categoryCampaignHoldReleased {
+			continue
+		}
+		var p map[string]any
+		if err := json.Unmarshal(e.Payload, &p); err != nil {
+			t.Fatalf("payload: %v", err)
+		}
+		if p["trigger"] != holdReleaseTriggerHostDispatch {
+			t.Errorf("release trigger = %v, want %s", p["trigger"], holdReleaseTriggerHostDispatch)
+		}
+		id, _ := p["campaign_id"].(string)
+		out = append(out, id)
+	}
+	return out
+}
+
+// TestCampaignDispatchHold_UnresolvedAncestryScope pins #4586 at the handler
+// over the campaign fake: an unresolvable ancestry is held only by a hold in
+// the stage's scope — its own account's campaigns plus legacy untenanted
+// (NULL-account) ones, on its own repository; an empty-account stage sees the
+// untenanted ones only. Every subtest starts from a harness whose own hold is
+// removed and seeds ONLY the holds under test, so no other hold can mask the
+// arm (a due-hold arm is never masked by an active one).
+func TestCampaignDispatchHold_UnresolvedAncestryScope(t *testing.T) {
+	acctA, acctB := uuid.NewString(), uuid.NewString()
+	newScope := func(t *testing.T, aud audit.Repository) *holdHarness {
+		t.Helper()
+		h := newHoldHarness(t, aud)
+		h.repo.mu.Lock()
+		delete(h.repo.holds, h.c.ID)
+		h.repo.mu.Unlock()
+		return h
+	}
+	admitBody := func(t *testing.T, h *holdHarness, st *run.Stage) string {
+		t.Helper()
+		w := h.mark(t, st)
+		if w.Code != http.StatusOK {
+			t.Fatalf("marker = %d %s, want 200", w.Code, w.Body.String())
+		}
+		if got := h.state(t, st.ID); got != run.StageStateDispatched {
+			t.Fatalf("stage reads %s after admission, want dispatched", got)
+		}
+		return w.Body.String()
+	}
+	heldUnresolved := func(t *testing.T, h *holdHarness, st *run.Stage) {
+		t.Helper()
+		d, _ := h.refused(t, st, http.StatusConflict, "campaign_dispatch_held")
+		if d["reason"] != "campaign_ancestry_unresolved" || d["unresolved"] != campaignAncestryMissingParent {
+			t.Errorf("details = %v, want the unresolved-ancestry refusal", d)
+		}
+	}
+	repo := func(h *holdHarness) string { return h.runS.Repo }
+
+	t.Run("a foreign-account active hold", func(t *testing.T) {
+		h := newScope(t, nil)
+		b := h.seedScopedHold(acctB, repo(h), "issue:901", false)
+		assertNamesNothingOf(t, admitBody(t, h, h.orphanStage(acctA)), b)
+		if h.holdOf(b.c) == nil {
+			t.Errorf("foreign-account hold row gone")
+		}
+		if n := h.aud.count(categoryCampaignHoldReleased); n != 0 {
+			t.Errorf("campaign_hold_released rows = %d, want 0", n)
+		}
+	})
+	t.Run("b own-account active hold", func(t *testing.T) {
+		h := newScope(t, nil)
+		a := h.seedScopedHold(acctA, repo(h), "issue:902", false)
+		heldUnresolved(t, h, h.orphanStage(acctA))
+		if h.holdOf(a.c) == nil {
+			t.Errorf("own-account hold released by a refusal")
+		}
+	})
+	t.Run("c foreign-account due hold", func(t *testing.T) {
+		h := newScope(t, nil)
+		b := h.seedScopedHold(acctB, repo(h), "issue:903", true)
+		assertNamesNothingOf(t, admitBody(t, h, h.orphanStage(acctA)), b)
+		if h.holdOf(b.c) == nil {
+			t.Errorf("foreign-account due hold released by a foreign stage")
+		}
+		if n := h.aud.count(categoryCampaignHoldReleased); n != 0 {
+			t.Errorf("campaign_hold_released rows = %d, want 0", n)
+		}
+	})
+	t.Run("d foreign-account due hold under an audit outage", func(t *testing.T) {
+		h := newScope(t, &hotfixFailCategoryAudit{fail: categoryCampaignHoldReleased})
+		b := h.seedScopedHold(acctB, repo(h), "issue:904", true)
+		assertNamesNothingOf(t, admitBody(t, h, h.orphanStage(acctA)), b)
+		if h.holdOf(b.c) == nil {
+			t.Errorf("foreign-account due hold row gone")
+		}
+	})
+	t.Run("e own-account due hold released", func(t *testing.T) {
+		h := newScope(t, nil)
+		a := h.seedScopedHold(acctA, repo(h), "issue:905", true)
+		admitBody(t, h, h.orphanStage(acctA))
+		if h.holdOf(a.c) != nil {
+			t.Errorf("own-account due hold survived")
+		}
+		if got := h.releasedCampaigns(t); len(got) != 1 || got[0] != a.c.ID.String() {
+			t.Errorf("released campaigns = %v, want [%s]", got, a.c.ID)
+		}
+	})
+	t.Run("f own-account due hold under an audit outage", func(t *testing.T) {
+		h := newScope(t, &hotfixFailCategoryAudit{fail: categoryCampaignHoldReleased})
+		a := h.seedScopedHold(acctA, repo(h), "issue:906", true)
+		h.refused(t, h.orphanStage(acctA), http.StatusServiceUnavailable, "campaign_audit_unavailable")
+		if h.holdOf(a.c) == nil {
+			t.Errorf("own-account hold released under an unrecordable release")
+		}
+	})
+	t.Run("g foreign repository", func(t *testing.T) {
+		for name, account := range map[string]string{"same account": acctA, "untenanted": ""} {
+			t.Run(name, func(t *testing.T) {
+				h := newScope(t, nil)
+				other := h.seedScopedHold(account, "other-org/other-repo", "issue:907", false)
+				assertNamesNothingOf(t, admitBody(t, h, h.orphanStage(acctA)), other)
+				if h.holdOf(other.c) == nil {
+					t.Errorf("foreign-repository hold row gone")
+				}
+			})
+		}
+	})
+	t.Run("h mixed state", func(t *testing.T) {
+		t.Run("tenanted stage, untenanted active hold", func(t *testing.T) {
+			h := newScope(t, nil)
+			h.seedScopedHold("", repo(h), "issue:908", false)
+			heldUnresolved(t, h, h.orphanStage(acctA))
+		})
+		t.Run("untenanted stage, tenanted active hold", func(t *testing.T) {
+			h := newScope(t, nil)
+			a := h.seedScopedHold(acctA, repo(h), "issue:909", false)
+			assertNamesNothingOf(t, admitBody(t, h, h.orphanStage("")), a)
+		})
+		t.Run("untenanted stage, untenanted active hold", func(t *testing.T) {
+			h := newScope(t, nil)
+			h.seedScopedHold("", repo(h), "issue:910", false)
+			heldUnresolved(t, h, h.orphanStage(""))
+		})
+	})
+	t.Run("i hold list read error", func(t *testing.T) {
+		h := newScope(t, nil)
+		h.seedScopedHold(acctA, repo(h), "issue:911", false)
+		h.repo.listHoldsErr = errInjected
+		h.refused(t, h.orphanStage(acctA), http.StatusInternalServerError, "dependency_check_failed")
+	})
+	t.Run("j in-scope campaign read error", func(t *testing.T) {
+		h := newScope(t, nil)
+		h.seedScopedHold(acctA, repo(h), "issue:912", false)
+		h.repo.getErr = errInjected
+		h.refused(t, h.orphanStage(acctA), http.StatusInternalServerError, "dependency_check_failed")
+	})
+	t.Run("k invalid scope", func(t *testing.T) {
+		for name, mutate := range map[string]func(r *run.Run){
+			"empty repository":  func(r *run.Run) { r.Repo = "" },
+			"malformed account": func(r *run.Run) { r.AccountID = "not-a-uuid" },
+		} {
+			t.Run(name, func(t *testing.T) {
+				h := newScope(t, nil)
+				st := h.orphanStage(acctA)
+				h.rr.mu.Lock()
+				mutate(h.rr.runs[st.RunID])
+				h.rr.mu.Unlock()
+				h.refused(t, st, http.StatusInternalServerError, "dependency_check_failed")
+			})
+		}
+	})
+	t.Run("l resolved arm unaffected", func(t *testing.T) {
+		h := newHoldHarness(t, nil)
+		h.repo.mu.Lock()
+		h.repo.accounts[h.c.ID] = acctB
+		h.repo.mu.Unlock()
+		h.rr.mu.Lock()
+		h.runS.AccountID = acctA
+		h.rr.mu.Unlock()
+		d, _ := h.refused(t, h.impl(h.runS.ID), http.StatusConflict, "campaign_dispatch_held")
+		if d["campaign_id"] != h.c.ID.String() || d["hotfix_item_id"] != h.hot.ID.String() {
+			t.Errorf("details = %v, want the resolved refusal naming %s", d, h.c.ID)
+		}
+	})
+	t.Run("m untenanted due hold released for a tenanted stage", func(t *testing.T) {
+		h := newScope(t, nil)
+		n := h.seedScopedHold("", repo(h), "issue:913", true)
+		admitBody(t, h, h.orphanStage(acctA))
+		if h.holdOf(n.c) != nil {
+			t.Errorf("untenanted due hold survived")
+		}
+		if got := h.releasedCampaigns(t); len(got) != 1 || got[0] != n.c.ID.String() {
+			t.Errorf("released campaigns = %v, want [%s]", got, n.c.ID)
+		}
+	})
+	t.Run("n untenanted due hold under an audit outage", func(t *testing.T) {
+		h := newScope(t, &hotfixFailCategoryAudit{fail: categoryCampaignHoldReleased})
+		n := h.seedScopedHold("", repo(h), "issue:914", true)
+		h.refused(t, h.orphanStage(acctA), http.StatusServiceUnavailable, "campaign_audit_unavailable")
+		if h.holdOf(n.c) == nil {
+			t.Errorf("untenanted hold released under an unrecordable release")
+		}
+	})
+	t.Run("o foreign and untenanted due holds", func(t *testing.T) {
+		h := newScope(t, nil)
+		b := h.seedScopedHold(acctB, repo(h), "issue:915", true)
+		n := h.seedScopedHold("", repo(h), "issue:916", true)
+		assertNamesNothingOf(t, admitBody(t, h, h.orphanStage(acctA)), b)
+		if h.holdOf(n.c) != nil {
+			t.Errorf("untenanted due hold survived")
+		}
+		if h.holdOf(b.c) == nil {
+			t.Errorf("foreign-account due hold released by a foreign stage")
+		}
+		if got := h.releasedCampaigns(t); len(got) != 1 || got[0] != n.c.ID.String() {
+			t.Errorf("released campaigns = %v, want only [%s]", got, n.c.ID)
+		}
+	})
+	t.Run("p untenanted stage, tenanted due hold", func(t *testing.T) {
+		h := newScope(t, nil)
+		a := h.seedScopedHold(acctA, repo(h), "issue:917", true)
+		assertNamesNothingOf(t, admitBody(t, h, h.orphanStage("")), a)
+		if h.holdOf(a.c) == nil {
+			t.Errorf("tenanted due hold released by an untenanted stage")
+		}
+		if n := h.aud.count(categoryCampaignHoldReleased); n != 0 {
+			t.Errorf("campaign_hold_released rows = %d, want 0", n)
 		}
 	})
 }
@@ -785,4 +1090,138 @@ func TestCampaignHotfix_HoldThenPromoteThenRelease_PG(t *testing.T) {
 	f.admitted(b, hostBody("h1"))
 	f.to(b.ID, run.StageStateRunning, run.StageStateSucceeded)
 	f.admitted(sib, hostBody("h1"))
+}
+
+// scopePG is the #4586 cross-layer fixture: accounts A and B exist, and
+// orphan() mints an implement stage whose run is in a parent_run_id CYCLE (an
+// unresolvable ancestry; a missing parent is unreachable in Postgres, where
+// the foreign key's ON DELETE SET NULL clears it) stamped with an account.
+// Every campaign shares the stage's repository, so the account predicate
+// alone decides the scope. Stamps are UPDATEs: no create path takes one.
+type scopePG struct {
+	*holdPG
+	acctA, acctB uuid.UUID
+}
+
+func newScopePG(t *testing.T) *scopePG {
+	t.Helper()
+	f := &scopePG{holdPG: newHoldPG(t, pgStore), acctA: uuid.New(), acctB: uuid.New()}
+	for _, a := range []uuid.UUID{f.acctA, f.acctB} {
+		f.exec(`INSERT INTO accounts (id, account_key) VALUES ($1, $2)`, a, "hold-scope-"+a.String())
+	}
+	return f
+}
+
+func (f *scopePG) orphan(account *uuid.UUID) *run.Stage {
+	f.t.Helper()
+	st, other := f.impl(), f.impl()
+	f.exec(`UPDATE runs SET parent_run_id = $1 WHERE id = $2`, other.RunID, st.RunID)
+	f.exec(`UPDATE runs SET parent_run_id = $1 WHERE id = $2`, st.RunID, other.RunID)
+	f.exec(`UPDATE runs SET account_id = $1 WHERE id = $2`, account, st.RunID)
+	return st
+}
+
+// heldBy seeds a campaign stamped with account (nil = untenanted) whose
+// expedited item holds dispatches. due makes the hotfix's run terminal, so
+// the hold is due (hotfix_terminal) on the next evaluation.
+func (f *scopePG) heldBy(account *uuid.UUID, due bool) (*campaign.Campaign, *campaign.Item) {
+	f.t.Helper()
+	hot := f.impl()
+	c, it := f.campaignWith(nil, hot, "", true)
+	f.exec(`UPDATE campaigns SET account_id = $1 WHERE id = $2`, account, c.ID)
+	if due {
+		f.exec(`UPDATE runs SET state = 'succeeded' WHERE id = $1`, hot.RunID)
+	}
+	return c, it
+}
+
+// admit asserts a 200 marker whose stage re-reads dispatched and returns the
+// body.
+func (f *scopePG) admit(st *run.Stage) string {
+	f.t.Helper()
+	w := f.mark(st, hostBody("h1"))
+	if w.Code != http.StatusOK {
+		f.t.Fatalf("marker = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if got := f.state(st.ID); got != run.StageStateDispatched {
+		f.t.Fatalf("stage reads %s after admission, want dispatched", got)
+	}
+	return w.Body.String()
+}
+
+func (f *scopePG) heldUnresolved(st *run.Stage) {
+	f.t.Helper()
+	w := f.mark(st, hostBody("h1"))
+	code, d := promoteErrorCode(f.t, w)
+	if w.Code != http.StatusConflict || code != "campaign_dispatch_held" ||
+		d["reason"] != "campaign_ancestry_unresolved" || d["unresolved"] != campaignAncestryCycle {
+		f.t.Fatalf("marker = %d %s, want 409 campaign_dispatch_held campaign_ancestry_unresolved", w.Code, w.Body.String())
+	}
+	if got := f.state(st.ID); got != run.StageStateAwaitingHostDispatch {
+		f.t.Fatalf("held stage reads %s, want awaiting_host_dispatch (untouched)", got)
+	}
+}
+
+func namesNothingOf(t *testing.T, body string, c *campaign.Campaign, it *campaign.Item) {
+	t.Helper()
+	for _, s := range []string{c.ID.String(), it.ID.String(), it.IssueRef} {
+		if strings.Contains(body, s) {
+			t.Errorf("body names %q of an out-of-scope campaign: %s", s, body)
+		}
+	}
+}
+
+// TestCampaignDispatchHold_UnresolvedAncestryScope_PG drives #4586 through
+// the REAL marker over the Postgres run, audit, concurrency and campaign
+// repositories (one subtest and one fresh database per case): the scope is
+// decided by the real ListDispatchHolds SQL, and every committed effect (the
+// stage state, the hold row, the campaign_hold_released rows) is re-read.
+func TestCampaignDispatchHold_UnresolvedAncestryScope_PG(t *testing.T) {
+	t.Run("pg1 tenanted stage, only a foreign-account hold", func(t *testing.T) {
+		f := newScopePG(t)
+		c, it := f.heldBy(&f.acctB, false)
+		namesNothingOf(t, f.admit(f.orphan(&f.acctA)), c, it)
+	})
+	t.Run("pg2 tenanted stage, only an own-account hold", func(t *testing.T) {
+		f := newScopePG(t)
+		f.heldBy(&f.acctA, false)
+		f.heldUnresolved(f.orphan(&f.acctA))
+	})
+	t.Run("pg3 tenanted stage, only an untenanted hold", func(t *testing.T) {
+		f := newScopePG(t)
+		f.heldBy(nil, false)
+		f.heldUnresolved(f.orphan(&f.acctA))
+	})
+	t.Run("pg4 tenanted stage, only a due untenanted hold", func(t *testing.T) {
+		f := newScopePG(t)
+		c, it := f.heldBy(nil, true)
+		f.admit(f.orphan(&f.acctA))
+		if f.holdRow(c) != nil {
+			t.Fatalf("due untenanted hold survived")
+		}
+		rel := f.releasedRows()
+		if len(rel) != 1 || rel[0]["campaign_id"] != c.ID.String() || rel[0]["hotfix_item_id"] != it.ID.String() ||
+			rel[0]["trigger"] != holdReleaseTriggerHostDispatch {
+			t.Fatalf("campaign_hold_released rows = %v, want one naming %s with trigger host_dispatch", rel, c.ID)
+		}
+	})
+	t.Run("pg5 untenanted stage, only a tenanted hold", func(t *testing.T) {
+		f := newScopePG(t)
+		c, it := f.heldBy(&f.acctA, false)
+		namesNothingOf(t, f.admit(f.orphan(nil)), c, it)
+		if h := f.holdRow(c); h == nil || h.HotfixItemID != it.ID {
+			t.Fatalf("tenanted hold = %+v, want it intact", h)
+		}
+	})
+	t.Run("pg6 tenanted stage, only a due foreign-account hold", func(t *testing.T) {
+		f := newScopePG(t)
+		c, it := f.heldBy(&f.acctB, true)
+		namesNothingOf(t, f.admit(f.orphan(&f.acctA)), c, it)
+		if h := f.holdRow(c); h == nil || h.HotfixItemID != it.ID {
+			t.Fatalf("foreign-account due hold = %+v, want it intact", h)
+		}
+		if rel := f.releasedRows(); len(rel) != 0 {
+			t.Fatalf("campaign_hold_released rows = %v, want none", rel)
+		}
+	})
 }
