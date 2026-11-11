@@ -6316,21 +6316,29 @@ components:
           description: True when the tracker was read this poll.
         skipped_reason:
           type: string
-          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates]
+          enum: [in_flight, min_interval, foreign_account, repo_not_visible, no_candidates, insufficient_scope]
           description: |
             Why no read happened: another refresh of this campaign is in flight;
             one finished (successfully or on a tracker error) under 30 s ago;
             the caller's account does not own the campaign; the caller cannot
-            see the repo; or no item is unstarted.
+            see the repo; no item is unstarted; or the caller lacks
+            `write:campaigns` (`insufficient_scope`: a read-scoped token, any
+            run-bound `mcp:run` token even one holding the scope, or an
+            anonymous caller). An `insufficient_scope` poll makes no tracker
+            read and no write, serves the persisted DAG, and neither stamps the
+            30 s interval nor reads, carries or clears an unrecorded hold.
         committed:
           type: boolean
           description: |
             False when observed additions could NOT be persisted (audit row or
             write failure). The additions are then HELD in `items`/`rollup`/
             `next_action` and listed under `added`, and `warnings` names the
-            cause. Every later status read (one the 30 s interval skips, or one
-            whose tracker read fails) keeps that hold and warning until a
-            refresh records the additions; the hold is process-local.
+            cause. Every later status read by a caller the refresh admits (one
+            the 30 s interval skips, or one whose tracker read fails) keeps that
+            hold and warning until a refresh records the additions; the hold is
+            process-local. A caller the refresh does not admit (for example one
+            without `write:campaigns`) is served the persisted DAG and carries
+            no hold.
         added:
           type: array
           items:
@@ -18880,10 +18888,15 @@ paths:
               carries `campaign_id`, `hotfix_item_id`, `hotfix_issue_ref`,
               `expires_at`, `stage_id` and `item_id`. An ancestry that cannot be
               resolved (a missing parent, a cycle, or the depth bound) could
-              belong to any campaign, so while ANY campaign holds dispatches
-              (due holds are released first) it is held FAIL-CLOSED with
-              `details.reason: campaign_ancestry_unresolved` and
-              `details.unresolved`; with no hold anywhere it is admitted.
+              belong to any campaign the stage can see, so, on the stage's
+              repository, while a campaign in the stage's own account or a
+              legacy untenanted (NULL-account) campaign holds dispatches (due
+              holds in that scope are released first) it is held FAIL-CLOSED
+              with `details.reason: campaign_ancestry_unresolved` and
+              `details.unresolved`, and admitted when none does. A stage with
+              no account sees only untenanted campaigns' holds; a hold on a
+              campaign stamped with another account, or on another
+              repository, neither holds it nor is released by it (#4586).
               Expedited items and their decomposed
               children, non-implement stages, runs in no campaign and the
               idempotent already-`dispatched` arm are never held. A
@@ -23176,16 +23189,22 @@ paths:
         Dependency refresh (E86.47 / #4358): after the reconcile, the read
         re-reads tracker dependencies for unstarted items and ADDS newly
         observed edges (never removes one) — see `CampaignDependencyRefresh`.
-        It runs only for a caller whose account owns the campaign (or it is
-        untenanted) and who can see the repo, at most once per 30 s per
-        campaign (single-flight), and never fails the read: a tracker error or
-        an unrecordable change is reported in `dependency_refresh.warnings`,
-        and an observed blocker that could not be persisted still HOLDS its
-        item in this and every later status read until a refresh records it.
+        It runs only for a caller holding `write:campaigns` (a cookie session
+        passes, as on the write routes; a run-bound `mcp:run` token never does,
+        even one holding the scope; a caller without it gets
+        `dependency_refresh.skipped_reason: insufficient_scope` and the
+        persisted DAG, with no tracker read and no write), whose account owns
+        the campaign (or it is untenanted) and who can see the repo, at most
+        once per 30 s per campaign (single-flight), and never fails the read: a
+        tracker error or an unrecordable change is reported in
+        `dependency_refresh.warnings`, and an observed blocker that could not be
+        persisted still HOLDS its item in this and every later status read by a
+        caller the refresh admits until a refresh records it.
 
         Dispatch hold (E83.100 / #4234): an active hotfix hold is reported as
-        `dispatch_hold`. For a caller passing the same ownership + visibility
-        predicate, a DUE hold (hotfix item or its run terminal, or past
+        `dispatch_hold`. For a caller whose account owns the campaign (or it is
+        untenanted) and who can see the repo (that access predicate alone; the
+        refresh's `write:campaigns` gate does not apply), a DUE hold (hotfix item or its run terminal, or past
         `expires_at`) is released first and recorded as a system-actor
         `campaign_hold_released` row with `trigger: status_read`; any other
         caller never triggers a release. Expedited items carry `expedited`,

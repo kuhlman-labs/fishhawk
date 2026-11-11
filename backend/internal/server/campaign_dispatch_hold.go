@@ -33,7 +33,9 @@ import (
 const maxCampaignAncestorDepth = 8
 
 // Why the ancestor walk could not reach a root. Each is treated as HELD
-// while any campaign dispatch hold is active (anyCampaignHoldActive).
+// while a dispatch hold in the stage's scope is active (anyScopedHoldActive):
+// a campaign on the stage's repository in its own account, or a legacy
+// untenanted (NULL-account) one.
 const (
 	campaignAncestryMissingParent = "missing_parent"
 	campaignAncestryCycle         = "cycle"
@@ -69,8 +71,9 @@ func runParentID(r *run.Run) *uuid.UUID {
 // decomposed child of a campaign item's run resolves to that item. A run with
 // no link and no item is not a campaign run. A missing parent, a cycle or
 // more than maxCampaignAncestorDepth hops sets unresolved, which the guard
-// treats as HELD (fail closed) while any campaign hold is active. A read
-// error other than a missing parent is returned.
+// treats as HELD (fail closed) while a hold in the stage's scope is active
+// (anyScopedHoldActive). A read error other than a missing parent is
+// returned.
 func (s *Server) resolveCampaignAncestry(ctx context.Context, runRow *run.Run) (campaignAncestry, error) {
 	cur := runRow
 	seen := map[uuid.UUID]bool{cur.ID: true}
@@ -112,8 +115,9 @@ func (s *Server) resolveCampaignAncestry(ctx context.Context, runRow *run.Run) (
 // every other item it releases a due hold first (releaseCampaignHoldIfDue,
 // trigger host_dispatch), then refuses 409 campaign_dispatch_held while a
 // hold is still active. An unresolvable ancestry is HELD too, but only while
-// some campaign still holds dispatches (anyCampaignHoldActive): with no
-// active hold anywhere it is admitted.
+// a campaign in the stage's scope still holds dispatches (anyScopedHoldActive:
+// the stage's own account or a legacy NULL-account campaign, on the stage's
+// repository); with no active hold in that scope it is admitted.
 //
 // It returns the expedited item the stage resolves to (nil when none), which
 // admitGroupedStage uses for the auto-promote, or a refusal. Read errors
@@ -136,11 +140,15 @@ func (s *Server) guardCampaignDispatchHold(ctx context.Context, runRow *run.Run,
 		return nil, readFailed(err)
 	}
 	if anc.unresolved != "" {
-		// The stage could belong to ANY campaign, so it is held only while some
-		// campaign still holds dispatches: with no active hold anywhere there
-		// is nothing to enforce, and a deep or broken lineage outside every
-		// campaign is admitted.
-		active, refusal := s.anyCampaignHoldActive(ctx, readFailed)
+		// The stage could belong to any campaign it can see: one on its own
+		// repository in its own account, or a legacy untenanted one whose
+		// owner is unknown and so could be the stage's own. It is held only
+		// while such a campaign still holds dispatches. A hold on a campaign
+		// stamped with another account (or on another repository) is not the
+		// stage's, and holding or releasing across it is the cross-tenant
+		// availability coupling #4586 removes; with no hold in scope a deep or
+		// broken lineage is admitted.
+		active, refusal := s.anyScopedHoldActive(ctx, runRow, readFailed)
 		if refusal != nil {
 			return nil, refusal
 		}
@@ -150,7 +158,7 @@ func (s *Server) guardCampaignDispatchHold(ctx context.Context, runRow *run.Run,
 		return nil, &campaignSourceRefusal{
 			Status: http.StatusConflict,
 			Code:   "campaign_dispatch_held",
-			Message: fmt.Sprintf("the stage's campaign membership could not be resolved (%s) while a campaign dispatch hold is active, so its implement admission is held fail-closed until every hold releases",
+			Message: fmt.Sprintf("the stage's campaign membership could not be resolved (%s) while a campaign on the stage's repository, in the stage's account or untenanted, holds dispatches, so its implement admission is held fail-closed until every such hold releases",
 				anc.unresolved),
 			Details: map[string]any{"run_id": runRow.ID.String(), "stage_id": stage.ID.String(),
 				"reason": "campaign_ancestry_unresolved", "unresolved": anc.unresolved},
@@ -202,14 +210,19 @@ func (s *Server) guardCampaignDispatchHold(ctx context.Context, runRow *run.Run,
 	return expedited, nil
 }
 
-// anyCampaignHoldActive reports whether any campaign still holds dispatches,
-// releasing each due hold first (releaseCampaignHoldIfDue, trigger
-// host_dispatch) and stopping at the first one still active. It backs the
-// guard's unresolved-ancestry arm. Errors fail closed exactly like the
-// resolved arm's: a read error through readFailed, an unrecordable release
-// through holdReleaseRefusal.
-func (s *Server) anyCampaignHoldActive(ctx context.Context, readFailed func(error) *campaignSourceRefusal) (bool, *campaignSourceRefusal) {
-	holds, err := s.cfg.CampaignRepo.ListDispatchHolds(ctx)
+// anyScopedHoldActive reports whether a campaign in runRow's scope still
+// holds dispatches: one on runRow's repository stamped with runRow's account,
+// or a legacy untenanted (NULL-account) one there (the #1829 migration
+// window; a run with no account sees only the untenanted ones, never every
+// account). It releases each listed due hold first (releaseCampaignHoldIfDue,
+// trigger host_dispatch) and stops at the first one still active, so a
+// release only ever touches an in-scope hold: a known foreign-account hold is
+// neither held against the stage, nor released by it, nor able to answer it
+// 503. It backs the guard's unresolved-ancestry arm. Errors fail closed
+// exactly like the resolved arm's: a read error (an invalid scope included)
+// through readFailed, an unrecordable release through holdReleaseRefusal.
+func (s *Server) anyScopedHoldActive(ctx context.Context, runRow *run.Run, readFailed func(error) *campaignSourceRefusal) (bool, *campaignSourceRefusal) {
+	holds, err := s.cfg.CampaignRepo.ListDispatchHolds(ctx, campaign.DispatchHoldScope{AccountID: runRow.AccountID, Repo: runRow.Repo})
 	if err != nil {
 		return false, readFailed(fmt.Errorf("list dispatch holds: %w", err))
 	}

@@ -1,0 +1,14 @@
+id: scenario:issue-4571/run-bound-token-skips-refresh
+statement: GET /v0/campaigns/{campaign_id}/status with a run-bound mcp:run token returns 200 with dependency_refresh.skipped_reason = insufficient_scope and dependency_refresh.performed = false.
+verify_hint: 'HTTP: GET /v0/campaigns/{campaign_id}/status with a token from POST /v0/runs/{run_id}/mcp-token and read dependency_refresh from the body. Decided in-suite by TestStatus_RefreshScopeGate_ThroughRealMux (run-bound row) in backend/internal/server/campaign_dependency_refresh_test.go when the preview cannot seed one.'
+steps: 'Posture B in the sanctioned checkout: cd backend && go test ./internal/server/ -count=1 -v -run ''TestStatus_|Refresh''. TestStatus_RefreshScopeGate_ThroughRealMux/run_bound_bearer_with_write_campaigns issues an fhm_ run-bound MCP token for a running run, with scopes mcp:read and write:campaigns. It then sends GET /v0/campaigns/{id}/status through the real mux with that bearer. TestStatus_RefreshRequiresWriteCampaignsScope covers run_bound_no_scope and run_bound_with_write_campaigns. The live preview has no campaign, so this could not run against the target.'
+assertions:
+    expected: 200, skipped_reason=insufficient_scope, performed=false
+    observed_at_record: PASS. The row asserts 200 and skipped_reason=insufficient_scope with zero resolver, append and refresh-audit counts; performed=false on the denied path. A run-bound token is denied even when it carries write:campaigns.
+    repro_handle: cd backend && go test ./internal/server/ -count=1 -v -run 'TestStatus_RefreshScopeGate_ThroughRealMux|TestStatus_RefreshRequiresWriteCampaignsScope'
+origin:
+    issue: 4571
+    pr: 5153
+    run_id: 2dd8bcf1-f514-4276-9deb-2d339fc756d4
+    head_sha: 27c32e505fb5fc1a6e2e3f51105ac12ee49ee281
+    recorded_at: 2026-11-11T03:53:14Z

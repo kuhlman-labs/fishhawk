@@ -124,7 +124,7 @@ type GetCampaignStatusOutput struct {
 	ScopeOverlap *campaignScopeOverlap `json:"scope_overlap,omitempty" jsonschema:"present when at least one campaign item is in flight (running or paused with a run): per in-flight item, the OTHER in-flight items' runs (or their decomposition slices) whose effective scope shares exact paths with it — merge one while the other is mid-implement and the other can strand. Advisory only. truncated marks items beyond the read cap; read_failures names items whose overlap read failed (a token without read:audit fails every read)"`
 	// DependencyRefresh passes the backend's monotone dependency refresh block
 	// through (E86.47 / #4358).
-	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty" jsonschema:"the monotone dependency refresh this poll ran: tracker blocked-by links and Depends-on lines re-read for unstarted items; edges are only ever ADDED (held), never removed. skipped_reason is in_flight/min_interval (30 s per campaign)/foreign_account/repo_not_visible/no_candidates; warnings name an unrecorded or unreadable refresh. Absent when the deployment disables it"`
+	DependencyRefresh *campaignDependencyRefresh `json:"dependency_refresh,omitempty" jsonschema:"the monotone dependency refresh this poll ran: tracker blocked-by links and Depends-on lines re-read for unstarted items; edges are only ever ADDED (held), never removed. skipped_reason is in_flight/min_interval (30 s per campaign)/foreign_account/repo_not_visible/no_candidates/insufficient_scope (the caller lacks write:campaigns, is run-bound or anonymous: the persisted DAG is served, no tracker read); warnings name an unrecorded or unreadable refresh. Absent when the deployment disables it"`
 	// DispatchHold passes the backend's active hotfix dispatch hold through
 	// (E83.100 / #4234).
 	DispatchHold *campaignDispatchHold `json:"dispatch_hold,omitempty" jsonschema:"present while a fishhawk_campaign_hotfix hold_dispatch hold is active: new implement dispatches of the campaign's other (non-expedited) items are refused campaign_dispatch_held until the hotfix item or its run is terminal or expires_at passes. Absent when not held"`
@@ -1073,7 +1073,7 @@ nothing). A cycle is refused only when it passes through a NEW item; a NEW
 item's dependency on a non-member refuses campaign_external_dependency unless
 allow_external_blockers admits it (the item is then held blocked). Existing
 members are not re-checked here: their tracker drift is observed and HELD by the
-dependency refresh on the next fishhawk_get_campaign_status poll or item start.
+dependency refresh on the next fishhawk_get_campaign_status poll by a write:campaigns caller, or item start.
 A write tool: needs an operator token with write:campaigns scope.
 `),
 	}, resolver.appendCampaignItems)

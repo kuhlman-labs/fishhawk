@@ -1,0 +1,14 @@
+id: scenario:issue-4571/write-campaigns-bearer-still-refreshes
+statement: GET /v0/campaigns/{campaign_id}/status with a bearer holding write:campaigns, for a campaign with an unstarted item and outside the 30 s interval, returns 200 with dependency_refresh.performed = true and no insufficient_scope skip reason.
+verify_hint: 'HTTP: GET /v0/campaigns/{campaign_id}/status with a write:campaigns bearer; performed is true even when the preview''s tracker read fails. Decided in-suite by TestStatus_RefreshScopeGate_ThroughRealMux (write:campaigns row) in backend/internal/server/campaign_dependency_refresh_test.go when the preview cannot seed a campaign.'
+steps: 'Posture B in the sanctioned checkout: cd backend && go test ./internal/server/ -count=1 -v -run ''TestStatus_|Refresh''. TestStatus_RefreshScopeGate_ThroughRealMux/write_campaigns_bearer sends GET /v0/campaigns/{id}/status with a write:campaigns API bearer. The campaign has two pending items, the resolver reports a new dependency, and the refresh harness is fresh, so no 30 s interval applies. The live preview has no campaign.'
+assertions:
+    expected: 200, performed=true, no insufficient_scope
+    observed_at_record: PASS. The row asserts 200 and dependency_refresh.performed=true, committed=true and an empty skipped_reason, with 1 resolver call and 1 campaign_dependencies_refreshed row. TestStatus_RefreshRequiresWriteCampaignsScope/write_campaigns_token and cookie_session also PASS.
+    repro_handle: cd backend && go test ./internal/server/ -count=1 -v -run TestStatus_RefreshScopeGate_ThroughRealMux/write_campaigns_bearer
+origin:
+    issue: 4571
+    pr: 5153
+    run_id: 2dd8bcf1-f514-4276-9deb-2d339fc756d4
+    head_sha: 27c32e505fb5fc1a6e2e3f51105ac12ee49ee281
+    recorded_at: 2026-11-11T03:53:14Z
