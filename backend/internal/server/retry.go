@@ -315,7 +315,11 @@ func (s *Server) retryAcceptanceOutcomeUnknown(w http.ResponseWriter, r *http.Re
 	}
 	recordedHead, hasVerdict := latestAcceptanceVerdictHead(entries, stage.ID)
 	if hasVerdict {
-		currentHead, currentOK, headErr := s.latestRunHeadSHA(ctx, stage.RunID)
+		// The current head is the acceptance head (#4874), unbounded, so a
+		// verdict recorded before a clean rebase reads stale against the merge
+		// commit and a verdict at the merge commit reads current.
+		currentHead, headErr := s.acceptanceHeadAsOf(ctx, stage.RunID, 0, false)
+		currentOK := currentHead != ""
 		if headErr != nil {
 			s.writeError(w, r, http.StatusInternalServerError, "internal_error",
 				"resolve current head for acceptance retry failed",

@@ -33,8 +33,11 @@ import (
 // membership category: it is deliberately absent from
 // auditcomplete.HeadReportCategoriesByPrecedence (see that slice's doc
 // comment for why no fixed precedence position is correct).
-var lineageLedgerCategories = []string{"pull_request_opened", "child_pushed", "fixup_pushed", "acceptance_scenarios_pushed",
-	auditcomplete.CategoryConflictResolutionPushed}
+//
+// The list itself lives in auditcomplete.ReportedHeadLedgerCategories (#4874)
+// so the MCP acceptance preview mirror shares it; this alias keeps membership
+// and order unchanged.
+var lineageLedgerCategories = auditcomplete.ReportedHeadLedgerCategories
 
 // lineageVouchLedgerCategory is the audit category carrying an operator's
 // vouched-commit declaration (#1044). Unlike the own-chain head categories
@@ -790,15 +793,16 @@ func (s *Server) emitForeignCommitInvariant(ctx context.Context, runID uuid.UUID
 		slog.String("offending_sha", offendingSHA))
 }
 
-// latestRunHeadSHA resolves the run's newest recorded head SHA (#1682): the
-// canonical "current head" the acceptance verdict binds to (acceptance.go),
-// the head Option C's retry compares against (retry.go), and the head the
-// audit-check publisher targets — all resolved through the ONE shared ordering
-// in auditcomplete.LatestReportedHeadSHA (fixup_pushed > child_pushed >
-// pull_request_opened, each by highest audit sequence). Sharing that resolver
-// with auditcheckpublisher.findHeadSHA is the load-bearing guarantee that the
-// acceptance/retry path and audit_complete publishing never resolve divergent
-// heads for the same audit history.
+// latestRunHeadSHA resolves the run's newest recorded head SHA (#1682) through
+// the shared category precedence in auditcomplete.LatestReportedHeadSHA
+// (acceptance_scenarios_pushed > fixup_pushed > child_pushed >
+// pull_request_opened, each by highest audit sequence), the same ordering
+// auditcheckpublisher.findHeadSHA targets. Its remaining callers are the
+// pull-request reopen and in-flight upkeep paths. Acceptance's verdict binding
+// and Option C's retry no longer read it: since #4874 they read
+// acceptanceHeadAsOf, which walks clean recorded base merges, so after a clean
+// rebase the publisher can target the pre-rebase ledger head while acceptance
+// names the merge commit.
 //
 // Returns ("", false, nil) when the run has recorded no head yet. A read error
 // on any head-report category is returned so the caller can fail closed (the
