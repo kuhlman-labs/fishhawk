@@ -209,7 +209,8 @@ func TestShipAcceptance_RecordsValidatedHeadSHA(t *testing.T) {
 }
 
 // TestShipAcceptance_HeadSHA_FixupBeforeDispatch binds to a fix-up head that
-// landed BEFORE dispatch (precedence: fixup_pushed > pull_request_opened).
+// landed BEFORE dispatch: the newest row by chain sequence at or before the
+// dispatch anchor wins (#4874), here the fix-up above the PR-open head.
 func TestShipAcceptance_HeadSHA_FixupBeforeDispatch(t *testing.T) {
 	runID, stageID := uuid.New(), uuid.New()
 	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
@@ -223,6 +224,30 @@ func TestShipAcceptance_HeadSHA_FixupBeforeDispatch(t *testing.T) {
 	}
 	if got := decodeAcceptanceOutcome(t, au)["head_sha"]; got != "fixhead" {
 		t.Errorf("head_sha = %v, want fixup head %q (a pre-dispatch fixup is what was validated)", got, "fixhead")
+	}
+}
+
+// TestShipAcceptance_HeadSHA_FixupAfterScenarioCommit is the #4673 shape
+// through the real signed ship handler: PR-open head, then a PRIOR acceptance
+// episode's corpus commit (a stage-scoped acceptance_scenarios_pushed row),
+// then a fix-up, then the second dispatch anchor. The persisted verdict binds
+// the fix-up head the second episode validated; the corpus commit ranks above
+// fixup_pushed under the old category precedence and must not decide it.
+func TestShipAcceptance_HeadSHA_FixupAfterScenarioCommit(t *testing.T) {
+	runID, stageID := uuid.New(), uuid.New()
+	s, sf, _, au, _ := newAcceptanceServer(t, runID, stageID)
+	seedHeadEntry(au, runID, nil, "pull_request_opened", 2, map[string]any{"head_sha": "prhead"})
+	seedHeadEntry(au, runID, &stageID, "acceptance_scenarios_pushed", 5, map[string]any{"head_sha": "scenariohead"})
+	seedHeadEntry(au, runID, nil, "fixup_pushed", 7, map[string]any{"head_sha": "fixhead"})
+	seedHeadEntry(au, runID, &stageID, CategoryAcceptanceDispatched, 10, map[string]any{"stage_id": stageID.String()})
+
+	priv, _ := sf.issue(t, runID)
+	if w := shipAcceptanceRequest(t, s, runID, stageID, priv, validAcceptanceBytes(t), ""); w.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201:\n%s", w.Code, w.Body.String())
+	}
+	got := decodeAcceptanceOutcome(t, au)["head_sha"]
+	if got != "fixhead" {
+		t.Errorf("head_sha = %v, want the fix-up head %q the second episode validated, never the prior episode's corpus commit %q", got, "fixhead", "scenariohead")
 	}
 }
 
