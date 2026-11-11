@@ -510,6 +510,48 @@ func TestDropRawDB_BudgetExpiryReturnsLastError(t *testing.T) {
 	}
 }
 
+// TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError: the budget ends BETWEEN
+// attempts, with the loop waiting on its (hour-long) delay timer, and the
+// returned error is still the last REAL attempt error (a transient 53300), not
+// the context error a further attempt on the expired ctx would produce. The
+// attempt honours its ctx like pgx.Connect does. Attempt 1 schedules the cancel
+// from a goroutine, so the loop reaches the wait either side of it, and the
+// delay timer can never fire first: the outcome is the same under any
+// scheduling, with no wall-clock assertion. A mutated loop that retries on the
+// expired ctx gets only context errors back and ends at runawayGuard with nil.
+func TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError(t *testing.T) {
+	lastReal := &pgconn.PgError{Code: "53300", Message: "sorry, too many clients already"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := testDropPolicy()
+	p.delay = time.Hour
+	calls := 0
+	err := dropRawDB(ctx, p, func(actx context.Context) error {
+		calls++
+		switch {
+		case calls == 1:
+			go cancel() // the budget runs out while the loop is between attempts
+			return fmt.Errorf("connect: %w", lastReal)
+		case calls >= runawayGuard:
+			return nil // a mutated loop that ignores the budget ends here, as a RED
+		}
+		if cerr := actx.Err(); cerr != nil {
+			return fmt.Errorf("connect: %w", cerr)
+		}
+		return nil
+	})
+	if !errors.Is(err, lastReal) {
+		t.Fatalf("err=%v, want it to wrap the last REAL attempt error (53300), not a context error", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls=%d, want exactly 1 (no attempt starts on an expired budget)", calls)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "1 attempt(s)") || !strings.Contains(msg, "budget exhausted") || strings.Contains(msg, "non-retryable") {
+		t.Errorf("err=%q, want the attempt count and the budget-exhausted wording", msg)
+	}
+}
+
 // TestDropRawDB_ConnectFailureCap (approval condition 4): a persistently
 // unreachable server stops at the connect-failure cap, long before the budget
 // (here the overall context never ends on its own), and says so.

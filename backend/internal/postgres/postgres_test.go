@@ -206,7 +206,8 @@ func isRetryableRawDropErr(err error) bool {
 // returns nil on success; otherwise the final error wrapped with the attempt
 // count and a reason that names which of the three exits fired: a non-retryable
 // error, an exhausted budget, or the connect-failure cap. The wrap uses %w so
-// errors.Is/As still reach the cause. Retries are idempotent: the statement is
+// errors.Is/As still reach the cause; on the budget exit that is the last REAL
+// attempt error, never a context error from an attempt started after expiry. Retries are idempotent: the statement is
 // DROP DATABASE IF EXISTS, so an attempt whose reply was lost after the drop
 // committed is followed by a no-op success.
 func dropRawDB(ctx context.Context, p rawDropPolicy, attempt func(context.Context) error) error {
@@ -222,9 +223,6 @@ func dropRawDB(ctx context.Context, p rawDropPolicy, attempt func(context.Contex
 		if !isRetryableRawDropErr(err) {
 			return fmt.Errorf("drop gave up after %d attempt(s): non-retryable error: %w", attempts, err)
 		}
-		if ctx.Err() != nil {
-			return fmt.Errorf("drop gave up after %d attempt(s): budget exhausted (%v): %w", attempts, ctx.Err(), err)
-		}
 		if !isTransientPGRefusal(err) {
 			connectFailures++
 			if connectFailures >= p.maxConnectFailures {
@@ -237,6 +235,14 @@ func dropRawDB(ctx context.Context, p rawDropPolicy, attempt func(context.Contex
 		case <-ctx.Done():
 			t.Stop()
 		case <-t.C:
+		}
+		// The ONE budget check, after the wait so it covers a budget that ended
+		// during the attempt and one that ended during the wait alike: without it
+		// the loop would run one more attempt on the expired ctx, whose connect
+		// error (a context error) would replace err — the real cause, e.g. 53300 —
+		// in the returned message.
+		if ctx.Err() != nil {
+			return fmt.Errorf("drop gave up after %d attempt(s): budget exhausted (%v): %w", attempts, ctx.Err(), err)
 		}
 	}
 }
@@ -276,7 +282,11 @@ func rawDropErr(name string) string {
 //     -> TestDropRawDB_StopsOnNonTransientPgError, TestRawDropCleanup_LogsAndRecordsFailure
 //   - dropRawDB's budget exit returns nil     -> TestDropRawDB_BudgetExpiryReturnsLastError
 //   - dropRawDB's connect-failure-cap exit returns nil -> TestDropRawDB_ConnectFailureCap
-//   - budget (ctx.Err()) check removed        -> TestDropRawDB_BudgetExpiryReturnsLastError
+//   - budget (ctx.Err()) check removed        -> TestDropRawDB_BudgetExpiryReturnsLastError,
+//     TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError
+//     (the check has ONE site, after the wait; a check only before the wait, the
+//     earlier shape, let the wait's ctx.Done() fall through to an attempt on the
+//     dead ctx -> TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError)
 //   - connect-failure cap check removed       -> TestDropRawDB_ConnectFailureCap
 //   - per-attempt context.WithTimeout replaced by a plain cancel context
 //     -> TestDropRawDB_AttemptTimeoutIsRetried
