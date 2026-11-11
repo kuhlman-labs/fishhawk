@@ -46,10 +46,13 @@ const fixupSupersededByVerifyRerun = "merge_candidate_verify_rerun"
 // carries when no concurrency slot store is wired.
 const categoryInstallationTokenIssued = "installation_token_issued"
 
-// stageAdmissionTryWait bounds beginSupersededFixupPass's acquisition of a
-// stage admission fence its context does not already hold (approval condition
-// C1): the pump that reaches it may run on a goroutine holding ANOTHER stage's
-// fence, so it never blocks unboundedly.
+// stageAdmissionTryWait bounds every acquisition of a stage admission fence a
+// context does not already hold on a path that must not block unboundedly:
+// beginSupersededFixupPass (approval condition C1), begin's PENDING
+// REPLACEMENT arm and the stale-pass settle on a held / not_queued queue
+// answer (#4811, merge_candidate_supersede.go). The pump that reaches them may
+// run on a goroutine holding ANOTHER stage's fence. A miss is a Transient
+// refusal (begin's arms) or a skipped settle (the queue answer).
 const stageAdmissionTryWait = 2 * time.Second
 
 // stageFixupSupersededPayload is the stage_fixup_superseded row.
@@ -132,7 +135,12 @@ func withStageAdmissionHeld(ctx context.Context, stageID uuid.UUID) context.Cont
 // begin's arm for a different stage T. That arm therefore never blocks
 // unboundedly: it takes T's fence through tryHoldStageAdmission, bounded by
 // stageAdmissionTryWait, and answers a transient refusal (the admission
-// returns the entry to held) when it is not acquired. A future path that
+// returns the entry to held) when it is not acquired. The same holds for
+// begin's PENDING REPLACEMENT arm (#4811): it now takes the implement stage's
+// fence the same bounded way, so a replacement never lands inside a
+// stale-pass settle's record, and a miss is a Transient refusal. The settle's
+// own producer arm (supersedeStalePassOnQueueAnswer) takes it bounded too and
+// releases it before Orchestrator.Advance. A future path that
 // re-enters the arm for the SAME stage on a context NOT derived from the
 // holder's while the holder waits on it synchronously would still deadlock
 // past that bound's refusal; no such path exists.
