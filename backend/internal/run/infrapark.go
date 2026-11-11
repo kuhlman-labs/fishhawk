@@ -66,9 +66,10 @@ var infraParkReopenedPassCategories = []string{
 // (#4426 approval condition C1): an implement PR open, a fix-up push and a
 // decomposition-child push. A row of one of them scoped to the failed
 // implement stage proves the stage already produced a head, so its failure is
-// a re-opened pass even when the pass's trigger row was never persisted (a
-// failed stage_fixup_triggered append is only logged after the stage was
-// re-opened, #4815).
+// a re-opened pass even when no trigger row for the pass is on the chain. Since
+// #4815 a failed stage_fixup_triggered append refuses the fix-up before the
+// re-open, so the fix-up path no longer produces that shape; the carve-out
+// stays for chains written before that change and is independent of it.
 var infraParkStagePushCategories = []string{
 	"pull_request_opened",
 	"fixup_pushed",

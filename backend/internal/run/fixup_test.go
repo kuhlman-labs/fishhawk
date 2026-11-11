@@ -1266,3 +1266,102 @@ func TestFixupStage_AcceptanceModeWrongTypeRefusesBeforeRepark(t *testing.T) {
 		t.Errorf("TransitionStage calls = %d, want 0 on a refused call", repo.transitions)
 	}
 }
+
+// TestPreviewFixupStage_MatchesFixupStageAndMovesNothing (#4815): a preview
+// moves no stage, and its receipt fields and stage ids equal the following
+// FixupStage's; a refusal carries the same sentinel and byte-identical message.
+func TestPreviewFixupStage_MatchesFixupStageAndMovesNothing(t *testing.T) {
+	type fixture struct {
+		repo *fixupRepo
+		impl *run.Stage
+		opts run.FixupOptions
+	}
+	withAcceptance := func(t *testing.T) fixture {
+		repo, impl, _, acc := implementReviewAcceptance(t, run.StageStateSucceeded, run.StageStateSucceeded, run.StageStateSucceeded)
+		return fixture{repo, impl, run.FixupOptions{MaxPasses: 1, HardCeiling: 3, AcceptanceStageID: &acc.ID}}
+	}
+	admit := map[string]func(t *testing.T) fixture{
+		"commit-yourself": func(t *testing.T) fixture {
+			repo, impl := implementStage(t, run.StageStateAwaitingApproval)
+			return fixture{repo, impl, run.FixupOptions{MaxPasses: 1, HardCeiling: 3}}
+		},
+		"push_and_open_pr": func(t *testing.T) fixture {
+			repo, impl, _ := implementWithReview(t, run.StageStateSucceeded, run.StageStateAwaitingApproval)
+			return fixture{repo, impl, run.FixupOptions{MaxPasses: 1, HardCeiling: 3}}
+		},
+		"acceptance mode": withAcceptance,
+		"forced": func(t *testing.T) fixture {
+			repo, impl := implementStage(t, run.StageStateAwaitingApproval)
+			return fixture{repo, impl, run.FixupOptions{PriorPassCount: 1, MaxPasses: 1, ForceAdditionalPass: true, HardCeiling: 3}}
+		},
+		"ceiling credit": func(t *testing.T) fixture {
+			repo, impl := implementStage(t, run.StageStateAwaitingApproval)
+			return fixture{repo, impl, run.FixupOptions{PriorPassCount: 3, MaxPasses: 4, HardCeiling: 3, CeilingRefundedPasses: 2}}
+		},
+	}
+	idOf := func(s *run.Stage) uuid.UUID {
+		if s == nil {
+			return uuid.Nil
+		}
+		return s.ID
+	}
+	for name, build := range admit {
+		t.Run(name, func(t *testing.T) {
+			f := build(t)
+			before := f.repo.stageStates()
+			preview, err := run.PreviewFixupStage(context.Background(), f.repo, f.impl.ID, f.opts)
+			if err != nil {
+				t.Fatalf("PreviewFixupStage: %v", err)
+			}
+			if f.repo.transitions != 0 {
+				t.Errorf("preview made %d transitions, want 0", f.repo.transitions)
+			}
+			after := f.repo.stageStates()
+			for id, st := range before {
+				if after[id] != st {
+					t.Errorf("preview moved stage %s %q -> %q", id, st, after[id])
+				}
+			}
+			dec, err := run.FixupStage(context.Background(), f.repo, f.impl.ID, f.opts)
+			if err != nil {
+				t.Fatalf("FixupStage: %v", err)
+			}
+			if preview.PriorState != dec.PriorState || preview.RemainingBudget != dec.RemainingBudget ||
+				preview.RemainingCeilingSlots != dec.RemainingCeilingSlots || preview.Forced != dec.Forced {
+				t.Errorf("preview receipt %+v != FixupStage receipt %+v", preview, dec)
+			}
+			if idOf(preview.Stage) != idOf(dec.Stage) || idOf(preview.ReparkedReview) != idOf(dec.ReparkedReview) ||
+				idOf(preview.ReopenedAcceptance) != idOf(dec.ReopenedAcceptance) {
+				t.Errorf("preview ids (%s,%s,%s) != FixupStage ids (%s,%s,%s)",
+					idOf(preview.Stage), idOf(preview.ReparkedReview), idOf(preview.ReopenedAcceptance),
+					idOf(dec.Stage), idOf(dec.ReparkedReview), idOf(dec.ReopenedAcceptance))
+			}
+		})
+	}
+
+	refuse := map[string]struct {
+		state    run.StageState
+		opts     run.FixupOptions
+		sentinel error
+	}{
+		"not applicable": {run.StageStateRunning, run.FixupOptions{MaxPasses: 1, HardCeiling: 3}, run.ErrFixupNotApplicable},
+		"budget":         {run.StageStateAwaitingApproval, run.FixupOptions{PriorPassCount: 1, MaxPasses: 1, HardCeiling: 3}, run.ErrFixupBudgetExhausted},
+		"ceiling":        {run.StageStateAwaitingApproval, run.FixupOptions{PriorPassCount: 3, MaxPasses: 1, ForceAdditionalPass: true, HardCeiling: 3}, run.ErrFixupCeilingReached},
+	}
+	for name, c := range refuse {
+		t.Run("refuse "+name, func(t *testing.T) {
+			repo, impl := implementStage(t, c.state)
+			_, perr := run.PreviewFixupStage(context.Background(), repo, impl.ID, c.opts)
+			_, ferr := run.FixupStage(context.Background(), repo, impl.ID, c.opts)
+			if !errors.Is(perr, c.sentinel) || !errors.Is(ferr, c.sentinel) {
+				t.Fatalf("preview err %v / FixupStage err %v, want both %v", perr, ferr, c.sentinel)
+			}
+			if perr.Error() != ferr.Error() {
+				t.Errorf("messages differ:\npreview: %s\nfixup:   %s", perr, ferr)
+			}
+			if repo.transitions != 0 {
+				t.Errorf("transitions = %d, want 0", repo.transitions)
+			}
+		})
+	}
+}

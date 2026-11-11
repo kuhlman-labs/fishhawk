@@ -773,6 +773,29 @@ func TestAutoDriveRunGate_RouteFixupGenuineErrorPropagates(t *testing.T) {
 	}
 }
 
+// TestAutoDriveRunGate_RouteFixupTriggerAppendFailurePropagates (#4815): the
+// delegated route_fixup arm's trigger append failing returns the raw refusal
+// (not acted, no decision_required) and leaves the implement stage unmoved.
+func TestAutoDriveRunGate_RouteFixupTriggerAppendFailurePropagates(t *testing.T) {
+	s, repo, au, cr := newAutoDriveServer(t)
+	runID, impl := seedRouteFixupReady(t, s, repo, au, cr)
+	au.appendErrCategory = CategoryStageFixupTriggered
+
+	out, err := s.AutoDriveRunGate(context.Background(), getRun(t, repo, runID), campaignOperatorIdentity(), nil, nil)
+	if err == nil || !errors.Is(err, errFixupTriggerNotRecorded) {
+		t.Fatalf("err = %v, want the unrecorded-trigger refusal to propagate; outcome = %+v", err, out)
+	}
+	if out.Acted || out.DecisionRequired {
+		t.Errorf("outcome = %+v, want neither acted nor decision_required", out)
+	}
+	if impl.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement state = %q, want unmoved awaiting_approval", impl.State)
+	}
+	if n := len(auditEntries(au, CategoryStageFixupTriggered)); n != 0 {
+		t.Errorf("appended triggers = %d, want 0", n)
+	}
+}
+
 // --- (c) may_retry(infra_flake) -> auto-retry -------------------------------
 
 func TestAutoDriveRunGate_Retry(t *testing.T) {

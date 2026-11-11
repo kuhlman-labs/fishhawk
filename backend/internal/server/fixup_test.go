@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -4212,11 +4213,12 @@ func TestFixupStageAs_DoesNotMutateCallerConcernIDs(t *testing.T) {
 }
 
 // TestFixupStage_OperatorConcern_RefusedMintsNoOrphan pins the no-orphan
-// ordering (#2623): mintOperatorConcern runs INSIDE fixupStageAs only AFTER
-// run.FixupStage's transition has committed, so a budget/ceiling/not-applicable
-// refusal — which returns from FixupStage with an error BEFORE the mint — leaves
-// the concern store untouched. There is no delete verb to unwind a minted row, so
-// a future refactor that hoisted the mint ABOVE the transition guard would have
+// ordering (#2623, #4815): mintOperatorConcern runs only AFTER the
+// run.PreviewFixupStage pre-flight admits the pass, so a budget/ceiling/
+// not-applicable refusal — which the pre-flight returns BEFORE the mint and the
+// trigger append — leaves the concern store and the chain untouched. There is no
+// delete verb to unwind a minted row, so a future refactor that hoisted the mint
+// ABOVE the pre-flight (or skipped the pre-flight) would have
 // every refused operator-concern fix-up wedge the open-concern gate with an
 // unremovable row. The budget is exhausted here by SEEDING a prior
 // stage_fixup_triggered entry (priorPasses=1, MaxPasses=1) rather than running a
@@ -5648,5 +5650,745 @@ func TestFixupStage_RouteFitAssumesIDPlaceholder(t *testing.T) {
 		if r.State != concern.StateRaised {
 			t.Errorf("row %d state = %q, want raised", i, r.State)
 		}
+	}
+}
+
+// --- append-then-reopen (#4815) ----------------------------------------------
+
+// fixupTriggerHookAudit wraps auditFake and runs hook (under no lock) just
+// before a stage_fixup_triggered append is recorded, so a test can observe or
+// perturb committed state at the exact moment the trigger lands.
+type fixupTriggerHookAudit struct {
+	*auditFake
+	hook func(ctx context.Context)
+	// failOnCancelled makes every append on a cancelled context fail with
+	// ctx.Err(), the way a real store's query would.
+	failOnCancelled bool
+}
+
+func (a *fixupTriggerHookAudit) AppendChained(ctx context.Context, p audit.ChainAppendParams) (*audit.Entry, error) {
+	if a.failOnCancelled && ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if p.Category == CategoryStageFixupTriggered && a.hook != nil {
+		a.hook(ctx)
+	}
+	return a.auditFake.AppendChained(ctx, p)
+}
+
+// implementOnlyTransitionFailRepo fails TransitionStage ONLY for failID, so a
+// push_and_open_pr fix-up's review re-park commits and the LATER implement
+// re-open fails (#4815 C2). onFail runs on that failure. getStageFailAfter,
+// when set, makes every GetStage after the failure fail too (the settle's
+// state re-read, #4815 C1 fallback); getStageNilAfter instead makes it return
+// (nil, nil), a row-less read the Repository contract does not promise away.
+type implementOnlyTransitionFailRepo struct {
+	*approvalRunRepo
+	failID            uuid.UUID
+	onFail            func()
+	getStageFailAfter bool
+	getStageNilAfter  bool
+	failed            bool
+}
+
+func (r *implementOnlyTransitionFailRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	if id == r.failID {
+		r.failed = true
+		if r.onFail != nil {
+			r.onFail()
+		}
+		return nil, errors.New("implement re-open store down")
+	}
+	return r.approvalRunRepo.TransitionStage(ctx, id, to, c)
+}
+
+func (r *implementOnlyTransitionFailRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
+	if r.getStageFailAfter && r.failed {
+		return nil, errors.New("settle re-read store down")
+	}
+	if r.getStageNilAfter && r.failed {
+		return nil, nil
+	}
+	return r.approvalRunRepo.GetStage(ctx, id)
+}
+
+func appendedCategories(au *auditFake) []string {
+	au.mu.Lock()
+	defer au.mu.Unlock()
+	out := make([]string, 0, len(au.appended))
+	for _, e := range au.appended {
+		out = append(out, e.Category)
+	}
+	return out
+}
+
+func decodePayload(t *testing.T, raw []byte) map[string]any {
+	t.Helper()
+	var m map[string]any
+	if err := json.Unmarshal(raw, &m); err != nil {
+		t.Fatalf("unmarshal payload: %v", err)
+	}
+	return m
+}
+
+// assertSettleRow asserts the appended chain ends [stage_fixup_triggered,
+// stage_fixup_recovered] for the stage and that the recovered row carries
+// EXACTLY the keys the refund, MCP floor-void and gate-view readers read, with
+// restored_state == wantState. Returns the recovered payload.
+func assertSettleRow(t *testing.T, au *auditFake, stageID uuid.UUID, wantState run.StageState) map[string]any {
+	t.Helper()
+	triggers := auditEntries(au, CategoryStageFixupTriggered)
+	recovered := auditEntries(au, CategoryStageFixupRecovered)
+	if len(triggers) != 1 || len(recovered) != 1 {
+		t.Fatalf("triggers = %d, recovered = %d, want 1/1 (chain %v)", len(triggers), len(recovered), appendedCategories(au))
+	}
+	cats := appendedCategories(au)
+	ti, ri := -1, -1
+	for i, c := range cats {
+		if c == CategoryStageFixupTriggered {
+			ti = i
+		}
+		if c == CategoryStageFixupRecovered {
+			ri = i
+		}
+	}
+	if ri < ti {
+		t.Errorf("chain %v: the settle row must FOLLOW its trigger", cats)
+	}
+	if recovered[0].StageID == nil || *recovered[0].StageID != stageID {
+		t.Errorf("recovered row stage = %v, want %s", recovered[0].StageID, stageID)
+	}
+	p := decodePayload(t, recovered[0].Payload)
+	if p["delivered_nothing"] != true {
+		t.Errorf("delivered_nothing = %v, want true", p["delivered_nothing"])
+	}
+	if p["source_failure_category"] != string(run.FailureC) {
+		t.Errorf("source_failure_category = %v, want C", p["source_failure_category"])
+	}
+	if p["restored_state"] != string(wantState) {
+		t.Errorf("restored_state = %v, want %q (the implement stage's ACTUAL state)", p["restored_state"], wantState)
+	}
+	if p["stage_id"] != stageID.String() {
+		t.Errorf("stage_id = %v, want %s", p["stage_id"], stageID)
+	}
+	want := map[string]bool{"stage_id": true, "restored_state": true, "delivered_nothing": true, "source_failure_category": true, "source_failure_reason": true}
+	for k := range p {
+		if !want[k] {
+			t.Errorf("unexpected settle-row key %q (no restored_review_* / reopen keys: nothing was restored)", k)
+		}
+	}
+	return p
+}
+
+// TestFixupStage_TriggerAppendFails_StageNeverReopened is #4815's done-means:
+// a failed stage_fixup_triggered append REFUSES the fix-up with every stage
+// untouched, on all three re-open shapes. MECHANISM (CF): ignoring the append
+// error (`_ = aerr`) falls through to run.FixupStage, which admits, and the
+// implement row reads pending where this asserts the prior state.
+func TestFixupStage_TriggerAppendFails_StageNeverReopened(t *testing.T) {
+	assertRefused := func(t *testing.T, repo *approvalRunRepo, au *auditFake, routed *concern.Concern) {
+		t.Helper()
+		if n := len(repo.transitions); n != 0 {
+			t.Errorf("repo transitions = %d (%+v), want 0", n, repo.transitions)
+		}
+		for _, c := range appendedCategories(au) {
+			if c == CategoryStageFixupTriggered || c == CategoryFixupPRBodyUnsatisfiable || c == CategoryStageFixupRecovered {
+				t.Errorf("appended %q despite the refusal", c)
+			}
+		}
+		if routed.State != concern.StateRaised {
+			t.Errorf("routed concern state = %q, want raised (never marked addressed_pending)", routed.State)
+		}
+	}
+
+	t.Run("commit-yourself", func(t *testing.T) {
+		s, repo, au, cr := fixupServerWithConcerns(t)
+		stage := seedImplementGateStage(repo)
+		routed := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 1, "tighten the seam")
+		au.appendErrCategory = CategoryStageFixupTriggered
+
+		w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{routed.ID.String()}, Reason: "r",
+			InstructionTargets: map[string]string{routed.ID.String(): string(fixupobligation.TargetPRBody)}})
+		if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "fix-up REFUSED") ||
+			!strings.Contains(w.Body.String(), "not re-opened") {
+			t.Fatalf("status = %d body = %s, want 500 naming the refusal", w.Code, w.Body.String())
+		}
+		if stage.State != run.StageStateAwaitingApproval {
+			t.Errorf("implement state = %q, want awaiting_approval", stage.State)
+		}
+		assertRefused(t, repo, au, routed)
+	})
+
+	t.Run("push_and_open_pr", func(t *testing.T) {
+		s, repo, au, cr := fixupServerWithConcerns(t)
+		impl, review := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)
+		routed := seedConcernRow(t, cr, impl.RunID, impl.ID, concern.StageKindImplement, 1, "tighten the seam")
+		au.appendErrCategory = CategoryStageFixupTriggered
+
+		w := postFixup(t, s, impl.ID, fixupRequest{ConcernIDs: []string{routed.ID.String()}, Reason: "r"})
+		if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "fix-up REFUSED") {
+			t.Fatalf("status = %d body = %s, want 500 naming the refusal", w.Code, w.Body.String())
+		}
+		if impl.State != run.StageStateSucceeded || review.State != run.StageStateAwaitingApproval {
+			t.Errorf("implement/review = %q/%q, want succeeded/awaiting_approval", impl.State, review.State)
+		}
+		assertRefused(t, repo, au, routed)
+	})
+
+	t.Run("acceptance mode", func(t *testing.T) {
+		s, repo, au, cr := fixupServerWithConcerns(t)
+		impl := repo.seedGatelessStage(run.StageStateSucceeded)
+		repo.seedRun(&run.Run{ID: impl.RunID, State: run.StateRunning})
+		review := repo.seedStageOnRunSeq(impl.RunID, 2, run.StageTypeReview, run.StageStateSucceeded)
+		acc := repo.seedStageOnRunSeq(impl.RunID, 3, run.StageTypeAcceptance, run.StageStateSucceeded)
+		routed := seedConcernRow(t, cr, impl.RunID, impl.ID, concern.StageKindImplement, 1, "tighten the seam")
+		au.appendErrCategory = CategoryStageFixupTriggered
+
+		_, _, err := s.fixupStageAs(context.Background(), Identity{Subject: acceptanceTriageSystemSubject}, fixupActionParams{
+			StageID:    impl.ID,
+			Options:    run.FixupOptions{MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling, AcceptanceStageID: &acc.ID},
+			Selected:   []planreview.Concern{{Severity: planreview.SeverityHigh, Category: "acceptance", Note: "criterion failed"}},
+			ConcernIDs: []uuid.UUID{routed.ID},
+		})
+		if err == nil || !strings.Contains(err.Error(), "fix-up REFUSED") {
+			t.Fatalf("err = %v, want the unrecorded-trigger refusal", err)
+		}
+		if impl.State != run.StageStateSucceeded || review.State != run.StageStateSucceeded || acc.State != run.StageStateSucceeded {
+			t.Errorf("implement/review/acceptance = %q/%q/%q, want all succeeded", impl.State, review.State, acc.State)
+		}
+		assertRefused(t, repo, au, routed)
+	})
+}
+
+// TestFixupStage_TriggerAppendFails_RetiresMintedOperatorConcern: the operator
+// concern minted for a pass whose trigger could not be recorded is retired to
+// superseded with a self-contained reason, so a healthy re-POST leaves exactly
+// ONE open operator concern. MECHANISM (CF): neutering the ApplyResolution
+// call leaves the minted row raised where this asserts superseded.
+func TestFixupStage_TriggerAppendFails_RetiresMintedOperatorConcern(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	stage := seedImplementGateStage(repo)
+	au.appendErrCategory = CategoryStageFixupTriggered
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer the seam", Reason: "r"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	rows := operatorConcernRows(cr)
+	if len(rows) != 1 || rows[0].State != concern.StateSuperseded {
+		t.Fatalf("operator concern rows = %+v, want one superseded row", rows)
+	}
+	if !strings.Contains(rows[0].StateReason, "fix-up refused") || !strings.Contains(rows[0].StateReason, "never routed") {
+		t.Errorf("state_reason = %q, want a self-contained refusal reason", rows[0].StateReason)
+	}
+
+	au.appendErrCategory = ""
+	w = postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer the seam", Reason: "r"})
+	if w.Code != http.StatusOK {
+		t.Fatalf("re-POST status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	open := 0
+	for _, r := range operatorConcernRows(cr) {
+		if r.State.IsOpen() {
+			open++
+		}
+	}
+	if open != 1 {
+		t.Errorf("open operator concerns = %d, want exactly 1 after the healthy re-POST", open)
+	}
+}
+
+// _RetireFailure_StillRefuses: a failing retirement WARN-logs and the caller
+// still gets the refusal (fail-closed), with no stage moved.
+func TestFixupStage_TriggerAppendFails_RetireFailure_StillRefuses(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+	stage := seedImplementGateStage(repo)
+	au.appendErrCategory = CategoryStageFixupTriggered
+	cr.applyResolutionErr = errors.New("concern store down")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "fix-up REFUSED") {
+		t.Fatalf("status = %d body = %s, want the 500 refusal", w.Code, w.Body.String())
+	}
+	if stage.State != run.StageStateAwaitingApproval || len(repo.transitions) != 0 {
+		t.Errorf("stage = %q, transitions = %d, want untouched", stage.State, len(repo.transitions))
+	}
+	if !strings.Contains(logBuf.String(), "retire unrouted operator concern failed") || !strings.Contains(logBuf.String(), "concern store down") {
+		t.Errorf("log missing the retirement WARN: %s", logBuf.String())
+	}
+}
+
+// TestFixupStage_ReopenFailsAfterTrigger_VoidsTriggerAndRefunds: the trigger
+// landed, then the re-open failed. The trigger is settled by a
+// stage_fixup_recovered void row the production refund reader counts, the
+// minted operator concern is retired, routed concerns are never marked, and a
+// later POST is admitted. MECHANISM (CF): dropping the settle call leaves no
+// recovered row and a 0 refund where this asserts one row and (1,1).
+func TestFixupStage_ReopenFailsAfterTrigger_VoidsTriggerAndRefunds(t *testing.T) {
+	s, repo, au, cr := fixupServerWithConcerns(t)
+	au.stampSequence = true
+	stage := seedImplementGateStage(repo)
+	routed := seedConcernRow(t, cr, stage.RunID, stage.ID, concern.StageKindImplement, 1, "tighten the seam")
+	repo.transitionErr = errors.New("stage store down")
+
+	w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{routed.ID.String()}, OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "fixup failed") {
+		t.Fatalf("status = %d body = %s, want the generic 500 for the re-open error", w.Code, w.Body.String())
+	}
+	p := assertSettleRow(t, au, stage.ID, run.StageStateAwaitingApproval)
+	if r, _ := p["source_failure_reason"].(string); !strings.Contains(r, "re-open failed") || !strings.Contains(r, "stage store down") {
+		t.Errorf("source_failure_reason = %q, want it to name the failed re-open", r)
+	}
+	refunded, crashed, err := s.fixupRefundedPasses(context.Background(), stage.RunID, stage.ID)
+	if err != nil || refunded != 1 || crashed != 1 {
+		t.Errorf("fixupRefundedPasses = (%d,%d,%v), want (1,1,nil)", refunded, crashed, err)
+	}
+	if rows := operatorConcernRows(cr); len(rows) != 1 || rows[0].State != concern.StateSuperseded {
+		t.Errorf("minted operator concern = %+v, want one superseded row", rows)
+	}
+	if routed.State != concern.StateRaised {
+		t.Errorf("routed concern = %q, want raised (not addressed_pending)", routed.State)
+	}
+
+	repo.transitionErr = nil
+	if w := postFixup(t, s, stage.ID, fixupRequest{ConcernIDs: []string{routed.ID.String()}, Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("second POST status = %d, want 200 (the settled trigger refunded):\n%s", w.Code, w.Body.String())
+	}
+}
+
+// TestFixupStage_ReopenFails_SettleReadFails_RecordsPreTriggerState (#4815 C1
+// fallback): when the settle cannot re-read the implement stage it records the
+// preview's pre-trigger state and SAYS so in source_failure_reason and a WARN.
+func TestFixupStage_ReopenFails_SettleReadFails_RecordsPreTriggerState(t *testing.T) {
+	s, base, au := fixupServer(t)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+	stage := seedImplementGateStage(base)
+	repo := &implementOnlyTransitionFailRepo{approvalRunRepo: base, failID: stage.ID, getStageFailAfter: true}
+	s.cfg.RunRepo = repo
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	p := assertSettleRow(t, au, stage.ID, run.StageStateAwaitingApproval)
+	if r, _ := p["source_failure_reason"].(string); !strings.Contains(r, "could not be re-read") || !strings.Contains(r, "pre-trigger state") {
+		t.Errorf("source_failure_reason = %q, want the explicit re-read diagnostic", r)
+	}
+	if !strings.Contains(logBuf.String(), "implement stage re-read failed") {
+		t.Errorf("log missing the re-read WARN: %s", logBuf.String())
+	}
+}
+
+// TestFixupStage_ReopenFails_SettleReadReturnsNoRow_RecordsPreTriggerState
+// (#4815 C1 fallback, nil-row arm): a re-read returning (nil, nil) takes the
+// same pre-trigger fallback as a read error, naming "no row returned" in
+// source_failure_reason and the WARN.
+func TestFixupStage_ReopenFails_SettleReadReturnsNoRow_RecordsPreTriggerState(t *testing.T) {
+	s, base, au := fixupServer(t)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+	stage := seedImplementGateStage(base)
+	s.cfg.RunRepo = &implementOnlyTransitionFailRepo{approvalRunRepo: base, failID: stage.ID, getStageNilAfter: true}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	p := assertSettleRow(t, au, stage.ID, run.StageStateAwaitingApproval)
+	if r, _ := p["source_failure_reason"].(string); !strings.Contains(r, "could not be re-read (no row returned)") || !strings.Contains(r, "pre-trigger state") {
+		t.Errorf("source_failure_reason = %q, want the no-row re-read diagnostic", r)
+	}
+	if !strings.Contains(logBuf.String(), "implement stage re-read failed") || !strings.Contains(logBuf.String(), "no row returned") {
+		t.Errorf("log missing the no-row re-read WARN: %s", logBuf.String())
+	}
+}
+
+// TestFixupStage_ReopenFailsAfterReviewRepark_RecordsActualState (#4815 C2):
+// on push_and_open_pr, run.FixupStage re-parks the review FIRST, so a failure
+// of the LATER implement re-open leaves the review committed at pending and
+// the implement stage at succeeded. The settle row records the implement
+// stage's actual state and carries no restored_review_* keys: nothing was
+// restored (atomic multi-stage restoration is deferred, #5043).
+func TestFixupStage_ReopenFailsAfterReviewRepark_RecordsActualState(t *testing.T) {
+	s, base, au := fixupServer(t)
+	impl, review := seedPushOpenPRStages(base, run.StageStateAwaitingApproval)
+	s.cfg.RunRepo = &implementOnlyTransitionFailRepo{approvalRunRepo: base, failID: impl.ID}
+
+	w := postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusInternalServerError || !strings.Contains(w.Body.String(), "fixup failed") {
+		t.Fatalf("status = %d body = %s, want the generic 500 for the re-open error", w.Code, w.Body.String())
+	}
+	if review.State != run.StageStatePending {
+		t.Errorf("review = %q, want pending (the committed re-park is not walked back)", review.State)
+	}
+	if impl.State != run.StageStateSucceeded {
+		t.Errorf("implement = %q, want succeeded (still parked)", impl.State)
+	}
+	assertSettleRow(t, au, impl.ID, run.StageStateSucceeded)
+}
+
+// TestFixupStage_ReopenRefusedAfterTrigger_KeepsSentinel: a state change that
+// lands after the preview (here: inside the trigger append) makes
+// run.FixupStage's own admission refuse. The sentinel survives to the 422 and
+// the void row records the ACTUAL running state. MECHANISM (CF, C1):
+// recording the preview prior state instead reads awaiting_approval.
+func TestFixupStage_ReopenRefusedAfterTrigger_KeepsSentinel(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	stage := seedImplementGateStage(repo)
+	s.cfg.AuditRepo = &fixupTriggerHookAudit{auditFake: au, hook: func(context.Context) {
+		repo.mu.Lock()
+		stage.State = run.StageStateRunning
+		repo.mu.Unlock()
+	}}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "fixup_not_applicable") {
+		t.Fatalf("status = %d body = %s, want 422 fixup_not_applicable", w.Code, w.Body.String())
+	}
+	assertSettleRow(t, au, stage.ID, run.StageStateRunning)
+}
+
+// TestFixupStage_ReopenFails_SettleAppendFails_StillRefuses: the settle append
+// failing is WARN-logged; the caller still gets the ORIGINAL re-open error and
+// no stage moved.
+func TestFixupStage_ReopenFails_SettleAppendFails_StillRefuses(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+	stage := seedImplementGateStage(repo)
+	au.appendErrCategory = CategoryStageFixupRecovered
+	repo.transitionErr = errors.New("stage store down")
+
+	_, _, err := s.fixupStageAs(context.Background(), Identity{Subject: "op", Scopes: []string{"write:fixups"}}, fixupActionParams{
+		StageID:         stage.ID,
+		Options:         run.FixupOptions{MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
+		Selected:        []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
+		OperatorConcern: "steer",
+	})
+	if err == nil || err.Error() != "FixupStage: awaiting_approval → pending: stage store down" {
+		t.Fatalf("err = %v, want the ORIGINAL re-open error verbatim", err)
+	}
+	if stage.State != run.StageStateAwaitingApproval {
+		t.Errorf("stage = %q, want unmoved", stage.State)
+	}
+	if !strings.Contains(logBuf.String(), "append stage_fixup_recovered audit entry failed") {
+		t.Errorf("log missing the settle-append WARN: %s", logBuf.String())
+	}
+}
+
+// TestFixupStage_ReopenFails_SettleSurvivesCancelledRequest: the request
+// context is cancelled mid-flight (inside the failing re-open); the settle
+// runs detached from cancellation and still lands. MECHANISM (CF): settling on
+// the request context makes the cancellation-honouring store refuse it.
+func TestFixupStage_ReopenFails_SettleSurvivesCancelledRequest(t *testing.T) {
+	s, base, au := fixupServer(t)
+	stage := seedImplementGateStage(base)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	s.cfg.RunRepo = &implementOnlyTransitionFailRepo{approvalRunRepo: base, failID: stage.ID, onFail: cancel}
+	s.cfg.AuditRepo = &fixupTriggerHookAudit{auditFake: au, failOnCancelled: true}
+
+	_, _, err := s.fixupStageAs(ctx, Identity{Subject: "op", Scopes: []string{"write:fixups"}}, fixupActionParams{
+		StageID:  stage.ID,
+		Options:  run.FixupOptions{MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
+		Selected: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
+	})
+	if err == nil {
+		t.Fatal("err = nil, want the re-open error")
+	}
+	if ctx.Err() == nil {
+		t.Fatal("fixture: request context was not cancelled")
+	}
+	assertSettleRow(t, au, stage.ID, run.StageStateAwaitingApproval)
+}
+
+// TestFixupStage_TriggerAppendedBeforeReopen pins the happy-path ORDER: when
+// the trigger is appended the implement (and, on push_and_open_pr, review)
+// rows are still at their prior states. MECHANISM (CF): moving the re-open
+// above the append snapshots pending.
+func TestFixupStage_TriggerAppendedBeforeReopen(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	impl, review := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)
+	var implAt, reviewAt run.StageState
+	s.cfg.AuditRepo = &fixupTriggerHookAudit{auditFake: au, hook: func(context.Context) {
+		repo.mu.Lock()
+		implAt, reviewAt = impl.State, review.State
+		repo.mu.Unlock()
+	}}
+
+	if w := postFixup(t, s, impl.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"}); w.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200:\n%s", w.Code, w.Body.String())
+	}
+	if implAt != run.StageStateSucceeded || reviewAt != run.StageStateAwaitingApproval {
+		t.Errorf("at trigger append implement/review = %q/%q, want succeeded/awaiting_approval (append BEFORE re-open)", implAt, reviewAt)
+	}
+	if impl.State != run.StageStatePending || review.State != run.StageStatePending {
+		t.Errorf("after the call implement/review = %q/%q, want pending/pending", impl.State, review.State)
+	}
+}
+
+// TestFixupStage_TriggerPayloadMatchesPostTransitionDecision (#4815 C3): the
+// FULL stage_fixup_triggered payload written from the preview is
+// byte-identical to the payload the admitted post-transition decision
+// produces, across every re-open shape and with every optional key present
+// (operator concern + id, evidence, delegated, model pin, PR-body targets,
+// truncation).
+func TestFixupStage_TriggerPayloadMatchesPostTransitionDecision(t *testing.T) {
+	type shape struct {
+		seed            func(repo *approvalRunRepo) (*run.Stage, *uuid.UUID)
+		opts            func(acc *uuid.UUID) run.FixupOptions
+		prior, refunded int
+	}
+	gate := func(repo *approvalRunRepo) (*run.Stage, *uuid.UUID) { return seedImplementGateStage(repo), nil }
+	cases := map[string]shape{
+		"commit-yourself": {seed: gate, opts: func(*uuid.UUID) run.FixupOptions {
+			return run.FixupOptions{MaxPasses: 1, HardCeiling: defaultFixupCeiling}
+		}},
+		"push_and_open_pr": {seed: func(repo *approvalRunRepo) (*run.Stage, *uuid.UUID) {
+			impl, _ := seedPushOpenPRStages(repo, run.StageStateAwaitingApproval)
+			return impl, nil
+		}, opts: func(*uuid.UUID) run.FixupOptions {
+			return run.FixupOptions{MaxPasses: 1, HardCeiling: defaultFixupCeiling}
+		}},
+		"acceptance mode": {seed: func(repo *approvalRunRepo) (*run.Stage, *uuid.UUID) {
+			impl := repo.seedGatelessStage(run.StageStateSucceeded)
+			repo.seedRun(&run.Run{ID: impl.RunID, State: run.StateRunning})
+			repo.seedStageOnRunSeq(impl.RunID, 2, run.StageTypeReview, run.StageStateSucceeded)
+			acc := repo.seedStageOnRunSeq(impl.RunID, 3, run.StageTypeAcceptance, run.StageStateSucceeded)
+			return impl, &acc.ID
+		}, opts: func(acc *uuid.UUID) run.FixupOptions {
+			return run.FixupOptions{MaxPasses: 1, HardCeiling: defaultFixupCeiling, AcceptanceStageID: acc}
+		}},
+		"forced": {seed: gate, prior: 1, opts: func(*uuid.UUID) run.FixupOptions {
+			return run.FixupOptions{PriorPassCount: 1, MaxPasses: 1, ForceAdditionalPass: true, HardCeiling: defaultFixupCeiling}
+		}},
+		"ceiling credit": {seed: gate, prior: 2, refunded: 2, opts: func(*uuid.UUID) run.FixupOptions {
+			return run.FixupOptions{PriorPassCount: 2, MaxPasses: 1 + 2, HardCeiling: defaultFixupCeiling, CeilingRefundedPasses: 2}
+		}},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			s, repo, au, cr := fixupServerWithConcerns(t)
+			stage, acc := c.seed(repo)
+			_, rawIDs := seedOverflowConcernRows(t, cr, stage, 6, 3000)
+			ids := make([]uuid.UUID, 0, len(rawIDs))
+			for _, raw := range rawIDs {
+				ids = append(ids, uuid.MustParse(raw))
+			}
+			selected, _, err := s.resolveConcernsByID(context.Background(), stage.RunID, stage.ID, ids)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := Identity{Subject: "op@example.test", Scopes: []string{"write:fixups"}}
+			targets := fixupInstructionTargets{Concerns: []fixupobligation.Target{fixupobligation.TargetPRBody}, Reason: fixupobligation.TargetPRBody}
+			pin := &ResolvedModel{Value: "claude-fable-5-2", Source: ModelSourceOperator}
+			p := fixupActionParams{
+				StageID: stage.ID, Options: c.opts(acc), Selected: selected, ConcernIDs: ids, Indices: nil,
+				Reason: "route them", AllowCreate: []string{"docs/new.md"}, PriorPasses: c.prior, RefundedPasses: c.refunded,
+				DelegatedRule: "may_route_fixup", PinModel: pin, OperatorConcern: strings.Repeat("o", 3500),
+				OperatorEvidence: "ran the repro", Targets: targets,
+			}
+			dec, _, err := s.fixupStageAs(context.Background(), id, p)
+			if err != nil {
+				t.Fatalf("fixupStageAs: %v", err)
+			}
+			rows := auditEntries(au, CategoryStageFixupTriggered)
+			if len(rows) != 1 {
+				t.Fatalf("triggers = %d, want 1", len(rows))
+			}
+			written := decodePayload(t, rows[0].Payload)
+			opID := uuid.MustParse(written["operator_concern_id"].(string))
+			routed := append(slices.Clone(ids), opID)
+			_, fullFit := fixupRouteFit(selected)
+			trunc := fixupTruncatedConcernIDs(fullFit, selected, routed, ids)
+			if !fullFit.BodiesTruncated {
+				t.Fatal("fixture: expected truncated bodies so the optional truncation keys are compared")
+			}
+			post, err := fixupTriggerPayload(id, dec, selected, routed, nil, p.Reason, p.AllowCreate, p.PriorPasses, p.RefundedPasses, p.DelegatedRule, pin, p.OperatorConcern, opID, p.OperatorEvidence, fullFit.BodiesTruncated, trunc, targets)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !bytes.Equal(rows[0].Payload, post) {
+				t.Errorf("preview payload != post-transition payload\npreview: %s\npost:    %s", rows[0].Payload, post)
+			}
+			for _, k := range []string{"remaining_budget", "remaining_ceiling_slots", "forced", "prior_state", "operator_concern_id", "concern_bodies_truncated", "truncated_concern_ids", "concern_targets", "reason_target", "operator_evidence", "delegated", "fixup_model"} {
+				if _, ok := written[k]; !ok {
+					t.Errorf("payload missing %q, so it was not compared", k)
+				}
+			}
+			if dec.ReparkedReview != nil && written["reparked_review_stage_id"] != dec.ReparkedReview.ID.String() {
+				t.Errorf("reparked_review_stage_id = %v, want %s", written["reparked_review_stage_id"], dec.ReparkedReview.ID)
+			}
+		})
+	}
+}
+
+// TestFixupStage_RepeatedSettlements_RespectsAbsoluteCeiling (#4815 C4): every
+// trigger-plus-settle refunds through the production readers, so repeated
+// failed re-opens are admitted only until the ABSOLUTE ceiling
+// (defaultFixupCeiling + maxCeilingRefundCredits) refuses the next one.
+// MECHANISM (CF): removing the handler's maxCeilingRefundCredits clamp credits
+// every settled pass and the loop never refuses.
+func TestFixupStage_RepeatedSettlements_RespectsAbsoluteCeiling(t *testing.T) {
+	s, repo, au := fixupServer(t)
+	au.stampSequence = true
+	stage := seedImplementGateStage(repo)
+	repo.transitionErr = errors.New("stage store down")
+	absolute := defaultFixupCeiling + maxCeilingRefundCredits
+
+	for i := 0; i < absolute; i++ {
+		w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+		if w.Code != http.StatusInternalServerError {
+			t.Fatalf("attempt %d: status = %d, want 500 (admitted, re-open failed):\n%s", i+1, w.Code, w.Body.String())
+		}
+	}
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusUnprocessableEntity || !strings.Contains(w.Body.String(), "fixup_ceiling_reached") {
+		t.Fatalf("attempt %d: status = %d body = %s, want 422 fixup_ceiling_reached", absolute+1, w.Code, w.Body.String())
+	}
+	if n := len(auditEntries(au, CategoryStageFixupTriggered)); n != absolute {
+		t.Errorf("triggers = %d, want %d (the refused attempt appends none)", n, absolute)
+	}
+	if n := len(auditEntries(au, CategoryStageFixupRecovered)); n != absolute {
+		t.Errorf("settle rows = %d, want %d", n, absolute)
+	}
+	if refunded, _, err := s.fixupRefundedPasses(context.Background(), stage.RunID, stage.ID); err != nil || refunded != absolute {
+		t.Errorf("refunded = %d (%v), want %d", refunded, err, absolute)
+	}
+}
+
+// tryLockStage tries to take the stage admission fence within wait; on a miss
+// the abandoned acquisition releases the fence the moment it gets it.
+func tryLockStage(o *orchestrator.Orchestrator, id uuid.UUID, wait time.Duration) (func(), bool) {
+	got := make(chan func(), 1)
+	go func() { got <- o.LockStageAdmission(id) }()
+	select {
+	case unlock := <-got:
+		return unlock, true
+	case <-time.After(wait):
+		go func() { (<-got)() }()
+		return nil, false
+	}
+}
+
+// postReopenGetRunRepo probes the stage admission fence on every GetRun made
+// after the implement stage left its gate — the post-re-open steps, Advance's
+// run read among them — and once AT the implement re-open (its first
+// TransitionStage), recording whether the call carried the held marker and
+// whether the fence was acquirable there.
+type postReopenGetRunRepo struct {
+	*approvalRunRepo
+	orch    *orchestrator.Orchestrator
+	stage   *run.Stage
+	mu      sync.Mutex
+	probes  int
+	blocked int
+	// reopenProbed / reopenMarked / reopenAcquired record the re-open probe.
+	reopenProbed, reopenMarked, reopenAcquired bool
+}
+
+func (r *postReopenGetRunRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	first := id == r.stage.ID && !r.reopenProbed
+	r.reopenProbed = r.reopenProbed || id == r.stage.ID
+	r.mu.Unlock()
+	if first {
+		marked := stageAdmissionHeldBy(ctx, id)
+		unlock, ok := tryLockStage(r.orch, id, fenceProbeWait)
+		if ok {
+			unlock()
+		}
+		r.mu.Lock()
+		r.reopenMarked, r.reopenAcquired = marked, ok
+		r.mu.Unlock()
+	}
+	return r.approvalRunRepo.TransitionStage(ctx, id, to, c)
+}
+
+// fenceProbeWait bounds a probe taken INSIDE the fenced section. With the fence
+// held the probe cannot succeed (the holder is the goroutine blocked in the
+// probe), so the wait only costs time; with it absent the lock is free and
+// returns at once.
+const fenceProbeWait = 500 * time.Millisecond
+
+func (r *postReopenGetRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
+	r.approvalRunRepo.mu.Lock()
+	reopened := r.stage.State != run.StageStateAwaitingApproval
+	r.approvalRunRepo.mu.Unlock()
+	if reopened {
+		unlock, ok := tryLockStage(r.orch, r.stage.ID, 200*time.Millisecond)
+		r.mu.Lock()
+		r.probes++
+		if !ok {
+			r.blocked++
+		}
+		r.mu.Unlock()
+		if ok {
+			unlock()
+		}
+	}
+	return r.approvalRunRepo.GetRun(ctx, id)
+}
+
+// TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen (#4815 C7): the
+// trigger append and the implement re-open run under the stage admission
+// fence, and the fence is released before the post-re-open steps (Advance
+// included) and is re-acquirable after the call. Each in-section check is
+// taken AT its synchronization point — the trigger append's audit hook and
+// the re-open's TransitionStage — not after a sleep: there the call must carry
+// the held marker and the fence must NOT be acquirable. MECHANISM (CF):
+// replacing the hold with a no-op drops the marker and frees the fence at both
+// points.
+func TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen(t *testing.T) {
+	s, base, au := fixupServer(t)
+	stage := seedImplementGateStage(base)
+	orch := &orchestrator.Orchestrator{Runs: base}
+	repo := &postReopenGetRunRepo{approvalRunRepo: base, orch: orch, stage: stage}
+	s.cfg.RunRepo = repo
+	orch.Runs = repo
+	s.cfg.Orchestrator = orch
+	var appendProbed, appendMarked, appendAcquired bool
+	s.cfg.AuditRepo = &fixupTriggerHookAudit{auditFake: au, hook: func(ctx context.Context) {
+		appendProbed = true
+		appendMarked = stageAdmissionHeldBy(ctx, stage.ID)
+		unlock, ok := tryLockStage(orch, stage.ID, fenceProbeWait)
+		if ok {
+			unlock()
+		}
+		appendAcquired = ok
+	}}
+
+	if _, _, err := s.fixupStageAs(context.Background(), Identity{Subject: "op", Scopes: []string{"write:fixups"}}, fixupActionParams{
+		StageID:  stage.ID,
+		Options:  run.FixupOptions{MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
+		Selected: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
+	}); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+	if !appendProbed || !appendMarked || appendAcquired {
+		t.Errorf("at the trigger append: probed = %v, held marker = %v, fence acquirable = %v; want true, true, false", appendProbed, appendMarked, appendAcquired)
+	}
+	repo.mu.Lock()
+	reopenProbed, reopenMarked, reopenAcquired := repo.reopenProbed, repo.reopenMarked, repo.reopenAcquired
+	repo.mu.Unlock()
+	if !reopenProbed || !reopenMarked || reopenAcquired {
+		t.Errorf("at the implement re-open: probed = %v, held marker = %v, fence acquirable = %v; want true, true, false", reopenProbed, reopenMarked, reopenAcquired)
+	}
+	if n := len(auditEntries(au, CategoryStageFixupTriggered)); n != 1 {
+		t.Errorf("triggers = %d, want 1", n)
+	}
+	repo.mu.Lock()
+	probes, blocked := repo.probes, repo.blocked
+	repo.mu.Unlock()
+	if probes == 0 || blocked != 0 {
+		t.Errorf("post-re-open fence probes = %d, blocked = %d, want >0 probes and none blocked (fence released before Advance)", probes, blocked)
+	}
+	if u, ok := tryLockStage(orch, stage.ID, time.Second); !ok {
+		t.Error("fence not re-acquirable after fixupStageAs returned")
+	} else {
+		u()
 	}
 }
