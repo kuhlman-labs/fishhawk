@@ -16,6 +16,7 @@ import (
 
 	"github.com/kuhlman-labs/fishhawk/backend/internal/audit"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/auditcomplete"
+	"github.com/kuhlman-labs/fishhawk/backend/internal/mergequeue"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/orchestrator"
 	"github.com/kuhlman-labs/fishhawk/backend/internal/run"
 )
@@ -2028,11 +2029,54 @@ func TestMergeCandidateVerifyState_ScenarioTerminalVouch(t *testing.T) {
 	})
 }
 
+// scArmedReadErr fails exactly ONE ListForRunByCategory read of category
+// fail: the first one made at or after the first read of category arm. Arming
+// on acceptance_scenarios_pushed (rule 4a's first read, which rules 1 to 4 never
+// make) means an earlier rule's read of the same category is never the one
+// that fails, and failing it only once means a later read (the verdict read
+// after classification) cannot re-surface an error the arm swallowed.
+type scArmedReadErr struct {
+	audit.Repository
+	arm, fail    string
+	armed, fired bool
+}
+
+func (a *scArmedReadErr) ListForRunByCategory(ctx context.Context, runID uuid.UUID, category string) ([]*audit.Entry, error) {
+	if category == a.arm {
+		a.armed = true
+	}
+	if a.armed && !a.fired && category == a.fail {
+		a.fired = true
+		return nil, errors.New(scArmedReadErrText + category)
+	}
+	return a.Repository.ListForRunByCategory(ctx, runID, category)
+}
+
+const scArmedReadErrText = "scArmedReadErr: injected scenario-arm read error for "
+
 // TestMergeCandidateVerifyState_ScenarioReadErrorsAreReturned: ADR-142 D4 —
 // every read the scenario arm adds returns its error, through a vouched
-// terminal chain that reaches each one. Category-scoped errors use
-// listByCategoryErrCategory with the global listByCategoryErr nil.
+// terminal chain that reaches each one. Rules 1 to 4 read several of these
+// categories BEFORE rule 4a, and the verdict read re-reads
+// merge_candidate_verified after it, so a category-wide fault would surface
+// from those reads even if the arm swallowed its own; scArmedReadErr fails only
+// the arm's first read of the category, so a swallowed error leaves err nil.
 func TestMergeCandidateVerifyState_ScenarioReadErrorsAreReturned(t *testing.T) {
+	seed := func(t *testing.T) *mcGateFixture {
+		g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
+		g.gh.compares = scBaseBringing(scF, scV)
+		scHeadRow(g.mcvFixture, "fixup_pushed", scF)
+		scVouch(g.mcvFixture, scV)
+		scScenario(g.mcvFixture, scC, scV)
+		return g
+	}
+	t.Run("baseline: the chain reaches the terminal ladder and answers base_advance", func(t *testing.T) {
+		g := seed(t)
+		got, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC)
+		if err != nil || got.State != mergeCandidateStateUnverified || got.Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("state = %+v err=%v, want unverified base_advance with no fault", got, err)
+		}
+	})
 	for _, cat := range []string{
 		CategoryAcceptanceScenariosPushed, CategoryBranchRebased, CategoryConflictResolutionPushed,
 		auditcomplete.CategoryIntegrationCommitRecorded, auditcomplete.CategorySlicesIntegrated,
@@ -2040,17 +2084,18 @@ func TestMergeCandidateVerifyState_ScenarioReadErrorsAreReturned(t *testing.T) {
 		CategoryMergeCandidateVerified,
 	} {
 		t.Run(cat, func(t *testing.T) {
-			g := newMCGateFixture(t, mcvUndelegatedSpecYAML)
-			g.gh.compares = scBaseBringing(scF, scV)
-			scHeadRow(g.mcvFixture, "fixup_pushed", scF)
-			scVouch(g.mcvFixture, scV)
-			scScenario(g.mcvFixture, scC, scV)
-			g.au.listByCategoryErrCategory = cat
-			if g.au.listByCategoryErr != nil {
-				t.Fatal("the global read error must stay nil")
+			g := seed(t)
+			fault := &scArmedReadErr{Repository: g.au, arm: CategoryAcceptanceScenariosPushed, fail: cat}
+			g.s.cfg.AuditRepo = fault
+			if g.au.listByCategoryErr != nil || g.au.listByCategoryErrCategory != "" {
+				t.Fatal("the fake's own read errors must stay unset")
 			}
-			if got, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC); err == nil {
-				t.Fatalf("state = %+v, err = nil; want the %s read error returned", got, cat)
+			got, err := g.s.mergeCandidateVerifyState(context.Background(), g.runRow(t), scC)
+			if !fault.fired {
+				t.Fatalf("the scenario arm never read %s (state %+v, err %v); the row does not reach it", cat, got, err)
+			}
+			if err == nil || !strings.Contains(err.Error(), scArmedReadErrText+cat) {
+				t.Fatalf("state = %+v, err = %v; want the scenario arm's %s read error returned", got, err, cat)
 			}
 		})
 	}
@@ -2241,4 +2286,264 @@ func TestMergeCandidateScenarioCommit_GateRefusesThenRebaseStartsExactHeadPass(t
 	if res := gate(); res.Code != "" || res.HeadSHA != scC {
 		t.Fatalf("gate after a pass at C = %+v, want an admit at %s", res, scC)
 	}
+}
+
+// scqSpecYAML is mqeSpecYAML (a declared verify command and a review approval
+// gate listing github:alice) with an acceptance stage added, so the admission
+// predicate's acceptance leg reads the recorded outcome.
+const scqSpecYAML = mqeSpecYAML + `      - id: accept
+        type: acceptance
+        executor:
+          agent: claude-code
+`
+
+// scqRun seeds one queue-recovery run on f's real Postgres stores: an
+// acceptance stage row (succeeded) beside the seeded plan, implement and
+// review, the chain rows seed writes, and C recorded through the REAL
+// recordAcceptanceScenariosPushed route with the forge configured as a real
+// push leaves it (ADR-141): PR head C and C's first parent base.
+func scqRun(t *testing.T, f *mcqFixture, name, base string, seed func(r *mcqRun)) (*mcqRun, *run.Stage) {
+	t.Helper()
+	ctx := context.Background()
+	r := f.seed(name, base, []byte(scqSpecYAML))
+	acc, err := f.repo.CreateStage(ctx, run.CreateStageParams{
+		RunID: r.id, Sequence: 4, Type: run.StageTypeAcceptance, ExecutorKind: run.ExecutorAgent, ExecutorRef: "claude-code",
+	})
+	if err != nil {
+		t.Fatalf("create acceptance stage: %v", err)
+	}
+	f.setStage(acc.ID, run.StageStateSucceeded)
+	seed(r)
+	f.gh.set(func() {
+		f.gh.prs[r.pr].head = scC
+		f.gh.commitParents[scC] = []string{base}
+	})
+	rec := httptest.NewRecorder()
+	req := httptest.NewRequest(http.MethodPost, "/v0/runs/"+r.id.String()+"/stages/"+acc.ID.String()+"/pull-request", nil)
+	subj := "runner"
+	f.srv.recordAcceptanceScenariosPushed(rec, req, r.id, acc, &pullRequestBody{
+		Outcome: outcomeAcceptanceScenariosPushed, Branch: r.branch, HeadSHA: scC, BaseSHA: base,
+	}, "run_token", audit.ActorSystem, &subj)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scenario push report = %d %s, want 200 (forge head %s, first parent %s)", rec.Code, rec.Body.String(), scC, base)
+	}
+	if rows := f.rows(r, CategoryAcceptanceScenariosPushed); len(rows) != 1 {
+		t.Fatalf("acceptance_scenarios_pushed rows = %d, want 1 written by the real route", len(rows))
+	}
+	return r, acc
+}
+
+// scqStandalone is the incident's standalone shape: pull_request_opened S, a
+// clean branch_rebased S -> M, a passed pass at M and acceptance recorded at
+// M with verdict.
+func scqStandalone(f *mcqFixture, verdict string) func(r *mcqRun) {
+	return func(r *mcqRun) {
+		f.mqeAppend(r, "pull_request_opened", map[string]any{"head_sha": scS})
+		f.mqeAppend(r, CategoryBranchRebased, map[string]any{
+			"prior_head_sha": scS, "new_head_sha": scM, "merge_commit_sha": scM, "clean_verified": true})
+		f.mqeAppend(r, CategoryMergeCandidateVerified, map[string]any{
+			"head_sha": scM, "cause": mergeCandidateCauseBaseAdvance, "verify_command": mcvCommand, "result": mergeCandidateResultPassed})
+		f.mqeAppend(r, CategoryAcceptanceOutcomeRecorded, map[string]any{"head_sha": scM, "verdict": verdict})
+	}
+}
+
+func scqState(t *testing.T, f *mcqFixture, r *mcqRun) mergeCandidateState {
+	t.Helper()
+	st, err := f.srv.mergeCandidateVerifyState(context.Background(), f.runRow(r), scC)
+	if err != nil {
+		t.Fatalf("verify state at C: %v", err)
+	}
+	return st
+}
+
+// scqPassAt records a merge_candidate_verified verdict at head.
+func scqPassAt(f *mcqFixture, r *mcqRun, head, cause, result string) {
+	f.mqeAppend(r, CategoryMergeCandidateVerified, map[string]any{
+		"head_sha": head, "cause": cause, "verify_command": mcvCommand, "result": result})
+}
+
+// TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC
+// decides queue ADMISSION for a scenario commit C (ADR-142, ADR-093 slice 1)
+// on newMCQFixture's real Postgres queue store, the real rebase verb's
+// up-to-date arm and the real scenario report route. It adds no permission,
+// bypass, queue or eligibility change: an unverified C needs a pass, and the
+// pass is queued only when the run is merge-queue eligible at C. A hold is
+// reported as a hold, never as a started pass. Merge-on-pass's need for an
+// approval covering exactly C (forge_approval.go) stays pinned by the existing
+// queue tests and is not re-proved here.
+func TestMergeCandidateScenarioCommit_QueueRecoveryNeedsCurrentApprovalAtC(t *testing.T) {
+	const dismissed = `[{"id":1,"user":{"login":"alice"},"state":"APPROVED"},{"id":2,"user":{"login":"alice"},"state":"DISMISSED"}]`
+	requireNotQueued := func(t *testing.T, f *mcqFixture, r *mcqRun, resp rebaseBranchResponse, reasons ...string) {
+		t.Helper()
+		if resp.MergeCandidateVerifyState != mergeCandidateStateNotQueued || resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v note %q, want not_queued, not triggered",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+		}
+		for _, want := range reasons {
+			if !strings.Contains(resp.MergeCandidateVerifyNote, want) {
+				t.Errorf("not_queued note %q lacks %q", resp.MergeCandidateVerifyNote, want)
+			}
+		}
+		if trig := f.triggers(r); len(trig) != 0 {
+			t.Errorf("triggers = %+v, want none at C", trig)
+		}
+		if es := f.entries(r); len(es) != 0 {
+			t.Errorf("queue entries = %+v, want none", es)
+		}
+		if st := f.stageState(r.impl.ID); st != run.StageStateSucceeded {
+			t.Errorf("implement = %s, want succeeded (not_queued re-opens nothing)", st)
+		}
+	}
+
+	t.Run("(1) no live approval at C, the dismissed shape: not_queued not_approved", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q1", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = dismissed })
+		if st := scqState(t, f, r); st.State != mergeCandidateStateUnverified || st.Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("state at C = %+v, want unverified base_advance (the pass at M covers nothing at C)", st)
+		}
+		requireNotQueued(t, f, r, f.rebase(r), mergeQueueReasonNotApproved, "fishhawk_merge_run")
+	})
+
+	t.Run("(2) acceptance parked at triage as well: not_queued not_approved and acceptance_not_eligible", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q2", scM, scqStandalone(f, acceptanceVerdictFailed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = dismissed })
+		requireNotQueued(t, f, r, f.rebase(r),
+			mergeQueueReasonNotApproved, mergeQueueReasonAcceptanceNotEligible, acceptanceGateTriage)
+	})
+
+	t.Run("(3) live approval at C, acceptance passed at M: in_flight, a trigger naming C, entry live at C", func(t *testing.T) {
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q3", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+		if st := scqState(t, f, r); st.State != mergeCandidateStateUnverified || st.Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("state at C = %+v, want unverified base_advance", st)
+		}
+		resp := f.rebase(r)
+		if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v note %q, want in_flight triggered",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+		}
+		trig := f.triggers(r)
+		if len(trig) != 1 || trig[0].ExpectedHeadSHA != scC || trig[0].Cause != mergeCandidateCauseBaseAdvance {
+			t.Fatalf("triggers = %+v, want one naming expected_head_sha %s cause base_advance", trig, scC)
+		}
+		if e := f.requireState(r, mergequeue.StateLive, ""); e.AnchoredHeadSHA != scC {
+			t.Fatalf("entry anchored at %q, want %s", e.AnchoredHeadSHA, scC)
+		}
+		if st := scqState(t, f, r); st.State != mergeCandidateStateInFlight {
+			t.Fatalf("state at C after the trigger = %+v, want in_flight (the pass at M does not make it passed)", st)
+		}
+		scqPassAt(f, r, scC, mergeCandidateCauseBaseAdvance, mergeCandidateResultPassed)
+		if st := scqState(t, f, r); st.State != mergeCandidateStatePassed {
+			t.Fatalf("state at C after a passed verdict at C = %+v, want passed", st)
+		}
+	})
+
+	t.Run("(4) eligible behind another run's live pass: held, nothing started", func(t *testing.T) {
+		f := newMCQFixture(t)
+		other := f.seed("live", "l0", []byte(mqeSpecYAML))
+		f.gh.set(func() { f.gh.reviews[other.pr] = mqeApprovedBy("alice") })
+		f.behind(other, "l0", "l1")
+		if resp := f.rebase(other); resp.MergeCandidateVerifyState != mergeCandidateStateInFlight {
+			t.Fatalf("fixture: other rebase = %q, want in_flight", resp.MergeCandidateVerifyState)
+		}
+		f.requireState(other, mergequeue.StateLive, "")
+
+		r, _ := scqRun(t, f, "q4", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+		resp := f.rebase(r)
+		if resp.MergeCandidateVerifyState != mergeCandidateStateHeld || resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v, want held, not triggered",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered)
+		}
+		if trig := f.triggers(r); len(trig) != 0 {
+			t.Fatalf("triggers = %+v, want none at C (a hold is not a started pass)", trig)
+		}
+		if e := f.requireState(r, mergequeue.StateHeld, ""); e.AnchoredHeadSHA != scC {
+			t.Fatalf("held entry anchored at %q, want %s", e.AnchoredHeadSHA, scC)
+		}
+		if st := f.stageState(r.impl.ID); st != run.StageStateSucceeded {
+			t.Fatalf("implement = %s, want succeeded (not re-opened while held)", st)
+		}
+	})
+
+	t.Run("(5) parent, fan-in only, no rebase: unverified fan_in, gate refuses, direct route starts the pass", func(t *testing.T) {
+		ctx := context.Background()
+		f := newMCQFixture(t)
+		r, _ := scqRun(t, f, "q5", scF, func(r *mcqRun) {
+			f.mqeAppend(r, auditcomplete.CategoryIntegrationCommitRecorded, map[string]any{"merge_sha": scF})
+			scqPassAt(f, r, scF, mergeCandidateCauseFanIn, mergeCandidateResultPassed)
+			f.mqeAppend(r, CategoryAcceptanceOutcomeRecorded, map[string]any{"head_sha": scF, "verdict": acceptanceVerdictPassed})
+		})
+		if n := len(f.rows(r, CategoryBranchRebased)); n != 0 {
+			t.Fatalf("fixture: branch_rebased rows = %d before the verb, want 0 (no rebase producer)", n)
+		}
+		if st := scqState(t, f, r); st.State != mergeCandidateStateUnverified || st.Cause != mergeCandidateCauseFanIn {
+			t.Fatalf("state at C = %+v, want unverified fan_in (the pass at F changes nothing)", st)
+		}
+		if res := f.srv.mergeCandidateGate(ctx, f.runRow(r)); res.Code != mergeCodeCandidateUnverified ||
+			res.Details["cause"] != mergeCandidateCauseFanIn || res.Details["head_sha"] != scC {
+			t.Fatalf("gate at C = %+v, want merge_candidate_unverified cause fan_in at %s", res, scC)
+		}
+
+		resp := f.rebase(r)
+		if resp.MergeCandidateVerifyState != mergeCandidateStateInFlight || !resp.MergeCandidateVerifyTriggered {
+			t.Fatalf("rebase at C = state %q triggered=%v note %q, want in_flight triggered (fan_in is not serialized, ADR-092 D1)",
+				resp.MergeCandidateVerifyState, resp.MergeCandidateVerifyTriggered, resp.MergeCandidateVerifyNote)
+		}
+		rebased := f.rows(r, CategoryBranchRebased)
+		if len(rebased) != 1 {
+			t.Fatalf("branch_rebased rows = %d, want only the verb's no-op row", len(rebased))
+		}
+		var noop map[string]any
+		_ = json.Unmarshal(rebased[0].Payload, &noop)
+		if noop["already_up_to_date"] != true {
+			t.Fatalf("branch_rebased payload = %v, want the up-to-date no-op row", noop)
+		}
+		trig := f.triggers(r)
+		if len(trig) != 1 || trig[0].ExpectedHeadSHA != scC || trig[0].Cause != mergeCandidateCauseFanIn {
+			t.Fatalf("triggers = %+v, want one naming expected_head_sha %s cause fan_in", trig, scC)
+		}
+		if es := f.entries(r); len(es) != 0 {
+			t.Fatalf("queue entries = %+v, want none (the direct route)", es)
+		}
+		scqPassAt(f, r, scC, mergeCandidateCauseFanIn, mergeCandidateResultPassed)
+		if st := scqState(t, f, r); st.State != mergeCandidateStatePassed {
+			t.Fatalf("state at C after a passed verdict at C = %+v, want passed", st)
+		}
+		if res := f.srv.mergeCandidateGate(ctx, f.runRow(r)); res.Code != "" || res.HeadSHA != scC {
+			t.Fatalf("gate after a pass at C = %+v, want an admit at %s", res, scC)
+		}
+	})
+
+	t.Run("(6) fishhawk_merge_run at C on an eligible run: 202 with merge intent, no merge dispatched", func(t *testing.T) {
+		f := newMCQFixture(t)
+		merger := &fakeMerger{}
+		f.srv.cfg.GateMerger = merger
+		r, _ := scqRun(t, f, "q6", scM, scqStandalone(f, acceptanceVerdictPassed))
+		f.gh.set(func() { f.gh.reviews[r.pr] = mqeApprovedBy("alice") })
+		w := f.mergeRun(r)
+		if w.Code != http.StatusAccepted {
+			t.Fatalf("merge at C = %d, want 202:\n%s", w.Code, w.Body.String())
+		}
+		var resp mergeRunResponse
+		if err := json.Unmarshal(w.Body.Bytes(), &resp); err != nil {
+			t.Fatalf("decode: %v", err)
+		}
+		if !resp.Queued || resp.MergeQueued || resp.AnchoredHeadSHA != scC || resp.IntentSequence == 0 {
+			t.Fatalf("response = %+v, want queued at %s with an intent sequence", resp, scC)
+		}
+		f.srv.bgMergeQueuePump.Wait()
+		if got := f.intentAt(r); len(got) != 1 || !got[0] {
+			t.Fatalf("entries merge_intent_at set = %v, want one entry with intent", got)
+		}
+		if merger.called != 0 {
+			t.Fatalf("merger called %d times, want 0 (no merge dispatched before a pass at C)", merger.called)
+		}
+		if n := len(f.rows(r, CategoryMergeVerdictRecorded)); n != 0 {
+			t.Fatalf("merge_verdict_recorded rows = %d, want 0 on the queued path", n)
+		}
+	})
 }
