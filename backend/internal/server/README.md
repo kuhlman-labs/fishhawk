@@ -132,6 +132,7 @@ This README is an INDEX (split 2026-10-29). Each section below lives, verbatim, 
 - Fix-up concern delivery: route-time fit + id pairing (#4284)
 - Fix-up delivered-nothing refund — one chokepoint (#3085)
 - Fix-up delivered-nothing round closure (#3395)
+- Fix-up trigger ordering: append-then-reopen (#4815)
 - Fix-up re-review backstop (#1932)
 - Default-branch resolution (`default_branch.go`, #4660)
 - Slice-ownership guard on mid-stage scope amendments (`slice_ownership.go`, E89.40 / [#4679](https://github.com/kuhlman-labs/fishhawk/issues/4679)) — kept in THIS file, below, until it moves to `docs/dispatch.md`

@@ -1027,6 +1027,29 @@ func TestRouteMergeCandidateFailure_BudgetSpentRefuses(t *testing.T) {
 	}
 }
 
+// TestRouteMergeCandidateFailure_TriggerAppendFails_NotRouted (#4815): the D6
+// route's trigger append failing reports routed=false with a refusal naming
+// the cause, and the implement stage stays at its gate.
+func TestRouteMergeCandidateFailure_TriggerAppendFails_NotRouted(t *testing.T) {
+	f := newMCVFixture(t, mcvDelegatedV0SpecYAML)
+	trigger := recordFailedPass(t, f)
+	f.au.appendErrCategory = CategoryStageFixupTriggered
+
+	routed, refusal := f.s.routeMergeCandidateFailure(context.Background(), f.runRow(t), f.impl.ID, trigger)
+	if routed {
+		t.Fatal("routed = true, want false when the trigger cannot be recorded")
+	}
+	if !strings.Contains(refusal, "stage_fixup_triggered audit entry could not be recorded") || !strings.Contains(refusal, "fishhawk_fixup_stage") {
+		t.Errorf("refusal %q does not name the cause and the route", refusal)
+	}
+	if f.impl.State != run.StageStateAwaitingApproval {
+		t.Errorf("implement state = %q, want untouched", f.impl.State)
+	}
+	if n := len(auditEntries(f.au, CategoryStageFixupTriggered)); n != 0 {
+		t.Errorf("stage_fixup_triggered rows = %d, want 0", n)
+	}
+}
+
 func TestRouteMergeCandidateFailure_FailClosedArms(t *testing.T) {
 	ctx := context.Background()
 	t.Run("no trigger", func(t *testing.T) {
