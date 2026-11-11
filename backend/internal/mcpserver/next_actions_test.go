@@ -7838,6 +7838,33 @@ func TestFoldMergeQueueOrphanedClaim(t *testing.T) {
 			}
 		})
 	}
+	t.Run("orphaned on a merging entry names the resume's release", func(t *testing.T) {
+		// ADR-109 A2 (#4862): the restart resume releases a merging entry's
+		// orphan before the fold, so the reason never says the claim holds
+		// the head, even with the approval-wait anchor set. CF: drop the
+		// q.Phase key → the approval-needed reason, RED.
+		run := naOrphanRun("orphaned", true)
+		run.MergeCandidateQueue.Phase = "merging"
+		na := &NextActions{Actions: []SuggestedAction{mergeRunAction(run)}}
+		foldMergeQueueOrphanedClaim(run, na)
+		if got := actionNames(na); !reflect.DeepEqual(got, []string{"fishhawk_merge_run", "fishhawk_get_merge_queue"}) {
+			t.Fatalf("actions = %v, want fishhawk_get_merge_queue appended once", got)
+		}
+		a := na.Actions[1]
+		if !reflect.DeepEqual(a.Params, map[string]string{"repo": "x/y", "base_ref": "main"}) || a.Consumes != consumesNone {
+			t.Errorf("fishhawk_get_merge_queue = %+v, want params {repo, base_ref} and consumes none", a)
+		}
+		for _, s := range []string{"ADR-109 A2", "the next restart resume releases it", "before the forge-approval fold"} {
+			if !strings.Contains(a.Reason, s) {
+				t.Errorf("reason = %q, want it to say %q", a.Reason, s)
+			}
+		}
+		for _, s := range []string{"holds the head", "nothing to do"} {
+			if strings.Contains(strings.ToLower(a.Reason), s) {
+				t.Errorf("reason = %q, must not say %q on a merging entry", a.Reason, s)
+			}
+		}
+	})
 	t.Run("no-ops", func(t *testing.T) {
 		terminal := naOrphanRun("orphaned_by_restart", false)
 		terminal.State = "succeeded"

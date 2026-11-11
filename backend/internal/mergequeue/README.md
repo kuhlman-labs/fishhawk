@@ -549,8 +549,10 @@ change nothing (ADR-093 slice 2, rejection item 1):
   outcome leaves a `dispatched` claim no live process owns. The server's
   restart resume (`backend/internal/server/README.md` § "Merge-queue
   durability (ADR-093 D8)") reconciles it with ONE forge re-read under the
-  run's merge-intent lock, and itself adds NO ledger transition and
-  dispatches NO merge (ADR-109); A1's release happens in merge-on-pass:
+  run's merge-intent lock and dispatches NO merge (ADR-109); its only claim
+  writes are the `orphaned_by_restart` transition and, since A2 (#4862), the
+  release of an open-PR orphan below (merge-on-pass step 8 keeps A1's
+  release as the backstop):
   - Only a `queue`-path claim is ever reconciled or released. An `inline` or
     `delegated` claim stays `dispatched` while the forge's auto-merge is
     armed, which is normal, as is a GitLab claim: neither the resume nor
@@ -568,22 +570,24 @@ change nothing (ADR-093 slice 2, rejection item 1):
   - Merged at the claimed head → the normal merged reconcile and tail.
     Closed unmerged → the EXISTING `MarkMergeDispatchFailed(run,
     "orphaned_by_restart")` and the entry settles closed.
-  - Not merged, PR OPEN (A1) → the resume records `merge_queue_resumed`
-    `{redecide, orphaned_claim_open}` and returns the entry to `passed` with
-    no ledger write. Ordinary merge-on-pass then re-runs steps 1-7 under the
-    lock (entry, PR, head, base, the ADR-112 forge-approval fold, the R4
-    `merge_queue_authorized` row, the verdict) and, in step 8's not-claimed
-    branch ONLY, releases the claim: a strict `merge_dispatch_settled`
+  - Not merged, PR OPEN (A2, #4862) → the resume records `merge_queue_resumed`
+    `{redecide, orphaned_claim_open}`, then RELEASES the claim through the
+    server's one release body: a strict `merge_dispatch_settled`
     `{released, released_orphaned_claim}` row FIRST, then
-    `ReleaseMergeDispatch` (the CAS DELETE on `state = 'dispatched'`), then a
-    fresh `ClaimMergeDispatch` and the ordinary pinned merge (at most one
-    extra pinned merge call per restart; no bespoke retry). A failed row or
-    release holds `orphaned_claim_release_failed` with the claim standing.
-    The release is CONDITIONAL on that decision's fold approving: while the
-    fold is not approved the decision waits at step 6b (`await_approval`),
-    the PR still needs a qualifying approval, and the orphaned claim keeps
-    holding the head of the line until it arrives or the operator acts; the
-    ADR-109 pre-yield refusal still never yields a claimed entry.
+    `ReleaseMergeDispatch` (the CAS DELETE on `state = 'dispatched'`), then
+    returns the entry to `passed`. Ordinary merge-on-pass then decides with no
+    claim standing: the ADR-112 forge-approval fold, waits and yields act as
+    on any other entry, and a merge is the ordinary `ClaimMergeDispatch` and
+    pinned merge (no bespoke retry). A failed row holds `resume_unrecorded`
+    with the claim standing; a failed DELETE holds
+    `orphaned_claim_release_failed` after the row, and the next resume
+    re-judges the claim. Merge-on-pass step 8's not-claimed branch keeps the
+    same release (A1) as the BACKSTOP for an orphan stranded on a non-merging
+    entry before A2 (and step 1's in-lock acceptance of a merging entry after
+    a stale pre-lock read): that release is CONDITIONAL on the decision's
+    fold approving, so such an orphan holds the head until a qualifying
+    approval arrives or the operator acts; the ADR-109 pre-yield refusal
+    still never yields a claimed entry.
   - Not merged, PR read INDETERMINATE (a failed read) → the EXISTING
     `MarkMergeDispatchFailed(run, "orphaned_by_restart")` (its
     `merge_dispatch_settled` row carries reason `orphaned_by_restart`), then
@@ -592,8 +596,9 @@ change nothing (ADR-093 slice 2, rejection item 1):
     pump re-decides. An entry in phase `settling` (the forge accepted) is
     never orphaned: PR open or an indeterminate read holds
     `settling_unconfirmed` with no ledger write.
-  - What A1 changed and what stays operator-only: the open-PR release above
-    is the ONE automatic release of a `dispatched` claim. A `dispatch_failed`
+  - What A1/A2 changed and what stays operator-only: the open-PR release
+    above (the resume's, with step 8's as backstop, sharing one body) is the
+    ONE automatic release of a `dispatched` claim. A `dispatch_failed`
     claim (an uncertain outcome, or `orphaned_by_restart`, including those
     left before A1) is NEVER released automatically: only reconciliation or
     the operator re-arm clears it. Nothing is retried in a loop; the
