@@ -4,10 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
+	"net"
 	"net/url"
 	"os"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -64,6 +67,10 @@ type fakeFataler struct {
 	fatalfCalled bool
 	lastFormat   string
 	lastArgs     []any
+	// logs holds every Logf line, formatted. Logf is non-terminal, so it sets
+	// neither skipfCalled nor fatalfCalled: a test can tell a log from a
+	// terminal call.
+	logs []string
 }
 
 func (f *fakeFataler) Helper() {}
@@ -74,6 +81,9 @@ func (f *fakeFataler) Skipf(format string, args ...any) {
 func (f *fakeFataler) Fatalf(format string, args ...any) {
 	f.fatalfCalled = true
 	f.lastFormat, f.lastArgs = format, args
+}
+func (f *fakeFataler) Logf(format string, args ...any) {
+	f.logs = append(f.logs, fmt.Sprintf(format, args...))
 }
 func (f *fakeFataler) message() string {
 	return fmt.Sprintf(f.lastFormat, f.lastArgs...)
@@ -329,6 +339,277 @@ func TestRetryObjectInUse(t *testing.T) {
 	}
 }
 
+// dialErr builds the connect-level shapes (EAGAIN, ECONNREFUSED) the raw-database
+// drop must retry (#5170): a unix-socket dial that fails instead of queueing.
+func dialErr(errno syscall.Errno) error {
+	return fmt.Errorf("failed to connect: %w", &net.OpError{Op: "dial", Net: "unix", Err: os.NewSyscallError("connect", errno)})
+}
+
+// testDropPolicy keeps every unit test fast and free of wall-clock assertions:
+// a 1ms delay, a generous per-attempt slice and a cap high enough that only a
+// test that WANTS the cap reaches it.
+func testDropPolicy() rawDropPolicy {
+	return rawDropPolicy{delay: time.Millisecond, attemptTimeout: time.Minute, maxConnectFailures: 1000}
+}
+
+// runawayGuard is how a test turns a mutated, never-ending retry loop into a
+// RED assertion instead of a hang, with no wall clock involved: past n calls the
+// context is cancelled, which ends dropRawDB's loop.
+const runawayGuard = 50
+
+// TestIsRetryableRawDropErr: the classifier table. A transient refusal and every
+// non-PgError failure (the connect-level class) retries; any other SQLSTATE is a
+// definitive answer and does not.
+func TestIsRetryableRawDropErr(t *testing.T) {
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"53300 wrapped", fmt.Errorf("connect: %w", &pgconn.PgError{Code: "53300"}), true},
+		{"57P03 wrapped", fmt.Errorf("connect: %w", &pgconn.PgError{Code: "57P03"}), true},
+		{"55006 wrapped", fmt.Errorf("connect: %w", &pgconn.PgError{Code: "55006"}), true},
+		{"42501 bare", &pgconn.PgError{Code: "42501"}, false},
+		{"28P01 wrapped", fmt.Errorf("connect: %w", &pgconn.PgError{Code: "28P01"}), false},
+		{"unix dial EAGAIN", dialErr(syscall.EAGAIN), true},
+		{"unix dial ECONNREFUSED", dialErr(syscall.ECONNREFUSED), true},
+		{"unexpected EOF", io.ErrUnexpectedEOF, true},
+		{"wrapped deadline exceeded", fmt.Errorf("connect: %w", context.DeadlineExceeded), true},
+	}
+	for _, tc := range cases {
+		if got := isRetryableRawDropErr(tc.err); got != tc.want {
+			t.Errorf("%s: isRetryableRawDropErr = %v, want %v", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestDropRawDB_RetriesNonPgErrorFailure is the #5170 counterfactual vehicle:
+// ONE non-PgError dial failure, then success. The pre-fix loop retried only a
+// server refusal, so it stopped after call 1 and leaked the database.
+func TestDropRawDB_RetriesNonPgErrorFailure(t *testing.T) {
+	calls := 0
+	err := dropRawDB(context.Background(), testDropPolicy(), func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return dialErr(syscall.EAGAIN)
+		}
+		return nil
+	})
+	if err != nil || calls != 2 {
+		t.Errorf("one dial EAGAIN then success: err=%v calls=%d, want nil after exactly 2 calls", err, calls)
+	}
+}
+
+// TestDropRawDB_TransientPgRefusalStillRetried: the 53300 class keeps retrying.
+func TestDropRawDB_TransientPgRefusalStillRetried(t *testing.T) {
+	calls := 0
+	err := dropRawDB(context.Background(), testDropPolicy(), func(context.Context) error {
+		calls++
+		if calls == 1 {
+			return fmt.Errorf("connect: %w", &pgconn.PgError{Code: "53300"})
+		}
+		return nil
+	})
+	if err != nil || calls != 2 {
+		t.Errorf("one 53300 then success: err=%v calls=%d, want nil after exactly 2 calls", err, calls)
+	}
+}
+
+// TestDropRawDB_StopsOnNonTransientPgError: a definitive SQLSTATE ends the loop
+// at once and is returned, wrapped and still reachable through errors.As, with a
+// message that says it was NOT a budget exit.
+func TestDropRawDB_StopsOnNonTransientPgError(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	err := dropRawDB(ctx, testDropPolicy(), func(context.Context) error {
+		calls++
+		if calls >= runawayGuard {
+			cancel()
+		}
+		return &pgconn.PgError{Code: "42501"}
+	})
+	if calls != 1 {
+		t.Errorf("42501: calls=%d, want exactly 1 (a definitive answer is not retried)", calls)
+	}
+	var pg *pgconn.PgError
+	if !errors.As(err, &pg) || pg.Code != "42501" {
+		t.Fatalf("err=%v, want it to wrap the 42501 PgError", err)
+	}
+	if !strings.Contains(err.Error(), "non-retryable") || strings.Contains(err.Error(), "budget") {
+		t.Errorf("err=%q, want the non-retryable wording and no budget clause", err)
+	}
+}
+
+// TestDropRawDB_AttemptTimeoutIsRetried (approval condition 1): each attempt runs
+// under its OWN deadline. Attempt 1 blocks until that per-attempt deadline fires
+// while the overall context is still live; the loop retries and attempt 2
+// succeeds. The overall context has no deadline here, so nothing in this test
+// depends on wall-clock scheduling: attempt 1 simply waits for its own ctx.
+func TestDropRawDB_AttemptTimeoutIsRetried(t *testing.T) {
+	overall, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := testDropPolicy()
+	p.attemptTimeout = 20 * time.Millisecond
+	calls := 0
+	var firstErr error
+	err := dropRawDB(overall, p, func(ctx context.Context) error {
+		calls++
+		if calls != 1 {
+			return nil
+		}
+		if _, ok := ctx.Deadline(); !ok {
+			// The per-attempt deadline is missing: fail without blocking.
+			t.Errorf("attempt 1 context has no deadline; want a per-attempt context.WithTimeout")
+			return nil
+		}
+		<-ctx.Done()
+		firstErr = ctx.Err()
+		return fmt.Errorf("connect: %w", ctx.Err())
+	})
+	if err != nil || calls != 2 {
+		t.Errorf("stalled attempt then success: err=%v calls=%d, want nil after exactly 2 calls", err, calls)
+	}
+	if !errors.Is(firstErr, context.DeadlineExceeded) {
+		t.Errorf("attempt 1 ended with %v, want its own context.DeadlineExceeded", firstErr)
+	}
+	if overall.Err() != nil {
+		t.Errorf("overall context ended (%v); only the attempt's own deadline should have fired", overall.Err())
+	}
+}
+
+// TestDropRawDB_BudgetExpiryReturnsLastError (approval condition 2): the budget
+// ends the retries and the last error is returned, not discarded. Expiry is
+// driven by the attempt itself (it cancels the overall context on call 3), so
+// the call count is exact and nothing depends on wall-clock scheduling.
+func TestDropRawDB_BudgetExpiryReturnsLastError(t *testing.T) {
+	sentinel := errors.New("sentinel connect failure")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	err := dropRawDB(ctx, testDropPolicy(), func(context.Context) error {
+		calls++
+		switch {
+		case calls == 3:
+			cancel() // the budget runs out during this attempt
+		case calls >= runawayGuard:
+			return nil // a mutated loop that ignores the budget ends here, as a RED
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) {
+		t.Fatalf("err=%v, want it to wrap the last attempt's error", err)
+	}
+	if calls != 3 {
+		t.Errorf("calls=%d, want exactly 3 (the attempt that cancelled is the last)", calls)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "3 attempt(s)") || !strings.Contains(msg, "budget exhausted") || strings.Contains(msg, "non-retryable") {
+		t.Errorf("err=%q, want the attempt count and the budget-exhausted wording, not the non-retryable one", msg)
+	}
+}
+
+// TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError: the budget ends BETWEEN
+// attempts, with the loop waiting on its (hour-long) delay timer, and the
+// returned error is still the last REAL attempt error (a transient 53300), not
+// the context error a further attempt on the expired ctx would produce. The
+// attempt honours its ctx like pgx.Connect does. Attempt 1 schedules the cancel
+// from a goroutine, so the loop reaches the wait either side of it, and the
+// delay timer can never fire first: the outcome is the same under any
+// scheduling, with no wall-clock assertion. A mutated loop that retries on the
+// expired ctx gets only context errors back and ends at runawayGuard with nil.
+func TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError(t *testing.T) {
+	lastReal := &pgconn.PgError{Code: "53300", Message: "sorry, too many clients already"}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := testDropPolicy()
+	p.delay = time.Hour
+	calls := 0
+	err := dropRawDB(ctx, p, func(actx context.Context) error {
+		calls++
+		switch {
+		case calls == 1:
+			go cancel() // the budget runs out while the loop is between attempts
+			return fmt.Errorf("connect: %w", lastReal)
+		case calls >= runawayGuard:
+			return nil // a mutated loop that ignores the budget ends here, as a RED
+		}
+		if cerr := actx.Err(); cerr != nil {
+			return fmt.Errorf("connect: %w", cerr)
+		}
+		return nil
+	})
+	if !errors.Is(err, lastReal) {
+		t.Fatalf("err=%v, want it to wrap the last REAL attempt error (53300), not a context error", err)
+	}
+	if calls != 1 {
+		t.Errorf("calls=%d, want exactly 1 (no attempt starts on an expired budget)", calls)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "1 attempt(s)") || !strings.Contains(msg, "budget exhausted") || strings.Contains(msg, "non-retryable") {
+		t.Errorf("err=%q, want the attempt count and the budget-exhausted wording", msg)
+	}
+}
+
+// TestDropRawDB_ConnectFailureCap (approval condition 4): a persistently
+// unreachable server stops at the connect-failure cap, long before the budget
+// (here the overall context never ends on its own), and says so.
+func TestDropRawDB_ConnectFailureCap(t *testing.T) {
+	sentinel := errors.New("sentinel connect failure")
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	p := testDropPolicy()
+	p.maxConnectFailures = 3
+	calls := 0
+	err := dropRawDB(ctx, p, func(context.Context) error {
+		calls++
+		if calls >= runawayGuard {
+			cancel() // a mutated loop with no cap ends here, as a RED
+		}
+		return sentinel
+	})
+	if !errors.Is(err, sentinel) || calls != 3 {
+		t.Fatalf("err=%v calls=%d, want the last error after exactly 3 calls (the cap)", err, calls)
+	}
+	msg := err.Error()
+	if !strings.Contains(msg, "cap of 3") || strings.Contains(msg, "budget") || strings.Contains(msg, "non-retryable") {
+		t.Errorf("err=%q, want the connect-failure-cap wording, distinct from the budget and non-retryable exits", msg)
+	}
+}
+
+// TestRawDropCleanup_LogsAndRecordsFailure: a give-up is logged once through the
+// non-terminal Logf and recorded per name for the parent test's survival
+// message; it is never a Fatalf or Skipf. A successful drop logs and records
+// nothing. Names are uuid-unique, so the shared rawDropFailures map cannot leak
+// a record between sub-cases or from another test.
+func TestRawDropCleanup_LogsAndRecordsFailure(t *testing.T) {
+	failName := "fh_raw_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	f := &fakeFataler{}
+	rawDropCleanup(f, failName, time.Minute, testDropPolicy(), func(context.Context) error {
+		return &pgconn.PgError{Code: "42501"}
+	})()
+	if len(f.logs) != 1 || !strings.Contains(f.logs[0], failName) || !strings.Contains(f.logs[0], "42501") {
+		t.Errorf("logs=%q, want exactly one entry naming %s and 42501", f.logs, failName)
+	}
+	if got := rawDropErr(failName); !strings.Contains(got, "42501") {
+		t.Errorf("rawDropErr(%s)=%q, want the recorded error naming 42501", failName, got)
+	}
+	if f.fatalfCalled || f.skipfCalled {
+		t.Errorf("fatalf=%v skipf=%v, want neither: the drop is best-effort", f.fatalfCalled, f.skipfCalled)
+	}
+
+	okName := "fh_raw_" + strings.ReplaceAll(uuid.NewString(), "-", "")
+	g := &fakeFataler{}
+	rawDropCleanup(g, okName, time.Minute, testDropPolicy(), func(context.Context) error { return nil })()
+	if len(g.logs) != 0 {
+		t.Errorf("success logged %q, want nothing", g.logs)
+	}
+	if got := rawDropErr(okName); got != "no drop error recorded" {
+		t.Errorf("rawDropErr(%s)=%q after a successful drop, want %q", okName, got, "no drop error recorded")
+	}
+}
+
 // TestStartContainer_ExternalURLCreatesFreshRawDB drives the REAL startContainer
 // through FISHHAWK_TEST_PG_URL. Off the gate container it stands the server up
 // itself and connects as a mirror of the role the runner's service hands the
@@ -420,7 +701,7 @@ func TestStartContainer_ExternalURLCreatesFreshRawDB(t *testing.T) {
 			t.Fatalf("probe pg_database: %v", err)
 		}
 		if exists {
-			t.Errorf("raw database %q survived its cleanup", n)
+			t.Errorf("raw database %q survived its cleanup; drop error: %s", n, rawDropErr(n))
 		}
 	}
 }

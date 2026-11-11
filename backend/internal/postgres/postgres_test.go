@@ -18,6 +18,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"testing"
 	"testing/fstest"
 	"time"
@@ -45,6 +46,9 @@ type fataler interface {
 	Helper()
 	Skipf(format string, args ...any)
 	Fatalf(format string, args ...any)
+	// Logf is non-terminal: rawDropCleanup reports a best-effort drop failure
+	// through it without ending the test.
+	Logf(format string, args ...any)
 }
 
 // connStringFunc resolves a started container's connection URL. The run closure
@@ -59,7 +63,7 @@ type connStringFunc func(context.Context) (string, error)
 // Docker isn't reachable so devs without Docker still pass `go test`. Inside
 // the runner's gate container (#2137) there is no daemon, so when the runner
 // provides FISHHAWK_TEST_PG_URL it instead creates a fresh raw database on that
-// server (see rawDBSource). The ~30 existing callers see an unchanged
+// server (see rawDBSource). The ~75 existing callers see an unchanged
 // `func startContainer(t *testing.T) string`.
 func startContainer(t *testing.T) string {
 	t.Helper()
@@ -77,6 +81,16 @@ const (
 
 	rawCreateAttempts = 12
 	rawCreateDelay    = 250 * time.Millisecond
+
+	// The drop budget stays at the pre-#5170 30s (smaller than the create path's
+	// 60s connect budget): ~75 startContainer callers each register a drop, so a
+	// persistently failing server must not add minutes across the suite. Each
+	// attempt gets its own rawDropAttemptTimeout slice of it, and non-PgError
+	// failures are capped at rawDropMaxConnectFailures (12 x rawCreateDelay = 3s
+	// of waiting) well before the budget runs out.
+	rawDropBudget             = 30 * time.Second
+	rawDropAttemptTimeout     = 10 * time.Second
+	rawDropMaxConnectFailures = 12
 )
 
 // rawDBSource routes startContainer (#2137), in pgtest's resolveBase order:
@@ -132,28 +146,159 @@ func createExternalRawDB(f fataler, cleanup func(func()), base string) string {
 		f.Fatalf("create raw database on %s: %v", externalPGURLEnv, err)
 		return ""
 	}
-	cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-		defer cancel()
-		// Best-effort (the per-exec server is discarded anyway), but retried
-		// on a transient refusal: the gate server is shared by every package
-		// in the test loop, so a connect can meet 53300 too_many_connections,
-		// and a single attempt silently leaked the database.
-		drop := func() error {
-			c, err := pgx.Connect(ctx, base)
-			if err != nil {
-				return err
-			}
-			defer func() { _ = c.Close(ctx) }()
-			_, err = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+	// Best-effort (the per-exec server is discarded anyway) but retried across
+	// the wider class isRetryableRawDropErr names — the gate server is shared by
+	// every package in the test loop, so a connect can meet 53300
+	// too_many_connections or a connect-level failure (a unix-socket dial EAGAIN,
+	// ECONNREFUSED, a dial timeout, an EOF), and a single attempt silently leaked
+	// the database. A give-up is logged and recorded, never Fatalf'd.
+	attempt := func(ctx context.Context) error {
+		c, err := pgx.Connect(ctx, base)
+		if err != nil {
 			return err
 		}
-		for err := drop(); isTransientPGRefusal(err) && ctx.Err() == nil; err = drop() {
-			time.Sleep(rawCreateDelay)
-		}
-	})
+		defer func() { _ = c.Close(ctx) }()
+		_, err = c.Exec(ctx, "DROP DATABASE IF EXISTS "+pgx.Identifier{name}.Sanitize()+" WITH (FORCE)")
+		return err
+	}
+	cleanup(rawDropCleanup(f, name, rawDropBudget, rawDropPolicy{
+		delay:              rawCreateDelay,
+		attemptTimeout:     rawDropAttemptTimeout,
+		maxConnectFailures: rawDropMaxConnectFailures,
+	}, attempt))
 	u.Path = "/" + name
 	return u.String()
+}
+
+// rawDropPolicy bounds one raw-database drop: delay is the wait between
+// attempts, attemptTimeout the slice of the overall budget one attempt may use
+// (so a stalled connect or a blocking DROP ... WITH (FORCE) is retried instead
+// of consuming the whole budget), and maxConnectFailures caps the non-PgError
+// failures (a persistently unreachable server) independently of the budget.
+type rawDropPolicy struct {
+	delay              time.Duration
+	attemptTimeout     time.Duration
+	maxConnectFailures int
+}
+
+// isRetryableRawDropErr reports whether a failed raw-database drop is worth
+// another attempt: the transient server refusals (isTransientPGRefusal) and
+// every non-PgError failure — the connect-level class (a unix-socket dial
+// EAGAIN or ECONNREFUSED, a dial or connect timeout, io.ErrUnexpectedEOF, a
+// closed conn). Any OTHER *pgconn.PgError is a definitive server answer (42501
+// insufficient_privilege, 28P01 invalid_password) that no retry changes. Context
+// errors are not special-cased: retries end when the loop's OWN context ends.
+func isRetryableRawDropErr(err error) bool {
+	if err == nil {
+		return false
+	}
+	if isTransientPGRefusal(err) {
+		return true
+	}
+	var pg *pgconn.PgError
+	return !errors.As(err, &pg)
+}
+
+// dropRawDB runs attempt until it succeeds, retrying each retryable failure
+// (isRetryableRawDropErr) after p.delay while ctx lasts. Every attempt gets its
+// own context.WithTimeout(ctx, p.attemptTimeout) — never longer than what is
+// left of ctx — so one stalled attempt cannot consume the whole budget. It
+// returns nil on success; otherwise the final error wrapped with the attempt
+// count and a reason that names which of the three exits fired: a non-retryable
+// error, an exhausted budget, or the connect-failure cap. The wrap uses %w so
+// errors.Is/As still reach the cause; on the budget exit that is the last REAL
+// attempt error, never a context error from an attempt started after expiry. Retries are idempotent: the statement is
+// DROP DATABASE IF EXISTS, so an attempt whose reply was lost after the drop
+// committed is followed by a no-op success.
+func dropRawDB(ctx context.Context, p rawDropPolicy, attempt func(context.Context) error) error {
+	attempts, connectFailures := 0, 0
+	for {
+		actx, cancel := context.WithTimeout(ctx, p.attemptTimeout)
+		err := attempt(actx)
+		cancel()
+		attempts++
+		if err == nil {
+			return nil
+		}
+		if !isRetryableRawDropErr(err) {
+			return fmt.Errorf("drop gave up after %d attempt(s): non-retryable error: %w", attempts, err)
+		}
+		if !isTransientPGRefusal(err) {
+			connectFailures++
+			if connectFailures >= p.maxConnectFailures {
+				return fmt.Errorf("drop gave up after %d attempt(s): %d connect-level failures reached the cap of %d: %w",
+					attempts, connectFailures, p.maxConnectFailures, err)
+			}
+		}
+		t := time.NewTimer(p.delay)
+		select {
+		case <-ctx.Done():
+			t.Stop()
+		case <-t.C:
+		}
+		// The ONE budget check, after the wait so it covers a budget that ended
+		// during the attempt and one that ended during the wait alike: without it
+		// the loop would run one more attempt on the expired ctx, whose connect
+		// error (a context error) would replace err — the real cause, e.g. 53300 —
+		// in the returned message.
+		if ctx.Err() != nil {
+			return fmt.Errorf("drop gave up after %d attempt(s): budget exhausted (%v): %w", attempts, ctx.Err(), err)
+		}
+	}
+}
+
+// rawDropFailures records, per raw database name, the error a give-up left
+// behind. A passing subtest's Logf is discarded in a non-verbose run, so the
+// parent test reads the cause back through rawDropErr when the survival probe
+// finds the database still there.
+var rawDropFailures sync.Map
+
+// rawDropErr returns the recorded drop error for name, or a fixed sentence.
+func rawDropErr(name string) string {
+	if v, ok := rawDropFailures.Load(name); ok {
+		return fmt.Sprint(v)
+	}
+	return "no drop error recorded"
+}
+
+// rawDropCleanup returns the cleanup func createExternalRawDB registers: it
+// runs dropRawDB under a fresh budget-long context. On a give-up it logs the
+// error and records it per name; it NEVER calls Fatalf/Errorf — the drop stays
+// best-effort for the ~75 startContainer callers, and the per-exec server is
+// discarded anyway.
+//
+// Mutation -> RED test, each run by hand and observed RED (#5170; the controls
+// live in _test.go files so runner-executed counterfactuals cannot name them;
+// precedent: the #2815 block further down):
+//   - isRetryableRawDropErr body = isTransientPGRefusal(err)
+//     -> TestDropRawDB_RetriesNonPgErrorFailure, TestIsRetryableRawDropErr,
+//     TestDropRawDB_AttemptTimeoutIsRetried, TestDropRawDB_BudgetExpiryReturnsLastError,
+//     TestDropRawDB_ConnectFailureCap
+//   - isRetryableRawDropErr body = true for every non-nil error
+//     -> TestDropRawDB_StopsOnNonTransientPgError, TestIsRetryableRawDropErr
+//   - f.Logf call deleted from rawDropCleanup -> TestRawDropCleanup_LogsAndRecordsFailure
+//   - rawDropFailures.Store call deleted      -> TestRawDropCleanup_LogsAndRecordsFailure
+//   - dropRawDB's non-retryable exit returns nil (the old silent discard)
+//     -> TestDropRawDB_StopsOnNonTransientPgError, TestRawDropCleanup_LogsAndRecordsFailure
+//   - dropRawDB's budget exit returns nil     -> TestDropRawDB_BudgetExpiryReturnsLastError
+//   - dropRawDB's connect-failure-cap exit returns nil -> TestDropRawDB_ConnectFailureCap
+//   - budget (ctx.Err()) check removed        -> TestDropRawDB_BudgetExpiryReturnsLastError,
+//     TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError
+//     (the check has ONE site, after the wait; a check only before the wait, the
+//     earlier shape, let the wait's ctx.Done() fall through to an attempt on the
+//     dead ctx -> TestDropRawDB_BudgetExpiryDuringWaitReturnsLastError)
+//   - connect-failure cap check removed       -> TestDropRawDB_ConnectFailureCap
+//   - per-attempt context.WithTimeout replaced by a plain cancel context
+//     -> TestDropRawDB_AttemptTimeoutIsRetried
+func rawDropCleanup(f fataler, name string, budget time.Duration, p rawDropPolicy, attempt func(context.Context) error) func() {
+	return func() {
+		ctx, cancel := context.WithTimeout(context.Background(), budget)
+		defer cancel()
+		if err := dropRawDB(ctx, p, attempt); err != nil {
+			f.Logf("best-effort drop of raw database %q failed; the database leaks: %v", name, err)
+			rawDropFailures.Store(name, err)
+		}
+	}
 }
 
 // isTransientPGRefusal reports whether err is a server refusal worth retrying:
@@ -8731,8 +8876,10 @@ func TestMigrateDown_CampaignsRunnerKindReversal(t *testing.T) {
 	}
 }
 
-// TestIsTransientPGRefusal: the raw-database drop retries only a server
-// refusal (also through a connect error's wrap), never another failure.
+// TestIsTransientPGRefusal: isTransientPGRefusal identifies the retryable
+// server refusals (also through a connect error's wrap) and nothing else; the
+// drop's wider retry policy, which adds the connect-level class, is
+// isRetryableRawDropErr (TestIsRetryableRawDropErr).
 func TestIsTransientPGRefusal(t *testing.T) {
 	t.Parallel()
 	for _, code := range []string{"53300", "57P03", "55006"} {
