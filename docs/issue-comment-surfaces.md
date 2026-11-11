@@ -1491,19 +1491,22 @@ Notes:
   status comment through `activityCategories` + `renderActivityLine` in
   `status_template.go`. Its sole writer is `server/concern_rollup.go`: on a
   decomposed parent's fan-in (every `integrateSlices` pass, immediately before
-  `slices_integrated`) or a child review landing after the child succeeded, it
+  `slices_integrated`), a child review landing after the child succeeded, or
+  the merge-queue eligibility predicate's concern leg (the merge-gate
+  reconcile of the parent's succeeded children), it
   copies the children's OPEN HIGH/MEDIUM concerns into the parent's concern
   ledger and, when at least one copy was inserted, appends ONE row on the
   parent and its implement stage, payload `{site, parent_stage_id, count,
   high, medium, concerns:[{concern_id, rolled_up_from, child_run_id,
   child_stage_id, slice_index, severity, category, reviewer_model,
   reviewer_role, origin_review_sequence}]}` (`site` ∈ `fan_in` |
-  `child_review`; no reviewer note prose). The line is count-only, with no
+  `child_review` | `merge_reconcile`; no reviewer note prose). The line is count-only, with no
   actor, no ids and no @-mention: `Child-slice concerns imported into the
   parent: <count> (<high> high, <medium> medium)`, or the bare phrase on a
   payload without a positive count. A re-run imports nothing and writes no
   row; an append failure leaves the durable copies without a row (ERROR
-  `concern_rolled_up_audit_lost`). Contract:
+  `concern_rolled_up_audit_lost`); a failed late or merge-gate import logs
+  WARN `concern_late_import_failed`. Contract:
   `backend/internal/concern/README.md` § "Child-slice rollup + the outcome
   column".
 - The implement-model resolution audit kind — `model_resolved` (#1013) — is

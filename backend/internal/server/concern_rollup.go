@@ -22,11 +22,14 @@ import (
 // and ids only — never reviewer note prose.
 const CategoryConcernRolledUp = "concern_rolled_up"
 
-// Sites a concern_rolled_up row names: the fan-in (every integrateSlices pass)
-// and a child review that landed after the child succeeded.
+// Sites a concern_rolled_up row names: the fan-in (every integrateSlices pass),
+// a child review that landed after the child succeeded, and the merge-gate
+// reconcile (leg (d) of the merge-queue eligibility predicate re-running the
+// idempotent import for the parent's succeeded children).
 const (
-	concernRollupSiteFanIn       = "fan_in"
-	concernRollupSiteChildReview = "child_review"
+	concernRollupSiteFanIn          = "fan_in"
+	concernRollupSiteChildReview    = "child_review"
+	concernRollupSiteMergeReconcile = "merge_reconcile"
 )
 
 // Stable log keys (approval condition C5).
@@ -34,6 +37,11 @@ const (
 	concernRolledUpAuditLostEvent        = "concern_rolled_up_audit_lost"
 	concernOpenAtMergeStampFailedEvent   = "concern_open_at_merge_stamp_failed"
 	concernRolledUpCopySupersedeFailEvnt = "concern_rolled_up_copy_supersede_failed"
+	// concernLateImportFailedEvent keys every failure of a child-slice import
+	// outside the fan-in: the late child-review hook (best-effort, so the key
+	// is what makes a lost import findable) and the merge-gate reconcile
+	// (which also returns its error).
+	concernLateImportFailedEvent = "concern_late_import_failed"
 )
 
 // ImportSliceConcerns satisfies orchestrator.SliceConcernImporter (E94.1 /
@@ -193,6 +201,20 @@ func (s *Server) appendConcernRolledUp(ctx context.Context, parentRunID, parentS
 	}
 }
 
+// warnConcernLateImportFailed is the ONE WARN every failure of a child-slice
+// import outside the fan-in goes through, under the stable key
+// concern_late_import_failed. extra carries branch-specific attributes.
+func (s *Server) warnConcernLateImportFailed(ctx context.Context, msg, site string, runID uuid.UUID, err error, extra ...slog.Attr) {
+	attrs := []slog.Attr{
+		slog.String("event", concernLateImportFailedEvent),
+		slog.String("site", site),
+		slog.String("run_id", runID.String()),
+		slog.String("error", err.Error()),
+	}
+	attrs = append(attrs, extra...)
+	s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, msg, attrs...)
+}
+
 // importLateSliceConcerns imports the open HIGH/MEDIUM concerns of a
 // decomposition child whose review verdict landed AFTER the child succeeded
 // (advisory implement reviews run detached, so the last slice's verdict
@@ -200,15 +222,19 @@ func (s *Server) appendConcernRolledUp(ctx context.Context, parentRunID, parentS
 // superseded by a stage retry at either read (approval condition C1(a)). It
 // imports only when the run is a decomposition child, the child run is
 // succeeded and the parent is not terminal. Best-effort: every failure
-// WARN-logs; nothing is returned.
+// WARN-logs under the stable key concern_late_import_failed (site child_review)
+// and nothing is returned. A lost import is not final: the merge-queue
+// eligibility predicate's concern leg re-runs the idempotent import
+// (reconcileSliceConcerns), so the copy reaches the parent ledger at the next
+// merge-gate evaluation.
 func (s *Server) importLateSliceConcerns(ctx context.Context, childRunID uuid.UUID) {
 	if s.cfg.RunRepo == nil || s.cfg.ConcernRepo == nil {
 		return
 	}
 	child, err := s.cfg.RunRepo.GetRun(ctx, childRunID)
 	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern rollup: late child review: get run failed",
-			slog.String("run_id", childRunID.String()), slog.String("error", err.Error()))
+		s.warnConcernLateImportFailed(ctx, "concern rollup: concern_late_import_failed: late child review: get run failed",
+			concernRollupSiteChildReview, childRunID, err)
 		return
 	}
 	if child == nil || child.DecomposedFrom == nil || child.State != run.StateSucceeded {
@@ -216,19 +242,62 @@ func (s *Server) importLateSliceConcerns(ctx context.Context, childRunID uuid.UU
 	}
 	parent, err := s.cfg.RunRepo.GetRun(ctx, *child.DecomposedFrom)
 	if err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern rollup: late child review: get parent run failed",
-			slog.String("run_id", childRunID.String()), slog.String("error", err.Error()))
+		s.warnConcernLateImportFailed(ctx, "concern rollup: concern_late_import_failed: late child review: get parent run failed",
+			concernRollupSiteChildReview, childRunID, err)
 		return
 	}
 	if parent == nil || parent.State.IsTerminal() {
 		return
 	}
 	if err := s.importSliceConcerns(ctx, parent.ID, []uuid.UUID{child.ID}, concernRollupSiteChildReview); err != nil {
-		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn, "concern rollup: late child review import failed",
-			slog.String("run_id", childRunID.String()),
-			slog.String("parent_run_id", parent.ID.String()),
-			slog.String("error", err.Error()))
+		s.warnConcernLateImportFailed(ctx, "concern rollup: concern_late_import_failed: late child review import failed",
+			concernRollupSiteChildReview, childRunID, err, slog.String("parent_run_id", parent.ID.String()))
 	}
+}
+
+// reconcileSliceConcerns re-runs the idempotent child-slice import for the
+// parent's SUCCEEDED decomposition children: the merge-gate reconcile that
+// recovers a late import the best-effort hook lost (importLateSliceConcerns
+// only WARN-logs). It is the merge-queue eligibility predicate's one write
+// (mergeQueueConcernLeg runs it before reading the parent ledger), so the
+// copies it inserts are what leg (d) then blocks on.
+//
+// The child set is the fan-in's (succeeded children only), and a terminal
+// parent is skipped (the late hook's rule: a copy on a merged parent would be
+// a false open row). A run with no succeeded child returns before any parent
+// stage read. A nil RunRepo imports nothing. A failure WARN-logs under
+// concern_late_import_failed (site merge_reconcile) and is RETURNED: the leg
+// maps it to undeterminable, which every caller holds on (fail closed). An
+// already-closed child source is not imported and the unique index never
+// re-mints a closed copy, so a repeat pass inserts nothing.
+func (s *Server) reconcileSliceConcerns(ctx context.Context, parent *run.Run) error {
+	if s.cfg.RunRepo == nil {
+		return nil
+	}
+	if parent.State.IsTerminal() {
+		return nil
+	}
+	children, err := s.listAllDecomposedChildren(ctx, parent.ID)
+	if err != nil {
+		s.warnConcernLateImportFailed(ctx, "concern rollup: concern_late_import_failed: merge reconcile: list decomposed children failed",
+			concernRollupSiteMergeReconcile, parent.ID, err)
+		return fmt.Errorf("list decomposed children of %s: %w", parent.ID, err)
+	}
+	var succeeded []uuid.UUID
+	for _, c := range children {
+		if c != nil && c.State == run.StateSucceeded {
+			succeeded = append(succeeded, c.ID)
+		}
+	}
+	if len(succeeded) == 0 {
+		return nil
+	}
+	if err := s.importSliceConcerns(ctx, parent.ID, succeeded, concernRollupSiteMergeReconcile); err != nil {
+		s.warnConcernLateImportFailed(ctx, "concern rollup: concern_late_import_failed: merge reconcile import failed",
+			concernRollupSiteMergeReconcile, parent.ID, err)
+		return err
+	}
+	return nil
 }
 
 // supersedeRolledUpCopies supersedes the parent copies of child concerns a
