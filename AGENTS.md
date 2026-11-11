@@ -42,7 +42,8 @@ scripts/test coverage                   # aggregate coverage
 Use the `verify-gate` skill for preflights and results. **Never start a concurrent
 verify or retry/poll one that refuses** (exit 73): use a focused `scripts/test
 single` instead. Scoped verify skips patch coverage; final verification must be
-full. A host-toolchain mismatch is an environment failure: use the pinned tools
+full. Inside a Fishhawk run (`FISHHAWK_RUN_ID` set), the runner's committed-tree
+gate is that full pass: run focused tests and a scoped verify only. A host-toolchain mismatch is an environment failure: use the pinned tools
 or the gate image, not code changes. Diagnose unexplained failures before
 changing unrelated code; report all failing modules and any skipped checks.
 The [verification guide](docs/agents/verification.md) routes the gate contracts.
