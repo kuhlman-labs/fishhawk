@@ -4339,6 +4339,15 @@ func withFakeGitOps(t *testing.T, fp *fakePusher, fpr *fakePROpener) {
 	origRunBranch := checkoutRunBranch
 	origDirty, origClean, origResPres := dirtyPaths, cleanDriftPaths, restoreHeadPreserving
 	origApply, origReset, origGate := applyFixupPatch, resetFixupWorktree, fixupVerifyGate
+	origKillPin := agentKillCheckpointPin
+	// Stub the #5147 agent-kill checkpoint to a no-op skip so a fake-pusher
+	// run() test — repoDir defaults to "." (the runner's own source repo) —
+	// never writes refs/fishhawk/checkpoints/* into the real repository. Tests
+	// that assert the wiring swap in a recording spy AFTER this.
+	agentKillCheckpointPin = func(_ context.Context, _, _, _, _ string) (agentKillPin, bool, error) {
+		return agentKillPin{}, false, errAgentKillSkip{reason: "test_default_noop"}
+	}
+	t.Cleanup(func() { agentKillCheckpointPin = origKillPin })
 	newPusher = func() pusher { return fp }
 	newPROpener = func(token string) prOpener {
 		fpr.gotToken = token

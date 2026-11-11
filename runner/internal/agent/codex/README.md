@@ -26,7 +26,7 @@ The prompt travels as the trailing `codex exec … <prompt>` positional argv str
 
 ## Kill robustness
 
-Unlike claudecode's direct-child `cmd.Process.Kill()`, the codex adapter sets `SysProcAttr{Setpgid:true}` and kills the whole process GROUP (`syscall.Kill(-pid, SIGKILL)`) on budget/timeout — Codex spawns grandchildren (shell exec, MCP servers) that inherit the stdout pipe, so a direct-child kill could hang the `io.Discard` drain + `Wait`; `cmd.Cancel` is overridden to the group kill for the timeout path.
+Like claudecode (#5147), the codex adapter sets `SysProcAttr{Setpgid:true}` and kills the whole process GROUP (`syscall.Kill(-pid, SIGKILL)`) on budget/timeout — Codex spawns grandchildren (shell exec, MCP servers) that inherit the stdout pipe, so a direct-child kill could hang the `io.Discard` drain + `Wait`; `cmd.Cancel` is overridden to the group kill for the timeout path.
 
 ## Provider selection
 
