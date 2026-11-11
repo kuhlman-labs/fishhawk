@@ -1,0 +1,14 @@
+id: scenario:issue-4874/rebased-parent-head-and-branch
+statement: For a decomposed parent with no reported-head row, the acceptance prompt names the rebased merge commit as acceptance_expected_head_sha and the consolidated branch as acceptance_run_branch.
+verify_hint: 'POST /v0/dev/fixtures {"scenario":"acceptance-rebased-head"}, then GET /v0/stages/{stage_id}/prompt for run rebased-parent''s acceptance stage: acceptance_expected_head_sha is the seeded merge SHA and acceptance_run_branch equals `fishhawk/run-<first 8 characters of the seeded run id>-consolidated` (the orchestrator.ConsolidatedBranch derivation). acceptance_pull_request_number is deliberately absent: the fixture run carries no PR URL.'
+steps: '1) POST /v0/dev/fixtures {"scenario":"acceptance-rebased-head"} -> rebased-parent 4d1cfda4-590c-41c7-9f1b-f929e7768e35, acceptance stage c98eb536-6eec-4310-bf90-53fc00393f6b. 2) GET /v0/runs/{run}/audit: integration_commit_recorded merge_sha 4444...(40), then branch_rebased prior 4444... new/merge 5555...(40), clean_verified true, then acceptance_dispatched; no reported-head row. 3) POST /v0/runs/{run}/signing-key {}. 4) POST /v0/dev/sign over ''prompt:<stage_id>''. 5) GET /v0/stages/{stage}/prompt with X-Fishhawk-Signature.'
+assertions:
+    expected: Expected head 5555... (the seeded merge); branch fishhawk/run-4d1cfda4-consolidated; no PR number.
+    observed_at_record: 200; acceptance_expected_head_sha=5555555555555555555555555555555555555555; acceptance_run_branch=fishhawk/run-4d1cfda4-consolidated; acceptance_pull_request_number absent.
+    repro_handle: GET /v0/stages/<rp-acceptance id>/prompt signed over 'prompt:<id>'
+origin:
+    issue: 4874
+    pr: 0
+    run_id: b17a1356-268d-4e98-8bf7-68e413ba7018
+    head_sha: ce361c0905f240c36b7ce26a24cd75d541a232e2
+    recorded_at: 2026-11-11T07:41:24Z
