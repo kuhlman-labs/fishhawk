@@ -401,7 +401,8 @@ deadline): `backend/internal/mergequeue/README.md`.
   answers `already_merged`, never 409) and append `merge_queue_merged`; a
   failed append after the forge accepted still settles merged and logs at
   ERROR. `ErrMergeConflict` (409 head mismatch) → re-read: merged → merged,
-  else readvance, no `merge_queue_merged` row. 405 / 422 →
+  else readvance, no `merge_queue_merged` row (after the in-lock return to
+  `passed` below). 405 / 422 →
   re-read: merged → merged, else ONE fresh review snapshot (no permission
   reads): reviewDecision `REVIEW_REQUIRED` / `CHANGES_REQUESTED` or
   mergeStateStatus `BLOCKED` → YIELD `forge_review_required` (ADR-112 R3 row
@@ -421,7 +422,21 @@ deadline): `backend/internal/mergequeue/README.md`.
   head (`mergeDispatchClaimNamesHead`: an inline or delegated claim recorded
   at head `unresolved`, an empty gate head, names ANY merged head, #4617),
   else holds `merged_claim_head_mismatch` (an unreadable claim holds
-  `merged_claim_unread`, #4748 M1). A `dispatch_failed` claim it reconciles
+  `merged_claim_unread`, #4748 M1). **Released claim → `passed`
+  ([#4876](https://github.com/kuhlman-labs/fishhawk/issues/4876)).** After a
+  RELEASED claim, the 409 readvance and the row-4 `forge_review_required`
+  yield first return the entry from `merging` to `passed` at its epoch,
+  under the lock (`mergeOnPassReleasedToPassed`, `SetPhase(passed)`),
+  because the pump applies both outside the lock with the phase-guarded
+  `UnadmitPassed` / `YieldPassed` (§ "Outcomes the pump applies"). It is the
+  rule ADR-109 A2 applies on the resume path (back to `passed` only once no
+  claim stands), applied at a second site. A missed write holds
+  `entry_changed` naming the lost outcome: the entry stays `merging` with no
+  claim and the next pump's D8 resume returns it to `passed` (`no_claim`,
+  `redecide`), so a persistent `SetPhase(passed)` failure costs at most one
+  refused forge PUT per pump cycle. The ejection settle (`SettleAt` is
+  phase-agnostic) and the uncertain arm (`dispatch_failed`, the claim
+  stands) keep `merging`. A `dispatch_failed` claim it reconciles
   appends ONE `merge_dispatch_settled` `reconciled_merged` row per run
   (`appendReconciledMergedOnce`, deduped on (run, outcome); a re-decide after
   a `SettleAt` CAS conflict appends no second row). A lock never taken → hold; a lapse after fn → WARN, its
@@ -444,20 +459,32 @@ deadline): `backend/internal/mergequeue/README.md`.
   decision's mark while its forge call is in flight. The pre-lock check stays
   `passed`-only: the pump routes a `merging`/`settling` entry to the restart
   resume (§ "Merge-queue durability (ADR-093 D8)"), skipping it while this
-  process's mark is set.
+  process's mark is set. A `passed`, intent-bearing entry is skipped the
+  same way while the mark is set (#4876): after a released claim the
+  decision returns the entry to `passed` under the lock, and the mark,
+  cleared only after the apply, keeps a concurrent same-process pump from
+  claiming or PUTting before this decision's outcome lands.
 - **Outcomes the pump applies.** `merged` → continue; `settle` → `SettleAt`
-  (epoch CAS; a conflict stops the pump); `readvance` → `Unadmit(epoch)`,
-  the only post-Unadmit continue, capped at `mergeQueueMaxReadvancesPerPump`
+  (epoch CAS; a conflict stops the pump); `readvance` → `UnadmitPassed(epoch)`,
+  the only post-readvance continue, capped at `mergeQueueMaxReadvancesPerPump`
   (3); `held` → stop; `await_approval` → `ApprovalWait(epoch, window)`
   OUTSIDE the merge-intent lock: not expired → hold and stop, expired →
-  `Yield` + `merge_queue_yielded` and continue; `yield` → `Yield` +
+  `YieldPassed` + `merge_queue_yielded` and continue; `yield` → `YieldPassed` +
   `merge_queue_yielded` and continue (a yield does not count against the
-  readvance cap); `expired_yielded` → continue (the expired-wait
+  readvance cap). The readvance and both yields are applied outside the lock,
+  so they compare-and-swap on phase `passed` as well as the epoch
+  ([#4876](https://github.com/kuhlman-labs/fishhawk/issues/4876)):
+  `SetPhase(merging)` keeps the epoch, and `merging` is stamped under the
+  lock before every queue claim, so a stale outcome landing after another
+  pump claimed the dispatch is refused (the pump stops) instead of returning
+  a claimed entry to held. An already-merging entry whose stale-read decision
+  returns a readvance or yield is therefore refused too and converges on the
+  next pump's D8 redecide (a one-pump delay). `expired_yielded` → continue (the expired-wait
   enforcement, which runs between the decision and this apply, already
   yielded a readvance or transient hold of an anchored entry under the
   run's merge-intent lock, #4748). Otherwise the pump continues only after a settle, a
   live admission or an admission yield (`stop := res.outcome != admitSettled
-  && res.outcome != admitLive && res.outcome != admitYielded`). Admission-owned writes (`Unadmit`, `SetPhase`, `ReanchorAt`,
+  && res.outcome != admitLive && res.outcome != admitYielded`). Admission-owned writes (`Unadmit`, `UnadmitPassed`, `SetPhase`, `ReanchorAt`,
   `SettleAt`) are compare-and-swaps on the entry's `admission_epoch`, so a
   stale decision changes nothing. A passed verdict pumps the base detached.
 - **Ownership and the three dispatch paths (approval conditions D1/D2).**
@@ -860,15 +887,23 @@ contract (columns, CAS keys, order): `backend/internal/mergequeue/README.md`
   merge-intent lock: the anchor `approval_wait_started_at` is persisted
   once per episode (never reset by a readvance, `Unadmit` or a
   re-admission) and expiry is judged on the database clock. Not expired →
-  the entry holds and the pump stops; expired → `Store.Yield` (one
+  the entry holds and the pump stops; expired → `Store.YieldPassed` (one
   transaction: held, marker stamped, `enqueued_at` and the anchor kept,
-  under the `admission_epoch` CAS) and the pump CONTINUES. Window:
+  under the `admission_epoch` CAS and phase `passed`, #4876: a stale
+  out-of-lock yield never moves an entry another pump stamped `merging`) and
+  the pump CONTINUES. Window:
   `Config.MergeQueueApprovalWait` (zero = 30m), fishhawkd
   `--merge-queue-approval-wait` / `FISHHAWKD_MERGE_QUEUE_APPROVAL_WAIT` (a
   non-positive or unparseable value refuses startup). Row 4 (a typed RELEASE
   refusal whose fresh snapshot reads REVIEW_REQUIRED, CHANGES_REQUESTED or
   BLOCKED; a null reviewDecision is row 5's eject) yields
-  `forge_review_required` with the claim released.
+  `forge_review_required` with the claim released. The 409 readvance and
+  this row-4 yield first return the released entry to `passed` under the
+  lock (§ "Merge-on-pass (ADR-093 D3/D6)", released claim → `passed`), so
+  the pump's out-of-lock `YieldPassed` / `UnadmitPassed` can land. The
+  expired-wait and merge-gate enforcements yield with plain `Store.Yield`
+  inside the lock, after their pre-yield refusal re-read phase `passed`, the
+  in-flight registry and the D1 claim.
 - **Expired-wait enforcement (#4748, `mergeOnPassEnforceExpiredWait`).**
   Once an approval wait is OPEN in this admission epoch
   (`approval_wait_started_at` set AND `approval_wait_open`, docs/adr/112

@@ -20,10 +20,14 @@ package server
 // merge_queue_yielded writer, the pre-yield refusal shared by every
 // enforcement (mergeOnPassPreYieldRefusal) and the expired-wait enforcement
 // (mergeOnPassEnforceExpiredWait, #4748). The pump applies a wait or a yield
-// outside the merge-intent lock (applyMergeOnPassOutcome); only the
-// expired-wait enforcement runs inside the run's merge-intent lock, and there
-// it makes one bounded ApprovalWait judgement plus one Yield, never a held
-// wait. The re-probe that clears a marker is merge_queue_yield_reprobe.go.
+// outside the merge-intent lock (applyMergeOnPassOutcome), and that yield is
+// Store.YieldPassed: it lands only on an entry still in phase passed, so a
+// stale yield never moves an entry a concurrent pump stamped merging and
+// claimed (#4876). Only the expired-wait enforcement runs inside the run's
+// merge-intent lock, and there it makes one bounded ApprovalWait judgement
+// plus one plain Yield (its pre-yield refusal re-read phase passed under the
+// lock), never a held wait. The re-probe that clears a marker is
+// merge_queue_yield_reprobe.go.
 // Contract: backend/internal/server/docs/merge-queue.md and
 // backend/internal/mergequeue/README.md § "Yield".
 
@@ -427,7 +431,7 @@ func (s *Server) mergeOnPassJudgeExpiredWait(ctx context.Context, req mergeOnPas
 // mergeOnPassExpiredYielded, or holds entry_changed when the Yield CAS did
 // not land.
 func (s *Server) mergeOnPassYieldExpiredWait(ctx context.Context, cur mergequeue.Entry, y mergeQueueYield) mergeOnPassOutcome {
-	if !s.yieldMergeQueueEntry(ctx, cur, y, mergeQueueYieldSiteMergeOnPass) {
+	if !s.yieldMergeQueueEntry(ctx, cur, y, mergeQueueYieldSiteMergeOnPass, false) { // in-lock: the pre-yield refusal re-read phase passed
 		return mergeOnPassExpiredWaitHeld(cur, mergeOnPassReasonEntryChanged, "the expired approval wait's yield did not land")
 	}
 	return mergeOnPassOutcome{Kind: mergeOnPassExpiredYielded, Reason: y.Reason, Detail: y.Detail, HeadSHA: cur.AnchoredHeadSHA, Yield: y}
@@ -444,14 +448,23 @@ func mergeOnPassExpiredWaitHeld(e mergequeue.Entry, reason, detail string) merge
 // continues the entry's last cleared episode (mergeQueueYieldContinuation,
 // docs/adr/112 A3.7). It reports
 // whether the entry yielded: a CAS conflict or a failed write leaves it
-// untouched and false. The pump's await and immediate yields call it OUTSIDE
-// the merge-intent lock (ADR-112 R3: the wait is never held inside it); only
-// the expired-wait enforcement (mergeOnPassEnforceExpiredWait) calls it inside
-// the run's merge-intent lock, after one bounded ApprovalWait judgement.
-func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y mergeQueueYield, site string) bool {
+// untouched and false. passedOnly picks Store.YieldPassed, which also
+// requires phase passed (#4876): the pump's await and immediate yields pass
+// true, because they run OUTSIDE the merge-intent lock (ADR-112 R3: the wait
+// is never held inside it) and SetPhase(merging) keeps the epoch, so only the
+// phase can show a concurrent pump's claim. The admission site (an
+// admitted/advancing entry) and the in-lock enforcements
+// (mergeOnPassEnforceExpiredWait, mergeOnPassEnforceGateWait, whose pre-yield
+// refusal re-read phase passed, the in-flight registry and the D1 claim under
+// the lock) pass false.
+func (s *Server) yieldMergeQueueEntry(ctx context.Context, e mergequeue.Entry, y mergeQueueYield, site string, passedOnly bool) bool {
 	m := y.marker()
 	m.Continue = s.mergeQueueYieldContinuation(ctx, e)
-	yielded, err := s.cfg.MergeQueue.Yield(ctx, e.ID, e.AdmissionEpoch, m)
+	cas := s.cfg.MergeQueue.Yield
+	if passedOnly {
+		cas = s.cfg.MergeQueue.YieldPassed // #4876: an out-of-lock merge-on-pass yield moves only a passed entry
+	}
+	yielded, err := cas(ctx, e.ID, e.AdmissionEpoch, m)
 	if err != nil {
 		s.cfg.Logger.LogAttrs(ctx, slog.LevelWarn,
 			"merge queue: the yield did not land; another admission owns the entry or the write failed",
