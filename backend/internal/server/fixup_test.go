@@ -5680,12 +5680,14 @@ func (a *fixupTriggerHookAudit) AppendChained(ctx context.Context, p audit.Chain
 // push_and_open_pr fix-up's review re-park commits and the LATER implement
 // re-open fails (#4815 C2). onFail runs on that failure. getStageFailAfter,
 // when set, makes every GetStage after the failure fail too (the settle's
-// state re-read, #4815 C1 fallback).
+// state re-read, #4815 C1 fallback); getStageNilAfter instead makes it return
+// (nil, nil), a row-less read the Repository contract does not promise away.
 type implementOnlyTransitionFailRepo struct {
 	*approvalRunRepo
 	failID            uuid.UUID
 	onFail            func()
 	getStageFailAfter bool
+	getStageNilAfter  bool
 	failed            bool
 }
 
@@ -5703,6 +5705,9 @@ func (r *implementOnlyTransitionFailRepo) TransitionStage(ctx context.Context, i
 func (r *implementOnlyTransitionFailRepo) GetStage(ctx context.Context, id uuid.UUID) (*run.Stage, error) {
 	if r.getStageFailAfter && r.failed {
 		return nil, errors.New("settle re-read store down")
+	}
+	if r.getStageNilAfter && r.failed {
+		return nil, nil
 	}
 	return r.approvalRunRepo.GetStage(ctx, id)
 }
@@ -5977,6 +5982,30 @@ func TestFixupStage_ReopenFails_SettleReadFails_RecordsPreTriggerState(t *testin
 	}
 }
 
+// TestFixupStage_ReopenFails_SettleReadReturnsNoRow_RecordsPreTriggerState
+// (#4815 C1 fallback, nil-row arm): a re-read returning (nil, nil) takes the
+// same pre-trigger fallback as a read error, naming "no row returned" in
+// source_failure_reason and the WARN.
+func TestFixupStage_ReopenFails_SettleReadReturnsNoRow_RecordsPreTriggerState(t *testing.T) {
+	s, base, au := fixupServer(t)
+	var logBuf bytes.Buffer
+	s.cfg.Logger = slog.New(slog.NewJSONHandler(&logBuf, nil))
+	stage := seedImplementGateStage(base)
+	s.cfg.RunRepo = &implementOnlyTransitionFailRepo{approvalRunRepo: base, failID: stage.ID, getStageNilAfter: true}
+
+	w := postFixup(t, s, stage.ID, fixupRequest{OperatorConcern: "steer", Reason: "r"})
+	if w.Code != http.StatusInternalServerError {
+		t.Fatalf("status = %d, want 500:\n%s", w.Code, w.Body.String())
+	}
+	p := assertSettleRow(t, au, stage.ID, run.StageStateAwaitingApproval)
+	if r, _ := p["source_failure_reason"].(string); !strings.Contains(r, "could not be re-read (no row returned)") || !strings.Contains(r, "pre-trigger state") {
+		t.Errorf("source_failure_reason = %q, want the no-row re-read diagnostic", r)
+	}
+	if !strings.Contains(logBuf.String(), "implement stage re-read failed") || !strings.Contains(logBuf.String(), "no row returned") {
+		t.Errorf("log missing the no-row re-read WARN: %s", logBuf.String())
+	}
+}
+
 // TestFixupStage_ReopenFailsAfterReviewRepark_RecordsActualState (#4815 C2):
 // on push_and_open_pr, run.FixupStage re-parks the review FIRST, so a failure
 // of the LATER implement re-open leaves the review committed at pending and
@@ -6247,7 +6276,9 @@ func tryLockStage(o *orchestrator.Orchestrator, id uuid.UUID, wait time.Duration
 
 // postReopenGetRunRepo probes the stage admission fence on every GetRun made
 // after the implement stage left its gate — the post-re-open steps, Advance's
-// run read among them.
+// run read among them — and once AT the implement re-open (its first
+// TransitionStage), recording whether the call carried the held marker and
+// whether the fence was acquirable there.
 type postReopenGetRunRepo struct {
 	*approvalRunRepo
 	orch    *orchestrator.Orchestrator
@@ -6255,7 +6286,33 @@ type postReopenGetRunRepo struct {
 	mu      sync.Mutex
 	probes  int
 	blocked int
+	// reopenProbed / reopenMarked / reopenAcquired record the re-open probe.
+	reopenProbed, reopenMarked, reopenAcquired bool
 }
+
+func (r *postReopenGetRunRepo) TransitionStage(ctx context.Context, id uuid.UUID, to run.StageState, c *run.StageCompletion) (*run.Stage, error) {
+	r.mu.Lock()
+	first := id == r.stage.ID && !r.reopenProbed
+	r.reopenProbed = r.reopenProbed || id == r.stage.ID
+	r.mu.Unlock()
+	if first {
+		marked := stageAdmissionHeldBy(ctx, id)
+		unlock, ok := tryLockStage(r.orch, id, fenceProbeWait)
+		if ok {
+			unlock()
+		}
+		r.mu.Lock()
+		r.reopenMarked, r.reopenAcquired = marked, ok
+		r.mu.Unlock()
+	}
+	return r.approvalRunRepo.TransitionStage(ctx, id, to, c)
+}
+
+// fenceProbeWait bounds a probe taken INSIDE the fenced section. With the fence
+// held the probe cannot succeed (the holder is the goroutine blocked in the
+// probe), so the wait only costs time; with it absent the lock is free and
+// returns at once.
+const fenceProbeWait = 500 * time.Millisecond
 
 func (r *postReopenGetRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.Run, error) {
 	r.approvalRunRepo.mu.Lock()
@@ -6277,11 +6334,14 @@ func (r *postReopenGetRunRepo) GetRun(ctx context.Context, id uuid.UUID) (*run.R
 }
 
 // TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen (#4815 C7): the
-// pre-flight, append and re-open run under the stage admission fence, and the
-// fence is released before the post-re-open steps (Advance included) and is
-// re-acquirable after the call. MECHANISM (CF): replacing the hold with a
-// no-op lets the trigger land and the stage re-open while the test holds the
-// fence.
+// trigger append and the implement re-open run under the stage admission
+// fence, and the fence is released before the post-re-open steps (Advance
+// included) and is re-acquirable after the call. Each in-section check is
+// taken AT its synchronization point — the trigger append's audit hook and
+// the re-open's TransitionStage — not after a sleep: there the call must carry
+// the held marker and the fence must NOT be acquirable. MECHANISM (CF):
+// replacing the hold with a no-op drops the marker and frees the fence at both
+// points.
 func TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen(t *testing.T) {
 	s, base, au := fixupServer(t)
 	stage := seedImplementGateStage(base)
@@ -6290,36 +6350,35 @@ func TestFixupStageAs_HoldsAdmissionFenceAcrossTriggerAndReopen(t *testing.T) {
 	s.cfg.RunRepo = repo
 	orch.Runs = repo
 	s.cfg.Orchestrator = orch
-
-	unlock := orch.LockStageAdmission(stage.ID)
-	done := make(chan error, 1)
-	go func() {
-		_, _, err := s.fixupStageAs(context.Background(), Identity{Subject: "op", Scopes: []string{"write:fixups"}}, fixupActionParams{
-			StageID:  stage.ID,
-			Options:  run.FixupOptions{MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
-			Selected: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
-		})
-		done <- err
-	}()
-	time.Sleep(150 * time.Millisecond)
-	base.mu.Lock()
-	heldState := stage.State
-	base.mu.Unlock()
-	heldTriggers := len(auditEntries(au, CategoryStageFixupTriggered))
-	unlock()
-	if heldTriggers != 0 || heldState != run.StageStateAwaitingApproval {
-		t.Errorf("while the fence was held: triggers = %d, stage = %q, want 0 and awaiting_approval", heldTriggers, heldState)
-	}
-	select {
-	case err := <-done:
-		if err != nil {
-			t.Fatalf("fixupStageAs: %v", err)
+	var appendProbed, appendMarked, appendAcquired bool
+	s.cfg.AuditRepo = &fixupTriggerHookAudit{auditFake: au, hook: func(ctx context.Context) {
+		appendProbed = true
+		appendMarked = stageAdmissionHeldBy(ctx, stage.ID)
+		unlock, ok := tryLockStage(orch, stage.ID, fenceProbeWait)
+		if ok {
+			unlock()
 		}
-	case <-time.After(5 * time.Second):
-		t.Fatal("fixupStageAs did not complete after the fence was released")
+		appendAcquired = ok
+	}}
+
+	if _, _, err := s.fixupStageAs(context.Background(), Identity{Subject: "op", Scopes: []string{"write:fixups"}}, fixupActionParams{
+		StageID:  stage.ID,
+		Options:  run.FixupOptions{MaxPasses: defaultMaxFixupPasses, HardCeiling: defaultFixupCeiling},
+		Selected: []planreview.Concern{{Severity: planreview.SeverityMedium, Category: "scope", Note: "n"}},
+	}); err != nil {
+		t.Fatalf("fixupStageAs: %v", err)
+	}
+	if !appendProbed || !appendMarked || appendAcquired {
+		t.Errorf("at the trigger append: probed = %v, held marker = %v, fence acquirable = %v; want true, true, false", appendProbed, appendMarked, appendAcquired)
+	}
+	repo.mu.Lock()
+	reopenProbed, reopenMarked, reopenAcquired := repo.reopenProbed, repo.reopenMarked, repo.reopenAcquired
+	repo.mu.Unlock()
+	if !reopenProbed || !reopenMarked || reopenAcquired {
+		t.Errorf("at the implement re-open: probed = %v, held marker = %v, fence acquirable = %v; want true, true, false", reopenProbed, reopenMarked, reopenAcquired)
 	}
 	if n := len(auditEntries(au, CategoryStageFixupTriggered)); n != 1 {
-		t.Errorf("triggers = %d, want 1 after release", n)
+		t.Errorf("triggers = %d, want 1", n)
 	}
 	repo.mu.Lock()
 	probes, blocked := repo.probes, repo.blocked
