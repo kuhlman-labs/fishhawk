@@ -1519,31 +1519,51 @@ func variantMissingCount(err error) int {
 // and response. false means a response is written with no row: a row would consume a
 // newer attempt's trigger, or record a refused claim as landed. Called after a
 // handler's dedup and lineage checks, so replays stay byte-identical.
+//
+// It is decideVariantStageAfterReport with the orchestrator advance fired at once.
 func (s *Server) advanceVariantStageAfterReport(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, respond func()) bool {
+	proceed, advance := s.decideVariantStageAfterReport(w, r, runID, stage, pr, respond)
+	if proceed {
+		advance()
+	}
+	return proceed
+}
+
+// noopVariantAdvance is the advance returned when no edge was won.
+func noopVariantAdvance() {}
+
+// decideVariantStageAfterReport decides and commits the variant edge, with the
+// same refusals and responses as advanceVariantStageAfterReport, but returns the
+// orchestrator advance instead of firing it, so a caller can order work between
+// the committed edge and the advance (#4804). advance is never nil: it is a no-op
+// unless this call won the running → terminal edge, and then it fires the
+// orchestrator for a gateless stage only. proceed is false on every refusal or
+// error, with the response already written.
+func (s *Server) decideVariantStageAfterReport(w http.ResponseWriter, r *http.Request, runID uuid.UUID, stage *run.Stage, pr *pullRequestBody, respond func()) (proceed bool, advance func()) {
 	if stage.Type != run.StageTypeImplement {
-		return true
+		return true, noopVariantAdvance
 	}
 	if stage.State != run.StageStateRunning {
 		settledRefused, missingCount, settledErr := s.variantRefusedOnSettledStage(r.Context(), runID, stage, pr)
 		if settledErr != nil {
 			s.writeSupplementalEdgeError(w, r, settledErr)
-			return false
+			return false, noopVariantAdvance
 		}
 		if settledRefused {
 			s.writeReviewObligationMissing(w, r, runID, stage.ID, pr.Outcome, missingCount)
-			return false
+			return false, noopVariantAdvance
 		}
-		return true
+		return true, noopVariantAdvance
 	}
 	runRow, err := s.cfg.RunRepo.GetRun(r.Context(), runID)
 	if err != nil {
 		s.writeSupplementalEdgeError(w, r, err)
-		return false
+		return false, noopVariantAdvance
 	}
 	isChild := runRow.DecomposedFrom != nil
 	if !s.guardedEdgeAvailable() {
 		s.writeSupplementalEdgeError(w, r, errSupplementalAttemptCASAbsent)
-		return false
+		return false, noopVariantAdvance
 	}
 	attempt := run.StageAttemptToken(stage.DispatchedAt)
 	terminal := implementStageTerminalState(stage)
@@ -1551,22 +1571,21 @@ func (s *Server) advanceVariantStageAfterReport(w http.ResponseWriter, r *http.R
 	var passIncomplete *supplementalPassIncompleteError
 	if errors.As(variantErr, &passIncomplete) {
 		s.writeReviewRoundInterrupted(w, r, runID, stage.ID, "implement")
-		return false
+		return false, noopVariantAdvance
 	}
 	if variantRefused(variantErr) {
 		s.writeReviewObligationMissing(w, r, runID, stage.ID, pr.Outcome, variantMissingCount(variantErr))
-		return false
+		return false, noopVariantAdvance
 	}
 	if supplementalEdgeRefused(variantErr) {
 		respond()
-		return false
+		return false, noopVariantAdvance
 	}
 	if variantErr != nil {
 		s.writeSupplementalEdgeError(w, r, variantErr)
-		return false
+		return false, noopVariantAdvance
 	}
-	s.advanceOrchestratorAfterImplementTerminal(r, runID, stage, terminal)
-	return true
+	return true, func() { s.advanceOrchestratorAfterImplementTerminal(r, runID, stage, terminal) }
 }
 
 // variantRefusedOnSettledStage applies the variant guard's reducer over an outside
@@ -1692,13 +1711,30 @@ type pullRequestFixupPushResponse struct {
 // succeedFixupPushStage handles the fix-up push success variant (#794): a
 // fix-up re-dispatch committed + pushed onto the EXISTING PR branch (no new PR)
 // after the trace gate left the fix-up implement stage in `running`. It drives
-// the running → terminal transition via advanceVariantStageAfterReport (a no-op
+// the running → terminal transition via decideVariantStageAfterReport (a no-op
 // if the stage already advanced — e.g. an older runner that never gated), writes
 // a fixup_pushed audit entry pinning the pushed commit into the chain, fires the
 // sticky status comment, and responds 200. No PR artifact, no pull_request_url
 // backfill — the PR already exists and tracks this branch. The terminal
 // transition is what the advisory implement re-review (fired at trace time)
 // keys off; deferring it here is the #794 fix.
+//
+// Order (#4804): edge → fixup_pushed row → acceptance re-open → orchestrator
+// advance. The edge is decided and committed first, so a refused claim re-opens
+// nothing; only the advance is deferred, for two reasons. (1) With the re-open
+// before the advance, the walk sees the re-opened acceptance as the next pending
+// stage: a local run parks it at awaiting_host_dispatch (no anchor; the
+// host-dispatch marker writes one at the spawn), a github_actions run dispatches
+// it as a first-time acceptance, and, when Orchestrator.Artifacts is wired and
+// the approved plan is empty-criteria or all-skip-with-basis, the walk
+// re-short-circuits it straight to succeeded with a fresh not_validated verdict
+// and opens the review gate, with no park. Advancing first instead walked a
+// later review to awaiting_approval past the still-succeeded acceptance, and the
+// re-open then stranded it pending. (2) With the advance after the fixup_pushed
+// row, a github_actions acceptance_dispatched anchor lands at a higher sequence
+// than the fix-up head, so the re-run verdict binds the new head. A gated
+// implement stage takes no advance, so its re-opened acceptance stays pending
+// behind the gate.
 //
 // It also calls maybeBackstopFixupReReview (#1932) as the SECOND implement
 // re-review dispatch path: when the trace-time hook (#793) never fired for this
@@ -1766,7 +1802,8 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 		return
 	}
 
-	if !s.advanceVariantStageAfterReport(w, r, runID, stage, pr, respondFixupPushed) {
+	proceed, advance := s.decideVariantStageAfterReport(w, r, runID, stage, pr, respondFixupPushed)
+	if !proceed {
 		return
 	}
 
@@ -1810,6 +1847,11 @@ func (s *Server) succeedFixupPushStage(w http.ResponseWriter, r *http.Request, r
 	// re-validates against the final commit rather than merging with stale
 	// evidence. No-op for a pre-acceptance fix-up (guarded inside).
 	s.reopenAcceptanceOnFixupPush(r.Context(), runID, pr.HeadSHA)
+	// #4804: the deferred orchestrator advance fires only AFTER the re-open, so
+	// the walk reaches the re-opened acceptance as the next pending stage instead
+	// of walking a later review past it and stranding it pending. A no-op unless
+	// this report won a gateless edge.
+	advance()
 
 	// #1682 AC3: re-post fishhawk_audit_complete for the NEW head. The local
 	// runner does not round-trip a GitHub `synchronize` webhook, so without
