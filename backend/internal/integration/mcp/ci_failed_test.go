@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"net/http/httptest"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -593,6 +594,281 @@ func TestE2E_CIRecovered_PersistsAcrossRealRepositories(t *testing.T) {
 	}
 	if strings.HasPrefix(na.State, "ci_failed") {
 		t.Fatalf("next_actions.state after recovery = %q, want a non-ci_failed_* arm", na.State)
+	}
+}
+
+// ciCancelledMergeVerbs is the #4706 no-merge invariant's closed set: no
+// action on the ci_cancelled arm may carry one of these.
+var ciCancelledMergeVerbs = map[string]bool{"fishhawk_merge_run": true, "merge_pr": true, "merge_and_file_follow_up": true}
+
+// appendRunAudit appends one chained audit entry for the run through the REAL
+// postgres audit repository (the head ledger and conflict-resolution rows the
+// observer and the MCP classifier read).
+func appendRunAudit(t *testing.T, ctx context.Context, repo audit.Repository, runID uuid.UUID, stageID *uuid.UUID, category string, payload map[string]any) {
+	t.Helper()
+	raw, err := json.Marshal(payload)
+	if err != nil {
+		t.Fatalf("marshal %s payload: %v", category, err)
+	}
+	if _, err := repo.AppendChained(ctx, audit.ChainAppendParams{
+		RunID:     runID,
+		StageID:   stageID,
+		Timestamp: time.Now().UTC(),
+		Category:  category,
+		Payload:   raw,
+	}); err != nil {
+		t.Fatalf("AppendChained %s: %v", category, err)
+	}
+}
+
+// persistedCIParks counts the run's persisted run_auto_advanced ci_failed and
+// ci_cancelled entries, read back through the real audit repository.
+func persistedCIParks(t *testing.T, ctx context.Context, repo audit.Repository, runID uuid.UUID) (ciFailed, ciCancelled int) {
+	t.Helper()
+	entries, err := repo.ListForRunByCategory(ctx, runID, drive.Category)
+	if err != nil {
+		t.Fatalf("ListForRunByCategory: %v", err)
+	}
+	for _, e := range entries {
+		var adv drive.Advance
+		if json.Unmarshal(e.Payload, &adv) != nil {
+			continue
+		}
+		switch adv.Rule {
+		case drive.RuleCIFailed:
+			ciFailed++
+		case drive.RuleCICancelled:
+			ciCancelled++
+		}
+	}
+	return ciFailed, ciCancelled
+}
+
+// ciCancelledStatusView is the slice of ONE fishhawk_get_run_status call the
+// #4706 walks assert on: the drive derived_status, whether the run read carries
+// a review_head_mismatch, and the FINAL next_actions block (after
+// getRunStatus's full post-fold chain).
+type ciCancelledStatusView struct {
+	DerivedStatus string
+	Mismatch      bool
+	NextActions   *nextActionsView
+}
+
+func getCICancelledStatusView(t *testing.T, ctx context.Context, session *mcp.ClientSession, runID uuid.UUID) ciCancelledStatusView {
+	t.Helper()
+	result, err := session.CallTool(ctx, &mcp.CallToolParams{
+		Name:      "fishhawk_get_run_status",
+		Arguments: map[string]any{"run_id": runID.String()},
+	})
+	if err != nil {
+		t.Fatalf("CallTool fishhawk_get_run_status: %v", err)
+	}
+	if result.IsError {
+		t.Fatalf("get_run_status tool returned error: %s", toolContentString(t, result))
+	}
+	var out struct {
+		Run struct {
+			ReviewHeadMismatch json.RawMessage `json:"review_head_mismatch"`
+		} `json:"run"`
+		DriveStatus *struct {
+			DerivedStatus string `json:"derived_status"`
+		} `json:"drive_status"`
+		NextActions *nextActionsView `json:"next_actions"`
+	}
+	decodeStructured(t, result, &out)
+	v := ciCancelledStatusView{NextActions: out.NextActions}
+	if out.DriveStatus != nil {
+		v.DerivedStatus = out.DriveStatus.DerivedStatus
+	}
+	if m := strings.TrimSpace(string(out.Run.ReviewHeadMismatch)); m != "" && m != "null" {
+		v.Mismatch = true
+	}
+	return v
+}
+
+// assertNoMergeVerb fails when any action on the block is a merge verb.
+func assertNoMergeVerb(t *testing.T, na *nextActionsView) {
+	t.Helper()
+	for i, a := range na.Actions {
+		if ciCancelledMergeVerbs[a.Action] {
+			t.Errorf("next_actions.actions[%d] = %s, a merge verb on the ci_cancelled arm (%+v)", i, a.Action, na.Actions)
+		}
+	}
+}
+
+// TestE2E_CICancelled_ObserverToDerivedStatusToNextActions (E1, #4706) crosses
+// the boundaries the per-layer units cannot exercise together: Postgres
+// stage_checks + audit (the head ledger), the drive observer, GET
+// /v0/runs/{id}'s derived_status read model, the MCP Run mirror and
+// getRunStatus's full post-fold chain, through the real fishhawk-mcp binary.
+//
+//   - current_head: the ledger's recorded head is cafebabe and the required
+//     check concluded cancelled AT cafebabe → the observer parks ci_cancelled,
+//     derived_status ci_cancelled, next_actions ci_cancelled leading with
+//     fishhawk_retrigger_ci, and no merge verb anywhere.
+//   - superseded_head: the ledger's recorded head moved to f00dface (a
+//     fix-up push) and the check was cancelled at the OLDER cafebabe → nothing
+//     parks (#3414 unchanged): derived_status empty, no ci_failed or
+//     ci_cancelled persisted.
+//
+// The pre-existing e2e walks above record no head ledger, so the head is
+// undetermined there and their behavior is unchanged.
+func TestE2E_CICancelled_ObserverToDerivedStatusToNextActions(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+
+	const requiredCheck = "ci/required"
+
+	t.Run("current_head", func(t *testing.T) {
+		const prURL = "https://github.com/kuhlman-labs/fishhawk/pull/4706"
+		srv, run, stage, stageCheckRepo, auditRepo := recoverableRun(t, ctx, fx, []string{requiredCheck}, prURL)
+		appendRunAudit(t, ctx, auditRepo, run.ID, nil, "pull_request_opened", map[string]any{"head_sha": "cafebabe"})
+		appendCheckRow(t, ctx, stageCheckRepo, stage.ID, requiredCheck, "completed", "cancelled", "cafebabe", time.Now().UTC())
+		observeTick(t, ctx, srv, fx.runRepo, stage.ID, prURL)
+
+		if f, c := persistedCIParks(t, ctx, auditRepo, run.ID); f != 0 || c != 1 {
+			t.Fatalf("persisted parks = ci_failed %d / ci_cancelled %d, want 0 / 1", f, c)
+		}
+		session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, mountServer(t, srv))
+		v := getCICancelledStatusView(t, ctx, session, run.ID)
+		if v.DerivedStatus != "ci_cancelled" {
+			t.Fatalf("drive_status.derived_status = %q, want ci_cancelled", v.DerivedStatus)
+		}
+		if v.Mismatch {
+			t.Fatal("run.review_head_mismatch present; the walk stages no review round, so it must be absent")
+		}
+		na := v.NextActions
+		if na == nil {
+			t.Fatal("next_actions absent on the ci_cancelled run")
+		}
+		if na.State != "ci_cancelled" {
+			t.Fatalf("next_actions.state = %q, want ci_cancelled (actions %+v)", na.State, na.Actions)
+		}
+		if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_retrigger_ci" {
+			t.Fatalf("next_actions.actions[0] = %+v, want fishhawk_retrigger_ci leading", na.Actions)
+		}
+		if na.Actions[0].Params["run_id"] != run.ID.String() {
+			t.Errorf("fishhawk_retrigger_ci params = %v, want run_id %s", na.Actions[0].Params, run.ID)
+		}
+		assertNoMergeVerb(t, na)
+	})
+
+	t.Run("superseded_head", func(t *testing.T) {
+		const prURL = "https://github.com/kuhlman-labs/fishhawk/pull/4707"
+		srv, run, stage, stageCheckRepo, auditRepo := recoverableRun(t, ctx, fx, []string{requiredCheck}, prURL)
+		appendRunAudit(t, ctx, auditRepo, run.ID, nil, "pull_request_opened", map[string]any{"head_sha": "cafebabe"})
+		appendRunAudit(t, ctx, auditRepo, run.ID, nil, "fixup_pushed", map[string]any{"head_sha": "f00dface"})
+		appendCheckRow(t, ctx, stageCheckRepo, stage.ID, requiredCheck, "completed", "cancelled", "cafebabe", time.Now().UTC())
+		observeTick(t, ctx, srv, fx.runRepo, stage.ID, prURL)
+
+		if f, c := persistedCIParks(t, ctx, auditRepo, run.ID); f != 0 || c != 0 {
+			t.Fatalf("persisted parks = ci_failed %d / ci_cancelled %d, want 0 / 0 (a cancellation at a superseded recorded head never parks)", f, c)
+		}
+		session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, mountServer(t, srv))
+		v := getCICancelledStatusView(t, ctx, session, run.ID)
+		if v.DerivedStatus != "" {
+			t.Fatalf("drive_status.derived_status = %q, want empty on a superseded cancellation", v.DerivedStatus)
+		}
+		if v.NextActions == nil || v.NextActions.State == "" {
+			t.Fatal("next_actions absent or state empty; want a present, routed state")
+		}
+		if strings.HasPrefix(v.NextActions.State, "ci_") {
+			t.Fatalf("next_actions.state = %q, want neither a ci_failed_* nor the ci_cancelled arm", v.NextActions.State)
+		}
+	})
+}
+
+// TestE2E_CICancelled_ConflictSignalKeepsFinalState (E2, #4706) pins the
+// conflict-fold composition on real Postgres through the real MCP binary: the
+// ledger's recorded head is cafebabe, a conflict-resolution entry lands, and
+// THEN the required check is cancelled at cafebabe and the observer stamps
+// ci_cancelled — so the ci_cancelled stamp is LATER than the conflict entry
+// while conflictResolutionSignalIn still reads the conflict entry as Present.
+// The FINAL next_actions state must stay ci_cancelled (never relabeled
+// conflict_resolution_pass_*), fishhawk_retrigger_ci must lead, the signal's
+// conflict action must still be APPENDED, and no merge verb may appear.
+//
+// The pushed subtest deliberately pins the documented #3673 limitation:
+// conflict_resolution_pushed is not a head-report category, so cafebabe stays
+// the current recorded head and the cancellation of it parks ci_cancelled. A
+// later #3673 fix must update that subtest. Mismatch-present is covered at the
+// C1/C2 route surfaces (staging a real review_head_mismatch needs a full review
+// round), so every subtest asserts the mismatch absent.
+func TestE2E_CICancelled_ConflictSignalKeepsFinalState(t *testing.T) {
+	t.Parallel()
+	fx := newFixture(t)
+	ctx, cancel := context.WithTimeout(context.Background(), 120*time.Second)
+	defer cancel()
+
+	const requiredCheck = "ci/required"
+	const refusal = "conflict_resolution_outside_hunk"
+	for i, tc := range []struct {
+		signal   string
+		category string
+		payload  map[string]any
+	}{
+		{"triggered", server.CategoryStageConflictResolutionTriggered, map[string]any{}},
+		{"failed", server.CategoryStageConflictResolutionFailed, map[string]any{"reason": refusal}},
+		{"pushed", server.CategoryConflictResolutionPushed, map[string]any{"head_sha": "deadbeef"}},
+	} {
+		t.Run(tc.signal, func(t *testing.T) {
+			prURL := "https://github.com/kuhlman-labs/fishhawk/pull/" + strconv.Itoa(4710+i)
+			srv, run, stage, stageCheckRepo, auditRepo := recoverableRun(t, ctx, fx, []string{requiredCheck}, prURL)
+			appendRunAudit(t, ctx, auditRepo, run.ID, nil, "pull_request_opened", map[string]any{"head_sha": "cafebabe"})
+			stageID := stage.ID
+			appendRunAudit(t, ctx, auditRepo, run.ID, &stageID, tc.category, tc.payload)
+			appendCheckRow(t, ctx, stageCheckRepo, stage.ID, requiredCheck, "completed", "cancelled", "cafebabe", time.Now().UTC())
+			observeTick(t, ctx, srv, fx.runRepo, stage.ID, prURL)
+
+			session := connectMCPClient(t, ctx, fx.mcpBinary, fx.operatorTok, mountServer(t, srv))
+			v := getCICancelledStatusView(t, ctx, session, run.ID)
+			if v.DerivedStatus != "ci_cancelled" {
+				t.Fatalf("drive_status.derived_status = %q, want ci_cancelled", v.DerivedStatus)
+			}
+			if v.Mismatch {
+				t.Fatal("run.review_head_mismatch present; the walk stages no review round, so it must be absent")
+			}
+			na := v.NextActions
+			if na == nil {
+				t.Fatal("next_actions absent on the ci_cancelled run")
+			}
+			if na.State != "ci_cancelled" {
+				t.Errorf("final next_actions.state = %q, want ci_cancelled (the conflict fold must not relabel it; actions %+v)", na.State, na.Actions)
+			}
+			if len(na.Actions) == 0 || na.Actions[0].Action != "fishhawk_retrigger_ci" {
+				t.Fatalf("next_actions.actions[0] = %+v, want fishhawk_retrigger_ci leading", na.Actions)
+			}
+			assertNoMergeVerb(t, na)
+			conflict := -1
+			for i, a := range na.Actions {
+				if strings.Contains(a.Precondition, "conflict-resolution") {
+					if conflict >= 0 {
+						t.Fatalf("more than one conflict-resolution action: %+v", na.Actions)
+					}
+					conflict = i
+				}
+			}
+			if conflict <= 0 {
+				t.Fatalf("conflict-resolution action at %d, want exactly one appended after the lead retrigger (actions %+v)", conflict, na.Actions)
+			}
+			a := na.Actions[conflict]
+			switch tc.signal {
+			case "triggered":
+				if a.Action != "fishhawk_await_stage" || a.Params["run_id"] != run.ID.String() || a.Params["stage_id"] != stage.ID.String() {
+					t.Errorf("triggered: conflict action = %s %v, want fishhawk_await_stage {run_id, stage_id %s}", a.Action, a.Params, stage.ID)
+				}
+			case "failed":
+				if a.Action != "fishhawk_rebase_run_branch" || a.Params["run_id"] != run.ID.String() || !strings.Contains(a.Reason, refusal) {
+					t.Errorf("failed: conflict action = %s %v reason %q, want fishhawk_rebase_run_branch naming %s", a.Action, a.Params, a.Reason, refusal)
+				}
+			case "pushed":
+				if a.Action != "fishhawk_rebase_run_branch" || a.Params["run_id"] != run.ID.String() || !strings.Contains(a.Reason, "SUCCEEDED") {
+					t.Errorf("pushed: conflict action = %s %v reason %q, want fishhawk_rebase_run_branch naming SUCCEEDED", a.Action, a.Params, a.Reason)
+				}
+			}
+		})
 	}
 }
 

@@ -246,7 +246,9 @@ type runResponse struct {
 	// "awaiting_merge" while a non-terminal drive run with an open PR has
 	// a checks_green_awaiting_merge auto-advance as its latest recorded
 	// transition, or "ci_failed" (#1045) when its negative mirror — a
-	// ci_failed stamp — is the latest. Never a persisted run.State — the state machine in
+	// ci_failed stamp — is the latest, or "ci_cancelled" (#4706) when a
+	// ci_cancelled stamp (a required check cancelled/stale at the run's
+	// current recorded head) is the latest. Never a persisted run.State — the state machine in
 	// run/transition.go is untouched. Populated by handleGetRun ONLY
 	// (distilled from run_auto_advanced audit entries, same single-read
 	// posture as Concerns); omitted everywhere else.
@@ -3271,6 +3273,15 @@ func applyDriveSurfaces(resp *runResponse, runRow *run.Run, entries []*audit.Ent
 	// supersession code.
 	if latest.Rule == drive.RuleCIFailed && runRow.PullRequestURL != nil {
 		resp.DerivedStatus = "ci_failed"
+	}
+	// Detection-only cancellation park (#4706): the latest stamp is
+	// ci_cancelled — a required check concluded cancelled/stale at the
+	// run's CURRENT recorded head — and the PR is open → the derived
+	// ci_cancelled presentation status. Same guard as ci_failed: a later
+	// ci_recovered / checks_green stamp supersedes it with no separate
+	// supersession code.
+	if latest.Rule == drive.RuleCICancelled && runRow.PullRequestURL != nil {
+		resp.DerivedStatus = "ci_cancelled"
 	}
 	// Acceptance-gate presentation statuses (E31.17 / #1568): when the latest
 	// stamp is an acceptance-gate rule and the PR is open, the derived status
