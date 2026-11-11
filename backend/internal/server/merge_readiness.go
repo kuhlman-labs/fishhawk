@@ -56,6 +56,22 @@ type mergeReadinessRefusal struct {
 // changes the head without re-opening acceptance, by design, and a head compare
 // would block merges the server has no verb to clear.
 //
+// A head compare could not have caught #4673 either. The wrong recorded head
+// #4673 reports is the prior episode's corpus commit, an ANCESTOR of the fix-up
+// head and of every later PR head, so an ancestor-or-equal check on head_sha
+// passes it. Every head-moving write Fishhawk makes without re-opening
+// acceptance (the scenario commit, a clean ADR-090 rebase merge, a conflict
+// resolution merge, an operator vouch commit) is a descendant of the verdict
+// head by construction, and the code those add is covered by the ADR-090 /
+// ADR-142 merge-candidate verification. The one write that changes validated
+// code, a fix-up push, invalidates the verdict through the acceptance_reopened
+// record this function reads, but only under reopenAcceptanceOnFixupPush's
+// conditions: it writes nothing when the acceptance stage is not succeeded or
+// has no recorded verdict, and a refused ReopenAcceptanceStage or a failed
+// acceptance_reopened append only WARN-logs. In those cases no record exists and
+// this function admits (known residuals). See docs/acceptance.md § "Verdict
+// head binding".
+//
 // nil (admit) when: the audit repo is unwired; the run has no acceptance stage
 // row; no reopen is scoped to that stage; no outcome is recorded at all (the
 // acceptance gate's pending / outcome-unknown states already refuse that); or
