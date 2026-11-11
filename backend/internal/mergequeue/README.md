@@ -110,10 +110,19 @@ untenanted); a non-UUID account is `ErrInvalidRequest`.
   - Empty base, or a base holding only yielded entries → zero `Admission`
     (`Entry` nil).
 - **`Unadmit(id, epoch)`**: `live` → `held` at its ORIGINAL place
-  (`enqueued_at` kept), phase and `admitted_at` cleared. Callers: the pump's
-  transient admission failure and merge-on-pass's readvance
+  (`enqueued_at` kept), phase and `admitted_at` cleared. Caller: the pump's
+  transient admission failure
   (`backend/internal/server/merge_candidate_queue.go`). Epoch CAS: not live,
   or live at another epoch → `ErrStateConflict`, nothing written.
+- **`UnadmitPassed(id, epoch)`** (#4876): `Unadmit` with one more
+  compare-and-swap condition, phase `passed`. Caller: merge-on-pass's
+  readvance, applied by the pump OUTSIDE the run's merge-intent lock.
+  `SetPhase` keeps the admission epoch, so the epoch check alone cannot see a
+  concurrent pump that stamped `merging` (or `settling`) under the lock and
+  claimed the dispatch; a live entry at `epoch` in any other phase →
+  `ErrStateConflict`, nothing written (`phaseConflict`). Not live, or another
+  epoch → `ErrStateConflict` as `Unadmit` (`TestUnadmitPassed_PhaseGuard`,
+  asserted on read-back).
 - **`SetPhase(id, epoch, phase)`**: `live` at `epoch` only (epoch CAS;
   `ErrStateConflict` otherwise, nothing written); empty phase is
   `ErrInvalidRequest`; an unchanged phase writes nothing.
@@ -312,6 +321,18 @@ Go `time.Now()` is compared against a stored instant.
   the episode's, WHATEVER the head or reason; `Enqueue` marking an unmarked
   held entry applies it after its re-anchor. An already-marked entry keeps
   its own `yielded_at` (`TestYield_ContinuesLastClearedEpisodeOnSameBaseRef`).
+- **`YieldPassed(id, epoch, YieldMarker{Reason, Detail, Row4})`** (#4876):
+  `Yield` with one more compare-and-swap condition, phase `passed`, for the
+  merge-on-pass yields the pump applies OUTSIDE the run's merge-intent lock
+  (the expired `await_approval` and the immediate yield). `SetPhase` keeps the
+  admission epoch, so the epoch check alone cannot see a concurrent pump that
+  stamped `merging` (or `settling`) under the lock and claimed the dispatch;
+  a live entry at `epoch` in any other phase → `ErrStateConflict` and nothing
+  is written (no marker, `yield_revision` unchanged, still live). The marker
+  is validated first (empty reason → `ErrInvalidRequest`); a landed write is
+  `Yield`'s (`TestYieldPassed_PhaseGuard`, asserted on read-back). `Yield`
+  keeps its any-phase contract for the admission-site yield and the in-lock
+  enforcements, which re-read the phase under the lock.
 - **`ClearYield(id, head, revision, clearRow4)`**: the ONLY way back in. Under
   the base lock, a compare-and-swap on `state = 'held' AND yielded_at IS NOT
   NULL AND anchored_head_sha = head AND yield_revision = revision`: clears
@@ -434,11 +455,13 @@ change nothing (ADR-093 slice 2, rejection item 1):
 
 | Write | Guard | Who |
 |---|---|---|
-| `Unadmit` | live AND `admission_epoch = epoch` | admission transient failure, merge-on-pass readvance |
+| `Unadmit` | live AND `admission_epoch = epoch` | admission transient failure |
+| `UnadmitPassed` | live AND epoch AND phase `passed` (#4876) | merge-on-pass readvance, applied outside the merge-intent lock |
 | `SetPhase` | live AND epoch | admission (incl. the D8 `advancing` stamp), verdict hook, transfer re-anchor, merge-on-pass's `merging` / `settling` stamps, the D8 resume |
 | `ReanchorAt` | live AND epoch | admission re-anchor |
 | `SettleAt` | live AND epoch (terminal: no-op) | admission settles, merge-on-pass settle outcomes |
-| `ApprovalWait` / `GateWait` / `Yield` | live AND epoch | merge-on-pass approval and merge-gate waits and yields, admission yields |
+| `ApprovalWait` / `GateWait` / `Yield` | live AND epoch | merge-on-pass approval and merge-gate waits, the in-lock wait enforcements' yields, admission yields |
+| `YieldPassed` | live AND epoch AND phase `passed` (#4876) | merge-on-pass yields applied outside the merge-intent lock (expired `await_approval`, immediate yield) |
 | `ClearYield` / `UpdateYield` / `ReanchorYielded` | held AND marked AND `anchored_head_sha` AND `yield_revision` | the yield re-probe |
 | `Settle` / `Reanchor` | active (unconditional) | EXTERNAL facts only: PR resolved, cancel / re-open release, run terminal, the rebase transfer re-anchor, the merged settle after the forge accepted a queue merge |
 
@@ -640,8 +663,8 @@ first 8 bytes of `sha256("fishhawk:mergequeue:" + account-or-"untenanted" +
   only stay put or be settled by a by-entry mutation; a settled one is treated
   as absent (fresh row), never re-anchored
   (`TestEnqueue_EntrySettledBetweenPeekAndLockGetsFreshRow`).
-- By-entry mutations (`Unadmit`, `SetPhase`, `Reanchor`, `Settle`,
-  `MarkMergeIntent`, `ApprovalWait`, `GateWait`, `Yield`, `ClearYield`, `UpdateYield`,
+- By-entry mutations (`Unadmit`, `UnadmitPassed`, `SetPhase`, `Reanchor`, `Settle`,
+  `MarkMergeIntent`, `ApprovalWait`, `GateWait`, `Yield`, `YieldPassed`, `ClearYield`, `UpdateYield`,
   `ReanchorYielded`): read the entry's base → its base lock → the row
   `FOR UPDATE`. `repo`/`base_ref` never change on a row, so the derived key
   stays correct.
