@@ -1161,25 +1161,28 @@ func (a triggerReadErrAudit) ListForRunByCategory(ctx context.Context, runID uui
 	return a.Repository.ListForRunByCategory(ctx, runID, category)
 }
 
-// TestHostDispatch_UnreadableTriggerRoutesAsImplement: when the trigger
-// cannot be read (a read error, or a malformed / half-populated payload) the
-// prompt endpoint serves NO pass and the runner runs an ordinary implement,
-// so the marker WARN-logs and admits the stage through local-implement:h1 —
-// and, with local-implement:h1 held, QUEUES it there rather than admitting it
-// through the free verify group.
+// TestHostDispatch_UnreadableTriggerRoutesAsImplement: when the trigger is
+// malformed / half-populated the prompt endpoint serves NO pass and the
+// runner runs an ordinary implement, so the marker WARN-logs and admits the
+// stage through local-implement:h1 — and, with local-implement:h1 held,
+// QUEUES it there rather than admitting it through the free verify group. A
+// trigger READ ERROR is refused earlier (#4811): the marker's
+// superseded-pass check fails closed with 500 dependency_check_failed before
+// any routing, leaving the stage untouched and writing no slot or queue row.
 func TestHostDispatch_UnreadableTriggerRoutesAsImplement(t *testing.T) {
 	for _, tc := range []struct {
-		name  string
-		setup func(f *scPG, st *run.Stage)
+		name    string
+		setup   func(f *scPG, st *run.Stage)
+		refused bool
 	}{
 		{"read error", func(f *scPG, st *run.Stage) {
 			f.triggerPass(st, "ffff6666")
 			f.srv.cfg.AuditRepo = triggerReadErrAudit{f.audit}
-		}},
+		}, true},
 		{"half-populated payload", func(f *scPG, st *run.Stage) {
 			tr := mcTrigger("")
 			f.appendStageAudit(st, CategoryStageMergeCandidateVerifyTriggered, tr)
-		}},
+		}, false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			f := newSCPG(t, pgStore)
@@ -1190,6 +1193,19 @@ func TestHostDispatch_UnreadableTriggerRoutesAsImplement(t *testing.T) {
 
 			st := f.impl()
 			tc.setup(f, st)
+			if tc.refused {
+				w := f.mark(st, hostBody("h1"))
+				if code, _ := decodeHostDispatchError(t, w); w.Code != http.StatusInternalServerError || code != "dependency_check_failed" {
+					t.Fatalf("marker %s = %d %q, want 500 dependency_check_failed (#4811):\n%s", st.ID, w.Code, code, w.Body.String())
+				}
+				if got := f.state(st.ID); got != run.StageStateAwaitingHostDispatch {
+					t.Errorf("stage %s reads %s, want untouched awaiting_host_dispatch", st.ID, got)
+				}
+				if row, ok := f.slot(st.ID); ok {
+					t.Errorf("stage %s has a slot/queue row %+v, want none", st.ID, row)
+				}
+				return
+			}
 			d, _, _ := f.queued(st, hostBody("h1"))
 			if d.Group != "local-implement:h1" || !sameStageIDs(holderIDs(d.Holders), holder.ID) {
 				t.Fatalf("details = %+v, want queued in local-implement:h1 behind the implement holder", d)

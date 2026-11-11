@@ -18692,6 +18692,19 @@ paths:
         `stage_concurrency_queued` (once per queue episode) and
         `stage_concurrency_admitted` (every grouped admission).
 
+        **Superseded merge-candidate pass (#4811).** An `implement` stage in
+        the `pending` or `awaiting_host_dispatch` arm whose live verify-only
+        pass (ADR-090) was triggered for a head that a recorded head write
+        sequenced after the trigger has since replaced is not spawned: the
+        pass is settled `not_executed` (pinned to the checked trigger, so a
+        replacement trigger appended since stays live) and the stage is
+        restored to its pre-pass gate, then the call answers 409
+        `dispatch_not_admissible` with `details.reason`
+        `merge_candidate_pass_superseded`. It fires after the state switch
+        and BEFORE the host memory hold and the CAS, so it never takes a
+        slot. A malformed newest trigger reads as no pass and the stage is
+        admitted. The idempotent already-`dispatched` arm is not checked.
+
         **Interim host memory hold (E85.11 / #4330).** Optional and default
         off; INTERIM, absorbed later by ADR-100's adaptive concurrency
         controller. With `fishhawkd serve --enable-ops-monitor
@@ -18812,6 +18825,23 @@ paths:
               `earlier_stage_failed`, `details.failed_stage_id`,
               `details.failed_stage_type` and `details.failure_category`,
               BEFORE the state CAS; retry or cancel the failed stage first.
+              Also the superseded merge-candidate pass refusal (#4811): an
+              `implement` stage in either admissible arm whose live
+              verify-only pass was triggered for a head the run has since
+              moved past is refused with `details.reason`
+              `merge_candidate_pass_superseded`, plus `details.stage_id`,
+              `details.trigger_sequence`, `details.expected_head_sha`,
+              `details.superseding_head_sha`, `details.superseding_category`,
+              `details.superseding_sequence` and `details.settled`. The stage
+              is SETTLED, not left in its state: when `settled` is `true` the
+              pass is recorded `not_executed` and the stage is back at its
+              pre-pass gate, so nothing is left to re-dispatch for that head.
+              When `settled` is `false`, `details.settle_step` names where the
+              settle stopped (`record_failed` leaves the stage and its trigger
+              untouched; `restore_failed` leaves it `failed`), and
+              `details.left_state` names the stage's state on
+              `before_restore_failed` (recover a stage left `running` or
+              `dispatched` with `fishhawk_reap_stage`). Never spawn on it.
             - `dependency_not_satisfied` — the decomposition wave-order guard
               (E48.99 / #2546): this run is a fan-out child (`decomposed_from`
               + `slice_index` set) whose declared dependency slice has not
@@ -18925,8 +18955,11 @@ paths:
             acceptance gate could not list the parent's decomposition children
             or read its `slices_integrated` history (#4080), or the campaign
             dispatch hold (#4234) could not resolve the stage's campaign
-            membership, its campaign, or the hold.
-            Retryable: all five fail closed on a read error rather than
+            membership, its campaign, or the hold, or the superseded
+            merge-candidate pass refusal (#4811) could not list the run's
+            stages or read its merge-candidate chain, including the settle's
+            own trigger read (the stage is untouched and nothing is written).
+            Retryable: all six fail closed on a read error rather than
             admitting out of order, on an unverified base, behind an
             unchecked deploy, or onto an unproven consolidated tree, and
             commit no state. `internal_error` — the state
