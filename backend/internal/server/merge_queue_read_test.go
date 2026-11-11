@@ -1207,7 +1207,9 @@ func mqrReadOrphan(t *testing.T, s *Server, runID uuid.UUID) mqrOrphanSurfaces {
 // clock_timestamp() (one clock domain, #3048). The orphaned note is
 // CONDITIONAL on the approval fold (approval condition 1): with the
 // approval-wait anchor set it names the needed approval and the claim
-// holding the head, never "nothing to do". Counterfactuals: dropping the
+// holding the head, never "nothing to do". On a MERGING entry (ADR-109 A2)
+// the note names the restart resume's release before the fold instead.
+// Counterfactuals: dropping the
 // runs.go helper call → the run-read rows go RED; making the orphaned note
 // clause unconditional → the approval-wait row goes RED.
 func TestMergeQueueRead_DispatchClaimOrphan(t *testing.T) {
@@ -1256,6 +1258,25 @@ func TestMergeQueueRead_DispatchClaimOrphan(t *testing.T) {
 				!strings.Contains(note, "still needs a qualifying forge approval") || !strings.Contains(note, "the claim holds the head until that approval arrives") ||
 				strings.Contains(note, "nothing to do") {
 				t.Errorf("note = %q, want the approval-needed clause and never \"nothing to do\"", note)
+			}
+		}
+	})
+	t.Run("orphaned on a merging entry names the resume's release before the fold", func(t *testing.T) {
+		// ADR-109 A2 (#4862): a MERGING entry's orphan is released by the next
+		// restart resume before the fold, so the note is unconditional on
+		// approval even with the approval-wait anchor set. CF: pass
+		// mergequeue.PhasePassed for e.Phase → the conditional clause, RED.
+		set(`state = 'dispatched', path = 'queue', failed_at = NULL, failure_cause = NULL, claimed_at = ` + mqrAged)
+		phase := f.entry(a).Phase
+		f.exec(`UPDATE merge_candidate_queue_entries SET phase = 'merging', approval_wait_started_at = clock_timestamp() WHERE id = $1`, f.entry(a).ID)
+		defer f.exec(`UPDATE merge_candidate_queue_entries SET phase = $2, approval_wait_started_at = NULL WHERE id = $1`, f.entry(a).ID, string(phase))
+		got := mqrReadOrphan(t, f.srv, a.id)
+		want(t, got, mergeQueueClaimOrphaned)
+		for _, note := range []string{got.runNote, got.gateNote} {
+			if !strings.HasSuffix(note, mergeQueueNoteOrphanedMerging) || !strings.Contains(note, "the next restart resume releases it") ||
+				!strings.Contains(note, "before the forge-approval fold") || strings.Contains(note, "holds the head") ||
+				strings.Contains(note, "nothing to do") {
+				t.Errorf("note = %q, want the merging clause (the resume releases it before the fold) and never \"holds the head\" or \"nothing to do\"", note)
 			}
 		}
 	})

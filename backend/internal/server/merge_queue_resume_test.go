@@ -229,9 +229,10 @@ func TestMergeQueueResume_IndeterminateRead_HeldRemedyNamed(t *testing.T) {
 
 // C2: a queue claim seeded just INSIDE the crash-left window (relative to the
 // database clock) holds with nothing written; the same claim aged past the
-// window, its PR open and unmerged, is handed to merge-on-pass (ADR-109 A1:
-// redecide orphaned_claim_open) with NO resume ledger write. CF: re-add a
-// MarkMergeDispatchFailed on the hand-over arm → RED on the read-back.
+// window, its PR open and unmerged, is RELEASED by the resume (ADR-109 A2:
+// redecide orphaned_claim_open, one merge_dispatch_settled {released,
+// released_orphaned_claim} row, the claim row gone). CF: restore the pre-A2
+// arm with no release call → the claim row still stands, RED.
 func TestMergeQueueResume_YoungQueueClaimHolds(t *testing.T) {
 	w := newMQMWorld(t)
 	a := w.seed("a", "h1", []byte(mcvUndelegatedSpecYAML))
@@ -249,13 +250,11 @@ func TestMergeQueueResume_YoungQueueClaimHolds(t *testing.T) {
 		t.Fatalf("rows written for a young claim: settled=%d resumed=%d", n, len(w.mqrResumed(a)))
 	}
 	w.exec(`UPDATE merge_dispatch_claims SET claimed_at = `+mqrAged+` WHERE run_id = $1`, a.id)
-	aged := w.mqrClaim(a)
+	releasedBefore := w.mqmReleasedRows(a)
 	requireOutcome(t, w.srv.mergeQueueResumeMerge(context.Background(), w.active(a)), mergeOnPassRedecide, mergeQueueResumeReasonOrphanedClaimOpen)
-	if c := w.mqrClaim(a); c.State != mergequeue.DispatchDispatched || c.FailureCause != "" || !c.ClaimedAt.Equal(aged.ClaimedAt) {
-		t.Fatalf("aged claim = %+v, want still dispatched and unchanged (the resume makes no ledger write)", c)
-	}
-	if n := len(w.rows(a, categoryMergeDispatchSettled)); n != settledBefore {
-		t.Fatalf("merge_dispatch_settled rows = %d, want %d (no resume ledger write)", n, settledBefore)
+	w.requireClaim(a, "")
+	if n := w.mqmReleasedRows(a); n != releasedBefore+1 {
+		t.Fatalf("released merge_dispatch_settled rows = %d, want %d (the resume releases the aged orphan, ADR-109 A2)", n, releasedBefore+1)
 	}
 }
 
@@ -342,9 +341,12 @@ func TestMergeQueueResume_MergeArms(t *testing.T) {
 				t.Fatalf("merge_dispatch_settled outcomes = %v, want a final reconciled_merged", got)
 			}
 		}},
-		{name: "open unmerged, aged queue claim (ADR-109 A1 hand-over)", setup: func(*mqmWorld, *mcqRun) {},
+		{name: "open unmerged, aged queue claim (ADR-109 A2 release)", setup: func(*mqmWorld, *mcqRun) {},
 			kind: mergeOnPassRedecide, reason: mergeQueueResumeReasonOrphanedClaimOpen, check: func(t *testing.T, w *mqmWorld, a *mcqRun) {
-				claimState(mergequeue.DispatchDispatched)(t, w, a)
+				w.requireClaim(a, "")
+				if n := w.mqmReleasedRows(a); n != 1 {
+					t.Fatalf("released merge_dispatch_settled rows = %d, want 1", n)
+				}
 				if e := w.storeEntry(a); e.State != mergequeue.StateLive || e.Phase != mergequeue.PhasePassed {
 					t.Fatalf("entry = %s/%s, want live passed", e.State, e.Phase)
 				}
@@ -479,16 +481,18 @@ func TestMergeQueueResume_MergingNoClaimRedecides(t *testing.T) {
 	}
 }
 
-// ADR-109 Amendment A1 (#4711), end to end through a restart: a crash-left
+// ADR-109 Amendment A2 (#4862), end to end through a restart: a crash-left
 // queue claim still 'dispatched' whose PR reads open and unmerged → the
-// resume hands the entry back (ONE merge_queue_resumed {redecide,
-// orphaned_claim_open} row), merge-on-pass re-runs steps 1-7 (a fresh
-// merge_queue_authorized row), releases the claim (merge_dispatch_settled
-// {released, released_orphaned_claim}, AFTER the redecide row), claims afresh
-// and merges ONCE at h1; B is admitted after A, and a second restart writes
-// nothing. CF-A: route the open arm back to mergeQueueResumeOrphan → the
-// claim is dispatch_failed with zero merges, RED. CF-B: the release body
-// returns (false, "", "") → hold merge_already_dispatched, zero merges, RED.
+// resume writes ONE merge_queue_resumed {redecide, orphaned_claim_open} row,
+// RELEASES the claim (merge_dispatch_settled {released,
+// released_orphaned_claim}, AFTER the redecide row and BEFORE the fresh
+// merge_queue_authorized row: the release precedes the fold), returns the
+// entry to passed, and ordinary merge-on-pass claims and merges ONCE at h1;
+// B is admitted after A, and a second restart writes nothing. CF-A: route
+// the open arm back to mergeQueueResumeOrphan → the claim is dispatch_failed
+// with zero merges, RED. CF-B: the resume's release call answers
+// (true, "", "") without releasing → step 8's backstop releases after the
+// fold, so the released row follows the fresh R4 row, RED.
 func TestMergeQueueResume_OrphanedOpenClaimReleasedThenMergesOnce(t *testing.T) {
 	w := newMQMWorld(t)
 	a := w.seed("a", "h1", []byte(mqeSpecYAML))
@@ -523,8 +527,12 @@ func TestMergeQueueResume_OrphanedOpenClaimReleasedThenMergesOnce(t *testing.T) 
 	if released == nil || released.Sequence <= res[0].Sequence {
 		t.Fatalf("released row = %v, want one after the redecide row %d", released, res[0].Sequence)
 	}
-	if n := len(w.rows(a, CategoryMergeQueueAuthorized)); n != authBefore+1 {
-		t.Fatalf("merge_queue_authorized rows = %d, want %d (a fresh R4 row)", n, authBefore+1)
+	auth := w.rows(a, CategoryMergeQueueAuthorized)
+	if len(auth) != authBefore+1 {
+		t.Fatalf("merge_queue_authorized rows = %d, want %d (a fresh R4 row)", len(auth), authBefore+1)
+	}
+	if fresh := auth[len(auth)-1]; released.Sequence >= fresh.Sequence {
+		t.Fatalf("released row %d is not before the fresh merge_queue_authorized row %d (ADR-109 A2 releases before the fold)", released.Sequence, fresh.Sequence)
 	}
 	if e := w.storeEntry(b); e.State != mergequeue.StateLive && e.State != mergequeue.StateMerged {
 		t.Fatalf("B = %s, want admitted after A settled", e.State)
@@ -573,7 +581,9 @@ func TestMergeQueueResume_AppendFailuresHoldUnchanged(t *testing.T) {
 		hold string
 	}{
 		{"merge_queue_resumed", CategoryMergeQueueResumed, true, false, mergequeue.DispatchDispatched, ""},
-		{"merge_dispatch_settled", categoryMergeDispatchSettled, false, false, mergequeue.DispatchDispatched, ""},
+		// ADR-109 A2: the resume's own release row fails, so the open arm
+		// holds resume_unrecorded with the claim standing.
+		{"merge_dispatch_settled", categoryMergeDispatchSettled, false, false, mergequeue.DispatchDispatched, mergeQueueResumeReasonUnrecorded},
 		{"merge_queue_merged", CategoryMergeQueueMerged, true, false, mergequeue.DispatchDispatched, ""},
 		// The hold row after the crash-left transition on the INDETERMINATE
 		// arm (ADR-109 A1 moved the open PR off it): the settled row and the

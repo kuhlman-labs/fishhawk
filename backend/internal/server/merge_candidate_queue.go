@@ -561,8 +561,9 @@ func (s *Server) applyMergeOnPassOutcome(ctx context.Context, e mergequeue.Entry
 		return true
 	case mergeOnPassRedecide:
 		// ADR-093 D8: the resume returned the entry to passed (no dispatch
-		// claim, or ADR-109 A1's orphaned open-PR claim, named by o.Reason);
-		// the pump's next iteration runs ordinary merge-on-pass.
+		// claim, or an orphaned open-PR claim the resume already released
+		// under ADR-109 A2, named by o.Reason); the pump's next iteration runs
+		// ordinary merge-on-pass with no claim standing.
 		log("merge queue: the resume returned a merging entry to passed; merge-on-pass re-decides")
 		return true
 	}
